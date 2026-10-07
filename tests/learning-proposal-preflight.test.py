@@ -1,4 +1,7 @@
 import hashlib
+import contextlib
+import io
+from unittest.mock import patch
 import json
 import subprocess
 import sys
@@ -7,6 +10,7 @@ import unittest
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'skills/learning-window/scripts'))
+import check_return
 from consumer_return import consume
 from window_state import _encode
 ENTRY = ROOT / 'skills/learning-window/scripts/check_return.py'
@@ -28,7 +32,23 @@ class PreflightTests(unittest.TestCase):
         before = {p.name: p.read_bytes() for p in self.root.iterdir()}
         result = subprocess.run([sys.executable, str(ENTRY), '--context', str(self.context)], capture_output=True, text=True, timeout=5)
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.root.iterdir()})
+        output = io.StringIO()
+        with patch.object(sys, 'argv', [str(ENTRY), '--context', str(self.context)]), contextlib.redirect_stdout(output):
+            code = check_return.main()
+        self.assertEqual(code, result.returncode)
+        self.assertEqual(json.loads(output.getvalue()), json.loads(result.stdout))
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.root.iterdir()})
         return result.returncode, json.loads(result.stdout)
+
+    def test_missing_or_wrong_context_is_unknown_without_writes(self):
+        for context in (None, {}, {'output_path': 'missing', 'receipt_paths': [], 'stores': {}}):
+            self.context.write_text(json.dumps(context))
+            output = io.StringIO()
+            with patch.object(sys, 'argv', [str(ENTRY), '--context', str(self.context)]), contextlib.redirect_stdout(output):
+                code = check_return.main()
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output.getvalue())['pending_writes'], 0)
+            self.assertFalse((self.root / 'pending').exists())
 
     def test_actual_cli_valid_preflight_does_not_persist_or_acknowledge(self):
         code, result = self.call([self.row])

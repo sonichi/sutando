@@ -52,18 +52,28 @@ label alone does not distinguish network failure from command-output validation.
 
 `launch.sh manifest directory log` detaches `dispatch_collection.py` with explicit
 manifest config, a dedicated private collection state directory and a caller
-resolved log path. A launch receipt means job started, not consumer completion.
+resolved log path. It delegates interpreter selection to the repository Python
+resolver. A launch receipt means dispatcher requested, not consumer completion.
 The locked dispatcher performs collection before invoking the configured consumer
 argument vector and supplies every retained digest-verified bundle. No fact
 acknowledgment or receipt deletion is implemented; consumer exit stays unverified.
 Scope keys must match the canonical collector gateway hostname, not a Matrix
 homeserver alias. Private dispatcher wiring belongs to the caller's adapter.
 
+Consumers run in their own process group. Before final readback and lock release,
+the dispatcher kills remaining group members and reaps its direct child, including
+on timeout, normal exit, and SIGTERM/SIGINT cancellation. A child deliberately
+escaping the group is outside this guarantee; this is not a sandbox.
+
 The consumer is a detached session with no task inbox: its child environment
 sets `SUTANDO_CORE_SESSION=0` and removes any inherited `SUTANDO_INSTANCE_ID`.
 The core Stop hook recognizes that explicit non-core role without relying on a
 fresh core heartbeat. Other environment and hook settings are preserved. This
 role declaration is queue ownership, not an authorization or tool boundary.
+The Stop hook is Claude-specific and is not installed as Codex enforcement.
+A detached Codex exec adapter must explicitly configure its working directory,
+receipt/checker access and private output write permission; no resident core
+launcher or implicit Codex sandbox grant is supplied.
 
 `receipt_status.py` emits canonical collection summaries from digest-verified
 bundles, including exact UTC timestamps and each scope's visible population.

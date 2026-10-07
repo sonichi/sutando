@@ -166,5 +166,24 @@
     "The reported21second5169 witness remains correlated reported evidence; raw Discord/authenticated cron effects not independently verified.",
     "No Muse/Dots parity baseline established.",
     "Latest upstream integration and its CI are not established by the tested deployed version."
-  ]
+  ],
+  "codex_compatibility_followup": {
+    "reviewed_heads": {
+      "5195": "5614b34d340f08357f3899bb2b63afcfcbb09329",
+      "5197": "c28773f3729da55e7f452383637a2cf68fa75ec9",
+      "5198": "3ce4f3c4b505a96bdb3303c865146884b8d511a7"
+    },
+    "reviewer_report": "Codex core recommended holding 5195 after reproducing timeout descendant survival and unresolved launcher Python; companion fixture checks passed within stated scope.",
+    "independent_local_before": {
+      "head": "5614b34d",
+      "tests": 2,
+      "failures": 2
+    },
+    "corrections": [
+      "supervise consumer process group before final readback and lock release",
+      "delegate launcher interpreter resolution to existing repository owner"
+    ],
+    "authenticated_codex_consumer_witness": "unverified",
+    "prior_5169_witness_applies": false
+  }
 }

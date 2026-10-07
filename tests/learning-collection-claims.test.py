@@ -1,4 +1,7 @@
 import json
+import contextlib
+import io
+from unittest.mock import patch
 import sys
 import tempfile
 import unittest
@@ -23,6 +26,41 @@ class ClaimsTests(unittest.TestCase):
     def rows(self):
         record_collection(self.path, self.receipt["scope"], self.receipt, self.receipt["since_ms"])
         return load_summaries(sorted((self.path / "receipts").glob("*.json")))
+
+    def test_receipt_report_cli_and_bounded_population_refuse_corruption(self):
+        import receipt_status
+        rows = self.rows()
+        paths = sorted((self.path / 'receipts').glob('*.json'))
+        claims = self.path / 'claims.json'
+        claims.write_text(json.dumps(rows))
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['receipt_status', str(paths[0]), '--claims', str(claims)]), contextlib.redirect_stdout(output):
+            receipt_status.main()
+        self.assertEqual(json.loads(output.getvalue()), rows)
+        self.assertEqual(receipt_status.load_population(paths)['unique_scope_room_events'], 1)
+        for invalid in ([], None, [str(paths[0])] * 1001):
+            with self.assertRaises(ValueError):
+                receipt_status.load_population(invalid)
+        wrong = self.path / 'wrong.json'
+        wrong.write_bytes(paths[0].read_bytes())
+        with self.assertRaises(ValueError):
+            receipt_status.load_population([wrong])
+        oversized = self.path / 'oversized.json'
+        with oversized.open('wb') as stream:
+            stream.truncate(4000001)
+        with self.assertRaises(ValueError):
+            receipt_status.load_population([oversized])
+
+    def test_invalid_summaries_cannot_be_claimed_complete(self):
+        from collection_claims import summarize
+        for change in ({'membership_count': 2}, {'scope': ''}, {'rooms': [{'room_id': 'r', 'messages': None}]},
+                       {'rooms': [{'room_id': 'r', 'messages': [{'event_id': '', 'ts': 1}]}]}):
+            receipt = {**self.receipt, **change}
+            with self.assertRaises(ValueError):
+                summarize(receipt, 'digest')
+        rows = self.rows()
+        with self.assertRaises(ValueError):
+            validate_claims(rows * 2, rows * 2)
 
     def test_real_writer_summary_uses_exact_utc_window(self):
         row = self.rows()[0]

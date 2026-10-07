@@ -65,6 +65,123 @@ output.write_text(json.dumps({'schema':1,'proposals':[row]}))
         state=json.loads((self.state/'dispatch-state.json').read_text())
         return result,state
 
+    def test_timeout_stops_descendant_before_readback_and_next_attempt(self):
+        import signal
+        import time
+        child_pid = self.root / 'child.pid'
+        late = self.root / 'late-write'
+        child = self.root / 'child.py'
+        child.write_text("import signal,time,pathlib\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\ntime.sleep(1)\npathlib.Path(" + repr(str(late)) + ").write_text('late')\ntime.sleep(20)\n")
+        self.consumer.write_text("import subprocess,sys,pathlib,time\np=subprocess.Popen([sys.executable," + repr(str(child)) + "],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\npathlib.Path(" + repr(str(child_pid)) + ").write_text(str(p.pid))\ntime.sleep(20)\n")
+        self.configure_readback('same')
+        result, state = self.call('timeout')
+        pid = int(child_pid.read_text())
+        def cleanup():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.addCleanup(cleanup)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(state['error'], 'TimeoutExpired')
+        self.assertIn('document_readbacks_after', state)
+        self.consumer.write_text('import sys;sys.exit(0)')
+        _, next_state = self.call('missing')
+        self.assertEqual(next_state['phase'], 'consumer_exited')
+        time.sleep(1.2)
+        self.assertFalse(late.exists(), 'timed-out descendant wrote after readback and next dispatch')
+
+    def test_dispatcher_cancellation_stops_child_before_failed_readback(self):
+        import signal
+        import time
+        self.call('missing')
+        self.configure_readback('same')
+        manifest = self.root / 'manifest.json'
+        value = json.loads(manifest.read_text())
+        value['config']['document_readback_argv'] = [sys.executable, str(self.readback)]
+        value['config']['consumer_timeout'] = 20
+        manifest.write_text(json.dumps(value))
+        pidfile = self.root / 'cancel-child.pid'
+        late = self.root / 'cancel-late'
+        child = "import pathlib,time;time.sleep(1);pathlib.Path(" + repr(str(late)) + ").write_text('late');time.sleep(20)"
+        self.consumer.write_text("import subprocess,sys,pathlib,time\np=subprocess.Popen([sys.executable,'-c'," + repr(child) + "],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\npathlib.Path(" + repr(str(pidfile)) + ").write_text(str(p.pid))\ntime.sleep(20)")
+        process = subprocess.Popen([sys.executable, str(ENTRY), '--config', str(manifest), '--directory', str(self.state)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+        until = time.monotonic() + 5
+        while not pidfile.exists() and time.monotonic() < until:
+            time.sleep(0.02)
+        self.assertTrue(pidfile.exists())
+        process.send_signal(signal.SIGTERM)
+        self.assertEqual(process.wait(timeout=5), 1)
+        state = json.loads((self.state / 'dispatch-state.json').read_text())
+        self.assertEqual(state['error'], 'InterruptedError')
+        self.assertIn('document_readbacks_after', state)
+        time.sleep(1.2)
+        self.assertFalse(late.exists())
+
+    def test_exited_consumer_cannot_leave_background_writer(self):
+        import time
+        late = self.root / 'exit-late'
+        child = "import pathlib,time;time.sleep(1);pathlib.Path(" + repr(str(late)) + ").write_text('late')"
+        self.consumer.write_text("import subprocess,sys\nsubprocess.Popen([sys.executable,'-c'," + repr(child) + "],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)")
+        result, state = self.call('missing')
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(state['phase'], 'consumer_exited')
+        time.sleep(1.2)
+        self.assertFalse(late.exists())
+
+    def test_optional_launcher_uses_resolved_python(self):
+        import time
+        self.call('valid')
+        (self.state / 'dispatch-state.json').unlink()
+        stub_dir = self.root / 'bin'
+        stub_dir.mkdir()
+        stub = stub_dir / 'python3'
+        stub.write_text('#!/bin/sh\necho developer-tools-stub >&2\nexit 71\n')
+        stub.chmod(0o755)
+        log = self.root / 'launch.log'
+        env = dict(os.environ, SUTANDO_PY=sys.executable, PATH=str(stub_dir) + os.pathsep + os.environ['PATH'])
+        run = subprocess.run(['bash', str(ENTRY.with_name('launch.sh')), str(self.root / 'manifest.json'),
+                              str(self.state), str(log)], env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        until = time.monotonic() + 5
+        state = {}
+        while time.monotonic() < until:
+            try:
+                state = json.loads((self.state / 'dispatch-state.json').read_text())
+            except FileNotFoundError:
+                pass
+            if state.get('phase') in ('consumer_exited', 'failed'):
+                break
+            time.sleep(0.02)
+        self.assertEqual(state.get('phase'), 'consumer_exited', log.read_text())
+        self.assertEqual(state['proposal_return']['proposal_return'], 'persisted')
+        self.assertNotIn('developer-tools-stub', log.read_text())
+
+    def test_direct_dispatch_entry_matches_cli_for_valid_and_timeout_readbacks(self):
+        import contextlib
+        import io
+        sys.path.insert(0, str(ENTRY.parent))
+        import dispatch_collection
+        self.checker = [sys.executable, str(ENTRY.with_name('check_return.py'))]
+        self.configure_readback('same')
+        for mode in ('valid', 'timeout'):
+            _, cli = self.call(mode)
+            output = io.StringIO()
+            with patch.object(sys, 'argv', [str(ENTRY), '--config', str(self.root / 'manifest.json'),
+                                          '--directory', str(self.state)]), contextlib.redirect_stdout(output):
+                code = dispatch_collection.main()
+            direct = json.loads(output.getvalue())
+            self.assertEqual(direct['phase'], cli['phase'])
+            self.assertEqual(code, 0 if mode == 'valid' else 1)
+            self.assertEqual(direct['document_retention']['person']['physical_retention'], 'unchanged')
+            self.assertEqual(direct['learning_outcome'], 'unverified')
+        (self.root / 'manifest.json').write_text('{}')
+        with patch.object(sys, 'argv', [str(ENTRY), '--config', str(self.root / 'manifest.json'), '--directory', str(self.state)]):
+            with self.assertRaises(ValueError):
+                dispatch_collection.main()
+
     def test_actual_cli_checker_repairs_quote_before_real_pending_writer(self):
         self.checker = [sys.executable, str(ENTRY.with_name('check_return.py'))]
         self.consumer.write_text(self.consumer.read_text() + """

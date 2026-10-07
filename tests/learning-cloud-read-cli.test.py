@@ -1,4 +1,8 @@
 import json
+import contextlib
+import io
+import types
+from unittest.mock import patch
 import subprocess
 import sys
 import tempfile
@@ -7,12 +11,34 @@ from pathlib import Path
 ENTRY = Path(__file__).resolve().parents[1] / 'skills/learning-window/scripts/cloud_person_read.py'
 
 
+sys.path.insert(0, str(ENTRY.parent))
+import cloud_person_read
+
+
 class CloudReadCLI(unittest.TestCase):
     def call(self, module, key='person'):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); (root/'src').mkdir(); (root/'src/cloud_auth.py').write_text(module)
-            return subprocess.run([sys.executable,str(ENTRY),'--engine',str(root),'--workspace',str(root),'--',key],
+            result = subprocess.run([sys.executable,str(ENTRY),'--engine',str(root),'--workspace',str(root),'--',key],
                                   capture_output=True,text=True,timeout=5)
+            fake = types.ModuleType('cloud_auth')
+            def load(name):
+                self.assertEqual(name, 'cloud_auth')
+                exec(module, fake.__dict__)
+                return fake
+            output = io.StringIO()
+            with patch.object(cloud_person_read.importlib, 'import_module', side_effect=load), patch.object(sys, 'path', list(sys.path)), patch.object(sys, 'argv',
+                    [str(ENTRY), '--engine', str(root), '--workspace', str(root), '--', key]), \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    code = cloud_person_read.main()
+                except SystemExit as exc:
+                    code = exc.code
+            self.assertEqual(code, result.returncode)
+            if output.getvalue():
+                self.assertEqual(json.loads(output.getvalue()), json.loads(result.stdout))
+            return result
+
 
     def test_actual_cli_delegates_get_auth_workspace_and_timeout(self):
         r=self.call('''def read_cloud_auth(ws):

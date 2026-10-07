@@ -29,6 +29,31 @@ class WriterTests(unittest.TestCase):
     def state(self):
         return json.loads((self.path / "collection-state.json").read_text())
 
+    def test_corrupted_state_and_wrong_bootstrap_are_preserved_on_refusal(self):
+        self.path.mkdir()
+        path = self.path / 'collection-state.json'
+        malformed = ({'schema': 2, 'scopes': {}}, {'schema': 1, 'scopes': {'prod': []}},
+                     {'schema': 1, 'scopes': {'prod': {'bootstrap_ms': 10, 'rooms': {'r': {'collected_through_ms': 0}}}}})
+        for value in malformed:
+            path.write_text(json.dumps(value))
+            before = path.read_bytes()
+            with self.assertRaises(ValueError):
+                writer.plan_windows(self.path, {'prod': ['r']}, 0)
+            self.assertEqual(path.read_bytes(), before)
+        path.unlink()
+        for memberships in ([], {'prod': [None]}):
+            with self.assertRaises(ValueError):
+                writer.plan_windows(self.path, memberships, 0)
+            self.assertFalse(path.exists())
+        writer.record_collection(self.path, 'prod', receipt(), 0)
+        before = path.read_bytes()
+        with self.assertRaises(ValueError):
+            writer.plan_windows(self.path, {'prod': ['!a']}, 1)
+        self.assertEqual(path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            writer.record_collection(self.path, 'prod', receipt(since=100, until=50), 0)
+        self.assertEqual(path.read_bytes(), before)
+
     def test_receipt_persisted_before_progress_not_learning_credit(self):
         got = writer.record_collection(self.path, "prod", receipt(), 0)
         self.assertFalse(got["learning_progress_advanced"])

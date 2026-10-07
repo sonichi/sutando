@@ -36,6 +36,14 @@ class DispatchTests(unittest.TestCase):
                          rooms=[{"room_id": "!room", "messages": [], "errors": [], "coverage": "server_no_cursor"}])
         return SimpleNamespace(returncode=0, stdout=json.dumps(value))
 
+    def test_bad_store_or_checker_config_has_no_state_effect(self):
+        for change in ({'proposal_stores': []}, {'proposal_stores': {'person': ''}},
+                       {'proposal_check_argv': ['checker']}, {'proposal_stores': {'person': 'id'}, 'proposal_check_argv': []}):
+            with self.assertRaises(ValueError):
+                dispatcher.dispatch({**self.config, **change}, self.path, 100, self.runner)
+            self.assertFalse(self.path.exists())
+        self.assertEqual(self.calls, [])
+
     def test_malformed_optional_readback_config_fails_before_state_or_consumer(self):
         for argv, stores in [([], {'person': 'id'}), (['read'], {}), ('read', {'person': 'id'})]:
             config = {**self.config, 'document_readback_argv': argv, 'proposal_stores': stores}

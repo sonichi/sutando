@@ -3,6 +3,7 @@ import argparse
 import fcntl
 import json
 import os
+import signal
 import subprocess
 import time
 import uuid
@@ -11,6 +12,34 @@ from pathlib import Path
 from command_collection import collect_commands
 from receipt_status import load_summaries
 from window_state import _atomic, _encode
+
+
+def _run_consumer(argv, *, timeout, env):
+    process = None
+    handlers = {}
+    cancelled = False
+    def interrupted(signum, frame):
+        nonlocal cancelled
+        cancelled = True
+        if process is not None:
+            raise InterruptedError('consumer dispatch cancelled')
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            handlers[signum] = signal.signal(signum, interrupted)
+        process = subprocess.Popen(argv, env=env, start_new_session=True)
+        if cancelled:
+            raise InterruptedError('consumer dispatch cancelled')
+        return subprocess.CompletedProcess(argv, process.wait(timeout=timeout))
+    finally:
+        if process is not None:
+            # The leader may have exited while descendants still own files.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
 
 
 def dispatch(config, directory, until_ms, runner=None):
@@ -79,7 +108,7 @@ def dispatch(config, directory, until_ms, runner=None):
                 _atomic(state_path, _encode(state))
             state.update(phase="consumer_starting", receipt_paths=receipts, consumer_attempted=True, consumer_started=None)
             _atomic(state_path, _encode(state))
-            run = runner or subprocess.run
+            run = runner or _run_consumer
             consumer_env = dict(os.environ)
             consumer_env["SUTANDO_CORE_SESSION"] = "0"
             consumer_env.pop("SUTANDO_INSTANCE_ID", None)
