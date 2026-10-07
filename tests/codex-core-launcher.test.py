@@ -287,6 +287,7 @@ exit 0
             "SCHEDULER_LOG": str(Path(self.tmp.name) / "scheduler.log"),
             "SUTANDO_CODEX_SCHEDULER_SCRIPT": str(self.root / "fake-codex-scheduler.py"),
             "SUTANDO_HOST_LABEL": "test-host",
+            "SUTANDO_CORE_SESSION_WAIT_S": "0",
         })
         env.update(env_extra or {})
         result = subprocess.run(
@@ -315,6 +316,7 @@ exit 0
             "HEARTBEAT_LOG": str(Path(self.tmp.name) / "heartbeat.log"),
             "HEARTBEAT_PID": str(Path(self.tmp.name) / "heartbeat.pid"),
             "SUTANDO_HOST_LABEL": "test-host",
+            "SUTANDO_CORE_SESSION_WAIT_S": "0",
         })
         env.update(env_extra or {})
         master, slave = pty.openpty()

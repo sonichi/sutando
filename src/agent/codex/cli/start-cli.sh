@@ -151,6 +151,11 @@ export PATH
 # on the first miss leaves a dead window that never recovers even once the
 # install finishes, so wait briefly for it to appear before giving up.
 CODEX_WAIT_TIMEOUT="${SUTANDO_CODEX_WAIT_TIMEOUT:-120}"
+# How long a freshly created core session may take to answer has-session.
+# Tests with a stub tmux that never reports one set this low.
+SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S:-5}"
+SESSION_UP_TRIES=$(( ${SESSION_UP_WAIT_S%.*} * 5 ))
+[ "$SESSION_UP_TRIES" -ge 1 ] 2>/dev/null || SESSION_UP_TRIES=1
 if ! command -v codex >/dev/null 2>&1; then
   echo "  … waiting for the Codex CLI to finish installing (up to ${CODEX_WAIT_TIMEOUT}s)" >&2
   _codex_waited=0
@@ -548,14 +553,14 @@ if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
   # new-session rc=0 means tmux accepted it; a child that exits at once leaves
   # has-session failing. Poll before opening intake rather than assuming.
-  for _ in $(seq 1 25); do
+  for _ in $(seq 1 "$SESSION_UP_TRIES"); do
     session_exists "$SESSION" && break
     sleep 0.2
   done
   if session_exists "$SESSION"; then
     clear_shutdown_sentinel
   else
-    echo "  ⚠ $SESSION did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
+    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_WAIT_S}s — sentinel NOT cleared, no core is serving." >&2
   fi
   ensure_task_notifier
   ensure_core_monitor
@@ -565,14 +570,14 @@ else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
   # new-session rc=0 means tmux accepted it; a child that exits at once leaves
   # has-session failing. Poll before opening intake rather than assuming.
-  for _ in $(seq 1 25); do
+  for _ in $(seq 1 "$SESSION_UP_TRIES"); do
     session_exists "$SESSION" && break
     sleep 0.2
   done
   if session_exists "$SESSION"; then
     clear_shutdown_sentinel
   else
-    echo "  ⚠ $SESSION did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
+    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_WAIT_S}s — sentinel NOT cleared, no core is serving." >&2
   fi
   ensure_task_notifier
   ensure_core_monitor
