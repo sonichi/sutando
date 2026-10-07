@@ -196,19 +196,8 @@ def severity_gate(verdict, *, confirm_min=2, freshly_booted=False):
     return "report"
 
 
-# Markers that mean the bundled claude CLI is sitting at its auth prompt and the
-# core therefore cannot act. Kept broad on purpose — the failure mode is a user
-# staring at an unresponsive agent, so a false "needs_login" (rare) is far less
-# costly than missing a real one.
-_LOGIN_MARKERS = (
-    "not logged in",
-    "please run /login",
-    "run `claude login`",
-    "run 'claude login'",
-    "unlock-keychain",
-    "invalid api key",
-    "authentication_error",
-)
+# Which pane lines mean the CLI needs /login is cli_wedge's (`login_marker_line`): the
+# needs-login banner grammar plus its auxiliary keychain / legacy-CLI hints.
 
 
 def _run(cmd):
@@ -515,11 +504,11 @@ def needs_login(pane_text):
     """Pure predicate: does the core pane show claude's auth prompt? Testable
     without a live tmux — this is the load-bearing 'stuck vs thinking' decision.
     Only the latest marker counts, and only while nothing after it shows the CLI
-    signed in again. The marker set is this module's (broad on purpose, above); the
+    signed in again. The marker set is cli_wedge's `login_marker_line`; the
     "signed in after it" reading is worker_auth_state's, the one the seat monitor
     uses, so both readers give one answer for one pane."""
     lines = pane_text.splitlines()
-    last = max((i for i, ln in enumerate(lines) if any(m in ln.lower() for m in _LOGIN_MARKERS)),
+    last = max((i for i, ln in enumerate(lines) if cli_wedge.login_marker_line(ln)),
                default=None)
     if last is None:
         return False

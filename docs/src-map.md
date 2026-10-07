@@ -346,6 +346,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`manager.py`** — HumanRequirement Manager: durable requirement store + projection ledger.
 - **`policy.py`** — Manager-level auto-answer policy: the tail of permission requests that never needs a human.
 - **`projector.py`** — Projects HumanRequirement state into Matrix via an injected sender.
+- **`renotify.py`** — Follow-up notices for a blocking requirement the owner has not cleared.
 - **`replies.py`** — Inbound half of the client action wire.
 - **`schema.py`** — HITL v1 domain model + wire contract (space.ag2.hitl).
 - **`supervisor.py`** — Runtime supervisor pass: detector -> manager -> projector, one turn.

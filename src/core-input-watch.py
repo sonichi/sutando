@@ -142,11 +142,15 @@ _BORDER_LINE = BORDER_LINE
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
 _REFUSAL = re.compile(
     r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
-    r"|Please run /login|OAuth access token has expired"
-    # "not logged in" is three common words: only the CLI's own line-start form, or
-    # the phrase beside a /login token, is a refusal; a tool result quoting it is not.
-    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b|not logged in\b.{0,60}/login\b|/login\b.{0,60}not logged in\b",
-    re.I)
+    # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
+    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b", re.I)
+
+
+def _refusal_line(line: str) -> bool:
+    """A limit refusal, or the CLI's needs-login line (cli_wedge's one grammar)."""
+    return bool(_REFUSAL.search(line)) or cli_wedge.needs_login_line(line)
+
+
 # The completed-turn line: "✻ Worked for 0s" / "✻ Cooked for 1s · done 12:32 PM". The spinner
 # reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
 _TURN_DONE = re.compile(
@@ -275,7 +279,7 @@ def _composer_text(pane: str) -> "str | None":
 def refused_turn(pane: str):
     """(kind, line) when the pane sits at the idle footer and the turn that ended there —
     the last completed one, with nothing newer below it — was refused: a short turn (≤1s
-    or no duration) whose only content is a `⎿` result carrying a _REFUSAL line. Else
+    or no duration) whose only content is a `⎿` result carrying a _refusal_line. Else
     None — a long turn that merely mentions the words, a turn that ran (any `●`/`⏺`
     line, so a tool result that quoted a refusal stays the tool's), a completion with a
     newer prompt or active turn below it, or a pane not at the footer all stay as they were."""
@@ -304,7 +308,7 @@ def refused_turn(pane: str):
     for core in turn:
         if core.startswith("⎿"):
             in_result = True
-        if in_result and _REFUSAL.search(core):
+        if in_result and _refusal_line(core):
             return "turn-rejected", core.lstrip("⎿").strip()
     return None
 
