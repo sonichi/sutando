@@ -571,6 +571,70 @@ class MainLoopWiringTest(FakeTmuxHarness):
                     pass
                 proc.wait(timeout=5)
 
+    def test_noncanonical_launch_also_clears_the_full_foreign_routing_env(self):
+        # Rui's finding: the prior fix only scrubbed on canonical. agy's OWN
+        # tasks-agy default inherits the same foreign env just as badly.
+        if shutil.which("fswatch") is None:
+            self.skipTest("fswatch not installed on this host")
+        noncanon_tasks = self.root / "workspace" / "tasks-agy"
+        noncanon_results = self.root / "workspace" / "results-agy"
+        noncanon_tasks.mkdir(parents=True)
+        noncanon_results.mkdir(parents=True)
+        env = self._env({
+            "SUTANDO_TASKS_DIR": str(noncanon_tasks),
+            "SUTANDO_RESULTS_DIR": str(noncanon_results),
+            "SUTANDO_INBOX_KIND": "deliveries",
+            "SUTANDO_INBOX_RESOLVER": str(REPO / "skills/worker-pool/scripts/resolve-inbox-entry"),
+            "SUTANDO_INBOX_RESOLVER_TIMEOUT": "5",
+            "SUTANDO_POOL_DELIVERY_SCRIPT": str(REPO / "skills/worker-pool/scripts/pool_delivery.py"),
+        })
+        proc = subprocess.Popen(
+            ["/bin/bash", str(NOTIFIER)],
+            env=env,
+            cwd=str(self.root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            state_dir = noncanon_tasks.parent / "state"
+            ready_deadline = time.time() + 15
+            while time.time() < ready_deadline and not any(
+                state_dir.glob("watch-tasks-stream*agy-task-notifier*.pid")
+            ):
+                time.sleep(0.2)
+            (noncanon_tasks / "task-routing-env-nc.txt").write_text(
+                "id: task-routing-env-nc.txt\ntask: say OK\n")
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if "TYPE Sutando task ready: task-routing-env-nc.txt" in self.sendkeys_log_text():
+                    break
+                time.sleep(0.2)
+            else:
+                self.fail(
+                    "a plain task on agy's own tasks-agy default was never dispatched -- "
+                    "the inherited worker-routing env was not cleared on a non-canonical "
+                    "launch:\n" + self.sendkeys_log_text())
+            (noncanon_results / "task-routing-env-nc.txt").write_text("OK\n")
+            deadline = time.time() + 10
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.2)
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=5)
+
     def test_an_older_refused_name_does_not_stall_the_newer_plain_task(self):
         # The queue head is chosen by next-pending: a refused name sorting first
         # must be skipped there, or every wake re-offers it and nothing behind it runs.

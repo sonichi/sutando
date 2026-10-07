@@ -271,11 +271,9 @@ fi
 # exact instance id, so it and this notifier's sentinel lookup agree.
 export SUTANDO_RESULTS_DIR="$RESULTS_DIR"
 export SUTANDO_INSTANCE_ID="$(resolved_instance_id)"
-# The id above is deliberately blank on canonical, so a foreign routing env must
-# be scrubbed here -- the watcher can no longer tell blank-on-purpose from unset.
-if inbox_is_canonical_core_tasks_dir "$TASKS_DIR"; then
-  unset SUTANDO_INBOX_KIND SUTANDO_INBOX_RESOLVER SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT
-fi
+# Never a worker-pool deliveries consumer on ANY inbox (it decides its own id
+# above), so an inherited resolver/kind/timeout/delivery-script is never valid.
+unset SUTANDO_INBOX_KIND SUTANDO_INBOX_RESOLVER SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT
 event_dir="$(mktemp -d "${TMPDIR:-/tmp}/sutando-agy-task-notifier.XXXXXX")"
 mkfifo "$event_dir/events"
 # The launch nonce rides the watcher's own ready event (<sentinel>.token), so readiness can

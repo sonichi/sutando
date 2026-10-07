@@ -103,7 +103,7 @@ retire_stale_watcher() {
   local watcher="${SESSION}-watcher"
   tmux -S "$TMUX_SOCKET" has-session -t "=$watcher" 2>/dev/null || return 0
   if tmux -S "$TMUX_SOCKET" kill-session -t "=$watcher" 2>/dev/null; then
-    echo "Retired stale $watcher (task injection is no longer part of this launcher)."
+    echo "Retired stale $watcher (nothing here can manage it right now: notifier or fswatch missing)."
   elif tmux -S "$TMUX_SOCKET" has-session -t "=$watcher" 2>/dev/null; then
     echo "  ⚠ could not retire stale $watcher on $TMUX_SOCKET" >&2
   fi
