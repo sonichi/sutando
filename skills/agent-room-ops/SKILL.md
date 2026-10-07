@@ -46,6 +46,49 @@ The normative op→Action map is the backend contract
   write it in the body too (the relay scans both). Parameters vary per room, so
   `room.actions.describe room.message.send` before relying on `mentions`.
 
+## Owner mentions: point the owner's Navigator at them
+
+On a task whose headers carry `owner_mentioned: true` (a room message that
+@-mentioned your owner, not you), run this first, before the DM the task's
+system instructions ask for:
+
+```bash
+python3 skills/agent-room-ops/room_ops.py navigate mention --task-file <workspace>/tasks/<task>.txt
+```
+
+It calls the `room.navigate` Action in the owner DM, so the owner's Navigator
+gets a row with Open that lands on the mentioning message, with a reason naming
+who mentioned them and where. The verb decides; you do not:
+
+| outcome | what it means | what you do |
+| --- | --- | --- |
+| `navigated: true` | the pointer is in the owner DM | nothing more |
+| `skipped` | not an owner-mention task, the mention is in the owner DM itself, or this message was already handled | nothing more |
+| `held: true` | another navigate went out inside the window (`OWNER_MENTION_NAVIGATE_WINDOW_S`, manifest default 120 s); a trailing navigate to the latest held mention runs by itself when it closes | nothing more |
+| `dm_line` present | the Action refused (most often: the owner has not joined that room) or could not be reached | add `dm_line` to your DM result; never run it again for this message |
+
+Rules the verb enforces: one navigate per mention message (by
+`source_message_id`); never the owner DM itself; never a retry loop. It never
+posts in the mentioning room, and neither do you. To point the owner somewhere
+by hand: `room_ops.py navigate to <room> [--event $e] [--thread $t] [--view doc]
+[--page p] --reason "<= 280 chars"`.
+
+The call goes through the Actions door, not the room-ops gateway: the gateway
+bearer discovers the hosted MCP on its relay, mints a delegation there, and runs
+`room.action.execute` with `operation_id` derived from the target, so a repeated
+call is the same operation.
+Every request that carries a token refuses redirects (a 3xx is an answer, never
+followed), the mint must be on the relay's host and the MCP URL on the relay's site.
+A held mention whose trailing flush never ran is delivered by the next `mention` run.
+
+The owner DM is the room whose members are exactly {this agent, its owner} (owner
+from the gateway's `/v1/agents` row): the only room the Action accepts. The
+gateway's `owner_dm_room` reading is not used as-is, because it can hold other
+members. With several such rooms, the one with the most recent owner message wins
+(else the lowest room id); the pick is logged to `logs/owner-mention-navigate.log`
+and cached for a day in `state/owner-mention-dm.json`. A room the Action refuses
+as the DM is excluded from later picks; a refusal about the target keeps it.
+
 **When `room_ops.py` is still the path (fallback)**
 - The MCP is not connected or unreachable, or an Action returns a server error.
 - `events subscribe` / `unsubscribe` / `list` / `pull` / `stream`: MCP event
@@ -77,6 +120,7 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `react <room> <event>` | add an `m.reaction` (ack) | discord `add_reaction` (👀/✅) |
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
 | `join <room>` | accept the agent's own pending invite | discord guild-join on invite |
+| `navigate to\|mention` | point the owner's Navigator at a room (`room.navigate` Action); `mention --task-file` applies the owner-mention rule | — |
 | `doc get\|put\|rm <room>` | read/write/delete the room's shared **Room Context** docs (context, todo, memos — or any agent-defined folder) | the durable-state half: like a pinned channel wiki the bot can edit |
 
 ```bash
