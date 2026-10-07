@@ -151,36 +151,28 @@ export PATH
 # on the first miss leaves a dead window that never recovers even once the
 # install finishes, so wait briefly for it to appear before giving up.
 CODEX_WAIT_TIMEOUT="${SUTANDO_CODEX_WAIT_TIMEOUT:-120}"
-# How long a freshly created core session may take to answer has-session.
-# Tests with a stub tmux that never reports one set this low.
+# Seconds a freshly created core session may take to answer has-session; a stub
+# tmux that never reports one (tests) sets this to 0.
 SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S:-5}"
-# A non-numeric value (a typo, a stray word) must fall back to the default rather
-# than reach the arithmetic below: under `set -u` an unset bare identifier like
-# "abc" is a hard "unbound variable" exit, not a graceful degrade. (keweichen,
-# PR #5210: the first version of this guard was verified without `set -u`,
-# which hid exactly this.)
-if ! [[ "$SESSION_UP_WAIT_S" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
-  SESSION_UP_WAIT_S=5
+# Only a signed base-10 integer counts (fraction dropped): under set -u a bare word is an
+# unbound-variable exit and a leading zero reads as octal, so anything else is the default.
+if [[ "$SESSION_UP_WAIT_S" =~ ^(-?)([0-9]+)(\.[0-9]+)?$ ]]; then
+  _session_up_neg="${BASH_REMATCH[1]}"
+  _session_up_mag="${BASH_REMATCH[2]}"
+else
+  _session_up_neg=""
+  _session_up_mag=5
 fi
-# A regex pass isn't enough: bash arithmetic treats a leading-zero integer
-# literal as octal, and "08"/"09" are invalid octal digits -- "08" matches
-# the check above but still crashes the arithmetic below. Force base 10
-# explicitly, and pull the sign out first since `10#` doesn't accept one
-# inline. (Sutando (rui), PR #5210, live repro with 08/1e3/.5 through the
-# full launcher.)
-_session_up_mag="${SESSION_UP_WAIT_S%.*}"
-_session_up_sign=""
-if [ "${_session_up_mag#-}" != "$_session_up_mag" ]; then
-  _session_up_sign="-"
-  _session_up_mag="${_session_up_mag#-}"
+# More than nine digits cannot be meant as seconds and would overflow the multiply.
+if [ -n "$_session_up_neg" ]; then
+  SESSION_UP_TRIES=1
+elif [ "${#_session_up_mag}" -gt 9 ]; then
+  SESSION_UP_TRIES=300
+else
+  SESSION_UP_TRIES=$(( 10#$_session_up_mag * 5 ))
 fi
-SESSION_UP_TRIES=$(( ${_session_up_sign}(10#$_session_up_mag) * 5 ))
-[ "$SESSION_UP_TRIES" -ge 1 ] 2>/dev/null || SESSION_UP_TRIES=1
-# A hostile/mistyped value (e.g. a stray extra digit) must not turn the seq-built
-# poll list into something that never finishes or exhausts memory building it.
-[ "$SESSION_UP_TRIES" -le 300 ] 2>/dev/null || SESSION_UP_TRIES=300
-# The warning below should name what the launcher actually waited, not the raw
-# (possibly huge, now-clamped) input value. (rui, PR #5210.)
+[ "$SESSION_UP_TRIES" -ge 1 ] || SESSION_UP_TRIES=1
+[ "$SESSION_UP_TRIES" -le 300 ] || SESSION_UP_TRIES=300
 SESSION_UP_EFFECTIVE_S=$(( SESSION_UP_TRIES / 5 ))
 echo "  · session-up wait: at most ${SESSION_UP_EFFECTIVE_S}s" >&2
 if ! command -v codex >/dev/null 2>&1; then

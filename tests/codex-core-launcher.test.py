@@ -56,10 +56,32 @@ def _read_when_nonempty(path, deadline):
     return None
 
 
-SESSION_UP_AT_ONCE_TMUX = '''#!/bin/bash
+# A tmux that reports the core session only once new-session has run, so the
+# launcher takes the create-and-poll path rather than "already running".
+SESSION_UP_AFTER_CREATE_TMUX = '''#!/bin/bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
-[ "${1:-}" = has-session ] && exit 0
+[ "${1:-}" = new-session ] && : > "$TMUX_STATE.created"
+if [ "${1:-}" = has-session ]; then
+  [ -e "$TMUX_STATE.created" ] && exit 0
+  exit 1
+fi
+exit 0
+'''
+
+# As above, but the session appears only on the third poll after new-session.
+SESSION_UP_THIRD_POLL_TMUX = '''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+[ "${1:-}" = new-session ] && : > "$TMUX_STATE.created"
+if [ "${1:-}" = has-session ]; then
+  [ -e "$TMUX_STATE.created" ] || exit 1
+  n="$(cat "$TMUX_STATE.hits" 2>/dev/null || echo 0)"
+  n=$((n + 1))
+  echo "$n" > "$TMUX_STATE.hits"
+  [ "$n" -ge 3 ] && exit 0
+  exit 1
+fi
 exit 0
 '''
 
@@ -1995,18 +2017,9 @@ exit 0
         return "\n".join(lines[start:end + 1])
 
     def test_session_wait_knob_validates_and_clamps_hostile_values(self):
-        """SUTANDO_CORE_SESSION_WAIT_S must degrade to a bounded try count for
-        every hostile shape, under the launcher's OWN `set -euo pipefail` —
-        not a looser shell. Two real gaps were caught in review on PR #5210,
-        both against an earlier version of this same test:
-        - keweichen: verified without `set -u`, so it passed while the real
-          launcher would exit on a non-numeric value (bash treats a bare
-          unset identifier like "abc" in arithmetic context as an
-          unbound-variable error under `set -u`, not a silent 0).
-        - Sutando (rui): a regex-only validation still let "08" through
-          (matches `^[0-9]+$`) into arithmetic, where bash's leading-zero
-          octal parsing makes "08"/"09" invalid digits and crashes the same
-          way; confirmed live through the full launcher with 08/1e3/.5."""
+        """The knob degrades to a bounded try count for every hostile shape under
+        the launcher's own set -euo pipefail: a bare word is otherwise an
+        unbound-variable exit and a leading zero an octal error."""
         snippet = self._session_wait_snippet()
         self.assertIn("SESSION_UP_TRIES", snippet)
         self.assertIn("-le 300", snippet, "clamp line moved or was removed")
@@ -2050,31 +2063,39 @@ exit 0
                 self.assertEqual(out_effective, expected_effective,
                                   f"case={name} hostile={hostile!r} stderr={result.stderr!r}")
 
+    def _calls_after_new_session(self):
+        calls = self.log.read_text().splitlines() if self.log.exists() else []
+        idx = next((i for i, c in enumerate(calls) if " new-session " in f" {c} "), None)
+        return [] if idx is None else calls[idx + 1:]
+
     def test_launcher_survives_an_invalid_session_wait_value_end_to_end(self):
-        """The real launcher (not an extracted snippet) must still bring up a
-        session when the knob is garbage, and say which bound it applied. "08"
-        is syntactically a number and must read as 8, not as invalid or octal."""
-        self._write_exe("tmux", SESSION_UP_AT_ONCE_TMUX)
+        """The real launcher creates the session and clears the sentinel when the
+        knob is garbage, naming the bound it applied; "08" reads as 8."""
         for hostile, expected_bound in (("abc", "5"), ("1e3", "5"), (".5", "5"), ("08", "8")):
             with self.subTest(hostile=hostile):
+                self.setUp()
+                self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
                 result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": hostile})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("unbound variable", result.stderr)
                 self.assertNotIn("value too great for base", result.stderr)
                 self.assertIn(f"session-up wait: at most {expected_bound}s", result.stderr)
+                polls = [c for c in self._calls_after_new_session() if "has-session -t =" in c and "-watcher" not in c]
+                self.assertGreaterEqual(len(polls), 1, "the launcher never polled after new-session")
                 self.assertNotIn("did not come up", result.stderr)
 
-    def test_launcher_reports_the_timeout_with_the_bound_it_applied(self):
-        """When the session never appears, the warning names the applied bound;
-        a bound of 0 keeps this on the one-poll path."""
-        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0"})
+    def test_launcher_times_out_with_the_effective_bound_not_the_raw_value(self):
+        """When the session never appears the warning names the applied bound: a
+        raw 0.9 is one poll and "~0s", so raw and effective differ cheaply."""
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("did not come up within ~0s", result.stderr)
+        self.assertNotIn("0.9s", result.stderr)
 
     def test_launcher_prints_the_effective_bound_not_the_raw_huge_value(self):
-        """rui's second finding: the launcher names the clamped bound it will
-        actually wait, never the raw huge input."""
-        self._write_exe("tmux", SESSION_UP_AT_ONCE_TMUX)
+        """A huge value is clamped to 300 polls and announced as 60 s before the
+        first poll; the raw digits never reach the output."""
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
         result = self.run_launcher(
             env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "99999999999999999"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2082,25 +2103,14 @@ exit 0
         self.assertNotIn("99999999999999999", result.stderr)
 
     def test_launcher_delayed_session_still_comes_up_within_the_wait(self):
-        """A session that reports itself a beat late (not instantly, not
-        never) must still be picked up inside the configured wait — the
-        delayed-session path kewei asked this PR to cover, exercised against
-        the real launcher rather than the extracted arithmetic."""
-        self._write_exe("tmux", '''#!/bin/bash
-printf '%s\n' "$*" >> "$TMUX_LOG"
-[ "${1:-}" = -S ] && shift 2
-if [ "${1:-}" = has-session ]; then
-  n="$(cat "$TMUX_STATE.hits" 2>/dev/null || echo 0)"
-  n=$((n + 1))
-  echo "$n" > "$TMUX_STATE.hits"
-  [ "$n" -ge 3 ] && exit 0
-  exit 1
-fi
-exit 0
-''')
+        """A session that reports itself on the third poll after new-session is
+        still picked up inside the configured wait, with no timeout warning."""
+        self._write_exe("tmux", SESSION_UP_THIRD_POLL_TMUX)
         result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "2"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("did not come up", result.stderr)
+        polls = [c for c in self._calls_after_new_session() if "has-session -t =" in c and "-watcher" not in c]
+        self.assertGreaterEqual(len(polls), 3, polls)
 
     def test_worker_one_shot_pending_failure_exits_nonzero_without_typing(self):
         workspace = self.root / "workspace"
