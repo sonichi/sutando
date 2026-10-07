@@ -456,10 +456,12 @@ def decide(workspace, rid: str, approve: bool, *, notifier=None) -> dict:
         cmd = rec["command"]
         out: dict = {"id": rid, "command": cmd}
         if approve and cmd.get("action") in ("pin", "unpin"):
-            applied = apply(workspace, cmd, task_id=f"{rec['task_id']}.approved-{rid}")
-            if not applied or applied.get("action") == "skipped":
-                return {**out, "status": "pending",
-                        "error": f"not applied: {(applied or {}).get('reason')}"}
+            try:
+                applied = apply(workspace, cmd, task_id=f"{rec['task_id']}.approved-{rid}")
+            except (pr.RosterError, OSError, ValueError) as e:
+                applied = {"action": "skipped", "reason": str(e)}
+            if applied.get("action") == "skipped":
+                return {**out, "status": "pending", "error": f"not applied: {applied.get('reason')}"}
             out["applied"] = applied
         elif approve:
             out["next"] = ("run the owner's add: grow the installed core pool by one via "
