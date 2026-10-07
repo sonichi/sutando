@@ -260,7 +260,7 @@ class RePickTests(FakeTmuxHarness):
         # marker's filename, never whitespace-stripped pane text.
         self.write_task("task-a b.txt")
         t = self._finish_on("task-a b.txt", lambda log: "ENTER" in log)
-        first = self.run_event("task-a b.txt")
+        first = self.run_event("task-a b.txt", env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1"})
         t.join(timeout=5)
         self.assertEqual(first.returncode, 0, first.stderr)
         self.write_task("task-ab.txt")
@@ -289,6 +289,23 @@ class MainLoopWiringTest(FakeTmuxHarness):
                 return True
             time.sleep(0.1)
         return False
+
+    def _wait_until(self, cond, timeout, msg):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if cond():
+                return
+            time.sleep(0.1)
+        self.fail(msg)
+
+    def _finish(self, name, timeout=10):
+        # The main loop ends only with its watcher, so a process-exit wait after a
+        # result proves nothing; the marker's clearing is what a pickup proves.
+        marker = self.inflight_dir / name
+        self._wait_until(marker.is_file, timeout, f"no in-flight marker for {name} after its paste")
+        self.write_result(name)
+        self._wait_until(lambda: not marker.exists(), timeout,
+                         f"the in-flight marker for {name} outlived its result")
 
     def tearDown(self):
         """Every test in this class starts the real main loop, whose standby
@@ -324,10 +341,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
             else:
                 self.fail("main loop never dispatched the dropped task file:\n"
                           + self.sendkeys_log_text())
-            self.write_result("task-live.txt")
-            deadline = time.time() + 10
-            while time.time() < deadline and proc.poll() is None:
-                time.sleep(0.2)
+            self._finish("task-live.txt")
         finally:
             if proc.poll() is None:
                 try:
@@ -436,10 +450,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
                 else:
                     self.fail(with_stderr("the periodic self-poll never retried the queued task:\n"
                                            + self.sendkeys_log_text()))
-                self.write_result("task-p.txt")
-                deadline = time.time() + 10
-                while time.time() < deadline and proc.poll() is None:
-                    time.sleep(0.2)
+                self._finish("task-p.txt")
             finally:
                 if proc.poll() is None:
                     try:
@@ -501,10 +512,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
             self.assertNotIn(
                 "Sutando task ready: task-claimed.txt", self.sendkeys_log_text(),
                 "a claimed must-handle task must never be typed into the live core")
-            self.write_result("task-unrelated.txt")
-            deadline = time.time() + 10
-            while time.time() < deadline and proc.poll() is None:
-                time.sleep(0.2)
+            self._finish("task-unrelated.txt")
         finally:
             if proc.poll() is None:
                 try:
@@ -555,10 +563,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
             self.assertNotIn(
                 "Sutando task ready: task-held.txt", self.sendkeys_log_text(),
                 "a worker-held task must never be typed into the live core")
-            self.write_result("task-unrelated.txt")
-            deadline = time.time() + 10
-            while time.time() < deadline and proc.poll() is None:
-                time.sleep(0.2)
+            self._finish("task-unrelated.txt")
         finally:
             if proc.poll() is None:
                 try:
