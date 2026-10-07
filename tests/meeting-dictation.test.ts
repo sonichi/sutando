@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { STTProvider } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate, isMeetingExitPhrase } from '../src/meeting-dictation.js';
+import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase } from '../src/meeting-dictation.js';
 
 class StubProvider implements STTProvider {
 	onTranscript?: (text: string, turnId: number | undefined) => void;
@@ -24,10 +24,37 @@ const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
 describe('meeting dictation', () => {
 	it('recognises exit phrases only', () => {
-		for (const t of ['Sutando, come back', 'okay the meeting is over', 'end meeting', 'stop dictation', 'active mode please', 'done dictating'])
+		for (const t of ['Sutando, come back', 'okay the meeting is over', 'end meeting', 'stop dictation', 'active mode please', 'done dictating',
+			'Switch back to active mode.', 'Hi, Sutando come back.', 'Sutando, end the meeting.'])
 			assert.ok(isMeetingExitPhrase(t), t);
 		for (const t of ['we should end the quarter strong', 'the meeting starts at noon', 'come back to this later'])
 			assert.ok(!isMeetingExitPhrase(t), t);
+	});
+
+	it('ignores a command phrase that is only mentioned in meeting speech', () => {
+		for (const t of [
+			'Do not stop dictation until we finish the budget review.',
+			'How should we end the meeting?',
+			'I think the meeting is over budget.',
+			'Let me stop dictation for a second and explain.',
+			'Next we discuss active mode in the app.',
+		]) assert.ok(!isMeetingExitPhrase(t), t);
+	});
+
+	it('keeps meeting speech before an addressed command and drops fillers', () => {
+		assert.deepEqual(findExitCommand('We ship on Friday. Sutando, come back.'), { before: 'We ship on Friday.' });
+		assert.deepEqual(findExitCommand('Budget is approved. Sutando, end the meeting please.'), { before: 'Budget is approved.' });
+		assert.deepEqual(findExitCommand('Hi, Sutando come back.'), { before: '' });
+		assert.deepEqual(findExitCommand('Okay, stop dictation.'), { before: '' });
+	});
+
+	it('stays in the meeting when a sentence merely mentions an exit phrase', async () => {
+		const t = setup();
+		await t.md.enter();
+		t.provider.say('Do not stop dictation until we finish the budget review.');
+		await tick();
+		assert.equal(t.mode, 'transcription');
+		assert.match(readFileSync(t.md.notePath!, 'utf-8'), /\] Do not stop dictation until we finish the budget review\.\n$/);
 	});
 
 	function setup() {

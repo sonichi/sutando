@@ -10,7 +10,14 @@ import type { STTProvider } from 'bodhi-realtime-agent';
 import { framedSystem } from './inject-framing.js';
 
 const EXIT_PATTERN =
-	/\b(?:(?:end|stop|exit|finish)\s+(?:the\s+)?(?:dictation|transcription|meeting(?:\s+mode)?|note[- ]?taking)|done\s+dictating|meeting\s+is\s+over|active\s+mode|sutando,?\s+come\s+back)\b/i;
+	/\b(?:(?:end|stop|exit|finish)\s+(?:the\s+)?(?:dictation|transcription|meeting(?:\s+mode)?|note[- ]?taking)|done\s+dictating|(?:the\s+)?meeting\s+is\s+over|(?:(?:switch|go|get)\s+(?:back\s+)?to\s+|back\s+to\s+)?(?:the\s+)?active\s+mode|sutando,?\s+come\s+back)\b/gi;
+/** Words that may surround a standalone command without making it part of the meeting. */
+const FILLER = new Set(['ok', 'okay', 'hi', 'hey', 'um', 'uh', 'umm', 'so', 'alright', 'right', 'yeah', 'yes', 'well', 'please', 'now', 'and', 'thanks']);
+const ADDRESSED = /\bsutando[\s,，.!?。]*$/i;
+const ONLY_FILLER_AFTER = /^[\s,.!?。，！？]*(?:(?:please|now|thanks|thank you)[\s,.!?。，！？]*)*$/i;
+
+const isFiller = (text: string) =>
+	text.toLowerCase().split(/[^a-z']+/).filter(Boolean).every((w) => FILLER.has(w));
 
 /** Transcript carried back into the voice session; a longer meeting keeps its end. */
 const MAX_CARRIED_CHARS = 30_000;
@@ -28,8 +35,23 @@ export function meetingEndedContext(path: string, transcript: string[]): string 
 	);
 }
 
+/**
+ * The exit command ending this segment, if any: the segment is only the command (fillers aside),
+ * or the command is addressed to Sutando at its end. `before` is meeting speech ahead of it.
+ */
+export function findExitCommand(text: string): { before: string } | null {
+	const last = [...text.matchAll(EXIT_PATTERN)].at(-1);
+	if (!last || last.index === undefined) return null;
+	if (!ONLY_FILLER_AFTER.test(text.slice(last.index + last[0].length))) return null;
+	let before = text.slice(0, last.index);
+	const addressed = ADDRESSED.test(before) || /^sutando/i.test(last[0]);
+	if (!addressed && !isFiller(before)) return null;
+	before = before.replace(ADDRESSED, '').replace(/[\s,，]+$/, '');
+	return { before: isFiller(before) ? '' : before };
+}
+
 export function isMeetingExitPhrase(text: string): boolean {
-	return EXIT_PATTERN.test(text);
+	return findExitCommand(text) !== null;
 }
 
 function hhmmss(d: Date): string {
@@ -111,11 +133,10 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 
 	deps.provider.onTranscript = (text, turnId) => {
 		if (!text) return;
-		const exitAt = text.search(EXIT_PATTERN);
-		if (exitAt >= 0) {
+		const command = findExitCommand(text);
+		if (command) {
 			deps.log(`[MeetingDictation] exit phrase heard: "${text}"`);
-			const before = text.slice(0, exitAt).replace(/[\s,，]+$/, '');
-			if (before) record(before, turnId);
+			if (command.before) record(command.before, turnId);
 			void exit({ byVoice: true });
 			return;
 		}
