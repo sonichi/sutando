@@ -1,4 +1,7 @@
 """Offline subprocess publication boundary; fixture capabilities never use network."""
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -6,9 +9,15 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "skills/review-preflight/scripts/github-status.py"
+
+sys.path.insert(0, str(CLI.parent))
+spec = importlib.util.spec_from_file_location("github_status_cli_acceptance", CLI)
+status = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(status)
 
 
 class CliTests(unittest.TestCase):
@@ -57,8 +66,46 @@ print(json.dumps(value))
     def run_cli(self, *args):
         (self.path / "fixture.json").write_text(json.dumps(self.fixture))
         env = {**os.environ, "PATH": str(self.path) + os.pathsep + os.environ["PATH"], **getattr(self, "extra_env", {})}
-        return subprocess.run([sys.executable, str(CLI), "o/r", "1", *args],
+        proc = subprocess.run([sys.executable, str(CLI), "o/r", "1", *args],
                               capture_output=True, text=True, env=env, timeout=10)
+        if type(self) is not CliTests or getattr(self, "extra_env", None):
+            # Transport harnesses own a durable broker; do not replay effects.
+            return proc
+        # Pair the real subprocess with the same entry point in this process so
+        # coverage includes CLI policy, not just imported collector helpers.
+        for name in ("calls.jsonl", "runtime-calls.jsonl"):
+            (self.path / name).unlink(missing_ok=True)
+        with patch.dict(os.environ, env), patch.object(sys, "argv", [str(CLI), "o/r", "1", *args]), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                code = status.main()
+            except SystemExit as exc:
+                code = exc.code
+        self.assertEqual(code, proc.returncode)
+        return proc
+
+    def test_read_only_collector_entrypoints_preserve_unknown_review_bar(self):
+        self.run_cli()
+        for module in (status.decision, status.evidence):
+            (self.path / "calls.jsonl").unlink(missing_ok=True)
+            output = io.StringIO()
+            with patch.dict(os.environ, {"PATH": str(self.path) + os.pathsep + os.environ["PATH"]}), \
+                    patch.object(sys, "argv", ["collector", "o/r", "1", "--expect-head", "abc"]), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(module.main(), 0)
+            self.assertEqual(json.loads(output.getvalue())["head_sha"], "abc")
+        self.assertFalse((self.path / "publication.json").exists())
+
+    def test_invalid_publication_context_refused_before_collection(self):
+        for args in (("--room", "!fixture:example.test"),
+                     ("--runtime-tool", str(self.tool)),
+                     ("--task-id", "fixture"),
+                     ("--room", "!fixture:example.test", "--runtime-tool", str(self.path / "missing")),
+                     ("--room", "!fixture:example.test", "--runtime-tool", str(self.tool), "--task-id", "")):
+            with self.subTest(args=args):
+                self.assertNotEqual(self.run_cli(*args).returncode, 0)
+                self.assertFalse((self.path / "calls.jsonl").exists())
+                self.assertFalse((self.path / "publication.json").exists())
 
     def test_default_runs_collectors_without_publication(self):
         proc = self.run_cli()

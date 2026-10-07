@@ -2,6 +2,8 @@
 """Hermetic acceptance regressions for the reliability experiment. No live tasks.
 Run: python3 tests/reliability-v2.test.py
 """
+import contextlib
+import io
 import importlib.util
 import json
 import multiprocessing
@@ -91,6 +93,27 @@ class AccuracyAcceptance(unittest.TestCase):
 
 
 class EffectiveHookAcceptance(unittest.TestCase):
+    def test_hook_entrypoint_and_unavailable_context_remain_unknown(self):
+        event = {"tool_name": "Bash", "hook_event_name": "PostToolUse",
+                 "tool_input": {"command": "gh pr view 1 --repo o/r"}}
+        output = io.StringIO()
+        with patch.object(sys, "stdin", io.StringIO(json.dumps(event))), \
+                patch.object(guard, "decision_context", side_effect=OSError("unavailable")), \
+                contextlib.redirect_stdout(output):
+            guard.main()
+        self.assertIn("unknown", json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"])
+        for data in ({"tool_name": "Read"}, {"tool_name": "Bash", "tool_input": {"command": 3}},
+                     {**event, "hook_event_name": "Other"}):
+            self.assertEqual(guard.decide(data), {})
+
+    def test_hook_target_parser_preserves_read_only_scope(self):
+        self.assertEqual(guard.decision_targets("gh pr view https://github.com/o/r/pull/1"), [("o/r", 1)])
+        self.assertEqual(guard.decision_targets("gh api repos/o/r/pulls/1"), [("o/r", 1)])
+        for command in ("gh api repos/o/r/pulls/1 -X POST", "gh pr view 1 --repo", "echo nothing"):
+            self.assertEqual(guard.decision_targets(command), [])
+        with patch.object(Path, "is_file", return_value=False):
+            self.assertIn("unknown", guard.decision_context("gh pr view 1 --repo o/r"))
+
     def test_known_lossy_ci_query_is_denied(self):
         for filter_command in ("grep FAIL | head -8", "rg error", "head -8", "tail -8", "sed -n '1,8p'", "awk '{print $1}'"):
             got = guard.decide({"tool_name": "Bash", "tool_input": {
