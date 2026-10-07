@@ -3,7 +3,22 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import type { STTProvider } from 'bodhi-realtime-agent';
 import { attachMeetingDictation, createMeetingEntryGate, isMeetingExitPhrase } from '../src/meeting-dictation.js';
+
+class StubProvider implements STTProvider {
+	onTranscript?: (text: string, turnId: number | undefined) => void;
+	onPartialTranscript?: (text: string) => void;
+	configure(): void {}
+	async start(): Promise<void> {}
+	async stop(): Promise<void> {}
+	feedAudio(): void {}
+	commit(): void {}
+	handleInterrupted(): void {}
+	handleTurnComplete(): void {}
+	/** A final line, as the transcription model delivers it. */
+	say(text: string): void { this.onTranscript?.(text, undefined); }
+}
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
@@ -21,7 +36,8 @@ describe('meeting dictation', () => {
 		const buffer: string[] = [];
 		const injected: string[] = [];
 		let exitedByVoice = 0;
-		const provider: any = { onTranscript: (t: string) => buffer.push(t) };
+		const provider = new StubProvider();
+		provider.onTranscript = (t) => { buffer.push(t); };
 		const session = {
 			setTranscriptionMode: async (m: 'agent' | 'transcription') => { mode = m; },
 			getTranscriptionMode: () => mode,
@@ -40,9 +56,9 @@ describe('meeting dictation', () => {
 		await t.md.enter();
 		assert.equal(t.mode, 'transcription');
 		const path = t.md.notePath!;
-		t.provider.onTranscript('first point', undefined);
-		t.provider.onTranscript('second point', undefined);
-		t.provider.onTranscript('Sutando, come back', undefined);
+		t.provider.say('first point');
+		t.provider.say('second point');
+		t.provider.say('Sutando, come back');
 		await tick();
 		assert.equal(t.mode, 'agent');
 		assert.equal(t.exitedByVoice, 1);
@@ -60,7 +76,7 @@ describe('meeting dictation', () => {
 		const t = setup();
 		await t.md.enter();
 		const path = t.md.notePath!;
-		t.provider.onTranscript("We ship on Friday. Sutando, come back.", undefined);
+		t.provider.say("We ship on Friday. Sutando, come back.");
 		await tick();
 		assert.equal(t.mode, 'agent');
 		assert.match(readFileSync(path, 'utf-8'), /\] We ship on Friday\.\n$/);
