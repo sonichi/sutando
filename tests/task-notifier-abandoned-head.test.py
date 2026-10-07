@@ -17,6 +17,8 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -26,7 +28,7 @@ NOTIFIERS = {
     "codex": (REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh", "wait_for_core_idle"),
 }
 sys.path.insert(0, str(REPO / "src"))
-from delivery.task_dispatch import head_abandoned  # noqa: E402
+from delivery.task_dispatch import _main, head_abandoned  # noqa: E402
 
 
 def _function_text(name: str, text: str) -> str:
@@ -70,6 +72,17 @@ class HeadAbandonedContract(unittest.TestCase):
         r = subprocess.run([sys.executable, str(DISPATCH), "head-abandoned", str(self.results), "task-a.txt"],
                            capture_output=True, timeout=30)
         self.assertEqual(r.returncode, 2)
+
+    def test_cli_entry_maps_drop_keep_and_usage_in_process(self):
+        argv = ["head-abandoned", str(self.results), "task-a.txt", str(self.payload)]
+        self.assertEqual(_main(argv), 0)
+        self.payload.write_text("task: x\n")
+        self.assertEqual(_main(argv), 1)
+        for bad in (argv + ["extra"], argv[:3]):
+            err = StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(_main(bad), 2, bad)
+            self.assertIn("head-abandoned <results_dir> <filename> <payload>", err.getvalue())
 
 
 class ShippedQueueDropsAbandonedHead(unittest.TestCase):
