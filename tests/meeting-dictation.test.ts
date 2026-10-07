@@ -201,6 +201,7 @@ describe('meeting dictation', () => {
 		assert.doesNotMatch(note, /come back/);
 		assert.equal(t.injected.length, 1);
 		assert.match(t.injected[0], /2 lines/);
+		assert.match(t.injected[0], /<MEETING_TRANSCRIPT_START>\nfirst point\nsecond point\n<MEETING_TRANSCRIPT_END>$/, 'the agent gets what was said');
 	});
 
 	it('keeps the words spoken before the exit phrase in the same segment', async () => {
@@ -256,5 +257,17 @@ describe('meeting entry gate', () => {
 		await tick(20);
 		assert.equal(fired, 0);
 		assert.equal(g.pending, false);
+	});
+});
+
+describe('meeting transcript carried back to the agent', () => {
+	it('keeps a long meeting\'s end and says where the rest is', async () => {
+		const { meetingEndedContext } = await import('../src/meeting-dictation.js');
+		const long = Array.from({ length: 2000 }, (_, i) => `line ${i} ${'x'.repeat(30)}`);
+		const ctx = meetingEndedContext('/n.md', long);
+		assert.match(ctx, /only the end of the meeting/);
+		assert.ok(ctx.includes('line 1999 '));
+		assert.ok(!ctx.includes('line 0 '));
+		assert.match(ctx, /<MEETING_TRANSCRIPT_START>\nline \d+ x/, 'starts on a whole line');
 	});
 });
