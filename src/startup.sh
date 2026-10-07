@@ -526,6 +526,17 @@ if [ "$BUNDLED_MODE" != "1" ] && [ ! -d node_modules ]; then
   fi
 fi
 
+# A pull can move the voice runtime pin past what node_modules holds; the old one lacks the API now called.
+if [ "$BUNDLED_MODE" != "1" ] && [ -d node_modules ] && command -v npm > /dev/null 2>&1 \
+  && ! npm ls bodhi-realtime-agent > /dev/null 2>&1; then
+  if npm install 2>/dev/null; then
+    echo "  ✓ Dependencies reinstalled (bodhi-realtime-agent did not match package.json)"
+  else
+    echo "  ✗ bodhi-realtime-agent does not match package.json and npm install failed — run: npm install"
+    exit 1
+  fi
+fi
+
 # Check CLI prerequisites. node/npx/python3, the selected core runtime, and
 # fswatch are checked here because they are not needed for init.sh bootstrap.
 # Bundled mode: node is $SUTANDO_NODE (its dir already heads PATH) and npx is
@@ -563,11 +574,13 @@ if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1
 
 # Check macOS permissions (can't grant programmatically, just warn)
 # Prevent display sleep (important for always-on Mac Mini — Zoom/summon fails on lock screen)
-if ! pgrep -q caffeinate; then
+# Only a caffeinate holding -s keeps a lid-closed Mac on AC awake; short-lived `-i -t N` ones must not count.
+SLEEP_GUARD_PATTERN='(^|/)caffeinate( [^ ]+)* -[a-zA-Z]*s( |$)'
+if ! pgrep -qf "$SLEEP_GUARD_PATTERN"; then
   caffeinate -d -i -s &
-  echo "  ✓ caffeinate started (prevents display sleep)"
+  echo "  ✓ caffeinate started (prevents display and system sleep on AC)"
 else
-  echo "  ✓ caffeinate already running"
+  echo "  ✓ caffeinate -s already running"
 fi
 
 echo "Checking permissions..."
@@ -692,20 +705,16 @@ fi
 # Core heartbeat — per-host alive signal under state/cores/<hostname>.alive.
 # Foundation for multi-core / cross-machine "who's running?" checks. Single
 # instance per host; gracefully cleans up its .alive file on SIGTERM.
-if ! pgrep -f "src/core_heartbeat.py" > /dev/null 2>&1; then
-  echo "  Starting core heartbeat..."
-  # The ✓ must live INSIDE the guard. `[ -n "$PY" ] && cmd &` followed by an
-  # unconditional echo claims a start that never happened when no interpreter
-  # resolved — and this one is the per-host liveness signal, so a false ✓ makes
-  # the node look alive with nothing writing .alive.
-  if [ -n "$PY" ]; then
-    "$PY" "$REPO/src/core_heartbeat.py" > /tmp/core-heartbeat.log 2>&1 &
-    echo "  ✓ core heartbeat"
+# --ensure is anchored to THIS checkout: a bare `pgrep -f src/core_heartbeat.py` matched another
+# checkout's writer on a multi-lane host and skipped starting ours.
+if [ -n "$PY" ]; then
+  if _hb_out="$("$PY" "$REPO/src/core_heartbeat.py" --ensure 2>&1)"; then
+    echo "  ✓ ${_hb_out#core_heartbeat: }"
   else
-    echo "  ⊘ core heartbeat skipped — no runnable python3"
+    echo "  ✗ core heartbeat --ensure failed: $_hb_out"
   fi
 else
-  echo "  ✓ core heartbeat (already running)"
+  echo "  ⊘ core heartbeat skipped — no runnable python3"
 fi
 
 # Services-status emitter — aggregates sidecar liveness into

@@ -31,8 +31,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tests" / "_helpers"))
 
 import watcher_identity as wid  # noqa: E402
+from process_group import STABLE_WATCHER_BODY, popen_in_own_group, own_group  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("hc", ROOT / "src" / "health-check.py")
 hc = importlib.util.module_from_spec(_spec)
@@ -168,8 +170,8 @@ class TestAgainstRealProcesses(unittest.TestCase):
     """Positive control for the instrument: a real ps and a real argv read."""
 
     def _spawn(self, argv):
-        p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.addCleanup(lambda: (p.kill(), p.wait()))
+        p = popen_in_own_group(argv)
+        own_group(self, p.pid, reap=p.wait)
         for _ in range(50):
             if wid.proc_argv_vector(p.pid) is not None:
                 break
@@ -180,7 +182,7 @@ class TestAgainstRealProcesses(unittest.TestCase):
         self._t = tempfile.TemporaryDirectory()
         self.addCleanup(self._t.cleanup)
         self.tmp = Path(self._t.name)
-        (self.tmp / "watch-tasks-stream.sh").write_text("#!/bin/sh\nsleep 30\n")
+        (self.tmp / "watch-tasks-stream.sh").write_text(STABLE_WATCHER_BODY)
         (self.tmp / "observer.py").write_text("import time; time.sleep(30)\n")
         self.inbox = str(self.tmp / "deliveries" / ("d" * 32))
 

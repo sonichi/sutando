@@ -1,5 +1,10 @@
 # room-ops — an agent's room-participation capability collection
 
+For an all-room analysis sweep, use the tested window collector and coverage
+contract in [history-workflow.md](history-workflow.md). Archive-derived room IDs
+and fixed recent limits cannot establish all-room coverage. Fallback text posts
+support `--strict say ROOM --body-file FILE` and require receipt inspection.
+
 > **DEPRECATED — room ops (`POST <gateway>/v1/room`) is being removed.** Use the
 > **AG2 Space MCP** room Actions instead. `room_ops.py` is kept only as a
 > **fallback for when the MCP is unreachable** (or for the gaps listed below) —

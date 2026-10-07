@@ -31,6 +31,7 @@ idle / wedged":
     needs_login             →   logged-out        (unless an ACTIVE gate shows, below)
     working                 →   running
     idle                    →   idle-ready
+    blocked (queue held)    →   blocked-known     (never hung: a restart is not the remedy)
     unknown (status stale)  →   hung              (only when the process probe SAW a session)
     unknown (unobserved)    →   unobserved        (probe could not run: hold, never RECOVER)
     (any, + gateway down)   →   gateway-down       (gateway probe is bundled-specific)
@@ -68,6 +69,8 @@ _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
 from worker_auth_state import authenticated_turn, login_expired  # noqa: E402
 import cli_wedge  # noqa: E402
+import core_gate_notice  # noqa: E402
+import self_opened_gate  # noqa: E402
 
 import argparse
 import hashlib
@@ -140,11 +143,15 @@ _BORDER_LINE = BORDER_LINE
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
 _REFUSAL = re.compile(
     r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
-    r"|Please run /login|OAuth access token has expired"
-    # "not logged in" is three common words: only the CLI's own line-start form, or
-    # the phrase beside a /login token, is a refusal; a tool result quoting it is not.
-    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b|not logged in\b.{0,60}/login\b|/login\b.{0,60}not logged in\b",
-    re.I)
+    # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
+    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b", re.I)
+
+
+def _refusal_line(line: str) -> bool:
+    """A limit refusal, or the CLI's needs-login line (cli_wedge's one grammar)."""
+    return bool(_REFUSAL.search(line)) or cli_wedge.needs_login_line(line)
+
+
 # The completed-turn line: "✻ Worked for 0s" / "✻ Cooked for 1s · done 12:32 PM". The spinner
 # reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
 _TURN_DONE = re.compile(
@@ -273,7 +280,7 @@ def _composer_text(pane: str) -> "str | None":
 def refused_turn(pane: str):
     """(kind, line) when the pane sits at the idle footer and the turn that ended there —
     the last completed one, with nothing newer below it — was refused: a short turn (≤1s
-    or no duration) whose only content is a `⎿` result carrying a _REFUSAL line. Else
+    or no duration) whose only content is a `⎿` result carrying a _refusal_line. Else
     None — a long turn that merely mentions the words, a turn that ran (any `●`/`⏺`
     line, so a tool result that quoted a refusal stays the tool's), a completion with a
     newer prompt or active turn below it, or a pane not at the footer all stay as they were."""
@@ -302,7 +309,7 @@ def refused_turn(pane: str):
     for core in turn:
         if core.startswith("⎿"):
             in_result = True
-        if in_result and _REFUSAL.search(core):
+        if in_result and _refusal_line(core):
             return "turn-rejected", core.lstrip("⎿").strip()
     return None
 
@@ -313,6 +320,8 @@ _BASE_TO_STATE = {
     "needs_login": ("logged-out", "core not authenticated (needs /login)"),
     "idle": ("idle-ready", "ready for a task"),
     "working": ("running", "actively processing"),
+    # Queued tasks held by the pane (a draft, an abnormal frame): visible, never a restart.
+    "blocked": ("blocked-known", "tasks queued but held by the pane (composer text or abnormal frame)"),
     # "unknown" = runtime-health saw a live session but a stale/absent core-status
     # ("running" that never advanced) → wedged. That IS the supervisor's `hung`.
     "unknown": ("hung", "core alive but stalled (status stale, no recognized prompt)"),
@@ -512,6 +521,28 @@ def answer_step(state, kind, prompt, answered_prompt, enabled=True):
     return auto_answer(kind)
 
 
+def gate_clock(clock, state, prompt, now):
+    """(first_seen, prompt_since, prompt) for the gate on screen: when it appeared, and
+    since when it has been unchanged. Any other state resets it; a changed prompt (a
+    caret moved, a dialog replaced) restarts only the second clock."""
+    if state not in ("blocked-human", "blocked-known"):
+        return (None, None, None)
+    first, since, last = clock
+    if first is None:
+        return (now, now, prompt)
+    return (first, since if prompt == last else now, prompt)
+
+
+def dismiss_step(state_dir, session, state, kind, prompt, clock, now, enabled=True):
+    """The key to dismiss a picker Sutando opened itself (self_opened_gate), or None.
+    No attribution record, no key: a picker a human opened is never touched."""
+    if not enabled:
+        return None
+    return self_opened_gate.dismiss_key(
+        self_opened_gate.load(state_dir, session), session=session, state=state, kind=kind,
+        prompt=prompt, gate_first_seen=clock[0], prompt_since=clock[1], now=now)
+
+
 #: How long a completed auto-answer stays in the signal file, so a relay that
 #: polls slower than the monitor still sees it exactly once.
 AUTO_ANSWER_CARRY_S = 120.0
@@ -578,7 +609,7 @@ def _name_seat(req, session, seat):
     return req
 
 
-def escalate(manager, state, detail, kind, prompt, session, seat=None):
+def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0):
     """Raise ONE requirement per episode. The Manager dedups on
     (runtime, kind, device) + guard, so the prompt IS the episode key: the same
     prompt returns the same record, a different one mints a new card.
@@ -591,6 +622,8 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None):
         from hitl import tui_gate
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
                                        escalation_message(state, detail, kind, prompt))
+        if queued:
+            req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
         if seat:
             req = _name_seat(req, session, seat)
         return manager.create(req)
@@ -706,6 +739,15 @@ def drive_escalations(manager, session, prompt, state, send):
     return acted
 
 
+def notice_queued(manager, req, workspace, state, kind):
+    """Tell each queued task why it is on hold (core_gate_notice); never fatal to the monitor."""
+    try:
+        return core_gate_notice.notice_queued(manager, req, workspace, state, kind)
+    except Exception as exc:  # noqa: BLE001
+        print(f"queued-task notice failed: {exc}", file=_sys.stderr)
+        return []
+
+
 def _atomic_write(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -758,6 +800,9 @@ def main():
     last_answered = None
     idle_ticks = 0
     prev_pane = None
+    clock = (None, None, None)
+    state_dir = os.path.dirname(os.path.abspath(a.out))
+    workspace = _Path(os.path.dirname(state_dir))
     while True:
         pane = capture(a.socket, a.session)
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
@@ -766,6 +811,7 @@ def main():
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
             process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane)
         prev_pane = pane
+        clock = gate_clock(clock, state, prompt, time.time())
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
@@ -787,6 +833,10 @@ def main():
         if key and send_keys(a.socket, a.session, key):
             answered_prompt = prompt
             last_answered = {"kind": kind, "key": key, "at": time.time()}
+        dkey = dismiss_step(state_dir, a.session, state, kind, prompt, clock, time.time(), a.auto_answer)
+        if dkey and send_keys(a.socket, a.session, dkey):
+            self_opened_gate.clear(state_dir, a.session)
+            last_answered = {"kind": kind, "key": dkey, "at": time.time(), "self_opened": True}
         if last_answered and time.time() - last_answered["at"] > AUTO_ANSWER_CARRY_S:
             last_answered = None
 
@@ -808,9 +858,15 @@ def main():
             if verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,
                                   lambda k: send_keys(a.socket, a.session, k))
-                escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None)
+                # Only the core's own seat owns tasks/; a worker's queue lives elsewhere.
+                queued = 0 if a.seat else core_gate_notice.queued_count(workspace)
+                req = escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None, queued=queued)
+                if not a.seat:
+                    notice_queued(hitl, req, workspace, state, kind)
             elif verdict == "resolve":
                 resolve_escalations(hitl, a.session, pane)
+                if not a.seat:
+                    core_gate_notice.end_outage(workspace)
         if a.once:
             return
         time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)

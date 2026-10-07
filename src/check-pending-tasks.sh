@@ -24,6 +24,11 @@
 # looped forever. The earlier rule read identity from the cwd's git repo instead,
 # which cannot tell a guest in the checkout from the core in the checkout.
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# An explicit non-core session owns no inbox unless enrolled as a pool worker.
+if [ "${SUTANDO_CORE_SESSION:-}" = "0" ] && [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
+  echo '{}'
+  exit 0
+fi
 UNIDENTIFIED=""
 if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "${SUTANDO_CORE_SESSION:-}" != "1" ]; then
   UNIDENTIFIED=1

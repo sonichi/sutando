@@ -910,6 +910,56 @@ class EndToEndThroughTheRealScript(unittest.TestCase):
         self.assertEqual((out.status, out.code), ("pending", 5), out.message)
 
 
+# Codex rejects /startup and leaves it in the composer above an idle footer.
+REJECTED_STARTUP = ("■ Unrecognized command '/startup'. Type \"/\" for a list of supported commands.\n\n"
+                    f"\x1b[1m»\x1b[0m /startup\n\n{CODEX_157_FOOTER}\n")
+
+
+class AutomationLeftoverIsExactlyAutomationText(unittest.TestCase):
+    """Only a composer holding exactly text automation types may be cleared; anything else is a draft."""
+
+    def test_a_rejected_startup_is_a_leftover_and_blocks_codex_dispatch(self):
+        v = pg.classify_pane(REJECTED_STARTUP, pg.CODEX)
+        self.assertEqual((v.state, v.pending), ("pending", "/startup"))
+        self.assertEqual(pg.automation_leftover(REJECTED_STARTUP, pg.CODEX), "/startup")
+        self.assertTrue(pg.blocks_dispatch(v, pg.CODEX))
+
+    def test_every_other_composer_is_left_alone(self):
+        cases = {
+            "longer draft": REJECTED_STARTUP.replace("m /startup\n", "m /startup now\n"),
+            "other command": REJECTED_STARTUP.replace("m /startup\n", "m /status\n"),
+            "multi-line draft": REJECTED_STARTUP.replace("m /startup\n", "m /startup\n  and the rest\n"),
+            "frame off screen": "\x1b[1m»\x1b[0m /startup\n",
+            "empty composer": CODEX_157_IDLE,
+            "plain draft": f"\x1b[1m»\x1b[0m half typed\n{CODEX_157_FOOTER}\n",
+        }
+        for name, capture in cases.items():
+            with self.subTest(name):
+                self.assertIsNone(pg.automation_leftover(capture, pg.CODEX))
+        self.assertNotEqual(cases["longer draft"], REJECTED_STARTUP)
+        self.assertNotEqual(cases["multi-line draft"], REJECTED_STARTUP)
+
+    def test_claude_has_no_leftovers_and_its_drafts_do_not_block(self):
+        capture = f"❯ /startup\n{FOOTER}\n"
+        v = pg.classify_pane(capture, pg.CLAUDE)
+        self.assertEqual(v.state, "pending")
+        self.assertIsNone(pg.automation_leftover(capture, pg.CLAUDE))
+        self.assertFalse(pg.blocks_dispatch(v, pg.CLAUDE))
+
+    def test_abnormal_blocks_dispatch_on_every_runtime(self):
+        for adapter in (pg.CLAUDE, pg.CODEX):
+            self.assertTrue(pg.blocks_dispatch(pg.Verdict("abnormal", "provider-limit"), adapter))
+            self.assertFalse(pg.blocks_dispatch(pg.Verdict("idle-ready", "idle"), adapter))
+
+    def test_cli_exits_zero_only_for_a_leftover(self):
+        argv = [sys.executable, str(REPO / "src" / "delivery" / "pane_gate.py"), "leftover", "--runtime", "codex"]
+        hit = subprocess.run(argv, input=REJECTED_STARTUP, capture_output=True, text=True)
+        self.assertEqual((hit.returncode, hit.stdout), (0, "/startup\n"))
+        miss = subprocess.run(argv, input=f"\x1b[1m»\x1b[0m half typed\n{CODEX_157_FOOTER}\n",
+                              capture_output=True, text=True)
+        self.assertEqual((miss.returncode, miss.stdout), (1, ""))
+
+
 class Cli(unittest.TestCase):
     def _cli(self, args, stdin):
         return subprocess.run([sys.executable, str(REPO / "src" / "delivery" / "pane_gate.py"), *args],
@@ -976,6 +1026,12 @@ class CliInProcess(unittest.TestCase):
         self.assertEqual(self._main(["classify", "--runtime", "codex"], CODEX_DIM_IDLE), (0, "idle-ready\n", ""))
         self.assertEqual(self._main(["classify", "--runtime", "codex"], ""), (0, "unknown\n", ""))
         self.assertEqual(self._main(["classify", "--runtime", "claude"], f"❯ x\n{FOOTER}\n"), (0, "pending\n", ""))
+
+    def test_leftover_prints_only_an_automation_leftover(self):
+        self.assertEqual(self._main(["leftover", "--runtime", "codex"], REJECTED_STARTUP), (0, "/startup\n", ""))
+        self.assertEqual(self._main(["leftover", "--runtime", "codex"],
+                                    f"\x1b[1m»\x1b[0m half typed\n{CODEX_157_FOOTER}\n"), (1, "", ""))
+        self.assertEqual(self._main(["leftover", "--runtime", "claude"], f"❯ /startup\n{FOOTER}\n"), (1, "", ""))
 
     def test_classify_json_is_the_verdict_dict(self):
         rc, out, err = self._main(["classify", "--runtime", "codex", "--json"], "◦ Working (esc to interrupt)\n")

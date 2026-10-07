@@ -85,7 +85,7 @@ describe('forwardVoiceResultToRoom — a room-bound result reaches its room, and
 
 	it('claims the filename in the delivered set at once — the proactive-* fallthrough passes it, so the claim is what stops a second narration', () => {
 		const file = forwardVoiceResultToRoom('task-1700000000001', 'done', '!abc123:ag2.space', 1_800_000_001);
-		assert.equal(_shouldFallthrough(file), true, 'the drain would otherwise speak this file on its next tick');
+		assert.equal(_shouldFallthrough(file), false, 'a .to-<bridge> file is that bridge\'s to claim; voice never speaks or archives it');
 		assert.equal(_shouldRegisterTaskRow(file), false, 'and it is not a task row either way');
 		assert.equal(_isDeliveredResult(file), true);
 		assert.equal(_isDeliveredResult('proactive-result-task-1700000000001-1800000002.to-ag2space.txt'), false, 'only the file actually written');
@@ -105,7 +105,7 @@ describe('forwardVoiceResultToRoom — a room-bound result reaches its room, and
 		].join('\n')], { cwd: process.cwd(), encoding: 'utf-8' });
 		assert.equal(py.status, 0, py.stderr);
 		assert.equal(py.stdout.trim(), 'ag2space False True True False');
-		assert.equal(_shouldFallthrough(file), true, 'voice still recognises the tagged name for its own dedupe');
+		assert.equal(_shouldFallthrough(file), false, 'a .to-<bridge> file is that bridge\'s to claim; voice never speaks or archives it');
 	});
 
 	it('a result that opens with its own [channel:] redirect keeps it: the docked room is not put in front', () => {
@@ -171,7 +171,7 @@ describe('keepVoiceResultToDm — a [dm-only] result of a room-bound task goes t
 		assert.equal(body, '[dm-only]\nThe mute bug is in the SDK.');
 		assert.ok(!body.includes('[channel:'), 'nothing for _proactive_route to redirect: the owner room is the default');
 		assert.equal(_isDeliveredResult(file), true, 'claimed so the next drain tick never speaks it again');
-		assert.equal(_shouldFallthrough(file), true, 'it would otherwise be spoken: the claim is the only thing stopping that');
+		assert.equal(_shouldFallthrough(file), false, 'a .to-<bridge> file is that bridge\'s to claim; voice never speaks or archives it');
 		const py = spawnSync('python3', ['-c', [
 			'import sys; sys.path.insert(0, "src")',
 			'from proactive_routing import proactive_destination',

@@ -20,6 +20,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 import health_snapshot as hs  # noqa: E402
+import runtime_observation as ro  # noqa: E402
 
 NOW = 1_790_000_000.0
 HOST = "test-host"
@@ -429,7 +430,8 @@ class Views(Base):
     def test_full_lists_every_source_with_workspace_relative_paths(self):
         self.ws.supervisor("idle-ready", age=12)
         core = self.core(view="full")
-        self.assertEqual(set(core["sources"]), {"supervisor", "cli_wedge", "heartbeat", "activity", "self_report"})
+        self.assertEqual(set(core["sources"]), {"supervisor", "observation", "cli_wedge", "heartbeat",
+                                           "activity", "self_report"})
         self.assertEqual(core["sources"]["supervisor"]["path"], "state/core-supervisor.json")
         self.assertEqual(core["sources"]["supervisor"]["age_s"], 12.0)
         self.assertNotIn(str(self.ws.root), json.dumps(core))
@@ -439,12 +441,318 @@ class Views(Base):
             self.snap(view="everything")
 
 
+class InstanceSessionSuspended(Base):
+    ME = "@mark-desktop.agent:ag2.space"
+
+    def lane(self, name="gateway-status.json", agent_id=ME, connected=True, age=5.0, last_ok=True):
+        self.ws.json(f"state/{name}", {"connected": connected, "ts": NOW - age,
+                                       "last_ok_ts": NOW - age if last_ok else None, "agent_id": agent_id})
+
+    def test_instance_is_the_identity_the_serving_lane_signed_in_as(self):
+        self.lane()
+        self.assertEqual(self.snap()["instance"], self.ME)
+
+    def test_a_parked_or_stale_lane_does_not_name_the_instance(self):
+        self.lane()
+        self.lane("gateway-status.dev.json", agent_id="@old:dev.ag2.space", age=600)
+        self.lane("gateway-status.local.json", agent_id="@down:ag2.space", connected=False)
+        self.assertEqual(self.snap()["instance"], self.ME)
+
+    def test_no_serving_lane_or_no_identity_is_null(self):
+        self.assertIsNone(self.snap()["instance"])
+        self.lane(last_ok=False)
+        self.assertIsNone(self.snap()["instance"])
+        self.lane(agent_id=None)
+        self.assertIsNone(self.snap()["instance"])
+
+    def test_two_serving_lanes_that_disagree_name_no_instance(self):
+        self.lane()
+        self.lane("gateway-status.dev.json", agent_id="@mark-dev:dev.ag2.space")
+        self.assertIsNone(self.snap()["instance"])
+
+    def test_core_session_comes_from_its_beat_then_its_supervisor(self):
+        self.assertIsNone(self.core()["session"])
+        self.ws.supervisor("idle-ready", session="sutando-core")
+        self.assertEqual(self.core()["session"], "sutando-core")
+        self.ws.json(f"state/cores/{HOST}.alive", {"session": "sutando-core-2"})
+        self.assertEqual(self.core()["session"], "sutando-core-2")
+
+    def test_worker_session_comes_from_its_seat_file_or_is_null(self):
+        self.ws.worker()
+        worker = lambda: next(a for a in self.snap()["agents"] if a["id"] == WID)  # noqa: E731
+        self.assertIsNone(worker()["session"])
+        self.ws.supervisor("idle-ready", session=f"sutando-worker-{WID}",
+                           name=f"core-supervisor.sutando-worker-{WID}.json")
+        self.assertEqual(worker()["session"], f"sutando-worker-{WID}")
+
+    def test_a_worker_the_suspension_took_down_is_not_alive_whatever_its_files_say(self):
+        self.ws.worker()
+        self.ws.touch(f"state/watchers/{WID}.alive", age=5)
+        self.ws.supervisor("idle-ready", session=f"sutando-worker-{WID}",
+                           name=f"core-supervisor.sutando-worker-{WID}.json", age=10)
+        self.assertEqual(self.snap(agent="workers")["agents"][0]["condition"], "healthy")
+        self.ws.json("state/pool-suspended", {"reason": "app-quit", "at": NOW - 3, "stopped": [WID]})
+        w = self.snap(agent="workers")["agents"][0]
+        self.assertEqual((w["alive"], w["motion"], w["condition"], w["reason"], w["since"]),
+                         (False, "unknown", "unknown", "suspended", NOW - 3))
+        self.ws.json("state/pool-suspended", {"reason": "app-quit", "at": NOW - 3, "stopped": []})
+        self.assertEqual(self.snap(agent="workers")["agents"][0]["condition"], "healthy")
+
+    def test_suspended_reads_the_pool_marker(self):
+        self.assertIsNone(self.snap()["suspended"])
+        self.ws.json("state/pool-suspended", {"reason": "app-quit", "at": 5, "stopped": [WID]})
+        self.assertEqual(self.snap()["suspended"], {"reason": "app-quit", "at": 5})
+        (self.ws.root / "state" / "pool-suspended").write_text("app-quit 5\n")
+        self.assertEqual(self.snap()["suspended"], {"reason": "app-quit 5", "at": None})
+        (self.ws.root / "state" / "pool-suspended").write_text("")
+        self.assertEqual(self.snap()["suspended"], {"reason": "suspended", "at": None})
+
+
 def _load_agent_api():
     spec = importlib.util.spec_from_file_location("agent_api_health", REPO / "src" / "agent-api.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+SESSION = f"sutando-worker-{WID}"
+
+
+class Observation(Base):
+    def obs(self, seat="core", session="sutando-core", **over):
+        rec = {"schema": 1, "observer": "obs", "observer_version": "0.3.0", "observer_id": "a" * 16,
+               "observer_started_at": NOW - 600, "seat": seat, "session": session, "claude_session_id": None,
+               "seq": 4, "changed_at": NOW - 10, "condition_since": None, "last_success_at": None,
+               "heartbeat_at": NOW - 3, "phase": "idle", "motion": "idle", "condition": "healthy", "reason": None}
+        self.assertTrue(ro.write({**rec, **over}, self.ws.root))
+
+    def worker_seat(self, state="idle-ready", age=0.0):
+        self.ws.worker()
+        self.ws.supervisor(state, session=SESSION, name=f"core-supervisor.{SESSION}.json", age=age)
+
+    def worker(self, **kw):
+        return self.snap(agent=WID, **kw)["agents"][0]
+
+    def wedge(self, abnormal, patterns=(), static=True, last_age=0.0):
+        rows = [{"ts": NOW - a, "state": "s" if static else f"s{i}", "raw_state": "r" if static else f"r{i}",
+                 "patterns": list(patterns), "abnormal": list(abnormal)}
+                for i, a in enumerate((last_age + 120, last_age + 60, last_age))]
+        self.ws.lines("state/cli-wedge/window.jsonl", rows)
+
+    def test_no_file_changes_no_verdict(self):
+        self.ws.supervisor("logged-out", age=40)
+        self.wedge(["quota-limit"])
+        self.worker_seat("hung", age=30)
+        out = self.snap(view="full")
+        for agent in out["agents"]:
+            self.assertEqual(agent["sources"]["observation"],
+                             {"path": f"state/runtime-observations/{agent['id'] if agent['id'] == 'core' else WID}.json",
+                              "age_s": None, "value": None, "opinion": None})
+            bare = {k: v for k, v in agent["sources"].items() if k != "observation"}
+            base = {k: v for k, v in agent.items() if k not in ("sources", "motion", "condition", "reason", "since")}
+            summary = {k: v for k, v in agent.items() if k != "sources"}
+            self.assertEqual(hs._verdict(base, bare), summary)
+        core = out["agents"][0]
+        self.assertEqual((core["condition"], core["reason"], core["since"]), ("abnormal", "needs-login", NOW - 40))
+        self.assertEqual(self.worker()["reason"], "hung")
+
+    def test_valid_healthy_idle(self):
+        self.obs(last_success_at=NOW - 20)
+        c = self.core(view="full")
+        self.assertEqual((c["motion"], c["condition"], c["reason"]), ("idle", "healthy", None))
+        self.assertEqual(c["sources"]["observation"]["value"], {
+            "phase": "idle", "observer": "obs", "observer_version": "0.3.0", "seq": 4,
+            "heartbeat_age_s": 3.0, "last_success_age_s": 20.0})
+        self.assertEqual(c["sources"]["observation"]["age_s"], 3.0)
+
+    def test_valid_abnormal_needs_login_names_reason_since_condition_since(self):
+        self.obs(condition="abnormal", reason="needs-login", phase="failed", condition_since=NOW - 50)
+        c = self.core()
+        self.assertEqual((c["motion"], c["condition"], c["reason"], c["since"]),
+                         ("idle", "abnormal", "needs-login", NOW - 50))
+
+    def test_unknown_motion_and_condition_give_no_opinion_fields(self):
+        self.obs(motion="unknown", condition="unknown", phase="unknown")
+        self.assertEqual(self.core()["condition"], "unknown")
+
+    def test_expired_lease_is_ignored(self):
+        self.obs(condition="abnormal", reason="needs-login", condition_since=NOW - 50,
+                 heartbeat_at=NOW - ro.LEASE_S - 1)
+        c = self.core(view="full")
+        self.assertEqual(c["condition"], "unknown")
+        self.assertIsNone(c["sources"]["observation"]["opinion"])
+
+    def test_future_dated_record_is_ignored(self):
+        self.obs(condition="abnormal", reason="needs-login", heartbeat_at=NOW + 30)
+        self.assertEqual(self.core()["condition"], "unknown")
+
+    def test_a_record_from_another_session_is_ignored_when_the_session_is_known(self):
+        self.ws.supervisor("idle-ready", session="sutando-core")
+        self.obs(session="other-core", condition="abnormal", reason="needs-login")
+        self.assertEqual(self.core()["condition"], "healthy")
+        self.obs(session="sutando-core", condition="abnormal", reason="needs-login", seq=5,
+                 heartbeat_at=NOW - 2)
+        self.assertEqual(self.core()["reason"], "needs-login")
+
+    def test_unknown_session_does_not_reject_a_record(self):
+        self.obs(session="anything", condition="abnormal", reason="quota-limit")
+        self.assertEqual(self.core()["reason"], "quota-limit")
+
+    def test_worker_record_from_a_previous_incarnation_is_ignored(self):
+        self.worker_seat()
+        started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - 60))
+        self.ws.json(f"state/workers/{WID}/current.json", {"incarnation_id": "b"})
+        self.ws.json(f"state/workers/{WID}/incarnations.json",
+                     {"incarnations": [{"incarnation_id": "b", "started_at": started}]})
+        self.obs(WID, SESSION, observer_started_at=NOW - 300, condition="abnormal", reason="needs-login",
+                 condition_since=NOW - 100)
+        w = self.worker(view="full")
+        self.assertEqual(w["condition"], "healthy")
+        self.assertEqual(w["sources"]["observation"]["value"], {"previous_run": True})
+        self.obs(WID, SESSION, observer_started_at=NOW - 30, observer_id="b" * 16, seq=1,
+                 condition="abnormal", reason="needs-login", condition_since=NOW - 20)
+        self.assertEqual(self.worker()["reason"], "needs-login")
+
+    def test_worker_observation_without_known_incarnation_still_counts(self):
+        self.worker_seat()
+        self.obs(WID, SESSION, condition="abnormal", reason="permission", condition_since=NOW - 9)
+        w = self.worker()
+        self.assertEqual((w["reason"], w["since"]), ("permission", NOW - 9))
+
+    def test_supervisor_logged_out_older_than_last_success_reads_healthy(self):
+        self.ws.supervisor("logged-out", age=40)
+        self.obs(last_success_at=NOW - 10)
+        c = self.core(view="full")
+        self.assertEqual((c["condition"], c["reason"]), ("healthy", None))
+        self.assertEqual(c["sources"]["supervisor"]["value"]["superseded_by"], "observation")
+        self.assertIsNone(c["sources"]["supervisor"]["opinion"])
+
+    def test_supervisor_logged_out_newer_than_last_success_stays_abnormal(self):
+        self.ws.supervisor("logged-out", age=5)
+        self.obs(last_success_at=NOW - 10)
+        c = self.core(view="full")
+        self.assertEqual((c["condition"], c["reason"]), ("abnormal", "needs-login"))
+        self.assertNotIn("superseded_by", c["sources"]["supervisor"]["value"])
+
+    def test_no_last_success_supersedes_nothing(self):
+        self.ws.supervisor("logged-out", age=40)
+        self.obs()
+        self.assertEqual(self.core()["reason"], "needs-login")
+
+    def test_supervisor_crashed_with_a_healthy_observation_is_still_crashed(self):
+        self.ws.supervisor("crashed", age=40)
+        self.obs(last_success_at=NOW - 10)
+        c = self.core()
+        self.assertEqual((c["alive"], c["condition"], c["reason"]), (False, "abnormal", "crashed"))
+
+    def test_hung_gateway_down_and_blocked_human_are_not_superseded(self):
+        self.obs(last_success_at=NOW - 10)
+        for state in ("hung", "gateway-down"):
+            self.ws.supervisor(state, age=40)
+            self.assertEqual(self.core()["reason"], state)
+        self.ws.supervisor("blocked-human", kind="permission", age=40)
+        self.assertEqual(self.core()["reason"], "permission")
+
+    def test_cli_wedge_quota_limit_is_superseded(self):
+        self.wedge(["quota-limit"])
+        self.obs(last_success_at=NOW - 1)
+        c = self.core(view="full")
+        self.assertEqual((c["condition"], c["reason"]), ("healthy", None))
+        self.assertEqual(c["sources"]["cli_wedge"]["value"]["superseded_by"], "observation")
+
+    def test_cli_wedge_quota_limit_newer_than_success_stands(self):
+        self.wedge(["quota-limit"])
+        self.obs(last_success_at=NOW - 3600)
+        self.assertEqual(self.core()["reason"], "quota-limit")
+
+    def retry_loop(self):
+        self.wedge([], patterns=["retrying"], static=False)
+
+    def test_retry_loop_with_an_idle_observation_is_superseded(self):
+        self.retry_loop()
+        self.obs(phase="idle")
+        c = self.core(view="full")
+        self.assertEqual((c["condition"], c["reason"]), ("healthy", None))
+        self.assertEqual(c["sources"]["cli_wedge"]["value"]["superseded_by"], "observation")
+        self.assertIsNone(c["sources"]["cli_wedge"]["opinion"])
+
+    def test_retry_loop_with_a_waiting_or_failed_observation_is_superseded(self):
+        self.retry_loop()
+        for seq, (phase, reason) in enumerate((("waiting", "permission"), ("failed", "api-error")), 10):
+            self.obs(phase=phase, seq=seq, condition="abnormal", reason=reason, condition_since=NOW - 5)
+            c = self.core(view="full")
+            self.assertEqual((c["condition"], c["reason"]), ("abnormal", reason), phase)
+            self.assertEqual(c["sources"]["cli_wedge"]["value"]["superseded_by"], "observation", phase)
+
+    def test_retry_loop_with_a_request_in_flight_and_no_newer_success_stands(self):
+        self.retry_loop()
+        self.obs(phase="requesting", motion="moving", last_success_at=NOW - 3600)
+        self.assertEqual(self.core()["reason"], "retry-loop")
+
+    def test_a_newer_success_does_not_drop_a_retry_loop_in_flight(self):
+        self.retry_loop()
+        self.obs(phase="requesting", motion="moving", last_success_at=NOW - 1)
+        c = self.core(view="full")
+        self.assertEqual(c["reason"], "retry-loop")
+        self.assertNotIn("superseded_by", c["sources"]["cli_wedge"]["value"])
+
+    def test_retry_loop_with_no_observation_stands(self):
+        self.retry_loop()
+        self.assertEqual(self.core()["reason"], "retry-loop")
+
+    def test_retry_loop_while_compacting_or_in_a_tool_stands(self):
+        self.retry_loop()
+        for seq, phase in enumerate(("compacting", "tool", "unknown"), 10):
+            self.obs(phase=phase, motion="moving", seq=seq)
+            self.assertEqual(self.core()["reason"], "retry-loop", phase)
+
+    def test_retry_loop_with_an_expired_observation_stands(self):
+        self.retry_loop()
+        self.obs(phase="idle", heartbeat_at=NOW - ro.LEASE_S - 1)
+        self.assertEqual(self.core()["reason"], "retry-loop")
+
+    def test_an_idle_observation_does_not_drop_other_pane_reasons(self):
+        self.wedge(["quota-limit"])
+        self.obs(phase="idle")
+        self.assertEqual(self.core()["reason"], "quota-limit")
+
+    def test_a_claim_with_no_time_is_never_superseded_by_a_success(self):
+        claim = {"path": "x", "age_s": None, "value": {"kind": "provider-limit"},
+                 "opinion": hs._opinion("idle", hs.ABNORMAL, "quota-limit", None)}
+        out = hs._supersede({"cli_wedge": claim}, {"last_success_at": NOW - 1}, NOW)
+        self.assertEqual(out["cli_wedge"], claim)
+
+    def test_worker_pool_and_roster_states_are_not_superseded(self):
+        self.worker_seat()
+        self.ws.json("state/pool-supervision.json", {"last_sample_at": NOW - 60, "workers": {
+            WID: {"wedge_escalated": True, "wedge_first_detected_at": NOW - 400}}})
+        self.obs(WID, SESSION, last_success_at=NOW - 1)
+        self.assertEqual(self.worker()["reason"], "wedged")
+
+    def test_worker_supervisor_login_claim_is_superseded(self):
+        self.worker_seat("logged-out", age=40)
+        self.obs(WID, SESSION, last_success_at=NOW - 10)
+        self.assertEqual((self.worker()["condition"], self.worker()["reason"]), ("healthy", None))
+
+    def test_suspended_worker_is_unchanged(self):
+        self.worker_seat()
+        self.obs(WID, SESSION, last_success_at=NOW - 10)
+        self.ws.json("state/pool-suspended", {"reason": "app-quit", "at": NOW - 3, "stopped": [WID]})
+        w = self.worker()
+        self.assertEqual((w["alive"], w["condition"], w["reason"], w["since"]), (False, "unknown", "suspended", NOW - 3))
+
+    def test_full_view_exposes_no_session_ids_or_absolute_paths(self):
+        self.obs(claude_session_id="secret-claude-session", session="sutando-core")
+        text = json.dumps(self.core(view="full")["sources"]["observation"])
+        self.assertNotIn("secret-claude-session", text)
+        self.assertNotIn(self.ws.root.as_posix(), text)
+        self.assertNotIn("a" * 16, text)
+        self.assertNotIn("sutando-core", text)
+
+    def test_summary_view_has_no_observation_detail(self):
+        self.obs()
+        self.assertNotIn("observation", json.dumps(self.snap(view="summary")))
 
 
 class Route(Base):

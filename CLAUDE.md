@@ -242,13 +242,11 @@ Asked to report or file a bug or feature about Sutando, AG2 Space or the desktop
 
 ## Pending decisions
 
-When you need user input on a decision or are blocked:
-1. If the voice client is connected — ask via voice (write to `results/question-{ts}.txt`)
-2. Send a macOS notification: `osascript -e 'display notification "message" with title "Sutando"'`
-3. Save the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`). It's per-host (F1): each host owns its own file, carried by the `hosts/*/` vault glob, and `personal_path("pending-questions.md")` resolves there (so the code readers — check-pending-questions, dashboard, agent-api, friction-detector, session-handoff — agree with this write location).
-4. Continue working on other things — don't block
+When you need the owner's word or are blocked:
+1. `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] --task-file <workspace>/tasks/<task>.txt` — records it as a row of the owner's Pending questions database, via the store an installed skill declares (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable; the next reconcile files it), queues it as `results/proactive-*.txt` (the task's conversation when that is the owner's DM; else his DM), and fires the macOS notification last, naming the fix when refused. Never hand-edit; the per-host `pending-questions.md` is history only.
+2. Continue with other work; don't block.
 
-On each proactive loop pass, check the per-host `pending-questions.md` (`<workspace>/hosts/<hostname>/pending-questions.md`) for unanswered items and surface them when the user is available.
+`python3 src/pending_questions_reader.py list` is read-only, only when the owner asks or you are blocked; `… resolve <id>` when he answers. `python3 src/check-pending-questions.py` reconciles and lists; `--notify` reminds, on demand only; nothing is scheduled or surfaced per pass.
 
 ## Task progress notifications
 
@@ -274,11 +272,11 @@ analysis, or anything likely to take more than ~60 seconds:
 
 ```bash
 python3 skills/task-progress/scripts/notify.py \
-  --source <source> --channel-id <channel_id> \
+  --task-file "$WORKSPACE/tasks/task-<id>.txt" \
   --message "On it — looking into that now. Back in a minute."
 ```
 
-Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). To thread it, add `--thread-ts <reply_thread_ts>` (Slack @mention) or `--thread-root '<thread_root>'` (AG2 Space). An AG2 Space task (`source: ag2space`) takes `--source ag2space --channel-id <room>` (its `channel_id`); the update lands in that room through the gateway.
+`--task-file` derives `source`, `channel_id`/`chat_id` and the thread (`thread_root`; Slack `reply_thread_ts`) from the task's headers; an explicit flag overrides it. Without a task file pass `--source <source> --channel-id <channel_id>` (`--chat-id` Telegram; `--thread-ts <reply_thread_ts>` Slack; `--thread-root '<thread_root>'` AG2 Space); an AG2 Space task (`source: ag2space`) takes `--source ag2space --channel-id <room>`.
 
 **Queue position.** When the `QUEUE:` line (or `activity.py queue`) says more than one task is
 pending, the first line to that task's conversation names the position: one ahead, "Got it, right

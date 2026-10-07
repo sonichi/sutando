@@ -70,7 +70,7 @@ Per-user runtime + content. Lives at `<repo>/workspace/` by default (post-M0). S
 | `notes/` | ✅ yes (default) | Persistent, user-authored | Long-form notes, research, daily logs |
 | `.claude-sutando/projects/<slug>/memory/` | ✅ yes (default) | Persistent, agent-authored | Auto-memory files written by `/remember` etc. |
 | `build_log.md` | ✅ yes (default) | Append-only | Session changelogs from proactive-loop |
-| `pending-questions.md` | ✅ yes (default) | Persistent | User-deferred questions |
+| `pending-questions.md` | ✅ yes (default) | Persistent | Legacy per-host file, read-only history; live questions are rows of the room database (`src/pending_questions_reader.py list`) |
 | `tasks/`, `results/` | ❌ no | Ephemeral | Per-tick task queue + replies (per-host runtime) |
 | `state/cores/<host>.alive` | ❌ no | Per-host heartbeat | Per-host structural state, not synced |
 | `state/auth/`, `state/cloud-auth.json`, `state/device.json` | ❌ no | Per-host durable | Install/identity state, per-host |

@@ -4,8 +4,9 @@
 Each case runs the gate inside a self-contained fixture repo in a tempdir
 (stub scripts/sutando-config.sh + stub src/auth_preflight.py), so the gate's
 own REPO-relative resolution points at the fixture and every fail-loud side
-effect (pending-questions append, proactive file) lands in the fixture
-workspace — never in the real one. Fixture paths are built from self.tmp (the
+effect (the ask-owner outbox entry, the proactive file) lands in the fixture
+workspace — never in the real one; the fixture's scripts/ask-owner.py forwards to
+the real one, so the shipped recording path runs, against the fixture workspace. Fixture paths are built from self.tmp (the
 actual tempdir Path); see #2411 for the cwd-leak bug this avoids.
 """
 import json
@@ -36,6 +37,11 @@ class TestAuthPreflightGate(unittest.TestCase):
         self.ws = self.tmp / "ws"
         (self.ws / "results").mkdir(parents=True)
         shutil.copy(GATE_SRC, self.repo / "src" / "auth-preflight-gate.sh")
+        (self.repo / "scripts" / "ask-owner.py").write_text(
+            "import runpy, sys\n"
+            f"sys.argv = [{str(REAL_REPO / 'scripts' / 'ask-owner.py')!r}, *sys.argv[1:]]\n"
+            "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+        )
         (self.repo / "scripts" / "sutando-config.sh").write_text(
             "#!/bin/bash\n"
             f'case "$1" in workspace) echo "{self.ws}";; host-label) echo testhost;; esac\n'
@@ -73,17 +79,22 @@ class TestAuthPreflightGate(unittest.TestCase):
         self.assertIn("ABORTING startup", r.stderr)
         self.assertIn("needs GUI /login on testhost", r.stderr)
 
-    def test_login_required_writes_pending_questions_and_proactive(self):
+    def test_login_required_records_the_question_and_queues_one_dm(self):
         self._write_probe(LOGIN_PROBE)
-        self._run()
-        pq = self.ws / "hosts" / "testhost" / "pending-questions.md"
-        self.assertTrue(pq.exists(), "pending-questions.md not written")
-        self.assertIn("BOOT ABORTED", pq.read_text())
+        r = self._run()
+        self.assertEqual(r.returncode, 2, r.stderr)
+        # No adapter reaches a room from the fixture, so the record is the outbox entry.
+        held = list((self.ws / "state" / "pending-questions-outbox").glob("*.json"))
+        self.assertEqual(len(held), 1, r.stdout + r.stderr)
+        record = json.loads(held[0].read_text())
+        self.assertIn("BOOT ABORTED", record["question"]["question"])
+        self.assertIn("needs GUI /login on testhost", record["question"]["context"])
         proactive = list((self.ws / "results").glob("proactive-*.txt"))
-        self.assertEqual(len(proactive), 1)
+        self.assertEqual(len(proactive), 1, "ask-owner queues the DM; the gate adds no second file")
         body = proactive[0].read_text()
         self.assertTrue(body.startswith("[dm-only]"), body)
         self.assertIn("needs GUI /login on testhost", body)
+        self.assertNotIn("pending-questions.md", r.stdout + r.stderr)
 
     def test_skip_env_bypasses_gate(self):
         self._write_probe(LOGIN_PROBE)  # would abort if consulted

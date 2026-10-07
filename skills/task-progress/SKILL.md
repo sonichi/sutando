@@ -75,13 +75,22 @@ annoying than silence for 2 minutes on a research task.
 
 ## How to use
 
-Read the task file to get `source` and `channel_id` (or `chat_id` for Telegram), then call
-**immediately after reading the task**:
+**Pass `--task-file <path>`.** It derives `--source`, `--channel-id`/`--chat-id`,
+`--thread-root` (from `thread_root:`, else `source_message_id:`) and `--thread-ts` (from Slack's
+`reply_thread_ts:`) straight from that task file's own headers, so there is nothing left to
+extract or remember by hand — including the thread, the field most often dropped. A task
+sends when its source is `slack`/`discord`/`telegram`, or — for ANY other source, known or
+not — when its channel is a valid Matrix room id: strict `!opaque:server`, or a server-less
+room v12 id (e.g. AG2 Space, or a docked voice task). Everything else — undocked `voice`
+(`local-voice`), `chat`, `cron`, `runtime-api`, `onboarding-wizard`, any non-room channel —
+sends nothing and exits 3 (no delivery path; not a failure of the task), whatever channel
+config exists. Accepted trade-off: gateway provider labels are install-configured, so routing
+keys on the room id, not the source — a future writer that carries a real room id will send.
+The verdict is `src/progress_route.py`. Call **immediately after reading the task**:
 
 ```bash
 python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
-  --source slack \
-  --channel-id D0B5L7X2TK2 \
+  --task-file "$WORKSPACE/tasks/task-<id>.txt" \
   --message "On it — looking into that now. Back in a minute."
 ```
 
@@ -90,18 +99,34 @@ For research tasks, be specific about what you're doing:
   --message "Researching Trigify setup time now — back in a minute."
 ```
 
-For a Slack @mention (threaded reply), add `--thread-ts <ts>` to keep the update in-thread.
-For AG2 Space, pass the task's `thread_root:` via `--thread-root '<event id>'` to post the update in that thread. Single-quote the id: it starts with `$`, which double quotes would expand. An empty value posts unthreaded.
+Mid-task checkpoint update — same `--task-file`, new message:
+```bash
+python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
+  --task-file "$WORKSPACE/tasks/task-<id>.txt" \
+  --message "Done with the research — writing up the summary now."
+```
 
-Mid-task checkpoint update:
+Any of `--source` / `--channel-id` / `--chat-id` / `--thread-root` / `--thread-ts` given
+explicitly alongside `--task-file` still wins over what the file carries (e.g. to post a
+checkpoint unthreaded on purpose, pass `--thread-root ''`).
+
+### When there is no task file to point at
+
+Pass the fields by hand — same flags, same meaning:
+
 ```bash
 python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
   --source slack \
   --channel-id D0B5L7X2TK2 \
-  --message "Done with the research — writing up the summary now."
+  --message "On it — looking into that now. Back in a minute."
 ```
 
+For a Slack @mention (threaded reply), add `--thread-ts <ts>` to keep the update in-thread.
+For AG2 Space, pass the task's `thread_root:` via `--thread-root '<event id>'` to post the update in that thread. Single-quote the id: it starts with `$`, which double quotes would expand. An empty value posts unthreaded.
+
 ### Field mapping from task files
+
+(What `--task-file` derives automatically; use this table only when passing fields by hand.)
 
 | source    | field in task file  | CLI flag        |
 |-----------|---------------------|-----------------|
@@ -110,7 +135,8 @@ python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
 | telegram  | `chat_id:`          | `--chat-id`     |
 | ag2space  | `channel_id:`       | `--channel-id`  |
 
-Optional for Slack @mentions: `reply_thread_ts:` → `--thread-ts`
+Optional for Slack @mentions: `reply_thread_ts:` → `--thread-ts`.
+Optional for AG2 Space threading: `thread_root:` (falls back to `source_message_id:`, the asking message — never `reply_to_event:`, the post the sender quoted) → `--thread-root`.
 
 ### AG2 Space rooms
 
@@ -119,7 +145,7 @@ The same script posts the update in that room:
 
 ```bash
 python3 skills/task-progress/scripts/notify.py \
-  --source ag2space --channel-id '!room:server' \
+  --task-file "$WORKSPACE/tasks/task-<id>.txt" \
   --message "Got it, 2 in line before this one."
 ```
 
@@ -204,5 +230,6 @@ For intentional plain-text handles that should not ping anyone, pass
 ## Fail-open
 
 A failed send (missing token, network error) prints a warning to stderr and exits 1.
+A task with no delivery path sends nothing and exits 3, so a caller never reads it as delivered.
 **Always continue working on the task regardless of exit code.** The notification is
 best-effort — task delivery via the result file is the authoritative path.

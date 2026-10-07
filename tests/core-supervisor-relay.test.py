@@ -34,6 +34,7 @@ main = _mod.main
 resolve_active_target = _mod.resolve_active_target
 
 import channel_env_containment  # noqa: E402 — the shared module the probe delegates to
+import progress_route  # noqa: E402 — the shared route verdict the relay delegates to
 
 _LOGIN = {"state": "blocked-human", "detail": "awaiting user: login",
           "prompt": "Login\nSelect login method:\n  1. Claude account", "kind": "login"}
@@ -417,11 +418,12 @@ class TestRunCycleAndCli(unittest.TestCase):
     def test_real_cycle_persists_and_debounces(self):
         with tempfile.TemporaryDirectory() as td:
             sf = os.path.join(td, "state", "relay.state")
-            first = run_cycle(_LOGIN, sf, macos=False)  # no channel → macOS suppressed, still decides
-            self.assertIsNotNone(first)
-            self.assertTrue(os.path.exists(sf))
-            second = run_cycle(_LOGIN, sf, macos=False)  # same prompt → suppressed
-            self.assertIsNone(second)
+            with patch.object(_mod, "_macos_notify", lambda m: True):
+                first = run_cycle(_LOGIN, sf, macos=True)  # macOS delivered → debounce
+                self.assertIsNotNone(first)
+                self.assertTrue(os.path.exists(sf))
+                second = run_cycle(_LOGIN, sf, macos=True)  # same prompt → suppressed
+                self.assertIsNone(second)
 
     def test_relative_state_file_still_debounces(self):
         # Regression: a cwd-relative --state-file (e.g. "relay.state") has an empty
@@ -432,11 +434,12 @@ class TestRunCycleAndCli(unittest.TestCase):
             cwd = os.getcwd()
             os.chdir(td)
             try:
-                first = run_cycle(_LOGIN, "relay.state", macos=False)
-                self.assertIsNotNone(first)
-                self.assertTrue(os.path.exists("relay.state"))  # persisted, not swallowed
-                second = run_cycle(_LOGIN, "relay.state", macos=False)  # same prompt → suppressed
-                self.assertIsNone(second)
+                with patch.object(_mod, "_macos_notify", lambda m: True):
+                    first = run_cycle(_LOGIN, "relay.state", macos=True)
+                    self.assertIsNotNone(first)
+                    self.assertTrue(os.path.exists("relay.state"))  # persisted, not swallowed
+                    second = run_cycle(_LOGIN, "relay.state", macos=True)  # same prompt → suppressed
+                    self.assertIsNone(second)
             finally:
                 os.chdir(cwd)
 
@@ -478,7 +481,7 @@ class TestRunCycleAndCli(unittest.TestCase):
             with open(sig, "w") as f:
                 f.write('{"state": "blocked-human", "prompt": "Log')  # truncated
             sent = []
-            with patch.object(_mod, "_macos_notify", lambda m: sent.append(m)):
+            with patch.object(_mod, "_macos_notify", lambda m: sent.append(m) or True):
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
                     self.assertEqual(main(["--signal", sig, "--state-file", state]), 0)
@@ -1036,6 +1039,271 @@ class TestTargetIsRunnable(unittest.TestCase):
             msg = compose_message(_HUNG)
         self.assertIn("where the core is running", msg)
         self.assertNotIn("tmux -S", msg)
+
+
+class TestProgressRouteDelegation(unittest.TestCase):
+    """Routability is src/progress_route.py's verdict, the one notify.py applies;
+    a private copy in the relay would drift from it."""
+
+    def _reload(self):
+        spec = importlib.util.spec_from_file_location("core_supervisor_relay_route", _SRC)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _activity(self, td, obj):
+        p = os.path.join(td, "last-owner-activity.json")
+        with open(p, "w") as f:
+            json.dump(obj, f)
+        return p
+
+    def test_binds_the_shared_route_by_identity(self):
+        self.assertIs(_mod._delivery_route, progress_route.delivery_route)
+
+    def test_verdict_follows_the_shared_function(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._activity(td, {"channel": "discord", "channel_id": "42"})
+            with patch.object(progress_route, "delivery_route", return_value=None):
+                self.assertEqual(self._reload().resolve_active_target(p), ("", ""))
+            self.assertEqual(self._reload().resolve_active_target(p), ("discord", "42"))
+
+    def test_unimportable_route_fails_closed(self):
+        with patch.dict(sys.modules, {"progress_route": None}):
+            fn = _mod._load_progress_route()
+        self.assertIsNone(fn("discord", "42"))
+
+    def test_explicit_no_route_target_degrades_to_macos_only(self):
+        calls = []
+        orig_c = _mod._channel_notify
+        _mod._channel_notify = lambda m, s, c: calls.append((s, c)) or True
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                sig = os.path.join(td, "core-supervisor.json")
+                with open(sig, "w") as f:
+                    json.dump(_LOGIN, f)
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    rc = main(["--signal", sig, "--notify-source", "voice",
+                               "--notify-channel", "local-voice", "--no-macos",
+                               "--state-file", os.path.join(td, "s.state")])
+        finally:
+            _mod._channel_notify = orig_c
+        self.assertEqual((rc, calls), (0, []))
+        self.assertIn("no delivery path; macOS disabled, nothing to escalate to", err.getvalue())
+
+
+class TestNoRouteIsNeverDelivered(unittest.TestCase):
+    """A configured custom source whose channel is no room id: notify.py sends
+    nothing, so the relay must neither select it nor debounce on it."""
+
+    def setUp(self):
+        self.cfg = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.cfg, ignore_errors=True)
+        os.makedirs(os.path.join(self.cfg, "channels", "dev-ag2space"))
+        with open(os.path.join(self.cfg, "channels", "dev-ag2space", ".env"), "w") as f:
+            f.write("REMOTE_TASK_URL=http://127.0.0.1:9\nREMOTE_TASK_TOKEN=x\n")
+        scripts = os.path.join(self.cfg, "skills", "task-progress", "scripts")
+        os.makedirs(scripts)
+        os.symlink(os.path.realpath(os.path.join(_HERE, "..", "skills", "task-progress",
+                                                 "scripts", "notify.py")),
+                   os.path.join(scripts, "notify.py"))
+        saved = {k: os.environ.get(k) for k in
+                 ("CLAUDE_CONFIG_DIR", "REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")}
+        os.environ["CLAUDE_CONFIG_DIR"] = self.cfg
+        for k in ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
+            os.environ.pop(k, None)
+
+        def _restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(_restore)
+
+    def test_relay_does_not_select_a_no_route_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "last-owner-activity.json")
+            with open(p, "w") as f:
+                json.dump({"channel": "dev-ag2space", "channel_id": "C0123"}, f)
+            self.assertEqual(resolve_active_target(p), ("", ""))
+
+    def test_a_no_route_send_does_not_debounce(self):
+        orig_m = _mod._macos_notify
+        _mod._macos_notify = lambda m: None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                sf = os.path.join(td, "s.state")
+                self.assertFalse(_mod._channel_notify("x", "dev-ag2space", "C0123"))
+                run_cycle(_LOGIN, sf, macos=False, source="dev-ag2space", channel="C0123")
+                self.assertFalse(os.path.exists(sf), "a no-route send must not debounce")
+        finally:
+            _mod._macos_notify = orig_m
+
+
+class TestDebounceNeedsAConfirmedDelivery(unittest.TestCase):
+    """The hash persists only after a delivery landed somewhere; a cycle that
+    reached no one must retry on the next tick."""
+
+    def _cycle(self, td, *, no_macos, macos_ok=True, channel_ok=None):
+        sig = os.path.join(td, "core-supervisor.json")
+        with open(sig, "w") as f:
+            json.dump(_LOGIN, f)
+        state = os.path.join(td, "s.state")
+        argv = ["--signal", sig, "--state-file", state,
+                "--notify-source", "voice", "--notify-channel", "local-voice"]
+        if no_macos:
+            argv.append("--no-macos")
+        calls = []
+        with patch.object(_mod, "_macos_notify", lambda m: calls.append("macos") or macos_ok), \
+                patch.object(_mod, "_channel_notify", lambda m, s, c: calls.append("chan") or channel_ok), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = main(argv)
+        return rc, calls, os.path.exists(state), out.getvalue()
+
+    def test_no_route_with_no_macos_persists_nothing_and_retries(self):
+        with tempfile.TemporaryDirectory() as td:
+            rc, calls, persisted, out = self._cycle(td, no_macos=True)
+            self.assertEqual((rc, calls, persisted), (0, [], False))
+            self.assertIn("not delivered: no route and macOS disabled (will retry)", out)
+            self.assertNotIn("escalated:", out)
+            rc, calls, persisted, out = self._cycle(td, no_macos=True)
+            self.assertNotIn("no escalation", out, "the next cycle must retry, not be suppressed")
+            self.assertFalse(persisted)
+
+    def test_no_route_with_a_failed_macos_notification_persists_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, calls, persisted, out = self._cycle(td, no_macos=False, macos_ok=False)
+            self.assertEqual((calls, persisted), (["macos"], False))
+            self.assertIn("not delivered: no route and macOS notification failed (will retry)", out)
+
+    def test_no_route_with_macos_delivered_persists(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, calls, persisted, out = self._cycle(td, no_macos=False, macos_ok=True)
+            self.assertEqual((calls, persisted), (["macos"], True))
+            self.assertIn("escalated:", out)
+            _, _, _, out = self._cycle(td, no_macos=False, macos_ok=True)
+            self.assertIn("no escalation", out, "a delivered alert is debounced")
+
+    def test_a_failed_channel_is_not_rescued_by_macos(self):
+        with tempfile.TemporaryDirectory() as td:
+            sf = os.path.join(td, "s.state")
+            with patch.object(_mod, "_macos_notify", lambda m: True), \
+                    patch.object(_mod, "_channel_notify", lambda m, s, c: False):
+                run_cycle(_LOGIN, sf, macos=True, source="discord", channel="42")
+            self.assertFalse(os.path.exists(sf))
+
+
+class TestMacosNotifyAdapter(unittest.TestCase):
+    """The real _macos_notify against a fake `osascript` on PATH: only an exit 0
+    is a delivery, and only a delivery may persist the debounce."""
+
+    def setUp(self):
+        self.bin = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.bin, ignore_errors=True)
+        self.calls = os.path.join(self.bin, "calls")
+
+    def _fake(self, body, mode=0o755):
+        p = os.path.join(self.bin, "osascript")
+        with open(p, "w") as f:
+            f.write(f"#!/bin/sh\necho called >> {self.calls}\n{body}\n")
+        os.chmod(p, mode)
+
+    def _notify(self):
+        with patch.dict(os.environ, {"PATH": self.bin}):
+            return _mod._macos_notify("hello")
+
+    def _main_cycle(self, td):
+        sig = os.path.join(td, "core-supervisor.json")
+        with open(sig, "w") as f:
+            json.dump(_LOGIN, f)
+        state = os.path.join(td, "s.state")
+        with patch.dict(os.environ, {"PATH": self.bin}), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            main(["--signal", sig, "--state-file", state,
+                  "--notify-source", "voice", "--notify-channel", "local-voice"])
+        return os.path.exists(state), out.getvalue()
+
+    def _assert_undelivered_and_retries(self):
+        with tempfile.TemporaryDirectory() as td:
+            persisted, out = self._main_cycle(td)
+            self.assertFalse(persisted)
+            self.assertIn("not delivered: no route and macOS notification failed", out)
+            persisted, out = self._main_cycle(td)
+            self.assertFalse(persisted)
+            self.assertNotIn("no escalation", out, "the next cycle must retry")
+
+    def test_exit_0_is_delivered_and_debounces(self):
+        self._fake("exit 0")
+        self.assertIs(self._notify(), True)
+        self.assertTrue(os.path.exists(self.calls), "the fake osascript ran")
+        with tempfile.TemporaryDirectory() as td:
+            persisted, out = self._main_cycle(td)
+            self.assertTrue(persisted)
+            self.assertIn("escalated:", out)
+            self.assertIn("no escalation", self._main_cycle(td)[1])
+
+    def test_exit_1_is_not_delivered(self):
+        self._fake("exit 1")
+        self.assertIs(self._notify(), False)
+        self.assertTrue(os.path.exists(self.calls), "the fake osascript ran")
+        self._assert_undelivered_and_retries()
+        with open(self.calls) as f:
+            self.assertEqual(len(f.readlines()), 3, "both cycles retried the notification")
+
+    def test_missing_binary_is_not_delivered(self):
+        self.assertIs(self._notify(), False)
+        self._assert_undelivered_and_retries()
+
+    def test_oserror_is_not_delivered(self):
+        self._fake("exit 0", mode=0o644)  # present but not executable: PermissionError
+        self.assertIs(self._notify(), False)
+        self._assert_undelivered_and_retries()
+
+    def test_timeout_is_not_delivered(self):
+        import subprocess as _sp
+        self._fake("exit 0")
+        with patch.object(_mod.subprocess, "run",
+                          side_effect=_sp.TimeoutExpired("osascript", 8)):
+            self.assertIs(self._notify(), False)
+            self._assert_undelivered_and_retries()
+
+
+class TestUndeliveredLogThrottle(unittest.TestCase):
+    """A cycle that reaches no one retries every tick but logs once per signal,
+    then at most every UNDELIVERED_LOG_INTERVAL_S; the debounce state stays empty."""
+
+    def _cycle(self, td, signal, now):
+        sig = os.path.join(td, "core-supervisor.json")
+        with open(sig, "w") as f:
+            json.dump(signal, f)
+        state = os.path.join(td, "s.state")
+        with patch.object(_mod.time, "time", return_value=now), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()):
+            main(["--signal", sig, "--state-file", state, "--no-macos"])
+        return out.getvalue().count("not delivered:"), os.path.exists(state)
+
+    def test_logs_once_then_again_after_the_interval(self):
+        iv = _mod.UNDELIVERED_LOG_INTERVAL_S
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0), (1, False))
+            self.assertEqual(self._cycle(td, _LOGIN, 1030.0), (0, False))
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0 + iv - 1), (0, False))
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0 + iv + 1), (1, False))
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0 + iv + 31), (0, False))
+
+    def test_a_new_signal_logs_at_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._cycle(td, _LOGIN, 1000.0), (1, False))
+            self.assertEqual(self._cycle(td, _LIMIT, 1030.0), (1, False))
+
+    def test_the_debounce_state_never_holds_the_throttle(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._cycle(td, _LOGIN, 1000.0)
+            self.assertFalse(os.path.exists(os.path.join(td, "s.state")))
+            self.assertTrue(os.path.exists(os.path.join(td, "s.state.undelivered")))
 
 
 if __name__ == "__main__":
