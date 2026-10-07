@@ -417,7 +417,7 @@ jobs:
           # neighbour misses its own window); legs 1-7 get the rest.
           LIST=tests/python-load-sensitive-suites.txt
           if [ "${SHARD:-1}" -ge 8 ]; then
-            # Leg 7 runs the list's `serial` suites alone, so they never share a runner's CPU.
+            # Leg 9 runs the list's `serial` suites alone, so they never share a runner's CPU.
             KIND=only; WORKERS=2; [ "${SHARD:-1}" = 9 ] && { KIND=serial; WORKERS=1; }
             bash scripts/select-load-sensitive-suites.sh "$KIND" "$LIST" "$RECDIR" < "$RECDIR/all" > "$RECDIR/sensitive"
             bash scripts/shard-by-cost.sh 1 1 tests/python-suite-costs.txt < "$RECDIR/sensitive" > "$RECDIR/files"
