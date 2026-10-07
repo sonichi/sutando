@@ -118,6 +118,29 @@ class AuthFailureIsNeedsLogin(unittest.TestCase):
                         # Debounced: the same standing state does not re-fire.
                         self.assertFalse(relay.should_escalate(signal, _h)[0])
 
+    def test_login_dm_names_where_to_run_login(self):
+        state, detail, prompt, kind = ciw.compose_state(AUTH_FAILURE_LINES["oauth-401"], "idle", True)
+        signal = {"state": state, "detail": detail, "prompt": prompt, "kind": kind}
+
+        def boom():
+            raise RuntimeError("no backend file")
+
+        cases = (
+            ("attach", lambda: {"socket": "/tmp/s.sock", "session": "core"},
+             "`tmux -S /tmp/s.sock attach -t core`"),
+            ("unreadable", boom, "the Runtime panel"),
+        )
+        orig = relay._derive_backend
+        try:
+            for name, fn, where in cases:
+                with self.subTest(backend=name):
+                    relay._derive_backend = fn
+                    msg = relay.compose_message(signal)
+                    self.assertIn(f"run /login in the core terminal ({where})", msg)
+                    self.assertNotIn("restart.sh", msg)
+        finally:
+            relay._derive_backend = orig
+
 
 class NegativeControls(unittest.TestCase):
     def test_no_reader_flags_login(self):
