@@ -3,10 +3,10 @@
 
 The selector writes a receipt (mode, list hash, output hash) when it selects, and the
 step's unconditional `verify` exits 4 unless the files about to run match that receipt.
-This runs ci.yml's real step for legs 1 (`without`), 6 (`only`) and 7 (`serial`): with the real
+This runs ci.yml's real step for legs 1 (`without`), 8 (`only`) and 9 (`serial`): with the real
 selector each leg verifies and reaches the lane with its receipt; with a selector that
 drops its receipt, or whose output is altered after it is hashed, each leg must stop with
-exit 4 before the lane runs; and legs 6-7 must stop when one file is added to or dropped
+exit 4 before the lane runs; and legs 8-9 must stop when one file is added to or dropped
 from their run list after sharding, the selection left intact. A workflow that skips
 verification passes those spoiled runs and fails here; one that skips the selector has no receipt and fails in CI itself.
 
@@ -100,9 +100,9 @@ def main() -> int:
         print("  FAIL", f)
     if fails:
         return 1
-    print("PASS: legs 1, 8 and 9 run only selector-receipted lists; a missing receipt or an output "
-          "altered after selection stops each leg with exit 4 before the lane; legs 6-7 also stop when "
-          "their run list gains or loses a file after sharding")
+    print(f"PASS: legs 1, {legs_mod.LOAD_LEG} and {legs_mod.SERIAL_LEG} run only selector-receipted lists; a missing "
+          "receipt or an output altered after selection stops each leg with exit 4 before the lane; legs "
+          f"{legs_mod.LOAD_LEG}-{legs_mod.SERIAL_LEG} also stop when their run list gains or loses a file after sharding")
     return 0
 
 

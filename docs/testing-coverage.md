@@ -104,5 +104,5 @@ with it. A suite that fails in leg 8 itself, beside another listed suite, is tag
 | readiness-window-decision-instant | CI run 36888802147 attempt 2, PR #5000 at 7dee69d8c |
 | readiness-window-held-task-recovery, -unreadable-config | split with decision-instant from one suite (#4630), same harness |
 | config-hot-reload, inbox-and-workspace-env, malformed-roster-row, priority-sweep, sentinel-ownership | flake issue #4862 (failed together under host load) |
-| handler-terminal-rc (`serial`: leg 9, alone) | flake issue #4855; timed out on two-worker leg 8 in CI run 36914315349 |
+| handler-terminal-rc (`serial`: leg 9, alone) | flake issue #4855; timed out on the two-worker leg (then leg 6 of a six-leg layout) in CI run 36914315349 |
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Regression pin: the seven python legs, as ci.yml's own step computes them, partition discovery.
+"""Regression pin: the python legs (seven cost-sharded plus the load-sensitive pair), as ci.yml's
+own step computes them, partition discovery.
 
 Runs the `Run Python standalone tests` step body from ci.yml once per leg (SHARD=1..9)
 in a fixture that has every discovered path, the real selector, sharder, cost table and
