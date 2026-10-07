@@ -1806,6 +1806,76 @@ exit 0
         self.assertNotIn("send-keys", calls)
         self.assertFalse(done.exists())
 
+    # Codex rejected /startup, left it in the composer, idle footer below.
+    _REJECTED_STARTUP = (
+        "\\342\\226\\240 Unrecognized command '/startup'. Type \"/\" for a list of supported commands.\\n\\n"
+        "\\033[1m\\302\\273\\033[0m {composer}\\n\\n"
+        "  gpt-5.5 high \\302\\267 100%% context left \\302\\267 ~/sutando\\n")
+
+    def _run_notifier_against_leftover(self, composer):
+        """One queued task; the pane shows `composer` after a rejected /startup until the
+        notifier sends C-k, then an empty composer. C-m completes the task."""
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        (workspace / "state" / "core-status.json").write_text(
+            f'{{"status":"idle","ts":{int(time.time())}}}\n')
+        (tasks / "task-owner.txt").write_text("priority: normal\ntask: owner message\n")
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-owner.txt\\n'\n")
+        watcher.chmod(0o755)
+        cleared = Path(self.tmp.name) / "composer-cleared"
+        cleared.unlink(missing_ok=True)
+        held = self._REJECTED_STARTUP.format(composer=composer)
+        empty = self._REJECTED_STARTUP.format(
+            composer="\\033[2mAsk Codex to do anything\\033[0m")
+        self._write_exe("tmux", f'''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${{1:-}}" = -S ] && shift 2
+if [ "${{1:-}}" = has-session ]; then exit 0; fi
+if [ "${{1:-}}" = capture-pane ]; then
+  if [ -f "$CLEARED" ]; then printf '{empty}'; else printf '{held}'; fi
+  exit 0
+fi
+if [ "${{1:-}}" = send-keys ]; then
+  case " $* " in *" C-k "*) touch "$CLEARED" ;; esac
+  [ "${{*: -1}}" = C-m ] && touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+fi
+exit 0
+''')
+        env = dict(
+            os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log), CLEARED=str(cleared),
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TASKS_DIR=str(tasks), SUTANDO_RESULTS_DIR=str(results),
+            SUTANDO_NOTIFIER_POLL_INTERVAL="0.02", SUTANDO_NOTIFIER_CORE_READY_TIMEOUT="2",
+            SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
+        )
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=20)
+        return result, self._tmux_calls(), results / "task-owner.txt"
+
+    def test_managed_notifier_clears_a_rejected_startup_and_submits_the_queued_task(self):
+        result, calls, done = self._run_notifier_against_leftover("/startup")
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("send-keys -t =sutando-core:0 C-a C-k", calls)
+        self.assertIn("cleared rejected automation input '/startup'", result.stderr)
+        self.assertLess(calls.index("C-a C-k"),
+                        calls.index("-l -- Sutando task ready: task-owner.txt"))
+        self.assertTrue(done.exists())
+
+    def test_managed_notifier_never_clears_an_owner_draft(self):
+        for draft in ("/startup but keep this draft", "/status", "fix the login bug"):
+            with self.subTest(draft=draft):
+                self.log.unlink(missing_ok=True)
+                result, calls, done = self._run_notifier_against_leftover(draft)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("core did not become idle within 2s", result.stderr)
+                self.assertIn("capture-pane", calls)
+                self.assertNotIn("send-keys", calls)
+                self.assertFalse(done.exists())
+
     def test_worker_done_writer_failure_is_logged_without_crashing_notifier(self):
         workspace = self.root / "workspace"
         tasks = workspace / "tasks"
