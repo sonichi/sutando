@@ -125,6 +125,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/tasks-dir-resolve.sh",
             "src/watcher_identity.py",
             "src/workspace_default.py",
+            "src/shutdown.py",
             "src/sutando_config.py",
             "scripts/sutando-config.sh",
             # sutando-config.sh sources this; a fixture repo without it dies with
@@ -334,6 +335,7 @@ exit 0
         # A suite run from inside a core would otherwise inherit the marker
         # and hit the in-session restart guard instead of the path under test.
         env.pop("SUTANDO_CORE_SESSION", None)
+        env.pop("TMUX", None)   # inherited from a tmux host, it would route to the detached branch
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -2070,6 +2072,12 @@ exit 0
                 self.assertEqual(out_effective, expected_effective,
                                   f"case={name} hostile={hostile!r} stderr={result.stderr!r}")
 
+    def _seed_sentinel(self):
+        p = self.root / "workspace" / "state" / "shutdown.sentinel"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('{"reason": "test", "ts": 0}\n')
+        return p
+
     def _calls_after_new_session(self):
         calls = self.log.read_text().splitlines() if self.log.exists() else []
         idx = next((i for i, c in enumerate(calls) if " new-session " in f" {c} "), None)
@@ -2094,10 +2102,12 @@ exit 0
     def test_launcher_times_out_with_the_effective_bound_not_the_raw_value(self):
         """When the session never appears the warning names the applied budget: a
         raw 0.9 is one poll and "~0.2s", so raw and effective differ cheaply."""
+        sentinel = self._seed_sentinel()
         result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("did not come up within ~0.2s", result.stderr)
         self.assertNotIn("0.9s", result.stderr)
+        self.assertTrue(sentinel.exists(), "a session that never came up must leave the shutdown sentinel in place")
 
     def test_launcher_prints_the_effective_bound_not_the_raw_huge_value(self):
         """A huge value is clamped to 300 polls and announced as 60 s before the
@@ -2136,21 +2146,27 @@ exit 0
         """A session that reports itself on the third poll after new-session is
         still picked up inside the configured wait, with no timeout warning."""
         self._write_exe("tmux", SESSION_UP_THIRD_POLL_TMUX)
+        sentinel = self._seed_sentinel()
         result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "1"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("did not come up", result.stderr)
         polls = [c for c in self._calls_after_new_session() if "has-session -t =" in c and "-watcher" not in c]
         self.assertGreaterEqual(len(polls), 3, polls)
+        self.assertFalse(sentinel.exists(), "a session that came up must clear the shutdown sentinel")
 
     def test_launcher_tty_branch_uses_the_same_session_wait(self):
         """The interactive branch runs the same create-and-poll unit: a third-poll
         session comes up under a tty too, with no timeout warning."""
         self._write_exe("tmux", SESSION_UP_THIRD_POLL_TMUX)
+        sentinel = self._seed_sentinel()
         result = self.run_launcher_with_tty(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "1"})
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("did not come up", result.stdout)
-        polls = [c for c in self._calls_after_new_session() if "has-session -t =" in c and "-watcher" not in c]
+        calls = self._calls_after_new_session()
+        polls = [c for c in calls if "has-session -t =" in c and "-watcher" not in c]
         self.assertGreaterEqual(len(polls), 3, polls)
+        self.assertTrue(any(" attach -t " in f" {c} " for c in calls), "the tty branch ends in attach; it did not run")
+        self.assertFalse(sentinel.exists(), "a session that came up must clear the shutdown sentinel")
 
     def test_worker_one_shot_pending_failure_exits_nonzero_without_typing(self):
         workspace = self.root / "workspace"
