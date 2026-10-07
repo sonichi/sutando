@@ -1973,6 +1973,36 @@ exit 0
         self.assertIn("could not prune spent delivery sentinels", result.stderr)
         self.assertEqual((results / "task-owner.txt").read_text(), "done\n")
 
+    def test_session_wait_knob_clamps_a_hostile_large_value(self):
+        """An absurd SUTANDO_CORE_SESSION_WAIT_S must not turn the seq-built poll
+        list into something that never finishes building it (confirmed live: an
+        unclamped 10**17-scale value still ran after 4s). Exercises the real
+        start-cli.sh arithmetic, not a reimplementation of it."""
+        script_text = (self.root / "src/agent/codex/cli/start-cli.sh").read_text()
+        lines = script_text.splitlines()
+        start = next(i for i, l in enumerate(lines)
+                     if l.startswith('SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S'))
+        snippet = "\n".join(lines[start:start + 6])
+        self.assertIn("SESSION_UP_TRIES", snippet)
+        self.assertIn("-le 300", snippet, "clamp line moved or was removed")
+
+        for hostile, expected_tries in [
+            ("99999999999999999", "300"),
+            ("-3", "1"),
+            ("abc", "1"),
+            ("", "25"),
+            ("5", "25"),
+        ]:
+            with self.subTest(hostile=hostile):
+                result = subprocess.run(
+                    ["/bin/bash", "-c", snippet + '\necho "$SESSION_UP_TRIES"'],
+                    env={**os.environ, "SUTANDO_CORE_SESSION_WAIT_S": hostile},
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected_tries,
+                                  f"hostile={hostile!r} stderr={result.stderr!r}")
+
     def test_worker_one_shot_pending_failure_exits_nonzero_without_typing(self):
         workspace = self.root / "workspace"
         tasks = workspace / "tasks"

@@ -156,6 +156,9 @@ CODEX_WAIT_TIMEOUT="${SUTANDO_CODEX_WAIT_TIMEOUT:-120}"
 SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S:-5}"
 SESSION_UP_TRIES=$(( ${SESSION_UP_WAIT_S%.*} * 5 ))
 [ "$SESSION_UP_TRIES" -ge 1 ] 2>/dev/null || SESSION_UP_TRIES=1
+# A hostile/mistyped value (e.g. a stray extra digit) must not turn the seq-built
+# poll list into something that never finishes or exhausts memory building it.
+[ "$SESSION_UP_TRIES" -le 300 ] 2>/dev/null || SESSION_UP_TRIES=300
 if ! command -v codex >/dev/null 2>&1; then
   echo "  … waiting for the Codex CLI to finish installing (up to ${CODEX_WAIT_TIMEOUT}s)" >&2
   _codex_waited=0
