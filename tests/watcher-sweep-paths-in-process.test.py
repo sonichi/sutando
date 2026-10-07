@@ -264,6 +264,52 @@ class LineRelay(Base):
     def test_lines_leave_whole_and_a_missing_final_newline_is_added(self):
         self.assertEqual(self.relay_bytes(b"a\nbb\nccc"), b"a\nbb\nccc\n")
 
+    def relay_writes(self, data: bytes, *, chunk: "int | None" = None) -> "tuple[bytes, list[bytes]]":
+        """(output, the bytes of each os.write the relay issued); `chunk` caps what a
+        write accepts, so a short write is answered the way a pipe would answer it."""
+        real_write = os.write
+        writes: list[bytes] = []
+        r, w = os.pipe()
+
+        def write(fd, buf):
+            if fd != w:
+                return real_write(fd, buf)
+            view = memoryview(buf)[:chunk] if chunk else memoryview(buf)
+            writes.append(bytes(view))
+            return real_write(fd, view)
+
+        got = bytearray()
+
+        def read():
+            with os.fdopen(r, "rb") as f:
+                got.extend(f.read())
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        with mock.patch.object(os, "write", write):
+            line_relay.relay(io.BytesIO(data), w)
+        os.close(w)
+        reader.join(10)
+        return bytes(got), writes
+
+    def test_lines_read_in_one_batch_still_leave_in_one_write_each(self):
+        # Lines a pipe would deliver together are never coalesced: a write is kept
+        # whole only up to PIPE_BUF, and the sweep writes its own lines to the FIFO.
+        lines = [b"/inbox/task-%03d.txt\n" % i for i in range(64)]
+        out, writes = self.relay_writes(b"".join(lines))
+        self.assertEqual(out, b"".join(lines))
+        self.assertEqual(writes, lines)
+
+    def test_an_unterminated_last_line_is_its_own_terminated_write(self):
+        out, writes = self.relay_writes(b"first\nlast")
+        self.assertEqual(out, b"first\nlast\n")
+        self.assertEqual(writes, [b"first\n", b"last\n"])
+
+    def test_a_short_write_resumes_from_where_it_stopped(self):
+        out, writes = self.relay_writes(b"abc\nde\n", chunk=2)
+        self.assertEqual(out, b"abc\nde\n")
+        self.assertEqual(writes, [b"ab", b"c\n", b"de", b"\n"])
+
     def test_eof_with_no_input_writes_nothing(self):
         self.assertEqual(self.relay_bytes(b""), b"")
 

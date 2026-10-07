@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The watcher runs the archived-pointer migration once per workspace, before its
 first sweep plan, and records that in a marker so a later start never repeats it.
+A migration that fails writes no marker, so the next start runs it again.
 
 Run: python3 tests/watch-tasks-stream-pointer-migration.test.py
 """
@@ -38,7 +39,7 @@ def wait_for(pred, timeout: float = 20.0) -> bool:
     return pred()
 
 
-def run_watcher(tmp: Path, ws: Path, inbox: Path, until) -> str:
+def run_watcher(tmp: Path, ws: Path, inbox: Path, until, extra_env=None) -> str:
     feed = tmp / "feed"
     feed.write_text("")
     (tmp / "bin").mkdir(exist_ok=True)
@@ -49,6 +50,7 @@ def run_watcher(tmp: Path, ws: Path, inbox: Path, until) -> str:
     env.update(PATH=f"{tmp / 'bin'}:{env['PATH']}", TMPDIR=str(tmp), SUTANDO_INSTANCE_ID=W, SUTANDO_INSTANCE=W,
                SUTANDO_WORKSPACE_DIR=str(ws), SUTANDO_RESULTS_DIR=str(ws / "results"),
                SUTANDO_INBOX_RESOLVER=str(REPO / "skills" / "worker-pool" / "scripts" / "resolve-inbox-entry"))
+    env.update(extra_env or {})
     err = tmp / "err"
     with err.open("w") as fh:
         p = subprocess.Popen(["bash", "src/watch-tasks-stream.sh", str(inbox), "--role", "standby", "--inbox", str(inbox)],
@@ -72,9 +74,21 @@ def main() -> int:
     (ws / "tasks" / "task-live.txt").write_text("id: task-live\ntask: x\n")
     (inbox / "task-live.txt").write_text("")
     marker = ws / "state" / "migrations" / "retire-archived-pointers.v1.done"
+    # A python that fails the migration subcommand only; everything else runs for real.
+    failing_py = tmp / "bin" / "failing-python3"
+    (tmp / "bin").mkdir(exist_ok=True)
+    failing_py.write_text('#!/bin/sh\ncase "$2" in retire-archived-pointers) echo "boom" >&2; exit 1;; esac\n'
+                          f'exec "{sys.executable}" "$@"\n')
+    failing_py.chmod(0o755)
     try:
+        err = run_watcher(tmp, ws, inbox, lambda e: "sweep plan over" in e, {"SUTANDO_PY": str(failing_py)})
+        check("a failed migration is reported and retried next start",
+              "pointer migration failed; it retries on the next start: boom" in err, err[-500:])
+        check("...is not recorded as done", not marker.exists() and not list(marker.parent.glob("*")))
+        check("...leaves every pointer in place", all((inbox / f"task-old{i}.txt").exists() for i in range(3)))
+        check("...and the sweep still planned the inbox", "sweep plan over 4 entries" in err, err[-500:])
         err = run_watcher(tmp, ws, inbox, lambda e: "sweep plan over" in e)
-        check("the first start migrated the archived pointers", 'pointer migration: {"retired": 3' in err, err[-500:])
+        check("the next start migrated the archived pointers", 'pointer migration: {"retired": 3' in err, err[-500:])
         check("...before the sweep planned the inbox", "sweep plan over 1 entries" in err, err[-500:])
         check("...and left the pending pointer in place", (inbox / "task-live.txt").exists())
         check("the marker records the run", marker.is_file() and '"retired": 3' in marker.read_text())
