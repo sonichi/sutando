@@ -480,12 +480,20 @@ _check(
 )
 
 _cs2 = _src("skills/phone-conversation/scripts/conversation-server.ts")
-_cs_missing = [k for k in _py_header_keys if k not in _cs2]
+# Compare the regex's parsed alternatives, not a file-wide substring: a key named
+# anywhere else in the file must not count as covered.
+_cs_re_m = re.search(
+    r"const _CONF_HEADER_RE = new RegExp\(\s*((?:'[^']*'\s*\+?\s*)+),", _cs2
+)
+_cs_alt_src = "".join(re.findall(r"'([^']*)'", _cs_re_m.group(1))) if _cs_re_m else ""
+_cs_alt_m = re.fullmatch(r"\^\(\?:([\w|]+)\)\\\\s\*:", _cs_alt_src)
+_cs_keys = set(_cs_alt_m.group(1).split("|")) if _cs_alt_m else set()
 _check(
-    "header-key-parity: conversation-server.ts _CONF_HEADER_RE contains all py keys",
-    not _cs_missing,
-    f"keys missing from conversation-server.ts _CONF_HEADER_RE: {_cs_missing} — "
-    "update the inline regex string to include them",
+    "header-key-parity: conversation-server.ts _CONF_HEADER_RE alternatives == py keys",
+    bool(_cs_keys) and _cs_keys == _py_header_keys,
+    f"conversation-server.ts _CONF_HEADER_RE drift: "
+    f"missing={sorted(_py_header_keys - _cs_keys)} extra={sorted(_cs_keys - _py_header_keys)} "
+    f"(parsed={bool(_cs_keys)}) — keep the regex alternation equal to KNOWN_HEADER_KEYS",
 )
 
 # ---------------------------------------------------------------------------
