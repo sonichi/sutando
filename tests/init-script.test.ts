@@ -30,6 +30,7 @@ function runInit(repoDir: string, mode?: '--auto' | '--preflight'): RunResult {
 			SUTANDO_REPO: repoDir,
 			SUTANDO_WORKSPACE: join(repoDir, '.workspace'),
 			SUTANDO_TEST_MODE: '1',  // v0.8: enable env-override-in-test escape hatch
+			SUTANDO_HOST_LABEL: 'h1',
 			HOME: repoDir + '/.fake-home',
 			CLAUDE_CONFIG_DIR: join(repoDir, '.fake-home', '.claude'),
 		},
@@ -163,8 +164,10 @@ describe('init.sh --auto (Tier 1: crons.json copy)', () => {
 		runInit(scratch, '--auto');
 		const body = readFileSync(join(exampleDir, 'crons.json'), 'utf-8');
 		assert.match(body, /"foo"/);
-		const marker = JSON.parse(readFileSync(join(exampleDir, 'crons.json.installer-seed'), 'utf-8'));
+		const marker = JSON.parse(readFileSync(join(workspace, 'hosts', 'h1', 'state', 'crons-installer-seed.json'), 'utf-8'));
 		assert.equal(marker.state, 'installer-seeded-not-activated', 'the copy carries its installer marker');
+		assert.equal(marker.ino, statSync(join(exampleDir, 'crons.json')).ino, 'the marker names the published inode');
+		assert.equal(existsSync(join(exampleDir, 'crons.json.installer-seed')), false, 'nothing mutable beside the copy');
 	});
 
 	it('does NOT copy when the target already exists', () => {
@@ -175,7 +178,7 @@ describe('init.sh --auto (Tier 1: crons.json copy)', () => {
 		runInit(scratch, '--auto');
 		const body = readFileSync(join(exampleDir, 'crons.json'), 'utf-8');
 		assert.match(body, /my-custom/);
-		assert.equal(existsSync(join(exampleDir, 'crons.json.installer-seed')), false, 'an existing file is never marked');
+		assert.equal(existsSync(join(workspace, 'hosts', 'h1', 'state', 'crons-installer-seed.json')), false, 'an existing file is never marked');
 	});
 
 	it('skips silently when no example file exists (fresh template install case)', () => {

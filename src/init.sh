@@ -93,7 +93,7 @@ create_dir_if_missing() {
   fi
 }
 
-# The legacy repo-side crons.json has one writer, which also records its installer marker;
+# The legacy repo-side crons.json has one writer, which records its marker in Workspace state;
 # if it cannot run, nothing is written: an unmarked copy would read as a live schedule.
 install_cron_starter() {
   local skill="$REPO/skills/schedule-crons" here writer py out
@@ -103,7 +103,7 @@ install_cron_starter() {
   [ -f "$writer" ] || writer="$here/../skills/schedule-crons/scripts/seed_crons.py"
   . "$here/../scripts/python-binary.sh"
   py="$(resolve_python "$REPO")"
-  if [ -n "$py" ] && out="$("$py" "$writer" --install-starter --skill-dir "$skill")"; then
+  if [ -n "$py" ] && out="$("$py" "$writer" --install-starter --skill-dir "$skill" --workspace "$WORKSPACE")"; then
     case "$out" in installed*) echo "  ✓ created skills/schedule-crons/crons.json (from crons.example.json)";; esac
   else
     echo "  ⚠ skipped skills/schedule-crons/crons.json: its installer did not run" >&2
