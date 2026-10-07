@@ -689,7 +689,6 @@ def stop_other_writers(timeout_s: float = 5.0) -> int:
     interpreter running exactly this script — and wait for exit (SIGKILL past the timeout). Nothing
     is swept by argv, and an ambiguous pid is left alone: killing the wrong process is the worse error."""
     me, parent = os.getpid(), os.getppid()
-    script = str(Path(__file__).resolve())
     pids = []
     for pid in _recorded_writer_pids():
         if pid in (me, parent) or pid <= 1:
@@ -698,7 +697,7 @@ def stop_other_writers(timeout_s: float = 5.0) -> int:
             r = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
         except Exception:
             continue
-        if r.returncode == 0 and _is_writer_argv((r.stdout or "").strip(), script):
+        if r.returncode == 0 and _this_checkouts_writer(pid, (r.stdout or "").strip()):
             pids.append(pid)
     for pid in pids:
         try:
@@ -747,6 +746,31 @@ def _writer_argv(args: str) -> bool:
         if form in args and _is_writer_argv(args, form):
             return not any(f in args.split(form, 1)[1] for f in _ONE_SHOT_FLAGS)
     return False
+
+
+def _pid_cwd(pid: int) -> str | None:
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        pass
+    try:
+        r = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                           capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return next((line[1:] for line in (r.stdout or "").splitlines() if line.startswith("n")), None)
+
+
+def _this_checkouts_writer(pid: int, args: str) -> bool:
+    """A writer argv whose script is THIS file: an absolute form directly, a relative one
+    (`python3 src/core_heartbeat.py`) only when it resolves here from the pid's own cwd."""
+    if not _writer_argv(args):
+        return False
+    if any(_is_writer_argv(args, s) for s in (str(_SCRIPT), os.path.abspath(__file__))):
+        return True
+    rel = [t for t in args.split() if t.endswith(_SCRIPT.name) and not os.path.isabs(t)]
+    cwd = _pid_cwd(pid) if rel else None
+    return bool(cwd) and any(_is_writer_argv(args, t) and Path(cwd, t).resolve() == _SCRIPT for t in rel)
 
 
 def running_writer_pids() -> list[int]:

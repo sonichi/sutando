@@ -172,6 +172,56 @@ class EnsureRunningIsIdempotent(unittest.TestCase):
         self.assertIn("writer already running", out)
         self.assertIn(f"(pid {proc.pid})", out)
 
+    def _workspace(self, root: Path) -> Path:
+        ws = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, 'src');"
+                             "from workspace_default import resolve_workspace; print(resolve_workspace())"],
+                            cwd=root, env=self.env, capture_output=True, text=True).stdout.strip()
+        (Path(ws) / "state" / "cores").mkdir(parents=True, exist_ok=True)
+        return Path(ws)
+
+    def _relative_writer(self, root: Path, tag: str) -> subprocess.Popen:
+        with open(self.td / f"{tag}.log", "w") as log:
+            proc = subprocess.Popen([sys.executable, "src/core_heartbeat.py"], cwd=root,
+                                    env=self.env, stdout=log, stderr=subprocess.STDOUT)
+        self.started.append(proc.pid)
+        self.addCleanup(proc.wait)
+        return proc
+
+    def _stop(self) -> str:
+        r = subprocess.run([sys.executable, str(self.root / "src/core_heartbeat.py"), "--stop"],
+                           env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r.stdout
+
+    def test_stop_ends_a_relative_argv_writer_of_this_checkout(self):
+        # A pre-upgrade writer runs as `python3 src/core_heartbeat.py`; --restart's handoff must
+        # end it, or it survives into the new core's grace window and then exits with no writer.
+        ws = self._workspace(self.root)
+        proc = self._relative_writer(self.root, "rel")
+        pidfile = ws / "state" / "cores"
+        deadline = time.monotonic() + 10
+        while not any(pidfile.glob("*.heartbeat.pid")) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertTrue(any(pidfile.glob("*.heartbeat.pid")), (self.td / "rel.log").read_text())
+        self.assertIn("stopped 1 writer(s)", self._stop())
+        self.assertIsNotNone(proc.wait(timeout=10), "the relative-argv writer survived --stop")
+
+    def test_stop_leaves_another_checkouts_relative_writer_alone(self):
+        other = self.td / "other"
+        shutil.copytree(self.root / "src", other / "src", symlinks=True)
+        shutil.copytree(self.root / "scripts", other / "scripts", symlinks=True)
+        self._workspace(other)
+        proc = self._relative_writer(other, "other")
+        time.sleep(1)
+        ws = self._workspace(self.root)
+        # This checkout's .alive names the foreign pid; its cwd resolves to the other checkout.
+        host = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, 'src');"
+                               "import core_heartbeat; print(core_heartbeat._alive_path().name)"],
+                              cwd=self.root, env=self.env, capture_output=True, text=True).stdout.strip()
+        (ws / "state" / "cores" / host).write_text(json.dumps({"heartbeat_pid": proc.pid}))
+        self.assertIn("stopped 0 writer(s)", self._stop())
+        self.assertIsNone(proc.poll(), "--stop killed another checkout's writer")
+
     def test_writer_exits_when_its_checkout_is_removed(self):
         self._ensure()
         pid = self.started[0]
@@ -302,6 +352,29 @@ class EnsureInProcess(unittest.TestCase):
         self.assertFalse(ch._writer_argv(f"python3 {s} --ensure"))
         self.assertFalse(ch._writer_argv("python3 -c 'core_heartbeat.py'"))
         self.assertFalse(ch._writer_argv("bash src/core_heartbeat.py"))
+
+    def test_this_checkouts_writer_resolves_relative_argv_through_cwd(self):
+        ch, s = self.ch, str(self.ch._SCRIPT)
+        root = str(self.ch._SCRIPT.parent.parent)
+        self.assertTrue(ch._this_checkouts_writer(9, f"python3 {s} --interval 60"))
+        self.assertFalse(ch._this_checkouts_writer(9, f"python3 {s} --stop"))
+        rel = "python3 src/core_heartbeat.py"
+        with unittest.mock.patch.object(ch, "_pid_cwd", return_value=root):
+            self.assertTrue(ch._this_checkouts_writer(9, rel))
+        with unittest.mock.patch.object(ch, "_pid_cwd", return_value=str(self.td)):
+            self.assertFalse(ch._this_checkouts_writer(9, rel), "another checkout's writer")
+        with unittest.mock.patch.object(ch, "_pid_cwd", return_value=None):
+            self.assertFalse(ch._this_checkouts_writer(9, rel), "an unverifiable cwd is left alone")
+
+    def test_pid_cwd_falls_back_to_lsof(self):
+        ch = self.ch
+        self.assertEqual(Path(ch._pid_cwd(os.getpid()) or "").resolve(), Path.cwd().resolve())
+        with unittest.mock.patch.object(ch.os, "readlink", side_effect=OSError), \
+             unittest.mock.patch.object(ch.subprocess, "run", return_value=_cp(0, "p1\nfcwd\nn/some/dir\n")):
+            self.assertEqual(ch._pid_cwd(1), "/some/dir")
+        with unittest.mock.patch.object(ch.os, "readlink", side_effect=OSError), \
+             unittest.mock.patch.object(ch.subprocess, "run", side_effect=OSError("no lsof")):
+            self.assertIsNone(ch._pid_cwd(1))
 
     def test_running_writer_pids_filters_candidates(self):
         ch, s = self.ch, str(self.ch._SCRIPT)
