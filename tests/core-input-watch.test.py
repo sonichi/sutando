@@ -311,6 +311,14 @@ class TestComposeState(unittest.TestCase):
         st, *_ = compose_state(_WORKING, "working", True)
         self.assertEqual(st, "running")
 
+    def test_blocked_base_is_never_hung(self):
+        # runtime-health "blocked" (queued tasks held behind the composer) must not fall
+        # through to "unknown" -> hung, which reads as a wedge and invites a restart.
+        st, detail, _p, kind = compose_state(_WORKING, "blocked", True)
+        self.assertEqual(st, "blocked-known")
+        self.assertIn("queued", detail)
+        self.assertIsNone(kind)
+
     def test_hung_when_base_unknown(self):
         # runtime-health "unknown" = live session but stale/absent core-status
         # (wedged loop) → the supervisor's hung, carrying the pane tail. Uses a

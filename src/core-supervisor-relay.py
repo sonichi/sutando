@@ -248,8 +248,14 @@ def compose_message(signal: dict, surface: str = "") -> str:
                 " If the core looks fine, no action is needed.")
     elif _is_login_class(signal):
         host = _core_host_label() or "the host"
-        msg += (f" — needs GUI /login on {host}: open Terminal there, run"
-                " `bash src/restart.sh` from the repo, then complete /login."
+        try:
+            be = _derive_backend()
+        except Exception:
+            be = None
+        where = (f"`tmux -S {be['socket']} attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
+                 if be else "the Runtime panel")
+        msg += (f" — needs GUI /login on {host}: run /login in the core terminal ({where})."
+                " If the credential proxy still refuses, see sonichi#4326."
                 " A chat reply can't resolve this.")
     else:
         host = _core_host_label() or "the host"

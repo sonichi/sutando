@@ -94,19 +94,26 @@ class TestAdaptersDelegate(unittest.TestCase):
                 src = path.read_text()
                 self.assertNotIn("codex exec --sandbox read-only", src)
 
+    # The AG2 Space gateway binds the owner through the shared per-tier selector,
+    # which is itself part of the owning module; Slack binds it directly.
+    BINDING = {"ag2space": "ag2space_tier_lines", "slack": "sandboxed_delegation_lines"}
+
     def test_each_adapter_binds_the_shared_owner(self):
         for name, path in ADAPTERS.items():
             with self.subTest(adapter=name):
                 src = path.read_text()
-                self.assertIn("sandboxed_delegation_lines", src)
+                self.assertIn(self.BINDING[name], src)
 
     def test_ag2space_guest_branch_renders_the_block(self):
         """Exercised end-to-end by src/remote-gateway-bridge.test.py; here we pin
-        that the guest branch is the caller, so a refactor cannot silently drop it."""
-        src = ADAPTERS["ag2space"].read_text()
-        m = re.search(r'sender_tier == "guest":\s*\n(.{0,400})', src, re.S)
+        that the guest branch is the caller, so a refactor cannot silently drop it.
+        The branch lives in the shared selector the gateway calls per tier."""
+        src = (REPO / "src/policy/guardrail.py").read_text()
+        m = re.search(r'tier == "guest":\s*\n(.{0,400})', src, re.S)
         self.assertIsNotNone(m, "guest branch not found")
         self.assertIn("sandboxed_delegation_lines", m.group(1))
+        gateway = ADAPTERS["ag2space"].read_text()
+        self.assertIn("ag2space_tier_lines(sender_tier, collaborator_enabled", gateway)
 
     def test_slack_non_owner_branch_renders_the_block(self):
         src = ADAPTERS["slack"].read_text()
