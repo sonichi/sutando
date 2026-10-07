@@ -16,7 +16,7 @@ import _shell_scan
 
 def decision_targets(command):
     try:
-        words = _shell_scan.words(command)
+        words = [word.text for word in _shell_scan.words(command)]
     except ValueError:
         return []
     targets = []
