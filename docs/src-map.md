@@ -93,6 +93,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
 - **`gateway_serving.py`** — Shared owner for the `gateway-status.json` sidecar verdict.
+- **`gemini-live-transcribe-stt.ts`** — STTProvider for Gemini Transcribe Live (`gemini-3.5-transcribe-live`), used as bodhi's `whisperProvider` so meeting mode can run on bodhi's dictation (transcription) mode without an OpenAI key.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
@@ -115,6 +116,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
+- **`meeting-dictation.ts`** — Meeting mode on bodhi's dictation (transcription) mode: while a meeting runs the voice model is quiesced, each final transcript line is appended to the day's meeting note, and an exit phrase returns the session to agent mode.
 - **`meeting-tools.ts`** — Meeting tools — Google Meet, phone call, and meeting ID lookup.
 - **`mention_gate.py`** — Owner @-mention ingestion trigger: shared policy for whether a message that tags the OWNER counts as a mention of the bot.
 - **`message_chunking.py`** — Shared message chunking — one fence-aware chunker for every outbound surface.
