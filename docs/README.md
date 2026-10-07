@@ -105,3 +105,5 @@ Run the audit locally:
 ```bash
 python3 skills/release/scripts/docs_audit.py
 ```
+
+- [GitHub verification receipts](github-verification.md) — bounded PR evidence and governed foreground publication.
