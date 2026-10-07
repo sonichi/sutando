@@ -232,6 +232,143 @@ class FirstInstallOnlyTests(unittest.TestCase):
 
 
 
+class HistoricalStarterTests(unittest.TestCase):
+    """init.sh never refreshes the legacy copy, so an older release's untouched starter
+    must still read as a starter; anything an owner changed must read as established."""
+
+    FIXTURES = REPO / "tests/fixtures/schedule-crons"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.ws = root / "ws"
+        self.skill = root / "skill"
+        self.skill.mkdir()
+        for name in ("crons.example.json", seed_crons.STARTERS_FILE):
+            shutil.copy(REPO / "skills/schedule-crons" / name, self.skill / name)
+        self.target = self.ws / "hosts" / "h1" / "crons.json"
+        self.afternoon = datetime(2026, 10, 6, 13, 0)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _seed(self):
+        return seed_crons.seed(self.ws, "h1", self.skill, first_install_only=("main-loop",))
+
+    def _names(self):
+        return [e["name"] for e in json.loads(self.target.read_text())]
+
+    def _legacy(self, entries):
+        (self.skill / "crons.json").write_text(json.dumps(entries, indent=2))
+
+    def _fixture(self, name):
+        return json.loads((self.FIXTURES / name).read_text())
+
+    def test_current_example_is_pinned(self):
+        current = json.loads((REPO / "skills/schedule-crons/crons.example.json").read_text())
+        self.assertIn(seed_crons.starter_digest(current), seed_crons.shipped_starter_digests(),
+                      "crons.example.json changed: append its starter_digest() to "
+                      "skills/schedule-crons/shipped-starters.json so older installs stay classified")
+
+    def test_fixture_versions_are_pinned(self):
+        pinned = seed_crons.shipped_starter_digests()
+        for name in ("crons.example.v0.12.0.json", "crons.example.2b45993b.json"):
+            self.assertIn(seed_crons.starter_digest(self._fixture(name)), pinned, name)
+
+    def test_untouched_v0_12_0_legacy_starter_is_a_first_install(self):
+        old = self._fixture("crons.example.v0.12.0.json")
+        self.assertNotEqual(old, json.loads((self.skill / "crons.example.json").read_text()))
+        self.assertIn("morning-briefing", [e["name"] for e in old])
+        shutil.copy(self.FIXTURES / "crons.example.v0.12.0.json", self.skill / "crons.json")
+        _, _, source = self._seed()
+        self.assertEqual(source, self.skill / "crons.json")
+        self.assertEqual(self._names(), ["main-loop"])
+        self.assertFalse(morning_catchup_due(json.loads(self.target.read_text()), self.afternoon))
+
+    def test_untouched_first_shipped_starter_is_a_first_install(self):
+        shutil.copy(self.FIXTURES / "crons.example.2b45993b.json", self.skill / "crons.json")
+        self._seed()
+        self.assertEqual(self._names(), ["main-loop"])
+
+    def test_interim_copy_of_an_older_starter_is_a_first_install(self):
+        interim = self.ws / "crons" / "h1.json"
+        interim.parent.mkdir(parents=True)
+        shutil.copy(self.FIXTURES / "crons.example.v0.12.0.json", interim)
+        self._seed()
+        self.assertEqual(self._names(), ["main-loop"])
+
+    def test_older_starter_reformatted_is_still_a_starter(self):
+        old = self._fixture("crons.example.v0.12.0.json")
+        (self.skill / "crons.json").write_text(json.dumps([dict(reversed(e.items())) for e in old]))
+        self._seed()
+        self.assertEqual(self._names(), ["main-loop"])
+
+    def test_established_schedule_built_on_the_current_template_is_copied_whole(self):
+        entries = json.loads((self.skill / "crons.example.json").read_text())
+        for e in entries:
+            if e["name"] == "morning-briefing":
+                e["cron"] = "30 7 * * *"
+        self._legacy(entries)
+        before = (self.skill / "crons.json").read_bytes()
+        self._seed()
+        self.assertEqual(self.target.read_bytes(), before)
+        self.assertTrue(morning_catchup_due(json.loads(self.target.read_text()), self.afternoon))
+
+    def test_established_schedule_built_on_an_older_starter_is_copied_whole(self):
+        entries = self._fixture("crons.example.v0.12.0.json")
+        entries.append({"name": "owner-job", "cron": "0 9 * * *", "prompt": "mine"})
+        self._legacy(entries)
+        self._seed()
+        self.assertIn("owner-job", self._names())
+        self.assertIn("morning-briefing", self._names())
+
+    def test_without_the_pin_file_an_older_starter_reads_as_established(self):
+        (self.skill / seed_crons.STARTERS_FILE).unlink()
+        shutil.copy(self.FIXTURES / "crons.example.v0.12.0.json", self.skill / "crons.json")
+        self._seed()
+        self.assertIn("morning-briefing", self._names())
+
+    def test_malformed_pin_file_is_refused_under_the_filter(self):
+        shutil.copy(self.FIXTURES / "crons.example.v0.12.0.json", self.skill / "crons.json")
+        for bad in ("{not json", '{"sha256": "x"}', '[{"digest": "x"}]', '["x"]'):
+            (self.skill / seed_crons.STARTERS_FILE).write_text(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                self._seed()
+            self.assertFalse(self.target.exists())
+
+    def test_pin_file_is_not_read_without_the_filter(self):
+        (self.skill / seed_crons.STARTERS_FILE).write_text("{not json")
+        shutil.copy(self.FIXTURES / "crons.example.v0.12.0.json", self.skill / "crons.json")
+        self.assertEqual(seed_crons.seed(self.ws, "h1", self.skill)[0], "seeded")
+        self.assertEqual(self.target.read_bytes(),
+                         (self.FIXTURES / "crons.example.v0.12.0.json").read_bytes())
+
+    def test_source_is_read_once_and_classified_on_the_published_bytes(self):
+        legacy = self.skill / "crons.json"
+        shutil.copy(self.FIXTURES / "crons.example.v0.12.0.json", legacy)
+        real_read_bytes, real_read_text = Path.read_bytes, Path.read_text
+        reads = []
+
+        def read_bytes(path):
+            data = real_read_bytes(path)
+            if path == legacy:
+                reads.append("bytes")
+                # A concurrent replacement after the read must not change the outcome.
+                legacy.write_text('[{"name": "owner-only"}]')
+            return data
+
+        def read_text(path, *a, **kw):
+            if path == legacy:
+                reads.append("text")
+            return real_read_text(path, *a, **kw)
+
+        with mock.patch.object(Path, "read_bytes", read_bytes), \
+                mock.patch.object(Path, "read_text", read_text):
+            self._seed()
+        self.assertEqual(reads, ["bytes"])
+        self.assertEqual(self._names(), ["main-loop"])
+
+
 class SeedErrorPathTests(unittest.TestCase):
     """The refusals: no source, a starter that is not JSON, a starter that is not a list."""
 

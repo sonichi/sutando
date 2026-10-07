@@ -1,0 +1,92 @@
+[
+  {
+    "sha256": "7a3b3985a506619400ac4eb570bf9858b921f5e8cf9c02930f41ec006b4e6796",
+    "commit": "373dbe95",
+    "date": "2026-10-03"
+  },
+  {
+    "sha256": "771f5ac02604a5faab496fb264b2cf61f40da7d5a648fe894d53982ad1ec2791",
+    "commit": "93230644",
+    "date": "2026-08-27"
+  },
+  {
+    "sha256": "dd6525c2bd0f1c89279b1d761088be1b2393f1b1d6d6919a9c2fad25bdf271fe",
+    "commit": "7e9380a0",
+    "date": "2026-08-06"
+  },
+  {
+    "sha256": "c7e340d4e8032dac4a4168f4eb3a940665d239e46327b02966a2636ffe8eef61",
+    "commit": "bb834e15",
+    "date": "2026-08-05"
+  },
+  {
+    "sha256": "d57b71b76eede8bf1d43a7ecfc0d05281d430f5cc447cba066d636c066515da9",
+    "commit": "9417af12",
+    "date": "2026-07-31"
+  },
+  {
+    "sha256": "00e0f8806edca3cd053c3551920ffb630afd65867e7e9791738c775f3827d391",
+    "commit": "c869066a",
+    "date": "2026-07-28"
+  },
+  {
+    "sha256": "989a683cd7ca804b0797d486e59627b031923c6e1e1e47d628080566fa16ba7f",
+    "commit": "5f40ca91",
+    "date": "2026-07-19"
+  },
+  {
+    "sha256": "7847bad0e4df824c85ad0cea10d65c32d9e9aad01fe63eb2ddda8e6a88d955c2",
+    "commit": "7985ef70",
+    "date": "2026-06-21"
+  },
+  {
+    "sha256": "2018df8367b4381fb2aa4704bcfbbf6ebd9cd77bcea0bb56034af987b252ad4f",
+    "commit": "b56bbeae",
+    "date": "2026-06-10"
+  },
+  {
+    "sha256": "e755cae1ffd069c051fa5206031e1e13dab733da33ba655a4e4a125e7db90024",
+    "commit": "325566cd",
+    "date": "2026-06-09"
+  },
+  {
+    "sha256": "dc31331ae78443bcdfab062d42dcfec6fb21cec0bfeeaac3663442ff1392c60e",
+    "commit": "8bf6367b",
+    "date": "2026-06-03"
+  },
+  {
+    "sha256": "6956d70158b2b121e8cd6e5bb1213618cfa5dbb40629e5eec0e4e89eb5ad3a25",
+    "commit": "0155333a",
+    "date": "2026-05-30"
+  },
+  {
+    "sha256": "431875b8db72c7bc5ce35cac067a2eb73b244257ea757ec2ac890ea5e45dae5d",
+    "commit": "90dbf94d",
+    "date": "2026-05-29"
+  },
+  {
+    "sha256": "94fd32781e46b8afcba19ae3db7dea4314a570070977dbae0973c3a6e33886dd",
+    "commit": "06c640ac",
+    "date": "2026-05-20"
+  },
+  {
+    "sha256": "0932dd8ff1df28a669c95a5bc6e6008b652c01189f0bd2fafa775919b4ad41af",
+    "commit": "040f675f",
+    "date": "2026-05-15"
+  },
+  {
+    "sha256": "c0b31c8c055c40e23cdc8f7643625b4f44f5854663b9f9fac46e6b859a954980",
+    "commit": "59c5a539",
+    "date": "2026-04-24"
+  },
+  {
+    "sha256": "7d9b898fedc79b5fe69ce70209186d7a7261dea2a9345f2ac80d378394ce075a",
+    "commit": "e2cb188b",
+    "date": "2026-04-17"
+  },
+  {
+    "sha256": "74556fce1dfcec385b36679931ba753d9a8dbfa762cc5e034baea75f97eaf932",
+    "commit": "2b45993b",
+    "date": "2026-04-08"
+  }
+]

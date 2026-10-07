@@ -8,14 +8,21 @@ precedence: the interim ``<workspace>/crons/<host>.json``, else the legacy
 file is never touched.
 
 ``--first-install-only NAME`` (Codex) seeds only the named entries when the
-source is the shipped starter: ``crons.example.json`` itself, or an interim or
-legacy file whose JSON equals it (``src/init.sh`` copies the example into the
-legacy path). Any other source is an established schedule and is copied whole.
+source is a shipped starter: ``crons.example.json`` itself, or an interim or
+legacy file whose JSON equals the current example or ANY released one.
+``src/init.sh`` copies the example into the legacy path once and never refreshes
+it, so an untouched install from an older release still holds that release's
+starter; ``shipped-starters.json`` pins every historical version's digest. Any
+other source is an established schedule and is copied whole. A schedule that
+equals a shipped starter is indistinguishable from an untouched copy and is
+treated as one: the per-host file is missing, so nothing was ever registered
+from it on this host.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -24,6 +31,7 @@ from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 REPO = SKILL_DIR.parents[1]
+STARTERS_FILE = "shipped-starters.json"
 
 
 def _config(key: str) -> str:
@@ -48,16 +56,42 @@ def _load(path: Path):
         return None
 
 
-def seed_bytes(source: Path, example: Path, first_install_only: tuple[str, ...] | None) -> bytes:
-    """The seeded content: ``source`` whole, unless it is the starter and a filter is given."""
-    raw = source.read_bytes()
+def starter_digest(entries) -> str:
+    """Whitespace- and key-order-insensitive identity of a parsed crons list."""
+    return hashlib.sha256(
+        json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def shipped_starter_digests(skill_dir: Path = SKILL_DIR) -> frozenset[str]:
+    """Digests of every released ``crons.example.json``; empty when the pin file is absent."""
+    try:
+        pinned = json.loads((skill_dir / STARTERS_FILE).read_text())
+    except FileNotFoundError:
+        return frozenset()
+    if not isinstance(pinned, list) or not all(isinstance(e, dict) and "sha256" in e for e in pinned):
+        raise ValueError(f"{skill_dir / STARTERS_FILE} is not a list of {{\"sha256\": ...}} entries")
+    return frozenset(e["sha256"] for e in pinned)
+
+
+def seed_bytes(source: Path, example: Path, first_install_only: tuple[str, ...] | None,
+               starters: frozenset[str] = frozenset()) -> bytes:
+    """The seeded content: ``source`` whole, unless it is a starter and a filter is given."""
+    raw = source.read_bytes()  # read once: classify and publish the same bytes
     if not first_install_only:
         return raw
+    try:
+        entries = json.loads(raw)
+    except ValueError:
+        if source == example:
+            raise
+        return raw
     if source != example:
-        starter = _load(example)
-        if starter is None or _load(source) != starter:
+        known = set(starters)
+        current = _load(example)
+        if current is not None:
+            known.add(starter_digest(current))
+        if starter_digest(entries) not in known:
             return raw
-    entries = json.loads(raw)
     if not isinstance(entries, list):
         raise ValueError(f"{source} is not a JSON list of cron entries")
     keep = [e for e in entries if isinstance(e, dict) and e.get("name") in first_install_only]
@@ -75,7 +109,8 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
     source = next((p for p in seed_sources(workspace, host_label, skill_dir) if p.is_file()), None)
     if source is None:
         raise FileNotFoundError(f"no crons seed source under {workspace} or {skill_dir}")
-    content = seed_bytes(source, skill_dir / "crons.example.json", first_install_only)
+    starters = shipped_starter_digests(skill_dir) if first_install_only else frozenset()
+    content = seed_bytes(source, skill_dir / "crons.example.json", first_install_only, starters)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     tmp.write_bytes(content)

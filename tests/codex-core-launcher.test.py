@@ -107,7 +107,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             shutil.copy2(REAL_REPO / rel, target)
         for rel in ("skills/schedule-crons/scripts/reconcile_launchd.py",
                     "skills/schedule-crons/scripts/seed_crons.py",
-                    "skills/schedule-crons/crons.example.json"):
+                    "skills/schedule-crons/crons.example.json",
+                    "skills/schedule-crons/shipped-starters.json"):
             if (REAL_REPO / rel).exists():
                 target = self.root / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -590,6 +591,42 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertNotIn("launchd", main_loop[0])
         seen = json.loads(probe.read_text())
         self.assertIn("main-loop", [e.get("name") for e in seen])
+
+    def test_schedule_helpers_use_the_resolved_python_not_bare_python3(self):
+        # A bare `python3` first on PATH (Apple's developer-tools stub on a clean
+        # Mac) must not cost the seed, the durable reconcile or the scheduler.
+        self._write_exe("python3", "#!/bin/sh\necho developer-tools stub >&2\nexit 71\n")
+        config = self.root / "workspace" / "hosts" / "test-host" / "crons.json"
+        probe, env = self._scheduler_that_records_crons()
+        env["SUTANDO_PY"] = sys.executable
+
+        result = self.run_launcher(env_extra=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("developer-tools stub", result.stderr)
+        for warning in ("Could not seed", "preflight failed", "Could not reconcile",
+                        "no runnable python3"):
+            self.assertNotIn(warning, result.stderr)
+        self.assertEqual([e.get("name") for e in json.loads(config.read_text())], ["main-loop"])
+        self.assertIn("main-loop", [e.get("name") for e in json.loads(probe.read_text())])
+        self.assertTrue((Path(self.tmp.name) / "heartbeat.log").exists())
+
+    def test_durable_reconcile_uses_the_resolved_python_not_bare_python3(self):
+        self._write_exe("python3", "#!/bin/sh\necho developer-tools stub >&2\nexit 71\n")
+        config = self.root / "workspace" / "hosts" / "test-host" / "crons.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps([
+            {"name": "main-loop", "cron": "*/5 * * * *", "prompt_skill": "proactive-loop"},
+            {"name": "digest", "cron": "2 6 * * *", "prompt": "run"},
+        ]))
+
+        result = self.run_launcher(env_extra={"SUTANDO_PY": sys.executable})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("developer-tools stub", result.stderr)
+        self.assertIs(json.loads(config.read_text())[1]["launchd"], True)
+        self.assertIn("durable schedules", result.stdout)
+        self.assertTrue((Path(self.tmp.name) / "scheduler.log").exists())
 
     def test_existing_per_host_crons_is_not_reseeded(self):
         config = self.root / "workspace" / "hosts" / "test-host" / "crons.json"
