@@ -6,14 +6,17 @@ calls or user-data writes occur here. Wrapper/variable bypasses remain possible.
 """
 import json
 import re
-import shlex
+from shlex import quote
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _shell_scan
 
 
 def decision_targets(command):
     try:
-        words = shlex.split(command)
+        words = _shell_scan.words(command)
     except ValueError:
         return []
     targets = []
@@ -60,7 +63,7 @@ def decide(data: dict) -> dict:
         return {}
     event = data.get("hook_event_name", "PreToolUse")
     script = Path(__file__).resolve().parent.parent / "skills/review-preflight/scripts"  # lint-workspace-resolution: allow-repo-root
-    helper = shlex.quote(str(script / "github-evidence.py"))
+    helper = quote(str(script / "github-evidence.py"))
     advice = (
         "GitHub evidence rule: verify the exact current PR head and required checks with "
         f"`python3 {helper} OWNER/REPO PR --expect-head SHA`. "
