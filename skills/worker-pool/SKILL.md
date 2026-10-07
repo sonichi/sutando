@@ -154,11 +154,16 @@ in-room that the owner was asked. Any other non-owner tier is refused in-room.
 When the owner answers, run exactly one of:
 
 ```bash
-python3 skills/worker-pool/scripts/worker_picker_commands.py approve <id> --workspace "$WS"
-python3 skills/worker-pool/scripts/worker_picker_commands.py decline <id> --workspace "$WS"
+python3 skills/worker-pool/scripts/worker_picker_commands.py approve <id> --task-file <owner's task> --workspace "$WS"
+python3 skills/worker-pool/scripts/worker_picker_commands.py decline <id> --task-file <owner's task> --workspace "$WS"
 ```
 
-`approve` applies the parked pin/unpin itself; for an add it prints `next`,
+`--task-file` is the owner's own reply task: the command refuses unless that
+file's attested tier is `owner` and its text names the request id, so a
+collaborator cannot approve their own request. `approve` refuses a pin/unpin
+that a newer request for the same room, or a later binding change, has
+overtaken (status `superseded`, the collaborator is told). Otherwise it
+applies the parked pin/unpin itself; for an add it prints `next`,
 the owner's add for the core to run. Either verb tells the collaborator in the
 room through the task-progress skill and prints `posted`; a `NOT posted` line
 means post `notice` there yourself. Then resolve the pending question

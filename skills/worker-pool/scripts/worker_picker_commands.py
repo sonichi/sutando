@@ -397,8 +397,11 @@ def request_approval(workspace, path, *, results_dir=None, asker=None) -> "dict 
         if new:
             thread = (headers.get("thread_root") or headers.get("source_message_id") or "").strip()
             lane = (headers.get("source") or "").strip()
+            seq = int(log.get("seq") or 0) + 1
+            log["seq"] = seq
+            room = (headers.get("channel_id") or "").strip() or None
             rec = {"id": rid, "task_id": task_id, "command": cmd, "status": "pending",
-                   "room": (headers.get("channel_id") or "").strip() or None,
+                   "seq": seq, "room_seq": _room_seq(workspace, room), "room": room,
                    "room_name": (headers.get("room_name") or "").strip() or None,
                    "thread_root": thread if thread.startswith("$") else None,
                    "lane": lane if lane and lane != SOURCE else "ag2space",
@@ -411,7 +414,8 @@ def request_approval(workspace, path, *, results_dir=None, asker=None) -> "dict 
         question = (f"{rec['requester']} (a collaborator in {where}) asks to "
                     f"{describe(cmd)}. Approve?")
         context = (f"Request {rid}. Reply 'approve {rid}' or 'decline {rid}'; the core then runs "
-                   f"skills/worker-pool/scripts/worker_picker_commands.py approve|decline {rid}.")
+                   f"skills/worker-pool/scripts/worker_picker_commands.py approve|decline {rid} "
+                   "--task-file <your reply's task file>.")
         try:
             asked = (asker or _ask_owner)(workspace, question, context)
         except Exception as e:  # noqa: BLE001 — the collaborator must hear either way
@@ -443,9 +447,45 @@ def _notify_room(rec: dict, text: str) -> str:
     return "posted" if rc == 0 else f"NOT posted: notify.py exited {rc}"
 
 
-def decide(workspace, rid: str, approve: bool, *, notifier=None) -> dict:
+def _room_seq(workspace, room) -> "int | None":
+    return ((_read_applied(workspace).get("rooms") or {}).get(room) or {}).get("seq") if room else None
+
+
+def owner_authority_error(path, workspace, rid: str) -> "str | None":
+    """Why the task at `path` cannot decide request `rid`, or None when it can:
+    its ATTESTED tier is owner and its text names the request."""
+    import task_envelope as te
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"owner task unreadable: {e}"
+    parsed = te.attested_task_headers(text, workspace)
+    if (parsed.headers.get("access_tier") or "").strip() != "owner":
+        return "the deciding task is not the owner's"
+    if rid not in (parsed.body or ""):
+        return f"the owner's task does not name request {rid}"
+    return None
+
+
+def _superseded(workspace, log: dict, rec: dict) -> "str | None":
+    """Why approving this room-scoped request now would undo a later change."""
+    for other in (log.get("requests") or {}).values():
+        if (other is not rec and other.get("room") == rec.get("room")
+                and (other.get("command") or {}).get("action") in ("pin", "unpin")
+                and int(other.get("seq") or 0) > int(rec.get("seq") or 0)
+                and other.get("status") in ("pending", "approved")):
+            return f"a newer request for this room ({other['id']}) is {other['status']}"
+    if _room_seq(workspace, rec.get("room")) != rec.get("room_seq"):
+        return "this room's worker binding changed after the request was made"
+    return None
+
+
+def decide(workspace, rid: str, approve: bool, *, authority, notifier=None) -> dict:
     """Apply (or drop) exactly the parked command, then tell the collaborator.
-    A request decides once; a second decision reports the first."""
+    `authority` is the owner's own task answering it; a request decides once."""
+    refused = owner_authority_error(authority, workspace, rid)
+    if refused:
+        return {"id": rid, "error": refused}
     with _requests_locked(workspace):
         log = _read_requests(workspace)
         rec = (log.get("requests") or {}).get(rid)
@@ -455,7 +495,11 @@ def decide(workspace, rid: str, approve: bool, *, notifier=None) -> dict:
             return {"id": rid, "status": rec.get("status"), "error": "already decided"}
         cmd = rec["command"]
         out: dict = {"id": rid, "command": cmd}
-        if approve and cmd.get("action") in ("pin", "unpin"):
+        why = _superseded(workspace, log, rec) if (
+            approve and cmd.get("action") in ("pin", "unpin")) else None
+        if why:
+            out["reason"] = why
+        elif approve and cmd.get("action") in ("pin", "unpin"):
             try:
                 applied = apply(workspace, cmd, task_id=f"{rec['task_id']}.approved-{rid}")
             except (pr.RosterError, OSError, ValueError) as e:
@@ -467,12 +511,19 @@ def decide(workspace, rid: str, approve: bool, *, notifier=None) -> dict:
             out["next"] = ("run the owner's add: grow the installed core pool by one via "
                            "scripts/install-core-pool.sh" +
                            (f", label '{cmd['label']}'" if cmd.get("label") else ""))
-        rec["status"] = "approved" if approve else "declined"
+        rec["status"] = "superseded" if why else ("approved" if approve else "declined")
         pr._write_atomic(requests_path(workspace), log)
     out["status"] = rec["status"]
-    text = (f"My owner approved your request to {describe(cmd)}" +
-            (" — it is applied." if out.get("applied") else " — setting it up now.")
-            if approve else f"My owner declined your request to {describe(cmd)}.")
+    if why:
+        text = (f"Your request to {describe(cmd)} was not applied: {why}, so applying it "
+                "now would undo that. Nothing was changed.")
+    elif out.get("applied"):
+        text = f"My owner approved your request to {describe(cmd)}, and it is applied."
+    elif approve:
+        text = (f"My owner approved your request to {describe(cmd)}. The worker is added "
+                "when my owner's Sutando runs the add.")
+    else:
+        text = f"My owner declined your request to {describe(cmd)}."
     out["notice"] = text
     try:
         out["posted"] = (notifier or _notify_room)(rec, text)
@@ -600,11 +651,12 @@ def main(argv=None) -> int:
     ap.add_argument("verb", nargs="?", default="parse",
                     choices=("parse", "request", "pending", "approve", "decline"))
     ap.add_argument("request_id", nargs="?", help="for approve/decline")
-    ap.add_argument("--task-file")
+    ap.add_argument("--task-file", help="the picker task; for approve/decline, the "
+                    "owner's own task that answers the request")
     ap.add_argument("--workspace", default=None)
     ap.add_argument("--results-dir", default=None)
     a = ap.parse_args(argv)
-    if a.verb in ("parse", "request") and not a.task_file:
+    if not a.task_file and a.verb != "pending":
         ap.error(f"{a.verb} needs --task-file")
     if a.verb in ("approve", "decline") and not a.request_id:
         ap.error(f"{a.verb} needs a request id")
@@ -625,7 +677,7 @@ def main(argv=None) -> int:
     elif a.verb == "pending":
         out = pending(ws)
     else:
-        out = decide(ws, a.request_id, a.verb == "approve")
+        out = decide(ws, a.request_id, a.verb == "approve", authority=a.task_file)
     print(json.dumps(out, indent=2))
     return 1 if isinstance(out, dict) and out.get("error") else 0
 
