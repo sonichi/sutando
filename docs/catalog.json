@@ -505,14 +505,26 @@
    "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract",
    "last_verified": "2026-09-22"
   },
-  "docs/github-verification.md": {
-   "title": "GitHub verification receipts",
+  "docs/learning-window.md": {
+   "title": "Retained learning windows",
    "audience": [
     "contributors",
+    "maintainers",
     "operators"
    ],
    "status": "active",
-   "canonical_for": "optional PR evidence receipts and governed status publication",
+   "canonical_for": "optional all-scope learning collection and pending evidence",
+   "last_verified": "2026-10-07"
+  },
+  "docs/reliability-v3-results.md": {
+   "title": "Sutando reliability evaluation: final results",
+   "audience": [
+    "contributors",
+    "maintainers",
+    "operators"
+   ],
+   "status": "historical",
+   "canonical_for": "concluded owner evaluation of the local reliability experiment",
    "last_verified": "2026-10-07"
   },
   "docs/cron-outstanding-payload.md": {
@@ -523,6 +535,16 @@
    ],
    "status": "active",
    "canonical_for": "prompt cron coalescing and outstanding payload lifetime",
+   "last_verified": "2026-10-07"
+  },
+  "docs/github-verification.md": {
+   "title": "GitHub verification receipts",
+   "audience": [
+    "contributors",
+    "operators"
+   ],
+   "status": "active",
+   "canonical_for": "optional PR evidence receipts and governed status publication",
    "last_verified": "2026-10-07"
   }
  }
