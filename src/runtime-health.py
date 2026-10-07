@@ -27,6 +27,7 @@ observer; it starts nothing and kills nothing.
 import json
 import math
 import os
+import re
 import tempfile
 import socket
 import subprocess
@@ -201,7 +202,6 @@ def severity_gate(verdict, *, confirm_min=2, freshly_booted=False):
 # staring at an unresponsive agent, so a false "needs_login" (rare) is far less
 # costly than missing a real one.
 _LOGIN_MARKERS = (
-    "not logged in",
     "please run /login",
     "run `claude login`",
     "run 'claude login'",
@@ -209,6 +209,12 @@ _LOGIN_MARKERS = (
     "invalid api key",
     "authentication_error",
 )
+# Three common words: unanchored, this fires on any pane that merely QUOTES them.
+# Require the CLI's own line-start form, or adjacency to a /login token.
+_NOT_LOGGED_IN = re.compile(
+    r"^[\s⎿·|>]*(?:you(?:'re| are) )?not logged in\b"
+    r"|not logged in\b.{0,60}/login\b"
+    r"|/login\b.{0,60}not logged in\b", re.I)
 
 
 def _run(cmd):
@@ -515,11 +521,14 @@ def needs_login(pane_text):
     """Pure predicate: does the core pane show claude's auth prompt? Testable
     without a live tmux — this is the load-bearing 'stuck vs thinking' decision.
     Only the latest marker counts, and only while nothing after it shows the CLI
-    signed in again. The marker set is this module's (broad on purpose, above); the
-    "signed in after it" reading is worker_auth_state's, the one the seat monitor
-    uses, so both readers give one answer for one pane."""
+    signed in again. The marker set is this module's (broad on purpose, above);
+    the anchored form (_NOT_LOGGED_IN) keeps a marker line from firing on a pane
+    that merely quotes the three common words. The "signed in after it" reading
+    is worker_auth_state's, the one the seat monitor uses, so both readers give
+    one answer for one pane."""
     lines = pane_text.splitlines()
-    last = max((i for i, ln in enumerate(lines) if any(m in ln.lower() for m in _LOGIN_MARKERS)),
+    last = max((i for i, ln in enumerate(lines)
+                if any(m in ln.lower() for m in _LOGIN_MARKERS) or _NOT_LOGGED_IN.search(ln)),
                default=None)
     if last is None:
         return False
