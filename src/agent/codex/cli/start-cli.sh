@@ -154,18 +154,15 @@ CODEX_WAIT_TIMEOUT="${SUTANDO_CODEX_WAIT_TIMEOUT:-120}"
 # Seconds a freshly created core session may take to answer has-session; a stub
 # tmux that never reports one (tests) sets this to 0. Polls run every 0.2 s.
 SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S:-5}"
-# Only a signed base-10 integer counts (fraction dropped): under set -u a bare word is an
-# unbound-variable exit and a leading zero reads as octal, so anything else is the default.
-if [[ "$SESSION_UP_WAIT_S" =~ ^(-?)([0-9]+)(\.[0-9]+)?$ ]]; then
+# Only a signed base-10 integer counts (fraction dropped, zero prefix consumed by the regex in
+# one pass): under set -u a bare word is an unbound-variable exit and 08 reads as octal.
+if [[ "$SESSION_UP_WAIT_S" =~ ^(-?)0*([0-9]+)(\.[0-9]+)?$ ]]; then
   _session_up_neg="${BASH_REMATCH[1]}"
   _session_up_mag="${BASH_REMATCH[2]}"
 else
   _session_up_neg=""
   _session_up_mag=5
 fi
-while [ "${#_session_up_mag}" -gt 1 ] && [ "${_session_up_mag#0}" != "$_session_up_mag" ]; do
-  _session_up_mag="${_session_up_mag#0}"
-done
 # Saturate on the digit string against the 60 s ceiling, so no multiply can wrap.
 if [ -n "$_session_up_neg" ] || [ "$_session_up_mag" = 0 ]; then
   SESSION_UP_TRIES=1
@@ -573,10 +570,10 @@ if ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n 
     >> "$ws/state/session-starts.log"
 fi
 
-if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
+# Creates the core session, waits for has-session within the configured budget
+# (new-session rc=0 only means tmux accepted it), then starts the helpers.
+start_core_session_and_helpers() {
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
-  # new-session rc=0 means tmux accepted it; a child that exits at once leaves
-  # has-session failing. Poll before opening intake rather than assuming.
   for _ in $(seq 1 "$SESSION_UP_TRIES"); do
     session_exists "$SESSION" && break
     sleep 0.2
@@ -589,23 +586,13 @@ if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   ensure_task_notifier
   ensure_core_monitor
   ensure_core_heartbeat
+}
+
+if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
+  start_core_session_and_helpers
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
-  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
-  # new-session rc=0 means tmux accepted it; a child that exits at once leaves
-  # has-session failing. Poll before opening intake rather than assuming.
-  for _ in $(seq 1 "$SESSION_UP_TRIES"); do
-    session_exists "$SESSION" && break
-    sleep 0.2
-  done
-  if session_exists "$SESSION"; then
-    clear_shutdown_sentinel
-  else
-    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_LABEL} — sentinel NOT cleared, no core is serving." >&2
-  fi
-  ensure_task_notifier
-  ensure_core_monitor
-  ensure_core_heartbeat
+  start_core_session_and_helpers
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
     echo "Started $SESSION detached with Codex — opened a Terminal window attached to it."

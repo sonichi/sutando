@@ -2043,6 +2043,11 @@ exit 0
             ("bare_sign", "-", "25", "5"),
             ("bare_dot", ".", "25", "5"),
             ("leading_dot", ".5", "25", "5"),
+            ("long_zero_prefix", "0" * 100000 + "5", "25", "5"),
+            ("ceiling", "60", "300", "60"),
+            ("just_over_ceiling", "61", "300", "60"),
+            ("zero_padded_ceiling", "0060", "300", "60"),
+            ("all_zeros", "0" * 30, "1", "0"),
         ]
         for name, hostile, expected_tries, expected_effective in cases:
             with self.subTest(case=name, hostile=hostile):
@@ -2050,12 +2055,14 @@ exit 0
                 env.pop("SUTANDO_CORE_SESSION_WAIT_S", None)
                 if hostile is not None:
                     env["SUTANDO_CORE_SESSION_WAIT_S"] = hostile
+                started = time.monotonic()
                 result = subprocess.run(
                     ["/bin/bash", "-c",
                      "set -euo pipefail\n" + snippet +
                      '\necho "$SESSION_UP_TRIES"\necho "$SESSION_UP_EFFECTIVE_S"'],
                     env=env, capture_output=True, text=True, timeout=5,
                 )
+                self.assertLess(time.monotonic() - started, 2.0, f"case={name} parsing stalled")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 out_tries, out_effective = result.stdout.splitlines()
                 self.assertEqual(out_tries, expected_tries,
@@ -2105,7 +2112,7 @@ exit 0
     def _mutate_launcher(self, old, new):
         path = self.root / "src/agent/codex/cli/start-cli.sh"
         text = path.read_text()
-        self.assertIn(old, text, "mutation target moved")
+        self.assertEqual(text.count(old), 1, "mutation target must exist exactly once")
         path.write_text(text.replace(old, new))
 
     def test_control_a_raw_value_in_the_warning_is_caught(self):
@@ -2129,9 +2136,19 @@ exit 0
         """A session that reports itself on the third poll after new-session is
         still picked up inside the configured wait, with no timeout warning."""
         self._write_exe("tmux", SESSION_UP_THIRD_POLL_TMUX)
-        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "2"})
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "1"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("did not come up", result.stderr)
+        polls = [c for c in self._calls_after_new_session() if "has-session -t =" in c and "-watcher" not in c]
+        self.assertGreaterEqual(len(polls), 3, polls)
+
+    def test_launcher_tty_branch_uses_the_same_session_wait(self):
+        """The interactive branch runs the same create-and-poll unit: a third-poll
+        session comes up under a tty too, with no timeout warning."""
+        self._write_exe("tmux", SESSION_UP_THIRD_POLL_TMUX)
+        result = self.run_launcher_with_tty(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("did not come up", result.stdout)
         polls = [c for c in self._calls_after_new_session() if "has-session -t =" in c and "-watcher" not in c]
         self.assertGreaterEqual(len(polls), 3, polls)
 
