@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Pins start-cli's proxy-routing policy: caller-set ANTHROPIC_BASE_URL wins; a
-# loaded proxy job polls bounded for the listener; a dead port is never wired.
+# loaded proxy job OR a live app-supervised proxy process polls bounded for the
+# listener; a dead port is never wired.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pass=0; fail=0
@@ -29,7 +30,22 @@ printf '#!/bin/sh\nexit 0\n' > "$TMP/exp-never-bin/sleep"
 # exp-dead: job loaded, port dead, REAL sleep — used to prove caller-preset
 # launches skip the wait entirely (timing assert).
 printf '#!/bin/sh\nexit 1\n' > "$TMP/exp-dead-bin/lsof"
-chmod +x "$TMP"/live-bin/* "$TMP"/dead-bin/* "$TMP"/exp-late-bin/* "$TMP"/exp-never-bin/* "$TMP"/exp-dead-bin/*
+# app-*: no launchd job, but a proxy PROCESS is alive (pgrep 0) — the desktop
+# app supervises the proxy itself. app-late binds on the 4th probe; app-never never.
+mkdir -p "$TMP/app-late-bin" "$TMP/app-never-bin"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/app-late-bin/launchctl"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/app-never-bin/launchctl"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/app-late-bin/pgrep"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/app-never-bin/pgrep"
+sed "s#$TMP/probe-count#$TMP/app-probe-count#g" "$TMP/exp-late-bin/lsof" > "$TMP/app-late-bin/lsof"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/app-never-bin/lsof"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/app-never-bin/sleep"
+# Every other dir: no proxy process, so a proxy live on the HOST cannot leak in.
+for d in live-bin dead-bin exp-late-bin exp-never-bin exp-dead-bin; do
+  printf '#!/bin/sh\nexit 1\n' > "$TMP/$d/pgrep"
+done
+chmod +x "$TMP"/live-bin/* "$TMP"/dead-bin/* "$TMP"/exp-late-bin/* "$TMP"/exp-never-bin/* "$TMP"/exp-dead-bin/* \
+  "$TMP"/app-late-bin/* "$TMP"/app-never-bin/*
 
 run_probe() {  # $1 = stub bin dir; remaining args = extra env KEY=VAL pairs
   local stub="$1"; shift
@@ -99,6 +115,24 @@ echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://example.test:1"
 check $? "caller preset still wins when the proxy is expected but down"
 [ "$_elapsed" -le 5 ]
 check $? "caller preset skips the wait (fast path, ${_elapsed}s elapsed)"
+
+# 8. App-supervised + LATE listener: no launchd job, but the desktop app's proxy
+#    process is alive and binds on the 4th poll. The wait must apply here too.
+rm -f "$TMP/app-probe-count"
+out="$(run_probe "$TMP/app-late-bin")"
+echo "$out" | grep -qx "ANTHROPIC_BASE_URL=http://localhost:7846"
+check $? "app-supervised (no launchd job) + late listener → bounded wait wires the proxy"
+[ "$(cat "$TMP/app-probe-count" 2>/dev/null || echo 0)" -ge 4 ]
+check $? "app-supervised path re-polled ($(cat "$TMP/app-probe-count" 2>/dev/null || echo 0) lsof probes)"
+
+# 9. App-supervised + never a listener: unwired, and the warning names the signal.
+rm -f "$TMP/stderr"
+out="$(run_probe "$TMP/app-never-bin")"
+echo "$out" | grep -q "ANTHROPIC_BASE_URL"
+[ $? -ne 0 ]
+check $? "app-supervised + never-listener → core env stays unwired"
+grep -q "expected (proxy process running).*no proxy protection" "$TMP/stderr"
+check $? "app-supervised budget exhaustion warns instead of staying silent"
 
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi

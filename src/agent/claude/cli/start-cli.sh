@@ -302,6 +302,12 @@ if [ -n "$RESTART_REQUESTED" ]; then
       exit 1
     fi
   fi
+  # Hand the heartbeat over too: the old writer is still in its absence grace window, so an
+  # ensure would adopt it and it would then exit, leaving the new core with no .alive.
+  if [ -n "$PY" ] && [ -f "$REPO/src/core_heartbeat.py" ]; then
+    "$PY" "$REPO/src/core_heartbeat.py" --stop > /dev/null 2>&1 \
+      || echo "  ⚠ heartbeat handoff (--stop) failed — the old writer may still be running" >&2
+  fi
   log_restart_attempt "kill-complete; creating fresh core"
 fi
 
@@ -426,6 +432,17 @@ ensure_task_notifier() {
     "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
 }
 
+# The heartbeat writer exits once its core pane is gone, so every launch of the core must
+# re-ensure it; cron-runner holds every prompt-backed fire while .alive is missing.
+ensure_core_heartbeat() {
+  if [ -z "$PY" ] || [ ! -f "$REPO/src/core_heartbeat.py" ]; then
+    echo "  ⚠ core heartbeat not ensured: no runnable Python interpreter; cron-runner fires stay held" >&2
+    return 0
+  fi
+  "$PY" "$REPO/src/core_heartbeat.py" --ensure > /dev/null 2>&1 \
+    || echo "  ⚠ core heartbeat --ensure failed; cron-runner fires stay held until it runs" >&2
+}
+
 # Core-only: a pool worker is never the subject of the Agent Shepherd monitor.
 ensure_core_monitor() {
   local ws mon_out relay_pid_file relay_state
@@ -493,6 +510,7 @@ ensure_core_monitor() {
 if claude_named_session_running; then
   apply_claude_tmux_defaults
   ensure_core_monitor   # re-ensure the supervisor monitor on every attach/re-run
+  ensure_core_heartbeat
   ensure_task_notifier
   if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
     echo "Attaching to existing $SESSION (Ctrl-b d to detach)..."
@@ -657,6 +675,7 @@ if [ -t 1 ]; then
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_task_notifier   # the supervisor needs the core session to exist first
+  ensure_core_heartbeat
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   # Verify the core actually came up before reporting success. Without this a
@@ -674,6 +693,7 @@ else
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   ensure_task_notifier
+  ensure_core_heartbeat
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
     echo "Started $SESSION detached — opened a Terminal window attached to it."

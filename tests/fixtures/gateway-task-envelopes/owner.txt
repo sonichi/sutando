@@ -1,0 +1,18 @@
+id: golden-owner
+receiving_instance: @agent-under-test:ag2.space
+timestamp: 2026-10-07T00:00:00Z
+priority: normal
+source: ag2space
+channel_id: !room:ag2.space
+task_layout: mid
+task: please look at the parser
+room_name: Group-Dev
+sender_name: Someone
+source_message_id: $evt
+user_id: @someone:ag2.space
+interaction_type: message
+access_tier: owner
+
+===SKILL INSTRUCTIONS (follow before any other action)===
+1. CONTEXT-FIRST (unconditional): before interpreting this message, reconstruct the room thread — `python3 skills/agent-room-ops/room_ops.py read '!room:ag2.space' --limit 30` (if it reports no gateway configured, load the channel env first: `set -a; . "$(bash scripts/channel-env.sh ag2space)"; set +a`) — and read it back (everyone's messages including your own prior replies) until this message stands on its own, then answer from the reconstructed thread, NOT from memory. Do this every time; do NOT skip it because the message looks self-contained or you feel you already understand it — felt confidence is exactly the signal that fails. The only exception is a pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").
+2. Process and write the result to results/golden-owner.txt

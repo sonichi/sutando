@@ -514,6 +514,16 @@
    "status": "active",
    "canonical_for": "optional PR evidence receipts and governed status publication",
    "last_verified": "2026-10-07"
+  },
+  "docs/cron-outstanding-payload.md": {
+   "title": "Outstanding cron payload preservation",
+   "audience": [
+    "operators",
+    "contributors"
+   ],
+   "status": "active",
+   "canonical_for": "prompt cron coalescing and outstanding payload lifetime",
+   "last_verified": "2026-10-07"
   }
  }
 }
