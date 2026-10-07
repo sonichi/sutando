@@ -176,7 +176,7 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 		// base-mode marker (appended below) anchors continuation instead.
 		const modeState = ctx.resolveCurrentMode();
 		const meetingHint = modeState.isMeeting
-			? '\n\n[MEETING MODE — you are listening and taking notes. Do NOT speak or produce any audio. Only respond if someone says "Sutando." Use the replayed history above as context for what was discussed before the reconnect.]'
+			? '\n\n[MEETING MODE — the meeting is being transcribed into notes and you are not hearing it. Do NOT speak or produce any audio.]'
 			: (isQuickReconnect || modeState.isPresenter)
 				? '\n\n[Do NOT greet the user. Do NOT say "Welcome back" or anything similar. Stay completely silent and wait for the user\'s next spoken input — they were just briefly disconnected and want to resume without interruption.]'
 				: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
@@ -195,7 +195,7 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 	const insightHint = hasHistory && existsSync(insightFile) ? ' Also mention: "I noticed a pattern in your usage — ask me about it if you are curious."' : '';
 	const modeState = ctx.resolveCurrentMode();
 	if (modeState.isMeeting) {
-		return `[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says "Sutando" or "hey Sutando" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no "silent", no sounds. You are an invisible note-taker until called upon.]${modeState.marker}`;
+		return `[System: MEETING MODE — the meeting is being transcribed into notes and you are not hearing it. Do NOT speak or produce any audio.]${modeState.marker}`;
 	}
 	return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${modeState.marker}`;
 }
@@ -267,8 +267,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'- join_gmeet: Join a Google Meet via browser with computer audio. Use when user says "join the meet" or gives a Meet code.',
 		'- summon: Share screen via Zoom (desktop app). Use when user says "summon", "share my screen".',
 		'- dismiss: Leave the current Zoom meeting. Use when user says "dismiss", "leave zoom", "end meeting", "leave the call".',
-		'- switch_mode: Switch between "active" (normal) and "meeting" (silent note-taker). Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode". Call switch_mode("active") to resume.',
-		'- save_meeting_note: Save meeting observations to notes/meeting-{date}.md. Call every 5-10 min in meeting mode. Use type "summary" when exiting meeting mode.',
+		'- switch_mode: Switch between "active" (normal) and "meeting" (transcribes the meeting into notes). Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode".',
 		'- For phone calls, meeting dial-in, or anything needing contacts/calendar context → use work (core handles it).',
 		...instantTools.map(t => `- ${t.name}: ${(t.description as string).split('.')[0]}. Instant.`),
 		...(coreDocumentedSkills.length > 0 ? [
@@ -279,10 +278,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		] : []),
 		'',
 		'CRITICAL RULES:',
-		(() => ctx.isMeetingActive()
-			? '⚠️ MEETING MODE IS CURRENTLY ACTIVE. You are an invisible note-taker. Listen to all audio and track: speakers, topics, decisions, action items. Produce ZERO audio output unless someone says "Sutando" or "hey Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key points. Do NOT call work or other tools unless explicitly addressed. When addressed, answer DIRECTLY from what you heard — do NOT call work (core has no meeting audio). "bye" in a meeting does NOT mean disconnect — only "Sutando disconnect" or "Sutando bye". To exit: user says "Sutando, active mode" → call switch_mode("active") and save_meeting_note(summary).'
-			: '- MEETING MODE: Call switch_mode("meeting") when user says "take notes", "be silent", "passive mode", or when you join a meeting. In meeting mode: listen and auto-save notes via save_meeting_note every 5-10 min, produce zero audio, don\'t call other tools — unless addressed by name. Call switch_mode("active") to resume.'
-		)(),
+		'- MEETING MODE: Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode", or "passive mode". From then on you do not hear the meeting: every sentence is transcribed into notes/meeting-<date>.md, and the user brings you back by saying "Sutando, come back", "meeting is over", "end meeting", or by switching to active in the menu bar.',
 		'- PRESENTER MODE: Call switch_mode("presenter") when user says "presenter mode on", "going live", "starting the talk", "the talk starts", or "I am on stage". Call switch_mode("active") when user says "presenter mode off", "talk is done", "stop presenting", or "done presenting". Do NOT route these phrases to work — they are direct tool triggers. switch_mode("presenter") returns a "say" field; speak it verbatim as your FIRST utterance.',
 		'- GOODBYE: When the user says goodbye, bye, or clearly ends the conversation, respond with a SHORT farewell that STARTS with the word "Goodbye" (e.g. "Goodbye! Talk to you later."). Keep it under one sentence. The session will close automatically. Do NOT start the farewell with "I\'m back", "Hello", "Welcome", or any other greeting word — only use a short starts-with-goodbye response for actual goodbyes.',
 		'- FILLERS ARE NOT REQUESTS: Short utterances that are fillers, acknowledgments, or thinking noises — "hmm", "um", "uh", "ah", "mhm", "oh", "ok", "yeah", "right", "[BLANK_AUDIO]", or any single-word backchannel — are NOT instructions. Do NOT call work, do NOT say "queued up" or "working on it", do NOT narrate. Either stay silent (preferred) or produce a brief ACK like "mm-hm" if the user seems to expect confirmation. Only act when the user issues a clear directive or question.',
@@ -297,10 +293,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'- DEICTIC SCREEN REFERENCES: When the user uses a deictic word ("this", "that", "it", "this part", "fix this", "what does this say") without obvious conversational antecedent, FIRST call read_selection to capture what they\'re pointing at on screen. Then act on the returned selection/window context. Only ask a clarifying question if read_selection returns empty AND no prior conversation context resolves the reference. Default to read_selection over "which one do you mean?" — the user is usually pointing.',
 		'- MISSING CONTEXT: When the user references something you don\'t have context for ("the draft", "what we discussed", "type that", "send what I asked for"), ALWAYS delegate to work. The core agent has the full conversation history and knows what was discussed. Never guess or ask the user to repeat — just call work.',
 		'- MISHEARD-RISK CONFIRM (distinct from MISSING CONTEXT): if the request came through GARBLED or you are genuinely unsure you transcribed it correctly — noisy audio, a phrase that does not parse, or two equally-likely readings of WHAT to delegate — do ONE brief read-back of your understanding ("You want me to X — right?") before calling work, rather than delegating a possibly-wrong transcript. Keep it to a single short confirm. If the request is clear, SKIP this and call work normally — the core also receives the recent transcript and can self-correct, so do NOT over-confirm; only when you are genuinely unsure of the words.',
-		(() => ctx.isMeetingActive()
-			? '- IN MEETING MODE: When addressed by name, answer DIRECTLY from what you heard in the meeting. Do NOT call work — the core agent cannot hear the meeting audio and has no context. You are the one who listened. Summarize discussions, decisions, and action items from your own memory of the conversation.'
-			: '- When in doubt, call work.'
-		)(),
+		'- When in doubt, call work.',
 		'',
 		'VOICE RULES:',
 		'- Keep responses to 2–3 sentences. You are talking, not writing.',
