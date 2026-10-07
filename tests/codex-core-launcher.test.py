@@ -1973,35 +1973,121 @@ exit 0
         self.assertIn("could not prune spent delivery sentinels", result.stderr)
         self.assertEqual((results / "task-owner.txt").read_text(), "done\n")
 
-    def test_session_wait_knob_clamps_a_hostile_large_value(self):
-        """An absurd SUTANDO_CORE_SESSION_WAIT_S must not turn the seq-built poll
-        list into something that never finishes building it (confirmed live: an
-        unclamped 10**17-scale value still ran after 4s). Exercises the real
-        start-cli.sh arithmetic, not a reimplementation of it."""
+    def _session_wait_snippet(self):
+        """The real start-cli.sh SESSION_UP_WAIT_S/TRIES block, lines
+        SESSION_UP_WAIT_S=... through the -le 300 ceiling clamp inclusive —
+        found by content, not a fixed line count, so the block can grow
+        without silently truncating what this test runs."""
         script_text = (self.root / "src/agent/codex/cli/start-cli.sh").read_text()
         lines = script_text.splitlines()
         start = next(i for i, l in enumerate(lines)
                      if l.startswith('SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S'))
-        snippet = "\n".join(lines[start:start + 6])
+        end = next(i for i, l in enumerate(lines)
+                   if i >= start and "SESSION_UP_EFFECTIVE_S" in l)
+        return "\n".join(lines[start:end + 1])
+
+    def test_session_wait_knob_validates_and_clamps_hostile_values(self):
+        """SUTANDO_CORE_SESSION_WAIT_S must degrade to a bounded try count for
+        every hostile shape, under the launcher's OWN `set -euo pipefail` —
+        not a looser shell. Two real gaps were caught in review on PR #5210,
+        both against an earlier version of this same test:
+        - keweichen: verified without `set -u`, so it passed while the real
+          launcher would exit on a non-numeric value (bash treats a bare
+          unset identifier like "abc" in arithmetic context as an
+          unbound-variable error under `set -u`, not a silent 0).
+        - Sutando (rui): a regex-only validation still let "08" through
+          (matches `^[0-9]+$`) into arithmetic, where bash's leading-zero
+          octal parsing makes "08"/"09" invalid digits and crashes the same
+          way; confirmed live through the full launcher with 08/1e3/.5."""
+        snippet = self._session_wait_snippet()
         self.assertIn("SESSION_UP_TRIES", snippet)
         self.assertIn("-le 300", snippet, "clamp line moved or was removed")
+        self.assertIn("10#", snippet, "base-10 guard against octal parsing moved or was removed")
 
-        for hostile, expected_tries in [
-            ("99999999999999999", "300"),
-            ("-3", "1"),
-            ("abc", "1"),
-            ("", "25"),
-            ("5", "25"),
-        ]:
-            with self.subTest(hostile=hostile):
+        # tries = clamp(5 * int(value), 1, 300) and the message shows tries / 5;
+        # anything that is not a signed base-10 literal falls back to the default 5.
+        cases = [
+            ("unset", None, "25", "5"),
+            ("empty", "", "25", "5"),
+            ("zero", "0", "1", "0"),
+            ("normal", "5", "25", "5"),
+            ("decimal", "5.7", "25", "5"),
+            ("negative", "-3", "1", "0"),
+            ("negative_leading_zero", "-08", "1", "0"),
+            ("leading_zero", "08", "40", "8"),
+            ("huge", "99999999999999999", "300", "60"),
+            ("non_numeric", "abc", "25", "5"),
+            ("scientific", "1e3", "25", "5"),
+            ("formula_injection", "5 * 1000", "25", "5"),
+            ("bare_sign", "-", "25", "5"),
+            ("bare_dot", ".", "25", "5"),
+            ("leading_dot", ".5", "25", "5"),
+        ]
+        for name, hostile, expected_tries, expected_effective in cases:
+            with self.subTest(case=name, hostile=hostile):
+                env = dict(os.environ)
+                env.pop("SUTANDO_CORE_SESSION_WAIT_S", None)
+                if hostile is not None:
+                    env["SUTANDO_CORE_SESSION_WAIT_S"] = hostile
                 result = subprocess.run(
-                    ["/bin/bash", "-c", snippet + '\necho "$SESSION_UP_TRIES"'],
-                    env={**os.environ, "SUTANDO_CORE_SESSION_WAIT_S": hostile},
-                    capture_output=True, text=True, timeout=5,
+                    ["/bin/bash", "-c",
+                     "set -euo pipefail\n" + snippet +
+                     '\necho "$SESSION_UP_TRIES"\necho "$SESSION_UP_EFFECTIVE_S"'],
+                    env=env, capture_output=True, text=True, timeout=5,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.strip(), expected_tries,
-                                  f"hostile={hostile!r} stderr={result.stderr!r}")
+                out_tries, out_effective = result.stdout.splitlines()
+                self.assertEqual(out_tries, expected_tries,
+                                  f"case={name} hostile={hostile!r} stderr={result.stderr!r}")
+                self.assertEqual(out_effective, expected_effective,
+                                  f"case={name} hostile={hostile!r} stderr={result.stderr!r}")
+
+    def test_launcher_survives_an_invalid_session_wait_value_end_to_end(self):
+        """The real launcher (not an extracted snippet) must still bring up a
+        session and clear the shutdown sentinel when the knob is garbage —
+        the full startup round trip kewei asked this PR to cover, including
+        rui's live repro values. "08" is a real gotcha here: it's syntactically
+        a plain number (so it must NOT fall back to the default — 08 means 8,
+        not "invalid"), but bash's own leading-zero octal parsing makes it
+        crash the exact same way as truly-invalid input unless arithmetic is
+        forced to base 10; both must be exercised, and distinguished."""
+        for hostile, expected_bound in (("abc", "5"), ("1e3", "5"), (".5", "5"), ("08", "8")):
+            with self.subTest(hostile=hostile):
+                result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": hostile})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("unbound variable", result.stderr)
+                self.assertNotIn("value too great for base", result.stderr)
+                self.assertIn(f"did not come up within ~{expected_bound}s", result.stderr)
+
+    def test_launcher_prints_the_effective_bound_not_the_raw_huge_value(self):
+        """rui's second finding: the warning must name what the launcher
+        actually waited (the clamped bound), not the raw huge input."""
+        result = self.run_launcher(
+            env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "99999999999999999"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("did not come up within ~60s", result.stderr)
+        self.assertNotIn("99999999999999999", result.stderr)
+
+    def test_launcher_delayed_session_still_comes_up_within_the_wait(self):
+        """A session that reports itself a beat late (not instantly, not
+        never) must still be picked up inside the configured wait — the
+        delayed-session path kewei asked this PR to cover, exercised against
+        the real launcher rather than the extracted arithmetic."""
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then
+  n="$(cat "$TMUX_STATE.hits" 2>/dev/null || echo 0)"
+  n=$((n + 1))
+  echo "$n" > "$TMUX_STATE.hits"
+  [ "$n" -ge 3 ] && exit 0
+  exit 1
+fi
+exit 0
+''')
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "2"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("did not come up", result.stderr)
 
     def test_worker_one_shot_pending_failure_exits_nonzero_without_typing(self):
         workspace = self.root / "workspace"

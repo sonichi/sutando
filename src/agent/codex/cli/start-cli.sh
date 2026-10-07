@@ -154,11 +154,34 @@ CODEX_WAIT_TIMEOUT="${SUTANDO_CODEX_WAIT_TIMEOUT:-120}"
 # How long a freshly created core session may take to answer has-session.
 # Tests with a stub tmux that never reports one set this low.
 SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S:-5}"
-SESSION_UP_TRIES=$(( ${SESSION_UP_WAIT_S%.*} * 5 ))
+# A non-numeric value (a typo, a stray word) must fall back to the default rather
+# than reach the arithmetic below: under `set -u` an unset bare identifier like
+# "abc" is a hard "unbound variable" exit, not a graceful degrade. (keweichen,
+# PR #5210: the first version of this guard was verified without `set -u`,
+# which hid exactly this.)
+if ! [[ "$SESSION_UP_WAIT_S" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+  SESSION_UP_WAIT_S=5
+fi
+# A regex pass isn't enough: bash arithmetic treats a leading-zero integer
+# literal as octal, and "08"/"09" are invalid octal digits -- "08" matches
+# the check above but still crashes the arithmetic below. Force base 10
+# explicitly, and pull the sign out first since `10#` doesn't accept one
+# inline. (Sutando (rui), PR #5210, live repro with 08/1e3/.5 through the
+# full launcher.)
+_session_up_mag="${SESSION_UP_WAIT_S%.*}"
+_session_up_sign=""
+if [ "${_session_up_mag#-}" != "$_session_up_mag" ]; then
+  _session_up_sign="-"
+  _session_up_mag="${_session_up_mag#-}"
+fi
+SESSION_UP_TRIES=$(( ${_session_up_sign}(10#$_session_up_mag) * 5 ))
 [ "$SESSION_UP_TRIES" -ge 1 ] 2>/dev/null || SESSION_UP_TRIES=1
 # A hostile/mistyped value (e.g. a stray extra digit) must not turn the seq-built
 # poll list into something that never finishes or exhausts memory building it.
 [ "$SESSION_UP_TRIES" -le 300 ] 2>/dev/null || SESSION_UP_TRIES=300
+# The warning below should name what the launcher actually waited, not the raw
+# (possibly huge, now-clamped) input value. (rui, PR #5210.)
+SESSION_UP_EFFECTIVE_S=$(( SESSION_UP_TRIES / 5 ))
 if ! command -v codex >/dev/null 2>&1; then
   echo "  … waiting for the Codex CLI to finish installing (up to ${CODEX_WAIT_TIMEOUT}s)" >&2
   _codex_waited=0
@@ -563,7 +586,7 @@ if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   if session_exists "$SESSION"; then
     clear_shutdown_sentinel
   else
-    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_WAIT_S}s — sentinel NOT cleared, no core is serving." >&2
+    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_EFFECTIVE_S}s — sentinel NOT cleared, no core is serving." >&2
   fi
   ensure_task_notifier
   ensure_core_monitor
@@ -580,7 +603,7 @@ else
   if session_exists "$SESSION"; then
     clear_shutdown_sentinel
   else
-    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_WAIT_S}s — sentinel NOT cleared, no core is serving." >&2
+    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_EFFECTIVE_S}s — sentinel NOT cleared, no core is serving." >&2
   fi
   ensure_task_notifier
   ensure_core_monitor
