@@ -321,3 +321,46 @@ export function migrateLegacyModel(configPath: string, now: Date = new Date()): 
 	renameSync(tmp, configPath);
 	return { migrated: true, backup, reason: 'moved from the old seeded default' };
 }
+
+/** Written by the voice switch tool: a model the user picked is never reverted. */
+export const MODEL_CHOSEN_KEY = 'modelChosenBySwitch';
+/** Written when a migrated install is put back on 3.1, so the revert also happens at most once. */
+export const MODEL_REVERT_KEY = 'modelMigrationReverted';
+
+export interface ModelRevert {
+	reverted: boolean;
+	model?: string;
+	reason: string;
+}
+
+/**
+ * Put a config the migration moved to 3.8 back on its old model, once, when 3.8 is unavailable.
+ *
+ * Only a config carrying the migration stamp and still on the migrated model is touched, and not
+ * one whose model the voice switch tool wrote, so a user who chose 3.8 themselves is not moved. The model comes from the `.bak-3.1` copy when it
+ * names one; every other current key is kept. The migration stamp stays, so it never re-runs.
+ */
+export function revertModelMigration(configPath: string, now: Date = new Date()): ModelRevert {
+	if (!existsSync(configPath)) return { reverted: false, reason: 'no config file' };
+	let raw: Record<string, unknown>;
+	try {
+		raw = JSON.parse(readFileSync(configPath, 'utf-8'));
+	} catch {
+		return { reverted: false, reason: 'config unreadable' };
+	}
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { reverted: false, reason: 'config is not an object' };
+	if (raw[MODEL_MIGRATION_KEY] === undefined) return { reverted: false, reason: 'not moved by the migration' };
+	if (raw[MODEL_REVERT_KEY] !== undefined) return { reverted: false, reason: 'already reverted once' };
+	if (raw.model !== MIGRATED_MODEL) return { reverted: false, reason: `model is ${String(raw.model)}, not the migrated one` };
+	if (raw[MODEL_CHOSEN_KEY] === raw.model) return { reverted: false, reason: 'model was chosen with the voice switch' };
+	let model = LEGACY_SEEDED_MODEL;
+	try {
+		const backupModel = JSON.parse(readFileSync(`${configPath}.bak-3.1`, 'utf-8'))?.model;
+		if (typeof backupModel === 'string' && backupModel && backupModel !== MIGRATED_MODEL) model = backupModel;
+	} catch { /* no usable backup: the migration only ever moved the legacy model */ }
+	const next = { ...raw, model, [MODEL_REVERT_KEY]: `${MIGRATED_MODEL} -> ${model} on ${now.toISOString().slice(0, 10)} (model unavailable)` };
+	const tmp = `${configPath}.tmp`;
+	writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
+	renameSync(tmp, configPath);
+	return { reverted: true, model, reason: 'migrated model unavailable' };
+}

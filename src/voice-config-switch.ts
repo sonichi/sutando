@@ -27,9 +27,9 @@ import { z } from 'zod';
 import { writeFileSync, renameSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
-import { VOICE_CONFIG_DEFAULTS, type VoiceConfig } from './voice-config.js';
+import { MODEL_CHOSEN_KEY, VOICE_CONFIG_DEFAULTS, type ModelRevert, type VoiceConfig } from './voice-config.js';
 import { resolveWorkspace } from './workspace_default.js';
 
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -49,14 +49,54 @@ export const GUARDED_RESTART_SCRIPT = join(REPO_ROOT, 'scripts', 'restart-voice-
  * takeover-blocked, nothing signaled; missing interpreter ⇒ the wrapper fails
  * closed before touching the lock. `spawnImpl` is injectable for tests.
  */
-export function fireGuardedRestart(spawnImpl: typeof spawn = spawn): void {
+export function fireGuardedRestart(
+	spawnImpl: typeof spawn = spawn,
+	onExit?: (code: number | null) => void,
+): void {
 	// detached so the wrapper outlives this process — the takeover it runs
 	// kills the current voice-agent (we ARE the lock holder) mid-script.
 	const child = spawnImpl('bash', [GUARDED_RESTART_SCRIPT], {
 		detached: true,
 		stdio: 'ignore',
 	});
+	// Fires only if this process is still alive, i.e. the wrapper refused or failed.
+	if (onExit) child.on('exit', (code) => onExit(code));
 	child.unref();
+}
+
+/** The guarded wrapper refuses (exit 5) unless voice-agent runs under this launchd job. */
+export function isVoiceAgentLaunchdManaged(spawnSyncImpl: typeof spawnSync = spawnSync): boolean {
+	const uid = typeof process.getuid === 'function' ? process.getuid() : -1;
+	if (uid < 0) return false;
+	const r = spawnSyncImpl('launchctl', ['print', `gui/${uid}/com.sutando.voice-agent`], { stdio: 'ignore' });
+	return r.status === 0;
+}
+
+/**
+ * After a model revert, restart only where something will respawn voice-agent, and tell the owner
+ * what actually happens: a restart, or voice down until Sutando is restarted.
+ */
+export function restartAfterModelRevert(
+	revert: ModelRevert,
+	fromModel: string,
+	deps: {
+		launchdManaged: boolean;
+		restart: (onExit: (code: number | null) => void) => void;
+		notify: (message: string) => void;
+	},
+): 'restarting' | 'needs-manual-restart' | 'nothing' {
+	if (!revert.reverted || !revert.model) return 'nothing';
+	const to = revert.model;
+	const down = `Voice model ${fromModel} isn't available for your Gemini key. Voice is set back to ${to} but stays down until Sutando restarts — restart Sutando to bring voice back on ${to}.`;
+	if (!deps.launchdManaged) {
+		deps.notify(down);
+		return 'needs-manual-restart';
+	}
+	deps.notify(`Voice model ${fromModel} isn't available for your Gemini key, so voice went back to ${to} and is restarting.`);
+	deps.restart((code) => {
+		if (code !== 0) deps.notify(down);
+	});
+	return 'restarting';
 }
 
 // Presets carry only the two knobs this tool switches (model + googleSearch);
@@ -101,7 +141,8 @@ export function nextSwitchConfig(
 		existingRaw && typeof existingRaw === 'object' && !Array.isArray(existingRaw)
 			? (existingRaw as Partial<VoiceConfig>)
 			: {};
-	return { ...VOICE_CONFIG_DEFAULTS, ...existing, ...preset };
+	const next = { ...VOICE_CONFIG_DEFAULTS, ...existing, ...preset, [MODEL_CHOSEN_KEY]: preset.model };
+	return next;
 }
 
 export const switchVoiceConfigTool: ToolDefinition = {

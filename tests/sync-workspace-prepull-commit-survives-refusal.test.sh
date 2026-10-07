@@ -27,6 +27,7 @@ mkhost() {  # name wsid -> sets ${name}_REPO ${name}_WS, runs --init
 JSON
   echo "$n note" > "$w/notes/$n-note.md"
   env -i HOME="$HOME" PATH="$PATH" SUTANDO_REPO_DIR="$r" SUTANDO_WORKSPACE="$w" SUTANDO_TEST_MODE=1 \
+      SUTANDO_SYNC_LOCK_DIR="$TEST_ROOT/sync.lock.d" \
       GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
       GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL" \
       SUTANDO_HOST_OVERRIDE="$n" SUTANDO_WS_ID_OVERRIDE="$wsid" \
@@ -37,6 +38,7 @@ runsync() {  # name wsid args...
   local n="$1" wsid="$2"; shift 2
   local r="$TEST_ROOT/$n-repo" w="$TEST_ROOT/$n-ws"
   env -i HOME="$HOME" PATH="$PATH" SUTANDO_REPO_DIR="$r" SUTANDO_WORKSPACE="$w" SUTANDO_TEST_MODE=1 \
+      SUTANDO_SYNC_LOCK_DIR="$TEST_ROOT/sync.lock.d" \
       GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
       GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL" \
       SUTANDO_HOST_OVERRIDE="$n" SUTANDO_WS_ID_OVERRIDE="$wsid" SUTANDO_FORCE_SYNC="${FORCE:-0}" \
