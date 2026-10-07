@@ -18,6 +18,7 @@ import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
 import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
+import { frameTaskResult } from './inject-framing.js';
 import {
 	emitTaskProcessed,
 	selectBackend,
@@ -812,209 +813,270 @@ export function queuedAheadInstruction(queuedAhead: number): string {
 	return ` ${queuedAhead} task(s) are still running ahead of this one. Tell the user exactly "${line}" and wait; do not narrate the queue again.`;
 }
 
+const workParameters = z.object({
+	task: z.string().describe('Full description of the task to perform'),
+	timeout_minutes: z
+		.number()
+		.optional()
+		.describe(
+			'Per-task timeout in minutes. Default 60. Lower it (e.g. 5) only when a late ' +
+			'answer is worse than no answer, so the user is told it failed instead of ' +
+			'waiting. Pass 0 for no timeout — use sparingly, only when the user ' +
+			'explicitly asks for a long autonomous job that may legitimately take hours.'
+		),
+	dm_on_timeout: z
+		.boolean()
+		.optional()
+		.describe(
+			'If true, send a Discord DM to the owner when this task hits its timeout. ' +
+			'Default false (silent UI-only timeout, per Susan PR #578). Use only for ' +
+			'tasks the user has explicitly flagged as critical. The Chi-override to ' +
+			'default-true (2026-05-03 06:00 PT) was reverted at 06:47 PT after Chi flagged ' +
+			'a timeout DM that shouldn\'t have gone through.'
+		),
+});
+
+type WorkArgs = { task: string; timeout_minutes?: number; dm_on_timeout?: boolean };
+
+/** Writes the task file (or answers from a fast path / dedup) and returns at once. */
+async function submitWork(args: WorkArgs): Promise<Record<string, unknown>> {
+	const { task, timeout_minutes, dm_on_timeout } = args as {
+		task: string;
+		timeout_minutes?: number;
+		dm_on_timeout?: boolean;
+	};
+	// Read before the first await: the session can move to another origin while this call
+	// waits, and the task belongs to the origin, and the words, it was asked from.
+	const origin = _voiceSessionOrigin;
+	const originGeneration = _voiceOriginGeneration;
+	let recentAtAsk = '';
+	try { recentAtAsk = getRecentConversation(4); } catch { /* best effort */ }
+
+	// Redirect pure screen-viewing tasks to inline tools (faster, no round-trip)
+	// Narrow match: only "describe/look at my screen" — not scroll, screenshot,
+	// or screen-related tasks that the brain should handle.
+	const screenViewOnly = /\b(describe\s+(my\s+)?screen|what.s on\s+(my\s+)?screen|look at\s+(my\s+)?screen)\b/i;
+	if (screenViewOnly.test(task)) {
+		return { status: 'rejected', message: 'Use describe_screen inline tool directly for screen viewing.' };
+	}
+
+	// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
+	// Same pattern as conversation-server's tryFastPath.
+	// Skipped on Windows: shells out to /bin/sh + bash + invokes a .sh skill
+	// that isn't ported yet. The slow file-bridge path below still works.
+	const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(task);
+	if (concatMatch && process.platform !== 'win32') {
+		try {
+			const { execFileSync } = await import('node:child_process');
+			// ls globs need shell for wildcard expansion — command strings are static literals (fixes #1451)
+			const image = execFileSync('/bin/sh', ['-c', 'ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1'], { timeout: 3000 }).toString().trim();
+			const video = execFileSync('/bin/sh', ['-c', 'ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1'], { timeout: 3000 }).toString().trim();
+			if (image && video) {
+				// execFileSync argv array bypasses shell — image/video paths are separate args, no interpolation (fixes #1451)
+				const scriptPath = resolve(claudeHomePath('skills', 'video-concat', 'scripts', 'prepend-image.sh'));
+				const result = execFileSync('bash', [scriptPath, image, video, '3'], { timeout: 60000 }).toString().trim();
+				const parsed = JSON.parse(result);
+				return { status: 'done', result: `Video with image prepended: ${parsed.output} (${parsed.size_mb}MB)` };
+			}
+		} catch (e) { console.log(`${ts()} [TaskBridge] fast path concat failed: ${e}`); }
+	}
+
+	// Check if the watcher (Claude Code brain) is running. The historic probe
+	// uses `pgrep -f watch-tasks` (POSIX only). On Windows we fall back to a
+	// PID-file sentinel written by src/watch-tasks-stream.ps1.
+	let watcherOnline = false;
+	try {
+		if (process.platform === 'win32') {
+			const { existsSync, readFileSync } = await import('node:fs');
+			const pidFile = join(REPO_DIR, 'state', 'watch-tasks-stream.pid');
+			if (existsSync(pidFile)) {
+				const pid = parseInt(readFileSync(pidFile, 'utf-8').trim());
+				if (pid > 0) {
+					try {
+						// `process.kill(pid, 0)` is a liveness probe (signal 0); throws if process is gone.
+						process.kill(pid, 0);
+						watcherOnline = true;
+					} catch {}
+				}
+			}
+		} else {
+			const { execFileSync } = await import('node:child_process');
+			// execFileSync argv array — no shell interpolation (fixes #1451)
+			const watcherRunning = execFileSync('pgrep', ['-f', 'watch-tasks'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+			watcherOnline = !!watcherRunning;
+		}
+	} catch {
+		// pgrep returns exit code 1 if no match
+	}
+	if (!watcherOnline) {
+		console.log(`${ts()} [TaskBridge] WARNING: watcher offline — task will be queued for next cron pass`);
+	}
+
+	// Dedup: if the same task text is already pending (within DEDUP_WINDOW_MS),
+	// return the existing taskId instead of writing a duplicate task file.
+	const normalizedTask = normalizeTask(task);
+	const now = Date.now();
+	for (const [existingId, pending] of _pendingTasks) {
+		if (
+			normalizeTask(pending.taskText) === normalizedTask &&
+			now - pending.submittedAt < DEDUP_WINDOW_MS
+		) {
+			console.log(`${ts()} [TaskBridge] Dedup: task matches ${existingId} (submitted ${Math.round((now - pending.submittedAt) / 1000)}s ago)`);
+			return {
+				status: 'duplicate',
+				taskId: existingId,
+				message: `Task already pending as ${existingId}. Do NOT submit again — tell the user you are already working on it.`,
+			};
+		}
+	}
+
+	const taskId = `task-${Date.now()}`;
+	// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
+	// Cap at 6 hours to prevent runaway pending-state if the voice agent
+	// hallucinates a giant value.
+	let timeoutMs = DEFAULT_TASK_TIMEOUT_MS;
+	if (typeof timeout_minutes === 'number') {
+		if (timeout_minutes === 0) timeoutMs = 0;
+		else if (timeout_minutes > 0) timeoutMs = Math.min(timeout_minutes, 360) * 60 * 1000;
+	}
+	// Reserved before the first await: an identical call during the spoken-turn wait
+	// must meet this entry in the dedup check above, not write a second task file.
+	const pendingEntry = () => ({ submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task });
+	_pendingTasks.set(taskId, pendingEntry());
+	try {
+		const timestamp = new Date().toISOString();
+		const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
+		// Field order: `task:` LAST so the user-supplied (Gemini-relayed,
+		// possibly multi-line) task body can't forge header fields. Same
+		// shape as agent-api.py's /task endpoint after PR #982; consumers
+		// (`_isVoiceTask`, `parse_priority_from_text`) stop scanning at
+		// the first `task:` line.
+		// Attach a short window of recent conversation AFTER the `task:` line so
+		// the core can self-correct a misheard/garbled transcript (per Chi: "the
+		// voice agent may mishear and pass the wrong transcripts"). It lands in
+		// the task BODY (everything after `task:`), so it cannot forge header
+		// fields — consumers stop scanning headers at the first `task:` line.
+		// Best-effort: empty string if no log/session yet.
+		// The owner's own words first: what was actually said, verbatim from the
+		// session's input transcription, so the core can judge the model's `task:`
+		// wording against real speech instead of trusting it.
+		let spokenBlock = '';
+		try {
+			const spoken = await _awaitSpokenTurns(2, SPOKEN_WAIT_MS, undefined, () => _voiceOriginGeneration === originGeneration);
+			if (spoken.length > 0) {
+				spokenBlock =
+					`\n\n--- spoken (the owner's last words, verbatim as transcribed, or as typed into the voice session; the task line ` +
+					`above is the voice model's wording of them — if it adds intent these words do not ` +
+					`carry, ask before acting) ---\n${confineUserContent(spoken.map((t) => `user: ${t}`).join('\n'))}\n`;
+			}
+		} catch { /* best effort */ }
+		let contextBlock = '';
+		try {
+			const recent = recentAtAsk;
+			if (recent) {
+				contextBlock =
+					`\n\n--- recent voice transcript (may contain ASR errors; if the task above ` +
+					`seems garbled or doesn't match this, infer the true intent from it or ask to ` +
+					`confirm before acting) ---\n${confineUserContent(recent)}\n`;
+			}
+		} catch { /* best effort — never block delegation on context attach */ }
+		// An origin-bound session addresses the task to its origin and adds the adapter's
+		// guidance line; without one the task keeps `channel_id: local-voice`.
+		const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
+		_rememberTaskOrigin(taskId, origin);
+		const content =
+			buildVoiceTaskHeader(taskId, timestamp, ownerId, origin) +
+			`task: ${confineUserContent(task)}${originGuidance}${spokenBlock}${contextBlock}\n`;
+		await _delegation.submitTask(taskId, content);
+	} catch (err) {
+		_pendingTasks.delete(taskId);   // nothing was written: the reservation must not dedup a retry
+		throw err;
+	}
+	// Default FALSE (Susan PR #578 silent-timeout contract restored after
+	// Chi's 2026-05-03 06:00 override was reverted at 06:47 — the always-on
+	// default was producing unwanted DMs). Caller must explicitly pass
+	// dm_on_timeout: true on critical tasks where they want the fallback.
+	_pendingTasks.set(taskId, pendingEntry());
+	// Record owner activity for status-aware-pivot in proactive loop
+	writeOwnerActivity('voice', task);
+	console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
+	_sendTaskStatus?.(taskId, 'working', task.slice(0, 60));
+	// Counted after the write, so the file just written is excluded by id and
+	// everything older in tasks/ is what stands ahead of it.
+	const queuedAhead = countQueuedAhead(TASK_DIR, taskId);
+	return {
+		status: 'pending',
+		taskId,
+		queuedAhead,
+		message: (watcherOnline
+			? 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.'
+			: 'Task has been saved. The processing engine will pick it up on its next pass (within a few minutes). Tell the user the task is queued and will be handled shortly.')
+			+ queuedAheadInstruction(queuedAhead),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Result waiters — a background `work` call waits for its own task's result
+// ---------------------------------------------------------------------------
+
+// A live `work` call waits here for its task's result, which bodhi delivers as that call's
+// completion; a task with no waiter (call aborted, process restarted) is injected as before.
+const _resultWaiters = new Map<string, (outcome: string) => void>();
+
+/** Hands `outcome` to the call waiting on `taskId`; false when none waits. */
+export function _settleResultWaiter(taskId: string, outcome: string): boolean {
+	const settle = _resultWaiters.get(taskId);
+	if (!settle) return false;
+	_resultWaiters.delete(taskId);
+	settle(outcome);
+	return true;
+}
+
+export function _awaitTaskResult(taskId: string, signal: AbortSignal): Promise<string> {
+	return new Promise((resolve) => {
+		const detach = () => {
+			if (_resultWaiters.get(taskId) !== settle) return;
+			_resultWaiters.delete(taskId);
+			console.log(`${ts()} [TaskBridge] ${taskId}: work call ended before its result; the result will be injected when it lands`);
+			resolve('The task is still running. Its result will be delivered separately; say nothing about it now.');
+		};
+		const settle = (outcome: string) => {
+			signal.removeEventListener('abort', detach);
+			resolve(outcome);
+		};
+		_resultWaiters.set(taskId, settle);
+		if (signal.aborted) detach();
+		else signal.addEventListener('abort', detach, { once: true });
+	});
+}
+
+/** Longest a task can legitimately run (360 min cap, or 0 = none); the sweep ends it sooner. */
+const WORK_CALL_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
 export const workTool: ToolDefinition = {
 	name: 'work',
 	description:
 		'Do the work. Call this for anything beyond simple greetings — questions, actions, ' +
 		'research, writing, translation, file changes, system queries, explanations, analysis. ' +
-		'This is how Sutando thinks and acts. Results are spoken back when ready.',
-	parameters: z.object({
-		task: z.string().describe('Full description of the task to perform'),
-		timeout_minutes: z
-			.number()
-			.optional()
-			.describe(
-				'Per-task timeout in minutes. Default 60. Lower it (e.g. 5) only when a late ' +
-				'answer is worse than no answer, so the user is told it failed instead of ' +
-				'waiting. Pass 0 for no timeout — use sparingly, only when the user ' +
-				'explicitly asks for a long autonomous job that may legitimately take hours.'
-			),
-		dm_on_timeout: z
-			.boolean()
-			.optional()
-			.describe(
-				'If true, send a Discord DM to the owner when this task hits its timeout. ' +
-				'Default false (silent UI-only timeout, per Susan PR #578). Use only for ' +
-				'tasks the user has explicitly flagged as critical. The Chi-override to ' +
-				'default-true (2026-05-03 06:00 PT) was reverted at 06:47 PT after Chi flagged ' +
-				'a timeout DM that shouldn\'t have gone through.'
-			),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { task, timeout_minutes, dm_on_timeout } = args as {
-			task: string;
-			timeout_minutes?: number;
-			dm_on_timeout?: boolean;
-		};
-		// Read before the first await: the session can move to another origin while this call
-		// waits, and the task belongs to the origin, and the words, it was asked from.
-		const origin = _voiceSessionOrigin;
-		const originGeneration = _voiceOriginGeneration;
-		let recentAtAsk = '';
-		try { recentAtAsk = getRecentConversation(4); } catch { /* best effort */ }
-
-		// Redirect pure screen-viewing tasks to inline tools (faster, no round-trip)
-		// Narrow match: only "describe/look at my screen" — not scroll, screenshot,
-		// or screen-related tasks that the brain should handle.
-		const screenViewOnly = /\b(describe\s+(my\s+)?screen|what.s on\s+(my\s+)?screen|look at\s+(my\s+)?screen)\b/i;
-		if (screenViewOnly.test(task)) {
-			return { status: 'rejected', message: 'Use describe_screen inline tool directly for screen viewing.' };
-		}
-
-		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
-		// Same pattern as conversation-server's tryFastPath.
-		// Skipped on Windows: shells out to /bin/sh + bash + invokes a .sh skill
-		// that isn't ported yet. The slow file-bridge path below still works.
-		const concatMatch = /\b(prepend|concatenat|concat|image.*video|video.*image)\b/i.test(task);
-		if (concatMatch && process.platform !== 'win32') {
-			try {
-				const { execFileSync } = await import('node:child_process');
-				// ls globs need shell for wildcard expansion — command strings are static literals (fixes #1451)
-				const image = execFileSync('/bin/sh', ['-c', 'ls -t /tmp/discord-inbox/*.jpg /tmp/discord-inbox/*.png 2>/dev/null | head -1'], { timeout: 3000 }).toString().trim();
-				const video = execFileSync('/bin/sh', ['-c', 'ls -t /tmp/sutando-recording-*-narrated-subtitled.mov /tmp/sutando-recording-*-narrated.mov /tmp/sutando-recording-*.mov 2>/dev/null | head -1'], { timeout: 3000 }).toString().trim();
-				if (image && video) {
-					// execFileSync argv array bypasses shell — image/video paths are separate args, no interpolation (fixes #1451)
-					const scriptPath = resolve(claudeHomePath('skills', 'video-concat', 'scripts', 'prepend-image.sh'));
-					const result = execFileSync('bash', [scriptPath, image, video, '3'], { timeout: 60000 }).toString().trim();
-					const parsed = JSON.parse(result);
-					return { status: 'done', result: `Video with image prepended: ${parsed.output} (${parsed.size_mb}MB)` };
-				}
-			} catch (e) { console.log(`${ts()} [TaskBridge] fast path concat failed: ${e}`); }
-		}
-
-		// Check if the watcher (Claude Code brain) is running. The historic probe
-		// uses `pgrep -f watch-tasks` (POSIX only). On Windows we fall back to a
-		// PID-file sentinel written by src/watch-tasks-stream.ps1.
-		let watcherOnline = false;
-		try {
-			if (process.platform === 'win32') {
-				const { existsSync, readFileSync } = await import('node:fs');
-				const pidFile = join(REPO_DIR, 'state', 'watch-tasks-stream.pid');
-				if (existsSync(pidFile)) {
-					const pid = parseInt(readFileSync(pidFile, 'utf-8').trim());
-					if (pid > 0) {
-						try {
-							// `process.kill(pid, 0)` is a liveness probe (signal 0); throws if process is gone.
-							process.kill(pid, 0);
-							watcherOnline = true;
-						} catch {}
-					}
-				}
-			} else {
-				const { execFileSync } = await import('node:child_process');
-				// execFileSync argv array — no shell interpolation (fixes #1451)
-				const watcherRunning = execFileSync('pgrep', ['-f', 'watch-tasks'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
-				watcherOnline = !!watcherRunning;
-			}
-		} catch {
-			// pgrep returns exit code 1 if no match
-		}
-		if (!watcherOnline) {
-			console.log(`${ts()} [TaskBridge] WARNING: watcher offline — task will be queued for next cron pass`);
-		}
-
-		// Dedup: if the same task text is already pending (within DEDUP_WINDOW_MS),
-		// return the existing taskId instead of writing a duplicate task file.
-		const normalizedTask = normalizeTask(task);
-		const now = Date.now();
-		for (const [existingId, pending] of _pendingTasks) {
-			if (
-				normalizeTask(pending.taskText) === normalizedTask &&
-				now - pending.submittedAt < DEDUP_WINDOW_MS
-			) {
-				console.log(`${ts()} [TaskBridge] Dedup: task matches ${existingId} (submitted ${Math.round((now - pending.submittedAt) / 1000)}s ago)`);
-				return {
-					status: 'duplicate',
-					taskId: existingId,
-					message: `Task already pending as ${existingId}. Do NOT submit again — tell the user you are already working on it.`,
-				};
-			}
-		}
-
-		const taskId = `task-${Date.now()}`;
-		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
-		// Cap at 6 hours to prevent runaway pending-state if the voice agent
-		// hallucinates a giant value.
-		let timeoutMs = DEFAULT_TASK_TIMEOUT_MS;
-		if (typeof timeout_minutes === 'number') {
-			if (timeout_minutes === 0) timeoutMs = 0;
-			else if (timeout_minutes > 0) timeoutMs = Math.min(timeout_minutes, 360) * 60 * 1000;
-		}
-		// Reserved before the first await: an identical call during the spoken-turn wait
-		// must meet this entry in the dedup check above, not write a second task file.
-		const pendingEntry = () => ({ submittedAt: Date.now(), timeoutMs, dmOnTimeout: dm_on_timeout === true, taskText: task });
-		_pendingTasks.set(taskId, pendingEntry());
-		try {
-			const timestamp = new Date().toISOString();
-			const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
-			// Field order: `task:` LAST so the user-supplied (Gemini-relayed,
-			// possibly multi-line) task body can't forge header fields. Same
-			// shape as agent-api.py's /task endpoint after PR #982; consumers
-			// (`_isVoiceTask`, `parse_priority_from_text`) stop scanning at
-			// the first `task:` line.
-			// Attach a short window of recent conversation AFTER the `task:` line so
-			// the core can self-correct a misheard/garbled transcript (per Chi: "the
-			// voice agent may mishear and pass the wrong transcripts"). It lands in
-			// the task BODY (everything after `task:`), so it cannot forge header
-			// fields — consumers stop scanning headers at the first `task:` line.
-			// Best-effort: empty string if no log/session yet.
-			// The owner's own words first: what was actually said, verbatim from the
-			// session's input transcription, so the core can judge the model's `task:`
-			// wording against real speech instead of trusting it.
-			let spokenBlock = '';
-			try {
-				const spoken = await _awaitSpokenTurns(2, SPOKEN_WAIT_MS, undefined, () => _voiceOriginGeneration === originGeneration);
-				if (spoken.length > 0) {
-					spokenBlock =
-						`\n\n--- spoken (the owner's last words, verbatim as transcribed, or as typed into the voice session; the task line ` +
-						`above is the voice model's wording of them — if it adds intent these words do not ` +
-						`carry, ask before acting) ---\n${confineUserContent(spoken.map((t) => `user: ${t}`).join('\n'))}\n`;
-				}
-			} catch { /* best effort */ }
-			let contextBlock = '';
-			try {
-				const recent = recentAtAsk;
-				if (recent) {
-					contextBlock =
-						`\n\n--- recent voice transcript (may contain ASR errors; if the task above ` +
-						`seems garbled or doesn't match this, infer the true intent from it or ask to ` +
-						`confirm before acting) ---\n${confineUserContent(recent)}\n`;
-				}
-			} catch { /* best effort — never block delegation on context attach */ }
-			// An origin-bound session addresses the task to its origin and adds the adapter's
-			// guidance line; without one the task keeps `channel_id: local-voice`.
-			const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
-			_rememberTaskOrigin(taskId, origin);
-			const content =
-				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin) +
-				`task: ${confineUserContent(task)}${originGuidance}${spokenBlock}${contextBlock}\n`;
-			await _delegation.submitTask(taskId, content);
-		} catch (err) {
-			_pendingTasks.delete(taskId);   // nothing was written: the reservation must not dedup a retry
-			throw err;
-		}
-		// Default FALSE (Susan PR #578 silent-timeout contract restored after
-		// Chi's 2026-05-03 06:00 override was reverted at 06:47 — the always-on
-		// default was producing unwanted DMs). Caller must explicitly pass
-		// dm_on_timeout: true on critical tasks where they want the fallback.
-		_pendingTasks.set(taskId, pendingEntry());
-		// Record owner activity for status-aware-pivot in proactive loop
-		writeOwnerActivity('voice', task);
-		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
-		_sendTaskStatus?.(taskId, 'working', task.slice(0, 60));
-		// Counted after the write, so the file just written is excluded by id and
-		// everything older in tasks/ is what stands ahead of it.
-		const queuedAhead = countQueuedAhead(TASK_DIR, taskId);
-		return {
-			status: 'pending',
-			taskId,
-			queuedAhead,
-			message: (watcherOnline
-				? 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.'
-				: 'Task has been saved. The processing engine will pick it up on its next pass (within a few minutes). Tell the user the task is queued and will be handled shortly.')
-				+ queuedAheadInstruction(queuedAhead),
-		};
+		'This is how Sutando thinks and acts. It runs in the background: keep talking with the ' +
+		'user, and the result comes back to you when it is ready.',
+	parameters: workParameters,
+	execution: 'background',
+	timeout: WORK_CALL_TIMEOUT_MS,
+	// Read by bodhi when the call is dispatched, before the task file is written,
+	// so every owner task already in tasks/ is ahead of this one.
+	get pendingMessage(): string {
+		return 'Task accepted and being worked on. Do NOT tell the user it is done — say you are working on it. ' +
+			'The result will come back to you on its own; do not call work again for it.' +
+			queuedAheadInstruction(countQueuedAhead(TASK_DIR, ''));
+	},
+	async execute(args, ctx) {
+		const submitted = await submitWork(args as WorkArgs);
+		// Without a live call (tests, other callers) the submission is the answer.
+		if (submitted.status !== 'pending' || !ctx?.abortSignal) return submitted;
+		const taskId = submitted.taskId as string;
+		console.log(`${ts()} [TaskBridge] ${taskId} is work call ${ctx.toolCallId}`);
+		return _awaitTaskResult(taskId, ctx.abortSignal);
 	},
 };
 
@@ -1329,9 +1391,10 @@ export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Da
 				_sendTaskStatus?.(taskId, 'timeout', snippet
 					? `Task '${snippet}' has not been picked up after ${waited} minutes — the processing engine may be down`
 					: `Task has not been picked up after ${waited} minutes — the processing engine may be down`);
-				onResult(snippet
-					? `[Task ${taskId} ('${snippet}') has not been picked up after ${waited} minutes. It is still queued; the processing engine may need to be restarted.]`
-					: `[Task ${taskId} has not been picked up after ${waited} minutes. It is still queued; the processing engine may need to be restarted.]`);
+				const unpicked = `has not been picked up after ${waited} minutes. It is still queued; the processing engine may need to be restarted.`;
+				if (!_settleResultWaiter(taskId, `The task ${unpicked}`)) {
+					onResult(snippet ? `[Task ${taskId} ('${snippet}') ${unpicked}]` : `[Task ${taskId} ${unpicked}]`);
+				}
 			}
 			continue;
 		}
@@ -1353,7 +1416,7 @@ export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Da
 			const userMsg = taskSnippet
 				? `[Task ${taskId} ('${taskSnippet}') timed out after ${minutes} minutes. The processing engine may need to be restarted.]`
 				: `[Task ${taskId} timed out after ${minutes} minutes. The processing engine may need to be restarted.]`;
-			onResult(userMsg);
+			if (!_settleResultWaiter(taskId, `The task timed out after ${minutes} minutes. The processing engine may need to be restarted.`)) onResult(userMsg);
 			// Move the task file out of tasks/ so /tasks/active stops listing it
 			// as 'working' forever. (Without this, dedup-orphan tasks left behind
 			// after a consolidated reply pile up in the UI as stuck spinners.)
@@ -1621,7 +1684,7 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					const keptToDm = taskOrigin ? keepVoiceResultToDm(taskId, result, dmOnly) : null;
 					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE);
 					else if (taskOrigin) void _deliverOriginBoundResult(taskId, result, taskOrigin, onResult);
-					else onResult(result);
+					else if (!_settleResultWaiter(taskId, frameTaskResult(result))) onResult(result);
 					// Notify agent-api directly (task results only), then delete file
 					if (registersTask) {
 						try {
