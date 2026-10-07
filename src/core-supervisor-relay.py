@@ -45,6 +45,7 @@ import platform
 import re
 import subprocess
 import sys
+import time
 
 # Hard blockers only the USER can clear → escalate to the owner's channel.
 # crashed/hung belong to RECOVER (restart), not to user-escalation.
@@ -248,8 +249,14 @@ def compose_message(signal: dict, surface: str = "") -> str:
                 " If the core looks fine, no action is needed.")
     elif _is_login_class(signal):
         host = _core_host_label() or "the host"
-        msg += (f" — needs GUI /login on {host}: open Terminal there, run"
-                " `bash src/restart.sh` from the repo, then complete /login."
+        try:
+            be = _derive_backend()
+        except Exception:
+            be = None
+        where = (f"`tmux -S {be['socket']} attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
+                 if be else "the Runtime panel")
+        msg += (f" — needs GUI /login on {host}: run /login in the core terminal ({where})."
+                " If the credential proxy still refuses, see sonichi#4326."
                 " A chat reply can't resolve this.")
     else:
         host = _core_host_label() or "the host"
@@ -275,20 +282,22 @@ def compose_message(signal: dict, surface: str = "") -> str:
 
 
 # ---- emit adapters (best-effort; a failed channel never crashes the cycle) --- #
-def _macos_notify(message: str) -> None:  # pragma: no cover - external I/O (osascript)
+def _macos_notify(message: str) -> bool:  # pragma: no cover - external I/O (osascript)
+    """True only when osascript ran and exited 0."""
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["osascript", "-e",
              f'display notification {json.dumps(message)} with title "Sutando · Agent Shepherd"'],
             capture_output=True, timeout=8)
+        return r.returncode == 0
     except Exception:
-        pass
+        return False
 
 
 def _channel_notify(message: str, source: str, channel: str) -> bool:  # pragma: no cover - external I/O (notify.py subprocess)
     """Route through the existing task-progress relay (notify.py). Returns True
     only when the send actually landed (notify.py exit 0), so the caller can
-    decide whether to debounce — a failed channel send must NOT suppress a retry."""
+    decide whether to debounce — a failed or no-route send must NOT suppress a retry."""
     notify = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR", ""),
                           "skills", "task-progress", "scripts", "notify.py")
     if not os.path.isfile(notify):
@@ -332,37 +341,78 @@ def _save_last_hash(state_file, h):
         pass
 
 
-def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=False):
-    """One escalation cycle. Returns the message emitted, or None if suppressed."""
+def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=False,
+              outcome=None):
+    """One escalation cycle. Returns the message emitted, or None if suppressed.
+    `outcome`, when given, receives "undelivered": the reason nothing landed, or None."""
     escalate, new_hash = should_escalate(signal, _load_last_hash(state_file))
     if not escalate:
         return None
     msg = compose_message(signal, surface=source)
     if dry_run:
         return msg
-    if macos:
-        _macos_notify(msg)
-    # Debounce only when delivery actually landed. If a channel was selected but
-    # its send failed, do NOT persist the hash — re-escalate next cycle so a
-    # transient/misconfigured channel can't permanently swallow the alert (macOS
-    # alone must not suppress the real channel). macOS-only (no channel selected)
-    # still debounces — the local notification IS the delivery there.
-    channel_ok = True
+    macos_ok = bool(_macos_notify(msg)) if macos else False
+    # Debounce only on a confirmed delivery: the selected channel when there is
+    # one (macOS alone must not suppress it), else the macOS notification.
     if source and channel:
-        channel_ok = _channel_notify(msg, source, channel)
-    if channel_ok:
+        delivered = _channel_notify(msg, source, channel)
+        reason = "channel send failed"
+    else:
+        delivered = macos_ok
+        reason = "no route and macOS " + ("notification failed" if macos else "disabled")
+    if delivered:
         _save_last_hash(state_file, new_hash)
+    if outcome is not None:
+        outcome["undelivered"] = None if delivered else reason
+        outcome["hash"] = new_hash
     return msg
 
 
-# Surfaces task-progress notify.py can actually DELIVER to. Other values that
-# land in last-owner-activity.json ("voice", "github-commits", …) are activity
-# signals, not deliverable channels — never route an escalation to them.
-# Beyond the static set, any source with a configured channel dir
-# ($CLAUDE_CONFIG_DIR/channels/<source>/ containing a *.env) counts — that
-# mirrors notify.py's own resolution rule, so a NEW homeserver bridge (e.g.
-# "dev-ag2space") becomes routable by creating its config dir, no code change.
+# Kept apart from the debounce state, which stays empty until a real delivery.
+UNDELIVERED_LOG_INTERVAL_S = 15 * 60
+
+
+def _should_log_undelivered(state_file, h):
+    """Once per signal hash, then at most every UNDELIVERED_LOG_INTERVAL_S."""
+    if not state_file:
+        return True
+    side = state_file + ".undelivered"
+    now = time.time()
+    try:
+        with open(side) as f:
+            d = json.load(f)
+        if (isinstance(d, dict) and d.get("hash") == h
+                and now - float(d.get("logged_at", 0)) < UNDELIVERED_LOG_INTERVAL_S):
+            return False
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        tmp = side + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"hash": h, "logged_at": now}, f)
+        os.replace(tmp, side)
+    except OSError:  # pragma: no cover - best-effort log throttle
+        pass
+    return True
+
+
+# Routability is src/progress_route.py's verdict; beyond it a source must be
+# configured: these are, any other needs a contained channels/<source>/.env.
 _DELIVERABLE_SURFACES = {"discord", "slack", "telegram", "ag2space"}
+
+
+def _load_progress_route():
+    """The shared route verdict, or a fail-closed stub that routes nothing."""
+    try:
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from progress_route import delivery_route  # type: ignore
+        return delivery_route
+    except Exception:
+        return lambda source, channel: None
+
+
+_delivery_route = _load_progress_route()
 
 # Must stay identical to notify.py's slug rule (sender/probe alignment): dots
 # only BETWEEN alphanumerics, so traversal shapes never reach the path probe.
@@ -388,7 +438,9 @@ def _load_channel_env_containment():
 _channel_env_is_contained = _load_channel_env_containment()
 
 
-def _is_deliverable(source):
+def _is_deliverable(source, channel):
+    if not channel or _delivery_route(source, channel) is None:
+        return False
     if source in _DELIVERABLE_SURFACES:
         return True
     if not source or not _SOURCE_SLUG_RE.match(source):
@@ -422,7 +474,7 @@ def resolve_active_target(activity_path):
         return "", ""
     source = str(data.get("channel", "")).strip()
     channel = str(data.get("channel_id", "")).strip()
-    if _is_deliverable(source) and channel:
+    if _is_deliverable(source, channel):
         return source, channel
     return "", ""
 
@@ -444,6 +496,12 @@ def main(argv=None):
     source, channel = a.notify_source, a.notify_channel
     if not (source and channel) and a.active_from:
         source, channel = resolve_active_target(a.active_from)
+    if source and channel and _delivery_route(source, channel) is None:
+        fallback = "macOS disabled, nothing to escalate to" if a.no_macos \
+            else "escalating by macOS notification only"
+        print(f"--notify-source {source!r} / --notify-channel {channel!r} has no delivery "
+              f"path; {fallback}", file=sys.stderr)
+        source = channel = ""
 
     try:
         with open(a.signal) as f:
@@ -455,8 +513,13 @@ def main(argv=None):
     if not isinstance(signal, dict):
         signal = dict(UNREADABLE_SIGNAL)
 
+    outcome = {}
     msg = run_cycle(signal, a.state_file, macos=not a.no_macos,
-                    source=source, channel=channel, dry_run=a.dry_run)
+                    source=source, channel=channel, dry_run=a.dry_run, outcome=outcome)
+    if msg and outcome.get("undelivered"):
+        if _should_log_undelivered(a.state_file, outcome.get("hash")):
+            print(f"not delivered: {outcome['undelivered']} (will retry): {msg}")
+        return 0
     if msg:
         print(("DRY-RUN " if a.dry_run else "escalated: ") + msg)
         return 0

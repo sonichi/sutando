@@ -336,14 +336,14 @@ heartbeat_python() {
 }
 ensure_core_heartbeat() {
   if [ -n "$EXTERNAL_HELPERS" ]; then check_external_helpers; return; fi
-  pgrep -f "$REPO/src/core_heartbeat.py" >/dev/null 2>&1 && return 0
   local _py
   _py="$(heartbeat_python)"
   if [ -z "$_py" ]; then
     echo "WARN no runnable python3 for the core heartbeat — not started; cron-runner fires will stay suppressed" >&2
     return 0
   fi
-  "$_py" "$REPO/src/core_heartbeat.py" >/tmp/core-heartbeat.log 2>&1 &
+  "$_py" "$REPO/src/core_heartbeat.py" --ensure >/dev/null 2>&1 \
+    || echo "WARN core heartbeat --ensure failed; cron-runner fires will stay suppressed" >&2
 }
 
 ensure_durable_schedules() {

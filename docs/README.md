@@ -105,3 +105,5 @@ Run the audit locally:
 ```bash
 python3 skills/release/scripts/docs_audit.py
 ```
+
+- [Outstanding cron payload preservation](cron-outstanding-payload.md) — immutable prompt tasks until retirement.

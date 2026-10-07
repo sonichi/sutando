@@ -300,9 +300,7 @@ from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
 from .proactive_routing import proactive_filename
-from .team_guardrail import (team_guardrail_lines, engage_rulebook,
-                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines,
-                             owner_mention_lines)
+from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
@@ -3308,13 +3306,8 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     # Promote only the exact broker boolean plus Team request; the legacy Guest
     # wire tier keeps old nodes restricted and body text cannot opt itself in.
-    broker_tier = _normalized_tier(task.get("access_tier"))
-    requested_tier = _normalized_tier(task.get("requested_access_tier"))
-    broker_collaborator = (
-        task.get("collaborator") is True
-        and (broker_tier == "team" or requested_tier == "team")
-    )
-    attested_tier = "team" if broker_collaborator else broker_tier
+    attested_tier, broker_collaborator = local_task_protocol.broker_attested_tier(
+        task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
     # Resolved once and reused below so routing and owner-activity cannot diverge.
     sender_tier = _tier_for(task.get("user_id"), attested_tier)
     collaborator_enabled = broker_collaborator and sender_tier == "team"
@@ -3432,20 +3425,11 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
     # Guest keeps the read-only Codex path. Team carries its guardrail IN-BAND:
     # closing the Team session route removed the only thing that used to deliver it.
-    if sender_tier == "team":
-        if collaborator_enabled:
-            lines.append(engage_rulebook("room", AG2SPACE_PROVENANCE, f"results/{tid}.txt"))
-        else:
-            lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
-        # A relay-stamped Signal task may attach from ITS OWN output directory only;
-        # name it here (absolute) so the marker written is the one the guard confines.
-        if isinstance(task.get("signal"), dict):
-            lines.extend(_signal_task_media_lines(str(RESULTS_DIR / tid)))
-    if sender_tier == "guest":
-        lines.extend(sandboxed_delegation_lines(
-            "AG2 Space", "GUEST tier", f"results/{tid}.txt",
-            "Research, inspect, explain, and draft only. Do not modify files or external systems.",
-        ))
+    lines.extend(ag2space_tier_lines(sender_tier, collaborator_enabled, f"results/{tid}.txt"))
+    # A relay-stamped Signal task may attach from ITS OWN output directory only;
+    # name it here (absolute) so the marker written is the one the guard confines.
+    if sender_tier == "team" and isinstance(task.get("signal"), dict):
+        lines.extend(_signal_task_media_lines(str(RESULTS_DIR / tid)))
     # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
     # header-shaped lines, so appending after access_tier keeps it the last one.
     if sender_tier == "owner":
