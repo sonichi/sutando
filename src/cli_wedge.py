@@ -121,12 +121,25 @@ PROVISIONAL_THRESHOLDS = {
     "status_ttl_s": 900,
     "min_duration_s": 60,
 }
+# The CLI's line-start forms for a rejected credential. A bare "401" never counts: it
+# needs the OAuth-expiry words, an API Error banner, or the CLI's "· Please run /login" tail.
+_AUTH_REJECTED = (
+    r"(?:API ?Error\s*[:(]?\s*)?401\b.{0,40}?\bOAuth (?:access )?token (?:has )?expired\b.*$"
+    r"|OAuth (?:access )?token has expired\b.{0,200}$"
+    r"|API ?Error\s*[:(]?\s*401\b.*$"
+    r"|API ?Error\b.{0,120}?\bauthentication_error\b.*$"
+    r"|Invalid API key\b.{0,80}$"
+    r"|[A-Za-z][^\n]{0,600}?\s·\s*(?:please )?run /login\b.{0,40}$"
+    r"|(?:please )?run /login\b.{0,40}$"
+)
+
 ABNORMAL_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
     (name, re.compile(rx, re.IGNORECASE))
     for name, rx in (
         ("quota-limit", r"(you('ve| have)? )?(hit|reached|exceeded)\b.{0,24}\b(session|usage|weekly|daily|plan) limit\b|(session|usage|weekly|daily|plan) limit (reached|exceeded|hit)\b|(you('ve| have)? )?hit your\b.{0,24}\blimit\b|/?usage-credits\b"),
         ("out-of-credits", r"(you('re| are)? )?out of (usage )?credits?\b|credit balance (is )?(too )?low\b|insufficient credits?\b"),
-        ("needs-login", r"(please )?(log ?in|sign ?in) to continue\b|session expired\b|(login|oauth access token has) expired\b.{0,60}/login\b|(you('re| are) )?not logged in\b.{0,60}/login\b|authentication (required|failed)\b|run /login\b|Select login method\b|Paste code here\b|Browser didn'?t open\b"),
+        ("needs-login", r"(please )?(log ?in|sign ?in) to continue\b|session expired\b|(login|oauth access token has) expired\b.{0,60}/login\b|(you('re| are) )?not logged in\b.{0,60}/login\b|authentication (required|failed)\b|(please )?run /login\b|Select login method\b|Paste code here\b|Browser didn'?t open\b"
+                        r"|" + _AUTH_REJECTED),
         ("compacting", r"compact(ing|ion)\b"),
         ("awaiting-input", r"(waiting|awaiting) for (your )?(input|approval|confirmation)\b"),
         # Parked ON an error, which is not a retry: nothing is being attempted.
@@ -185,13 +198,33 @@ LIVE_PARKED_BANNERS: tuple[tuple[str, re.Pattern], ...] = tuple(
     for name, rx in (
         ("quota-limit", r"^(?:you(?:'ve| have)? )?(?:hit|reached|exceeded) (?:your |the )?.{0,24}?(?:session|usage|weekly|daily|plan)? ?limit\b.{0,80}$|^(?:session|usage|weekly|daily|plan) limit (?:reached|exceeded|hit)\b.{0,80}$"),
         ("out-of-credits", r"^(?:you(?:'re| are)? )?out of (?:usage )?credits?\b.{0,80}$|^credit balance (?:is )?(?:too )?low\b.{0,80}$|^insufficient credits?\b.{0,80}$"),
-        ("needs-login", r"^(?:please )?(?:log ?in|sign ?in) to continue\b.{0,40}$|^session expired\b.{0,40}$|^(?:login|oauth access token has) expired\b.{0,60}/login\b.{0,40}$|^(?:you(?:'re| are) )?not logged in\b.{0,60}/login\b.{0,40}$|^authentication (?:required|failed)\b.{0,40}$|^run /login\b.{0,40}$|^Select login method\b.{0,60}$|^Paste code here\b.{0,60}$|^Browser didn'?t open\b.{0,60}$"),
+        ("needs-login", r"^(?:please )?(?:log ?in|sign ?in) to continue\b.{0,40}$|^session expired\b.{0,40}$|^(?:login|oauth access token has) expired\b.{0,60}/login\b.{0,40}$|^(?:you(?:'re| are) )?not logged in\b.{0,60}/login\b.{0,40}$|^authentication (?:required|failed)\b.{0,40}$|^run /login\b.{0,40}$|^Select login method\b.{0,60}$|^Paste code here\b.{0,60}$|^Browser didn'?t open\b.{0,60}$"
+                        r"|^(?:" + _AUTH_REJECTED + r")"),
         ("compacting", r"^compacting (?:conversation|context)\b.{0,40}$"),
         ("awaiting-input", r"^(?:waiting|awaiting) for (?:your )?(?:input|approval|confirmation)\b.{0,40}$"),
         ("api-error", r"^API ?Error(?::\s*\S.{0,200}|\s*\(.{0,200}\).{0,80})?\s*$|^(?:internal server error|bad gateway|service unavailable)\b.{0,80}$|^HTTP [45]\d\d\b.{0,80}$"),
         ("network-error", r"^network error\b.{0,80}$|^fetch failed\b.{0,80}$|^could not reach\b.{0,80}$|^E(?:CONNREFUSED|NOTFOUND|HOSTUNREACH)\b.{0,80}$|^dns (?:lookup )?failed\b.{0,40}$"),
     )
 )
+
+
+_NEEDS_LOGIN_BANNER = dict(LIVE_PARKED_BANNERS)["needs-login"]
+
+# Auxiliary login hints runtime-health also reads as a marker (keychain, legacy CLI).
+LOGIN_HINT_MARKERS = ("run `claude login`", "run 'claude login'", "unlock-keychain")
+
+
+def needs_login_line(line: str) -> bool:
+    """Is this one line the CLI saying it needs /login? The one definition every reader
+    (runtime-health, worker_auth_state, core-input-watch) uses; judged as a whole line."""
+    return any(family == "parked" and name == "needs-login"
+               for family, name, _text in live_banner_lines(line))
+
+
+def login_marker_line(line: str) -> bool:
+    """needs_login_line, or one of the auxiliary LOGIN_HINT_MARKERS anywhere on the line."""
+    low = line.lower()
+    return needs_login_line(line) or any(m in low for m in LOGIN_HINT_MARKERS)
 
 
 def live_banner_lines(text: str) -> list:
@@ -202,6 +235,10 @@ def live_banner_lines(text: str) -> list:
     for ln in text.splitlines():
         stripped = _BANNER_DECOR.sub("", ln).rstrip()
         if not stripped:
+            continue
+        # A rejected credential retries too, but no retry clears it: login outranks retry.
+        if _NEEDS_LOGIN_BANNER.match(stripped):
+            hits.append(("parked", "needs-login", stripped))
             continue
         if LIVE_RETRY_BANNER.match(stripped):
             hits.append(("retry", "retrying", stripped))

@@ -91,6 +91,8 @@ CRONS_FILE = WORKSPACE / "hosts" / host_slug() / "crons.json"
 TASKS_DIR = WORKSPACE / "tasks"
 STATE_FILE = WORKSPACE / "state" / "cron-runner-state.json"
 CORE_ALIVE_FILE = WORKSPACE / "state" / "cores" / f"{host_slug()}.alive"
+# Read by health-check: the record that due fires are being held for a dead heartbeat.
+HOLD_FILE = WORKSPACE / "state" / "cron-runner-hold.json"
 REPO_ROOT = SRC_DIR.parent
 
 # Look back at most this far when catching up a missed fire. Bounds work after
@@ -374,6 +376,36 @@ def local_core_alive(now_epoch: Optional[int] = None) -> bool:
     return 0 <= age < CORE_ALIVE_MAX_AGE_SECONDS
 
 
+def _core_alive_reason(now_epoch: float) -> str:
+    """Why local_core_alive() said no, for the hold record and the log line."""
+    try:
+        age = now_epoch - CORE_ALIVE_FILE.stat().st_mtime
+    except OSError:
+        return f"core heartbeat missing ({CORE_ALIVE_FILE})"
+    return f"core heartbeat stale ({int(age)}s old, limit {CORE_ALIVE_MAX_AGE_SECONDS}s)"
+
+
+def _record_hold(held: list, now_epoch: int) -> None:
+    """Publish (or clear) the held-fires record; a hold left silent is how schedules vanished."""
+    hold_file = STATE_FILE.parent / HOLD_FILE.name
+    if not held:
+        hold_file.unlink(missing_ok=True)
+        return
+    prior = _load_json(hold_file, {})
+    since = prior.get("since") if isinstance(prior, dict) else None
+    reason = _core_alive_reason(now_epoch)
+    record = {
+        "since": since if isinstance(since, int) else now_epoch,
+        "updated_at": now_epoch,
+        "held": sorted(set(held) | set(prior.get("held", []) if isinstance(prior, dict) else [])),
+        "reason": reason,
+    }
+    _atomic_write_text(hold_file, json.dumps(record))
+    _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch))
+    print(f"{_ts} cron-runner: holding due fire(s) {', '.join(sorted(set(held)))}: {reason}",
+          file=sys.stderr)
+
+
 def _load_json(path: Path, default):
     try:
         return json.loads(path.read_text())
@@ -634,6 +666,7 @@ def run(now_epoch: Optional[int] = None) -> list:
     # concurrent reconciler (Codex boot) can neither observe a half-written
     # state nor have its just-seeded migration boundary clobbered by our
     # write-back. See _state_lock for the race this closes.
+    held: list = []
     with _state_lock(STATE_FILE):
         state = _load_json(STATE_FILE, {})
         for entry in crons:
@@ -673,6 +706,7 @@ def run(now_epoch: Optional[int] = None) -> list:
                 elif not core_alive:
                     # Preserve the previous boundary so a short outage can
                     # recover this slot after the heartbeat returns.
+                    held.append(name)
                     continue
                 else:
                     lateness = now_epoch - due_epoch
@@ -693,6 +727,8 @@ def run(now_epoch: Optional[int] = None) -> list:
 
         if crons:  # only persist once we've actually read a config
             _atomic_write_text(STATE_FILE, json.dumps(state))
+        if held or core_alive:
+            _record_hold(held, now_epoch)
     return emitted
 
 
