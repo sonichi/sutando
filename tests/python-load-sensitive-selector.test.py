@@ -79,7 +79,7 @@ def main() -> int:
         untagged = td / "untagged.txt"
         untagged.write_text("tests/sb.test.py\n")
         r = select("serial", untagged, disc)
-        if r.returncode != 3 or "leg 7: the selector emitted no serial suites" not in r.stderr:
+        if r.returncode != 3 or "leg 9: the selector emitted no serial suites" not in r.stderr:
             fails.append(f"an empty serial leg did not fail with its reason: rc={r.returncode} err={r.stderr.strip()!r}")
         badtag = td / "badtag.txt"
         badtag.write_text("tests/sb.test.py later\n")
@@ -129,12 +129,12 @@ def main() -> int:
     if r.returncode != 0 or ser.returncode != 0:
         fails.append(f"the committed list does not select cleanly: {(r.stderr + ser.stderr).strip()}")
     elif sorted(r.stdout.split() + ser.stdout.split()) != sorted(listed):
-        fails.append(f"legs 6-7 would run {len(r.stdout.split() + ser.stdout.split())} suites for {len(listed)} listed")
+        fails.append(f"legs 8-9 would run {len(r.stdout.split() + ser.stdout.split())} suites for {len(listed)} listed")
     rest = select("without", LIST, discovered)
     if set(rest.stdout.split()) & set(listed):
         fails.append("a listed suite is still in the shared legs")
     if sorted(rest.stdout.split() + r.stdout.split() + ser.stdout.split()) != sorted(discovered):
-        fails.append("legs 6-7 + legs 1-5 is not the real discovery list")
+        fails.append("legs 8-9 + legs 1-7 is not the real discovery list")
 
     for f in fails:
         print("  FAIL", f)
