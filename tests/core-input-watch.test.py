@@ -860,6 +860,90 @@ class TestAnswerStep(unittest.TestCase):
         self.assertIsNone(_mod.answer_step("blocked-known", "fable-limit", "p1", None, enabled=False))
 
 
+# An idle Codex core as the monitor captures it: plain text, so the composer's dim
+# placeholder arrives as ordinary characters. Footer from a live Codex 0.157 pane.
+_CODEX_FOOTER = "  GPT-6-Sol ultra · ~/Library/Application Support/sp…  ⚠ 1 warning · f2 to view"
+_CODEX_IDLE = f"• Done — PR #5169 updated.\n\n» Ask Codex to do anything\n\n{_CODEX_FOOTER}"
+_CODEX_IDLE_CARET = f"• Done.\n\n› Improve documentation in @filename\n\n{_CODEX_FOOTER}"
+_CODEX_WORKING = f"• Working (3m 02s • esc to interrupt)\n\n› \n\n{_CODEX_FOOTER}"
+_CODEX_PICKER = f"  Select Model and Effort\n› 4. gpt-5.5 (current)  Proven model\n\n{_CODEX_FOOTER}"
+
+
+class TestCodexIdleIsNotHung(unittest.TestCase):
+    """After a switch to Codex an idle core writes core-status rarely, exactly as
+    Claude's does, so the stale-status `hung` must yield to Codex's own idle footer."""
+
+    def test_an_idle_codex_pane_with_stale_status_is_idle_ready(self):
+        for pane in (_CODEX_IDLE, _CODEX_IDLE_CARET):
+            with self.subTest(pane=pane.splitlines()[2]):
+                st, detail, prompt, _k = compose_state(pane, "unknown", True, runtime="codex")
+                self.assertEqual((st, detail, prompt), ("idle-ready", "ready for a task", None))
+
+    def test_a_codex_pane_that_is_not_at_rest_stays_hung(self):
+        for name, pane in (("working", _CODEX_WORKING), ("picker", _CODEX_PICKER),
+                           ("no footer", "» Ask Codex to do anything"),
+                           ("no prompt", f"Running step 3...\n{_CODEX_FOOTER}")):
+            with self.subTest(name):
+                st, *_ = compose_state(pane, "unknown", True, runtime="codex")
+                self.assertEqual(st, "hung")
+
+    def test_the_claude_rule_is_unchanged(self):
+        idle = "prior output\n\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        for runtime in (None, "claude", "something-new"):
+            with self.subTest(runtime=runtime):
+                self.assertEqual(compose_state(idle, "unknown", True, runtime=runtime)[0], "idle-ready")
+                self.assertEqual(compose_state(_CODEX_IDLE, "unknown", True, runtime=runtime)[0], "hung")
+
+    def _fake_tmux(self, body):
+        import stat
+        import tempfile
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "tmux")
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
+        return d
+
+    def test_session_runtime_reads_the_sessions_own_stamp(self):
+        from unittest.mock import patch
+        cases = (('[ "$3" = show-environment ] && echo SUTANDO_CORE_RUNTIME=codex', "codex"),
+                 ("echo -SUTANDO_CORE_RUNTIME", None),
+                 ("echo SUTANDO_CORE_RUNTIME=codex; exit 1", None),
+                 ("echo SUTANDO_CORE_RUNTIME=", None))
+        for body, want in cases:
+            with self.subTest(body=body), \
+                    patch.dict(os.environ, {"PATH": self._fake_tmux(body) + os.pathsep + os.environ["PATH"]}):
+                self.assertEqual(_mod.session_runtime("/tmp/x.sock", "sutando-core"), want)
+        with patch.object(_mod.subprocess, "run", side_effect=OSError("no tmux")):
+            self.assertIsNone(_mod.session_runtime("/tmp/x.sock", "sutando-core"))
+
+    def test_a_monitor_started_for_claude_reads_the_codex_core_that_replaced_it(self):
+        # The watcher re-reads the stamp each poll: a switch keeps the socket, so the
+        # running monitor is the Claude one. Here tmux is the only runtime source.
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+        tmux = self._fake_tmux('[ "$3" = show-environment ] && echo SUTANDO_CORE_RUNTIME=codex')
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "unknown", "signals": {"process": True}}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
+                "--once", "--no-chat-escalation"]
+        with patch.object(_mod, "capture", lambda s, sess: _CODEX_IDLE), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.dict(os.environ, {"PATH": tmux + os.pathsep + os.environ["PATH"]}), \
+                patch.object(sys, "argv", argv):
+            main()
+        with open(out) as f:
+            self.assertEqual(json.load(f)["state"], "idle-ready")
+
+
 class TestMainAutoAnswerWiring(unittest.TestCase):
     """One --once tick against a Fable-limit pane: the key is typed through send_keys
     and the signal file records it; --no-auto-answer only reports."""
