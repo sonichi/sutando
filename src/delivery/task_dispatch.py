@@ -25,6 +25,7 @@ CLI, for bash callers with only an interpreter path:
 
     task_dispatch.py has-result <results_dir> <filename>                 # exit 0/1
     task_dispatch.py find-ready <results_dir> <filename>                 # prints path, exit 0/1
+    task_dispatch.py head-abandoned <results_dir> <filename> <payload>  # exit 0 = drop the queue head
     task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir D]
     task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir D]
     task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>
@@ -135,6 +136,15 @@ def find_ready_result_for_filename(results_dir: "Path | str", filename: str, *,
     it can read THAT path's body instead of assuming the live one backs every ready result.
     """
     return find_ready_result(results_dir, _task_id_for_filename(filename), reader=reader)
+
+
+def head_abandoned(results_dir: "Path | str", filename: str, payload: "Path | str") -> bool:
+    """True iff a queued task can never resolve: no ready result and its payload is gone.
+
+    A task archived without a result findable here would otherwise hold a notifier's
+    queue head forever, blocking every task behind it.
+    """
+    return not Path(payload).exists() and not has_ready_result(results_dir, filename)
 
 
 def has_ready_result(results_dir: "Path | str", filename: str) -> bool:
@@ -400,6 +410,7 @@ def partial_paste_leftover(partial_dir: "Path | str", filename: str, incarnation
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename>\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
+    "       task_dispatch.py head-abandoned <results_dir> <filename> <payload>   # exit 0 drop / 1 keep\n"
     "       task_dispatch.py sort-by-priority <tasks_dir> [--resolve-inbox WORKSPACE HELPER [--resolution-cache DIR]]\n"
     "       task_dispatch.py reuse-inbox-resolution <cache_dir> <entry>   # exit 5 if changed or uncached\n"
     "       task_dispatch.py priority-tier <task_file>   # prints urgent|normal|low, the file's own header\n"
@@ -543,6 +554,11 @@ def _main(argv: list[str]) -> int:
             print(_USAGE, file=sys.stderr)
             return 2
         return 0 if has_ready_result(first, second) else 1
+    if cmd == "head-abandoned":
+        if len(rest) != 1:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return 0 if head_abandoned(first, second, rest[0]) else 1
     if cmd == "find-ready":
         if rest:
             print(_USAGE, file=sys.stderr)
