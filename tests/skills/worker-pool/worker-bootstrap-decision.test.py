@@ -16,6 +16,7 @@ import importlib.util
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -519,11 +520,9 @@ class TestOwnershipIsScopedToThisSession(Base):
         """The real shape: a watcher reparented away from this session."""
         script = self.ws / "watch-tasks-stream.sh"
         script.write_text(STABLE_WATCHER_BODY)
-        out = subprocess.run(
-            ["bash", "-c", f'nohup bash "{script}" "{self.inbox}" >/dev/null 2>&1 & echo $!'],
-            capture_output=True, text=True, check=True).stdout.strip()
-        pid = int(out)
-        self.addCleanup(lambda: subprocess.run(["kill", str(pid)], capture_output=True))
+        pid = _spawn_detached(script, self.inbox)
+        self.addCleanup(lambda: self.assertEqual(_group_members(pid), [], "fixture left a process behind"))
+        self.addCleanup(_kill_group, pid)
         import watcher_identity
         if not _wait_for_exec(pid, str(script), watcher_identity.proc_argv_vector):
             self.skipTest("no authoritative argv read on this platform")
@@ -542,6 +541,45 @@ class TestOwnershipIsScopedToThisSession(Base):
 # The trailing no-op stops bash exec'ing `sleep` in place, which would turn the
 # pid's argv into ["sleep", "30"] while the gate may still re-read it.
 STABLE_WATCHER_BODY = "#!/bin/sh\nsleep 30; :\n"
+
+
+def _spawn_detached(script, inbox):
+    """Start `bash script inbox` detached (reparented away from us) in its own
+    process group, so teardown can take the shell and its sleep child together."""
+    out = subprocess.run(
+        ["bash", "-c", f'set -m; nohup bash "{script}" "{inbox}" >/dev/null 2>&1 & echo $!'],
+        capture_output=True, text=True, check=True).stdout.strip()
+    return int(out)
+
+
+def _group_members(pgid):
+    """Live pids in the fixture's process group; a zombie leader awaiting its
+    parent's wait() is not a leak, so it is not counted."""
+    r = subprocess.run(["ps", "-o", "pid=,stat=", "-g", str(pgid)], capture_output=True, text=True)
+    out = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and not parts[1].startswith("Z"):
+            out.append(int(parts[0]))
+    return out
+
+
+def _kill_group(pgid, wait_s=2.0):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        members = _group_members(pgid)
+        if not members:
+            return
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            for pid in members:   # a group with a reaped leader refuses killpg; signal each member
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline and _group_members(pgid):
+            time.sleep(0.02)
 
 
 def _wait_for_exec(pid, script, read_argv, tries=250, delay=0.02):
@@ -595,6 +633,30 @@ class TestWaitForExec(unittest.TestCase):
         self.assertIsNot(v.watcher, True)
 
 
+class TestFixtureTeardownOwnsTheProcessGroup(unittest.TestCase):
+    def test_killing_only_the_shell_would_orphan_its_sleep_child(self):
+        import watcher_identity
+        ws = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(ws)], capture_output=True))
+        script = ws / "watch-tasks-stream.sh"
+        script.write_text(STABLE_WATCHER_BODY)
+        pid = _spawn_detached(str(script), str(ws))
+        self.addCleanup(_kill_group, pid)
+        if not _wait_for_exec(pid, str(script), watcher_identity.proc_argv_vector):
+            self.skipTest("no authoritative argv read on this platform")
+        for _ in range(100):
+            if len(_group_members(pid)) >= 2:
+                break
+            time.sleep(0.02)
+        self.assertGreaterEqual(len(_group_members(pid)), 2, "shell and its sleep child")
+        subprocess.run(["kill", str(pid)], capture_output=True)      # the old teardown
+        time.sleep(0.2)
+        survivors = [p for p in _group_members(pid) if p != pid]
+        self.assertTrue(survivors, "the sleep child should have outlived a shell-only kill")
+        _kill_group(pid)
+        self.assertEqual(_group_members(pid), [])
+
+
 class TestFixtureWatcherArgvIsStable(unittest.TestCase):
     """The detached fixture must keep the shell-plus-script argv for as long as
     the gate may re-read it, not just at the moment the wait returns."""
@@ -604,11 +666,9 @@ class TestFixtureWatcherArgvIsStable(unittest.TestCase):
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(ws)], capture_output=True))
         script = ws / "watch-tasks-stream.sh"
         script.write_text(body)
-        out = subprocess.run(
-            ["bash", "-c", f'nohup bash "{script}" "{ws}" >/dev/null 2>&1 & echo $!'],
-            capture_output=True, text=True, check=True).stdout.strip()
-        pid = int(out)
-        self.addCleanup(lambda: subprocess.run(["kill", str(pid)], capture_output=True))
+        pid = _spawn_detached(script, ws)
+        self.addCleanup(lambda: self.assertEqual(_group_members(pid), [], "fixture left a process behind"))
+        self.addCleanup(_kill_group, pid)
         return pid, str(script)
 
     def _samples(self, pid, n=6, gap=0.1):
@@ -731,8 +791,12 @@ class TestThroughTheProcessInspectionBoundary(Base):
                          alive=lambda p: True)
 
     def _spawn(self, argv):
-        p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.addCleanup(lambda: (p.kill(), p.wait()))
+        # Own process group: the body keeps its shell resident, so teardown must
+        # take the shell and its sleep child together and prove nothing is left.
+        p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             preexec_fn=os.setpgrp)
+        self.addCleanup(lambda: self.assertEqual(_group_members(p.pid), [], "fixture left a process behind"))
+        self.addCleanup(lambda: (_kill_group(p.pid), p.wait()))
         import watcher_identity
         for _ in range(50):
             if watcher_identity.proc_argv_vector(p.pid) is not None:
