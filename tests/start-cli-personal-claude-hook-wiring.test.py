@@ -11,6 +11,10 @@ violation (this hook is Claude-only policy) that also fired the call for a
 Codex launch. Moved here per review; this file proves the new call site and
 that the generic dispatcher no longer carries Claude-specific policy.
 
+The actual `bash ".../install-personal-claude-hook.sh"` line now lives in
+session-launch.sh's install_claude_personal_hook() (shared with a pool
+worker's own launcher); start-cli.sh's own call site is the function call.
+
 Hermetic: real scripts/install-personal-claude-hook.sh is stubbed. The
 wiring test truncates the REAL start-cli.sh source at (and including) the
 install-hook call, so it proves the actual call executes, in the actual
@@ -28,7 +32,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
-CALL_RE = re.compile(r'^\s*bash "\$REPO/scripts/install-personal-claude-hook\.sh"')
+SESSION_LAUNCH = REPO / "src" / "agent" / "claude" / "cli" / "session-launch.sh"
+CALL_RE = re.compile(r'^\s*install_claude_personal_hook\s*$')
 
 
 class StartCliPersonalClaudeHookWiringTest(unittest.TestCase):
@@ -42,14 +47,23 @@ class StartCliPersonalClaudeHookWiringTest(unittest.TestCase):
         call_idx = next((i for i, ln in enumerate(lines) if CALL_RE.match(ln)), None)
         self.assertIsNotNone(
             call_idx,
-            "install-personal-claude-hook.sh call not found in "
+            "install_claude_personal_hook call not found in "
             "src/agent/claude/cli/start-cli.sh — did it move or get removed?",
+        )
+        self.assertIn(
+            'bash "$REPO/scripts/install-personal-claude-hook.sh"',
+            SESSION_LAUNCH.read_text(),
+            "install_claude_personal_hook in session-launch.sh no longer "
+            "calls install-personal-claude-hook.sh",
         )
         # Truncate immediately after the call so the harness never reaches the
         # tmux/CLAUDE_CONFIG_DIR machinery below it.
         truncated = "".join(lines[: call_idx + 1])
         (self.root / "src/agent/claude/cli/start-cli.sh").write_text(truncated)
         (self.root / "src/agent/claude/cli/start-cli.sh").chmod(0o755)
+        shutil.copy2(
+            SESSION_LAUNCH, self.root / "src/agent/claude/cli/session-launch.sh"
+        )
 
         shutil.copy2(
             REPO / "scripts/python-binary.sh", self.root / "scripts/python-binary.sh"
@@ -61,6 +75,10 @@ class StartCliPersonalClaudeHookWiringTest(unittest.TestCase):
         shutil.copy2(
             REPO / "src/agent/restart-guard.sh",
             self.root / "src/agent/restart-guard.sh",
+        )
+        shutil.copy2(
+            REPO / "src/agent/task-event-handler-lookup.sh",
+            self.root / "src/agent/task-event-handler-lookup.sh",
         )
 
         self.marker = self.root / "installer-ran.marker"
@@ -134,6 +152,13 @@ class RuntimeScopingTest(unittest.TestCase):
             "startup.sh execs into src/agent/start-cli.sh for every runtime; "
             "the call belongs only at the Claude launch chokepoint",
         )
+
+    def test_the_worker_launcher_also_calls_it(self):
+        """A pool worker is also a headless claude session (session-launch.sh
+        is shared for exactly this reason) — it needs the compaction-reinject
+        hook the same way the core does."""
+        worker_launcher = REPO / "skills/worker-pool/scripts/launch-worker-session.sh"
+        self.assertIn("install_claude_personal_hook", worker_launcher.read_text())
 
 
 if __name__ == "__main__":

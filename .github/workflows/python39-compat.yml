@@ -11,6 +11,8 @@ on:
   pull_request:
     paths:
       - 'src/**/*.py'
+      # Production python that moved out of src/ into a skill still ships.
+      - 'skills/**/*.py'
       - 'scripts/check-python39-compat.py'
       - 'tests/check-python39-compat.test.py'
       - '.github/workflows/python39-compat.yml'
@@ -18,6 +20,8 @@ on:
     branches: [main]
     paths:
       - 'src/**/*.py'
+      # Production python that moved out of src/ into a skill still ships.
+      - 'skills/**/*.py'
       - 'scripts/check-python39-compat.py'
       - 'tests/check-python39-compat.test.py'
       - '.github/workflows/python39-compat.yml'

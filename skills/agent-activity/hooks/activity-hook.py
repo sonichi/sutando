@@ -15,7 +15,6 @@ Always exits 0; a hook that fails must not block the tool it observed.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
@@ -26,6 +25,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from file_lock import locked_file  # noqa: E402
 from local_task_protocol import find_result  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
@@ -126,12 +126,11 @@ def processing_task_id(command: str, ws: Path) -> str | None:
 
 
 def bind(p: dict, task_id: str, session_id: str) -> None:
-    """One writer at a time (flock on a sidecar), a per-process temp name, atomic replace; entries of
-    tasks that have a done row are pruned so the file does not grow forever."""
+    """One writer at a time (shared advisory lock), unique temp, atomic replace.
+    Entries of tasks with a done row are pruned so the file stays bounded."""
     p["bind"].parent.mkdir(parents=True, exist_ok=True)
     lock = p["bind"].with_suffix(".lock")
-    with open(lock, "w") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
+    with locked_file(lock, create_mode=0o600):
         binds = load_json(p["bind"], {})
         binds[task_id] = session_id
         # The same open set completion uses: the live log plus the writer's index, so a task whose
@@ -144,8 +143,8 @@ def bind(p: dict, task_id: str, session_id: str) -> None:
         os.replace(tmp, p["bind"])
 
 
-TASK_FILE = re.compile(rf"tasks/({TASK_ID})\.txt\b")  # tasks/archive/… has no direct match
-RESULT_FILE = re.compile(rf"results/({TASK_ID})\.txt\b")
+TASK_FILE = re.compile(rf"tasks[\\/]+({TASK_ID})\.txt\b")  # tasks/archive/… has no direct match
+RESULT_FILE = re.compile(rf"results[\\/]+({TASK_ID})\.txt\b")
 
 
 def task_file_refs(text: str) -> list[str]:

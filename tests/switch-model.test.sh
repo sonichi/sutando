@@ -9,6 +9,8 @@ cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ -n "${TMUX_FAIL:-}" ] && exit 1
+# The core has one window, index 0: what the shared core-target lookup asks first.
+case " $* " in *" list-windows "*) echo 0; exit 0;; esac
 # One failed capture, then normal: the first capture-pane call exits 1.
 case " $* " in *" capture-pane "*) n=$(( $(cat "$TMUX_LOG.caps" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$TMUX_LOG.caps"; [ "${TMUX_FAIL_CAPTURE_N:-0}" = "$n" ] && exit 1;; esac
 case " $* " in *" capture-pane "*)
@@ -123,5 +125,22 @@ rc=$(TMUX_FAIL_CAPTURE_N=3 run sonnet); [ "$rc" = 7 ] && ! grep -q -- "-l /model
   && ok "33 the baseline capture fails: refuse BEFORE sending, nothing recorded (a blind pane is not a zero)" || fail "33 blind baseline" "rc=$rc $(cat "$T/err")"
 rm -f "$T/tmux.log.caps"
 # The capture counter must reset per run: run() truncates the log, so reset the counter with it.
+
+# --- #4389: a picker the switch may leave on screen is attributed to it, and only while it can be
+GREC="$T/state/self-opened-gate.sutando-core.json"; rm -f "$GREC"
+rc=$(run haiku); [ "$rc" = 0 ] && [ ! -e "$GREC" ] && ok "34 accepted: the picker attribution is cleared" || fail "34" "rc=$rc $(ls "$T/state")"
+rc=$(TMUX_DIALOG=1 run opus); [ "$rc" = 6 ] && [ ! -e "$GREC" ] && ok "35 dialog cancelled by the script itself: attribution cleared" || fail "35" "rc=$rc"
+# The claim window must end within the 5s sighting slack of the exit, not run the full 32s.
+closed(){ python3 -c "import json,sys,time;d=json.load(open('$GREC'));sys.exit(0 if d['claim_window_s']<32 and d['opened_at']+d['claim_window_s']<=time.time()+0.01+$1 else 1)" 2>/dev/null; }
+rc=$(TMUX_NO_ACCEPT=1 run sonnet --accept-timeout 1); R=$(python3 -c "import json;d=json.load(open('$GREC'));print(d['opener'],d['kind'],d['dismiss_after_s'])" 2>/dev/null)
+[ "$rc" = 8 ] && [ "$R" = "model-switch selection 300.0" ] && grep -q "dismissed after 300s" "$T/err" && closed 5 \
+  && ok "36 no acceptance (picker may remain): attribution kept, delay from the manifest (300s), claim window closed at exit" || fail "36" "rc=$rc R=$R"
+rc=$(MODEL_SWITCH_PICKER_DISMISS_AFTER_S=90 TMUX_NO_ACCEPT=1 run sonnet --accept-timeout 1); R=$(python3 -c "import json;print(json.load(open('$GREC'))['dismiss_after_s'])" 2>/dev/null)
+[ "$rc" = 8 ] && [ "$R" = "90.0" ] && ok "37 env overrides the manifest delay" || fail "37" "rc=$rc R=$R"
+rc=$(MODEL_SWITCH_PICKER_DISMISS_AFTER_S=90 TMUX_NO_ACCEPT=1 run sonnet --accept-timeout 1 --picker-dismiss-after 0); R=$(python3 -c "import json;print(json.load(open('$GREC'))['dismiss_after_s'])" 2>/dev/null)
+[ "$rc" = 8 ] && [ "$R" = "0.0" ] && ok "38 --picker-dismiss-after overrides env (0 = never dismiss)" || fail "38" "rc=$rc R=$R"
+rm -f "$GREC"; rc=$(run haiku --dry-run); [ "$rc" = 0 ] && [ ! -e "$GREC" ] && ok "39 --dry-run writes no attribution" || fail "39" "rc=$rc"
+rm -f "$GREC"; rc=$(TMUX_DIALOG=1 TMUX_ACCEPT_AS=haiku run opus --confirm --accept-timeout 1)
+[ "$rc" = 8 ] && [ -e "$GREC" ] && closed 5 && ok "40 confirmed but not accepted: attribution kept, claim window closed at exit" || fail "40" "rc=$rc $(cat "$T/err")"
 
 echo; [ $fails -eq 0 ] && echo "switch-model: all $oks checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

@@ -33,10 +33,10 @@ from typing import NamedTuple
 # derives its classification from parse_markers rather than a parallel grammar.
 try:  # pragma: no cover - the packaged twin exercises the relative imports
     from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
-    from .local_task_protocol import canonical_access_tier
+    from .local_task_protocol import canonical_access_tier, parse_task_headers
 except ImportError:
     from result_markers import parse_markers  # monorepo src/ on sys.path
-    from local_task_protocol import canonical_access_tier
+    from local_task_protocol import canonical_access_tier, parse_task_headers
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
@@ -75,6 +75,10 @@ def is_guarded_tier(tier) -> bool:
     return (tier or "").strip().lower() != OWNER_TIER
 
 
+# Not a tier: an unreadable file, kept distinct from a malformed one (`guest`).
+# Outside the legal set, so it guards like every non-owner value and cannot be forged.
+TIER_UNREADABLE = "unreadable"
+
 class TeamResultLeakError(RuntimeError):
     """A Team result carried a delivery-control marker or a likely secret."""
 
@@ -85,12 +89,14 @@ def resolve_access_tier(task_file) -> str:
     Task-last writers put the trusted tier before ``task:``; prefer that value.
     The remote gateway is task-mid and newline-confines every wire value, so if
     no pre-task tier exists its final tier line is the trusted value.  Missing
-    legacy tiers remain owner; malformed explicit tiers fail closed to guest.
+    legacy tiers remain owner; malformed explicit tiers fail closed to guest, and an
+    UNREADABLE file answers `TIER_UNREADABLE` so a transient I/O failure is never
+    reported as a tier the file does not carry.
     """
     try:
         content = Path(task_file).read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return "guest"
+        return TIER_UNREADABLE
     # LF-only split: the writer strips only \r/\n, so a Unicode line
     # boundary in a field must not forge a header. str.splitlines() would.
     def _tiers(text):
@@ -231,6 +237,24 @@ def is_suppression_only(body: str) -> bool:
     return bool(actions) and all(action.kind == "skip" for action in actions)
 
 
+OWNER_MENTION_HEADER = "owner_mentioned"
+
+
+def is_owner_mention_task(task_text) -> bool:
+    """True when the task's writer attested an owner mention above `task:`.
+
+    The strict parse stops at `task:`, so a body line can never claim it.
+    """
+    headers = parse_task_headers(task_text or "")
+    return (headers.get(OWNER_MENTION_HEADER) or "").strip() == "true"
+
+
+def owner_mention_result_refused_by_room(task_text, body: str) -> bool:
+    """An owner-mention task may close its room turn silently and nothing more:
+    any other result goes to the owner's DM, never to the room that mentioned him."""
+    return is_owner_mention_task(task_text) and not is_suppression_only(body)
+
+
 VERDICT_DELIVER = "deliver"
 VERDICT_LEAK = "leak"
 VERDICT_SUPPRESS = "suppress"
@@ -315,14 +339,19 @@ def _write_artifact(path: Path, payload: dict) -> bool:
         return True
     fd, temporary = tempfile.mkstemp(prefix=".withheld-", suffix=".tmp", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600)
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            os.link(temporary, path)
+            if os.name == "nt":
+                # Windows rename is atomic and refuses to replace an existing file.
+                os.rename(temporary, path)
+            else:
+                os.link(temporary, path)
         except FileExistsError:
             pass
         return path.is_file()
@@ -464,8 +493,10 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
         body, tier, repo, secret_filter, scan_sensitive_data,
         allow_attach=allow_attach, honor_suppressions=honor_suppressions,
         attach_roots=attach_roots)
+    # An unreadable tier is not a decision to record: journalling it can only
+    # fail the same way the tier read did, and its notice replaces the answer.
     if (suppress_journal is not None and is_guarded_tier(tier)
-            and is_suppression_only(body)):
+            and tier != TIER_UNREADABLE and is_suppression_only(body)):
         state_dir, task_id = suppress_journal
         verdict = journal_suppressed_result(verdict, body, state_dir, task_id)
     if (suppress_journal is not None and verdict.kind == VERDICT_LEAK

@@ -11,6 +11,7 @@ Run: python3 tests/core-supervisor-relay.test.py
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -43,6 +44,12 @@ _LIMIT = {"state": "blocked-human", "detail": "awaiting user: session-limit",
           "kind": "session-limit"}
 _LOGGED_OUT = {"state": "logged-out", "detail": "core not authenticated (needs /login)",
                "prompt": None, "kind": None}
+# The monitor's refused-turn signal (#4015): the core sits at its idle prompt and every turn
+# it is sent ends in this line. The prompt IS the line, so the remedy is chosen from it.
+_REFUSED_LINE = ("You're out of usage credits. Run /usage-credits to keep using Fable 5.1 "
+                 "or /model to switch models.")
+_REFUSED = {"state": "blocked-human", "detail": "awaiting user: turn-rejected",
+            "prompt": _REFUSED_LINE, "kind": "turn-rejected"}
 _IDLE = {"state": "idle-ready", "detail": "ready for a task", "prompt": None, "kind": None}
 _RUNNING = {"state": "running", "detail": "actively processing", "prompt": None, "kind": None}
 _CRASHED = {"state": "crashed", "detail": "core process/session not found", "prompt": None}
@@ -248,6 +255,98 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("when the limit window resets", m)
         self.assertNotIn("/login", m)
 
+    def test_turn_rejected_escalates(self):
+        self.assertTrue(should_escalate(_REFUSED, None)[0])
+
+    def test_turn_rejected_says_every_turn_is_refused_and_names_the_line(self):
+        m = compose_message(_REFUSED)
+        self.assertIn("refuses every turn", m)
+        self.assertIn("out of usage credits", m)
+        # A credit line gets the limit remedy, never the login one.
+        self.assertIn("/usage-credits", m)
+        self.assertIn("not a login problem", m)
+        self.assertNotIn("GUI /login", m)
+        self.assertNotIn("restart.sh", m)
+
+    def test_turn_rejected_login_line_names_gui_login_remedy(self):
+        sig = dict(_REFUSED, prompt="OAuth access token has expired · Please run /login")
+        m = compose_message(sig)
+        self.assertIn("refuses every turn", m)
+        self.assertIn("OAuth access token has expired", m)
+        self.assertIn("GUI /login", m)
+        self.assertNotIn("usage limit", m)
+
+    def test_turn_rejected_unknown_line_falls_back_to_the_terminal(self):
+        sig = dict(_REFUSED, prompt="Something else the CLI refused with")
+        with _no_backend():
+            m = compose_message(sig)
+        self.assertIn("refuses every turn", m)
+        self.assertIn("where the core is running", m)
+
+    _PICKER = "Select model\n  1. Opus\n❯ 2. Sonnet\n  3. Haiku\n  Enter to confirm · Esc to cancel"
+    _YESNO = "Allow Bash(rm -rf build)?\n❯ 1. Yes\n  2. No\n  Esc to cancel"
+
+    def test_a_selection_or_permission_gate_names_the_choice_card_first_on_ag2space(self):
+        """A numbered picker or a permission dialog is projected to the owner's AG2 Space DM
+        as a HITL card whose buttons type the answer; the notice says so before the
+        terminal. A typed reply still cannot answer it."""
+        for kind, prompt in (("selection", self._PICKER), ("permission", self._YESNO)):
+            sig = {"state": "blocked-human", "detail": f"awaiting user: {kind}", "prompt": prompt, "kind": kind}
+            with _no_backend():
+                m = compose_message(sig, surface="ag2space")
+            self.assertIn("choice card in our DM", m, kind)
+            self.assertLess(m.index("choice card"), m.index("where the core is running"), kind)
+            self.assertIn("A typed chat reply can't answer it", m)
+        sig = {"state": "blocked-human", "detail": "awaiting user: unknown", "prompt": "??", "kind": "unknown"}
+        with _no_backend():
+            self.assertNotIn("choice card", compose_message(sig, surface="ag2space"))
+
+    def test_the_choice_card_is_named_only_where_a_card_with_buttons_exists(self):
+        """No card on discord/slack/telegram or macOS-only; a trust/bypass/limit dialog and an
+        unparseable prompt get the button-less card, so the notice names the terminal instead."""
+        base = {"state": "blocked-human", "detail": "awaiting user: selection", "kind": "selection"}
+        for surface in ("discord", "slack", "telegram", ""):
+            with _no_backend():
+                m = compose_message({**base, "prompt": self._PICKER}, surface=surface)
+            self.assertNotIn("choice card", m, surface or "macos-only")
+            self.assertIn("answer it where the core is running", m, surface or "macos-only")
+        never = ("Do you trust the files in this folder?\n❯ 1. Yes, proceed\n  2. No, exit",
+                 "Bypass Permissions mode\n❯ 1. Yes, I accept\n  2. No",
+                 "You've hit your weekly limit\n❯ 1. Switch to Opus and continue\n  2. Stop")
+        for prompt in never:
+            with _no_backend():
+                m = compose_message({**base, "prompt": prompt}, surface="ag2space")
+            self.assertNotIn("choice card", m, prompt.splitlines()[0])
+            self.assertIn("answer it where the core is running", m)
+        with _no_backend():
+            m = compose_message({**base, "prompt": "pick one"}, surface="ag2space")
+        self.assertNotIn("choice card", m, "no numbered options: no buttons")
+        # A permission gate keyed on a Yes/No pair is a card on a configured homeserver bridge too.
+        with _no_backend():
+            m = compose_message({**base, "kind": "permission", "prompt": self._YESNO}, surface="dev-ag2space")
+        self.assertIn("choice card", m)
+
+    def test_a_card_lookup_failure_falls_back_to_the_terminal_wording(self):
+        sig = {"state": "blocked-human", "detail": "awaiting user: selection", "prompt": self._PICKER,
+               "kind": "selection"}
+        with _no_backend(), patch.dict(sys.modules, {"hitl": None, "hitl.tui_gate": None}):
+            m = compose_message(sig, surface="ag2space")
+        self.assertNotIn("choice card", m)
+        self.assertIn("answer it where the core is running", m)
+        # Run as a script, src/ is not on sys.path yet: the lookup puts it there itself.
+        src = os.path.dirname(os.path.abspath(_SRC))
+        with patch.object(sys, "path", [p for p in sys.path if os.path.abspath(p) != src]):
+            self.assertTrue(_mod._card_projected(sig, "ag2space"))
+
+    def test_run_cycle_hands_the_delivery_surface_to_the_composer(self):
+        sig = {"state": "blocked-human", "detail": "awaiting user: selection", "prompt": self._PICKER,
+               "kind": "selection"}
+        with _no_backend():
+            on_space = run_cycle(sig, "", macos=False, source="ag2space", channel="!r:x", dry_run=True)
+            on_discord = run_cycle(sig, "", macos=False, source="discord", channel="1", dry_run=True)
+        self.assertIn("choice card", on_space)
+        self.assertNotIn("choice card", on_discord)
+
     def test_non_login_blocker_names_the_cli_terminal(self):
         """A `blocked-human` prompt waits on the core's stdin. Neither a chat reply
         nor the app can answer it, so the remedy must name the terminal."""
@@ -360,12 +459,47 @@ class TestRunCycleAndCli(unittest.TestCase):
                 json.dump(_IDLE, f)
             self.assertEqual(main(["--signal", sig, "--no-macos"]), 0)
 
-    def test_cli_non_dict_signal_degrades(self):
+    def test_cli_non_dict_signal_escalates_as_unreadable(self):
         with tempfile.TemporaryDirectory() as td:
             sig = os.path.join(td, "core-supervisor.json")
             with open(sig, "w") as f:
                 json.dump([1, 2, 3], f)  # valid JSON, wrong shape
-            self.assertEqual(main(["--signal", sig, "--no-macos"]), 0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["--signal", sig, "--no-macos", "--dry-run"]), 0)
+            self.assertIn("status file is unreadable", out.getvalue())
+
+    def test_cli_corrupt_signal_escalates_once_not_silently(self):
+        # 2026-09-11: a short write left core-supervisor.json corrupt from boot; the
+        # relay used to treat that exactly like "no signal yet" and escalate nothing.
+        with tempfile.TemporaryDirectory() as td:
+            sig = os.path.join(td, "core-supervisor.json")
+            state = os.path.join(td, "relay.state")
+            with open(sig, "w") as f:
+                f.write('{"state": "blocked-human", "prompt": "Log')  # truncated
+            sent = []
+            with patch.object(_mod, "_macos_notify", lambda m: sent.append(m)):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(main(["--signal", sig, "--state-file", state]), 0)
+                    self.assertEqual(main(["--signal", sig, "--state-file", state]), 0)
+            self.assertEqual(len(sent), 1, "debounced like any blocker")
+            self.assertIn("Agent needs you", sent[0])
+            self.assertIn("restarting the engine rewrites the file", sent[0])
+
+    def test_cli_signal_that_cannot_be_opened_escalates(self):
+        # present but unopenable (a directory here; a permissions fault in the wild)
+        # is not "no signal yet" either — only a missing file is
+        with tempfile.TemporaryDirectory() as td:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["--signal", td, "--no-macos", "--dry-run"]), 0)
+            self.assertIn("status file is unreadable", out.getvalue())
+
+    def test_unreadable_signal_decision_and_message(self):
+        esc, h = should_escalate(dict(_mod.UNREADABLE_SIGNAL), None)
+        self.assertTrue(esc)
+        self.assertFalse(should_escalate(dict(_mod.UNREADABLE_SIGNAL), h)[0])
 
     def test_cycle_without_state_file_still_emits(self):
         # No --state-file → no debounce persistence, but the escalation still fires.

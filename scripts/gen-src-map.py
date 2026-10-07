@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src"
@@ -161,7 +161,10 @@ def purpose(path: Path) -> str:
 
 def collect() -> list[tuple[str, str]]:
     rows = []
-    for p in sorted(SRC.rglob("*")):
+    for p in sorted(
+        SRC.rglob("*"),
+        key=lambda p: p.relative_to(REPO).as_posix(),
+    ):
         if not p.is_file() or p.suffix not in SUFFIXES:
             continue
         if any(part in SKIP_DIRS for part in p.relative_to(REPO).parts):
@@ -200,13 +203,13 @@ def render(rows: list[tuple[str, str]]) -> str:
     # Group by directory so related modules read together.
     groups: dict[str, list[tuple[str, str]]] = {}
     for rel, desc in rows:
-        groups.setdefault(str(Path(rel).parent), []).append((rel, desc))
+        groups.setdefault(PurePosixPath(rel).parent.as_posix(), []).append((rel, desc))
 
     for group in sorted(groups):
         out.append(f"## `{group}/`")
         out.append("")
         for rel, desc in groups[group]:
-            name = Path(rel).name
+            name = PurePosixPath(rel).name
             out.append(f"- **`{name}`** — {desc}" if desc else f"- **`{name}`** — _(no header comment)_")
         out.append("")
 
@@ -235,7 +238,7 @@ def main() -> int:
         return 1
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(rendered, encoding="utf-8")
+    OUT.write_bytes(rendered.encode("utf-8"))
     undocumented = sum(1 for _, d in rows if not d)
     tally = f"{len(rows)} modules"
     if undocumented:

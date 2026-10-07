@@ -79,8 +79,15 @@ TWEET_URL = "https://api.twitter.com/2/tweets"
 def get_auth():
     _require_requests()
     if not all([API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
+        # Name the OTHER route here, at the point of failure: a host can lack
+        # API keys and still have a signed-in browser that posts fine.
         print("Error: X API credentials not set in .env")
         print("Need: X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET")
+        print("This is the API route only. An agent with the Chrome tools can "
+              "post from a signed-in x.com session instead — navigate to "
+              "x.com/compose/post, type, file_upload to the hidden media input "
+              "(never click it: that opens a native picker), Post, then read "
+              "the permalink back off the profile to verify.", file=sys.stderr)
         sys.exit(1)
     return OAuth1(API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET)
 

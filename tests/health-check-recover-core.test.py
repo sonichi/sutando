@@ -13,6 +13,8 @@ REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
 hc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hc)
+# Recovery tests must never send production analytics.
+hc._recovery_metric = lambda *args, **kwargs: None
 
 # Pin thresholds so the test is independent of any SUTANDO_RECOVER_* env override
 # present in the runner's environment.

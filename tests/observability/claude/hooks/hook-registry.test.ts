@@ -46,7 +46,7 @@ const FIXTURES: Record<string, ClaudeCodeHook> = {
 	PostToolUseFailure: { hook_event_name: 'PostToolUseFailure', session_id: 's', tool_name: 'Bash', tool_input: { command: 'ls' }, error: 'boom' },
 	Stop: { hook_event_name: 'Stop', session_id: 's' },
 	SessionStart: { hook_event_name: 'SessionStart', session_id: 's', source: 'startup', model: 'm' },
-	SessionEnd: { hook_event_name: 'SessionEnd', session_id: 's', end_reason: 'clear' },
+	SessionEnd: { hook_event_name: 'SessionEnd', session_id: 's', reason: 'clear' },
 	PreCompact: { hook_event_name: 'PreCompact', session_id: 's', trigger: 'auto' },
 	Notification: { hook_event_name: 'Notification', session_id: 's', notification_type: 'permission' },
 	SubagentStart: { hook_event_name: 'SubagentStart', session_id: 's', agent_type: 'Explore' },

@@ -24,6 +24,41 @@
 # file (health-check.py, services_status.py, and the tests), so a richer token
 # would convert this bug into a different false "watcher is broken" signal.
 
+# --- naming ------------------------------------------------------------------
+# The stem only. The per-instance SUFFIX is not computed here: src/util_paths.py
+# owns it and delegates to src/runtime-api/instance_key.py, so a shell mirror
+# would be a second implementation of one contract.
+WATCHER_SENTINEL_STEM="watch-tasks-stream"
+
+# The sentinel THIS process writes. $1 = state dir. Asks the Python owner, which
+# reads SUTANDO_INSTANCE_ID and the enrolled actor exactly as the run dir does.
+# A failure is fatal: guessing a path here is how two instances share one file.
+sentinel_path_for() {
+  local state_dir="$1" here out
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local py
+  # shellcheck source=../scripts/python-binary.sh
+  . "$here/../scripts/python-binary.sh" || return 1
+  py="$(require_python "$here/.." "resolve the watcher sentinel")" || return 1
+  if ! out="$("$py" "$here/util_paths.py" watcher-sentinel "$state_dir")"; then
+    echo "watcher_sentinel: could not resolve the sentinel path" >&2
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+# Every sentinel present, historic name first, one per line. A caller that asks
+# about one file has asked about one watcher; on a pool host the others are
+# equally real.
+sentinel_paths_in() {
+  local state_dir="$1" p
+  [ -f "$state_dir/$WATCHER_SENTINEL_STEM.pid" ] && printf '%s/%s.pid\n' "$state_dir" "$WATCHER_SENTINEL_STEM"
+  for p in "$state_dir/$WATCHER_SENTINEL_STEM"-*.pid; do
+    [ -f "$p" ] && printf '%s\n' "$p"
+  done
+  return 0
+}
+
 # Seconds of elapsed time for a pid, or empty when it cannot be determined.
 # `etime` is [[DD-]HH:]MM:SS on both BSD and GNU ps.
 sentinel_pid_elapsed() {

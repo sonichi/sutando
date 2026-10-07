@@ -17,9 +17,51 @@ Output per warn: PARKED (with file:line + date) or UNTRIAGED. A PARKED hit is a
 pointer to read, not permission to skip: extend it with what is new, or say
 plainly that nothing is new.
 """
+import json
 import pathlib
 import re
+import subprocess
 import sys
+
+# Core's read-only entry over the store an installed skill declares; this skill names no other skill.
+PQ_CLI = pathlib.Path(__file__).resolve().parents[3] / "src" / "pending_questions_reader.py"
+
+
+class _LiveSource:
+    """Not a file: the owner's live pending questions, read once via the core reader's list --json."""
+    name = "pending-questions"
+    parent = pathlib.PurePath("live")
+
+    def exists(self):
+        return True
+
+    def __str__(self):
+        return f"pending-questions (python3 {PQ_CLI} list --json)"
+
+
+PENDING_QUESTIONS = _LiveSource()
+
+
+def live_pending_lines():
+    """Searchable lines of every waiting question (title, snippet, body). Fail-open:
+    any failure is an empty source, said once on stderr, never a crash."""
+    try:
+        proc = subprocess.run([sys.executable, str(PQ_CLI), "list", "--json"],
+                              capture_output=True, text=True, timeout=180)
+        items = json.loads(proc.stdout) if proc.returncode == 0 else None
+        if not isinstance(items, list):
+            raise ValueError((proc.stderr or proc.stdout).strip()[-200:] or f"exit {proc.returncode}")
+    except Exception as e:  # noqa: BLE001
+        print(f"pending-questions source unavailable ({e.__class__.__name__}: {e}); searched as empty",
+              file=sys.stderr)
+        return []
+    lines = []
+    for it in items:
+        lines.append(f"## {it.get('title') or ''}")
+        for k in ("snippet", "body"):
+            lines.extend(str(it.get(k) or "").splitlines())
+    return lines
+
 
 def parking_files():
     """Everywhere a triage is parked, resolved by the repo's own helpers.
@@ -35,9 +77,8 @@ def parking_files():
     """
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "src"))
     from util_paths import memory_dir, personal_path, shared_personal_path
-    files = [p for p in (personal_path("pending-questions.md"),
-                         personal_path("current-track.md"),
-                         shared_personal_path("build_log.md")) if p.exists()]
+    files = [PENDING_QUESTIONS] + [p for p in (personal_path("current-track.md"),
+                                               shared_personal_path("build_log.md")) if p.exists()]
     mem = memory_dir()
     if mem.is_dir():
         files.extend(sorted(p for p in mem.glob("*.md") if p.is_file()))
@@ -60,7 +101,8 @@ def lines_of(path):
     """Read once per run: the corpus is now dozens of files x tokens x warns."""
     key = str(path)
     if key not in _LINES:
-        _LINES[key] = path.read_text(errors="ignore").splitlines()
+        _LINES[key] = (live_pending_lines() if isinstance(path, _LiveSource)
+                       else path.read_text(errors="ignore").splitlines())
     return _LINES[key]
 
 # entities worth searching for: paths, dotted filenames, backticked identifiers,
@@ -68,6 +110,10 @@ def lines_of(path):
 # Component count is unbounded; the 3..40 length check below is the only size
 # bound. A cap truncates a hyphenated name and drops a snake_case one entirely.
 ENT = re.compile(r'`([^`]{3,40})`|([\w./-]+\.(?:py|sh|json|md|ts|yml))|\b([a-z][a-z0-9]+(?:-[a-z0-9]+)+)\b|\b(_?[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)\b|(?<!\w)(#\d{3,5})\b')
+# A truncated candidate list reads as a complete one. Must exceed the worst
+# real miss: 7 hits, answer 7th.
+SHOW_CANDIDATES = 12
+
 STOP = {"health-check", "not-running", "restart-needed", "session-read", "read-limit"}
 
 def tokens(name, text):
@@ -107,24 +153,33 @@ def report(name, text, files):
                         hits.append((tok, display(f), i, line.strip()[:92]))
                     break
     if hits:
-        # ALL candidates, not just the first. A probe warns for SEVERAL distinct
-        # conditions and a parking for one does NOT cover another.
+        # Hit order is token-then-file, NOT relevance, so a silent truncation
+        # hides an arbitrary subset. Anything withheld is counted out loud.
         print(f"  CANDIDATES {label:25} ({len(hits)}) — verify the CONDITION matches, not just the probe")
-        for tok, fn, i, line in hits[:3]:
+        for tok, fn, i, line in hits[:SHOW_CANDIDATES]:
             print(f"             via '{tok}' -> {fn}:{i}  {line}")
+        if len(hits) > SHOW_CANDIDATES:
+            print(f"             +{len(hits) - SHOW_CANDIDATES} further candidate(s) NOT shown — "
+                  f"narrow the claim to see them")
         return "parked"
-    body = []
+    hits_by_file = {}
     for tok in toks:
         for f in files:
             for i, line in enumerate(lines_of(f), 1):
                 if tok.lower() in line.lower():
-                    body.append((tok, display(f), i)); break
-    if body:
-        # "No heading" is NOT "nothing written" — material is often parked in a
-        # BODY under a neighbouring heading.
-        tok, fn, i = body[0]
-        print(f"  NO HEADING {label:25} — but {len(body)} body mention(s), first "
-              f"'{tok}' -> {fn}:{i}. READ before investigating")
+                    hits_by_file.setdefault(display(f), {}).setdefault(i, tok)
+    if hits_by_file:
+        # Parking files are append-only, so the NEWEST line of the file holding
+        # the MOST mentions is the verdict; token order is not relevance.
+        total = sum(len(v) for v in hits_by_file.values())
+        fn, at = max(hits_by_file.items(), key=lambda kv: len(kv[1]))
+        ls = sorted(at)
+        first, last, n = ls[0], ls[-1], len(ls)
+        extra = ("" if len(hits_by_file) == 1 else
+                 f", +{total - n} in {len(hits_by_file) - 1} other file(s)")
+        print(f"  NO HEADING {label:25} — but {n} body mention(s) in {fn}{extra}; "
+              f"NEWEST '{at[last]}' -> {fn}:{last}, oldest :{first}. "
+              f"READ the newest first")
         return "parked"
     print(f"  NONE FOUND {label:25} — no heading, no body mention; genuinely "
           f"untriaged, OR every token missed (try one from the warn text)")

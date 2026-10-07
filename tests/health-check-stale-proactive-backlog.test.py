@@ -155,7 +155,10 @@ class StaleProactiveBacklogTest(unittest.TestCase):
         self.assertEqual(verdict["status"], "warn")
         self.assertIn("unreadable", verdict["detail"])
 
-    @unittest.skipIf(os.geteuid() == 0, "root bypasses directory permissions")
+    @unittest.skipIf(
+        os.name == "nt" or getattr(os, "geteuid", lambda: 1)() == 0,
+        "POSIX directory permission semantics required",
+    )
     def test_an_unscannable_results_dir_is_not_read_as_clean(self) -> None:
         # The per-file guard cannot cover this: the failure is on the directory
         # itself, and glob() answers [] there — the same answer as "no backlog".

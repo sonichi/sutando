@@ -4,6 +4,7 @@ answer THAT dialog: never a guessed key, never a key into a dialog the human did
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 from hitl import tui_gate as G  # noqa: E402
@@ -58,6 +59,16 @@ class TestRequirement(unittest.TestCase):
         self.assertEqual(r.subject["option_for_action"], {"deny": 2, "allow": 0})
         self.assertEqual(r.subject["source"], G.SOURCE)
         self.assertEqual(r.device, {"id": "s", "name": "s"})
+
+    def test_the_producer_leaves_the_host_to_the_wire(self):
+        # One policy, in schema.wire_device: every producer (this gate, driver events,
+        # the auth card) gets `host` there, so the gate itself must not add one.
+        self.assertNotIn("host", req("permission", PERM).device)
+
+    def test_an_unreadable_host_label_never_breaks_the_card(self):
+        from hitl.host import device_host
+        with mock.patch("util_paths._host_label", side_effect=RuntimeError("no scutil")):
+            self.assertEqual(device_host(), "")
 
     def test_a_selection_is_a_choice_with_one_button_per_option(self):
         r = req("selection", SELECT)

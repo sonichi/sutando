@@ -209,6 +209,35 @@ class OwnershipTransitionTest(unittest.TestCase):
                            "config_digests": digest_map(registered)})
             self.assertEqual(self._check(ws)["status"], "warn")
 
+    def test_worker_owner_transition_warns(self):
+        """Pinning a previously core-registered entry to a worker (owner:
+        <worker-id>) is the same shape as the launchd/codex transitions above:
+        the core deregisters it out of band (CronDelete, not /schedule-crons),
+        so until the next /schedule-crons run the stamp still says it was
+        registered while `expected` has already dropped."""
+        registered = entries()
+        moved = [dict(e, owner="9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f") if e["name"] == "pr-flag" else e
+                 for e in entries()]
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), moved,
+                          {"ts": STAMPED, "registered": 2, "config_total": 2,
+                           "config_digests": digest_map(registered)})
+            check = self._check(ws)
+            self.assertEqual(check["status"], "warn")
+            self.assertIn("never de-registered", check["detail"])
+
+    def test_worker_owned_entry_present_from_boot_is_not_expected(self):
+        """An entry that ALREADY carries a worker `owner` when the core boots
+        must never count as core-expected — it is the worker's own /startup
+        that registers it (skills/startup/SKILL.md), not this core."""
+        ents = [dict(e, owner="9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f") if e["name"] == "pr-flag" else e
+                for e in entries()]
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), ents,
+                          {"ts": STAMPED, "registered": 1, "config_total": 1,
+                           "config_digests": digest_map([e for e in ents if e["name"] != "pr-flag"])})
+            self.assertEqual(self._check(ws)["status"], "ok")
+
     def test_deleted_entry_whose_job_is_still_live_warns(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(Path(td), entries()[:1],

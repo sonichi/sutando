@@ -57,9 +57,21 @@ TRANSCRIPT="$1"  # Optional explicit path (manual invocations)
 # NOTE (rebase over #2077): the pre-rebase branch also set
 # STATE_FILE="$REPO/session-state.md" here — dropped; STATE_FILE is now
 # derived from the resolved workspace below, per the workspace contract.
-if [ -z "$TRANSCRIPT" ] && [ ! -t 0 ]; then
-  TRANSCRIPT="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("transcript_path") or "")' 2>/dev/null || true)"
+# Resolution is shared with archive-transcript.sh via src/hook_transcript_path.sh
+# (#4001 review): two readers of one payload drift, and the copy nobody
+# remembers is the one that ships the bug. Empty stays non-fatal HERE — the
+# extraction site below falls through to --latest, which is the pre-existing
+# behaviour on a stock hook config and must not change in a refactor.
+__TP_HELPER="$REPO/src/hook_transcript_path.sh"
+[ -f "$__TP_HELPER" ] || __TP_HELPER="$(cd "$(dirname "$0")" && pwd)/hook_transcript_path.sh"
+if [ -f "$__TP_HELPER" ]; then
+  # shellcheck source=hook_transcript_path.sh
+  source "$__TP_HELPER"
+  TRANSCRIPT="$(resolve_hook_transcript_path "$TRANSCRIPT")"
+else
+  echo "session-handoff: hook_transcript_path.sh not found; transcript unresolved, falling through to --latest" >&2
 fi
+unset __TP_HELPER
 
 # Workspace resolves via the shared post-M0 helper (src/workspace_resolve.sh).
 # Exports $WORKSPACE on success; exits non-zero with a diagnostic on failure
@@ -223,56 +235,14 @@ record_compaction_event "${TRANSCRIPT:-}" "${SUTANDO_HANDOFF_TRIGGER:-precompact
   gh pr list --repo sonichi/sutando --state open --limit 5 2>/dev/null || echo "(couldn't fetch)"
   echo ""
 
-  # Pending questions — per-host canonical home is <workspace>/hosts/<hostname>/
-  # (post-#1717). personal_path() must receive the workspace root (WORKSPACE_DIR),
-  # not REPO — passing REPO caused it to probe <repo>/hosts/<host>/ which doesn't
-  # exist and fall back to the non-existent <repo>/pending-questions.md, silently
-  # dropping the section from every session-state.md. Fallback echo uses
-  # WORKSPACE_DIR for the same reason.
-  PQ_PATH=$(SUTANDO_MEMORY_DIR="${SUTANDO_MEMORY_DIR:-}" SUTANDO_PRIVATE_DIR="${SUTANDO_PRIVATE_DIR:-}" python3 -c "
-import sys; sys.path.insert(0, '$REPO/src')
-from util_paths import personal_path
-from pathlib import Path
-print(personal_path('pending-questions.md', Path('$WORKSPACE_DIR')))
-" 2>/dev/null || echo "$WORKSPACE_DIR/hosts/${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-$(scutil --get LocalHostName 2>/dev/null | grep . || hostname | sed 's/\..*//')}}/pending-questions.md")
-  # Extract via the canonical parser (src/check-pending-questions.py) instead of
-  # a second, weaker pattern here. Its `^## ` section split matches all three
-  # heading formats in use — legacy `## Q1 — Title`, `## Title` + `**Status:**`,
-  # and the free-form dated headings the proactive loop actually writes. The
-  # previous `grep "^## Q"` matched only the legacy shape, so on a file using
-  # either newer format the section rendered EMPTY.
-  #
-  # Empty is the dangerous part: it reads as "nothing pending" rather than "not
-  # parsed", so the successor session is told there is nothing waiting on the
-  # owner. Note this is the SECOND fix to this same section — the comment above
-  # records a path-resolution fix, and repairing the path is what turned an
-  # honest "None" (file not found) into a silent "" (found, matched nothing).
-  # Hence the explicit parse-failure branch below: a broken extractor must never
-  # be indistinguishable from an empty queue.
+  # Pending questions — through the one reader (the skill's adapter); never the file.
   echo "## Pending Questions"
-  if [ -f "$PQ_PATH" ]; then
-    pq_out=$(python3 -c "
-import importlib.util
-spec = importlib.util.spec_from_file_location('cpq', '$REPO/src/check-pending-questions.py')
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
-# Read the file the shell already guarded. The module resolves its own PQ_FILE
-# independently, and a second resolution can name a file the [ -f ] never saw.
-from pathlib import Path as _P
-m.PQ_FILE = _P('$PQ_PATH')
-qs = m.get_waiting_questions()
-print('\n'.join('- ' + q['title'] for q in qs[:20]) if qs else 'None')
-" 2>/dev/null)
-    if [ -n "$pq_out" ]; then
-      echo "$pq_out"
-    else
-      # Name both inputs so the failure is reproducible by hand. stderr is
-      # dropped above to match the idiom of the sibling extractors in this
-      # function, which makes this line the only handle an operator gets.
-      echo "(could not parse $PQ_PATH via $REPO/src/check-pending-questions.py — section unavailable, NOT necessarily empty)"
-    fi
+  if pq_out=$(python3 "$REPO/src/pending_questions_reader.py" list --workspace "$WORKSPACE_DIR" 2>/dev/null) \
+      && [ -n "$pq_out" ]; then
+    echo "$pq_out"
   else
-    echo "None"
+    # A broken extractor must never read as an empty queue.
+    echo "(pending-questions reader failed: python3 $REPO/src/pending_questions_reader.py list — section unavailable, NOT necessarily empty)"
   fi
   echo ""
 

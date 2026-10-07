@@ -56,7 +56,9 @@ import sys
 from pathlib import Path
 
 #: Directories scanned. src/ is where the bridge-imported modules live.
-DEFAULT_TARGETS = ("src",)
+# src/ is not the whole product: a module relocated into skills/ runs on the
+# same 3.9.6 interpreter, so the scan follows the code rather than the folder.
+DEFAULT_TARGETS = ("src", "skills")
 
 #: Constructs that MUST fail to parse on 3.9. If any of these compiles, the
 #: interpreter running this script is newer than the floor and the scan below

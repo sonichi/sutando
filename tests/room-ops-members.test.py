@@ -36,8 +36,15 @@ for uid in ("@yixuan-desktop.agent:ag2.space",
 for uid in ("@sutando-rui:ag2.space", "@sutando-bassil:ag2.space",
             "@sutando-qingyun-001:ag2.space"):
     check(mem.classify_member(uid) == "agent", f"`@sutando-` prefix -> agent ({uid})")
+# The other runtimes' legacy prefixes, the same list the web client reads
+# (cinny agentMxid.ts) — one mxid must classify the same on both sides.
+for uid in ("@codex-x:ag2.space", "@hermes-x:ag2.space", "@openclaw-x:ag2.space",
+            "@cline-x:ag2.space", "@pi-x:ag2.space", "@kilo-x:ag2.space"):
+    check(mem.classify_member(uid) == "agent", f"legacy runtime prefix -> agent ({uid})")
 for uid in ("@qingyun:ag2.space", "@chi:ag2.space", "@vidhu:ag2.space"):
     check(mem.classify_member(uid) == "human", f"bare localpart -> human ({uid})")
+check(mem.classify_member("@codexy:ag2.space") == "human",
+      "a prefix needs its hyphen: `codexy` is not `codex-`")
 check(mem.classify_member("") == "human", "empty id does not crash (defaults human)")
 # `sutando` inside a localpart is not the prefix: the rule is anchored, so a
 # human who happens to be named for the product is not reclassified.

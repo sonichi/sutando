@@ -8,7 +8,7 @@
 # context, not in unrelated sessions.
 #
 # Hooks installed (4):
-#   PreCompact  → cp $TRANSCRIPT_PATH ~/Desktop/sutando-conversations/...
+#   PreCompact  → src/archive-transcript.sh ~/Desktop/sutando-conversations/
 #   PreCompact  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   SessionEnd  → bash src/session-handoff.sh "$TRANSCRIPT_PATH"
 #   Stop        → bash src/check-pending-tasks.sh
@@ -93,14 +93,20 @@ shq() {
 # ~/Desktop, so every hook installed by the old script pointed at a directory
 # that does not exist and failed silently on each fire.
 HOOKS=(
-  "PreCompact|sutando-conversations/|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
+  "PreCompact|sutando-conversations/|bash $(shq "$REPO_DIR/src/archive-transcript.sh") \"\$HOME/Desktop/sutando-conversations/\""
   "PreCompact|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "SessionEnd|src/session-handoff.sh|bash $(shq "$REPO_DIR/src/session-handoff.sh") \"\$TRANSCRIPT_PATH\""
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
+  # Without this the Stop gate spends its one reminder and never re-arms:
+  # begin_turn is the only reset and nothing else in the lifecycle calls it.
+  "UserPromptSubmit|src/turn-start.sh|bash $(shq "$REPO_DIR/src/turn-start.sh")"
 )
 
-# The transcript archiver writes OUTSIDE the workspace (~/Desktop). Omitting it
-# is install-only: phase 0 skips it anyway (no repo path), so an opt-in survives.
+# The transcript archiver writes to ~/Desktop, OUTSIDE the vault carrier set.
+# The location is not what keeps transcripts out of the vault: sync is a whitelist
+# (see .git/info/exclude -- `*` then the include list), so a workspace path is
+# unsynced until vault.sync.include names it. Omitting it
+# drops it from HOOKS, which every phase iterates, so a registered one is untouched.
 if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" = "1" ]; then
   _kept=()
   for _h in "${HOOKS[@]}"; do
@@ -138,15 +144,22 @@ DEPRECATED_HOOKS=(
   "Stop|watch-tasks-stream.pid"
 )
 
+# This PR changed the archiver's command: phase 0 cannot migrate the old one (it
+# embeds no repo path) and phase 1 matches exactly, so both would fire.
+if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" != "1" ]; then
+  # SCOPE, not egress: the flag already dropped the archiver from HOOKS, so an
+  # ungated removal here would delete a registered hook and install no successor.
+  DEPRECATED_HOOKS+=(
+    "PreCompact|cp \"\$TRANSCRIPT_PATH\" \"\$HOME/Desktop/sutando-conversations/\$(date +%Y-%m-%dT%H-%M-%S).jsonl\""
+  )
+fi
+
 if ! command -v jq >/dev/null 2>&1; then
   echo "error: jq is required for atomic settings.json edit" >&2
   exit 2
 fi
 
 mkdir -p "$REPO_DIR/.claude"
-# The PreCompact archive hook is a bare `cp`, which cannot create its own
-# destination; without this the archiver fails on every compaction, silently.
-mkdir -p "$HOME/Desktop/sutando-conversations"
 if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi
@@ -345,6 +358,14 @@ for entry in "${DEPRECATED_HOOKS[@]}"; do
   mv "$TMP" "$SETTINGS"
   REMOVED=$((REMOVED + 1))
 done
+
+# A bare `cp` archiver (legacy, or an operator's own) cannot create its destination;
+# the managed archive-transcript.sh makes its own, so only the bare form gets one.
+if jq -e '(.hooks // {}).PreCompact // [] | map(.hooks // []) | flatten
+          | map((.command // "") | test("^cp .*sutando-conversations/")) | any' \
+     "$SETTINGS" >/dev/null 2>&1; then
+  mkdir -p "$HOME/Desktop/sutando-conversations"
+fi
 
 echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED removed=$REMOVED → $SETTINGS"
 

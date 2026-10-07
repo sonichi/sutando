@@ -1,6 +1,15 @@
 /**
- * Inline tools — lightweight macOS actions that execute instantly without going through the core agent.
- * Shared between voice-agent.ts and phone conversation-server.ts.
+ * Inline tools — lightweight platform actions that execute instantly without
+ * going through the core agent. Shared between voice-agent.ts and the phone
+ * conversation-server.ts.
+ *
+ * Originally macOS-only (osascript, pbcopy/pbpaste, screencapture, …). On
+ * Windows, the platform-specific call sites delegate to src/platform.ts so
+ * clipboard, notifications, screen capture, and app switching work; AppleScript-only tools
+ * (type_text, press_key against a specific app, Chrome JS-injected
+ * scroll, QuickTime control) return a clear `macOSOnly` error rather than
+ * silently failing. The error is surfaced to Gemini so the voice/phone agent
+ * can fall back to telling the user instead of pretending it ran the action.
  *
  * Add new tools here and they auto-appear in both voice and phone agents.
  */
@@ -8,12 +17,15 @@
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { join, extname, dirname, delimiter } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import { requirePython } from './python-binary.js';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
+import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
+import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
+import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin } from './task-bridge.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -57,14 +69,14 @@ import { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool
 export const openFileTool: ToolDefinition = {
 	name: 'open_file',
 	description:
-		'Open a file with macOS. ALWAYS pass an absolute `path` (or one starting with $VAR / ~). ' +
+		'Open a file with the OS default handler (macOS: `open`, Windows: ShellExecute). ALWAYS pass an absolute `path` (or one starting with $VAR / ~). ' +
 		'Use for: "open the file", "open that", "can you open it". ' +
 		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
 		'"voice diagnostics" = /tmp/voice-diagnostics-tracker.html, ' +
 		'"voice context" / "the voice context file" / "the active context" = $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt where <active> is the trimmed contents of $SUTANDO_MEMORY_DIR/voice-contexts/active (legacy users may have $SUTANDO_PRIVATE_DIR set instead — either expands). Pass it with the env-var expanded by you, or as $SUTANDO_MEMORY_DIR/voice-contexts/<active>.txt — both work. ' +
-		'Pass `app` when the user names a specific app ("open with Sublime Text", "open the SQLite db in TablePlus") OR when recent conversation makes the intended app clear (e.g. user just said "I\'ll review this in VS Code"). Without `app`, macOS uses its default handler for that file type — leave unset when the default is fine. ' +
-		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — works generically for any file type via Cmd+Ctrl+F to whichever app the OS routed the file to (QuickTime → Present mode, Preview → fullscreen PDF, Chrome → fullscreen page, etc.).',
+		'Pass `app` when the user names a specific app ("open with Sublime Text", "open the SQLite db in TablePlus") OR when recent conversation makes the intended app clear (e.g. user just said "I\'ll review this in VS Code"). Without `app`, the OS picks the default handler for that file type — leave unset when the default is fine. NOTE: the `app` argument is macOS-only; on Windows the file always opens with its default handler. ' +
+		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — macOS sends Cmd+Ctrl+F to whichever app the OS routed the file to. Windows-only ignores this flag.',
 	parameters: z.object({
 		path: z.string().describe('Absolute file path to open.'),
 		app: z.string().optional().describe('Optional app name (e.g. "Sublime Text", "VS Code", "TablePlus") to open the file with. If omitted, macOS uses its default handler for the file type. Set this when the user names an app explicitly OR recent conversation makes the intended app clear; otherwise leave unset.'),
@@ -83,8 +95,7 @@ export const openFileTool: ToolDefinition = {
 			// silently-empty substitution flow through to a generic "file not
 			// found" error below.
 			const unresolvedVars: string[] = [];
-			const filePath = path
-				.replace(/^~/, process.env.HOME || '')
+			const filePath = expandHome(path)
 				.replace(/\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)/g, (_, a, b) => {
 					const name = a || b;
 					const val = process.env[name];
@@ -105,14 +116,20 @@ export const openFileTool: ToolDefinition = {
 			// into a shell string.
 			//
 			// Resolution per issue #560:
-			//   1. Explicit `app` arg → `open -a <app> <path>`
-			//   2. No `app` → `open <path>` (macOS LaunchServices picks default)
+			//   1. Explicit `app` arg → `open -a <app> <path>` (macOS)
+			//   2. No `app` → `open <path>` (macOS LaunchServices picks default) / ShellExecute (Windows)
 			// Contextual inference (rule 2 from issue) is the model's job — Gemini
 			// reads the conversation and decides whether to pass `app`. The tool
 			// only honors what it's told.
-			const openArgs = app ? ['-a', app, filePath] : [filePath];
-			execFileSync('open', openArgs, { timeout: 5_000 });
-			if (fullscreen) {
+			if (isMacOS()) {
+				const openArgs = app ? ['-a', app, filePath] : [filePath];
+				execFileSync('open', openArgs, { timeout: 5_000 });
+			} else {
+				// Windows + Linux: app-specific open isn't portable; defer to default
+				// handler via ShellExecute / xdg-open. Surfaced in the tool description.
+				openWithDefault(filePath);
+			}
+			if (fullscreen && isMacOS()) {
 				// Brief delay so the just-opened app becomes frontmost before
 				// the keystroke lands. Cmd+Ctrl+F is the macOS native-fullscreen
 				// toggle — every app that supports fullscreen handles it (QT
@@ -140,7 +157,7 @@ export const openFileTool: ToolDefinition = {
 			if (['.mp4', '.mov', '.webm', '.m4v'].includes(ext)) {
 				try {
 					const fs = await import('node:fs');
-					fs.writeFileSync('/tmp/sutando-playback-path', filePath);
+					fs.writeFileSync(PLAYBACK_PATH, filePath);
 					console.log(`${ts()} [OpenFile] wrote playback-path for video-control tools`);
 				} catch {}
 			}
@@ -184,6 +201,11 @@ export const pressKeyTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { key, modifiers = [], app } = args as { key: string; modifiers?: string[]; app?: string };
+		// Cross-platform note: this tool drives macOS AppleScript System Events.
+		// Windows has no portable equivalent for "send keystroke X with modifiers
+		// to app Y" from the command line — gate cleanly so Gemini knows to fall
+		// back rather than silently dropping the keystroke.
+		if (!isMacOS()) return macOSOnlyError('press_key');
 		// Activate target app if specified. Escape `app` before embedding
 		// in the AppleScript string literal — without this, a value like
 		// `"; do shell script "rm -rf ~"; tell application "Finder` would
@@ -256,13 +278,26 @@ const PROCESS_NAMES: Record<string, string> = {
 export const switchAppTool: ToolDefinition = {
 	name: 'switch_app',
 	description:
-		'Switch to (activate) a macOS application. Use for: "switch to Chrome", "open Slack", "go to Terminal".',
+		'Switch to (activate) a macOS or Windows application. Use for: "switch to Chrome", "open Slack", "go to Terminal".',
 	parameters: z.object({
 		app: z.string().describe('Application name (e.g. "Google Chrome", "Slack", "Terminal", "Finder")'),
 	}),
 	execution: 'inline',
-	async execute(args) {
+	async execute(args, ctx) {
 		let { app } = args as { app: string };
+		if (isWindows()) {
+			try {
+				const windowsAliases: Record<string, string> = {
+					...APP_ALIASES, terminal: 'Terminal', explorer: 'File Explorer',
+					edge: 'Microsoft Edge', calculator: 'Calculator',
+				};
+				app = windowsAliases[app.toLowerCase()] ?? app;
+				return await activateWindowsApp(app, fileURLToPath(new URL('./windows-app-launcher.ps1', import.meta.url)), ctx?.abortSignal);
+			} catch (err) {
+				return { error: `Failed to switch to ${app}: ${err instanceof Error ? err.message : err}` };
+			}
+		}
+		if (!isMacOS()) return macOSOnlyError('switch_app');
 		app = APP_ALIASES[app.toLowerCase()] ?? app;
 		// Escape for AppleScript string literals — no shell layer needed with execFileSync.
 		const safeApp = app.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -332,6 +367,7 @@ export const typeTextTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const a = args as { text: string; mode?: 'replace_all' | 'append' | 'at_caret'; append?: boolean };
+		if (!isMacOS()) return macOSOnlyError('type_text');
 		const text = a.text;
 		// Resolve effective mode. Explicit `mode` wins; legacy `append: true` → 'append';
 		// otherwise default to 'at_caret' (the long-standing default behavior pre-2026-06-01).
@@ -415,6 +451,7 @@ export const volumeTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { level, mute } = args as { level?: number; mute?: boolean };
+		if (!isMacOS()) return macOSOnlyError('volume');
 		try {
 			if (mute === true) {
 				execFileSync('osascript', ['-e', 'set volume with output muted'], { timeout: 5_000 });
@@ -542,6 +579,7 @@ export const brightnessTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		let { level } = args as { level: number };
+		if (!isMacOS()) return macOSOnlyError('brightness');
 		// Gemini sometimes passes 0-1 instead of 0-100 — normalize
 		if (level <= 1 && level > 0) level = Math.round(level * 100);
 		level = Math.max(0, Math.min(100, level));
@@ -594,7 +632,7 @@ export const brightnessTool: ToolDefinition = {
 export const clipboardTool: ToolDefinition = {
 	name: 'clipboard',
 	description:
-		'Read or write the system clipboard. Use for: "what did I copy", "copy this text", "paste". Instant.',
+		'Read or write the system clipboard. Use for: "what did I copy", "copy this text", "paste". Instant. Cross-platform (macOS pbcopy/pbpaste, Windows PowerShell Get-Clipboard/Set-Clipboard).',
 	parameters: z.object({
 		action: z.enum(['read', 'write']).describe('"read" to get clipboard contents, "write" to set them'),
 		text: z.string().optional().describe('Text to write to clipboard (only for action="write")'),
@@ -604,12 +642,12 @@ export const clipboardTool: ToolDefinition = {
 		const { action, text } = args as { action: 'read' | 'write'; text?: string };
 		try {
 			if (action === 'read') {
-				const content = execFileSync('pbpaste', [], { encoding: 'utf-8', timeout: 5_000 });
+				const content = clipboardRead();
 				console.log(`${ts()} [Clipboard] read: ${content.slice(0, 40)}`);
 				return { status: 'read', content };
 			} else {
 				if (!text) return { error: 'No text provided to write' };
-				execFileSync('pbcopy', [], { input: text, timeout: 5_000 });
+				clipboardWrite(text);
 				console.log(`${ts()} [Clipboard] wrote: ${text.slice(0, 40)}`);
 				return { status: 'written', text };
 			}
@@ -696,17 +734,13 @@ export const cancelTaskTool: ToolDefinition = {
 			// Strip newlines from targetId (Gemini-supplied; task IDs are alphanumeric
 			// in practice but defence-in-depth). task: field is placed LAST so a
 			// forged line in the body cannot shadow the real source/access_tier above it.
+			// Same header writer as the work tool, so the confirmation follows the session's origin.
 			const safeTargetId = (targetId ?? '').replace(/[\r\n]/g, '');
-			const cancelBody = [
-				`id: task-${cancelTs}`,
-				`timestamp: ${new Date().toISOString()}`,
-				`source: voice`,
-				`channel_id: local-voice`,
-				`user_id: voice-local`,
-				`access_tier: owner`,
-				`task: CANCEL_INSTRUCTION: stop processing ${safeTargetId} if still in flight. If already completed, no-op. Reply briefly confirming.`,
-				``,
-			].join('\n');
+			const cancelOrigin = getVoiceSessionOrigin();
+			_rememberTaskOrigin(`task-${cancelTs}`, cancelOrigin);
+			const cancelBody =
+				buildVoiceTaskHeader(`task-${cancelTs}`, new Date().toISOString(), 'voice-local', cancelOrigin) +
+				`task: CANCEL_INSTRUCTION: stop processing ${safeTargetId} if still in flight. If already completed, no-op. Reply briefly confirming.\n`;
 			writeFileSync(join(tasksDir, cancelFilename), cancelBody);
 
 			// Also unlink the original task file if it's still present — prevents
@@ -737,6 +771,7 @@ export const toggleTasksTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { action, taskIndex } = args as { action: 'collapse' | 'expand'; taskIndex?: number };
+		if (!isMacOS()) return macOSOnlyError('toggle_tasks');
 		// Set data attribute on body — MutationObserver in the page picks it up and updates state.
 		// When taskIndex is set, encode as "expand:N" / "collapse:N"; handler in web-client.ts parses the suffix.
 		const actionStr = taskIndex ? `${action}:${taskIndex}` : action;
@@ -775,14 +810,28 @@ export const getCurrentTimeTool: ToolDefinition = {
 	},
 };
 
+// The pending queue's fresh snapshot (src/task_queue.py write_snapshot):
+// {ts, depth, pending}. Older than 10 minutes, or absent, is unknown — a
+// stale depth is worse than none. Exported for the test.
+export function readQueueDepth(workspaceDir: string, nowSec = Math.floor(Date.now() / 1000)): number | null {
+	try {
+		const p = statusReadPath('task-queue.json', workspaceDir);
+		if (!existsSync(p)) return null;
+		const q = JSON.parse(readFileSync(p, 'utf-8')) as { ts?: number; depth?: number };
+		if (typeof q.ts !== 'number' || nowSec - q.ts > 600 || typeof q.depth !== 'number') return null;
+		return q.depth;
+	} catch { return null; }
+}
+
 // Get what the core agent (Claude Code proactive-loop) is currently doing.
 // Lets voice-agent Gemini answer "what are you working on?" truthfully
-// instead of guessing. Reads core-status.json written by the core agent.
+// instead of guessing. Reads core-status.json written by the core agent, and
+// the queue depth from state/task-queue.json.
 export const getCoreStatusTool: ToolDefinition = {
 	name: 'get_core_status',
 	description:
-		'Get what the core agent (Claude Code) is currently doing. Use when the user asks ' +
-		'"what are you working on", "what are you up to", "are you busy", "anything running", ' +
+		'Get what the core agent (Claude Code) is currently doing and how many tasks are queued. Use when the user asks ' +
+		'"what are you working on", "what are you up to", "are you busy", "anything running", "how many are waiting", ' +
 		'or similar questions about background work. Instant file read. Call it ONLY for those ' +
 		'explicit status questions — NEVER on greetings ("hello"), filler, garbled speech, or as ' +
 		'a fallback when unsure what the user wants; fire nothing instead.',
@@ -794,8 +843,10 @@ export const getCoreStatusTool: ToolDefinition = {
 			// (workspace resolves via the M0 helper; default <repo>/workspace/ post-v0.8).
 			// statusReadPath falls back to the legacy workspace-root location for one release.
 			const corePath = statusReadPath('core-status.json', WORKSPACE_DIR);
+			const queued = readQueueDepth(WORKSPACE_DIR);
+			const queueNote = queued === null ? '' : queued === 0 ? ' Nothing is queued.' : ` ${queued} task(s) queued.`;
 			if (!existsSync(corePath)) {
-				return { status: 'idle', description: 'Core agent is not currently running.' };
+				return { status: 'idle', queued, description: 'Core agent is not currently running.' + queueNote };
 			}
 			const raw = readFileSync(corePath, 'utf-8');
 			const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
@@ -806,10 +857,11 @@ export const getCoreStatusTool: ToolDefinition = {
 					status: 'running',
 					step: s.step || '(no step label)',
 					ageSec,
-					description: `Core agent is working on: ${s.step || 'an unlabeled task'} (started ${ageSec}s ago).`,
+					queued,
+					description: `Core agent is working on: ${s.step || 'an unlabeled task'} (started ${ageSec}s ago).` + queueNote,
 				};
 			}
-			return { status: 'idle', description: 'Core agent is idle right now.' };
+			return { status: 'idle', queued, description: 'Core agent is idle right now.' + queueNote };
 		} catch (e) {
 			return { status: 'unknown', description: `Could not read core status: ${e instanceof Error ? e.message : e}` };
 		}
@@ -834,6 +886,7 @@ export const slideControlTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { action, slideNumber } = args as { action: 'next' | 'previous' | 'goto'; slideNumber?: number };
+		if (!isMacOS()) return macOSOnlyError('slide_control');
 		try {
 			// All slide navigation uses DOM manipulation for reliability, and is
 			// LAYOUT-AGNOSTIC: it addresses slides by VISUAL POSITION (1-indexed) via the
@@ -881,6 +934,7 @@ export const fullscreenTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('fullscreen');
 		try {
 			const script = `
 tell application "System Events"
@@ -949,7 +1003,7 @@ export const createChatTaskTool: ToolDefinition = {
 // (legacy $SUTANDO_PRIVATE_DIR honored via sharedPersonalPath()), else
 // <workspace>/notes fallback. Notes are SHARED across the fleet so they live
 // at the top-level memory dir, not under machine-<host>/.
-import { sharedPersonalPath, memoryDirEnv, readCaptureToken } from './util_paths.js';
+import { sharedPersonalPath, memoryDirEnv, readCaptureToken, expandHome } from './util_paths.js';
 const NOTES_DIR = sharedPersonalPath('notes', WORKSPACE_DIR);
 
 export const showViewTool: ToolDefinition = {
@@ -1225,10 +1279,11 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // access_tier values: "owner" (default if omitted) | "any_caller".
 // OPTIONAL hook a skill's tools.ts may export; core calls it once per voice
 // session so the skill registers session handlers without importing core.
-export type { SkillSetupCtx, SkillSetup } from './skill-setup-runner.js';
-import type { SkillSetup } from './skill-setup-runner.js';
+export type { SkillSetupCtx, SkillSetup, VoiceSurfaceContribution, VoiceSurfaceHook } from './skill-setup-runner.js';
+import { collectVoiceSurface } from './skill-setup-runner.js';
+import type { SkillSetup, VoiceSurfaceHook } from './skill-setup-runner.js';
 
-async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[]; setups: SkillSetup[] }> {
+async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[]; setups: SkillSetup[]; voiceSurfaces: VoiceSurfaceHook[] }> {
 	// Scan the public-repo `skills/` dir, the per-user workspace
 	// `$SUTANDO_WORKSPACE/skills/`, AND the optional private skills dir
 	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
@@ -1239,7 +1294,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	const dirsToScan: string[] = [join(REPO_ROOT, 'skills'), join(WORKSPACE_DIR, 'skills')];
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
-		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
+		const expanded = expandHome(privateRoot);
 		dirsToScan.push(join(expanded, 'skills'));
 	}
 	// External plugin checkouts: an optional voice-surface plugin can live
@@ -1263,6 +1318,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	// Keyed by skill identity (manifest.name || dirName), not tool name: the same
 	// skill scanned from two roots must attach its handler ONCE, last-write-wins.
 	const setups = new Map<string, SkillSetup>();
+	const voiceSurfaces = new Map<string, VoiceSurfaceHook>();
 	for (const skillsDir of dirsToScan) {
 		if (!existsSync(skillsDir)) continue;
 		let dirs: string[];
@@ -1290,7 +1346,10 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 			const tier = manifest.access_tier === 'any_caller' ? 'any_caller' : 'owner';
 			try {
 				// @ts-ignore — dynamic relative import resolved at runtime by tsx
-				const mod = await import(toolsPath);
+				// Node's ESM loader rejects raw Windows drive paths (`Q:\...`)
+				// because it interprets the drive letter as a URL scheme. A
+				// file URL works on every platform and preserves spaces safely.
+				const mod = await import(pathToFileURL(toolsPath).href);
 				if (Array.isArray(mod.tools)) {
 					(tier === 'any_caller' ? anyCaller : owner).push(...mod.tools);
 					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
@@ -1301,6 +1360,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 					console.log(`[skill-loader] found setup() hook in ${manifest.name || dirName} (${skillsDir})`);
 					setups.set(manifest.name || dirName, mod.setup as SkillSetup);
 				}
+				if (typeof mod.voiceSurface === 'function') voiceSurfaces.set(manifest.name || dirName, mod.voiceSurface as VoiceSurfaceHook);
 			} catch (err) {
 				console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools} from ${skillsDir}:`, err instanceof Error ? err.message : err);
 			}
@@ -1319,7 +1379,7 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	};
 	// One authoritative line for what actually got registered, after dedupe.
 	if (setups.size) console.log(`[skill-loader] registered ${setups.size} setup() hook(s): ${[...setups.keys()].join(', ')}`);
-	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups: [...setups.values()] };
+	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups: [...setups.values()], voiceSurfaces: [...voiceSurfaces.values()] };
 }
 const personalTools = await loadSkillManifestTools();
 // Also dedupe across the owner+anyCaller union (a tool declared in both tiers).
@@ -1332,12 +1392,16 @@ const personalAllTools = (() => {
 // presenter-sentinel conditionals) — exported so behavior-anchor tests can
 // pin the STATIC tool surface portably (CI has no personal skill manifests;
 // see tests/voice-behavior-anchors.test.ts).
+// macOS automation only; other hosts must not be shown tools that cannot run there.
+const MACOS_ONLY_TOOLS = new Set(['press_key', 'type_text', 'volume', 'brightness', 'toggle_tasks', 'slide_control', 'fullscreen']);
 export const envDependentToolNames: ReadonlySet<string> = new Set([
-	...personalAllTools.map(t => t.name), 'slide_control', 'fullscreen',
+	...personalAllTools.map(t => t.name), ...MACOS_ONLY_TOOLS,
 ]);
 // voice-agent invokes each once per session with {session, injectText}.
 // Empty when no skill exports setup().
 export const personalSkillSetups: SkillSetup[] = personalTools.setups;
+// Voice-session-only tools, prompt rules and context lines from skills' voiceSurface().
+export const personalVoiceSurface = collectVoiceSurface(personalTools.voiceSurfaces);
 
 // Manifest-driven discovery of skills that core (not voice-inline) runs.
 // When a manifest has `documented_for_core: true` and a `core_description`,
@@ -1356,7 +1420,7 @@ function loadCoreDocumentedSkills(): { name: string; description: string }[] {
 	const dirsToScan: string[] = [join(REPO_ROOT, 'skills'), join(WORKSPACE_DIR, 'skills')];
 	const privateRoot = memoryDirEnv();
 	if (privateRoot) {
-		const expanded = privateRoot.replace(/^~/, process.env.HOME || '');
+		const expanded = expandHome(privateRoot);
 		dirsToScan.push(join(expanded, 'skills'));
 	}
 	// Last-write-wins map so private (later in dirsToScan) overrides public —
@@ -1391,7 +1455,11 @@ function loadCoreDocumentedSkills(): { name: string; description: string }[] {
 }
 export const coreDocumentedSkills = loadCoreDocumentedSkills();
 
-export const inlineTools = assertUniqueToolNames([
+export function forHostPlatform<T extends { name: string }>(tools: T[], platform: NodeJS.Platform = process.platform): T[] {
+	return platform === 'darwin' ? tools : tools.filter(t => !MACOS_ONLY_TOOLS.has(t.name));
+}
+
+export const inlineTools = forHostPlatform(assertUniqueToolNames([
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
 	volumeTool, brightnessTool, clipboardTool,
@@ -1403,7 +1471,7 @@ export const inlineTools = assertUniqueToolNames([
 	sendVisionFrameTool, startVisionTool, stopVisionTool,
 	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
 	switchVoiceConfigTool,
-	...personalAllTools ]);
+	...personalAllTools ]));
 
 /** Tools available to any caller (including unverified) */
 export const anyCallerTools = [
@@ -1413,7 +1481,7 @@ export const anyCallerTools = [
 ];
 
 /** Owner-only tools (require isOwner) */
-export const ownerOnlyTools = [
+export const ownerOnlyTools = forHostPlatform([
 	volumeTool, brightnessTool,
 	pressKeyTool, scrollTool, switchTabTool, closeTabTool, openUrlTool,
 	switchAppTool, captureScreenTool, typeTextTool,
@@ -1426,7 +1494,7 @@ export const ownerOnlyTools = [
 	setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool,
 	switchVoiceConfigTool,
 	...personalTools.owner,
-];
+]);
 
 /** Configurable tools — default to owner-only, can be opened to verified callers */
 export const configurableTools = [

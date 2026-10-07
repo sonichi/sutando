@@ -4,6 +4,7 @@ window, the I/O edge with fakes, and the record/replay/probe CLI end to end."""
 import contextlib
 import io
 import json
+import argparse
 import os
 import stat
 import subprocess
@@ -12,6 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -43,6 +45,29 @@ class Normalization(unittest.TestCase):
             self.assertIn(token, n, token)
         # No blanket digit stripping (owner review): a bare number is content until a trace says otherwise.
         self.assertIn("run 42", n)
+
+    def test_a_compound_duration_is_one_field(self):
+        self.assertEqual(w.normalize("(12s · esc to interrupt)"), w.normalize("(1h 3m 12s · esc to interrupt)"))
+        self.assertEqual(w.normalize("took 3.5s"), "took <dur>")
+
+    def test_spelled_out_durations_are_one_field(self):
+        self.assertEqual(w.normalize("Retrying in 5 seconds"), w.normalize("Retrying in 4 seconds"))
+        self.assertEqual(w.normalize("waited 2 minutes 1 second"), "waited <dur>")
+
+    def test_the_spinner_lines_cycling_glyph_is_not_a_new_state(self):
+        frames = [f"{g} Hatching… (9s · ↓ 1.2k tokens · esc to interrupt)" for g in "✻✶✳✢·✽*"]
+        self.assertEqual(len({w.state_id(f) for f in frames}), 1)
+        self.assertNotEqual(w.state_id("✻ Hatching… (9s)"), w.state_id("✻ Cooking… (9s)"))
+
+    def test_a_hyphenated_spinner_verb_cycles_its_glyph_without_a_new_state(self):
+        for verb in ("Dilly-dallying", "Re-ticulating", "Topsy-turvying"):
+            with self.subTest(verb=verb):
+                frames = [f"{g} {verb}… (9s · ↓ 1.2k tokens · esc to interrupt)" for g in "✻✶✳✢·✽*"]
+                self.assertEqual(len({w.state_id(f) for f in frames}), 1)
+
+    def test_a_markdown_bullet_is_content_not_a_spinner(self):
+        self.assertNotEqual(w.state_id("* Fix the parser\n"), w.state_id("· Fix the parser\n"))
+        self.assertIn("* Fix the parser", w.normalize("* Fix the parser"))
 
     def test_semantic_digits_are_progress_not_noise(self):
         self.assertNotEqual(w.state_id("editing migration_41.sql\n"), w.state_id("editing migration_42.sql\n"))
@@ -83,24 +108,39 @@ class Classifier(unittest.TestCase):
         v = w.classify([IDLE] * 6, False, 30)
         self.assertEqual((v["kind"], v["warn"], v["raw_static"]), ("idle", False, True))
 
-    def test_case1_is_pure_raw_static_with_work(self):
-        low = w.classify([IDLE] * 6, True, 60, "core-status running")
-        high = w.classify([IDLE] * 6, True, 900, "core-status running")
-        self.assertEqual((low["kind"], low["warn"], low["confidence"]), ("static-with-work", True, "low"))
-        self.assertEqual(high["confidence"], "high")
-        self.assertIn("core-status running", high["reason"])
+    def test_the_work_queue_does_not_decide_a_verdict(self):
+        # This module reads the CLI (Chi). A static pane is idle whatever is queued
+        # elsewhere; `static-with-work` rested on the queue and is gone.
+        for work in (False, True):
+            v = w.classify([IDLE] * 6, work, 900, "core-status running")
+            self.assertEqual((v["kind"], v["warn"]), ("idle", False), work)
 
-    def test_clock_only_pane_is_not_case1(self):
-        # Spec: case 1 is pure static, no normalization. A ticking clock is motion.
+    def test_idle_reason_does_not_claim_nothing_outstanding_when_something_is(self):
+        # qingyun-wu, #4131 review: the verdict correctly ignores the queue (Chi's
+        # design), but the reason text must not then assert the queue is empty.
+        v = w.classify([IDLE] * 6, True, 900, "core-status running")
+        self.assertNotIn("nothing outstanding", v["reason"])
+        self.assertIn("core-status running", v["reason"])
+        v2 = w.classify([IDLE] * 6, False, 900, "")
+        self.assertIn("nothing outstanding", v2["reason"])
+
+    def test_a_pane_parked_on_an_error_warns_from_its_own_text(self):
+        for frame in ("❯ \n⏵⏵ APIError: 500 Internal Server Error\n",
+                      "❯ \n⏵⏵ Network error: could not reach the API\n",
+                      "❯ \n⏵⏵ fetch failed\n"):
+            v = w.classify([frame] * 6, False, 300)
+            self.assertEqual((v["kind"], v["warn"]), ("abnormal", True), frame)
+
+    def test_a_clock_ticking_pane_is_not_case1_and_never_warns(self):
+        # A ticking clock is motion, so this pane is alive and never a warning.
+        # It has no kind of its own: `clock-only` only suppressed low-novelty.
         frames = [idle_with_clock(i) for i in range(6)]
         v = w.classify(frames, True, 900)
         self.assertNotEqual(v["kind"], "static-with-work")
         self.assertFalse(v["raw_static"])
-        self.assertTrue(v["clock_only"])
-        # A clock-only pane is ALIVE (Chi): never a warning, with or without work, however long
         for work in (False, True):
             q = w.classify([idle_with_clock(i) for i in range(12)], work, 900)
-            self.assertEqual((q["kind"], q["warn"]), ("clock-only", False), work)
+            self.assertEqual((q["kind"], q["warn"]), ("working", False), work)
         # ...unless retry text says otherwise: counters-only motion WITH retry text is still case 2
         r = w.classify([retry_frame(i) for i in range(12)], True, 60)
         self.assertEqual(r["kind"], "retry-loop")
@@ -117,9 +157,9 @@ class Classifier(unittest.TestCase):
                 f"* {verb} for 1s · done 5:{17 + i // 3:02d} PM · 1 monitor still running\n"
             )
         v = w.classify([frame(i) for i in range(12)], True, 300)
-        # A provider-blocked CLI is its own kind (owner review), not forced into "retry loop".
+        # A provider-abnormal CLI is its own kind (owner review), not forced into "retry loop".
         self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("provider-limit", True, "high"))
-        self.assertIn("quota-limit", v["current_patterns"])
+        self.assertIn("quota-limit", v["current_abnormal"])
         self.assertFalse(v["raw_static"])  # the pane moved: this is case 2, not case 1
 
     def test_codex_idle_banner_is_not_a_provider_limit(self):
@@ -133,7 +173,7 @@ class Classifier(unittest.TestCase):
                 "› \n"
             )
         v = w.classify([frame(i) for i in range(20)], False, 60)
-        self.assertNotIn("quota-limit", v["matched_patterns"], v)
+        self.assertNotIn("quota-limit", v["matched_patterns"] + v.get("matched_abnormal", []), v)
         self.assertNotEqual(v["kind"], "provider-limit", v)
         # Positive controls: the phrasings that DO mean a limit was hit still match.
         for line in ("You've hit your usage limit · resets 6pm",
@@ -141,7 +181,35 @@ class Classifier(unittest.TestCase):
                      "Session limit reached. Try again at 6pm",
                      "usage limit exceeded for this plan",
                      "/usage-credits to finish what you're working on."):
-            self.assertIn("quota-limit", w.matched_patterns([line]), line)
+            self.assertIn("quota-limit", w.matched_abnormal([line]), line)
+
+    def test_an_abnormal_pane_whose_clock_moves_is_not_clock_only(self):
+        """The clock-only exemption ("a live CLI, not a wedge") swallowed every
+        abnormal state whose pane ticked: #4015 sat 70 min refusing each turn."""
+        def moving(msg):
+            return [f"{msg}\n  idle · 5:{17 + i // 3:02d} PM · nothing running\n> "
+                    for i in range(12)]
+        for msg, want in (("You are out of usage credits", "provider-limit"),
+                          ("Please log in to continue", "abnormal"),
+                          ("Compacting conversation", "abnormal")):
+            v = w.classify(moving(msg), False, 4200)
+            self.assertEqual(v["kind"], want, msg)
+            self.assertTrue(v["warn"], msg)
+
+    def test_abnormal_is_reached_without_any_retry_text(self):
+        """Every abnormal verdict used to be gated on retry text, which is why
+        quota-limit had to live in RETRY_PATTERNS to work at all."""
+        v = w.classify(["Please log in to continue"] * 8, True, 600)
+        self.assertEqual(v["matched_patterns"], [])
+        self.assertIn("needs-login", v["matched_abnormal"])
+        self.assertEqual(v["kind"], "abnormal")
+
+    def test_the_two_families_are_disjoint(self):
+        self.assertFalse({n for n, _ in w.RETRY_PATTERNS} & {n for n, _ in w.ABNORMAL_PATTERNS})
+
+    def test_ordinary_work_still_does_not_warn(self):
+        v = w.classify([f"Thinking... step {i}" for i in range(8)], True, 600)
+        self.assertEqual((v["kind"], v["warn"]), ("working", False))
 
     def test_a_pattern_in_one_old_sample_does_not_colour_the_window(self):
         # Owner review P1: sample 1 says "command timed out", the rest is a finished, idle pane.
@@ -155,6 +223,27 @@ class Classifier(unittest.TestCase):
         entries = [{"ts": 0.0, "state": "t", "raw_state": "t", "patterns": ["timeout"]}] + \
                   [{"ts": 60.0 * i, "state": "i", "raw_state": "i", "patterns": []} for i in range(1, 12)]
         self.assertEqual(w.classify_window(entries, (False, ""), 660.0)["kind"], "idle")
+
+    def test_a_tool_status_line_carrying_a_timeout_setting_is_not_a_timeout(self):
+        for line in ("  \u23bf  Monitor started \u00b7 task btr403775 \u00b7 timeout 1800s",
+                     "Monitor started \u00b7 task b1 \u00b7 timeout 30s", "timeout=600", "timeout: 30",
+                     "Bash(sleep 5) timeout: 600000"):
+            self.assertNotIn("timeout", w.matched_patterns([line]), line)
+        for line in ("Request timed out", "API Error: Request timed out.", "Connection error: timed out",
+                     "timeout of 30000ms exceeded", "command timed out after 30s", "timed out 3 times",
+                     "Timeout 30000ms exceeded", "Operation timed out: 60", "Error: timeout 30s exceeded"):
+            self.assertIn("timeout", w.matched_patterns([line]), line)
+
+    def test_two_frames_with_only_the_monitor_line_are_not_a_retry_loop(self):
+        frame = IDLE + "  \u23bf  Monitor started \u00b7 task btr403775 \u00b7 timeout 1800s\n"
+        self.assertNotEqual(w.classify([frame, frame], False, 60)["kind"], "retry-loop")
+        with tempfile.TemporaryDirectory() as d:
+            entries = []
+            for t in (0.0, 60.0):
+                entries = w.append_window(Path(d), frame, t)
+            v = w.classify_window(entries, (False, ""), 60.0)
+        self.assertNotEqual(v["kind"], "retry-loop")
+        self.assertEqual(v["matched_patterns"], [])
 
     def test_retry_text_must_be_current_and_recurrent(self):
         # retry-loop = low novelty AND retry text that is current and recurrent
@@ -191,15 +280,19 @@ class Classifier(unittest.TestCase):
         v = w.classify([retry_frame(0), retry_frame(0)], True, 1)
         self.assertEqual((v["kind"], v["warn"]), ("unknown", False))
         self.assertIn("too short", v["reason"])
-        self.assertEqual(w.classify([IDLE] * 3, True, 30)["kind"], "unknown")          # would warn → too short
-        self.assertEqual(w.classify([IDLE] * 3, True, 60)["kind"], "static-with-work")
+        self.assertEqual(w.classify([retry_frame(0)] * 3, True, 30)["kind"], "unknown")  # would warn → too short
+        self.assertEqual(w.classify([retry_frame(0)] * 3, True, 60)["kind"], "retry-loop")
         self.assertEqual(w.classify([IDLE] * 3, False, 1)["kind"], "idle")               # not a warning: stated
 
-    def test_low_novelty_without_retry_text_is_a_soft_warning_only_with_work(self):
+    def test_repetition_alone_no_longer_warns_retry_is_read_from_the_text(self):
+        # Novelty measured repetition; retry is a cause. It reached neither the
+        # constant-text retry (text catches it) nor the varying one (novelty 1.00).
         frames = [f"state {'AB'[i % 2]}\n" for i in range(12)]
-        v = w.classify(frames, True, 60)
-        self.assertEqual((v["kind"], v["warn"], v["confidence"]), ("low-novelty", True, "low"))
-        self.assertEqual(w.classify(frames, False, 60)["kind"], "working")
+        self.assertEqual((w.classify(frames, True, 60)["kind"], w.classify(frames, True, 60)["warn"]),
+                         ("working", False))
+        # ...while the retry the TEXT can see still warns, with or without constant text.
+        r = w.classify([retry_frame(i) for i in range(12)], True, 60)
+        self.assertEqual((r["kind"], r["warn"]), ("retry-loop", True))
 
     def test_working_is_not_a_warning(self):
         v = w.classify([working_frame(i) for i in range(20)], True, 60)
@@ -218,11 +311,11 @@ class Classifier(unittest.TestCase):
 
     def test_thresholds_are_reported_and_overridable(self):
         v = w.classify([f"state {'AB'[i % 2]}\n" for i in range(6)], True, 60,
-                       thresholds={"min_samples": 4, "low_novelty_rate": 0.5})
-        self.assertEqual(v["kind"], "low-novelty")
+                       thresholds={"min_samples": 4})
         self.assertEqual(v["thresholds"]["min_samples"], 4)
-        # the same frames under the provisional thresholds read as working (2/6 = 0.33 > 0.25)
-        self.assertEqual(w.classify([f"state {'AB'[i % 2]}\n" for i in range(6)], True, 60)["kind"], "working")
+        # pattern_min_consecutive still gates: a retry seen once is not yet a loop.
+        one = [retry_frame(0)] + [working_frame(i) for i in range(11)]
+        self.assertEqual(w.classify(one, True, 60, thresholds={"pattern_min_consecutive": 5})["warn"], False)
         self.assertTrue(v["advisory"])
         self.assertIn("not a health guarantee", v["note"])
 
@@ -268,10 +361,9 @@ class IoEdge(unittest.TestCase):
             v = w.classify_window(entries, w.work_outstanding(ws, now=1500.0), 1500.0)
             # the static run started at 1100 (the working frame before it does not count)
             self.assertEqual(v["duration"], 400.0)
-            self.assertEqual(v["kind"], "static-with-work")
+            self.assertEqual(v["kind"], "idle")
             self.assertEqual(v["trailing_static_samples"], 2)
             self.assertEqual(v["sample_count"], 3)  # the run is still reported whole
-            self.assertEqual(v["confidence"], "low")  # 2 samples: one gap, however long (TustinOC)
             self.assertEqual((v["observation_runs"], v["median_gap_s"]), (1, 300.0))
             # a clock-only trailing run is NOT a static run (raw ids differ)
             for i in range(3):
@@ -295,7 +387,7 @@ class IoEdge(unittest.TestCase):
         # three samples within the continuity limit ARE a run, and the duration is the run's
         entries = [e(0.0), e(600.0), e(1200.0)]
         v = w.classify_window(entries, (True, "1 queued task(s)"), 1230.0)
-        self.assertEqual((v["kind"], v["confidence"], v["duration"], v["observation_runs"]), ("static-with-work", "high", 1230.0, 1))
+        self.assertEqual((v["kind"], v["confidence"], v["duration"], v["observation_runs"]), ("idle", "high", 1230.0, 1))
         # a window whose newest sample is itself older than the limit has no current observation
         v = w.classify_window(entries, (True, "1 queued task(s)"), 1200.0 + 5000)
         self.assertEqual(v["kind"], "unknown")
@@ -312,7 +404,7 @@ class IoEdge(unittest.TestCase):
         self.assertIn("cannot be observed at this rate", v["reason"])
         # the same pane sampled inside the limit is a plain case-1 warning
         dense = [e(1800.0 * i) for i in range(6)]
-        self.assertEqual(w.classify_window(dense, (True, "x"), 1800.0 * 5 + 10)["kind"], "static-with-work")
+        self.assertEqual(w.classify_window(dense, (True, "x"), 1800.0 * 5 + 10)["kind"], "idle")
 
     def test_a_cadence_change_is_judged_on_the_recent_gaps_not_the_window_median(self):
         # Codex on 8ada45a: 15 half-hourly samples then 5 hourly ones kept the window median
@@ -378,7 +470,12 @@ class IoEdge(unittest.TestCase):
         junk = lambda *a, **k: SimpleNamespace(returncode=0, stdout="garbage\n")
         self.assertIsNone(w.sampled_from_inside("/s", "=c:1", "tmux", runner=junk, tmux_pane="%7", tmux_env="/s,1,0", ancestors=[4242]))
         self.assertEqual(w._pid_ancestors(pid=777, runner=boom), [777])
-        self.assertIn(os.getppid(), w._pid_ancestors())
+        snapshot = "PID PPID ARGS\n777 4242 child\n4242 1 parent\n"
+        with patch.object(w, "is_windows", return_value=True), \
+                patch.object(w, "process_snapshot", return_value=snapshot):
+            self.assertEqual(w._pid_ancestors(pid=777), [777, 4242])
+        if os.name != "nt":
+            self.assertIn(os.getppid(), w._pid_ancestors())
 
     def test_pane_identity_probe(self):
         ok = w.pane_identity("/s", "core", "tmux", runner=lambda *a, **k: SimpleNamespace(returncode=0, stdout="4242:1788000000\n"))
@@ -390,7 +487,7 @@ class IoEdge(unittest.TestCase):
 
 def fake_tmux(dir_: Path, frames_file: Path) -> Path:
     """A stand-in tmux binary: each capture-pane prints the next frame from a file."""
-    script = dir_ / "tmux"
+    script = dir_ / ("tmux.py" if os.name == "nt" else "tmux")
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import sys, pathlib\n"
@@ -403,7 +500,47 @@ def fake_tmux(dir_: Path, frames_file: Path) -> Path:
         "sys.stdout.write(frames[min(i, len(frames) - 1)])\n"
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    if os.name == "nt":
+        wrapper = dir_ / "tmux.cmd"
+        wrapper.write_text(f'@echo off\n"{sys.executable}" "{script}" %*\n')
+        return wrapper
     return script
+
+
+def _append_window_worker(workspace: str, barrier, index: int) -> None:
+    barrier.wait(timeout=20)
+    w.append_window(Path(workspace), working_frame(index), 10.0 + index)
+
+
+def _racy_window_worker(workspace: str, barrier, index: int) -> None:
+    path = w.window_path(Path(workspace))
+    entries = w.load_window(path)
+    barrier.wait(timeout=20)
+    (Path(workspace) / f"racy-{index}.attempted").write_text("1")
+    entries.append({"ts": 10.0 + index, "state": "s", "raw_state": "r", "patterns": []})
+    try:
+        w._write_private(path, "".join(json.dumps(e) + "\n" for e in entries))
+    except OSError:
+        pass
+
+
+class Identity(unittest.TestCase):
+    # Outside Cli: that class pins _local_host_label to 'host' for every probe.
+
+    def test_local_host_label_comes_from_util_paths_or_the_short_hostname(self):
+        # Coverage of the resolver itself (the class pins it elsewhere): the shared helper when it
+        # imports, the short hostname when it cannot.
+        import socket
+        self.assertIsInstance(w._local_host_label(), str)
+        with patch.dict(sys.modules, {"util_paths": None}):
+            self.assertEqual(w._local_host_label(), socket.gethostname().split(".")[0])
+
+    def test_an_unreadable_pane_is_an_unknown_verdict_for_that_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; (ws / "state" / "cores").mkdir(parents=True)
+            with patch.object(w, "capture_pane", return_value=None):
+                v = w.probe_one(argparse.Namespace(socket="/s", tmux="tmux", workspace=str(ws), work_file=None, work_outstanding=None, now=None, warn_after=None, sample=None), ws, "=core-9:0", "worker")
+            self.assertEqual((v["kind"], v["reason"], v["role"]), ("unknown", "pane not readable", "worker"))
 
 
 class Cli(unittest.TestCase):
@@ -468,9 +605,217 @@ class Cli(unittest.TestCase):
             self.assertEqual([o["sample_count"] for o in outs], [1, 1, 2, 2], outs)
             self.assertIn("no work signal", outs[0]["work_detail"])
             self.assertFalse(w.window_path(ws).exists(), "an explicit target must not write the core's window")
-            self.assertTrue(w.window_path(ws, "=worker-1:1").exists())
-            self.assertNotEqual(w.window_path(ws, "=worker-1:1"), w.window_path(ws, "=worker-2:1"))
+            self.assertTrue(w.window_path(ws, w.window_slot("/s", "=worker-1:1")).exists())
+            self.assertNotEqual(w.window_path(ws, w.window_slot("/s", "=worker-1:1")), w.window_path(ws, w.window_slot("/s", "=worker-2:1")))
             self.assertEqual(w.window_path(ws), w.window_path(ws, None))
+
+    def test_probe_takes_the_callers_work_signal_for_a_worker(self):
+        # The deliverer knows what a worker owes; the core's queue does not. A work file keyed by
+        # target, or an explicit flag, replaces the core-queue read for explicit targets.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join([IDLE] * 8))
+            tmux = fake_tmux(Path(d), frames)
+            wf = Path(d) / "work.json"
+            wf.write_text(json.dumps({"=worker-1:1": {"outstanding": True, "detail": "task-abc handed 40s ago, no result"},
+                                      "=worker-2:1": {"outstanding": False}}))
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux)]
+            rc, out = self.run_main(*base, "--target", "=worker-1:1", "--work-file", str(wf))
+            v = json.loads(out)
+            self.assertEqual((rc, v["work_outstanding"], v["work_detail"], v["target"]), (0, True, "task-abc handed 40s ago, no result", "=worker-1:1"))
+            rc, out = self.run_main(*base, "--target", "=worker-2:1", "--work-file", str(wf))
+            v = json.loads(out)
+            self.assertEqual((v["work_outstanding"], v["work_detail"]), (False, "work file: nothing outstanding"))
+            rc, out = self.run_main(*base, "--target", "=worker-9:1", "--work-file", str(wf))
+            v = json.loads(out)
+            self.assertEqual(v["work_outstanding"], False)
+            self.assertIn("no work signal for '=worker-9:1'", v["work_detail"])
+            rc, out = self.run_main(*base, "--target", "=worker-9:1", "--work-outstanding")
+            self.assertEqual(json.loads(out)["work_outstanding"], True)
+            rc, out = self.run_main(*base, "--target", "=worker-9:1", "--no-work")
+            v = json.loads(out)
+            self.assertEqual((v["work_outstanding"], v["work_detail"]), (False, "caller says nothing outstanding"))
+            # a missing or broken work file is a missing signal, never a verdict input
+            rc, out = self.run_main(*base, "--target", "=worker-1:1", "--work-file", str(Path(d) / "absent.json"))
+            self.assertIn("work file unreadable", json.loads(out)["work_detail"])
+            # the core's own pane still reads its own queue (no explicit target)
+            (ws / "tasks").mkdir(parents=True, exist_ok=True); (ws / "tasks" / "task-1.txt").write_text("x")
+            rc, out = self.run_main(*base)
+            self.assertIn("queued task", json.loads(out)["work_detail"])
+
+    def test_a_work_file_never_silences_the_cores_own_queue(self):
+        # --work-file keyed for workers plus the core in --targets: the core still reads its queue
+        # (no key for it), and a key for the core's own target is honoured when present.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join([IDLE] * 8))
+            tmux = fake_tmux(Path(d), frames)
+            self._alive(ws, "sutando-core")
+            (ws / "tasks").mkdir(parents=True, exist_ok=True)
+            for i in range(3):
+                (ws / "tasks" / f"task-{i}.txt").write_text("x")
+            wf = Path(d) / "work.json"
+            wf.write_text(json.dumps({"=w1:1": {"outstanding": False}}))
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux), "--targets", "=w1:1,=sutando-core:0"]
+            with patch.object(w, "_local_host_label", return_value="host"):
+                rc, out = self.run_main(*base, "--work-file", str(wf))
+                by = json.loads(out)["targets"]
+                self.assertEqual(by["=sutando-core:0"]["role"], "core")
+                self.assertTrue(by["=sutando-core:0"]["work_outstanding"], by["=sutando-core:0"])
+                self.assertIn("queued task", by["=sutando-core:0"]["work_detail"])
+                self.assertNotIn("None", by["=sutando-core:0"]["work_detail"])
+                self.assertEqual(by["=w1:1"]["work_outstanding"], False)
+                wf.write_text(json.dumps({"=sutando-core:0": {"outstanding": False, "detail": "deliverer says drained"}}))
+                rc, out = self.run_main(*base, "--work-file", str(wf))
+                by = json.loads(out)["targets"]
+                self.assertEqual((by["=sutando-core:0"]["work_outstanding"], by["=sutando-core:0"]["work_detail"]), (False, "deliverer says drained"))
+
+    def test_an_invalid_work_file_never_silences_the_core_but_still_silences_a_worker(self):
+        # Missing file, bad JSON, non-boolean record: the core falls back to its queue; a worker
+        # keeps the fail-closed missing-signal result.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d); (ws / "tasks").mkdir(); (ws / "tasks" / "task-1.txt").write_text("x")
+            truth = w.work_outstanding(ws, 0.0)
+            self.assertTrue(truth[0])
+            missing = str(ws / "absent.json")
+            bad = ws / "bad.json"; bad.write_text("{not json")
+            nonbool = ws / "nb.json"; nonbool.write_text(json.dumps({"=sutando-core:0": {"outstanding": "false"}}))
+            for wf in (missing, str(bad), str(nonbool)):
+                self.assertEqual(w.work_signal("=sutando-core:0", ws, 0.0, work_file=wf, core=True), truth, wf)
+                got = w.work_signal("=w1:1", ws, 0.0, work_file=wf)
+                self.assertFalse(got[0], (wf, got))
+                self.assertIn("no work signal", got[1])
+
+    def test_probe_targets_gives_one_verdict_per_worker_with_its_own_signal(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"
+            frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join(working_frame(i) for i in range(8)))
+            tmux = fake_tmux(Path(d), frames)
+            wf = Path(d) / "work.json"
+            wf.write_text(json.dumps({"=w1:1": {"outstanding": True, "detail": "owes task-1"}}))
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux), "--targets", "=w1:1, =w2:1", "--work-file", str(wf)]
+            rc, out = self.run_main(*base)
+            v = json.loads(out)
+            self.assertEqual((rc, v["socket"], sorted(v["targets"])), (0, "/s", ["=w1:1", "=w2:1"]))
+            self.assertEqual((v["targets"]["=w1:1"]["work_outstanding"], v["targets"]["=w1:1"]["work_detail"]), (True, "owes task-1"))
+            self.assertFalse(v["targets"]["=w2:1"]["work_outstanding"])
+            rc, out = self.run_main(*base)
+            v2 = json.loads(out)
+            self.assertEqual([v2["targets"][k]["sample_count"] for k in ("=w1:1", "=w2:1")], [2, 2])
+            self.assertFalse(w.window_path(ws).exists())
+            self.assertTrue(w.window_path(ws, w.window_slot("/s", "=w1:1")).exists() and w.window_path(ws, w.window_slot("/s", "=w2:1")).exists())
+
+    def setUp(self):
+        super().setUp()
+        p = patch.object(w, "_local_host_label", return_value="host"); p.start(); self.addCleanup(p.stop)
+
+    def _alive(self, ws: Path, session: str, socket: str = "/s") -> None:
+        cores = ws / "state" / "cores"; cores.mkdir(parents=True, exist_ok=True)
+        (cores / "host.alive").write_text(json.dumps({"host": "host", "socket": socket, "session": session, "schema_version": 4}))
+
+    def test_core_identity_reads_this_hosts_heartbeat_only(self):
+        # A shared workspace holds other hosts' heartbeats; a fresher peer record must not become the
+        # local core, and with no local record the identity is the configured default, never the env.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; cores = ws / "state" / "cores"; cores.mkdir(parents=True)
+            (cores / "host.alive").write_text(json.dumps({"host": "host", "socket": "/s", "session": "sutando-core"}))
+            (cores / "peer.alive").write_text(json.dumps({"host": "peer", "socket": "/p", "session": "core-9"}))
+            os.utime(cores / "host.alive", (1, 1))  # the peer's record is the newer one
+            with patch.object(w, "_local_host_label", return_value="host"):
+                self.assertEqual(w.core_identity(ws), ("/s", "sutando-core"))
+                (cores / "host.alive").unlink()
+                with patch.dict(os.environ, {"SUTANDO_TMUX_SESSION": "core-2"}):
+                    self.assertEqual(w.core_identity(ws), (None, w.DEFAULT_SESSION))
+                (cores / "host.alive").write_text("not json")
+                self.assertEqual(w.core_identity(ws), (None, w.DEFAULT_SESSION))
+
+    def test_a_malformed_socket_in_the_heartbeat_is_an_unreadable_record(self):
+        # One bad socket must not crash the diagnostic at realpath(), nor cost the core its session.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; cores = ws / "state" / "cores"; cores.mkdir(parents=True)
+            with patch.object(w, "_local_host_label", return_value="host"):
+                for bad in (["/s"], {"path": "/s"}, 7, True):
+                    (cores / "host.alive").write_text(json.dumps({"host": "host", "socket": bad, "session": "core-2"}))
+                    self.assertEqual(w.core_identity(ws), (None, "core-2"), bad)
+                for absent in ({"host": "host", "session": "core-2"}, {"host": "host", "socket": None, "session": "core-2"}, {"host": "host", "socket": "", "session": "core-2"}):
+                    (cores / "host.alive").write_text(json.dumps(absent))
+                    self.assertEqual(w.core_identity(ws), (None, "core-2"), absent)
+
+    def test_role_comes_from_identity_not_from_how_the_session_was_spelled(self):
+        # The heartbeat record names the core's session. Naming that session explicitly is still the
+        # core; a worker reached through the environment with no flag is still a worker.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join(working_frame(i) for i in range(12)))
+            tmux = fake_tmux(Path(d), frames)
+            self._alive(ws, "sutando-core")
+            (ws / "tasks").mkdir(parents=True, exist_ok=True); (ws / "tasks" / "task-1.txt").write_text("x")
+            base = ["probe", "--socket", "/s", "--workspace", str(ws), "--tmux", str(tmux)]
+            rc, out = self.run_main(*base, "--session", "sutando-core")        # explicit, but it IS the core
+            v = json.loads(out)
+            self.assertEqual((v["role"], v["work_outstanding"]), ("core", True), v)
+            self.assertIn("queued task", v["work_detail"])
+            self.assertTrue(w.window_path(ws).exists())
+            with patch.dict(os.environ, {"SUTANDO_TMUX_SESSION": "core-2"}):     # env names a WORKER, no flag
+                rc, out = self.run_main(*base)
+            v = json.loads(out)
+            self.assertEqual((v["role"], v["work_outstanding"]), ("worker", False), v)
+            self.assertIn("no work signal", v["work_detail"])
+            self.assertEqual(v["target"], "=core-2:0")
+            rc, out = self.run_main(*base, "--target", "=sutando-core:0")       # explicit target that IS the core
+            self.assertEqual(json.loads(out)["role"], "core")
+            rc, out = self.run_main(*base, "--session", "sutando-core", "--role", "worker")   # the override wins
+            v = json.loads(out); self.assertEqual((v["role"], v["work_outstanding"]), ("worker", False))
+            rc, out = self.run_main(*base, "--target", "=core-9:0", "--role", "core")
+            self.assertEqual(json.loads(out)["role"], "core")
+            # no heartbeat record: the configured default is the core, a named other session a worker,
+            # and a session named only by the environment is a worker too (never promoted to core)
+            (ws / "state" / "cores" / "host.alive").unlink()
+            rc, out = self.run_main(*base); self.assertEqual(json.loads(out)["role"], "core")
+            rc, out = self.run_main(*base, "--session", "core-3"); self.assertEqual(json.loads(out)["role"], "worker")
+            with patch.dict(os.environ, {"SUTANDO_TMUX_SESSION": "core-2"}):
+                rc, out = self.run_main(*base)
+            v = json.loads(out); self.assertEqual((v["role"], v["target"]), ("worker", "=core-2:0"), v)
+
+    def test_windows_are_keyed_by_socket_as_well_as_target(self):
+        # Two tmux servers on one host can both hold =core-2:1; the same target on two sockets must not
+        # share a window (alternating pane identities would split every sample into a new run).
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "ws"; frames = Path(d) / "frames.txt"
+            frames.write_text("\n===\n".join(working_frame(i) for i in range(8)))
+            tmux = fake_tmux(Path(d), frames)
+            counts = []
+            for sock in ("/s1", "/s2", "/s1", "/s2"):
+                rc, out = self.run_main("probe", "--socket", sock, "--target", "=core-2:1", "--workspace", str(ws), "--tmux", str(tmux))
+                counts.append(json.loads(out)["sample_count"])
+            self.assertEqual(counts, [1, 1, 2, 2])
+            self.assertNotEqual(w.window_slot("/s1", "=core-2:1"), w.window_slot("/s2", "=core-2:1"))
+            self.assertEqual(w.window_slot("/s1", "=x"), w.window_slot("/s1", "=x"))
+            self.assertTrue(w.window_path(ws, w.window_slot("/s1", "=core-2:1")).exists())
+            self.assertTrue(w.window_path(ws, w.window_slot("/s2", "=core-2:1")).exists())
+            self.assertFalse(w.window_path(ws).exists())
+
+    def test_work_signal_precedence(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d); wf = Path(d) / "w.json"
+            wf.write_text(json.dumps({"outstanding": True, "detail": "flat record"}))
+            self.assertEqual(w.work_signal("=t:1", ws, 0.0, work_file=str(wf)), (True, "flat record"))
+            self.assertEqual(w.work_signal("=t:1", ws, 0.0, work_file=str(wf), say=False), (False, "caller says nothing outstanding"))
+            self.assertEqual(w.work_signal("=t:1", ws, 0.0), (False, "no work signal for an explicit --target"))
+            wf.write_text("{not json")
+            self.assertIn("unreadable", w.work_signal("=t:1", ws, 0.0, work_file=str(wf))[1])
+            # `outstanding` is a JSON boolean or it is no signal: nothing is coerced.
+            for val, want in (("false", False), ("true", False), (0, False), (1, False), (None, False), (True, True), (False, False)):
+                wf.write_text(json.dumps({"=t:1": {"outstanding": val}}))
+                got = w.work_signal("=t:1", ws, 0.0, work_file=str(wf))
+                self.assertEqual(got[0], want, (val, got))
+                if type(val) is not bool:
+                    self.assertIn("is not a boolean", got[1], (val, got))
+            wf.write_text(json.dumps({"=t:1": {"detail": "no key"}}))
+            self.assertIn("no work signal", w.work_signal("=t:1", ws, 0.0, work_file=str(wf))[1])
 
     def test_probe_with_unreadable_pane_is_unknown_not_a_warning(self):
         with tempfile.TemporaryDirectory() as d:
@@ -524,8 +869,9 @@ class Cli(unittest.TestCase):
         path = w.record(args, lambda: IDLE, clock=clock, sleep=lambda s: None)
         first = json.loads(path.read_text().splitlines()[0])
         self.assertEqual(sorted(first), ["patterns", "raw_state", "state", "ts"])
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
         args2 = SimpleNamespace(**{**vars(args), "keep_normalized": True})
         path2 = w.record(args2, lambda: IDLE, clock=clock, sleep=lambda s: None)
         self.assertIn("normalized", json.loads(path2.read_text().splitlines()[0]))
@@ -550,14 +896,11 @@ class ConcurrentWriters(unittest.TestCase):
             # Every worker holds the lock only inside append_window; a barrier lines them up
             # at the door so they contend for the same read/modify/write.
             n = 6
-            barrier = mp.Barrier(n)
-
-            def worker(i):
-                barrier.wait(timeout=20)
-                w.append_window(ws, working_frame(i), 10.0 + i)
-
-            ctx = mp.get_context("fork")
-            procs = [ctx.Process(target=worker, args=(i,)) for i in range(n)]
+            ctx = mp.get_context("spawn" if os.name == "nt" else "fork")
+            barrier = ctx.Barrier(n)
+            procs = [ctx.Process(
+                target=_append_window_worker, args=(str(ws), barrier, i)
+            ) for i in range(n)]
             for pr in procs:
                 pr.start()
             for pr in procs:
@@ -566,7 +909,8 @@ class ConcurrentWriters(unittest.TestCase):
             entries = w.load_window(w.window_path(ws))
             self.assertEqual(len(entries), 1 + n)
             self.assertEqual(sorted(e["ts"] for e in entries), [1.0] + [10.0 + i for i in range(n)])
-            self.assertFalse((w.window_path(ws).with_name("window.jsonl.lock")).stat().st_mode & 0o077)
+            if os.name != "nt":
+                self.assertFalse((w.window_path(ws).with_name("window.jsonl.lock")).stat().st_mode & 0o077)
 
     def test_without_the_lock_the_same_race_loses_a_sample(self):
         # Negative control: the pre-fix shape — load, then append+replace after every
@@ -576,22 +920,18 @@ class ConcurrentWriters(unittest.TestCase):
             ws = Path(d)
             w.append_window(ws, IDLE, 1.0)
             n = 3
-            barrier = mp.Barrier(n)
-
-            def racy(i):
-                path = w.window_path(ws)
-                entries = w.load_window(path)
-                barrier.wait(timeout=20)  # everyone has loaded the same 1 entry
-                entries.append({"ts": 10.0 + i, "state": "s", "raw_state": "r", "patterns": []})
-                w._write_private(path, "".join(json.dumps(e) + "\n" for e in entries))
-
-            ctx = mp.get_context("fork")
-            procs = [ctx.Process(target=racy, args=(i,)) for i in range(n)]
+            ctx = mp.get_context("spawn" if os.name == "nt" else "fork")
+            barrier = ctx.Barrier(n)
+            procs = [ctx.Process(
+                target=_racy_window_worker, args=(str(ws), barrier, i)
+            ) for i in range(n)]
             for pr in procs:
                 pr.start()
             for pr in procs:
                 pr.join(30)
-            self.assertEqual(len(w.load_window(w.window_path(ws))), 2)  # 1 + one survivor, not 4
+            self.assertEqual([pr.exitcode for pr in procs], [0] * n)
+            self.assertEqual(len(list(ws.glob("racy-*.attempted"))), n)
+            self.assertLess(len(w.load_window(w.window_path(ws))), 1 + n)
 
 
 class Confidentiality(unittest.TestCase):
@@ -600,11 +940,23 @@ class Confidentiality(unittest.TestCase):
     def test_window_entries_carry_hashes_and_patterns_only(self):
         with tempfile.TemporaryDirectory() as d:
             entries = w.append_window(Path(d), retry_frame(1), 1.0)
-            self.assertEqual(sorted(entries[-1]), ["patterns", "raw_state", "state", "ts"])
+            self.assertEqual(sorted(entries[-1]), ["abnormal", "patterns", "raw_state", "state", "ts"])
             text = w.window_path(Path(d)).read_text()
             self.assertNotIn("Retrying", text)
             self.assertNotIn("attempt", text)
 
+    def test_persisted_pattern_fields_hold_NAMES_from_the_known_vocabulary(self):
+        # `abnormal` joined `patterns` in the window; both must stay a closed set of
+        # pattern names, never a snippet of the pane that matched.
+        vocab = {n for n, _ in w.RETRY_PATTERNS} | {n for n, _ in w.ABNORMAL_PATTERNS}
+        with tempfile.TemporaryDirectory() as d:
+            e = w.append_window(Path(d), "❯ \n⏵⏵ please log in to continue · run /login\n", 1.0)
+            self.assertTrue(e[-1]["abnormal"], "the fixture must match, or this proves nothing")
+            for key in ("patterns", "abnormal"):
+                self.assertLessEqual(set(e[-1][key]), vocab, key)
+            self.assertNotIn("/login", w.window_path(Path(d)).read_text())
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are not meaningful on Windows")
     def test_files_are_owner_only_under_a_permissive_umask(self):
         old = os.umask(0o022)
         try:
@@ -650,6 +1002,321 @@ class FailureBoundary(unittest.TestCase):
             w.window_path(ws).mkdir(parents=True)
             with self.assertRaises(OSError):
                 w.append_window(ws, IDLE, 1.0)
+
+
+
+class ProseMentioningAStateIsNotThatState(unittest.TestCase):
+    """One negative control per abnormal pattern.
+
+    These panes are agent CLIs whose transcripts are English prose about their
+    own work, so an unanchored substring search is SELF-HITTING: a session
+    discussing compaction classified itself `abnormal` at high confidence
+    (measured on 12 prose-only frames of an idle pane). The matcher anchors to
+    the start of a line after stripping banner decoration — a banner leads its
+    line, prose buries the phrase mid-sentence.
+    """
+
+    PROSE = [
+        ("compacting", "I am compacting the summary of what we discussed"),
+        ("compacting", "reviewing the compacting patterns in cli_wedge"),
+        ("needs-login", "we fixed the bug where it says please log in to continue"),
+        ("needs-login", "a session expired bug we already fixed"),
+        ("awaiting-input", "the draft is waiting for your input before it sends"),
+        ("out-of-credits", "the ticket says the user was out of usage credits last week"),
+        ("quota-limit", "the docs explain what happens when you hit your weekly limit"),
+        # Markdown decoration must not unmask prose as a banner.
+        ("compacting", "- compacting the transcript is what the hook does"),
+        ("compacting", "**compaction** is the thing that lost the context"),
+        ("compacting", "> compacting conversation"),
+        ("compacting", "  - compaction happens at 90%"),
+        ("awaiting-input", "- waiting for your approval before I merge"),
+        ("awaiting-input", "**Waiting for input** on the developer-mode question"),
+        ("needs-login", "- authentication failed on the dev lane, per the log"),
+    ]
+    BANNERS = [
+        ("compacting", "Compacting conversation"),
+        ("compacting", "\u273b Compacting conversation"),
+        ("needs-login", "Please log in to continue"),
+        ("needs-login", "Session expired"),
+        ("awaiting-input", "Waiting for your input"),
+        ("out-of-credits", "You are out of usage credits"),
+    ]
+
+    def test_prose_mentioning_a_state_does_not_match(self):
+        for name, line in self.PROSE:
+            self.assertEqual(w.matched_abnormal([line]), [],
+                             f"{name}: prose matched as a banner -> {line!r}")
+
+    def test_real_banners_still_match(self):
+        """The other half. Anchoring alone would drop a true positive --
+        'You are out of usage credits' does not START with the pattern -- so each
+        pattern also carries the banner's leading form. Without this test the
+        anchor could be tightened until nothing fires and every prose case passes."""
+        for name, line in self.BANNERS:
+            self.assertIn(name, w.matched_abnormal([line]),
+                          f"{name}: real banner stopped matching -> {line!r}")
+
+    def test_a_prose_only_idle_pane_does_not_warn(self):
+        frames = [f"I am reviewing the compacting patterns\n  \u00b7 5:{17 + i // 3:02d} PM\n> "
+                  for i in range(12)]
+        v = w.classify(frames, False, 600)
+        self.assertFalse(v["warn"], f"a prose-only idle pane warned: {v}")
+        self.assertNotEqual(v["kind"], "abnormal", v)
+
+    def test_the_internal_marker_does_not_ride_in_the_verdict(self):
+        v = w.classify(["x"], False, 60)
+        self.assertNotIn("_abnormal", v,
+                         "the marker duplicates the flattened abnormal_* keys already spread in")
+
+
+class IdleAbnormalSubcases(unittest.TestCase):
+    """Chi, 2026-09-10: "in idle + abnormal, there are more subcases not mentioned".
+    All five, measured -- four named by text, one by the absence of it."""
+
+    def test_every_idle_abnormal_subcase_is_idle_and_warns(self):
+        for name, frame, work in (
+            ("quota-limit", "❯ \n⏵⏵ you have hit your usage limit · resets 3:00 PM\n", True),
+            ("out-of-credits", "❯ \n⏵⏵ you are out of usage credits\n", True),
+            ("needs-login", "❯ \n⏵⏵ please log in to continue · run /login\n", True),
+            ("awaiting-input", "❯ \n⏵⏵ waiting for your approval to run a command\n", True),
+            ("compacting-frozen", "Compacting conversation…\n", True),
+            ("api-error", "❯ \n⏵⏵ APIError: 500 Internal Server Error\n", True),
+            ("network-error", "❯ \n⏵⏵ Network error: could not reach the API\n", True),
+        ):
+            v = w.classify([frame] * 6, work, 900, "core-status running")
+            self.assertTrue(v["raw_static"], f"{name} must be idle")
+            self.assertTrue(v["warn"], f"{name} must warn, got {v['kind']}")
+
+    def test_a_static_pane_with_no_abnormal_text_is_healthy_idle(self):
+        # Every subcase is named by text now, so a pane with none is idle -- and
+        # stays idle whether or not work is queued elsewhere.
+        for work in (False, True):
+            v = w.classify(["❯ \n⏵⏵ bypass permissions on · 1 monitor\n"] * 6, work, 900)
+            self.assertEqual((v["kind"], v["warn"]), ("idle", False), work)
+
+
+class FourCasesFold(unittest.TestCase):
+    """Chi, 2026-09-10: "retry loop is under moving + abnormal". Every kind is a
+    cell of the 2x2, never a fifth case. This pins the FOLD, not the kind names."""
+
+    CELLS = {
+        "idle": ("idle", "healthy"), "static-with-work": ("idle", "abnormal"),
+        "abnormal": ("moving", "abnormal"), "provider-limit": ("idle", "abnormal"),
+        "retry-loop": ("moving", "abnormal"), "working": ("moving", "healthy"),
+    }
+
+    def test_every_warning_kind_sits_in_an_abnormal_cell(self):
+        for kind, (_, health) in self.CELLS.items():
+            warns = kind not in ("idle", "working")
+            self.assertEqual(warns, health == "abnormal", kind)
+
+    def test_retry_is_the_moving_abnormal_cell_not_a_fifth_case(self):
+        r = w.classify([retry_frame(i) for i in range(12)], True, 300)
+        self.assertEqual(r["kind"], "retry-loop")
+        self.assertFalse(r["raw_static"], "moving")
+        self.assertTrue(r["warn"], "abnormal")
+        self.assertEqual(self.CELLS[r["kind"]], ("moving", "abnormal"))
+
+
+
+class BannerPrefix(unittest.TestCase):
+    def test_the_clis_retry_banner_is_the_retry_family_under_its_result_prefix(self):
+        # Claude Code renders errors under "⎿"; the prefix must not hide the banner
+        # from either family's line-start anchor.
+        for line in ("Connection error. Retrying…",
+                     "  ⎿  Connection error. Retrying in 2 seconds…"):
+            self.assertIn("connection-error", w.matched_patterns([line]), line)
+            self.assertEqual([], w.matched_abnormal([line]), line)
+        self.assertIn("api-error", w.matched_abnormal(["  ⎿  API Error: 529 Overloaded"]))
+
+
+class LiveRetryBanner(unittest.TestCase):
+    """The CLI's own retry line, judged whole; prose that mentions a retry is not one."""
+
+    LIVE = (
+        "  ⎿  Connection error. Retrying in 2 seconds…",
+        '  ⎿  API Error (529 {"type":"overloaded_error"}) · Retrying in 1 seconds… (attempt 1/10)',
+        "Rate limit reached. Retrying in 30s (attempt 2 of 5)",
+        "Retrying…",
+        "Reconnecting…",
+    )
+    PROSE = (
+        "  ⎿  Connection error. Retrying was the fix.",       # the tool-result prefix, then prose
+        "⏺ I once saw a Connection error. Retrying was the fix.",
+        "  Connection error handling is covered by tests.",   # a wrapped sentence's second row
+        "⎿  Read 3 files; retrying the build later",
+        "Retrying in 2 seconds is what the docs recommend.",
+        "Connection error. The fix was retrying",              # cause, then prose, then the verb
+        "API Error handling is covered by tests.",
+    )
+
+    def test_each_live_banner_matches(self):
+        for line in self.LIVE:
+            self.assertEqual(1, len(w.live_retry_banner_lines(line)), line)
+
+    def test_prose_about_a_retry_does_not(self):
+        for line in self.PROSE:
+            self.assertEqual([], w.live_retry_banner_lines(line), line)
+
+    def test_a_banner_is_found_inside_a_full_pane(self):
+        pane = "⏺ working\n" + self.LIVE[0] + "\n❯ \n"
+        self.assertEqual(1, len(w.live_retry_banner_lines(pane)))
+
+    def test_a_cause_followed_by_prose_is_not_a_banner_even_when_it_ends_in_retrying(self):
+        self.assertEqual([], w.live_retry_banner_lines("Connection error. The fix was retrying"))
+        self.assertEqual(1, len(w.live_retry_banner_lines("Connection error · Retrying")))
+
+    def test_the_retry_family_keyword_check_is_wider_than_the_banner(self):
+        # RETRY_PATTERNS is telemetry over any text; the banner grammar must be strictly narrower.
+        for line in self.PROSE:
+            self.assertTrue(w.matched_patterns([line]) or "retry" not in line.lower(), line)
+
+
+class LiveParkedBanner(unittest.TestCase):
+    """The parked family as whole lines: the CLI's own stop banner, never a sentence naming it."""
+
+    LIVE = (
+        ("api-error", 'API Error: 529 {"type":"overloaded_error"}'),
+        ("api-error", "  ⎿  API Error (Connection error.)"),
+        ("api-error", "API Error"),
+        ("compacting", "Compacting conversation…"),
+        ("needs-login", "Please log in to continue"),
+        ("needs-login", "Session expired. Run /login"),
+        ("needs-login", "  ⎿  Login expired · Please run /login"),
+        ("needs-login", "OAuth access token has expired · Please run /login"),
+        ("needs-login", "Not logged in · Please run /login"),
+        ("quota-limit", "You have hit your usage limit · resets 3pm"),
+        ("out-of-credits", "Credit balance is too low"),
+        ("awaiting-input", "Waiting for your approval"),
+        ("network-error", "Network error: fetch failed"),
+    )
+    PROSE = (
+        "API Error handling is covered by tests.",
+        "⏺ The API Error we saw yesterday was a 529.",
+        "compacting the notes into one file",
+        "the network error we saw yesterday was different",
+        "I logged in to continue the review",
+        "the usage limit is documented here",
+        "Login expired is what the banner said",
+        "not logged in yet, will retry",
+        "the OAuth access token has expired, so I ran /login and it worked fine",
+    )
+
+    def test_each_live_banner_is_found_with_its_family_and_name(self):
+        for name, line in self.LIVE:
+            hits = w.live_banner_lines(line)
+            self.assertEqual(1, len(hits), line)
+            self.assertEqual(("parked", name), hits[0][:2], line)
+
+    def test_prose_naming_a_parked_condition_does_not(self):
+        for line in self.PROSE:
+            self.assertEqual([], w.live_banner_lines(line), line)
+
+    def test_a_retry_banner_reports_the_retry_family(self):
+        self.assertEqual(("retry", "retrying"), w.live_banner_lines("  ⎿  Connection error. Retrying in 2 seconds…")[0][:2])
+
+    def test_the_gate_grammar_is_narrower_than_the_detector(self):
+        # ABNORMAL_PATTERNS is telemetry over any text and may match prose; the gate must not.
+        for line in self.PROSE:
+            if w.matched_abnormal([line]):
+                self.assertEqual([], w.live_banner_lines(line), line)
+
+
+class NeedsLoginRecognisesTheDialogTitleNotOnlyProseAboutLoggingIn(unittest.TestCase):
+    """The family matched Claude's own "run /login" phrasing but not the login
+    DIALOG'S title text -- a real blind spot, not the Fable-limit collision this
+    looks like at a glance (that one is already caught, by the whole-line
+    quota-limit grammar's optional session/usage/... group, and is fenced off by
+    pane_gate's existing named-gate-first precedence, not by cli_wedge)."""
+
+    TITLES = ("Select login method", "Paste code here", "Browser didn't open")
+    PROSE = "I logged in yesterday and it worked fine."
+
+    def test_each_dialog_title_is_needs_login(self):
+        for title in self.TITLES:
+            with self.subTest(title=title):
+                v = w.frame_abnormal(title)
+                self.assertEqual((v.kind, v.names), ("abnormal", ("needs-login",)))
+
+    def test_prose_about_logging_in_stays_clean(self):
+        self.assertIsNone(w.frame_abnormal(self.PROSE))
+
+    def test_fable_limit_was_already_caught_by_the_looser_whole_line_grammar(self):
+        # Control: proves this PR did not newly create the Fable/quota-limit
+        # overlap -- it already existed via live_banner_lines before this change.
+        v = w.frame_abnormal("reached your Fable limit")
+        self.assertEqual((v.kind, v.names), ("provider-limit", ("quota-limit",)))
+
+
+class TheWorkingMarkerIsMotionSoItLivesWithTheMotionAxis(unittest.TestCase):
+    """`esc to interrupt` says a turn is in flight, which is this module's axis.
+    classify() answers motion only from frame-to-frame novelty, so it needs two
+    samples and cannot speak for a single capture; frame_working can."""
+
+    RUNNING = "\u273b Thinking\u2026 (12s \u00b7 esc to interrupt)"
+
+    def test_the_affordance_is_a_running_turn(self):
+        self.assertTrue(w.frame_working(self.RUNNING))
+
+    def test_an_idle_footer_is_not(self):
+        self.assertFalse(w.frame_working("\u23f5\u23f5 bypass permissions on"))
+
+    def test_it_is_orthogonal_to_the_abnormal_verdict(self):
+        # A retrying pane is BOTH working-looking and abnormal; each answers its own
+        # question, and the gate's ordering between them is the gate's to make.
+        both = self.RUNNING + "\n  \u23bf  Connection error. Retrying in 2 seconds\u2026"
+        self.assertTrue(w.frame_working(both))
+        self.assertEqual(w.frame_abnormal(both).kind, "retry-loop")
+
+
+class FrameAbnormalRanksOneCaptureAsTheWindowRanksASample(unittest.TestCase):
+    """A single capture cannot show recurrence, so its abnormal verdict is the
+    window classifier's ranking of a current sample and nothing more: provider-limit
+    over retry over the rest. A gate that consumed the detectors and ranked them
+    itself once put the interrupt affordance above a retry; the ranking is here."""
+
+    RETRY = "  ⎿  Connection error. Retrying in 2 seconds…"
+    API = "API Error: 529 Overloaded"
+    QUOTA = "You've hit your usage limit · resets 3pm"
+    PROSE = "⏺ I once saw a Connection error. Retrying was the fix.\n❯ \n"
+    ABNORMAL_KINDS = {"provider-limit", "retry-loop", "abnormal"}
+
+    def test_prose_is_no_verdict(self):
+        self.assertIsNone(w.frame_abnormal(self.PROSE))
+
+    def test_a_retry_alone_is_a_retry_loop_and_says_so(self):
+        v = w.frame_abnormal(self.RETRY)
+        self.assertEqual((v.kind, v.retrying, v.names), ("retry-loop", True, ("retry:retrying",)))
+
+    def test_a_retry_beside_a_parked_line_is_abnormal_keeping_both_names(self):
+        v = w.frame_abnormal(f"{self.RETRY}\n{self.API}")
+        self.assertEqual((v.kind, v.retrying), ("abnormal", True))
+        self.assertEqual(set(v.names), {"retry:retrying", "api-error"})
+
+    def test_a_family_only_the_anchored_patterns_see_still_reaches_the_verdict(self):
+        # ABNORMAL_PATTERNS is line-anchored and looser than the whole-line banner
+        # grammar, so a long parked line reaches the verdict through it alone.
+        long_line = ("Compacting context and this line runs on well past forty characters "
+                     "so the banner grammar will not take it")
+        self.assertEqual(w.live_banner_lines(long_line), [])          # control
+        self.assertEqual(w.matched_abnormal([long_line]), ["compacting"])
+        v = w.frame_abnormal(long_line)
+        self.assertEqual((v.kind, v.names, v.retrying), ("abnormal", ("compacting",), False))
+
+    def test_a_provider_limit_outranks_a_retry(self):
+        v = w.frame_abnormal(f"{self.RETRY}\n{self.QUOTA}")
+        self.assertEqual((v.kind, v.retrying), ("provider-limit", True))
+
+    def test_the_kind_is_what_the_window_classifier_says_of_a_run_of_that_capture(self):
+        # Banners only: the window's retry telemetry is searched text and may fire on
+        # still prose, which the whole-line grammar here is narrower than by design.
+        th = w.PROVISIONAL_THRESHOLDS
+        for text in (self.RETRY, self.API, self.QUOTA, f"{self.RETRY}\n{self.API}",
+                     f"{self.RETRY}\n{self.QUOTA}"):
+            with self.subTest(text=text):
+                frames = [text] * max(3, th["min_samples"])
+                window = w.classify(frames, work_outstanding=False, duration_s=th["min_duration_s"] + 1)
+                self.assertEqual(w.frame_abnormal(text).kind, window["kind"])
 
 
 if __name__ == "__main__":

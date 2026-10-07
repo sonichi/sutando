@@ -158,7 +158,7 @@ def _read_then_race(path):
     if not _spawned:                 # once, while --commit holds the lock
         _spawned["p"] = subprocess.Popen(
             [_sys.executable, "-B", _HELD, "--state", str(path),
-             "--add", "raced:owner", "--write"],
+             "--add", "raced:owner", "--note", "race fixture", "--write"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         time.sleep(0.4)              # let it reach and block on the lock
     return got

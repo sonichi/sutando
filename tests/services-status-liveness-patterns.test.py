@@ -143,3 +143,41 @@ if failures:
     print(f"{len(failures)} check(s) FAILED: {failures}")
     sys.exit(1)
 print("all checks passed — liveness patterns match the daemon, not mentions of it")
+
+def _dup_pid_sentinels_are_not_two_watchers():
+    """john-the-dev on #3875: two sentinel FILES naming one pid reported
+    "2 watchers: pid 95442, pid 95442" — a pool that does not exist."""
+    import tempfile
+    import pathlib as _pl
+    from services_status import probe_watcher_sentinels
+    td = _pl.Path(tempfile.mkdtemp())
+    (td / "watch-tasks-stream-agent+a.pid").write_text("95442")
+    (td / "watch-tasks-stream-agent+b.pid").write_text("95442")
+    status, detail, _ = probe_watcher_sentinels(td, lambda p: True)
+    assert status == "degraded", (status, detail)
+    assert "one pid, two sentinels" in detail, detail
+    assert "2 watchers" not in detail, detail
+    print("  ok   duplicate-pid sentinels are degraded, not two watchers")
+
+
+_dup_pid_sentinels_are_not_two_watchers()
+
+def _collision_survives_a_partly_down_pool():
+    """keweichen: A/B -> live 100 plus C -> dead 999 reported
+    '2 of 3 up (pid 100, pid 100)' — the collision vanished and one process
+    was counted twice."""
+    import tempfile
+    import pathlib as _pl
+    from services_status import probe_watcher_sentinels
+    td = _pl.Path(tempfile.mkdtemp())
+    (td / "watch-tasks-stream-A.pid").write_text("100")
+    (td / "watch-tasks-stream-B.pid").write_text("100")
+    (td / "watch-tasks-stream-C.pid").write_text("999")
+    status, detail, _ = probe_watcher_sentinels(td, lambda p: int(p) == 100)
+    assert "1 of 3 up" in detail, detail
+    assert "pid 100, pid 100" not in detail, detail
+    assert "one pid, two sentinels" in detail, detail
+    print("  ok   a collision survives a partly-down pool")
+
+
+_collision_survives_a_partly_down_pool()

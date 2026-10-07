@@ -123,6 +123,12 @@ if [ -n "${SUTANDO_NODE:-}" ]; then
 elif [ -x "$_W_APP_NODE_DIR/node" ] && [ "${REPO_ROOT#"$_W_ENGINE_ROOT"/}" != "$REPO_ROOT" ]; then
     _W_BUNDLED=1
 fi
+# launchd (KeepAlive + ThrottleInterval) restarts this job on exit; the legacy
+# `run_node_service ... &` fallback in startup.sh does not. credential-proxy.ts
+# reads this to decide whether giving up on repeated refresh failure is safe —
+# unset there, it never exits on its own.
+export SUTANDO_PROXY_SUPERVISED=1
+
 DIST_PROXY="$REPO_ROOT/dist/credential-proxy.js"
 if [ "$_W_BUNDLED" = "1" ]; then
     if [ ! -f "$DIST_PROXY" ]; then

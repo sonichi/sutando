@@ -68,7 +68,7 @@ with tempfile.TemporaryDirectory() as td:
     check(sup.status()["workers"]["steady"]["pid"] is not None,
           "running worker exposes its pid in status")
 
-    check(wait_for(lambda: sup.status()["workers"]["flappy"]["restarts"] >= 2),
+    check(wait_for(lambda: len(sleeps) >= 2),
           "crashing worker is restarted (crash loop supervised, not fatal)")
     check(sup.status()["workers"]["flappy"]["last_exit"] == 3,
           "status reports the worker's real exit code")

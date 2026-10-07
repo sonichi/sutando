@@ -20,8 +20,8 @@
     "contributors"
    ],
    "status": "active",
-   "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, AG2 Space collaborator opt-in, ambient taskify provenance",
-   "last_verified": "2026-09-04"
+   "canonical_for": "per-channel tier rules: TOFU onboarding, allowFrom/tierMap, Discord contextNotFrom gate, AG2 Space collaborator opt-in, AG2 Space owner-mention tasks, ambient taskify provenance",
+   "last_verified": "2026-10-03"
   },
   "docs/adr/0001-pointer-teacher-brain.md": {
    "title": "Pointer Teacher brain: accessibility-first, Gemini-vision fallback",
@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-08-26"
+   "last_verified": "2026-09-18"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -96,7 +96,7 @@
    ],
    "status": "active",
    "canonical_for": "verbatim parking for relocated CLAUDE.md detail: marker-migration history, vault python bootstrap, liveness payload schema",
-   "last_verified": "2026-08-17"
+   "last_verified": "2026-09-30"
   },
   "docs/codex-core.md": {
    "title": "Codex CLI as the Sutando core",
@@ -105,8 +105,8 @@
     "operators"
    ],
    "status": "active",
-   "canonical_for": "Codex core setup and rollback",
-   "last_verified": "2026-08-04"
+   "canonical_for": "Codex core setup, earned-reset policy, and rollback",
+   "last_verified": "2026-09-30"
   },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
@@ -145,7 +145,18 @@
    ],
    "status": "draft",
    "canonical_for": "the single authoritative severity-tagged core-health verdict and the report-vs-restart severity gate",
-   "last_verified": "2026-08-02"
+   "last_verified": "2026-09-28"
+  },
+  "docs/health-snapshot.md": {
+   "title": "Health snapshot: GET /health",
+   "audience": [
+    "operators",
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "the per-agent health snapshot served at GET /health: its sources, how each source's opinion is derived and combined, reasons, and blind spots",
+   "last_verified": "2026-10-06"
   },
   "docs/design-credential-capability-resolver.md": {
    "title": "Credential resolution by capability, not key (G8)",
@@ -165,7 +176,7 @@
    ],
    "status": "draft",
    "canonical_for": "proposed privileged-capability mediation, authorization, and audit model",
-   "last_verified": "2026-08-04"
+   "last_verified": "2026-10-02"
   },
   "docs/host-cli-bindings.md": {
    "title": "Host CLI bindings",
@@ -236,7 +247,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-09-04"
+   "last_verified": "2026-09-30"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -248,7 +259,7 @@
    ],
    "status": "canonical",
    "canonical_for": "external tool and package requirements, and what to vendor when embedding Sutando",
-   "last_verified": "2026-08-04"
+   "last_verified": "2026-09-18"
   },
   "docs/runtime/claude-hook-contract-v1.md": {
    "title": "Claude Code Hook Contract — v1",
@@ -258,7 +269,7 @@
    ],
    "status": "canonical",
    "canonical_for": "Claude Code hook event mapping and privacy contract",
-   "last_verified": "2026-07-27"
+   "last_verified": "2026-09-08"
   },
   "docs/slack-bridge.md": {
    "title": "Slack bridge",
@@ -299,7 +310,7 @@
    ],
    "status": "active",
    "canonical_for": "generated source-module inventory",
-   "last_verified": "2026-07-23"
+   "last_verified": "2026-10-02"
   },
   "docs/state-sync-allowlist.md": {
    "title": "State sync allowlist design",
@@ -360,7 +371,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace configuration and resolver APIs",
-   "last_verified": null
+   "last_verified": "2026-10-05"
   },
   "docs/workspace-contract.md": {
    "title": "Workspace contract",
@@ -371,7 +382,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace operational contract",
-   "last_verified": "2026-09-04"
+   "last_verified": "2026-10-02"
   },
   "docs/workspace-design.md": {
    "title": "Workspace design",
@@ -381,7 +392,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace two-space mental model",
-   "last_verified": null
+   "last_verified": "2026-10-02"
   },
   "docs/workspace-hosts-convention.md": {
    "title": "Per-host workspace convention",
@@ -391,7 +402,7 @@
    ],
    "status": "canonical",
    "canonical_for": "hosts/<hostname> workspace convention",
-   "last_verified": null
+   "last_verified": "2026-10-02"
   },
   "docs/workspace-per-host-paths.md": {
    "title": "Per-host carried paths",
@@ -452,7 +463,47 @@
    ],
    "status": "canonical",
    "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
-   "last_verified": "2026-09-04"
+   "last_verified": "2026-10-02"
+  },
+  "docs/recovery-issue-metrics.md": {
+   "title": "Recovery issue metrics",
+   "audience": [
+    "contributors",
+    "operators"
+   ],
+   "status": "canonical",
+   "canonical_for": "Recovery issue identity, event lifecycle, and rate query semantics",
+   "last_verified": "2026-09-15"
+  },
+  "docs/worker-pool-design.md": {
+   "title": "Worker pool — design (v1)",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
+   "last_verified": "2026-10-05"
+  },
+  "docs/worker-pool-design-notes.md": {
+   "title": "Worker pool — design notes",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the record behind the v1 worker-pool design: rejected alternatives, the failure model inherited from the #3860 draft, and the owner decisions it encodes",
+   "last_verified": "2026-09-08"
+  },
+  "docs/task-watcher-hosting-modes.md": {
+   "title": "Task watcher hosting modes — session watcher, standby, supervisor",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract",
+   "last_verified": "2026-09-22"
   }
  }
 }

@@ -24,7 +24,7 @@ spec.loader.exec_module(sd)
 
 # Cover the REAL _sentinel_path() once (it's replaced with a temp path below).
 _real_path = sd._sentinel_path()
-assert str(_real_path).endswith("state/shutdown.sentinel"), _real_path
+assert _real_path.parts[-2:] == ("state", "shutdown.sentinel"), _real_path
 
 # Redirect the sentinel to a temp path (never touch the real state dir).
 _tmp = Path(tempfile.mkdtemp(prefix="shutdown-")) / "shutdown.sentinel"

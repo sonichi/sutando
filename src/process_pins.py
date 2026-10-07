@@ -27,12 +27,14 @@ adapter that already resolves the workspace stays the one that decides. Shape:
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+from file_lock import locked_file
+from atomic_replace import replace_snapshot
 
 ARMED = "armed"
 EXPIRED = "expired"
@@ -108,9 +110,10 @@ def save_pins(path, pins: list) -> None:
     tmp = target.with_name(f".{target.name}.tmp-{os.getpid()}-{os.urandom(4).hex()}")
     try:
         tmp.write_text(payload)
-        os.replace(tmp, target)
+        replace_snapshot(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)
+
 
 
 def _load_strict(path) -> list:
@@ -135,12 +138,8 @@ def _locked(path):
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     lock = target.with_name(f".{target.name}.lock")
-    with open(lock, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    with locked_file(lock):
+        yield
 
 
 def arm_pin(path, service, pid, lstart, reason, expires_at) -> dict:

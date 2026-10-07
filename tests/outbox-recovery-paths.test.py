@@ -85,7 +85,13 @@ def main() -> int:
         check("note_attempt counts", ob.attempts_for(root, "i") == 2)
         ob.park_item(root, "i", reason="unconfirmed")
         ob.requeue_item(root, "i")
-        check("requeue clears the budget", ob.attempts_for(root, "i") == 0)
+        check("requeue keeps the budget unless the operator asks",
+              ob.attempts_for(root, "i") == 2,
+              "reset is opt-in: --reset-attempts is the full-budget form")
+        ob.park_item(root, "i", reason="unconfirmed")
+        ob.requeue_item(root, "i", reset_attempts=True)
+        check("requeue --reset-attempts clears the budget",
+              ob.attempts_for(root, "i") == 0)
         check("requeue also releases the claim",
               ob.read_delivery_claim(root, "i") is None,
               "a re-queued item still holding its claim can never be picked up")
@@ -258,6 +264,7 @@ def main() -> int:
         # --- a crash mid-claim must LEAVE the torn file ----------------------
         real_fdopen = os.fdopen
         def boom(*a, **k):
+            os.close(a[0])
             raise OSError("disk went away mid-write")
         os.fdopen = boom
         try:

@@ -140,6 +140,12 @@ class BridgeWiring(unittest.TestCase):
         self.assertFalse(fn({"groups": {"123": True}}, "123"))          # bool cfg, no dict
         self.assertTrue(fn({"groups": {"123": {"collaboratorAttachments": True}}}, "123"))
         self.assertFalse(fn({"groups": {"123": {"collaboratorAttachments": "yes"}}}, "123"))  # is True only
+        # `channels` is NOT a config section: only `groups` is consulted. This
+        # assertion FAILS on the pre-fix code, which looped ("groups","channels").
+        self.assertFalse(fn({"channels": {"123": {"collaboratorAttachments": True}}}, "123"))
+        # and a groups entry still wins when both are present
+        self.assertTrue(fn({"groups": {"123": {"collaboratorAttachments": True}},
+                            "channels": {"123": {"collaboratorAttachments": False}}}, "123"))
 
 
 class QuarantineRecord(unittest.TestCase):
@@ -154,11 +160,13 @@ class QuarantineRecord(unittest.TestCase):
         self.assertEqual(rec["withheld_body"], "body text")
         self.assertEqual(rec["task_id"], "task-1")
 
-    def test_an_unwritable_state_dir_costs_the_record_not_the_withhold(self):
+    def test_a_state_path_that_is_not_a_directory_costs_the_record_not_the_withhold(self):
         # Best-effort by contract: a failed record must return False, never raise
         # into the delivery loop that already withheld the attachment.
+        blocked = pathlib.Path(tempfile.mkdtemp(prefix="qrec-blocked-")) / "file"
+        blocked.write_text("not a directory")
         self.assertFalse(
-            guard.journal_quarantined_attachment("b", "/dev/null/nope", "task-2", now=1700000000))
+            guard.journal_quarantined_attachment("b", blocked, "task-2", now=1700000000))
 
 
 

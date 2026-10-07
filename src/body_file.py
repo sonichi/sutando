@@ -14,7 +14,7 @@ def read_body_file(path):
     """Validate the DESCRIPTOR, never the pathname: a path that stats as regular can
     be swapped for a FIFO before open, and the open then blocks forever."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     except OSError as exc:
         raise SystemExit(f"ERROR: cannot read --body-file {path!r}: {exc}")
     try:

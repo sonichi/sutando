@@ -18,6 +18,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -101,6 +102,34 @@ class CloudOriginPrecedence(unittest.TestCase):
             "AG2_CLOUD_ORIGIN", m["config"], "manifest does not declare AG2_CLOUD_ORIGIN"
         )
         self.assertTrue(str(m["config"]["AG2_CLOUD_ORIGIN"]).startswith("http"))
+
+    def test_retired_origin_reads_as_current_from_env_and_manifest(self):
+        """The shared list in src/cloud_auth.py decides what is retired; a
+        retired origin from the env or the manifest is sent nowhere."""
+        sys.path.insert(0, str(SKILL.parents[1] / "src"))
+        import cloud_auth  # noqa: E402
+
+        retired = cloud_auth.RETIRED_CLOUD_ORIGINS[0]
+        with tempfile.TemporaryDirectory() as td:
+            mp = _write_manifest(td, {"AG2_CLOUD_ORIGIN": retired})
+            from_manifest = report_usage.resolve_cloud_origin({}, mp)
+            from_env = report_usage.resolve_cloud_origin({"AG2_CLOUD_ORIGIN": retired}, mp)
+        self.assertEqual(from_manifest, cloud_auth.DEFAULT_CLOUD_ORIGIN)
+        self.assertEqual(from_env, cloud_auth.DEFAULT_CLOUD_ORIGIN)
+
+    def test_normalizer_is_fail_open_without_cloud_auth(self):
+        """A checkout without src/cloud_auth.py (a cron-invoked reporter on a
+        stripped tree) keeps the value it was given rather than crashing."""
+        import builtins
+        real_import = builtins.__import__
+
+        def no_cloud_auth(name, *a, **k):
+            if name == "cloud_auth":
+                raise ImportError("stripped tree")
+            return real_import(name, *a, **k)
+
+        with mock.patch.object(builtins, "__import__", side_effect=no_cloud_auth):
+            self.assertEqual(report_usage._normalize_origin("https://kept.example"), "https://kept.example")
 
     def test_script_has_no_ad_hoc_environ_read(self):
         """The specific shape that was flagged: a bare

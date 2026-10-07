@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import weakref
 from pathlib import Path
@@ -125,6 +126,7 @@ from access_store import (  # noqa: E402  — single locked writer for access.js
     discord_access_backup_file,
 )
 from task_priority import default_priority_for_source  # noqa: E402
+from ingress_identity import provider_task_id, already_admitted  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 import send_failure_policy  # noqa: E402  # pragma: no cover — bridge not unit-imported; policy is covered in send_failure_policy.py
@@ -155,7 +157,7 @@ def _is_discord_channel_id(value: str) -> bool:
     """A snowflake, so a Telegram chat id or a Matrix room id can never be
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
-from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
+from result_markers import parse_markers, has_skip_action  # noqa: E402
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
@@ -201,8 +203,8 @@ async def _note_empty_result(task_id: str, result_file) -> None:
     # reports resolved while still visible to queue-health.
     _empty_result_polls.pop(task_id, None)
     channel = pending_replies.pop(task_id, None)  # stop re-polling it
-    _atomic_write_pending_replies(
-        {k: str(getattr(v, "id", v)) for k, v in pending_replies.items()})
+    pending_admitted_ms.pop(task_id, None)
+    save_pending_replies()
     pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
     _progress_msgs.pop(task_id, None)             # else the placeholder never clears
     tier = pending_task_tiers.pop(task_id, None) or "unknown"
@@ -663,10 +665,10 @@ def notify_agent_api_task_done(task_id: str, result: str) -> None:
         urllib.request.urlopen(req, timeout=2).read()
     except Exception:
         pass  # best-effort; agent-api will catch up via polling
-INBOX_DIR = Path("/tmp/discord-inbox")
+INBOX_DIR = Path("/tmp/discord-inbox") if os.name == "posix" else Path(tempfile.gettempdir()) / "discord-inbox"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-INBOX_DIR.mkdir(exist_ok=True)
+INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _transcribe_via_skill(local_path: str) -> str | None:
@@ -2564,6 +2566,9 @@ def _should_welcome_first_post(message, welcome_channel_id, welcome_template_pat
 
 # Track pending replies: task_id -> channel
 pending_replies = {}
+# task_id -> epoch_ms admitted. The ager keys on THIS, never on id shape
+# (provider-derived ids carry no parseable epoch — john-the-dev, #3316).
+pending_admitted_ms: dict = {}
 # Track source message id per pending task so the result-sender can default
 # reply_to_id to the triggering message (visually threads the reply). Lives
 # in memory only — crash-recovery isn't critical; missing entry just means
@@ -3051,41 +3056,20 @@ def channel_allows_collaborator_attachments(access_data, channel_id) -> bool:
     """Per-channel owner opt-in: a COLLABORATOR's result may carry [file:]/
     [attach:] markers here. Path authorization stays with the transport
     allowlist; [channel:] redirects stay blocked regardless. Default off."""
-    for section in ("groups", "channels"):
-        cfg = (access_data.get(section) or {}).get(str(channel_id))
-        if isinstance(cfg, dict):
-            return cfg.get("collaboratorAttachments") is True
+    cfg = (access_data.get("groups") or {}).get(str(channel_id))
+    if isinstance(cfg, dict):
+        return cfg.get("collaboratorAttachments") is True
     return False
 
 
 def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
-    """True iff `sender_id` is listed under the SERVING channel's `collaborators`
-    array in access.json.
-
-    A collaborator is a team-tier sender the owner has designated for
-    substantive engagement in ONE specific channel (see the `team-collaborator`
-    rulebook). Scope is strictly per-channel: membership in some OTHER channel's
-    `collaborators` does NOT carry over — the check keys on the serving channel
-    only. Fail-closed: any malformed config or missing key yields False.
-
-    Pure + side-effect-free so it can be unit-tested directly (the caller lives
-    inside the async Discord handler, which is not independently exercisable).
-    """
-    try:
-        serving_cfg = (access_data.get("groups", {}) or {}).get(str(serving_channel_id), {})
-        if isinstance(serving_cfg, dict) and sender_id in set(serving_cfg.get("collaborators", []) or []):
-            return True
-    except Exception:
-        pass
-    return False
+    from discord_access import resolve_is_collaborator as resolve
+    return resolve(access_data, sender_id, serving_channel_id)
 
 
 def resolve_team_collaborator(access_data, access_tier, sender_id, serving_channel_id):
-    """Collaborator status for a TEAM sender, however that tier was reached.
-    Global-allowlist members resolved to team by the tierMap are eligible too."""
-    if access_tier != "team":
-        return False
-    return resolve_is_collaborator(access_data, sender_id, serving_channel_id)
+    from discord_access import resolve_team_collaborator as resolve
+    return resolve(access_data, access_tier, sender_id, serving_channel_id)
 
 
 def select_rulebook_key(access_tier, is_collaborator):
@@ -3919,9 +3903,20 @@ async def _handle_discord_message(message, force=False):
     if await _handle_restart_command(message, text, access_tier, username, str(REPO)):
         return
 
-    # Write as task
+    # Write as task. The id derives from the provider event (injective), so a
+    # replayed event maps to the same file — skipped, never a second task.
     ts = int(time.time() * 1000)
-    task_id = f"task-{ts}"
+    _inst = getattr(getattr(client, "user", None), "id", None)
+    if _inst and getattr(message, "id", None):
+        task_id = provider_task_id(f"dc{_inst}", str(message.id))
+        # Every month partition: an event archived before a rollover is still admitted.
+        if already_admitted(task_id, TASKS_DIR, RESULTS_DIR,
+                            lambda tid: any(ARCHIVE_TASKS_DIR.glob(f"*/{tid}.txt"))):
+            print(f"  [ingress-dedup] replay of {task_id} — already admitted",
+                  flush=True)
+            return
+    else:  # pragma: no cover — client identity absent (startup edge): legacy mint
+        task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
 
     # Intercept vault commands before any disk write.
@@ -3998,7 +3993,6 @@ async def _handle_discord_message(message, force=False):
         )
     else:
         codex_prompt_text = user_task_text
-
 
     # Pre-classify Discord-state-reference tasks. Two-tier flow (per Chi's
     # 2026-05-08 strategy chat — option 3 systemic fix):
@@ -4213,15 +4207,21 @@ async def _handle_discord_message(message, force=False):
         # confident about. Removing the gate trades a few cheap reads for never
         # skipping it; only a pure greeting/ack is exempt. Supersedes the
         # self-contained-judgment form (root-cause 2026-06-25).
+        # The depth is stated HERE: the reader's own default is one page of ten,
+        # which measured as "the last ten messages" and was reported as absence.
         lines.append(
             f'{step}. CONTEXT-FIRST (unconditional): before interpreting this message, '
-            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str} --serving {channel_id_str}` — '
+            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str} --serving {channel_id_str} --limit 50` — '
             f'and read it back (everyone\'s messages including your own prior replies) '
-            f'until this message stands on its own, then answer from the reconstructed '
-            f'thread, NOT from memory. Do this every time; do NOT skip it because the '
-            f'message looks self-contained or you feel you already understand it — felt '
-            f'confidence is exactly the signal that fails. The only exception is a pure '
-            f'greeting or acknowledgement with no referent (e.g. "hi", "thanks").'
+            f'until this message stands on its own. That command returns ONE page of at '
+            f'most 50 messages; if the referent is not in it, continue OLDER with '
+            f'`--until <ISO time or message id>` until it is. If you stop before the '
+            f'message stands on its own, say so — name the oldest timestamp you read — '
+            f'never report a fact as absent from messages you did not read. Then answer '
+            f'from the reconstructed thread, NOT from memory. Do this every time; do NOT '
+            f'skip it because the message looks self-contained or you feel you already '
+            f'understand it — felt confidence is exactly the signal that fails. The only '
+            f'exception is a pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").'
         )
         step += 1
         if _notify_py.exists():
@@ -4303,6 +4303,7 @@ async def _handle_discord_message(message, force=False):
         # now does a mention-gate admission earn its audit row.
         _mention_gate_log_admission(message)
     pending_replies[task_id] = message.channel
+    pending_admitted_ms[task_id] = int(time.time() * 1000)
     pending_task_tiers[task_id] = access_tier
     pending_task_collab[task_id] = bool(is_collaborator)
     # Observability: one inbound accepted-message event.
@@ -4830,9 +4831,12 @@ def _atomic_write_pending_replies(data: dict) -> None:
         pass
 
 def save_pending_replies():
-    """Persist pending_replies channel IDs to disk for crash recovery."""
+    """Persist pending_replies channel ids + admitted_at for crash recovery."""
     try:
-        data = {k: str(v.id) for k, v in pending_replies.items()}
+        now_ms = int(time.time() * 1000)
+        data = {k: {"ch": str(v.id),
+                    "at": pending_admitted_ms.setdefault(k, now_ms)}
+                for k, v in pending_replies.items()}
         _atomic_write_pending_replies(data)
     except Exception:
         pass
@@ -4848,24 +4852,36 @@ def load_pending_replies_from_disk():
     try:
         if not PENDING_REPLIES_FILE.exists():
             return {}
-        data = json.loads(PENDING_REPLIES_FILE.read_text())
+        raw = json.loads(PENDING_REPLIES_FILE.read_text())
         now_ms = int(time.time() * 1000)
         max_age_ms = 7 * 86400 * 1000
         aged_out = []
-        for task_id in list(data.keys()):
-            try:
-                # task_id format: "task-<epoch_ms>"
-                ts_ms = int(task_id.split("-")[1])
-                if now_ms - ts_ms > max_age_ms:
-                    aged_out.append(task_id)
-                    del data[task_id]
-            except (ValueError, IndexError):
-                # Malformed task_id — leave it; cap protects the simple case
-                pass
+        data = {}
+        rewrite = False
+        for task_id, val in raw.items():
+            if isinstance(val, dict):
+                at, ch = val.get("at"), val.get("ch")
+            else:
+                # Legacy string: parseable task-<epoch_ms> keeps its clock;
+                # any other shape starts NOW — bounded, never immortal (#3316).
+                ch = str(val)
+                try:
+                    at = int(task_id.split("-")[1])
+                except (ValueError, IndexError):
+                    at = now_ms
+                rewrite = True
+            if not isinstance(at, int):
+                at, rewrite = now_ms, True
+            if now_ms - at > max_age_ms:
+                aged_out.append(task_id)
+                continue
+            data[task_id] = {"ch": ch, "at": at}
+            pending_admitted_ms[task_id] = at
         if aged_out:
             print(f"  [recovery] aged out {len(aged_out)} pending_replies > 7d", flush=True)
+        if aged_out or rewrite:
             _atomic_write_pending_replies(data)
-        return data
+        return {k: v["ch"] for k, v in data.items()}
     except Exception:
         pass
     return {}
@@ -4991,77 +5007,21 @@ async def poll_results():
                 _parsed = parse_markers(reply_text)
                 _skip = next((a for a in _parsed.actions if a.kind == "skip"), None)
                 if _skip is not None:
-                    # [no-send] / [REPLIED] / [deduped:] — normally a silent
-                    # archive. GUARD: dedup is per-channel only. A
-                    # `[deduped: task-X]` whose holder X came from a DIFFERENT
-                    # channel is invalid (it would leave the asking channel
-                    # silent). Reject it and RE-QUEUE the original task with a
-                    # trusted ===SYSTEM=== note so the core re-answers it in its
-                    # own channel. Loop guard: a task that comes back
-                    # cross-channel-deduped a SECOND time is not re-queued again
-                    # — notify in-channel instead (owner-directed).
+                    # All dedup boundaries and retry limits belong to the shared
+                    # plan; Discord only routes the re-ask or sends its report.
                     if _skip.value == "deduped":
                         _act, _delivered = "defer", None
                         try:
-                            # find_task_file globs unchecked; an id failing the
-                            # gate find_result applies is "holder not found".
-                            _holder_file = (
-                                find_task_file(TASKS_DIR, _skip.extra)
-                                if local_task_protocol.valid_archive_lookup_id(_skip.extra)
-                                else None)
-                            _holder_text = _holder_file.read_text() if _holder_file else None
-                            _target = dedup_cross_channel_target(channel.id, _holder_text)
-                            # Cross-channel is an unconfirmed report: the asker is
-                            # only served once the notify or the re-queue lands.
-                            _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)
-                                         if not _target else ("report", None))
+                            _act, _pl = _dedup_recover(task_id, _skip.extra, channel.id)
                             if _act == "requeue":
                                 pending_replies[_pl] = channel
+                                pending_admitted_ms[_pl] = int(time.time() * 1000)
                                 save_pending_replies()
-                            elif _act == "report" and not _target:
-                                # Cross-channel carries a None payload and is
-                                # delivered by the _target block below instead.
+                            elif _act == "report":
                                 await channel.send(_pl)
                                 _delivered = True
-                            if _target:
-                                _orig_file = find_task_file(TASKS_DIR, task_id)
-                                _orig_text = _orig_file.read_text() if _orig_file else None
-                                _count = dedup_requeue_count(_orig_text)
-                                if _count >= 1:
-                                    # Second time — don't loop; flag it.
-                                    print(
-                                        f"  [dedup] cross-channel retry failed for {task_id} "
-                                        f"(holder {_skip.extra} in #{_target}) — notifying",
-                                        flush=True,
-                                    )
-                                    await channel.send(
-                                        f"⚠️ Couldn't auto-correct a cross-channel dedup for "
-                                        f"`{task_id}` (folded into `{_skip.extra}` in <#{_target}>) "
-                                        f"even after a re-queue — flagging instead of looping. "
-                                        f"This needs a direct answer here."
-                                    )
-                                    _delivered = True
-                                else:
-                                    # First time — reject + re-queue for an
-                                    # in-channel answer.
-                                    _new_id = f"task-{int(time.time() * 1000)}"
-                                    _requeued = build_requeued_task(
-                                        _orig_text or "", _new_id, _count + 1,
-                                        channel.id, _skip.extra,
-                                    )
-                                    (TASKS_DIR / f"{_new_id}.txt").write_text(_requeued)
-                                    # Route the re-answer back to THIS channel.
-                                    pending_replies[_new_id] = channel
-                                    save_pending_replies()
-                                    print(
-                                        f"  [dedup] cross-channel reject: {task_id} (#{channel.id}) "
-                                        f"folded into {_skip.extra} (#{_target}) — re-queued as "
-                                        f"{_new_id} for in-channel answer",
-                                        flush=True,
-                                    )
-                                    _delivered = True
                         except Exception as e:
-                            print(f"  [dedup] cross-channel reject/requeue failed: {e}", flush=True)
+                            print(f"  [dedup] recovery routing failed: {e}", flush=True)
                         if report_disposition(_act, _delivered) == "retain":
                             # Nobody was told. Keep the result AND the task so a
                             # later pass retries; archiving loses the question.
@@ -5532,14 +5492,26 @@ async def poll_proactive():
             # state/last-owner-activity.json; default discord on missing
             # state).
             from proactive_routing import (  # noqa: E402
-                redirect_target_is_foreign, should_claim_proactive_file)
-            for f in RESULTS_DIR.iterdir():
+                body_target_channel, redirect_target_is_foreign,
+                should_claim_proactive_file)
+
+            def _discord_claims(f):
                 # Per-FILE decision: an explicit .to-<channel> destination
                 # outranks activity routing (see proactive_routing).
+                if should_claim_proactive_file(
+                        f.name, STATE_DIR / "last-owner-activity.json", "discord"):
+                    return True
+                # An explicit body [channel:] target also outranks activity
+                # routing, matching slack/telegram's body_claimable_by peek.
+                try:
+                    peek = f.read_text(errors="ignore")
+                except OSError:
+                    return False
+                return body_target_channel(peek) == "discord"
+
+            for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt" \
-                        and should_claim_proactive_file(
-                            f.name, STATE_DIR / "last-owner-activity.json",
-                            "discord"):
+                        and _discord_claims(f):
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration
                     # (this coroutine, a race with the same-node telegram

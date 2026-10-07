@@ -5,11 +5,12 @@ current-track.md is the per-host goal anchor the proactive loop reads first
 every pass. It is chronological and append-only, so it grows without bound
 (222 KB on one host, 2026-09-06); rotation keeps the pinned preamble plus the
 newest entries under a byte budget and moves the older entries to
-current-track-archive.md beside it. Rotation reads the whole file and replaces
-it, so an append landing between that read and that replace would be lost:
-both operations take the same flock on <file>.lock.
+current-track-archive.md beside it. Rotation reads the whole file and replaces it, so an append landing between
+that read and that replace would be lost: both operations take the same
+cross-platform advisory lock on <file>.lock.
 
-    append(path, text)                -> None
+    append(path, text, keep_bytes, auto_rotate, pin) -> RotateResult | None
+                                              (None unless the write crossed keep_bytes)
     replace(path, text)               -> None   (create or rewrite the whole head)
     rotate(path, keep_bytes, pin) -> RotateResult(head, archived, oversized)
 
@@ -38,23 +39,45 @@ still over budget" -- the archive and the head ARE written, because shrinking a
 """
 from __future__ import annotations
 
-import fcntl
 import os
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from file_lock import locked_file
+
 ENTRY = re.compile(r"^##+ ", re.M)
 DEFAULT_KEEP = 32 * 1024
 
 #: Entries other tools read as LIVE STATE, kept at any age: an aged-out hold
 #: reads as "not held" to every consumer that greps this file.
+#: `HOLD` is case-SENSITIVE: the lowercase verb and a denial of a hold are not state.
+#: A config-value hold keeps its own alternative — that spelling is lowercase by nature.
 PIN_DEFAULT = re.compile(
-    r"\bHOLD\b|\bhands off\b|\bdo not (?:merge|touch|act|proceed)\b"
+    r"(?-i:\bHOLD\b)|\b\w+=hold\b|\bhands off\b|\bdo not (?:merge|touch|act|proceed)\b"
     r"|\bin force until\b|\bawait(?:ing)? (?:the )?owner\b|⛔",
     re.I,
 )
+
+
+CONDENSED_NOTE = "_[rotation condensed this entry; the full text is in the archive]_\n"
+
+
+def condense(entry: str, pin=PIN_DEFAULT) -> str:
+    """Heading + only the lines a consumer greps as live state.
+
+    A hold is a LINE, so carrying its whole entry to keep it greppable spends
+    the read budget on prose no consumer reads.
+    """
+    lines = entry.splitlines(keepends=True)
+    if not lines or not pin:
+        return entry
+    held = [l for l in lines[1:] if pin.search(l)]
+    if not held:
+        return entry
+    body = lines[0] + CONDENSED_NOTE + "".join(held)
+    return body if body.endswith("\n") else body + "\n"
 
 
 def lock_path(path: Path) -> Path:
@@ -64,19 +87,25 @@ def lock_path(path: Path) -> Path:
 @contextmanager
 def locked(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path(path), "w") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lk, fcntl.LOCK_UN)
+    with locked_file(lock_path(path), create_mode=0o600):
+        yield
 
 
-def append(path: Path, text: str) -> None:
-    """Append under the writer lock; O_APPEND keeps the write a single record."""
+def append(path: Path, text: str, keep_bytes: int = DEFAULT_KEEP,
+           auto_rotate: bool = True, pin=PIN_DEFAULT) -> "RotateResult | None":
+    """Append under the writer lock; O_APPEND keeps the write a single record.
+
+    Rotates in the SAME lock when the append crosses keep_bytes, because the writer is
+    the only place that knows the head just grew — leaving it to a later probe means
+    every pass in between pays the oversized read. Returns the RotateResult when it
+    rotated, else None. Nothing is deleted: head + archive is still the original.
+    """
     with locked(path):
         with open(path, "a", encoding="utf-8") as f:
             f.write(text if text.endswith("\n") else text + "\n")
+        if not auto_rotate or path.stat().st_size <= keep_bytes:
+            return None
+        return _rotate_locked(path, keep_bytes, False, pin, None)
 
 
 def replace(path: Path, text: str) -> None:
@@ -158,6 +187,9 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
     if not entries:
         return RotateResult(text, "", True)
     pinned = {i for i, e in enumerate(entries) if pin and pin.search(e)}
+    # A pin buys its HOLD LINES a place in the head, not its whole entry. Charge
+    # the stub, so the bytes it no longer holds go back to the age walk.
+    stub = {i: condense(entries[i], pin) for i in pinned}
     facing = _orientation(entries)
     # Walk from the NEWEST end, whichever that is; a pin never stops the walk, or an
     # old hold would freeze the archive and rotation would free nothing.
@@ -166,23 +198,42 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
     # Undetermined orientation protects BOTH ends: the live entry sits at one of
     # them, and no walk direction can be shown to keep it.
     keep = set(pinned) | ({0, len(entries) - 1} if facing is None else set())
+    ends = {0, len(entries) - 1} if facing is None else set()
     # Every entry kept BEFORE the walk is spent budget; charging only the pins let
     # the walk fill the whole cap on top of the protected ends.
-    budget = keep_bytes - _size(preamble) - sum(_size(entries[i]) for i in keep)
+    budget = keep_bytes - _size(preamble) - sum(
+        _size(stub.get(i, entries[i])) if i in pinned and i not in ends else _size(entries[i])
+        for i in keep)
     # The exception exists to keep the LIVE ANCHOR whole. Ask whether THAT entry is
     # already kept -- pinned, or a protected end -- not why it might have been.
     used, started = 0, order[0] in keep
+    walked = set()
     for i in order:
+        if i in pinned and i not in ends:
+            # The stub is already charged, so reaching a pin buys back only the rest.
+            # The newest entry is exempt from the cap, or rotation hides the live anchor.
+            upgrade = _size(entries[i]) - _size(stub[i])
+            if i == order[0] or used + upgrade <= budget:
+                used += upgrade
+                walked.add(i)
+            continue
         if i in keep:
             continue
         if started and used + _size(entries[i]) > budget:
             break
         used += _size(entries[i])
         keep.add(i)
+        walked.add(i)
         started = True
-    head = preamble + "".join(entries[i] for i in sorted(keep))
-    archived = "".join(entries[i] for i in sorted(set(range(len(entries))) - keep))
-    pinned_bytes = sum(_size(entries[i]) for i in pinned)
+    # A pinned entry the walk also reached is recent, so it stays whole; one kept
+    # only by its pin is carried as the stub and its full text goes to the archive.
+    shrunk = {i for i in pinned if i not in walked and i not in ends
+              and _size(stub[i]) < _size(entries[i])}
+    render = {i: (stub[i] if i in shrunk else entries[i]) for i in keep}
+    head = preamble + "".join(render[i] for i in sorted(keep))
+    archived = "".join(entries[i]
+                       for i in sorted((set(range(len(entries))) - keep) | shrunk))
+    pinned_bytes = sum(_size(render[i]) for i in pinned if i in render)
     return RotateResult(head, archived, _size(head) > keep_bytes, pinned_bytes, len(pinned))
 
 
@@ -190,16 +241,22 @@ def rotate(path: Path, keep_bytes: int = DEFAULT_KEEP, dry_run: bool = False,
            pin=PIN_DEFAULT, _between_read_and_replace=None) -> RotateResult:
     """Rotate under the writer lock. `_between_read_and_replace` is a test seam."""
     with locked(path):
-        text = path.read_text(encoding="utf-8")
-        r = plan(text, keep_bytes, pin)
-        if _between_read_and_replace:
-            _between_read_and_replace()
-        if dry_run or not r.archived:
-            return r
-        archive = path.with_name(path.stem + "-archive.md")
-        with open(archive, "a", encoding="utf-8") as f:  # archive first: a crash duplicates, never loses
-            f.write(r.archived)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(r.head, encoding="utf-8")
-        os.replace(tmp, path)
+        return _rotate_locked(path, keep_bytes, dry_run, pin, _between_read_and_replace)
+
+
+def _rotate_locked(path: Path, keep_bytes: int, dry_run: bool, pin,
+                   _between_read_and_replace) -> RotateResult:
+    """rotate()'s body, with the writer lock ALREADY held. locked() is not reentrant."""
+    text = path.read_text(encoding="utf-8")
+    r = plan(text, keep_bytes, pin)
+    if _between_read_and_replace:
+        _between_read_and_replace()
+    if dry_run or not r.archived:
         return r
+    archive = path.with_name(path.stem + "-archive.md")
+    with open(archive, "a", encoding="utf-8") as f:  # archive first: a crash duplicates, never loses
+        f.write(r.archived)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(r.head, encoding="utf-8")
+    os.replace(tmp, path)
+    return r

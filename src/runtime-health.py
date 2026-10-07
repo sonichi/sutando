@@ -35,9 +35,40 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tmux_probe import has_session as _tmux_has_session  # noqa: E402
+import cli_wedge  # noqa: E402 — owns the core pane target and its capture
+from worker_auth_state import signed_in_since  # noqa: E402 — the one "signed in again" reading
 
 SESSION = "sutando-core"
 TMUX_SOCKET = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
+
+
+def _tmux_socket():
+    """The socket the core ACTUALLY launched on, not the one this process can guess.
+
+    The launcher may override SUTANDO_TMUX_SOCKET (the desktop app runs the core on
+    <app-support>/run/tmux.sock), and a detached probe does not inherit it — so the
+    module-level default above targets a socket that does not exist and a live core
+    reads as offline. core_heartbeat records the real one in its own environment;
+    prefer that when it is fresh. An explicit SUTANDO_TMUX_SOCKET always wins."""
+    if os.environ.get("SUTANDO_TMUX_SOCKET"):
+        return TMUX_SOCKET
+    try:
+        host = _host_label_safe()
+        if host:
+            repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            alive = os.path.join(_resolve_workspace(repo), "state", "cores", f"{host}.alive")
+            # Bounded BOTH ways: a crashed core leaves a stale record, and a clock step
+            # leaves a future-dated one that a one-sided test accepts forever.
+            age = time.time() - os.path.getmtime(alive)
+            if age >= HEARTBEAT_STALE_SECONDS or age < -HEARTBEAT_FUTURE_TOLERANCE_SECONDS:
+                return TMUX_SOCKET
+            with open(alive, "r", encoding="utf-8") as fh:
+                sock = (json.load(fh) or {}).get("socket")
+            if isinstance(sock, str) and sock:
+                return sock
+    except Exception:
+        pass  # a probe must never fail on its own socket lookup
+    return TMUX_SOCKET
 
 # A `core-status.json` claiming "running" is only trustworthy if its `ts` is
 # recent — a crashed/wedged loop can leave it stuck on "running" indefinitely.
@@ -52,6 +83,10 @@ STALE_STATUS_SECONDS = 90
 # by a SEPARATE process (src/core_heartbeat.py); >90s means it stopped beating.
 # Matches the documented staleness threshold every other reader of that file uses.
 HEARTBEAT_STALE_SECONDS = 90
+
+# A far-future .alive has a NEGATIVE age, which a one-sided `age >= max` test reads
+# as fresh. A tolerance, not zero, so an atomic rewrite mid-stat is not discarded.
+HEARTBEAT_FUTURE_TOLERANCE_SECONDS = 5
 
 # ── Severity layer (design: docs/design-core-health-verdict.md) ──────────────
 # One authoritative, severity-tagged verdict every consumer reads, so "report
@@ -195,7 +230,7 @@ def _run(cmd):
 def _core_running():
     # None = unobserved (tmux absent, hung, or a client the server refused) and
     # never a down-vote; only a server that answered "no session" is False.
-    return _tmux_has_session(TMUX_SOCKET, SESSION, timeout=8)
+    return _tmux_has_session(_tmux_socket(), SESSION, timeout=8)
 
 
 def _gateway_configured():
@@ -233,7 +268,7 @@ def _gateway_running():
     if rc == 0:
         return True
     # Fallback: a window named "gateway" in the core session.
-    rc2, out = _run(["tmux", "-S", TMUX_SOCKET, "list-windows", "-t", SESSION, "-F", "#{window_name}"])
+    rc2, out = _run(["tmux", "-S", _tmux_socket(), "list-windows", "-t", f"={SESSION}", "-F", "#{window_name}"])
     if rc2 == 0 and any(w.strip() == "gateway" for w in out.splitlines()):
         return True
     # Neither probe confirmed the gateway. Only report "down" if at least one
@@ -471,15 +506,24 @@ def _refresh_station(workspace, *, now=None, ttl=_STATION_TTL,
 
 
 def _pane_text():
-    rc, out = _run(["tmux", "-S", TMUX_SOCKET, "capture-pane", "-p", "-t", SESSION])
-    return out if rc == 0 else ""
+    sock = _tmux_socket()
+    target = cli_wedge.core_target(sock, SESSION)
+    return (cli_wedge.capture_pane(sock, target) or "") if target else ""
 
 
 def needs_login(pane_text):
     """Pure predicate: does the core pane show claude's auth prompt? Testable
-    without a live tmux — this is the load-bearing 'stuck vs thinking' decision."""
-    low = pane_text.lower()
-    return any(m in low for m in _LOGIN_MARKERS)
+    without a live tmux — this is the load-bearing 'stuck vs thinking' decision.
+    Only the latest marker counts, and only while nothing after it shows the CLI
+    signed in again. The marker set is this module's (broad on purpose, above); the
+    "signed in after it" reading is worker_auth_state's, the one the seat monitor
+    uses, so both readers give one answer for one pane."""
+    lines = pane_text.splitlines()
+    last = max((i for i, ln in enumerate(lines) if any(m in ln.lower() for m in _LOGIN_MARKERS)),
+               default=None)
+    if last is None:
+        return False
+    return not signed_in_since("\n".join(lines[last + 1:]))
 
 
 def _core_status(workspace):
@@ -598,7 +642,7 @@ def derive():
         "ag2space_app_running": ag2space_app,
         # Real reachability of the Station gateway (tri-state); None = unknown.
         "station_available": station,
-        "tmux_socket": TMUX_SOCKET,
+        "tmux_socket": _tmux_socket(),
         "session": SESSION,
         "detail": detail,
         # Raw inputs behind the verdict, so a wrong call is auditable instead of

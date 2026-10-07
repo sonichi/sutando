@@ -199,5 +199,39 @@ class Refusals(unittest.TestCase):
         self.assertIn("not importable", buf.getvalue() + err.getvalue())
 
 
+class MonthNestedArchive(unittest.TestCase):
+    """Results archive into `archive/<YYYY-MM>/` (agent-api.py iterates `archive/*/`),
+    but the audit globbed `archive/*.txt` and so audited almost nothing. Measured on a
+    live workspace: 943 files seen, 3157 present, 2214 invisible."""
+
+    def _nested(self):
+        ws = Path(tempfile.mkdtemp())
+        month = ws / "results" / "archive" / "2026-09"
+        month.mkdir(parents=True)
+        # a dedup onto a holder that delivers nothing — the audit's whole purpose
+        (month / "task-a.txt").write_text("[deduped: task-b]\n")
+        (month / "task-b.txt").write_text("[no-send]\n")
+        return ws
+
+    def test_the_audit_sees_a_month_nested_archive(self):
+        # Drive main() with NO argv so the script's own enumeration runs. Building the
+        # file list here instead would re-implement the line under test and pass either way.
+        ws = self._nested()
+        buf, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cdt, "workspace", lambda: ws), \
+                contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = cdt.main([])
+        out = buf.getvalue() + err.getvalue()
+        self.assertEqual(1, rc, f"the nested dedup onto a [no-send] holder must be found: {out}")
+        self.assertIn("task-a.txt", out)
+        self.assertIn("checked 2 result file(s)", out)
+
+    def test_a_flat_glob_would_have_seen_nothing(self):
+        # Pins WHY this regressed: the old expression is not merely narrower, it is empty.
+        ws = self._nested()
+        flat = list((ws / "results" / "archive").glob("*.txt"))
+        self.assertEqual([], flat, "the pre-fix glob returns nothing on the real layout")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

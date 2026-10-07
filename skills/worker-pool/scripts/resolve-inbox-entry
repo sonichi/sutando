@@ -1,0 +1,22 @@
+#!/bin/sh
+# The core execs this directly, and executing a PATH python3 that is the macOS
+# stub raises a modal dialog, so the interpreter comes from the repo's resolver.
+set -u
+_d=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
+_repo=$(CDPATH= cd -- "$_d/../../.." && pwd -P) || exit 1
+_pb="$_repo/scripts/python-binary.sh"
+if [ -r "$_pb" ]; then
+  . "$_pb"
+  _py="$(resolve_python "$_repo")"
+elif [ -n "${SUTANDO_PY:-}" ] && [ -x "${SUTANDO_PY}" ]; then
+  # No resolver reachable: the forwarded interpreter is the only candidate whose
+  # safety is already decided. PATH is not probed here.
+  _py="$SUTANDO_PY"
+else
+  _py=""
+fi
+[ -n "$_py" ] || {
+  echo "resolve-inbox-entry: no usable interpreter (SUTANDO_PY=${SUTANDO_PY:-<unset>})" >&2
+  exit 1
+}
+exec "$_py" "$_d/resolve_inbox_entry.py" "$@"
