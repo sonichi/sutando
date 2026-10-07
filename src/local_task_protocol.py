@@ -138,7 +138,9 @@ def canonical_access_tier(value) -> str:
     return LEGACY_ACCESS_TIER_ALIASES.get(tier, tier)
 
 
-ACCESS_TIERS = ("owner", "team", "guest")
+# The tiers the AG2 Space broker puts on the wire; the fuller ACCESS_TIERS above
+# also names the local-only spellings.
+BROKER_WIRE_TIERS = ("owner", "team", "guest")
 
 
 def broker_attested_tier(access_tier, requested_access_tier, collaborator) -> tuple[str, bool]:
@@ -150,7 +152,7 @@ def broker_attested_tier(access_tier, requested_access_tier, collaborator) -> tu
     """
     def known(value):
         tier = canonical_access_tier(value)
-        return tier if tier in ACCESS_TIERS else "guest"
+        return tier if tier in BROKER_WIRE_TIERS else "guest"
 
     broker, requested = known(access_tier), known(requested_access_tier)
     is_collaborator = collaborator is True and "team" in (broker, requested)
