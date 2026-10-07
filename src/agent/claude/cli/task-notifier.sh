@@ -959,6 +959,13 @@ process_announced_queue() {
       tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || exit 1
       return 0
     fi
+    # Archived with no visible result: nothing will resolve it, so it must not block the queue.
+    # Checked after the healthy wait so a file archived during that wait is never typed.
+    if [ ! -e "$(task_payload "$filename")" ]; then
+      log_notifier "dropped $filename from the queue: its task file is gone and no result was found"
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
+      continue
+    fi
     submit_task "$filename"
     if has_result "$filename"; then
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
