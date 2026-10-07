@@ -10,6 +10,12 @@
     "collection_timeout": 600,
     "consumer_timeout": 1800,
     "consumer_argv": [],
-    "consumer_prompt": ""
-  }
+    "consumer_prompt": "",
+    "proposal_stores": null,
+    "proposal_check_argv": null,
+    "document_readback_argv": null
+  },
+  "version": "0.1.0",
+  "owner": "Rui",
+  "stability": "experimental"
 }

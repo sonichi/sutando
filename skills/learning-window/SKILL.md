@@ -6,8 +6,9 @@ description: Persist collection evidence and plan unread room windows separately
 # Learning window state
 
 This optional workflow component owns learning collection checkpoints, not a
-resident gateway event cursor, task inbox, or transport lifecycle. It starts no
-daemon and performs no network calls. Core services do not depend on it.
+resident gateway event cursor, task inbox, or transport lifecycle. It starts no resident
+daemon. Network reads delegate adapter-supplied capabilities and the existing
+cloud auth/HTTP owner. Core services do not depend on it.
 
 The dispatcher supplies current joined membership for every configured scope.
 `scripts/window_state.py:plan_windows` returns each scope's earliest unread
