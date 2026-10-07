@@ -1,0 +1,12 @@
+# Watcher suites that miss their own wait windows beside CPU-heavy neighbours: leg 6 runs them two
+# at a time, leg 7 the ones tagged `serial` alone. Admission rule and evidence: docs/testing-coverage.md.
+tests/watch-tasks-stream-bare-directory-event.test.py
+tests/watch-tasks-stream-config-hot-reload.test.py
+tests/watch-tasks-stream-handler-terminal-rc.test.py serial
+tests/watch-tasks-stream-inbox-and-workspace-env.test.py
+tests/watch-tasks-stream-malformed-roster-row.test.py
+tests/watch-tasks-stream-priority-sweep.test.py
+tests/watch-tasks-stream-readiness-window-decision-instant.test.py
+tests/watch-tasks-stream-readiness-window-held-task-recovery.test.py
+tests/watch-tasks-stream-readiness-window-unreadable-config.test.py
+tests/watch-tasks-stream-sentinel-ownership.test.py
