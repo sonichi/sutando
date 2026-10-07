@@ -553,15 +553,15 @@ def _spawn_detached(script, inbox):
 
 
 def _group_members(pgid):
-    """Live pids in the fixture's process group; a zombie leader awaiting its
-    parent's wait() is not a leak, so it is not counted."""
-    r = subprocess.run(["ps", "-o", "pid=,stat=", "-g", str(pgid)], capture_output=True, text=True)
-    out = []
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and not parts[1].startswith("Z"):
-            out.append(int(parts[0]))
-    return out
+    """Live pids whose process group is pgid, from an all-process listing: a
+    numeric `ps -g` means a session on procps, so the PGID column is filtered
+    here. A zombie awaiting wait() is not a leak. Raises if ps gave no table."""
+    r = subprocess.run(["ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True)
+    rows = [line.split() for line in r.stdout.splitlines() if line.strip()]
+    if r.returncode != 0 or not rows:
+        raise RuntimeError(f"ps gave no process table (rc={r.returncode}): {r.stderr.strip()}")
+    return [int(pid) for pid, pg, stat, *_ in rows
+            if pg == str(pgid) and not stat.startswith("Z")]
 
 
 def _kill_group(pgid, wait_s=2.0):
