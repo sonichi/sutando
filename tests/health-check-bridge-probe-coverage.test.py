@@ -56,7 +56,21 @@ def _run_bridges(fake_run, *, pin_pid=PID, log_text="ok\n"):
         mod.WORKSPACE_DIR = ws
         mod.REPO_DIR = repo
         real = subprocess.run
-        with mock.patch.object(mod.subprocess, "run", fake_run(real)):
+        runner = fake_run(real)
+
+        def probe(pattern):
+            try:
+                result = runner(
+                    ["pgrep", "-f", pattern], capture_output=True, text=True)
+            except (OSError, subprocess.TimeoutExpired):
+                return [], False
+            if result.returncode not in (0, 1):
+                return [], False
+            pids = result.stdout.strip().splitlines() if result.returncode == 0 else []
+            return [pid for pid in pids if pid], True
+
+        with mock.patch.object(mod.subprocess, "run", runner), \
+                mock.patch.object(mod, "probe_pids", side_effect=probe):
             checks = mod.run_all_checks()
         return next(c for c in checks if c.get("name") == "slack-bridge")
 

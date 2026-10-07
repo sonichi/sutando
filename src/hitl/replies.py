@@ -48,6 +48,21 @@ def parse_reply(event: Dict[str, Any]) -> Optional[ActionReply]:
         return None
 
 
+def is_room_question_reply(event: Dict[str, Any]) -> bool:
+    """True when the action belongs to backend-owned room-question HITL.
+
+    Room questions deliberately reuse ``space.ag2.hitl`` presentation, but
+    their answers are accepted by the backend.  They must never enter this
+    local owner/runtime authority merely because their Matrix content reached
+    the agent event or task relay.
+    """
+    content = event.get("content") or {}
+    payload = content.get(REPLY_FIELD)
+    return isinstance(payload, dict) and (
+        payload.get("scope") == "room" or "question_id" in payload
+    )
+
+
 def write_driver_action(workspace: Path, req: HumanRequirement, action: Action) -> Path:
     """Atomically drop the driver's action file; the driver replaces it with a receipt."""
     d = actions_dir(workspace)
@@ -93,7 +108,11 @@ class HitlReplyHandler:
 
     def claims(self, event: Dict[str, Any]) -> bool:
         content = event.get("content") or {}
-        return event.get("type") == EVENT_TYPE and isinstance(content.get(REPLY_FIELD), dict)
+        return (
+            event.get("type") == EVENT_TYPE
+            and isinstance(content.get(REPLY_FIELD), dict)
+            and not is_room_question_reply(event)
+        )
 
     def offer(self, event: Dict[str, Any]) -> List[str]:
         eid = str(event.get("event_id") or "")

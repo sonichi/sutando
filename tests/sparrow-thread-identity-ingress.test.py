@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Thread identity survives Sparrow ingress (ag2space-backend #831 companion).
+"""Room-origin placement survives Sparrow ingress (backend #1090 companion).
 
-The backend now emits `thread_root` + `source_room_id` on the task envelope.
+The backend emits `source_message_id`, `thread_root`, and `source_room_id` on
+the task envelope.
 Sparrow serializes gateway-sent fields through a WHITELIST, so a field absent
 from it is dropped silently — the task file is written, nothing errors, and the
 agent simply never learns it was asked inside a thread. Two lists gate this and
@@ -18,6 +19,7 @@ value would let a reply name a thread it was not asked in.
 
 Run: python3 tests/sparrow-thread-identity-ingress.test.py
 """
+import concurrent.futures
 import pathlib
 import sys
 
@@ -25,16 +27,16 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "packages" / "ag2-sparrow"))
 
 from ag2_sparrow.local_task_protocol import (  # noqa: E402
-    KNOWN_HEADER_KEYS, parse_task_headers)
+    KNOWN_HEADER_KEYS, parse_task_headers, parse_task_headers_trusted)
 
-THREAD_FIELDS = ("thread_root", "source_room_id")
+ORIGIN_FIELDS = ("source_message_id", "thread_root", "source_room_id")
 ROOM = "!room:ag2.space"
 ROOT = "$thread_root"
 INNER = "$specific_message"
 TRIGGER = "$trigger"
 
 
-def _drive_gateway_writer(task: dict) -> "str | None":
+def _bound_gateway_writer():
     """Run the REAL remote_gateway_bridge._write_task against temp dirs.
 
     Every dir is bound BEFORE import. The module resolves task/result/state
@@ -58,6 +60,10 @@ def _drive_gateway_writer(task: dict) -> "str | None":
     global _BOUND
     _BOUND = {"tasks": rgb.TASKS_DIR, "results": rgb.RESULTS_DIR,
               "state": rgb._STATE, "rooms": rgb.TASK_ROOMS_FILE}
+    return rgb, tmp
+
+
+def _drive_gateway_writer(rgb, tmp: pathlib.Path, task: dict) -> "str | None":
     written = rgb._write_task(task)
     if not written:
         return None
@@ -82,12 +88,13 @@ def check(label: str, ok: bool) -> None:
 
 def main() -> None:
     # 1) both lockstep lists carry the fields
-    for f in THREAD_FIELDS:
+    for f in ORIGIN_FIELDS:
         check(f"KNOWN_HEADER_KEYS carries {f}", f in KNOWN_HEADER_KEYS)
 
     # 1b) Drive the REAL writer: a source-text assertion on _TASK_FIELDS passes
     # even if the writer filters the values later, which is the defect itself.
-    written = _drive_gateway_writer({
+    rgb, tmp = _bound_gateway_writer()
+    written = _drive_gateway_writer(rgb, tmp, {
         "id": "task-thr1", "task": "in-thread ask", "source": "ag2space",
         "channel_id": ROOM, "user_id": "@qingyun:ag2.space",
         "source_message_id": TRIGGER, "reply_to_event": INNER,
@@ -104,13 +111,61 @@ def main() -> None:
                w.get("reply_to_event")) == (TRIGGER, ROOT, INNER))
         # Control: the same writer, same call, with the fields absent — proves
         # the assertions above track the input rather than always passing.
-        plain = _drive_gateway_writer({
+        plain = _drive_gateway_writer(rgb, tmp, {
             "id": "task-thr2", "task": "top-level ask", "source": "ag2space",
-            "channel_id": ROOM, "user_id": "@qingyun:ag2.space",
+            "channel_id": ROOM, "source_room_id": ROOM,
+            "source_message_id": INNER, "user_id": "@qingyun:ag2.space",
         })
-        check("CONTROL: a top-level task file carries neither field",
+        plain_headers = parse_task_headers_trusted(plain or "")
+        check("top-level room request retains the reply_to source event",
+              plain_headers.get("source_message_id") == INNER)
+        check("top-level room request has no canonical thread_root",
               plain is not None
-              and "thread_root:" not in plain and "source_room_id:" not in plain)
+              and "thread_root:" not in plain)
+
+        proactive = _drive_gateway_writer(rgb, tmp, {
+            "id": "task-proactive", "task": "proactive local work",
+            "source": "cron", "user_id": "@qingyun:ag2.space",
+        })
+        proactive_headers = parse_task_headers_trusted(proactive or "")
+        check("proactive terminal task carries no reply_to source event",
+              proactive is not None
+              and proactive_headers.get("source_message_id") is None)
+        check("proactive terminal task carries no thread_root",
+              proactive is not None
+              and proactive_headers.get("thread_root") is None)
+
+        contaminated = _drive_gateway_writer(rgb, tmp, {
+            "id": "task-proactive-contaminated", "task": "proactive local work",
+            "source": "cron", "source_message_id": "$leaked",
+            "thread_root": "$leaked-root", "user_id": "@qingyun:ag2.space",
+        })
+        contaminated_headers = parse_task_headers_trusted(contaminated or "")
+        check("CONTROL: trusted parser detects both leaked placement headers",
+              contaminated is not None
+              and (contaminated_headers.get("source_message_id"),
+                   contaminated_headers.get("thread_root"))
+              == ("$leaked", "$leaked-root"))
+
+        concurrent_tasks = [
+            {"id": "task-concurrent-a", "task": "alpha", "source": "ag2space",
+             "channel_id": "!alpha:ag2.space", "source_room_id": "!alpha:ag2.space",
+             "source_message_id": "$alpha", "thread_root": "$alpha-root",
+             "user_id": "@qingyun:ag2.space"},
+            {"id": "task-concurrent-b", "task": "beta", "source": "ag2space",
+             "channel_id": "!beta:ag2.space", "source_room_id": "!beta:ag2.space",
+             "source_message_id": "$beta", "thread_root": "$beta-root",
+             "user_id": "@qingyun:ag2.space"},
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            concurrent_files = list(pool.map(
+                lambda task: _drive_gateway_writer(rgb, tmp, task), concurrent_tasks))
+        concurrent_headers = [parse_task_headers_trusted(body or "") for body in concurrent_files]
+        check("concurrent tasks retain only their own placement context",
+              [(h.get("source_message_id"), h.get("thread_root"), h.get("source_room_id"))
+               for h in concurrent_headers] == [
+                   ("$alpha", "$alpha-root", "!alpha:ag2.space"),
+                   ("$beta", "$beta-root", "!beta:ag2.space")])
         # Assert where the module BOUND its paths: on a host with no default
         # state file, observing "nothing changed" would prove nothing.
         home = pathlib.Path.home() / ".ag2-sparrow"

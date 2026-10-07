@@ -48,9 +48,20 @@ class TestCheckCoreSupervisor(unittest.TestCase):
             self.assertEqual(r["status"], "ok")
             self.assertEqual(r["name"], "core-supervisor")
 
-    def test_malformed_is_ok(self):
+    def test_malformed_warns_it_can_hide_a_blocker(self):
+        # A present-but-corrupt signal is a fault, not "not yet written": a short
+        # write over a longer one stays corrupt until the state changes (2026-09-11).
         with tempfile.TemporaryDirectory() as td:
-            self.assertEqual(self._run(td, "{not json")["status"], "ok")
+            r = self._run(td, "{not json")
+            self.assertEqual(r["status"], "warn")
+            self.assertIn("unreadable", r["detail"])
+            self.assertIn("can't be ruled out", r["detail"])
+
+    def test_wrong_shape_warns(self):
+        with tempfile.TemporaryDirectory() as td:
+            r = self._run(td, "[1, 2, 3]")
+            self.assertEqual(r["status"], "warn")
+            self.assertIn("expected an object, got list", r["detail"])
 
     def test_blocked_human_warns_needs_you_with_prompt(self):
         with tempfile.TemporaryDirectory() as td:

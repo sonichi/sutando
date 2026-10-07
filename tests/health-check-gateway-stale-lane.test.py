@@ -79,6 +79,7 @@ class GatewayBridgeVerdictSeesStoppedLane(unittest.TestCase):
     def _run(self, serving, lanes=(), stalled=()):
         with patch.object(hc, "_gateway_configured", return_value=True), \
              patch.object(hc, "subprocess") as sp, \
+             patch.object(hc, "probe_pids", return_value=(["4242"], True)), \
              patch.object(hc, "_gateway_lock_pids", return_value={}), \
              patch.object(hc, "_gateway_serving", return_value=serving), \
              patch.object(hc, "_gateway_status_stale_age_s", return_value=None), \
@@ -126,6 +127,7 @@ class ShippedPathReadsTheRealSidecar(unittest.TestCase):
                ts=now - STALE)
         with patch.object(hc, "_gateway_configured", return_value=True), \
              patch.object(hc, "subprocess") as sp, \
+             patch.object(hc, "probe_pids", return_value=(["4242"], True)), \
              patch.object(hc, "_gateway_lock_pids", return_value={}), \
              patch.object(hc, "status_read_path",
                           side_effect=lambda name, *_a, **_k: d / name):

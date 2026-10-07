@@ -159,6 +159,17 @@ def _move_without_clobbering(src: Path, dest: Path) -> Path:
     return candidate
 
 
+def archive_month(when: float | None = None) -> str:
+    """Month partition the archive writes into, in the LOCAL calendar.
+
+    A reader computing this in UTC misses the writer's partition for the hours
+    either side of a month boundary, and reads a delivered reply as absent.
+    """
+    from datetime import datetime
+    moment = datetime.fromtimestamp(when) if when is not None else datetime.now()
+    return moment.strftime("%Y-%m")
+
+
 def archive_file(src: Path, kind: str, task_id: str, *,
                  tasks_dir: Path, results_dir: Path, log=print) -> bool:
     """Move src into the archive, NEVER deleting or overwriting a record.
@@ -170,7 +181,7 @@ def archive_file(src: Path, kind: str, task_id: str, *,
     try:
         if src.exists():
             base = tasks_dir if kind == "tasks" else results_dir
-            dest_dir = base / datetime.now().strftime("%Y-%m")
+            dest_dir = base / archive_month()
             dest_dir.mkdir(parents=True, exist_ok=True)
             _move_without_clobbering(src, dest_dir / f"{task_id}.txt")
         return True

@@ -20,6 +20,7 @@ Run: python3 tests/briefing-all-clear-verified.test.py
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 from pathlib import Path
 
@@ -130,6 +131,10 @@ class _Result:
 
 _real_run = _mod.subprocess.run
 _real_path = _mod.Path
+# The local Reminders read is the owner's opt-in; these cases are about the
+# script's answer, so opt in for their duration.
+_prev_src = os.environ.get("MORNING_BRIEFING_CALENDAR_SOURCE")
+os.environ["MORNING_BRIEFING_CALENDAR_SOURCE"] = "macos"
 try:
     # non-zero exit: the script ran but failed -> unknown, not empty
     _mod.subprocess.run = lambda *a, **k: _Result(1, "")
@@ -143,6 +148,10 @@ try:
        got == [], f"got {got!r}")
 finally:
     _mod.subprocess.run = _real_run
+    if _prev_src is None:
+        os.environ.pop("MORNING_BRIEFING_CALENDAR_SOURCE", None)
+    else:
+        os.environ["MORNING_BRIEFING_CALENDAR_SOURCE"] = _prev_src
 
 # missing script / missing health-check binary -> cannot answer
 class _NoSuchPath(type(_real_path())):

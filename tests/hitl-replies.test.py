@@ -82,6 +82,21 @@ class ReplyHandlerTests(unittest.TestCase):
         self.assertFalse(self.h.claims(event(reply_for(self.req, "allow"), etype="reaction.added")))
         self.assertFalse(self.h.claims(event("junk")))
 
+    def test_room_question_reply_is_never_claimed_by_local_runtime_hitl(self):
+        for payload in (
+            {"scope": "room", "question_id": "q_1", "expected_revision": 1,
+             "response": {"kind": "choice", "option_id": "minimal"}},
+            {"question_id": "q_1", "expected_revision": 1,
+             "response": {"kind": "text", "text": "Use the small change."}},
+        ):
+            with self.subTest(payload=payload):
+                self.assertFalse(self.h.claims(event(payload)))
+                # The event-id echo remains; HandlerChain checks claims() and
+                # routes the unclaimed event to the backend/ambient path.
+                self.assertEqual(self.h.offer(event(payload)), ["$e1"])
+                self.assertEqual(self.mgr.get(self.req.id).status, "pending")
+                self.assertFalse(list(actions_dir(self.ws).glob("*.json")))
+
     def test_owner_reply_applies_and_unblocks(self):
         out = self.h.offer(event(reply_for(self.req, "allow")))
         self.assertEqual(out, ["$e1"])

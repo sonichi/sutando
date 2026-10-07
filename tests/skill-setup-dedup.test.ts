@@ -6,10 +6,17 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, delimiter } from 'node:path';
+import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const TSX = join(REPO_ROOT, 'node_modules', '.bin', 'tsx');
+const TSX_CLI = (() => {
+	try {
+		return createRequire(join(REPO_ROOT, 'package.json')).resolve('tsx/cli');
+	} catch {
+		return null;
+	}
+})();
 
 /** Write one fixture skill that tags `globalThis.__setupCalls` when its setup() runs. */
 function writeSkill(root: string, dirName: string, manifestName: string, marker: string): void {
@@ -31,6 +38,7 @@ function writeSkill(root: string, dirName: string, manifestName: string, marker:
  * dirs, invoke every registered setup() hook, and return the markers that fired.
  */
 function collectSetupEffects(roots: string[]): string[] {
+	assert.ok(TSX_CLI);
 	const driver = join(roots[0], '..', 'driver.mjs');
 	writeFileSync(
 		driver,
@@ -38,7 +46,7 @@ function collectSetupEffects(roots: string[]): string[] {
 			`for (const s of m.personalSkillSetups) s({ session: {}, injectText: () => {} });\n` +
 			`console.log('__EFFECTS__' + JSON.stringify(globalThis.__setupCalls ?? []));\n`,
 	);
-	const out = execFileSync(TSX, [driver], {
+	const out = execFileSync(process.execPath, [TSX_CLI, driver], {
 		cwd: REPO_ROOT,
 		encoding: 'utf8',
 		stdio: ['ignore', 'pipe', 'pipe'],
@@ -54,7 +62,7 @@ function collectSetupEffects(roots: string[]): string[] {
 }
 
 test('setup() hooks: same skill in two roots registers once (last-write-wins); a distinct skill survives', t => {
-	if (!existsSync(TSX)) return t.skip('tsx binary not present (no node_modules)');
+	if (!TSX_CLI || !existsSync(TSX_CLI)) return t.skip('tsx binary not present (no node_modules)');
 
 	const base = mkdtempSync(join(tmpdir(), 'skill-setup-dedup-'));
 	const rootA = join(base, 'rootA');
@@ -89,7 +97,7 @@ test('setup() hooks: same skill in two roots registers once (last-write-wins); a
 });
 
 test('setup() hooks: skill identity is the manifest name, not the directory name', t => {
-	if (!existsSync(TSX)) return t.skip('tsx binary not present (no node_modules)');
+	if (!TSX_CLI || !existsSync(TSX_CLI)) return t.skip('tsx binary not present (no node_modules)');
 
 	const base = mkdtempSync(join(tmpdir(), 'skill-setup-identity-'));
 	const rootA = join(base, 'rootA');

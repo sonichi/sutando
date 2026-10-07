@@ -48,7 +48,14 @@ import sys
 
 # Hard blockers only the USER can clear → escalate to the owner's channel.
 # crashed/hung belong to RECOVER (restart), not to user-escalation.
-HARD_ESCALATE = {"blocked-human", "logged-out"}
+HARD_ESCALATE = {"blocked-human", "logged-out", "signal-unreadable"}
+# A signal file that exists but can't be parsed may be hiding a hard blocker, so it
+# escalates once like one: a spurious notice costs a message, a suppressed one an outage.
+UNREADABLE_SIGNAL = {
+    "state": "signal-unreadable",
+    "detail": "the core supervisor's status file is unreadable, so a blocked core can't be ruled out",
+    "prompt": "",
+}
 # Gates the monitor answered by itself but the owner should still hear about:
 # the core changed something (its model) without anyone asking.
 SOFT_NOTICE_KINDS = {"fable-limit"}
@@ -173,8 +180,30 @@ def _derive_backend() -> "dict | None":
         return None            # fail-open: an unknown target degrades to generic phrasing
 
 
-def compose_message(signal: dict) -> str:
-    """The owner-facing 'action needed' line: what's stuck + a prompt excerpt."""
+# The HITL card is projected into AG2 Space rooms only (src/hitl/projector.py).
+_CARD_SURFACE = re.compile(r"ag2[.-]?space")
+
+
+def _card_projected(signal: dict, surface: str) -> bool:
+    """True only when the owner's surface shows the HITL card AND tui_gate gives it option
+    buttons; a trust/bypass/limit dialog or an unparseable prompt keeps the button-less card."""
+    if not surface or not _CARD_SURFACE.search(surface):
+        return False
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from hitl import tui_gate
+        req = tui_gate.requirement_for(signal.get("state") or "", signal.get("kind"), signal.get("prompt"),
+                                       signal.get("session") or "", "", "")
+        return any(a.kind != "open_terminal" for a in req.actions)
+    except Exception:  # noqa: BLE001 - no card known for sure: name the terminal
+        return False
+
+
+def compose_message(signal: dict, surface: str = "") -> str:
+    """The owner-facing 'action needed' line: what's stuck + a prompt excerpt. `surface` is
+    the channel it goes to, which decides whether a choice card can be named."""
     aa = _soft_notice(signal)
     if aa and signal.get("state") not in HARD_ESCALATE:
         return ("ℹ️ Fable weekly limit reached — the core pressed Enter on the focused"
@@ -213,6 +242,10 @@ def compose_message(signal: dict) -> str:
                 " not \"Switch to <fallback> and continue\", so the core will not press Enter"
                 " (that could spend credits). Pick the switch at the core's terminal, or"
                 " /usage-credits to stay on Fable.")
+    elif signal.get("state") == "signal-unreadable":
+        host = _core_host_label() or "the host"
+        msg += (f" — check the core on {host}; restarting the engine rewrites the file."
+                " If the core looks fine, no action is needed.")
     elif _is_login_class(signal):
         host = _core_host_label() or "the host"
         msg += (f" — needs GUI /login on {host}: open Terminal there, run"
@@ -231,7 +264,13 @@ def compose_message(signal: dict) -> str:
         where = (f"at the core's terminal on {host} — `tmux -S {be['socket']} "
                  f"attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
                  if be else f"where the core is running on {host}")
-        msg += f" — answer it {where}. A chat reply can't answer it."
+        if kind in ("selection", "permission") and _card_projected(signal, surface):
+            # The card's buttons type the answer into the dialog, so it is the first option
+            # and the terminal the second; a card is named only when one is really there.
+            msg += (f" — tap an option on the choice card in our DM (it answers for you), or answer it"
+                    f" {where}. A typed chat reply can't answer it.")
+        else:
+            msg += f" — answer it {where}. A chat reply can't answer it."
     return msg
 
 
@@ -298,7 +337,7 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
     escalate, new_hash = should_escalate(signal, _load_last_hash(state_file))
     if not escalate:
         return None
-    msg = compose_message(signal)
+    msg = compose_message(signal, surface=source)
     if dry_run:
         return msg
     if macos:
@@ -409,10 +448,12 @@ def main(argv=None):
     try:
         with open(a.signal) as f:
             signal = json.load(f)
-        if not isinstance(signal, dict):
-            signal = {}
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return 0  # no signal yet → nothing to escalate (degrade quietly)
+    except (OSError, ValueError):
+        signal = None
+    if not isinstance(signal, dict):
+        signal = dict(UNREADABLE_SIGNAL)
 
     msg = run_cycle(signal, a.state_file, macos=not a.no_macos,
                     source=source, channel=channel, dry_run=a.dry_run)

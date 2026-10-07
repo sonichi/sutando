@@ -1,11 +1,13 @@
 ---
 name: report-feedback
-description: File a bug report, feature request, or feedback about Sutando to the team from any surface (chat, Discord, Telegram, or a voice-delegated task) — or automatically (--auto) when the agent itself hits a Sutando/AG2 Space bug. Reuses the cloud /api/feedback API and auto-attaches diagnostic context. Use when the user says "report a bug", "something's broken, file it", "I have a feature request", etc.
+description: THE way a bug, feature request or feedback about Sutando, AG2 Space or the desktop app reaches the AG2 team; the only path to the tracker (Slack #product-feedback, a GitHub issue, the master DB). Posting it in chat, a room or a DM, or asking another agent to log it, is not reporting it. Use when the owner says "report this bug", "report this issue", "report an issue", "report a bug", "file a bug", "log this bug", "submit feedback", "feature request", "tell the team this is broken", "something's broken, file it", in a DM, a room or by voice (not "report this on the PR" or "to <someone>": that is a comment or a message); or automatically (--auto) when the agent itself hits a Sutando/AG2 Space bug. Files through the cloud /api/feedback API with diagnostic context and replies with the reference id. A non-owner asking is told to file it through their own report-feedback skill or the app's Report a bug button.
 ---
 
 # Report Feedback
 
-When the user asks to **report a bug / issue / feature request / feedback about Sutando itself** — e.g. "report a bug", "something's broken, file it", "I have a feature request" — use this skill to file it.
+When the user asks to **report a bug / issue / feature request / feedback about Sutando, AG2 Space or the desktop app** — e.g. "report this bug", "report this issue", "report an issue", "file a bug", "log this bug", "submit feedback", "I have a feature request", "tell the team this is broken" — use this skill to file it, whether the ask comes in a DM, in a room or by voice. "Report this on the PR" or "report this to <someone>" asks for a PR comment or a message, not a report.
+
+**This is the only path that reaches the AG2 team.** The report goes skill → `/api/feedback` → Slack #product-feedback, a GitHub issue on sonichi/sutando and the master feedback DB. A message in a room or a DM, a hand-opened GitHub issue, or asking another agent (another Sutando included) to "add a row" or pass it on never gets there; do not do those instead of filing. After filing, reply with the reference id the script prints.
 
 It posts to the cloud `/api/feedback` route (the same one the desktop "Report an issue" form uses, which mirrors into GitHub issues) and auto-attaches diagnostic context (platform + a tail of recent workspace logs), so you don't need to gather logs yourself.
 
@@ -70,7 +72,7 @@ python3 skills/report-feedback/report-feedback.py --decide <draft-id> file|file_
 
 ## Automatic reports (`--auto`)
 
-When **you** (not the user) determine that a bug or error is caused by Sutando itself or AG2 Space — engine services, bridges, the desktop app, AG2 Space connectivity, or the AG2 cloud — file it automatically with `--auto`. Never `--auto`-file problems in the user's own projects or code, third-party tools/sites/APIs, or expected failures (bad input, credentials the owner simply hasn't provided).
+When **you** (not the user) determine that a bug or error is caused by Sutando itself or AG2 Space — engine services, bridges, the desktop app, AG2 Space connectivity, or the AG2 cloud — queue it with `--auto`. Never `--auto`-file problems in the user's own projects or code, third-party tools/sites/APIs, or expected failures (bad input, credentials the owner simply hasn't provided).
 
 `--auto` enforces the owner's Settings toggles (read from `<workspace>/state/feedback-prefs.json`, written by the desktop app). When the file is absent the two defaults differ:
 
@@ -79,16 +81,88 @@ When **you** (not the user) determine that a bug or error is caused by Sutando i
 
 The split is deliberate. Absence of the file must not disable reporting on installs that predate the toggles, but absence is not consent either, and the log excerpt is the part that carries incidental owner data — paths containing usernames, hostnames, workspace content. An owner who has never opened Settings ships no logs.
 
-Auto reports are also deduped (an identical title within 24h) and rate-limited (5 per 24h) via `<workspace>/state/feedback-auto-reports.json`. A `SKIPPED` exit (3) is a normal outcome, not an error — just move on. After filing an auto report, tell the owner in one short sentence (e.g. "I've filed a bug report about this"); the Settings toggle is the consent surface, so don't ask permission first.
+Auto reports are also deduped (an identical title within 24h) and rate-limited (5 per 24h) via `<workspace>/state/feedback-auto-reports.json`. A `SKIPPED` exit (3) is a normal outcome, not an error — just move on. Only after `OK: filed` (not `HELD`), tell the owner in one short sentence (e.g. "I've filed a bug report about this"); the Settings toggle is the consent surface, so don't ask permission first.
+
+## Hold automatic reports while existing recovery runs
+
+`--auto` first returns `HELD: incident fb_…`. The report stays locally in
+`state/feedback-drafts/`; it sends nothing and creates no approval card yet.
+An identical pending title reuses its incident ID and original deadline.
+Manual reports without `--auto` remain immediate.
+
+Use the returned incident ID to record the **existing** recovery lifecycle:
+
+```bash
+python3 skills/report-feedback/report-feedback.py --auto --title "Bridge disconnected" --body "Observed failure"
+python3 skills/report-feedback/report-feedback.py --recovery fb_0123456789 started
+# After the existing recovery finishes, record exactly one outcome:
+python3 skills/report-feedback/report-feedback.py --recovery fb_0123456789 succeeded
+# Or, only when recovery has definitively failed / exhausted its own timeout:
+python3 skills/report-feedback/report-feedback.py --recovery fb_0123456789 failed
+```
+
+- Record `started` as soon as an existing recovery begins (or immediately after
+  queuing if it is already running). **Do not start extra recovery to satisfy reporting.**
+- Record `succeeded` only when the original failing operation is verified working.
+  Restarting a process alone is insufficient. Success archives the local diagnostic
+  draft as `.suppressed` and cancels any unsent approval card.
+- Record `failed` only for the final outcome, not an intermediate failed retry.
+  This immediately releases the report through the current preferences, daily cap,
+  deduplication and ask-first flow. An already-failed recovery can be recorded
+  immediately after queuing; no new attempt is required.
+- If recovery never starts, the report becomes eligible one hour after queuing.
+  If recovery is still running at that deadline, it remains held. The existing
+  recovery controller/agent must report its final failure, including its own timeout.
+  This skill never infers success or failure from unrelated health checks.
+- Keep the incident ID with the task's recovery context across turns. Record outcomes
+  for that incident only. Repeat detections do not extend the one-hour deadline.
+- `--drafts` lists pending incidents and their recovery state. `--apply` evaluates
+  deadlines and applies owner clicks. Reports carry `context.recovery` with the state,
+  deadline and release reason. Automatic posting never claims owner approval.
+- The auto-report off-switch is checked again at release; disabled queued reports
+  are archived and do not return when the switch is re-enabled. Logs are collected
+  only at filing, using current `sendLogs` and the queued `--no-logs` choice.
+
+### Deadline worker (deployment)
+
+The Stop hook applies owner clicks without waiting behind a worker; automatic
+releases run in the worker or explicit CLI. **Install the periodic worker when deploying this change on macOS:**
+
+```bash
+python3 skills/report-feedback/install-worker.py
+# Inspect the job without installing:
+python3 skills/report-feedback/install-worker.py --render
+# Remove the worker:
+python3 skills/report-feedback/install-worker.py --uninstall
+```
+
+It runs `report-feedback.py --apply` every 60 seconds via launchd and at login,
+independent of the core. Deadlines persist across restarts and are evaluated on the
+next tick after wake/login; an offline/asleep machine cannot submit at an exact
+wall-clock deadline. Use a persistent checkout and Python installation; reinstall
+if either path changes. Inspect `logs/feedback-recovery.log` for worker errors.
+On other platforms, configure the OS scheduler to run the same `--apply` command
+once per minute. Without a periodic worker, deadlines are checked only on an explicit `--apply`
+or recovery update; installing the code alone does not activate the timer.
+
+Posts use the existing draft `.posting`/`.filed` receipts: uncertain network outcomes
+are held for the existing owner decision card, never automatically reposted. CLI,
+Stop hook and worker serialize mutations with `state/feedback-reports.lock`.
 
 ## Behavior
 
+- Every report includes Sutando and AG2Space version/commit identifiers in both structured context and a readable body section, even with `--no-logs`. Packaged apps use build-stamped metadata; source checkouts include the Git revision and tracked local-edit marker. Parked reports retain their incident-time versions across upgrades; older drafts and unavailable identifiers are explicitly `unknown`.
+
 - Requires the user to be **signed in to Sutando Cloud** (Settings → Sutando Cloud). If not, the script prints `NOT_SIGNED_IN` and exits 2 — relay that and ask them to sign in, then retry. For `--auto` reports, don't nag: mention it at most once.
-- On success it prints `OK: filed <kind> report`. On API error it prints `ERROR: …` — relay a brief apology and offer to retry.
-- Exit codes: `0` filed, `1` error, `2` not signed in, `3` skipped (auto reports disabled, duplicate, or rate-limited).
+- On success it prints `OK: filed <kind> report (<status>). Reference: <id>.` (the id the feedback API returned; the line has no `Reference:` when the API named none). Tell the user it is filed and give the reference. On API error it prints `ERROR: …` — relay a brief apology and offer to retry.
+- Exit codes: `0` filed, held, recovery recorded, or applied (read the output), `1` error, `2` not signed in, `3` skipped (auto reports disabled, duplicate, or rate-limited).
 
 ## Access tier
 
-**Owner-tier only** — it files under the owner's Sutando Cloud identity, and it reads the owner's cloud token + attaches the owner's workspace log tail. Do not run it for non-owner (team/other) Discord, Slack, or Telegram tiers.
+**Owner-tier only** — it files under the owner's Sutando Cloud identity, and it reads the owner's cloud token + attaches the owner's workspace log tail. Run it only for `access_tier: owner` (or an unauthenticated local/voice owner task). The script has no tier check of its own.
 
-Non-owner tasks never reach this skill: the bridges route team/other tiers to a sandboxed `codex exec --sandbox read-only` agent (see CLAUDE.md access-control), which has no cloud token and cannot execute this script — so a non-owner can't ship the owner's logs into an issue. Only `access_tier: owner` (or an unauthenticated local/voice owner task) is processed with full capabilities that can invoke this skill.
+Guest tasks, every non-owner Slack task, and non-owner Discord tasks from senders outside the channel's `collaborators` list go to a read-only `codex exec --sandbox` agent with no cloud token, which cannot run this script. AG2 Space Team tasks, broker-attested collaborators included, and a Discord channel's listed collaborators run in the owner's core with its normal tools (`docs/access-control.md`). Nothing structural stops them from running this script: the gate is prose, the in-band Team guardrail or collaborator rulebook (no external actions on their say-so) and the section below.
+
+### When a non-owner asks
+
+This applies to every task whose `access_tier` is not `owner`, a collaborator's included. A teammate, a guest or another agent asking you to report a bug cannot be filed under your owner's identity. Never stay silent and never hand it to another agent. Answer them in one line: file it through your own `report-feedback` skill (a person: through their own Sutando), or with the **Report a bug** button in the AG2 Space app (the bug icon in the composer), which files it under their own account. If your owner asks you to file it for them, it is the owner's report: file it as usual.

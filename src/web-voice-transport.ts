@@ -488,6 +488,10 @@ export const CONNECT_TIMEOUT_MS = 6000;
  *  frame within this window after open ⇒ legacy server, behave exactly as
  *  before the protocol existed. */
 export const AGENT_STATE_LEGACY_MS = 3000;
+/** How long the upstream may sit in connecting/backoff — measured from the first such frame
+ *  since connect() or since the last `live` — before the attempt is failed with an actionable
+ *  card instead of an endless "Reconnecting…". Frames do not restart it; only `live` does. */
+export const UPSTREAM_DEADLINE_MS = 30_000;
 
 /** Bound on the awaited close handshake in `disconnect()` (amendment T8): if
  *  the socket's real `close` event never arrives within this window, the
@@ -557,6 +561,8 @@ export interface VoiceTransportOptions extends VoiceTransportEvents {
   connectTimeoutMs?: number;
   /** Legacy-detection window override (tests). Default AGENT_STATE_LEGACY_MS. */
   agentStateLegacyMs?: number;
+  /** Override UPSTREAM_DEADLINE_MS (tests). */
+  upstreamDeadlineMs?: number;
   /** Bound on disconnect()'s awaited close handshake (tests). Default
    *  DISCONNECT_CLOSE_TIMEOUT_MS. */
   disconnectCloseTimeoutMs?: number;
@@ -595,14 +601,24 @@ export class VoiceTransport {
   private playbackRate: number;
   private connectTimeoutMs: number;
   private agentStateLegacyMs: number;
+  private upstreamDeadlineMs: number;
+  private upstreamTimer: ReturnType<typeof setTimeout> | null = null;
+  /** nowFn() at the first connecting/backoff since connect() or since the last `live`; null while live/idle. */
+  private upstreamDownSince: number | null = null;
+  /** This attempt saw `live` at least once: a later outage is a loss, not an unreachable model. */
+  private upstreamEverLive = false;
   private disconnectCloseTimeoutMs: number;
   private wsFactory: (url: string) => WebSocket;
 
   private ws: WebSocket | null = null;
   private audioCtx: AudioContext | null = null;
+  /** Playback runs on its own context at the stream rate: a buffer/context
+   *  rate mismatch makes the browser linearly interpolate each chunk. */
+  private playbackCtx: AudioContext | null = null;
   private micStream: MediaStream | null = null;
   private processor: ScriptProcessorNode | null = null;
   private analyserNode: AnalyserNode | null = null;
+  private rateMismatchLogged = false;
   /** `cancelled` distinguishes flushPlayback stops from natural completions —
    *  stop() fires `onended` too, and cancellation is not completion (D7.1). */
   private activeSources: Array<{ src: AudioBufferSourceNode; cancelled: boolean }> = [];
@@ -732,6 +748,7 @@ export class VoiceTransport {
     this.playbackRate = opts.playbackRate ?? 1.0;
     this.connectTimeoutMs = opts.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
     this.agentStateLegacyMs = opts.agentStateLegacyMs ?? AGENT_STATE_LEGACY_MS;
+    this.upstreamDeadlineMs = opts.upstreamDeadlineMs ?? UPSTREAM_DEADLINE_MS;
     this.disconnectCloseTimeoutMs = opts.disconnectCloseTimeoutMs ?? DISCONNECT_CLOSE_TIMEOUT_MS;
     this.wsFactory = opts.wsFactory ?? ((url: string) => new WebSocket(url));
     this.speechRmsFloor = opts.speechRmsFloor ?? SPEECH_RMS_FLOOR;
@@ -792,8 +809,11 @@ export class VoiceTransport {
     this.agentStateSeen = false;
     this.legacyServer = false;
     this.lastUpstream = null;
+    this.upstreamDownSince = null;
+    this.upstreamEverLive = false;
     this.clearConnectTimer();
     this.clearLegacyTimer();
+    this.clearUpstreamTimer();
     if (this.ws) {
       // A Retry on the same transport must not stack a second socket or
       // audio graph on top of a leftover one.
@@ -817,12 +837,22 @@ export class VoiceTransport {
 
     this.status('connecting', 'Connecting…');
 
-    // Create the AudioContext up front (ideally on a user gesture) so playback
-    // and capture share one clock and it isn't born suspended.
+    // Create the AudioContext up front (ideally on a user gesture) so it isn't
+    // born suspended. Capture uses this one; playback has its own (playbackCtx).
     if (!this.audioCtx || this.audioCtx.state === 'closed') {
       this.audioCtx = new AudioContext();
     }
     this.adoptCtx(this.audioCtx);
+    if (!this.playbackCtx || this.playbackCtx.state === 'closed') {
+      try {
+        this.playbackCtx = this.createPlaybackContext();
+      } catch {
+        this.playbackCtx = null; // playChunk retries lazily
+      }
+    }
+    if (this.playbackCtx?.state === 'suspended') {
+      void this.playbackCtx.resume().catch(() => {});
+    }
     if (this.audioCtx.state === 'suspended') {
       try {
         await this.audioCtx.resume();
@@ -936,6 +966,7 @@ export class VoiceTransport {
     this.attemptGen++;
     this.clearConnectTimer();
     this.clearLegacyTimer();
+    this.clearUpstreamTimer();
     const emitClosed = this.attemptActive && !this.terminal;
     this.attemptActive = false;
     const ws = this.ws;
@@ -1052,6 +1083,14 @@ export class VoiceTransport {
       }
     }
     this.audioCtx = null;
+    if (this.playbackCtx && this.playbackCtx.state !== 'closed') {
+      try {
+        this.playbackCtx.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.playbackCtx = null;
     this.analyserNode = null; // recreated against the next ctx in playChunk
   }
 
@@ -1150,6 +1189,7 @@ export class VoiceTransport {
       this.terminal = true;
       this.attemptActive = false;
       this.clearLegacyTimer();
+    this.clearUpstreamTimer();
       this.teardownAudio();
       // P1: latch the self-inflicted close-handshake completion before any
       // callback emits (see onConnectTimeout).
@@ -1214,6 +1254,7 @@ export class VoiceTransport {
     this.debug('WS closed: code=' + code + ' reason=' + reason);
     this.clearConnectTimer();
     this.clearLegacyTimer();
+    this.clearUpstreamTimer();
     // Attempt concluded ⇒ generation invalidated. Every branch below
     // concludes the attempt, and the gen fence in connect()'s onclose closure
     // guarantees this method only ever runs for the CURRENT attempt — so one
@@ -1299,6 +1340,7 @@ export class VoiceTransport {
 
   private armLegacyTimer(gen: number): void {
     this.clearLegacyTimer();
+    this.clearUpstreamTimer();
     this.legacyTimer = setTimeout(() => {
       this.legacyTimer = null;
       if (gen !== this.attemptGen || this.agentStateSeen) return;
@@ -1317,50 +1359,35 @@ export class VoiceTransport {
     this.agentStateSeen = true;
     this.legacyServer = false;
     this.clearLegacyTimer();
+    // The deadline is NOT cleared here: the agent sends a fresh state on every
+    // redial (backoff 1, 2, 4, 8 s…), and a per-frame clear let the 30 s window
+    // restart each time, so the card fired only once a single gap reached 30 s.
+    // live and idle clear it below; connecting/backoff arm it once.
     const prev = this.lastUpstream;
     this.lastUpstream = frame.upstream;
     this.ev.onAgentState?.(frame);
     if (this.terminal) return; // latched attempt — frames are informational only
     switch (frame.upstream) {
       case 'failed': {
-        // Terminal CLIENT transition (design 1e): the server deliberately
-        // stays reachable, so no close will arrive — the client itself must
-        // invalidate the attempt, stop mic/stats/playback, close the socket,
-        // latch the error, and suppress the self-inflicted onclose. Otherwise
-        // the mic keeps streaming behind the error card and a Retry stacks a
-        // second socket/audio graph.
         const { detail, remediation } = describeAgentFailure(frame.reason, frame.category);
-        this.attemptGen++; // invalidate: no callback of this socket runs again
-        this.terminal = true;
-        this.attemptActive = false;
-        this.clearConnectTimer();
-        this.teardownAudio();
-        const ws = this.ws;
-        // P1: latch the self-initiated close-handshake completion before the
-        // terminal status/failure emit (see onConnectTimeout).
-        this.trackCloseCompletion(ws);
-        this.ws = null;
-        if (ws) {
-          try {
-            ws.close();
-          } catch {
-            /* already closed */
-          }
-        }
-        this.status('error', detail);
-        const failure: VoiceConnectFailure = { kind: 'agent-failed', detail, remediation };
-        if (frame.reason !== undefined) failure.reason = frame.reason;
-        if (frame.category !== undefined) failure.category = frame.category;
-        this.emitFailure(failure);
+        this.failUpstream(detail, remediation, frame.reason, frame.category);
         return;
       }
       case 'connecting':
       case 'backoff':
         // Progress, not an error: idle→connecting→live after connect is the
-        // normal wake-up sequence.
+        // normal wake-up sequence. But an upstream that never answers, or one
+        // that was live and never comes back, must not spin forever behind
+        // "Reconnecting…": the window opens at the first such frame and only a
+        // `live` closes it; the agent's redial frames do not restart it.
+        if (this.upstreamDownSince === null) this.upstreamDownSince = this.nowFn();
         this.status('live', frame.upstream === 'connecting' ? 'Waking up…' : 'Reconnecting to the model…');
+        this.armUpstreamTimer();
         return;
       case 'live':
+        this.upstreamEverLive = true;
+        this.upstreamDownSince = null;
+        this.clearUpstreamTimer();
         if (prev !== null && prev !== 'live') {
           this.status('live', 'Live — speak now');
         }
@@ -1368,8 +1395,88 @@ export class VoiceTransport {
       default:
         // 'idle' — healthy torn-down upstream; our attach wakes it (the
         // connecting frame follows). Nothing to render yet.
+        this.upstreamDownSince = null;
+        this.clearUpstreamTimer();
         return;
     }
+  }
+
+  /**
+   * Terminal CLIENT transition (design 1e): the server deliberately stays
+   * reachable, so no close will arrive — the client itself must invalidate
+   * the attempt, stop mic/stats/playback, close the socket, latch the error,
+   * and suppress the self-inflicted onclose. Otherwise the mic keeps streaming
+   * behind the error card and a Retry stacks a second socket/audio graph.
+   */
+  private failUpstream(
+    detail: string,
+    remediation: string,
+    reason?: string,
+    category?: AgentStateCategory,
+  ): void {
+    this.attemptGen++; // invalidate: no callback of this socket runs again
+    this.terminal = true;
+    this.attemptActive = false;
+    this.clearConnectTimer();
+    this.clearUpstreamTimer();
+    this.teardownAudio();
+    const ws = this.ws;
+    // P1: latch the self-initiated close-handshake completion before the
+    // terminal status/failure emit (see onConnectTimeout).
+    this.trackCloseCompletion(ws);
+    this.ws = null;
+    if (ws) {
+      try {
+        ws.close();
+      } catch {
+        /* already closed */
+      }
+    }
+    this.status('error', detail);
+    const failure: VoiceConnectFailure = { kind: 'agent-failed', detail, remediation };
+    if (reason !== undefined) failure.reason = reason;
+    if (category !== undefined) failure.category = category;
+    this.emitFailure(failure);
+  }
+
+  /** One deadline per outage: armed once the window is open, for what remains of it; cleared by live. */
+  private armUpstreamTimer(): void {
+    if (this.upstreamTimer || this.terminal || this.upstreamDownSince === null) return;
+    const gen = this.attemptGen;
+    const remaining = Math.max(0, this.upstreamDownSince + this.upstreamDeadlineMs - this.nowFn());
+    this.upstreamTimer = setTimeout(() => this.onUpstreamDeadline(gen), remaining);
+  }
+
+  private clearUpstreamTimer(): void {
+    if (this.upstreamTimer) {
+      clearTimeout(this.upstreamTimer);
+      this.upstreamTimer = null;
+    }
+  }
+
+  private onUpstreamDeadline(gen: number): void {
+    this.upstreamTimer = null;
+    if (gen !== this.attemptGen || this.terminal) return;
+    if (this.lastUpstream === 'live' || this.upstreamDownSince === null) return;
+    const secs = Math.round(this.upstreamDeadlineMs / 1000);
+    if (this.upstreamEverLive || this.bytesRecv > 0) {
+      // The model answered on this attempt, so the key and the model are fine: the link was lost.
+      this.debug('Upstream lost: still ' + this.lastUpstream + ' ' + this.upstreamDeadlineMs + 'ms after the last live', 'err');
+      this.failUpstream(
+        'Voice agent lost the model mid-call and could not reconnect for ' + secs + ' s.',
+        'Check your network connection, then retry.',
+        'upstream-lost',
+        'network',
+      );
+      return;
+    }
+    this.debug('Upstream still ' + this.lastUpstream + ' after ' + this.upstreamDeadlineMs + 'ms with nothing received', 'err');
+    this.failUpstream(
+      'Voice agent could not reach the model: it kept reconnecting for ' + secs + ' s without an answer.',
+      'Check the Gemini key in Agent settings → Agent → Gemini API and the voice log in voice setup, then retry.',
+      'upstream-unreachable',
+      'network',
+    );
   }
 
   // ─── mic capture ────────────────────────────────────────────
@@ -1553,7 +1660,7 @@ export class VoiceTransport {
       });
       this.micStream = null;
     }
-    // Don't close audioCtx here — playback may still be draining.
+    // Don't close audioCtx here — connect() and recovery reuse it.
   }
 
   // ─── WS message routing ─────────────────────────────────────
@@ -1582,8 +1689,10 @@ export class VoiceTransport {
     if (msg?.type === 'agent.state') {
       this.handleAgentState(msg as AgentStateV1);
     } else if (msg?.type === 'session.config' && msg.audioFormat) {
+      const prevOutputRate = this.outputRate;
       this.inputRate = msg.audioFormat.inputSampleRate ?? this.inputRate;
       this.outputRate = msg.audioFormat.outputSampleRate ?? this.outputRate;
+      if (this.outputRate !== prevOutputRate) this.retirePlaybackCtx();
       this.ev.onSessionConfig?.(this.inputRate, this.outputRate);
     } else if (msg?.type === 'transcript') {
       this.ev.onTranscript?.(msg.role, msg.text, msg.partial !== false);
@@ -1609,15 +1718,21 @@ export class VoiceTransport {
     // Deafened: drop the agent's audio (like a call deafen — you don't hear
     // what was said while deafened).
     if (this.deafened) return;
-    if (!this.audioCtx || this.audioCtx.state === 'closed') {
+    if (!this.playbackCtx || this.playbackCtx.state === 'closed') {
       try {
-        this.audioCtx = new AudioContext();
+        this.playbackCtx = this.createPlaybackContext();
       } catch {
         return;
       }
-      this.adoptCtx(this.audioCtx);
     }
-    const ctx = this.audioCtx;
+    const ctx = this.playbackCtx;
+    if (ctx.sampleRate !== this.outputRate && !this.rateMismatchLogged) {
+      this.rateMismatchLogged = true;
+      this.debug(
+        `playback AudioContext rate ${ctx.sampleRate} differs from stream rate ${this.outputRate}; the browser will interpolate each chunk`,
+        'warn',
+      );
+    }
     if (ctx.state === 'suspended') ctx.resume();
 
     const f32 = int16ToFloat32(arrayBuf);
@@ -1700,6 +1815,36 @@ export class VoiceTransport {
     this.ev.onDebug?.(msg, kind);
   }
 
+  /** Playback context at the stream's rate; falls back to the device rate
+   *  where the constructor rejects it (NotSupportedError). */
+  private createPlaybackContext(): AudioContext {
+    try {
+      return new AudioContext({ sampleRate: this.outputRate });
+    } catch (e) {
+      this.debug(
+        `playback AudioContext at ${this.outputRate} Hz rejected (${(e as Error)?.name ?? e}); using device rate`,
+        'warn',
+      );
+      return new AudioContext();
+    }
+  }
+
+  /** A renegotiated output rate needs a context at that rate; playChunk
+   *  recreates it lazily (and re-hands the analyser to the surface). */
+  private retirePlaybackCtx(): void {
+    if (!this.playbackCtx) return;
+    this.flushPlayback();
+    if (this.playbackCtx.state !== 'closed') {
+      try {
+        this.playbackCtx.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.playbackCtx = null;
+    this.analyserNode = null;
+  }
+
   private stopStats(): void {
     if (this.statsTimer) {
       clearInterval(this.statsTimer);
@@ -1736,6 +1881,7 @@ export class VoiceTransport {
     this.speechAboveFloorMs = 0;
     this.ctxSuspendCount = 0;
     this.ctxLastTransition = null;
+    this.rateMismatchLogged = false;
     for (const slot of this.episodeRing) {
       slot.id = 0;
       slot.sent = false;
@@ -1859,7 +2005,7 @@ export class VoiceTransport {
       scheduledDepth: this.activeSources.length,
       lastEndedAt: this.lastEndedAt,
       ctxState: this.audioCtx?.state ?? null,
-      ctxTimeMs: this.audioCtx ? Math.round(this.audioCtx.currentTime * 1000) : null,
+      ctxTimeMs: this.playbackCtx ? Math.round(this.playbackCtx.currentTime * 1000) : null,
       ctxSuspendCount: this.ctxSuspendCount,
       captureState: this.captureState,
       capStalled: this.capStalled,
@@ -1897,7 +2043,7 @@ export class VoiceTransport {
    *       failed/skipped frame's interval folds into the next delta):
    *       [capCallbacks, bytesSent, sendSkipped, sendFailed, chunksRecv,
    *        chunksScheduled, chunksEnded, chunksCancelled]
-   *   x   [ctxTimeMs|-1, scheduledDepth, lastEndedAgoMs|-1]
+   *   x   [playback ctxTimeMs|-1, scheduledDepth, lastEndedAgoMs|-1]
    *   cs  ctx state initial ('r'unning | 's'uspended | 'c'losed)
    *   cap capture state initial ('o'bserving | 'r'ecovering | 'd'egraded)
    *   sc  ctxSuspendCount
@@ -1932,7 +2078,7 @@ export class VoiceTransport {
         this.chunksCancelled - this.hbPrev.chunksCancelled,
       ],
       x: [
-        this.audioCtx ? Math.round(this.audioCtx.currentTime * 1000) : -1,
+        this.playbackCtx ? Math.round(this.playbackCtx.currentTime * 1000) : -1,
         this.activeSources.length,
         this.lastEndedAt != null ? Math.max(0, now - this.lastEndedAt) : -1,
       ],
@@ -2139,7 +2285,7 @@ export class VoiceTransport {
   }
 
   private async tryReacquire(gen: number, capGen: number): Promise<boolean> {
-    // Tear down the dead capture first (keep the ctx — playback drains on it).
+    // Tear down the dead capture first (keep the ctx — the reacquire rewires on it).
     this.stopMic();
     let stream: MediaStream;
     try {

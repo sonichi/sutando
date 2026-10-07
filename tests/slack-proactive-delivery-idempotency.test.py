@@ -53,6 +53,8 @@ def _load_bridge():
 
     os.environ["SUTANDO_WORKSPACE"] = tempfile.mkdtemp(prefix="sutando-slack-dedupe-bridge-")
     os.environ["SUTANDO_TEST_MODE"] = "1"
+    # A Slack-only install: the host's real ~/.claude/channels must not decide the claim.
+    os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="sutando-slack-ccd-")
     os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-not-real"
     os.environ["SLACK_APP_TOKEN"] = "xapp-test-not-real"
     bridge_spec = importlib.util.spec_from_file_location(
