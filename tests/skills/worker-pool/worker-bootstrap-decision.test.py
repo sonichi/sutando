@@ -22,6 +22,11 @@ import sys
 import tempfile
 import time
 import unittest
+
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[3] / "tests" / "_helpers"))
+from process_group import (STABLE_WATCHER_BODY, group_members as _group_members,  # noqa: E402
+                           kill_group as _kill_group, spawn_detached as _spawn_detached,
+                           popen_in_own_group, own_group)
 from unittest.mock import patch
 from pathlib import Path
 
@@ -521,8 +526,7 @@ class TestOwnershipIsScopedToThisSession(Base):
         script = self.ws / "watch-tasks-stream.sh"
         script.write_text(STABLE_WATCHER_BODY)
         pid = _spawn_detached(script, self.inbox)
-        self.addCleanup(lambda: self.assertEqual(_group_members(pid), [], "fixture left a process behind"))
-        self.addCleanup(_kill_group, pid)
+        own_group(self, pid)
         import watcher_identity
         if not _wait_for_exec(pid, str(script), watcher_identity.proc_argv_vector):
             self.skipTest("no authoritative argv read on this platform")
@@ -536,50 +540,6 @@ class TestOwnershipIsScopedToThisSession(Base):
                            alive=lambda p: True)
         self.assertEqual(d, "start", why)
         self.assertIn("not started by this session", why)
-
-
-# The trailing no-op stops bash exec'ing `sleep` in place, which would turn the
-# pid's argv into ["sleep", "30"] while the gate may still re-read it.
-STABLE_WATCHER_BODY = "#!/bin/sh\nsleep 30; :\n"
-
-
-def _spawn_detached(script, inbox):
-    """Start `bash script inbox` detached (reparented away from us) in its own
-    process group, so teardown can take the shell and its sleep child together."""
-    out = subprocess.run(
-        ["bash", "-c", f'set -m; nohup bash "{script}" "{inbox}" >/dev/null 2>&1 & echo $!'],
-        capture_output=True, text=True, check=True).stdout.strip()
-    return int(out)
-
-
-def _group_members(pgid):
-    """Live pids whose process group is pgid, from an all-process listing: a
-    numeric `ps -g` means a session on procps, so the PGID column is filtered
-    here. A zombie awaiting wait() is not a leak. Raises if ps gave no table."""
-    r = subprocess.run(["ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True)
-    rows = [line.split() for line in r.stdout.splitlines() if line.strip()]
-    if r.returncode != 0 or not rows:
-        raise RuntimeError(f"ps gave no process table (rc={r.returncode}): {r.stderr.strip()}")
-    return [int(pid) for pid, pg, stat, *_ in rows
-            if pg == str(pgid) and not stat.startswith("Z")]
-
-
-def _kill_group(pgid, wait_s=2.0):
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        members = _group_members(pgid)
-        if not members:
-            return
-        try:
-            os.killpg(pgid, sig)
-        except (ProcessLookupError, PermissionError):
-            for pid in members:   # a group with a reaped leader refuses killpg; signal each member
-                try:
-                    os.kill(pid, sig)
-                except ProcessLookupError:
-                    pass
-        deadline = time.monotonic() + wait_s
-        while time.monotonic() < deadline and _group_members(pgid):
-            time.sleep(0.02)
 
 
 def _wait_for_exec(pid, script, read_argv, tries=250, delay=0.02):
@@ -621,6 +581,10 @@ class TestWaitForExec(unittest.TestCase):
     def test_a_sequence_that_ends_at_nohup_is_not_a_watcher(self):
         read, _ = _staged(STAGES[:3] + [STAGES[2]] * 5)
         self.assertFalse(_wait_for_exec(1, "/w/watch-tasks-stream.sh", read, tries=8, delay=0))
+
+    def test_a_non_shell_with_the_script_in_argv1_is_not_a_watcher(self):
+        read, _ = _staged([["python3", "/w/watch-tasks-stream.sh", "/in"]] * 4)
+        self.assertFalse(_wait_for_exec(1, "/w/watch-tasks-stream.sh", read, tries=4, delay=0))
 
     def test_gives_up_when_argv_never_names_the_script(self):
         self.assertFalse(_wait_for_exec(1, "/w/x.sh", lambda _p: ["bash", "-c", "x"],
@@ -667,8 +631,7 @@ class TestFixtureWatcherArgvIsStable(unittest.TestCase):
         script = ws / "watch-tasks-stream.sh"
         script.write_text(body)
         pid = _spawn_detached(script, ws)
-        self.addCleanup(lambda: self.assertEqual(_group_members(pid), [], "fixture left a process behind"))
-        self.addCleanup(_kill_group, pid)
+        own_group(self, pid)
         return pid, str(script)
 
     def _samples(self, pid, n=6, gap=0.1):
@@ -793,10 +756,8 @@ class TestThroughTheProcessInspectionBoundary(Base):
     def _spawn(self, argv):
         # Own process group: the body keeps its shell resident, so teardown must
         # take the shell and its sleep child together and prove nothing is left.
-        p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             preexec_fn=os.setpgrp)
-        self.addCleanup(lambda: self.assertEqual(_group_members(p.pid), [], "fixture left a process behind"))
-        self.addCleanup(lambda: (_kill_group(p.pid), p.wait()))
+        p = popen_in_own_group(argv)
+        own_group(self, p.pid, reap=p.wait)
         import watcher_identity
         for _ in range(50):
             if watcher_identity.proc_argv_vector(p.pid) is not None:
