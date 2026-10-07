@@ -41,8 +41,7 @@ import { injectText, injectSilentContext } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
-import { GeminiBatchSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
-import { GeminiLiveTranscribeSTTProvider } from './gemini-live-transcribe-stt.js';
+import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
 import { attachMeetingDictation, createMeetingEntryGate } from './meeting-dictation.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {

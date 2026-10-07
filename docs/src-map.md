@@ -93,7 +93,6 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
 - **`gateway_serving.py`** — Shared owner for the `gateway-status.json` sidecar verdict.
-- **`gemini-live-transcribe-stt.ts`** — STTProvider for Gemini Transcribe Live (`gemini-3.5-transcribe-live`), used as bodhi's `whisperProvider` so meeting mode can run on bodhi's dictation (transcription) mode without an OpenAI key.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
