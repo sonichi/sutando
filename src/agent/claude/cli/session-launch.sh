@@ -306,6 +306,15 @@ resolve_claude_credential_proxy() {
   fi
 }
 
+# Appends --plugin-dir for each enabled skill's Claude plugin to SURFACE_ARGS.
+# Reads REPO, PY.
+add_skill_claude_plugins() {
+  declare -F skill_manifest_claude_plugins >/dev/null || return 0
+  while IFS= read -r -d '' _plugin_dir; do
+    SURFACE_ARGS+=(--plugin-dir "$_plugin_dir")
+  done < <(skill_manifest_claude_plugins "$REPO" "$PY")
+}
+
 # Any installed skill's manifest.json "config" block, forwarded the same way
 # every other env var in a caller's own env-args array is. Set-ness wins, not
 # non-emptiness: an explicit empty value must not be re-filled from a

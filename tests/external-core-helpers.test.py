@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Real helper receipts and guarded Codex launch without a provider or live workspace."""
-import hashlib
 import contextlib
 import io
 import runpy
@@ -131,15 +130,22 @@ exit 0
         args.update(kw)
         return helpers.validate(**args)
 
-    def global_logs(self):
-        result = {}
-        for name in ("core-input-watch.log", "core-heartbeat.log"):
-            path = Path("/tmp") / name
-            try:
-                result[name] = (path.stat().st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest())
-            except FileNotFoundError:
-                result[name] = None
-        return result
+    @contextlib.contextmanager
+    def helper_tripwire(self):
+        # Running helpers keep their loaded code; any new start of these copies marks this test's launch.
+        mark = self.base / "helper-restarted"
+        mark.unlink(missing_ok=True)
+        saved = {}
+        for name in helpers.SCRIPTS.values():
+            script = self.repo / "src" / name
+            saved[script] = script.read_bytes()
+            script.write_text("import pathlib\n"
+                              f"pathlib.Path({str(mark)!r}).open('a').write({name!r} + '\\n')\n")
+        try:
+            yield mark
+        finally:
+            for script, body in saved.items():
+                script.write_bytes(body)
 
     def launch(self, *extra, env=None):
         return subprocess.run(["bash", str(self.repo / "src/agent/start-cli.sh"), "--runtime", "codex",
@@ -228,14 +234,30 @@ exit 0
     def test_valid_launch_and_restart_do_not_manage_owned_helpers(self):
         processes = self.pair()
         identities = self.validate()
-        logs = self.global_logs()
-        for extra in [(), ("--restart",)]:
-            result = self.launch(*extra)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertTrue(self.core_mark.exists())
-            self.assertEqual(self.validate(), identities)
-            self.assertTrue(all(p.poll() is None for p in processes))
-            self.assertEqual(self.global_logs(), logs)
+        with self.helper_tripwire() as started:
+            for extra in [(), ("--restart",)]:
+                result = self.launch(*extra)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(self.core_mark.exists())
+                self.assertEqual(self.validate(), identities)
+                self.assertTrue(all(p.poll() is None for p in processes))
+                time.sleep(0.3)
+                self.assertFalse(started.exists(), started.read_text() if started.exists() else "")
+
+    def test_concurrent_writer_of_host_global_helper_logs_does_not_fail_launch(self):
+        stat, read_bytes, ticks = Path.stat, Path.read_bytes, iter(range(1, 10**6))
+        logs = {f"/tmp/core-{n}.log" for n in ("input-watch", "heartbeat")}
+
+        def fake_stat(path, *a, **kw):
+            if str(path) in logs:
+                return mock.Mock(st_mtime_ns=next(ticks), st_mode=0o100600)
+            return stat(path, *a, **kw)
+
+        def fake_read(path):
+            return str(next(ticks)).encode() if str(path) in logs else read_bytes(path)
+
+        with mock.patch.object(Path, "stat", fake_stat), mock.patch.object(Path, "read_bytes", fake_read):
+            self.test_valid_launch_and_restart_do_not_manage_owned_helpers()
 
     def test_no_schedule_reconcile_keeps_real_helpers_and_skips_installers(self):
         processes = self.pair()

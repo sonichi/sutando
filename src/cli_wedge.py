@@ -83,7 +83,8 @@ RETRY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
         ("http-529", r"\b529\b"),
         ("reconnecting", r"\breconnect(ing)?\b"),
         ("connection-error", r"\bconnection (error|reset|refused)\b"),
-        ("timeout", r"\btimed? ?out\b"),
+        # "timeout 1800s" / "timeout=30" is a setting, not a timeout.
+        ("timeout", r"\btimed ?out\b|\btime ?out\b(?!\s*[=:]?\s*\d+(?:\.\d+)?[a-z]*\b(?!\s+exceeded))"),
         # A CLI told to stop by its provider: every turn ends the same way while the clock
         # moves; only text tells this from work — and it must be a limit HIT, not one mentioned.
     )

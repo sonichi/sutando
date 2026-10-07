@@ -71,13 +71,8 @@ def _source(path: Path) -> str | None:
     return None
 
 
-def pending(workspace: Path | None = None, inbox: Path | str | None = None) -> list[dict]:
-    """[{id, source, priority, since}] in consumption order. A missing tasks/ dir is an empty queue;
-    one that exists but cannot be read raises (PermissionError and the rest), never reads as empty.
-
-    `inbox` is the directory the announcing watcher reads, when that is not the workspace's tasks/:
-    a pool worker's delivery folder, whose entries are sentinels (a name and nothing else). The
-    queue is what waits in THAT inbox; without it, the core's tasks/ is the queue."""
+def pending_files(workspace: Path | None = None, inbox: Path | str | None = None) -> list[Path]:
+    """The pending task files in consumption order; `pending` describes each. Raises like `pending`."""
     ws = workspace or resolve_workspace()
     tasks_dir = Path(inbox) if inbox else ws / "tasks"
     try:
@@ -91,8 +86,18 @@ def pending(workspace: Path | None = None, inbox: Path | str | None = None) -> l
         paths = [p for p in paths if p.name.endswith(".txt")]
         ready = ready_result_filenames(ws / "results", [p.name for p in paths])
         paths = [p for p in paths if p.name not in ready]
+    return sort_tasks_by_priority(paths)
+
+
+def pending(workspace: Path | None = None, inbox: Path | str | None = None) -> list[dict]:
+    """[{id, source, priority, since}] in consumption order. A missing tasks/ dir is an empty queue;
+    one that exists but cannot be read raises (PermissionError and the rest), never reads as empty.
+
+    `inbox` is the directory the announcing watcher reads, when that is not the workspace's tasks/:
+    a pool worker's delivery folder, whose entries are sentinels (a name and nothing else). The
+    queue is what waits in THAT inbox; without it, the core's tasks/ is the queue."""
     out = []
-    for p in sort_tasks_by_priority(paths):
+    for p in pending_files(workspace, inbox):
         try:
             since = int(p.stat().st_mtime)
         except OSError:

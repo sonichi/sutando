@@ -88,7 +88,11 @@ def who(workspace, *, runner=None) -> list:
 def resolve(workspace, name: str) -> str:
     """A label, an id or `core` to the recipient id; unknown names are refused,
     never guessed."""
-    roster = pr.load_roster(workspace)
+    return resolve_in(pr.load_roster(workspace), name)
+
+
+def resolve_in(roster, name: str) -> str:
+    """`resolve` against a roster snapshot the caller already read."""
     if roster is None:
         raise ValueError("no roster: this host has no pool to ask")
     try:
@@ -132,7 +136,8 @@ def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool,
 def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
         sleep=time.sleep, tier: str = "team", relayed_from: "str | None" = None) -> dict:
     ws = Path(workspace)
-    rid = resolve(ws, to)
+    roster = pr.load_roster(ws)     # one snapshot: the recipient is resolved and routed against it
+    rid = resolve_in(roster, to)
     sender = whoami()
     if rid == sender:
         raise ValueError("that is you")
@@ -148,7 +153,7 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
         # Routed here as well as by the watcher's own pass: the router is idempotent,
         # so whichever runs second reports `already` and delivers nothing twice.
         task = {"id": task_id, "source": SOURCE, "requested_worker": rid}
-        out["route"] = rt.route(ws, task)
+        out["route"] = rt.route(ws, task, roster)
     if wait_s > 0:
         out["reply"] = wait_for_reply(ws, task_id, wait_s, sleep=sleep)
     return out

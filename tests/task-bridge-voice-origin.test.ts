@@ -18,7 +18,7 @@ mkdirSync(RESULT_DIR, { recursive: true });
 const {
 	setVoiceSessionOrigin, getVoiceSessionOrigin, voiceTaskOrigin, resolveVoiceResultOrigin, forwardVoiceResultToOrigin, forwardVoiceResultToOwnerDm,
 	keepVoiceResultToDm, forwardOfflineVoiceResult, startResultWatcher, workTool, DM_ONLY_DELIVERY_NOTE, LEADING_REDIRECT_RE, DM_ONLY_RE,
-	_isDeliveredResult, _shouldFallthrough, _shouldRegisterTaskRow, _resultFileOps, _deliverOriginBoundResult,
+	_isDeliveredResult, _shouldFallthrough, _shouldRegisterTaskRow, _resultFileOps, _deliverOriginBoundResult, setVoiceTurnsProvider, logConversation,
 } = await import('../src/task-bridge.js');
 
 after(() => {
@@ -64,6 +64,56 @@ describe('setVoiceSessionOrigin — one origin per live client, opaque to the br
 		assert.match(readFileSync(join(TASK_DIR, `${t1.taskId}.txt`), 'utf-8'), /^channel_id: place-1$/m);
 		assert.match(readFileSync(join(TASK_DIR, `${t3.taskId}.txt`), 'utf-8'), /^channel_id: local-voice$/m);
 		for (const t of [t1, t2, t3]) rmSync(join(TASK_DIR, `${t.taskId}.txt`), { force: true });
+	});
+
+	it('a session that moves during the spoken-turn wait leaves the task with its own origin and words', async () => {
+		// The owner spoke just now and no utterance has landed, so the call waits. The first read
+		// of the session after the call began moves it: place-b's words appear in both the
+		// live turns and the conversation log.
+		mkdirSync(join(TMP, 'logs'), { recursive: true });
+		logConversation('user', 'words said in place a');
+		setVoiceSessionOrigin(origin('place-a'));
+		let moved = false;
+		let armed = false;
+		setVoiceTurnsProvider(() => {
+			if (armed && !moved) {
+				moved = true;
+				setVoiceSessionOrigin(origin('place-b'));
+				logConversation('user', 'words said in place b');
+			}
+			return moved
+				? { items: [{ role: 'user', content: 'words said in place b' }], pendingInput: '', lastUserSpeechAt: Date.now() }
+				: { items: [{ role: 'assistant', content: 'On it.' }], pendingInput: '', lastUserSpeechAt: Date.now() };
+		});
+		try {
+			const pending = delegate('origin probe across a move');
+			armed = true;
+			const t = await pending;
+			assert.equal(moved, true, 'the session moved while the call was in flight');
+			const body = readFileSync(join(TASK_DIR, `${t.taskId}.txt`), 'utf-8');
+			assert.equal(voiceTaskOrigin(t.taskId)?.target, 'place-a');
+			assert.match(body, /^channel_id: place-a$/m);
+			assert.doesNotMatch(body, /words said in place b/, 'none of the new session\'s words reach the task');
+			assert.match(body, /words said in place a/, 'the context is the one the task was asked in');
+			rmSync(join(TASK_DIR, `${t.taskId}.txt`), { force: true });
+		} finally {
+			setVoiceTurnsProvider(null);
+			setVoiceSessionOrigin(null);
+		}
+	});
+
+	it('a session that moves right after the call is made leaves the task with the origin it was asked from', async () => {
+		setVoiceSessionOrigin(origin('place-a'));
+		try {
+			const pending = delegate('origin probe immediate move');
+			setVoiceSessionOrigin(origin('place-b'));
+			const t = await pending;
+			assert.equal(voiceTaskOrigin(t.taskId)?.target, 'place-a');
+			assert.match(readFileSync(join(TASK_DIR, `${t.taskId}.txt`), 'utf-8'), /^channel_id: place-a$/m);
+			rmSync(join(TASK_DIR, `${t.taskId}.txt`), { force: true });
+		} finally {
+			setVoiceSessionOrigin(null);
+		}
 	});
 });
 
