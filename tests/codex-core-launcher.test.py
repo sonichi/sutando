@@ -653,6 +653,14 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
             f"  kickstart) printf '{{}}' > \"{state}\" ;;\n"
             "esac\n"
             "exit 0\n"))
+        if sys.platform != "darwin":
+            # The installer's self-test reads mtimes with BSD `stat -f %m`; GNU stat reads -f as --file-system.
+            self._write_exe("stat", (
+                "#!/bin/sh\n"
+                "if [ \"$1\" = -f ] && [ \"$2\" = %m ]; then\n"
+                f"  exec \"{sys.executable}\" -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))' \"$3\"\n"
+                "fi\n"
+                "exec /usr/bin/stat \"$@\"\n"))
         config = workspace / "hosts" / "test-host" / "crons.json"
         config.parent.mkdir(parents=True)
         config.write_text(json.dumps([{"name": "digest", "cron": "2 6 * * *", "prompt": "run"}]))
