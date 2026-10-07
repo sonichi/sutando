@@ -43,6 +43,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
+import { GeminiLiveTranscribeSTTProvider } from './gemini-live-transcribe-stt.js';
+import { attachMeetingDictation } from './meeting-dictation.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
 	if (process.platform === 'win32') {
@@ -431,6 +433,9 @@ function getPendingToolCalls(toolName?: string) {
 // Meeting mode state — persists across Gemini reconnects
 // =============================================================================
 let meetingActive = false;
+// Set once the session exists; null keeps the prompt-only meeting mode.
+let meetingDictation: ReturnType<typeof attachMeetingDictation> | null = null;
+const MEETING_ENTER_DELAY_MS = 1_500;
 // Third base mode (mirrors discord-voice PR #39: active ⊕ meeting ⊕ presenter,
 // mutually exclusive). Toggled via switch_mode("presenter"); previously the
 // prompt referenced a presenter_mode tool that only exists on installs with
@@ -480,6 +485,8 @@ function applyModeRequest() {
 		writeVoiceModeSentinel();
 		syncPresenterSentinel();
 		console.log(`${ts()} [Meeting] External request applied: mode=${wantPresenter ? 'presenter' : want ? 'meeting' : 'active'}`);
+		if (want) void meetingDictation?.enter().catch((err) => console.error(`${ts()} [MeetingDictation] enter failed: ${err?.message ?? err}`));
+		else void meetingDictation?.exit();
 	} catch {
 		// no request file or delete failed — both are fine (silent poll)
 	}
@@ -522,7 +529,7 @@ const switchModeTool: ToolDefinition = {
 		'Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode", "passive mode", or joins a meeting. ' +
 		'Call switch_mode("presenter") when user says "presenter mode on", "going live", "starting the talk", "the talk starts", or "I am on stage". ' +
 		'Call switch_mode("active") when user says "I need you", "come back", "active mode", "presenter mode off", "talk is done", or the meeting ends. ' +
-		'In meeting mode: listen to everything and track discussion internally, but produce ZERO audio output and do NOT call any other tools — unless explicitly addressed by name ("Sutando" or "hey Sutando").',
+		'In meeting mode you stop hearing the conversation: every sentence is transcribed into the meeting note automatically, and you come back when the user says "Sutando, come back", "meeting is over", "active mode" or "end meeting".',
 	parameters: z.object({
 		mode: z.enum(['active', 'meeting', 'presenter']).describe('"meeting" = silent note-taker, "presenter" = on-stage co-presenter (mutes notifications), "active" = normal assistant'),
 	}),
@@ -543,8 +550,14 @@ const switchModeTool: ToolDefinition = {
 		writeVoiceModeSentinel();
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
+			if (meetingDictation) {
+				// Enter after this result is delivered: results sent while transcribing are held until exit.
+				setTimeout(() => { meetingDictation?.enter().catch((err) => console.error(`${ts()} [MeetingDictation] enter failed: ${err?.message ?? err}`)); }, MEETING_ENTER_DELAY_MS);
+				return { status: 'meeting_mode', transcribing: true };
+			}
 			return { status: 'meeting_mode', instruction: 'You are now in meeting mode. Listen and track the discussion internally. Produce ZERO audio output unless someone says "Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key decisions, action items, and discussion points. When you exit meeting mode, call save_meeting_note with type "summary" for a final recap. Do not call work or any other tools unless explicitly addressed.' };
 		}
+		await meetingDictation?.exit();
 		if (mode === 'presenter') {
 			return { status: 'presenter_mode', say: 'Presenter mode on — notifications muted. Break a leg.', instruction: 'You are now in presenter mode (on-stage co-presenter). Notifications are muted for the audience. Follow the CO-PRESENTER protocol from your context for slide cues. Exit ONLY when the user says "presenter mode off", "talk is done", or "active mode" — then call switch_mode("active").' };
 		}
@@ -1113,6 +1126,11 @@ async function main() {
 		},
 	});
 
+	const meetingTranscriber = new GeminiLiveTranscribeSTTProvider({
+		apiKey: GEMINI_VOICE_API_KEY,
+		log: (m) => console.log(`${ts()} ${m}`),
+	});
+
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
 		userId: 'user',
@@ -1125,6 +1143,7 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		whisperProvider: meetingTranscriber,
 		// A lost upstream parks the session in UPSTREAM_LOST with the WS
 		// listener up; the redial paths below call recoverUpstream().
 		upstreamLossPolicy: 'hold',
@@ -1292,6 +1311,18 @@ async function main() {
 	});
 
 	sessionRef = session;
+	meetingDictation = attachMeetingDictation({
+		session: session as any,
+		provider: meetingTranscriber,
+		notePathFor: (today) => sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR),
+		onExitByVoice: () => {
+			meetingActive = false;
+			voiceWatchdogShadow.noteMeetingMode(false);
+			voiceRecoveryCoordinator?.noteMeetingMode(false);
+			writeVoiceModeSentinel();
+		},
+		log: (m) => console.log(`${ts()} ${m}`),
+	});
 
 	// Armed only with the full bodhi recovery surface; anything less falls
 	// back to shadow with a loud line (the design's capability-validation rule).
