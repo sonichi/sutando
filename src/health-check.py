@@ -64,6 +64,7 @@ from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
+import session_runtime  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_platform import (  # noqa: E402
     find_pids,
@@ -10116,18 +10117,7 @@ def _local_codex_core_target(target: "dict | None" = None) -> "dict | None":
     exists = _run_tmux(socket_path, "has-session", "-t", f"={session}")
     if exists is None or exists.returncode != 0:
         return None
-    runtime = _run_tmux(
-        socket_path,
-        "show-environment",
-        "-t",
-        f"={session}",
-        "SUTANDO_CORE_RUNTIME",
-    )
-    if (
-        runtime is None
-        or runtime.returncode != 0
-        or runtime.stdout.strip() != "SUTANDO_CORE_RUNTIME=codex"
-    ):
+    if session_runtime.read(session, lambda *a: _run_tmux(socket_path, *a)) != "codex":
         return None
     return target
 
@@ -10496,10 +10486,9 @@ def fix_claude_task_notifier() -> str:
         return "not repaired — the live Claude core session could not be verified"
     # The shared launcher injects --restart when the session records another
     # runtime, and spawns a new core when the heartbeat's process is gone.
-    recorded = _run_tmux(target["socket"], "show-environment", "-t", f"={target['session']}", "SUTANDO_CORE_RUNTIME")
-    if recorded is None or recorded.returncode != 0 or recorded.stdout.strip() != "SUTANDO_CORE_RUNTIME=claude":
-        seen = (recorded.stdout.strip() if recorded is not None and recorded.returncode == 0 else "unreadable")
-        return f"not repaired — the live core records a different runtime ({seen})"
+    recorded = session_runtime.read(target["session"], lambda *a: _run_tmux(target["socket"], *a))
+    if recorded != "claude":
+        return f"not repaired — the live core records a different runtime ({recorded or 'unreadable'})"
     core_pid = heartbeat.get("pid")
     if not isinstance(core_pid, int) or isinstance(core_pid, bool) or not _process_alive(core_pid):
         return f"not repaired — the heartbeat's core process (pid {core_pid}) is not running"
@@ -12427,15 +12416,9 @@ def _live_core_runtime(socket: str, sessions) -> "str | None":
     """
     seen = set()
     for sess in sessions:
-        res = _run_tmux(socket, "show-environment", "-t", f"={sess}",
-                        "SUTANDO_CORE_RUNTIME")
-        if res is None or res.returncode != 0:
-            continue
-        out = (res.stdout or "").strip()
-        if out.startswith("SUTANDO_CORE_RUNTIME="):
-            val = out.split("=", 1)[1].strip()
-            if val:
-                seen.add(val)
+        val = session_runtime.read(sess, lambda *a: _run_tmux(socket, *a))
+        if val:
+            seen.add(val)
     return seen.pop() if len(seen) == 1 else None
 
 

@@ -38,6 +38,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tmux_probe import has_session as _tmux_has_session  # noqa: E402
 import cli_wedge  # noqa: E402 — owns the core pane target and its capture
+import session_runtime  # noqa: E402 — the one reading of a session's runtime stamp
 from worker_auth_state import signed_in_since  # noqa: E402 — the one "signed in again" reading
 
 SESSION = "sutando-core"
@@ -532,9 +533,8 @@ def _pane_blocks_dispatch(workspace):
     try:
         from delivery import pane_gate
         sock = _tmux_socket()
-        rc, out = _run(["tmux", "-S", sock, "show-environment", "-t", f"={SESSION}", "SUTANDO_CORE_RUNTIME"])
-        runtime = out.strip().partition("=")[2] if rc == 0 and out.startswith("SUTANDO_CORE_RUNTIME=") else ""
-        adapter = pane_gate.ADAPTERS.get(runtime)
+        runtime = session_runtime.parse(*_run(["tmux", "-S", sock, *session_runtime.argv(SESSION)]))
+        adapter = pane_gate.ADAPTERS.get(runtime or "")
         target = cli_wedge.core_target(sock, SESSION)
         if adapter is None or target is None:
             return None
