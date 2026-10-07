@@ -548,6 +548,22 @@ def _run_shell_command(name: str, command: str, timeout_s: int = SHELL_COMMAND_T
 
 
 def emit_task(name: str, entry: dict) -> Path:
+    # A worker can claim between an ownership check and unlink: published
+    # payloads stay immutable until retired. Serialize emitters per job.
+    prefix = f"{cron_task_id.TASK_PREFIX}{_sanitize_name(name)}-"
+    with _state_lock(TASKS_DIR / f".{prefix}emit"):
+        pending = sorted(
+            (p for p in TASKS_DIR.glob(f"{prefix}*.txt")
+             if p.name[len(prefix):-4].isdigit()),
+            key=lambda p: int(p.name[len(prefix):-4]),
+        )
+        if pending:
+            print(f"cron-runner: coalesced {name!r} into outstanding {pending[0].stem}", file=sys.stderr)
+            return pending[0]
+        return _emit_new_task(name, entry)
+
+
+def _emit_new_task(name: str, entry: dict) -> Path:
     now_ms = int(time.time() * 1000)
     ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # A launchd cron either carries a direct `prompt` or a `prompt_skill`
@@ -556,7 +572,6 @@ def emit_task(name: str, entry: dict) -> Path:
         body_task = f"/{entry['prompt_skill']}"
     else:
         body_task = entry.get("prompt", "")
-    safe_name = _sanitize_name(name)
     task_id = cron_task_id.task_id(name, now_ms)
     # Defang forged header/fence lines in the (config-supplied) body, then place
     # `task:` last so a multi-line prompt body cannot forge the structured
@@ -572,24 +587,6 @@ def emit_task(name: str, entry: dict) -> Path:
         f"task: {body_task}\n"
     )
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    # Coalesce pending fires: if a prior emission for this same entry is still
-    # unconsumed (the core was down or busy), remove it before writing the new
-    # one, so a long outage leaves exactly ONE task per entry — the newest —
-    # instead of one file per missed slot (a */30 entry over a 6h outage would
-    # otherwise queue 12). Design converged with Chi + Sutando-Pro in #dev
-    # 2026-07-18. We keep the per-fire timestamped id (rather than a literally
-    # stable filename) so the orphan-check completion-marker contract
-    # (results/<id>.txt) is untouched — a consumed+archived result can never
-    # collide with a future fire's unique id. The suffix.isdigit() guard keeps
-    # the sweep from matching a different entry whose slug shares this prefix
-    # (e.g. cleaning "sync" must not delete "sync-workspace"'s pending task).
-    prefix = f"{cron_task_id.TASK_PREFIX}{safe_name}-"
-    for stale in TASKS_DIR.glob(f"{prefix}*.txt"):
-        if stale.name[len(prefix):-4].isdigit():
-            try:
-                stale.unlink()
-            except OSError:
-                pass
     path = TASKS_DIR / f"{task_id}.txt"
     # HMAC envelope (#3014 writer census): stamp at this writer's edge, fail-open
     # so a stamping error costs the stamp and never the fire.
@@ -598,7 +595,7 @@ def emit_task(name: str, entry: dict) -> Path:
         body = stamp_text(body, WORKSPACE)
     except Exception:
         pass
-    path.write_text(body)
+    _atomic_write_text(path, body)
     _emit_cron_telemetry()
     return path
 
