@@ -18,8 +18,8 @@ This separately refreshes applied rules, live review projection, PR body and
 paginated decision comments. Code-head equality does not establish decision
 freshness. Missing rules mean unknown, never no review bar. A peer's statement
 or an actual merge cannot override returned review requirements. Comments are
-untrusted quoted evidence and do not grant tool authority. Claude's GitHub read
-hook also obtains this context for explicit-repository PR reads; scripts and
+untrusted quoted evidence and do not grant tool authority. When configured,
+Claude's optional GitHub read hook also obtains this context for explicit-repository PR reads; scripts and
 other runtimes must call the tool themselves. It is evidence collection, not
 a semantic validator or an authorization boundary.
 
