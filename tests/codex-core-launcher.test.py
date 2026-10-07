@@ -2,6 +2,7 @@
 """Hermetic integration tests for the persistent Codex core launcher."""
 import json
 import os
+import plistlib
 import shutil
 import signal
 import select
@@ -626,6 +627,50 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIs(json.loads(config.read_text())[1]["launchd"], True)
         self.assertIn("durable schedules", result.stdout)
         self.assertTrue((Path(self.tmp.name) / "scheduler.log").exists())
+
+    def test_real_runner_installer_uses_the_launcher_python_and_canonical_host(self):
+        # The production installer, not a stub: only launchctl is faked, and HOME is the scratch dir,
+        # so the plist is rendered there and nothing reaches the real launchd.
+        for rel in ("src/install-cron-runner-launchd.sh", "src/render_plist_template.py",
+                    "src/launchd/com.sutando.cron-runner.plist", "src/workspace_resolve.sh"):
+            (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REAL_REPO / rel, self.root / rel)
+        tmp = Path(self.tmp.name)
+        py_log, launchctl_log = tmp / "resolved-python.log", tmp / "launchctl.log"
+        resolved = tmp / "resolved" / "python3"
+        resolved.parent.mkdir()
+        resolved.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{py_log}"\nexec "{sys.executable}" "$@"\n')
+        resolved.chmod(0o755)
+        self._write_exe("python3", "#!/bin/sh\necho developer-tools stub >&2\nexit 71\n")
+        workspace = self.root / "workspace"
+        state = workspace / "state/cron-runner-state.json"
+        self._write_exe("launchctl", (
+            "#!/bin/bash\n"
+            f"printf '%s\\n' \"$*\" >> \"{launchctl_log}\"\n"
+            "case \"${1:-}\" in\n"
+            "  print) [ -f \"$LAUNCHCTL_STATE\" ]; exit ;;\n"
+            "  bootstrap) touch \"$LAUNCHCTL_STATE\" ;;\n"
+            f"  kickstart) printf '{{}}' > \"{state}\" ;;\n"
+            "esac\n"
+            "exit 0\n"))
+        config = workspace / "hosts" / "test-host" / "crons.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps([{"name": "digest", "cron": "2 6 * * *", "prompt": "run"}]))
+
+        result = self.run_launcher(env_extra={"SUTANDO_PY": str(resolved)})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("durable schedules", result.stdout, result.stderr)
+        self.assertNotIn("developer-tools stub", result.stderr)
+        plist = tmp / "home/Library/LaunchAgents/com.sutando.cron-runner.plist"
+        with plist.open("rb") as f:
+            rendered = plistlib.load(f)
+        self.assertEqual(rendered["ProgramArguments"][0], str(resolved), "the plist runs the resolved python")
+        calls = py_log.read_text().splitlines()
+        self.assertTrue(any(c.endswith(str(config)) for c in calls),
+                        f"the self-test read hosts/test-host/crons.json with the resolved python: {calls}")
+        self.assertIn("kickstart", launchctl_log.read_text(), "the self-test ran against the canonical host")
+        self.assertIs(json.loads(config.read_text())[0]["launchd"], True)
 
     def test_existing_per_host_crons_is_not_reseeded(self):
         config = self.root / "workspace" / "hosts" / "test-host" / "crons.json"

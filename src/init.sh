@@ -93,23 +93,6 @@ create_dir_if_missing() {
   fi
 }
 
-# The legacy repo-side crons.json has one writer, which records its marker in Workspace state;
-# if it cannot run, nothing is written: an unmarked copy would read as a live schedule.
-install_cron_starter() {
-  local skill="$REPO/skills/schedule-crons" here writer py out
-  if [ -f "$skill/crons.json" ] || [ ! -f "$skill/crons.example.json" ]; then return 0; fi
-  here="$(cd "$(dirname "$0")" && pwd)"
-  writer="$skill/scripts/seed_crons.py"
-  [ -f "$writer" ] || writer="$here/../skills/schedule-crons/scripts/seed_crons.py"
-  . "$here/../scripts/python-binary.sh"
-  py="$(resolve_python "$REPO")"
-  if [ -n "$py" ] && out="$("$py" "$writer" --install-starter --skill-dir "$skill" --workspace "$WORKSPACE")"; then
-    case "$out" in installed*) echo "  ✓ created skills/schedule-crons/crons.json (from crons.example.json)";; esac
-  else
-    echo "  ⚠ skipped skills/schedule-crons/crons.json: its installer did not run" >&2
-  fi
-}
-
 # One-time migration of stale repo-root runtime state into $WORKSPACE. Fires
 # only when the migration sentinel is absent — same idempotent posture as
 # workspace_default.py's _migrate_from_legacy (PR #762). Non-destructive on
@@ -307,8 +290,8 @@ tier1() {
     "{\"connected\":false,\"ts\":$(date +%s)}
 "
 
-  # crons.json — the marked installer copy of the example, if present
-  install_cron_starter
+  # No repo-side crons.json: the per-host seed (seed_crons.py) derives a fresh install from
+  # crons.example.json, and a legacy copy made here would read as an owner's schedule.
 }
 
 # --- Tier 2: preflight (warn, don't block) ---

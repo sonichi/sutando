@@ -358,7 +358,7 @@ ensure_durable_schedules() {
   # while every custom schedule silently stops.
   [ "$(uname -s)" = "Darwin" ] || return 0
   have_launcher_python "durable schedule reconcile" || return 0
-  local preflight result service
+  local preflight result service host
   preflight="$("$_HB_PY" "$REPO/skills/schedule-crons/scripts/reconcile_launchd.py" --check)" || {
     echo "  ⚠ durable schedule preflight failed" >&2
     return 0
@@ -367,7 +367,13 @@ ensure_durable_schedules() {
     *"runner_needed=1"*)
       service="gui/$(id -u)/com.sutando.cron-runner"
       if ! launchctl print "$service" >/dev/null 2>&1; then
-        bash "$REPO/src/install-cron-runner-launchd.sh" >/dev/null 2>&1 || {
+        # The installer renders and self-tests with this launcher's interpreter and host label.
+        host="$(resolve_schedule_host)" || {
+          echo "  ⚠ durable schedule runner not installed: host label did not resolve" >&2
+          return 0
+        }
+        SUTANDO_PY="$_HB_PY" SUTANDO_HOST_LABEL="$host" \
+          bash "$REPO/src/install-cron-runner-launchd.sh" >/dev/null 2>&1 || {
           echo "  ⚠ durable schedule runner failed to install" >&2
           return 0
         }

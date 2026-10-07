@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""The per-host crons.json seed: source precedence, no overwrite, atomic publish."""
+"""The per-host crons.json seed: source precedence, no overwrite, crash-consistent publish."""
 import contextlib
-import hashlib
+import signal
 import importlib.util
 import io
 import json
@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -165,12 +165,6 @@ class FirstInstallOnlyTests(unittest.TestCase):
         self.assertNotIn("example-digest", names)
         self.assertEqual(self._entries()[0]["prompt_skill"], "proactive-loop")
 
-    def test_installer_marked_legacy_copy_is_a_first_install(self):
-        self.assertEqual(seed_crons.install_starter(self.ws, "h1", self.skill), "installed")
-        _, _, source = self._seed()
-        self.assertEqual(source, self.skill / "crons.json")
-        self.assertEqual([e["name"] for e in self._entries()], ["main-loop"])
-
     def test_unmarked_legacy_copy_of_the_current_example_is_copied_whole(self):
         shutil.copy(self.skill / "crons.example.json", self.skill / "crons.json")
         self._seed()
@@ -213,10 +207,6 @@ class FirstInstallOnlyTests(unittest.TestCase):
         # must not queue task-wake-briefing ahead of the owner's first message.
         self._seed()
         self.assertFalse(morning_catchup_due(self._entries(), self.afternoon))
-        seed_crons.install_starter(self.ws, "h1", self.skill)
-        self.target.unlink()
-        self._seed()
-        self.assertFalse(morning_catchup_due(self._entries(), self.afternoon))
 
     def test_unfiltered_seed_is_unchanged_for_the_claude_path(self):
         seed_crons.seed(self.ws, "h1", self.skill)
@@ -233,9 +223,8 @@ class FirstInstallOnlyTests(unittest.TestCase):
         self.assertEqual([e["name"] for e in self._entries()], ["main-loop"])
 
 
-
-class InstallProvenanceTests(unittest.TestCase):
-    """A starter is proven by the installer's marker, never by content: the four polarities."""
+class PolarityTests(unittest.TestCase):
+    """The whole rule: canonical -> no-op; legacy/interim -> whole; nothing -> main-loop from the example."""
 
     V01_DEMO = REPO / "tests/fixtures/schedule-crons/crons.example.2b45993b.json"
 
@@ -247,7 +236,6 @@ class InstallProvenanceTests(unittest.TestCase):
         self.skill.mkdir()
         shutil.copy(REPO / "skills/schedule-crons/crons.example.json", self.skill / "crons.example.json")
         self.legacy = self.skill / "crons.json"
-        self.marker = seed_crons.marker_path(self.ws, "h1")
         self.target = self.ws / "hosts" / "h1" / "crons.json"
         self.afternoon = datetime(2026, 10, 6, 13, 0)
 
@@ -260,46 +248,27 @@ class InstallProvenanceTests(unittest.TestCase):
     def _names(self, path=None):
         return [e["name"] for e in json.loads((path or self.target).read_text())]
 
-    # 1. marked + unchanged -> main-loop only
-    def test_marked_unchanged_starter_is_filtered_to_main_loop(self):
-        self.assertEqual(seed_crons.install_starter(self.ws, "h1", self.skill), "installed")
-        self.assertTrue(self.marker.exists())
+    def test_fresh_install_is_main_loop_only(self):
         status, _, source = self._seed()
-        self.assertEqual((status, source), ("seeded", self.legacy))
+        self.assertEqual((status, source), ("seeded", self.skill / "crons.example.json"))
         self.assertEqual(self._names(), ["main-loop"])
         self.assertFalse(morning_catchup_due(json.loads(self.target.read_text()), self.afternoon))
 
-    # 2. marked + modified -> whole
-    def test_marked_then_modified_is_preserved_whole(self):
-        seed_crons.install_starter(self.ws, "h1", self.skill)
-        entries = json.loads(self.legacy.read_text())
-        for e in entries:
-            if e["name"] == "morning-briefing":
-                e["cron"] = "30 7 * * *"
-        self.legacy.write_text(json.dumps(entries, indent=2))
-        before = self.legacy.read_bytes()
-        self._seed()
-        self.assertEqual(self.target.read_bytes(), before)
-        self.assertTrue(morning_catchup_due(json.loads(self.target.read_text()), self.afternoon))
+    def test_legacy_copy_of_the_current_example_is_preserved_whole(self):
+        # An older init.sh made exactly this copy, and older docs registered every entry from it.
+        shutil.copy(self.skill / "crons.example.json", self.legacy)
+        status, _, source = self._seed()
+        self.assertEqual((status, source), ("seeded", self.legacy))
+        self.assertEqual(self.target.read_bytes(), self.legacy.read_bytes())
+        self.assertEqual(len(self._names()), len(self._names(self.legacy)))
+        self.assertGreater(len(self._names()), 1)
 
-    def test_marked_then_reformatted_is_preserved_whole(self):
-        # Provenance is over bytes: any edit after marking makes the file the owner's.
-        seed_crons.install_starter(self.ws, "h1", self.skill)
-        self.legacy.write_text(json.dumps(json.loads(self.legacy.read_text())))
-        before = self.legacy.read_bytes()
-        self._seed()
-        self.assertEqual(self.target.read_bytes(), before)
-
-    # 3. unmarked historical / live -> whole (keweichen's v0.1-demo repro, review 5437822577)
     def test_unmarked_v0_1_demo_legacy_is_preserved_whole(self):
         shutil.copy(self.V01_DEMO, self.legacy)
         status, _, source = self._seed()
-        legacy_jobs = self._names(self.legacy)
-        canonical_jobs = self._names()
         self.assertEqual((status, source), ("seeded", self.legacy))
-        self.assertEqual(legacy_jobs, ["main-loop", "morning-briefing", "daily-insight",
-                                       "pending-questions", "sync-memory"])
-        self.assertEqual(canonical_jobs, legacy_jobs)
+        self.assertEqual(self._names(), ["main-loop", "morning-briefing", "daily-insight",
+                                         "pending-questions", "sync-memory"])
         self.assertEqual(self.target.read_bytes(), self.V01_DEMO.read_bytes())
 
     def test_unmarked_interim_v0_1_demo_is_preserved_whole(self):
@@ -309,9 +278,8 @@ class InstallProvenanceTests(unittest.TestCase):
         self._seed()
         self.assertEqual(self.target.read_bytes(), self.V01_DEMO.read_bytes())
 
-    # 4. existing canonical -> untouched
-    def test_existing_canonical_is_untouched_and_keeps_the_marker(self):
-        seed_crons.install_starter(self.ws, "h1", self.skill)
+    def test_existing_canonical_is_untouched_on_both_runtimes(self):
+        shutil.copy(self.skill / "crons.example.json", self.legacy)
         self.target.parent.mkdir(parents=True, exist_ok=True)
         self.target.write_text('[{"name": "owner-only", "cron": "0 9 * * *"}]')
         os.utime(self.target, (1_000_000, 1_000_000))
@@ -320,153 +288,79 @@ class InstallProvenanceTests(unittest.TestCase):
         self.assertEqual(self._seed(None), ("exists", self.target, None))
         self.assertEqual(self.target.read_bytes(), before)
         self.assertEqual(self.target.stat().st_mtime, 1_000_000)
-        self.assertTrue(self.marker.exists())
 
-    def test_marker_is_consumed_by_the_first_seed_on_either_runtime(self):
-        seed_crons.install_starter(self.ws, "h1", self.skill)
-        self._seed(None)  # Claude: whole copy, every entry gets registered
-        self.assertFalse(self.marker.exists())
-        self.assertEqual(self.target.read_bytes(), self.legacy.read_bytes())
+    def test_a_reseed_after_deleting_canonical_republishes_the_legacy_file_whole(self):
+        shutil.copy(self.skill / "crons.example.json", self.legacy)
+        self._seed(None)  # Claude: every entry gets registered
         self.target.unlink()
-        self._seed()  # activated once, so no longer provably a starter
+        self._seed()
         self.assertEqual(self.target.read_bytes(), self.legacy.read_bytes())
 
-    def test_a_malformed_or_foreign_marker_is_ambiguous(self):
-        raw = (self.skill / "crons.example.json").read_bytes()
-        good = hashlib.sha256(raw).hexdigest()
-        self.legacy.write_bytes(raw)
-        ident = seed_crons._identity(os.stat(self.legacy))
-        self.marker.parent.mkdir(parents=True)
-        for bad in ("{not json", '["x"]',
-                    json.dumps({"state": "activated", **ident, "sha256": good}),
-                    json.dumps({"state": seed_crons.MARKER_STATE, **ident, "sha256": "0" * 64}),
-                    json.dumps({"state": seed_crons.MARKER_STATE, **ident}),
-                    json.dumps({"state": seed_crons.MARKER_STATE, "sha256": good}),
-                    json.dumps({"state": seed_crons.MARKER_STATE, **ident, "ino": ident["ino"] + 1,
-                                "sha256": good})):
-            self.marker.write_text(bad)
-            self.target.unlink(missing_ok=True)
-            self._seed()
-            self.assertEqual(self.target.read_bytes(), raw, bad)
-
-    def test_control_a_well_formed_hand_written_marker_is_honoured(self):
-        # Proves the polarities above fail for the field they vary, not for the harness.
-        raw = (self.skill / "crons.example.json").read_bytes()
-        self.legacy.write_bytes(raw)
-        seed_crons._write_marker(self.marker, os.stat(self.legacy), raw)
-        self._seed()
-        self.assertEqual(self._names(), ["main-loop"])
-
-    def test_a_marker_does_not_vouch_for_another_source(self):
-        seed_crons.install_starter(self.ws, "h1", self.skill)
-        interim = self.ws / "crons" / "h1.json"
-        interim.parent.mkdir(parents=True)
-        shutil.copy(self.legacy, interim)
-        _, _, source = self._seed()
-        self.assertEqual(source, interim)
-        self.assertEqual(self.target.read_bytes(), interim.read_bytes())
-        self.assertTrue(self.marker.exists())
-
-    def test_source_is_read_once_and_classified_on_the_published_bytes(self):
-        seed_crons.install_starter(self.ws, "h1", self.skill)
-        real_read = seed_crons._read_source
+    def test_source_is_read_once_and_the_read_bytes_are_published(self):
+        shutil.copy(self.skill / "crons.example.json", self.legacy)
+        real_read = Path.read_bytes
         reads = []
 
-        def read_source(path):
-            result = real_read(path)
-            reads.append(path)
-            # A concurrent replacement after the read must not change the outcome.
-            self.legacy.write_text('[{"name": "owner-only"}]')
-            return result
+        def read_bytes(path):
+            data = real_read(path)
+            if path == self.legacy:
+                reads.append(path)
+                # A concurrent replacement after the read must not change what is published.
+                path.write_text('[{"name": "owner-only"}]')
+            return data
 
-        with mock.patch.object(seed_crons, "_read_source", read_source):
+        expected = self.legacy.read_bytes()
+        with mock.patch.object(Path, "read_bytes", read_bytes):
             self._seed()
         self.assertEqual(reads, [self.legacy])
-        self.assertEqual(self._names(), ["main-loop"])
+        self.assertEqual(self.target.read_bytes(), expected)
 
-    # Review 5438426255: the marker proves the exact published object, never equal bytes.
-    def test_publish_failure_leaves_no_marker_and_a_later_identical_copy_is_whole(self):
-        # keweichen's repro: install fails at publish, then a matching live copy appears.
-        with mock.patch.object(seed_crons, "_publish", side_effect=OSError("simulated publish failure")):
-            with self.assertRaisesRegex(OSError, "simulated publish failure"):
-                seed_crons.install_starter(self.ws, "h1", self.skill)
-        self.assertEqual((self.marker.exists(), self.legacy.exists()), (False, False))
-        shutil.copy(self.skill / "crons.example.json", self.legacy)
+    def test_no_installer_state_is_consulted_or_written(self):
         self._seed()
-        self.assertEqual(self._names(), self._names(self.legacy))
-        self.assertGreater(len(self._names()), 1)
-
-    def test_publish_failure_also_withdraws_a_stale_marker_from_an_earlier_attempt(self):
-        self.marker.parent.mkdir(parents=True)
-        self.marker.write_text('{"state": "%s"}' % seed_crons.MARKER_STATE)
-        with mock.patch.object(seed_crons, "_publish", side_effect=OSError("simulated publish failure")):
-            with self.assertRaises(OSError):
-                seed_crons.install_starter(self.ws, "h1", self.skill)
-        self.assertFalse(self.marker.exists())
-
-    def test_an_unknown_identical_writer_that_wins_is_unmarked_and_whole(self):
-        real_publish = seed_crons._publish
-
-        def racing_publish(target, content):
-            target.write_bytes(content)  # the unknown writer lands first, byte-identical
-            return real_publish(target, content)
-
-        with mock.patch.object(seed_crons, "_publish", racing_publish):
-            self.assertEqual(seed_crons.install_starter(self.ws, "h1", self.skill), "exists")
-        self.assertFalse(self.marker.exists())
-        self._seed()
-        self.assertEqual(self.target.read_bytes(), self.legacy.read_bytes())
-        self.assertGreater(len(self._names()), 1)
-
-    def test_an_equal_byte_replacement_with_another_inode_is_whole(self):
-        seed_crons.install_starter(self.ws, "h1", self.skill)
-        before = os.stat(self.legacy)
-        swap = self.skill / ".swap"
-        swap.write_bytes(self.legacy.read_bytes())
-        os.replace(swap, self.legacy)
-        self.assertNotEqual(os.stat(self.legacy).st_ino, before.st_ino)
-        self.assertTrue(self.marker.exists())
-        self._seed()
-        self.assertEqual(self.target.read_bytes(), self.legacy.read_bytes())
-        self.assertGreater(len(self._names()), 1)
-
-    def test_a_seed_started_between_link_and_marker_waits_and_sees_the_marked_copy(self):
-        real_write = seed_crons._write_marker
-        linked, release = threading.Event(), threading.Event()
-
-        def paused_write(marker, st, raw):
-            linked.set()
-            release.wait(30)
-            real_write(marker, st, raw)
-
-        def install():
-            with mock.patch.object(seed_crons, "_write_marker", paused_write):
-                seed_crons.install_starter(self.ws, "h1", self.skill)
-
-        installer = threading.Thread(target=install)
-        installer.start()
-        self.assertTrue(linked.wait(30))
-        self.assertTrue(self.legacy.exists())
-        self.assertFalse(self.marker.exists())
-        seeder = subprocess.Popen(
-            [sys.executable, str(SCRIPT), "--skill-dir", str(self.skill), "--workspace", str(self.ws),
-             "--host-label", "h1", "--first-install-only", "main-loop"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        try:
-            with self.assertRaises(subprocess.TimeoutExpired):
-                seeder.wait(1.5)  # blocked on the per-host lock, not racing ahead
-            self.assertFalse(self.target.exists())
-        finally:
-            release.set()
-            installer.join(30)
-        out, err = seeder.communicate(timeout=30)
-        self.assertEqual(seeder.returncode, 0, err)
-        self.assertIn(f"from {self.legacy}", out)
-        self.assertEqual(self._names(), ["main-loop"])
+        written = sorted(str(p.relative_to(self.ws)) for p in self.ws.rglob("*"))
+        self.assertEqual(written, ["hosts", "hosts/h1", "hosts/h1/crons.json"])
 
 
-class InstallStarterWriterTests(unittest.TestCase):
-    """The one writer of the marked legacy copy: a marker exists only for the copy this writer linked."""
+# The child pauses at one publish boundary, says so, and waits to be terminated.
+_CRASH_CHILD = r"""
+import importlib.util, os, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("seed_crons", sys.argv[1])
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+ws, skill, point, ready = Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], Path(sys.argv[5])
+
+def pause():
+    ready.write_text(point)
+    time.sleep(60)
+
+real_link, real_write = mod.os.link, Path.write_bytes
+if point == "before-publish":
+    real_publish = mod._publish
+    def publish(target, content):
+        pause(); return real_publish(target, content)
+    mod._publish = publish
+elif point == "mid-temp-write":
+    def write_bytes(path, data):
+        with open(path, "wb") as f:
+            f.write(data[: len(data) // 2]); f.flush()
+        pause()
+    Path.write_bytes = write_bytes
+elif point == "before-link":
+    def link(src, dst):
+        pause(); return real_link(src, dst)
+    mod.os.link = link
+elif point == "after-link":
+    def link(src, dst):
+        real_link(src, dst); pause()
+    mod.os.link = link
+mod.seed(ws, "h1", skill, first_install_only=("main-loop",))
+"""
+
+
+class CrashConsistencyTests(unittest.TestCase):
+    """SIGTERM at every publish boundary leaves no canonical file or a complete one; a retry completes it."""
+
+    POINTS = ("before-publish", "mid-temp-write", "before-link", "after-link")
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -474,121 +368,110 @@ class InstallStarterWriterTests(unittest.TestCase):
         self.ws = root / "ws"
         self.skill = root / "skill"
         self.skill.mkdir()
-        (self.skill / "crons.example.json").write_text('[{"name": "main-loop"}, {"name": "x"}]')
-        self.legacy = self.skill / "crons.json"
-        self.marker = seed_crons.marker_path(self.ws, "h1")
+        shutil.copy(REPO / "skills/schedule-crons/crons.example.json", self.skill / "crons.example.json")
+        self.target = self.ws / "hosts" / "h1" / "crons.json"
+        self.ready = root / "ready"
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _install(self):
-        return seed_crons.install_starter(self.ws, "h1", self.skill)
+    def _terminate_at(self, point):
+        self.ready.unlink(missing_ok=True)
+        child = subprocess.Popen([sys.executable, "-c", _CRASH_CHILD, str(SCRIPT), str(self.ws),
+                                  str(self.skill), point, str(self.ready)])
+        deadline = time.monotonic() + 30
+        while not self.ready.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(self.ready.exists(), f"child never reached {point}")
+        child.send_signal(signal.SIGTERM)
+        self.assertEqual(child.wait(30), -signal.SIGTERM)
 
-    def test_writes_a_byte_copy_and_a_marker_bound_to_its_inode(self):
-        self.assertEqual(self._install(), "installed")
-        raw = (self.skill / "crons.example.json").read_bytes()
-        st = os.stat(self.legacy)
-        self.assertEqual(self.legacy.read_bytes(), raw)
-        self.assertEqual(json.loads(self.marker.read_text()),
-                         {"state": seed_crons.MARKER_STATE, "dev": st.st_dev, "ino": st.st_ino,
-                          "birthtime": getattr(st, "st_birthtime", None),
-                          "sha256": hashlib.sha256(raw).hexdigest()})
-        self.assertTrue(seed_crons.is_marked_starter(self.marker, st, raw))
-        # Nothing mutable is written beside the copy in the replaceable engine tree.
-        self.assertEqual(sorted(p.name for p in self.skill.iterdir()), ["crons.example.json", "crons.json"])
-        self.assertEqual(self.marker, self.ws / "hosts/h1/state/crons-installer-seed.json")
-        self.assertEqual(sorted(p.name for p in self.marker.parent.iterdir()), [self.marker.name])
+    def _assert_nothing_or_complete(self, expected, point):
+        if self.target.exists():
+            self.assertEqual(self.target.read_bytes(), expected, point)
+        retry = seed_crons.seed(self.ws, "h1", self.skill, first_install_only=("main-loop",))
+        self.assertIn(retry[0], ("seeded", "exists"), point)
+        self.assertEqual(self.target.read_bytes(), expected, point)
+        return retry[0]
 
-    def test_the_copy_is_published_before_the_marker(self):
-        real_write = seed_crons._write_marker
-        seen = []
+    def _fresh_expected(self):
+        entries = json.loads((self.skill / "crons.example.json").read_text())
+        return (json.dumps([e for e in entries if e["name"] == "main-loop"], indent=2) + "\n").encode()
 
-        def write(marker, st, raw):
-            seen.append((self.legacy.exists(), os.stat(self.legacy).st_ino == st.st_ino))
-            real_write(marker, st, raw)
+    def test_fresh_install_terminated_at_each_boundary(self):
+        outcomes = {}
+        for point in self.POINTS:
+            with self.subTest(point=point):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                self._terminate_at(point)
+                existed = self.target.exists()
+                retry = self._assert_nothing_or_complete(self._fresh_expected(), point)
+                outcomes[point] = (existed, retry)
+                self.assertEqual([e["name"] for e in json.loads(self.target.read_text())], ["main-loop"])
+        # The sweep reaches both sides of the one durable step: before it nothing, after it the file.
+        self.assertEqual(outcomes, {"before-publish": (False, "seeded"), "mid-temp-write": (False, "seeded"),
+                                    "before-link": (False, "seeded"), "after-link": (True, "exists")})
 
-        with mock.patch.object(seed_crons, "_write_marker", write):
-            self._install()
-        self.assertEqual(seen, [(True, True)])
+    def test_legacy_source_terminated_at_each_boundary_is_never_filtered(self):
+        legacy = self.skill / "crons.json"
+        shutil.copy(self.skill / "crons.example.json", legacy)
+        for point in self.POINTS:
+            with self.subTest(point=point):
+                shutil.rmtree(self.ws, ignore_errors=True)
+                self._terminate_at(point)
+                self._assert_nothing_or_complete(legacy.read_bytes(), point)
+                self.assertGreater(len(json.loads(self.target.read_text())), 1)
 
-    def test_never_overwrites_and_never_marks_an_existing_file(self):
-        self.legacy.write_text('[{"name": "owner"}]')
-        self.assertEqual(self._install(), "exists")
-        self.assertEqual(self.legacy.read_text(), '[{"name": "owner"}]')
-        self.assertFalse(self.marker.exists())
+    def test_a_crash_leftover_temp_is_never_read_as_the_schedule(self):
+        self._terminate_at("before-link")
+        leftovers = [p.name for p in self.target.parent.iterdir()]
+        self.assertEqual(len(leftovers), 1)
+        self.assertRegex(leftovers[0], r"^\.crons\.json\.\d+\.tmp$")
+        self.assertEqual(seed_crons.seed(self.ws, "h1", self.skill)[0], "seeded")
 
-    def test_losing_the_race_to_different_bytes_writes_no_marker(self):
-        real_publish = seed_crons._publish
 
-        def racing_publish(target, content):
-            target.write_text('[{"name": "racer"}]')
-            return real_publish(target, content)
+class ConcurrentPublisherTests(unittest.TestCase):
+    """Concurrent seeders never clobber: exactly one publishes, the rest see a valid winner."""
 
-        with mock.patch.object(seed_crons, "_publish", racing_publish):
-            self.assertEqual(self._install(), "exists")
-        self.assertEqual(self.legacy.read_text(), '[{"name": "racer"}]')
-        self.assertFalse(self.marker.exists())
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.ws = root / "ws"
+        self.skill = root / "skill"
+        self.skill.mkdir()
+        shutil.copy(REPO / "skills/schedule-crons/crons.example.json", self.skill / "crons.example.json")
+        self.target = self.ws / "hosts" / "h1" / "crons.json"
 
-    def test_a_failed_marker_write_removes_exactly_the_copy_it_published(self):
-        with mock.patch.object(seed_crons.os, "replace", side_effect=OSError("simulated marker failure")):
-            with self.assertRaisesRegex(OSError, "simulated marker failure"):
-                self._install()
-        self.assertFalse(self.legacy.exists())
-        self.assertFalse(self.marker.exists())
-        self.assertEqual(list(self.marker.parent.iterdir()), [])
+    def tearDown(self):
+        self.tmp.cleanup()
 
-    def test_cleanup_never_removes_a_file_that_replaced_the_published_copy(self):
-        def write(marker, st, raw):
-            swap = self.skill / ".swap"
-            swap.write_text('[{"name": "owner"}]')
-            os.replace(swap, self.legacy)  # someone else's object now holds the name
-            raise OSError("simulated marker failure")
+    def _race(self, n, *extra):
+        argv = [sys.executable, str(SCRIPT), "--skill-dir", str(self.skill), "--workspace", str(self.ws),
+                "--host-label", "h1", *extra]
+        procs = [subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for _ in range(n)]
+        results = [(p.wait(60), *p.communicate()) for p in procs]
+        for rc, _, err in results:
+            self.assertEqual(rc, 0, err)
+        return [out.split()[0] for _, out, _ in results]
 
-        with mock.patch.object(seed_crons, "_write_marker", write):
-            with self.assertRaises(OSError):
-                self._install()
-        self.assertEqual(self.legacy.read_text(), '[{"name": "owner"}]')
-        self.assertFalse(self.marker.exists())
+    def test_concurrent_codex_seeders_publish_one_main_loop_file(self):
+        statuses = self._race(8, "--first-install-only", "main-loop")
+        self.assertEqual(sorted(statuses), ["exists"] * 7 + ["seeded"])
+        self.assertEqual([e["name"] for e in json.loads(self.target.read_text())], ["main-loop"])
+        self.assertEqual(sorted(p.name for p in self.target.parent.iterdir()), ["crons.json"])
 
-    def test_cleanup_tolerates_a_copy_that_already_vanished(self):
-        def write(marker, st, raw):
-            self.legacy.unlink()
-            raise OSError("simulated marker failure")
-
-        with mock.patch.object(seed_crons, "_write_marker", write):
-            with self.assertRaises(OSError):
-                self._install()
-        self.assertFalse(self.legacy.exists())
-
-    def test_missing_example_writes_nothing(self):
-        (self.skill / "crons.example.json").unlink()
-        with self.assertRaises(OSError):
-            self._install()
-        self.assertEqual(list(self.skill.iterdir()), [])
-        self.assertFalse(self.marker.exists())
-
-    def test_blank_host_label_is_refused_before_anything_is_written(self):
-        with self.assertRaisesRegex(ValueError, "host label did not resolve"):
-            seed_crons.install_starter(self.ws, " ", self.skill)
-        self.assertFalse(self.legacy.exists())
-        self.assertFalse(self.ws.exists())
-
-    def test_cli_install_starter_is_idempotent(self):
-        argv = [sys.executable, str(SCRIPT), "--install-starter", "--skill-dir", str(self.skill),
-                "--workspace", str(self.ws), "--host-label", "h1"]
-        first = subprocess.run(argv, capture_output=True, text=True)
-        self.assertEqual((first.returncode, first.stdout), (0, f"installed {self.legacy}\n"), first.stderr)
-        second = subprocess.run(argv, capture_output=True, text=True)
-        self.assertEqual((second.returncode, second.stdout), (0, f"exists {self.legacy}\n"))
-        self.assertTrue(self.marker.exists())
-
-    def test_cli_install_starter_without_an_example_fails_with_a_message(self):
-        (self.skill / "crons.example.json").unlink()
-        argv = [sys.executable, str(SCRIPT), "--install-starter", "--skill-dir", str(self.skill),
-                "--workspace", str(self.ws), "--host-label", "h1"]
-        result = subprocess.run(argv, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 1)
-        self.assertTrue(result.stderr.startswith("seed-crons: "), result.stderr)
+    def test_mixed_runtimes_racing_leave_one_valid_winner(self):
+        argv = [sys.executable, str(SCRIPT), "--skill-dir", str(self.skill), "--workspace", str(self.ws),
+                "--host-label", "h1"]
+        procs = [subprocess.Popen(argv + (["--first-install-only", "main-loop"] if i % 2 else []),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for i in range(8)]
+        outs = [p.communicate(timeout=60)[0] for p in procs]
+        self.assertEqual(sum(o.startswith("seeded") for o in outs), 1)
+        names = [e["name"] for e in json.loads(self.target.read_text())]
+        full = [e["name"] for e in json.loads((self.skill / "crons.example.json").read_text())]
+        self.assertIn(names, (["main-loop"], full))
 
 
 def _strict_env(home, **extra):
@@ -599,54 +482,43 @@ def _strict_env(home, **extra):
 
 
 class FreshInstallEndToEndTests(unittest.TestCase):
-    """#5157 at today's code: init.sh writes the marked copy, the Codex seed takes main-loop only."""
+    """#5157 at today's code: init.sh writes no legacy copy, so the Codex seed takes main-loop only."""
+
+    def _repo(self, root):
+        repo = root / "repo"
+        skill = repo / "skills/schedule-crons"
+        skill.mkdir(parents=True)
+        shutil.copy(REPO / "skills/schedule-crons/crons.example.json", skill / "crons.example.json")
+        ws = root / "ws"
+        env = _strict_env(root, SUTANDO_REPO=str(repo), SUTANDO_WORKSPACE=str(ws),
+                          SUTANDO_TEST_MODE="1", SUTANDO_PY=sys.executable, SUTANDO_HOST_LABEL="h1",
+                          CLAUDE_CONFIG_DIR=str(root / ".claude"))
+        return skill, ws, env
+
+    def _init_then_codex_seed(self, skill, ws, env):
+        init = subprocess.run(["bash", str(REPO / "src/init.sh"), "--auto"],
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(init.returncode, 0, init.stderr)
+        seed = subprocess.run(
+            [sys.executable, str(SCRIPT), "--skill-dir", str(skill), "--workspace", str(ws),
+             "--host-label", "h1", "--first-install-only", "main-loop"],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(seed.returncode, 0, seed.stderr)
+        return [e["name"] for e in json.loads((ws / "hosts/h1/crons.json").read_text())]
 
     def test_init_then_codex_seed_is_main_loop_only(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = root / "repo"
-            skill = repo / "skills/schedule-crons"
-            skill.mkdir(parents=True)
-            shutil.copy(REPO / "skills/schedule-crons/crons.example.json", skill / "crons.example.json")
-            ws = root / "ws"
-            env = _strict_env(root, SUTANDO_REPO=str(repo), SUTANDO_WORKSPACE=str(ws),
-                              SUTANDO_TEST_MODE="1", SUTANDO_PY=sys.executable, SUTANDO_HOST_LABEL="h1",
-                              CLAUDE_CONFIG_DIR=str(root / ".claude"))
-            init = subprocess.run(["bash", str(REPO / "src/init.sh"), "--auto"],
-                                  capture_output=True, text=True, env=env)
-            self.assertEqual(init.returncode, 0, init.stderr)
-            self.assertTrue(seed_crons.marker_path(ws, "h1").exists(), init.stdout + init.stderr)
-            seed = subprocess.run(
-                [sys.executable, str(SCRIPT), "--skill-dir", str(skill), "--workspace", str(ws),
-                 "--host-label", "h1", "--first-install-only", "main-loop"],
-                capture_output=True, text=True, env=env)
-            self.assertEqual(seed.returncode, 0, seed.stderr)
-            target = ws / "hosts/h1/crons.json"
-            self.assertEqual([e["name"] for e in json.loads(target.read_text())], ["main-loop"])
-            self.assertFalse(seed_crons.marker_path(ws, "h1").exists())
-
-    def test_init_writes_no_unmarked_copy_when_the_writer_fails(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            repo = root / "repo"
-            skill = repo / "skills/schedule-crons"
-            skill.mkdir(parents=True)
-            example = skill / "crons.example.json"
-            shutil.copy(REPO / "skills/schedule-crons/crons.example.json", example)
-            env = _strict_env(root, SUTANDO_REPO=str(repo), SUTANDO_WORKSPACE=str(root / "ws"),
-                              SUTANDO_TEST_MODE="1", SUTANDO_PY=sys.executable, SUTANDO_HOST_LABEL="h1",
-                              CLAUDE_CONFIG_DIR=str(root / ".claude"))
-            example.chmod(0)
-            try:
-                result = subprocess.run(["bash", str(REPO / "src/init.sh"), "--auto"],
-                                        capture_output=True, text=True, env=env)
-            finally:
-                example.chmod(0o644)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("skipped skills/schedule-crons/crons.json: its installer did not run",
-                          result.stderr)
+            skill, ws, env = self._repo(Path(tmp))
+            self.assertEqual(self._init_then_codex_seed(skill, ws, env), ["main-loop"])
             self.assertFalse((skill / "crons.json").exists())
-            self.assertFalse(seed_crons.marker_path(root / "ws", "h1").exists())
+
+    def test_init_then_codex_seed_keeps_an_upgraded_hosts_legacy_file_whole(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            skill, ws, env = self._repo(Path(tmp))
+            shutil.copy(skill / "crons.example.json", skill / "crons.json")  # an older init.sh's copy
+            names = self._init_then_codex_seed(skill, ws, env)
+            self.assertEqual(names, [e["name"] for e in json.loads((skill / "crons.json").read_text())])
+            self.assertGreater(len(names), 1)
 
 
 class DocumentedSkillCommandTests(unittest.TestCase):
@@ -744,8 +616,8 @@ class SeedErrorPathTests(unittest.TestCase):
             seed_crons.seed(self.ws, "h1", self.skill, first_install_only=("main-loop",))
         self.assertFalse(self.target.exists())
 
-    def test_unreadable_starter_makes_a_legacy_file_established(self):
-        # An example that does not parse cannot match, so the legacy file is copied whole.
+    def test_unreadable_starter_does_not_affect_a_legacy_file(self):
+        # A legacy file is never classified, so the example is not even parsed.
         (self.skill / "crons.example.json").write_text("{not json")
         (self.skill / "crons.json").write_text('[{"name": "a"}, {"name": "main-loop"}]')
         seed_crons.seed(self.ws, "h1", self.skill, first_install_only=("main-loop",))
@@ -754,13 +626,6 @@ class SeedErrorPathTests(unittest.TestCase):
     def test_invalid_json_legacy_is_copied_whole_under_the_filter(self):
         (self.skill / "crons.example.json").write_text('[{"name": "main-loop"}]')
         (self.skill / "crons.json").write_text("{broken")
-        _, _, source = seed_crons.seed(self.ws, "h1", self.skill, first_install_only=("main-loop",))
-        self.assertEqual(source, self.skill / "crons.json")
-        self.assertEqual(self.target.read_text(), "{broken")
-
-    def test_marked_legacy_that_is_not_json_is_copied_whole_under_the_filter(self):
-        (self.skill / "crons.example.json").write_text("{broken")
-        seed_crons.install_starter(self.ws, "h1", self.skill)
         _, _, source = seed_crons.seed(self.ws, "h1", self.skill, first_install_only=("main-loop",))
         self.assertEqual(source, self.skill / "crons.json")
         self.assertEqual(self.target.read_text(), "{broken")
@@ -850,18 +715,6 @@ class MainInProcessTests(unittest.TestCase):
                               "--first-install-only", "other")
         self.assertEqual(rc, 0)
         self.assertEqual(self._names(), ["main-loop", "other"])
-
-    def test_install_starter_with_flags_writes_the_marked_copy_without_consulting_config(self):
-        rc, out, err = self._main("--install-starter", "--workspace", str(self.ws), "--host-label", "h1")
-        self.assertEqual((rc, out, err), (0, f"installed {self.skill / 'crons.json'}\n", ""))
-        self.assertTrue(seed_crons.marker_path(self.ws.resolve(), "h1").exists())
-        self.assertEqual(self.config_calls, [])
-
-    def test_install_starter_resolves_its_marker_home_from_config(self):
-        rc, _, _ = self._main("--install-starter")
-        self.assertEqual(rc, 0)
-        self.assertEqual(self.config_calls, ["workspace", "host-label"])
-        self.assertTrue(seed_crons.marker_path(self.ws.resolve(), "h1").exists())
 
     def test_unresolved_workspace_fails_with_a_message(self):
         self.config["workspace"] = ""

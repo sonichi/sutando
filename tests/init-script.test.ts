@@ -30,7 +30,6 @@ function runInit(repoDir: string, mode?: '--auto' | '--preflight'): RunResult {
 			SUTANDO_REPO: repoDir,
 			SUTANDO_WORKSPACE: join(repoDir, '.workspace'),
 			SUTANDO_TEST_MODE: '1',  // v0.8: enable env-override-in-test escape hatch
-			SUTANDO_HOST_LABEL: 'h1',
 			HOME: repoDir + '/.fake-home',
 			CLAUDE_CONFIG_DIR: join(repoDir, '.fake-home', '.claude'),
 		},
@@ -156,35 +155,29 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 	});
 });
 
-describe('init.sh --auto (Tier 1: crons.json copy)', () => {
-	it('copies crons.example.json → crons.json when example exists and target is missing', () => {
+describe('init.sh --auto (Tier 1: no repo-side crons.json)', () => {
+	it('does not create skills/schedule-crons/crons.json from the example', () => {
+		// A repo-side copy is a legacy source the per-host seed must publish whole, so making one
+		// here turned every fresh install into a full starter schedule.
 		const exampleDir = join(scratch, 'skills', 'schedule-crons');
 		mkdirSync(exampleDir, { recursive: true });
 		writeFileSync(join(exampleDir, 'crons.example.json'), '[{"name":"foo","cron":"* * * * *"}]');
-		runInit(scratch, '--auto');
-		const body = readFileSync(join(exampleDir, 'crons.json'), 'utf-8');
-		assert.match(body, /"foo"/);
-		const marker = JSON.parse(readFileSync(join(workspace, 'hosts', 'h1', 'state', 'crons-installer-seed.json'), 'utf-8'));
-		assert.equal(marker.state, 'installer-seeded-not-activated', 'the copy carries its installer marker');
-		assert.equal(marker.ino, statSync(join(exampleDir, 'crons.json')).ino, 'the marker names the published inode');
-		assert.equal(existsSync(join(exampleDir, 'crons.json.installer-seed')), false, 'nothing mutable beside the copy');
+		const out = runInit(scratch, '--auto');
+		assert.equal(out.status, 0, `script exit non-zero: stderr=${out.stderr}`);
+		assert.equal(existsSync(join(exampleDir, 'crons.json')), false, 'no legacy copy is materialized');
+		assert.equal(existsSync(join(workspace, 'hosts')), false, 'and no per-host state is written for it');
+		assert.doesNotMatch(out.stdout + out.stderr, /crons\.json/);
 	});
 
-	it('does NOT copy when the target already exists', () => {
+	it('leaves an existing legacy crons.json byte-for-byte untouched', () => {
 		const exampleDir = join(scratch, 'skills', 'schedule-crons');
 		mkdirSync(exampleDir, { recursive: true });
 		writeFileSync(join(exampleDir, 'crons.example.json'), '[{"name":"example"}]');
 		writeFileSync(join(exampleDir, 'crons.json'), '[{"name":"my-custom"}]');
+		const before = statSync(join(exampleDir, 'crons.json'));
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(exampleDir, 'crons.json'), 'utf-8');
-		assert.match(body, /my-custom/);
-		assert.equal(existsSync(join(workspace, 'hosts', 'h1', 'state', 'crons-installer-seed.json')), false, 'an existing file is never marked');
-	});
-
-	it('skips silently when no example file exists (fresh template install case)', () => {
-		const out = runInit(scratch, '--auto');
-		assert.equal(out.status, 0);
-		assert.equal(existsSync(join(scratch, 'skills/schedule-crons/crons.json')), false);
+		assert.equal(readFileSync(join(exampleDir, 'crons.json'), 'utf-8'), '[{"name":"my-custom"}]');
+		assert.equal(statSync(join(exampleDir, 'crons.json')).mtimeMs, before.mtimeMs);
 	});
 });
 
