@@ -50,9 +50,12 @@ Stdlib only (urllib) — no new dependencies.
 from __future__ import annotations
 
 import atexit
+import glob
 import base64
+import hashlib
 import json
 import os
+import stat
 import uuid
 import re
 import shlex
@@ -294,10 +297,15 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
+from .result_markers import neutralize_markers
+from . import undelivered_quarantine
+from .proactive_routing import proactive_filename
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
-                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
+                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines,
+                             owner_mention_lines)
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
+from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
@@ -306,8 +314,10 @@ from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core.provider_ag2space import AG2SpaceResultProvider
 from .result_ready import read_ready_result
 from .dedup_recovery import plan_dedup_recovery
+from . import pool_record
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
+from .workspace_lock import _host_label as _stable_host_label
 
 TASKS_DIR = _task_dir()
 # Written by THIS bridge on replay, not by an agent — the guard must not
@@ -681,15 +691,15 @@ def _stage_durable(path: Path, text: str) -> "Path | None":
 
 
 def _publish_staged(tmp: Path, path: Path) -> bool:
-    """Rename a staged file into place and fsync the directory entry, so the
-    publication is durable the moment it becomes visible."""
+    """Rename a staged file into place and fsync the directory where supported."""
     try:
         os.replace(tmp, path)
-        dfd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        if os.name != "nt":
+            dfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         return True
     except Exception as exc:  # noqa: BLE001
         _log(f"durable publish failed for {path.name} ({exc})")
@@ -718,6 +728,7 @@ def _read_private_json(path: Path) -> "dict | None":
 
 def _gateway_owner() -> str:
     global _GATEWAY_OWNER_DM_HINT
+    _GATEWAY_OWNER_DM_HINT = ""  # a lookup that never reaches a row leaves no reading behind for the caller
     identity = _reenroll_identity()
     answer = _req("GET", "/v1/agents")
     agents = answer.get("agents") if isinstance(answer, dict) else None
@@ -910,10 +921,21 @@ def _match_review_decision(task: dict) -> "tuple[Path, dict, str] | None":
     return (*candidates[0], answer) if len(candidates) == 1 else None
 
 
+def _released_review_body(raw: str) -> str:
+    """Room text for an owner-released result. Markers are stripped, never executed:
+    the release posts to the original room only and uploads nothing."""
+    parsed = parse_markers(raw)
+    dropped = sum(1 for action in parsed.actions if action.kind == "attach")
+    if not dropped:
+        return parsed.body
+    note = f"({dropped} attachment{'' if dropped == 1 else 's'} not published)"
+    return f"{parsed.body}\n\n{note}" if parsed.body else note
+
+
 def _publish_review(path: Path, record: dict) -> bool:
     context = record.get("context") or {}
     room = str(context.get("channel_id") or "")
-    body = str(record.get("withheld_body") or "")
+    body = _released_review_body(str(record.get("withheld_body") or ""))
     if not room.startswith("!") or not body:
         record.update({"status": "publish_failed", "publish_error": "invalid origin/body",
                        "card_resolution_pending": True})
@@ -989,6 +1011,11 @@ def _handle_hitl_action(task: dict):
         return False
     if out == "rejected":
         return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
+    if out == "applied" and getattr(handler, "last_turn", False):
+        # Recorded, and the requirement asked for a turn: the same relay task goes on to
+        # the core (idempotent by id) with a header saying it is a click, not an order.
+        task["hitl_click"] = "true"
+        return False
     if out == "ignored" and getattr(handler, "last_branch", None) == "fallback":
         # A non-owner typed a label as a reply: that is a message, not a click
         # to decline; it must reach _write_task like any other text.
@@ -1130,9 +1157,19 @@ def _guarded_result_body(tid: str, body: str):
                 "source_message_id", "user_id")}
         except OSError:
             pass
+    # 5G ⑤a-cap: a TEAM task whose sidecar says task-media may attach from the DELIVERY
+    # task's `<results>/<id>/` (a dedup requeue carries the original's instruction).
+    attach_roots: tuple = ()
+    if tier == "team":
+        _delivery_for_media = _delivery_tid(tid)
+        _media_modes = _load_task_media() if _delivery_for_media is not None else None
+        if (_media_modes is not None
+                and (_media_modes.get(_broker_tid(_delivery_for_media)) or {}).get("mode")
+                == "task-media"):
+            attach_roots = (str(RESULTS_DIR / _delivery_for_media),)
     verdict = classify(
         body, tier, None, secret_filter=filter_chat_secrets,
-        scan_sensitive_data=scan_sensitive_data)
+        scan_sensitive_data=scan_sensitive_data, attach_roots=attach_roots)
     is_leak = verdict.kind == "leak"
     agent_id = _reenroll_identity()
     verdict = materialize(
@@ -1204,7 +1241,11 @@ def _project_hitl(log=print) -> int:
     calling this every pulse re-sends nothing; it is the driver that was
     missing, not the machinery.
     """
-    if not PROACTIVE_ROOM:
+    if GATEWAY_INSTANCE:
+        return 0  # only the primary gateway (launched without GATEWAY_INSTANCE) projects the owner's cards
+    room = resolve_destination(OWNER_PRIVATE)  # a runtime prompt is the owner's, whatever room raised it
+    if not room:
+        _held("the runtime prompt card")
         return 0
     if time.monotonic() < _HITL_BACKOFF["until"]:
         return 0
@@ -1226,7 +1267,7 @@ def _project_hitl(log=print) -> int:
         return 0
     try:
         done = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20),
-                       PROACTIVE_ROOM)
+                       room)
     except Exception:
         _hitl_backoff_bump(log)  # a raising sender is a refusal too
         raise
@@ -1313,6 +1354,104 @@ PROACTIVE_ROOM = (
 # Host-injected claim gate (Path -> bool), consulted per file before the claim
 # rename; None (standalone default) claims every routable file unchanged.
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+# Host-injected post-claim room gate ((original path, room) -> bool), consulted
+# on the CLAIMED body of a `proactive-result-*` naming a room; None allows all.
+PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
+# Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
+# connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
+_ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
+                  "held_logged": 0.0}
+ROUTING_REFRESH_S = 300.0
+ROUTING_RETRY_S = 30.0
+OWNER_PRIVATE = "owner_private"
+CURRENT_ROOM = "current_room"
+SELECTED_MEMBERS = "selected_members"
+SYSTEM = "system"
+
+
+def _routing_file() -> Path:
+    return _STATE / f"owner-routing{_INST_SUFFIX}.json"
+
+
+def _load_routing() -> None:
+    if _ROUTING["loaded"]:
+        return
+    _ROUTING["loaded"] = True
+    _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # what the in-memory reading is bound to
+    try:
+        d = json.loads(_routing_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    # another agent's reading, or this agent's reading from another gateway, authorizes nothing
+    if isinstance(d, dict) and d.get("identity") == _reenroll_identity() and d.get("gateway") == URL:
+        _ROUTING["owner_dm"] = _ROUTING["persisted"] = str(d.get("owner_dm") or "")
+
+
+def refresh_routing(force: bool = False) -> None:
+    """Pull the agent's routing state from the gateway. A failed refresh books a short retry, not the
+    window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk."""
+    _load_routing()
+    if not _ROUTING["identity"] and not _ROUTING["gateway"]:
+        _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # a reading set before any binding adopts this one
+    elif (_reenroll_identity(), URL) != (_ROUTING["identity"], _ROUTING["gateway"]):  # re-enrolled while running
+        _ROUTING.update(owner_dm="", persisted="", loaded=False)
+        _load_routing()
+        force = True
+    now = time.time()
+    if not force and now < _ROUTING["next"]:
+        return
+    try:
+        _gateway_owner()
+    except Exception:  # noqa: BLE001 - offline: the last known owner DM stands
+        _ROUTING["next"] = now + ROUTING_RETRY_S
+        return
+    if _GATEWAY_OWNER_DM_HINT:
+        _ROUTING["owner_dm"] = _GATEWAY_OWNER_DM_HINT
+    if _ROUTING["owner_dm"] and _ROUTING["owner_dm"] != _ROUTING["persisted"]:  # until durably published
+        try:
+            f = _routing_file(); f.parent.mkdir(parents=True, exist_ok=True)
+            tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({"identity": _reenroll_identity(), "gateway": URL,
+                                       "owner_dm": _ROUTING["owner_dm"]}), encoding="utf-8")
+            os.replace(tmp, f)
+            _ROUTING["persisted"] = _ROUTING["owner_dm"]
+        except OSError:
+            _ROUTING["next"] = now + ROUTING_RETRY_S  # in memory it holds; the write is retried soon
+            return
+    _ROUTING["next"] = now + (ROUTING_REFRESH_S if _ROUTING["owner_dm"] else ROUTING_RETRY_S)
+
+
+def _held(what: str) -> None:
+    """An owner-private message with no owner DM reading is held, and the log says so once per window."""
+    now = time.time()
+    if now - _ROUTING["held_logged"] >= ROUTING_REFRESH_S:
+        _ROUTING["held_logged"] = now
+        _log(f"holding {what}: no owner DM reading from the gateway yet (never the pinned room)")
+
+
+def resolve_destination(audience: str, *, room_id: str | None = None,
+                        recipients: list | None = None) -> str | list[str]:
+    """The one place an outbound room is chosen. OWNER_PRIVATE is the gateway's owner DM, the last
+    reading kept identity-bound on disk across restarts and outages; with no reading it is "" and the
+    caller holds the message, never the pinned room. CURRENT_ROOM is the triggering room;
+    SELECTED_MEMBERS are explicit recipients (the one list-valued audience); SYSTEM is the
+    configured destination. Eligibility is the instance, never the pin: only the primary (launched
+    without GATEWAY_INSTANCE) owns unaddressed nudges and projects cards."""
+    if audience == OWNER_PRIVATE:
+        refresh_routing()
+        return _ROUTING["owner_dm"]
+    if audience == CURRENT_ROOM:
+        return room_id or ""
+    if audience == SELECTED_MEMBERS:
+        return list(recipients or [])
+    if audience == SYSTEM:
+        return PROACTIVE_ROOM or ""
+    raise ValueError(f"unknown audience {audience!r}")
+
+
+def proactive_room() -> str:
+    """Owner-directed by default: a proactive message or an owner-private card goes to the owner."""
+    return resolve_destination(OWNER_PRIVATE)
 
 # Runtime self-report (#3279 verification layer 3): a host loader may inject
 # {build_sha, entrypoint} BEFORE exec'ing this source; standalone stays empty.
@@ -1588,8 +1727,28 @@ def _auth_probe() -> bool:
         return False
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
+_last_core_health: "dict | None" = None
 
-_TASK_FIELDS = ("id", "timestamp", "session_scope", "task", "source", "channel_id",
+_TASK_FIELDS = ("id", "timestamp", "session_scope",
+                # Both ahead of "task": the safe parser stops at the body, so a
+                # field written below it is invisible to every task-last reader.
+                "requested_worker", "priority",
+                # A card click already recorded in the HITL store, passed on for the turn it
+                # causes: the core answers [no-send] and lets its Stop hook do the work.
+                "hitl_click",
+                # Which worker-picker button was pressed. Above "task" for the same
+                # reason: worker_picker_commands reads it with the safe parser.
+                "picker_command", "picker_args",
+                # Also above "task": these carry the picker's authorization, and a
+                # task-last reader cannot see a field written below the body.
+                "source", "channel_id",
+                # Declares the task-mid shape (one-line body, writer-owned trailer) so a
+                # verified reader may trust the lines below task:. Above it: a body cannot claim it.
+                "task_layout",
+                # The broker's word that the message mentioned the owner, not this agent.
+                # Above "task" so the strict parser reads it and a body cannot claim it.
+                "owner_mentioned",
+                "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
                 "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
@@ -1598,9 +1757,10 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope", "task", "source", "channel_i
                 # reply echoing these back could name a thread it was not asked in.
                 "thread_root", "source_room_id",
                 # Room-membership context (gateway writer side, same contract):
-                # a capped one-line mxid list + the true joined total.
-                "room_members", "room_member_count",
-                "source_message_id", "user_id", "priority", "interaction_type",
+                # a capped one-line mxid list + the true joined total, and the
+                # broker's own dm|room verdict so a skill need not count members.
+                "room_members", "room_member_count", "channel_kind",
+                "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
                 "platform_card")
@@ -1618,9 +1778,8 @@ _INTERACTION_TYPES = frozenset({
 
 # Effective access is the lower of the broker-attested tier and the local cap.
 # Unset local policy defaults to owner; invalid values fail closed to guest.
-LOCAL_TIER = (_env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "owner").strip().lower()
-if LOCAL_TIER == "other":
-    LOCAL_TIER = "guest"
+LOCAL_TIER = local_task_protocol.canonical_access_tier(
+    _env_compat("REMOTE_TASK_TIER", "AG2_REMOTE_TIER") or "owner")
 if LOCAL_TIER not in ("owner", "team", "guest"):
     LOCAL_TIER = "guest"
 
@@ -1668,9 +1827,7 @@ _TIER_RANK = {"guest": 0, "team": 1, "owner": 2}
 
 
 def _normalized_tier(value):
-    tier = str(value or "").strip().lower()
-    if tier == "other":
-        tier = "guest"
+    tier = local_task_protocol.canonical_access_tier(value)
     return tier if tier in _TIER_RANK else "guest"
 
 _TIER_MAP_CACHE = {"path": None, "ident": None, "map": {}}
@@ -1702,9 +1859,9 @@ def _validate_tier_map(raw):
     tm = {}
     if isinstance(raw, dict):
         for who, tier in raw.items():
-            t = str(tier).strip().lower()
-            if isinstance(who, str) and t in ("owner", "team", "guest", "other"):
-                tm[who.strip()] = _normalized_tier(t)
+            t = local_task_protocol.canonical_access_tier(tier)
+            if isinstance(who, str) and t in _TIER_RANK:
+                tm[who.strip()] = t
     return tm
 
 
@@ -1905,8 +2062,12 @@ def _one_line(value) -> str:
     practice and a stray newline only ever indicates an injection attempt.
 
     Load-bearing: this producer does no body defanging, so the flatten is the
-    only thing stopping a field from forging a registered header line."""
-    return str(value).replace("\r", " ").replace("\n", " ")
+    only thing stopping a field from forging a registered header line.
+
+    Folds on str.splitlines()' own set, not on CR/LF: readers split with
+    splitlines(), so any narrower set leaves a separator that is one line to
+    the writer and two to the reader."""
+    return " ".join(str(value).splitlines())
 
 
 def _redact_url(value: str) -> str:
@@ -2287,17 +2448,452 @@ def _read_core_status() -> tuple[str | None, str | None]:
         return (None, None)
 
 
+_POOL_ADVERTISEMENT_FILE = _STATE / "pool-advertisement.json"
+# A roster row is ~100 bytes, so this is >10k workers; past it the loop would
+# re-read and re-parse a runaway file every pass before it can poll for tasks.
+_POOL_ADVERTISEMENT_MAX_BYTES = 1 << 20
+_workers_pushed_identity = ""
+_workers_push_retry_at = 0.0
+# The broker wants a report at least every 60 s (rows go stale at 120 s); the push only runs
+# between polls, which take up to POLL_WAIT + 10 s, so 20 s keeps the gap under 60 s.
+WORKERS_REFRESH_S = 20.0
+_workers_pushed_at: "float | None" = None
+_advertisement_unavailable_logged = False
+
+# 404/405/501 are the broker saying "this endpoint does not exist here"; every
+# other status is a live endpoint failing, which a short retry can clear.
+_UNSUPPORTED_ENDPOINT_STATUS = frozenset({404, 405, 501})
+
+
+def _read_pool_advertisement() -> "tuple[str, dict | None]":
+    """The pool's roster-derived advertisement -> (identity, record), or
+    ("", None) when the record is UNAVAILABLE — absent, unreadable, mid-write,
+    malformed, or carrying only one of its two halves.
+
+    The identity is a digest of the record's canonical content and is the ONE
+    change signal both publications key on. mtime is not: a restore that lands
+    below the prior file's mtime is new content the picker must see, and the
+    two halves keyed on different signals disagreed on exactly that record.
+
+    Availability is a tri-state, and None is the only "cannot read it" value: a
+    record whose maps are empty is AVAILABLE and means "the pool is empty", an
+    intentional clear the callers must push. Collapsing the two (the pre-fix
+    (0.0, {})) is what let a deleted or half-written file PUT a profile card
+    with no `workers`, and the broker REPLACES that document.
+
+    Both halves are validated from this one read so a one-sided record cannot
+    POST a status map whose labels never ship. This runs in the task loop
+    BEFORE the /v1/tasks poll and may never raise: the outer handler backs off
+    and retries the same file, so any exception here — a RecursionError from a
+    deeply nested value, not only OSError/ValueError — would stall intake for
+    as long as that file stays. The path is opened ONCE, non-blocking, and
+    everything is decided on that descriptor: a FIFO with no writer would park
+    a blocking open forever, and a size read from a second lookup can be
+    stale by the time the content is read, so the bound is enforced on the
+    bytes actually read (MAX+1: one more than allowed proves the overflow)."""
+    fd = -1
+    try:
+        fd = os.open(str(_POOL_ADVERTISEMENT_FILE), os.O_RDONLY | os.O_NONBLOCK)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ("", None)
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            data = fh.read(_POOL_ADVERTISEMENT_MAX_BYTES + 1)
+        if len(data) > _POOL_ADVERTISEMENT_MAX_BYTES:
+            return ("", None)
+        rec = json.loads(data.decode("utf-8"))
+        canonical = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+    except Exception:  # noqa: BLE001 — a parser/resource failure is UNAVAILABLE, never a stalled poll
+        return ("", None)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if not isinstance(rec, dict):
+        return ("", None)
+    if not isinstance(rec.get("workers"), dict):
+        return ("", None)
+    if not isinstance(rec.get("profile_workers"), dict):
+        return ("", None)
+    return (hashlib.sha256(canonical.encode()).hexdigest(), rec)
+
+
+def _advertisement_or_none() -> "tuple[str, dict | None]":
+    """_read_pool_advertisement, logging the availability edge once per edge so
+    an absent producer cannot fill the log at the loop's cadence."""
+    global _advertisement_unavailable_logged
+    identity, rec = _read_pool_advertisement()
+    if rec is None:
+        if not _advertisement_unavailable_logged:
+            _advertisement_unavailable_logged = True
+            _log(f"pool advertisement unavailable ({_POOL_ADVERTISEMENT_FILE.name}"
+                 " missing or unreadable) — keeping the last pushed pool state")
+    elif _advertisement_unavailable_logged:
+        _advertisement_unavailable_logged = False
+        _log("pool advertisement readable again")
+    return (identity, rec)
+
+
+def _defer_push(what: str, e: "urllib.error.HTTPError", now: float) -> float:
+    """The retry taxonomy both pushes share -> the absolute retry-at."""
+    if e.code in _UNSUPPORTED_ENDPOINT_STATUS:
+        _log(f"{what} deferred 1h: broker has no such endpoint (HTTP {e.code})")
+        return now + 3600
+    _log(f"{what} failed, retrying in 5m: endpoint exists, HTTP {e.code}")
+    return now + 300
+
+
+# The broker's copy is a replica: a broker restart empties it, and nothing on
+# our side changes, so resend both halves on a cadence even when unchanged.
+_REPUSH_EVERY_S = 600.0
+_last_full_push_at = 0.0
+_now = time.monotonic
+
+
+_PUSH_THREAD: "threading.Thread | None" = None
+_PUSH_LOCK = threading.Lock()
+# The profile PUT is unversioned and REPLACES the broker document, so a request
+# landing after a successor took the lock overwrites the successor's card.
+_OWNERSHIP_RELINQUISHED = threading.Event()
+
+
+def _publication_permitted() -> bool:
+    """False once ownership is being handed over: no request may START, because
+    its completion could land after a successor owns the document."""
+    return not _OWNERSHIP_RELINQUISHED.is_set()
+
+
+def _push_pool_advertisement() -> None:
+    """Hand the beat's publications to a daemon thread and return at once: both
+    requests carry 15 s timeouts and the intake poll must never wait on them.
+    A push still in flight from the last beat is left to finish; this beat's is
+    skipped, not queued, since the next beat re-reads the advertisement."""
+    global _PUSH_THREAD
+    with _PUSH_LOCK:
+        if _PUSH_THREAD is not None and _PUSH_THREAD.is_alive():
+            return
+        _PUSH_THREAD = threading.Thread(target=_push_pool_advertisement_now,
+                                        name="pool-advertisement", daemon=True)
+        _PUSH_THREAD.start()
+
+
+def _join_push_thread(timeout: float = 5.0) -> bool:
+    """A normal exit finishes the snapshot+card pair (bounded): the broker must
+    not be left holding a snapshot and a card from different revisions.
+
+    True when nothing is in flight — ownership may only be handed over then.
+    """
+    t = _PUSH_THREAD
+    if t is None or not t.is_alive():
+        return True
+    t.join(timeout)
+    return not t.is_alive()
+
+
+atexit.register(_join_push_thread)
+
+
+def _push_pool_advertisement_now() -> None:
+    """One read of the advertisement per beat, handed to BOTH publications:
+    two reads let a sibling writer's atomic rename land between them, and the
+    broker would then hold a snapshot and a card from different revisions."""
+    global _workers_pushed_identity, _profile_pushed_identity, _last_full_push_at
+    if _now() - _last_full_push_at >= _REPUSH_EVERY_S:
+        _workers_pushed_identity = ""
+        _profile_pushed_identity = ""
+        _last_full_push_at = _now()
+    try:
+        record = _advertisement_or_none()
+        _maybe_push_workers_snapshot(record)
+        _maybe_push_agent_profile(record)
+        _maybe_pull_worker_labels(record)
+    except Exception as e:  # noqa: BLE001 — a background push fails loudly, never silently
+        _log(f"pool advertisement push failed: {e}")
+
+
+def _workers_body(ad: dict) -> dict:
+    """The per-worker report when the record carries one: only it tells the broker
+    a worker is retired; the legacy snapshot has no per-worker state."""
+    rep = ad.get("report")
+    if isinstance(rep, dict) and isinstance(rep.get("workers"), list):
+        return rep
+    return ad["workers"]
+
+
+HEALTH_FIELDS = ("alive", "motion", "condition", "reason", "since")
+HEALTH_TTL_S = 15.0
+_health_cache: dict = {"at": None, "value": None, "error": None}
+
+
+def _health_snapshot() -> "dict | None":
+    """The workspace health summary, reused for HEALTH_TTL_S; None where the monorepo
+    src/ is absent or the snapshot fails, so a standalone sparrow reports no health."""
+    at = _health_cache["at"]
+    if at is not None and time.monotonic() - at < HEALTH_TTL_S:
+        return _health_cache["value"]
+    value, error = None, None
+    try:
+        src = _monorepo_src("health_snapshot.py")
+        if src:
+            if src not in sys.path:
+                sys.path.insert(0, src)
+            import health_snapshot
+            value = health_snapshot.snapshot(_STATE.parent)
+    except Exception as e:  # noqa: BLE001 — health is optional; it never breaks a push
+        error = f"{type(e).__name__}: {e}"
+    if error and error != _health_cache["error"]:
+        _log(f"health snapshot unavailable: {error}")
+    _health_cache.update(at=time.monotonic(), value=value, error=error)
+    return value
+
+
+def _health_row(agent: dict) -> dict:
+    """The wire row; the broker takes `reason` as a slug of [a-z0-9-]{1,40}."""
+    row = {k: agent.get(k) for k in HEALTH_FIELDS}
+    if row["reason"] is not None:
+        row["reason"] = re.sub(r"[^a-z0-9-]+", "-", str(row["reason"]).lower()).strip("-")[:40].strip("-") or None
+    return row
+
+
+def _core_health(snap: "dict | None") -> "dict | None":
+    core = next((a for a in (snap or {}).get("agents") or [] if a.get("role") == "core"), None)
+    return _health_row(core) if core else None
+
+
+def _with_health(body: dict, snap: "dict | None") -> dict:
+    """The report plus each worker's health and the pool suspension. The legacy body has
+    no worker rows, so it and a missing snapshot pass through unchanged."""
+    if snap is None or not isinstance(body.get("workers"), list):
+        return body
+    health = {a.get("id"): _health_row(a) for a in snap.get("agents") or [] if a.get("role") == "worker"}
+    rows = [{**r, "health": health[r["id"]]} if isinstance(r, dict) and r.get("id") in health else r
+            for r in body["workers"]]
+    return {**body, "workers": rows, "suspended": _suspended_row(snap.get("suspended"))}
+
+
+def _suspended_row(value) -> "dict | None":
+    """The pool suspension as summary fields: its reason a slug like any health reason."""
+    if not isinstance(value, dict):
+        return None
+    reason = _health_row({"reason": value.get("reason")})["reason"]
+    at = value.get("at")
+    numeric = isinstance(at, (int, float)) and not isinstance(at, bool)
+    return {"reason": reason or "suspended", "at": at if numeric else None}
+
+
+def _profile_host_id() -> str:
+    """The host's stable label: gethostname() drifts with the network (a DHCP lease renames
+    it). The monorepo src/ is put on the path first, so the label never depends on call order."""
+    src = _monorepo_src("util_paths.py")
+    if src and src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        return _stable_host_label()
+    except OSError:
+        return "unknown-host"
+
+
+def _maybe_push_workers_snapshot(record) -> bool:
+    """Push-on-change relay of the pool's workers snapshot (the worker
+    picker's read path). An unavailable advertisement pushes NOTHING and
+    leaves the broker holding the last snapshot we sent; an unsupported
+    endpoint backs the push off an hour and any other HTTP status 5m;
+    nothing here may ever break the task loop."""
+    global _workers_pushed_identity, _workers_push_retry_at, _workers_pushed_at
+    if not _publication_permitted():
+        return False
+    now = time.time()
+    if now < _workers_push_retry_at:
+        return False
+    identity, ad = record  # one read per beat, shared with the other publication
+    if ad is None:
+        return False
+    base = _workers_body(ad)
+    body = _with_health(base, _health_snapshot())
+    if body is not base:
+        # Health changes between advertisements, so it joins the change signal.
+        identity += ":" + hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+    # Only a body carrying health has the broker's 120 s staleness; others keep the 600 s re-push.
+    fresh = body is base or (_workers_pushed_at is not None and _now() - _workers_pushed_at < WORKERS_REFRESH_S)
+    if identity == _workers_pushed_identity and fresh:
+        return False
+    try:
+        _req("POST", "/v1/workers", body, timeout=15)
+    except urllib.error.HTTPError as e:
+        _workers_push_retry_at = _defer_push("workers-snapshot push", e, now)
+        return False
+    except Exception as e:  # noqa: BLE001 — relay must never kill the loop
+        _workers_push_retry_at = now + 300
+        _log(f"workers-snapshot push failed, retrying in 5m: {e}")
+        return False
+    _workers_pushed_identity = identity
+    _workers_pushed_at = _now()
+    _log("workers-snapshot pushed")
+    return True
+
+
+_profile_pushed_identity = ""
+_profile_push_retry_at = 0.0
+
+# The host injects this optional adapter before executing the standalone bridge.
+# AG2 Space owns overrides; the skill owns the roster.
+_WORKER_LABEL_APPLIER = globals().get("_SUTANDO_WORKER_LABEL_APPLIER")
+_PROFILE_LABEL_REFRESH_S = 60.0
+_profile_labels_checked_at = 0.0
+_profile_labels_retry_at = 0.0
+
+
+def _build_agent_profile(workers: "dict") -> "dict":
+    """The instance's identity card for PUT /v1/agents/{mxid}/profile.
+    Only instance-authoritative fields — appearance is user/platform-owned
+    and the broker drops it from instance PUTs anyway.
+
+    `workers` comes from an advertisement the caller already established is
+    AVAILABLE: the broker REPLACES the profile document, so this function must
+    never be reached with a map it could not read."""
+    name = (os.environ.get("SUTANDO_DISPLAY_NAME") or "Sutando").strip()
+    return {"display": {"name": name},
+            "host": {"host_id": _profile_host_id(), "kind": "local"},
+            "workers": workers}
+
+
+def _maybe_push_agent_profile(record) -> bool:
+    """Push-on-change relay of the agent's profile card. An unavailable
+    advertisement pushes NOTHING: the card carries the `workers` map the
+    picker draws and the broker REPLACES the document, so a card built from
+    a record we could not read would erase the pool. Same retry taxonomy as
+    the workers-snapshot push; nothing here may break the task loop."""
+    global _profile_pushed_identity, _profile_push_retry_at
+    if not _publication_permitted():
+        return False
+    now = time.time()
+    if now < _profile_push_retry_at:
+        return False
+    mxid = _reenroll_identity()
+    if not mxid:
+        return False  # identity may appear mid-episode; recheck next loop
+    identity, ad = record  # one read per beat, shared with the other publication
+    if ad is None:
+        return False
+    # The same record identity the workers push keys on, so the two halves
+    # can never disagree on whether a record is new; mxid may change mid-run.
+    key = f"{mxid}\n{identity}"
+    if key == _profile_pushed_identity:
+        return False
+    card = _build_agent_profile(ad["profile_workers"])
+    try:
+        _req("PUT", f"/v1/agents/{urllib.parse.quote(mxid, safe='')}/profile",
+             card, timeout=15)
+    except urllib.error.HTTPError as e:
+        _profile_push_retry_at = _defer_push("agent-profile push", e, now)
+        return False
+    except Exception as e:  # noqa: BLE001 — relay must never kill the loop
+        _profile_push_retry_at = now + 300
+        _log(f"agent-profile push failed, retrying in 5m: {e}")
+        return False
+    _profile_pushed_identity = key
+    _log(f"agent-profile pushed for {mxid}")
+    return True
+
+
+def _maybe_pull_worker_labels(record) -> bool:
+    """Apply explicit owner label overrides after our profile is published."""
+    global _profile_labels_checked_at, _profile_labels_retry_at
+    if not callable(_WORKER_LABEL_APPLIER) or not _publication_permitted():
+        return False
+    now = time.time()
+    if now < max(_profile_labels_retry_at,
+                 _profile_labels_checked_at + _PROFILE_LABEL_REFRESH_S):
+        return False
+    mxid = _reenroll_identity()
+    identity, ad = record
+    if not mxid or ad is None or _profile_pushed_identity != f"{mxid}\n{identity}":
+        return False
+    path = f"/v1/agents/{urllib.parse.quote(mxid, safe='')}/profile"
+    try:
+        profile = _req("GET", path, timeout=15)
+    except urllib.error.HTTPError as e:
+        _profile_labels_retry_at = _defer_push("worker-label read", e, now)
+        return False
+    except Exception as e:  # noqa: BLE001 — optional read cannot stop task intake
+        _profile_labels_retry_at = now + 300
+        _log(f"worker-label read failed, retrying in 5m: {e}")
+        return False
+
+    _profile_labels_checked_at = now
+    config = profile.get("config") if isinstance(profile, dict) else None
+    display = profile.get("display") if isinstance(profile, dict) else None
+    version = config.get("version") if isinstance(config, dict) else None
+    labels = display.get("worker_labels") if isinstance(display, dict) else None
+    if (not isinstance(profile, dict)
+            or type(profile.get("schema_version")) is not int
+            or profile.get("schema_version") != 1
+            or profile.get("mxid") != mxid or type(version) is not int
+            or version < 0 or not isinstance(labels, dict)
+            or len(labels) > 10000
+            or any(not isinstance(wid, str) or not _is_worker_id(wid)
+                   or not isinstance(label, str) or not label
+                   or label != label.strip() or len(label) > 120
+                   or any(ord(ch) < 32 or ord(ch) == 127 for ch in label)
+                   for wid, label in labels.items())):
+        _profile_labels_retry_at = now + 300
+        _log("worker-label read returned an invalid profile; keeping local labels")
+        return False
+    if _reenroll_identity() != mxid:
+        return False
+    try:
+        result = _WORKER_LABEL_APPLIER(labels, version, mxid)
+    except Exception as e:  # noqa: BLE001 — local pool may be absent or upgrading
+        _profile_labels_retry_at = now + 300
+        _log(f"worker-label apply failed, retrying in 5m: {e}")
+        return False
+    if isinstance(result, dict) and result.get("changed"):
+        _log(f"worker labels applied from owner profile config v{version}")
+    return True
+
+
+# The primary app checks every 30 minutes; the fallback checks every five.
+_HEALTH_REPORT_MAX_AGE = 35 * 60
+
+
+def _reported_core_status() -> tuple[str | None, str | None]:
+    """Overlay independent diagnostics without exporting their private details."""
+    status, step = _read_core_status()
+    if status in ("error", "offline"):
+        return status, step
+    try:
+        report = json.loads((_STATE / "agent-health.json").read_text())
+    except FileNotFoundError:
+        return status, step
+    except Exception:
+        return "unknown", "Health check unavailable"
+    try:
+        ts, total, failures = (report[k] for k in ("checked_at", "total", "failures"))
+        if (report.get("version") != 1 or type(ts) not in (int, float)
+                or not 0 <= time.time() - ts <= _HEALTH_REPORT_MAX_AGE
+                or type(total) is not int or total <= 0
+                or type(failures) is not int or not 0 <= failures <= total):
+            return "unknown", "Health check unavailable"
+        if failures:
+            return "error", f"Health check: {failures} failing check(s)"
+    except Exception:
+        return "unknown", "Health check unavailable"
+    return status, step
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
-    global _heartbeat_disabled, _last_heartbeat_at
+    global _heartbeat_disabled, _last_heartbeat_at, _last_core_health
     if _heartbeat_disabled:
         return False
     now = time.time()
-    if not force and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
+    health = _core_health(_health_snapshot())
+    changed = health is not None and health != _last_core_health
+    if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
-    _status, _step = _read_core_status()
+    _last_core_health = health
+    _status, _step = _reported_core_status()
     try:
         payload = {
             "client": "sutando-gateway-client",
@@ -2314,6 +2910,9 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             payload["status"] = _status
         if _step is not None:
             payload["step"] = _step
+        if health is not None:
+            payload["health"] = health
+            payload["capabilities"].append("worker_health.v1")
         _req("POST", "/v1/heartbeat", payload, timeout=10)
         return True
     except urllib.error.HTTPError as e:
@@ -2357,6 +2956,8 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "backoff_s": int(backoff_s),
             "error": _one_line(error) if error else None,
             "gateway": _redact_url(URL),
+            # Re-read on every write, so a lane switch or re-login shows at the next poll.
+            "agent_id": (_reenroll_identity() or None) if connected else None,
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
             "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
@@ -2612,12 +3213,13 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
 
 
 def _fsync_in_place(tid: str, *targets: Path) -> bool:
-    """fsync files (and directories) already on disk. A pre-durability writer
-    left these bytes uncommitted, so nothing may be claimed durable until this
-    lands; False when it did not."""
+    """Fsync existing files and directories where supported."""
     try:
         for target in targets:
-            fd = os.open(target, os.O_RDONLY)
+            if os.name == "nt" and target.is_dir():
+                continue
+            flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+            fd = os.open(target, flags)
             try:
                 os.fsync(fd)
             finally:
@@ -2639,6 +3241,25 @@ def _repair_pending_task(tid: str, task: dict) -> bool:
         return False
     return _record_task_media(tid, task)
 
+
+
+# Signal Room tasks (5G ⑤a-cap), AG2 Space adapter edge: names the ONE directory a
+# Team result may attach from; `attach_markers_confined` withholds anything else.
+def _signal_task_media_lines(media_dir: str) -> list[str]:
+    """Prose lines (no fence, no header-shaped line) appended after the Team
+    guardrail of a Signal Room task, naming the task's own media directory."""
+    output_q = shlex.quote(f"{media_dir}/<name>.png")  # a workspace path may hold spaces
+    return [
+        "",
+        "Signal Room media: this request came from a live Signal Room call. If it asks for "
+        "an image, illustration, chart or diagram, you MAY create ONE with the "
+        "image-generation skill (python3 skills/image-generation/scripts/generate.py "
+        f"--prompt \"...\" --output {output_q}), and you may save images you "
+        f"actually found. Save such files ONLY under {media_dir}/ (create the directory), "
+        f"then reference each on its own line as [file: {media_dir}/<name>.png] -- an "
+        "absolute path, up to 10 files. A file anywhere else is withheld from the room. "
+        "Write the prose answer first; a picture is garnish, never the answer.",
+    ]
 
 def _write_task(task: dict) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
@@ -2769,6 +3390,22 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                 _mh = local_task_protocol.media_attachment_headers(_media_refs, bool(_txt.strip()))
                 if _mh:
                     lines.extend(_mh.rstrip("\n").split("\n"))
+        elif f == "task_layout":
+            lines.append("task_layout: mid")
+        elif f == "owner_mentioned":
+            if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
+                lines.append("owner_mentioned: true")
+        elif f == "picker_args":
+            # Present-but-unusable is preserved as a refusing stamp, like
+            # picker_command: dropping it makes `add` + bad args a valid add.
+            if f in task:
+                pa = task[f]
+                if isinstance(pa, (dict, list)):
+                    # json.loads reads this, so re-serialize — _one_line would
+                    # emit a Python repr the reader cannot parse.
+                    lines.append(f"picker_args: {json.dumps(pa, separators=(',', ':'))}")
+                else:
+                    lines.append(f"picker_args: {'' if pa is None else _one_line(pa)}")
         elif f == "platform_card":
             # Signed platform-metadata pointer: re-serialize only the expected
             # subkeys as one compact JSON line (dict repr or extra keys never
@@ -2776,6 +3413,12 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
             if isinstance(pc, dict) and all(k in pc for k in _PLATFORM_CARD_KEYS):
                 card = {k: str(pc[k]) for k in _PLATFORM_CARD_KEYS}
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
+        elif f == "picker_command":
+            # Present but unusable (empty OR null) reaches the parser as a
+            # refused stamp; dropping it lets prose decide an unstamped action.
+            if f in task:
+                _pc = task[f]
+                lines.append(f"picker_command: {'' if _pc is None else _one_line(_pc)}")
         elif f in task and task[f] not in (None, ""):
             lines.append(f"{f}: {_one_line(task[f])}")
             # After id: so the canonical id-first / HMAC-stamp prefix stays line 0.
@@ -2794,6 +3437,10 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
             lines.append(engage_rulebook("room", AG2SPACE_PROVENANCE, f"results/{tid}.txt"))
         else:
             lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
+        # A relay-stamped Signal task may attach from ITS OWN output directory only;
+        # name it here (absolute) so the marker written is the one the guard confines.
+        if isinstance(task.get("signal"), dict):
+            lines.extend(_signal_task_media_lines(str(RESULTS_DIR / tid)))
     if sender_tier == "guest":
         lines.extend(sandboxed_delegation_lines(
             "AG2 Space", "GUEST tier", f"results/{tid}.txt",
@@ -2807,6 +3454,9 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         lines.extend(render_skill_prelude(
             _one_line(task.get("channel_id") or ""), CHANNEL_DIR, tid,
             _one_line(task.get("addressed_to") or "")))
+    # Last, after every tier block: it keeps their limits and replaces their reply step.
+    if task.get("owner_mentioned") == "true":
+        lines.extend(owner_mention_lines(f"results/{tid}.txt"))
     from .local_task_protocol import apply_task_stamper
     tmp = _stage_durable(dest, apply_task_stamper("\n".join(lines) + "\n"))
     if tmp is None:
@@ -3063,6 +3713,20 @@ _ORPHAN_MIN_AGE_S = 600
 # Filenames THIS process has already logged as claimed-empty, so a genuinely
 # orphaned nudge is noted once instead of on every pass. Discarded when the file
 _EMPTY_LOGGED: "set[str]" = set()
+_GATE_FAILED_LOGGED: "set[str]" = set()
+
+
+def _room_bound_result(name: str, room: "str | None") -> bool:
+    """A task-bridge voice result addressed to a room: a gate that fails on
+    one holds it, never delivers it unchecked."""
+    return name.startswith("proactive-result-") and room is not None
+
+
+def _gate_failed(name: str, exc: Exception) -> None:
+    if name not in _GATE_FAILED_LOGGED:
+        _GATE_FAILED_LOGGED.add(name)
+        _log(f"proactive {name} held: room gate failed ({exc}) — a room-bound "
+             "result is never delivered unchecked")
 
 # Bodies above this never fit a Matrix event, so they are undeliverable no
 # matter how often they are retried; they are dead-lettered instead of looping.
@@ -3101,6 +3765,26 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
     return ("send", None, parsed.body)
 
 
+def _own_homeserver() -> str:
+    """The server this lane's agent lives on, from its enrolled identity;
+    "" when the identity is unknown (then nothing below can discriminate)."""
+    mxid = _reenroll_identity()
+    # FIRST colon: the server part may itself carry a port or an IPv6 bracket.
+    return mxid.split(":", 1)[1] if mxid.startswith("@") and ":" in mxid else ""
+
+
+def _room_is_deliverable_here(room: str) -> bool:
+    """A gateway posts only to rooms on its own homeserver. Another lane's room
+    must be left for that lane: claiming it here fails at the gateway and the
+    retry budget then parks deliverable work as undeliverable."""
+    own = _own_homeserver()
+    if not own:
+        return True  # identity unknown: today's behaviour, deliberately
+    if ":" not in room:
+        return False  # names no server: deliverable nowhere, strands visibly
+    return room.split(":", 1)[1] == own
+
+
 def _record_proactive_receipt(item_id: str, room: str) -> None:
     """Durable "delivered where" for the proactive leg. The log line naming the
     room rotates; this outlives it. Fail-open: a receipt write must never
@@ -3111,16 +3795,6 @@ def _record_proactive_receipt(item_id: str, room: str) -> None:
     except Exception as e:  # noqa: BLE001 — receipt is best-effort by design
         _log(f"proactive receipt write failed for {item_id}: {e} "
              "(delivery unaffected)")
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True  # exists but not signalable — treat as alive
-    return True
 
 
 def _recover_orphan_proactive() -> None:
@@ -3212,7 +3886,9 @@ def _post_proactive() -> None:
     fail-open — one malformed nudge never blocks the rest. A file naming its own
     Matrix room is delivered whether or not PROACTIVE_ROOM is set; only a file
     with no target needs it. A host-injected PROACTIVE_CLAIM_GATE may defer a file
-    that belongs to another bridge (cross-bridge routing stays host policy)."""
+    that belongs to another bridge (cross-bridge routing stays host policy); a
+    PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
+    peek may have read a body still being written."""
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
@@ -3222,16 +3898,24 @@ def _post_proactive() -> None:
             continue  # racing consumer already claimed it
         if route == "foreign":
             continue
+        if route == "send" and peek_room is not None and not _room_is_deliverable_here(peek_room):
+            continue  # another homeserver's lane owns it; a claim here can only park it
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
-        if route == "send" and peek_room is None and not PROACTIVE_ROOM:
+        if route == "send" and peek_room is None and GATEWAY_INSTANCE:
+            continue  # a named secondary never owns unaddressed nudges; the primary runs without GATEWAY_INSTANCE
+        if route == "send" and peek_room is None and not proactive_room():
+            _held(f"owner-directed {f.name}")
             continue
         if PROACTIVE_CLAIM_GATE is not None:
             try:
                 if not PROACTIVE_CLAIM_GATE(f):
                     continue  # another bridge's file right now; retry next pass
-            except Exception:
-                pass  # a broken gate must not strand owner nudges — claim
+            except Exception as exc:  # noqa: BLE001
+                # A plain owner nudge still claims; a room-bound result waits for the gate.
+                if _room_bound_result(f.name, peek_room):
+                    _gate_failed(f.name, exc)
+                    continue
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
         claim = f.with_suffix(f".sending.{os.getpid()}")
@@ -3255,14 +3939,30 @@ def _post_proactive() -> None:
                      f"owner nudge stranded under live pid until restart")
             continue
         if route == "foreign" or (
-                route == "send" and room_override is None and not PROACTIVE_ROOM):
-            # Hand back rather than eat: a foreign target seen only post-claim,
-            # or one that vanished with no default (room_id=None loses the body).
+                route == "send" and room_override is not None
+                and not _room_is_deliverable_here(room_override)) or (
+                route == "send" and room_override is None and (GATEWAY_INSTANCE or not proactive_room())):
+            # Hand back rather than eat: a foreign target seen only post-claim, or one that vanished
+            # and left an unaddressed body this instance may not own or cannot place.
             try:
                 claim.rename(f)
             except OSError:
                 pass
             continue
+        if PROACTIVE_ROOM_GATE is not None and route == "send" and _room_bound_result(f.name, room_override):
+            try:
+                allowed = PROACTIVE_ROOM_GATE(f, room_override)
+            except Exception as exc:  # noqa: BLE001
+                _gate_failed(f.name, exc)
+                allowed = False
+            if not allowed:
+                # Hand back under its own name: the claim gate holds it from here.
+                try:
+                    claim.rename(f)
+                except OSError:
+                    pass
+                continue
+            _GATE_FAILED_LOGGED.discard(f.name)
         if route == "drop":
             # Skip marker ([no-send]/[REPLIED]/[deduped:]) — the protocol says
             # archive silently, deliver nothing. Nothing was delivered, so on
@@ -3294,7 +3994,7 @@ def _post_proactive() -> None:
                  "— dead-lettering, it can never be delivered")
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
-        dest_room = room_override or PROACTIVE_ROOM
+        dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
         try:
             resp = _req("POST", "/v1/room",
                         {"op": "message",
@@ -3447,26 +4147,243 @@ def _delivery_core() -> DeliveryCore:
 def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
     """Move a result the outbox has finally refused into results/undelivered/,
     the same quarantine the proactive path uses. Without this the file is
-    rescanned every pass and the refusal is invisible."""
+    rescanned every pass and the refusal is invisible.
+
+    The printed command must carry BOTH ids on a named instance: the record is
+    keyed by the broker id and the body file by the local one, so neither alone
+    recovers both halves.
+    """
     try:
-        UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        rfile.rename(UNDELIVERABLE_RESULTS_DIR /
-                     f"{rfile.stem}-{int(time.time())}.txt")
+        undelivered_quarantine.quarantine(rfile, RESULTS_DIR)
         _log(f"result {tid}: {why} — quarantined to "
-             f"{UNDELIVERABLE_RESULTS_DIR.name}/, it will NOT be re-sent")
+             f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
+             f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
+             f"requeue {_broker_tid(tid)} "
+             f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
     except OSError as e:
         _log(f"result {tid}: {why} but quarantine failed ({e}) — "
              "leaving it in place")
 
 
-def _worker_of(task_id: str) -> str:
-    """Which pool worker finished this task, read from the per-core done-flag.
-    `task_id` is the result stem, which already carries the `task-` prefix."""
+def _is_worker_id(value: str) -> bool:
+    """The pool's instance-id grammar, restated here for the same reason the
+    path conventions below are: this package cannot import the optional skill
+    that owns it. `core` is not a worker and never satisfies this."""
+    return len(value) == 32 and all(c in "0123456789abcdef" for c in value)
+
+
+def _assigned_worker(task_id: str) -> str:
+    """Which pool worker this task was ASSIGNED to, read from the router's
+    assignment record. Provenance is fixed before the task runs, so it does
+    not depend on the worker finishing, on residue surviving, or on the
+    producer remembering to stamp itself.
+
+    Path convention (state/attribution/<task_id>) is owned by the pool's own
+    recorder in an optional local skill this standalone PyPI package cannot
+    import or name (docs/architecture-boundaries.md, "Optional adapter
+    capabilities") — the same arrangement _worker_of() has with the done-flag
+    writer. tests/gateway-result-worker-attribution.test.py builds its
+    fixtures through that recorder's own path function, so a drift fails a
+    test instead of silently losing attribution.
+
+    FAILS CLOSED, for the reason _worker_of does: a wrong worker id labels a
+    reply with another worker's identity. Anything unreadable, not a regular
+    file, or outside the instance-id grammar yields "" rather than a guess.
+    """
+    if not task_id or "/" in task_id or task_id in (".", ".."):
+        return ""
+    path = _STATE / "attribution" / task_id
     try:
-        hits = sorted((_STATE / "cores").glob(f"*/done/{task_id}.flag"))
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return ""  # unreadable: no reading, not "never assigned"
+    if not stat.S_ISREG(st.st_mode):
+        return ""  # malformed record the recorder would itself refuse
+    try:
+        value = path.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
-    return hits[0].parent.parent.name if len(hits) == 1 else ""
+    return value if _is_worker_id(value) else ""
+
+
+# The core is a delivery recipient like any worker, but the router records
+# attribution only for workers — so a core sentinel with no record is normal.
+_CORE_RECIPIENT = "core"
+_DELIVERY_SUFFIXES = (".txt", ".accepted", ".claimed")
+
+
+def _delivery_recipient(task_id: str) -> tuple[str, bool]:
+    """`(recipient, blind)` — which worker this task was DELIVERED to, read
+    from the pool's delivery sentinel. Used ONLY to tell "this was a worker's
+    task" from "this was the core's" when attribution is missing — never as an
+    attribution source.
+
+    Path convention (deliveries/<recipient>/<task_id>.{txt,accepted,claimed})
+    is owned by the pool's own delivery writer, an optional local skill this
+    standalone package cannot import or name; the test builds its fixtures
+    through that writer so a drift fails there instead of silently reading
+    nothing, and asserts this module's recipient/suffix constants still cover
+    what that writer produces.
+
+    The core NEVER counts as a claimant: the router writes a sentinel for every
+    recipient but records attribution only for workers, so "core sentinel, no
+    record" is the ordinary shape of a task the core answered itself, not an
+    invariant violation.
+
+    `blind` is the second outcome because a read failure and "never delivered"
+    are different facts that both have no recipient, and the caller WITHHOLDS on
+    one and sends on the other. Logging the difference was not enough: the send
+    decision could not see a log. An ABSENT tree is not blind — a host with no
+    pool has no deliveries dir, and that is knowledge, not failure.
+    """
+    if not task_id or "/" in task_id or task_id in (".", ".."):
+        return "", False
+    root = _STATE.parent / "deliveries"
+    try:
+        recipients = sorted(p.name for p in root.iterdir())
+    except FileNotFoundError:
+        return "", False
+    except OSError as exc:
+        _log(f"attribution: cannot read {root} ({type(exc).__name__}) - the "
+             f"delivery discriminator is BLIND for {task_id}, which is not the "
+             f"same as this task never having been delivered.")
+        return "", True
+    claimants = set()
+    for name in recipients:
+        if name == _CORE_RECIPIENT:
+            continue
+        for suffix in _DELIVERY_SUFFIXES:
+            try:
+                st = os.lstat(root / name / f"{task_id}{suffix}")
+            except (FileNotFoundError, NotADirectoryError):
+                # Reading through a stray file at the root raises
+                # NotADirectoryError: a non-recipient, not a read failure.
+                continue
+            except OSError as exc:
+                _log(f"attribution: cannot read delivery sentinel for "
+                     f"{task_id} under {name} ({type(exc).__name__}) - the "
+                     f"delivery discriminator is BLIND for this task, which is "
+                     f"not the same as it never having been delivered.")
+                return "", True
+            if not stat.S_ISREG(st.st_mode):
+                # Malformed, not unreadable: the writer would never make one,
+                # so this is refusal to believe it, not absence of a reading.
+                return "", False
+            claimants.add(name)
+            break
+    if len(claimants) == 1:
+        return claimants.pop(), False
+    if claimants:
+        # Sentinels under several recipients prove a worker owned this task
+        # without saying which, which is the refusal condition, not its absence.
+        _log(f"attribution: {task_id} has delivery sentinels under "
+             f"{len(claimants)} recipients ({', '.join(sorted(claimants))}) - "
+             f"ownership is AMBIGUOUS, so refusing rather than relaying a "
+             f"worker's reply as the core's own.")
+        return "", True
+    return "", False
+
+
+def _attribution(task_id: str) -> tuple[str, bool]:
+    """`(worker, refused)` for one result: assignment truth first, completion
+    residue only as the migration fallback.
+
+    A task routed before assignment records existed has none, so residue still
+    answers for it; once no such task is in flight the residue arm can go. A
+    result with residue but no assignment record is precisely the anomaly the
+    assignment store exists to surface — an author nobody recorded at routing
+    time — so it is logged rather than passed over.
+
+    `refused` is the second outcome, and it is why this returns a pair: a
+    worker's result with no attribution and an ordinary core result BOTH have
+    no worker id, so a bare "" cannot tell a caller to withhold one and send
+    the other. Refused means the sentinel proves a worker owned the task while
+    nothing recorded who — publishing it would relay a worker's reply as the
+    core's own.
+    """
+    assigned = _assigned_worker(task_id)
+    if assigned:
+        return assigned, False
+    residue = _worker_of(task_id)
+    if residue:
+        _log(f"attribution: {task_id} has no assignment record; using "
+             f"completion residue ({residue}). Assignment-time recording "
+             f"did not run for this task.")
+        return residue, False
+    # FAILS CLOSED, LOUDLY. A delivery sentinel proves this was a worker's task,
+    # so silence here would relay it as if the core had produced it.
+    delivered, blind = _delivery_recipient(task_id)
+    if blind:
+        # The evidence store is exactly what decides worker-vs-core here, so an
+        # unreadable one is not a licence to assume core and send.
+        _log(f"attribution: {task_id} cannot be classified - the delivery "
+             f"evidence is unreadable, so whether a worker owned this task is "
+             f"UNKNOWN. Withholding rather than assuming the core produced it.")
+        return "", True
+    if delivered:
+        _log(f"attribution: {task_id} was DELIVERED to {delivered} but has no "
+             f"assignment record and no completion residue - refusing to stamp "
+             f"rather than attribute it to the core. The record is written under "
+             f"the same lock as the sentinel, so this is an invariant violation.")
+        return "", True
+    return "", False
+
+
+def _result_worker(task_id: str) -> str:
+    """The worker id alone, for callers that only label and never withhold.
+    A refusal reads as "" here, so anything deciding whether to SEND must use
+    _attribution() instead."""
+    return _attribution(task_id)[0]
+
+
+def _worker_of(task_id: str) -> str:
+    """Which pool worker finished this task, read from the per-worker
+    completion record. `task_id` is the result stem, prefix included.
+
+    SUPERSEDED as the primary signal by _assigned_worker(): this infers the
+    author from completion residue after the fact, which is exactly the
+    fragility assignment-time provenance removes. Kept as the transition
+    fallback in _result_worker() for tasks routed before that record existed.
+
+    The recipient grammar, the record layout, the stage order and the "is this
+    a record?" predicate all come from pool_record, which the pool's own
+    writer binds too — an optional local skill this standalone package can
+    neither import nor name (docs/architecture-boundaries.md, "Optional
+    adapter capabilities"). No second predicate lives here, so the reader
+    cannot accept state the writer would refuse.
+
+    FAILS CLOSED. A wrong worker id is worse than none — it labels a reply
+    with another worker's identity — so anything unreadable, or any record the
+    writer's own predicate would reject, yields "". Entries PROVEN not to be
+    recipients are skipped instead: a stray file beside the recipient folders
+    is not an unreadable claimant, and must not suppress valid attribution.
+    `Path.glob` is deliberately not used: it reports an unreadable subtree as
+    absent, which would let one unreadable claimant hand the answer to another.
+    """
+    root = pool_record.workers_root(_STATE)
+    try:
+        recipients = pool_record.iter_recipients(root)
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return ""  # unreadable root: no reading, not "nobody claimed it"
+    claimants = set()
+    for name in recipients:
+        for stage in pool_record.STAGES:
+            try:
+                state = pool_record.read_record_state(
+                    pool_record.record_path(root, name, task_id, stage))
+            except OSError:
+                return ""  # unreadable claim tree: abstain, never fall through
+            if state is pool_record.RecordState.ABSENT:
+                continue
+            if state is not pool_record.RecordState.PRESENT:
+                return ""  # malformed record the writer would itself refuse
+            claimants.add(name)
+            break
+    return claimants.pop() if len(claimants) == 1 else ""
 
 
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
@@ -3482,9 +4399,21 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["no_send"] = True
     # Structured attribution, not the "— core-N" prose in the body: the
     # signature is for humans and reformatting it must not change routing.
-    worker = _worker_of(tid)
+    worker, refused = _attribution(tid)
+    if refused:
+        # ENFORCED, not just logged: this is a worker's reply that nothing
+        # recorded, so sending it would publish it as the core's own.
+        why = ("attribution refused: delivered to a worker but no assignment "
+               "record and no completion residue - withholding rather than "
+               "publishing an unattributed result as the core's own")
+        if result_file is not None:
+            _quarantine_undelivered(result_file, tid, why)
+        else:
+            _log(f"result {tid}: {why} - not published, not delivered")
+        return False
     if worker:
         doc["metadata"] = {"worker_id": worker}
+        _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
     core.backend.publish(broker_tid, payload)   # False = already live: retry pass
     res = core.deliver_one(broker_tid, payload)
@@ -3527,6 +4456,61 @@ def _result_tier(tid: str) -> "str | None":
         return None
 
 
+def _owner_mention_refused(tid: str, body: str) -> "bool | None":
+    """Whether the room must not get this result (team_result_guard owns the rule).
+    None = the task file exists but could not be read; the caller retries."""
+    tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+    if tfile is None:
+        return False
+    try:
+        text = tfile.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return team_result_guard.owner_mention_result_refused_by_room(text, body)
+
+
+def _owner_mention_dm_name(tid: str) -> str:
+    return proactive_filename(f"owner-mention-{tid}", "ag2space")[:-len(".txt")]
+
+
+def _owner_mention_dm_queued(tid: str) -> bool:
+    """A copy already handed to the proactive leg (pending, claimed, sent or parked)."""
+    stem = glob.escape(_owner_mention_dm_name(tid))
+    return ((RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt").exists()
+            or any(RESULTS_DIR.glob(f"{stem}.sending*"))
+            or any(ARCHIVE_RESULTS_DIR.glob(f"{stem}-*.txt"))
+            or any(UNDELIVERABLE_RESULTS_DIR.glob(f"{stem}-*.txt")))
+
+
+def _queue_owner_mention_dm(tid: str, text: str) -> bool:
+    """Hand an owner-mention result to the proactive leg, addressed to the owner's DM.
+    False = not queued (no owner DM reading yet, or the write failed); retried next pass."""
+    if not text.strip() or _owner_mention_dm_queued(tid):
+        return True
+    room = resolve_destination(OWNER_PRIVATE)
+    if not room:
+        _held(f"owner-mention result {tid}")
+        return False
+    # Addressed to a Matrix room, so every other bridge's drain leaves this file alone.
+    body = f"[channel: {room}]\n{neutralize_markers(text).strip()}\n"
+    return _durable_write(RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt", body)
+
+
+def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
+    """Every result consumer asks this first, before the tier guard.
+
+    True = an owner-mention result the room must not get: its DM is queued and the
+    caller closes the room lease silently. False = deliver as usual. None = retry.
+    """
+    refused = _owner_mention_refused(tid, raw)
+    if not refused:
+        return refused
+    if not _queue_owner_mention_dm(tid, parse_markers(raw).body):
+        return None
+    _log(f"owner mention {tid}: result sent to the owner's DM, not the room")
+    return True
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     changed = False
@@ -3538,9 +4522,13 @@ def _post_ready_results(inflight: set[str]) -> None:
         raw = read_ready_result(rfile)
         if raw is None:
             continue
+        # Before the tier guard: a withheld review would name the shared room as its release target.
+        mention = _owner_mention_disposition(tid, raw)
+        if mention is None:
+            continue
         # The guard honours suppression on every tier now, so there is no stub
         # to pre-apply; the ordinary guarded path returns the body unchanged.
-        body, _withheld = _guarded_result_body(tid, raw)
+        body, _withheld = ("[no-send]", None) if mention else _guarded_result_body(tid, raw)
         if body is None:
             _log(f"result guard unavailable for {tid} — leaving for retry")
             continue
@@ -3568,15 +4556,19 @@ def _post_ready_results(inflight: set[str]) -> None:
                         continue
                     # The report IS the delivery: archiving before confirm
                     # would strand the ask exactly as the unreported dedup did.
+                    mention = _owner_mention_disposition(tid, payload)
+                    if mention is None:
+                        continue
                     if not _deliver_result_payload(tid, _broker_tid(_delivery),
-                                                  payload):
+                                                  "[no-send]" if mention else payload,
+                                                  no_send=bool(mention)):
                         continue
                 _holder = (skip.extra or "").strip()
                 # An out-of-grammar holder is sender-controlled; name its shape,
                 # never its bytes.
                 _shown = (_holder if local_task_protocol.valid_archive_lookup_id(_holder)
                           else f"<malformed, {len(_holder)} chars>")
-                _log(f"dedup {action} for {tid} (holder {_shown} delivered nothing)")
+                _log(f"dedup {action} for {tid} (holder {_shown} is not a valid delivery for this task)")
                 _archive_result(rfile, tid)
                 inflight.discard(tid)
                 _forget_task_room(tid)
@@ -3802,6 +4794,17 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         tid = rfile.stem
         if not _valid_local_tid(tid) or tid in inflight:
             continue
+        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
+        if task is not None:
+            try:
+                headers = local_task_protocol.parse_task_headers(
+                    task.read_text(encoding="utf-8", errors="replace")).headers
+            except OSError:
+                continue
+            # Cron completions belong to the local scheduler, not a gateway lease.
+            # Leave their delivery and retirement to the local consumers.
+            if headers.get("source") == "cron":
+                continue
         try:
             age = now - rfile.stat().st_mtime
         except OSError:
@@ -3827,7 +4830,6 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # No task anywhere: nothing resolves a destination — quarantine,
         # never a labeled re-delivery (permanent sweep error otherwise).
-        task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
         if task is None:
             if not _quarantine_orphan(rfile, tid, "no-task"):
                 continue
@@ -3843,9 +4845,12 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         delivery = _delivery_tid(tid)
         if delivery is None:
             continue                            # alias ledger unreadable: retry later
+        mention = _owner_mention_disposition(tid, raw)
+        if mention is None:
+            continue
         # Recovery is still a delivery: the ordinary path's guard runs BEFORE
         # any marker is interpreted, so tier + suppression cannot be skipped.
-        body, _withheld = _guarded_result_body(tid, raw)
+        body, _withheld = ("[no-send]", None) if mention else _guarded_result_body(tid, raw)
         if body is None:
             _log(f"orphan sweep: result guard unavailable for {tid} — leaving for retry")
             continue
@@ -3905,6 +4910,16 @@ def _lock_on() -> bool:
 
 def _release_singleton() -> None:
     if not _lock_on():
+        return
+    # The ORDER is the invariant, not the registration order of two atexit hooks
+    # (atexit runs them in reverse, so that ordering released the lock first).
+    _OWNERSHIP_RELINQUISHED.set()
+    if not _join_push_thread():
+        # Still in flight, and the request cannot be recalled. Holding the lock
+        # costs a successor the stale window; releasing costs it its card.
+        _log("singleton: a publication is still in flight — holding the lock so "
+             "a successor waits for it to go stale instead of having its "
+             "advertisement overwritten by this generation")
         return
     try:
         _ws_release(_LOCK_ROLE, _LOCK_WS)
@@ -4054,7 +5069,9 @@ def main() -> None:
         sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
                  f"'https://<gateway>|<secret>' onboarding token{_hint}.")
     if not _acquire_singleton():
-        return  # a live bridge already polls this workspace — exit cleanly (no dual-poll)
+        # A live bridge already polls this workspace: stand down. 75 tells a
+        # supervising wrapper not to relaunch; a plain exit would loop it.
+        sys.exit(75)
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
     abandoned_suspects: set[str] = set()
@@ -4069,6 +5086,7 @@ def main() -> None:
     backoff = 1
     last_poll_ok = time.time()
     _emit_gateway_status(False, error="starting — not yet connected")
+    refresh_routing(force=True)  # the owner's DM comes from the gateway at connect, not from a pin
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
@@ -4088,6 +5106,9 @@ def main() -> None:
             _retry_pending_publications()
             _retry_review_card_resolutions()
             _retry_review_control_results()
+            # LAST of the beat's work, on a daemon thread: two optional 15 s
+            # requests never delay the next task poll or a durable retry.
+            _push_pool_advertisement()
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
                 last_poll_ok = time.time()
@@ -4134,6 +5155,9 @@ def main() -> None:
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
             _reconcile_orphan_results(inflight)
             _post_heartbeat(inflight)
+            # The pool's advertisement rides the same beat: push-on-change, never
+            # raising, so a broker without the endpoints costs one deferred log.
+            _push_pool_advertisement()
             backoff = 1  # healthy round-trip → reset backoff
             _emit_gateway_status(True)
         except urllib.error.HTTPError as e:

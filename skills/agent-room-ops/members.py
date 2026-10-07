@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · members — enumerate a room's members (op `members`).
 
 Closes the client half of a gap the gateway never had: `POST /v1/room`
@@ -16,10 +18,10 @@ from __future__ import annotations
 
 from _gateway import gateway, http_json, degrade_reason, HTTPError, URLError
 
-# An `.agent:` localpart suffix is assigned by the platform when an agent
-# registers; the `sutando-` prefix is this fleet's own naming convention.
+# `.agent:` is the platform's registration suffix; the prefixes are the legacy conventions
+# and MIRROR cinny `src/app/utils/agentMxid.ts:14-22` — change both lists together.
 _AGENT_SUFFIX = ".agent:"
-_AGENT_PREFIX = "@sutando-"
+_AGENT_PREFIXES = ("sutando-", "codex-", "hermes-", "openclaw-", "cline-", "pi-", "kilo-")
 
 
 def classify_member(user_id: str) -> str:
@@ -32,7 +34,11 @@ def classify_member(user_id: str) -> str:
     supports. Callers that must not be wrong should ask the platform, not this.
     """
     uid = (user_id or "").strip()
-    if _AGENT_SUFFIX in uid or uid.startswith(_AGENT_PREFIX):
+    if _AGENT_SUFFIX in uid:
+        return "agent"
+    # Anchored at the start of the LOCALPART: a human named for a product
+    # ("@notsutando-x") must not be reclassified.
+    if uid.lstrip("@").split(":", 1)[0].startswith(_AGENT_PREFIXES):
         return "agent"
     return "human"
 

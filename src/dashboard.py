@@ -15,6 +15,7 @@ from __future__ import annotations
 
 
 import http.server
+import html
 import json
 import os
 import re
@@ -35,8 +36,10 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import config_get  # noqa: E402
+from sutando_platform import probe_pids  # noqa: E402
 from util_paths import personal_path, shared_personal_path, _host_label  # noqa: E402
-from pending_questions_md import active_region  # noqa: E402
+import pending_questions_reader  # noqa: E402
+import skill_roots  # noqa: E402
 import dashboard_schedules  # noqa: E402
 import quota_projection  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
@@ -119,25 +122,17 @@ def get_activity(max_items: int = 10) -> list[dict]:
 
 
 def get_pending_count() -> dict:
-    pending_file = Path(personal_path("pending-questions.md"))
-    if not pending_file.exists():
-        return {"open": 0, "done": 0}
-    content = pending_file.read_text()
-    # Questions are filed as free-form `## ` sections (no **Status:** field — see
-    # #1265) and moved below a top-level `# Resolved` divider once answered. The
-    # old `**Status:** Waiting/Answered` regex matched neither and always returned
-    # 0/0 for the format actually in use — count `## ` sections per region instead.
-    # Must use the shared locator, not a bare partition: a line-initial
-    # `# Resolved` inside the file's own HTML banner (which documents the divider)
-    # matches first, so the active region collapses and every open question is
-    # counted as resolved. Measured on the decoy shape: partition gave open=0
-    # done=3 where the truth is open=2 done=1 — and this surface is public via
-    # /json, so it was reporting a confident zero.
-    active = active_region(content)
-    resolved = content[len(active):]
-    open_count = len(re.findall(r'^## ', active, flags=re.MULTILINE))
-    done_count = len(re.findall(r'^## ', resolved, flags=re.MULTILINE))
-    return {"open": open_count, "done": done_count}
+    """{"open", "done", "unavailable", "reason"} from the one pending-questions reader (the
+    skill's adapter); `open` is None, never 0, while the room cannot be read."""
+    store = skill_roots.declared(pending_questions_reader.DECLARATION, WORKSPACE_DIR)
+    return pending_questions_reader.count(WORKSPACE_DIR, store)
+
+
+def pending_tile(pending: dict) -> tuple:
+    """(value, title) for the Pending stat: "?" with the reason when the count is unknown."""
+    if pending.get("unavailable") or pending.get("open") is None:
+        return "?", f"unknown — room unreachable ({pending.get('reason') or 'no count'})"
+    return str(pending["open"]), ""
 
 
 def get_score() -> str:
@@ -245,6 +240,24 @@ def _quota_freshness(data: dict, quota_file) -> dict:
 
 
 
+_QUOTA_MODEL_MAX_LEN = 64
+
+
+def _quota_model_label(quota: dict) -> str:
+    """The model last seen consuming quota, from the proxy's `last_request`.
+
+    Read from what the proxy observed on the wire, not from a launch-time
+    marker: /model switches mid-session, and a stamped model would go stale.
+    """
+    lr = quota.get("last_request")
+    model = lr.get("model") if isinstance(lr, dict) else None
+    if not isinstance(model, str) or not model.strip():
+        return "model —"
+    # The value comes from a request body any local caller can send: escape
+    # at the sink and cap it, so the tile cannot carry markup or a novel.
+    return html.escape(model.strip()[:_QUOTA_MODEL_MAX_LEN])
+
+
 def _quota_has_data(quota: dict) -> bool:
     """Whether a reading actually exists, as opposed to defaulting to zero.
 
@@ -306,16 +319,19 @@ def _quota_age_label(quota: dict) -> str:
     return f"{int(age*60)}m ago"
 
 def get_system_stats() -> dict:
-    import os
-    st = os.statvfs("/")
-    free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+    import shutil
+    free_gb = shutil.disk_usage(WORKSPACE_DIR).free / (1024 ** 3)
 
-    result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
-    battery_m = re.search(r'(\d+)%', result.stdout)
+    try:
+        result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
+        battery_output = result.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        battery_output = ""
+    battery_m = re.search(r'(\d+)%', battery_output)
     if battery_m:
         battery = f"{battery_m.group(1)}%"
         # \b keeps "discharging" (battery power) from substring-matching "charging".
-        charging = bool(re.search(r'\bcharging\b', result.stdout.lower())) or "ac power" in result.stdout.lower()
+        charging = bool(re.search(r'\bcharging\b', battery_output.lower())) or "ac power" in battery_output.lower()
     else:
         # Battery-less Mac (mini / Studio / Pro): pmset reports "AC Power" with no
         # percentage line. The old "?" + charging=True combo rendered as "? ⚡".
@@ -673,8 +689,8 @@ def render_dashboard() -> str:
 <div class="stat"><div class="stat-val">{stats['disk_free']}</div><div class="stat-label">Disk Free</div></div>
 <div class="stat"><div class="stat-val">{stats['battery']}{charge}</div><div class="stat-label">Battery</div></div>
 <div class="stat"><div class="stat-val">{ok_count}/{total_count}</div><div class="stat-label">Services OK</div></div>
-<div class="stat"><div class="stat-val">{pending['open']}</div><div class="stat-label">Pending</div></div>
-<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
+<div class="stat"><div class="stat-val" title="{pending_tile(pending)[1]}">{pending_tile(pending)[0]}</div><div class="stat-label">Pending</div></div>
+<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:#8fa3c8">{_quota_model_label(stats["quota"])}</span><br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
 <div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-5h" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "5h") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-5h" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
 <div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-7d" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "7d") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-7d" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
 </div>""" + _QUOTA_SPARK_JS + """</div>""")
@@ -732,8 +748,11 @@ def render_dashboard() -> str:
     # Keyboard shortcuts
     # Match both the dev-built binary (`<repo>/src/Sutando/Sutando`) and the
     # distributed .app (`/Applications/Sutando.app/Contents/MacOS/Sutando`).
-    sutando_running = subprocess.run(["/usr/bin/pgrep", "-f", "(Sutando|MacOS)/Sutando"], capture_output=True).returncode == 0
+    sutando_pids, probe_ok = probe_pids("(Sutando|MacOS)/Sutando", timeout=3.0)
+    sutando_running = bool(sutando_pids)
     shortcut_status = '<span class="ok">✓</span> Sutando app running' if sutando_running else '<span class="bad">✗</span> Sutando app not running'
+    if not probe_ok:
+        shortcut_status = "Sutando app status unavailable"
     # Shortcuts come from <workspace>/state/hotkeys.json (published by the
     # Sutando app from its resolved config — single source of truth). Only the
     # human descriptions are local UI copy, keyed by the stable action name.

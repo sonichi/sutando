@@ -31,10 +31,12 @@ from typing import NamedTuple
 
 # A marker is a control only where the shared parser EXECUTES it, so the guard
 # derives its classification from parse_markers rather than a parallel grammar.
-try:
+try:  # pragma: no cover - the packaged twin exercises the relative imports
     from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
+    from .local_task_protocol import canonical_access_tier, parse_task_headers
 except ImportError:
     from result_markers import parse_markers  # monorepo src/ on sys.path
+    from local_task_protocol import canonical_access_tier, parse_task_headers
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
@@ -73,6 +75,10 @@ def is_guarded_tier(tier) -> bool:
     return (tier or "").strip().lower() != OWNER_TIER
 
 
+# Not a tier: an unreadable file, kept distinct from a malformed one (`guest`).
+# Outside the legal set, so it guards like every non-owner value and cannot be forged.
+TIER_UNREADABLE = "unreadable"
+
 class TeamResultLeakError(RuntimeError):
     """A Team result carried a delivery-control marker or a likely secret."""
 
@@ -83,12 +89,14 @@ def resolve_access_tier(task_file) -> str:
     Task-last writers put the trusted tier before ``task:``; prefer that value.
     The remote gateway is task-mid and newline-confines every wire value, so if
     no pre-task tier exists its final tier line is the trusted value.  Missing
-    legacy tiers remain owner; malformed explicit tiers fail closed to guest.
+    legacy tiers remain owner; malformed explicit tiers fail closed to guest, and an
+    UNREADABLE file answers `TIER_UNREADABLE` so a transient I/O failure is never
+    reported as a tier the file does not carry.
     """
     try:
         content = Path(task_file).read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return "guest"
+        return TIER_UNREADABLE
     # LF-only split: the writer strips only \r/\n, so a Unicode line
     # boundary in a field must not forge a header. str.splitlines() would.
     def _tiers(text):
@@ -102,12 +110,10 @@ def resolve_access_tier(task_file) -> str:
     if not candidates:
         return "owner"
     # Conflicting explicit tiers can only come from injection — fail closed.
-    normed = {"guest" if t == "other" else t for t in candidates}
+    normed = {canonical_access_tier(t) for t in candidates}
     if len(normed) > 1:
         return "guest"
-    tier = candidates[-1]
-    if tier == "other":
-        tier = "guest"
+    tier = normed.pop()
     return tier if tier in {"owner", "team", "guest"} else "guest"
 
 
@@ -160,18 +166,50 @@ def load_team_result_scanner(repo: Path):
     return filter_chat_secrets
 
 
+def attach_markers_confined(body: str, attach_roots) -> bool:
+    """True iff the body carries at least one attach marker and EVERY one names an
+    ABSOLUTE path whose realpath sits under one of `attach_roots`.
+
+    The task-scoped output allowance (Signal Room, design 5G ⑤a-cap): a Team
+    result may carry `[file:]` markers for files the task itself produced under
+    its own output directory -- and nothing else. Realpath on both sides, so a
+    symlink planted inside the root that points out of it is caught the way
+    send_allowlist catches it. A relative or `~`-prefixed path is not confined:
+    it would resolve against a cwd or a home directory this policy cannot
+    vouch for. An empty `attach_roots` confines nothing.
+    """
+    roots = [os.path.realpath(str(r)) for r in (attach_roots or ()) if str(r).strip()]
+    if not roots:
+        return False
+    values = [a.value for a in parse_markers(body or "").actions if a.kind == "attach"]
+    if not values:
+        return False
+    for raw in values:
+        candidate = (raw or "").strip()
+        if not candidate or not os.path.isabs(candidate):
+            return False
+        real = os.path.realpath(candidate)
+        if not any(real == root or real.startswith(root + os.sep) for root in roots):
+            return False
+    return True
+
+
 def scan_team_result(body: str, repo: Path, secret_filter=None,
                      scan_sensitive_data: bool = True,
-                     allow_attach: bool = False) -> str:
+                     allow_attach: bool = False,
+                     attach_roots=()) -> str:
     """Return `body` unchanged, or raise TeamResultLeakError if it must be withheld."""
     kinds = {action.kind for action in parse_markers(body or "").actions}
     # dm-only only suppresses a redirect the guard already withholds, and a
     # redirect it suppressed never executes -- neither is a control here.
     if kinds & {"redirect"}:
         raise TeamResultLeakError("result delivery control marker")
-    if "attach" in kinds and not allow_attach:
+    if ("attach" in kinds and not allow_attach
+            and not attach_markers_confined(body, attach_roots)):
         # Verdict-only exemption: the adapter says whether THIS channel+sender
         # may attach; path authorization stays with the transport allowlist.
+        # The task-scoped allowance is narrower than allow_attach: only files
+        # under the task's own output root (attach_markers_confined) pass.
         raise TeamResultLeakError("result delivery control marker")
     # Suppression is deliberately absent: redirect and attach move data
     # somewhere the sender should not reach, a skip marker moves nothing.
@@ -197,6 +235,24 @@ def is_suppression_only(body: str) -> bool:
     """
     actions = parse_markers(body or "").actions
     return bool(actions) and all(action.kind == "skip" for action in actions)
+
+
+OWNER_MENTION_HEADER = "owner_mentioned"
+
+
+def is_owner_mention_task(task_text) -> bool:
+    """True when the task's writer attested an owner mention above `task:`.
+
+    The strict parse stops at `task:`, so a body line can never claim it.
+    """
+    headers = parse_task_headers(task_text or "")
+    return (headers.get(OWNER_MENTION_HEADER) or "").strip() == "true"
+
+
+def owner_mention_result_refused_by_room(task_text, body: str) -> bool:
+    """An owner-mention task may close its room turn silently and nothing more:
+    any other result goes to the owner's DM, never to the room that mentioned him."""
+    return is_owner_mention_task(task_text) and not is_suppression_only(body)
 
 
 VERDICT_DELIVER = "deliver"
@@ -283,14 +339,19 @@ def _write_artifact(path: Path, payload: dict) -> bool:
         return True
     fd, temporary = tempfile.mkstemp(prefix=".withheld-", suffix=".tmp", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600)
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            os.link(temporary, path)
+            if os.name == "nt":
+                # Windows rename is atomic and refuses to replace an existing file.
+                os.rename(temporary, path)
+            else:
+                os.link(temporary, path)
         except FileExistsError:
             pass
         return path.is_file()
@@ -386,7 +447,8 @@ def classify_result_for_tier(body: str, tier, repo: Path,
                              secret_filter=None,
                              scan_sensitive_data: bool = True,
                              allow_attach: bool = False,
-                             honor_suppressions: bool = True) -> TeamResultVerdict:
+                             honor_suppressions: bool = True,
+                             attach_roots=()) -> TeamResultVerdict:
     """The guard-owned policy verdict. Adapters apply transport mechanics only;
     re-deciding (or bypassing) this classification in a bridge is a boundary
     violation, not an implementation choice."""
@@ -400,7 +462,7 @@ def classify_result_for_tier(body: str, tier, repo: Path,
         return TeamResultVerdict(
             VERDICT_DELIVER,
             scan_team_result(body, repo, secret_filter, scan_sensitive_data,
-                         allow_attach=allow_attach),
+                         allow_attach=allow_attach, attach_roots=attach_roots),
             None)
     except TeamResultLeakError as exc:
         if str(exc) == "result delivery control marker":
@@ -416,7 +478,7 @@ def classify_result_for_tier(body: str, tier, repo: Path,
 def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
                           scan_sensitive_data: bool = True, *,
                           suppress_journal=None, allow_attach: bool = False,
-                          honor_suppressions: bool = True):
+                          honor_suppressions: bool = True, attach_roots=()):
     """Consumer-facing gate: returns (safe_body, withheld_reason).
 
     Returns a body rather than raising, so a caller cannot deliver the raw text
@@ -429,9 +491,12 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
     """
     verdict = classify_result_for_tier(
         body, tier, repo, secret_filter, scan_sensitive_data,
-        allow_attach=allow_attach, honor_suppressions=honor_suppressions)
+        allow_attach=allow_attach, honor_suppressions=honor_suppressions,
+        attach_roots=attach_roots)
+    # An unreadable tier is not a decision to record: journalling it can only
+    # fail the same way the tier read did, and its notice replaces the answer.
     if (suppress_journal is not None and is_guarded_tier(tier)
-            and is_suppression_only(body)):
+            and tier != TIER_UNREADABLE and is_suppression_only(body)):
         state_dir, task_id = suppress_journal
         verdict = journal_suppressed_result(verdict, body, state_dir, task_id)
     if (suppress_journal is not None and verdict.kind == VERDICT_LEAK

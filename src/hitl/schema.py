@@ -12,12 +12,32 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .host import device_host
+
 WIRE_FIELD = "space.ag2.hitl"
 
 KINDS = frozenset(
     {"auth", "permission", "choice", "confirmation", "billing", "external_action",
      "core-blocked", "unknown"}
 )
+
+CATEGORY_BLOCKED = "blocked"
+CATEGORY_DECISION = "decision"
+# Mirrors ag2-space/cinny-webclient src/app/components/message/hitlCategory.ts
+# (#847). An unlisted kind is BLOCKED: under-stating a block strands the user.
+_KIND_CATEGORY = {
+    "auth": CATEGORY_BLOCKED,
+    "permission": CATEGORY_BLOCKED,
+    "billing": CATEGORY_BLOCKED,
+    "external_action": CATEGORY_BLOCKED,
+    "choice": CATEGORY_DECISION,
+    "confirmation": CATEGORY_DECISION,
+}
+
+
+def category_of(kind: "str | None") -> str:
+    """Which of the two presentations this kind gets."""
+    return _KIND_CATEGORY.get(kind or "", CATEGORY_BLOCKED)
 
 STATUS_PENDING = "pending"
 STATUS_IN_PROGRESS = "in_progress"
@@ -72,6 +92,9 @@ class HumanRequirement:
     answer: Optional[Any] = None
     # Absolute epoch after which the producer treats the requirement as expired.
     expires_at: Optional[float] = None
+    # The applied click also reaches the core as a task, so an executor that runs
+    # at the end of an agent turn (a Stop hook) runs now, not after an unrelated turn.
+    turn_on_action: bool = False
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -105,6 +128,22 @@ class HumanRequirement:
         self.revision += 1
         self.updated_at = time.time()
 
+    def wire_device(self) -> Optional[Dict[str, str]]:
+        """The device as a reader sees it: the producer's dict plus `host` (this
+        machine's label) when the producer left it out. Every card, one place.
+        Assumes the store is per-host: `state/` is not carried by default, so the
+        serializing machine is the terminal's. A `vault.sync.include` covering
+        `state/` would break that; a producer that knows a remote host must set
+        `host` itself."""
+        if not self.device:
+            return None
+        device = dict(self.device)
+        if not device.get("host"):
+            host = device_host()
+            if host:
+                device["host"] = host
+        return device
+
     def to_wire(self) -> Dict[str, Any]:
         wire: Dict[str, Any] = {
             "id": self.id,
@@ -117,14 +156,17 @@ class HumanRequirement:
         }
         if self.title:
             wire["title"] = self.title
-        if self.device:
-            wire["device"] = dict(self.device)
+        device = self.wire_device()
+        if device:
+            wire["device"] = device
         if self.actions:
             wire["actions"] = [a.to_wire() for a in self.actions]
         if self.subject:
             wire["subject"] = dict(self.subject)
         if self.expires_at is not None:
             wire["expires_at"] = self.expires_at
+        if self.turn_on_action:
+            wire["turn_on_action"] = True
         # `answer` is inbound-only (what the human typed back); a card never
         # renders it, so it is persisted but deliberately not on the wire.
         return wire

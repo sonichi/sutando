@@ -60,15 +60,16 @@ def _requirement_for(ev: Dict) -> HumanRequirement:
         "confirmation": f"{runtime} is waiting for your confirmation",
         "choice": f"{runtime} is asking you a question",
     }.get(ev.get("kind"), f"{runtime} is waiting on something in its terminal")
+    # The session keys dedup, the jump and (with its socket) the driver's action
+    # file on a click; the host label is added at the wire (schema.wire_device).
+    device = {"id": session, "name": session, "socket": str(ev.get("socket") or "")}
     return HumanRequirement(
         kind=str(ev.get("kind") or "unknown"),
         runtime=runtime,
         message=f"{prompt} — session {session}",
         guard=str(ev.get("guard") or ""),
         subject=dict(ev.get("subject") or {}) if isinstance(ev.get("subject"), dict) else {},
-        # The session is the requirement's device: it keys dedup, the jump, and
-        # (with its tmux socket) the driver's action file on a click.
-        device={"id": session, "name": session, "socket": str(ev.get("socket") or "")},
+        device=device,
         title=f"{runtime} · {session}",
         actions=_actions_for(ev),
     )

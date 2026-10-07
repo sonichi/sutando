@@ -516,6 +516,32 @@ class TestKeychainInteraction(unittest.TestCase):
         self.assertEqual(args[w_idx + 1], value)
 
 
+class TestKeychainReadDeadline(unittest.TestCase):
+    """get_vault_key — `security` can block on a locked keychain's unlock
+    dialog; a reader on the startup / health-check path must read no answer
+    as "not present", not hang behind it (review of #4666)."""
+
+    def test_read_carries_a_deadline(self):
+        with patch("vault_intercept.subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout=b"value\n")) as mock_run:
+            self.assertEqual(vault_intercept.get_vault_key("MY_KEY"), "value")
+        self.assertEqual(mock_run.call_args.kwargs.get("timeout"), vault_intercept._KEYCHAIN_READ_TIMEOUT_S)
+        self.assertGreater(vault_intercept._KEYCHAIN_READ_TIMEOUT_S, 0)
+
+    def test_no_answer_within_the_deadline_is_not_present(self):
+        import subprocess as _sp
+        expired = _sp.TimeoutExpired(cmd=["security"], timeout=vault_intercept._KEYCHAIN_READ_TIMEOUT_S)
+        with patch("vault_intercept.subprocess.run", side_effect=expired):
+            with self.assertRaises(KeyError) as ctx:
+                vault_intercept.get_vault_key("MY_KEY")
+            self.assertIn("no answer", str(ctx.exception))
+            # The channel-token tier the bridges, startup.sh and health-check
+            # read through turns that KeyError into '' — the gate stays closed.
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+            import channel_token
+            self.assertEqual(channel_token.token_from_vault("MY_KEY"), "")
+
+
 class TestRedactVaultCommands(unittest.TestCase):
     """redact_vault_commands — scrubs vault patterns without touching Keychain."""
 
@@ -600,6 +626,7 @@ if __name__ == "__main__":
         TestMultipleVaultSets,
         TestHermeticManifest,
         TestKeychainInteraction,
+        TestKeychainReadDeadline,
         TestRedactVaultCommands,
         TestErrorHandling,
     ]:

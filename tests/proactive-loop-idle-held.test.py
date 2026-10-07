@@ -32,6 +32,7 @@ def run(args):
         rc = ih.main(args)
     return rc, out.getvalue(), err.getvalue()
 
+KEY_HELD = ih.KEY
 print("idle-held")
 
 p = state(BASE)
@@ -51,13 +52,13 @@ check("an id built from RECALL is refused, not silently applied",
 check("...and it names the near-miss so the real id is one read away",
       "sutando-3198" in err, err[:90])
 
-rc, out, _ = run(["--state", str(p), "--add", "new-thing:ci"])
+rc, out, _ = run(["--state", str(p), "--add", "new-thing:ci", "--note", "sonichi/sutando#1"])
 check("add appends the pair", rc == 0 and ["new-thing","ci"] in json.loads(out))
 
-rc, _, err = run(["--state", str(p), "--add", "cinny-717:owner"])
+rc, _, err = run(["--state", str(p), "--add", "cinny-717:owner", "--note", "n"])
 check("adding an existing id is refused", rc == 1 and "already held" in err, err[:70])
 
-rc, _, err = run(["--state", str(p), "--add", "nogate"])
+rc, _, err = run(["--state", str(p), "--add", "nogate", "--note", "n"])
 check("--add without a gate is refused", rc == 1 and "ID:GATE" in err, err[:70])
 
 # there is NO interface that takes a whole list — the defect, made unreachable
@@ -101,6 +102,7 @@ check("without --write the file is UNCHANGED", json.loads(nw.read_text())["held_
 
 # --- --audit-notes: a sha in a note is a COPY of a fact git owns ---------------
 import subprocess as _sp
+import time as _time
 import tempfile as _tf
 
 def _git_repo():
@@ -297,6 +299,250 @@ with _tf.TemporaryDirectory() as td:
     check("archive: --audit-notes goes GREEN afterwards", r.returncode == 0,
           f"rc={r.returncode} {r.stdout}{r.stderr}")
 
+
+# --init-empty: the ONE path that may create the key, and only when absent.
+# `load` cannot tell a never-seeded host from a drifted one, so it refuses both.
+fresh = pathlib.Path(tempfile.mkdtemp()) / "s.json"
+fresh.write_text(json.dumps({"streak": 0, "noop_total": 48,
+                             "last_surfaced_ids": ["3753:peer-review"]}))
+
+rc, _, err = run(["--state", str(fresh), "--add", "3857:owner", "--note", "sonichi/sutando#3857", "--write"])
+check("PRE-CONTROL: --add on a keyless state still refuses",
+      rc == 2 and "refusing to invent" in err, err[:80])
+
+rc, out, _ = run(["--state", str(fresh), "--init-empty"])
+_d = json.loads(fresh.read_text())
+check("--init-empty creates the key as [] and exits 0",
+      rc == 0 and _d.get("held_item_ids") == [], f"rc={rc} {_d.get('held_item_ids')!r}")
+check("--init-empty records provenance, so a seeded key is never anonymous",
+      _d.get("held_item_seed", {}).get("by") == "idle-held.py --init-empty",
+      str(_d.get("held_item_seed"))[:70])
+check("--init-empty leaves every other key untouched",
+      _d.get("streak") == 0 and _d.get("noop_total") == 48
+      and _d.get("last_surfaced_ids") == ["3753:peer-review"], str(_d)[:90])
+
+rc, _, err = run(["--state", str(fresh), "--init-empty"])
+check("--init-empty REFUSES a second time — it bootstraps, never clears",
+      rc == 2 and "REFUSED" in err, err[:80])
+
+rc, _, _ = run(["--state", str(fresh), "--add", "3857:owner", "--note", "sonichi/sutando#3857", "--write"])
+check("THE POINT: --add works after the bootstrap",
+      rc == 0 and json.loads(fresh.read_text())["held_item_ids"] == [["3857", "owner"]],
+      str(json.loads(fresh.read_text()).get("held_item_ids"))[:60])
+
+pop = state(BASE)
+rc, _, err = run(["--state", str(pop), "--init-empty"])
+check("--init-empty on a POPULATED record refuses and does not wipe it",
+      rc == 2 and "REFUSED" in err
+      and json.loads(pop.read_text())["held_item_ids"] == BASE, err[:80])
+
+corrupt = pathlib.Path(tempfile.mkdtemp()) / "s.json"
+corrupt.write_text('{"streak": 0, "noop_tot')   # truncated mid-write
+rc, _, err = run(["--state", str(corrupt), "--init-empty"])
+check("--init-empty on a CORRUPT state cannot answer and does not overwrite it",
+      rc == 2 and "not JSON" in err and corrupt.read_text() == '{"streak": 0, "noop_tot',
+      f"rc={rc} {err[:60]}")
+
+nofile = pathlib.Path(tempfile.mkdtemp()) / "nope.json"
+rc, _, err = run(["--state", str(nofile), "--init-empty"])
+check("--init-empty on a MISSING state file cannot answer, never creates one",
+      rc == 2 and not nofile.exists(), f"rc={rc} exists={nofile.exists()}")
+
+
+# CONCURRENCY REGRESSION, both PRODUCTION writers, in two PROCESSES: an
+# in-process racer deadlocks on the same flock and a hung suite proves nothing.
+_HASH = str(SCRIPTS / "idle-surface-hash.py")
+conc = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+conc.write_text(json.dumps({"streak": 0, "noop_total": 0}))
+
+_racer = {}
+_orig_read = ih.idle_state.read_state_strict
+def _read_then_race(path):
+    got = _orig_read(path)
+    if not _racer:                      # once, while the seed holds the lock
+        _racer["p"] = _sp.Popen([*_PY, _HASH, "--state", str(path),
+                                 "--pass-outcome", "noop"],
+                                stdout=_sp.PIPE, stderr=_sp.PIPE, text=True)
+        _time.sleep(0.4)                # let it reach and block on the lock
+    return got
+
+ih.idle_state.read_state_strict = _read_then_race
+try:
+    rc, _, _ = run(["--state", str(conc), "--init-empty"])
+finally:
+    ih.idle_state.read_state_strict = _orig_read
+check("harness: the racer actually fired (else this arm proves nothing)",
+      "p" in _racer, "read hook never called — retarget it")
+if "p" in _racer:
+    _racer["p"].wait(timeout=20)
+
+_after = json.loads(conc.read_text())
+check("CONCURRENCY: the pass recorded during --init-empty is NOT lost",
+      _after.get("noop_total") == 1 and _after.get("streak") == 1,
+      f"streak={_after.get('streak')} noop_total={_after.get('noop_total')}")
+check("CONCURRENCY: and the seed survives the interleaving",
+      rc == 0 and _after.get("held_item_ids") == [],
+      f"rc={rc} {_after.get('held_item_ids')!r}")
+check("both writers serialise on ONE lock file",
+      conc.with_suffix(".json.lock").exists(),
+      str(sorted(x.name for x in conc.parent.iterdir())))
+
+
+# FAIL-CLOSED: every writer here refuses an unparseable record rather than
+# publishing its mutate() output onto the empty dict a lenient read returns.
+def _refuses_held(argv, label):
+    f = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+    f.write_text('{"streak": 7, "held_item_ids": [["keep","owner"')
+    before = f.read_text()
+    # All three refuse BEFORE locked_update — load()/the pre-lock parse — so
+    # these arms pin that guard, not the strict read inside the lock.
+    try:
+        rc, _, err = run(["--state", str(f)] + argv)
+    except SystemExit as e:
+        rc, err = e.code, "SystemExit"
+    # "usage:" would mean argparse rejected the argv and the guard never ran —
+    # two of these arms passed that way before the flags were corrected.
+    check(f"fail-closed: {label} refuses AND leaves the file byte-identical",
+          rc == 2 and f.read_text() == before and "usage:" not in str(err),
+          f"rc={rc} changed={f.read_text() != before} err={str(err).strip()[:60]!r}")
+
+_refuses_held(["--init-empty"], "--init-empty")
+_refuses_held(["--add", "x:owner", "--note", "n", "--write"], "--add --write")
+_refuses_held(["--archive-orphan-notes", "--write"], "--archive-orphan-notes --write")
+
+_valid_h = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_valid_h.write_text(json.dumps({"streak": 7}))
+_rc_h, _, _ = run(["--state", str(_valid_h), "--init-empty"])
+check("CONTROL: a VALID keyless record still initialises — corrupt is the "
+      "discriminator, not 'refuses everything'",
+      _rc_h == 0 and json.loads(_valid_h.read_text()).get("held_item_ids") == []
+      and json.loads(_valid_h.read_text()).get("streak") == 7,
+      f"rc={_rc_h} {_valid_h.read_text()[:70]}")
+
+# TOCTOU: the pre-lock parse can succeed and the record still be unusable by the
+# time the lock is held, which is the only way these branches are reached.
+def _raced(err):
+    def hook(path):
+        return (None, err) if err else (json.loads(pathlib.Path(path).read_text()), None)
+    return hook
+
+_orig_rss = ih.idle_state.read_state_strict
+def _under_race(argv, err="raced corruption", seed=None):
+    f = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+    f.write_text(json.dumps(seed if seed is not None else {"streak": 1}))
+    before = f.read_text()
+    ih.idle_state.read_state_strict = _raced(err)
+    try:
+        rc, _, err_out = run(["--state", str(f)] + argv)
+    finally:
+        ih.idle_state.read_state_strict = _orig_rss
+    return rc, f.read_text() == before, err_out
+
+for _argv, _label, _seed in (
+        (["--init-empty"], "--init-empty", {"streak": 1}),
+        (["--add", "x:owner", "--note", "n", "--write"], "--add --write", {"held_item_ids": []}),
+        (["--archive-orphan-notes", "--write"], "--archive-orphan-notes --write",
+         {"held_item_ids": [], "held_item_notes": {"gone": "n"}}),
+):
+    _rc, _same, _e = _under_race(_argv, seed=_seed)
+    check(f"raced corruption: {_label} exits 2 and writes nothing",
+          _rc == 2 and _same and "usage:" not in _e,
+          f"rc={_rc} unchanged={_same} err={_e.strip()[:60]!r}")
+
+# The locked doc already holds the id this call meant to add: apply_ops errs
+# under the lock, so the whole write aborts rather than half-landing.
+_f = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_f.write_text(json.dumps({KEY_HELD: []}))
+_before = _f.read_text()
+ih.idle_state.read_state_strict = lambda path: ({KEY_HELD: [["x", "owner"]]}, None)
+try:
+    _rc, _, _err = run(["--state", str(_f), "--add", "x:owner", "--note", "n", "--write"])
+finally:
+    ih.idle_state.read_state_strict = _orig_rss
+check("a racer that added the same id under the lock aborts the write (exit 1)",
+      _rc == 1 and _f.read_text() == _before and "REFUSED" in _err,
+      f"rc={_rc} unchanged={_f.read_text() == _before} err={_err.strip()[:60]!r}")
+
+# A racer archived the orphan between the snapshot and the lock: re-deriving
+# under the lock finds nothing left, so the write aborts instead of re-moving it.
+_ar = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_ar.write_text(json.dumps({KEY_HELD: [], "held_item_notes": {"gone": "n"}}))
+_ar_before = _ar.read_text()
+ih.idle_state.read_state_strict = lambda path: ({KEY_HELD: [], "held_item_notes": {}}, None)
+try:
+    _rc, _, _ = run(["--state", str(_ar), "--archive-orphan-notes", "--write"])
+finally:
+    ih.idle_state.read_state_strict = _orig_rss
+check("a racer that already archived the orphan aborts the write, not re-moves it",
+      _rc == 0 and _ar.read_text() == _ar_before,
+      f"rc={_rc} unchanged={_ar.read_text() == _ar_before}")
+
+# A refusal nobody can act on is a dead end: --init-empty is the only route out
+# of this state, so the message that blocks must name it.
+_dead = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_dead.write_text(json.dumps({"streak": 3}))
+_doc_d, _err2 = ih.load(_dead)
+check("the no-key refusal NAMES the flag that resolves it",
+      _doc_d is None and "--init-empty" in (_err2 or ""), repr(_err2))
+check("...and still says what it refuses to do, so the reason survives",
+      "refusing to invent one" in (_err2 or ""), repr(_err2))
+
+# --add without --note: an id lands in held_item_ids that --audit-prs can never
+# check, which is the silent-shrink failure pointing the other way (#4033).
+_np = state(BASE)
+_rc, _, _err = run(["--state", str(_np), "--add", "z:owner"])
+check("an add with NO note is refused", _rc == 1 and "invisible to --audit-prs" in _err, _err[:90])
+
+_rc, _, _err = run(["--state", str(_np), "--add", "z:owner", "--add", "y:owner", "--note", "n"])
+check("a --note count that does not match --add is refused",
+      _rc == 1 and "2 --add but 1 --note" in _err, _err[:90])
+
+_rc, _out, _err = run(["--state", str(_np), "--add", "z:owner", "--note", "sonichi/sutando#77"])
+check("a paired add still succeeds and echoes the note",
+      _rc == 0 and ["z","owner"] in json.loads(_out) and "added z: sonichi/sutando#77" in _err,
+      _err[:100])
+
+_wp = state(BASE)
+_rc, _, _ = run(["--state", str(_wp), "--add", "z:owner", "--note", "sonichi/sutando#77", "--write"])
+_after = json.loads(_wp.read_text())
+check("--write persists the note under the SAME lock as the id",
+      _rc == 0 and ["z","owner"] in _after["held_item_ids"]
+      and _after["held_item_notes"].get("z") == "sonichi/sutando#77",
+      json.dumps(_after.get("held_item_notes"))[:100])
+check("...and an unrelated pre-existing note survives that write",
+      _after["held_item_notes"].get("keep") == "must survive a write")
+
+_rc, _, _ = run(["--state", str(_wp), "--remove", "z", "--reason", "done"])
+check("a removal still needs no --note", _rc == 0)
+
+
+# A blank explanation passes a COUNT check and satisfies nothing: the audit sees the
+# key present and does not even list it among the missing (qingyun-wu, #4042).
+for _flag, _val, _label in (("--note", "", "an empty"), ("--note", "   ", "a whitespace-only")):
+    _bp = state(list(BASE))
+    _before = _bp.read_bytes()
+    _rc, _, _err = run(["--state", str(_bp), "--add", "blank:owner", _flag, _val, "--write"])
+    check(f"{_label} --note is REFUSED", _rc == 1, _err[:90])
+    check(f"...and {_label} --note leaves the file BYTE-IDENTICAL",
+          _bp.read_bytes() == _before)
+
+# The sibling flag has the same shape, and an unauditable REMOVAL is the silent
+# shrink this tool exists to stop.
+for _val, _label in (("", "an empty"), ("  ", "a whitespace-only")):
+    _bp = state(list(BASE))
+    _before = _bp.read_bytes()
+    _rc, _, _err = run(["--state", str(_bp), "--remove", "ds-pr-12", "--reason", _val, "--write"])
+    check(f"{_label} --reason is REFUSED", _rc == 1, _err[:90])
+    check(f"...and {_label} --reason leaves the file BYTE-IDENTICAL",
+          _bp.read_bytes() == _before)
+
+# The guard must not over-refuse: a non-PR explanation is explicitly allowed.
+_op = state(list(BASE))
+_rc, _, _ = run(["--state", str(_op), "--add", "prose:owner", "--note", "no PR; owner judgement", "--write"])
+check("a non-PR --note is still accepted", _rc == 0)
+_op2 = state(list(BASE))
+_rc2, _, _ = run(["--state", str(_op2), "--remove", "ds-pr-12", "--reason", "landed", "--write"])
+check("a plain --reason is still accepted", _rc2 == 0)
 
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} ({ran - len(fails)}/{ran} assertions)")
 sys.exit(1 if fails else 0)

@@ -57,9 +57,10 @@ import json
 import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 
 
@@ -118,9 +119,23 @@ PRIORITIES = ("urgent", "normal", "low")
 # canonical completion marker); archived = under tasks/archive/.
 LIFECYCLE_STATES = ("pending", "result_written", "archived")
 
-# `owner` is full, `team` is workspace-write sandboxed, `guest`/`other` are
-# read-only, and `ambient` is sandboxed observation — never instructions.
+# `owner` is full, `team` is workspace-write sandboxed, `guest` is read-only,
+# and `ambient` is sandboxed observation — never instructions.
 ACCESS_TIERS = ("owner", "team", "guest", "other", "ambient")
+
+# Legacy spellings readers accept until every writer (Slack, phone, webhook) emits
+# the value; removal is gated on the writers, not on a release count.
+LEGACY_ACCESS_TIER_ALIASES = {"other": "guest"}
+
+
+def canonical_access_tier(value) -> str:
+    """Normalize a tier string: trimmed, lower-cased, legacy aliases resolved.
+
+    Unknown values pass through unchanged so each reader keeps its own
+    fail-closed default; only the spelling is unified here.
+    """
+    tier = str(value or "").strip().lower()
+    return LEGACY_ACCESS_TIER_ALIASES.get(tier, tier)
 
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
@@ -133,7 +148,7 @@ ACCESS_TIERS = ("owner", "team", "guest", "other", "ambient")
 #   can survive undefanged in user-supplied content.
 # Adding a producer header = add it here; the guard follows automatically.
 KNOWN_HEADER_KEYS = (
-    "id", "timestamp", "session_scope", "task", "source", "access_tier", "user_id",
+    "id", "timestamp", "session_scope", "task", "source", "wire_source", "picker_command", "picker_args", "access_tier", "user_id",
     "channel_id", "priority", "interaction_type", "source_message_id",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reply_chain_ids", "reminder", "author_name",
@@ -145,6 +160,9 @@ KNOWN_HEADER_KEYS = (
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
+    # dm|room verdict a trusted writer stamps (room-bound voice tasks put it
+    # above task:); header status defangs a forged body copy that would claim DM.
+    "channel_kind",
     # Which instance took delivery. Same namespace as the addressee in the body, so a
     # non-addressed core can tell; header status defangs a forged body copy.
     "receiving_instance",
@@ -170,8 +188,23 @@ KNOWN_HEADER_KEYS = (
     # Broker attestation that a Team sender is a collaborator. The bridge
     # appends this line directly, bypassing serialize_task_last's key check.
     "collaborator",
+    # Which worker the sender asked for. INTENT, not placement: the pool's
+    # own binding table decides, and no claim path consults this header.
+    "requested_worker",
+    # A card click the HITL store already recorded, passed on for the turn it causes;
+    # the core trusts it, so the guard must defang a forged copy in body text.
+    "hitl_click",
+    # Broker attestation that the message @-mentioned the owner, not this agent;
+    # the core reads it to keep out of the room, so the guard defangs a forged copy.
+    "owner_mentioned",
+    # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
+    # one line and every later line is the writer's; meaningful only under a verified envelope.
+    "task_layout",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
+# Only the task-mid writer may declare its layout; a task-last file carrying it
+# would hand its multi-line body to the trusted scan.
+WRITER_ONLY_KEYS = frozenset({"task_layout"})
 
 # Canonical live task-id shape: `task-<slug>` where slug is dash-separated
 # [a-z0-9] segments (task-1783..., task-chat-1783..., task-phone-...,
@@ -533,6 +566,126 @@ def _epoch_suffixed(directory, task_id):
     )
 
 
+def _iter_archived_result_candidates(results_dir: Path, task_id: str) -> Iterator[Path]:
+    """Existing archived results for `task_id` in lookup precedence; the id is
+    already validated by the public callers."""
+    archive = Path(results_dir) / "archive"
+    fname = f"{task_id}.txt"
+
+    direct = archive / fname
+    if direct.is_file():
+        yield direct
+
+    try:
+        with os.scandir(archive) as entries:
+            months = sorted((e.name for e in entries
+                             if _MONTH_DIR_RE.match(e.name) and e.is_dir()),
+                            reverse=True)
+    except (OSError, ValueError):
+        months = []
+    for month in months:
+        candidate = archive / month / fname
+        if candidate.is_file():
+            yield candidate
+        # A re-archive inside a month dir carries the epoch suffix; a
+        # literal-name scan misses it. After the exact name, newest first.
+        yield from reversed(_epoch_suffixed(archive / month, task_id))
+
+    # Retention dirs are SIBLINGS of archive/, so they need their own scan;
+    # newest day first, name-filtered before is_dir, as the month scan is.
+    try:
+        with os.scandir(Path(results_dir)) as entries:
+            days = sorted((e.name for e in entries
+                           if _RETENTION_DIR_RE.match(e.name) and e.is_dir()),
+                          reverse=True)
+    except (OSError, ValueError):
+        days = []
+    for day in days:
+        candidate = Path(results_dir) / day / fname
+        if candidate.is_file():
+            yield candidate
+        # Same epoch-suffix rule as the month scan: exact name first, then re-archives.
+        yield from reversed(_epoch_suffixed(Path(results_dir) / day, task_id))
+
+    # glob on a missing or non-directory path yields nothing rather than
+    # raising, so no guard is needed here.
+    yield from reversed(_epoch_suffixed(archive, task_id))
+
+
+def iter_result_candidates(results_dir: Path, task_id: str) -> Iterator[Path]:
+    """Every EXISTING result file for `task_id`, in lookup precedence: the live
+    `results/<id>.txt`, then each archive layout in `find_archived_result`
+    order, newest first within a layout.
+
+    This is the one definition of that order. `find_result` is its first
+    entry; a caller that must not stop at an empty placeholder (an existing
+    live file hiding a ready archived body) walks it until a body is ready.
+    Existence is all it checks — readiness belongs to `delivery.readiness`.
+    Rejects malformed ids rather than globbing with them (traversal gate).
+    """
+    if not valid_archive_lookup_id(task_id):
+        return
+    live = Path(results_dir) / f"{task_id}.txt"
+    if live.is_file():
+        yield live
+    yield from _iter_archived_result_candidates(results_dir, task_id)
+
+
+def index_result_candidates(results_dir: Path, task_ids) -> dict[str, list[Path]]:
+    """Every EXISTING result file for each id in `task_ids`, keyed by id, from ONE listing of
+    each layout `iter_result_candidates` walks (live, `archive/` flat and epoch-suffixed,
+    `archive/<YYYY-MM>/`, retention `archive-<day>/`). A malformed id gets no entry.
+
+    Same files as walking `iter_result_candidates` per id, without the per-id glob over the
+    flat archive: the cost is the listings plus the ids, never their product. Order within an
+    id is not the lookup precedence; use it for "does any candidate satisfy", not "which one".
+    """
+    wanted = {t for t in task_ids if valid_archive_lookup_id(t)}
+    out: dict[str, list[Path]] = {t: [] for t in wanted}
+    if not wanted:
+        return out
+
+    def take(directory: Path, epoch_forms: bool) -> None:
+        try:
+            entries = os.scandir(directory)
+        except OSError:
+            return
+        with entries:
+            for e in entries:
+                name = e.name
+                if not name.endswith(".txt"):
+                    continue
+                stem = name[:-4]
+                if stem in wanted:
+                    if e.is_file():
+                        out[stem].append(directory / name)
+                    continue
+                if epoch_forms:
+                    cut = stem.rfind("-")
+                    if cut > 0 and stem[:cut] in wanted and _EPOCH_SUFFIX_RE.match(stem[cut + 1:]) and e.is_file():
+                        out[stem[:cut]].append(directory / name)
+
+    base = Path(results_dir)
+    take(base, False)
+    archive = base / "archive"
+    take(archive, True)
+    try:
+        with os.scandir(archive) as entries:
+            months = [e.name for e in entries if _MONTH_DIR_RE.match(e.name) and e.is_dir()]
+    except (OSError, ValueError):
+        months = []
+    for month in months:
+        take(archive / month, True)
+    try:
+        with os.scandir(base) as entries:
+            days = [e.name for e in entries if _RETENTION_DIR_RE.match(e.name) and e.is_dir()]
+    except (OSError, ValueError):
+        days = []
+    for day in days:
+        take(base / day, True)
+    return out
+
+
 def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate an archived result across BOTH layouts in use.
 
@@ -547,63 +700,19 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
 
     Month scan mirrors `find_archived_task`: scandir, filter on NAME before
     asking is_dir, newest month first. Rejects malformed ids rather than
-    globbing with them (traversal gate).
+    globbing with them (traversal gate). First existing candidate only — see
+    `iter_result_candidates` for the walk past empty placeholders.
     """
     if not valid_archive_lookup_id(task_id):
         return None
-    archive = Path(results_dir) / "archive"
-    fname = f"{task_id}.txt"
-
-    direct = archive / fname
-    if direct.is_file():
-        return direct
-
-    try:
-        with os.scandir(archive) as entries:
-            months = sorted((e.name for e in entries
-                             if _MONTH_DIR_RE.match(e.name) and e.is_dir()),
-                            reverse=True)
-    except (OSError, ValueError):
-        months = []
-    for month in months:
-        candidate = archive / month / fname
-        if candidate.is_file():
-            return candidate
-        # A re-archive inside a month dir carries the epoch suffix; a
-        # literal-name scan misses it. Fallback only, so an exact hit wins.
-        suffixed = _epoch_suffixed(archive / month, task_id)
-        if suffixed:
-            return suffixed[-1]
-
-    # Retention dirs are SIBLINGS of archive/, so they need their own scan;
-    # newest day first, name-filtered before is_dir, as the month scan is.
-    try:
-        with os.scandir(Path(results_dir)) as entries:
-            days = sorted((e.name for e in entries
-                           if _RETENTION_DIR_RE.match(e.name) and e.is_dir()),
-                          reverse=True)
-    except (OSError, ValueError):
-        days = []
-    for day in days:
-        candidate = Path(results_dir) / day / fname
-        if candidate.is_file():
-            return candidate
-
-    # glob on a missing or non-directory path yields nothing rather than
-    # raising, so no guard is needed here.
-    flat = _epoch_suffixed(archive, task_id)
-    return flat[-1] if flat else None
+    return next(_iter_archived_result_candidates(results_dir, task_id), None)
 
 
 def find_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate a task's result: live dir first, then archive. Archival trails
-    delivery, so an archive-only lookup reads a fresh result as never delivered."""
-    if not valid_archive_lookup_id(task_id):
-        return None
-    live = Path(results_dir) / f"{task_id}.txt"
-    if live.is_file():
-        return live
-    return find_archived_result(results_dir, task_id)
+    delivery, so an archive-only lookup reads a fresh result as never delivered.
+    First EXISTING path, ready or not — completion checks use `iter_result_candidates`."""
+    return next(iter_result_candidates(results_dir, task_id), None)
 
 
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
@@ -725,6 +834,8 @@ def serialize_task_last(headers: "Iterable[tuple[str, str]]", task_body: str) ->
             raise ValueError("pass the body via task_body, not as a header")
         if key not in _KNOWN_KEY_SET:
             raise ValueError(f"unknown header key {key!r} — add it to KNOWN_HEADER_KEYS first")
+        if key in WRITER_ONLY_KEYS:
+            raise ValueError(f"header {key!r} is reserved for the task-mid writer")
         if "\n" in value or "\r" in value:
             raise ValueError(f"header {key!r} value contains a newline")
         lines.append(f"{key}: {value}")
@@ -759,7 +870,15 @@ def set_task_stamper(fn) -> None:
 def write_task_file(tasks_dir: "Path | str", task_id: str,
                     headers: "Iterable[tuple[str, str]]", task_body: str) -> Path:
     """Write `<tasks_dir>/<task_id>.txt` in the task-last shape. The task
-    enters the Durable Work Model's `pending` state the moment this returns."""
+    enters the Durable Work Model's `pending` state the moment this returns.
+
+    A hard kill between staging and publish leaves the `.<task_id>.*.tmp`
+    behind, and nothing reaps it: the dot and the missing `.txt` that keep it
+    out of the watcher keep it out of every sweep too, and `find_task_file`'s
+    `{task_id}.*` glob cannot match a leading-dot name either. Bounded — one
+    small file per hard kill inside a sub-millisecond window — and deliberately
+    not reaped, because a reaper would race a live writer for the same names.
+    """
     if not valid_task_id(task_id):
         raise ValueError(f"not a canonical task id: {task_id!r}")
     hdrs = list(headers)
@@ -773,5 +892,21 @@ def write_task_file(tasks_dir: "Path | str", task_id: str,
     d = Path(tasks_dir)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{task_id}.txt"
-    path.write_text(apply_task_stamper(serialize_task_last(hdrs, task_body)))
+    text = apply_task_stamper(serialize_task_last(hdrs, task_body))
+    # `task:` is last, so a partial file still PARSES with the ask short or empty.
+    # mkstemp is per-writer unique; the dot and `.tmp` keep it out of task sweeps.
+    fd, staged = tempfile.mkstemp(prefix=f".{task_id}.", suffix=".tmp", dir=str(d))
+    tmp = Path(staged)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     return path

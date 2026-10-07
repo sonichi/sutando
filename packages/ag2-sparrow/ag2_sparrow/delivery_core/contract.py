@@ -195,6 +195,18 @@ class ClaimBackend(Protocol):
         """
         ...
 
+    def resend_epoch(self, item_id: str) -> int:
+        """The item's operator re-send generation; 0 until a requeue bumps it.
+
+        Declared, not duck-typed: the core derives the idempotency key from it,
+        so a backend that silently lacks it presents the SAME key the provider
+        already saw for the attempt that parked the item — the operator reads
+        `requeued`, and the provider dedupes the re-send away with no error on
+        any surface. Return 0 for a backend that does not track re-sends; that
+        is a decision the contract suite can see, not an absence it cannot.
+        """
+        ...
+
     # False = complete() accepts provider/destination and DROPS them.
     # Check this; a signature does not imply durable storage.
     persists_receipt_metadata: bool = False

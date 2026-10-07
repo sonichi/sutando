@@ -11,6 +11,7 @@ right states, an episode key the Manager can dedup on, resolution when the
 core moves on, and never dying of its own escalation.
 """
 import importlib.util as u
+import json
 import os
 import pathlib
 import sys
@@ -49,6 +50,57 @@ class TestMessage(unittest.TestCase):
     def test_logged_out_says_signed_out_not_blocked(self):
         self.assertIn("signed out",
                       M.escalation_message("logged-out", "d", None, None))
+
+    LOGIN_PANE = (
+        "───────────────────────────────── sutando-core ─\n"
+        "Browser didn't open? Use the url below to sign in:\n"
+        "https://claude.ai/oauth/authorize?code=true&client_id=abc&scope=user%3Aprofile+user%3A\n"
+        "s%3Aclaude_code+user%3Amcp_servers&code_challenge=ncifI5jOgzI138TpX&state=uvUrUTS4WTI2FL\n"
+        "Paste code here if prompted > \n"
+        "Esc to cancel\n"
+        "  ⏵⏵ bypass permissions on · 1 monitor · esc to interrupt · ← for agents\n"
+        "[sutando-c0:2.1.261* 2:monitor                       \"✳ sutando-core\" 00:55 06-Sep-26\n"
+    )
+
+    def test_the_excerpt_is_the_prompt_not_the_chrome_around_it(self):
+        """The owner saw a card whose 'terminal' was the tail of an OAuth URL plus a rule line
+        that ran past the card (2026-09-06): the pane's last six lines are not the prompt."""
+        b = M.escalation_message("blocked-human", "awaiting user: login", "login", self.LOGIN_PANE)
+        self.assertIn("Paste code here if prompted", b)
+        self.assertIn("Esc to cancel", b)
+        self.assertIn("Use the url below to sign in", b)
+        for noise in ("code_challenge", "%3A", "https://", "───", "bypass permissions", "2:monitor"):
+            self.assertNotIn(noise, b, noise)
+
+    def test_the_excerpt_is_plain_lines_not_a_code_fence(self):
+        """The room card renders text, so a markdown fence arrives as literal backticks."""
+        b = M.escalation_message("blocked-human", "d", "selection", "Pick one:\n> a\n  b")
+        self.assertNotIn("```", b)
+        self.assertIn("  Pick one:", b)
+
+    def test_an_all_chrome_pane_falls_back_to_the_raw_tail(self):
+        """Over-filtering and 'nothing was there' look the same from inside the filter, and this
+        card is the only thing that reaches the owner: fail noisy, never silent."""
+        b = M.escalation_message("blocked-human", "d", "unknown",
+                                 "──────── x ────────\nhttps://example.test/a?b=1\n")
+        self.assertIn("What the terminal is showing", b)
+        self.assertIn("https://example.test/a?b=1", b)
+
+    def test_blank_lines_and_long_unbroken_tokens_are_dropped(self):
+        pe = M.prompt_excerpt
+        self.assertEqual(pe("keep me\n\nkeep me too"), ["keep me", "keep me too"])
+        self.assertEqual(pe("keep me\n" + "a1b2c3" * 16 + "\nkeep me too"), ["keep me", "keep me too"])
+
+    def test_a_prompt_that_mentions_the_footer_words_is_kept(self):
+        pe = M.prompt_excerpt
+        self.assertEqual(pe("Bypass permissions for this tool? (y/n)"), ["Bypass permissions for this tool? (y/n)"])
+        self.assertEqual(pe("Enable MCP for agents? [y/N]"), ["Enable MCP for agents? [y/N]"])
+        self.assertEqual(pe("  ⏵⏵ bypass permissions on · 1 monitor · ← for agents\nreal"), ["real"])
+
+    def test_a_short_boxed_option_survives_the_rule_filter(self):
+        pe = M.prompt_excerpt
+        self.assertEqual(pe("╭──────╮\n│ Yes │\n╰──────╯"), ["Yes"])
+        self.assertEqual(pe("──── sutando-core ─\n❯ 1. Yes"), ["❯ 1. Yes"])
 
 
 class TestEscalate(unittest.TestCase):
@@ -127,6 +179,110 @@ class TestResolve(unittest.TestCase):
         M.resolve_escalations(m, "s")
         again = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
         self.assertNotEqual(first.id, again.id)
+
+
+_FOOTER = ("────────\n❯ \n────────\n"
+           "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+_LOGIN_EXPIRED = "Login expired · Please run /login"
+_LOGIN_REFUSED = f"❯ /startup\n  ⎿  {_LOGIN_EXPIRED}\n✻ Worked for 0s\n"
+_REAL_TURN = ("❯ /startup\n● /startup complete: watcher streaming, 3 crons registered.\n"
+              "✻ Worked for 2m 14s · done 12:55 PM\n")
+
+
+class TestSignedOutCardNeedsProof(unittest.TestCase):
+    """User feedback 2026-09-29 (P1-41): a "session expired" card read "✓ Resolved — Sutando
+    has continued its work" while the worker still refused every turn in 0 s. Leaving the
+    blocked set is not recovery for a signed-out card; a turn that ran is."""
+
+    def _signed_out(self, m, session="s"):
+        state, detail, prompt, kind = M.compose_state(_LOGIN_REFUSED + _FOOTER, "idle", True)
+        self.assertEqual((state, kind), ("logged-out", "login"), "fixture no longer reads signed out")
+        return M.escalate(m, state, detail, kind, prompt, session)
+
+    def test_the_card_is_the_auth_card(self):
+        r = self._signed_out(_mgr())
+        self.assertEqual(r.kind, "auth")
+        self.assertIn("authenticate", [a.kind for a in r.actions])
+
+    def test_a_newer_typed_prompt_does_not_resolve_it(self):
+        # The pool typed at the seat again: the refusal is no longer the last turn, the seat
+        # is exactly as signed out. Old code resolved here.
+        m = _mgr()
+        r = self._signed_out(m)
+        pane = _LOGIN_REFUSED + _FOOTER.replace("❯ \n", "❯ try again\n", 1)
+        self.assertEqual(M.resolve_escalations(m, "s", pane), [])
+        self.assertEqual([x.id for x in m.active()], [r.id])
+
+    def test_an_empty_capture_does_not_resolve_it(self):
+        m = _mgr()
+        r = self._signed_out(m)
+        for pane in (None, "", _FOOTER):
+            self.assertEqual(M.resolve_escalations(m, "s", pane), [], repr(pane))
+        self.assertEqual([x.id for x in m.active()], [r.id])
+
+    def test_a_turn_that_ran_resolves_it(self):
+        m = _mgr()
+        r = self._signed_out(m)
+        self.assertEqual(M.resolve_escalations(m, "s", _LOGIN_REFUSED + _REAL_TURN + _FOOTER), [r.id])
+        self.assertEqual(m.get(r.id).status, STATUS_RESOLVED)
+
+    def test_login_successful_resolves_it(self):
+        m = _mgr()
+        r = self._signed_out(m)
+        self.assertEqual(M.resolve_escalations(m, "s", _LOGIN_REFUSED + "  ⎿  Login successful\n" + _FOOTER),
+                         [r.id])
+
+    def test_other_cards_of_the_session_still_resolve_on_the_same_tick(self):
+        m = _mgr()
+        held = self._signed_out(m)
+        other = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
+        self.assertEqual(M.resolve_escalations(m, "s", _FOOTER), [other.id])
+        self.assertEqual([x.id for x in m.active()], [held.id])
+
+
+class TestSignedOutSeatAcrossTicks(unittest.TestCase):
+    """The monitor loop itself, one --once tick per pane, against a real store: the card
+    a refused login raises survives the re-armed seat's next prompt and closes only on a
+    turn that ran. The middle tick is the one the old code resolved."""
+
+    def _tick(self, out, pane, health="idle"):
+        from unittest.mock import patch
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": health}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--session", "sutando-worker-1",
+                "--out", out, "--once", "--stable", "1", "--seat", "worker comm"]
+        with patch.object(M, "capture", lambda s, sess: pane), \
+                patch.object(M, "_load_runtime_health", lambda: _RH()), \
+                patch.object(M, "gateway_alive", lambda *a: True), \
+                patch.object(M, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(sys, "argv", argv):
+            M.main()
+        with open(out) as f:
+            return json.load(f)
+
+    def test_the_card_holds_until_a_turn_ran(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "state", "core-supervisor.sutando-worker-1.json")
+            os.makedirs(os.path.dirname(out))
+            m = M._hitl_manager(out)
+            sig = self._tick(out, _LOGIN_REFUSED + _FOOTER)
+            self.assertEqual((sig["state"], sig["kind"]), ("logged-out", "login"))
+            [card] = m.active()
+            self.assertEqual(card.kind, "auth")
+            self.assertEqual(card.device["name"], "worker comm")
+            sig = self._tick(out, _LOGIN_REFUSED + _FOOTER.replace("❯ \n", "❯ try again\n", 1))
+            self.assertEqual(sig["state"], "logged-out")
+            self.assertEqual([r.id for r in m.active()], [card.id], "re-armed seat closed the card")
+            sig = self._tick(out, _LOGIN_REFUSED + _LOGIN_REFUSED + _FOOTER, health="working")
+            self.assertEqual([r.id for r in m.active()], [card.id], "a second refusal is the same episode")
+            sig = self._tick(out, _LOGIN_REFUSED + _REAL_TURN + _FOOTER)
+            self.assertEqual(sig["state"], "idle-ready")
+            self.assertEqual(m.active(), [])
+            self.assertEqual(m.get(card.id).status, STATUS_RESOLVED)
 
 
 class TestScope(unittest.TestCase):
@@ -211,6 +367,149 @@ class TestDegradesWithoutDyingV(unittest.TestCase):
             ws = pathlib.Path(td)
             (ws / "state").mkdir()
             self.assertIsNotNone(M._hitl_manager(str(ws / "state" / "core-status.json")))
+
+
+PERM = ("  Dangerous rm operation on a possibly-empty path\n  Do you want to proceed?\n"
+        "  ❯ 1. Yes\n    2. Yes, and don't ask again for rm commands\n    3. No\n  Esc to cancel")
+
+
+def _click(m, r, action_id):
+    from hitl.schema import ActionReply
+    m.apply_action(ActionReply(hitl_id=r.id, expected_revision=r.revision,
+                               action_id=action_id, guard=r.guard))
+
+
+class TestDrive(unittest.TestCase):
+    """A click on the card is realised as keystrokes into the dialog it was made
+    for — once, only by a human, only while that dialog is still on screen."""
+
+    def _blocked(self, m, session="s"):
+        return M.escalate(m, "blocked-human", "awaiting user: permission", "permission", PERM, session)
+
+    def test_the_real_dialog_through_classify_is_a_no_yes_card(self):
+        """Through the monitor's own classifier, not a hand-picked gate label: the
+        live pane names this dialog `selection`, and the card must still be No/Yes."""
+        state, detail, prompt, kind = M.compose_state(PERM, "working", True)
+        self.assertEqual((state, kind), ("blocked-human", "selection"))
+        r = M.escalate(_mgr(), state, detail, kind, prompt, "s")
+        self.assertEqual(r.kind, "permission")
+        self.assertEqual([a.label for a in r.actions], ["No", "Yes", "Open terminal"])
+
+    def test_a_numbered_trust_dialog_through_classify_gets_no_button(self):
+        """End to end through the monitor's own classifier: this pane is labelled
+        `selection` (caret row nearest the bottom) and must still not offer Yes."""
+        TRUST = ("  Do you trust the files in this folder?\n  ❯ 1. Yes, proceed\n"
+                 "    2. No, exit\n  Enter to confirm · Esc to cancel")
+        state, detail, prompt, kind = M.compose_state(TRUST, "working", True)
+        self.assertEqual(kind, "selection", "fixture no longer reproduces the label collision")
+        r = M.escalate(_mgr(), state, detail, kind, prompt, "s")
+        self.assertEqual(r.kind, "core-blocked")
+        self.assertEqual([a.label for a in r.actions], ["Open terminal"])
+
+    def test_a_permission_gate_carries_no_yes_buttons_not_ack(self):
+        r = self._blocked(_mgr())
+        self.assertEqual(r.kind, "permission")
+        self.assertEqual([a.label for a in r.actions], ["No", "Yes", "Open terminal"])
+
+    def test_a_clicked_no_walks_the_caret_to_no_and_confirms(self):
+        m, sent = _mgr(), []
+        r = self._blocked(m)
+        _click(m, r, "deny")
+        acted = M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: sent.append(k) or True)
+        self.assertEqual(sent, ["Down", "Down", "Enter"])
+        self.assertEqual(acted, [(r.id, ["Down", "Down", "Enter"])])
+
+    def test_a_click_is_driven_once_not_every_tick(self):
+        m, sent = _mgr(), []
+        r = self._blocked(m)
+        _click(m, r, "allow")
+        for _ in range(5):
+            M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: sent.append(k) or True)
+        self.assertEqual(sent, ["Enter"])
+
+    def test_a_click_against_a_changed_dialog_sends_nothing_and_expires_the_card(self):
+        from hitl.schema import STATUS_EXPIRED
+        m, sent = _mgr(), []
+        r = self._blocked(m)
+        _click(m, r, "allow")
+        other = PERM.replace("possibly-empty", "non-empty")
+        M.drive_escalations(m, "s", other, "blocked-human", lambda k: sent.append(k) or True)
+        self.assertEqual(sent, [])
+        self.assertEqual(m.get(r.id).status, STATUS_EXPIRED)
+        self.assertEqual(m.get(r.id).answer, {"note": "This prompt has changed. Refresh the action."})
+
+    def test_an_unclicked_card_is_never_driven(self):
+        m, sent = _mgr(), []
+        self._blocked(m)
+        M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: sent.append(k) or True)
+        self.assertEqual(sent, [])
+
+    def test_another_sessions_click_is_not_driven_into_this_pane(self):
+        m, sent = _mgr(), []
+        r = self._blocked(m, session="worker-2")
+        _click(m, r, "allow")
+        M.drive_escalations(m, "worker-1", PERM, "blocked-human", lambda k: sent.append(k) or True)
+        self.assertEqual(sent, [])
+
+    def test_a_policy_decision_is_never_typed_into_a_human_gate(self):
+        from hitl.manager import POLICY_DECIDER
+        m, sent = _mgr(), []
+        r = self._blocked(m)
+        _click(m, r, "allow")
+        with m.store.locked():
+            cur = m.get(r.id); cur.decided_by = POLICY_DECIDER; m.store.save(cur)
+        M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: sent.append(k) or True)
+        self.assertEqual(sent, [])
+
+    def test_a_hook_driver_permission_card_is_not_resolved_by_the_core_moving(self):
+        """TUI cards can now be kind=permission too; scope is the source, not the kind."""
+        m = _mgr()
+        from hitl.schema import Action, HumanRequirement
+        hook = m.create(HumanRequirement(kind="permission", runtime="claude", message="may I",
+                                         guard="hook:1", device={"id": "s", "name": "s"},
+                                         subject={"session": "s", "tool": "Bash"},
+                                         actions=[Action("allow", "allow_once", "Allow")]))
+        mine = self._blocked(m)
+        self.assertEqual(M.resolve_escalations(m, "s"), [mine.id])
+        self.assertNotEqual(m.get(hook.id).status, STATUS_RESOLVED)
+
+    def test_no_manager_is_survivable_for_the_driver_too(self):
+        self.assertEqual(M.drive_escalations(None, "s", PERM, "blocked-human", lambda k: True), [])
+
+
+class TestPartialSend(unittest.TestCase):
+    """Reviewer P1: a key sequence that half-lands must never read as driven, and
+    must never be finished later against a caret nobody can place."""
+
+    def _blocked(self, m):
+        return M.escalate(m, "blocked-human", "awaiting user: permission", "permission", PERM, "s")
+
+    def test_a_refused_second_key_expires_the_card_and_records_only_what_went_in(self):
+        from hitl.schema import STATUS_EXPIRED
+        m, sent = _mgr(), []
+        r = self._blocked(m)
+        _click(m, r, "deny")                      # plan: Down, Down, Enter
+        def flaky(k):
+            sent.append(k)
+            return len(sent) < 2                  # first Down accepted, second refused
+        acted = M.drive_escalations(m, "s", PERM, "blocked-human", flaky)
+        self.assertEqual(sent, ["Down", "Down"])
+        self.assertEqual(acted, [(r.id, None)])
+        cur = m.get(r.id)
+        self.assertEqual(cur.status, STATUS_EXPIRED)
+        self.assertEqual(cur.subject["driven_keys"], ["Down"])
+        self.assertTrue(cur.subject["driven_partial"])
+        self.assertEqual(cur.answer, {"note": "The answer did not take. Open the terminal to finish it."})
+
+    def test_after_a_partial_send_nothing_is_ever_typed_again_for_that_card(self):
+        m, sent = _mgr(), []
+        r = self._blocked(m)
+        _click(m, r, "deny")
+        M.drive_escalations(m, "s", PERM, "blocked-human", lambda k: sent.append(k) or len(sent) < 2)
+        moved = PERM.replace("  ❯ 1. Yes", "    1. Yes").replace("    2. Yes, and", "  ❯ 2. Yes, and")
+        for _ in range(3):
+            M.drive_escalations(m, "s", moved, "blocked-human", lambda k: sent.append(k) or True)
+        self.assertEqual(sent, ["Down", "Down"])
 
 
 if __name__ == "__main__":

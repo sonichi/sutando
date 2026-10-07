@@ -9,7 +9,7 @@ Defaults by source (writers emit these; consumers can override per call):
   voice, phone            -> "urgent"   (sub-second response expected)
   chat, context-drop      -> "normal"   (owner foreground)
   discord, telegram, slack (owner-tier)        -> "normal"
-  discord, telegram, slack (team/other-tier)   -> "low"
+  discord, telegram, slack (team/guest-tier)   -> "low"
   health-check, sync-memory, sync-workspace, cron -> "low"
 
 Anything not recognized parses as "normal" (fail-open). Order on disk:
@@ -44,7 +44,7 @@ def default_priority_for_source(source: str, access_tier: str | None = None) -> 
     if s in ("chat", "context-drop"):
         return "normal"
     if s in ("discord", "telegram", "slack"):
-        # Owner-tier traffic stays at normal; team/other gets demoted so a
+        # Owner-tier traffic stays at normal; team/guest gets demoted so a
         # public-channel ping never preempts an owner-DM follow-up. Slack was
         # omitted originally (Air's finding 2026-07-24) — it carries the exact
         # same owner/team/other tier model as discord, so its non-owner tasks

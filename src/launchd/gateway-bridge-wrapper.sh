@@ -6,7 +6,7 @@
 # REMOTE_TASK_TOKEN (legacy AG2_REMOTE_TOKEN), which lives in the ag2space
 # channel .env — NOT in the environment launchd hands the job. launchd doesn't
 # source shell profiles or .env files, so we resolve + load the channel .env
-# here, map the legacy token names to the ones the bridge reads, then exec the
+# here, map the legacy token names to the ones the bridge reads, then supervise the
 # bridge. Mirrors the credential-proxy-wrapper.sh pattern.
 #
 # Called by com.sutando.gateway-bridge.plist as the ProgramArguments entry so
@@ -32,6 +32,11 @@ fi
 # Resolve + load the ag2space channel .env (holds REMOTE_TASK_TOKEN). Honor
 # $CLAUDE_CONFIG_DIR if the plist exports it (claude-sutando installs); the
 # config helper falls back to ~/.claude otherwise.
+# What the process environment (the plist, or a caller) provided, kept apart from
+# what the .env provides, so a re-read can drop a removed .env token without
+# dropping an environment-provided one.
+_ENV_REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-}"; _ENV_AG2_REMOTE_TOKEN="${AG2_REMOTE_TOKEN:-}"
+_ENV_REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-}"; _ENV_AG2_REMOTE_TIER="${AG2_REMOTE_TIER:-}"
 if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)"; then
     [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
 fi
@@ -61,6 +66,8 @@ export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
 # install; don't hammer the system, just stop cleanly (launchd honors the clean
 # exit under our KeepAlive.SuccessfulExit=false policy).
 if [ -z "$REMOTE_TASK_TOKEN" ]; then
+    # Exit 0 into an idle job on purpose: startup-runtime's "loaded but idle"
+    # branch kickstarts it once a token exists, and an idle PID would read as running.
     echo "[gateway-bridge-wrapper] no REMOTE_TASK_TOKEN configured — nothing to run; exiting cleanly." >&2
     exit 0
 fi
@@ -77,4 +84,77 @@ if [ -f "$_EVICT_HELPER" ]; then
   sleep 0.3
 fi
 
-exec python3 "$REPO/src/remote-gateway-bridge.py"
+# Supervise the bridge instead of exec-ing it, the same way channel-bridge-wrapper.sh
+# does: a bridge that exits (restart.sh's pkill, a crash, a clean stop) is relaunched
+# by this wrapper, so the launchd job never sits idle after a clean exit. An exit
+# inside the deliberate-restart window is expected and raises no alert; rc 75 is
+# the bridge's own stand-down and ends the wrapper for good.
+if ! WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || [ -z "$WORKSPACE" ]; then
+    echo "[gateway-bridge-wrapper] FATAL: workspace unresolvable via scripts/sutando-config.sh (check sutando.config.local.json) — not starting the bridge" >&2
+    osascript -e 'display notification "Gateway bridge cannot resolve the workspace; it is not running." with title "Sutando"' >/dev/null 2>&1 || true
+    exit 0
+fi
+STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"
+mkdir -p "$STATE_DIR" "$WORKSPACE/results" 2>/dev/null || true
+MARKER="$STATE_DIR/gateway.started"
+DELIBERATE="$STATE_DIR/deliberate-restart"
+DELIBERATE_WINDOW_S="${SUTANDO_BRIDGE_DELIBERATE_WINDOW_S:-180}"
+ALERT_STAMP="$STATE_DIR/gateway.last-alert"
+ALERT_COOLDOWN_S="${SUTANDO_BRIDGE_ALERT_COOLDOWN_S:-600}"
+RESTART_DELAY="${SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY:-10}"
+_age() { local t; t="$(cat "$1" 2>/dev/null || echo 0)"; echo $(( $(date +%s) - ${t:-0} )); }
+emit_restart_alert() {
+  NOW="$(date +%s)"
+  echo "[gateway-bridge-wrapper] previous process exited; automatically restarting" >&2
+  if [ -f "$DELIBERATE" ] && [ "$(_age "$DELIBERATE")" -lt "$DELIBERATE_WINDOW_S" ]; then
+    echo "[gateway-bridge-wrapper] exit within a deliberate restart window; no alert" >&2
+    return 0
+  fi
+  if [ -f "$ALERT_STAMP" ] && [ "$(_age "$ALERT_STAMP")" -lt "$ALERT_COOLDOWN_S" ]; then
+    echo "[gateway-bridge-wrapper] alert cooldown active; not repeating" >&2
+    return 0
+  fi
+  echo "$NOW" > "$ALERT_STAMP"
+  printf '%s\n' "⚠️ The gateway bridge exited and was automatically restarted." > "$WORKSPACE/results/proactive-gateway-bridge-restarted-$NOW.txt"
+  osascript -e "display notification \"The gateway bridge exited and was automatically restarted.\" with title \"Sutando\"" >/dev/null 2>&1 || true
+}
+if [ -f "$MARKER" ]; then emit_restart_alert; fi
+date +%s > "$MARKER"
+CHILD_PID=''
+STOPPING=0
+stop_wrapper() {
+  STOPPING=1
+  [ -z "$CHILD_PID" ] || kill "$CHILD_PID" 2>/dev/null || true
+}
+trap stop_wrapper TERM INT HUP
+while [ "$STOPPING" = 0 ]; do
+  # A rotated or removed .env token must reach the next child: reset to the
+  # environment-provided values, re-read the .env, redo the legacy mapping.
+  REMOTE_TASK_TOKEN="$_ENV_REMOTE_TASK_TOKEN"; AG2_REMOTE_TOKEN="$_ENV_AG2_REMOTE_TOKEN"
+  REMOTE_TASK_TIER="$_ENV_REMOTE_TASK_TIER"; AG2_REMOTE_TIER="$_ENV_AG2_REMOTE_TIER"
+  [ -n "${_RELAY_ENV:-}" ] && [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+  REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
+  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
+  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
+  if [ -z "$REMOTE_TASK_TOKEN" ]; then
+    echo "[gateway-bridge-wrapper] token removed — nothing to relaunch; exiting cleanly." >&2
+    rm -f "$MARKER"
+    exit 0
+  fi
+  python3 "$REPO/src/remote-gateway-bridge.py" &
+  CHILD_PID=$!
+  set +e
+  wait "$CHILD_PID"
+  CHILD_RC=$?
+  set -e
+  CHILD_PID=''
+  [ "$STOPPING" = 0 ] || break
+  [ "$CHILD_RC" -eq 75 ] && { rm -f "$MARKER"; exit 0; }
+  emit_restart_alert
+  sleep "$RESTART_DELAY" &
+  CHILD_PID=$!
+  set +e
+  wait "$CHILD_PID"
+  set -e
+  CHILD_PID=''
+done

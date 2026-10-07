@@ -93,12 +93,19 @@ function stableInstructions(text: string): string {
 	return text.split('\n').filter(l =>
 		!(l.startsWith('- ') && l.endsWith(' — call these directly, not through work. Instant.'))
 		&& !(l.startsWith('- ') && l.endsWith('. Instant.'))
+		&& !l.startsWith('You run entirely on the owner\'s local ')
 	).join('\n');
 }
 
 // The tuned static entries, in order (multi-line entries appear as their
 // constituent lines; conditional/dynamic segments are asserted separately).
 const va = readFileSync(join(REPO, 'src', 'voice-agent.ts'), 'utf-8');
+function toolTableRegionHash(source: string): string {
+	const normalized = source.replace(/\r\n/g, '\n');
+	const start = normalized.indexOf('const mainAgentTools');
+	const line = normalized.slice(start, normalized.indexOf('\n', start));
+	return createHash('sha256').update(line).digest('hex');
+}
 const anchors = {
 	note: 'Step-5 behavior anchors (post-5a-1: real factory output). Deliberate prompt changes must regenerate via ANCHOR_UPDATE=1 with the diff called out in the PR.',
 	tools: importableTools.map(toolAnchor)
@@ -106,8 +113,7 @@ const anchors = {
 	instructions_hash_fixed_env: createHash('sha256').update(stableInstructions(instructions)).digest('hex'),
 	meeting_greeting: cfg.buildGreeting(ctx({ meeting: true })),
 	regions: {
-		tool_table: createHash('sha256').update(
-			(() => { const i = va.indexOf('const mainAgentTools'); return va.slice(i, va.indexOf('\n', i)); })()).digest('hex'),
+		tool_table: toolTableRegionHash(va),
 	},
 };
 
@@ -139,6 +145,11 @@ test('instructions: injected seams land where tuned', () => {
 	assert.ok(instructions.includes('[ANCHOR-AGENT-CONTEXT]'), 'agent context block');
 	assert.ok(instructions.includes('The Sutando GitHub repo is https://github.com/sonichi/sutando.'), 'repo line');
 	assert.ok(instructions.includes('- Google Search for current-info queries'), 'googleSearch=true line');
+});
+
+test('instructions identify the actual host platform', () => {
+	const expectedHost = process.platform === 'darwin' ? 'Mac' : process.platform === 'win32' ? 'Windows' : process.platform;
+	assert.ok(instructions.includes(`owner's local ${expectedHost}`));
 });
 
 test('instructions: googleSearch=false omits the search line (capability honesty)', () => {
@@ -173,6 +184,13 @@ test('greeting: reconnect replay guard preserved', () => {
 
 test('source tripwire: tool-table composition line unchanged', () => {
 	assert.deepStrictEqual(anchors.regions, expected.regions);
+});
+
+test('source tripwire: line endings do not change the hash', () => {
+	assert.strictEqual(
+		toolTableRegionHash('const mainAgentTools = [];\nnext'),
+		toolTableRegionHash('const mainAgentTools = [];\r\nnext'),
+	);
 });
 
 test('anchor breadth: importable tool table is non-trivial', () => {

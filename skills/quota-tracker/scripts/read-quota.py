@@ -274,6 +274,11 @@ def main():
     util_7d = float(headers.get("anthropic-ratelimit-unified-7d-utilization", 0))
     reset_5h = headers.get("anthropic-ratelimit-unified-5h-reset", "")
     reset_7d = headers.get("anthropic-ratelimit-unified-7d-reset", "")
+    # The API also meters a top-tier-model weekly lane (`7d_oi`); a pinned
+    # Opus/Fable core can exhaust it while the all-model windows read fine.
+    util_7d_oi_raw = headers.get("anthropic-ratelimit-unified-7d_oi-utilization")
+    util_7d_oi = float(util_7d_oi_raw) if util_7d_oi_raw is not None else None
+    reset_7d_oi = headers.get("anthropic-ratelimit-unified-7d_oi-reset", "")
 
     # Stated once: a second copy of this predicate drifts the moment either is
     # extended, and the two fields then contradict each other in one payload.
@@ -308,6 +313,11 @@ def main():
         result["reset_5h"] = datetime.fromtimestamp(int(reset_5h)).isoformat()
     if reset_7d:
         result["reset_7d"] = datetime.fromtimestamp(int(reset_7d)).isoformat()
+    if util_7d_oi is not None:
+        result["utilization_7d_oi"] = util_7d_oi
+        result["remaining_7d_oi_pct"] = round((1 - util_7d_oi) * 100)
+        if reset_7d_oi:
+            result["reset_7d_oi"] = datetime.fromtimestamp(int(reset_7d_oi)).isoformat()
 
     # Unrouted: the utilization delta is another session's, and _update_burn_rate
     # ends in _save_burn_history — a foreign sample outlives the banner flagging it.
@@ -359,6 +369,11 @@ def main():
     print(f"7d window: {int(util_7d * 100)}% used, {result['remaining_7d_pct']}% remaining")
     if reset_7d:
         print(f"  Resets: {datetime.fromtimestamp(int(reset_7d)).strftime('%H:%M %b %d')}")
+    if util_7d_oi is not None:
+        print(f"7d-oi window (top-tier models): {int(util_7d_oi * 100)}% used, "
+              f"{result['remaining_7d_oi_pct']}% remaining")
+        if reset_7d_oi:
+            print(f"  Resets: {datetime.fromtimestamp(int(reset_7d_oi)).strftime('%H:%M %b %d')}")
     if not routed:
         print("Burn rate / passes-left: SUPPRESSED — computed from traffic that is not "
               "this session's.")

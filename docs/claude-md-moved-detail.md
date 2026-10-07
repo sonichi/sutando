@@ -1,5 +1,14 @@
 # Detail moved verbatim from CLAUDE.md (2026-08-17 context-budget diet)
 
+## Windows task watcher
+
+Claude Code 2.1.168 on Windows does not ship the `Monitor` tool. `src/startup.ps1`
+therefore launches `src/task-dispatcher.ps1`, a `FileSystemWatcher` process that
+atomically claims task files and invokes `claude --print`. The dispatcher gives
+chat low latency while the long-running core retains scheduled/proactive work.
+Each dispatched task is a separate subprocess, so continuity is stored per
+channel through resumable Claude sessions rather than shared process context.
+
 ## Result-marker parser migration status
 
 *Migration status: all four Python consumers conform, and the guard enforces it.*
@@ -35,13 +44,24 @@ api_key = get_vault_key("OPENAI_API_KEY")  # raises KeyError if not found
 
 Payload schema:
 ```json
-{"host": "...", "pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...", "socket": "...", "locality": {"kind": "local|cloud", "host": "..."}, "schema_version": 2}
+{"host": "...", "pid": ..., "heartbeat_pid": ..., "started_at": ..., "last_beat_at": ..., "status": "...",
+ "socket": "...", "session": "sutando-core", "locality": {"kind": "local|cloud", "host": "..."},
+ "backend": "tmux", "tmux_binary": "/opt/homebrew/bin/tmux", "tmux_version": "3.6b", "tmux_server_version": "3.6b",
+ "tmux_verified": true, "tmux_candidates": ["/opt/homebrew/bin/tmux"], "schema_version": 4}
 ```
+
+For an explicitly selected non-Claude runtime, `pid` comes only from the panes
+of the recorded socket and exact session; a same-named Claude process elsewhere
+cannot supply it. Claude and unknown-runtime resolution retain the existing
+name-identity fallback, which is not socket attestation. `heartbeat_pid` remains
+the writer's PID, separate from the core PID.
 
 This is foundation for the lease-based multi-core scheduler — workers consult
 the alive directory to know who's available before assigning a claim. For
 single-machine use today it also gives `health-check.py` and the dashboard a
 cleaner liveness probe than scanning `pgrep -f claude`.
+
+`backend` / `tmux_binary` / `tmux_version` / `tmux_server_version` / `tmux_verified` / `tmux_candidates` (schema 4): a tmux client **verified** to speak to this core's server — the first of the PATH `tmux` (what the launchers run) and `SUTANDO_TMUX_BIN` (what the app exports) that proves two facts with two commands — `display-message -p -t =<session> '#{version}|#{socket_path}'` must answer with the **server's own socket path** (tmux renders `#{session_name}` empty under `-t`, so the session is never taken from that output), and `has-session -t =<session>` on the **same binary** must resolve the observed session (an arbitrary executable that exits 0 is rejected; a `-V` that does not start with `tmux` records no version) — with its `-V`, and the version the **server itself** reports. Every probe the writer makes (session discovery, core pid) goes through that same client, so a protocol-refused PATH `tmux` beside a compatible exported one still finds the session. `restart.sh` and the Codex launcher's `--restart` run `core_heartbeat.py --stop` first, so an upgrade hands `.alive` to the new writer instead of keeping the old one (and its old schema) alive. Recorded because tmux versions with incompatible protocols cannot talk to each other, and a client that cannot connect reads a live core as absent; a reader starts from the recorded client instead of guessing. `tmux_binary` is a compatible client, **not** a claim about who created the server; when nothing speaks the fields are null and `tmux_verified` is false. The backend record is re-verified on every beat; the client the probes use is re-chosen at most once per beat (a hit is kept ~10 s, a miss retried every call). `--stop` signals only the writer(s) this checkout's own records name (its pidfile and `.alive`'s `heartbeat_pid`) after `ps` shows an interpreter running exactly this script — never an argv sweep — and both restart paths resolve that interpreter through `scripts/python-binary.sh`, failing closed with a warning when none resolves. A reader should still re-verify before trusting a recorded path — it may have moved. `pid` is the core's, `heartbeat_pid` the writer's (schema 3); `session` is the observed tmux session.
 
 `locality` is the core's self-reported {kind: local|cloud, host} (Track 10) —
 additive and informational; mtime remains the liveness signal, so readers that
@@ -83,7 +103,11 @@ user-facing reply instead of N separate ones:
 
 - `[deduped: task-<other-id>]` — both voice (task-bridge) and Discord (discord-bridge) silently archive this task as done, no narration, no DM. Put the full reply in the other task's result file and put this marker in each superseded task's result. The canonical way to handle thread-consolidated replies (e.g. when voice over-delegates 3 tasks for the same continuation utterance — see `src/task-bridge.ts:527`).
 - `[no-send]` — Discord bridge skips delivery for this task (still archives). Use when the task is internally handled but produces no user-visible reply.
-- `[REPLIED]` — Discord bridge skips delivery (already sent through another path).
+- `[REPLIED]` — skip delivery because the answer was already sent through another path.
+  A dedup holder with this marker counts as answered; it must not trigger a
+  "delivered nothing" requeue or warning. This trusts the marker assertion,
+  not an independently verified receipt. `[no-send]`, missing/empty results,
+  and chained `[deduped:]` holders still require recovery; sender checks still apply.
 - `[channel: <channel-id>]` — when this is the first non-empty line of the body, the bridge delivers the rest of the body to `<channel-id>` instead of the originating channel (and drops `thread_ts` since the post is moving threads). Discord ids are 17-20 digits; Slack ids match `[CDG][A-Z0-9]+`. Use when a task arrives in a noisy channel but the reply belongs somewhere else (e.g. #dev). Telegram silently drops it — no concept of "channels" on that surface.
 - `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body (regardless of marker order), so a body carrying private data can never be *redirected* out to a shared channel. It marks dm-only intent but does not by itself force a DM — that stays the consumer's job. In practice the private producer (the morning briefing's calendar + email) is emitted as a proactive result (`results/proactive-*.txt`), which every bridge already delivers to the owner's DM; `[dm-only]` reinforces that by guaranteeing no stray `[channel:]` redirect overrides it. **Detected anywhere in the body** — that is what makes the guard undefeatable by marker order, and over-triggering it fails safe. **Stripped only when the marker stands alone on its line**, before delivery and before voice speaks it; a marker mentioned inline in prose is detected but the text is delivered verbatim. Parsed by `result_markers.parse_markers`.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — Discord bridge extracts and attaches the file alongside the text body.
@@ -109,3 +133,9 @@ Moved verbatim from CLAUDE.md "Workspace contract" (2026-08-21 context-budget di
 > workspace-tasks/.
 
 Current policy + protection layers: `docs/workspace-config.md`.
+
+## Per-channel pull namespace — existing consumers
+
+Moved verbatim from CLAUDE.md "Task bridge" (2026-09-21 context-budget diet):
+
+> Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses.

@@ -10,6 +10,13 @@
 #
 #   bash skills/claude-codex/scripts/review-pr.sh 1754
 #   bash skills/claude-codex/scripts/review-pr.sh 1754 --max 300
+#   bash skills/claude-codex/scripts/review-pr.sh sonichi/sutando-skills#657
+#
+# A BARE number resolves against the cwd repo's remote, so the same number in a
+# sibling repo is a different PR and the review reads as confident and clean about
+# the wrong object. Qualify it (`owner/repo#N`, or `--repo owner/repo`) whenever the
+# request did not come from this checkout. Either way the resolved repo and title are
+# printed after the marker, so the verdict names what it actually reviewed.
 #
 # stdout is NOT the verdict: take only what follows the LAST `VERDICT-MARKER:` line.
 # The stream, or its tail, picks up codex trace or truncates the checks. See SKILL.md.
@@ -21,21 +28,37 @@
 # codex explores, not diff size.
 set -u
 
-[[ $# -ge 1 && -n "${1:-}" ]] || { echo "usage: review-pr <pr-number> [--max secs] [--stall secs]" >&2; exit 2; }
+[[ $# -ge 1 && -n "${1:-}" ]] || { echo "usage: review-pr <pr-number|owner/repo#N> [--repo owner/repo] [--max secs] [--stall secs]" >&2; exit 2; }
 PR="$1"; shift
 MAX=240
 STALL=60
+REPO=""
+# `owner/repo#N` carries its own repo; a bare number does not and defers to cwd.
+if [[ "$PR" == */*#* ]]; then
+    REPO="${PR%%#*}"
+    PR="${PR##*#}"
+fi
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --max)   MAX="${2:?--max needs a value}";   shift 2;;
         --stall) STALL="${2:?--stall needs a value}"; shift 2;;
+        --repo)  REPO="${2:?--repo needs a value}";  shift 2;;
         *)       echo "review-pr: unknown arg '$1'" >&2; exit 2;;
     esac
 done
+[[ "$PR" =~ ^[0-9]+$ ]] || { echo "review-pr: '$PR' is not a PR number" >&2; exit 2; }
+GH_R=()
+[[ -n "$REPO" ]] && GH_R=(-R "$REPO")
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-DIFF="$(gh pr diff "$PR" 2>/dev/null)" || { echo "review-pr: \`gh pr diff $PR\` failed (bad PR number, or no gh auth/remote)" >&2; exit 2; }
+DIFF="$(gh pr diff "${GH_R[@]+"${GH_R[@]}"}" "$PR" 2>/dev/null)" || { echo "review-pr: \`gh pr diff ${REPO:+-R $REPO }$PR\` failed (bad PR number, or no gh auth/remote)" >&2; exit 2; }
+# Identify what was actually resolved, so a wrong-repo review is visible in the verdict
+# rather than only in the caller's assumption.
+# URL only, shape-checked. A title is free text and would put unvalidated bytes
+# after the verdict marker, which is the one region that must stay trace-free.
+SUBJECT="$(gh pr view "${GH_R[@]+"${GH_R[@]}"}" "$PR" --json url --jq '.url' 2>/dev/null | head -1 || true)"
+[[ "$SUBJECT" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+$ ]] || SUBJECT=""
 [[ -n "$DIFF" ]] || { echo "review-pr: empty diff for #$PR (already merged with no changes, or not found)" >&2; exit 2; }
 
 OUT="$(mktemp -t review-pr.XXXXXX)"
@@ -65,6 +88,9 @@ rc=$?
 # codex's trace shares this stdout and --stall watches it, so it cannot be
 # silenced; the marker is what separates that trace from the review output.
 printf '%s\n' "$VERDICT_MARKER"
+# What was resolved, not what was asked for: a bare number silently follows cwd, so
+# the verdict has to carry its own subject or a wrong-repo review reads as clean.
+[[ -n "$SUBJECT" ]] && printf 'Reviewed: %s\n\n' "$SUBJECT"
 [[ -n "$MECH" ]] && printf 'Mechanical checks (review-checks.sh):\n%s\n\n' "$MECH"
 if [[ $rc -eq 0 && -s "$OUT" ]]; then
     cat "$OUT"

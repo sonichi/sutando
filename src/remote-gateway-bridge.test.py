@@ -72,6 +72,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Location", "http://evil.example/steal")
                 self.end_headers(); return
             self.send_response(200); self.end_headers(); self.wfile.write(b"OK"); return
+        if self.path == "/v1/agents":  # pragma: no cover - the server thread is outside the gate's trace
+            if STATE.get("agents") is None:
+                self.send_response(404); self.end_headers(); return
+            body = json.dumps({"agents": STATE["agents"]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers(); self.wfile.write(body); return
         if self.path.startswith("/v1/tasks"):
             tasks = [TASK] if STATE["tasks_served"] == 0 else []
             STATE["tasks_served"] += 1
@@ -367,6 +374,23 @@ def main() -> int:
           "no receiving_instance header when the agent identity is unknown")
     rtc._reenroll_identity = _orig_reenroll
 
+    # priority must survive to the reader that sorts the queue. The safe parser
+    # stops at `task:`, so a priority serialized below it is silently invisible.
+    import task_priority as _tp
+    for _want in ("urgent", "low"):
+        _pid = f"task-PRIO{_want.upper()}"
+        rtc._write_task({**TASK, "id": _pid, "task": "hi", "priority": _want})
+        _pf = rtc.TASKS_DIR / f"{_pid}.txt"
+        _pbody = _pf.read_text()
+        check(_pbody.index("priority:") < _pbody.index("task:"),
+              f"priority is serialized above task: ({_want})")
+        check(local_task_protocol.parse_task_headers(_pbody).get("priority") == _want,
+              f"safe parser reads a gateway priority ({_want})")
+        check(_tp.parse_priority_from_text(_pbody) == _want,
+              f"the production priority reader sees a gateway {_want}")
+        check(_tp.parse_priority_from_file(_pf) == _want,
+              f"parse_priority_from_file agrees for a gateway {_want}")
+
     rtc._write_task({**TASK, "id": "task-ROOMSESSION", "session_scope": "room"})
     room_session = (rtc.TASKS_DIR / "task-ROOMSESSION.txt").read_text()
     check(room_session.count("session_scope: room") == 1
@@ -486,18 +510,15 @@ def main() -> int:
         rtc.LOCAL_TIER = _saved_tier
     check("===SKILL INSTRUCTIONS (follow before any other action)===" in sk
           and "room_ops.py read '!room:ag2.space' --limit 30" in sk
-          and "--source ag2space --channel-id '!room:ag2.space'" in sk
           and "write the result to results/task-SKILL.txt" in sk,
-          "owner task carries the ag2space skill-instructions block (context-first, notify, result path)")
-    # notify.py falls back to a channel env file only when url+token are absent
-    # from the environment, and WHICH file carries them differs per onboarding.
+          "owner task carries the ag2space skill-instructions block (context-first, result path; no notify step)")
+    check("notify.py" not in sk and "--channel-id" not in sk,
+          "AG2 Space has no NOTIFY step")
+    # room_ops.py falls back to a channel env file only when url+token are
+    # absent from the environment; WHICH file carries them differs per onboarding.
     _env_hint = 'set -a; . "$(bash scripts/channel-env.sh ag2space)"; set +a'
-    _notify_line = next(ln for ln in sk.splitlines() if "NOTIFY FIRST" in ln)
-    check(_env_hint in _notify_line and _notify_line.index(_env_hint)
-          < _notify_line.index("notify.py"),
-          "notify step carries the channel-env prelude BEFORE the notify.py call")
-    check(sum(_env_hint in ln for ln in sk.splitlines()) == 2,
-          "the env prelude rides both gateway-calling steps (context-first + notify)")
+    check(sum(_env_hint in ln for ln in sk.splitlines()) == 1,
+          "the env prelude rides the sole gateway-calling step (context-first)")
     # CHANNEL_DIR defaults to "ag2space", so every assertion above passes even
     # when the hint is hardcoded; varying it is what makes this prove anything.
     _saved_dir, _saved_tier2 = rtc.CHANNEL_DIR, rtc.LOCAL_TIER
@@ -508,40 +529,46 @@ def main() -> int:
     finally:
         rtc.CHANNEL_DIR, rtc.LOCAL_TIER = _saved_dir, _saved_tier2
     check("channel-env.sh dev-ag2space" in skd
-          and "--source dev-ag2space " in skd
           and "channel-env.sh ag2space)" not in skd,
-          "a non-default CHANNEL_DIR reaches BOTH env preludes and the notify --source")
-    check(sum("channel-env.sh dev-ag2space" in ln for ln in skd.splitlines()) == 2,
-          "both gateway-calling steps name the task's own channel dir, not the default")
+          "a non-default CHANNEL_DIR reaches the env prelude, not the default")
+    check(sum("channel-env.sh dev-ag2space" in ln for ln in skd.splitlines()) == 1,
+          "the sole gateway-calling step names the task's own channel dir, not the default")
     # A string assertion passes even when the named file holds no gateway vars,
     # so drive the resolver itself across both real layouts and neither-has-it.
     import os as _os
+    import shutil as _shutil
     import subprocess as _sp
     import tempfile as _tf
     _helper = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
                             "scripts", "channel-env.sh")
+    _bash = _shutil.which("bash")
+    if _os.name == "nt" and (_git := _shutil.which("git")):
+        _git_bash = Path(_git).resolve().parent.parent / "bin" / "bash.exe"
+        if _git_bash.is_file():
+            _bash = str(_git_bash)
     def _resolve(files):
-        d = _tf.mkdtemp()
-        ch = _os.path.join(d, "channels", "ag2space")
-        _os.makedirs(ch)
-        for name, body in files.items():
-            with open(_os.path.join(ch, name), "w") as fh:
-                fh.write(body)
-        env = dict(_os.environ, CLAUDE_CONFIG_DIR=d)
-        r = _sp.run(["bash", _helper, "ag2space"], capture_output=True, text=True, env=env)
-        return r.returncode, r.stdout.strip()
+        with _tf.TemporaryDirectory() as d:
+            ch = _os.path.join(d, "channels", "ag2space")
+            _os.makedirs(ch)
+            for name, body in files.items():
+                with open(_os.path.join(ch, name), "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(body)
+            env = dict(_os.environ, CLAUDE_CONFIG_DIR=d, SUTANDO_PY=sys.executable)
+            r = _sp.run([_bash, _helper, "ag2space"], capture_output=True,
+                        text=True, env=env, timeout=30)
+            return r.returncode, r.stdout.strip()
     _TOK = "REMOTE_TASK_URL=https://gw/relay\nREMOTE_TASK_TOKEN=s3cret\n"
     _MATRIX = "AG2SPACE_HOMESERVER=https://chat.ag2.space\nACCESS_TOKEN=matrix-only\n"
     rc, got = _resolve({".env": _TOK})
-    check(rc == 0 and got.endswith("/.env"),
+    check(rc == 0 and Path(got).name == ".env",
           "layout A (.env carries the token) resolves to .env")
     rc, got = _resolve({".env": _MATRIX, "relay-client.env": _TOK})
-    check(rc == 0 and got.endswith("/relay-client.env"),
+    check(rc == 0 and Path(got).name == "relay-client.env",
           "layout B (.env is matrix-only, sibling carries the token) resolves to the sibling")
     rc, got = _resolve({".env": _MATRIX})
     check(rc != 0 and not got,
           "no file defines the token -> resolver FAILS instead of naming a tokenless file")
-    check(sk.rstrip().splitlines()[-1].startswith("3. Process"),
+    check(sk.rstrip().splitlines()[-1].startswith("2. Process"),
           "skill block is the file tail (appended after access_tier)")
     tiers_sk = [ln for ln in sk.splitlines() if ln.startswith("access_tier:")]
     check(tiers_sk == ["access_tier: owner"], "exactly one access_tier line, owner")
@@ -955,9 +982,11 @@ def main() -> int:
     rtc.PROACTIVE_ROOM = ""
     rtc._post_proactive()
     check((rtc.RESULTS_DIR / "proactive-t1.txt").exists() and not STATE["room_posts"],
-          "proactive drain is a no-op without REMOTE_PROACTIVE_ROOM")
-    # Set → delivered as op:message to the room, file archived.
+          "the primary with no owner DM reading holds an unaddressed file (the pin is never a destination)")
+    # A reading → delivered as op:message to the owner DM, file archived. The harness's reading is the
+    # same room the pin names, so every count-based arm below reads as before.
     rtc.PROACTIVE_ROOM = "!owner:example.org"
+    rtc._ROUTING.update(owner_dm="!owner:example.org", loaded=True, next=time.time() + 3600)
     rtc._post_proactive()
     check(len(STATE["room_posts"]) == 1
           and STATE["room_posts"][0] == {"op": "message", "room_id": "!owner:example.org",
@@ -1180,6 +1209,122 @@ def main() -> int:
           and _it3b.get("destination") == "!owner:example.org",
           "the successful retry records the receipt")
 
+    # 3.5b the owner DM comes from the gateway; the pin is never an owner-private destination (owner 2026-09-07)
+    _real_identity, _real_state = rtc._reenroll_identity, rtc._STATE
+    rtc._reenroll_identity = lambda: "@agent-t:example.org"  # the row match, not an env var the CI box lacks
+    rtc._STATE = Path(tempfile.mkdtemp(prefix="rtc-routing-"))  # the persisted reading lands here, never live state
+    rtc._ROUTING.update(owner_dm="", next=0.0, loaded=True)
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
+    (rtc.RESULTS_DIR / "proactive-t1b.txt").write_text("to the dm\n")
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["room_id"] == "!dm:example.org",
+          "proactive delivery goes to the gateway's owner_dm_room, not the pinned room")
+    check(json.loads(rtc._routing_file().read_text()) == {"identity": "@agent-t:example.org", "gateway": rtc.URL, "owner_dm": "!dm:example.org"},
+          "the reading is persisted under the state dir, bound to this identity and this gateway")
+    _real_replace = rtc.os.replace; _faults = []
+    def _fail_routing_once(src, dst):
+        if not _faults and Path(dst) == rtc._routing_file():
+            _faults.append(1); raise OSError("one cache publication fault")
+        return _real_replace(src, dst)
+    rtc._routing_file().unlink(); rtc._ROUTING.update(persisted="", next=0.0)
+    rtc.os.replace = _fail_routing_once
+    check(rtc.proactive_room() == "!dm:example.org" and not rtc._routing_file().exists()
+          and 0 < rtc._ROUTING["next"] - time.time() <= rtc.ROUTING_RETRY_S,
+          "a failed cache publication keeps the reading in memory and books the short retry")
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "!dm:example.org" and rtc._routing_file().exists(),
+          "the next refresh publishes the same unchanged reading; a failed write is retried, not skipped")
+    rtc.os.replace = _real_replace
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org"}]  # the row lost its field
+    rtc._ROUTING["next"] = 0.0
+    (rtc.RESULTS_DIR / "proactive-t1c.txt").write_text("still to the dm\n")
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["room_id"] == "!dm:example.org",
+          "a row without owner_dm_room keeps the last owner DM reading, never the pin")
+    STATE["agents"] = []  # a gateway that answers but has no row for me
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "!dm:example.org", "an answer without my row keeps the last owner DM reading")
+    STATE["agents"] = None  # the agents endpoint 404s
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "!dm:example.org", "an unreachable gateway keeps the last owner DM reading")
+    check(0 < rtc._ROUTING["next"] - time.time() <= rtc.ROUTING_RETRY_S,
+          "a failed refresh books the short retry, not the five-minute window")
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm2:example.org"}]
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "!dm2:example.org", "a later answer with a new DM replaces the reading")
+    rtc._ROUTING.update(owner_dm="", next=0.0, loaded=False)  # a restart: memory gone, the file not
+    STATE["agents"] = []  # and the gateway has lost my registration meanwhile
+    check(rtc.proactive_room() == "!dm2:example.org", "after a restart the persisted reading survives an answer without my row")
+    rtc._reenroll_identity = lambda: "@someone-else:example.org"  # the file belongs to another identity
+    rtc._ROUTING.update(owner_dm="", next=0.0, loaded=False)
+    check(rtc.proactive_room() == "", "a persisted reading bound to another identity is not mine: held")
+    rtc._reenroll_identity = lambda: "@agent-t:example.org"
+    _real_url = rtc.URL; rtc.URL = "http://other-gateway.example.org"  # the same agent, repointed
+    rtc._ROUTING.update(owner_dm="", persisted="", next=0.0, loaded=False)
+    check(rtc.proactive_room() == "", "a persisted reading from another gateway is not this gateway's: held")
+    rtc.URL = _real_url
+    rtc._routing_file().unlink()
+    rtc._ROUTING.update(owner_dm="", next=0.0, loaded=False)  # a fresh bridge with no reading ever
+    n_posts = len(STATE["room_posts"])
+    (rtc.RESULTS_DIR / "proactive-t1e.txt").write_text("owner-private, nowhere safe to go\n")
+    rtc._post_proactive()
+    check(rtc.proactive_room() == "" and len(STATE["room_posts"]) == n_posts
+          and (rtc.RESULTS_DIR / "proactive-t1e.txt").exists(),
+          "with no reading ever, an owner-private file is held: not the pin, not lost")
+    (rtc.RESULTS_DIR / "proactive-t1e.txt").unlink()
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.resolve_destination(rtc.CURRENT_ROOM, room_id="!here:example.org") == "!here:example.org"
+          and rtc.resolve_destination(rtc.SELECTED_MEMBERS, recipients=["@a:x", "@b:x"]) == ["@a:x", "@b:x"]
+          and rtc.resolve_destination(rtc.SYSTEM) == "!owner:example.org",
+          "the resolver answers every audience from one place")
+    (rtc.RESULTS_DIR / "proactive-t1d.txt").write_text("[channel: !here:example.org]\nfor that room\n")
+    rtc._post_proactive()
+    check(STATE["room_posts"][-1]["room_id"] == "!here:example.org",
+          "a [channel:] redirect is the CURRENT_ROOM audience, untouched by the owner DM")
+    rtc._reenroll_identity = lambda: "@agent-t:example.org"
+    rtc._ROUTING.update(owner_dm="", persisted="", next=0.0, loaded=False)
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
+    check(rtc.proactive_room() == "!dm:example.org", "seeded for the in-process identity change")
+    rtc._reenroll_identity = lambda: "@new-agent:example.org"  # re-enrolled while the bridge keeps running
+    STATE["agents"] = []
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "", "an in-process identity change discards the cached DM: held until the new identity has a reading")
+    rtc._reenroll_identity = lambda: "@agent-t:example.org"
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "!dm:example.org", "back under the bound identity, the persisted reading returns")
+    check(rtc.GATEWAY_INSTANCE == "" and bool(rtc.PROACTIVE_ROOM), "precondition: the harness bridge is the primary, pin set")
+    _inst = rtc.GATEWAY_INSTANCE; rtc.GATEWAY_INSTANCE = "dev"  # a named secondary: pin set AND a DM reading present
+    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1f.txt").write_text("the primary's nudge\n")
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1f.txt").exists(),
+          "a named secondary never consumes an unaddressed nudge, whatever room the pin or the registry names")
+    (rtc.RESULTS_DIR / "proactive-t1f.txt").unlink(); rtc.GATEWAY_INSTANCE = _inst
+    rtc._reenroll_identity = lambda: "@agent-t:example.org"
+    rtc._ROUTING.update(owner_dm="", persisted="", next=0.0, loaded=False)
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
+    check(rtc.proactive_room() == "!dm:example.org", "seeded for the malformed-registry case")
+    rtc._reenroll_identity = lambda: "@new-agent:example.org"  # re-enrolled while running
+    STATE["agents"] = "MALFORMED"  # the registry answers {"agents": null}
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "" and json.loads(rtc._routing_file().read_text())["identity"] == "@agent-t:example.org",
+          "a malformed registry answer after an identity change revives nothing: held, and the old reading stays bound to the old identity")
+    rtc._reenroll_identity = lambda: "@agent-t:example.org"
+    STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
+    rtc._ROUTING["next"] = 0.0
+    check(rtc.proactive_room() == "!dm:example.org", "back under the bound identity with a healthy answer, the DM reading returns")
+    _inst = rtc.GATEWAY_INSTANCE; rtc.GATEWAY_INSTANCE = "dev"; _real_route = rtc._proactive_route; _calls = []
+    def _target_vanishes(body):  # peek sees an explicit room; the post-claim re-read sees an unaddressed body
+        _calls.append(1); return ("send", "!here:example.org" if len(_calls) == 1 else None, "rewritten after the peek")
+    rtc._proactive_route = _target_vanishes
+    n_posts = len(STATE["room_posts"]); (rtc.RESULTS_DIR / "proactive-t1g.txt").write_text("[channel: !here:example.org]\nfor that room\n")
+    rtc._post_proactive()
+    check(len(_calls) == 2 and len(STATE["room_posts"]) == n_posts and (rtc.RESULTS_DIR / "proactive-t1g.txt").exists(),
+          "a secondary hands back a file whose target vanished after the claim, whatever DM it has read")
+    rtc._proactive_route = _real_route; rtc.GATEWAY_INSTANCE = _inst; (rtc.RESULTS_DIR / "proactive-t1g.txt").unlink()
+    STATE["agents"] = None  # teardown: the sections below run on the harness reading, no gateway lookups
+    rtc._ROUTING.update(owner_dm="!owner:example.org", persisted="", identity="", gateway="", next=time.time() + 3600, loaded=True)
+    rtc._reenroll_identity, rtc._STATE = _real_identity, _real_state
     # 3.6 cross-bridge claim gate (proactive_routing wired by the loader).
     # Hermetic: the gate asks claude_home_path() whether the routed bridge is
     # configured, so an ambient ~/.claude would decide these cases from the
@@ -1249,6 +1394,32 @@ def main() -> int:
     rtc._post_proactive()
     check(not young.exists() and len(STATE["room_posts"]) == posts_b4_young + 1,
           "configured bridge with no trace yet: a file past the abandonment window is released")
+
+    # Slack is a bridge channel too (P1-27): owner on slack + a configured,
+    # recently alive slack bridge keeps its aged file out of this gateway.
+    _activity.write_text(json.dumps({"ts": int(time.time()), "channel": "slack", "summary": "hi"}))
+    (_gate_cfg / "channels" / "slack").mkdir(parents=True, exist_ok=True)
+    (_gate_cfg / "channels" / "slack" / "access.json").write_text('{"allowFrom": ["1"]}')
+    _slog = rtc.WS / "logs" / "slack-bridge.log"
+    _slog.write_text("alive\n")
+    slack_owned = rtc.RESULTS_DIR / "proactive-t11s.txt"
+    slack_owned.write_text("slack owner's nudge, bridge alive\n")
+    os.utime(slack_owned, (aged, aged))
+    posts_b4_slack = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(slack_owned.exists() and len(STATE["room_posts"]) == posts_b4_slack,
+          "owner-on-slack, slack bridge configured + alive: aged nudge is never stolen")
+    # ...and with no slack bridge on this host, the past-grace fallback delivers.
+    slack_owned.unlink()
+    _slog.unlink()
+    shutil.rmtree(_gate_cfg / "channels" / "slack")
+    unowned = rtc.RESULTS_DIR / "proactive-t11t.txt"
+    unowned.write_text("slack owner's nudge, no slack bridge here\n")
+    os.utime(unowned, (aged, aged))
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4_slack + 1 and not unowned.exists(),
+          "owner-on-slack, no slack bridge configured: past-grace fallback delivers")
+    _activity.write_text(json.dumps({"ts": int(time.time()), "channel": "discord", "summary": "hi"}))
 
     # `.env`-only configuration counts too (health-check.py's own either/or).
     (_gate_cfg / "channels" / "telegram").mkdir(parents=True, exist_ok=True)

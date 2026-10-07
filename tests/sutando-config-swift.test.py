@@ -15,6 +15,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+import sys
+sys.path.insert(0, str(ROOT / "tests" / "_helpers"))
+from os_probes import SWIFTC_SKIP_REASON, swiftc_usable  # noqa: E402
 SWIFT_CONFIG = ROOT / "src" / "Sutando" / "SutandoConfig.swift"
 
 # Shared with tests/sutando-config-python-resolution.test.py: one warm Clang
@@ -23,7 +26,7 @@ _MODULE_CACHE = Path(tempfile.gettempdir()) / "sutando-swift-module-cache"
 _MODULE_CACHE.mkdir(parents=True, exist_ok=True)
 
 
-@unittest.skipUnless(shutil.which("swiftc"), "swiftc not available")
+@unittest.skipUnless(swiftc_usable(), SWIFTC_SKIP_REASON)
 class TestSutandoConfigSwift(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="sutando-swift-config-"))
@@ -101,7 +104,7 @@ class TestSutandoConfigSwift(unittest.TestCase):
         self.assertEqual(proc.stderr, "")
 
 
-@unittest.skipUnless(shutil.which("swiftc"), "swiftc not available")
+@unittest.skipUnless(swiftc_usable(), SWIFTC_SKIP_REASON)
 class TestPersonalAssetPathSwift(unittest.TestCase):
     """Compiles the REAL SutandoConfig.swift and calls the real functions rather than
     re-implementing the resolution order, so a regression in it cannot stay green."""
@@ -211,6 +214,96 @@ class TestPersonalAssetPathSwift(unittest.TestCase):
         got = self._run(["asset", str(ws), "stand-avatar.png"],
                         {"SUTANDO_HOST_LABEL": "OtherHost"})
         self.assertEqual(got, str(ws / "hosts" / "OtherHost" / "stand-avatar.png"))
+
+
+
+@unittest.skipUnless(swiftc_usable(), SWIFTC_SKIP_REASON)
+class TestWorkspaceLayerSwift(unittest.TestCase):
+    """The Swift twin applies `<workspace>/sutando.config.local.json` like the Python one."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="sutando-swift-wslayer-")).resolve()
+        probe_dir = self.tmp / "probe"
+        probe_dir.mkdir()
+        self.probe = probe_dir / "layer-probe"
+        (probe_dir / "main.swift").write_text(
+            "import Foundation\n"
+            "let repo = CommandLine.arguments[1]\n"
+            "print(SutandoConfig.resolveCoreRuntime(repoRoot: repo, environment: [:]) ?? \"nil\")\n"
+            "print(SutandoConfig.resolveWorkspace(repoRoot: repo))\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["CLANG_MODULE_CACHE_PATH"] = str(_MODULE_CACHE)
+        subprocess.run(
+            ["swiftc", str(SWIFT_CONFIG), str(probe_dir / "main.swift"), "-o", str(self.probe)],
+            env=env, check=True, text=True, capture_output=True,
+        )
+        self.repo = self.tmp / "engine"
+        self.ws = self.tmp / "durable-workspace"
+        self.repo.mkdir()
+        self.ws.mkdir()
+        (self.repo / "workspace").symlink_to(self.ws)
+        (self.repo / "sutando.config.json").write_text(json.dumps(
+            {"workspace": {"path": "${REPO_DIR}/workspace"}, "core": {"runtime": "claude"}}))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        for k in ("SUTANDO_TEST_MODE", "SUTANDO_WORKSPACE", "SUTANDO_DEFAULT_WORKSPACE"):
+            env.pop(k, None)
+        return subprocess.run([str(self.probe), str(self.repo)], env=env, text=True,
+                              capture_output=True, check=False)
+
+    def test_layer_overrides_repo_config(self) -> None:
+        (self.ws / "sutando.config.local.json").write_text(json.dumps({"core": {"runtime": "codex"}}))
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.splitlines()[0], "codex")
+
+    def test_absent_layer_keeps_repo_config(self) -> None:
+        proc = self._run()
+        self.assertEqual(proc.stdout.splitlines()[0], "claude")
+        self.assertEqual(proc.stderr, "")
+
+    def test_workspace_key_in_layer_is_dropped_with_warning(self) -> None:
+        (self.ws / "sutando.config.local.json").write_text(
+            json.dumps({"workspace": {"path": "/somewhere/else"}, "core": {"runtime": "codex"}}))
+        proc = self._run()
+        runtime, workspace = proc.stdout.splitlines()
+        self.assertEqual(runtime, "codex")
+        self.assertEqual(workspace, str(self.repo / "workspace"))
+        self.assertIn("sets 'workspace', which it cannot change", proc.stderr)
+    def _custom_workspace(self) -> Path:
+        custom = self.tmp / "custom-ws"
+        custom.mkdir()
+        (self.repo / "sutando.config.local.json").write_text(
+            json.dumps({"workspace": {"path": str(custom)}}))
+        return custom
+
+    def test_malformed_layer_keeps_the_workspace_and_names_the_file(self) -> None:
+        custom = self._custom_workspace()
+        (custom / "sutando.config.local.json").write_text("{ not json")
+        proc = self._run()
+        runtime, workspace = proc.stdout.splitlines()
+        self.assertEqual(workspace, str(custom), "a bad layer must not move the workspace")
+        self.assertEqual(runtime, "nil", "no guessed runtime from a config that failed to load")
+        self.assertIn(f"sutando config: failed to parse {custom / 'sutando.config.local.json'}", proc.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a chmod 000 file")
+    def test_unreadable_layer_keeps_the_workspace_and_names_the_file(self) -> None:
+        custom = self._custom_workspace()
+        layer = custom / "sutando.config.local.json"
+        layer.write_text(json.dumps({"core": {"runtime": "codex"}}))
+        layer.chmod(0)
+        try:
+            proc = self._run()
+        finally:
+            layer.chmod(0o600)
+        self.assertEqual(proc.stdout.splitlines()[1], str(custom))
+        self.assertIn(f"sutando config: cannot read {layer}", proc.stderr)
 
 
 if __name__ == "__main__":

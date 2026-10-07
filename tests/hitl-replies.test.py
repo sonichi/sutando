@@ -82,6 +82,21 @@ class ReplyHandlerTests(unittest.TestCase):
         self.assertFalse(self.h.claims(event(reply_for(self.req, "allow"), etype="reaction.added")))
         self.assertFalse(self.h.claims(event("junk")))
 
+    def test_room_question_reply_is_never_claimed_by_local_runtime_hitl(self):
+        for payload in (
+            {"scope": "room", "question_id": "q_1", "expected_revision": 1,
+             "response": {"kind": "choice", "option_id": "minimal"}},
+            {"question_id": "q_1", "expected_revision": 1,
+             "response": {"kind": "text", "text": "Use the small change."}},
+        ):
+            with self.subTest(payload=payload):
+                self.assertFalse(self.h.claims(event(payload)))
+                # The event-id echo remains; HandlerChain checks claims() and
+                # routes the unclaimed event to the backend/ambient path.
+                self.assertEqual(self.h.offer(event(payload)), ["$e1"])
+                self.assertEqual(self.mgr.get(self.req.id).status, "pending")
+                self.assertFalse(list(actions_dir(self.ws).glob("*.json")))
+
     def test_owner_reply_applies_and_unblocks(self):
         out = self.h.offer(event(reply_for(self.req, "allow")))
         self.assertEqual(out, ["$e1"])
@@ -136,6 +151,31 @@ class ReplyHandlerTests(unittest.TestCase):
         # The jump action is the client's, never the driver's.
         self.h.offer(event(reply_for(self.mgr.get(tui.id), "open_terminal"), eid="$e3"))
         self.assertEqual(len(list(actions_dir(self.ws).glob("*.json"))), 1)
+
+    def test_turn_on_action_is_reported_after_an_applied_click_and_only_then(self):
+        """A producer that needs a turn sets turn_on_action; the handler reports it so the caller
+        keeps the click on the task path. A plain requirement, a rejection and a stale click all
+        report False, and the flag never survives from a previous offer."""
+        req = self.mgr.create(HumanRequirement(kind="choice", runtime="report-feedback", message="file?",
+                                               guard="fb_0123456789", device={"id": "rf:fb_0123456789"},
+                                               actions=[Action(id="file", kind="confirmation", label="File"),
+                                                        Action(id="skip", kind="confirmation", label="Skip")],
+                                               turn_on_action=True))
+        self.assertFalse(self.h.last_turn)
+        self.h.offer(event(reply_for(req, "file")))
+        self.assertEqual((self.h.last_outcome, self.h.last_turn), ("applied", True))
+        self.assertEqual(self.mgr.get(req.id).chosen_action, "file")
+        # the SAME click redelivered (a death before its task was written) still owes the turn
+        self.h.offer(event(reply_for(req, "file", revision=1), eid="$e2"))
+        self.assertEqual((self.h.last_outcome, self.h.last_turn), ("applied", True))
+        self.assertEqual(self.mgr.get(req.id).revision, 2, "the store did not move")
+        # a DIFFERENT action at the old revision is a stale click
+        self.h.offer(event(reply_for(req, "skip", revision=1), eid="$e2b"))
+        self.assertEqual((self.h.last_outcome, self.h.last_turn), ("rejected", False))
+        self.h.offer(event(reply_for(self.req, "allow"), eid="$e3"))
+        self.assertEqual((self.h.last_outcome, self.h.last_turn), ("applied", False))
+        self.assertTrue(HumanRequirement(kind="choice", runtime="x", message="m", turn_on_action=True).to_wire()["turn_on_action"])
+        self.assertNotIn("turn_on_action", HumanRequirement(kind="choice", runtime="x", message="m").to_wire())
 
     def test_no_workspace_means_no_driver_file_but_still_applies(self):
         h = HitlReplyHandler(self.mgr, OWNER, workspace=None, log=self.logs.append)
@@ -350,6 +390,76 @@ class TestFallbackCarriesTheNote(unittest.TestCase):
                               "user_id": "@owner:x", "reply_to_event": "$card",
                               "task": "Not now"})
         self.assertNotIn("answer", ev["content"][REPLY_FIELD])
+
+
+class SiblingLabelsAndWordInternalHyphens(unittest.TestCase):
+    """Echo Act IV Mini's two rows, both reproduced by execution at ffd8164a."""
+
+    def _two(self):
+        return HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="approve", kind="answer", label="Approve"),
+                     Action(id="approve_all", kind="answer", label="Approve-all")])
+
+    def _one(self):
+        return HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="not_now", kind="answer", label="Not now")])
+
+    def test_a_shorter_sibling_does_not_claim_the_longer_labels_click(self):
+        """`Approve-all` returned Approve with note `all`: the scan returned on
+        the FIRST label that prefixed the text."""
+        a, note = match_action(self._two(), "Approve-all")
+        self.assertEqual(a.id, "approve_all")
+        self.assertIsNone(note)
+
+    def test_the_shorter_sibling_still_works_on_its_own(self):
+        a, note = match_action(self._two(), "Approve")
+        self.assertEqual(a.id, "approve")
+        self.assertIsNone(note)
+
+    def test_the_longest_matching_label_wins_when_a_note_follows(self):
+        a, note = match_action(self._two(), "Approve-all — because rui waited")
+        self.assertEqual(a.id, "approve_all")
+        self.assertEqual(note, "because rui waited")
+
+    def test_the_longest_label_wins_when_BOTH_are_valid_matches(self):
+        """The discriminating case for longest-wins, and it took a surviving
+        mutation to find: with `Approve-all` the hyphen boundary already
+        eliminates the shorter sibling, so first-wins and longest-wins agree.
+        They differ only when the longer label is the shorter one plus a
+        SEPARATOR, where both parse legally."""
+        req = HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="ship", kind="answer", label="Ship"),
+                     Action(id="ship_fast", kind="answer", label="Ship: fast")])
+        a, note = match_action(req, "Ship: fast — now")
+        self.assertEqual(a.id, "ship_fast", "first-wins would pick `Ship`")
+        self.assertEqual(note, "now", "and would have swallowed `fast` into the note")
+
+    def test_a_hyphen_inside_a_word_is_not_a_separator(self):
+        """`Not now-ish, maybe Friday` became a decision — exactly the failure
+        the separator requirement exists to prevent, one character narrower
+        than the case the earlier test covered."""
+        a, note = match_action(self._one(), "Not now-ish, maybe Friday")
+        self.assertIsNone(a)
+        self.assertIsNone(note)
+
+    def test_a_hyphen_at_a_word_boundary_still_separates(self):
+        for text in ("Not now - later", "Not now-  later"):
+            a, note = match_action(self._one(), text)
+            self.assertEqual(a.id, "not_now", text)
+            self.assertEqual(note, "later", text)
+
+    def test_the_dashes_and_colon_need_no_surrounding_space(self):
+        for text, want in (("Not now—soon", "soon"), ("Not now:soon", "soon")):
+            a, note = match_action(self._one(), text)
+            self.assertEqual(a.id, "not_now", text)
+            self.assertEqual(note, want, text)
+
+    def test_the_previously_covered_prose_case_still_stays_prose(self):
+        for text in ("Not nowadays, this needs thought", "Not nowhere near ready"):
+            self.assertIsNone(match_action(self._one(), text)[0], text)
 
 
 if __name__ == "__main__":

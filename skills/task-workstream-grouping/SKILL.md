@@ -33,6 +33,16 @@ labels.
    - omit isolated, ambiguous, or low-confidence tasks so they remain
      ungrouped;
    - give every proposed group a confidence from 0 to 1.
+   - **a new workstream's `summary` is truncated to 160 characters and is then
+     immutable — write to that budget and front-load the distinctive nouns.**
+     `apply` stores the summary only in the creation branch
+     (`src/task_workstreams.py`, `_safe_text(group.get("summary"), 160)`), so a
+     later `apply` that reuses the id never rewrites it and nothing reports the
+     cut. A longer summary is silently halved at the 160th character, and the
+     tail is exactly what a future task would have matched on: submitting 260
+     characters cost the words `confidence`, `verification`, `render` and
+     `intros` from a workstream whose first line survived intact, which is the
+     failure mode — it looks fine because the beginning is fine.
    - **when reusing an existing workstream, rank with `scripts/rank_workstreams.py`
      rather than by eye.** `best_match(candidates, keywords)` returns the top id
      only if it beats the runner-up by a margin, and `None` otherwise — on a tie

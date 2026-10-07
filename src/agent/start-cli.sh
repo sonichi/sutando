@@ -3,7 +3,15 @@
 # src/agent/<runtime>/cli/; every caller uses this dispatcher.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+# Pure bash, no external dirname: this dispatcher is the boot chain's own
+# first line (startup.sh execs straight into it), run before anything has
+# confirmed PATH resolves basic commands at all.
+case "$0" in
+  */*) _self_dir="${0%/*}" ;;
+  *)   _self_dir="." ;;
+esac
+REPO="$(cd "$_self_dir/../.." && pwd)"
+unset _self_dir
 
 # Direct restarts (menu bar, health-check recovery, and manual --restart) do
 # not pass through startup.sh. Load the same repo configuration here so policy
@@ -18,6 +26,11 @@ if [ -f "$REPO/.env" ]; then
     _self_dev_was_set=1
     _self_dev_ambient="$SUTANDO_SELF_DEVELOPMENT_ENABLED"
   fi
+  _codex_reset_was_set=0
+  if [ "${SUTANDO_CODEX_AUTO_RESET_ENABLED+x}" = x ]; then
+    _codex_reset_was_set=1
+    _codex_reset_ambient="$SUTANDO_CODEX_AUTO_RESET_ENABLED"
+  fi
   set -a
   # shellcheck disable=SC1091
   source "$REPO/.env"
@@ -25,13 +38,33 @@ if [ -f "$REPO/.env" ]; then
   if [ "$_self_dev_was_set" = 1 ]; then
     export SUTANDO_SELF_DEVELOPMENT_ENABLED="$_self_dev_ambient"
   fi
+  if [ "$_codex_reset_was_set" = 1 ]; then
+    export SUTANDO_CODEX_AUTO_RESET_ENABLED="$_codex_reset_ambient"
+  fi
   unset _self_dev_was_set _self_dev_ambient
+  unset _codex_reset_was_set _codex_reset_ambient
 fi
 
-runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)" || {
-  echo "start-cli: failed to resolve core runtime" >&2
-  exit 1
-}
+# `--runtime <name>` names the runtime for THIS launch (leading arg only). A
+# caller that recorded one must not get the core's config substituted for it.
+requested_runtime=""
+if [ "${1:-}" = "--runtime" ]; then
+  requested_runtime="${2:-}"
+  if [ -z "$requested_runtime" ]; then
+    echo "start-cli: --runtime needs a value" >&2
+    exit 2
+  fi
+  shift 2
+fi
+
+if [ -n "$requested_runtime" ]; then
+  runtime="$requested_runtime"
+else
+  runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)" || {
+    echo "start-cli: failed to resolve core runtime" >&2
+    exit 1
+  }
+fi
 
 case "$runtime" in
   claude|codex)
@@ -47,6 +80,17 @@ if [ ! -x "$launcher" ]; then
   echo "start-cli: $runtime launcher is missing or not executable: $launcher" >&2
   exit 1
 fi
+
+for _arg in "$@"; do
+  case "${_arg%%=*}" in
+    --external-helpers|--no-schedule-reconcile)
+      if [ "$runtime" != "codex" ]; then
+        echo "start-cli: ${_arg%%=*} is supported only for Codex" >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
 
 export SUTANDO_CORE_RUNTIME="$runtime"
 

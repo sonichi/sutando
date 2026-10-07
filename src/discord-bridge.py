@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import weakref
 from pathlib import Path
@@ -125,6 +126,7 @@ from access_store import (  # noqa: E402  — single locked writer for access.js
     discord_access_backup_file,
 )
 from task_priority import default_priority_for_source  # noqa: E402
+from ingress_identity import provider_task_id, already_admitted  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 import send_failure_policy  # noqa: E402  # pragma: no cover — bridge not unit-imported; policy is covered in send_failure_policy.py
@@ -155,7 +157,7 @@ def _is_discord_channel_id(value: str) -> bool:
     """A snowflake, so a Telegram chat id or a Matrix room id can never be
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
-from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
+from result_markers import parse_markers, has_skip_action  # noqa: E402
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
@@ -201,8 +203,8 @@ async def _note_empty_result(task_id: str, result_file) -> None:
     # reports resolved while still visible to queue-health.
     _empty_result_polls.pop(task_id, None)
     channel = pending_replies.pop(task_id, None)  # stop re-polling it
-    _atomic_write_pending_replies(
-        {k: str(getattr(v, "id", v)) for k, v in pending_replies.items()})
+    pending_admitted_ms.pop(task_id, None)
+    save_pending_replies()
     pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
     _progress_msgs.pop(task_id, None)             # else the placeholder never clears
     tier = pending_task_tiers.pop(task_id, None) or "unknown"
@@ -217,6 +219,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
 
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from task_body_guard import header_safe_value  # noqa: E402
 from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
@@ -578,6 +581,15 @@ def archive_path(kind: str, task_id: str) -> "Path":
     return month_dir / f"{task_id}.txt"
 
 
+def sandbox_prompt_argument(text: str) -> str:
+    """The prompt as a quoted heredoc for the core's own shell, so no prompt is ever
+    written to a file a same-user sandbox could read; codex receives it as argv."""
+    tag = "SUTANDO_PROMPT"
+    while re.search(rf"^{tag}\s*$", text, re.M):
+        tag += "_" + os.urandom(3).hex()
+    return f'"$(cat <<\'{tag}\'\n{text}\n{tag}\n)"'
+
+
 def archive_file(src: "Path", kind: str, task_id: str) -> bool:
     """Adapter: inject this bridge's archive roots + logger into the shared
     never-delete policy in task_archive."""
@@ -653,10 +665,10 @@ def notify_agent_api_task_done(task_id: str, result: str) -> None:
         urllib.request.urlopen(req, timeout=2).read()
     except Exception:
         pass  # best-effort; agent-api will catch up via polling
-INBOX_DIR = Path("/tmp/discord-inbox")
+INBOX_DIR = Path("/tmp/discord-inbox") if os.name == "posix" else Path(tempfile.gettempdir()) / "discord-inbox"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-INBOX_DIR.mkdir(exist_ok=True)
+INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _transcribe_via_skill(local_path: str) -> str | None:
@@ -905,7 +917,7 @@ def load_policy():
 
 
 def load_tier_map() -> dict:
-    """Per-user-id -> tier ("owner"|"team"|"other") from access.json `tierMap`.
+    """Per-user-id -> tier ("owner"|"team"|"guest") from access.json `tierMap`.
     Empty dict if absent. Mirrors slack-bridge.load_tier_map so the two
     bridges share one access-control model."""
     try:
@@ -2554,6 +2566,9 @@ def _should_welcome_first_post(message, welcome_channel_id, welcome_template_pat
 
 # Track pending replies: task_id -> channel
 pending_replies = {}
+# task_id -> epoch_ms admitted. The ager keys on THIS, never on id shape
+# (provider-derived ids carry no parseable epoch — john-the-dev, #3316).
+pending_admitted_ms: dict = {}
 # Track source message id per pending task so the result-sender can default
 # reply_to_id to the triggering message (visually threads the reply). Lives
 # in memory only — crash-recovery isn't critical; missing entry just means
@@ -3041,41 +3056,20 @@ def channel_allows_collaborator_attachments(access_data, channel_id) -> bool:
     """Per-channel owner opt-in: a COLLABORATOR's result may carry [file:]/
     [attach:] markers here. Path authorization stays with the transport
     allowlist; [channel:] redirects stay blocked regardless. Default off."""
-    for section in ("groups", "channels"):
-        cfg = (access_data.get(section) or {}).get(str(channel_id))
-        if isinstance(cfg, dict):
-            return cfg.get("collaboratorAttachments") is True
+    cfg = (access_data.get("groups") or {}).get(str(channel_id))
+    if isinstance(cfg, dict):
+        return cfg.get("collaboratorAttachments") is True
     return False
 
 
 def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
-    """True iff `sender_id` is listed under the SERVING channel's `collaborators`
-    array in access.json.
-
-    A collaborator is a team-tier sender the owner has designated for
-    substantive engagement in ONE specific channel (see the `team-collaborator`
-    rulebook). Scope is strictly per-channel: membership in some OTHER channel's
-    `collaborators` does NOT carry over — the check keys on the serving channel
-    only. Fail-closed: any malformed config or missing key yields False.
-
-    Pure + side-effect-free so it can be unit-tested directly (the caller lives
-    inside the async Discord handler, which is not independently exercisable).
-    """
-    try:
-        serving_cfg = (access_data.get("groups", {}) or {}).get(str(serving_channel_id), {})
-        if isinstance(serving_cfg, dict) and sender_id in set(serving_cfg.get("collaborators", []) or []):
-            return True
-    except Exception:
-        pass
-    return False
+    from discord_access import resolve_is_collaborator as resolve
+    return resolve(access_data, sender_id, serving_channel_id)
 
 
 def resolve_team_collaborator(access_data, access_tier, sender_id, serving_channel_id):
-    """Collaborator status for a TEAM sender, however that tier was reached.
-    Global-allowlist members resolved to team by the tierMap are eligible too."""
-    if access_tier != "team":
-        return False
-    return resolve_is_collaborator(access_data, sender_id, serving_channel_id)
+    from discord_access import resolve_team_collaborator as resolve
+    return resolve(access_data, access_tier, sender_id, serving_channel_id)
 
 
 def select_rulebook_key(access_tier, is_collaborator):
@@ -3812,7 +3806,7 @@ async def _handle_discord_message(message, force=False):
     print(f"  @{username}: {safe_detail_log}")
 
     # Determine access tier
-    access_tier = "other"
+    access_tier = "guest"
     # is_collaborator: a TEAM sender the owner has listed under the SERVING
     # channel's `collaborators` array in access.json. Collaborators get the
     # `team-collaborator` "engage" rulebook (reply in-channel, fold in their
@@ -3834,7 +3828,7 @@ async def _handle_discord_message(message, force=False):
         seeded_ok = ensure_tier_map_seeded()
         _tier_map = load_tier_map()
         if sender_id in _tier_map:
-            access_tier = _tier_map[sender_id]
+            access_tier = local_task_protocol.canonical_access_tier(_tier_map[sender_id])
         else:  # pragma: no cover — fail-closed branch inside the async handler mega-function; the seed-failure→team resolution logic is unit-tested in tests/bridges-allowlist-default-readonly.test.py
             access_tier = "team"
             if not seeded_ok and not _tier_map:
@@ -3909,9 +3903,20 @@ async def _handle_discord_message(message, force=False):
     if await _handle_restart_command(message, text, access_tier, username, str(REPO)):
         return
 
-    # Write as task
+    # Write as task. The id derives from the provider event (injective), so a
+    # replayed event maps to the same file — skipped, never a second task.
     ts = int(time.time() * 1000)
-    task_id = f"task-{ts}"
+    _inst = getattr(getattr(client, "user", None), "id", None)
+    if _inst and getattr(message, "id", None):
+        task_id = provider_task_id(f"dc{_inst}", str(message.id))
+        # Every month partition: an event archived before a rollover is still admitted.
+        if already_admitted(task_id, TASKS_DIR, RESULTS_DIR,
+                            lambda tid: any(ARCHIVE_TASKS_DIR.glob(f"*/{tid}.txt"))):
+            print(f"  [ingress-dedup] replay of {task_id} — already admitted",
+                  flush=True)
+            return
+    else:  # pragma: no cover — client identity absent (startup edge): legacy mint
+        task_id = f"task-{ts}"
     task_file = TASKS_DIR / f"{task_id}.txt"
 
     # Intercept vault commands before any disk write.
@@ -3963,14 +3968,8 @@ async def _handle_discord_message(message, force=False):
     user_task_text = confine_user_content(
         f"[Discord @{username}] {text}{attachment_note}{reply_context}"
     )
-    # Write task text to a /tmp file and reference via `"$(cat ...)"` heredoc
-    # form instead of shlex.quote'ing it inline. Reason: codex's stdin parser
-    # hangs 7-20min on nested-quote escapes (`'"'"'` style) that arise when
-    # the agent's Bash tool eval-wraps the bridge-injected codex command. The
-    # heredoc form has no nesting depth at any layer; codex receives the file
-    # contents directly via shell command substitution. Per memory
-    # `feedback_codex_nested_quotes_hang_stdin` (Lucy 2026-05-08) + reproduced
-    # live 2026-05-09 PT on Mini coord ping (task-1778363006905, hung 7+min).
+    # The prompt reaches codex as argv through a quoted heredoc the core's shell expands:
+    # no file on disk, and no nested quoting for codex's stdin parser to hang on.
     #
     # Sutando-identity preamble for codex-sandbox-tier tasks (team/other).
     # Without this, codex answers identity/capability questions about ITSELF
@@ -3983,7 +3982,7 @@ async def _handle_discord_message(message, force=False):
     # codex (per CLAUDE.md "Discord access control"), so preamble is N/A there.
     # Collaborators are also N/A: they're engaged directly by the core agent
     # (not sandboxed via codex), so they must NOT get the codex framing preamble.
-    if access_tier in ("team", "other") and not is_collaborator:
+    if access_tier in ("team", "guest") and not is_collaborator:
         codex_prompt_text = (
             "You are answering on behalf of Sutando, an autonomous personal AI agent.\n"
             "Sutando's actual skills live in `skills/` (this repo) and under `$CLAUDE_CONFIG_DIR/skills/`.\n"
@@ -3994,10 +3993,6 @@ async def _handle_discord_message(message, force=False):
         )
     else:
         codex_prompt_text = user_task_text
-
-    prompt_path = f"/tmp/sutando-{task_id}.txt"
-    Path(prompt_path).write_text(codex_prompt_text)
-    quoted_task = f'"$(cat {prompt_path})"'
 
     # Pre-classify Discord-state-reference tasks. Two-tier flow (per Chi's
     # 2026-05-08 strategy chat — option 3 systemic fix):
@@ -4040,17 +4035,9 @@ async def _handle_discord_message(message, force=False):
             secret_notice = secret_handling_instruction("Discord", detected_secret_types)  # pragma: no cover
             enriched = filtered_enriched.text  # pragma: no cover
             user_task_text = confine_user_content(enriched)
-            # Rewrite the prompt file with the enriched body. quoted_task
-            # already points to `"$(cat {prompt_path})"` — keep the heredoc
-            # form (per PR #652's codex-stdin-hang fix). Using shlex.quote
-            # here would reintroduce the nested-escape pathology codex's
-            # stdin parser hangs on. Per MacBook's #644 v2 review 2026-05-10.
-            # Deep async-handler branch (fires only when a ref actually enriches);
-            # not independently invocable from unit tests — the enrich/confine
-            # logic is covered via confine_user_content's own tests. no-cover here
-            # keeps the diff gate honest without a Discord-message integration rig.
-            Path(prompt_path).write_text(user_task_text)  # pragma: no cover
-        elif access_tier in ("team", "other") and not is_collaborator:
+            # The enriched body replaces the prompt; the launch argument is composed later.
+            codex_prompt_text = user_task_text  # pragma: no cover
+        elif access_tier in ("team", "guest") and not is_collaborator:
             # Silent-escalate stays NON-OWNER-only, and collaborators are
             # excluded too. The prefetch above now runs for all tiers (so the
             # contextNotFrom gate applies to owner too), but an owner OR
@@ -4088,7 +4075,7 @@ async def _handle_discord_message(message, force=False):
     # both tier blocks are robust regardless of cwd.
     # Note: the silent-escalate path (above) `return`s before this point when
     # `already_escalated=True`, so the only valid keys consumed below are
-    # owner/team/other. (An earlier draft had an `already_escalated` tier
+    # owner/team/guest. (An earlier draft had an `already_escalated` tier
     # instruction that told the agent to NO-REPLY archive, but that left the
     # task in `pending_replies` until age-out — leak-prone per MacBook's #639
     # review. Removed in favor of skipping the task-file write entirely.)
@@ -4102,7 +4089,7 @@ async def _handle_discord_message(message, force=False):
             "This task is from a TEAM tier sender. Choose ONE of three actions based on the content:\n\n"
             "1. RUN CODEX — for genuine requests (code review, bug report, technical question, analysis).\n"
             "   Two-stage execution to avoid racing the bridge's results-dir poller:\n"
-            f"   - Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {quoted_task} < /dev/null   (the bounded runner kills the codex tree if it goes SILENT for 45s — the 'never going to finish' signal, since a working codex streams output — with a hard 240s backstop; a slow-but-progressing run is NOT killed. `< /dev/null` avoids the stdin hang. Exit 125 = stalled, 124 = hit the max cap; EITHER → fire the Stage-2 fallback.)\n"
+            f"   - Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {sandbox_prompt_argument(codex_prompt_text)} < /dev/null   (the bounded runner kills the codex tree if it goes SILENT for 45s — the 'never going to finish' signal, since a working codex streams output — with a hard 240s backstop; a slow-but-progressing run is NOT killed. `< /dev/null` avoids the stdin hang. Exit 125 = stalled, 124 = hit the max cap; EITHER → fire the Stage-2 fallback.)\n"
             f"   - Stage 2: if codex exits 0 AND {RESULTS_DIR}/.codex-staging-{{id}}.txt is non-empty: mv {RESULTS_DIR}/.codex-staging-{{id}}.txt {RESULTS_DIR}/task-{{id}}.txt (atomic single move; bridge only ever sees a complete file).\n"
             f"   - Stage 2 fallback: if codex exits non-zero OR staging file is empty/missing: write the matching sentinel VERBATIM to {RESULTS_DIR}/task-{{id}}.txt — nonzero exit: 'Sandbox unavailable (codex exit <rc>) — no reply generated.' with <rc> the actual status; exit 0 but staging empty/missing: 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'. These are DIFFERENT failures and 'exit 0' must never appear in the first form. Neither is a refusal.\n"
             "   - The `-o` flag writes ONLY the agent's final message to the file (no exec sub-command dumps, no setup banner). Do NOT redirect stdout — codex's stdout includes verbose exec output from internal tool calls (e.g. github plugin reading PR diffs), which floods Discord. Do NOT add commentary.\n\n"
@@ -4124,10 +4111,10 @@ async def _handle_discord_message(message, force=False):
             "- If codex is invoked and Stage 2 fallback triggers (codex exit non-zero or staging file empty), the fallback line is the result body — do not write anything else to results/task-{id}.txt for that task.\n"
             "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
         ),
-        "other": (
+        "guest": (
             "\n\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
-            "This task is from an OTHER tier sender (untrusted). You MUST delegate to a sandboxed Codex agent with HARD isolation. Two-stage execution to avoid racing the bridge's results-dir poller:\n\n"
-            f"  Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -C /tmp -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {quoted_task} < /dev/null   (bounded runner kills the codex tree on 45s of SILENCE — the 'never going to finish' signal — with a hard 240s backstop; exit 125 = stalled or 124 = max cap → Stage-2 fallback)\n"
+            "This task is from a GUEST tier sender (untrusted). You MUST delegate to a sandboxed Codex agent with HARD isolation. Two-stage execution to avoid racing the bridge's results-dir poller:\n\n"
+            f"  Stage 1: bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- codex exec --sandbox read-only --skip-git-repo-check -C /tmp -o {RESULTS_DIR}/.codex-staging-{{id}}.txt -- {sandbox_prompt_argument(codex_prompt_text)} < /dev/null   (bounded runner kills the codex tree on 45s of SILENCE — the 'never going to finish' signal — with a hard 240s backstop; exit 125 = stalled or 124 = max cap → Stage-2 fallback)\n"
             f"  Stage 2: if codex exits 0 AND {RESULTS_DIR}/.codex-staging-{{id}}.txt is non-empty: mv {RESULTS_DIR}/.codex-staging-{{id}}.txt {RESULTS_DIR}/task-{{id}}.txt (atomic single move).\n"
             f"  Stage 2 fallback: if codex exits non-zero OR staging file empty/missing: write the matching sentinel VERBATIM to {RESULTS_DIR}/task-{{id}}.txt — nonzero exit: 'Sandbox unavailable (codex exit <rc>) — no reply generated.'; exit 0 with empty/missing staging: 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'.\n\n"
             "Rules:\n"
@@ -4158,11 +4145,10 @@ async def _handle_discord_message(message, force=False):
     # channel_name / guild_name: human-readable labels so the task-consumer can
     # disambiguate one team channel from another without grepping numeric IDs
     # against a memory file. DM channels have no `.name` attr; DMs have no
-    # guild. Default to "DM" for both. Newline-sanitize so a Discord name
-    # containing \n (rare but possible) can't inject a spurious metadata
-    # line into the task file's k:v shape (per qingyun review on #1077).
-    channel_name = (getattr(message.channel, "name", None) or "DM").replace("\n", " ")
-    guild_name = (message.guild.name if message.guild else "DM").replace("\n", " ")
+    # guild. Default to "DM" for both. Both are attacker-settable (a server or
+    # channel name), and land above `access_tier:`, so they flatten via the guard.
+    channel_name = header_safe_value(getattr(message.channel, "name", None) or "DM")
+    guild_name = header_safe_value(message.guild.name if message.guild else "DM")
     # When this message is a REPLY, emit the parent's id so the core agent can
     # re-fetch the full original on demand rather than relying on the lossy
     # 400-char `[Replying to ...]` snippet. Mirrors how the official Claude
@@ -4221,15 +4207,21 @@ async def _handle_discord_message(message, force=False):
         # confident about. Removing the gate trades a few cheap reads for never
         # skipping it; only a pure greeting/ack is exempt. Supersedes the
         # self-contained-judgment form (root-cause 2026-06-25).
+        # The depth is stated HERE: the reader's own default is one page of ten,
+        # which measured as "the last ten messages" and was reported as absence.
         lines.append(
             f'{step}. CONTEXT-FIRST (unconditional): before interpreting this message, '
-            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str} --serving {channel_id_str}` — '
+            f'reconstruct the thread — `python3 src/discord-read.py {channel_id_str} --serving {channel_id_str} --limit 50` — '
             f'and read it back (everyone\'s messages including your own prior replies) '
-            f'until this message stands on its own, then answer from the reconstructed '
-            f'thread, NOT from memory. Do this every time; do NOT skip it because the '
-            f'message looks self-contained or you feel you already understand it — felt '
-            f'confidence is exactly the signal that fails. The only exception is a pure '
-            f'greeting or acknowledgement with no referent (e.g. "hi", "thanks").'
+            f'until this message stands on its own. That command returns ONE page of at '
+            f'most 50 messages; if the referent is not in it, continue OLDER with '
+            f'`--until <ISO time or message id>` until it is. If you stop before the '
+            f'message stands on its own, say so — name the oldest timestamp you read — '
+            f'never report a fact as absent from messages you did not read. Then answer '
+            f'from the reconstructed thread, NOT from memory. Do this every time; do NOT '
+            f'skip it because the message looks self-contained or you feel you already '
+            f'understand it — felt confidence is exactly the signal that fails. The only '
+            f'exception is a pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").'
         )
         step += 1
         if _notify_py.exists():
@@ -4279,6 +4271,9 @@ async def _handle_discord_message(message, force=False):
         rulebook_key = select_rulebook_key(access_tier, is_collaborator)
         return (
             f"id: {task_id}\n"
+            # Second line on purpose: every reader is first-match, so nothing a
+            # sender can set (channel_name, guild_name) may precede the tier.
+            f"access_tier: {access_tier}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
             f"source: discord\n"
             f"interaction_type: message\n"
@@ -4292,11 +4287,10 @@ async def _handle_discord_message(message, force=False):
             f"receiving_instance: {getattr(getattr(client, 'user', None), 'id', '')}\n"
             f"{parent_msg_line}"
             f"user_id: {message.author.id}\n"
-            f"access_tier: {access_tier}\n"
             f"{collaborator_line}"
             f"priority: {priority}\n"
             f"task: {user_task_text}\n"
-            f"{tier_instructions.get(rulebook_key, tier_instructions['other'])}"
+            f"{tier_instructions.get(rulebook_key, tier_instructions['guest'])}"
             f"{discord_skill_hints}"
             f"{secret_notice}"
         )
@@ -4309,6 +4303,7 @@ async def _handle_discord_message(message, force=False):
         # now does a mention-gate admission earn its audit row.
         _mention_gate_log_admission(message)
     pending_replies[task_id] = message.channel
+    pending_admitted_ms[task_id] = int(time.time() * 1000)
     pending_task_tiers[task_id] = access_tier
     pending_task_collab[task_id] = bool(is_collaborator)
     # Observability: one inbound accepted-message event.
@@ -4836,9 +4831,12 @@ def _atomic_write_pending_replies(data: dict) -> None:
         pass
 
 def save_pending_replies():
-    """Persist pending_replies channel IDs to disk for crash recovery."""
+    """Persist pending_replies channel ids + admitted_at for crash recovery."""
     try:
-        data = {k: str(v.id) for k, v in pending_replies.items()}
+        now_ms = int(time.time() * 1000)
+        data = {k: {"ch": str(v.id),
+                    "at": pending_admitted_ms.setdefault(k, now_ms)}
+                for k, v in pending_replies.items()}
         _atomic_write_pending_replies(data)
     except Exception:
         pass
@@ -4854,24 +4852,36 @@ def load_pending_replies_from_disk():
     try:
         if not PENDING_REPLIES_FILE.exists():
             return {}
-        data = json.loads(PENDING_REPLIES_FILE.read_text())
+        raw = json.loads(PENDING_REPLIES_FILE.read_text())
         now_ms = int(time.time() * 1000)
         max_age_ms = 7 * 86400 * 1000
         aged_out = []
-        for task_id in list(data.keys()):
-            try:
-                # task_id format: "task-<epoch_ms>"
-                ts_ms = int(task_id.split("-")[1])
-                if now_ms - ts_ms > max_age_ms:
-                    aged_out.append(task_id)
-                    del data[task_id]
-            except (ValueError, IndexError):
-                # Malformed task_id — leave it; cap protects the simple case
-                pass
+        data = {}
+        rewrite = False
+        for task_id, val in raw.items():
+            if isinstance(val, dict):
+                at, ch = val.get("at"), val.get("ch")
+            else:
+                # Legacy string: parseable task-<epoch_ms> keeps its clock;
+                # any other shape starts NOW — bounded, never immortal (#3316).
+                ch = str(val)
+                try:
+                    at = int(task_id.split("-")[1])
+                except (ValueError, IndexError):
+                    at = now_ms
+                rewrite = True
+            if not isinstance(at, int):
+                at, rewrite = now_ms, True
+            if now_ms - at > max_age_ms:
+                aged_out.append(task_id)
+                continue
+            data[task_id] = {"ch": ch, "at": at}
+            pending_admitted_ms[task_id] = at
         if aged_out:
             print(f"  [recovery] aged out {len(aged_out)} pending_replies > 7d", flush=True)
+        if aged_out or rewrite:
             _atomic_write_pending_replies(data)
-        return data
+        return {k: v["ch"] for k, v in data.items()}
     except Exception:
         pass
     return {}
@@ -4904,6 +4914,7 @@ async def poll_results():
         # A task written straight into tasks/ was never in pending_replies, so
         # its result would sit forever. Adopt the route it declared, then let
         # the existing resolution below turn it into a channel.
+
         global _orphan_route_cursor
         _adopted, _orphan_route_cursor = orphan_result_routes(
             RESULTS_DIR, TASKS_DIR,
@@ -4996,77 +5007,21 @@ async def poll_results():
                 _parsed = parse_markers(reply_text)
                 _skip = next((a for a in _parsed.actions if a.kind == "skip"), None)
                 if _skip is not None:
-                    # [no-send] / [REPLIED] / [deduped:] — normally a silent
-                    # archive. GUARD: dedup is per-channel only. A
-                    # `[deduped: task-X]` whose holder X came from a DIFFERENT
-                    # channel is invalid (it would leave the asking channel
-                    # silent). Reject it and RE-QUEUE the original task with a
-                    # trusted ===SYSTEM=== note so the core re-answers it in its
-                    # own channel. Loop guard: a task that comes back
-                    # cross-channel-deduped a SECOND time is not re-queued again
-                    # — notify in-channel instead (owner-directed).
+                    # All dedup boundaries and retry limits belong to the shared
+                    # plan; Discord only routes the re-ask or sends its report.
                     if _skip.value == "deduped":
                         _act, _delivered = "defer", None
                         try:
-                            # find_task_file globs unchecked; an id failing the
-                            # gate find_result applies is "holder not found".
-                            _holder_file = (
-                                find_task_file(TASKS_DIR, _skip.extra)
-                                if local_task_protocol.valid_archive_lookup_id(_skip.extra)
-                                else None)
-                            _holder_text = _holder_file.read_text() if _holder_file else None
-                            _target = dedup_cross_channel_target(channel.id, _holder_text)
-                            # Cross-channel is an unconfirmed report: the asker is
-                            # only served once the notify or the re-queue lands.
-                            _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)
-                                         if not _target else ("report", None))
+                            _act, _pl = _dedup_recover(task_id, _skip.extra, channel.id)
                             if _act == "requeue":
                                 pending_replies[_pl] = channel
+                                pending_admitted_ms[_pl] = int(time.time() * 1000)
                                 save_pending_replies()
-                            elif _act == "report" and not _target:
-                                # Cross-channel carries a None payload and is
-                                # delivered by the _target block below instead.
+                            elif _act == "report":
                                 await channel.send(_pl)
                                 _delivered = True
-                            if _target:
-                                _orig_file = find_task_file(TASKS_DIR, task_id)
-                                _orig_text = _orig_file.read_text() if _orig_file else None
-                                _count = dedup_requeue_count(_orig_text)
-                                if _count >= 1:
-                                    # Second time — don't loop; flag it.
-                                    print(
-                                        f"  [dedup] cross-channel retry failed for {task_id} "
-                                        f"(holder {_skip.extra} in #{_target}) — notifying",
-                                        flush=True,
-                                    )
-                                    await channel.send(
-                                        f"⚠️ Couldn't auto-correct a cross-channel dedup for "
-                                        f"`{task_id}` (folded into `{_skip.extra}` in <#{_target}>) "
-                                        f"even after a re-queue — flagging instead of looping. "
-                                        f"This needs a direct answer here."
-                                    )
-                                    _delivered = True
-                                else:
-                                    # First time — reject + re-queue for an
-                                    # in-channel answer.
-                                    _new_id = f"task-{int(time.time() * 1000)}"
-                                    _requeued = build_requeued_task(
-                                        _orig_text or "", _new_id, _count + 1,
-                                        channel.id, _skip.extra,
-                                    )
-                                    (TASKS_DIR / f"{_new_id}.txt").write_text(_requeued)
-                                    # Route the re-answer back to THIS channel.
-                                    pending_replies[_new_id] = channel
-                                    save_pending_replies()
-                                    print(
-                                        f"  [dedup] cross-channel reject: {task_id} (#{channel.id}) "
-                                        f"folded into {_skip.extra} (#{_target}) — re-queued as "
-                                        f"{_new_id} for in-channel answer",
-                                        flush=True,
-                                    )
-                                    _delivered = True
                         except Exception as e:
-                            print(f"  [dedup] cross-channel reject/requeue failed: {e}", flush=True)
+                            print(f"  [dedup] recovery routing failed: {e}", flush=True)
                         if report_disposition(_act, _delivered) == "retain":
                             # Nobody was told. Keep the result AND the task so a
                             # later pass retries; archiving loses the question.
@@ -5108,17 +5063,11 @@ async def poll_results():
                     continue
 
                 try:
-                    # Extract optional [reply: <message_id>] directive — the
-                    # agent signals "this result is a reply to that message"
-                    # so the bridge POSTs with `message_reference` (Discord's
-                    # reply-style) rather than as a fresh message. Used for
-                    # welcome posts that reply to a new-user message + any
-                    # context-replying response. msze 2026-05-06 ask.
-                    reply_pattern = re.compile(r'\[reply:\s*(\d{17,20})\]')
-                    reply_match = reply_pattern.search(reply_text)
-                    reply_to_id = int(reply_match.group(1)) if reply_match else None
-                    if reply_match:
-                        reply_text = reply_pattern.sub('', reply_text).strip()
+                    # Taken from parse_markers(), which already stripped it —
+                    # a second regex here would search an emptied body.
+                    _reply = next((a.value for a in _parsed.actions
+                                   if a.kind == "reply"), None)
+                    reply_to_id = int(_reply) if _reply else None
                     # Default to quoting the triggering message. Threads too:
                     # interleaved exchanges make position stop identifying it.
                     if reply_to_id is None:
@@ -5147,12 +5096,12 @@ async def poll_results():
                     _redirect_action = next((a for a in _parsed.actions if a.kind == "redirect"), None)
                     if _redirect_action:
                         target_channel_id = int(_redirect_action.value)
-                        task_tier = "other"
+                        task_tier = "guest"
                         # The core agent may have already moved the processed
                         # task out of the live dir before we pick up the result
                         # (2026-06-10: an owner [channel:] forward was dropped
                         # because the gate read tier from a path that no longer
-                        # existed and failed safe to "other"). A processed task
+                        # existed and failed safe to "guest"). A processed task
                         # can be in four places — mirror _isVoiceTask's set
                         # (task-bridge.ts): live, processed/, legacy flat
                         # archive/, and the active month-partitioned
@@ -5173,11 +5122,10 @@ async def poll_results():
                                 task_body = _tier_path.read_text()
                             except Exception:
                                 continue
-                            for ln in task_body.splitlines():
-                                if ln.startswith("access_tier:"):
-                                    task_tier = ln.split(":", 1)[1].strip() or "other"
-                                    break
-                            break  # first readable file wins; missing all → "other"
+                            task_tier = local_task_protocol.canonical_access_tier(
+                                local_task_protocol.parse_task_headers(task_body)
+                                .headers.get("access_tier")) or "guest"
+                            break  # first readable file wins; missing all → "guest"
                         if task_tier != "owner":
                             print(
                                 f"  [channel-redirect] dropped — tier '{task_tier}' is not owner "
@@ -5544,14 +5492,26 @@ async def poll_proactive():
             # state/last-owner-activity.json; default discord on missing
             # state).
             from proactive_routing import (  # noqa: E402
-                redirect_target_is_foreign, should_claim_proactive_file)
-            for f in RESULTS_DIR.iterdir():
+                body_target_channel, redirect_target_is_foreign,
+                should_claim_proactive_file)
+
+            def _discord_claims(f):
                 # Per-FILE decision: an explicit .to-<channel> destination
                 # outranks activity routing (see proactive_routing).
+                if should_claim_proactive_file(
+                        f.name, STATE_DIR / "last-owner-activity.json", "discord"):
+                    return True
+                # An explicit body [channel:] target also outranks activity
+                # routing, matching slack/telegram's body_claimable_by peek.
+                try:
+                    peek = f.read_text(errors="ignore")
+                except OSError:
+                    return False
+                return body_target_channel(peek) == "discord"
+
+            for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt" \
-                        and should_claim_proactive_file(
-                            f.name, STATE_DIR / "last-owner-activity.json",
-                            "discord"):
+                        and _discord_claims(f):
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration
                     # (this coroutine, a race with the same-node telegram
@@ -6023,7 +5983,7 @@ async def poll_dm_fallback():
                     target_channel_id = int(_redirect_fb.value)
                     clean_body = _parsed_fb.body  # already stripped by parse_markers
                     _task_id = f.stem
-                    # Tier read from task file. Default "other" on missing /
+                    # Tier read from task file. Default "guest" on missing /
                     # unreadable: voice- and cron-originated tasks don't write
                     # an access_tier field (only the Discord bridge does at
                     # line ~2534), so they'll fall into this default. The
@@ -6032,15 +5992,14 @@ async def poll_dm_fallback():
                     # voice user who genuinely wants channel-redirect can
                     # have voice-agent write `access_tier: owner` into the
                     # task file (the same shape Discord uses).
-                    task_tier = "other"
+                    task_tier = "guest"
                     try:
                         task_body = (TASKS_DIR / f"{_task_id}.txt").read_text()
-                        for ln in task_body.splitlines():
-                            if ln.startswith("access_tier:"):
-                                task_tier = ln.split(":", 1)[1].strip() or "other"
-                                break
+                        task_tier = local_task_protocol.canonical_access_tier(
+                            local_task_protocol.parse_task_headers(task_body)
+                            .headers.get("access_tier")) or "guest"
                     except Exception:
-                        task_tier = "other"
+                        task_tier = "guest"
 
                     if task_tier == "owner":
                         try:

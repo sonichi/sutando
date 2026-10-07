@@ -8,9 +8,10 @@ out via SUTANDO_TELEMETRY=0, and telemetry honors that opt-out. This test
 fails if either half regresses:
 
   1. each test runner sets SUTANDO_TELEMETRY=0
-     - scripts/coverage-gate.sh (local + coverage-gate.yml)
+     - scripts/coverage-gate.sh (local; ci.yml's coverage-gate job)
      - .github/workflows/ci.yml           (node + python tests)
      - .github/workflows/python39-compat.yml
+     - .github/workflows/windows-runtime.yml
   2. telemetry.opted_out() honors SUTANDO_TELEMETRY=0 (and enabled() → False)
 
 Run: python3 tests/telemetry-test-optout-guard.test.py
@@ -35,7 +36,7 @@ gate = (REPO / "scripts" / "coverage-gate.sh").read_text()
 check("coverage-gate.sh exports SUTANDO_TELEMETRY=0",
       re.search(r"^\s*export\s+SUTANDO_TELEMETRY=0\b", gate, re.MULTILINE) is not None)
 
-for wf in ("ci.yml", "python39-compat.yml"):
+for wf in ("ci.yml", "python39-compat.yml", "windows-runtime.yml"):
     text = (REPO / ".github" / "workflows" / wf).read_text()
     # a workflow-level `env:` mapping (top-level, not nested under a step) with
     # SUTANDO_TELEMETRY: "0" — applies to every job/step in the workflow.
@@ -81,4 +82,4 @@ print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")
     raise SystemExit(1)
-print(f"ALL PASS ({6} checks)")
+print(f"ALL PASS ({7} checks)")

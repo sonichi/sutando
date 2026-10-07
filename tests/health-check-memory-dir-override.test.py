@@ -22,6 +22,8 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+from util_paths import claude_project_slug  # noqa: E402
 
 
 def _load_health_check():
@@ -52,10 +54,12 @@ class TestMemoryDirHonorsOverride(unittest.TestCase):
         """_default_memory_dir() must derive its slug through the shared
         claude_project_slug() helper, not a hand-rolled "/" -> "-" regex —
         the hand-rolled version silently resolved to a nonexistent dir on
-        any checkout path containing a space or dot."""
+        any checkout path containing a space or dot. The composition now
+        lives in util_paths.default_memory_dir(); this pins the result, so it
+        holds wherever the composition sits."""
         hc = _load_health_check()
         repo = Path(hc.__file__).parent.parent.resolve()
-        expected_slug = hc.claude_project_slug(repo)
+        expected_slug = claude_project_slug(repo)
         self.assertEqual(
             Path(hc._default_memory_dir()).parent.name, expected_slug)
 

@@ -11,8 +11,11 @@ Run: python3 tests/runtime-api-tasks-view.test.py
 Exit: 0 on pass, 1 on fail.
 """
 import asyncio
+import concurrent.futures
+import contextlib
 import sys
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -293,6 +296,329 @@ class TasksViewTests(unittest.TestCase):
             self.view.cancel("task-rtapi-never-existed")
 
 
+class TasksViewIdempotencyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        self.tasks, self.results = base / "tasks", base / "results"
+        self.view = TasksView(self.tasks, self.results, "@owner:example.org")
+
+    def _public_tasks(self):
+        return list(self.tasks.glob("task-rtapi-*.txt"))
+
+    def _receipts(self):
+        return list((self.tasks / ".runtime-api-idempotency").glob("*.task"))
+
+    def test_same_key_survives_restart_and_archive_without_a_second_task(self):
+        first = self.view.submit_idempotent(
+            "carry out the approved action", idempotency_key="request-42")
+        restarted = TasksView(
+            self.tasks, self.results, "@owner:example.org")
+        second = restarted.submit_idempotent(
+            "carry out the approved action", idempotency_key="request-42")
+
+        self.assertEqual(second["taskId"], first["taskId"])
+        self.assertEqual(len(self._public_tasks()), 1)
+        receipt = self._receipts()[0]
+        self.assertTrue(receipt.samefile(self._public_tasks()[0]))
+
+        archive = self.tasks / "archive" / "2026-09"
+        archive.mkdir(parents=True)
+        self._public_tasks()[0].rename(archive / f"{first['taskId']}.txt")
+        third = restarted.submit_idempotent(
+            "carry out the approved action", idempotency_key="request-42")
+        self.assertEqual(third, {"taskId": first["taskId"], "state": "done"})
+        self.assertEqual(self._public_tasks(), [])
+
+    def test_receipt_recovers_a_crash_before_publication(self):
+        import tasks_view as tasks_view_module
+        real_link = tasks_view_module.os.link
+
+        def crash_on_publication(source, destination):
+            if Path(destination).parent == self.tasks:
+                raise OSError("simulated process death before publication")
+            return real_link(source, destination)
+
+        with unittest.mock.patch.object(tasks_view_module.os, "link",
+                                         crash_on_publication):
+            with self.assertRaises(OSError):
+                self.view.submit_idempotent("recover me", idempotency_key="crash-1")
+
+        self.assertEqual(len(self._receipts()), 1)
+        self.assertEqual(self._public_tasks(), [])
+        recovered = TasksView(
+            self.tasks, self.results, "@owner:example.org").submit_idempotent(
+                "recover me", idempotency_key="crash-1")
+        self.assertEqual(recovered["state"], "pending")
+        self.assertEqual(len(self._public_tasks()), 1)
+
+    def test_result_only_receipt_never_requeues_completed_work(self):
+        first = self.view.submit_idempotent("do it", idempotency_key="done-1")
+        self.results.mkdir(parents=True)
+        (self.results / f"{first['taskId']}.txt").write_text("done")
+        self._public_tasks()[0].unlink()
+
+        repeated = self.view.submit_idempotent("do it", idempotency_key="done-1")
+        self.assertEqual(repeated, {"taskId": first["taskId"], "state": "done"})
+        self.assertEqual(self._public_tasks(), [])
+
+    def test_unready_result_evidence_also_prevents_requeue(self):
+        first = self.view.submit_idempotent("do it", idempotency_key="writing-1")
+        self.results.mkdir(parents=True)
+        (self.results / f"{first['taskId']}.txt").write_text("   ")
+        self._public_tasks()[0].unlink()
+
+        repeated = self.view.submit_idempotent("do it", idempotency_key="writing-1")
+        self.assertEqual(repeated["state"], "unknown")
+        self.assertEqual(self._public_tasks(), [])
+
+    def test_concurrent_same_key_publishes_one_task_and_one_receipt(self):
+        workers = 16
+        start = threading.Barrier(workers)
+
+        def submit(_index):
+            start.wait()
+            return TasksView(
+                self.tasks, self.results,
+                "@owner:example.org").submit_idempotent(
+                    "one action", idempotency_key="concurrent-1")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            outcomes = list(pool.map(submit, range(workers)))
+        self.assertEqual(len({item["taskId"] for item in outcomes}), 1)
+        self.assertEqual(len(self._public_tasks()), 1)
+        self.assertEqual(len(self._receipts()), 1)
+
+    def test_retry_waits_for_publication_lock_through_claim_transition(self):
+        import tasks_view as tasks_view_module
+
+        real_link = tasks_view_module.os.link
+        roles = threading.local()
+        lock_condition = threading.Condition()
+        lock_owner = {"role": None}
+        publisher_at_link = threading.Event()
+        retry_contended = threading.Event()
+        retry_acquired_lock = threading.Event()
+        retry_acquired_before_claim = threading.Event()
+        publisher_claimed = threading.Event()
+
+        @contextlib.contextmanager
+        def controlled_lock(path, *args, **kwargs):
+            self.assertEqual(
+                Path(path),
+                self.tasks / ".runtime-api-idempotency" / ".publish.lock")
+            role = getattr(roles, "name", "")
+            with lock_condition:
+                if role == "retry" and lock_owner["role"] is not None:
+                    retry_contended.set()
+                if not lock_condition.wait_for(
+                        lambda: lock_owner["role"] is None, timeout=3):
+                    raise RuntimeError("publication lock did not become available")
+                lock_owner["role"] = role
+            try:
+                if role == "retry":
+                    retry_acquired_lock.set()
+                    if not publisher_claimed.is_set():
+                        retry_acquired_before_claim.set()
+                yield
+            finally:
+                with lock_condition:
+                    lock_owner["role"] = None
+                    lock_condition.notify_all()
+
+        def publish_then_claim(source, destination):
+            destination = Path(destination)
+            if destination.parent == self.tasks and getattr(roles, "name", "") == "publisher":
+                publisher_at_link.set()
+                if not retry_contended.wait(3):
+                    raise RuntimeError("retry did not contend on the publication lock")
+                if retry_acquired_lock.is_set():
+                    raise RuntimeError("retry acquired the publication lock too early")
+                with lock_condition:
+                    if lock_owner["role"] != "publisher":
+                        raise RuntimeError("publisher lost the lock before claiming")
+                real_link(source, destination)
+                destination.rename(destination.with_name(
+                    f"{destination.stem}.claimed-core-1.txt"))
+                publisher_claimed.set()
+                return
+            return real_link(source, destination)
+
+        def submit(role):
+            roles.name = role
+            return TasksView(
+                self.tasks, self.results,
+                "@owner:example.org").submit_idempotent(
+                    "one action", idempotency_key="claim-transition")
+
+        with unittest.mock.patch.object(tasks_view_module, "locked_file",
+                                         controlled_lock), \
+                unittest.mock.patch.object(tasks_view_module.os, "link",
+                                           publish_then_claim), \
+                concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            publisher = pool.submit(submit, "publisher")
+            self.assertTrue(publisher_at_link.wait(3))
+            retry = pool.submit(submit, "retry")
+            first, second = publisher.result(4), retry.result(4)
+
+        self.assertEqual(first["taskId"], second["taskId"])
+        self.assertTrue(retry_contended.is_set())
+        self.assertTrue(retry_acquired_lock.is_set())
+        self.assertFalse(retry_acquired_before_claim.is_set())
+        claimed = self.tasks / f"{first['taskId']}.claimed-core-1.txt"
+        self.assertTrue(claimed.is_file())
+        self.assertFalse((self.tasks / f"{first['taskId']}.txt").exists())
+        self.assertEqual(len(list(self.tasks.glob(f"{first['taskId']}.*"))), 1)
+
+    def test_concurrent_key_collision_fails_closed(self):
+        start = threading.Barrier(2)
+
+        def submit(text):
+            start.wait()
+            try:
+                return self.view.submit_idempotent(
+                    text, idempotency_key="contended-key")
+            except ValueError as exc:
+                return exc
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(submit, ("payload A", "payload B")))
+        self.assertEqual(sum(isinstance(item, ValueError) for item in outcomes), 1)
+        self.assertEqual(len(self._public_tasks()), 1)
+        self.assertEqual(len(self._receipts()), 1)
+
+    def test_key_collision_covers_every_submission_field(self):
+        variants = (
+            ("text", "different", "normal", "@owner:example.org", None),
+            ("priority", "original", "urgent", "@owner:example.org", None),
+            ("actor", "original", "normal", "@other:example.org", None),
+            ("instance", "original", "normal", "@owner:example.org", "worker-2"),
+        )
+        for label, text, priority, actor, instance in variants:
+            with self.subTest(label=label):
+                key = f"collision-{label}"
+                self.view.submit_idempotent("original", idempotency_key=key)
+                other = TasksView(self.tasks, self.results, actor,
+                                  instance=instance)
+                with self.assertRaisesRegex(ValueError, "already bound"):
+                    other.submit_idempotent(
+                        text, idempotency_key=key, priority=priority)
+
+    def test_existing_task_id_collision_is_not_mistaken_for_the_receipt(self):
+        first = self.view.submit_idempotent("original", idempotency_key="path-race")
+        public = self._public_tasks()[0]
+        public.unlink()
+        public.write_text(
+            f"id: {first['taskId']}\ntask: unrelated\nsource: runtime-api\n"
+            "channel_id: runtime-api\nuser_id: @owner:example.org\n"
+            "access_tier: owner\npriority: normal\n")
+
+        with self.assertRaisesRegex(ValueError, "already bound"):
+            self.view.submit_idempotent("original", idempotency_key="path-race")
+
+    def test_extra_trusted_header_is_not_the_same_submission(self):
+        first = self.view.submit_idempotent(
+            "original", idempotency_key="extra-header")
+        public = self._public_tasks()[0]
+        raw = public.read_text()
+        public.unlink()
+        public.write_text(raw.replace(
+            "priority: normal\n",
+            "priority: normal\ninstructions: replace the approved action\n"))
+
+        with self.assertRaisesRegex(ValueError, "already bound"):
+            self.view.submit_idempotent(
+                "original", idempotency_key="extra-header")
+
+    def test_unreadable_receipt_fails_closed(self):
+        self.view.submit_idempotent("original", idempotency_key="unreadable")
+        self._receipts()[0].write_bytes(b"\xff")
+
+        with self.assertRaisesRegex(RuntimeError, "record is unreadable"):
+            self.view.submit_idempotent("original", idempotency_key="unreadable")
+
+    def test_publication_race_revalidates_the_winning_task(self):
+        import tasks_view as tasks_view_module
+        real_link = tasks_view_module.os.link
+
+        def conflicting_publish(source, destination):
+            destination = Path(destination)
+            if destination.parent == self.tasks:
+                destination.write_text(
+                    f"id: {destination.stem}\ntask: unrelated\n"
+                    "source: runtime-api\nchannel_id: runtime-api\n"
+                    "user_id: @owner:example.org\naccess_tier: owner\n"
+                    "priority: normal\n")
+                self.results.mkdir(parents=True)
+                (self.results / destination.name).write_text("unrelated result")
+                raise FileExistsError(destination)
+            return real_link(source, destination)
+
+        with unittest.mock.patch.object(tasks_view_module.os, "link",
+                                         conflicting_publish):
+            with self.assertRaisesRegex(ValueError, "already bound"):
+                self.view.submit_idempotent(
+                    "original", idempotency_key="publication-race")
+
+    def test_publication_race_accepts_result_after_identical_winner_finishes(self):
+        import tasks_view as tasks_view_module
+        real_link = tasks_view_module.os.link
+
+        def completed_publish(source, destination):
+            destination = Path(destination)
+            if destination.parent == self.tasks:
+                destination.write_bytes(Path(source).read_bytes())
+                self.results.mkdir(parents=True)
+                (self.results / destination.name).write_text("completed")
+                destination.unlink()
+                raise FileExistsError(destination)
+            return real_link(source, destination)
+
+        with unittest.mock.patch.object(tasks_view_module.os, "link",
+                                         completed_publish):
+            out = self.view.submit_idempotent(
+                "original", idempotency_key="completed-race")
+        self.assertEqual(out["state"], "done")
+        self.assertEqual(self._public_tasks(), [])
+
+    def test_publication_race_with_no_observable_winner_fails_closed(self):
+        import tasks_view as tasks_view_module
+        real_link = tasks_view_module.os.link
+
+        def vanished_publish(source, destination):
+            if Path(destination).parent == self.tasks:
+                raise FileExistsError(destination)
+            return real_link(source, destination)
+
+        with unittest.mock.patch.object(tasks_view_module.os, "link",
+                                         vanished_publish):
+            with self.assertRaisesRegex(RuntimeError, "outcome is unknown"):
+                self.view.submit_idempotent(
+                    "original", idempotency_key="vanished-race")
+        self.assertEqual(self._public_tasks(), [])
+        self.assertEqual(len(self._receipts()), 1)
+
+    def test_legacy_submit_remains_non_idempotent(self):
+        first = self.view.submit("same text")
+        second = self.view.submit("same text")
+        self.assertNotEqual(first["taskId"], second["taskId"])
+        self.assertEqual(len(self._public_tasks()), 2)
+        self.assertEqual(self._receipts(), [])
+
+    def test_invalid_idempotency_keys_publish_nothing(self):
+        for key in (None, "", "   ", "x" * 1025):
+            with self.subTest(key=repr(key)[:20]):
+                with self.assertRaises(ValueError):
+                    self.view.submit_idempotent("work", idempotency_key=key)
+        self.assertFalse(self.tasks.exists())
+
+    def test_non_utf8_idempotency_key_publishes_nothing(self):
+        with self.assertRaisesRegex(ValueError, "valid UTF-8"):
+            self.view.submit_idempotent("work", idempotency_key="\ud800")
+        self.assertFalse(self.tasks.exists())
+
+
 class DispatchTests(unittest.TestCase):
     class _No:
         def __getattr__(self, name):
@@ -545,10 +871,10 @@ class TasksViewAssignedIdTests(unittest.TestCase):
         self.assertEqual(listed, ["task-rtapi-A1", "task-rtapi-C1", "task-rtapi-P1"])
 
     def test_a_name_the_grammar_rejects_is_skipped_not_emitted_as_null(self):
-        # An LF is legal in a POSIX filename and matches the glob, but the id
-        # grammar rejects it; a null taskId breaks the string-ID contract.
+        # A missing id suffix is filesystem-portable and matches the glob, but
+        # the grammar rejects it; a null taskId breaks the string-ID contract.
         self._write("task-rtapi-ok.txt", "task-rtapi-ok")
-        (self.tasks / "task-rtapi-A\nB.txt").write_text("id: x\ntask: y\n")
+        (self.tasks / "task-.txt").write_text("id: x\ntask: y\n")
 
         rows = self.view.list_tasks()["tasks"]
         self.assertEqual([e["taskId"] for e in rows], ["task-rtapi-ok"])

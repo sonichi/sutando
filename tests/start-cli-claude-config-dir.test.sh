@@ -145,10 +145,15 @@ EOF
   # resolve claude_sutando_config_dir
   # (sutando-config.sh stays under scripts/ — start-cli calls $REPO/scripts/...).
   cp "$REAL_REPO/src/agent/claude/cli/start-cli.sh" "$REPO_FAKE/src/agent/claude/cli/"
+  # start-cli sources the shared session-launch mechanics unconditionally
+  # (not the optional-helper pattern claude_config_dir.sh below is) — without
+  # this the fake repo dies at start-cli's own second line.
+  cp "$REAL_REPO/src/agent/claude/cli/session-launch.sh" "$REPO_FAKE/src/agent/claude/cli/"
   # start-cli sources the shared resolve-or-refuse policy from $REPO/src/.
   cp "$REAL_REPO/src/claude_config_dir.sh" "$REPO_FAKE/src/"
   # Sourced by the launcher before anything else it does here.
   cp "$REAL_REPO/src/agent/restart-guard.sh" "$REPO_FAKE/src/agent/"
+  cp "$REAL_REPO/src/agent/task-event-handler-lookup.sh" "$REPO_FAKE/src/agent/"
   cp "$REAL_REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO_FAKE/src/agent/claude/cli/"
   cp "$REAL_REPO/hooks/skip-ask-user-question.py" "$REPO_FAKE/hooks/"
 
@@ -298,8 +303,16 @@ test_block_present_in_start_cli() {
     echo "  FAIL: src/agent/claude/cli/start-cli.sh no longer references CLAUDE_CONFIG_DIR"
     return 1
   fi
-  if ! grep -qF 'resolve_claude_config_dir "$REPO"' "$REAL_REPO/src/agent/claude/cli/start-cli.sh"; then
-    echo "  FAIL: src/agent/claude/cli/start-cli.sh no longer delegates to the shared resolver"
+  # start-cli.sh calls the shared wrapper (session-launch.sh, also sourced by
+  # a pool worker's own launcher); the wrapper is what delegates to
+  # resolve_claude_config_dir "$REPO" -- checking both link is what makes
+  # this catch a break in either half of that chain.
+  if ! grep -qF 'resolve_claude_config_dir_and_seed' "$REAL_REPO/src/agent/claude/cli/start-cli.sh"; then
+    echo "  FAIL: src/agent/claude/cli/start-cli.sh no longer calls the shared config-dir wrapper"
+    return 1
+  fi
+  if ! grep -qF 'resolve_claude_config_dir "$REPO"' "$REAL_REPO/src/agent/claude/cli/session-launch.sh"; then
+    echo "  FAIL: src/agent/claude/cli/session-launch.sh no longer delegates to the shared resolver"
     return 1
   fi
   if ! grep -qF 'refusing to start' "$REAL_REPO/src/claude_config_dir.sh"; then

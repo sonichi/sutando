@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""check-pending-questions must not claim delivery it did not achieve.
+"""The pending-questions reminder must not claim delivery it did not achieve.
 
 2026-07-21: the cron printed "Notified: 16 pending questions" on a host where no
 bridge was draining results/proactive-*.txt. The DM never reached the owner; only
@@ -9,14 +9,16 @@ outcome is how a blocked decision sits unseen for a day.
 import importlib.util
 import time
 import re
+import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
 
 def _load(results_dir):
-    spec = importlib.util.spec_from_file_location("cpq", REPO / "src" / "check-pending-questions.py")
+    spec = importlib.util.spec_from_file_location("cpq", REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_remind.py")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     m.RESULTS_DIR = Path(results_dir)
@@ -104,6 +106,11 @@ class TestUndrainedDetection(unittest.TestCase):
             self.assertFalse(self.m.notify_macos(1, ["t"]), "a failed osascript must not read as delivered")
             subprocess.run = lambda *a, **k: type("R", (), {"returncode": 0})()
             self.assertTrue(self.m.notify_macos(1, ["t"]))
+            subprocess.run = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError())
+            self.assertFalse(
+                self.m.notify_macos(1, ["t"]),
+                "a host without osascript must degrade to a failed optional path",
+            )
         finally:
             subprocess.run = real
 
@@ -208,9 +215,10 @@ class TestReviewFindings(unittest.TestCase):
         stamp = pathlib.Path(tempfile.mkdtemp()) / "last-notify"
         self.m.LAST_NOTIFY_FILE = stamp
         self.m.deliver = lambda *a, **k: (_ for _ in ()).throw(OSError("delivery blew up"))
-        self.m.get_waiting_questions = lambda: [{"title": "q"}]
+        self.m.gather = lambda adapter=None: {"waiting": [{"title": "q"}], "notes": [], "unavailable": False, "reason": None}
         self.m.should_notify = lambda *a, **k: True
-        with self.assertRaises(OSError):
+        with mock.patch.object(sys, "argv", ["check-pending-questions.py", "--notify"]), \
+                self.assertRaises(OSError):
             self.m.main()
         self.assertFalse(stamp.exists(),
                          "a failed delivery must NOT put the next hour on cooldown")
@@ -224,9 +232,10 @@ class TestReviewFindings(unittest.TestCase):
         stamp = pathlib.Path(tempfile.mkdtemp()) / "last-notify"
         self.m.LAST_NOTIFY_FILE = stamp
         self.m.deliver = lambda *a, **k: "Notified: 1 pending questions [ok]"
-        self.m.get_waiting_questions = lambda: [{"title": "q"}]
+        self.m.gather = lambda adapter=None: {"waiting": [{"title": "q"}], "notes": [], "unavailable": False, "reason": None}
         self.m.should_notify = lambda *a, **k: True
-        self.m.main()
+        with mock.patch.object(sys, "argv", ["check-pending-questions.py", "--notify"]):
+            self.m.main()
         self.assertTrue(stamp.exists(), "a successful delivery MUST set the cooldown")
         # The marker carries "<epoch> <content-key>" as of 2026-08-01: the cooldown
         # gates on the SET rather than only the clock, so the key must persist next
@@ -357,7 +366,7 @@ class TestReviewFindings(unittest.TestCase):
 
     def test_d_written_name_matches_the_scanned_prefix(self):
         """Writer and detector must agree, or the check silently never fires."""
-        src = (REPO / "src" / "check-pending-questions.py").read_text()
+        src = (REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_remind.py").read_text()
         self.assertIn('RESULTS_DIR / f"{PROACTIVE_PREFIX}', src)
         self.assertIn('RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}', src)
 

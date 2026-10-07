@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 # startup's watch-tasks-stream reaper must only delete the sentinel it inspected.
-#
-# Unlinking a sentinel this reap did not inspect strands a live watcher untrackable.
-# Case 3 makes that window deterministic: the `ps` shim re-stamps the file mid-reap.
-#
-# Run: bash tests/startup-watcher-reaper-ownership.test.sh
-# Exit: 0 = all pass, 1 = failure
+# Run: bash tests/startup-watcher-reaper-ownership.test.sh (0 = pass, 1 = fail)
 set -uo pipefail
 
 REPO="${REPO_UNDER_TEST:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -124,17 +119,259 @@ else
 fi
 fi  # have_fn
 
-# --- wiring: startup.sh must delegate, not re-implement ------------------------
-if grep -q 'reap_stale_task_watcher "\$WORKSPACE/state/watch-tasks-stream.pid"' "$REPO/src/startup.sh"; then
-  ok "startup.sh delegates to the shared reaper"
+# --- wiring: startup.sh must delegate, and reap only THIS instance -------------
+# Not `sentinel_paths_in` (every instance's sentinel) -- that loop killed a peer's live watcher.
+if grep -q 'reap_stale_task_watcher "\$__sentinel"' "$REPO/src/startup.sh" \
+   && grep -q 'sentinel_path_for "\$WORKSPACE/state"' "$REPO/src/startup.sh"; then
+  ok "startup.sh delegates to the shared reaper for its OWN sentinel"
 else
   bad "startup.sh delegates to the shared reaper" "call site not found"
+fi
+if grep -q 'sentinel_paths_in "\$WORKSPACE/state"' "$REPO/src/startup.sh"; then
+  bad "startup.sh reaps only its own identity" "it still enumerates every instance's sentinel"
+else
+  ok "startup.sh reaps only its own identity"
+fi
+
+# --- peer survival: the property the enumeration assertion could not express ---
+# LIMIT: calls the reaper directly, so it does NOT re-fail if startup.sh regresses to enumeration.
+if [ -n "${have_fn:-}" ] && command -v sentinel_path_for >/dev/null 2>&1; then
+  _pt="$(mktemp -d)"; mkdir -p "$_pt/state" "$_pt/src"
+  printf '#!/bin/bash\nsleep 60\n' > "$_pt/src/watch-tasks-stream.sh"; chmod +x "$_pt/src/watch-tasks-stream.sh"
+  bash "$_pt/src/watch-tasks-stream.sh" & _a=$!
+  bash "$_pt/src/watch-tasks-stream.sh" & _b=$!
+  sleep 2
+  echo "$_a" > "$_pt/state/watch-tasks-stream.pid"
+  echo "$_b" > "$_pt/state/watch-tasks-stream-peer-b+w2.pid"
+  if kill -0 "$_a" 2>/dev/null && kill -0 "$_b" 2>/dev/null; then
+    if _s="$(sentinel_path_for "$_pt/state")" && [ -n "$_s" ]; then
+      reap_stale_task_watcher "$_s" >/dev/null 2>&1
+    fi
+    sleep 1
+    if kill -0 "$_b" 2>/dev/null && [ -f "$_pt/state/watch-tasks-stream-peer-b+w2.pid" ]; then
+      ok "a peer instance's live watcher and sentinel both survive this startup"
+    else
+      bad "a peer instance survives this startup" "the peer was killed or its sentinel removed"
+    fi
+    if kill -0 "$_a" 2>/dev/null; then
+      bad "this instance's own stale watcher is still reaped" "it survived, so the reap did nothing"
+    else
+      ok "this instance's own stale watcher is still reaped"
+    fi
+  else
+    bad "peer-survival fixture" "a fixture watcher was not alive; the case measured nothing"
+  fi
+  kill "$_a" "$_b" 2>/dev/null; rm -rf "$_pt"
 fi
 if grep -q 'rm -f "\$WATCHER_PID_FILE"' "$REPO/src/startup.sh"; then
   bad "startup.sh keeps no unguarded copy" "the inline rm -f is still there"
 else
   ok "startup.sh keeps no unguarded copy"
 fi
+
+# --- case 5: an OBSERVER whose argv merely NAMES the script is not a watcher --
+# Identity belongs to src/watcher_identity.py: argv[1] is not the script.
+cat > "$TMP/observer.sh" << 'SH'
+#!/bin/bash
+# argv carries the watcher's name as an OPERAND, which is what used to match.
+sleep 30
+SH
+chmod +x "$TMP/observer.sh"
+"$TMP/observer.sh" src/watch-tasks-stream.sh "$TMP/inbox" &
+obs_pid=$!
+f="$TMP/case5.pid"
+echo "$obs_pid" > "$f"
+out="$(reap_stale_task_watcher "$f" 2>&1)"
+if kill -0 "$obs_pid" 2>/dev/null; then
+  ok "observer naming the script is NOT killed"
+else
+  bad "observer naming the script is NOT killed" "reaped an unrelated process ($out)"
+fi
+kill "$obs_pid" 2>/dev/null; wait "$obs_pid" 2>/dev/null
+
+# --- case 6: an UNOBSERVED ps must not release the sentinel -------------------
+# A silent non-zero `ps` (no stderr) used to fall through to release; hazard is a LIVE, unreadable watcher.
+sleep 30 &
+live6=$!
+f="$TMP/case6.pid"
+echo "$live6" > "$f"
+shimdir="$TMP/shim6"; mkdir -p "$shimdir"
+printf '#!/bin/sh\nexit 1\n' > "$shimdir/ps"; chmod +x "$shimdir/ps"
+out="$(PATH="$shimdir:$PATH" reap_stale_task_watcher "$f" 2>&1)"
+if [ -f "$f" ]; then
+  ok "unobserved ps: sentinel left in place"
+else
+  bad "unobserved ps: sentinel left in place" "released on an unproven pid ($out)"
+fi
+kill "$live6" 2>/dev/null; wait "$live6" 2>/dev/null
+
+
+# --- case 7: stdout NOISE ahead of the verdict must not be read as one --------
+# A startup hook can prepend a line; unrecognised output is not an answer.
+sleep 30 &
+live7=$!
+f="$TMP/case7.pid"
+echo "$live7" > "$f"
+noisy="$TMP/noisy"; mkdir -p "$noisy"
+cat > "$noisy/python3" << 'SH'
+#!/bin/sh
+echo "site-banner"
+echo "watcher"
+echo "why=bash /x/watch-tasks-stream.sh /inbox"
+exit 0
+SH
+chmod +x "$noisy/python3"
+out="$(PATH="$noisy:$PATH" SUTANDO_PY="$noisy/python3" reap_stale_task_watcher "$f" 2>&1)"
+if [ -f "$f" ] && kill -0 "$live7" 2>/dev/null; then
+  ok "banner ahead of the verdict: neither killed nor released"
+else
+  bad "banner ahead of the verdict: neither killed nor released" \
+      "sentinel present=$([ -f "$f" ] && echo yes || echo no) alive=$(kill -0 "$live7" 2>/dev/null && echo yes || echo no) ($out)"
+fi
+kill "$live7" 2>/dev/null; wait "$live7" 2>/dev/null
+
+
+# --- case 8: `dead` from a SUCCEEDING helper still licenses the release -------
+# The control for case 9: same stub, same live pid, only the exit code differs.
+sleep 30 &
+live8=$!
+f="$TMP/case8.pid"
+echo "$live8" > "$f"
+ok8="$TMP/ok8"; mkdir -p "$ok8"
+cat > "$ok8/python3" << 'SH'
+#!/bin/sh
+echo "dead"
+echo "why=no such process"
+exit 0
+SH
+chmod +x "$ok8/python3"
+out="$(PATH="$ok8:$PATH" SUTANDO_PY="$ok8/python3" reap_stale_task_watcher "$f" 2>&1)"
+if [ ! -f "$f" ]; then
+  ok "dead from a succeeding helper: sentinel released"
+else
+  bad "dead from a succeeding helper: sentinel released" "still present ($out)"
+fi
+kill "$live8" 2>/dev/null; wait "$live8" 2>/dev/null
+
+
+# --- case 9: `dead` from a FAILED helper licenses nothing ---------------------
+# A failed run is not a verdict, whatever it printed.
+sleep 30 &
+live9=$!
+f="$TMP/case9.pid"
+echo "$live9" > "$f"
+bad9="$TMP/bad9"; mkdir -p "$bad9"
+cat > "$bad9/python3" << 'SH'
+#!/bin/sh
+echo "dead"
+echo "why=no such process"
+exit 42
+SH
+chmod +x "$bad9/python3"
+out="$(PATH="$bad9:$PATH" SUTANDO_PY="$bad9/python3" reap_stale_task_watcher "$f" 2>&1)"
+if [ -f "$f" ] && kill -0 "$live9" 2>/dev/null; then
+  ok "dead from a FAILED helper: neither killed nor released"
+else
+  bad "dead from a FAILED helper: neither killed nor released" \
+      "sentinel present=$([ -f "$f" ] && echo yes || echo no) alive=$(kill -0 "$live9" 2>/dev/null && echo yes || echo no) ($out)"
+fi
+kill "$live9" 2>/dev/null; wait "$live9" 2>/dev/null
+
+
+# --- case 10: a watcher that does not exit on TERM must not be left running ---
+# bash DEFERS a TERM trap until the foreground child returns.
+mkdir -p "$TMP/fakebin10"
+cat > "$TMP/fakebin10/watch-tasks-stream.sh" << 'SH'
+#!/bin/bash
+trap '' TERM
+sleep 30
+SH
+chmod +x "$TMP/fakebin10/watch-tasks-stream.sh"
+bash "$TMP/fakebin10/watch-tasks-stream.sh" &
+live10=$!
+f="$TMP/case10.pid"
+echo "$live10" > "$f"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  ps -p "$live10" -o args= 2>/dev/null | grep -q watch-tasks-stream && break
+  sleep 0.1
+done
+out="$(reap_stale_task_watcher "$f" 2>&1)"
+# The discriminator is ALIVE-vs-DEAD: pre-fix this pid survived while its
+# sentinel was released and success was printed anyway.
+if ! kill -0 "$live10" 2>/dev/null; then
+  ok "watcher ignoring TERM: escalated until actually gone"
+else
+  bad "watcher ignoring TERM: escalated until actually gone" \
+      "still running after the reap, so the release below was unverified ($out)"
+fi
+if kill -0 "$live10" 2>/dev/null && [ ! -f "$f" ]; then
+  bad "watcher ignoring TERM: no sentinel released while alive" \
+      "sentinel gone while the watcher runs — untracked watcher ($out)"
+else
+  ok "watcher ignoring TERM: no sentinel released while alive"
+fi
+kill -KILL "$live10" 2>/dev/null; wait "$live10" 2>/dev/null
+
+
+# --- case 11: a verdict-shaped line from a startup hook is still not a verdict -
+# Case 7 covers an unrecognised prelude; this one uses protocol vocabulary.
+sleep 30 &
+live11=$!
+f="$TMP/case11.pid"
+echo "$live11" > "$f"
+vocab="$TMP/vocab11"; mkdir -p "$vocab"
+cat > "$vocab/python3" << 'SH'
+#!/bin/sh
+printf 'watcher\nnot-watcher\nwhy=python3 observer.py src/watch-tasks-stream.sh /inbox\n'
+SH
+chmod +x "$vocab/python3"
+out="$(PATH="$vocab:$PATH" SUTANDO_PY="$vocab/python3" reap_stale_task_watcher "$f" 2>&1)"
+if [ -f "$f" ] && kill -0 "$live11" 2>/dev/null; then
+  ok "vocabulary prelude: neither killed nor released"
+else
+  bad "vocabulary prelude: neither killed nor released" \
+      "sentinel=$([ -f "$f" ] && echo present || echo gone) alive=$(kill -0 "$live11" 2>/dev/null && echo yes || echo no) ($out)"
+fi
+kill "$live11" 2>/dev/null; wait "$live11" 2>/dev/null
+
+
+# --- case 12: identity is re-proved before KILL, so a reused pid is not killed --
+# The wait is long enough for an exited watcher's pid to be reissued.
+mkdir -p "$TMP/fakebin12"
+cat > "$TMP/fakebin12/watch-tasks-stream.sh" << 'SH'
+#!/bin/bash
+trap '' TERM
+sleep 30
+SH
+chmod +x "$TMP/fakebin12/watch-tasks-stream.sh"
+bash "$TMP/fakebin12/watch-tasks-stream.sh" &
+live12=$!
+f="$TMP/case12.pid"
+echo "$live12" > "$f"
+flip="$TMP/flip12"; mkdir -p "$flip"
+export FLIP_COUNT="$TMP/flip12.count"; : > "$FLIP_COUNT"
+cat > "$flip/python3" << 'SH'
+#!/bin/sh
+n=$(cat "$FLIP_COUNT" 2>/dev/null || echo 0)
+n=$((n + 1)); printf '%s' "$n" > "$FLIP_COUNT"
+if [ "$n" -le 1 ]; then printf 'watcher\nwhy=original\n'; else printf 'not-watcher\nwhy=reissued\n'; fi
+SH
+chmod +x "$flip/python3"
+out="$(PATH="$flip:$PATH" SUTANDO_PY="$flip/python3" reap_stale_task_watcher "$f" 2>&1)"
+if kill -0 "$live12" 2>/dev/null && [ -f "$f" ]; then
+  ok "identity changed before KILL: not escalated, both left alone"
+else
+  bad "identity changed before KILL: not escalated, both left alone" \
+      "alive=$(kill -0 "$live12" 2>/dev/null && echo yes || echo no) sentinel=$([ -f "$f" ] && echo present || echo gone) ($out)"
+fi
+if printf '%s' "$out" | grep -q 'no longer proves to be this sentinel'"'"'s watcher'; then
+  ok "identity changed before KILL: refusal is the reason, not an earlier return"
+else
+  bad "identity changed before KILL: refusal is the reason, not an earlier return" "($out)"
+fi
+unset FLIP_COUNT
+kill -KILL "$live12" 2>/dev/null; wait "$live12" 2>/dev/null
+
 
 if [ "$fails" -eq 0 ]; then
   echo "ALL PASS"

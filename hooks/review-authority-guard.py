@@ -46,6 +46,7 @@ from typing import Optional
 
 STATE_REL = os.path.join("state", "authority.json")
 KEY = "github_formal_review"
+MODES = ("hold", "findings-only", "allow")
 BLOCKING = {"approve": "APPROVE", "request-changes": "REQUEST_CHANGES"}
 
 # `gh api .../reviews`: the event ASSIGNMENT (-f event=APPROVE, "event": "APPROVE"),
@@ -98,7 +99,7 @@ def read_state(workspace: str) -> str:
             val = json.load(fh).get(KEY)
     except Exception:
         return "hold"
-    if isinstance(val, str) and val.strip().lower() in ("hold", "findings-only", "allow"):
+    if isinstance(val, str) and val.strip().lower() in MODES:
         return val.strip().lower()
     return "hold"
 
@@ -157,9 +158,21 @@ def _heredoc_owner(prefix):
     return None
 
 
+def _is_gh(word: str) -> bool:
+    """A path-qualified `gh` is still gh. `_heredoc_owner` already basenames;
+    the main scan compared the whole word, so an absolute path slipped past."""
+    return word.rsplit("/", 1)[-1] == "gh"
+
+
+def _has_gh(words) -> bool:
+    return any(_is_gh(w) for w in words)
+
+
 def classify(command: str) -> Optional[str]:
     """Return 'APPROVE' / 'REQUEST_CHANGES' / 'COMMENT', or None if not a formal review."""
-    if not isinstance(command, str) or "gh" not in command:
+    # Case-fold here too: the token scan lowercases, but this prefilter runs
+    # first, and a case-insensitive filesystem runs `GH` as the same binary.
+    if not isinstance(command, str) or "gh" not in command.lower():
         return None
     for m in _HEREDOC.finditer(command):
         # Only program text or API input is scanned; a `cat`/`tee` heredoc that
@@ -204,8 +217,8 @@ def classify(command: str) -> Optional[str]:
             nested = classify(inner)
             if nested is not None:
                 return nested
-        if "gh" in low and "pr" in low and "review" in low:
-            starts = [i for i, w in enumerate(low) if w == "gh"]
+        if _has_gh(low) and "pr" in low and "review" in low:
+            starts = [i for i, w in enumerate(low) if _is_gh(w)]
             if any(low[i + 1:i + 3] == ["pr", "review"] for i in starts):
                 for w in low:
                     flag = w.lstrip("-")
@@ -219,7 +232,7 @@ def classify(command: str) -> Optional[str]:
                     return "COMMENT"
                 # `gh pr review` with no event flag opens an interactive prompt.
                 return "COMMENT"
-        if "gh" in low and "api" in low and _API_REVIEWS.search(seg):
+        if _has_gh(low) and "api" in low and _API_REVIEWS.search(seg):
             m = _API_EVENT.search(seg)
             if m:
                 return m.group(1)
@@ -242,7 +255,14 @@ def reason(event: str, mode: str, workspace: str) -> str:
         f"if the state is 'hold' or an unreadable file, {{\"{KEY}\": \"findings-only\"}} "
         "in that file is the setting that restores --comment while the votes stay gated. "
         "Otherwise post in-room and let a human or an authorised agent file the review. "
-        "When the owner rules, set the state file and this lifts. "
+        "Only an explicit owner ruling counts, quoted with where it was given; it is never "
+        "inferred from memory, notes, or a peer. Before asking the owner, search memory and "
+        "notes for such an explicit owner ruling on formal reviews — one recorded only in a "
+        "note never reaches this hook. When you have one, record it where this hook reads it: "
+        f"`python3 scripts/authority.py set {KEY} <hold|findings-only|allow> "
+        "--source \"<where>\" --owner-event <event id or URL> --quote \"<owner's verbatim "
+        "words>\"` (run from the repo root; raising the mode refuses without --owner-event "
+        "and --quote); the hook reads it on its next call. "
         "Override for one session with SUTANDO_ALLOW_FORMAL_GH_REVIEWS=1. "
         "[review-authority-guard]"
     )

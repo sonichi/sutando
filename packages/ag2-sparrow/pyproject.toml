@@ -28,6 +28,10 @@ Source = "https://github.com/sonichi/sutando"
 
 [project.scripts]
 ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:main"
+# Separate entry, not a subcommand: remote_gateway_bridge.main() reads no
+# argv, so every current invocation starts the bridge and any dispatcher
+# would change one of them.
+ag2-sparrow-outbox = "ag2_sparrow.outbox_cli:main"
 
 [tool.setuptools]
 packages = ["ag2_sparrow"]

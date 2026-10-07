@@ -565,6 +565,17 @@ _AGENTS = [
     {"id": "@qingyun-air.agent:ag2.space", "label": "core"},
 ]
 
+# One real room's shapes (2026-09-10): a person, their platform agent (the slug keeps
+# the possessive's "s" as a token), a legacy-prefix agent, a short-labelled platform agent.
+_ROSTER = [
+    {"id": "@bassil:ag2.space", "display_name": "Bassil"},
+    {"id": "@bassil-bassil-s-sutando.agent:ag2.space", "display_name": "Bassil's Sutando"},
+    {"id": "@sutando-sonichi:ag2.space", "display_name": "Sonichi's Sutando"},
+    {"id": "@qingyun-air.agent:ag2.space", "display_name": "core"},
+]
+BASSIL_AGENT = "@bassil-bassil-s-sutando.agent:ag2.space"
+SONICHI_AGENT = "@sutando-sonichi:ag2.space"
+
 
 class ResolveTests(unittest.TestCase):
     def test_exact_localpart(self):
@@ -607,8 +618,152 @@ class ResolveTests(unittest.TestCase):
     def test_empty_query(self):
         self.assertFalse(rs.match_agent("", _AGENTS)["ok"])
 
+    # ----- display names, possessives and the platform's slug (2026-09-10) ----- #
+    def test_display_name_resolves_the_agent_in_every_spelling(self):
+        for q in ("Bassil's Sutando", "bassil sutando", "bassil\u2019s sutando",
+                  "@Bassil's Sutando"):
+            r = rs.match_agent(q, _ROSTER)
+            self.assertTrue(r["ok"], (q, r))
+            self.assertEqual(r["mxid"], BASSIL_AGENT, q)
 
-class MentionBodyTests(unittest.TestCase):
+    def test_exact_human_name_beats_agent_preference(self):
+        """The query "Bassil" is the person's exact localpart AND name; the agent only
+        token-prefix-matches. A lower tier never competes, so the preference
+        (which breaks ties INSIDE a tier) has nothing to break."""
+        r = rs.match_member("Bassil", _ROSTER, prefer_agents=True)
+        self.assertEqual(r["mxid"], "@bassil:ag2.space")
+
+    def test_shared_word_across_two_agents_is_ambiguous(self):
+        # Both agents carry "sutando"; the preference cannot pick between two
+        # agents, so this is a refusal with both named.
+        for prefer in (True, False):
+            r = rs.match_member("sutando", _ROSTER, prefer_agents=prefer)
+            self.assertFalse(r["ok"], prefer)
+            self.assertEqual(sorted(r["candidates"]), sorted([BASSIL_AGENT, SONICHI_AGENT]))
+
+    def test_platform_slug_resolves_the_agent(self):
+        self.assertEqual(rs.match_agent("bassil-s-sutando", _ROSTER)["mxid"], BASSIL_AGENT)
+
+    def test_token_prefix_rides_over_the_agent_suffix(self):
+        self.assertEqual(rs.match_agent("qingyun air", _ROSTER)["mxid"],
+                         "@qingyun-air.agent:ag2.space")
+        self.assertEqual(rs.match_agent("core", _ROSTER)["mxid"], "@qingyun-air.agent:ag2.space")
+
+    def test_member_dicts_carry_display_names_bare_ids_do_not(self):
+        """Same roster, two shapes: the {user_id, display_name, kind} dicts
+        `members.room_members` returns, and the bare mxid list older callers
+        pass. The name tier is what the dicts add — the localpart alone
+        cannot answer "Sonichi's Sutando" (its token order differs)."""
+        dicts = [{"user_id": m["id"], "display_name": m["display_name"], "kind": "?"}
+                 for m in _ROSTER]
+        ids = [m["id"] for m in _ROSTER]
+        self.assertEqual(rs.match_member("Sonichi's Sutando", dicts)["mxid"], SONICHI_AGENT)
+        self.assertFalse(rs.match_member("Sonichi's Sutando", ids)["ok"])
+        for q in ("sutando-sonichi", "sonichi"):   # the ids-only callers keep working
+            self.assertEqual(rs.match_member(q, ids)["mxid"], SONICHI_AGENT, q)
+
+    def test_prefer_agents_breaks_a_same_name_tie_only_when_asked(self):
+        pair = [{"id": "@alex:ag2.space", "display_name": "Alex Sutando"},
+                {"id": "@alex-alex-sutando.agent:ag2.space", "display_name": "Alex Sutando"}]
+        self.assertEqual(rs.match_agent("Alex Sutando", pair, prefer_agents=True)["mxid"],
+                         "@alex-alex-sutando.agent:ag2.space")
+        r = rs.match_agent("Alex Sutando", pair, prefer_agents=False)
+        self.assertFalse(r["ok"])
+        self.assertEqual(len(r["candidates"]), 2)
+        # match_member defaults to the preference: a mention is a hand-off, and
+        # the agent is the one that acts on it.
+        self.assertEqual(rs.match_member("Alex Sutando", pair)["mxid"],
+                         "@alex-alex-sutando.agent:ag2.space")
+
+
+# Every apostrophe look-alike `normalize_handle` folds to U+0027. The web client's
+# mention smoke (cinny mentionCandidates) carries the same list — diff the two.
+APOSTROPHE_TWINS = ("\u0027", "\u2019", "\u2018", "\u201b", "\u02bc", "\u2032", "\u0060", "\u00b4")
+
+
+class NormalizeHandleTests(unittest.TestCase):
+    def test_possessive_spacing_case_and_at_collapse(self):
+        for q in ("Bassil's Sutando", "bassil sutando", "bassil\u2019s sutando",
+                  "@Bassil's Sutando", "Bassil_Sutando", "  BASSIL'S  SUTANDO "):
+            self.assertEqual(rs.normalize_handle(q), "bassil-sutando", q)
+
+    def test_every_apostrophe_twin_normalises_to_the_same_handle(self):
+        """One row per code point in APOSTROPHE_TWINS, so a look-alike dropped
+        from either copy of the map shows up as one named failing row."""
+        for apo in APOSTROPHE_TWINS:
+            with self.subTest(code_point=f"U+{ord(apo):04X}"):
+                self.assertEqual(rs.normalize_handle(f"Bassil{apo}s Sutando"), "bassil-sutando")
+                self.assertEqual(rs.normalize_handle(f"Susan{apo}s bot"), "susan-bot")
+
+    def test_a_localpart_is_its_own_normal_form(self):
+        self.assertEqual(rs.normalize_handle("sutando-qingyun-001"), "sutando-qingyun-001")
+        self.assertEqual(rs.normalize_handle("bassil-s-sutando"), "bassil-s-sutando")
+        self.assertEqual(rs.normalize_handle("qingyun-air.agent"), "qingyun-air.agent")
+
+    def test_possessive_only_at_a_token_end(self):
+        # An "s" inside a word is not a possessive; a plural possessive just
+        # loses its apostrophe.
+        self.assertEqual(rs.normalize_handle("o'neil"), "oneil")
+        self.assertEqual(rs.normalize_handle("James' car"), "james-car")
+        self.assertEqual(rs.normalize_handle("Chris's desk"), "chris-desk")
+
+    def test_empty_and_junk(self):
+        for q in ("", None, "@", "'s", "  -  "):
+            self.assertEqual(rs.normalize_handle(q), "", repr(q))
+
+    def test_slug_handle_is_the_platform_spelling(self):
+        self.assertEqual(rs.slug_handle("Susan's bot"), "susan-s-bot")
+        self.assertEqual(rs.slug_handle("Bassil's Sutando"), "bassil-s-sutando")
+        self.assertEqual(rs.slug_handle("@Bassil\u2019s Sutando!"), "bassil-s-sutando")
+        self.assertEqual(rs.slug_handle("qingyun-001"), "qingyun-001")
+        self.assertEqual(rs.slug_handle(""), "")
+
+
+class ResolveUserResponseTests(unittest.TestCase):
+    """`parse_resolve_user_response` reads the broker's three `op: resolve_user`
+    answers (shapes verified against matrix_ingest.py, 2026-09-10) and treats
+    everything else as a miss — never as a hit."""
+
+    def test_hit(self):
+        r = rs.parse_resolve_user_response({"mxid": BASSIL_AGENT, "display_name": "Bassil's Sutando"})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mxid"], BASSIL_AGENT)
+        self.assertEqual(r["display_name"], "Bassil's Sutando")
+        self.assertEqual(r["candidates"], [])
+        self.assertFalse(rs.is_ambiguous(r))
+
+    def test_ambiguous_lists_the_candidates_and_refuses(self):
+        r = rs.parse_resolve_user_response({"error": f"ambiguous: {SONICHI_AGENT}, {BASSIL_AGENT}"})
+        self.assertFalse(r["ok"])
+        self.assertIsNone(r["mxid"])
+        self.assertEqual(r["candidates"], [SONICHI_AGENT, BASSIL_AGENT])
+        self.assertTrue(rs.is_ambiguous(r))
+
+    def test_not_found_is_a_plain_miss(self):
+        r = rs.parse_resolve_user_response({"error": "user 'nobody' not found in room"})
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["candidates"], [])
+        self.assertIn("not found", r["reason"])
+        self.assertFalse(rs.is_ambiguous(r))
+
+    def test_junk_is_a_miss_never_a_hit(self):
+        for junk in ("not a dict", None, {}, [], {"mxid": "nobody"}, {"mxid": 42}, {"ok": True}):
+            r = rs.parse_resolve_user_response(junk)
+            self.assertFalse(r["ok"], junk)
+            self.assertIsNone(r["mxid"], junk)
+            self.assertTrue(r["reason"], junk)
+
+    def test_ambiguous_without_names_still_refuses(self):
+        # Defensive: a broker that says "ambiguous" but lists nobody parseable
+        # must still read as too-many, never as a miss for a later source to widen.
+        r = rs.parse_resolve_user_response({"error": "ambiguous"})
+        self.assertEqual(r["candidates"], [])
+        self.assertTrue(rs.is_ambiguous(r))
+
+
+class MentionBodyTests(EnvCase):
+    # EnvCase: an ambiguous directory answer now reads the roster (a gateway
+    # call), so the env must be cleared and the channel .env shadowed here too.
     def test_leads_with_mxid(self):
         b = mn.build_body("@sutando-qingyun-001:ag2.space", "review #149")
         self.assertTrue(b.startswith("@sutando-qingyun-001:ag2.space"))
@@ -620,14 +775,19 @@ class MentionBodyTests(unittest.TestCase):
     def test_ambiguous_handle_does_not_post(self):
         # mention() must refuse to post on an ambiguous handle (never mention the
         # wrong agent) — returns ok:false + candidates, no network touched.
-        res = mn.mention("sutando-qingyun", "hi", ROOM, HS, gate=None, agents=_AGENTS)
+        with mock.patch.object(_gateway, "http_request",
+                               side_effect=AssertionError("network touched")):
+            res = mn.mention("sutando-qingyun", "hi", ROOM, HS, gate=None, agents=_AGENTS)
         self.assertFalse(res["ok"])
         self.assertEqual(len(res["candidates"]), 2)
+        self.assertEqual(res["resolved_by"], "directory")
 
     def test_post_payload_leads_with_mxid_and_carries_mentions(self):
-        # A resolved mention posts op:message to /v1/room with the mxid LEADING
-        # the body (text trigger) AND a forward-compat `mentions:[mxid]` (activates
-        # structured push once the broker honors it). Both pinned so neither regresses.
+        """A resolved mention posts op:message to /v1/room with the mxid LEADING
+        the body (the routing token the broker matches as a whole token, and
+        the literal it pills for humans) AND `mentions:[mxid]` (stamped into
+        m.mentions). Both pinned so neither regresses; `resolved_by` names the
+        source so a wrong hit is traceable."""
         cap = {}
 
         def _fake_http_json(method, url, headers, payload):
@@ -644,6 +804,7 @@ class MentionBodyTests(unittest.TestCase):
         self.assertEqual(p["op"], "message")
         self.assertEqual(p["mentions"], ["@sutando-qingyun-001:ag2.space"])
         self.assertTrue(p["body"].startswith("@sutando-qingyun-001:ag2.space"))
+        self.assertEqual(res["resolved_by"], "directory")
 
 
 import events as ev  # noqa: E402
@@ -1304,11 +1465,12 @@ class RelationFieldsTests(unittest.TestCase):
     def test_whitespace_is_stripped(self):
         self.assertEqual(rl.relation_fields(reply_to="  $evt1  "), {"reply_to": EV})
 
-    def test_no_thread_surface_is_offered(self):
-        # The gateway cannot honour a thread relation, so asking for one must be
-        # impossible rather than silently downgraded to this citation.
-        with self.assertRaises(TypeError):
-            rl.relation_fields(thread_root=EV)
+    def test_thread_root_becomes_its_own_field_and_is_checked_like_a_citation(self):
+        self.assertEqual(rl.relation_fields(thread_root=EV), {"thread_root": EV})
+        self.assertEqual(rl.relation_fields(reply_to=EV, thread_root="$root"),
+                         {"reply_to": EV, "thread_root": "$root"})
+        with self.assertRaises(rl.RelationError):
+            rl.relation_fields(thread_root="root-without-dollar")
 
 
 class SayCitationTests(EnvCase):
@@ -1333,12 +1495,31 @@ class SayCitationTests(EnvCase):
         self.assertEqual(cap["payload"]["body"], "hi")
         self.assertEqual(cap["payload"]["op"], "message")
 
-    def test_no_thread_relation_is_ever_sent(self):
-        # Pins the review's requirement: nothing on this path may claim thread
-        # membership the gateway cannot deliver.
+    def test_a_citation_alone_never_claims_a_thread(self):
+        # A reply-to is a citation; only an explicit thread_root asks for the thread.
         _res, cap = self._post(reply_to=EV)
         self.assertNotIn("thread_root", cap["payload"])
         self.assertNotIn("m.relates_to", cap["payload"])
+
+    def test_thread_root_rides_the_payload_as_the_gateways_own_field(self):
+        res, cap = self._post(thread_root="$root")
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["thread_root"], "$root")
+        self.assertNotIn("m.relates_to", cap["payload"], "the gateway builds the relation, not this side")
+
+    def test_extra_content_rides_the_payload_beside_the_body(self):
+        anchor = {"space.ag2.collab.doc.comment": {"anchor": {"quote": "x"}, "v": 1}}
+        res, cap = self._post(extra_content=anchor)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.collab.doc.comment"],
+                         anchor["space.ag2.collab.doc.comment"])
+        self.assertEqual(cap["payload"]["body"], "hi")
+
+    def test_extra_content_keeps_the_worker_stamp(self):
+        os.environ["SUTANDO_WORKER_SEAT"] = "7"
+        _res, cap = self._post(extra_content={"space.ag2.x": 1})
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.worker"]["id"], "worker-7")
+        self.assertEqual(cap["payload"]["extra_content"]["space.ag2.x"], 1)
 
     def test_bad_id_refuses_before_the_network(self):
         os.environ["RELAY_URL"] = "https://r"
@@ -1394,6 +1575,22 @@ class CitationCLITests(EnvCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 room_ops._main(["say", ROOM, "hi", "--reply-to", EV])
         self.assertEqual(cap["kw"], {"reply_to": EV})
+
+    def test_say_extra_content_flag_is_parsed_and_reaches_the_function(self):
+        cap = {}
+        with mock.patch.object(room_ops._say, "say",
+                               side_effect=lambda *a, **k: (cap.update(kw=k), {"ok": True})[1]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["say", ROOM, "hi", "--extra-content", '{"space.ag2.k": {"v": 1}}'])
+        self.assertEqual(cap["kw"], {"reply_to": None, "extra_content": {"space.ag2.k": {"v": 1}}})
+
+    def test_say_extra_content_that_is_not_an_object_is_refused_before_the_function(self):
+        out = io.StringIO()
+        with mock.patch.object(room_ops._say, "say", side_effect=AssertionError("called")):
+            with contextlib.redirect_stdout(out):
+                rc = room_ops._main(["say", ROOM, "hi", "--extra-content", '["not", "an", "object"]'])
+        self.assertEqual(rc, 1)
+        self.assertIs(json.loads(out.getvalue())["ok"], False)
 
     def test_mention_flag_reaches_the_function(self):
         cap = {}
@@ -1541,6 +1738,7 @@ class DegradeReasonFromTests(unittest.TestCase):
 
     def test_no_body_falls_back_to_the_status_text(self):
         self.assertEqual(_gateway.degrade_reason_from(self._err(403, "")), _gateway.degrade_reason(403))
+
 
 
 if __name__ == "__main__":

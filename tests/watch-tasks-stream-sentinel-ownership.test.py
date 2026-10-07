@@ -24,12 +24,12 @@ WHY THIS IS A PYTHON TEST DRIVING REAL PROCESSES, and not a shell test or a grep
   * The watcher does not service SIGTERM promptly — it blocks reading from
     fswatch, and bash defers the trap until that read returns. So a test cannot
     drive `cleanup()` with a signal to the watcher. It CAN by killing the
-    watcher's fswatch child: the read hits EOF and the script exits through its
-    EXIT trap, which is the path that runs cleanup.
-  * `cleanup()` ends in `kill 0`, which signals the whole PROCESS GROUP. A
-    harness that starts the watcher in its own group gets killed by the code it
-    is testing (this cost me a shell before `start_new_session=True` went in).
-    Every watcher here is started in its OWN session for that reason.
+    watcher's fswatch child with the relaunch budget at 0: the read hits EOF and
+    the script exits through its EXIT trap, which is the path that runs cleanup.
+  * `cleanup()` signals its whole PROCESS GROUP (`kill 0`) only when the watcher
+    leads that group, as it does under the notifier's setsid. Every watcher here
+    is started in its OWN session, so that production path is the one tested and
+    the signal stays inside the watcher's session, never reaching this harness.
 
 CLEANUP DISCIPLINE: every kill is by a pid this test recorded, via killpg on a
 session this test created. Never `pkill -f watch-tasks-stream` — that pattern
@@ -97,11 +97,15 @@ def resolved_workspace(workspace: Path, env: dict) -> str:
 
 
 class Watcher:
-    """One watcher in its OWN session, so its `kill 0` cannot reach us."""
+    """One watcher leading its OWN session, as under the notifier's setsid: the
+    `kill 0` its cleanup then sends stays inside that session."""
 
-    def __init__(self, workspace: Path, bin_dir: Path):
+    def __init__(self, workspace: Path, bin_dir: Path, args=()):
+        # No fswatch relaunch: this test drives cleanup() through the EOF a
+        # killed fswatch leaves, so the first EOF must end the watcher.
         env = dict(os.environ,
                    SUTANDO_WORKSPACE=str(workspace), SUTANDO_TEST_MODE="1",
+                   SUTANDO_FSWATCH_RESTART_MAX="0",
                    PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH','')}")
         # ASSERT THE RESOLVED PATH BEFORE SPAWNING (@john-the-dev). The script
         # takes STATE_DIR from `sutando-config.sh workspace`, NOT from the
@@ -118,7 +122,7 @@ class Watcher:
                 "  isolation before running this test."
             )
         self.proc = subprocess.Popen(
-            ["bash", "src/watch-tasks-stream.sh"], cwd=str(REPO), env=env,
+            ["bash", "src/watch-tasks-stream.sh", *args], cwd=str(REPO), env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
@@ -175,7 +179,9 @@ def main() -> int:
     make_stub_fswatch(bin_dir)
     a = b = None
     try:
-        a = Watcher(ws, bin_dir)
+        # The production shape: every launcher names the inbox as an operand, and
+        # the startup self-check can only see an inbox that argv names.
+        a = Watcher(ws, bin_dir, args=(str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks")))
         # A watcher that exits on startup makes every assertion below either
         # fail for the wrong reason or pass vacuously, so establish liveness
         # FIRST and bail with a diagnosis rather than a cascade.
@@ -195,25 +201,23 @@ def main() -> int:
               "sentinel never appeared")
         pid_a = sentinel.read_text().strip() if sentinel.exists() else ""
 
-        b = Watcher(ws, bin_dir)
-        check("a SECOND watcher takes ownership of the sentinel",
-              wait_for(lambda: sentinel.exists() and sentinel.read_text().strip() not in ("", pid_a)),
+        # A second watcher on a watched inbox exits at startup; only --force-restart
+        # replaces the holder, and the sentinel must end up naming the replacement.
+        b = Watcher(ws, bin_dir, args=(str(ws / "tasks"), "--role", "standby", "--inbox", str(ws / "tasks"), "--force-restart"))
+        check("a SECOND watcher with --force-restart takes ownership of the sentinel",
+              wait_for(lambda: sentinel.exists() and sentinel.read_text().strip() not in ("", pid_a),
+                       timeout=15),
               f"sentinel still reads {pid_a!r}")
         pid_b = sentinel.read_text().strip() if sentinel.exists() else ""
 
-        # THE REGRESSION: retire the STALE watcher; the live one must keep its file.
-        a.retire_via_eof()
-        exited = wait_for(lambda: not a.alive(), timeout=10)
-        check("the stale watcher exits through its EXIT trap (so cleanup RUNS)",
-              exited,
-              "it never exited — cleanup did not run, so the assertion below "
-              "would pass vacuously")
+        exited = wait_for(lambda: not a.alive(), timeout=15)
+        check("the replaced watcher is gone", exited, "it never exited")
 
         survived = sentinel.exists() and sentinel.read_text().strip() == pid_b
-        check("stopping the STALE watcher leaves the LIVE sentinel intact",
+        check("the sentinel names the replacement once the holder is gone",
               survived,
               f"sentinel={sentinel.read_text().strip() if sentinel.exists() else '<DELETED>'} "
-              f"expected={pid_b} — a dying duplicate erased a live watcher's pid file")
+              f"expected={pid_b}")
         check("  ...and the live watcher really is still running",
               b.alive(),
               "it died too, so the check above proved nothing")

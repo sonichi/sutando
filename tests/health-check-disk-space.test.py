@@ -7,9 +7,11 @@ looked at free space. A health check that stays green through the failure it
 should catch is worse than no check — it actively certifies a broken system.
 """
 import importlib.util
-import os
+import shutil
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -21,25 +23,19 @@ def _load():
     return mod
 
 
-class _FakeStat:
-    """statvfs_result stand-in: free bytes = f_bavail * f_frsize."""
-    def __init__(self, free_gib, fsid=1):
-        self.f_frsize = 4096
-        self.f_bavail = int(free_gib * (1024 ** 3) / 4096)
-        self.f_fsid = fsid
+class _FakeUsage:
+    """disk_usage_result stand-in with the requested free bytes."""
+    def __init__(self, free_gib):
+        self.free = int(free_gib * (1024 ** 3))
 
 
 class TestDiskSpace(unittest.TestCase):
     def setUp(self):
         self.hc = _load()
-        self._real = os.statvfs
-
-    def tearDown(self):
-        os.statvfs = self._real
 
     def _status(self, free_gib):
-        os.statvfs = lambda p: _FakeStat(free_gib)
-        return self.hc.check_disk_space()
+        with patch.object(shutil, "disk_usage", return_value=_FakeUsage(free_gib)):
+            return self.hc.check_disk_space()
 
     def test_a_full_volume_fails(self):
         r = self._status(0.1)
@@ -58,20 +54,22 @@ class TestDiskSpace(unittest.TestCase):
         self.assertEqual(self._status(self.hc.DISK_WARN_GIB + 0.01)["status"], "ok")
 
     def test_e_reports_the_worse_of_two_distinct_volumes(self):
-        """A roomy /tmp must not mask a full workspace."""
+        """A roomy temp volume must not mask a full workspace."""
         seen = {"n": 0}
-        def fake(_p):
+
+        def fake_usage(_p):
             seen["n"] += 1
-            return _FakeStat(500.0, fsid=1) if seen["n"] == 1 else _FakeStat(0.2, fsid=2)
-        os.statvfs = fake
-        r = self.hc.check_disk_space()
+            return _FakeUsage(0.2) if seen["n"] == 1 else _FakeUsage(500.0)
+
+        with patch.object(Path, "stat", side_effect=[SimpleNamespace(st_dev=1), SimpleNamespace(st_dev=2)]), \
+                patch.object(shutil, "disk_usage", side_effect=fake_usage):
+            r = self.hc.check_disk_space()
         self.assertEqual(r["status"], "fail", r)
+        self.assertIn("workspace", r["detail"], r)
 
     def test_f_stat_failure_is_reported_not_swallowed(self):
-        def boom(_p):
-            raise OSError("nope")
-        os.statvfs = boom
-        self.assertEqual(self.hc.check_disk_space()["status"], "error")
+        with patch.object(shutil, "disk_usage", side_effect=OSError("nope")):
+            self.assertEqual(self.hc.check_disk_space()["status"], "error")
 
     def test_g_check_is_actually_registered(self):
         src = (REPO / "src" / "health-check.py").read_text()

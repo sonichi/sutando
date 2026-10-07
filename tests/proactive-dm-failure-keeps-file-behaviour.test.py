@@ -39,6 +39,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 # Imported before the stub replaces sys.modules: it hands back the real gate.
 from proactive_routing import redirect_target_is_foreign as _real_redirect_target_is_foreign  # noqa: E402
+from proactive_routing import body_target_channel as _real_body_target_channel  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -94,17 +95,18 @@ class _Boom(Exception):
     """The error Discord actually returned: 413 Payload Too Large (40005)."""
 
 
-def _run_one_pass(results: Path, send):
+def _run_one_pass(results: Path, send, claims_by_routing: bool = True):
     db.RESULTS_DIR = results
     db.ACCESS_FILE = Path(_CFG) / "channels" / "discord" / "access.json"
     db.presenter_mode_active = lambda *_a, **_k: False
 
     routing = types.ModuleType("proactive_routing")
-    routing.should_claim_proactive = lambda *_a, **_k: True
-    routing.should_claim_proactive_file = lambda *_a, **_k: True
+    routing.should_claim_proactive = lambda *_a, **_k: claims_by_routing
+    routing.should_claim_proactive_file = lambda *_a, **_k: claims_by_routing
     routing.proactive_destination = lambda *_a, **_k: None
     # Stubbed routing claims every file; redirect_target_is_foreign stays REAL.
     routing.redirect_target_is_foreign = _real_redirect_target_is_foreign
+    routing.body_target_channel = _real_body_target_channel
     sys.modules["proactive_routing"] = routing
 
     class _DM:
@@ -223,6 +225,30 @@ def main() -> int:
     if survivors:
         check("  ...body intact even on the last-resort path",
               survivors[0].read_text() == "must not vanish", "content lost")
+
+    # An explicit body [channel:] target outranks routing alone -- the
+    # defect-detecting coverage for this fix (see #4593's review history).
+    box4 = Path(tempfile.mkdtemp(prefix="proactive-bodymarker-"))
+    (box4 / "proactive-bodymarker.txt").write_text(
+        "[channel: 1530802402603700415]\nbriefing text")
+    sent4: list = []
+    _run_one_pass(box4, lambda *a, **_k: sent4.append(a), claims_by_routing=False)
+    check("a body [channel:] Discord target is claimed even when routing alone says no",
+          bool(sent4), "routing-false + body marker still did not deliver")
+
+    # --- the peek itself can fail: routing False + an unreadable file ------
+    # Same branch, the OTHER outcome: read_text() raises, must not crash or claim.
+    box5 = Path(tempfile.mkdtemp(prefix="proactive-unreadable-"))
+    unreadable = box5 / "proactive-unreadable.txt"
+    unreadable.write_text("[channel: 1530802402603700415]\nbriefing text")
+    os.chmod(unreadable, 0)
+    sent5: list = []
+    try:
+        _run_one_pass(box5, lambda *a, **_k: sent5.append(a), claims_by_routing=False)
+        check("an unreadable file with routing=False is left unclaimed, no crash",
+              not sent5 and unreadable.exists(), f"sent={sent5!r}")
+    finally:
+        os.chmod(unreadable, 0o644)
 
     # --- hermeticity, asserted rather than assumed -------------------------
     live_after = sorted(p.name for p in _LIVE_RESULTS.iterdir()) if _LIVE_RESULTS.exists() else None

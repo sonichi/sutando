@@ -35,14 +35,12 @@ _SOURCE = {
     "whatsapp": "whatsapp-bridge",
 }
 
-# The bridges' access-control vocabulary (owner/team/other) onto the obs schema's
-# AccessTier (events.ts: owner/team/public/unknown). "other" is the bridges' name
-# for the schema's "public" (non-owner external); anything unrecognized — incl.
-# the fail-safe sentinel — is "unknown", never "owner". Keeps every emitted
-# channel event in-schema for downstream TS consumers.
+# Bridge tiers (owner/team/guest, legacy "other") onto the obs schema's AccessTier
+# (events.ts); "guest" is the schema's "public", unrecognized is "unknown", never owner.
 _TIER_TO_SCHEMA = {
     "owner": "owner",
     "team": "team",
+    "guest": "public",
     "other": "public",
     "public": "public",
     "unknown": "unknown",

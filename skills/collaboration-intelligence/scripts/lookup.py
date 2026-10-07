@@ -27,9 +27,15 @@ def load(d):
     # Each store loads on its OWN existence check — either may exist alone.
     yp = d / "quick-lookup.yaml"
     if yp.exists():
-        import yaml
+        # The import belongs INSIDE the try: an interpreter without PyYAML is the same
+        # degradation as an unparseable file, and outside it the ImportError crashes.
         try:
+            import yaml
             raw = yaml.safe_load(yp.read_text()) or {}
+        except ImportError:
+            print(f"warning: PyYAML missing under {sys.executable} — using roster only",
+                  file=sys.stderr)
+            raw = {}
         except Exception as e:
             print(f"warning: {yp} unparseable ({type(e).__name__}) — using roster only",
                   file=sys.stderr)
@@ -37,9 +43,15 @@ def load(d):
         q = raw.get("quick_lookup") or raw if isinstance(raw, dict) else {}
     ep = d / "entities.yaml"
     if ep.exists():
-        import yaml
         try:
+            import yaml
             ents = yaml.safe_load(ep.read_text()).get("entities") or []
+        except ImportError:
+            # Silently empty entities reads as "no entities", which is a different
+            # fact from "this interpreter cannot parse them".
+            print(f"warning: PyYAML missing under {sys.executable} — {ep.name} not read",
+                  file=sys.stderr)
+            ents = []
         except Exception:
             ents = []
     return q, ents
@@ -48,15 +60,16 @@ def load(d):
 def load_roster(d):
     """reviewer-stands.json rows, normalised to the quick-lookup row shape.
 
-    The roster is keyed by short name with the GitHub login in the `github`
-    FIELD; a key-equality lookup queries the wrong axis and reads a mapped
-    reviewer as absent (measured twice: 2026-08-27, 2026-08-28 — both times
-    `get("john-the-dev")` missed the entry keyed `rui`).
+    The roster is keyed by short name with the GitHub login in a FIELD; a
+    key-equality lookup queries the wrong axis and reads a mapped reviewer as
+    absent (measured twice: 2026-08-27, 2026-08-28 — both times
+    `get("john-the-dev")` missed the entry keyed `rui`). Which field spells that
+    login is roster_union.roster_login's call, shared with the other reader.
     """
     # Same union, same collision semantics as notify_reviewers: both readers of
     # this store delegate to roster_union so they cannot drift apart.
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from roster_union import host_rosters, roster_union
+    from roster_union import host_rosters, roster_login, roster_union
     # The file this reader was pointed at is its LOCAL and goes first: on a
     # legacy host it is the shared file, which host_rosters lists LAST.
     local = d / "reviewer-stands.json"
@@ -69,13 +82,14 @@ def load_roster(d):
     for key, r in merged.items():
         if not isinstance(r, dict):
             continue
+        gh = roster_login(r)[0]
         rows.append({
             "entity_id": key,
             "agent_mxid": r.get("stand") or "",
-            "github": r.get("github") or "",
+            "github": gh,
             "human": r.get("human") or "",
             "allowlisted": r.get("allowlisted"),
-            "one_line": f"github={r.get('github','')} human={r.get('human','')} stand={r.get('stand','')}",
+            "one_line": f"github={gh} human={r.get('human','')} stand={r.get('stand','')}",
         })
     return rows
 

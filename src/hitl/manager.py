@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import logging
-import fcntl
 import os
 import re
 import tempfile
@@ -22,6 +21,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from file_lock import lock_fd, unlock_fd
 from workspace_default import resolve_workspace
 
 from .schema import (
@@ -42,6 +42,19 @@ AUTH_KIND = "auth"
 # The requirement id contract, in one place: `save()` refuses anything else and
 # `all()` enumerates exactly this shape, so a saved record is never invisible.
 ID_RE = re.compile(r"^hitl_[A-Za-z0-9_-]+$")
+
+
+def _activity(task_ids, to_phase: str, reason: str) -> None:
+    """A requirement is the scheduler's WAITING; its end is RUNNING again. Never breaks HITL."""
+    if not task_ids:
+        return
+    try:
+        import activity_bus as _bus
+        store = _bus.ActivityStore()
+        for tid in task_ids:
+            store.apply(_bus.LifecycleTransition(tid, to_phase, reason=reason))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def default_store(workspace: Optional[Path] = None) -> Path:
@@ -75,14 +88,14 @@ class HitlStore:
         (a blocking hook and the bridge do). Re-entrant within one thread."""
         if self._lock_depth == 0:
             self._lock_fd = os.open(str(self.root / ".lock"), os.O_RDWR | os.O_CREAT, 0o644)
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+            lock_fd(self._lock_fd)
         self._lock_depth += 1
         try:
             yield
         finally:
             self._lock_depth -= 1
             if self._lock_depth == 0 and self._lock_fd is not None:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                unlock_fd(self._lock_fd)
                 os.close(self._lock_fd)
                 self._lock_fd = None
 
@@ -126,7 +139,7 @@ class HitlStore:
         for p in sorted(self.root.glob("hitl_*.json")):
             try:
                 out.append(_req_from_dict(json.loads(p.read_text())["requirement"]))
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
                 skipped.append(p.name)
         # An empty store reads as "nothing needs the human", so a dropped
         # record must leave a trace that a quiet day would not.
@@ -171,7 +184,9 @@ class HitlManager:
                 req.decided_by = POLICY_DECIDER
                 req.transition(STATUS_IN_PROGRESS)
             self.store.save(req)
-            return req
+        if req.decided_by != POLICY_DECIDER and req.status not in TERMINAL_STATUSES:
+            _activity(req.blocked_task_ids, "WAITING", req.kind)  # policy-answered: nobody is waiting
+        return req
 
     def active(self) -> List[HumanRequirement]:
         return [r for r in self.store.all() if r.status not in TERMINAL_STATUSES]
@@ -219,7 +234,8 @@ class HitlManager:
                 return []
             req.transition(status)
             self.store.save(req)
-            return list(req.blocked_task_ids)
+        _activity(req.blocked_task_ids, "RUNNING", status)
+        return list(req.blocked_task_ids)
 
     def link_blocked_task(self, req_id: str, task_id: str) -> None:
         with self.store.locked():

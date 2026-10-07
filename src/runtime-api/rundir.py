@@ -42,6 +42,10 @@ from instance_key import (DEFAULT_INSTANCE, TRUNC, bound,  # noqa: E402
                           instance_key)
 
 DEFAULT_ACTOR = "local-agent"
+
+# The actor half's env precedence, in order, first NON-EMPTY wins. Exported
+# because a consumer reading another process's identity needs the same list.
+ACTOR_ENV_NAMES = ("SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID")
 SOCK_NAME = "runtime.sock"
 # AF_UNIX sun_path is 104 bytes on darwin/BSD and 108 on Linux, NUL included.
 SUN_PATH_MAX = 103 if sys.platform == "darwin" else 107
@@ -94,9 +98,7 @@ def agent_id(state_dir=None) -> str:
     """The actor half of the runtime identity: env → enrolled record →
     DEFAULT_ACTOR. Every consumer MUST come through here — a consumer that
     stops one link short of another resolves a different socket."""
-    env = (os.environ.get("SUTANDO_AGENT_ID")
-           or os.environ.get("AGENT_MXID")
-           or os.environ.get("AGENT_ID"))
+    env = next((v for v in (os.environ.get(n) for n in ACTOR_ENV_NAMES) if v), None)
     if env:
         return env
     if state_dir is None:

@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("ci_triage", REPO / "scripts" / "ci-triage.py")
+spec = importlib.util.spec_from_file_location("ci_triage", REPO / "skills" / "review-preflight" / "scripts" / "ci-triage.py")
 ct = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ct)
 

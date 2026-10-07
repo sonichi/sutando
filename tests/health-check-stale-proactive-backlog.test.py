@@ -155,7 +155,10 @@ class StaleProactiveBacklogTest(unittest.TestCase):
         self.assertEqual(verdict["status"], "warn")
         self.assertIn("unreadable", verdict["detail"])
 
-    @unittest.skipIf(os.geteuid() == 0, "root bypasses directory permissions")
+    @unittest.skipIf(
+        os.name == "nt" or getattr(os, "geteuid", lambda: 1)() == 0,
+        "POSIX directory permission semantics required",
+    )
     def test_an_unscannable_results_dir_is_not_read_as_clean(self) -> None:
         # The per-file guard cannot cover this: the failure is on the directory
         # itself, and glob() answers [] there — the same answer as "no backlog".
@@ -178,6 +181,23 @@ class StaleProactiveBacklogTest(unittest.TestCase):
             "check_stale_proactive_backlog() is never appended to `checks`, so "
             "it cannot report on a real run",
         )
+
+    def test_the_ok_detail_names_its_window_not_an_absolute_absence(self) -> None:
+        # A body younger than the threshold is skipped by the age filter and is
+        # still undelivered, so "none undelivered" would be a wrong denominator.
+        self._write("results/proactive-1786480017.txt")
+        verdict = hc.check_stale_proactive_backlog()
+        self.assertEqual(verdict["status"], "ok")
+        self.assertNotIn("no undelivered proactive bodies", verdict["detail"])
+        self.assertIn("older than 60m", verdict["detail"])
+        self.assertIn("no claim older than 120m", verdict["detail"])
+
+    def test_the_ok_detail_tracks_the_thresholds_it_was_given(self) -> None:
+        verdict = hc.check_stale_proactive_backlog(threshold_age_sec=1800,
+                                                   claim_threshold_age_sec=5400)
+        self.assertEqual(verdict["status"], "ok")
+        self.assertIn("older than 30m", verdict["detail"])
+        self.assertIn("no claim older than 90m", verdict["detail"])
 
 
 if __name__ == "__main__":

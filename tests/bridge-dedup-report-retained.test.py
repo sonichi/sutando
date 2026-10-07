@@ -104,11 +104,16 @@ class DiscordRealLoop(unittest.TestCase):
         except (Exception, SystemExit) as e:  # noqa: BLE001
             self.skipTest(f"discord-bridge not importable: {str(e)[:60]}")
 
-    def _one_pass(self, td, marker, *, send_raises, orig=None):
+    def _one_pass(self, td, marker, *, send_raises, orig=None, holder_channel=None):
         db = self.db
         orig = orig if orig is not None else H.ORIG + "dedup_requeue_count: 1\n"
         results, tasks = H._seed(db, td, "", orig)
         (results / f"{H.TID}.txt").write_text(marker)
+        if holder_channel is not None:
+            (tasks / "archive").mkdir()
+            (tasks / "archive" / f"{H.HOLDER}.txt").write_text(
+                f"channel_id: {holder_channel}\n")
+            (results / "archive" / f"{H.HOLDER}-1785976425.txt").write_text("[REPLIED]")
         sent = []
 
         class _Chan:
@@ -203,13 +208,8 @@ class DiscordRealLoop(unittest.TestCase):
         """The sibling shape: _target prelabelled the action terminal, so an
         exception from the second-pass notify still archived the question."""
         with tempfile.TemporaryDirectory() as td:
-            db = self.db
-            _orig_t = db.dedup_cross_channel_target
-            db.dedup_cross_channel_target = lambda *a, **k: 9999
-            try:
-                r = self._one_pass(td, f"[deduped: {H.HOLDER}]", send_raises=True)
-            finally:
-                db.dedup_cross_channel_target = _orig_t
+            r = self._one_pass(td, f"[deduped: {H.HOLDER}]",
+                               send_raises=True, holder_channel=9999)
             self.assertEqual(r["sent"], [], "control broken: the notify did not fail")
             self.assertTrue(r["result_remaining"],
                             f"result archived after a failed cross-channel notice; "
@@ -220,15 +220,11 @@ class DiscordRealLoop(unittest.TestCase):
     def test_a_delivered_cross_channel_notice_still_retires(self):
         """Positive control: without it the two tests above pass by construction."""
         with tempfile.TemporaryDirectory() as td:
-            db = self.db
-            _orig_t = db.dedup_cross_channel_target
-            db.dedup_cross_channel_target = lambda *a, **k: 9999
-            try:
-                r = self._one_pass(td, f"[deduped: {H.HOLDER}]", send_raises=False)
-            finally:
-                db.dedup_cross_channel_target = _orig_t
+            r = self._one_pass(td, f"[deduped: {H.HOLDER}]",
+                               send_raises=False, holder_channel=9999)
             self.assertTrue(r["sent"] and all(r["sent"]),
                             f"control broken: the notify never sent a real body ({r['sent']!r})")
+            self.assertIn("different room", r["sent"][0])
             self.assertFalse(r["result_remaining"],
                              "retained a cross-channel notice that WAS delivered")
 

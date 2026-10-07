@@ -66,7 +66,10 @@ else
   bad "start_gateway_lanes is defined in src/startup-runtime.sh" "not found"
 fi
 
-reap_line="$(grep -n 'reap_stale_task_watcher "\$WORKSPACE' "$REPO/src/startup.sh" | head -1 | cut -d: -f1)"
+# Locate the reap CALL, not one particular argument spelling: the reaper now
+# enumerates every per-instance sentinel, so the argument is a loop variable.
+# Comment lines are skipped (startup.sh mentions the function in prose below).
+reap_line="$(awk '/reap_stale_task_watcher/ { l=$0; sub(/^[[:space:]]+/, "", l); if (l !~ /^#/) { print NR; exit } }' "$REPO/src/startup.sh")"
 gw_line="$(grep -n '^start_gateway_lanes$' "$REPO/src/startup.sh" | head -1 | cut -d: -f1)"
 if [ -n "$reap_line" ] && [ -n "$gw_line" ] && [ "$reap_line" -lt "$gw_line" ]; then
   ok "startup.sh still reaps before (re)starting gateway lanes on a real boot"

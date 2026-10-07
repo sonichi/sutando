@@ -21,10 +21,14 @@ Machine-readable ownership and lifecycle metadata lives in
 
 - [Channel access control](access-control.md) — per-channel tier rules and gates.
 - [Core pool + standing sessions](core-pool-standing-sessions.md) — how the lead-follower pool composes with standing sessions; design record, not yet implemented.
+- [Worker pool design (v1)](worker-pool-design.md) — the normative v1 worker-pool design: durable worker identities, one delivery sentinel per recipient, and a router that runs as the core watcher's handler over an owner-declared roster.
+- [Worker pool design notes](worker-pool-design-notes.md) — the record behind the v1 design: rejected alternatives, the failure model taken from the #3860 draft, and the owner decisions it encodes.
 - [Migration transition window](migration-transition-window.md) — 30-day reader fallback.
 - [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
 - [Tutorial delivery](tutorial-delivery.md) — walkthrough procedure.
 - [Graceful shutdown](graceful-shutdown.md) — which restart path signals the core to exit cleanly.
+- [Proactive loop rationale](proactive-loop-rationale.md) — the measurements and incidents behind each step of `skills/proactive-loop/SKILL.md`, which itself carries only the commands.
+- [Task watcher hosting modes](task-watcher-hosting-modes.md) — session watcher vs the supervisor's standby: the tag, the two per-inbox verdicts, the readiness proof, the handoff contract and its timings, the known gaps.
 - [CLAUDE.md moved detail](claude-md-moved-detail.md) — verbatim parking for relocated snippets.
 - [Subagent delegation](subagent-delegation.md) — when to spawn a subagent and how to pick its model.
 
@@ -36,6 +40,8 @@ Machine-readable ownership and lifecycle metadata lives in
 - [GAIA-100 benchmark run (2026-08-26)](benchmarks/gaia-100-2026-08-26.md) — 76/100 blind-scored, and how to rebuild the suite.
 
 ## Operations
+
+- [Recovery issue metrics](recovery-issue-metrics.md) — persistent issue IDs and recovery-rate definitions.
 
 - [Release process and migrations](release-process.md)
 - [Workspace sync across machines](workspace-sync.md)
@@ -66,6 +72,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)
 - [Core health verdict + severity gate](design-core-health-verdict.md)
+- [Health snapshot: `GET /health`](health-snapshot.md)
 - [Pointer Teacher design](pointer-teacher-design.md)
 - [Credential resolution by capability (G8)](design-credential-capability-resolver.md)
 - [ADR 0001: Pointer Teacher brain](adr/0001-pointer-teacher-brain.md)

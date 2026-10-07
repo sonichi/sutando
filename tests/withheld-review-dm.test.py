@@ -263,6 +263,47 @@ with tempfile.TemporaryDirectory() as td:
           and (retry_path.parent / "archive" / retry_path.name).is_file(),
           "the retry loop must resolve and archive the kept-private review")
 
+    local_path = "/Users/owner/Library/Application Support/app/workspace/data/images/pic.png"
+    marked_body = (
+        "[channel: !elsewhere:ag2.space]\n"
+        "Here is the picture.\n\n"
+        f"[file: {local_path}]\n\n"
+        "A marker shown in code stays: `[file: /tmp/example.png]`")
+    guard.materialize_withheld_verdict(
+        leak, marked_body, bridge._STATE, "task-markers", context,
+        "@agent:ag2.space", now=1003)
+    marked_path = guard.withheld_review_path(bridge._STATE, "task-markers")
+    bridge._route_withheld_review(marked_path)
+    marked_record = json.loads(marked_path.read_text())
+    marked_dm = [p for _m, u, p in calls
+                 if u == "/v1/room" and p.get("room_id") == "!owner-dm:ag2.space"
+                 and marked_record["review_id"] in (p.get("body") or "")]
+    check(any(local_path in p["body"] for p in marked_dm),
+          "the owner's private review still shows the raw candidate, path included")
+    calls_before = len(calls)
+    check(bridge._handle_review_decision({
+        **no_task, "id": "decision-markers", "task": f"No {marked_record['review_id']}"}),
+        "an owner No on a marker-bearing result must be consumed")
+    marked_archive = marked_path.parent / "archive" / marked_path.name
+    check(json.loads(marked_archive.read_text())["status"] == "published",
+          "a marker-bearing result still publishes")
+    new_calls = calls[calls_before:]
+    shared_posts = [p for _m, u, p in new_calls
+                    if u == "/v1/room" and p.get("op") == "message"
+                    and p.get("room_id") == "!shared:ag2.space"]
+    check(len(shared_posts) == 1, "exactly one post to the original room")
+    released = shared_posts[0]["body"]
+    check(local_path not in released and "[file:" not in released.split("`")[0]
+          and "[channel:" not in released,
+          "released text carries no local path and no unparsed control marker")
+    check(released.startswith("Here is the picture.")
+          and "`[file: /tmp/example.png]`" in released
+          and "(1 attachment not published)" in released,
+          "prose and shown-in-code markers survive; the dropped file is noted without its path")
+    check(not any(p and p.get("room_id") == "!elsewhere:ag2.space" for _m, _u, p in new_calls)
+          and not any("/media" in u for _m, u, _p in new_calls),
+          "a release never executes a redirect or uploads a file")
+
     bridge._tier_for = lambda *_args: "team"
     check(not bridge._handle_review_decision({**yes_task, "id": "team-forgery"}),
           "a collaborator cannot release a pending review")

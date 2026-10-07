@@ -45,6 +45,7 @@ class TestEnumAndDefaults(unittest.TestCase):
     def test_discord_owner_tier_normal_other_tier_low(self):
         self.assertEqual(default_priority_for_source("discord", "owner"), "normal")
         self.assertEqual(default_priority_for_source("discord", "team"), "low")
+        self.assertEqual(default_priority_for_source("discord", "guest"), "low")
         self.assertEqual(default_priority_for_source("discord", "other"), "low")
         # Missing access_tier defaults to owner per the helper.
         self.assertEqual(default_priority_for_source("discord", None), "normal")
@@ -87,6 +88,25 @@ class TestParsing(unittest.TestCase):
             "source: voice\n"
             "priority: urgent\n"
             "task: do something\n"
+        )
+        self.assertEqual(parse_priority_from_text(body), "urgent")
+
+    def test_parse_priority_room_bound_voice_still_urgent(self):
+        # Room-bound voice: channel_id carries the room and two room keys sit
+        # above priority:; none of that may push priority: out of the header block.
+        body = (
+            "id: task-1\n"
+            "timestamp: 2026-09-18T00:00:00Z\n"
+            "source: voice\n"
+            "interaction_type: realtime_audio\n"
+            "media_form: live_stream\n"
+            "channel_id: !abc123:ag2.space\n"
+            "channel_kind: room\n"
+            "source_room_id: !abc123:ag2.space\n"
+            "user_id: voice-local\n"
+            "access_tier: owner\n"
+            "priority: urgent\n"
+            "task: find apartments\n"
         )
         self.assertEqual(parse_priority_from_text(body), "urgent")
 

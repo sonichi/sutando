@@ -13,7 +13,6 @@ skill-callable CLI — can just ``import`` it.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import uuid
@@ -25,6 +24,7 @@ _SRC = Path(__file__).resolve().parent
 if str(_SRC) not in _sys.path:
     _sys.path.insert(0, str(_SRC))
 
+from file_lock import lock_fd, unlock_fd  # noqa: E402
 from util_paths import claude_home_path, channel_access_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
@@ -46,10 +46,9 @@ def resolve_discord_access_file() -> Path:
     so any writer (the bridge, or a skill-callable CLI in a separate process)
     resolves the identical file rather than duplicating the migration logic.
 
-    Before the first durable backup exists, preserve the transition-window
-    behavior: a missing canonical file may read/write the populated legacy
-    ``~/.claude`` file. Once the durable backup exists, a missing canonical
-    file is a wipe to restore — not a reason to resurrect legacy state.
+    A missing canonical file is a wipe to restore (durable backup) or a
+    migration to run — never a reason to reach the pre-migration home-directory file;
+    that fallback retired with its ~30-day window (shipped 2026-06-21).
     """
     if discord_access_backup_file().exists():
         return claude_home_path("channels", "discord", "access.json")
@@ -80,20 +79,18 @@ def read_access_for_transaction(path: Path):
 def _locked(path: Path):
     """OS-level mutual exclusion across processes via a sidecar lock file.
 
-    fcntl.flock only excludes other flock'ers of the SAME inode, so every
-    caller — in-process and cross-process (a future `/discord:access` skill
-    invocation included) — must go through this same lock file. Held for the
-    read+mutate+write only; never across an await/network call by any caller.
+    Every caller — in-process and cross-process — must use this same lock file.
+    Held for read+mutate+write only; never across await or network I/O.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(path.suffix + ".lock")
     fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        lock_fd(fd)
         try:
             yield
         finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            unlock_fd(fd)
     finally:
         os.close(fd)
 

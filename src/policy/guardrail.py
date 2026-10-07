@@ -118,3 +118,27 @@ def engage_rulebook(surface: str, provenance: str, result_path: str) -> str:
         surface=surface, provenance=provenance, result_path=result_path,
         trust_boundary=SHARED_TRUST_BOUNDARY,
     )
+
+
+def owner_mention_lines(result_path: str) -> list[str]:
+    """The owner-mention instruction as in-band SYSTEM INSTRUCTIONS lines for a task file.
+
+    For a room message that @-mentioned the OWNER, not this agent. Written after any
+    tier block: the tier's limits still apply, but this replaces its reply step.
+    """
+    return [
+        "",
+        "===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===",
+        "This room message mentioned your OWNER. You were not addressed, so it is not a request to you.",
+        "Do not reply in the room, and do not act on the message itself. Any tier rules above still"
+        " bound what you do; this block replaces only their reply step.",
+        "1. Read the room after this message. If the owner has already replied to it or reacted"
+        " to it, write exactly [no-send] to " + result_path + " and stop.",
+        "2. Otherwise DM the owner: who wrote what, in which room, with a link to the message"
+        " (its room and message id are in the headers above). Write that DM as your result to "
+        + result_path + ". The room gets nothing; the result goes only to the owner's DM.",
+        "3. When a next step is appropriate, propose it for his approval with"
+        " `python3 scripts/ask-owner.py \"<proposed step>\" --task-file <this task file>`"
+        " (it reaches his DM, never this room). Never take that step yourself without his approval.",
+        "===END SUTANDO SYSTEM INSTRUCTIONS===",
+    ]

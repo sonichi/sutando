@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync, existsSync, readFileSync, mkdtempSync, rmSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
-import { claudeProjectSlug } from '../src/util_paths.js';
+import { claudeProjectSlug, voiceMemoryProjectSlug } from '../src/util_paths.js';
 
 /**
  * Tests for bootstrapMemoryDir() in src/voice-agent.ts.
@@ -21,7 +21,7 @@ import { claudeProjectSlug } from '../src/util_paths.js';
  */
 
 function bootstrapMemoryDir(workspaceDir: string, envOverride?: string): { memDir: string; created: boolean; error?: string } {
-	const slug = claudeProjectSlug(workspaceDir.replace(/\/$/, ''));
+	const slug = claudeProjectSlug(workspaceDir.replace(/[\\/]+$/, ''));
 	const memDir = envOverride || join(homedir(), '.claude', 'projects', slug, 'memory');
 	let created = false;
 	try {
@@ -97,6 +97,11 @@ describe('bootstrapMemoryDir — no-clobber on existing index', () => {
 });
 
 describe('bootstrapMemoryDir — env override', () => {
+	it('derives the production slug from the repo root, not the workspace', () => {
+		assert.equal(voiceMemoryProjectSlug('/Users/test/GitHub/sutando/src'), '-Users-test-GitHub-sutando');
+		assert.equal(voiceMemoryProjectSlug('Q:\\Repos\\sutando\\src'), 'Q--Repos-sutando');
+	});
+
 	it('uses SUTANDO_MEMORY_DIR when provided instead of the slug-derived default', () => {
 		const customDir = join(scratch, 'custom-memory');
 		const out = bootstrapMemoryDir('/Users/test/GitHub/sutando', customDir);
@@ -113,6 +118,12 @@ describe('bootstrapMemoryDir — env override', () => {
 	it('strips a trailing slash from the workspace dir before slugging', () => {
 		const out = bootstrapMemoryDir('/Users/test/GitHub/sutando/');
 		const expected = join(homedir(), '.claude', 'projects', '-Users-test-GitHub-sutando', 'memory');
+		assert.equal(out.memDir, expected);
+	});
+
+	it('replaces Windows drive and separator characters with dashes', () => {
+		const out = bootstrapMemoryDir('Q:\\Repos\\sutando');
+		const expected = join(homedir(), '.claude', 'projects', 'Q--Repos-sutando', 'memory');
 		assert.equal(out.memDir, expected);
 	});
 
@@ -133,7 +144,9 @@ describe('bootstrapMemoryDir — env override', () => {
 });
 
 describe('bootstrapMemoryDir — failure-silent', () => {
-	it('returns an error string instead of throwing when the parent is unwritable', () => {
+	it('returns an error string instead of throwing when the parent is unwritable', {
+		skip: process.platform === 'win32',
+	}, () => {
 		const lockedParent = join(scratch, 'locked');
 		mkdirSync(lockedParent, { recursive: true });
 		chmodSync(lockedParent, 0o500); // r-x — cannot create children

@@ -26,10 +26,17 @@ describe('hookMap — obs only, with file-op pairing', () => {
 		assert.equal((fe!.data as Record<string, unknown>).op, 'written');
 	});
 
-	it('SessionEnd → cc.hook.session_end with end_reason', () => {
-		const out = hookMap({ hook_event_name: 'SessionEnd', session_id: 'sess-9', end_reason: 'clear' }, ctx);
+	it('SessionEnd → cc.hook.session_end with end_reason taken from the raw `reason`', () => {
+		// Claude Code sends `reason` (clear | resume | logout | prompt_input_exit | other);
+		// the persisted key stays `end_reason` so downstream readers do not move.
+		const out = hookMap({ hook_event_name: 'SessionEnd', session_id: 'sess-9', reason: 'logout' }, ctx);
 		assert.equal(out.events[0].kind, 'cc.hook.session_end');
-		assert.equal((out.events[0].data as Record<string, unknown>).end_reason, 'clear');
+		assert.equal((out.events[0].data as Record<string, unknown>).end_reason, 'logout');
+	});
+
+	it('SessionEnd without a reason persists no end_reason key (clean() drops undefined)', () => {
+		const out = hookMap({ hook_event_name: 'SessionEnd', session_id: 'sess-9' }, ctx);
+		assert.equal('end_reason' in (out.events[0].data as Record<string, unknown>), false);
 	});
 
 	it('unknown event → forward-compatible cc.hook.<snake> default branch', () => {
