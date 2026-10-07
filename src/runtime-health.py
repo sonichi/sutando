@@ -11,7 +11,9 @@ made concrete when a core sat unresponsive at claude's `/login` (locked keychain
     python3 src/runtime-health.py           # prints JSON; also writes state/runtime-health.json
 
 Output (single JSON object on stdout):
-    health           working | idle | needs_login | offline | unknown
+    health           working | idle | blocked | needs_login | offline | unknown
+                     (blocked: tasks are queued but the pane holds them — a draft the
+                     dispatcher will not type over, or an abnormal frame)
     authenticated    bool | null  (false when the core is sitting at claude's login prompt;
                      null when we can't tell, e.g. the core is offline)
     core_running     bool   (a `sutando-core` tmux session exists on the socket)
@@ -36,6 +38,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tmux_probe import has_session as _tmux_has_session  # noqa: E402
 import cli_wedge  # noqa: E402 — owns the core pane target and its capture
+import session_runtime  # noqa: E402 — the one reading of a session's runtime stamp
 from worker_auth_state import signed_in_since  # noqa: E402 — the one "signed in again" reading
 
 SESSION = "sutando-core"
@@ -95,12 +98,13 @@ HEARTBEAT_FUTURE_TOLERANCE_SECONDS = 5
 # severity + signals + the gate are layered on top.
 #
 #   ok        working | idle           → no action
+#   warn      blocked                  → surface it; a restart is not the remedy
 #   escalate  needs_login              → tell the human; NEVER auto-restart
 #   critical  unknown(wedged) | offline→ restart, but only through severity_gate
-#   warn      (reserved: 'degraded' soft-warnings folded in a later slice)
 _SEVERITY = {
     "working": "ok",
     "idle": "ok",
+    "blocked": "warn",
     "degraded": "warn",
     "needs_login": "escalate",
     "unknown": "critical",   # status-stale wedge
@@ -196,19 +200,8 @@ def severity_gate(verdict, *, confirm_min=2, freshly_booted=False):
     return "report"
 
 
-# Markers that mean the bundled claude CLI is sitting at its auth prompt and the
-# core therefore cannot act. Kept broad on purpose — the failure mode is a user
-# staring at an unresponsive agent, so a false "needs_login" (rare) is far less
-# costly than missing a real one.
-_LOGIN_MARKERS = (
-    "not logged in",
-    "please run /login",
-    "run `claude login`",
-    "run 'claude login'",
-    "unlock-keychain",
-    "invalid api key",
-    "authentication_error",
-)
+# Which pane lines mean the CLI needs /login is cli_wedge's (`login_marker_line`): the
+# needs-login banner grammar plus its auxiliary keychain / legacy-CLI hints.
 
 
 def _run(cmd):
@@ -511,15 +504,45 @@ def _pane_text():
     return (cli_wedge.capture_pane(sock, target) or "") if target else ""
 
 
+def _queued_tasks(workspace):
+    """How many core tasks still owe a result, by task_dispatch's one reading; 0 when unreadable."""
+    try:
+        from delivery.task_dispatch import pending_candidates
+        return sum(1 for _ in pending_candidates(
+            os.path.join(workspace, "tasks"), os.path.join(workspace, "results"),
+            claims_dir=os.path.join(workspace, "state", "task-event-handler-claims"),
+            deliveries_dir=os.path.join(workspace, "deliveries")))
+    except Exception:  # noqa: BLE001 — a failed read is no evidence of a queue
+        return 0
+
+
+def _pane_blocks_dispatch(workspace):
+    """The pane gate's verdict when it holds queued tasks, else None. The adapter is the
+    session's own runtime; a session that cannot name it is not judged."""
+    try:
+        from delivery import pane_gate
+        sock = _tmux_socket()
+        runtime = session_runtime.parse(*_run(["tmux", "-S", sock, *session_runtime.argv(SESSION)]))
+        adapter = pane_gate.ADAPTERS.get(runtime or "")
+        target = cli_wedge.core_target(sock, SESSION)
+        if adapter is None or target is None:
+            return None
+        verdict = pane_gate.classify_pane(cli_wedge.capture_pane(sock, target, escapes=True),
+                                          adapter, workspace, sock, SESSION)
+        return verdict if pane_gate.blocks_dispatch(verdict, adapter) else None
+    except Exception:  # noqa: BLE001 — best-effort: an unreadable pane keeps the prior verdict
+        return None
+
+
 def needs_login(pane_text):
     """Pure predicate: does the core pane show claude's auth prompt? Testable
     without a live tmux — this is the load-bearing 'stuck vs thinking' decision.
     Only the latest marker counts, and only while nothing after it shows the CLI
-    signed in again. The marker set is this module's (broad on purpose, above); the
+    signed in again. The marker set is cli_wedge's `login_marker_line`; the
     "signed in after it" reading is worker_auth_state's, the one the seat monitor
     uses, so both readers give one answer for one pane."""
     lines = pane_text.splitlines()
-    last = max((i for i, ln in enumerate(lines) if any(m in ln.lower() for m in _LOGIN_MARKERS)),
+    last = max((i for i, ln in enumerate(lines) if cli_wedge.login_marker_line(ln)),
                default=None)
     if last is None:
         return False
@@ -630,6 +653,14 @@ def derive():
                 health, detail = "unknown", "Status stale (still 'running', not updated recently) — possibly wedged"
             elif status == "idle":
                 health, detail = "idle", "Agent is online and idle"
+                # core-status is a self-report; queued work the pane is holding is not idle.
+                queued = _queued_tasks(workspace)
+                held = _pane_blocks_dispatch(workspace) if queued else None
+                if held is not None:
+                    what = (f"unsent text in the composer: {held.pending!r}"
+                            if held.state == "pending" else f"{held.state} ({held.reason})")
+                    health = "blocked"
+                    detail = f"{queued} task(s) queued but not dispatched — {what}"
             else:
                 health, detail = "unknown", "Agent is running (status unknown)"
 

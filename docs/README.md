@@ -110,3 +110,5 @@ python3 skills/release/scripts/docs_audit.py
 
 - [Retained learning windows](learning-window.md) — optional collector and pending-evidence contract.
 - [Concluded reliability evaluation](reliability-v3-results.md) — Rui's full-day testimony, measured components and limitations.
+
+- [Outstanding cron payload preservation](cron-outstanding-payload.md) — immutable prompt tasks until retirement.

@@ -526,6 +526,16 @@
    "status": "historical",
    "canonical_for": "concluded owner evaluation of the local reliability experiment",
    "last_verified": "2026-10-07"
+  },
+  "docs/cron-outstanding-payload.md": {
+   "title": "Outstanding cron payload preservation",
+   "audience": [
+    "operators",
+    "contributors"
+   ],
+   "status": "active",
+   "canonical_for": "prompt cron coalescing and outstanding payload lifetime",
+   "last_verified": "2026-10-07"
   }
  }
 }

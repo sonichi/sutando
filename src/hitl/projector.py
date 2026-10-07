@@ -14,8 +14,10 @@ returning the gateway's dict answer) — this module never imports a bridge.
 
 from __future__ import annotations
 
+import time
 from typing import Callable, Dict, List, Optional, Tuple
 
+from . import renotify
 from .manager import HitlManager
 from .schema import (
     CATEGORY_BLOCKED,
@@ -29,6 +31,7 @@ from .schema import (
 )
 
 Sender = Callable[[Dict], Dict]
+Clock = Callable[[], float]
 
 # The card colours these two apart; a client that ignores the card field saw the
 # blocking header for every kind, so a mere decision read as an alarm.
@@ -58,17 +61,28 @@ def fallback_body(req: HumanRequirement) -> str:
     return head
 
 
-def pending_ids(manager: HitlManager) -> List[str]:
-    """Requirement ids whose revision is ahead of their projection.
+def _notice_due(manager: HitlManager, req, now: float) -> Optional[str]:
+    if req.decided_by is not None:
+        return None
+    return renotify.due(req, manager.store.projection(req.id), now)
+
+
+def pending_ids(manager: HitlManager, clock: Clock = time.time) -> List[str]:
+    """Requirement ids whose revision is ahead of their projection, or that owe
+    the owner a follow-up notice (hitl.renotify).
 
     A caller owning retry cadence needs to tell "nothing to send" from "every
     send was refused"; `project()` returns an empty list for both.
     """
-    return [r.id for r in manager.store.all() if manager.needs_projection(r.id)]
+    now = clock()
+    return [r.id for r in manager.store.all()
+            if manager.needs_projection(r.id) or _notice_due(manager, r, now)]
 
 
-def project(manager: HitlManager, send: Sender, room_id: str) -> List[Tuple[str, Optional[str]]]:
-    """Drive every requirement whose revision is ahead of its projection.
+def project(manager: HitlManager, send: Sender, room_id: str,
+            clock: Clock = time.time) -> List[Tuple[str, Optional[str]]]:
+    """Drive every requirement whose revision is ahead of its projection, then
+    send each follow-up notice that is due as a NEW message.
 
     Returns [(req_id, event_id_or_None), ...] for the projections that were
     accepted this drive. A rejected send is skipped (nothing recorded) so the
@@ -94,6 +108,27 @@ def project(manager: HitlManager, send: Sender, room_id: str) -> List[Tuple[str,
         if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
             continue
         event_id = str(answer.get("event_id") or "") or None
-        manager.record_projection(req.id, req.revision, event_id if not target else None)
+        extra = None if target else renotify.on_create(req, clock())
+        manager.record_projection(req.id, req.revision, event_id if not target else None, extra)
         out.append((req.id, event_id))
+    out.extend(_send_notices(manager, send, room_id, clock()))
+    return out
+
+
+def _send_notices(manager: HitlManager, send: Sender, room_id: str,
+                  now: float) -> List[Tuple[str, Optional[str]]]:
+    out: List[Tuple[str, Optional[str]]] = []
+    for req in manager.store.all():
+        notice = _notice_due(manager, req, now)
+        if notice is None:
+            continue
+        ledger = manager.store.projection(req.id)
+        # Plain text, no card field: a second card would never receive the status edits.
+        answer = send({"room_id": room_id, "op": "message",
+                       "body": renotify.body(notice, req, now),
+                       "dedupe_key": renotify.dedupe_key(notice, req, ledger)})
+        if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
+            continue
+        manager.record_notice(req.id, renotify.after(notice, ledger, now))
+        out.append((req.id, str(answer.get("event_id") or "") or None))
     return out

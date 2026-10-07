@@ -33,6 +33,7 @@
 # fallback (not last) because CODEOWNERS is last-match-wins: a broad /src/ line
 # at the end of the file would override every more-specific /src/... entry below.
 /src/ @sonichi @qingyun-wu
+/tests/ @sonichi @qingyun-wu @liususan091219
 
 # Clear per-area leader over the full history (90-day leader in parentheses where it differs).
 /skills/agent-room-ops/    @qingyun-wu
