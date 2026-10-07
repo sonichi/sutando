@@ -56,6 +56,14 @@ def _read_when_nonempty(path, deadline):
     return None
 
 
+SESSION_UP_AT_ONCE_TMUX = '''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+[ "${1:-}" = has-session ] && exit 0
+exit 0
+'''
+
+
 class CodexCoreLauncherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2044,28 +2052,33 @@ exit 0
 
     def test_launcher_survives_an_invalid_session_wait_value_end_to_end(self):
         """The real launcher (not an extracted snippet) must still bring up a
-        session and clear the shutdown sentinel when the knob is garbage —
-        the full startup round trip kewei asked this PR to cover, including
-        rui's live repro values. "08" is a real gotcha here: it's syntactically
-        a plain number (so it must NOT fall back to the default — 08 means 8,
-        not "invalid"), but bash's own leading-zero octal parsing makes it
-        crash the exact same way as truly-invalid input unless arithmetic is
-        forced to base 10; both must be exercised, and distinguished."""
+        session when the knob is garbage, and say which bound it applied. "08"
+        is syntactically a number and must read as 8, not as invalid or octal."""
+        self._write_exe("tmux", SESSION_UP_AT_ONCE_TMUX)
         for hostile, expected_bound in (("abc", "5"), ("1e3", "5"), (".5", "5"), ("08", "8")):
             with self.subTest(hostile=hostile):
                 result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": hostile})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("unbound variable", result.stderr)
                 self.assertNotIn("value too great for base", result.stderr)
-                self.assertIn(f"did not come up within ~{expected_bound}s", result.stderr)
+                self.assertIn(f"session-up wait: at most {expected_bound}s", result.stderr)
+                self.assertNotIn("did not come up", result.stderr)
+
+    def test_launcher_reports_the_timeout_with_the_bound_it_applied(self):
+        """When the session never appears, the warning names the applied bound;
+        a bound of 0 keeps this on the one-poll path."""
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("did not come up within ~0s", result.stderr)
 
     def test_launcher_prints_the_effective_bound_not_the_raw_huge_value(self):
-        """rui's second finding: the warning must name what the launcher
-        actually waited (the clamped bound), not the raw huge input."""
+        """rui's second finding: the launcher names the clamped bound it will
+        actually wait, never the raw huge input."""
+        self._write_exe("tmux", SESSION_UP_AT_ONCE_TMUX)
         result = self.run_launcher(
             env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "99999999999999999"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("did not come up within ~60s", result.stderr)
+        self.assertIn("session-up wait: at most 60s", result.stderr)
         self.assertNotIn("99999999999999999", result.stderr)
 
     def test_launcher_delayed_session_still_comes_up_within_the_wait(self):

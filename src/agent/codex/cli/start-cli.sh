@@ -182,6 +182,7 @@ SESSION_UP_TRIES=$(( ${_session_up_sign}(10#$_session_up_mag) * 5 ))
 # The warning below should name what the launcher actually waited, not the raw
 # (possibly huge, now-clamped) input value. (rui, PR #5210.)
 SESSION_UP_EFFECTIVE_S=$(( SESSION_UP_TRIES / 5 ))
+echo "  · session-up wait: at most ${SESSION_UP_EFFECTIVE_S}s" >&2
 if ! command -v codex >/dev/null 2>&1; then
   echo "  … waiting for the Codex CLI to finish installing (up to ${CODEX_WAIT_TIMEOUT}s)" >&2
   _codex_waited=0
