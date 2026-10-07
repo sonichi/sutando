@@ -2022,7 +2022,7 @@ exit 0
         unbound-variable exit and a leading zero an octal error."""
         snippet = self._session_wait_snippet()
         self.assertIn("SESSION_UP_TRIES", snippet)
-        self.assertIn("-le 300", snippet, "clamp line moved or was removed")
+        self.assertIn("SESSION_UP_TRIES=300", snippet, "the 300-poll ceiling moved or was removed")
         self.assertIn("10#", snippet, "base-10 guard against octal parsing moved or was removed")
 
         # tries = clamp(5 * int(value), 1, 300) and the message shows tries / 5;
@@ -2079,17 +2079,17 @@ exit 0
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("unbound variable", result.stderr)
                 self.assertNotIn("value too great for base", result.stderr)
-                self.assertIn(f"session-up wait: at most {expected_bound}s", result.stderr)
+                self.assertIn(f"session-up wait: at most {int(expected_bound) * 5} poll(s), {expected_bound}.0s", result.stderr)
                 polls = [c for c in self._calls_after_new_session() if "has-session -t =" in c and "-watcher" not in c]
                 self.assertGreaterEqual(len(polls), 1, "the launcher never polled after new-session")
                 self.assertNotIn("did not come up", result.stderr)
 
     def test_launcher_times_out_with_the_effective_bound_not_the_raw_value(self):
-        """When the session never appears the warning names the applied bound: a
-        raw 0.9 is one poll and "~0s", so raw and effective differ cheaply."""
+        """When the session never appears the warning names the applied budget: a
+        raw 0.9 is one poll and "~0.2s", so raw and effective differ cheaply."""
         result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("did not come up within ~0s", result.stderr)
+        self.assertIn("did not come up within ~0.2s", result.stderr)
         self.assertNotIn("0.9s", result.stderr)
 
     def test_launcher_prints_the_effective_bound_not_the_raw_huge_value(self):
@@ -2099,8 +2099,31 @@ exit 0
         result = self.run_launcher(
             env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "99999999999999999"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("session-up wait: at most 60s", result.stderr)
+        self.assertIn("session-up wait: at most 300 poll(s), 60.0s", result.stderr)
         self.assertNotIn("99999999999999999", result.stderr)
+
+    def _mutate_launcher(self, old, new):
+        path = self.root / "src/agent/codex/cli/start-cli.sh"
+        text = path.read_text()
+        self.assertIn(old, text, "mutation target moved")
+        path.write_text(text.replace(old, new))
+
+    def test_control_a_raw_value_in_the_warning_is_caught(self):
+        """Control: if the timeout warning printed the raw value again, the
+        timeout test above would fail on this very output."""
+        self._mutate_launcher('within ~${SESSION_UP_LABEL}', 'within ~${SESSION_UP_WAIT_S}s')
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9"})
+        self.assertIn("did not come up within ~0.9s", result.stderr)
+        self.assertNotIn("within ~0.2s", result.stderr)
+
+    def test_control_a_raw_value_driving_seq_is_caught(self):
+        """Control: if the raw value drove `seq` again, a knob of 1 would give one
+        poll instead of five, the third-poll session would be missed, and the
+        delayed test above would fail on the warning this run produces."""
+        self._mutate_launcher('seq 1 "$SESSION_UP_TRIES"', 'seq 1 "$SESSION_UP_WAIT_S"')
+        self._write_exe("tmux", SESSION_UP_THIRD_POLL_TMUX)
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "1"})
+        self.assertIn("did not come up", result.stderr)
 
     def test_launcher_delayed_session_still_comes_up_within_the_wait(self):
         """A session that reports itself on the third poll after new-session is

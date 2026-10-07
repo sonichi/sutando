@@ -152,7 +152,7 @@ export PATH
 # install finishes, so wait briefly for it to appear before giving up.
 CODEX_WAIT_TIMEOUT="${SUTANDO_CODEX_WAIT_TIMEOUT:-120}"
 # Seconds a freshly created core session may take to answer has-session; a stub
-# tmux that never reports one (tests) sets this to 0.
+# tmux that never reports one (tests) sets this to 0. Polls run every 0.2 s.
 SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S:-5}"
 # Only a signed base-10 integer counts (fraction dropped): under set -u a bare word is an
 # unbound-variable exit and a leading zero reads as octal, so anything else is the default.
@@ -163,18 +163,23 @@ else
   _session_up_neg=""
   _session_up_mag=5
 fi
-# More than nine digits cannot be meant as seconds and would overflow the multiply.
-if [ -n "$_session_up_neg" ]; then
+while [ "${#_session_up_mag}" -gt 1 ] && [ "${_session_up_mag#0}" != "$_session_up_mag" ]; do
+  _session_up_mag="${_session_up_mag#0}"
+done
+# Saturate on the digit string against the 60 s ceiling, so no multiply can wrap.
+if [ -n "$_session_up_neg" ] || [ "$_session_up_mag" = 0 ]; then
   SESSION_UP_TRIES=1
-elif [ "${#_session_up_mag}" -gt 9 ]; then
+elif [ "${#_session_up_mag}" -gt 2 ]; then
   SESSION_UP_TRIES=300
 else
-  SESSION_UP_TRIES=$(( 10#$_session_up_mag * 5 ))
+  case "$_session_up_mag" in
+    6[1-9]|[7-9][0-9]) SESSION_UP_TRIES=300 ;;
+    *) SESSION_UP_TRIES=$(( 10#$_session_up_mag * 5 )) ;;
+  esac
 fi
-[ "$SESSION_UP_TRIES" -ge 1 ] || SESSION_UP_TRIES=1
-[ "$SESSION_UP_TRIES" -le 300 ] || SESSION_UP_TRIES=300
 SESSION_UP_EFFECTIVE_S=$(( SESSION_UP_TRIES / 5 ))
-echo "  · session-up wait: at most ${SESSION_UP_EFFECTIVE_S}s" >&2
+SESSION_UP_LABEL="$(( SESSION_UP_TRIES * 2 / 10 )).$(( SESSION_UP_TRIES * 2 % 10 ))s"
+echo "  · session-up wait: at most ${SESSION_UP_TRIES} poll(s), ${SESSION_UP_LABEL}" >&2
 if ! command -v codex >/dev/null 2>&1; then
   echo "  … waiting for the Codex CLI to finish installing (up to ${CODEX_WAIT_TIMEOUT}s)" >&2
   _codex_waited=0
@@ -579,7 +584,7 @@ if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   if session_exists "$SESSION"; then
     clear_shutdown_sentinel
   else
-    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_EFFECTIVE_S}s — sentinel NOT cleared, no core is serving." >&2
+    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_LABEL} — sentinel NOT cleared, no core is serving." >&2
   fi
   ensure_task_notifier
   ensure_core_monitor
@@ -596,7 +601,7 @@ else
   if session_exists "$SESSION"; then
     clear_shutdown_sentinel
   else
-    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_EFFECTIVE_S}s — sentinel NOT cleared, no core is serving." >&2
+    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_LABEL} — sentinel NOT cleared, no core is serving." >&2
   fi
   ensure_task_notifier
   ensure_core_monitor
