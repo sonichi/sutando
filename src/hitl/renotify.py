@@ -43,7 +43,9 @@ def due(req: HumanRequirement, projection: Dict, now: float) -> Optional[str]:
     if projection.get("revision", 0) < req.revision:
         return None  # the edit goes first
     if req.status == STATUS_RESOLVED:
-        return None if projection.get("recovered") else RECOVERY
+        # Only a card this module scheduled owes a recovery; a pre-upgrade ledger has no notified_at.
+        owed = projection.get("notified_at") and not projection.get("recovered")
+        return RECOVERY if owed else None
     if req.status in TERMINAL_STATUSES:
         return None
     # A card projected before this ledger key existed counts from its creation.

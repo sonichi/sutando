@@ -158,6 +158,42 @@ class RenotifyTests(unittest.TestCase):
         self.assertEqual([p["op"] for p in self.drive()], ["message"])
         self.assertEqual(self.drive(), [])
 
+    def _pre_upgrade(self, req, edited=True):
+        """A record the old projector wrote: a bare {revision, event_id} ledger."""
+        self.mgr.create(req)
+        self.mgr.resolve(req.id)
+        stored = self.mgr.store.load(req.id)
+        rev = stored.revision if edited else 1
+        self.mgr.store.save(stored, projection={"revision": rev, "event_id": "$old-" + req.id})
+        return stored
+
+    def test_a_card_resolved_before_the_upgrade_owes_no_recovery(self):
+        self._pre_upgrade(blocking())
+        self.clock.advance(7 * HOUR)
+        self.assertEqual(self.drive(), [])
+
+    def test_a_pre_upgrade_card_whose_resolve_edit_is_pending_gets_only_the_edit(self):
+        self._pre_upgrade(blocking(), edited=False)
+        self.assertEqual([p["op"] for p in self.drive()], ["edit"])
+        self.assertEqual(self.drive(), [])
+
+    def test_one_pulse_over_a_pre_upgrade_store_sends_no_recovery(self):
+        for i in range(100):
+            kind = ("auth", "core-blocked", "choice")[i % 3]
+            self._pre_upgrade(blocking(kind=kind, guard=f"g{i}"), edited=i % 4 != 0)
+        sent = self.drive()
+        self.assertEqual([p for p in sent if p["op"] == "message"], [])
+        self.assertTrue(all(p["op"] == "edit" for p in sent))
+
+    def test_a_pre_upgrade_card_re_alerted_after_upgrade_announces_recovery(self):
+        req = self.mgr.create(blocking())
+        stored = self.mgr.store.load(req.id)
+        self.mgr.store.save(stored, projection={"revision": stored.revision, "event_id": "$old"})
+        self.clock.advance(31 * MIN)
+        self.assertIn("Still blocked", self.drive()[0]["body"])
+        self.mgr.resolve(req.id)
+        self.assertEqual([p["op"] for p in self.drive()], ["edit", "message"])
+
     def test_a_block_longer_than_a_day_reads_in_days(self):
         req = self.mgr.create(blocking())
         self.assertIn("after 1d 2h", renotify.body(renotify.REMINDER, req, T0 + 26 * HOUR))
