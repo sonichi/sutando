@@ -70,7 +70,7 @@ KNOWN_TOP = {
     "agent_compatibility", "dependencies", "permissions", "contract",
     "provenance", "enabled", "access_tier", "tools", "server", "startup", "config",
     "hooks", "documented_for_core", "core_description", "supervised_worker",
-    "pending_questions_store",
+    "pending_questions_store", "claude_plugin",
 }
 # Signals a skill actually touches the network (used for the permission cross-check).
 # No trailing \b: signals ending in a space/paren (`curl `, `fetch(`) are followed

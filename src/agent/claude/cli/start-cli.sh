@@ -60,6 +60,7 @@ WATCHER_SESSION="${SESSION}-watcher"
 NOTIFIER_SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
 NOTIFIER_SCRIPT="$REPO/src/agent/claude/cli/task-notifier.sh"
 SURFACE_ARGS=(--remote-control "Sutando" --chrome)
+add_skill_claude_plugins
 # `/startup` is the CANONICAL CORE's ceremony: orphan recovery, session crons,
 # a gate any watcher satisfies. One arg — the skill reads it as $ARGUMENTS.
 BOOT_PROMPT="/startup"

@@ -30,6 +30,8 @@ CLI, for bash callers with only an interpreter path:
     task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>
     task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1
     task_dispatch.py inflight-clear <inflight_dir> <filename>
+    task_dispatch.py partial-mark <partial_dir> <filename> <incarnation>   # composer text on stdin, optional
+    task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1
     task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>]  # prints key<TAB>payload, exit 0/1
 
 `announced-entry` is the one reading of a watcher's `TASK_FILE:` line: a bare name is a file in
@@ -40,6 +42,11 @@ filed under; the payload is what the prompt tells the session to read.
 
 `inflight-*` is the at-most-once record a notifier keeps between a confirmed submit and a
 ready result, keyed to the core incarnation, because terminal history is a lossy record.
+
+`partial-*` is the same at-most-once record, kept in its own directory, for a paste a
+notifier cut short -- plus (optionally) the exact composer text that attempt left behind,
+so a later attempt can prove a garbled, non-boundary leftover sitting in the composer is
+its OWN failed typing (safe to clear) rather than guess from character counts alone.
 
 `find-ready` exists because "does a ready result exist" and "read what it says" must resolve
 to the SAME file: a caller that re-derives the live path after `has-result` says yes can be
@@ -65,6 +72,7 @@ __all__ = [
     "find_ready_result", "has_ready_result", "find_ready_result_for_filename", "ready_result_filenames",
     "pending_candidates", "next_pending_task",
     "mark_inflight", "inflight_is_live", "clear_inflight",
+    "mark_partial_paste", "partial_paste_leftover",
     "announced_entry",
 ]
 
@@ -312,10 +320,14 @@ def inflight_is_live(inflight_dir: "Path | str", filename: str, incarnation: str
     turn with it) and is removed. An unreadable current incarnation ("") keeps
     any marker live: not knowing which core is running is not evidence the
     prompt was never submitted.
+
+    Liveness is judged on the FIRST line only. `mark_partial_paste` writes a
+    second line (the leftover composer text) after the same incarnation; a
+    plain `mark_inflight` record never has one, so this is backward compatible.
     """
     path = _inflight_path(inflight_dir, filename)
     try:
-        recorded = path.read_text().strip()
+        recorded = path.read_text().split("\n", 1)[0].strip()
     except FileNotFoundError:
         return False
     if not recorded:
@@ -334,6 +346,52 @@ def clear_inflight(inflight_dir: "Path | str", filename: str) -> None:
     _inflight_path(inflight_dir, filename).unlink(missing_ok=True)
 
 
+def mark_partial_paste(partial_dir: "Path | str", filename: str, incarnation: str, composer_text: str = "") -> None:
+    """Record a cut-short paste for `filename` under `incarnation`, same at-most-once
+    contract as `mark_inflight` (first line), plus the exact composer text the failed
+    attempt left behind, when the caller has it.
+
+    Without the text, a later attempt can only ever learn "something was cut short" --
+    never whether a non-boundary, garbled leftover sitting in the composer right now is
+    that same cut-short paste (safe to clear) or an unrelated human draft (never ours to
+    touch). Recording the text is what makes that distinction provable.
+    """
+    incarnation = incarnation.strip()
+    if not incarnation:
+        raise ValueError("a partial-paste marker needs the core incarnation; empty would read as live forever")
+    path = _inflight_path(partial_dir, filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(incarnation + "\n")
+            if composer_text:
+                fh.write(composer_text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def partial_paste_leftover(partial_dir: "Path | str", filename: str, incarnation: str) -> "str | None":
+    """The composer text `mark_partial_paste` recorded for `filename`, if the marker is
+    still live for the CURRENT incarnation (same staleness rule as `inflight_is_live`)
+    AND carries text; None otherwise -- absent, stale, or written before this field
+    existed (a plain `mark_inflight`-style single-line record, which pre-dates this and
+    must not be misread as "an empty leftover", so the caller gets the same answer as a
+    missing marker: nothing provable to clear against).
+    """
+    if not inflight_is_live(partial_dir, filename, incarnation):
+        return None
+    path = _inflight_path(partial_dir, filename)
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return None
+    _, _, rest = raw.partition("\n")
+    return rest or None
+
+
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename>\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
@@ -346,7 +404,9 @@ _USAGE = (
     "       task_dispatch.py owned-by <deliveries_dir> <recipient>   # one id per line; exit 2 cannot decide\n"
     "       task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>\n"
     "       task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1\n"
-    "       task_dispatch.py inflight-clear <inflight_dir> <filename>"
+    "       task_dispatch.py inflight-clear <inflight_dir> <filename>\n"
+    "       task_dispatch.py partial-mark <partial_dir> <filename> <incarnation>   # composer text on stdin, optional\n"
+    "       task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1"
 )
 
 
@@ -422,6 +482,26 @@ def _main(argv: list[str]) -> int:
             # Cannot decide is its own answer: 1 would read as "not in flight".
             print(f"task_dispatch.py: {cmd}: cannot read the marker ({exc})", file=sys.stderr)
             return 2
+    if cmd in ("partial-mark", "partial-leftover"):
+        if len(rest) != 1:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        incarnation = rest[0]
+        try:
+            if cmd == "partial-mark":
+                mark_partial_paste(first, second, incarnation, sys.stdin.read())
+                return 0
+            text = partial_paste_leftover(first, second, incarnation)
+        except ValueError as exc:
+            print(f"task_dispatch.py: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"task_dispatch.py: {cmd}: cannot read the marker ({exc})", file=sys.stderr)
+            return 2
+        if text is None:
+            return 1
+        sys.stdout.write(text)
+        return 0
     if cmd == "owned-by":
         if rest:
             print(_USAGE, file=sys.stderr)

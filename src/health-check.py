@@ -1571,6 +1571,7 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
     "session-state.md",      # written by src/session-handoff.sh on compaction
     ".gitkeep",              # git placeholder, not state
     ".env",                  # sutando_config.resolve_dotenv's 2nd tier (#1871)
+    "sutando.config.local.json",  # sutando_config's workspace config layer
     # The two lock guards that legitimately sit at the ROOT, by name. Exempt
     # until they migrate to state/locks/ the way workspace_lock.py already
     # writes <workspace>/state/locks/<role>.lock.guard.
