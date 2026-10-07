@@ -2006,16 +2006,15 @@ exit 0
         self.assertEqual((results / "task-owner.txt").read_text(), "done\n")
 
     def _session_wait_snippet(self):
-        """The real start-cli.sh SESSION_UP_WAIT_S/TRIES block, lines
-        SESSION_UP_WAIT_S=... through the -le 300 ceiling clamp inclusive —
-        found by content, not a fixed line count, so the block can grow
-        without silently truncating what this test runs."""
+        """The real start-cli.sh session-wait block, from SESSION_UP_WAIT_S=... through
+        the SESSION_UP_LABEL line, found by content so the block can grow without
+        silently truncating what this test runs."""
         script_text = (self.root / "src/agent/codex/cli/start-cli.sh").read_text()
         lines = script_text.splitlines()
         start = next(i for i, l in enumerate(lines)
                      if l.startswith('SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S'))
         end = next(i for i, l in enumerate(lines)
-                   if i >= start and "SESSION_UP_EFFECTIVE_S" in l)
+                   if i >= start and l.startswith("SESSION_UP_LABEL="))
         return "\n".join(lines[start:end + 1])
 
     def test_session_wait_knob_validates_and_clamps_hostile_values(self):
@@ -2023,35 +2022,32 @@ exit 0
         the launcher's own set -euo pipefail: a bare word is otherwise an
         unbound-variable exit and a leading zero an octal error."""
         snippet = self._session_wait_snippet()
-        self.assertIn("SESSION_UP_TRIES", snippet)
-        self.assertIn("SESSION_UP_TRIES=300", snippet, "the 300-poll ceiling moved or was removed")
-        self.assertIn("10#", snippet, "base-10 guard against octal parsing moved or was removed")
 
         # tries = clamp(5 * int(value), 1, 300) and the message shows tries / 5;
         # anything that is not a signed base-10 literal falls back to the default 5.
         cases = [
-            ("unset", None, "25", "5"),
-            ("empty", "", "25", "5"),
-            ("zero", "0", "1", "0"),
-            ("normal", "5", "25", "5"),
-            ("decimal", "5.7", "25", "5"),
-            ("negative", "-3", "1", "0"),
-            ("negative_leading_zero", "-08", "1", "0"),
-            ("leading_zero", "08", "40", "8"),
-            ("huge", "99999999999999999", "300", "60"),
-            ("non_numeric", "abc", "25", "5"),
-            ("scientific", "1e3", "25", "5"),
-            ("formula_injection", "5 * 1000", "25", "5"),
-            ("bare_sign", "-", "25", "5"),
-            ("bare_dot", ".", "25", "5"),
-            ("leading_dot", ".5", "25", "5"),
-            ("long_zero_prefix", "0" * 100000 + "5", "25", "5"),
-            ("ceiling", "60", "300", "60"),
-            ("just_over_ceiling", "61", "300", "60"),
-            ("zero_padded_ceiling", "0060", "300", "60"),
-            ("all_zeros", "0" * 30, "1", "0"),
+            ("unset", None, "25", "5.0s"),
+            ("empty", "", "25", "5.0s"),
+            ("zero", "0", "1", "0.2s"),
+            ("normal", "5", "25", "5.0s"),
+            ("decimal", "5.7", "25", "5.0s"),
+            ("negative", "-3", "1", "0.2s"),
+            ("negative_leading_zero", "-08", "1", "0.2s"),
+            ("leading_zero", "08", "40", "8.0s"),
+            ("huge", "99999999999999999", "300", "60.0s"),
+            ("non_numeric", "abc", "25", "5.0s"),
+            ("scientific", "1e3", "25", "5.0s"),
+            ("formula_injection", "5 * 1000", "25", "5.0s"),
+            ("bare_sign", "-", "25", "5.0s"),
+            ("bare_dot", ".", "25", "5.0s"),
+            ("leading_dot", ".5", "25", "5.0s"),
+            ("long_zero_prefix", "0" * 100000 + "5", "25", "5.0s"),
+            ("ceiling", "60", "300", "60.0s"),
+            ("just_over_ceiling", "61", "300", "60.0s"),
+            ("zero_padded_ceiling", "0060", "300", "60.0s"),
+            ("all_zeros", "0" * 30, "1", "0.2s"),
         ]
-        for name, hostile, expected_tries, expected_effective in cases:
+        for name, hostile, expected_tries, expected_label in cases:
             with self.subTest(case=name, hostile=hostile):
                 env = dict(os.environ)
                 env.pop("SUTANDO_CORE_SESSION_WAIT_S", None)
@@ -2061,15 +2057,15 @@ exit 0
                 result = subprocess.run(
                     ["/bin/bash", "-c",
                      "set -euo pipefail\n" + snippet +
-                     '\necho "$SESSION_UP_TRIES"\necho "$SESSION_UP_EFFECTIVE_S"'],
+                     '\necho "$SESSION_UP_TRIES"\necho "$SESSION_UP_LABEL"'],
                     env=env, capture_output=True, text=True, timeout=5,
                 )
                 self.assertLess(time.monotonic() - started, 2.0, f"case={name} parsing stalled")
                 self.assertEqual(result.returncode, 0, result.stderr)
-                out_tries, out_effective = result.stdout.splitlines()
+                out_tries, out_label = result.stdout.splitlines()
                 self.assertEqual(out_tries, expected_tries,
                                   f"case={name} hostile={hostile!r} stderr={result.stderr!r}")
-                self.assertEqual(out_effective, expected_effective,
+                self.assertEqual(out_label, expected_label,
                                   f"case={name} hostile={hostile!r} stderr={result.stderr!r}")
 
     def _seed_sentinel(self):
@@ -2086,10 +2082,11 @@ exit 0
     def test_launcher_survives_an_invalid_session_wait_value_end_to_end(self):
         """The real launcher creates the session and clears the sentinel when the
         knob is garbage, naming the bound it applied; "08" reads as 8."""
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
         for hostile, expected_bound in (("abc", "5"), ("1e3", "5"), (".5", "5"), ("08", "8")):
             with self.subTest(hostile=hostile):
-                self.setUp()
-                self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+                for leftover in (self.log, Path(str(Path(self.tmp.name) / "tmux-killed") + ".created")):
+                    leftover.unlink(missing_ok=True)
                 result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": hostile})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn("unbound variable", result.stderr)
@@ -2127,7 +2124,7 @@ exit 0
 
     def test_control_a_raw_value_in_the_warning_is_caught(self):
         """Control: if the timeout warning printed the raw value again, the
-        timeout test above would fail on this very output."""
+        timeout test would fail on this very output."""
         self._mutate_launcher('within ~${SESSION_UP_LABEL}', 'within ~${SESSION_UP_WAIT_S}s')
         result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9"})
         self.assertIn("did not come up within ~0.9s", result.stderr)
@@ -2136,7 +2133,7 @@ exit 0
     def test_control_a_raw_value_driving_seq_is_caught(self):
         """Control: if the raw value drove `seq` again, a knob of 1 would give one
         poll instead of five, the third-poll session would be missed, and the
-        delayed test above would fail on the warning this run produces."""
+        delayed test below would fail on the warning this run produces."""
         self._mutate_launcher('seq 1 "$SESSION_UP_TRIES"', 'seq 1 "$SESSION_UP_WAIT_S"')
         self._write_exe("tmux", SESSION_UP_THIRD_POLL_TMUX)
         result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "1"})

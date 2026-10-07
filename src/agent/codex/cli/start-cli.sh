@@ -174,7 +174,6 @@ else
     *) SESSION_UP_TRIES=$(( 10#$_session_up_mag * 5 )) ;;
   esac
 fi
-SESSION_UP_EFFECTIVE_S=$(( SESSION_UP_TRIES / 5 ))
 SESSION_UP_LABEL="$(( SESSION_UP_TRIES * 2 / 10 )).$(( SESSION_UP_TRIES * 2 % 10 ))s"
 echo "  · session-up wait: at most ${SESSION_UP_TRIES} poll(s), ${SESSION_UP_LABEL}" >&2
 if ! command -v codex >/dev/null 2>&1; then
