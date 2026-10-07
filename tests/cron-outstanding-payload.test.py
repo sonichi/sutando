@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Hermetic acceptance regressions for the reliability experiment. No live tasks.
-Run: python3 tests/reliability-v2.test.py
+Run: python3 tests/cron-outstanding-payload.test.py
 """
 import importlib.util
 import json
@@ -91,7 +91,7 @@ class CronAcceptance(unittest.TestCase):
             with self.assertRaises(OSError):
                 cron.emit_task("audit", {"prompt": "partial must not be seen"})
         self.assertFalse(list(cron.TASKS_DIR.glob("task-*.txt")))
-        self.assertFalse(list(cron.TASKS_DIR.glob(".*.tmp")))
+        self.assertFalse(list(cron.TASKS_DIR.glob(".task-*.txt.*")))
 
     def test_newest_configuration_applies_after_prior_task_retires(self):
         first = cron.emit_task("audit", {"prompt": "original"})
