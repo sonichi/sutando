@@ -93,14 +93,20 @@ create_dir_if_missing() {
   fi
 }
 
-# Repo-rooted copy helper — for shipping example configs from the checkout
-# into a stable location. Used today only for skills/schedule-crons/crons.json
-# which lives in the repo, NOT the workspace.
-copy_if_missing() {
-  local src="$1"; local dst="$2"
-  if [ ! -f "$REPO/$dst" ] && [ -f "$REPO/$src" ]; then
-    cp "$REPO/$src" "$REPO/$dst"
-    echo "  ✓ created $dst (from $src)"
+# The legacy repo-side crons.json has one writer, which also records its installer marker;
+# if it cannot run, nothing is written: an unmarked copy would read as a live schedule.
+install_cron_starter() {
+  local skill="$REPO/skills/schedule-crons" here writer py out
+  if [ -f "$skill/crons.json" ] || [ ! -f "$skill/crons.example.json" ]; then return 0; fi
+  here="$(cd "$(dirname "$0")" && pwd)"
+  writer="$skill/scripts/seed_crons.py"
+  [ -f "$writer" ] || writer="$here/../skills/schedule-crons/scripts/seed_crons.py"
+  . "$here/../scripts/python-binary.sh"
+  py="$(resolve_python "$REPO")"
+  if [ -n "$py" ] && out="$("$py" "$writer" --install-starter --skill-dir "$skill")"; then
+    case "$out" in installed*) echo "  ✓ created skills/schedule-crons/crons.json (from crons.example.json)";; esac
+  else
+    echo "  ⚠ skipped skills/schedule-crons/crons.json: its installer did not run" >&2
   fi
 }
 
@@ -301,8 +307,8 @@ tier1() {
     "{\"connected\":false,\"ts\":$(date +%s)}
 "
 
-  # crons.json — copy from the example if present
-  copy_if_missing "skills/schedule-crons/crons.example.json" "skills/schedule-crons/crons.json"
+  # crons.json — the marked installer copy of the example, if present
+  install_cron_starter
 }
 
 # --- Tier 2: preflight (warn, don't block) ---

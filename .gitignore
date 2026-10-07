@@ -84,6 +84,7 @@ skills/personal-*/
 tests/security/*.md
 !tests/security/*.md.example
 skills/schedule-crons/crons.json
+skills/schedule-crons/crons.json.installer-seed
 # voice-agent + phone-conversation configs are per-user data (model/grounding
 # prefs the operator tunes) and live in $SUTANDO_WORKSPACE/config/. The repo
 # ships only the *.example templates — never commit a live config here.

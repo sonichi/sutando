@@ -107,8 +107,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             shutil.copy2(REAL_REPO / rel, target)
         for rel in ("skills/schedule-crons/scripts/reconcile_launchd.py",
                     "skills/schedule-crons/scripts/seed_crons.py",
-                    "skills/schedule-crons/crons.example.json",
-                    "skills/schedule-crons/shipped-starters.json"):
+                    "skills/schedule-crons/crons.example.json"):
             if (REAL_REPO / rel).exists():
                 target = self.root / rel
                 target.parent.mkdir(parents=True, exist_ok=True)

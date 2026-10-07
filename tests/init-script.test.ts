@@ -163,6 +163,8 @@ describe('init.sh --auto (Tier 1: crons.json copy)', () => {
 		runInit(scratch, '--auto');
 		const body = readFileSync(join(exampleDir, 'crons.json'), 'utf-8');
 		assert.match(body, /"foo"/);
+		const marker = JSON.parse(readFileSync(join(exampleDir, 'crons.json.installer-seed'), 'utf-8'));
+		assert.equal(marker.state, 'installer-seeded-not-activated', 'the copy carries its installer marker');
 	});
 
 	it('does NOT copy when the target already exists', () => {
@@ -173,6 +175,7 @@ describe('init.sh --auto (Tier 1: crons.json copy)', () => {
 		runInit(scratch, '--auto');
 		const body = readFileSync(join(exampleDir, 'crons.json'), 'utf-8');
 		assert.match(body, /my-custom/);
+		assert.equal(existsSync(join(exampleDir, 'crons.json.installer-seed')), false, 'an existing file is never marked');
 	});
 
 	it('skips silently when no example file exists (fresh template install case)', () => {
