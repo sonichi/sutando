@@ -525,11 +525,7 @@ class TestOwnershipIsScopedToThisSession(Base):
         pid = int(out)
         self.addCleanup(lambda: subprocess.run(["kill", str(pid)], capture_output=True))
         import watcher_identity
-        for _ in range(50):
-            if watcher_identity.proc_argv_vector(pid) is not None:
-                break
-            time.sleep(0.02)
-        else:
+        if not _wait_for_exec(pid, str(script), watcher_identity.proc_argv_vector):
             self.skipTest("no authoritative argv read on this platform")
         table = wb._process_table()
         if wb.session_root(table, os.getppid()) is None:
@@ -541,6 +537,35 @@ class TestOwnershipIsScopedToThisSession(Base):
                            alive=lambda p: True)
         self.assertEqual(d, "start", why)
         self.assertIn("not started by this session", why)
+
+
+def _wait_for_exec(pid, script, read_argv, tries=250, delay=0.02):
+    """True once pid's argv names script: a readable argv may still be the forked
+    `bash -c`/nohup stage, which the gate rightly calls not-a-watcher."""
+    for _ in range(tries):
+        argv = read_argv(pid)
+        if argv is not None and any(a == script for a in argv):
+            return True
+        time.sleep(delay)
+    return False
+
+
+class TestWaitForExec(unittest.TestCase):
+    def test_a_pre_exec_argv_is_not_taken_as_the_watcher(self):
+        stages = iter([None, ["bash", "-c", "nohup bash /w/watch-tasks-stream.sh /in &"],
+                       ["nohup", "bash", "/w/watch-tasks-stream.sh", "/in"],
+                       ["bash", "/w/watch-tasks-stream.sh", "/in"]])
+        seen = []
+        def read(_pid):
+            v = next(stages)
+            seen.append(v)
+            return v
+        self.assertTrue(_wait_for_exec(1, "/w/watch-tasks-stream.sh", read, delay=0))
+        self.assertEqual(len(seen), 3, "returned before the exec landed")
+
+    def test_gives_up_when_argv_never_names_the_script(self):
+        self.assertFalse(_wait_for_exec(1, "/w/x.sh", lambda _p: ["bash", "-c", "x"],
+                                        tries=3, delay=0))
 
 
 class TestTheShippedStartupNamesTheInbox(Base):
