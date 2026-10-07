@@ -65,6 +65,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from tmux_probe import classify as _classify_session_probe  # noqa: E402
 import core_lineage  # noqa: E402
+import session_runtime  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 
@@ -437,13 +438,9 @@ def _session_runtime(sock: str, sess: str) -> "str | None":
     Returns None rather than guessing: callers must treat unknown as "no
     discrimination possible" and keep their pre-existing behaviour.
     """
-    r = _tmux(sock, "show-environment", "-t", f"={sess}", "SUTANDO_CORE_RUNTIME")
-    if r is not None and r.returncode == 0:
-        line = r.stdout.strip()
-        if line.startswith("SUTANDO_CORE_RUNTIME=") and not line.startswith("-"):
-            val = line.split("=", 1)[1].strip()
-            if val:
-                return val
+    val = session_runtime.read(sess, lambda *a: _tmux(sock, *a))
+    if val:
+        return val
     # Config fallback. Import `resolve_core_runtime` directly rather than
     # shelling out to `scripts/sutando-config.sh` — that shell-out had to walk
     # two levels up from `__file__` to locate the script, which is the repo-root

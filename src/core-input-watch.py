@@ -31,6 +31,7 @@ idle / wedged":
     needs_login             →   logged-out        (unless an ACTIVE gate shows, below)
     working                 →   running
     idle                    →   idle-ready
+    blocked (queue held)    →   blocked-known     (never hung: a restart is not the remedy)
     unknown (status stale)  →   hung              (only when the process probe SAW a session)
     unknown (unobserved)    →   unobserved        (probe could not run: hold, never RECOVER)
     (any, + gateway down)   →   gateway-down       (gateway probe is bundled-specific)
@@ -319,6 +320,8 @@ _BASE_TO_STATE = {
     "needs_login": ("logged-out", "core not authenticated (needs /login)"),
     "idle": ("idle-ready", "ready for a task"),
     "working": ("running", "actively processing"),
+    # Queued tasks held by the pane (a draft, an abnormal frame): visible, never a restart.
+    "blocked": ("blocked-known", "tasks queued but held by the pane (composer text or abnormal frame)"),
     # "unknown" = runtime-health saw a live session but a stale/absent core-status
     # ("running" that never advanced) → wedged. That IS the supervisor's `hung`.
     "unknown": ("hung", "core alive but stalled (status stale, no recognized prompt)"),
