@@ -137,6 +137,19 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(got["pr_body"], "[redacted]")
         self.assertEqual(got["decision_context"][0]["body"], "[redacted]")
 
+    def test_private_key_crossing_text_bounds_is_redacted_before_truncation(self):
+        for field, bound in (("body", 12000), ("comment", 3000)):
+            text = "-----BEGIN PRIVATE KEY-----\n" + "fixture payload\n" * bound + "-----END PRIVATE KEY-----\npublic suffix"
+            body = text if field == "body" else "public body"
+            comment = text if field == "comment" else "public comment"
+            answers = [pr(body=body), {"headRefOid": "abc"}, [], [[{"body": comment}]], pr(body=body)]
+            got = decision.collect("o/r", 1, runner=lambda args: SimpleNamespace(returncode=0, stdout=json.dumps(answers.pop(0))))
+            self.assertEqual(got["evidence_status"], "stable")
+            self.assertNotIn("fixture payload", json.dumps(got))
+            output = got["pr_body"] if field == "body" else got["decision_context"][0]["body"]
+            self.assertLessEqual(len(output), bound)
+            self.assertIn("public suffix", output)
+
     def test_redaction_failure_withholds_context_and_stays_unknown(self):
         answers = [pr(), {"headRefOid": "abc"}, [], [[{"body": "private fixture"}]], pr()]
         def fail(text):
@@ -159,6 +172,13 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(guard.decision_targets("gh api repos/o/r/pulls/1 -X PATCH -f body=x"), [])
         with self.assertRaises(ValueError):
             decision.collect("o/r; echo x", 1)
+
+    def test_echoed_gh_arguments_do_not_query_github(self):
+        with patch.object(subprocess, "run") as run:
+            guard.decide({"tool_name": "Bash", "hook_event_name": "PostToolUse", "tool_input": {"command": "echo gh pr view 1 --repo o/r"}})
+            run.assert_not_called()
+        self.assertEqual(guard.decision_targets("echo ignored; gh pr view 1 --repo o/r"), [("o/r", 1)])
+        self.assertEqual(guard.decision_targets("LANG=C gh pr view 1 --repo o/r"), [("o/r", 1)])
 
 
 if __name__ == "__main__":

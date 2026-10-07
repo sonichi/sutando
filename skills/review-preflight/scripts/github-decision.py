@@ -43,23 +43,17 @@ def collect(repo, number, expected_head=None, runner=None, budget=24):
     pages = read(["api", f"repos/{repo}/issues/{number}/comments?per_page=100", "--paginate", "--slurp"])
     comments = [c for page in pages for c in page] if isinstance(pages, list) and all(isinstance(page, list) for page in pages) else None
     after = read(["api", endpoint])
-    result = classify(before, after, status, rules, comments, expected_head)
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+        from chat_redaction import redact_chat_body
+    except Exception:
+        redact_chat_body = lambda text: "[text withheld: redactor unavailable]"
+        errors.append("Decision text redaction unavailable")
+    result = classify(before, after, status, rules, comments, expected_head, redact=redact_chat_body)
     result.update(schema=1, repository=repo, pr=number,
                   observed_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
     result["errors"].extend(errors)
     if errors:
-        result["evidence_status"] = "unknown"
-    try:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
-        from chat_redaction import redact_chat_body
-        result["pr_body"] = redact_chat_body(result.get("pr_body", ""))
-        for comment in result.get("decision_context", []):
-            comment["body"] = redact_chat_body(comment["body"])
-    except Exception:
-        result["pr_body"] = "[body withheld: redactor unavailable]"
-        for comment in result.get("decision_context", []):
-            comment["body"] = "[comment withheld: redactor unavailable]"
-        result["errors"].append("Decision text redaction unavailable")
         result["evidence_status"] = "unknown"
     return result
 

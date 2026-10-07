@@ -15,14 +15,16 @@ import _shell_scan
 
 def decision_targets(command):
     try:
-        words = [word.text for word in _shell_scan.words(command)]
+        commands = _shell_scan.segments(command)
     except ValueError:
         return []
     targets = []
-    for index, word in enumerate(words):
-        if word != "gh":
+    for words in commands:
+        while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0].text):
+            words = words[1:]
+        if not words or not words[0].basename_is("gh"):
             continue
-        tail = words[index + 1:]
+        tail = [word.text for word in words[1:]]
         if tail[:2] == ["pr", "view"] and len(tail) > 2:
             url = re.fullmatch(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", tail[2])
             if url:
