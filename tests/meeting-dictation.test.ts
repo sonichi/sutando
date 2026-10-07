@@ -51,6 +51,19 @@ describe('GeminiLiveTranscribeSTTProvider', () => {
 		await p.stop();
 	});
 
+	it('sends custom vocabulary when given', async () => {
+		const sockets: FakeSocket[] = [];
+		const p = new GeminiLiveTranscribeSTTProvider({
+			apiKey: 'k', customVocabulary: ['Sutando'],
+			createSocket: () => { const s = new FakeSocket(); sockets.push(s); return s; },
+		});
+		p.configure({ sampleRate: 24000, bitDepth: 16, channels: 1 });
+		await p.start();
+		sockets[0].openAndSetup();
+		assert.deepEqual(sockets[0].sent[0].setup.inputAudioTranscription.customVocabulary, ['Sutando']);
+		await p.stop();
+	});
+
 	it('buffers audio until setup completes', async () => {
 		const { p, sockets } = makeProvider();
 		await p.start();

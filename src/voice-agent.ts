@@ -1128,6 +1128,8 @@ async function main() {
 
 	const meetingTranscriber = new GeminiLiveTranscribeSTTProvider({
 		apiKey: GEMINI_VOICE_API_KEY,
+		// The exit phrase names Sutando; without the hint it transcribes as "Siddhartha"/"Sutanu".
+		customVocabulary: ['Sutando'],
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
 
