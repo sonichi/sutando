@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/learning-window/scripts'))
 from readback_adapter import capture_person, parse_person, capture_inventory
 from unittest.mock import patch
-from document_effect import digest, verify, compare_inventory
+from document_effect import digest, compare_inventory
 NOW = 1791200000
 
 
@@ -40,12 +40,10 @@ class ReadbackTests(unittest.TestCase):
             with self.assertRaises(ValueError): parse_person(value, 'person', 'adapter-id', NOW)
 
     def test_readbacks_delegate_to_effect_classifier_without_fact_success(self):
-        before = parse_person(response(), 'person', 'adapter-id', NOW - 1)
-        after = parse_person(response('old context\nnew claim'), 'person', 'adapter-id', NOW)
-        planned = {'store_identity': 'adapter-id', 'document_sha256': after['document_sha256'],
-                   'candidates': [{'candidate_id': 'candidate', 'text': 'new claim'}]}
-        effect = verify(before, after, planned, NOW)
-        self.assertEqual(effect['newly_present_candidate_ids'], ['candidate'])
+        before = {'readback': 'verified', **parse_person(response(), 'person', 'adapter-id', NOW - 1)}
+        after = {'readback': 'verified', **parse_person(response('old context\nnew claim'), 'person', 'adapter-id', NOW)}
+        effect = compare_inventory({'person': before}, {'person': after})['person']
+        self.assertEqual(effect['physical_retention'], 'changed_unattributed')
         self.assertEqual(effect['semantic_accuracy'], 'unknown')
 
     def test_retention_refuses_stale_reversed_or_missing_observations(self):
