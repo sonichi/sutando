@@ -518,7 +518,7 @@ class TestOwnershipIsScopedToThisSession(Base):
     def test_a_detached_watcher_on_this_inbox_is_not_this_sessions(self):
         """The real shape: a watcher reparented away from this session."""
         script = self.ws / "watch-tasks-stream.sh"
-        script.write_text("#!/bin/sh\nsleep 30\n")
+        script.write_text(STABLE_WATCHER_BODY)
         out = subprocess.run(
             ["bash", "-c", f'nohup bash "{script}" "{self.inbox}" >/dev/null 2>&1 & echo $!'],
             capture_output=True, text=True, check=True).stdout.strip()
@@ -539,33 +539,105 @@ class TestOwnershipIsScopedToThisSession(Base):
         self.assertIn("not started by this session", why)
 
 
+# The trailing no-op stops bash exec'ing `sleep` in place, which would turn the
+# pid's argv into ["sleep", "30"] while the gate may still re-read it.
+STABLE_WATCHER_BODY = "#!/bin/sh\nsleep 30; :\n"
+
+
 def _wait_for_exec(pid, script, read_argv, tries=250, delay=0.02):
-    """True once pid's argv names script: a readable argv may still be the forked
-    `bash -c`/nohup stage, which the gate rightly calls not-a-watcher."""
+    """True once the production classifier accepts pid's argv as this script's
+    watcher; the forked `bash -c` and `nohup` stages are both rejected."""
+    import watcher_identity
     for _ in range(tries):
         argv = read_argv(pid)
-        if argv is not None and any(a == script for a in argv):
-            return True
+        if argv is not None and len(argv) >= 2 and argv[1] == script:
+            v = watcher_identity.classify_argv(" ".join(argv), pid, lambda _p: argv)
+            if v.watcher is True:
+                return True
         time.sleep(delay)
     return False
 
 
+STAGES = [None, ["bash", "-c", "nohup bash /w/watch-tasks-stream.sh /in &"],
+          ["nohup", "bash", "/w/watch-tasks-stream.sh", "/in"],
+          ["bash", "/w/watch-tasks-stream.sh", "/in"]]
+
+
+def _staged(seq):
+    it = iter(seq)
+    seen = []
+
+    def read(_pid):
+        v = next(it)
+        seen.append(v)
+        return v
+    return read, seen
+
+
 class TestWaitForExec(unittest.TestCase):
-    def test_a_pre_exec_argv_is_not_taken_as_the_watcher(self):
-        stages = iter([None, ["bash", "-c", "nohup bash /w/watch-tasks-stream.sh /in &"],
-                       ["nohup", "bash", "/w/watch-tasks-stream.sh", "/in"],
-                       ["bash", "/w/watch-tasks-stream.sh", "/in"]])
-        seen = []
-        def read(_pid):
-            v = next(stages)
-            seen.append(v)
-            return v
+    def test_consumes_every_pre_exec_stage_before_returning(self):
+        read, seen = _staged(STAGES)
         self.assertTrue(_wait_for_exec(1, "/w/watch-tasks-stream.sh", read, delay=0))
-        self.assertEqual(len(seen), 3, "returned before the exec landed")
+        self.assertEqual(len(seen), 4, "returned before the final exec landed")
+
+    def test_a_sequence_that_ends_at_nohup_is_not_a_watcher(self):
+        read, _ = _staged(STAGES[:3] + [STAGES[2]] * 5)
+        self.assertFalse(_wait_for_exec(1, "/w/watch-tasks-stream.sh", read, tries=8, delay=0))
 
     def test_gives_up_when_argv_never_names_the_script(self):
         self.assertFalse(_wait_for_exec(1, "/w/x.sh", lambda _p: ["bash", "-c", "x"],
                                         tries=3, delay=0))
+
+    def test_an_exec_into_the_last_command_is_rejected_by_the_classifier(self):
+        import watcher_identity
+        after = ["sleep", "30"]
+        v = watcher_identity.classify_argv(" ".join(after), 1, lambda _p: after)
+        self.assertIsNot(v.watcher, True)
+
+
+class TestFixtureWatcherArgvIsStable(unittest.TestCase):
+    """The detached fixture must keep the shell-plus-script argv for as long as
+    the gate may re-read it, not just at the moment the wait returns."""
+
+    def _spawn(self, body):
+        ws = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(ws)], capture_output=True))
+        script = ws / "watch-tasks-stream.sh"
+        script.write_text(body)
+        out = subprocess.run(
+            ["bash", "-c", f'nohup bash "{script}" "{ws}" >/dev/null 2>&1 & echo $!'],
+            capture_output=True, text=True, check=True).stdout.strip()
+        pid = int(out)
+        self.addCleanup(lambda: subprocess.run(["kill", str(pid)], capture_output=True))
+        return pid, str(script)
+
+    def _samples(self, pid, n=6, gap=0.1):
+        import watcher_identity
+        out = []
+        for _ in range(n):
+            argv = watcher_identity.proc_argv_vector(pid)
+            out.append(argv if argv is None else
+                       watcher_identity.classify_argv(" ".join(argv), pid, lambda _p: argv).watcher)
+            time.sleep(gap)
+        return out
+
+    def test_the_stable_body_stays_a_watcher_while_it_sleeps(self):
+        import watcher_identity
+        pid, script = self._spawn(STABLE_WATCHER_BODY)
+        if not _wait_for_exec(pid, script, watcher_identity.proc_argv_vector):
+            self.skipTest("no authoritative argv read on this platform")
+        self.assertEqual(self._samples(pid), [True] * 6)
+
+    def test_a_bare_sleep_body_shows_the_boundary_the_stable_body_avoids(self):
+        import watcher_identity
+        pid, script = self._spawn("#!/bin/sh\nsleep 30\n")
+        if not _wait_for_exec(pid, script, watcher_identity.proc_argv_vector):
+            self.skipTest("no authoritative argv read on this platform")
+        samples = self._samples(pid)
+        if False not in samples:
+            self.skipTest("this shell does not exec its last command in place")
+        # The pid stopped reading as a watcher mid-sleep: the hazard the
+        # stable body removes.
 
 
 class TestTheShippedStartupNamesTheInbox(Base):
@@ -696,7 +768,7 @@ class TestThroughTheProcessInspectionBoundary(Base):
 
     def test_a_genuine_watcher_on_this_inbox_is_skipped(self):
         script = self.ws / "watch-tasks-stream.sh"
-        script.write_text("#!/bin/sh\nsleep 30\n")
+        script.write_text(STABLE_WATCHER_BODY)
         p = self._spawn(["bash", str(script), self.inbox])
         import watcher_identity
         if watcher_identity.proc_argv_vector(p.pid) is None:
@@ -706,7 +778,7 @@ class TestThroughTheProcessInspectionBoundary(Base):
 
     def test_a_genuine_watcher_on_another_inbox_starts_ours(self):
         script = self.ws / "watch-tasks-stream.sh"
-        script.write_text("#!/bin/sh\nsleep 30\n")
+        script.write_text(STABLE_WATCHER_BODY)
         p = self._spawn(["bash", str(script), str(self.ws / "deliveries" / OTHER)])
         import watcher_identity
         if watcher_identity.proc_argv_vector(p.pid) is None:
