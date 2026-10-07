@@ -323,6 +323,44 @@ class TestSweep(Base):
         self.assertTrue(accepted.exists())
 
 
+class TestAliasRefused(Base):
+    """The writer refuses to publish through a recipient-named symlink: a record
+    would otherwise land in the TARGET's folder under this recipient's name."""
+
+    A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    def _root(self):
+        return pd.done_flag(self.ws.root, self.B, "task-0aliased000000000").parent.parent.parent
+
+    def _alias(self):
+        root = self._root()
+        (root / self.B / "done").mkdir(parents=True)
+        (root / self.A).symlink_to(root / self.B)
+        return root
+
+    def test_mark_done_through_an_aliased_recipient_dir_writes_nothing(self):
+        root = self._alias()
+        for published in (False, True):
+            with self.assertRaises(pd.RecipientAliasError):
+                pd.mark_done(self.ws.root, self.A, "task-0aliased000000001", published=published)
+        self.assertEqual(sorted(p.name for p in (root / self.B / "done").iterdir()), [],
+                         "a record was published into B's folder under A's name")
+
+    def test_an_aliased_done_dir_is_refused_too(self):
+        root = self._root()
+        (root / self.B / "done").mkdir(parents=True)
+        (root / self.A).mkdir()
+        (root / self.A / "done").symlink_to(root / self.B / "done")
+        with self.assertRaises(OSError):
+            pd.mark_done(self.ws.root, self.A, "task-0aliased000000002", published=True)
+        self.assertEqual(list((root / self.B / "done").iterdir()), [])
+
+    def test_control_a_real_recipient_dir_still_publishes(self):
+        pd.mark_done(self.ws.root, self.B, "task-0aliased000000003", published=True)
+        self.assertTrue(pd.done_flag(self.ws.root, self.B, "task-0aliased000000003").exists())
+
+
 class TestPayload(Base):
     def test_reads_the_bridges_task_file_as_text(self):
         self.ws.payload("task-1", "write the docs")
@@ -763,6 +801,22 @@ class TestMarkDoneCli(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(pd.is_done_flag(pd.done_flag(self.root, "worker-3", "task-1")))
 
+    def test_prune_spent_cli_retires_a_finished_sentinel_but_keeps_inflight_work(self):
+        self.ws.payload("task-finished")
+        finished = pd.accept(self.ws.deliver("worker-3", "task-finished"))
+        self.ws.result("task-finished")
+        pd.mark_done(self.root, "worker-3", "task-finished", published=True)
+        self.ws.payload("task-inflight")
+        inflight = pd.accept(self.ws.deliver("worker-3", "task-inflight"))
+
+        rc, out = self._main("prune-spent")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), {"retired": ["task-finished"],
+                                           "stale": [], "kept": ["task-inflight"]})
+        self.assertFalse(finished.exists())
+        self.assertTrue(inflight.exists())
+
 
 class TestClearPending(Base):
     """A hold the worker will not finish is withdrawn; a finish is never undone."""
@@ -829,10 +883,12 @@ class TestClearPending(Base):
         self.ws.deliver("worker-3", "task-1"); self.ws.payload("task-1")
         pd.mark_done(self.root, "worker-3", "task-1", published=False)
         seen = {}
-        real_find = pd.find
+        real_find_in = pd.find_in
 
-        def find_under_scrutiny(workspace, recipient, task_id):
-            with open(pd.deliveries_dir(workspace, recipient) / pd.LOCK_NAME, "a+") as fh:
+        def find_under_scrutiny(dir_fd, task_id):
+            # The body reads through the anchored `find_in`; the lock is the same
+            # file, so a path-opened probe still tells whether it is held.
+            with open(pd.deliveries_dir(self.root, "worker-3") / pd.LOCK_NAME, "a+") as fh:
                 try:
                     fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
@@ -840,11 +896,11 @@ class TestClearPending(Base):
                 else:
                     fcntl.flock(fh, fcntl.LOCK_UN)
                     seen["held"] = False
-            return real_find(workspace, recipient, task_id)
+            return real_find_in(dir_fd, task_id)
 
-        with mock.patch.object(pd, "find", find_under_scrutiny):
+        with mock.patch.object(pd, "find_in", find_under_scrutiny):
             pd.clear_pending(self.root, "worker-3", "task-1")
-        self.assertIs(seen.get("held"), True, "find ran outside the arbitration lock")
+        self.assertIs(seen.get("held"), True, "find_in ran outside the arbitration lock")
         self.assertIsNone(pd.find(self.root, "worker-3", "task-1"))
 
     def test_abandon_leaves_a_finished_delivery_for_the_sweep(self):

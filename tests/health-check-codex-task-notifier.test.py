@@ -111,14 +111,14 @@ class CodexTaskNotifierHealthTests(unittest.TestCase):
 
     def test_bare_watcher_can_be_green_while_managed_notifier_is_missing(self):
         self.write_local_core()
-        (self.state / "watch-tasks-stream.pid").write_text("4242")
+        (self.state / "watch-tasks-stream.pid").write_text("4194305")
         tmux = FakeTmux(panes=None)
         with (
             mock.patch.object(
                 hc, "_proc_argv", return_value="bash src/watch-tasks-stream.sh"
             ),
             mock.patch.object(
-                hc, "_watcher_trees", return_value={"4200": {"4200", "4242"}}
+                hc, "_watcher_trees", return_value={"4200": {"4200", "4194305"}}
             ),
             # check_task_watcher() returns early when ps is unavailable, so
             # without this the generic assertion measures the host, not the code.

@@ -38,6 +38,8 @@ def _load(base):
     m = importlib.reload(mod)
     # hermetic: the channel .env fallback must not leak this host's identity
     m._config_from_channel_env = lambda *a, **k: ""
+    # health rides on the same POST; tests/gateway-health-push.test.py pins it
+    m._health_snapshot = lambda: None
     return m
 
 
@@ -91,6 +93,26 @@ def test_boot_pushes_workers_and_a_card_carrying_them():
         assert calls[1][2]["workers"] == _record()["profile_workers"]
         assert calls[1][2]["display"]["name"] == "Sutando", "card keeps identity"
         print("PASS test_boot_pushes_workers_and_a_card_carrying_them")
+
+
+def test_a_record_with_a_report_posts_the_report_so_retired_workers_are_known():
+    """Only the report carries per-worker state; the legacy snapshot shows a
+    retired worker to the broker as just another labelled id."""
+    W2 = "b" * 32
+    rec = _record()
+    rec["report"] = {"ts": 1, "roster_version": 3,
+                     "workers": [{"id": W1, "state": "live"},
+                                 {"id": W2, "state": "retired"}],
+                     "applied": {"labels": {W1: "reviewer"}, "bindings": {}}}
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        m = _load(base)
+        _advertise(m, rec)
+        calls = _capture(m)
+        assert m._maybe_push_workers_snapshot(m._advertisement_or_none()) is True
+        assert calls[0][1] == "/v1/workers"
+        assert calls[0][2] == rec["report"], calls[0][2]
+        print("PASS test_a_record_with_a_report_posts_the_report_so_retired_workers_are_known")
 
 
 def test_a_missing_file_pushes_nothing_at_all():
@@ -515,25 +537,55 @@ def test_the_identity_is_one_path_segment():
 def test_an_unchanged_pool_is_resent_on_the_cadence_so_a_restarted_broker_heals():
     """Production 2026-09-12: the broker redeployed at 07:43Z after the last
     snapshot push at 22:58Z and the picker stayed empty, because nothing here
-    changed. Both halves must go again on the cadence, unchanged or not."""
+    changed. Both halves must go again on the cadence, unchanged or not. A body
+    carrying health also refreshes every WORKERS_REFRESH_S for the broker's staleness."""
     with tempfile.TemporaryDirectory() as d:
         base = pathlib.Path(d)
         os.environ["AGENT_CONNECT_STATE_DIR"] = str(base / "state")
         (base / "state").mkdir(parents=True, exist_ok=True)
         m = _load(base)
-        _advertise(m, _record())
+        m._health_snapshot = lambda: {"suspended": None, "agents": [
+            {"id": W1, "role": "worker", "alive": True, "motion": "idle", "condition": "healthy"}]}
+        _advertise(m, {**_record(), "report": {"ts": 1, "workers": [{"id": W1, "state": "live"}]}})
         clock = [1000.0]
         m._now = lambda: clock[0]
         calls = _capture(m)
         m._push_pool_advertisement_now()
         assert [c[0] for c in calls] == ["POST", "PUT"], calls
         calls.clear()
-        clock[0] += 60
+        clock[0] += m.WORKERS_REFRESH_S - 1
         m._push_pool_advertisement_now()
         assert calls == [], "within the cadence and unchanged: nothing resent"
+        clock[0] += 1
+        m._push_pool_advertisement_now()
+        assert [c[0] for c in calls] == ["POST"], "the workers report refreshes for the broker's staleness window"
+        calls.clear()
         clock[0] += m._REPUSH_EVERY_S
         m._push_pool_advertisement_now()
         assert [c[0] for c in calls] == ["POST", "PUT"], "past the cadence: both halves resent unchanged"
+
+
+def test_without_health_the_workers_body_keeps_the_slow_cadence():
+    """Only a body carrying health has the broker's 120 s staleness; a standalone
+    sparrow (no health snapshot) re-sends its unchanged body on the 600 s cadence only."""
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        os.environ["AGENT_CONNECT_STATE_DIR"] = str(base / "state")
+        (base / "state").mkdir(parents=True, exist_ok=True)
+        m = _load(base)
+        m._health_snapshot = lambda: None
+        _advertise(m, _record())
+        clock = [1000.0]
+        m._now = lambda: clock[0]
+        calls = _capture(m)
+        m._push_pool_advertisement_now()
+        calls.clear()
+        clock[0] += m.WORKERS_REFRESH_S * 3
+        m._push_pool_advertisement_now()
+        assert calls == [], "no health: no 20 s refresh"
+        clock[0] += m._REPUSH_EVERY_S
+        m._push_pool_advertisement_now()
+        assert [c[0] for c in calls] == ["POST", "PUT"], calls
 
 
 def test_a_fifo_with_no_writer_is_unavailable_not_a_wedged_loop():
@@ -779,6 +831,7 @@ def test_shutdown_holds_the_lock_until_no_publication_can_complete():
 
 if __name__ == "__main__":
     test_boot_pushes_workers_and_a_card_carrying_them()
+    test_a_record_with_a_report_posts_the_report_so_retired_workers_are_known()
     test_a_missing_file_pushes_nothing_at_all()
     test_malformed_json_pushes_nothing_and_keeps_the_prior_snapshot()
     test_a_deleted_file_after_a_good_push_changes_nothing()
@@ -802,6 +855,7 @@ if __name__ == "__main__":
     test_one_beat_publishes_one_revision_even_if_the_file_changes_mid_beat()
     test_the_identity_is_one_path_segment()
     test_an_unchanged_pool_is_resent_on_the_cadence_so_a_restarted_broker_heals()
+    test_without_health_the_workers_body_keeps_the_slow_cadence()
     test_the_hand_off_returns_before_its_requests_complete()
     test_an_in_flight_push_is_skipped_not_queued()
     test_a_failing_background_push_is_logged_not_silent()

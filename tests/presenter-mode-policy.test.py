@@ -92,7 +92,7 @@ consumers = {
     "slack": (REPO / "src" / "slack-bridge.py", "presenter_mode_active(REPO)"),
     "telegram": (REPO / "src" / "telegram-bridge.py", "presenter_mode_active(REPO)"),
     "pending questions": (
-        REPO / "src" / "check-pending-questions.py",
+        REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_remind.py",
         "presenter_mode_active(WORKSPACE)",
     ),
 }

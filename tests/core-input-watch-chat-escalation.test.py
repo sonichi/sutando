@@ -11,6 +11,7 @@ right states, an episode key the Manager can dedup on, resolution when the
 core moves on, and never dying of its own escalation.
 """
 import importlib.util as u
+import json
 import os
 import pathlib
 import sys
@@ -178,6 +179,110 @@ class TestResolve(unittest.TestCase):
         M.resolve_escalations(m, "s")
         again = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
         self.assertNotEqual(first.id, again.id)
+
+
+_FOOTER = ("────────\n❯ \n────────\n"
+           "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+_LOGIN_EXPIRED = "Login expired · Please run /login"
+_LOGIN_REFUSED = f"❯ /startup\n  ⎿  {_LOGIN_EXPIRED}\n✻ Worked for 0s\n"
+_REAL_TURN = ("❯ /startup\n● /startup complete: watcher streaming, 3 crons registered.\n"
+              "✻ Worked for 2m 14s · done 12:55 PM\n")
+
+
+class TestSignedOutCardNeedsProof(unittest.TestCase):
+    """User feedback 2026-09-29 (P1-41): a "session expired" card read "✓ Resolved — Sutando
+    has continued its work" while the worker still refused every turn in 0 s. Leaving the
+    blocked set is not recovery for a signed-out card; a turn that ran is."""
+
+    def _signed_out(self, m, session="s"):
+        state, detail, prompt, kind = M.compose_state(_LOGIN_REFUSED + _FOOTER, "idle", True)
+        self.assertEqual((state, kind), ("logged-out", "login"), "fixture no longer reads signed out")
+        return M.escalate(m, state, detail, kind, prompt, session)
+
+    def test_the_card_is_the_auth_card(self):
+        r = self._signed_out(_mgr())
+        self.assertEqual(r.kind, "auth")
+        self.assertIn("authenticate", [a.kind for a in r.actions])
+
+    def test_a_newer_typed_prompt_does_not_resolve_it(self):
+        # The pool typed at the seat again: the refusal is no longer the last turn, the seat
+        # is exactly as signed out. Old code resolved here.
+        m = _mgr()
+        r = self._signed_out(m)
+        pane = _LOGIN_REFUSED + _FOOTER.replace("❯ \n", "❯ try again\n", 1)
+        self.assertEqual(M.resolve_escalations(m, "s", pane), [])
+        self.assertEqual([x.id for x in m.active()], [r.id])
+
+    def test_an_empty_capture_does_not_resolve_it(self):
+        m = _mgr()
+        r = self._signed_out(m)
+        for pane in (None, "", _FOOTER):
+            self.assertEqual(M.resolve_escalations(m, "s", pane), [], repr(pane))
+        self.assertEqual([x.id for x in m.active()], [r.id])
+
+    def test_a_turn_that_ran_resolves_it(self):
+        m = _mgr()
+        r = self._signed_out(m)
+        self.assertEqual(M.resolve_escalations(m, "s", _LOGIN_REFUSED + _REAL_TURN + _FOOTER), [r.id])
+        self.assertEqual(m.get(r.id).status, STATUS_RESOLVED)
+
+    def test_login_successful_resolves_it(self):
+        m = _mgr()
+        r = self._signed_out(m)
+        self.assertEqual(M.resolve_escalations(m, "s", _LOGIN_REFUSED + "  ⎿  Login successful\n" + _FOOTER),
+                         [r.id])
+
+    def test_other_cards_of_the_session_still_resolve_on_the_same_tick(self):
+        m = _mgr()
+        held = self._signed_out(m)
+        other = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
+        self.assertEqual(M.resolve_escalations(m, "s", _FOOTER), [other.id])
+        self.assertEqual([x.id for x in m.active()], [held.id])
+
+
+class TestSignedOutSeatAcrossTicks(unittest.TestCase):
+    """The monitor loop itself, one --once tick per pane, against a real store: the card
+    a refused login raises survives the re-armed seat's next prompt and closes only on a
+    turn that ran. The middle tick is the one the old code resolved."""
+
+    def _tick(self, out, pane, health="idle"):
+        from unittest.mock import patch
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": health}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--session", "sutando-worker-1",
+                "--out", out, "--once", "--stable", "1", "--seat", "worker comm"]
+        with patch.object(M, "capture", lambda s, sess: pane), \
+                patch.object(M, "_load_runtime_health", lambda: _RH()), \
+                patch.object(M, "gateway_alive", lambda *a: True), \
+                patch.object(M, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(sys, "argv", argv):
+            M.main()
+        with open(out) as f:
+            return json.load(f)
+
+    def test_the_card_holds_until_a_turn_ran(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "state", "core-supervisor.sutando-worker-1.json")
+            os.makedirs(os.path.dirname(out))
+            m = M._hitl_manager(out)
+            sig = self._tick(out, _LOGIN_REFUSED + _FOOTER)
+            self.assertEqual((sig["state"], sig["kind"]), ("logged-out", "login"))
+            [card] = m.active()
+            self.assertEqual(card.kind, "auth")
+            self.assertEqual(card.device["name"], "worker comm")
+            sig = self._tick(out, _LOGIN_REFUSED + _FOOTER.replace("❯ \n", "❯ try again\n", 1))
+            self.assertEqual(sig["state"], "logged-out")
+            self.assertEqual([r.id for r in m.active()], [card.id], "re-armed seat closed the card")
+            sig = self._tick(out, _LOGIN_REFUSED + _LOGIN_REFUSED + _FOOTER, health="working")
+            self.assertEqual([r.id for r in m.active()], [card.id], "a second refusal is the same episode")
+            sig = self._tick(out, _LOGIN_REFUSED + _REAL_TURN + _FOOTER)
+            self.assertEqual(sig["state"], "idle-ready")
+            self.assertEqual(m.active(), [])
+            self.assertEqual(m.get(card.id).status, STATUS_RESOLVED)
 
 
 class TestScope(unittest.TestCase):

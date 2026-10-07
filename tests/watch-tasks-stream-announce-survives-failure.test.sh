@@ -27,17 +27,23 @@ EOF
 chmod +x "$HANDLER"
 
 run_sweep() {
-  local outfile="$TMP/sweep.out" pid i
+  local outfile="$TMP/sweep.out" pid i status=timed_out
   : > "$outfile"
   set -m
   SUTANDO_INBOX_RESOLVER="$RESOLVER" SUTANDO_WORKSPACE_DIR="$WS" \
     SUTANDO_RESULTS_DIR="$WS/results" SUTANDO_INSTANCE=w-test \
     SUTANDO_TASK_EVENT_HANDLER="$HANDLER" \
-    bash "$REPO/src/watch-tasks-stream.sh" "$INBOX" > "$outfile" 2>"$TMP/sweep.err" &
+    bash "$REPO/src/watch-tasks-stream.sh" "$INBOX" --role standby --inbox "$INBOX" > "$outfile" 2>"$TMP/sweep.err" &
   pid=$!
   set +m
   # A failed handler run takes a beat: probe, queue, spawn the real run, HANDLER_DONE.
-  for i in $(seq 1 60); do grep -q 'TASK_FILE:' "$outfile" 2>/dev/null && break; sleep 0.25; done
+  for i in $(seq 1 60); do
+    grep -q 'TASK_FILE:' "$outfile" 2>/dev/null && { status=emitted; break; }
+    sleep 0.25
+  done
+  # A var assigned here never reaches the caller: $(run_sweep) is a subshell.
+  # A file does, the same way sweep.out/.err already cross that boundary.
+  printf '%s %s\n' "$i" "$status" > "$TMP/poll.iters"
   kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
   grep 'TASK_FILE:' "$outfile" 2>/dev/null | head -1
@@ -46,7 +52,17 @@ run_sweep() {
 line="$(run_sweep)"
 echo "  watcher emitted after handler failure: ${line:-<nothing>}"
 [ "$line" = "TASK_FILE: $PAYLOAD" ]
-check $? "a failed handler's fallback emission still names the resolved payload path"
+rc=$?
+check $rc "a failed handler's fallback emission still names the resolved payload path"
+# 2>/dev/null on sed would make a missing file print as silently empty.
+dump_file() { [ -f "$1" ] && sed 's/^/    /' "$1" || echo "    <file missing: $1>"; }
+# timed_out at 60 vs emitted at N< 60: a wrong path caught early looks nothing
+# like a genuine no-emission timeout, and only the loop's own record can say which.
+if [ "$rc" != "0" ]; then
+  echo "  poll loop: $(cat "$TMP/poll.iters" 2>/dev/null || echo "<poll.iters missing>")/60"
+  echo "  watcher stdout:"; dump_file "$TMP/sweep.out"
+  echo "  watcher stderr:"; dump_file "$TMP/sweep.err"
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then echo "PASS — $pass checks green"; else echo "FAIL — $fail failed, $pass passed"; exit 1; fi

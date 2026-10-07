@@ -278,6 +278,20 @@ class Cloud:
             raise cloud_auth.CloudError(0, "network", str(exc)) from None
         return data if isinstance(data, dict) else {}
 
+    def post(self, path: str, body: dict | None = None) -> dict:
+        """One authenticated POST; the same error mapping as `get`."""
+        if not self.signed_in():
+            raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+        try:
+            data = self._request(self.base or cloud_auth.DEFAULT_CLOUD_ORIGIN, self.token, "POST", path, body or {})
+        except cloud_auth.CloudError as exc:
+            if exc.status == 401:
+                self.token = None
+            raise
+        except (OSError, ValueError) as exc:
+            raise cloud_auth.CloudError(0, "network", str(exc)) from None
+        return data if isinstance(data, dict) else {}
+
     def user_id(self) -> str | None:
         """The signed-in account's id, with auth re-read so a sign-in as someone else is seen."""
         self.token = None
@@ -1010,7 +1024,10 @@ def cmd_status(
     rows = cloud.connection_rows(cached=True)
     connections = [
         {"id": r.get("id"), "toolkit": r.get("toolkit"), "name": r.get("name"), "status": r.get("status"),
-         "accountLabel": r.get("accountLabel")}
+         "accountLabel": r.get("accountLabel"),
+         # The account the agent uses for the app unless a call names another
+         # (agent-universe #279). None: the cloud predates the flag.
+         "isDefault": r.get("isDefault")}
         for r in rows
         if isinstance(r, dict)
     ]
@@ -1029,6 +1046,55 @@ def cmd_status(
     }
     emit(payload)
     return EXIT_OK if payload["all_connected"] else EXIT_NO
+
+
+def pick_account(rows: list, toolkit: str, account: str) -> tuple[dict | None, str, list]:
+    """The active connection of `toolkit` the owner means by `account`: its id, its label
+    (case-insensitive), or a substring of exactly one label. Returns (row, reason, candidates);
+    reason is '' on a match, else no_match / ambiguous / none (nothing connected) / no_id (the
+    account meant carries no id, so nothing can be posted for it)."""
+    active = [r for r in rows if isinstance(r, dict) and str(r.get("toolkit") or "").lower() == toolkit
+              and r.get("status") == "active"]
+    cands = [{"id": r.get("id"), "accountLabel": r.get("accountLabel"), "isDefault": r.get("isDefault")}
+             for r in active]
+    if not active:
+        return None, "none", cands
+    sel = (account or "").strip()
+    low = sel.lower()
+    match = next((r for r in active if sel and r.get("id") == sel), None)
+    if match is None:
+        exact = [r for r in active if str(r.get("accountLabel") or "").lower() == low]
+        partial = [r for r in active if low and low in str(r.get("accountLabel") or "").lower()]
+        if len(exact) == 1:
+            match = exact[0]
+        elif len(partial) == 1:
+            match = partial[0]
+        else:
+            return None, ("ambiguous" if len(exact) > 1 or len(partial) > 1 else "no_match"), cands
+    if not (isinstance(match.get("id"), str) and match["id"].strip()):
+        return None, "no_id", cands
+    return match, "", cands
+
+
+def cmd_set_default(ws: Path, cloud: Cloud, args: argparse.Namespace, **_: Any) -> int:
+    """Make one of the app's connected accounts the one the agent uses unless told otherwise
+    (agent-universe #279, POST /api/connectors/<id>/default). Exit 1 with the candidates when the
+    account is unknown, the name fits several, or the row has no id, so the caller can ask the
+    owner which one. The cache is refreshed after the write, so `status` shows the new default."""
+    toolkit = _require(args.slug, SLUG_RE, "toolkit").lower()
+    rows = cloud.connection_rows()
+    row, reason, cands = pick_account(rows, toolkit, args.account)
+    if row is None:
+        emit({"toolkit": toolkit, "ok": False, "reason": reason, "candidates": cands})
+        return EXIT_NO
+    if row.get("isDefault") is None:
+        raise Setup("unsupported", "This AG2 Cloud has no default accounts yet; the newest account is used.")
+    cloud.post(f"/api/connectors/{row.get('id')}/default")
+    # The read cache would serve the old default to `status` until its TTL; the write refreshes it.
+    (cloud.cache or ConnectCache(ws)).put_connections(cloud.connection_rows())
+    emit({"toolkit": toolkit, "ok": True, "account": {"id": row.get("id"), "accountLabel": row.get("accountLabel")},
+          "candidates": cands})
+    return EXIT_OK
 
 
 def _require(value: str, pattern: re.Pattern, what: str) -> str:
@@ -1458,6 +1524,9 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status")
     s.add_argument("slugs", nargs="*")
     s.add_argument("--room", help="only this room's waits")
+    d = sub.add_parser("set-default", help="make one of an app's accounts the one the agent uses")
+    d.add_argument("slug", help="the app, e.g. gmail")
+    d.add_argument("account", help="the account: its label (me@work.com), part of it (work), or its id")
     a = sub.add_parser("await")
     a.add_argument("slugs", nargs="+")
     a.add_argument("--room", required=True)
@@ -1504,7 +1573,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {"find": cmd_find, "status": cmd_status, "await": cmd_await, "card": cmd_card, "claim": cmd_claim,
-            "verify-account": cmd_verify_account, "note": cmd_note}
+            "verify-account": cmd_verify_account, "note": cmd_note, "set-default": cmd_set_default}
 
 
 def main(

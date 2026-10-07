@@ -503,8 +503,8 @@ start_gateway_lanes() {
           echo "  ✓ gateway bridge (launchd-supervised)"
           _gw_supervised=1
         else
-          # Loaded is not the same as running: the wrapper exits 0 when the token
-          # is removed, leaving an idle job. Bring it back when credentials return.
+          # Loaded is not the same as running: the wrapper exits 0 only when no
+          # token is configured, leaving an idle job. Bring it back when one exists.
           launchctl kickstart -k "gui/$(id -u)/$_GW_LABEL" > /dev/null 2>&1 || true
           for _ in $(seq 1 12); do
             [ -n "$(_gw_job_pid)" ] && { _gw_supervised=1; break; }

@@ -2,7 +2,8 @@
 """Morning briefing for Sutando.
 
 Runs daily at 6:57am via cron. No external credentials needed.
-Sources: weather (Open-Meteo), macOS Calendar, macOS Reminders,
+Sources: weather (Open-Meteo), the agent-written Google-calendar cache, macOS
+Calendar + Reminders (owner opt-in only: they raise a macOS permission prompt),
 overnight Discord DMs, pending questions, system health.
 
 Output: results/proactive-<ts>.txt (voice speaks it) + Discord DM.
@@ -17,6 +18,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 from urllib.request import urlopen
 from urllib.error import URLError
 
@@ -27,6 +29,13 @@ sys.path.insert(0, str(_SRC_DIR))
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import personal_path  # noqa: E402
 
+_MACOS_TOOLS_SCRIPTS = _SRC_DIR.parent / "skills" / "macos-tools" / "scripts"
+sys.path.insert(0, str(_MACOS_TOOLS_SCRIPTS))
+try:
+    import native_pim_consent as consent  # noqa: E402  (the one denial/opt-in policy)
+except ImportError:  # the skill is optional: without it the local apps are simply not read
+    consent = None
+
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
 STATE_DIR = WORKSPACE / "state"
@@ -35,6 +44,29 @@ STATE_DIR = WORKSPACE / "state"
 # standalone script cannot reach the Station connector, but the core agent can —
 # it writes today's events here during the morning cron. See get_calendar_events.
 CALENDAR_CACHE_FILE = STATE_DIR / "calendar-today.json"
+
+# Why the calendar came back None, when the owner can act on it; None = plain "couldn't read".
+CALENDAR_UNREAD_NOTE: str | None = None
+NO_CALENDAR_SOURCE_NOTE = (
+    "I couldn't read your calendar: no calendar source is configured. "
+    "Connect Google Calendar via Settings → Integrations, or set "
+    "MORNING_BRIEFING_CALENDAR_SOURCE=macos to use the local Calendar app."
+)
+NO_MACOS_TOOLS_NOTE = (
+    "I couldn't read your calendar: the local Calendar app needs the macos-tools skill, "
+    "which is not installed. Connect Google Calendar via Settings → Integrations."
+)
+CALENDAR_DENIED_NOTE = (
+    "I couldn't read your calendar: macOS denied Calendar access "
+    "(System Settings → Privacy & Security → Automation); I won't ask again."
+)
+# Why reminders came back None, when the owner can act on it; None = say nothing extra.
+REMINDERS_UNREAD_NOTE: str | None = None
+NO_REMINDERS_SOURCE_NOTE = (
+    "Reminders not read: the local Reminders app is opt-in "
+    "(set MORNING_BRIEFING_CALENDAR_SOURCE=macos to include it)."
+)
+NO_REMINDERS_SKILL_NOTE = "Reminders not read: the local Reminders app needs the macos-tools skill."
 
 # Weather codes → one-word description
 WEATHER_CODES = {
@@ -234,38 +266,54 @@ def _next_event(events: list[dict], now=None):
     return min(future, key=lambda pair: pair[0])[1] if future else None
 
 
-def get_calendar_events() -> list[dict] | None:
-    """Get today's calendar events, preferring the owner's real Google calendar.
+def _calendar_source() -> str:
+    from sutando_config import config_get_env_first
+    return (config_get_env_first("MORNING_BRIEFING_CALENDAR_SOURCE", "") or "").strip().lower()
 
-    Source preference:
+
+def _native_pim_opted_in() -> bool:
+    """Owner opt-in for the local Calendar/Reminders apps. They raise a macOS
+    permission prompt, so an unattended cron never touches them unasked."""
+    if _calendar_source() == "macos":
+        return True
+    if consent is None:
+        return False
+    return consent.env_allows() or consent.consent_marker(STATE_DIR).exists()
+
+
+def _calendar_denied_marker() -> Path:
+    return consent.denial_marker("Calendar", STATE_DIR)
+
+
+def get_calendar_events() -> list[dict] | None:
+    """Today's calendar events, or None when no source could be read.
+
+    Source order:
       1. The Google-calendar cache (``state/calendar-today.json``) written by the
-         core agent — the ONLY source that sees the owner's Google Workspace
-         calendar, which a local macOS Calendar.app may not have subscribed.
-      2. Local macOS Calendar.app via AppleScript (fallback). An EMPTY result
-         from this source is only trusted on hosts that have never written a
-         Google cache; where one exists, empty means blind, so None is returned.
+         core agent from the Station connector — the default, and the ONLY source
+         that sees the owner's Google Workspace calendar.
+      2. Local macOS Calendar.app via AppleScript — only when the owner opted in
+         with ``MORNING_BRIEFING_CALENDAR_SOURCE=macos`` (or
+         ``SUTANDO_ALLOW_NATIVE_PIM=1``). It raises a macOS Automation prompt,
+         so it never runs unasked. An EMPTY result is only trusted on hosts that
+         have never written a Google cache; where one exists, empty means blind.
+
+    ``MORNING_BRIEFING_CALENDAR_SOURCE=google`` pins the cache as the only trusted
+    source: missing/stale → None ("couldn't read"), never a local read. With no
+    source at all, None comes with ``CALENDAR_UNREAD_NOTE`` naming the fix.
 
     Returns a list of events ([] means verified empty) or None when the calendar
     could not be read — callers must not render None as "clear".
 
-    When ``MORNING_BRIEFING_CALENDAR_SOURCE=google`` is set, the cache is the only
-    TRUSTED source: if it's missing/stale, return None (→ "couldn't read your
-    calendar") rather than a misleading empty read from a local calendar that
-    doesn't include the work account. This is exactly the 2026-07-21 bug — the
-    briefing announced "calendar is clear" off an empty local read while the
-    owner had three Google meetings that day.
-
-    Respects MORNING_BRIEFING_SKIP_CALENDARS (comma-separated list of
-    calendar names to exclude, e.g. "Home,Wedding,Birthdays"). Useful for
-    filtering out subscribed shared calendars that clutter the briefing
-    (closes #964). Case-insensitive match on calendar name.
+    Respects MORNING_BRIEFING_SKIP_CALENDARS (comma-separated list of calendar
+    names to exclude, e.g. "Home,Wedding,Birthdays"; case-insensitive).
     """
-    import os as _os
-
+    global CALENDAR_UNREAD_NOTE
+    CALENDAR_UNREAD_NOTE = None
     cached = _read_calendar_cache()
     if cached is not None:
         return cached
-    if _os.environ.get("MORNING_BRIEFING_CALENDAR_SOURCE", "").strip().lower() == "google":
+    if _calendar_source() == "google":
         # Trusted source expected but unavailable — do NOT fall back to a local
         # read that can't see the work calendar and would look falsely "clear".
         print(
@@ -273,7 +321,18 @@ def get_calendar_events() -> list[dict] | None:
             file=sys.stderr,
         )
         return None
-    script = '''
+    if _native_pim_opted_in():
+        return _read_local_calendar()
+    CALENDAR_UNREAD_NOTE = NO_CALENDAR_SOURCE_NOTE
+    print(
+        "  calendar: no source — no Google cache for today, and the local Calendar.app "
+        "is opt-in (MORNING_BRIEFING_CALENDAR_SOURCE=macos); reporting unread",
+        file=sys.stderr,
+    )
+    return None
+
+
+_CALENDAR_SCRIPT = '''
 set theDate to (current date)
 set hours of theDate to 0
 set minutes of theDate to 0
@@ -303,25 +362,40 @@ tell application "Calendar"
 end tell
 return output
 '''
-    result, err = _run_applescript(script, timeout=10)
-    if result is None:
-        # Calendar.app not running fails the query with -600 ("Application
-        # isn't running"). Launch it in the background and retry once.
-        try:
-            subprocess.run(["open", "-gja", "Calendar"], timeout=5)
-            time.sleep(3)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-        result, err = _run_applescript(script, timeout=10)
+
+
+def _record_calendar_denial(marker: Path) -> None:
+    consent.record_denial("Calendar", STATE_DIR)
+    print(
+        "  calendar: Automation permission denied (-1743). Recorded in "
+        f"{marker.name}; the local read stays off until the owner grants Calendar under "
+        f"System Settings → Privacy & Security → Automation and runs `{consent.GRANT_COMMAND}`.",
+        file=sys.stderr,
+    )
+
+
+def _read_local_calendar() -> list[dict] | None:
+    """One AppleScript read of Calendar.app — never launches the app, never retries.
+    A stored denial (-1743) is final: recorded once, later runs skip the read."""
+    global CALENDAR_UNREAD_NOTE
+    if consent is None:
+        CALENDAR_UNREAD_NOTE = NO_MACOS_TOOLS_NOTE
+        print("  calendar: local read needs the macos-tools skill (native_pim_consent); not installed",
+              file=sys.stderr)
+        return None
+    marker = _calendar_denied_marker()
+    if marker.exists():
+        CALENDAR_UNREAD_NOTE = CALENDAR_DENIED_NOTE
+        print(f"  calendar: automation denied earlier ({marker.name}); not asking again",
+              file=sys.stderr)
+        return None
+    result, err = _run_applescript(_CALENDAR_SCRIPT, timeout=10)
     if result is None:
         if err:
             print(f"  calendar: AppleScript error — {err}", file=sys.stderr)
-            if "-1743" in err:
-                print(
-                    "  calendar: Automation permission needed. "
-                    "System Settings → Privacy & Security → Automation → grant Calendar access.",
-                    file=sys.stderr,
-                )
+        if consent.is_denied(err):
+            CALENDAR_UNREAD_NOTE = CALENDAR_DENIED_NOTE
+            _record_calendar_denial(marker)
         return None
     from sutando_config import config_get
     skip_cals_raw = config_get("MORNING_BRIEFING_SKIP_CALENDARS", "") or ""
@@ -373,13 +447,25 @@ def get_reminders() -> "list[str] | None":
     clean" — the same shape as the 2026-07-21 falsely-clear calendar bug
     (#2256), which is why `get_calendar_events()` already draws this line.
     """
-    script_path = _SRC_DIR.parent / "skills" / "macos-tools" / "scripts" / "reminders.py"
-    if not script_path.exists():
+    global REMINDERS_UNREAD_NOTE
+    REMINDERS_UNREAD_NOTE = None
+    if not _native_pim_opted_in():
+        REMINDERS_UNREAD_NOTE = NO_REMINDERS_SOURCE_NOTE
+        print("  reminders: local Reminders.app is opt-in "
+              "(MORNING_BRIEFING_CALENDAR_SOURCE=macos); not read", file=sys.stderr)
+        return None
+    script_path = _MACOS_TOOLS_SCRIPTS / "reminders.py"
+    if consent is None or not script_path.exists():
+        REMINDERS_UNREAD_NOTE = NO_REMINDERS_SKILL_NOTE
+        print("  reminders: local read needs the macos-tools skill; not installed", file=sys.stderr)
         return None
     try:
+        # The host opt-in was verified above; it is passed as the env consent,
+        # never as --owner-asked (nobody asked in a conversation here).
         r = subprocess.run(
             [sys.executable, str(script_path), "list", "--due-today"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ, consent.ENV: "1"},
         )
         if r.returncode != 0:
             return None
@@ -508,28 +594,8 @@ def get_overnight_discord(now: float | None = None) -> list[str]:
     return [body for _when, body in found[-5:]]
 
 
-def _load_notifier():
-    """Load check-pending-questions.py once, as a module.
-
-    Module level on purpose: loading it inside get_pending_questions() would make
-    the predicate unreachable to tests, which point the notifier at a fixture by
-    swapping `PQ_FILE` on the loaded module (the pattern
-    tests/check-pending-questions-open-status.test.py already uses). A per-call
-    load rebuilds a private copy every time, so a test can only ever exercise a
-    re-implementation of the delegation instead of the shipped function — which is
-    exactly how the first version of this change shipped a regression past its own
-    test. Its main() is __name__-guarded, so importing fires no notification.
-    """
-    import importlib.util
-
-    src = _SRC_DIR / "check-pending-questions.py"
-    spec = importlib.util.spec_from_file_location("_cpq_predicate", src)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_CPQ = _load_notifier()
+import pending_questions_reader  # noqa: E402
+import skill_roots  # noqa: E402
 
 
 #: The briefing is SPOKEN (voice reads results/proactive-morning-*.txt) as well as
@@ -598,69 +664,40 @@ def clip_for_speech(text: str, limit: int) -> str:
     return head + "\u2026"
 
 
-def get_pending_questions() -> list[str]:
-    """Return unanswered questions, delegating to check-pending-questions.py.
-
-    That module's `get_waiting_questions()` is the single source of truth for
-    "is this question still waiting". This function used to re-implement the
-    predicate, and the two copies drifted: on 2026-07-28 the notifier counted 33
-    and this counted 32. The missing entry was a live owner ask
-    ("/observe MVP: design fully resolved, build on your nod") dropped because
-    the local copy tested `'RESOLVED' in title.upper()` — a substring match that
-    fires on the word appearing anywhere in the prose, including in "NOT
-    self-resolved". An open question that goes uncounted goes unsurfaced.
-
-    Fixing only this copy would leave the duplicate in place to re-diverge —
-    #2351 had already fixed the notifier's side (`Status: open`) without this one
-    changing. So the predicate now lives in exactly one place.
-
-    That invariant was initially only half-true: this function still dropped
-    organizer shells and inline `[RESOLVED ...]` titles locally, so the two
-    consumers reported different counts (notifier 2 / briefing 1 on a corpus with
-    one active marker plus one open ask) — review finding on 919c35f2. Both
-    classifications now live in the shared parser, and nothing here judges
-    waiting-ness; this function only maps the result to display titles.
-
-    Deliberately no fallback parser: a second implementation is the bug. And a
-    failure here must not degrade to `[]`, which the briefing would render as the
-    confident "no pending questions" that this whole class of bug produces.
+def get_pending_questions() -> dict:
+    """{"count": n | None, "link": str | None, "unavailable": bool, "reason": str | None} from
+    the one pending-questions reader. The briefing speaks a COUNT and where to open it, never
+    the questions themselves: they are sent as they come up, not re-delivered on a schedule.
+    An unreadable room is `count` None — said as unknown, never as none.
     """
-    # The briefing resolves its OWN file and hands it to the predicate, rather
-    # than relying on the notifier's independent resolution. Two reasons: the two
-    # modules could otherwise read different files on a host where resolution
-    # differs, silently reintroducing the divergence this change removes; and it
-    # keeps `personal_path` as the single patch point the existing regression
-    # tests already use (tests/briefing-pending-status.test.py,
-    # tests/morning-briefing-pending-extract.test.py), so the seam does not move.
-    _CPQ.PQ_FILE = personal_path("pending-questions.md", WORKSPACE)
-
-    out: list[str] = []
-    for q in _CPQ.get_waiting_questions():
-        title = (q.get("title") or q.get("id") or "") if isinstance(q, dict) else str(q)
-        title = re.sub(r'^\[\d{4}-\d{2}-\d{2}\]\s*', '', title.strip())
-        if not title:
-            continue
-        out.append(clip_for_speech(title, 60))
-    return out
+    g = pending_questions_reader.gather(WORKSPACE, skill_roots.declared(pending_questions_reader.DECLARATION, WORKSPACE))
+    for note in g["notes"]:
+        print(f"  pending questions: {note}", file=sys.stderr)
+    return {"count": None if g["unavailable"] else len(g["waiting"]), "link": g.get("link"),
+            "unavailable": g["unavailable"], "reason": g["reason"]}
 
 
+def pending_summary(pending) -> str:
+    """The count for the log line: a number, or "unknown (room unreachable)"."""
+    if not isinstance(pending, dict):
+        return str(len(pending or []))
+    return "unknown (room unreachable)" if pending.get("count") is None else str(pending["count"])
 
-def below_fold_count(total: int) -> int:
-    """How many waiting questions render on no surface the owner reads.
 
-    The notifier sends `questions[:VISIBLE_PREFIX]`, so waiting order IS
-    priority order and everything past it counts as open while reaching
-    nobody. Returns 0 when the prefix cannot be read — an unknown cutoff
-    must not be guessed into a number the briefing then states as fact.
-    """
-    prefix = getattr(_CPQ, "VISIBLE_PREFIX", None)
-    if not isinstance(prefix, int) or isinstance(prefix, bool) or prefix < 0:
-        # Say so: without this, an unreadable prefix and a genuinely unhidden
-        # list both render as no line, which is the silent no-op this fixes.
-        print(f"  below-fold: VISIBLE_PREFIX unreadable ({prefix!r}) — line omitted",
-              file=sys.stderr)
-        return 0
-    return max(0, total - prefix)
+def pending_line(pending) -> Optional[str]:
+    """The spoken/DM'd sentence for the count, or None when there is nothing to say."""
+    if not pending:
+        return None
+    if not isinstance(pending, dict):  # a bare list of titles: only its length is said
+        pending = {"count": len(pending)}
+    if pending.get("unavailable") or pending.get("count") is None:
+        return f"Pending questions: unknown — the room was unreachable ({pending.get('reason') or 'no count'})."
+    n = pending["count"]
+    if not n:
+        return None
+    where = f" Open it: {pending['link']}." if pending.get("link") else ""
+    noun = "One pending question is" if n == 1 else f"{n} pending questions are"
+    return f"{noun} waiting in your Pending questions database.{where}"
 
 
 def get_health_issues() -> "list[str] | None":
@@ -726,7 +763,7 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
 
     # Calendar — None means the query failed (distinct from verified empty).
     if events is None:
-        parts.append("I couldn't read your calendar this morning.")
+        parts.append(CALENDAR_UNREAD_NOTE or "I couldn't read your calendar this morning.")
     elif events:
         count = len(events)
         if count == 1:
@@ -752,18 +789,13 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         shown = reminders[:3]
         more = f" (+{n_rem - len(shown)} more)" if n_rem > len(shown) else ""
         parts.append(f"Reminders due: {', '.join(shown)}{more}.")
+    elif reminders is None and REMINDERS_UNREAD_NOTE:
+        parts.append(REMINDERS_UNREAD_NOTE)
 
-    # Pending questions
-    if pending_qs:
-        if len(pending_qs) == 1:
-            parts.append(f"One pending question waiting: {pending_qs[0]}.")
-        else:
-            # "Top item" asserted a ranking this code does not perform: get_waiting_questions()
-            # yields FILE order, so index 0 is first-listed, not most important.
-            parts.append(f"{len(pending_qs)} pending questions. First on the list: {pending_qs[0]}.")
-        hidden = below_fold_count(len(pending_qs))
-        if hidden:
-            parts.append(f"{hidden} of them render below the fold.")
+    # Pending questions: the count and where they live, never the questions
+    pq_line = pending_line(pending_qs)
+    if pq_line:
+        parts.append(pq_line)
 
     # Overnight Discord
     if discord_msgs:
@@ -789,7 +821,7 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
     # returning [] at the time) produced a confident "Everything looks clean"
     # over two questions nobody had answered.
     if (events == [] and reminders == [] and health_issues == []
-            and not pending_qs):
+            and not pq_line):
         parts.append("Everything looks clean. Good day for deep work.")
 
     return " ".join(parts)
@@ -839,7 +871,7 @@ def main():
 
 
     pending_qs = get_pending_questions()
-    print(f"  pending questions: {len(pending_qs)}")
+    print(f"  pending questions: {pending_summary(pending_qs)}")
 
     health_issues = get_health_issues()
     print(f"  health issues: {'unavailable' if health_issues is None else len(health_issues)}")

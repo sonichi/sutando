@@ -75,6 +75,7 @@ from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
+import pool_suspension  # noqa: E402
 import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
@@ -655,21 +656,48 @@ def _vault_remote_url(vault: "dict | None" = None) -> str:
 # Checks
 # ---------------------------------------------------------------------------
 
-def twilio_configured(env_content: str) -> bool:
-    """True only when .env has an ACTIVE TWILIO_ACCOUNT_SID with a value.
+# Everything conversation-server.ts exits without (its own startup check).
+TWILIO_SERVER_VARS = ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER")
+
+
+def _dotenv_active_value(env_content: str, var: str) -> str:
+    """The value of an ACTIVE `var=` line in .env text; '' when the line is
+    absent, commented out, or has nothing after the `=`."""
+    for line in env_content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(var + "="):
+            value = stripped.split("=", 1)[1].strip()
+            if value:
+                return value
+    return ""
+
+
+def twilio_configured(env_content: str, vault_get=None) -> bool:
+    """True when every credential the phone server refuses to start without
+    (TWILIO_SERVER_VARS) resolves: an ACTIVE line with a value in .env, or the
+    Keychain vault (`vault set …`) for each one.
 
     A plain substring test also matched the commented placeholder shipped in
     the .env template (`# TWILIO_ACCOUNT_SID=ACxxxxxxxxx`), so hosts that
     never configured Twilio still ran the conversation-server + tunnel
     checks — and startup.sh's matching gate kept a public ngrok tunnel open
-    to a port with nothing behind it (caught 2026-07-02). startup.sh's
-    phone block carries the anchored-grep equivalent of this test.
+    to a port with nothing behind it (caught 2026-07-02). Asking for the SID
+    alone reopened the same hole from the other side: the documented setup
+    vaults the SID + token first and writes TWILIO_PHONE_NUMBER only at
+    `twilio-setup.py buy`, and in that gap the server exits at once while the
+    check reported it down on every run (review of #4666). startup.sh's phone
+    block (`twilio_creds_present`) answers the same question through the
+    channel-token resolver with the anchored test as its grep fallback;
+    tests/health-check-twilio-gate.test.py drives both. `vault_get` is the
+    test seam for the vault tier (None reads the real Keychain).
     """
-    for line in env_content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("TWILIO_ACCOUNT_SID=") and stripped.split("=", 1)[1].strip():
-            return True
-    return False
+    for var in TWILIO_SERVER_VARS:
+        if _dotenv_active_value(env_content, var):
+            continue
+        if token_from_vault(var, vault_get=vault_get):
+            continue
+        return False
+    return True
 
 
 def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict:
@@ -855,7 +883,8 @@ def check_secret_scanner_mode() -> dict:
             "status": "ok",
             "detail": f"detect-secrets present in all {len(checked)} bridge interpreter(s)",
         }
-    fix = f"{degraded[0]} -m pip install detect-secrets"
+    from secret_scanner import install_hint  # noqa: PLC0415 — one owner of the hint
+    fix = install_hint(degraded[0])
     return {
         "name": "secret-scanner",
         "status": "warn",
@@ -863,7 +892,7 @@ def check_secret_scanner_mode() -> dict:
                    f"({', '.join(degraded)}): detect-secrets missing, so its provider "
                    f"detectors and entropy checks are off and inbound text is scanned by "
                    f"repo-local whole-line rules only; unquoted `vault set` is REFUSED. "
-                   f"Fix: {fix} (add --break-system-packages if PEP 668 blocks it)"),
+                   f"Fix: {fix}"),
     }
 
 
@@ -1542,6 +1571,7 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
     "session-state.md",      # written by src/session-handoff.sh on compaction
     ".gitkeep",              # git placeholder, not state
     ".env",                  # sutando_config.resolve_dotenv's 2nd tier (#1871)
+    "sutando.config.local.json",  # sutando_config's workspace config layer
     # The two lock guards that legitimately sit at the ROOT, by name. Exempt
     # until they migrate to state/locks/ the way workspace_lock.py already
     # writes <workspace>/state/locks/<role>.lock.guard.
@@ -3159,6 +3189,7 @@ _SERVICE_SOURCES = (
     # KeepAlive jobs in src/launchd/ whose program SURVIVES as a process. A
     # wrapper that `exec`s is gone from the table, so its payload's row covers it.
     ("src/launchd/channel-bridge-wrapper.sh", "channel-bridge-wrapper.sh"),
+    ("src/launchd/gateway-bridge-wrapper.sh", "gateway-bridge-wrapper.sh"),
     ("src/Sutando/", "Sutando.app/Contents/MacOS/Sutando"),
 )
 
@@ -4562,6 +4593,63 @@ def _pin_verdicts(service: str, lstart_by_pid: dict) -> list:
         service, lstart_by_pid, time.time())
 
 
+def _phone_server_active_calls(health_url: str = "http://127.0.0.1:3100/health") -> int:
+    """Live calls the phone server reports, 0 when it does not answer (nothing to protect)."""
+    try:
+        import urllib.request as _ur
+        with _ur.urlopen(health_url, timeout=2) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        n = d.get("activeCalls") if isinstance(d, dict) else 0
+        return int(n) if isinstance(n, (int, float)) and n > 0 else 0
+    except Exception:
+        return 0
+
+
+def _phone_server_launch_argv() -> list:
+    """The bundled artifact when it exists (no tsx in a packaged install), else the source."""
+    bundled = REPO_DIR / "dist" / "conversation-server.js"
+    if bundled.exists():
+        return ["node", str(bundled)]
+    return ["npx", "tsx", "skills/phone-conversation/scripts/conversation-server.ts"]
+
+
+def fix_conversation_server(c: dict, *, settle_s: float = 1.0) -> str:
+    """Restart the phone server, never mid-call: a stale server with live calls is
+    deferred (it drains on SIGTERM, but the owner's call comes first); a stale one
+    is killed only after a re-check right before the kill; the launch is the
+    bundled artifact when it exists."""
+    stale = c.get("status") == "stale"
+    live = _phone_server_active_calls()
+    if stale and live:
+        return f"stale but {live} call(s) active — deferred, run --fix again later"
+    if stale:
+        # Old PIDs first so the new process neither bind-fails nor lands beside a zombie.
+        try:
+            old_pids = subprocess.run(
+                ["/usr/bin/pgrep", "-f", "conversation-server"],
+                capture_output=True, text=True
+            ).stdout.strip().split("\n")
+            old_pids = _filter_pids_this_checkout([p for p in old_pids if p])
+            if _phone_server_active_calls():
+                return "a call started — deferred"
+            for pid in old_pids:
+                if pid:
+                    subprocess.run(["/bin/kill", pid], check=False)
+            time.sleep(settle_s)
+        except Exception:
+            pass
+    subprocess.Popen(_phone_server_launch_argv(),
+                     cwd=str(REPO_DIR),
+                     stdout=open("/tmp/conversation-server.log", "a"),
+                     stderr=subprocess.STDOUT, start_new_session=True)
+    return "restarted (stale code)" if stale else "restarted"
+
+
+def _C_LOCALE_ENV() -> dict:
+    """The environment for a `ps -o lstart` whose output is parsed in English."""
+    return {**os.environ, "LC_ALL": "C"}
+
+
 def _proc_lstarts(pgrep_pattern: str) -> tuple:
     """(start timestamps, {pid: lstart}) for THIS checkout's matching processes.
 
@@ -4589,9 +4677,11 @@ def _proc_lstarts(pgrep_pattern: str) -> tuple:
         pids = _filter_pids_this_checkout(pids)
         if not pids:
             return [], {}
+        # LC_ALL=C: macOS formats lstart in the locale's %c, and a non-English
+        # one broke the English strptime below (P1-19).
         _ps = subprocess.run(
             ["/bin/ps", "-o", "pid=,lstart=", "-p", ",".join(pids)],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=5, env=_C_LOCALE_ENV()
         )
         if _ps.returncode != 0:
             return [], None
@@ -5460,64 +5550,14 @@ def core_env_has_proxy_url(
     Both subprocess calls are injectable so the contract is testable without a live
     core; production passes neither.
     """
-    tmux_runner = tmux_runner or (lambda sock, *a: _run_tmux(sock, *a))
-    if ps_runner is None:
-        def ps_runner(pid):
-            return subprocess.run(
-                ["ps", "eww", "-o", "command=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=15,
-            )
+    from quota_availability import seat_env_base_url  # src/ is on sys.path
     sock = socket_path or _local_core_socket()
     if not sock:
         return None                       # no live LOCAL core -> unknown, not a bypass
-    # `-s` = every pane in the SESSION, not just the current window's.
-    panes = tmux_runner(sock, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}")
-    if panes is None or getattr(panes, "returncode", 1) != 0:
-        return None                       # no such session / tmux unavailable
-    pids = [p for p in (panes.stdout or "").split() if p.isdigit()]
-    if not pids:
-        return None
-    # Identify the core by argv, not by position: `--name <session>` is what
-    # start-cli.sh passes and no sibling window carries it.
-    #
-    # TOKEN equality, never substring. `f"--name {session}" in argv` also matches
-    # `--name sutando-core-watcher`, so a prefix-named sibling in the same session
-    # was accepted as the core (john-the-dev, reproduced on a sole pane: returned
-    # True where the contract is None). This is the SAME lookalike class as the
-    # `ANTHROPIC_BASE_URL_OLD` control already in the suite — I guarded the env-var
-    # axis and then introduced the identical hole on the session-name axis.
-    def _names_this_session(argv: str) -> bool:
-        toks = argv.split()
-        for i, t in enumerate(toks):
-            if t == "--name" and i + 1 < len(toks) and toks[i + 1] == session:
-                return True
-            if t == f"--name={session}":  # the =-joined spelling
-                return True
-        return False
-
-    matches = []
-    for pid in pids:
-        try:
-            proc = ps_runner(pid)
-        except Exception:                 # noqa: BLE001 — a probe failure is "unknown"
-            return None
-        if proc is None or getattr(proc, "returncode", 1) != 0:
-            continue                      # this pane vanished; keep looking
-        out = proc.stdout or ""
-        if _names_this_session(out):
-            matches.append(out)
-    # Zero matches: the core is not in this session (or ps could not read any pane).
-    # More than one: ambiguous, and an ambiguous session is not evidence of a bypass.
-    if len(matches) != 1:
-        return None
-    tokens = matches[0].split()
-    # `ps eww` prints argv alone when the env is unreadable, so "no KEY=VALUE pair"
-    # is what keeps an unreadable env reporting None rather than an empty env.
-    env_pairs = [t for t in tokens if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
-    if not env_pairs:
-        return None
-    return any(t.startswith("ANTHROPIC_BASE_URL=") for t in env_pairs)
-
+    env = seat_env_base_url(sock, session,
+                            tmux_runner=tmux_runner or (lambda s, *a: _run_tmux(s, *a)),
+                            ps_runner=ps_runner)
+    return None if not env.observed else env.base_url is not None
 
 def _agent_activity_age() -> "float | None":
     """Seconds since the agent last recorded loop activity, or None if unknown.
@@ -5882,10 +5922,12 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
         )
         return check
 
-    # Every unified window is read, not just 5h/7d: a per-model window such as
-    # 7d_oi can be the one rejected while the headline windows sit low.
+    # Every limit window can page (7d_oi can be the one rejected while 5h/7d sit
+    # low); overage is shown but never pages, it is purchase eligibility.
+    from quota_availability import limit_windows as _limit_windows, quota_windows as _quota_windows
     windows = _quota_windows(headers)
-    full = [w for w, (u, st) in windows.items() if st == "rejected" or (u is not None and u >= 0.9)]
+    full = [w for w, (u, st) in _limit_windows(headers).items()
+            if st == "rejected" or (u is not None and u >= 0.9)]
     if windows and not full:
         summary = _window_summary(windows)
         check["status"] = "warn"
@@ -5925,24 +5967,6 @@ def _window_summary(windows: dict) -> str:
         elif u is not None:
             parts.append(f"{w} {u:.0%}")
     return ", ".join(parts)
-
-
-def _quota_windows(headers: dict) -> dict:
-    """Every `anthropic-ratelimit-unified-<window>-utilization` header, keyed by
-    window, as (utilization or None, that window's own status or None)."""
-    out = {}
-    prefix, suffix = "anthropic-ratelimit-unified-", "-utilization"
-    for k, v in headers.items():
-        if not (k.startswith(prefix) and k.endswith(suffix)):
-            continue
-        w = k[len(prefix):-len(suffix)]
-        try:
-            u = float(v)
-        except (TypeError, ValueError):
-            u = None
-        st = headers.get(f"{prefix}{w}-status")
-        out[w] = (u, str(st) if st is not None else None)
-    return out
 
 
 def _scoped_keychain_service(config_dir: Optional[str]) -> Optional[str]:
@@ -6308,7 +6332,7 @@ def check_bodhi_dist() -> dict:
     exercised until a client connects — so existing probes silently let
     it through. This probe catches that case on every health tick.
 
-    Fix when this check fails: `npm install github:sonichi/bodhi_realtime_agent`
+    Fix when this check fails: `npm install` (installs the package.json pin)
     then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
 
     Scans whichever artifact the voice-agent ACTUALLY loads, because that
@@ -6383,7 +6407,7 @@ def check_bodhi_dist() -> dict:
         check["status"] = "fail"
         check["detail"] = (
             f"bodhi dist stale: {'/'.join(stale)} still uses deprecated `media` key — "
-            "Gemini 3.1 rejects with 1007. Run `npm install github:sonichi/bodhi_realtime_agent`."
+            "Gemini 3.1 rejects with 1007. Run `npm install`."
         )
     return check
 
@@ -8305,6 +8329,24 @@ def _pool_held_stuck(pooled: "list", now: float, stuck_age_sec: int) -> "list":
     return out
 
 
+def check_pool_suspended() -> dict:
+    """A pool suspension never expires; only resuming the pool lifts it. One still present
+    while a core runs means the host never resumed it, and no worker is being healed."""
+    name = "pool-suspended"
+    try:
+        rec = pool_suspension.read(WORKSPACE_DIR)
+    except OSError as e:
+        return {"name": name, "status": "warn", "detail": f"pool-suspended unreadable: {e}"}
+    if rec is None:
+        return {"name": name, "status": "ok", "detail": "pool not suspended"}
+    what = rec["reason"][:80] + (f" since {rec['at']}" if rec["at"] is not None else "")
+    if not _any_core_alive():
+        return {"name": name, "status": "ok", "detail": f"pool suspended ({what}) while no core runs"}
+    return {"name": name, "status": "warn",
+            "detail": f"pool suspended ({what}) while a core is running, so no worker is being "
+                      "healed; repair: resume the worker pool"}
+
+
 def check_pool_advertisement() -> dict:
     """The picker follows the roster only through the advertisement the bridge
     sends; a roster version that file does not carry is a pin nobody was told."""
@@ -8732,12 +8774,26 @@ def check_proactive_quarantine() -> dict:
                 "detail": "no quarantined proactive bodies (undelivered/ absent)"}
     now = time.time()
     try:
-        entries = list(quarantine.iterdir())
+        top = list(quarantine.iterdir())
     except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
         return {"name": name, "status": "warn",
                 "detail": f"could not scan results/undelivered/: {e}"}
     kept: list[tuple[str, int, int]] = []
     unreadable = 0
+    # Explicit walk, not `rglob`: rglob swallows an unreadable subdirectory,
+    # and a dropped body is the one failure this probe exists to prevent.
+    entries: list[Path] = []
+    pending = list(top)
+    while pending:
+        item = pending.pop()
+        try:
+            if item.is_dir():
+                pending.extend(item.iterdir())
+                continue
+        except OSError:
+            unreadable += 1
+            continue
+        entries.append(item)
     for path in entries:
         # Per-file isolation, same reason as check_orphaned_results: one
         # unreadable entry must not decide the answer for the directory.
@@ -8762,7 +8818,9 @@ def check_proactive_quarantine() -> dict:
             skips = set()          # unreadable -> judge it as before, never silently clear
         if skips & {"no-send", "REPLIED"}:
             continue
-        kept.append((path.name, int(age), int(arrived)))
+        # Relative to the quarantine root: two subdirectories can hold the
+        # same filename, and this label is what a reader opens.
+        kept.append((str(path.relative_to(quarantine)), int(age), int(arrived)))
     partial = (f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)"
                if unreadable else "")
     if not kept:
@@ -8930,6 +8988,14 @@ def _is_watcher_argv(argv: str, pid: "int | None" = None) -> "bool | None":
     return watcher_identity.is_watcher_argv(argv, pid, argv_vector=_proc_argv_vector)
 
 
+def _watcher_role_and_inbox(argv: str, pid: "int | None" = None) -> tuple:
+    """(`--role`, `--inbox`) of a proven watcher, (None, None) when its operands
+    cannot be read. A sentinel proves a watcher holds the inbox; only the role
+    says whether the SESSION does, or merely the supervisor's standby."""
+    ops = watcher_identity.classify_argv(argv, pid, argv_vector=_proc_argv_vector).operands
+    return watcher_identity.watcher_role(ops), watcher_identity.watcher_inbox(ops)
+
+
 # Read from the module that defines the precedence; a copy here is how this
 # reader and `rundir.agent_id` come to disagree about the same process.
 
@@ -9073,6 +9139,23 @@ def extras_present(trees, live) -> bool:
     """Any watcher tree not claimed by a live sentinel."""
     tracked = {str(x) for x in live}
     return any(not (members & tracked) for members in trees.values())
+
+
+def _watcher_runtime(sentinel: Path, inbox: "str | None") -> str:
+    """The runtime whose notifier armed this watcher: the worker's roster row
+    (spawn_worker records it; a Claude core can host a Codex worker), else the core's."""
+    try:
+        rows = json.loads((WORKSPACE_DIR / "state" / "roster.json")
+                          .read_text(encoding="utf-8")).get("workers") or {}
+    except (OSError, ValueError, AttributeError):
+        rows = {}
+    parts = set(Path(inbox).parts) if inbox else set()
+    for wid, row in rows.items():
+        if wid and (wid in sentinel.name or wid in parts):
+            if isinstance(row, dict) and row.get("runtime") in ("claude", "codex"):
+                return row["runtime"]
+            break
+    return "claude" if _claude_runtime_selected() else "other"
 
 
 def check_task_watcher() -> dict:
@@ -9228,11 +9311,16 @@ def check_task_watcher() -> dict:
                               f"supervised: {', '.join(supervised) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
-                          "restart via Monitor: bash src/watch-tasks-stream.sh"}
+                          "restart via Monitor (timeout_ms 1800000, re-armed on its expiry notice): "
+                          "bash src/watch-tasks-stream.sh --role session --inbox "
+                          "\"$(bash scripts/sutando-config.sh workspace)/tasks\" "
+                          "($SUTANDO_TASKS_DIR as the inbox when set); until then the standby "
+                          "supervisor announces tasks through the pane after its 45 s grace"}
     # Classify EVERY sentinel, because each names a different watcher. The
     # single-sentinel host takes exactly the branches it always did.
     live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []
     collided = []
+    live_argv = {}
     for sp in sentinels:
         try:
             spid = int(sp.read_text().strip())
@@ -9256,6 +9344,7 @@ def check_task_watcher() -> dict:
                 if spid in live:
                     collided.append((spid, live[spid], sp))
                 live[spid] = sp
+                live_argv[spid] = sargv
 
     if not live:
         # Aggregate EVERY record class before advising: a per-class early
@@ -9404,10 +9493,57 @@ def check_task_watcher() -> dict:
                           f"sentinel(s) name no provable live watcher — {'; '.join(faults)}. "
                           f"Each is a separate instance's "
                           "record; a live peer does not clear it"}
+    # The standby stamps the same sentinel as the session watcher it stands in
+    # for, so a live sentinel proves an announcer, never that the session works.
+    _roles = {_p: _watcher_role_and_inbox(live_argv[_p], _p) for _p in live}
+    # Per resolved inbox: a standby beside a live session watcher of it is the handoff.
+    _held = {watcher_identity.canonical_inbox(_i) for _r, _i in _roles.values()
+             if _r == "session" and _i}
+    standby_only, standby_note = [], []
+    for _p in sorted(live):
+        _role, _inbox = _roles[_p]
+        if _role != "standby" or watcher_identity.canonical_inbox(_inbox) in _held:
+            continue
+        _entry = f"{live[_p].name} -> pid {_p} (inbox {_inbox or 'unstated'})"
+        # Only a Claude runtime runs Monitor; Codex's notifier always arms the
+        # standby (src/agent/codex/cli/start-cli.sh), so there it IS the delivery path.
+        _held_by = standby_only if _watcher_runtime(live[_p], _inbox) == "claude" else standby_note
+        _held_by.append(_entry)
+    standby_note = (f"; {len(standby_note)} sentinel(s) name the standby watcher, "
+                    f"the delivery path on a runtime that is not Claude (no session "
+                    f"watcher is expected there): {'; '.join(standby_note)}"
+                    if standby_note else "")
+    if standby_only:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(standby_only)} sentinel(s) name only the STANDBY watcher: "
+                          f"{'; '.join(standby_only)}. No session-role watcher holds that "
+                          "inbox, so its session is not draining tasks itself — a worker "
+                          "whose turn ended logged out (\"Login expired · Please run /login\") "
+                          "never re-arms its Monitor, and the standby only announces through "
+                          "the pane. Degraded, not clear: run /login in that session if it "
+                          "asks, then re-arm via the Monitor tool: "
+                          "bash src/watch-tasks-stream.sh --role session --inbox <inbox>"
+                          f"{standby_note}"}
+    # A watcher holds its inbox whether or not anything consumes what it
+    # announces; the reader is the only difference visible from outside.
+    unread = []
+    for _p in sorted(live):
+        _sink = watcher_identity.output_sink(_p)
+        if _sink.observed and _sink.read is False:
+            unread.append(f"{_p} -> {_sink.kind} {_sink.target}".rstrip())
+    if unread:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(live)} watcher(s) alive (pids {alive}), but "
+                          f"{len(unread)} announce(s) where nothing is reading: "
+                          f"{'; '.join(unread)}. That inbox is held but not served — "
+                          "a session start will exit naming the holder, so clearing it "
+                          "needs `watch-tasks-stream.sh --force-restart` on the owner's word"}
     if len(live) == 1:
-        return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {alive})"}
+        return {"name": name, "status": "ok",
+                "detail": f"streaming watcher alive (pid {alive}){standby_note}"}
     return {"name": name, "status": "ok",
-            "detail": f"{len(live)} streaming watchers alive, one per instance (pids {alive})"}
+            "detail": f"{len(live)} streaming watchers alive, one per instance "
+                      f"(pids {alive}){standby_note}"}
 
 
 #: Track session-worker.py's own SUTANDO_TIER_HARD_TIMEOUT (default 900s,
@@ -9597,6 +9733,64 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
                           "each with a live counter (measured zero)"}
     return {"name": name, "status": "ok",
             "detail": "no migrated outbox roots — dual-read window not active"}
+
+
+
+def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
+    """A PARKED outbound item is a reply the owner never received, and nothing
+    retries it: `outbox_cli`'s own header calls PARKED a durable terminal state
+    that nothing in production could lift. Until now it was visible only to
+    someone who ran the CLI by hand."""
+    name = "outbox-parked"
+    results = Path(workspace_dir or WORKSPACE_DIR) / "results"
+    # On EACCES glob yields nothing and is_dir() either answers False or raises,
+    # by version; iterdir raises on all, and only ENOENT means "nothing to park".
+    try:
+        roots = sorted(p for p in results.iterdir() if p.name.startswith(".outbox"))
+    except FileNotFoundError:
+        roots = []
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"{results.name}/ unreadable ({exc}) — parked replies unjudged"}
+    if not roots:
+        return {"name": name, "status": "ok",
+                "detail": "no outbox root — nothing to park (this 0 is untestable)"}
+    try:
+        import outbox  # noqa: PLC0415 - src-local, imported only when a root exists
+    except ImportError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
+    parked: list[tuple[str, str]] = []  # (root.name, item_id) -- roots differ, see below
+    unreadable: list[str] = []
+    for root in roots:
+        # An unreadable ROOT reaches here too, and a raise would abort every
+        # later check, so nothing but ENOENT may pass as an empty outbox.
+        items_dir = outbox._items_dir(Path(root))
+        try:
+            list(items_dir.iterdir())
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            unreadable.append(f"{root.name} ({exc})")
+            continue
+        for d in outbox.list_items(root, status="PARKED"):
+            parked.append((root.name, str(d.get("item_id") or "?")))
+    if unreadable:
+        return {"name": name, "status": "warn",
+                "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
+                          + "; ".join(unreadable)}
+    if parked:
+        parked.sort()
+        shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
+                           for root_name, item_id in parked[:4])
+        more = f" (+{len(parked) - 4} more)" if len(parked) > 4 else ""
+        return {"name": name, "status": "warn",
+                "detail": f"{len(parked)} reply/replies PARKED and never delivered — "
+                          f"nothing retries them: {shown}{more}. Recover with "
+                          f"`python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
+                          f"(the root varies per item; a single hardcoded root under-reports)"}
+    return {"name": name, "status": "ok",
+            "detail": f"no parked replies across {len(roots)} outbox root(s)"}
 
 
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
@@ -9976,8 +10170,17 @@ def _command_runs_script(command: str, expected: Path) -> bool:
 
 
 def _probe_codex_task_notifier(target: dict) -> dict:
-    """Inspect the exact managed notifier tmux session for one healthy pane."""
-    name = "codex-task-notifier"
+    return _probe_task_notifier(target, name="codex-task-notifier",
+                                expected=_expected_codex_notifier_entrypoint())
+
+
+def _probe_task_notifier(target: dict, *, name: str, expected: Path,
+                         script: "Path | None" = None) -> dict:
+    """Inspect the exact managed notifier tmux session for one healthy pane.
+
+    `script`, when given, is the notifier the supervisor must be running; the
+    supervisor's own default is another runtime's, so the pane command alone
+    cannot certify which one is live."""
     socket_path = target["socket"]
     watcher_session = f"{target['session']}-watcher"
     exists = _run_tmux(socket_path, "has-session", "-t", f"={watcher_session}")
@@ -10018,7 +10221,6 @@ def _probe_codex_task_notifier(target: dict) -> dict:
             "status": "warn",
             "detail": f"managed tmux session {watcher_session!r} has a dead pane",
         }
-    expected = _expected_codex_notifier_entrypoint()
     if not _command_runs_script(command, expected):
         return {
             "name": name,
@@ -10028,12 +10230,27 @@ def _probe_codex_task_notifier(target: dict) -> dict:
                 f"command; expected {expected.name}"
             ),
         }
+    if script is not None:
+        env = _run_tmux(socket_path, "show-environment", "-t", f"={watcher_session}",
+                        "SUTANDO_NOTIFIER_SCRIPT")
+        configured = ""
+        if env is not None and env.returncode == 0:
+            configured = env.stdout.strip().partition("=")[2]
+        if configured != str(script):
+            return {
+                "name": name,
+                "status": "warn",
+                "detail": (
+                    f"managed tmux session {watcher_session!r} runs notifier "
+                    f"{configured or '(supervisor default)'!r}; expected {script}"
+                ),
+            }
     return {
         "name": name,
         "status": "ok",
         "detail": (
             f"managed notifier healthy in {watcher_session!r} "
-            f"({expected.name})"
+            f"({(script or expected).name})"
         ),
     }
 
@@ -10203,6 +10420,113 @@ def check_codex_task_notifier() -> dict:
             ),
         }
     return _probe_codex_task_notifier(target)
+
+
+def _claude_runtime_selected() -> bool:
+    try:
+        return resolve_core_runtime(REPO_DIR) == "claude"
+    except Exception:  # noqa: BLE001 — config check reports the underlying error
+        return False
+
+
+def _local_claude_notifier_target(heartbeat: "dict | None" = None) -> "dict | None":
+    """Socket + session of the live Claude core, from its own heartbeat record."""
+    if heartbeat is None:
+        heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return None
+    socket_path = heartbeat.get("socket")
+    session = heartbeat.get("session")
+    if not isinstance(socket_path, str) or not socket_path:
+        return None
+    if not isinstance(session, str) or not session:
+        return None
+    exists = _run_tmux(socket_path, "has-session", "-t", f"={session}")
+    if exists is None or exists.returncode != 0:
+        return None
+    return {"socket": socket_path, "session": session}
+
+
+def check_claude_task_notifier() -> dict:
+    """The Claude core's standby notifier lives in `<session>-watcher`, like Codex's."""
+    name = "claude-task-notifier"
+    if not _claude_runtime_selected():
+        return {"name": name, "status": "ok",
+                "detail": "Claude runtime not selected — notifier not expected"}
+    heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return {"name": name, "status": "ok",
+                "detail": "no fresh local core heartbeat — notifier not expected"}
+    target = _local_claude_notifier_target(heartbeat)
+    if target is None:
+        return {"name": name, "status": "warn",
+                "detail": "fresh local Claude heartbeat, but its live tmux session could not be verified"}
+    supervisor = REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
+    notifier = REPO_DIR / "src" / "agent" / "claude" / "cli" / "task-notifier.sh"
+    return _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
+
+
+def _process_alive(pid: int) -> bool:
+    """Whether `pid` is a running process we may signal (kill -0)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def fix_claude_task_notifier() -> str:
+    """Notifier-only recovery for the Claude core, mirroring the Codex one: the
+    canonical launcher, run without --restart, recreates a missing `<session>-watcher`
+    and leaves the live core alone (P1-23: the standby notifier went missing and
+    only a full relaunch brought it back)."""
+    if not _claude_runtime_selected():
+        return "not repaired — Claude runtime is not selected"
+    heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return "not repaired — no fresh local Claude core heartbeat"
+    target = _local_claude_notifier_target(heartbeat)
+    if target is None:
+        return "not repaired — the live Claude core session could not be verified"
+    # The shared launcher injects --restart when the session records another
+    # runtime, and spawns a new core when the heartbeat's process is gone.
+    recorded = _run_tmux(target["socket"], "show-environment", "-t", f"={target['session']}", "SUTANDO_CORE_RUNTIME")
+    if recorded is None or recorded.returncode != 0 or recorded.stdout.strip() != "SUTANDO_CORE_RUNTIME=claude":
+        seen = (recorded.stdout.strip() if recorded is not None and recorded.returncode == 0 else "unreadable")
+        return f"not repaired — the live core records a different runtime ({seen})"
+    core_pid = heartbeat.get("pid")
+    if not isinstance(core_pid, int) or isinstance(core_pid, bool) or not _process_alive(core_pid):
+        return f"not repaired — the heartbeat's core process (pid {core_pid}) is not running"
+    if check_claude_task_notifier()["status"] == "ok":
+        return "already healthy"
+    launcher = REPO_DIR / "src" / "agent" / "start-cli.sh"
+    if not launcher.is_file():
+        return "not repaired — canonical launcher is missing"
+    env = _resolve_launch_env()
+    env["SUTANDO_TMUX_SOCKET"] = target["socket"]
+    env["SUTANDO_TMUX_SESSION"] = target["session"]
+    env["SUTANDO_CORE_RUNTIME"] = "claude"
+    try:
+        launched = subprocess.run(["/bin/bash", str(launcher)], env=env,
+                                  capture_output=True, text=True, timeout=120)
+    except Exception as error:  # noqa: BLE001
+        return f"not repaired — launcher failed ({type(error).__name__})"
+    if launched.returncode != 0:
+        detail = (launched.stderr or launched.stdout).strip().splitlines()
+        suffix = f": {detail[-1][:120]}" if detail else ""
+        return f"not repaired — launcher exited {launched.returncode}{suffix}"
+    if _local_claude_notifier_target(_fresh_local_core_record()) != target:
+        return "not repaired — local Claude core changed during repair"
+    after = check_claude_task_notifier()
+    if after["status"] != "ok":
+        return f"not repaired — {after['detail']}"
+    return "repaired managed notifier; live core session preserved"
 
 
 def fix_codex_task_notifier() -> str:
@@ -12316,6 +12640,48 @@ def proxy_liveness_status(proxy_check: dict) -> str:
     return proxy_check.get("status")
 
 
+def _credential_proxy_wedge_from_quota_state(check: dict) -> None:
+    """Escalate `check` to 'warn' when the proxy's own last-recorded credential
+    state (quota-state.json, written by recordCredentialState()) is 'exhausted'
+    and was recorded by the current process (a record older than the process
+    start is ignored). Advisory: silent on any read/parse failure, and never
+    runs unless the caller's own gate already proved the port is 'ok'/'stale'.
+    """
+    if check["status"] not in ("ok", "stale"):
+        return
+    path = status_read_path("quota-state.json", WORKSPACE_DIR)
+    if not path.exists():
+        return
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(state, dict) or state.get("credential_state") != "exhausted":
+        return
+    detail = state.get("credential_state_detail") or "no detail recorded"
+    at = state.get("credential_state_at")
+    age = ""
+    at_ts = None
+    if isinstance(at, str):
+        from datetime import datetime as _dt  # local: not at module scope in this file
+        try:
+            at_ts = _dt.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+            age_s = time.time() - at_ts
+            age = f" ({int(age_s / 60)}m ago)" if age_s >= 0 else ""
+        except ValueError:
+            pass
+    # Written only on a transition, never reset at startup: a restart inherits
+    # a stale 'exhausted' record, which predates the process that would prove it.
+    starts, _ = _proc_lstarts("credential-proxy")
+    if at_ts is not None and starts and at_ts < max(starts):
+        return
+    check["status"] = "warn"
+    check["detail"] = (
+        f"listening, but its own last-recorded credential state is 'exhausted'{age}: "
+        f"{detail} — requests are likely 401ing/502ing despite the port being open"
+    )
+
+
 def check_credential_proxy() -> dict:
     """Credential proxy (port 7846). probe=False: a forwarding proxy has no
     liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
@@ -12336,6 +12702,7 @@ def check_credential_proxy() -> dict:
                          if _process_executes_artifact(artifact, "credential-proxy")
                          else None),
         )
+        _credential_proxy_wedge_from_quota_state(check)
     # Pin verdicts resolve on EVERY branch: a healthy replacement or a down
     # service still owes any ORPHAN/MISMATCH/EXPIRED finding to the report.
     _, _pls = _proc_lstarts("credential-proxy")
@@ -12673,10 +13040,13 @@ def run_all_checks() -> list[dict]:
                 c["status"] = "warn"
                 c["detail"] = "not running (starts on demand)"
             else:
+                # The bundled desktop runs dist/conversation-server.js: an engine
+                # update refreshes that artifact without touching the source.
                 mark_stale_if_outdated(
                     c,
                     REPO_DIR / "skills" / "phone-conversation" / "scripts" / "conversation-server.ts",
                     "conversation-server.ts",
+                    binary_path=REPO_DIR / "dist" / "conversation-server.js",
                 )
             # Compose after BOTH branches — the non-ok rewrite replaces check_port's
             # diagnosis, and the healthy branch never composed a pin at all.
@@ -12808,7 +13178,7 @@ def run_all_checks() -> list[dict]:
         try:
             _psb = subprocess.run(
                 ["/bin/ps", "-o", "lstart=", "-p", pids[0]],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5, env=_C_LOCALE_ENV()
             )
             ps_out = _psb.stdout.strip()
             if _psb.returncode == 0 and ps_out:
@@ -12990,12 +13360,10 @@ def run_all_checks() -> list[dict]:
                 )
             checks.append(check)
         elif pgrep_status == "ok-stopped":
-            # checkWatcher() only pokes while the CLI is idle (cliIsWorking gates it),
-            # so absent app + busy CLI means nothing recovers the watcher from either side.
             checks.append({"name": "sutando-app", "status": "warn",
                            "detail": "not running — hotkeys disabled AND checkWatcher is "
-                                     "absent, so a dead task watcher is recovered by nothing "
-                                     "while the CLI is busy"})
+                                     "absent, so a dead task watcher is recovered by "
+                                     "nothing until the app restarts"})
         else:
             # pgrep itself errored — don't false-alarm "not running" when we
             # actually couldn't determine state. Surface as a transient warn
@@ -13023,6 +13391,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_pool_advertisement())
+    checks.append(check_pool_suspended())
     checks.append(check_orphaned_results())
     checks.append(check_held_no_consumer())
     checks.append(check_proactive_quarantine())
@@ -13031,7 +13400,9 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_watcher())
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
+    checks.append(check_outbox_parked())
     checks.append(check_codex_task_notifier())
+    checks.append(check_claude_task_notifier())
     checks.append(check_codex_presence())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
@@ -14197,9 +14568,8 @@ def recover_core_if_wedged(
 # detects a little later than it strictly could.
 #
 # Recovery is a NUDGE, not a restart: type `/schedule-crons` into the live
-# core's tmux pane — the same keystroke channel Sutando.app's checkWatcher
-# uses (`watcher` keystroke) when the task watcher dies — so the session
-# re-arms its own crons and keeps its context. Bounded by the SAME
+# core's tmux pane, so the session re-arms its own crons and keeps its
+# context. Bounded by the SAME
 # confirm/cooldown/give-up discipline as the wedge path so it can't
 # nudge-storm a pane.
 
@@ -14283,9 +14653,8 @@ def _default_cron_nudge(
     session: Optional[str] = None,
 ) -> bool:
     """Re-arm the live core's in-session crons by typing `/schedule-crons`
-    into its tmux pane — the same keystroke channel Sutando.app's checkWatcher
-    uses for a dead task watcher (main.swift tmuxSendKeys). Returns True only
-    when the session exists and send-keys succeeded. tmux_bin/sock/session are
+    into its tmux pane. Returns True only when the session exists and
+    send-keys succeeded. tmux_bin/sock/session are
     injectable so tests can drive the real subprocess path against a fake
     tmux binary."""
     if sock is None:
@@ -14297,13 +14666,14 @@ def _default_cron_nudge(
     env = _resolve_launch_env()
     try:
         has = subprocess.run(
-            [tmux_bin, "-S", sock, "has-session", "-t", session],
+            [tmux_bin, "-S", sock, "has-session", "-t", f"={session}"],
             env=env, capture_output=True, timeout=15,
         )
         if has.returncode != 0:
             return False
         send = subprocess.run(
-            [tmux_bin, "-S", sock, "send-keys", "-t", session, "/schedule-crons", "Enter"],
+            # Exact name: a bare target prefix-matches the core's `-watcher` session once the core is gone.
+            [tmux_bin, "-S", sock, "send-keys", "-t", f"={session}:", "/schedule-crons", "Enter"],
             env=env, capture_output=True, timeout=15,
         )
         return send.returncode == 0
@@ -14538,6 +14908,31 @@ def summary_line(checks) -> str:
         return "All systems operational."
     return (f"No failures — {len(warns)} warning(s): "
             + ", ".join(c["name"] for c in warns))
+
+
+def publish_health_report(checks, state_dir=None):
+    """Publish only aggregate health; diagnostics and user data stay local."""
+    state_dir = Path(state_dir) if state_dir is not None else WORKSPACE_DIR / "state"
+    tmp = None
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        report = {"version": 1, "checked_at": time.time(), "total": len(checks),
+                  "failures": sum(is_issue(c) for c in checks)}
+        with tempfile.NamedTemporaryFile(mode="w", dir=state_dir,
+                                         prefix=".agent-health-", delete=False) as out:
+            tmp = Path(out.name)
+            json.dump(report, out)
+        os.replace(tmp, state_dir / "agent-health.json")
+    except OSError:
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def main():
     as_json = "--json" in sys.argv
     do_fix = "--fix" in sys.argv
@@ -14549,6 +14944,7 @@ def main():
     quiet = "--quiet" in sys.argv or "-q" in sys.argv
 
     checks = run_all_checks()
+    publish_health_report(checks)
     track_health_fix(checks)
     if do_fix:
         track_health_fix(checks, start=True)
@@ -14562,6 +14958,11 @@ def main():
             ),
             None,
         )
+        if do_fix
+        else None
+    )
+    claude_notifier = (
+        next((c for c in checks if c["name"] == "claude-task-notifier" and c["status"] == "warn"), None)
         if do_fix
         else None
     )
@@ -14658,7 +15059,7 @@ def main():
                 pass
             else:
                 sys.exit(1)
-        elif codex_notifier is None:
+        elif codex_notifier is None and claude_notifier is None:
             sys.exit(0)
 
     # Human-readable
@@ -14774,25 +15175,7 @@ def main():
                     result = fix_launchd("com.sutando.voice-agent")
                     print(f"  voice-agent (stuck CONNECTING): {result}")
                 elif c["name"] == "conversation-server":
-                    # If stale, kill old PIDs first so the new process doesn't
-                    # bind-fail or end up alongside a still-running zombie.
-                    if c["status"] == "stale":
-                        try:
-                            old_pids = subprocess.run(
-                                ["/usr/bin/pgrep", "-f", "conversation-server.ts"],
-                                capture_output=True, text=True
-                            ).stdout.strip().split("\n")
-                            for pid in old_pids:
-                                if pid:
-                                    subprocess.run(["/bin/kill", pid], check=False)
-                            import time as _t; _t.sleep(1)
-                        except Exception:
-                            pass
-                    subprocess.Popen(["npx", "tsx", "skills/phone-conversation/scripts/conversation-server.ts"],
-                                     cwd=str(REPO_DIR),
-                                     stdout=open("/tmp/conversation-server.log", "a"),
-                                     stderr=subprocess.STDOUT, start_new_session=True)
-                    print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+                    print(f"  {c['name']}: {fix_conversation_server(c)}")
 
     # Screen-capture (:7845) is optional, so a down server is downgraded to
     # warn and never enters `issues` — the fix loop above can't reach it. An
@@ -14816,6 +15199,8 @@ def main():
     # local Codex session and delegates topology to the canonical launcher.
     if codex_notifier:
         print(f"  codex-task-notifier: {fix_codex_task_notifier()}")
+    if claude_notifier:
+        print(f"  claude-task-notifier: {fix_claude_task_notifier()}")
 
     # Channel bridges have the same optional-component shape: "configured but
     # not running" is warn-only, so the fix loop above can't reach a dead
@@ -14836,6 +15221,7 @@ def main():
         # 2s matches the fix-loop's per-service `time.sleep(1)` budget.
         import time as _t; _t.sleep(2)
         residual_checks = run_all_checks()
+        publish_health_report(residual_checks)
         emit_task_for_failures(residual_checks)
 
     sys.exit(1 if issues else 0)

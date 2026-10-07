@@ -8,7 +8,7 @@
  * ## Audio chain (inbound — caller speaks)
  *
  *   Caller → Twilio → [mu-law 8kHz JSON WS] → Server (mulawTopcm16k)
- *     → [PCM 16kHz Buffer] → VoiceSession.handleAudioFromClient()
+ *     → [PCM 16kHz Buffer] → VoiceSession.feedAudioFromClient()
  *     → GeminiLiveTransport.sendAudio() → Gemini
  *
  * ## Audio chain (outbound — Gemini speaks)
@@ -54,6 +54,7 @@ import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, exi
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
+import { envOrVault } from '../../../src/vault-secret.js';
 import { loadVoiceConfig } from '../../../src/voice-config.js';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
 import { PLAYBACK_PATH } from '../../../src/tmp-paths.js';
@@ -66,6 +67,9 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { buildPhoneInstructions } from './phone-agent-config.js';
+import { syncTwilioWebhook } from './twilio-webhook-sync.js';
+import { RespawnScheduler, drainMayExit, healthPayload, isDrainBlocked } from './server-lifecycle.js';
+import { wirePhoneUpstreamRecovery, type PhoneRecoverySession } from './upstream-recovery-wiring.js';
 import { recordConversation, recordToolCall } from '../../../src/conversation-store.js';
 import { startPhoneTicker } from '../../../src/observability/realtime.js';
 import { createSessionRecorder, type SessionRecorder } from '../../../src/live-agent-runtime.js';
@@ -98,9 +102,14 @@ function detachVisionFromCall(): void {
 // chain via voiceApiKey() (src/voice-key.ts). VOICE-key path isolates voice
 // billing onto a paid-tier key; MAIN-key fallback preserves single-key setup.
 const GEMINI_API_KEY = voiceApiKey();
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID ?? '';
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN ?? '';
-const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER ?? '';
+// Each Twilio credential resolves the way twilio-setup.py and startup.sh's
+// phone gate resolve it: the environment (sourced .env included) wins, the
+// Keychain vault answers when it is empty. All three are required below, and
+// the gate starts this server only when all three resolve — a `vault set` of
+// the SID alone is not a start signal.
+const TWILIO_ACCOUNT_SID = envOrVault('TWILIO_ACCOUNT_SID');
+const TWILIO_AUTH_TOKEN = envOrVault('TWILIO_AUTH_TOKEN');
+const TWILIO_PHONE_NUMBER = envOrVault('TWILIO_PHONE_NUMBER');
 const NGROK_AUTHTOKEN = process.env.NGROK_AUTHTOKEN ?? '';
 const PORT = Number(process.env.PHONE_PORT) || 3100;
 const WORKSPACE_DIR = resolveWorkspace();
@@ -203,7 +212,7 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 
 /** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
 const _ZWSP = '​';
-// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (42 keys) — injection-guard-sweep
+// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (51 keys) — injection-guard-sweep
 // asserts this regex covers every py key. reply_chain_ids added with PR #2310.
 const _CONF_HEADER_RE = new RegExp(
 	'^(?:id|timestamp|session_scope|task|source|access_tier|user_id|channel_id|priority|' +
@@ -211,10 +220,10 @@ const _CONF_HEADER_RE = new RegExp(
 	'sender_name|room_name|parent_message_id|reply_chain_ids|reminder|' +
 	'author_name|author_id|' +
 	'chat_id|thread_ts|reply_to_event|reply_to_me|reply_to_sender|addressed_to|callSid|caller|from|' +
-	'thread_root|source_room_id|' +
+	'thread_root|source_room_id|channel_kind|' +
 	'receiving_instance|' +
 	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
-	'attachments|platform_card|instance_id|collaborator|requested_worker|wire_source|picker_command|picker_args|hitl_click)\\s*:',
+	'attachments|platform_card|instance_id|collaborator|requested_worker|wire_source|picker_command|picker_args|hitl_click|owner_mentioned|task_layout)\\s*:',
 	'i',
 );
 const _CONF_FENCE_RE = /^={3,}/;
@@ -269,7 +278,7 @@ function pcmToMulaw(sample: number): number {
 	return ~(sign | (exponent << 4) | mantissa) & 0xff;
 }
 
-// [Inbound audio chain] Twilio mu-law 8kHz → PCM 16kHz for VoiceSession.handleAudioFromClient()
+// [Inbound audio chain] Twilio mu-law 8kHz → PCM 16kHz for VoiceSession.feedAudioFromClient()
 function mulawTopcm16k(mulawBytes: Buffer): Buffer {
 	const numSamples = mulawBytes.length;
 	const out = Buffer.alloc(numSamples * 2 * 2);
@@ -698,7 +707,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 // --- Create VoiceSession for a call ---
 // Each Twilio call gets its own bodhi VoiceSession on a dynamic internal port.
 // Audio bypasses ClientTransport's WebSocket — we override handleAudioOutput()
-// and call handleAudioFromClient() directly for lower latency.
+// and call feedAudioFromClient() directly for lower latency.
 
 async function createCallSession(params: {
 	callSid: string;
@@ -772,6 +781,11 @@ async function createCallSession(params: {
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: 'Aoede' },
+		// A lost upstream parks in UPSTREAM_LOST (CLOSED is terminal in 0.4); the
+		// wirePhoneUpstreamRecovery below redials it with recoverUpstream().
+		upstreamLossPolicy: 'hold',
+		// Greet the caller once: a re-attach after a turn has completed is silent.
+		reattachGreeting: 'until-first-turn',
 		hooks: {
 			onToolCall: (e) => {
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
@@ -835,8 +849,6 @@ async function createCallSession(params: {
 	// [Outbound audio chain] Override to send Gemini audio directly to Twilio
 	// Bypasses ClientTransport's internal WebSocket for lower latency
 	const sessionAny = session as any;
-	let isReplaying = false; // suppress audio during reconnect replay
-	let turnCountBeforeDisconnect = 0; // track turns to know when replay is done
 	let _isRecordingMuted: (() => boolean) | null = null;
 	import('../../../src/browser-tools.js').then(bt => { _isRecordingMuted = bt.isRecordingMuted; }).catch(() => {});
 
@@ -846,7 +858,7 @@ async function createCallSession(params: {
 
 	sessionAny.handleAudioOutput = (data: string) => {
 		sessionAny.notificationQueue?.markAudioReceived?.();
-		if (isReplaying || _isRecordingMuted?.()) return;
+		if (_isRecordingMuted?.()) return;
 		const pcmBuf = Buffer.from(data, 'base64');
 		_teeAudio?.(pcmBuf);
 		if (params.twilioWs.readyState === WebSocket.OPEN) {
@@ -871,12 +883,6 @@ async function createCallSession(params: {
 	let lastProcessedIdx = 0;
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;
-		// Detect end of reconnect replay: when items catch up to pre-disconnect count
-		if (isReplaying && items.length >= turnCountBeforeDisconnect) {
-			console.log(`${ts()} [Phone] replay complete (${items.length}/${turnCountBeforeDisconnect} turns) — unmuting`);
-			isReplaying = false;
-			import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
-		}
 		// Guard: if items shrunk (reconnect reset context), re-scan from start but skip already-seen text
 		if (items.length < lastProcessedIdx) lastProcessedIdx = 0;
 		const lastTranscriptText = callSession.transcript.length > 0
@@ -923,53 +929,19 @@ async function createCallSession(params: {
 		}
 	});
 
-	// Trigger client connected (so VoiceSession sends greeting and starts Gemini)
-	sessionAny.handleClientConnected();
-	// Suppress greeting on reconnect — mute the first few seconds of audio after reconnect
-	let firstGreetingSent = false;
-	const origSendGreeting = sessionAny.sendGreeting?.bind(sessionAny);
-	if (origSendGreeting) {
-		sessionAny.sendGreeting = (...args: any[]) => {
-			if (firstGreetingSent) {
-				console.log(`${ts()} [Phone] suppressed reconnect greeting`);
-				return;
-			}
-			firstGreetingSent = true;
-			return origSendGreeting(...args);
-		};
-	}
+	// The Twilio stream is this session's client: attaching starts Gemini and greets once.
+	session.notifyClientConnected();
 
-	// Auto-reconnect when Gemini transport closes (e.g. 1008 crash).
-	// We bypass ClientTransport, so VoiceSession's built-in reconnect won't trigger.
-	// Override handleTransportClose (not transport.onClose) because transport.onClose
-	// gets re-bound when transport.connect() is called during reconnection.
-	const origHandleTransportClose = sessionAny.handleTransportClose.bind(sessionAny);
-	sessionAny.handleTransportClose = (code?: number, reason?: string) => {
-		console.log(`${ts()} [Phone] transport closed: code=${code} reason=${reason}`);
-		// Call original (transitions state to CLOSED)
-		origHandleTransportClose(code, reason);
-		// Trigger reconnect
-		if (!callSession.hangingUp && activeCalls.has(callSession.callSid)) {
-			setTimeout(() => {
-				if (!callSession.hangingUp && activeCalls.has(callSession.callSid)) {
-					console.log(`${ts()} [Phone] reconnecting Gemini for ${callSession.callSid}`);
-					isReplaying = true; // mute audio while Gemini replays history
-					turnCountBeforeDisconnect = session.conversationContext.items.length;
-					console.log(`${ts()} [Phone] replay suppression: ${turnCountBeforeDisconnect} turns to replay`);
-					sessionAny.handleClientConnected();
-					// Fallback: unmute after max(10s, 2s per turn) in case turn detection fails
-					const fallbackMs = Math.max(10000, turnCountBeforeDisconnect * 2000);
-					setTimeout(() => {
-						if (isReplaying) {
-							console.log(`${ts()} [Phone] replay suppression fallback (${fallbackMs}ms)`);
-							isReplaying = false;
-							import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {});
-						}
-					}, fallbackMs);
-				}
-			}, 1500);
-		}
-	};
+	// bodhi retries a transport close on the resumption handle; once parked, only recoverUpstream()
+	// redials, holding greeting and injected context until the caller speaks again.
+	wirePhoneUpstreamRecovery({
+		session: session as unknown as PhoneRecoverySession,
+		callSession,
+		activeCalls,
+		onActivated: () => { void import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {}); },
+		log: (msg) => console.log(`${ts()} ${msg}`),
+		error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
+	});
 
 	// Narration cleanup placeholder — delegates to skill module if loaded
 	callSession.cleanupNarration = () => {
@@ -1269,21 +1241,45 @@ function killPortOccupant(port: number): void {
 // --- ngrok ---
 
 let ngrokProcess: ChildProcess | null = null;
+// Shutdown state: a SIGTERM with live calls drains instead of dropping them.
+const STARTED_AT = Date.now();
+let shuttingDown = false;
+let draining = false;
+let drainStartedAt = 0;
+// One pending ngrok respawn at a time, whichever of the child's exit or the
+// attempt's own failure asks first.
+let ngrokPort = 0;
+const ngrokScheduler = new RespawnScheduler(() => { void respawnNgrok(ngrokPort); });
 
 async function startNgrokCli(port: number): Promise<string> {
+	ngrokPort = port;
 	try { execSync('pkill -f "ngrok http"', { stdio: 'ignore' }); } catch {}
 	await new Promise(r => setTimeout(r, 500));
-	ngrokProcess = spawn('ngrok', ['http', String(port), '--log=stdout'], {
+	const proc = spawn('ngrok', ['http', String(port), '--log=stdout'], {
 		stdio: ['ignore', 'pipe', 'pipe'],
 		env: { ...process.env, NGROK_AUTHTOKEN },
 	});
-	ngrokProcess.stderr?.on('data', (d: Buffer) => {
+	ngrokProcess = proc;
+	let exited = false;
+	proc.stderr?.on('data', (d: Buffer) => {
 		const line = d.toString().trim();
 		if (line) console.error(`${ts()} [ngrok] ${line}`);
+	});
+	// The tunnel is supervised here, by the process that owns it: an ngrok that
+	// dies is respawned with backoff, and Twilio is re-pointed when the URL moved.
+	proc.on('exit', (code, signal) => {
+		exited = true;
+		if (shuttingDown || ngrokProcess !== proc) return;
+		ngrokProcess = null;
+		const delay = ngrokScheduler.schedule();
+		if (delay >= 0) console.error(`${ts()} [ngrok] exited (code=${code} signal=${signal}); respawn ${ngrokScheduler.attempts} in ${delay / 1000}s`);
 	});
 	const deadline = Date.now() + 15_000;
 	while (Date.now() < deadline) {
 		await new Promise(r => setTimeout(r, 500));
+		// A child that already died has no tunnel to wait for; polling on would
+		// read a LATER attempt's tunnel as this one's.
+		if (exited) throw new Error('ngrok exited before its tunnel came up');
 		try {
 			const resp = await fetch('http://127.0.0.1:4040/api/tunnels');
 			const data = await resp.json() as { tunnels: Array<{ public_url: string; proto: string }> };
@@ -1292,6 +1288,49 @@ async function startNgrokCli(port: number): Promise<string> {
 		} catch {}
 	}
 	throw new Error('ngrok tunnel did not start within 15s');
+}
+
+async function respawnNgrok(port: number): Promise<void> {
+	if (shuttingDown) return;
+	try {
+		const url = await startNgrokCli(port);
+		ngrokScheduler.reset();
+		if (url !== WEBHOOK_BASE_URL) {
+			console.log(`${ts()} [ngrok] tunnel back at ${url} (was ${WEBHOOK_BASE_URL})`);
+			WEBHOOK_BASE_URL = url;
+			if (process.env.TWILIO_AUTO_WEBHOOK === '1') {
+				await syncTwilioWebhook({ sid: TWILIO_ACCOUNT_SID, token: TWILIO_AUTH_TOKEN, number: TWILIO_PHONE_NUMBER }, WEBHOOK_BASE_URL, {
+					log: (line) => console.log(`${ts()} ${line}`),
+					error: (line) => console.error(`${ts()} ${line}`),
+				});
+			}
+		} else {
+			console.log(`${ts()} [ngrok] tunnel back at ${url}`);
+		}
+	} catch (err) {
+		// The same single schedule as the exit handler: whichever asked first owns the timer.
+		const delay = ngrokScheduler.schedule();
+		console.error(`${ts()} [ngrok] respawn failed (${err instanceof Error ? err.message : String(err)}); ${delay >= 0 ? `retry in ${delay / 1000}s` : 'retry already scheduled'}`);
+	}
+}
+
+/** SIGTERM/SIGINT: exit at once when idle; with live calls, refuse new call work
+ *  (503) and exit when the last call ends or the drain cap elapses. Never mid-call. */
+function beginShutdown(signal: string): void {
+	if (shuttingDown) return;
+	shuttingDown = true;
+	if (activeCalls.size === 0) { cleanupNgrok(); process.exit(0); }
+	draining = true;
+	drainStartedAt = Date.now();
+	console.log(`${ts()} [Server] ${signal} with ${activeCalls.size} live call(s): draining, new calls refused`);
+	const tick = setInterval(() => {
+		if (drainMayExit(activeCalls.size, drainStartedAt, Date.now())) {
+			clearInterval(tick);
+			console.log(`${ts()} [Server] drain complete (${activeCalls.size} call(s) left); exiting`);
+			cleanupNgrok();
+			process.exit(0);
+		}
+	}, 1000);
 }
 
 function cleanupNgrok(): void {
@@ -1346,9 +1385,14 @@ const server = createServer(async (req, res) => {
 		return;
 	}
 
+	if (isDrainBlocked(path, req.method, draining)) {
+		json(res, 503, { error: 'draining: the server is shutting down after its live calls end', activeCalls: activeCalls.size });
+		return;
+	}
+
 	try {
 		if (path === '/health' && req.method === 'GET') {
-			json(res, 200, { status: 'ok', activeCalls: activeCalls.size, webhookUrl: WEBHOOK_BASE_URL });
+			json(res, 200, { ...healthPayload({ activeCalls: activeCalls.size, webhookUrl: WEBHOOK_BASE_URL, startedAt: STARTED_AT, bundlePath: process.argv[1] ?? '' }), draining });
 
 		} else if (path === '/call' && req.method === 'POST') {
 			await waitForWebhook();
@@ -1782,10 +1826,10 @@ wss.on('connection', (ws: WebSocket) => {
 
 
 					try {
-						(callSession.voiceSession as any).handleAudioFromClient(pcm16k);
+						callSession.voiceSession.feedAudioFromClient(pcm16k);
 					} catch (e) {
 						if (mediaEventCount % 100 === 0) {
-							console.error(`${ts()} [WS] handleAudioFromClient error:`, e);
+							console.error(`${ts()} [WS] feedAudioFromClient error:`, e);
 						}
 					}
 					break;
@@ -1869,6 +1913,14 @@ async function start(): Promise<void> {
 		} else {
 			WEBHOOK_BASE_URL = await startNgrokCli(PORT);
 		}
+		// Opt-in: re-point the number at the tunnel bound just above (the runtime
+		// URL, never a recorded one); a number shared with another host stays put.
+		if (process.env.TWILIO_AUTO_WEBHOOK === '1') {
+			await syncTwilioWebhook({ sid: TWILIO_ACCOUNT_SID, token: TWILIO_AUTH_TOKEN, number: TWILIO_PHONE_NUMBER }, WEBHOOK_BASE_URL, {
+				log: (line) => console.log(`${ts()} ${line}`),
+				error: (line) => console.error(`${ts()} ${line}`),
+			});
+		}
 		console.log(`\n╔════════════════════════════════════════════════════╗`);
 		console.log(`║  Phone Server (bodhi VoiceSession)                 ║`);
 		console.log(`╠════════════════════════════════════════════════════╣`);
@@ -1893,9 +1945,9 @@ async function start(): Promise<void> {
 	}
 }
 
-process.on('SIGINT', () => { cleanupNgrok(); process.exit(0); });
-process.on('SIGTERM', () => { cleanupNgrok(); process.exit(0); });
-process.on('uncaughtException', (err) => { console.error(`${ts()} [FATAL]`, err); cleanupNgrok(); process.exit(1); });
-process.on('unhandledRejection', (err) => { console.error(`${ts()} [FATAL]`, err); cleanupNgrok(); process.exit(1); });
+process.on('SIGINT', () => beginShutdown('SIGINT'));
+process.on('SIGTERM', () => beginShutdown('SIGTERM'));
+process.on('uncaughtException', (err) => { console.error(`${ts()} [FATAL]`, err); shuttingDown = true; cleanupNgrok(); process.exit(1); });
+process.on('unhandledRejection', (err) => { console.error(`${ts()} [FATAL]`, err); shuttingDown = true; cleanupNgrok(); process.exit(1); });
 
 start().catch(err => { console.error('Fatal:', err); cleanupNgrok(); process.exit(1); });

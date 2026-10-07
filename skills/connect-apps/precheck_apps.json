@@ -1,7 +1,9 @@
 {
   "version": 1,
-  "_comment": "keyword -> toolkit slug table for hooks/connect-precheck.py. Slugs are Station (Composio) toolkit slugs; keywords are matched as whole words, case-insensitive, in the owner's message. Order matters: the first app whose keyword matches an ambiguous word (email) is the one named.",
+  "_comment": "keyword -> toolkit slug table for hooks/connect-precheck.py. Slugs are Station (Composio) toolkit slugs; keywords are matched as whole words, case-insensitive, in the owner's message. A longer phrase beats a shorter one it contains ('cold email campaign' names Smartlead, not Gmail). `prefer_skill` names a local skill that owns the app's job end to end (its own API key in the vault); such an app never gets a Connect card and the bare connector is never used for it.",
   "apps": [
+    {"slug": "smartlead", "name": "Smartlead", "prefer_skill": "campaign-runner",
+     "keywords": ["smartlead", "cold email", "cold emails", "cold email campaign", "email campaign", "email campaigns", "outbound campaign", "outbound campaigns", "email sequence", "email sequences", "mailbox warmup", "campaign stats", "campaign reply", "campaign replies"]},
     {"slug": "gmail", "name": "Gmail",
      "keywords": ["gmail", "email", "e-mail", "emails", "mail", "inbox", "unread messages"]},
     {"slug": "googlecalendar", "name": "Google Calendar",

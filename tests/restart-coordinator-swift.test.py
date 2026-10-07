@@ -16,6 +16,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+import sys
+sys.path.insert(0, str(ROOT / "tests" / "_helpers"))
+from os_probes import SWIFTC_SKIP_REASON, swiftc_usable  # noqa: E402
 COORDINATOR = ROOT / "src" / "Sutando" / "RestartCoordinator.swift"
 
 PROBE = r"""
@@ -176,7 +179,7 @@ default:
 """
 
 
-@unittest.skipUnless(shutil.which("swiftc"), "swiftc not available")
+@unittest.skipUnless(swiftc_usable(), SWIFTC_SKIP_REASON)
 class TestRestartCoordinator(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

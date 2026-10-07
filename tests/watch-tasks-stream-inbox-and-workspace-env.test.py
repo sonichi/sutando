@@ -44,11 +44,13 @@ def _private_repo(td: Path) -> Path:
     return root
 
 
-def _run_watcher(root: Path, env: dict, ready, timeout: float = 8.0) -> None:
+def _run_watcher(root: Path, env: dict, ready, inbox: str, timeout: float = 8.0) -> None:
     """Run the watcher until `ready()` or the deadline. It is a process GROUP
-    (bash, fswatch, a sleep loop); killing the leader alone leaves children."""
+    (bash, fswatch, a sleep loop); killing the leader alone leaves children.
+    `inbox` is the --inbox tag: the same directory the env resolves to."""
     p = subprocess.Popen(
-        ["bash", str(root / "src" / "watch-tasks-stream.sh")],
+        ["bash", str(root / "src" / "watch-tasks-stream.sh"),
+         "--role", "standby", "--inbox", inbox],
         cwd=str(root), env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
     )
@@ -78,7 +80,8 @@ def _watched_dir(extra_env: dict, td: Path) -> tuple[bool, bool]:
     root = _private_repo(td)
     ws = td / "ws"
     env = _base_env(SUTANDO_RESULTS_DIR=str(ws / "results"), **extra_env)
-    _run_watcher(root, env, lambda: (ws / "tasks").is_dir() or (td / "deliveries").is_dir())
+    _run_watcher(root, env, lambda: (ws / "tasks").is_dir() or (td / "deliveries").is_dir(),
+                 inbox=env.get("SUTANDO_TASKS_DIR", str(ws / "tasks")))
     return (ws / "tasks").is_dir(), (td / "deliveries").is_dir()
 
 
@@ -100,7 +103,7 @@ def _state_root(extra_env: dict, td: Path) -> tuple[bool, bool, bool]:
     )
     under_ws = ws / "state" / "task-event-handler-claims"
     under_inbox = td / "deliveries" / "state" / "task-event-handler-claims"
-    _run_watcher(root, env, lambda: under_ws.is_dir() or under_inbox.is_dir())
+    _run_watcher(root, env, lambda: under_ws.is_dir() or under_inbox.is_dir(), inbox=str(inbox))
     return under_ws.is_dir(), under_inbox.is_dir(), inbox.is_dir()
 
 

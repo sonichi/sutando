@@ -3,7 +3,7 @@
  "tools": [
   {
    "name": "call_contact",
-   "description": "Look up a phone number and call a contact. Searches macOS Contacts by name. Instant. Use for ANY contact lookup or phone call — \"find Bob's number\", \"call Mary\", \"look up Susan's phone\".",
+   "description": "Look up a phone number and call a contact. Searches macOS Contacts by name (only when the owner allowed the local Contacts app on this host; otherwise it tells you what to ask the owner). Instant. Use for ANY contact lookup or phone call — \"find Bob's number\", \"call Mary\", \"look up Susan's phone\".",
    "execution": "inline",
    "params": {
     "message": "What to tell the person. They have no tools — include all details they might need.",
@@ -12,7 +12,7 @@
   },
   {
    "name": "call_contact",
-   "description": "Look up a phone number and call a contact. Searches macOS Contacts by name. Instant. Use for ANY contact lookup or phone call — \"find Bob's number\", \"call Mary\", \"look up Susan's phone\".",
+   "description": "Look up a phone number and call a contact. Searches macOS Contacts by name (only when the owner allowed the local Contacts app on this host; otherwise it tells you what to ask the owner). Instant. Use for ANY contact lookup or phone call — \"find Bob's number\", \"call Mary\", \"look up Susan's phone\".",
    "execution": "inline",
    "params": {
     "message": "What to tell the person. They have no tools — include all details they might need.",
@@ -163,7 +163,7 @@
   },
   {
    "name": "get_core_status",
-   "description": "Get what the core agent (Claude Code) is currently doing. Use when the user asks \"what are you working on\", \"what are you up to\", \"are you busy\", \"anything running\", or similar questions about background work. Instant file read. Call it ONLY for those explicit status questions — NEVER on greetings (\"hello\"), filler, garbled speech, or as a fallback when unsure what the user wants; fire nothing instead.",
+   "description": "Get what the core agent (Claude Code) is currently doing and how many tasks are queued. Use when the user asks \"what are you working on\", \"what are you up to\", \"are you busy\", \"anything running\", \"how many are waiting\", or similar questions about background work. Instant file read. Call it ONLY for those explicit status questions — NEVER on greetings (\"hello\"), filler, garbled speech, or as a fallback when unsure what the user wants; fire nothing instead.",
    "execution": "inline",
    "params": {}
   },
@@ -529,18 +529,18 @@
   },
   {
    "name": "switch_voice_config",
-   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding); \"latest-search\" = gemini-3.1-flash-live-preview + googleSearch:true (newest model with Web grounding; needs a paid-tier VOICE key). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
+   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"use Gemini 3.8\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (legacy 3.1 mode); \"gemini-3.8\" = gemini-3.8-live + googleSearch:false (default low-latency mode); \"latest-search\" = gemini-3.8-live + googleSearch:true (newest model with Web grounding; availability depends on the Gemini project/account quota). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
    "execution": "inline",
    "params": {
-    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web. \"latest-search\" = 3.1+Web grounding."
+    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = legacy 3.1 without Web. \"gemini-3.8\" = 3.8 without Web. \"latest-search\" = 3.8 with Web grounding; availability depends on Gemini project/account quota."
    }
   },
   {
    "name": "switch_voice_config",
-   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding); \"latest-search\" = gemini-3.1-flash-live-preview + googleSearch:true (newest model with Web grounding; needs a paid-tier VOICE key). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
+   "description": "Switch voice-agent to a different model + googleSearch preset and restart. Use when the user explicitly asks to switch — e.g. \"switch to search mode\", \"switch to no-search mode\", \"use 2.5\", \"use 3.1\", \"use Gemini 3.8\", \"turn search on\", \"turn search off\". Presets: \"search\" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); \"no-search\" = gemini-3.1-flash-live-preview + googleSearch:false (legacy 3.1 mode); \"gemini-3.8\" = gemini-3.8-live + googleSearch:false (default low-latency mode); \"latest-search\" = gemini-3.8-live + googleSearch:true (newest model with Web grounding; availability depends on the Gemini project/account quota). Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch requests — NEVER because the conversation merely mentions search/searching, and never on filler or garbled speech; when unsure, fire nothing.",
    "execution": "inline",
    "params": {
-    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = 3.1+no-Web. \"latest-search\" = 3.1+Web grounding."
+    "preset": "Which preset to switch to. \"search\" = 2.5+Web grounding. \"no-search\" = legacy 3.1 without Web. \"gemini-3.8\" = 3.8 without Web. \"latest-search\" = 3.8 with Web grounding; availability depends on Gemini project/account quota."
    }
   },
   {
@@ -550,13 +550,13 @@
    "params": {
     "dm_on_timeout": "If true, send a Discord DM to the owner when this task hits its timeout. Default false (silent UI-only timeout, per Susan PR #578). Use only for tasks the user has explicitly flagged as critical. The Chi-override to default-true (2026-05-03 06:00 PT) was reverted at 06:47 PT after Chi flagged a timeout DM that shouldn't have gone through.",
     "task": "Full description of the task to perform",
-    "timeout_minutes": "Per-task timeout in minutes. Default 10. Pass a larger value (e.g. 30) for multi-step jobs like rendering, batch encoding, or long research. Pass 0 for no timeout — use sparingly, only when the user explicitly asks for a long autonomous job that may legitimately take hours."
+    "timeout_minutes": "Per-task timeout in minutes. Default 60. Lower it (e.g. 5) only when a late answer is worse than no answer, so the user is told it failed instead of waiting. Pass 0 for no timeout — use sparingly, only when the user explicitly asks for a long autonomous job that may legitimately take hours."
    }
   }
  ],
- "instructions_hash_fixed_env": "4bfd0db86de348a3cd2be8b1acf85952a50d63f1a06c157f001ddc6cb83eb7f5",
+ "instructions_hash_fixed_env": "d62c80a88a2a5d4a8839437b710ed1541005da10ddd19ba363b2683bf045e1de",
  "meeting_greeting": "[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says \"Sutando\" or \"hey Sutando\" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no \"silent\", no sounds. You are an invisible note-taker until called upon.]\n\n[MODE-MARKER-MEETING]",
  "regions": {
-  "tool_table": "e6d53e7a98b6c0f052148b6bae6096eab4e5768fb8187be8d03deee179023e78"
+  "tool_table": "4dde4aec376b971beec73d13e6561c509386970286531dd36eb32ca2c4304f3f"
  }
 }

@@ -2,21 +2,78 @@
 # Persistent Codex CLI implementation of the Sutando core.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
+# Pure bash, no external dirname: this is the launcher's own first line, run
+# before anything has confirmed PATH resolves basic commands at all.
+case "$0" in
+  */*) _self_dir="${0%/*}" ;;
+  *)   _self_dir="." ;;
+esac
+REPO="$(cd "$_self_dir/../../../.." && pwd)"
+unset _self_dir
 cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
 
-# This runtime has no worker mode: everything below is the canonical core's
-# ceremony, so an instance launch is refused before the first step of it.
+# This entry point only launches the canonical core. A Codex pool worker uses
+# the pool's runtime launcher instead.
 if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
-  echo "start-cli: SUTANDO_INSTANCE_ID is set, but Codex workers are unsupported — only the claude runtime launches a pool worker." >&2
+  echo "start-cli: SUTANDO_INSTANCE_ID is set; launch Codex workers through the pool launcher." >&2
   exit 2
 fi
 
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 WATCHER_SESSION="${SESSION}-watcher"
+
+EXTERNAL_HELPERS=""
+RECONCILE_SCHEDULES=1
+_LAUNCH_ARGS=()
+while [ "$#" -gt 0 ]; do
+  if [[ "$1" == --no-schedule-reconcile=* ]]; then
+    echo "start-cli: --no-schedule-reconcile takes no value" >&2
+    exit 2
+  elif [ "$1" = "--no-schedule-reconcile" ]; then
+    if [ "$RECONCILE_SCHEDULES" = 0 ]; then
+      echo "start-cli: --no-schedule-reconcile may be specified only once" >&2
+      exit 2
+    fi
+    RECONCILE_SCHEDULES=0
+    shift
+  elif [[ "$1" == --external-helpers=* ]]; then
+    echo "start-cli: use --external-helpers followed by its receipt directory" >&2
+    exit 2
+  elif [ "$1" = "--external-helpers" ]; then
+    if [ -n "$EXTERNAL_HELPERS" ] || [ -z "${2:-}" ]; then
+      echo "start-cli: --external-helpers needs one receipt directory" >&2
+      exit 2
+    fi
+    EXTERNAL_HELPERS="$2"
+    shift 2
+  else
+    _LAUNCH_ARGS+=("$1")
+    shift
+  fi
+done
+if [ "${#_LAUNCH_ARGS[@]}" -gt 0 ]; then
+  set -- "${_LAUNCH_ARGS[@]}"
+else
+  set --
+fi
+check_external_helpers() {
+  [ -n "$EXTERNAL_HELPERS" ] || return 0
+  if [ -n "${_EXTERNAL_HELPER_IDENTITY:-}" ]; then
+    "$_EXTERNAL_HELPER_PY" "$REPO/src/external_core_helpers.py" "$EXTERNAL_HELPERS" \
+      --socket "$TMUX_SOCKET" --session "$SESSION" --expected "$_EXTERNAL_HELPER_IDENTITY" >/dev/null
+  else
+    "$_EXTERNAL_HELPER_PY" "$REPO/src/external_core_helpers.py" "$EXTERNAL_HELPERS" \
+      --socket "$TMUX_SOCKET" --session "$SESSION"
+  fi
+}
+if [ -n "$EXTERNAL_HELPERS" ]; then
+  . "$REPO/scripts/python-binary.sh"
+  _EXTERNAL_HELPER_PY="$(require_python "$REPO" "validate external core helpers")" || exit 1
+  _EXTERNAL_HELPER_IDENTITY="$(check_external_helpers)" || exit 1
+fi
 
 # --visible (sonichi#2410): open a Terminal window attached to the core after
 # boot (or on an already-running no-TTY re-run) via a generated .command +
@@ -160,6 +217,9 @@ CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex)
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
   CORE_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
 fi
+if [ "${SUTANDO_CODEX_AUTO_RESET_ENABLED+x}" = x ]; then
+  CORE_ENV_ARGS+=(-e "SUTANDO_CODEX_AUTO_RESET_ENABLED=$SUTANDO_CODEX_AUTO_RESET_ENABLED")
+fi
 
 CODEX_ARGS=(
   -C "$WORKING_DIR"
@@ -188,11 +248,16 @@ ensure_task_notifier() {
     "$NOTIFIER_SUPERVISOR"
     "$REPO/src/agent/codex/cli/task-notifier.sh"
     "$REPO/src/watch-tasks-stream.sh"
+    "$REPO/src/tasks-dir-resolve.sh"
+    "$REPO/src/watcher_identity.py"
   )
+  # No resolution here: the watcher reads <workspace>/state/task-event-handler.json
+  # itself and fswatches it for changes, so the launcher forwards only a genuine
+  # operator pin (if one is already set) and nothing computed.
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
-  )"
+  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')"
   if session_exists "$WATCHER_SESSION"; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -215,6 +280,12 @@ ensure_task_notifier() {
   fi
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
+  # Standby/grace-period knobs: unset here means the supervisor keeps
+  # its own generic defaults. A skill that needs different pacing for an
+  # instance it spawns sets these in ITS environment before this launcher
+  # runs, same forwarding pattern as every other var above.
+  [ -n "${SUTANDO_NOTIFIER_GRACE_PERIOD:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_GRACE_PERIOD=$SUTANDO_NOTIFIER_GRACE_PERIOD")
+  [ -n "${SUTANDO_NOTIFIER_ROLE_POLL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ROLE_POLL=$SUTANDO_NOTIFIER_ROLE_POLL")
   tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
     "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
 }
@@ -224,6 +295,7 @@ ensure_task_notifier() {
 # best-effort and safely falls back to the generic running/idle/hung states for
 # Codex panes it does not recognize.
 ensure_core_monitor() {
+  if [ -n "$EXTERNAL_HELPERS" ]; then check_external_helpers; return; fi
   local ws mon_out
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
@@ -263,6 +335,7 @@ heartbeat_python() {
   [ -n "$_HB_PY" ] && printf '%s' "$_HB_PY"
 }
 ensure_core_heartbeat() {
+  if [ -n "$EXTERNAL_HELPERS" ]; then check_external_helpers; return; fi
   pgrep -f "$REPO/src/core_heartbeat.py" >/dev/null 2>&1 && return 0
   local _py
   _py="$(heartbeat_python)"
@@ -321,23 +394,46 @@ ensure_codex_scheduler() {
   fi
 }
 
+ensure_codex_auto_reset_timer() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  local ws timer py
+  timer="$REPO/skills/proactive-loop/scripts/codex-auto-reset-timer.py"
+  [ -f "$timer" ] || return 0
+  py="$(heartbeat_python)"
+  if [ -z "$py" ]; then
+    echo "  ⚠ Could not reconcile the Codex earned-reset timer: no runnable Python" >&2
+    return 0
+  fi
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  if ! "$py" "$timer" ensure --workspace "$ws" --codex-home "${CODEX_HOME:-$HOME/.codex}" >/dev/null; then
+    echo "  ⚠ Could not reconcile the Codex earned-reset timer" >&2
+  fi
+}
+
 # Codex has no session CronCreate surface. Two complementary reconcilers run on
-# every launcher invocation, partitioned by reconcile_launchd.py's eligibility
+# each default invocation, partitioned by reconcile_launchd.py's eligibility
 # rules so no entry is double-owned: ensure_durable_schedules moves ordinary
 # fixed crons.json entries onto the OS-backed cron-runner (skipping main-loop,
 # codex-task entries, and anything already launchd-owned), and
 # ensure_codex_scheduler owns execution:codex-task entries plus the canonical
 # five-minute main loop while this runtime is selected.
-ensure_durable_schedules
-ensure_codex_scheduler
 resolve_heartbeat_python
+if [ "$RECONCILE_SCHEDULES" = 1 ]; then
+  ensure_durable_schedules
+  ensure_codex_scheduler
+  ensure_codex_auto_reset_timer
+fi
+
+check_external_helpers || exit 1
 
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION" 2>/dev/null || true
   # Hand the heartbeat over as well: ensure_core_heartbeat only starts one when none is running.
   _hb_py="$(heartbeat_python)"
-  if [ -n "$_hb_py" ]; then
+  if [ -n "$EXTERNAL_HELPERS" ]; then
+    check_external_helpers || exit 1
+  elif [ -n "$_hb_py" ]; then
     "$_hb_py" "$REPO/src/core_heartbeat.py" --stop >/dev/null 2>&1 || echo "WARN heartbeat handoff (--stop) failed — old writer may still be running" >&2
   else
     echo "WARN no runnable python3 for the heartbeat handoff — old writer left running" >&2
@@ -412,6 +508,10 @@ restore_shutdown_sentinel() {
 }
 
 if ! tmux_available; then
+  if [ -n "$EXTERNAL_HELPERS" ]; then
+    echo "start-cli: external helpers require tmux for post-launch verification" >&2
+    exit 1
+  fi
   echo "  ⚠ tmux not found — Codex will run, but file-bridge task wakeups are unavailable" >&2
   if ! command -v codex >/dev/null 2>&1; then
     echo "  ⚠ codex not found — not clearing the shutdown sentinel, no core can start." >&2

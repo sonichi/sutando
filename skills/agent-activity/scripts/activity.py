@@ -5,6 +5,7 @@ events drawer and the dock's Events panel.
   activity.py append "<line>" --kind processing|thinking|working|notice \
       [--task-id ID --from MXID --text "<the user's message>"] [--room ROOM_ID]
   activity.py done "<what was done>" --task-id ID [--room ROOM_ID]
+  activity.py queue --task-file <workspace>/tasks/<task>.txt      -> {"depth": N, "position": K}
 
 A row: {"ts": epoch, "room": ROOM, "line": str, "kind": str, "task": {"id","from","text"}, "done": bool}
 at <workspace>/state/agent-activity.jsonl. Rows of a task stay live in the drawer until its `done` row.
@@ -20,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402,F401
+from task_queue import position as queue_position  # noqa: E402
 from activity_rows import (  # noqa: E402,F401  (the writer lives in core; the CLI keeps these names)
     KINDS, LIVE_ROWS, TEXT_MAX, append, day_of, day_range, default_room, index_path, log_path, open_task_index,
     rotate, summaries_path, summarize, task_from_file,
@@ -43,12 +45,33 @@ def queued(task_file: Path, workspace: Path | None = None) -> int:
     return 0
 
 
+def queue(task_file: Path, workspace: Path | None = None) -> int:
+    """Where this task stands in the pending list: depth (how many are pending) and its 1-based
+    position, 0 when it is no longer pending. The first line to a task's conversation names it.
+    When tasks/ cannot be read: nothing on stdout, the reason on stderr, exit 1 — never a zero."""
+    ws = workspace or task_file.resolve().parent.parent
+    task_id = task_file.stem
+    try:
+        task_id = task_from_file(task_file)[0]["id"]
+    except OSError:
+        pass
+    try:
+        print(json.dumps(queue_position(ws, task_id)))
+    except OSError as exc:
+        print(f"activity: queue not counted, tasks/ could not be read: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     q = sub.add_parser("queued", help="the message reached this device and no turn has it yet; from the task file only")
     q.add_argument("--task-file", required=True)
     q.add_argument("--workspace", default=None, help=argparse.SUPPRESS)
+    qp = sub.add_parser("queue", help="this task's {depth, position} in the pending list")
+    qp.add_argument("--task-file", required=True)
+    qp.add_argument("--workspace", default=None, help=argparse.SUPPRESS)
     for name, help_ in (("append", "one event"), ("done", "the task is finished: its rows leave the drawer")):
         s = sub.add_parser(name, help=help_)
         s.add_argument("line")
@@ -67,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     if a.cmd == "queued":
         return queued(Path(a.task_file), Path(a.workspace) if a.workspace else None)
+    if a.cmd == "queue":
+        return queue(Path(a.task_file), Path(a.workspace) if a.workspace else None)
     task = None
     room = a.room
     if a.task_file:

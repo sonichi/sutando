@@ -1,6 +1,6 @@
 #!/bin/bash
 # Inbox-entry resolver — sourceable so a test can invoke it in isolation.
-# Sourcing this file defines resolve_inbox_entry and nothing else.
+# Sourcing this file defines resolve_inbox_entry, plus run_bounded from bounded-wait.sh.
 
 # Only the adapter that wrote a sentinel knows where its payload lives, so
 # the core just runs the executable it was handed.
@@ -8,11 +8,12 @@
 # The resolver MUST print an ABSOLUTE path: checked with `-f` against the
 # watcher's cwd, not the resolver's, so a relative one fails safe, silently.
 
-# Bounded: this runs inline in the single-threaded dispatch loop, so a hung
-# resolver would hang every future dispatch, not just its own.
-SUTANDO_INBOX_RESOLVER_TIMEOUT="${SUTANDO_INBOX_RESOLVER_TIMEOUT:-5}"
+# Bounded (SUTANDO_INBOX_RESOLVER_TIMEOUT, 5s): this runs inline in the
+# single-threaded dispatch loop, so a hung resolver would hang every future dispatch.
+# shellcheck source=bounded-wait.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bounded-wait.sh"
 resolve_inbox_entry() {
-	local entry="$1" out rc resolved not_absolute out_file resolver_pid watchdog_pid
+	local entry="$1" out rc resolved not_absolute out_file
 	if [ -z "${SUTANDO_INBOX_RESOLVER:-}" ]; then
 		printf '%s\n' "$entry"
 		return 0
@@ -21,25 +22,12 @@ resolve_inbox_entry() {
 		echo "watch-tasks-stream: SUTANDO_INBOX_RESOLVER names no executable ($SUTANDO_INBOX_RESOLVER); refusing to dispatch $entry unresolved" >&2
 		return 3
 	fi
-	# One bounding path, never `timeout` when available: `timeout` with no
-	# kill-after leaves a TERM-resistant resolver unbounded, and only one branch runs per host.
 	out_file="$(mktemp)"
 	# The assignment is APPENDED: $1 stays the entry, so a resolver written
 	# before this flag existed is unaffected, and a new one can require it.
-	"$SUTANDO_INBOX_RESOLVER" "$entry" --workspace "${WORKSPACE_DIR:-}" > "$out_file" 2>/dev/null &
-	resolver_pid=$!
-	# The sleep runs in the watchdog's BACKGROUND under a TERM trap: bash defers a
-	# signal while a foreground child runs, which stalled every resolution.
-	( trap 'kill "$_s" 2>/dev/null; exit 0' TERM
-	  sleep "$SUTANDO_INBOX_RESOLVER_TIMEOUT" & _s=$!; wait "$_s"
-	  # TERM then KILL: a resolver that traps TERM is otherwise unbounded.
-	  kill -TERM "$resolver_pid" 2>/dev/null; sleep 1
-	  kill -KILL "$resolver_pid" 2>/dev/null ) &
-	watchdog_pid=$!
-	wait "$resolver_pid" 2>/dev/null
+	run_bounded "${SUTANDO_INBOX_RESOLVER_TIMEOUT:-5}" -- \
+		"$SUTANDO_INBOX_RESOLVER" "$entry" --workspace "${WORKSPACE_DIR:-}" > "$out_file" 2>/dev/null
 	rc=$?
-	kill -TERM "$watchdog_pid" 2>/dev/null
-	wait "$watchdog_pid" 2>/dev/null
 	out="$(cat "$out_file" 2>/dev/null)"
 	rm -f "$out_file"
 	# First line only, and it must BE a file: a resolver that printed a banner
@@ -53,6 +41,9 @@ resolve_inbox_entry() {
 	esac
 	if [ "$rc" -ne 0 ] || [ -z "$resolved" ] || [ "$not_absolute" -eq 1 ] || [ ! -f "$resolved" ]; then
 		echo "watch-tasks-stream: resolver $SUTANDO_INBOX_RESOLVER did not name an existing ABSOLUTE file for $entry (rc=$rc, first line: ${resolved:-<empty>}); not dispatching it" >&2
+		# rc 3 is the resolver's typed verdict (no payload behind the sentinel);
+		# everything else is a failure of this run and says nothing about the entry.
+		[ "$rc" -eq 3 ] && [ -z "$resolved" ] && return 4
 		return 3
 	fi
 	printf '%s\n' "$resolved"
