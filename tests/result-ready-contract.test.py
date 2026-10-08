@@ -6,15 +6,19 @@ results directory and keeps only provider-specific delivery.
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+from delivery import readiness  # noqa: E402
 from delivery.readiness import is_ready_body, read_ready_result  # noqa: E402
 
 # Every consumer that decides "is this result ready to deliver?".
@@ -76,6 +80,50 @@ class ContractTest(unittest.TestCase):
             self.assertTrue(p.exists(), "an unready result file was consumed")
             p.write_text("the answer")
             self.assertEqual(read_ready_result(p), "the answer")
+
+    def test_body_still_being_written_is_not_ready(self):
+        """The #3956 shape: a header lands, the body follows. The prefix must not be claimed."""
+        import threading
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "task-abc.txt"
+            with open(p, "w") as fh:
+                fh.write("x" * 207)
+                fh.flush()
+                t = threading.Thread(target=lambda: (time.sleep(0.01), fh.write("y" * 2575), fh.flush()))
+                t.start()
+                self.assertIsNone(read_ready_result(p))
+                t.join()
+            self.assertEqual(p.stat().st_size, 2782)
+            self.assertEqual(len(read_ready_result(p)), 2782)
+
+    def test_body_that_grows_during_the_read_is_not_ready(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, "x" * 207)
+            real_read = Path.read_text
+
+            def read_then_append(self_, *a, **kw):
+                text = real_read(self_, *a, **kw)
+                with open(self_, "a") as fh:
+                    fh.write("y" * 2575)
+                return text
+
+            with mock.patch.object(Path, "read_text", read_then_append):
+                self.assertIsNone(read_ready_result(p))
+
+    def test_young_but_still_body_is_ready_after_one_hold(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, "the answer")
+            started = time.monotonic()
+            self.assertEqual(read_ready_result(p), "the answer")
+            self.assertLess(time.monotonic() - started, readiness.SETTLE_SEC)
+
+    def test_settled_body_is_read_without_a_hold(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, "the answer")
+            old = time.time() - 2 * readiness.SETTLE_SEC
+            os.utime(p, (old, old))
+            with mock.patch.object(readiness, "_sleep", side_effect=AssertionError("held a settled file")):
+                self.assertEqual(read_ready_result(p), "the answer")
 
     def test_is_ready_body(self):
         for value in ("", "   ", "\n", None):

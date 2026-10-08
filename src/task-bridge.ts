@@ -1371,11 +1371,10 @@ export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Da
 			if (dmOnTimeout) {
 				try {
 					const proactiveTs = Math.floor(Date.now() / 1000);
-					const proactivePath = join(RESULT_DIR, `proactive-timeout-${taskId}-${proactiveTs}.txt`);
 					const dmBody = taskSnippet
 						? `⏱ Task '${taskSnippet}' timed out after ${minutes}m. The processing engine may need to be restarted, or the task may need a longer timeout via timeout_minutes.`
 						: `⏱ Task ${taskId} timed out after ${minutes}m.`;
-					writeFileSync(proactivePath, dmBody);
+					publishResultFile(`proactive-timeout-${taskId}-${proactiveTs}.txt`, dmBody);
 					console.log(`${ts()} [TaskBridge] Wrote DM-on-timeout proactive file for ${taskId}`);
 				} catch (e) {
 					console.error(`${ts()} [TaskBridge] Failed to emit DM-on-timeout for ${taskId}:`, e);

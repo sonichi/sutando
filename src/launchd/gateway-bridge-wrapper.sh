@@ -115,7 +115,8 @@ emit_restart_alert() {
     return 0
   fi
   echo "$NOW" > "$ALERT_STAMP"
-  printf '%s\n' "⚠️ The gateway bridge exited and was automatically restarted." > "$WORKSPACE/results/proactive-gateway-bridge-restarted-$NOW.txt"
+  printf '%s\n' "⚠️ The gateway bridge exited and was automatically restarted." \
+    | python3 "$REPO/src/result_publish.py" "$WORKSPACE/results/proactive-gateway-bridge-restarted-$NOW.txt"
   osascript -e "display notification \"The gateway bridge exited and was automatically restarted.\" with title \"Sutando\"" >/dev/null 2>&1 || true
 }
 if [ -f "$MARKER" ]; then emit_restart_alert; fi
