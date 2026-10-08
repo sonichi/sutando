@@ -18,7 +18,8 @@ a Finished row whose entry is back, an empty cell, or an entry whose crons.json 
 
 A database already named "Crons" in the room is adopted in place: matching columns are reused,
 missing ones are added. A row sync did not create (adopted by its title) only has its empty cells
-filled from crons.json; a value someone typed there is never overwritten.
+filled from crons.json; a value someone typed there is never overwritten, except Status when that
+entry's crons.json status changes (disabling or re-enabling it is an explicit change of schedule).
 
 The room is CRONS_TABLE_ROOM (--room, env, then this skill's manifest), else the owner's DM room.
 Fail-open: without the room capability, a room, an identity or a connection, one line is printed
