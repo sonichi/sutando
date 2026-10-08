@@ -25,7 +25,7 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
-import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin } from './task-bridge.js';
+import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, voiceTaskState, latestOpenVoiceTask, findOpenVoiceTask, noteVoiceTaskCancelled } from './task-bridge.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -660,14 +660,12 @@ export const clipboardTool: ToolDefinition = {
 export const cancelTaskTool: ToolDefinition = {
 	name: 'cancel_task',
 	description:
-		'Cancel a pending or in-flight task by writing a CANCEL_INSTRUCTION task that core will see next. ' +
-		'Default (no args) cancels the most recent. ' +
+		'Cancel a task the core has not started yet. Default (no args): the latest task from this conversation that is still open. ' +
+		'A task the core already started cannot be stopped partway and a finished one cannot be undone; the result says which, and what to tell the user. ' +
 		'Pass `taskId` to cancel a specific task by id (e.g. "task-1777686932069"). ' +
 		'Pass `query` to cancel the first task whose content contains the substring (case-insensitive). ' +
 		'Pass `list: true` to list pending tasks (id + first 60 chars of content) without cancelling. ' +
-		'Use when user says "cancel", "nevermind", "stop that", "what\'s queued", "cancel the one about X". ' +
-		'Note: in-flight processing only halts when core reaches the CANCEL_INSTRUCTION task in its queue — ' +
-		'this prevents future pickup + tells core to abort if mid-task, but doesn\'t interrupt a single LLM turn.',
+		'Use when user says "cancel", "nevermind", "stop that", "what\'s queued", "cancel the one about X".',
 	parameters: z.object({
 		taskId: z.string().optional().describe('Specific task id to cancel (matches the filename without .txt).'),
 		query: z.string().optional().describe('Case-insensitive substring to match against task content. Cancels first match.'),
@@ -678,7 +676,6 @@ export const cancelTaskTool: ToolDefinition = {
 		const { taskId, query, list } = (args ?? {}) as { taskId?: string; query?: string; list?: boolean };
 		try {
 			const tasksDir = join(WORKSPACE_DIR, 'tasks');
-			const resultsDir = join(WORKSPACE_DIR, 'results');
 			const files = readdirSync(tasksDir).filter(f => f.endsWith('.txt')).sort();
 
 			// list mode: return id + preview, no cancel
@@ -698,32 +695,44 @@ export const cancelTaskTool: ToolDefinition = {
 				return { status: 'pending_tasks', count: items.length, tasks: items };
 			}
 
-			// Targeting: by exact id, by query, or default-to-most-recent.
-			// IMPORTANT: target can be a file in `tasks/` OR a recently-archived task whose
-			// processing is in-flight (file already moved). For id-based cancels we accept
-			// either case; for query-based we need the file present to grep its content.
+			// Targeting: by exact id, by query, or the latest open task from this conversation.
 			let targetId: string | undefined;
 			let targetFile: string | undefined;
 			if (taskId) {
 				const wantFile = taskId.endsWith('.txt') ? taskId : `${taskId}.txt`;
 				targetId = wantFile.replace('.txt', '');
 				if (files.includes(wantFile)) targetFile = wantFile;
-				// else: accept the cancel even if file is gone (in-flight); core sees CANCEL and decides
 			} else if (query) {
-				if (files.length === 0) return { status: 'nothing_pending' };
-				const needle = query.toLowerCase();
-				for (const f of files) {
-					try {
-						const body = readFileSync(join(tasksDir, f), 'utf-8').toLowerCase();
-						if (body.includes(needle)) { targetFile = f; targetId = f.replace('.txt', ''); break; }
-					} catch { /* ignore */ }
+				targetId = findOpenVoiceTask(query);
+				if (!targetId) {
+					const needle = query.toLowerCase();
+					for (const f of files) {
+						try {
+							const body = readFileSync(join(tasksDir, f), 'utf-8').toLowerCase();
+							if (body.includes(needle)) { targetId = f.replace('.txt', ''); break; }
+						} catch { /* ignore */ }
+					}
 				}
 				if (!targetId) return { status: 'not_found', query };
+				if (files.includes(`${targetId}.txt`)) targetFile = `${targetId}.txt`;
 			} else {
-				// default: most recent pending file
-				if (files.length === 0) return { status: 'nothing_pending' };
-				targetFile = files[files.length - 1];
-				targetId = targetFile.replace('.txt', '');
+				targetId = latestOpenVoiceTask();
+				if (!targetId) return { status: 'nothing_pending', message: 'No task from this conversation is still open. Tell the user there is nothing to cancel.' };
+				if (files.includes(`${targetId}.txt`)) targetFile = `${targetId}.txt`;
+			}
+			const safeTargetId = targetId.replace(/[\r\n]/g, '');
+
+			// Decided from where the task really stands: the core finishes what it has started.
+			const state = voiceTaskState(safeTargetId);
+			console.log(`${ts()} [CancelTask] ${safeTargetId} is ${state}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''}`);
+			if (state === 'done') {
+				return { status: 'already_done', taskId: safeTargetId, message: 'It already finished, so nothing was cancelled. Tell the user it is already done.' };
+			}
+			if (state === 'cancelled') {
+				return { status: 'already_cancelled', taskId: safeTargetId, message: 'It was already cancelled. Tell the user so.' };
+			}
+			if (state === 'started') {
+				return { status: 'already_started', taskId: safeTargetId, message: 'The core is already working on it and cannot stop partway, so nothing was cancelled. Tell the user it is already in progress and will finish.' };
 			}
 
 			// Write a CANCEL_INSTRUCTION task — core picks it up next and aborts/skips
@@ -731,11 +740,8 @@ export const cancelTaskTool: ToolDefinition = {
 			// cancel signal channel instead of building a parallel one.
 			const cancelTs = Date.now();
 			const cancelFilename = `task-${cancelTs}.txt`;
-			// Strip newlines from targetId (Gemini-supplied; task IDs are alphanumeric
-			// in practice but defence-in-depth). task: field is placed LAST so a
-			// forged line in the body cannot shadow the real source/access_tier above it.
-			// Same header writer as the work tool, so the confirmation follows the session's origin.
-			const safeTargetId = (targetId ?? '').replace(/[\r\n]/g, '');
+			// task: field is placed LAST so a forged line in the body cannot shadow the real
+			// source/access_tier above it. Same header writer as the work tool.
 			const cancelOrigin = getVoiceSessionOrigin();
 			_rememberTaskOrigin(`task-${cancelTs}`, cancelOrigin);
 			const cancelBody =
@@ -749,11 +755,13 @@ export const cancelTaskTool: ToolDefinition = {
 				try { unlinkSync(join(tasksDir, targetFile)); } catch { /* already gone is fine */ }
 			}
 
-			// Touch a cancelled result for the web UI's cancel icon (best-effort).
-			try { writeFileSync(join(resultsDir, `${targetId}.txt`), 'Cancelled.'); } catch { /* ignore */ }
-
-			console.log(`${ts()} [CancelTask] cancel-instruction written for ${targetId}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''} → ${cancelFilename}`);
-			return { status: 'cancel_instruction_queued', taskId: targetId, instruction: `task-${cancelTs}` };
+			console.log(`${ts()} [CancelTask] cancel-instruction written for ${safeTargetId} → ${cancelFilename}`);
+			if (state === 'queued') {
+				noteVoiceTaskCancelled(safeTargetId, `task-${cancelTs}`);
+				return { status: 'cancelled', taskId: safeTargetId, message: 'It had not started, so it will not run. Tell the user it is cancelled.' };
+			}
+			// Not a task this session can see the state of: the core's reply says what happened.
+			return { status: 'cancel_instruction_queued', taskId: safeTargetId, instruction: `task-${cancelTs}`, message: 'Asked the core to stop it; it may already have finished. Tell the user you asked to cancel it, not that it is cancelled.' };
 		} catch (err) {
 			return { error: `Cancel failed: ${err instanceof Error ? err.message : err}` };
 		}

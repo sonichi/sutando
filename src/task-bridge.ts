@@ -456,6 +456,88 @@ export function _taskActivity(taskId: string): TaskActivity {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Voice task manager: where a task stands, from the core's own records
+// ---------------------------------------------------------------------------
+// Answers from the same records as the timeout clock, so a cancel reports what the core really did.
+export type VoiceTaskState = 'queued' | 'started' | 'done' | 'cancelled' | 'unknown';
+
+// Tasks cancelled before the core started them, and the cancel instructions written for them.
+const _cancelledVoiceTasks = new Set<string>();
+const _cancelInstructions = new Set<string>();
+
+function _activityPhase(taskId: string): string | null {
+	try {
+		const d = JSON.parse(readFileSync(join(REPO_DIR, 'state', 'activity', `${taskId}.json`), 'utf-8')) as { phase?: unknown };
+		return typeof d.phase === 'string' ? d.phase : null;
+	} catch {
+		return null;
+	}
+}
+
+/** A result for the task exists, live or archived (results/archive/YYYY-MM/, this month or last). */
+function _hasResult(taskId: string): boolean {
+	if (existsSync(join(RESULT_DIR, `${taskId}.txt`))) return true;
+	const now = new Date();
+	const last = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+	return [now, last].some((d) => existsSync(join(RESULT_DIR, 'archive', d.toISOString().slice(0, 7), `${taskId}.txt`)));
+}
+
+/** Where the task stands now. "started" means the core is engaged (see _taskActivity), not just handed it. */
+export function voiceTaskState(taskId: string): VoiceTaskState {
+	if (_cancelledVoiceTasks.has(taskId)) return 'cancelled';
+	if (_hasResult(taskId)) return 'done';
+	const phase = _activityPhase(taskId);
+	if (phase === 'COMPLETED' || phase === 'FAILED') return 'done';
+	if (phase === 'CANCELLED') return 'cancelled';
+	const activity = _taskActivity(taskId);
+	if (activity !== 'none') return activity;
+	// No snapshot: a task file still in tasks/ is queued; one the core took may be running.
+	if (existsSync(join(TASK_DIR, `${taskId}.txt`))) return 'queued';
+	return _pendingTasks.has(taskId) ? 'started' : 'unknown';
+}
+
+/** The task "cancel it" means: the latest `work` task this session submitted that is still open. */
+export function latestOpenVoiceTask(): string | undefined {
+	let latest: string | undefined;
+	let at = -Infinity;
+	for (const [id, p] of _pendingTasks) {
+		if (_cancelledVoiceTasks.has(id) || p.submittedAt < at) continue;
+		latest = id;
+		at = p.submittedAt;
+	}
+	return latest;
+}
+
+/** The open voice task whose text contains `query` (case-insensitive), latest first. */
+export function findOpenVoiceTask(query: string): string | undefined {
+	const needle = query.toLowerCase();
+	return [..._pendingTasks.entries()]
+		.filter(([id, p]) => !_cancelledVoiceTasks.has(id) && p.taskText.toLowerCase().includes(needle))
+		.sort((a, b) => b[1].submittedAt - a[1].submittedAt)[0]?.[0];
+}
+
+/**
+ * Called by cancel_task once a queued task is cancelled. The task leaves the
+ * timeout sweep, its card closes, and the core's reply to `instructionId` is not
+ * spoken: the user was told when they asked.
+ */
+export function noteVoiceTaskCancelled(taskId: string, instructionId: string): void {
+	_cancelledVoiceTasks.add(taskId);
+	_cancelInstructions.add(instructionId);
+	_pendingTasks.delete(taskId);
+	_sendTaskStatus?.(taskId, 'done', 'Cancelled.');
+}
+
+/** A cancelled task the core had started after all: the user was told it was cancelled. */
+export const CANCELLED_BUT_FINISHED_NOTE = 'The user cancelled this task and was told it was cancelled, but the core had already started it and it finished. Tell them in one sentence that it finished anyway.';
+
+/** Test-only: forget cancels between cases. */
+export function _resetVoiceTaskCancelsForTest(): void {
+	_cancelledVoiceTasks.clear();
+	_cancelInstructions.clear();
+}
+
 // Dedup window: identical task text within 2 minutes → return existing taskId.
 const DEDUP_WINDOW_MS = 2 * 60 * 1000;
 const normalizeTask = (t: string) => t.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 150);
@@ -795,12 +877,15 @@ const QUEUE_BOOKKEEPING_PREFIXES = ['task-cron-', 'task-bench-', 'task-workstrea
 
 /** How many owner tasks are pending in `dir` besides `excludeId`: the voice
  *  agent's "N ahead of this one". A directory it cannot read counts as 0 —
- *  the number is a courtesy line, never a reason to fail the delegation. */
+ *  the number is a courtesy line, never a reason to fail the delegation.
+ *  A task whose result is already in the sibling results/ is done, not ahead. */
 export function countQueuedAhead(dir: string, excludeId: string): number {
 	let names: string[];
 	try { names = readdirSync(dir); } catch { return 0; }
+	const resultsDir = join(dir, '..', 'results');
 	return names.filter(f => f.startsWith('task-') && f.endsWith('.txt') && f !== `${excludeId}.txt`
-		&& !QUEUE_BOOKKEEPING_PREFIXES.some(p => f.startsWith(p))).length;
+		&& !QUEUE_BOOKKEEPING_PREFIXES.some(p => f.startsWith(p))
+		&& !existsSync(join(resultsDir, f))).length;
 }
 
 /** The sentence the voice agent says when other tasks are ahead; empty when none are. */
@@ -1475,6 +1560,17 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					setTimeout(() => archiveFile(path, 'results', `voice-${Date.now()}`), 10_000);
 					continue;
 				}
+				if (_cancelInstructions.has(taskId)) {
+					console.log(`${ts()} [TaskBridge] ${taskId}: core's reply to a voice cancel the user was already told; archiving unspoken (${result.slice(0, 80)})`);
+					_cancelInstructions.delete(taskId);
+					_deliveredResults.add(file);
+					setTimeout(() => {
+						archiveFile(path, 'results', taskId);
+						const taskFile = join(TASK_DIR, `${taskId}.txt`);
+						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+					}, 5_000);
+					continue;
+				}
 				// [no-send] / [REPLIED] / [deduped: <id>] — archive silently, no voice.
 				// deduped had its own branch above this one, bypassing the ownership gate.
 				// These are set by the core agent when delivery already happened via another path
@@ -1621,6 +1717,7 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					const keptToDm = taskOrigin ? keepVoiceResultToDm(taskId, result, dmOnly) : null;
 					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE);
 					else if (taskOrigin) void _deliverOriginBoundResult(taskId, result, taskOrigin, onResult);
+					else if (_cancelledVoiceTasks.has(taskId)) onResult(result, CANCELLED_BUT_FINISHED_NOTE);
 					else onResult(result);
 					// Notify agent-api directly (task results only), then delete file
 					if (registersTask) {
