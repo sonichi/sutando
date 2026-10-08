@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DictationTranscriptEvent } from 'bodhi-realtime-agent';
@@ -28,10 +28,12 @@ describe('meeting dictation', () => {
 	});
 
 	it('keeps meeting speech before an addressed command and drops fillers', () => {
-		assert.deepEqual(findExitCommand('We ship on Friday. Sutando, come back.'), { before: 'We ship on Friday.' });
-		assert.deepEqual(findExitCommand('Budget is approved. Sutando, end the meeting please.'), { before: 'Budget is approved.' });
-		assert.deepEqual(findExitCommand('Hi, Sutando come back.'), { before: '' });
-		assert.deepEqual(findExitCommand('Okay, stop dictation.'), { before: '' });
+		assert.deepEqual(findExitCommand('We ship on Friday. Sutando, come back.'), { before: 'We ship on Friday.', after: '' });
+		assert.deepEqual(findExitCommand('Budget is approved. Sutando, end the meeting please.'), { before: 'Budget is approved.', after: '' });
+		assert.deepEqual(findExitCommand('Hi, Sutando come back.'), { before: '', after: '' });
+		assert.deepEqual(findExitCommand('Sutando, come back and summarize.'), { before: '', after: 'and summarize.' });
+		assert.equal(findExitCommand('Stop dictation and summarize.'), null, 'an unaddressed command must stand alone');
+		assert.deepEqual(findExitCommand('Okay, stop dictation.'), { before: '', after: '' });
 	});
 
 	it('stays in the meeting when a sentence merely mentions an exit phrase', async () => {
@@ -43,7 +45,7 @@ describe('meeting dictation', () => {
 		assert.match(readFileSync(t.md.notePath!, 'utf-8'), /\] Do not stop dictation until we finish the budget review\.\n$/);
 	});
 
-	function setup() {
+	function setup(opts: { switching?: () => Promise<void>; notePathFor?: (d: string) => string } = {}) {
 		const dir = mkdtempSync(join(tmpdir(), 'meet-'));
 		let mode: 'agent' | 'transcription' = 'agent';
 		const buffer: string[] = [];
@@ -58,7 +60,8 @@ describe('meeting dictation', () => {
 		};
 		const provider = { say: (text: string) => emit(text, false), partial: (text: string) => emit(text, true) };
 		const session = {
-			setTranscriptionMode: async (m: 'agent' | 'transcription') => { mode = m; },
+			// Like bodhi: the mode reads as the old one until the switch (provider start/stop) finishes.
+			setTranscriptionMode: async (m: 'agent' | 'transcription') => { await opts.switching?.(); mode = m; },
 			getTranscriptionMode: () => mode,
 			clearDictationBuffer: () => { buffer.length = 0; },
 			injectText: async (t: string) => { injected.push(t); return true; },
@@ -68,7 +71,7 @@ describe('meeting dictation', () => {
 			},
 		};
 		const md = attachMeetingDictation({
-			session, notePathFor: (d) => join(dir, `notes/meeting-${d}.md`),
+			session, notePathFor: opts.notePathFor ?? ((d) => join(dir, `notes/meeting-${d}.md`)),
 			onExitByVoice: () => { exitedByVoice++; }, log: () => {},
 		});
 		return { md, provider, buffer, injected, get mode() { return mode; }, get exitedByVoice() { return exitedByVoice; } };
@@ -112,6 +115,61 @@ describe('meeting dictation', () => {
 		await tick();
 		assert.equal(t.mode, 'agent');
 		assert.match(readFileSync(path, 'utf-8'), /\] We ship on Friday\.\n$/);
+	});
+
+	it('an exit requested while entry is still starting the transcriber runs after it', async () => {
+		const t = setup({ switching: () => tick(20) });
+		const entering = t.md.enter();
+		const exiting = t.md.exit();
+		await Promise.all([entering, exiting]);
+		assert.equal(t.mode, 'agent', 'the session does not stay in transcription');
+		assert.equal(t.md.notePath, null);
+	});
+
+	it('an entry requested while an exit is unfinished starts a new meeting after it', async () => {
+		const t = setup({ switching: () => tick(20) });
+		await t.md.enter();
+		const exiting = t.md.exit();
+		const entering = t.md.enter();
+		await Promise.all([exiting, entering]);
+		assert.equal(t.mode, 'transcription');
+		assert.ok(t.md.notePath, 'the new meeting has its note');
+		t.provider.say('second meeting point');
+		assert.match(readFileSync(t.md.notePath!, 'utf-8'), /\] second meeting point\n$/);
+	});
+
+	it('a failed entry leaves no meeting behind and can be retried', async () => {
+		let fail = true;
+		const t = setup({ switching: async () => { if (fail) throw new Error('setup timed out'); } });
+		await assert.rejects(t.md.enter(), /setup timed out/);
+		assert.equal(t.mode, 'agent');
+		assert.equal(t.md.notePath, null);
+		fail = false;
+		await t.md.enter();
+		assert.equal(t.mode, 'transcription');
+	});
+
+	it('passes a request spoken with the exit command on to the agent', async () => {
+		const t = setup();
+		await t.md.enter();
+		t.provider.say('We ship on Friday.');
+		t.provider.say('Sutando, come back and summarize.');
+		await tick();
+		assert.equal(t.mode, 'agent');
+		assert.match(t.injected[0], /the user also said: "and summarize\."/);
+	});
+
+	it('tells the agent the notes are incomplete when lines could not be written', async () => {
+		const t = setup();
+		await t.md.enter();
+		rmSync(t.md.notePath!);
+		mkdirSync(t.md.notePath!); // appending to a directory fails
+		t.provider.say('lost point');
+		t.provider.say('Sutando, come back');
+		await tick();
+		assert.match(t.injected[0], /1 of these lines could not be written to the note/);
+		assert.doesNotMatch(t.injected[0], /notes are saved/);
+		assert.match(t.injected[0], /lost point/, 'the agent still gets what was said');
 	});
 
 	it('exit() from the menu returns to agent mode without the voice callback', async () => {
