@@ -5,7 +5,8 @@ exact after rotation, and the summary left at done.
 
 One owner: the agent-activity skill's CLI and the activity bus both write through here, so the
 lock, the rotation, the index and the summary cannot drift between them. Row shape is the contract
-the client reads: {"ts", "room", "line", "kind", "task": {"id","from","text","event","into"}, "done"}.
+the client reads: {"ts", "room", "line", "kind", "task": {"id","from","text","event","into"}, "done",
+"queue": {"depth","position"}?} — `queue` rides only on the queued row, from task_queue.position().
 """
 from __future__ import annotations
 
@@ -174,7 +175,8 @@ def _pid_in_log(path: Path, pid: str) -> bool:
 def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
            done: bool = False, workspace: Path | None = None, live_rows: int | None = None,
            audience: str | None = None, projection: str | None = None,
-           pid: str | None = None, ts: float | None = None, replay: bool = False) -> dict:
+           pid: str | None = None, ts: float | None = None, replay: bool = False,
+           queue: dict | None = None) -> dict:
     """`pid` is the row's stable projection identity: a replay after a partial write (row appended,
     index or summary not) is applied exactly once, each half checking what already landed."""
     if kind not in KINDS:
@@ -192,6 +194,8 @@ def append(line: str, *, kind: str, room: str | None, task: dict | None = None,
         rec["task"] = task
     if done:
         rec["done"] = True
+    if queue:
+        rec["queue"] = queue
     path = log_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     # One lock for the append AND the rotation; the log is opened only under it, so no writer holds

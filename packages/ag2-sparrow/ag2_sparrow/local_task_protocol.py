@@ -137,6 +137,27 @@ def canonical_access_tier(value) -> str:
     tier = str(value or "").strip().lower()
     return LEGACY_ACCESS_TIER_ALIASES.get(tier, tier)
 
+
+# The tiers the AG2 Space broker puts on the wire; the fuller ACCESS_TIERS above
+# also names the local-only spellings.
+BROKER_WIRE_TIERS = ("owner", "team", "guest")
+
+
+def broker_attested_tier(access_tier, requested_access_tier, collaborator) -> tuple[str, bool]:
+    """The tier the AG2 Space broker attests on a task, and whether it is a collaborator.
+
+    Team travels as wire `guest` plus `requested_access_tier: team`; only the exact
+    boolean `collaborator: true` promotes it, so body text cannot opt itself in.
+    Unknown tiers resolve to guest. Any local cap is the caller's, applied after.
+    """
+    def known(value):
+        tier = canonical_access_tier(value)
+        return tier if tier in BROKER_WIRE_TIERS else "guest"
+
+    broker, requested = known(access_tier), known(requested_access_tier)
+    is_collaborator = collaborator is True and "team" in (broker, requested)
+    return ("team" if is_collaborator else broker), is_collaborator
+
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
 # ENFORCED in two places that must stay in lockstep (Codex P2 on PR #1954):
@@ -155,11 +176,14 @@ KNOWN_HEADER_KEYS = (
     "author_id", "chat_id",
     # Reply addressing: header status means only the trusted bridge writes
     # them, and the guard defangs forged body copies of the same names.
-    "thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
+    "thread_ts", "reply_thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
     "addressed_to", "callSid", "caller",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
+    # dm|room verdict a trusted writer stamps (room-bound voice tasks put it
+    # above task:); header status defangs a forged body copy that would claim DM.
+    "channel_kind",
     # Which instance took delivery. Same namespace as the addressee in the body, so a
     # non-addressed core can tell; header status defangs a forged body copy.
     "receiving_instance",
@@ -191,8 +215,17 @@ KNOWN_HEADER_KEYS = (
     # A card click the HITL store already recorded, passed on for the turn it causes;
     # the core trusts it, so the guard must defang a forged copy in body text.
     "hitl_click",
+    # Broker attestation that the message @-mentioned the owner, not this agent;
+    # the core reads it to keep out of the room, so the guard defangs a forged copy.
+    "owner_mentioned",
+    # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
+    # one line and every later line is the writer's; meaningful only under a verified envelope.
+    "task_layout",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
+# Only the task-mid writer may declare its layout; a task-last file carrying it
+# would hand its multi-line body to the trusted scan.
+WRITER_ONLY_KEYS = frozenset({"task_layout"})
 
 # Canonical live task-id shape: `task-<slug>` where slug is dash-separated
 # [a-z0-9] segments (task-1783..., task-chat-1783..., task-phone-...,
@@ -619,6 +652,61 @@ def iter_result_candidates(results_dir: Path, task_id: str) -> Iterator[Path]:
     yield from _iter_archived_result_candidates(results_dir, task_id)
 
 
+def index_result_candidates(results_dir: Path, task_ids) -> dict[str, list[Path]]:
+    """Every EXISTING result file for each id in `task_ids`, keyed by id, from ONE listing of
+    each layout `iter_result_candidates` walks (live, `archive/` flat and epoch-suffixed,
+    `archive/<YYYY-MM>/`, retention `archive-<day>/`). A malformed id gets no entry.
+
+    Same files as walking `iter_result_candidates` per id, without the per-id glob over the
+    flat archive: the cost is the listings plus the ids, never their product. Order within an
+    id is not the lookup precedence; use it for "does any candidate satisfy", not "which one".
+    """
+    wanted = {t for t in task_ids if valid_archive_lookup_id(t)}
+    out: dict[str, list[Path]] = {t: [] for t in wanted}
+    if not wanted:
+        return out
+
+    def take(directory: Path, epoch_forms: bool) -> None:
+        try:
+            entries = os.scandir(directory)
+        except OSError:
+            return
+        with entries:
+            for e in entries:
+                name = e.name
+                if not name.endswith(".txt"):
+                    continue
+                stem = name[:-4]
+                if stem in wanted:
+                    if e.is_file():
+                        out[stem].append(directory / name)
+                    continue
+                if epoch_forms:
+                    cut = stem.rfind("-")
+                    if cut > 0 and stem[:cut] in wanted and _EPOCH_SUFFIX_RE.match(stem[cut + 1:]) and e.is_file():
+                        out[stem[:cut]].append(directory / name)
+
+    base = Path(results_dir)
+    take(base, False)
+    archive = base / "archive"
+    take(archive, True)
+    try:
+        with os.scandir(archive) as entries:
+            months = [e.name for e in entries if _MONTH_DIR_RE.match(e.name) and e.is_dir()]
+    except (OSError, ValueError):
+        months = []
+    for month in months:
+        take(archive / month, True)
+    try:
+        with os.scandir(base) as entries:
+            days = [e.name for e in entries if _RETENTION_DIR_RE.match(e.name) and e.is_dir()]
+    except (OSError, ValueError):
+        days = []
+    for day in days:
+        take(base / day, True)
+    return out
+
+
 def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate an archived result across BOTH layouts in use.
 
@@ -767,6 +855,8 @@ def serialize_task_last(headers: "Iterable[tuple[str, str]]", task_body: str) ->
             raise ValueError("pass the body via task_body, not as a header")
         if key not in _KNOWN_KEY_SET:
             raise ValueError(f"unknown header key {key!r} — add it to KNOWN_HEADER_KEYS first")
+        if key in WRITER_ONLY_KEYS:
+            raise ValueError(f"header {key!r} is reserved for the task-mid writer")
         if "\n" in value or "\r" in value:
             raise ValueError(f"header {key!r} value contains a newline")
         lines.append(f"{key}: {value}")

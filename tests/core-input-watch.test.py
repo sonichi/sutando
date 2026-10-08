@@ -311,6 +311,14 @@ class TestComposeState(unittest.TestCase):
         st, *_ = compose_state(_WORKING, "working", True)
         self.assertEqual(st, "running")
 
+    def test_blocked_base_is_never_hung(self):
+        # runtime-health "blocked" (queued tasks held behind the composer) must not fall
+        # through to "unknown" -> hung, which reads as a wedge and invites a restart.
+        st, detail, _p, kind = compose_state(_WORKING, "blocked", True)
+        self.assertEqual(st, "blocked-known")
+        self.assertIn("queued", detail)
+        self.assertIsNone(kind)
+
     def test_hung_when_base_unknown(self):
         # runtime-health "unknown" = live session but stale/absent core-status
         # (wedged loop) → the supervisor's hung, carrying the pane tail. Uses a
@@ -335,6 +343,106 @@ class TestComposeState(unittest.TestCase):
         self.assertEqual(st2, "hung")
 
 
+# A turn in flight, as Claude Code renders it: output above, the spinner line below.
+_TURN_A = ("⏺ Bash(gh pr list --state open)\n  ⎿  #4944 feat(health): …\n"
+           "✻ Perambulating… (12s · ↓ 1.2k tokens · esc to interrupt)")
+_TURN_B = ("⏺ Bash(gh pr list --state open)\n  ⎿  #4944 feat(health): …\n"
+           "⏺ Read(src/health_snapshot.py)\n  ⎿  Read 400 lines\n"
+           "✻ Perambulating… (15s · ↓ 1.9k tokens · esc to interrupt)")
+# The same frame three minutes later: only the clock and the token count moved.
+_TURN_A_TICKED = ("⏺ Bash(gh pr list --state open)\n  ⎿  #4944 feat(health): …\n"
+                  "✻ Perambulating… (3m 12s · ↓ 4.8k tokens · esc to interrupt)")
+
+
+class TestMovingTurnIsNotHung(unittest.TestCase):
+    """A stale self-report is not a wedge when the pane shows a turn in flight AND it
+    changed since the last poll; a frozen turn still reads hung."""
+
+    def test_a_moving_working_pane_reads_running(self):
+        st, detail, prompt, _k = compose_state(_TURN_B, "unknown", True, prev_pane=_TURN_A)
+        self.assertEqual((st, detail, prompt), ("running", "actively processing", None))
+
+    def test_a_frozen_working_pane_stays_hung(self):
+        st, *_ = compose_state(_TURN_A, "unknown", True, prev_pane=_TURN_A)
+        self.assertEqual(st, "hung")
+
+    def test_the_first_poll_has_no_motion_to_see(self):
+        st, *_ = compose_state(_TURN_A, "unknown", True)
+        self.assertEqual(st, "hung")
+
+    def test_only_the_spinner_clock_moving_is_still_hung(self):
+        st, *_ = compose_state(_TURN_A_TICKED, "unknown", True, prev_pane=_TURN_A)
+        self.assertEqual(st, "hung")
+
+    def test_only_the_spinner_glyph_cycling_is_still_hung(self):
+        for glyph in "✶✳✢·✽*":
+            with self.subTest(glyph=glyph):
+                st, *_ = compose_state(_TURN_A.replace("✻ ", glyph + " "), "unknown", True, prev_pane=_TURN_A)
+                self.assertEqual(st, "hung")
+
+    def test_a_hyphenated_spinner_verb_cycling_its_glyph_is_still_hung(self):
+        prev = _TURN_A.replace("Perambulating", "Dilly-dallying")
+        for glyph in "✶✳✢·✽*":
+            with self.subTest(glyph=glyph):
+                st, *_ = compose_state(prev.replace("✻ ", glyph + " "), "unknown", True, prev_pane=prev)
+                self.assertEqual(st, "hung")
+
+    def test_a_real_captured_turn_reads_as_in_flight_and_its_glyph_cycle_is_not_motion(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
+                            "pane-claude-turn-in-flight.txt")
+        with open(path, encoding="utf-8") as f:
+            real = f.read()
+        self.assertTrue(_mod.cli_wedge.frame_working(real))
+        cycled = real.replace("✢ Transmogrifying…", "✻ Transmogrifying…")
+        self.assertNotEqual(cycled, real)
+        st, *_ = compose_state(cycled, "unknown", True, prev_pane=real)
+        self.assertEqual(st, "hung")
+        grown = real.replace("⏺\n", "⏺ Rain on the roof,\n")
+        st, *_ = compose_state(grown, "unknown", True, prev_pane=real)
+        self.assertEqual(st, "running")
+
+    def test_a_changing_pane_without_a_turn_in_flight_stays_hung(self):
+        st, *_ = compose_state("Running step 4...", "unknown", True, prev_pane="Running step 3...")
+        self.assertEqual(st, "hung")
+
+    def test_the_idle_footer_override_is_unchanged(self):
+        idle = "prior output\n\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        st, *_ = compose_state(idle, "unknown", True, prev_pane=_TURN_A)
+        self.assertEqual(st, "idle-ready")
+
+    def test_the_watcher_carries_the_previous_capture_between_polls(self):
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+        panes, states = iter([_TURN_A, _TURN_B]), []
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "unknown", "signals": {"process": True}}
+
+        class _Stop(Exception):
+            pass
+
+        def _sleep(_s):
+            with open(out) as f:
+                states.append(json.load(f)["state"])
+            if len(states) == 2:
+                raise _Stop
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--no-chat-escalation"]
+        with patch.object(_mod, "capture", lambda s, sess: next(panes)), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "session_runtime", lambda *a: None), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod.time, "sleep", _sleep), \
+                patch.object(sys, "argv", argv), self.assertRaises(_Stop):
+            main()
+        self.assertEqual(states, ["hung", "running"])
+
+
 class TestRefusedTurn(unittest.TestCase):
     """#4015: a turn the CLI refuses is a FINISHED turn at the idle footer — no gate, no
     affordance — so classify() cannot see it and every base health reads idle-ready.
@@ -353,12 +461,14 @@ class TestRefusedTurn(unittest.TestCase):
             self.assertIn("turn-rejected", detail)
 
     def test_a_bare_done_line_counts(self):
-        # The captured shape without "· done HH:MM" (tests/runtime-health.test.py).
+        # The captured shape without "· done HH:MM" (tests/runtime-health.test.py). A refused
+        # LOGIN is the signed-out state itself, whatever the shared health made of the pane.
         pane = ("❯ /startup\n  ⎿  OAuth access token has expired · Please run /login\n"
                 "✻ Worked for 0s\n" + _IDLE_FOOTER)
-        st, _d, prompt, kind = compose_state(pane, "idle", True)
-        self.assertEqual((st, kind), ("blocked-human", "turn-rejected"))
-        self.assertEqual(prompt, "OAuth access token has expired · Please run /login")
+        for base in ("idle", "working", "unknown", "needs_login"):
+            st, _d, prompt, kind = compose_state(pane, base, True)
+            self.assertEqual((st, kind), ("logged-out", "login"), base)
+            self.assertEqual(prompt, "OAuth access token has expired · Please run /login")
 
     def test_a_successful_last_turn_stays_idle_ready(self):
         for base in ("idle", "unknown"):
@@ -407,11 +517,16 @@ class TestRefusedTurn(unittest.TestCase):
 
     def test_the_clis_own_not_logged_in_line_is_a_refusal(self):
         for line in ("Not logged in · Please run /login", "You are not logged in. Run /login",
-                     "not logged in", "Run /login first: not logged in"):
+                     "Run /login first: not logged in"):
             pane = f"❯ /startup\n  ⎿  {line}\n✻ Worked for 0s\n" + _IDLE_FOOTER
             st, _d, prompt, kind = compose_state(pane, "idle", True)
-            self.assertEqual((st, kind), ("blocked-human", "turn-rejected"), line)
+            self.assertEqual((st, kind), ("logged-out", "login"), line)
             self.assertEqual(prompt, line)
+        # The bare three words with no /login token are not the signed-out state: the shared
+        # banner grammar (cli_wedge needs-login) keeps prose clean; the turn is still refused.
+        pane = "❯ /startup\n  ⎿  not logged in\n✻ Worked for 0s\n" + _IDLE_FOOTER
+        st, _d, prompt, kind = compose_state(pane, "idle", True)
+        self.assertEqual((st, kind, prompt), ("blocked-human", "turn-rejected", "not logged in"))
 
     def test_a_tool_result_alone_in_a_short_turn_is_not_a_refusal(self):
         # Same ownership, no trailing agent line: the `⏺` header already says the turn ran.
@@ -464,6 +579,248 @@ class TestRefusedTurn(unittest.TestCase):
         self.assertIsNone(_mod.answer_step("blocked-human", "turn-rejected", _REFUSAL_LINE, None))
 
 
+_LOGIN_EXPIRED = "Login expired · Please run /login"
+_LOGIN_REFUSED = f"❯ /startup\n  ⎿  {_LOGIN_EXPIRED}\n✻ Worked for 0s\n"
+
+
+class TestLoginExpiredStands(unittest.TestCase):
+    """User feedback 2026-09-29 (P1-41): four workers on a six-seat pool host printed
+    "Login expired · Please run /login" in a 0 s turn, and every "session expired" card was
+    edited to Resolved within 30 s. The refusal was no longer the LAST completed turn (the
+    seat had been typed at again, or a turn was spinning), so `refused_turn` stood down and
+    the tick read idle-ready — and on a worker seat the shared health reads the CORE's fresh
+    status file and calls the pane's login marker a false positive. The pane's own refusal
+    is the signed-out state until the pane shows a turn that ran."""
+
+    def test_a_refused_login_under_a_newer_typed_prompt_is_still_logged_out(self):
+        pane = _LOGIN_REFUSED + _IDLE_FOOTER.replace("❯ \n", "❯ try again\n", 1)
+        for base in ("idle", "working", "unknown"):
+            st, _d, prompt, kind = compose_state(pane, base, True)
+            self.assertEqual((st, kind, prompt), ("logged-out", "login", _LOGIN_EXPIRED), base)
+
+    def test_a_refused_login_under_a_spinning_turn_is_still_logged_out(self):
+        pane = _LOGIN_REFUSED + "❯ try again\n✻ Perambulating… (1m 46s · ↓ 5.9k tokens)\n" + _IDLE_FOOTER
+        st, _d, prompt, kind = compose_state(pane, "working", True)
+        self.assertEqual((st, kind, prompt), ("logged-out", "login", _LOGIN_EXPIRED))
+
+    def test_a_refused_login_repeated_by_a_re_armed_seat_is_one_episode(self):
+        # Two refusals, same line: the card's episode key is the line, so one card.
+        pane = _LOGIN_REFUSED + _LOGIN_REFUSED + _IDLE_FOOTER
+        st, _d, prompt, kind = compose_state(pane, "idle", True)
+        self.assertEqual((st, kind, prompt), ("logged-out", "login", _LOGIN_EXPIRED))
+
+    def test_a_signed_in_turn_after_the_refusal_is_idle_ready(self):
+        st, _d, prompt, kind = compose_state(_LOGIN_REFUSED + _STARTUP_OK_TURN + _IDLE_FOOTER, "idle", True)
+        self.assertEqual((st, kind, prompt), ("idle-ready", None, None))
+
+    def test_login_successful_after_the_refusal_is_idle_ready(self):
+        st, *_ = compose_state(_LOGIN_REFUSED + "  ⎿  Login successful\n" + _IDLE_FOOTER, "idle", True)
+        self.assertEqual(st, "idle-ready")
+
+    def test_a_credits_refusal_is_still_a_rejected_turn_not_a_login(self):
+        # Only the login family is the signed-out state; the spend/wait refusal keeps its kind.
+        st, _d, prompt, kind = compose_state(_REFUSED_TURNS + _IDLE_FOOTER, "idle", True)
+        self.assertEqual((st, kind, prompt), ("blocked-human", "turn-rejected", _REFUSAL_LINE))
+
+    def test_a_live_login_menu_still_outranks_the_refusal_in_scrollback(self):
+        st, _d, _p, kind = compose_state(_LOGIN_REFUSED + _LOGIN_MENU, "idle", True)
+        self.assertEqual((st, kind), ("blocked-human", "login"))
+
+    def test_the_words_inside_a_turn_that_ran_are_not_a_login_refusal(self):
+        pane = ("❯ check auth\n⏺ Bash(cat diagnostic.txt)\n"
+                f"  ⎿  {_LOGIN_EXPIRED}\n● The diagnostic was read successfully.\n"
+                "✻ Worked for 1s\n" + _IDLE_FOOTER)
+        st, *_ = compose_state(pane, "idle", True)
+        self.assertEqual(st, "idle-ready")
+
+
+class TestNovelPromptBesideAnOldFooter(unittest.TestCase):
+    """An unforeseen confirmation rendered under an idle footer that is still
+    in the 14-line window. The footer vouches only for itself: the prompt is
+    live, so this is `unknown`, not idle, and never idle-ready."""
+
+    PANE = "\n".join([
+        "❯",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+        "Overwrite the existing config file?",
+        "Enter to confirm · Esc to cancel",
+        "❯",
+    ])
+
+    def test_classify_surfaces_it_as_unknown(self):
+        kind, _ = _mod.classify(self.PANE)
+        self.assertEqual(kind, "unknown")
+
+    def test_it_is_not_idle_ready(self):
+        self.assertFalse(_mod._is_idle_ready(self.PANE))
+
+    def test_a_plain_idle_footer_is_still_idle(self):
+        self.assertIsNone(_mod.classify(_IDLE))
+        self.assertTrue(_mod._is_idle_ready(_IDLE))
+
+
+class TestComposerIsEmpty(unittest.TestCase):
+    """_composer_is_empty: distinct from _is_idle_ready -- an idle-ready
+    footer and an unsent owner draft in the composer are not mutually
+    exclusive (task-notifier.sh's typing-safety gate, #4307)."""
+
+    def test_empty_composer_is_empty(self):
+        self.assertTrue(_mod._composer_is_empty(_IDLE))
+
+    def test_a_draft_in_the_composer_is_not_empty(self):
+        draft = _IDLE.replace("❯ ", "❯ owner draft")
+        self.assertFalse(_mod._composer_is_empty(draft))
+
+    def test_no_prompt_line_at_all_fails_closed(self):
+        self.assertFalse(_mod._composer_is_empty("no prompt line here\njust text"))
+
+    def test_the_bottommost_prompt_line_wins_over_older_scrollback(self):
+        pane = "❯ stale text\n" + _IDLE
+        self.assertTrue(_mod._composer_is_empty(pane))
+
+    # Verbatim `capture-pane -e` composer lines from Claude Code v2.1.276: the
+    # suggested reply is an SGR-2 span, the typed draft carries no escape at all.
+    GHOST = "\x1b[39m❯ \x1b[2myes\x1b[0m"
+    TYPED = "\x1b[39m❯ hello draft"
+
+    def test_dim_ghost_text_is_not_a_draft(self):
+        self.assertTrue(_mod._composer_is_empty(_IDLE.replace("❯ ", self.GHOST)))
+
+    def test_a_typed_draft_in_an_escaped_capture_is_not_empty(self):
+        self.assertFalse(_mod._composer_is_empty(_IDLE.replace("❯ ", self.TYPED)))
+
+    def test_typed_text_beside_a_dim_span_is_not_empty(self):
+        mixed = _IDLE.replace("❯ ", "\x1b[39m❯ hel\x1b[2mlo\x1b[0m")
+        self.assertFalse(_mod._composer_is_empty(mixed))
+
+    # A peer build dims with 256-colour grey and never emits SGR 2: its idle line is
+    # the grey glyph, a no-break space and a reset; a suggestion there would be grey text.
+    def test_grey_glyph_only_line_is_empty(self):
+        pane = _IDLE.replace("❯ ", "\x1b[38;5;246m❯\xa0\x1b[39m")
+        self.assertTrue(_mod._composer_is_empty(pane))
+
+    def test_grey_ghost_text_is_not_a_draft(self):
+        pane = _IDLE.replace("❯ ", "\x1b[38;5;246m❯\xa0\x1b[39m\x1b[38;5;246myes\x1b[39m")
+        self.assertTrue(_mod._composer_is_empty(pane))
+
+    def test_the_queued_messages_line_is_not_a_draft(self):
+        # After Enter on a running turn the composer shows this hint, not our text.
+        pane = _IDLE.replace("❯ ", "❯ Press up to edit queued messages")
+        self.assertTrue(_mod._composer_is_empty(pane))
+
+    def test_a_grey_colour_outside_the_ramp_is_not_dim(self):
+        pane = _IDLE.replace("❯ ", "\x1b[39m❯ \x1b[38;5;208mdraft\x1b[39m")
+        self.assertFalse(_mod._composer_is_empty(pane))
+
+
+class TestComposerText(unittest.TestCase):
+    """_composer_text: the composer's dewrapped content for EXACT-equality
+    staging checks (task-notifier.sh, #4307 round 3) -- distinct from
+    _composer_is_empty, which only asks whether it's blank."""
+
+    def test_empty_composer_returns_empty_string(self):
+        self.assertEqual(_mod._composer_text(_IDLE), "")
+
+    def test_single_line_draft_is_returned_verbatim(self):
+        draft = _IDLE.replace("❯ ", "❯ owner draft")
+        self.assertEqual(_mod._composer_text(draft), "owner draft")
+
+    def test_no_prompt_line_at_all_returns_none(self):
+        self.assertIsNone(_mod._composer_text("no prompt line here\njust text"))
+
+    def test_wrapped_rows_are_dewrapped_with_no_separator(self):
+        pane = "❯ Sutando task rea\ndy: task-x.txt\n" + "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txt")
+
+    def test_trailing_status_rows_are_stripped(self):
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "──────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txt")
+
+    def test_a_trailing_row_that_only_resembles_a_gate_is_kept(self):
+        # A gate never coexists with an editable composer; a row below the
+        # marker matching gate wording is what the owner typed last.
+        pane = "❯ Sutando task ready: task-x.txt\npermission to continue\n"
+        self.assertEqual(_mod._composer_text(pane),
+                         "Sutando task ready: task-x.txtpermission to continue")
+
+    def test_interior_row_resembling_ui_text_is_kept_as_typed_text(self):
+        # An owner row matching a gate signature ("permission to ...") inside the
+        # composer is typed text: it must survive so the mix compares unequal.
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "permission to continue\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane),
+                         "Sutando task ready: task-x.txtpermission to continue")
+
+    def test_interior_row_matching_the_idle_footer_words_is_kept(self):
+        pane = ("❯ notes for agents in prod\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane), "notes for agents in prod")
+
+    def test_the_box_rule_between_composer_and_footer_is_stripped(self):
+        pane = "❯ Sutando task rea\ndy: task-x.txt\n──────────\n" + \
+               "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txt")
+
+    def test_an_owner_continuation_row_reading_for_agents_survives_the_footer_strip(self):
+        # Popping the real footer must not re-classify the row it exposes:
+        # "for agents" matches the idle regex but here it is what was typed.
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "for agents\n"
+                "──────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txtfor agents")
+
+    def test_for_agents_row_survives_with_no_box_rule_between_it_and_the_footer(self):
+        # With nothing structural between them, popping the footer exposes the
+        # owner row directly; a strip that loops on the idle regex eats it.
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "for agents\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane), "Sutando task ready: task-x.txtfor agents")
+
+    def test_an_owner_row_of_box_characters_survives(self):
+        pane = ("❯ Sutando task ready: task-x.txt\n"
+                "────\n"
+                "more owner text\n"
+                "──────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+        self.assertEqual(_mod._composer_text(pane),
+                         "Sutando task ready: task-x.txt────more owner text")
+
+    def test_interleaved_owner_text_survives_in_the_result(self):
+        # The exact-equality caller depends on this NOT silently dropping
+        # owner text -- a mix must compare unequal to the bare prompt.
+        pane = _IDLE.replace("❯ ", "❯ Sutando task ready: task-x.txt OWNERTEXT")
+        self.assertEqual(_mod._composer_text(pane),
+                          "Sutando task ready: task-x.txt OWNERTEXT")
+
+    def test_the_bottommost_prompt_line_wins_over_older_scrollback(self):
+        pane = "❯ stale text\n" + _IDLE
+        self.assertEqual(_mod._composer_text(pane), "")
+
+    # Captured live from Claude Code v2.1.275 on an idle, never-typed-in pane:
+    # the empty composer renders a hint, and a plain capture loses its dimming.
+    LIVE_PLACEHOLDER_PANE = (
+        "                                            ● high · /effort\n"
+        "────────────────────────────────────────────────────────────────\n"
+        '❯ Try "refactor <filepath>"\n'
+        "────────────────────────────────────────────────────────────────\n"
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+
+    def test_live_placeholder_hint_is_an_empty_composer(self):
+        self.assertEqual(_mod._composer_text(self.LIVE_PLACEHOLDER_PANE), "")
+        self.assertTrue(_mod._composer_is_empty(self.LIVE_PLACEHOLDER_PANE))
+
+    def test_a_draft_that_starts_like_the_hint_is_still_a_draft(self):
+        pane = self.LIVE_PLACEHOLDER_PANE.replace('❯ Try "refactor <filepath>"',
+                                                  '❯ Try "refactor <filepath>" on main')
+        self.assertFalse(_mod._composer_is_empty(pane))
+        self.assertEqual(_mod._composer_text(pane), 'Try "refactor <filepath>" on main')
+
+
 class TestAutoAnswer(unittest.TestCase):
     """M4 decision safety: only strictly-safe gates auto-answer; all else escalates."""
 
@@ -510,6 +867,90 @@ class TestAnswerStep(unittest.TestCase):
 
     def test_disabled_flag_reports_only(self):
         self.assertIsNone(_mod.answer_step("blocked-known", "fable-limit", "p1", None, enabled=False))
+
+
+# An idle Codex core as the monitor captures it: plain text, so the composer's dim
+# placeholder arrives as ordinary characters. Footer from a live Codex 0.157 pane.
+_CODEX_FOOTER = "  GPT-6-Sol ultra · ~/Library/Application Support/sp…  ⚠ 1 warning · f2 to view"
+_CODEX_IDLE = f"• Done — PR #5169 updated.\n\n» Ask Codex to do anything\n\n{_CODEX_FOOTER}"
+_CODEX_IDLE_CARET = f"• Done.\n\n› Improve documentation in @filename\n\n{_CODEX_FOOTER}"
+_CODEX_WORKING = f"• Working (3m 02s • esc to interrupt)\n\n› \n\n{_CODEX_FOOTER}"
+_CODEX_PICKER = f"  Select Model and Effort\n› 4. gpt-5.5 (current)  Proven model\n\n{_CODEX_FOOTER}"
+
+
+class TestCodexIdleIsNotHung(unittest.TestCase):
+    """After a switch to Codex an idle core writes core-status rarely, exactly as
+    Claude's does, so the stale-status `hung` must yield to Codex's own idle footer."""
+
+    def test_an_idle_codex_pane_with_stale_status_is_idle_ready(self):
+        for pane in (_CODEX_IDLE, _CODEX_IDLE_CARET):
+            with self.subTest(pane=pane.splitlines()[2]):
+                st, detail, prompt, _k = compose_state(pane, "unknown", True, runtime="codex")
+                self.assertEqual((st, detail, prompt), ("idle-ready", "ready for a task", None))
+
+    def test_a_codex_pane_that_is_not_at_rest_stays_hung(self):
+        for name, pane in (("working", _CODEX_WORKING), ("picker", _CODEX_PICKER),
+                           ("no footer", "» Ask Codex to do anything"),
+                           ("no prompt", f"Running step 3...\n{_CODEX_FOOTER}")):
+            with self.subTest(name):
+                st, *_ = compose_state(pane, "unknown", True, runtime="codex")
+                self.assertEqual(st, "hung")
+
+    def test_the_claude_rule_is_unchanged(self):
+        idle = "prior output\n\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        for runtime in (None, "claude", "something-new"):
+            with self.subTest(runtime=runtime):
+                self.assertEqual(compose_state(idle, "unknown", True, runtime=runtime)[0], "idle-ready")
+                self.assertEqual(compose_state(_CODEX_IDLE, "unknown", True, runtime=runtime)[0], "hung")
+
+    def _fake_tmux(self, body):
+        import stat
+        import tempfile
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "tmux")
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
+        return d
+
+    def test_session_runtime_reads_the_sessions_own_stamp(self):
+        from unittest.mock import patch
+        cases = (('[ "$3" = show-environment ] && echo SUTANDO_CORE_RUNTIME=codex', "codex"),
+                 ("echo -SUTANDO_CORE_RUNTIME", None),
+                 ("echo SUTANDO_CORE_RUNTIME=codex; exit 1", None),
+                 ("echo SUTANDO_CORE_RUNTIME=", None))
+        for body, want in cases:
+            with self.subTest(body=body), \
+                    patch.dict(os.environ, {"PATH": self._fake_tmux(body) + os.pathsep + os.environ["PATH"]}):
+                self.assertEqual(_mod.session_runtime("/tmp/x.sock", "sutando-core"), want)
+        with patch.object(_mod.subprocess, "run", side_effect=OSError("no tmux")):
+            self.assertIsNone(_mod.session_runtime("/tmp/x.sock", "sutando-core"))
+
+    def test_a_monitor_started_for_claude_reads_the_codex_core_that_replaced_it(self):
+        # The watcher re-reads the stamp each poll: a switch keeps the socket, so the
+        # running monitor is the Claude one. Here tmux is the only runtime source.
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+        tmux = self._fake_tmux('[ "$3" = show-environment ] && echo SUTANDO_CORE_RUNTIME=codex')
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "unknown", "signals": {"process": True}}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
+                "--once", "--no-chat-escalation"]
+        with patch.object(_mod, "capture", lambda s, sess: _CODEX_IDLE), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.dict(os.environ, {"PATH": tmux + os.pathsep + os.environ["PATH"]}), \
+                patch.object(sys, "argv", argv):
+            main()
+        with open(out) as f:
+            self.assertEqual(json.load(f)["state"], "idle-ready")
 
 
 class TestMainAutoAnswerWiring(unittest.TestCase):
@@ -580,7 +1021,8 @@ class TestSendKeys(unittest.TestCase):
         log = os.path.join(d, "argv.log")
         p = os.path.join(d, "tmux")
         with open(p, "w") as f:
-            f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n" + script + "\n")
+            f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n"
+                    + "[ \"$3\" = list-windows ] && { echo 1; " + script + "; }\n" + script + "\n")
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return d, log
 
@@ -591,7 +1033,7 @@ class TestSendKeys(unittest.TestCase):
             self.assertTrue(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
         with open(log) as f:
             self.assertEqual(f.read().split("\n")[:6],
-                             ["-S", "/tmp/x.sock", "send-keys", "-t", "sutando-core:0", "Enter"])
+                             ["-S", "/tmp/x.sock", "send-keys", "-t", "=sutando-core:1", "Enter"])
 
     def test_non_zero_exit_is_false(self):
         from unittest.mock import patch
@@ -601,7 +1043,8 @@ class TestSendKeys(unittest.TestCase):
 
     def test_an_unrunnable_tmux_is_false_not_an_exception(self):
         from unittest.mock import patch
-        with patch.object(_mod.subprocess, "run", side_effect=OSError("no tmux")):
+        with patch.object(_mod.cli_wedge, "core_target", return_value="=sutando-core:0"), \
+                patch.object(_mod.subprocess, "run", side_effect=OSError("no tmux")):
             self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
 
 
@@ -661,6 +1104,83 @@ class TestMainOnce(unittest.TestCase):
                 sig = json.load(f)
         self.assertEqual(sig["state"], "crashed")
         self.assertEqual(sig["session"], "sutando-core")
+
+    def test_a_dead_seat_whose_input_session_lives_on_is_crashed(self):
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+        tmux = shutil.which("tmux")
+        if tmux is None:
+            self.skipTest("tmux not installed")
+        with tempfile.TemporaryDirectory() as td:
+            sock = os.path.join(td, "sock")
+            seat = "sutando-worker-" + "a" * 32
+            subprocess.run([tmux, "-S", sock, "new-session", "-d", "-s", seat + "-input", "sleep 60"],
+                           check=True)
+            out = os.path.join(td, "state", f"core-supervisor.{seat}.json")
+            old, old_sock = sys.argv, os.environ.get("SUTANDO_TMUX_SOCKET")
+            sys.argv = ["core-input-watch.py", f"--socket={sock}", f"--session={seat}",
+                        f"--out={out}", "--no-chat-escalation", "--once"]
+            try:
+                main()
+            finally:
+                sys.argv = old
+                if old_sock is None:
+                    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                else:
+                    os.environ["SUTANDO_TMUX_SOCKET"] = old_sock
+                subprocess.run([tmux, "-S", sock, "kill-server"], check=False)
+            with open(out) as f:
+                self.assertEqual(json.load(f)["state"], "crashed")
+
+    def test_capture_reads_the_core_on_a_base_index_1_host(self):
+        import shutil
+        import subprocess
+        import tempfile
+        import time
+        tmux = shutil.which("tmux")
+        if tmux is None:
+            self.skipTest("tmux not installed")
+        with tempfile.TemporaryDirectory() as td:
+            conf, sock = os.path.join(td, "base1.conf"), os.path.join(td, "sock")
+            with open(conf, "w") as f:
+                f.write("set -g base-index 1\n")
+            subprocess.run([tmux, "-f", conf, "-S", sock, "new-session", "-d", "-s", "sutando-core",
+                            "printf 'core pane here\\n'; sleep 60"], check=True)
+            try:
+                frame = ""
+                for _ in range(20):
+                    frame = _mod.capture(sock, "sutando-core") or ""
+                    if "core pane here" in frame:
+                        break
+                    time.sleep(0.1)
+                self.assertIn("core pane here", frame)
+            finally:
+                subprocess.run([tmux, "-S", sock, "kill-server"], check=False)
+
+    def test_capture_and_keys_target_the_lowest_window_exactly(self):
+        from unittest.mock import patch
+        seen = []
+
+        class R:
+            returncode, stdout = 0, ""
+        with patch.object(_mod.cli_wedge, "core_target", return_value="=seat:1") as target, \
+                patch.object(_mod.cli_wedge, "capture_pane", return_value="frame") as cap, \
+                patch.object(_mod.subprocess, "run", side_effect=lambda argv, **k: seen.append(argv) or R()):
+            self.assertEqual(_mod.capture("s.sock", "seat"), "frame")
+            self.assertTrue(_mod.send_keys("s.sock", "seat", "Enter"))
+        self.assertEqual([c.args for c in target.call_args_list], [("s.sock", "seat")] * 2)
+        cap.assert_called_once_with("s.sock", "=seat:1")
+        self.assertEqual(seen, [["tmux", "-S", "s.sock", "send-keys", "-t", "=seat:1", "Enter"]])
+
+    def test_no_core_window_means_no_capture_and_no_keys(self):
+        from unittest.mock import patch
+        with patch.object(_mod.cli_wedge, "core_target", return_value=None), \
+                patch.object(_mod.subprocess, "run") as run:
+            self.assertIsNone(_mod.capture("s.sock", "seat"))
+            self.assertFalse(_mod.send_keys("s.sock", "seat", "Enter"))
+        run.assert_not_called()
 
     def test_once_blocked_prompt_debounces_on_first_tick(self):
         """A fresh gate with --stable 2 must NOT escalate on the first tick — the

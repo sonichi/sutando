@@ -41,14 +41,12 @@ cloud tools together; the script works out which is which.
    pass `--yes` to `uninstall` without the owner's OK.
 4. **Apply.** Re-run the same command with `--yes`. One failed item doesn't
    stop the rest.
-5. **Report.** Say what's ready and what failed, using the reasons the script
-   prints (not enough credits, plan too low, not found…).
-6. **Use it now; restart only when told.** A newly activated cloud tool is
-   usable at once through `station_find` / `station_call` (the output says
-   "usable now through station_call", `usable_now` in JSON). Only if the output
-   says `RESTART REQUIRED` (`restart_required: true`) did the running engine
-   start without the Station, or for another account; then tell the owner
-   exactly once, after everything else:
+5. **Use it now; restart only when told.** A newly activated cloud tool is
+   **usable at once through `station_find` / `station_call`** (the output says
+   "usable now through station_call", `usable_now` in JSON): go on with the
+   owner's request in the same turn. **Only if the output says `RESTART REQUIRED`**
+   (`restart_required: true`) did the running engine start without the Station,
+   or for another account; then tell the owner exactly once, after everything else:
 
    > New cloud tools are active on your account, but I can only use them after
    > an engine restart: open **Agent settings** (the bot icon, bottom left),
@@ -59,8 +57,12 @@ cloud tools together; the script works out which is which.
    yet (`restart_after_sign_in: true`), the tools need that same one restart
    once the owner signs in; re-check with `status` then.
 
-   Never restart the core yourself. Installed **skills** need no restart; they
+   **Never restart the core yourself, never ask for a restart the output did not
+   name, and never send the owner to a dashboard or Station page to activate:
+   this script is the activation.** Installed **skills** need no restart; they
    are usable right away.
+6. **Report.** Say what's ready and what failed, using the reasons the script
+   prints (not enough credits, plan too low, not found…).
 7. **Price before the first paid call.** `station_find` marks a metered tool
    `confirm_before_call: true`. Before the first `station_call` to such a tool
    in a conversation, state its price from `pricing` ("5 credits per result")

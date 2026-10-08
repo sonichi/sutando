@@ -8,7 +8,7 @@ out via SUTANDO_TELEMETRY=0, and telemetry honors that opt-out. This test
 fails if either half regresses:
 
   1. each test runner sets SUTANDO_TELEMETRY=0
-     - scripts/coverage-gate.sh (local + coverage-gate.yml)
+     - scripts/coverage-gate.sh (local; ci.yml's coverage-gate job)
      - .github/workflows/ci.yml           (node + python tests)
      - .github/workflows/python39-compat.yml
      - .github/workflows/windows-runtime.yml

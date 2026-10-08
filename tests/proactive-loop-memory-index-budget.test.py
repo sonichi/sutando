@@ -9,6 +9,8 @@ import contextlib
 import importlib.util
 import io
 import pathlib
+import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -114,7 +116,15 @@ with tempfile.TemporaryDirectory() as d:
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         rc = mib.main(["--repo", str(REPO), "--index", str(p)])
-    check("report mode on a healthy index exits 0", rc == 0 and "load (limit" in buf.getvalue(), f"rc={rc}")
+    out = buf.getvalue()
+    # Pins the CONTENT of the budget line, not its old phrasing: both limits and
+    # the measured path, so a reader can tell which index the verdict is about.
+    check("report mode on a healthy index exits 0", rc == 0, f"rc={rc}")
+    check("the budget line names the BYTE limit", "/ 25,000 B" in out, out.splitlines()[:2])
+    check("the budget line names the LINE limit too", "/ 200 lines" in out, out.splitlines()[:2])
+    check("the verdict names the index it measured", f"index: {p}" in out, out.splitlines()[:2])
+    check("an explicit --index never carries the $SUTANDO_MEMORY_DIR marker",
+          "SUTANDO_MEMORY_DIR" not in out, out.splitlines()[:1])
     add = pathlib.Path(d) / "add.md"; add.write_text(row(7000))
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -174,6 +184,64 @@ with tempfile.TemporaryDirectory() as d:
     rc, out = run("")
     check("--adding '' is a read-only budget check and warns about nothing",
           "CREATES A NEW MEMORY FILE" not in out, f"rc={rc}")
+
+# A 200-row index sits at the LINE cut on a fifth of the byte budget; reporting
+# bytes alone made that read as roomy.
+with tempfile.TemporaryDirectory() as d:
+    p = pathlib.Path(d) / "MEMORY.md"
+    p.write_text("# Index\n" + "".join(f"- f:row_{i}\n" for i in range(240)))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mib.main(["--repo", str(REPO), "--index", str(p)])
+    out = buf.getvalue()
+    check("a line-capped index reports 200 / 200 lines", "200 / 200 lines" in out,
+          out.splitlines()[:2])
+    mb = re.search(r"^([\d,]+) / 25,000 B", out, re.M)
+    check("and its byte figure is nowhere near the byte limit",
+          mb is not None and int(mb.group(1).replace(",", "")) < 12_000,
+          out.splitlines()[:2])
+    check("it also refuses, because rows past the cut already do not load", rc == 1, f"rc={rc}")
+
+# --- the env marker: only the index the var selected is attributed to it -----
+def _with_env(value, argv):
+    buf = io.StringIO()
+    old = os.environ.get("SUTANDO_MEMORY_DIR")
+    os.environ["SUTANDO_MEMORY_DIR"] = value
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = mib.main(argv)
+    finally:
+        if old is None:
+            os.environ.pop("SUTANDO_MEMORY_DIR", None)
+        else:
+            os.environ["SUTANDO_MEMORY_DIR"] = old
+    return rc, buf.getvalue()
+
+with tempfile.TemporaryDirectory() as d:
+    p = pathlib.Path(d) / "MEMORY.md"
+    p.write_text("# Index\n- f:a\n")
+    rc, out = _with_env(d, ["--repo", str(REPO)])
+    check("with the override selecting the index, the index line says so",
+          rc == 0 and f"index: {p} ($SUTANDO_MEMORY_DIR)" in out, out.splitlines()[:1])
+    rc, out = _with_env("/definitely/not/the/index", ["--repo", str(REPO), "--index", str(p)])
+    check("an explicit --index is not attributed to a set $SUTANDO_MEMORY_DIR",
+          rc == 0 and f"index: {p}\n" in out and "SUTANDO_MEMORY_DIR" not in out,
+          out.splitlines()[:1])
+
+# Report mode alone left the adding-mode header uncovered: dropping line_limit
+# there survived every assertion above.
+with tempfile.TemporaryDirectory() as d:
+    p = pathlib.Path(d) / "MEMORY.md"
+    p.write_text("# Index\n- f:a\n")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mib.main(["--repo", str(REPO), "--index", str(p), "--adding", "- f:b"])
+    out = buf.getvalue()
+    check("--adding names the LINE limit as well as the byte limit",
+          "/ 200 lines" in out and "/ 25,000 B" in out, out.splitlines()[:2])
+    check("--adding reports the line delta, not only the byte delta",
+          "+1 line(s)" in out, out.splitlines()[:2])
+    check("--adding on a small index still exits 0", rc == 0, f"rc={rc}")
 
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} "
       f"({ran - len(fails)}/{ran} assertions)")

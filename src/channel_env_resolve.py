@@ -5,8 +5,20 @@ others into a sibling (e.g. `relay-client.env`) while `.env` holds Matrix
 creds. Resolving by CONTENT rather than filename is what makes one instruction
 correct on both.
 
-This module owns only the SELECTION — the two rules a candidate must satisfy
-are each answered by their existing owner, not re-stated here:
+This module owns the SELECTION, including the candidate ORDER:
+
+  1. `$AG2_DEVICE_ENV`, for the `ag2space` source only. The desktop launcher
+     names this file for every process it spawns; it is the only pointer that
+     reaches a desktop-spawned core. It is trusted because the launcher names
+     it — it is exempt from containment, not approximated by it — but it must
+     be an existing regular file holding a non-empty token, else it falls
+     through. The gateway bridge's `_channel_env_candidates` keeps the same
+     first entry (pinned by tests/channel-env-order-contract.test.py).
+  2. The `channels/<source>` candidates, which must satisfy both rules below.
+
+The channels dir is the caller's input; this module never guesses a home dir.
+The two rules a channels-tree candidate must satisfy are each answered by
+their existing owner, not re-stated here:
 
   * containment — `channel_env_containment.channel_env_is_contained`. The
     caller's contract is `set -a; . "$(...)"; set +a`, so a returned path is
@@ -36,6 +48,26 @@ from channel_token import RELAY_TOKEN_VARS, token_from_env_file  # noqa: E402
 # this list would let the cleaner and the resolver disagree about what a relay is.
 TOKEN_VARS = RELAY_TOKEN_VARS
 
+DEVICE_ENV_VAR = "AG2_DEVICE_ENV"
+DEVICE_ENV_SOURCE = "ag2space"
+
+
+def _has_token(path: Path) -> bool:
+    return any(token_from_env_file(var, path) for var in TOKEN_VARS)
+
+
+def device_env(source: str) -> Path | None:
+    """The launcher-named file when it applies to `source` and is usable."""
+    if source != DEVICE_ENV_SOURCE:
+        return None
+    named = (os.environ.get(DEVICE_ENV_VAR) or "").strip()
+    if not named:
+        return None
+    path = Path(named)
+    if not path.is_file() or not _has_token(path):
+        return None
+    return path
+
 
 def candidates(channel_dir: Path) -> list[Path]:
     """`.env` first so a correct existing layout keeps its precedence, then any
@@ -51,17 +83,21 @@ def candidates(channel_dir: Path) -> list[Path]:
 
 
 def resolve_channel_env(channels_dir, source: str) -> Path | None:
-    """The first candidate that is BOTH contained and holds a non-empty token.
+    """The usable launcher-named file, else the first channels-tree candidate
+    that is BOTH contained and holds a non-empty token.
 
-    None when the channel dir is absent or no candidate satisfies both.
+    None when neither the launcher-named file nor any candidate qualifies.
     """
+    named = device_env(source)
+    if named is not None:
+        return named
     channel_dir = Path(channels_dir) / source
     if not channel_dir.is_dir():
         return None
     for candidate in candidates(channel_dir):
         if not channel_env_is_contained(candidate, channels_dir, source):
             continue
-        if any(token_from_env_file(var, candidate) for var in TOKEN_VARS):
+        if _has_token(candidate):
             return candidate
     return None
 
@@ -71,10 +107,10 @@ def main(argv: list[str]) -> int:
         print("usage: channel_env_resolve.py <channels-dir> <source>", file=sys.stderr)
         return 2
     channels_dir, source = argv[1], argv[2]
-    if not os.path.isdir(os.path.join(channels_dir, source)):
+    resolved = resolve_channel_env(channels_dir, source)
+    if resolved is None and not os.path.isdir(os.path.join(channels_dir, source)):
         print(f"channel-env: no channel dir {os.path.join(channels_dir, source)}", file=sys.stderr)
         return 1
-    resolved = resolve_channel_env(channels_dir, source)
     if resolved is None:
         print(f"channel-env: no contained file under {channels_dir}/{source} defines a "
               f"non-empty {' / '.join(TOKEN_VARS)}", file=sys.stderr)

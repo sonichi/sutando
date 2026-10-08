@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · react — add / remove an agent's reaction on a room event.
 
 Native m.reaction add (`react`) + redact (`unreact`) — the Discord auto-react
@@ -9,8 +11,6 @@ Emoji convention (owner-finalized): 🫡 = task acknowledged (accepted into the
 queue), 👀 = event merely OBSERVED. "received" is a task-ack, so it is 🫡 — 👀
 belongs to ambient observation (events_acceptance.OBSERVE_REACTION) and must
 not double as the receipt ack, which is the collision this convention retires.
-The broker also emits 🫡 server-side at task intake (ag2space-backend#188), so
-this client alias agrees with that one glyph everywhere.
 """
 from __future__ import annotations
 

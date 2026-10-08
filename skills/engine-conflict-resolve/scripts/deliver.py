@@ -8,13 +8,13 @@ reads activity state to guess a "last active" room — a merge proposal is
 owner-only material and a guessed room may be shared.
 
 No room configured, or the room post fails for ANY reason → the fallback always
-runs: macOS notification (best-effort) + a question section inserted into the
-per-host pending-questions.md ABOVE the '# Resolved' divider (via the shared
-src/pending_questions_md.py locator — never a private regex).
+runs: the proposal is asked of the owner through scripts/ask-owner.py (the room
+database, else the workspace outbox; it queues the owner's DM and the macOS
+notification itself).
 
 stdout: {"status": "posted", ...} or {"status": "fallback", "reason": ...};
-exit 0 for both (delivery happened on some channel), 1 only when even the
-pending-questions write failed.
+exit 0 for both (delivery happened on some channel), 1 only when even ask-owner
+could not run.
 """
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ import importlib.util
 import subprocess
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -35,7 +34,7 @@ ROOM_CONFIG_KEY = "ENGINE_CONFLICT_NOTIFY_ROOM"
 
 def _repo_root() -> Optional[Path]:
     for p in Path(__file__).resolve().parents:
-        if (p / "src" / "pending_questions_md.py").is_file():
+        if (p / "scripts" / "ask-owner.py").is_file():
             return p
     return None
 
@@ -70,56 +69,23 @@ def post_via_room_ops(room_ops_dir: Path, room_id: str, body: str) -> Tuple[bool
         return False, f"post-failed: {e.__class__.__name__}: {e}"
 
 
-def notify_macos(title: str) -> bool:
-    try:
-        proc = subprocess.run(
-            ["osascript", "-e",
-             f'display notification "{title}" with title "Sutando"'],
-            capture_output=True, timeout=10)
-        return proc.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-
-def pending_questions_target(override: Optional[Path]) -> Path:
-    if override:
-        return override
+def ask_owner(title: str, body: str, workspace: Optional[Path]) -> dict:
+    """The fallback: core's ask-owner records the question and queues the owner's DM.
+    Raises OSError only when it could not run at all; a non-zero exit is reported."""
     repo = _repo_root()
     if repo is None:
-        die("cannot locate the repo (src/pending_questions_md.py) for the pending-questions fallback",
-            reason="no-repo")
-    if str(repo / "src") not in sys.path:
-        sys.path.insert(0, str(repo / "src"))
-    from util_paths import personal_path, _host_label  # noqa: E402
-    p = personal_path("pending-questions.md")
-    if p.exists():
-        return p
-    from workspace_default import resolve_workspace  # noqa: E402
-    return resolve_workspace() / "hosts" / _host_label() / "pending-questions.md"
-
-
-def write_pending_question(path: Path, title: str, body: str) -> None:
-    """Insert the section ABOVE the '# Resolved' divider (shared locator)."""
-    repo = _repo_root()
-    if repo is not None and str(repo / "src") not in sys.path:
-        sys.path.insert(0, str(repo / "src"))
-    section = "## %s\n- asked: %s\n- source: engine-conflict-resolve\n\n%s\n\n" % (
-        title, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), body.rstrip())
-    text = path.read_text() if path.is_file() else ""
-    insert_at = len(text)
+        raise OSError("cannot locate the repo (scripts/ask-owner.py)")
+    argv = [sys.executable, str(repo / "scripts" / "ask-owner.py"), title,
+            "--context", body.rstrip(), "--urgency", "live"]
+    if workspace:
+        argv += ["--workspace", str(workspace)]
     try:
-        import pending_questions_md as pq
-        m = pq.DIVIDER_RE.search(pq.mask_markup(text))
-        if m:
-            insert_at = m.start()
-    except Exception:
-        pass  # divider location is best-effort; appending is still a valid file
-    if insert_at == len(text) and text and not text.endswith("\n"):
-        section = "\n" + section
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text[:insert_at] + section + text[insert_at:])
-    os.replace(tmp, path)
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise OSError(f"ask-owner did not run: {e.__class__.__name__}: {e}") from e
+    if proc.returncode != 0:
+        raise OSError(f"ask-owner exit {proc.returncode}: {(proc.stderr or proc.stdout).strip()[-300:]}")
+    return {"ask": proc.stdout.strip().splitlines()}
 
 
 def main() -> None:
@@ -131,8 +97,8 @@ def main() -> None:
                     help=f"owner-only room id (else ${ROOM_CONFIG_KEY} / manifest config)")
     ap.add_argument("--room-ops-dir", type=Path,
                     default=skill_dir().parent / "agent-room-ops")
-    ap.add_argument("--pending-questions", type=Path, default=None,
-                    help="override the per-host pending-questions.md target")
+    ap.add_argument("--workspace", type=Path, default=None,
+                    help="workspace for the fallback's ask-owner record (default: the resolved one)")
     args = ap.parse_args()
 
     try:
@@ -148,14 +114,11 @@ def main() -> None:
             emit({"status": "posted", "room": room, "via": "agent-room-ops gateway"})
         reason = fail or "post-failed"
 
-    target = pending_questions_target(args.pending_questions)
     try:
-        write_pending_question(target, args.title, body)
+        asked = ask_owner(args.title, body, args.workspace)
     except OSError as e:
-        die(f"fallback failed too — could not write {target}: {e}", reason="fallback-failed")
-    notified = notify_macos(args.title)
-    emit({"status": "fallback", "reason": reason,
-          "pending_questions": str(target), "notified": notified})
+        die(f"fallback failed too — {e}", reason="fallback-failed")
+    emit({"status": "fallback", "reason": reason, **asked})
 
 
 if __name__ == "__main__":

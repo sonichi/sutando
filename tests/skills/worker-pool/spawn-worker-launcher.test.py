@@ -14,11 +14,14 @@ Run: python3 tests/skills/worker-pool/spawn-worker-launcher.test.py
 from __future__ import annotations
 
 import json
+import os
+import plistlib
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "skills/worker-pool/scripts"))
@@ -30,18 +33,29 @@ import worker_identity as wi  # noqa: E402
 class FakeTmux:
     """Records argv + env; answers has-session from a set of names it knows.
 
-    The core's launcher is faked as well: like the real one, it creates the
-    session named by SUTANDO_TMUX_SESSION and exits non-zero when it cannot."""
+    The worker's own launcher is faked as well: like the real one, it creates
+    the session named by SUTANDO_TMUX_SESSION and exits non-zero when it cannot."""
     def __init__(self, existing=(), fail_on=None, runtime="claude"):
         self.calls, self.existing, self.fail_on = [], set(existing), fail_on
         self.envs, self.runtime = [], runtime
+        self.loaded = set()
 
     def __call__(self, argv, **kw):
         self.calls.append(argv)
         self.envs.append(dict(kw.get("env") or {}))
+        if argv[0] == "launchctl":
+            if argv[1] == "print":
+                return subprocess.CompletedProcess(argv, 0 if argv[2] in self.loaded else 113, "", "")
+            if argv[1] == "bootout":
+                self.loaded.discard(argv[2])
+            if argv[1] == "bootstrap":
+                with open(argv[3], "rb") as fh:
+                    label = plistlib.load(fh)["Label"]
+                self.loaded.add(f"gui/{os.getuid()}/{label}")
+            return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[0] == "bash" and argv[1].endswith("sutando-config.sh"):
             return subprocess.CompletedProcess(argv, 0, self.runtime + "\n", "")
-        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+        if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
             if self.fail_on == "launcher":
                 return subprocess.CompletedProcess(argv, 1, "", "did not come up within ~5s")
             self.existing.add((kw.get("env") or {}).get("SUTANDO_TMUX_SESSION", ""))
@@ -58,7 +72,7 @@ class FakeTmux:
 
     def launches(self):
         return [e for a, e in zip(self.calls, self.envs)
-                if a[0] == "bash" and a[1].endswith("start-cli.sh")]
+                if a[0] == "bash" and a[1].endswith("launch-worker-session.sh")]
 
 class FakeTmuxUnsureAfterLaunch(FakeTmux):
     """Answers "absent" before the launch and "cannot tell" after it — a tmux
@@ -74,7 +88,7 @@ class FakeTmuxUnsureAfterLaunch(FakeTmux):
             if self.launched:
                 return subprocess.CompletedProcess(argv, 1, "", "error connecting to server")
             return subprocess.CompletedProcess(argv, 1, "", "can't find session: x")
-        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+        if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
             self.launched = True
             self.calls.append(argv); self.envs.append(dict(kw.get("env") or {}))
             return subprocess.CompletedProcess(argv, 1, "", "did not come up within ~5s")
@@ -98,7 +112,7 @@ class FakeTmuxSlowStart(FakeTmux):
     cannot distinguish rollback-is-safe from rollback-destroys-a-live-worker.
     """
     def __call__(self, argv, **kw):
-        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+        if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
             self.calls.append(argv)
             self.envs.append(dict(kw.get("env") or {}))
             self.existing.add((kw.get("env") or {}).get("SUTANDO_TMUX_SESSION", ""))
@@ -112,6 +126,13 @@ class Base(unittest.TestCase):
         self._t = tempfile.TemporaryDirectory()
         self.addCleanup(self._t.cleanup)
         self.ws = Path(self._t.name)
+        self.la = self.ws / "LaunchAgents"
+        real_ensure = sw.ensure_remedy_timer
+        patcher = mock.patch.object(
+            sw, "ensure_remedy_timer",
+            side_effect=lambda ws, repo, **kw: real_ensure(ws, repo, launch_agents=self.la, **kw))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 class TestPlan(Base):
@@ -134,6 +155,7 @@ class TestPlan(Base):
         p = sw.plan(self.ws, REPO, cwd="/dev/proj")
         self.assertEqual(p["cwd"], "/dev/proj")
         self.assertNotIn("/dev/proj", p["delivery_dir"])
+        self.assertEqual(p["env"]["SUTANDO_CODEX_WORKING_DIR"], "/dev/proj")
 
 
 class TestRefusals(Base):
@@ -168,7 +190,7 @@ class TestRefusals(Base):
         self.assertFalse(wi.worker_dir(self.ws, probe["worker_id"]).exists())
         self.assertFalse(wi.current_path(self.ws, probe["worker_id"]).exists())
         self.assertFalse(Path(probe["delivery_dir"]).exists())
-        self.assertFalse(any(a[0] == "bash" and a[1].endswith("start-cli.sh") for a in t.calls))
+        self.assertFalse(any(a[0] == "bash" and a[1].endswith("launch-worker-session.sh") for a in t.calls))
 
     def test_a_launcher_failure_surfaces_rather_than_half_creating(self):
         with self.assertRaises(sw.SpawnRefused) as e:
@@ -177,10 +199,55 @@ class TestRefusals(Base):
         self.assertIn("did not come up", str(e.exception))
 
 
+class TestAutomaticRemedyTimer(Base):
+    def _ensure_as_macos(self, runner):
+        # The CI runner is Linux. Exercise macOS's real timer decision logic,
+        # while Base redirects every plist into this test's temporary folder.
+        with mock.patch.object(sys, "platform", "darwin"):
+            return sw.ensure_remedy_timer(self.ws, REPO, runner=runner)
+
+    def test_an_unreadable_workspace_timer_is_not_replaced(self):
+        path = sw.prt.plist_path(self.ws, self.la)
+        path.parent.mkdir(parents=True)
+        path.write_text("not a plist")
+        runner = FakeTmux()
+        out = self._ensure_as_macos(runner)
+        self.assertTrue(out["conflict"])
+        self.assertIn("unreadable timer", out["why"])
+        self.assertEqual(path.read_text(), "not a plist")
+        self.assertFalse(any(c[0] == "launchctl" and c[1] in ("bootout", "bootstrap")
+                             for c in runner.calls))
+
+    def test_a_loaded_workspace_timer_with_no_plist_is_not_replaced(self):
+        runner = FakeTmux()
+        target = sw.prt.service_target(self.ws)
+        runner.loaded.add(target)
+        out = self._ensure_as_macos(runner)
+        self.assertTrue(out["conflict"])
+        self.assertIn("loaded timer with no readable plist", out["why"])
+        self.assertIn(target, runner.loaded)
+        self.assertFalse(any(c[0] == "launchctl" and c[1] in ("bootout", "bootstrap")
+                             for c in runner.calls))
+
+    def test_an_unreadable_legacy_timer_is_not_migrated(self):
+        path = sw.prt.legacy_plist_path(self.la)
+        path.parent.mkdir(parents=True)
+        path.write_text("not a plist")
+        runner = FakeTmux()
+        out = self._ensure_as_macos(runner)
+        self.assertTrue(out["conflict"])
+        self.assertIn("legacy timer with no readable target", out["why"])
+        self.assertEqual(path.read_text(), "not a plist")
+        self.assertFalse(any(c[0] == "launchctl" and c[1] in ("bootout", "bootstrap")
+                             for c in runner.calls))
+
+
 class TestSpawn(Base):
     def test_all_four_parts_exist(self):
         t = FakeTmux()
         got = sw.spawn(self.ws, REPO, runner=t, require_sentinel=False)
+        if sys.platform == "darwin":
+            self.assertEqual(Path(got["remedy_timer"]["plist"]).parent, self.la)
         w = got["worker_id"]
         self.assertTrue((self.ws / "deliveries" / w).is_dir(), "delivery folder")
         self.assertEqual(len(wi.sessions(self.ws, w)), 1, "lineage")
@@ -354,18 +421,76 @@ class TestRuntimeStartFailure(Base):
         self.assertEqual(sessions[0]["session_id"], t.launches()[0]["SUTANDO_CLAUDE_SESSION_ID"])
 
     def test_the_worker_runs_the_runtime_the_core_is_configured_for(self):
+        """No --runtime selection in the launcher argv: WORKER_MODE_RUNTIMES
+        below is the only adapter that ever had worker mode, so `runtime` is
+        recorded for the plan's own callers but the launcher itself needs no
+        flag to know which one it is."""
         t = FakeTmux(runtime="claude")
         got = sw.spawn(self.ws, REPO, runner=t, require_sentinel=False)
         self.assertEqual(got["runtime"], "claude")
-        argv = t.calls[-1]
-        self.assertEqual(argv[argv.index("--runtime") + 1], "claude")
+        argv = [c for c in t.calls if c[0] == "bash" and c[1].endswith("launch-worker-session.sh")][0]
+        self.assertNotIn("--runtime", argv)
 
-    def test_a_configured_runtime_without_worker_mode_is_refused(self):
-        """Worker mode is a property of the ADAPTER. Spawning under one that
-        has none reports a worker the launcher cannot actually isolate."""
+    def test_a_codex_worker_gets_its_runtime_and_folder_without_claude_session_env(self):
+        t = FakeTmux(runtime="codex")
+        got = sw.spawn(self.ws, REPO, cwd="/dev/project", runner=t,
+                       require_sentinel=False)
+        env = t.launches()[0]
+        self.assertEqual(got["runtime"], "codex")
+        self.assertIsNone(got["runtime_session_id"])
+        self.assertEqual(env["SUTANDO_WORKER_RUNTIME"], "codex")
+        self.assertEqual(env["SUTANDO_CODEX_WORKING_DIR"], "/dev/project")
+        self.assertEqual(env["SUTANDO_TASKS_DIR"], got["delivery_dir"])
+        self.assertNotIn("SUTANDO_CLAUDE_SESSION_ID", env)
+        self.assertNotIn("SUTANDO_CLAUDE_RESUME", env)
+        self.assertEqual(wi.sessions(self.ws, got["worker_id"]), [])
+
+    def test_codex_resume_refuses_before_any_identity_write(self):
+        t = FakeTmux(runtime="codex")
         with self.assertRaises(sw.SpawnRefused):
-            sw.spawn(self.ws, REPO, runner=FakeTmux(runtime="codex"),
-                     require_sentinel=False)
+            sw.spawn(self.ws, REPO, runtime="codex", resume="unrecorded-id",
+                     runner=t, require_sentinel=False)
+        self.assertFalse((self.ws / "state" / "workers").exists())
+        self.assertFalse((self.ws / "deliveries").exists())
+
+
+class TestWorkerIdRecoveryRefusals(Base):
+    def test_only_codex_can_restart_by_worker_id(self):
+        wid = "a" * 32
+        runner = FakeTmux()
+        with self.assertRaisesRegex(sw.SpawnRefused, "only supported for Codex"):
+            sw.spawn(self.ws, REPO, runtime="claude", existing_worker_id=wid,
+                     runner=runner, require_sentinel=False)
+        self.assertFalse(wi.worker_dir(self.ws, wid).exists())
+        self.assertFalse(any(c[0] == "bash" and c[1].endswith("launch-worker-session.sh")
+                             for c in runner.calls))
+
+    def test_codex_recovery_requires_an_identity_record(self):
+        wid = "b" * 32
+        runner = FakeTmux(runtime="codex")
+        with self.assertRaisesRegex(sw.SpawnRefused, "no identity record"):
+            sw.spawn(self.ws, REPO, runtime="codex", existing_worker_id=wid,
+                     runner=runner, require_sentinel=False)
+        self.assertFalse(Path(sw.plan(self.ws, REPO, runtime="codex",
+                                      worker_id=wid)["delivery_dir"]).exists())
+        self.assertFalse(any(c[0] == "bash" and c[1].endswith("launch-worker-session.sh")
+                             for c in runner.calls))
+
+    def test_codex_recovery_requires_a_codex_roster_row(self):
+        wid = "c" * 32
+        wi.create_worker(self.ws, runtime="codex", worker_id=wid, cwd=str(REPO))
+        record = wi.incarnations_path(self.ws, wid).read_bytes()
+        runner = FakeTmux(runtime="codex")
+        for roster in (None, {"workers": {wid: {"runtime": "claude"}}}):
+            with self.subTest(roster=roster), mock.patch.object(sw.pr, "load_roster",
+                                                         return_value=roster):
+                with self.assertRaisesRegex(sw.SpawnRefused, "not a rostered Codex worker"):
+                    sw.spawn(self.ws, REPO, runtime="codex", existing_worker_id=wid,
+                             runner=runner, require_sentinel=False)
+                self.assertEqual(wi.incarnations_path(self.ws, wid).read_bytes(), record)
+                self.assertFalse((self.ws / "deliveries" / wid).exists())
+        self.assertFalse(any(c[0] == "bash" and c[1].endswith("launch-worker-session.sh")
+                             for c in runner.calls))
 
 
 class TestSentinelProbe(Base):
@@ -468,7 +593,7 @@ class TestWorkerIsolation(Base):
         p = sw.plan(self.ws, "/anchor/repo", cwd="/some/other/checkout")
         self.assertEqual(p["cwd"], "/some/other/checkout")
         self.assertEqual(p["launcher_argv"],
-                         ["bash", "/anchor/repo/src/agent/start-cli.sh", "--runtime", "claude"])
+                         ["bash", "/anchor/repo/skills/worker-pool/scripts/launch-worker-session.sh"])
         self.assertEqual(p["env"]["SUTANDO_CLAUDE_WORKING_DIR"], "/some/other/checkout")
 
     def test_two_workers_declare_different_instances_and_sessions(self):
@@ -530,12 +655,24 @@ class TestBootstrapSeam(Base):
         self.assertEqual(r.stdout.strip(), "", "it printed a path for a non-sentinel")
 
     def test_the_launcher_forwards_both_rather_than_naming_them(self):
-        """The core must not name a concrete skill path; it forwards what it is
-        given. This is the other half of the contract the two cases above pin."""
-        launcher = (REPO / "src/agent/claude/cli/start-cli.sh").read_text(encoding="utf-8")
+        """The worker's own launcher must not name a concrete skill path; it
+        forwards what it is given. This is the other half of the contract the
+        two cases above pin."""
+        launcher = (REPO / "skills/worker-pool/scripts/launch-worker-session.sh").read_text(encoding="utf-8")
         for key in ("SUTANDO_INBOX_RESOLVER", "SUTANDO_POOL_DELIVERY_SCRIPT"):
             self.assertIn(f'"{key}=${key}"', launcher, f"the launcher does not forward {key}")
-        self.assertNotIn("skills/worker-pool", launcher)
+
+    def test_the_core_launcher_carries_none_of_this(self):
+        """Stronger than "must not name a concrete skill path": since this
+        forwarding moved into the worker's own launcher, core's launcher now
+        names neither the keys nor any pool path at all."""
+        core_launcher = (REPO / "src/agent/claude/cli/start-cli.sh").read_text(encoding="utf-8")
+        session_launch = (REPO / "src/agent/claude/cli/session-launch.sh").read_text(encoding="utf-8")
+        for key in ("SUTANDO_INBOX_RESOLVER", "SUTANDO_POOL_DELIVERY_SCRIPT", "SUTANDO_WATCHER_CMD"):
+            self.assertNotIn(key, core_launcher, f"core's launcher still names {key}")
+            self.assertNotIn(key, session_launch, f"the shared session helper still names {key}")
+        self.assertNotIn("skills/worker-pool", core_launcher)
+        self.assertNotIn("skills/worker-pool", session_launch)
 
     def test_the_core_startup_skill_names_the_env_not_a_path(self):
         """The core boots with this skill absent, so its own `/startup` carries
@@ -545,7 +682,7 @@ class TestBootstrapSeam(Base):
         self.assertNotIn("skills/worker-pool", skill)
         # The scan is live: the core launcher's own suite reaches this skill by
         # path on purpose, and the same needle finds it there.
-        control = REPO / "tests" / "skills" / "worker-pool" / "start-cli-worker-env-forwarded.test.sh"
+        control = REPO / "tests" / "skills" / "worker-pool" / "launch-worker-session-env-forwarded.test.sh"
         self.assertIn("skills/worker-pool", control.read_text(encoding="utf-8"))
 
 
@@ -563,7 +700,7 @@ class FakeTmuxRefusedAfterLaunch(FakeTmux):
             if self.launched:
                 return subprocess.CompletedProcess(argv, 1, "", self.message)
             return subprocess.CompletedProcess(argv, 1, "", "can't find session: x")
-        if argv[0] == "bash" and argv[1].endswith("start-cli.sh"):
+        if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
             self.launched = True
             self.calls.append(argv); self.envs.append(dict(kw.get("env") or {}))
             return subprocess.CompletedProcess(argv, 1, "", "did not come up within ~5s")

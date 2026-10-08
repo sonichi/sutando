@@ -28,7 +28,7 @@ If an interval is provided in ARGUMENTS (e.g. "5m", "10m", "30m"), use it. Other
 ## On activation
 
 1. Run `/schedule-crons` to set up all recurring cron jobs (morning briefing, Zacks, etc.)
-2. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
+2. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'` (`$SUTANDO_TASKS_DIR` as the inbox when set; the tag is what the external standby supervisor recognises), `timeout_ms: 1800000`, `description: 'Streaming task watcher'`. The `Monitor` tool has no `persistent` option (passing one does not keep the command alive): `timeout_ms` (30 min at most; 5 min when omitted) is the command's lifetime, after which the tool kills it and sends one expiry notice, and the watcher must be re-armed on that notice. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
 
    **Windows:** the `Monitor` tool is unavailable, so `src/startup.ps1` starts
    `src/task-dispatcher.ps1`, an external `FileSystemWatcher` that invokes `claude --print` for each
@@ -135,7 +135,7 @@ Each pass, in order:
 
    Either way: budget informs the **depth** of step 6 — not whether to do it when quota permits. When the branch resolves to `LIGHT`/`MINIMAL`, skip autonomous self-development/research in step 6 even if the self-development policy is enabled; owner-requested tasks, pending questions, health/service recovery, watcher maintenance, and the build-log update remain active. "Ran out of ideas" is never a valid skip; the work menu is infinite by design. See **Skip conditions** below for the other legitimate reasons step 6 may be skipped.
 
-0.7. **Reconstruct context (every pass — don't recall, read).** Before interpreting the queue or acting on anything that depends on earlier context, **invoke the `context-reconstruct` skill** (an actual Skill-tool invocation — a "see X" reference does not load it). It reads `<workspace>/hosts/<hostname>/current-track.md` first (the pinned main-track goal + active sub-task + open decisions), then — as the situation needs — the live owner thread (`src/discord-read.py <channel_id> --serving <task channel_id>` (task-serving; gated) or `--operator` (autonomous pass)), per-host `pending-questions.md`, the latest `relay/relay-*.md`, and the `build_log.md` tail. Where the record differs from what you *think* is true, **trust the record**. Then **maintain** `<workspace>/hosts/<hostname>/current-track.md`: create it if absent, rewrite it when the track moves (owner redirected / thing shipped / decision resolved). This step is the load-bearing anti-erosion hook — over long/compacted sessions, felt confidence is confidently wrong; the fix is reading the durable record, not remembering it. (Restored 2026-07-13 after being dropped in the ~Jun 30 workspace-revamp SKILL.md rewrite; originally added 2026-06-25 — see the context-reconstruct skill's Practice log.)
+0.7. **Reconstruct context (every pass — don't recall, read).** Before interpreting the queue or acting on anything that depends on earlier context, **invoke the `context-reconstruct` skill** (an actual Skill-tool invocation — a "see X" reference does not load it). It reads `<workspace>/hosts/<hostname>/current-track.md` first (the pinned main-track goal + active sub-task + open decisions), then — as the situation needs — the live owner thread (`src/discord-read.py <channel_id> --serving <task channel_id>` (task-serving; gated) or `--operator` (autonomous pass)), pending questions (`python3 src/pending_questions_reader.py list`), the latest `relay/relay-*.md`, and the `build_log.md` tail. Where the record differs from what you *think* is true, **trust the record**. Then **maintain** `<workspace>/hosts/<hostname>/current-track.md`: create it if absent, rewrite it when the track moves (owner redirected / thing shipped / decision resolved). This step is the load-bearing anti-erosion hook — over long/compacted sessions, felt confidence is confidently wrong; the fix is reading the durable record, not remembering it. (Restored 2026-07-13 after being dropped in the ~Jun 30 workspace-revamp SKILL.md rewrite; originally added 2026-06-25 — see the context-reconstruct skill's Practice log.)
 
 ## Skip conditions for step 6 (the ONLY legitimate reasons)
 
@@ -166,6 +166,8 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    - **Thread consolidation:** when several tasks in a short window are the same continuation thought (e.g. voice over-delegating "yes, right, this is useful…" as 3 separate tasks), put the FULL reply in the latest task's result and put `[deduped: task-<latest-id>]` in each earlier task's result.
 
      **⚠ THE TARGET MUST ACTUALLY DELIVER. `[deduped: X]` onto a `[no-send]` X is a contradiction** — it says "the reply is in X" where X says "send nothing" — and the failure is invisible until the bridge announces it INTO THE ROOM, naming an internal task id the peer cannot resolve. Measured 2026-09-01: three collaborator notices closed that way produced a DELIVERED outbox item reading *"This was folded into `task-<internal id>`, which delivered nothing"*, and the peer spent a 519-task sweep hunting an id that never existed on their side. All-time on this host: **68 such pairs on disk**. ⚠ I first published "12 of which reached a room" — WRONG, and the error is instructive: I grepped my outbox for the phrase, which matched my own replies QUOTING it, so my write-up inflated its own count. Corrected: 5 genuine bridge notices, of which 3 had targets that DID deliver (the notice was a false alarm), so **2 genuinely delivered nothing — and neither owed a reply**. The harm was five confusing room notices, not lost messages. **A grep for a defect's own wording counts the documentation of the defect.**
+
+     **Policy correction (2026-09-29): `[REPLIED]` is an answer assertion, not non-delivery.** The earlier account below describes matching the bridge's old behavior, not evidence that rejecting `[REPLIED]` was correct. That old predicate collapsed "already sent through another path" into "send nothing." Production room history plus broker records showed actual answers followed by false warnings. The shared policy now honors `[REPLIED]` only within the sender and destination boundaries. `dedup_recovery.plan_dedup_recovery` checks live or archived holder routing, including Telegram `chat_id`, and requeues cross-room folds once before reporting. All adapters, including Discord, use that shared plan. `[no-send]`, empty/missing holders, and chained dedups remain invalid. This trusts the existing marker contract rather than independently verifying receipts, so a falsely written `[REPLIED]` can still conceal an unanswered request.
 
      `[deduped: A]` where A is itself `[deduped: B]` resolves to no reply just as completely (found by @yixuan-ag2 against their tree).
 
@@ -200,7 +202,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    or a killed process tree, so the pass re-arms it: `connectors.py rearm` starts a waiter only for
    an unclaimed wait whose lock no live waiter holds, so running it every pass never doubles one.
 
-2. **Check pending questions.** Read the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; this is the F1 per-host location, carried by `hosts/*/`, and where `personal_path("pending-questions.md")` resolves). If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
+2. **Pending questions are not surfaced on a pass.** A question is sent to the owner once, when it is asked (`scripts/ask-owner.py`), and reminded only on demand (`python3 src/check-pending-questions.py --notify`); a per-pass voice file or macOS notification was a scheduled reminder under another name. The pass runs `python3 src/check-pending-questions.py` (flagless: reconcile and list, nothing sent) so anything the outbox holds is filed, and `python3 src/pending_questions_reader.py list` only when the owner asks what is waiting or the pass is blocked on an answer. These are core's public entries over the store an installed skill declares (`pending_questions_store` in its manifest); the loop names no skill's private CLI.
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
@@ -217,7 +219,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    ```bash
    # token = an entity from the warn TEXT (a path, filename, host, command), not the probe name
    H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"
-   grep -in "<subject-token>" "$H/pending-questions.md" "$H/current-track.md" | head
+   grep -in "<subject-token>" "$H/current-track.md" | head; python3 src/pending_questions_reader.py list --json | grep -i "<subject-token>"
    ```
 
    **Grep BOTH parking files.** Warns get parked wherever the pass that triaged them was writing —
@@ -239,12 +241,16 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    a regex not matching real exit codes, a truncated function-window read, `ps | grep` matching its
    own argv, a `git log --name-only` block-split) — each a clean, quotable, WRONG zero, never an
    error. The mitigation was a token-search of the claim's own nouns against the parking files
-   (`pending-questions.md`, `current-track.md`, `build_log.md`, core memory), via
+   (pending questions, `current-track.md`, `build_log.md`, core memory), via
    `warn-already-triaged.py --claim`, chained before any claim-to-owner send.
 
    It genuinely caught things (its own test suite, `tests/proactive-loop-warn-already-triaged.test.py`,
-   still lives and still passes — the script is UNCHANGED, `gh-duplicate-check.py`/step 3.45 still
-   imports its tokenizer). But the clause was itself patched twice in place after recurring — once on
+   still lives and still passes; `gh-duplicate-check.py`/step 3.45 still imports its tokenizer). The
+   script itself changed with the pending-questions store move (#5027): its first parking source was
+   the per-host `pending-questions.md` file, and is now the live listing from core's reader
+   (`src/pending_questions_reader.py list --json`), read once per run and treated as empty — said once
+   on stderr — when the store cannot be read; the tokenizer, the verdicts and the other sources are as
+   they were. But the clause was itself patched twice in place after recurring — once on
    2026-09-01 after five same-night instances, and again the same day on a claim that had already been
    filed AND retracted in `current-track.md`, found only because "prose in a file I read is not a
    gate" — even a file reread every pass. Owner, 2026-09-15, on being told the check is a token/grep
@@ -524,7 +530,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    `echo logged` / `echo closed` is not this check. It asserts the *last* command in the chain
    ran, which is true even when the append was the one that silently went elsewhere.
 
-   **Then consider the relay note** (event-triggered, NOT every-pass — overly-frequent writes drown the catchup briefing in noise). Ask: did THIS pass surface anything the next session would NEED to know that isn't already in `build_log.md` or `pending-questions.md`? Typical relay-worthy events:
+   **Then consider the relay note** (event-triggered, NOT every-pass — overly-frequent writes drown the catchup briefing in noise). Ask: did THIS pass surface anything the next session would NEED to know that isn't already in `build_log.md` or the pending questions (`python3 src/pending_questions_reader.py list`)? Typical relay-worthy events:
    - A PR opened, merged, or got a meaningful review reply
    - A pending question resolved (owner picked an option)
    - A design decision reached that hasn't shipped yet ("we'll do X tomorrow")
@@ -567,78 +573,10 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    removing it.** This used to name a `memory-hub-containment` script; that path has never existed
    in the repo, so the advice was unrunnable at the one moment it is read. `health-check.py`'s
    `memory-index` probe reports the loaded prefix and is the coverage that does exist — do not build
-   a duplicate. Which rows may go is the owner's call (`pending-questions.md` -> "MEMORY.md byte
+   a duplicate. Which rows may go is the owner's call (a pending question -> "MEMORY.md byte
    budget"); the guard's job is only to stop the write that would decide it by accident.
 
-8. **If blocked, ask.** Write the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; create the `hosts/<hostname>/` dir if absent) — send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — apply the Pivot-on-block rule and pick another menu item.
-
-   **⚠ INSERT ABOVE THE `# Resolved` DIVIDER, NEVER `>>` AT EOF (2026-08-02, twice in one session).** Every reader — `check-pending-questions.py`, morning-briefing, agent-api, friction-detector, dashboard — counts only the text ABOVE the file's top-level `# Resolved` line; everything below it is the audit trail. `cat >> "$PQ"` appends at EOF, which on this host is **500 lines below the divider**, so the question lands in the archive and is never counted.
-
-   **⚠⚠ AND PLACE IT BY IMPORTANCE, AT THE TOP — "above the divider" is NOT enough (2026-08-20).**
-   The instruction above is correct and load-bearing, but for an append-style writer "above the
-   divider" means the **last position of the active region** — so the documented cure for
-   archive-invisibility prescribes the exact position that causes **prefix-invisibility**. The
-   notifiers render fixed-depth prefixes, not the whole list:
-
-   ```
-   check-pending-questions.py:258  notify_macos       titles[:3]
-   check-pending-questions.py:327  notify_discord_dm  questions[:5]
-   check-pending-questions.py:310  notify_voice       unsliced
-   ```
-
-   With 36 open items, anything at index ≥ 5 renders on **voice only** — and voice is usually not
-   connected. Measured 2026-08-20: the Google-Drive-mirroring-the-live-repo question, filed that
-   day and the highest-stakes item on the list, sat at **position 35 of 36** and reached no surface
-   the owner reads, while `len(q)` honestly reported 36 the whole time. Sutando-rui hit the same
-   thing independently: a PR needing ~30 seconds of owner time sat at position 12 for days, blocked
-   not on review or code but on a rendering slice.
-
-   **So: a fixed-depth prefix over an append-ordered list makes POSITION a priority signal whether
-   or not anyone intended one, and appending asserts the lowest one by construction.** Decide
-   placement deliberately at write time. If the new question outranks what is already at the top,
-   put it at the top; if it does not, you have just decided it can wait — say so to yourself, not
-   by accident.
-
-   **Assert the right invariant for the edit you actually made** — the count discriminates
-   differently per operation, and the wrong choice passes while the entry is gone:
-
-   | edit | assert |
-   |---|---|
-   | new question | count went **up**, and the title matches (see below) |
-   | reorder / promote | count **unchanged**, and the entry is now inside the rendered prefix |
-   | fold two into one | count went **down by exactly the number folded**, AND the folded id appears in the survivor, AND no standalone entry for it remains — a fold that *lost* an entry shows the same count |
-
-   I filed two questions this way on 2026-08-02 (the ep007 spine pick, and an ag2space room-join request) and **both were invisible**: the reader stayed at 22 while the file grew. Moving them above the divider took it to 24. **This is the exact defect PR #2521 fixes in `auth-preflight-gate.sh`** — which I reviewed, fixed an ABA race in, and pushed the same afternoon I committed the bug by hand, twice.
-
-   It reports success in every cheap way: bytes land, the path is right, nothing errors, the file grows. **Only calling the reader shows the zero.** So after writing, assert it:
-   ```bash
-   python3 -c "import importlib.util;s=importlib.util.spec_from_file_location('c','src/check-pending-questions.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m);q=m.get_waiting_questions();print(len(q), sum('<distinctive phrase from your TITLE>' in (x.get('title') or '') for x in q))"
-   ```
-   **Match on `title`, and check that the COUNT went up — not `str(x)`.** ⚠ 2026-08-13: the
-   substring-anywhere form above this line passed while the entry was **swallowed into the
-   neighbouring section's body**, because a merged section still contains your text. The reader
-   splits on `##` ONLY; a `###` heading is body text, not a new question. Tell: a purely additive
-   edit (`git diff --numstat` = N/0) that leaves the count UNCHANGED. I saw that delta=0, explained
-   it away as a stale count, and only a title-level check showed the zero. The count is the
-   discriminator; the substring cannot fail the way this actually fails.
-
-   **⚠ A COUNTED question can still be INVISIBLE — assert POSITION too (2026-08-20).** The count
-   rising proves membership, not visibility. Waiting order is FILE order, so "insert above the
-   `# Resolved` divider" — the rule that makes a question counted at all — lands it at the BOTTOM of
-   the visible list. The two rules pull opposite ways. Only two consumers render anything, and both
-   take an ordered prefix: `notify_macos` shows `titles[:3]` and the proactive DM body shows
-   `questions[:5]` (hence `VISIBLE_PREFIX = 5` in `src/check-pending-questions.py`). **Positions 6+
-   render nowhere** — they exist only in the file and the web UI's Questions tab. Measured on a live
-   host: `VISIBLE_PREFIX=5; waiting=34; rendered nowhere = 29 of 34`, and the question filed that
-   pass sat at **34/34** while the assertion documented above printed `34 1` — a pass. Extend the
-   proof to position:
-   ```bash
-   python3 -c "import importlib.util;s=importlib.util.spec_from_file_location('c','src/check-pending-questions.py');m=importlib.util.module_from_spec(s);s.loader.exec_module(m);q=m.get_waiting_questions();i=next(k for k,x in enumerate(q,1) if '<distinctive phrase from your TITLE>' in (x.get('title') or ''));assert i <= m.VISIBLE_PREFIX, f'filed at {i}/{len(q)} - below the fold, renders nowhere'"
-   ```
-   If it lands below the fold and it genuinely needs the owner, **move it up** — do not file a second
-   question about the first one being unread. Promotion is self-announcing: `notify_key` hashes the
-   visible-ordered prefix (#3004), so changing the top 5 defeats the cooldown by construction and the
-   next fire notifies.
+8. **If blocked, ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]` — through the store an installed skill declares it records the question as a row of the owner's Pending questions database (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable), queues it to the owner and fires the macOS notification. Never hand-edit; the per-host `pending-questions.md` is read-only history. Read the output: a `FAILED` line is not an ask. Confirm with `python3 src/pending_questions_reader.py list --json` that the ask id is listed. Don't stop — apply the Pivot-on-block rule and pick another menu item.
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
@@ -681,7 +619,20 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. This branch emits ONE undifferentiated list, so the two-group test fails: **change nothing**. Stop roots only if a future build names owned and ownerless separately here. |
    | sentinel pid dead but **other watcher(s) still run** | same — one undifferentiated list, so **change nothing**. |
    | multiple trees, some **not tracked by the sentinel**, reported as two groups | stop exactly the group with **no live owning session**; leave the session-owned group alone. If the ownerless group is empty, change nothing. |
-   | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |
+   | not running (no sentinel, no trees) / pid dead with none running | nothing here: the start decision is the per-inbox verdict below, not this probe. |
+
+   **The start decision is per inbox, and the watcher itself refuses to double one.** The probe
+   answers "is any watcher running on this host", which on a pool host is always yes (each worker
+   runs its own), so it read `ok` for a whole day while the core's inbox had no watcher (measured
+   2026-09-22). The step asks `watcher_identity.py role-present session --inbox … --ready …` for the
+   core's inbox and, on `no`, runs the launcher. The launcher is safe by construction: at startup
+   `watch-tasks-stream.sh` asks `watcher_identity.py inbox-holders` for every watcher-shaped process
+   naming its inbox, tagged or not, ready or not; a second watcher of the same kind exits 0 naming
+   the holder, a session watcher over a standby proceeds (the supervisor stands the standby down once
+   it proves ready), a standby over a session watcher exits, and an unobservable `ps` refuses to
+   start. Only `--force-restart` replaces a holder, and only on the owner's word. So a start is never
+   a duplicate, and the untagged and present-but-unready cases that a verdict alone cannot see are
+   closed where the process is born, not in this instruction.
 
    **Never stop a watcher whose owning core is alive** — that is the invariant the table cannot
    express on its own, and the one that makes the difference between a cleanup and an outage.
@@ -722,10 +673,10 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    - First-PR-opened wins the claim. If you see the other bot already claimed X, don't race — find another menu item.
    - Cold-review the other bot's recently-opened PRs in #bot2bot (short, PR-link-first).
    - **No merge authority for bots.** All merges remain owner's call. Bots prepare + review; owner merges.
-   - Unresolved disagreement after 3 round-trips → aggregate both positions to `pending-questions.md`, proceed with whichever option is cheaper to reverse.
+   - Unresolved disagreement after 3 round-trips → aggregate both positions into one `scripts/ask-owner.py` ask, proceed with whichever option is cheaper to reverse.
 
 11. **Heartbeat.** If this pass shipped anything substantive (commit / PR opened or merged / memory edit / new note / new skill) AND (#bot2bot is configured AND other bot is active), post a short `done: <one-line summary>` to #bot2bot via the `bot2bot-post` skill. Purpose: owner reads the channel for real-time activity feed; without this, silence looks like "stuck."
 
-   **Note**: contextual-chips refresh used to be step 11 in this loop. As of 2026-05-05 it is owned exclusively by Sutando.app's 120s timer (PR #600). The proactive-loop must NOT write `contextual-chips.json` — Sutando.app is the single writer. If a future case calls for chip-state the menu-bar app can't see (e.g. decision-state from `pending-questions.md`), surface it via a different file Sutando.app reads, not by competing as a writer.
+   **Note**: contextual-chips refresh used to be step 11 in this loop. As of 2026-05-05 it is owned exclusively by Sutando.app's 120s timer (PR #600). The proactive-loop must NOT write `contextual-chips.json` — Sutando.app is the single writer. If a future case calls for chip-state the menu-bar app can't see (e.g. decision-state from the pending questions), surface it via a different file Sutando.app reads, not by competing as a writer.
 
    **Do NOT fall back to `results/proactive-*.txt` for heartbeats if `bot2bot-post` is not installed.** That legacy path is polled by both Discord and Telegram bridges and produces duplicate deliveries to the owner's DMs (9-per-heartbeat in practice on 2026-04-20). If the skill is missing, skip the heartbeat silently; fold the summary into the next task-reply instead.

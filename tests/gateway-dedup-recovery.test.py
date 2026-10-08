@@ -61,12 +61,21 @@ class _Harness:
         (self.gw.ARCHIVE_RESULTS_DIR / f"{HOLDER}-1785976425.txt").write_text(holder_body)
         (self.gw.TASKS_DIR / f"{TID}.txt").write_text(orig_task)
         (self.gw.RESULTS_DIR / f"{TID}.txt").write_text(result_body)
+        if holder_body.strip():
+            from ag2_sparrow.delivery_core import DeliveryOutcome
+            self.gw._delivery_core().backend.publish(
+                HOLDER, __import__("json").dumps({"id": HOLDER, "body": holder_body}).encode())
+            token = self.gw._delivery_core().backend.claim(HOLDER, "fixture")
+            self.gw._delivery_core().backend.complete(token, DeliveryOutcome.CONFIRMED)
+            (self.gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+            (self.gw.TASKS_DIR / "archive" / f"{HOLDER}.txt").write_text(
+                f"id: {HOLDER}\nsource: gateway\nchannel_id: {ROOM}\nuser_id: owner\ntask: question\n")
 
     def requeued_tasks(self):
         return [p for p in self.gw.TASKS_DIR.glob("task-*.txt") if p.stem != TID]
 
 
-ORIG = f"id: {TID}\nsource: gateway\naccess_tier: owner\ntask: What is AG2Space?\n"
+ORIG = f"id: {TID}\nsource: gateway\nchannel_id: {ROOM}\nuser_id: owner\naccess_tier: owner\ntask: What is AG2Space?\n"
 DEDUP = f"[deduped: {HOLDER}]"
 
 
@@ -100,6 +109,53 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
                       "marker must stay intact so the server suppresses delivery")
         self.assertEqual(r["requeued"], [], "honoured dedup should not re-ask")
         self.assertNotIn(TID, r["inflight"])
+
+    def test_replied_holder_closes_lease_without_warning_or_reask(self):
+        for count in (0, 1):
+            with self.subTest(count=count):
+                r = self._run("[REPLIED]", orig=ORIG + f"dedup_requeue_count: {count}\n")
+                self.assertEqual(r["requeued"], [])
+                self.assertEqual(len(r["posts"]), 1)
+                self.assertEqual(r["posts"][0]["payload"]["body"], DEDUP)
+                self.assertEqual(r["posts"][0]["payload"]["id"], self.gw._broker_tid(TID))
+                self.assertNotIn(TID, r["inflight"])
+
+    def test_cross_room_replied_requeues_then_delivers_to_original_lease(self):
+        with tempfile.TemporaryDirectory() as td:
+            with _Harness(self.gw, Path(td)) as h:
+                h.seed("[REPLIED]", ORIG + f"channel_id: {ROOM}\nuser_id: alice\n", DEDUP)
+                (h.gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+                (h.gw.TASKS_DIR / "archive" / f"{HOLDER}.txt").write_text(
+                    "channel_id: !other:ag2.space\nuser_id: alice\n")
+                inflight = {TID}
+                self.gw._post_ready_results(inflight)
+                self.assertEqual(h.posts, [])
+                requeued = h.requeued_tasks()
+                self.assertEqual(len(requeued), 1)
+                new_id = requeued[0].stem
+                self.assertIn(f"channel_id: {ROOM}", requeued[0].read_text())
+                self.assertEqual(h.rooms[new_id], ROOM)
+                (h.gw.RESULTS_DIR / f"{new_id}.txt").write_text("answer in asking room")
+                self.gw._post_ready_results(inflight)
+                self.assertEqual(len(h.posts), 1)
+                self.assertEqual(h.posts[0]["payload"]["id"], self.gw._broker_tid(TID))
+                self.assertEqual(h.posts[0]["payload"]["body"], "answer in asking room")
+                self.assertNotIn(new_id, inflight)
+
+    def test_cross_room_replied_retry_reports_instead_of_silent_close(self):
+        with tempfile.TemporaryDirectory() as td:
+            with _Harness(self.gw, Path(td)) as h:
+                h.seed("[REPLIED]", ORIG + "dedup_requeue_count: 1\n", DEDUP)
+                (h.gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+                (h.gw.TASKS_DIR / "archive" / f"{HOLDER}.txt").write_text(
+                    "channel_id: !other:ag2.space\n")
+                inflight = {TID}
+                self.gw._post_ready_results(inflight)
+                self.assertEqual(h.requeued_tasks(), [])
+                self.assertEqual(len(h.posts), 1)
+                self.assertEqual(h.posts[0]["payload"]["id"], self.gw._broker_tid(TID))
+                self.assertIn("different room", h.posts[0]["payload"]["body"])
+                self.assertNotIn(TID, inflight)
 
     def test_empty_holder_is_re_asked(self):
         r = self._run("")

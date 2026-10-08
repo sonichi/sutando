@@ -47,6 +47,7 @@ omit =
     packages/ag2-sparrow/ag2_sparrow/proactive_recovery.py
     packages/ag2-sparrow/ag2_sparrow/outbox.py
     packages/ag2-sparrow/ag2_sparrow/outbox_adapter.py
+    packages/ag2-sparrow/ag2_sparrow/proactive_routing.py
     */node_modules/*
     */.venv/*
     */venv/*

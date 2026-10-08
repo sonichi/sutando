@@ -45,7 +45,7 @@ STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "room_posts": [], "force_room_502": False, "force_room_empty_200": False,
          "force_room_ok_only": False,
          "force_heartbeat_404": False, "force_media_redirect": False,
-         "force_results_502_once": False, "force_results_400": False}
+         "force_results_502_once": False, "force_results_503": False}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
         "task": "hello from gateway", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
@@ -96,8 +96,8 @@ class Handler(BaseHTTPRequestHandler):
             if STATE["force_results_502_once"]:
                 STATE["force_results_502_once"] = False
                 self.send_response(502); self.end_headers(); return
-            if STATE["force_results_400"]:
-                self.send_response(400); self.end_headers(); return
+            if STATE["force_results_503"]:
+                self.send_response(503); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
             STATE["results"].append(json.loads(self.rfile.read(n).decode()))
             self.send_response(200); self.end_headers()
@@ -510,18 +510,15 @@ def main() -> int:
         rtc.LOCAL_TIER = _saved_tier
     check("===SKILL INSTRUCTIONS (follow before any other action)===" in sk
           and "room_ops.py read '!room:ag2.space' --limit 30" in sk
-          and "--source ag2space --channel-id '!room:ag2.space'" in sk
           and "write the result to results/task-SKILL.txt" in sk,
-          "owner task carries the ag2space skill-instructions block (context-first, notify, result path)")
-    # notify.py falls back to a channel env file only when url+token are absent
-    # from the environment, and WHICH file carries them differs per onboarding.
+          "owner task carries the ag2space skill-instructions block (context-first, result path; no notify step)")
+    check("notify.py" not in sk and "--channel-id" not in sk,
+          "AG2 Space has no NOTIFY step")
+    # room_ops.py falls back to a channel env file only when url+token are
+    # absent from the environment; WHICH file carries them differs per onboarding.
     _env_hint = 'set -a; . "$(bash scripts/channel-env.sh ag2space)"; set +a'
-    _notify_line = next(ln for ln in sk.splitlines() if "NOTIFY FIRST" in ln)
-    check(_env_hint in _notify_line and _notify_line.index(_env_hint)
-          < _notify_line.index("notify.py"),
-          "notify step carries the channel-env prelude BEFORE the notify.py call")
-    check(sum(_env_hint in ln for ln in sk.splitlines()) == 2,
-          "the env prelude rides both gateway-calling steps (context-first + notify)")
+    check(sum(_env_hint in ln for ln in sk.splitlines()) == 1,
+          "the env prelude rides the sole gateway-calling step (context-first)")
     # CHANNEL_DIR defaults to "ag2space", so every assertion above passes even
     # when the hint is hardcoded; varying it is what makes this prove anything.
     _saved_dir, _saved_tier2 = rtc.CHANNEL_DIR, rtc.LOCAL_TIER
@@ -532,11 +529,10 @@ def main() -> int:
     finally:
         rtc.CHANNEL_DIR, rtc.LOCAL_TIER = _saved_dir, _saved_tier2
     check("channel-env.sh dev-ag2space" in skd
-          and "--source dev-ag2space " in skd
           and "channel-env.sh ag2space)" not in skd,
-          "a non-default CHANNEL_DIR reaches BOTH env preludes and the notify --source")
-    check(sum("channel-env.sh dev-ag2space" in ln for ln in skd.splitlines()) == 2,
-          "both gateway-calling steps name the task's own channel dir, not the default")
+          "a non-default CHANNEL_DIR reaches the env prelude, not the default")
+    check(sum("channel-env.sh dev-ag2space" in ln for ln in skd.splitlines()) == 1,
+          "the sole gateway-calling step names the task's own channel dir, not the default")
     # A string assertion passes even when the named file holds no gateway vars,
     # so drive the resolver itself across both real layouts and neither-has-it.
     import os as _os
@@ -572,7 +568,7 @@ def main() -> int:
     rc, got = _resolve({".env": _MATRIX})
     check(rc != 0 and not got,
           "no file defines the token -> resolver FAILS instead of naming a tokenless file")
-    check(sk.rstrip().splitlines()[-1].startswith("3. Process"),
+    check(sk.rstrip().splitlines()[-1].startswith("2. Process"),
           "skill block is the file tail (appended after access_tier)")
     tiers_sk = [ln for ln in sk.splitlines() if ln.startswith("access_tier:")]
     check(tiers_sk == ["access_tier: owner"], "exactly one access_tier line, owner")
@@ -745,14 +741,16 @@ def main() -> int:
     (rtc.TASKS_DIR / "task-CORE1.txt").write_text(
         "id: task-CORE1\naccess_tier: owner\ntask: fixture\n")
     (rtc.RESULTS_DIR / "task-CORE1.txt").write_text("core answer")
-    STATE["force_results_400"] = True
+    STATE["force_results_503"] = True
     rtc._post_ready_results({"task-CORE1"})
     check((rtc.RESULTS_DIR / "task-CORE1.txt").exists()
           and len(STATE["results"]) == _before,
           "refused POST leaves the result file for the next pass")
     check(rtc._delivery_core().backend.attempts("task-CORE1") == 1,
           "the refusal is recorded in the outbox (drain ran through the seam)")
-    STATE["force_results_400"] = False
+    STATE["force_results_503"] = False
+    backend = rtc._delivery_core().backend
+    backend.clock = lambda: rtc.read_item(backend.root, "task-CORE1")["retry"]["next_attempt_at"]
     STATE["force_results_502_once"] = True
     _ifc = {"task-CORE1"}
     import contextlib
@@ -760,9 +758,12 @@ def main() -> int:
     _cap = _io.StringIO()
     with contextlib.redirect_stdout(_cap):
         rtc._post_ready_results(_ifc)
+        check((rtc.RESULTS_DIR / "task-CORE1.txt").exists(),
+              "ambiguous 502 defers the safe resend to its scheduled retry")
+        rtc._post_ready_results(_ifc)
     _out = _cap.getvalue()
     print(_out, end="")
-    check("delivered via DeliveryCore" in _out
+    check("accepted by gateway; Matrix delivery unconfirmed" in _out
           and "AG2SpaceResultProvider" in _out,
           "a CONFIRMED delivery announces the seam it went through "
           "(the live-path evidence CONTRIBUTING asks for)")
@@ -770,12 +771,13 @@ def main() -> int:
           and STATE["results"][-1]["id"] == "task-CORE1"
           and STATE["results"][-1]["body"] == "core answer"
           and not (rtc.RESULTS_DIR / "task-CORE1.txt").exists(),
-          "ambiguous 502 resolved by the idempotent re-send in ONE pass "
+          "ambiguous 502 resolved by the scheduled idempotent re-send "
           "(delivered + archived)")
     check(not _ifc, "confirmed delivery retires the task from inflight")
     STATE["results"].pop()
     (rtc.TASKS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
     (rtc.ARCHIVE_RESULTS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
+    backend.clock = time.time
     # Destined filenames outrank the gate's activity/grace logic entirely.
     check(rtc._ag2space_proactive_claim_gate(
               Path("proactive-1.to-ag2space.txt")) is True,
@@ -787,23 +789,28 @@ def main() -> int:
     # Guarded-tier suppression: team skip-only results post the marker
     # line alone; the remainder never leaves the host.
     _before = len(STATE["results"])
-    (rtc.TASKS_DIR / "task-TSKIP.txt").write_text(
-        "id: task-TSKIP\naccess_tier: team\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TSKIP.txt").write_text(
+    (rtc.TASKS_DIR / "task-TSKIP2.txt").write_text(
+        "id: task-TSKIP2\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TSKIP2.txt").write_text(
         "[no-send] internal bookkeeping note that must not reach the wire\n")
-    rtc._post_ready_results({"task-TSKIP"})
+    rtc._post_ready_results({"task-TSKIP2"})
     _posted = STATE["results"][_before:]
-    check(len(_posted) == 1 and not (rtc.RESULTS_DIR / "task-TSKIP.txt").exists(),
+    check(len(_posted) == 1 and not (rtc.RESULTS_DIR / "task-TSKIP2.txt").exists(),
           "team [no-send] POSTs (closes lease) and archives")
     check(bool(_posted) and (_posted[0].get("body") or "").strip() == "[no-send]",
           "team skip wire body is the marker line ALONE — remainder withheld")
     # Control: a side-effectful marker from a guarded tier is still withheld.
     _before = len(STATE["results"])
-    (rtc.TASKS_DIR / "task-TREDIR.txt").write_text(
-        "id: task-TREDIR\naccess_tier: team\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TREDIR.txt").write_text(
+    (rtc.TASKS_DIR / "task-TREDIR2.txt").write_text(
+        "id: task-TREDIR2\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TREDIR2.txt").write_text(
         "[channel: 12345678901234567] exfil attempt\n")
-    rtc._post_ready_results({"task-TREDIR"})
+    _real_route_withheld_review = rtc._route_withheld_review
+    rtc._route_withheld_review = lambda _path: True
+    try:
+        rtc._post_ready_results({"task-TREDIR2"})
+    finally:
+        rtc._route_withheld_review = _real_route_withheld_review
     _posted = STATE["results"][_before:]
     check(bool(_posted) and "[channel:" not in (_posted[0].get("body") or ""),
           "team redirect marker still withheld (canned body, no redirect)")
@@ -811,10 +818,10 @@ def main() -> int:
     # class admits newlines, so a forged extra must hit the guard, not repost.
     _hostile = "[deduped: task-123\nSECRET sk-live-abcdef0123456789\nstolen]"
     _before = len(STATE["results"])
-    (rtc.TASKS_DIR / "task-TDEXF.txt").write_text(
-        "id: task-TDEXF\naccess_tier: team\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TDEXF.txt").write_text(_hostile + "\n")
-    rtc._post_ready_results({"task-TDEXF"})
+    (rtc.TASKS_DIR / "task-TDEXF2.txt").write_text(
+        "id: task-TDEXF2\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TDEXF2.txt").write_text(_hostile + "\n")
+    rtc._post_ready_results({"task-TDEXF2"})
     _posted = STATE["results"][_before:]
     check(bool(_posted) and "SECRET" not in (_posted[0].get("body") or "")
           and "sk-live" not in (_posted[0].get("body") or ""),
@@ -857,30 +864,34 @@ def main() -> int:
     # DeliveryCore wiring, proven by side effects only the seam produces:
     # outbox attempt accounting + UNKNOWN resolved by the idempotent re-send.
     _before = len(STATE["results"])
-    (rtc.TASKS_DIR / "task-CORE1.txt").write_text(
-        "id: task-CORE1\naccess_tier: owner\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-CORE1.txt").write_text("core answer")
-    STATE["force_results_400"] = True
-    rtc._post_ready_results({"task-CORE1"})
-    check((rtc.RESULTS_DIR / "task-CORE1.txt").exists()
+    (rtc.TASKS_DIR / "task-CORE2.txt").write_text(
+        "id: task-CORE2\naccess_tier: owner\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-CORE2.txt").write_text("core answer")
+    STATE["force_results_503"] = True
+    rtc._post_ready_results({"task-CORE2"})
+    check((rtc.RESULTS_DIR / "task-CORE2.txt").exists()
           and len(STATE["results"]) == _before,
           "refused POST leaves the result file for the next pass")
-    check(rtc._delivery_core().backend.attempts("task-CORE1") == 1,
+    check(rtc._delivery_core().backend.attempts("task-CORE2") == 1,
           "the refusal is recorded in the outbox (drain ran through the seam)")
-    STATE["force_results_400"] = False
+    STATE["force_results_503"] = False
+    backend = rtc._delivery_core().backend
+    backend.clock = lambda: rtc.read_item(backend.root, "task-CORE2")["retry"]["next_attempt_at"]
     STATE["force_results_502_once"] = True
-    _ifc = {"task-CORE1"}
+    _ifc = {"task-CORE2"}
+    rtc._post_ready_results(_ifc)
     rtc._post_ready_results(_ifc)
     check(len(STATE["results"]) == _before + 1
-          and STATE["results"][-1]["id"] == "task-CORE1"
+          and STATE["results"][-1]["id"] == "task-CORE2"
           and STATE["results"][-1]["body"] == "core answer"
-          and not (rtc.RESULTS_DIR / "task-CORE1.txt").exists(),
-          "ambiguous 502 resolved by the idempotent re-send in ONE pass "
+          and not (rtc.RESULTS_DIR / "task-CORE2.txt").exists(),
+          "ambiguous 502 resolved by the scheduled idempotent re-send "
           "(delivered + archived)")
     check(not _ifc, "confirmed delivery retires the task from inflight")
     STATE["results"].pop()
-    (rtc.TASKS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
-    (rtc.ARCHIVE_RESULTS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
+    (rtc.TASKS_DIR / "task-CORE2.txt").unlink(missing_ok=True)
+    (rtc.ARCHIVE_RESULTS_DIR / "task-CORE2.txt").unlink(missing_ok=True)
+    backend.clock = time.time
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content
@@ -1398,6 +1409,32 @@ def main() -> int:
     rtc._post_proactive()
     check(not young.exists() and len(STATE["room_posts"]) == posts_b4_young + 1,
           "configured bridge with no trace yet: a file past the abandonment window is released")
+
+    # Slack is a bridge channel too (P1-27): owner on slack + a configured,
+    # recently alive slack bridge keeps its aged file out of this gateway.
+    _activity.write_text(json.dumps({"ts": int(time.time()), "channel": "slack", "summary": "hi"}))
+    (_gate_cfg / "channels" / "slack").mkdir(parents=True, exist_ok=True)
+    (_gate_cfg / "channels" / "slack" / "access.json").write_text('{"allowFrom": ["1"]}')
+    _slog = rtc.WS / "logs" / "slack-bridge.log"
+    _slog.write_text("alive\n")
+    slack_owned = rtc.RESULTS_DIR / "proactive-t11s.txt"
+    slack_owned.write_text("slack owner's nudge, bridge alive\n")
+    os.utime(slack_owned, (aged, aged))
+    posts_b4_slack = len(STATE["room_posts"])
+    rtc._post_proactive()
+    check(slack_owned.exists() and len(STATE["room_posts"]) == posts_b4_slack,
+          "owner-on-slack, slack bridge configured + alive: aged nudge is never stolen")
+    # ...and with no slack bridge on this host, the past-grace fallback delivers.
+    slack_owned.unlink()
+    _slog.unlink()
+    shutil.rmtree(_gate_cfg / "channels" / "slack")
+    unowned = rtc.RESULTS_DIR / "proactive-t11t.txt"
+    unowned.write_text("slack owner's nudge, no slack bridge here\n")
+    os.utime(unowned, (aged, aged))
+    rtc._post_proactive()
+    check(len(STATE["room_posts"]) == posts_b4_slack + 1 and not unowned.exists(),
+          "owner-on-slack, no slack bridge configured: past-grace fallback delivers")
+    _activity.write_text(json.dumps({"ts": int(time.time()), "channel": "discord", "summary": "hi"}))
 
     # `.env`-only configuration counts too (health-check.py's own either/or).
     (_gate_cfg / "channels" / "telegram").mkdir(parents=True, exist_ok=True)

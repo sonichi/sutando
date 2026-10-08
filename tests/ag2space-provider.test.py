@@ -174,11 +174,10 @@ def main() -> int:
                             AG2SpaceResultProvider(gw),
                             policy=RetryPolicy(max_attempts=3), worker="w")
         core.backend.publish("task-X", ENVELOPE)
-        for i in range(3):
-            res = core.deliver_one("task-X", ENVELOPE)
-            check(f"refusal #{i+1} completes NOT_DELIVERED",
-                  res.outcome is DeliveryOutcome.NOT_DELIVERED
-                  and core.backend.attempts("task-X") == i + 1)
+        res = core.deliver_one("task-X", ENVELOPE)
+        check("permanent refusal parks after one call",
+              res.outcome is DeliveryOutcome.NOT_DELIVERED
+              and core.backend.attempts("task-X") == 1 and len(gw.calls) == 1)
         # The 4th pass must NOT reach the provider: the item is parked, so the
         # still-scripted {"ok": True} is never consumed.
         res = core.deliver_one("task-X", ENVELOPE)
