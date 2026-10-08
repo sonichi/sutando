@@ -1084,18 +1084,26 @@ function _handOffWhenPaused(taskId: string, outcome: string, fallback: () => voi
 	return true;
 }
 
+// Cancelled tasks whose call has not ended yet; they are no longer a target for "cancel it".
+const _cancelledWaiting = new Set<string>();
+
 // Tasks the user cancelled by voice, and the cancel instructions written for them: cancel_task
 // already confirmed it, so the "Cancelled." stub and the core's reply are archived unspoken.
 const _quietResults = new Set<string>();
 
 /**
- * Called by cancel_task. A call still waiting on the task ends now, telling the model to drop it,
- * and the later results for the task and for the cancel instruction are not spoken.
+ * Called by cancel_task. The later results for the task and for the cancel instruction are not
+ * spoken. A call still waiting on the task ends at the next pause, after the model has confirmed
+ * the cancel: ended in the same turn, its "say nothing" also silenced the confirmation (live).
  */
 export function _noteVoiceCancel(taskId: string, instructionId: string): void {
 	_quietResults.add(taskId);
 	_quietResults.add(instructionId);
-	_settleResultWaiter(taskId, 'The user cancelled this task and you already confirmed it. Say nothing about it.');
+	_cancelledWaiting.add(taskId);
+	void _waitForPause().then(() => {
+		_cancelledWaiting.delete(taskId);
+		_settleResultWaiter(taskId, 'This task was cancelled at the user\'s request, and the user has been told. Say nothing more about it.');
+	});
 }
 
 /** Releases a waiting call whose result goes another way (DM, origin, skip marker). */
@@ -1105,7 +1113,7 @@ function _releaseResultWaiter(taskId: string): void {
 
 /** The task of the most recent `work` call still waiting for its result. */
 export function latestWaitingWorkTask(): string | undefined {
-	return [..._resultWaiters.keys()].at(-1);
+	return [..._resultWaiters.keys()].filter((id) => !_cancelledWaiting.has(id)).at(-1);
 }
 
 export function _awaitTaskResult(taskId: string, signal: AbortSignal): Promise<string> {

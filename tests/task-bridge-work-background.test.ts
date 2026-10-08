@@ -118,6 +118,29 @@ describe('work as a background tool', () => {
 		injected.length = 0;
 	});
 
+	it('a cancelled call ends only at the next pause, after the confirmation turn', async () => {
+		const pauses: Array<() => void> = [];
+		setResultPacing(() => new Promise<void>((r) => { pauses.push(r); }));
+		const before = new Set(_pendingTasksForTest.keys());
+		let done: unknown;
+		const running = call('draw a horse', new AbortController().signal).then((r) => { done = r; });
+		await tick(50);
+		const [taskId] = newTaskIds(before);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const out = await (cancelTaskTool.execute as any)({}) as { taskId?: string; instruction?: string };
+		assert.equal(out.taskId, taskId);
+		await tick(50);
+		assert.equal(done, undefined, 'the call stays open while the model confirms the cancel');
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const again = await (cancelTaskTool.execute as any)({}) as { taskId?: string };
+		assert.notEqual(again.taskId, taskId, 'a cancelled call is no longer the target of "cancel it"');
+		for (const p of pauses) p();
+		await running;
+		assert.match(String(done), /cancelled at the user's request/);
+		setResultPacing(async () => {});
+		for (const id of [taskId, out.instruction!, again.taskId!]) _pendingTasksForTest.delete(id);
+	});
+
 	it('a voice cancel ends the waiting call and keeps the stub and the core reply unspoken', async () => {
 		const before = new Set(_pendingTasksForTest.keys());
 		let done: unknown;
@@ -128,7 +151,7 @@ describe('work as a background tool', () => {
 		const out = await (cancelTaskTool.execute as any)({}) as { taskId?: string; instruction?: string };
 		assert.equal(out.taskId, taskId);
 		await running;
-		assert.match(String(done), /cancelled this task/);
+		assert.match(String(done), /cancelled at the user's request/);
 		writeFileSync(join(TMP, 'results', `${out.instruction}.txt`), 'Nothing to cancel — it was never started.');
 		await tick(2_500);
 		assert.deepEqual(injected, [], 'neither "Cancelled." nor the core reply is spoken');
