@@ -200,11 +200,14 @@ has_result() {
 # Did an API-error turn consume this submitted prompt? Policy and guards: delivery/turn_failure.py.
 # On yes the marker is cleared, so the next pick of the still-queued task types it again.
 release_lost_submit() {
-  local filename="$1" reason held=()
+  local filename="$1" reason rc=0 held=()
   [ "${SUTANDO_INBOX_KIND:-}" = "deliveries" ] || held=(--deliveries-dir "$DELIVERIES_DIR")
   reason="$("$NOTIFIER_PY" "$TURN_FAILURE_PY" retry-due --state "$WORKSPACE_DIR/state" \
     --inflight-dir "$INFLIGHT_DIR" --results-dir "$RESULTS_DIR" --payload "$(task_payload "$filename")" \
-    ${held[@]+"${held[@]}"} "$filename" 2>/dev/null)" || return 1
+    ${held[@]+"${held[@]}"} "$filename" 2>/dev/null)" || rc=$?
+  # 3: the attempt cap was reached just now; say so once and keep waiting.
+  [ "$rc" -eq 3 ] && log_notifier "$reason"
+  [ "$rc" -eq 0 ] || return 1
   "$NOTIFIER_PY" "$TURN_FAILURE_PY" retry-note --state "$WORKSPACE_DIR/state" "$filename" >/dev/null 2>&1 || return 1
   "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" || return 1
   log_notifier "re-delivering $filename: $reason"

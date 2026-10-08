@@ -24,7 +24,7 @@ State (per instance: `util_paths.turn_failure_path`):
     <state>/core-turn-failure/<key|core>.turn.json
         {"task", "session_id", "started_at"}    -- the turn now running
     <state>/task-notifier-retry/<filename>.json
-        {"attempts", "last_retry_at"}
+        {"attempts", "last_retry_at", "gave_up_at"}
 
 Only transient errors are retryable (`RETRYABLE_ERRORS`). Authentication,
 billing, account and request errors are not: re-typing cannot fix them and
@@ -37,7 +37,9 @@ the task's submission (the in-flight marker's mtime). A later turn -- another
 prompt, a Monitor event, a turn after a successful Stop -- is not blamed. A successful turn newer than the
 failure means the API is back: re-deliver now. Otherwise wait out the backoff
 (`BACKOFF_SECONDS`, by attempts already made, capped at the last entry),
-measured from the later of the failure and the previous re-delivery.
+measured from the later of the failure and the previous re-delivery. After
+`MAX_ATTEMPTS` re-deliveries of one task it stops: `retry-due` reports the
+give-up once (exit 3) and the task keeps the ordinary completion timeout.
 
 CLI:
 
@@ -45,7 +47,8 @@ CLI:
     turn_failure.py hook-stop-failure --state <state_dir>     # hook JSON on stdin; always exit 0
     turn_failure.py record-recovery --state <state_dir>        # ends the turn too; always exit 0
     turn_failure.py retry-due --state <state_dir> --inflight-dir <dir> --results-dir <dir> \\
-        --payload <task_path> [--deliveries-dir <dir>] <filename>   # exit 0 due (prints reason), 1 not
+        --payload <task_path> [--deliveries-dir <dir>] <filename>
+        # exit 0 due (prints reason), 3 gave up just now (prints why), 1 not due
     turn_failure.py retry-note --state <state_dir> <filename>
     turn_failure.py retry-clear --state <state_dir> <filename>
 """
@@ -61,14 +64,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # lint-workspace-resolution: allow-repo-root
 
 __all__ = [
-    "RETRYABLE_ERRORS", "BACKOFF_SECONDS", "TASK_PROMPT_PREFIX", "backoff_delay",
-    "decide_retry", "task_of_prompt", "record_turn_start", "read_turn", "end_turn",
+    "RETRYABLE_ERRORS", "BACKOFF_SECONDS", "MAX_ATTEMPTS", "TASK_PROMPT_PREFIX", "backoff_delay",
+    "decide_retry", "gives_up", "retry_verdict", "task_of_prompt", "record_turn_start", "read_turn", "end_turn",
     "record_failure", "record_recovery", "read_failure",
     "read_retry", "note_retry", "clear_retry", "retry_due",
 ]
 
 RETRYABLE_ERRORS = frozenset({"server_error", "overloaded", "rate_limit", "unknown"})
 BACKOFF_SECONDS = (30, 60, 120, 300, 600)
+# Re-deliveries per task; past this the task keeps the notifier's ordinary completion timeout.
+MAX_ATTEMPTS = 3
 # How the notifier's task_prompt (agent/claude/cli/task-notifier.sh) begins; a test pins the two together.
 TASK_PROMPT_PREFIX = "Sutando task ready: "
 
@@ -103,14 +108,10 @@ def decide_retry(failure: "dict | None", filename: str, submitted_at: float, att
 
     Pure: every input is a value, so the policy is testable without files.
     """
-    if not failure or failure.get("task") != filename:
+    error = _lost_to(failure, filename, submitted_at)
+    if error is None or attempts >= MAX_ATTEMPTS:
         return None
-    failed_at = _num(failure.get("failed_at"))
-    if failed_at is None or failed_at <= submitted_at:
-        return None
-    error = failure.get("error")
-    if error not in RETRYABLE_ERRORS:
-        return None
+    failed_at = failure["failed_at"]
     recovered_at = _num(failure.get("recovered_at"))
     if recovered_at is not None and recovered_at > failed_at:
         return f"a turn ended in {error} after the submit and a later turn succeeded"
@@ -119,6 +120,22 @@ def decide_retry(failure: "dict | None", filename: str, submitted_at: float, att
     if now - base >= delay:
         return f"a turn ended in {error} after the submit; backoff {delay}s elapsed (attempt {attempts + 1})"
     return None
+
+
+def gives_up(failure: "dict | None", filename: str, submitted_at: float, attempts: int) -> bool:
+    """The failed turn lost this task's prompt, but MAX_ATTEMPTS re-deliveries are spent."""
+    return attempts >= MAX_ATTEMPTS and _lost_to(failure, filename, submitted_at) is not None
+
+
+def _lost_to(failure: "dict | None", filename: str, submitted_at: float) -> "str | None":
+    """The retryable error of a failed turn that this task's submitted prompt started, else None."""
+    if not failure or failure.get("task") != filename:
+        return None
+    failed_at = _num(failure.get("failed_at"))
+    if failed_at is None or failed_at <= submitted_at:
+        return None
+    error = failure.get("error")
+    return error if error in RETRYABLE_ERRORS else None
 
 
 def _num(v) -> "float | None":
@@ -219,16 +236,35 @@ def note_retry(state_dir, filename: str, now: "float | None" = None) -> int:
     return attempts
 
 
+def _note_give_up(state_dir, filename: str, now: float) -> bool:
+    """Stamp the give-up once; False when it was already stamped."""
+    path = _retry_path(state_dir, filename)
+    rec = _read_json(path) or {}
+    if rec.get("gave_up_at") is not None:
+        return False
+    rec["gave_up_at"] = now
+    _write_json(path, rec)
+    return True
+
+
 def clear_retry(state_dir, filename: str) -> None:
     _retry_path(state_dir, filename).unlink(missing_ok=True)
 
 
 def retry_due(state_dir, inflight_dir, results_dir, payload, filename: str,
               deliveries_dir=None, now: "float | None" = None) -> "str | None":
-    """`decide_retry` over the on-disk state, behind the notifier's own guards.
+    """Why to re-deliver now (`retry_verdict` "due"), or None."""
+    verdict = retry_verdict(state_dir, inflight_dir, results_dir, payload, filename, deliveries_dir, now)
+    return verdict[1] if verdict and verdict[0] == "due" else None
 
-    Never due when the task has a ready result, is gone from its inbox (archived),
-    is held by a pool worker (or that cannot be read), or has no in-flight marker.
+
+def retry_verdict(state_dir, inflight_dir, results_dir, payload, filename: str,
+                  deliveries_dir=None, now: "float | None" = None) -> "tuple[str, str] | None":
+    """("due", reason), ("give_up", why) the first time the cap stops it, or None.
+
+    `decide_retry` over the on-disk state, behind the notifier's own guards: never
+    due when the task has a ready result, is gone from its inbox (archived), is held
+    by a pool worker (or that cannot be read), or has no in-flight marker.
     """
     # Imported here: the hooks run on every turn end and need none of it.
     from delivery.task_dispatch import has_ready_result, worker_holds
@@ -244,9 +280,16 @@ def retry_due(state_dir, inflight_dir, results_dir, payload, filename: str,
         submitted_at = (Path(inflight_dir) / filename).stat().st_mtime
     except OSError:
         return None
+    now = time.time() if now is None else now
     attempts, last_retry_at = read_retry(state_dir, filename)
-    return decide_retry(read_failure(state_dir), filename, submitted_at, attempts, last_retry_at,
-                        time.time() if now is None else now)
+    failure = read_failure(state_dir)
+    reason = decide_retry(failure, filename, submitted_at, attempts, last_retry_at, now)
+    if reason is not None:
+        return ("due", reason)
+    if gives_up(failure, filename, submitted_at, attempts) and _note_give_up(state_dir, filename, now):
+        return ("give_up", f"not re-delivering {filename}: {attempts} re-deliveries already lost to "
+                           f"{failure.get('error')}; waiting out the completion timeout")
+    return None
 
 
 def _hook_payload(event: str) -> "dict | None":
@@ -317,11 +360,11 @@ def _main(argv: list) -> int:
             payload, deliveries = _take(args, "--payload"), _take(args, "--deliveries-dir")
             if None in (inflight, results, payload) or len(args) != 1:
                 raise ValueError(_USAGE)
-            reason = retry_due(state, inflight, results, payload, args[0], deliveries)
-            if reason is None:
+            verdict = retry_verdict(state, inflight, results, payload, args[0], deliveries)
+            if verdict is None:
                 return 1
-            print(reason)
-            return 0
+            print(verdict[1])
+            return 0 if verdict[0] == "due" else 3
         if cmd in ("retry-note", "retry-clear") and len(args) == 1:
             if cmd == "retry-note":
                 print(note_retry(state, args[0]))

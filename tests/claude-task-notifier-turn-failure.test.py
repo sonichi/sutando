@@ -87,6 +87,19 @@ class LostSubmitTests(FakeTmuxHarness):
         self.assertTrue(marker.exists())
         self.assertEqual(self.typed("task-busy.txt"), 1)
 
+    def test_after_max_attempts_it_logs_once_and_keeps_waiting(self):
+        marker = self.submit_once("task-cap.txt")
+        self.write_failure("rate_limit", recovered=True, task="task-cap.txt")
+        retry = self.state_dir / "task-notifier-retry" / "task-cap.txt.json"
+        retry.parent.mkdir(parents=True, exist_ok=True)
+        retry.write_text(json.dumps({"attempts": 3, "last_retry_at": time.time() - 3600}))
+        second = self.run_event("task-cap.txt", env_extra=FAST)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stderr.count("not re-delivering task-cap.txt"), 1, second.stderr)
+        self.assertNotIn("task-notifier: re-delivering", second.stderr)
+        self.assertTrue(marker.exists())
+        self.assertEqual(self.typed("task-cap.txt"), 1)
+
     def test_an_auth_failure_keeps_waiting_and_never_retypes(self):
         marker = self.submit_once("task-auth.txt")
         self.write_failure("authentication_failed", recovered=True, task="task-auth.txt")

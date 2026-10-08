@@ -67,6 +67,15 @@ class DecideRetryTests(unittest.TestCase):
     def test_backoff_schedule_grows_then_caps_at_600(self):
         self.assertEqual([tf.backoff_delay(n) for n in range(8)], [30, 60, 120, 300, 600, 600, 600, 600])
 
+    def test_re_delivery_stops_after_max_attempts(self):
+        self.assertEqual(tf.MAX_ATTEMPTS, 3)
+        f = self.rec(110, error="rate_limit", recovered=111)
+        self.assertIsNotNone(tf.decide_retry(f, "t", 100, 2, 0, 10_000))
+        self.assertIsNone(tf.decide_retry(f, "t", 100, 3, 0, 10_000))
+        self.assertTrue(tf.gives_up(f, "t", 100, 3))
+        self.assertFalse(tf.gives_up(f, "t", 100, 2))
+        self.assertFalse(tf.gives_up(self.rec(110, task=None), "t", 100, 3))
+
     def test_backoff_counts_from_the_later_of_failure_and_last_retry(self):
         f = self.rec(110)
         self.assertIsNone(tf.decide_retry(f, "t", 100, 2, 200, 200 + 119))
@@ -135,6 +144,18 @@ class OnDiskTests(unittest.TestCase):
         (self.inflight / self.name).unlink()
         self.assertIsNone(self.due(), "re-sent a task that was never submitted")
 
+    def test_the_cap_is_reported_once_then_stays_quiet(self):
+        tf.record_failure(self.state, "unknown", "s", now=1010, task=self.name)
+        for n in range(tf.MAX_ATTEMPTS):
+            self.assertIsNotNone(self.due(now=100_000 + n), f"attempt {n + 1} was not due")
+            tf.note_retry(self.state, self.name, now=1011)
+        args = (self.state, self.inflight, self.results, self.tasks / self.name, self.name)
+        kind, why = tf.retry_verdict(*args, now=200_000)
+        self.assertEqual(kind, "give_up")
+        self.assertIn(f"{tf.MAX_ATTEMPTS} re-deliveries", why)
+        self.assertIsNone(tf.retry_verdict(*args, now=300_000), "the give-up was reported twice")
+        self.assertIsNone(self.due(now=400_000))
+
     def test_retry_clear_resets_attempts(self):
         tf.note_retry(self.state, self.name, now=1)
         tf.clear_retry(self.state, self.name)
@@ -149,6 +170,12 @@ class OnDiskTests(unittest.TestCase):
         out = subprocess.run(args, capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("server_error", out.stdout)
+        for _ in range(tf.MAX_ATTEMPTS):
+            tf.note_retry(self.state, self.name, now=1)
+        capped = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(capped.returncode, 3, capped.stderr)
+        self.assertIn("not re-delivering", capped.stdout)
+        self.assertEqual(subprocess.run(args, capture_output=True).returncode, 1)
         bad = subprocess.run([sys.executable, str(MODULE), "retry-due", "--state", str(self.state)],
                              capture_output=True)
         self.assertEqual(bad.returncode, 2)
