@@ -86,6 +86,20 @@ The goal of this phase is to confirm the PR is necessary at all. In rough order 
 
    Worth the second it costs because these findings are mechanical and invisible while writing. `prose-cap` counts **consecutive added comment lines**, so a trailing comment on a code line folds into the block beneath it — `return None  # why` above a 2-line block is a 3-line run, and the fix is a blank line between them, not a rewrite. On 2026-09-01 one file cost four separate CI round-trips across two authors for that class alone.
 
+## Regression declaration for bug fixes
+
+PRs with a `fix:` / `fix(scope):` title or the `bug` label must fill in
+`Regression test:` (test file/name and command) and `Regression evidence:`
+(actual failing-before/passing-after output or a link to that evidence).
+Alternatively, fill in `Regression exception:` with a concrete reason a
+regression test is not practical. Existing reviewers assess both evidence
+and exceptions; this adds no approval or test-suite run. Non-bug-fix PRs
+are exempt. The `regression declaration` check validates declaration presence,
+not the truth of the evidence; reviewers retain that responsibility.
+
+After this workflow lands, an administrator must make `regression declaration`
+a required status check on protected release branches to enforce it at merge.
+
 ## The PR body should answer
 
 In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so the reviewer doesn't wonder whether you forgot it.
