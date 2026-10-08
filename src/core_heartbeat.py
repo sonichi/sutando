@@ -794,7 +794,7 @@ def running_writer_pids() -> list[int]:
                                   text=True, timeout=5).stdout.strip()
         except Exception:
             continue
-        if _writer_argv(args):
+        if _this_checkouts_writer(pid, args):
             found.append(pid)
     return found
 
