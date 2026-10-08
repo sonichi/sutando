@@ -1257,6 +1257,7 @@ async function main() {
 	meetingDictation = attachMeetingDictation({
 		session: session as any,
 		notePathFor: (today) => sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR),
+		toClient: (frame) => session.sendJsonToClient(frame),
 		onExitByVoice: () => {
 			noteMeetingState(false);
 			writeVoiceModeSentinel();

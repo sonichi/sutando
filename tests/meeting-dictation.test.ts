@@ -77,6 +77,7 @@ describe('meeting dictation', () => {
 		let mode: 'agent' | 'transcription' = 'agent';
 		const buffer: string[] = [];
 		const injected: string[] = [];
+		const shown: Array<{ text: string; partial: boolean }> = [];
 		let exitedByVoice = 0;
 		const listeners: Array<(e: DictationTranscriptEvent) => void> = [];
 		// Like bodhi: outside agent mode a final is buffered first, then sent to subscribers.
@@ -99,9 +100,10 @@ describe('meeting dictation', () => {
 		};
 		const md = attachMeetingDictation({
 			session, notePathFor: opts.notePathFor ?? ((d) => join(dir, `notes/meeting-${d}.md`)),
+			toClient: ({ text, partial }) => shown.push({ text, partial }),
 			onExitByVoice: () => { exitedByVoice++; }, log: opts.log ?? (() => {}),
 		});
-		return { md, provider, buffer, injected, get mode() { return mode; }, get exitedByVoice() { return exitedByVoice; } };
+		return { md, provider, buffer, injected, shown, get mode() { return mode; }, get exitedByVoice() { return exitedByVoice; } };
 	}
 
 	it('writes each sentence to the note and exits on the phrase', async () => {
@@ -132,6 +134,15 @@ describe('meeting dictation', () => {
 		t.provider.say('first point');
 		assert.match(readFileSync(t.md.notePath!, 'utf-8'), /## Transcript[^\n]*\n- \[[\d:]+\] first point\n$/);
 		assert.deepEqual(t.buffer, ['first point'], 'bodhi keeps its own buffer');
+	});
+
+	it('shows partials and finals on the client while transcribing', async () => {
+		const t = setup();
+		t.provider.say('before the meeting');
+		await t.md.enter();
+		t.provider.partial('预算已');
+		t.provider.say('预算已经批准。');
+		assert.deepEqual(t.shown, [{ text: '预算已', partial: true }, { text: '预算已经批准。', partial: false }]);
 	});
 
 	it('keeps the words spoken before the exit phrase in the same segment', async () => {

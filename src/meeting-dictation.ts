@@ -146,6 +146,8 @@ export interface MeetingDictationDeps {
 	notePathFor: (today: string) => string;
 	/** Called after an exit phrase returned the session to agent mode. */
 	onExitByVoice: () => void;
+	/** Sends a frame to the voice client, so its transcript shows the transcription model's text. */
+	toClient?: (frame: { type: 'transcript'; role: 'user'; text: string; partial: boolean }) => void;
 	log: (msg: string) => void;
 	now?: () => Date;
 }
@@ -171,7 +173,9 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 	};
 
 	deps.session.onDictationTranscript(({ text, partial }) => {
-		if (partial || !text) return;
+		if (!text) return;
+		deps.toClient?.({ type: 'transcript', role: 'user', text, partial });
+		if (partial) return;
 		const command = findExitCommand(text);
 		if (command) {
 			deps.log(`[MeetingDictation] exit phrase heard: "${text}"`);
