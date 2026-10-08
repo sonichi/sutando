@@ -517,6 +517,8 @@ def _credentials(cap, collab_url: Optional[str]) -> tuple:
     try:
         return cap.resolve_url(collab_url), cap.resolve_token(None)
     except Exception:  # noqa: BLE001 — retried below only when the env file has them
+        # Never with --collab-url: that host was named elsewhere, and the channel token
+        # must not go to a host its own file did not name (the capability's no-mix rule).
         extra = {} if collab_url else channel_credentials(cap)
         if not extra:
             raise

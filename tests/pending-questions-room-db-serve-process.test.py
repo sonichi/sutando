@@ -17,6 +17,7 @@ import importlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -91,6 +92,7 @@ FAKE_CLIENT = textwrap.dedent('''
 class ServeProcess(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="pq-serve-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.scripts = self.tmp / "skills" / "room-collab" / "scripts"
         self.scripts.mkdir(parents=True)
         (self.scripts / "room_collab.py").write_text(FAKE_CAP)
@@ -183,6 +185,7 @@ class InProcess(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="pq-inproc-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.config = self.tmp / "claude-config"
         base = {k: v for k, v in os.environ.items()
                 if k not in CRED_VARS and k not in ("AG2_DEVICE_ENV", "CLAUDE_HOME")}
@@ -219,10 +222,14 @@ class InProcess(unittest.TestCase):
         self.channel_file(REMOTE_TASK_URL="https://relay.test.invalid/relay", REMOTE_TASK_TOKEN="file-token")
         self.assertEqual(adapter._credentials(FakeCap(), None), ("https://relay.test.invalid/relay", "file-token"))
 
-    def test_credentials_never_mix_and_never_override_a_collab_url(self):
+    def test_a_collab_url_override_never_receives_the_channel_token(self):
         self.channel_file(REMOTE_TASK_URL="https://relay.test.invalid/relay", REMOTE_TASK_TOKEN="file-token")
         with self.assertRaisesRegex(FakeCap.RoomDocError, "no access token"):
             adapter._credentials(FakeCap(), "https://override.test.invalid")
+        self.assertNotIn("REMOTE_TASK_TOKEN", os.environ)
+
+    def test_credentials_never_mix_an_env_token_with_the_files_url(self):
+        self.channel_file(REMOTE_TASK_URL="https://relay.test.invalid/relay", REMOTE_TASK_TOKEN="file-token")
         os.environ["REMOTE_TASK_TOKEN"] = "env-token"
         with self.assertRaisesRegex(FakeCap.RoomDocError, "no service URL"):
             adapter._credentials(FakeCap(), None)
