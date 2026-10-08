@@ -15,8 +15,7 @@ REPO = Path(__file__).resolve().parents[3]
 
 
 class CodexWorkerResetLauncherTests(unittest.TestCase):
-    def test_worker_installs_timer_with_workspace_home_and_disable_override(self):
-        with tempfile.TemporaryDirectory() as tmp:
+    def _launch(self, tmp):
             root = Path(tmp) / "repo"
             home = Path(tmp) / "home"
             workspace = Path(tmp) / "workspace"
@@ -78,6 +77,11 @@ class CodexWorkerResetLauncherTests(unittest.TestCase):
                 ["bash", str(root / "skills/worker-pool/scripts/launch-codex-worker-session.sh")],
                 cwd=root, env=env, capture_output=True, text=True, timeout=15,
             )
+            return result, reset_log, tmux_log, home, workspace
+
+    def test_worker_installs_timer_with_workspace_home_and_disable_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, reset_log, tmux_log, home, workspace = self._launch(tmp)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(reset_log.read_text()), {
                 "args": ["ensure", "--workspace", str(workspace),
@@ -85,6 +89,15 @@ class CodexWorkerResetLauncherTests(unittest.TestCase):
                 "enabled": "0",
             })
             self.assertIn("-e SUTANDO_CODEX_AUTO_RESET_ENABLED=0", tmux_log.read_text())
+
+    def test_worker_codex_skips_the_interactive_startup_update_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, tmux_log, _, _ = self._launch(tmp)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            launch = [l for l in tmux_log.read_text().splitlines() if "new-session" in l]
+            self.assertEqual(len(launch), 1, launch)
+            self.assertIn(" codex ", f" {launch[0]} ")
+            self.assertIn("-c check_for_update_on_startup=false", launch[0])
 
 
 if __name__ == "__main__":
