@@ -183,6 +183,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`send_failure_policy.py`** — Classify an outbound-send failure as transient (retry) or permanent (park).
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
+- **`session_identity.sh`** — Sourced by hooks: who this Claude session is.
 - **`session_runtime.py`** — Runtime a tmux core session was launched with, read from the session's own environment.
 - **`shepherd_contract.py`** — Shepherd contract: the responsibility scope a task accepts for an external objective, and the admission rule deciding which observed events belong to it.
 - **`shutdown.py`** — Graceful-shutdown sentinel — a durable, cross-process "we are shutting down on purpose (not crashing)" signal.
