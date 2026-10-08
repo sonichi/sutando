@@ -1088,7 +1088,7 @@ function _handOffWhenPaused(taskId: string, outcome: string, fallback: () => voi
 const _cancelledWaiting = new Set<string>();
 
 // Tasks the user cancelled by voice, and the cancel instructions written for them: cancel_task
-// already confirmed it, so the "Cancelled." stub and the core's reply are archived unspoken.
+// already confirmed it, so a late result for the task and the core's reply are archived unspoken.
 const _quietResults = new Set<string>();
 
 /**
@@ -1099,6 +1099,10 @@ const _quietResults = new Set<string>();
 export function _noteVoiceCancel(taskId: string, instructionId: string): void {
 	_quietResults.add(taskId);
 	_quietResults.add(instructionId);
+	// cancel_task's return value is the confirmation, so no "Cancelled." result file is written:
+	// the task card closes here, and the task leaves the timeout sweep.
+	_pendingTasks.delete(taskId);
+	_sendTaskStatus?.(taskId, 'done', 'Cancelled.');
 	_cancelledWaiting.add(taskId);
 	void _waitForPause().then(() => {
 		_cancelledWaiting.delete(taskId);

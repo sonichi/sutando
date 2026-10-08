@@ -678,7 +678,6 @@ export const cancelTaskTool: ToolDefinition = {
 		const { taskId, query, list } = (args ?? {}) as { taskId?: string; query?: string; list?: boolean };
 		try {
 			const tasksDir = join(WORKSPACE_DIR, 'tasks');
-			const resultsDir = join(WORKSPACE_DIR, 'results');
 			const files = readdirSync(tasksDir).filter(f => f.endsWith('.txt')).sort();
 
 			// list mode: return id + preview, no cancel
@@ -755,9 +754,6 @@ export const cancelTaskTool: ToolDefinition = {
 			if (targetFile) {
 				try { unlinkSync(join(tasksDir, targetFile)); } catch { /* already gone is fine */ }
 			}
-
-			// Touch a cancelled result for the web UI's cancel icon (best-effort).
-			try { writeFileSync(join(resultsDir, `${targetId}.txt`), 'Cancelled.'); } catch { /* ignore */ }
 
 			console.log(`${ts()} [CancelTask] cancel-instruction written for ${targetId}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''} → ${cancelFilename}`);
 			return { status: 'cancel_instruction_queued', taskId: targetId, instruction: `task-${cancelTs}` };

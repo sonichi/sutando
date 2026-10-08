@@ -5,7 +5,7 @@
 // Run: npx tsx --test --test-force-exit tests/task-bridge-work-background.test.ts
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -150,6 +150,8 @@ describe('work as a background tool', () => {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const out = await (cancelTaskTool.execute as any)({}) as { taskId?: string; instruction?: string };
 		assert.equal(out.taskId, taskId);
+		assert.ok(!existsSync(join(TMP, 'results', `${taskId}.txt`)), 'no "Cancelled." result file: the call itself confirms');
+		assert.ok(!_pendingTasksForTest.has(taskId), 'a cancelled task leaves the timeout sweep');
 		await running;
 		assert.match(String(done), /cancelled at the user's request/);
 		writeFileSync(join(TMP, 'results', `${out.instruction}.txt`), 'Nothing to cancel — it was never started.');
