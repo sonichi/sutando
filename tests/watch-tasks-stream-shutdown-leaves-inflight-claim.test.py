@@ -175,7 +175,9 @@ class Workspace:
         return p
 
     def sentinels(self, tid: str) -> list[str]:
-        return sorted(str(p.relative_to(self.ws)) for p in (self.ws / "deliveries").glob(f"*/{tid}.*"))
+        # Sentinels only: the delivered payload sits beside them as <tid>.body (#4836).
+        return sorted(str(p.relative_to(self.ws)) for p in (self.ws / "deliveries").glob(f"*/{tid}.*")
+                      if p.suffix in (".txt", ".accepted", ".claimed"))
 
     def attribution(self, tid: str) -> str | None:
         return pa.worker_for_task(self.ws, tid)
@@ -287,12 +289,18 @@ def router_runs(w: Workspace) -> int:
     return sum(1 for ln in w.log() if ln.startswith("router rc="))
 
 
-def expect_settled(w: Workspace, w2: Watcher, name: str, runs: int, recipient: str = A) -> None:
+def expect_settled(w: Workspace, w2: Watcher, name: str, runs: int, recipient: str = A,
+                   replayed: bool = True) -> None:
     tid = name[:-4]
     # "claim absent" and "sentinel present" can both be true BEFORE the replay
     # runs: wait for the router's Nth completion, then for the release after it.
+    # A route that completed before the kill moved the payload beside the sentinel:
+    # the successor finds no file, retires the dead claim and replays nothing.
     check("the next watcher's sweep replayed the router to completion",
           wait_for(lambda: router_runs(w) >= runs, 30.0), str(w.log()))
+    if not replayed:
+        check("the payload left the inbox with the delivery, so there was nothing to replay",
+              not (w.ws / "tasks" / name).exists() and router_runs(w) == runs, str(w.log()))
     check("the next watcher releases the claim after its sweep",
           wait_for(lambda: not claimed(w, name), 30.0), w.claim_pid(name))
     check("...and the sentinel is in place",
@@ -348,9 +356,9 @@ def arm_barrier(sub: str, transition: str, delivered_before_kill: bool) -> None:
         w.pause_at("")
         w2 = Watcher(w)
         w2.start()
-        expect_settled(w, w2, "task-p.txt", runs=2 if delivered_before_kill else 1)
+        expect_settled(w, w2, "task-p.txt", runs=1, replayed=not delivered_before_kill)
         check("the router ran to completion exactly once after the kill",
-              router_runs(w) == (2 if delivered_before_kill else 1), str(w.log()))
+              router_runs(w) == 1, str(w.log()))
     finally:
         w1.stop()
         if w2 is not None:
@@ -378,7 +386,7 @@ def arm_during_routing(sub: str, mode: str) -> None:
         w.mode("normal")
         w2 = Watcher(w)
         w2.start()
-        expect_settled(w, w2, "task-b.txt", runs=2 if mode == "hang-after" else 1)
+        expect_settled(w, w2, "task-b.txt", runs=1, replayed=(mode != "hang-after"))
     finally:
         w1.stop()
         if w2 is not None:
@@ -520,12 +528,13 @@ def arm_reader_ps_failure_keeps_then_recovers() -> None:
         broken_ps.chmod(0o755)
         w2 = Watcher(w, role="session")
         w2.start()
-        # With ps failing the writer refuses to claim anything (fail closed), so a
-        # routed poke cannot be the signal here; the reader's own diagnostic is.
         check("the reader says why it keeps the claim",
               wait_for(lambda: "cannot read the start time" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
         check("with ps failing, the live owner's claim is kept",
               w.claim_pid("task-o.txt") == str(w1.proc.pid), w.claim_pid("task-o.txt"))
+        # task-o's payload left the inbox with its delivery (#4836), so the writer's
+        # refusal needs a dispatch of its own: a fresh task under the broken ps.
+        (w.ws / "tasks" / "task-q1.txt").write_text("id: task-q1\nsource: ag2space\nchannel_id: !bound:example.test\ntask: q1\n")
         check("...and the writer refused to claim rather than publish a blank identity",
               wait_for(lambda: "cannot read my own start time" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
         check("...so no claim of w2's exists anywhere", all(
@@ -537,7 +546,8 @@ def arm_reader_ps_failure_keeps_then_recovers() -> None:
         check("with ps back, the live owner's claim is still kept", w.claim_pid("task-o.txt") == str(w1.proc.pid))
         w1.stop(graceful=True)             # now the owner dies; the next dispatch re-asks and sees it
         poke(w, w2, "task-q3.txt")
-        expect_settled(w, w2, "task-o.txt", runs=4)
+        # runs: task-o (1) + q1 once ps answers + q2 + q3; task-o itself is not replayed.
+        expect_settled(w, w2, "task-o.txt", runs=4, replayed=False)
     finally:
         if w2 is not None:
             w2.stop()
@@ -641,18 +651,18 @@ def arm_no_handler_live_claim_committed_never_announced() -> None:
         broken_ps.chmod(0o755)
         w2 = Watcher(w, handler=False, role="session")
         w2.start()
-        check("the no-handler watcher holds the task rather than announcing into the guards",
-              wait_for(lambda: "no handler is available" in w2.err.read_text(), 30.0), w2.err.read_text()[-300:])
+        # The delivery moved the payload beside A's sentinel (#4836): the no-handler
+        # watcher finds nothing in its inbox to hold or announce, and the claim stands.
         time.sleep(3.0)
-        check("zero TASK_FILE lines while the claim stands", w2.announced("task-h.txt") == 0, w2.out.read_text()[-200:])
+        check("the no-handler watcher announces nothing: the delivered payload is not in its inbox",
+              w2.announced("task-h.txt") == 0 and not (w.ws / "tasks" / "task-h.txt").exists(), w2.out.read_text()[-200:])
         broken_ps.unlink()               # ps returns; the owner is still alive
         time.sleep(5.0)
         check("still zero with ps back and the owner alive", w2.announced("task-h.txt") == 0, w2.out.read_text()[-200:])
         w1.stop(graceful=True)           # the owner dies; nothing else is fed
         time.sleep(7.0)                  # three retry intervals with no handler available
         check("with no handler here the dead claim is preserved, not retired", claimed(w, "task-h.txt"), w.claim_pid("task-h.txt"))
-        check("...and the task is held, never announced to the core", w2.announced("task-h.txt") == 0
-              and "no handler is available" in w2.err.read_text(), w2.out.read_text()[-300:])
+        check("...and never announced to the core", w2.announced("task-h.txt") == 0, w2.out.read_text()[-300:])
         check("A's sentinel and attribution are untouched",
               w.sentinels("task-h") == [f"deliveries/{A}/task-h.txt"] and w.attribution("task-h") == A)
         # Restart durability: the holding watcher dies; a fresh no-handler watcher must
@@ -660,15 +670,17 @@ def arm_no_handler_live_claim_committed_never_announced() -> None:
         w2.stop()
         w3 = Watcher(w, handler=False)
         w3.start()
-        check("a fresh no-handler watcher holds it again from the durable claim",
-              wait_for(lambda: "no handler is available" in w3.err.read_text(), 30.0), w3.err.read_text()[-300:])
         time.sleep(5.0)
         check("...zero core lines, no handler run, claim still there",
               w3.announced("task-h.txt") == 0 and router_runs(w) == 1 and claimed(w, "task-h.txt"), str(w.log()))
-        # The handler returns (its declaration appears): the held task is replayed through it.
+        # The handler returns: the next dispatch retires the dead claim and finds no file
+        # to replay (the payload sits beside A's sentinel); a poke is that dispatch.
         (w.ws / "state" / "task-event-handler.json").write_text(json.dumps({"handler": str(w.handler)}))
-        check("the returned handler replays it: the dead claim is retired and released",
-              wait_for(lambda: router_runs(w) == 2 and not claimed(w, "task-h.txt"), 40.0), f"{w.log()} {w.claim_pid('task-h.txt')}")
+        before = router_runs(w)
+        poke(w, w3, "task-hx.txt")
+        check("the returned handler retires the dead claim without a replay: the payload already left the inbox",
+              wait_for(lambda: not claimed(w, "task-h.txt"), 40.0) and router_runs(w) == before + 1
+              and not (w.ws / "tasks" / "task-h.txt").exists(), f"{w.log()} {w.claim_pid('task-h.txt')}")
         check("...as 'already': still one sentinel, attribution A, and still never announced",
               w.sentinels("task-h") == [f"deliveries/{A}/task-h.txt"] and w.attribution("task-h") == A
               and w3.announced("task-h.txt") == 0, str(w.sentinels("task-h")))
@@ -879,7 +891,9 @@ def arm_rebind_between_kill_and_replay() -> None:
         w.mode("normal")
         w2 = Watcher(w)
         w2.start()
-        expect_settled(w, w2, "task-g.txt", runs=2, recipient=A)
+        # The delivery moved the payload beside A's sentinel: the rebind changes nothing,
+        # because the successor has no file to replay and the commit to A stands.
+        expect_settled(w, w2, "task-g.txt", runs=1, recipient=A, replayed=False)
         check("B never received a sentinel", not (w.ws / "deliveries" / B / "task-g.txt").exists())
     finally:
         w1.stop()

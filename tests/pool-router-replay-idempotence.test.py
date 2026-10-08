@@ -76,7 +76,9 @@ def task(ws: Path) -> dict:
 
 
 def sentinels(ws: Path) -> list[str]:
-    return sorted(str(p.relative_to(ws)) for p in (ws / "deliveries").glob("*/task-r*"))
+    # Sentinels only: a delivered payload sits beside them as task-r.body (#4836).
+    return sorted(str(p.relative_to(ws)) for p in (ws / "deliveries").glob("*/task-r*")
+                  if p.suffix in (".txt", ".accepted", ".claimed"))
 
 
 def scenario_rebind_between_delivery_and_replay() -> None:
