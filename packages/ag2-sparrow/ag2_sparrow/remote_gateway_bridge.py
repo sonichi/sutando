@@ -1688,13 +1688,22 @@ def _reenroll_claim() -> None:
         if body.get("pending") and code:
             _reenroll_state["code"] = code
             _reenroll_state["claimed_at"] = int(time.time())
+            _reenroll_state.pop("refused", None)
             _log("RELINK PENDING — this agent's server-side registration was "
                  f"lost. RELINK CODE: {code} — the owner approves by DMing the "
                  f"concierge: relink approve {code}")
         else:
             _log(f"reenroll: claim not parked ({str(body)[:200]})")
     except urllib.error.HTTPError as e:
-        _log(f"reenroll: claim refused HTTP {e.code} ({_http_error_body(e)[:200]})")
+        raw = _http_error_body(e)
+        try:
+            err = json.loads(raw).get("error")
+        except Exception:  # noqa: BLE001 — a non-JSON body still records the status
+            err = None
+        _reenroll_state["refused"] = {"status": e.code,
+                                      "error": err if isinstance(err, str) else None,
+                                      "at": int(time.time())}
+        _log(f"reenroll: claim refused HTTP {e.code} ({raw[:200]})")
     except Exception as e:  # noqa: BLE001 — recovery must never crash the loop
         _log(f"reenroll: claim failed: {e}")
 
@@ -1705,6 +1714,7 @@ def _reenroll_clear(recovered: bool = False) -> None:
     was_pending = bool(_reenroll_state.get("code"))
     prior_attempt = _reenroll_state.get("last_attempt_at")
     _reenroll_state.update({"last_attempt_at": None, "code": None, "claimed_at": None})
+    _reenroll_state.pop("refused", None)
     if not was_pending:
         # No claim was granted this episode — preserve its cadence, or a
         # probe-only resume lets every future episode re-claim immediately.
@@ -2274,8 +2284,9 @@ def _recover_auth(code: int) -> bool:
     the token file rotates. Returns True once a rotated token is live; False
     when no TOKEN_FILE is configured (caller keeps the historical FATAL
     exit)."""
-    # A new rejection episode invalidates any prior recovered terminal.
+    # A new rejection episode invalidates any prior recovered or refused terminal.
     _reenroll_state.pop("recovered_at", None)
+    _reenroll_state.pop("refused", None)
     if _reload_rotated_token():
         _log("auth rejected but token file already rotated — resuming with new token")
         _reenroll_clear()
@@ -2294,12 +2305,17 @@ def _recover_auth(code: int) -> bool:
     cycle = 0
     while True:
         pending = _reenroll_state["code"]
+        refused = _reenroll_state.get("refused")
         # `backoff_s` means "retryable TRANSPORT backoff"; this loop is waiting on
         # a human, so it stays 0 — the re-check cadence is not a reconnect estimate.
-        _emit_gateway_status(False,
-                             error=(f"auth rejected HTTP {code} — relink pending "
-                                    f"(code {pending})" if pending else
-                                    f"auth rejected HTTP {code} — waiting for re-connect"))
+        if pending:
+            wait = f"relink pending (code {pending})"
+        elif refused:
+            wait = (f"re-link claim refused (HTTP {refused['status']}"
+                    + (f" {refused['error']})" if refused["error"] else ")"))
+        else:
+            wait = "waiting for re-connect"
+        _emit_gateway_status(False, error=f"auth rejected HTTP {code} — {wait}")
         time.sleep(AUTH_RECHECK_INTERVAL)
         if not _heartbeat_singleton():
             sys.exit("FATAL: lost poller singleton while waiting for token rotation")
@@ -2974,6 +2990,16 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
                 "pending": False,
                 "recovered": True,
                 "recovered_at": _reenroll_state["recovered_at"],
+            }
+        elif _reenroll_state.get("refused"):
+            # The server answered the claim; without this the owner sees only a 401.
+            r = _reenroll_state["refused"]
+            payload["reenroll"] = {
+                "pending": False,
+                "refused": True,
+                "refused_status": r["status"],
+                "refused_error": r["error"],
+                "refused_at": r["at"],
             }
         # AWP P0 per-channel health: the task connection is `connected` above; the
         # additive event channel (if running) reports its own status, so a
