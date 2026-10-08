@@ -25,7 +25,7 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
-import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin } from './task-bridge.js';
+import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, latestWaitingWorkTask } from './task-bridge.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -719,6 +719,11 @@ export const cancelTaskTool: ToolDefinition = {
 					} catch { /* ignore */ }
 				}
 				if (!targetId) return { status: 'not_found', query };
+			} else if (latestWaitingWorkTask()) {
+				// default: the task of the most recent `work` call still waiting for its result —
+				// the model no longer sees task ids, and filename order ranks task-health-* above it.
+				targetId = latestWaitingWorkTask()!;
+				if (files.includes(`${targetId}.txt`)) targetFile = `${targetId}.txt`;
 			} else {
 				// default: most recent pending file
 				if (files.length === 0) return { status: 'nothing_pending' };

@@ -153,7 +153,10 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				}
 			},
 		});
-	}, () => session.clientConnected);
+	}, () => session.clientConnected,
+	// A waiting `work` call takes its result only from a live agent-mode session: in meeting
+	// mode the reply would be silenced, and a stuck session would never deliver it.
+	() => session.sessionManager.isActive && session.clientConnected && session.getTranscriptionMode() !== 'transcription');
 }
 
 // ── Session observability recorder (step 5a-3) ───────────────────────────────

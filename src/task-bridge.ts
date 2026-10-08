@@ -1023,13 +1023,37 @@ async function submitWork(args: WorkArgs): Promise<Record<string, unknown>> {
 // completion; a task with no waiter (call aborted, process restarted) is injected as before.
 const _resultWaiters = new Map<string, (outcome: string) => void>();
 
-/** Hands `outcome` to the call waiting on `taskId`; false when none waits. */
-export function _settleResultWaiter(taskId: string, outcome: string): boolean {
+/** Set by startResultWatcher; the timeout sweep reads it too. */
+let _canTakeResult: () => boolean = () => true;
+
+const DELIVERED_SEPARATELY = 'The task is still running. Its result will be delivered separately; say nothing about it now.';
+
+/**
+ * Hands `outcome` to the call waiting on `taskId`; false when none waits. With `deliverable`
+ * false (no client, or the session is in meeting mode) the call is released without it and the
+ * caller delivers the result the old way, which keeps the DM fallback and the meeting hold.
+ */
+export function _settleResultWaiter(taskId: string, outcome: string, deliverable = true): boolean {
 	const settle = _resultWaiters.get(taskId);
 	if (!settle) return false;
 	_resultWaiters.delete(taskId);
+	if (!deliverable) {
+		console.log(`${ts()} [TaskBridge] ${taskId}: the session cannot take the result now; delivering it separately`);
+		settle(DELIVERED_SEPARATELY);
+		return false;
+	}
 	settle(outcome);
 	return true;
+}
+
+/** Releases a waiting call whose result goes another way (DM, origin, skip marker). */
+function _releaseResultWaiter(taskId: string): void {
+	_settleResultWaiter(taskId, '', false);
+}
+
+/** The task of the most recent `work` call still waiting for its result. */
+export function latestWaitingWorkTask(): string | undefined {
+	return [..._resultWaiters.keys()].at(-1);
 }
 
 export function _awaitTaskResult(taskId: string, signal: AbortSignal): Promise<string> {
@@ -1038,7 +1062,7 @@ export function _awaitTaskResult(taskId: string, signal: AbortSignal): Promise<s
 			if (_resultWaiters.get(taskId) !== settle) return;
 			_resultWaiters.delete(taskId);
 			console.log(`${ts()} [TaskBridge] ${taskId}: work call ended before its result; the result will be injected when it lands`);
-			resolve('The task is still running. Its result will be delivered separately; say nothing about it now.');
+			resolve(DELIVERED_SEPARATELY);
 		};
 		const settle = (outcome: string) => {
 			signal.removeEventListener('abort', detach);
@@ -1303,7 +1327,7 @@ export function resetNoteViewingDebounce(): void {
  * submitted. Results it doesn't own are left untouched for their real
  * consumers on the core host. Skip markers get the same silent-archive
  * treatment as the local path. */
-function startRelayResultWatcher(onResult: ResultListener): void {
+function startRelayResultWatcher(onResult: ResultListener, canTakeResult: () => boolean): void {
 	console.log(`${ts()} [TaskBridge] Relay result watcher polling core agent-api`);
 	let inFlight = false;
 	setInterval(async () => {
@@ -1320,7 +1344,9 @@ function startRelayResultWatcher(onResult: ResultListener): void {
 					const minutes = Math.floor(timeoutMs / 60000);
 					const snippet = pending.taskText.length > 80 ? pending.taskText.slice(0, 77) + '...' : pending.taskText;
 					_sendTaskStatus?.(taskId, 'timeout', `Task '${snippet}' timed out — core agent may be unresponsive`);
-					onResult(`[Task ${taskId} ('${snippet}') timed out after ${minutes} minutes. The core host may be unreachable or busy.]`);
+					if (!_settleResultWaiter(taskId, `The task timed out after ${minutes} minutes. The core host may be unreachable or busy.`, canTakeResult())) {
+						onResult(`[Task ${taskId} ('${snippet}') timed out after ${minutes} minutes. The core host may be unreachable or busy.]`);
+					}
 				}
 			}
 			const files = await _delegation.listResultFiles();
@@ -1336,7 +1362,9 @@ function startRelayResultWatcher(onResult: ResultListener): void {
 				// src/result_markers.py, which is case-insensitive and accepts `[deduped:]`.
 				if (!bodyIsSkipMarked(result)) {
 					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
-					onResult(`[Task result for ${taskId}]\n${result}`);
+					if (!_settleResultWaiter(taskId, frameTaskResult(result), canTakeResult())) onResult(`[Task result for ${taskId}]\n${result}`);
+				} else {
+					_releaseResultWaiter(taskId);
 				}
 				await _delegation.archiveResultFile(file, taskId);
 			}
@@ -1392,7 +1420,7 @@ export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Da
 					? `Task '${snippet}' has not been picked up after ${waited} minutes — the processing engine may be down`
 					: `Task has not been picked up after ${waited} minutes — the processing engine may be down`);
 				const unpicked = `has not been picked up after ${waited} minutes. It is still queued; the processing engine may need to be restarted.`;
-				if (!_settleResultWaiter(taskId, `The task ${unpicked}`)) {
+				if (!_settleResultWaiter(taskId, `The task ${unpicked}`, _canTakeResult())) {
 					onResult(snippet ? `[Task ${taskId} ('${snippet}') ${unpicked}]` : `[Task ${taskId} ${unpicked}]`);
 				}
 			}
@@ -1416,7 +1444,7 @@ export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Da
 			const userMsg = taskSnippet
 				? `[Task ${taskId} ('${taskSnippet}') timed out after ${minutes} minutes. The processing engine may need to be restarted.]`
 				: `[Task ${taskId} timed out after ${minutes} minutes. The processing engine may need to be restarted.]`;
-			if (!_settleResultWaiter(taskId, `The task timed out after ${minutes} minutes. The processing engine may need to be restarted.`)) onResult(userMsg);
+			if (!_settleResultWaiter(taskId, `The task timed out after ${minutes} minutes. The processing engine may need to be restarted.`, _canTakeResult())) onResult(userMsg);
 			// Move the task file out of tasks/ so /tasks/active stops listing it
 			// as 'working' forever. (Without this, dedup-orphan tasks left behind
 			// after a consolidated reply pile up in the UI as stuck spinners.)
@@ -1452,7 +1480,13 @@ export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Da
  *  when the written copy went somewhere other than the session was told to expect. */
 export type ResultListener = (result: string, deliveryNote?: string) => void;
 
-export function startResultWatcher(onResult: ResultListener, isClientConnected: () => boolean): void {
+export function startResultWatcher(
+	onResult: ResultListener,
+	isClientConnected: () => boolean,
+	/** Whether a waiting `work` call may take its result now; otherwise it goes through onResult. */
+	canTakeResult: () => boolean = isClientConnected,
+): void {
+	_canTakeResult = canTakeResult;
 	if (_delegation.mode === 'relay') {
 		// Split-host mode: the local watcher below reads core-host state
 		// (task files for timeout snippets, voice-/question-/proactive- flows,
@@ -1461,7 +1495,7 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 		// THIS process submitted — and nothing else: consuming other task-*
 		// results here would steal them from their real consumers on the core
 		// host (deliver-once). Core-host-only flows stay core-host-only.
-		startRelayResultWatcher(onResult);
+		startRelayResultWatcher(onResult, canTakeResult);
 		return;
 	}
 	console.log(`${ts()} [TaskBridge] Watching for results in ${RESULT_DIR}`);
@@ -1552,6 +1586,7 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 						continue;   // another consumer's: leave the files for its owner
 					}
 					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker; archiving silently`);
+					_releaseResultWaiter(taskId);
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
@@ -1604,6 +1639,7 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					if (file.startsWith('task-') && _isVoiceTask(taskId)) {
 						// Claimed now, delivered once the origin is re-verified; an
 						// unverified origin falls back to the owner DM.
+						_releaseResultWaiter(taskId);
 						void _forwardOfflineThenArchive(taskId, file, result, dmOnly);
 					}
 					// Chat-path tasks have no bridge consumer — archive them directly
@@ -1682,9 +1718,10 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					// owner's DM when the core marked it `[dm-only]` — and voice is told which.
 					const taskOrigin = registersTask && !foreignOrigin ? voiceTaskOrigin(taskId) : null;
 					const keptToDm = taskOrigin ? keepVoiceResultToDm(taskId, result, dmOnly) : null;
+					if (keptToDm || taskOrigin) _releaseResultWaiter(taskId);
 					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE);
 					else if (taskOrigin) void _deliverOriginBoundResult(taskId, result, taskOrigin, onResult);
-					else if (!_settleResultWaiter(taskId, frameTaskResult(result))) onResult(result);
+					else if (!_settleResultWaiter(taskId, frameTaskResult(result), canTakeResult())) onResult(result);
 					// Notify agent-api directly (task results only), then delete file
 					if (registersTask) {
 						try {

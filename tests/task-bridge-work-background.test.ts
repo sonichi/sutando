@@ -16,11 +16,13 @@ mkdirSync(join(TMP, 'tasks'), { recursive: true });
 mkdirSync(join(TMP, 'results'), { recursive: true });
 
 const { workTool, startResultWatcher, _sweepTimeouts, _pendingTasksForTest } = await import('../src/task-bridge.js');
+const { cancelTaskTool } = await import('../src/inline-tools.js');
 
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
 const injected: string[] = [];
-startResultWatcher((result) => injected.push(result), () => true);
+let canTake = true;
+startResultWatcher((result) => injected.push(result), () => true, () => canTake);
 
 const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const newTaskIds = (before: Set<string>) =>
@@ -64,6 +66,38 @@ describe('work as a background tool', () => {
 		await tick(2_500);
 		assert.deepEqual(injected, ['Draft ready.']);
 		injected.length = 0;
+	});
+
+	it('hands the result back the old way when the session cannot take it (DM fallback, meeting hold)', async () => {
+		const before = new Set(_pendingTasksForTest.keys());
+		let done: unknown;
+		const running = call('check the deploy', new AbortController().signal).then((r) => { done = r; });
+		await tick(50);
+		const [taskId] = newTaskIds(before);
+		canTake = false;
+		writeFileSync(join(TMP, 'results', `${taskId}.txt`), 'Deploy is green.');
+		await running;
+		canTake = true;
+		assert.match(String(done), /delivered separately/);
+		assert.deepEqual(injected, ['Deploy is green.']);
+		injected.length = 0;
+	});
+
+	it('cancel_task with no arguments cancels the latest waiting work call, not the newest file', async () => {
+		const before = new Set(_pendingTasksForTest.keys());
+		const ac = new AbortController();
+		const running = call('draw a mouse', ac.signal);
+		await tick(50);
+		const [taskId] = newTaskIds(before);
+		// Sorted by name, task-health-* comes after task-<digits>; the old default picked it.
+		writeFileSync(join(TMP, 'tasks', 'task-health-1.txt'), 'task: health check\n');
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const out = await (cancelTaskTool.execute as any)({}) as { taskId?: string };
+		assert.equal(out.taskId, taskId);
+		rmSync(join(TMP, 'tasks', 'task-health-1.txt'));
+		ac.abort();
+		await running;
+		_pendingTasksForTest.delete(taskId); // keep it out of the timeout test below
 	});
 
 	it('hands a timeout to the waiting call without the task id', async () => {
