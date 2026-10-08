@@ -54,6 +54,12 @@ describe('meeting dictation', () => {
 		assert.equal(findExitCommand('好的 stop dictation'), null, 'only listed English fillers may stand next to an unaddressed command');
 	});
 
+	it('takes one word alone before the vocative as a misheard greeting', () => {
+		assert.deepEqual(findExitCommand('Has Sutando come back?'), { before: '', after: '', following: '' });
+		assert.deepEqual(findExitCommand('Kai Sutando, come back and summarize the meeting.'), { before: '', after: 'summarize the meeting.', following: '' });
+		assert.equal(findExitCommand('预算 Sutando come back about it'), null);
+	});
+
 	it('counts Sutando as addressed only at the start of a sentence', () => {
 		for (const t of [
 			'We said Sutando come back online and email the report to the client.',
