@@ -10,6 +10,7 @@ gateway-side. See _gateway.py for the shared boundary + gate.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -106,6 +107,31 @@ def _redactor():
     return _REDACTOR
 
 
+_KIND_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+_MXC_RE = re.compile(r"mxc://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9_-]+")
+
+
+def _bp(v):
+    ok = isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 10000
+    return v if ok else None
+
+
+def _commons_comment_line(cc):
+    """One line from allow-listed shapes only; agents read it verbatim, the view is member-written."""
+    parts = []
+    area = cc.get("area")
+    if isinstance(area, dict):
+        x, y, w, h = (_bp(area.get(k)) for k in ("x", "y", "w", "h"))
+        if None not in (x, y, w, h):
+            kind = cc.get("kind")
+            on = " on %s" % kind if isinstance(kind, str) and _KIND_RE.fullmatch(kind) else ""
+            parts.append("area %d,%d %dx%d bp%s" % (x, y, w, h, on))
+    image = cc.get("image")
+    if isinstance(image, str) and _MXC_RE.fullmatch(image):
+        parts.append("picture: %s" % image)
+    return "[%s]" % "; ".join(parts) if parts else None
+
+
 def _normalize(items):
     out = []
     redact = _redactor()
@@ -131,6 +157,13 @@ def _normalize(items):
             # arriving without msgtype must not grow an explicit null either.
             if (mt := m.get("msgtype")):
                 norm["msgtype"] = mt
+        # Server-validated but untrusted room data: passed through untouched, plus one
+        # display line so a reader sees the area and the picture it can `fetch`.
+        cc = m.get("commons_comment")
+        if isinstance(cc, dict):
+            norm["commons_comment"] = cc
+            if (line := _commons_comment_line(cc)):
+                norm["commons_comment_line"] = line
         out.append(norm)
     return out
 
