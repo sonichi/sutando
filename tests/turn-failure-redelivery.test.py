@@ -22,41 +22,55 @@ from util_paths import turn_failure_path  # noqa: E402
 
 HOOK = REPO / "src" / "stop-failure.sh"
 STOP_HOOK = REPO / "src" / "check-pending-tasks.sh"
+TURN_START = REPO / "src" / "turn-start.sh"
 MODULE = REPO / "src" / "delivery" / "turn_failure.py"
 
 
 class DecideRetryTests(unittest.TestCase):
-    def rec(self, at, error="server_error", recovered=None):
-        return {"failed_at": at, "error": error, "recovered_at": recovered}
+    def rec(self, at, error="server_error", recovered=None, task="t"):
+        return {"failed_at": at, "error": error, "recovered_at": recovered, "task": task}
 
     def test_no_failure_or_one_older_than_the_submit_never_retries(self):
-        self.assertIsNone(tf.decide_retry(None, 100, 0, 0, 10_000))
-        self.assertIsNone(tf.decide_retry(self.rec(99), 100, 0, 0, 10_000))
-        self.assertIsNone(tf.decide_retry(self.rec(100), 100, 0, 0, 10_000))
+        self.assertIsNone(tf.decide_retry(None, "t", 100, 0, 0, 10_000))
+        self.assertIsNone(tf.decide_retry(self.rec(99), "t", 100, 0, 0, 10_000))
+        self.assertIsNone(tf.decide_retry(self.rec(100), "t", 100, 0, 0, 10_000))
 
     def test_a_failure_after_the_submit_is_due_once_the_first_backoff_elapses(self):
-        self.assertIsNone(tf.decide_retry(self.rec(110), 100, 0, 0, 110 + 29))
-        self.assertIn("backoff 30s", tf.decide_retry(self.rec(110), 100, 0, 0, 110 + 30))
+        self.assertIsNone(tf.decide_retry(self.rec(110), "t", 100, 0, 0, 110 + 29))
+        self.assertIn("backoff 30s", tf.decide_retry(self.rec(110), "t", 100, 0, 0, 110 + 30))
 
     def test_a_successful_turn_after_the_failure_is_due_immediately(self):
-        reason = tf.decide_retry(self.rec(110, recovered=111), 100, 0, 0, 111)
+        reason = tf.decide_retry(self.rec(110, recovered=111), "t", 100, 0, 0, 111)
         self.assertIn("later turn succeeded", reason)
         # A recovery stamp OLDER than the failure is a previous episode's, not this one's.
-        self.assertIsNone(tf.decide_retry(self.rec(110, recovered=105), 100, 0, 0, 111))
+        self.assertIsNone(tf.decide_retry(self.rec(110, recovered=105), "t", 100, 0, 0, 111))
+
+    def test_a_failure_in_a_turn_another_prompt_started_never_retries(self):
+        for task in (None, "task-other.txt"):
+            with self.subTest(task=task):
+                self.assertIsNone(tf.decide_retry(self.rec(110, task=task, recovered=111), "t", 100, 0, 0, 10_000))
+
+    def test_task_of_prompt_reads_only_the_notifier_prompt(self):
+        self.assertEqual(tf.task_of_prompt("Sutando task ready: task-1.txt. Read /w/tasks/task-1.txt, ..."),
+                         "task-1.txt")
+        for p in (None, "", "hello", "Re: Sutando task ready: task-1.txt.", "Sutando task ready: ../x.",
+                  "Sutando task ready: a/b.txt."):
+            with self.subTest(p=p):
+                self.assertIsNone(tf.task_of_prompt(p))
 
     def test_non_transient_errors_never_retry(self):
         for err in ("authentication_failed", "billing_error", "oauth_org_not_allowed", "account_on_hold",
                     "invalid_request", "model_not_found", "cloud_credential_error", "max_output_tokens"):
             with self.subTest(err=err):
-                self.assertIsNone(tf.decide_retry(self.rec(110, err, recovered=200), 100, 0, 0, 10_000))
+                self.assertIsNone(tf.decide_retry(self.rec(110, err, recovered=200), "t", 100, 0, 0, 10_000))
 
     def test_backoff_schedule_grows_then_caps_at_600(self):
         self.assertEqual([tf.backoff_delay(n) for n in range(8)], [30, 60, 120, 300, 600, 600, 600, 600])
 
     def test_backoff_counts_from_the_later_of_failure_and_last_retry(self):
         f = self.rec(110)
-        self.assertIsNone(tf.decide_retry(f, 100, 2, 200, 200 + 119))
-        self.assertIsNotNone(tf.decide_retry(f, 100, 2, 200, 200 + 120))
+        self.assertIsNone(tf.decide_retry(f, "t", 100, 2, 200, 200 + 119))
+        self.assertIsNotNone(tf.decide_retry(f, "t", 100, 2, 200, 200 + 120))
 
 
 class OnDiskTests(unittest.TestCase):
@@ -82,18 +96,23 @@ class OnDiskTests(unittest.TestCase):
                             self.name, now=now, **kw)
 
     def test_failure_newer_than_submission_is_due_and_retry_note_pushes_backoff(self):
-        tf.record_failure(self.state, "overloaded", "s", now=1010)
+        tf.record_failure(self.state, "overloaded", "s", now=1010, task=self.name)
         self.assertIsNotNone(self.due(now=1040))
         self.assertEqual(tf.note_retry(self.state, self.name, now=1040), 1)
         self.assertIsNone(self.due(now=1040 + 59))
         self.assertIsNotNone(self.due(now=1040 + 60))
 
     def test_recovery_makes_it_due_at_once(self):
-        tf.record_failure(self.state, "server_error", "s", now=1010)
+        tf.record_failure(self.state, "server_error", "s", now=1010, task=self.name)
         self.assertIsNone(self.due(now=1011))
         self.assertTrue(tf.record_recovery(self.state, now=1011))
         self.assertIsNotNone(self.due(now=1011))
         self.assertFalse(tf.record_recovery(self.state, now=1012), "a second Stop re-stamped the recovery")
+
+    def test_a_later_unrelated_turn_failing_is_not_due(self):
+        tf.record_failure(self.state, "server_error", "s", now=1010, task=None)
+        self.assertTrue(tf.record_recovery(self.state, now=1011))
+        self.assertIsNone(self.due(now=5000), "a 502 in a turn our prompt did not start re-typed the task")
 
     def test_auth_error_is_not_recorded_and_never_due(self):
         self.assertFalse(tf.record_failure(self.state, "authentication_failed", "s", now=1010))
@@ -101,7 +120,7 @@ class OnDiskTests(unittest.TestCase):
         self.assertIsNone(self.due())
 
     def test_guards_result_archived_worker_held_no_marker(self):
-        tf.record_failure(self.state, "server_error", "s", now=1010)
+        tf.record_failure(self.state, "server_error", "s", now=1010, task=self.name)
         self.assertIsNotNone(self.due())
         (self.results / self.name).write_text("done\n")
         self.assertIsNone(self.due(), "re-sent a task that has a result")
@@ -126,7 +145,7 @@ class OnDiskTests(unittest.TestCase):
                 "--inflight-dir", str(self.inflight), "--results-dir", str(self.results),
                 "--payload", str(self.tasks / self.name), self.name]
         self.assertEqual(subprocess.run(args, capture_output=True).returncode, 1)
-        tf.record_failure(self.state, "server_error", "s", now=time.time() - 60)
+        tf.record_failure(self.state, "server_error", "s", now=time.time() - 60, task=self.name)
         out = subprocess.run(args, capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("server_error", out.stdout)
@@ -172,6 +191,43 @@ class HookTests(unittest.TestCase):
                           identity={"SUTANDO_INSTANCE_ID": "w1"})
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(list((self.ws / "state" / "core-turn-failure").glob("*.json")), r.stderr)
+
+    def turn_start(self, prompt, session="abc", identity=None):
+        r = self.run_hook(json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": session,
+                                      "prompt": prompt}), script=TURN_START, identity=identity)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def stop_failure(self, session="abc"):
+        r = self.run_hook(json.dumps({"hook_event_name": "StopFailure", "session_id": session,
+                                      "error": "server_error"}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(self.marker.read_text())
+
+    def test_the_failure_is_blamed_on_the_task_whose_prompt_started_the_turn(self):
+        self.turn_start("Sutando task ready: task-a.txt. Read /w/tasks/task-a.txt, follow CLAUDE.md")
+        self.assertEqual(self.stop_failure()["task"], "task-a.txt")
+
+    def test_a_failure_in_a_turn_another_prompt_started_blames_no_task(self):
+        self.turn_start("Sutando task ready: task-a.txt. Read it")
+        self.turn_start("<task-notification> monitor event </task-notification>")
+        self.assertIsNone(self.stop_failure()["task"])
+
+    def test_a_failure_after_a_successful_stop_blames_no_task(self):
+        self.turn_start("Sutando task ready: task-a.txt. Read it")
+        (self.ws / "tasks").mkdir()
+        (self.ws / "results").mkdir()
+        r = self.run_hook(json.dumps({"hook_event_name": "Stop"}), script=STOP_HOOK,
+                          extra={"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNone(self.stop_failure()["task"], "a later turn's 502 was blamed on a finished prompt")
+
+    def test_a_failure_in_another_session_blames_no_task(self):
+        self.turn_start("Sutando task ready: task-a.txt. Read it", session="core")
+        self.assertIsNone(self.stop_failure(session="other")["task"])
+
+    def test_a_guest_prompt_records_no_turn(self):
+        self.turn_start("Sutando task ready: task-a.txt. Read it", identity={})
+        self.assertIsNone(tf.read_turn(self.ws / "state"))
 
     def test_authentication_failed_is_ignored(self):
         r = self.run_hook(json.dumps({"hook_event_name": "StopFailure", "error": "authentication_failed"}))

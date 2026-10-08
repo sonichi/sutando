@@ -8,16 +8,21 @@ result", so without this the task waits out the whole completion timeout.
 
 This module is the one owner of that recovery state and its policy:
 
-* the `StopFailure` hook (`src/stop-failure.sh`) records the failure;
-* the `Stop` hook (`src/check-pending-tasks.sh`) records the next successful
-  turn as the recovery;
+* the `UserPromptSubmit` hook (`src/turn-start.sh`) records which task, if
+  any, the turn's prompt delivered;
+* the `StopFailure` hook (`src/stop-failure.sh`) records the failure against
+  that turn's task;
+* the `Stop` hook (`src/check-pending-tasks.sh`) ends the turn and records it
+  as the recovery;
 * the notifier asks `retry-due` whether an in-flight task should be re-typed,
   and `retry-note` counts each re-delivery.
 
 State (per instance: `util_paths.turn_failure_path`):
 
     <state>/core-turn-failure/<key|core>.json
-        {"failed_at", "error", "session_id", "recovered_at"}
+        {"failed_at", "error", "session_id", "task", "recovered_at"}
+    <state>/core-turn-failure/<key|core>.turn.json
+        {"task", "session_id", "started_at"}    -- the turn now running
     <state>/task-notifier-retry/<filename>.json
         {"attempts", "last_retry_at"}
 
@@ -26,16 +31,19 @@ billing, account and request errors are not: re-typing cannot fix them and
 would only spend turns, so those tasks keep the notifier's ordinary timeout.
 `max_output_tokens` is excluded too -- the same prompt hits the same ceiling.
 
-A failure counts against a task only when it is NEWER than that task's
-submission (the in-flight marker's mtime). A successful turn newer than the
+A failure counts against a task only when the failed turn is the one that
+task's notifier prompt started (`TASK_PROMPT_PREFIX`) and it is NEWER than
+the task's submission (the in-flight marker's mtime). A later turn -- another
+prompt, a Monitor event, a turn after a successful Stop -- is not blamed. A successful turn newer than the
 failure means the API is back: re-deliver now. Otherwise wait out the backoff
 (`BACKOFF_SECONDS`, by attempts already made, capped at the last entry),
 measured from the later of the failure and the previous re-delivery.
 
 CLI:
 
+    turn_failure.py hook-turn-start --state <state_dir>       # hook JSON on stdin; always exit 0
     turn_failure.py hook-stop-failure --state <state_dir>     # hook JSON on stdin; always exit 0
-    turn_failure.py record-recovery --state <state_dir>        # always exit 0
+    turn_failure.py record-recovery --state <state_dir>        # ends the turn too; always exit 0
     turn_failure.py retry-due --state <state_dir> --inflight-dir <dir> --results-dir <dir> \\
         --payload <task_path> [--deliveries-dir <dir>] <filename>   # exit 0 due (prints reason), 1 not
     turn_failure.py retry-note --state <state_dir> <filename>
@@ -53,16 +61,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # lint-workspace-resolution: allow-repo-root
 
 __all__ = [
-    "RETRYABLE_ERRORS", "BACKOFF_SECONDS", "backoff_delay", "decide_retry",
+    "RETRYABLE_ERRORS", "BACKOFF_SECONDS", "TASK_PROMPT_PREFIX", "backoff_delay",
+    "decide_retry", "task_of_prompt", "record_turn_start", "read_turn", "end_turn",
     "record_failure", "record_recovery", "read_failure",
     "read_retry", "note_retry", "clear_retry", "retry_due",
 ]
 
 RETRYABLE_ERRORS = frozenset({"server_error", "overloaded", "rate_limit", "unknown"})
 BACKOFF_SECONDS = (30, 60, 120, 300, 600)
+# How the notifier's task_prompt (agent/claude/cli/task-notifier.sh) begins; a test pins the two together.
+TASK_PROMPT_PREFIX = "Sutando task ready: "
 
 _USAGE = (
-    "usage: turn_failure.py hook-stop-failure --state DIR\n"
+    "usage: turn_failure.py hook-turn-start --state DIR\n"
+    "       turn_failure.py hook-stop-failure --state DIR\n"
     "       turn_failure.py record-recovery --state DIR\n"
     "       turn_failure.py retry-due --state DIR --inflight-dir DIR --results-dir DIR "
     "--payload PATH [--deliveries-dir DIR] FILENAME\n"
@@ -76,13 +88,22 @@ def backoff_delay(attempts: int) -> int:
     return BACKOFF_SECONDS[min(max(attempts, 0), len(BACKOFF_SECONDS) - 1)]
 
 
-def decide_retry(failure: "dict | None", submitted_at: float, attempts: int,
+def task_of_prompt(prompt) -> "str | None":
+    """The task filename a notifier prompt delivers, or None for any other prompt."""
+    if not isinstance(prompt, str) or not prompt.startswith(TASK_PROMPT_PREFIX):
+        return None
+    words = prompt[len(TASK_PROMPT_PREFIX):].split(maxsplit=1)
+    name = words[0].rstrip(".") if words else ""
+    return name if name and "/" not in name and ".." not in name else None
+
+
+def decide_retry(failure: "dict | None", filename: str, submitted_at: float, attempts: int,
                  last_retry_at: float, now: float) -> "str | None":
     """Why the in-flight task should be re-delivered now, or None to keep waiting.
 
     Pure: every input is a value, so the policy is testable without files.
     """
-    if not failure:
+    if not failure or failure.get("task") != filename:
         return None
     failed_at = _num(failure.get("failed_at"))
     if failed_at is None or failed_at <= submitted_at:
@@ -129,19 +150,41 @@ def _failure_path(state_dir) -> Path:
     return turn_failure_path(state_dir)
 
 
+def _turn_path(state_dir) -> Path:
+    path = _failure_path(state_dir)
+    return path.with_name(f"{path.stem}.turn.json")
+
+
 def _retry_path(state_dir, filename: str) -> Path:
     if not filename or "/" in filename or ".." in filename:
         raise ValueError(f"not a task filename: {filename!r}")
     return Path(state_dir) / "task-notifier-retry" / f"{filename}.json"
 
 
-def record_failure(state_dir, error: str, session_id: str = "", now: "float | None" = None) -> bool:
-    """Record a retryable API-error turn; False (nothing written) for any other error."""
+def record_turn_start(state_dir, prompt, session_id: str = "", now: "float | None" = None) -> None:
+    """A turn began from `prompt`: remember which task it delivers (None for any other prompt)."""
+    _write_json(_turn_path(state_dir), {
+        "task": task_of_prompt(prompt), "session_id": session_id,
+        "started_at": time.time() if now is None else now,
+    })
+
+
+def read_turn(state_dir) -> "dict | None":
+    return _read_json(_turn_path(state_dir))
+
+
+def end_turn(state_dir) -> None:
+    _turn_path(state_dir).unlink(missing_ok=True)
+
+
+def record_failure(state_dir, error: str, session_id: str = "", now: "float | None" = None,
+                   task: "str | None" = None) -> bool:
+    """Record a retryable API-error turn and the task its prompt delivered; False for any other error."""
     if error not in RETRYABLE_ERRORS:
         return False
     _write_json(_failure_path(state_dir), {
         "failed_at": time.time() if now is None else now,
-        "error": error, "session_id": session_id, "recovered_at": None,
+        "error": error, "session_id": session_id, "task": task, "recovered_at": None,
     })
     return True
 
@@ -202,21 +245,40 @@ def retry_due(state_dir, inflight_dir, results_dir, payload, filename: str,
     except OSError:
         return None
     attempts, last_retry_at = read_retry(state_dir, filename)
-    return decide_retry(read_failure(state_dir), submitted_at, attempts, last_retry_at,
+    return decide_retry(read_failure(state_dir), filename, submitted_at, attempts, last_retry_at,
                         time.time() if now is None else now)
 
 
-def _hook_stop_failure(state_dir: str) -> None:
+def _hook_payload(event: str) -> "dict | None":
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except ValueError:
-        return
-    if not isinstance(payload, dict) or payload.get("hook_event_name", "StopFailure") != "StopFailure":
+        return None
+    if not isinstance(payload, dict) or payload.get("hook_event_name", event) != event:
+        return None
+    return payload
+
+
+def _hook_turn_start(state_dir: str) -> None:
+    payload = _hook_payload("UserPromptSubmit")
+    if payload is not None:
+        session = payload.get("session_id")
+        record_turn_start(state_dir, payload.get("prompt"), session if isinstance(session, str) else "")
+
+
+def _hook_stop_failure(state_dir: str) -> None:
+    payload = _hook_payload("StopFailure")
+    if payload is None:
         return
     error = payload.get("error")
     session = payload.get("session_id")
+    session = session if isinstance(session, str) else ""
+    turn = read_turn(state_dir) or {}
+    same_session = not session or not turn.get("session_id") or turn.get("session_id") == session
+    task = turn.get("task") if same_session else None
+    end_turn(state_dir)
     if isinstance(error, str):
-        record_failure(state_dir, error, session if isinstance(session, str) else "")
+        record_failure(state_dir, error, session, task=task if isinstance(task, str) else None)
 
 
 def _take(args: list, flag: str) -> "str | None":
@@ -235,15 +297,19 @@ def _main(argv: list) -> int:
         print(_USAGE, file=sys.stderr)
         return 2
     cmd, args = argv[0], list(argv[1:])
-    hook = cmd in ("hook-stop-failure", "record-recovery")
+    hook = cmd in ("hook-turn-start", "hook-stop-failure", "record-recovery")
     try:
         state = _take(args, "--state")
         if state is None:
             raise ValueError(_USAGE)
+        if cmd == "hook-turn-start" and not args:
+            _hook_turn_start(state)
+            return 0
         if cmd == "hook-stop-failure" and not args:
             _hook_stop_failure(state)
             return 0
         if cmd == "record-recovery" and not args:
+            end_turn(state)
             record_recovery(state)
             return 0
         if cmd == "retry-due":

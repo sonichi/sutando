@@ -45,7 +45,7 @@ if ! PYBIN="$(bash "$REPO_DIR/scripts/sutando-config.sh" python-bin 2>/dev/null)
   PYBIN=""
 fi
 
-# A Stop at all means this turn reached the API: stamp recovery after a recorded API-error turn.
+# A Stop means this turn reached the API: end it and stamp recovery after a recorded API-error turn.
 if [ -z "$UNIDENTIFIED" ] && [ -n "$PYBIN" ]; then
   "$PYBIN" "$REPO_DIR/src/delivery/turn_failure.py" record-recovery --state "${SUTANDO_WORKSPACE_DIR:-$WORKSPACE}/state" >/dev/null 2>&1 || true
 fi
