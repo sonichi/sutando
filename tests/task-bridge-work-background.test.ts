@@ -15,7 +15,7 @@ process.env.SUTANDO_TEST_MODE = '1';
 mkdirSync(join(TMP, 'tasks'), { recursive: true });
 mkdirSync(join(TMP, 'results'), { recursive: true });
 
-const { workTool, startResultWatcher, _sweepTimeouts, _pendingTasksForTest, setResultPacing } = await import('../src/task-bridge.js');
+const { workTool, startResultWatcher, _sweepTimeouts, _pendingTasksForTest, setResultPacing, _setHandOffMaxWaitForTest } = await import('../src/task-bridge.js');
 const { cancelTaskTool } = await import('../src/inline-tools.js');
 
 after(() => rmSync(TMP, { recursive: true, force: true }));
@@ -85,7 +85,7 @@ describe('work as a background tool', () => {
 		injected.length = 0;
 	});
 
-	it('hands the result back the old way when the session cannot take it (DM fallback, meeting hold)', async () => {
+	it('waits out a session that cannot take the result (reconnect) and then hands it to the call', async () => {
 		const before = new Set(_pendingTasksForTest.keys());
 		let done: unknown;
 		const running = call('check the deploy', new AbortController().signal).then((r) => { done = r; });
@@ -93,11 +93,47 @@ describe('work as a background tool', () => {
 		const [taskId] = newTaskIds(before);
 		canTake = false;
 		writeFileSync(join(TMP, 'results', `${taskId}.txt`), 'Deploy is green.');
+		await tick(3_000);
+		assert.equal(done, undefined, 'held while the session reconnects');
+		canTake = true;
+		await running;
+		assert.match(String(done), /Deploy is green\./);
+		assert.deepEqual(injected, []);
+	});
+
+	it('hands the result back the old way when the session stays unable to take it (DM fallback, meeting hold)', async () => {
+		_setHandOffMaxWaitForTest(1_500);
+		const before = new Set(_pendingTasksForTest.keys());
+		let done: unknown;
+		const running = call('check the logs', new AbortController().signal).then((r) => { done = r; });
+		await tick(50);
+		const [taskId] = newTaskIds(before);
+		canTake = false;
+		writeFileSync(join(TMP, 'results', `${taskId}.txt`), 'Logs are clean.');
 		await running;
 		canTake = true;
+		_setHandOffMaxWaitForTest(60_000);
 		assert.match(String(done), /delivered separately/);
-		assert.deepEqual(injected, ['Deploy is green.']);
+		assert.deepEqual(injected, ['Logs are clean.']);
 		injected.length = 0;
+	});
+
+	it('a voice cancel ends the waiting call and keeps the stub and the core reply unspoken', async () => {
+		const before = new Set(_pendingTasksForTest.keys());
+		let done: unknown;
+		const running = call('draw a dog', new AbortController().signal).then((r) => { done = r; });
+		await tick(50);
+		const [taskId] = newTaskIds(before);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const out = await (cancelTaskTool.execute as any)({}) as { taskId?: string; instruction?: string };
+		assert.equal(out.taskId, taskId);
+		await running;
+		assert.match(String(done), /cancelled this task/);
+		writeFileSync(join(TMP, 'results', `${out.instruction}.txt`), 'Nothing to cancel — it was never started.');
+		await tick(2_500);
+		assert.deepEqual(injected, [], 'neither "Cancelled." nor the core reply is spoken');
+		_pendingTasksForTest.delete(taskId);
+		_pendingTasksForTest.delete(out.instruction!);
 	});
 
 	it('cancel_task with no arguments cancels the latest waiting work call, not the newest file', async () => {

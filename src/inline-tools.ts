@@ -25,7 +25,7 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
-import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, latestWaitingWorkTask } from './task-bridge.js';
+import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, latestWaitingWorkTask, _noteVoiceCancel } from './task-bridge.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -747,6 +747,8 @@ export const cancelTaskTool: ToolDefinition = {
 				buildVoiceTaskHeader(`task-${cancelTs}`, new Date().toISOString(), 'voice-local', cancelOrigin) +
 				`task: CANCEL_INSTRUCTION: stop processing ${safeTargetId} if still in flight. If already completed, no-op. Reply briefly confirming.\n`;
 			writeFileSync(join(tasksDir, cancelFilename), cancelBody);
+			// The confirmation below is what the user hears; the stub and the core's reply stay unspoken.
+			_noteVoiceCancel(safeTargetId, `task-${cancelTs}`);
 
 			// Also unlink the original task file if it's still present — prevents
 			// double-pickup if core hadn't started yet. Best-effort.

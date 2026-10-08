@@ -1052,21 +1052,50 @@ export function setResultPacing(waitForPause: () => Promise<void>): void {
 	_waitForPause = waitForPause;
 }
 
+/** Longest a result waits for a pause and a session that can take it before it goes the old way. */
+let HAND_OFF_MAX_WAIT_MS = 60_000;
+export function _setHandOffMaxWaitForTest(ms: number): void {
+	HAND_OFF_MAX_WAIT_MS = ms;
+}
+
 /**
- * Hands a result to its waiting call once the conversation pauses. The session is checked
- * again after the wait; if it can no longer take the result, or the call has gone, `fallback`
- * delivers it the old way. False when no call waits (the caller delivers it now).
+ * Hands a result to its waiting call once the conversation pauses and the session can take it
+ * (a reconnect or a meeting is waited out, up to HAND_OFF_MAX_WAIT_MS). After that, or if the call
+ * has gone, `fallback` delivers it the old way. False when no call waits (the caller delivers it now).
  */
 function _handOffWhenPaused(taskId: string, outcome: string, fallback: () => void): boolean {
 	if (!_resultWaiters.has(taskId)) return false;
-	if (!_canTakeResult()) {
-		_releaseResultWaiter(taskId);
-		return false;
-	}
-	void _waitForPause().then(() => {
-		if (!_settleResultWaiter(taskId, outcome, _canTakeResult())) fallback();
-	});
+	const startedAt = Date.now();
+	const attempt = async (): Promise<void> => {
+		await _waitForPause();
+		if (!_resultWaiters.has(taskId)) return fallback();
+		if (_canTakeResult()) {
+			_settleResultWaiter(taskId, outcome);
+			return;
+		}
+		if (Date.now() - startedAt >= HAND_OFF_MAX_WAIT_MS) {
+			_releaseResultWaiter(taskId);
+			return fallback();
+		}
+		await new Promise((r) => setTimeout(r, 1_000));
+		return attempt();
+	};
+	void attempt();
 	return true;
+}
+
+// Tasks the user cancelled by voice, and the cancel instructions written for them: cancel_task
+// already confirmed it, so the "Cancelled." stub and the core's reply are archived unspoken.
+const _quietResults = new Set<string>();
+
+/**
+ * Called by cancel_task. A call still waiting on the task ends now, telling the model to drop it,
+ * and the later results for the task and for the cancel instruction are not spoken.
+ */
+export function _noteVoiceCancel(taskId: string, instructionId: string): void {
+	_quietResults.add(taskId);
+	_quietResults.add(instructionId);
+	_settleResultWaiter(taskId, 'The user cancelled this task and you already confirmed it. Say nothing about it.');
 }
 
 /** Releases a waiting call whose result goes another way (DM, origin, skip marker). */
@@ -1591,6 +1620,19 @@ export function startResultWatcher(
 					onResult(result);
 					_deliveredResults.add(file);
 					setTimeout(() => archiveFile(path, 'results', `voice-${Date.now()}`), 10_000);
+					continue;
+				}
+				if (_quietResults.has(taskId)) {
+					console.log(`${ts()} [TaskBridge] ${taskId}: cancelled by voice; archiving its result unspoken`);
+					_quietResults.delete(taskId);
+					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+					_deliveredResults.add(file);
+					_pendingTasks.delete(taskId);
+					setTimeout(() => {
+						archiveFile(path, 'results', taskId);
+						const taskFile = join(TASK_DIR, `${taskId}.txt`);
+						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+					}, 5_000);
 					continue;
 				}
 				// [no-send] / [REPLIED] / [deduped: <id>] — archive silently, no voice.
