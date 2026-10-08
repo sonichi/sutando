@@ -86,16 +86,15 @@ EXECUTORS = {
 GOVERNED_ACTIONS = frozenset({"message.send"})
 
 
-def _fingerprint(params: dict) -> str:
-    """Canonical identity of an execution: action + resource + input. An
-    idempotency key may only replay a request with the SAME fingerprint —
-    a reused key with different content must be rejected, never report a
-    different side effect as complete (review P1)."""
+def _fingerprint(params: dict, *, include_task: bool = True) -> str:
+    """Bind the exact effect and any supplied task context."""
     import hashlib
-    canon = json.dumps({"action": params.get("action"),
-                        "resource": params.get("resource"),
-                        "input": params.get("input")},
-                       sort_keys=True, ensure_ascii=False)
+    bound = {"action": params.get("action"),
+             "resource": params.get("resource"),
+             "input": params.get("input")}
+    if include_task and params.get("taskId") is not None:
+        bound["taskId"] = params["taskId"]
+    canon = json.dumps(bound, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
@@ -436,10 +435,16 @@ class RuntimeDispatcher:
             # A key replays ONLY the identical execution — a different
             # fingerprint under the same key is a caller bug and must not
             # report the earlier side effect as this call's result.
-            if existing.get("fingerprint") != fp:
+            persisted = existing.get("fingerprint")
+            original = existing.get("params")
+            replay_match = (isinstance(original, dict)
+                            and _fingerprint(original) == fp
+                            and persisted in (_fingerprint(original),
+                                              _fingerprint(original, include_task=False)))
+            if not replay_match:
                 raise ProtocolError(-32602,
                                     f"idempotencyKey {idem_key!r} was used for a "
-                                    "different action/resource/input — keys are "
+                                    "different action/resource/input or task — keys are "
                                     "per-execution, pick a new one")
             return {"requestId": existing["requestId"],
                     "status": existing["status"],
@@ -482,7 +487,7 @@ class RuntimeDispatcher:
             if _fingerprint(ap) != fp:
                 raise ProtocolError(-32602,
                                     f"approval {approval_id} is bound to a different "
-                                    "resource/input than this execution — the owner "
+                                    "resource/input or task than this execution — the owner "
                                     "approves the exact effect, payload included")
         # Record creation + approval consumption are ONE durable transaction
         # (review P1: consume-then-create left a window where a crash between

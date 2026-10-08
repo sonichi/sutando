@@ -94,7 +94,7 @@ const _HEADER_KEYS = [
 	'channel_id', 'priority', 'interaction_type', 'source_message_id',
 	'channel_name', 'guild_name', 'attempts', 'sender_name', 'room_name',
 	'parent_message_id', 'reply_chain_ids', 'reminder', 'author_name', 'author_id', 'chat_id',
-	'thread_ts', 'reply_to_event', 'reply_to_me', 'reply_to_sender', 'addressed_to', 'callSid', 'caller',
+	'thread_ts', 'reply_thread_ts', 'reply_to_event', 'reply_to_me', 'reply_to_sender', 'addressed_to', 'callSid', 'caller',
 	'thread_root', 'source_room_id', 'channel_kind',
 	'receiving_instance',
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
@@ -219,13 +219,17 @@ function _usableOrigin(origin: VoiceSessionOrigin | null | undefined): VoiceSess
 }
 
 let _voiceSessionOrigin: VoiceSessionOrigin | null = null;
+// Bumped whenever the bound origin changes, so a call can tell its session has moved.
+let _voiceOriginGeneration = 0;
 let _voiceTaskOriginResolver: VoiceTaskOriginResolver | null = null;
 const _taskOrigins = new Map<string, VoiceSessionOrigin>();
 
-/** Bind (or, with null, release) the origin of the live voice session. Tasks written
- *  afterwards carry the origin current at write time; a malformed origin binds nothing. */
+/** Bind (or, with null, release) the origin of the live voice session. A task carries the
+ *  origin current when it was asked for; a malformed origin binds nothing. */
 export function setVoiceSessionOrigin(origin: VoiceSessionOrigin | null): void {
-	_voiceSessionOrigin = _usableOrigin(origin);
+	const next = _usableOrigin(origin);
+	if (next?.channel !== _voiceSessionOrigin?.channel || next?.target !== _voiceSessionOrigin?.target) _voiceOriginGeneration += 1;
+	_voiceSessionOrigin = next;
 }
 
 /** One turn of the live voice session as the runtime keeps it: `user` items are the
@@ -311,14 +315,18 @@ export function _speechMayBeLanding(now = Date.now()): boolean {
 /** The current turn's utterances, waiting up to `maxMs` for a late transcription chunk
  *  when none has arrived yet (the runtime flushes only what it has when the tool fires);
  *  no wait for a turn the model started on its own. */
-export async function _awaitSpokenTurns(count = 2, maxMs = SPOKEN_WAIT_MS, sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))): Promise<string[]> {
+export async function _awaitSpokenTurns(count = 2, maxMs = SPOKEN_WAIT_MS, sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)), isCurrent: () => boolean = () => true): Promise<string[]> {
 	if (!_voiceTurns) return [];
-	const first = _spokenTurns(count);
+	// Words read after the session moved belong to the new session, not to this call.
+	const read = () => { const spoken = _spokenTurns(count); return isCurrent() ? spoken : null; };
+	const first = read();
+	if (first === null) return [];
 	if (first.length > 0 || !_speechMayBeLanding()) return first;
 	const deadline = Date.now() + maxMs;
 	for (;;) {
 		await sleep(SPOKEN_POLL_MS);
-		const spoken = _spokenTurns(count);
+		const spoken = read();
+		if (spoken === null) return [];
 		if (spoken.length > 0 || Date.now() >= deadline) return spoken;
 	}
 }
@@ -839,6 +847,12 @@ export const workTool: ToolDefinition = {
 			timeout_minutes?: number;
 			dm_on_timeout?: boolean;
 		};
+		// Read before the first await: the session can move to another origin while this call
+		// waits, and the task belongs to the origin, and the words, it was asked from.
+		const origin = _voiceSessionOrigin;
+		const originGeneration = _voiceOriginGeneration;
+		let recentAtAsk = '';
+		try { recentAtAsk = getRecentConversation(4); } catch { /* best effort */ }
 
 		// Redirect pure screen-viewing tasks to inline tools (faster, no round-trip)
 		// Narrow match: only "describe/look at my screen" — not scroll, screenshot,
@@ -950,7 +964,7 @@ export const workTool: ToolDefinition = {
 			// wording against real speech instead of trusting it.
 			let spokenBlock = '';
 			try {
-				const spoken = await _awaitSpokenTurns(2);
+				const spoken = await _awaitSpokenTurns(2, SPOKEN_WAIT_MS, undefined, () => _voiceOriginGeneration === originGeneration);
 				if (spoken.length > 0) {
 					spokenBlock =
 						`\n\n--- spoken (the owner's last words, verbatim as transcribed, or as typed into the voice session; the task line ` +
@@ -960,7 +974,7 @@ export const workTool: ToolDefinition = {
 			} catch { /* best effort */ }
 			let contextBlock = '';
 			try {
-				const recent = getRecentConversation(4);
+				const recent = recentAtAsk;
 				if (recent) {
 					contextBlock =
 						`\n\n--- recent voice transcript (may contain ASR errors; if the task above ` +
@@ -970,7 +984,6 @@ export const workTool: ToolDefinition = {
 			} catch { /* best effort — never block delegation on context attach */ }
 			// An origin-bound session addresses the task to its origin and adds the adapter's
 			// guidance line; without one the task keeps `channel_id: local-voice`.
-			const origin = _voiceSessionOrigin;
 			const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
 			_rememberTaskOrigin(taskId, origin);
 			const content =

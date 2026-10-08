@@ -31,7 +31,6 @@ import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
 import { notify as platformNotify } from './platform.js';
 import { inlineTools, personalSkillSetups, personalVoiceSurface } from './inline-tools.js';
 import { createClientFrameHub } from './client-frame-hub.js';
@@ -42,7 +41,8 @@ import { injectText, injectSilentContext } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
-import { GeminiBatchSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
+import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
+import { attachMeetingDictation, createMeetingEntryGate } from './meeting-dictation.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
 	if (process.platform === 'win32') {
@@ -431,6 +431,27 @@ function getPendingToolCalls(toolName?: string) {
 // Meeting mode state — persists across Gemini reconnects
 // =============================================================================
 let meetingActive = false;
+// Meeting mode is bodhi dictation; set once the session exists.
+let meetingDictation: ReturnType<typeof attachMeetingDictation> | null = null;
+// Entering quiesces audio output, so it waits for the spoken confirmation's turn to complete.
+const meetingEntry = createMeetingEntryGate({ fallbackMs: 8_000, onFire: () => enterMeetingDictation() });
+function noteMeetingState(on: boolean) {
+	if (!on) meetingEntry.cancel();
+	meetingActive = on;
+	voiceWatchdogShadow.noteMeetingMode(on);
+	voiceRecoveryCoordinator?.noteMeetingMode(on);
+}
+// Only the latest entry's failure may turn meeting mode off; an older one can fail while a newer one is transcribing.
+let meetingEntrySeq = 0;
+function enterMeetingDictation() {
+	const seq = ++meetingEntrySeq;
+	meetingDictation?.enter().catch((err) => {
+		console.error(`${ts()} [MeetingDictation] enter failed: ${err?.message ?? err}`);
+		if (seq !== meetingEntrySeq) return;
+		noteMeetingState(false);
+		writeVoiceModeSentinel();
+	});
+}
 // Third base mode (mirrors discord-voice PR #39: active ⊕ meeting ⊕ presenter,
 // mutually exclusive). Toggled via switch_mode("presenter"); previously the
 // prompt referenced a presenter_mode tool that only exists on installs with
@@ -473,42 +494,19 @@ function applyModeRequest() {
 		const wantPresenter = req === 'presenter';
 		const want = req === 'meeting';
 		if (meetingActive === want && presenterActive === wantPresenter) return; // no-op if already in that mode
-		meetingActive = want;
-		voiceWatchdogShadow.noteMeetingMode(want);
-		voiceRecoveryCoordinator?.noteMeetingMode(want);
+		noteMeetingState(want);
 		presenterActive = wantPresenter;
 		writeVoiceModeSentinel();
 		syncPresenterSentinel();
 		console.log(`${ts()} [Meeting] External request applied: mode=${wantPresenter ? 'presenter' : want ? 'meeting' : 'active'}`);
+		if (want) enterMeetingDictation();
+		else void meetingDictation?.exit();
 	} catch {
 		// no request file or delete failed — both are fine (silent poll)
 	}
 }
 setInterval(applyModeRequest, 1_000);
 
-// Detect active meeting on startup — sync so it runs before first greeting.
-// Skips on non-macOS: pgrep + osascript aren't available on Windows, and the
-// Zoom meeting-detection heuristic is macOS-shaped (process.zoom.us + window
-// count via System Events). Windows would need a different probe; left as a
-// follow-up.
-try {
-	if (process.platform === 'darwin') {
-		const zoomRunning = execFileSync('/usr/bin/pgrep', ['-f', 'zoom.us'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-		if (zoomRunning) {
-			const inMeeting = execFileSync('osascript', ['-e', 'tell application "System Events" to tell process "zoom.us" to count of windows'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-			if (parseInt(inMeeting) >= 2) {
-				meetingActive = true;
-				voiceWatchdogShadow.noteMeetingMode(true);
-				console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
-			}
-		}
-	}
-} catch { /* no zoom */ }
-
-// Write the initial voice-mode sentinel AFTER the Zoom auto-detect — so
-// the on-disk state matches the in-memory `meetingActive` decision (was
-// previously written before the auto-detect, leaving voice-mode.txt
-// stuck on "active" even when Zoom was detected as active).
 writeVoiceModeSentinel();
 
 // =============================================================================
@@ -519,19 +517,18 @@ const switchModeTool: ToolDefinition = {
 	name: 'switch_mode',
 	description:
 		'Switch between active, meeting, and presenter mode (mutually exclusive). ' +
-		'Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode", "passive mode", or joins a meeting. ' +
+		'Call switch_mode("meeting") when user says "take notes", "be silent", "meeting mode", or "passive mode". ' +
 		'Call switch_mode("presenter") when user says "presenter mode on", "going live", "starting the talk", "the talk starts", or "I am on stage". ' +
 		'Call switch_mode("active") when user says "I need you", "come back", "active mode", "presenter mode off", "talk is done", or the meeting ends. ' +
-		'In meeting mode: listen to everything and track discussion internally, but produce ZERO audio output and do NOT call any other tools — unless explicitly addressed by name ("Sutando" or "hey Sutando").',
+		'In meeting mode you stop hearing the conversation: every sentence is transcribed into the meeting note automatically, and you come back when the user says "Sutando, come back", "meeting is over", "active mode" or "end meeting".',
 	parameters: z.object({
-		mode: z.enum(['active', 'meeting', 'presenter']).describe('"meeting" = silent note-taker, "presenter" = on-stage co-presenter (mutes notifications), "active" = normal assistant'),
+		mode: z.enum(['active', 'meeting', 'presenter']).describe('"meeting" = transcribe the meeting into notes (you stop hearing until the user calls you back), "presenter" = on-stage co-presenter (mutes notifications), "active" = normal assistant'),
 	}),
 	execution: 'inline',
 	async execute(args) {
 		const { mode } = args as { mode: 'active' | 'meeting' | 'presenter' };
-		meetingActive = mode === 'meeting';
-		voiceWatchdogShadow.noteMeetingMode(meetingActive);
-		voiceRecoveryCoordinator?.noteMeetingMode(meetingActive);
+		if (mode === 'meeting' && !meetingDictation) return { status: 'error', error: 'meeting mode is not available yet' };
+		noteMeetingState(mode === 'meeting');
 		presenterActive = mode === 'presenter';
 		syncPresenterSentinel();
 		// Sync the on-disk sentinel so menu-bar consumers (Sutando.app
@@ -543,46 +540,14 @@ const switchModeTool: ToolDefinition = {
 		writeVoiceModeSentinel();
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
-			return { status: 'meeting_mode', instruction: 'You are now in meeting mode. Listen and track the discussion internally. Produce ZERO audio output unless someone says "Sutando." The ONLY tool you may call unprompted is save_meeting_note — call it every 5-10 minutes to capture key decisions, action items, and discussion points. When you exit meeting mode, call save_meeting_note with type "summary" for a final recap. Do not call work or any other tools unless explicitly addressed.' };
+			meetingEntry.schedule();
+			return { status: 'meeting_mode', transcribing: true };
 		}
+		await meetingDictation?.exit();
 		if (mode === 'presenter') {
 			return { status: 'presenter_mode', say: 'Presenter mode on — notifications muted. Break a leg.', instruction: 'You are now in presenter mode (on-stage co-presenter). Notifications are muted for the audience. Follow the CO-PRESENTER protocol from your context for slide cues. Exit ONLY when the user says "presenter mode off", "talk is done", or "active mode" — then call switch_mode("active").' };
 		}
 		return { status: 'active_mode', instruction: 'Back to active mode. You can speak and use all tools normally.' };
-	},
-};
-
-const saveMeetingNoteTool: ToolDefinition = {
-	name: 'save_meeting_note',
-	description:
-		'Save a meeting observation, decision, or action item to notes. ' +
-		'Use this ONLY in meeting mode to periodically capture key points. ' +
-		'Call every 5-10 minutes during a meeting, or when a significant decision/action item is discussed. ' +
-		'Also call when exiting meeting mode to save a final summary.',
-	parameters: z.object({
-		content: z.string().describe('The meeting note: decisions, action items, key discussion points, or a summary. Include speaker names when known.'),
-		type: z.enum(['point', 'summary']).optional().describe('"point" for individual observations (default), "summary" for end-of-meeting summary'),
-	}),
-	execution: 'inline',
-	async execute(args) {
-		const { content, type } = args as { content: string; type?: 'point' | 'summary' };
-		const today = new Date().toISOString().slice(0, 10);
-		const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
-		const notePath = sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR);
-		const isSummary = type === 'summary';
-
-		if (!existsSync(notePath)) {
-			// Create new meeting note file with frontmatter
-			const header = `---\ntitle: Meeting notes — ${today}\ndate: ${today}\ntags: [meeting, notes]\n---\n\n`;
-			writeFileSync(notePath, header);
-		}
-
-		const entry = isSummary
-			? `\n## Summary (${time})\n${content}\n`
-			: `\n- **[${time}]** ${content}`;
-		appendFileSync(notePath, entry);
-		console.log(`${ts()} [MeetingNote] ${isSummary ? 'Summary' : 'Point'} saved to ${notePath}`);
-		return { status: 'saved', path: notePath, type: isSummary ? 'summary' : 'point' };
 	},
 };
 
@@ -726,7 +691,7 @@ function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }
 
-const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, saveMeetingNoteTool, ...inlineTools, ...personalVoiceSurface.tools];
+const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, ...inlineTools, ...personalVoiceSurface.tools];
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
@@ -786,6 +751,7 @@ const mainAgent: MainAgent = {
 	// or apology loops) doesn't match. Real farewell responses to
 	// a user "bye" are almost always a short standalone line.
 	onTurnCompleted: async (ctx, _transcript) => {
+		meetingEntry.noteTurnCompleted();
 		// Clear narration speaking flag + capture what Gemini actually said
 		try {
 			const { narrationSpeakingRef, lastSpokenRef } = await import('./recording-state.js');
@@ -1113,6 +1079,13 @@ async function main() {
 		},
 	});
 
+	const meetingTranscriber = new GeminiLiveTranscribeSTTProvider({
+		apiKey: GEMINI_VOICE_API_KEY,
+		// The exit phrase names Sutando; without the hint it transcribes as "Siddhartha"/"Sutanu".
+		customVocabulary: ['Sutando'],
+		log: (m) => console.log(`${ts()} ${m}`),
+	});
+
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
 		userId: 'user',
@@ -1125,6 +1098,7 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		whisperProvider: meetingTranscriber,
 		// A lost upstream parks the session in UPSTREAM_LOST with the WS
 		// listener up; the redial paths below call recoverUpstream().
 		upstreamLossPolicy: 'hold',
@@ -1256,18 +1230,6 @@ async function main() {
 				// this to the tool track so the browser's 1s poll can't
 				// overwrite it back to listening.
 				fetch(`http://localhost:8080/mute-state?state=working&source=tool&label=${encodeURIComponent(e.toolName)}`).catch(() => {});
-				// Auto-switch meeting mode on join/dismiss
-				if (['summon', 'join_zoom', 'join_gmeet'].includes(e.toolName)) {
-					meetingActive = true;
-					voiceWatchdogShadow.noteMeetingMode(true);
-					voiceRecoveryCoordinator?.noteMeetingMode(true);
-					console.log(`${ts()} [Meeting] Auto-activated by ${e.toolName}`);
-				} else if (e.toolName === 'dismiss') {
-					meetingActive = false;
-					voiceWatchdogShadow.noteMeetingMode(false);
-					voiceRecoveryCoordinator?.noteMeetingMode(false);
-					console.log(`${ts()} [Meeting] Ended by dismiss`);
-				}
 			},
 			onToolResult: (e) => {
 				voiceWatchdogShadow.noteToolSettled(e.toolCallId);
@@ -1292,6 +1254,15 @@ async function main() {
 	});
 
 	sessionRef = session;
+	meetingDictation = attachMeetingDictation({
+		session: session as any,
+		notePathFor: (today) => sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR),
+		onExitByVoice: () => {
+			noteMeetingState(false);
+			writeVoiceModeSentinel();
+		},
+		log: (m) => console.log(`${ts()} ${m}`),
+	});
 
 	// Armed only with the full bodhi recovery surface; anything less falls
 	// back to shadow with a loud line (the design's capability-validation rule).

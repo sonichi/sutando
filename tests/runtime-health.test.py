@@ -458,5 +458,85 @@ finally:
     rh._tmux_has_session = _oh
     rh._tmux_socket = _ot
 
+# 8) core-status says idle, but the Codex pane holds the queue behind a rejected
+#    /startup. Driven through a stubbed tmux on PATH so the real capture + pane_gate run.
+_bt = tempfile.mkdtemp()
+_bin = os.path.join(_bt, "bin")
+os.makedirs(_bin)
+_pane_file = os.path.join(_bt, "pane.txt")
+with open(os.path.join(_bin, "tmux"), "w") as _fh:
+    _fh.write('#!/bin/bash\n'
+              'for a in "$@"; do\n'
+              '  case "$a" in\n'
+              '    list-windows) echo 0; exit 0 ;;\n'
+              '    show-environment) echo "SUTANDO_CORE_RUNTIME=$STUB_RUNTIME"; exit 0 ;;\n'
+              '    capture-pane) cat "$PANE_FILE"; exit 0 ;;\n'
+              '  esac\n'
+              'done\nexit 0\n')
+os.chmod(os.path.join(_bin, "tmux"), 0o755)
+_FOOTER_157 = "  GPT-6-Sol ultra · ~/Library/Application Support/sp…  ⚠ 1 warning · f2 to view"
+_REJECTED = ("■ Unrecognized command '/startup'. Type \"/\" for a list of supported commands.\n\n"
+             f"\x1b[1m»\x1b[0m /startup\n\n{_FOOTER_157}\n")
+_EMPTY = f"\x1b[1m»\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\n\n{_FOOTER_157}\n"
+
+
+def _derive_blocked_case(pane, queued, runtime="codex"):
+    ws = tempfile.mkdtemp()
+    for d in ("tasks", "results", "state"):
+        os.makedirs(os.path.join(ws, d))
+    for i in range(queued):
+        with open(os.path.join(ws, "tasks", f"task-{i}.txt"), "w") as fh:
+            fh.write("priority: normal\ntask: owner message\n")
+    with open(_pane_file, "w") as fh:
+        fh.write(pane)
+    saved = (rh._core_running, rh._core_status, rh._gateway_running, rh._resolve_workspace,
+             rh._tmux_socket)
+    env_saved = {k: os.environ.get(k) for k in ("PATH", "PANE_FILE", "STUB_RUNTIME")}
+    rh._core_running = lambda: True
+    rh._core_status = lambda w: ("idle", time.time())
+    rh._gateway_running = lambda: True
+    rh._resolve_workspace = lambda repo: ws
+    rh._tmux_socket = lambda: "/tmp/rh-stub.sock"
+    os.environ.update(PATH=_bin + os.pathsep + os.environ["PATH"], PANE_FILE=_pane_file,
+                      STUB_RUNTIME=runtime)
+    try:
+        return rh.derive()
+    finally:
+        (rh._core_running, rh._core_status, rh._gateway_running, rh._resolve_workspace,
+         rh._tmux_socket) = saved
+        for k, v in env_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+d = _derive_blocked_case(_REJECTED, queued=1)
+check("derive: idle status + queued task + Codex composer holding /startup -> blocked/warn",
+      d["health"] == "blocked" and d["severity"] == "warn")
+check("derive: ...the detail names the queue and the held text",
+      "1 task(s) queued" in d["detail"] and "'/startup'" in d["detail"])
+check("derive: ...and the gate reports it, never restarts", rh.severity_gate(d) == "report")
+check("derive: an owner's Codex draft holding the queue is blocked too (not cleared, but not Ready)",
+      _derive_blocked_case(_REJECTED.replace("m /startup", "m half typed"), queued=2)["health"] == "blocked")
+check("derive: CONTROL empty Codex composer + queued task -> idle/ok",
+      _derive_blocked_case(_EMPTY, queued=1)["health"] == "idle")
+check("derive: CONTROL /startup in the composer but nothing queued -> idle",
+      _derive_blocked_case(_REJECTED, queued=0)["health"] == "idle")
+check("derive: CONTROL a Claude draft does not hold its queue -> idle",
+      _derive_blocked_case(f"❯ /startup\n{_FOOTER}", queued=1, runtime="claude")["health"] == "idle")
+check("severity_of: blocked is warn", rh.severity_of("blocked") == "warn")
+check("derive: a session that cannot name its runtime is not judged -> idle",
+      _derive_blocked_case(_REJECTED, queued=1, runtime="")["health"] == "idle")
+check("_queued_tasks: an unreadable workspace counts as no queue, never a crash",
+      rh._queued_tasks(None) == 0)
+_ocw = rh.cli_wedge.core_target
+rh.cli_wedge.core_target = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("tmux gone"))
+try:
+    check("_pane_blocks_dispatch: a failing pane probe is no verdict, never a crash",
+          rh._pane_blocks_dispatch(tempfile.mkdtemp()) is None)
+finally:
+    rh.cli_wedge.core_target = _ocw
+
 print("\n" + ("PASS — runtime-health green" if fails == 0 else "FAIL — %d failing" % fails))
 sys.exit(fails)

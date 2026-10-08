@@ -151,6 +151,31 @@ export PATH
 # on the first miss leaves a dead window that never recovers even once the
 # install finishes, so wait briefly for it to appear before giving up.
 CODEX_WAIT_TIMEOUT="${SUTANDO_CODEX_WAIT_TIMEOUT:-120}"
+# Seconds a freshly created core session may take to answer has-session; a stub
+# tmux that never reports one (tests) sets this to 0. Polls run every 0.2 s.
+SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S:-5}"
+# Only a signed base-10 integer counts (fraction dropped, zero prefix consumed by the regex in
+# one pass): under set -u a bare word is an unbound-variable exit and 08 reads as octal.
+if [[ "$SESSION_UP_WAIT_S" =~ ^(-?)0*([0-9]+)(\.[0-9]+)?$ ]]; then
+  _session_up_neg="${BASH_REMATCH[1]}"
+  _session_up_mag="${BASH_REMATCH[2]}"
+else
+  _session_up_neg=""
+  _session_up_mag=5
+fi
+# Saturate on the digit string against the 60 s ceiling, so no multiply can wrap.
+if [ -n "$_session_up_neg" ] || [ "$_session_up_mag" = 0 ]; then
+  SESSION_UP_TRIES=1
+elif [ "${#_session_up_mag}" -gt 2 ]; then
+  SESSION_UP_TRIES=300
+else
+  case "$_session_up_mag" in
+    6[1-9]|[7-9][0-9]) SESSION_UP_TRIES=300 ;;
+    *) SESSION_UP_TRIES=$(( 10#$_session_up_mag * 5 )) ;;
+  esac
+fi
+SESSION_UP_LABEL="$(( SESSION_UP_TRIES * 2 / 10 )).$(( SESSION_UP_TRIES * 2 % 10 ))s"
+echo "  · session-up wait: at most ${SESSION_UP_TRIES} poll(s), ${SESSION_UP_LABEL}" >&2
 if ! command -v codex >/dev/null 2>&1; then
   echo "  … waiting for the Codex CLI to finish installing (up to ${CODEX_WAIT_TIMEOUT}s)" >&2
   _codex_waited=0
@@ -339,14 +364,14 @@ heartbeat_python() {
 }
 ensure_core_heartbeat() {
   if [ -n "$EXTERNAL_HELPERS" ]; then check_external_helpers; return; fi
-  pgrep -f "$REPO/src/core_heartbeat.py" >/dev/null 2>&1 && return 0
   local _py
   _py="$(heartbeat_python)"
   if [ -z "$_py" ]; then
     echo "WARN no runnable python3 for the core heartbeat — not started; cron-runner fires will stay suppressed" >&2
     return 0
   fi
-  "$_py" "$REPO/src/core_heartbeat.py" >/tmp/core-heartbeat.log 2>&1 &
+  "$_py" "$REPO/src/core_heartbeat.py" --ensure >/dev/null 2>&1 \
+    || echo "WARN core heartbeat --ensure failed; cron-runner fires will stay suppressed" >&2
 }
 
 ensure_durable_schedules() {
@@ -547,39 +572,29 @@ if ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n 
     >> "$ws/state/session-starts.log"
 fi
 
-if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
+# Creates the core session, waits for has-session within the configured budget
+# (new-session rc=0 only means tmux accepted it), then starts the helpers.
+start_core_session_and_helpers() {
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
-  # new-session rc=0 means tmux accepted it; a child that exits at once leaves
-  # has-session failing. Poll before opening intake rather than assuming.
-  for _ in $(seq 1 25); do
+  for _ in $(seq 1 "$SESSION_UP_TRIES"); do
     session_exists "$SESSION" && break
     sleep 0.2
   done
   if session_exists "$SESSION"; then
     clear_shutdown_sentinel
   else
-    echo "  ⚠ $SESSION did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
+    echo "  ⚠ $SESSION did not come up within ~${SESSION_UP_LABEL} — sentinel NOT cleared, no core is serving." >&2
   fi
   ensure_task_notifier
   ensure_core_monitor
   ensure_core_heartbeat
+}
+
+if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
+  start_core_session_and_helpers
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
-  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
-  # new-session rc=0 means tmux accepted it; a child that exits at once leaves
-  # has-session failing. Poll before opening intake rather than assuming.
-  for _ in $(seq 1 25); do
-    session_exists "$SESSION" && break
-    sleep 0.2
-  done
-  if session_exists "$SESSION"; then
-    clear_shutdown_sentinel
-  else
-    echo "  ⚠ $SESSION did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
-  fi
-  ensure_task_notifier
-  ensure_core_monitor
-  ensure_core_heartbeat
+  start_core_session_and_helpers
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
     echo "Started $SESSION detached with Codex — opened a Terminal window attached to it."

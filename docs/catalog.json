@@ -56,7 +56,7 @@
    "last_verified": "2026-08-24"
   },
   "docs/benchmark-reports/2026-08-24-3a73e03.md": {
-   "title": "Sutando comprehensive benchmark — 2026-08-24",
+   "title": "Sutando comprehensive benchmark \u2014 2026-08-24",
    "audience": [
     "users",
     "operators",
@@ -79,7 +79,7 @@
    "last_verified": "2026-09-18"
   },
   "docs/census/d1-identity-census.md": {
-   "title": "D1 identity/state census — Discord / AG2 Space / Slack",
+   "title": "D1 identity/state census \u2014 Discord / AG2 Space / Slack",
    "audience": [
     "contributors",
     "maintainers"
@@ -262,7 +262,7 @@
    "last_verified": "2026-09-18"
   },
   "docs/runtime/claude-hook-contract-v1.md": {
-   "title": "Claude Code Hook Contract — v1",
+   "title": "Claude Code Hook Contract \u2014 v1",
    "audience": [
     "contributors",
     "maintainers"
@@ -282,7 +282,7 @@
    "last_verified": null
   },
   "docs/sparrow-delivery-identity.md": {
-   "title": "Sparrow delivery identity — frozen definitions (B, slice 1)",
+   "title": "Sparrow delivery identity \u2014 frozen definitions (B, slice 1)",
    "audience": [
     "contributors",
     "maintainers"
@@ -292,7 +292,7 @@
    "last_verified": "2026-08-22"
   },
   "docs/sparrow-v1-contract.md": {
-   "title": "ag2-sparrow v1 — the frozen delivery contract",
+   "title": "ag2-sparrow v1 \u2014 the frozen delivery contract",
    "audience": [
     "contributors",
     "maintainers"
@@ -436,7 +436,7 @@
    "last_verified": "2026-08-27"
   },
   "docs/graceful-shutdown.md": {
-   "title": "Graceful shutdown — sentinel paths",
+   "title": "Graceful shutdown \u2014 sentinel paths",
    "audience": [
     "contributors",
     "maintainers"
@@ -456,7 +456,7 @@
    "last_verified": "2026-08-25"
   },
   "docs/proactive-loop-rationale.md": {
-   "title": "Proactive loop — rationale and measurements",
+   "title": "Proactive loop \u2014 rationale and measurements",
    "audience": [
     "contributors",
     "maintainers"
@@ -476,7 +476,7 @@
    "last_verified": "2026-09-15"
   },
   "docs/worker-pool-design.md": {
-   "title": "Worker pool — design (v1)",
+   "title": "Worker pool \u2014 design (v1)",
    "audience": [
     "contributors",
     "maintainers"
@@ -486,7 +486,7 @@
    "last_verified": "2026-10-05"
   },
   "docs/worker-pool-design-notes.md": {
-   "title": "Worker pool — design notes",
+   "title": "Worker pool \u2014 design notes",
    "audience": [
     "contributors",
     "maintainers"
@@ -496,7 +496,7 @@
    "last_verified": "2026-09-08"
   },
   "docs/task-watcher-hosting-modes.md": {
-   "title": "Task watcher hosting modes — session watcher, standby, supervisor",
+   "title": "Task watcher hosting modes \u2014 session watcher, standby, supervisor",
    "audience": [
     "contributors",
     "maintainers"
@@ -504,6 +504,48 @@
    "status": "canonical",
    "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract",
    "last_verified": "2026-09-22"
+  },
+  "docs/learning-window.md": {
+   "title": "Retained learning windows",
+   "audience": [
+    "contributors",
+    "maintainers",
+    "operators"
+   ],
+   "status": "active",
+   "canonical_for": "optional all-scope learning collection and pending evidence",
+   "last_verified": "2026-10-07"
+  },
+  "docs/reliability-v3-results.md": {
+   "title": "Sutando reliability evaluation: final results",
+   "audience": [
+    "contributors",
+    "maintainers",
+    "operators"
+   ],
+   "status": "historical",
+   "canonical_for": "concluded owner evaluation of the local reliability experiment",
+   "last_verified": "2026-10-07"
+  },
+  "docs/cron-outstanding-payload.md": {
+   "title": "Outstanding cron payload preservation",
+   "audience": [
+    "operators",
+    "contributors"
+   ],
+   "status": "active",
+   "canonical_for": "prompt cron coalescing and outstanding payload lifetime",
+   "last_verified": "2026-10-07"
+  },
+  "docs/github-verification.md": {
+   "title": "GitHub verification receipts",
+   "audience": [
+    "contributors",
+    "operators"
+   ],
+   "status": "active",
+   "canonical_for": "optional PR evidence receipts and governed status publication",
+   "last_verified": "2026-10-07"
   }
  }
 }

@@ -30,7 +30,7 @@ producer and emit a durable artifact every cycle:
 
     state/core-verdict.json
     {
-      "state":    "working|idle|degraded|needs_login|wedged|offline",
+      "state":    "working|idle|blocked|degraded|needs_login|wedged|offline",
       "severity": "ok|warn|escalate|critical",
       "authed":   true|false|null,
       "detail":   "<human string>",
@@ -56,6 +56,7 @@ shipped as separate fixes).
 | state       | severity  | meaning                                             | action    |
 |-------------|-----------|-----------------------------------------------------|-----------|
 | working/idle| `ok`      | alive and (acting \| idle-at-prompt)                | none      |
+| blocked     | `warn`    | alive, status idle, but tasks are queued and the pane holds them (a draft the dispatcher will not type over, or an abnormal frame) | REPORT, never restart |
 | degraded    | `warn`    | alive but a soft issue (stale quota, memory-index over limit, checkout drift, gateway-down-with-config) | REPORT |
 | needs_login | `escalate`| human-only blocker (login / unrecognized prompt)    | REPORT→human, **never restart** |
 | wedged      | `critical`| alive but stalled: status stale AND no progress AND no recognized prompt | ACT (gated) |

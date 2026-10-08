@@ -37,6 +37,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import datetime
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 import read as _read       # noqa: E402
@@ -49,6 +51,7 @@ import say as _say         # noqa: E402
 import rooms as _rooms     # noqa: E402
 import members as _members # noqa: E402
 import events as _events   # noqa: E402
+import history as _history # noqa: E402
 
 
 def _record_say(res):
@@ -244,7 +247,8 @@ def _main(argv):
 
     p = sub.add_parser("say", help="post a plain message into a room (mentions no one)")
     p.add_argument("room_id")
-    p.add_argument("message")
+    p.add_argument("message", nargs="?")
+    p.add_argument("--body-file", help="UTF-8 message file; exclusive with positional message")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
     p.add_argument("--worker", default=None,
                    help="worker id to stamp on the event (space.ag2.worker) so the "
@@ -272,6 +276,12 @@ def _main(argv):
                    help="tier for members not named by --tier")
     p.add_argument("--revoke", action="store_true",
                    help="disable the grant (authoritative=false); leaves other policy fields intact")
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
+    p = sub.add_parser("history", help="read all joined rooms with window pagination and coverage receipts")
+    p.add_argument("--since", required=True, help="ISO 8601 time with timezone")
+    p.add_argument("--until", help="ISO 8601 time with timezone; default now")
+    p.add_argument("--pages", type=int, default=20)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
     sub.add_parser("capabilities", help="print, as JSON, the subcommands and `say` flags this "
@@ -331,7 +341,25 @@ def _main(argv):
     elif a.cmd == "mention":
         res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid,
                                reply_to=a.reply_to)
+    elif a.cmd == "history":
+        try:
+            start = datetime.datetime.fromisoformat(a.since.replace("Z", "+00:00"))
+            end = datetime.datetime.fromisoformat(a.until.replace("Z", "+00:00")) if a.until else datetime.datetime.now(datetime.timezone.utc)
+            if not start.tzinfo or not end.tzinfo:
+                raise ValueError("timestamps require timezone")
+            res = _history.history(start.timestamp() * 1000, end.timestamp() * 1000, a.pages, a.agent_mxid)
+        except (ValueError, TypeError):
+            res = {"ok": False, "complete_available_history": False, "reason": "Invalid history window or membership data"}
     elif a.cmd == "say":
+        if (a.message is None) == (a.body_file is None):
+            print(json.dumps({"ok": False, "reason": "say requires exactly one positional message or --body-file"}))
+            return 2
+        if a.body_file is not None:
+            try:
+                a.message = Path(a.body_file).read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                print(json.dumps({"ok": False, "reason": "Cannot read UTF-8 message file"}))
+                return 2
         _kw = {"reply_to": a.reply_to}
         if a.worker:
             _kw["worker"] = a.worker
