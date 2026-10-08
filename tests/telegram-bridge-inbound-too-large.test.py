@@ -115,5 +115,19 @@ finally:
     fresh.urllib.request.urlopen = urllib.request.urlopen
 check("api() returns the error description", out == {"ok": False, "description": "Bad Request: file is too big"})
 
+
+# A non-JSON error body (a proxy page, say) still reads as a plain failure.
+def raise_html(req, timeout=30):
+    raise urllib.error.HTTPError(
+        "https://api.telegram.org", 502, "Bad Gateway", {}, io.BytesIO(b"<html>bad gateway</html>"),
+    )
+
+fresh.urllib.request.urlopen = raise_html
+try:
+    out = fresh.api("getFile", file_id="x")
+finally:
+    fresh.urllib.request.urlopen = urllib.request.urlopen
+check("api() tolerates a non-JSON error body", out == {"ok": False, "description": ""})
+
 print(f"\n{len(failures)} failed" if failures else "\nall passed")
 sys.exit(1 if failures else 0)
