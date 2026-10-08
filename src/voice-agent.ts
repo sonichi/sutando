@@ -441,9 +441,13 @@ function noteMeetingState(on: boolean) {
 	voiceWatchdogShadow.noteMeetingMode(on);
 	voiceRecoveryCoordinator?.noteMeetingMode(on);
 }
+// Only the latest entry's failure may turn meeting mode off; an older one can fail while a newer one is transcribing.
+let meetingEntrySeq = 0;
 function enterMeetingDictation() {
+	const seq = ++meetingEntrySeq;
 	meetingDictation?.enter().catch((err) => {
 		console.error(`${ts()} [MeetingDictation] enter failed: ${err?.message ?? err}`);
+		if (seq !== meetingEntrySeq) return;
 		noteMeetingState(false);
 		writeVoiceModeSentinel();
 	});

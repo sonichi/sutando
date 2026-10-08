@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DictationTranscriptEvent } from 'bodhi-realtime-agent';
@@ -28,12 +28,32 @@ describe('meeting dictation', () => {
 	});
 
 	it('keeps meeting speech before an addressed command and drops fillers', () => {
-		assert.deepEqual(findExitCommand('We ship on Friday. Sutando, come back.'), { before: 'We ship on Friday.', after: '' });
-		assert.deepEqual(findExitCommand('Budget is approved. Sutando, end the meeting please.'), { before: 'Budget is approved.', after: '' });
-		assert.deepEqual(findExitCommand('Hi, Sutando come back.'), { before: '', after: '' });
-		assert.deepEqual(findExitCommand('Sutando, come back and summarize.'), { before: '', after: 'and summarize.' });
+		const none = { after: '', following: '' };
+		assert.deepEqual(findExitCommand('We ship on Friday. Sutando, come back.'), { before: 'We ship on Friday.', ...none });
+		assert.deepEqual(findExitCommand('Budget is approved. Sutando, end the meeting please.'), { before: 'Budget is approved.', ...none });
+		assert.deepEqual(findExitCommand('Hi, Sutando come back.'), { before: '', ...none });
+		assert.deepEqual(findExitCommand('Sutando, come back and summarize.'), { before: '', after: 'summarize.', following: '' });
+		assert.deepEqual(findExitCommand('Sutando, come back, then send the notes to Chi.'), { before: '', after: 'send the notes to Chi.', following: '' });
+		assert.deepEqual(findExitCommand('Sutando, come back. What did we decide?'), { before: '', after: '', following: 'What did we decide?' },
+			'a further sentence stays meeting speech, not a request');
 		assert.equal(findExitCommand('Stop dictation and summarize.'), null, 'an unaddressed command must stand alone');
-		assert.deepEqual(findExitCommand('Okay, stop dictation.'), { before: '', after: '' });
+		assert.deepEqual(findExitCommand('Okay, stop dictation.'), { before: '', ...none });
+	});
+
+	it('treats CJK text and numbers as meeting speech, never as filler', () => {
+		assert.deepEqual(findExitCommand('预算已经批准。 Sutando, come back.'), { before: '预算已经批准。', after: '', following: '' });
+		assert.equal(findExitCommand('我们接下来介绍 active mode.'), null);
+		assert.equal(findExitCommand('500. Stop dictation.'), null);
+		assert.equal(findExitCommand('好的 stop dictation'), null, 'only listed English fillers may stand next to an unaddressed command');
+	});
+
+	it('counts Sutando as addressed only at the start of a sentence', () => {
+		for (const t of [
+			'We said Sutando come back online and email the report to the client.',
+			'Did you hear Sutando come back online yesterday?',
+			'Sutando, the meeting is over budget.',
+			'I asked Sutando, end the meeting notes feature is buggy.',
+		]) assert.equal(findExitCommand(t), null, t);
 	});
 
 	it('stays in the meeting when a sentence merely mentions an exit phrase', async () => {
@@ -45,7 +65,7 @@ describe('meeting dictation', () => {
 		assert.match(readFileSync(t.md.notePath!, 'utf-8'), /\] Do not stop dictation until we finish the budget review\.\n$/);
 	});
 
-	function setup(opts: { switching?: () => Promise<void>; notePathFor?: (d: string) => string } = {}) {
+	function setup(opts: { switching?: () => Promise<void>; notePathFor?: (d: string) => string; inject?: boolean; log?: (m: string) => void } = {}) {
 		const dir = mkdtempSync(join(tmpdir(), 'meet-'));
 		let mode: 'agent' | 'transcription' = 'agent';
 		const buffer: string[] = [];
@@ -64,7 +84,7 @@ describe('meeting dictation', () => {
 			setTranscriptionMode: async (m: 'agent' | 'transcription') => { await opts.switching?.(); mode = m; },
 			getTranscriptionMode: () => mode,
 			clearDictationBuffer: () => { buffer.length = 0; },
-			injectText: async (t: string) => { injected.push(t); return true; },
+			injectText: async (t: string) => { injected.push(t); return opts.inject ?? true; },
 			onDictationTranscript: (l: (e: DictationTranscriptEvent) => void) => {
 				listeners.push(l);
 				return () => { listeners.splice(listeners.indexOf(l), 1); };
@@ -72,7 +92,7 @@ describe('meeting dictation', () => {
 		};
 		const md = attachMeetingDictation({
 			session, notePathFor: opts.notePathFor ?? ((d) => join(dir, `notes/meeting-${d}.md`)),
-			onExitByVoice: () => { exitedByVoice++; }, log: () => {},
+			onExitByVoice: () => { exitedByVoice++; }, log: opts.log ?? (() => {}),
 		});
 		return { md, provider, buffer, injected, get mode() { return mode; }, get exitedByVoice() { return exitedByVoice; } };
 	}
@@ -156,7 +176,45 @@ describe('meeting dictation', () => {
 		t.provider.say('Sutando, come back and summarize.');
 		await tick();
 		assert.equal(t.mode, 'agent');
-		assert.match(t.injected[0], /the user also said: "and summarize\."/);
+		assert.match(t.injected[0], /the user also said: "summarize\."/);
+	});
+
+	it('keeps a sentence that only mentions Sutando coming back in the note and stays in the meeting', async () => {
+		const t = setup();
+		await t.md.enter();
+		const line = 'We said Sutando come back online and email the report to the client.';
+		t.provider.say(line);
+		await tick();
+		assert.equal(t.mode, 'transcription');
+		assert.ok(readFileSync(t.md.notePath!, 'utf-8').endsWith(`] ${line}\n`));
+		assert.deepEqual(t.injected, [], 'nothing reaches the agent as a request');
+	});
+
+	it('keeps mixed-language speech before an addressed exit in the note', async () => {
+		const t = setup();
+		await t.md.enter();
+		const path = t.md.notePath!;
+		t.provider.say('预算已经批准。 Sutando, come back.');
+		await tick();
+		assert.equal(t.mode, 'agent');
+		assert.match(readFileSync(path, 'utf-8'), /\] 预算已经批准。\n$/);
+		assert.match(t.injected[0], /预算已经批准。/);
+	});
+
+	it('a failed entry writes no transcript heading', async () => {
+		const path = join(mkdtempSync(join(tmpdir(), 'meet-fail-')), 'note.md');
+		const t = setup({ switching: async () => { throw new Error('setup timed out'); }, notePathFor: () => path });
+		await assert.rejects(t.md.enter(), /setup timed out/);
+		assert.equal(existsSync(path), false);
+	});
+
+	it('logs when the transcript cannot be delivered to the session', async () => {
+		const logs: string[] = [];
+		const t = setup({ inject: false, log: (m) => logs.push(m) });
+		await t.md.enter();
+		t.provider.say('a point');
+		await t.md.exit();
+		assert.ok(logs.some((m) => /transcript not delivered/.test(m)));
 	});
 
 	it('tells the agent the notes are incomplete when lines could not be written', async () => {

@@ -16,8 +16,13 @@ const FILLER = new Set(['ok', 'okay', 'hi', 'hey', 'um', 'uh', 'umm', 'so', 'alr
 const ADDRESSED = /\bsutando[\s,，.!?。]*$/i;
 const ONLY_FILLER_AFTER = /^[\s,.!?。，！？]*(?:(?:please|now|thanks|thank you)[\s,.!?。，！？]*)*$/i;
 
+/** True when every word is a filler; CJK text and numbers are words, so they are never filler. */
 const isFiller = (text: string) =>
-	text.toLowerCase().split(/[^a-z']+/).filter(Boolean).every((w) => FILLER.has(w));
+	(text.toLowerCase().match(/[\p{L}\p{N}']+/gu) ?? []).every((w) => FILLER.has(w));
+/** Nothing but fillers before this point, or the previous sentence has ended. */
+const atSentenceStart = (text: string) => isFiller(text) || /[.!?。！？]\s*$/.test(text);
+/** A request joined to the command ("…come back and summarize"). */
+const JOINED_REQUEST = /^[\s,，]*(?:and|then)\b(?:[\s,，]+then\b)?[\s,，]*/i;
 
 /** Transcript carried back into the voice session; a longer meeting keeps its end. */
 const MAX_CARRIED_CHARS = 30_000;
@@ -40,21 +45,34 @@ export function meetingEndedContext(path: string, transcript: string[], opts: { 
 }
 
 /**
- * The exit command in this segment, if any: the segment is only the command (fillers aside), or the
- * command is addressed to Sutando. `before` is meeting speech ahead of it, `after` a request that follows it.
+ * The exit command in this segment, if any. Either the segment is only the command (fillers aside), or
+ * the command is addressed to Sutando at the start of a sentence ("…. Sutando, come back").
+ * `before` is meeting speech ahead of the command. `after` is a request joined to it with "and" or "then".
+ * `following` is a further sentence after an addressed command; it is meeting speech, not a request.
+ * Anything else after the command means it was only mentioned, and the segment stays in the meeting.
  */
-export function findExitCommand(text: string): { before: string; after: string } | null {
+export function findExitCommand(text: string): { before: string; after: string; following: string } | null {
 	const last = [...text.matchAll(EXIT_PATTERN)].at(-1);
 	if (!last || last.index === undefined) return null;
-	let before = text.slice(0, last.index);
+	const before = text.slice(0, last.index);
 	const rest = text.slice(last.index + last[0].length);
-	const addressed = ADDRESSED.test(before) || /^sutando/i.test(last[0]);
-	const tailOnlyFiller = ONLY_FILLER_AFTER.test(rest);
-	if (!addressed && (!tailOnlyFiller || !isFiller(before))) return null;
-	before = before.replace(ADDRESSED, '').replace(/[\s,，]+$/, '');
-	const after = tailOnlyFiller ? '' : rest.replace(/^[\s,，]+/, '').trim();
-	return { before: isFiller(before) ? '' : before, after };
+	const lead = before.replace(ADDRESSED, '');
+	const vocative = lead !== before || /^sutando/i.test(last[0]);
+	if (ONLY_FILLER_AFTER.test(rest)) {
+		if (vocative ? !atSentenceStart(lead) : !isFiller(before)) return null;
+		return { before: kept(lead), after: '', following: '' };
+	}
+	if (!vocative || !atSentenceStart(lead)) return null;
+	const joined = rest.match(JOINED_REQUEST);
+	if (joined) return { before: kept(lead), after: rest.slice(joined[0].length).trim(), following: '' };
+	if (/^\s*[.!?。！？]/.test(rest)) return { before: kept(lead), after: '', following: rest.replace(/^[\s.!?。！？]+/, '').trim() };
+	return null;
 }
+
+const kept = (lead: string) => {
+	const t = lead.replace(/[\s,，]+$/, '');
+	return isFiller(t) ? '' : t;
+};
 
 export function isMeetingExitPhrase(text: string): boolean {
 	return findExitCommand(text) !== null;
@@ -128,14 +146,17 @@ export interface MeetingDictationDeps {
 }
 
 /**
- * Wraps the provider's transcript callback (which bodhi points at its
- * dictation buffer) so every final line also lands in the note file.
+ * Subscribes to bodhi's dictation transcript so every final line also lands in the
+ * note file, and runs meeting enter/exit on top of the session's transcription mode.
  */
 export function attachMeetingDictation(deps: MeetingDictationDeps) {
 	const now = deps.now ?? (() => new Date());
 	let notePath: string | null = null;
 	let lines: string[] = [];
 	let unsaved = 0;
+	// The note and its header are written with the first line or once transcription is on,
+	// so an entry that fails leaves no empty heading behind.
+	let headerAt: Date | null = null;
 	// Enter and exit run one at a time, each after the previous one's mode switch has settled.
 	let queue: Promise<void> = Promise.resolve();
 	const serial = (op: () => Promise<void>): Promise<void> => {
@@ -150,6 +171,7 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 		if (command) {
 			deps.log(`[MeetingDictation] exit phrase heard: "${text}"`);
 			if (command.before) record(command.before);
+			if (command.following) record(command.following);
 			void serial(() => exit({ byVoice: true, request: command.after }));
 			return;
 		}
@@ -160,6 +182,7 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 		if (!notePath) return;
 		lines.push(text);
 		try {
+			writeHeader();
 			appendTranscriptLine(notePath, text, now());
 		} catch (err) {
 			unsaved++;
@@ -167,22 +190,33 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 		}
 	}
 
+	function writeHeader(): void {
+		if (!notePath || !headerAt) return;
+		const at = headerAt;
+		headerAt = null;
+		ensureMeetingNote(notePath, at.toISOString().slice(0, 10));
+		appendTranscriptHeader(notePath, at);
+	}
+
 	async function enter(): Promise<void> {
 		if (deps.session.getTranscriptionMode() === 'transcription') return;
-		const at = now();
-		const today = at.toISOString().slice(0, 10);
-		notePath = deps.notePathFor(today);
+		headerAt = now();
+		notePath = deps.notePathFor(headerAt.toISOString().slice(0, 10));
 		lines = [];
 		unsaved = 0;
-		ensureMeetingNote(notePath, today);
-		appendTranscriptHeader(notePath, at);
 		deps.session.clearDictationBuffer();
 		try {
 			await deps.session.setTranscriptionMode('transcription');
 		} catch (err) {
 			notePath = null;
+			headerAt = null;
 			lines = [];
 			throw err;
+		}
+		try {
+			writeHeader();
+		} catch (err) {
+			deps.log(`[MeetingDictation] note header failed: ${(err as Error).message}`);
 		}
 		deps.log(`[MeetingDictation] transcribing to ${notePath}`);
 	}
@@ -197,10 +231,11 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 		deps.log(`[MeetingDictation] back to agent mode (${transcript.length} lines in ${path})`);
 		if (opts.byVoice) deps.onExitByVoice();
 		if (path) {
-			await deps.session.injectText(
+			const delivered = await deps.session.injectText(
 				meetingEndedContext(path, transcript, { unsaved, request: opts.request || undefined }),
 				{ mode: 'live' },
 			);
+			if (!delivered) deps.log(`[MeetingDictation] transcript not delivered to the session; the note is in ${path}`);
 		}
 	}
 
