@@ -11,8 +11,8 @@ while [ $# -gt 0 ]; do case "$1" in
   *) [ -z "$MODEL" ] && MODEL="$1" || { echo "switch-model: one model, got '$1' too" >&2; exit 2; };;
 esac; shift; done
 [ -n "$MODEL" ] || { echo "usage: switch-model.sh <model> [--dry-run]" >&2; exit 2; }
-# Aliases the CLI's /model accepts, or a full id with an optional context tag.
-if ! printf '%s' "$MODEL" | grep -Eq '^(default|opus|sonnet|haiku|fable|claude-[a-z0-9.-]+(\[1m\])?)$'; then
+# Aliases the CLI's /model accepts, or a full id; a family alias or id may carry a context tag.
+if ! printf '%s' "$MODEL" | grep -Eq '^(default|(opus|sonnet|haiku|fable)(\[1m\])?|claude-[a-z0-9.-]+(\[1m\])?)$'; then
   echo "switch-model: refused '$MODEL' — not a model alias or claude-* id" >&2; exit 2
 fi
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
