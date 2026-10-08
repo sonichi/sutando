@@ -435,6 +435,7 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
         with patch.object(_mod, "capture", lambda s, sess: next(panes)), \
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "session_runtime", lambda *a: None), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
                 patch.object(_mod.time, "sleep", _sleep), \
                 patch.object(sys, "argv", argv), self.assertRaises(_Stop):
