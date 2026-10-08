@@ -305,15 +305,17 @@ class MainLoopWiringTest(FakeTmuxHarness):
         self.assertEqual(len(hits), 1, f"expected one queue entry for {name}, found {hits}")
         return hits[0]
 
-    def _finish(self, name, timeout=10):
+    def _finish(self, name, proc, timeout=10):
         # The main loop ends only with its watcher, so a process-exit wait after a
         # result proves nothing; pickup is the queue entry going, marker already clear.
         marker = self.inflight_dir / name
         self._wait_until(marker.is_file, timeout, f"no in-flight marker for {name} after its paste")
         queued = self._queue_entry(name)
-        # Five completion polls (0.1 s each) with no result on disk: a marker cleared
-        # ahead of its result would already be gone here.
-        time.sleep(0.5)
+        # Two more probes by this notifier that saw the marker and no result: two
+        # completion polls missed while the precondition held, whatever the schedule.
+        polls = self.no_result_polls(proc.pid, name)
+        self._wait_until(lambda: self.no_result_polls(proc.pid, name) >= polls + 2, timeout,
+                         f"notifier {proc.pid} ran no completion poll for {name} with its marker present and no result")
         self.assertTrue(marker.is_file(), f"the in-flight marker for {name} cleared before any result existed")
         self.assertTrue(queued.is_file(), f"{name} left the notifier's queue before any result existed")
         self.write_result(name)
@@ -355,7 +357,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
             else:
                 self.fail("main loop never dispatched the dropped task file:\n"
                           + self.sendkeys_log_text())
-            self._finish("task-live.txt")
+            self._finish("task-live.txt", proc)
         finally:
             if proc.poll() is None:
                 try:
@@ -464,7 +466,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
                 else:
                     self.fail(with_stderr("the periodic self-poll never retried the queued task:\n"
                                            + self.sendkeys_log_text()))
-                self._finish("task-p.txt")
+                self._finish("task-p.txt", proc)
             finally:
                 if proc.poll() is None:
                     try:
@@ -526,7 +528,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
             self.assertNotIn(
                 "Sutando task ready: task-claimed.txt", self.sendkeys_log_text(),
                 "a claimed must-handle task must never be typed into the live core")
-            self._finish("task-unrelated.txt")
+            self._finish("task-unrelated.txt", proc)
         finally:
             if proc.poll() is None:
                 try:
@@ -577,7 +579,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
             self.assertNotIn(
                 "Sutando task ready: task-held.txt", self.sendkeys_log_text(),
                 "a worker-held task must never be typed into the live core")
-            self._finish("task-unrelated.txt")
+            self._finish("task-unrelated.txt", proc)
         finally:
             if proc.poll() is None:
                 try:

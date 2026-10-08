@@ -126,6 +126,9 @@ class FakeTmuxHarness(unittest.TestCase):
         # Every capture-pane increments this; the paste logs `CAPTURES@<n>`, so a
         # test can aim a state flip at "the read before the paste" without hard-coding order.
         self.capture_count = self.root / "capture-count.txt"
+        # One line per has-session probe: the caller's pid and what the marker and results
+        # dirs held at that moment; after a paste the notifier probes only once has_result missed.
+        self.session_probe_log = self.root / "has-session.log"
         # Holds N: on the Nth capture the footer flips to BUSY (consumed once).
         self.busy_on_capture_flag = self.root / "busy-on-capture.flag"
         # Holds N: on the Nth capture a trust gate replaces the pane (consumed once).
@@ -284,6 +287,7 @@ history_size() {{
 }}
 case "$cmd" in
   has-session)
+    printf 'PROBE pid=%s markers=%s results=%s\n' "$PPID" "$(ls "{self.inflight_dir}" 2>/dev/null | tr '\n' ',')" "$(ls "{self.results_dir}" 2>/dev/null | tr '\n' ',')" >> "{self.session_probe_log}"
     [ -f "{self.session_flag}" ] && exit 0
     exit 1
     ;;
@@ -557,6 +561,15 @@ esac
                 f"Delivered by the standby: no session-role watcher holds {self.tasks_dir}. "
                 f'Re-arm yours via the Monitor tool: bash "{REPO}/src/watch-tasks-stream.sh" '
                 f'"{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"')
+
+    def no_result_polls(self, pid, name):
+        """has-session probes by pid that found name's marker present and its result absent."""
+        n = 0
+        for line in (self.session_probe_log.read_text() if self.session_probe_log.exists() else "").splitlines():
+            m = re.match(r"PROBE pid=(\d+) markers=(\S*) results=(\S*)$", line)
+            if m and int(m.group(1)) == pid and name in m.group(2).split(",") and name not in m.group(3).split(","):
+                n += 1
+        return n
 
     def sendkeys_log_text(self):
         return self.sendkeys_log.read_text()
