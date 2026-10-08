@@ -91,6 +91,9 @@ The goal of this phase is to confirm the PR is necessary at all. In rough order 
 PRs with a `fix:` / `fix(scope):` title or the `bug` label must fill in
 `Regression test:` (test file/name and command) and `Regression evidence:`
 (actual failing-before/passing-after output or a link to that evidence).
+Keep each field value on the **same line** as its label. For multiline output,
+put a link or a reference such as `see Before / after evidence below` on that
+line, and paste the output in the referenced section.
 Alternatively, fill in `Regression exception:` with a concrete reason a
 regression test is not practical. Existing reviewers assess both evidence
 and exceptions; this adds no approval or test-suite run. Non-bug-fix PRs
