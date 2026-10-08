@@ -11965,6 +11965,7 @@ def _runs_a_script(command: str) -> bool:
 _HOOK_FAMILY_INSTALLERS = {
     "personal-claude-compact-hint.sh": "scripts/install-personal-claude-hook.sh",
     "schedule-crons-session-hint.sh": "scripts/install-session-start-hook.sh",
+    "watcher-rearm-session-hint.sh": "scripts/install-watcher-rearm-hook.sh",
 }
 
 
