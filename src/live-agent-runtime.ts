@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 import { injectText } from './browser-tools.js';
+import { meetingHoldsModel } from './meeting-input-hold.js';
 import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull, frameTaskResult, framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher } from './task-bridge.js';
@@ -93,7 +94,27 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		return false;
 	});
 
-	startResultWatcher((result, deliveryNote) => {
+	// Results that land during a meeting wait until it ends: the model must not speak in
+	// meeting mode, and the result must not be lost either.
+	const heldForMeeting: Array<{ result: string; deliveryNote?: string }> = [];
+	let heldTimer: ReturnType<typeof setInterval> | null = null;
+	const holdForMeeting = (result: string, deliveryNote?: string) => {
+		heldForMeeting.push({ result, deliveryNote });
+		console.log(`${ts()} [TaskBridge] Meeting mode: holding the result until the meeting ends (${heldForMeeting.length} held)`);
+		heldTimer ??= setInterval(() => {
+			if (meetingHoldsModel(session)) return;
+			clearInterval(heldTimer!);
+			heldTimer = null;
+			for (const held of heldForMeeting.splice(0)) deliverResult(held.result, held.deliveryNote);
+		}, 2_000);
+		heldTimer.unref?.();
+	};
+
+	const deliverResult = (result: string, deliveryNote?: string) => {
+		if (meetingHoldsModel(session)) {
+			holdForMeeting(result, deliveryNote);
+			return;
+		}
 		console.log(`${ts()} [TaskBridge] Delivering result to user${deliveryNote ? ' (with a delivery note)' : ''}`);
 		// Re-check session state inside the timer rather than at callback
 		// time. Reason: TaskBridge delivers `voice-*.txt` results the
@@ -107,6 +128,10 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		// (Gemini setup completed 106ms later). Now the check fires at
 		// T+1500ms when setup is reliably finished.
 		const inject = () => {
+			if (meetingHoldsModel(session)) {
+				holdForMeeting(result, deliveryNote);
+				return true;
+			}
 			if (session.sessionManager.isActive && session.clientConnected) {
 				// The note sits OUTSIDE the TASK_RESULT markers: it is delivery
 				// state the model acts on, not result text it must only summarise.
@@ -153,7 +178,8 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				}
 			},
 		});
-	}, () => session.clientConnected);
+	};
+	startResultWatcher(deliverResult, () => session.clientConnected);
 }
 
 // ── Session observability recorder (step 5a-3) ───────────────────────────────
