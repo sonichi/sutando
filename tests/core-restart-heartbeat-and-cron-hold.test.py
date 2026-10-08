@@ -222,6 +222,24 @@ class EnsureRunningIsIdempotent(unittest.TestCase):
         self.assertIn("stopped 0 writer(s)", self._stop())
         self.assertIsNone(proc.poll(), "--stop killed another checkout's writer")
 
+    def test_ensure_starts_its_own_writer_past_another_checkouts(self):
+        other = self.td / "other"
+        shutil.copytree(self.root / "src", other / "src", symlinks=True)
+        shutil.copytree(self.root / "scripts", other / "scripts", symlinks=True)
+        self._workspace(other)
+        proc = self._relative_writer(other, "other")
+        time.sleep(1)
+        ws = self._workspace(self.root)
+        # A stale .alive here names the foreign writer; adopting it would leave this core unbeaten.
+        host = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, 'src');"
+                               "import core_heartbeat; print(core_heartbeat._alive_path().name)"],
+                              cwd=self.root, env=self.env, capture_output=True, text=True).stdout.strip()
+        (ws / "state" / "cores" / host).write_text(json.dumps({"heartbeat_pid": proc.pid}))
+        out = self._ensure()
+        self.assertIn("started writer", out)
+        self.assertNotIn(f"(pid {proc.pid})", out)
+        self.assertIsNone(proc.poll(), "--ensure disturbed another checkout's writer")
+
     def test_writer_exits_when_its_checkout_is_removed(self):
         self._ensure()
         pid = self.started[0]
@@ -378,17 +396,21 @@ class EnsureInProcess(unittest.TestCase):
 
     def test_running_writer_pids_filters_candidates(self):
         ch, s = self.ch, str(self.ch._SCRIPT)
-        ch._recorded_writer_pids = lambda: [1, 501]
+        ch._recorded_writer_pids = lambda: [1, 501, 505]
         args = {501: "python3 src/core_heartbeat.py", 502: f"python3 {s}", 503: f"python3 {s} --stop",
-                504: OSError("ps gone")}
+                504: OSError("ps gone"), 505: "python3 src/core_heartbeat.py"}
+        cwds = {501: str(ch._SCRIPT.parent.parent), 505: str(self.td)}  # 505: another checkout's writer
         pg = _cp(0, f"502\n503\n504\n{os.getpid()}\n")
-        with unittest.mock.patch.object(ch.subprocess, "run", self._fake_run(pg, args)):
+        with unittest.mock.patch.object(ch.subprocess, "run", self._fake_run(pg, args)), \
+             unittest.mock.patch.object(ch, "_pid_cwd", side_effect=cwds.get):
             self.assertEqual(ch.running_writer_pids(), [501, 502])
 
     def test_running_writer_pids_pgrep_outcomes(self):
         ch = self.ch
         ch._recorded_writer_pids = lambda: [601]
         args = {601: "python3 src/core_heartbeat.py"}
+        self.addCleanup(unittest.mock.patch.stopall)
+        unittest.mock.patch.object(ch, "_pid_cwd", return_value=str(ch._SCRIPT.parent.parent)).start()
         with unittest.mock.patch.object(ch.subprocess, "run", self._fake_run(_cp(1), args)):
             self.assertEqual(ch.running_writer_pids(), [601])
         with unittest.mock.patch.object(ch.subprocess, "run", self._fake_run(OSError("no pgrep"), args)):

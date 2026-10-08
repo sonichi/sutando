@@ -119,7 +119,8 @@ def _load_runtime_health():
 # Claude Code's weekly Fable-consent dialog (title / body); Enter is safe there only
 # with the caret on its "Switch to <fallback> and continue" row.
 from delivery.pane_gate import (  # noqa: E402
-    AWAIT_HINT, BORDER_LINE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE, COMPOSER_PLACEHOLDER, FABLE_TEXT,
+    ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
+    COMPOSER_PLACEHOLDER, FABLE_TEXT, classify_pane as _pg_classify_pane,
     composer_text as _pg_composer_text,
 )
 
@@ -242,13 +243,22 @@ def classify(pane: str):
     return "unknown", tail
 
 
-def _is_idle_ready(pane: str) -> bool:
+def _is_idle_ready(pane: str, runtime: "str | None" = None) -> bool:
     """True when the pane POSITIVELY shows the idle-ready prompt (the bypass /
     for-agents footer) and no gate signature — the core is sitting ready for a
     task. Distinct from `classify(pane) is None`, which is ALSO None for a
     no-affordance pane (mid-processing / blank / frozen); that must NOT be read as
-    idle. Mirrors classify()'s idle-footer suppression."""
+    idle. Mirrors classify()'s idle-footer suppression.
+
+    `runtime` is the session's own stamp. A non-Claude pane draws a different idle
+    footer, which pane_gate's adapter for that runtime reads; None keeps Claude's.
+    The capture is unstyled, so a dim placeholder reads as a draft: under the footer
+    both are a composer at rest, as Claude's footer rule already treats them."""
     tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
+    adapter = ADAPTERS.get(runtime or "")
+    if adapter is not None and adapter is not CLAUDE:
+        state = _pg_classify_pane(pane, adapter).state
+        return state == "idle-ready" or (state == "pending" and bool(adapter.idle_ready.search(tail)))
     return bool(_IDLE.search(tail)) and classify(pane) is None
 
 
@@ -328,7 +338,7 @@ _BASE_TO_STATE = {
 }
 
 
-def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None):
+def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime=None):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -339,6 +349,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     `process` is runtime-health's `signals.process` tri-state: True (session
     seen), False (server answered "no session"), None (the probe could not run).
     `prev_pane` is the previous poll's capture, the only evidence a turn is moving.
+    `runtime` is the runtime stamped on the core session (see `session_runtime`).
     """
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
@@ -378,7 +389,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         # direct evidence over the stale status file: it's idle, not wedged. Only
         # a positive idle match overrides — a no-affordance pane (mid-work or truly
         # frozen) still reads hung, preserving genuine wedge detection.
-        if pane and _is_idle_ready(pane):
+        if pane and _is_idle_ready(pane, runtime):
             return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
         if pane and _turn_moving(pane, prev_pane):
             return "running", _BASE_TO_STATE["working"][1], None, None
@@ -490,6 +501,20 @@ def gateway_alive(app_data, state_dir=None):
     # primary. Same reasoning as startup.sh's launcher P1; instance-aware
     # probing tracked separately.
     return _pgrep("remote-gateway-bridge")
+
+
+def session_runtime(socket, session):
+    """The runtime the start-cli launcher stamped on the core session, or None.
+
+    Read every poll: a runtime switch relaunches the core on the same socket, so a
+    monitor started for the previous runtime keeps watching the new one."""
+    try:
+        r = subprocess.run(["tmux", "-S", socket, "show-environment", "-t", f"={session}",
+                            "SUTANDO_CORE_RUNTIME"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (r.stdout or "").strip() if r.returncode == 0 else ""
+    return out.split("=", 1)[1].strip() or None if out.startswith("SUTANDO_CORE_RUNTIME=") else None
 
 
 def capture(socket, session):
@@ -809,7 +834,8 @@ def main():
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
-            process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane)
+            process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane,
+            runtime=session_runtime(a.socket, a.session))
         prev_pane = pane
         clock = gate_clock(clock, state, prompt, time.time())
 

@@ -355,9 +355,11 @@ forward_skill_manifest_config() {
   unset _mc_seen _mcrec
 }
 
-# Registers the PERSONAL_CLAUDE.md compaction-reinject hook. Idempotent.
+# Registers the post-compaction SessionStart hooks: PERSONAL_CLAUDE.md re-inject
+# and the task-watcher re-arm hint. Idempotent.
 install_claude_personal_hook() {
   bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "session-launch: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
+  bash "$REPO/scripts/install-watcher-rearm-hook.sh" || echo "session-launch: watcher re-arm hook install failed (rc=$?) — hook may be absent" >&2
 }
 
 # Creates a new tmux session running claude with the fully-assembled args, then
