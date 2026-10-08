@@ -24,15 +24,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from task_archive import find_task_file  # noqa: E402
-from local_task_protocol import host_zone_name, serialize_task_last  # noqa: E402
+from local_task_protocol import serialize_task_last  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 
 
 LABEL = "com.sutando.codex-schedules"
 STATE_VERSION = 1
-# The host's own zone; Los Angeles only when the host names none.
-DEFAULT_TIMEZONE = host_zone_name() or "America/Los_Angeles"
+DEFAULT_TIMEZONE = "America/Los_Angeles"
 DEFAULT_RETRY_MINUTES = 15
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_ACTIVE_STALE_MINUTES = 60
