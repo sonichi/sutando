@@ -844,7 +844,7 @@ submit_task_grown() {
   fi
   restore_window
   started="$(date +%s)"
-  checked=0
+  checked="$started"
   while ! has_result "$filename"; do
     tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || return 0
     if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
