@@ -11,8 +11,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import io
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -283,6 +285,188 @@ class HookTests(unittest.TestCase):
                                  "SUTANDO_WORKSPACE": str(self.ws)})
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIsNotNone(json.loads(self.marker.read_text())["recovered_at"], r.stderr)
+
+
+class InProcessCliTests(unittest.TestCase):
+    """`_main` and the hook handlers called directly, so coverage measures them (subprocesses are not)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.state = root / "state"
+        self.inflight = self.state / "task-notifier-inflight"
+        self.results = root / "results"
+        self.tasks = root / "tasks"
+        for d in (self.inflight, self.results, self.tasks):
+            d.mkdir(parents=True)
+        self.name = "task-y.txt"
+        (self.tasks / self.name).write_text("task: y\n")
+        marker = self.inflight / self.name
+        marker.write_text("1\n")
+        os.utime(marker, (1000, 1000))
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for k in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT", "SUTANDO_CORE_SESSION"):
+            os.environ.pop(k, None)
+
+    def main(self, *argv, stdin=""):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)), \
+                mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+            rc = tf._main(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
+    def st(self):
+        return ["--state", str(self.state)]
+
+    def due_args(self, *extra):
+        return ["retry-due", *self.st(), "--inflight-dir", str(self.inflight), "--results-dir",
+                str(self.results), "--payload", str(self.tasks / self.name), *extra, self.name]
+
+    def hook(self, cmd, payload):
+        return self.main(cmd, *self.st(), stdin=payload if isinstance(payload, str) else json.dumps(payload))
+
+    def test_no_arguments_prints_usage_and_exits_2(self):
+        rc, out, err = self.main()
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn("usage:", err)
+
+    def test_missing_state_fails_a_command_but_never_a_hook(self):
+        for cmd in ("hook-turn-start", "hook-stop-failure", "record-recovery"):
+            with self.subTest(cmd=cmd):
+                rc, _, err = self.main(cmd)
+                self.assertEqual(rc, 0)
+                self.assertIn("usage:", err)
+        for argv in (("retry-note", "x"), ("retry-due",), ("--state",), ("bogus", "--state")):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.main(*argv)[0], 2)
+
+    def test_unknown_command_and_stray_arguments_exit_2_or_0_for_hooks(self):
+        self.assertEqual(self.main("bogus", *self.st())[0], 2)
+        self.assertEqual(self.main("retry-note", *self.st())[0], 2)
+        self.assertEqual(self.main("retry-clear", *self.st(), "a", "b")[0], 2)
+        for cmd in ("hook-turn-start", "hook-stop-failure", "record-recovery"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.main(cmd, *self.st(), "extra")[0], 0)
+
+    def test_retry_due_exit_codes_in_process(self):
+        rc, out, _ = self.main(*self.due_args())
+        self.assertEqual((rc, out), (1, ""))
+        tf.record_failure(self.state, "overloaded", "s", now=time.time() - 60, task=self.name)
+        rc, out, _ = self.main(*self.due_args())
+        self.assertEqual(rc, 0)
+        self.assertIn("overloaded", out)
+        for n in range(1, tf.MAX_ATTEMPTS + 1):
+            rc, out, _ = self.main("retry-note", *self.st(), self.name)
+            self.assertEqual((rc, out.strip()), (0, str(n)))
+        rc, out, _ = self.main(*self.due_args())
+        self.assertEqual(rc, 3)
+        self.assertIn("not re-delivering", out)
+        self.assertEqual(self.main(*self.due_args())[0], 1, "the give-up was reported twice")
+        self.assertEqual(self.main("retry-clear", *self.st(), self.name)[0], 0)
+        self.assertEqual(tf.read_retry(self.state, self.name), (0, 0.0))
+        self.assertEqual(self.main(*self.due_args())[0], 0)
+
+    def test_retry_due_usage_errors_exit_2(self):
+        base = ["retry-due", *self.st()]
+        self.assertEqual(self.main(*base, self.name)[0], 2)
+        self.assertEqual(self.main(*self.due_args("extra"))[0], 2)
+        rc, _, err = self.main(*base, "--inflight-dir")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+
+    def test_retry_due_with_a_deliveries_dir(self):
+        tf.record_failure(self.state, "server_error", "s", now=time.time() - 60, task=self.name)
+        pool = Path(self._tmp.name) / "deliveries"
+        self.assertEqual(self.main(*self.due_args("--deliveries-dir", str(pool)))[0], 0)
+        (pool / "w").mkdir(parents=True)
+        (pool / "w" / self.name).write_text("")
+        self.assertEqual(self.main(*self.due_args("--deliveries-dir", str(pool)))[0], 1)
+
+    def test_an_unreadable_pool_is_not_due(self):
+        tf.record_failure(self.state, "server_error", "s", now=1010, task=self.name)
+        with mock.patch("delivery.task_dispatch.worker_holds", side_effect=OSError("denied")):
+            self.assertIsNone(tf.retry_due(self.state, self.inflight, self.results, self.tasks / self.name,
+                                           self.name, deliveries_dir=self.tasks, now=5000))
+
+    def test_a_bad_filename_is_rejected(self):
+        for name in ("../x", "a/b", ""):
+            with self.subTest(name=name):
+                rc, _, err = self.main("retry-note", *self.st(), name)
+                self.assertEqual(rc, 2)
+                self.assertIn("not a task filename", err)
+
+    def test_a_failed_write_leaves_no_temp_file(self):
+        path = self.state / "x" / "rec.json"
+        with self.assertRaises(TypeError):
+            tf._write_json(path, {"bad": object()})
+        self.assertEqual(list(path.parent.iterdir()), [])
+
+    def test_turn_start_then_stop_failure_blames_the_task(self):
+        prompt = f"Sutando task ready: {self.name}. Read it"
+        self.assertEqual(self.hook("hook-turn-start", {"hook_event_name": "UserPromptSubmit",
+                                                        "session_id": "s1", "prompt": prompt})[0], 0)
+        self.assertEqual(tf.read_turn(self.state)["task"], self.name)
+        self.assertEqual(self.hook("hook-stop-failure", {"hook_event_name": "StopFailure",
+                                                          "session_id": "s1", "error": "server_error"})[0], 0)
+        self.assertIsNone(tf.read_turn(self.state), "the failed turn was not ended")
+        rec = tf.read_failure(self.state)
+        self.assertEqual((rec["task"], rec["session_id"], rec["error"]), (self.name, "s1", "server_error"))
+
+    def test_turn_start_with_a_non_string_session_and_empty_stdin(self):
+        self.hook("hook-turn-start", {"session_id": 7, "prompt": f"Sutando task ready: {self.name}."})
+        self.assertEqual(tf.read_turn(self.state)["session_id"], "")
+        self.assertEqual(self.main("hook-turn-start", *self.st(), stdin="")[0], 0)
+        self.assertIsNone(tf.read_turn(self.state)["task"])
+
+    def test_stop_failure_in_another_session_blames_no_task(self):
+        tf.record_turn_start(self.state, f"Sutando task ready: {self.name}.", "core")
+        self.hook("hook-stop-failure", {"hook_event_name": "StopFailure", "session_id": "other",
+                                        "error": "overloaded"})
+        self.assertIsNone(tf.read_failure(self.state)["task"])
+
+    def test_stop_failure_without_a_session_or_with_a_bad_one_keeps_the_task(self):
+        for session in (None, 7):
+            with self.subTest(session=session):
+                tf.record_turn_start(self.state, f"Sutando task ready: {self.name}.", "core")
+                self.hook("hook-stop-failure", {"hook_event_name": "StopFailure", "session_id": session,
+                                                "error": "rate_limit"})
+                self.assertEqual(tf.read_failure(self.state)["task"], self.name)
+
+    def test_stop_failure_with_a_non_string_error_records_nothing_but_ends_the_turn(self):
+        tf.record_turn_start(self.state, "hello", "s")
+        self.hook("hook-stop-failure", {"hook_event_name": "StopFailure", "error": 7})
+        self.assertIsNone(tf.read_failure(self.state))
+        self.assertIsNone(tf.read_turn(self.state))
+
+    def test_hooks_ignore_bad_or_foreign_payloads(self):
+        for stdin in ("not json", "[1, 2]", json.dumps({"hook_event_name": "Stop", "error": "server_error",
+                                                         "prompt": "Sutando task ready: t."})):
+            for cmd in ("hook-turn-start", "hook-stop-failure"):
+                with self.subTest(cmd=cmd, stdin=stdin):
+                    rc, out, _ = self.hook(cmd, stdin)
+                    self.assertEqual((rc, out), (0, ""))
+                    self.assertIsNone(tf.read_turn(self.state))
+                    self.assertIsNone(tf.read_failure(self.state))
+
+    def test_record_recovery_ends_the_turn_and_stamps_once(self):
+        tf.record_turn_start(self.state, "hello", "s")
+        self.assertEqual(self.main("record-recovery", *self.st())[0], 0)
+        self.assertIsNone(tf.read_turn(self.state))
+        self.assertIsNone(tf.read_failure(self.state))
+        tf.record_failure(self.state, "server_error", "s", now=10, task=self.name)
+        self.assertEqual(self.main("record-recovery", *self.st())[0], 0)
+        self.assertIsNotNone(tf.read_failure(self.state)["recovered_at"])
+
+    def test_a_hook_error_is_reported_but_exits_0(self):
+        blocked = Path(self._tmp.name) / "file-not-dir"
+        blocked.write_text("x")
+        rc, _, err = self.main("hook-stop-failure", "--state", str(blocked),
+                               stdin=json.dumps({"hook_event_name": "StopFailure", "error": "overloaded"}))
+        self.assertEqual(rc, 0)
+        self.assertIn("turn_failure.py hook-stop-failure:", err)
 
 
 if __name__ == "__main__":
