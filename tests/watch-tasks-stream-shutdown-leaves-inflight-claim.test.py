@@ -89,6 +89,7 @@ LEAVING = "to the next watcher's sweep"
 # The real router, with a linger before or after it so a kill lands mid-route.
 # The transition hook: sleeps inside the named transition so a TERM lands there.
 HOOK = '''#!/bin/bash
+echo "$1 $2 $PPID" >> "$CTRL/transitions"
 [ "$1" = "$(cat "$CTRL/pause-at" 2>/dev/null)" ] || exit 0
 echo "hook $1 $2" >> "$CTRL/log"
 sleep 60
@@ -328,6 +329,14 @@ def poke(w: Workspace, w2: Watcher, name: str) -> None:
 
 def in_hook(w: Workspace, transition: str) -> bool:
     return any(ln.startswith(f"hook {transition} ") for ln in w.log())
+
+
+def claim_attempts(w: Workspace, wt: Watcher, name: str) -> int:
+    """How often this watcher reached `before-claim` for the task: the hook's
+    parent is the watcher, so its pid tells the two watchers' attempts apart."""
+    p = w.ctrl / "transitions"
+    want = f"before-claim {name} {wt.proc.pid}"
+    return sum(1 for ln in p.read_text().splitlines() if ln == want) if p.is_file() else 0
 
 
 def arm_barrier(sub: str, transition: str, delivered_before_kill: bool) -> None:
@@ -761,10 +770,11 @@ def arm_handler_overlap_lost_acquisition_recovers(sig: str = "TERM") -> None:
         w.mode("normal")
         w2 = Watcher(w, role="session")
         w2.start()
-        # A lost acquisition is held without a log line, so this wait stays
-        # time-based: four retry intervals.
-        time.sleep(4.0)
-        check("the session watcher did not route it while the owner lived (several timer passes)",
+        # The sweep is the first attempt; a second one can only come from the timer.
+        check("the session watcher re-asked the claim on its timer while the owner lived",
+              wait_for(lambda: claim_attempts(w, w2, "task-v.txt") >= 2, 20.0),
+              f"{claim_attempts(w, w2, 'task-v.txt')} attempt(s)")
+        check("...and lost every time: nothing routed, the owner's claim intact",
               router_runs(w) == 0 and w.claim_pid("task-v.txt") == str(w1.proc.pid), str(w.log()))
         if sig == "KILL":
             os.killpg(os.getpgid(w1.proc.pid), signal.SIGKILL)   # no settle, no log line
