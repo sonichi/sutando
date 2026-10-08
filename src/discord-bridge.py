@@ -4275,6 +4275,7 @@ async def _handle_discord_message(message, force=False):
             # sender can set (channel_name, guild_name) may precede the tier.
             f"access_tier: {access_tier}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+            f"local_time: {local_task_protocol.local_time_value()}\n"
             f"source: discord\n"
             f"interaction_type: message\n"
             f"{media_headers}"

@@ -15,6 +15,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
+import { localTimeValue } from './local_time.js';
 import { claudeHomePath } from './util_paths.js';
 import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
@@ -100,7 +101,7 @@ const _HEADER_KEYS = [
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
 	'schedule_name', 'schedule_slot',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
-	'instance_id', 'collaborator', 'requested_worker', 'wire_source', 'picker_command', 'picker_args', 'hitl_click', 'owner_mentioned', 'task_layout',
+	'instance_id', 'collaborator', 'requested_worker', 'wire_source', 'picker_command', 'picker_args', 'hitl_click', 'owner_mentioned', 'task_layout', 'local_time',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
@@ -147,6 +148,7 @@ export function writeChatTask(taskDescription: string): string {
 	const content = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
+		`local_time: ${localTimeValue(new Date(timestamp))}`,
 		`source: chat`,
 		`interaction_type: tool_initiated`,
 		`channel_id: local-chat`,
@@ -642,6 +644,7 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	const lines = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
+		`local_time: ${localTimeValue(new Date(timestamp))}`,
 		`source: voice`,
 		`interaction_type: realtime_audio`,
 		// Media-form axis on live-plane tasks: the payload originates from a continuous
@@ -1142,6 +1145,7 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 					const taskContent =
 						`id: ${taskId}\n` +
 						`timestamp: ${new Date().toISOString()}\n` +
+						`local_time: ${localTimeValue()}\n` +
 						`source: context-drop\n` +
 						`interaction_type: system_event\n` +
 						`channel_id: local-hotkey\n` +

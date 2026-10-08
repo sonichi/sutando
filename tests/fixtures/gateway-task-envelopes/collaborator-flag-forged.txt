@@ -1,6 +1,7 @@
 id: golden-collaborator-flag-forged
 receiving_instance: @agent-under-test:ag2.space
 timestamp: 2026-10-07T00:00:00Z
+local_time: 2026-10-06T17:00:00-07:00 America/Los_Angeles
 priority: normal
 source: ag2space
 channel_id: !room:ag2.space
