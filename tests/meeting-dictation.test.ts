@@ -3,22 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { STTProvider } from 'bodhi-realtime-agent';
+import type { DictationTranscriptEvent } from 'bodhi-realtime-agent';
 import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase } from '../src/meeting-dictation.js';
-
-class StubProvider implements STTProvider {
-	onTranscript?: (text: string, turnId: number | undefined) => void;
-	onPartialTranscript?: (text: string) => void;
-	configure(): void {}
-	async start(): Promise<void> {}
-	async stop(): Promise<void> {}
-	feedAudio(): void {}
-	commit(): void {}
-	handleInterrupted(): void {}
-	handleTurnComplete(): void {}
-	/** A final line, as the transcription model delivers it. */
-	say(text: string): void { this.onTranscript?.(text, undefined); }
-}
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
@@ -63,16 +49,26 @@ describe('meeting dictation', () => {
 		const buffer: string[] = [];
 		const injected: string[] = [];
 		let exitedByVoice = 0;
-		const provider = new StubProvider();
-		provider.onTranscript = (t) => { buffer.push(t); };
+		const listeners: Array<(e: DictationTranscriptEvent) => void> = [];
+		// Like bodhi: outside agent mode a final is buffered first, then sent to subscribers.
+		const emit = (text: string, partial: boolean) => {
+			if (mode === 'agent') return;
+			if (!partial) buffer.push(text);
+			for (const l of listeners) l({ text, partial });
+		};
+		const provider = { say: (text: string) => emit(text, false), partial: (text: string) => emit(text, true) };
 		const session = {
 			setTranscriptionMode: async (m: 'agent' | 'transcription') => { mode = m; },
 			getTranscriptionMode: () => mode,
 			clearDictationBuffer: () => { buffer.length = 0; },
 			injectText: async (t: string) => { injected.push(t); return true; },
+			onDictationTranscript: (l: (e: DictationTranscriptEvent) => void) => {
+				listeners.push(l);
+				return () => { listeners.splice(listeners.indexOf(l), 1); };
+			},
 		};
 		const md = attachMeetingDictation({
-			session, provider, notePathFor: (d) => join(dir, `notes/meeting-${d}.md`),
+			session, notePathFor: (d) => join(dir, `notes/meeting-${d}.md`),
 			onExitByVoice: () => { exitedByVoice++; }, log: () => {},
 		});
 		return { md, provider, buffer, injected, get mode() { return mode; }, get exitedByVoice() { return exitedByVoice; } };
@@ -97,6 +93,15 @@ describe('meeting dictation', () => {
 		assert.equal(t.injected.length, 1);
 		assert.match(t.injected[0], /2 lines/);
 		assert.match(t.injected[0], /<MEETING_TRANSCRIPT_START>\nfirst point\nsecond point\n<MEETING_TRANSCRIPT_END>$/, 'the agent gets what was said');
+	});
+
+	it('takes finals from the dictation subscription and ignores partials', async () => {
+		const t = setup();
+		await t.md.enter();
+		t.provider.partial('first po');
+		t.provider.say('first point');
+		assert.match(readFileSync(t.md.notePath!, 'utf-8'), /## Transcript[^\n]*\n- \[[\d:]+\] first point\n$/);
+		assert.deepEqual(t.buffer, ['first point'], 'bodhi keeps its own buffer');
 	});
 
 	it('keeps the words spoken before the exit phrase in the same segment', async () => {

@@ -6,7 +6,7 @@
 
 import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { STTProvider } from 'bodhi-realtime-agent';
+import type { DictationTranscriptEvent } from 'bodhi-realtime-agent';
 import { framedSystem } from './inject-framing.js';
 
 const EXIT_PATTERN =
@@ -107,11 +107,12 @@ export interface MeetingDictationSession {
 	getTranscriptionMode(): 'agent' | 'transcription';
 	clearDictationBuffer(): void;
 	injectText(text: string, opts: { mode: 'live' | 'quiet' }): Promise<boolean>;
+	/** Every transcript line while not in agent mode; finals are already in the dictation buffer. */
+	onDictationTranscript(listener: (event: DictationTranscriptEvent) => void): () => void;
 }
 
 export interface MeetingDictationDeps {
 	session: MeetingDictationSession;
-	provider: STTProvider;
 	/** Resolved per meeting so a meeting crossing midnight keeps one file. */
 	notePathFor: (today: string) => string;
 	/** Called after an exit phrase returned the session to agent mode. */
@@ -129,22 +130,20 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 	let notePath: string | null = null;
 	let lines: string[] = [];
 	let exiting = false;
-	const bufferSink = deps.provider.onTranscript;
 
-	deps.provider.onTranscript = (text, turnId) => {
-		if (!text) return;
+	deps.session.onDictationTranscript(({ text, partial }) => {
+		if (partial || !text) return;
 		const command = findExitCommand(text);
 		if (command) {
 			deps.log(`[MeetingDictation] exit phrase heard: "${text}"`);
-			if (command.before) record(command.before, turnId);
+			if (command.before) record(command.before);
 			void exit({ byVoice: true });
 			return;
 		}
-		record(text, turnId);
-	};
+		record(text);
+	});
 
-	function record(text: string, turnId: number | undefined): void {
-		bufferSink?.(text, turnId);
+	function record(text: string): void {
 		if (notePath) {
 			try {
 				appendTranscriptLine(notePath, text, now());

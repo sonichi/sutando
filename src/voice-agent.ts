@@ -1252,7 +1252,6 @@ async function main() {
 	sessionRef = session;
 	meetingDictation = attachMeetingDictation({
 		session: session as any,
-		provider: meetingTranscriber,
 		notePathFor: (today) => sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR),
 		onExitByVoice: () => {
 			noteMeetingState(false);
