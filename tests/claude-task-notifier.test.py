@@ -507,8 +507,18 @@ esac
 
     def _env(self, extra=None):
         env = dict(os.environ)
+        # A pool worker's shell routes its inbox through these; inherited, they reclassify
+        # the fixture's tasks (a deliveries inbox skips the worker-held check).
+        for k in ("SUTANDO_INBOX_KIND", "SUTANDO_INBOX_RESOLVER", "SUTANDO_INBOX_RESOLVER_TIMEOUT",
+                  "SUTANDO_INSTANCE", "SUTANDO_INSTANCE_ID", "SUTANDO_POOL_DELIVERY_SCRIPT",
+                  "SUTANDO_WATCHER_BEAT", "SUTANDO_WATCHER_TRANSITION_HOOK"):
+            env.pop(k, None)
         env.update({
             "PATH": f"{self.bin}:{env.get('PATH', '/usr/bin:/bin')}",
+            # The notifier derives state/ from the workspace and its queue from TMPDIR;
+            # inherited values would put both outside the fixture (the live core's, in a core shell).
+            "SUTANDO_WORKSPACE_DIR": str(self.tasks_dir.parent),
+            "TMPDIR": str(self.root),
             "SUTANDO_TMUX_SOCKET": str(self.root / "fake.sock"),
             "SUTANDO_TMUX_SESSION": "sutando-core-test",
             "SUTANDO_TASKS_DIR": str(self.tasks_dir),

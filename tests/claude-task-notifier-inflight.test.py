@@ -298,14 +298,28 @@ class MainLoopWiringTest(FakeTmuxHarness):
             time.sleep(0.1)
         self.fail(msg)
 
+    def _queue_entry(self, name):
+        # The notifier queues each announced task under its TMPDIR event dir and drops
+        # the entry only once has_result has seen the result: the pickup witness.
+        hits = list(self.root.glob(f"sutando-claude-task-notifier.*/queue/{name}"))
+        self.assertEqual(len(hits), 1, f"expected one queue entry for {name}, found {hits}")
+        return hits[0]
+
     def _finish(self, name, timeout=10):
         # The main loop ends only with its watcher, so a process-exit wait after a
-        # result proves nothing; the marker's clearing is what a pickup proves.
+        # result proves nothing; pickup is the queue entry going, marker already clear.
         marker = self.inflight_dir / name
         self._wait_until(marker.is_file, timeout, f"no in-flight marker for {name} after its paste")
+        queued = self._queue_entry(name)
+        # Five completion polls (0.1 s each) with no result on disk: a marker cleared
+        # ahead of its result would already be gone here.
+        time.sleep(0.5)
+        self.assertTrue(marker.is_file(), f"the in-flight marker for {name} cleared before any result existed")
+        self.assertTrue(queued.is_file(), f"{name} left the notifier's queue before any result existed")
         self.write_result(name)
-        self._wait_until(lambda: not marker.exists(), timeout,
-                         f"the in-flight marker for {name} outlived its result")
+        self._wait_until(lambda: not queued.exists(), timeout,
+                         f"the notifier never picked up the result for {name}")
+        self.assertFalse(marker.exists(), f"the in-flight marker for {name} outlived its pickup")
 
     def tearDown(self):
         """Every test in this class starts the real main loop, whose standby
