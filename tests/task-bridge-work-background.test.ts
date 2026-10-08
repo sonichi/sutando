@@ -15,7 +15,7 @@ process.env.SUTANDO_TEST_MODE = '1';
 mkdirSync(join(TMP, 'tasks'), { recursive: true });
 mkdirSync(join(TMP, 'results'), { recursive: true });
 
-const { workTool, startResultWatcher, _sweepTimeouts, _pendingTasksForTest } = await import('../src/task-bridge.js');
+const { workTool, startResultWatcher, _sweepTimeouts, _pendingTasksForTest, setResultPacing } = await import('../src/task-bridge.js');
 const { cancelTaskTool } = await import('../src/inline-tools.js');
 
 after(() => rmSync(TMP, { recursive: true, force: true }));
@@ -31,12 +31,29 @@ const newTaskIds = (before: Set<string>) =>
 const call = (task: string, signal: AbortSignal) => (workTool.execute as any)({ task }, { toolCallId: 'call-1', abortSignal: signal }) as Promise<unknown>;
 
 describe('work as a background tool', () => {
-	it('is declared background with a pending message that counts the tasks ahead', () => {
+	it('is declared background with a fixed pending message (bodhi copies it once per session)', () => {
 		assert.equal(workTool.execution, 'background');
-		writeFileSync(join(TMP, 'tasks', 'task-1.txt'), 'task: ahead\n');
+		assert.equal(typeof Object.getOwnPropertyDescriptor(workTool, 'pendingMessage')?.value, 'string', 'a value, not a getter');
 		assert.match(workTool.pendingMessage ?? '', /Do NOT tell the user it is done/);
-		assert.match(workTool.pendingMessage ?? '', /right after the one I'm on/);
-		rmSync(join(TMP, 'tasks', 'task-1.txt'));
+		assert.doesNotMatch(workTool.pendingMessage ?? '', /in line|right after/, 'no queue count frozen at session start');
+	});
+
+	it('waits for a pause in the conversation before handing the result to its call', async () => {
+		let pause!: () => void;
+		setResultPacing(() => new Promise<void>((r) => { pause = r; }));
+		const before = new Set(_pendingTasksForTest.keys());
+		let done: unknown;
+		const running = call('draw a cat', new AbortController().signal).then((r) => { done = r; });
+		await tick(50);
+		const [taskId] = newTaskIds(before);
+		writeFileSync(join(TMP, 'results', `${taskId}.txt`), 'Here is your cat.');
+		await tick(2_500);
+		assert.equal(done, undefined, 'held while the conversation is going');
+		pause();
+		await running;
+		assert.match(String(done), /Here is your cat\./);
+		assert.deepEqual(injected, []);
+		setResultPacing(async () => {});
 	});
 
 	it('resolves the call with its own framed result, without the task id, and injects nothing', async () => {

@@ -58,7 +58,8 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, publishResultFile } from './task-bridge.js';
+import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, publishResultFile, setResultPacing } from './task-bridge.js';
+import { createConversationPacer } from './conversation-pacing.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -1661,6 +1662,16 @@ async function main() {
 	);
 	session.eventBus.subscribe('turn.end', () => _duck('off'));
 	session.eventBus.subscribe('turn.interrupted', () => _duck('off'));
+
+	// A background `work` result waits for a pause instead of taking the next free turn
+	// (live: it cut in right after an interrupted answer, and that answer was never finished).
+	const pacer = createConversationPacer();
+	session.eventBus.subscribe('turn.start', () => pacer.onTurnStart());
+	session.eventBus.subscribe('turn.end', () => pacer.onTurnEnd());
+	session.eventBus.subscribe('turn.interrupted', () => pacer.onTurnInterrupted());
+	session.eventBus.subscribe('speech.user_started', () => pacer.onUserSpeechStarted());
+	session.eventBus.subscribe('speech.user_ended', () => pacer.onUserSpeechEnded());
+	setResultPacing(() => pacer.waitForQuiet());
 
 	const shutdown = async () => {
 		console.log(`\n${ts()} Shutting down...`);

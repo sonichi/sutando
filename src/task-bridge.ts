@@ -1046,6 +1046,29 @@ export function _settleResultWaiter(taskId: string, outcome: string, deliverable
 	return true;
 }
 
+/** Waits for a pause in the conversation before a result is handed to its call; set by the voice agent. */
+let _waitForPause: () => Promise<void> = async () => {};
+export function setResultPacing(waitForPause: () => Promise<void>): void {
+	_waitForPause = waitForPause;
+}
+
+/**
+ * Hands a result to its waiting call once the conversation pauses. The session is checked
+ * again after the wait; if it can no longer take the result, or the call has gone, `fallback`
+ * delivers it the old way. False when no call waits (the caller delivers it now).
+ */
+function _handOffWhenPaused(taskId: string, outcome: string, fallback: () => void): boolean {
+	if (!_resultWaiters.has(taskId)) return false;
+	if (!_canTakeResult()) {
+		_releaseResultWaiter(taskId);
+		return false;
+	}
+	void _waitForPause().then(() => {
+		if (!_settleResultWaiter(taskId, outcome, _canTakeResult())) fallback();
+	});
+	return true;
+}
+
 /** Releases a waiting call whose result goes another way (DM, origin, skip marker). */
 function _releaseResultWaiter(taskId: string): void {
 	_settleResultWaiter(taskId, '', false);
@@ -1087,13 +1110,10 @@ export const workTool: ToolDefinition = {
 	parameters: workParameters,
 	execution: 'background',
 	timeout: WORK_CALL_TIMEOUT_MS,
-	// Read by bodhi when the call is dispatched, before the task file is written,
-	// so every owner task already in tasks/ is ahead of this one.
-	get pendingMessage(): string {
-		return 'Task accepted and being worked on. Do NOT tell the user it is done — say you are working on it. ' +
-			'The result will come back to you on its own; do not call work again for it.' +
-			queuedAheadInstruction(countQueuedAhead(TASK_DIR, ''));
-	},
+	// bodhi copies this once, when it builds its tool registry at session start, so it must not
+	// depend on the moment of the call (a queue count read here was frozen for the whole session).
+	pendingMessage: 'Task accepted and being worked on. Do NOT tell the user it is done — say you are working on it. ' +
+		'The result will come back to you on its own; do not call work again for it.',
 	async execute(args, ctx) {
 		const submitted = await submitWork(args as WorkArgs);
 		// Without a live call (tests, other callers) the submission is the answer.
@@ -1362,7 +1382,8 @@ function startRelayResultWatcher(onResult: ResultListener, canTakeResult: () => 
 				// src/result_markers.py, which is case-insensitive and accepts `[deduped:]`.
 				if (!bodyIsSkipMarked(result)) {
 					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
-					if (!_settleResultWaiter(taskId, frameTaskResult(result), canTakeResult())) onResult(`[Task result for ${taskId}]\n${result}`);
+					const injected = `[Task result for ${taskId}]\n${result}`;
+					if (!_handOffWhenPaused(taskId, frameTaskResult(result), () => onResult(injected))) onResult(injected);
 				} else {
 					_releaseResultWaiter(taskId);
 				}
@@ -1721,7 +1742,7 @@ export function startResultWatcher(
 					if (keptToDm || taskOrigin) _releaseResultWaiter(taskId);
 					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE);
 					else if (taskOrigin) void _deliverOriginBoundResult(taskId, result, taskOrigin, onResult);
-					else if (!_settleResultWaiter(taskId, frameTaskResult(result), canTakeResult())) onResult(result);
+					else if (!_handOffWhenPaused(taskId, frameTaskResult(result), () => onResult(result))) onResult(result);
 					// Notify agent-api directly (task results only), then delete file
 					if (registersTask) {
 						try {
