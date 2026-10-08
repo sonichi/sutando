@@ -12,7 +12,9 @@ can see what every agent has scheduled.
 Rows are keyed per host and cron name, so two hosts never write each other's rows. sync owns the
 columns crons.json defines on the rows it created; "Last ran (UTC)" and "Last result" are written
 only by `touch`. Status is set by sync only on a new row, an entry gone from crons.json (Finished),
-a Finished row whose entry is back, or an empty cell; otherwise a Status set by `status` stays.
+a Finished row whose entry is back, an empty cell, or an entry whose crons.json status (Paused when
+`disabled: true` or DISABLED in the name) changed since the last sync; otherwise a Status set by
+`status` stays.
 
 A database already named "Crons" in the room is adopted in place: matching columns are reused,
 missing ones are added. A row sync did not create (adopted by its title) only has its empty cells
@@ -43,9 +45,11 @@ from cron_ownership import entry_owner  # noqa: E402
 from owner_room_access import (agent_identity, capability_scripts, owner_dm, owner_routing,  # noqa: E402
                                resolve_credentials)
 
-# (skill directory, CLI module, client module, its open function), canonical layout first.
-CAPABILITY_LAYOUTS = (("room-commons", "room_commons", "room_commons_client", "open_room_commons"),
-                      ("room-collab", "room_collab", "room_collab_client", "open_room_collab"))
+# (skill directory, CLI module, client module), canonical layout first.
+CAPABILITY_LAYOUTS = (("room-commons", "room_commons", "room_commons_client"),
+                      ("room-collab", "room_collab", "room_collab_client"))
+# The client's open function: the current name first; releases before the rename export only the second.
+OPENERS = ("open_room_commons", "open_room_collab")
 TIMEOUT_SEC = 120.0
 ROOM_KEY = "CRONS_TABLE_ROOM"
 DB_KEY = "CRONS_TABLE_DB"
@@ -334,13 +338,19 @@ def _split(derived: Optional[dict]) -> tuple:
     return d, ({"status": status} if status else {})
 
 
-def plan_sync(rd, maps: dict, db_name: str, host: str, rows: dict, by: str, now_ms: int) -> Plan:
+def plan_sync(rd, maps: dict, db_name: str, host: str, rows: dict, by: str, now_ms: int,
+              synced: Optional[dict] = None) -> Plan:
+    """`synced` is {name: status} as crons.json gave it at the last sync; an entry whose crons.json
+    status moved since then has it written, while a Status set by hand otherwise stays."""
     plan = Plan(rd, maps, db_name, by, now_ms)
+    synced = synced if isinstance(synced, dict) else {}
     kept = set()
     for name, values in rows.items():
         derived, start = _split(values)
         row = plan.find_row(host, name)
-        reset = row is not None and (plan._display(row, "status") == "Finished" or plan._empty(row, "status"))
+        moved = name in synced and synced[name] != values.get("status")
+        reset = row is not None and (moved or plan._display(row, "status") == "Finished"
+                                     or plan._empty(row, "status"))
         kept.add(plan.upsert(host, name, derived, start if reset else None, start))
     for name, row in plan.host_rows(host).items():
         if row not in kept and plan._display(row, "status") != "Finished":
@@ -399,12 +409,13 @@ def read_stamp(workspace: Path, host: str) -> dict:
         return {}
 
 
-def write_stamp(workspace: Path, host: str, digest: str, room: str, count: int) -> None:
+def write_stamp(workspace: Path, host: str, digest: str, room: str, rows: dict) -> None:
     p = Path(workspace) / "hosts" / host / STAMP
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(f".{p.name}.{os.getpid()}")
-    tmp.write_text(json.dumps({"ts": int(time.time()), "digest": digest, "room": room, "rows": count}) + "\n",
-                   encoding="utf-8")
+    statuses = {n: r.get("status") for n, r in rows.items()}
+    tmp.write_text(json.dumps({"ts": int(time.time()), "digest": digest, "room": room, "rows": len(rows),
+                               "statuses": statuses}) + "\n", encoding="utf-8")
     os.replace(tmp, p)
 
 
@@ -416,7 +427,7 @@ def target(workspace: Path, room_cli: Optional[str], environ) -> tuple:
     """(capability scripts dir, room, identity); Unavailable when any is missing."""
     roots = (Path(workspace) / "skills", REPO / "skills")
     scripts = next((s for s in (capability_scripts(roots, (skill,), (f"{cli}.py", f"{client}.py"))
-                                for skill, cli, client, _ in CAPABILITY_LAYOUTS) if s), None)
+                                for skill, cli, client in CAPABILITY_LAYOUTS) if s), None)
     if scripts is None:
         raise Unavailable("no room capability installed (" + " or ".join(x[0] for x in CAPABILITY_LAYOUTS) + ")")
     routing = owner_routing(workspace)
@@ -434,9 +445,12 @@ def load_capability(scripts: Path):
     may re-exec this process onto an interpreter that has its dependencies, before anything is written."""
     if str(scripts) not in sys.path:
         sys.path.insert(0, str(scripts))
-    _, cli, client, opener = next(x for x in CAPABILITY_LAYOUTS if (Path(scripts) / f"{x[2]}.py").is_file())
+    _, cli, client = next(x for x in CAPABILITY_LAYOUTS if (Path(scripts) / f"{x[2]}.py").is_file())
     cap = importlib.import_module(cli)
-    open_room = getattr(importlib.import_module(client), opener)
+    module = importlib.import_module(client)
+    open_room = next((getattr(module, n) for n in OPENERS if callable(getattr(module, n, None))), None)
+    if open_room is None:
+        raise ImportError(f"{client} exports none of {', '.join(OPENERS)}")
     import room_database
     return cap, open_room, room_database
 
@@ -509,12 +523,13 @@ def main(argv=None, environ=None, runner=run_plan) -> int:
             print(f"crons-table: not synced — {unavailable}")
             return EXIT_UNAVAILABLE
         digest = rows_digest(rows, room, db_name)
-        if not args.force and read_stamp(workspace, host).get("digest") == digest:
+        stamp = read_stamp(workspace, host)
+        if not args.force and stamp.get("digest") == digest:
             print(f"crons-table: unchanged ({len(rows)} rows for {host}; digest {digest})")
             return 0
 
         def build(rd, maps, by, now_ms):
-            return plan_sync(rd, maps, db_name, host, rows, by, now_ms)
+            return plan_sync(rd, maps, db_name, host, rows, by, now_ms, stamp.get("statuses"))
     else:
         if unavailable:
             print(f"crons-table: not written — {unavailable}")
@@ -535,7 +550,7 @@ def main(argv=None, environ=None, runner=run_plan) -> int:
         print(f"crons-table: note — {note}")
     if args.command == "sync":
         try:
-            write_stamp(workspace, host, digest, room, len(rows))
+            write_stamp(workspace, host, digest, room, rows)
         except OSError as e:
             print(f"crons-table: synced, but the digest stamp failed ({e}); the next sync writes again")
         print(f"crons-table: synced {len(rows)} rows for {host} to {db_name!r} in {room} "

@@ -107,12 +107,43 @@ FAKE_CLIENT = textwrap.dedent('''
                 json.dump(self.maps, f)
 
     @asynccontextmanager
-    async def open_room_commons(url, room, token, kind="markdown"):
+    async def _open(url, room, token, kind="markdown"):
         if os.environ.get("CRONS_FAKE_DOWN"):
             raise ConnectionError("collab service unreachable")
         assert kind == "db" and room == os.environ.get("CRONS_FAKE_ROOM", room)
         yield FakeDoc(os.environ["CRONS_FAKE_STATE"])
 ''')
+
+
+def installed_client() -> "Path | None":
+    """The room_commons_client.py an install on this machine carries, if any (CI has none)."""
+    roots = [Path(os.environ[v]) / "skills" for v in ("CLAUDE_CONFIG_DIR",) if os.environ.get(v)]
+    roots.append(Path.home() / ".claude" / "skills")
+    for root in roots:
+        p = root / "room-commons" / "scripts" / "room_commons_client.py"
+        if p.is_file():
+            return p
+    return None
+
+
+def exported_names(path: Path) -> set:
+    """Module-level names a client file binds (defs and plain assignments), read with ast."""
+    import ast
+    names = set()
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    return names
+
+
+# The fake exports the open functions the installed client really exports; without one, only the
+# name every released client exports (the newer ones add open_room_commons beside it).
+REAL_CLIENT = installed_client()
+FAKE_OPENERS = (tuple(n for n in ct.OPENERS if n in exported_names(REAL_CLIENT)) if REAL_CLIENT
+                else ("open_room_collab",))
+FAKE_CLIENT += "".join(f"\n{n} = _open\n" for n in FAKE_OPENERS)
 
 ENTRIES = [
     {"name": "main-loop", "cron": "*/5 * * * *", "prompt_skill": "proactive-loop"},
@@ -376,6 +407,30 @@ class TouchAndStatus(Base):
         self.run_cli("sync", "--force")
         self.assertEqual(self.row("inbox")["Status"], "Paused")
 
+    def test_disabling_an_entry_reaches_its_existing_row_and_reenabling_clears_it(self):
+        self.run_cli("sync")
+        edited = [dict(e) for e in ENTRIES]
+        edited[0]["disabled"] = True
+        self.write_crons(HOST, edited)
+        self.run_cli("sync")
+        self.assertEqual(self.row("main-loop")["Status"], "Paused")
+        self.write_crons(HOST, ENTRIES)
+        self.run_cli("sync")
+        self.assertEqual(self.row("main-loop")["Status"], "Active")
+
+    def test_a_hand_set_status_survives_when_its_crons_json_status_did_not_move(self):
+        self.run_cli("sync")
+        self.run_cli("status", "main-loop", "Paused")
+        edited = [dict(e) for e in ENTRIES]
+        edited[1]["disabled"] = True  # another entry's status moves; main-loop's does not
+        self.write_crons(HOST, edited)
+        self.run_cli("sync")
+        self.assertEqual((self.row("main-loop")["Status"], self.row("pr-practice")["Status"]), ("Paused", "Paused"))
+        (self.ws / "hosts" / HOST / ct.STAMP).unlink()  # no record of the last sync: nothing counts as moved
+        self.run_cli("status", "pr-practice", "Active")
+        self.run_cli("sync")
+        self.assertEqual(self.row("pr-practice")["Status"], "Active")
+
     def test_touch_does_not_reset_status(self):
         self.run_cli("sync")
         self.run_cli("status", "inbox", "Paused")
@@ -484,6 +539,36 @@ class FailOpen(Base):
 
 
 class Layouts(unittest.TestCase):
+    def _load(self, exports):
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t) / "room-commons" / "scripts"
+            d.mkdir(parents=True)
+            (d / "room_commons.py").write_text(FAKE_CLI)
+            (d / "room_commons_client.py").write_text("".join(f"def {n}(*a, **k):\n    return {n!r}\n" for n in exports))
+            (d / "room_database.py").write_text(FAKE_DATABASE)
+            saved = {m: sys.modules.pop(m) for m in ("room_commons", "room_commons_client", "room_database")
+                     if m in sys.modules}
+            try:
+                return ct.load_capability(d)[1]()
+            finally:
+                for m in ("room_commons", "room_commons_client", "room_database"):
+                    sys.modules.pop(m, None)
+                sys.modules.update(saved)
+                sys.path.remove(str(d))
+
+    def test_the_open_function_falls_back_to_the_pre_rename_name(self):
+        self.assertEqual(self._load(["open_room_collab"]), "open_room_collab")
+        self.assertEqual(self._load(["open_room_commons"]), "open_room_commons")
+        self.assertEqual(self._load(["open_room_collab", "open_room_commons"]), "open_room_commons")
+        with self.assertRaisesRegex(ImportError, "exports none of open_room_commons, open_room_collab"):
+            self._load(["open_something_else"])
+
+    @unittest.skipUnless(REAL_CLIENT, "no room-commons install on this machine")
+    def test_the_installed_client_exports_an_open_function_this_script_accepts(self):
+        names = exported_names(REAL_CLIENT)
+        self.assertTrue(set(ct.OPENERS) & names, f"{REAL_CLIENT} exports none of {ct.OPENERS}")
+        self.assertTrue(set(FAKE_OPENERS) <= names)
+
     def test_room_commons_is_preferred_and_the_room_collab_shim_is_the_fallback(self):
         with tempfile.TemporaryDirectory() as t:
             ws = Path(t)
