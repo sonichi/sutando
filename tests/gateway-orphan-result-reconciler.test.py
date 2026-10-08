@@ -159,8 +159,8 @@ class GenuinelyUndelivered(_Base):
         gw._req = gone
         for _ in range(gw.MAX_TRANSIENT_ATTEMPTS + 1):
             self._sweep()
-        q = list(gw.UNDELIVERABLE_RESULTS_DIR.glob(f"{TID}.undeliverable-after-retries.*"))
-        self.assertEqual(len(q), 1, "permanent 4xx quarantines after bounded retries")
+        q = list(gw.UNDELIVERABLE_RESULTS_DIR.glob(f"{TID}-*.txt"))
+        self.assertEqual(len(q), 1, "permanent 4xx quarantines without repeating the refusal")
         self.assertFalse((gw.RESULTS_DIR / f"{TID}.txt").exists())
 
     def test_ok_false_refusal_keeps_result_and_never_archives(self):
@@ -174,7 +174,13 @@ class GenuinelyUndelivered(_Base):
                         "refused close must keep its retryable result")
         self.assertFalse(any("recovered + delivered" in l for l in self.logs),
                          "a refused close must not log as delivered")
-        # And the successful retry archives through the same gate.
+        self._sweep()
+        from ag2_sparrow import outbox, undelivered_quarantine
+        core = gw._delivery_core()
+        self.assertEqual(outbox.read_item(core.backend.root, TID)["reason"], "permanent-refusal")
+        outbox.requeue_item(core.backend.root, TID, reset_attempts=True, operator="test")
+        undelivered_quarantine.restore(gw.RESULTS_DIR, TID)
+        _age(gw.RESULTS_DIR / f"{TID}.txt", OLD)
         gw._req = lambda m, path, payload=None: {"ok": True}
         self._sweep()
         self.assertFalse((gw.RESULTS_DIR / f"{TID}.txt").exists(),

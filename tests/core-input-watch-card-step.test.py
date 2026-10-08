@@ -70,6 +70,7 @@ class TestCardStep(unittest.TestCase):
         with patch.object(M, "capture", capture), \
                 patch.object(M, "_load_runtime_health", lambda: _RH()), \
                 patch.object(M, "gateway_alive", lambda *a: True), \
+                patch.object(M, "session_runtime", lambda *a: None), \
                 patch.object(M, "_ensure_tmux_on_path", lambda: None), \
                 patch.object(M, "_hitl_manager", lambda out_path: object()), \
                 patch.object(M, "escalate", lambda *a, **k: calls.append("escalate")), \

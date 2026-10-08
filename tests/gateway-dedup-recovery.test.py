@@ -61,12 +61,21 @@ class _Harness:
         (self.gw.ARCHIVE_RESULTS_DIR / f"{HOLDER}-1785976425.txt").write_text(holder_body)
         (self.gw.TASKS_DIR / f"{TID}.txt").write_text(orig_task)
         (self.gw.RESULTS_DIR / f"{TID}.txt").write_text(result_body)
+        if holder_body.strip():
+            from ag2_sparrow.delivery_core import DeliveryOutcome
+            self.gw._delivery_core().backend.publish(
+                HOLDER, __import__("json").dumps({"id": HOLDER, "body": holder_body}).encode())
+            token = self.gw._delivery_core().backend.claim(HOLDER, "fixture")
+            self.gw._delivery_core().backend.complete(token, DeliveryOutcome.CONFIRMED)
+            (self.gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+            (self.gw.TASKS_DIR / "archive" / f"{HOLDER}.txt").write_text(
+                f"id: {HOLDER}\nsource: gateway\nchannel_id: {ROOM}\nuser_id: owner\ntask: question\n")
 
     def requeued_tasks(self):
         return [p for p in self.gw.TASKS_DIR.glob("task-*.txt") if p.stem != TID]
 
 
-ORIG = f"id: {TID}\nsource: gateway\naccess_tier: owner\ntask: What is AG2Space?\n"
+ORIG = f"id: {TID}\nsource: gateway\nchannel_id: {ROOM}\nuser_id: owner\naccess_tier: owner\ntask: What is AG2Space?\n"
 DEDUP = f"[deduped: {HOLDER}]"
 
 
@@ -115,7 +124,7 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             with _Harness(self.gw, Path(td)) as h:
                 h.seed("[REPLIED]", ORIG + f"channel_id: {ROOM}\nuser_id: alice\n", DEDUP)
-                (h.gw.TASKS_DIR / "archive").mkdir()
+                (h.gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
                 (h.gw.TASKS_DIR / "archive" / f"{HOLDER}.txt").write_text(
                     "channel_id: !other:ag2.space\nuser_id: alice\n")
                 inflight = {TID}
@@ -137,7 +146,7 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             with _Harness(self.gw, Path(td)) as h:
                 h.seed("[REPLIED]", ORIG + "dedup_requeue_count: 1\n", DEDUP)
-                (h.gw.TASKS_DIR / "archive").mkdir()
+                (h.gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
                 (h.gw.TASKS_DIR / "archive" / f"{HOLDER}.txt").write_text(
                     "channel_id: !other:ag2.space\n")
                 inflight = {TID}

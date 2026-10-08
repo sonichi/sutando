@@ -349,16 +349,16 @@ jobs:
         run: bash scripts/run-shell-suites.sh tail 3 ${{ matrix.shard }}
 
   python-standalone-tests:
-    name: python standalone tests (${{ matrix.shard }}/7)
+    name: python standalone tests (${{ matrix.shard }}/9)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # Legs 1-5 share the files by measured cost; legs 6-7 run the load-sensitive
+    # Legs 1-7 share the files by measured cost; legs 8-9 run the load-sensitive
     # suites (see the step). The coverage-gate job combines every leg's data.
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9]
     # Split out of `tsc + tests` so the three suites run beside each other rather
     # than one after another. Same environment, same commands — only sequencing.
     # 20, not 15: the suite now runs under coverage instrumentation (the only
@@ -413,12 +413,12 @@ jobs:
           # `skills` too: a skill owns its own tests/, so a suite that moves into one
           # keeps running; the root is optional, so it is added only when present.
           bash scripts/discover-python-tests.sh > "$RECDIR/all"
-          # Legs 6-7 run the listed load-sensitive suites (a timing suite beside a CPU-heavy
-          # neighbour misses its own window); legs 1-5 get the rest.
+          # Legs 8-9 run the listed load-sensitive suites (a timing suite beside a CPU-heavy
+          # neighbour misses its own window); legs 1-7 get the rest.
           LIST=tests/python-load-sensitive-suites.txt
-          if [ "${SHARD:-1}" -ge 6 ]; then
-            # Leg 7 runs the list's `serial` suites alone, so they never share a runner's CPU.
-            KIND=only; WORKERS=2; [ "${SHARD:-1}" = 7 ] && { KIND=serial; WORKERS=1; }
+          if [ "${SHARD:-1}" -ge 8 ]; then
+            # Leg 9 runs the list's `serial` suites alone, so they never share a runner's CPU.
+            KIND=only; WORKERS=2; [ "${SHARD:-1}" = 9 ] && { KIND=serial; WORKERS=1; }
             bash scripts/select-load-sensitive-suites.sh "$KIND" "$LIST" "$RECDIR" < "$RECDIR/all" > "$RECDIR/sensitive"
             bash scripts/shard-by-cost.sh 1 1 tests/python-suite-costs.txt < "$RECDIR/sensitive" > "$RECDIR/files"
             SELECTED="$RECDIR/sensitive"
@@ -428,7 +428,7 @@ jobs:
             bash scripts/select-load-sensitive-suites.sh without "$LIST" "$RECDIR" < "$RECDIR/all" > "$RECDIR/rest"
             # Measured cost, heaviest first onto the lightest leg: every file lands in
             # exactly one leg, and the legs finish together instead of by line parity.
-            bash scripts/shard-by-cost.sh 5 "${SHARD:-1}" tests/python-suite-costs.txt < "$RECDIR/rest" > "$RECDIR/files"
+            bash scripts/shard-by-cost.sh 7 "${SHARD:-1}" tests/python-suite-costs.txt < "$RECDIR/rest" > "$RECDIR/files"
             KIND=without SELECTED="$RECDIR/rest"
           fi
           # Runs whatever the branches did: no receipt, or a list edited after selection, exits 4.

@@ -43,7 +43,7 @@ failure. The same content lands in the Actions job summary.
 
 Mechanically this is one suite run and two jobs in `ci.yml`, then a second
 workflow. `python-standalone-tests` runs the suite once under `coverage run`,
-as seven matrix legs: legs 1-5 balanced by measured cost (`scripts/shard-by-cost.sh` over `tests/python-suite-costs.txt`, regenerated with `scripts/gen-suite-costs.sh` from job logs), heaviest suite first; leg 6 the load-sensitive suites, heaviest first, two at a time; leg 7 the ones tagged `serial`, alone. They
+as nine matrix legs: legs 1-7 balanced by measured cost (`scripts/shard-by-cost.sh` over `tests/python-suite-costs.txt`, regenerated with `scripts/gen-suite-costs.sh` from job logs), heaviest suite first; leg 8 the load-sensitive suites, heaviest first, two at a time; leg 9 the ones tagged `serial`, alone. They
 upload their combined data as `coverage-data-<shard>`; the `coverage-gate`
 job (`needs:` that job, `pull_request` only — where fork PRs get a read-only
 token) downloads every leg, combines the fragments into one `.coverage` +
@@ -83,7 +83,7 @@ legitimately cannot meet the bar (rare — e.g. a pure launchd-installer
 change), the owner can merge over a red gate; the gate is a required
 conversation, not an unappealable veto.
 
-### Load-sensitive suites (legs 6-7)
+### Load-sensitive suites (legs 8-9)
 
 `tests/python-load-sensitive-suites.txt` lists the suites CI keeps off the shared
 four-worker legs; `scripts/select-load-sensitive-suites.sh` is the only reader, and
@@ -95,8 +95,8 @@ before its suites: no receipt, or a list changed after selection, fails the leg 
 misses its own wait windows under load: either a CI run where it failed that way while
 sharing a leg with heavier suites (cite the run id), or a tracked flake issue naming it
 (cite the number). A suite split out of an admitted one, sharing its harness, is admitted
-with it. A suite that fails in leg 6 itself, beside another listed suite, is tagged `serial`
-(cite that run) and runs alone in leg 7. Current entries and their evidence:
+with it. A suite that fails in leg 8 itself, beside another listed suite, is tagged `serial`
+(cite that run) and runs alone in leg 9. Current entries and their evidence:
 
 | suite | evidence |
 |---|---|
@@ -104,5 +104,5 @@ with it. A suite that fails in leg 6 itself, beside another listed suite, is tag
 | readiness-window-decision-instant | CI run 36888802147 attempt 2, PR #5000 at 7dee69d8c |
 | readiness-window-held-task-recovery, -unreadable-config | split with decision-instant from one suite (#4630), same harness |
 | config-hot-reload, inbox-and-workspace-env, malformed-roster-row, priority-sweep, sentinel-ownership | flake issue #4862 (failed together under host load) |
-| handler-terminal-rc (`serial`: leg 7, alone) | flake issue #4855; timed out on two-worker leg 6 in CI run 36914315349 |
+| handler-terminal-rc (`serial`: leg 9, alone) | flake issue #4855; timed out on the two-worker leg (then leg 6 of a six-leg layout) in CI run 36914315349 |
 

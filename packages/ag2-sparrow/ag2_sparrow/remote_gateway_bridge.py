@@ -300,11 +300,9 @@ from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
 from .proactive_routing import proactive_filename
-from .team_guardrail import (team_guardrail_lines, engage_rulebook,
-                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines,
-                             owner_mention_lines)
+from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
-from .outbox import DeliveryOutcome, record_delivered
+from .outbox import DeliveryOutcome, record_delivered, RetrySchedule, read_item
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
@@ -314,7 +312,7 @@ from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core.provider_ag2space import AG2SpaceResultProvider
 from .result_ready import read_ready_result
 from .result_publish import publish_staged as _publish_staged_whole, stage_text as _stage_text
-from .dedup_recovery import plan_dedup_recovery
+from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
@@ -3295,13 +3293,8 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     # Promote only the exact broker boolean plus Team request; the legacy Guest
     # wire tier keeps old nodes restricted and body text cannot opt itself in.
-    broker_tier = _normalized_tier(task.get("access_tier"))
-    requested_tier = _normalized_tier(task.get("requested_access_tier"))
-    broker_collaborator = (
-        task.get("collaborator") is True
-        and (broker_tier == "team" or requested_tier == "team")
-    )
-    attested_tier = "team" if broker_collaborator else broker_tier
+    attested_tier, broker_collaborator = local_task_protocol.broker_attested_tier(
+        task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
     # Resolved once and reused below so routing and owner-activity cannot diverge.
     sender_tier = _tier_for(task.get("user_id"), attested_tier)
     collaborator_enabled = broker_collaborator and sender_tier == "team"
@@ -3419,20 +3412,11 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         lines.append(secret_handling_instruction("AG2Space", _secret_types).strip("\n"))
     # Guest keeps the read-only Codex path. Team carries its guardrail IN-BAND:
     # closing the Team session route removed the only thing that used to deliver it.
-    if sender_tier == "team":
-        if collaborator_enabled:
-            lines.append(engage_rulebook("room", AG2SPACE_PROVENANCE, f"results/{tid}.txt"))
-        else:
-            lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
-        # A relay-stamped Signal task may attach from ITS OWN output directory only;
-        # name it here (absolute) so the marker written is the one the guard confines.
-        if isinstance(task.get("signal"), dict):
-            lines.extend(_signal_task_media_lines(str(RESULTS_DIR / tid)))
-    if sender_tier == "guest":
-        lines.extend(sandboxed_delegation_lines(
-            "AG2 Space", "GUEST tier", f"results/{tid}.txt",
-            "Research, inspect, explain, and draft only. Do not modify files or external systems.",
-        ))
+    lines.extend(ag2space_tier_lines(sender_tier, collaborator_enabled, f"results/{tid}.txt"))
+    # A relay-stamped Signal task may attach from ITS OWN output directory only;
+    # name it here (absolute) so the marker written is the one the guard confines.
+    if sender_tier == "team" and isinstance(task.get("signal"), dict):
+        lines.extend(_signal_task_media_lines(str(RESULTS_DIR / tid)))
     # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
     # header-shaped lines, so appending after access_tier keeps it the last one.
     if sender_tier == "owner":
@@ -3517,8 +3501,13 @@ def _forget_dedup_alias(tid: str) -> None:
     aliases = _load_dedup_aliases()
     if aliases is None:
         return
+    delivery = aliases.get(tid)
+    if delivery is not None:
+        record = read_item(_delivery_core().backend.root, _broker_tid(delivery))
+        if record and record.get("status") == "DELIVERED":
+            return  # Waiting dependents still resolve the holder's accepted broker id.
     if aliases.pop(tid, None) is not None:
-        _save_dedup_aliases(aliases)  # cleanup: a stale entry is harmless
+        _save_dedup_aliases(aliases)
 
 
 def _load_task_rooms() -> dict[str, str]:
@@ -4064,6 +4053,32 @@ def _save_inflight(inflight: set[str]) -> bool:
 _uploaded_attachments: set[tuple[str, str]] = set()
 
 
+def _holder_delivery_state(holder_id: str) -> str:
+    """Gateway acceptance evidence comes from the outbox, never archive location."""
+    if not _valid_local_tid(holder_id):
+        return "failed"
+    delivery = _delivery_tid(holder_id)
+    if delivery is None:
+        return "failed"
+    record = read_item(_delivery_core().backend.root, _broker_tid(delivery))
+    candidates = [local_task_protocol.find_result(RESULTS_DIR, holder_id)]
+    candidates.extend(reversed(undelivered_quarantine.find_quarantined(RESULTS_DIR, holder_id)))
+    body = None
+    if record and record.get("payload"):
+        try:
+            body = json.loads(record["payload"]).get("body")
+        except (ValueError, TypeError, AttributeError):
+            return "failed"
+    if body is None:
+        for path in candidates:
+            if path is not None:
+                body = read_ready_result(path)
+                if body:
+                    break
+    return classify_holder_delivery(record, body,
+                                    (RESULTS_DIR / f"{holder_id}.txt").exists())
+
+
 def _dedup_plan(tid: str, holder_id: str | None):
     """Shared dedup recovery, bound to this adapter's directories.
 
@@ -4090,7 +4105,7 @@ def _dedup_plan(tid: str, holder_id: str | None):
     action, payload = plan_dedup_recovery(
         RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
         f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit,
-        channel_dir=CHANNEL_DIR)
+        channel_dir=CHANNEL_DIR, holder_delivery_state=_holder_delivery_state)
     return action, payload, room
 
 
@@ -4111,29 +4126,22 @@ _DELIVERY_CORE: "DeliveryCore | None" = None
 
 
 def _delivery_core() -> DeliveryCore:
-    """The outbound result leg behind the ClaimBackend/DeliveryProvider seam:
-    claim, retry, ambiguity and crash-recovery semantics live in DeliveryCore;
-    this bridge keeps presentation (guard, markers, attachments) and the
-    resolved dirs. The ceiling is the shared outbound cap, NOT the legacy
-    retry-every-pass behaviour: an unbounded retry is a duplicate generator.
-    The root lives INSIDE the
-    results dir it drains (archive/ and undelivered/ precedent), so every
-    harness that redirects RESULTS_DIR is hermetic for free; the singleton is
-    keyed by that root and recomposes when it moves."""
+    """Compose a persisted retry window over idempotent gateway result POSTs."""
     global _DELIVERY_CORE
     root = RESULTS_DIR / f".outbox{_INST_SUFFIX}"
     if _DELIVERY_CORE is None or _DELIVERY_CORE.backend.root != root:
         _DELIVERY_CORE = DeliveryCore(
-            DesignAClaimBackend(root),
+            DesignAClaimBackend(root, retry_schedule=RetrySchedule(), republish_delivered=False),
             # Late-bound so token rotation reassigning module globals (and the
             # test harness's _req double) reach the provider mid-process.
             AG2SpaceResultProvider(lambda *a, **k: _req(*a, **k)),
-            policy=RetryPolicy(max_attempts=MAX_TRANSIENT_ATTEMPTS),
+            policy=RetryPolicy(max_attempts=MAX_TRANSIENT_ATTEMPTS,
+                               defer_idempotent_resend=True),
             worker="gateway-result-drain")
     return _DELIVERY_CORE
 
 
-def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
+def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None) -> None:
     """Move a result the outbox has finally refused into results/undelivered/,
     the same quarantine the proactive path uses. Without this the file is
     rescanned every pass and the refusal is invisible.
@@ -4147,7 +4155,7 @@ def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
         _log(f"result {tid}: {why} — quarantined to "
              f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
              f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
-             f"requeue {_broker_tid(tid)} "
+             f"requeue {outbox_item_id or _broker_tid(_delivery_tid(tid) or tid)} --reset-attempts "
              f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
     except OSError as e:
         _log(f"result {tid}: {why} but quarantine failed ({e}) — "
@@ -4404,34 +4412,50 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["metadata"] = {"worker_id": worker}
         _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
-    core.backend.publish(broker_tid, payload)   # False = already live: retry pass
-    res = core.deliver_one(broker_tid, payload)
+    accepted = (read_item(core.backend.root, broker_tid) or {}) if no_send else {}
+    item_id = (f"{broker_tid}.lease-close"
+               if accepted.get("status") == "DELIVERED" else broker_tid)
+    if item_id != broker_tid:
+        core.backend.publish(item_id, payload, republish_delivered=True)
+    else:
+        core.backend.publish(item_id, payload)
+    res = core.deliver_one(item_id, payload)
     if res.status is DrainStatus.TERMINAL:
+        record = read_item(core.backend.root, item_id) or {}
+        if record.get("status") == "DELIVERED":
+            return True
         # The outbox has decided this item; no pass will ever claim it again,
         # so retrying logs forever and hides the failure behind "will retry".
-        why = (f"outbox item is terminal after "
-               f"{core.backend.attempts(broker_tid)} attempt(s)")
+        why = (f"outbox item is terminal: {record.get('reason')} after "
+               f"{core.backend.attempts(item_id)} attempt(s)")
         if result_file is not None:
-            _quarantine_undelivered(result_file, tid, why)
+            _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id)
         else:
             _log(f"result {tid}: {why} — not retrying")
         return False
     if res.status is DrainStatus.NOT_CLAIMED:
         # A dead prior incarnation's claim; reclaim-TTL recovers it, and
         # with an idempotent provider nothing parks on ambiguity.
-        _log(f"result {tid}: outbox item not claimable this pass "
-             f"(attempts={core.backend.attempts(broker_tid)}) — will retry")
+        record = read_item(core.backend.root, item_id) or {}
+        retry = record.get("retry", {})
+        _log(f"result {tid}: pending retry or delivery claim "
+             f"(attempts={core.backend.attempts(item_id)}, "
+             f"next={retry.get('next_attempt_at')}, deadline={retry.get('deadline')})")
         return False
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
         _ENGINE_COUNTS["core_confirmed"] += 1
         # A confirmed send was otherwise silent, so nothing on the happy path
         # told a live round trip apart from the legacy one it replaces.
-        _log(f"result {tid} delivered via DeliveryCore "
+        _log(f"result {tid} accepted by gateway; Matrix delivery unconfirmed "
              f"(provider={type(core.provider).__name__}, "
              f"backend={type(core.backend).__name__}, worker={core.worker})")
         return True
+    record = read_item(core.backend.root, item_id) or {}
+    retry = record.get("retry", {})
     _log(f"result POST not confirmed for {tid} "
-         f"({res.outcome.value if res.outcome else '?'}) — will retry")
+         f"({res.outcome.value if res.outcome else '?'}: {res.detail}) — "
+         f"status={record.get('status')}, reason={record.get('reason')}, "
+         f"next={retry.get('next_attempt_at')}, deadline={retry.get('deadline')}")
     return False
 
 
@@ -4531,6 +4555,11 @@ def _post_ready_results(inflight: set[str]) -> None:
         # it owns the reject-and-report policy (dedup_recovery.plan_dedup_recovery).
         if skip and skip.value == "deduped":
             action, payload, room = _dedup_plan(tid, skip.extra)
+            if action == "wait":
+                inflight.add(payload)
+                changed = True
+                _log(f"dedup {tid} waiting for holder {payload} gateway acceptance")
+                continue
             if action == "defer":
                 # Nothing was retired; the next pass retries the whole decision.
                 _log(f"dedup deferred for {tid} — alias not committed")
@@ -4550,7 +4579,7 @@ def _post_ready_results(inflight: set[str]) -> None:
                         continue
                     if not _deliver_result_payload(tid, _broker_tid(_delivery),
                                                   "[no-send]" if mention else payload,
-                                                  no_send=bool(mention)):
+                                                  no_send=bool(mention), result_file=rfile):
                         continue
                 _holder = (skip.extra or "").strip()
                 # An out-of-grammar holder is sender-controlled; name its shape,
@@ -4579,7 +4608,7 @@ def _post_ready_results(inflight: set[str]) -> None:
                 continue
             if not _deliver_result_payload(tid, _broker_tid(_delivery),
                                            _lease_close_body(skip),
-                                           no_send=True):
+                                           no_send=True, result_file=rfile):
                 continue
             _archive_result(rfile, tid)
             # Retire the provenance WITH the result, never at read: this line is
@@ -4653,7 +4682,7 @@ def _post_ready_results(inflight: set[str]) -> None:
         _forget_task_media(tid)
         _forget_dedup_alias(tid)
         changed = True
-        _log(f"delivered result for {tid}")
+        _log(f"archived gateway-accepted result for {tid}; Matrix delivery unconfirmed")
     if changed:
         _save_inflight(inflight)
 
@@ -4872,18 +4901,11 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         # Same outcome owner as the live drain: a 2xx {"ok": false} is a
         # refusal, and an unconfirmed close must keep its retryable result.
         _btid = _broker_tid(delivery)
-        if _deliver_result_payload(tid, _btid, labeled, no_send=bool(skip)):
+        if _deliver_result_payload(tid, _btid, labeled, no_send=bool(skip), result_file=rfile):
             _archive_result(rfile, tid)
-            _log(f"orphan sweep: recovered + delivered {tid}")
+            _log(f"orphan sweep: recovered + gateway accepted {tid}; Matrix delivery unconfirmed")
             continue
         _tries = _delivery_core().backend.attempts(_btid)
-        if _tries >= MAX_TRANSIENT_ATTEMPTS:
-            # Permanent disposition (lease gone or standing refusal): the
-            # bounded-attempts ceiling replaces the raw 4xx probe the core hides.
-            if _quarantine_orphan(rfile, tid, "undeliverable-after-retries"):
-                _log(f"orphan sweep: {tid} unconfirmed after {_tries} attempts "
-                     "— quarantined")
-            continue
         _log(f"orphan sweep: {tid} close not confirmed (attempt {_tries}) — will retry")
 
 

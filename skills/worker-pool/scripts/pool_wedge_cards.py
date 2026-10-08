@@ -225,7 +225,11 @@ def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None) -> list
     for r in manager.active():
         subj = r.subject or {}
         w = subj.get("worker_id")
-        stale = w in worker_ids or (w in wedges and subj.get("wedge") != wedges[w])
+        # The HITL guard can deduplicate a login request onto its older cause card.
+        legacy_login = (wedges.get(w) == ps.CARD_LOGIN and subj.get("wedge") == ps.CARD_CAUSE
+                        and isinstance(subj.get("cause"), list) and "needs-login" in subj["cause"])
+        stale = w in worker_ids or (w in wedges and subj.get("wedge") != wedges[w]
+                                   and not legacy_login)
         if subj.get("source") == SOURCE and stale and r.status != STATUS_IN_PROGRESS:
             manager.resolve(r.id)
             closed.append(r.id)

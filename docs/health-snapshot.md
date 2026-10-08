@@ -210,7 +210,22 @@ has no incarnation record, so for it only the session match and the lease apply.
 failure does not age: a seat whose last request failed stays abnormal, its lease renewed, until a
 request completes or the observer stops.
 
-Seats with no observer (the Codex runtime, an older engine, the observer disabled) have no record:
+**Codex core.** `src/agent/codex/cli/codex-observer.mjs`, started by the Codex launcher in its own
+`<session>-observer` tmux session, writes the core's record. It finds the rollout file the core's
+Codex process holds open (`lsof` over the pane's process tree). It needs exactly one top-level
+rollout and none it cannot classify; otherwise it keeps its target for one discovery, then writes no
+record. It follows that file: `task_started` reads `requesting · moving`, a tool call `tool`. A model output
+(an assistant message, reasoning or a tool call) stamps `last_success_at` and `healthy`;
+`token_count` does not, since Codex writes one from running totals before a usage-limit failure.
+`task_complete` reads `idle`, or, when it carries an `error`, `failed · idle · abnormal` with
+`codex_error_info` mapped to `needs-login` (`unauthorized`), `quota-limit`
+(`usage_limit_exceeded`, `session_budget_exceeded`) or `api-error` (anything else). A failure stands
+until a later model output. The record does not see a stall: a turn that writes nothing for an hour
+still reads `moving`, and stalls stay with the screen-derived sources. It does not use the
+app-server daemon: a core launched with `--search` does not register there. It exits when the core
+session is gone on two discoveries in a row.
+
+Seats with no observer (Codex pool workers, an older engine, the observer disabled) have no record:
 their verdicts and the `summary` view are exactly what the other sources say, and `full` only gains
 an empty `observation` source.
 

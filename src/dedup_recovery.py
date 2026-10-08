@@ -26,6 +26,7 @@ try:  # pragma: no cover - exercised by whichever context imports it
         task_channel_id,
         task_source,
         task_user_id,
+        parse_markers,
     )
     from .task_archive import find_task_file
 except ImportError:  # pragma: no cover - flat src/ import path
@@ -39,11 +40,13 @@ except ImportError:  # pragma: no cover - flat src/ import path
         task_channel_id,
         task_source,
         task_user_id,
+        parse_markers,
     )
     from task_archive import find_task_file
 
 __all__ = [
     "plan_dedup_recovery",
+    "classify_holder_delivery",
     "report_disposition",
     "REPORT_TEMPLATE",
     "CROSS_SENDER_TEMPLATE",
@@ -82,6 +85,25 @@ def _read(path) -> str | None:
         return None
 
 
+def classify_holder_delivery(record, body, live: bool) -> str:
+    """Separate an existing answer's pending state from its provider receipt."""
+    if not body or not isinstance(body, str):
+        return "failed" if record else "missing"
+    parsed = parse_markers(body)
+    if any(a.kind == "skip" for a in parsed.actions):
+        if record and record.get("status") == "DELIVERED" and any(
+                a.kind == "skip" and a.value == "REPLIED" for a in parsed.actions):
+            return "accepted"
+        return "missing"
+    if any(a.kind == "redirect" for a in parsed.actions):
+        return "failed"
+    if record and record.get("status") == "DELIVERED":
+        return "accepted"
+    if record and record.get("status") == "PARKED":
+        return "failed"
+    return "pending" if live else "failed"
+
+
 def plan_dedup_recovery(
     results_dir: Path,
     tasks_dir: Path,
@@ -91,6 +113,7 @@ def plan_dedup_recovery(
     new_task_id: str,
     commit_identity=None,
     channel_dir: str = "",
+    holder_delivery_state=None,
 ) -> tuple[str, str | None]:
     """Decide and perform the filesystem half of dedup recovery.
 
@@ -99,6 +122,7 @@ def plan_dedup_recovery(
       ``("requeue", new_id)``  — a re-ask was written; route its reply.
       ``("report", message)``  — tell the asker; do not re-ask again.
       ``("defer", None)``      — nothing was changed; retry on a later pass.
+      ``("wait", holder)``     — an existing answer awaits gateway acceptance.
 
     ``commit_identity(new_task_id)`` runs BEFORE the task file is published and
     must return True. A re-ask visible to the watcher without its routing
@@ -119,10 +143,29 @@ def plan_dedup_recovery(
     destination = asking_channel or task_channel_id(orig_text)
     cross_channel = dedup_cross_channel_target(destination, holder_task, task_source(orig_text))
     cross_sender = (dedup_cross_sender_target(task_user_id(orig_text), holder_task)
-                    if decision == "honour" and orig_text else None)
+                    if orig_text and (decision == "honour" or holder_delivery_state is not None) else None)
     reason = "cross-channel" if cross_channel else "cross-sender" if cross_sender else "holder-empty"
     template = (CROSS_CHANNEL_TEMPLATE if cross_channel else
                 CROSS_SENDER_TEMPLATE if cross_sender else REPORT_TEMPLATE)
+    if holder_delivery_state is not None and holder and not (cross_channel or cross_sender):
+        state = holder_delivery_state(holder)
+        if state != "missing":
+            compatible = (orig_text and holder_task and destination
+                          and task_source(orig_text) == task_source(holder_task)
+                          and task_channel_id(holder_task) == destination
+                          and task_user_id(orig_text)
+                          and task_user_id(orig_text) == task_user_id(holder_task))
+            if not compatible:
+                return "report", (
+                    "⚠️ The holder's delivery destination or sender could not be verified. "
+                    "This question needs a direct answer.")
+            if state == "accepted":
+                return "honour", None
+            if state == "pending":
+                return "wait", holder
+            return "report", (
+                f"⚠️ The existing answer for `{holder}` is retained but its gateway "
+                "delivery requires operator recovery. No new answer was requested.")
     if decision == "honour" and not (cross_channel or cross_sender):
         return "honour", None
     if dedup_requeue_count(orig_text) >= 1:

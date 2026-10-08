@@ -1,5 +1,5 @@
-# Watcher suites that miss their own wait windows beside CPU-heavy neighbours: leg 6 runs them two
-# at a time, leg 7 the ones tagged `serial` alone. Admission rule and evidence: docs/testing-coverage.md.
+# Watcher suites that miss their own wait windows beside CPU-heavy neighbours: leg 8 runs them two
+# at a time, leg 9 the ones tagged `serial` alone. Admission rule and evidence: docs/testing-coverage.md.
 tests/watch-tasks-stream-bare-directory-event.test.py
 tests/watch-tasks-stream-config-hot-reload.test.py
 tests/watch-tasks-stream-handler-terminal-rc.test.py serial

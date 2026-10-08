@@ -41,7 +41,7 @@ import sys as _sys
 from typing import List, Optional
 
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
-from cli_wedge import live_banner_lines  # noqa: E402 — the one banner grammar
+from cli_wedge import needs_login_line  # noqa: E402 — the one banner grammar
 
 LOGGED_IN_AGAIN = re.compile(r"^login successful\b", re.I)
 # The completed-turn line ("✻ Worked for 0s", "✻ Cooked for 1m 3s · done 12:32 PM"); the
@@ -56,8 +56,7 @@ _RAN = re.compile(r"^[●⏺]")
 def login_refusal(line: str) -> bool:
     """Is this one line the CLI's login refusal? cli_wedge's needs-login family, judged
     whole: the three common words without a /login token beside them are prose."""
-    return any(family == "parked" and name == "needs-login"
-               for family, name, _text in live_banner_lines(line))
+    return needs_login_line(line)
 
 
 def _core(line: str) -> str:

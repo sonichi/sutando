@@ -275,6 +275,100 @@ than store a second copy.
 - A task whose `id` is already queued, claimed, or archived locally is dropped
   (idempotent write).
 
+### Recovering result POSTs after a gateway outage
+
+Ordinary task results use the shared outbox and a persisted retry schedule.
+The first claim starts a **10-minute elapsed window**. Retry delays are
+**2, 4, 8, 16, then 30 seconds**, capped at 30 seconds thereafter. These are
+minimum delays: the outbound drain's polling cadence and request duration can
+make an attempt later. Each eligible drain makes one result POST; an ambiguous
+response defers the idempotent resend to the next scheduled attempt. The answer
+and broker result ID remain the same. No agent task is created to regenerate
+an answer because its POST failed.
+
+HTTP 401/403 (while polling recovers authentication), 408, 425, 429, 5xx and
+transport failures are retryable. Other 4xx responses,
+malformed envelopes and explicit decline envelopes are permanent refusals and
+park on the first attempt. This policy applies to the gateway **task-result**
+leg only; proactive room sends and other providers keep their existing retry
+policy. Providers without an idempotent-send or reconciliation capability still
+park an ambiguous outcome rather than retrying it automatically.
+
+The outbox item stores its start, absolute deadline, next eligible time and
+failure count atomically under the delivery claim lock. A restart retains these
+values; time spent stopped consumes the window. At least five failed sends are
+required before expiry parks an answer, so sparse orphan sweeps and laptop sleep
+do not reduce recovery to a single attempt. Scheduling uses Unix wall time; clock
+adjustments can shorten or extend the window, while the minimum remains intact.
+A crashed claim owner is recovered by the existing owner-liveness/TTL protocol
+(up to its 300-second reclaim delay), without stealing an active sender's claim.
+An attempt already in progress at the deadline can finish. After the deadline,
+remaining minimum attempts still use backoff; further failures park the answer. Invalid schedule state parks visibly instead of
+silently granting a fresh budget.
+
+The gateway outbox preserves an accepted record when an unarchived result is
+seen again after a crash; it does not start another answer delivery cycle.
+If the broker redelivers an accepted task, the bridge re-ACKs it and POSTs a
+structured `no_send` lease-close control through a separate outbox item. The
+original accepted answer and receipt stay intact. Repeated redeliveries can
+start another control cycle; failed controls retain the usual bounded retry
+schedule. The broker must finalize duplicate results as well as fresh results
+for this control to clear a lingering lease. Retries use
+the originally published payload even if the caller rebuilds different text.
+Accepted re-ask aliases remain available so waiting dependents resolve the
+holder's broker receipt after its result is archived. Abandoned torn claims
+use the outbox's existing grace-period sweep; fresh torn claims remain guarded.
+
+Success means **accepted by the gateway**, including result-ID deduplication and
+closing its task lease. It does not establish downstream Matrix delivery.
+The outbox's historical `DELIVERED` label represents gateway acceptance for this
+provider. Logs explicitly say `accepted by gateway; Matrix delivery unconfirmed`.
+Pending logs include the next attempt and deadline; terminal records distinguish
+`retry-window-exhausted`, `permanent-refusal` and `invalid-retry-state`.
+
+After exhaustion or permanent refusal, the bridge retains the answer under
+`results/undelivered/` and logs the outbox recovery command. An operator can
+inspect the record and deliberately recover it with:
+
+```sh
+ag2-sparrow-outbox --root <results>/.outbox<instance-suffix> inspect <broker-result-id>
+ag2-sparrow-outbox --root <results>/.outbox<instance-suffix> requeue <broker-result-id> \
+  --reset-attempts --results-dir <results> --body-id <local-task-id>
+```
+
+`--reset-attempts` resets both the attempt count and elapsed retry schedule.
+Without it, an expired window stays expired. The operator action increments the
+outbox resend epoch, but the gateway envelope retains the same broker result ID.
+Inspect whether a reply was already manually sent before recovering it.
+Existing parked records and historical quarantined replies are **not** migrated
+or replayed automatically. Live nonterminal records without a schedule acquire
+one on their next claim.
+
+### Duplicates waiting for a holder's answer
+
+Gateway dedup recovery distinguishes an existing pending answer from gateway
+acceptance and failure. A compatible duplicate waits while its holder's answer
+is pending. Its dedup result and original in-flight ID persist until the holder
+is accepted, then its own broker lease closes with a suppressed result POST.
+The holder's existing outbox item provides delivery ownership and retry timing;
+concurrent dependent decisions do not create recovery aliases or additional
+agent tasks. The same durable files and receipt record reconstruct this state
+on restart. Archive location alone is not evidence of gateway acceptance.
+
+Compatibility requires matching task source, sender and room with readable
+holder provenance. A redirected holder answer cannot silently satisfy the
+original room. Cross-room and cross-sender dedups retain the bounded re-ask and
+report path. A genuinely missing or unusable holder also keeps the existing
+one-re-ask-per-lineage limit.
+
+A quarantined, exhausted or otherwise unverifiable existing answer requires
+operator recovery. Dependents receive a visible recovery report under each of
+their own broker IDs; they do not regenerate or replay the holder's answer.
+Report delivery itself uses the bounded gateway retry policy. An exhausted
+report remains retained for operator inspection. Acceptance is the strongest
+holder evidence available through the current result POST contract; this does
+not promise downstream Matrix delivery.
+
 ## Security
 
 - Inbound message text is **not trusted to set its own access tier.** Effective

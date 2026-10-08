@@ -282,9 +282,8 @@ def test_emit_task_prompt_skill():
 
 
 def test_emit_task_coalesces_pending_fires():
-    # A prior unconsumed fire for the SAME entry is removed before the new one
-    # is written, so a long outage leaves exactly one (newest) task per entry
-    # instead of one per missed slot (#dev design 2026-07-18).
+    # Published payloads remain immutable, even while a consumer is claiming.
+    # One outstanding fire represents missed intervals without a backlog.
     with tempfile.TemporaryDirectory() as d:
         cr.TASKS_DIR = Path(d)
         p1 = cr.emit_task("digest", {"prompt": "fire 1"})
@@ -292,9 +291,11 @@ def test_emit_task_coalesces_pending_fires():
         p2 = cr.emit_task("digest", {"prompt": "fire 2"})
         files = list(Path(d).glob("task-cron-digest-*.txt"))
         check(len(files) == 1, "same-entry pending fires coalesce to one file")
-        check(files[0].name == p2.name, "the surviving file is the newest fire")
-        check("task: fire 2" in files[0].read_text(), "surviving file carries newest body")
-        check(not p1.exists() or p1.name == p2.name, "prior pending fire removed")
+        check(p1 == p2, "coalescing retains the outstanding task identity")
+        check("task: fire 1" in files[0].read_text(), "published payload is immutable")
+        p1.unlink()  # model the consumer retiring the completed fire
+        p3 = cr.emit_task("digest", {"prompt": "fire 3"})
+        check("task: fire 3" in p3.read_text(), "a retired fire permits a fresh emission")
 
 
 def test_emit_task_coalesce_respects_entry_boundary():

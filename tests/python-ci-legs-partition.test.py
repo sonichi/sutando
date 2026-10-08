@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Regression pin: the seven python legs, as ci.yml's own step computes them, partition discovery.
+"""Regression pin: the python legs (seven cost-sharded plus the load-sensitive pair), as ci.yml's
+own step computes them, partition discovery.
 
-Runs the `Run Python standalone tests` step body from ci.yml once per leg (SHARD=1..7)
+Runs the `Run Python standalone tests` step body from ci.yml once per leg (SHARD=1..9)
 in a fixture that has every discovered path, the real selector, sharder, cost table and
 list, and a stub lane runner that records the file list and worker count it is handed.
 Whatever the workflow does to pick a leg's files — selector, sharder, or anything that
 replaces them — is what gets measured. It must hold that every discovered suite runs in
-exactly one leg, the listed load-sensitive suites in leg 6 (heaviest first, two workers)
-except those tagged `serial`, which run alone in leg 7, and legs 1-5 none of them; and a list with a stale or duplicate entry must stop every
+exactly one leg, the listed load-sensitive suites in leg 8 (heaviest first, two workers)
+except those tagged `serial`, which run alone in leg 9, and legs 1-7 none of them; and a list with a stale or duplicate entry must stop every
 leg with the selector's exit 3, so a leg that reads the list without the selector fails.
 
 Run: python3 tests/python-ci-legs-partition.test.py
@@ -66,7 +67,13 @@ def build_fixture(td: Path, discovered) -> Path:
     return fx
 
 
-def run_legs(fx: Path, list_text: str, nproc: int = 8, shards=range(1, 8)):
+# The leg layout ci.yml encodes: cost-sharded legs, then the load-sensitive pair.
+SHARED_LEGS = range(1, 8)
+LOAD_LEG, SERIAL_LEG = 8, 9
+ALL_LEGS = range(1, SERIAL_LEG + 1)
+
+
+def run_legs(fx: Path, list_text: str, nproc: int = 8, shards=ALL_LEGS):
     body = step_body()
     (fx / LIST).write_text(list_text)
     getconf = fx.parent / "bin" / "getconf"
@@ -117,29 +124,29 @@ def main() -> int:
     missing = sorted(set(disc) - set(every))
     if missing:
         fails.append(f"{len(missing)} discovered suite(s) run in no leg, e.g. {missing[:3]}")
-    shared = sorted(set(listed) & {f for s in range(1, 6) for f in legs[s][1]})
+    shared = sorted(set(listed) & {f for s in SHARED_LEGS for f in legs[s][1]})
     if shared:
-        fails.append(f"load-sensitive suite(s) in legs 1-5: {shared[:3]}")
-    leg6, leg7 = legs[6][1], legs[7][1]
+        fails.append(f"load-sensitive suite(s) in legs 1-{SHARED_LEGS[-1]}: {shared[:3]}")
+    leg6, leg7 = legs[LOAD_LEG][1], legs[SERIAL_LEG][1]
     if not serial:
-        fails.append("the list tags no suite `serial`, so leg 7 has nothing to run")
+        fails.append(f"the list tags no suite `serial`, so leg {SERIAL_LEG} has nothing to run")
     if sorted(leg6) != sorted(paired):
-        fails.append(f"leg 6 runs {len(leg6)} suites, not exactly the {len(paired)} listed without `serial`")
+        fails.append(f"leg {LOAD_LEG} runs {len(leg6)} suites, not exactly the {len(paired)} listed without `serial`")
     if sorted(leg7) != sorted(serial):
-        fails.append(f"leg 7 runs {leg7}, not exactly the `serial` suites {serial}")
+        fails.append(f"leg {SERIAL_LEG} runs {leg7}, not exactly the `serial` suites {serial}")
     if [cost.get(f, 1) for f in leg6] != sorted((cost.get(f, 1) for f in leg6), reverse=True):
-        fails.append("leg 6 is not ordered heaviest first")
-    # The step's rule: shared legs take the host's core count, leg 6 two, leg 7 one. Checked
+        fails.append(f"leg {LOAD_LEG} is not ordered heaviest first")
+    # The step's rule: shared legs take the host's core count, the load leg two, the serial leg one. Checked
     # on a 2-core and an 8-core host so a valid 2-core value is never read as hardcoding.
     for nproc in (2, 8):
         got = legs if nproc == 8 else run_legs(fx, real, nproc)
-        shared = {s: got[s][2] for s in range(1, 6)}
+        shared = {s: got[s][2] for s in SHARED_LEGS}
         if set(shared.values()) != {str(nproc)}:
-            fails.append(f"on a {nproc}-core host legs 1-5 run with {sorted(set(shared.values()))} workers, not {nproc}")
-        if got[6][2] != "2":
-            fails.append(f"on a {nproc}-core host leg 6 runs with {got[6][2]} workers, not 2")
-        if got[7][2] != "1":
-            fails.append(f"on a {nproc}-core host leg 7 runs with {got[7][2]} workers, not 1")
+            fails.append(f"on a {nproc}-core host legs 1-{SHARED_LEGS[-1]} run with {sorted(set(shared.values()))} workers, not {nproc}")
+        if got[LOAD_LEG][2] != "2":
+            fails.append(f"on a {nproc}-core host leg {LOAD_LEG} runs with {got[LOAD_LEG][2]} workers, not 2")
+        if got[SERIAL_LEG][2] != "1":
+            fails.append(f"on a {nproc}-core host leg {SERIAL_LEG} runs with {got[SERIAL_LEG][2]} workers, not 1")
 
     # A list that only partitions correctly when it is valid proves nothing about who reads
     # it: a stale or duplicate entry must stop every leg with the selector's exit 3.
@@ -154,21 +161,21 @@ def main() -> int:
                 fails.append(f"{what}: leg {shard} exited {rc}, not the selector's 3"
                              f"{' and ran ' + str(len(files)) + ' suites' if files else ''}")
 
-    # No `serial` tag left: leg 7 must stop with a reason, not run nothing.
+    # No `serial` tag left: the serial leg must stop with a reason, not run nothing.
     untagged = real.replace(f"{serial[0]} serial", serial[0]) if serial else real
-    rc, files, _w, err, _r = run_legs(fx, untagged, 8, (7,))[7]
-    if rc != 3 or "leg 7: the selector emitted no serial suites" not in err:
-        fails.append(f"no `serial` suite: leg 7 exited {rc} without the empty-leg reason: {err.strip()!r}")
+    rc, files, _w, err, _r = run_legs(fx, untagged, 8, (SERIAL_LEG,))[SERIAL_LEG]
+    if rc != 3 or f"leg {SERIAL_LEG}: the selector emitted no serial suites" not in err:
+        fails.append(f"no `serial` suite: leg {SERIAL_LEG} exited {rc} without the empty-leg reason: {err.strip()!r}")
 
     td_obj.cleanup()
     for f in fails:
         print("  FAIL", f)
     if fails:
         return 1
-    print(f"PASS: ci.yml's seven legs run all {len(disc)} discovered suites exactly once "
-          f"({'/'.join(str(len(legs[s][1])) for s in legs)}); {len(paired)} listed in leg 6 (heaviest first, two "
-          f"workers), {len(serial)} `serial` alone in leg 7, on 2- and 8-core hosts; a stale, duplicate or "
-          "badly tagged list entry stops every leg with exit 3; an untagged list stops leg 7 with its reason")
+    print(f"PASS: ci.yml's {len(legs)} legs run all {len(disc)} discovered suites exactly once "
+          f"({'/'.join(str(len(legs[s][1])) for s in legs)}); {len(paired)} listed in leg {LOAD_LEG} (heaviest first, two "
+          f"workers), {len(serial)} `serial` alone in leg {SERIAL_LEG}, on 2- and 8-core hosts; a stale, duplicate or "
+          f"badly tagged list entry stops every leg with exit 3; an untagged list stops leg {SERIAL_LEG} with its reason")
     return 0
 
 
