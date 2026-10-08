@@ -107,7 +107,7 @@ FAKE_CLIENT = textwrap.dedent('''
                 json.dump(self.maps, f)
 
     @asynccontextmanager
-    async def open_room_collab(url, room, token, kind="markdown"):
+    async def open_room_commons(url, room, token, kind="markdown"):
         if os.environ.get("CRONS_FAKE_DOWN"):
             raise ConnectionError("collab service unreachable")
         assert kind == "db" and room == os.environ.get("CRONS_FAKE_ROOM", room)
@@ -129,10 +129,11 @@ ENTRIES = [
 
 
 def fake_capability(ws: Path) -> Path:
+    """The room-commons layout a current install has."""
     d = ws / "skills" / "room-commons" / "scripts"
     d.mkdir(parents=True)
-    (d / "room_collab.py").write_text(FAKE_CLI)
-    (d / "room_collab_client.py").write_text(FAKE_CLIENT)
+    (d / "room_commons.py").write_text(FAKE_CLI)
+    (d / "room_commons_client.py").write_text(FAKE_CLIENT)
     (d / "room_database.py").write_text(FAKE_DATABASE)
     return d
 
@@ -360,6 +361,27 @@ class TouchAndStatus(Base):
         self.run_cli("sync")
         self.assertEqual(self.row("inbox")["Status"], "Paused")
 
+    def test_a_status_set_by_hand_survives_a_sync_that_writes(self):
+        self.run_cli("sync")
+        self.run_cli("status", "inbox", "Paused")
+        self.run_cli("status", "main-loop", "Finished")
+        edited = [dict(e) for e in ENTRIES]
+        edited[6]["prompt_skill"] = "inbox-score-v2"
+        self.write_crons(HOST, edited)
+        code, out = self.run_cli("sync")  # crons.json changed: the digest skip does not apply
+        self.assertIn("synced 8 rows", out)
+        self.assertEqual((self.row("inbox")["Status"], self.row("inbox")["What"]), ("Paused", "/inbox-score-v2"))
+        self.assertEqual(self.row("main-loop")["Status"], "Active")  # Finished with its entry present: revived
+        self.run_cli("status", "inbox", "Paused")
+        self.run_cli("sync", "--force")
+        self.assertEqual(self.row("inbox")["Status"], "Paused")
+
+    def test_touch_does_not_reset_status(self):
+        self.run_cli("sync")
+        self.run_cli("status", "inbox", "Paused")
+        self.run_cli("touch", "inbox", "skipped")
+        self.assertEqual(self.row("inbox")["Status"], "Paused")
+
     def test_status_refuses_an_unknown_value(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             self.run_cli("status", "inbox", "Gone")
@@ -391,6 +413,27 @@ class Adopt(Base):
         self.run_cli("touch", "parked", "skipped")
         lr = self.maps()["cells"]["dB1|r1|lr"]["v"]
         self.assertRegex(lr["start"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")  # a date column takes the date shape
+
+    def test_hand_typed_cells_on_an_adopted_row_survive(self):
+        maps = {"dbs": {"dB1": {"name": "Crons", "order": 1024, "created": 1, "by": AGENT}},
+                "props": {"dB1|name": {"name": "Cron", "type": "title", "order": 1024},
+                          "dB1|sch": {"name": "Schedule", "type": "text", "order": 2048},
+                          "dB1|own": {"name": "Owner", "type": "text", "order": 3072},
+                          "dB1|st": {"name": "Status", "type": "text", "order": 4096}},
+                "rows": {"dB1|r1": {"order": 1024, "created": 1, "by": AGENT}},
+                "cells": {"dB1|r1|name": {"v": "Main-Loop", "updated": 1, "by": AGENT},
+                          "dB1|r1|sch": {"v": "every 10m (GTM room)", "updated": 1, "by": AGENT},
+                          "dB1|r1|own": {"v": "Bassil", "updated": 1, "by": AGENT},
+                          "dB1|r1|st": {"v": "Paused", "updated": 1, "by": AGENT}}}
+        self.state.write_text(json.dumps(maps))
+        self.assertEqual(self.run_cli("sync")[0], 0)
+        self.run_cli("sync", "--force")
+        cells = self.maps()["cells"]
+        self.assertEqual([cells[f"dB1|r1|{p}"]["v"] for p in ("name", "sch", "own", "st")],
+                         ["Main-Loop", "every 10m (GTM room)", "Bassil", "Paused"])
+        r = next(x for x in self.table() if x["Cron"] == "Main-Loop")
+        self.assertEqual((r["Host"], r["Runner"], r["What"]), (HOST, "session", "/proactive-loop"))  # empty: filled
+        self.assertEqual(len(self.table()), 8)  # adopted, not duplicated
 
     def test_two_databases_with_the_name_refuse(self):
         maps = {"dbs": {"a": {"name": "Crons", "order": 1, "created": 1, "by": AGENT},
@@ -438,6 +481,22 @@ class FailOpen(Base):
         self.assertIn("!shared:test.invalid", out)
         code, out = self.run_cli("--room", "!cli:test.invalid", "sync")
         self.assertEqual(code, ct.EXIT_UNAVAILABLE)  # the fake only serves the shared room
+
+
+class Layouts(unittest.TestCase):
+    def test_room_commons_is_preferred_and_the_room_collab_shim_is_the_fallback(self):
+        with tempfile.TemporaryDirectory() as t:
+            ws = Path(t)
+            (ws / "state").mkdir()
+            (ws / "state" / "owner-routing.json").write_text(json.dumps({"owner_dm": ROOM, "identity": AGENT}))
+            shim = ws / "skills" / "room-collab" / "scripts"
+            shim.mkdir(parents=True)
+            for m in ("room_collab.py", "room_collab_client.py"):
+                (shim / m).write_text("")
+            with mock.patch.object(ct, "REPO", ws / "none"):
+                self.assertEqual(ct.target(ws, None, {})[0], shim)
+                canon = fake_capability(ws)
+                self.assertEqual(ct.target(ws, None, {})[0], canon)
 
 
 class Delegation(unittest.TestCase):

@@ -4,13 +4,19 @@ can see what every agent has scheduled.
 
   sync                  upsert this host's rows from <workspace>/hosts/<host>/crons.json; an entry
                         gone from it is marked Finished (its row is kept). Skipped when the rows it
-                        would write match the last synced digest (--force writes anyway).
+                        would write match the last synced digest; --force writes anyway, which is
+                        also how rows deleted on the room side are restored.
   touch NAME RESULT     stamp "Last ran (UTC)" and "Last result" on this host's row.
   status NAME STATUS    set Status (Active, Paused or Finished) on this host's row.
 
-Rows are keyed per host and cron name, so two hosts never write each other's rows. sync owns every
-column but "Last ran (UTC)" and "Last result", which only `touch` writes. A database already named
-"Crons" in the room is adopted in place: matching columns are reused, missing ones are added.
+Rows are keyed per host and cron name, so two hosts never write each other's rows. sync owns the
+columns crons.json defines on the rows it created; "Last ran (UTC)" and "Last result" are written
+only by `touch`. Status is set by sync only on a new row, an entry gone from crons.json (Finished),
+a Finished row whose entry is back, or an empty cell; otherwise a Status set by `status` stays.
+
+A database already named "Crons" in the room is adopted in place: matching columns are reused,
+missing ones are added. A row sync did not create (adopted by its title) only has its empty cells
+filled from crons.json; a value someone typed there is never overwritten.
 
 The room is CRONS_TABLE_ROOM (--room, env, then this skill's manifest), else the owner's DM room.
 Fail-open: without the room capability, a room, an identity or a connection, one line is printed
@@ -37,9 +43,10 @@ from cron_ownership import entry_owner  # noqa: E402
 from owner_room_access import (agent_identity, capability_scripts, owner_dm, owner_routing,  # noqa: E402
                                resolve_credentials)
 
-# The skill directories that provide the room capability, canonical name first.
-CAPABILITY_SKILLS = ("room-commons", "room-collab")
-CAPABILITY_MODULES = ("room_collab_client.py", "room_collab.py")
+# (skill directory, CLI module, client module, its open function), canonical layout first.
+CAPABILITY_LAYOUTS = (("room-commons", "room_commons", "room_commons_client", "open_room_commons"),
+                      ("room-collab", "room_collab", "room_collab_client", "open_room_collab"))
+TIMEOUT_SEC = 120.0
 ROOM_KEY = "CRONS_TABLE_ROOM"
 DB_KEY = "CRONS_TABLE_DB"
 DEFAULT_DB = "Crons"
@@ -299,24 +306,44 @@ class Plan:
             self._write("cells", self.rd.key(self.db, row, self.prop[cid]),
                         None if v is None else {"v": v, "updated": self.now_ms, "by": self.by})
 
-    def upsert(self, host: str, name: str, values: dict, on_create: Optional[dict] = None) -> str:
+    def _empty(self, row: str, cid: str) -> bool:
+        return self._cell(row, cid) in (None, "", [])
+
+    def upsert(self, host: str, name: str, derived: dict, explicit: Optional[dict] = None,
+               on_create: Optional[dict] = None) -> str:
+        """`derived` (from crons.json) is written on a row this host's sync created, and only fills
+        empty cells on an adopted row; `explicit` is always written; `on_create` only on a new row."""
         row = self.find_row(host, name)
+        base = {"cron": name, "host": host, **derived}
         if row is None:
             row = self.row_id(host, name)
             last = max((r["order"] for r in self._read()["rows"]), default=0)
             self._write("rows", self.rd.key(self.db, row), {"order": last + GAP, "created": self.now_ms, "by": self.by})
             self.created.append(name)
-            values = {**(on_create or {}), **values}
-        self.set_cells(row, {"cron": name, "host": host, **values})
+            base.update(on_create or {})
+        elif row != self.row_id(host, name):
+            base = {c: v for c, v in base.items() if self._empty(row, c)}
+        self.set_cells(row, {**base, **(explicit or {})})
         return row
+
+
+def _split(derived: Optional[dict]) -> tuple:
+    """(the crons.json columns sync may refresh, the status a new row starts with)."""
+    d = {k: v for k, v in (derived or {}).items() if k not in STAMPED}
+    status = d.pop("status", None)
+    return d, ({"status": status} if status else {})
 
 
 def plan_sync(rd, maps: dict, db_name: str, host: str, rows: dict, by: str, now_ms: int) -> Plan:
     plan = Plan(rd, maps, db_name, by, now_ms)
+    kept = set()
     for name, values in rows.items():
-        plan.upsert(host, name, {k: v for k, v in values.items() if k not in STAMPED})
+        derived, start = _split(values)
+        row = plan.find_row(host, name)
+        reset = row is not None and (plan._display(row, "status") == "Finished" or plan._empty(row, "status"))
+        kept.add(plan.upsert(host, name, derived, start if reset else None, start))
     for name, row in plan.host_rows(host).items():
-        if name not in rows and plan._display(row, "status") != "Finished":
+        if row not in kept and plan._display(row, "status") != "Finished":
             plan.set_cells(row, {"status": "Finished"})
             plan.finished.append(name)
     return plan
@@ -325,15 +352,16 @@ def plan_sync(rd, maps: dict, db_name: str, host: str, rows: dict, by: str, now_
 def plan_touch(rd, maps: dict, db_name: str, host: str, name: str, result: str, derived: Optional[dict],
                by: str, now_ms: int) -> Plan:
     plan = Plan(rd, maps, db_name, by, now_ms)
-    plan.upsert(host, name, {"last_ran": utc_minute(now_ms / 1000), "last_result": _one_line(result, 2000)},
-                derived)
+    cols, start = _split(derived)
+    plan.upsert(host, name, cols,
+                {"last_ran": utc_minute(now_ms / 1000), "last_result": _one_line(result, 2000)}, start)
     return plan
 
 
 def plan_status(rd, maps: dict, db_name: str, host: str, name: str, status: str, derived: Optional[dict],
                 by: str, now_ms: int) -> Plan:
     plan = Plan(rd, maps, db_name, by, now_ms)
-    plan.upsert(host, name, {"status": status}, derived)
+    plan.upsert(host, name, _split(derived)[0], {"status": status})
     return plan
 
 
@@ -386,10 +414,11 @@ class Unavailable(Exception):
 
 def target(workspace: Path, room_cli: Optional[str], environ) -> tuple:
     """(capability scripts dir, room, identity); Unavailable when any is missing."""
-    scripts = capability_scripts((Path(workspace) / "skills", REPO / "skills"), CAPABILITY_SKILLS,
-                                 CAPABILITY_MODULES)
+    roots = (Path(workspace) / "skills", REPO / "skills")
+    scripts = next((s for s in (capability_scripts(roots, (skill,), (f"{cli}.py", f"{client}.py"))
+                                for skill, cli, client, _ in CAPABILITY_LAYOUTS) if s), None)
     if scripts is None:
-        raise Unavailable(f"no room capability installed ({' or '.join(CAPABILITY_SKILLS)})")
+        raise Unavailable("no room capability installed (" + " or ".join(x[0] for x in CAPABILITY_LAYOUTS) + ")")
     routing = owner_routing(workspace)
     room = configured(ROOM_KEY, room_cli, environ) or owner_dm(routing)
     if not room:
@@ -401,21 +430,22 @@ def target(workspace: Path, room_cli: Optional[str], environ) -> tuple:
 
 
 def load_capability(scripts: Path):
-    """(room_collab, open_room_collab, room_database) from the injected capability; its client may
-    re-exec this process onto an interpreter that has its dependencies, before anything is written."""
+    """(the CLI module, its open function, room_database) from the injected capability; its client
+    may re-exec this process onto an interpreter that has its dependencies, before anything is written."""
     if str(scripts) not in sys.path:
         sys.path.insert(0, str(scripts))
-    import room_collab
-    from room_collab_client import open_room_collab
+    _, cli, client, opener = next(x for x in CAPABILITY_LAYOUTS if (Path(scripts) / f"{x[2]}.py").is_file())
+    cap = importlib.import_module(cli)
+    open_room = getattr(importlib.import_module(client), opener)
     import room_database
-    return room_collab, open_room_collab, room_database
+    return cap, open_room, room_database
 
 
 async def run_plan(scripts: Path, room: str, user: str, build):
     """Open the room's databases, plan with `build(rd, maps, by, now_ms)`, write it in one update."""
-    cap, open_room_collab, rd = load_capability(scripts)
+    cap, open_room, rd = load_capability(scripts)
     url, token = resolve_credentials(cap, None)
-    async with open_room_collab(url, room, token, kind="db") as doc:
+    async with open_room(url, room, token, kind="db") as doc:
         plan = build(rd, doc.database, user, int(time.time() * 1000))
         if plan.writes:
             await doc.put_database(plan.writes)
@@ -445,6 +475,7 @@ def main(argv=None, environ=None, runner=run_plan) -> int:
     ap.add_argument("--host", default=None, help="host label (default: this host's)")
     ap.add_argument("--room", default=None, help=f"room id (default: {ROOM_KEY}, else the owner's DM)")
     ap.add_argument("--db", default=None, help=f"database name (default: {DB_KEY}, else {DEFAULT_DB!r})")
+    ap.add_argument("--timeout", type=float, default=TIMEOUT_SEC, help="seconds for the whole room exchange")
     sub = ap.add_subparsers(dest="command", required=True)
     s = sub.add_parser("sync")
     s.add_argument("--force", action="store_true", help="write even when nothing changed since the last sync")
@@ -489,7 +520,6 @@ def main(argv=None, environ=None, runner=run_plan) -> int:
             print(f"crons-table: not written — {unavailable}")
             return EXIT_UNAVAILABLE
         derived = _derived(workspace, host, args.name)
-        derived = {k: v for k, v in (derived or {}).items() if k not in STAMPED}
 
         def build(rd, maps, by, now_ms):
             if args.command == "touch":
@@ -497,7 +527,7 @@ def main(argv=None, environ=None, runner=run_plan) -> int:
             return plan_status(rd, maps, db_name, host, args.name, args.status, derived, by, now_ms)
 
     try:
-        plan = asyncio.run(runner(scripts, room, user, build))
+        plan = asyncio.run(asyncio.wait_for(runner(scripts, room, user, build), args.timeout))
     except (Exception, SystemExit) as e:  # noqa: BLE001 — fail-open: one line, never a raise into the caller
         print(f"crons-table: not written — {type(e).__name__}: {e}")
         return EXIT_UNAVAILABLE

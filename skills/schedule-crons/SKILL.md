@@ -199,7 +199,8 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    Then publish this host's schedule to the owner's **Crons** room database, so anyone can see what
    every agent has scheduled: `python3 skills/schedule-crons/scripts/crons_table.py sync`. It is
    fail-open (one line and a non-zero exit when the room is unreachable) and never blocks
-   registration; an unchanged `crons.json` writes nothing. A cron may end its prompt with
+   registration; an unchanged `crons.json` writes nothing, so rows deleted in the room come back
+   only with `sync --force`. A cron may end its prompt with
    `python3 skills/schedule-crons/scripts/crons_table.py touch <name> "<one-line result>"` to stamp
    its row's Last ran (UTC) and Last result.
 
