@@ -143,8 +143,11 @@ class HookTests(unittest.TestCase):
         self.ws.mkdir()
         self.marker = turn_failure_path(self.ws / "state")
 
-    def run_hook(self, stdin, script=HOOK, extra=None):
-        env = dict(os.environ, SUTANDO_WORKSPACE_DIR=str(self.ws), **(extra or {}))
+    def run_hook(self, stdin, script=HOOK, extra=None, identity=None):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SUTANDO_CORE_SESSION", "SUTANDO_INSTANCE_ID")}
+        env.update({"SUTANDO_CORE_SESSION": "1"} if identity is None else identity)
+        env.update(SUTANDO_WORKSPACE_DIR=str(self.ws), **(extra or {}))
         return subprocess.run(["bash", str(script)], input=stdin, env=env,
                               capture_output=True, text=True, timeout=60)
 
@@ -154,6 +157,21 @@ class HookTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         rec = json.loads(self.marker.read_text())
         self.assertEqual((rec["error"], rec["session_id"], rec["recovered_at"]), ("server_error", "abc", None))
+
+    def test_a_guest_session_records_nothing(self):
+        stdin = json.dumps({"hook_event_name": "StopFailure", "session_id": "guest-review-session",
+                            "error": "server_error"})
+        for identity in ({}, {"SUTANDO_CORE_SESSION": "0"}):
+            with self.subTest(identity=identity):
+                r = self.run_hook(stdin, identity=identity)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertFalse(self.marker.exists(), "a guest session's API error was blamed on the core")
+
+    def test_a_pool_worker_records_its_own_failure(self):
+        r = self.run_hook(json.dumps({"hook_event_name": "StopFailure", "error": "overloaded"}),
+                          identity={"SUTANDO_INSTANCE_ID": "w1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(list((self.ws / "state" / "core-turn-failure").glob("*.json")), r.stderr)
 
     def test_authentication_failed_is_ignored(self):
         r = self.run_hook(json.dumps({"hook_event_name": "StopFailure", "error": "authentication_failed"}))

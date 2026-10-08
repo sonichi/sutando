@@ -29,10 +29,9 @@ if [ "${SUTANDO_CORE_SESSION:-}" = "0" ] && [ -z "${SUTANDO_INSTANCE_ID:-}" ]; t
   echo '{}'
   exit 0
 fi
+. "$REPO_DIR/src/session_identity.sh"
 UNIDENTIFIED=""
-if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "${SUTANDO_CORE_SESSION:-}" != "1" ]; then
-  UNIDENTIFIED=1
-fi
+sutando_session_identified || UNIDENTIFIED=1
 WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
 # Fall back to the documented default, never to the repo root: a resolver
 # failure must still leave this pointed at a real queue rather than silently

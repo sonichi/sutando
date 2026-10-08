@@ -2,6 +2,9 @@
 # StopFailure hook: an API error ended the turn, so the prompt it was running is lost.
 # Records it for the task notifier (src/delivery/turn_failure.py); fails open and silent.
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Only the core's (or a pool worker's) own turn can lose a prompt the notifier typed.
+. "$REPO_DIR/src/session_identity.sh"
+sutando_session_identified || exit 0
 
 if ! PYBIN="$(bash "$REPO_DIR/scripts/sutando-config.sh" python-bin 2>/dev/null)" \
    || [ -z "$PYBIN" ] || [ ! -x "$PYBIN" ]; then
