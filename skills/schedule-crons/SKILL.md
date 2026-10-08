@@ -196,6 +196,13 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    with no digest map at all. Omitting the field is safe (the probe skips the check); a WRONG map
    would report drift that is not there.
 
+   Then publish this host's schedule to the owner's **Crons** room database, so anyone can see what
+   every agent has scheduled: `python3 skills/schedule-crons/scripts/crons_table.py sync`. It is
+   fail-open (one line and a non-zero exit when the room is unreachable) and never blocks
+   registration; an unchanged `crons.json` writes nothing. A cron may end its prompt with
+   `python3 skills/schedule-crons/scripts/crons_table.py touch <name> "<one-line result>"` to stamp
+   its row's Last ran (UTC) and Last result.
+
 6. Confirm what was scheduled — note whether the proactive-loop fallback was triggered (informs operator that crons.json may need a persistent entry).
 
 ## Adding New Crons
