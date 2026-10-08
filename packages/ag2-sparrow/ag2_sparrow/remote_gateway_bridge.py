@@ -4419,14 +4419,20 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         return False
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
         _ENGINE_COUNTS["core_confirmed"] += 1
-        # A confirmed send was otherwise silent, so nothing on the happy path
-        # told a live round trip apart from the legacy one it replaces.
-        _log(f"result {tid} delivered via DeliveryCore "
+        # Only the broker's own `delivered` read-back may be logged as delivered;
+        # an accept alone is recorded, not posted.
+        ref = getattr(res, "provider_ref", None)
+        what = ("delivered" if ref == "delivered" else
+                f"accepted by the broker, room delivery unconfirmed "
+                f"({ref or 'accepted'}),")
+        _log(f"result {tid} {what} via DeliveryCore "
              f"(provider={type(core.provider).__name__}, "
              f"backend={type(core.backend).__name__}, worker={core.worker})")
         return True
+    detail = getattr(res, "detail", "")
     _log(f"result POST not confirmed for {tid} "
-         f"({res.outcome.value if res.outcome else '?'}) — will retry")
+         f"({res.outcome.value if res.outcome else '?'}"
+         f"{': ' + detail if detail else ''}) — will retry")
     return False
 
 
@@ -4648,7 +4654,7 @@ def _post_ready_results(inflight: set[str]) -> None:
         _forget_task_media(tid)
         _forget_dedup_alias(tid)
         changed = True
-        _log(f"delivered result for {tid}")
+        _log(f"archived result for {tid}")
     if changed:
         _save_inflight(inflight)
 
