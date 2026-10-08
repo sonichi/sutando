@@ -42,7 +42,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate } from './meeting-dictation.js';
+import { attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY } from './meeting-dictation.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
 	if (process.platform === 'win32') {
@@ -541,7 +541,7 @@ const switchModeTool: ToolDefinition = {
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
 			meetingEntry.schedule();
-			return { status: 'meeting_mode', transcribing: true };
+			return { status: 'meeting_mode', transcribing: true, say: MEETING_ENTRY_SAY, instruction: `Say exactly: "${MEETING_ENTRY_SAY}" Then stop; your next sentence ends your turn.` };
 		}
 		await meetingDictation?.exit();
 		if (mode === 'presenter') {
