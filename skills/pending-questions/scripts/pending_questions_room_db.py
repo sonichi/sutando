@@ -484,11 +484,50 @@ async def apply(doc, req: dict, by: str, now_ms: int, link: Optional[str] = None
     raise ValueError(f"unknown op {op!r}")
 
 
+def _load_capability(scripts: str):
+    """Import the injected capability. Its client may re-exec this process onto an interpreter
+    that has its dependencies, so this runs before stdin is read: a re-exec reads it afresh."""
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import room_collab  # noqa: PLC0415 — the injected capability
+    import room_collab_client  # noqa: PLC0415, F401
+    return room_collab
+
+
+def channel_credentials(cap, environ=None) -> dict:
+    """The capability's credential variables from the AG2 Space channel env file the shared
+    resolver picks; empty when a variable already names either, so the two never mix."""
+    from channel_env_resolve import resolve_channel_env
+    from channel_token import token_from_env_file
+    from util_paths import claude_home_path
+    env = os.environ if environ is None else environ
+    names = (*getattr(cap, "URL_VARS", ()), *getattr(cap, "TOKEN_VARS", ()))
+    if not names or any(env.get(v) for v in names):
+        return {}
+    path = resolve_channel_env(claude_home_path("channels"), "ag2space")
+    if path is None:
+        return {}
+    found = {v: token_from_env_file(v, path) for v in names}
+    return {v: x for v, x in found.items() if x}
+
+
+def _credentials(cap, collab_url: Optional[str]) -> tuple:
+    """(url, token) by the capability's own order; when that finds neither, from the channel
+    env file the shared resolver picks (a desktop install keeps them there)."""
+    try:
+        return cap.resolve_url(collab_url), cap.resolve_token(None)
+    except Exception:  # noqa: BLE001 — retried below only when the env file has them
+        extra = {} if collab_url else channel_credentials(cap)
+        if not extra:
+            raise
+    os.environ.update(extra)
+    return cap.resolve_url(None), cap.resolve_token(None)
+
+
 async def _serve(args, req: dict) -> object:
-    sys.path.insert(0, args.skill_scripts)
-    from room_collab import resolve_token, resolve_url  # noqa: PLC0415 — the injected capability
+    cap = _load_capability(args.skill_scripts)
     from room_collab_client import open_room_collab  # noqa: PLC0415
-    url, token = resolve_url(args.collab_url or None), resolve_token(None)
+    url, token = _credentials(cap, args.collab_url or None)
     link = LINK_TEMPLATE.format(origin=url.rstrip("/"), room=args.room, db=req["schema"]["id"])
     async with open_room_collab(url, args.room, token, kind="db") as doc:
         result = await apply(doc, req, args.user_id, int(time.time() * 1000), link)
@@ -505,9 +544,10 @@ def main(argv=None) -> int:
     ap.add_argument("--collab-url", default=None)
     args = ap.parse_args(argv)
     try:
+        _load_capability(args.skill_scripts)
         req = json.loads(sys.stdin.read())
         result = asyncio.run(_serve(args, req))
-    except Exception as e:  # noqa: BLE001 — the caller keeps the question in the outbox on any failure
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — the caller keeps the question in the outbox on any failure
         print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}))
         return 1
     print(json.dumps({"ok": True, "result": result}, ensure_ascii=False))
