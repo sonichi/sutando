@@ -43,6 +43,7 @@ import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
 import { attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY } from './meeting-dictation.js';
+import { meetingHoldsModel } from './meeting-input-hold.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
 	if (process.platform === 'win32') {
@@ -1884,7 +1885,8 @@ async function main() {
 	// Watch for phone call results and inject into voice conversation
 	const callResultFile = join(CALL_RESULTS_DIR, 'latest-result.json');
 	setInterval(() => {
-		if (!session.clientConnected || !existsSync(callResultFile)) return;
+		// In a meeting injectText sends nothing, so the file waits until the meeting ends.
+		if (!session.clientConnected || meetingHoldsModel(session) || !existsSync(callResultFile)) return;
 		try {
 			const data = JSON.parse(readFileSync(callResultFile, 'utf-8'));
 			unlinkSync(callResultFile);

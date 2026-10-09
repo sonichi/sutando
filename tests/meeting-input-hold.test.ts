@@ -62,3 +62,13 @@ describe('meeting mode holds direct model input', () => {
 		assert.match(s.sent[0], /Health check: all services up\./);
 	});
 });
+
+describe('the phone call-result poller', () => {
+	it('leaves latest-result.json in place during a meeting instead of deleting it unsent', async () => {
+		const { readFileSync } = await import('node:fs');
+		const src = readFileSync(join(import.meta.dirname, '..', 'src', 'voice-agent.ts'), 'utf-8');
+		const poller = src.slice(src.indexOf("join(CALL_RESULTS_DIR, 'latest-result.json')"));
+		const guard = poller.indexOf('meetingHoldsModel(session)');
+		assert.ok(guard !== -1 && guard < poller.indexOf('unlinkSync(callResultFile)'), 'the meeting check returns before the file is deleted');
+	});
+});
