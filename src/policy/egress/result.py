@@ -34,9 +34,11 @@ from typing import NamedTuple
 try:  # pragma: no cover - the packaged twin exercises the relative imports
     from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
     from .local_task_protocol import canonical_access_tier, parse_task_headers
+    from .file_lock import locked_file
 except ImportError:
     from result_markers import parse_markers  # monorepo src/ on sys.path
     from local_task_protocol import canonical_access_tier, parse_task_headers
+    from file_lock import locked_file
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
@@ -396,6 +398,34 @@ def materialize_withheld_verdict(verdict: TeamResultVerdict, body: str,
         return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT_UNSAVED, verdict.reason)
     return TeamResultVerdict(
         VERDICT_SUPPRESS, "[no-send]", f"{verdict.reason}; pending private owner review")
+
+
+def claim_withheld_decision(path: Path, updates: dict) -> "dict | None":
+    """Apply the owner's decision only to a record still awaiting it; None means it
+    was already decided (or is gone), so the reply must change nothing."""
+    path = Path(path)
+    with locked_file(path.parent / ".decision.lock", create_mode=0o600):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(record, dict) or record.get("status") != "awaiting_owner":
+            return None
+        record.update(updates)
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(record, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        return record
 
 
 def suppressed_record_path(state_dir: Path, task_id: str) -> Path:

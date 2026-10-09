@@ -939,6 +939,8 @@ def _publish_review(path: Path, record: dict) -> bool:
                        "card_resolution_pending": True})
         _atomic_private_json(path, record)
         return False
+    if (_read_private_json(path) or {}).get("status") != "publish_pending":
+        return False  # only a won release claim may post the body
     answer = _req("POST", "/v1/room", {
         "op": "message", "room_id": room, "body": body,
         "dedupe_key": f"withheld-publish:{record['review_id']}",
@@ -1023,6 +1025,15 @@ def _handle_hitl_action(task: dict):
     return out or False
 
 
+def _claim_review_decision(task: dict, path: Path, updates: dict) -> "dict | None":
+    # The first durable decision is final; a later or racing reply is closed and logged.
+    claimed = team_result_guard.claim_withheld_decision(path, updates)
+    if claimed is None:
+        _log(f"withheld review {path.stem}: already decided; reply {task.get('id')} ignored")
+    _queue_review_control_result(task)
+    return claimed
+
+
 def _handle_review_decision(task: dict) -> bool:
     task_id = str(task.get("id") or "")
     if task_id and _control_result_path(task_id).is_file():
@@ -1037,10 +1048,11 @@ def _handle_review_decision(task: dict) -> bool:
             _resolve_review_card(path, record)
         return True  # delivery retry of the same owner decision
     if answer == "yes":
-        record.update({"status": "kept_private", "resolved_at": time.time(),
-                       "decision": "sensitive", "card_resolution_pending": True})
-        _atomic_private_json(path, record)
-        _queue_review_control_result(task)
+        record = _claim_review_decision(task, path, {
+            "status": "kept_private", "resolved_at": time.time(),
+            "decision": "sensitive", "card_resolution_pending": True})
+        if record is None:
+            return True
         try:
             _resolve_review_card(path, record)
         except Exception as exc:  # noqa: BLE001 — durable pending state retries
@@ -1048,10 +1060,11 @@ def _handle_review_decision(task: dict) -> bool:
         return True
     # Persist release before the network call; pending retries use a stable
     # dedupe key so they cannot duplicate the disclosure.
-    record.update({"status": "publish_pending", "resolved_at": time.time(),
-                   "decision": "false_positive", "card_resolution_pending": True})
-    _atomic_private_json(path, record)
-    _queue_review_control_result(task)
+    record = _claim_review_decision(task, path, {
+        "status": "publish_pending", "resolved_at": time.time(),
+        "decision": "false_positive", "card_resolution_pending": True})
+    if record is None:
+        return True
     try:
         _resolve_review_card(path, record)
         if _publish_review(path, record):
