@@ -943,6 +943,16 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
         if d.get("status") != "PARKED":
             return RequeueOutcome.NOT_PARKED
         _release_locked(root, item_id, force=True)
+        # The parked body stays in the id's history: this one explicit retry
+        # is allowed, an automatic republish of the same body later is not.
+        own = d.get("payload_digest")
+        if not isinstance(own, str) and isinstance(d.get("payload"), str):
+            own = hashlib.sha256(d["payload"].encode("utf-8")).hexdigest()
+        if isinstance(own, str):
+            history = [x for x in d.get("parked_digests") or [] if isinstance(x, str)]
+            if own not in history:
+                history.append(own)
+            d["parked_digests"] = history
         d["resend_epoch"] = int(d.get("resend_epoch", 0) or 0) + 1
         d["status"] = "QUEUED"
         d["reason"] = None

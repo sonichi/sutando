@@ -107,6 +107,9 @@ class DeliveryCore:
             payload = stored_payload(token)
         key = idempotency_key(item_id, _resend_epoch(self.backend, item_id))
         outcome, destination, permanent, detail = self._attempt(item_id, payload, key)
+        # An attempt that may have crossed the boundary taints the whole cycle:
+        # a later refusal cannot prove this one never landed.
+        ambiguous = outcome is DeliveryOutcome.OUTCOME_UNKNOWN
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities
             if caps.reconcile_capable:
@@ -115,6 +118,7 @@ class DeliveryCore:
                     # The reconciliation receipt is the statement about THIS
                     # item; its destination replaces the ambiguous attempt's.
                     outcome, destination = resolved
+                    ambiguous = outcome is DeliveryOutcome.OUTCOME_UNKNOWN
             elif caps.idempotent_send:
                 if not self.policy.defer_idempotent_resend:
                     outcome, destination, permanent, detail = self._attempt(item_id, payload, key)
@@ -124,11 +128,13 @@ class DeliveryCore:
                     outcome = DeliveryOutcome.NOT_DELIVERED
         # The ceiling rides WITH the completion: parking after the claim
         # is released lets a successor confirm in the gap.
-        terminal = {"terminal_reason": "permanent-refusal"} if permanent else {}
+        extra = {"terminal_reason": "permanent-refusal"} if permanent else {}
+        if ambiguous:
+            extra["ambiguous"] = True
         self.backend.complete(token, outcome,
                               park_at_attempts=self.policy.max_attempts,
                               provider=type(self.provider).__name__,
-                              destination=destination, **terminal)
+                              destination=destination, **extra)
         return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome, detail=detail)
 
     def recover(self) -> RecoverReport:

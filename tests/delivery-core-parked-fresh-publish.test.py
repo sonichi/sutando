@@ -5,18 +5,22 @@ published under the same id gets its own delivery cycle; after an ambiguous
 park (lost responses, exhausted retries, outcome-unknown) every payload stays
 refused, because the broker dedupes on the envelope id and would keep the
 parked body while reporting the new one delivered. Every payload the id ever
-parked on stays refused, across a later delivery too.
+parked on stays refused, across a later delivery and an operator requeue too; a
+cycle with any ambiguous attempt stays refused even when its last attempt was a
+definite refusal; and the parked history is bounded, saturating the id closed.
 
 Run: python3 tests/delivery-core-parked-fresh-publish.test.py"""
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 import urllib.error
+from unittest import mock
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -25,7 +29,7 @@ if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 from ag2_sparrow.delivery_core import (  # noqa: E402
-    DeliveryCore, DeliveryOutcome, DeliveryReceipt, DesignAClaimBackend,
+    BackendCapabilities, DeliveryCore, DeliveryOutcome, DeliveryReceipt, DesignAClaimBackend,
     DrainStatus, ProviderCapabilities, ProviderIndeterminate, ProviderRefused,
     ProviderPermanentRefused, RetryPolicy)
 from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceResultProvider  # noqa: E402
@@ -306,22 +310,34 @@ class _Broker:
     """A request double for the real AG2 Space provider: dedupes by envelope
     id and keeps the FIRST body it stored, like the gateway it stands in for.
     mode: 'lose' stores then loses the response; 'accept' stores or dedupes;
-    'refuse' declines without storing."""
+    'refuse' declines without storing; 'http:503' stores then answers 503;
+    'http:409' declines with a 409 without storing. `script` runs one mode per
+    POST, then falls back to `mode`."""
 
-    def __init__(self, mode: str):
+    def __init__(self, mode: str, script: list[str] | None = None):
         self.mode = mode
+        self.script = list(script or [])
         self.stored: dict[str, dict] = {}
         self.posts: list[dict] = []
 
+    def _http(self, code: int):
+        return urllib.error.HTTPError("http://broker/v1/results", code, "scripted", {},
+                                      io.BytesIO(b""))
+
     def request(self, method, path, payload):
         self.posts.append(payload)
-        if self.mode == "refuse":
+        mode = self.script.pop(0) if self.script else self.mode
+        if mode == "refuse":
             return {"ok": False, "error": "declined"}
+        if mode == "http:409":
+            raise self._http(409)
         duplicate = payload["id"] in self.stored
         if not duplicate:
             self.stored[payload["id"]] = payload
-        if self.mode == "lose":
+        if mode == "lose":
             raise urllib.error.URLError("response lost after the broker stored it")
+        if mode == "http:503":
+            raise self._http(503)
         return {"ok": True, "duplicate": duplicate}
 
 
@@ -372,6 +388,174 @@ class ThroughTheRealProvider(unittest.TestCase):
         self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "DELIVERED")
         self.assertEqual(broker.stored[ITEM]["body"], "a later, different reply")
         self.assertEqual(len(broker.posts), 2)
+
+
+class TheWholeCycleMustBeDefinite(unittest.TestCase):
+    """A refusal on the LAST attempt proves nothing about an earlier one that
+    may have crossed the boundary: lost-then-409, lost-then-ok:false and
+    503-then-refusal all park as permanent-refusal, and all must keep refusing
+    a successor (the reviewers' mixed-cycle probes)."""
+
+    MIXED = {"lost-then-409": ["lose", "http:409"],
+             "lost-then-ok-false": ["lose", "refuse"],
+             "503-then-refusal": ["http:503", "refuse"]}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _core(self, broker, root=None):
+        backend = DesignAClaimBackend(root or self.tmp / ".outbox")
+        core = DeliveryCore(backend, AG2SpaceResultProvider(broker.request),
+                            policy=RetryPolicy(max_attempts=CAP, defer_idempotent_resend=True),
+                            worker="gateway-result-drain")
+        return backend, core
+
+    def _mixed_park(self, script):
+        broker = _Broker("accept", script=script)
+        backend, core = self._core(broker)
+        self.assertTrue(backend.publish(ITEM, FIRST))
+        first = core.deliver_one(ITEM, FIRST)
+        self.assertIs(first.outcome, DeliveryOutcome.NOT_DELIVERED,
+                      "the lost response is folded into a retryable attempt")
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual(rec.get("status"), "READY")
+        self.assertTrue(rec.get("cycle_ambiguous"),
+                        "the taint is written before the fold, while the cycle is still live")
+        self.assertIs(core.deliver_one(ITEM, FIRST).status, DrainStatus.ATTEMPTED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual((rec.get("status"), rec.get("reason")), ("PARKED", "permanent-refusal"))
+        return broker, backend, core
+
+    def test_a_mixed_cycle_keeps_refusing_a_successor(self):
+        for name, script in self.MIXED.items():
+            with self.subTest(cycle=name):
+                self.tmp = Path(tempfile.mkdtemp())
+                broker, backend, core = self._mixed_park(script)
+                self.assertEqual(broker.stored.get(ITEM, {}).get("body"), "first reply",
+                                 "A landed on the first attempt; only its response was lost")
+                self.assertFalse(backend.publish(ITEM, SECOND),
+                                 "a later refusal does not prove the earlier attempt never landed")
+                self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.TERMINAL)
+                rec = outbox._read_item(backend.root, ITEM)
+                self.assertEqual(rec.get("status"), "PARKED", "B is quarantined, not DELIVERED")
+                self.assertEqual(broker.stored[ITEM]["body"], "first reply")
+                self.assertEqual(len(broker.posts), 2, "no POST for B")
+
+    def test_the_taint_survives_a_restart(self):
+        broker, backend, _ = self._mixed_park(self.MIXED["lost-then-ok-false"])
+        broker.mode = "accept"
+        restarted, core = self._core(broker, root=backend.root)      # fresh objects, same disk
+        self.assertFalse(restarted.publish(ITEM, SECOND))
+        self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.TERMINAL)
+        self.assertEqual(len(broker.posts), 2)
+
+    def test_the_taint_survives_an_operator_requeue_of_the_same_cycle(self):
+        broker, backend, core = self._mixed_park(self.MIXED["lost-then-ok-false"])
+        self.assertIs(outbox.requeue_item(backend.root, ITEM, operator="op"),
+                      outbox.RequeueOutcome.REQUEUED)
+        broker.script = ["refuse"]
+        self.assertIs(core.deliver_one(ITEM, FIRST).status, DrainStatus.ATTEMPTED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual((rec.get("status"), rec.get("reason")), ("PARKED", "permanent-refusal"))
+        self.assertFalse(backend.publish(ITEM, SECOND),
+                         "the explicit retry's refusal still cannot clear the earlier ambiguity")
+
+    def test_an_untainted_definite_refusal_still_admits_a_fresh_cycle(self):
+        broker = _Broker("accept", script=["refuse"])
+        backend, core = self._core(broker)
+        self.assertTrue(backend.publish(ITEM, FIRST))
+        self.assertIs(core.deliver_one(ITEM, FIRST).status, DrainStatus.ATTEMPTED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual((rec.get("status"), rec.get("reason")), ("PARKED", "permanent-refusal"))
+        self.assertFalse(rec.get("cycle_ambiguous", False))
+        self.assertTrue(backend.publish(ITEM, SECOND))
+        self.assertFalse(outbox._read_item(backend.root, ITEM).get("cycle_ambiguous", False),
+                         "a fresh cycle starts untainted")
+        self.assertIs(core.deliver_one(ITEM, SECOND).outcome, DeliveryOutcome.CONFIRMED)
+        self.assertEqual(broker.stored[ITEM]["body"], "a later, different reply")
+
+
+class HistoryIsBounded(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_the_parked_history_saturates_closed_instead_of_forgetting(self):
+        limit = DesignAClaimBackend.PARKED_HISTORY_LIMIT
+        prov = _Provider(refusals=10 ** 6)
+        backend, core = _core(self.tmp, prov)
+        accepted = 0
+        for n in range(2000):
+            body = json.dumps({"id": ITEM, "n": n}).encode()
+            if backend.publish(ITEM, body):
+                accepted += 1
+                self.assertIs(core.deliver_one(ITEM, body).status, DrainStatus.ATTEMPTED)
+        self.assertEqual(accepted, limit, "exactly the retained history's worth of cycles")
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertTrue(rec.get("saturated"))
+        self.assertEqual(rec.get("status"), "PARKED", "the item stays visible to the operator")
+        self.assertEqual(len(DesignAClaimBackend._parked_digests(rec)), limit)
+        size = outbox._item_path(backend.root, ITEM).stat().st_size
+        self.assertLess(size, 64 * (limit + 1) + 4096, f"record grew to {size} bytes")
+        self.assertFalse(backend.publish(ITEM, b'{"id": "x", "fresh": true}'),
+                         "saturated: every new payload is refused")
+        self.assertIs(core.deliver_one(ITEM, b'{"id": "x", "fresh": true}').status,
+                      DrainStatus.TERMINAL)
+        self.assertEqual(len(prov.calls), limit)
+        self.assertIn(str(limit), backend.cleanup().detail)
+
+    def test_saturation_outlives_a_delivery_of_the_id(self):
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        outbox._write_item(backend.root, ITEM, {
+            "item_id": ITEM, "status": "DELIVERED", "attempts": 1, "saturated": True,
+            "payload": FIRST.decode(), "payload_digest": hashlib.sha256(FIRST).hexdigest(),
+            "parked_digests": []})
+        self.assertFalse(backend.publish(ITEM, SECOND), "a saturated id admits nothing new")
+
+
+class RequeueKeepsTheParkedBody(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_one_explicit_retry_does_not_readmit_the_body_automatically(self):
+        prov = _Provider(refusals=1)
+        backend, core = _parked(self.tmp, prov)                       # A parks (definite)
+        self.assertIs(outbox.requeue_item(backend.root, ITEM, operator="op"),
+                      outbox.RequeueOutcome.REQUEUED)
+        self.assertIn(hashlib.sha256(FIRST).hexdigest(),
+                      outbox._read_item(backend.root, ITEM).get("parked_digests"),
+                      "the requeue folds the parked body into the id's history")
+        self.assertIs(core.deliver_one(ITEM, FIRST).outcome, DeliveryOutcome.CONFIRMED,
+                      "the operator's one retry goes out")
+        self.assertEqual(_status(backend), "DELIVERED")
+        self.assertFalse(backend.publish(ITEM, FIRST),
+                         "the same body is not readmitted by the delivered-republish path")
+        self.assertTrue(backend.publish(ITEM, SECOND), "a never-parked body still is")
+
+    def test_a_legacy_park_without_a_digest_is_folded_by_its_stored_text(self):
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        outbox._write_item(backend.root, ITEM, {"item_id": ITEM, "status": "PARKED",
+                                                "attempts": 1, "reason": "permanent-refusal",
+                                                "payload": FIRST.decode("utf-8")})
+        self.assertIs(outbox.requeue_item(backend.root, ITEM, operator="op"),
+                      outbox.RequeueOutcome.REQUEUED)
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("parked_digests"),
+                         [hashlib.sha256(FIRST).hexdigest()])
+
+
+class TheCapabilityIsReadNotDeclared(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_without_the_capability_a_definite_refusal_admits_nothing(self):
+        prov = _Provider(refusals=1)
+        backend, core = _parked(self.tmp, prov)
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("reason"), "permanent-refusal")
+        with mock.patch.object(DesignAClaimBackend, "capabilities",
+                               BackendCapabilities(supports_force_release=True,
+                                                   fresh_cycle_after_definite_park=False)):
+            self.assertFalse(backend.publish(ITEM, SECOND),
+                             "publish reads the flag; it is not a comment")
+        self.assertTrue(backend.publish(ITEM, SECOND))
 
 
 if __name__ == "__main__":

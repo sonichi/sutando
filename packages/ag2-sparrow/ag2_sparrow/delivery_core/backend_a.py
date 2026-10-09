@@ -28,6 +28,10 @@ class DesignAClaimBackend:
     # landed; any other park may hold a body the broker already accepted.
     DEFINITE_PARK_REASONS = frozenset({"permanent-refusal"})
 
+    # Parked-body history an id may carry; a park past it saturates the id
+    # closed (every new payload refused) instead of forgetting a body.
+    PARKED_HISTORY_LIMIT = 128
+
     def __init__(self, root: Path, reclaim_ttl_s: float = 300.0,
                  retry_schedule: Optional[outbox.RetrySchedule] = None,
                  clock=time.time, republish_delivered: bool = True):
@@ -53,12 +57,15 @@ class DesignAClaimBackend:
     def publish(self, item_id: str, payload: bytes, *,
                 republish_delivered: Optional[bool] = None) -> bool:
         """A PARKED id accepts a payload it has never parked on only when the
-        park is a definite refusal (the broker holds nothing for the id); an
-        ambiguous park (lost responses, exhausted retries, outcome-unknown)
-        refuses every payload, because the broker dedupes on the envelope id
-        and would silently keep the parked body in place of the new one. Every
-        payload the id ever parked on stays refused, across later deliveries
-        too, so bodies cannot alternate through the park."""
+        whole parked cycle is a definite refusal: its final reason is a
+        permanent refusal AND no attempt in it was ambiguous (a lost response
+        taints the cycle for good — a later refusal cannot prove the earlier
+        body never landed). Any other park refuses every payload, because the
+        broker dedupes on the envelope id and would silently keep the parked
+        body in place of the new one. Every payload the id ever parked on stays
+        refused, across later deliveries too, so bodies cannot alternate through
+        the park; once PARKED_HISTORY_LIMIT bodies have parked, the id is
+        saturated and refuses every new payload rather than forgetting one."""
         allow_republish = (self.republish_delivered if republish_delivered is None
                            else republish_delivered)
         text = payload.decode("utf-8", "replace")
@@ -69,10 +76,18 @@ class DesignAClaimBackend:
                 prior = outbox._read_item(self.root, item_id)
                 status = prior.get("status")
                 if status == "PARKED":
+                    if not self.capabilities.fresh_cycle_after_definite_park:
+                        return False
                     parked = self._parked_digests(prior)
-                    if parked is None or digest in parked:
+                    if parked is None or digest in parked or prior.get("saturated"):
                         return False
                     if prior.get("reason") not in self.DEFINITE_PARK_REASONS:
+                        return False
+                    if prior.get("cycle_ambiguous"):
+                        return False
+                    if len(parked) >= self.PARKED_HISTORY_LIMIT:
+                        prior["saturated"] = True
+                        outbox._write_item(self.root, item_id, prior)
                         return False
                     rec = outbox.read_delivery_claim(self.root, item_id)
                     if rec is not None:
@@ -97,7 +112,7 @@ class DesignAClaimBackend:
                         return False
                     history = [d for d in prior.get("parked_digests") or []
                                if isinstance(d, str)]
-                    if digest in history:
+                    if digest in history or prior.get("saturated"):
                         return False
                     # A delivery in between does not forgive a parked body.
                     record = {
@@ -182,7 +197,8 @@ class DesignAClaimBackend:
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,
                  destination: Optional[str] = None,
-                 terminal_reason: Optional[str] = None) -> bool:
+                 terminal_reason: Optional[str] = None,
+                 ambiguous: bool = False) -> bool:
         item_id = token.item_id
         # Validate -> transition -> retire, all under the item lock: a stale
         # incarnation must not mutate or park its successor's item.
@@ -191,6 +207,12 @@ class DesignAClaimBackend:
             if rec is None or rec.drainer_id != token.worker or \
                     self._incarnation_of(item_id) != token.incarnation:
                 return False
+            if ambiguous:
+                # Persisted before the outcome: the taint outlives retries,
+                # restarts and an operator requeue of this same cycle.
+                item = outbox._read_item(self.root, item_id)
+                item["cycle_ambiguous"] = True
+                outbox._write_item(self.root, item_id, item)
             if outcome is DeliveryOutcome.CONFIRMED:
                 outbox.record_delivered(self.root, item_id,
                                         provider=provider, destination=destination)
@@ -254,7 +276,9 @@ class DesignAClaimBackend:
         return rep
 
     def cleanup(self) -> CleanupReport:
-        return CleanupReport(pruned=0, detail="A: bounded by lock striping")
+        return CleanupReport(
+            pruned=0, detail="A: locks bounded by striping; parked-body history "
+                             f"capped at {self.PARKED_HISTORY_LIMIT} per id (saturates closed)")
 
     def force_release(self, item_id: str) -> bool:
         return outbox.release_delivery_claim(self.root, item_id, force=True)

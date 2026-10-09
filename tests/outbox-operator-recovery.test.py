@@ -46,6 +46,24 @@ class RequeueTransition(unittest.TestCase):
             self.assertEqual(rec["requeue_reason"], "relay 503")
             self.assertIsNone(rec["reason"])
 
+    def test_requeue_keeps_the_parked_body_in_the_ids_history(self):
+        """The explicit retry goes out once; the body stays on the record's
+        parked history so a later automatic republish of it is refused."""
+        import hashlib
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            outbox._write_item(root, ITEM, {"item_id": ITEM, "attempts": 1, "status": "PARKED",
+                                            "reason": "permanent-refusal", "payload": "A",
+                                            "payload_digest": "d-a", "parked_digests": ["d-z"]})
+            self.assertIs(outbox.requeue_item(root, ITEM), outbox.RequeueOutcome.REQUEUED)
+            self.assertEqual(outbox.read_item(root, ITEM)["parked_digests"], ["d-z", "d-a"])
+            outbox._write_item(root, OTHER, {"item_id": OTHER, "attempts": 1, "status": "PARKED",
+                                             "reason": "permanent-refusal", "payload": "legacy"})
+            self.assertIs(outbox.requeue_item(root, OTHER), outbox.RequeueOutcome.REQUEUED)
+            self.assertEqual(outbox.read_item(root, OTHER)["parked_digests"],
+                             [hashlib.sha256(b"legacy").hexdigest()],
+                             "a record written before digests existed is folded by its text")
+
     def test_attempts_preserved_unless_reset_requested(self):
         """Opt-in per the operator brief: the default keeps the count."""
         with TemporaryDirectory() as td:

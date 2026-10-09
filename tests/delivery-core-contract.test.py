@@ -130,6 +130,12 @@ class ContractCase(unittest.TestCase):
             self.assertTrue(self.backend.publish(ITEM, b"x"))
             self.assertFalse(self.backend.publish(ITEM, b"y"),
                              "without the capability a live id refuses every other payload")
+            self.backend.park(ITEM, "permanent-refusal")
+            self.assertTrue(self.backend.is_terminal(ITEM))
+            self.assertFalse(self.backend.publish(ITEM, b"x"), "a park is final for the parked body")
+            self.assertFalse(self.backend.publish(ITEM, b"y"),
+                             "without the capability a park is final for every payload, "
+                             "even after a definite refusal")
             return
         root = Path(self.tmp.name)
         self.assertTrue(self.backend.publish(ITEM, b"x"))

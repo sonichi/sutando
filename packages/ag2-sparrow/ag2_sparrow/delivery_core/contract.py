@@ -121,8 +121,8 @@ class BackendCapabilities:
     claim is eventually recoverable" holds for every backend — force
     release is one mechanism (A), a requeue-layer path is another (B)."""
     supports_force_release: bool = False
-    # True: a parked id accepts a never-parked payload after a DEFINITE refusal
-    # (publish docstring); False: a park is final for every payload.
+    # Read by publish(): True admits a never-parked payload after a definite,
+    # untainted refusal; False makes every park final for every payload.
     fresh_cycle_after_definite_park: bool = False
 
 
@@ -170,7 +170,10 @@ class ClaimBackend(Protocol):
       2. a stale incarnation can never destroy a successful claimant;
       3. crash at any syscall boundary leaves the item in exactly one
          deliverable state or with a terminal record;
-      4. protocol metadata is bounded (cleanup);
+      4. protocol metadata is bounded (cleanup) — including per-item parked-body
+         history, which caps at a declared limit and then saturates the item
+         closed (every new payload refused, item still visible) rather than
+         evicting a body it promised to keep refusing;
       5. a dead owner's claim is eventually recoverable (mechanism per
          capabilities);
       6. lost races are protocol outcomes; config errors raise loudly."""
@@ -183,15 +186,21 @@ class ClaimBackend(Protocol):
         and not eligible for this payload.
 
         A park is final for the payload that parked and for every payload the
-        id ever parked on, including after a later delivery of the same id, so
-        a rescanned live file never turns one park into a retry per pass and
-        bodies cannot alternate through the park. A backend that declares
+        id ever parked on, including after a later delivery of the same id and
+        after an operator requeue of a parked body, so a rescanned live file
+        never turns one park into a retry per pass and bodies cannot alternate
+        through the park. A backend that declares
         `capabilities.fresh_cycle_after_definite_park` additionally accepts a
-        never-parked payload when the park is a DEFINITE refusal (the provider
-        proved it holds nothing for the id); an ambiguous park — lost
-        responses, an exhausted retry window, outcome-unknown — refuses every
-        payload, because a provider that dedupes on the item id would keep the
-        parked body and report the new one delivered. The refused payload stays
+        never-parked payload when the whole parked cycle is a DEFINITE refusal:
+        its final reason is a permanent refusal and no attempt in the cycle was
+        ambiguous. A cycle with any ambiguous attempt — a lost response, an
+        exhausted retry window, outcome-unknown — refuses every payload for
+        good, even when a later attempt was definitely refused, because a
+        provider that dedupes on the item id may already hold the parked body
+        and would report the new one delivered. A backend without the
+        capability treats every park as final for every payload. The history
+        of parked bodies is bounded: past the backend's declared limit the id
+        saturates and refuses every new payload. A refused payload stays
         visible to the operator through the caller's quarantine, never lost.
 
         Durable backends may expose payload_for_claim(token) so the core sends
@@ -240,7 +249,8 @@ class ClaimBackend(Protocol):
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,
                  destination: Optional[str] = None,
-                 terminal_reason: Optional[str] = None) -> bool:
+                 terminal_reason: Optional[str] = None,
+                 ambiguous: bool = False) -> bool:
         """Validate the exact incarnation, apply the outcome transition, and
         retire the claim — ALL inside one backend critical section, in that
         order. A stale token must change nothing: validating after mutating
@@ -251,7 +261,10 @@ class ClaimBackend(Protocol):
         two transactions, or a successor can claim and confirm between them
         and the stale caller's park overwrites its DELIVERED state.
         `terminal_reason` parks a definitive refusal in that same transaction,
-        regardless of any retry schedule or attempt ceiling.
+        regardless of any retry schedule or attempt ceiling. `ambiguous` says
+        an attempt in this call may have crossed the side-effect boundary; a
+        backend that admits fresh cycles must persist it on the cycle so no
+        later refusal reads as proof that the body never landed.
         True = this incarnation owned the claim and it is now retired."""
         ...
 
