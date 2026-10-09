@@ -343,6 +343,26 @@ def behavioral() -> list:
                   for p in (state / guard.WITHHELD_RESULT_DIR).glob("wr_*.json")}
         if "B body" not in bodies or bodies["B body"] == b_digest_id.stem:
             fails.append("an unreadable archived id is occupied: another body gets a fresh id")
+
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "state"
+        first = guard.withheld_review_path(state, "task-ledger")
+        if not guard._reserve(first, guard._body_digest("B body")) or guard._reserve(first, "x"):
+            fails.append("an id is reserved exactly once")
+        guard.materialize_withheld_verdict(
+            guard.classify_result_for_tier("B body", "team", REPO, secret_filter=_leaky),
+            "B body", state, "task-ledger", context, now=1000)
+        if first.exists() or not guard.withheld_review_artifact(state, "task-ledger", "B body").exists():
+            fails.append("an id reserved for a body whose record is gone is never written: a fresh id is")
+        for path in guard._candidates(guard.withheld_review_path, state, "task-full", "C body"):
+            guard._reserve(path, "another body")
+        full = guard.materialize_withheld_verdict(
+            guard.classify_result_for_tier("C body", "team", REPO, secret_filter=_leaky),
+            "C body", state, "task-full", context, now=1000)
+        if full.body != guard.TEAM_LEAK_RESULT_UNSAVED:
+            fails.append("with every id taken the result stays withheld, unsaved")
+        if guard.suppressed_record_for(state, "task-none", "D body").exists():
+            fails.append("a body never journalled has no suppression record")
     return fails
 
 
