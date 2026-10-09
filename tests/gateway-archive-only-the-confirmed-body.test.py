@@ -109,6 +109,29 @@ class ArchiveOnlyTheConfirmedBody(unittest.TestCase):
         self.assertEqual(len(self._archived()), 1)
         self.assertEqual(self.server.calls[-1].get("body"), "Fresh answer")
 
+    def test_a_legacy_record_without_a_digest_is_proved_by_its_stored_text(self):
+        """Records written before payload_digest existed carry only the text."""
+        self.assertTrue(gw._record_holds_payload({"payload": "same"}, b"same"))
+        self.assertFalse(gw._record_holds_payload({"payload": "same"}, b"other"))
+        self.assertFalse(gw._record_holds_payload({"payload": None}, b"same"))
+        self.assertFalse(gw._record_holds_payload({}, b"same"))
+
+    def test_a_refused_body_without_a_result_file_is_logged_not_retried(self):
+        """The direct-call path has no file to quarantine: both refusals log
+        the cause and return False so nothing is archived."""
+        lines = []
+        with patch.object(gw, "_log", lines.append):
+            self.core.backend.publish(TID, b"OLDER")
+            outbox.record_delivered(self.outbox, TID, provider="p", destination="d")
+            self.assertFalse(gw._deliver_result_payload(TID, TID, "LIVE-REFUSED"))
+            self.assertIn("a different body was delivered under this id", lines[-1])
+            other = f"{TID}-queued"
+            self.core.backend.publish(other, json.dumps({"id": other, "body": "A"}).encode())
+            self.assertFalse(gw._deliver_result_payload(other, other, "B"))
+            self.assertIn("the outbox sent its stored body, not this one", lines[-1])
+        self.assertEqual([c.get("body") for c in self.server.calls], ["A"])
+        self.assertEqual(self._archived(), [])
+
 
 if __name__ == "__main__":
     unittest.main()
