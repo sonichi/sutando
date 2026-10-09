@@ -30,7 +30,8 @@ IN_QUARANTINE = {"fallback-links-then-unlinks", "place-replaces-a-taken-name",
 CLI = [REPO / "src" / "outbox_cli.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox_cli.py"]
 BRIDGE = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"]
 OUTBOX = [REPO / "src" / "outbox.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox.py"]
-IN_OUTBOX = {"requeue-keeps-the-stored-payload", "adopt-ignores-a-claim", "adopt-every-publish"}
+IN_OUTBOX = {"adopt-requires-a-marker", "adopt-a-never-requeued-record", "adopt-ignores-a-claim",
+             "adopt-every-publish"}
 IN_CLI = {"cli-exits-0-on-no-safe-move", "cli-reads-epoch-after-lock", "cli-parks-on-no-safe-move"}
 IN_BRIDGE = {"orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
@@ -133,9 +134,9 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "    if True:\n        return RestoreOutcome.RESTORED, target\n"),
     "retire-recaptures-the-generation": (
         "an orphan retire binds to whatever is at the name when it takes the lock",
-        "        with locked(results_dir):\n            return _retire(",
+        "        with locked(results_dir):\n            done = _retire(",
         "        with locked(results_dir):\n            _, generation = identity_of(rfile)\n"
-        "            return _retire("),
+        "            done = _retire("),
     "missing-destination-is-source-gone": (
         "a destination that is missing reads as nothing left to move",
         "    except _SourceGone:\n        return _unless_replaced(",
@@ -150,24 +151,32 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "    except ZeroDivisionError as e:\n        return Retired("),
     "retire-lock-error-escapes": (
         "a lock or directory error other than busy escapes the typed retirement",
-        "    except OSError as e:                              # the lock or the directory itself failed\n",
-        "    except DisposalBusy as e:                              # the lock or the directory itself failed\n"),
+        "    except OSError as e:\n        if done is None:",
+        "    except DisposalBusy as e:\n        if done is None:"),
+    "retire-unlock-error-erases-the-outcome": (
+        "an unlock failure after a committed move is reported as nothing moved",
+        "        if done is None:                              # the lock or the directory itself failed\n",
+        "        if True:                              # the lock or the directory itself failed\n"),
     "retire-fallback-reads-as-placed": (
         "a body kept outside the requested directory is reported as placed",
         "    if ended.parent != directory:\n",
         "    if False:\n"),
-    "requeue-keeps-the-stored-payload": (
-        "a requeued record resends its stored body, not the result live at its name",
-        "        d[\"resend_from_live\"] = True\n",
-        "        d[\"resend_from_live\"] = False\n"),
+    "adopt-requires-a-marker": (
+        "only a record carrying a newer writer's marker adopts the live reply",
+        "    if (adopted >= epoch or d.get(\"status\") != \"QUEUED\"",
+        "    if (not d.get(\"resend_from_live\") or adopted >= epoch or d.get(\"status\") != \"QUEUED\""),
+    "adopt-a-never-requeued-record": (
+        "a record no operator requeued replaces its stored payload on publish",
+        "    if (adopted >= epoch or d.get(\"status\") != \"QUEUED\"",
+        "    if (adopted > epoch or d.get(\"status\") != \"QUEUED\""),
     "adopt-ignores-a-claim": (
         "a publish replaces the payload of an item a drain has claimed",
         "            or read_delivery_claim(root, item_id) is not None):\n",
         "            or False):\n"),
     "adopt-every-publish": (
         "every later publish replaces a requeued record's payload, not only the first",
-        "    d.pop(\"resend_from_live\", None)\n",
-        "    d.get(\"resend_from_live\", None)\n"),
+        "    d[\"resend_adopted_epoch\"] = epoch\n",
+        "    d[\"resend_adopted_epoch\"] = 0\n"),
     "cli-parks-on-no-safe-move": (
         "requeue parks the record again when the body could not be restored",
         "            _emit(payload, args.json)\n            return 4\n",

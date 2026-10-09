@@ -1022,6 +1022,19 @@ class RetirementOutcome(unittest.TestCase):
                 self.assertIn(err.strerror, done.cause)
                 self.assertEqual(r.read_text(), "answer")
 
+    def test_an_unlock_error_after_the_move_keeps_the_real_outcome(self):
+        r = self.result()
+        _, gen = identity_of(r)
+        with unittest.mock.patch.object(disposal, "unlock_fd",
+                                        side_effect=OSError(errno.EIO, "unlock failed")):
+            done = self.retire(r, gen)
+        self.assertIs(done.outcome, disposal.Retirement.PLACED)
+        self.assertEqual(done.path, self.results / "archive" / "task-a-x.txt")
+        self.assertEqual(done.path.read_text(), "answer")
+        self.assertTrue(done.retired)
+        self.assertIn("unlock failed", done.warning)
+        self.assertTrue(any("unlock failed" in l for l in self.lines), self.lines)
+
     def test_a_placement_that_falls_back_is_fallback_with_its_real_destination(self):
         r = self.result()
         _, gen = identity_of(r)

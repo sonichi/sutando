@@ -966,22 +966,27 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
-        d["resend_from_live"] = True
         _write_item(root, item_id, d)
         return RequeueOutcome.REQUEUED, d["resend_epoch"]
 
 
 def adopt_resend_payload_locked(root: Path, item_id: str, payload: str) -> bool:
     """Under the caller's `_item_lock`: a requeued record awaiting its resend
-    takes the bytes being published now, keeping its epoch and attempts.
-    False when the record is not one (the caller's normal publish rule applies)."""
+    takes the bytes being published now, once per resend epoch, keeping its
+    epoch and attempts. Keyed on the epoch every requeue writer has bumped, so a
+    record requeued by an older writer adopts too. False = the normal publish rule."""
     root = Path(root)
     d = _read_item(root, item_id)
-    if (not d.get("resend_from_live") or d.get("status") != "QUEUED"
+    try:
+        epoch = int(d.get("resend_epoch", 0) or 0)
+        adopted = int(d.get("resend_adopted_epoch", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if (adopted >= epoch or d.get("status") != "QUEUED"
             or read_delivery_claim(root, item_id) is not None):
         return False
     d["payload"] = payload
     d["published_at"] = time.time()
-    d.pop("resend_from_live", None)
+    d["resend_adopted_epoch"] = epoch
     _write_item(root, item_id, d)
     return True

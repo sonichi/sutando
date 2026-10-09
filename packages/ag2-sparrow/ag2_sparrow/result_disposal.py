@@ -160,10 +160,12 @@ class Retirement(str, Enum):
 
 class Retired(NamedTuple):
     """How one retirement ended; `path` is where the retired generation is
-    now (None when it was not moved), `cause` why it is not where asked."""
+    now (None when it was not moved), `cause` why it is not where asked,
+    `warning` a failure after the outcome was already committed."""
     outcome: Retirement
     path: Optional[Path] = None
     cause: str = ""
+    warning: str = ""
 
     @property
     def retired(self) -> bool:
@@ -485,13 +487,19 @@ def retire_generation(results_dir: Path, rfile: Path, generation: ResultIdentity
     reply found at the name, before the move or after it, stays live. Never
     raises for a filesystem outcome: the `Retired` record says what happened."""
     names = list(names)
+    done: Optional[Retired] = None
     try:
         with locked(results_dir):
-            return _retire(Path(results_dir), Path(rfile), generation, log, Path(directory), names)
+            done = _retire(Path(results_dir), Path(rfile), generation, log, Path(directory), names)
     except DisposalBusy as e:
         return Retired(Retirement.FAILED, None, f"the disposal lock is busy ({e})")
-    except OSError as e:                              # the lock or the directory itself failed
-        return Retired(Retirement.FAILED, None, f"the disposal lock could not be taken ({e})")
+    except OSError as e:
+        if done is None:                              # the lock or the directory itself failed
+            return Retired(Retirement.FAILED, None, f"the disposal lock could not be taken ({e})")
+        warning = f"the disposal lock could not be released ({e})"
+        log(f"result {Path(rfile).stem}: {done.outcome.value}, but {warning}")
+        return done._replace(warning=warning)
+    return done
 
 
 def _retire(results_dir: Path, rfile: Path, generation: ResultIdentity, log: Log,

@@ -554,6 +554,25 @@ class ResendFromLive(unittest.TestCase):
             self.assertFalse(self._adopt(root, "B"))
             self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
 
+    def test_a_requeue_written_without_any_marker_adopts_once(self):
+        with TemporaryDirectory() as td:
+            root = Path(td) / "ob"
+            outbox._write_item(root, ITEM, {"item_id": ITEM, "status": "QUEUED", "payload": "A",
+                                            "resend_epoch": 1, "requeued_by": "old-cli"})
+            self.assertTrue(self._adopt(root, "B"))
+            self.assertFalse(self._adopt(root, "C"))
+            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "B")
+
+    def test_a_parked_record_never_adopts_and_a_new_requeue_adopts_again(self):
+        with TemporaryDirectory() as td:
+            root = self._requeued(td)
+            self.assertTrue(self._adopt(root, "B"))
+            outbox.park_item(root, ITEM, "refused again")
+            self.assertFalse(self._adopt(root, "C"), "a parked record is the operator's")
+            outbox.requeue_item(root, ITEM)
+            self.assertTrue(self._adopt(root, "C"), "each requeue resends what is live once")
+            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "C")
+
     def test_a_record_never_requeued_keeps_its_stored_payload(self):
         with TemporaryDirectory() as td:
             root = Path(td) / "ob"

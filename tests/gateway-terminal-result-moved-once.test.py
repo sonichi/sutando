@@ -741,6 +741,21 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(outbox.item_status(self.outbox, TID), 'QUEUED', 'B was parked unsent')
         self._assert_b_was_sent_and_b_retired(result)
 
+    def _requeue_as_main_writes_it(self):
+        """The record exactly as main's requeue_item writes it: no newer marker."""
+        d = dict(outbox._read_item(self.outbox, TID))
+        outbox._release_locked(self.outbox, TID, force=True)
+        d.update(resend_epoch=int(d.get('resend_epoch', 0) or 0) + 1, status='QUEUED', reason=None,
+                 attempts=0, requeued_at=time.time(), requeued_by='old-cli', requeue_reason='')
+        d.pop('retry', None)
+        outbox._write_item(self.outbox, TID, d)
+
+    def test_a_persisted_requeue_from_an_older_writer_sends_the_live_reply(self):
+        _, result = self._parked_on_a_host_that_cannot_restore()
+        self._requeue_as_main_writes_it()
+        self._publish_b(result)
+        self._assert_b_was_sent_and_b_retired(result)
+
     def test_an_unrestorable_body_leaves_an_inert_queued_record(self):
         """No live result, no send: the drain and the sweep act only on a
         result file, and the body waits in undelivered/ for the operator."""
