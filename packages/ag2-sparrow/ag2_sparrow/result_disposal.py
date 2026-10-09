@@ -490,6 +490,8 @@ def retire_generation(results_dir: Path, rfile: Path, generation: ResultIdentity
             return _retire(Path(results_dir), Path(rfile), generation, log, Path(directory), names)
     except DisposalBusy as e:
         return Retired(Retirement.FAILED, None, f"the disposal lock is busy ({e})")
+    except OSError as e:                              # the lock or the directory itself failed
+        return Retired(Retirement.FAILED, None, f"the disposal lock could not be taken ({e})")
 
 
 def _retire(results_dir: Path, rfile: Path, generation: ResultIdentity, log: Log,

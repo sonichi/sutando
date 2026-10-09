@@ -523,6 +523,45 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
         self.assertIn("disposal.quarantine_generation(", bridge)
 
 
+class ResendFromLive(unittest.TestCase):
+    """A requeued record resends the result published at its name next, so a
+    reply published after a failed restore is the one sent, not the stored body."""
+
+    def _adopt(self, root, payload):
+        with outbox._item_lock(root, ITEM):
+            return outbox.adopt_resend_payload_locked(root, ITEM, payload)
+
+    def _requeued(self, td):
+        root = Path(td) / "ob"
+        _parked(root)
+        outbox._write_item(root, ITEM, dict(outbox.read_item(root, ITEM), payload="A"))
+        outbox.requeue_item(root, ITEM)
+        return root
+
+    def test_the_next_publish_is_adopted_once_keeping_the_epoch(self):
+        with TemporaryDirectory() as td:
+            root = self._requeued(td)
+            self.assertTrue(self._adopt(root, "B"))
+            rec = outbox.read_item(root, ITEM)
+            self.assertEqual((rec["payload"], rec["status"], rec["resend_epoch"]), ("B", "QUEUED", 1))
+            self.assertFalse(self._adopt(root, "C"), "only the first publish after a requeue")
+            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "B")
+
+    def test_a_claimed_item_keeps_the_payload_in_flight(self):
+        with TemporaryDirectory() as td:
+            root = self._requeued(td)
+            self.assertTrue(outbox.acquire_delivery_claim(root, ITEM, "peer"))
+            self.assertFalse(self._adopt(root, "B"))
+            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
+
+    def test_a_record_never_requeued_keeps_its_stored_payload(self):
+        with TemporaryDirectory() as td:
+            root = Path(td) / "ob"
+            outbox._write_item(root, ITEM, {"item_id": ITEM, "status": "QUEUED", "payload": "A"})
+            self.assertFalse(self._adopt(root, "B"))
+            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
+
+
 class CliRenderingAndErrorPaths(unittest.TestCase):
     """The CLI's own output and refusal paths. Calling outbox directly, as the
     other tests do, leaves every line of `_emit` and both readers unrun."""

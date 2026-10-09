@@ -1010,6 +1010,18 @@ class RetirementOutcome(unittest.TestCase):
         self.assertIn("busy", done.cause)
         self.assertEqual(r.read_text(), "answer")
 
+    def test_a_lock_error_that_is_not_busy_is_failed_and_does_not_raise(self):
+        for name, err in (("lock_fd", OSError(errno.ENOLCK, "No locks available")),
+                          ("_open_lock", PermissionError(errno.EACCES, "Permission denied"))):
+            with self.subTest(at=name):
+                r = self.result()
+                _, gen = identity_of(r)
+                with unittest.mock.patch.object(disposal, name, side_effect=err):
+                    done = self.retire(r, gen)
+                self.assertIs(done.outcome, disposal.Retirement.FAILED)
+                self.assertIn(err.strerror, done.cause)
+                self.assertEqual(r.read_text(), "answer")
+
     def test_a_placement_that_falls_back_is_fallback_with_its_real_destination(self):
         r = self.result()
         _, gen = identity_of(r)

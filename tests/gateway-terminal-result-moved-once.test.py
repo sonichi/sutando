@@ -703,14 +703,15 @@ class TerminalResultMovedOnce(unittest.TestCase):
         gw._post_ready_results({TID})
         return self.server.calls[before:]
 
-    def _assert_b_was_offered_not_quarantined(self, result):
-        # The send carries the record's stored payload; which bytes a QUEUED id
-        # sends is the outbox payload contract, not this rollback's.
+    def _assert_b_was_sent_and_b_retired(self, result):
         sent = self._drain_once_accepting()
-        self.assertEqual(len(sent), 1, 'B got no provider attempt')
-        self.assertEqual(outbox.item_status(self.outbox, TID), 'DELIVERED')
-        self.assertFalse(result.exists(), 'a delivered result stays rescannable')
-        self.assertNotIn('BODY-B newer reply', self.quarantined_bodies(), 'B was quarantined unsent')
+        archived = sorted(p.read_text() for p in (self.results / 'archive').rglob('*.txt'))
+        self.assertEqual(
+            {'provider_bodies': [c.get('body') for c in sent],
+             'status': outbox.item_status(self.outbox, TID), 'live': result.exists(),
+             'undelivered': self.quarantined_bodies(), 'archive': archived},
+            {'provider_bodies': ['BODY-B newer reply'], 'status': 'DELIVERED', 'live': False,
+             'undelivered': ['BODY-A parked answer'], 'archive': ['BODY-B newer reply']})
 
     def test_a_reply_published_before_the_failed_restore_returns_is_sent(self):
         outbox_cli, result = self._parked_on_a_host_that_cannot_restore()
@@ -719,7 +720,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(outbox.item_status(self.outbox, TID), 'QUEUED', 'B was parked unsent')
         self.assertEqual(result.read_text(), 'BODY-B newer reply')
         self.assertEqual(self.quarantined_bodies(), ['BODY-A parked answer'])
-        self._assert_b_was_offered_not_quarantined(result)
+        self._assert_b_was_sent_and_b_retired(result)
 
     def test_a_reply_published_after_the_live_check_is_never_parked(self):
         """B lands just before any PARKED write the requeue makes (between a
@@ -738,7 +739,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
             self._publish_b(result)
         self.assertEqual(rc, 4)
         self.assertEqual(outbox.item_status(self.outbox, TID), 'QUEUED', 'B was parked unsent')
-        self._assert_b_was_offered_not_quarantined(result)
+        self._assert_b_was_sent_and_b_retired(result)
 
     def test_an_unrestorable_body_leaves_an_inert_queued_record(self):
         """No live result, no send: the drain and the sweep act only on a

@@ -945,6 +945,9 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
 
     Returns the epoch written under the lock (None unless REQUEUED): a later
     read can see a peer's re-requeue, and a rollback keyed on it undoes theirs.
+
+    The requeued record resends the result live at its name: the next publish
+    of this id replaces the stored payload once (`adopt_resend_payload_locked`).
     """
     root = Path(root)
     with _item_lock(root, item_id):
@@ -963,5 +966,22 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
+        d["resend_from_live"] = True
         _write_item(root, item_id, d)
         return RequeueOutcome.REQUEUED, d["resend_epoch"]
+
+
+def adopt_resend_payload_locked(root: Path, item_id: str, payload: str) -> bool:
+    """Under the caller's `_item_lock`: a requeued record awaiting its resend
+    takes the bytes being published now, keeping its epoch and attempts.
+    False when the record is not one (the caller's normal publish rule applies)."""
+    root = Path(root)
+    d = _read_item(root, item_id)
+    if (not d.get("resend_from_live") or d.get("status") != "QUEUED"
+            or read_delivery_claim(root, item_id) is not None):
+        return False
+    d["payload"] = payload
+    d["published_at"] = time.time()
+    d.pop("resend_from_live", None)
+    _write_item(root, item_id, d)
+    return True
