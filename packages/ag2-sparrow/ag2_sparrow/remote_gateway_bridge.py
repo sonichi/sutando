@@ -930,7 +930,16 @@ def _released_review_body(raw: str) -> str:
     return f"{parsed.body}\n\n{note}" if parsed.body else note
 
 
+_REFUSED_REVIEW_PUBLICATIONS: set = set()
+
+
 def _publish_review(path: Path, record: dict) -> bool:
+    if not team_result_guard.withheld_claim_publishable(path, record.get("decision_claim_id")):
+        if path.stem not in _REFUSED_REVIEW_PUBLICATIONS:
+            _REFUSED_REVIEW_PUBLICATIONS.add(path.stem)
+            _log(f"withheld review {path.stem}: publication refused, no matching release "
+                 "claim; the body stays private until the owner acts")
+        return False
     context = record.get("context") or {}
     room = str(context.get("channel_id") or "")
     body = _released_review_body(str(record.get("withheld_body") or ""))
@@ -939,8 +948,6 @@ def _publish_review(path: Path, record: dict) -> bool:
                        "card_resolution_pending": True})
         _atomic_private_json(path, record)
         return False
-    if (_read_private_json(path) or {}).get("status") != "publish_pending":
-        return False  # only a won release claim may post the body
     answer = _req("POST", "/v1/room", {
         "op": "message", "room_id": room, "body": body,
         "dedupe_key": f"withheld-publish:{record['review_id']}",

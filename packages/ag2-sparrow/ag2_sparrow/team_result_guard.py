@@ -400,18 +400,44 @@ def materialize_withheld_verdict(verdict: TeamResultVerdict, body: str,
         VERDICT_SUPPRESS, "[no-send]", f"{verdict.reason}; pending private owner review")
 
 
+def withheld_decision_lock(directory: Path):
+    """The one lock over a review directory's decision records; every decision
+    read-check-write and every publication check holds it."""
+    return locked_file(Path(directory) / ".decision.lock", create_mode=0o600)
+
+
+def _live_undecided_record(path: Path) -> "dict | None":
+    # An archived decision for the same review always wins over a live record.
+    if (path.parent / "archive" / path.name).exists():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def withheld_claim_publishable(path: Path, claim_id) -> bool:
+    """True only for the exact release claim claim_withheld_decision wrote; a legacy,
+    foreign or ambiguous pending record never publishes."""
+    path = Path(path)
+    with withheld_decision_lock(path.parent):
+        record = _live_undecided_record(path)
+    return (record is not None and record.get("status") == "publish_pending"
+            and record.get("decision") == "false_positive"
+            and isinstance(claim_id, str) and len(claim_id) == 32
+            and record.get("decision_claim_id") == claim_id)
+
+
 def claim_withheld_decision(path: Path, updates: dict) -> "dict | None":
     """Apply the owner's decision only to a record still awaiting it; None means it
     was already decided (or is gone), so the reply must change nothing."""
     path = Path(path)
-    with locked_file(path.parent / ".decision.lock", create_mode=0o600):
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+    with withheld_decision_lock(path.parent):
+        record = _live_undecided_record(path)
+        if record is None or record.get("status") != "awaiting_owner":
             return None
-        if not isinstance(record, dict) or record.get("status") != "awaiting_owner":
-            return None
-        record.update(updates)
+        record.update(updates, decision_claim_id=os.urandom(16).hex())
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
