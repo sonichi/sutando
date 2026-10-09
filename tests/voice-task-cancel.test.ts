@@ -71,16 +71,17 @@ beforeEach(() => {
 });
 
 describe('cancel_task decides from the task state', () => {
-	it('a queued task is cancelled: instruction written, task file deleted, card closed, no "Cancelled." result', async () => {
+	it('a queued task gets a cancel request: instruction written, task file deleted, card closed, no "Cancelled." result', async () => {
 		const id = submit('draw a car');
 		const out = await cancel();
-		assert.equal(out.status, 'cancelled');
+		assert.equal(out.status, 'cancel_requested');
+		assert.match(out.message, /Do not say it is cancelled/);
 		assert.equal(out.taskId, id);
 		assert.equal(cancelInstructions().length, 1);
 		assert.ok(!existsSync(join(TMP, 'tasks', `${id}.txt`)));
 		assert.ok(!archivedTask(id), 'not in tasks/archive/ either, where a core missing the file would find and run it');
 		assert.ok(!existsSync(join(TMP, 'results', `${id}.txt`)), 'no stub result');
-		assert.ok(statuses.some((s) => s.taskId === id && s.status === 'done' && s.text === 'Cancelled.'));
+		assert.ok(statuses.some((s) => s.taskId === id && s.status === 'done' && s.text === 'Cancel requested.'));
 		assert.ok(!_pendingTasksForTest.has(id), 'out of the timeout sweep');
 	});
 
@@ -88,7 +89,7 @@ describe('cancel_task decides from the task state', () => {
 		const id = submit('draw a statue');
 		announce(id);
 		assert.equal(voiceTaskState(id), 'queued');
-		assert.equal((await cancel()).status, 'cancelled');
+		assert.equal((await cancel()).status, 'cancel_requested');
 	});
 
 	it('a task the core has read but not yet run a tool on is started, not cancelled', async () => {
@@ -148,13 +149,13 @@ describe('cancel_task decides from the task state', () => {
 		assert.equal((await cancel({ query: 'dog' })).taskId, dog);
 	});
 
-	it("the core's reply to the cancel is archived unspoken", async () => {
+	it("the core's reply to the cancel is spoken: it is the confirmation the user was promised", async () => {
 		submit('draw an apple');
 		await cancel();
 		const [instruction] = cancelInstructions();
-		writeFileSync(join(TMP, 'results', instruction), 'Nothing to cancel — it was never started.');
+		writeFileSync(join(TMP, 'results', instruction), 'Cancelled task-x before it started.');
 		await tick(2_500);
-		assert.deepEqual(spoken, []);
+		assert.deepEqual(spoken.map((s) => s.text), ['Cancelled task-x before it started.']);
 	});
 
 	it('a cancelled task the core finished anyway is spoken with a note saying so', async () => {

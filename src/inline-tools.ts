@@ -725,7 +725,7 @@ export const cancelTaskTool: ToolDefinition = {
 				return { status: 'already_done', taskId: safeTargetId, message: 'It already finished, so nothing was cancelled. Tell the user it is already done.' };
 			}
 			if (state === 'cancelled') {
-				return { status: 'already_cancelled', taskId: safeTargetId, message: 'It was already cancelled. Tell the user so.' };
+				return { status: 'already_cancelled', taskId: safeTargetId, message: 'Cancelling it was already requested. Tell the user so.' };
 			}
 			if (state === 'started') {
 				return { status: 'already_started', taskId: safeTargetId, message: 'The core is already working on it and cannot stop partway, so nothing was cancelled. Tell the user it is already in progress and will finish.' };
@@ -747,8 +747,8 @@ export const cancelTaskTool: ToolDefinition = {
 
 			console.log(`${ts()} [CancelTask] cancel-instruction written for ${safeTargetId} → ${cancelFilename}`);
 			if (state === 'queued' && isVoiceSubmittedTask(safeTargetId)) {
-				noteVoiceTaskCancelled(safeTargetId, `task-${cancelTs}`);
-				return { status: 'cancelled', taskId: safeTargetId, message: 'It had not started, so it will not run. Tell the user it is cancelled.' };
+				noteVoiceTaskCancelled(safeTargetId);
+				return { status: 'cancel_requested', taskId: safeTargetId, message: 'The core had not started it and was asked not to run it; it can still have taken it already. Tell the user you asked to cancel it and will confirm when the core replies. Do not say it is cancelled.' };
 			}
 			// Not a voice task, or one whose state is unknown: the core's reply says what happened.
 			return { status: 'cancel_instruction_queued', taskId: safeTargetId, instruction: `task-${cancelTs}`, message: 'Asked the core to stop it; it may already have finished. Tell the user you asked to cancel it, not that it is cancelled.' };

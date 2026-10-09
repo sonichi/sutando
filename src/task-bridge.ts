@@ -461,9 +461,8 @@ export function _taskActivity(taskId: string): TaskActivity {
 // Where a voice task stands, from the core's own records, so a cancel reports what the core really did.
 export type VoiceTaskState = 'queued' | 'started' | 'done' | 'cancelled' | 'unknown';
 
-// Tasks cancelled before the core started them, and the cancel instructions written for them.
+// Queued voice tasks the user asked to cancel.
 const _cancelledVoiceTasks = new Set<string>();
-const _cancelInstructions = new Set<string>();
 
 function _activityPhase(taskId: string): string | null {
 	try {
@@ -522,23 +521,21 @@ export function isVoiceSubmittedTask(taskId: string): boolean {
 	return _pendingTasks.has(taskId) || _isVoiceTask(taskId);
 }
 
-/** A queued voice task was cancelled: delete its file and close its card; the core's reply to `instructionId` is not spoken. */
-export function noteVoiceTaskCancelled(taskId: string, instructionId: string): void {
+/** A queued voice task the user asked to cancel: delete its file; the core's reply to the instruction confirms. */
+export function noteVoiceTaskCancelled(taskId: string): void {
 	_cancelledVoiceTasks.add(taskId);
-	_cancelInstructions.add(instructionId);
 	_pendingTasks.delete(taskId);
 	// Deleted, not archived: a core that misses the file looks in tasks/archive/ and runs what it finds there.
 	try { unlinkSync(join(TASK_DIR, `${taskId}.txt`)); } catch { /* already gone */ }
-	_sendTaskStatus?.(taskId, 'done', 'Cancelled.');
+	_sendTaskStatus?.(taskId, 'done', 'Cancel requested.');
 }
 
-/** A cancelled task the core had started after all: the user was told it was cancelled. */
-export const CANCELLED_BUT_FINISHED_NOTE = 'The user cancelled this task and was told it was cancelled, but the core had already started it and it finished. Tell them in one sentence that it finished anyway.';
+/** A task the user asked to cancel that the core ran anyway. */
+export const CANCELLED_BUT_FINISHED_NOTE = 'The user asked to cancel this task, but the core had already taken it and it finished. Tell them in one sentence that it finished anyway.';
 
 /** Test-only: forget cancels between cases. */
 export function _resetVoiceTaskCancelsForTest(): void {
 	_cancelledVoiceTasks.clear();
-	_cancelInstructions.clear();
 }
 
 // Dedup window: identical task text within 2 minutes → return existing taskId.
@@ -1558,17 +1555,6 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					onResult(result);
 					_deliveredResults.add(file);
 					setTimeout(() => archiveFile(path, 'results', `voice-${Date.now()}`), 10_000);
-					continue;
-				}
-				if (_cancelInstructions.has(taskId)) {
-					console.log(`${ts()} [TaskBridge] ${taskId}: core's reply to a voice cancel the user was already told; archiving unspoken (${result.slice(0, 80)})`);
-					_cancelInstructions.delete(taskId);
-					_deliveredResults.add(file);
-					setTimeout(() => {
-						archiveFile(path, 'results', taskId);
-						const taskFile = join(TASK_DIR, `${taskId}.txt`);
-						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
-					}, 5_000);
 					continue;
 				}
 				// [no-send] / [REPLIED] / [deduped: <id>] — archive silently, no voice.
