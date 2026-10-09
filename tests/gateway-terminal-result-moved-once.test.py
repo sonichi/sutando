@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import inspect
+import json
 import os
 import subprocess
 import sys
@@ -755,6 +756,65 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self._requeue_as_main_writes_it()
         self._publish_b(result)
         self._assert_b_was_sent_and_b_retired(result)
+
+    def test_a_legacy_epoch_already_used_never_carries_a_new_body(self):
+        """main requeues A at epoch 1, the gateway takes A but the response is
+        lost; after the upgrade C is published. The deduping relay answers for A,
+        so C must not be recorded DELIVERED under that epoch, nor archived as sent."""
+        relay = [self.server.request]
+        backend = DesignAClaimBackend(self.outbox, retry_schedule=outbox.RetrySchedule(),
+                                      clock=lambda: self.server.now, republish_delivered=False)
+        self.bridge(DeliveryCore(backend, AG2SpaceResultProvider(lambda *a: relay[0](*a)),
+                                 RetryPolicy(max_attempts=5, defer_idempotent_resend=True)))
+        self.task()
+        result = self.result('BODY-A parked answer')
+        gw._post_ready_results({TID})                      # 400: parked, A quarantined
+        self._requeue_as_main_writes_it()
+        result.write_text('BODY-A parked answer')          # main's restore put A back
+        held = []
+
+        def take_then_lose_the_response(method, path, payload):
+            self.server.calls.append(dict(payload))
+            held.append(payload.get('body'))
+            raise TimeoutError('response lost after send')
+        relay[0] = take_then_lose_the_response
+        self.server.now += 3600
+        gw._post_ready_results({TID})
+        rec = outbox.read_item(self.outbox, TID) or {}
+        rec.pop('resend_adopted_epoch', None)                # main's drain never writes it
+        outbox._write_item(self.outbox, TID, rec)
+        self.assertEqual((rec.get('status'), rec.get('resend_epoch'), rec.get('attempts'),
+                          (rec.get('retry') or {}).get('failures'), 'requeued_attempts' in rec,
+                          'resend_adopted_epoch' in rec),
+                         ('QUEUED', 1, 1, 1, False, False), 'not the persisted shape main leaves')
+        self._publish_c(result)
+
+        def dedupe(method, path, payload):
+            self.server.calls.append(dict(payload))
+            return {'ok': True, 'duplicate': True}       # it already holds A for this id
+        relay[0] = dedupe
+        self.server.now += 3600
+        before = len(self.server.calls)
+        gw._post_ready_results({TID})
+        rec = outbox.read_item(self.outbox, TID) or {}
+        archived = sorted(p.read_text() for p in (self.results / 'archive').rglob('*.txt'))
+        self.assertEqual(
+            {'relay_holds': held, 'sent': [c.get('body') for c in self.server.calls[before:]],
+             'status': rec.get('status'), 'recorded_body': json.loads(rec.get('payload', '{}')).get('body'),
+             'c_live': result.exists(), 'c_listed': 'BODY-C newest reply' in self.quarantined_bodies(),
+             'c_archived_as_sent': 'BODY-C newest reply' in archived},
+            {'relay_holds': ['BODY-A parked answer'], 'sent': ['BODY-A parked answer'],
+             'status': 'DELIVERED', 'recorded_body': 'BODY-A parked answer',
+             'c_live': False, 'c_listed': True, 'c_archived_as_sent': False})
+        said = [l for l in self.lines if TID in l and 'not this one' in l]
+        self.assertEqual(len(said), 1, '\n'.join(self.lines))
+        self.assertIn('send it by hand', said[0])
+        self.assertNotIn('restores it', said[0], 'a requeue of a delivered id restores nothing')
+
+    def _publish_c(self, result):
+        tmp = result.with_name('.producer.tmp')
+        tmp.write_text('BODY-C newest reply')
+        os.replace(tmp, result)
 
     def test_an_unrestorable_body_leaves_an_inert_queued_record(self):
         """No live result, no send: the drain and the sweep act only on a

@@ -591,6 +591,44 @@ class ResendFromLive(unittest.TestCase):
             self.assertFalse(self._adopt(root, "B"))
             self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
 
+    # Every shape a QUEUED-or-READY unclaimed record can be persisted in by main's
+    # writers (publish, retry_ready/failed, note_attempt, requeue) and by this head.
+    RETRY = {"started_at": 1.0, "deadline": 9e9, "next_attempt_at": 1.0, "min_attempts": 5,
+             "initial_delay_s": 1.0, "max_delay_s": 2.0}
+    SHAPES = (
+        ("main: published, never attempted", {"status": "READY"}, False),
+        ("main: published, attempts failed", {"status": "READY", "attempts": 2,
+                                              "retry": dict(RETRY, failures=2)}, False),
+        ("main: requeued --reset-attempts", {"status": "QUEUED", "resend_epoch": 1,
+                                             "attempts": 0, "requeued_by": "op"}, True),
+        ("main: requeued --reset-attempts, retry armed, no attempt",
+         {"status": "QUEUED", "resend_epoch": 1, "attempts": 0, "retry": dict(RETRY, failures=0)}, True),
+        ("main: requeued without --reset-attempts", {"status": "QUEUED", "resend_epoch": 1,
+                                                     "attempts": 5, "retry": dict(RETRY, failures=5)}, False),
+        ("main: requeued --reset-attempts, then attempted (response lost)",
+         {"status": "QUEUED", "resend_epoch": 1, "attempts": 1, "retry": dict(RETRY, failures=1)}, False),
+        ("main: requeued --reset-attempts, then attempted, no retry schedule",
+         {"status": "QUEUED", "resend_epoch": 1, "attempts": 1}, False),
+        ("main: requeued twice, --reset-attempts", {"status": "QUEUED", "resend_epoch": 2, "attempts": 0}, True),
+        ("main: parked", {"status": "PARKED", "resend_epoch": 1, "attempts": 0}, False),
+        ("head: requeued --reset-attempts", {"status": "QUEUED", "resend_epoch": 1, "attempts": 0,
+                                             "requeued_attempts": 0}, True),
+        ("head: requeued without --reset-attempts", {"status": "QUEUED", "resend_epoch": 1,
+                                                     "attempts": 5, "requeued_attempts": 5}, True),
+        ("head: requeued, then attempted", {"status": "QUEUED", "resend_epoch": 1, "attempts": 6,
+                                            "requeued_attempts": 5}, False),
+        ("head: requeued, already adopted", {"status": "QUEUED", "resend_epoch": 1, "attempts": 0,
+                                             "requeued_attempts": 0, "resend_adopted_epoch": 1}, False),
+    )
+
+    def test_every_persisted_shape_adopts_only_an_unused_requeue_epoch(self):
+        for name, fields, adopts in self.SHAPES:
+            with self.subTest(shape=name), TemporaryDirectory() as td:
+                root = Path(td) / "ob"
+                outbox._write_item(root, ITEM, dict(fields, item_id=ITEM, payload="A"))
+                self.assertIs(self._adopt(root, "B"), adopts)
+                self.assertEqual(outbox.read_item(root, ITEM)["payload"], "B" if adopts else "A")
+
     def test_an_unreadable_epoch_keeps_the_stored_payload(self):
         with TemporaryDirectory() as td:
             root = Path(td) / "ob"

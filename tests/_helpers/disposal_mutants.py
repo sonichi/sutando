@@ -33,7 +33,7 @@ OUTBOX = [REPO / "src" / "outbox.py", REPO / "packages" / "ag2-sparrow" / "ag2_s
 IN_OUTBOX = {"adopt-after-an-attempt", "adopt-requires-a-marker", "adopt-a-never-requeued-record", "adopt-ignores-a-claim",
              "adopt-every-publish"}
 IN_CLI = {"cli-exits-0-on-no-safe-move", "cli-reads-epoch-after-lock", "cli-parks-on-no-safe-move"}
-IN_BRIDGE = {"orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
+IN_BRIDGE = {"confirmed-archives-another-body", "orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
 
 MUTANTS: dict[str, tuple[str, str, str]] = {
@@ -203,6 +203,10 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "        raw = ready_body_of(data)\n        if raw is None:\n",
         "        try:\n            raw = data.decode(\"utf-8\").strip()\n"
         "        except UnicodeDecodeError:\n            continue\n        if not raw:\n"),
+    "confirmed-archives-another-body": (
+        "a confirmed send of the outbox's stored body lets the live, different reply be archived as sent",
+        "        if \"payload\" in record and not _record_sent_this_body(record, payload):\n",
+        "        if False:\n"),
     "orphan-links-then-unlinks": (
         "an orphan arm moves the canonical result itself: link, then unlink its name",
         "        done = disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))\n",

@@ -4208,7 +4208,7 @@ def _disposed_copy_exists(tid: str, generation) -> bool:
 
 
 def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
-                            generation=None) -> None:
+                            generation=None, requeueable: bool = True) -> None:
     """Move a result the outbox has finally refused into results/undelivered/,
     the same quarantine the proactive path uses. Without this the file is
     rescanned every pass and the refusal is invisible.
@@ -4222,6 +4222,10 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
             disposal.quarantine_current(RESULTS_DIR, rfile, _log)
         else:
             disposal.quarantine_generation(RESULTS_DIR, rfile, generation, _log)
+        if not requeueable:
+            _log(f"result {tid}: {why} — quarantined to {UNDELIVERABLE_RESULTS_DIR.name}/; "
+                 "its outbox id is already delivered, so a requeue cannot resend it: send it by hand")
+            return
         _log(f"result {tid}: {why} — quarantined to "
              f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
              f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
@@ -4469,6 +4473,18 @@ def _worker_of(task_id: str) -> str:
     return claimants.pop() if len(claimants) == 1 else ""
 
 
+def _record_sent_this_body(record: dict, payload: bytes) -> bool:
+    """The outbox record's stored envelope carries the same reply body as this one;
+    envelope metadata (attribution) may differ between passes."""
+    try:
+        stored = json.loads(record.get("payload") or "")
+        mine = json.loads(payload.decode("utf-8"))
+    except (TypeError, ValueError):
+        return False
+    return (isinstance(stored, dict) and isinstance(mine, dict)
+            and stored.get("body") == mine.get("body") and stored.get("no_send") == mine.get("no_send"))
+
+
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
                             no_send: bool = False, result_file=None,
                             generation=None) -> bool:
@@ -4524,6 +4540,19 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
              f"next={retry.get('next_attempt_at')}, deadline={retry.get('deadline')})")
         return False
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
+        root = getattr(core.backend, "root", None)
+        record = (read_item(root, item_id) or {}) if root is not None else {}
+        if "payload" in record and not _record_sent_this_body(record, payload):
+            # The outbox sent its stored body: this one never went out, so it is
+            # kept where the operator looks, never archived as sent.
+            why = (f"the outbox sent the body stored for {item_id} under resend epoch "
+                   f"{record.get('resend_epoch', 0)}, not this one")
+            if result_file is not None:
+                _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id,
+                                        generation=generation, requeueable=False)
+            else:
+                _log(f"result {tid}: {why} — not retrying")
+            return False
         _ENGINE_COUNTS["core_confirmed"] += 1
         # A confirmed send was otherwise silent, so nothing on the happy path
         # told a live round trip apart from the legacy one it replaces.
