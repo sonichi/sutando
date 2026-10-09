@@ -757,10 +757,9 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self._publish_b(result)
         self._assert_b_was_sent_and_b_retired(result)
 
-    def test_a_legacy_epoch_already_used_never_carries_a_new_body(self):
+    def _legacy_epoch_used_then_c(self):
         """main requeues A at epoch 1, the gateway takes A but the response is
-        lost; after the upgrade C is published. The deduping relay answers for A,
-        so C must not be recorded DELIVERED under that epoch, nor archived as sent."""
+        lost; after the upgrade C is published and the relay dedupes on the id."""
         relay = [self.server.request]
         backend = DesignAClaimBackend(self.outbox, retry_schedule=outbox.RetrySchedule(),
                                       clock=lambda: self.server.now, republish_delivered=False)
@@ -794,6 +793,11 @@ class TerminalResultMovedOnce(unittest.TestCase):
             return {'ok': True, 'duplicate': True}       # it already holds A for this id
         relay[0] = dedupe
         self.server.now += 3600
+        return result, held
+
+    def test_a_legacy_epoch_already_used_never_carries_a_new_body(self):
+        """C must not be recorded DELIVERED under A's epoch, nor archived as sent."""
+        result, held = self._legacy_epoch_used_then_c()
         before = len(self.server.calls)
         gw._post_ready_results({TID})
         rec = outbox.read_item(self.outbox, TID) or {}
@@ -810,6 +814,13 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(len(said), 1, '\n'.join(self.lines))
         self.assertIn('send it by hand', said[0])
         self.assertNotIn('restores it', said[0], 'a requeue of a delivered id restores nothing')
+
+    def test_a_caller_without_a_result_file_is_told_the_stored_body_went(self):
+        self._legacy_epoch_used_then_c()
+        self.assertFalse(gw._deliver_result_payload(TID, TID, 'BODY-C newest reply'))
+        self.assertTrue(any('not this one' in l and 'not retrying' in l for l in self.lines), self.lines)
+        self.assertFalse(gw._record_sent_this_body({'payload': 'not json'}, b'{}'))
+        self.assertFalse(gw._record_sent_this_body({'payload': '{}'}, b'\xff'))
 
     def _publish_c(self, result):
         tmp = result.with_name('.producer.tmp')
