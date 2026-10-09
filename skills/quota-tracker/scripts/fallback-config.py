@@ -15,7 +15,7 @@ restart). Precedence the proxy applies: env > that override file > manifest > bu
   fallback-config.py set low-priority on|off
   fallback-config.py set hysteresis 0.02
   fallback-config.py set enabled on|off
-  fallback-config.py set dm-min-interval-sec 900  # tier-change DMs: at most one per window per 15 min
+  fallback-config.py set dm-min-interval-sec 900  # de-escalation DMs: at most one per 15 min
   fallback-config.py unset 7d level1           # back to the manifest default
 """
 from __future__ import annotations
@@ -211,7 +211,7 @@ def render(manifest: dict[str, str], override: dict[str, str], env: dict[str, st
         f"7d window: level1 > {pct('7D_LEVEL1')} → level 2, level2 > {pct('7D_LEVEL2')} → level 3",
         f"hysteresis: {pct('HYSTERESIS')}   low-priority ladder: {on('LOW_PRIORITY')} "
         f"(level1 > {pct('LOW_LEVEL1')}, level2 > {pct('LOW_LEVEL2')})",
-        f"family levels: {g('FAMILY_LEVELS')[0]}   tier-change DMs: at most one per window per {g('DM_MIN_INTERVAL_SEC')[0]}s",
+        f"family levels: {g('FAMILY_LEVELS')[0]}   de-escalation DMs: at most one per {g('DM_MIN_INTERVAL_SEC')[0]}s",
         "",
         "sources:",
     ]

@@ -54,7 +54,7 @@ export interface FallbackConfig {
 	level2Model: string;
 	level3Model: string;
 	familyLevels: Record<string, Level>;
-	dmMinIntervalSec: number; // at most one tier-change DM per window per this many seconds
+	dmMinIntervalSec: number; // at most one de-escalation DM per this many seconds (one gate for both windows)
 }
 
 export const DEFAULT_FALLBACK_CONFIG: FallbackConfig = {
@@ -482,52 +482,39 @@ export function transitionLine(prev: FallbackState | null, next: FallbackState, 
 }
 
 /**
- * Owner-DM rate gate. Escalations, recovery to the primary tier and runtime
- * switches always go out; only a de-escalation (tier 3 → 2) is held, at most one
- * per window per interval, and a held line is flushed when the interval elapses.
+ * Owner-DM rate gate. The effective tier is one number, so the gate is one
+ * shared gate: escalations, recovery to the primary tier and runtime switches
+ * always go out and clear whatever was held; only a de-escalation (tier 3 → 2)
+ * is held inside the interval, and a held line is flushed when it elapses.
  */
 export type DmKind = 'escalation' | 'recovery' | 'runtime' | 'lateral';
 
 export interface DmGate {
-	last_sent: Record<string, number>;
-	held: Record<string, string[]>;
+	last_sent: number | null;
+	held: string[];
 }
+
+export const EMPTY_DM_GATE: DmGate = { last_sent: null, held: [] };
 
 function withSummary(line: string, held: string[]): string {
 	return held.length ? `${line} [${held.length} earlier change(s) held since the last message: ${held.join(' | ')}]` : line;
 }
 
-export function gateLine(gate: DmGate, key: string, kind: DmKind, line: string, nowMs: number, minIntervalMs: number): { gate: DmGate; send: string | null } {
-	const last = gate.last_sent[key];
-	const inWindow = last !== undefined && nowMs - last < minIntervalMs;
+export function gateLine(gate: DmGate, kind: DmKind, line: string, nowMs: number, minIntervalMs: number): { gate: DmGate; send: string | null } {
+	const inWindow = gate.last_sent !== null && nowMs - gate.last_sent < minIntervalMs;
 	if (kind === 'lateral' && minIntervalMs > 0 && inWindow) {
-		return { gate: { ...gate, held: { ...gate.held, [key]: [...(gate.held[key] ?? []), line] } }, send: null };
+		return { gate: { ...gate, held: [...gate.held, line] }, send: null };
 	}
-	return {
-		gate: { last_sent: { ...gate.last_sent, [key]: nowMs }, held: { ...gate.held, [key]: [] } },
-		send: withSummary(line, gate.held[key] ?? []),
-	};
+	return { gate: { last_sent: nowMs, held: [] }, send: withSummary(line, gate.held) };
 }
 
-/** Held lines whose interval has elapsed: the latest goes out, the rest are summarised into it. */
-export function flushHeld(gate: DmGate, nowMs: number, minIntervalMs: number): { gate: DmGate; send: string[] } {
-	let out = gate;
-	const send: string[] = [];
-	for (const [key, held] of Object.entries(gate.held)) {
-		if (!held.length || nowMs - (gate.last_sent[key] ?? 0) < minIntervalMs) continue;
-		send.push(withSummary(held[held.length - 1], held.slice(0, -1)));
-		out = { last_sent: { ...out.last_sent, [key]: nowMs }, held: { ...out.held, [key]: [] } };
-	}
-	return { gate: out, send };
+/** The held lines once the interval has elapsed: the latest goes out, the rest are summarised into it. */
+export function flushHeld(gate: DmGate, nowMs: number, minIntervalMs: number): { gate: DmGate; send: string | null } {
+	if (!gate.held.length || nowMs - (gate.last_sent ?? 0) < minIntervalMs) return { gate, send: null };
+	return { gate: { last_sent: nowMs, held: [] }, send: withSummary(gate.held[gate.held.length - 1], gate.held.slice(0, -1)) };
 }
 
-/** When the earliest held line becomes due, or null when nothing is held. */
+/** When the held line becomes due, or null when nothing is held. */
 export function nextFlushAt(gate: DmGate, minIntervalMs: number): number | null {
-	let due: number | null = null;
-	for (const [key, held] of Object.entries(gate.held)) {
-		if (!held.length) continue;
-		const at = (gate.last_sent[key] ?? 0) + minIntervalMs;
-		due = due === null ? at : Math.min(due, at);
-	}
-	return due;
+	return gate.held.length ? (gate.last_sent ?? 0) + minIntervalMs : null;
 }

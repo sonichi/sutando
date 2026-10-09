@@ -21,8 +21,8 @@ import { createHash } from 'node:crypto';
 import { resolveWorkspace, statusPath } from '../../../src/workspace_default.js';
 import { resolveHostLabel } from '../../../src/util_paths.js';
 import {
-	decideModel, flushHeld, gateLine, initialState, nextFlushAt, nextState, observationFromHeaders, pushSample,
-	requestPriority, rewriteModel, samplesFromHistoryRows, stateChanged, transitionLine,
+	EMPTY_DM_GATE, decideModel, flushHeld, gateLine, initialState, nextFlushAt, nextState, observationFromHeaders,
+	pushSample, requestPriority, rewriteModel, samplesFromHistoryRows, stateChanged, transitionLine,
 	type DmGate, type DmKind, type FallbackConfig, type FallbackState, type Sample,
 } from './quota-fallback-policy.js';
 import { createConfigReader, OVERRIDE_BASENAME, SKILL_MANIFEST_PATH } from './quota-fallback-config.js';
@@ -451,7 +451,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 	let fallbackState: FallbackState | null = deps.readFallbackState();
 	let samples: Sample[] = [];
 	try { samples = deps.readHistorySamples(deps.now(), deps.fallbackConfig().projection5h.lookbackSec); } catch { samples = []; }
-	let dmGate: DmGate = { last_sent: {}, held: {} };
+	let dmGate: DmGate = EMPTY_DM_GATE;
 	let flushTimer: NodeJS.Timeout | null = null;
 
 	// A held line must not wait for the next event: send it when its interval elapses.
@@ -464,7 +464,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 			flushTimer = null;
 			const r = flushHeld(dmGate, deps.now(), deps.fallbackConfig().dmMinIntervalSec * 1000);
 			dmGate = r.gate;
-			for (const l of r.send) { try { deps.notifyOwner(l); } catch { /* best effort */ } }
+			if (r.send) { try { deps.notifyOwner(r.send); } catch { /* best effort */ } }
 			scheduleFlush();
 		}, Math.max(due - deps.now(), 0) + 50);
 		flushTimer.unref?.();
@@ -488,11 +488,10 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 			const switched = (next.runtime_switch?.to ?? null) !== (prev?.runtime_switch?.to ?? null);
 			const prevTier = prev?.tier ?? 1;
 			const kind: DmKind = switched ? 'runtime' : next.tier > prevTier ? 'escalation' : next.tier === 1 ? 'recovery' : 'lateral';
-			const key = next.fired?.window ?? prev?.fired?.window ?? 'tier';
-			const gated = gateLine(dmGate, key, kind, line, nowMs, cfg.dmMinIntervalSec * 1000);
+			const gated = gateLine(dmGate, kind, line, nowMs, cfg.dmMinIntervalSec * 1000);
 			dmGate = gated.gate;
 			if (gated.send) { try { deps.notifyOwner(gated.send); } catch { /* best effort */ } }
-			else { console.log(`${ts()} [Fallback] DM held (${key} ${kind} within ${cfg.dmMinIntervalSec}s): ${line}`); scheduleFlush(); }
+			else { console.log(`${ts()} [Fallback] DM held (${kind} within ${cfg.dmMinIntervalSec}s): ${line}`); scheduleFlush(); }
 		}
 	}
 
@@ -798,9 +797,11 @@ function recordRejection(rej: RejectionRecord): void {
 	} catch { /* best effort */ }
 }
 
-/** The owner's per-host override; the same label the shell's fallback-config.py resolves. */
+/** The owner's per-host override; the same label the shell's fallback-config.py resolves. Resolved once. */
+let overridePath: string | null = null;
 export function productionOverridePath(): string {
-	return join(resolveWorkspace(), 'hosts', resolveHostLabel(), OVERRIDE_BASENAME);
+	overridePath ??= join(resolveWorkspace(), 'hosts', resolveHostLabel(), OVERRIDE_BASENAME);
+	return overridePath;
 }
 
 // Lazy: resolving the host label (scutil) and reading the override belong to a

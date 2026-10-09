@@ -84,7 +84,7 @@ class TestFallbackConfigCli(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text())["SUTANDO_QUOTA_FALLBACK_5H_PROJECTION_CLEAR_SAMPLES"], "5")
         rc, out, _ = self.run_cli("set", "dm-min-interval-sec", "900")
         self.assertEqual(rc, 0)
-        self.assertIn("at most one per window per 900s", out)
+        self.assertIn("de-escalation DMs: at most one per 900s", out)
 
     def test_target_models_are_validated_against_the_family_levels(self):
         for args in (("set", "level2-model", "claude-opsu-5-5"),      # typo family

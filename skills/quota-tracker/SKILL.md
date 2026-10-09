@@ -127,10 +127,11 @@ reverts, and the `fallback-config set …` clause that moves that line. For exam
 > `fallback-config set 5h projection-limit <0..1>`).
 
 Escalations (a tier going up), recovery to the primary models and runtime-switch lines always go
-out. Only a de-escalation (tier 3 → 2) is rate-limited — at most one per window per 30 minutes
-(`set dm-min-interval-sec`) — and a held line is sent when the interval elapses even if nothing else
-happens; lines held meanwhile are summarised into the next one. The gate is in-memory, so a proxy
-restart resets its window.
+out and clear anything held. Only a de-escalation (tier 3 → 2) is rate-limited — at most one per
+30 minutes (`set dm-min-interval-sec`; one gate, since the effective tier is one number across both
+windows) — and a held line is sent when the interval elapses even if nothing else happens; lines held
+meanwhile are summarised into the next one. The gate is in-memory, so a proxy restart resets its
+window.
 
 **Caveats.** The prompt cache is cold on every switch (caches are model-scoped). Claude Code's
 `/model` still shows the model the user picked; `quota-state.json`'s `last_request.model` and
