@@ -25,16 +25,16 @@ echo "$out" | grep -qx "BASH_MAX_TIMEOUT_MS=120000"
 check $? "default core env forwards BASH_MAX_TIMEOUT_MS=120000"
 
 # 2. Exactly one entry, so tmux cannot receive two conflicting values.
-[ "$(echo "$out" | grep -c '^BASH_MAX_TIMEOUT_MS=')" = "1" ]
-check $? "BASH_MAX_TIMEOUT_MS appears once"
+n="$(echo "$out" | grep -c '^BASH_MAX_TIMEOUT_MS=')"
+rc=1; [ "$n" = "1" ] && rc=0
+check "$rc" "BASH_MAX_TIMEOUT_MS appears once"
 
 # 3. A caller-set value wins over the default.
 out="$(run_probe BASH_MAX_TIMEOUT_MS=300000)"
 echo "$out" | grep -qx "BASH_MAX_TIMEOUT_MS=300000"
 check $? "caller-set BASH_MAX_TIMEOUT_MS=300000 is forwarded verbatim"
-echo "$out" | grep -qx "BASH_MAX_TIMEOUT_MS=120000"
-[ $? -ne 0 ]
-check $? "caller preset is not overridden by the default"
+rc=0; echo "$out" | grep -qx "BASH_MAX_TIMEOUT_MS=120000" && rc=1
+check "$rc" "caller preset is not overridden by the default"
 
 # 4. The baseline core marker is still present (the append did not replace the array).
 echo "$out" | grep -qx "SUTANDO_CORE_SESSION=1"
