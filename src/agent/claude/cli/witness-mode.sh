@@ -144,11 +144,13 @@ PY
   [ -n "$ccd" ] || echo "  ⚠ no CLAUDE_CONFIG_DIR in the caller's env: the witness gets a fresh one and will need /login in its pane" >&2
   echo "  ✓ witness '$name': workspace $WITNESS_WS"
 
+  local notifier_env=()
+  [ -n "${SUTANDO_NOTIFIER_GRACE_PERIOD:-}" ] && notifier_env+=("SUTANDO_NOTIFIER_GRACE_PERIOD=$SUTANDO_NOTIFIER_GRACE_PERIOD")
+  [ -n "${SUTANDO_NOTIFIER_ROLE_POLL:-}" ] && notifier_env+=("SUTANDO_NOTIFIER_ROLE_POLL=$SUTANDO_NOTIFIER_ROLE_POLL")
   # A clean env, so nothing of the caller's (memory dir, inbox resolver, instance id) reaches the witness.
   exec env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" SHELL="${SHELL:-/bin/bash}" \
     TERM="${TERM:-xterm-256color}" LANG="${LANG:-en_US.UTF-8}" TMPDIR="${TMPDIR:-/tmp}" \
-    ${SUTANDO_NOTIFIER_GRACE_PERIOD:+SUTANDO_NOTIFIER_GRACE_PERIOD="$SUTANDO_NOTIFIER_GRACE_PERIOD"} \
-    ${SUTANDO_NOTIFIER_ROLE_POLL:+SUTANDO_NOTIFIER_ROLE_POLL="$SUTANDO_NOTIFIER_ROLE_POLL"} \
+    ${notifier_env[@]+"${notifier_env[@]}"} \
     SUTANDO_TMUX_SOCKET="$WITNESS_SOCKET" SUTANDO_TMUX_SESSION="$WITNESS_SESSION" \
     SUTANDO_WORKSPACE_DIR="$WITNESS_WS" SUTANDO_TASKS_DIR="$WITNESS_WS/tasks" \
     SUTANDO_RESULTS_DIR="$WITNESS_WS/results" SUTANDO_CLAUDE_WORKING_DIR="$REPO" \
