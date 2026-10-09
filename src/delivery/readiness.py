@@ -27,11 +27,14 @@ __all__ = ["read_ready_result", "read_ready_result_with_identity", "identity_of"
 
 
 class ResultIdentity(NamedTuple):
-    """The exact file a consumer read: inode and bytes, not a path. A later
-    file at the same name is a different reply and must not be disposed of
-    under a decision made about this one."""
+    """The exact publication a consumer read, not a path: inode, the write
+    time a rename preserves, and the bytes. A later file at the same name is
+    a different reply and must not be disposed of under a decision made about
+    this one; an inode the filesystem hands back after an unlink carries a
+    new write time, so equal bytes there are still a distinct publication."""
     dev: int
     ino: int
+    mtime_ns: int
     digest: str
 
 
@@ -46,7 +49,8 @@ def identity_of(path: str | Path) -> "tuple[bytes, ResultIdentity]":
     with open(path, "rb") as f:
         st = os.fstat(f.fileno())
         data = f.read()
-    return data, ResultIdentity(st.st_dev, st.st_ino, hashlib.sha256(data).hexdigest())
+    return data, ResultIdentity(st.st_dev, st.st_ino, st.st_mtime_ns,
+                                hashlib.sha256(data).hexdigest())
 
 
 def is_ready_body(text: str | None) -> bool:

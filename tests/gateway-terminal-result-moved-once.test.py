@@ -12,6 +12,7 @@ Run: python3 tests/gateway-terminal-result-moved-once.test.py
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import inspect
 import os
 import subprocess
@@ -259,9 +260,12 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(len(self.quarantined()), 1)
         self.assertEqual(self.about(), [], '\n'.join(self.about()))
 
-    def claim_name(self, pid, start, nonce='deadbeef', acquired=None, restore=False):
+    def claim_name(self, pid, start, nonce='deadbeef', acquired=None, restore=False,
+                   body='Existing answer'):
+        # The name carries the first 16 hex of the digest the owner meant to dispose of.
         acquired = int(time.time() if acquired is None else acquired)
-        return self.results / (f'.{TID}.disposing-{pid}-{start}-{acquired}-{nonce}'
+        gen = hashlib.sha256(body.encode()).hexdigest()[:16]
+        return self.results / (f'.{TID}.disposing-{pid}-{start}-{acquired}-{gen}-{nonce}'
                                + ('.restore' if restore else ''))
 
     def live_other_owner(self):
@@ -434,9 +438,11 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.task()
         odd = self.results / f'.{TID}.disposing-123-1-abcd'    # an older, three-field name
         self.result().rename(odd)
-        gw._post_ready_results({TID})
+        for _ in range(PASSES):
+            gw._post_ready_results({TID})
         self.assertTrue(odd.exists())
-        self.assertEqual(self.about(), [])
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+        self.assertIn('unknown shape', self.about()[0])
 
     def test_a_claim_gone_between_listing_and_stat_is_left_alone(self):
         core = self.park_without_disposing()
@@ -632,18 +638,89 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(len(self.server.calls), 1)
 
     def test_equal_bytes_in_another_publication_do_not_silence_the_loser(self):
+        # Simulated inode reuse: the same dev/ino and bytes under a new write
+        # time is a later, distinct publication, so the loser's reply is lost.
         core = self.park_without_disposing()
         self.bridge(core)
         self.task()
         result = self.result()
         body, gen = self.read(result)
-        result.unlink()
-        other = self.results / f'{TID}.later'                   # another inode, equal bytes
-        other.write_text('Existing answer')
-        undelivered_quarantine.quarantine(other, self.results)
+        os.utime(result, ns=(gen.mtime_ns + 1_000, gen.mtime_ns + 1_000))
+        undelivered_quarantine.quarantine(result, self.results)
         self.deliver(body, result, gen)
         self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
         self.assertIn('vanished', self.about()[0])
+        self.assertEqual(len(self.quarantined()), 1, 'the other publication is untouched')
+
+    def test_a_dead_owners_unverified_claim_goes_back_live(self):
+        # The owner died after claiming but before checking: the claim names
+        # OLD's digest while it holds NEWER, so NEWER is restored, not quarantined.
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        self.result('NEWER BODY').rename(self.claim_name(self.dead_pid(), 1, '01d00007', body='OLD BODY'))
+        gw._post_ready_results({TID})
+        # Restored live first; the item is terminal, so the same pass then
+        # disposes of NEWER under its own identity, once, with its own line.
+        self.assertEqual(self.claims(), [])
+        self.assertEqual(len(self.server.calls), 1, 'the park itself; a terminal item is never re-POSTed')
+        self.assertEqual(len(self.quarantined()), 1, self.quarantined())
+        self.assertEqual((self.results / 'undelivered' / self.quarantined()[0]).read_text(), 'NEWER BODY')
+        self.assertEqual(len(self.about()), 2, '\n'.join(self.about()))
+        self.assertIn('never verified', self.about()[0])
+        self.assertIn('terminal', self.about()[1])
+
+    def test_a_claim_that_cannot_be_read_is_reported_and_the_body_stays_live(self):
+        # EMFILE while checking the claim is not a replacement: the bridge says
+        # the quarantine failed and the reply is back at its name.
+        self.bridge()
+        self.task()
+        result = self.result()
+        body, gen = self.read(result)
+        real = disposal.identity_of
+
+        def emfile(path):
+            if 'disposing' in str(path):
+                raise OSError(24, 'Too many open files')
+            return real(path)
+        with patch.object(disposal, 'identity_of', emfile):
+            self.deliver(body, result, gen)
+        self.assertTrue(result.exists(), 'the body must be back at its name')
+        self.assertEqual(self.claims(), [])
+        self.assertEqual(self.quarantined(), [])
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+        self.assertIn('leaving it in place', self.about()[0])
+        self.assertNotIn('replaced', self.about()[0])
+
+    def test_a_sweep_during_the_restore_rename_cannot_take_the_claim(self):
+        # The .restore path is registered before it exists; a sweep that runs
+        # at the rename sees it held and leaves it, and the owner finishes.
+        self.bridge()
+        self.task()
+        result = self.result('OLD BODY')
+        body, gen = self.read(result)
+        result.unlink()
+        self.result('NEWER BODY')
+        real = os.rename
+        swept = []
+
+        def sweep_at_restore(src, dst, *a, **kw):
+            out = real(src, dst, *a, **kw)
+            if str(dst).endswith('.restore') and not swept:
+                swept.append(disposal.owner_holds(Path(dst)))
+                gw._last_orphan_sweep = 0.0
+                with patch.object(os, 'rename', real):
+                    gw._reconcile_orphan_results(set())
+                self.assertTrue(Path(dst).exists(), 'the sweep took a live restore claim')
+            return out
+        with patch.object(os, 'rename', sweep_at_restore):
+            self.deliver(body, result, gen)
+        self.assertEqual(swept, [True])
+        self.assertEqual(result.read_text(), 'NEWER BODY')
+        self.assertEqual(self.claims(), [])
+        self.assertEqual(self.quarantined(), [])
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+        self.assertIn('replaced', self.about()[0])
 
     def test_a_dead_owners_claim_is_recovered(self):
         core = self.park_without_disposing()
@@ -674,7 +751,9 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(self.quarantined(), [])
         self.assertEqual(self.about(), [], '\n'.join(self.about()))
 
-    def test_a_live_owners_claim_past_the_bound_is_recovered(self):
+    def test_a_live_owners_claim_is_never_taken_on_age_alone(self):
+        # A live owner's moves run under the lock, so a claim it still holds is
+        # one it is still making: age says nothing about it.
         core = self.park_without_disposing()
         self.bridge(core)
         self.task()
@@ -683,6 +762,27 @@ class TerminalResultMovedOnce(unittest.TestCase):
         claim = self.claim_name(pid, start, '5fc00001',
                                 acquired=time.time() - disposal.CLAIM_MAX_S - 1)
         result.rename(claim)
+        for _ in range(PASSES):
+            gw._post_ready_results({TID})
+            gw._last_orphan_sweep = 0.0
+            gw._reconcile_orphan_results({TID})
+        self.assertTrue(claim.exists(), 'a live owner keeps its claim whatever its age')
+        self.assertEqual(self.quarantined(), [])
+        self.assertEqual(self.about(), [], '\n'.join(self.about()))
+
+    def test_an_owner_whose_state_cannot_be_read_ages_out(self):
+        # pid 1 answers EPERM: neither alive nor dead to us, so the bound applies.
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        self.assertIs(outbox.process_identity(1).state, outbox.OwnerState.UNKNOWN)
+        result = self.result()
+        fresh = self.claim_name(1, 0, '5fc00002')
+        result.rename(fresh)
+        gw._post_ready_results({TID})
+        self.assertTrue(fresh.exists(), 'within the bound an opaque owner is trusted')
+        stale = self.claim_name(1, 0, '5fc00003', acquired=time.time() - disposal.CLAIM_MAX_S - 1)
+        fresh.rename(stale)
         gw._post_ready_results({TID})
         self.assertEqual(self.claims(), [])
         self.assertEqual(len(self.quarantined()), 1, self.quarantined())
