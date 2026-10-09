@@ -908,6 +908,12 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(len(self.server.calls), posts, 'nothing is posted')
         self.assertTrue(any(UNSENT in l for l in self.lines), self.lines)
 
+    def test_a_late_copy_not_yet_readable_is_left_for_a_later_sweep(self):
+        result, posts = self._delivered_then_late('  \n')
+        self.assertEqual(result.read_text(), '  \n')
+        self.assertEqual((self.quarantined_bodies(), len(self.server.calls)), ([], posts))
+        self.assertEqual(list((self.results / 'archive').rglob(f'{TID}-*-late-duplicate*.txt')), [])
+
     def test_a_byte_identical_late_copy_is_archived_as_a_duplicate(self):
         result, posts = self._delivered_then_late('BODY-A the reply')
         self.assertFalse(result.exists())
