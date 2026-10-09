@@ -337,17 +337,23 @@ class CoreContract(unittest.TestCase):
         r = self.result("NEWER")
         c = self.claim(restore=True, body="NEWER", nonce="ab00000a")
         r.rename(c)
-        real = os.unlink
+        real, real_link = os.unlink, os.link
 
         def retake_then_unlink(path, *a, **kw):
             tmp = self.results / "task-a.newest"
             tmp.write_text("NEWEST")
             os.replace(tmp, self.results / "task-a.txt")
             return real(path, *a, **kw)
-        with unittest.mock.patch.object(disposal, "_RENAME", None), \
-                unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "none"), \
+
+        def link_only_into_quarantine(src, dst, *a, **kw):
+            # A link is only ever a no-clobber placement into undelivered/, never a put-back.
+            if "undelivered" not in str(dst):
+                raise AssertionError(f"links to {dst}")
+            return real_link(src, dst, *a, **kw)
+        with unittest.mock.patch.object(disposal.undelivered_quarantine, "_RENAME", None), \
+                unittest.mock.patch.object(disposal.undelivered_quarantine, "RENAME_PRIMITIVE", "none"), \
                 unittest.mock.patch.object(os, "unlink", retake_then_unlink), \
-                unittest.mock.patch.object(os, "link", unittest.mock.Mock(side_effect=AssertionError("never links"))):
+                unittest.mock.patch.object(os, "link", link_only_into_quarantine):
             self.assertFalse(disposal.put_back(c, self.results / "task-a.txt", self.lines.append))
             self.assertEqual(c.read_text(), "NEWER", "the claim keeps the body")
             self.assertFalse((self.results / "task-a.txt").exists())
@@ -356,10 +362,11 @@ class CoreContract(unittest.TestCase):
         self.assertEqual(disposal.find_claims(self.results), [])
         self.assertEqual(len(self.lines), 2, "\n".join(self.lines))
         self.assertIn("never put back", self.lines[0])
-        self.assertIn("superseded", self.lines[1])
+        self.assertIn("cannot put back", self.lines[1])
+        self.assertNotIn("superseded", self.lines[1], "nothing retook the name; it was not superseded")
 
     def test_the_kernel_rename_refuses_a_taken_name_without_moving(self):
-        if disposal.RENAME_PRIMITIVE == "link":
+        if disposal.undelivered_quarantine.RENAME_PRIMITIVE == "link":
             self.skipTest("no kernel no-replace rename on this platform")
         a = self.result("A", stem="task-a")
         b = self.result("B", stem="task-b")
@@ -571,12 +578,12 @@ class CoreContract(unittest.TestCase):
     def test_a_filesystem_without_the_primitive_refuses_every_put_back_from_then_on(self):
         a = self.result("A")
         for err in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
-            with unittest.mock.patch.object(disposal, "_RENAME", self.fake_rename(err)), \
-                    unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "probe"):
+            with unittest.mock.patch.object(disposal.undelivered_quarantine, "_RENAME", self.fake_rename(err)), \
+                    unittest.mock.patch.object(disposal.undelivered_quarantine, "RENAME_PRIMITIVE", "probe"):
                 dst = self.results / f"task-{err}.txt"
                 with self.assertRaises(FileExistsError):
                     disposal.rename_noreplace(a, dst, self.lines.append)
-                self.assertEqual((disposal.RENAME_PRIMITIVE, disposal._RENAME), ("none", None))
+                self.assertEqual((disposal.undelivered_quarantine.RENAME_PRIMITIVE, disposal.undelivered_quarantine._RENAME), ("none", None))
             self.assertFalse(dst.exists())
             self.assertEqual(a.read_text(), "A", "nothing moved")
         self.assertEqual(len(self.lines), 1, "the refusal is reported once per process")
@@ -584,36 +591,36 @@ class CoreContract(unittest.TestCase):
 
     def test_any_other_kernel_error_raises_and_moves_nothing(self):
         a = self.result("A")
-        with unittest.mock.patch.object(disposal, "_RENAME", self.fake_rename(errno.EACCES)), \
-                unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "probe"):
+        with unittest.mock.patch.object(disposal.undelivered_quarantine, "_RENAME", self.fake_rename(errno.EACCES)), \
+                unittest.mock.patch.object(disposal.undelivered_quarantine, "RENAME_PRIMITIVE", "probe"):
             with self.assertRaises(OSError) as cm:
                 disposal.rename_noreplace(a, self.results / "task-b.txt", self.lines.append)
             self.assertEqual(cm.exception.errno, errno.EACCES)
-            self.assertEqual(disposal.RENAME_PRIMITIVE, "probe", "an unexplained error is not a missing primitive")
+            self.assertEqual(disposal.undelivered_quarantine.RENAME_PRIMITIVE, "probe", "an unexplained error is not a missing primitive")
         self.assertEqual(a.read_text(), "A")
         self.assertFalse((self.results / "task-b.txt").exists())
         self.assertEqual(self.lines, [])
 
     def test_the_probe_names_no_primitive_where_none_is_known(self):
         with unittest.mock.patch.object(sys, "platform", "freebsd14"):
-            self.assertEqual(disposal._probe_rename(), ("none", None))
+            self.assertEqual(disposal.undelivered_quarantine._probe_rename(), ("none", None))
 
     def test_without_a_primitive_a_rewritten_reply_stays_in_its_claim_for_recovery(self):
         # The undo of a post-verification rewrite needs a put-back; without the
         # primitive the body goes back into the private claim, never quarantine.
         r = self.result("answer")
         _, gen = identity_of(r)
-        real_rename = os.rename
+        real_move = disposal._move_into_quarantine
 
-        def rewrite_before_the_move(src, dst, *a, **kw):
-            if ".disposing-" in str(src) and "undelivered" in str(dst):
+        def rewrite_before_the_move(src, dst, log):
+            if ".disposing-" in str(src):
                 with open(src, "r+b") as fh:
                     fh.seek(0); fh.write(b"ANSWER")
                 os.utime(src, ns=(gen.mtime_ns, gen.mtime_ns))
-            return real_rename(src, dst, *a, **kw)
-        with unittest.mock.patch.object(disposal, "_RENAME", None), \
-                unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "none"), \
-                unittest.mock.patch.object(os, "rename", rewrite_before_the_move):
+            return real_move(src, dst, log)
+        with unittest.mock.patch.object(disposal.undelivered_quarantine, "_RENAME", None), \
+                unittest.mock.patch.object(disposal.undelivered_quarantine, "RENAME_PRIMITIVE", "none"), \
+                unittest.mock.patch.object(disposal, "_move_into_quarantine", rewrite_before_the_move):
             with self.assertRaises(disposal.GenerationReplaced):
                 disposal.quarantine_generation(self.results, r, gen, self.lines.append)
         self.assertEqual(self.quarantined(), [])
@@ -661,6 +668,78 @@ class CoreContract(unittest.TestCase):
         self.assertEqual(cm.exception.errno, errno.ESTALE)
         self.assertEqual(len(seen), 8)
 
+    def pin_quarantine_clock(self, when=7):
+        # Every move into undelivered/ chooses its name from the clock; pinning
+        # it makes the first choice collide with an earlier copy on purpose.
+        return unittest.mock.patch.object(undelivered_quarantine.time, "time_ns", lambda: when)
+
+    def prior_evidence(self, stem="task-a", when=7):
+        d = self.results / undelivered_quarantine.DIRNAME
+        d.mkdir(exist_ok=True)
+        prior = d / undelivered_quarantine.quarantine_name(stem, when)
+        prior.write_text("PRIOR-EVIDENCE")
+        return prior
+
+    def test_terminal_quarantine_never_overwrites_an_earlier_copy(self):
+        prior = self.prior_evidence()
+        r = self.result("answer")
+        _, gen = identity_of(r)
+        with self.pin_quarantine_clock():
+            target = disposal.quarantine_generation(self.results, r, gen, self.lines.append)
+        self.assertEqual(prior.read_text(), "PRIOR-EVIDENCE", "earlier evidence was overwritten")
+        self.assertNotEqual(target, prior)
+        self.assertEqual(sorted(p.read_text() for p in self.quarantined()), ["PRIOR-EVIDENCE", "answer"])
+
+    def test_recovery_never_overwrites_an_earlier_copy(self):
+        prior = self.prior_evidence()
+        r = self.result("answer")
+        _, gen = identity_of(r)
+        c = self.claim(nonce="ab000020")                  # names the very publication it holds
+        r.rename(c)
+        with self.pin_quarantine_clock():
+            disposal.recover_claim(self.results, c, self.lines.append)
+        self.assertEqual(prior.read_text(), "PRIOR-EVIDENCE")
+        self.assertEqual(sorted(p.read_text() for p in self.quarantined()), ["PRIOR-EVIDENCE", "answer"])
+        self.assertEqual(disposal.find_claims(self.results), [])
+
+    def test_a_kept_duplicate_never_overwrites_an_earlier_copy(self):
+        prior = self.prior_evidence()
+        c = self.claim(nonce="ab000021")
+        self.result("DUPLICATE-BODY").rename(c)
+        with self.pin_quarantine_clock():
+            disposal._keep_duplicate(c, self.lines.append, "task-a", self.results)
+        self.assertEqual(prior.read_text(), "PRIOR-EVIDENCE")
+        self.assertEqual(sorted(p.read_text() for p in self.quarantined()), ["DUPLICATE-BODY", "PRIOR-EVIDENCE"])
+
+    def test_without_a_primitive_quarantine_still_never_overwrites(self):
+        prior = self.prior_evidence()
+        r = self.result("answer")
+        _, gen = identity_of(r)
+        with self.pin_quarantine_clock(), \
+                unittest.mock.patch.object(undelivered_quarantine, "_RENAME", None), \
+                unittest.mock.patch.object(undelivered_quarantine, "RENAME_PRIMITIVE", "none"):
+            disposal.quarantine_generation(self.results, r, gen, self.lines.append)
+        self.assertEqual(prior.read_text(), "PRIOR-EVIDENCE")
+        self.assertEqual(sorted(p.read_text() for p in self.quarantined()), ["PRIOR-EVIDENCE", "answer"])
+        self.assertEqual(disposal.find_claims(self.results), [])
+
+    def test_place_gives_up_rather_than_overwrite_when_no_name_is_free(self):
+        d = self.results / undelivered_quarantine.DIRNAME
+        d.mkdir(exist_ok=True)
+        for n in range(7, 7 + undelivered_quarantine._PLACE_TRIES):
+            (d / undelivered_quarantine.quarantine_name("task-a", n)).write_text(f"P{n}")
+        src = self.result("answer")
+        with self.assertRaises(FileExistsError):
+            undelivered_quarantine.place(src, self.results, "task-a", when=7)
+        self.assertEqual(src.read_text(), "answer", "nothing moved")
+
+    def test_place_passes_through_a_refusal_that_is_not_a_taken_name(self):
+        def cannot(_s, _d):
+            raise FileExistsError(errno.ENOTSUP, "no primitive")
+        with self.assertRaises(FileExistsError) as cm:
+            undelivered_quarantine.place(self.result("answer"), self.results, "task-a", move=cannot)
+        self.assertEqual(cm.exception.errno, errno.ENOTSUP)
+
     def test_a_duplicate_name_is_kept_where_the_operator_looks(self):
         c = self.claim(nonce="ab00000c")
         self.result("only copy").rename(c)
@@ -673,15 +752,15 @@ class CoreContract(unittest.TestCase):
     def rewrite_at_the_final_move(self, gen, new=b"ANSWER"):
         # The producer rewrites the claimed inode in place between the
         # verification and the final rename, same size, original mtime restored.
-        real_rename = os.rename
+        real_move = disposal._move_into_quarantine
 
-        def rewrite_then_move(src, dst, *a, **kw):
-            if ".disposing-" in str(src) and "undelivered" in str(dst):
+        def rewrite_then_move(src, dst, log):
+            if ".disposing-" in str(src):
                 with open(src, "r+b") as fh:
                     fh.seek(0); fh.write(new)
                 os.utime(src, ns=(gen.mtime_ns, gen.mtime_ns))
-            return real_rename(src, dst, *a, **kw)
-        return unittest.mock.patch.object(os, "rename", rewrite_then_move)
+            return real_move(src, dst, log)
+        return unittest.mock.patch.object(disposal, "_move_into_quarantine", rewrite_then_move)
 
     def test_a_rewrite_after_verification_goes_back_live_not_into_quarantine(self):
         r = self.result("answer")
@@ -771,21 +850,23 @@ class CoreContract(unittest.TestCase):
         r = self.result("answer")
         _, gen = identity_of(r)
         real = os.rename
+        real_move = disposal._move_into_quarantine
 
-        def rewrite_retake_then_lose(src, dst, *a, **kw):
-            if ".disposing-" in str(src) and "undelivered" in str(dst):
-                with open(src, "r+b") as fh:
-                    fh.seek(0); fh.write(b"ANSWER")
-                os.utime(src, ns=(gen.mtime_ns, gen.mtime_ns))
-                real(src, dst, *a, **kw)
-                tmp = self.results / "task-a.newest"
-                tmp.write_text("NEWEST")
-                os.replace(tmp, self.results / "task-a.txt")
-                return None
+        def rewrite_retake_then_move(src, dst, log):
+            with open(src, "r+b") as fh:
+                fh.seek(0); fh.write(b"ANSWER")
+            os.utime(src, ns=(gen.mtime_ns, gen.mtime_ns))
+            real_move(src, dst, log)
+            tmp = self.results / "task-a.newest"
+            tmp.write_text("NEWEST")
+            os.replace(tmp, self.results / "task-a.txt")
+
+        def lose(src, dst, *a, **kw):
             if "undelivered" in str(src) and ".disposing-" in str(dst):
                 raise FileNotFoundError(errno.ENOENT, "taken elsewhere", str(src))
             return real(src, dst, *a, **kw)
-        with unittest.mock.patch.object(os, "rename", rewrite_retake_then_lose):
+        with unittest.mock.patch.object(disposal, "_move_into_quarantine", rewrite_retake_then_move), \
+                unittest.mock.patch.object(os, "rename", lose):
             with self.assertRaises(disposal.GenerationReplaced):
                 disposal.quarantine_generation(self.results, r, gen, self.lines.append)
         self.assertEqual(r.read_text(), "NEWEST")

@@ -11,8 +11,10 @@ The interleaving is injected at the production move itself, not simulated by a
 reimplementation, so the test exercises the shipped function.
 """
 import importlib.util
+import os
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,45 +38,60 @@ class ConcurrentProducerAtTheMoveBoundary(unittest.TestCase):
         return p
 
     def test_a_reply_written_inside_the_window_survives(self):
-        """The exact production-writer interleaving, driven through restore()."""
+        """A producer lands a newer reply at the canonical name in the instant
+        before restore() moves: the live reply wins and the quarantined body
+        stays quarantined (the guarantee: never overwrite, never lose)."""
         task = "abc123"
-        self._quarantine(task, "OLD quarantined body", 1)
+        q = self._quarantine(task, "OLD quarantined body", 1)
         target = self.results / f"task-{task}.txt"
-
-        # The concurrent producer: land a newer reply at the canonical name
-        # after restore() has looked, in the instant before it moves.
-        _os = getattr(uq, "os", None)
-        real_link = getattr(_os, "link", None) if _os is not None else None
-        real_rename = Path.rename
+        real = uq.rename_noreplace
         fired = {"n": 0}
 
-        def _write_then_delegate(path_self, dst, *a, **kw):
+        def write_then_move(src, dst, *a, **kw):
             fired["n"] += 1
             Path(dst).write_text("NEW live reply", encoding="utf-8")
-            return real_rename(path_self, dst, *a, **kw)
-
-        def _write_then_link(src, dst, *a, **kw):
-            fired["n"] += 1
-            Path(dst).write_text("NEW live reply", encoding="utf-8")
-            return real_link(src, dst, *a, **kw)
-
-        Path.rename = _write_then_delegate
-        if real_link is not None:
-            _os.link = _write_then_link
-        try:
+            return real(src, dst, *a, **kw)
+        with unittest.mock.patch.object(uq, "rename_noreplace", write_then_move):
             outcome, _ = uq.restore(self.results, task)
-        finally:
-            Path.rename = real_rename
-            if real_link is not None:
-                _os.link = real_link
-
-        self.assertGreater(fired["n"], 0,
-                           "the injection never ran — the test proves nothing")
-        self.assertEqual(
-            target.read_text(encoding="utf-8"), "NEW live reply",
-            "restore() overwrote a live result that landed inside its window; "
-            f"outcome={outcome}")
+        self.assertGreater(fired["n"], 0, "the injection never ran — the test proves nothing")
+        self.assertEqual(target.read_text(encoding="utf-8"), "NEW live reply",
+                         f"restore() overwrote a live result; outcome={outcome}")
         self.assertIs(outcome, uq.RestoreOutcome.LIVE_RESULT_PRESENT)
+        self.assertEqual(q.read_text(encoding="utf-8"), "OLD quarantined body",
+                         "the refused body must stay quarantined")
+
+    def test_a_producer_retaking_the_name_after_the_install_never_costs_the_body(self):
+        """The link-then-unlink schedule: a producer replaces the canonical name
+        after the body was installed and before any cleanup. The body must still
+        exist somewhere, and RESTORED may only be claimed if it is at the name."""
+        task = "race1"
+        self._quarantine(task, "OLD quarantined body", 1)
+        target = self.results / f"task-{task}.txt"
+        real_unlink = os.unlink
+
+        def producer_then_unlink(path, *a, **kw):
+            tmp = self.results / "producer.tmp"
+            tmp.write_text("NEW live reply", encoding="utf-8")
+            os.replace(tmp, target)
+            return real_unlink(path, *a, **kw)
+        with unittest.mock.patch.object(os, "unlink", producer_then_unlink):
+            outcome, _ = uq.restore(self.results, task)
+        survivors = [p.read_text(encoding="utf-8") for p in
+                     [target, *self.results.joinpath(uq.DIRNAME).glob("*.txt")] if p.exists()]
+        self.assertIn("OLD quarantined body", survivors, "restore() lost the body it was installing")
+        if outcome is uq.RestoreOutcome.RESTORED:
+            self.assertEqual(target.read_text(encoding="utf-8"), "OLD quarantined body")
+
+    def test_without_a_primitive_restore_refuses_and_keeps_the_body(self):
+        task = "noprim1"
+        q = self._quarantine(task, "OLD quarantined body", 1)
+        with unittest.mock.patch.object(uq, "_RENAME", None), \
+                unittest.mock.patch.object(uq, "RENAME_PRIMITIVE", "none"):
+            outcome, path = uq.restore(self.results, task)
+        self.assertIs(outcome, uq.RestoreOutcome.NO_SAFE_MOVE)
+        self.assertEqual(path, q)
+        self.assertEqual(q.read_text(encoding="utf-8"), "OLD quarantined body")
+        self.assertFalse((self.results / f"task-{task}.txt").exists())
 
     def test_the_ordinary_restore_still_works(self):
         """Negative control: with no concurrent writer the body is restored."""

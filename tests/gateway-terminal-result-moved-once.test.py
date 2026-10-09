@@ -113,6 +113,9 @@ class TerminalResultMovedOnce(unittest.TestCase):
     def about(self):
         return [ln for ln in self.lines if TID in ln]
 
+    def quarantined_bodies(self):
+        return sorted(p.read_text() for p in (self.results / 'undelivered').glob('*.txt'))
+
     def quarantined(self):
         return sorted(p.name for p in (self.results / 'undelivered').glob(f'{TID}*'))
 
@@ -514,14 +517,14 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.result()
         claim = self.claim_name(self.dead_pid(), 1, 'ace00001')
         (self.results / f'{TID}.txt').rename(claim)
-        real_rename = os.rename
+        real_move = disposal._move_into_quarantine
 
-        def taken_first(src, dst, *a, **kw):
+        def taken_first(src, dst, log):
             if Path(src) == claim:
-                real_rename(src, self.results / 'elsewhere.txt')   # the other observer
+                os.rename(src, self.results / 'elsewhere.txt')    # the other observer
                 raise FileNotFoundError(2, 'gone', str(src))
-            return real_rename(src, dst, *a, **kw)
-        with patch.object(os, 'rename', taken_first):
+            return real_move(src, dst, log)
+        with patch.object(disposal, '_move_into_quarantine', taken_first):
             gw._post_ready_results({TID})
         self.assertEqual(self.about(), [])
         self.assertEqual(self.quarantined(), [])
@@ -973,6 +976,25 @@ class TerminalResultMovedOnce(unittest.TestCase):
         gw._quarantine_undelivered(result, TID, 'refused')
         self.assertFalse(result.exists())
         self.assertEqual(len(self.quarantined()), 1)
+
+    def test_without_a_primitive_a_newer_reply_kept_in_quarantine_is_not_called_live(self):
+        # No no-replace rename: the newer reply found at the name cannot go back,
+        # waits in undelivered/, and nothing claims it is live or superseded.
+        self.bridge(self.park_without_disposing())
+        self.task()
+        result = self.result('OLD BODY')
+        _, gen = self.read(result)
+        os.unlink(result)
+        result.write_text('NEWER BODY')
+        with patch.object(disposal.undelivered_quarantine, '_RENAME', None), \
+                patch.object(disposal.undelivered_quarantine, 'RENAME_PRIMITIVE', 'none'):
+            gw._quarantine_undelivered(result, TID, 'terminal', generation=gen)
+        self.assertFalse(result.exists(), '\n'.join(self.lines))
+        self.assertEqual(self.quarantined_bodies(), ['NEWER BODY'])
+        said = '\n'.join(self.lines)
+        self.assertIn('requeue it to deliver', said)
+        self.assertNotIn('stays live', said)
+        self.assertNotIn('superseded', said)
 
     def test_a_reply_rewritten_in_place_is_a_new_generation(self):
         # Same inode, new bytes: still not the file this pass read.

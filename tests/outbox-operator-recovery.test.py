@@ -424,7 +424,10 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
         bridge = (ROOT / "packages" / "ag2-sparrow" / "ag2_sparrow"
                   / "remote_gateway_bridge.py").read_text(encoding="utf-8")
         self.assertNotIn('f"{rfile.stem}-{int(time.time())}.txt"', bridge)
-        self.assertIn("undelivered_quarantine.quarantine(", bridge)
+        # Every quarantine goes through the lifecycle owner, which names files
+        # only through undelivered_quarantine.place().
+        self.assertIn("disposal.quarantine_current(", bridge)
+        self.assertIn("disposal.quarantine_generation(", bridge)
 
 
 class CliRenderingAndErrorPaths(unittest.TestCase):

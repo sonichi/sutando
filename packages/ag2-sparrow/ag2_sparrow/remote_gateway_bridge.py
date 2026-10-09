@@ -4218,7 +4218,7 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
     """
     try:
         if generation is None:
-            undelivered_quarantine.quarantine(rfile, RESULTS_DIR)
+            disposal.quarantine_current(RESULTS_DIR, rfile, _log)
         else:
             disposal.quarantine_generation(RESULTS_DIR, rfile, generation, _log)
         _log(f"result {tid}: {why} — quarantined to "
@@ -4226,6 +4226,8 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
              f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
              f"requeue {outbox_item_id or _broker_tid(_delivery_tid(tid) or tid)} --reset-attempts "
              f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
+    except disposal.KeptQuarantined:
+        return                                          # the lifecycle owner named where it waits
     except disposal.GenerationReplaced:
         # The file this pass read is already disposed of, or a newer reply took
         # its name and stays live; either way nothing of this pass is lost.

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Named mutants of src/delivery/disposal.py, so a reviewer can reproduce
+"""Named mutants of src/delivery/disposal.py and src/undelivered_quarantine.py
+(the no-replace transition's owner), so a reviewer can reproduce
 "this test kills that mutant" without hand-editing the module.
 
     python3 tests/_helpers/disposal_mutants.py list
@@ -17,8 +18,13 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-FILES = [REPO / "src" / "delivery" / "disposal.py",
-         REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "result_disposal.py"]
+DISPOSAL = [REPO / "src" / "delivery" / "disposal.py",
+            REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "result_disposal.py"]
+QUARANTINE = [REPO / "src" / "undelivered_quarantine.py",
+              REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "undelivered_quarantine.py"]
+# Mutants whose site lives in the quarantine module; every other one edits disposal.
+IN_QUARANTINE = {"fallback-links-then-unlinks", "place-replaces-a-taken-name",
+                 "place-does-not-retry", "restore-links-then-unlinks"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
 
 MUTANTS: dict[str, tuple[str, str, str]] = {
@@ -82,10 +88,9 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "    raise FileExistsError(errno.EEXIST, \"retaken\", str(dst))\n"),
     "duplicate-unlinked-after-stat": (
         "a second name of a reply is unlinked after a link-count check",
-        "    kept = _quarantine_target(results_dir, stem)\n    try:\n        os.rename(claim, kept)\n",
-        "    kept = _quarantine_target(results_dir, stem)\n    try:\n"
-        "        if os.stat(claim).st_nlink > 1:\n            os.unlink(claim)\n            return\n"
-        "        os.rename(claim, kept)\n"),
+        "    try:\n        kept = _place(claim, results_dir, stem, log)\n",
+        "    try:\n        if os.stat(claim).st_nlink > 1:\n            os.unlink(claim)\n            return\n"
+        "        kept = _place(claim, results_dir, stem, log)\n"),
     "quarantine-skips-the-post-move-verify": (
         "the quarantined file is not read again after the move, so a rewrite after verification stays quarantined",
         "                    if _still_is(fd, generation, log, rfile.stem, target):\n",
@@ -98,11 +103,27 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "an error from the results-dir precheck escapes recovery into the drain",
         "    results_dir = Path(results_dir)\n    try:\n        if not results_dir.is_dir():\n            return\n",
         "    results_dir = Path(results_dir)\n    if not results_dir.is_dir():\n        return\n    try:\n"),
+    "place-replaces-a-taken-name": (
+        "a quarantine move replaces whatever already holds the chosen name",
+        "            move(Path(src), target)\n            return target\n",
+        "            os.replace(Path(src), target)\n            return target\n"),
+    "place-does-not-retry": (
+        "a taken quarantine name is not skipped for a fresh one",
+        "            if e.errno not in (None, errno.EEXIST):\n                raise\n            n += 1\n",
+        "            raise\n"),
+    "restore-links-then-unlinks": (
+        "restore links the quarantined body to the live name, then unlinks the quarantine copy",
+        "        rename_noreplace(found[-1], target)\n    except FileExistsError as e:\n",
+        "        os.link(found[-1], target)\n        os.unlink(found[-1])\n    except FileExistsError as e:\n"),
 }
 
 
-def _edit(old: str, new: str) -> None:
-    for f in FILES:
+def _files(name: str) -> "list[Path]":
+    return QUARANTINE if name in IN_QUARANTINE else DISPOSAL
+
+
+def _edit(old: str, new: str, files: "list[Path]") -> None:
+    for f in files:
         text = f.read_text()
         if text.count(old) != 1:
             sys.exit(f"{f.name}: expected the mutation site exactly once, found {text.count(old)}")
@@ -123,7 +144,7 @@ def main(argv: list[str]) -> int:
             return 0
         name = STATE.read_text().strip()
         _what, old, new = MUTANTS[name]
-        _edit(new, old)
+        _edit(new, old, _files(name))
         STATE.unlink()
         print(f"reverted {name}")
         return 0
@@ -133,7 +154,7 @@ def main(argv: list[str]) -> int:
     if STATE.exists():
         sys.exit(f"{STATE.read_text().strip()} is still applied; revert first")
     what, old, new = MUTANTS[name]
-    _edit(old, new)
+    _edit(old, new, _files(name))
     STATE.write_text(name)
     print(f"applied {name}: {what}")
     return 0
