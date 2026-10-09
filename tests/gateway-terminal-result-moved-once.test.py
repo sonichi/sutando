@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -244,15 +246,295 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(len(self.quarantined()), 1)
         self.assertEqual(self.about(), [], '\n'.join(self.about()))
 
-    def test_a_copy_still_held_in_a_claim_silences_the_loser(self):
+    def claim_name(self, pid, start, nonce='deadbeef'):
+        return self.results / f'.{TID}.disposing-{pid}-{start}-{nonce}'
+
+    def live_other_owner(self):
+        """A process that is alive and is not this one: the parent."""
+        ident = outbox.process_identity(os.getppid())
+        self.assertIs(ident.state, outbox.OwnerState.ALIVE)
+        return os.getppid(), int(ident.start_usec or 0)
+
+    def test_a_copy_still_held_in_a_live_owners_claim_silences_the_loser(self):
         core = self.park_without_disposing()
         self.bridge(core)
         self.task()
         result = self.result()
         body, gen = self.read(result)
-        result.rename(self.results / f'.{TID}.disposing-999-deadbeef')   # the winner, mid-move
+        pid, start = self.live_other_owner()
+        claim = self.claim_name(pid, start)
+        result.rename(claim)                             # the winner, mid-move
         self.deliver(body, result, gen)
         self.assertEqual(self.about(), [], '\n'.join(self.about()))
+        self.assertTrue(claim.exists(), 'a live owner must keep its claim')
+        self.assertEqual(self.quarantined(), [])
+
+    # ---- crash safety of the private claim
+
+    def die_after_claim_rename(self):
+        """Kewei's recipe: the owner dies right after the first rename."""
+        real = gw.identity_of
+
+        def dying(path):
+            if 'disposing' in str(path):
+                raise SystemExit('owner died mid-disposal')
+            return real(path)
+        return patch.object(gw, 'identity_of', dying)
+
+    def claims(self):
+        return sorted(p.name for p in self.results.glob(f'.{TID}.disposing-*'))
+
+    def test_a_death_after_the_claim_rename_is_recovered_by_the_next_passes(self):
+        self.bridge()
+        self.task()
+        result = self.result()
+        body, gen = self.read(result)
+        with self.die_after_claim_rename():
+            with self.assertRaises(SystemExit):
+                self.deliver(body, result, gen)
+        self.assertFalse(result.exists())
+        self.assertEqual(len(self.claims()), 1, 'the body sits at the claim path')
+        self.assertEqual(self.quarantined(), [])
+        for _ in range(PASSES):
+            gw._post_ready_results({TID})
+            gw._last_orphan_sweep = 0.0
+            gw._reconcile_orphan_results({TID})
+        self.assertEqual(self.claims(), [], 'the claim must not be stranded')
+        self.assertEqual(len(self.quarantined()), 1, self.quarantined())
+        self.assertEqual((self.results / 'undelivered' / self.quarantined()[0]).read_text(),
+                         'Existing answer')
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+        self.assertIn('recovered', self.about()[0])
+        self.assertEqual(len(self.server.calls), 1)
+
+    def test_a_death_mid_disposal_whose_bytes_were_quarantined_meanwhile_is_dropped(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        result = self.result()
+        body, gen = self.read(result)
+        pid, start = gw._self_token()
+        claim = self.claim_name(pid, start, 'aba0d001')      # ours, but not active
+        result.rename(claim)
+        undelivered_quarantine.quarantine(self.result(), self.results)
+        gw._post_ready_results({TID})
+        self.assertEqual(self.claims(), [])
+        self.assertEqual(len(self.quarantined()), 1, 'no second copy of the same bytes')
+        self.assertEqual(self.about(), [], '\n'.join(self.about()))
+
+    def test_a_quarantine_setup_failure_after_the_claim_rename_puts_the_body_back(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        (self.results / 'undelivered').write_text('not a directory')
+        result = self.result()
+        body, gen = self.read(result)
+        self.deliver(body, result, gen)                  # winner: setup fails
+        self.assertTrue(result.exists(), 'the body must be back at its canonical name')
+        self.assertEqual(result.read_text(), 'Existing answer')
+        self.assertEqual(self.claims(), [], 'no stranded claim')
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+        self.assertIn('leaving it in place', self.about()[0])
+        self.deliver(body, result, gen)                  # loser: not silent either
+        self.assertEqual(len(self.about()), 2, '\n'.join(self.about()))
+        self.assertTrue(result.exists())
+
+    def test_a_setup_failure_with_the_canonical_name_retaken_keeps_the_body(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        result = self.result('OLD BODY')
+        body, gen = self.read(result)
+        real_mkdir = Path.mkdir
+        failed = []
+
+        def retake_then_fail(path, *a, **kw):
+            if path.name == 'undelivered' and not failed:
+                failed.append(True)
+                self.result('NEWER BODY')                # a producer reuses the name
+                raise PermissionError(13, 'no quarantine dir')
+            return real_mkdir(path, *a, **kw)
+        with patch.object(Path, 'mkdir', retake_then_fail):
+            self.deliver(body, result, gen)
+        self.assertEqual(result.read_text(), 'NEWER BODY')
+        self.assertEqual(self.claims(), [], 'no stranded claim')
+        self.assertEqual(len(self.quarantined()), 1, self.quarantined())
+        self.assertEqual((self.results / 'undelivered' / self.quarantined()[0]).read_text(),
+                         'OLD BODY')
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+
+    def test_a_stale_claim_under_a_reused_pid_is_recovered(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        result = self.result()
+        pid, start = gw._self_token()
+        claim = self.claim_name(pid, start + 7, 'ce05ed01')  # same pid, another birth
+        result.rename(claim)
+        gw._post_ready_results({TID})
+        self.assertEqual(self.claims(), [])
+        self.assertEqual(len(self.quarantined()), 1, self.quarantined())
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+        self.assertIn('recovered', self.about()[0])
+
+    def test_another_live_pid_with_a_different_birth_is_a_reused_pid(self):
+        # The pid is alive but was born at another time: not the claimant.
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        result = self.result()
+        pid, start = self.live_other_owner()
+        result.rename(self.claim_name(pid, start + 7, 'ce05ed02'))
+        gw._post_ready_results({TID})
+        self.assertEqual(self.claims(), [])
+        self.assertEqual(len(self.quarantined()), 1, self.quarantined())
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+
+    # ---- the sweep's defensive edges
+
+    def dead_pid(self):
+        dead = subprocess.Popen(['true']); dead.wait()
+        return dead.pid
+
+    def test_a_claim_of_an_unknown_shape_is_never_touched(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        odd = self.results / f'.{TID}.disposing-123-abcd'      # an older, two-field name
+        self.result().rename(odd)
+        gw._post_ready_results({TID})
+        self.assertTrue(odd.exists())
+        self.assertEqual(self.about(), [])
+
+    def test_a_claim_gone_between_listing_and_stat_is_left_alone(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        os.symlink('nowhere', self.claim_name(self.dead_pid(), 1, 'da0611e0'))
+        gw._post_ready_results({TID})                   # stat fails: treated as held
+        self.assertEqual(self.about(), [])
+
+    def test_an_unreadable_claim_is_skipped_by_recovery_and_by_the_loser(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        result = self.result()
+        body, gen = self.read(result)
+        self.claim_name(self.dead_pid(), 1, 'd1ec0000').mkdir()   # a claim nobody can read
+        result.unlink()
+        gw._post_ready_results({TID})                   # recovery: nothing it can move
+        self.assertEqual(self.quarantined(), [])
+        self.assertEqual(self.about(), [])
+        self.deliver(body, result, gen)                  # loser: skips it, reports the loss
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+        self.assertIn('vanished', self.about()[0])
+
+    def test_a_dead_owners_claim_with_other_bytes_does_not_silence_the_loser(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        result = self.result()
+        body, gen = self.read(result)
+        self.result('OTHER BODY').rename(self.claim_name(self.dead_pid(), 1, '07e40000'))
+        self.deliver(body, result, gen)                  # its own bytes are gone
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+        self.assertIn('vanished', self.about()[0])
+
+    def test_recovery_skips_an_unreadable_quarantined_copy(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        (self.results / 'undelivered').mkdir()
+        (self.results / 'undelivered' / undelivered_quarantine.quarantine_name(TID, 5)).mkdir()
+        self.result().rename(self.claim_name(self.dead_pid(), 1, 'c0de0001'))
+        gw._post_ready_results({TID})
+        self.assertEqual(self.claims(), [])
+        self.assertEqual(len(self.quarantined()), 2)      # the dir and the recovered body
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+
+    def test_recovery_losing_the_final_rename_to_another_observer_is_quiet(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        claim = self.claim_name(self.dead_pid(), 1, 'ace00001')
+        self.result().rename(claim)
+        real_rename = os.rename
+
+        def taken_first(src, dst, *a, **kw):
+            if Path(src) == claim:
+                real_rename(src, self.results / 'elsewhere.txt')   # the other observer
+                raise FileNotFoundError(2, 'gone', str(src))
+            return real_rename(src, dst, *a, **kw)
+        with patch.object(os, 'rename', taken_first):
+            gw._post_ready_results({TID})
+        self.assertEqual(self.about(), [])
+        self.assertEqual(self.quarantined(), [])
+
+    def test_recovery_survives_an_unlistable_results_dir(self):
+        self.bridge(self.park_without_disposing())
+        with patch.object(Path, 'glob', side_effect=PermissionError(13, 'no listing')):
+            gw._recover_disposing_claims()
+        self.assertEqual(self.about(), [])
+
+    def test_a_dead_owners_claim_is_recovered(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        result = self.result()
+        dead = subprocess.Popen(['true']); dead.wait()  # a pid that has exited
+        self.assertIs(outbox.process_identity(dead.pid).state, outbox.OwnerState.DEAD)
+        result.rename(self.claim_name(dead.pid, 1, 'dead0001'))
+        gw._post_ready_results({TID})
+        self.assertEqual(self.claims(), [])
+        self.assertEqual(len(self.quarantined()), 1, self.quarantined())
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+
+    def test_a_live_owners_claim_is_left_alone_by_the_sweep(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        result = self.result()
+        pid, start = self.live_other_owner()
+        claim = self.claim_name(pid, start, '11e00001')
+        result.rename(claim)
+        for _ in range(PASSES):
+            gw._post_ready_results({TID})
+            gw._last_orphan_sweep = 0.0
+            gw._reconcile_orphan_results({TID})
+        self.assertTrue(claim.exists())
+        self.assertEqual(self.quarantined(), [])
+        self.assertEqual(self.about(), [], '\n'.join(self.about()))
+
+    def test_a_live_owners_claim_past_the_bound_is_recovered(self):
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        result = self.result()
+        pid, start = self.live_other_owner()
+        claim = self.claim_name(pid, start, '5fc00001')
+        result.rename(claim)
+        old = time.time() - gw.DISPOSING_CLAIM_MAX_S - 1
+        os.utime(claim, (old, old))
+        gw._post_ready_results({TID})
+        self.assertEqual(self.claims(), [])
+        self.assertEqual(len(self.quarantined()), 1, self.quarantined())
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+
+    def test_a_dead_owners_claim_holding_the_losers_bytes_is_recovered_once(self):
+        # The loser finds its bytes in a claim nobody holds: it recovers them
+        # with one line instead of trusting a stranded copy.
+        core = self.park_without_disposing()
+        self.bridge(core)
+        self.task()
+        result = self.result()
+        body, gen = self.read(result)
+        dead = subprocess.Popen(['true']); dead.wait()
+        result.rename(self.claim_name(dead.pid, 1, 'dead0002'))
+        self.deliver(body, result, gen)
+        self.assertEqual(self.claims(), [])
+        self.assertEqual(len(self.quarantined()), 1, self.quarantined())
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+        self.assertIn('recovered', self.about()[0])
 
     def test_an_unrelated_copy_with_a_later_stamp_does_not_hide_a_lost_reply(self):
         # A quarantined OTHER body carries a timestamp after this attempt; the

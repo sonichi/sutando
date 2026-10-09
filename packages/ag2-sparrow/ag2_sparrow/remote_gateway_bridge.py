@@ -302,7 +302,8 @@ from . import undelivered_quarantine
 from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
-from .outbox import DeliveryOutcome, record_delivered, RetrySchedule, read_item
+from .outbox import (DeliveryOutcome, OwnerState, RetrySchedule, process_identity,
+                     read_item, record_delivered)
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
@@ -4184,28 +4185,115 @@ def _read_ready_generation(rfile) -> "tuple[str | None, ResultIdentity | None]":
     return (ready.body, ready.identity) if ready else (None, None)
 
 
-_DISPOSING = ".{stem}.disposing-{pid}-{nonce}"
+_DISPOSING = ".{stem}.disposing-{pid}-{start}-{nonce}"
+_DISPOSING_RE = re.compile(r"^\.(?P<stem>task-.+)\.disposing-(?P<pid>\d+)-(?P<start>\d+)-(?P<nonce>[0-9a-f]+)$")
+# A disposal is a few renames; a claim older than this under a live owner is stuck.
+DISPOSING_CLAIM_MAX_S = 600.0
+# Claims THIS process is moving right now; one it made but no longer holds was abandoned.
+_ACTIVE_CLAIMS: "set[str]" = set()
+
+
+def _self_token() -> "tuple[int, int]":
+    ident = process_identity(os.getpid())
+    return os.getpid(), int(ident.start_usec or 0)
+
+
+def _claim_owner_holds(claim: Path) -> bool:
+    """True while the claim's owner may still finish the move: a live process with
+    the same birth token (so a recycled pid is not an owner), inside the bound.
+    Our own pid holds only the claims it is actively moving."""
+    m = _DISPOSING_RE.match(claim.name)
+    if not m:
+        return True                                     # unknown shape: never touch
+    pid, start = int(m.group("pid")), int(m.group("start"))
+    if pid == os.getpid():
+        return str(claim) in _ACTIVE_CLAIMS
+    try:
+        age = time.time() - claim.stat().st_mtime
+    except OSError:
+        return True
+    if age > DISPOSING_CLAIM_MAX_S:
+        return False
+    owner = process_identity(pid)
+    if owner.state is OwnerState.DEAD:
+        return False
+    if owner.state is OwnerState.ALIVE and start and owner.start_usec and start != owner.start_usec:
+        return False                                    # the pid was reused
+    return True
+
+
+def _claim_stem(claim: Path) -> str:
+    m = _DISPOSING_RE.match(claim.name)
+    return m.group("stem") if m else claim.stem
+
+
+def _recover_disposing_claim(claim: Path, quiet: bool = False) -> "Path | None":
+    """Put an abandoned claim where the operator looks: into quarantine under the
+    standard name, or drop it when those bytes are already quarantined. Returns
+    the quarantined path, None when nothing is left to recover."""
+    try:
+        _, found = identity_of(claim)
+    except OSError:
+        return None
+    stem = _claim_stem(claim)
+    for copy in undelivered_quarantine.find_quarantined(RESULTS_DIR, stem):
+        try:
+            if identity_of(copy)[1].digest == found.digest:
+                claim.unlink()
+                return copy
+        except OSError:
+            continue
+    d = undelivered_quarantine.quarantine_dir(RESULTS_DIR)
+    d.mkdir(parents=True, exist_ok=True)
+    target = d / undelivered_quarantine.quarantine_name(stem)
+    try:
+        os.rename(claim, target)
+    except FileNotFoundError:
+        return None                                     # another observer got there first
+    if not quiet:
+        _log(f"result {stem}: recovered a result left in an interrupted disposal — "
+             f"quarantined to {UNDELIVERABLE_RESULTS_DIR.name}/")
+    return target
+
+
+def _recover_disposing_claims() -> None:
+    """Every drain pass: no result body may stay stranded behind a dead owner."""
+    try:
+        claims = sorted(RESULTS_DIR.glob(".task-*.disposing-*"))
+    except OSError:
+        return
+    for claim in claims:
+        if not _claim_owner_holds(claim):
+            _recover_disposing_claim(claim)
 
 
 def _quarantine_generation(rfile, generation: ResultIdentity) -> Path:
     """Quarantine `rfile` only if it still IS `generation`. The rename to a
     private claim name is the atomic step; a different file found there is a
-    newer reply and goes back, the observed one is reported as not found."""
+    newer reply and goes back, the observed one is reported as not found.
+    A failure after the claim rename puts the body back or quarantines it:
+    the claim path is never where a result ends up."""
     rfile = Path(rfile)
-    claim = rfile.with_name(_DISPOSING.format(stem=rfile.stem, pid=os.getpid(),
+    pid, start = _self_token()
+    claim = rfile.with_name(_DISPOSING.format(stem=rfile.stem, pid=pid, start=start,
                                               nonce=uuid.uuid4().hex[:8]))
-    os.rename(rfile, claim)                       # FileNotFoundError: nothing there
-    _, found = identity_of(claim)
-    if found == generation:
-        d = undelivered_quarantine.quarantine_dir(RESULTS_DIR)
-        d.mkdir(parents=True, exist_ok=True)
-        target = d / undelivered_quarantine.quarantine_name(rfile.stem)
-        os.rename(claim, target)
-        return target
+    _ACTIVE_CLAIMS.add(str(claim))
     try:
-        os.link(claim, rfile)
-        os.unlink(claim)
-    except FileExistsError:
+        os.rename(rfile, claim)                       # FileNotFoundError: nothing there
+        try:
+            _, found = identity_of(claim)
+            if found == generation:
+                d = undelivered_quarantine.quarantine_dir(RESULTS_DIR)
+                d.mkdir(parents=True, exist_ok=True)
+                target = d / undelivered_quarantine.quarantine_name(rfile.stem)
+                os.rename(claim, target)
+                return target
+        except OSError:
+            if _put_back(claim, rfile):
+                raise
+            return _recover_disposing_claim(claim, quiet=True) or rfile
+        if _put_back(claim, rfile):
+            raise FileNotFoundError(str(rfile))
         # Yet another reply landed meanwhile; the one we hold is superseded but
         # is still someone's answer, so it is kept where the operator looks.
         d = undelivered_quarantine.quarantine_dir(RESULTS_DIR)
@@ -4213,23 +4301,46 @@ def _quarantine_generation(rfile, generation: ResultIdentity) -> Path:
         kept = d / undelivered_quarantine.quarantine_name(rfile.stem)
         os.rename(claim, kept)
         _log(f"result {rfile.stem}: a superseded reply was kept as {kept.name}")
-    raise FileNotFoundError(str(rfile))
+        raise FileNotFoundError(str(rfile))
+    finally:
+        _ACTIVE_CLAIMS.discard(str(claim))
+
+
+def _put_back(claim: Path, rfile: Path) -> bool:
+    """Return the claimed body to its canonical name; False when that name is
+    taken again (os.link refuses atomically where rename would replace)."""
+    try:
+        os.link(claim, rfile)
+    except FileExistsError:
+        return False
+    os.unlink(claim)
+    return True
 
 
 def _disposed_copy_exists(tid: str, generation: ResultIdentity) -> bool:
-    """True when the bytes this pass read already sit in quarantine or in
-    another observer's claim; scanned twice because a claim can become a
-    quarantined copy between the two listings."""
+    """True when the bytes this pass read already sit in quarantine or in a
+    claim a live owner is still moving; a claim nobody holds is recovered
+    instead of trusted. Scanned twice because a claim can become a quarantined
+    copy between the two listings."""
     stem = f"task-{tid}" if not str(tid).startswith("task-") else str(tid)
     for _ in range(2):
-        copies = list(undelivered_quarantine.find_quarantined(RESULTS_DIR, tid))
-        copies += list(RESULTS_DIR.glob(_DISPOSING.format(stem=stem, pid="*", nonce="*")))
-        for p in copies:
+        for p in undelivered_quarantine.find_quarantined(RESULTS_DIR, tid):
             try:
                 if identity_of(p)[1].digest == generation.digest:
                     return True
             except OSError:
                 continue
+        for claim in RESULTS_DIR.glob(_DISPOSING.format(stem=stem, pid="*", start="*", nonce="*")):
+            try:
+                same = identity_of(claim)[1].digest == generation.digest
+            except OSError:
+                continue
+            if not same:
+                continue
+            if _claim_owner_holds(claim):
+                return True
+            if _recover_disposing_claim(claim) is not None:
+                return True
     return False
 
 
@@ -4647,6 +4758,7 @@ def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
 
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
+    _recover_disposing_claims()
     changed = False
     for tid in list(inflight):
         if not _valid_local_tid(tid):  # defense-in-depth: never read an unsafe path (local ids may carry the instance encoding)
@@ -4928,6 +5040,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
     if now - _last_orphan_sweep < ORPHAN_SWEEP_EVERY_S:
         return
     _last_orphan_sweep = now
+    _recover_disposing_claims()
     try:
         candidates = sorted(RESULTS_DIR.glob("task-*.txt"))
     except OSError:
