@@ -262,10 +262,8 @@ class TerminalResultMovedOnce(unittest.TestCase):
 
     def claim_name(self, pid, start, nonce='deadbeef', acquired=None, restore=False,
                    body='Existing answer', ino=None, mtime=None):
-        # The name carries the full identity (inode, write time, digest) of the
-        # generation the owner meant to dispose of. When the live result holds
-        # `body`, that file IS the generation; otherwise the name describes
-        # another publication and the body found at the claim is unverified.
+        # When the live result holds `body` that file IS the generation; otherwise
+        # the name describes another publication and the claim's body is unverified.
         acquired = int(time.time() if acquired is None else acquired)
         digest = hashlib.sha256(body.encode()).hexdigest()
         live = self.results / f'{TID}.txt'

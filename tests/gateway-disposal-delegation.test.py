@@ -53,9 +53,8 @@ class CoreContract(unittest.TestCase):
 
     def claim(self, stem="task-a", pid=None, start=1, acquired=None, nonce="deadbeef", restore=False,
               body="answer", ino=None, mtime=None):
-        # The name carries the full identity the owner meant to dispose of. When the
-        # live result at `stem` holds `body`, that file's inode and write time are the
-        # identity; any other combination describes a generation that is not the file.
+        # When the live result at `stem` holds `body` its inode and write time are
+        # the identity; any other combination names a generation that is not the file.
         digest = hashlib.sha256(body.encode()).hexdigest()
         live = self.results / f"{stem}.txt"
         if ino is None or mtime is None:
@@ -258,9 +257,8 @@ class CoreContract(unittest.TestCase):
         self.assertEqual(seen, [True], "the .restore path must be held before the rename")
 
     def test_a_put_back_whose_name_is_retaken_keeps_the_last_link(self):
-        # A producer retakes the canonical name right before the put-back: the
-        # no-replace rename refuses, nothing is unlinked, the claim still holds
-        # the reply, and recovery keeps it where the operator looks.
+        # The name is retaken right before the put-back: the no-replace rename
+        # refuses, nothing is unlinked, recovery keeps the claim as a superseded copy.
         r = self.result("NEWER")
         c = self.claim(restore=True, body="NEWER", nonce="ab000004")
         r.rename(c)
@@ -284,9 +282,8 @@ class CoreContract(unittest.TestCase):
         self.assertIn("superseded", self.lines[0])
 
     def test_a_rewrite_of_the_claimed_inode_during_hashing_is_not_verified(self):
-        # A producer holding the inode open rewrites it while the owner hashes
-        # it: the bytes may still hash equal, but the file is no longer the
-        # generation read, so it goes back live instead of into quarantine.
+        # The inode is rewritten while it is hashed: equal bytes are not the
+        # generation read, so the reply goes back live instead of into quarantine.
         r = self.result("answer")
         _, gen = identity_of(r)
         real_read = os.read
@@ -310,8 +307,7 @@ class CoreContract(unittest.TestCase):
 
     def test_the_link_fallback_reports_a_name_retaken_in_its_gap(self):
         # Without a kernel no-replace rename the put-back links then unlinks;
-        # a producer retaking the name in between is reported and the claim
-        # keeps the reply's last link.
+        # a name retaken in between is reported and the claim keeps the last link.
         r = self.result("NEWER")
         c = self.claim(restore=True, body="NEWER", nonce="ab00000a")
         r.rename(c)
