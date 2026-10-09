@@ -303,7 +303,7 @@ from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
-from .outbox import RetrySchedule, adoption_era, delivered_body_differs, read_item, source_digest
+from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest, source_proof
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
@@ -4491,9 +4491,10 @@ def _live_source(result_file, generation) -> "str | None":
     return ready.body
 
 
-def _record_is_adoption_era(item_id: str) -> bool:
+def _delivery_provable(item_id: str) -> bool:
+    """The delivered record carries this writer's stamped source proof."""
     root = getattr(_delivery_core().backend, "root", None)
-    return root is not None and adoption_era(read_item(root, item_id))
+    return root is not None and source_proof(read_item(root, item_id)) is not None
 
 
 def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> None:
@@ -4551,9 +4552,11 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
         because = (f"it is addressed to [channel: {where}] only: review it; never post it anywhere else")
     elif withheld:
         because = f"the result guard withheld it ({withheld}): review it; do not send it by hand"
-    elif _record_is_adoption_era(item_id):
-        because = ("its outbox record was written by an earlier head, so whether it was already "
-                   "delivered cannot be proven: review it; it may already have been sent")
+    elif any(a.kind != "skip" for a in actions) and not _delivery_provable(item_id):
+        # A marked reply composes to a different wire body; without the stamped proof
+        # its delivery cannot be ruled out.
+        because = ("its outbox record carries no source proof from this writer, so whether it was "
+                   "already delivered cannot be proven: review it; it may already have been sent")
     else:
         because = "its outbox id is already delivered, so a requeue cannot resend it: send it by hand"
     _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id, generation=generation,

@@ -890,38 +890,34 @@ def read_item(root: Path, item_id: str) -> Optional[dict]:
     return _read_item(Path(root), item_id)
 
 
-# Written only by heads of the adoption design (now issue 5280), never by main: a
-# record carrying any of them may hold a proof of a body other than its payload's source.
-ADOPTION_ERA_FIELDS = ("resend_adopted_epoch", "requeued_attempts", "requeued_attempts_epoch",
-                       "resend_from_live", "source_sha256")
+PROOF_VERSION = 1
 
 
-def adoption_era(record: Optional[dict]) -> bool:
-    """The record was last written by an adoption-era head: whether a later body was
-    already delivered under it cannot be proven either way."""
-    return bool(record) and any(field in record for field in ADOPTION_ERA_FIELDS)
+def _proof_binding(payload: str, published_at) -> str:
+    """What a stamped proof vouches for: this version, the stored payload and the
+    publish that wrote it. Any other writer of the payload rewrites `published_at`."""
+    return hashlib.sha256(json.dumps([PROOF_VERSION, payload, published_at]).encode("utf-8")).hexdigest()
 
 
-def source_proof(record: dict) -> Optional[str]:
-    """The record's source digest, only while it still describes the stored payload:
-    a writer that replaced the payload without it leaves a proof of another body, and
-    an adoption-era record is read as having none."""
+def source_proof(record: Optional[dict]) -> Optional[str]:
+    """The record's source digest, trusted only from this writer's stamp
+    (`proof_version`) and only while its binding still matches the stored payload
+    and publish; main's records, earlier heads' and unknown shapes have none."""
+    if not record:
+        return None
     proof, payload = record.get("source_ready_sha256"), record.get("payload")
-    if not proof or not isinstance(payload, str):
-        return None
-    if adoption_era(record):
-        return None
-    if record.get("source_payload_sha256") != hashlib.sha256(payload.encode("utf-8")).hexdigest():
+    if (record.get("proof_version") != PROOF_VERSION or not proof or not isinstance(payload, str)
+            or record.get("source_payload_sha256") != _proof_binding(payload, record.get("published_at"))):
         return None
     return proof
 
 
-def source_proof_fields(source_ready_sha256: Optional[str], payload: str) -> dict:
-    """Every source-proof field, written together with the payload they vouch for."""
+def source_proof_fields(source_ready_sha256: Optional[str], payload: str, published_at) -> dict:
+    """Every source-proof field, written atomically with the payload and publish they vouch for."""
     if not source_ready_sha256:
         return {}
-    return {"source_ready_sha256": source_ready_sha256,
-            "source_payload_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest()}
+    return {"proof_version": PROOF_VERSION, "source_ready_sha256": source_ready_sha256,
+            "source_payload_sha256": _proof_binding(payload, published_at)}
 
 
 def source_digest(ready_body: str) -> str:

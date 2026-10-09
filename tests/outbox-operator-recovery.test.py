@@ -554,7 +554,7 @@ class DeliveredBodyDiffers(unittest.TestCase):
         dig = outbox.source_digest
 
         def proof(source, payload=env):
-            return outbox.source_proof_fields(dig(source), payload)
+            return dict(outbox.source_proof_fields(dig(source), payload, 7.0), published_at=7.0)
         for name, fields, live, differs in (
                 ("no record", None, "C", False),
                 ("queued", {"status": "QUEUED", "payload": env, **proof("A")}, "C", False),
@@ -582,16 +582,20 @@ class DeliveredBodyDiffers(unittest.TestCase):
                 root = self._rec(td, **fields) if fields is not None else Path(td) / "ob"
                 self.assertIs(outbox.delivered_body_differs(root, ITEM, live), differs)
 
-    def test_an_adoption_era_record_has_no_trusted_proof(self):
+    def test_only_this_writers_stamp_with_a_matching_binding_is_trusted(self):
         env = json.dumps({"id": ITEM, "body": "A"})
-        bound = outbox.source_proof_fields(outbox.source_digest("A"), env)
-        self.assertEqual(outbox.source_proof(dict(bound, payload=env)), outbox.source_digest("A"))
-        for field in outbox.ADOPTION_ERA_FIELDS:
-            with self.subTest(field=field):
-                record = dict(bound, payload=env, **{field: 1})
-                self.assertTrue(outbox.adoption_era(record))
-                self.assertIsNone(outbox.source_proof(record))
-        self.assertFalse(outbox.adoption_era(None))
+        stamped = dict(outbox.source_proof_fields(outbox.source_digest("A"), env, 7.0),
+                       payload=env, published_at=7.0)
+        self.assertEqual(outbox.source_proof(stamped), outbox.source_digest("A"))
+        for name, change in (("no stamp", {"proof_version": None}),
+                             ("another stamp", {"proof_version": 2}),
+                             ("payload rewritten by another writer", {"payload": env + " "}),
+                             ("publish rewritten by another writer", {"published_at": 8.0}),
+                             ("payload-only binding of an earlier head",
+                              {"source_payload_sha256": hashlib.sha256(env.encode()).hexdigest()})):
+            with self.subTest(case=name):
+                self.assertIsNone(outbox.source_proof(dict(stamped, **change)))
+        self.assertIsNone(outbox.source_proof(None))
 
     def test_the_source_digest_is_of_the_ready_body(self):
         self.assertEqual(outbox.source_digest("A"), hashlib.sha256(b"A").hexdigest())

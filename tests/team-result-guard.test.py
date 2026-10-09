@@ -327,6 +327,22 @@ def behavioral() -> list:
         replay = guard.materialize_withheld_verdict(leak, "B body", state, "task-arch", context, now=1000)
         if "already decided in owner review" not in (replay.reason or "") or b_path.exists():
             fails.append("a replay of an archived body is suppressed against that decision, no new record")
+
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "state"
+        guard.materialize_withheld_verdict(
+            guard.classify_result_for_tier("A body", "team", REPO, secret_filter=_leaky),
+            "A body", state, "task-unread", context, now=1000)
+        b_digest_id = guard.withheld_review_path(state, "task-unread", guard._body_digest("B body"))
+        (b_digest_id.parent / "archive").mkdir(exist_ok=True)
+        (b_digest_id.parent / "archive" / b_digest_id.name).write_text("not json", encoding="utf-8")
+        guard.materialize_withheld_verdict(
+            guard.classify_result_for_tier("B body", "team", REPO, secret_filter=_leaky),
+            "B body", state, "task-unread", context, now=1001)
+        bodies = {json.loads(p.read_text())["withheld_body"]: p.stem
+                  for p in (state / guard.WITHHELD_RESULT_DIR).glob("wr_*.json")}
+        if "B body" not in bodies or bodies["B body"] == b_digest_id.stem:
+            fails.append("an unreadable archived id is occupied: another body gets a fresh id")
     return fails
 
 

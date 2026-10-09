@@ -34,9 +34,11 @@ from typing import NamedTuple
 try:  # pragma: no cover - the packaged twin exercises the relative imports
     from .result_markers import parse_markers  # packaged sibling (ag2-sparrow)
     from .local_task_protocol import canonical_access_tier, parse_task_headers
+    from .file_lock import lock_fd, unlock_fd
 except ImportError:
     from result_markers import parse_markers  # monorepo src/ on sys.path
     from local_task_protocol import canonical_access_tier, parse_task_headers
+    from file_lock import lock_fd, unlock_fd
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
@@ -310,25 +312,117 @@ def _holds(path: Path, field: str, body: str) -> bool:
         return False
 
 
-def _record_for(path_of, state_dir: Path, task_id: str, body: str, field: str) -> Path:
-    """The record for this exact body: the task-keyed id unless another body of the
-    task ever used it (live, or archived after resolution), else one keyed by this
-    body's digest. An id is never reissued: once its record of this body is archived,
-    the archived record is returned, so a replay points at the decision already made."""
-    def live_and_archived(path: Path) -> "list[Path]":
-        return [p for p in (path, path.parent / "archive" / path.name) if p.exists()]
-    path = path_of(state_dir, task_id)
-    if not all(_holds(p, field, body) for p in live_and_archived(path)):
-        path = path_of(state_dir, task_id, _body_digest(body))
-    archived = path.parent / "archive" / path.name
-    if not path.exists() and _holds(archived, field, body):
-        return archived
-    return path
+# Ids a record may take for one body of a task: the task-keyed one, then ones keyed
+# by the body's digest. Every id ever issued is reserved in `issued/`, never released.
+_ID_TRIES = 8
+
+
+def _candidates(path_of, state_dir: Path, task_id: str, body: str):
+    digest = _body_digest(body)
+    yield path_of(state_dir, task_id)
+    yield path_of(state_dir, task_id, digest)
+    for n in range(2, _ID_TRIES):
+        yield path_of(state_dir, task_id, f"{digest}#{n}")
+
+
+def _archived(path: Path) -> Path:
+    return path.parent / "archive" / path.name
+
+
+def _reservation(path: Path) -> Path:
+    return path.parent / "issued" / f"{path.stem}.issued"
+
+
+def _reserve(path: Path, digest: str) -> bool:
+    """Reserve `path`'s id for the body with `digest`: an exclusive create, so an id
+    is issued exactly once and the reservation outlives archive and resolution."""
+    _reservation(path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        fd = os.open(_reservation(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(digest)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return True
+
+
+def _issued_to(path: Path, field: str) -> "str | None":
+    """The body digest `path`'s id was issued to; None if never issued. A record
+    from before reservations existed is reserved first (seeding), and an unreadable
+    one counts as issued to no body this rule can match."""
+    try:
+        return _reservation(path).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        pass
+    for existing in (path, _archived(path)):
+        if existing.exists():
+            try:
+                body = json.loads(existing.read_text(encoding="utf-8")).get(field)
+                digest = _body_digest(body) if isinstance(body, str) else "unreadable"
+            except (OSError, ValueError, AttributeError):
+                digest = "unreadable"
+            _reserve(path, digest)
+            return _reservation(path).read_text(encoding="utf-8").strip()
+    return None
+
+
+def _record_of(path: Path) -> "Path | None":
+    """The record of an issued id: its decision once archived, else the live one."""
+    for existing in (_archived(path), path):
+        if existing.exists():
+            return existing
+    return None
+
+
+def _find_record(path_of, state_dir: Path, task_id: str, body: str, field: str) -> Path:
+    """Where the record of this exact body is, without issuing an id."""
+    digest, unissued = _body_digest(body), None
+    for path in _candidates(path_of, state_dir, task_id, body):
+        owner = _issued_to(path, field)
+        if owner == digest:
+            found = _record_of(path)
+            if found is not None:
+                return found
+        elif owner is None and unissued is None:
+            unissued = path                         # where this body's record would be issued
+    return unissued or path_of(state_dir, task_id, digest)
+
+
+def _issue_record(path_of, state_dir: Path, task_id: str, body: str, field: str,
+                  make_payload) -> "tuple[Path | None, bool]":
+    """The record for this exact body, issuing an id only once, ever: an id
+    reserved for this body returns its existing record (its decision once archived)
+    and is never written again; one reserved for another body is skipped. Returns
+    (path, saved); serialized per directory so a reservation and its record land together."""
+    first = path_of(state_dir, task_id)
+    issued = first.parent / "issued"
+    issued.mkdir(parents=True, exist_ok=True)
+    os.chmod(issued, 0o700)
+    digest = _body_digest(body)
+    fd = os.open(issued / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        lock_fd(fd)
+        try:
+            for path in _candidates(path_of, state_dir, task_id, body):
+                owner = _issued_to(path, field)
+                if owner is None and _reserve(path, digest):
+                    return path, _write_artifact(path, make_payload(path), field)
+                if (owner or _issued_to(path, field)) == digest:
+                    found = _record_of(path)
+                    if found is not None:
+                        return found, True
+            return None, False
+        finally:
+            unlock_fd(fd)
+    finally:
+        os.close(fd)
 
 
 def withheld_review_artifact(state_dir: Path, task_id: str, body: str) -> Path:
     """Where the private review of this exact withheld body lives."""
-    return _record_for(withheld_review_path, state_dir, task_id, body, "withheld_body")
+    return _find_record(withheld_review_path, state_dir, task_id, body, "withheld_body")
 
 
 def is_attach_only_withhold(body: str) -> bool:
@@ -356,17 +450,18 @@ def journal_quarantined_attachment(body: str, state_dir: Path, task_id: str,
         os.chmod(directory, 0o700)
     except OSError:
         return False
-    record = _record_for(quarantined_attachment_path, state_dir, task_id, body, "withheld_body")
-    payload = {
-        "schema_version": 1,
-        "record_id": record.stem[len("qa_"):],
-        "task_id": task_id,
-        "status": "withheld_attachment_pending",
-        "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
-        "withheld_body": body,
-    }
+    def payload(record: Path) -> dict:
+        return {
+            "schema_version": 1,
+            "record_id": record.stem[len("qa_"):],
+            "task_id": task_id,
+            "status": "withheld_attachment_pending",
+            "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+            "withheld_body": body,
+        }
     try:
-        return _write_artifact(record, payload, "withheld_body")
+        return _issue_record(quarantined_attachment_path, state_dir, task_id, body,
+                             "withheld_body", payload)[1]
     except OSError:
         # best-effort for real: a failed record costs the release option,
         # never the already-decided withhold and never the delivery loop
@@ -417,22 +512,23 @@ def materialize_withheld_verdict(verdict: TeamResultVerdict, body: str,
         os.chmod(directory, 0o700)
     except OSError:
         return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT_UNSAVED, verdict.reason)
-    artifact = withheld_review_artifact(state_dir, task_id, body)
-    payload = {
-        "schema_version": 2,
-        "review_id": artifact.stem,
-        "status": "pending_dm",
-        "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
-        "task_id": task_id,
-        "agent_id": agent_id,
-        "reason": verdict.reason,
-        "context": bounded,
-        "withheld_body": body,
-    }
+    def payload(artifact: Path) -> dict:
+        return {
+            "schema_version": 2,
+            "review_id": artifact.stem,
+            "status": "pending_dm",
+            "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "reason": verdict.reason,
+            "context": bounded,
+            "withheld_body": body,
+        }
     try:
-        saved = _write_artifact(artifact, payload, "withheld_body")
+        artifact, saved = _issue_record(withheld_review_path, state_dir, task_id, body,
+                                        "withheld_body", payload)
     except Exception:  # noqa: BLE001 — storage failure must remain fail-closed
-        saved = False
+        artifact, saved = None, False
     if not saved:
         return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT_UNSAVED, verdict.reason)
     if artifact.parent.name == "archive":
@@ -448,7 +544,7 @@ def suppressed_record_path(state_dir: Path, task_id: str, body_digest: str = "")
 
 def suppressed_record_for(state_dir: Path, task_id: str, body: str) -> Path:
     """Where the suppression record of this exact body lives."""
-    return _record_for(suppressed_record_path, state_dir, task_id, body, "suppressed_body")
+    return _find_record(suppressed_record_path, state_dir, task_id, body, "suppressed_body")
 
 
 def journal_suppressed_result(verdict: TeamResultVerdict, body: str,
@@ -471,20 +567,21 @@ def journal_suppressed_result(verdict: TeamResultVerdict, body: str,
     except OSError:
         return TeamResultVerdict(VERDICT_SUPPRESS, TEAM_SUPPRESS_RESULT,
                                  "suppression record unwritable")
-    record = suppressed_record_for(state_dir, task_id, body)
-    payload = {
-        "schema_version": 1,
-        "record_id": record.stem,
-        "status": "suppressed_silent_close",
-        "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
-        "task_id": task_id,
-        "agent_id": agent_id,
-        "reason": verdict.reason,
-        "context": _bounded_context(context),
-        "suppressed_body": body,
-    }
+    def payload(record: Path) -> dict:
+        return {
+            "schema_version": 1,
+            "record_id": record.stem,
+            "status": "suppressed_silent_close",
+            "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "reason": verdict.reason,
+            "context": _bounded_context(context),
+            "suppressed_body": body,
+        }
     try:
-        saved = _write_artifact(record, payload, "suppressed_body")
+        saved = _issue_record(suppressed_record_path, state_dir, task_id, body,
+                              "suppressed_body", payload)[1]
     except Exception:  # noqa: BLE001 -- storage failure must remain fail-closed
         saved = False
     if not saved:

@@ -30,15 +30,14 @@ IN_QUARANTINE = {"fallback-links-then-unlinks", "place-replaces-a-taken-name",
 CLI = [REPO / "src" / "outbox_cli.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox_cli.py"]
 BRIDGE = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"]
 OUTBOX = [REPO / "src" / "outbox.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox.py"]
-IN_OUTBOX = {"proof-trusts-adoption-era-records", "proof-ignores-its-payload", "reader-trusts-the-earlier-digest", "delivered-rule-compares-the-composed-body", "delivered-body-never-differs"}
+IN_OUTBOX = {"proof-ignores-its-stamp", "binding-ignores-the-publish", "reader-trusts-the-earlier-digest", "delivered-rule-compares-the-composed-body", "delivered-body-never-differs"}
 IN_CLI = {"cli-exits-0-on-no-safe-move", "cli-reads-epoch-after-lock", "cli-parks-on-no-safe-move"}
 BACKEND = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "delivery_core" / "backend_a.py"]
 IN_BACKEND = {"publish-drops-the-source"}
 GUARD = [REPO / "src" / "policy" / "egress" / "result.py",
          REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "team_result_guard.py"]
-IN_GUARD = {"artifact-claims-another-body", "record-path-ignores-the-body", "record-reuses-an-archived-id",
-            "record-reissues-an-archived-id"}
-IN_BRIDGE = {"unsent-hands-over-an-adoption-era-body", "unsent-ignores-a-changed-generation", "verdict-cache-keyed-by-task", "late-duplicate-hashes-the-raw-bytes", "unsent-skips-the-guard", "unsent-skips-owner-mention",
+IN_GUARD = {"issue-reissues-a-reserved-id", "decision-loses-to-a-live-copy", "ledger-ignores-prior-records", "artifact-claims-another-body"}
+IN_BRIDGE = {"unsent-hands-over-an-unprovable-marked-body", "unsent-ignores-a-changed-generation", "verdict-cache-keyed-by-task", "late-duplicate-hashes-the-raw-bytes", "unsent-skips-the-guard", "unsent-skips-owner-mention",
              "unsent-ignores-suppression", "unsent-ignores-restriction",              "confirmed-archives-another-body", "terminal-delivered-archives-another-body",
              "late-duplicate-archives-another-body", "orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
@@ -182,16 +181,8 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "    proof = source_proof(d) or d.get(\"source_sha256\")\n    if proof:\n"),
     "publish-drops-the-source": (
         "the delivery backend's publish never persists the source digest",
-        "                **outbox.source_proof_fields(source_ready_sha256, text),\n",
-        "                **outbox.source_proof_fields(None, text),\n"),
-    "proof-trusts-adoption-era-records": (
-        "a source proof on a record an adoption-era head wrote is trusted",
-        "    if adoption_era(record):\n        return None",
-        "    if False:\n        return None"),
-    "proof-ignores-its-payload": (
-        "a source proof is trusted although the payload it vouched for was replaced",
-        "    if record.get(\"source_payload_sha256\") != hashlib.sha256(payload.encode(\"utf-8\")).hexdigest():\n",
-        "    if False and record.get(\"source_payload_sha256\") != hashlib.sha256(payload.encode(\"utf-8\")).hexdigest():\n"),
+        "                **outbox.source_proof_fields(source_ready_sha256, text, published_at),\n",
+        "                **outbox.source_proof_fields(None, text, published_at),\n"),
     "cli-parks-on-no-safe-move": (
         "requeue parks the record again when the body could not be restored",
         "            _emit(payload, args.json)\n            return 4\n",
@@ -242,10 +233,6 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "a reply that replaced the one ruled on is disposed of on that ruling",
         "    if generation is not None and ready.identity != generation:\n",
         "    if False:\n"),
-    "unsent-hands-over-an-adoption-era-body": (
-        "a reply at an adoption-era record is handed over as one to send by hand",
-        "    elif _record_is_adoption_era(item_id):\n",
-        "    elif False:\n"),
     "unsent-ignores-suppression": (
         "a suppressed reply at a delivered id is quarantined and handed over for sending",
         "    if skip is not None:\n        done = disposal.retire_generation(",
@@ -262,18 +249,30 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "an existing review or suppression record of another body counts as written",
         "    if path.is_file():\n        return _holds(path, field, payload[field])\n",
         "    if path.is_file():\n        return True\n"),
-    "record-path-ignores-the-body": (
-        "a later body of a task reuses the task-keyed record path",
-        "    if not all(_holds(p, field, body) for p in live_and_archived(path)):\n",
-        "    if False:\n"),
-    "record-reuses-an-archived-id": (
-        "a review id archived after resolution is reused for a different body",
-        "        return [p for p in (path, path.parent / \"archive\" / path.name) if p.exists()]\n",
-        "        return [p for p in (path,) if p.exists()]\n"),
-    "record-reissues-an-archived-id": (
-        "a body whose review was archived gets a new record under the consumed id",
-        "    if not path.exists() and _holds(archived, field, body):\n        return archived\n",
-        "    if False:\n        return archived\n"),
+    "proof-ignores-its-stamp": (
+        "a source proof is trusted without this writer's version stamp",
+        "    if (record.get(\"proof_version\") != PROOF_VERSION or not proof or not isinstance(payload, str)\n",
+        "    if (not proof or not isinstance(payload, str)\n"),
+    "binding-ignores-the-publish": (
+        "a proof stays trusted after another writer rewrote the payload's publish",
+        "    return hashlib.sha256(json.dumps([PROOF_VERSION, payload, published_at]).encode(\"utf-8\")).hexdigest()\n",
+        "    return hashlib.sha256(json.dumps([PROOF_VERSION, payload]).encode(\"utf-8\")).hexdigest()\n"),
+    "unsent-hands-over-an-unprovable-marked-body": (
+        "a marked reply at a record with no trusted proof is handed over as one to send by hand",
+        "    elif any(a.kind != \"skip\" for a in actions) and not _delivery_provable(item_id):\n",
+        "    elif False:\n"),
+    "issue-reissues-a-reserved-id": (
+        "an id reserved for this body but whose record moved is issued again",
+        "                    found = _record_of(path)\n                    if found is not None:\n                        return found, True\n",
+        "                    found = None\n                    if found is not None:\n                        return found, True\n"),
+    "decision-loses-to-a-live-copy": (
+        "a stale live copy is preferred over the archived decision of the same id",
+        "    \"\"\"The record of an issued id: its decision once archived, else the live one.\"\"\"\n    for existing in (_archived(path), path):\n",
+        "    \"\"\"The record of an issued id: its decision once archived, else the live one.\"\"\"\n    for existing in (path, _archived(path)):\n"),
+    "ledger-ignores-prior-records": (
+        "records from before the reservation ledger are not seeded as issued ids",
+        "            _reserve(path, digest)\n            return _reservation(path).read_text(encoding=\"utf-8\").strip()\n",
+        "            return None\n"),
     "orphan-links-then-unlinks": (
         "an orphan arm moves the canonical result itself: link, then unlink its name",
         "        done = disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))\n",

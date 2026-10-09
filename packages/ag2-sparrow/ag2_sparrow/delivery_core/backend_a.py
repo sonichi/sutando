@@ -46,13 +46,13 @@ class DesignAClaimBackend:
                     return False
                 if outbox.read_delivery_claim(self.root, item_id) is not None:
                     return False
-            text = payload.decode("utf-8", "replace")
+            text, published_at = payload.decode("utf-8", "replace"), time.time()
             record = {
                 "item_id": item_id,
                 "payload": text,
                 "status": "READY",
-                "published_at": time.time(),
-                **outbox.source_proof_fields(source_ready_sha256, text),
+                "published_at": published_at,
+                **outbox.source_proof_fields(source_ready_sha256, text, published_at),
             }
             outbox._write_item(self.root, item_id, record)
             return True
