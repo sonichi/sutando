@@ -30,14 +30,15 @@ IN_QUARANTINE = {"fallback-links-then-unlinks", "place-replaces-a-taken-name",
 CLI = [REPO / "src" / "outbox_cli.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox_cli.py"]
 BRIDGE = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"]
 OUTBOX = [REPO / "src" / "outbox.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox.py"]
-IN_OUTBOX = {"proof-ignores-its-payload", "reader-trusts-the-earlier-digest", "delivered-rule-compares-the-composed-body", "delivered-body-never-differs"}
+IN_OUTBOX = {"proof-trusts-adoption-era-records", "proof-ignores-its-payload", "reader-trusts-the-earlier-digest", "delivered-rule-compares-the-composed-body", "delivered-body-never-differs"}
 IN_CLI = {"cli-exits-0-on-no-safe-move", "cli-reads-epoch-after-lock", "cli-parks-on-no-safe-move"}
 BACKEND = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "delivery_core" / "backend_a.py"]
 IN_BACKEND = {"publish-drops-the-source"}
 GUARD = [REPO / "src" / "policy" / "egress" / "result.py",
          REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "team_result_guard.py"]
-IN_GUARD = {"artifact-claims-another-body", "record-path-ignores-the-body", "record-reuses-an-archived-id"}
-IN_BRIDGE = {"unsent-ignores-a-changed-generation", "verdict-cache-keyed-by-task", "late-duplicate-hashes-the-raw-bytes", "unsent-skips-the-guard", "unsent-skips-owner-mention",
+IN_GUARD = {"artifact-claims-another-body", "record-path-ignores-the-body", "record-reuses-an-archived-id",
+            "record-reissues-an-archived-id"}
+IN_BRIDGE = {"unsent-hands-over-an-adoption-era-body", "unsent-ignores-a-changed-generation", "verdict-cache-keyed-by-task", "late-duplicate-hashes-the-raw-bytes", "unsent-skips-the-guard", "unsent-skips-owner-mention",
              "unsent-ignores-suppression", "unsent-ignores-restriction",              "confirmed-archives-another-body", "terminal-delivered-archives-another-body",
              "late-duplicate-archives-another-body", "orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
@@ -183,6 +184,10 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "the delivery backend's publish never persists the source digest",
         "                **outbox.source_proof_fields(source_ready_sha256, text),\n",
         "                **outbox.source_proof_fields(None, text),\n"),
+    "proof-trusts-adoption-era-records": (
+        "a source proof on a record an adoption-era head wrote is trusted",
+        "    if adoption_era(record):\n        return None",
+        "    if False:\n        return None"),
     "proof-ignores-its-payload": (
         "a source proof is trusted although the payload it vouched for was replaced",
         "    if record.get(\"source_payload_sha256\") != hashlib.sha256(payload.encode(\"utf-8\")).hexdigest():\n",
@@ -237,6 +242,10 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "a reply that replaced the one ruled on is disposed of on that ruling",
         "    if generation is not None and ready.identity != generation:\n",
         "    if False:\n"),
+    "unsent-hands-over-an-adoption-era-body": (
+        "a reply at an adoption-era record is handed over as one to send by hand",
+        "    elif _record_is_adoption_era(item_id):\n",
+        "    elif False:\n"),
     "unsent-ignores-suppression": (
         "a suppressed reply at a delivered id is quarantined and handed over for sending",
         "    if skip is not None:\n        done = disposal.retire_generation(",
@@ -255,12 +264,16 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "    if path.is_file():\n        return True\n"),
     "record-path-ignores-the-body": (
         "a later body of a task reuses the task-keyed record path",
-        "    if all(_holds(p, field, body) for p in used):\n        return first\n",
-        "    if True:\n        return first\n"),
+        "    if not all(_holds(p, field, body) for p in live_and_archived(path)):\n",
+        "    if False:\n"),
     "record-reuses-an-archived-id": (
         "a review id archived after resolution is reused for a different body",
-        "    used = [p for p in (first, first.parent / \"archive\" / first.name) if p.exists()]\n",
-        "    used = [p for p in (first,) if p.exists()]\n"),
+        "        return [p for p in (path, path.parent / \"archive\" / path.name) if p.exists()]\n",
+        "        return [p for p in (path,) if p.exists()]\n"),
+    "record-reissues-an-archived-id": (
+        "a body whose review was archived gets a new record under the consumed id",
+        "    if not path.exists() and _holds(archived, field, body):\n        return archived\n",
+        "    if False:\n        return archived\n"),
     "orphan-links-then-unlinks": (
         "an orphan arm moves the canonical result itself: link, then unlink its name",
         "        done = disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))\n",

@@ -321,8 +321,8 @@ def behavioral() -> list:
         c_path = guard.withheld_review_artifact(state, "task-arch", "C body")
         if c_path.name == b_path.name:
             fails.append("a resolved and archived review id must never be reused for another body")
-        if guard.withheld_review_artifact(state, "task-arch", "B body") != b_path:
-            fails.append("the archived body keeps its own review id")
+        if guard.withheld_review_artifact(state, "task-arch", "B body") != b_path.parent / "archive" / b_path.name:
+            fails.append("an archived body's id is never reissued: a replay points at its decision")
     return fails
 
 

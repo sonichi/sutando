@@ -1180,6 +1180,78 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertIn('BODY-B newer answer', self._archived_bodies())
         self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
 
+    def test_an_identical_body_after_its_review_was_archived_reuses_no_consumed_id(self):
+        """B is reviewed, resolved and archived; after a restart identical B arrives
+        again: no new record under the consumed id, no new review messages, and B
+        is retired against the decision already made."""
+        from ag2_sparrow import team_result_guard as trg
+        with patch.object(gw, '_gateway_owner', return_value='@owner:ag2.space'), \
+                patch.object(gw, '_owner_review_dm', return_value='!ownerdm:ag2.space'):
+            result, posts = self._team_delivered_then_late('[file: /tmp/b.txt]\nBODY-B')
+            hot = self.root / 'state' / trg.WITHHELD_RESULT_DIR
+            (b_path,) = hot.glob('wr_*.json')
+            b = json.loads(b_path.read_text())
+            b['status'] = 'kept_private'
+            b_path.write_text(json.dumps(b))
+            self.assertTrue(gw._archive_resolved_review(b_path, b))
+            room_messages = len([c for c in self.server.calls if c.get('op') == 'message'])
+            self.bridge(self.core())                             # a restart: no in-memory verdicts
+            self._late(result, '[file: /tmp/b.txt]\nBODY-B')
+        self.assertEqual(list(hot.glob('wr_*.json')), [], 'a consumed review id was reissued')
+        self.assertEqual(json.loads((hot / 'archive' / b_path.name).read_text())['status'], 'kept_private')
+        self.assertEqual(len([c for c in self.server.calls if c.get('op') == 'message']), room_messages)
+        self.assertFalse(result.exists())
+        self.assertTrue(any('already decided in owner review' in l for l in self.lines), self.lines)
+        self.assertEqual(self.quarantined_bodies(), [])
+
+    ADOPTION_ERA = (
+        ('round 14 (resend_from_live)', {'resend_from_live': True}),
+        ('round 16 (requeued_attempts)', {'requeued_attempts': 0}),
+        ('round 17 (requeued_attempts_epoch)', {'requeued_attempts': 0, 'requeued_attempts_epoch': 1}),
+        ('rounds 18-19 (source_sha256, resend_adopted_epoch)', {'source_sha256': 'f' * 64, 'resend_adopted_epoch': 1}),
+        ('rounds 20-21 (bound proof of another body, resend_adopted_epoch)', {'resend_adopted_epoch': 1}),
+    )
+
+    def _as_adoption_era_head_wrote_it(self, fields, proof_of=None):
+        def rewrite():
+            rec = outbox.read_item(self.outbox, TID)
+            if proof_of is not None:
+                rec.update(outbox.source_proof_fields(outbox.source_digest(proof_of), rec['payload']))
+            rec.update(fields, resend_epoch=1)
+            outbox._write_item(self.outbox, TID, rec)
+        return rewrite
+
+    def test_an_adoption_era_record_never_turns_a_delivered_body_into_a_manual_send(self):
+        """Records as the adoption-era heads left them are read as digest-less: an
+        unchanged delivered body is a duplicate, never "send it by hand"."""
+        for name, fields in self.ADOPTION_ERA:
+            with self.subTest(head=name):
+                self.setUp()
+                result, posts = self._delivered_then_late(
+                    'BODY-A the reply', first='BODY-A the reply',
+                    before_late=self._as_adoption_era_head_wrote_it(fields, proof_of='BODY-Z another source'))
+                self.assertFalse(result.exists())
+                self.assertEqual(self.quarantined_bodies(), [])
+                self.assertEqual(len(list((self.results / 'archive').rglob(f'{TID}-*-late-duplicate*.txt'))), 1)
+                self.assertEqual(len(self.server.calls), posts)
+                self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
+
+    def test_an_adoption_era_marked_body_with_the_same_wire_payload_is_never_handed_over(self):
+        """An adoption-era head adopted marked B whose composed payload equals A's and
+        delivered it; this head must not read A's proof as B being unsent."""
+        late = '[file: /tmp/report.txt]\nBODY-A the reply'
+        result, posts = self._delivered_then_late(
+            late, first='BODY-A the reply',
+            before_late=self._as_adoption_era_head_wrote_it({'resend_adopted_epoch': 1,
+                                                            'source_sha256': 'e' * 64},
+                                                           proof_of='BODY-A the reply'))
+        self.assertEqual(len(self.server.calls), posts)
+        self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
+        self.assertFalse(result.exists())
+        self.assertIn(late, self.quarantined_bodies(), 'kept where the operator looks')
+        self.assertTrue(any('cannot be proven' in l and 'may already have been sent' in l
+                            for l in self.lines), self.lines)
+
     def test_a_replacement_before_retirement_is_judged_on_its_own(self):
         from ag2_sparrow import team_result_guard as trg
         real, fired = disposal.retire_generation, []

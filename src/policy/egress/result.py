@@ -311,14 +311,19 @@ def _holds(path: Path, field: str, body: str) -> bool:
 
 
 def _record_for(path_of, state_dir: Path, task_id: str, body: str, field: str) -> Path:
-    """The record path for this exact body: the task-keyed one unless another body
-    of the task ever used that id (live, or archived after resolution), then one
-    keyed by this body's digest. A record applies only to the body it holds."""
-    first = path_of(state_dir, task_id)
-    used = [p for p in (first, first.parent / "archive" / first.name) if p.exists()]
-    if all(_holds(p, field, body) for p in used):
-        return first
-    return path_of(state_dir, task_id, _body_digest(body))
+    """The record for this exact body: the task-keyed id unless another body of the
+    task ever used it (live, or archived after resolution), else one keyed by this
+    body's digest. An id is never reissued: once its record of this body is archived,
+    the archived record is returned, so a replay points at the decision already made."""
+    def live_and_archived(path: Path) -> "list[Path]":
+        return [p for p in (path, path.parent / "archive" / path.name) if p.exists()]
+    path = path_of(state_dir, task_id)
+    if not all(_holds(p, field, body) for p in live_and_archived(path)):
+        path = path_of(state_dir, task_id, _body_digest(body))
+    archived = path.parent / "archive" / path.name
+    if not path.exists() and _holds(archived, field, body):
+        return archived
+    return path
 
 
 def withheld_review_artifact(state_dir: Path, task_id: str, body: str) -> Path:
@@ -430,6 +435,9 @@ def materialize_withheld_verdict(verdict: TeamResultVerdict, body: str,
         saved = False
     if not saved:
         return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT_UNSAVED, verdict.reason)
+    if artifact.parent.name == "archive":
+        return TeamResultVerdict(
+            VERDICT_SUPPRESS, "[no-send]", f"{verdict.reason}; already decided in owner review {artifact.stem}")
     return TeamResultVerdict(
         VERDICT_SUPPRESS, "[no-send]", f"{verdict.reason}; pending private owner review")
 
