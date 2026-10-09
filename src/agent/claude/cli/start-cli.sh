@@ -11,6 +11,7 @@
 #   bash src/agent/claude/cli/start-cli.sh           # start (or attach if running)
 #   bash src/agent/claude/cli/start-cli.sh --restart # kill existing session then start fresh
 #   ... --restart --visible / --visible               # additionally open a Terminal window attached (macOS)
+#   bash src/agent/claude/cli/start-cli.sh --witness <name> / --witness-stop <name>  # see witness-mode.sh
 #
 # Per Chi's prompt 2026-05-05 ("shall we add core CLI-related commands in
 # sutando app"): extracting the launch command from startup.sh's inline tmux
@@ -41,6 +42,20 @@ fi
 # shellcheck source=session-launch.sh
 . "$REPO/src/agent/claude/cli/session-launch.sh"
 
+# Witness mode runs before anything touches shared state; see witness-mode.sh.
+WITNESS=""
+for _arg in "$@"; do
+  case "$_arg" in
+    --witness|--witness-stop|--witness-scrubbed|--witness=*|--witness-stop=*)
+      # shellcheck source=witness-mode.sh
+      . "$REPO/src/agent/claude/cli/witness-mode.sh"
+      witness_dispatch "$@"
+      set --
+      break
+      ;;
+  esac
+done
+
 resolve_claude_py
 # shellcheck source=skill-manifest-config.sh
 [ -r "$REPO/src/skill-manifest-config.sh" ] && . "$REPO/src/skill-manifest-config.sh"
@@ -60,10 +75,15 @@ WATCHER_SESSION="${SESSION}-watcher"
 NOTIFIER_SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
 NOTIFIER_SCRIPT="$REPO/src/agent/claude/cli/task-notifier.sh"
 SURFACE_ARGS=(--remote-control "Sutando" --chrome)
+# Remote control and Chrome are the owner's surfaces, held by the production core.
+[ -n "$WITNESS" ] && SURFACE_ARGS=()
 add_skill_claude_plugins
 # `/startup` is the CANONICAL CORE's ceremony: orphan recovery, session crons,
 # a gate any watcher satisfies. One arg — the skill reads it as $ARGUMENTS.
 BOOT_PROMPT="/startup"
+if [ -n "$WITNESS" ]; then
+  BOOT_PROMPT="You are witness core '$WITNESS': a throwaway Sutando core launched from a PR checkout for a live test, beside the production core. Do not run /startup, register crons, or start or re-arm a task watcher yourself, even if asked to: the external task notifier types each task into this pane. Handle each task as CLAUDE.md says, but write files only under this checkout's resolved workspace, and send no messages, posts, PRs or pushes. Reply 'witness ready' now."
+fi
 SESSION_ARGS=()
 if [ -n "${SUTANDO_CLAUDE_RESUME:-}" ]; then
   SESSION_ARGS=(--resume "$SUTANDO_CLAUDE_RESUME")
@@ -430,17 +450,22 @@ ensure_task_notifier() {
 # The heartbeat writer exits once its core pane is gone, so every launch of the core must
 # re-ensure it; cron-runner holds every prompt-backed fire while .alive is missing.
 ensure_core_heartbeat() {
+  local log_args=()
   if [ -z "$PY" ] || [ ! -f "$REPO/src/core_heartbeat.py" ]; then
     echo "  ⚠ core heartbeat not ensured: no runnable Python interpreter; cron-runner fires stay held" >&2
     return 0
   fi
-  "$PY" "$REPO/src/core_heartbeat.py" --ensure > /dev/null 2>&1 \
+  # The beat itself already lands in the witness workspace; its log must too.
+  [ -n "$WITNESS" ] && log_args=(--log "$SUTANDO_WORKSPACE_DIR/logs/core-heartbeat.log")
+  "$PY" "$REPO/src/core_heartbeat.py" --ensure ${log_args[@]+"${log_args[@]}"} > /dev/null 2>&1 \
     || echo "  ⚠ core heartbeat --ensure failed; cron-runner fires stay held until it runs" >&2
 }
 
 # Core-only: a pool worker is never the subject of the Agent Shepherd monitor.
 ensure_core_monitor() {
   local ws mon_out relay_pid_file relay_state
+  # Its relay escalates to the owner's channels and it logs to shared /tmp files.
+  [ -z "$WITNESS" ] || return 0
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
   mon_out="$ws/state/core-supervisor.json"
