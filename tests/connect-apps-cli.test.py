@@ -1501,6 +1501,15 @@ class TestCardStationAccount(Base):
                                  (connectors.EXIT_NO, "account_changed", "u-agent", "u-desktop", None))
                 self.assert_no_card()
 
+    def test_the_stamp_is_read_once_so_both_ids_come_from_one_read(self):
+        reads = [{"version": 1, "cloud_user_id": "u-desktop"}, None]
+        reader = mock.Mock(side_effect=lambda _ws: reads.pop(0))
+        with mock.patch.object(connectors, "read_station_stamp", reader):
+            code, out = run(self.ws, card_argv("googlecalendar"), FakeCloud(self.ws, user="u-agent"), self.spawn)
+        self.assertEqual((code, out["reason"], out["stamp_cloud_user_id"], reader.call_count),
+                         (connectors.EXIT_NO, "account_changed", "u-desktop", 1))
+        self.assert_no_card()
+
     def test_the_stamped_account_still_gets_its_card(self):
         self.stamp("u-owner")
         code, out = run(self.ws, card_argv("googlecalendar"), FakeCloud(self.ws), self.spawn)
