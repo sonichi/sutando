@@ -258,15 +258,31 @@ class Cloud:
         self.base: str | None = None
         self.token: str | None = None
         self.cache: ConnectCache | None = None
+        self.refused: Any = None
 
     def signed_in(self) -> bool:
         if not self.token:
-            self.base, self.token = self._read_auth(self.workspace)
+            auth = self._read_auth(self.workspace)
+            self.base, self.token = auth
+            self.refused = auth if getattr(auth, "refused", None) else None
         return bool(self.token)
+
+    def not_signed_in(self) -> Setup:
+        """The Setup to raise when signed_in() is False: wrong_account when cloud_auth refused a
+        credential for another user than the desktop stamped, else not_signed_in."""
+        r = self.refused
+        if r is None:
+            return Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+        if r.refused == "account_changed":
+            found = ", ".join(r.credential_user_ids)
+            return Setup("wrong_account", f"This agent's AG2 Cloud credentials belong to {found}, not the account "
+                         f"the desktop app started it for ({r.stamp_user_id}): sign in again from the desktop app.")
+        return Setup("wrong_account", "Could not confirm this agent's AG2 Cloud credentials belong to the account "
+                     f"the desktop app started it for ({r.stamp_user_id}); not acting as an unknown account.")
 
     def get(self, path: str) -> dict:
         if not self.signed_in():
-            raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+            raise self.not_signed_in()
         try:
             data = self._request(self.base or cloud_auth.DEFAULT_CLOUD_ORIGIN, self.token, "GET", path)
         except cloud_auth.CloudError as exc:
@@ -281,7 +297,7 @@ class Cloud:
     def post(self, path: str, body: dict | None = None) -> dict:
         """One authenticated POST; the same error mapping as `get`."""
         if not self.signed_in():
-            raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+            raise self.not_signed_in()
         try:
             data = self._request(self.base or cloud_auth.DEFAULT_CLOUD_ORIGIN, self.token, "POST", path, body or {})
         except cloud_auth.CloudError as exc:
@@ -1210,7 +1226,7 @@ def cmd_await(
     if origin_owner(ws, a["task"]) != a["owner"]:
         raise Setup("not_owner_task", f"--owner is not the user of {a['task']}.")
     if not cloud.signed_in():
-        raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+        raise cloud.not_signed_in()
     cloud_user_id = account_for_wait(cloud, sleep)
     changed = station_account_changed(ws, cloud, cloud_user_id)
     if changed:
@@ -1397,7 +1413,7 @@ def cmd_card(
               "owner": a["owner"]})
         return EXIT_OK
     if not cloud.signed_in():
-        raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
+        raise cloud.not_signed_in()
     cloud_user_id = account_for_wait(cloud, sleep)
     changed = station_account_changed(ws, cloud, cloud_user_id)
     if changed:

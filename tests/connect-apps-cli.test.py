@@ -1846,5 +1846,61 @@ class CloudPostTests(unittest.TestCase):
                 self.assertEqual((ctx.exception.status, ctx.exception.code), (0, "network"))
 
 
+class TestStampedAccountCredential(unittest.TestCase):
+    """#5261: cloud_auth refuses a credential for another user than the stamp; connect-apps
+    names that as wrong_account instead of acting as that user or saying 'not signed in'."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        tmp = Path(self._tmp.name)
+        self.ws = tmp / "ws"
+        (self.ws / "state" / "auth").mkdir(parents=True)
+        (self.ws / "state" / "auth" / "cloud-auth.json").write_text(
+            json.dumps({"apiBase": "https://sutando.ag2.space", "token": "sutk_B"}))
+        (self.ws / "state" / "station-core-stamp.json").write_text(
+            json.dumps({"version": 1, "has_station_entry": True, "cloud_user_id": "u-A", "spawned_at": "x"}))
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("SUTANDO_PACKAGED", "SUTANDO_APP_SUPPORT", "SUTANDO_METERING_HEADERS")}
+        self.ids = {"sutk_B": "u-B"}
+        for p in (mock.patch.dict(os.environ, env, clear=True),
+                  mock.patch.object(cloud_auth.Path, "home", return_value=tmp / "home"),
+                  mock.patch.object(cloud_auth, "keychain_get", return_value=None),
+                  mock.patch.object(cloud_auth, "cloud_request", side_effect=self.me),
+                  mock.patch.object(cloud_auth, "_USER_IDS", {}, create=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def me(self, base, token, method, path, **_):
+        if token not in self.ids:
+            raise cloud_auth.CloudError(0, "network", "down")
+        return {"id": self.ids[token]}
+
+    def test_another_users_file_is_never_sent_and_reads_as_wrong_account(self):
+        sent = []
+        cloud = connectors.Cloud(self.ws, request=lambda *a, **k: sent.append(a) or {})
+        with self.assertRaises(connectors.Setup) as ctx:
+            cloud.get("/api/connectors")
+        self.assertEqual(ctx.exception.code, "wrong_account")
+        self.assertIn("u-B", str(ctx.exception))
+        self.assertIn("u-A", str(ctx.exception))
+        with self.assertRaises(connectors.Setup):
+            cloud.post("/api/x")
+        self.assertEqual(sent, [], "no call acts as the other account")
+
+    def test_an_unconfirmable_credential_reads_as_wrong_account_too(self):
+        self.ids = {}
+        with self.assertRaises(connectors.Setup) as ctx:
+            connectors.Cloud(self.ws, request=lambda *a, **k: {}).get("/api/connectors")
+        self.assertEqual(ctx.exception.code, "wrong_account")
+        self.assertIn("Could not confirm", str(ctx.exception))
+
+    def test_the_stamped_users_credential_still_serves(self):
+        self.ids = {"sutk_B": "u-A"}
+        cloud = connectors.Cloud(self.ws, request=lambda base, tok, *a, **k: {"connections": [], "tok": tok})
+        self.assertEqual(cloud.get("/api/connectors")["tok"], "sutk_B")
+        self.assertIsNone(cloud.refused)
+
+
 if __name__ == "__main__":
     unittest.main()

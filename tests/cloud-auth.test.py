@@ -180,6 +180,129 @@ class TestSignedOutIsTerminalUnderTheHost(unittest.TestCase):
             self.assertEqual(cloud_auth.read_cloud_auth(ws)[1], "sutk_live")
 
 
+class TestStampedAccountIsNeverSwapped(unittest.TestCase):
+    """#5261: once the desktop stamped the station for a user, a credential for another
+    user (an older cloud-auth.json, the metering token) is refused, never returned."""
+
+    BASE = "https://sutando.ag2.space"
+    IDS = {"sutk_A": "u-A", "sutk_A2": "u-A", "sutk_B": "u-B"}
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.ws = self.tmp / "ws"
+        (self.ws / "state" / "auth").mkdir(parents=True)
+        env = {k: v for k, v in cloud_auth.os.environ.items()
+               if k not in ("SUTANDO_PACKAGED", "SUTANDO_APP_SUPPORT", "SUTANDO_METERING_HEADERS", "AG2_CLOUD_ORIGIN")}
+        self.store: dict = {}
+        self.me_calls: list = []
+        for p in (mock.patch.dict(cloud_auth.os.environ, env, clear=True),
+                  mock.patch.object(cloud_auth.Path, "home", return_value=self.tmp / "home"),
+                  mock.patch.object(cloud_auth, "keychain_get", side_effect=lambda k: self.store.get(k)),
+                  mock.patch.object(cloud_auth, "cloud_request", side_effect=self._me),
+                  mock.patch.object(cloud_auth, "_USER_IDS", {}, create=True)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _me(self, base, token, method, path, **_):
+        self.me_calls.append(token)
+        if token not in self.IDS:
+            raise cloud_auth.CloudError(0, "network", "down")
+        return {"id": self.IDS[token]}
+
+    def stamp(self, user):
+        (self.ws / "state" / "station-core-stamp.json").write_text(json.dumps(
+            {"version": 1, "has_station_entry": True, "cloud_user_id": user, "spawned_at": "2026-10-08T00:00:00Z"}))
+
+    def file(self, token):
+        (self.ws / "state" / "auth" / "cloud-auth.json").write_text(json.dumps({"apiBase": self.BASE, "token": token}))
+
+    def keychain(self, token, key=None):
+        self.store[key or cloud_auth.origin_vault_key(cloud_auth.DEFAULT_CLOUD_ORIGIN)] = token
+
+    def metering(self, token):
+        cloud_auth.os.environ["SUTANDO_METERING_HEADERS"] = json.dumps({"Authorization": f"Bearer {token}"})
+
+    def test_a_stale_file_for_another_user_yields_to_the_stamped_users_keychain_key(self):
+        self.stamp("u-A")
+        self.file("sutk_B")
+        self.keychain("sutk_A")
+        self.assertEqual(cloud_auth.read_cloud_auth(self.ws), (self.BASE, "sutk_A"))
+
+    def test_only_another_users_credential_is_refused_not_returned(self):
+        self.stamp("u-A")
+        self.file("sutk_B")
+        auth = cloud_auth.read_cloud_auth(self.ws)
+        self.assertEqual((tuple(auth), auth.refused, auth.stamp_user_id, auth.credential_user_ids),
+                         ((None, None), "account_changed", "u-A", ("u-B",)))
+
+    def test_the_metering_token_for_another_user_is_refused(self):
+        self.stamp("u-A")
+        cloud_auth.os.environ["SUTANDO_APP_SUPPORT"] = str(self.tmp)
+        self.keychain(cloud_auth.SIGNED_OUT_SENTINEL)
+        self.metering("sutk_B")
+        auth = cloud_auth.read_cloud_auth(self.ws)
+        self.assertEqual((tuple(auth), auth.refused), ((None, None), "account_changed"))
+        self.metering("sutk_A")
+        self.assertEqual(cloud_auth.read_cloud_auth(self.ws)[1], "sutk_A", "the stamped user's metering token serves")
+
+    def test_under_the_host_the_keychain_key_for_the_stamped_user_is_preferred(self):
+        self.stamp("u-A")
+        cloud_auth.os.environ["SUTANDO_APP_SUPPORT"] = str(self.tmp)
+        self.keychain("sutk_B")
+        self.keychain("sutk_A", key="AG2_CLOUD_TOKEN")
+        self.file("sutk_A2")
+        self.assertEqual(cloud_auth.read_cloud_auth(self.ws)[1], "sutk_A", "the file is still never read under the host")
+
+    def test_a_matching_user_is_unchanged(self):
+        self.stamp("u-A")
+        self.file("sutk_A")
+        self.keychain("sutk_A2")
+        auth = cloud_auth.read_cloud_auth(self.ws)
+        self.assertEqual((tuple(auth), auth.refused), ((self.BASE, "sutk_A"), None))
+        cloud_auth.read_cloud_auth(self.ws)
+        self.assertEqual(self.me_calls, ["sutk_A"], "one /api/me per credential, then cached")
+
+    def test_no_stamp_is_unchanged_and_makes_no_network_call(self):
+        self.file("sutk_B")
+        self.keychain("sutk_A")
+        self.assertEqual(cloud_auth.read_cloud_auth(self.ws), (self.BASE, "sutk_B"))
+        self.stamp(None)
+        self.assertEqual(cloud_auth.read_cloud_auth(self.ws), (self.BASE, "sutk_B"))
+        (self.ws / "state" / "auth" / "cloud-auth.json").unlink()
+        self.store.clear()
+        self.assertEqual(cloud_auth.read_cloud_auth(self.ws), (None, None))
+        self.assertEqual(self.me_calls, [])
+
+    def test_an_unconfirmable_credential_is_not_used(self):
+        self.stamp("u-A")
+        self.file("sutk_unknown")
+        self.metering("sutk_unknown")
+        auth = cloud_auth.read_cloud_auth(self.ws)
+        self.assertEqual((tuple(auth), auth.refused, auth.credential_user_ids), ((None, None), "account_unverified", ()))
+        self.assertEqual(self.me_calls, ["sutk_unknown"], "one token is checked once")
+        self.assertEqual(cloud_auth.read_cloud_auth(self.ws, user_id=lambda b, t: None).refused, "account_unverified")
+
+    def test_a_stamp_with_no_credential_at_all_is_plain_signed_out(self):
+        self.stamp("u-A")
+        auth = cloud_auth.read_cloud_auth(self.ws)
+        self.assertEqual((tuple(auth), auth.refused), ((None, None), None))
+
+    def test_an_injected_keychain_reader_is_one_candidate(self):
+        self.stamp("u-A")
+        self.file("sutk_B")
+        self.assertEqual(cloud_auth.read_cloud_auth(self.ws, keychain_auth=lambda: (self.BASE, "sutk_A"))[1], "sutk_A")
+
+    def test_credential_user_id_needs_an_id(self):
+        cloud_auth.cloud_request.side_effect = lambda *a, **k: {"email": "x"}
+        self.assertIsNone(cloud_auth.credential_user_id(self.BASE, "sutk_A"))
+        cloud_auth.cloud_request.side_effect = lambda *a, **k: None
+        self.assertIsNone(cloud_auth.credential_user_id(self.BASE, "sutk_A"))
+        self.assertEqual(cloud_auth._USER_IDS, {})
+
+
 class TestCloudRequest(unittest.TestCase):
     def test_refuses_untrusted_or_plaintext_hosts(self):
         for base in ("https://evil.example", "http://sutando.ag2.space", "https://u:p@sutando.ag2.space"):
