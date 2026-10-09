@@ -58,6 +58,10 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "a lock the filesystem refuses raises into the drain",
         "    except OSError as e:                                # DisposalBusy, ENOLCK, EACCES, a vanished dir\n",
         "    except DisposalBusy as e:                                # DisposalBusy, ENOLCK, EACCES, a vanished dir\n"),
+    "recovery-digest-only": (
+        "recovery calls a claim verified when only its bytes match the name",
+        "    unverified = (found.ino, found.mtime_ns, found.digest) != (c.ino, c.mtime_ns, c.digest)\n",
+        "    unverified = found.digest != c.digest\n"),
     "put-back-replaces": (
         "the put-back uses a replacing rename, so a retaken canonical name is overwritten",
         "        rename_noreplace(Path(claim), Path(rfile), log)\n    except FileExistsError:\n        return False\n",

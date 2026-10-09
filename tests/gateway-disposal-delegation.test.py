@@ -10,6 +10,8 @@ Run: python3 tests/gateway-disposal-delegation.test.py
 from __future__ import annotations
 
 import ast
+import ctypes
+import errno
 import hashlib
 import os
 import subprocess
@@ -41,6 +43,7 @@ class CoreContract(unittest.TestCase):
         self.results = Path(self.tmp.name) / "results"
         self.results.mkdir()
         self.lines: list[str] = []
+        disposal._REPORTED.discard("rename:fallback")     # once-per-process lines start fresh per test
 
     def result(self, body="answer", stem="task-a"):
         p = self.results / f"{stem}.txt"
@@ -527,6 +530,170 @@ class CoreContract(unittest.TestCase):
             self.assertTrue(disposal.owner_holds(c))
         finally:
             disposal.ACTIVE_CLAIMS.discard(str(c))
+
+    # ── round 8: every branch the gate flagged, executed on the main thread ──
+
+    def fake_rename(self, err):
+        # A kernel primitive that fails with `err`, the way ctypes reports it.
+        def prim(_a, _b):
+            ctypes.set_errno(err)
+            return -1
+        return prim
+
+    def test_a_filesystem_without_the_primitive_moves_the_process_to_the_link_fallback(self):
+        a = self.result("A")
+        for err in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+            with unittest.mock.patch.object(disposal, "_RENAME", self.fake_rename(err)), \
+                    unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "probe"):
+                dst = self.results / f"task-{err}.txt"
+                disposal.rename_noreplace(a, dst, self.lines.append)
+                self.assertEqual((disposal.RENAME_PRIMITIVE, disposal._RENAME), ("link", None))
+            self.assertEqual(dst.read_text(), "A")
+            self.assertFalse(a.exists())
+            dst.rename(a)
+        self.assertEqual(len(self.lines), 1, "the fallback is reported once per process")
+        self.assertIn("no no-replace rename", self.lines[0])
+
+    def test_any_other_kernel_error_raises_and_moves_nothing(self):
+        a = self.result("A")
+        with unittest.mock.patch.object(disposal, "_RENAME", self.fake_rename(errno.EACCES)), \
+                unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "probe"):
+            with self.assertRaises(OSError) as cm:
+                disposal.rename_noreplace(a, self.results / "task-b.txt", self.lines.append)
+            self.assertEqual(cm.exception.errno, errno.EACCES)
+            self.assertEqual(disposal.RENAME_PRIMITIVE, "probe", "an unexplained error is not a missing primitive")
+        self.assertEqual(a.read_text(), "A")
+        self.assertFalse((self.results / "task-b.txt").exists())
+        self.assertEqual(self.lines, [])
+
+    def test_the_probe_names_link_where_no_primitive_is_known(self):
+        with unittest.mock.patch.object(sys, "platform", "freebsd14"):
+            self.assertEqual(disposal._probe_rename(), ("link", None))
+
+    def test_the_link_fallback_completes_a_plain_move(self):
+        a = self.result("A")
+        with unittest.mock.patch.object(disposal, "_RENAME", None), \
+                unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "link"):
+            disposal.rename_noreplace(a, self.results / "task-b.txt", self.lines.append)
+            self.assertFalse(a.exists())
+            self.assertEqual((self.results / "task-b.txt").read_text(), "A")
+            # A taken name is refused at the link, nothing moved.
+            self.result("C", stem="task-c")
+            with self.assertRaises(FileExistsError):
+                disposal.rename_noreplace(self.results / "task-b.txt", self.results / "task-c.txt")
+            self.assertEqual((self.results / "task-b.txt").read_text(), "A")
+
+    def test_the_link_fallback_is_quiet_when_the_source_vanishes_before_the_verify(self):
+        a = self.result("A")
+        real_stat = os.stat
+
+        def source_gone(path, *args, **kw):
+            if Path(path) == a:
+                raise FileNotFoundError(errno.ENOENT, "gone", str(path))
+            return real_stat(path, *args, **kw)
+        with unittest.mock.patch.object(disposal, "_RENAME", None), \
+                unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "link"), \
+                unittest.mock.patch.object(os, "stat", source_gone):
+            disposal.rename_noreplace(a, self.results / "task-b.txt", self.lines.append)
+        self.assertEqual((self.results / "task-b.txt").read_text(), "A")
+        self.assertTrue(a.exists(), "nothing is unlinked on a verify it could not make")
+
+    def test_the_lock_refuses_a_fifo(self):
+        # A FIFO opens read-write without blocking, so only the regular-file check stops it.
+        lock = self.results / disposal.LOCK_NAME
+        os.mkfifo(lock)
+        with self.assertRaises(OSError) as cm:
+            with disposal.locked(self.results):
+                pass
+        self.assertEqual(cm.exception.errno, errno.EINVAL)
+
+    def test_a_busy_errno_from_the_lock_call_reads_as_held(self):
+        fd = os.open(self.results / disposal.LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        for err in sorted(disposal._BUSY_ERRNOS):
+            with unittest.mock.patch.object(disposal, "lock_fd",
+                                            lambda _fd, *, blocking=True, e=err: (_ for _ in ()).throw(OSError(e, "busy"))):
+                self.assertFalse(disposal._try_lock(fd))
+        with unittest.mock.patch.object(disposal, "lock_fd",
+                                        lambda _fd, *, blocking=True: (_ for _ in ()).throw(OSError(errno.EIO, "io"))):
+            with self.assertRaises(OSError):
+                disposal._try_lock(fd)
+
+    def test_a_lock_file_removed_on_every_attempt_is_given_up_after_eight(self):
+        # The re-check after flock sees no file at the lock's name each time;
+        # locked() retries a bounded number of times, then reports ESTALE.
+        lock = self.results / disposal.LOCK_NAME
+        real = disposal._try_lock
+        seen = []
+
+        def unlink_after_lock(fd):
+            ok = real(fd)
+            if ok:
+                seen.append(1)
+                lock.unlink()
+            return ok
+        with unittest.mock.patch.object(disposal, "_try_lock", unlink_after_lock):
+            with self.assertRaises(OSError) as cm:
+                with disposal.locked(self.results):
+                    self.fail("never locked")
+        self.assertEqual(cm.exception.errno, errno.ESTALE)
+        self.assertEqual(len(seen), 8)
+
+    def test_a_sole_link_claim_is_kept_as_a_superseded_copy(self):
+        c = self.claim(nonce="ab00000c")
+        self.result("only copy").rename(c)
+        disposal._drop_link(c, self.lines.append, "task-a", self.results)
+        self.assertFalse(c.exists())
+        self.assertEqual([p.read_text() for p in self.results.glob("undelivered/task-a-*.txt")], ["only copy"])
+        self.assertEqual(len(self.lines), 1)
+        self.assertIn("superseded reply was kept", self.lines[0])
+
+    def test_a_rewrite_during_the_final_move_is_named_in_the_log(self):
+        r = self.result("answer")
+        _, gen = identity_of(r)
+        real_rename = os.rename
+
+        def rewrite_then_move(src, dst, *a, **kw):
+            if ".disposing-" in str(src) and "undelivered" in str(dst):
+                with open(src, "a") as fh:                 # the producer rewrites the claimed inode
+                    fh.write(" and more")
+            return real_rename(src, dst, *a, **kw)
+        with unittest.mock.patch.object(os, "rename", rewrite_then_move):
+            target = disposal.quarantine_generation(self.results, r, gen, self.lines.append)
+        self.assertEqual(target.read_text(), "answer and more")
+        self.assertEqual(len(self.lines), 1)
+        self.assertIn("rewritten in place during the move", self.lines[0])
+
+    def test_a_claim_that_cannot_be_matched_proves_nothing_to_the_loser(self):
+        # An EMFILE while matching a claim is skipped (the copies before it did not match).
+        r = self.result("answer")
+        _, gen = identity_of(r)
+        self.result("other", stem="task-a").rename(self.claim(nonce="ab00000d", body="other"))
+        undelivered_quarantine.quarantine(self.result("third"), self.results)
+        real = disposal._is_generation
+
+        def emfile_on_claims(path, generation):
+            if ".disposing-" in str(path):
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real(path, generation)
+        with unittest.mock.patch.object(disposal, "_is_generation", emfile_on_claims):
+            self.assertFalse(disposal.disposed_copy_exists(self.results, "task-a", gen, self.lines.append))
+
+    def test_equal_bytes_under_the_claims_named_identity_are_restored_not_quarantined(self):
+        # The claim names publication A (inode, write time, digest); it holds B,
+        # a distinct publication with A's bytes. Identity, not bytes, decides.
+        a = self.result("same bytes")
+        _, gen_a = identity_of(a)
+        a.unlink()
+        b = self.result("same bytes")
+        os.utime(b, ns=(gen_a.mtime_ns + 5_000_000, gen_a.mtime_ns + 5_000_000))
+        c = self.claim(nonce="ab00000e", body="same bytes", ino=gen_a.ino, mtime=gen_a.mtime_ns)
+        b.rename(c)
+        self.assertEqual(disposal.recover_claim(self.results, c, self.lines.append), self.results / "task-a.txt")
+        self.assertEqual((self.results / "task-a.txt").read_text(), "same bytes")
+        self.assertEqual(self.quarantined(), [])
+        self.assertEqual(len(self.lines), 1)
+        self.assertIn("never verified", self.lines[0])
 
 
 class BridgeDelegates(unittest.TestCase):

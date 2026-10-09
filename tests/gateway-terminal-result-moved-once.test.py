@@ -687,6 +687,28 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertIn('never verified', self.about()[0])
         self.assertIn('terminal', self.about()[1])
 
+    def test_a_lock_the_loser_cannot_take_is_no_verdict_and_it_reports(self):
+        # Both loser branches ask the owner for a verdict; a lock it cannot
+        # take is reported, and the loser still says what it saw.
+        self.bridge(self.park_without_disposing())
+        self.task()
+        result = self.result()
+        _, gen = self.read(result)
+
+        def no_lock(*_a, **_k):
+            raise OSError(77, 'No locks available')
+        with patch.object(disposal, 'disposed_copy_exists', no_lock), \
+                patch.object(disposal, 'quarantine_generation',
+                             lambda *_a, **_k: (_ for _ in ()).throw(disposal.GenerationReplaced('replaced'))):
+            gw._quarantine_undelivered(result, TID, 'terminal', generation=gen)
+        result.unlink()
+        with patch.object(disposal, 'disposed_copy_exists', no_lock):
+            gw._quarantine_undelivered(result, TID, 'terminal', generation=gen)
+        self.assertEqual(len(self.about()), 4, '\n'.join(self.about()))
+        self.assertEqual(sum('could not check for a disposed copy' in ln for ln in self.about()), 2)
+        self.assertTrue(any('stays live' in ln for ln in self.about()))
+        self.assertTrue(any('vanished' in ln for ln in self.about()))
+
     def test_a_claim_that_cannot_be_read_is_reported_and_the_body_stays_live(self):
         # EMFILE while checking the claim is not a replacement: the bridge says
         # the quarantine failed and the reply is back at its name.

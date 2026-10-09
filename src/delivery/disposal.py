@@ -133,7 +133,7 @@ def _probe_rename() -> "tuple[str, Optional[Callable[[bytes, bytes], int]]]":
         libc = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
     except OSError:  # pragma: no cover - no libc to speak of
         return "link", None
-    if sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+    if sys.platform == "darwin" and hasattr(libc, "renamex_np"):  # pragma: no cover - Linux CI
         fn = libc.renamex_np
         fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
         fn.restype = ctypes.c_int
@@ -153,8 +153,9 @@ RENAME_PRIMITIVE, _RENAME = _probe_rename()
 def rename_noreplace(src: Path, dst: Path, log: Optional[Log] = None) -> None:
     """Rename `src` to `dst` only if `dst` does not exist: FileExistsError
     otherwise, and nothing moved. Without a kernel primitive the fallback
-    links then unlinks, verifying in between that the link still names the
-    same file, and reports the gap once."""
+    links, verifies the link still names the same file, then unlinks: a name
+    retaken between link and verify is reported; one retaken between the
+    verify and the unlink is a residual silent loss on such platforms."""
     global RENAME_PRIMITIVE, _RENAME
     if _RENAME is not None:
         rc = _RENAME(os.fsencode(src), os.fsencode(dst))
@@ -216,7 +217,8 @@ def locked(results_dir: Path) -> Iterator[None]:
     within a thread. Two threads of one process lock two open file
     descriptions, so the drain and the sweep serialize exactly like two
     processes do. After locking, the fd must still be the file at the lock's
-    name: a lock file replaced underneath would let two lockers in."""
+    name, which only protects a locker arriving after a replacement; the
+    contract is that nothing removes the lock file while it is in use."""
     results_dir = Path(results_dir)
     key = os.path.realpath(results_dir)
     held = getattr(_HELD, "dirs", None)
