@@ -248,3 +248,78 @@ describe('build-core-settings.mjs', () => {
 		assert.deepEqual(matchers, ['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*']);
 	});
 });
+
+describe('build-core-settings.mjs — Sutando-owned lifecycle hooks', () => {
+	const REPO = "/r o'x";
+	const run = (...extra: string[]) =>
+		JSON.parse(execFileSync('node', [CORE_BUILDER, GUARD, ...extra], { encoding: 'utf8' }));
+	const commands = (o: any, event: string): string[] =>
+		(o.hooks[event] || []).flatMap((g: any) => g.hooks.map((h: any) => h.command));
+
+	it('without --owned-hooks registers none of them (a guest launch path)', () => {
+		const o = run();
+		for (const event of ['Stop', 'UserPromptSubmit', 'PreCompact', 'SessionEnd', 'SessionStart']) {
+			assert.equal(o.hooks[event], undefined, event);
+		}
+	});
+
+	it('registers every owned hook, each running its script from the given checkout', () => {
+		const o = run('', '--owned-hooks', REPO);
+		const want: Array<[string, string, string[]]> = [
+			['Stop', '', ['/r o\'x/src/check-pending-tasks.sh']],
+			['UserPromptSubmit', '', ['/r o\'x/src/turn-start.sh']],
+			['PreCompact', '', ['/r o\'x/src/session-handoff.sh', '$TRANSCRIPT_PATH']],
+			['SessionEnd', '', ['/r o\'x/src/session-handoff.sh', '$TRANSCRIPT_PATH']],
+			['SessionStart', '', ['/r o\'x/src/schedule-crons-session-hint.sh']],
+			['SessionStart', 'compact', ['/r o\'x/src/personal-claude-compact-hint.sh']],
+			['SessionStart', 'compact|resume', ['/r o\'x/src/watcher-rearm-session-hint.sh']],
+		];
+		for (const [event, matcher, words] of want) {
+			const group = o.hooks[event].find(
+				(g: any) => g.matcher === matcher && shellParsedWords(g.hooks[0].command)[0] === words[0],
+			);
+			assert.ok(group, `${event}[${matcher}] → ${words[0]}`);
+			// $TRANSCRIPT_PATH stays literal for the hook-run shell, so parse it single-quoted.
+			assert.deepEqual(shellParsedWords(group.hooks[0].command.replace('"$TRANSCRIPT_PATH"', "'$TRANSCRIPT_PATH'")), words);
+		}
+	});
+
+	it('emits the exact strings the old installer wrote, so the sweep recognizes old copies', () => {
+		const o = run('', '--owned-hooks', '/repo');
+		assert.deepEqual(commands(o, 'Stop'), ["bash '/repo/src/check-pending-tasks.sh'"]);
+		assert.deepEqual(commands(o, 'PreCompact'), ["bash '/repo/src/session-handoff.sh' \"$TRANSCRIPT_PATH\""]);
+	});
+
+	it('registers skill-declared hooks as given, and the guard stays first', () => {
+		const rows = [
+			{ event: 'PreToolUse', command: '[ -f /s/a.py ] || exit 0; exec python3 /s/a.py', prior: 'python3 /s/a.py' },
+			{ event: 'Stop', command: '[ -f /s/b.py ] || exit 0; exec python3 /s/b.py', prior: 'python3 /s/b.py' },
+		];
+		const o = run('', '--owned-hooks', '/repo', '--skill-hooks', JSON.stringify(rows));
+		assert.equal(o.hooks.PreToolUse[0].matcher, 'AskUserQuestion');
+		assert.ok(commands(o, 'PreToolUse').includes(rows[0].command));
+		assert.ok(commands(o, 'Stop').includes(rows[1].command));
+		assert.ok(commands(o, 'Stop').includes("bash '/repo/src/check-pending-tasks.sh'"));
+	});
+
+	it('named options do not shift the positional slots', () => {
+		const o = JSON.parse(
+			execFileSync('node', [CORE_BUILDER, '--owned-hooks', '/repo', GUARD, '', SKILL_TELEMETRY], { encoding: 'utf8' }),
+		);
+		assert.equal(shellParsedPath(o.hooks.PreToolUse[0].hooks[0].command), GUARD);
+		assert.equal(shellParsedPath(o.hooks.PostToolUse[0].hooks[0].command), SKILL_TELEMETRY);
+	});
+
+	it('an unparseable or non-array skill-hooks blob exits 3', () => {
+		for (const bad of ['{not json', '{"event":"Stop"}']) {
+			assert.throws(
+				() => execFileSync('node', [CORE_BUILDER, GUARD, '--skill-hooks', bad], { stdio: 'pipe' }),
+				(e: any) => e.status === 3,
+			);
+		}
+	});
+
+	it('sets cleanupPeriodDays so the core transcripts outlive the 30-day default', () => {
+		assert.equal(run().cleanupPeriodDays, 3650);
+	});
+});

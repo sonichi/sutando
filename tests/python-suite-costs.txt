@@ -898,7 +898,6 @@
 0 tests/session-recap-extract.test.py
 0 tests/session-recap-pick-skips-sidechain.test.py
 0 tests/session-runtime.test.py
-0 tests/session-start-schedule-crons-hook.test.py
 0 tests/shell-ci-allowlist-expires.test.py
 0 tests/shell-ci-lane-classification.test.py
 1 tests/shell-project-slug-matches-helper.test.py
@@ -1005,7 +1004,7 @@
 0 tests/start-cli-dangerous-mode-seed.test.py
 0 tests/start-cli-fullscreen-upsell-seed.test.py
 69 tests/start-cli-model-pin.test.py
-0 tests/start-cli-personal-claude-hook-wiring.test.py
+0 tests/start-cli-project-hook-sweep-wiring.test.py
 0 tests/start-cli-relay-loop-dies-with-its-repo.test.py
 63 tests/start-cli-restart-verify.test.py
 98 tests/start-cli-worker-bootstrap.test.py

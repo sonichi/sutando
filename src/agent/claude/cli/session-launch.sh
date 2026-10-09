@@ -224,6 +224,8 @@ PY
 #    it, so a PreToolUse `deny` short-circuits the call instead of hanging.
 #  * obs collector hooks — added to the SAME JSON only when an export
 #    endpoint is set ($SUTANDO_OBS_ENDPOINT).
+#  * Sutando's own lifecycle hooks and the skill-declared ones — here and
+#    nowhere else, so only a session this launcher starts runs them.
 # Built by node helpers, not shell string interpolation (a $REPO with a space
 # or a `"` broke hand-rolled interpolation in the past). Reads REPO. Sets
 # SETTINGS_ARGS and exports SUTANDO_OBS_ENDPOINT.
@@ -246,10 +248,17 @@ resolve_claude_settings_args() {
       echo "obs hooks: settings build failed — capture disabled this session" >&2
     fi
   fi
-  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py")"
+  SKILL_HOOKS_JSON=""
+  if [ -n "${PY:-}" ]; then
+    SKILL_HOOKS_JSON="$("$PY" "$REPO/src/skill_hooks.py" "$REPO" 2>/dev/null)" \
+      || { SKILL_HOOKS_JSON=""; echo "session hooks: skill hook discovery failed — skill hooks NOT registered this session" >&2; }
+  else
+    echo "session hooks: no runnable python — skill hooks NOT registered this session" >&2
+  fi
+  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" --owned-hooks "$REPO" --skill-hooks "$SKILL_HOOKS_JSON")"
   if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
     SETTINGS_ARGS=(--settings "$CLAUDE_SETTINGS_JSON")
-    echo "session hooks: AskUserQuestion guard registered (PreToolUse deny — a headless session can't answer it)"
+    echo "session hooks: AskUserQuestion guard + Sutando lifecycle and skill hooks registered for this session only"
   else
     echo "session hooks: settings build failed — AskUserQuestion guard NOT registered this session" >&2
   fi
@@ -355,11 +364,10 @@ forward_skill_manifest_config() {
   unset _mc_seen _mcrec
 }
 
-# Registers the post-compaction SessionStart hooks: PERSONAL_CLAUDE.md re-inject
-# and the task-watcher re-arm hint. Idempotent.
-install_claude_personal_hook() {
-  bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "session-launch: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
-  bash "$REPO/scripts/install-watcher-rearm-hook.sh" || echo "session-launch: watcher re-arm hook install failed (rc=$?) — hook may be absent" >&2
+# Removes the entries older installers wrote into the project settings file; left
+# there they would also fire, a second time here and in every guest session.
+sweep_project_claude_hooks() {
+  bash "$REPO/src/install-claude-hooks.sh" || echo "session-launch: project hook sweep failed (rc=$?) — old project-level copies may still fire" >&2
 }
 
 # Creates a new tmux session running claude with the fully-assembled args, then

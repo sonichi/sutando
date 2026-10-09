@@ -154,9 +154,8 @@ if [ "${1:-}" = "--print-core-env" ]; then
   exit 0
 fi
 
-# Registers the PERSONAL_CLAUDE.md compaction-reinject hook. Below the probe
-# exit: --print-core-env is a pure read and must not write settings.
-install_claude_personal_hook
+# Below the probe exit: --print-core-env is a pure read and must not write settings.
+sweep_project_claude_hooks
 
 # Optional working-directory override for the core `claude` process.
 #   - Unset (upstream default): no override — the core launches from $REPO (the

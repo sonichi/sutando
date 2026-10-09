@@ -1,7 +1,7 @@
 """
 Tests for the PERSONAL_CLAUDE.md compaction re-inject hook:
   - src/personal-claude-compact-hint.sh (hint output)
-  - scripts/install-personal-claude-hook.sh (settings.json wiring)
+  - src/agent/claude/cli/build-core-settings.mjs (launch-settings registration)
 
 Discovered by CI's Python test runner alongside other *.test.py files.
 
@@ -10,8 +10,7 @@ Covers:
   - Per-host hosts/<host>/PERSONAL_CLAUDE.md wins over workspace root
   - Missing file → no output, exit 0 (silent no-op)
   - COMPACT-CORE-END marker → only the core is injected + pointer to the tail
-  - Installer: fresh install registers under matcher "compact"
-  - Installer: idempotent (no duplicate on re-run)
+  - The core's launch settings register it once, under matcher "compact"
 """
 
 import json
@@ -22,7 +21,7 @@ import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HINT = os.path.join(REPO, "src", "personal-claude-compact-hint.sh")
-INSTALLER = os.path.join(REPO, "scripts", "install-personal-claude-hook.sh")
+BUILDER = os.path.join(REPO, "src", "agent", "claude", "cli", "build-core-settings.mjs")
 
 sys.path.insert(0, REPO)
 from src.util_paths import _host_label  # noqa: E402
@@ -120,49 +119,19 @@ with tempfile.TemporaryDirectory() as ws:
     except (json.JSONDecodeError, KeyError) as e:
         fail("marker split", f"bad output {r.stdout[:200]!r} ({e})")
 
-# ── Test 5: installer fresh install registers matcher "compact" ───────────────
-with tempfile.TemporaryDirectory() as tmp:
-    env = dict(os.environ)
-    env["SUTANDO_CLAUDE_WORKING_DIR"] = tmp
-    r = subprocess.run(
-        ["bash", INSTALLER], capture_output=True, text=True, env=env, timeout=30
-    )
-    settings_path = os.path.join(tmp, ".claude", "settings.json")
-    try:
-        with open(settings_path) as f:
-            data = json.load(f)
-        entries = data["hooks"]["SessionStart"]
-        entry = next(
-            (
-                e
-                for e in entries
-                if any("personal-claude-compact-hint.sh" in h.get("command", "") for h in e.get("hooks", []))
-            ),
-            None,
-        )
-        if r.returncode == 0 and entry is not None and entry.get("matcher") == "compact":
-            ok('installer registers hook under matcher "compact"')
-        else:
-            fail("installer fresh", f"rc={r.returncode} entry={entry!r} err={r.stderr[:200]!r}")
-    except (OSError, json.JSONDecodeError, KeyError) as e:
-        fail("installer fresh", f"{e} out={r.stdout[:200]!r} err={r.stderr[:200]!r}")
-
-    # ── Test 6: idempotent re-run — no duplicate entry ────────────────────────
-    r2 = subprocess.run(
-        ["bash", INSTALLER], capture_output=True, text=True, env=env, timeout=30
-    )
-    with open(settings_path) as f:
-        data2 = json.load(f)
-    cmds = [
-        h["command"]
-        for e in data2["hooks"]["SessionStart"]
-        for h in e.get("hooks", [])
-        if "personal-claude-compact-hint.sh" in h.get("command", "")
-    ]
-    if r2.returncode == 0 and "already installed" in r2.stdout and len(cmds) == 1:
-        ok("installer idempotent — single entry after re-run")
+# ── Test 5: the core's launch settings register it once, matcher "compact" ───
+r = subprocess.run(["node", BUILDER, "/x/guard.py", "", "--owned-hooks", REPO],
+                   capture_output=True, text=True, timeout=30)
+try:
+    groups = json.loads(r.stdout)["hooks"]["SessionStart"]
+    hits = [(g.get("matcher"), h["command"]) for g in groups for h in g.get("hooks", [])
+            if "personal-claude-compact-hint.sh" in h.get("command", "")]
+    if len(hits) == 1 and hits[0][0] == "compact" and HINT in hits[0][1]:
+        ok('launch settings register the hint once under matcher "compact"')
     else:
-        fail("installer idempotent", f"rc={r2.returncode} n={len(cmds)} out={r2.stdout[:120]!r}")
+        fail("launch-settings registration", f"hits={hits!r}")
+except (json.JSONDecodeError, KeyError) as e:
+    fail("launch-settings registration", f"{e} out={r.stdout[:200]!r} err={r.stderr[:200]!r}")
 
 
 # ── Test 7: hook is cwd-independent (hooks run from the session cwd) ──────────
@@ -188,35 +157,6 @@ with tempfile.TemporaryDirectory() as ws:
             fail("cwd independence", f"ctx={ctx[:120]!r}")
     except (json.JSONDecodeError, KeyError) as e:
         fail("cwd independence", f"bad output {r.stdout[:200]!r} ({e})")
-
-# ── Test 8b: installer skips (not crashes) on a clean Mac with no dev tools ───
-# "No CLT" fixture per tests/python-binary-sh.test.sh: fake xcode-select (exit 2).
-with tempfile.TemporaryDirectory() as tmp:
-    noclt = os.path.join(tmp, "noclt")
-    os.makedirs(noclt)
-    with open(os.path.join(noclt, "xcode-select"), "w") as f:
-        f.write("#!/bin/sh\nexit 2\n")
-    os.chmod(os.path.join(noclt, "xcode-select"), 0o755)
-
-    cwd = os.path.join(tmp, "cwd")
-    os.makedirs(cwd)
-    env = dict(os.environ)
-    env["SUTANDO_CLAUDE_WORKING_DIR"] = cwd
-    env["PATH"] = f"{noclt}:/usr/bin:/bin"
-    env["OSTYPE"] = "darwin25"
-    env.pop("SUTANDO_PY", None)
-    r = subprocess.run(
-        ["bash", INSTALLER], capture_output=True, text=True, env=env, timeout=30
-    )
-    settings_path = os.path.join(cwd, ".claude", "settings.json")
-    if r.returncode == 0 and not os.path.exists(settings_path):
-        ok("installer skips cleanly on a clean Mac with no developer tools")
-    else:
-        fail(
-            "installer clean-mac stub skip",
-            f"rc={r.returncode} settings_exists={os.path.exists(settings_path)} "
-            f"out={r.stdout[:160]!r} err={r.stderr[:160]!r}",
-        )
 
 # ── Test 8: scope gate — non-core session (no SUTANDO_CORE_SESSION) is silent ──
 with tempfile.TemporaryDirectory() as ws:

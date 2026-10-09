@@ -145,7 +145,7 @@ fi
 # headless (no TTY, --dangerously-skip-permissions) and can hang on the exact
 # same unattended prompts (folder-trust, bypass-permissions, AskUserQuestion)
 # if this is skipped.
-install_claude_personal_hook
+sweep_project_claude_hooks
 resolve_claude_cwd_args
 resolve_claude_config_dir_and_seed
 resolve_claude_settings_args

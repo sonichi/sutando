@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 
-One owner: the installer registers what this returns and the health probe
-verifies exactly that, so a drifted second copy cannot make them disagree.
+One owner: the core's launch settings register what this returns and the health
+probe verifies exactly that, so a drifted second copy cannot make them disagree.
 """
 from __future__ import annotations
 
@@ -58,12 +58,11 @@ def discover(repo_dir: Path) -> list[tuple[str, str, str, str]]:
     return out
 
 
+def as_json(repo_dir: Path) -> str:
+    """The rows build-core-settings.mjs registers via --skill-hooks."""
+    return json.dumps([{"event": e, "command": c, "prior": p} for e, _t, c, p in discover(repo_dir)])
+
+
 if __name__ == "__main__":
     import sys
-    # NUL-framed: two fields carry a repo path, and a path may contain any byte
-    # except NUL — including the `|` the reader would otherwise split on.
-    out = sys.stdout.buffer
-    for row in discover(Path(sys.argv[1])):
-        for field in row:
-            out.write(field.encode() + b"\0")
-    out.flush()
+    print(as_json(Path(sys.argv[1])))

@@ -37,12 +37,27 @@
 
 import path from 'node:path';
 
-const guardHook = process.argv[2];
+const CLEANUP_PERIOD_DAYS = 3650;
+
+// --owned-hooks <repo> and --skill-hooks <json> (skill_hooks.py rows; exit 3 if unparseable)
+// may sit anywhere in argv; lifting them out first keeps the positional slots' meaning.
+const named = {};
+const argv = [process.argv[0], process.argv[1]];
+for (let i = 2; i < process.argv.length; i++) {
+	const a = process.argv[i];
+	if (a === '--owned-hooks' || a === '--skill-hooks') {
+		named[a] = process.argv[++i] ?? '';
+	} else {
+		argv.push(a);
+	}
+}
+
+const guardHook = argv[2];
 if (!guardHook) {
-	process.stderr.write('usage: build-core-settings.mjs <guard-hook-path> [<obs-settings-json>]\n');
+	process.stderr.write('usage: build-core-settings.mjs <guard-hook-path> [<obs-settings-json>] [--owned-hooks <repo>] [--skill-hooks <json>]\n');
 	process.exit(2);
 }
-const obsJson = process.argv[3] || '';
+const obsJson = argv[3] || '';
 
 // POSIX single-quote a string so it survives as one shell word regardless of
 // spaces, $, backticks, or quotes: wrap in '…' and replace each embedded ' with
@@ -89,7 +104,7 @@ if (obsJson.trim()) {
 // Skill-usage product telemetry: always-on registration (the hook itself
 // respects the telemetry opt-out). Kept OUT of the obs blob so the feature
 // counter never depends on the prompt/tool-capture opt-in.
-const skillTelemetryHook = process.argv[4] || '';
+const skillTelemetryHook = argv[4] || '';
 let skillTelemetrySettings = null;
 if (skillTelemetryHook.trim()) {
 	skillTelemetrySettings = {
@@ -101,7 +116,7 @@ if (skillTelemetryHook.trim()) {
 
 // Always-on: the connector's write scopes are broken, so the deny must reach the
 // caller. The hook re-checks the tool name, so the matcher is belt-and-braces.
-const gmailWriteGuardHook = process.argv[5] || '';
+const gmailWriteGuardHook = argv[5] || '';
 let gmailWriteGuardSettings = null;
 if (gmailWriteGuardHook.trim()) {
 	gmailWriteGuardSettings = {
@@ -113,7 +128,7 @@ if (gmailWriteGuardHook.trim()) {
 
 // Both events point at one script: the read (PostToolUse) records the snapshot the
 // write (PreToolUse) requires. The hook re-checks toolkit/action itself.
-const gdocsWriteGuardHook = process.argv[6] || '';
+const gdocsWriteGuardHook = argv[6] || '';
 let gdocsWriteGuardSettings = null;
 if (gdocsWriteGuardHook.trim()) {
 	// The hook imports src/ from a CONFIGURED root, never a walk from __file__:
@@ -127,7 +142,7 @@ if (gdocsWriteGuardHook.trim()) {
 // Always-on: a native Calendar/Reminders/Contacts command raises a macOS
 // permission prompt, so the deny must reach the model before the command runs;
 // the file tools are matched so the consent record cannot be written directly.
-const nativePimGuardHook = process.argv[7] || '';
+const nativePimGuardHook = argv[7] || '';
 const NATIVE_PIM_GUARD_MATCHER = 'Bash|Write|Edit|MultiEdit|NotebookEdit';
 let nativePimGuardSettings = null;
 if (nativePimGuardHook.trim()) {
@@ -138,8 +153,51 @@ if (nativePimGuardHook.trim()) {
 	};
 }
 
-process.stdout.write(
-	JSON.stringify(
-		mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings, gdocsWriteGuardSettings, nativePimGuardSettings),
-	),
+// [event, matcher, script under src/, args]. Registered nowhere else, so a session launched
+// without this JSON (a contributor's, a review bot's, a `claude -p` the core spawns) runs none.
+const OWNED_HOOKS = [
+	['Stop', '', 'check-pending-tasks.sh', ''],
+	// begin_turn is the Stop gate's only reset, so without this it never re-arms.
+	['UserPromptSubmit', '', 'turn-start.sh', ''],
+	['PreCompact', '', 'session-handoff.sh', ' "$TRANSCRIPT_PATH"'],
+	['SessionEnd', '', 'session-handoff.sh', ' "$TRANSCRIPT_PATH"'],
+	['SessionStart', '', 'schedule-crons-session-hint.sh', ''],
+	['SessionStart', 'compact', 'personal-claude-compact-hint.sh', ''],
+	['SessionStart', 'compact|resume', 'watcher-rearm-session-hint.sh', ''],
+];
+const ownedRepo = named['--owned-hooks'] || '';
+let ownedSettings = null;
+if (ownedRepo.trim()) {
+	ownedSettings = { hooks: {} };
+	for (const [event, matcher, script, args] of OWNED_HOOKS) {
+		const command = `bash ${shq(path.join(ownedRepo, 'src', script))}${args}`;
+		(ownedSettings.hooks[event] ||= []).push({ matcher, hooks: [{ type: 'command', command }] });
+	}
+}
+
+let skillHookSettings = null;
+const skillHooksJson = named['--skill-hooks'] || '';
+if (skillHooksJson.trim()) {
+	let rows;
+	try {
+		rows = JSON.parse(skillHooksJson);
+		if (!Array.isArray(rows)) throw new Error('not a JSON array');
+	} catch (e) {
+		process.stderr.write(`build-core-settings: skill-hooks JSON is unparseable: ${e.message}\n`);
+		process.exit(3);
+	}
+	skillHookSettings = { hooks: {} };
+	for (const row of rows) {
+		if (!row || typeof row.event !== 'string' || typeof row.command !== 'string') continue;
+		(skillHookSettings.hooks[row.event] ||= []).push({ matcher: '', hooks: [{ type: 'command', command: row.command }] });
+	}
+}
+
+const settings = mergeHookSettings(
+	guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings, gdocsWriteGuardSettings,
+	nativePimGuardSettings, ownedSettings, skillHookSettings,
 );
+// The 30-day default deletes the core's transcripts, its only conversation record;
+// ten years is "keep", since 0 fails validation.
+settings.cleanupPeriodDays = CLEANUP_PERIOD_DAYS;
+process.stdout.write(JSON.stringify(settings));
