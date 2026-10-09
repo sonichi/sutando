@@ -1307,6 +1307,16 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(json.loads((hot / 'archive' / b_path.name).read_text())['status'], 'kept_private')
         self.assertEqual(self._messages(), sent)
 
+    def test_a_delivered_record_whose_wire_body_is_unknown_never_yields_a_manual_send(self):
+        def garble():
+            rec = outbox.read_item(self.outbox, TID)
+            outbox._write_item(self.outbox, TID, dict(rec, payload='{not json'))
+        result, posts = self._delivered_then_late('BODY-C a different reply', before_late=garble)
+        said = [l for l in self.lines if UNSENT in l]
+        self.assertEqual(len(said), 1, self.lines)
+        self.assertNotIn('by hand', said[0])
+        self.assertIn('may already have been sent', said[0])
+
     def test_invariant_record_ownership_stays_bound_to_its_body(self):
         """Legacy state: B's decision archived and a stale live C under the same id,
         no reservations. B replays against its own decision; C is a new body with
@@ -1343,21 +1353,23 @@ class TerminalResultMovedOnce(unittest.TestCase):
                 patch.object(gw, '_owner_review_dm', return_value='!ownerdm:ag2.space'):
             result, hot, b_path = self._reviewed('[file: /tmp/b.txt]\nBODY-B')
             self.bridge(self.core())
-            real, threads = trg._record_of, []
+            # Between the lookup's archive check and its read of the live record.
+            hook = '_record_digest' if hasattr(trg, '_record_digest') else '_record_of'
+            real, threads = getattr(trg, hook), []
+
+            decided = dict(json.loads(b_path.read_text()), status='kept_private')
+            b_path.write_text(json.dumps(decided))           # the owner's decision, already recorded
 
             def resolve_and_archive():
-                b = json.loads(b_path.read_text())
-                b['status'] = 'kept_private'
-                trg.update_record(b_path, b)
-                gw._archive_resolved_review(b_path, b)
+                gw._archive_resolved_review(b_path, decided)
 
             def archive_inside_lookup(path, *rest):
-                if not threads and path.name == b_path.name:
+                if not threads and path == b_path:
                     threads.append(threading.Thread(target=resolve_and_archive))
                     threads[0].start()
                     threads[0].join(0.2)
                 return real(path, *rest)
-            with patch.object(trg, '_record_of', archive_inside_lookup):
+            with patch.object(trg, hook, archive_inside_lookup):
                 self._late(result, '[file: /tmp/b.txt]\nBODY-B')
             threads[0].join(5)
         self.assertEqual(list(hot.glob('wr_*.json')), [], 'a fresh id was issued for a decided body')

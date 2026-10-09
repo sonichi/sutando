@@ -363,6 +363,29 @@ def behavioral() -> list:
             fails.append("with every id taken the result stays withheld, unsaved")
         if guard.suppressed_record_for(state, "task-none", "D body").exists():
             fails.append("a body never journalled has no suppression record")
+        stale = guard.withheld_review_path(state, "task-stale")
+        guard._reserve(stale, guard._body_digest("B body"))
+        stale.write_text(json.dumps({"withheld_body": "C body"}), encoding="utf-8")
+        replay = guard.materialize_withheld_verdict(
+            guard.classify_result_for_tier("B body", "team", REPO, secret_filter=_leaky),
+            "B body", state, "task-stale", context, now=1000)
+        if (json.loads(stale.read_text())["withheld_body"] != "C body"
+                or guard.withheld_review_artifact(state, "task-stale", "B body") == stale
+                or "pending private owner review" not in (replay.reason or "")):
+            fails.append("an id's record counts only if it holds the body the id was issued to")
+        live = guard.withheld_review_artifact(state, "task-ledger", "B body")
+        record = json.loads(live.read_text())
+        if not guard.update_record(live, dict(record, status="kept_private")):
+            fails.append("an update of a live record is written")
+        if not guard.archive_record(live) or live.exists() or not (live.parent / "archive" / live.name).exists():
+            fails.append("a resolved record moves into archive/ under the ledger lock")
+        if guard.withheld_review_artifact(state, "task-ledger", "B body") != live.parent / "archive" / live.name:
+            fails.append("an archived record stays its body's decision, never a new id")
+        if guard.archive_record(live):
+            fails.append("archiving a record that is gone reports failure")
+        gone = guard.withheld_review_path(state, "task-gone")
+        if guard.update_record(gone, {"withheld_body": "x"}) or gone.exists():
+            fails.append("an update never recreates a record that is gone or archived")
     return fails
 
 
