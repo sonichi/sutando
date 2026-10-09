@@ -80,20 +80,6 @@ originals = {name: getattr(bridge, name) for name in (
     "_STATE", "_WITHHELD_DM_CACHE", "_WITHHELD_CONTROL_DIR", "_GATEWAY_OWNER_DM_HINT",
     "_reenroll_identity", "_tier_for", "_req", "_match_review_decision", "_log",
     "team_result_guard")}
-spy_calls = {"claim_withheld_decision": 0, "withheld_claim_publishable": 0}
-
-
-def spied(name):
-    real = getattr(guard, name)
-
-    def wrapper(*args, **kwargs):
-        spy_calls[name] += 1
-        return real(*args, **kwargs)
-    return wrapper
-
-
-for _name in spy_calls:
-    setattr(guard, _name, spied(_name))
 bridge.team_result_guard = guard
 bridge._STATE = root / "state"
 bridge._WITHHELD_DM_CACHE = bridge._STATE / "withheld-review-dm.json"
@@ -117,6 +103,8 @@ def fake_req(method, path, payload=None, timeout=35):
     if path == "/v1/room" and payload.get("op") == "message":
         return {"ok": True, "event_id": f"$event-{n}"}
     if path == "/v1/room" and payload.get("op") == "edit":
+        if fail_edits[0] == "reject":
+            return {"ok": False}
         if fail_edits[0]:
             raise TimeoutError("card edit unavailable")
         return {"ok": True, "event_id": f"$edit-{n}"}
@@ -223,32 +211,85 @@ YES = {"status": "kept_private", "decision": "sensitive", "card_resolution_pendi
 NO = {"status": "publish_pending", "decision": "false_positive",
       "card_resolution_pending": True}
 
-# 6. Legacy upgrade: an older writer left a live publish_pending (no claim id) beside
-# an archived kept_private, and stopped before its POST; the retry loop must not post.
-path, rid = new_review("task-legacy")
-stale = json.loads(path.read_text())
-bridge._handle_review_decision(decision("Yes", rid, "legacy-yes"))
-stale.update({"status": "publish_pending", "resolved_at": 1001.0,
-              "decision": "false_positive", "card_resolution_pending": True})
-bridge._atomic_private_json(path, stale)
-before_state = frozen(path)
-before = len(shared_posts())
-bridge._retry_pending_publications()
-check(len(shared_posts()) == before, "a legacy publish_pending beside kept_private must not post")
-check(unchanged(path, before_state), "the refused legacy record is left byte-for-byte")
-check(json.loads((path.parent / "archive" / path.name).read_text())["status"] == "kept_private",
-      "the archived keep-private decision survives the retry")
-check(any(path.stem in line and "publication refused" in line for line in logs),
-      "the refused publication is logged for the owner")
+def card_edits_since(mark):
+    return [p["body"] for _m, u, p in calls[mark:] if u == "/v1/room" and p.get("op") == "edit"]
 
-# 7. Every non-awaiting state refuses both a claim and a publication, and is not touched.
+
+# 6. Legacy upgrade through the whole retry beat: a claimless live publish_pending beside an
+# archived kept_private. Nothing posts, nothing contradicts the archive, the card is restored.
+for card_pending in (True, False):
+    path, rid = new_review(f"task-legacy-{card_pending}")
+    stale = json.loads(path.read_text())
+    bridge._handle_review_decision(decision("Yes", rid, f"legacy-yes-{card_pending}"))
+    archived = path.parent / "archive" / path.name
+    stale.update({"status": "publish_pending", "resolved_at": 1001.0,
+                  "decision": "false_positive", "card_resolution_pending": card_pending})
+    bridge._atomic_private_json(path, stale)
+    legacy_bytes = path.read_bytes()
+    live_state, archive_state = frozen(path), frozen(archived)
+    before, mark = len(shared_posts()), len(calls)
+    fail_edits[0] = True if card_pending else "reject"
+    bridge._retry_withheld_reviews()
+    fail_edits[0] = False
+    check(len(shared_posts()) == before and unchanged(path, live_state)
+          and unchanged(archived, archive_state)
+          and not any("False positive" in b for b in card_edits_since(mark)),
+          f"legacy pending={card_pending}, card unreachable: record, archive and card untouched")
+    check(any(path.stem in line and "left untouched" in line for line in logs),
+          f"legacy pending={card_pending}: the deferral is logged for the owner")
+    mark = len(calls)
+    bridge._retry_withheld_reviews()
+    bridge._retry_withheld_reviews()
+    edits = [b for b in card_edits_since(mark) if rid in b]
+    superseded = list((path.parent / "archive" / "superseded").glob(f"{path.stem}.*.json"))
+    check(len(shared_posts()) == before, f"legacy pending={card_pending}: nothing posts")
+    check(len(edits) == 1 and "Kept private" in edits[0],
+          f"legacy pending={card_pending}: the card is restored to the archive once: {edits}")
+    check(not path.exists() and unchanged(archived, archive_state)
+          and any(p.read_bytes() == legacy_bytes for p in superseded),
+          f"legacy pending={card_pending}: the live copy is retired; the archive is untouched")
+
+# 6b. Each retry that touches a record or card defers on its own: the card retry reconciles
+# a stale live "published", and a direct card resolution never shows "False positive".
+for label in ("stale-published", "direct-resolve"):
+    path, rid = new_review(f"task-defer-{label}")
+    stale = json.loads(path.read_text())
+    bridge._handle_review_decision(decision("Yes", rid, f"defer-{label}"))
+    archived = path.parent / "archive" / path.name
+    if label == "stale-published":
+        stale.update({"status": "published", "decision": "false_positive",
+                      "card_resolution_pending": False})
+    else:
+        stale.update({"status": "publish_pending", "decision": "false_positive",
+                      "card_resolution_pending": True})
+    bridge._atomic_private_json(path, stale)
+    legacy_bytes, archive_state = path.read_bytes(), frozen(archived)
+    mark = len(calls)
+    if label == "stale-published":
+        bridge._retry_withheld_reviews()
+    else:
+        check(bridge._resolve_review_card(path, dict(stale)) is False,
+              "a card resolution beside an archived decision reports nothing resolved")
+    edits = [b for b in card_edits_since(mark) if rid in b]
+    superseded = list((path.parent / "archive" / "superseded").glob(f"{path.stem}.*.json"))
+    check(len(edits) == 1 and "Kept private" in edits[0] and not path.exists()
+          and unchanged(archived, archive_state)
+          and any(p.read_bytes() == legacy_bytes for p in superseded),
+          f"{label}: card restored to the archive and copy retired, archive untouched: {edits}")
+
+# 7. Every non-awaiting or unproven state refuses a claim, a publication and the whole
+# retry beat, and is not touched.
 claim_id = "ab" * 16
 base_record = {"review_id": "wr_0000000000000000", "status": "awaiting_owner",
                "dm_room_id": DM, "owner": OWNER, "withheld_body": "SECRET-BODY",
                "context": {"channel_id": SHARED}}
 cases = {
     "legacy-publish_pending": {**base_record, **NO},
-    "malformed-claim-publish_pending": {**base_record, **NO, "decision_claim_id": ["x"]},
+    "list-claim-publish_pending": {**base_record, **NO, "decision_claim_id": ["x"]},
+    "short-claim-publish_pending": {**base_record, **NO, "decision_claim_id": "ab"},
+    "nonhex32-claim-publish_pending": {**base_record, **NO, "decision_claim_id": "z" * 32},
+    "unissued-hex32-claim-publish_pending": {**base_record, **NO, "decision_claim_id": claim_id},
+    "claim-issued-for-another-review": {**base_record, **NO, "decision_claim_id": claim_id},
     "wrong-decision-publish_pending": {**base_record, **NO, "decision": "sensitive",
                                        "decision_claim_id": claim_id},
     "publish_failed": {**base_record, "status": "publish_failed",
@@ -258,19 +299,29 @@ cases = {
                   "decision_claim_id": claim_id},
     "claimed-but-archived-kept_private": {**base_record, **NO, "decision_claim_id": claim_id},
     "awaiting-but-archived-kept_private": dict(base_record),
+    "pending-but-archived-unreadable": {**base_record, **NO, "decision_claim_id": claim_id},
+    "pending-but-archived-non-dict": {**base_record, **NO, "decision_claim_id": claim_id},
     "malformed-json": "{not json",
     "non-dict-json": ["SECRET-BODY"],
     "missing": None,
 }
+issued_here = ("wrong-decision", "publish_failed", "kept_private", "published", "claimed-but",
+               "pending-but")
 for label, content in cases.items():
     bridge._STATE = root / "states" / label
     directory = bridge._STATE / "withheld-team-results"
     directory.mkdir(parents=True)
     case_path = directory / "wr_0000000000000000.json"
+    (directory / "claims").mkdir()
+    if label.startswith(issued_here):
+        (directory / "claims" / f"{case_path.stem}.{claim_id}").touch()
+    if label == "claim-issued-for-another-review":
+        (directory / "claims" / f"wr_1111111111111111.{claim_id}").touch()
     if "archived" in label:
         (directory / "archive").mkdir()
         (directory / "archive" / case_path.name).write_text(
-            json.dumps({**base_record, **YES}))
+            "{unreadable" if label.endswith("unreadable") else "[]" if label.endswith("non-dict")
+            else json.dumps({**base_record, **YES}))
     if isinstance(content, str):
         case_path.write_text(content)
     elif content is not None:
@@ -279,23 +330,29 @@ for label, content in cases.items():
     before = len(shared_posts())
     claims = [guard.claim_withheld_decision(case_path, dict(u)) for u in (YES, NO)]
     published = bridge._publish_review(case_path, {**base_record, "decision_claim_id": claim_id})
-    bridge._retry_pending_publications()
+    bridge._retry_withheld_reviews()
     check(claims == [None, None] and published is False and len(shared_posts()) == before,
           f"{label}: claims {claims}, publish {published}, "
           f"{len(shared_posts()) - before} posts")
-    check(unchanged(case_path, before_state), f"{label}: record bytes or mtime changed")
+    # A decided record may be archived by the beat, as it always was: same bytes, moved.
+    moved = directory / "archive" / case_path.name
+    landed = moved if not case_path.exists() and "archived" not in label else case_path
+    check(unchanged(landed, before_state), f"{label}: record bytes or mtime changed")
 bridge._STATE = root / "state"
 
-# 7b. A caller holding one well-formed claim id never publishes a record that carries another.
+# 7b. Exact claim: both ids were issued for this review, but the caller's is not the one
+# the live record carries, so it never publishes.
 bridge._STATE = root / "states" / "other-claim-id"
 directory = bridge._STATE / "withheld-team-results"
-directory.mkdir(parents=True)
+(directory / "claims").mkdir(parents=True)
 case_path = directory / "wr_0000000000000000.json"
+for issued in (claim_id, "cd" * 16):
+    (directory / "claims" / f"{case_path.stem}.{issued}").touch()
 case_path.write_text(json.dumps({**base_record, **NO, "decision_claim_id": "cd" * 16}))
 before_state = frozen(case_path)
 before = len(shared_posts())
 check(not guard.withheld_claim_publishable(case_path, claim_id),
-      "a different well-formed claim id is not the release claim")
+      "a different issued claim id is not the live record's release claim")
 check(bridge._publish_review(case_path, {**base_record, **NO, "decision_claim_id": claim_id})
       is False and len(shared_posts()) == before,
       "a snapshot with another claim id must not post")
@@ -303,15 +360,53 @@ check(unchanged(case_path, before_state), "other-claim-id: record bytes or mtime
 bridge._STATE = root / "state"
 
 # 8. Positive control: a release claimed by this writer, interrupted before its POST,
-# is still published exactly once by the retry loop.
+# is still published exactly once by the retry beat.
 path, rid = new_review("task-claimed-retry")
 claimed = guard.claim_withheld_decision(path, dict(NO))
-check(claimed is not None and len(claimed["decision_claim_id"]) == 32,
-      "a claim on an awaiting record carries a fresh claim id")
+check(claimed is not None
+      and (path.parent / "claims" / f"{path.stem}.{claimed['decision_claim_id']}").is_file(),
+      "a claim on an awaiting record is recorded in the claim ledger")
 before = len(shared_posts())
-bridge._retry_pending_publications()
-bridge._retry_pending_publications()
+bridge._retry_withheld_reviews()
+bridge._retry_withheld_reviews()
 check(len(shared_posts()) - before == 1, "the claimed release is published exactly once")
+check(guard.retire_superseded_record(path) is False,
+      "with no archived decision there is nothing to retire")
+
+# 9. Delegation: the bridge acts on what the injected guard answers. Each fake returns an
+# answer the real guard would not give for that state, so a bypass changes the outcome.
+real = {name: getattr(guard, name) for name in (
+    "claim_withheld_decision", "withheld_claim_publishable",
+    "archived_withheld_decision", "retire_superseded_record")}
+seen = []
+path, rid = new_review("task-delegate-claim")
+awaiting = path.read_bytes()
+guard.claim_withheld_decision = lambda p, u: seen.append(("claim", p)) and None
+bridge._handle_review_decision(decision("Yes", rid, "delegate-claim"))
+check(("claim", path) in seen and path.read_bytes() == awaiting,
+      "the bridge's decision is the injected guard's claim answer (refused: nothing written)")
+SENTINEL = "5e" * 16
+bridge._STATE = root / "states" / "delegate-publish"
+directory = bridge._STATE / "withheld-team-results"
+directory.mkdir(parents=True)
+case_path = directory / "wr_0000000000000000.json"
+legacy = {**base_record, **NO, "decision_claim_id": SENTINEL}
+case_path.write_text(json.dumps(legacy))
+guard.withheld_claim_publishable = lambda p, c: seen.append(("publish", c)) or c == SENTINEL
+before = len(shared_posts())
+bridge._publish_review(case_path, legacy)
+check(("publish", SENTINEL) in seen and len(shared_posts()) == before + 1,
+      "the bridge's publication gate is the injected guard's answer")
+guard.archived_withheld_decision = lambda p: {**base_record, **YES, "decision": "sensitive",
+                                              "dm_event_id": "$sentinel-card"}
+guard.retire_superseded_record = lambda p: seen.append(("retire", p)) or True
+mark = len(calls)
+check(bridge._defers_to_archive(case_path) and ("retire", case_path) in seen
+      and any(p.get("event_id") == "$sentinel-card" for _m, _u, p in calls[mark:]),
+      "the bridge's archive authority and retirement are the injected guard's")
+for name, function in real.items():
+    setattr(guard, name, function)
+bridge._STATE = root / "state"
 
 # 5. Race: both replies matched, then released together; exactly one decision wins.
 for round_no in range(25):
@@ -344,9 +439,6 @@ for round_no in range(25):
           and (not winner_published or not kept_edits) and len(losers) == 1,
           f"race round {round_no}: status {record['status']}, {len(posts)} posts, "
           f"{len(kept_edits)} keep-private edits, {len(losers)} ignored replies")
-
-check(all(count > 0 for count in spy_calls.values()),
-      f"the bridge delegates claims and publication checks to the guard: {spy_calls}")
 
 builtins.open, io.open, os.open = _real_open, _real_io_open, _real_os_open
 check(bridge.TOKEN == "dummy-test-token", "the bridge took the test token, not a host one")

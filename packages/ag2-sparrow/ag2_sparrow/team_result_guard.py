@@ -417,16 +417,51 @@ def _live_undecided_record(path: Path) -> "dict | None":
     return record if isinstance(record, dict) else None
 
 
+def _issued_claim(path: Path, claim_id: str) -> Path:
+    return path.parent / "claims" / f"{path.stem}.{claim_id}"
+
+
 def withheld_claim_publishable(path: Path, claim_id) -> bool:
-    """True only for the exact release claim claim_withheld_decision wrote; a legacy,
-    foreign or ambiguous pending record never publishes."""
+    """True only when claim_withheld_decision issued this claim id for this review
+    (its ledger entry) and the live record still carries it as a pending release."""
     path = Path(path)
+    if not (isinstance(claim_id, str) and len(claim_id) == 32
+            and all(c in "0123456789abcdef" for c in claim_id)):
+        return False
     with withheld_decision_lock(path.parent):
         record = _live_undecided_record(path)
-    return (record is not None and record.get("status") == "publish_pending"
+        issued = _issued_claim(path, claim_id).is_file()
+    return (issued and record is not None and record.get("status") == "publish_pending"
             and record.get("decision") == "false_positive"
-            and isinstance(claim_id, str) and len(claim_id) == 32
             and record.get("decision_claim_id") == claim_id)
+
+
+def archived_withheld_decision(path: Path) -> "dict | None":
+    """The archived decision that owns this review, or None if there is none; {}
+    when it exists but is unreadable. A live copy beside it must never act."""
+    path = Path(path)
+    archived = path.parent / "archive" / path.name
+    with withheld_decision_lock(path.parent):
+        if not archived.exists():
+            return None
+        try:
+            record = json.loads(archived.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+    return record if isinstance(record, dict) else {}
+
+
+def retire_superseded_record(path: Path) -> bool:
+    """Move a live copy that an archived decision outranks into archive/superseded/,
+    so the hot directory again agrees with the archive. The archive is untouched."""
+    path = Path(path)
+    with withheld_decision_lock(path.parent):
+        if not (path.parent / "archive" / path.name).exists() or not path.exists():
+            return False
+        target = path.parent / "archive" / "superseded"
+        target.mkdir(mode=0o700, exist_ok=True)
+        os.replace(path, target / f"{path.stem}.{os.urandom(4).hex()}.json")
+        return True
 
 
 def claim_withheld_decision(path: Path, updates: dict) -> "dict | None":
@@ -437,7 +472,17 @@ def claim_withheld_decision(path: Path, updates: dict) -> "dict | None":
         record = _live_undecided_record(path)
         if record is None or record.get("status") != "awaiting_owner":
             return None
-        record.update(updates, decision_claim_id=os.urandom(16).hex())
+        claim_id = os.urandom(16).hex()
+        ledger = _issued_claim(path, claim_id)
+        ledger.parent.mkdir(mode=0o700, exist_ok=True)
+        os.close(os.open(ledger, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        if os.name != "nt":  # the ledger entry is durable before the record names it
+            directory = os.open(ledger.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        record.update(updates, decision_claim_id=claim_id)
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:

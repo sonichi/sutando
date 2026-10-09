@@ -976,16 +976,47 @@ def _resolved_review_body(record: dict) -> str:
     return f"**Private result review `{rid}` resolved**\n\n✓ {outcome}"
 
 
-def _resolve_review_card(path: Path, record: dict) -> bool:
+def _edit_review_card(record: dict) -> "dict | None":
     room = str(record.get("dm_room_id") or "")
     event_id = str(record.get("dm_event_id") or "")
     if not room.startswith("!") or not event_id.startswith("$"):
-        return False
+        return None
     answer = _req("POST", "/v1/room", {
         "op": "edit", "room_id": room, "event_id": event_id,
         "body": _resolved_review_body(record),
     }, timeout=20)
     if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
+        return None
+    return answer
+
+
+def _defers_to_archive(path: Path) -> bool:
+    """True when an archived decision owns this review: the live copy never acts. The
+    card is restored to the archived outcome first; only then is the copy retired."""
+    archived = team_result_guard.archived_withheld_decision(path)
+    if archived is None:
+        return False
+    try:
+        restored = (archived.get("status") in ("kept_private", "published")
+                    and _edit_review_card(archived) is not None)
+    except Exception as exc:  # noqa: BLE001 — both stay untouched; next poll retries
+        restored = False
+        _log(f"withheld review {path.stem}: archived-outcome card edit deferred: {exc}")
+    if restored and team_result_guard.retire_superseded_record(path):
+        _log(f"withheld review {path.stem}: a live copy contradicted its archived "
+             f"{archived.get('status')} decision; card restored and copy retired")
+    elif f"archived:{path.stem}" not in _REFUSED_REVIEW_PUBLICATIONS:
+        _REFUSED_REVIEW_PUBLICATIONS.add(f"archived:{path.stem}")
+        _log(f"withheld review {path.stem}: live copy left untouched; its archived "
+             "decision stands")
+    return True
+
+
+def _resolve_review_card(path: Path, record: dict) -> bool:
+    if _defers_to_archive(path):
+        return False
+    answer = _edit_review_card(record)
+    if answer is None:
         return False
     record.update({"card_resolution_pending": False,
                    "card_resolved_at": time.time(),
@@ -1081,6 +1112,13 @@ def _handle_review_decision(task: dict) -> bool:
     return True
 
 
+def _retry_withheld_reviews() -> None:
+    """One poll beat's durable review retries, in order."""
+    _retry_pending_publications()
+    _retry_review_card_resolutions()
+    _retry_review_control_results()
+
+
 def _retry_pending_publications() -> None:
     for path, record in _pending_review_records():
         if record.get("status") != "publish_pending":
@@ -1094,6 +1132,8 @@ def _retry_pending_publications() -> None:
 
 def _retry_review_card_resolutions() -> None:
     for path, record in _pending_review_records():
+        if _defers_to_archive(path):
+            continue
         if not record.get("card_resolution_pending"):
             _archive_resolved_review(path, record)
             continue
@@ -5171,9 +5211,7 @@ def main() -> None:
                     _results_watcher.join(timeout=5)
                 return
             _post_heartbeat(inflight)
-            _retry_pending_publications()
-            _retry_review_card_resolutions()
-            _retry_review_control_results()
+            _retry_withheld_reviews()
             # LAST of the beat's work, on a daemon thread: two optional 15 s
             # requests never delay the next task poll or a durable retry.
             _push_pool_advertisement()
