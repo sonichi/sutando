@@ -5,8 +5,9 @@ QUEUED as a proactive file — to the task's own conversation only for an owner-
 in the owner's own DM (`.to-<bridge>` name + `[channel:]` marker), to the owner's DM on
 the task's bridge for any other bridge task, else to the owner's DM on the bridge he was
 last active on; a drain delivering the file is what makes it sent; (2) the question and
-its queue record are saved to the outbox (`pending_questions_outbox`), atomically; (3) the
-macOS notification fires last, and a refusal prints the fix instead of a success. The
+its queue record are saved to the outbox (`pending_questions_outbox`), atomically; (3) only
+when nothing was queued does a macOS notification fire, pointing at the DM, and a refusal prints
+the fix instead of a success; a queued question is left to the chat app's own notification. The
 room-database adapter builds its row on top of `queue_question`; with no room, `ask_owner`
 here is the whole ask and the outbox is the record.
 
@@ -200,6 +201,15 @@ def notify_macos(text: str) -> tuple:
     return True, None
 
 
+def notify_unless_queued(out: dict, question: str) -> None:
+    """Set out["macos"]/["macos_fix"]: "skipped" once a DM file is queued, else the fallback notification.
+    An osascript notification has no click target; the chat app's own one opens the DM."""
+    if out.get("proactive_file"):
+        out["macos"], out["macos_fix"] = "skipped", None
+    else:
+        out["macos"], out["macos_fix"] = notify_macos(f"Open your Sutando DM to answer: {question}")
+
+
 def queue_question(question: str, context: Optional[str] = None, task_file: Optional[str] = None,
                    workspace: Optional[Path] = None, host: Optional[str] = None, now: Optional[float] = None,
                    link: Optional[str] = None, intro: Optional[str] = None,
@@ -256,7 +266,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
                 "db_error": out["outbox_error"] or "no room database store", "link": None,
                 "macos": None, "macos_fix": None})
     if urgency == "live":
-        out["macos"], out["macos_fix"] = notify_macos(f"Question: {question}")
+        notify_unless_queued(out, question)
     return out
 
 
@@ -281,7 +291,9 @@ def report_lines(out: dict) -> list:
         lines.append(f"sent: FAILED — {out.get('send_error')} (the record stands; ask by hand)")
     if out.get("send_error") and out.get("proactive_file"):
         lines.append(f"note: {out['send_error']}")
-    if out.get("macos") is True:
+    if out.get("macos") == "skipped":
+        lines.append("macos: skipped (question queued to your DM; your chat app notifies)")
+    elif out.get("macos") is True:
         lines.append("macos: notification sent")
     elif out.get("macos") is False:
         lines.append(f"macos: FAILED — {out.get('macos_fix')}")

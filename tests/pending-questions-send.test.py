@@ -11,6 +11,7 @@ import io
 import json
 import os
 import runpy
+import shutil
 import stat
 import subprocess
 import sys
@@ -464,7 +465,12 @@ class TestFailOpen(_Workspace):
         self.assertIn("**Sent:** FAILED", sent)
         self.assertIsNone(pqa.sent_at(sent), "a failed send is not a send")
 
+    def _break_send(self):
+        shutil.rmtree(self.ws / "results")
+        (self.ws / "results").write_text("not a directory")
+
     def test_refused_osascript_prints_the_fix(self):
+        self._break_send()
         self._osascript(1)
         r = self._run("q?")
         self.assertEqual(r.returncode, 0)
@@ -474,17 +480,39 @@ class TestFailOpen(_Workspace):
         self.assertNotIn("notification sent", r.stdout)
 
     def test_missing_osascript_prints_the_fix(self):
+        self._break_send()
         empty = self.ws / "empty-bin"
         empty.mkdir()
         r = self._run("q?", path=empty)
         self.assertIn("osascript not found", r.stdout)
         self.assertIn("System Settings > Notifications", r.stdout)
 
-    def test_live_notifies_and_durable_does_not(self):
+    def test_a_queued_dm_skips_osascript(self):
         r = self._run("q?")
+        self.assertIn("sent: queued", r.stdout)
+        self.assertIn("macos: skipped (question queued to your DM; your chat app notifies)", r.stdout)
+        self.assertNotIn("notification sent", r.stdout)
+        self.assertFalse(self.calls.exists(), "a queued DM fires no osascript notification")
+
+    def test_a_failed_send_falls_back_to_osascript_pointing_at_the_dm(self):
+        self._break_send()
+        r = self._run("q?")
+        self.assertIn("sent: FAILED", r.stdout)
         self.assertIn("macos: notification sent", r.stdout)
-        self.assertIn("Question: q?", self.calls.read_text())
-        self.calls.unlink()
+        self.assertIn("Open your Sutando DM to answer: q?", self.calls.read_text())
+
+    def test_the_core_ask_applies_the_same_rule(self):
+        with mock.patch.object(pqa, "notify_macos", return_value=(True, None)) as macos:
+            out = pqa.ask_owner("q?", workspace=self.ws, host=HOST)
+            self.assertEqual(out["macos"], "skipped")
+            macos.assert_not_called()
+            self._break_send()
+            out = pqa.ask_owner("q?", workspace=self.ws, host=HOST)
+        self.assertTrue(out["macos"])
+        macos.assert_called_once_with("Open your Sutando DM to answer: q?")
+
+    def test_durable_never_notifies(self):
+        self._break_send()
         r = self._run("q?", "--urgency", "durable")
         self.assertNotIn("macos:", r.stdout)
         self.assertFalse(self.calls.exists())

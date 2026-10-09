@@ -342,8 +342,8 @@ class TestAdapterLookupsAndMarks(rdb._Ws):
         self.assertEqual(out["reconcile"]["errors"], ["RuntimeError: boom"])
         self.assertIsNotNone(out["record"])
         self.assertIsNone(out["send_error"], "an introduction that was not needed writes no mark")
-        self.assertEqual((out["macos"], out["macos_fix"]), (False, "no osascript"))
-        macos.assert_called_once()
+        self.assertEqual((out["macos"], out["macos_fix"]), ("skipped", None), "the DM was queued")
+        macos.assert_not_called()
         mark.rmdir()
         with mock.patch.object(adapter, "mark_room_introduced", side_effect=OSError("read-only")):
             out = adapter.ask_owner("q2?", urgency="durable", workspace=self.ws, host=HOST, store=store)

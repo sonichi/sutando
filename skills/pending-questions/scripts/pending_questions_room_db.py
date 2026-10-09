@@ -342,7 +342,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
         else:
             out["record"] = f"outbox {out['outbox']}"
     if urgency == "live":
-        out["macos"], out["macos_fix"] = core_ask.notify_macos(f"Question: {question}")
+        core_ask.notify_unless_queued(out, question)
     return out
 
 
