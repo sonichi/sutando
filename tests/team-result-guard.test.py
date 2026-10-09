@@ -202,6 +202,16 @@ def behavioral() -> list:
                     raise FileExistsError
                 return raced_link
 
+            (directory / "held.json").write_text(json.dumps({"value": 7}), encoding="utf-8")
+            if guard._write_artifact(directory / "held.json", {"value": 1}, "value"):
+                fails.append("an existing record of another body must not count as written")
+            if not guard._write_artifact(directory / "held.json", {"value": 7}, "value"):
+                fails.append("an existing record of this body counts as written")
+            (directory / "garbled.json").write_text("not json", encoding="utf-8")
+            if guard._write_artifact(directory / "garbled.json", {"value": 1}, "value"):
+                fails.append("an unreadable existing record must not count as written")
+            if guard.withheld_review_id("") == guard.withheld_review_id(""):
+                fails.append("a review with no task id must never share an id")
             guard.os.link = raced_link_with(1)
             if not guard._write_artifact(directory / "raced.json", {"value": 1}, "value"):
                 fails.append("a concurrent winner recording the same body must count as persisted")

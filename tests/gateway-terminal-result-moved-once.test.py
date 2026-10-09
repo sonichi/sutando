@@ -1159,6 +1159,12 @@ class TerminalResultMovedOnce(unittest.TestCase):
                 self.assertFalse(result.exists())
                 self.assertEqual(len(self.server.calls), posts)
 
+    def test_a_reply_gone_before_its_ruling_is_left_for_the_next_pass(self):
+        self.bridge()
+        gw._quarantine_unsent(self.results / f'{TID}.txt', TID, TID)
+        self.assertTrue(any('not readable now' in l for l in self.lines), self.lines)
+        self.assertEqual(self.quarantined_bodies(), [])
+
     def test_an_earlier_digest_field_is_never_read_as_this_one(self):
         """A record from an earlier writer of `source_sha256` (raw bytes, or the ready
         body): an unchanged plain body is a duplicate, never "send it by hand"."""
