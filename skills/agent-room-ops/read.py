@@ -123,14 +123,16 @@ def _normalize(items):
             "reactions": m.get("reactions") or [],
         }
         # `fetch` needs media_ref as its handle, so dropping it leaves an attachment
-        # visible but unfetchable. Set only when present, keeping the shape additive.
-        ref = m.get("media_ref")
+        # visible but unfetchable. The broker names it `mxc`; both are accepted.
+        ref = m.get("media_ref") or m.get("mxc")
         if ref:
             norm["media_ref"] = ref
             # Also conditional: the gateway is an external producer, so a media event
-            # arriving without msgtype must not grow an explicit null either.
+            # arriving without msgtype or mimetype must not grow an explicit null either.
             if (mt := m.get("msgtype")):
                 norm["msgtype"] = mt
+            if (mime := m.get("mimetype")):
+                norm["mimetype"] = mime
         out.append(norm)
     return out
 

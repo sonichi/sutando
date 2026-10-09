@@ -172,7 +172,10 @@ def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
     ev = replace(ev, last_pane_id=obs.pane_id)
     if kind is None:
         return _cleared_wedge(ev), NOTHING
-    if ev.wedge_escalated and ev.wedge_kind not in (None, kind):
+    # A legacy acknowledgment cannot prove a login card exists; other kinds
+    # retain their existing compatibility behavior.
+    if ev.wedge_escalated and (ev.wedge_kind not in (None, kind)
+                              or (ev.wedge_kind is None and kind == "login")):
         ev = replace(ev, wedge_escalated=False)
     ev = replace(
         ev,

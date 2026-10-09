@@ -159,6 +159,13 @@ the owner's DM through the proactive path and keeps one generic record under
 `<workspace>/state/ask-owner/` (`src/local_record.py`), saying that nothing lists or closes it.
 The outbox, the ask-id grammar and every question schema are the declaring skill's.
 
+## Claude plugin (`claude_plugin`)
+
+`"claude_plugin": "./plugin"` names a Claude Code plugin directory inside the skill. The Claude
+launchers (core and Claude pool workers) pass each enabled skill's directory as `--plugin-dir`.
+The path must resolve to a real directory inside the skill folder and the manifest must be
+`"enabled": true`; anything else is skipped with a note on stderr. Codex seats ignore it.
+
 ## Currently active manifest skills
 
 Run `grep -l '"enabled": true' skills/*/manifest.json "$SUTANDO_MEMORY_DIR/skills"/*/manifest.json` for the live list (legacy users may need `$SUTANDO_PRIVATE_DIR` in place of the new var).

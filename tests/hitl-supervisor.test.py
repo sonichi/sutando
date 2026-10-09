@@ -56,17 +56,19 @@ class SupervisorTests(unittest.TestCase):
         self.mgr.link_blocked_task(first.drove.created, "task-9")
         out = self.run_pass(LOGGED_IN)
         self.assertEqual(out.resumed_tasks, ["task-9"])
-        edit = self.send.sent[-1]
+        edit, notice = self.send.sent[-2:]
         self.assertEqual(edit["op"], "edit")
         self.assertEqual(edit["extra_content"]["space.ag2.hitl"]["status"], "resolved")
+        self.assertEqual(notice["op"], "message")  # the edit notifies nobody
+        self.assertIn("resuming 1 queued task", notice["body"])
 
     def test_flap_within_one_pass_projects_final_state_once(self):
         # Created and resolved between projector drives: only the final state
-        # is ever sent (detect-then-project ordering).
+        # is ever sent (detect-then-project ordering); recovery is one new message.
         self.run_pass(LOGGED_OUT)
         self.run_pass(LOGGED_IN)
-        ops = [p["op"] for p in self.send.sent]
-        self.assertEqual(ops, ["message", "edit"])
+        ops = [(p["op"], "extra_content" in p) for p in self.send.sent]
+        self.assertEqual(ops, [("message", True), ("edit", True), ("message", False)])
 
     def test_probe_unknown_projects_pending_state_unchanged(self):
         self.run_pass(LOGGED_OUT)

@@ -311,6 +311,33 @@ test('image: managed generation reported verbatim; env never carries the VOICE g
 		{ key: 'vk', source: 'env' });
 });
 
+// --- desktop: the supervisor injects the managed Live token as GEMINI_VOICE_API_KEY into every child ---
+
+test('image: never spends a Live token from env (by `auth_tokens/` shape or equality with the managed voice entry)', () => {
+	process.env.GEMINI_VOICE_API_KEY = 'auth_tokens/injected';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: missing() }),
+		{ key: '', source: 'none' });
+	assert.deepEqual(resolveCredential('gemini-voice', { managedPath: missing() }),
+		{ key: 'auth_tokens/injected', source: 'env' });
+	process.env.GEMINI_VOICE_API_KEY = 'auth_tokens/managed-v';
+	const desktop = writeManaged({ 'gemini-voice': { key: 'auth_tokens/managed-v' } });
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: desktop }),
+		{ key: '', source: 'none' });
+	assert.deepEqual(resolveCredential('gemini-voice', { managedPath: desktop }),
+		{ key: 'auth_tokens/managed-v', source: 'managed' });
+	process.env.GEMINI_API_KEY = 'mk';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: desktop }),
+		{ key: 'mk', source: 'env' });
+	delete process.env.GEMINI_API_KEY;
+	process.env.GEMINI_VOICE_API_KEY = 'managed-v';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: writeManaged({ 'gemini-voice': { key: 'managed-v' } }) }),
+		{ key: '', source: 'none' });
+	delete process.env.GEMINI_VOICE_API_KEY;
+	process.env.GEMINI_API_KEY = 'auth_tokens/misplaced';
+	assert.deepEqual(resolveCredential('gemini-image', { managedPath: missing() }),
+		{ key: '', source: 'none' });
+});
+
 // --- credentialSourceLabel: the design's user-facing vocabulary -------------
 
 test("credentialSourceLabel: managed→managed, env→byok, none→none", () => {

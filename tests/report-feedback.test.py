@@ -204,10 +204,12 @@ class TestReportFeedbackCloudAuth(unittest.TestCase):
                 json.dumps({"apiBase": "https://legacy.example", "token": "legacy-token"})
             )
 
-            self.assertEqual(
-                report_feedback.read_cloud_auth(ws),
-                ("https://canonical.example", "canonical-token"),
-            )
+            with mock.patch.object(report_feedback, "_keychain_get", return_value=None), \
+                    mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(
+                    report_feedback.read_cloud_auth(ws),
+                    ("https://canonical.example", "canonical-token"),
+                )
 
     def test_skips_malformed_auth_file_and_returns_none_when_unsigned(self):
         # Invalid JSON in the canonical file must be swallowed (except: continue),
@@ -220,7 +222,7 @@ class TestReportFeedbackCloudAuth(unittest.TestCase):
             bad.parent.mkdir(parents=True)
             bad.write_text("{not valid json")
             with mock.patch("pathlib.Path.home", return_value=Path(fake_home)), \
-                    mock.patch.object(report_feedback, "read_keychain_auth", return_value=(None, None)), \
+                    mock.patch.object(report_feedback, "_keychain_get", return_value=None), \
                     mock.patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(report_feedback.read_cloud_auth(ws), (None, None))
 
@@ -230,7 +232,7 @@ class TestReportFeedbackCloudAuth(unittest.TestCase):
         with tempfile.TemporaryDirectory() as fake_home:
             app_ws = Path(fake_home) / ".sutando" / "repo" / "workspace"
             with mock.patch("pathlib.Path.home", return_value=Path(fake_home)), \
-                    mock.patch.object(report_feedback, "read_keychain_auth", return_value=(None, None)), \
+                    mock.patch.object(report_feedback, "_keychain_get", return_value=None), \
                     mock.patch.dict(os.environ, {}, clear=True):
                 # No files exist under the fake home, so this returns (None, None)
                 # after exercising the dedup continue on the colliding path.
@@ -244,7 +246,7 @@ class TestReportFeedbackCloudAuth(unittest.TestCase):
                 "SUTANDO_METERING_ENDPOINT": "https://metered.example/api/usage/v2",
             }
             with mock.patch("pathlib.Path.home", return_value=Path(fake_home)), \
-                    mock.patch.object(report_feedback, "read_keychain_auth", return_value=(None, None)), \
+                    mock.patch.object(report_feedback, "_keychain_get", return_value=None), \
                     mock.patch.dict(os.environ, env, clear=True):
                 base, token = report_feedback.read_cloud_auth(ws)
             self.assertEqual(token, "env-tok")
@@ -254,7 +256,7 @@ class TestReportFeedbackCloudAuth(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as fake_home:
             ws = Path(td)
             with mock.patch("pathlib.Path.home", return_value=Path(fake_home)), \
-                    mock.patch.object(report_feedback, "read_keychain_auth", return_value=(None, None)), \
+                    mock.patch.object(report_feedback, "_keychain_get", return_value=None), \
                     mock.patch.dict(os.environ, {"SUTANDO_METERING_HEADERS": "{bad"}, clear=True):
                 self.assertEqual(report_feedback.read_cloud_auth(ws), (None, None))
 
@@ -266,24 +268,45 @@ class TestReportFeedbackCloudAuth(unittest.TestCase):
             rec = ws / "state" / "auth" / "cloud-auth.json"
             rec.parent.mkdir(parents=True)
             rec.write_text(json.dumps({"apiBase": "https://sutando.ag2.ai", "token": "t"}))
-            self.assertEqual(
-                report_feedback.read_cloud_auth(ws),
-                ("https://sutando.ag2.space", "t"),
-            )
+            with mock.patch.object(report_feedback, "_keychain_get", return_value=None), \
+                    mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(
+                    report_feedback.read_cloud_auth(ws),
+                    ("https://sutando.ag2.space", "t"),
+                )
 
     def test_keychain_tier_used_when_no_auth_file(self):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as fake_home:
             ws = Path(td)
             with mock.patch("pathlib.Path.home", return_value=Path(fake_home)), \
                     mock.patch.object(
-                        report_feedback, "read_keychain_auth",
-                        return_value=("https://sutando.ag2.space", "sutk_key"),
+                        report_feedback, "_keychain_get",
+                        side_effect=lambda k: "sutk_key" if k == report_feedback.origin_vault_key(
+                            "https://sutando.ag2.space") else None,
                     ), \
                     mock.patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(
                     report_feedback.read_cloud_auth(ws),
                     ("https://sutando.ag2.space", "sutk_key"),
                 )
+
+
+class TestReportFeedbackStampedAccount(unittest.TestCase):
+    def test_under_a_stamp_every_keychain_key_is_a_candidate(self):
+        cur = report_feedback.origin_vault_key("https://sutando.ag2.space")
+        store = {cur: "sutk_B", "AG2_CLOUD_TOKEN": "sutk_A"}
+        ids = {"sutk_A": "u-A", "sutk_B": "u-B"}
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as fake_home:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            (ws / "state" / "station-core-stamp.json").write_text(json.dumps({"version": 1, "cloud_user_id": "u-A"}))
+            with mock.patch("pathlib.Path.home", return_value=Path(fake_home)), \
+                    mock.patch.object(report_feedback, "_keychain_get", side_effect=store.get), \
+                    mock.patch.object(report_feedback.cloud_auth, "_USER_IDS", {}), \
+                    mock.patch.object(report_feedback.cloud_auth, "cloud_request",
+                                      side_effect=lambda b, t, *a, **k: {"id": ids[t]}), \
+                    mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(report_feedback.read_cloud_auth(ws), ("https://sutando.ag2.space", "sutk_A"))
 
 
 class TestKeychainAuth(unittest.TestCase):
@@ -487,6 +510,14 @@ class TestAskFirst(unittest.TestCase):
                     with self.assertRaises(SystemExit) as cm:
                         self._run(["--decide", did, "file"])
                     self.assertEqual(cm.exception.code, 2)
+                refused = type("Refused", (tuple,), {"refused": "account_changed", "stamp_user_id": "u-A",
+                                                      "credential_user_ids": ("u-B",)})((None, None))
+                out = io.StringIO()
+                with mock.patch.object(report_feedback, "read_cloud_auth", return_value=refused), \
+                        contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+                    self._run(["--decide", did, "file"])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("ACCOUNT_REFUSED: This agent's AG2 Cloud credentials belong to u-B", out.getvalue())
             self.assertEqual(len(report_feedback.list_drafts(ws)), 1, "a refused decision keeps the draft parked")
 
     def test_decide_file_attaches_logs_when_allowed_and_explains_their_absence(self):
@@ -1111,6 +1142,17 @@ class TestMain(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             self._run(["--title", "   "])
         self.assertEqual(cm.exception.code, 1)
+
+    def test_a_refused_account_exits_2_with_its_reason(self):
+        refused = type("Refused", (tuple,), {"refused": "account_unverified", "stamp_user_id": "u-A",
+                                              "credential_user_ids": ()})((None, None))
+        out = io.StringIO()
+        with mock.patch.object(report_feedback, "read_cloud_auth", return_value=refused), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            self._run(["--title", "hello"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("ACCOUNT_REFUSED: Verifying", out.getvalue())
+        self.assertNotIn("NOT_SIGNED_IN", out.getvalue())
 
     def test_not_signed_in_exits_2(self):
         with mock.patch.object(report_feedback, "read_cloud_auth", return_value=(None, None)):

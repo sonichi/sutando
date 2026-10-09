@@ -94,7 +94,7 @@ def resolve_key() -> tuple[str, str]:
         return got.key, got.source
     except Exception:  # noqa: BLE001 - a copied install has no core tree
         for var in ("GEMINI_API_KEY", "GEMINI_VOICE_API_KEY"):
-            if os.environ.get(var):
+            if os.environ.get(var) and not os.environ[var].startswith("auth_tokens/"):  # a Live-only token
                 return os.environ[var], "env"
         return "", "none"
 

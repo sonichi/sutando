@@ -18,14 +18,15 @@ from dataclasses import dataclass
 
 from .contract import (ClaimBackend, DeliveryAttempt, DeliveryOutcome, DeliveryProvider,
                        DrainResult, DrainStatus, ProviderIndeterminate,
-                       ProviderRefused, RecoverReport)
+                       ProviderRefused, ProviderPermanentRefused, RecoverReport)
 
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    """The park ceiling is mandatory: an adapter may raise it, never remove it.
-    An unbounded retry is a duplicate generator, not a resilience setting."""
+    """Attempt ceiling for default backends; timed backends enforce an elapsed window.
+    Deferred resends require the provider's idempotent-send capability."""
     max_attempts: int = 3
+    defer_idempotent_resend: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.max_attempts, int) or self.max_attempts < 1:
@@ -56,18 +57,19 @@ class DeliveryCore:
         self.worker = worker
 
     def _attempt(self, item_id: str, payload: bytes,
-                 key: str) -> DeliveryOutcome:
+                 key: str) -> tuple:
         """One provider call, classified by the typed failure taxonomy.
         Only a boundary-crossing failure is UNKNOWN; a refusal is
         NOT_DELIVERED; anything else (programming, config, capability
         violation) propagates rather than masquerading as ambiguity."""
         try:
             receipt = self.provider.deliver(item_id, payload, key)
-            return receipt.outcome, getattr(receipt, "destination", None)
-        except ProviderIndeterminate:
-            return DeliveryOutcome.OUTCOME_UNKNOWN, None
-        except ProviderRefused:
-            return DeliveryOutcome.NOT_DELIVERED, None
+            return receipt.outcome, getattr(receipt, "destination", None), False, receipt.detail
+        except ProviderIndeterminate as exc:
+            return DeliveryOutcome.OUTCOME_UNKNOWN, None, False, str(exc)
+        except ProviderRefused as exc:
+            return (DeliveryOutcome.NOT_DELIVERED, None,
+                    isinstance(exc, ProviderPermanentRefused), str(exc))
 
     def _reconcile(self, item_id: str, payload: bytes, key: str):
         """Resolve a prior ambiguity, or None when reconciliation resolved
@@ -100,8 +102,11 @@ class DeliveryCore:
             return DrainResult(status=DrainStatus.NOT_CLAIMED)
         # A requeued item must present a NEW logical side effect, or the
         # provider dedupes the re-send against the attempt that parked it.
+        stored_payload = getattr(self.backend, "payload_for_claim", None)
+        if callable(stored_payload):
+            payload = stored_payload(token)
         key = idempotency_key(item_id, _resend_epoch(self.backend, item_id))
-        outcome, destination = self._attempt(item_id, payload, key)
+        outcome, destination, permanent, detail = self._attempt(item_id, payload, key)
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities
             if caps.reconcile_capable:
@@ -111,18 +116,20 @@ class DeliveryCore:
                     # item; its destination replaces the ambiguous attempt's.
                     outcome, destination = resolved
             elif caps.idempotent_send:
-                outcome, destination = self._attempt(item_id, payload, key)
+                if not self.policy.defer_idempotent_resend:
+                    outcome, destination, permanent, detail = self._attempt(item_id, payload, key)
                 if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
                     # Retryable by license: parking would strand an item a
                     # later safe re-send could still deliver.
                     outcome = DeliveryOutcome.NOT_DELIVERED
         # The ceiling rides WITH the completion: parking after the claim
         # is released lets a successor confirm in the gap.
+        terminal = {"terminal_reason": "permanent-refusal"} if permanent else {}
         self.backend.complete(token, outcome,
                               park_at_attempts=self.policy.max_attempts,
                               provider=type(self.provider).__name__,
-                              destination=destination)
-        return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome)
+                              destination=destination, **terminal)
+        return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome, detail=detail)
 
     def recover(self) -> RecoverReport:
         return self.backend.recover()

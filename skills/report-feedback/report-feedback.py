@@ -217,7 +217,7 @@ def resolve_workspace() -> Path:
 
 
 # Wrappers, not aliases: each hands its sibling down as the injected reader, so
-# patching _keychain_get / read_keychain_auth here still steers the chain.
+# patching _keychain_get here still steers the chain (every Keychain key is a candidate).
 _normalize_base = cloud_auth.normalize_base
 _fnv1a64 = cloud_auth.fnv1a64
 origin_vault_key = cloud_auth.origin_vault_key
@@ -233,7 +233,7 @@ def read_keychain_auth():
 
 
 def read_cloud_auth(ws: Path):
-    return cloud_auth.read_cloud_auth(ws, keychain_auth=read_keychain_auth)
+    return cloud_auth.read_cloud_auth(ws, keychain_get=_keychain_get)
 
 
 def why_no_logs(ws: Path) -> str:
@@ -721,7 +721,12 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
     if rec["payload"].get("recovery") and not recovery_ready(rec):
         print(f"HELD: incident {draft_id} is awaiting recovery.")
         return 3
-    base, token = read_cloud_auth(ws)
+    auth = read_cloud_auth(ws)
+    base, token = auth
+    refusal = None if token else cloud_auth.refusal_message(auth)
+    if refusal:
+        print(f"ACCOUNT_REFUSED: {refusal} The draft stays parked.")
+        return 2
     if not token:
         print(f"NOT_SIGNED_IN: not signed in to Sutando Cloud (probed {base or resolve_cloud_origin()}) — the draft stays parked; sign in, then retry.")
         return 2
@@ -859,7 +864,12 @@ def _main() -> None:
         print(f"ASKED: draft {draft_id} parked as {req_id}; the bridge delivers the card. After the owner answers, run --apply.")
         return
 
-    base, token = read_cloud_auth(ws)
+    auth = read_cloud_auth(ws)
+    base, token = auth
+    refusal = None if token else cloud_auth.refusal_message(auth)
+    if refusal:
+        print(f"ACCOUNT_REFUSED: {refusal}")
+        sys.exit(2)
     if not token:
         print(f"NOT_SIGNED_IN: not signed in to Sutando Cloud (probed {base or resolve_cloud_origin()}) — ask the user to sign in (Settings → Sutando Cloud), then retry.")
         sys.exit(2)

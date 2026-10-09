@@ -418,14 +418,16 @@ def drain_two_pass():
     posted = []
     real_req = m._req
     attempts = {"n": 0}
+    now = [1000.0]
+    core = m._delivery_core()
+    real_clock = core.backend.clock
+    core.backend.clock = lambda: now[0]
 
     def flaky(meth, path, payload=None, **kw):
         if path != "/v1/results":
             return {}
         attempts["n"] += 1
-        # The drain's idempotent re-send retries ambiguity once IN-pass, so a
-        # genuinely failed pass must fail both the send and its re-send.
-        if attempts["n"] <= 2:
+        if attempts["n"] == 1:
             raise urllib.error.URLError("transient")
         posted.append(payload)
         return {}
@@ -435,11 +437,16 @@ def drain_two_pass():
         inflight = {tid}
         m._post_ready_results(inflight)      # pass 1: POST raises
         first = (tid in m._REDELIVERED, tid in inflight, list(posted))
-        m._post_ready_results(inflight)      # pass 2: POST succeeds
+        m._post_ready_results(inflight)
+        check(attempts["n"] == 1 and tid in m._REDELIVERED and tid in inflight,
+              "before the retry is due no POST occurs and provenance survives")
+        now[0] = m.read_item(core.backend.root, tid)["retry"]["next_attempt_at"]
+        m._post_ready_results(inflight)      # due retry: POST succeeds
         second = (tid in m._REDELIVERED, tid in inflight, list(posted))
         return first, second
     finally:
         m._req = real_req
+        core.backend.clock = real_clock
         _undo_two()
 
 

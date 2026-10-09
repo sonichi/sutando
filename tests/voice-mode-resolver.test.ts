@@ -29,7 +29,7 @@ test('meeting mode when meetingActive=true and presenter off', () => {
 	assert.equal(r.isMeeting, true);
 	assert.equal(r.isPresenter, false);
 	assert.match(r.marker, /\[BASE MODE: meeting/);
-	assert.match(r.marker, /listen and take notes silently/);
+	assert.match(r.marker, /transcribed into notes/);
 	assert.match(r.marker, /Produce ZERO audio output/);
 });
 

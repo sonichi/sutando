@@ -319,6 +319,14 @@ turn in flight. With the same sustain and stale line, once per episode:
   owner presses it; the next tick then re-reads the pane and types one Escape only
   if it still shows the frame the card was raised for, and refuses otherwise.
 
+An expired login is the exception to the work-owed and sustain requirements: its
+banner asks for a `/login` card immediately, even with an empty inbox. On upgrade,
+an acknowledgment saved before wedge kinds existed is rechecked for login only.
+An existing `needs-login` cause card remains the same actionable warning when HITL
+deduplicates the login request onto it; cleanup closes it after the pane recovers,
+not merely because its older card type differs. Other legacy acknowledgments keep
+their existing behavior. No login warning restarts or types into a worker session.
+
 A card decision repeats on each tick until the card is actually created, so one
 unreadable capture delays it by a tick rather than suppressing it. The clocks are
 tick-bound: with the 300 s timer the three-sighting sustain, not the 90 s line,
@@ -493,6 +501,8 @@ Input is the roster and one admitted task; nothing else may be read.
 The name keeps `.txt` because the watcher a worker runs emits for no other extension; accepting substitutes the suffix, so a accepted file stops waking anyone.
 
 Order candidates `urgent > normal > low`, then oldest payload `created_at` first.
+
+**Non-exclusive claim folders.** A folder under `deliveries/` that holds a regular file named `.non-exclusive` (`pool_delivery.NON_EXCLUSIVE_MARKER`) takes claims, not deliveries. A service outside the roster can put `<task-id>.accepted` there while it works on a task, and the core's held-readers (`task_dispatch.worker_holds`, `worker_delivery.holder_of`, the Stop hook) count the task as held, the same as for any recipient folder. The router does not: it never counts that folder as the recipient a task is committed to. So a claim beside a worker's delivery is not "two holders", and it is never adopted as a delivery target. Exclusion between the claimant and a worker is the claimant's own job. The marker MUST exist before the first sentinel is written to that folder: a pass that sees the sentinel without it reads the claimant as the committed recipient and never delivers to the bound worker. The marker is read only in a folder that holds a sentinel for the task being decided; a marked folder that does not hold it is ignored without reading the roster, so a committed replay still finishes without a roster. Where the folder does hold the task, a marker that is not a regular file (a directory, a FIFO, or a symlink even to a regular file, since it is read without following links) refuses the pass, like any other unreadable evidence. So does a marker in the `core` folder or a roster worker's folder, or a marker while the roster cannot be read: the marker can only mean "outside the roster", and a real recipient's deliveries are never skipped. The delivery step enforces the same rule under the folder lock: it never writes or adopts a sentinel in a folder carrying the marker, and refuses the pass instead. One routing pass reads the roster once and uses that snapshot for marker eligibility and for the target. A claimant that dies without removing its sentinel leaves the task held with nobody answering; surfacing that is tracked in #5132.
 
 ### Worker loop
 

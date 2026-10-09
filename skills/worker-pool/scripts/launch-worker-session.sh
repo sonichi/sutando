@@ -51,6 +51,7 @@ SESSION="${SUTANDO_TMUX_SESSION:?launch-worker-session.sh needs SUTANDO_TMUX_SES
 # A worker never gets the owner-facing surfaces (remote control, Chrome) —
 # those are the canonical core's alone.
 SURFACE_ARGS=()
+add_skill_claude_plugins
 # `/startup --worker` is the pool worker's own boot ceremony (orphan recovery
 # and session crons are core-only; the worker gate is what it runs instead).
 BOOT_PROMPT="/startup --worker"

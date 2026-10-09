@@ -342,7 +342,9 @@ class KeyAndEnv(Base):
                 self.assertEqual(gen.resolve_key(), ("voice-k", "env"))
                 os.environ["GEMINI_API_KEY"] = "text-k"
                 self.assertEqual(gen.resolve_key(), ("text-k", "env"), "the text key outranks the voice key")
-                os.environ.pop("GEMINI_API_KEY"); os.environ.pop("GEMINI_VOICE_API_KEY")
+                os.environ.pop("GEMINI_API_KEY"); os.environ["GEMINI_VOICE_API_KEY"] = "auth_tokens/live"
+                self.assertEqual(gen.resolve_key(), ("", "none"), "a Live-only token is never an image key")
+                os.environ.pop("GEMINI_VOICE_API_KEY")
                 self.assertEqual(gen.resolve_key(), ("", "none"))
         finally:
             for pt in self.patches:
