@@ -1415,6 +1415,8 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertFalse(trg.update_record(old, dict(b, status='published')))
         self.assertEqual(json.loads((hot / 'archive' / old.name).read_text()), b, "B's decision changed")
         self.assertTrue(any('frozen' in l for l in self.lines), self.lines)
+        with patch.object(gw.team_result_guard, 'actionable_records', side_effect=OSError(5, 'EIO')):
+            self.assertEqual(gw._pending_review_records(), [], 'an unreadable store lists nothing to act on')
 
     def test_an_archive_inside_a_lookup_waits_for_it(self):
         """The resolver's archive cannot land between a lookup's archive and live

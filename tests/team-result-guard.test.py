@@ -393,8 +393,43 @@ def behavioral() -> list:
                                                          encoding="utf-8")
         if guard.archive_record(twin) or json.loads((twin.parent / "archive" / twin.name).read_text()).get("k") != 1:
             fails.append("archive never writes over an existing decision")
+        owns = guard._owns_its_id
+        guard._owns_its_id = lambda *_a: True        # even past the ownership check, the move is no-clobber
+        try:
+            if guard.archive_record(twin) or json.loads(
+                    (twin.parent / "archive" / twin.name).read_text()).get("k") != 1 or not twin.exists():
+                fails.append("the archive move itself never replaces a decision")
+        finally:
+            guard._owns_its_id = owns
         if guard.update_record(twin, {"withheld_body": "other body"}):
             fails.append("an update never changes the body a record holds")
+        listing = state / "listing" / guard.WITHHELD_RESULT_DIR
+        acted, frozen = guard.actionable_records(listing)
+        if acted or frozen:
+            fails.append("a directory that does not exist lists nothing")
+        listing.mkdir(parents=True)
+        own = listing / "wr_own.json"
+        guard._reserve(own, guard._body_digest("own body"))
+        own.write_text(json.dumps({"withheld_body": "own body"}), encoding="utf-8")
+        other = listing / "wr_other.json"
+        guard._reserve(other, guard._body_digest("first body"))
+        other.write_text(json.dumps({"withheld_body": "second body"}), encoding="utf-8")
+        acted, frozen = guard.actionable_records(listing)
+        if [p.name for p, _r in acted] != ["wr_own.json"] or len(frozen) != 1 or other.exists():
+            fails.append("a live record conflicting with its id's reservation is frozen, never listed")
+        if json.loads(frozen[0].read_text())["withheld_body"] != "second body":
+            fails.append("a frozen record keeps its body for the owner")
+        (listing / "wr_garbled.json").write_text("not json", encoding="utf-8")
+        acted, frozen = guard.actionable_records(listing)
+        if [p.name for p, _r in acted] != ["wr_own.json"] or len(frozen) != 1:
+            fails.append("an unreadable record never acts and is frozen")
+        blocker = listing / "wr_blocked.json"
+        blocker.write_text("also not json", encoding="utf-8")
+        (listing / guard.CONFLICTS_DIR / f"wr_blocked.{guard._record_digest(blocker, 'withheld_body')[:16]}.json"
+         ).write_text("held", encoding="utf-8")
+        acted, frozen = guard.actionable_records(listing)
+        if frozen or not blocker.exists() or [p.name for p, _r in acted] != ["wr_own.json"]:
+            fails.append("a record that cannot be frozen still never acts")
         gone = guard.withheld_review_path(state, "task-gone")
         if guard.update_record(gone, {"withheld_body": "x"}) or gone.exists():
             fails.append("an update never recreates a record that is gone or archived")

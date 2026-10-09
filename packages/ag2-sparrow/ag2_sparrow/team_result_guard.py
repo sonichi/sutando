@@ -471,11 +471,12 @@ def actionable_records(directory: Path, field: str = "withheld_body"):
         return actionable, frozen
     with _ledger_lock(directory):
         for path in sorted(directory.glob("*.json")):
-            if _owns_its_id(path, field):
-                try:
-                    actionable.append((path, json.loads(path.read_text(encoding="utf-8"))))
-                except (OSError, ValueError):
-                    continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                record = None                            # unreadable: never acts, frozen below
+            if isinstance(record, dict) and _owns_its_id(path, field):
+                actionable.append((path, record))
                 continue
             target = directory / CONFLICTS_DIR / f"{path.stem}.{_record_digest(path, field)[:16]}.json"
             try:

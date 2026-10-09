@@ -291,8 +291,8 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "            path.replace(archive / path.name)\n"),
     "conflicting-record-stays-actionable": (
         "a live record whose id belongs to another body or decision stays actionable",
-        "            if _owns_its_id(path, field):\n                try:\n",
-        "            if True:\n                try:\n"),
+        "            if isinstance(record, dict) and _owns_its_id(path, field):\n",
+        "            if isinstance(record, dict):\n"),
     "update-ignores-id-ownership": (
         "an update writes a record that no longer owns its id",
         "        if not path.is_file() or not _owns_its_id(path, field) or record.get(field) != json.loads(\n",
