@@ -1103,6 +1103,28 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertIn("owner's DM", said[0])
         self.assertNotIn('by hand', said[0])
 
+    def test_a_guard_that_cannot_decide_leaves_the_reply_live_and_a_withheld_one_is_never_handed_over(self):
+        for name, patches, outcome in (
+                ('mention routing unavailable', {'_owner_mention_disposition': None}, 'live'),
+                ('guard unavailable', {'_guarded_result_body': (None, 'guard unavailable')}, 'live'),
+                ('guard withheld a redaction', {'_guarded_result_body': ('BODY-C [redacted]', 'secret redacted')},
+                 'review')):
+            with self.subTest(case=name):
+                self.setUp()
+                stack = contextlib.ExitStack()
+                with stack:
+                    result, posts = self._delivered_then_late(
+                        'BODY-C secret', before_late=lambda: [stack.enter_context(
+                            patch.object(gw, fn, return_value=value)) for fn, value in patches.items()])
+                self.assertEqual(len(self.server.calls), posts)
+                self.assertFalse(any('cannot resend it: send it by hand' in l for l in self.lines), self.lines)
+                if outcome == 'live':
+                    self.assertEqual(result.read_text(), 'BODY-C secret')
+                    self.assertEqual(self.quarantined_bodies(), [])
+                else:
+                    self.assertIn('BODY-C secret', self.quarantined_bodies())
+                    self.assertTrue(any('withheld it (secret redacted)' in l for l in self.lines), self.lines)
+
     def test_a_different_restricted_reply_is_quarantined_for_review_not_sending(self):
         for body, says in (('[dm-only]\nprivate detail for the owner', "owner's DM"),
                            ('[channel: !other:ag2.space]\nfor that room', '[channel: !other:ag2.space]')):
