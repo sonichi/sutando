@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Named mutants of src/delivery/disposal.py and src/undelivered_quarantine.py
-(the no-replace transition's owner), so a reviewer can reproduce
+"""Named mutants of src/delivery/disposal.py, src/undelivered_quarantine.py
+(the no-replace transition's owner), src/outbox_cli.py and the bridge's orphan
+arms, so a reviewer can reproduce
 "this test kills that mutant" without hand-editing the module.
 
     python3 tests/_helpers/disposal_mutants.py list
@@ -24,7 +25,11 @@ QUARANTINE = [REPO / "src" / "undelivered_quarantine.py",
               REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "undelivered_quarantine.py"]
 # Mutants whose site lives in the quarantine module; every other one edits disposal.
 IN_QUARANTINE = {"fallback-links-then-unlinks", "place-replaces-a-taken-name",
-                 "place-does-not-retry", "restore-links-then-unlinks"}
+                 "place-does-not-retry", "restore-links-then-unlinks", "restore-aside-unlinks"}
+CLI = [REPO / "src" / "outbox_cli.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox_cli.py"]
+BRIDGE = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"]
+IN_CLI = {"cli-exits-0-on-no-safe-move"}
+IN_BRIDGE = {"orphan-links-then-unlinks"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
 
 MUTANTS: dict[str, tuple[str, str, str]] = {
@@ -115,10 +120,28 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "restore links the quarantined body to the live name, then unlinks the quarantine copy",
         "        rename_noreplace(found[-1], target)\n    except FileExistsError as e:\n",
         "        os.link(found[-1], target)\n        os.unlink(found[-1])\n    except FileExistsError as e:\n"),
+    "restore-aside-unlinks": (
+        "without a primitive, restore unlinks the quarantined name instead of renaming it aside",
+        "        os.rename(quarantined, private_name(quarantined, \"restored\"))\n",
+        "        os.unlink(quarantined)\n"),
+    "cli-exits-0-on-no-safe-move": (
+        "requeue reports success when the body could not be restored",
+        "            return 4\n",
+        "            return 0\n"),
+    "orphan-links-then-unlinks": (
+        "an orphan arm moves the canonical result itself: link, then unlink its name",
+        "        disposal.retire_current(RESULTS_DIR, rfile, _log, directory, _names(base))\n",
+        "        Path(directory).mkdir(parents=True, exist_ok=True)\n"
+        "        os.link(str(rfile), str(Path(directory) / next(_names(base))))\n"
+        "        Path(rfile).unlink()\n"),
 }
 
 
 def _files(name: str) -> "list[Path]":
+    if name in IN_CLI:
+        return CLI
+    if name in IN_BRIDGE:
+        return BRIDGE
     return QUARANTINE if name in IN_QUARANTINE else DISPOSAL
 
 

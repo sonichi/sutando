@@ -82,16 +82,93 @@ class ConcurrentProducerAtTheMoveBoundary(unittest.TestCase):
         if outcome is uq.RestoreOutcome.RESTORED:
             self.assertEqual(target.read_text(encoding="utf-8"), "OLD quarantined body")
 
-    def test_without_a_primitive_restore_refuses_and_keeps_the_body(self):
+    def _no_primitive(self):
+        return unittest.mock.patch.multiple(uq, _RENAME=None, RENAME_PRIMITIVE="none")
+
+    def _aside(self):
+        return [p for p in (self.results / uq.DIRNAME).iterdir() if ".restored-" in p.name]
+
+    def test_without_a_primitive_restore_installs_by_link_and_keeps_the_copy_aside(self):
         task = "noprim1"
         q = self._quarantine(task, "OLD quarantined body", 1)
-        with unittest.mock.patch.object(uq, "_RENAME", None), \
-                unittest.mock.patch.object(uq, "RENAME_PRIMITIVE", "none"):
+        with self._no_primitive():
+            outcome, path = uq.restore(self.results, task)
+        target = self.results / f"task-{task}.txt"
+        self.assertIs(outcome, uq.RestoreOutcome.RESTORED)
+        self.assertEqual(path, target)
+        self.assertEqual(target.read_text(encoding="utf-8"), "OLD quarantined body")
+        self.assertFalse(q.exists(), "the quarantined name must no longer be offered for restore")
+        self.assertEqual(uq.find_quarantined(self.results, task), [])
+        self.assertEqual([p.read_text(encoding="utf-8") for p in self._aside()], ["OLD quarantined body"])
+
+    def test_without_a_primitive_a_name_taken_before_the_link_keeps_the_copy(self):
+        task = "noprim2"
+        q = self._quarantine(task, "OLD quarantined body", 1)
+        target = self.results / f"task-{task}.txt"
+        real_link = os.link
+
+        def producer_first(src, dst, *a, **k):
+            if Path(dst) == target:
+                target.write_text("NEW live reply", encoding="utf-8")
+            return real_link(src, dst, *a, **k)
+        with self._no_primitive(), unittest.mock.patch("os.link", producer_first):
+            outcome, _ = uq.restore(self.results, task)
+        self.assertIs(outcome, uq.RestoreOutcome.LIVE_RESULT_PRESENT)
+        self.assertEqual(target.read_text(encoding="utf-8"), "NEW live reply")
+        self.assertEqual(q.read_text(encoding="utf-8"), "OLD quarantined body")
+        self.assertEqual(self._aside(), [])
+
+    def test_without_a_primitive_or_hard_links_restore_refuses_and_keeps_the_body(self):
+        task = "noprim3"
+        q = self._quarantine(task, "OLD quarantined body", 1)
+        with self._no_primitive(), unittest.mock.patch("os.link", side_effect=PermissionError(1, "no links")):
             outcome, path = uq.restore(self.results, task)
         self.assertIs(outcome, uq.RestoreOutcome.NO_SAFE_MOVE)
         self.assertEqual(path, q)
         self.assertEqual(q.read_text(encoding="utf-8"), "OLD quarantined body")
         self.assertFalse((self.results / f"task-{task}.txt").exists())
+
+    def test_a_failed_aside_rename_still_reports_the_install(self):
+        task = "noprim4"
+        q = self._quarantine(task, "OLD quarantined body", 1)
+        with self._no_primitive(), unittest.mock.patch("os.rename", side_effect=OSError(5, "EIO")):
+            outcome, path = uq.restore(self.results, task)
+        self.assertIs(outcome, uq.RestoreOutcome.RESTORED)
+        self.assertEqual(path.read_text(encoding="utf-8"), "OLD quarantined body")
+        self.assertTrue(q.exists(), "the copy keeps its name when the aside rename fails")
+
+    def test_quarantine_without_a_primitive_never_unlinks_the_live_name(self):
+        live = self.results / "task-q1.txt"
+        live.write_text("refused body", encoding="utf-8")
+        real_unlink = os.unlink
+        unlinked = []
+
+        def watch(path, *a, **k):
+            unlinked.append(Path(path).name)
+            return real_unlink(path, *a, **k)
+        with self._no_primitive(), unittest.mock.patch("os.unlink", watch):
+            moved = uq.quarantine(live, self.results, when=7)
+        self.assertEqual(moved.read_text(encoding="utf-8"), "refused body")
+        self.assertFalse(live.exists())
+        self.assertNotIn(live.name, unlinked, "the live name was unlinked")
+        self.assertTrue(all(n.startswith(".") for n in unlinked), unlinked)
+
+    def test_quarantine_with_every_name_taken_refuses_and_leaves_the_result(self):
+        for i in range(uq._PLACE_TRIES):
+            self._quarantine("q3", f"evidence {i}", 9 + i)
+        live = self.results / "task-q3.txt"
+        live.write_text("refused body", encoding="utf-8")
+        with self.assertRaises(FileExistsError):
+            uq.quarantine(live, self.results, when=9)
+        self.assertEqual(live.read_text(encoding="utf-8"), "refused body")
+
+    def test_quarantine_never_replaces_earlier_evidence(self):
+        earlier = self._quarantine("q2", "EARLIER evidence", 7)
+        live = self.results / "task-q2.txt"
+        live.write_text("refused body", encoding="utf-8")
+        moved = uq.quarantine(live, self.results, when=7)
+        self.assertNotEqual(moved, earlier)
+        self.assertEqual(earlier.read_text(encoding="utf-8"), "EARLIER evidence")
 
     def test_the_ordinary_restore_still_works(self):
         """Negative control: with no concurrent writer the body is restored."""

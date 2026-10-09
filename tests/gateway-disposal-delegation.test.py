@@ -957,11 +957,14 @@ class BridgeDelegates(unittest.TestCase):
         self.assertIn("recover_abandoned_claims", self.calls_in("_recover_disposing_claims"))
         self.assertIn("_recover_disposing_claims", self.calls_in("_post_ready_results"))
         self.assertIn("_recover_disposing_claims", self.calls_in("_reconcile_orphan_results"))
+        self.assertIn("retire_current", self.calls_in("_retire_orphan"))
+        self.assertIn("_retire_orphan", self.calls_in("_quarantine_orphan"))
+        self.assertIn("_retire_orphan", self.calls_in("_reconcile_orphan_results"))
 
     # Every function of the bridge that still moves or removes a file, as of
     # this head; a new one is a private disposal path until proven otherwise.
     MOVERS = {"_atomic_private_json", "_backup_tier_map_to_disk", "_emit_gateway_status",
-              "_move_no_clobber", "_publish_staged", "_save_dedup_aliases", "_save_task_rooms",
+              "_publish_staged", "_save_dedup_aliases", "_save_task_rooms",
               "_write_owner_activity", "refresh_routing"}
 
     def test_no_filesystem_transition_outside_the_known_movers(self):
@@ -977,6 +980,9 @@ class BridgeDelegates(unittest.TestCase):
                     movers.setdefault(f.name, set()).add(f"{base or '?'}.{fn.attr}@{c.lineno}")
         self.assertEqual(set(movers) - self.MOVERS, set(),
                          f"a bridge function moves files on its own: {movers}")
+        links = [f"{c.lineno}" for c in ast.walk(self.tree) if isinstance(c, ast.Call)
+                 and isinstance(c.func, ast.Attribute) and c.func.attr in ("link", "link_to", "hardlink_to")]
+        self.assertEqual(links, [], "a hard link in the bridge is a private move into undelivered/")
         for literal in (".disposing-", "disposing-*", ".restore"):
             self.assertNotIn(literal, self.src, "the bridge must not know the claim namespace")
 

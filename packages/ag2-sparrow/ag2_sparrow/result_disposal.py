@@ -58,7 +58,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, Iterator, NamedTuple, Optional
+from typing import Callable, Iterable, Iterator, NamedTuple, Optional
 
 try:
     from .result_ready import ResultIdentity, identity_of
@@ -142,16 +142,8 @@ rename_noreplace = undelivered_quarantine.rename_noreplace
 
 
 def _move_into_quarantine(src: Path, dst: Path, log: Log) -> None:
-    """The mover `place` uses for a body held under a private claim name. Where
-    the platform has no no-replace rename a hard link refuses a taken target
-    just as atomically, and only the private source name is then dropped."""
-    try:
-        rename_noreplace(src, dst, log)
-    except FileExistsError as e:
-        if not undelivered_quarantine.no_primitive(e):
-            raise
-        os.link(src, dst)
-        os.unlink(src)                                  # a claim name: no producer retakes it
+    """The mover `place` uses for a body held under a private claim name."""
+    undelivered_quarantine.move_private(src, dst, log)
 
 
 def _place(src: Path, results_dir: Path, stem: str, log: Log) -> Path:
@@ -391,7 +383,8 @@ def _undo_move(moved: Path, rfile: Path, claim: Path, log: Log, stem: str) -> Op
 
 
 def _quarantine_generation(results_dir: Path, rfile: Path, generation: ResultIdentity,
-                           log: Log) -> Path:
+                           log: Log, placer: Optional[Callable[[Path], Path]] = None) -> Path:
+    placer = placer or (lambda src: _place(src, results_dir, rfile.stem, log))
     pid, start = self_token()
     claim = rfile.with_name(_NAME.format(stem=rfile.stem, pid=pid, start=start,
                                          acquired=int(time.time()), ino=generation.ino,
@@ -406,7 +399,7 @@ def _quarantine_generation(results_dir: Path, rfile: Path, generation: ResultIde
             try:
                 matches, _ = _verify_fd(fd, generation)
                 if matches:
-                    target = _place(claim, results_dir, rfile.stem, log)
+                    target = placer(claim)
                     if _still_is(fd, generation, log, rfile.stem, target):
                         return target
                     _undo_move(target, rfile, claim, log, rfile.stem)
@@ -446,6 +439,21 @@ def quarantine_current(results_dir: Path, rfile: Path, log: Log) -> Path:
     with locked(results_dir):
         _, generation = identity_of(rfile)
         return _quarantine_generation(Path(results_dir), Path(rfile), generation, log)
+
+
+def retire_current(results_dir: Path, rfile: Path, log: Log, directory: Path,
+                   names: "Iterable[str]") -> Path:
+    """Move what is at `rfile` now into `directory` under the first free of
+    `names`, through the same claim and verification as a quarantine, so a
+    reply that replaces it meanwhile stays live. Raises GenerationReplaced or
+    FileNotFoundError when the file it would move is no longer there."""
+    names = list(names)
+    with locked(results_dir):
+        _, generation = identity_of(rfile)
+        return _quarantine_generation(
+            Path(results_dir), Path(rfile), generation, log,
+            lambda src: undelivered_quarantine.place_as(
+                src, directory, names, lambda s, d: _move_into_quarantine(s, d, log)))
 
 
 def put_back(claim: Path, rfile: Path, log: Optional[Log] = None) -> bool:

@@ -309,6 +309,55 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             self.assertTrue(live.exists(), "the body must be back in the drain's view")
             self.assertEqual(len(uq.find_quarantined(results, ITEM)), 0)
 
+    def _no_primitive(self, links=True):
+        import unittest.mock as um
+        m = outbox_cli.undelivered_quarantine
+        ctx = [um.patch.object(m, "_RENAME", None), um.patch.object(m, "RENAME_PRIMITIVE", "none")]
+        if not links:
+            ctx.append(um.patch("os.link", side_effect=PermissionError(1, "no hard links")))
+        import contextlib
+        stack = contextlib.ExitStack()
+        for c in ctx:
+            stack.enter_context(c)
+        return stack
+
+    def test_without_a_no_replace_rename_requeue_still_restores_the_body(self):
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td, root_inside_results=True)
+            with self._no_primitive():
+                rc = outbox_cli.main(["--root", str(root), "requeue", ITEM])
+            self.assertEqual(rc, 0)
+            self.assertEqual((results / f"{ITEM}.txt").read_text(encoding="utf-8"), "the reply")
+            self.assertEqual(outbox.item_status(root, ITEM), "QUEUED")
+
+    def test_a_body_that_cannot_be_restored_fails_loudly_and_stays_parked(self):
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td, root_inside_results=True)
+            out = []
+            real = outbox_cli._emit
+            outbox_cli._emit = lambda rec, as_json: out.append(dict(rec))
+            try:
+                with self._no_primitive(links=False):
+                    rc = outbox_cli.main(["--root", str(root), "requeue", ITEM])
+            finally:
+                outbox_cli._emit = real
+            self.assertEqual(rc, 4, "a requeue that left the body quarantined must not exit 0")
+            self.assertEqual(outbox.item_status(root, ITEM), "PARKED",
+                             "a QUEUED record with no body would never send")
+            self.assertEqual(out[-1]["result"], "requeue-undone")
+            self.assertIn("could not be moved back", out[-1]["error"])
+            self.assertFalse((results / f"{ITEM}.txt").exists())
+            self.assertEqual(len(uq.find_quarantined(results, ITEM)), 1, "the body must stay intact")
+
+    def test_an_unrestorable_body_on_an_already_queued_record_is_not_reparked(self):
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td, root_inside_results=True)
+            outbox.requeue_item(root, ITEM)                  # the record half committed earlier
+            with self._no_primitive(links=False):
+                rc = outbox_cli.main(["--root", str(root), "requeue", ITEM])
+            self.assertEqual(rc, 4)
+            self.assertEqual(outbox.item_status(root, ITEM), "QUEUED")
+
     def test_a_retry_with_nothing_to_do_still_reports_nothing_to_do(self):
         """The exit code must not become 0 for every already-queued item, or the
         idempotent re-run loses the distinction the code exists to carry."""

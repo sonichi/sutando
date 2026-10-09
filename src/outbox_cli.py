@@ -83,7 +83,8 @@ def cmd_inspect(args) -> int:
 
 
 def cmd_requeue(args) -> int:
-    """Exit 0 only when this call performed the transition; 3 = nothing to do.
+    """Exit 0 only when this call performed the transition; 3 = nothing to do;
+    4 = the body could not be restored on this host (the item is left parked).
 
     A distinct code matters for the idempotent re-run: "already queued" is not
     a failure, and a script must be able to tell it from "I recovered it".
@@ -107,6 +108,16 @@ def cmd_requeue(args) -> int:
         payload["body"] = outcome.value
         payload["body_path"] = str(path) if path else None
         restored = outcome is undelivered_quarantine.RestoreOutcome.RESTORED
+        if outcome is undelivered_quarantine.RestoreOutcome.NO_SAFE_MOVE:
+            # A QUEUED record with no body would read as recovered and never send.
+            if result is outbox.RequeueOutcome.REQUEUED:
+                outbox.park_item(args.root, args.item_id,
+                                 reason="requeue undone: the body could not be restored on this host")
+                payload["result"] = "requeue-undone"
+            payload["error"] = (f"the quarantined body {path} could not be moved back on this host; "
+                                "it is untouched — copy it to the results directory by hand")
+            _emit(payload, args.json)
+            return 4
     _emit(payload, args.json)
     if result is outbox.RequeueOutcome.REQUEUED or restored:
         return 0

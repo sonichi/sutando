@@ -4880,29 +4880,31 @@ def _delivered_copy_exists(tid: str) -> bool:
                for p in ARCHIVE_RESULTS_DIR.glob(f"*/{tid}-*.txt"))
 
 
-def _move_no_clobber(src, dst) -> bool:
-    """Move src to dst or a uniquified sibling, never over an existing file:
-    os.link fails EEXIST atomically, where exists-then-rename clobbers."""
-    for candidate in (dst, dst.with_name(f"{dst.stem}.{time.time_ns()}{dst.suffix}")):
-        try:
-            os.link(str(src), str(candidate))
-        except FileExistsError:
-            continue
-        except OSError:
-            return False
-        try:
-            src.unlink()
-        except OSError:
-            pass
+def _names(base: str, tries: int = 64):
+    """`<base>.txt`, then `<base>.<ns>.txt`: the shapes the archive and
+    quarantine readers already parse."""
+    yield f"{base}.txt"
+    ns = time.time_ns()
+    for i in range(tries - 1):
+        yield f"{base}.{ns + i}.txt"
+
+
+def _retire_orphan(rfile, directory, base: str) -> bool:
+    """The lifecycle owner moves the file it finds there; a reply that replaces
+    it meanwhile stays live. False when nothing of this pass was moved."""
+    try:
+        disposal.retire_current(RESULTS_DIR, rfile, _log, directory, _names(base))
         return True
-    return False
+    except (disposal.GenerationReplaced, FileNotFoundError):
+        return False
+    except OSError as e:
+        _log(f"orphan sweep: {Path(rfile).stem} could not be moved ({e}); left in place")
+        return False
 
 
 def _quarantine_orphan(rfile, tid: str, reason: str) -> bool:
     """Never replaces prior quarantined evidence, under collision."""
-    UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    dst = UNDELIVERABLE_RESULTS_DIR / f"{tid}.{reason}.{int(time.time())}.txt"
-    return _move_no_clobber(rfile, dst)
+    return _retire_orphan(rfile, UNDELIVERABLE_RESULTS_DIR, f"{tid}.{reason}.{int(time.time())}")
 
 
 def _reconcile_orphan_results(inflight: "set[str]") -> None:
@@ -4949,9 +4951,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         # Delivered copy = double-write. NEVER re-deliver: the sweep would
         # post agent narration about having answered into the room.
         if _delivered_copy_exists(tid):
-            ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-            dst = ARCHIVE_RESULTS_DIR / f"{tid}-{int(now)}-late-duplicate.txt"
-            if _move_no_clobber(rfile, dst):
+            if _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, f"{tid}-{int(now)}-late-duplicate"):
                 _log(f"orphan sweep: {tid} is a post-delivery duplicate — moved aside")
             continue
         # No task anywhere: nothing resolves a destination — quarantine,

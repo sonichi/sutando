@@ -11,9 +11,11 @@ Every move into or out of the quarantine goes through ONE no-replace transition
 
 * into it (`place`): a quarantined copy is never overwritten — the target name is
   allocated fresh and a taken one is skipped, so earlier evidence always survives;
-* out of it (`restore`): the exact quarantined body is installed at the live name
-  in one atomic step, or it stays quarantined and the refusal is reported — never
-  a link-then-unlink a producer could interleave with.
+* out of it (`restore`): the exact quarantined body is installed at the live name,
+  or it stays quarantined and the refusal is reported. Where the platform has no
+  no-replace rename the install is a hard link (it refuses a taken name just as
+  atomically) and the quarantined name is then renamed aside, never unlinked: no
+  name a producer can retake is ever removed, and the body always keeps a name.
 
 Dependency-light on purpose: no bridge import, no gateway, no env. The caller
 supplies the results directory.
@@ -27,9 +29,10 @@ import os
 import re
 import sys
 import time
+import uuid
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 DIRNAME = "undelivered"
 # `<task stem>-<unix seconds>.txt`; the stem may itself contain hyphens.
@@ -115,38 +118,72 @@ def no_primitive(e: OSError) -> bool:
     return isinstance(e, FileExistsError) and e.errno == errno.ENOTSUP
 
 
+def move_private(src: Path, dst: Path, log: Optional[Log] = None) -> None:
+    """Move a body held under a PRIVATE name (one no producer writes) to `dst`,
+    never over a file. Without a no-replace rename a hard link refuses a taken
+    target just as atomically, and only the private source name is dropped."""
+    try:
+        rename_noreplace(src, dst, log)
+    except FileExistsError as e:
+        if not no_primitive(e):
+            raise
+        os.link(src, dst)
+        os.unlink(src)                                  # private: no producer retakes it
+
+
+def private_name(path: Path, tag: str) -> Path:
+    """A sibling nobody else creates, so a plain rename onto it replaces nothing."""
+    return Path(path).with_name(f".{Path(path).name}.{tag}-{time.time_ns()}-{uuid.uuid4().hex[:8]}")
+
+
 # Enough to step past any burst of same-nanosecond copies of one task.
 _PLACE_TRIES = 64
 
 
-def place(src: Path, results_dir: Path, stem: str,
-          move: Optional[Callable[[Path, Path], None]] = None,
-          when: Optional[int] = None) -> Path:
-    """Guarantee (into the quarantine): move `src` there under a name nothing
-    holds yet, never replacing a file. `move` must refuse a taken target with
-    FileExistsError(EEXIST); a taken name is skipped for the next one, so an
-    earlier quarantined copy always survives. Returns the new path."""
-    d = quarantine_dir(results_dir)
+def place_as(src: Path, directory: Path, names: Iterable[str],
+             move: Optional[Callable[[Path, Path], None]] = None) -> Path:
+    """Move `src` into `directory` under the first of `names` nothing holds,
+    never replacing a file: `move` must refuse a taken target with
+    FileExistsError(EEXIST), and a taken name is skipped for the next."""
+    d = Path(directory)
     d.mkdir(parents=True, exist_ok=True)
     move = move or rename_noreplace
-    n = int(when if when is not None else time.time_ns())
-    for _ in range(_PLACE_TRIES):
-        target = d / quarantine_name(stem, n)
+    for name in names:
+        target = d / name
         try:
             move(Path(src), target)
             return target
         except FileExistsError as e:
             if e.errno not in (None, errno.EEXIST):
                 raise
-            n += 1
-    raise FileExistsError(errno.EEXIST, "no free quarantine name", str(d))
+    raise FileExistsError(errno.EEXIST, "no free name", str(d))
+
+
+def place(src: Path, results_dir: Path, stem: str,
+          move: Optional[Callable[[Path, Path], None]] = None,
+          when: Optional[int] = None) -> Path:
+    """Guarantee (into the quarantine): move `src` there under a name nothing
+    holds yet, never replacing a file; a taken name is skipped for the next
+    one, so an earlier quarantined copy always survives. Returns the new path."""
+    n = int(when if when is not None else time.time_ns())
+    return place_as(src, quarantine_dir(results_dir),
+                    (quarantine_name(stem, n + i) for i in range(_PLACE_TRIES)), move)
 
 
 def quarantine(rfile: Path, results_dir: Path,
                when: Optional[int] = None) -> Path:
     """Move a refused result out of the drain's view, never over an earlier
-    quarantined copy. Returns the new path."""
-    return place(Path(rfile), results_dir, Path(rfile).stem, when=when)
+    quarantined copy. Returns the new path. Without a no-replace rename the
+    file is first taken under a private name, so the live name is never unlinked."""
+    src = Path(rfile)
+    try:
+        return place(src, results_dir, src.stem, when=when)
+    except FileExistsError as e:
+        if not no_primitive(e):
+            raise
+    held = private_name(src, "quarantining")
+    os.rename(src, held)
+    return place(held, results_dir, src.stem, move=move_private, when=when)
 
 
 def find_quarantined(results_dir: Path, task_id: str) -> list[Path]:
@@ -181,11 +218,10 @@ class RestoreOutcome(str, Enum):
 
 def restore(results_dir: Path, task_id: str) -> "tuple[RestoreOutcome, Optional[Path]]":
     """Guarantee (out of the quarantine): the NEWEST quarantined body is
-    installed at the drain's canonical name in one no-replace rename, or it
-    stays quarantined and the outcome says why. A live result is never
-    overwritten (a newer reply waiting to go is the one the user should get),
-    and the body is never left without a name: there is no link-then-unlink
-    for a producer retaking the name to interleave with.
+    installed at the drain's canonical name, or it stays quarantined and the
+    outcome says why. A live result is never overwritten (a newer reply waiting
+    to go is the one the user should get), and the body never loses its last
+    name: nothing a producer can retake is unlinked.
     """
     found = find_quarantined(results_dir, task_id)
     if not found:
@@ -195,7 +231,24 @@ def restore(results_dir: Path, task_id: str) -> "tuple[RestoreOutcome, Optional[
     try:
         rename_noreplace(found[-1], target)
     except FileExistsError as e:
-        if no_primitive(e):
-            return RestoreOutcome.NO_SAFE_MOVE, found[-1]
+        if not no_primitive(e):
+            return RestoreOutcome.LIVE_RESULT_PRESENT, target
+        return _restore_by_link(found[-1], target)
+    return RestoreOutcome.RESTORED, target
+
+
+def _restore_by_link(quarantined: Path, target: Path) -> "tuple[RestoreOutcome, Optional[Path]]":
+    """No no-replace rename here: a hard link installs the body and refuses a
+    taken name atomically; the quarantined name is then renamed aside (a name
+    `find_quarantined` does not match), so the body keeps a name either way."""
+    try:
+        os.link(quarantined, target)
+    except FileExistsError:
         return RestoreOutcome.LIVE_RESULT_PRESENT, target
+    except OSError:
+        return RestoreOutcome.NO_SAFE_MOVE, quarantined
+    try:
+        os.rename(quarantined, private_name(quarantined, "restored"))
+    except OSError:
+        pass                    # still quarantined too: a re-run sees the live name and stops
     return RestoreOutcome.RESTORED, target

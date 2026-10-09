@@ -607,6 +607,38 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertTrue(any('second name' in l for l in self.about()))
         self.assertTrue(any('terminal' in l for l in self.about()))
 
+    def test_without_a_no_replace_rename_the_printed_requeue_still_delivers(self):
+        # A host with no RENAME_NOREPLACE: the reply parked by a refusal must come
+        # back through the requeue the bridge prints, and then be delivered.
+        sys.path.insert(0, str(REPO / 'src'))
+        import outbox_cli
+        mods = {id(m): m for m in (undelivered_quarantine, getattr(disposal, 'undelivered_quarantine', None),
+                                   outbox_cli.undelivered_quarantine) if m is not None}
+        stack = contextlib.ExitStack()
+        for m in mods.values():
+            stack.enter_context(patch.object(m, 'RENAME_PRIMITIVE', 'none'))
+            stack.enter_context(patch.object(m, '_RENAME', None))
+        self.addCleanup(stack.close)
+        self.bridge()
+        self.task()
+        result = self.result('the parked answer')
+        gw._post_ready_results({TID})
+        self.assertFalse(result.exists())
+        self.assertEqual(len(self.quarantined()), 1)
+
+        def accept(method, path, payload):
+            self.server.calls.append(dict(payload))
+            return {'ok': True}
+        self.server.request = accept
+        rc = outbox_cli.main(['--root', str(self.outbox), 'requeue', TID, '--reset-attempts',
+                              '--results-dir', str(self.results), '--body-id', TID])
+        self.assertEqual(rc, 0)
+        self.assertTrue(result.exists(), 'the requeue did not put the body back')
+        self.assertEqual(self.quarantined(), [], 'the restored body is still where the drain cannot see it')
+        gw._post_ready_results({TID})
+        self.assertEqual([c.get('body') for c in self.server.calls][-1:], ['the parked answer'])
+        self.assertFalse(result.exists(), 'a delivered result stays rescannable')
+
     def test_a_recovery_precheck_error_never_blocks_delivery(self):
         # EIO from the results-dir precheck, through the real drain entry:
         # recovery skips and says so once; the ordinary result is still posted.
