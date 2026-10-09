@@ -93,10 +93,17 @@ python3 "$SKILL_DIR/scripts/fallback-config.py" set low-priority on
 python3 "$SKILL_DIR/scripts/fallback-config.py" unset 7d level1
 ```
 
-`set` validates `0 < value < 1` and `level1 < level2` per ladder, and that a target model is a Claude
-id whose family sits at exactly its level (`set level2-model claude-opsu-5-5` is refused, never
-routed). It writes `<workspace>/hosts/<host>/quota-fallback-config.json` (per host, beside
-`crons.json`) atomically and prints the effective ladder with each value's source. Precedence the
+`set` validates `0 < value < 1` and `level1 < level2` per ladder, that the hysteresis stays below
+every level1 line and every ladder's gap (a wider band would pin a tier until the window resets), and
+that a target model is a Claude id whose family sits at exactly its level (`set level2-model
+claude-opsu-5-5` is refused, never routed); the proxy's reader applies the same checks and falls back
+to the shipped default. It writes `<workspace>/hosts/<host>/quota-fallback-config.json` (per host,
+beside `crons.json`) atomically and prints the effective ladder with each value's source. The host
+label is the repo's shared resolver (`SUTANDO_HOST_LABEL` → Bonjour name → hostname) in both the
+proxy and the CLI, so **the proxy process must see the same `SUTANDO_HOST_LABEL` as the shell you
+run `fallback-config.py` from**; the proxy logs the override path it uses at startup
+(`[Fallback] owner override: …`) and `set` prints the label it resolved — compare them if a change
+does not land. Precedence the
 proxy applies: `SUTANDO_QUOTA_FALLBACK_*` env > that per-host override > `manifest.json` `config` >
 built-in — the per-host file sits above the shipped default because a running service must honor an
 owner change without a restart. `set enabled off` turns the rewrite off entirely.
@@ -119,8 +126,11 @@ reverts, and the `fallback-config set …` clause that moves that line. For exam
 > Fable requests now run on claude-opus-5-5; reverts once the rate slows (adjust with
 > `fallback-config set 5h projection-limit <0..1>`).
 
-At most one such line per window per 30 minutes (`set dm-min-interval-sec`); changes held inside
-the interval are summarised in the next line. Runtime-switch lines are never held.
+Escalations (a tier going up), recovery to the primary models and runtime-switch lines always go
+out. Only a de-escalation (tier 3 → 2) is rate-limited — at most one per window per 30 minutes
+(`set dm-min-interval-sec`) — and a held line is sent when the interval elapses even if nothing else
+happens; lines held meanwhile are summarised into the next one. The gate is in-memory, so a proxy
+restart resets its window.
 
 **Caveats.** The prompt cache is cold on every switch (caches are model-scoped). Claude Code's
 `/model` still shows the model the user picked; `quota-state.json`'s `last_request.model` and

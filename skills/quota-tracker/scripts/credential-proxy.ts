@@ -21,9 +21,9 @@ import { createHash } from 'node:crypto';
 import { resolveWorkspace, statusPath } from '../../../src/workspace_default.js';
 import { resolveHostLabel } from '../../../src/util_paths.js';
 import {
-	decideModel, gateLine, initialState, nextState, observationFromHeaders, pushSample, requestPriority,
-	rewriteModel, samplesFromHistoryRows, stateChanged, transitionLine,
-	type DmGate, type FallbackConfig, type FallbackState, type Sample,
+	decideModel, flushHeld, gateLine, initialState, nextFlushAt, nextState, observationFromHeaders, pushSample,
+	requestPriority, rewriteModel, samplesFromHistoryRows, stateChanged, transitionLine,
+	type DmGate, type DmKind, type FallbackConfig, type FallbackState, type Sample,
 } from './quota-fallback-policy.js';
 import { createConfigReader, OVERRIDE_BASENAME, SKILL_MANIFEST_PATH } from './quota-fallback-config.js';
 
@@ -452,6 +452,23 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 	let samples: Sample[] = [];
 	try { samples = deps.readHistorySamples(deps.now(), deps.fallbackConfig().projection5h.lookbackSec); } catch { samples = []; }
 	let dmGate: DmGate = { last_sent: {}, held: {} };
+	let flushTimer: NodeJS.Timeout | null = null;
+
+	// A held line must not wait for the next event: send it when its interval elapses.
+	function scheduleFlush(): void {
+		const intervalMs = deps.fallbackConfig().dmMinIntervalSec * 1000;
+		const due = nextFlushAt(dmGate, intervalMs);
+		if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+		if (due === null) return;
+		flushTimer = setTimeout(() => {
+			flushTimer = null;
+			const r = flushHeld(dmGate, deps.now(), deps.fallbackConfig().dmMinIntervalSec * 1000);
+			dmGate = r.gate;
+			for (const l of r.send) { try { deps.notifyOwner(l); } catch { /* best effort */ } }
+			scheduleFlush();
+		}, Math.max(due - deps.now(), 0) + 50);
+		flushTimer.unref?.();
+	}
 
 	function observeQuota(quotaHeaders: Record<string, string>): void {
 		const cfg = deps.fallbackConfig();
@@ -469,11 +486,13 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		}
 		if (line) {
 			const switched = (next.runtime_switch?.to ?? null) !== (prev?.runtime_switch?.to ?? null);
-			const key = switched ? 'runtime' : (next.fired?.window ?? prev?.fired?.window ?? 'tier');
-			const gated = gateLine(dmGate, key, line, nowMs, cfg.dmMinIntervalSec * 1000);
+			const prevTier = prev?.tier ?? 1;
+			const kind: DmKind = switched ? 'runtime' : next.tier > prevTier ? 'escalation' : next.tier === 1 ? 'recovery' : 'lateral';
+			const key = next.fired?.window ?? prev?.fired?.window ?? 'tier';
+			const gated = gateLine(dmGate, key, kind, line, nowMs, cfg.dmMinIntervalSec * 1000);
 			dmGate = gated.gate;
 			if (gated.send) { try { deps.notifyOwner(gated.send); } catch { /* best effort */ } }
-			else console.log(`${ts()} [Fallback] DM held (${key} within ${cfg.dmMinIntervalSec}s): ${line}`);
+			else { console.log(`${ts()} [Fallback] DM held (${key} ${kind} within ${cfg.dmMinIntervalSec}s): ${line}`); scheduleFlush(); }
 		}
 	}
 
@@ -779,11 +798,18 @@ function recordRejection(rej: RejectionRecord): void {
 	} catch { /* best effort */ }
 }
 
-const productionFallbackConfig = createConfigReader({
-	manifestPath: SKILL_MANIFEST_PATH,
-	overridePath: join(resolveWorkspace(), 'hosts', resolveHostLabel(), OVERRIDE_BASENAME),
-	env: process.env,
-});
+/** The owner's per-host override; the same label the shell's fallback-config.py resolves. */
+export function productionOverridePath(): string {
+	return join(resolveWorkspace(), 'hosts', resolveHostLabel(), OVERRIDE_BASENAME);
+}
+
+// Lazy: resolving the host label (scutil) and reading the override belong to a
+// running proxy, not to importing this module.
+let fallbackReader: (() => FallbackConfig) | null = null;
+function productionFallbackConfig(): FallbackConfig {
+	fallbackReader ??= createConfigReader({ manifestPath: SKILL_MANIFEST_PATH, overridePath: productionOverridePath(), env: process.env });
+	return fallbackReader();
+}
 
 // The persisted record may predate a field; each window is filled from the
 // initial shape so arithmetic on it never sees undefined.
@@ -909,6 +935,7 @@ if (isMain) {
 	console.log(`${ts()} [Fallback] ${fb.enabled ? 'on' : 'off'}: 5h level1 ${fb.thresholds['5h'].level1}/level2 ${fb.thresholds['5h'].level2}` +
 		` (projection ${fb.projection5h.enabled ? `on, limit ${fb.projection5h.limit}` : 'off'}), 7d level1 ${fb.thresholds['7d'].level1}/level2 ${fb.thresholds['7d'].level2}` +
 		`, hysteresis ${fb.hysteresis}, → ${fb.level2Model} / ${fb.level3Model}, low-priority ${fb.lowPriorityEnabled ? 'on' : 'off'}`);
+	console.log(`${ts()} [Fallback] owner override: ${productionOverridePath()} (per host — fallback-config.py must resolve the same SUTANDO_HOST_LABEL as this process)`);
 
 	createProxyServer().listen(PORT, '127.0.0.1', () => {
 		console.log(`${ts()} [Proxy] Credential proxy → http://localhost:${PORT}`);

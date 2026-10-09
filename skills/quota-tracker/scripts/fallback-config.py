@@ -154,14 +154,23 @@ def family_levels(values: dict[str, str]) -> dict[str, int]:
 
 
 def validate_merged(values: dict[str, str]) -> None:
-    """After the merge: every ladder keeps level1 < level2, and each target model is a
-    Claude id whose family sits at exactly its level (a typo is refused, never routed)."""
+    """After the merge: every ladder keeps level1 < level2 with hysteresis inside it, and each
+    target model is a Claude id whose family sits at exactly its level (a typo is refused, never routed)."""
     for lo, hi in _LADDERS:
         a, b = values.get(P + lo), values.get(P + hi)
         if a is None or b is None:
             continue
         if float(a) >= float(b):
             raise ValueError(f"{lo.lower().replace('_', ' ')} ({a}) must be below {hi.lower().replace('_', ' ')} ({b})")
+    h = values.get(P + "HYSTERESIS")
+    if h is not None:
+        for lo, hi in _LADDERS:
+            a, b = values.get(P + lo), values.get(P + hi)
+            if a is None or b is None:
+                continue
+            if float(h) >= float(a) or float(h) >= float(b) - float(a):
+                raise ValueError(f"hysteresis ({h}) must stay below {lo.lower().replace('_', ' ')} ({a}) and below the "
+                                 f"{lo[:-7].lower()} ladder's gap ({float(b) - float(a):.3g}); a wider band would pin a tier until the window resets")
     fams = family_levels(values)
     for suffix, level in _MODEL_LEVEL.items():
         m = values.get(P + suffix)
@@ -236,6 +245,8 @@ def main(argv: list[str], workspace: Path | None = None, env: dict[str, str] | N
             write_override(path, new)
             print(f"set {key} = {new[key]} (override file: {path})\n")
             print(render(manifest, new, env))
+            print(f"\nThe proxy re-reads this file within 2s; it must resolve the same host label "
+                  f"({host_label()}) — see its startup log line 'owner override:'.")
             return 0
         if cmd == "unset":
             key, _ = resolve_setting(rest)

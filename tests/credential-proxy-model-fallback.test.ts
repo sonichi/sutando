@@ -136,22 +136,29 @@ test('above the 7d level2 line every Claude request above Sonnet runs on the lev
 	assert.match(h.notified[0], /Fable and Opus requests now run on claude-sonnet-5/);
 });
 
-test('tier-change DMs are rate-limited per window: the second change inside the interval is held and summarised in the next one', async () => {
+test('DM gate: recovery and escalation inside the interval are sent; a de-escalation is held and flushed by the timer', async () => {
 	NOW = 1_700_000_000_000;
-	const h = await start({ ...CFG, dmMinIntervalSec: 1800 });
-	h.setUpstreamHeaders(H7('0.86'));
-	await call(h.port, '{"model":"claude-opus-5-5","messages":[]}');
-	NOW += 60_000;
-	h.setUpstreamHeaders(H7('0.50'));
-	await call(h.port, '{"model":"claude-opus-5-5","messages":[]}');
-	assert.strictEqual(h.notified.length, 1, 'the revert one minute later is held');
-	assert.strictEqual(h.recorded.at(-1)?.tier, 1, '...but the state still moved');
-	NOW += 1800_000;
-	h.setUpstreamHeaders(H7('0.96'));
-	await call(h.port, '{"model":"claude-opus-5-5","messages":[]}');
-	assert.strictEqual(h.notified.length, 2);
+	const h = await start({ ...CFG, dmMinIntervalSec: 1 }); // 1 s so the flush timer fires inside the test
+	const opus = '{"model":"claude-opus-5-5","messages":[]}';
+	h.setUpstreamHeaders(H7('0.86')); await call(h.port, opus);                 // 1 → 2
+	NOW += 100; h.setUpstreamHeaders(H7('0.96')); await call(h.port, opus);     // 2 → 3, inside the interval
+	assert.strictEqual(h.notified.length, 2, 'an escalation is never held');
 	assert.match(h.notified[1], /^Quota 7d window 96% is over the 95% line/);
-	assert.match(h.notified[1], /\[1 earlier change\(s\) held since the last message: Quota eased \(5h 20%, 7d 50%\) — back on the primary models\.\]$/);
+	NOW += 100; h.setUpstreamHeaders(H7('0.90')); await call(h.port, opus);     // 3 → 2 (under the 0.92 clear line): held
+	assert.strictEqual(h.notified.length, 2, 'a de-escalation inside the interval is held');
+	assert.strictEqual(h.recorded.at(-1)?.tier, 2, '...but the state still moved');
+	NOW += 100; h.setUpstreamHeaders(H7('0.50')); await call(h.port, opus);     // 2 → 1: recovery
+	assert.strictEqual(h.notified.length, 3, 'recovery to the primary models is never held');
+	assert.match(h.notified[2], /^Quota eased \(5h 20%, 7d 50%\) — back on the primary models\. \[1 earlier change\(s\) held since the last message: Quota 7d window 90%/);
+
+	// A held line with no later event is flushed when the interval elapses.
+	NOW += 100; h.setUpstreamHeaders(H7('0.96')); await call(h.port, opus);     // 1 → 3
+	NOW += 100; h.setUpstreamHeaders(H7('0.90')); await call(h.port, opus);     // 3 → 2 (under the 0.92 clear line): held
+	assert.strictEqual(h.notified.length, 4);
+	NOW += 1100;                                                                 // the interval (1 s) elapses in proxy time
+	await new Promise((r) => setTimeout(r, 1300));                               // ...and the real timer fires
+	assert.strictEqual(h.notified.length, 5, 'the held de-escalation was flushed without a new event');
+	assert.match(h.notified[4], /^Quota 7d window 90% is over the 85% line — Fable requests now run on claude-opus-5-5/);
 	NOW = 1_700_000_000_000;
 });
 

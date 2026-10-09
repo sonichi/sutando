@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
-	DEFAULT_FALLBACK_CONFIG as D, clearLine, decideModel, fiveHourTier, gateLine, initialState, modelLevel, nextState,
+	DEFAULT_FALLBACK_CONFIG as D, clearLine, decideModel, fiveHourTier, flushHeld, gateLine, initialState, modelLevel, nextFlushAt, nextState,
 	observationFromHeaders, projectFiveHour, pushSample, requestPriority, rewriteModel, samplesFromHistoryRows,
 	splitModel, stateChanged, transitionLine, validModelForLevel, windowTier,
 	type DmGate, type FallbackConfig, type FallbackState, type QuotaObservation, type Sample,
@@ -53,21 +53,32 @@ test('hysteresis is bounded: a tier\'s clear line never sinks below the next tie
 	assert.strictEqual(windowTier(2, 0.865, tight, 0.03, false), 1);
 });
 
-test('DM gate: one line per window per interval, held lines summarised in the next, runtime-switch lines exempt', () => {
+test('DM gate: escalation, recovery and runtime lines always go out; only a de-escalation is held, and it flushes on its own', () => {
+	const I = 1800_000;
 	let g: DmGate = { last_sent: {}, held: {} };
-	let r = gateLine(g, '7d', 'A', T0, 1800_000); g = r.gate;
-	assert.strictEqual(r.send, 'A', 'the first line goes out at once');
-	r = gateLine(g, '7d', 'B', T0 + 60_000, 1800_000); g = r.gate;
-	assert.strictEqual(r.send, null, 'inside the interval: held');
-	r = gateLine(g, '5h', 'C', T0 + 61_000, 1800_000); g = r.gate;
-	assert.strictEqual(r.send, 'C', 'another window has its own budget');
-	r = gateLine(g, 'runtime', 'R', T0 + 62_000, 1800_000); g = r.gate;
-	assert.strictEqual(r.send, 'R', 'a runtime switch is never held');
-	r = gateLine(g, '7d', 'D', T0 + 1800_000, 1800_000); g = r.gate;
-	assert.strictEqual(r.send, 'D [1 earlier change(s) held since the last message: B]');
-	r = gateLine(g, '7d', 'E', T0 + 3600_000, 1800_000); g = r.gate;
-	assert.strictEqual(r.send, 'E', 'the held list was flushed');
-	assert.strictEqual(gateLine(g, '7d', 'F', T0 + 3600_001, 0).send, 'F', 'interval 0 disables the gate');
+	let r = gateLine(g, '7d', 'escalation', 'up to 2', T0, I); g = r.gate;
+	assert.strictEqual(r.send, 'up to 2');
+	r = gateLine(g, '7d', 'escalation', 'up to 3', T0 + 60_000, I); g = r.gate;
+	assert.strictEqual(r.send, 'up to 3', 'an escalation inside the interval is never held');
+	r = gateLine(g, '7d', 'lateral', 'down to 2', T0 + 120_000, I); g = r.gate;
+	assert.strictEqual(r.send, null, 'a de-escalation inside the interval is held');
+	assert.strictEqual(nextFlushAt(g, I), T0 + 60_000 + I, 'due when the window that started at the last sent line elapses');
+	r = gateLine(g, '7d', 'recovery', 'back to primary', T0 + 180_000, I); g = r.gate;
+	assert.strictEqual(r.send, 'back to primary [1 earlier change(s) held since the last message: down to 2]', 'recovery is never held and carries the held line');
+	assert.strictEqual(nextFlushAt(g, I), null);
+	r = gateLine(g, 'runtime', 'runtime', 'codex', T0 + 181_000, I); g = r.gate;
+	assert.strictEqual(r.send, 'codex');
+	// Timer flush: a held line with no later event goes out when the interval elapses.
+	r = gateLine(g, '7d', 'escalation', 'up to 3 again', T0 + 200_000, I); g = r.gate;
+	r = gateLine(g, '7d', 'lateral', 'down A', T0 + 210_000, I); g = r.gate;
+	r = gateLine(g, '7d', 'lateral', 'down B', T0 + 220_000, I); g = r.gate;
+	assert.strictEqual(r.send, null);
+	let f = flushHeld(g, T0 + 200_000 + I - 1, I);
+	assert.deepStrictEqual(f.send, [], 'not due yet');
+	f = flushHeld(g, T0 + 200_000 + I, I); g = f.gate;
+	assert.deepStrictEqual(f.send, ['down B [1 earlier change(s) held since the last message: down A]'], 'the latest held line goes out, the rest summarised');
+	assert.strictEqual(nextFlushAt(g, I), null, 'flushed');
+	assert.strictEqual(gateLine(g, '7d', 'lateral', 'C', T0 + 200_000 + I + 1, 0).send, 'C', 'interval 0 disables the gate');
 });
 
 test('model levels by family; the [1m] variant is preserved as a suffix; unknown models have no level', () => {

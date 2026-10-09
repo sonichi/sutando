@@ -481,22 +481,53 @@ export function transitionLine(prev: FallbackState | null, next: FallbackState, 
 	return `Quota ${f.window} window ${usage} is over the ${pct(f.threshold)} line — ${what}; reverts below ${back} (move the line with \`${adjust}\`).`;
 }
 
-/** Owner-DM rate gate: at most one line per key per interval; held lines are summarised in the next one. */
+/**
+ * Owner-DM rate gate. Escalations, recovery to the primary tier and runtime
+ * switches always go out; only a de-escalation (tier 3 → 2) is held, at most one
+ * per window per interval, and a held line is flushed when the interval elapses.
+ */
+export type DmKind = 'escalation' | 'recovery' | 'runtime' | 'lateral';
+
 export interface DmGate {
 	last_sent: Record<string, number>;
 	held: Record<string, string[]>;
 }
 
-export function gateLine(gate: DmGate, key: string, line: string, nowMs: number, minIntervalMs: number): { gate: DmGate; send: string | null } {
+function withSummary(line: string, held: string[]): string {
+	return held.length ? `${line} [${held.length} earlier change(s) held since the last message: ${held.join(' | ')}]` : line;
+}
+
+export function gateLine(gate: DmGate, key: string, kind: DmKind, line: string, nowMs: number, minIntervalMs: number): { gate: DmGate; send: string | null } {
 	const last = gate.last_sent[key];
-	const exempt = minIntervalMs <= 0 || key === 'runtime';
-	if (!exempt && last !== undefined && nowMs - last < minIntervalMs) {
+	const inWindow = last !== undefined && nowMs - last < minIntervalMs;
+	if (kind === 'lateral' && minIntervalMs > 0 && inWindow) {
 		return { gate: { ...gate, held: { ...gate.held, [key]: [...(gate.held[key] ?? []), line] } }, send: null };
 	}
-	const held = gate.held[key] ?? [];
-	const summary = held.length ? ` [${held.length} earlier change(s) held since the last message: ${held.join(' | ')}]` : '';
 	return {
 		gate: { last_sent: { ...gate.last_sent, [key]: nowMs }, held: { ...gate.held, [key]: [] } },
-		send: `${line}${summary}`,
+		send: withSummary(line, gate.held[key] ?? []),
 	};
+}
+
+/** Held lines whose interval has elapsed: the latest goes out, the rest are summarised into it. */
+export function flushHeld(gate: DmGate, nowMs: number, minIntervalMs: number): { gate: DmGate; send: string[] } {
+	let out = gate;
+	const send: string[] = [];
+	for (const [key, held] of Object.entries(gate.held)) {
+		if (!held.length || nowMs - (gate.last_sent[key] ?? 0) < minIntervalMs) continue;
+		send.push(withSummary(held[held.length - 1], held.slice(0, -1)));
+		out = { last_sent: { ...out.last_sent, [key]: nowMs }, held: { ...out.held, [key]: [] } };
+	}
+	return { gate: out, send };
+}
+
+/** When the earliest held line becomes due, or null when nothing is held. */
+export function nextFlushAt(gate: DmGate, minIntervalMs: number): number | null {
+	let due: number | null = null;
+	for (const [key, held] of Object.entries(gate.held)) {
+		if (!held.length) continue;
+		const at = (gate.last_sent[key] ?? 0) + minIntervalMs;
+		due = due === null ? at : Math.min(due, at);
+	}
+	return due;
 }

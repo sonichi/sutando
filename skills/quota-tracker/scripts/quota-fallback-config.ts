@@ -8,7 +8,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_FALLBACK_CONFIG, validModelForLevel, type FallbackConfig, type Level } from './quota-fallback-policy.js';
+import { DEFAULT_FALLBACK_CONFIG, validModelForLevel, type FallbackConfig, type Level, type Window, type WindowThresholds } from './quota-fallback-policy.js';
 
 /** Owner overrides are per host: <workspace>/hosts/<host>/<basename>, beside crons.json. */
 export const OVERRIDE_BASENAME = 'quota-fallback-config.json';
@@ -67,6 +67,11 @@ export function parseFamilyLevels(v: string | undefined, dflt: Record<string, Le
 	return Object.keys(out).length ? out : dflt;
 }
 
+/** Hysteresis must leave every ladder a band: below each level1 line and each level2 − level1 gap. */
+export function hysteresisBound(thresholds: Record<Window, WindowThresholds>, low: WindowThresholds): number {
+	return Math.min(...[thresholds['5h'], thresholds['7d'], low].flatMap((t) => [t.level1, t.level2 - t.level1]));
+}
+
 /** Pure: merged raw strings → a validated config; anything unparsable falls back per field. */
 export function parseFallbackConfig(raw: RawConfig, dflt: FallbackConfig = DEFAULT_FALLBACK_CONFIG): FallbackConfig {
 	const g = (k: string): string | undefined => raw[`${P}${k}`];
@@ -74,12 +79,16 @@ export function parseFallbackConfig(raw: RawConfig, dflt: FallbackConfig = DEFAU
 		const t = { level1: frac(g(`${w}_LEVEL1`), d.level1), level2: frac(g(`${w}_LEVEL2`), d.level2) };
 		return t.level1 < t.level2 ? t : d; // an inverted ladder is a typo, not a policy
 	};
-	const low = { level1: frac(g('LOW_LEVEL1'), dflt.lowThresholds.level1), level2: frac(g('LOW_LEVEL2'), dflt.lowThresholds.level2) };
+	const lowRaw = { level1: frac(g('LOW_LEVEL1'), dflt.lowThresholds.level1), level2: frac(g('LOW_LEVEL2'), dflt.lowThresholds.level2) };
+	const low = lowRaw.level1 < lowRaw.level2 ? lowRaw : dflt.lowThresholds;
+	const thresholds = { '5h': win('5H', dflt.thresholds['5h']), '7d': win('7D', dflt.thresholds['7d']) };
+	const bound = hysteresisBound(thresholds, low);
+	const h = frac(g('HYSTERESIS'), dflt.hysteresis);
 	const families = parseFamilyLevels(g('FAMILY_LEVELS'), dflt.familyLevels);
 	return {
 		enabled: flag(g('ENABLED'), dflt.enabled),
-		thresholds: { '5h': win('5H', dflt.thresholds['5h']), '7d': win('7D', dflt.thresholds['7d']) },
-		hysteresis: frac(g('HYSTERESIS'), dflt.hysteresis),
+		thresholds,
+		hysteresis: h < bound ? h : bound / 2, // a band that swallows a line would pin the tier until reset
 		projection5h: {
 			enabled: flag(g('5H_PROJECTION'), dflt.projection5h.enabled),
 			limit: frac(g('5H_PROJECTION_LIMIT'), dflt.projection5h.limit),
@@ -90,7 +99,7 @@ export function parseFallbackConfig(raw: RawConfig, dflt: FallbackConfig = DEFAU
 			escalateAfterSec: count(g('5H_PROJECTION_ESCALATE_AFTER_SEC'), dflt.projection5h.escalateAfterSec),
 		},
 		lowPriorityEnabled: flag(g('LOW_PRIORITY'), dflt.lowPriorityEnabled),
-		lowThresholds: low.level1 < low.level2 ? low : dflt.lowThresholds,
+		lowThresholds: low,
 		level2Model: model(g('LEVEL2_MODEL'), 2, families, dflt.level2Model),
 		level3Model: model(g('LEVEL3_MODEL'), 3, families, dflt.level3Model),
 		familyLevels: families,

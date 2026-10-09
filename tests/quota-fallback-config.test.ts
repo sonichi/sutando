@@ -9,7 +9,7 @@ import { mkdtempSync, writeFileSync, utimesSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
-	CONFIG_KEYS, SKILL_MANIFEST_PATH, createConfigReader, manifestConfig, mergeLayers, parseFallbackConfig, parseFamilyLevels,
+	CONFIG_KEYS, SKILL_MANIFEST_PATH, createConfigReader, hysteresisBound, manifestConfig, mergeLayers, parseFallbackConfig, parseFamilyLevels,
 } from '../skills/quota-tracker/scripts/quota-fallback-config.ts';
 import { DEFAULT_FALLBACK_CONFIG as D } from '../skills/quota-tracker/scripts/quota-fallback-policy.ts';
 
@@ -59,6 +59,15 @@ test('malformed values fall back per field; an inverted ladder keeps the default
 	const custom = parseFallbackConfig({ SUTANDO_QUOTA_FALLBACK_FAMILY_LEVELS: 'fable:1,opus:2,haiku:3', SUTANDO_QUOTA_FALLBACK_LEVEL3_MODEL: 'claude-haiku-4-5' });
 	assert.strictEqual(custom.level3Model, 'claude-haiku-4-5', 'validated against the configured families');
 	assert.deepStrictEqual(parseFamilyLevels('fable:1, opus:2', D.familyLevels), { fable: 1, opus: 2 });
+});
+
+test('hysteresis is kept inside every ladder: a band that would swallow a line falls back to half the tightest gap', () => {
+	assert.ok(Math.abs(hysteresisBound(D.thresholds, D.lowThresholds) - 0.07) < 1e-9, 'the 5h gap 0.97 − 0.90 is the tightest');
+	assert.strictEqual(parseFallbackConfig({ SUTANDO_QUOTA_FALLBACK_HYSTERESIS: '0.06' }).hysteresis, 0.06);
+	assert.ok(Math.abs(parseFallbackConfig({ SUTANDO_QUOTA_FALLBACK_HYSTERESIS: '0.07' }).hysteresis - 0.035) < 1e-9, 'at the gap: halved');
+	assert.ok(Math.abs(parseFallbackConfig({ SUTANDO_QUOTA_FALLBACK_HYSTERESIS: '0.5' }).hysteresis - 0.035) < 1e-9);
+	const tight = parseFallbackConfig({ SUTANDO_QUOTA_FALLBACK_7D_LEVEL1: '0.02', SUTANDO_QUOTA_FALLBACK_7D_LEVEL2: '0.95' });
+	assert.strictEqual(tight.hysteresis, 0.01, 'the default 0.03 would exceed a 0.02 level1 line: halved to 0.01');
 });
 
 test('the reader picks up an override written later without a restart, and ignores the file when absent', () => {

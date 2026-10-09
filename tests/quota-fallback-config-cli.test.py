@@ -123,6 +123,18 @@ class TestFallbackConfigCli(unittest.TestCase):
         self.assertEqual(self.run_cli("set", "7d", "level2", "0.99")[0], 0)
         self.assertEqual(self.run_cli("set", "7d", "level1", "0.96")[0], 0)
 
+    def test_hysteresis_must_fit_inside_every_ladder(self):
+        rc, _, err = self.run_cli("set", "hysteresis", "0.07")       # equals the 5h gap 0.97 − 0.90
+        self.assertEqual(rc, 2)
+        self.assertIn("pin a tier", err)
+        rc, _, err = self.run_cli("set", "hysteresis", "0.9")
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.run_cli("set", "hysteresis", "0.06")[0], 0)
+        rc, _, err = self.run_cli("set", "7d", "level1", "0.05")      # under the (now 0.06) band
+        self.assertEqual(rc, 2)
+        self.assertIn("hysteresis", err)
+        self.assertEqual(self.run_cli("set", "7d", "level1", "0.80")[0], 0)
+
     def test_env_wins_over_override_in_show(self):
         self.run_cli("set", "7d", "level1", "0.90")
         rc, out, _ = self.run_cli("show", env={"SUTANDO_QUOTA_FALLBACK_7D_LEVEL1": "0.80"})
