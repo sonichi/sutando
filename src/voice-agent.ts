@@ -43,6 +43,7 @@ import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
 import { attachMeetingDictation, MEETING_ENTRY_SAY } from './meeting-dictation.js';
+import { meetingCueAudio } from './meeting-cue-audio.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
@@ -441,11 +442,13 @@ function noteMeetingState(on: boolean) {
 }
 // Only the latest entry's failure may turn meeting mode off; an older one can fail while a newer one is transcribing.
 let meetingEntrySeq = 0;
+// The cue in the session's own voice, rendered once at startup; until then (or if it fails) the page speaks the text.
+let meetingCueWav: string | null = null;
 function enterMeetingDictation() {
 	const seq = ++meetingEntrySeq;
 	// The confirmation is a fixed cue the web client speaks with the mic muted: spoken by the model,
 	// any sound could cut it off, and the transcriber would write it into the note.
-	try { sessionRef?.sendJsonToClient({ type: 'meeting.cue', text: MEETING_ENTRY_SAY } as never); } catch { /* no client */ }
+	try { sessionRef?.sendJsonToClient({ type: 'meeting.cue', text: MEETING_ENTRY_SAY, audio: meetingCueWav ?? undefined } as never); } catch { /* no client */ }
 	meetingDictation?.enter().catch((err) => {
 		console.error(`${ts()} [MeetingDictation] enter failed: ${err?.message ?? err}`);
 		if (seq !== meetingEntrySeq) return;
@@ -1254,6 +1257,8 @@ async function main() {
 	});
 
 	sessionRef = session;
+	void meetingCueAudio({ apiKey: GEMINI_VOICE_API_KEY, voice: VOICE_NAME, text: MEETING_ENTRY_SAY, dir: join(WORKSPACE_DIR, 'state', 'cues') })
+		.then((wav) => { meetingCueWav = wav; console.log(`${ts()} [Meeting] entry cue ${wav ? `ready in voice ${VOICE_NAME}` : 'not rendered; the page will speak it'}`); });
 	meetingDictation = attachMeetingDictation({
 		session: session as any,
 		notePathFor: (today) => sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR),

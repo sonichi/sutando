@@ -2347,7 +2347,7 @@ function handleProtocolMessage(msg) {
     if (voice) { voice.disconnect(); }
     doCleanup();
   } else if (msg.type === 'meeting.cue') {
-    playMeetingCue(String(msg.text || ''));
+    playMeetingCue(String(msg.text || ''), typeof msg.audio === 'string' ? msg.audio : '');
   } else if (msg.type === 'task.status') {
     updateTask(msg.taskId, msg.status, msg.text, msg.result);
   } else if (msg.type === 'grounding') {
@@ -2727,12 +2727,15 @@ function toggleWatch() {
 window.toggleWatch = toggleWatch;
 
 // ─── Meeting-mode cue ─────────────────────────────────────
-// The meeting-mode confirmation is a fixed sentence the page speaks itself. The mic is muted while
-// it plays, so no sound can cut it off and the transcriber does not write it into the note.
-function playMeetingCue(text) {
+// The meeting-mode confirmation is a fixed cue the page plays itself: the recording in the session's
+// voice when the server has one, else speech synthesis. The mic is muted meanwhile, so no sound can
+// cut it off and the transcriber does not write it into the note.
+function playMeetingCue(text, audio) {
   if (!text) return;
   addSystem(text);
-  if (!window.speechSynthesis || typeof SpeechSynthesisUtterance === 'undefined') return;
+  var canSpeak = !!window.speechSynthesis && typeof SpeechSynthesisUtterance !== 'undefined';
+  var canPlay = !!audio && typeof Audio !== 'undefined';
+  if (!canSpeak && !canPlay) return;
   var heldMic = !!voice && !muted;
   if (heldMic) voice.setMicMuted(true);
   var released = false;
@@ -2742,15 +2745,31 @@ function playMeetingCue(text) {
     // A user who muted during the cue stays muted.
     if (heldMic && voice && !muted) voice.setMicMuted(false);
   }
-  try {
-    var utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = 'en-US';
-    utterance.onend = release;
-    utterance.onerror = release;
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(utterance);
-    setTimeout(release, 20000);
-  } catch (e) { release(); }
+  function speak() {
+    if (!canSpeak) { release(); return; }
+    try {
+      var utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'en-US';
+      utterance.onend = release;
+      utterance.onerror = release;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(utterance);
+    } catch (e) { release(); }
+  }
+  setTimeout(release, 20000);
+  if (canPlay) {
+    try {
+      var clip = new Audio('data:audio/wav;base64,' + audio);
+      var fellBack = false;
+      var fallBack = function () { if (fellBack) return; fellBack = true; speak(); };
+      clip.onended = release;
+      clip.onerror = fallBack;
+      var played = clip.play();
+      if (played && played.catch) played.catch(fallBack);
+      return;
+    } catch (e) { /* fall through to speech synthesis */ }
+  }
+  speak();
 }
 
 // ─── Mute toggle ──────────────────────────────────────────
