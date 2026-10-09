@@ -97,3 +97,34 @@ describe('the phone call-result poller', () => {
 		assert.ok(guard !== -1 && guard < poller.indexOf('unlinkSync(callResultFile)'), 'the meeting check returns before the file is deleted');
 	});
 });
+
+describe('results the session cannot take', () => {
+	it('each result in a batch gets its own DM fallback file; none overwrites another', async () => {
+		const mode = { value: 'agent' as 'agent' | 'transcription' };
+		const s = fakeSession(mode);
+		s.sessionManager.isActive = false;   // reconnecting, and it does not come back
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const durable = wireDurableChannels(s as any, { notReadyRetriesMs: [10, 10] });
+		for (const pr of ['3509', '5140', '5167']) durable.enqueue({ text: `PR ${pr} status`, taskId: `task-${pr}` });
+		await tick(2_500);
+		const { readdirSync, readFileSync } = await import('node:fs');
+		const files = readdirSync(join(TMP, 'results')).filter((f) => f.startsWith('proactive-voice-stuck-'));
+		const bodies = files.map((f) => readFileSync(join(TMP, 'results', f), 'utf-8')).join('\n');
+		for (const pr of ['3509', '5140', '5167']) assert.match(bodies, new RegExp(`PR ${pr} status`));
+		assert.deepEqual(s.sent, []);
+	});
+
+	it('a reconnect shorter than the wait is waited out: the results are spoken, not sent to the DM', async () => {
+		const mode = { value: 'agent' as 'agent' | 'transcription' };
+		const s = fakeSession(mode);
+		s.sessionManager.isActive = false;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const durable = wireDurableChannels(s as any, { notReadyRetriesMs: Array(20).fill(200) });
+		durable.enqueue({ text: 'PR 4200 status', taskId: 'task-4200' });
+		await tick(3_000);
+		s.sessionManager.isActive = true;   // the reconnect completes
+		await tick(1_000);
+		assert.equal(s.sent.length, 1);
+		assert.match(s.sent[0], /PR 4200 status/);
+	});
+});

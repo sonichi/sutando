@@ -36,6 +36,8 @@ export interface DurableChannelOptions {
 	 * other adapters may not). */
 	cartesiaApiKey?: string;
 	generateSpeech?: ((text: string, meta: { category: string; label: string }) => Promise<string>) | null;
+	/** Waits between checks while the session cannot take a result, before the DM fallback. */
+	notReadyRetriesMs?: number[];
 }
 
 /**
@@ -101,12 +103,14 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	const results = createResultQueue({
 		held: () => meetingHoldsModel(session),
 		canInject: () => session.sessionManager.isActive && session.clientConnected,
+		// A reconnect takes seconds; wait up to a minute for it before sending results to the DM.
+		notReadyRetriesMs: opts.notReadyRetriesMs ?? Array(30).fill(2_000),
 		inject: (text) => injectText(session, text),
 		waitForQuiet: () => pacer.waitForQuiet(),
 		store: voiceTaskStore,
 		log: (msg) => console.log(`${ts()} ${msg}`),
 		fallback: (items) => {
-			for (const { text: result } of items) {
+			for (const [i, { text: result }] of items.entries()) {
 				// Stuck-voice fallback. Per Susan's PR #924 review (Q3): Cartesia
 				// only reaches the user if they're watching the web client with
 				// audio playback — a user in a stuck voice session is probably
@@ -115,10 +119,11 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				// Discord DM via a proactive-*.txt file so the result is never
 				// silently lost. Cartesia stays as a bonus path when available
 				// (some users keep the web UI open).
-				console.log(`${ts()} [TaskBridge] Voice not active after 3s — falling back to Discord DM${cartesiaApiKey && generateSpeech ? ' + Cartesia' : ''}`);
+				console.log(`${ts()} [TaskBridge] Voice not active after waiting — falling back to Discord DM${cartesiaApiKey && generateSpeech ? ' + Cartesia' : ''}`);
 				try {
 					const proactiveTs = Math.floor(Date.now() / 1000);
-					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${proactiveTs}.txt`);
+					// One file per result: a batch falls back within the same second.
+					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${proactiveTs}-${i}.txt`);
 					const dmBody = `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${result}`;
 					writeFileSync(proactivePath, dmBody);
 				} catch (e) {
