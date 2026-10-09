@@ -1075,12 +1075,76 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
         self.assertEqual(payload["kind"], "fable-limit")
         self.assertNotIn("auto_answered", payload)
 
+    def _ticks(self, panes, extra_args=()):
+        """Run main() across len(panes) real loop iterations (no --once): one
+        capture() result per tick, time.sleep stubbed to stop once every pane
+        has been consumed."""
+        import sys
+        import tempfile
+        from unittest.mock import patch
+
+        class _Stop(Exception):
+            pass
+
+        sent, calls = [], []
+        pane_iter = iter(panes)
+
+        def fake_capture(s, sess):
+            return next(pane_iter)
+
+        def fake_sleep(s):
+            calls.append(s)
+            if len(calls) >= len(panes):
+                raise _Stop
+
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "unknown"}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
+                "--stable", "1", *extra_args]
+        with patch.object(_mod, "capture", fake_capture), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod, "send_keys", lambda s, sess, k: sent.append((s, sess, k)) or True), \
+                patch.object(_mod.time, "sleep", fake_sleep), \
+                patch.object(sys, "argv", argv):
+            try:
+                main()
+            except _Stop:
+                pass
+        return sent
+
+    def test_a_pending_follow_up_fires_once_idle_clears(self):
+        # Tick 1 types the refused-turn switch and arms the follow-up; tick 2's
+        # plain idle pane (no refusal line) fires it instead of re-typing.
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, _IDLE])
+        self.assertEqual(sent, [
+            ("/tmp/x.sock", "sutando-core", ("/model opus", "Enter")),
+            ("/tmp/x.sock", "sutando-core", ("continue", "Enter")),
+        ])
+
+    def test_a_second_refusal_within_the_cooldown_is_not_retyped(self):
+        # tick2 (idle) resets answered_prompt; tick3's recurring refusal must
+        # not be retyped inside TYPED_ANSWER_COOLDOWN_S.
+        sent = self._ticks([_FABLE_REFUSED_MONITOR, _IDLE, _FABLE_REFUSED_MONITOR])
+        self.assertEqual(sent, [
+            ("/tmp/x.sock", "sutando-core", ("/model opus", "Enter")),
+            ("/tmp/x.sock", "sutando-core", ("continue", "Enter")),
+        ])
+
 
 class TestSendKeys(unittest.TestCase):
     """send_keys reports what tmux did: True only on a zero exit, False on a
     non-zero exit or when tmux cannot be run at all — never an exception."""
 
     def _with_fake_tmux(self, script):
+        # list-windows (core_target's probe) always succeeds; `script` governs
+        # only the send-keys call itself -- a different exit than target resolution.
         import stat
         import tempfile
         d = tempfile.mkdtemp()
@@ -1088,7 +1152,7 @@ class TestSendKeys(unittest.TestCase):
         p = os.path.join(d, "tmux")
         with open(p, "w") as f:
             f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n"
-                    + "[ \"$3\" = list-windows ] && { echo 1; " + script + "; }\n" + script + "\n")
+                    + "[ \"$3\" = list-windows ] && { echo 1; exit 0; }\n" + script + "\n")
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return d, log
 
