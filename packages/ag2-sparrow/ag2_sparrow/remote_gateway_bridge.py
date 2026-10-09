@@ -4191,6 +4191,16 @@ def _recover_disposing_claims() -> None:
     disposal.recover_abandoned_claims(RESULTS_DIR, _log)
 
 
+def _disposed_copy_exists(tid: str, generation) -> bool:
+    """The lifecycle owner's verdict; a lock it cannot take is no verdict, and
+    the loser then reports rather than staying quiet."""
+    try:
+        return disposal.disposed_copy_exists(RESULTS_DIR, tid, generation, _log)
+    except OSError as e:
+        _log(f"result {tid}: could not check for a disposed copy ({e})")
+        return False
+
+
 def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
                             generation=None) -> None:
     """Move a result the outbox has finally refused into results/undelivered/,
@@ -4214,14 +4224,14 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
     except disposal.GenerationReplaced:
         # The file this pass read is already disposed of, or a newer reply took
         # its name and stays live; either way nothing of this pass is lost.
-        if disposal.disposed_copy_exists(RESULTS_DIR, tid, generation, _log):
+        if _disposed_copy_exists(tid, generation):
             return
         _log(f"result {tid}: {why} but the reply this pass read was replaced by a "
              "newer one at its name, which stays live")
     except FileNotFoundError:
         # Two observers can reach a terminal item at once; the loser is quiet
         # only when the very file it read is already disposed of.
-        if generation is not None and disposal.disposed_copy_exists(RESULTS_DIR, tid, generation, _log):
+        if generation is not None and _disposed_copy_exists(tid, generation):
             return
         _log(f"result {tid}: {why} but the result file vanished before "
              "quarantine and no quarantined copy of the body this pass read was found")

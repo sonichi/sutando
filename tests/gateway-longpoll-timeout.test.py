@@ -10,6 +10,7 @@ timeout as a network error backed a healthy bridge off and wrote
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -41,7 +42,8 @@ class _Loop:
               "_recover_orphan_proactive", "_maybe_start_event_channel",
               "_heartbeat_singleton", "_post_heartbeat", "_req", "_write_task",
               "_post_task_ack", "_post_ready_results", "_post_proactive",
-              "_reconcile_abandoned", "_emit_gateway_status", "_save_inflight", "_log")
+              "_reconcile_abandoned", "_reconcile_orphan_results", "_emit_gateway_status",
+              "_save_inflight", "_log", "RESULTS_DIR")
 
     def __init__(self, gw, poll_raises=None, advance=0.0):
         self.gw, self.poll_raises, self.advance = gw, poll_raises, advance
@@ -70,8 +72,11 @@ class _Loop:
         gw._heartbeat_singleton = lambda *a, **k: self._alive.pop(0) if self._alive else False
         for noop in ("_recover_orphan_proactive", "_maybe_start_event_channel",
                      "_post_heartbeat", "_post_task_ack", "_post_ready_results",
-                     "_post_proactive"):
+                     "_post_proactive", "_reconcile_orphan_results"):
             setattr(gw, noop, lambda *a, **k: None)
+        # The loop under test is the poll; no results dir on the host may be read or written.
+        self._tmp = tempfile.TemporaryDirectory()
+        gw.RESULTS_DIR = Path(self._tmp.name) / "results-never-created"
         gw._save_inflight = lambda *a, **k: None
         gw._write_task = lambda *a, **k: None
         gw._reconcile_abandoned = lambda inflight, s, *a, **k: s
@@ -83,6 +88,7 @@ class _Loop:
     def __exit__(self, *exc):
         for n, v in self._saved.items():
             setattr(self.gw, n, v)
+        self._tmp.cleanup()
         return False
 
     def run(self):

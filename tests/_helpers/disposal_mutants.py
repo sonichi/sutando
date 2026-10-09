@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Named mutants of src/delivery/disposal.py, so a reviewer can reproduce
+"this test kills that mutant" without hand-editing the module.
+
+    python3 tests/_helpers/disposal_mutants.py list
+    python3 tests/_helpers/disposal_mutants.py apply <name>     # edits src + vendored copy
+    python3 tests/_helpers/disposal_mutants.py revert           # undo the applied mutant
+
+Each mutant is one exact-string substitution; `apply` refuses when the text
+is not found exactly once, so a stale mutant is a loud failure, not a no-op.
+`revert` undoes the substitution in place (never a git checkout, which would
+also discard unrelated edits to the module).
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+FILES = [REPO / "src" / "delivery" / "disposal.py",
+         REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "result_disposal.py"]
+STATE = Path(__file__).with_name(".disposal_mutant_applied")
+
+MUTANTS: dict[str, tuple[str, str, str]] = {
+    "live-owner-ages-out": (
+        "a live owner's claim is reclaimed on age alone",
+        "        return not (c.start and owner.start_usec and c.start != owner.start_usec)\n",
+        "        return (not (c.start and owner.start_usec and c.start != owner.start_usec)) "
+        "and (time.time() - c.acquired <= CLAIM_MAX_S)\n"),
+    "liveness-after-age": (
+        "the age bound is checked before liveness",
+        "    owner = process_identity(c.pid)\n    if owner.state is OwnerState.DEAD:\n",
+        "    owner = process_identity(c.pid)\n    if time.time() - c.acquired > CLAIM_MAX_S:\n"
+        "        return False\n    if owner.state is OwnerState.DEAD:\n"),
+    "identity-ignores-write-time": (
+        "a reused inode with new bytes' write time reads as the same publication",
+        "    if (st.st_dev, st.st_ino, st.st_mtime_ns) != (generation.dev, generation.ino, generation.mtime_ns):\n        return False\n    return identity_of(path)[1] == generation\n",
+        "    if (st.st_dev, st.st_ino) != (generation.dev, generation.ino):\n        return False\n"
+        "    return identity_of(path)[1].digest == generation.digest\n"),
+    "restore-registered-after-rename": (
+        "the .restore path becomes visible before this process holds it",
+        "        ACTIVE_CLAIMS.add(str(restoring))             # registered before it can be seen\n        try:\n            os.rename(claim, restoring)",
+        "        try:\n            os.rename(claim, restoring)\n            ACTIVE_CLAIMS.add(str(restoring))"),
+    "lock-never-taken": (
+        "every transition runs without the directory lock",
+        "    path = results_dir / LOCK_NAME\n    deadline = time.monotonic() + LOCK_WAIT_S\n",
+        "    held[key] = 1\n    try:\n        yield\n    finally:\n        held[key] = 0\n    return\n"
+        "    path = results_dir / LOCK_NAME\n    deadline = time.monotonic() + LOCK_WAIT_S\n"),
+    "recovery-ignores-claim-identity": (
+        "an abandoned claim is quarantined even when it holds a reply the owner never verified",
+        "    unverified = (found.ino, found.mtime_ns, found.digest) != (c.ino, c.mtime_ns, c.digest)\n",
+        "    unverified = False\n"),
+    "recovery-unisolated": (
+        "one claim's recovery failure aborts the pass",
+        "                except Exception as e:  # noqa: BLE001 - isolation is the point\n",
+        "                except DisposalBusy as e:  # noqa: BLE001 - isolation is the point\n"),
+    "lock-error-escapes": (
+        "a lock the filesystem refuses raises into the drain",
+        "    except OSError as e:                                # DisposalBusy, ENOLCK, EACCES, a vanished dir\n",
+        "    except DisposalBusy as e:                                # DisposalBusy, ENOLCK, EACCES, a vanished dir\n"),
+    "put-back-replaces": (
+        "the put-back uses a replacing rename, so a retaken canonical name is overwritten",
+        "        rename_noreplace(Path(claim), Path(rfile), log)\n    except FileExistsError:\n        return False\n",
+        "        os.rename(Path(claim), Path(rfile))\n    except FileExistsError:\n        return False\n"),
+    "verify-skips-rewrite-check": (
+        "an in-place rewrite of the claimed inode during hashing goes unnoticed",
+        "    same = (h.hexdigest() == generation.digest\n            and (again.st_mtime_ns, again.st_size) == (st.st_mtime_ns, st.st_size))\n",
+        "    same = h.hexdigest() == generation.digest\n"),
+    "missing-dir-not-skipped": (
+        "recovery runs against an absent results directory",
+        "    if not results_dir.is_dir():\n        return\n    for odd in find_malformed",
+        "    for odd in find_malformed"),
+}
+
+
+def _edit(old: str, new: str) -> None:
+    for f in FILES:
+        text = f.read_text()
+        if text.count(old) != 1:
+            sys.exit(f"{f.name}: expected the mutation site exactly once, found {text.count(old)}")
+        f.write_text(text.replace(old, new))
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2 or argv[1] not in ("list", "apply", "revert"):
+        print(__doc__)
+        return 2
+    if argv[1] == "list":
+        for name, (what, _o, _n) in MUTANTS.items():
+            print(f"{name:34s} {what}")
+        return 0
+    if argv[1] == "revert":
+        if not STATE.exists():
+            print("nothing applied")
+            return 0
+        name = STATE.read_text().strip()
+        _what, old, new = MUTANTS[name]
+        _edit(new, old)
+        STATE.unlink()
+        print(f"reverted {name}")
+        return 0
+    name = argv[2] if len(argv) > 2 else ""
+    if name not in MUTANTS:
+        sys.exit(f"unknown mutant {name!r}; see `list`")
+    if STATE.exists():
+        sys.exit(f"{STATE.read_text().strip()} is still applied; revert first")
+    what, old, new = MUTANTS[name]
+    _edit(old, new)
+    STATE.write_text(name)
+    print(f"applied {name}: {what}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

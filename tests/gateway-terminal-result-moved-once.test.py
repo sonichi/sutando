@@ -261,11 +261,30 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(self.about(), [], '\n'.join(self.about()))
 
     def claim_name(self, pid, start, nonce='deadbeef', acquired=None, restore=False,
-                   body='Existing answer'):
-        # The name carries the first 16 hex of the digest the owner meant to dispose of.
+                   body='Existing answer', ino=None, mtime=None):
+        # The name carries the full identity (inode, write time, digest) of the
+        # generation the owner meant to dispose of. When the live result holds
+        # `body`, that file IS the generation; otherwise the name describes
+        # another publication and the body found at the claim is unverified.
         acquired = int(time.time() if acquired is None else acquired)
-        gen = hashlib.sha256(body.encode()).hexdigest()[:16]
-        return self.results / (f'.{TID}.disposing-{pid}-{start}-{acquired}-{gen}-{nonce}'
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        live = self.results / f'{TID}.txt'
+        if ino is None or mtime is None:
+            # The generation is the file holding `body`: the live result, or a
+            # claim/quarantined copy it was already moved to.
+            same = False
+            for cand in [live] + sorted(live.parent.glob(f'.{live.stem}.disposing-*')) \
+                    + sorted((live.parent / 'undelivered').glob(f'{live.stem}-*.txt')):
+                try:
+                    if cand.read_bytes() == body.encode():
+                        st = os.stat(cand)
+                        same = True
+                        break
+                except OSError:
+                    continue
+            ino = ino if ino is not None else (st.st_ino if same else 0)
+            mtime = mtime if mtime is not None else (st.st_mtime_ns if same else 0)
+        return self.results / (f'.{TID}.disposing-{pid}-{start}-{acquired}-{ino}-{mtime}-{digest}-{nonce}'
                                + ('.restore' if restore else ''))
 
     def live_other_owner(self):
@@ -291,14 +310,11 @@ class TerminalResultMovedOnce(unittest.TestCase):
     # ---- crash safety of the private claim
 
     def die_after_claim_rename(self):
-        """Kewei's recipe: the owner dies right after the first rename."""
-        real = disposal.identity_of
-
-        def dying(path):
-            if 'disposing' in str(path):
-                raise SystemExit('owner died mid-disposal')
-            return real(path)
-        return patch.object(disposal, 'identity_of', dying)
+        """Kewei's recipe: the owner dies right after the first rename (its
+        verification of the claimed file is the first thing after it)."""
+        def dying(fd, generation):
+            raise SystemExit('owner died mid-disposal')
+        return patch.object(disposal, '_verify_fd', dying)
 
     def claims(self):
         return sorted(p.name for p in self.results.glob(f'.{TID}.disposing-*'))
@@ -494,8 +510,9 @@ class TerminalResultMovedOnce(unittest.TestCase):
         core = self.park_without_disposing()
         self.bridge(core)
         self.task()
+        self.result()
         claim = self.claim_name(self.dead_pid(), 1, 'ace00001')
-        self.result().rename(claim)
+        (self.results / f'{TID}.txt').rename(claim)
         real_rename = os.rename
 
         def taken_first(src, dst, *a, **kw):
@@ -621,17 +638,19 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.task()
         result = self.result()
         body, gen = self.read(result)
-        real = disposal.identity_of
+        real = disposal._verify_fd
         swept = []
 
-        def sweep_mid_move(path):
-            if 'disposing' in str(path) and not swept:
+        def sweep_mid_move(fd, generation):
+            if not swept:
                 swept.append(True)
+                claim = disposal.find_claims(self.results)
+                self.assertEqual(len(claim), 1)
                 gw._last_orphan_sweep = 0.0
                 gw._reconcile_orphan_results(set())
-                self.assertTrue(Path(path).exists(), 'the sweep took a live claim')
-            return real(path)
-        with patch.object(disposal, 'identity_of', sweep_mid_move):
+                self.assertTrue(claim[0].exists(), 'the sweep took a live claim')
+            return real(fd, generation)
+        with patch.object(disposal, '_verify_fd', sweep_mid_move):
             self.deliver(body, result, gen)
         self.assertTrue(swept)
         self.assert_once(result, 'sweep during a live move')
@@ -677,13 +696,9 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.task()
         result = self.result()
         body, gen = self.read(result)
-        real = disposal.identity_of
-
-        def emfile(path):
-            if 'disposing' in str(path):
-                raise OSError(24, 'Too many open files')
-            return real(path)
-        with patch.object(disposal, 'identity_of', emfile):
+        def emfile(fd, generation):
+            raise OSError(24, 'Too many open files')
+        with patch.object(disposal, '_verify_fd', emfile):
             self.deliver(body, result, gen)
         self.assertTrue(result.exists(), 'the body must be back at its name')
         self.assertEqual(self.claims(), [])
@@ -775,7 +790,10 @@ class TerminalResultMovedOnce(unittest.TestCase):
         core = self.park_without_disposing()
         self.bridge(core)
         self.task()
-        self.assertIs(outbox.process_identity(1).state, outbox.OwnerState.UNKNOWN)
+        # pid 1 reads UNKNOWN (EPERM) on macOS but ALIVE on the Linux runners: stub the probe.
+        unknown = outbox.ProcessIdentity(1, outbox.OwnerState.UNKNOWN)
+        probe = patch.object(disposal, 'process_identity', lambda pid: unknown)
+        probe.start(); self.addCleanup(probe.stop)
         result = self.result()
         fresh = self.claim_name(1, 0, '5fc00002')
         result.rename(fresh)
@@ -842,14 +860,13 @@ class TerminalResultMovedOnce(unittest.TestCase):
         body, gen = self.read(result)
         result.unlink()
         self.result('NEWER BODY')
-        import os
-        real_link = os.link
+        real = disposal.rename_noreplace
 
-        def link_after_producer(src, dst, *a, **kw):
+        def producer_first(src, dst, *a, **kw):
             if Path(dst) == result:
                 self.result('NEWEST BODY')
-            return real_link(src, dst, *a, **kw)
-        with patch.object(os, 'link', link_after_producer):
+            return real(src, dst, *a, **kw)
+        with patch.object(disposal, 'rename_noreplace', producer_first):
             self.deliver(body, result, gen)
         self.assertEqual(result.read_text(), 'NEWEST BODY')
         bodies = sorted((self.results / 'undelivered' / n).read_text() for n in self.quarantined())
