@@ -6,8 +6,8 @@ in the owner's own DM (`.to-<bridge>` name + `[channel:]` marker), to the owner'
 the task's bridge for any other bridge task, else to the owner's DM on the bridge he was
 last active on; a drain delivering the file is what makes it sent; (2) the question and
 its queue record are saved to the outbox (`pending_questions_outbox`), atomically; (3) only
-when nothing was queued does a macOS notification fire, pointing at the DM, and a refusal prints
-the fix instead of a success; a queued question is left to the chat app's own notification. The
+when nothing was queued is a persistent macOS dialog launched, offering the question's row,
+and a launch failure is printed; a queued question is left to the chat app's own notification. The
 room-database adapter builds its row on top of `queue_question`; with no room, `ask_owner`
 here is the whole ask and the outbox is the record.
 
@@ -47,9 +47,7 @@ SENT_RE = re.compile(
     r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s*$", re.MULTILINE)
 # Bridges whose drain honours a `[channel:]` room redirect (telegram drops it).
 _ROOM_MARKER_BRIDGES = frozenset({"discord", "slack", "ag2space"})
-NOTIFY_MAX = 200  # escaped body chars notify_macos hands to osascript
-MACOS_FIX = ("allow notifications for your terminal app under System Settings > "
-             "Notifications, or run from a session where osascript is permitted")
+MACOS_FIX = "the question is still held; answer it in Pending questions"
 
 # Positive evidence, per bridge, that the task's channel is the owner's own DM.
 _DM_EVIDENCE = {
@@ -185,45 +183,50 @@ def write_proactive(results: Path, name: str, body: str) -> Path:
     return write_text_whole(Path(results) / name, body)
 
 
-def _applescript_escape(text: str) -> str:
-    return text.replace("\\", "\\\\").replace('"', '\\"')
+# Text arrives as argv, never spliced into the script; item 1 is a fixed sentinel so a
+# question starting with "-" is not read as an osascript option.
+_DIALOG_SCRIPT = (
+    "on run argv",
+    "set msg to \"Sutando couldn't message you. Question: \" & item 2 of argv",
+    "if (count of argv) > 2 then",
+    "set r to display dialog msg with title \"Sutando\" buttons {\"Later\", \"Open Pending questions\"} "
+    "default button \"Open Pending questions\"",
+    "if button returned of r is \"Open Pending questions\" then open location (item 3 of argv)",
+    "else",
+    "display dialog msg with title \"Sutando\" buttons {\"OK\"} default button \"OK\"",
+    "end if",
+    "end run",
+)
+DIALOG_QUESTION_MAX = 1000
 
 
-def notify_macos(text: str) -> tuple:
-    """(ok, fix). A refused or failed osascript names the fix; it never claims ok."""
-    esc = _applescript_escape(text)[:NOTIFY_MAX]
+def dialog_argv(question: str, link: Optional[str] = None) -> list:
+    q = question.strip()
+    if len(q) > DIALOG_QUESTION_MAX:
+        q = q[:DIALOG_QUESTION_MAX - 1] + "…"
+    argv = ["osascript"]
+    for line in _DIALOG_SCRIPT:
+        argv += ["-e", line]
+    return argv + ["sutando", q] + ([link] if link else [])
+
+
+def show_dialog(question: str, link: Optional[str] = None) -> tuple:
+    """(launched, fix). Detached so the ask returns at once; the dialog stays until dismissed."""
     try:
-        r = subprocess.run(["osascript", "-e",
-                            f'display notification "{esc}" with title "Sutando"'],
-                           capture_output=True, text=True, timeout=15)
-    except (FileNotFoundError, OSError):
-        return False, "osascript not found on PATH (not macOS, or a bare PATH); " + MACOS_FIX
-    except subprocess.TimeoutExpired:
-        return False, "osascript did not return within 15s; " + MACOS_FIX
-    if r.returncode != 0:
-        err = " ".join((r.stderr or "").split())[:120]
-        return False, f"osascript exit {r.returncode} ({err or 'no stderr'}); {MACOS_FIX}"
+        subprocess.Popen(dialog_argv(question, link), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except (FileNotFoundError, OSError) as e:
+        return False, f"osascript could not start ({type(e).__name__}; not macOS, or a bare PATH); {MACOS_FIX}"
     return True, None
 
 
 def notify_unless_queued(out: dict, question: str) -> None:
-    """Set out["macos"]/["macos_fix"]: "skipped" once a DM file is queued, else the fallback notification.
-    An osascript notification has no click target; the chat app's own one opens the DM."""
+    """Set out["macos"]/["macos_fix"]: "skipped" once a DM file is queued, else a persistent dialog.
+    A notification vanishes and has no click target, so it is never the fallback."""
     if out.get("proactive_file"):
         out["macos"], out["macos_fix"] = "skipped", None
     else:
-        out["macos"], out["macos_fix"] = notify_macos(fallback_text(question))
-
-
-def fallback_text(question: str) -> str:
-    """The question is shortened, never the instruction after it, so the notification keeps its ending."""
-    head, tail = "Sutando couldn't message you. Question: ", ". Reply to Sutando in any chat, or see Pending questions."
-    q = " ".join(question.split())
-    for n in range(min(len(q), NOTIFY_MAX), -1, -1):
-        cut = q if n == len(q) else q[:max(n - 1, 0)] + "…"
-        if len(_applescript_escape(head + cut + tail)) <= NOTIFY_MAX:
-            return head + cut + tail
-    return head + tail
+        out["macos"], out["macos_fix"] = show_dialog(question, out.get("link"))
 
 
 def queue_question(question: str, context: Optional[str] = None, task_file: Optional[str] = None,
@@ -310,7 +313,7 @@ def report_lines(out: dict) -> list:
     if out.get("macos") == "skipped":
         lines.append("macos: skipped (question queued to your DM; your chat app notifies)")
     elif out.get("macos") is True:
-        lines.append("macos: notification sent")
+        lines.append("macos: dialog launched (DM send failed)")
     elif out.get("macos") is False:
         lines.append(f"macos: FAILED — {out.get('macos_fix')}")
     return lines

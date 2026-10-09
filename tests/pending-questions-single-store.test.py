@@ -93,7 +93,7 @@ class TestSingleStore(unittest.TestCase):
         r"ASK_ID_RE|\[A-Za-z0-9\]\[A-Za-z0-9\._-\]\{0,119\}|safe_ask_id|BadAskId|TERMINAL|CLOSED_DIR|"
         r"pending-questions-outbox|held_items|local_closes|local_done_count|store_history|room_was_used|"
         r"db-introduced|store-history|\"saved_at\"|\"at\":|SENT_RE|\*\*Sent:\*\*|destination_from_task|"
-        r"_DM_EVIDENCE|proactive_body|question_dict|new_ask_id|notify_macos|replay_closes|reconcile_pending")
+        r"_DM_EVIDENCE|proactive_body|question_dict|new_ask_id|show_dialog|replay_closes|reconcile_pending")
     CORE = ("src/pending_questions_reader.py", "src/local_record.py", "src/check-pending-questions.py",
             "src/agent-api.py", "scripts/ask-owner.py")
 

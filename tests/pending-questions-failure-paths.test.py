@@ -337,7 +337,7 @@ class TestAdapterLookupsAndMarks(rdb._Ws):
         mark = pqo.status_path(pqo.ROOM_INTRODUCED, self.ws)
         mark.mkdir()
         with mock.patch.object(adapter, "reconcile_pending", side_effect=RuntimeError("boom")), \
-                mock.patch.object(adapter.core_ask, "notify_macos", return_value=(False, "no osascript")) as macos:
+                mock.patch.object(adapter.core_ask, "show_dialog", return_value=(False, "no osascript")) as macos:
             out = adapter.ask_owner("q?", urgency="live", workspace=self.ws, host=HOST, store=store)
         self.assertEqual(out["reconcile"]["errors"], ["RuntimeError: boom"])
         self.assertIsNotNone(out["record"])
