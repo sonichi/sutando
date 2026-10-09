@@ -28,6 +28,11 @@ sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
 import outbox
 import undelivered_quarantine
+
+
+def _park_in_quarantine(rfile, results, when=None):
+    """Fixture: put a result where the quarantine reader lists it."""
+    return undelivered_quarantine.place(Path(rfile), results, Path(rfile).stem, when=when)
 from delivery import disposal
 from delivery.readiness import identity_of
 
@@ -108,7 +113,7 @@ class CoreContract(unittest.TestCase):
         _, gen = identity_of(r)
         other = self.results / "task-a.later"               # another inode, equal bytes
         other.write_text("answer")
-        undelivered_quarantine.quarantine(other, self.results)
+        _park_in_quarantine(other, self.results)
         self.assertFalse(disposal.disposed_copy_exists(self.results, "task-a", gen, self.lines.append))
 
     def test_the_acquisition_time_lives_in_the_name_not_the_mtime(self):
@@ -250,7 +255,7 @@ class CoreContract(unittest.TestCase):
         _, gen = identity_of(r)
         os.utime(r, ns=(gen.mtime_ns + 1_000, gen.mtime_ns + 1_000))
         self.assertFalse(disposal._is_generation(r, gen))
-        undelivered_quarantine.quarantine(r, self.results)
+        _park_in_quarantine(r, self.results)
         self.assertFalse(disposal.disposed_copy_exists(self.results, "task-a", gen, self.lines.append))
 
     def test_a_failure_to_read_the_claim_is_reported_not_called_a_replacement(self):
@@ -539,7 +544,7 @@ class CoreContract(unittest.TestCase):
         # EMFILE while matching a candidate is skipped, never read as a match.
         r = self.result()
         _, gen = identity_of(r)
-        undelivered_quarantine.quarantine(r, self.results)
+        _park_in_quarantine(r, self.results)
         self.result().rename(self.claim(nonce="ab000007"))
         real = disposal.identity_of
 
@@ -896,7 +901,7 @@ class CoreContract(unittest.TestCase):
         r = self.result("answer")
         _, gen = identity_of(r)
         self.result("other", stem="task-a").rename(self.claim(nonce="ab00000d", body="other"))
-        undelivered_quarantine.quarantine(self.result("third"), self.results)
+        _park_in_quarantine(self.result("third"), self.results)
         real = disposal._is_generation
 
         def emfile_on_claims(path, generation):
@@ -957,7 +962,7 @@ class BridgeDelegates(unittest.TestCase):
         self.assertIn("recover_abandoned_claims", self.calls_in("_recover_disposing_claims"))
         self.assertIn("_recover_disposing_claims", self.calls_in("_post_ready_results"))
         self.assertIn("_recover_disposing_claims", self.calls_in("_reconcile_orphan_results"))
-        self.assertIn("retire_current", self.calls_in("_retire_orphan"))
+        self.assertIn("retire_generation", self.calls_in("_retire_orphan"))
         self.assertIn("_retire_orphan", self.calls_in("_quarantine_orphan"))
         self.assertIn("_retire_orphan", self.calls_in("_reconcile_orphan_results"))
 

@@ -535,6 +535,28 @@ class GuardDelegation(_Base):
                         "a withheld reason must be logged")
 
 
+class UnreadableOrphan(_Base):
+    def _archived(self):
+        d = gw.TASKS_DIR / "archive"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{TID}.txt").write_text(f"id: {TID}\ntask: hi\nsource: ag2space\n")
+
+    def test_a_partial_utf8_write_is_left_for_a_later_pass(self):
+        self._archived()
+        f = gw.RESULTS_DIR / f"{TID}.txt"
+        f.write_bytes(b"half a character \xe2\x80")
+        _age(f, OLD)
+        self._sweep()
+        self.assertEqual(f.read_bytes(), b"half a character \xe2\x80")
+        self.assertEqual(self.posted, [])
+
+    def test_a_blank_result_is_left_for_a_later_pass(self):
+        self._archived()
+        f = self._result("  \n")
+        self._sweep()
+        self.assertEqual(f.read_text(), "  \n")
+        self.assertEqual(self.posted, [])
+
 class ReplacementAtTheMove(_Base):
     """A producer replacing the canonical result while an orphan arm moves it:
     the reply that replaced it must stay live. The hook fires right after the
@@ -554,7 +576,7 @@ class ReplacementAtTheMove(_Base):
 
     def test_a_move_that_fails_leaves_the_result_and_says_so(self):
         canonical = self._result("BODY-A orphan")
-        with patch.object(gw.disposal, "retire_current", side_effect=OSError(5, "EIO")):
+        with patch.object(gw.disposal, "retire_generation", side_effect=OSError(5, "EIO")):
             self._sweep()
         self.assertEqual(canonical.read_text(), "BODY-A orphan")
         self.assertTrue(any("could not be moved" in l for l in self.logs), self.logs)
@@ -622,6 +644,72 @@ class ReplacementAtTheMove(_Base):
         self.assertEqual(self._moved(gw.ARCHIVE_RESULTS_DIR, f"{TID}-*-late-duplicate*.txt"),
                          ["BODY-A duplicate"])
         self.assertEqual(self.posted, [])
+
+
+class ReplacementBeforeTheRetire(ReplacementAtTheMove):
+    """A producer replaces A with B after the arm classified A and before the
+    owner touches the file: only A's generation may be retired, so B stays
+    live, untouched, and is judged on its own on the next pass."""
+
+    def _race_before(self, body, age=OLD, b_body="BODY-B plain reply"):
+        import os
+        canonical = self._result(body, age)
+        real = gw.disposal.retire_generation
+        fired = []
+
+        def replace_then_retire(results_dir, rfile, generation, *a, **k):
+            if not fired:
+                fired.append(1)
+                tmp = canonical.with_name(".producer.tmp")
+                tmp.write_text(b_body)
+                os.replace(tmp, canonical)
+            return real(results_dir, rfile, generation, *a, **k)
+
+        with patch.object(gw.disposal, "retire_generation", replace_then_retire):
+            self._sweep()
+        self.assertEqual(fired, [1], "the arm never reached the retire")
+        self.assertTrue(canonical.exists(), "B was moved under A's disposition")
+        self.assertEqual(canonical.read_text(), b_body, "B was rewritten")
+        for d in (gw.UNDELIVERABLE_RESULTS_DIR, gw.ARCHIVE_RESULTS_DIR):
+            moved = [q.read_text() for q in d.rglob("*.txt")] if d.is_dir() else []
+            self.assertNotIn(b_body, moved, f"B was moved into {d.name}")
+        self.assertEqual(self.posted, [])
+        self.assertFalse(any("quarantined" in l or "moved aside" in l for l in self.logs), self.logs)
+        return canonical
+
+    def _next_pass_posts_b(self, canonical):
+        _age(canonical, OLD)
+        self._sweep()
+        self.assertEqual(len(self.posted), 1, "B was never offered for delivery")
+        self.assertIn("BODY-B plain reply", self.posted[0][2]["body"])
+
+    def test_too_old(self):
+        self._archived(age=gw.ORPHAN_MAX_AGE_S + 60)
+        self._race_before("BODY-A old", age=gw.ORPHAN_MAX_AGE_S + 60)
+
+    def test_no_task(self):
+        self._race_before("BODY-A orphan")
+
+    def test_attachments(self):
+        self._archived()
+        self._next_pass_posts_b(self._race_before("BODY-A [file: /tmp/x.png]"))
+
+    def test_deduped(self):
+        self._archived()
+        self._next_pass_posts_b(self._race_before("[deduped: task-00000000000000000b]\nBODY-A"))
+
+    def test_late_duplicate(self):
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
+        (gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt").write_text("the reply")
+        self._race_before("BODY-A duplicate")
+
+    def test_too_old_b_is_young_and_waits_out_its_grace(self):
+        self._archived(age=gw.ORPHAN_MAX_AGE_S + 60)
+        canonical = self._race_before("BODY-A old", age=gw.ORPHAN_MAX_AGE_S + 60)
+        self._sweep()
+        self.assertEqual(canonical.read_text(), "BODY-B plain reply")
+        self.assertEqual(self.posted, [])
+        self._next_pass_posts_b(canonical)
 
 
 if __name__ == "__main__":

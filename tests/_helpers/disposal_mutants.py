@@ -25,11 +25,14 @@ QUARANTINE = [REPO / "src" / "undelivered_quarantine.py",
               REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "undelivered_quarantine.py"]
 # Mutants whose site lives in the quarantine module; every other one edits disposal.
 IN_QUARANTINE = {"fallback-links-then-unlinks", "place-replaces-a-taken-name",
-                 "place-does-not-retry", "restore-links-then-unlinks", "restore-aside-unlinks"}
+                 "place-does-not-retry", "restore-links-then-unlinks", "restore-aside-unlinks",
+                 "restore-trusts-the-link"}
 CLI = [REPO / "src" / "outbox_cli.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox_cli.py"]
 BRIDGE = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"]
 IN_CLI = {"cli-exits-0-on-no-safe-move"}
 IN_BRIDGE = {"orphan-links-then-unlinks"}
+OUTBOX = [REPO / "src" / "outbox.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox.py"]
+IN_OUTBOX = {"undo-parks-unconditionally", "undo-ignores-a-live-result"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
 
 MUTANTS: dict[str, tuple[str, str, str]] = {
@@ -114,23 +117,41 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "            os.replace(Path(src), target)\n            return target\n"),
     "place-does-not-retry": (
         "a taken quarantine name is not skipped for a fresh one",
-        "            if e.errno not in (None, errno.EEXIST):\n                raise\n            n += 1\n",
-        "            raise\n"),
+        "            if e.errno not in (None, errno.EEXIST):\n                raise\n    raise FileExistsError(errno.EEXIST, \"no free name\"",
+        "            raise\n    raise FileExistsError(errno.EEXIST, \"no free name\""),
     "restore-links-then-unlinks": (
         "restore links the quarantined body to the live name, then unlinks the quarantine copy",
         "        rename_noreplace(found[-1], target)\n    except FileExistsError as e:\n",
         "        os.link(found[-1], target)\n        os.unlink(found[-1])\n    except FileExistsError as e:\n"),
     "restore-aside-unlinks": (
         "without a primitive, restore unlinks the quarantined name instead of renaming it aside",
-        "        os.rename(quarantined, private_name(quarantined, \"restored\"))\n",
+        "        os.rename(quarantined, aside)\n",
         "        os.unlink(quarantined)\n"),
+    "restore-trusts-the-link": (
+        "restore reports RESTORED although a producer replaced the live name after the link",
+        "    if not _held_by_another(target, aside):\n        return RestoreOutcome.RESTORED, target\n",
+        "    if True:\n        return RestoreOutcome.RESTORED, target\n"),
+    "retire-recaptures-the-generation": (
+        "an orphan retire binds to whatever is at the name when it takes the lock",
+        "    names = list(names)\n    with locked(results_dir):\n        return _retire(",
+        "    names = list(names)\n    with locked(results_dir):\n        _, generation = identity_of(rfile)\n"
+        "        return _retire("),
+    "undo-parks-unconditionally": (
+        "the requeue rollback parks whatever state a peer left",
+        "        if d.get(\"status\") != \"QUEUED\" or int(d.get(\"resend_epoch\", 0) or 0) != int(expect_epoch):\n"
+        "            return UndoOutcome.MOVED_ON\n",
+        "        if False:\n            return UndoOutcome.MOVED_ON\n"),
+    "undo-ignores-a-live-result": (
+        "the requeue rollback parks an item whose result is live",
+        "        if _claim_path(root, item_id).exists() or live_result():\n",
+        "        if False:\n"),
     "cli-exits-0-on-no-safe-move": (
         "requeue reports success when the body could not be restored",
         "            return 4\n",
         "            return 0\n"),
     "orphan-links-then-unlinks": (
         "an orphan arm moves the canonical result itself: link, then unlink its name",
-        "        disposal.retire_current(RESULTS_DIR, rfile, _log, directory, _names(base))\n",
+        "        disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))\n",
         "        Path(directory).mkdir(parents=True, exist_ok=True)\n"
         "        os.link(str(rfile), str(Path(directory) / next(_names(base))))\n"
         "        Path(rfile).unlink()\n"),
@@ -142,6 +163,8 @@ def _files(name: str) -> "list[Path]":
         return CLI
     if name in IN_BRIDGE:
         return BRIDGE
+    if name in IN_OUTBOX:
+        return OUTBOX
     return QUARANTINE if name in IN_QUARANTINE else DISPOSAL
 
 

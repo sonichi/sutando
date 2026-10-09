@@ -170,20 +170,10 @@ def place(src: Path, results_dir: Path, stem: str,
                     (quarantine_name(stem, n + i) for i in range(_PLACE_TRIES)), move)
 
 
-def quarantine(rfile: Path, results_dir: Path,
-               when: Optional[int] = None) -> Path:
-    """Move a refused result out of the drain's view, never over an earlier
-    quarantined copy. Returns the new path. Without a no-replace rename the
-    file is first taken under a private name, so the live name is never unlinked."""
-    src = Path(rfile)
-    try:
-        return place(src, results_dir, src.stem, when=when)
-    except FileExistsError as e:
-        if not no_primitive(e):
-            raise
-    held = private_name(src, "quarantining")
-    os.rename(src, held)
-    return place(held, results_dir, src.stem, move=move_private, when=when)
+def canonical_result(results_dir: Path, task_id: str) -> Path:
+    """The drain's live name for one task's result."""
+    stem = f"task-{task_id}" if not str(task_id).startswith("task-") else str(task_id)
+    return Path(results_dir) / f"{stem}.txt"
 
 
 def find_quarantined(results_dir: Path, task_id: str) -> list[Path]:
@@ -226,8 +216,7 @@ def restore(results_dir: Path, task_id: str) -> "tuple[RestoreOutcome, Optional[
     found = find_quarantined(results_dir, task_id)
     if not found:
         return RestoreOutcome.NOTHING_QUARANTINED, None
-    stem = f"task-{task_id}" if not str(task_id).startswith("task-") else str(task_id)
-    target = Path(results_dir) / f"{stem}.txt"
+    target = canonical_result(results_dir, task_id)
     try:
         rename_noreplace(found[-1], target)
     except FileExistsError as e:
@@ -247,8 +236,23 @@ def _restore_by_link(quarantined: Path, target: Path) -> "tuple[RestoreOutcome, 
         return RestoreOutcome.LIVE_RESULT_PRESENT, target
     except OSError:
         return RestoreOutcome.NO_SAFE_MOVE, quarantined
+    aside = private_name(quarantined, "restored")
     try:
-        os.rename(quarantined, private_name(quarantined, "restored"))
+        os.rename(quarantined, aside)
     except OSError:
-        pass                    # still quarantined too: a re-run sees the live name and stops
-    return RestoreOutcome.RESTORED, target
+        return RestoreOutcome.RESTORED, target   # still listed too: a re-run sees the live name and stops
+    if not _held_by_another(target, aside):
+        return RestoreOutcome.RESTORED, target
+    # A producer replaced the live name after the link: the body is not live, so
+    # it goes back where the operator lists it rather than staying under the aside name.
+    place(aside, Path(target).parent, Path(target).stem, move=move_private)
+    return RestoreOutcome.LIVE_RESULT_PRESENT, target
+
+
+def _held_by_another(target: Path, body: Path) -> bool:
+    """True only when a different file provably holds `target`; a name a drain
+    already took holds the body as far as anyone can tell."""
+    try:
+        return not os.path.samefile(target, body)
+    except OSError:
+        return False

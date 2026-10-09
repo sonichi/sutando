@@ -137,21 +137,37 @@ class ConcurrentProducerAtTheMoveBoundary(unittest.TestCase):
         self.assertEqual(path.read_text(encoding="utf-8"), "OLD quarantined body")
         self.assertTrue(q.exists(), "the copy keeps its name when the aside rename fails")
 
-    def test_quarantine_without_a_primitive_never_unlinks_the_live_name(self):
-        live = self.results / "task-q1.txt"
-        live.write_text("refused body", encoding="utf-8")
-        real_unlink = os.unlink
-        unlinked = []
+    def test_a_live_name_replaced_after_the_link_puts_the_body_back_where_it_is_listed(self):
+        task = "n1"
+        self._quarantine(task, "OLD quarantined body", 1)
+        target = self.results / "task-n1.txt"
+        real_link = os.link
 
-        def watch(path, *a, **k):
-            unlinked.append(Path(path).name)
-            return real_unlink(path, *a, **k)
-        with self._no_primitive(), unittest.mock.patch("os.unlink", watch):
-            moved = uq.quarantine(live, self.results, when=7)
-        self.assertEqual(moved.read_text(encoding="utf-8"), "refused body")
-        self.assertFalse(live.exists())
-        self.assertNotIn(live.name, unlinked, "the live name was unlinked")
-        self.assertTrue(all(n.startswith(".") for n in unlinked), unlinked)
+        def link_then_replace(src, dst, *a, **k):
+            real_link(src, dst, *a, **k)
+            tmp = target.with_name(".producer.tmp")
+            tmp.write_text("NEWEST reply", encoding="utf-8")
+            os.replace(tmp, target)
+        with self._no_primitive(), unittest.mock.patch("os.link", link_then_replace):
+            outcome, path = uq.restore(self.results, task)
+        self.assertIs(outcome, uq.RestoreOutcome.LIVE_RESULT_PRESENT)
+        self.assertEqual(target.read_text(encoding="utf-8"), "NEWEST reply")
+        listed = [p.read_text(encoding="utf-8") for p in uq.find_quarantined(self.results, task)]
+        self.assertEqual(listed, ["OLD quarantined body"], "the old body left the operator's listing")
+
+    def test_a_live_name_a_drain_took_after_the_link_counts_as_restored(self):
+        task = "n1b"
+        self._quarantine(task, "OLD quarantined body", 1)
+        target = self.results / "task-n1b.txt"
+        real_link = os.link
+
+        def link_then_drain(src, dst, *a, **k):
+            real_link(src, dst, *a, **k)
+            os.unlink(target)                       # delivered and archived meanwhile
+        with self._no_primitive(), unittest.mock.patch("os.link", link_then_drain):
+            outcome, _ = uq.restore(self.results, task)
+        self.assertIs(outcome, uq.RestoreOutcome.RESTORED)
+        self.assertEqual(uq.find_quarantined(self.results, task), [], "a delivered body is listed again")
 
     def test_quarantine_with_every_name_taken_refuses_and_leaves_the_result(self):
         for i in range(uq._PLACE_TRIES):
@@ -159,14 +175,14 @@ class ConcurrentProducerAtTheMoveBoundary(unittest.TestCase):
         live = self.results / "task-q3.txt"
         live.write_text("refused body", encoding="utf-8")
         with self.assertRaises(FileExistsError):
-            uq.quarantine(live, self.results, when=9)
+            uq.place(live, self.results, "task-q3", when=9)
         self.assertEqual(live.read_text(encoding="utf-8"), "refused body")
 
     def test_quarantine_never_replaces_earlier_evidence(self):
         earlier = self._quarantine("q2", "EARLIER evidence", 7)
         live = self.results / "task-q2.txt"
         live.write_text("refused body", encoding="utf-8")
-        moved = uq.quarantine(live, self.results, when=7)
+        moved = uq.place(live, self.results, "task-q2", when=7)
         self.assertNotEqual(moved, earlier)
         self.assertEqual(earlier.read_text(encoding="utf-8"), "EARLIER evidence")
 

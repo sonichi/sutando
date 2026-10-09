@@ -27,6 +27,11 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'packages' / 'ag2-sparrow'))
 from ag2_sparrow import outbox, remote_gateway_bridge as gw, undelivered_quarantine
+
+
+def _park_in_quarantine(rfile, results, when=None):
+    """Fixture: put a result where the quarantine reader lists it."""
+    return undelivered_quarantine.place(Path(rfile), results, Path(rfile).stem, when=when)
 try:
     # The canonical module, so the coverage gate (source = src) sees the
     # lifecycle run under the bridge; the vendored copy is pinned byte-equal.
@@ -53,8 +58,12 @@ class Gateway:
         self.now = 1000.0
         self.calls = []
 
+    accepting = False
+
     def request(self, method, path, payload):
         self.calls.append(dict(payload))
+        if self.accepting:
+            return {'ok': True}
         raise urllib.error.HTTPError('https://gateway.invalid', 400, 'bad request', None, None)
 
 
@@ -258,7 +267,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.task()
         result = self.result()
         body, gen = self.read(result)
-        undelivered_quarantine.quarantine(result, self.results, when=1)   # ancient epoch
+        _park_in_quarantine(result, self.results, when=1)   # ancient epoch
         self.deliver(body, result, gen)
         self.assertEqual(len(self.quarantined()), 1)
         self.assertEqual(self.about(), [], '\n'.join(self.about()))
@@ -353,7 +362,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         pid, start = disposal.self_token()
         claim = self.claim_name(pid, start, 'aba0d001')      # ours, but not active
         result.rename(claim)
-        undelivered_quarantine.quarantine(self.result(), self.results)
+        _park_in_quarantine(self.result(), self.results)
         gw._post_ready_results({TID})
         self.assertEqual(self.claims(), [])
         self.assertEqual(len(self.quarantined()), 2, 'a distinct publication is never deleted')
@@ -370,7 +379,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         pid, start = disposal.self_token()
         claim = self.claim_name(pid, start, 'aba0d002')
         os.link(result, claim)
-        undelivered_quarantine.quarantine(result, self.results)
+        _park_in_quarantine(result, self.results)
         gw._post_ready_results({TID})
         self.assertEqual(self.claims(), [])
         copies = [self.results / 'undelivered' / n for n in self.quarantined()]
@@ -639,6 +648,72 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual([c.get('body') for c in self.server.calls][-1:], ['the parked answer'])
         self.assertFalse(result.exists(), 'a delivered result stays rescannable')
 
+    def _parked_on_a_host_that_cannot_restore(self):
+        """A refusal parks the item and quarantines its body, on a host with
+        neither a no-replace rename nor hard links, so a requeue hits NO_SAFE_MOVE."""
+        sys.path.insert(0, str(REPO / 'src'))
+        import outbox_cli
+        mods = {id(m): m for m in (undelivered_quarantine, getattr(disposal, 'undelivered_quarantine', None),
+                                   outbox_cli.undelivered_quarantine) if m is not None}
+        stack = contextlib.ExitStack()
+        for m in mods.values():
+            stack.enter_context(patch.object(m, 'RENAME_PRIMITIVE', 'none'))
+            stack.enter_context(patch.object(m, '_RENAME', None))
+        self.addCleanup(stack.close)
+        self.bridge()
+        self.task()
+        result = self.result('BODY-A parked answer')
+        gw._post_ready_results({TID})
+        self.assertEqual(outbox.item_status(self.outbox, TID), 'PARKED')
+        return outbox_cli, result
+
+    def _requeue_with(self, outbox_cli, after_restore):
+        real = outbox_cli.undelivered_quarantine.restore
+        out = []
+
+        def restore_then(results_dir, body_id):
+            got = real(results_dir, body_id)
+            self.assertIs(got[0], outbox_cli.undelivered_quarantine.RestoreOutcome.NO_SAFE_MOVE)
+            after_restore()
+            return got
+        with patch.object(outbox_cli.undelivered_quarantine, 'restore', restore_then), \
+                patch('os.link', side_effect=PermissionError(1, 'no hard links')), \
+                patch.object(outbox_cli, '_emit', lambda rec, as_json, **k: out.append(dict(rec))):
+            rc = outbox_cli.main(['--root', str(self.outbox), 'requeue', TID, '--reset-attempts',
+                                  '--results-dir', str(self.results), '--body-id', TID])
+        return rc, out[-1]
+
+    def test_a_failed_restore_never_overwrites_a_peers_delivered(self):
+        outbox_cli, _ = self._parked_on_a_host_that_cannot_restore()
+        rc, out = self._requeue_with(outbox_cli, lambda: outbox.record_delivered(self.outbox, TID))
+        self.assertEqual(rc, 4)
+        self.assertEqual(outbox.item_status(self.outbox, TID), 'DELIVERED', 'the peer\'s transition was overwritten')
+        self.assertEqual(out['result'], 'left-moved-on')
+        self.assertEqual(self.quarantined_bodies(), ['BODY-A parked answer'])
+
+    def test_a_reply_published_while_queued_is_never_parked_by_the_rollback(self):
+        # The rollback leaves B live and the record QUEUED for the drain; which
+        # payload the drain then sends under this id is the outbox payload contract.
+        outbox_cli, result = self._parked_on_a_host_that_cannot_restore()
+
+        def publish_b():
+            tmp = result.with_name('.producer.tmp')
+            tmp.write_text('BODY-B newer reply')
+            os.replace(tmp, result)
+        rc, out = self._requeue_with(outbox_cli, publish_b)
+        self.assertEqual(rc, 4)
+        self.assertEqual(out['result'], 'left-live-result')
+        self.assertEqual(outbox.item_status(self.outbox, TID), 'QUEUED', 'B was parked unsent')
+        self.assertEqual(result.read_text(), 'BODY-B newer reply')
+        self.assertEqual(self.quarantined_bodies(), ['BODY-A parked answer'])
+
+    def test_an_unrestorable_body_parks_its_own_queued_record_again(self):
+        outbox_cli, _ = self._parked_on_a_host_that_cannot_restore()
+        rc, out = self._requeue_with(outbox_cli, lambda: None)
+        self.assertEqual(rc, 4)
+        self.assertEqual(out['result'], 'requeue-undone')
+        self.assertEqual(outbox.item_status(self.outbox, TID), 'PARKED')
+
     def test_a_recovery_precheck_error_never_blocks_delivery(self):
         # EIO from the results-dir precheck, through the real drain entry:
         # recovery skips and says so once; the ordinary result is still posted.
@@ -745,7 +820,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         result = self.result()
         body, gen = self.read(result)
         os.utime(result, ns=(gen.mtime_ns + 1_000, gen.mtime_ns + 1_000))
-        undelivered_quarantine.quarantine(result, self.results)
+        _park_in_quarantine(result, self.results)
         self.deliver(body, result, gen)
         self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
         self.assertIn('vanished', self.about()[0])
@@ -931,7 +1006,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.bridge(core)
         self.task()
         other = self.result('OTHER BODY')
-        undelivered_quarantine.quarantine(other, self.results, when=time.time_ns() + 10 ** 12)
+        _park_in_quarantine(other, self.results, when=time.time_ns() + 10 ** 12)
         result = self.result('NEW BODY')
         body, gen = self.read(result)
         result.unlink()                           # lost before disposal
@@ -986,7 +1061,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         q = self.results / 'undelivered'
         q.mkdir()
         (q / f'{TID}-5.txt').symlink_to(q / 'gone.txt')     # listed, not readable
-        undelivered_quarantine.quarantine(result, self.results, when=7)
+        _park_in_quarantine(result, self.results, when=7)
         self.deliver(body, result, gen)
         self.assertEqual(self.about(), [], '\n'.join(self.about()))
 

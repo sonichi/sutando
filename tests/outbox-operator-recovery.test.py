@@ -261,7 +261,7 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
         root = (results / ".outbox-test") if root_inside_results else Path(td) / "ob"
         _parked(root)
         (results / f"{ITEM}.txt").write_text("the reply", encoding="utf-8")
-        uq.quarantine(results / f"{ITEM}.txt", results, when=1700000000)
+        uq.place(results / f"{ITEM}.txt", results, f"{ITEM}", when=1700000000)
         return root, results
 
     def test_the_DEFAULT_requeue_restores_the_body(self):
@@ -349,14 +349,28 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             self.assertFalse((results / f"{ITEM}.txt").exists())
             self.assertEqual(len(uq.find_quarantined(results, ITEM)), 1, "the body must stay intact")
 
-    def test_an_unrestorable_body_on_an_already_queued_record_is_not_reparked(self):
+    def test_an_unrestorable_body_on_an_already_queued_record_is_parked_again(self):
+        """A QUEUED record with no body would read as recovered and never send,
+        whichever run committed the transition."""
         with TemporaryDirectory() as td:
             root, results = self._quarantined(td, root_inside_results=True)
             outbox.requeue_item(root, ITEM)                  # the record half committed earlier
             with self._no_primitive(links=False):
                 rc = outbox_cli.main(["--root", str(root), "requeue", ITEM])
             self.assertEqual(rc, 4)
-            self.assertEqual(outbox.item_status(root, ITEM), "QUEUED")
+            self.assertEqual(outbox.item_status(root, ITEM), "PARKED")
+
+    def test_a_delivered_record_never_gets_its_body_back(self):
+        """A copy left listed in undelivered/ (its aside rename failed) is not
+        owed again once the record is DELIVERED: a re-run restores nothing."""
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td, root_inside_results=True)
+            outbox.record_delivered(root, ITEM)
+            rc = outbox_cli.main(["--root", str(root), "requeue", ITEM])
+            self.assertEqual(rc, 3)
+            self.assertFalse((results / f"{ITEM}.txt").exists(), "a delivered body went live again")
+            self.assertEqual(len(uq.find_quarantined(results, ITEM)), 1)
+
 
     def test_a_retry_with_nothing_to_do_still_reports_nothing_to_do(self):
         """The exit code must not become 0 for every already-queued item, or the
@@ -384,7 +398,7 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             broker_id, local_id = "task-abc", "task-dev~task-abc"
             _parked(root, broker_id)
             (results / f"{local_id}.txt").write_text("the reply", encoding="utf-8")
-            uq.quarantine(results / f"{local_id}.txt", results, when=1700000000)
+            uq.place(results / f"{local_id}.txt", results, f"{local_id}", when=1700000000)
 
             # the local id addresses no record
             self.assertEqual(
@@ -423,7 +437,7 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             self.assertEqual(uq.restore(results, ITEM)[0],
                              uq.RestoreOutcome.NOTHING_QUARANTINED)
             (results / f"{ITEM}.txt").write_text("old", encoding="utf-8")
-            uq.quarantine(results / f"{ITEM}.txt", results)
+            uq.place(results / f"{ITEM}.txt", results, f"{ITEM}")
             (results / f"{ITEM}.txt").write_text("newer", encoding="utf-8")
             self.assertEqual(uq.restore(results, ITEM)[0],
                              uq.RestoreOutcome.LIVE_RESULT_PRESENT)
@@ -435,7 +449,7 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             results = Path(td) / "results"; results.mkdir()
             for body in ("first", "second"):
                 (results / f"{ITEM}.txt").write_text(body, encoding="utf-8")
-                uq.quarantine(results / f"{ITEM}.txt", results)
+                uq.place(results / f"{ITEM}.txt", results, f"{ITEM}")
             self.assertEqual(len(uq.find_quarantined(results, ITEM)), 2)
 
     def test_requeue_with_results_dir_returns_the_body_to_the_drain(self):
@@ -477,6 +491,50 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
         # only through undelivered_quarantine.place().
         self.assertIn("disposal.quarantine_current(", bridge)
         self.assertIn("disposal.quarantine_generation(", bridge)
+
+
+class UndoRequeue(unittest.TestCase):
+    """The rollback writes only over the exact QUEUED state the requeue made."""
+
+    def _queued(self, td):
+        root = Path(td) / "ob"
+        _parked(root)
+        outbox.requeue_item(root, ITEM)
+        return root, outbox.resend_epoch_for(root, ITEM)
+
+    def test_undoes_its_own_queued_state(self):
+        with TemporaryDirectory() as td:
+            root, epoch = self._queued(td)
+            self.assertIs(outbox.undo_requeue(root, ITEM, expect_epoch=epoch, reason="r",
+                                              live_result=lambda: False), outbox.UndoOutcome.UNDONE)
+            self.assertEqual(outbox.item_status(root, ITEM), "PARKED")
+
+    def test_another_epoch_is_left_alone(self):
+        with TemporaryDirectory() as td:
+            root, epoch = self._queued(td)
+            self.assertIs(outbox.undo_requeue(root, ITEM, expect_epoch=epoch - 1, reason="r",
+                                              live_result=lambda: False), outbox.UndoOutcome.MOVED_ON)
+            self.assertEqual(outbox.item_status(root, ITEM), "QUEUED")
+
+    def test_an_absent_record_is_left_alone(self):
+        with TemporaryDirectory() as td:
+            self.assertIs(outbox.undo_requeue(Path(td) / "ob", ITEM, expect_epoch=1, reason="r",
+                                              live_result=lambda: False), outbox.UndoOutcome.MOVED_ON)
+
+    def test_a_claimed_item_is_left_to_its_drainer(self):
+        with TemporaryDirectory() as td:
+            root, epoch = self._queued(td)
+            self.assertTrue(outbox.acquire_delivery_claim(root, ITEM, "peer"))
+            self.assertIs(outbox.undo_requeue(root, ITEM, expect_epoch=epoch, reason="r",
+                                              live_result=lambda: False), outbox.UndoOutcome.LIVE_RESULT)
+            self.assertEqual(outbox.item_status(root, ITEM), "QUEUED")
+
+    def test_a_live_result_is_left_for_delivery(self):
+        with TemporaryDirectory() as td:
+            root, epoch = self._queued(td)
+            self.assertIs(outbox.undo_requeue(root, ITEM, expect_epoch=epoch, reason="r",
+                                              live_result=lambda: True), outbox.UndoOutcome.LIVE_RESULT)
+            self.assertEqual(outbox.item_status(root, ITEM), "QUEUED")
 
 
 class CliRenderingAndErrorPaths(unittest.TestCase):

@@ -83,7 +83,7 @@ except ImportError:  # pragma: no cover
 __all__ = ["CLAIM_MAX_S", "LOCK_WAIT_S", "LOCK_NAME", "ACTIVE_CLAIMS",
            "Claim", "GenerationReplaced", "KeptQuarantined", "DisposalBusy", "locked", "rename_noreplace",
            "self_token", "parse_claim", "find_claims", "find_malformed", "owner_holds",
-           "quarantine_generation", "quarantine_current", "put_back", "recover_claim", "recover_abandoned_claims",
+           "quarantine_generation", "quarantine_current", "retire_generation", "put_back", "recover_claim", "recover_abandoned_claims",
            "disposed_copy_exists", "report_once"]
 
 # Only an owner whose liveness cannot be read (EPERM) ages out: the bound is a
@@ -441,19 +441,23 @@ def quarantine_current(results_dir: Path, rfile: Path, log: Log) -> Path:
         return _quarantine_generation(Path(results_dir), Path(rfile), generation, log)
 
 
-def retire_current(results_dir: Path, rfile: Path, log: Log, directory: Path,
-                   names: "Iterable[str]") -> Path:
-    """Move what is at `rfile` now into `directory` under the first free of
-    `names`, through the same claim and verification as a quarantine, so a
-    reply that replaces it meanwhile stays live. Raises GenerationReplaced or
-    FileNotFoundError when the file it would move is no longer there."""
+def retire_generation(results_dir: Path, rfile: Path, generation: ResultIdentity, log: Log,
+                      directory: Path, names: "Iterable[str]") -> Path:
+    """Move `rfile` into `directory` under the first free of `names` only if it
+    still IS `generation`, the publication the caller read and acted on. A
+    reply that replaced it meanwhile stays live; raises GenerationReplaced or
+    FileNotFoundError when nothing of that publication is left to move."""
     names = list(names)
     with locked(results_dir):
-        _, generation = identity_of(rfile)
-        return _quarantine_generation(
-            Path(results_dir), Path(rfile), generation, log,
-            lambda src: undelivered_quarantine.place_as(
-                src, directory, names, lambda s, d: _move_into_quarantine(s, d, log)))
+        return _retire(Path(results_dir), Path(rfile), generation, log, directory, names)
+
+
+def _retire(results_dir: Path, rfile: Path, generation: ResultIdentity, log: Log,
+            directory: Path, names: "list[str]") -> Path:
+    return _quarantine_generation(
+        results_dir, rfile, generation, log,
+        lambda src: undelivered_quarantine.place_as(
+            src, directory, names, lambda s, d: _move_into_quarantine(s, d, log)))
 
 
 def put_back(claim: Path, rfile: Path, log: Optional[Log] = None) -> bool:

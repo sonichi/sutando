@@ -311,7 +311,8 @@ from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
                             RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core.provider_ag2space import AG2SpaceResultProvider
-from .result_ready import read_ready_result, read_ready_result_with_identity, ResultIdentity
+from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
+                           ResultIdentity)
 from . import result_disposal as disposal
 from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
@@ -4889,11 +4890,11 @@ def _names(base: str, tries: int = 64):
         yield f"{base}.{ns + i}.txt"
 
 
-def _retire_orphan(rfile, directory, base: str) -> bool:
-    """The lifecycle owner moves the file it finds there; a reply that replaces
-    it meanwhile stays live. False when nothing of this pass was moved."""
+def _retire_orphan(rfile, directory, base: str, generation) -> bool:
+    """The lifecycle owner moves the generation this pass classified; a reply
+    that replaced it since stays live. False when nothing of it was moved."""
     try:
-        disposal.retire_current(RESULTS_DIR, rfile, _log, directory, _names(base))
+        disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))
         return True
     except (disposal.GenerationReplaced, FileNotFoundError):
         return False
@@ -4902,9 +4903,10 @@ def _retire_orphan(rfile, directory, base: str) -> bool:
         return False
 
 
-def _quarantine_orphan(rfile, tid: str, reason: str) -> bool:
+def _quarantine_orphan(rfile, tid: str, reason: str, generation) -> bool:
     """Never replaces prior quarantined evidence, under collision."""
-    return _retire_orphan(rfile, UNDELIVERABLE_RESULTS_DIR, f"{tid}.{reason}.{int(time.time())}")
+    return _retire_orphan(rfile, UNDELIVERABLE_RESULTS_DIR, f"{tid}.{reason}.{int(time.time())}",
+                          generation)
 
 
 def _reconcile_orphan_results(inflight: "set[str]") -> None:
@@ -4933,16 +4935,18 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             # Leave their delivery and retirement to the local consumers.
             if headers.get("source") == "cron":
                 continue
+        # One open decides every arm below, and only that generation is retired.
         try:
-            age = now - rfile.stat().st_mtime
+            data, generation = identity_of(rfile)
         except OSError:
             continue
+        age = now - generation.mtime_ns / 1e9
         if age < ORPHAN_GRACE_S:
             continue                            # young: normal path may claim it
         if age > ORPHAN_MAX_AGE_S:
             # A minimum age alone lets an automatic pass replay an unbounded
             # historical backlog into live rooms; backfill must be deliberate.
-            if _quarantine_orphan(rfile, tid, "too-old"):
+            if _quarantine_orphan(rfile, tid, "too-old", generation):
                 if tid not in _orphan_quarantine_logged:
                     _orphan_quarantine_logged.add(tid)
                     _log(f"orphan sweep: {tid} is {int(age)}s old (>{int(ORPHAN_MAX_AGE_S)}s) "
@@ -4951,13 +4955,14 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         # Delivered copy = double-write. NEVER re-deliver: the sweep would
         # post agent narration about having answered into the room.
         if _delivered_copy_exists(tid):
-            if _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, f"{tid}-{int(now)}-late-duplicate"):
+            if _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, f"{tid}-{int(now)}-late-duplicate",
+                              generation):
                 _log(f"orphan sweep: {tid} is a post-delivery duplicate — moved aside")
             continue
         # No task anywhere: nothing resolves a destination — quarantine,
         # never a labeled re-delivery (permanent sweep error otherwise).
         if task is None:
-            if not _quarantine_orphan(rfile, tid, "no-task"):
+            if not _quarantine_orphan(rfile, tid, "no-task", generation):
                 continue
             if tid not in _orphan_quarantine_logged:
                 _orphan_quarantine_logged.add(tid)
@@ -4965,8 +4970,11 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # Genuinely undelivered: ONE labeled attempt — at-least-once by
         # design; the label makes the rare duplicate self-explaining.
-        raw, generation = _read_ready_generation(rfile)
-        if raw is None:
+        try:
+            raw = data.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            continue                            # a partial write: readable on a later pass
+        if not raw:
             continue
         delivery = _delivery_tid(tid)
         if delivery is None:
@@ -4986,14 +4994,14 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         if [a for a in parsed.actions if a.kind == "attach"]:
             # Delivering without the files would silently drop them — park
             # for a human instead of composing a partial delivery.
-            if _quarantine_orphan(rfile, tid, "has-attachments"):
+            if _quarantine_orphan(rfile, tid, "has-attachments", generation):
                 _log(f"orphan sweep: {tid} carries attachments — quarantined")
             continue
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
         if skip and skip.value == "deduped":
             # _dedup_plan reports or requeues when the holder delivered
             # nothing; posting here would retire the ask without that check.
-            if _quarantine_orphan(rfile, tid, "deduped-orphan"):
+            if _quarantine_orphan(rfile, tid, "deduped-orphan", generation):
                 _log(f"orphan sweep: {tid} defers to its dedup holder — quarantined")
             continue
         if skip:
