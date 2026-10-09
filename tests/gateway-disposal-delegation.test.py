@@ -283,6 +283,31 @@ class CoreContract(unittest.TestCase):
         self.assertEqual(len(self.lines), 1)
         self.assertIn("superseded", self.lines[0])
 
+    def test_a_rewrite_of_the_claimed_inode_during_hashing_is_not_verified(self):
+        # A producer holding the inode open rewrites it while the owner hashes
+        # it: the bytes may still hash equal, but the file is no longer the
+        # generation read, so it goes back live instead of into quarantine.
+        r = self.result("answer")
+        _, gen = identity_of(r)
+        real_read = os.read
+        rewritten = []
+
+        def rewrite_mid_hash(fd, n):
+            data = real_read(fd, n)
+            if data and not rewritten:
+                rewritten.append(True)
+                with open(r if r.exists() else disposal.find_claims(self.results)[0], "r+b") as f:
+                    f.seek(0); f.write(b"answer"); f.flush(); os.fsync(f.fileno())
+                os.utime(disposal.find_claims(self.results)[0], ns=(gen.mtime_ns + 5_000, gen.mtime_ns + 5_000))
+            return data
+        with unittest.mock.patch.object(os, "read", rewrite_mid_hash):
+            with self.assertRaises(disposal.GenerationReplaced):
+                disposal.quarantine_generation(self.results, r, gen, self.lines.append)
+        self.assertTrue(rewritten)
+        self.assertEqual(r.read_text(), "answer", "the rewritten reply stays live")
+        self.assertEqual(self.quarantined(), [])
+        self.assertEqual(disposal.find_claims(self.results), [])
+
     def test_the_link_fallback_reports_a_name_retaken_in_its_gap(self):
         # Without a kernel no-replace rename the put-back links then unlinks;
         # a producer retaking the name in between is reported and the claim
