@@ -628,7 +628,7 @@ def _launch_shell_job(name: str, command: str, timeout_s: int) -> "subprocess.Po
     """
     argv = [
         sys.executable, str(Path(__file__).resolve()), "--shell-job",
-        "--name", name, "--timeout", str(timeout_s),
+        f"--name={name}", "--timeout", str(timeout_s),
         "--state-file", str(STATE_FILE), "--cwd", str(REPO_ROOT),
         "--", command,
     ]

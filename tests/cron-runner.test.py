@@ -717,6 +717,94 @@ def test_names_sharing_a_slug_get_separate_locks_and_logs():
             cr.REPO_ROOT = original_repo_root
 
 
+def test_held_job_lock_skips_the_fire_in_process():
+    """The lock-held branch of _run_shell_job: returns None, logs the skip,
+    and never runs the command."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original = (cr.STATE_FILE, cr.REPO_ROOT)
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        cr.REPO_ROOT = root
+        try:
+            lock = cr._shell_lock_path("busy")
+            check(cr._shell_job_key("busy") in lock.name, "lock path is keyed by _shell_job_key")
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            holder = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o644)
+            # flock is per open file description, so a second open in this
+            # process contends with the held one exactly as another process would.
+            cr.lock_fd(holder)
+            try:
+                rc = cr._run_shell_job("busy", "echo ran > ran.txt", 5)
+            finally:
+                cr.unlock_fd(holder)
+                os.close(holder)
+            check(rc is None, f"held lock returns None (got {rc!r})")
+            check(not (root / "ran.txt").exists(), "the command never ran")
+            check("skipped: previous run still in progress"
+                  in cr._shell_log_path("busy").read_text(), "the skip is logged")
+        finally:
+            cr.STATE_FILE, cr.REPO_ROOT = original
+
+
+def test_failed_launch_is_logged_and_not_counted():
+    """run() survives a launch failure, does not count the job, and logs it."""
+    import contextlib
+    import io
+    import json
+    import unittest.mock as _m
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        _point_runner_at(root)
+        try:
+            fire = _epoch(2026, 7, 2, 6, 2)
+            cr.CRONS_FILE.write_text(json.dumps([
+                {"name": "unlaunchable", "cron": "2 6 * * *", "launchd": True,
+                 "shell_command": "true"},
+            ]))
+            cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cr.STATE_FILE.write_text(json.dumps({"unlaunchable": fire - 60}))
+            err = io.StringIO()
+            with _m.patch.object(cr.subprocess, "Popen", side_effect=OSError(24, "too many")), \
+                 contextlib.redirect_stderr(err):
+                emitted = cr.run(now_epoch=fire)
+            check(emitted == [], f"failed launch is not counted (got {emitted})")
+            check("launch failed" in err.getvalue(), "failure is reported on stderr")
+            check("launch failed" in cr._shell_log_path("unlaunchable").read_text(),
+                  "failure is recorded in the job log")
+            check(not cr.TASKS_DIR.exists(), "no task is emitted as a fallback")
+        finally:
+            cr.REPO_ROOT = original_repo_root
+
+
+def test_dash_leading_name_survives_the_child_argv():
+    """A configured name starting with '-' must not be parsed as an option."""
+    import contextlib
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        _point_runner_at(root)
+        try:
+            fire = _epoch(2026, 7, 2, 6, 2)
+            name = "--weird-name"
+            cr.CRONS_FILE.write_text(json.dumps([
+                {"name": name, "cron": "2 6 * * *", "launchd": True,
+                 "shell_command": "echo ran > dash.txt"},
+            ]))
+            cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cr.STATE_FILE.write_text(json.dumps({name: fire - 60}))
+            with contextlib.redirect_stdout(io.StringIO()):
+                cr.run(now_epoch=fire)
+            log = cr._shell_log_path(name)
+            check(_wait_for(lambda: log.exists() and "exit_code=0" in log.read_text(), 15),
+                  "dash-leading name runs and logs under its own key")
+            check((root / "dash.txt").exists(), "dash-leading name's command ran")
+        finally:
+            cr.REPO_ROOT = original_repo_root
+
+
 def test_shell_job_child_enforces_timeout():
     """The detached child applies the per-entry timeout and logs the kill."""
     with tempfile.TemporaryDirectory() as d:
