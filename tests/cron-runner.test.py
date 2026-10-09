@@ -595,7 +595,7 @@ def test_run_executes_shell_command_without_core_or_task_file():
                 emitted = cr.run(now_epoch=fire)
 
             check(emitted == ["mechanical"], "shell command is recorded as launched")
-            log_path = root / "logs" / "cron" / "mechanical.log"
+            log_path = cr._shell_log_path("mechanical")
             check(_wait_for(lambda: log_path.exists() and "exit_code=" in log_path.read_text()),
                   "shell job writes its own per-job log")
             check((root / "shell-marker").read_text() == "ok", "shell command runs from repo root")
@@ -638,7 +638,7 @@ def test_run_does_not_wait_for_a_long_shell_job():
                   "the prompt entry is emitted without waiting for the shell job")
             check(not list(cr.TASKS_DIR.glob("task-cron-slow-*.txt")),
                   "the shell job never becomes a task for the core")
-            slow_log = root / "logs" / "cron" / "slow.log"
+            slow_log = cr._shell_log_path("slow")
             check(_wait_for(lambda: slow_log.exists() and "exit_code=0" in slow_log.read_text()),
                   "the detached shell job completes on its own")
         finally:
@@ -668,12 +668,51 @@ def test_overlapping_fire_is_skipped():
                 cr.run(now_epoch=first)
                 check(_wait_for(runs.exists, 10), "first fire starts")
                 cr.run(now_epoch=first + 60)
-            log_path = root / "logs" / "cron" / "every-minute.log"
+            log_path = cr._shell_log_path("every-minute")
             check(_wait_for(lambda: log_path.exists() and "skipped" in log_path.read_text(), 10),
                   "overlapping fire is logged as skipped")
             check(_wait_for(lambda: "exit_code=0" in log_path.read_text()),
                   "first run still completes")
             check(runs.read_text().count("run") == 1, "the overlapping fire did not run the command")
+        finally:
+            cr.REPO_ROOT = original_repo_root
+
+
+def test_names_sharing_a_slug_get_separate_locks_and_logs():
+    """Distinct configured names must never share a lock or log, even when the
+    slug collapses them (punctuation, or a non-Latin name)."""
+    import contextlib
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        _point_runner_at(root)
+        try:
+            fire = _epoch(2026, 7, 2, 6, 2)
+            names = ["inbox triage", "inbox-triage", "\u6536\u4ef6\u7bb1", "\u6574\u7406"]
+            cr.CRONS_FILE.write_text(json.dumps([
+                {"name": n, "cron": "2 6 * * *", "launchd": True,
+                 "shell_command": f"sleep 2; echo ran >> done-{i}.txt"}
+                for i, n in enumerate(names)
+            ]))
+            cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cr.STATE_FILE.write_text(json.dumps({n: fire - 60 for n in names}))
+            check(len({cr._shell_lock_path(n) for n in names}) == len(names),
+                  "each distinct name has its own lock path")
+            check(len({cr._shell_log_path(n) for n in names}) == len(names),
+                  "each distinct name has its own log path")
+            with contextlib.redirect_stdout(io.StringIO()):
+                emitted = cr.run(now_epoch=fire)
+            check(sorted(emitted) == sorted(names), "all four entries fire")
+            logs = sorted({cr._shell_log_path(n) for n in names})
+            check(_wait_for(lambda: all(p.exists() and "exit_code=0" in p.read_text()
+                                        for p in logs), 15),
+                  "every job finishes and logs its exit")
+            check(all((root / f"done-{i}.txt").exists() for i in range(len(names))),
+                  "every job's command ran")
+            check(not any("skipped" in p.read_text() for p in logs if p.exists()),
+                  "no job was skipped by another job's lock")
         finally:
             cr.REPO_ROOT = original_repo_root
 
@@ -693,10 +732,10 @@ def test_shell_job_child_enforces_timeout():
             elapsed = time.monotonic() - started
             check(rc == 124, f"timed-out job exits 124 (got {rc})")
             check(elapsed < 15, f"timeout is enforced ({elapsed:.1f}s)")
-            log = (root / "logs" / "cron" / "hung.log").read_text()
+            log = cr._shell_log_path("hung").read_text()
             check("exit_code=124" in log and "exceeded 1s" in log,
                   "timeout is recorded in the job log")
-            lock = root / "state" / "cron-shell-locks" / "hung.lock"
+            lock = cr._shell_lock_path("hung")
             fd = os.open(str(lock), os.O_RDWR)
             try:
                 cr.lock_fd(fd, blocking=False)

@@ -463,16 +463,24 @@ def _sanitize_name(name: str) -> str:
     return cron_task_id.sanitize_name(name)
 
 
+def _shell_job_key(name: str) -> str:
+    """Readable slug plus a digest of the exact name; the slug alone is lossy
+    (`a b` and `a-b` collide, non-Latin names become `unnamed`)."""
+    import hashlib
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+    return f"{_sanitize_name(name)}-{digest}"
+
+
 def _shell_log_path(name: str) -> Path:
     """Return the durable per-job log path for a direct shell-command job."""
     # Derive this from the state path so tests and callers that inject a
     # workspace by replacing STATE_FILE keep all runner state together.
-    return STATE_FILE.parent.parent / "logs" / "cron" / f"{_sanitize_name(name)}.log"
+    return STATE_FILE.parent.parent / "logs" / "cron" / f"{_shell_job_key(name)}.log"
 
 
 def _shell_lock_path(name: str) -> Path:
     """Per-job lock held for the life of one run; a busy lock means skip the fire."""
-    return STATE_FILE.parent / "cron-shell-locks" / f"{_sanitize_name(name)}.lock"
+    return STATE_FILE.parent / "cron-shell-locks" / f"{_shell_job_key(name)}.lock"
 
 
 # A hung job would hold its own lock and skip every later fire; a chatty one
