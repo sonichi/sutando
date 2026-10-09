@@ -524,137 +524,18 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
         self.assertIn("disposal.quarantine_generation(", bridge)
 
 
-class ResendFromLive(unittest.TestCase):
-    """A requeued record resends the result published at its name next, so a
-    reply published after a failed restore is the one sent, not the stored body."""
+class RequeueNeverChangesThePayload(unittest.TestCase):
+    """A requeue sends the stored body; a later publish of the id is refused."""
 
-    def _adopt(self, root, payload):
-        with outbox._item_lock(root, ITEM):
-            return outbox.adopt_resend_payload_locked(root, ITEM, payload)
-
-    def _requeued(self, td):
-        root = Path(td) / "ob"
-        _parked(root)
-        outbox._write_item(root, ITEM, dict(outbox.read_item(root, ITEM), payload="A"))
-        outbox.requeue_item(root, ITEM)
-        return root
-
-    def test_the_next_publish_is_adopted_once_keeping_the_epoch(self):
-        with TemporaryDirectory() as td:
-            root = self._requeued(td)
-            self.assertTrue(self._adopt(root, "B"))
-            rec = outbox.read_item(root, ITEM)
-            self.assertEqual((rec["payload"], rec["status"], rec["resend_epoch"]), ("B", "QUEUED", 1))
-            self.assertFalse(self._adopt(root, "C"), "only the first publish after a requeue")
-            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "B")
-
-    def test_a_claimed_item_keeps_the_payload_in_flight(self):
-        with TemporaryDirectory() as td:
-            root = self._requeued(td)
-            self.assertTrue(outbox.acquire_delivery_claim(root, ITEM, "peer"))
-            self.assertFalse(self._adopt(root, "B"))
-            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
-
-    def test_a_requeue_written_without_any_marker_adopts_once(self):
+    def test_the_stored_payload_survives_a_requeue_and_a_later_publish(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages" / "ag2-sparrow"))
+        from ag2_sparrow.delivery_core import DesignAClaimBackend
         with TemporaryDirectory() as td:
             root = Path(td) / "ob"
-            outbox._write_item(root, ITEM, {"item_id": ITEM, "status": "QUEUED", "payload": "A",
-                                            "resend_epoch": 1, "requeued_by": "old-cli"})
-            self.assertTrue(self._adopt(root, "B"))
-            self.assertFalse(self._adopt(root, "C"))
-            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "B")
-
-    def test_a_parked_record_never_adopts_and_a_new_requeue_adopts_again(self):
-        with TemporaryDirectory() as td:
-            root = self._requeued(td)
-            self.assertTrue(self._adopt(root, "B"))
-            outbox.park_item(root, ITEM, "refused again")
-            self.assertFalse(self._adopt(root, "C"), "a parked record is the operator's")
+            _parked(root)
+            outbox._write_item(root, ITEM, dict(outbox.read_item(root, ITEM), payload="A"))
             outbox.requeue_item(root, ITEM)
-            self.assertTrue(self._adopt(root, "C"), "each requeue resends what is live once")
-            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "C")
-
-    def test_a_main_requeue_attempted_since_keeps_its_stored_payload(self):
-        """main's requeue (attempts reset), then a failed attempt under the new
-        epoch's key: adopting B now would reuse the key A was sent under."""
-        with TemporaryDirectory() as td:
-            root = Path(td) / "ob"
-            outbox._write_item(root, ITEM, {"item_id": ITEM, "status": "QUEUED", "payload": "A",
-                                            "resend_epoch": 1, "requeued_by": "old-cli",
-                                            "attempts": 1})
-            self.assertFalse(self._adopt(root, "B"))
-            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
-
-    def test_a_requeue_attempted_since_keeps_its_stored_payload(self):
-        with TemporaryDirectory() as td:
-            root = self._requeued(td)
-            outbox.note_attempt(root, ITEM)
-            self.assertFalse(self._adopt(root, "B"))
-            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
-
-    # Every shape a QUEUED-or-READY unclaimed record can be persisted in by main's
-    # writers (publish, retry_ready/failed, note_attempt, requeue) and by this head.
-    RETRY = {"started_at": 1.0, "deadline": 9e9, "next_attempt_at": 1.0, "min_attempts": 5,
-             "initial_delay_s": 1.0, "max_delay_s": 2.0}
-    SHAPES = (
-        ("main: published, never attempted", {"status": "READY"}, False),
-        ("main: published, attempts failed", {"status": "READY", "attempts": 2,
-                                              "retry": dict(RETRY, failures=2)}, False),
-        ("main: requeued --reset-attempts", {"status": "QUEUED", "resend_epoch": 1,
-                                             "attempts": 0, "requeued_by": "op"}, True),
-        ("main: requeued --reset-attempts, retry armed, no attempt",
-         {"status": "QUEUED", "resend_epoch": 1, "attempts": 0, "retry": dict(RETRY, failures=0)}, True),
-        ("main: requeued without --reset-attempts", {"status": "QUEUED", "resend_epoch": 1,
-                                                     "attempts": 5, "retry": dict(RETRY, failures=5)}, False),
-        ("main: requeued --reset-attempts, then attempted (response lost)",
-         {"status": "QUEUED", "resend_epoch": 1, "attempts": 1, "retry": dict(RETRY, failures=1)}, False),
-        ("main: requeued --reset-attempts, then attempted, no retry schedule",
-         {"status": "QUEUED", "resend_epoch": 1, "attempts": 1}, False),
-        ("main: requeued twice, --reset-attempts", {"status": "QUEUED", "resend_epoch": 2, "attempts": 0}, True),
-        ("main: parked", {"status": "PARKED", "resend_epoch": 1, "attempts": 0}, False),
-        ("head: requeued --reset-attempts", {"status": "QUEUED", "resend_epoch": 1, "attempts": 0,
-                                             "requeued_attempts": 0, "requeued_attempts_epoch": 1}, True),
-        ("head: requeued without --reset-attempts",
-         {"status": "QUEUED", "resend_epoch": 1, "attempts": 5, "requeued_attempts": 5,
-          "requeued_attempts_epoch": 1}, True),
-        ("head: requeued, then attempted", {"status": "QUEUED", "resend_epoch": 1, "attempts": 6,
-                                            "requeued_attempts": 5, "requeued_attempts_epoch": 1}, False),
-        ("head: requeued, already adopted",
-         {"status": "QUEUED", "resend_epoch": 1, "attempts": 0, "requeued_attempts": 0,
-          "requeued_attempts_epoch": 1, "resend_adopted_epoch": 1}, False),
-        ("mixed: head baseline at epoch 1, main requeued --reset-attempts to 2, then attempted",
-         {"status": "QUEUED", "resend_epoch": 2, "attempts": 1, "requeued_attempts": 1,
-          "requeued_attempts_epoch": 1, "retry": dict(RETRY, failures=1)}, False),
-    )
-
-    def test_every_persisted_shape_adopts_only_an_unused_requeue_epoch(self):
-        for name, fields, adopts in self.SHAPES:
-            with self.subTest(shape=name), TemporaryDirectory() as td:
-                root = Path(td) / "ob"
-                outbox._write_item(root, ITEM, dict(fields, item_id=ITEM, payload="A"))
-                self.assertIs(self._adopt(root, "B"), adopts)
-                self.assertEqual(outbox.read_item(root, ITEM)["payload"], "B" if adopts else "A")
-
-    def test_a_requeue_records_the_epoch_its_baseline_belongs_to(self):
-        with TemporaryDirectory() as td:
-            root = self._requeued(td)
-            rec = outbox.read_item(root, ITEM)
-            self.assertEqual((rec["requeued_attempts"], rec["requeued_attempts_epoch"]),
-                             (rec["attempts"], rec["resend_epoch"]))
-
-    def test_an_unreadable_epoch_keeps_the_stored_payload(self):
-        with TemporaryDirectory() as td:
-            root = Path(td) / "ob"
-            outbox._write_item(root, ITEM, {"item_id": ITEM, "status": "QUEUED", "payload": "A",
-                                            "resend_epoch": "one"})
-            self.assertFalse(self._adopt(root, "B"))
-            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
-
-    def test_a_record_never_requeued_keeps_its_stored_payload(self):
-        with TemporaryDirectory() as td:
-            root = Path(td) / "ob"
-            outbox._write_item(root, ITEM, {"item_id": ITEM, "status": "QUEUED", "payload": "A"})
-            self.assertFalse(self._adopt(root, "B"))
+            self.assertFalse(DesignAClaimBackend(root).publish(ITEM, b"B"))
             self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
 
 
@@ -703,23 +584,6 @@ class DeliveredBodyDiffers(unittest.TestCase):
 
     def test_the_source_digest_is_of_the_ready_body(self):
         self.assertEqual(outbox.source_digest("A"), hashlib.sha256(b"A").hexdigest())
-
-    def test_an_adoption_without_a_source_drops_the_stale_one(self):
-        with TemporaryDirectory() as td:
-            root = self._rec(td, status="QUEUED", payload="A", resend_epoch=1, attempts=0,
-                             source_ready_sha256="sA", source_payload_sha256="pA", source_sha256="raw")
-            with outbox._item_lock(root, ITEM):
-                self.assertTrue(outbox.adopt_resend_payload_locked(root, ITEM, "B"))
-            rec = outbox.read_item(root, ITEM)
-            self.assertNotIn("source_ready_sha256", rec)
-            self.assertNotIn("source_sha256", rec, "an earlier digest field never survives an adoption")
-            self.assertNotIn("source_payload_sha256", rec)
-            outbox._write_item(root, ITEM, dict(outbox.read_item(root, ITEM), resend_epoch=2))
-            with outbox._item_lock(root, ITEM):
-                self.assertTrue(outbox.adopt_resend_payload_locked(root, ITEM, "C", "sC"))
-            rec = outbox.read_item(root, ITEM)
-            self.assertEqual(rec["source_ready_sha256"], "sC")
-            self.assertEqual(outbox.source_proof(rec), "sC", "the proof is bound to the adopted payload")
 
 
 class CliRenderingAndErrorPaths(unittest.TestCase):

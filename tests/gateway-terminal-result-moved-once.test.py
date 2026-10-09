@@ -706,24 +706,29 @@ class TerminalResultMovedOnce(unittest.TestCase):
         gw._post_ready_results({TID})
         return self.server.calls[before:]
 
-    def _assert_b_was_sent_and_b_retired(self, result):
+    def _assert_a_sent_and_b_kept_visible(self, result):
+        """A requeue sends the stored body: A goes out; B, a different reply at an id
+        now delivered, is quarantined with its cause, never archived or lost."""
         sent = self._drain_once_accepting()
         archived = sorted(p.read_text() for p in (self.results / 'archive').rglob('*.txt'))
         self.assertEqual(
             {'provider_bodies': [c.get('body') for c in sent],
              'status': outbox.item_status(self.outbox, TID), 'live': result.exists(),
-             'undelivered': self.quarantined_bodies(), 'archive': archived},
-            {'provider_bodies': ['BODY-B newer reply'], 'status': 'DELIVERED', 'live': False,
-             'undelivered': ['BODY-A parked answer'], 'archive': ['BODY-B newer reply']})
+             'undelivered': self.quarantined_bodies(), 'b_archived': 'BODY-B newer reply' in archived},
+            {'provider_bodies': ['BODY-A parked answer'], 'status': 'DELIVERED', 'live': False,
+             'undelivered': ['BODY-A parked answer', 'BODY-B newer reply'], 'b_archived': False})
+        said = [l for l in self.lines if TID in l and UNSENT in l]
+        self.assertEqual(len(said), 1, '\n'.join(self.lines))
+        self.assertIn('send it by hand', said[0])
 
-    def test_a_reply_published_before_the_failed_restore_returns_is_sent(self):
+    def test_a_reply_published_before_the_failed_restore_returns_is_kept_visible(self):
         outbox_cli, result = self._parked_on_a_host_that_cannot_restore()
         rc, out = self._requeue_with(outbox_cli, lambda: self._publish_b(result))
         self.assertEqual(rc, 4)
         self.assertEqual(outbox.item_status(self.outbox, TID), 'QUEUED', 'B was parked unsent')
         self.assertEqual(result.read_text(), 'BODY-B newer reply')
         self.assertEqual(self.quarantined_bodies(), ['BODY-A parked answer'])
-        self._assert_b_was_sent_and_b_retired(result)
+        self._assert_a_sent_and_b_kept_visible(result)
 
     def test_a_reply_published_after_the_live_check_is_never_parked(self):
         """B lands just before any PARKED write the requeue makes (between a
@@ -742,7 +747,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
             self._publish_b(result)
         self.assertEqual(rc, 4)
         self.assertEqual(outbox.item_status(self.outbox, TID), 'QUEUED', 'B was parked unsent')
-        self._assert_b_was_sent_and_b_retired(result)
+        self._assert_a_sent_and_b_kept_visible(result)
 
     def _requeue_as_main_writes_it(self):
         """The record exactly as main's requeue_item writes it: no newer marker."""
@@ -753,16 +758,9 @@ class TerminalResultMovedOnce(unittest.TestCase):
         d.pop('retry', None)
         outbox._write_item(self.outbox, TID, d)
 
-    def test_a_persisted_requeue_from_an_older_writer_sends_the_live_reply(self):
-        _, result = self._parked_on_a_host_that_cannot_restore()
-        self._requeue_as_main_writes_it()
-        self._publish_b(result)
-        self._assert_b_was_sent_and_b_retired(result)
-
-    def _legacy_epoch_used_then_c(self, head_requeued_first=False):
+    def _legacy_epoch_used_then_c(self):
         """main requeues A, the gateway takes A but the response is lost; after
-        the upgrade C is published and the relay dedupes on the id. With
-        `head_requeued_first`, this head requeued and the item parked again first."""
+        the upgrade C is published and the relay dedupes on the id."""
         relay = [self.server.request]
         backend = DesignAClaimBackend(self.outbox, retry_schedule=outbox.RetrySchedule(),
                                       clock=lambda: self.server.now, republish_delivered=False)
@@ -771,12 +769,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.task()
         result = self.result('BODY-A parked answer')
         gw._post_ready_results({TID})                      # 400: parked, A quarantined
-        epoch = 1
-        if head_requeued_first:
-            outbox.requeue_item(self.outbox, TID, operator='head')    # baseline: attempts=1
-            outbox.park_item(self.outbox, TID, 'refused again')
-            epoch = 2
-        self._requeue_as_main_writes_it()                  # main keeps fields it does not know
+        self._requeue_as_main_writes_it()
         result.write_text('BODY-A parked answer')          # main's restore put A back
         held = []
 
@@ -788,13 +781,9 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.server.now += 3600
         gw._post_ready_results({TID})
         rec = outbox.read_item(self.outbox, TID) or {}
-        rec.pop('resend_adopted_epoch', None)                # main's drain never writes it
-        outbox._write_item(self.outbox, TID, rec)
         self.assertEqual((rec.get('status'), rec.get('resend_epoch'), rec.get('attempts'),
-                          (rec.get('retry') or {}).get('failures'), rec.get('requeued_attempts'),
-                          'resend_adopted_epoch' in rec),
-                         ('QUEUED', epoch, 1, 1, 1 if head_requeued_first else None, False),
-                         'not the persisted shape main leaves')
+                          (rec.get('retry') or {}).get('failures')),
+                         ('QUEUED', 1, 1, 1), 'not the persisted shape main leaves')
         self._publish_c(result)
 
         def dedupe(method, path, payload):
@@ -807,11 +796,6 @@ class TerminalResultMovedOnce(unittest.TestCase):
     def test_a_legacy_epoch_already_used_never_carries_a_new_body(self):
         """C must not be recorded DELIVERED under A's epoch, nor archived as sent."""
         self._assert_c_never_rides_a_used_epoch(*self._legacy_epoch_used_then_c())
-
-    def test_a_stale_baseline_from_an_earlier_epoch_is_not_trusted(self):
-        """Mixed writers: this head requeues, the item parks, main requeues again
-        (keeping the head's baseline), A is attempted with a lost response, C lands."""
-        self._assert_c_never_rides_a_used_epoch(*self._legacy_epoch_used_then_c(head_requeued_first=True))
 
     def _assert_c_never_rides_a_used_epoch(self, result, held):
         before = len(self.server.calls)

@@ -909,9 +909,6 @@ def source_proof_fields(source_ready_sha256: Optional[str], payload: str) -> dic
             "source_payload_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest()}
 
 
-SOURCE_PROOF_FIELDS = ("source_ready_sha256", "source_payload_sha256", "source_sha256")
-
-
 def source_digest(ready_body: str) -> str:
     """The digest an outbox record keeps of the result it was built from: the
     readiness-normalized body, so surrounding whitespace is the same source."""
@@ -996,9 +993,7 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
 
     Returns the epoch written under the lock (None unless REQUEUED): a later
     read can see a peer's re-requeue, and a rollback keyed on it undoes theirs.
-
-    The requeued record resends the result live at its name: the next publish
-    of this id replaces the stored payload once (`adopt_resend_payload_locked`).
+    A requeue never changes the stored payload.
     """
     root = Path(root)
     with _item_lock(root, item_id):
@@ -1017,40 +1012,5 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
-        d["requeued_attempts"] = int(d.get("attempts", 0) or 0)
-        d["requeued_attempts_epoch"] = d["resend_epoch"]
         _write_item(root, item_id, d)
         return RequeueOutcome.REQUEUED, d["resend_epoch"]
-
-
-def adopt_resend_payload_locked(root: Path, item_id: str, payload: str,
-                                source_ready_sha256: Optional[str] = None) -> bool:
-    """Under the caller's `_item_lock`: a requeued record awaiting its resend
-    takes the bytes being published now, once per resend epoch, keeping its
-    epoch and attempts. Keyed on the epoch every requeue writer has bumped, so a
-    record requeued by an older writer adopts too. Never after an attempt under
-    this epoch: its idempotency key may already carry the stored body. False =
-    the normal publish rule."""
-    root = Path(root)
-    d = _read_item(root, item_id)
-    try:
-        epoch = int(d.get("resend_epoch", 0) or 0)
-        adopted = int(d.get("resend_adopted_epoch", 0) or 0)
-        # A baseline counts only for the epoch that wrote it (an older writer keeps
-        # unknown fields across its own requeue); otherwise only zero proves no attempt.
-        tagged = int(d.get("requeued_attempts_epoch", -1)) == epoch
-        baseline = int(d.get("requeued_attempts", 0) or 0) if tagged else 0
-        attempted = int(d.get("attempts", 0) or 0) > baseline
-    except (TypeError, ValueError):
-        return False
-    if (attempted or adopted >= epoch or d.get("status") != "QUEUED"
-            or read_delivery_claim(root, item_id) is not None):
-        return False
-    d["payload"] = payload
-    d["published_at"] = time.time()
-    d["resend_adopted_epoch"] = epoch
-    for field in SOURCE_PROOF_FIELDS:                # a proof of the replaced body never survives
-        d.pop(field, None)
-    d.update(source_proof_fields(source_ready_sha256, payload))
-    _write_item(root, item_id, d)
-    return True

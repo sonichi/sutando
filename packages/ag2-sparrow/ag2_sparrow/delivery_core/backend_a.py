@@ -39,9 +39,6 @@ class DesignAClaimBackend:
                            else republish_delivered)
         with outbox._item_lock(self.root, item_id):
             if outbox._item_path(self.root, item_id).exists():
-                if outbox.adopt_resend_payload_locked(
-                        self.root, item_id, payload.decode("utf-8", "replace"), source_ready_sha256):
-                    return True
                 # DELIVERED = completed lifecycle -> fresh cycle (C-parity);
                 # PARKED stays refused: the operator holds it.
                 if (not allow_republish
