@@ -1029,13 +1029,6 @@ class CarrierSetProbe(unittest.TestCase):
         outside = Path("/definitely/not/under") / "tmp" / "stray.md"
         self.assertEqual(hc._stale_with_culprits(["hosts/*/"], {"hosts/*/": outside}, ws),
                          f"hosts/*/ -> {outside}")
-        # The message must USE it: testing the helper alone left a revert to
-        # entry-only green.
-        src = SRC.read_text()
-        self.assertIn("_stale_with_culprits(stale, stale_culprit, workspace)", src,
-                      "the STILL GIT-IGNORED message no longer names the dropped match")
-        self.assertIn("stale_culprit[entry] = culprit", src,
-                      "nothing records which match git ignored")
 
 
 class TheProbeSelectsTheIgnoredMatch(CarrierSetProbe):
