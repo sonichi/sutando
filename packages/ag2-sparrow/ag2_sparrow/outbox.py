@@ -967,6 +967,7 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
         d["requeued_attempts"] = int(d.get("attempts", 0) or 0)
+        d["requeued_attempts_epoch"] = d["resend_epoch"]
         _write_item(root, item_id, d)
         return RequeueOutcome.REQUEUED, d["resend_epoch"]
 
@@ -983,8 +984,11 @@ def adopt_resend_payload_locked(root: Path, item_id: str, payload: str) -> bool:
     try:
         epoch = int(d.get("resend_epoch", 0) or 0)
         adopted = int(d.get("resend_adopted_epoch", 0) or 0)
-        # An older writer recorded no count at requeue; only zero proves no attempt.
-        attempted = int(d.get("attempts", 0) or 0) > int(d.get("requeued_attempts", 0) or 0)
+        # A baseline counts only for the epoch that wrote it (an older writer keeps
+        # unknown fields across its own requeue); otherwise only zero proves no attempt.
+        tagged = int(d.get("requeued_attempts_epoch", -1)) == epoch
+        baseline = int(d.get("requeued_attempts", 0) or 0) if tagged else 0
+        attempted = int(d.get("attempts", 0) or 0) > baseline
     except (TypeError, ValueError):
         return False
     if (attempted or adopted >= epoch or d.get("status") != "QUEUED"

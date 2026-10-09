@@ -30,7 +30,7 @@ IN_QUARANTINE = {"fallback-links-then-unlinks", "place-replaces-a-taken-name",
 CLI = [REPO / "src" / "outbox_cli.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox_cli.py"]
 BRIDGE = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"]
 OUTBOX = [REPO / "src" / "outbox.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox.py"]
-IN_OUTBOX = {"adopt-after-an-attempt", "adopt-requires-a-marker", "adopt-a-never-requeued-record", "adopt-ignores-a-claim",
+IN_OUTBOX = {"adopt-trusts-an-untagged-baseline", "adopt-after-an-attempt", "adopt-requires-a-marker", "adopt-a-never-requeued-record", "adopt-ignores-a-claim",
              "adopt-every-publish"}
 IN_CLI = {"cli-exits-0-on-no-safe-move", "cli-reads-epoch-after-lock", "cli-parks-on-no-safe-move"}
 IN_BRIDGE = {"confirmed-archives-another-body", "orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
@@ -173,6 +173,10 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "a requeued record adopts a new payload after an attempt under its epoch's key",
         "    if (attempted or adopted >= epoch or d.get(\"status\") != \"QUEUED\"",
         "    if (adopted >= epoch or d.get(\"status\") != \"QUEUED\""),
+    "adopt-trusts-an-untagged-baseline": (
+        "a requeue baseline is trusted whatever epoch wrote it",
+        "        tagged = int(d.get(\"requeued_attempts_epoch\", -1)) == epoch\n",
+        "        tagged = True\n"),
     "adopt-ignores-a-claim": (
         "a publish replaces the payload of an item a drain has claimed",
         "            or read_delivery_claim(root, item_id) is not None):\n",

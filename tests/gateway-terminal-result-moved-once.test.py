@@ -757,9 +757,10 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self._publish_b(result)
         self._assert_b_was_sent_and_b_retired(result)
 
-    def _legacy_epoch_used_then_c(self):
-        """main requeues A at epoch 1, the gateway takes A but the response is
-        lost; after the upgrade C is published and the relay dedupes on the id."""
+    def _legacy_epoch_used_then_c(self, head_requeued_first=False):
+        """main requeues A, the gateway takes A but the response is lost; after
+        the upgrade C is published and the relay dedupes on the id. With
+        `head_requeued_first`, this head requeued and the item parked again first."""
         relay = [self.server.request]
         backend = DesignAClaimBackend(self.outbox, retry_schedule=outbox.RetrySchedule(),
                                       clock=lambda: self.server.now, republish_delivered=False)
@@ -768,7 +769,12 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.task()
         result = self.result('BODY-A parked answer')
         gw._post_ready_results({TID})                      # 400: parked, A quarantined
-        self._requeue_as_main_writes_it()
+        epoch = 1
+        if head_requeued_first:
+            outbox.requeue_item(self.outbox, TID, operator='head')    # baseline: attempts=1
+            outbox.park_item(self.outbox, TID, 'refused again')
+            epoch = 2
+        self._requeue_as_main_writes_it()                  # main keeps fields it does not know
         result.write_text('BODY-A parked answer')          # main's restore put A back
         held = []
 
@@ -783,9 +789,10 @@ class TerminalResultMovedOnce(unittest.TestCase):
         rec.pop('resend_adopted_epoch', None)                # main's drain never writes it
         outbox._write_item(self.outbox, TID, rec)
         self.assertEqual((rec.get('status'), rec.get('resend_epoch'), rec.get('attempts'),
-                          (rec.get('retry') or {}).get('failures'), 'requeued_attempts' in rec,
+                          (rec.get('retry') or {}).get('failures'), rec.get('requeued_attempts'),
                           'resend_adopted_epoch' in rec),
-                         ('QUEUED', 1, 1, 1, False, False), 'not the persisted shape main leaves')
+                         ('QUEUED', epoch, 1, 1, 1 if head_requeued_first else None, False),
+                         'not the persisted shape main leaves')
         self._publish_c(result)
 
         def dedupe(method, path, payload):
@@ -797,7 +804,14 @@ class TerminalResultMovedOnce(unittest.TestCase):
 
     def test_a_legacy_epoch_already_used_never_carries_a_new_body(self):
         """C must not be recorded DELIVERED under A's epoch, nor archived as sent."""
-        result, held = self._legacy_epoch_used_then_c()
+        self._assert_c_never_rides_a_used_epoch(*self._legacy_epoch_used_then_c())
+
+    def test_a_stale_baseline_from_an_earlier_epoch_is_not_trusted(self):
+        """Mixed writers: this head requeues, the item parks, main requeues again
+        (keeping the head's baseline), A is attempted with a lost response, C lands."""
+        self._assert_c_never_rides_a_used_epoch(*self._legacy_epoch_used_then_c(head_requeued_first=True))
+
+    def _assert_c_never_rides_a_used_epoch(self, result, held):
         before = len(self.server.calls)
         gw._post_ready_results({TID})
         rec = outbox.read_item(self.outbox, TID) or {}

@@ -612,13 +612,18 @@ class ResendFromLive(unittest.TestCase):
         ("main: requeued twice, --reset-attempts", {"status": "QUEUED", "resend_epoch": 2, "attempts": 0}, True),
         ("main: parked", {"status": "PARKED", "resend_epoch": 1, "attempts": 0}, False),
         ("head: requeued --reset-attempts", {"status": "QUEUED", "resend_epoch": 1, "attempts": 0,
-                                             "requeued_attempts": 0}, True),
-        ("head: requeued without --reset-attempts", {"status": "QUEUED", "resend_epoch": 1,
-                                                     "attempts": 5, "requeued_attempts": 5}, True),
+                                             "requeued_attempts": 0, "requeued_attempts_epoch": 1}, True),
+        ("head: requeued without --reset-attempts",
+         {"status": "QUEUED", "resend_epoch": 1, "attempts": 5, "requeued_attempts": 5,
+          "requeued_attempts_epoch": 1}, True),
         ("head: requeued, then attempted", {"status": "QUEUED", "resend_epoch": 1, "attempts": 6,
-                                            "requeued_attempts": 5}, False),
-        ("head: requeued, already adopted", {"status": "QUEUED", "resend_epoch": 1, "attempts": 0,
-                                             "requeued_attempts": 0, "resend_adopted_epoch": 1}, False),
+                                            "requeued_attempts": 5, "requeued_attempts_epoch": 1}, False),
+        ("head: requeued, already adopted",
+         {"status": "QUEUED", "resend_epoch": 1, "attempts": 0, "requeued_attempts": 0,
+          "requeued_attempts_epoch": 1, "resend_adopted_epoch": 1}, False),
+        ("mixed: head baseline at epoch 1, main requeued --reset-attempts to 2, then attempted",
+         {"status": "QUEUED", "resend_epoch": 2, "attempts": 1, "requeued_attempts": 1,
+          "requeued_attempts_epoch": 1, "retry": dict(RETRY, failures=1)}, False),
     )
 
     def test_every_persisted_shape_adopts_only_an_unused_requeue_epoch(self):
@@ -628,6 +633,13 @@ class ResendFromLive(unittest.TestCase):
                 outbox._write_item(root, ITEM, dict(fields, item_id=ITEM, payload="A"))
                 self.assertIs(self._adopt(root, "B"), adopts)
                 self.assertEqual(outbox.read_item(root, ITEM)["payload"], "B" if adopts else "A")
+
+    def test_a_requeue_records_the_epoch_its_baseline_belongs_to(self):
+        with TemporaryDirectory() as td:
+            root = self._requeued(td)
+            rec = outbox.read_item(root, ITEM)
+            self.assertEqual((rec["requeued_attempts"], rec["requeued_attempts_epoch"]),
+                             (rec["attempts"], rec["resend_epoch"]))
 
     def test_an_unreadable_epoch_keeps_the_stored_payload(self):
         with TemporaryDirectory() as td:
