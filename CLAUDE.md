@@ -326,7 +326,7 @@ Tasks arrive from multiple channels via the same file bridge:
 ### Where replies go
 
 Reply in the conversation the request came from: a task with `channel_id`/`source_room_id` is
-answered in that room, threaded to `source_message_id`. Two tests apply:
+answered in that room, replying to `source_message_id`. Two tests apply:
 
 - **Audience.** In a room with other people (anything but the owner's own DM), post only what they
   are meant to read: a reply to their message, what the owner asked to be posted there, or work the
