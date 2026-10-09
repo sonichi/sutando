@@ -1,13 +1,8 @@
 #!/bin/bash
 # tests/sutando-config-hooks.test.sh — E2E smoke for scripts/sutando-config-hooks.sh
 #
-# Coverage:
-#   1. detect-missing returns 1 on empty settings, 0 after install
-#   2. install is idempotent (re-run doesn't duplicate the entry)
-#   3. install --with-project-hooks adds PreCompact + Stop entries
-#   4. migration-notice flags non-Sutando hooks while filtering Sutando-owned
-#   5. the two installers agree on the command string, so neither double-registers
-#
+# Coverage: `install` / `detect-missing` are gone (Sutando hooks register at launch);
+# migration-notice flags non-Sutando hooks while filtering Sutando-owned ones.
 # Run: bash tests/sutando-config-hooks.test.sh
 # Exit: 0 = all pass, 1 = failure
 
@@ -25,31 +20,13 @@ report() {
   fi
 }
 
-# Test 1: detect-missing on empty returns 1
+# Test 1: Sutando hooks register only at core launch; this helper writes none.
 T="$(mktemp -d)"
 echo '{}' > "$T/s.json"
-bash "$SCRIPT" detect-missing "$T/s.json" >/dev/null 2>&1
-[ "$?" = "1" ]; report "$?" "detect-missing returns 1 on empty settings"
-
-# Test 2: install adds the catchup hook
-bash "$SCRIPT" install "$T/s.json" >/dev/null 2>&1
-catchup_count="$(jq '[.hooks.SessionEnd[].hooks[] | select(.command | contains("session-handoff.sh"))] | length' "$T/s.json")"
-[ "$catchup_count" -ge 1 ]; report "$?" "install adds SessionEnd catchup hook"
-
-# Test 3: detect-missing returns 0 after install
-bash "$SCRIPT" detect-missing "$T/s.json" >/dev/null 2>&1
-[ "$?" = "0" ]; report "$?" "detect-missing returns 0 after install"
-
-# Test 4: idempotent re-install (count stays at 1)
-bash "$SCRIPT" install "$T/s.json" >/dev/null 2>&1
-catchup_count_after="$(jq '[.hooks.SessionEnd[].hooks[] | select(.command | contains("session-handoff.sh"))] | length' "$T/s.json")"
-[ "$catchup_count_after" = "$catchup_count" ]; report "$?" "install is idempotent (catchup count unchanged on re-run)"
-
-# Test 5: --with-project-hooks adds PreCompact + Stop
-bash "$SCRIPT" install "$T/s.json" --with-project-hooks >/dev/null 2>&1
-precompact_count="$(jq '[.hooks.PreCompact[].hooks[]] | length' "$T/s.json" 2>/dev/null || echo 0)"
-stop_count="$(jq '[.hooks.Stop[].hooks[]] | length' "$T/s.json" 2>/dev/null || echo 0)"
-[ "$precompact_count" -ge 2 ] && [ "$stop_count" -ge 1 ]; report "$?" "--with-project-hooks adds PreCompact + Stop entries"
+for sub in install detect-missing; do
+  bash "$SCRIPT" "$sub" "$T/s.json" >/dev/null 2>&1
+  [ "$?" = "3" ] && [ "$(cat "$T/s.json")" = "{}" ]; report "$?" "$sub is gone (exit 3) and leaves the settings file untouched"
+done
 
 # Test 6: migration-notice filters Sutando hooks, flags third-party
 cat > "$T/old.json" << 'EOJ'
@@ -67,29 +44,12 @@ notice_out="$(bash "$SCRIPT" migration-notice "$T/old.json" "$T/new.json" 2>&1)"
 echo "$notice_out" | grep -q "third-party.sh"; report "$?" "migration-notice flags third-party hook"
 echo "$notice_out" | grep -qv "session-handoff.sh"; report "$?" "migration-notice filters out Sutando hook (session-handoff.sh)"
 
-# Test 7: detect-missing on non-existent file returns 1
-bash "$SCRIPT" detect-missing "$T/does-not-exist.json" >/dev/null 2>&1
-[ "$?" = "1" ]; report "$?" "detect-missing returns 1 on missing file"
-
 # Test 8: invalid subcommand exits 3
 bash "$SCRIPT" bogus-subcommand >/dev/null 2>&1
 [ "$?" = "3" ]; report "$?" "invalid subcommand exits 3"
 
-# Test 9: malformed JSON in detect-missing — explicit error + exit 1
-# (per Mini's PR #1500 review — previously this silently fell through)
-echo 'not valid json {{{' > "$T/malformed.json"
-err_out="$(bash "$SCRIPT" detect-missing "$T/malformed.json" 2>&1)"
-rc="$?"
-[ "$rc" = "1" ] && echo "$err_out" | grep -q "not valid JSON"
-report "$?" "detect-missing emits explicit error + exit 1 on malformed JSON"
-
-# Test 10: malformed JSON in install — refuses to edit
-err_out2="$(bash "$SCRIPT" install "$T/malformed.json" 2>&1)"
-rc2="$?"
-[ "$rc2" = "1" ] && echo "$err_out2" | grep -q "not valid JSON"
-report "$?" "install refuses to edit malformed JSON (exit 1)"
-
 # Test 11: malformed JSON in migration-notice — skip cleanly, exit 0
+echo 'not valid json {{{' > "$T/malformed.json"
 err_out3="$(bash "$SCRIPT" migration-notice "$T/malformed.json" "$T/new.json" 2>&1)"
 rc3="$?"
 [ "$rc3" = "0" ] && echo "$err_out3" | grep -q "malformed"
@@ -163,98 +123,5 @@ rm -rf "$T15"
 
 rm -rf "$T"
 echo
-
-# Tests 16-18: #4309 review round 6 (keweichen, 2026-09-16) — _installer_hook_command
-# collapsed "installer absent" / "installer present but failed" / "hook
-# intentionally omitted" into one signal, so callers guessed a fallback command
-# in all three cases, defeating SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE and
-# masking real resolver failures as quiet success.
-
-# Test 16: installer GENUINELY ABSENT — fallback is used, and the fallback's
-# archive path comes from the workspace RESOLVER, not a hardcoded
-# $REPO_DIR/workspace guess (a relocated workspace must not be silently ignored).
-T16="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooks-absent.XXXXXX")"
-# Normalize through cd+pwd — macOS resolves /tmp (and some /var/folders
-# paths) through a /private symlink, and Python's Path.resolve() (inside
-# resolve_workspace) follows it while a raw mktemp string does not.
-T16="$(cd "$T16" && pwd)"
-mkdir -p "$T16/scripts" "$T16/src" "$T16/.claude"
-cp "$SCRIPT" "$T16/scripts/"
-cp "$REPO_DIR/scripts/sutando-config.sh" "$T16/scripts/"
-cp "$REPO_DIR/scripts/python-binary.sh" "$T16/scripts/" 2>/dev/null || true
-cp "$REPO_DIR/src/sutando_config.py" "$T16/src/"
-cp "$REPO_DIR/sutando.config.json" "$T16/"
-echo "{\"workspace\":{\"path\":\"$T16/custom-ws\"}}" > "$T16/sutando.config.local.json"
-echo '{}' > "$T16/.claude/settings.json"
-# Deliberately no src/install-claude-hooks.sh — genuinely absent installer.
-( cd "$T16" && bash scripts/sutando-config-hooks.sh install "$T16/.claude/settings.json" --no-catchup-hook --with-project-hooks >/dev/null 2>&1 )
-rc16=$?
-[ "$rc16" = "0" ]; report "$?" "absent installer: install --with-project-hooks still succeeds (fallback)"
-archive_cmd="$(jq -r '.hooks.PreCompact[0].hooks[0].command' "$T16/.claude/settings.json" 2>/dev/null)"
-echo "$archive_cmd" | grep -qF "$T16/custom-ws/logs/conversations/"
-report "$?" "absent installer: archive fallback path comes from the workspace RESOLVER"
-echo "$archive_cmd" | grep -qF "$T16/workspace/logs/conversations/"
-[ "$?" != "0" ]; report "$?" "absent installer: archive fallback does NOT hardcode \$REPO_DIR/workspace"
-rm -rf "$T16"
-
-# Test 17: installer PRESENT but FAILS (--print-hooks exits non-zero) — must
-# PROPAGATE (exit non-zero, write nothing), never silently guess a fallback.
-T17="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooks-resolver-fail.XXXXXX")"
-mkdir -p "$T17/scripts" "$T17/src" "$T17/.claude"
-cp "$SCRIPT" "$T17/scripts/"
-printf '#!/bin/bash\necho "boom: resolver failed" >&2\nexit 1\n' > "$T17/src/install-claude-hooks.sh"
-chmod +x "$T17/src/install-claude-hooks.sh"
-echo '{}' > "$T17/.claude/settings.json"
-err17="$(cd "$T17" && bash scripts/sutando-config-hooks.sh install "$T17/.claude/settings.json" --no-catchup-hook --with-project-hooks 2>&1)"
-rc17=$?
-[ "$rc17" != "0" ]; report "$?" "failing installer: install --with-project-hooks propagates (non-zero exit)"
-echo "$err17" | grep -q "refusing to guess"
-report "$?" "failing installer: error names the refusal to guess"
-pc_count17="$(jq '[.hooks.PreCompact // [] | .[] | .hooks // [] | .[]] | length' "$T17/.claude/settings.json" 2>/dev/null || echo 0)"
-[ "${pc_count17:-0}" = "0" ]; report "$?" "failing installer: no PreCompact hook was written"
-rm -rf "$T17"
-
-# Test 18: INTENTIONAL OMISSION (SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1) —
-# the archive hook must be skipped silently (no fallback, no failure), while
-# the other two project hooks still install normally.
-T18="$(mktemp -d "${TMPDIR:-/tmp}/sutando-hooks-omit.XXXXXX")"
-mkdir -p "$T18/.claude"
-echo '{}' > "$T18/.claude/settings.json"
-SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 \
-  bash "$SCRIPT" install "$T18/.claude/settings.json" --no-catchup-hook --with-project-hooks >/dev/null 2>&1
-rc18=$?
-[ "$rc18" = "0" ]; report "$?" "omit flag: install --with-project-hooks still succeeds"
-archive_count18="$(jq '[.hooks.PreCompact // [] | .[] | .hooks // [] | .[] | select(.command | contains("archive-transcript.sh"))] | length' "$T18/.claude/settings.json" 2>/dev/null || echo 0)"
-[ "${archive_count18:-0}" = "0" ]; report "$?" "omit flag: no archive hook (real or fallback) was written"
-stop_count18="$(jq '[.hooks.Stop // [] | .[] | .hooks // []] | flatten | length' "$T18/.claude/settings.json" 2>/dev/null || echo 0)"
-[ "${stop_count18:-0}" -ge 1 ]; report "$?" "omit flag: the OTHER project hook (Stop) still installs"
-rm -rf "$T18"
-
-# Test 19-21: both installers own ONE command string per hook. They used to carry
-# separate copies, and a SessionEnd handoff written two ways registered twice.
-# Pin the repo both sides resolve against: $SCRIPT asks ${SUTANDO_REPO_DIR:-$REPO_DIR}
-# internally, but the install-claude-hooks.sh call below always asks $REPO_DIR — an
-# inherited SUTANDO_REPO_DIR pointing at another checkout diverges the two commands
-# and this check measures the host's environment, not the code (qingyun-wu 2026-09-16).
-unset SUTANDO_REPO_DIR
-D="$(mktemp -d)"
-mkdir -p "$D/workspace/.claude-sutando"
-CORE_SETTINGS="$D/workspace/.claude-sutando/settings.json"
-INSTALLER_SE="$(bash "$REPO_DIR/src/install-claude-hooks.sh" --print-hooks 2>/dev/null \
-  | grep '^SessionEnd|src/session-handoff.sh|')"
-INSTALLER_SE="${INSTALLER_SE#*|*|}"
-[ -n "$INSTALLER_SE" ]; report "$?" "install-claude-hooks.sh --print-hooks emits the SessionEnd command"
-
-echo '{}' > "$D/s.json"
-bash "$SCRIPT" install "$D/s.json" >/dev/null 2>&1
-CONFIG_SE="$(jq -r '[.hooks.SessionEnd[].hooks[] | select(.command | contains("session-handoff.sh")) | .command] | .[0] // ""' "$D/s.json")"
-[ "$CONFIG_SE" = "$INSTALLER_SE" ]; report "$?" "sutando-config-hooks.sh writes the installer's exact command"
-
-# Run BOTH against one settings file: the shapes must collapse to a single entry.
-bash "$SCRIPT" install "$D/s.json" --with-project-hooks >/dev/null 2>&1
-SE_COUNT="$(jq '[.hooks.SessionEnd[].hooks[] | select(.command | contains("session-handoff.sh"))] | length' "$D/s.json")"
-[ "$SE_COUNT" = "1" ]; report "$?" "one SessionEnd handoff entry after both install paths, not two"
-rm -rf "$D"
-
 echo "Results: $pass passed, $fail failed"
 [ "$fail" = "0" ]

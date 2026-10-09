@@ -1,29 +1,17 @@
 #!/usr/bin/env python3
-"""Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently and prune dead copies of the same hook.
+"""Remove the hook entries older Sutando installers wrote into settings files.
 
-Two installers (``scripts/install-personal-claude-hook.sh``,
-``scripts/install-session-start-hook.sh``) carried their own inline merge. Each
-could add its entry but neither could remove one, so a test run from a copy of
-the repo under a temp dir left the live settings pointing at three deleted
-``/var/folders/…/repo/src/…`` scripts, and every compaction fired all four.
+Sutando's hooks are registered only through the core's launch-time ``--settings``
+JSON (src/agent/claude/cli/build-core-settings.mjs). Copies an earlier installer
+left in a project ``.claude/settings.json`` fire in every session opened there,
+and copies in the core's config dir fire again in the core, so both are swept.
 
-Pruning is scoped to the SAME FAMILY as the hook being installed — entries whose
-command runs a script with the same basename — and only when that script no
-longer exists. A user's own hooks, dead or alive, are never touched.
+An entry is removed only when it is byte-identical to a command an installer
+emitted for this checkout under that event, or when it runs one of those scripts
+from a path that no longer exists. Anything else, an operator's edit included,
+stays.
 
-Why a bare existence check is enough: the two costs are asymmetric. A false
-prune (the script is merely unreachable at launch) costs ONE launch without that
-hook, because every installer re-adds its own command at the next core launch.
-A missed prune (a dead copy left in place) costs every compaction until a human
-notices — which is how this reached the owner. So the predicate stays broad and
-the blast radius is bounded by family, not by path shape — with one exception: a
-path carrying an unexpanded variable is skipped, because the installer would re-add
-its own ABSOLUTE command, never the portable one, so that false prune is permanent
-rather than costing one launch.
-
-    python3 src/claude_hooks_settings.py install --settings <path> \\
-        --event SessionStart --command 'bash "<repo>/src/x.sh"' \\
-        [--matcher compact] [--prepend] [--label "x hook"]
+    python3 src/claude_hooks_settings.py sweep --repo <repo> [--settings <file>]... [--dry-run] [--no-core-config]
 """
 
 from __future__ import annotations
@@ -31,13 +19,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shlex
 import sys
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 _INTERPRETERS = {"bash", "sh", "zsh", "python", "python3", "node"}
+
+# Frozen history, not the live table: these must keep matching what was written
+# even after the builder's own strings change.
+_OWNED_SCRIPTS = (
+    "check-pending-tasks.sh", "turn-start.sh", "session-handoff.sh", "archive-transcript.sh",
+    "schedule-crons-session-hint.sh", "personal-claude-compact-hint.sh",
+    "watcher-rearm-session-hint.sh",
+)
+_DESKTOP_ARCHIVE_CP = ('cp "$TRANSCRIPT_PATH" '
+                       '"$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl"')
 
 
 def script_path_of(command: str) -> Optional[str]:
@@ -56,137 +53,160 @@ def script_path_of(command: str) -> Optional[str]:
     return None
 
 
-def family_of(command: str) -> str:
+def emitted_commands(repo: Path) -> set[tuple[str, str]]:
+    """Every (event, command) a Sutando installer has written for the checkout at ``repo``."""
+    # An installer saw the checkout through whatever path it was run by, symlinked or not.
+    out: set[tuple[str, str]] = set()
+    for root in {Path(repo), Path(repo).resolve()}:
+        out |= _emitted_for(root)
+    return out
+
+
+def _emitted_for(repo: Path) -> set[tuple[str, str]]:
+    src = Path(repo) / "src"
+
+    def sq(name: str) -> str:
+        return _shq(str(src / name))
+
+    def dq(name: str) -> str:
+        return f'"{src / name}"'
+
+    out = {
+        ("Stop", f"bash {sq('check-pending-tasks.sh')}"),
+        ("Stop", f"bash {dq('check-pending-tasks.sh')}"),
+        ("Stop", "bash $HOME/Desktop/sutando/src/check-pending-tasks.sh"),
+        ("UserPromptSubmit", f"bash {sq('turn-start.sh')}"),
+        ("PreCompact", f"bash {sq('archive-transcript.sh')} \"$HOME/Desktop/sutando-conversations/\""),
+        ("PreCompact", _DESKTOP_ARCHIVE_CP),
+        ("SessionStart", f"bash {dq('schedule-crons-session-hint.sh')}"),
+        ("SessionStart", f"bash {dq('personal-claude-compact-hint.sh')}"),
+        ("SessionStart", f"bash {dq('watcher-rearm-session-hint.sh')}"),
+        ("SessionEnd", f"bash {dq('session-handoff.sh')} \"${{TRANSCRIPT_PATH:-}}\""),
+    }
+    for event in ("PreCompact", "SessionEnd"):
+        out.add((event, f"bash {sq('session-handoff.sh')} \"$TRANSCRIPT_PATH\""))
+        out.add((event, f"bash {dq('session-handoff.sh')} \"$TRANSCRIPT_PATH\""))
+        out.add((event, "bash $HOME/Desktop/sutando/src/session-handoff.sh \"$TRANSCRIPT_PATH\""))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from skill_hooks import discover
+    for event, _token, command, prior in discover(Path(repo)):
+        out.add((event, command))
+        out.add((event, prior))
+    return out
+
+
+def _shq(s: str) -> str:
+    """The installer's shq(): always single-quoted, `'` written as `'\\''`."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _is_dead_owned_copy(command: str) -> bool:
+    """Runs one of our scripts from a path that no longer exists (and carries no variable)."""
     path = script_path_of(command)
-    return os.path.basename(path) if path else ""
+    if not path or os.path.basename(path) not in _OWNED_SCRIPTS or "$" in path:
+        return False
+    return os.path.isabs(path) and not os.path.exists(path)
 
 
-def load(settings_path: Path) -> dict:
-    if not settings_path.is_file():
-        return {"hooks": {}}
-    data = json.loads(settings_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError(f"{settings_path}: top level is not an object")
-    data.setdefault("hooks", {})
-    return data
-
-
-def save(settings_path: Path, settings: dict) -> None:
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = settings_path.with_suffix(settings_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, settings_path)
-
-
-def _judgeable(path: str) -> bool:
-    """False when the path carries an unexpanded variable, which no existence check can decide."""
-    return "$" not in path
-
-
-def _exists(path: str, project_dir: Optional[Path]) -> bool:
-    """A relative script path is relative to the project the settings file belongs to."""
-    candidate = Path(path)
-    if not candidate.is_absolute() and project_dir is not None:
-        candidate = project_dir / candidate
-    return candidate.exists()
-
-
-def prune_dead(settings: dict, event: str, family: str,
-               project_dir: Optional[Path] = None) -> list[str]:
-    """Remove hooks under ``event`` that run a script named ``family`` which no longer exists.
-
-    Returns the removed commands. Entries left with no hooks are dropped too. A relative
-    script path is checked against ``project_dir`` (the settings file's project), never the
-    caller's cwd, so a live relative hook cannot read as dead.
-    """
-    if not family:
-        return []
-    removed: list[str] = []
-    kept_entries = []
-    for entry in settings.get("hooks", {}).get(event, []) or []:
-        if not isinstance(entry, dict):
-            kept_entries.append(entry)
+def sweep(settings: dict, owned: set[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Drop owned entries from ``settings`` in place; returns the (event, command) pairs removed."""
+    removed: list[tuple[str, str]] = []
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return removed
+    for event, entries in list(hooks.items()):
+        if not isinstance(entries, list):
             continue
-        kept_hooks = []
-        for hook in entry.get("hooks", []) or []:
-            command = str(hook.get("command", "")) if isinstance(hook, dict) else ""
-            path = script_path_of(command)
-            if (family_of(command) == family and path and _judgeable(path)
-                    and not _exists(path, project_dir)):
-                removed.append(command)
+        kept_entries = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                kept_entries.append(entry)
                 continue
-            kept_hooks.append(hook)
-        if kept_hooks:
-            kept_entries.append(dict(entry, hooks=kept_hooks))
-    if removed:
-        settings.setdefault("hooks", {})[event] = kept_entries
+            kept = []
+            for hook in entry["hooks"]:
+                command = hook.get("command") if isinstance(hook, dict) else None
+                if isinstance(command, str) and ((event, command) in owned
+                                                 or _is_dead_owned_copy(command)):
+                    removed.append((event, command))
+                    continue
+                kept.append(hook)
+            if kept:
+                kept_entries.append(dict(entry, hooks=kept))
+            elif not entry["hooks"]:
+                kept_entries.append(entry)
+        hooks[event] = kept_entries
     return removed
 
 
-def install(
-    settings_path: Path,
-    *,
-    event: str,
-    command: str,
-    matcher: str = "",
-    prepend: bool = False,
-) -> tuple[str, list[str]]:
-    """Prune dead same-family entries, then add ``command`` once. Returns (status, removed)."""
-    settings = load(settings_path)
-    # <project>/.claude/settings.json → the project is two levels up.
-    project_dir = settings_path.resolve().parent.parent
-    removed = prune_dead(settings, event, family_of(command), project_dir=project_dir)
-    entries = settings.setdefault("hooks", {}).setdefault(event, [])
-    present = any(
-        isinstance(h, dict) and h.get("command", "") == command
-        for entry in entries if isinstance(entry, dict)
-        for h in entry.get("hooks", []) or []
-    )
-    if present:
-        status = "already installed"
-    else:
-        new_entry = {"matcher": matcher, "hooks": [{"type": "command", "command": command}]}
-        if prepend:
-            entries.insert(0, new_entry)
-        else:
-            entries.append(new_entry)
-        status = "installed"
-    if status == "installed" or removed or not settings_path.is_file():
-        save(settings_path, settings)
-    return status, removed
+def sweep_file(path: Path, owned: set[tuple[str, str]], dry_run: bool = False) -> list[tuple[str, str]]:
+    """Sweep one settings file; a missing file is a no-op and is never created."""
+    if not path.is_file():
+        return []
+    settings = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(settings, dict):
+        raise ValueError(f"{path}: top level is not an object")
+    removed = sweep(settings, owned)
+    if removed and not dry_run:
+        tmp = path.with_name(path.name + ".sweep.tmp")
+        tmp.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    return removed
 
 
-def _describe_removed(removed: Iterable[str], family: str) -> str:
-    items = list(removed)
-    noun = "entry" if len(items) == 1 else "entries"
-    paths = ", ".join(script_path_of(c) or c for c in items)
-    return f"  ✂ removed {len(items)} dead {family} {noun}: {paths}"
+def default_targets(repo: Path) -> list[Path]:
+    """The project settings files Sutando installers wrote: the repo's and the core working dir's."""
+    targets = [Path(repo) / ".claude" / "settings.json"]
+    working = os.environ.get("SUTANDO_CLAUDE_WORKING_DIR", "")
+    if working:
+        wd = Path(os.path.expanduser(working)) / ".claude" / "settings.json"
+        if wd.resolve() != targets[0].resolve():
+            targets.append(wd)
+    return targets
+
+
+def core_config_settings(repo: Path) -> Optional[Path]:
+    """<core CLAUDE_CONFIG_DIR>/settings.json for ``repo``, or None when it cannot be resolved."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from sutando_config import resolve_claude_sutando_config_dir
+        return Path(resolve_claude_sutando_config_dir(Path(repo))) / "settings.json"
+    except Exception:  # noqa: BLE001 — an unresolvable config dir is skipped, not fatal
+        return None
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("install")
-    p.add_argument("--settings", required=True)
-    p.add_argument("--event", default="SessionStart")
-    p.add_argument("--command", required=True)
-    p.add_argument("--matcher", default="")
-    p.add_argument("--prepend", action="store_true")
-    p.add_argument("--label", default=None)
+    p = sub.add_parser("sweep")
+    p.add_argument("--repo", required=True)
+    p.add_argument("--settings", action="append", default=[],
+                   help="extra settings file to sweep (repeatable)")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-core-config", action="store_true",
+                   help="skip the core CLAUDE_CONFIG_DIR settings.json")
     args = parser.parse_args(argv)
-    label = args.label or f"{family_of(args.command)} {args.event} hook"
-    try:
-        status, removed = install(
-            Path(args.settings), event=args.event, command=args.command,
-            matcher=args.matcher, prepend=args.prepend,
-        )
-    except (OSError, ValueError) as exc:
-        print(f"  ✗ {label}: {exc}", file=sys.stderr)
-        return 1
-    if removed:
-        print(_describe_removed(removed, family_of(args.command)))
-    print(f"  ✓ {label} ({status})")
-    return 0
+    repo = Path(args.repo)
+    owned = emitted_commands(repo)
+    rc = 0
+    total = 0
+    targets = default_targets(repo) + [Path(s) for s in args.settings]
+    ccd = core_config_settings(repo) if not args.no_core_config else None
+    if ccd is not None:
+        targets.append(ccd)
+    for target in targets:
+        try:
+            removed = sweep_file(target, owned, dry_run=args.dry_run)
+        except (OSError, ValueError) as exc:
+            print(f"claude-hooks sweep: {target}: {exc} — left untouched", file=sys.stderr)
+            rc = 1
+            continue
+        verb = "would remove" if args.dry_run else "removed"
+        for event, command in removed:
+            print(f"claude-hooks sweep: {verb} {event} {command!r} from {target}")
+        total += len(removed)
+    print(f"claude-hooks sweep: {total} owned entr{'y' if total == 1 else 'ies'} "
+          f"{'found' if args.dry_run else 'removed'}; Sutando hooks register only at core launch")
+    return rc
 
 
 if __name__ == "__main__":
