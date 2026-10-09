@@ -4521,12 +4521,8 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
     skip = next((a for a in actions if a.kind == "skip"), None)
     if skip is not None:
         generation = generation or ready.identity     # a skip marker was read, so `ready` is set
-        try:
-            done = disposal.retire_generation(RESULTS_DIR, result_file, generation, _log,
-                                              ARCHIVE_RESULTS_DIR, _names(f"{tid}-{int(time.time())}-suppressed"))
-        except OSError as e:
-            _log(f"result {tid}: {why}; it is suppressed ([{skip.value}]) but could not be archived ({e})")
-            return
+        done = disposal.retire_generation(RESULTS_DIR, result_file, generation, _log,
+                                          ARCHIVE_RESULTS_DIR, _names(f"{tid}-{int(time.time())}-suppressed"))
         if done.retired:
             _log(f"result {tid}: {why}; it is suppressed ([{skip.value}]), owes no delivery, and is archived")
         elif done.outcome is not disposal.Retirement.REPLACEMENT_LIVE:

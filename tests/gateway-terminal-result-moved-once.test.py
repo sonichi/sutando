@@ -946,6 +946,17 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
         self.assertTrue(any('suppressed' in l and 'owes no delivery' in l for l in self.lines), self.lines)
 
+    def test_a_suppressed_reply_that_cannot_be_archived_stays_for_the_next_pass(self):
+        failed = disposal.Retired(disposal.Retirement.FAILED, None, 'the disposal lock is busy')
+        with patch.object(disposal, 'retire_generation', return_value=failed):
+            result, posts = self._delivered_then_late('[no-send]\nsomething internal')
+        self.assertTrue(result.exists(), 'a failed archive leaves it live')
+        self.assertTrue(any('could not be archived' in l for l in self.lines), self.lines)
+        gw._last_orphan_sweep = 0.0
+        gw._reconcile_orphan_results(set())
+        self.assertIn('[no-send]\nsomething internal', self._archived_bodies())
+        self.assertEqual((self.quarantined_bodies(), len(self.server.calls)), ([], posts))
+
     def test_a_different_restricted_reply_is_quarantined_for_review_not_sending(self):
         for body, says in (('[dm-only]\nprivate detail for the owner', "owner's DM"),
                            ('[channel: !other:ag2.space]\nfor that room', '[channel: !other:ag2.space]')):
