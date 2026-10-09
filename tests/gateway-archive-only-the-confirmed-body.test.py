@@ -1,7 +1,8 @@
 """The gateway archives a live result only when the body the outbox confirmed
 is that file's body. A different live body under an id that already holds a
-delivered record, or a restored body under an id whose outbox still queues
-the earlier one, is quarantined with the refusal cause, never archived."""
+delivered or parked record, or a restored body under an id whose outbox still
+queues the earlier one, is quarantined with the refusal cause, never archived
+and never sent."""
 from __future__ import annotations
 
 import json
@@ -25,9 +26,12 @@ class Gateway:
     def __init__(self):
         self.calls = []
         self.accepted = {}
+        self.refuse = False
 
     def request(self, method, path, payload):
         self.calls.append(dict(payload))
+        if self.refuse:
+            return {"ok": False, "error": "refused"}
         duplicate = payload["id"] in self.accepted
         if not duplicate:
             self.accepted[payload["id"]] = dict(payload)
@@ -109,8 +113,7 @@ class ArchiveOnlyTheConfirmedBody(unittest.TestCase):
         self.assertEqual(len(self._archived()), 1)
         self.assertEqual(self.server.calls[-1].get("body"), "Fresh answer")
 
-    def test_a_legacy_record_without_a_digest_is_proved_by_its_stored_text(self):
-        """Records written before payload_digest existed carry only the text."""
+    def test_the_stored_text_is_the_proof(self):
         self.assertTrue(gw._record_holds_payload({"payload": "same"}, b"same"))
         self.assertFalse(gw._record_holds_payload({"payload": "same"}, b"other"))
         self.assertFalse(gw._record_holds_payload({"payload": None}, b"same"))
@@ -131,6 +134,70 @@ class ArchiveOnlyTheConfirmedBody(unittest.TestCase):
             self.assertIn("the outbox sent its stored body, not this one", lines[-1])
         self.assertEqual([c.get("body") for c in self.server.calls], ["A"])
         self.assertEqual(self._archived(), [])
+
+    def _park(self, body: bytes, reason: str = "permanent-refusal", **extra):
+        self.core.backend.publish(TID, body)
+        outbox.park_item(self.outbox, TID, reason=reason)
+        if extra:
+            rec = outbox.read_item(self.outbox, TID)
+            rec.update(extra)
+            outbox._write_item(self.outbox, TID, rec)
+
+    def _post_with_log(self):
+        lines = []
+        with patch.object(gw, "_log", lines.append):
+            gw._post_ready_results({TID})
+        return [ln for ln in lines if TID in ln]
+
+    def test_a_parked_id_quarantines_a_later_different_body_naming_the_cause(self):
+        self._park(b"PARKED")
+        (self.results / f"{TID}.txt").write_text("LATER")
+        lines = self._post_with_log()
+        named = [ln for ln in lines if "a later, different result for a parked outbox id is refused" in ln]
+        self.assertEqual(len(named), 1, lines)
+        self.assertIn("permanent-refusal", named[0])
+        self.assertIn("quarantined to undelivered/", named[0])
+        self.assertIn("requeue", named[0])
+        self.assertEqual(self._quarantined(), ["LATER"])
+        self.assertEqual(self.server.calls, [], "a refused body is never sent")
+        self.assertEqual(outbox.read_item(self.outbox, TID)["status"], "PARKED")
+
+    def test_the_parked_body_itself_is_refused_without_a_resend(self):
+        self.server.refuse = True
+        (self.results / f"{TID}.txt").write_text("PARKED")
+        gw._post_ready_results({TID})
+        self.assertEqual(outbox.read_item(self.outbox, TID)["status"], "PARKED")
+        self.assertEqual(len(self.server.calls), 1)
+        self.server.calls.clear()
+        for f in (self.results / "undelivered").glob(f"{TID}*"):
+            f.unlink()
+        (self.results / f"{TID}.txt").write_text("PARKED")
+        lines = self._post_with_log()
+        self.assertTrue(any("outbox item is terminal: permanent-refusal" in ln for ln in lines), lines)
+        self.assertFalse(any("different result" in ln for ln in lines), lines)
+        self.assertEqual(self.server.calls, [])
+        self.assertEqual(self._quarantined(), ["PARKED"])
+
+    def test_no_attempt_counters_or_park_reason_reopen_a_parked_id(self):
+        """Whatever an older engine left on the record — clean counters, an
+        ambiguous or a definite park — a later body is refused, never sent."""
+        shapes = [dict(reason="permanent-refusal", attempts_started=0, attempts_classified=0),
+                  dict(reason="permanent-refusal", attempts_started=1, attempts_classified=1),
+                  dict(reason="outcome-unknown"), dict(reason="retry-window-exhausted", attempts=5)]
+        for shape in shapes:
+            with self.subTest(**{k: str(v) for k, v in shape.items()}):
+                for f in list(self.outbox.rglob("*")) + list((self.results / "undelivered").glob("*")):
+                    if f.is_file():
+                        f.unlink()
+                self.server.calls.clear()
+                reason = shape.pop("reason")
+                self._park(b"A", reason=reason, **shape)
+                (self.results / f"{TID}.txt").write_text("B")
+                gw._post_ready_results({TID})
+                self.assertEqual(self.server.calls, [])
+                self.assertFalse(self.core.backend.publish(TID, b"B"))
+                self.assertEqual(outbox.read_item(self.outbox, TID)["status"], "PARKED")
+                self.assertEqual(self._quarantined(), ["B"])
 
 
 if __name__ == "__main__":

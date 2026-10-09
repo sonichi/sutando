@@ -70,16 +70,6 @@ class _Recorder:
                                provider_ref="r-1")
 
 
-class ProtocolDeclaresNoDefault(unittest.TestCase):
-    """The ClaimBackend protocol only names begin_attempt: a backend inherits
-    no behaviour from it, so a backend that forgets it fails loudly."""
-
-    def test_begin_attempt_is_abstract(self):
-        from ag2_sparrow.delivery_core.contract import ClaimBackend
-        token = ClaimToken(item_id=ITEM, worker="w1", incarnation="none")
-        self.assertIsNone(ClaimBackend.begin_attempt(object(), token))
-
-
 class ContractCase(unittest.TestCase):
     """Runs once per BACKENDS entry (see load_tests)."""
     backend_name = "A"
@@ -131,47 +121,6 @@ class ContractCase(unittest.TestCase):
 
     def test_capabilities_are_declared_not_sniffed(self):
         self.assertIsInstance(self.backend.capabilities, BackendCapabilities)
-
-    def test_a_fresh_payload_after_a_park_follows_the_declared_capability(self):
-        """The parked-id rule is scoped by `fresh_cycle_after_definite_park`,
-        never asserted for a backend that did not declare it."""
-        caps = self.backend.capabilities
-        if not caps.fresh_cycle_after_definite_park:
-            self.assertTrue(self.backend.publish(ITEM, b"x"))
-            self.assertFalse(self.backend.publish(ITEM, b"y"),
-                             "without the capability a live id refuses every other payload")
-            self.backend.park(ITEM, "permanent-refusal")
-            self.assertTrue(self.backend.is_terminal(ITEM))
-            self.assertFalse(self.backend.publish(ITEM, b"x"), "a park is final for the parked body")
-            self.assertFalse(self.backend.publish(ITEM, b"y"),
-                             "without the capability a park is final for every payload, "
-                             "even after a definite refusal")
-            return
-        root = Path(self.tmp.name)
-        self.assertTrue(self.backend.publish(ITEM, b"x"))
-        if not any(r.get("item_id") == ITEM for r in outbox.list_items(root)):
-            self.fail("a backend declaring the capability must keep outbox-visible parks")
-        outbox.park_item(root, ITEM, "max-attempts")
-        self.assertFalse(self.backend.publish(ITEM, b"y"),
-                         "an ambiguous park refuses even a never-parked payload")
-        outbox.park_item(root, ITEM, "permanent-refusal")
-        self.assertFalse(self.backend.publish(ITEM, b"x"), "the parked body stays refused")
-        self.assertFalse(self.backend.publish(ITEM, b"y"),
-                         "a park the backend did not drive carries no attempt evidence: "
-                         "certainty is never inferred, so it refuses like an ambiguous one")
-        # A definite refusal the record itself proves: one attempt, started
-        # and classified by this backend, then a never-parked payload.
-        self.assertIs(outbox.requeue_item(root, ITEM, operator="op"),
-                      outbox.RequeueOutcome.REQUEUED)
-        token = self.backend.claim(ITEM, "w1")
-        self.assertIsNotNone(token)
-        self.assertTrue(self.backend.begin_attempt(token))
-        self.assertTrue(self.backend.complete(token, DeliveryOutcome.NOT_DELIVERED,
-                                              terminal_reason="permanent-refusal"))
-        self.assertTrue(self.backend.is_terminal(ITEM))
-        self.assertFalse(self.backend.publish(ITEM, b"x"), "the parked body stays refused")
-        self.assertTrue(self.backend.publish(ITEM, b"y"),
-                        "a definite refusal the record proves admits a never-parked payload")
 
     def test_single_owner(self):
         self.backend.publish(ITEM, b"x")
@@ -249,18 +198,6 @@ class ContractCase(unittest.TestCase):
         self.assertTrue(
             self.backend.complete(successor, DeliveryOutcome.CONFIRMED),
             "the live incarnation still owns the claim")
-
-    def test_begin_attempt_writes_nothing_for_a_token_that_lost_its_claim(self):
-        """The started-attempt mark belongs to the incarnation that will send;
-        a token whose claim is gone must not mark its successor's cycle."""
-        self.backend.publish(ITEM, b"x")
-        token = self.backend.claim(ITEM, "w1")
-        self.assertIsNotNone(token)
-        self.assertTrue(self.backend.begin_attempt(token))
-        self.backend.force_release(ITEM)
-        self.assertFalse(self.backend.begin_attempt(token))
-        forged = ClaimToken(item_id=ITEM, worker="w2", incarnation=token.incarnation)
-        self.assertFalse(self.backend.begin_attempt(forged))
 
     def test_a_foreign_item_is_never_retired(self):
         """Retirement authority belongs to the dispatching consumer: a
@@ -493,23 +430,6 @@ class CorePolicy(unittest.TestCase):
         with self.assertRaises(KeyError):
             self._core(p).deliver_one(ITEM, b"x")
 
-    def test_an_attempt_that_cannot_be_marked_is_not_sent(self):
-        """A claim lost between claim() and the send is contention, not a
-        delivery: the provider is never called for a cycle nobody owns."""
-        class _LosesTheClaim:
-            def __init__(self, inner):
-                self._b = inner
-
-            def __getattr__(self, name):
-                return getattr(self._b, name)
-
-            def begin_attempt(self, token):
-                return False
-        p = _Recorder([DeliveryOutcome.CONFIRMED])
-        r = DeliveryCore(_LosesTheClaim(self.backend), p).deliver_one(ITEM, b"x")
-        self.assertIs(r.status, DrainStatus.NOT_CLAIMED)
-        self.assertEqual(p.deliver_calls, [], "no send for an unmarked attempt")
-
     def test_unknown_resends_only_with_idempotent_send(self):
         p = _Recorder([ProviderIndeterminate("timeout after send"),
                        DeliveryOutcome.CONFIRMED],
@@ -674,7 +594,6 @@ def load_tests(loader, tests, pattern):
     # An unregistered class is collected by nothing here: load_tests
     # replaces discovery, so a new case must be added explicitly.
     suite.addTests(loader.loadTestsFromTestCase(SharedRootResendEpoch))
-    suite.addTests(loader.loadTestsFromTestCase(ProtocolDeclaresNoDefault))
     return suite
 
 

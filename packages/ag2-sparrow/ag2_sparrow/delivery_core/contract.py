@@ -58,8 +58,8 @@ class DrainResult:
     status: DrainStatus
     outcome: Optional[DeliveryOutcome] = None   # set iff status is ATTEMPTED
     detail: str = ""
-    # The typed admission proof: sha256 of the bytes this attempt handed the
-    # provider (the stored body), so a caller can tell its own payload from it.
+    # sha256 of the bytes this attempt handed the provider (the stored body),
+    # so a caller can tell whether the body it published is the one that went.
     dispatched_digest: Optional[str] = None
 
     def __post_init__(self):
@@ -124,9 +124,6 @@ class BackendCapabilities:
     claim is eventually recoverable" holds for every backend — force
     release is one mechanism (A), a requeue-layer path is another (B)."""
     supports_force_release: bool = False
-    # Read by publish(): True admits a never-parked payload after a definite,
-    # untainted refusal; False makes every park final for every payload.
-    fresh_cycle_after_definite_park: bool = False
 
 
 @dataclass(frozen=True)
@@ -173,10 +170,7 @@ class ClaimBackend(Protocol):
       2. a stale incarnation can never destroy a successful claimant;
       3. crash at any syscall boundary leaves the item in exactly one
          deliverable state or with a terminal record;
-      4. protocol metadata is bounded (cleanup) — including per-item parked-body
-         history, which caps at a declared limit and then saturates the item
-         closed (every new payload refused, item still visible) rather than
-         evicting a body it promised to keep refusing;
+      4. protocol metadata is bounded (cleanup);
       5. a dead owner's claim is eventually recoverable (mechanism per
          capabilities);
       6. lost races are protocol outcomes; config errors raise loudly."""
@@ -185,73 +179,19 @@ class ClaimBackend(Protocol):
     def capabilities(self) -> BackendCapabilities: ...
 
     def publish(self, item_id: str, payload: bytes) -> bool:
-        """True = newly published; False = this id is already live, or parked
-        and not eligible for this payload.
+        """True = newly published; False = this id is already live, or parked.
 
-        A park is final for the payload that parked and for every payload the
-        id ever parked on, including after a later delivery of the same id and
-        after an operator requeue of a parked body, so a rescanned live file
-        never turns one park into a retry per pass and bodies cannot alternate
-        through the park. A backend that declares
-        `capabilities.fresh_cycle_after_definite_park` additionally accepts a
-        never-parked payload when the whole parked cycle is a DEFINITE refusal:
-        its final reason is a permanent refusal and no attempt in the cycle was
-        ambiguous. A cycle with any ambiguous attempt — a lost response, an
-        exhausted retry window, outcome-unknown — refuses every payload for
-        good, even when a later attempt was definitely refused, because a
-        provider that dedupes on the item id may already hold the parked body
-        and would report the new one delivered. An attempt that STARTED and
-        never classified (`begin_attempt` was written, `complete` never ran:
-        the owner died or raised mid-send) is ambiguous for the same reason.
-        Certainty is never inferred from silence: a fresh cycle is admitted
-        only when the record itself proves every started attempt was
-        classified, so a record written before attempts were tracked (an
-        upgrade in place) or a torn record refuses exactly like an ambiguous
-        one — fail closed, visible to the operator, never a silent substitution.
-        That evidence is sticky: every record this code creates carries its
-        counters from zero, and a record with NO counter field — whatever else
-        it holds — is marked (`attempt_evidence_missing`) the moment it is
-        touched again (a new attempt or an operator requeue, before
-        `--reset-attempts` can zero anything), because absence cannot tell a
-        never-sent body from one a worker stored before dying; the counters a
-        later retry adds never launder it, and only a new cycle (a fresh
-        record) clears the mark. Counters are real integers; a boolean is not
-        evidence. The caller must archive a result only when the payload the
-        outbox confirmed is that result's payload: a refused or merely
-        coincident body stays visible through its quarantine. Each
-        refusal of a parked id records its cause (`last_refusal`); a delivered
-        id records one only when its history refuses the body (a caller's own
-        no-republish policy or a live claim leaves the record untouched), and a
-        requeue clears the parked cycle's cause.
-        A backend without the capability treats every park as final for every
-        payload. A republish of a DELIVERED id starts a new cycle: the parked
-        history carries over, the delivered cycle's ambiguity does not. The
-        history of parked bodies is bounded by ONE writer (publish, requeue and
-        every other transition fold through it): past the backend's declared
-        limit the id saturates and refuses every new payload, logs once, and
-        the health check counts it. A refused payload stays visible to the
-        operator through the caller's quarantine, never lost; the backend
-        records the cause of each refusal so the quarantine names it. Operator
-        recovery for a saturated or tainted id is the existing requeue of the
-        parked body (one explicit retry under a new resend epoch) and the
-        restore of quarantined bodies; nothing automatic reopens the id.
+        A park is final for every payload, the parked one and any later,
+        different one, until an operator requeues the parked body or restores
+        a quarantined one; admitting a later body after a definite refusal is
+        deferred until attempt evidence survives version skew. A caller must
+        keep a refused payload visible (quarantine it, naming the cause) and
+        must archive a result only when the payload the outbox confirmed is
+        that result's payload.
 
         Durable backends may expose payload_for_claim(token) so the core sends
         the original published bytes rather than a rebuilt caller payload.
         """
-        ...
-
-    def begin_attempt(self, token: ClaimToken) -> bool:
-        """Persist "an attempt may dispatch" for this incarnation BEFORE the
-        provider is called, inside one backend critical section.
-
-        This is the side-effect boundary's other half: `complete` runs after
-        the provider returns, so an attempt that dies or raises mid-send never
-        reaches it. A backend that admits fresh cycles must treat a started
-        attempt that was never classified as ambiguous — a successor's
-        begin_attempt folds the stale mark into the cycle's taint. A backend
-        that admits no fresh cycle may keep no record. False = this
-        incarnation no longer owns the claim; nothing was written."""
         ...
 
     def claim(self, item_id: str, worker: str) -> Optional[ClaimToken]:
@@ -295,8 +235,7 @@ class ClaimBackend(Protocol):
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,
                  destination: Optional[str] = None,
-                 terminal_reason: Optional[str] = None,
-                 ambiguous: bool = False) -> bool:
+                 terminal_reason: Optional[str] = None) -> bool:
         """Validate the exact incarnation, apply the outcome transition, and
         retire the claim — ALL inside one backend critical section, in that
         order. A stale token must change nothing: validating after mutating
@@ -307,13 +246,7 @@ class ClaimBackend(Protocol):
         two transactions, or a successor can claim and confirm between them
         and the stale caller's park overwrites its DELIVERED state.
         `terminal_reason` parks a definitive refusal in that same transaction,
-        regardless of any retry schedule or attempt ceiling. `ambiguous` says
-        an attempt in this call may have crossed the side-effect boundary; a
-        backend that admits fresh cycles must persist it on the cycle so no
-        later refusal reads as proof that the body never landed. A call with a
-        stale token writes nothing — including the taint — which is safe only
-        because `begin_attempt` already left the started-attempt mark that the
-        next incarnation folds into the taint.
+        regardless of any retry schedule or attempt ceiling.
         True = this incarnation owned the claim and it is now retired."""
         ...
 

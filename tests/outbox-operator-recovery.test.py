@@ -46,24 +46,6 @@ class RequeueTransition(unittest.TestCase):
             self.assertEqual(rec["requeue_reason"], "relay 503")
             self.assertIsNone(rec["reason"])
 
-    def test_requeue_keeps_the_parked_body_in_the_ids_history(self):
-        """The explicit retry goes out once; the body stays on the record's
-        parked history so a later automatic republish of it is refused."""
-        import hashlib
-        with TemporaryDirectory() as td:
-            root = Path(td)
-            outbox._write_item(root, ITEM, {"item_id": ITEM, "attempts": 1, "status": "PARKED",
-                                            "reason": "permanent-refusal", "payload": "A",
-                                            "payload_digest": "d-a", "parked_digests": ["d-z"]})
-            self.assertIs(outbox.requeue_item(root, ITEM), outbox.RequeueOutcome.REQUEUED)
-            self.assertEqual(outbox.read_item(root, ITEM)["parked_digests"], ["d-z", "d-a"])
-            outbox._write_item(root, OTHER, {"item_id": OTHER, "attempts": 1, "status": "PARKED",
-                                             "reason": "permanent-refusal", "payload": "legacy"})
-            self.assertIs(outbox.requeue_item(root, OTHER), outbox.RequeueOutcome.REQUEUED)
-            self.assertEqual(outbox.read_item(root, OTHER)["parked_digests"],
-                             [hashlib.sha256(b"legacy").hexdigest()],
-                             "a record written before digests existed is folded by its text")
-
     def test_attempts_preserved_unless_reset_requested(self):
         """Opt-in per the operator brief: the default keeps the count."""
         with TemporaryDirectory() as td:
@@ -100,36 +82,6 @@ class RequeueTransition(unittest.TestCase):
         with TemporaryDirectory() as td:
             self.assertIs(outbox.requeue_item(Path(td), "nope"),
                           outbox.RequeueOutcome.ABSENT)
-
-
-class RequeueKeepsUntrackedAttemptsUnproven(unittest.TestCase):
-    """A legacy park carries attempts but no counters: the requeue must mark
-    that before --reset-attempts zeroes the only trace, and must drop the parked
-    cycle's refusal cause so a later quarantine line never names a stale one."""
-
-    def test_a_park_with_attempts_but_no_counters_is_marked_before_the_reset(self):
-        with TemporaryDirectory() as td:
-            root = Path(td)
-            _parked(root, attempts=5)
-            d = outbox._read_item(root, ITEM)
-            d["last_refusal"] = "attempt-evidence-missing"
-            outbox._write_item(root, ITEM, d)
-            self.assertIs(outbox.requeue_item(root, ITEM, reset_attempts=True),
-                          outbox.RequeueOutcome.REQUEUED)
-            d = outbox._read_item(root, ITEM)
-            self.assertEqual(d.get("attempts"), 0)
-            self.assertTrue(d.get("attempt_evidence_missing"))
-            self.assertNotIn("last_refusal", d)
-
-    def test_a_tracked_park_is_not_marked(self):
-        with TemporaryDirectory() as td:
-            root = Path(td)
-            _parked(root, attempts=2)
-            d = outbox._read_item(root, ITEM)
-            d["attempts_started"] = d["attempts_classified"] = 2
-            outbox._write_item(root, ITEM, d)
-            self.assertIs(outbox.requeue_item(root, ITEM), outbox.RequeueOutcome.REQUEUED)
-            self.assertNotIn("attempt_evidence_missing", outbox._read_item(root, ITEM))
 
 
 class ClaimSafety(unittest.TestCase):
@@ -551,37 +503,6 @@ class CliRenderingAndErrorPaths(unittest.TestCase):
             self.assertTrue(outbox_cli._default_operator())
         finally:
             getpass.getuser = real
-
-
-class ParkedHistoryHasOneWriter(unittest.TestCase):
-    """`fold_parked_digest` is the only place an id's parked history grows or
-    saturates; `parked_digests_of` is the only reader of what it means."""
-
-    def test_the_reader_derives_a_legacy_record_from_its_text(self):
-        self.assertIsNone(outbox.parked_digests_of({"item_id": "x"}),
-                          "no payload at all: nothing can be proven different")
-        legacy = outbox.parked_digests_of({"payload": "body"})
-        self.assertEqual(legacy, [outbox.hashlib.sha256(b"body").hexdigest()])
-        self.assertEqual(outbox.parked_digests_of({"payload_digest": "d1", "parked_digests": ["d0"]}),
-                         ["d0", "d1"])
-        self.assertEqual(outbox.parked_digests_of({"payload_digest": "d1", "parked_digests": ["d0", "d1"]}),
-                         ["d0", "d1"], "the current body is listed once")
-
-    def test_the_writer_saturates_at_the_limit_and_logs_once(self):
-        d = {"item_id": "task-x"}
-        for n in range(3):
-            self.assertTrue(outbox.fold_parked_digest(d, f"d{n}", limit=3))
-        self.assertTrue(outbox.fold_parked_digest(d, "d1", limit=3), "a known digest is not re-added")
-        self.assertEqual(d["parked_digests"], ["d0", "d1", "d2"])
-        with self.assertLogs("outbox", level="WARNING") as logs:
-            self.assertFalse(outbox.fold_parked_digest(d, "d3", limit=3))
-        self.assertEqual(len(logs.output), 1, "saturation is logged once")
-        self.assertIn("task-x saturated", logs.output[0])
-        self.assertTrue(d["saturated"])
-        self.assertEqual(d["parked_digests"], ["d0", "d1", "d2"], "nothing forgotten, nothing added")
-        self.assertFalse(outbox.fold_parked_digest(d, "d4", limit=3))
-        self.assertFalse(outbox.fold_parked_digest(d, "d0", limit=3), "saturated: even a known body is refused")
-        self.assertEqual(outbox.PARKED_HISTORY_LIMIT, 128)
 
 
 class OutboxReaderEdges(unittest.TestCase):

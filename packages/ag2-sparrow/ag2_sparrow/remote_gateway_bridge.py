@@ -4421,20 +4421,14 @@ def _worker_of(task_id: str) -> str:
 
 
 def _record_holds_payload(record: dict, payload: bytes) -> bool:
-    """The typed admission proof: the outbox record's stored payload is the
-    one the caller asked to publish (digest, or the text of a legacy record)."""
-    digest = record.get("payload_digest")
-    if not isinstance(digest, str):
-        text = record.get("payload")
-        if not isinstance(text, str):
-            return False
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    return digest == hashlib.sha256(payload).hexdigest()
+    """The outbox record stores the body this caller asked to publish."""
+    text = record.get("payload")
+    return isinstance(text, str) and text.encode("utf-8") == payload
 
 
 def _other_body_why(record: dict, what: str) -> str:
-    cause = record.get("last_refusal") or "id-already-live"
-    return f"fresh cycle refused: {cause} ({what})"
+    return (f"a later, different result for a {str(record.get('status') or 'live').lower()} "
+            f"outbox id is refused ({what})")
 
 
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
@@ -4489,10 +4483,9 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         # so retrying logs forever and hides the failure behind "will retry".
         why = (f"outbox item is terminal: {record.get('reason')} after "
                f"{core.backend.attempts(item_id)} attempt(s)")
-        if record.get("last_refusal"):
-            # The park's reason describes the parked body; the refusal cause
-            # describes why THIS body was not given a cycle of its own.
-            why = f"fresh cycle refused: {record['last_refusal']} ({why})"
+        if not _record_holds_payload(record, payload):
+            # The park's reason describes the parked body, not this one.
+            why = _other_body_why(record, f"the parked body: {why}")
         if result_file is not None:
             _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id)
         else:
@@ -4510,7 +4503,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
         sent = getattr(res, "dispatched_digest", None)
         if sent is not None and sent != hashlib.sha256(payload).hexdigest():
-            # The outbox sends its stored body; this one was refused a cycle
+            # The outbox sends its stored body; this one was refused
             # and must stay visible, never archived as if it had gone out.
             record = read_item(core.backend.root, item_id) or {}
             why = _other_body_why(record, "the outbox sent its stored body, not this one")

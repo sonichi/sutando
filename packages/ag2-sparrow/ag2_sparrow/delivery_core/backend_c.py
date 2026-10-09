@@ -194,21 +194,12 @@ class DesignCClaimBackend:
             _move(src, dst.with_name(dst.name + f"{SEP}{time.time_ns()}"))
 
     # ── ClaimBackend surface ────────────────────────────────────────────
-    def _parked(self, key: str) -> bool:
-        prefix = key + SEP
-        return any(e.name.startswith(prefix) for e in self._d(PARKED).iterdir())
-
     def publish(self, item_id: str, payload: bytes) -> bool:
         key = _safe_key(item_id)
         with self._lock(key):
             # RAW tokens block on purpose: a dead ghost holding the slot is
             # the verified harmless-by-construction recover-window semantics.
             if self._tokens(key):
-                return False
-            # Without the fresh-cycle capability a park is final for every
-            # payload: the parked namespace is the id's terminal state.
-            if (not self.capabilities.fresh_cycle_after_definite_park
-                    and self._parked(key)):
                 return False
             tmp = self._d(TMP) / f"{key}{SEP}{os.getpid()}{SEP}{time.time_ns()}"
             tmp.write_bytes(payload)
@@ -239,21 +230,11 @@ class DesignCClaimBackend:
             return ClaimToken(item_id=item_id, worker=worker,
                               incarnation=fname)
 
-    def begin_attempt(self, token: ClaimToken) -> bool:
-        # No started-attempt record: C admits no fresh cycle after a park, so an
-        # attempt that never classifies cannot be mistaken for a definite one.
-        parts = token.incarnation.split(SEP)
-        if len(parts) != TOKEN_PARTS or parts[1] != _safe_component(token.worker):
-            return False
-        return (self.root / INFLIGHT / token.incarnation).exists()
-
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,
                  destination: Optional[str] = None,
-                 terminal_reason: Optional[str] = None,
-                 ambiguous: bool = False) -> bool:
-        # `ambiguous` needs no record here: C admits no fresh cycle after a park.
+                 terminal_reason: Optional[str] = None) -> bool:
         parts = token.incarnation.split(SEP)
         if len(parts) != TOKEN_PARTS or parts[1] != _safe_component(token.worker):
             return False                    # forged: worker != the record's
