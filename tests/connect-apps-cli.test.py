@@ -1888,11 +1888,12 @@ class TestStampedAccountCredential(unittest.TestCase):
             cloud.post("/api/x")
         self.assertEqual(sent, [], "no call acts as the other account")
 
-    def test_an_unconfirmable_credential_reads_as_temporarily_unverified(self):
+    def test_an_unreachable_account_check_is_a_retriable_cloud_error(self):
         self.ids = {}
-        with self.assertRaises(connectors.Setup) as ctx:
+        with self.assertRaises(cloud_auth.CloudError) as ctx:
             connectors.Cloud(self.ws, request=lambda *a, **k: {}).get("/api/connectors")
-        self.assertEqual(ctx.exception.code, "account_unverified")
+        self.assertEqual((ctx.exception.status, ctx.exception.code), (0, "account_unverified"))
+        self.assertIn("try again", str(ctx.exception))
         self.assertIn("temporarily unavailable", str(ctx.exception))
         self.assertNotIn("sign in", str(ctx.exception))
 

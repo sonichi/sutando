@@ -217,7 +217,7 @@ def resolve_workspace() -> Path:
 
 
 # Wrappers, not aliases: each hands its sibling down as the injected reader, so
-# patching _keychain_get / read_keychain_auth here still steers the chain.
+# patching _keychain_get here still steers the chain (every Keychain key is a candidate).
 _normalize_base = cloud_auth.normalize_base
 _fnv1a64 = cloud_auth.fnv1a64
 origin_vault_key = cloud_auth.origin_vault_key
@@ -233,7 +233,7 @@ def read_keychain_auth():
 
 
 def read_cloud_auth(ws: Path):
-    return cloud_auth.read_cloud_auth(ws, keychain_auth=read_keychain_auth)
+    return cloud_auth.read_cloud_auth(ws, keychain_get=_keychain_get)
 
 
 def why_no_logs(ws: Path) -> str:

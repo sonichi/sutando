@@ -27,7 +27,8 @@ Once the desktop has stamped the running core's station for a user
 (state/station-core-stamp.json `cloud_user_id`), only a credential whose
 /api/me id is that user is returned; the first matching candidate in the
 order above wins. If none matches, the result is empty with `refused` set
-(account_changed / account_unverified) instead of acting as another account.
+(account_changed / account_unverified) instead of acting as another account;
+account_unverified means /api/me could not be reached (network, 429, 5xx).
 
 cloud_request() is the one HTTP path: https only, host allowlisted, bearer
 never sent anywhere else, errors surfaced as CloudError(status, code, detail)
@@ -172,18 +173,24 @@ _USER_IDS: dict[tuple[str, str], str] = {}
 
 
 def credential_user_id(base: str, token: str) -> str | None:
-    """The AG2 Cloud user a credential acts as, from /api/me; None when it cannot be told."""
+    """The AG2 Cloud user a credential acts as, from /api/me; None when the answer has no id.
+    Raises CloudError when /api/me fails, which unreachable() classifies."""
     key = (normalize_base(base), token)
     if key not in _USER_IDS:
-        try:
-            me = cloud_request(key[0], token, "GET", "/api/me", timeout=10)
-        except (CloudError, OSError, ValueError):
-            return None
+        me = cloud_request(key[0], token, "GET", "/api/me", timeout=10)
         uid = str((me or {}).get("id") or "") if isinstance(me, dict) else ""
         if not uid:
             return None
         _USER_IDS[key] = uid
     return _USER_IDS[key]
+
+
+def unreachable(exc: Exception) -> bool:
+    """True when a failed /api/me says nothing about the credential (network, 429, 5xx);
+    False for a real answer such as 401 or a refused host."""
+    if not isinstance(exc, CloudError):
+        return True
+    return exc.code == "network" or exc.status == 429 or exc.status >= 500
 
 
 def _file_candidates(ws: Path) -> Iterator[tuple[str, str]]:
@@ -209,7 +216,8 @@ def _file_candidates(ws: Path) -> Iterator[tuple[str, str]]:
             continue
 
 
-def _candidates(ws: Path, keychain_auth: Callable[[], tuple] | None) -> Iterator[tuple[str, str]]:
+def _candidates(ws: Path, keychain_auth: Callable[[], tuple] | None,
+                keychain_get: Callable[[str], str | None] | None) -> Iterator[tuple[str, str]]:
     host = keychain_first()
     if not host:
         yield from _file_candidates(ws)
@@ -218,14 +226,15 @@ def _candidates(ws: Path, keychain_auth: Callable[[], tuple] | None) -> Iterator
         if tok:
             yield base, tok
     else:
-        yield from keychain_candidates(signed_out_is_terminal=host)
+        yield from keychain_candidates(keychain_get, signed_out_is_terminal=host)
     base, tok = _metering_env_auth()
     if tok:
         yield base, tok
 
 
 def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None,
-                    user_id: Callable[[str, str], str | None] | None = None) -> CloudAuth:
+                    user_id: Callable[[str, str], str | None] | None = None,
+                    keychain_get: Callable[[str], str | None] | None = None) -> CloudAuth:
     """Return (apiBase, token) if signed in to Sutando Cloud, else (None, None).
 
     Post-M1 the record lives at ``<workspace>/state/auth/cloud-auth.json``; the
@@ -239,29 +248,37 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None,
 
     With a station stamp naming a user, a credential is returned only if
     `user_id` (default: /api/me) says it is that user; see CloudAuth.refused.
+    `keychain_get` replaces the Keychain reader; `keychain_auth` replaces the whole Keychain tier.
     """
     stamped = str((read_station_stamp(ws) or {}).get("cloud_user_id") or "")
     if not stamped:
-        for base, tok in _candidates(ws, keychain_auth):
+        for base, tok in _candidates(ws, keychain_auth, keychain_get):
             return CloudAuth(base, tok)
         return CloudAuth(None, None)
     user_id = user_id or credential_user_id
     tried: set[tuple[str, str]] = set()
     others: list[str] = []
-    for base, tok in _candidates(ws, keychain_auth):
+    unknown = False
+    for base, tok in _candidates(ws, keychain_auth, keychain_get):
         # Keyed like the id cache: one token on an unusable base must still be tried on its real one.
         key = (normalize_base(base or DEFAULT_CLOUD_ORIGIN), tok)
         if key in tried:
             continue
         tried.add(key)
-        uid = user_id(key[0], tok)
+        try:
+            uid = user_id(key[0], tok)
+        except (CloudError, OSError, ValueError) as exc:
+            unknown = unknown or unreachable(exc)
+            continue
+        unknown = unknown or not uid
         if uid == stamped:
             return CloudAuth(base, tok, stamp_user_id=stamped, credential_user_ids=(uid,))
         if uid and uid not in others:
             others.append(uid)
-    if not tried:
-        return CloudAuth(None, None)
-    return CloudAuth(None, None, "account_changed" if others else "account_unverified", stamped, others)
+    if others:
+        return CloudAuth(None, None, "account_changed", stamped, others)
+    # Only dead or unsendable credentials left is plainly signed out, not a cloud outage.
+    return CloudAuth(None, None, "account_unverified" if unknown else None, stamped if unknown else None)
 
 
 def refusal_message(auth: Any) -> str | None:

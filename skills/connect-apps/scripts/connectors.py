@@ -267,14 +267,15 @@ class Cloud:
             self.refused = auth if getattr(auth, "refused", None) else None
         return bool(self.token)
 
-    def not_signed_in(self) -> Setup:
-        """The Setup to raise when signed_in() is False: wrong_account / account_unverified when
-        cloud_auth refused a credential against the desktop's stamp, else not_signed_in."""
+    def not_signed_in(self) -> Exception:
+        """What to raise when signed_in() is False: wrong_account for another account than the
+        desktop stamped, a retriable CloudError when /api/me was unreachable, else not_signed_in."""
         r = self.refused
         if r is None:
             return Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
-        code = "wrong_account" if r.refused == "account_changed" else "account_unverified"
-        return Setup(code, cloud_auth.refusal_message(r))
+        if r.refused == "account_changed":
+            return Setup("wrong_account", cloud_auth.refusal_message(r))
+        return cloud_auth.CloudError(0, "account_unverified", cloud_auth.refusal_message(r))
 
     def get(self, path: str) -> dict:
         if not self.signed_in():

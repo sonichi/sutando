@@ -325,6 +325,19 @@ class TestStampedAccountIsNeverSwapped(unittest.TestCase):
         self.assertIsNone(cloud_auth.refusal_message(cloud_auth.CloudAuth(None, None)))
         self.assertIsNone(cloud_auth.refusal_message((None, None)))
 
+    def test_only_an_unreachable_cloud_reads_as_unverified(self):
+        self.stamp("u-A")
+        self.file("sutk_dead")
+        for exc, refused in ((cloud_auth.CloudError(401, "unauthenticated"), None),
+                             (cloud_auth.CloudError(0, "untrusted_host"), None),
+                             (cloud_auth.CloudError(429, "rate_limited"), "account_unverified"),
+                             (cloud_auth.CloudError(503, "http_503"), "account_unverified"),
+                             (OSError("reset"), "account_unverified")):
+            def me(*a, exc=exc, **k):
+                raise exc
+            auth = cloud_auth.read_cloud_auth(self.ws, user_id=me)
+            self.assertEqual((tuple(auth), auth.refused), ((None, None), refused), repr(exc))
+
     def test_credential_user_id_needs_an_id(self):
         cloud_auth.cloud_request.side_effect = lambda *a, **k: {"email": "x"}
         self.assertIsNone(cloud_auth.credential_user_id(self.BASE, "sutk_A"))
