@@ -14,6 +14,7 @@ const MONTH = new Date().toISOString().slice(0, 7);
 for (const d of ['tasks', 'results', join('tasks', 'archive', MONTH), join('results', 'archive', MONTH), join('state', 'activity')]) mkdirSync(join(TMP, d), { recursive: true });
 
 const { createResultQueue, createVoiceTaskStore, frameBatch, planReconcile, NOT_PICKED_MS, MAX_REPLAYS } = await import('../src/relay-agent.js');
+const { createConversationPacer } = await import('../src/conversation-pacing.js');
 const { frameTaskResult } = await import('../src/inject-framing.js');
 const tb = await import('../src/task-bridge.js');
 const { _pendingTasksForTest, voiceTaskStore, MISSED_RESULT_NOTE, _forwardOfflineThenArchive, reconcileVoiceTasks, voiceTaskRows, voiceTasksAhead } = tb;
@@ -121,6 +122,37 @@ describe('result queue', () => {
 		assert.equal(injected.length, 1);
 		assert.match(injected[0], /2 task results arrived together/);
 		assert.ok(injected[0].includes('[System: call done]') && !injected[0].includes('TASK_RESULT_START>\n[System: call done]'), 'a framed item is not wrapped as a task result');
+	});
+
+	it('a session that comes back mid-speech after a wait gets nothing until the next pause', async () => {
+		const pacer = createConversationPacer({ quietMs: 60, afterInterruptMs: 60, maxWaitMs: 5_000, pollMs: 5 });
+		const state = { ready: false };
+		const injected: Array<{ speaking: boolean }> = [];
+		let speaking = false;
+		const q = createResultQueue({
+			canInject: () => state.ready,
+			inject: () => injected.push({ speaking }),
+			waitForQuiet: () => pacer.waitForQuiet(),
+			fallback: () => assert.fail('no fallback: the session came back'),
+			gatherMs: 1,
+			notReadyRetriesMs: Array(20).fill(20),
+		});
+		q.enqueue({ text: 'PR 3509 status.' });
+		await tick(80);                                   // the queue is in its not-ready wait
+		state.ready = true; speaking = true; pacer.onTurnStart();   // back, and the model is talking
+		await tick(200);
+		assert.deepEqual(injected, [], 'nothing cuts into the turn the session came back to');
+		speaking = false; pacer.onTurnEnd();
+		await tick(300);
+		assert.deepEqual(injected, [{ speaking: false }], 'handed over at the pause after it');
+	});
+
+	it('each result in a batch names the request it answers, and only the batch ends the turn', () => {
+		const out = frameBatch([{ text: '#5140 merged.', request: 'check PR 5140' }, { text: '#5167 blocked.', request: 'check PR 5167' }]);
+		assert.match(out, /This answers the user's request: "check PR 5140"\.[\s\S]*#5140 merged\.[\s\S]*This answers the user's request: "check PR 5167"\.[\s\S]*#5167 blocked\./);
+		assert.match(out, /Task result 1 of 2[\s\S]*Task result 2 of 2/);
+		assert.equal(out.match(/wait for real input/g)?.length, 1, 'once, in the batch header');
+		assert.match(frameBatch([{ text: 'x', request: 'draw a dog' }]), /This answers the user's request: "draw a dog"\.\]\n\n\[System: Task completed\./);
 	});
 
 	it('one result is framed exactly as before', () => {
@@ -248,6 +280,19 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 		reconcileVoiceTasks(deliver, () => false);
 		assert.ok(owed.some((o) => o.taskId === x));
 		assert.ok(!owed.some((o) => o.taskId === y));
+	});
+
+	it('a task the core has not picked up is reported as a framed notice, not as a finished task', () => {
+		const id = `task-${1_800_000_700_000 + ++seq}`;
+		writeFileSync(join(TMP, 'tasks', `${id}.txt`), `id: ${id}\nsource: voice\ntask: draw a kite\n`);
+		voiceTaskStore.add(id, 'draw a kite');
+		const got: Array<{ text: string; framed?: boolean }> = [];
+		reconcileVoiceTasks((text, _note, meta) => got.push({ text, framed: meta.framed }), () => false, Date.now() + NOT_PICKED_MS + 1_000);
+		const notice = got.find((g) => g.text.includes('draw a kite'));
+		assert.ok(notice?.framed, 'framed, so the queue does not wrap it as a task result');
+		assert.match(notice!.text, /^\[System: The user's task "draw a kite" has not been picked up by the core/);
+		assert.doesNotMatch(frameBatch([{ text: notice!.text, framed: true }]), /Task completed/);
+		rmSync(join(TMP, 'tasks', `${id}.txt`));
 	});
 
 	it('status rows and the count ahead come from the table: a health check in tasks/ is not one of the user\'s', () => {

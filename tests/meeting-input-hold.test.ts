@@ -99,18 +99,26 @@ describe('the phone call-result poller', () => {
 });
 
 describe('results the session cannot take', () => {
-	it('each result in a batch gets its own DM fallback file; none overwrites another', async () => {
+	it('each result in a batch gets its own DM fallback: a task result as its offline copy, anything else as its own file', async () => {
 		const mode = { value: 'agent' as 'agent' | 'transcription' };
 		const s = fakeSession(mode);
 		s.sessionManager.isActive = false;   // reconnecting, and it does not come back
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const durable = wireDurableChannels(s as any, { notReadyRetriesMs: [10, 10] });
 		for (const pr of ['3509', '5140', '5167']) durable.enqueue({ text: `PR ${pr} status`, taskId: `task-${pr}` });
+		durable.enqueue({ text: '[System: The phone call just completed.]\n\nCall transcript:\nfirst call', framed: true });
+		durable.enqueue({ text: '[System: The phone call just completed.]\n\nCall transcript:\nsecond call', framed: true });
 		await tick(2_500);
 		const { readdirSync, readFileSync } = await import('node:fs');
-		const files = readdirSync(join(TMP, 'results')).filter((f) => f.startsWith('proactive-voice-stuck-'));
-		const bodies = files.map((f) => readFileSync(join(TMP, 'results', f), 'utf-8')).join('\n');
-		for (const pr of ['3509', '5140', '5167']) assert.match(bodies, new RegExp(`PR ${pr} status`));
+		const all = readdirSync(join(TMP, 'results'));
+		for (const pr of ['3509', '5140', '5167']) {
+			const copy = all.find((f) => f.startsWith(`proactive-result-task-${pr}-`));
+			assert.ok(copy, `task-${pr} has its offline copy`);
+			assert.equal(readFileSync(join(TMP, 'results', copy!), 'utf-8'), `PR ${pr} status`);
+		}
+		const stuck = all.filter((f) => f.startsWith('proactive-voice-stuck-')).map((f) => readFileSync(join(TMP, 'results', f), 'utf-8')).join('\n');
+		assert.match(stuck, /first call/);
+		assert.match(stuck, /second call/, 'two in the same second do not overwrite each other');
 		assert.deepEqual(s.sent, []);
 	});
 
@@ -123,38 +131,8 @@ describe('results the session cannot take', () => {
 		durable.enqueue({ text: 'PR 4200 status', taskId: 'task-4200' });
 		await tick(3_000);
 		s.sessionManager.isActive = true;   // the reconnect completes
-		await tick(1_000);
+		await tick(3_500);                    // a fresh gather and pause after it, never straight in
 		assert.equal(s.sent.length, 1);
 		assert.match(s.sent[0], /PR 4200 status/);
-	});
-});
-
-describe('relay agent end to end: results lost in a reconnect come back', () => {
-	it('three PR results fall back to the DM while the session reconnects; once it can speak, all three are handed over', async () => {
-		const { voiceTaskStore } = await import('../src/task-bridge.js');
-		const month = new Date().toISOString().slice(0, 7);
-		mkdirSync(join(TMP, 'results', 'archive', month), { recursive: true });
-		mkdirSync(join(TMP, 'tasks', 'archive', month), { recursive: true });
-		const mode = { value: 'agent' as 'agent' | 'transcription' };
-		const s = fakeSession(mode);
-		s.sessionManager.isActive = false;   // the reconnect outlasts the wait
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const durable = wireDurableChannels(s as any, { notReadyRetriesMs: [10, 10], reconcileMs: 200 });
-		const ids = ['3509', '5140', '5167'].map((pr) => `task-19000000${pr}`);
-		for (const [i, pr] of ['3509', '5140', '5167'].entries()) {
-			const id = ids[i];
-			writeFileSync(join(TMP, 'tasks', 'archive', month, `${id}.txt`), `id: ${id}\nsource: voice\ntask: check PR ${pr}\n`);
-			writeFileSync(join(TMP, 'results', 'archive', month, `${id}.txt`), `PR ${pr} status.`);
-			voiceTaskStore.add(id, `check PR ${pr}`);
-			durable.enqueue({ text: `PR ${pr} status.`, taskId: id });
-		}
-		await tick(2_500);
-		assert.deepEqual(s.sent, [], 'nothing spoken while the session is down');
-		assert.deepEqual(ids.map((id) => voiceTaskStore.get(id)?.delivery), ['dm', 'dm', 'dm']);
-		s.sessionManager.isActive = true;   // the reconnect completes
-		await tick(3_500);
-		assert.equal(s.sent.length, 1, 'one hand-over');
-		for (const pr of ['3509', '5140', '5167']) assert.match(s.sent[0], new RegExp(`PR ${pr} status`));
-		assert.match(s.sent[0], /did not hear this result/);
 	});
 });

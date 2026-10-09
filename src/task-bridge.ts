@@ -18,6 +18,7 @@ import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
 import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
 import { createVoiceTaskStore, planReconcile } from './relay-agent.js';
+import { framedSystem } from './inject-framing.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 import {
 	emitTaskProcessed,
@@ -573,8 +574,23 @@ export function voiceTaskRows(now = Date.now()): VoiceTaskRow[] {
 	return rows;
 }
 
+const OFFLINE_COPY_RE = /^proactive-result-(task-[A-Za-z0-9._-]+?)-\d+\.txt$/;
+
+/** The task an untagged offline DM copy (forwardOfflineVoiceResult) answers, or null. */
+export function _offlineCopyTask(file: string): string | null {
+	return OFFLINE_COPY_RE.exec(file)?.[1] ?? null;
+}
+
+function _hasLiveOfflineCopy(taskId: string): boolean {
+	try {
+		return readdirSync(RESULT_DIR).some((f) => _offlineCopyTask(f) === taskId && !_deliveredResults.has(f));
+	} catch {
+		return false;
+	}
+}
+
 /** Delivers an owed result or notice to the user (the relay agent's queue). */
-export type RelayDeliver = (text: string, note: string | undefined, meta: { taskId?: string }) => void;
+export type RelayDeliver = (text: string, note: string | undefined, meta: { taskId?: string; framed?: boolean }) => void;
 
 /**
  * The relay agent's reconcile pass: for every recent voice task, compare what the core did with
@@ -584,6 +600,8 @@ export function reconcileVoiceTasks(deliver: RelayDeliver, isInFlight: (taskId: 
 	for (const [id, row] of voiceTaskStore.list()) {
 		if (row.submittedAt === undefined || now - row.submittedAt > STATUS_WINDOW_MS) continue;
 		// A result still in results/ is the watcher's to deliver first.
+		// An offline DM copy still in results/ is on its way (a bridge takes it, or the drain speaks it on reconnect).
+		if (_hasLiveOfflineCopy(id)) continue;
 		const settledResult = existsSync(join(RESULT_DIR, `${id}.txt`)) ? _deliveredResults.has(`${id}.txt`) : _hasResult(id);
 		const text = settledResult ? _readResultText(id) : null;
 		const action = planReconcile({
@@ -602,7 +620,7 @@ export function reconcileVoiceTasks(deliver: RelayDeliver, isInFlight: (taskId: 
 			const minutes = Math.floor((now - (row.submittedAt ?? now)) / 60000);
 			console.log(`${ts()} [RelayAgent] ${id}: not picked up after ${minutes}m; telling the user`);
 			voiceTaskStore.noteNotPicked(id);
-			deliver(`[Task '${(row.text ?? '').slice(0, 80)}' has not been picked up by the core after ${minutes} minutes. It is still queued; the core may be busy or down.]`, undefined, {});
+			deliver(framedSystem(`The user's task "${(row.text ?? '').slice(0, 80).replace(/"/g, "'")}" has not been picked up by the core after ${minutes} minutes. It is still queued; the core may be busy or down. Tell the user in one sentence.`), undefined, { framed: true });
 		}
 	}
 }
@@ -1786,11 +1804,12 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					// owner's DM when the core marked it `[dm-only]` — and voice is told which.
 					const taskOrigin = registersTask && !foreignOrigin ? voiceTaskOrigin(taskId) : null;
 					const keptToDm = taskOrigin ? keepVoiceResultToDm(taskId, result, dmOnly) : null;
-					const meta = registersTask && !foreignOrigin ? { taskId } : undefined;
+					const offlineCopyOf = _offlineCopyTask(file);
+					const meta = registersTask && !foreignOrigin ? { taskId } : offlineCopyOf ? { taskId: offlineCopyOf } : undefined;
 					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE, meta);
 					else if (taskOrigin) void _deliverOriginBoundResult(taskId, result, taskOrigin, onResult);
 					else if (_cancelledVoiceTasks.has(taskId)) onResult(result, CANCELLED_BUT_FINISHED_NOTE, meta);
-					else onResult(result, undefined, meta);
+					else onResult(result, offlineCopyOf ? MISSED_RESULT_NOTE : undefined, meta);
 					// Notify agent-api directly (task results only), then delete file
 					if (registersTask) {
 						try {

@@ -20,7 +20,7 @@ import { resolveWorkspace, statusPath } from './workspace_default.js';
 import { injectText } from './browser-tools.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
 import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull } from './inject-framing.js';
-import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, voiceTaskStore, reconcileVoiceTasks } from './task-bridge.js';
+import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, voiceTaskStore, reconcileVoiceTasks, forwardOfflineVoiceResult } from './task-bridge.js';
 import { createConversationPacer } from './conversation-pacing.js';
 import { createResultQueue, type ResultItem } from './relay-agent.js';
 
@@ -112,7 +112,15 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		store: voiceTaskStore,
 		log: (msg) => console.log(`${ts()} ${msg}`),
 		fallback: (items) => {
-			for (const [i, { text: result }] of items.entries()) {
+			for (const [i, { text: result, taskId }] of items.entries()) {
+				// A voice task's result takes the offline path: one DM copy the drain speaks on reconnect
+				// when no bridge takes it, credited to the task so the relay agent does not hand it over twice.
+				if (taskId?.startsWith('task-')) {
+					// One DM copy per result: a copy read back while the session is still down is not copied again.
+					if (voiceTaskStore.get(taskId)?.delivery === 'dm') continue;
+					void forwardOfflineVoiceResult(taskId, result).catch((e) => console.error(`${ts()} [TaskBridge] offline forward failed for ${taskId}:`, e));
+					continue;
+				}
 				// Stuck-voice fallback. Per Susan's PR #924 review (Q3): Cartesia
 				// only reaches the user if they're watching the web client with
 				// audio playback — a user in a stuck voice session is probably
@@ -146,6 +154,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			}
 		},
 	});
+	const requestOf = (taskId?: string) => (taskId ? voiceTaskStore.get(taskId)?.text : undefined);
 	session.eventBus.subscribe('turn.start', () => pacer.onTurnStart());
 	session.eventBus.subscribe('turn.end', () => { pacer.onTurnEnd(); results.onTurnEnd(); });
 	session.eventBus.subscribe('turn.interrupted', () => { pacer.onTurnInterrupted(); results.onTurnInterrupted(); });
@@ -154,7 +163,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 
 	startResultWatcher((result, deliveryNote, meta) => {
 		console.log(`${ts()} [TaskBridge] Queueing result for the user${deliveryNote ? ' (with a delivery note)' : ''}`);
-		results.enqueue({ text: result, note: deliveryNote, taskId: meta?.taskId });
+		results.enqueue({ text: result, note: deliveryNote, taskId: meta?.taskId, request: requestOf(meta?.taskId) });
 	}, () => session.clientConnected);
 
 	// The relay agent's reconcile loop: whatever the core finished that the user has not heard
@@ -162,7 +171,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	const reconcile = setInterval(() => {
 		if (!session.sessionManager.isActive || !session.clientConnected || meetingHoldsModel(session)) return;
 		try {
-			reconcileVoiceTasks((text, note, meta) => results.enqueue({ text, note, taskId: meta.taskId }), (id) => results.isInFlight(id));
+			reconcileVoiceTasks((text, note, meta) => results.enqueue({ text, note, taskId: meta.taskId, framed: meta.framed, request: requestOf(meta.taskId) }), (id) => results.isInFlight(id));
 		} catch (err) {
 			console.error(`${ts()} [RelayAgent] reconcile failed (will retry):`, err);
 		}
