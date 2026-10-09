@@ -70,6 +70,16 @@ class _Recorder:
                                provider_ref="r-1")
 
 
+class ProtocolDeclaresNoDefault(unittest.TestCase):
+    """The ClaimBackend protocol only names begin_attempt: a backend inherits
+    no behaviour from it, so a backend that forgets it fails loudly."""
+
+    def test_begin_attempt_is_abstract(self):
+        from ag2_sparrow.delivery_core.contract import ClaimBackend
+        token = ClaimToken(item_id=ITEM, worker="w1", incarnation="none")
+        self.assertIsNone(ClaimBackend.begin_attempt(object(), token))
+
+
 class ContractCase(unittest.TestCase):
     """Runs once per BACKENDS entry (see load_tests)."""
     backend_name = "A"
@@ -664,6 +674,7 @@ def load_tests(loader, tests, pattern):
     # An unregistered class is collected by nothing here: load_tests
     # replaces discovery, so a new case must be added explicitly.
     suite.addTests(loader.loadTestsFromTestCase(SharedRootResendEpoch))
+    suite.addTests(loader.loadTestsFromTestCase(ProtocolDeclaresNoDefault))
     return suite
 
 
