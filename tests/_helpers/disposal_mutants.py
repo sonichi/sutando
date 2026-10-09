@@ -48,20 +48,20 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "    path = results_dir / LOCK_NAME\n    deadline = time.monotonic() + LOCK_WAIT_S\n"),
     "recovery-ignores-claim-identity": (
         "an abandoned claim is quarantined even when it holds a reply the owner never verified",
-        "    unverified = (found.ino, found.mtime_ns, found.digest) != (c.ino, c.mtime_ns, c.digest)\n",
-        "    unverified = False\n"),
+        "            verified, _ = _verify_fd(fd, named)         # the body, not a stat of a name\n",
+        "            verified = True\n"),
     "recovery-unisolated": (
         "one claim's recovery failure aborts the pass",
         "                except Exception as e:  # noqa: BLE001 - isolation is the point\n",
         "                except DisposalBusy as e:  # noqa: BLE001 - isolation is the point\n"),
     "lock-error-escapes": (
         "a lock the filesystem refuses raises into the drain",
-        "    except OSError as e:                                # DisposalBusy, ENOLCK, EACCES, a vanished dir\n",
-        "    except DisposalBusy as e:                                # DisposalBusy, ENOLCK, EACCES, a vanished dir\n"),
+        "    except OSError as e:                                # DisposalBusy, ENOLCK, EACCES, a dir that cannot be read\n",
+        "    except DisposalBusy as e:                                # DisposalBusy, ENOLCK, EACCES, a dir that cannot be read\n"),
     "recovery-digest-only": (
         "recovery calls a claim verified when only its bytes match the name",
-        "    unverified = (found.ino, found.mtime_ns, found.digest) != (c.ino, c.mtime_ns, c.digest)\n",
-        "    unverified = found.digest != c.digest\n"),
+        "            named = ResultIdentity(os.fstat(fd).st_dev, c.ino, c.mtime_ns, c.digest)\n",
+        "            _st = os.fstat(fd)\n            named = ResultIdentity(_st.st_dev, _st.st_ino, _st.st_mtime_ns, c.digest)\n"),
     "put-back-replaces": (
         "the put-back uses a replacing rename, so a retaken canonical name is overwritten",
         "        rename_noreplace(Path(claim), Path(rfile), log)\n    except FileExistsError:\n        return False\n",
@@ -72,8 +72,32 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "    same = h.hexdigest() == generation.digest\n"),
     "missing-dir-not-skipped": (
         "recovery runs against an absent results directory",
-        "    if not results_dir.is_dir():\n        return\n    for odd in find_malformed",
-        "    for odd in find_malformed"),
+        "        if not results_dir.is_dir():\n            return\n        for odd in find_malformed",
+        "        for odd in find_malformed"),
+    "fallback-links-then-unlinks": (
+        "without a kernel primitive the put-back links then unlinks the claim after a stat",
+        "    raise FileExistsError(errno.ENOTSUP, \"no no-replace rename on this platform; nothing moved\", str(dst))\n",
+        "    os.link(src, dst)\n    sa, sb = os.stat(src), os.stat(dst)\n"
+        "    if (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino):\n        os.unlink(src)\n        return\n"
+        "    raise FileExistsError(errno.EEXIST, \"retaken\", str(dst))\n"),
+    "duplicate-unlinked-after-stat": (
+        "a second name of a reply is unlinked after a link-count check",
+        "    kept = _quarantine_target(results_dir, stem)\n    try:\n        os.rename(claim, kept)\n",
+        "    kept = _quarantine_target(results_dir, stem)\n    try:\n"
+        "        if os.stat(claim).st_nlink > 1:\n            os.unlink(claim)\n            return\n"
+        "        os.rename(claim, kept)\n"),
+    "quarantine-skips-the-post-move-verify": (
+        "the quarantined file is not read again after the move, so a rewrite after verification stays quarantined",
+        "                    if _still_is(fd, generation, log, rfile.stem, target):\n",
+        "                    if True:\n"),
+    "recovery-skips-the-post-move-verify": (
+        "recovery does not read the body again after its own move",
+        "        if not (c.restore or not verified) and not _still_is(fd, named, log, c.stem, target):\n",
+        "        if False:\n"),
+    "precheck-outside-the-catch": (
+        "an error from the results-dir precheck escapes recovery into the drain",
+        "    results_dir = Path(results_dir)\n    try:\n        if not results_dir.is_dir():\n            return\n",
+        "    results_dir = Path(results_dir)\n    if not results_dir.is_dir():\n        return\n    try:\n"),
 }
 
 

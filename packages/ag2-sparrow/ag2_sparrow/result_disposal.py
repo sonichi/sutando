@@ -15,9 +15,13 @@ recovery pass runs under one exclusive lock per results directory
 lock cannot cover is the producer, which writes results without it, so every
 step that touches the canonical name is a conditional primitive: a put-back is
 an atomic no-replace rename (`renameat2(RENAME_NOREPLACE)` on Linux,
-`renamex_np(RENAME_EXCL)` on macOS), so a claim never has a second name that
-could be unlinked after a producer retook the canonical one. Where neither
-primitive exists the fallback links and verifies, and says so.
+`renamex_np(RENAME_EXCL)` on macOS, `os.rename` on Windows), so a claim never
+has a second name that could be unlinked after a producer retook the canonical
+one. Where no such primitive exists nothing is put back at all: the body stays
+in its claim and recovery keeps it where the operator looks. No name a producer
+can retake is ever unlinked after a check, and the file moved into quarantine
+is verified again through the open descriptor after the move; a rewrite after
+verification goes back live rather than into quarantine.
 
 The move is two renames through a private claim,
 `results/.<stem>.disposing-<pid>-<birth-usec>-<acquired-s>-<ino>-<mtime-ns>-<sha256>-<nonce>[.restore]`.
@@ -33,8 +37,9 @@ is stranded where the operator cannot see it, one damaged claim never blocks
 the others, and a pass that cannot take the lock never blocks delivery.
 
 Residual: on a filesystem with coarse timestamps an inode reused within one
-tick for equal bytes still reads as the same publication. The content
-survives either way; only the loser's report can be wrong.
+tick for equal bytes still reads as the same publication, and an inode
+rewritten in place after the post-move check already sits in quarantine with
+the new bytes. The content survives either way; only a report can be wrong.
 
 Dependency-light: the caller supplies its results directory and a log callback.
 """
@@ -79,7 +84,7 @@ __all__ = ["CLAIM_MAX_S", "LOCK_WAIT_S", "LOCK_NAME", "ACTIVE_CLAIMS", "RENAME_P
            "Claim", "GenerationReplaced", "DisposalBusy", "locked", "rename_noreplace",
            "self_token", "parse_claim", "find_claims", "find_malformed", "owner_holds",
            "quarantine_generation", "put_back", "recover_claim", "recover_abandoned_claims",
-           "disposed_copy_exists"]
+           "disposed_copy_exists", "report_once"]
 
 # Only an owner whose liveness cannot be read (EPERM) ages out: the bound is a
 # fallback for UNKNOWN, never a reason to take a claim from a live process.
@@ -132,7 +137,7 @@ def _probe_rename() -> "tuple[str, Optional[Callable[[bytes, bytes], int]]]":
     try:
         libc = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
     except OSError:  # pragma: no cover - no libc to speak of
-        return "link", None
+        return "none", None
     if sys.platform == "darwin" and hasattr(libc, "renamex_np"):  # pragma: no cover - Linux CI
         fn = libc.renamex_np
         fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
@@ -144,7 +149,9 @@ def _probe_rename() -> "tuple[str, Optional[Callable[[bytes, bytes], int]]]":
         fn.restype = ctypes.c_int
         at_fdcwd = -100
         return "renameat2", lambda a, b: fn(at_fdcwd, a, at_fdcwd, b, 1)  # RENAME_NOREPLACE
-    return "link", None
+    if sys.platform == "win32":  # pragma: no cover - os.rename refuses a taken name there
+        return "os.rename", None
+    return "none", None
 
 
 RENAME_PRIMITIVE, _RENAME = _probe_rename()
@@ -152,11 +159,14 @@ RENAME_PRIMITIVE, _RENAME = _probe_rename()
 
 def rename_noreplace(src: Path, dst: Path, log: Optional[Log] = None) -> None:
     """Rename `src` to `dst` only if `dst` does not exist: FileExistsError
-    otherwise, and nothing moved. Without a kernel primitive the fallback
-    links, verifies the link still names the same file, then unlinks: a name
-    retaken between link and verify is reported; one retaken between the
-    verify and the unlink is a residual silent loss on such platforms."""
+    otherwise, and nothing moved. Without a kernel primitive nothing is moved
+    either, and the same FileExistsError says so: a link-then-unlink put-back
+    would have to unlink `src` after a check a producer can invalidate, so the
+    body stays where it is and the caller keeps it where the operator looks."""
     global RENAME_PRIMITIVE, _RENAME
+    if RENAME_PRIMITIVE == "os.rename":  # pragma: no cover - Windows only
+        os.rename(src, dst)
+        return
     if _RENAME is not None:
         rc = _RENAME(os.fsencode(src), os.fsencode(dst))
         if rc == 0:
@@ -165,23 +175,13 @@ def rename_noreplace(src: Path, dst: Path, log: Optional[Log] = None) -> None:
         if err == errno.EEXIST:
             raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(dst))
         if err in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)):
-            RENAME_PRIMITIVE, _RENAME = "link", None   # this filesystem cannot; fall through
+            RENAME_PRIMITIVE, _RENAME = "none", None   # this filesystem cannot; refuse from now on
         else:
             raise OSError(err, os.strerror(err), str(src))
     _report_once("rename:fallback", log or (lambda _m: None),
-                 "result disposal: no no-replace rename on this platform; put-back links then "
-                 "unlinks, so a producer retaking the name in that gap is reported, not silent")
-    os.link(src, dst)                                   # FileExistsError: name taken
-    try:
-        sa, sb = os.stat(src), os.stat(dst)
-    except FileNotFoundError:
-        return
-    if (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino):
-        os.unlink(src)
-        return
-    # A producer replaced the canonical name between link and verify: `src`
-    # is the restored reply's last link, so it stays, and the caller is told.
-    raise FileExistsError(errno.EEXIST, "canonical name retaken during the put-back", str(dst))
+                 "result disposal: no no-replace rename on this platform; a reply that would go "
+                 "back to its name is kept where the operator looks instead, never put back")
+    raise FileExistsError(errno.ENOTSUP, "no no-replace rename on this platform; nothing moved", str(dst))
 
 
 # ── the lock ─────────────────────────────────────────────────────────────────
@@ -341,28 +341,28 @@ def _quarantine_target(results_dir: Path, stem: str) -> Path:
     return d / undelivered_quarantine.quarantine_name(stem)
 
 
-def _drop_link(claim: Path, log: Log, stem: str, results_dir: Path) -> None:
-    """Remove a claim that is a second name of a restored or quarantined file
-    (only the link fallback can leave one). While it is the sole link it is a
-    reply's last copy and is kept where the operator looks instead."""
+def _keep_duplicate(claim: Path, log: Log, stem: str, results_dir: Path) -> None:
+    """A claim that is a second name of a file already restored or quarantined
+    (an older link-based put-back left it). It is never unlinked: no check can
+    prove the other name still exists at the instant of the unlink, so the
+    name is moved where the operator looks, which keeps the body either way."""
+    kept = _quarantine_target(results_dir, stem)
     try:
-        if os.stat(claim).st_nlink > 1:
-            os.unlink(claim)
-            return
+        os.rename(claim, kept)
     except FileNotFoundError:
         return
-    kept = _quarantine_target(results_dir, stem)
-    os.rename(claim, kept)
-    log(f"result {stem}: a superseded reply was kept as {kept.name}")
+    log(f"result {stem}: a second name of a reply already restored or quarantined was kept as {kept.name}")
 
 
 def quarantine_generation(results_dir: Path, rfile: Path, generation: ResultIdentity,
                           log: Log) -> Path:
     """Quarantine `rfile` only if it still IS `generation`. The rename to a
     private claim is the atomic step; a different file found there is a newer
-    reply and goes back under a recorded `.restore` intent. A failure after
-    the claim rename puts the body back or quarantines it: the claim path is
-    never where a result ends up."""
+    reply and goes back under a recorded `.restore` intent. The quarantined
+    file is verified again through the same open descriptor after the move; a
+    rewrite after verification goes back live. A failure after the claim
+    rename puts the body back or quarantines it: the claim path is never where
+    a result ends up."""
     with locked(results_dir):
         return _quarantine_generation(Path(results_dir), Path(rfile), generation, log)
 
@@ -386,6 +386,38 @@ def _verify_fd(fd: int, generation: ResultIdentity) -> "tuple[bool, os.stat_resu
     return same, again
 
 
+def _still_is(fd: int, generation: ResultIdentity, log: Log, stem: str, moved: Path) -> bool:
+    """The moved file, read again through the descriptor the verdict was made
+    on, is still that publication. Unreadable now: it stays where it was moved,
+    and the doubt is named."""
+    try:
+        still, _ = _verify_fd(fd, generation)
+    except OSError as e:
+        log(f"result {stem}: could not re-verify {moved.name} after the move ({e}); it holds what was moved")
+        return True
+    return still
+
+
+def _undo_move(moved: Path, rfile: Path, claim: Path, log: Log, stem: str) -> Optional[Path]:
+    """The publication changed between its verification and the end of the
+    move, so the decision no longer describes it: it goes back live when its
+    name is free, else back into the private claim for recovery to judge
+    again. Returns where it ended; None when it was already taken elsewhere."""
+    try:
+        rename_noreplace(moved, rfile, log)
+        log(f"result {stem}: the reply was rewritten after verification; it is back at its name, live")
+        return rfile
+    except FileExistsError:
+        pass
+    try:
+        os.rename(moved, claim)
+    except FileNotFoundError:
+        return None
+    log(f"result {stem}: the reply was rewritten after verification and its name was retaken; "
+        f"it is kept in its claim for recovery")
+    return claim
+
+
 def _quarantine_generation(results_dir: Path, rfile: Path, generation: ResultIdentity,
                            log: Log) -> Path:
     pid, start = self_token()
@@ -394,26 +426,28 @@ def _quarantine_generation(results_dir: Path, rfile: Path, generation: ResultIde
                                          mtime=generation.mtime_ns, digest=generation.digest,
                                          nonce=uuid.uuid4().hex[:8]))
     ACTIVE_CLAIMS.add(str(claim))
+    undone = False
     try:
         os.rename(rfile, claim)                       # FileNotFoundError: nothing there
         try:
             fd = os.open(claim, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             try:
-                matches, before = _verify_fd(fd, generation)
+                matches, _ = _verify_fd(fd, generation)
                 if matches:
                     target = _quarantine_target(results_dir, rfile.stem)
                     os.rename(claim, target)
-                    after = os.fstat(fd)
-                    if (after.st_mtime_ns, after.st_size) != (before.st_mtime_ns, before.st_size):
-                        log(f"result {rfile.stem}: the quarantined file was rewritten in place "
-                            f"during the move; {target.name} is not the verified bytes")
-                    return target
+                    if _still_is(fd, generation, log, rfile.stem, target):
+                        return target
+                    _undo_move(target, rfile, claim, log, rfile.stem)
+                    undone = True                        # live, in its claim, or taken by another: not ours now
             finally:
                 os.close(fd)
         except OSError:
             if put_back(claim, rfile, log):
                 raise
             return _recover_claim(results_dir, claim, log, quiet=True) or rfile
+        if undone:
+            raise GenerationReplaced(str(rfile))
         restoring = claim.with_name(claim.name + _RESTORE)
         ACTIVE_CLAIMS.add(str(restoring))             # registered before it can be seen
         try:
@@ -460,46 +494,61 @@ def _recover_claim(results_dir: Path, claim: Path, log: Log, quiet: bool = False
     if c is None:
         return None
     try:
-        _, found = identity_of(claim)                   # unreadable or gone: not ours to move
+        fd = os.open(claim, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
-        return None
-    canonical = results_dir / f"{c.stem}.txt"
-    if canonical.exists() and _same_file(claim, canonical):
-        _drop_link(claim, log, c.stem, results_dir)     # a link-fallback put-back, finished
-        return canonical
-    for copy in undelivered_quarantine.find_quarantined(results_dir, c.stem):
-        if _same_file(claim, copy):
-            _drop_link(claim, log, c.stem, results_dir)
-            return copy
-    unverified = (found.ino, found.mtime_ns, found.digest) != (c.ino, c.mtime_ns, c.digest)
-    if c.restore or unverified:
-        try:
-            if put_back(claim, canonical, log):
-                if not quiet:
-                    what = "a reply the owner never verified" if unverified and not c.restore \
-                        else "a reply left in an interrupted put-back"
-                    log(f"result {c.stem}: restored {what}")
-                return canonical
-        except FileNotFoundError:
-            return None                                 # another observer got there first
-        why = "a superseded reply left in an interrupted put-back was kept as"
-    else:
-        why = "recovered a result left in an interrupted disposal — quarantined to"
-    target = _quarantine_target(results_dir, c.stem)
+        return None                                     # gone or unreadable: not ours to move
     try:
-        os.rename(claim, target)
-    except FileNotFoundError:
-        return None
-    if not quiet:
-        where = target.name if (c.restore or unverified) else f"{undelivered_quarantine.DIRNAME}/"
-        log(f"result {c.stem}: {why} {where}")
-    return target
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            return None                                 # not a result body: never moved
+        canonical = results_dir / f"{c.stem}.txt"
+        if canonical.exists() and _same_file(claim, canonical):
+            _keep_duplicate(claim, log, c.stem, results_dir)
+            return canonical
+        for copy in undelivered_quarantine.find_quarantined(results_dir, c.stem):
+            if _same_file(claim, copy):
+                _keep_duplicate(claim, log, c.stem, results_dir)
+                return copy
+        try:
+            named = ResultIdentity(os.fstat(fd).st_dev, c.ino, c.mtime_ns, c.digest)
+            verified, _ = _verify_fd(fd, named)         # the body, not a stat of a name
+        except OSError:
+            return None
+        if c.restore or not verified:
+            try:
+                if put_back(claim, canonical, log):
+                    if not quiet:
+                        what = "a reply the owner never verified" if not (verified or c.restore) \
+                            else "a reply left in an interrupted put-back"
+                        log(f"result {c.stem}: restored {what}")
+                    return canonical
+            except FileNotFoundError:
+                return None                             # another observer got there first
+            why = "a superseded reply left in an interrupted put-back was kept as"
+        else:
+            why = "recovered a result left in an interrupted disposal — quarantined to"
+        target = _quarantine_target(results_dir, c.stem)
+        try:
+            os.rename(claim, target)
+        except FileNotFoundError:
+            return None
+        if not (c.restore or not verified) and not _still_is(fd, named, log, c.stem, target):
+            return _undo_move(target, canonical, claim, log, c.stem) or target
+        if not quiet:
+            where = target.name if (c.restore or not verified) else f"{undelivered_quarantine.DIRNAME}/"
+            log(f"result {c.stem}: {why} {where}")
+        return target
+    finally:
+        os.close(fd)
 
 
-def _report_once(key: str, log: Log, line: str) -> None:
+def report_once(key: str, log: Log, line: str) -> None:
+    """Say `line` once per process for `key`; an adapter's boundary guard uses it too."""
     if key not in _REPORTED:
         _REPORTED.add(key)
         log(line)
+
+
+_report_once = report_once
 
 
 def recover_abandoned_claims(results_dir: Path, log: Log) -> None:
@@ -508,12 +557,12 @@ def recover_abandoned_claims(results_dir: Path, log: Log) -> None:
     a pass that cannot take the lock, or has no directory to lock, skips and
     never blocks the delivery that follows it."""
     results_dir = Path(results_dir)
-    if not results_dir.is_dir():
-        return
-    for odd in find_malformed(results_dir):
-        _report_once(f"malformed:{odd}", log, f"result file {odd.name}: a claim of an unknown "
-                                              "shape — left alone")
     try:
+        if not results_dir.is_dir():
+            return
+        for odd in find_malformed(results_dir):
+            _report_once(f"malformed:{odd}", log, f"result file {odd.name}: a claim of an unknown "
+                                                  "shape — left alone")
         with locked(results_dir):
             for claim in find_claims(results_dir):
                 try:
@@ -522,7 +571,7 @@ def recover_abandoned_claims(results_dir: Path, log: Log) -> None:
                 except Exception as e:  # noqa: BLE001 - isolation is the point
                     _report_once(str(claim), log, f"result {parse_claim(claim).stem}: could not "
                                                   f"recover {claim.name} ({e}) — left for the operator")
-    except OSError as e:                                # DisposalBusy, ENOLCK, EACCES, a vanished dir
+    except OSError as e:                                # DisposalBusy, ENOLCK, EACCES, a dir that cannot be read
         _report_once(f"lock:{results_dir}", log, f"result disposal: {e}; recovery skipped this pass")
 
 

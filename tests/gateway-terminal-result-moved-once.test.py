@@ -357,8 +357,9 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
         self.assertIn('recovered', self.about()[0])
 
-    def test_a_death_mid_disposal_of_the_very_file_already_quarantined_is_dropped(self):
-        # The same inode under two names (an interrupted move): one copy, no line.
+    def test_a_death_mid_disposal_of_the_very_file_already_quarantined_keeps_both_names(self):
+        # The same inode under two names (an interrupted move): the second name
+        # is kept where the operator looks, never unlinked after a check.
         core = self.park_without_disposing()
         self.bridge(core)
         self.task()
@@ -369,8 +370,10 @@ class TerminalResultMovedOnce(unittest.TestCase):
         undelivered_quarantine.quarantine(result, self.results)
         gw._post_ready_results({TID})
         self.assertEqual(self.claims(), [])
-        self.assertEqual(len(self.quarantined()), 1)
-        self.assertEqual(self.about(), [], '\n'.join(self.about()))
+        copies = [self.results / 'undelivered' / n for n in self.quarantined()]
+        self.assertEqual(len({os.stat(c).st_ino for c in copies}), 1, 'one body, every name visible')
+        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
+        self.assertIn('second name', self.about()[0])
 
     def test_a_quarantine_setup_failure_after_the_claim_rename_puts_the_body_back(self):
         core = self.park_without_disposing()
@@ -585,7 +588,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
         self.assertIn('restored', self.about()[0])
 
-    def test_a_crash_between_the_put_back_link_and_unlink_leaves_one_copy(self):
+    def test_a_crash_between_the_put_back_link_and_unlink_strands_nothing_and_unlinks_nothing(self):
         core = self.park_without_disposing()
         self.bridge(core)
         self.task()
@@ -595,9 +598,53 @@ class TerminalResultMovedOnce(unittest.TestCase):
         for _ in range(PASSES):
             gw._post_ready_results({TID})
         self.assertEqual(self.claims(), [])
-        self.assertEqual(len(self.quarantined()), 1, self.quarantined())
-        self.assertEqual(len(self.about()), 1, '\n'.join(self.about()))
-        self.assertIn('terminal', self.about()[0])
+        copies = [self.results / 'undelivered' / n for n in self.quarantined()]
+        self.assertEqual(len({os.stat(c).st_ino for c in copies}), 1, 'one body, every name visible')
+        self.assertEqual(len(self.about()), 2, '\n'.join(self.about()))
+        self.assertTrue(any('second name' in l for l in self.about()))
+        self.assertTrue(any('terminal' in l for l in self.about()))
+
+    def test_a_recovery_precheck_error_never_blocks_delivery(self):
+        # EIO from the results-dir precheck, through the real drain entry:
+        # recovery skips and says so once; the ordinary result is still posted.
+        def accept(method, path, payload):
+            self.server.calls.append(dict(payload))
+            return {'ok': True}
+        self.server.request = accept
+        self.bridge()
+        self.task()
+        other = self.result('fresh answer')
+        real = Path.is_dir
+        results = self.results
+
+        def eio(self_):
+            if self_ == results:
+                raise OSError(5, 'Input/output error')
+            return real(self_)
+        with patch.object(Path, 'is_dir', eio):
+            for _ in range(PASSES):
+                gw._post_ready_results({TID})
+        self.assertFalse(other.exists(), 'the ordinary result must still be delivered')
+        self.assertEqual(len([c for c in self.server.calls if c.get('id') == TID]), 1)
+        skipped = [l for l in self.lines if 'recovery skipped this pass' in l]
+        self.assertEqual(len(skipped), 1, '\n'.join(self.lines))
+
+    def test_the_adapter_boundary_fails_open_when_recovery_itself_raises(self):
+        def accept(method, path, payload):
+            self.server.calls.append(dict(payload))
+            return {'ok': True}
+        self.server.request = accept
+        self.bridge()
+        self.task()
+        other = self.result('fresh answer')
+        with patch.object(gw.disposal, 'recover_abandoned_claims',
+                          side_effect=RuntimeError('recovery exploded')):
+            for _ in range(PASSES):
+                gw._post_ready_results({TID})
+        self.assertFalse(other.exists(), 'the ordinary result must still be delivered')
+        self.assertEqual(len([c for c in self.server.calls if c.get('id') == TID]), 1)
+        failed = [l for l in self.lines if 'recovery failed' in l and 'delivery continues' in l]
+        self.assertEqual(len(failed), 1, '\n'.join(self.lines))
 
     def test_one_damaged_claim_never_blocks_ordinary_delivery(self):
         def accept(method, path, payload):

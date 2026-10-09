@@ -159,15 +159,37 @@ class CoreContract(unittest.TestCase):
         self.assertEqual(len(self.lines), 1)
         self.assertIn("restored", self.lines[0])
 
-    def test_an_interrupted_put_back_leaves_no_duplicate(self):
+    def test_an_interrupted_put_back_leaves_no_claim_and_unlinks_nothing(self):
+        # A second name of the live reply (an older link-based put-back left it)
+        # is moved where the operator looks, never unlinked after a check.
         r = self.result()
         c = self.claim(restore=True)
         os.link(r, c)                                    # died between link and unlink
         disposal.recover_abandoned_claims(self.results, self.lines.append)
         self.assertTrue(r.exists())
         self.assertEqual(disposal.find_claims(self.results), [])
-        self.assertEqual(self.quarantined(), [])
-        self.assertEqual(self.lines, [])
+        self.assertEqual([os.stat(p).st_ino for p in self.quarantined()], [os.stat(r).st_ino])
+        self.assertEqual(len(self.lines), 1)
+        self.assertIn("second name", self.lines[0])
+
+    def test_a_duplicate_is_never_unlinked_even_when_its_other_name_is_retaken(self):
+        # The producer retakes the canonical name at the instant an unlink would
+        # run: nothing is unlinked, so the reply keeps a name either way.
+        r = self.result("NEWER")
+        c = self.claim(restore=True, body="NEWER", nonce="ab000011")
+        os.link(r, c)
+        real = os.unlink
+
+        def retake_then_unlink(path, *a, **kw):
+            if Path(path) == c:
+                tmp = self.results / "task-a.newest"
+                tmp.write_text("NEWEST")
+                os.replace(tmp, self.results / "task-a.txt")
+            return real(path, *a, **kw)
+        with unittest.mock.patch.object(os, "unlink", retake_then_unlink):
+            disposal.recover_abandoned_claims(self.results, self.lines.append)
+        self.assertEqual([p.read_text() for p in self.quarantined()], ["NEWER"], "the reply survives")
+        self.assertEqual(disposal.find_claims(self.results), [])
 
     def test_one_broken_claim_does_not_stop_the_others(self):
         self.result("A", stem="task-a").rename(self.claim(stem="task-a", body="A"))
@@ -307,28 +329,34 @@ class CoreContract(unittest.TestCase):
         self.assertEqual(r.read_text(), "answer", "the rewritten reply stays live")
         self.assertEqual(self.quarantined(), [])
         self.assertEqual(disposal.find_claims(self.results), [])
+        self.assertEqual(self.lines, [], "caught before the move, so no undo was needed")
 
-    def test_the_link_fallback_reports_a_name_retaken_in_its_gap(self):
-        # Without a kernel no-replace rename the put-back links then unlinks;
-        # a name retaken in between is reported and the claim keeps the last link.
+    def test_without_a_primitive_nothing_is_put_back_and_the_body_stays_visible(self):
+        # No kernel no-replace rename: the put-back is refused outright, the
+        # claim keeps the body, and recovery keeps it where the operator looks.
         r = self.result("NEWER")
         c = self.claim(restore=True, body="NEWER", nonce="ab00000a")
         r.rename(c)
-        real_link = os.link
+        real = os.unlink
 
-        def producer_between(src, dst, *a, **kw):
-            real_link(src, dst, *a, **kw)
+        def retake_then_unlink(path, *a, **kw):
             tmp = self.results / "task-a.newest"
             tmp.write_text("NEWEST")
-            os.replace(tmp, dst)
+            os.replace(tmp, self.results / "task-a.txt")
+            return real(path, *a, **kw)
         with unittest.mock.patch.object(disposal, "_RENAME", None), \
-                unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "link"), \
-                unittest.mock.patch.object(os, "link", producer_between):
+                unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "none"), \
+                unittest.mock.patch.object(os, "unlink", retake_then_unlink), \
+                unittest.mock.patch.object(os, "link", unittest.mock.Mock(side_effect=AssertionError("never links"))):
             self.assertFalse(disposal.put_back(c, self.results / "task-a.txt", self.lines.append))
-        self.assertEqual((self.results / "task-a.txt").read_text(), "NEWEST")
-        self.assertEqual(c.read_text(), "NEWER")
-        self.assertEqual(len(self.lines), 1)
-        self.assertIn("no no-replace rename", self.lines[0])
+            self.assertEqual(c.read_text(), "NEWER", "the claim keeps the body")
+            self.assertFalse((self.results / "task-a.txt").exists())
+            disposal.recover_abandoned_claims(self.results, self.lines.append)
+        self.assertEqual([p.read_text() for p in self.quarantined()], ["NEWER"])
+        self.assertEqual(disposal.find_claims(self.results), [])
+        self.assertEqual(len(self.lines), 2, "\n".join(self.lines))
+        self.assertIn("never put back", self.lines[0])
+        self.assertIn("superseded", self.lines[1])
 
     def test_the_kernel_rename_refuses_a_taken_name_without_moving(self):
         if disposal.RENAME_PRIMITIVE == "link":
@@ -515,9 +543,9 @@ class CoreContract(unittest.TestCase):
         with unittest.mock.patch.object(disposal, "identity_of", real):
             self.assertTrue(disposal.disposed_copy_exists(self.results, "task-a", gen, self.lines.append))
 
-    def test_dropping_a_link_that_already_vanished_is_quiet(self):
+    def test_keeping_a_duplicate_that_already_vanished_is_quiet(self):
         c = self.claim(nonce="ab000008")
-        disposal._drop_link(c, self.lines.append, "task-a", self.results)
+        disposal._keep_duplicate(c, self.lines.append, "task-a", self.results)
         self.assertEqual(self.lines, [])
 
     def test_an_active_claim_of_this_process_is_held(self):
@@ -540,18 +568,18 @@ class CoreContract(unittest.TestCase):
             return -1
         return prim
 
-    def test_a_filesystem_without_the_primitive_moves_the_process_to_the_link_fallback(self):
+    def test_a_filesystem_without_the_primitive_refuses_every_put_back_from_then_on(self):
         a = self.result("A")
         for err in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
             with unittest.mock.patch.object(disposal, "_RENAME", self.fake_rename(err)), \
                     unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "probe"):
                 dst = self.results / f"task-{err}.txt"
-                disposal.rename_noreplace(a, dst, self.lines.append)
-                self.assertEqual((disposal.RENAME_PRIMITIVE, disposal._RENAME), ("link", None))
-            self.assertEqual(dst.read_text(), "A")
-            self.assertFalse(a.exists())
-            dst.rename(a)
-        self.assertEqual(len(self.lines), 1, "the fallback is reported once per process")
+                with self.assertRaises(FileExistsError):
+                    disposal.rename_noreplace(a, dst, self.lines.append)
+                self.assertEqual((disposal.RENAME_PRIMITIVE, disposal._RENAME), ("none", None))
+            self.assertFalse(dst.exists())
+            self.assertEqual(a.read_text(), "A", "nothing moved")
+        self.assertEqual(len(self.lines), 1, "the refusal is reported once per process")
         self.assertIn("no no-replace rename", self.lines[0])
 
     def test_any_other_kernel_error_raises_and_moves_nothing(self):
@@ -566,37 +594,31 @@ class CoreContract(unittest.TestCase):
         self.assertFalse((self.results / "task-b.txt").exists())
         self.assertEqual(self.lines, [])
 
-    def test_the_probe_names_link_where_no_primitive_is_known(self):
+    def test_the_probe_names_no_primitive_where_none_is_known(self):
         with unittest.mock.patch.object(sys, "platform", "freebsd14"):
-            self.assertEqual(disposal._probe_rename(), ("link", None))
+            self.assertEqual(disposal._probe_rename(), ("none", None))
 
-    def test_the_link_fallback_completes_a_plain_move(self):
-        a = self.result("A")
+    def test_without_a_primitive_a_rewritten_reply_stays_in_its_claim_for_recovery(self):
+        # The undo of a post-verification rewrite needs a put-back; without the
+        # primitive the body goes back into the private claim, never quarantine.
+        r = self.result("answer")
+        _, gen = identity_of(r)
+        real_rename = os.rename
+
+        def rewrite_before_the_move(src, dst, *a, **kw):
+            if ".disposing-" in str(src) and "undelivered" in str(dst):
+                with open(src, "r+b") as fh:
+                    fh.seek(0); fh.write(b"ANSWER")
+                os.utime(src, ns=(gen.mtime_ns, gen.mtime_ns))
+            return real_rename(src, dst, *a, **kw)
         with unittest.mock.patch.object(disposal, "_RENAME", None), \
-                unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "link"):
-            disposal.rename_noreplace(a, self.results / "task-b.txt", self.lines.append)
-            self.assertFalse(a.exists())
-            self.assertEqual((self.results / "task-b.txt").read_text(), "A")
-            # A taken name is refused at the link, nothing moved.
-            self.result("C", stem="task-c")
-            with self.assertRaises(FileExistsError):
-                disposal.rename_noreplace(self.results / "task-b.txt", self.results / "task-c.txt")
-            self.assertEqual((self.results / "task-b.txt").read_text(), "A")
-
-    def test_the_link_fallback_is_quiet_when_the_source_vanishes_before_the_verify(self):
-        a = self.result("A")
-        real_stat = os.stat
-
-        def source_gone(path, *args, **kw):
-            if Path(path) == a:
-                raise FileNotFoundError(errno.ENOENT, "gone", str(path))
-            return real_stat(path, *args, **kw)
-        with unittest.mock.patch.object(disposal, "_RENAME", None), \
-                unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "link"), \
-                unittest.mock.patch.object(os, "stat", source_gone):
-            disposal.rename_noreplace(a, self.results / "task-b.txt", self.lines.append)
-        self.assertEqual((self.results / "task-b.txt").read_text(), "A")
-        self.assertTrue(a.exists(), "nothing is unlinked on a verify it could not make")
+                unittest.mock.patch.object(disposal, "RENAME_PRIMITIVE", "none"), \
+                unittest.mock.patch.object(os, "rename", rewrite_before_the_move):
+            with self.assertRaises(disposal.GenerationReplaced):
+                disposal.quarantine_generation(self.results, r, gen, self.lines.append)
+        self.assertEqual(self.quarantined(), [])
+        self.assertEqual([c.read_text() for c in disposal.find_claims(self.results)], ["ANSWER"])
+        self.assertTrue(any("kept in its claim" in l for l in self.lines), "\n".join(self.lines))
 
     def test_the_lock_refuses_a_fifo(self):
         # A FIFO opens read-write without blocking, so only the regular-file check stops it.
@@ -639,30 +661,154 @@ class CoreContract(unittest.TestCase):
         self.assertEqual(cm.exception.errno, errno.ESTALE)
         self.assertEqual(len(seen), 8)
 
-    def test_a_sole_link_claim_is_kept_as_a_superseded_copy(self):
+    def test_a_duplicate_name_is_kept_where_the_operator_looks(self):
         c = self.claim(nonce="ab00000c")
         self.result("only copy").rename(c)
-        disposal._drop_link(c, self.lines.append, "task-a", self.results)
+        disposal._keep_duplicate(c, self.lines.append, "task-a", self.results)
         self.assertFalse(c.exists())
         self.assertEqual([p.read_text() for p in self.results.glob("undelivered/task-a-*.txt")], ["only copy"])
         self.assertEqual(len(self.lines), 1)
-        self.assertIn("superseded reply was kept", self.lines[0])
+        self.assertIn("kept as", self.lines[0])
 
-    def test_a_rewrite_during_the_final_move_is_named_in_the_log(self):
-        r = self.result("answer")
-        _, gen = identity_of(r)
+    def rewrite_at_the_final_move(self, gen, new=b"ANSWER"):
+        # The producer rewrites the claimed inode in place between the
+        # verification and the final rename, same size, original mtime restored.
         real_rename = os.rename
 
         def rewrite_then_move(src, dst, *a, **kw):
             if ".disposing-" in str(src) and "undelivered" in str(dst):
-                with open(src, "a") as fh:                 # the producer rewrites the claimed inode
-                    fh.write(" and more")
+                with open(src, "r+b") as fh:
+                    fh.seek(0); fh.write(new)
+                os.utime(src, ns=(gen.mtime_ns, gen.mtime_ns))
             return real_rename(src, dst, *a, **kw)
-        with unittest.mock.patch.object(os, "rename", rewrite_then_move):
-            target = disposal.quarantine_generation(self.results, r, gen, self.lines.append)
-        self.assertEqual(target.read_text(), "answer and more")
+        return unittest.mock.patch.object(os, "rename", rewrite_then_move)
+
+    def test_a_rewrite_after_verification_goes_back_live_not_into_quarantine(self):
+        r = self.result("answer")
+        _, gen = identity_of(r)
+        with self.rewrite_at_the_final_move(gen):
+            with self.assertRaises(disposal.GenerationReplaced):
+                disposal.quarantine_generation(self.results, r, gen, self.lines.append)
+        self.assertEqual(r.read_text(), "ANSWER", "the rewritten reply is live, not quarantined")
+        self.assertEqual(self.quarantined(), [])
+        self.assertEqual(disposal.find_claims(self.results), [])
         self.assertEqual(len(self.lines), 1)
-        self.assertIn("rewritten in place during the move", self.lines[0])
+        self.assertIn("rewritten after verification", self.lines[0])
+
+    def test_a_rewrite_after_verification_with_the_name_retaken_waits_in_its_claim(self):
+        r = self.result("answer")
+        _, gen = identity_of(r)
+        real = disposal.rename_noreplace
+
+        def producer_first(src, dst, *a, **kw):
+            if "undelivered" in str(src):                 # the undo's put-back finds the name taken
+                tmp = self.results / "task-a.newest"
+                tmp.write_text("NEWEST")
+                os.replace(tmp, self.results / "task-a.txt")
+            return real(src, dst, *a, **kw)
+        with self.rewrite_at_the_final_move(gen), \
+                unittest.mock.patch.object(disposal, "rename_noreplace", producer_first):
+            with self.assertRaises(disposal.GenerationReplaced):
+                disposal.quarantine_generation(self.results, r, gen, self.lines.append)
+        self.assertEqual(r.read_text(), "NEWEST")
+        self.assertEqual(self.quarantined(), [])
+        self.assertEqual([c.read_text() for c in disposal.find_claims(self.results)], ["ANSWER"])
+        self.assertIn("kept in its claim", self.lines[-1])
+        # The next pass judges it again: its name is taken, so it is kept visible.
+        disposal.recover_abandoned_claims(self.results, self.lines.append)
+        self.assertEqual([p.read_text() for p in self.quarantined()], ["ANSWER"])
+        self.assertEqual(disposal.find_claims(self.results), [])
+
+    def test_recovery_re_verifies_the_body_after_its_own_move(self):
+        # A dead owner's claim is verified, then rewritten in place at the
+        # final rename: recovery puts the changed reply back live, not quarantine.
+        r = self.result("answer")
+        _, gen = identity_of(r)
+        c = self.claim(nonce="ab000012")                  # names the very publication it holds
+        r.rename(c)
+        with self.rewrite_at_the_final_move(gen):
+            self.assertEqual(disposal.recover_claim(self.results, c, self.lines.append), r)
+        self.assertEqual(r.read_text(), "ANSWER")
+        self.assertEqual(self.quarantined(), [])
+        self.assertEqual(disposal.find_claims(self.results), [])
+        self.assertEqual(len(self.lines), 1)
+        self.assertIn("rewritten after verification", self.lines[0])
+
+    def test_a_move_that_cannot_be_re_verified_stays_where_it_went_and_says_so(self):
+        r = self.result("answer")
+        _, gen = identity_of(r)
+        calls = []
+        real = disposal._verify_fd
+
+        def emfile_after_the_move(fd, generation):
+            calls.append(1)
+            if len(calls) == 2:
+                raise OSError(errno.EMFILE, "Too many open files")
+            return real(fd, generation)
+        with unittest.mock.patch.object(disposal, "_verify_fd", emfile_after_the_move):
+            target = disposal.quarantine_generation(self.results, r, gen, self.lines.append)
+        self.assertEqual(target.read_text(), "answer")
+        self.assertEqual(len(self.lines), 1)
+        self.assertIn("could not re-verify", self.lines[0])
+
+    def test_a_precheck_error_skips_the_pass_and_is_said_once(self):
+        real = Path.is_dir
+
+        def eio(self_):
+            if self_ == results:
+                raise OSError(errno.EIO, "Input/output error")
+            return real(self_)
+        results = self.results
+        with unittest.mock.patch.object(Path, "is_dir", eio):
+            for _ in range(3):
+                disposal.recover_abandoned_claims(self.results, self.lines.append)
+        self.assertEqual(len(self.lines), 1, "\n".join(self.lines))
+        self.assertIn("recovery skipped this pass", self.lines[0])
+
+    def test_an_undo_whose_moved_file_was_taken_elsewhere_is_quiet(self):
+        # The name is retaken after the move and the quarantined copy is taken
+        # by someone else before the undo: nothing of ours is left, nothing said.
+        r = self.result("answer")
+        _, gen = identity_of(r)
+        real = os.rename
+
+        def rewrite_retake_then_lose(src, dst, *a, **kw):
+            if ".disposing-" in str(src) and "undelivered" in str(dst):
+                with open(src, "r+b") as fh:
+                    fh.seek(0); fh.write(b"ANSWER")
+                os.utime(src, ns=(gen.mtime_ns, gen.mtime_ns))
+                real(src, dst, *a, **kw)
+                tmp = self.results / "task-a.newest"
+                tmp.write_text("NEWEST")
+                os.replace(tmp, self.results / "task-a.txt")
+                return None
+            if "undelivered" in str(src) and ".disposing-" in str(dst):
+                raise FileNotFoundError(errno.ENOENT, "taken elsewhere", str(src))
+            return real(src, dst, *a, **kw)
+        with unittest.mock.patch.object(os, "rename", rewrite_retake_then_lose):
+            with self.assertRaises(disposal.GenerationReplaced):
+                disposal.quarantine_generation(self.results, r, gen, self.lines.append)
+        self.assertEqual(r.read_text(), "NEWEST")
+        self.assertEqual(disposal.find_claims(self.results), [])
+        self.assertEqual(self.lines, [])
+
+    def test_a_claim_recovery_cannot_read_is_left_alone(self):
+        c = self.claim(nonce="ab000014")
+        self.result("answer").rename(c)
+
+        def emfile(fd, generation):
+            raise OSError(errno.EMFILE, "Too many open files")
+        with unittest.mock.patch.object(disposal, "_verify_fd", emfile):
+            self.assertIsNone(disposal.recover_claim(self.results, c, self.lines.append))
+        self.assertEqual(c.read_text(), "answer", "untouched until it can be read")
+        self.assertEqual(self.lines, [])
+
+    def test_a_claim_that_is_not_a_regular_file_is_never_moved(self):
+        c = self.claim(nonce="ab000013")
+        c.mkdir()
+        self.assertIsNone(disposal.recover_claim(self.results, c, self.lines.append))
+        self.assertTrue(c.is_dir())
+        self.assertFalse((self.results / "task-a.txt").exists())
 
     def test_a_claim_that_cannot_be_matched_proves_nothing_to_the_loser(self):
         # An EMFILE while matching a claim is skipped (the copies before it did not match).

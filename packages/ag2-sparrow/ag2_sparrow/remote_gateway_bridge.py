@@ -4187,8 +4187,13 @@ def _read_ready_generation(rfile) -> "tuple[str | None, ResultIdentity | None]":
 
 
 def _recover_disposing_claims() -> None:
-    """Every drain pass and sweep: the lifecycle owner recovers stranded claims."""
-    disposal.recover_abandoned_claims(RESULTS_DIR, _log)
+    """Every drain pass and sweep: the lifecycle owner recovers stranded
+    claims. Recovery serves the operator; it never gates ordinary delivery."""
+    try:
+        disposal.recover_abandoned_claims(RESULTS_DIR, _log)
+    except Exception as e:  # noqa: BLE001 - the adapter boundary fails open
+        disposal.report_once(f"recovery:{RESULTS_DIR}", _log,
+                             f"result disposal: recovery failed ({e}); delivery continues")
 
 
 def _disposed_copy_exists(tid: str, generation) -> bool:
