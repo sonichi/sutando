@@ -186,28 +186,64 @@ def write_proactive(results: Path, name: str, body: str) -> Path:
 # Text arrives as argv, never spliced into the script; item 1 is a fixed sentinel so a
 # question starting with "-" is not read as an osascript option.
 _DIALOG_SCRIPT = (
+    "use framework \"AppKit\"",
+    "use scripting additions",
     "on run argv",
     "set msg to \"Sutando couldn't message you. Question: \" & item 2 of argv",
     "if (count of argv) > 2 then",
     "set r to display dialog msg with title \"Sutando\" buttons {\"Later\", \"Open Pending questions\"} "
     "default button \"Open Pending questions\"",
-    "if button returned of r is \"Open Pending questions\" then open location (item 3 of argv)",
+    "if button returned of r is \"Open Pending questions\" then",
+    "set target to item 3 of argv",
+    "if (count of argv) > 3 then",
+    "set deepURL to current application's NSURL's URLWithString:(item 4 of argv)",
+    "if deepURL is not missing value then",
+    "set appURL to current application's NSWorkspace's sharedWorkspace()'s URLForApplicationToOpenURL:deepURL",
+    "if appURL is not missing value then set target to item 4 of argv",
+    "end if",
+    "end if",
+    "open location target",
+    "end if",
     "else",
     "display dialog msg with title \"Sutando\" buttons {\"OK\"} default button \"OK\"",
     "end if",
     "end run",
 )
 DIALOG_QUESTION_MAX = 1000
+_ROW_PATH_RE = re.compile(r"^/(?:room|home)/(?P<room>[^/?#]+)(?:/(?P<event>[^/?#]+))?/?$")
+
+
+def app_deep_link(link: Optional[str]) -> Optional[str]:
+    """The AG2 Space app's link for a row's https link (hash or path route): scheme ag2space, host
+    home, path <room>[/<event>]/, query surface/page; None when the link does not parse."""
+    from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit  # noqa: PLC0415
+    try:
+        u = urlsplit(link or "")
+    except ValueError:
+        return None
+    if u.scheme not in ("https", "http") or not u.netloc:
+        return None
+    route = u.fragment if u.fragment.startswith("/") else u.path + (f"?{u.query}" if u.query else "")
+    path, _, query = route.partition("?")
+    m = _ROW_PATH_RE.match(path)
+    if not m:
+        return None
+    parts = [quote(unquote(m.group(g)), safe="") for g in ("room", "event") if m.group(g)]
+    q = parse_qs(query)
+    params = "&".join(f"{k}={quote(q[k][0], safe='')}" for k in ("surface", "page") if q.get(k))
+    return urlunsplit(("ag2space", "home", "/" + "/".join(parts) + "/", params, ""))
 
 
 def dialog_argv(question: str, link: Optional[str] = None) -> list:
+    """Item 3 is the row's https link, item 4 its app deep link; the script picks at click time."""
     q = question.strip()
     if len(q) > DIALOG_QUESTION_MAX:
         q = q[:DIALOG_QUESTION_MAX - 1] + "…"
     argv = ["osascript"]
     for line in _DIALOG_SCRIPT:
         argv += ["-e", line]
-    return argv + ["sutando", q] + ([link] if link else [])
+    deep = app_deep_link(link) if link else None
+    return argv + ["sutando", q] + ([link] if link else []) + ([deep] if deep else [])
 
 
 def show_dialog(question: str, link: Optional[str] = None) -> tuple:

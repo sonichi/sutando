@@ -511,6 +511,35 @@ class TestFailOpen(_Workspace):
         self.assertNotIn("giving up", script)
         self.assertEqual(out["macos"], True)
 
+    def test_the_app_deep_link_is_derived_from_the_row_link(self):
+        cases = {
+            "https://chat.ag2.space/#/room/!r1:ag2.space?surface=db&page=pendingq":
+                "ag2space://home/%21r1%3Aag2.space/?surface=db&page=pendingq",
+            "https://chat.ag2.space/home/%21r1%3Aag2.space?surface=db&page=pendingq":
+                "ag2space://home/%21r1%3Aag2.space/?surface=db&page=pendingq",
+            "https://chat.ag2.space/#/home/!r1:ag2.space/$ev1/": "ag2space://home/%21r1%3Aag2.space/%24ev1/",
+            "https://chat.ag2.space/#/room/!r1:ag2.space?page=pendingq":
+                "ag2space://home/%21r1%3Aag2.space/?page=pendingq",
+            "https://chat.ag2.space/#/room/!r1:ag2.space": "ag2space://home/%21r1%3Aag2.space/",
+        }
+        for link, deep in cases.items():
+            self.assertEqual(pqa.app_deep_link(link), deep, link)
+        for bad in (None, "", "not a link", "https://chat.ag2.space/#/settings", "ftp://x/#/room/!r:a",
+                    "https://chat.ag2.space/#/room/", "https://example.test/row"):
+            self.assertIsNone(pqa.app_deep_link(bad), bad)
+
+    def test_open_prefers_the_app_only_when_it_handles_the_deep_link(self):
+        link = "https://chat.ag2.space/#/room/!r1:ag2.space?surface=db&page=pendingq"
+        argv = pqa.dialog_argv("q?", link)
+        self.assertEqual(argv[-4:], ["sutando", "q?", link,
+                                     "ag2space://home/%21r1%3Aag2.space/?surface=db&page=pendingq"])
+        script = "\n".join(argv[2:-4:2])
+        self.assertNotIn("ag2space", script, "links are argv, never script text")
+        self.assertIn("set target to item 3 of argv", script)
+        self.assertIn("URLForApplicationToOpenURL:deepURL", script)
+        self.assertIn("if appURL is not missing value then set target to item 4 of argv", script)
+        self.assertIn("open location target", script)
+
     def test_question_text_is_argv_never_script(self):
         evil = '-e" & (do shell script "touch /tmp/x") & "'
         argv = pqa.dialog_argv(evil, None)
