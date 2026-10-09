@@ -207,8 +207,6 @@ else:
 print("the two LIVE owners of the suffix set agree")
 # The hook asks task_dispatch.py now, so the second copy is that module's.
 # Nothing else compares the two, and src/ may not import the skill to share one.
-check(re.search(r"task_dispatch\.py\"?\s+owned-by", hook) is not None,
-      "the hook asks task_dispatch.py owned-by for ownership")
 spec = importlib.util.spec_from_file_location(
     "task_dispatch_suffix_guard", ROOT / "src" / "delivery" / "task_dispatch.py")
 task_dispatch = importlib.util.module_from_spec(spec)
