@@ -284,16 +284,12 @@ class DesignAClaimBackend:
             if rec is None or rec.drainer_id != token.worker or \
                     self._incarnation_of(item_id) != token.incarnation:
                 return False
-            item = outbox._read_item(self.root, item_id)
             if ambiguous:
                 # Persisted before the outcome: the taint outlives retries,
                 # restarts and an operator requeue of this same cycle.
+                item = outbox._read_item(self.root, item_id)
                 item["cycle_ambiguous"] = True
-            # This attempt is classified now; the pending mark it began with
-            # would otherwise taint the cycle as an attempt that never returned.
-            if item.pop("dispatch_pending", None):
-                item["attempts_classified"] = int(item.get("attempts_classified", 0) or 0) + 1
-            outbox._write_item(self.root, item_id, item)
+                outbox._write_item(self.root, item_id, item)
             if outcome is DeliveryOutcome.CONFIRMED:
                 outbox.record_delivered(self.root, item_id,
                                         provider=provider, destination=destination)
@@ -308,6 +304,12 @@ class DesignAClaimBackend:
                 attempts = outbox.note_attempt(self.root, item_id)
                 if park_at_attempts is not None and attempts >= park_at_attempts:
                     outbox.park_item(self.root, item_id, "max-attempts")
+            # The pending mark outlives the outcome write: a crash before the
+            # outcome is durable leaves the attempt unclassified, never clean.
+            item = outbox._read_item(self.root, item_id)
+            if item.pop("dispatch_pending", None):
+                item["attempts_classified"] = int(item.get("attempts_classified", 0) or 0) + 1
+                outbox._write_item(self.root, item_id, item)
             return outbox._release_locked(self.root, item_id, token.worker)
 
     def resend_epoch(self, item_id: str) -> int:

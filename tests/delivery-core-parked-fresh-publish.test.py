@@ -499,6 +499,28 @@ core.deliver_one(item, body.encode())
 """
 
 
+_CHILD_DEATH_AT_RECORD = r"""
+import os, sys, json, pathlib
+sys.path.insert(0, sys.argv[1])
+from ag2_sparrow import outbox
+from ag2_sparrow.delivery_core import DesignAClaimBackend, DeliveryCore, RetryPolicy
+from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceResultProvider
+root, store, item, body = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4], sys.argv[5]
+def request(method, path, payload):
+    store.write_text(json.dumps(payload))        # the broker stored A and confirmed it ...
+    return {"ok": True, "duplicate": False}
+def die(*a, **k):
+    os._exit(17)                                 # ... and the owner died entering record_delivered()
+outbox.record_delivered = die
+backend = DesignAClaimBackend(root, reclaim_ttl_s=0.0)
+core = DeliveryCore(backend, AG2SpaceResultProvider(request),
+                    policy=RetryPolicy(max_attempts=3, defer_idempotent_resend=True),
+                    worker="gateway-result-drain")
+assert backend.publish(item, body.encode())
+core.deliver_one(item, body.encode())
+"""
+
+
 class AStartedAttemptThatNeverClassifiesTaintsTheCycle(unittest.TestCase):
     """The taint used to be written in complete(), after the provider call, so
     an attempt that landed A and then died or raised left no mark; a later
@@ -547,6 +569,27 @@ class AStartedAttemptThatNeverClassifiesTaintsTheCycle(unittest.TestCase):
         backend, core = self._core(broker)
         rec = outbox._read_item(backend.root, ITEM)
         self.assertTrue(rec.get("dispatch_pending"), "the dead attempt's mark is on the record")
+        self._then_refused_and_b_is_not_admitted(broker, backend, core, 0)
+
+    def test_an_owner_that_dies_before_the_outcome_is_durable_keeps_its_mark(self):
+        """The mark used to be cleared in the write BEFORE the outcome's own
+        write; a crash between the two left READY with started == classified."""
+        store = self.tmp / "broker-store.json"
+        proc = subprocess.run([sys.executable, "-c", _CHILD_DEATH_AT_RECORD, str(_PKG),
+                               str(self.tmp / ".outbox"), str(store), ITEM, FIRST.decode()],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 17, proc.stderr[-400:])
+        self.assertEqual(json.loads(store.read_text())["body"], "first reply",
+                         "the broker stored and confirmed A before the owner died")
+        broker = _Broker("accept")
+        broker.stored[ITEM] = json.loads(store.read_text())
+        backend, core = self._core(broker)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertNotEqual(rec.get("status"), "DELIVERED", "the outcome never became durable")
+        self.assertTrue(rec.get("dispatch_pending"),
+                        "the mark outlives a crash before the outcome write")
+        self.assertNotEqual(rec.get("attempts_started"), rec.get("attempts_classified"),
+                            "an attempt whose outcome never landed on disk is not classified")
         self._then_refused_and_b_is_not_admitted(broker, backend, core, 0)
 
     def _raising_after_store(self, exc):
