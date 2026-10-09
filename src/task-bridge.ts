@@ -522,12 +522,13 @@ export function isVoiceSubmittedTask(taskId: string): boolean {
 	return _pendingTasks.has(taskId) || _isVoiceTask(taskId);
 }
 
-/** A queued voice task was cancelled: archive its file and close its card; the core's reply to `instructionId` is not spoken. */
+/** A queued voice task was cancelled: delete its file and close its card; the core's reply to `instructionId` is not spoken. */
 export function noteVoiceTaskCancelled(taskId: string, instructionId: string): void {
 	_cancelledVoiceTasks.add(taskId);
 	_cancelInstructions.add(instructionId);
 	_pendingTasks.delete(taskId);
-	archiveFile(join(TASK_DIR, `${taskId}.txt`), 'tasks', taskId);
+	// Deleted, not archived: a core that misses the file looks in tasks/archive/ and runs what it finds there.
+	try { unlinkSync(join(TASK_DIR, `${taskId}.txt`)); } catch { /* already gone */ }
 	_sendTaskStatus?.(taskId, 'done', 'Cancelled.');
 }
 

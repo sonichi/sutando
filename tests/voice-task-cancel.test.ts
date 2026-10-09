@@ -71,14 +71,14 @@ beforeEach(() => {
 });
 
 describe('cancel_task decides from the task state', () => {
-	it('a queued task is cancelled: instruction written, task file archived, card closed, no "Cancelled." result', async () => {
+	it('a queued task is cancelled: instruction written, task file deleted, card closed, no "Cancelled." result', async () => {
 		const id = submit('draw a car');
 		const out = await cancel();
 		assert.equal(out.status, 'cancelled');
 		assert.equal(out.taskId, id);
 		assert.equal(cancelInstructions().length, 1);
 		assert.ok(!existsSync(join(TMP, 'tasks', `${id}.txt`)));
-		assert.ok(archivedTask(id), 'archived, so its header stays readable');
+		assert.ok(!archivedTask(id), 'not in tasks/archive/ either, where a core missing the file would find and run it');
 		assert.ok(!existsSync(join(TMP, 'results', `${id}.txt`)), 'no stub result');
 		assert.ok(statuses.some((s) => s.taskId === id && s.status === 'done' && s.text === 'Cancelled.'));
 		assert.ok(!_pendingTasksForTest.has(id), 'out of the timeout sweep');
@@ -163,7 +163,6 @@ describe('cancel_task decides from the task state', () => {
 		writeFileSync(join(TMP, 'results', `${id}.txt`), "Here's your boat.");
 		await tick(2_500);
 		assert.deepEqual(spoken, [{ text: "Here's your boat.", note: CANCELLED_BUT_FINISHED_NOTE }]);
-		assert.ok(tb._isVoiceTask(id), 'still a voice task, so its result is archived here, not left for another bridge');
 	});
 
 	it('a task this session did not submit is never reported cancelled, and its file is left alone', async () => {
