@@ -310,7 +310,7 @@ from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
                             RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core.provider_ag2space import AG2SpaceResultProvider
-from .result_ready import read_ready_result
+from .result_ready import read_ready_result, read_ready_result_with_identity, identity_of, ResultIdentity
 from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
 from .send_allowlist import is_path_sendable
@@ -4178,8 +4178,63 @@ def _delivery_core() -> DeliveryCore:
     return _DELIVERY_CORE
 
 
+def _read_ready_generation(rfile) -> "tuple[str | None, ResultIdentity | None]":
+    """The body the drain will send and the identity of the file it came from."""
+    ready = read_ready_result_with_identity(rfile)
+    return (ready.body, ready.identity) if ready else (None, None)
+
+
+_DISPOSING = ".{stem}.disposing-{pid}-{nonce}"
+
+
+def _quarantine_generation(rfile, generation: ResultIdentity) -> Path:
+    """Quarantine `rfile` only if it still IS `generation`. The rename to a
+    private claim name is the atomic step; a different file found there is a
+    newer reply and goes back, the observed one is reported as not found."""
+    rfile = Path(rfile)
+    claim = rfile.with_name(_DISPOSING.format(stem=rfile.stem, pid=os.getpid(),
+                                              nonce=uuid.uuid4().hex[:8]))
+    os.rename(rfile, claim)                       # FileNotFoundError: nothing there
+    _, found = identity_of(claim)
+    if found == generation:
+        d = undelivered_quarantine.quarantine_dir(RESULTS_DIR)
+        d.mkdir(parents=True, exist_ok=True)
+        target = d / undelivered_quarantine.quarantine_name(rfile.stem)
+        os.rename(claim, target)
+        return target
+    try:
+        os.link(claim, rfile)
+        os.unlink(claim)
+    except FileExistsError:
+        # Yet another reply landed meanwhile; the one we hold is superseded but
+        # is still someone's answer, so it is kept where the operator looks.
+        d = undelivered_quarantine.quarantine_dir(RESULTS_DIR)
+        d.mkdir(parents=True, exist_ok=True)
+        kept = d / undelivered_quarantine.quarantine_name(rfile.stem)
+        os.rename(claim, kept)
+        _log(f"result {rfile.stem}: a superseded reply was kept as {kept.name}")
+    raise FileNotFoundError(str(rfile))
+
+
+def _disposed_copy_exists(tid: str, generation: ResultIdentity) -> bool:
+    """True when the bytes this pass read already sit in quarantine or in
+    another observer's claim; scanned twice because a claim can become a
+    quarantined copy between the two listings."""
+    stem = f"task-{tid}" if not str(tid).startswith("task-") else str(tid)
+    for _ in range(2):
+        copies = list(undelivered_quarantine.find_quarantined(RESULTS_DIR, tid))
+        copies += list(RESULTS_DIR.glob(_DISPOSING.format(stem=stem, pid="*", nonce="*")))
+        for p in copies:
+            try:
+                if identity_of(p)[1].digest == generation.digest:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
-                            since_ns=None) -> None:
+                            generation=None) -> None:
     """Move a result the outbox has finally refused into results/undelivered/,
     the same quarantine the proactive path uses. Without this the file is
     rescanned every pass and the refusal is invisible.
@@ -4189,7 +4244,10 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
     recovers both halves.
     """
     try:
-        undelivered_quarantine.quarantine(rfile, RESULTS_DIR)
+        if generation is None:
+            undelivered_quarantine.quarantine(rfile, RESULTS_DIR)
+        else:
+            _quarantine_generation(rfile, generation)
         _log(f"result {tid}: {why} — quarantined to "
              f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
              f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
@@ -4197,20 +4255,14 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
              f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
     except FileNotFoundError:
         # Two observers can reach a terminal item at once; the loser is quiet
-        # only once the winner's copy is verifiably in quarantine.
-        if since_ns is not None and not Path(rfile).exists() \
-                and _quarantined_since(tid, since_ns):
+        # only when the very bytes it read are already disposed of.
+        if generation is not None and _disposed_copy_exists(tid, generation):
             return
         _log(f"result {tid}: {why} but the result file vanished before "
-             "quarantine and no quarantined copy was found")
+             "quarantine and no quarantined copy of the body this pass read was found")
     except OSError as e:
         _log(f"result {tid}: {why} but quarantine failed ({e}) — "
              "leaving it in place")
-
-
-def _quarantined_since(tid: str, since_ns: int) -> bool:
-    copies = undelivered_quarantine.find_quarantined(RESULTS_DIR, tid)
-    return bool(copies) and int(copies[-1].stem.rsplit("-", 1)[-1]) >= since_ns
 
 
 def _is_worker_id(value: str) -> bool:
@@ -4435,12 +4487,13 @@ def _worker_of(task_id: str) -> str:
 
 
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
-                            no_send: bool = False, result_file=None) -> bool:
+                            no_send: bool = False, result_file=None,
+                            generation=None) -> bool:
     """One outbound result POST through the delivery core. True = the
     gateway confirmed (server lease closed; caller archives). False = not
-    confirmed this pass; leave the result file for the next one."""
+    confirmed this pass; leave the result file for the next one.
+    `generation` is the file the caller read; disposal touches only that."""
     core = _delivery_core()
-    started = time.time_ns()
     # `no_send` is the broker's STRUCTURED suppression field: the lease must
     # close without a user-facing send. It rides the payload, not the body.
     doc = {"id": broker_tid, "body": body}
@@ -4456,7 +4509,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
                "record and no completion residue - withholding rather than "
                "publishing an unattributed result as the core's own")
         if result_file is not None:
-            _quarantine_undelivered(result_file, tid, why)
+            _quarantine_undelivered(result_file, tid, why, generation=generation)
         else:
             _log(f"result {tid}: {why} - not published, not delivered")
         return False
@@ -4476,7 +4529,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
             return True
         # The outbox has decided this item; no pass will ever claim it again,
         # so retrying logs forever and hides the failure behind "will retry".
-        _dispose_terminal(core, item_id, tid, record, result_file, started)
+        _dispose_terminal(core, item_id, tid, record, result_file, generation)
         return False
     if res.status is DrainStatus.NOT_CLAIMED:
         # A dead prior incarnation's claim; reclaim-TTL recovers it, and
@@ -4499,7 +4552,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     if record.get("status") == "PARKED":
         # Parked by this very attempt: dispose now, or the next pass logs the
         # refusal a second time before the file leaves the drain's view.
-        _dispose_terminal(core, item_id, tid, record, result_file, started)
+        _dispose_terminal(core, item_id, tid, record, result_file, generation)
         return False
     retry = record.get("retry", {})
     _log(f"result POST not confirmed for {tid} "
@@ -4517,12 +4570,12 @@ def _effective_item_id(core, broker_tid: str, no_send: bool) -> str:
 
 
 def _dispose_terminal(core, item_id: str, tid: str, record: dict, result_file,
-                      since_ns=None) -> None:
+                      generation=None) -> None:
     why = (f"outbox item is terminal: {record.get('reason')} after "
            f"{core.backend.attempts(item_id)} attempt(s)")
     if result_file is not None:
         _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id,
-                                since_ns=since_ns)
+                                generation=generation)
     else:
         _log(f"result {tid}: {why} — not retrying")
 
@@ -4600,7 +4653,7 @@ def _post_ready_results(inflight: set[str]) -> None:
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        raw = read_ready_result(rfile)
+        raw, generation = _read_ready_generation(rfile)
         if raw is None:
             continue
         # Before the tier guard: a withheld review would name the shared room as its release target.
@@ -4647,7 +4700,8 @@ def _post_ready_results(inflight: set[str]) -> None:
                         continue
                     if not _deliver_result_payload(tid, _broker_tid(_delivery),
                                                   "[no-send]" if mention else payload,
-                                                  no_send=bool(mention), result_file=rfile):
+                                                  no_send=bool(mention), result_file=rfile,
+                                                  generation=generation):
                         continue
                 _holder = (skip.extra or "").strip()
                 # An out-of-grammar holder is sender-controlled; name its shape,
@@ -4676,7 +4730,8 @@ def _post_ready_results(inflight: set[str]) -> None:
                 continue
             if not _deliver_result_payload(tid, _broker_tid(_delivery),
                                            _lease_close_body(skip),
-                                           no_send=True, result_file=rfile):
+                                           no_send=True, result_file=rfile,
+                                           generation=generation):
                 continue
             _archive_result(rfile, tid)
             # Retire the provenance WITH the result, never at read: this line is
@@ -4742,7 +4797,8 @@ def _post_ready_results(inflight: set[str]) -> None:
                 continue
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
-        if not _deliver_result_payload(tid, _wire, out_body, result_file=rfile):
+        if not _deliver_result_payload(tid, _wire, out_body, result_file=rfile,
+                                       generation=generation):
             continue
         _archive_result(rfile, tid)
         inflight.discard(tid)
@@ -4925,7 +4981,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # Genuinely undelivered: ONE labeled attempt — at-least-once by
         # design; the label makes the rare duplicate self-explaining.
-        raw = read_ready_result(rfile)
+        raw, generation = _read_ready_generation(rfile)
         if raw is None:
             continue
         delivery = _delivery_tid(tid)
@@ -4969,7 +5025,8 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         # Same outcome owner as the live drain: a 2xx {"ok": false} is a
         # refusal, and an unconfirmed close must keep its retryable result.
         _btid = _broker_tid(delivery)
-        if _deliver_result_payload(tid, _btid, labeled, no_send=bool(skip), result_file=rfile):
+        if _deliver_result_payload(tid, _btid, labeled, no_send=bool(skip), result_file=rfile,
+                                   generation=generation):
             _archive_result(rfile, tid)
             _log(f"orphan sweep: recovered + gateway accepted {tid}; Matrix delivery unconfirmed")
             continue
