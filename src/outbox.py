@@ -890,6 +890,28 @@ def read_item(root: Path, item_id: str) -> Optional[dict]:
     return _read_item(Path(root), item_id)
 
 
+def source_proof(record: dict) -> Optional[str]:
+    """The record's source digest, only while it still describes the stored payload:
+    a writer that replaced the payload without it leaves a proof of another body."""
+    proof, payload = record.get("source_ready_sha256"), record.get("payload")
+    if not proof or not isinstance(payload, str):
+        return None
+    if record.get("source_payload_sha256") != hashlib.sha256(payload.encode("utf-8")).hexdigest():
+        return None
+    return proof
+
+
+def source_proof_fields(source_ready_sha256: Optional[str], payload: str) -> dict:
+    """Every source-proof field, written together with the payload they vouch for."""
+    if not source_ready_sha256:
+        return {}
+    return {"source_ready_sha256": source_ready_sha256,
+            "source_payload_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest()}
+
+
+SOURCE_PROOF_FIELDS = ("source_ready_sha256", "source_payload_sha256", "source_sha256")
+
+
 def source_digest(ready_body: str) -> str:
     """The digest an outbox record keeps of the result it was built from: the
     readiness-normalized body, so surrounding whitespace is the same source."""
@@ -899,17 +921,19 @@ def source_digest(ready_body: str) -> str:
 def delivered_body_differs(root: Path, item_id: str, ready_body: Optional[str]) -> bool:
     """True when the id is DELIVERED and a live result whose ready body is
     `ready_body` was never provably what was sent (None: nothing provable).
-    Decided on the record's `source_ready_sha256`. A record without it (including
-    one carrying only the earlier `source_sha256`, whose meaning is not trusted)
-    proves only a source identical to its stored wire body; any marker a path
-    strips or acts on ([dm-only], [channel:], [file:]...) makes it unprovable."""
+    Decided on the record's source proof (`source_proof`), valid only while it
+    describes the stored payload. A record without a valid proof (an earlier
+    `source_sha256`, or a payload replaced without it) proves only a source
+    identical to its stored wire body; any marker a path strips or acts on
+    ([dm-only], [channel:], [file:]...) makes it unprovable."""
     d = read_item(root, item_id)
     if not d or d.get("status") != "DELIVERED":
         return False
     if ready_body is None:
         return True
-    if d.get("source_ready_sha256"):
-        return d["source_ready_sha256"] != source_digest(ready_body)
+    proof = source_proof(d)
+    if proof:
+        return proof != source_digest(ready_body)
     try:
         stored = json.loads(d.get("payload") or "")
     except (TypeError, ValueError):
@@ -1025,10 +1049,8 @@ def adopt_resend_payload_locked(root: Path, item_id: str, payload: str,
     d["payload"] = payload
     d["published_at"] = time.time()
     d["resend_adopted_epoch"] = epoch
-    d.pop("source_sha256", None)                     # an earlier digest field, never trusted
-    if source_ready_sha256:
-        d["source_ready_sha256"] = source_ready_sha256
-    else:
-        d.pop("source_ready_sha256", None)           # a stale source would vouch for these bytes
+    for field in SOURCE_PROOF_FIELDS:                # a proof of the replaced body never survives
+        d.pop(field, None)
+    d.update(source_proof_fields(source_ready_sha256, payload))
     _write_item(root, item_id, d)
     return True

@@ -669,14 +669,22 @@ class DeliveredBodyDiffers(unittest.TestCase):
 
     def test_cases(self):
         env = json.dumps({"id": ITEM, "body": "A"})
+        other = json.dumps({"id": ITEM, "body": "B"})
         dig = outbox.source_digest
+
+        def proof(source, payload=env):
+            return outbox.source_proof_fields(dig(source), payload)
         for name, fields, live, differs in (
                 ("no record", None, "C", False),
-                ("queued", {"status": "QUEUED", "payload": env, "source_ready_sha256": dig("A")}, "C", False),
+                ("queued", {"status": "QUEUED", "payload": env, **proof("A")}, "C", False),
                 ("delivered, same source", {"status": "DELIVERED", "payload": env,
-                                            "source_ready_sha256": dig("[dm-only]\nA")}, "[dm-only]\nA", False),
+                                            **proof("[dm-only]\nA")}, "[dm-only]\nA", False),
                 ("delivered, other source, same wire body", {"status": "DELIVERED", "payload": env,
-                                                             "source_ready_sha256": dig("A")}, "[dm-only]\nA", True),
+                                                             **proof("A")}, "[dm-only]\nA", True),
+                ("delivered, a proof written for another payload (stale), unchanged body",
+                 {"status": "DELIVERED", "payload": env, **proof("B", other)}, "A", False),
+                ("delivered, a proof with no payload binding", {"status": "DELIVERED", "payload": env,
+                                                               "source_ready_sha256": dig("B")}, "A", False),
                 ("legacy delivered, identical unmarked source", {"status": "DELIVERED", "payload": env}, "A", False),
                 ("legacy delivered, marked source", {"status": "DELIVERED", "payload": env}, "[dm-only]\nA", True),
                 ("legacy delivered, other source", {"status": "DELIVERED", "payload": env}, "C", True),
@@ -688,7 +696,7 @@ class DeliveredBodyDiffers(unittest.TestCase):
                 ("delivered, earlier source_sha256 only, marked body",
                  {"status": "DELIVERED", "payload": env, "source_sha256": dig("[dm-only]\nA")}, "[dm-only]\nA", True),
                 ("delivered, nothing readable live", {"status": "DELIVERED", "payload": env,
-                                                      "source_ready_sha256": dig("A")}, None, True)):
+                                                      **proof("A")}, None, True)):
             with self.subTest(case=name), TemporaryDirectory() as td:
                 root = self._rec(td, **fields) if fields is not None else Path(td) / "ob"
                 self.assertIs(outbox.delivered_body_differs(root, ITEM, live), differs)
@@ -699,16 +707,19 @@ class DeliveredBodyDiffers(unittest.TestCase):
     def test_an_adoption_without_a_source_drops_the_stale_one(self):
         with TemporaryDirectory() as td:
             root = self._rec(td, status="QUEUED", payload="A", resend_epoch=1, attempts=0,
-                             source_ready_sha256="sA", source_sha256="raw")
+                             source_ready_sha256="sA", source_payload_sha256="pA", source_sha256="raw")
             with outbox._item_lock(root, ITEM):
                 self.assertTrue(outbox.adopt_resend_payload_locked(root, ITEM, "B"))
             rec = outbox.read_item(root, ITEM)
             self.assertNotIn("source_ready_sha256", rec)
             self.assertNotIn("source_sha256", rec, "an earlier digest field never survives an adoption")
+            self.assertNotIn("source_payload_sha256", rec)
             outbox._write_item(root, ITEM, dict(outbox.read_item(root, ITEM), resend_epoch=2))
             with outbox._item_lock(root, ITEM):
                 self.assertTrue(outbox.adopt_resend_payload_locked(root, ITEM, "C", "sC"))
-            self.assertEqual(outbox.read_item(root, ITEM)["source_ready_sha256"], "sC")
+            rec = outbox.read_item(root, ITEM)
+            self.assertEqual(rec["source_ready_sha256"], "sC")
+            self.assertEqual(outbox.source_proof(rec), "sC", "the proof is bound to the adopted payload")
 
 
 class CliRenderingAndErrorPaths(unittest.TestCase):

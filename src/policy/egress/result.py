@@ -311,10 +311,12 @@ def _holds(path: Path, field: str, body: str) -> bool:
 
 
 def _record_for(path_of, state_dir: Path, task_id: str, body: str, field: str) -> Path:
-    """The record path for this exact body: the task-keyed one unless it already
-    holds another body of the same task, then one keyed by this body's digest."""
+    """The record path for this exact body: the task-keyed one unless another body
+    of the task ever used that id (live, or archived after resolution), then one
+    keyed by this body's digest. A record applies only to the body it holds."""
     first = path_of(state_dir, task_id)
-    if not first.exists() or _holds(first, field, body):
+    used = [p for p in (first, first.parent / "archive" / first.name) if p.exists()]
+    if all(_holds(p, field, body) for p in used):
         return first
     return path_of(state_dir, task_id, _body_digest(body))
 
@@ -331,8 +333,8 @@ def is_attach_only_withhold(body: str) -> bool:
     return "attach" in kinds and "redirect" not in kinds
 
 
-def quarantined_attachment_path(state_dir: Path, task_id: str) -> Path:
-    return Path(state_dir) / SUPPRESSED_RESULT_DIR / f"qa_{withheld_review_id(task_id)}.json"
+def quarantined_attachment_path(state_dir: Path, task_id: str, body_digest: str = "") -> Path:
+    return Path(state_dir) / SUPPRESSED_RESULT_DIR / f"qa_{withheld_review_id(task_id, body_digest)}.json"
 
 
 def journal_quarantined_attachment(body: str, state_dir: Path, task_id: str,
@@ -349,16 +351,17 @@ def journal_quarantined_attachment(body: str, state_dir: Path, task_id: str,
         os.chmod(directory, 0o700)
     except OSError:
         return False
+    record = _record_for(quarantined_attachment_path, state_dir, task_id, body, "withheld_body")
     payload = {
         "schema_version": 1,
-        "record_id": withheld_review_id(task_id),
+        "record_id": record.stem[len("qa_"):],
         "task_id": task_id,
         "status": "withheld_attachment_pending",
         "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
         "withheld_body": body,
     }
     try:
-        return _write_artifact(quarantined_attachment_path(state_dir, task_id), payload, "withheld_body")
+        return _write_artifact(record, payload, "withheld_body")
     except OSError:
         # best-effort for real: a failed record costs the release option,
         # never the already-decided withhold and never the delivery loop

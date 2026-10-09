@@ -302,6 +302,27 @@ def behavioral() -> list:
             guard.tempfile.mkstemp = original_mkstemp
         if unsaved.body != guard.TEAM_LEAK_RESULT_UNSAVED:
             fails.append("artifact write exceptions must return the fail-closed verdict")
+
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "state"
+        first = guard.journal_quarantined_attachment("[file: /tmp/b.txt]\nB", state, "task-qa", now=1000)
+        second = guard.journal_quarantined_attachment("[file: /tmp/c.txt]\nC", state, "task-qa", now=1001)
+        kept = sorted(json.loads(p.read_text())["withheld_body"]
+                      for p in (state / guard.SUPPRESSED_RESULT_DIR).glob("qa_*.json"))
+        if not (first and second) or kept != ["[file: /tmp/b.txt]\nB", "[file: /tmp/c.txt]\nC"]:
+            fails.append("each attach-only withheld body of one task needs its own release record")
+
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "state"
+        b_path = guard.withheld_review_artifact(state, "task-arch", "B body")
+        b_path.parent.mkdir(parents=True)
+        (b_path.parent / "archive").mkdir()
+        (b_path.parent / "archive" / b_path.name).write_text(json.dumps({"withheld_body": "B body"}))
+        c_path = guard.withheld_review_artifact(state, "task-arch", "C body")
+        if c_path.name == b_path.name:
+            fails.append("a resolved and archived review id must never be reused for another body")
+        if guard.withheld_review_artifact(state, "task-arch", "B body") != b_path:
+            fails.append("the archived body keeps its own review id")
     return fails
 
 

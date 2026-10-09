@@ -4504,6 +4504,10 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
     if ready is None:
         _log(f"result {tid}: {why}; it is not readable now, left for the next pass")
         return
+    if generation is not None and ready.identity != generation:
+        # The ruling was about the reply the caller read; this is another one.
+        _log(f"result {tid}: the reply changed after it was ruled on; left for the next pass")
+        return
     # Every decision below is about this generation, and only it is moved.
     raw, generation = ready.body, ready.identity
     mention = _owner_mention_disposition(tid, raw)

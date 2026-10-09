@@ -62,7 +62,7 @@ class Gateway:
 
     accepting = False
 
-    def request(self, method, path, payload):
+    def request(self, method, path, payload, **_kw):
         self.calls.append(dict(payload))
         if self.accepting:
             return {'ok': True}
@@ -1121,6 +1121,80 @@ class TerminalResultMovedOnce(unittest.TestCase):
                 self.assertIn('[file: /tmp/c.txt]\nBODY-C', routed)
                 self.assertFalse(result.exists())
                 self.assertEqual(len(self.server.calls), posts)
+
+    def test_a_resolved_review_id_is_never_reused_for_a_later_body(self):
+        """B is reviewed, resolved and archived; C gets its own review id, its own
+        messages (the gateway dedupes on that id), and B's archive is untouched."""
+        from ag2_sparrow import team_result_guard as trg
+        with patch.object(gw, '_gateway_owner', return_value='@owner:ag2.space'), \
+                patch.object(gw, '_owner_review_dm', return_value='!ownerdm:ag2.space'):
+            result, posts = self._team_delivered_then_late('[file: /tmp/b.txt]\nBODY-B')
+            hot = self.root / 'state' / trg.WITHHELD_RESULT_DIR
+            (b_path,) = hot.glob('wr_*.json')
+            b = json.loads(b_path.read_text())
+            self.assertEqual(b['status'], 'awaiting_owner')
+            b['status'] = 'kept_private'
+            b_path.write_text(json.dumps(b))
+            self.assertTrue(gw._archive_resolved_review(b_path, b))
+            self._late(result, '[file: /tmp/c.txt]\nBODY-C')
+            (c_path,) = hot.glob('wr_*.json')
+        c = json.loads(c_path.read_text())
+        self.assertNotEqual(c['review_id'], b['review_id'])
+        self.assertEqual((c['withheld_body'], c['status']), ('[file: /tmp/c.txt]\nBODY-C', 'awaiting_owner'))
+        keys = [p.get('dedupe_key', '') for p in self.server.calls]
+        self.assertTrue(any(c['review_id'] in k for k in keys), keys)
+        self.assertTrue(any('BODY-C' in str(p.get('body')) for p in self.server.calls))
+        archived = json.loads((hot / 'archive' / b_path.name).read_text())
+        self.assertEqual(archived['withheld_body'], '[file: /tmp/b.txt]\nBODY-B')
+
+    def test_a_reply_replaced_between_its_ruling_and_its_disposal_is_judged_again(self):
+        """C is ruled different; the delivered A is put back before the disposal
+        rereads the file: A is not disposed of on C's ruling."""
+        real, fired = gw.delivered_body_differs, []
+
+        def rule_then_put_a_back(root, item_id, ready_body):
+            out = real(root, item_id, ready_body)
+            if out and not fired:
+                fired.append(1)
+                tmp = self.results / '.producer.tmp'
+                tmp.write_text('BODY-A the reply')
+                os.replace(tmp, self.results / f'{TID}.txt')
+            return out
+        with patch.object(gw, 'delivered_body_differs', rule_then_put_a_back):
+            result, posts = self._delivered_then_late('BODY-C a different reply')
+        self.assertEqual(fired, [1])
+        self.assertEqual(result.read_text(), 'BODY-A the reply', 'A was disposed of on C\'s ruling')
+        self.assertEqual(self.quarantined_bodies(), [])
+        self._late(result, 'BODY-A the reply')
+        self.assertFalse(result.exists())
+        self.assertEqual(self.quarantined_bodies(), [])
+        self.assertEqual(len(list((self.results / 'archive').rglob(f'{TID}-*-late-duplicate*.txt'))), 1)
+        self.assertEqual(len(self.server.calls), posts)
+        self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
+
+    def test_a_payload_adopted_by_an_earlier_writer_never_keeps_this_heads_proof(self):
+        """This head parks A with a proof; an earlier writer adopts B (payload and its
+        own source_sha256, keeping fields it does not know); B is delivered. The proof
+        of A no longer describes the payload, so the unchanged B is a duplicate."""
+        self.bridge()
+        self.task()
+        result = self.result('BODY-A first answer')
+        gw._post_ready_results({TID})                            # 400: parked with A's proof
+        self.assertTrue(outbox.read_item(self.outbox, TID).get('source_ready_sha256'))
+        outbox.requeue_item(self.outbox, TID, reset_attempts=True)
+        rec = outbox.read_item(self.outbox, TID)
+        rec.update(payload=json.dumps({'id': TID, 'body': 'BODY-B newer answer'}),
+                   resend_adopted_epoch=rec['resend_epoch'],
+                   source_sha256=hashlib.sha256(b'BODY-B newer answer').hexdigest())
+        outbox._write_item(self.outbox, TID, rec)                # what the earlier adopt wrote
+        result.write_text('BODY-B newer answer')
+        self.server.accepting = True
+        gw._post_ready_results({TID})
+        self.assertEqual([c.get('body') for c in self.server.calls][-1], 'BODY-B newer answer')
+        self.assertEqual(outbox.item_status(self.outbox, TID), 'DELIVERED')
+        self.assertEqual(self.quarantined_bodies(), ['BODY-A first answer'], 'only the refused A')
+        self.assertIn('BODY-B newer answer', self._archived_bodies())
+        self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
 
     def test_a_replacement_before_retirement_is_judged_on_its_own(self):
         from ag2_sparrow import team_result_guard as trg
