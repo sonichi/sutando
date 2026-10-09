@@ -899,16 +899,17 @@ def source_digest(ready_body: str) -> str:
 def delivered_body_differs(root: Path, item_id: str, ready_body: Optional[str]) -> bool:
     """True when the id is DELIVERED and a live result whose ready body is
     `ready_body` was never provably what was sent (None: nothing provable).
-    Decided on the record's `source_sha256`. A record without it proves only a
-    source identical to its stored wire body; any marker a path strips or acts on
-    ([dm-only], [channel:], [file:]...) makes the source unprovable, so it fails closed."""
+    Decided on the record's `source_ready_sha256`. A record without it (including
+    one carrying only the earlier `source_sha256`, whose meaning is not trusted)
+    proves only a source identical to its stored wire body; any marker a path
+    strips or acts on ([dm-only], [channel:], [file:]...) makes it unprovable."""
     d = read_item(root, item_id)
     if not d or d.get("status") != "DELIVERED":
         return False
     if ready_body is None:
         return True
-    if d.get("source_sha256"):
-        return d["source_sha256"] != source_digest(ready_body)
+    if d.get("source_ready_sha256"):
+        return d["source_ready_sha256"] != source_digest(ready_body)
     try:
         stored = json.loads(d.get("payload") or "")
     except (TypeError, ValueError):
@@ -999,7 +1000,7 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
 
 
 def adopt_resend_payload_locked(root: Path, item_id: str, payload: str,
-                                source_sha256: Optional[str] = None) -> bool:
+                                source_ready_sha256: Optional[str] = None) -> bool:
     """Under the caller's `_item_lock`: a requeued record awaiting its resend
     takes the bytes being published now, once per resend epoch, keeping its
     epoch and attempts. Keyed on the epoch every requeue writer has bumped, so a
@@ -1024,9 +1025,10 @@ def adopt_resend_payload_locked(root: Path, item_id: str, payload: str,
     d["payload"] = payload
     d["published_at"] = time.time()
     d["resend_adopted_epoch"] = epoch
-    if source_sha256:
-        d["source_sha256"] = source_sha256
+    d.pop("source_sha256", None)                     # an earlier digest field, never trusted
+    if source_ready_sha256:
+        d["source_ready_sha256"] = source_ready_sha256
     else:
-        d.pop("source_sha256", None)                 # a stale source would vouch for these bytes
+        d.pop("source_ready_sha256", None)           # a stale source would vouch for these bytes
     _write_item(root, item_id, d)
     return True

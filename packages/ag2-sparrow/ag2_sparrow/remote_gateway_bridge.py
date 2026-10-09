@@ -328,7 +328,7 @@ GATEWAY_REDELIVERY_RESULT = "[no-send] gateway redelivery of already-handled tas
 
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
-_WITHHELD_TASK_OUTPUT: "dict[str, tuple]" = {}
+_WITHHELD_TASK_OUTPUT: "dict[tuple, tuple]" = {}
 _WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
 _WITHHELD_CONTROL_DIR = _STATE / "withheld-review-control-results"
 _GATEWAY_OWNER_DM_HINT = ""
@@ -645,12 +645,13 @@ def _team_guard_fns():
         materialize_withheld_verdict,
         resolve_access_tier,
         sensitive_data_filter_enabled,
+        withheld_review_artifact,
         withheld_review_path,
     )
     return (classify_result_for_tier, materialize_withheld_verdict,
             resolve_access_tier, sensitive_data_filter_enabled,
             withheld_review_path, journal_suppressed_result,
-            is_suppression_only, is_guarded_tier)
+            is_suppression_only, is_guarded_tier, withheld_review_artifact)
 
 
 def _atomic_private_json(path: Path, payload: dict) -> None:
@@ -1135,11 +1136,13 @@ def _guarded_result_body(tid: str, body: str):
     # not consume it — a deferred POST retries and needs the same provenance.
     if tid in _REDELIVERED and _is_redelivery_control(body):
         return body, None
-    if tid in _WITHHELD_TASK_OUTPUT:
-        return _WITHHELD_TASK_OUTPUT[tid]
+    # A verdict is about one body: a later, different result of the task is judged anew.
+    cached = (tid, source_digest(body))
+    if cached in _WITHHELD_TASK_OUTPUT:
+        return _WITHHELD_TASK_OUTPUT[cached]
     try:
-        (classify, materialize, resolve, filter_enabled, review_path,
-         journal_suppression, suppression_only, guarded_tier) = _team_guard_fns()
+        (classify, materialize, resolve, filter_enabled, _review_path,
+         journal_suppression, suppression_only, guarded_tier, review_artifact) = _team_guard_fns()
         from .chat_secret_filter import filter_chat_secrets
     except Exception as exc:
         return None, f"team_result_guard unavailable: {exc}"
@@ -1183,7 +1186,7 @@ def _guarded_result_body(tid: str, body: str):
             verdict, body, _STATE, tid, context=context, agent_id=agent_id,
             now=time.time())
     if is_leak:
-        artifact = review_path(_STATE, tid)
+        artifact = review_artifact(_STATE, tid, body)
         if not artifact.is_file():
             return None, verdict.reason
         try:
@@ -1193,7 +1196,7 @@ def _guarded_result_body(tid: str, body: str):
             return None, f"{verdict.reason}; private owner review failed: {exc}"
     result = (verdict.body, verdict.reason)
     if verdict.reason is not None:
-        _WITHHELD_TASK_OUTPUT[tid] = result
+        _WITHHELD_TASK_OUTPUT[cached] = result
         if len(_WITHHELD_TASK_OUTPUT) > 512:
             _WITHHELD_TASK_OUTPUT.pop(next(iter(_WITHHELD_TASK_OUTPUT)))
     return result
@@ -4498,7 +4501,11 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
         _log(f"result {tid}: {why} — not retrying")
         return
     ready = read_ready_result_with_identity(result_file)
-    raw = ready.body if ready else ""
+    if ready is None:
+        _log(f"result {tid}: {why}; it is not readable now, left for the next pass")
+        return
+    # Every decision below is about this generation, and only it is moved.
+    raw, generation = ready.body, ready.identity
     mention = _owner_mention_disposition(tid, raw)
     if mention is None:
         _log(f"result {tid}: {why}; its owner-mention routing is unavailable, left for the next pass")
@@ -4517,7 +4524,6 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
     actions = parse_markers(body).actions
     skip = next((a for a in actions if a.kind == "skip"), None)
     if skip is not None:
-        generation = generation or ready.identity     # a skip marker was read, so `ready` is set
         done = disposal.retire_generation(RESULTS_DIR, result_file, generation, _log,
                                           ARCHIVE_RESULTS_DIR, _names(f"{tid}-{int(time.time())}-suppressed"))
         what = (f"withheld by the result guard ({withheld})" if withheld
@@ -4577,7 +4583,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     live = _live_source(result_file, generation)
     # With no result file there is nothing live to protect; the body sent is this call's.
     ruled = live if result_file is not None else body
-    source = ({"source_sha256": source_digest(live)}
+    source = ({"source_ready_sha256": source_digest(live)}
               if live is not None and getattr(core.backend, "records_source_digest", False) else {})
     if item_id != broker_tid:
         core.backend.publish(item_id, payload, republish_delivered=True, **source)

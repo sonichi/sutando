@@ -284,13 +284,44 @@ def _bounded_context(context) -> dict:
     return {key: str(context.get(key) or "")[:512] for key in keys}
 
 
-def withheld_review_id(task_id: str) -> str:
-    identity = task_id.encode() if task_id else os.urandom(32)
+def withheld_review_id(task_id: str, body_digest: str = "") -> str:
+    """Task-keyed for a task's first recorded body; a later, different body of the
+    same task gets its own id, keyed by the digest of that body."""
+    if not task_id:
+        identity = os.urandom(32)
+    else:
+        identity = (task_id + ("\0" + body_digest if body_digest else "")).encode()
     return f"wr_{hashlib.sha256(identity).hexdigest()[:16]}"
 
 
-def withheld_review_path(state_dir: Path, task_id: str) -> Path:
-    return Path(state_dir) / WITHHELD_RESULT_DIR / f"{withheld_review_id(task_id)}.json"
+def withheld_review_path(state_dir: Path, task_id: str, body_digest: str = "") -> Path:
+    return Path(state_dir) / WITHHELD_RESULT_DIR / f"{withheld_review_id(task_id, body_digest)}.json"
+
+
+def _body_digest(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _holds(path: Path, field: str, body: str) -> bool:
+    """The record at `path` is about exactly `body`; unreadable is not a match."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get(field) == body
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _record_for(path_of, state_dir: Path, task_id: str, body: str, field: str) -> Path:
+    """The record path for this exact body: the task-keyed one unless it already
+    holds another body of the same task, then one keyed by this body's digest."""
+    first = path_of(state_dir, task_id)
+    if not first.exists() or _holds(first, field, body):
+        return first
+    return path_of(state_dir, task_id, _body_digest(body))
+
+
+def withheld_review_artifact(state_dir: Path, task_id: str, body: str) -> Path:
+    """Where the private review of this exact withheld body lives."""
+    return _record_for(withheld_review_path, state_dir, task_id, body, "withheld_body")
 
 
 def is_attach_only_withhold(body: str) -> bool:
@@ -327,16 +358,18 @@ def journal_quarantined_attachment(body: str, state_dir: Path, task_id: str,
         "withheld_body": body,
     }
     try:
-        return _write_artifact(quarantined_attachment_path(state_dir, task_id), payload)
+        return _write_artifact(quarantined_attachment_path(state_dir, task_id), payload, "withheld_body")
     except OSError:
         # best-effort for real: a failed record costs the release option,
         # never the already-decided withhold and never the delivery loop
         return False
 
 
-def _write_artifact(path: Path, payload: dict) -> bool:
+def _write_artifact(path: Path, payload: dict, field: str) -> bool:
+    """True only when `path` holds a record of this payload's body: an existing
+    record of another body is never claimed as written."""
     if path.is_file():
-        return True
+        return _holds(path, field, payload[field])
     fd, temporary = tempfile.mkstemp(prefix=".withheld-", suffix=".tmp", dir=path.parent)
     try:
         if os.name != "nt":
@@ -354,7 +387,7 @@ def _write_artifact(path: Path, payload: dict) -> bool:
                 os.link(temporary, path)
         except FileExistsError:
             pass
-        return path.is_file()
+        return _holds(path, field, payload[field])
     finally:
         try:
             os.unlink(temporary)
@@ -376,10 +409,10 @@ def materialize_withheld_verdict(verdict: TeamResultVerdict, body: str,
         os.chmod(directory, 0o700)
     except OSError:
         return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT_UNSAVED, verdict.reason)
-    artifact = withheld_review_path(state_dir, task_id)
+    artifact = withheld_review_artifact(state_dir, task_id, body)
     payload = {
         "schema_version": 2,
-        "review_id": withheld_review_id(task_id),
+        "review_id": artifact.stem,
         "status": "pending_dm",
         "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
         "task_id": task_id,
@@ -389,7 +422,7 @@ def materialize_withheld_verdict(verdict: TeamResultVerdict, body: str,
         "withheld_body": body,
     }
     try:
-        saved = _write_artifact(artifact, payload)
+        saved = _write_artifact(artifact, payload, "withheld_body")
     except Exception:  # noqa: BLE001 — storage failure must remain fail-closed
         saved = False
     if not saved:
@@ -398,8 +431,13 @@ def materialize_withheld_verdict(verdict: TeamResultVerdict, body: str,
         VERDICT_SUPPRESS, "[no-send]", f"{verdict.reason}; pending private owner review")
 
 
-def suppressed_record_path(state_dir: Path, task_id: str) -> Path:
-    return Path(state_dir) / SUPPRESSED_RESULT_DIR / f"{withheld_review_id(task_id)}.json"
+def suppressed_record_path(state_dir: Path, task_id: str, body_digest: str = "") -> Path:
+    return Path(state_dir) / SUPPRESSED_RESULT_DIR / f"{withheld_review_id(task_id, body_digest)}.json"
+
+
+def suppressed_record_for(state_dir: Path, task_id: str, body: str) -> Path:
+    """Where the suppression record of this exact body lives."""
+    return _record_for(suppressed_record_path, state_dir, task_id, body, "suppressed_body")
 
 
 def journal_suppressed_result(verdict: TeamResultVerdict, body: str,
@@ -422,9 +460,10 @@ def journal_suppressed_result(verdict: TeamResultVerdict, body: str,
     except OSError:
         return TeamResultVerdict(VERDICT_SUPPRESS, TEAM_SUPPRESS_RESULT,
                                  "suppression record unwritable")
+    record = suppressed_record_for(state_dir, task_id, body)
     payload = {
         "schema_version": 1,
-        "record_id": withheld_review_id(task_id),
+        "record_id": record.stem,
         "status": "suppressed_silent_close",
         "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
         "task_id": task_id,
@@ -434,7 +473,7 @@ def journal_suppressed_result(verdict: TeamResultVerdict, body: str,
         "suppressed_body": body,
     }
     try:
-        saved = _write_artifact(suppressed_record_path(state_dir, task_id), payload)
+        saved = _write_artifact(record, payload, "suppressed_body")
     except Exception:  # noqa: BLE001 -- storage failure must remain fail-closed
         saved = False
     if not saved:

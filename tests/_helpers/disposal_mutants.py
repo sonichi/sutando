@@ -30,12 +30,15 @@ IN_QUARANTINE = {"fallback-links-then-unlinks", "place-replaces-a-taken-name",
 CLI = [REPO / "src" / "outbox_cli.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox_cli.py"]
 BRIDGE = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"]
 OUTBOX = [REPO / "src" / "outbox.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox.py"]
-IN_OUTBOX = {"delivered-rule-compares-the-composed-body", "adopt-keeps-a-stale-source", "delivered-body-never-differs", "adopt-trusts-an-untagged-baseline", "adopt-after-an-attempt", "adopt-requires-a-marker", "adopt-a-never-requeued-record", "adopt-ignores-a-claim",
+IN_OUTBOX = {"reader-trusts-the-earlier-digest", "delivered-rule-compares-the-composed-body", "adopt-keeps-a-stale-source", "delivered-body-never-differs", "adopt-trusts-an-untagged-baseline", "adopt-after-an-attempt", "adopt-requires-a-marker", "adopt-a-never-requeued-record", "adopt-ignores-a-claim",
              "adopt-every-publish"}
 IN_CLI = {"cli-exits-0-on-no-safe-move", "cli-reads-epoch-after-lock", "cli-parks-on-no-safe-move"}
 BACKEND = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "delivery_core" / "backend_a.py"]
 IN_BACKEND = {"publish-drops-the-source"}
-IN_BRIDGE = {"late-duplicate-hashes-the-raw-bytes", "unsent-skips-the-guard", "unsent-skips-owner-mention",
+GUARD = [REPO / "src" / "policy" / "egress" / "result.py",
+         REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "team_result_guard.py"]
+IN_GUARD = {"artifact-claims-another-body", "record-path-ignores-the-body"}
+IN_BRIDGE = {"verdict-cache-keyed-by-task", "late-duplicate-hashes-the-raw-bytes", "unsent-skips-the-guard", "unsent-skips-owner-mention",
              "unsent-ignores-suppression", "unsent-ignores-restriction",              "confirmed-archives-another-body", "terminal-delivered-archives-another-body",
              "late-duplicate-archives-another-body", "orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
@@ -183,16 +186,21 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "    return False and stored.get(\"body\") != ready_body\n"),
     "delivered-rule-compares-the-composed-body": (
         "the delivered-id rule compares composed wire bodies even when the source digest is known",
-        "    if d.get(\"source_sha256\"):\n        return d[\"source_sha256\"] != source_digest(ready_body)\n",
-        "    if False and d.get(\"source_sha256\"):\n        return d[\"source_sha256\"] != source_digest(ready_body)\n"),
+        "    if d.get(\"source_ready_sha256\"):\n        return d[\"source_ready_sha256\"] != source_digest(ready_body)\n",
+        "    if False and d.get(\"source_ready_sha256\"):\n        return d[\"source_ready_sha256\"] != source_digest(ready_body)\n"),
+    "reader-trusts-the-earlier-digest": (
+        "the delivered-id rule reinterprets an earlier source_sha256 as a ready-body digest",
+        "    if d.get(\"source_ready_sha256\"):\n        return d[\"source_ready_sha256\"] != source_digest(ready_body)\n",
+        "    if d.get(\"source_ready_sha256\") or d.get(\"source_sha256\"):\n"
+        "        return (d.get(\"source_ready_sha256\") or d.get(\"source_sha256\")) != source_digest(ready_body)\n"),
     "publish-drops-the-source": (
         "the delivery backend's publish never persists the source digest",
-        "            if source_sha256:\n                record[\"source_sha256\"] = source_sha256\n",
-        "            if False:\n                record[\"source_sha256\"] = source_sha256\n"),
+        "            if source_ready_sha256:\n                record[\"source_ready_sha256\"] = source_ready_sha256\n",
+        "            if False:\n                record[\"source_ready_sha256\"] = source_ready_sha256\n"),
     "adopt-keeps-a-stale-source": (
         "an adoption with no known source keeps the digest of the body it replaced",
-        "        d.pop(\"source_sha256\", None)                 # a stale source would vouch for these bytes\n",
-        "        d.get(\"source_sha256\", None)                 # a stale source would vouch for these bytes\n"),
+        "        d.pop(\"source_ready_sha256\", None)           # a stale source would vouch for these bytes\n",
+        "        d.get(\"source_ready_sha256\", None)           # a stale source would vouch for these bytes\n"),
     "adopt-trusts-an-untagged-baseline": (
         "a requeue baseline is trusted whatever epoch wrote it",
         "        tagged = int(d.get(\"requeued_attempts_epoch\", -1)) == epoch\n",
@@ -253,12 +261,24 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "    mention = False\n    if mention is None:\n        _log(f\"result {tid}: {why}; its owner"),
     "unsent-ignores-suppression": (
         "a suppressed reply at a delivered id is quarantined and handed over for sending",
-        "    if skip is not None:\n        generation = generation or ready.identity",
-        "    if False:\n        generation = generation or ready.identity"),
+        "    if skip is not None:\n        done = disposal.retire_generation(",
+        "    if False:\n        done = disposal.retire_generation("),
     "unsent-ignores-restriction": (
         "a restricted reply at a delivered id is handed over as one to send by hand",
         "    if any(a.kind == \"dm-only\" for a in actions):\n        because = (",
         "    if False:\n        because = ("),
+    "verdict-cache-keyed-by-task": (
+        "the result guard reuses a task's withheld verdict for a different body",
+        "    cached = (tid, source_digest(body))\n",
+        "    cached = (tid, \"\")\n"),
+    "artifact-claims-another-body": (
+        "an existing review or suppression record of another body counts as written",
+        "    if path.is_file():\n        return _holds(path, field, payload[field])\n",
+        "    if path.is_file():\n        return True\n"),
+    "record-path-ignores-the-body": (
+        "a later body of a task reuses the task-keyed record path",
+        "    if not first.exists() or _holds(first, field, body):\n        return first\n",
+        "    if True:\n        return first\n"),
     "orphan-links-then-unlinks": (
         "an orphan arm moves the canonical result itself: link, then unlink its name",
         "        done = disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))\n",
@@ -278,6 +298,8 @@ def _files(name: str) -> "list[Path]":
         return OUTBOX
     if name in IN_BACKEND:
         return BACKEND
+    if name in IN_GUARD:
+        return GUARD
     return QUARANTINE if name in IN_QUARANTINE else DISPOSAL
 
 

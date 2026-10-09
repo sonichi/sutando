@@ -923,7 +923,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
     def _forget_the_source(self):
         """The record as a drain from before source digests left it."""
         rec = outbox.read_item(self.outbox, TID)
-        rec.pop('source_sha256', None)
+        rec.pop('source_ready_sha256', None)
         outbox._write_item(self.outbox, TID, rec)
 
     def test_an_identical_late_copy_of_a_marked_reply_is_archived_as_a_duplicate(self):
@@ -1042,7 +1042,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
                 self.setUp()
                 result, posts = self._delivered_then_late(late)
                 rec = outbox.read_item(self.outbox, TID)
-                self.assertEqual(rec.get('source_sha256'),
+                self.assertEqual(rec.get('source_ready_sha256'),
                                  hashlib.sha256('BODY-A the reply'.encode()).hexdigest())
                 self.assertIn(late, self.quarantined_bodies())
                 self.assertNotIn(late, self._archived_bodies())
@@ -1090,6 +1090,95 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertEqual(len(said), 1, self.lines)
         self.assertIn('withheld by the result guard', said[0])
         self.assertNotIn('by hand', said[0])
+
+    def _late(self, result, body):
+        result.write_text(body)
+        os.utime(result, (time.time() - gw.ORPHAN_GRACE_S - 60,) * 2)
+        gw._last_orphan_sweep = 0.0
+        gw._reconcile_orphan_results(set())
+
+    def _records(self, directory, field):
+        d = self.root / 'state' / directory
+        return sorted(json.loads(p.read_text())[field] for p in d.glob('*.json')) if d.is_dir() else []
+
+    def test_each_later_team_attachment_gets_its_own_owner_review(self):
+        """B then C under one task, warm and across a restart: C is reviewed as C,
+        never archived on B's record."""
+        from ag2_sparrow import team_result_guard as trg
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                self.setUp()
+                routed = []
+                route = patch.object(gw, '_route_withheld_review',
+                                     side_effect=lambda p: routed.append(json.loads(p.read_text())['withheld_body']) or True)
+                with route:
+                    result, posts = self._team_delivered_then_late('[file: /tmp/b.txt]\nBODY-B')
+                    if restart:
+                        self.bridge(self.core())             # a fresh process: no in-memory verdicts
+                    self._late(result, '[file: /tmp/c.txt]\nBODY-C')
+                self.assertEqual(self._records(trg.WITHHELD_RESULT_DIR, 'withheld_body'),
+                                 ['[file: /tmp/b.txt]\nBODY-B', '[file: /tmp/c.txt]\nBODY-C'])
+                self.assertIn('[file: /tmp/c.txt]\nBODY-C', routed)
+                self.assertFalse(result.exists())
+                self.assertEqual(len(self.server.calls), posts)
+
+    def test_a_replacement_before_retirement_is_judged_on_its_own(self):
+        from ag2_sparrow import team_result_guard as trg
+        real, fired = disposal.retire_generation, []
+
+        def replace_then_retire(results_dir, rfile, generation, log, directory, names):
+            names = list(names)
+            if not fired and names and '-suppressed' in names[0]:
+                fired.append(1)
+                tmp = Path(rfile).with_name('.producer.tmp')
+                tmp.write_text('[file: /tmp/d.txt]\nBODY-D')
+                os.replace(tmp, rfile)
+            return real(results_dir, rfile, generation, log, directory, names)
+        with patch.object(gw, '_route_withheld_review', return_value=True), \
+                patch.object(disposal, 'retire_generation', replace_then_retire):
+            result, posts = self._team_delivered_then_late('[file: /tmp/c.txt]\nBODY-C')
+            self.assertEqual(fired, [1])
+            self.assertEqual(result.read_text(), '[file: /tmp/d.txt]\nBODY-D', 'D was retired on C\'s decision')
+            self._late(result, '[file: /tmp/d.txt]\nBODY-D')
+        self.assertEqual(self._records(trg.WITHHELD_RESULT_DIR, 'withheld_body'),
+                         ['[file: /tmp/c.txt]\nBODY-C', '[file: /tmp/d.txt]\nBODY-D'])
+        self.assertFalse(result.exists())
+        self.assertEqual(len(self.server.calls), posts)
+
+    def test_two_distinct_team_suppressions_are_both_journalled(self):
+        from ag2_sparrow import team_result_guard as trg
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                self.setUp()
+                result, posts = self._team_delivered_then_late('[no-send]\ninternal note one')
+                if restart:
+                    self.bridge(self.core())
+                self._late(result, '[no-send]\ninternal note two')
+                self.assertEqual(self._records(trg.SUPPRESSED_RESULT_DIR, 'suppressed_body'),
+                                 ['[no-send]\ninternal note one', '[no-send]\ninternal note two'])
+                self.assertFalse(result.exists())
+                self.assertEqual(len(self.server.calls), posts)
+
+    def test_an_earlier_digest_field_is_never_read_as_this_one(self):
+        """A record from an earlier writer of `source_sha256` (raw bytes, or the ready
+        body): an unchanged plain body is a duplicate, never "send it by hand"."""
+        for name, value in (('raw-bytes writer', lambda text: hashlib.sha256(text.encode()).hexdigest()),
+                            ('wrong value', lambda text: '0' * 64)):
+            with self.subTest(writer=name):
+                self.setUp()
+
+                def earlier_writer():
+                    rec = outbox.read_item(self.outbox, TID)
+                    rec.pop('source_ready_sha256', None)
+                    rec['source_sha256'] = value('BODY-A the reply\n')
+                    outbox._write_item(self.outbox, TID, rec)
+                result, posts = self._delivered_then_late('BODY-A the reply\n', first='BODY-A the reply\n',
+                                                          before_late=earlier_writer)
+                self.assertFalse(result.exists())
+                self.assertEqual(self.quarantined_bodies(), [])
+                self.assertEqual(len(list((self.results / 'archive').rglob(f'{TID}-*-late-duplicate*.txt'))), 1)
+                self.assertEqual(len(self.server.calls), posts)
+                self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
 
     def test_an_owner_mention_result_at_a_delivered_id_goes_to_the_owner_dm(self):
         with patch.object(gw, 'resolve_destination', lambda audience, **kw: '!ownerdm:ag2.space'):

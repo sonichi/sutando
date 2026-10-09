@@ -672,19 +672,23 @@ class DeliveredBodyDiffers(unittest.TestCase):
         dig = outbox.source_digest
         for name, fields, live, differs in (
                 ("no record", None, "C", False),
-                ("queued", {"status": "QUEUED", "payload": env, "source_sha256": dig("A")}, "C", False),
+                ("queued", {"status": "QUEUED", "payload": env, "source_ready_sha256": dig("A")}, "C", False),
                 ("delivered, same source", {"status": "DELIVERED", "payload": env,
-                                            "source_sha256": dig("[dm-only]\nA")}, "[dm-only]\nA", False),
+                                            "source_ready_sha256": dig("[dm-only]\nA")}, "[dm-only]\nA", False),
                 ("delivered, other source, same wire body", {"status": "DELIVERED", "payload": env,
-                                                             "source_sha256": dig("A")}, "[dm-only]\nA", True),
+                                                             "source_ready_sha256": dig("A")}, "[dm-only]\nA", True),
                 ("legacy delivered, identical unmarked source", {"status": "DELIVERED", "payload": env}, "A", False),
                 ("legacy delivered, marked source", {"status": "DELIVERED", "payload": env}, "[dm-only]\nA", True),
                 ("legacy delivered, other source", {"status": "DELIVERED", "payload": env}, "C", True),
                 ("legacy delivered, no envelope stored", {"status": "DELIVERED"}, "A", True),
                 ("legacy delivered, unreadable envelope", {"status": "DELIVERED", "payload": "{"}, "A", True),
                 ("legacy delivered, envelope not an object", {"status": "DELIVERED", "payload": "[]"}, "A", True),
+                ("delivered, earlier source_sha256 only, identical body",
+                 {"status": "DELIVERED", "payload": env, "source_sha256": dig("other")}, "A", False),
+                ("delivered, earlier source_sha256 only, marked body",
+                 {"status": "DELIVERED", "payload": env, "source_sha256": dig("[dm-only]\nA")}, "[dm-only]\nA", True),
                 ("delivered, nothing readable live", {"status": "DELIVERED", "payload": env,
-                                                      "source_sha256": dig("A")}, None, True)):
+                                                      "source_ready_sha256": dig("A")}, None, True)):
             with self.subTest(case=name), TemporaryDirectory() as td:
                 root = self._rec(td, **fields) if fields is not None else Path(td) / "ob"
                 self.assertIs(outbox.delivered_body_differs(root, ITEM, live), differs)
@@ -695,14 +699,16 @@ class DeliveredBodyDiffers(unittest.TestCase):
     def test_an_adoption_without_a_source_drops_the_stale_one(self):
         with TemporaryDirectory() as td:
             root = self._rec(td, status="QUEUED", payload="A", resend_epoch=1, attempts=0,
-                             source_sha256="sA")
+                             source_ready_sha256="sA", source_sha256="raw")
             with outbox._item_lock(root, ITEM):
                 self.assertTrue(outbox.adopt_resend_payload_locked(root, ITEM, "B"))
-            self.assertNotIn("source_sha256", outbox.read_item(root, ITEM))
+            rec = outbox.read_item(root, ITEM)
+            self.assertNotIn("source_ready_sha256", rec)
+            self.assertNotIn("source_sha256", rec, "an earlier digest field never survives an adoption")
             outbox._write_item(root, ITEM, dict(outbox.read_item(root, ITEM), resend_epoch=2))
             with outbox._item_lock(root, ITEM):
                 self.assertTrue(outbox.adopt_resend_payload_locked(root, ITEM, "C", "sC"))
-            self.assertEqual(outbox.read_item(root, ITEM)["source_sha256"], "sC")
+            self.assertEqual(outbox.read_item(root, ITEM)["source_ready_sha256"], "sC")
 
 
 class CliRenderingAndErrorPaths(unittest.TestCase):

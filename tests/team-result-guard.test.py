@@ -196,19 +196,24 @@ def behavioral() -> list:
         original_rename = guard.os.rename
         original_fchmod = getattr(guard.os, "fchmod", None)
         try:
-            def raced_link(_temporary, destination):
-                Path(destination).write_text("race winner", encoding="utf-8")
-                raise FileExistsError
+            def raced_link_with(value):
+                def raced_link(_temporary, destination):
+                    Path(destination).write_text(json.dumps({"value": value}), encoding="utf-8")
+                    raise FileExistsError
+                return raced_link
 
-            guard.os.link = raced_link
-            if not guard._write_artifact(directory / "raced.json", {"value": 1}):
-                fails.append("a concurrent artifact winner must count as persisted")
+            guard.os.link = raced_link_with(1)
+            if not guard._write_artifact(directory / "raced.json", {"value": 1}, "value"):
+                fails.append("a concurrent winner recording the same body must count as persisted")
+            guard.os.link = raced_link_with(9)
+            if guard._write_artifact(directory / "raced-other.json", {"value": 1}, "value"):
+                fails.append("a concurrent winner recording another body must not count as persisted")
 
             def consuming_link(temporary, destination):
                 Path(temporary).replace(destination)
 
             guard.os.link = consuming_link
-            if not guard._write_artifact(directory / "consumed.json", {"value": 2}):
+            if not guard._write_artifact(directory / "consumed.json", {"value": 2}, "value"):
                 fails.append("cleanup must tolerate an already-consumed temporary file")
 
             def consuming_rename(temporary, destination):
@@ -220,7 +225,7 @@ def behavioral() -> list:
             guard.os.rename = consuming_rename
             guard.os.fchmod = lambda *_args: (_ for _ in ()).throw(
                 AssertionError("Windows artifact publication must not require fchmod"))
-            if not guard._write_artifact(directory / "windows.json", {"value": 3}):
+            if not guard._write_artifact(directory / "windows.json", {"value": 3}, "value"):
                 fails.append("Windows artifact publication must use atomic rename")
         finally:
             guard.os.name = original_name
