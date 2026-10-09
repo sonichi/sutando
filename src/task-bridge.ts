@@ -424,10 +424,12 @@ export const _pendingTasksForTest = _pendingTasks;
 // task. A snapshot without engagement is still queued; no snapshot at all (a
 // runtime that never writes one) keeps the submission clock.
 export type TaskActivity = 'started' | 'queued' | 'none';
-const ENGAGED_ROW_KINDS = new Set(['working']);
+const ENGAGED_ROW_KINDS: ReadonlySet<string> = new Set(['working']);
+// The core has read the task: too late to cancel it, though it is not yet engaged.
+const HANDED_OVER_ROW_KINDS: ReadonlySet<string> = new Set(['processing', 'working']);
 
-/** Whether the session's own activity hook recorded real work on the task. */
-export function _taskHasWorkingRow(taskId: string): boolean {
+/** Whether the session's own activity hook recorded a row of `kinds` (default: real work) on the task. */
+export function _taskHasWorkingRow(taskId: string, kinds: ReadonlySet<string> = ENGAGED_ROW_KINDS): boolean {
 	const log = join(REPO_DIR, 'state', 'agent-activity.jsonl');
 	if (!existsSync(log)) return false;
 	try {
@@ -436,7 +438,7 @@ export function _taskHasWorkingRow(taskId: string): boolean {
 			let rec: { projection?: unknown; kind?: unknown; task?: { id?: unknown } };
 			try { rec = JSON.parse(line); } catch { continue; }
 			if (!rec || rec.projection === 'TASK_STATUS' || rec.task?.id !== taskId) continue;
-			if (typeof rec.kind === 'string' && ENGAGED_ROW_KINDS.has(rec.kind)) return true;
+			if (typeof rec.kind === 'string' && kinds.has(rec.kind)) return true;
 		}
 	} catch { /* unreadable log: no evidence */ }
 	return false;
@@ -456,10 +458,7 @@ export function _taskActivity(taskId: string): TaskActivity {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Voice task manager: where a task stands, from the core's own records
-// ---------------------------------------------------------------------------
-// Answers from the same records as the timeout clock, so a cancel reports what the core really did.
+// Where a voice task stands, from the core's own records, so a cancel reports what the core really did.
 export type VoiceTaskState = 'queued' | 'started' | 'done' | 'cancelled' | 'unknown';
 
 // Tasks cancelled before the core started them, and the cancel instructions written for them.
@@ -483,13 +482,14 @@ function _hasResult(taskId: string): boolean {
 	return [now, last].some((d) => existsSync(join(RESULT_DIR, 'archive', d.toISOString().slice(0, 7), `${taskId}.txt`)));
 }
 
-/** Where the task stands now. "started" means the core is engaged (see _taskActivity), not just handed it. */
+/** Where the task stands now. "started" means the core has read it (a processing row) or is engaged. */
 export function voiceTaskState(taskId: string): VoiceTaskState {
 	if (_cancelledVoiceTasks.has(taskId)) return 'cancelled';
 	if (_hasResult(taskId)) return 'done';
 	const phase = _activityPhase(taskId);
 	if (phase === 'COMPLETED' || phase === 'FAILED') return 'done';
 	if (phase === 'CANCELLED') return 'cancelled';
+	if (_taskHasWorkingRow(taskId, HANDED_OVER_ROW_KINDS)) return 'started';
 	const activity = _taskActivity(taskId);
 	if (activity !== 'none') return activity;
 	// No snapshot: a task file still in tasks/ is queued; one the core took may be running.
@@ -517,15 +517,17 @@ export function findOpenVoiceTask(query: string): string | undefined {
 		.sort((a, b) => b[1].submittedAt - a[1].submittedAt)[0]?.[0];
 }
 
-/**
- * Called by cancel_task once a queued task is cancelled. The task leaves the
- * timeout sweep, its card closes, and the core's reply to `instructionId` is not
- * spoken: the user was told when they asked.
- */
+/** A task the voice agent submitted: only these may be reported as cancelled outright. */
+export function isVoiceSubmittedTask(taskId: string): boolean {
+	return _pendingTasks.has(taskId) || _isVoiceTask(taskId);
+}
+
+/** A queued voice task was cancelled: archive its file and close its card; the core's reply to `instructionId` is not spoken. */
 export function noteVoiceTaskCancelled(taskId: string, instructionId: string): void {
 	_cancelledVoiceTasks.add(taskId);
 	_cancelInstructions.add(instructionId);
 	_pendingTasks.delete(taskId);
+	archiveFile(join(TASK_DIR, `${taskId}.txt`), 'tasks', taskId);
 	_sendTaskStatus?.(taskId, 'done', 'Cancelled.');
 }
 
@@ -877,15 +879,12 @@ const QUEUE_BOOKKEEPING_PREFIXES = ['task-cron-', 'task-bench-', 'task-workstrea
 
 /** How many owner tasks are pending in `dir` besides `excludeId`: the voice
  *  agent's "N ahead of this one". A directory it cannot read counts as 0 —
- *  the number is a courtesy line, never a reason to fail the delegation.
- *  A task whose result is already in the sibling results/ is done, not ahead. */
+ *  the number is a courtesy line, never a reason to fail the delegation. */
 export function countQueuedAhead(dir: string, excludeId: string): number {
 	let names: string[];
 	try { names = readdirSync(dir); } catch { return 0; }
-	const resultsDir = join(dir, '..', 'results');
 	return names.filter(f => f.startsWith('task-') && f.endsWith('.txt') && f !== `${excludeId}.txt`
-		&& !QUEUE_BOOKKEEPING_PREFIXES.some(p => f.startsWith(p))
-		&& !existsSync(join(resultsDir, f))).length;
+		&& !QUEUE_BOOKKEEPING_PREFIXES.some(p => f.startsWith(p))).length;
 }
 
 /** The sentence the voice agent says when other tasks are ahead; empty when none are. */

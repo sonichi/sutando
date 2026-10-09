@@ -21,7 +21,7 @@
   },
   {
    "name": "cancel_task",
-   "description": "Cancel a task the core has not started yet. Default (no args): the latest task from this conversation that is still open. A task the core already started cannot be stopped partway and a finished one cannot be undone; the result says which, and what to tell the user. Pass `taskId` to cancel a specific task by id (e.g. \"task-1777686932069\"). Pass `query` to cancel the first task whose content contains the substring (case-insensitive). Pass `list: true` to list pending tasks (id + first 60 chars of content) without cancelling. Use when user says \"cancel\", \"nevermind\", \"stop that\", \"what's queued\", \"cancel the one about X\".",
+   "description": "Cancel a task the core has not started yet. Default (no args): the latest still-open task submitted by voice since the voice agent started. A task the core already started cannot be stopped partway and a finished one cannot be undone; the result says which, and what to tell the user. Pass `taskId` to cancel a specific task by id (e.g. \"task-1777686932069\"). Pass `query` to cancel the first task whose content contains the substring (case-insensitive). Pass `list: true` to list pending tasks (id + first 60 chars of content) without cancelling. Use when user says \"cancel\", \"nevermind\", \"stop that\", \"what's queued\", \"cancel the one about X\".",
    "execution": "inline",
    "params": {
     "list": "If true, list pending tasks (id + 60-char preview) without cancelling.",
@@ -31,7 +31,7 @@
   },
   {
    "name": "cancel_task",
-   "description": "Cancel a task the core has not started yet. Default (no args): the latest task from this conversation that is still open. A task the core already started cannot be stopped partway and a finished one cannot be undone; the result says which, and what to tell the user. Pass `taskId` to cancel a specific task by id (e.g. \"task-1777686932069\"). Pass `query` to cancel the first task whose content contains the substring (case-insensitive). Pass `list: true` to list pending tasks (id + first 60 chars of content) without cancelling. Use when user says \"cancel\", \"nevermind\", \"stop that\", \"what's queued\", \"cancel the one about X\".",
+   "description": "Cancel a task the core has not started yet. Default (no args): the latest still-open task submitted by voice since the voice agent started. A task the core already started cannot be stopped partway and a finished one cannot be undone; the result says which, and what to tell the user. Pass `taskId` to cancel a specific task by id (e.g. \"task-1777686932069\"). Pass `query` to cancel the first task whose content contains the substring (case-insensitive). Pass `list: true` to list pending tasks (id + first 60 chars of content) without cancelling. Use when user says \"cancel\", \"nevermind\", \"stop that\", \"what's queued\", \"cancel the one about X\".",
    "execution": "inline",
    "params": {
     "list": "If true, list pending tasks (id + 60-char preview) without cancelling.",

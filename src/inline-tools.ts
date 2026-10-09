@@ -25,7 +25,7 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
-import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, voiceTaskState, latestOpenVoiceTask, findOpenVoiceTask, noteVoiceTaskCancelled } from './task-bridge.js';
+import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, voiceTaskState, latestOpenVoiceTask, findOpenVoiceTask, noteVoiceTaskCancelled, isVoiceSubmittedTask } from './task-bridge.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -660,7 +660,7 @@ export const clipboardTool: ToolDefinition = {
 export const cancelTaskTool: ToolDefinition = {
 	name: 'cancel_task',
 	description:
-		'Cancel a task the core has not started yet. Default (no args): the latest task from this conversation that is still open. ' +
+		'Cancel a task the core has not started yet. Default (no args): the latest still-open task submitted by voice since the voice agent started. ' +
 		'A task the core already started cannot be stopped partway and a finished one cannot be undone; the result says which, and what to tell the user. ' +
 		'Pass `taskId` to cancel a specific task by id (e.g. "task-1777686932069"). ' +
 		'Pass `query` to cancel the first task whose content contains the substring (case-insensitive). ' +
@@ -695,13 +695,11 @@ export const cancelTaskTool: ToolDefinition = {
 				return { status: 'pending_tasks', count: items.length, tasks: items };
 			}
 
-			// Targeting: by exact id, by query, or the latest open task from this conversation.
+			// Targeting: by exact id, by query, or the latest open voice task.
 			let targetId: string | undefined;
-			let targetFile: string | undefined;
 			if (taskId) {
 				const wantFile = taskId.endsWith('.txt') ? taskId : `${taskId}.txt`;
 				targetId = wantFile.replace('.txt', '');
-				if (files.includes(wantFile)) targetFile = wantFile;
 			} else if (query) {
 				targetId = findOpenVoiceTask(query);
 				if (!targetId) {
@@ -714,11 +712,9 @@ export const cancelTaskTool: ToolDefinition = {
 					}
 				}
 				if (!targetId) return { status: 'not_found', query };
-				if (files.includes(`${targetId}.txt`)) targetFile = `${targetId}.txt`;
 			} else {
 				targetId = latestOpenVoiceTask();
-				if (!targetId) return { status: 'nothing_pending', message: 'No task from this conversation is still open. Tell the user there is nothing to cancel.' };
-				if (files.includes(`${targetId}.txt`)) targetFile = `${targetId}.txt`;
+				if (!targetId) return { status: 'nothing_pending', message: 'No task submitted by voice is still open. Tell the user there is nothing to cancel.' };
 			}
 			const safeTargetId = targetId.replace(/[\r\n]/g, '');
 
@@ -749,18 +745,12 @@ export const cancelTaskTool: ToolDefinition = {
 				`task: CANCEL_INSTRUCTION: stop processing ${safeTargetId} if still in flight. If already completed, no-op. Reply briefly confirming.\n`;
 			writeFileSync(join(tasksDir, cancelFilename), cancelBody);
 
-			// Also unlink the original task file if it's still present — prevents
-			// double-pickup if core hadn't started yet. Best-effort.
-			if (targetFile) {
-				try { unlinkSync(join(tasksDir, targetFile)); } catch { /* already gone is fine */ }
-			}
-
 			console.log(`${ts()} [CancelTask] cancel-instruction written for ${safeTargetId} → ${cancelFilename}`);
-			if (state === 'queued') {
+			if (state === 'queued' && isVoiceSubmittedTask(safeTargetId)) {
 				noteVoiceTaskCancelled(safeTargetId, `task-${cancelTs}`);
 				return { status: 'cancelled', taskId: safeTargetId, message: 'It had not started, so it will not run. Tell the user it is cancelled.' };
 			}
-			// Not a task this session can see the state of: the core's reply says what happened.
+			// Not a voice task, or one whose state is unknown: the core's reply says what happened.
 			return { status: 'cancel_instruction_queued', taskId: safeTargetId, instruction: `task-${cancelTs}`, message: 'Asked the core to stop it; it may already have finished. Tell the user you asked to cancel it, not that it is cancelled.' };
 		} catch (err) {
 			return { error: `Cancel failed: ${err instanceof Error ? err.message : err}` };

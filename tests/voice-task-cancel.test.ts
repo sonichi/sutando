@@ -5,7 +5,9 @@ import { describe, it, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const TMP = mkdtempSync(join(tmpdir(), 'sutando-voice-cancel-'));
 process.env.SUTANDO_WORKSPACE = TMP;
@@ -14,7 +16,7 @@ for (const d of ['tasks', 'results', join('state', 'activity')]) mkdirSync(join(
 
 const tb = await import('../src/task-bridge.js');
 const { cancelTaskTool } = await import('../src/inline-tools.js');
-const { _pendingTasksForTest, voiceTaskState, countQueuedAhead, startResultWatcher, setTaskStatusCallback, CANCELLED_BUT_FINISHED_NOTE, _resetVoiceTaskCancelsForTest } = tb;
+const { _pendingTasksForTest, voiceTaskState, startResultWatcher, setTaskStatusCallback, CANCELLED_BUT_FINISHED_NOTE, _resetVoiceTaskCancelsForTest } = tb;
 
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
@@ -30,11 +32,28 @@ function submit(text: string): string {
 	_pendingTasksForTest.set(id, { submittedAt: Date.now() + seq, timeoutMs: 3_600_000, dmOnTimeout: false, taskText: text });
 	return id;
 }
-/** The core picked the task up (watcher announce) and, with `engaged`, started working on it. */
-function pickUp(id: string, engaged: boolean) {
-	writeFileSync(join(TMP, 'state', 'activity', `${id}.json`), JSON.stringify({ task_id: id, phase: 'RUNNING', seq: engaged ? 1 : 0 }));
-	rmSync(join(TMP, 'tasks', `${id}.txt`), { force: true });
+const HOOK = join(dirname(fileURLToPath(import.meta.url)), '..', 'skills', 'agent-activity', 'hooks', 'activity-hook.py');
+/** One tool call by the core session, through the real activity hook. */
+function coreTool(tool: string, input: Record<string, unknown>) {
+	const payload = JSON.stringify({ hook_event_name: 'PreToolUse', session_id: 'core', tool_name: tool, tool_input: input });
+	const r = spawnSync('python3', [HOOK], { input: payload, env: { ...process.env, SUTANDO_TEST_MODE: '1', SUTANDO_WORKSPACE: TMP }, encoding: 'utf-8' });
+	assert.equal(r.status, 0, r.stderr);
 }
+/** The watcher announced the task (RUNNING, seq 0); the task file stays in tasks/ until its result is archived. */
+const announce = (id: string) => writeFileSync(join(TMP, 'state', 'activity', `${id}.json`), JSON.stringify({ task_id: id, phase: 'RUNNING', seq: 0 }));
+/** The core read the task file: the hook's processing row, nothing else yet. */
+function coreReads(id: string) {
+	announce(id);
+	coreTool('Read', { file_path: join(TMP, 'tasks', `${id}.txt`) });
+}
+/** The core read the task and ran a tool on it: a working row. */
+function coreWorks(id: string) {
+	coreReads(id);
+	coreTool('Bash', { command: 'true', description: 'Generate the image' });
+}
+const rows = (kind: string) => existsSync(join(TMP, 'state', 'agent-activity.jsonl'))
+	? readFileSync(join(TMP, 'state', 'agent-activity.jsonl'), 'utf-8').split('\n').filter((l) => l.includes(`"kind": "${kind}"`)).length : 0;
+const archivedTask = (id: string) => existsSync(join(TMP, 'tasks', 'archive', new Date().toISOString().slice(0, 7), `${id}.txt`));
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const cancel = (args: Record<string, unknown> = {}) => (cancelTaskTool.execute as any)(args) as Promise<Record<string, string>>;
 const cancelInstructions = () => readdirSync(join(TMP, 'tasks')).filter((f) => f.endsWith('.txt'))
@@ -47,31 +66,46 @@ beforeEach(() => {
 	spoken.length = 0;
 	statuses.length = 0;
 	for (const f of readdirSync(join(TMP, 'tasks'))) if (f.endsWith('.txt')) rmSync(join(TMP, 'tasks', f));
+	rmSync(join(TMP, 'state', 'agent-activity.jsonl'), { force: true });
+	rmSync(join(TMP, 'state', 'agent-activity.sessions.json'), { force: true });
 });
 
 describe('cancel_task decides from the task state', () => {
-	it('a queued task is cancelled: instruction written, task file removed, card closed, no "Cancelled." result', async () => {
+	it('a queued task is cancelled: instruction written, task file archived, card closed, no "Cancelled." result', async () => {
 		const id = submit('draw a car');
 		const out = await cancel();
 		assert.equal(out.status, 'cancelled');
 		assert.equal(out.taskId, id);
 		assert.equal(cancelInstructions().length, 1);
 		assert.ok(!existsSync(join(TMP, 'tasks', `${id}.txt`)));
+		assert.ok(archivedTask(id), 'archived, so its header stays readable');
 		assert.ok(!existsSync(join(TMP, 'results', `${id}.txt`)), 'no stub result');
 		assert.ok(statuses.some((s) => s.taskId === id && s.status === 'done' && s.text === 'Cancelled.'));
 		assert.ok(!_pendingTasksForTest.has(id), 'out of the timeout sweep');
 	});
 
-	it('a task picked up but not yet engaged is still queued', async () => {
+	it('a task announced but not yet read by the core is still queued', async () => {
 		const id = submit('draw a statue');
-		pickUp(id, false);
+		announce(id);
 		assert.equal(voiceTaskState(id), 'queued');
 		assert.equal((await cancel()).status, 'cancelled');
 	});
 
+	it('a task the core has read but not yet run a tool on is started, not cancelled', async () => {
+		const id = submit('draw a dog');
+		coreReads(id);
+		assert.equal(rows('processing'), 1);
+		assert.equal(rows('working'), 0);
+		const out = await cancel();
+		assert.equal(out.status, 'already_started');
+		assert.deepEqual(cancelInstructions(), []);
+		assert.ok(existsSync(join(TMP, 'tasks', `${id}.txt`)), 'the file the core has in context stays');
+	});
+
 	it('a task the core is working on is not "cancelled": no files, the user is told it will finish', async () => {
 		const id = submit('draw a kiwi');
-		pickUp(id, true);
+		coreWorks(id);
+		assert.equal(rows('working'), 1);
 		const out = await cancel();
 		assert.equal(out.status, 'already_started');
 		assert.match(out.message, /cannot stop partway/);
@@ -82,7 +116,7 @@ describe('cancel_task decides from the task state', () => {
 
 	it('a finished task (result written, not yet read) is left alone: the real result is not overwritten', async () => {
 		const id = submit('draw a fence');
-		pickUp(id, true);
+		coreWorks(id);
 		writeFileSync(join(TMP, 'results', `${id}.txt`), "Here's your fence.");
 		const out = await cancel();
 		assert.equal(out.status, 'already_done');
@@ -129,16 +163,16 @@ describe('cancel_task decides from the task state', () => {
 		writeFileSync(join(TMP, 'results', `${id}.txt`), "Here's your boat.");
 		await tick(2_500);
 		assert.deepEqual(spoken, [{ text: "Here's your boat.", note: CANCELLED_BUT_FINISHED_NOTE }]);
+		assert.ok(tb._isVoiceTask(id), 'still a voice task, so its result is archived here, not left for another bridge');
 	});
-});
 
-describe('queue count', () => {
-	it('a task whose result is already in results/ is not counted as ahead', () => {
-		const done = submit('draw a cat');
-		writeFileSync(join(TMP, 'results', `${done}.txt`), "Here's your cat.");
-		const next = submit('explain the weather');
-		assert.equal(countQueuedAhead(join(TMP, 'tasks'), next), 0);
-		rmSync(join(TMP, 'results', `${done}.txt`));
-		assert.equal(countQueuedAhead(join(TMP, 'tasks'), next), 1);
+	it('a task this session did not submit is never reported cancelled, and its file is left alone', async () => {
+		const id = 'task-1800000000999';
+		writeFileSync(join(TMP, 'tasks', `${id}.txt`), `id: ${id}\nsource: discord\nchannel_id: 123\ntask: summarize the thread\n`);
+		const out = await cancel({ taskId: id });
+		assert.equal(out.status, 'cancel_instruction_queued');
+		assert.match(out.message, /not that it is cancelled/);
+		assert.ok(existsSync(join(TMP, 'tasks', `${id}.txt`)));
+		assert.equal(cancelInstructions().length, 1);
 	});
 });
