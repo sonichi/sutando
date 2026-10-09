@@ -582,6 +582,17 @@ class DeliveredBodyDiffers(unittest.TestCase):
                 root = self._rec(td, **fields) if fields is not None else Path(td) / "ob"
                 self.assertIs(outbox.delivered_body_differs(root, ITEM, live), differs)
 
+    def test_an_adoption_era_record_has_no_trusted_proof(self):
+        env = json.dumps({"id": ITEM, "body": "A"})
+        bound = outbox.source_proof_fields(outbox.source_digest("A"), env)
+        self.assertEqual(outbox.source_proof(dict(bound, payload=env)), outbox.source_digest("A"))
+        for field in outbox.ADOPTION_ERA_FIELDS:
+            with self.subTest(field=field):
+                record = dict(bound, payload=env, **{field: 1})
+                self.assertTrue(outbox.adoption_era(record))
+                self.assertIsNone(outbox.source_proof(record))
+        self.assertFalse(outbox.adoption_era(None))
+
     def test_the_source_digest_is_of_the_ready_body(self):
         self.assertEqual(outbox.source_digest("A"), hashlib.sha256(b"A").hexdigest())
 

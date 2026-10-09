@@ -323,6 +323,10 @@ def behavioral() -> list:
             fails.append("a resolved and archived review id must never be reused for another body")
         if guard.withheld_review_artifact(state, "task-arch", "B body") != b_path.parent / "archive" / b_path.name:
             fails.append("an archived body's id is never reissued: a replay points at its decision")
+        leak = guard.classify_result_for_tier("B body", "team", REPO, secret_filter=_leaky)
+        replay = guard.materialize_withheld_verdict(leak, "B body", state, "task-arch", context, now=1000)
+        if "already decided in owner review" not in (replay.reason or "") or b_path.exists():
+            fails.append("a replay of an archived body is suppressed against that decision, no new record")
     return fails
 
 
