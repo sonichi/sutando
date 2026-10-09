@@ -13,9 +13,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages" / "ag2-sparrow"))
 
-from ag2_sparrow import outbox, remote_gateway_bridge as gw  # noqa: E402
-from ag2_sparrow.delivery_core import DeliveryCore, DesignAClaimBackend, RetryPolicy  # noqa: E402
-from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceResultProvider  # noqa: E402
+from ag2_sparrow import outbox, remote_gateway_bridge as gw
+from ag2_sparrow.delivery_core import DeliveryCore, DesignAClaimBackend, RetryPolicy
+from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceResultProvider
 
 ROOM = "!same:ag2.space"
 TID = "task-holder"
