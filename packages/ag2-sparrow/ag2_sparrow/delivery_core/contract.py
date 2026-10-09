@@ -197,15 +197,38 @@ class ClaimBackend(Protocol):
         exhausted retry window, outcome-unknown — refuses every payload for
         good, even when a later attempt was definitely refused, because a
         provider that dedupes on the item id may already hold the parked body
-        and would report the new one delivered. A backend without the
-        capability treats every park as final for every payload. The history
-        of parked bodies is bounded: past the backend's declared limit the id
-        saturates and refuses every new payload. A refused payload stays
-        visible to the operator through the caller's quarantine, never lost.
+        and would report the new one delivered. An attempt that STARTED and
+        never classified (`begin_attempt` was written, `complete` never ran:
+        the owner died or raised mid-send) is ambiguous for the same reason.
+        A backend without the capability treats every park as final for every
+        payload. A republish of a DELIVERED id starts a new cycle: the parked
+        history carries over, the delivered cycle's ambiguity does not. The
+        history of parked bodies is bounded by ONE writer (publish, requeue and
+        every other transition fold through it): past the backend's declared
+        limit the id saturates and refuses every new payload, logs once, and
+        the health check counts it. A refused payload stays visible to the
+        operator through the caller's quarantine, never lost; the backend
+        records the cause of each refusal so the quarantine names it. Operator
+        recovery for a saturated or tainted id is the existing requeue of the
+        parked body (one explicit retry under a new resend epoch) and the
+        restore of quarantined bodies; nothing automatic reopens the id.
 
         Durable backends may expose payload_for_claim(token) so the core sends
         the original published bytes rather than a rebuilt caller payload.
         """
+        ...
+
+    def begin_attempt(self, token: ClaimToken) -> bool:
+        """Persist "an attempt may dispatch" for this incarnation BEFORE the
+        provider is called, inside one backend critical section.
+
+        This is the side-effect boundary's other half: `complete` runs after
+        the provider returns, so an attempt that dies or raises mid-send never
+        reaches it. A backend that admits fresh cycles must treat a started
+        attempt that was never classified as ambiguous — a successor's
+        begin_attempt folds the stale mark into the cycle's taint. A backend
+        that admits no fresh cycle may keep no record. False = this
+        incarnation no longer owns the claim; nothing was written."""
         ...
 
     def claim(self, item_id: str, worker: str) -> Optional[ClaimToken]:
@@ -264,7 +287,10 @@ class ClaimBackend(Protocol):
         regardless of any retry schedule or attempt ceiling. `ambiguous` says
         an attempt in this call may have crossed the side-effect boundary; a
         backend that admits fresh cycles must persist it on the cycle so no
-        later refusal reads as proof that the body never landed.
+        later refusal reads as proof that the body never landed. A call with a
+        stale token writes nothing — including the taint — which is safe only
+        because `begin_attempt` already left the started-attempt mark that the
+        next incarnation folds into the taint.
         True = this incarnation owned the claim and it is now retired."""
         ...
 

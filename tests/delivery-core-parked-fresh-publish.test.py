@@ -13,8 +13,10 @@ Run: python3 tests/delivery-core-parked-fresh-publish.test.py"""
 from __future__ import annotations
 
 import hashlib
+import http.client
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -475,6 +477,184 @@ class TheWholeCycleMustBeDefinite(unittest.TestCase):
         self.assertEqual(broker.stored[ITEM]["body"], "a later, different reply")
 
 
+_CHILD_DEATH = r"""
+import os, sys, json, pathlib
+sys.path.insert(0, sys.argv[1])
+from ag2_sparrow.delivery_core import DesignAClaimBackend, DeliveryCore, RetryPolicy
+from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceResultProvider
+root, store, item, body = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4], sys.argv[5]
+def request(method, path, payload):
+    store.write_text(json.dumps(payload))        # the broker stored A ...
+    os._exit(17)                                 # ... and this owner died mid-POST
+backend = DesignAClaimBackend(root, reclaim_ttl_s=0.0)
+core = DeliveryCore(backend, AG2SpaceResultProvider(request),
+                    policy=RetryPolicy(max_attempts=3, defer_idempotent_resend=True),
+                    worker="gateway-result-drain")
+assert backend.publish(item, body.encode())
+core.deliver_one(item, body.encode())
+"""
+
+
+class AStartedAttemptThatNeverClassifiesTaintsTheCycle(unittest.TestCase):
+    """The taint used to be written in complete(), after the provider call, so
+    an attempt that landed A and then died or raised left no mark; a later
+    definite refusal parked the cycle as untainted and admitted B, which the
+    broker deduped into A. The started-attempt mark is written BEFORE the send
+    and only a classified completion clears it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _core(self, broker):
+        backend = DesignAClaimBackend(self.tmp / ".outbox", reclaim_ttl_s=0.0)
+        core = DeliveryCore(backend, AG2SpaceResultProvider(broker.request),
+                            policy=RetryPolicy(max_attempts=CAP, defer_idempotent_resend=True),
+                            worker="gateway-result-drain")
+        return backend, core
+
+    def _then_refused_and_b_is_not_admitted(self, broker, backend, core, posts_before):
+        broker.script = ["refuse"]                   # the retry of A is definitely refused
+        self.assertIs(core.deliver_one(ITEM, FIRST).status, DrainStatus.ATTEMPTED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual((rec.get("status"), rec.get("reason")), ("PARKED", "permanent-refusal"))
+        self.assertTrue(rec.get("cycle_ambiguous"),
+                        "the attempt that never classified taints the cycle")
+        self.assertFalse(rec.get("dispatch_pending"), "the classified attempt cleared its mark")
+        broker.mode = "accept"
+        self.assertFalse(backend.publish(ITEM, SECOND),
+                         "a later refusal cannot prove the dead attempt never landed")
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("last_refusal"),
+                         "parked-cycle-ambiguous")
+        self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.TERMINAL)
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "PARKED")
+        self.assertEqual(broker.stored[ITEM]["body"], "first reply", "the broker holds A")
+        self.assertEqual(len(broker.posts), posts_before + 1, "no POST for B")
+
+    def test_an_owner_that_dies_during_the_post_taints_the_cycle(self):
+        store = self.tmp / "broker-store.json"
+        proc = subprocess.run([sys.executable, "-c", _CHILD_DEATH, str(_PKG),
+                               str(self.tmp / ".outbox"), str(store), ITEM, FIRST.decode()],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 17, proc.stderr[-400:])
+        self.assertEqual(json.loads(store.read_text())["body"], "first reply",
+                         "the broker stored A before the owner died")
+        broker = _Broker("accept")
+        broker.stored[ITEM] = json.loads(store.read_text())   # the broker's memory survives
+        backend, core = self._core(broker)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertTrue(rec.get("dispatch_pending"), "the dead attempt's mark is on the record")
+        self._then_refused_and_b_is_not_admitted(broker, backend, core, 0)
+
+    def _raising_after_store(self, exc):
+        broker = _Broker("accept")
+        real = broker.request
+        broker.torn = True
+
+        def request(method, path, payload):
+            resp = real(method, path, payload)       # the broker stored A ...
+            if broker.torn:
+                raise exc                            # ... then the response tore
+            return resp
+        broker.request = request
+        return broker, real
+
+    def test_a_torn_response_is_indeterminate_not_a_crash(self):
+        for name, exc in (("IncompleteRead", http.client.IncompleteRead(b"")),
+                          ("garbled 200", json.JSONDecodeError("garbled", "<html>", 0))):
+            with self.subTest(failure=name):
+                self.tmp = Path(tempfile.mkdtemp())
+                broker, real = self._raising_after_store(exc)
+                backend, core = self._core(broker)
+                self.assertTrue(backend.publish(ITEM, FIRST))
+                try:
+                    res = core.deliver_one(ITEM, FIRST)
+                except Exception:                # noqa: BLE001 - the pre-fix shape
+                    backend.force_release(ITEM)  # the owner's claim outlives the raise
+                else:
+                    self.assertIs(res.outcome, DeliveryOutcome.NOT_DELIVERED,
+                                  "an unclassified post-send failure is folded like a lost response")
+                broker.torn = False
+                self._then_refused_and_b_is_not_admitted(broker, backend, core, 1)
+
+    def test_a_programming_error_after_the_send_still_leaves_the_mark(self):
+        """The core lets a non-taxonomy error propagate, loudly; the record
+        still says an attempt started, so no later refusal can admit B."""
+        class _Broken:
+            capabilities = ProviderCapabilities(idempotent_send=True)
+
+            def deliver(self, item_id, payload, key):
+                raise KeyError("config key missing")
+
+            def reconcile(self, attempt):
+                return None
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        core = DeliveryCore(backend, _Broken(), policy=RetryPolicy(max_attempts=CAP), worker="w1")
+        self.assertTrue(backend.publish(ITEM, FIRST))
+        with self.assertRaises(KeyError):
+            core.deliver_one(ITEM, FIRST)
+        self.assertTrue(outbox._read_item(backend.root, ITEM).get("dispatch_pending"))
+        backend.force_release(ITEM)
+        prov = _Provider(refusals=1)
+        core = DeliveryCore(backend, prov, policy=RetryPolicy(max_attempts=CAP), worker="w1")
+        self.assertIs(core.deliver_one(ITEM, FIRST).status, DrainStatus.ATTEMPTED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual((rec.get("status"), rec.get("reason")), ("PARKED", "permanent-refusal"))
+        self.assertTrue(rec.get("cycle_ambiguous"))
+        self.assertFalse(backend.publish(ITEM, SECOND))
+
+    def test_a_park_written_over_a_pending_attempt_admits_nothing(self):
+        """The park's reason is definite, but an attempt that started and
+        never classified is still on the record: the cycle is not definite."""
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        self.assertTrue(backend.publish(ITEM, FIRST))
+        token = backend.claim(ITEM, "w1")
+        self.assertTrue(backend.begin_attempt(token))      # the owner then died mid-send
+        backend.force_release(ITEM)
+        backend.park(ITEM, "permanent-refusal")            # a sweep or operator parks it
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertTrue(rec.get("dispatch_pending"))
+        self.assertFalse(rec.get("cycle_ambiguous", False))
+        self.assertFalse(backend.publish(ITEM, SECOND),
+                         "a started attempt without a classification is not a definite cycle")
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("last_refusal"),
+                         "attempt-unclassified")
+
+    def test_a_classified_attempt_leaves_no_pending_mark(self):
+        prov = _Provider(refusals=0)
+        backend, core = _core(self.tmp, prov)
+        self.assertTrue(backend.publish(ITEM, FIRST))
+        self.assertIs(core.deliver_one(ITEM, FIRST).outcome, DeliveryOutcome.CONFIRMED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual(rec.get("attempts_started"), 1)
+        self.assertNotIn("dispatch_pending", rec)
+        self.assertNotIn("cycle_ambiguous", rec)
+
+    def test_a_reconcile_receipt_clears_the_ambiguity(self):
+        """A receipt is a statement about the original attempt: a cycle whose
+        ambiguity was RESOLVED by one carries no taint (the mutant that taints
+        on every reconcile fails here)."""
+        class _Resolved:
+            capabilities = ProviderCapabilities(reconcile_capable=True)
+
+            def __init__(self):
+                self.n = 0
+
+            def deliver(self, item_id, payload, key):
+                self.n += 1
+                raise ProviderIndeterminate("response lost after send")
+
+            def reconcile(self, attempt):
+                return DeliveryReceipt(outcome=DeliveryOutcome.NOT_DELIVERED,
+                                       detail="server never accepted it")
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        core = DeliveryCore(backend, _Resolved(), policy=RetryPolicy(max_attempts=CAP), worker="w1")
+        self.assertTrue(backend.publish(ITEM, FIRST))
+        self.assertIs(core.deliver_one(ITEM, FIRST).outcome, DeliveryOutcome.NOT_DELIVERED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertNotIn("cycle_ambiguous", rec, "the receipt resolved the ambiguity")
+        self.assertNotIn("dispatch_pending", rec)
+
+
 class HistoryIsBounded(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -489,19 +669,59 @@ class HistoryIsBounded(unittest.TestCase):
             if backend.publish(ITEM, body):
                 accepted += 1
                 self.assertIs(core.deliver_one(ITEM, body).status, DrainStatus.ATTEMPTED)
-        self.assertEqual(accepted, limit, "exactly the retained history's worth of cycles")
+        self.assertEqual(accepted, limit + 1, "the retained history plus the body whose park "
+                         "saturated it; nothing beyond")
         rec = outbox._read_item(backend.root, ITEM)
         self.assertTrue(rec.get("saturated"))
         self.assertEqual(rec.get("status"), "PARKED", "the item stays visible to the operator")
-        self.assertEqual(len(DesignAClaimBackend._parked_digests(rec)), limit)
+        self.assertEqual(len(rec.get("parked_digests")), limit, "the stored history is bounded")
+        self.assertEqual(len(DesignAClaimBackend._parked_digests(rec)), limit + 1,
+                         "the parked body itself is still refused, from its own digest")
         size = outbox._item_path(backend.root, ITEM).stat().st_size
         self.assertLess(size, 64 * (limit + 1) + 4096, f"record grew to {size} bytes")
         self.assertFalse(backend.publish(ITEM, b'{"id": "x", "fresh": true}'),
                          "saturated: every new payload is refused")
         self.assertIs(core.deliver_one(ITEM, b'{"id": "x", "fresh": true}').status,
                       DrainStatus.TERMINAL)
-        self.assertEqual(len(prov.calls), limit)
+        self.assertEqual(len(prov.calls), limit + 1)
         self.assertIn(str(limit), backend.cleanup().detail)
+
+    def test_requeue_and_delivery_fold_through_the_same_writer(self):
+        """The reviewers' loop: publish, park, requeue, deliver, 140 times.
+        Each park folds into the id's history through the one writer, so the
+        id saturates at the limit and the next different body is refused."""
+        limit = DesignAClaimBackend.PARKED_HISTORY_LIMIT
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        accepted = 0
+        for n in range(limit + 12):
+            body = json.dumps({"id": ITEM, "n": n}).encode()
+            if not backend.publish(ITEM, body):
+                break
+            accepted += 1
+            backend.park(ITEM, "permanent-refusal")
+            self.assertIs(outbox.requeue_item(backend.root, ITEM, operator="op"),
+                          outbox.RequeueOutcome.REQUEUED)
+            outbox.record_delivered(backend.root, ITEM)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual(accepted, limit + 1, "the limit-th park saturates; one more cycle "
+                         "was already live when it did")
+        self.assertTrue(rec.get("saturated"), "requeue cannot grow the history past the bound")
+        self.assertEqual(len(rec.get("parked_digests")), limit)
+        self.assertFalse(backend.publish(ITEM, b'{"id": "x", "fresh": true}'))
+
+    def test_each_refusal_names_its_cause(self):
+        prov = _Provider(refusals=1)
+        backend, core = _parked(self.tmp, prov)
+        self.assertFalse(backend.publish(ITEM, FIRST))
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("last_refusal"),
+                         "parked-body-already-refused")
+        backend.park(ITEM, "max-attempts")
+        self.assertFalse(backend.publish(ITEM, SECOND))
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("last_refusal"),
+                         "park-not-definite")
+        for why in ("parked-body-already-refused", "park-not-definite",
+                    "parked-cycle-ambiguous", "attempt-unclassified", "parked-history-saturated"):
+            self.assertIn(why, DesignAClaimBackend.REFUSALS)
 
     def test_saturation_outlives_a_delivery_of_the_id(self):
         backend = DesignAClaimBackend(self.tmp / ".outbox")

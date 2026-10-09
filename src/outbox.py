@@ -25,6 +25,7 @@ import ctypes.util
 import errno
 import hashlib
 import json
+import logging
 import math
 import os
 import threading
@@ -906,6 +907,46 @@ def list_items(root: Path, status: Optional[str] = None) -> list[dict]:
     return out
 
 
+# Parked bodies an id may remember before it saturates closed.
+PARKED_HISTORY_LIMIT = 128
+
+_LOG = logging.getLogger("outbox")
+
+
+def parked_digests_of(d: dict) -> Optional[list]:
+    """Every payload digest this record has parked on, oldest first, the
+    current body last; None when the park recorded no payload at all."""
+    own = d.get("payload_digest")
+    if not isinstance(own, str):
+        text = d.get("payload")
+        if not isinstance(text, str):
+            return None
+        own = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    earlier = [x for x in d.get("parked_digests") or [] if isinstance(x, str)]
+    return earlier + [own] if own not in earlier else earlier
+
+
+def fold_parked_digest(d: dict, digest: str, limit: int = PARKED_HISTORY_LIMIT) -> bool:
+    """The ONE writer of an id's parked history: publish, requeue and every
+    other transition fold through here. Appends `digest` unless known; past
+    `limit` the record saturates closed instead of forgetting a body. False
+    when the record is saturated (the digest was not added)."""
+    history = [x for x in d.get("parked_digests") or [] if isinstance(x, str)]
+    if digest in history:
+        d["parked_digests"] = history
+        return not d.get("saturated")
+    if d.get("saturated") or len(history) >= limit:
+        if not d.get("saturated"):
+            d["saturated"] = True
+            _LOG.warning("outbox item %s saturated: %d parked bodies remembered, "
+                         "every new payload is now refused", d.get("item_id"), len(history))
+        d["parked_digests"] = history
+        return False
+    history.append(digest)
+    d["parked_digests"] = history
+    return True
+
+
 class RequeueOutcome(str, Enum):
     """Only REQUEUED means this call moved the item; the other two touched
     nothing, which is what makes a repeated requeue safe to script."""
@@ -949,10 +990,7 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
         if not isinstance(own, str) and isinstance(d.get("payload"), str):
             own = hashlib.sha256(d["payload"].encode("utf-8")).hexdigest()
         if isinstance(own, str):
-            history = [x for x in d.get("parked_digests") or [] if isinstance(x, str)]
-            if own not in history:
-                history.append(own)
-            d["parked_digests"] = history
+            fold_parked_digest(d, own)
         d["resend_epoch"] = int(d.get("resend_epoch", 0) or 0) + 1
         d["status"] = "QUEUED"
         d["reason"] = None

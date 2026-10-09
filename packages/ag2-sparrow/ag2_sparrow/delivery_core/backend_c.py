@@ -239,6 +239,14 @@ class DesignCClaimBackend:
             return ClaimToken(item_id=item_id, worker=worker,
                               incarnation=fname)
 
+    def begin_attempt(self, token: ClaimToken) -> bool:
+        # No started-attempt record: C admits no fresh cycle after a park, so an
+        # attempt that never classifies cannot be mistaken for a definite one.
+        parts = token.incarnation.split(SEP)
+        if len(parts) != TOKEN_PARTS or parts[1] != _safe_component(token.worker):
+            return False
+        return (self.root / INFLIGHT / token.incarnation).exists()
+
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,

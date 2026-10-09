@@ -52,6 +52,11 @@ class AG2SpaceResultProvider:
             # after-send; the idempotent re-send resolves the ambiguity.
             raise ProviderIndeterminate(
                 f"transport failure for {item_id}: {e}") from e
+        except Exception as e:  # noqa: BLE001
+            # A torn body or garbled 200 may have landed: Indeterminate keeps it out of a fresh cycle.
+            raise ProviderIndeterminate(
+                f"unclassified failure during send for {item_id}: "
+                f"{type(e).__name__}: {e}") from e
         # This receipt confirms acceptance only, never downstream Matrix delivery.
         if resp.get("ok") is False or resp.get("error") or resp.get("errcode"):
             raise ProviderPermanentRefused(f"gateway declined {item_id}: {str(resp)[:200]}")

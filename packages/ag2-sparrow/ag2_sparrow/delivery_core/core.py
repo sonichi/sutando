@@ -106,6 +106,10 @@ class DeliveryCore:
         if callable(stored_payload):
             payload = stored_payload(token)
         key = idempotency_key(item_id, _resend_epoch(self.backend, item_id))
+        # Written BEFORE the side effect: an attempt that dies or raises mid-send
+        # leaves a started-but-unclassified record, which no later refusal clears.
+        if not self.backend.begin_attempt(token):
+            return DrainResult(status=DrainStatus.NOT_CLAIMED)
         outcome, destination, permanent, detail = self._attempt(item_id, payload, key)
         # An attempt that may have crossed the boundary taints the whole cycle:
         # a later refusal cannot prove this one never landed.

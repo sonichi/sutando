@@ -4465,6 +4465,10 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         # so retrying logs forever and hides the failure behind "will retry".
         why = (f"outbox item is terminal: {record.get('reason')} after "
                f"{core.backend.attempts(item_id)} attempt(s)")
+        if record.get("last_refusal"):
+            # The park's reason describes the parked body; the refusal cause
+            # describes why THIS body was not given a cycle of its own.
+            why = f"fresh cycle refused: {record['last_refusal']} ({why})"
         if result_file is not None:
             _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id)
         else:

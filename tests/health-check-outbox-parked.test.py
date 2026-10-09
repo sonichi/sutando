@@ -73,9 +73,9 @@ class OutboxParkedProbe(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _write(self, item_id, status, root_name=".outbox"):
+    def _write(self, item_id, status, root_name=".outbox", **fields):
         self._items(root_name).joinpath(f"{item_id}.json").write_text(
-            json.dumps({"item_id": item_id, "status": status}), encoding="utf-8")
+            json.dumps({"item_id": item_id, "status": status, **fields}), encoding="utf-8")
 
     def test_no_outbox_root_says_its_zero_is_untestable(self):
         r = self.hc.check_outbox_parked(self.ws)
@@ -92,6 +92,17 @@ class OutboxParkedProbe(unittest.TestCase):
         self.assertEqual(r["status"], "warn")
         self.assertIn("task-abc", r["detail"])
         self.assertIn("requeue", r["detail"])
+
+    def test_saturated_and_ambiguous_parks_are_counted_distinctly(self):
+        self._write("task-sat", "PARKED", saturated=True)
+        self._write("task-amb", "PARKED", cycle_ambiguous=True)
+        self._write("task-pend", "PARKED", dispatch_pending=True)
+        self._write("task-plain", "PARKED")
+        r = self.hc.check_outbox_parked(self.ws)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("4 reply/replies", r["detail"])
+        self.assertIn("1 saturated", r["detail"])
+        self.assertIn("2 ambiguous-cycle", r["detail"])
 
     def test_a_delivered_item_is_not_counted(self):
         self._write("task-abc", "PARKED")

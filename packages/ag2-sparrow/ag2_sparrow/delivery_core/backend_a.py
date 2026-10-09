@@ -30,7 +30,20 @@ class DesignAClaimBackend:
 
     # Parked-body history an id may carry; a park past it saturates the id
     # closed (every new payload refused) instead of forgetting a body.
-    PARKED_HISTORY_LIMIT = 128
+    PARKED_HISTORY_LIMIT = outbox.PARKED_HISTORY_LIMIT
+
+    # Why the last publish for a parked id was refused; the caller's
+    # quarantine line names it so an operator reads the real cause.
+    REFUSALS = {
+        "no-capability": "this backend admits no fresh cycle after a park",
+        "park-without-payload": "the park recorded no payload to compare against",
+        "parked-body-already-refused": "this body already parked on this id",
+        "parked-history-saturated": "the id's parked history is full",
+        "park-not-definite": "the park was not a definite refusal",
+        "parked-cycle-ambiguous": "an attempt in the parked cycle may have landed",
+        "attempt-unclassified": "an attempt in the parked cycle started but never classified",
+        "claim-live-on-park": "a live owner still holds the parked cycle's claim",
+    }
 
     def __init__(self, root: Path, reclaim_ttl_s: float = 300.0,
                  retry_schedule: Optional[outbox.RetrySchedule] = None,
@@ -45,14 +58,15 @@ class DesignAClaimBackend:
     def _parked_digests(prior: dict) -> Optional[list]:
         """Every payload this id has parked on, oldest first; None when the
         park recorded no payload, so no new one can be proven different."""
-        own = prior.get("payload_digest")
-        if not isinstance(own, str):
-            text = prior.get("payload")
-            if not isinstance(text, str):
-                return None
-            own = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        earlier = [d for d in prior.get("parked_digests") or [] if isinstance(d, str)]
-        return earlier + [own]
+        return outbox.parked_digests_of(prior)
+
+    @staticmethod
+    def _refuse(prior: dict, root: Path, item_id: str, why: str) -> bool:
+        """Record why a fresh payload was refused (once per cause) and refuse."""
+        if prior.get("last_refusal") != why:
+            prior["last_refusal"] = why
+            outbox._write_item(root, item_id, prior)
+        return False
 
     def publish(self, item_id: str, payload: bytes, *,
                 republish_delivered: Optional[bool] = None) -> bool:
@@ -65,7 +79,11 @@ class DesignAClaimBackend:
         body in place of the new one. Every payload the id ever parked on stays
         refused, across later deliveries too, so bodies cannot alternate through
         the park; once PARKED_HISTORY_LIMIT bodies have parked, the id is
-        saturated and refuses every new payload rather than forgetting one."""
+        saturated and refuses every new payload rather than forgetting one.
+        An attempt that started and never classified (its owner died or raised
+        mid-send) counts as ambiguous. A republish of a DELIVERED id starts a
+        new cycle: the delivered cycle's taint does not carry over, its parked
+        history does. Each refusal records its cause as `last_refusal`."""
         allow_republish = (self.republish_delivered if republish_delivered is None
                            else republish_delivered)
         text = payload.decode("utf-8", "replace")
@@ -76,29 +94,35 @@ class DesignAClaimBackend:
                 prior = outbox._read_item(self.root, item_id)
                 status = prior.get("status")
                 if status == "PARKED":
+                    refuse = lambda why: self._refuse(prior, self.root, item_id, why)  # noqa: E731
                     if not self.capabilities.fresh_cycle_after_definite_park:
-                        return False
+                        return refuse("no-capability")
                     parked = self._parked_digests(prior)
-                    if parked is None or digest in parked or prior.get("saturated"):
-                        return False
+                    if parked is None:
+                        return refuse("park-without-payload")
+                    if digest in parked:
+                        return refuse("parked-body-already-refused")
+                    # The parked body joins the history through the one writer;
+                    # a full history saturates the id closed right here.
+                    if not outbox.fold_parked_digest(prior, parked[-1],
+                                                     self.PARKED_HISTORY_LIMIT):
+                        return refuse("parked-history-saturated")
                     if prior.get("reason") not in self.DEFINITE_PARK_REASONS:
-                        return False
+                        return refuse("park-not-definite")
                     if prior.get("cycle_ambiguous"):
-                        return False
-                    if len(parked) >= self.PARKED_HISTORY_LIMIT:
-                        prior["saturated"] = True
-                        outbox._write_item(self.root, item_id, prior)
-                        return False
+                        return refuse("parked-cycle-ambiguous")
+                    if prior.get("dispatch_pending"):
+                        return refuse("attempt-unclassified")
                     rec = outbox.read_delivery_claim(self.root, item_id)
                     if rec is not None:
                         # The cycle ended at the park: a claim here is a crash
                         # remnant unless its owner runs or is torn; no TTL applies.
                         if not outbox._record_is_reclaimable(rec, 0.0):
-                            return False
+                            return refuse("claim-live-on-park")
                         outbox._release_locked(self.root, item_id, rec.drainer_id)
                     record = {
                         "resend_epoch": int(prior.get("resend_epoch", 0) or 0) + 1,
-                        "parked_digests": parked,
+                        "parked_digests": list(prior.get("parked_digests") or []),
                         "superseded_park": {
                             "attempts": int(prior.get("attempts", 0) or 0),
                             "reason": prior.get("reason"),
@@ -179,6 +203,26 @@ class DesignAClaimBackend:
             return ClaimToken(item_id=item_id, worker=worker,
                               incarnation=incarnation)
 
+    def begin_attempt(self, token: ClaimToken) -> bool:
+        """Write "an attempt may dispatch" BEFORE the provider is called.
+
+        A previous mark still present means an attempt started and never
+        classified (its owner died or raised mid-send): it may have landed, so
+        the cycle is tainted for good before this attempt begins."""
+        item_id = token.item_id
+        with outbox._item_lock(self.root, item_id):
+            rec = outbox.read_delivery_claim(self.root, item_id)
+            if rec is None or rec.drainer_id != token.worker or \
+                    self._incarnation_of(item_id) != token.incarnation:
+                return False
+            item = outbox._read_item(self.root, item_id)
+            if item.get("dispatch_pending"):
+                item["cycle_ambiguous"] = True
+            item["dispatch_pending"] = True
+            item["attempts_started"] = int(item.get("attempts_started", 0) or 0) + 1
+            outbox._write_item(self.root, item_id, item)
+            return True
+
     def payload_for_claim(self, token: ClaimToken) -> bytes:
         """The claimed item's original payload, including across retries/restarts."""
         with outbox._item_lock(self.root, token.item_id):
@@ -207,12 +251,15 @@ class DesignAClaimBackend:
             if rec is None or rec.drainer_id != token.worker or \
                     self._incarnation_of(item_id) != token.incarnation:
                 return False
+            item = outbox._read_item(self.root, item_id)
             if ambiguous:
                 # Persisted before the outcome: the taint outlives retries,
                 # restarts and an operator requeue of this same cycle.
-                item = outbox._read_item(self.root, item_id)
                 item["cycle_ambiguous"] = True
-                outbox._write_item(self.root, item_id, item)
+            # This attempt is classified now; the pending mark it began with
+            # would otherwise taint the cycle as an attempt that never returned.
+            item.pop("dispatch_pending", None)
+            outbox._write_item(self.root, item_id, item)
             if outcome is DeliveryOutcome.CONFIRMED:
                 outbox.record_delivered(self.root, item_id,
                                         provider=provider, destination=destination)
