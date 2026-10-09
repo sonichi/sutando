@@ -137,6 +137,27 @@ def canonical_access_tier(value) -> str:
     tier = str(value or "").strip().lower()
     return LEGACY_ACCESS_TIER_ALIASES.get(tier, tier)
 
+
+# The tiers the AG2 Space broker puts on the wire; the fuller ACCESS_TIERS above
+# also names the local-only spellings.
+BROKER_WIRE_TIERS = ("owner", "team", "guest")
+
+
+def broker_attested_tier(access_tier, requested_access_tier, collaborator) -> tuple[str, bool]:
+    """The tier the AG2 Space broker attests on a task, and whether it is a collaborator.
+
+    Team travels as wire `guest` plus `requested_access_tier: team`; only the exact
+    boolean `collaborator: true` promotes it, so body text cannot opt itself in.
+    Unknown tiers resolve to guest. Any local cap is the caller's, applied after.
+    """
+    def known(value):
+        tier = canonical_access_tier(value)
+        return tier if tier in BROKER_WIRE_TIERS else "guest"
+
+    broker, requested = known(access_tier), known(requested_access_tier)
+    is_collaborator = collaborator is True and "team" in (broker, requested)
+    return ("team" if is_collaborator else broker), is_collaborator
+
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
 # ENFORCED in two places that must stay in lockstep (Codex P2 on PR #1954):
@@ -155,7 +176,7 @@ KNOWN_HEADER_KEYS = (
     "author_id", "chat_id",
     # Reply addressing: header status means only the trusted bridge writes
     # them, and the guard defangs forged body copies of the same names.
-    "thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
+    "thread_ts", "reply_thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
     "addressed_to", "callSid", "caller",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
@@ -194,8 +215,17 @@ KNOWN_HEADER_KEYS = (
     # A card click the HITL store already recorded, passed on for the turn it causes;
     # the core trusts it, so the guard must defang a forged copy in body text.
     "hitl_click",
+    # Broker attestation that the message @-mentioned the owner, not this agent;
+    # the core reads it to keep out of the room, so the guard defangs a forged copy.
+    "owner_mentioned",
+    # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
+    # one line and every later line is the writer's; meaningful only under a verified envelope.
+    "task_layout",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
+# Only the task-mid writer may declare its layout; a task-last file carrying it
+# would hand its multi-line body to the trusted scan.
+WRITER_ONLY_KEYS = frozenset({"task_layout"})
 
 # Canonical live task-id shape: `task-<slug>` where slug is dash-separated
 # [a-z0-9] segments (task-1783..., task-chat-1783..., task-phone-...,
@@ -825,6 +855,8 @@ def serialize_task_last(headers: "Iterable[tuple[str, str]]", task_body: str) ->
             raise ValueError("pass the body via task_body, not as a header")
         if key not in _KNOWN_KEY_SET:
             raise ValueError(f"unknown header key {key!r} — add it to KNOWN_HEADER_KEYS first")
+        if key in WRITER_ONLY_KEYS:
+            raise ValueError(f"header {key!r} is reserved for the task-mid writer")
         if "\n" in value or "\r" in value:
             raise ValueError(f"header {key!r} value contains a newline")
         lines.append(f"{key}: {value}")

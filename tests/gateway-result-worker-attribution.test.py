@@ -72,6 +72,8 @@ class WorkerAttribution(unittest.TestCase):
         self.seen = {}
 
         class _Backend:
+            root = Path(self.workspace) / "results" / ".outbox"
+
             def publish(_s, tid, payload):
                 self.seen["payload"] = json.loads(payload.decode())
                 raise _Captured()

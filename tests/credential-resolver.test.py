@@ -17,9 +17,9 @@ reflected in BOTH suites with identical inputs/outputs.
   5. S3/R15 read side: opaque generations REPORTED (managed `generation` field /
      SUTANDO_VOICE_CREDENTIAL_GENERATION), never minted; top-level
      preferenceRevision/sessionRevision tolerated and ignored.
-  6. 'gemini-image': slots text THEN voice per tier; a byok voice preference
-     skips only the managed voice slot; a managed preference never blocks its
-     env fallback; quarantine hides every managed entry.
+  6. 'gemini-image': env slots text THEN voice; the managed tier offers its
+     TEXT slot only (the managed voice entry is a Live-only token); a managed
+     preference never blocks its env fallback; quarantine hides every managed entry.
 """
 
 import json
@@ -202,15 +202,19 @@ check("image: no managed, VOICE key serves", resolve_credential("gemini-image", 
 _reset_env()
 check("image: nothing set -> none", resolve_credential("gemini-image", _missing()), {"key": "", "source": "none"})
 
-# 26. managed: text slot first, voice slot second, both beat env
+# 26. managed: the TEXT slot beats env; the managed VOICE entry is a Live-only token, never an image key
 _reset_env(); os.environ["GEMINI_API_KEY"] = "mk"
-check("image: managed TEXT beats managed VOICE and env", resolve_credential("gemini-image", _write_managed(_BOTH_SLOTS)), {"key": "managed-t", "source": "managed"})
-check("image: a managed-key install (voice entry only) serves images", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "managed-v"}})), {"key": "managed-v", "source": "managed"})
+check("image: managed TEXT beats env", resolve_credential("gemini-image", _write_managed(_BOTH_SLOTS)), {"key": "managed-t", "source": "managed"})
+check("image: a managed-key install (voice entry only) falls through to the env key", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "auth_tokens/managed-v"}})), {"key": "mk", "source": "env"})
+_reset_env(); os.environ["GEMINI_VOICE_API_KEY"] = "vk"
+check("image: managed VOICE only, env VOICE key serves (a real key)", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "auth_tokens/managed-v"}})), {"key": "vk", "source": "env"})
+_reset_env()
+check("image: managed VOICE only, no env -> none (never the Live token)", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "auth_tokens/managed-v"}})), {"key": "", "source": "none"})
 
-# 27. byok voice preference: only the managed VOICE slot is skipped
+# 27. byok voice preference: the image walk does not change (it never read the managed VOICE slot)
 _reset_env(); os.environ["GEMINI_API_KEY"] = "mk"
 check("image: byok pref keeps the managed TEXT slot", resolve_credential("gemini-image", _write_managed(_BOTH_SLOTS, {"voicePreference": "byok"})), {"key": "managed-t", "source": "managed"})
-check("image: byok pref skips the managed VOICE slot -> env", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "managed-v"}}, {"voicePreference": "byok"})), {"key": "mk", "source": "env"})
+check("image: byok pref, managed VOICE only -> env", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "managed-v"}}, {"voicePreference": "byok"})), {"key": "mk", "source": "env"})
 _reset_env()
 check("image: byok pref, managed VOICE only, no env -> none", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "managed-v"}}, {"voicePreference": "byok"})), {"key": "", "source": "none"})
 
@@ -229,6 +233,21 @@ _reset_env()
 check("image: managed generation reported verbatim", resolve_credential("gemini-image", _write_managed({"gemini-text": {"key": "managed-t", "generation": "cg1-img"}})), {"key": "managed-t", "source": "managed", "credential_generation": "cg1-img"})
 _reset_env(); os.environ["GEMINI_VOICE_API_KEY"] = "vk"; os.environ["SUTANDO_VOICE_CREDENTIAL_GENERATION"] = "cg1-injected"
 check("image: env key never carries the voice generation", resolve_credential("gemini-image", _missing()), {"key": "vk", "source": "env"})
+
+# 31. desktop: the supervisor injects the managed Live token as GEMINI_VOICE_API_KEY into every child;
+#     the image walk never spends it (by `auth_tokens/` shape or by equality with the managed voice entry)
+_reset_env(); os.environ["GEMINI_VOICE_API_KEY"] = "auth_tokens/injected"
+check("image: env VOICE Live token, no managed file -> none", resolve_credential("gemini-image", _missing()), {"key": "", "source": "none"})
+check("voice: env VOICE Live token still serves voice (unchanged)", resolve_credential("gemini-voice", _missing()), {"key": "auth_tokens/injected", "source": "env"})
+_reset_env(); os.environ["GEMINI_VOICE_API_KEY"] = "auth_tokens/managed-v"
+check("image: desktop shape (managed VOICE + same token injected in env) -> none", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "auth_tokens/managed-v"}})), {"key": "", "source": "none"})
+check("voice: desktop shape still resolves the managed voice token (unchanged)", resolve_credential("gemini-voice", _write_managed({"gemini-voice": {"key": "auth_tokens/managed-v"}})), {"key": "auth_tokens/managed-v", "source": "managed"})
+os.environ["GEMINI_API_KEY"] = "mk"
+check("image: desktop shape + real GEMINI_API_KEY -> the real key", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "auth_tokens/managed-v"}})), {"key": "mk", "source": "env"})
+_reset_env(); os.environ["GEMINI_VOICE_API_KEY"] = "managed-v"
+check("image: env VOICE equal to the managed voice entry -> none", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "managed-v"}})), {"key": "", "source": "none"})
+_reset_env(); os.environ["GEMINI_API_KEY"] = "auth_tokens/misplaced"
+check("image: a Live token in GEMINI_API_KEY -> none", resolve_credential("gemini-image", _missing()), {"key": "", "source": "none"})
 
 # 24. credential_source_label: the design's user-facing vocabulary
 _reset_env()

@@ -46,9 +46,11 @@ def classify(returncode: Optional[int], stderr) -> Optional[bool]:
 
 def has_session(socket: str, session: str, timeout: float = 10,
                 tmux: str = "tmux") -> Optional[bool]:
-    """Run `tmux -S <socket> has-session -t <session>` and classify it."""
+    """Run `tmux -S <socket> has-session -t =<session>` and classify it."""
+    # Exact: a bare name also matches as a prefix, so a dead seat's `-input` session reads it alive.
+    target = session if session.startswith("=") else "=" + session
     try:
-        r = subprocess.run([tmux, "-S", socket, "has-session", "-t", session],
+        r = subprocess.run([tmux, "-S", socket, "has-session", "-t", target],
                            capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None

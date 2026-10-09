@@ -26,6 +26,9 @@ import sys
 from dataclasses import dataclass
 from typing import Iterable
 
+# Slack's token family has one owner; a private copy here missed xapp-/xoxe- tokens.
+from chat_secret_filter import PRIVATE_KEY_PATTERN, SLACK_TOKEN_PATTERN
+
 # Guarded: a module-scope import let detect-secrets' ABSENCE disable the
 # repo-local rules written to cover its blind spots (issue #3100).
 try:
@@ -82,10 +85,8 @@ _FULL_PATTERNS: dict[str, re.Pattern] = {
     "AWS Access Key": re.compile(r"AKIA[A-Z0-9]{16}"),
     "GitHub Token": re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}"),
     "JSON Web Token": re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
-    "Slack Token": re.compile(r"xox[abps]-[A-Za-z0-9-]+"),
-    "Private Key": re.compile(
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----"
-    ),
+    "Slack Token": SLACK_TOKEN_PATTERN,
+    "Private Key": PRIVATE_KEY_PATTERN,
     "OpenAI Token": re.compile(r"sk-[A-Za-z0-9_-]*[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}"),  # matches detect-secrets OpenAIDetector pattern
     "Stripe Access Key": re.compile(r"sk_(?:live|test)_[A-Za-z0-9]{24,}"),
     "Discord Bot Token": re.compile(
@@ -122,6 +123,9 @@ _WHOLE_LINE_PATTERNS: dict[str, re.Pattern] = {
         r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
     ),
     "Bare Hex Token": re.compile(r"^[0-9a-fA-F]{32,}$"),
+    # detect-secrets has no xapp-/xoxe- rule, so a bare Slack token handed to
+    # `vault set` read as prose; the shared family anchored whole-line closes that.
+    "Slack Token": re.compile(rf"^(?:{SLACK_TOKEN_PATTERN.pattern})$"),
 }
 
 
@@ -185,7 +189,7 @@ def redact_secrets(text: str, hits: Iterable[SecretHit]) -> str:
             continue
         if h.secret_type == "Private Key":
             # Find END marker on or after the hit line.
-            end_idx = idx
+            end_idx = len(lines) - 1
             for j in range(idx, len(lines)):
                 if "-----END " in lines[j] and "PRIVATE KEY-----" in lines[j]:
                     end_idx = j

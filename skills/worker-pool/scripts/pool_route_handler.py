@@ -79,13 +79,24 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     # the older one stamps source itself. Either mark means the same command.
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         return DECLINE, [], None
+    # A replay follows the committed delivery, whatever the bindings say now; one roster
+    # read serves the replay check and the route, and decides for a task nobody holds yet.
     try:
-        raw = pr._load_existing_roster_strict(workspace)
+        raw, unreadable = pr._load_existing_roster_strict(workspace), False
     except pr.RosterError:
+        raw, unreadable = None, True
+    roster = raw if (isinstance(raw, dict) and "workers" in raw) else None
+    try:
+        committed = rt.committed_recipient(workspace, task.get("id") or "", roster=roster)
+    except rt.RouterRefused as e:      # a conflict, or evidence that cannot be read
+        print(f"pool_route_handler: {e}", file=sys.stderr)
+        return MUST_HANDLE, [], None
+    if committed is not None and committed != pr.CORE:
+        return 0, [committed], roster
+    if unreadable:
         # Absent means no pool; UNREADABLE means we cannot tell whose work this
         # is. Declining would hand every bound task to the unrestricted core.
         return MUST_HANDLE, [], None
-    roster = raw if (isinstance(raw, dict) and "workers" in raw) else None
     if roster is None:
         return DECLINE, [], None
     try:
@@ -182,7 +193,10 @@ def main(argv=None) -> int:
         print(f"pool_route_handler: delivery failed: {e}", file=sys.stderr)
         return MUST_HANDLE
     settled = set(out.get("delivered") or []) | set(out.get("already") or [])
-    unsettled = [t for t in targets if t not in settled] + list(out.get("skipped") or [])
+    # Judge settlement by the targets the route COMMITTED to, not the probe's
+    # snapshot: a commit that landed between the two is not a missing delivery.
+    routed = list(out.get("targets") or targets)
+    unsettled = [t for t in routed if t not in settled] + list(out.get("skipped") or [])
     if unsettled:
         # 0 here releases the watcher's claim on a task no worker holds.
         print(json.dumps({**out, "unsettled": unsettled}), file=sys.stderr)

@@ -72,6 +72,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)
 - [Core health verdict + severity gate](design-core-health-verdict.md)
+- [Health snapshot: `GET /health`](health-snapshot.md)
 - [Pointer Teacher design](pointer-teacher-design.md)
 - [Credential resolution by capability (G8)](design-credential-capability-resolver.md)
 - [ADR 0001: Pointer Teacher brain](adr/0001-pointer-teacher-brain.md)
@@ -104,3 +105,12 @@ Run the audit locally:
 ```bash
 python3 skills/release/scripts/docs_audit.py
 ```
+
+## Local reliability evaluation
+
+- [Retained learning windows](learning-window.md) — optional collector and pending-evidence contract.
+- [Concluded reliability evaluation](reliability-v3-results.md) — Rui's full-day testimony, measured components and limitations.
+
+- [GitHub verification receipts](github-verification.md) — bounded PR evidence and governed foreground publication.
+
+- [Outstanding cron payload preservation](cron-outstanding-payload.md) — immutable prompt tasks until retirement.

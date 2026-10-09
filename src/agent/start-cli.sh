@@ -26,6 +26,11 @@ if [ -f "$REPO/.env" ]; then
     _self_dev_was_set=1
     _self_dev_ambient="$SUTANDO_SELF_DEVELOPMENT_ENABLED"
   fi
+  _codex_reset_was_set=0
+  if [ "${SUTANDO_CODEX_AUTO_RESET_ENABLED+x}" = x ]; then
+    _codex_reset_was_set=1
+    _codex_reset_ambient="$SUTANDO_CODEX_AUTO_RESET_ENABLED"
+  fi
   set -a
   # shellcheck disable=SC1091
   source "$REPO/.env"
@@ -33,7 +38,11 @@ if [ -f "$REPO/.env" ]; then
   if [ "$_self_dev_was_set" = 1 ]; then
     export SUTANDO_SELF_DEVELOPMENT_ENABLED="$_self_dev_ambient"
   fi
+  if [ "$_codex_reset_was_set" = 1 ]; then
+    export SUTANDO_CODEX_AUTO_RESET_ENABLED="$_codex_reset_ambient"
+  fi
   unset _self_dev_was_set _self_dev_ambient
+  unset _codex_reset_was_set _codex_reset_ambient
 fi
 
 # `--runtime <name>` names the runtime for THIS launch (leading arg only). A
@@ -72,6 +81,17 @@ if [ ! -x "$launcher" ]; then
   exit 1
 fi
 
+for _arg in "$@"; do
+  case "${_arg%%=*}" in
+    --external-helpers|--no-schedule-reconcile)
+      if [ "$runtime" != "codex" ]; then
+        echo "start-cli: ${_arg%%=*} is supported only for Codex" >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
 export SUTANDO_CORE_RUNTIME="$runtime"
 
 # A config switch may find the other runtime still occupying the canonical
@@ -93,10 +113,24 @@ if [ -n "$active_runtime" ] && [ "$active_runtime" != "$runtime" ] \
   set -- --restart "$@"
 fi
 
+# A restart the launcher will refuse must refuse here too, before any helper is reaped:
+# otherwise the still-running core keeps its pane but loses task intake and observation.
+. "$REPO/src/agent/restart-guard.sh"
+case "${1:-}" in
+  --restart|--force-restart)
+    if sutando_restart_guard_refuses "${SUTANDO_CORE_SESSION:-}"; then
+      sutando_restart_guard_explain
+      sutando_restart_attempt_log "$REPO" "${1#--}" "$SUTANDO_RESTART_GUARD_REASON"
+      exit 1
+    fi
+    ;;
+esac
+
 # The Codex notifier is runtime-specific. Always reap it before launching a
 # non-Codex core, including upgrades from sessions that predate runtime markers.
 if [ "$runtime" != "codex" ] && command -v tmux >/dev/null 2>&1; then
   tmux -S "$tmux_socket" kill-session -t "=${session}-watcher" 2>/dev/null || true
+  tmux -S "$tmux_socket" kill-session -t "=${session}-observer" 2>/dev/null || true
 fi
 
 exec bash "$launcher" "$@"

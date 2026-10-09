@@ -82,14 +82,14 @@ print(resolve_workspace(), end='')
 "
     ;;
   skill-roots)
-    # Every directory that holds skills, one per line, in precedence order (src/skill_roots.py).
+    # Every directory that holds skills, one per line, in precedence order (src/installed_skill_roots.py).
     # $2 (optional): an already-resolved workspace root, as for voice-pidfile.
     if [ -n "${2:-}" ]; then _ws="$2"; else _ws="$(bash "$0" workspace)" || exit 1; fi
     py - "$REPO_ROOT" "$_ws" <<'PYEOF'
 import sys
 sys.path.insert(0, sys.argv[1] + '/src')
-from skill_roots import skill_roots
-for root in skill_roots(sys.argv[1], sys.argv[2]):
+from installed_skill_roots import installed_skill_roots
+for root in installed_skill_roots(sys.argv[1], sys.argv[2]):
     print(root)
 PYEOF
     ;;

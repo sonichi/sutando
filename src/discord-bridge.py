@@ -157,7 +157,7 @@ def _is_discord_channel_id(value: str) -> bool:
     """A snowflake, so a Telegram chat id or a Matrix room id can never be
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
-from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
+from result_markers import parse_markers, has_skip_action  # noqa: E402
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
@@ -5007,79 +5007,21 @@ async def poll_results():
                 _parsed = parse_markers(reply_text)
                 _skip = next((a for a in _parsed.actions if a.kind == "skip"), None)
                 if _skip is not None:
-                    # [no-send] / [REPLIED] / [deduped:] — normally a silent
-                    # archive. GUARD: dedup is per-channel only. A
-                    # `[deduped: task-X]` whose holder X came from a DIFFERENT
-                    # channel is invalid (it would leave the asking channel
-                    # silent). Reject it and RE-QUEUE the original task with a
-                    # trusted ===SYSTEM=== note so the core re-answers it in its
-                    # own channel. Loop guard: a task that comes back
-                    # cross-channel-deduped a SECOND time is not re-queued again
-                    # — notify in-channel instead (owner-directed).
+                    # All dedup boundaries and retry limits belong to the shared
+                    # plan; Discord only routes the re-ask or sends its report.
                     if _skip.value == "deduped":
                         _act, _delivered = "defer", None
                         try:
-                            # find_task_file globs unchecked; an id failing the
-                            # gate find_result applies is "holder not found".
-                            _holder_file = (
-                                find_task_file(TASKS_DIR, _skip.extra)
-                                if local_task_protocol.valid_archive_lookup_id(_skip.extra)
-                                else None)
-                            _holder_text = _holder_file.read_text() if _holder_file else None
-                            _target = dedup_cross_channel_target(channel.id, _holder_text)
-                            # Cross-channel is an unconfirmed report: the asker is
-                            # only served once the notify or the re-queue lands.
-                            _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)
-                                         if not _target else ("report", None))
+                            _act, _pl = _dedup_recover(task_id, _skip.extra, channel.id)
                             if _act == "requeue":
                                 pending_replies[_pl] = channel
                                 pending_admitted_ms[_pl] = int(time.time() * 1000)
                                 save_pending_replies()
-                            elif _act == "report" and not _target:
-                                # Cross-channel carries a None payload and is
-                                # delivered by the _target block below instead.
+                            elif _act == "report":
                                 await channel.send(_pl)
                                 _delivered = True
-                            if _target:
-                                _orig_file = find_task_file(TASKS_DIR, task_id)
-                                _orig_text = _orig_file.read_text() if _orig_file else None
-                                _count = dedup_requeue_count(_orig_text)
-                                if _count >= 1:
-                                    # Second time — don't loop; flag it.
-                                    print(
-                                        f"  [dedup] cross-channel retry failed for {task_id} "
-                                        f"(holder {_skip.extra} in #{_target}) — notifying",
-                                        flush=True,
-                                    )
-                                    await channel.send(
-                                        f"⚠️ Couldn't auto-correct a cross-channel dedup for "
-                                        f"`{task_id}` (folded into `{_skip.extra}` in <#{_target}>) "
-                                        f"even after a re-queue — flagging instead of looping. "
-                                        f"This needs a direct answer here."
-                                    )
-                                    _delivered = True
-                                else:
-                                    # First time — reject + re-queue for an
-                                    # in-channel answer.
-                                    _new_id = f"task-{int(time.time() * 1000)}"
-                                    _requeued = build_requeued_task(
-                                        _orig_text or "", _new_id, _count + 1,
-                                        channel.id, _skip.extra,
-                                    )
-                                    (TASKS_DIR / f"{_new_id}.txt").write_text(_requeued)
-                                    # Route the re-answer back to THIS channel.
-                                    pending_replies[_new_id] = channel
-                                    pending_admitted_ms[_new_id] = int(time.time() * 1000)
-                                    save_pending_replies()
-                                    print(
-                                        f"  [dedup] cross-channel reject: {task_id} (#{channel.id}) "
-                                        f"folded into {_skip.extra} (#{_target}) — re-queued as "
-                                        f"{_new_id} for in-channel answer",
-                                        flush=True,
-                                    )
-                                    _delivered = True
                         except Exception as e:
-                            print(f"  [dedup] cross-channel reject/requeue failed: {e}", flush=True)
+                            print(f"  [dedup] recovery routing failed: {e}", flush=True)
                         if report_disposition(_act, _delivered) == "retain":
                             # Nobody was told. Keep the result AND the task so a
                             # later pass retries; archiving loses the question.

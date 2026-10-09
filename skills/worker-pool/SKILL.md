@@ -76,6 +76,72 @@ these fields. A broker label edit can persist without a version bump, so a
 repeat of the current version follows the owner's complete map and repairs
 local label drift.
 
+## Binding a room to an existing worker
+
+`pool_roster.py:bind_room(workspace, room, target)` pins one room to one
+already-registered worker (by id or unique label) — the picker's "pin" action
+and `pool_roster.py bind` both go through it. **It does not call
+`publish_task_event_handler()`.** `register_worker()` (and therefore
+`create_worker.py`) does, on every call, because a registration that leaves
+the core watcher without its route handler is a pool the launcher cannot
+recognize (see its docstring). `bind_room()` only writes the binding and
+recompiles the roster/advertisement — nothing declares the handler.
+
+That handler — `state/task-event-handler.json`, pointing at
+`pool_route_handler.py` — is what makes the core watcher hand a bound room's
+tasks to its worker instead of answering them itself. If it was never
+published (a fresh install whose only registrations ever went through
+`bind_room()`, or one where the file was lost), every room pinned since then
+silently falls through to the core: the room still gets an answer, just from
+the wrong instance, and nothing errors. Check with (from the repo root, so
+the relative `sys.path` inserts resolve):
+
+```bash
+WS="$(bash scripts/sutando-config.sh workspace)"
+python3 -c "
+import sys; sys.path.insert(0, 'src')
+from util_paths import task_event_handler_config_path
+print(task_event_handler_config_path('$WS/state').exists())
+"
+```
+
+`False` (or the equivalent: `bindings.json` names a worker but its
+`deliveries/<worker id>/` never gets a sentinel for that room's traffic) means
+routing has never actually reached the worker. Stopgap, safe to run any time —
+it is the exact call `register_worker()` makes, just without a registration
+attached (also from the repo root):
+
+```bash
+WS="$(bash scripts/sutando-config.sh workspace)"
+python3 -c "
+import sys; sys.path.insert(0, 'skills/worker-pool/scripts')
+from pool_roster import publish_task_event_handler
+print(publish_task_event_handler('$WS'))
+"
+```
+
+The core's watcher fswatches that path, so this takes effect immediately —
+no restart. It is a one-time fix for this host's *current* state, not a code
+fix: `bind_room()` itself still won't publish on the *next* fresh pin until
+it is taught to (tracked in #4580). Re-run the stopgap if
+`state/task-event-handler.json` is ever lost, or if a room is pinned via
+`bind_room()` on an install that has never registered a worker through
+`register_worker()`/`create_worker()`.
+
+**Finding your own name.** `pool_ask.py --who` already marks your own row:
+`whoami()` compares `$SUTANDO_INSTANCE_ID` against every row (it still lists
+every worker, not just yours), text output appends `  (you)` to the matching
+one, and `--json` sets `"me": true` on it:
+
+```bash
+python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --who
+```
+
+Add `--json` for `"me": true`. Built from the roster
+(`pool_roster.py:load_roster`), not the advertisement file —
+`state/pool-advertisement.json`'s `profile_workers` map carries only `label`
+and (when known) `runtime`, never `display_label` or a self-marker.
+
 ## Talking to the other instances (core ↔ worker)
 
 You are one instance of a pool: the **core** (the canonical session, owning `tasks/`)

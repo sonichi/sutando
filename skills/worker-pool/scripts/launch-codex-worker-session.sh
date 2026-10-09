@@ -63,6 +63,9 @@ fi
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
   ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
 fi
+if [ "${SUTANDO_CODEX_AUTO_RESET_ENABLED+x}" = x ]; then
+  ENV_ARGS+=(-e "SUTANDO_CODEX_AUTO_RESET_ENABLED=$SUTANDO_CODEX_AUTO_RESET_ENABLED")
+fi
 
 if [ "${1:-}" = "--print-env" ]; then
   printf '%s\n' "${ENV_ARGS[@]}"
@@ -89,7 +92,9 @@ fi
 
 BOOT_PROMPT="You are Sutando worker $SUTANDO_INSTANCE_ID. The pool delivers tasks to your inbox. Do not run core startup, register schedules, start a watcher, or write core status. Handle only a delivered task prompt, read its named payload, and write the answer to its named result file. Reply Worker ready, then wait."
 CODEX_ARGS=(-C "$WORKING_DIR" --add-dir "$HOME" --sandbox danger-full-access
-            --ask-for-approval never --search --no-alt-screen)
+            --ask-for-approval never --search --no-alt-screen
+            # Headless like the core: an interactive startup update menu would block it.
+            -c check_for_update_on_startup=false)
 tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" \
   codex "${CODEX_ARGS[@]}" "$BOOT_PROMPT"
 for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -99,6 +104,14 @@ done
 if ! tmux -S "$SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
   echo "launch-codex-worker-session: $SESSION exited during startup" >&2
   exit 1
+fi
+
+if [ "$(uname -s)" = "Darwin" ]; then
+  reset_timer="$REPO/skills/proactive-loop/scripts/codex-auto-reset-timer.py"
+  if [ -f "$reset_timer" ] && ! "$WORKER_PY" "$reset_timer" ensure \
+      --workspace "$SUTANDO_WORKSPACE_DIR" --codex-home "${CODEX_HOME:-$HOME/.codex}" >/dev/null; then
+    echo "launch-codex-worker-session: could not reconcile the Codex earned-reset timer" >&2
+  fi
 fi
 
 # The supervisor owns this worker's standby watcher and task notifier.

@@ -76,6 +76,9 @@ record_delivery() {
 
 export SUTANDO_TEST_MODE=1
 export SUTANDO_WORKSPACE="$TMPWS"
+# The suite models the CORE: the launcher's marked session. An unmarked session
+# is a guest and is not gated at all (case 7).
+export SUTANDO_CORE_SESSION=1
 # This suite is about the queue and guest gates; the watcher-coverage gate (a
 # temp inbox nobody watches would block every case) has its own suite.
 export SUTANDO_STOP_HOOK_WATCHER_GATE=0
@@ -204,14 +207,14 @@ case "$REJ_OUT" in
   '{}') ok "a refused interpreter still emits valid JSON" ;;
   *) bad "a refused interpreter still emits valid JSON" "got: ${REJ_OUT:0:120}" ;;
 esac
-# EXACT equality over argc + per-argument lines, not raw character content --
-# 3 separate args and 1 space-joined arg produce different argc here.
-GIT_CALLS_EXPECTED="$(printf 'GIT_CALLED argc=3\nARG<rev-parse>\nARG<--path-format=absolute>\nARG<--git-common-dir>\nGIT_CALLED argc=5\nARG<-C>\nARG<%s>\nARG<rev-parse>\nARG<--path-format=absolute>\nARG<--git-common-dir>\n' "$REJ")"
-if [ -f "$REJ/git-calls.log" ] && [ "$(cat "$REJ/git-calls.log")" = "$GIT_CALLS_EXPECTED" ]; then
-  ok "the git stub was invoked exactly twice, with the two expected EXACT argv records (argc + per-argument)"
+# Identity comes from the launcher's marker now, never from a git probe: the
+# recording stub must stay silent (a bare `git` here would raise the CLT dialog
+# this path exists to avoid).
+if [ ! -f "$REJ/git-calls.log" ]; then
+  ok "the hook never invokes git (identity is the launcher's marker, not the cwd's repo)"
 else
-  bad "the git stub was invoked exactly twice, with the two expected EXACT argv records (argc + per-argument)" \
-    "$([ -f "$REJ/git-calls.log" ] && cat "$REJ/git-calls.log" || echo "no log file -- git never ran")"
+  bad "the hook never invokes git (identity is the launcher's marker, not the cwd's repo)" \
+    "git ran: $(cat "$REJ/git-calls.log")"
 fi
 # Isolated positive control, separate whole-file controls: the fixture's own
 # args never contain a space, and a shared-log line-range slice can be fooled.
@@ -325,43 +328,92 @@ fi
 rm -f "$REJ/workspace/tasks/$EMPTY_PROBE" "$REJ/workspace/results/$EMPTY_PROBE"
 rm -f "$REJ/workspace/tasks/$RESULT_PROBE" "$REJ/workspace/results/$RESULT_PROBE"
 rm -rf "$REJ_CWD"
-# 7. THE GUEST CARVE-OUT. A worktree of an UNRELATED repo must not be held
-# hostage by the core's queue, even with a real pending task sitting in it.
-printf 'id: probe\ntask: guest-worktree-probe\n' > "$WS/tasks/$PROBE"
+# 7. IDENTITY. The core is the session the launcher marked (SUTANDO_CORE_SESSION=1)
+# or an enrolled worker (SUTANDO_INSTANCE_ID). Any other session in this checkout
+# -- an ad-hoc `claude`, a `claude -p <skill>` one-shot -- is a GUEST and owes
+# nothing (user report 2026-09-24: a one-shot skill session was blocked at every
+# Stop on the live core's own queue and looped). Identity used to be read from
+# the cwd's git repo, which cannot tell a guest in the checkout from the core.
+printf 'id: probe\ntask: guest-probe\n' > "$WS/tasks/$PROBE"
+# 7a. No marked core alive: the unmarked session may BE the core (a hand launch),
+# so it is gated -- the guest exit fails closed (review of #4863).
+NOCORE_OUT="$(env -u SUTANDO_CORE_SESSION bash "$HOOK" 2>"$TMPWS/nocore.err")"
+case "$NOCORE_OUT" in
+  *'"decision":"block"'*) ok "an unmarked session with NO live marked core is gated as the core (fail closed)" ;;
+  *) bad "an unmarked session with NO live marked core is gated as the core (fail closed)" "got: ${NOCORE_OUT:0:120}" ;;
+esac
+grep -q "no live marked core" "$TMPWS/nocore.err" \
+  && ok "...and says so on stderr" || bad "...and says so on stderr" "stderr: $(cat "$TMPWS/nocore.err")"
+# 7b. A stale heartbeat is no core either. The file is THIS host's, named the way
+# core_heartbeat.py names it (util_paths._host_label).
+HOST_LABEL="$("$TEST_PY" -c "import sys; sys.path.insert(0, '$REPO/src'); from util_paths import _host_label; print(_host_label())")"
+[ -n "$HOST_LABEL" ] || { bad "fixture: host label resolved" "empty"; HOST_LABEL="$(hostname -s)"; }
+mkdir -p "$WS/state/cores"
+printf '{"pid":1,"socket":"/tmp/x.sock","session":"core"}\n' > "$WS/state/cores/$HOST_LABEL.alive"
+touch -t 202001010000 "$WS/state/cores/$HOST_LABEL.alive"
+STALE_OUT="$(env -u SUTANDO_CORE_SESSION bash "$HOOK" 2>/dev/null)"
+case "$STALE_OUT" in
+  *'"decision":"block"'*) ok "a stale state/cores/<host>.alive does not make the unmarked session a guest" ;;
+  *) bad "a stale state/cores/<host>.alive does not make the unmarked session a guest" "got: ${STALE_OUT:0:120}" ;;
+esac
+# 7b2. ANOTHER host's fresh heartbeat (the workspace syncs them) is not this host's core.
+printf '{"pid":1,"socket":"/tmp/peer.sock","session":"core"}\n' > "$WS/state/cores/some-other-host.alive"
+FOREIGN_OUT="$(env -u SUTANDO_CORE_SESSION bash "$HOOK" 2>/dev/null)"
+case "$FOREIGN_OUT" in
+  *'"decision":"block"'*) ok "a foreign host's live heartbeat does not make the unmarked session a guest" ;;
+  *) bad "a foreign host's live heartbeat does not make the unmarked session a guest" "got: ${FOREIGN_OUT:0:120}" ;;
+esac
+rm -f "$WS/state/cores/some-other-host.alive"
+# 7c. A fresh heartbeat of THIS host: a marked core owns the queue, so the unmarked session is a guest.
+touch "$WS/state/cores/$HOST_LABEL.alive"
+GUEST_OUT="$(env -u SUTANDO_CORE_SESSION bash "$HOOK" 2>"$TMPWS/guest.err")"
+case "$GUEST_OUT" in
+  '{}') ok "an unmarked session beside a live marked core is a guest: {} with the queue pending" ;;
+  *) bad "an unmarked session beside a live marked core is a guest: {} with the queue pending" "got: ${GUEST_OUT:0:120}" ;;
+esac
+grep -q "guest session" "$TMPWS/guest.err" \
+  && ok "...and says so on stderr" || bad "...and says so on stderr" "stderr: $(cat "$TMPWS/guest.err")"
+GUEST_ZERO_OUT="$(SUTANDO_CORE_SESSION=0 bash "$HOOK" 2>/dev/null)"
+case "$GUEST_ZERO_OUT" in
+  '{}') ok "SUTANDO_CORE_SESSION set to anything but 1 is not the mark" ;;
+  *) bad "SUTANDO_CORE_SESSION set to anything but 1 is not the mark" "got: ${GUEST_ZERO_OUT:0:120}" ;;
+esac
+
+# 7b. A guest in an unrelated repo's worktree is a guest too (the old carve-out's case).
 GUEST_REPO="$(mktemp -d)"
 _git_fixture_repo "$GUEST_REPO"
-GUEST_OUT="$(cd "$GUEST_REPO" && bash "$HOOK" 2>&1)"
-case "$GUEST_OUT" in
-  '{}') ok "unrelated-repo worktree is not blocked by the core's queue" ;;
-  *) bad "unrelated-repo worktree is not blocked by the core's queue" "got: ${GUEST_OUT:0:120}" ;;
+GUEST_WT_OUT="$(cd "$GUEST_REPO" && env -u SUTANDO_CORE_SESSION bash "$HOOK" 2>/dev/null)"
+case "$GUEST_WT_OUT" in
+  '{}') ok "an unmarked session in an unrelated repo is not blocked by the core's queue" ;;
+  *) bad "an unmarked session in an unrelated repo is not blocked by the core's queue" "got: ${GUEST_WT_OUT:0:120}" ;;
 esac
-rm -rf "$GUEST_REPO"
 
-# 8. CONTROL FOR CASE 7. A worktree of THIS repo shares its git-common-dir --
-# still core, still blocks -- proving case 7 is keyed on a DIFFERENT repo, not "any worktree".
-OWN_WT="$REPO/.claude/worktrees/hooktest-$$"
-if "$TEST_GIT" -C "$REPO" worktree add -q --detach "$OWN_WT" HEAD 2>/dev/null; then
-  OWN_WT_OUT="$(cd "$OWN_WT" && bash "$HOOK" 2>&1)"
-  case "$OWN_WT_OUT" in
-    *'"decision":"block"'*) ok "this repo's own worktree is still the core, still blocks" ;;
-    *) bad "this repo's own worktree is still the core, still blocks" "got: ${OWN_WT_OUT:0:120}" ;;
-  esac
-  "$TEST_GIT" -C "$REPO" worktree remove --force "$OWN_WT" 2>/dev/null || rm -rf "$OWN_WT"
-else
-  printf '  skip own-repo worktree control; could not create one here\n'
-fi
+# 8. CONTROL FOR 7. The MARKED core is gated wherever it runs: this checkout and
+# a foreign cwd alike (SUTANDO_CLAUDE_WORKING_DIR is a supported core config).
+MARKED_HERE_OUT="$(bash "$HOOK" 2>&1)"
+case "$MARKED_HERE_OUT" in
+  *'"decision":"block"'*) ok "the marked core in the checkout still blocks" ;;
+  *) bad "the marked core in the checkout still blocks" "got: ${MARKED_HERE_OUT:0:120}" ;;
+esac
+MARKED_FOREIGN_OUT="$(cd "$GUEST_REPO" && bash "$HOOK" 2>&1)"
+case "$MARKED_FOREIGN_OUT" in
+  *'"decision":"block"'*) ok "the marked core in a foreign repo still blocks on the pending queue" ;;
+  *) bad "the marked core in a foreign repo still blocks on the pending queue" "got: ${MARKED_FOREIGN_OUT:0:160}" ;;
+esac
+case "$MARKED_FOREIGN_OUT" in
+  *"$PROBE"*) ok "the marked-core block payload names the pending task" ;;
+  *) bad "the marked-core block payload names the pending task" "payload omits $PROBE" ;;
+esac
 rm -f "$WS/tasks/$PROBE"
 
-# 8b. An ENROLLED WORKER (SUTANDO_INSTANCE_ID set) in a foreign worktree must
-# NOT take case 7's guest exit -- foreign --cwd is a supported worker config.
-WORKER_FOREIGN_REPO="$(mktemp -d)"
-_git_fixture_repo "$WORKER_FOREIGN_REPO"
+# 8b. An ENROLLED WORKER (SUTANDO_INSTANCE_ID set, no core mark) in a foreign
+# worktree is gated on its OWN deliveries -- foreign --cwd is a supported worker config.
 WFR_WORKER="worker-foreign-$$"
 WFR_PROBE="task-wfr-hooktest-$$"
 mkdir -p "$WS/deliveries/$WFR_WORKER"
 : > "$WS/deliveries/$WFR_WORKER/$WFR_PROBE.txt"
 printf 'id: %s\ntask: worker-foreign-probe\n' "$WFR_PROBE" > "$WS/tasks/$WFR_PROBE.txt"
-WFR_OUT="$(cd "$WORKER_FOREIGN_REPO" && SUTANDO_INSTANCE_ID="$WFR_WORKER" bash "$HOOK" 2>&1)"
+WFR_OUT="$(cd "$GUEST_REPO" && env -u SUTANDO_CORE_SESSION SUTANDO_INSTANCE_ID="$WFR_WORKER" bash "$HOOK" 2>&1)"
 case "$WFR_OUT" in
   *'"decision":"block"'*) ok "an enrolled worker in a foreign worktree still blocks on its own pending delivery" ;;
   *) bad "an enrolled worker in a foreign worktree still blocks on its own pending delivery" "got: ${WFR_OUT:0:160}" ;;
@@ -375,407 +427,36 @@ esac
 # real delivery gate, not a stuck-open one.
 printf 'done\n' > "$WS/results/$WFR_PROBE.txt"
 record_delivery
-WFR_CLEAR_OUT="$(cd "$WORKER_FOREIGN_REPO" && SUTANDO_INSTANCE_ID="$WFR_WORKER" bash "$HOOK" 2>&1)"
+WFR_CLEAR_OUT="$(cd "$GUEST_REPO" && env -u SUTANDO_CORE_SESSION SUTANDO_INSTANCE_ID="$WFR_WORKER" bash "$HOOK" 2>&1)"
 case "$WFR_CLEAR_OUT" in
   '{}') ok "the foreign-worker block clears once its own result is ready" ;;
   *) bad "the foreign-worker block clears once its own result is ready" "got: ${WFR_CLEAR_OUT:0:160}" ;;
 esac
 rm -f "$WS/results/$WFR_PROBE.txt" "$WS/deliveries/$WFR_WORKER/$WFR_PROBE.txt" "$WS/tasks/$WFR_PROBE.txt"
 rmdir "$WS/deliveries/$WFR_WORKER" 2>/dev/null || true
+rm -rf "$GUEST_REPO"
 
-# 8d. An ORDINARY GUEST (no SUTANDO_INSTANCE_ID) in the SAME foreign repo
-# must still take the fast guest exit -- proves 8b/8c keys on worker status.
-printf 'id: probe\ntask: guest-not-worker-probe\n' > "$WS/tasks/$PROBE"
-WFR_GUEST_OUT="$(cd "$WORKER_FOREIGN_REPO" && bash "$HOOK" 2>&1)"
-case "$WFR_GUEST_OUT" in
-  '{}') ok "an ordinary (non-worker) session in the same foreign repo still gets the guest exit" ;;
-  *) bad "an ordinary (non-worker) session in the same foreign repo still gets the guest exit" "got: ${WFR_GUEST_OUT:0:120}" ;;
-esac
-rm -f "$WS/tasks/$PROBE"
-
-# 8e. The MARKED CORE (SUTANDO_CORE_SESSION=1, the launcher's own mark, no
-# worker id) launched with a foreign cwd is the core, not a guest: same repo,
-# same pending task as 8d, and it must block instead of taking the guest exit.
-printf 'id: probe\ntask: marked-core-foreign-probe\n' > "$WS/tasks/$PROBE"
-WFR_CORE_OUT="$(cd "$WORKER_FOREIGN_REPO" && SUTANDO_CORE_SESSION=1 bash "$HOOK" 2>&1)"
-case "$WFR_CORE_OUT" in
-  *'"decision":"block"'*) ok "a marked core session in a foreign worktree still blocks on the pending queue" ;;
-  *) bad "a marked core session in a foreign worktree still blocks on the pending queue" "got: ${WFR_CORE_OUT:0:160}" ;;
-esac
-case "$WFR_CORE_OUT" in
-  *"$PROBE"*) ok "the marked-core block payload names the pending task" ;;
-  *) bad "the marked-core block payload names the pending task" "payload omits $PROBE" ;;
-esac
-rm -f "$WS/tasks/$PROBE"
-rm -rf "$WORKER_FOREIGN_REPO"
-
-# 9/10. THE PACKAGED-BUNDLE DEPLOYMENT MATRIX. A shipped app bundle has no
-# .git at all, so REPO_COMMON_DIR is empty by design -- pin both adjacent cases.
+# 9. A PACKAGED BUNDLE has no .git at all; identity does not depend on one.
 BUNDLE="$(mktemp -d)"
 mkdir -p "$BUNDLE/src" "$BUNDLE/scripts" "$BUNDLE/workspace/tasks" "$BUNDLE/workspace/results"
 cp "$REPO/src/check-pending-tasks.sh" "$BUNDLE/src/"
-cp "$REPO/scripts/git-binary.sh" "$BUNDLE/scripts/"
-BUNDLE_PY="$TEST_PY"
 printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
-  "$BUNDLE" "$BUNDLE_PY" > "$BUNDLE/scripts/sutando-config.sh"
+  "$BUNDLE" "$TEST_PY" > "$BUNDLE/scripts/sutando-config.sh"
 chmod +x "$BUNDLE/scripts/sutando-config.sh"
-printf 'id: probe\ntask: bundle-matrix-probe\n' > "$BUNDLE/workspace/tasks/$PROBE"
-
-# 9. non-Git bundle + a genuinely foreign Git cwd -> must SKIP ({}).
-BUNDLE_FOREIGN="$(mktemp -d)"
-_git_fixture_repo "$BUNDLE_FOREIGN"
-BF_OUT="$(cd "$BUNDLE_FOREIGN" && bash "$BUNDLE/src/$(basename "$HOOK")" 2>&1)"
-case "$BF_OUT" in
-  '{}') ok "non-Git bundle + foreign Git cwd -> skip (guest carve-out applies)" ;;
-  *) bad "non-Git bundle + foreign Git cwd -> skip (guest carve-out applies)" "got: ${BF_OUT:0:120}" ;;
+printf 'id: probe\ntask: bundle-probe\n' > "$BUNDLE/workspace/tasks/$PROBE"
+mkdir -p "$BUNDLE/workspace/state/cores" && printf '{"socket":"/tmp/x.sock"}\n' > "$BUNDLE/workspace/state/cores/$HOST_LABEL.alive"
+BUNDLE_CWD="$(mktemp -d)"
+B_CORE_OUT="$(cd "$BUNDLE_CWD" && bash "$BUNDLE/src/$(basename "$HOOK")" 2>&1)"
+case "$B_CORE_OUT" in
+  *'"decision":"block"'*) ok "non-Git bundle + marked core -> blocks on the bundle's queue" ;;
+  *) bad "non-Git bundle + marked core -> blocks on the bundle's queue" "got: ${B_CORE_OUT:0:120}" ;;
 esac
-# 9b. The same bundle and foreign cwd, but the session is the MARKED CORE: the
-# carve-out must not apply, so the bundle's own pending queue blocks it.
-BF_CORE_OUT="$(cd "$BUNDLE_FOREIGN" && SUTANDO_CORE_SESSION=1 bash "$BUNDLE/src/$(basename "$HOOK")" 2>&1)"
-case "$BF_CORE_OUT" in
-  *'"decision":"block"'*) ok "non-Git bundle + foreign Git cwd + marked core -> still blocks on the bundle's queue" ;;
-  *) bad "non-Git bundle + foreign Git cwd + marked core -> still blocks on the bundle's queue" "got: ${BF_CORE_OUT:0:120}" ;;
+B_GUEST_OUT="$(cd "$BUNDLE_CWD" && env -u SUTANDO_CORE_SESSION bash "$BUNDLE/src/$(basename "$HOOK")" 2>/dev/null)"
+case "$B_GUEST_OUT" in
+  '{}') ok "non-Git bundle + unmarked session -> guest ({})" ;;
+  *) bad "non-Git bundle + unmarked session -> guest ({})" "got: ${B_GUEST_OUT:0:120}" ;;
 esac
-rm -rf "$BUNDLE_FOREIGN"
-
-# 10. non-Git bundle + a NON-Git cwd -> fail closed -- the control proving
-# case 9 is keyed on "a different repo", not on "the bundle has no .git".
-BUNDLE_CLEAN_CWD="$(mktemp -d)"
-BC_OUT="$(cd "$BUNDLE_CLEAN_CWD" && bash "$BUNDLE/src/$(basename "$HOOK")" 2>&1)"
-case "$BC_OUT" in
-  *'"decision":"block"'*) ok "non-Git bundle + non-Git cwd -> still gates (fail closed)" ;;
-  *) bad "non-Git bundle + non-Git cwd -> still gates (fail closed)" "got: ${BC_OUT:0:120}" ;;
-esac
-rm -rf "$BUNDLE_CLEAN_CWD" "$BUNDLE"
-
-# 11. A REAL checkout whose repo-side git probe FAILS must still GATE -- same
-# empty REPO_COMMON_DIR as a packaged bundle, opposite cause, opposite answer.
-FAILPROBE="$(mktemp -d)"
-mkdir -p "$FAILPROBE/src" "$FAILPROBE/scripts" "$FAILPROBE/workspace/tasks" "$FAILPROBE/workspace/results" "$FAILPROBE/.git"
-cp "$REPO/src/check-pending-tasks.sh" "$FAILPROBE/src/"
-cp "$REPO/scripts/git-binary.sh" "$FAILPROBE/scripts/"
-FP_PY="$TEST_PY"
-printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
-  "$FAILPROBE" "$FP_PY" > "$FAILPROBE/scripts/sutando-config.sh"
-chmod +x "$FAILPROBE/scripts/sutando-config.sh"
-printf 'id: probe\ntask: failed-probe-matrix\n' > "$FAILPROBE/workspace/tasks/$PROBE"
-FAILPROBE_FOREIGN="$(mktemp -d)"
-_git_fixture_repo "$FAILPROBE_FOREIGN"
-# A silently-broken init would also leave this empty, blocking via "no identity
-# at all" rather than the specific failed-probe ambiguity this case names.
-FPF_IDENTITY="$("$TEST_GIT" -C "$FAILPROBE_FOREIGN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-if [ -z "$FPF_IDENTITY" ]; then
-  bad "real checkout + failed repo-side git probe -> still gates (ambiguity fails closed)" \
-    "fixture bug: FAILPROBE_FOREIGN has no resolvable git identity, this case tests nothing"
-else
-  FPO_OUT="$(cd "$FAILPROBE_FOREIGN" && bash "$FAILPROBE/src/$(basename "$HOOK")" 2>&1)"
-  case "$FPO_OUT" in
-    *'"decision":"block"'*) ok "real checkout + failed repo-side git probe -> still gates (ambiguity fails closed)" ;;
-    *) bad "real checkout + failed repo-side git probe -> still gates (ambiguity fails closed)" "got: ${FPO_OUT:0:120}" ;;
-  esac
-fi
-rm -rf "$FAILPROBE_FOREIGN" "$FAILPROBE"
-
-# 12. A REAL checkout with NO .git of its OWN (an inner child with the .git
-# only in the OUTER parent) but a RESOLVED identity equal to the cwd's must still be core.
-OUTER_REPO="$(mktemp -d)"
-_git_fixture_repo "$OUTER_REPO"
-NESTED_REPO="$OUTER_REPO/child"
-mkdir -p "$NESTED_REPO/src" "$NESTED_REPO/scripts" "$NESTED_REPO/workspace/tasks" "$NESTED_REPO/workspace/results"
-cp "$REPO/src/check-pending-tasks.sh" "$NESTED_REPO/src/"
-cp "$REPO/scripts/git-binary.sh" "$NESTED_REPO/scripts/"
-NR_PY="$TEST_PY"
-printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
-  "$NESTED_REPO" "$NR_PY" > "$NESTED_REPO/scripts/sutando-config.sh"
-chmod +x "$NESTED_REPO/scripts/sutando-config.sh"
-printf 'id: probe\ntask: nested-subdir-probe\n' > "$NESTED_REPO/workspace/tasks/$PROBE"
-NR_REPO_ID="$("$TEST_GIT" -C "$NESTED_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-NR_CWD_ID="$("$TEST_GIT" -C "$OUTER_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-if [ -e "$NESTED_REPO/.git" ]; then
-  bad "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" \
-    "fixture bug: $NESTED_REPO/.git exists, this case tests nothing"
-elif [ -z "$NR_REPO_ID" ] || [ -z "$NR_CWD_ID" ] || [ "$NR_REPO_ID" != "$NR_CWD_ID" ]; then
-  bad "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" \
-    "fixture bug: identities don't both resolve equal -- child='$NR_REPO_ID' outer='$NR_CWD_ID', this case tests nothing"
-else
-  # Run from the OUTER root, not the child -- REPO_COMMON_DIR (walked up from
-  # the child) must equal CWD_COMMON_DIR (resolved directly at the outer root).
-  NR_OUT="$(cd "$OUTER_REPO" && bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
-  case "$NR_OUT" in
-    *'"decision":"block"'*) ok "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" ;;
-    *) bad "no-own-.git subdir of a real repo, matching cwd identity -> still core, still blocks" "got: ${NR_OUT:0:120}" ;;
-  esac
-fi
-rm -rf "$OUTER_REPO"
-
-# 12b. The SAME no-own-.git subdir as case 12, but the `-C DIR` probe itself
-# fails while a plain `cd`'d probe would still succeed -- must still block.
-OUTER_REPO="$(mktemp -d)"
-_git_fixture_repo "$OUTER_REPO"
-NESTED_REPO="$OUTER_REPO/child"
-mkdir -p "$NESTED_REPO/src" "$NESTED_REPO/scripts" "$NESTED_REPO/workspace/tasks" "$NESTED_REPO/workspace/results"
-cp "$REPO/src/check-pending-tasks.sh" "$NESTED_REPO/src/"
-cp "$REPO/scripts/git-binary.sh" "$NESTED_REPO/scripts/"
-printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
-  "$NESTED_REPO" "$TEST_PY" > "$NESTED_REPO/scripts/sutando-config.sh"
-chmod +x "$NESTED_REPO/scripts/sutando-config.sh"
-printf 'id: probe\ntask: nested-subdir-failed-c-probe\n' > "$NESTED_REPO/workspace/tasks/$PROBE"
-FCP_REPO_ID="$("$TEST_GIT" -C "$NESTED_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-FCP_CWD_ID="$("$TEST_GIT" -C "$OUTER_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-if [ -e "$NESTED_REPO/.git" ] || [ -z "$FCP_REPO_ID" ] || [ -z "$FCP_CWD_ID" ] || [ "$FCP_REPO_ID" != "$FCP_CWD_ID" ]; then
-  bad "no-own-.git subdir + failed -C probe -> still core, still blocks" \
-    "fixture bug: child='$FCP_REPO_ID' outer='$FCP_CWD_ID', this case tests nothing"
-else
-  # Fails only a bare `-C` invocation; a real script, not a symlink, so
-  # resolve_git() treats it as a real git rather than the macOS CLT stub.
-  STUBDIR="$(mktemp -d)"
-  printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = "-C" ] && exit 1; done\nexec "%s" "$@"\n' "$TEST_GIT" > "$STUBDIR/git"
-  chmod +x "$STUBDIR/git"
-  FCP_OUT="$(cd "$OUTER_REPO" && PATH="$STUBDIR:$PATH" bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
-  case "$FCP_OUT" in
-    *'"decision":"block"'*) ok "no-own-.git subdir + failed -C probe -> still core, still blocks" ;;
-    *) bad "no-own-.git subdir + failed -C probe -> still core, still blocks" "got: ${FCP_OUT:0:160}" ;;
-  esac
-  rm -rf "$STUBDIR"
-fi
-rm -rf "$OUTER_REPO"
-
-# 12c. A repo-side probe that RESOLVES but then fails to canonicalize must
-# be as ambiguous as an outright probe failure, never read as no identity.
-OUTER_REPO="$(mktemp -d)"
-_git_fixture_repo "$OUTER_REPO"
-NESTED_REPO="$OUTER_REPO/child"
-mkdir -p "$NESTED_REPO/src" "$NESTED_REPO/scripts" "$NESTED_REPO/workspace/tasks" "$NESTED_REPO/workspace/results"
-cp "$REPO/src/check-pending-tasks.sh" "$NESTED_REPO/src/"
-cp "$REPO/scripts/git-binary.sh" "$NESTED_REPO/scripts/"
-printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
-  "$NESTED_REPO" "$TEST_PY" > "$NESTED_REPO/scripts/sutando-config.sh"
-chmod +x "$NESTED_REPO/scripts/sutando-config.sh"
-printf 'id: probe\ntask: nested-subdir-dead-canon\n' > "$NESTED_REPO/workspace/tasks/$PROBE"
-DC_REPO_ID="$("$TEST_GIT" -C "$NESTED_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-DC_CWD_ID="$("$TEST_GIT" -C "$OUTER_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-if [ -e "$NESTED_REPO/.git" ] || [ -z "$DC_REPO_ID" ] || [ -z "$DC_CWD_ID" ] || [ "$DC_REPO_ID" != "$DC_CWD_ID" ]; then
-  bad "resolved-but-uncanonicalizable repo probe -> still core, still blocks" \
-    "fixture bug: child='$DC_REPO_ID' outer='$DC_CWD_ID', this case tests nothing"
-else
-  # A wrapper that answers the -C probe with a path it then DELETES, so the
-  # canonicalizing `cd` in the hook fails on a value that was real a moment ago.
-  STUBDIR="$(mktemp -d)"
-  DEAD_ALIAS="$(mktemp -d)"; rmdir "$DEAD_ALIAS"
-  printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = "-C" ] && { echo "%s"; exit 0; }; done\nexec "%s" "$@"\n' \
-    "$DEAD_ALIAS" "$TEST_GIT" > "$STUBDIR/git"
-  chmod +x "$STUBDIR/git"
-  DC_OUT="$(cd "$OUTER_REPO" && PATH="$STUBDIR:$PATH" bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
-  case "$DC_OUT" in
-    *'"decision":"block"'*) ok "resolved-but-uncanonicalizable repo probe -> still core, still blocks" ;;
-    *) bad "resolved-but-uncanonicalizable repo probe -> still core, still blocks" "got: ${DC_OUT:0:160}" ;;
-  esac
-  rm -rf "$STUBDIR"
-fi
-rm -rf "$OUTER_REPO"
-
-# 12d. Both repo-side probes FAIL, but not with git's own "not a git
-# repository" answer -- an unrelated error must not be read as confirmed absence.
-OUTER_REPO="$(mktemp -d)"
-_git_fixture_repo "$OUTER_REPO"
-NESTED_REPO="$OUTER_REPO/child"
-mkdir -p "$NESTED_REPO/src" "$NESTED_REPO/scripts" "$NESTED_REPO/workspace/tasks" "$NESTED_REPO/workspace/results"
-cp "$REPO/src/check-pending-tasks.sh" "$NESTED_REPO/src/"
-cp "$REPO/scripts/git-binary.sh" "$NESTED_REPO/scripts/"
-printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
-  "$NESTED_REPO" "$TEST_PY" > "$NESTED_REPO/scripts/sutando-config.sh"
-chmod +x "$NESTED_REPO/scripts/sutando-config.sh"
-printf 'id: probe\ntask: nested-subdir-other-error\n' > "$NESTED_REPO/workspace/tasks/$PROBE"
-OE_REPO_ID="$("$TEST_GIT" -C "$NESTED_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-OE_CWD_ID="$("$TEST_GIT" -C "$OUTER_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-if [ -e "$NESTED_REPO/.git" ] || [ -z "$OE_REPO_ID" ] || [ -z "$OE_CWD_ID" ] || [ "$OE_REPO_ID" != "$OE_CWD_ID" ]; then
-  bad "no-own-.git subdir + non-repo-confirming probe error -> still core, still blocks" \
-    "fixture bug: child='$OE_REPO_ID' outer='$OE_CWD_ID', this case tests nothing"
-else
-  # Fails only probes targeting NESTED_REPO (both `-C DIR` and the cd'd retry),
-  # leaving the separate CWD_COMMON_DIR probe (run from OUTER_REPO) untouched.
-  STUBDIR="$(mktemp -d)"
-  printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = "%s" ] && { echo "fatal: unable to read config file" >&2; exit 128; }; done\n[ "$PWD" = "%s" ] && { echo "fatal: unable to read config file" >&2; exit 128; }\nexec "%s" "$@"\n' \
-    "$NESTED_REPO" "$NESTED_REPO" "$TEST_GIT" > "$STUBDIR/git"
-  chmod +x "$STUBDIR/git"
-  OE_OUT="$(cd "$OUTER_REPO" && PATH="$STUBDIR:$PATH" bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
-  case "$OE_OUT" in
-    *'"decision":"block"'*) ok "no-own-.git subdir + non-repo-confirming probe error -> still core, still blocks" ;;
-    *) bad "no-own-.git subdir + non-repo-confirming probe error -> still core, still blocks" "got: ${OE_OUT:0:160}" ;;
-  esac
-  rm -rf "$STUBDIR"
-fi
-rm -rf "$OUTER_REPO"
-
-# 12e. Same no-own-.git subdir as case 12, but a caller-inherited ceiling
-# makes both probes answer "not a git repository" though this child IS ours.
-OUTER_REPO="$(mktemp -d)"
-_git_fixture_repo "$OUTER_REPO"
-NESTED_REPO="$OUTER_REPO/child"
-mkdir -p "$NESTED_REPO/src" "$NESTED_REPO/scripts" "$NESTED_REPO/workspace/tasks" "$NESTED_REPO/workspace/results"
-cp "$REPO/src/check-pending-tasks.sh" "$NESTED_REPO/src/"
-cp "$REPO/scripts/git-binary.sh" "$NESTED_REPO/scripts/"
-printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
-  "$NESTED_REPO" "$TEST_PY" > "$NESTED_REPO/scripts/sutando-config.sh"
-chmod +x "$NESTED_REPO/scripts/sutando-config.sh"
-printf 'id: probe\ntask: nested-subdir-ceiling\n' > "$NESTED_REPO/workspace/tasks/$PROBE"
-CE_REPO_ID="$("$TEST_GIT" -C "$NESTED_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-CE_CWD_ID="$("$TEST_GIT" -C "$OUTER_REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-CE_CEILINGED="$(GIT_CEILING_DIRECTORIES="$OUTER_REPO" "$TEST_GIT" -C "$NESTED_REPO" rev-parse --git-common-dir 2>&1)"
-if [ -e "$NESTED_REPO/.git" ] || [ -z "$CE_REPO_ID" ] || [ -z "$CE_CWD_ID" ] || [ "$CE_REPO_ID" != "$CE_CWD_ID" ] \
-   || [[ "$CE_CEILINGED" != *"not a git repository"* ]]; then
-  bad "GIT_CEILING_DIRECTORIES-limited subdir -> still core, still blocks" \
-    "fixture bug: child='$CE_REPO_ID' outer='$CE_CWD_ID' ceilinged='$CE_CEILINGED', this case tests nothing"
-else
-  CE_OUT="$(cd "$OUTER_REPO" && GIT_CEILING_DIRECTORIES="$OUTER_REPO" \
-    bash "$NESTED_REPO/src/$(basename "$HOOK")" 2>&1)"
-  case "$CE_OUT" in
-    *'"decision":"block"'*) ok "GIT_CEILING_DIRECTORIES-limited subdir -> still core, still blocks" ;;
-    *) bad "GIT_CEILING_DIRECTORIES-limited subdir -> still core, still blocks" "got: ${CE_OUT:0:160}" ;;
-  esac
-fi
-rm -rf "$OUTER_REPO"
-
-# 12f. Case 9's fixture, but git's diagnostic is TRANSLATED for the caller's
-# locale -- the guest carve-out must not go blind over a non-C LC_ALL.
-LOC_BUNDLE="$(mktemp -d)"
-mkdir -p "$LOC_BUNDLE/src" "$LOC_BUNDLE/scripts" "$LOC_BUNDLE/workspace/tasks" "$LOC_BUNDLE/workspace/results"
-cp "$REPO/src/check-pending-tasks.sh" "$LOC_BUNDLE/src/"
-cp "$REPO/scripts/git-binary.sh" "$LOC_BUNDLE/scripts/"
-printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
-  "$LOC_BUNDLE" "$TEST_PY" > "$LOC_BUNDLE/scripts/sutando-config.sh"
-chmod +x "$LOC_BUNDLE/scripts/sutando-config.sh"
-printf 'id: probe\ntask: locale-translated-not-a-repo\n' > "$LOC_BUNDLE/workspace/tasks/$PROBE"
-LOC_FOREIGN="$(mktemp -d)"
-_git_fixture_repo "$LOC_FOREIGN"
-LOC_STUBDIR="$(mktemp -d)"
-# Wraps the resolved real git; only TRANSLATES its own "not a git repository"
-# line when the caller's LC_ALL isn't C, so the fix is what forces English.
-cat > "$LOC_STUBDIR/git" << WRAP
-#!/bin/bash
-OUT="\$("$TEST_GIT" "\$@" 2>"$LOC_STUBDIR/.err")"
-RC=\$?
-ERR="\$(cat "$LOC_STUBDIR/.err")"
-if [ "\$RC" -ne 0 ]; then
-  if [ "\${LC_ALL:-}" != "C" ] && [[ "\$ERR" == *"not a git repository"* ]]; then
-    echo "fatal : ceci n'est pas un dépôt git : .git" >&2
-  else
-    echo "\$ERR" >&2
-  fi
-else
-  echo "\$OUT"
-fi
-exit "\$RC"
-WRAP
-chmod +x "$LOC_STUBDIR/git"
-if [ -z "$("$TEST_GIT" -C "$LOC_FOREIGN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ]; then
-  bad "translated not-a-repo diagnostic -> guest carve-out still applies" \
-    "fixture bug: LOC_FOREIGN has no resolvable git identity, this case tests nothing"
-else
-  LOC_ERRFILE="$(mktemp)"
-  LOC_OUT="$(cd "$LOC_FOREIGN" && LC_ALL=fr_FR.UTF-8 PATH="$LOC_STUBDIR:$PATH" \
-    bash "$LOC_BUNDLE/src/$(basename "$HOOK")" 2>"$LOC_ERRFILE")"
-  case "$LOC_OUT" in
-    '{}') ok "translated not-a-repo diagnostic -> guest carve-out still applies" ;;
-    *) bad "translated not-a-repo diagnostic -> guest carve-out still applies" \
-      "got stdout: ${LOC_OUT:0:160}; stderr: $(cat "$LOC_ERRFILE" | head -c 160)" ;;
-  esac
-  rm -f "$LOC_ERRFILE"
-fi
-rm -rf "$LOC_BUNDLE" "$LOC_FOREIGN" "$LOC_STUBDIR"
-
-# 12g/12h. A foreign repo whose caller inherited GIT_DIR/GIT_COMMON_DIR
-# pointed at THIS repo -- either alone must not answer with our identity.
-printf 'id: probe\ntask: git-dir-env-inheritance\n' > "$WS/tasks/$PROBE"
-THIS_COMMON_DIR="$("$TEST_GIT" -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-GDE_REPO="$(mktemp -d)"
-_git_fixture_repo "$GDE_REPO"
-if [ -z "$THIS_COMMON_DIR" ]; then
-  bad "inherited GIT_DIR -> still a guest, not blocked" \
-    "fixture bug: could not resolve this repo's own common dir"
-  bad "inherited GIT_COMMON_DIR -> still a guest, not blocked" \
-    "fixture bug: could not resolve this repo's own common dir"
-else
-  GDE_OUT="$(cd "$GDE_REPO" && GIT_DIR="$THIS_COMMON_DIR" bash "$HOOK" 2>&1)"
-  case "$GDE_OUT" in
-    '{}') ok "inherited GIT_DIR -> still a guest, not blocked" ;;
-    *) bad "inherited GIT_DIR -> still a guest, not blocked" "got: ${GDE_OUT:0:160}" ;;
-  esac
-  GCDE_OUT="$(cd "$GDE_REPO" && GIT_COMMON_DIR="$THIS_COMMON_DIR" bash "$HOOK" 2>&1)"
-  case "$GCDE_OUT" in
-    '{}') ok "inherited GIT_COMMON_DIR -> still a guest, not blocked" ;;
-    *) bad "inherited GIT_COMMON_DIR -> still a guest, not blocked" "got: ${GCDE_OUT:0:160}" ;;
-  esac
-fi
-rm -rf "$GDE_REPO"
-rm -f "$WS/tasks/$PROBE"
-
-# 13. A DANGLING `.git` SYMLINK is marker-PRESENT (ambiguous), not marker-absent
-# -- `-e` alone would misread a broken checkout as an intentional bundle.
-DANGLING="$(mktemp -d)"
-mkdir -p "$DANGLING/src" "$DANGLING/scripts" "$DANGLING/workspace/tasks" "$DANGLING/workspace/results"
-cp "$REPO/src/check-pending-tasks.sh" "$DANGLING/src/"
-cp "$REPO/scripts/git-binary.sh" "$DANGLING/scripts/"
-DL_PY="$TEST_PY"
-printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
-  "$DANGLING" "$DL_PY" > "$DANGLING/scripts/sutando-config.sh"
-chmod +x "$DANGLING/scripts/sutando-config.sh"
-printf 'id: probe\ntask: dangling-symlink-probe\n' > "$DANGLING/workspace/tasks/$PROBE"
-ln -s "/nonexistent-target-$$" "$DANGLING/.git"
-DANGLING_FOREIGN="$(mktemp -d)"
-_git_fixture_repo "$DANGLING_FOREIGN"
-DLF_IDENTITY="$("$TEST_GIT" -C "$DANGLING_FOREIGN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-if [ -z "$DLF_IDENTITY" ]; then
-  bad "a dangling .git symlink is marker-present, ambiguous -> still gates" \
-    "fixture bug: DANGLING_FOREIGN has no resolvable git identity, this case tests nothing"
-else
-  DL_OUT="$(cd "$DANGLING_FOREIGN" && bash "$DANGLING/src/$(basename "$HOOK")" 2>&1)"
-  case "$DL_OUT" in
-    *'"decision":"block"'*) ok "a dangling .git symlink is marker-present, ambiguous -> still gates" ;;
-    *) bad "a dangling .git symlink is marker-present, ambiguous -> still gates" "got: ${DL_OUT:0:120}" ;;
-  esac
-fi
-rm -rf "$DANGLING_FOREIGN" "$DANGLING"
-
-# 14. RESOLVER-EMPTY, POISON-STUB INTEGRATION CASE. A symlink-to-system-git on
-# PATH must leave GIT_BIN empty (fail closed), catching a `GIT_BIN=git` bypass.
-POISON="$(mktemp -d)"
-mkdir -p "$POISON/src" "$POISON/scripts" "$POISON/workspace/tasks" "$POISON/workspace/results"
-cp "$REPO/src/check-pending-tasks.sh" "$POISON/src/"
-cp "$REPO/scripts/git-binary.sh" "$POISON/scripts/"
-PS_PY="$TEST_PY"
-printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
-  "$POISON" "$PS_PY" > "$POISON/scripts/sutando-config.sh"
-chmod +x "$POISON/scripts/sutando-config.sh"
-printf 'id: probe\ntask: resolver-empty-probe\n' > "$POISON/workspace/tasks/$PROBE"
-_git_fixture_repo "$POISON"
-POISON_FOREIGN="$(mktemp -d)"
-_git_fixture_repo "$POISON_FOREIGN"
-PSF_IDENTITY="$("$TEST_GIT" -C "$POISON_FOREIGN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-STUBDIR="$(mktemp -d)"
-ln -s /usr/bin/git "$STUBDIR/git"
-XCS_LOG="$STUBDIR/xcode-select-calls.log"
-printf '#!/bin/sh\necho "$@" >> %s\nexit 2\n' "$XCS_LOG" > "$STUBDIR/xcode-select"
-chmod +x "$STUBDIR/xcode-select"
-if [ -z "$PSF_IDENTITY" ]; then
-  bad "resolver-empty (poison stub on PATH): GIT_BIN stays unset, hook still gates" \
-    "fixture bug: POISON_FOREIGN has no resolvable git identity, this case tests nothing"
-else
-  PS_OUT="$(cd "$POISON_FOREIGN" && OSTYPE=darwin25 PATH="$STUBDIR:/usr/bin:/bin" bash "$POISON/src/$(basename "$HOOK")" 2>&1)"
-  case "$PS_OUT" in
-    *'"decision":"block"'*) ok "resolver-empty (poison stub on PATH): GIT_BIN stays unset, hook still gates" ;;
-    *) bad "resolver-empty (poison stub on PATH): GIT_BIN stays unset, hook still gates" "got: ${PS_OUT:0:160} -- a GIT_BIN=git bypass would see this PATH's git as usable and wrongly skip" ;;
-  esac
-fi
-# EXACTLY 1, not >=1 -- and "never executed to decide" is proven once, generically,
-# by tests/git-binary-sh.test.sh's stub-ran witness (same code path, any candidate).
-if [ -f "$XCS_LOG" ] && [ "$(wc -l < "$XCS_LOG")" -eq 1 ]; then
-  ok "the developer-tools probe ran exactly once (resolve_git was exercised, not bypassed)"
-else
-  bad "the developer-tools probe ran exactly once (resolve_git was exercised, not bypassed)" \
-    "$([ -f "$XCS_LOG" ] && cat "$XCS_LOG" || echo "xcode-select was never invoked")"
-fi
-rm -rf "$POISON" "$POISON_FOREIGN" "$STUBDIR"
+rm -rf "$BUNDLE_CWD" "$BUNDLE"
 
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 exit "$FAILED"

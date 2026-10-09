@@ -6,6 +6,7 @@ never answered; adapters keep only their routing and notification.
 """
 from __future__ import annotations
 
+import ast
 import sys
 import tempfile
 import unittest
@@ -67,11 +68,74 @@ class _Space:
 
 
 class PlanTest(unittest.TestCase):
+    def test_destination_provider_namespace(self):
+        for source, expected in (("telegram", "requeue"), ("discord", "honour"),
+                                 ("DISCORD", "honour")):
+            for count in (0, 1):
+                with self.subTest(source=source, count=count), tempfile.TemporaryDirectory() as td:
+                    sp = _Space(td); sp.holder("[REPLIED]")
+                    sp.orig(f"id: {TID}\nsource: discord\nchannel_id: 4242\nuser_id: 9001\n"
+                            f"dedup_requeue_count: {count}\ntask: answer here\n")
+                    (sp.tasks / f"{HOLDER}.txt").write_text(
+                        f"source: {source}\nchat_id: 4242\nuser_id: 9001\n")
+                    action, _ = plan_dedup_recovery(sp.results, sp.tasks, TID, HOLDER, "4242", NEW)
+                    self.assertEqual(action, "report" if count and expected == "requeue" else expected)
+                    self.assertEqual((sp.tasks / f"{NEW}.txt").exists(),
+                                     expected == "requeue" and count == 0)
+
     def test_holder_answered_is_honoured(self):
         with tempfile.TemporaryDirectory() as td:
             sp = _Space(td); sp.holder("the full answer"); sp.orig()
             self.assertEqual(sp.plan(), ("honour", None))
             self.assertFalse((sp.tasks / f"{NEW}.txt").exists(), "honour must not re-ask")
+
+    def test_replied_holder_is_honoured_in_live_and_archive_layouts(self):
+        for layout in ("live", "flat", "month"):
+            for count in (0, 1):
+                with self.subTest(layout=layout, count=count), tempfile.TemporaryDirectory() as td:
+                    sp = _Space(td)
+                    sp.orig(ORIG + f"dedup_requeue_count: {count}\n")
+                    if layout == "live":
+                        (sp.results / f"{HOLDER}.txt").write_text("[REPLIED]")
+                    else:
+                        sp.holder("[REPLIED]", month=layout == "month")
+                    self.assertEqual(sp.plan(), ("honour", None))
+                    self.assertFalse((sp.tasks / f"{NEW}.txt").exists())
+
+    def test_replied_destination_boundary(self):
+        for field, asking, other in (("channel_id", "C1", "C2"),
+                                      ("chat_id", "-1001", "-1002")):
+            for count in (0, 1):
+                for destination in (asking, other):
+                    with self.subTest(field=field, count=count, destination=destination):
+                        with tempfile.TemporaryDirectory() as td:
+                            sp = _Space(td)
+                            sp.holder("[REPLIED]")
+                            sp.orig(ORIG + f"{field}: {asking}\nuser_id: alice\n"
+                                    f"dedup_requeue_count: {count}\n")
+                            (sp.tasks / f"{HOLDER}.txt").write_text(
+                                f"id: {HOLDER}\n{field}: {destination}\nuser_id: alice\n")
+                            action, payload = plan_dedup_recovery(
+                                sp.results, sp.tasks, TID, HOLDER, asking, NEW)
+                            expected = "honour" if destination == asking else (
+                                "requeue" if count == 0 else "report")
+                            self.assertEqual(action, expected)
+                            new = sp.tasks / f"{NEW}.txt"
+                            self.assertEqual(new.exists(), expected == "requeue")
+                            if expected == "requeue":
+                                self.assertIn(f"{field}: {asking}", new.read_text())
+                                self.assertIn("DIFFERENT channel", new.read_text())
+                            elif expected == "report":
+                                self.assertIn("different room", payload)
+                                self.assertNotIn("delivered nothing", payload)
+
+    def test_destination_falls_back_to_task_when_route_map_is_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            sp = _Space(td); sp.holder("[REPLIED]")
+            sp.orig(ORIG + "channel_id: C1\nuser_id: alice\n")
+            (sp.tasks / f"{HOLDER}.txt").write_text("channel_id: C2\nuser_id: alice\n")
+            self.assertEqual(plan_dedup_recovery(
+                sp.results, sp.tasks, TID, HOLDER, "", NEW)[0], "requeue")
 
     def test_empty_holder_is_requeued_and_the_task_is_written(self):
         with tempfile.TemporaryDirectory() as td:
@@ -247,6 +311,23 @@ class DelegationTest(unittest.TestCase):
                     "dedup_decision(", src,
                     f"{name}: calls dedup_decision directly — the plan owns that",
                 )
+
+    def test_adapters_do_not_import_or_call_private_policy(self):
+        forbidden = {"dedup_decision", "dedup_cross_channel_target", "dedup_cross_sender_target",
+                     "dedup_destination_mismatch", "dedup_requeue_count", "build_requeued_task"}
+        for name, path in CONSUMERS.items():
+            tree = ast.parse(path.read_text())
+            used = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    used.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name):
+                        used.add(node.func.id)
+                    elif isinstance(node.func, ast.Attribute):
+                        used.add(node.func.attr)
+            with self.subTest(consumer=name):
+                self.assertFalse(used & forbidden, f"{name} bypasses shared planner: {used & forbidden}")
 
     def test_result_lookup_is_not_reimplemented(self):
         """Live-then-archive is one policy: an archive-only copy reads a

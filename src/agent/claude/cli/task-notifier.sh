@@ -26,6 +26,8 @@ CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Durable at-most-once record of a submitted prompt, per core incarnation.
 INFLIGHT_DIR="$WORKSPACE_DIR/state/task-notifier-inflight"
+# Same marker shape: which core incarnation this notifier left a cut-short paste in.
+PARTIAL_DIR="$WORKSPACE_DIR/state/task-notifier-partial-paste"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
@@ -137,11 +139,11 @@ clear_composer_block() {
 }
 
 alert_composer_block() {
-  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for $2 consecutive attempts; clear the composer or press Enter to resume"
+  log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for $2 consecutive attempts; clear the composer to resume (Enter would submit it as it is)"
   command -v osascript >/dev/null 2>&1 || return 0
   # Advisory only: backgrounded, then TERM->KILL so an osascript ignoring TERM cannot outlive it.
   (
-    osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it or press Enter.\" with title \"Sutando\"" &
+    osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it to resume.\" with title \"Sutando\"" &
     op=$!
     (
       trap 'kill "$s" 2>/dev/null || true; exit 0' TERM
@@ -367,11 +369,115 @@ if cur:
 print(" ".join(map(str, out)))' "$PASTE_CHUNK"
 }
 
+# The ONE test admitting a non-empty composer: exactly the prompt's first chunks (maybe all),
+# AND this notifier recorded a cut-short paste of $1 into this incarnation. Prints the offset.
+composer_resume_offset() {
+  local filename="$1" prompt="$2" incarnation="$3" raw="$4" c i=0 n prefix
+  c="$(composer_text "$raw" | squeeze)"
+  [ -n "$c" ] || return 1
+  [ -n "$incarnation" ] || return 1
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$PARTIAL_DIR" "$filename" "$incarnation" || return 1
+  for n in $(chunk_lengths "$prompt"); do
+    i=$((i + n))
+    prefix="$(LC_ALL=C; printf '%s' "${prompt:0:$i}")"
+    if [ "$(printf '%s' "$prefix" | squeeze)" = "$c" ]; then printf '%s' "$i"; return 0; fi
+  done
+  return 1
+}
+
+# True only when $1 is an exact prefix of $2 through a verified chunk boundary,
+# plus a trailing SUFFIX of the next chunk -- never a match anywhere inside it.
+leftover_is_dropped_bytes() {
+  "$NOTIFIER_PY" -c '
+import sys
+leftover_raw, prompt_raw, cap = sys.argv[1], sys.argv[2], int(sys.argv[3])
+MIN_TAIL = 8  # a fuzzy tail shorter than this matches almost any chunk by luck (measured: 1-3 chars do)
+
+def squeeze(s):
+    return "".join(c for c in s if not c.isspace())
+
+bounds = [0]
+cur = 0
+for ch in prompt_raw:
+    n = len(ch.encode("utf-8", "surrogateescape"))
+    if cur and cur + n > cap:
+        bounds.append(bounds[-1] + cur)
+        cur = 0
+    cur += n
+bounds.append(bounds[-1] + cur)
+
+leftover = squeeze(leftover_raw)
+ok = False
+for k in range(len(bounds) - 1):
+    a, b = bounds[k], bounds[k + 1]
+    exact_prefix = squeeze(prompt_raw[:a])
+    if not leftover.startswith(exact_prefix):
+        continue
+    rest = leftover[len(exact_prefix):]
+    if rest == "" or (len(rest) >= MIN_TAIL and squeeze(prompt_raw[a:b]).endswith(rest)):
+        ok = True
+        break
+sys.exit(0 if ok else 1)
+' "$1" "$2" "$3"
+}
+
+# $3 = composer text the caller already proved is ours (leftover_is_dropped_bytes);
+# never pass through unchecked composer text.
+note_partial_paste() {
+  printf '%s' "${3-}" | "$NOTIFIER_PY" "$DISPATCH_PY" partial-mark "$PARTIAL_DIR" "$1" "$2" \
+    || log_notifier "could not record the cut-short paste of $1; the next attempt will not resume it"
+}
+
+clear_partial_paste() {
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$PARTIAL_DIR" "$1" || true
+}
+
+# True only when the composer's CURRENT content is, whitespace aside, exactly the text
+# note_partial_paste recorded for this filename and incarnation -- i.e. this garbled,
+# non-boundary leftover is provably this notifier's own failed chunk, not a human draft,
+# because nothing else is ever written under this key. A cut box never qualifies: a
+# capture that cannot show the whole composer cannot prove what the whole thing is.
+composer_matches_own_leftover() {
+  local filename="$1" incarnation="$2" raw="$3" c recorded
+  pane_frame_is_cut "$raw" && return 1
+  c="$(composer_text "$raw")"
+  [ -n "$c" ] || return 1
+  [ -n "$incarnation" ] || return 1
+  recorded="$("$NOTIFIER_PY" "$DISPATCH_PY" partial-leftover "$PARTIAL_DIR" "$filename" "$incarnation")" || return 1
+  [ -n "$recorded" ] || return 1
+  [ "$(printf '%s' "$c" | squeeze)" = "$(printf '%s' "$recorded" | squeeze)" ]
+}
+
+# Delete exactly the composer's own current content, one character at a time (never a
+# line-kill or select-all: those are terminal-dependent and some would reach past the
+# composer). Verifies empty afterward; a caller that got here already proved via
+# composer_matches_own_leftover that every one of these characters is this notifier's.
+clear_own_leftover() {
+  local filename="$1" raw="$2" n text waited=0
+  text="$(composer_text "$raw")"
+  n="$(printf '%s' "$text" | "$NOTIFIER_PY" -c \
+    'import sys; sys.stdout.write(str(len(sys.stdin.buffer.read().decode("utf-8", "surrogateescape"))))')"
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$n" -gt 0 ] || return 0
+  log_notifier "erasing $n char(s) recorded as $filename's own leftover, about to clear: $text"
+  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -N "$n" BSpace 2>/dev/null || return 1
+  # A real CLI renders N backspaces over several redraws, not instantly (measured
+  # live) -- polls instead of reading once; still fails closed past the budget.
+  while [ -n "$(composer_text "$(capture_raw)")" ]; do
+    waited=$((waited + 1))
+    [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ] || return 1
+    sleep "$POLL_INTERVAL"
+  done
+}
+
 # Type the prompt in chunks (bytes under LC_ALL=C: the 1022 limit is bytes), each read back
 # EXACTLY before the next; the first chunk that does not read back ends it, and that is final.
+# $3 = byte offset already in the composer (a chunk boundary): typing resumes there.
 type_prompt() {
-  local prompt="$1" filename="$2" i=0 n typed="" chunk arg cap LC_ALL=C
+  local prompt="$1" filename="$2" start="${3:-0}" i=0 n typed="" chunk arg cap LC_ALL=C
+  typed="${prompt:0:$start}"
   for n in $(chunk_lengths "$prompt"); do
+    if [ "$i" -lt "$start" ]; then i=$((i + n)); continue; fi
     chunk="${prompt:$i:$n}"; i=$((i + n)); typed="$typed$chunk"
     # tmux reads a trailing ';' as its command separator; '\;' is how one sends it.
     arg="$chunk"; case "$arg" in *';') arg="${arg%;}\;" ;; esac
@@ -425,8 +531,8 @@ deliver_prompt() {
 }
 
 deliver_prompt_grown() {
-  local filename="$1" prompt="$2" type_tries=0 staged=0
-  local baseline_esc baseline_raw staged_raw="" incarnation=""
+  local filename="$1" prompt="$2" type_tries=0 staged=0 resume=0
+  local baseline_esc baseline_raw staged_raw="" incarnation="" leftover_now
   if ! wait_for_core_healthy; then
     log_notifier "core did not become healthy for $filename; leaving it queued"
     return 1
@@ -453,21 +559,38 @@ deliver_prompt_grown() {
       log_notifier "core is not healthy at the paste for $filename (abnormal or a gate); leaving it queued (failing closed)"
       return 1
     fi
+    resume=0
     if ! pane_text_composer_is_empty "$baseline_esc"; then
-      warn_if_capture_truncated "$baseline_raw" "$filename"
-      log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
-      composer_is_cut_prompt "$baseline_raw" "$prompt" \
-        && log_notifier "composer holds only the tail of $filename's prompt (a paste cut short); core may need attention"
-      note_composer_block "$filename" "$incarnation"
-      return 1
+      if resume="$(composer_resume_offset "$filename" "$prompt" "$incarnation" "$baseline_raw")"; then
+        log_notifier "composer holds the first $resume bytes of $filename's prompt, a paste this notifier cut short; resuming it there"
+      elif composer_matches_own_leftover "$filename" "$incarnation" "$baseline_raw" \
+           && clear_own_leftover "$filename" "$baseline_raw"; then
+        log_notifier "composer held $filename's own garbled, non-boundary leftover from a failed chunk; cleared it, retyping from the start"
+      else
+        warn_if_capture_truncated "$baseline_raw" "$filename"
+        log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
+        composer_is_cut_prompt "$baseline_raw" "$prompt" \
+          && log_notifier "composer holds only the tail of $filename's prompt (a paste cut short); core may need attention"
+        note_composer_block "$filename" "$incarnation"
+        return 1
+      fi
     fi
     clear_composer_block
-    if type_prompt "$prompt" "$filename"; then
+    if type_prompt "$prompt" "$filename" "$resume"; then
       staged_raw="$(capture_raw)"
-      if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
+      if prompt_is_staged "$staged_raw" "$prompt"; then clear_partial_paste "$filename"; staged=1; break; fi
     else
       staged_raw="$(capture_raw)"
       log_notifier "a chunk of $filename's prompt did not read back; what landed is not staged (failing closed)"
+      # Record the leftover only when it's unreadable-whole (nothing to check) or every
+      # character in it is provably ours; otherwise record nothing (fails closed as before).
+      leftover_now="$(composer_text "$staged_raw")"
+      if pane_frame_is_cut "$staged_raw" || [ -z "$leftover_now" ] \
+         || ! leftover_is_dropped_bytes "$leftover_now" "$prompt" "$PASTE_CHUNK"; then
+        note_partial_paste "$filename" "$incarnation"
+      else
+        note_partial_paste "$filename" "$incarnation" "$leftover_now"
+      fi
     fi
     type_tries=$((type_tries + 1))
     [ "$type_tries" -ge 2 ] && break

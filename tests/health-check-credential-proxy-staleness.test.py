@@ -60,6 +60,11 @@ class CredentialProxyStalenessTests(unittest.TestCase):
         patcher = patch.object(hc, "REPO_DIR", self.repo)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Isolate from this host's real quota-state.json (check_credential_proxy now
+        # reads it too); this tmpdir has none, so that read is a silent no-op here.
+        ws_patcher = patch.object(hc, "WORKSPACE_DIR", self.repo)
+        ws_patcher.start()
+        self.addCleanup(ws_patcher.stop)
 
         self.now = time.time()
         self.proc_start = self.now - 2 * 3600

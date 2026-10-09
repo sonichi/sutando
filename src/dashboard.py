@@ -38,7 +38,8 @@ from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import config_get  # noqa: E402
 from sutando_platform import probe_pids  # noqa: E402
 from util_paths import personal_path, shared_personal_path, _host_label  # noqa: E402
-from pending_questions_md import active_region  # noqa: E402
+import pending_questions_reader  # noqa: E402
+import skill_roots  # noqa: E402
 import dashboard_schedules  # noqa: E402
 import quota_projection  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
@@ -121,25 +122,17 @@ def get_activity(max_items: int = 10) -> list[dict]:
 
 
 def get_pending_count() -> dict:
-    pending_file = Path(personal_path("pending-questions.md"))
-    if not pending_file.exists():
-        return {"open": 0, "done": 0}
-    content = pending_file.read_text()
-    # Questions are filed as free-form `## ` sections (no **Status:** field — see
-    # #1265) and moved below a top-level `# Resolved` divider once answered. The
-    # old `**Status:** Waiting/Answered` regex matched neither and always returned
-    # 0/0 for the format actually in use — count `## ` sections per region instead.
-    # Must use the shared locator, not a bare partition: a line-initial
-    # `# Resolved` inside the file's own HTML banner (which documents the divider)
-    # matches first, so the active region collapses and every open question is
-    # counted as resolved. Measured on the decoy shape: partition gave open=0
-    # done=3 where the truth is open=2 done=1 — and this surface is public via
-    # /json, so it was reporting a confident zero.
-    active = active_region(content)
-    resolved = content[len(active):]
-    open_count = len(re.findall(r'^## ', active, flags=re.MULTILINE))
-    done_count = len(re.findall(r'^## ', resolved, flags=re.MULTILINE))
-    return {"open": open_count, "done": done_count}
+    """{"open", "done", "unavailable", "reason"} from the one pending-questions reader (the
+    skill's adapter); `open` is None, never 0, while the room cannot be read."""
+    store = skill_roots.declared(pending_questions_reader.DECLARATION, WORKSPACE_DIR)
+    return pending_questions_reader.count(WORKSPACE_DIR, store)
+
+
+def pending_tile(pending: dict) -> tuple:
+    """(value, title) for the Pending stat: "?" with the reason when the count is unknown."""
+    if pending.get("unavailable") or pending.get("open") is None:
+        return "?", f"unknown — room unreachable ({pending.get('reason') or 'no count'})"
+    return str(pending["open"]), ""
 
 
 def get_score() -> str:
@@ -696,7 +689,7 @@ def render_dashboard() -> str:
 <div class="stat"><div class="stat-val">{stats['disk_free']}</div><div class="stat-label">Disk Free</div></div>
 <div class="stat"><div class="stat-val">{stats['battery']}{charge}</div><div class="stat-label">Battery</div></div>
 <div class="stat"><div class="stat-val">{ok_count}/{total_count}</div><div class="stat-label">Services OK</div></div>
-<div class="stat"><div class="stat-val">{pending['open']}</div><div class="stat-label">Pending</div></div>
+<div class="stat"><div class="stat-val" title="{pending_tile(pending)[1]}">{pending_tile(pending)[0]}</div><div class="stat-label">Pending</div></div>
 <div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:#8fa3c8">{_quota_model_label(stats["quota"])}</span><br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
 <div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-5h" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "5h") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-5h" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
 <div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-7d" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "7d") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-7d" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>

@@ -1,88 +1,116 @@
 #!/usr/bin/env python3
-"""src/skill_roots.py: the ordered skill-root set, and its shell entry
-`scripts/sutando-config.sh skill-roots`.
+"""src/skill_roots.py — the one scan of the installed-skill roots: both roots derive from the
+repo's workspace helper, the field is the caller's, a declaration must stay inside its skill,
+and two declarers (one per root included) are a refusal, not a pick.
 
 Run: python3 tests/skill-roots.test.py
 """
+import json
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
-from skill_roots import skill_roots  # noqa: E402
+import skill_roots  # noqa: E402
+
+FIELD = "example_script"
 
 
-class SkillRoots(unittest.TestCase):
+class _Tmp(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        self.engine = self.root / "engine" / "sutando"
-        self.ws = self.root / "workspace"
-        for d in (self.engine / "skills", self.ws / "skills", self.root / "mem" / "skills",
-                  self.root / "plugin" / "skills", self.root / "engine" / "b-sib" / "skills",
-                  self.root / "engine" / "a-sib" / "skills", self.root / "engine" / "no-skills"):
-            d.mkdir(parents=True)
+        self.tmp = Path(tempfile.mkdtemp(prefix="skill-roots-"))
+        self.ws = self.tmp / "workspace"
+        self.engine = self.tmp / "engine-skills"
+        self.engine.mkdir()
+        (self.ws / "skills").mkdir(parents=True)
 
-    def tearDown(self):
-        self.tmp.cleanup()
+    def skill(self, root, name, manifest, script="scripts/run.py"):
+        d = root / name
+        (d / "scripts").mkdir(parents=True)
+        if script:
+            (d / script).write_text("x = 1\n")
+        (d / "manifest.json").write_text(manifest if isinstance(manifest, str) else json.dumps(manifest))
+        return d
 
-    def test_an_unreadable_sibling_is_skipped_and_the_rest_still_listed(self):
-        locked = self.root / "engine" / "locked"
-        (locked / "skills").mkdir(parents=True)
-        locked.chmod(0)
-        try:
-            roots = skill_roots(self.engine, self.ws, {})
-        finally:
-            locked.chmod(0o755)
-        self.assertIn(self.ws / "skills", roots)
-        self.assertNotIn(locked / "skills", roots)
 
-    def test_a_plain_clone_scans_no_siblings(self):
-        clone = self.root / "code" / "sutando"
-        (clone / "skills").mkdir(parents=True)
-        (self.root / "code" / "unrelated" / "skills").mkdir(parents=True)
-        self.assertEqual(skill_roots(clone, self.ws, {}), [clone / "skills", self.ws / "skills"])
-        opted = {"SUTANDO_EXTERNAL_PLUGIN_DIRS": str(self.root / "code" / "unrelated")}
-        self.assertEqual(skill_roots(clone, self.ws, opted),
-                         [clone / "skills", self.ws / "skills", self.root / "code" / "unrelated" / "skills"])
+class Roots(_Tmp):
+    def test_the_two_roots_come_from_the_workspace_helper(self):
+        self.assertEqual(skill_roots.skill_roots(self.ws), [skill_roots.REPO_SKILLS, self.ws / "skills"])
+        with mock.patch("workspace_default.resolve_workspace", return_value=self.ws) as rw:
+            self.assertEqual(skill_roots.skill_roots(), [skill_roots.REPO_SKILLS, self.ws / "skills"])
+        rw.assert_called_once_with(migrate=False)
+        self.assertEqual(skill_roots.REPO_SKILLS, REPO / "skills")
+        src = (REPO / "src" / "skill_roots.py").read_text()
+        self.assertNotRegex(src, r"SUTANDO_WORKSPACE|expanduser|\.sutando|environ", "no hand-rolled fallback")
 
-    def test_order_is_shipped_workspace_memory_external_then_sorted_siblings(self):
-        env = {"SUTANDO_MEMORY_DIR": str(self.root / "mem"),
-               "SUTANDO_EXTERNAL_PLUGIN_DIRS": os.pathsep.join(["", str(self.root / "plugin"),
-                                                                 str(self.root / "absent")])}
-        self.assertEqual(skill_roots(self.engine, self.ws, env), [
-            self.engine / "skills", self.ws / "skills", self.root / "mem" / "skills",
-            self.root / "plugin" / "skills", self.root / "engine" / "a-sib" / "skills",
-            self.root / "engine" / "b-sib" / "skills"])
+    def test_the_same_directory_is_scanned_once(self):
+        with mock.patch.object(skill_roots, "REPO_SKILLS", self.ws / "skills"):
+            self.assertEqual(skill_roots.skill_roots(self.ws), [self.ws / "skills"])
+        link = self.tmp / "link"
+        os.symlink(self.ws, link)
+        with mock.patch.object(skill_roots, "REPO_SKILLS", link / "skills"):
+            self.assertEqual(skill_roots.skill_roots(self.ws), [link / "skills"])
 
-    def test_legacy_memory_alias_and_each_dir_once(self):
-        # The external dir names the memory dir again: it is listed once, at its first position.
-        env = {"SUTANDO_PRIVATE_DIR": str(self.root / "mem"),
-               "SUTANDO_EXTERNAL_PLUGIN_DIRS": str(self.root / "mem")}
-        roots = skill_roots(self.engine, self.ws, env)
-        self.assertEqual(roots[2], self.root / "mem" / "skills")
-        self.assertEqual(roots.count(self.root / "mem" / "skills"), 1)
 
-    def test_an_unreadable_siblings_dir_contributes_nothing(self):
-        gone = self.root / "missing-parent" / "sutando"
-        self.assertEqual(skill_roots(gone, self.ws, {}), [self.ws / "skills"])
+class Declarations(_Tmp):
+    def test_only_an_enabled_contained_declaration_counts(self):
+        self.skill(self.engine, "off", {"enabled": False, FIELD: "scripts/run.py"})
+        self.skill(self.engine, "escapes", {FIELD: "../off/scripts/run.py"})
+        self.skill(self.engine, "missing", {FIELD: "scripts/none.py"}, script=None)
+        self.skill(self.engine, "other-field", {"other": "scripts/run.py"})
+        self.skill(self.engine, "broken", "{not json")
+        self.skill(self.engine, "not-a-dict", "[1, 2]")
+        self.assertEqual(skill_roots.declared_scripts(FIELD, self.engine), [])
+        ok = self.skill(self.engine, "ok", {FIELD: "scripts/run.py"})
+        self.assertEqual(skill_roots.declared_scripts(FIELD, self.engine), [("ok", (ok / "scripts" / "run.py").resolve())])
+        self.assertEqual(skill_roots.declared_scripts(FIELD, [self.engine]), skill_roots.declared_scripts(FIELD, self.engine))
+        self.assertEqual(skill_roots.declared_script(FIELD, self.engine), (ok / "scripts" / "run.py").resolve())
+        self.assertIsNone(skill_roots.declared_script(FIELD, self.ws / "skills"))
 
-    def test_shell_entry_prints_the_same_roots(self):
-        env = {**os.environ, "SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws),
-               "SUTANDO_EXTERNAL_PLUGIN_DIRS": str(self.root / "plugin")}
-        for k in ("SUTANDO_MEMORY_DIR", "SUTANDO_PRIVATE_DIR"):
-            env.pop(k, None)
-        out = subprocess.run(["bash", str(REPO / "scripts" / "sutando-config.sh"), "skill-roots", str(self.ws)],
-                             env=env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        lines = out.stdout.splitlines()
-        self.assertEqual(lines[:3], [str(REPO / "skills"), str(self.ws / "skills"),
-                                     str(self.root / "plugin" / "skills")])
+    def test_a_declarer_in_each_root_is_a_conflict_and_the_workspace_one_alone_is_picked(self):
+        mine = self.skill(self.ws / "skills", "mine", {FIELD: "scripts/run.py"})
+        with mock.patch.object(skill_roots, "REPO_SKILLS", self.engine):
+            self.assertEqual(skill_roots.declared(FIELD, self.ws),
+                             skill_roots.Declaration((mine / "scripts" / "run.py").resolve(), None))
+            self.skill(self.engine, "shipped", {FIELD: "scripts/run.py"})
+            with self.assertRaisesRegex(skill_roots.DeclarationConflict, f"{FIELD}: mine, shipped; refusing to pick one"):
+                skill_roots.declared_script(FIELD, skill_roots.skill_roots(self.ws))
+            decl = skill_roots.declared(FIELD, self.ws)
+            self.assertIsNone(decl.script)
+            self.assertIn("mine, shipped", decl.reason)
+            self.assertEqual(skill_roots.declared(FIELD, self.ws, override=self.tmp / "x.py"),
+                             skill_roots.Declaration(self.tmp / "x.py", None), "an override is taken as given")
+            self.assertEqual(skill_roots.declared(FIELD, roots=self.engine).script, (self.engine / "shipped" / "scripts" / "run.py").resolve())
+
+    def test_the_same_skill_name_in_both_roots_is_shadowed_not_a_conflict(self):
+        """install.sh's rule: the shipped copy wins a name collision; the owner's copy of the same
+        name is skipped, and a plain symlink of the shipped skill into the workspace root changes
+        nothing. A different name in the other root is still a conflict."""
+        shipped = self.skill(self.engine, "pq", {FIELD: "scripts/run.py"})
+        os.symlink(shipped, self.ws / "skills" / "pq")
+        with mock.patch.object(skill_roots, "REPO_SKILLS", self.engine):
+            self.assertEqual(skill_roots.declared(FIELD, self.ws),
+                             skill_roots.Declaration((shipped / "scripts" / "run.py").resolve(), None))
+        (self.ws / "skills" / "pq").unlink()
+        own = self.skill(self.ws / "skills", "pq", {FIELD: "scripts/other.py"}, script="scripts/other.py")
+        with mock.patch.object(skill_roots, "REPO_SKILLS", self.engine):
+            d = skill_roots.declared(FIELD, self.ws)
+        self.assertEqual(d.script, (shipped / "scripts" / "run.py").resolve())
+        self.assertNotEqual(d.script, (own / "scripts" / "other.py").resolve())
+        self.assertEqual([n for n, _ in skill_roots.declared_scripts(FIELD, [self.ws / "skills", self.engine])],
+                         ["pq"], "root order is the precedence, whichever root comes first")
+
+    def test_two_declarers_in_one_root_are_a_conflict_not_an_alphabetical_pick(self):
+        self.skill(self.engine, "aaa", {FIELD: "scripts/run.py"})
+        self.skill(self.engine, "zzz", {FIELD: "scripts/run.py"})
+        with self.assertRaisesRegex(skill_roots.DeclarationConflict, "aaa, zzz"):
+            skill_roots.declared_script(FIELD, self.engine)
+        self.assertEqual(skill_roots.declared(FIELD, roots=[self.engine]).script, None)
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=1)
+    unittest.main()
