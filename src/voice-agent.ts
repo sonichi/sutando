@@ -42,7 +42,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY } from './meeting-dictation.js';
+import { attachMeetingDictation, MEETING_ENTRY_SAY } from './meeting-dictation.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
@@ -434,10 +434,7 @@ function getPendingToolCalls(toolName?: string) {
 let meetingActive = false;
 // Meeting mode is bodhi dictation; set once the session exists.
 let meetingDictation: ReturnType<typeof attachMeetingDictation> | null = null;
-// Entering quiesces audio output, so it waits for the spoken confirmation's turn to complete.
-const meetingEntry = createMeetingEntryGate({ fallbackMs: 15_000, onFire: () => enterMeetingDictation() });
 function noteMeetingState(on: boolean) {
-	if (!on) meetingEntry.cancel();
 	meetingActive = on;
 	voiceWatchdogShadow.noteMeetingMode(on);
 	voiceRecoveryCoordinator?.noteMeetingMode(on);
@@ -446,6 +443,9 @@ function noteMeetingState(on: boolean) {
 let meetingEntrySeq = 0;
 function enterMeetingDictation() {
 	const seq = ++meetingEntrySeq;
+	// The confirmation is a fixed cue the web client speaks with the mic muted: spoken by the model,
+	// any sound could cut it off, and the transcriber would write it into the note.
+	try { sessionRef?.sendJsonToClient({ type: 'meeting.cue', text: MEETING_ENTRY_SAY } as never); } catch { /* no client */ }
 	meetingDictation?.enter().catch((err) => {
 		console.error(`${ts()} [MeetingDictation] enter failed: ${err?.message ?? err}`);
 		if (seq !== meetingEntrySeq) return;
@@ -541,8 +541,8 @@ const switchModeTool: ToolDefinition = {
 		writeVoiceModeSentinel();
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
-			meetingEntry.schedule();
-			return { status: 'meeting_mode', transcribing: true, say: MEETING_ENTRY_SAY, instruction: `Say exactly this, then end your turn: "${MEETING_ENTRY_SAY}"` };
+			enterMeetingDictation();
+			return { status: 'meeting_mode', transcribing: true, instruction: 'Meeting mode is on, and the client has already told the user how to come back. Say nothing.' };
 		}
 		await meetingDictation?.exit();
 		if (mode === 'presenter') {
@@ -752,7 +752,6 @@ const mainAgent: MainAgent = {
 	// or apology loops) doesn't match. Real farewell responses to
 	// a user "bye" are almost always a short standalone line.
 	onTurnCompleted: async (ctx, _transcript) => {
-		meetingEntry.noteTurnCompleted();
 		// Clear narration speaking flag + capture what Gemini actually said
 		try {
 			const { narrationSpeakingRef, lastSpokenRef } = await import('./recording-state.js');

@@ -2346,6 +2346,8 @@ function handleProtocolMessage(msg) {
     // sees connected=false → clean path ("Disconnected.", no retry).
     if (voice) { voice.disconnect(); }
     doCleanup();
+  } else if (msg.type === 'meeting.cue') {
+    playMeetingCue(String(msg.text || ''));
   } else if (msg.type === 'task.status') {
     updateTask(msg.taskId, msg.status, msg.text, msg.result);
   } else if (msg.type === 'grounding') {
@@ -2723,6 +2725,33 @@ function toggleWatch() {
   }
 }
 window.toggleWatch = toggleWatch;
+
+// ─── Meeting-mode cue ─────────────────────────────────────
+// The meeting-mode confirmation is a fixed sentence the page speaks itself. The mic is muted while
+// it plays, so no sound can cut it off and the transcriber does not write it into the note.
+function playMeetingCue(text) {
+  if (!text) return;
+  addSystem(text);
+  if (!window.speechSynthesis || typeof SpeechSynthesisUtterance === 'undefined') return;
+  var heldMic = !!voice && !muted;
+  if (heldMic) voice.setMicMuted(true);
+  var released = false;
+  function release() {
+    if (released) return;
+    released = true;
+    // A user who muted during the cue stays muted.
+    if (heldMic && voice && !muted) voice.setMicMuted(false);
+  }
+  try {
+    var utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'en-US';
+    utterance.onend = release;
+    utterance.onerror = release;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(utterance);
+    setTimeout(release, 20000);
+  } catch (e) { release(); }
+}
 
 // ─── Mute toggle ──────────────────────────────────────────
 function toggleMute() {

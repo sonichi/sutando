@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DictationTranscriptEvent } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE } from '../src/meeting-dictation.js';
+import { attachMeetingDictation, findExitCommand, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE } from '../src/meeting-dictation.js';
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
@@ -245,41 +245,6 @@ describe('meeting dictation', () => {
 		assert.equal(t.exitedByVoice, 0);
 		await t.md.exit(); // idempotent
 		assert.equal(t.injected.length, 1);
-	});
-});
-
-describe('meeting entry gate', () => {
-	it('enters after the confirmation turn, not the tool-call turn', () => {
-		let fired = 0;
-		const g = createMeetingEntryGate({ fallbackMs: 10_000, onFire: () => fired++ });
-		g.schedule();
-		g.noteTurnCompleted(); // turn that carried switch_mode
-		assert.equal(fired, 0);
-		g.noteTurnCompleted(); // "I have switched to meeting mode."
-		assert.equal(fired, 1);
-		g.noteTurnCompleted();
-		assert.equal(fired, 1, 'fires once');
-	});
-
-	it('falls back when no confirmation turn arrives', async () => {
-		let fired = 0;
-		const g = createMeetingEntryGate({ fallbackMs: 10, onFire: () => fired++ });
-		g.schedule();
-		g.noteTurnCompleted();
-		await tick(20);
-		assert.equal(fired, 1);
-	});
-
-	it('cancel (switching back before entry) prevents entering', async () => {
-		let fired = 0;
-		const g = createMeetingEntryGate({ fallbackMs: 10, onFire: () => fired++ });
-		g.schedule();
-		g.cancel();
-		g.noteTurnCompleted();
-		g.noteTurnCompleted();
-		await tick(20);
-		assert.equal(fired, 0);
-		assert.equal(g.pending, false);
 	});
 });
 

@@ -101,36 +101,6 @@ export function appendTranscriptHeader(notePath: string, at: Date = new Date()):
 	appendFileSync(notePath, `\n## Transcript (from ${hhmmss(at)})\n`);
 }
 
-/**
- * Defers entering dictation until the turn after the one carrying switch_mode
- * (the spoken confirmation) completes, with a fallback for models that never send one.
- */
-export function createMeetingEntryGate(opts: { fallbackMs: number; onFire: () => void }) {
-	let pending: { turns: number; timer: ReturnType<typeof setTimeout> } | null = null;
-	const cancel = () => {
-		if (pending) clearTimeout(pending.timer);
-		pending = null;
-	};
-	const fire = () => {
-		if (!pending) return;
-		cancel();
-		opts.onFire();
-	};
-	return {
-		schedule() {
-			cancel();
-			pending = { turns: 0, timer: setTimeout(fire, opts.fallbackMs) };
-		},
-		cancel,
-		noteTurnCompleted() {
-			if (pending && ++pending.turns >= 2) fire();
-		},
-		get pending() {
-			return pending !== null;
-		},
-	};
-}
-
 export interface MeetingDictationSession {
 	setTranscriptionMode(mode: 'agent' | 'transcription'): Promise<void>;
 	getTranscriptionMode(): 'agent' | 'transcription';
