@@ -537,6 +537,16 @@ export function findOpenVoiceTask(query: string): string | undefined {
 	return _openVoiceTasks().find((t) => t.text.toLowerCase().includes(needle))?.id;
 }
 
+/** The voice task whose text contains `query`: an open one first, else the latest recent one, finished or not. */
+export function findVoiceTask(query: string, now = Date.now()): string | undefined {
+	const open = findOpenVoiceTask(query);
+	if (open) return open;
+	const needle = query.toLowerCase();
+	return voiceTaskStore.list()
+		.filter(([, row]) => row.submittedAt !== undefined && now - row.submittedAt <= STATUS_WINDOW_MS && (row.text ?? '').toLowerCase().includes(needle))
+		.sort((a, b) => (b[1].submittedAt ?? 0) - (a[1].submittedAt ?? 0))[0]?.[0];
+}
+
 /** How long a finished row stays in status answers. */
 const STATUS_WINDOW_MS = 6 * 60 * 60 * 1000;
 

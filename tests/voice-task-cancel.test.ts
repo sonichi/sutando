@@ -143,6 +143,20 @@ describe('cancel_task decides from the task state', () => {
 		assert.ok(existsSync(join(TMP, 'tasks', 'task-health-2.txt')));
 	});
 
+	it('a query also finds a voice task that already finished, and answers done, saying whether it was heard', async () => {
+		const id = `task-${1_800_000_000_000 + ++seq}`;
+		const month = new Date().toISOString().slice(0, 7);
+		mkdirSync(join(TMP, 'results', 'archive', month), { recursive: true });
+		writeFileSync(join(TMP, 'results', 'archive', month, `${id}.txt`), "Here's your mouse.");
+		tb.voiceTaskStore.add(id, 'draw a mouse');
+		tb.voiceTaskStore.set(id, 'spoken');
+		const out = await cancel({ query: 'mouse' });
+		assert.equal(out.status, 'already_done');
+		assert.equal(out.taskId, id);
+		assert.equal(out.heard as unknown as boolean, true);
+		assert.deepEqual(cancelInstructions(), []);
+	});
+
 	it('a query matches the open task by its text', async () => {
 		const dog = submit('draw a dog driving a car');
 		submit('draw a parrot');

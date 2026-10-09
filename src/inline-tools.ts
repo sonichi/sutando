@@ -25,7 +25,7 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
-import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, voiceTaskState, latestOpenVoiceTask, findOpenVoiceTask, noteVoiceTaskCancelled, isVoiceSubmittedTask, voiceTaskRows, type VoiceTaskRow } from './task-bridge.js';
+import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, voiceTaskState, latestOpenVoiceTask, findVoiceTask, noteVoiceTaskCancelled, voiceTaskStore, isVoiceSubmittedTask, voiceTaskRows, type VoiceTaskRow } from './task-bridge.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -692,7 +692,7 @@ export const cancelTaskTool: ToolDefinition = {
 				const wantFile = taskId.endsWith('.txt') ? taskId : `${taskId}.txt`;
 				targetId = wantFile.replace('.txt', '');
 			} else if (query) {
-				targetId = findOpenVoiceTask(query);
+				targetId = findVoiceTask(query);
 				if (!targetId) {
 					const needle = query.toLowerCase();
 					for (const f of files) {
@@ -713,7 +713,10 @@ export const cancelTaskTool: ToolDefinition = {
 			const state = voiceTaskState(safeTargetId);
 			console.log(`${ts()} [CancelTask] ${safeTargetId} is ${state}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''}`);
 			if (state === 'done') {
-				return { status: 'already_done', taskId: safeTargetId, message: 'It already finished, so nothing was cancelled. Tell the user it is already done.' };
+				const heard = ['spoken', 'injected'].includes(voiceTaskStore.get(safeTargetId)?.delivery ?? '');
+				return { status: 'already_done', taskId: safeTargetId, heard, message: heard
+					? 'It already finished and the user has heard the result, so nothing was cancelled. Tell the user it is already done.'
+					: 'It already finished, so nothing was cancelled; the user has not heard the result yet and will. Tell the user it is already done.' };
 			}
 			if (state === 'cancelled') {
 				return { status: 'already_cancelled', taskId: safeTargetId, message: 'Cancelling it was already requested. Tell the user so.' };
