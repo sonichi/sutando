@@ -434,7 +434,7 @@ let meetingActive = false;
 // Meeting mode is bodhi dictation; set once the session exists.
 let meetingDictation: ReturnType<typeof attachMeetingDictation> | null = null;
 // Entering quiesces audio output, so it waits for the spoken confirmation's turn to complete.
-const meetingEntry = createMeetingEntryGate({ fallbackMs: 8_000, onFire: () => enterMeetingDictation() });
+const meetingEntry = createMeetingEntryGate({ fallbackMs: 15_000, onFire: () => enterMeetingDictation() });
 function noteMeetingState(on: boolean) {
 	if (!on) meetingEntry.cancel();
 	meetingActive = on;
@@ -541,7 +541,7 @@ const switchModeTool: ToolDefinition = {
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
 			meetingEntry.schedule();
-			return { status: 'meeting_mode', transcribing: true, say: MEETING_ENTRY_SAY, instruction: `Say exactly: "${MEETING_ENTRY_SAY}" Then stop; your next sentence ends your turn.` };
+			return { status: 'meeting_mode', transcribing: true, say: MEETING_ENTRY_SAY, instruction: `Say exactly this, then end your turn: "${MEETING_ENTRY_SAY}"` };
 		}
 		await meetingDictation?.exit();
 		if (mode === 'presenter') {
