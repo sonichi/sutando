@@ -259,9 +259,30 @@ resolve_claude_settings_args() {
   if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
     SETTINGS_ARGS=(--settings "$CLAUDE_SETTINGS_JSON")
     echo "session hooks: AskUserQuestion guard + Sutando lifecycle and skill hooks registered for this session only"
+    seed_claude_transcript_retention
   else
     echo "session hooks: settings build failed — AskUserQuestion guard NOT registered this session" >&2
   fi
+}
+
+# A `claude -p` the core spawns inherits CLAUDE_CONFIG_DIR but not --settings, and runs the
+# transcript cleanup over the same store, so the retention goes there too unless already set.
+seed_claude_transcript_retention() {
+  [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -n "${PY:-}" ] || return 0
+  _settings_json="$CLAUDE_SETTINGS_JSON" "$PY" - "$CLAUDE_CONFIG_DIR/settings.json" <<'PY' \
+    || echo "session hooks: transcript-retention seed skipped (non-fatal)" >&2
+import json, os, sys
+days = json.loads(os.environ["_settings_json"]).get("cleanupPeriodDays")
+path = sys.argv[1]
+st = json.load(open(path)) if os.path.exists(path) else {}
+if days and isinstance(st, dict) and "cleanupPeriodDays" not in st:
+    st["cleanupPeriodDays"] = days
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(st, f, indent=2)
+    os.replace(path + ".tmp", path)
+    print(f"  ✓ transcript-retention seed: cleanupPeriodDays={days} in {path}")
+PY
 }
 
 # Claude Code's native OTel token+cost metrics. Hooks give obs EVENTS but no

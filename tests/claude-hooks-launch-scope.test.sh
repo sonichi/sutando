@@ -48,7 +48,8 @@ PY
 
 # The same launcher steps start-cli.sh and launch-worker-session.sh run.
 OUT="$ROOT/launch.out"
-env -u CLAUDE_CONFIG_DIR -u SUTANDO_CLAUDE_WORKING_DIR -u SUTANDO_OBS_ENDPOINT HOME="$ROOT/home" \
+# CLAUDE_CONFIG_DIR as resolve_claude_config_dir_and_seed exports it before this step.
+env -u SUTANDO_CLAUDE_WORKING_DIR -u SUTANDO_OBS_ENDPOINT HOME="$ROOT/home" CLAUDE_CONFIG_DIR="$WS/.claude-sutando" \
   SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$WS" REPO="$REPO" bash -c '
   . "$REPO/src/agent/claude/cli/session-launch.sh"
   resolve_claude_py
@@ -69,6 +70,9 @@ ok "launch settings register the skill hook" "$(echo "$LAUNCH" | grep -qxF "$SKI
 ok "launch settings keep transcripts (cleanupPeriodDays)" \
    "$(python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["cleanupPeriodDays"] >= 3650 else 1)' "$OUT"; echo $?)"
 
+ok "the config dir carries the same retention for sessions that inherit only CLAUDE_CONFIG_DIR" \
+   "$(python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("cleanupPeriodDays") == 3650 else 1)' "$WS/.claude-sutando/settings.json"; echo $?)"
+
 # A guest session (no --settings) reads only these two files from Sutando's side.
 GUEST="$(commands_of "$REPO/.claude/settings.json"; commands_of "$WS/.claude-sutando/settings.json")"
 ok "a guest session sees only the operator's own hook" "$([ "$GUEST" = "echo operator" ] && echo 0 || echo 1)" "$GUEST"
@@ -79,11 +83,25 @@ ok "a guest session does not run the skill hook" "$(echo "$GUEST" | grep -qF "$S
 
 # A second launch writes nothing back into either file.
 snap="$(cat "$REPO/.claude/settings.json" "$WS/.claude-sutando/settings.json")"
-env -u CLAUDE_CONFIG_DIR -u SUTANDO_CLAUDE_WORKING_DIR HOME="$ROOT/home" SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$WS" \
+env -u SUTANDO_CLAUDE_WORKING_DIR HOME="$ROOT/home" CLAUDE_CONFIG_DIR="$WS/.claude-sutando" SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$WS" \
   REPO="$REPO" bash -c '. "$REPO/src/agent/claude/cli/session-launch.sh"; resolve_claude_py
   sweep_project_claude_hooks; resolve_claude_settings_args' >/dev/null 2>&1
 ok "a relaunch leaves both settings files byte-identical" \
    "$([ "$(cat "$REPO/.claude/settings.json" "$WS/.claude-sutando/settings.json")" = "$snap" ] && echo 0 || echo 1)"
+
+# An operator's own retention is kept, and a file the seed cannot parse is left alone.
+seed_once() {
+  env -u SUTANDO_OBS_ENDPOINT HOME="$ROOT/home" CLAUDE_CONFIG_DIR="$1" REPO="$REPO" bash -c '
+    . "$REPO/src/agent/claude/cli/session-launch.sh"; resolve_claude_py; resolve_claude_settings_args' >/dev/null 2>&1
+}
+mkdir -p "$ROOT/ccd-own" "$ROOT/ccd-bad"
+echo '{"cleanupPeriodDays": 45}' > "$ROOT/ccd-own/settings.json"
+printf '{broken' > "$ROOT/ccd-bad/settings.json"
+seed_once "$ROOT/ccd-own"; seed_once "$ROOT/ccd-bad"
+ok "an operator-set cleanupPeriodDays is kept" \
+   "$(python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["cleanupPeriodDays"] == 45 else 1)' "$ROOT/ccd-own/settings.json"; echo $?)"
+ok "an unparseable config-dir settings file is left byte-identical" \
+   "$([ "$(cat "$ROOT/ccd-bad/settings.json")" = '{broken' ] && echo 0 || echo 1)"
 
 echo "claude-hooks-launch-scope: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]
