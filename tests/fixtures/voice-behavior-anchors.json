@@ -163,7 +163,7 @@
   },
   {
    "name": "get_core_status",
-   "description": "Get what the core agent (Claude Code) is currently doing and how many tasks are queued. Use when the user asks \"what are you working on\", \"what are you up to\", \"are you busy\", \"anything running\", \"how many are waiting\", or similar questions about background work. Instant file read. Call it ONLY for those explicit status questions — NEVER on greetings (\"hello\"), filler, garbled speech, or as a fallback when unsure what the user wants; fire nothing instead.",
+   "description": "Get what the core agent (Claude Code) is currently doing, and where each task the user asked for by voice stands now. Use when the user asks \"what are you working on\", \"what are you up to\", \"are you busy\", \"anything running\", \"how many are waiting\", \"is X done\", or similar questions about background work. Instant file read. Call it ONLY for those explicit status questions — NEVER on greetings (\"hello\"), filler, garbled speech, or as a fallback when unsure what the user wants; fire nothing instead.",
    "execution": "inline",
    "params": {}
   },

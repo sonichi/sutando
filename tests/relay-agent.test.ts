@@ -1,6 +1,6 @@
 // The voice task manager: every result goes through one queue (one hand-over at a time, at a
 // pause, confirmed by the model's turn), and a durable record of how each result reached the user.
-// Run: npx tsx --test --test-force-exit tests/voice-task-manager.test.ts
+// Run: npx tsx --test --test-force-exit tests/relay-agent.test.ts
 import { describe, it, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -13,10 +13,10 @@ process.env.SUTANDO_TEST_MODE = '1';
 const MONTH = new Date().toISOString().slice(0, 7);
 for (const d of ['tasks', 'results', join('tasks', 'archive', MONTH), join('results', 'archive', MONTH), join('state', 'activity')]) mkdirSync(join(TMP, d), { recursive: true });
 
-const { createResultQueue, createVoiceTaskStore, frameBatch, shouldReplayDeduped } = await import('../src/voice-task-manager.js');
+const { createResultQueue, createVoiceTaskStore, frameBatch, planReconcile, NOT_PICKED_MS, MAX_REPLAYS } = await import('../src/relay-agent.js');
 const { frameTaskResult } = await import('../src/inject-framing.js');
 const tb = await import('../src/task-bridge.js');
-const { _pendingTasksForTest, startResultWatcher, voiceTaskStore, REPEATED_REQUEST_NOTE, _forwardOfflineThenArchive } = tb;
+const { _pendingTasksForTest, voiceTaskStore, MISSED_RESULT_NOTE, _forwardOfflineThenArchive, reconcileVoiceTasks, voiceTaskRows, voiceTasksAhead } = tb;
 
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
@@ -154,61 +154,114 @@ describe('voice task store', () => {
 		assert.equal(s.get('task-204'), undefined);
 	});
 
-	it('replays a repeat only when the user never heard the first result', () => {
-		assert.equal(shouldReplayDeduped({ delivery: 'dm', at: 1 }), true);
-		assert.equal(shouldReplayDeduped(undefined), true);
-		assert.equal(shouldReplayDeduped({ delivery: 'spoken', at: 1 }), false);
-		assert.equal(shouldReplayDeduped({ delivery: 'injected', at: 1 }), false);
+	it('keeps a row per voice task: text, submission, cancel asked, delivery', () => {
+		const st = createVoiceTaskStore(join(TMP, 'state', 'rows.json'));
+		st.add('task-r', 'check PR 3509');
+		st.markCancelRequested('task-r');
+		st.set('task-r', 'dm');
+		const row = st.get('task-r')!;
+		assert.equal(row.text, 'check PR 3509');
+		assert.equal(typeof row.submittedAt, 'number');
+		assert.equal(row.cancelRequested, true);
+		assert.equal(row.delivery, 'dm');
 	});
 });
 
-describe('result watcher: repeated requests', () => {
-	const heard: Array<{ text: string; note?: string; taskId?: string }> = [];
-	startResultWatcher((text, note, meta) => heard.push({ text, note, taskId: meta?.taskId }), () => true);
+describe('the relay agent\'s rule: every voice task ends in an outcome the user heard', () => {
+	const base = { core: 'done' as const, settledResult: true, resultIsSkip: false, inFlight: false, now: 1_000_000 };
+	it('a result the user has not heard is owed; one they heard, or one being spoken, is not', () => {
+		assert.equal(planReconcile({ ...base, row: { at: 1, delivery: 'dm' } }), 'speak_result');
+		assert.equal(planReconcile({ ...base, row: { at: 1 } }), 'speak_result', 'no delivery recorded at all');
+		assert.equal(planReconcile({ ...base, row: { at: 1, delivery: 'spoken' } }), 'none');
+		assert.equal(planReconcile({ ...base, row: { at: 1, delivery: 'injected' } }), 'none');
+		assert.equal(planReconcile({ ...base, inFlight: true, row: { at: 1, delivery: 'dm' } }), 'none');
+	});
+	it('a skip-marked result ([deduped: X]) owes nothing itself: its outcome is X\'s', () => {
+		assert.equal(planReconcile({ ...base, resultIsSkip: true, row: { at: 1 } }), 'none');
+	});
+	it('gives up after a bounded number of replays', () => {
+		assert.equal(planReconcile({ ...base, row: { at: 1, delivery: 'dm', replays: MAX_REPLAYS } }), 'none');
+	});
+	it('a task the core has not picked up after a while is reported once', () => {
+		const q = { ...base, core: 'queued' as const, settledResult: false };
+		assert.equal(planReconcile({ ...q, row: { at: 1, submittedAt: base.now - NOT_PICKED_MS - 1 } }), 'tell_not_picked');
+		assert.equal(planReconcile({ ...q, row: { at: 1, submittedAt: base.now - 1_000 } }), 'none', 'not yet');
+		assert.equal(planReconcile({ ...q, row: { at: 1, submittedAt: 0, notPickedNoticed: true } }), 'none', 'once');
+		assert.equal(planReconcile({ ...q, row: { at: 1, submittedAt: 0, cancelRequested: true } }), 'none');
+	});
+});
+
+describe('reconcile pass (task-bridge, temp workspace)', () => {
+	const owed: Array<{ text: string; note?: string; taskId?: string }> = [];
+	const deliver = (text: string, note: string | undefined, meta: { taskId?: string }) => owed.push({ text, note, taskId: meta.taskId });
 	let seq = 0;
-	const voiceTask = (where: string, id: string, text: string) =>
-		writeFileSync(join(TMP, where, `${id}.txt`), `id: ${id}\nsource: voice\nchannel_id: local-voice\ntask: ${text}\n`);
-	/** An earlier request whose result is already archived. */
-	function earlier(text: string, result: string): string {
-		const id = `task-${1_800_000_100_000 + ++seq}`;
-		voiceTask(join('tasks', 'archive', MONTH), id, text);
+	/** A voice task that went through work, whose result the core wrote and the watcher already archived. */
+	function finished(text: string, result: string): string {
+		const id = `task-${1_800_000_400_000 + ++seq}`;
+		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${id}.txt`), `id: ${id}\nsource: voice\nchannel_id: local-voice\ntask: ${text}\n`);
 		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${id}.txt`), result);
+		voiceTaskStore.add(id, text);
 		return id;
 	}
-	/** The repeat: a new voice task the core answers with a dedup pointer. */
-	function repeat(text: string, heldBy: string): string {
-		const id = `task-${1_800_000_200_000 + ++seq}`;
-		voiceTask('tasks', id, text);
-		_pendingTasksForTest.set(id, { submittedAt: Date.now(), timeoutMs: 3_600_000, dmOnTimeout: false, taskText: text });
-		writeFileSync(join(TMP, 'results', `${id}.txt`), `[deduped: ${heldBy}]`);
-		return id;
-	}
-	beforeEach(() => { heard.length = 0; _pendingTasksForTest.clear(); });
+	beforeEach(() => { owed.length = 0; _pendingTasksForTest.clear(); });
 
-	it('a result that went to the DM while voice was offline is spoken when the request is repeated', async () => {
-		const first = earlier('check PR 3509', 'PR 3509 has two approvals and green CI.');
-		const forwarded = await _forwardOfflineThenArchive(first, `${first}.txt`, 'PR 3509 has two approvals and green CI.', false, async () => {}, 0);
+	it('three PR results that all fell back to the DM are all handed over again once the session can speak', () => {
+		const ids = ['3509', '5140', '5167'].map((pr) => finished(`check PR ${pr}`, `PR ${pr} status.`));
+		for (const id of ids) voiceTaskStore.set(id, 'dm');
+		reconcileVoiceTasks(deliver, () => false);
+		assert.deepEqual(owed.map((o) => o.taskId).sort(), [...ids].sort());
+		assert.ok(owed.every((o) => o.note === MISSED_RESULT_NOTE));
+		reconcileVoiceTasks(deliver, (id) => ids.includes(id));
+		assert.equal(owed.length, 3, 'nothing again while they are in the queue');
+	});
+
+	it('a result forwarded to the DM while voice was offline (the real forward) is owed', async () => {
+		const id = finished('check PR 3509', 'PR 3509 has two approvals and green CI.');
+		const forwarded = await _forwardOfflineThenArchive(id, `${id}.txt`, 'PR 3509 has two approvals and green CI.', false, async () => {}, 0);
 		assert.equal(forwarded, true);
-		assert.equal(voiceTaskStore.get(first)?.delivery, 'dm');
-		repeat('check PR 3509 again', first);
-		await tick(2_500);
-		assert.deepEqual(heard, [{ text: 'PR 3509 has two approvals and green CI.', note: REPEATED_REQUEST_NOTE, taskId: first }]);
+		reconcileVoiceTasks(deliver, () => false);
+		assert.deepEqual(owed.filter((o) => o.taskId === id), [{ text: 'PR 3509 has two approvals and green CI.', note: MISSED_RESULT_NOTE, taskId: id }]);
 	});
 
-	it('a result the user already heard stays silent on a repeat, also after a restart', async () => {
-		const first = earlier('check PR 4000', 'PR 4000 is merged.');
-		createVoiceTaskStore(join(TMP, 'state', 'voice-tasks.json')).set(first, 'spoken');
-		repeat('check PR 4000 again', first);
-		await tick(2_500);
-		assert.deepEqual(heard, []);
+	it('a result already heard owes nothing, also when the row comes back from disk after a restart', () => {
+		const id = finished('check PR 4000', 'PR 4000 is merged.');
+		createVoiceTaskStore(join(TMP, 'state', 'voice-tasks.json')).set(id, 'spoken');
+		reconcileVoiceTasks(deliver, () => false);
+		assert.ok(!owed.some((o) => o.taskId === id));
 	});
 
-	it('a result still on its way is not spoken twice', async () => {
-		const id = `task-${1_800_000_300_000 + ++seq}`;
-		voiceTask('tasks', id, 'check PR 4100');
+	it('a result still landing in results/ is left to the watcher', () => {
+		const id = `task-${1_800_000_500_000 + ++seq}`;
+		writeFileSync(join(TMP, 'tasks', `${id}.txt`), `id: ${id}\nsource: voice\ntask: check PR 4100\n`);
 		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 4100 is open.');
-		repeat('check PR 4100 again', id);
-		await tick(2_500);
-		assert.ok(heard.every((h) => h.note !== REPEATED_REQUEST_NOTE), JSON.stringify(heard));
+		voiceTaskStore.add(id, 'check PR 4100');
+		reconcileVoiceTasks(deliver, () => false);
+		assert.ok(!owed.some((o) => o.taskId === id));
+		rmSync(join(TMP, 'results', `${id}.txt`));
+		rmSync(join(TMP, 'tasks', `${id}.txt`));
+	});
+
+	it('a repeated request answered [deduped: X] owes nothing itself; X\'s unheard result is owed', () => {
+		const x = finished('check PR 3509', 'PR 3509 is open.');
+		voiceTaskStore.set(x, 'dm');
+		const y = finished('check PR 3509 again', `[deduped: ${x}]`);
+		reconcileVoiceTasks(deliver, () => false);
+		assert.ok(owed.some((o) => o.taskId === x));
+		assert.ok(!owed.some((o) => o.taskId === y));
+	});
+
+	it('status rows and the count ahead come from the table: a health check in tasks/ is not one of the user\'s', () => {
+		writeFileSync(join(TMP, 'tasks', 'task-health-9.txt'), 'id: task-health-9\nsource: health-check\ntask: health\n');
+		const a = `task-${1_800_000_600_000 + ++seq}`;
+		const b = `task-${1_800_000_600_000 + ++seq}`;
+		for (const [id, t] of [[a, 'draw a dog'], [b, 'draw a cat']]) {
+			writeFileSync(join(TMP, 'tasks', `${id}.txt`), `id: ${id}\nsource: voice\ntask: ${t}\n`);
+			voiceTaskStore.add(id, t);
+		}
+		assert.equal(voiceTasksAhead(b), 1, 'only the dog is ahead of the cat');
+		const rows = voiceTaskRows().filter((r) => r.id === a || r.id === b);
+		assert.deepEqual(rows.map((r) => r.state), ['queued', 'queued']);
+		assert.ok(!voiceTaskRows().some((r) => r.id === 'task-health-9'));
+		for (const f of [a, b, 'task-health-9']) rmSync(join(TMP, 'tasks', `${f}.txt`));
 	});
 });

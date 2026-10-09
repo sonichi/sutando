@@ -20,9 +20,9 @@ import { resolveWorkspace, statusPath } from './workspace_default.js';
 import { injectText } from './browser-tools.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
 import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull } from './inject-framing.js';
-import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, voiceTaskStore } from './task-bridge.js';
+import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, voiceTaskStore, reconcileVoiceTasks } from './task-bridge.js';
 import { createConversationPacer } from './conversation-pacing.js';
-import { createResultQueue, type ResultItem } from './voice-task-manager.js';
+import { createResultQueue, type ResultItem } from './relay-agent.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
 
@@ -38,6 +38,8 @@ export interface DurableChannelOptions {
 	generateSpeech?: ((text: string, meta: { category: string; label: string }) => Promise<string>) | null;
 	/** Waits between checks while the session cannot take a result, before the DM fallback. */
 	notReadyRetriesMs?: number[];
+	/** How often the relay agent reconciles the task table with the core. */
+	reconcileMs?: number;
 }
 
 /**
@@ -154,6 +156,18 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		console.log(`${ts()} [TaskBridge] Queueing result for the user${deliveryNote ? ' (with a delivery note)' : ''}`);
 		results.enqueue({ text: result, note: deliveryNote, taskId: meta?.taskId });
 	}, () => session.clientConnected);
+
+	// The relay agent's reconcile loop: whatever the core finished that the user has not heard
+	// (sent to the DM, lost in a reconnect, cut off) is handed over again once the session can speak.
+	const reconcile = setInterval(() => {
+		if (!session.sessionManager.isActive || !session.clientConnected || meetingHoldsModel(session)) return;
+		try {
+			reconcileVoiceTasks((text, note, meta) => results.enqueue({ text, note, taskId: meta.taskId }), (id) => results.isInFlight(id));
+		} catch (err) {
+			console.error(`${ts()} [RelayAgent] reconcile failed (will retry):`, err);
+		}
+	}, opts.reconcileMs ?? 5_000);
+	reconcile.unref?.();
 	return { enqueue: results.enqueue };
 }
 

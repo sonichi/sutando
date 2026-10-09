@@ -1,8 +1,8 @@
 /**
- * The voice side's task manager: one queue every task result goes through before the model
- * speaks it, and a durable record of how each voice task's result reached the user.
- * Results are handed over one batch at a time, at a pause; a batch counts as spoken only
- * once the model finishes a turn after it.
+ * Sutando's relay agent: the voice side's task manager between the voice model and the core.
+ * It keeps a table of every task the user asked for by voice (what, when, cancel asked, how its
+ * result reached the user), answers from it, and owns the one queue every result goes through
+ * before the model speaks it. Where a task stands is read from the core's own records each time.
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -12,12 +12,24 @@ import { frameTaskResult, framedSystem } from './inject-framing.js';
 /** How a voice task's result reached the user. `injected`: handed to the model, turn never confirmed. */
 export type Delivery = 'spoken' | 'injected' | 'dm';
 
-export interface VoiceTaskRecord { delivery: Delivery; at: number }
+/** One row per task the user asked for by voice. Where the task stands is read from the core, not stored here. */
+export interface VoiceTaskRecord {
+	text?: string;
+	submittedAt?: number;
+	cancelRequested?: boolean;
+	delivery?: Delivery;
+	/** Times the relay handed an unheard result over again. */
+	replays?: number;
+	/** The user was told the core had not picked it up. */
+	notPickedNoticed?: boolean;
+	/** Last change, for the cap. */
+	at: number;
+}
 
-const STORE_VERSION = 1;
+const STORE_VERSION = 2;
 const STORE_CAP = 200;
 
-/** `state/voice-tasks.json`: voice delivery only; where a task stands stays the core's record. */
+/** `state/voice-tasks.json`: the voice task table. One writer, atomic, capped; survives a restart. */
 export function createVoiceTaskStore(path: string, now: () => number = Date.now) {
 	const read = (): Record<string, VoiceTaskRecord> => {
 		try {
@@ -28,31 +40,85 @@ export function createVoiceTaskStore(path: string, now: () => number = Date.now)
 			return {};
 		}
 	};
+	const update = (taskId: string, change: (row: VoiceTaskRecord) => VoiceTaskRecord | null) => {
+		const tasks = read();
+		const next = change(tasks[taskId] ?? { at: 0 });
+		if (!next) return;
+		tasks[taskId] = { ...next, at: now() };
+		const kept = Object.entries(tasks).sort((a, b) => b[1].at - a[1].at).slice(0, STORE_CAP);
+		try {
+			if (!existsSync(dirname(path))) mkdirSync(dirname(path), { recursive: true });
+			const tmp = `${path}.${process.pid}.tmp`;
+			writeFileSync(tmp, JSON.stringify({ version: STORE_VERSION, tasks: Object.fromEntries(kept) }));
+			renameSync(tmp, path);
+		} catch { /* a row that cannot be written costs a possible repeat, never a lost result */ }
+	};
 	return {
 		get(taskId: string): VoiceTaskRecord | undefined {
 			return read()[taskId];
 		},
+		/** Every row, oldest submission first. */
+		list(): Array<[string, VoiceTaskRecord]> {
+			return Object.entries(read()).sort((a, b) => (a[1].submittedAt ?? a[1].at) - (b[1].submittedAt ?? b[1].at));
+		},
+		/** A `work` task was submitted. */
+		add(taskId: string, text: string): void {
+			update(taskId, (row) => ({ ...row, text: text.slice(0, 200), submittedAt: now() }));
+		},
+		/** The user asked to cancel it. */
+		markCancelRequested(taskId: string): void {
+			update(taskId, (row) => ({ ...row, cancelRequested: true }));
+		},
 		set(taskId: string, delivery: Delivery): void {
-			const tasks = read();
 			// A confirmed delivery is never downgraded by a later, weaker one.
-			if (tasks[taskId]?.delivery === 'spoken' && delivery !== 'spoken') return;
-			tasks[taskId] = { delivery, at: now() };
-			const kept = Object.entries(tasks).sort((a, b) => b[1].at - a[1].at).slice(0, STORE_CAP);
-			try {
-				if (!existsSync(dirname(path))) mkdirSync(dirname(path), { recursive: true });
-				const tmp = `${path}.${process.pid}.tmp`;
-				writeFileSync(tmp, JSON.stringify({ version: STORE_VERSION, tasks: Object.fromEntries(kept) }));
-				renameSync(tmp, path);
-			} catch { /* a record that cannot be written costs a possible repeat, never a lost result */ }
+			update(taskId, (row) => (row.delivery === 'spoken' && delivery !== 'spoken' ? null : { ...row, delivery }));
+		},
+		noteReplay(taskId: string): void {
+			update(taskId, (row) => ({ ...row, replays: (row.replays ?? 0) + 1 }));
+		},
+		noteNotPicked(taskId: string): void {
+			update(taskId, (row) => ({ ...row, notPickedNoticed: true }));
 		},
 	};
 }
 
 export type VoiceTaskStore = ReturnType<typeof createVoiceTaskStore>;
 
-/** The user never heard this result, so a repeat of the request should get it spoken. */
-export function shouldReplayDeduped(record: VoiceTaskRecord | undefined): boolean {
-	return record?.delivery !== 'spoken' && record?.delivery !== 'injected';
+/** Where the core says a task stands, read fresh each time. */
+export type CoreTaskState = 'queued' | 'started' | 'done' | 'cancelled' | 'unknown';
+
+export interface ReconcileInput {
+	row: VoiceTaskRecord;
+	core: CoreTaskState;
+	/** The core wrote a result and the watcher has already handled it (not one still landing). */
+	settledResult: boolean;
+	/** That result is a skip marker ([deduped: X], [no-send], [REPLIED]): its outcome lives elsewhere. */
+	resultIsSkip: boolean;
+	/** The result is in the queue right now. */
+	inFlight: boolean;
+	now: number;
+}
+
+export type ReconcileAction = 'none' | 'speak_result' | 'tell_not_picked';
+
+/** Hand an unheard result over at most this many more times. */
+export const MAX_REPLAYS = 2;
+/** A task the core has not picked up after this long is reported once. */
+export const NOT_PICKED_MS = 3 * 60 * 1000;
+
+/**
+ * The relay agent's one rule: every voice task ends in an outcome the user heard. Compares what
+ * the core did with what the user was told and returns what is still owed.
+ */
+export function planReconcile(i: ReconcileInput): ReconcileAction {
+	if (i.settledResult) {
+		if (i.resultIsSkip || i.inFlight) return 'none';
+		if (i.row.delivery === 'spoken' || i.row.delivery === 'injected') return 'none';
+		return (i.row.replays ?? 0) < MAX_REPLAYS ? 'speak_result' : 'none';
+	}
+	if (i.core === 'queued' && !i.row.cancelRequested && !i.row.notPickedNoticed
+		&& i.row.submittedAt !== undefined && i.now - i.row.submittedAt > NOT_PICKED_MS) return 'tell_not_picked';
+	return 'none';
 }
 
 export interface ResultItem {
@@ -108,11 +174,17 @@ export function createResultQueue(deps: ResultQueueDeps) {
 	const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 	const log = deps.log ?? (() => {});
 	const queue: ResultItem[] = [];
+	/** Task ids queued or handed over and not yet settled. */
+	const inFlight = new Set<string>();
 	let running = false;
 	let settleTurn: ((o: TurnOutcome) => void) | null = null;
 
 	const record = (items: ResultItem[], delivery: Delivery) => {
-		for (const i of items) if (i.taskId) deps.store?.set(i.taskId, delivery);
+		for (const i of items) {
+			if (!i.taskId) continue;
+			deps.store?.set(i.taskId, delivery);
+			inFlight.delete(i.taskId);
+		}
 	};
 
 	const awaitTurn = () => new Promise<TurnOutcome>((resolve) => {
@@ -165,6 +237,7 @@ export function createResultQueue(deps: ResultQueueDeps) {
 
 	return {
 		enqueue(item: ResultItem): void {
+			if (item.taskId) inFlight.add(item.taskId);
 			queue.push(item);
 			if (!running) void drain();
 		},
@@ -173,5 +246,7 @@ export function createResultQueue(deps: ResultQueueDeps) {
 		/** The user cut the model's turn off. */
 		onTurnInterrupted(): void { settleTurn?.('interrupted'); },
 		get pending(): number { return queue.length; },
+		/** The task's result is queued or being spoken. */
+		isInFlight(taskId: string): boolean { return inFlight.has(taskId); },
 	};
 }

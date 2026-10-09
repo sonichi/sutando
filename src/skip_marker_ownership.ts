@@ -14,12 +14,6 @@ export function bodyIsSkipMarked(result: string): boolean {
 	return SKIP_MARKER_RE.test(String(result ?? "").replace(D7_HEADER_RE, ""));
 }
 
-/** The task a `[deduped: <id>]` body points at, or null; same grammar as SKIP_MARKER_RE. */
-export function dedupTarget(result: string): string | null {
-	const m = String(result ?? "").replace(D7_HEADER_RE, "").match(/^\s*\[deduped:\s*([^\]\s]+)\s*\]/i);
-	return m ? m[1] : null;
-}
-
 export function isSkipMarked(file: string, result: string): boolean {
 	return file.startsWith('task-') && bodyIsSkipMarked(result);
 }
