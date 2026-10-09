@@ -1184,6 +1184,17 @@ def read_baseline(cloud: Cloud) -> dict[str, set[str]]:
         raise Setup("cloud_error", f"Could not read the current connections to switch from: {exc}") from None
 
 
+def station_account_changed(ws: Path, cloud: Cloud, cloud_user_id: str | None) -> dict | None:
+    """The account_changed payload when the agent's credential is not the account the desktop stamped
+    for the running core's station: a card then would ask the owner to connect what is already there."""
+    # An unknown agent id or no stamp keeps today's card: nothing to compare, and the wait records it.
+    stamp = read_station_stamp(ws)
+    if account_mismatch(stamp, cloud_user_id, lambda: cloud_user_id) != "account_changed":
+        return None
+    return {"wait_id": None, "reason": "account_changed", "cloud_user_id": cloud_user_id,
+            "stamp_cloud_user_id": (stamp or {}).get("cloud_user_id"), "base": cloud.base}
+
+
 def cmd_await(
     ws: Path,
     cloud: Cloud,
@@ -1201,6 +1212,10 @@ def cmd_await(
     if not cloud.signed_in():
         raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
     cloud_user_id = account_for_wait(cloud, sleep)
+    changed = station_account_changed(ws, cloud, cloud_user_id)
+    if changed:
+        emit(changed)
+        return EXIT_NO
     payload = arm_wait(ws, a, cloud_user_id, toolkits=lambda slugs: resolve_toolkits(cloud, slugs),
                        baseline=lambda: read_baseline(cloud), spawn=spawn, now=now)
     emit(payload)
@@ -1384,6 +1399,10 @@ def cmd_card(
     if not cloud.signed_in():
         raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
     cloud_user_id = account_for_wait(cloud, sleep)
+    changed = station_account_changed(ws, cloud, cloud_user_id)
+    if changed:
+        emit({**changed, "all_connected": False, "apps": apps, "mode": mode, "message": None})
+        return EXIT_NO
     intro = a["lines"][0] if a["lines"] else card_intro(names, switch)
     if a["private"]:
         a["lines"] = a["lines"] or [intro, "Once that's done I'll carry on."]
@@ -1410,7 +1429,8 @@ def cmd_claim(
         ready = [m for m in pending if conns is None or wait_ready(m, conns)]
         current = (lambda: None) if args.force else functools.lru_cache(maxsize=None)(cloud.user_id)
         # Every verdict before any claim, so a cloud error leaves every wait armed.
-        verdicts = {m["wait_id"]: account_mismatch(ws, m.get("cloud_user_id"), current) for m in ready}
+        stamp = read_station_stamp(ws)
+        verdicts = {m["wait_id"]: account_mismatch(stamp, m.get("cloud_user_id"), current) for m in ready}
         for marker in pending:
             if marker["wait_id"] not in verdicts:
                 waiting.append(marker)
@@ -1429,12 +1449,13 @@ def cmd_claim(
     return EXIT_OK if claimed else EXIT_NO
 
 
-def account_mismatch(ws: Path, want: Any, current: Callable[[], str | None]) -> str | None:
+def account_mismatch(stamp: dict | None, want: Any, current: Callable[[], str | None]) -> str | None:
     """None when the wait's account is known, signed in, and the one the running core's station was
-    started for (when the desktop stamped one); else account_unknown or account_changed."""
+    started for (`stamp`, from read_station_stamp, when the desktop wrote one); else account_unknown
+    or account_changed."""
     if not want:
         return "account_unknown"
-    stamped = (read_station_stamp(ws) or {}).get("cloud_user_id")
+    stamped = (stamp or {}).get("cloud_user_id")
     if stamped and stamped != want:
         return "account_changed"
     found = current()
@@ -1448,7 +1469,7 @@ def cmd_verify_account(ws: Path, cloud: Cloud, args: argparse.Namespace, **_: An
     wait_id = _require(args.wait_id, WAIT_ID_RE, "wait id")
     record = _read_json(claimed_path(ws, wait_id))
     if _valid_marker(record, wait_id):
-        reason = account_mismatch(ws, record.get("cloud_user_id"), cloud.user_id)
+        reason = account_mismatch(read_station_stamp(ws), record.get("cloud_user_id"), cloud.user_id)
     else:
         reason = "no_such_wait"
     emit({"wait_id": wait_id, "ok": reason is None, "reason": reason})
