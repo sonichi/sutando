@@ -40,6 +40,10 @@ os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
 os.environ["SUTANDO_STOP_HOOK_WATCHER_GATE"] = "0"
 
 HOOK = pathlib.Path(__file__).resolve().parent.parent / "src" / "check-pending-tasks.sh"
+# The hook gates only the launcher-marked core (or an enrolled worker); this suite is the core.
+os.environ["SUTANDO_CORE_SESSION"] = "1"
+# A worker session exports SUTANDO_INSTANCE_ID; inherited here it would put the hook in worker mode.
+os.environ.pop("SUTANDO_INSTANCE_ID", None)
 RESOLVE = 'WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"'
 REPO_LINE = 'REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"'
 REPO = HOOK.resolve().parent.parent

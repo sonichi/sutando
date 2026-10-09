@@ -253,7 +253,8 @@ class HitlManager:
             return False  # a policy answer is a record, never a card
         return self.store.projection(req_id).get("revision", 0) < req.revision
 
-    def record_projection(self, req_id: str, revision: int, event_id: Optional[str]) -> None:
+    def record_projection(self, req_id: str, revision: int, event_id: Optional[str],
+                          extra: Optional[Dict] = None) -> None:
         """Idempotent: recording an older revision than already projected is a
         no-op; the event id (first CREATE event, the EDIT target) is kept."""
         with self.store.locked():
@@ -264,7 +265,16 @@ class HitlManager:
             if revision <= current.get("revision", 0):
                 return
             event_id = event_id or current.get("event_id")
-            self.store.save(req, projection={"revision": revision, "event_id": event_id})
+            self.store.save(req, projection={**current, **(extra or {}),
+                                             "revision": revision, "event_id": event_id})
+
+    def record_notice(self, req_id: str, fields: Dict) -> None:
+        """Merge follow-up-notice bookkeeping (hitl.renotify) into the ledger."""
+        with self.store.locked():
+            req = self.store.load(req_id)
+            if req is None:
+                return
+            self.store.save(req, projection={**self.store.projection(req_id), **fields})
 
     def projection_target(self, req_id: str) -> Optional[str]:
         """Event id of the CREATE projection — the target for status EDITs."""

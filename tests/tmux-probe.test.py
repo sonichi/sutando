@@ -92,8 +92,22 @@ class TestHasSession(unittest.TestCase):
             seen["argv"], seen["timeout"] = argv, k.get("timeout")
             return _R(0)
         self.assertIs(self._with_run(fake, timeout=8, tmux="/x/tmux"), True)
-        self.assertEqual(seen["argv"], ["/x/tmux", "-S", "s.sock", "has-session", "-t", "core"])
+        self.assertEqual(seen["argv"], ["/x/tmux", "-S", "s.sock", "has-session", "-t", "=core"])
         self.assertEqual(seen["timeout"], 8)
+
+    def test_an_already_exact_target_is_not_prefixed_twice(self):
+        seen = {}
+
+        def fake(argv, **k):
+            seen["argv"] = argv
+            return _R(0)
+        orig = subprocess.run
+        subprocess.run = fake
+        try:
+            tmux_probe.has_session("s.sock", "=core")
+        finally:
+            subprocess.run = orig
+        self.assertEqual(seen["argv"][-1], "=core")
 
     def test_skew_stderr_is_unknown(self):
         self.assertIsNone(self._with_run(lambda *a, **k: _R(1, b"server exited unexpectedly\n")))
@@ -191,6 +205,22 @@ class TestTmuxProbeCli(unittest.TestCase):
             try:
                 self.assertEqual(self._run([sock, "=clitest"]), 0)
                 self.assertEqual(self._run([sock, "=nope"]), 1)
+            finally:
+                subprocess.run([tmux, "-S", sock, "kill-server"], check=False)
+
+    def test_a_longer_session_sharing_the_name_is_not_the_session(self):
+        import shutil
+        tmux = shutil.which("tmux")
+        if tmux is None:
+            self.skipTest("tmux not installed")
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sock = os.path.join(td, "sock")
+            subprocess.run([tmux, "-S", sock, "new-session", "-d", "-s", "seat-input", "sleep 60"],
+                           check=True)
+            try:
+                self.assertIs(tmux_probe.has_session(sock, "seat"), False)
+                self.assertIs(tmux_probe.has_session(sock, "seat-input"), True)
             finally:
                 subprocess.run([tmux, "-S", sock, "kill-server"], check=False)
 

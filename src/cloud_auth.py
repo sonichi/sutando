@@ -13,7 +13,22 @@ Lookup order (read_cloud_auth):
   2. The desktop host's Keychain session. The Tauri host stores the sutk_ ONLY
      there, under a key bound to the origin it was minted against
      (cloud_session.rs origin_key_suffix — mirrored byte-for-byte below).
+     Under the desktop host (SUTANDO_APP_SUPPORT in the core's environment, or
+     SUTANDO_PACKAGED=1 on the sidecar) the Keychain is the ONLY record
+     consulted: it is the session the app is signed into, the host writes no
+     file, and a leftover cloud-auth.json from another workspace or the
+     Electron era can hold nothing but a stale bearer, which made the engine
+     act as a different account than the app showed, and keep acting as it
+     after a sign-out (user feedback P1-11). Signed out in the Keychain means
+     signed out; only the metering env (3) is still honoured there.
   3. The metering env the supervisor injects for signed-in runs.
+
+Once the desktop has stamped the running core's station for a user
+(state/station-core-stamp.json `cloud_user_id`), only a credential whose
+/api/me id is that user is returned; the first matching candidate in the
+order above wins. If none matches, the result is empty with `refused` set
+(account_changed / account_unverified) instead of acting as another account;
+account_unverified means /api/me could not be reached (network, 429, 5xx).
 
 cloud_request() is the one HTTP path: https only, host allowlisted, bearer
 never sent anywhere else, errors surfaced as CloudError(status, code, detail)
@@ -30,7 +45,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
+
+from station_stamp import read_station_stamp
 
 # Hosts the bearer may be sent to. Anything else aborts rather than forwarding
 # the owner's token.
@@ -93,38 +110,90 @@ def keychain_get(key: str) -> str | None:
         return None
 
 
-def read_keychain_auth(get: Callable[[str], str | None] = keychain_get):
+def keychain_candidates(get: Callable[[str], str | None] | None = None, *,
+                        signed_out_is_terminal: bool = False) -> Iterator[tuple[str, str]]:
+    """Every (apiBase, token) the Keychain holds, in read_keychain_auth's order."""
+    get = get or keychain_get  # resolved at call time, so a patched reader is honoured
+    origin = resolve_cloud_origin()
+    if signed_out_is_terminal and get(origin_vault_key(origin)) == SIGNED_OUT_SENTINEL:
+        return
+    candidates = [origin]
+    if origin == DEFAULT_CLOUD_ORIGIN:
+        candidates.extend(RETIRED_CLOUD_ORIGINS)
+    keys = [origin_vault_key(o) for o in candidates]
+    # Pre-origin-scoping installs stored a bare, unscoped key.
+    keys.append("AG2_CLOUD_TOKEN")
+    for key in keys:
+        tok = get(key)
+        if tok and tok != SIGNED_OUT_SENTINEL:
+            yield origin, tok
+
+
+def read_keychain_auth(get: Callable[[str], str | None] | None = None, *,
+                       signed_out_is_terminal: bool = False):
     """(apiBase, token) from the Tauri host's origin-scoped Keychain session.
 
     No cross-origin fallback except the host's own retired-production
     carry-over, mirrored here. `get` is injectable so callers that wrap this
-    (report-feedback) keep their own patch points.
+    (report-feedback) keep their own patch points. With
+    `signed_out_is_terminal` (the desktop host), the host's sign-out marker on
+    the current origin ends the lookup: the retired-origin carry-over and the
+    bare pre-scoping key are older sessions, which is exactly what a sign-out
+    must not fall back to.
     """
-    origin = resolve_cloud_origin()
-    candidates = [origin]
-    if origin == DEFAULT_CLOUD_ORIGIN:
-        candidates.extend(RETIRED_CLOUD_ORIGINS)
-    for o in candidates:
-        tok = get(origin_vault_key(o))
-        if tok and tok != SIGNED_OUT_SENTINEL:
-            return origin, tok
-    # Pre-origin-scoping installs stored a bare, unscoped key.
-    tok = get("AG2_CLOUD_TOKEN")
-    if tok and tok != SIGNED_OUT_SENTINEL:
-        return origin, tok
+    for found in keychain_candidates(get, signed_out_is_terminal=signed_out_is_terminal):
+        return found
     return None, None
 
 
-def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None):
-    """Return (apiBase, token) if signed in to Sutando Cloud, else (None, None).
+def keychain_first() -> bool:
+    """Under the desktop host the Keychain session is the account the app shows;
+    files are legacy readers there. The core's own environment carries
+    SUTANDO_APP_SUPPORT (the desktop launcher exports it to every engine process,
+    and channel_env_containment keys on the same variable); SUTANDO_PACKAGED=1
+    reaches only the sidecar, so it is accepted but never relied on."""
+    if os.environ.get("SUTANDO_PACKAGED") == "1":
+        return True
+    return bool((os.environ.get("SUTANDO_APP_SUPPORT") or "").strip())
 
-    Post-M1 the record lives at ``<workspace>/state/auth/cloud-auth.json``; the
-    pre-M1 root ``<workspace>/cloud-auth.json`` is probed as a 30-day reader
-    fallback. Both packaged-app workspace equivalents are also probed so the
-    token is found even when running from a different checkout. The Tauri
-    desktop writes no auth file at all — its session lives in the Keychain,
-    probed next. Falls back to the metering env the supervisor injects.
-    """
+
+class CloudAuth(tuple):
+    """(apiBase, token), unpacking like the plain pair, plus why it is empty when a
+    credential was refused: `refused` is account_changed or account_unverified."""
+
+    def __new__(cls, base, token, refused=None, stamp_user_id=None, credential_user_ids=()):
+        self = super().__new__(cls, (base, token))
+        self.refused = refused
+        self.stamp_user_id = stamp_user_id
+        self.credential_user_ids = tuple(credential_user_ids)
+        return self
+
+
+_USER_IDS: dict[tuple[str, str], str] = {}
+
+
+def credential_user_id(base: str, token: str) -> str | None:
+    """The AG2 Cloud user a credential acts as, from /api/me; None when the answer has no id.
+    Raises CloudError when /api/me fails, which unreachable() classifies."""
+    key = (normalize_base(base), token)
+    if key not in _USER_IDS:
+        me = cloud_request(key[0], token, "GET", "/api/me", timeout=10)
+        uid = str((me or {}).get("id") or "") if isinstance(me, dict) else ""
+        if not uid:
+            return None
+        _USER_IDS[key] = uid
+    return _USER_IDS[key]
+
+
+def unreachable(exc: Exception) -> bool:
+    """True when a failed /api/me says nothing about the credential (network, 429, 5xx);
+    False for a real answer such as 401 or a refused host."""
+    if not isinstance(exc, CloudError):
+        return True
+    return exc.code == "network" or exc.status == 429 or exc.status >= 500
+
+
+def _file_candidates(ws: Path) -> Iterator[tuple[str, str]]:
     seen: set[str] = set()
     _app_ws = Path.home() / ".sutando" / "repo" / "workspace"
     for p in (
@@ -142,14 +211,91 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None):
             if p.exists():
                 d = json.loads(p.read_text())
                 if d.get("token"):  # signed in == has token (matches desktop)
-                    return normalize_base(d.get("apiBase") or ""), d["token"]
+                    yield normalize_base(d.get("apiBase") or ""), d["token"]
         except Exception:
             continue
 
-    base, tok = (keychain_auth or read_keychain_auth)()
-    if tok:
-        return base, tok
 
+def _candidates(ws: Path, keychain_auth: Callable[[], tuple] | None,
+                keychain_get: Callable[[str], str | None] | None) -> Iterator[tuple[str, str]]:
+    host = keychain_first()
+    if not host:
+        yield from _file_candidates(ws)
+    if keychain_auth is not None:
+        base, tok = keychain_auth()[:2]
+        if tok:
+            yield base, tok
+    else:
+        yield from keychain_candidates(keychain_get, signed_out_is_terminal=host)
+    base, tok = _metering_env_auth()
+    if tok:
+        yield base, tok
+
+
+def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None,
+                    user_id: Callable[[str, str], str | None] | None = None,
+                    keychain_get: Callable[[str], str | None] | None = None) -> CloudAuth:
+    """Return (apiBase, token) if signed in to Sutando Cloud, else (None, None).
+
+    Post-M1 the record lives at ``<workspace>/state/auth/cloud-auth.json``; the
+    pre-M1 root ``<workspace>/cloud-auth.json`` is probed as a 30-day reader
+    fallback. Both packaged-app workspace equivalents are also probed so the
+    token is found even when running from a different checkout. The Tauri
+    desktop writes no auth file at all — its session lives in the Keychain,
+    probed next. Falls back to the metering env the supervisor injects.
+    Under the desktop host the Keychain is the only record consulted (a file
+    can hold nothing but a stale bearer, wrong again after a sign-out).
+
+    With a station stamp naming a user, a credential is returned only if
+    `user_id` (default: /api/me) says it is that user; see CloudAuth.refused.
+    `keychain_get` replaces the Keychain reader; `keychain_auth` replaces the whole Keychain tier.
+    """
+    stamped = str((read_station_stamp(ws) or {}).get("cloud_user_id") or "")
+    if not stamped:
+        for base, tok in _candidates(ws, keychain_auth, keychain_get):
+            return CloudAuth(base, tok)
+        return CloudAuth(None, None)
+    user_id = user_id or credential_user_id
+    tried: set[tuple[str, str]] = set()
+    others: list[str] = []
+    unknown = False
+    for base, tok in _candidates(ws, keychain_auth, keychain_get):
+        # Keyed like the id cache: one token on an unusable base must still be tried on its real one.
+        key = (normalize_base(base or DEFAULT_CLOUD_ORIGIN), tok)
+        if key in tried:
+            continue
+        tried.add(key)
+        try:
+            uid = user_id(key[0], tok)
+        except (CloudError, OSError, ValueError) as exc:
+            unknown = unknown or unreachable(exc)
+            continue
+        unknown = unknown or not uid
+        if uid == stamped:
+            return CloudAuth(base, tok, stamp_user_id=stamped, credential_user_ids=(uid,))
+        if uid and uid not in others:
+            others.append(uid)
+    if others:
+        return CloudAuth(None, None, "account_changed", stamped, others)
+    # Only dead or unsendable credentials left is plainly signed out, not a cloud outage.
+    return CloudAuth(None, None, "account_unverified" if unknown else None, stamped if unknown else None)
+
+
+def refusal_message(auth: Any) -> str | None:
+    """Owner-facing words for a refused CloudAuth (see read_cloud_auth), else None."""
+    refused = getattr(auth, "refused", None)
+    if refused == "account_changed":
+        return (f"This agent's AG2 Cloud credentials belong to {', '.join(auth.credential_user_ids)}, not the "
+                f"account the desktop app started it for ({auth.stamp_user_id}): sign in again from the desktop app.")
+    if refused == "account_unverified":
+        return ("Verifying which AG2 Cloud account this agent's credentials belong to is temporarily "
+                "unavailable, so they were not used; try again in a moment.")
+    return None
+
+
+def _metering_env_auth():
+    """(apiBase, token) from the metering env the supervisor injects for a signed-in
+    run, else (None, None)."""
     hdrs = os.environ.get("SUTANDO_METERING_HEADERS")
     if hdrs:
         try:

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import math
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -276,10 +277,91 @@ def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", in
                                queue=queue)
 
 
+#: How long a RUNNING task counts as "being worked" without a newer activity stamp.
+IN_PROGRESS_MAX_AGE_S = 1800.0
+
+
+#: The row kind that is real work on a task: a tool call the session's own activity
+#: hook attributed to it. Reading the task (processing) or thinking about it is not.
+_ENGAGED_KINDS = frozenset({"working"})
+
+
+def engaged_at(workspace: Path, task_id: str) -> float | None:
+    """When the session last did real work on the task: the newest `working` row naming
+    it from the session's own hook (never the bus's TASK_STATUS rows, which mark delivery,
+    and never a read or a thought: a task read and then dropped is still owed). None when
+    no such row exists."""
+    newest = None
+    try:
+        with open(workspace / "state" / "agent-activity.jsonl", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict) or rec.get("projection") == "TASK_STATUS":
+                    continue
+                task = rec.get("task")
+                if not isinstance(task, dict) or task.get("id") != task_id:
+                    continue
+                if rec.get("kind") not in _ENGAGED_KINDS:
+                    continue
+                ts = rec.get("ts")
+                if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts):
+                    newest = ts if newest is None else max(newest, ts)
+    except OSError:
+        return None
+    return newest
+
+
+def in_progress(workspace: Path, task_id: str, max_age: float = IN_PROGRESS_MAX_AGE_S,
+                now: float | None = None) -> bool:
+    """True when the snapshot says RUNNING and the session has ENGAGED with the task within
+    max_age: a runtime event applied to the snapshot (seq > 0) or an agent-activity row from
+    the session's own hook naming the task. RUNNING alone is delivery (the watcher marks it
+    at hand-off), and a delivered task nobody answered must still block. Queued, waiting on
+    a person, terminal, stale, a future or non-finite stamp, no or unreadable snapshot: False."""
+    try:
+        d = json.loads(ActivityStore(workspace).path(task_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(d, dict) or d.get("phase") != "RUNNING":
+        return False
+    seq = d.get("seq")
+    stamps = []
+    if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
+        stamps.append(d.get("last_activity_at"))
+    row_ts = engaged_at(workspace, task_id)
+    if row_ts is not None:
+        stamps.append(row_ts)
+    stamps = [x for x in stamps if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)]
+    if not stamps:
+        return False
+    age = (time.time() if now is None else now) - float(max(stamps))
+    return 0 <= age <= max_age
+
+
+def _in_progress_cli(args: list[str]) -> int:
+    """`in-progress <task_id> [--workspace W] [--max-age S]`: rc 0 when in progress, 1 when not,
+    2 on a usage error. Unlike the emitting commands this one is a query, so it answers by rc."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="activity_bus.py in-progress")
+    ap.add_argument("task_id"); ap.add_argument("--workspace"); ap.add_argument("--max-age", type=float, default=IN_PROGRESS_MAX_AGE_S)
+    try:
+        a = ap.parse_args(args)
+    except SystemExit:
+        return 2
+    ws = Path(a.workspace) if a.workspace else resolve_workspace()
+    return 0 if in_progress(ws, a.task_id, a.max_age) else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """`transition <PHASE> (--task-file P | --task-id ID) [--reason R] [--into-task ID] [--worker W]`
     and `event <task_id> <kind> --session S --seq N [--text T]`. Exits 0 on every path: a caller in
     the delivery path must never fail because the card could not be updated."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "in-progress":
+        return _in_progress_cli(args[1:])
     import argparse
     ap = argparse.ArgumentParser(description="activity bus CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)

@@ -42,12 +42,16 @@ injection/``requires`` gate, ``startup-runtime.sh``'s shell gate,
 ``voicePreference`` scopes the VOICE capability; 'gemini-text' resolution is
 preference-independent but still honors the quarantine marker.
 
-'gemini-image' (the image-generation skill) walks the slots text THEN voice in
-each tier: any Gemini key generates images, and a managed-key install holds
-only the voice entry. It is not a voice surface, so a 'managed' preference
-never blocks its env fallback; a 'byok' preference skips only the managed
-VOICE slot (the owner chose their own key for voice, so that managed entry is
-not theirs to spend), and quarantine hides every managed entry as always.
+'gemini-image' (the image-generation skill) walks text THEN voice in the ENV
+tier: any real Gemini key generates images. In the MANAGED tier it reads the
+text slot only: the managed voice entry is a cloud-minted Gemini Live
+ephemeral token (``auth_tokens/...``), accepted by the Live API alone, so
+spending it on ``generateContent`` is rejected as an invalid API key. It is
+not a voice surface, so a 'managed' preference never blocks its env fallback,
+and quarantine hides every managed entry as always. A desktop supervisor also
+injects that token into every child as GEMINI_VOICE_API_KEY, so no capability
+but voice accepts an ``auth_tokens/`` value, or the managed voice key, from ANY
+tier; with nothing else left it resolves ``('', 'none')``.
 
 Managed-file schema (version 1):
   {"version": 1,
@@ -92,12 +96,21 @@ class _ManagedFile(NamedTuple):
     quarantined: bool
 
 
-# Per-capability lookup order within a tier (voice falls back to text).
-_CAPABILITY_FALLBACKS = {
+# Per-capability lookup order per tier (voice falls back to text). The managed
+# voice entry is a Live-only ephemeral token: only the voice capability may spend it.
+_MANAGED_SLOTS = {
+    "gemini-voice": ["gemini-voice", "gemini-text"],
+    "gemini-text": ["gemini-text"],
+    "gemini-image": ["gemini-text"],
+}
+_ENV_SLOTS = {
     "gemini-voice": ["gemini-voice", "gemini-text"],
     "gemini-text": ["gemini-text"],
     "gemini-image": ["gemini-text", "gemini-voice"],
 }
+
+# Cloud-minted Gemini Live ephemeral tokens carry this prefix; only the Live API accepts them.
+_LIVE_TOKEN_PREFIX = "auth_tokens/"
 
 # Env-var names per capability slot, in existing-chain order.
 _ENV_VARS = {
@@ -148,19 +161,24 @@ def resolve_credential(
     truth table (module docstring) gates the tiers. Byte-identical to the TS
     twin.
     """
-    slots = _CAPABILITY_FALLBACKS[capability]
     managed = _read_managed(managed_path if managed_path is not None else managed_credentials_path())
     # S1: the preference governs the VOICE capability; quarantine hides
     # managed entries from every capability in every mode.
     preference = managed.voice_preference if capability == "gemini-voice" else None
+    managed_voice = managed.caps.get("gemini-voice")
+    managed_voice_key = managed_voice.get("key") if isinstance(managed_voice, dict) else None
+
+    def spendable(key: str) -> bool:
+        # A Live token (or its injected env copy) is spendable by the voice capability alone.
+        return capability == "gemini-voice" or not (
+            key.startswith(_LIVE_TOKEN_PREFIX) or key == managed_voice_key
+        )
+
     if preference != "byok" and not managed.quarantined:
-        for slot in slots:
-            # The managed voice entry is not the image capability's to spend under a byok voice preference.
-            if capability == "gemini-image" and slot == "gemini-voice" and managed.voice_preference == "byok":
-                continue
+        for slot in _MANAGED_SLOTS[capability]:
             entry = managed.caps.get(slot)
             key = entry.get("key") if isinstance(entry, dict) else None
-            if isinstance(key, str) and key:
+            if isinstance(key, str) and key and spendable(key):
                 # S3: report the entry's opaque generation verbatim, when present.
                 generation = entry.get("generation")
                 return ResolvedCredential(
@@ -175,9 +193,9 @@ def resolve_credential(
         # preference — a present env key must not silently satisfy it (the
         # logout-quarantine bypass the design closes). Fail actionably.
         return ResolvedCredential(key="", source="none")
-    for slot in slots:
+    for slot in _ENV_SLOTS[capability]:
         key = os.environ.get(_ENV_VARS[slot])
-        if key:
+        if key and spendable(key):
             # S3/U4: for the voice capability the launcher injects
             # SUTANDO_VOICE_CREDENTIAL_GENERATION beside a materialized BYOK
             # key. Manual/legacy .env keys stay generationless (Y4/Z4: a

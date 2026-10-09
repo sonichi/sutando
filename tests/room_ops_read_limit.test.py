@@ -260,6 +260,20 @@ class NormalizeMediaRefTests(unittest.TestCase):
         self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
         self.assertEqual(out[0]["msgtype"], "m.file")
 
+    def test_broker_shaped_media_event_keeps_its_handle(self):
+        # The broker names the handle `mxc` and adds `mimetype` (room_ops `_media_fields`).
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "guide.md",
+                              "msgtype": "m.file", "mxc": "mxc://hs/abc123",
+                              "mimetype": "text/markdown"}])
+        self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
+        self.assertEqual(out[0]["msgtype"], "m.file")
+        self.assertEqual(out[0]["mimetype"], "text/markdown")
+
+    def test_media_ref_wins_when_both_names_arrive(self):
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "a.pdf",
+                              "media_ref": "mxc://hs/ref", "mxc": "mxc://hs/other"}])
+        self.assertEqual(out[0]["media_ref"], "mxc://hs/ref")
+
     def test_media_without_msgtype_grows_no_null(self):
         # Third case: media present, msgtype absent. The gateway is external, so this
         # cannot be ruled out from here — keep the same additive shape as plain text.
@@ -267,6 +281,7 @@ class NormalizeMediaRefTests(unittest.TestCase):
                               "media_ref": "mxc://hs/abc123"}])
         self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
         self.assertNotIn("msgtype", out[0])
+        self.assertNotIn("mimetype", out[0])
 
     def test_no_media_ref_key_for_plain_message(self):
         # A text message must not grow a null media_ref — keep the shape additive.

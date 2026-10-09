@@ -75,7 +75,7 @@ claude_named_process_running() {
 
 claude_named_tmux_session_exists() {
   command -v tmux > /dev/null 2>&1 || return 1
-  tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null
 }
 
 claude_named_session_running() {
@@ -149,6 +149,13 @@ if cfg.get("hasCompletedClaudeInChromeOnboarding") is not True:
 if cfg.get("theme") is None and glob.get("theme") is not None:
     cfg["theme"] = glob["theme"]
     changed = True
+# Claude Code's "Flicker-free output" upsell shows until this counter reaches 3
+# (what "Not now" writes); a headless core cannot take the trial (P1-24).
+upsell_seeded = False
+if (cfg.get("fullscreenUpsellSeenCount") or 0) < 3:
+    cfg["fullscreenUpsellSeenCount"] = 3
+    changed = True
+    upsell_seeded = True
 # Trust-seed for the explicitly-configured working dir. Claude Code keys the
 # folder-trust dialog on projects[<abs cwd>].hasTrustDialogAccepted; a fresh
 # scoped config lacks it for a custom cwd, so a detached session would hang on
@@ -198,6 +205,8 @@ if changed:
         print("  ✓ chrome-seed: hasCompletedClaudeInChromeOnboarding set in .claude.json")
     if trusted_dir:
         print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
+    if upsell_seeded:
+        print("  ✓ upsell-seed: fullscreenUpsellSeenCount set in .claude.json")
 PY
     fi
   else
@@ -275,11 +284,13 @@ resolve_claude_credential_proxy() {
     lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1
   }
   if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
-    # A loaded launchd job means the proxy is EXPECTED on this host even when
-    # its listener hasn't bound yet.
+    # The proxy is EXPECTED, though not yet bound, under either supervisor: a loaded
+    # launchd job, or a live proxy process (the desktop app supervises it without launchd).
     PROXY_EXPECTED=""
     if launchctl print "gui/$(id -u)/com.sutando.credential-proxy" > /dev/null 2>&1; then
-      PROXY_EXPECTED=1
+      PROXY_EXPECTED="launchd job loaded"
+    elif pgrep -f 'credential-proxy\.(js|ts)( |$)' > /dev/null 2>&1; then
+      PROXY_EXPECTED="proxy process running"
     fi
     if [ -n "$PROXY_EXPECTED" ]; then
       # Bounded wait (~10s): a supervised proxy can bind seconds after this
@@ -292,9 +303,18 @@ resolve_claude_credential_proxy() {
     if _proxy_listener_up; then
       export ANTHROPIC_BASE_URL=http://localhost:7846
     elif [ -n "$PROXY_EXPECTED" ]; then
-      echo "  ⚠ credential proxy expected (launchd job loaded) but :7846 never bound within ~10s — session runs unrouted this launch (no proxy protection, no quota telemetry)" >&2
+      echo "  ⚠ credential proxy expected ($PROXY_EXPECTED) but :7846 never bound within ~10s — session runs unrouted this launch (no proxy protection, no quota telemetry)" >&2
     fi
   fi
+}
+
+# Appends --plugin-dir for each enabled skill's Claude plugin to SURFACE_ARGS.
+# Reads REPO, PY.
+add_skill_claude_plugins() {
+  declare -F skill_manifest_claude_plugins >/dev/null || return 0
+  while IFS= read -r -d '' _plugin_dir; do
+    SURFACE_ARGS+=(--plugin-dir "$_plugin_dir")
+  done < <(skill_manifest_claude_plugins "$REPO" "$PY")
 }
 
 # Any installed skill's manifest.json "config" block, forwarded the same way
@@ -335,9 +355,11 @@ forward_skill_manifest_config() {
   unset _mc_seen _mcrec
 }
 
-# Registers the PERSONAL_CLAUDE.md compaction-reinject hook. Idempotent.
+# Registers the post-compaction SessionStart hooks: PERSONAL_CLAUDE.md re-inject
+# and the task-watcher re-arm hint. Idempotent.
 install_claude_personal_hook() {
   bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "session-launch: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
+  bash "$REPO/scripts/install-watcher-rearm-hook.sh" || echo "session-launch: watcher re-arm hook install failed (rc=$?) — hook may be absent" >&2
 }
 
 # Creates a new tmux session running claude with the fully-assembled args, then

@@ -91,6 +91,8 @@ CRONS_FILE = WORKSPACE / "hosts" / host_slug() / "crons.json"
 TASKS_DIR = WORKSPACE / "tasks"
 STATE_FILE = WORKSPACE / "state" / "cron-runner-state.json"
 CORE_ALIVE_FILE = WORKSPACE / "state" / "cores" / f"{host_slug()}.alive"
+# Read by health-check: the record that due fires are being held for a dead heartbeat.
+HOLD_FILE = WORKSPACE / "state" / "cron-runner-hold.json"
 REPO_ROOT = SRC_DIR.parent
 
 # Look back at most this far when catching up a missed fire. Bounds work after
@@ -374,6 +376,36 @@ def local_core_alive(now_epoch: Optional[int] = None) -> bool:
     return 0 <= age < CORE_ALIVE_MAX_AGE_SECONDS
 
 
+def _core_alive_reason(now_epoch: float) -> str:
+    """Why local_core_alive() said no, for the hold record and the log line."""
+    try:
+        age = now_epoch - CORE_ALIVE_FILE.stat().st_mtime
+    except OSError:
+        return f"core heartbeat missing ({CORE_ALIVE_FILE})"
+    return f"core heartbeat stale ({int(age)}s old, limit {CORE_ALIVE_MAX_AGE_SECONDS}s)"
+
+
+def _record_hold(held: list, now_epoch: int) -> None:
+    """Publish (or clear) the held-fires record; a hold left silent is how schedules vanished."""
+    hold_file = STATE_FILE.parent / HOLD_FILE.name
+    if not held:
+        hold_file.unlink(missing_ok=True)
+        return
+    prior = _load_json(hold_file, {})
+    since = prior.get("since") if isinstance(prior, dict) else None
+    reason = _core_alive_reason(now_epoch)
+    record = {
+        "since": since if isinstance(since, int) else now_epoch,
+        "updated_at": now_epoch,
+        "held": sorted(set(held) | set(prior.get("held", []) if isinstance(prior, dict) else [])),
+        "reason": reason,
+    }
+    _atomic_write_text(hold_file, json.dumps(record))
+    _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch))
+    print(f"{_ts} cron-runner: holding due fire(s) {', '.join(sorted(set(held)))}: {reason}",
+          file=sys.stderr)
+
+
 def _load_json(path: Path, default):
     try:
         return json.loads(path.read_text())
@@ -548,6 +580,22 @@ def _run_shell_command(name: str, command: str, timeout_s: int = SHELL_COMMAND_T
 
 
 def emit_task(name: str, entry: dict) -> Path:
+    # A worker can claim between an ownership check and unlink: published
+    # payloads stay immutable until retired. Serialize emitters per job.
+    prefix = f"{cron_task_id.TASK_PREFIX}{_sanitize_name(name)}-"
+    with _state_lock(TASKS_DIR / f".{prefix}emit"):
+        pending = sorted(
+            (p for p in TASKS_DIR.glob(f"{prefix}*.txt")
+             if p.name[len(prefix):-4].isdigit()),
+            key=lambda p: int(p.name[len(prefix):-4]),
+        )
+        if pending:
+            print(f"cron-runner: coalesced {name!r} into outstanding {pending[0].stem}", file=sys.stderr)
+            return pending[0]
+        return _emit_new_task(name, entry)
+
+
+def _emit_new_task(name: str, entry: dict) -> Path:
     now_ms = int(time.time() * 1000)
     ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # A launchd cron either carries a direct `prompt` or a `prompt_skill`
@@ -556,7 +604,6 @@ def emit_task(name: str, entry: dict) -> Path:
         body_task = f"/{entry['prompt_skill']}"
     else:
         body_task = entry.get("prompt", "")
-    safe_name = _sanitize_name(name)
     task_id = cron_task_id.task_id(name, now_ms)
     # Defang forged header/fence lines in the (config-supplied) body, then place
     # `task:` last so a multi-line prompt body cannot forge the structured
@@ -572,24 +619,6 @@ def emit_task(name: str, entry: dict) -> Path:
         f"task: {body_task}\n"
     )
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    # Coalesce pending fires: if a prior emission for this same entry is still
-    # unconsumed (the core was down or busy), remove it before writing the new
-    # one, so a long outage leaves exactly ONE task per entry — the newest —
-    # instead of one file per missed slot (a */30 entry over a 6h outage would
-    # otherwise queue 12). Design converged with Chi + Sutando-Pro in #dev
-    # 2026-07-18. We keep the per-fire timestamped id (rather than a literally
-    # stable filename) so the orphan-check completion-marker contract
-    # (results/<id>.txt) is untouched — a consumed+archived result can never
-    # collide with a future fire's unique id. The suffix.isdigit() guard keeps
-    # the sweep from matching a different entry whose slug shares this prefix
-    # (e.g. cleaning "sync" must not delete "sync-workspace"'s pending task).
-    prefix = f"{cron_task_id.TASK_PREFIX}{safe_name}-"
-    for stale in TASKS_DIR.glob(f"{prefix}*.txt"):
-        if stale.name[len(prefix):-4].isdigit():
-            try:
-                stale.unlink()
-            except OSError:
-                pass
     path = TASKS_DIR / f"{task_id}.txt"
     # HMAC envelope (#3014 writer census): stamp at this writer's edge, fail-open
     # so a stamping error costs the stamp and never the fire.
@@ -598,7 +627,7 @@ def emit_task(name: str, entry: dict) -> Path:
         body = stamp_text(body, WORKSPACE)
     except Exception:
         pass
-    path.write_text(body)
+    _atomic_write_text(path, body)
     _emit_cron_telemetry()
     return path
 
@@ -634,6 +663,7 @@ def run(now_epoch: Optional[int] = None) -> list:
     # concurrent reconciler (Codex boot) can neither observe a half-written
     # state nor have its just-seeded migration boundary clobbered by our
     # write-back. See _state_lock for the race this closes.
+    held: list = []
     with _state_lock(STATE_FILE):
         state = _load_json(STATE_FILE, {})
         for entry in crons:
@@ -673,6 +703,7 @@ def run(now_epoch: Optional[int] = None) -> list:
                 elif not core_alive:
                     # Preserve the previous boundary so a short outage can
                     # recover this slot after the heartbeat returns.
+                    held.append(name)
                     continue
                 else:
                     lateness = now_epoch - due_epoch
@@ -693,6 +724,8 @@ def run(now_epoch: Optional[int] = None) -> list:
 
         if crons:  # only persist once we've actually read a config
             _atomic_write_text(STATE_FILE, json.dumps(state))
+        if held or core_alive:
+            _record_hold(held, now_epoch)
     return emitted
 
 

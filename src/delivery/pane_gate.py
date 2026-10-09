@@ -26,6 +26,7 @@ CLI:
     python3 src/delivery/pane_gate.py classify --runtime codex [--json] < capture.txt
     python3 src/delivery/pane_gate.py pending  --runtime codex < capture.txt
     python3 src/delivery/pane_gate.py composer-text --runtime claude < capture.txt
+    python3 src/delivery/pane_gate.py leftover --runtime codex < capture.txt   # exit 0 = clearable
     python3 src/delivery/pane_gate.py healthy --runtime claude < capture.txt   # exit 0 = accepts input
     python3 src/delivery/pane_gate.py deliver <session> <line> --runtime codex
         [--socket PATH] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
@@ -105,6 +106,10 @@ class RuntimeAdapter:
     await_hint: "re.Pattern[str]" = AWAIT_HINT
     alternate_glyphs: Tuple[str, ...] = ()
     idle_requires_prompt: bool = False
+    # Composer text only automation ever types: a dispatcher may clear exactly these.
+    automation_leftovers: Tuple[str, ...] = ()
+    # The runtime's dispatcher waits for idle-ready, so a draft holds every queued task.
+    pending_blocks_dispatch: bool = False
 
 
 CLAUDE = RuntimeAdapter(
@@ -123,6 +128,9 @@ CODEX = RuntimeAdapter(
     await_hint=re.compile(f"{AWAIT_HINT.pattern}|{CODEX_PICKER_ROW.pattern}", re.I),
     alternate_glyphs=("»",),
     idle_requires_prompt=True,
+    # Codex rejects Claude's /startup and leaves it in the composer.
+    automation_leftovers=("/startup",),
+    pending_blocks_dispatch=True,
 )
 ADAPTERS = {CLAUDE.name: CLAUDE, CODEX.name: CODEX}
 
@@ -344,6 +352,28 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
     return None
 
 
+def automation_leftover(capture: Optional[str], adapter: RuntimeAdapter, workspace=None,
+                        socket=None, session=None, verdict: Optional[Verdict] = None) -> Optional[str]:
+    """The composer's text when it is EXACTLY one of the runtime's automation leftovers and
+    nothing else, else None. Both parsers must agree: the prompt row alone misses a
+    multi-line draft whose first row happens to read the same, and the composer's frame must
+    be on screen so no row of it is hidden."""
+    if not adapter.automation_leftovers or capture is None:
+        return None
+    v = verdict or classify_pane(capture, adapter, workspace, socket, session)
+    if v.state != "pending" or v.pending not in adapter.automation_leftovers:
+        return None
+    if not composer_frame_visible(capture, adapter):
+        return None  # the box runs off the screen bottom: more text may sit below
+    return v.pending if composer_text(capture, adapter) == v.pending else None
+
+
+def blocks_dispatch(verdict: Verdict, adapter: RuntimeAdapter) -> bool:
+    """True when this pane holds every queued task: an abnormal frame on any runtime, or a
+    draft on a runtime whose dispatcher waits for idle-ready."""
+    return verdict.state == "abnormal" or (verdict.state == "pending" and adapter.pending_blocks_dispatch)
+
+
 # A working turn queues typed input (the Claude notifier delivers like the Monitor
 # tool); a dialog, a parked banner or an unreadable pane does not.
 def accepts_input(verdict: Verdict) -> bool:
@@ -469,6 +499,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             p.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
             p.add_argument("--session", default=None, help="the seat the record must vouch for")
             p.add_argument("--probe", action="store_true", help="refresh a stale record through the proxy first")
+    lo = sub.add_parser("leftover")
+    lo.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
+    lo.add_argument("--workspace", default=None, help="where state/quota-state.json lives")
+    lo.add_argument("--socket", default=os.environ.get("SUTANDO_TMUX_SOCKET"))
+    lo.add_argument("--session", default=None, help="the seat the record must vouch for")
     ct = sub.add_parser("composer-text")
     ct.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     cf = sub.add_parser("composer-frame")
@@ -519,6 +554,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"pane_gate: {v.state} ({v.reason}) — not accepting input", file=sys.stderr)
             return EXIT_UNSAFE
         print(v.state)
+        return 0
+    if a.cmd == "leftover":
+        # Exit 0 + the text only when the composer holds an automation leftover and nothing
+        # else; any other content, or no prompt, exits 1 and must be left alone.
+        text = automation_leftover(_read_stdin(), adapter, a.workspace, a.socket, a.session)
+        if text is None:
+            return 1
+        print(text)
         return 0
     if a.cmd == "composer-text":
         # Same None/"" contract as "pending", via the frame-stripping parser

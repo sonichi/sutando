@@ -20,7 +20,7 @@ memory-sync onboarding-status host-subtrees per-host-config-backup sync-conflict
 skills-driver-code-drift live-checkout-branch engine-revision-drift migrate-reader-contract
 tcc-documents-access quota-telemetry core-request-rejections core-quota quota-account-identity
 battery memory cron-schedule core-proactive-loop core-supervisor gateway-bridge runtime-identity
-daily-cron-punctuality live-tree-drift disk-space skill-symlinks task-queue pool-advertisement held-no-consumer
+daily-cron-punctuality live-tree-drift disk-space skill-symlinks task-queue pool-advertisement pool-suspended held-no-consumer
 orphaned-results stranded-destined-proactive proactive-quarantine stale-proactive-backlog
 task-watcher a-fallback-hits outbox-parked task-claims codex-task-notifier claude-task-notifier
 codex-presence notes-split-brain

@@ -762,6 +762,147 @@ class _RecoverLoop(unittest.TestCase):
                 setattr(gw, n, v)
 
 
+class _Refused(unittest.TestCase):
+    """A refused claim is surfaced in gateway-status.json, not only logged."""
+
+    def setUp(self):
+        self._saved = {n: getattr(gw, n) for n in
+                       ("URL", "TOKEN", "REENROLL_ENABLED", "_log",
+                        "GATEWAY_STATUS_FILE")}
+        self._env = gw.os.environ.get("AGENT_MXID")
+        gw.os.environ["AGENT_MXID"] = "@probe.agent:ag2.space"
+        gw.URL = "https://chat.example/relay"
+        gw.TOKEN = "ab" * 24
+        gw.REENROLL_ENABLED = True
+        gw._log = lambda m: None
+        self.status = Path(tempfile.mkdtemp()) / "gateway-status.json"
+        gw.GATEWAY_STATUS_FILE = self.status
+        _reset()
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(gw, n, v)
+        if self._env is None:
+            gw.os.environ.pop("AGENT_MXID", None)
+        else:
+            gw.os.environ["AGENT_MXID"] = self._env
+        _reset()
+
+    def _claim_answering(self, status, body):
+        def opener(req, timeout=0):
+            raise urllib.error.HTTPError(req.full_url, status, "x", {},
+                                         io.BytesIO(body))
+        real = gw.urllib.request.urlopen
+        gw.urllib.request.urlopen = opener
+        try:
+            gw._reenroll_claim()
+        finally:
+            gw.urllib.request.urlopen = real
+
+    def _block(self):
+        gw._emit_gateway_status(False, error="auth rejected HTTP 401")
+        return json.loads(self.status.read_text()).get("reenroll")
+
+    def test_disabled_window_is_published_with_the_server_error(self):
+        self._claim_answering(503, b'{"error":"reenroll_disabled"}')
+        block = self._block()
+        self.assertEqual(
+            {k: block[k] for k in ("pending", "refused", "refused_status",
+                                   "refused_error")},
+            {"pending": False, "refused": True, "refused_status": 503,
+             "refused_error": "reenroll_disabled"})
+        self.assertIsInstance(block["refused_at"], int)
+        self.assertNotIn("approval_code", block)
+
+    def test_already_registered_is_published_too(self):
+        self._claim_answering(409, b'{"error":"already_registered"}')
+        self.assertEqual(self._block()["refused_error"], "already_registered")
+
+    def test_non_json_body_keeps_the_status_and_no_error_name(self):
+        self._claim_answering(502, b"<html>bad gateway</html>")
+        block = self._block()
+        self.assertEqual((block["refused_status"], block["refused_error"]),
+                         (502, None))
+
+    def test_non_string_error_field_is_not_published(self):
+        self._claim_answering(503, b'{"error":{"nested":1}}')
+        self.assertIsNone(self._block()["refused_error"])
+
+    def test_a_later_parked_claim_replaces_the_refusal(self):
+        self._claim_answering(503, b'{"error":"reenroll_disabled"}')
+        gw._reenroll_state["last_attempt_at"] = None   # cadence elapsed
+
+        def park(req, timeout=0):
+            resp = io.BytesIO(json.dumps({"pending": True,
+                                          "approval_code": "c0de"}).encode())
+            resp.__enter__ = lambda *a: resp
+            resp.__exit__ = lambda *a: False
+            return resp
+        real = gw.urllib.request.urlopen
+        gw.urllib.request.urlopen = park
+        try:
+            gw._reenroll_claim()
+        finally:
+            gw.urllib.request.urlopen = real
+        self.assertNotIn("refused", gw._reenroll_state)
+        self.assertEqual(self._block(),
+                         {"pending": True, "approval_code": "c0de",
+                          "claimed_at": gw._reenroll_state["claimed_at"]})
+
+    def test_episode_end_drops_the_refusal(self):
+        self._claim_answering(503, b'{"error":"reenroll_disabled"}')
+        gw._reenroll_clear()
+        self.assertIsNone(self._block())
+
+    def test_a_new_episode_starts_without_the_old_refusal(self):
+        self._claim_answering(503, b'{"error":"reenroll_disabled"}')
+        saved = {n: getattr(gw, n) for n in
+                 ("TOKEN_FILE", "_reload_rotated_token", "_reenroll_claim")}
+        try:
+            gw.TOKEN_FILE = ""
+            gw.TOKEN = ""   # no bearer: _recover_auth returns before the loop
+            gw._reload_rotated_token = lambda: False
+            gw._reenroll_claim = lambda: None
+            self.assertFalse(gw._recover_auth(401))
+        finally:
+            for n, v in saved.items():
+                setattr(gw, n, v)
+        self.assertNotIn("refused", gw._reenroll_state)
+
+    def test_wait_loop_status_names_the_refusal(self):
+        errors = []
+        saved = {n: getattr(gw, n) for n in
+                 ("TOKEN_FILE", "AUTH_RECHECK_INTERVAL", "REENROLL_PROBE_EVERY",
+                  "_reload_rotated_token", "_heartbeat_singleton", "_auth_probe",
+                  "_reenroll_claim", "_emit_gateway_status")}
+
+        def refuse_once():
+            if not gw._reenroll_state.get("refused"):
+                gw._reenroll_state["refused"] = {"status": 503,
+                                                 "error": "reenroll_disabled",
+                                                 "at": 1}
+        beats = {"n": 0}
+
+        def beat():
+            beats["n"] += 1
+            return True
+        try:
+            gw.TOKEN_FILE = ""
+            gw.AUTH_RECHECK_INTERVAL = 0
+            gw.REENROLL_PROBE_EVERY = 1
+            gw._reload_rotated_token = lambda: False
+            gw._heartbeat_singleton = beat
+            gw._auth_probe = lambda: beats["n"] >= 2
+            gw._reenroll_claim = refuse_once
+            gw._emit_gateway_status = lambda c, **k: errors.append(k.get("error"))
+            self.assertTrue(gw._recover_auth(401))
+        finally:
+            for n, v in saved.items():
+                setattr(gw, n, v)
+        self.assertEqual(errors[0], "auth rejected HTTP 401 — re-link claim "
+                                    "refused (HTTP 503 reenroll_disabled)")
+
+
 if __name__ == "__main__":
     import urllib.request  # noqa: F401 — used via gw.urllib in fixtures
     unittest.main(verbosity=1)

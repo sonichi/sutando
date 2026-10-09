@@ -59,6 +59,8 @@ CODEX_PICKER = "◦ Working (2m • esc to interrupt)\n› 4. gpt-5.5 (current)\
 CODEX_ABNORMAL = "API Error: 500 internal server error\n› \n"
 CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
 FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
+LOGIN = getattr(ps, "CARD_LOGIN", "card_login")
+PANES["logged-out"] = f"❯ /startup\n  ⎿  Login expired · Please run /login\n\n❯ \n{FOOTER}\n"
 
 
 class Done:
@@ -126,7 +128,7 @@ class NoWedgeActsOnTheSession(unittest.TestCase):
     def test_the_policy_never_decides_a_restart(self):
         self.assertFalse(hasattr(ps, "RESTART_WEDGED"), "the restart decision still exists")
         kinds = (ps.PANE_GATE, ps.PANE_LIMIT, ps.PANE_ABNORMAL, ps.PANE_WORKING,
-                 ps.PANE_IDLE, ps.PANE_UNKNOWN, None)
+                 ps.PANE_IDLE, ps.PANE_UNKNOWN, ps.PANE_LOGGED_OUT, None)
         seen = set()
         for pane in kinds:
             st, t = ps.SupervisionState(), 1000.0
@@ -136,12 +138,12 @@ class NoWedgeActsOnTheSession(unittest.TestCase):
                 st, d = ps.evaluate(st, {"w": o}, t)
                 seen.add(d["w"])
                 t += 300.0
-        self.assertEqual(seen - {ps.NOTHING, ps.ESCALATE, CAUSE, FROZEN}, set())
+        self.assertEqual(seen - {ps.NOTHING, ps.ESCALATE, CAUSE, FROZEN, LOGIN}, set())
         self.assertNotIn(ps.RECOVER, seen)
 
     def test_no_wedge_decision_reaches_kill_send_keys_or_spawn(self):
         self.assertIsNotNone(wc, "no wedge card module")
-        for which in (ps.ESCALATE, CAUSE, FROZEN):
+        for which in (ps.ESCALATE, CAUSE, FROZEN, LOGIN):
             for label, pane in PANES.items():
                 ws, t = pool(), Tmux(pane)
                 rem.apply(ws, REPO, {WID: which}, runner=t, spawn=never_spawn)
@@ -221,6 +223,44 @@ class CauseCard(unittest.TestCase):
     def test_a_cleared_seat_closes_its_pending_card(self):
         _, _, req = card(self.ws, CAUSE, PANES["abnormal"])
         self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [req.id])
+
+
+class LoginCard(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(wc, "no wedge card module")
+        self.ws = pool()
+
+    def test_quotes_the_banner_and_tells_the_owner_to_run_login(self):
+        _, t, req = card(self.ws, LOGIN, PANES["logged-out"])
+        self.assertIn("Login expired · Please run /login", req.message)
+        self.assertIn("is logged out", req.message)
+        self.assertIn("Run /login in that session", req.message)
+        self.assertNotIn("owes work", req.message)
+        self.assertIn("needs-login", req.title)
+        self.assertEqual(req.kind, "core-blocked")
+        self.assertEqual([a.id for a in req.actions], ["open_terminal"])
+        self.assertEqual(req.subject["wedge"], LOGIN)
+        self.assertEqual(t.acted(), [])
+
+    def test_a_pane_that_no_longer_shows_the_login_banner_is_cleared(self):
+        for pane in (PANES["abnormal"], f"❯ \n{FOOTER}\n"):
+            out, _, req = card(self.ws, LOGIN, pane)
+            self.assertEqual((out["outcome"], req), ("cleared", None), pane)
+
+    def test_a_cause_card_still_reads_other_banners_with_the_owes_work_lead(self):
+        _, _, req = card(self.ws, CAUSE, PANES["abnormal"])
+        self.assertIn("owes work", req.message)
+
+    def test_a_seat_still_wedged_on_another_kind_retires_the_login_card(self):
+        _, _, req = card(self.ws, LOGIN, PANES["logged-out"])
+        m = manager(self.ws)
+        kept = wc.resolve_cleared(self.ws, set(), manager=m, wedges={WID: LOGIN})
+        self.assertEqual(kept, [], "the pane still shows the expired login")
+        for now_asks in (CAUSE, None):     # abnormal text, or a gate/limit that escalates
+            _, _, again = card(self.ws, LOGIN, PANES["logged-out"])
+            self.assertEqual(wc.resolve_cleared(self.ws, set(), manager=manager(self.ws),
+                                                wedges={WID: now_asks}), [again.id], now_asks)
+        self.assertEqual(manager(self.ws).get(req.id).status, "resolved")
 
 
 class CodexCards(unittest.TestCase):

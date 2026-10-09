@@ -120,6 +120,15 @@ the same supervisor pid; the second handoff took 12 s.
   standby covering the gap after 45 s. Measured on a bundled non-git install (engine `3ab5e26da`,
   2026-09-21) and on the Pro host's core the same day; builds that expose `persistent` are not
   affected: #4524.
+- **An early exit, and `exit code 144`.** A notice that the session watcher exited before
+  its `timeout_ms` is the same instruction as the expiry notice: re-arm first, investigate second;
+  the inbox is unwatched until the supervisor's 45 s grace re-arms the standby. On macOS Claude Code
+  reports a background command that died of SIGTERM as `exit code 144` (128 + 16 reads as SIGURG, but
+  SIGURG's default is discard and the watcher ignores it). Before this fix the 144 was the `Monitor`'s
+  own wrapper shell, killed by the watcher's `kill -TERM 0` in `cleanup()`, so every exit reached the
+  session as "144, no stderr"; `cleanup()` now signals the process group only when the watcher leads
+  it. The watcher also relaunches a dead fswatch (backoff 1-16 s, `SUTANDO_FSWATCH_RESTART_MAX`) and
+  exits 1, saying so, only when fswatch will not stay up.
 - **Watchers started before the tag was required** (`SUTANDO_WATCHER_CMD <inbox>` on hosts whose
   worker boot skill predated the tagged form) keep running and read as `untagged` holders until
   their session restarts; a new untagged start is refused. The rule (owner, 2026-09-22): every start

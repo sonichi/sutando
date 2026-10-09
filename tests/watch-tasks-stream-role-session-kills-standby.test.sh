@@ -6,12 +6,18 @@
 #   (c) exactly one sentinel remains and it names the session watcher;
 #   (d) a session watcher whose fswatch dies before readiness leaves the
 #       standby, its sentinel and the supervisor untouched;
+#   (e0) a session watcher outlives its fswatch: the child is relaunched, the
+#       sentinel stands and no standby arms;
 #   (e) a session watcher that dies after the handoff is replaced: the
-#       supervisor re-arms the pair within grace + poll (the gap is printed);
+#       supervisor logs the death and re-arms the pair within grace + poll
+#       (the gap is printed); (e2) the same for a death with no cleanup
+#       (SIGKILL), whose stale sentinel the standby overwrites;
 #   (f) a readiness probe that never comes back exits the session watcher,
 #       standby untouched;
 #   (g) an inbox named through a symlinked path with no workspace override
-#       is still recognised as ready by the supervisor.
+#       is still recognised as ready by the supervisor;
+#   (z) teardown leaves nothing naming either scratch dir, the setsid'd standby
+#       included: it is in no group but its own, and it relaunches a killed fswatch.
 #
 # Run: bash tests/watch-tasks-stream-role-session-kills-standby.test.sh
 set -u
@@ -53,15 +59,55 @@ printf '#!/bin/bash\nexec sleep 100000\n' > "$IDLEBIN/fswatch"
 chmod +x "$IDLEBIN/fswatch"
 
 sup_pid=""
-cleanup_all() {
-  # The notifier runs in its own process group under the supervisor; end that
-  # group by pid, never by name, so a real notifier on this host is untouched.
-  local c
-  for c in $(pgrep -P "${sup_pid:-0}" 2>/dev/null); do
-    kill -9 -- "-$c" 2>/dev/null || kill -9 "$c" 2>/dev/null || true
+WORK2=""
+# Every kill below is gated on these: an empty pid means `pgrep -P 0`, which on Linux
+# lists init, and an empty pattern matches every process on the host.
+is_rig_supervisor() { case "$(ps -o command= -p "${1:-0}" 2>/dev/null)" in "bash $SUPERVISOR") return 0 ;; esac; return 1; }
+is_tag() { case "$1" in sut-handoff.??????|sut-handoff-link.??????) return 0 ;; esac; return 1; }
+# By pid and group, never by name: the supervisor stopped first so it re-arms nothing,
+# then the notifier's group, tmux, and each watcher a sentinel names, in its own group.
+stop_rig() {  # <supervisor pid> <tmux socket> <state dir> <tag: the work dir's basename>
+  local p g
+  is_tag "$4" || return 0
+  if is_rig_supervisor "$1"; then
+    kill -STOP "$1" 2>/dev/null
+    for p in $(pgrep -P "$1" 2>/dev/null); do
+      kill -9 -- "-$p" 2>/dev/null || kill -9 "$p" 2>/dev/null || true
+    done
+    kill -9 "$1" 2>/dev/null
+  fi
+  tmux -S "$2" kill-server >/dev/null 2>&1 || true
+  for p in $(cat "$3"/*.pid 2>/dev/null); do
+    case "$p" in ''|*[!0-9]*|0|1) continue ;; esac
+    ps -o command= -p "$p" 2>/dev/null | grep -qF "$4" || continue
+    pkill -9 -P "$p" 2>/dev/null
+    g="$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')"
+    if [ "$g" = "$p" ]; then kill -9 -- "-$p" 2>/dev/null; else kill -9 "$p" 2>/dev/null; fi
   done
-  tmux -S "$SOCK" kill-server >/dev/null 2>&1 || true
-  pkill -9 -f "fswatch.*$WORK" >/dev/null 2>&1 || true
+}
+rig_leftovers() {  # <tag>: what still names it after stop_rig, once exits have had 5 s to land
+  local i left
+  is_tag "$1" || { echo "not a scratch-dir tag: '$1'"; return; }
+  for i in $(seq 1 50); do
+    left="$(pgrep -f "$1" 2>/dev/null | grep -vx "$$")"
+    [ -z "$left" ] && return 0
+    sleep 0.1
+  done
+  for i in $left; do ps -o pid=,command= -p "$i" 2>/dev/null; done
+}
+sweep() {  # <tag>: the last resort, anything whose command line names it
+  local p
+  is_tag "$1" || return 0
+  for p in $(pgrep -f "$1" 2>/dev/null); do [ "$p" = "$$" ] || kill -9 "$p" 2>/dev/null; done
+}
+cleanup_all() {
+  if [ -n "$WORK2" ]; then
+    stop_rig "${sup2_pid:-}" "$SOCK2" "$WORK2/real/state" "$(basename "$WORK2")"
+    sweep "$(basename "$WORK2")"
+    rm -rf "$WORK2"
+  fi
+  stop_rig "$sup_pid" "$SOCK" "$WORK/state" "$(basename "$WORK")"
+  sweep "$(basename "$WORK")"
   rm -rf "$WORK"
 }
 trap cleanup_all EXIT
@@ -77,7 +123,14 @@ tmux -S "$SOCK" new-session -d -s target-watcher -c "$REPO" \
      SUTANDO_NOTIFIER_GRACE_PERIOD=$GRACE SUTANDO_NOTIFIER_ROLE_POLL=$POLL SUTANDO_NOTIFIER_TARGET_POLL=$POLL \
      bash $SUPERVISOR > $WORK/sup.log 2>&1"
 
-supervisor_pid() { pgrep -f "bash $SUPERVISOR" | head -1; }
+rig_supervisor_pid() {  # <tmux socket>: the supervisor in that rig's own pane, no other
+  local pane p
+  pane="$(tmux -S "$1" display -p -t target-watcher '#{pane_pid}' 2>/dev/null)"
+  case "$pane" in ''|*[!0-9]*) return ;; esac
+  for p in "$pane" $(pgrep -P "$pane" 2>/dev/null); do
+    is_rig_supervisor "$p" && { echo "$p"; return; }
+  done
+}
 sentinel_pid() { cat "$WORK"/state/*.pid 2>/dev/null | head -1; }
 sentinel_count() { ls "$WORK"/state/*.pid 2>/dev/null | wc -l | tr -d ' '; }
 notifier_pid() { pgrep -f "task-notifier.sh" | while read -r p; do
@@ -104,7 +157,7 @@ start_session_watcher() {  # start_session_watcher <name> [<PATH prefix>] [<read
 }
 
 standby_pid="$(wait_standby)" || { echo "  FAIL: setup -- the supervisor never armed a standby watcher"; fail=1; }
-sup_pid="$(supervisor_pid)"
+sup_pid="$(rig_supervisor_pid "$SOCK")"
 [ -n "$sup_pid" ] || { echo "  FAIL: setup -- no supervisor process"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
@@ -138,10 +191,27 @@ if [ "$fail" -eq 0 ]; then
     fail=1
   fi
 
-  # --- (e): post-takeover death restores coverage -----------------------------
+  # --- (e0): the session watcher outlives its fswatch ----------------------------
   fsw="$(pgrep -P "${ses_pid:-0}" -f fswatch | head -1)"
-  t_kill="$(now_ms)"
   [ -n "$fsw" ] && kill -9 "$fsw" 2>/dev/null
+  new_fsw=""
+  for i in $(seq 1 80); do
+    new_fsw="$(pgrep -P "${ses_pid:-0}" -f fswatch | head -1)"
+    [ -n "$new_fsw" ] && [ "$new_fsw" != "$fsw" ] && break
+    new_fsw=""
+    sleep 0.1
+  done
+  sleep "$GRACE"   # long enough for a supervisor that misread the death to arm
+  if alive "${ses_pid:-0}" && [ -n "$new_fsw" ] && [ "$(sentinel_pid)" = "${ses_pid:-}" ] && [ "$(sentinel_count)" = "1" ]; then
+    echo "  PASS (e0): the session watcher outlived its fswatch ($fsw -> $new_fsw); its sentinel stands and no standby armed"
+  else
+    echo "  FAIL (e0): after fswatch $fsw died: watcher-alive=$(alive "${ses_pid:-0}" && echo yes || echo no) new-fswatch='${new_fsw}' sentinel=$(sentinel_pid) count=$(sentinel_count); stderr: $(tail -2 "$WORK/ses.err" 2>/dev/null)"
+    fail=1
+  fi
+
+  # --- (e): the session watcher's own death restores coverage --------------------
+  t_kill="$(now_ms)"
+  kill -TERM "${ses_pid:-0}" 2>/dev/null
   new_standby=""
   for i in $(seq 1 400); do
     sp="$(sentinel_pid)"
@@ -151,13 +221,19 @@ if [ "$fail" -eq 0 ]; then
   if [ -n "$new_standby" ]; then
     gap=$(( $(now_ms) - t_kill ))
     if [ "$gap" -le $(( (GRACE + 3 * POLL + 5) * 1000 )) ]; then
-      echo "  PASS (e): after the session watcher's fswatch died, the supervisor re-armed a standby ($new_standby) in ${gap} ms (grace ${GRACE}s, poll ${POLL}s)"
+      echo "  PASS (e): after the session watcher was SIGTERMed, the supervisor re-armed a standby ($new_standby) in ${gap} ms (grace ${GRACE}s, poll ${POLL}s)"
     else
       echo "  FAIL (e): re-arm took ${gap} ms, more than grace + polls"
       fail=1
     fi
   else
     echo "  FAIL (e): no standby re-armed after the session watcher died"
+    fail=1
+  fi
+  if grep -q "the session watcher for .* is gone" "$WORK/sup.log" 2>/dev/null; then
+    echo "  PASS (e'): the supervisor logged the death and the clock its re-arm runs on"
+  else
+    echo "  FAIL (e'): no death line in the supervisor's log: $(tail -2 "$WORK/sup.log" 2>/dev/null)"
     fail=1
   fi
   tmux -S "$SOCK" kill-session -t ses >/dev/null 2>&1 || true
@@ -168,8 +244,39 @@ if [ "$fail" -eq 0 ]; then
     fail=1
   fi
 
-  # --- (d): fswatch dies before readiness --------------------------------------
+  # --- (e2): a death with no cleanup leaves a stale sentinel; the standby still comes
   standby_pid="$new_standby"
+  start_session_watcher ses2
+  ses2_pid=""
+  for i in $(seq 1 300); do
+    sp="$(sentinel_pid)"
+    if [ -n "$sp" ] && [ "$sp" != "$standby_pid" ] && alive "$sp" && ! alive "$standby_pid"; then ses2_pid="$sp"; break; fi
+    sleep 0.1
+  done
+  if [ -z "$ses2_pid" ]; then
+    echo "  FAIL (e2): setup -- a second session watcher never took the inbox over from standby $standby_pid"
+    fail=1
+  else
+    t_kill="$(now_ms)"
+    kill -9 "$ses2_pid" 2>/dev/null
+    new_standby=""
+    for i in $(seq 1 400); do
+      sp="$(sentinel_pid)"
+      if [ -n "$sp" ] && [ "$sp" != "$ses2_pid" ] && alive "$sp"; then new_standby="$sp"; break; fi
+      sleep 0.1
+    done
+    gap=$(( $(now_ms) - t_kill ))
+    if [ -n "$new_standby" ] && [ "$gap" -le $(( (GRACE + 3 * POLL + 5) * 1000 )) ] && [ "$(sentinel_count)" = "1" ]; then
+      echo "  PASS (e2): after the session watcher was SIGKILLed (stale sentinel $ses2_pid), a standby ($new_standby) overwrote it in ${gap} ms"
+    else
+      echo "  FAIL (e2): SIGKILLed session watcher $ses2_pid: standby='${new_standby}' after ${gap} ms, sentinel=$(sentinel_pid) count=$(sentinel_count)"
+      fail=1
+    fi
+    tmux -S "$SOCK" kill-session -t ses2 >/dev/null 2>&1 || true
+  fi
+
+  # --- (d): fswatch dies before readiness --------------------------------------
+  standby_pid="${new_standby:-$standby_pid}"
   start_session_watcher ses-die "$DIEBIN"
   gone=""
   for i in $(seq 1 100); do
@@ -223,7 +330,7 @@ for i in $(seq 1 150); do
   [ -n "$sb2" ] && alive "$sb2" && break
   sleep 0.1
 done
-sup2_pid="$(pgrep -f "bash $SUPERVISOR" | while read -r p; do ps -o command= -p "$p" | grep -q . && echo "$p"; done | grep -v "^${sup_pid:-0}$" | head -1)"
+sup2_pid="$(rig_supervisor_pid "$SOCK2")"
 if [ -z "$sb2" ]; then
   echo "  FAIL (g): setup -- the supervisor on the symlinked inbox never armed a standby (sentinel dir $WORK2/real/state)"
   fail=1
@@ -244,10 +351,23 @@ else
     fail=1
   fi
 fi
-for c in $(pgrep -P "${sup2_pid:-0}" 2>/dev/null); do kill -9 -- "-$c" 2>/dev/null || kill -9 "$c" 2>/dev/null || true; done
-tmux -S "$SOCK2" kill-server >/dev/null 2>&1 || true
-pkill -9 -f "fswatch.*$WORK2" >/dev/null 2>&1 || true
-rm -rf "$WORK2"
+
+# --- (z): teardown leaves nothing behind -------------------------------------
+# The symlinked rig first: its fswatch runs from the first rig's stub dir, so names both.
+for rig in "$sup2_pid|$SOCK2|$WORK2/real/state|$WORK2" "$sup_pid|$SOCK|$WORK/state|$WORK"; do
+  IFS='|' read -r r_sup r_sock r_state r_work <<< "$rig"
+  tag="$(basename "$r_work")"
+  stop_rig "$r_sup" "$r_sock" "$r_state" "$tag"
+  left="$(rig_leftovers "$tag")"
+  if [ -z "$left" ]; then
+    echo "  PASS (z): nothing names $tag after its teardown (supervisor ${r_sup:-none}, its notifier's group, tmux, each sentinel's watcher)"
+  else
+    echo "  FAIL (z): still running after the teardown of $tag, swept now: $left"
+    fail=1
+  fi
+  sweep "$tag"
+done
+sup_pid=""; sup2_pid=""
 
 if [ "$fail" -eq 0 ]; then
   echo "PASSED: the hosting-mode handoff keeps the supervisor alive and stands the standby down only on readiness"

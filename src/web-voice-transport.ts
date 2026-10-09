@@ -488,6 +488,10 @@ export const CONNECT_TIMEOUT_MS = 6000;
  *  frame within this window after open ⇒ legacy server, behave exactly as
  *  before the protocol existed. */
 export const AGENT_STATE_LEGACY_MS = 3000;
+/** How long the upstream may sit in connecting/backoff — measured from the first such frame
+ *  since connect() or since the last `live` — before the attempt is failed with an actionable
+ *  card instead of an endless "Reconnecting…". Frames do not restart it; only `live` does. */
+export const UPSTREAM_DEADLINE_MS = 30_000;
 
 /** Bound on the awaited close handshake in `disconnect()` (amendment T8): if
  *  the socket's real `close` event never arrives within this window, the
@@ -557,6 +561,8 @@ export interface VoiceTransportOptions extends VoiceTransportEvents {
   connectTimeoutMs?: number;
   /** Legacy-detection window override (tests). Default AGENT_STATE_LEGACY_MS. */
   agentStateLegacyMs?: number;
+  /** Override UPSTREAM_DEADLINE_MS (tests). */
+  upstreamDeadlineMs?: number;
   /** Bound on disconnect()'s awaited close handshake (tests). Default
    *  DISCONNECT_CLOSE_TIMEOUT_MS. */
   disconnectCloseTimeoutMs?: number;
@@ -595,6 +601,12 @@ export class VoiceTransport {
   private playbackRate: number;
   private connectTimeoutMs: number;
   private agentStateLegacyMs: number;
+  private upstreamDeadlineMs: number;
+  private upstreamTimer: ReturnType<typeof setTimeout> | null = null;
+  /** nowFn() at the first connecting/backoff since connect() or since the last `live`; null while live/idle. */
+  private upstreamDownSince: number | null = null;
+  /** This attempt saw `live` at least once: a later outage is a loss, not an unreachable model. */
+  private upstreamEverLive = false;
   private disconnectCloseTimeoutMs: number;
   private wsFactory: (url: string) => WebSocket;
 
@@ -736,6 +748,7 @@ export class VoiceTransport {
     this.playbackRate = opts.playbackRate ?? 1.0;
     this.connectTimeoutMs = opts.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
     this.agentStateLegacyMs = opts.agentStateLegacyMs ?? AGENT_STATE_LEGACY_MS;
+    this.upstreamDeadlineMs = opts.upstreamDeadlineMs ?? UPSTREAM_DEADLINE_MS;
     this.disconnectCloseTimeoutMs = opts.disconnectCloseTimeoutMs ?? DISCONNECT_CLOSE_TIMEOUT_MS;
     this.wsFactory = opts.wsFactory ?? ((url: string) => new WebSocket(url));
     this.speechRmsFloor = opts.speechRmsFloor ?? SPEECH_RMS_FLOOR;
@@ -796,8 +809,11 @@ export class VoiceTransport {
     this.agentStateSeen = false;
     this.legacyServer = false;
     this.lastUpstream = null;
+    this.upstreamDownSince = null;
+    this.upstreamEverLive = false;
     this.clearConnectTimer();
     this.clearLegacyTimer();
+    this.clearUpstreamTimer();
     if (this.ws) {
       // A Retry on the same transport must not stack a second socket or
       // audio graph on top of a leftover one.
@@ -950,6 +966,7 @@ export class VoiceTransport {
     this.attemptGen++;
     this.clearConnectTimer();
     this.clearLegacyTimer();
+    this.clearUpstreamTimer();
     const emitClosed = this.attemptActive && !this.terminal;
     this.attemptActive = false;
     const ws = this.ws;
@@ -1172,6 +1189,7 @@ export class VoiceTransport {
       this.terminal = true;
       this.attemptActive = false;
       this.clearLegacyTimer();
+    this.clearUpstreamTimer();
       this.teardownAudio();
       // P1: latch the self-inflicted close-handshake completion before any
       // callback emits (see onConnectTimeout).
@@ -1236,6 +1254,7 @@ export class VoiceTransport {
     this.debug('WS closed: code=' + code + ' reason=' + reason);
     this.clearConnectTimer();
     this.clearLegacyTimer();
+    this.clearUpstreamTimer();
     // Attempt concluded ⇒ generation invalidated. Every branch below
     // concludes the attempt, and the gen fence in connect()'s onclose closure
     // guarantees this method only ever runs for the CURRENT attempt — so one
@@ -1321,6 +1340,7 @@ export class VoiceTransport {
 
   private armLegacyTimer(gen: number): void {
     this.clearLegacyTimer();
+    this.clearUpstreamTimer();
     this.legacyTimer = setTimeout(() => {
       this.legacyTimer = null;
       if (gen !== this.attemptGen || this.agentStateSeen) return;
@@ -1339,50 +1359,35 @@ export class VoiceTransport {
     this.agentStateSeen = true;
     this.legacyServer = false;
     this.clearLegacyTimer();
+    // The deadline is NOT cleared here: the agent sends a fresh state on every
+    // redial (backoff 1, 2, 4, 8 s…), and a per-frame clear let the 30 s window
+    // restart each time, so the card fired only once a single gap reached 30 s.
+    // live and idle clear it below; connecting/backoff arm it once.
     const prev = this.lastUpstream;
     this.lastUpstream = frame.upstream;
     this.ev.onAgentState?.(frame);
     if (this.terminal) return; // latched attempt — frames are informational only
     switch (frame.upstream) {
       case 'failed': {
-        // Terminal CLIENT transition (design 1e): the server deliberately
-        // stays reachable, so no close will arrive — the client itself must
-        // invalidate the attempt, stop mic/stats/playback, close the socket,
-        // latch the error, and suppress the self-inflicted onclose. Otherwise
-        // the mic keeps streaming behind the error card and a Retry stacks a
-        // second socket/audio graph.
         const { detail, remediation } = describeAgentFailure(frame.reason, frame.category);
-        this.attemptGen++; // invalidate: no callback of this socket runs again
-        this.terminal = true;
-        this.attemptActive = false;
-        this.clearConnectTimer();
-        this.teardownAudio();
-        const ws = this.ws;
-        // P1: latch the self-initiated close-handshake completion before the
-        // terminal status/failure emit (see onConnectTimeout).
-        this.trackCloseCompletion(ws);
-        this.ws = null;
-        if (ws) {
-          try {
-            ws.close();
-          } catch {
-            /* already closed */
-          }
-        }
-        this.status('error', detail);
-        const failure: VoiceConnectFailure = { kind: 'agent-failed', detail, remediation };
-        if (frame.reason !== undefined) failure.reason = frame.reason;
-        if (frame.category !== undefined) failure.category = frame.category;
-        this.emitFailure(failure);
+        this.failUpstream(detail, remediation, frame.reason, frame.category);
         return;
       }
       case 'connecting':
       case 'backoff':
         // Progress, not an error: idle→connecting→live after connect is the
-        // normal wake-up sequence.
+        // normal wake-up sequence. But an upstream that never answers, or one
+        // that was live and never comes back, must not spin forever behind
+        // "Reconnecting…": the window opens at the first such frame and only a
+        // `live` closes it; the agent's redial frames do not restart it.
+        if (this.upstreamDownSince === null) this.upstreamDownSince = this.nowFn();
         this.status('live', frame.upstream === 'connecting' ? 'Waking up…' : 'Reconnecting to the model…');
+        this.armUpstreamTimer();
         return;
       case 'live':
+        this.upstreamEverLive = true;
+        this.upstreamDownSince = null;
+        this.clearUpstreamTimer();
         if (prev !== null && prev !== 'live') {
           this.status('live', 'Live — speak now');
         }
@@ -1390,8 +1395,88 @@ export class VoiceTransport {
       default:
         // 'idle' — healthy torn-down upstream; our attach wakes it (the
         // connecting frame follows). Nothing to render yet.
+        this.upstreamDownSince = null;
+        this.clearUpstreamTimer();
         return;
     }
+  }
+
+  /**
+   * Terminal CLIENT transition (design 1e): the server deliberately stays
+   * reachable, so no close will arrive — the client itself must invalidate
+   * the attempt, stop mic/stats/playback, close the socket, latch the error,
+   * and suppress the self-inflicted onclose. Otherwise the mic keeps streaming
+   * behind the error card and a Retry stacks a second socket/audio graph.
+   */
+  private failUpstream(
+    detail: string,
+    remediation: string,
+    reason?: string,
+    category?: AgentStateCategory,
+  ): void {
+    this.attemptGen++; // invalidate: no callback of this socket runs again
+    this.terminal = true;
+    this.attemptActive = false;
+    this.clearConnectTimer();
+    this.clearUpstreamTimer();
+    this.teardownAudio();
+    const ws = this.ws;
+    // P1: latch the self-initiated close-handshake completion before the
+    // terminal status/failure emit (see onConnectTimeout).
+    this.trackCloseCompletion(ws);
+    this.ws = null;
+    if (ws) {
+      try {
+        ws.close();
+      } catch {
+        /* already closed */
+      }
+    }
+    this.status('error', detail);
+    const failure: VoiceConnectFailure = { kind: 'agent-failed', detail, remediation };
+    if (reason !== undefined) failure.reason = reason;
+    if (category !== undefined) failure.category = category;
+    this.emitFailure(failure);
+  }
+
+  /** One deadline per outage: armed once the window is open, for what remains of it; cleared by live. */
+  private armUpstreamTimer(): void {
+    if (this.upstreamTimer || this.terminal || this.upstreamDownSince === null) return;
+    const gen = this.attemptGen;
+    const remaining = Math.max(0, this.upstreamDownSince + this.upstreamDeadlineMs - this.nowFn());
+    this.upstreamTimer = setTimeout(() => this.onUpstreamDeadline(gen), remaining);
+  }
+
+  private clearUpstreamTimer(): void {
+    if (this.upstreamTimer) {
+      clearTimeout(this.upstreamTimer);
+      this.upstreamTimer = null;
+    }
+  }
+
+  private onUpstreamDeadline(gen: number): void {
+    this.upstreamTimer = null;
+    if (gen !== this.attemptGen || this.terminal) return;
+    if (this.lastUpstream === 'live' || this.upstreamDownSince === null) return;
+    const secs = Math.round(this.upstreamDeadlineMs / 1000);
+    if (this.upstreamEverLive || this.bytesRecv > 0) {
+      // The model answered on this attempt, so the key and the model are fine: the link was lost.
+      this.debug('Upstream lost: still ' + this.lastUpstream + ' ' + this.upstreamDeadlineMs + 'ms after the last live', 'err');
+      this.failUpstream(
+        'Voice agent lost the model mid-call and could not reconnect for ' + secs + ' s.',
+        'Check your network connection, then retry.',
+        'upstream-lost',
+        'network',
+      );
+      return;
+    }
+    this.debug('Upstream still ' + this.lastUpstream + ' after ' + this.upstreamDeadlineMs + 'ms with nothing received', 'err');
+    this.failUpstream(
+      'Voice agent could not reach the model: it kept reconnecting for ' + secs + ' s without an answer.',
+      'Check the Gemini key in Agent settings → Agent → Gemini API and the voice log in voice setup, then retry.',
+      'upstream-unreachable',
+      'network',
+    );
   }
 
   // ─── mic capture ────────────────────────────────────────────
