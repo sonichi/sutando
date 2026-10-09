@@ -570,13 +570,12 @@ class AStartedAttemptThatNeverClassifiesTaintsTheCycle(unittest.TestCase):
                 broker, real = self._raising_after_store(exc)
                 backend, core = self._core(broker)
                 self.assertTrue(backend.publish(ITEM, FIRST))
-                try:
-                    res = core.deliver_one(ITEM, FIRST)
-                except Exception:                # noqa: BLE001 - the pre-fix shape
-                    backend.force_release(ITEM)  # the owner's claim outlives the raise
-                else:
-                    self.assertIs(res.outcome, DeliveryOutcome.NOT_DELIVERED,
-                                  "an unclassified post-send failure is folded like a lost response")
+                # Strict: the provider's catch-all turns a torn reply into an
+                # indeterminate outcome; a raise here would strand the claim.
+                res = core.deliver_one(ITEM, FIRST)
+                self.assertIs(res.outcome, DeliveryOutcome.NOT_DELIVERED,
+                              "an unclassified post-send failure is folded like a lost response")
+                self.assertEqual(_status(backend), "READY", "the item retries instead of stranding")
                 broker.torn = False
                 self._then_refused_and_b_is_not_admitted(broker, backend, core, 1)
 
@@ -807,6 +806,172 @@ assert backend.publish(item, body)
 core.deliver_one(item, body)
 core.deliver_one(item, body)
 """
+
+
+_LEGACY_LOST_RESPONSE = r"""
+import sys, pathlib
+sys.path.insert(0, sys.argv[1])
+from ag2_sparrow.delivery_core import (DesignAClaimBackend, DeliveryCore, RetryPolicy,
+                                       ProviderCapabilities, ProviderIndeterminate)
+root, item, body = pathlib.Path(sys.argv[2]), sys.argv[3], sys.argv[4].encode()
+class Lost:
+    capabilities = ProviderCapabilities(idempotent_send=True)
+    def deliver(self, item_id, payload, key):
+        raise ProviderIndeterminate("response lost after the broker stored A")
+    def reconcile(self, attempt):
+        return None
+backend = DesignAClaimBackend(root)
+core = DeliveryCore(backend, Lost(), policy=RetryPolicy(max_attempts=3, defer_idempotent_resend=True),
+                    worker="gateway-result-drain")
+assert backend.publish(item, body)
+core.deliver_one(item, body)
+"""
+
+
+def _base_archive(tmp: Path):
+    """The merge base's package, or None when it is not reachable."""
+    base = tmp / "base"
+    base.mkdir()
+    archive = subprocess.run(["git", "-C", str(_REPO), "archive", "--format=tar", "d37b79474",
+                              "packages/ag2-sparrow/ag2_sparrow"], capture_output=True)
+    if archive.returncode != 0:
+        return None
+    subprocess.run(["tar", "-x", "-C", str(base)], input=archive.stdout, check=True)
+    return base / "packages" / "ag2-sparrow"
+
+
+class UntrackedAttemptsStayUnproven(unittest.TestCase):
+    """An attempt made before attempts were counted can never be proven
+    classified. The counters a later retry adds would otherwise read as
+    complete evidence (started 1 == classified 1) and admit a fresh cycle for
+    an id whose first body the broker may hold: the record must carry a sticky
+    mark from the moment it is touched again, and an operator requeue must set
+    it before --reset-attempts zeroes the only trace of that attempt."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _drive_to_definite_park_then_publish_b(self, backend):
+        core = DeliveryCore(backend, _Provider(refusals=CAP), policy=RetryPolicy(max_attempts=CAP),
+                            worker="w1")
+        while _status(backend) != "PARKED":
+            self.assertIs(core.deliver_one(ITEM, FIRST).status, DrainStatus.ATTEMPTED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual(rec.get("reason"), "permanent-refusal")
+        self.assertEqual((rec.get("attempts_started"), rec.get("attempts_classified")), (1, 1),
+                         "this code's own attempt is fully classified; it is not the problem")
+        self.assertFalse(backend.publish(ITEM, SECOND),
+                         "the untracked attempt may have landed A: B gets no cycle")
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("last_refusal"),
+                         "attempt-evidence-missing")
+        self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.TERMINAL,
+                      "the gateway quarantines B instead of sending it")
+
+    def test_begin_attempt_marks_a_record_with_attempts_but_no_counters(self):
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        outbox._write_item(backend.root, ITEM, {
+            "item_id": ITEM, "payload": FIRST.decode(), "status": "READY",
+            "attempts": 1, "published_at": 1.0})
+        self._drive_to_definite_park_then_publish_b(backend)
+        self.assertTrue(outbox._read_item(backend.root, ITEM).get("attempt_evidence_missing"))
+
+    def test_a_retry_record_alone_is_dispatch_evidence(self):
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        outbox._write_item(backend.root, ITEM, {
+            "item_id": ITEM, "payload": FIRST.decode(), "status": "READY",
+            "attempts": 0, "retry": {"failures": 1, "next_attempt_at": 0.0},
+            "published_at": 1.0})
+        self._drive_to_definite_park_then_publish_b(backend)
+
+    def test_an_untried_legacy_record_is_not_marked(self):
+        """Published before tracking but never attempted: nothing may have
+        landed, so the cycle this code drives carries its own proof."""
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        outbox._write_item(backend.root, ITEM, {
+            "item_id": ITEM, "payload": FIRST.decode(), "status": "READY",
+            "attempts": 0, "published_at": 1.0})
+        core = DeliveryCore(backend, _Provider(refusals=1), policy=RetryPolicy(max_attempts=CAP),
+                            worker="w1")
+        self.assertIs(core.deliver_one(ITEM, FIRST).status, DrainStatus.ATTEMPTED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual(rec.get("status"), "PARKED")
+        self.assertFalse(rec.get("attempt_evidence_missing"))
+        self.assertTrue(backend.publish(ITEM, SECOND))
+
+    def test_a_ready_record_the_merge_base_left_refuses_a_fresh_cycle(self):
+        """The reviewer's repro: the merge base's own code makes one attempt
+        whose response is lost (the broker stored A) and leaves the item READY;
+        HEAD opens the unchanged outbox and refuses A definitely until it parks."""
+        pkg = _base_archive(self.tmp)
+        if pkg is None:
+            self.skipTest("the merge base is not reachable from this checkout")
+        proc = subprocess.run([sys.executable, "-c", _LEGACY_LOST_RESPONSE, str(pkg),
+                               str(self.tmp / ".outbox"), ITEM, FIRST.decode()],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-600:])
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual((rec.get("status"), rec.get("attempts")), ("READY", 1))
+        self.assertNotIn("attempts_started", rec, "the base tracked no attempts")
+        self._drive_to_definite_park_then_publish_b(backend)
+
+    def test_a_legacy_park_taken_through_requeue_still_refuses(self):
+        """The documented recovery path: a legacy PARKED record (an ambiguous
+        cycle with no head-only fields) is requeued with --reset-attempts, then
+        definitely refused; the one retry's counters must not launder it."""
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        outbox._write_item(backend.root, ITEM, {
+            "item_id": ITEM, "payload": FIRST.decode(), "payload_digest": None,
+            "status": "PARKED", "reason": "retry-window-exhausted", "attempts": 5,
+            "published_at": 1.0})
+        self.assertFalse(backend.publish(ITEM, SECOND), "refused before the requeue")
+        self.assertIs(outbox.requeue_item(backend.root, ITEM, reset_attempts=True, operator="op"),
+                      outbox.RequeueOutcome.REQUEUED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual(rec.get("attempts"), 0, "--reset-attempts zeroed the count")
+        self.assertTrue(rec.get("attempt_evidence_missing"),
+                        "the requeue marked the untracked attempt before zeroing it")
+        self.assertIsNone(rec.get("last_refusal"), "the requeue clears the parked cycle's cause")
+        self._drive_to_definite_park_then_publish_b(backend)
+
+    def test_a_new_cycle_rebuilds_the_record_without_the_mark(self):
+        """Once a definitely parked, fully tracked cycle admits a fresh body, the
+        fresh record carries neither mark; the delivered id keeps its history."""
+        prov = _Provider(refusals=1)
+        backend, core = _parked(self.tmp, prov)
+        self.assertTrue(backend.publish(ITEM, SECOND))
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertNotIn("attempt_evidence_missing", rec)
+        self.assertNotIn("cycle_ambiguous", rec)
+
+
+class TheDeliveredArmNamesItsOwnCause(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_a_stale_parked_cause_never_outlives_a_delivery(self):
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        outbox._write_item(backend.root, ITEM, {
+            "item_id": ITEM, "payload": FIRST.decode(), "payload_digest": None,
+            "status": "PARKED", "reason": "permanent-refusal", "attempts": 2,
+            "published_at": 1.0})
+        self.assertFalse(backend.publish(ITEM, SECOND))
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("last_refusal"),
+                         "attempt-evidence-missing")
+        self.assertIs(outbox.requeue_item(backend.root, ITEM, operator="op"),
+                      outbox.RequeueOutcome.REQUEUED)
+        self.assertIsNone(outbox._read_item(backend.root, ITEM).get("last_refusal"))
+        core = DeliveryCore(backend, _Provider(refusals=0), policy=RetryPolicy(max_attempts=CAP),
+                            worker="w1")
+        self.assertIs(core.deliver_one(ITEM, FIRST).outcome, DeliveryOutcome.CONFIRMED)
+        self.assertEqual(_status(backend), "DELIVERED")
+        self.assertFalse(backend.publish(ITEM, FIRST), "the parked body stays refused")
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("last_refusal"),
+                         "parked-body-already-refused", "the delivered arm names its own cause")
+        before = outbox._read_item(backend.root, ITEM)
+        self.assertFalse(backend.publish(ITEM, SECOND, republish_delivered=False))
+        self.assertEqual(outbox._read_item(backend.root, ITEM), before,
+                         "a caller's own no-republish policy leaves the delivered record untouched")
 
 
 class RecordsWithoutAttemptEvidenceFailClosed(unittest.TestCase):

@@ -9782,7 +9782,7 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
                 "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
     parked: list[tuple[str, str]] = []  # (root.name, item_id) -- roots differ, see below
     unreadable: list[str] = []
-    saturated = ambiguous = 0   # ids closed to every new body; cycles a body may have landed in
+    saturated = ambiguous = unproven = 0   # closed ids; cycles a body may have landed in; no attempt evidence
     for root in roots:
         # An unreadable ROOT reaches here too, and a raise would abort every
         # later check, so nothing but ENOENT may pass as an empty outbox.
@@ -9800,6 +9800,9 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
                 saturated += 1
             if d.get("cycle_ambiguous") or d.get("dispatch_pending"):
                 ambiguous += 1
+            elif d.get("attempt_evidence_missing") or \
+                    d.get("last_refusal") == "attempt-evidence-missing":
+                unproven += 1
     if unreadable:
         return {"name": name, "status": "warn",
                 "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
@@ -9812,7 +9815,9 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
         closed = ((f"; {saturated} saturated (parked history full, every new body refused)"
                    if saturated else "")
                   + (f"; {ambiguous} ambiguous-cycle (a parked body may have landed, "
-                     f"every new body refused)" if ambiguous else ""))
+                     f"every new body refused)" if ambiguous else "")
+                  + (f"; {unproven} without attempt evidence (written before attempts "
+                     f"were tracked, every new body refused)" if unproven else ""))
         return {"name": name, "status": "warn",
                 "detail": f"{len(parked)} reply/replies PARKED and never delivered — "
                           f"nothing retries them: {shown}{more}{closed}. Recover with "

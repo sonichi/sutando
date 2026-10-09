@@ -98,11 +98,14 @@ class OutboxParkedProbe(unittest.TestCase):
         self._write("task-amb", "PARKED", cycle_ambiguous=True)
         self._write("task-pend", "PARKED", dispatch_pending=True)
         self._write("task-plain", "PARKED")
+        self._write("task-legacy", "PARKED", attempt_evidence_missing=True)
+        self._write("task-refused", "PARKED", last_refusal="attempt-evidence-missing")
         r = self.hc.check_outbox_parked(self.ws)
         self.assertEqual(r["status"], "warn")
-        self.assertIn("4 reply/replies", r["detail"])
+        self.assertIn("6 reply/replies", r["detail"])
         self.assertIn("1 saturated", r["detail"])
         self.assertIn("2 ambiguous-cycle", r["detail"])
+        self.assertIn("2 without attempt evidence", r["detail"])
 
     def test_a_delivered_item_is_not_counted(self):
         self._write("task-abc", "PARKED")

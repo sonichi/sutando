@@ -205,6 +205,15 @@ class ClaimBackend(Protocol):
         classified, so a record written before attempts were tracked (an
         upgrade in place) or a torn record refuses exactly like an ambiguous
         one — fail closed, visible to the operator, never a silent substitution.
+        That evidence is sticky: an attempt made before tracking began marks
+        the record (`attempt_evidence_missing`) the moment it is touched again
+        — a new attempt or an operator requeue, before `--reset-attempts` can
+        zero the only trace of it — so the counters a later retry adds never
+        launder it; only a new cycle (a fresh record) clears the mark. Each
+        refusal of a parked id records its cause (`last_refusal`); a delivered
+        id records one only when its history refuses the body (a caller's own
+        no-republish policy or a live claim leaves the record untouched), and a
+        requeue clears the parked cycle's cause.
         A backend without the capability treats every park as final for every
         payload. A republish of a DELIVERED id starts a new cycle: the parked
         history carries over, the delivered cycle's ambiguity does not. The

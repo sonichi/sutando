@@ -95,7 +95,11 @@ class DesignAClaimBackend:
         mid-send) counts as ambiguous. Certainty is never inferred: the record
         must itself prove that every attempt it started was classified
         (`attempts_started` == `attempts_classified`), so a record written
-        before attempts were tracked, or torn, refuses like an ambiguous one.
+        before attempts were tracked, or torn, refuses like an ambiguous one;
+        an attempt made before tracking began leaves a sticky
+        `attempt_evidence_missing` mark the moment the record is touched again
+        (begin_attempt, requeue), so the counters a later retry adds can never
+        launder it. Only a new cycle (fresh record) clears either mark.
         A republish of a DELIVERED id starts a new cycle: the delivered cycle's
         taint does not carry over, its parked history does. Each refusal
         records its cause as `last_refusal`."""
@@ -128,9 +132,10 @@ class DesignAClaimBackend:
                         return refuse("parked-cycle-ambiguous")
                     if prior.get("dispatch_pending"):
                         return refuse("attempt-unclassified")
-                    # Missing evidence is not evidence of safety: a record from
-                    # before attempts were tracked may hold a landed body too.
-                    if not self._every_started_attempt_classified(prior):
+                    # Missing evidence is not evidence of safety; the sticky mark
+                    # outlives the counters a later retry adds.
+                    if prior.get("attempt_evidence_missing") or \
+                            not self._every_started_attempt_classified(prior):
                         return refuse("attempt-evidence-missing")
                     rec = outbox.read_delivery_claim(self.root, item_id)
                     if rec is not None:
@@ -149,14 +154,22 @@ class DesignAClaimBackend:
                         },
                     }
                 else:
-                    if not allow_republish or status != "DELIVERED":
+                    if status != "DELIVERED":
+                        return False
+                    # A caller's own policy or a live claim is not a cause the
+                    # operator needs; a delivered record stays untouched for those.
+                    if not allow_republish:
                         return False
                     if outbox.read_delivery_claim(self.root, item_id) is not None:
                         return False
+                    # Named here so a quarantine line never carries the park's stale cause.
+                    refuse = lambda why: self._refuse(prior, self.root, item_id, why)  # noqa: E731
                     history = [d for d in prior.get("parked_digests") or []
                                if isinstance(d, str)]
-                    if digest in history or prior.get("saturated"):
-                        return False
+                    if prior.get("saturated"):
+                        return refuse("parked-history-saturated")
+                    if digest in history:
+                        return refuse("parked-body-already-refused")
                     # A delivery in between does not forgive a parked body.
                     record = {
                         "resend_epoch": int(prior.get("resend_epoch", 0) or 0),
@@ -237,6 +250,7 @@ class DesignAClaimBackend:
             item = outbox._read_item(self.root, item_id)
             if item.get("dispatch_pending"):
                 item["cycle_ambiguous"] = True
+            outbox.mark_untracked_attempts(item)
             item["dispatch_pending"] = True
             item["attempts_started"] = int(item.get("attempts_started", 0) or 0) + 1
             outbox._write_item(self.root, item_id, item)

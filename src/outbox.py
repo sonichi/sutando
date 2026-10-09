@@ -947,6 +947,19 @@ def fold_parked_digest(d: dict, digest: str, limit: int = PARKED_HISTORY_LIMIT) 
     return True
 
 
+def mark_untracked_attempts(d: dict) -> bool:
+    """Sticky evidence that an attempt was made before attempts were counted
+    (`attempts` > 0, or a retry record, with no `attempts_started`): the record
+    can never prove that attempt was classified, so a fresh cycle stays refused
+    until a new cycle rebuilds the record. True when the mark was set."""
+    if isinstance(d.get("attempts_started"), int) or d.get("attempt_evidence_missing"):
+        return False
+    tried = int(d.get("attempts", 0) or 0) > 0 or isinstance(d.get("retry"), dict)
+    if tried:
+        d["attempt_evidence_missing"] = True
+    return tried
+
+
 class RequeueOutcome(str, Enum):
     """Only REQUEUED means this call moved the item; the other two touched
     nothing, which is what makes a repeated requeue safe to script."""
@@ -984,6 +997,10 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
         if d.get("status") != "PARKED":
             return RequeueOutcome.NOT_PARKED
         _release_locked(root, item_id, force=True)
+        # Marked before --reset-attempts can zero the only evidence of an
+        # untracked attempt; the cause of the park no longer describes the item.
+        mark_untracked_attempts(d)
+        d.pop("last_refusal", None)
         # The parked body stays in the id's history: this one explicit retry
         # is allowed, an automatic republish of the same body later is not.
         own = d.get("payload_digest")

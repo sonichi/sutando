@@ -102,6 +102,36 @@ class RequeueTransition(unittest.TestCase):
                           outbox.RequeueOutcome.ABSENT)
 
 
+class RequeueKeepsUntrackedAttemptsUnproven(unittest.TestCase):
+    """A legacy park carries attempts but no counters: the requeue must mark
+    that before --reset-attempts zeroes the only trace, and must drop the parked
+    cycle's refusal cause so a later quarantine line never names a stale one."""
+
+    def test_a_park_with_attempts_but_no_counters_is_marked_before_the_reset(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            _parked(root, attempts=5)
+            d = outbox._read_item(root, ITEM)
+            d["last_refusal"] = "attempt-evidence-missing"
+            outbox._write_item(root, ITEM, d)
+            self.assertIs(outbox.requeue_item(root, ITEM, reset_attempts=True),
+                          outbox.RequeueOutcome.REQUEUED)
+            d = outbox._read_item(root, ITEM)
+            self.assertEqual(d.get("attempts"), 0)
+            self.assertTrue(d.get("attempt_evidence_missing"))
+            self.assertNotIn("last_refusal", d)
+
+    def test_a_tracked_park_is_not_marked(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            _parked(root, attempts=2)
+            d = outbox._read_item(root, ITEM)
+            d["attempts_started"] = d["attempts_classified"] = 2
+            outbox._write_item(root, ITEM, d)
+            self.assertIs(outbox.requeue_item(root, ITEM), outbox.RequeueOutcome.REQUEUED)
+            self.assertNotIn("attempt_evidence_missing", outbox._read_item(root, ITEM))
+
+
 class ClaimSafety(unittest.TestCase):
     def test_a_live_claim_on_an_unparked_item_survives(self):
         """The no-concurrent-delivery guarantee. An item holding a live claim is
