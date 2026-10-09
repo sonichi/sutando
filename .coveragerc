@@ -36,6 +36,7 @@ omit =
     packages/ag2-sparrow/ag2_sparrow/local_task_protocol.py
     packages/ag2-sparrow/ag2_sparrow/result_markers.py
     packages/ag2-sparrow/ag2_sparrow/result_ready.py
+    packages/ag2-sparrow/ag2_sparrow/result_disposal.py
     packages/ag2-sparrow/ag2_sparrow/dedup_recovery.py
     packages/ag2-sparrow/ag2_sparrow/file_lock.py
     packages/ag2-sparrow/ag2_sparrow/workspace_lock.py
