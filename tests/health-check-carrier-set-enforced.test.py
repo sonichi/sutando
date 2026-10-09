@@ -1024,6 +1024,11 @@ class CarrierSetProbe(unittest.TestCase):
             hc._stale_with_culprits(["notes/"], {"notes/": ws / "notes"}, ws), "notes/")
         # A missing culprit degrades to the entry rather than raising.
         self.assertEqual(hc._stale_with_culprits(["build_log.md"], {}, ws), "build_log.md")
+        # A culprit outside the workspace cannot be made relative — show it whole
+        # rather than raising inside a health probe.
+        outside = Path("/definitely/not/under") / "tmp" / "stray.md"
+        self.assertEqual(hc._stale_with_culprits(["hosts/*/"], {"hosts/*/": outside}, ws),
+                         f"hosts/*/ -> {outside}")
         # The message must USE it: testing the helper alone left a revert to
         # entry-only green.
         src = SRC.read_text()
