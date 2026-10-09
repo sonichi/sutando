@@ -1184,6 +1184,16 @@ def read_baseline(cloud: Cloud) -> dict[str, set[str]]:
         raise Setup("cloud_error", f"Could not read the current connections to switch from: {exc}") from None
 
 
+def station_account_changed(ws: Path, cloud: Cloud, cloud_user_id: str | None) -> dict | None:
+    """The account_changed payload when the agent's credential is not the account the desktop stamped
+    for the running core's station: a card then would ask the owner to connect what is already there."""
+    # An unknown agent id or no stamp keeps today's card: nothing to compare, and the wait records it.
+    if account_mismatch(ws, cloud_user_id, lambda: cloud_user_id) != "account_changed":
+        return None
+    return {"wait_id": None, "reason": "account_changed", "cloud_user_id": cloud_user_id,
+            "stamp_cloud_user_id": (read_station_stamp(ws) or {}).get("cloud_user_id"), "base": cloud.base}
+
+
 def cmd_await(
     ws: Path,
     cloud: Cloud,
@@ -1201,6 +1211,10 @@ def cmd_await(
     if not cloud.signed_in():
         raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
     cloud_user_id = account_for_wait(cloud, sleep)
+    changed = station_account_changed(ws, cloud, cloud_user_id)
+    if changed:
+        emit(changed)
+        return EXIT_NO
     payload = arm_wait(ws, a, cloud_user_id, toolkits=lambda slugs: resolve_toolkits(cloud, slugs),
                        baseline=lambda: read_baseline(cloud), spawn=spawn, now=now)
     emit(payload)
@@ -1384,6 +1398,10 @@ def cmd_card(
     if not cloud.signed_in():
         raise Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
     cloud_user_id = account_for_wait(cloud, sleep)
+    changed = station_account_changed(ws, cloud, cloud_user_id)
+    if changed:
+        emit({**changed, "all_connected": False, "apps": apps, "mode": mode, "message": None})
+        return EXIT_NO
     intro = a["lines"][0] if a["lines"] else card_intro(names, switch)
     if a["private"]:
         a["lines"] = a["lines"] or [intro, "Once that's done I'll carry on."]

@@ -1469,6 +1469,63 @@ class TestCard(Base):
         self.assertEqual((connectors.list_markers(self.ws), self.spawned), ([], []))
 
 
+class TestCardStationAccount(Base):
+    """No card, from `card` or `await`, when the agent's account is not the one the station was stamped for."""
+
+    def stamp(self, user):
+        (self.ws / "state").mkdir(exist_ok=True)
+        stamp = {"version": 1, "has_station_entry": True, "cloud_user_id": user, "spawned_at": "2026-09-15T00:00:00Z"}
+        (self.ws / "state" / "station-core-stamp.json").write_text(json.dumps(stamp))
+
+    def assert_no_card(self):
+        self.assertEqual((connectors.list_markers(self.ws), connectors.read_cards(self.ws), self.spawned), ([], [], []))
+
+    def test_card_on_another_account_posts_no_card_and_names_both(self):
+        self.stamp("u-desktop")
+        for private in (False, True):
+            with self.subTest(private=private):
+                room = SHARED if private else ROOM
+                code, out = run(self.ws, card_argv("googlecalendar", room=room, private=private),
+                                FakeCloud(self.ws, user="u-agent"), self.spawn)
+                self.assertEqual((code, out["reason"], out["cloud_user_id"], out["stamp_cloud_user_id"]),
+                                 (connectors.EXIT_NO, "account_changed", "u-agent", "u-desktop"))
+                self.assertEqual((out["wait_id"], out["message"], out["base"]), (None, None, "https://sutando.ag2.space"))
+                self.assert_no_card()
+
+    def test_await_on_another_account_posts_no_card_and_names_both(self):
+        self.stamp("u-desktop")
+        for argv in (await_argv("linear"), private_argv("linear")):
+            with self.subTest(private="--private" in argv):
+                code, out = run(self.ws, argv, FakeCloud(self.ws, user="u-agent"), self.spawn)
+                self.assertEqual((code, out["reason"], out["cloud_user_id"], out["stamp_cloud_user_id"], out["wait_id"]),
+                                 (connectors.EXIT_NO, "account_changed", "u-agent", "u-desktop", None))
+                self.assert_no_card()
+
+    def test_the_stamped_account_still_gets_its_card(self):
+        self.stamp("u-owner")
+        code, out = run(self.ws, card_argv("googlecalendar"), FakeCloud(self.ws), self.spawn)
+        self.assertEqual((code, out["message"]["operation_id"]), (connectors.EXIT_OK, "task-abc:connect-card"))
+        self.assertEqual(self.spawned, [out["wait_id"]])
+
+    def test_no_stamp_or_an_unknown_account_keeps_the_card(self):
+        for name, stamped, user in (("no stamp", None, "u-agent"), ("stamp without account", "", "u-agent"),
+                                    ("unknown agent account", "u-desktop", "")):
+            with self.subTest(name):
+                stamp_file = self.ws / "state" / "station-core-stamp.json"
+                if stamped is None:
+                    stamp_file.unlink(missing_ok=True)
+                else:
+                    self.stamp(stamped)
+                task = f"task-{len(self.spawned)}"
+                self.origin(task)
+                with mock.patch.object(connectors, "ACCOUNT_RETRY_S", ()):
+                    code, out = run(self.ws, card_argv("googlecalendar", task=task, reply=f"$e{task}"),
+                                    FakeCloud(self.ws, user=user), self.spawn)
+                self.assertEqual(code, connectors.EXIT_OK)
+                self.assertIsNotNone(out["message"])
+                self.assertNotIn("reason", out)
+
+
 class TestCardSwitch(Base):
     def test_switch_payload_and_a_fresh_baseline(self):
         cloud = FakeCloud(self.ws, connections=linear_rows(OLD_ID))

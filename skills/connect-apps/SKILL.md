@@ -90,6 +90,12 @@ yours, not the owner's: plain sentences, no quotes from their message.
 | 1 | a negative answer: no exact match, an app not connected, nothing claimed, `account_changed`, `account_unknown`, `no_such_wait` |
 | 2 | a setup problem to relay, never retry: `not_signed_in`, `connectors_disabled`, `unknown_app`, `coming_soon`, `too_many_apps`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
 
+`card` and `await` exit 1 with `"reason": "account_changed"` (plus `cloud_user_id`,
+`stamp_cloud_user_id`, `base`) when this agent's AG2 Cloud credential is not the account the desktop
+started the core's station for: no wait and no card are made. Post no card; tell the owner in one
+line that the agent is signed in to a different AG2 Cloud account than the desktop app (both ids),
+so Settings → Integrations may already show the app connected.
+
 `card` prints everything `await` prints plus `mode` (`dm` or `private`), `apps` (each with
 `connected`), `all_connected`, and for `mode: dm` a `message` object (`body`, `extra_content`,
 `reply_to`, `operation_id`) to pass verbatim to `room.action.execute` / `room.message.send`. It is
