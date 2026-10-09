@@ -16,7 +16,8 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
-import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
+import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, dedupTarget, type TaskOrigin } from './skip_marker_ownership.js';
+import { createVoiceTaskStore, shouldReplayDeduped } from './voice-task-manager.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 import {
 	emitTaskProcessed,
@@ -481,6 +482,23 @@ function _hasResult(taskId: string): boolean {
 	return [now, last].some((d) => existsSync(join(RESULT_DIR, 'archive', d.toISOString().slice(0, 7), `${taskId}.txt`)));
 }
 
+/** How each voice task's result reached the user; survives a voice-agent restart. */
+export const voiceTaskStore = createVoiceTaskStore(join(REPO_DIR, 'state', 'voice-tasks.json'));
+
+/** The task's result text, live or archived (this month or last); null when there is none. */
+function _readResultText(taskId: string): string | null {
+	const now = new Date();
+	const last = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+	const paths = [join(RESULT_DIR, `${taskId}.txt`), ...[now, last].map((d) => join(RESULT_DIR, 'archive', d.toISOString().slice(0, 7), `${taskId}.txt`))];
+	for (const p of paths) {
+		try { if (existsSync(p)) return readFileSync(p, 'utf-8').trim(); } catch { /* next */ }
+	}
+	return null;
+}
+
+/** Said with a result the user asked for again but never heard the first time. */
+export const REPEATED_REQUEST_NOTE = 'The user asked for this again because they never heard this result the first time. Tell them now.';
+
 /** Where the task stands now. "started" means the core has read it (a processing row) or is engaged. */
 export function voiceTaskState(taskId: string): VoiceTaskState {
 	if (_cancelledVoiceTasks.has(taskId)) return 'cancelled';
@@ -705,6 +723,7 @@ export function _forwardOfflineThenArchive(
 	_deliveredResults.add(file);
 	_pendingTasks.delete(taskId);
 	return forward(taskId, result, undefined, dmOnly).then(() => {
+		voiceTaskStore.set(taskId, 'dm');
 		setTimeout(() => {
 			archiveFile(join(RESULT_DIR, file), 'results', taskId);
 			const taskFile = join(TASK_DIR, `${taskId}.txt`);
@@ -1469,7 +1488,7 @@ export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Da
 
 /** The drain's listener: the result text, plus an optional delivery note injected under it
  *  when the written copy went somewhere other than the session was told to expect. */
-export type ResultListener = (result: string, deliveryNote?: string) => void;
+export type ResultListener = (result: string, deliveryNote?: string, meta?: { taskId?: string }) => void;
 
 export function startResultWatcher(onResult: ResultListener, isClientConnected: () => boolean): void {
 	if (_delegation.mode === 'relay') {
@@ -1571,6 +1590,17 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 						continue;   // another consumer's: leave the files for its owner
 					}
 					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker; archiving silently`);
+					const heldBy = dedupTarget(result);
+					const heldRecord = heldBy ? voiceTaskStore.get(heldBy) : undefined;
+					// No record yet but already on its way (live file, or handed over this run): not lost.
+					const onItsWay = !heldRecord && !!heldBy && (_deliveredResults.has(`${heldBy}.txt`) || existsSync(join(RESULT_DIR, `${heldBy}.txt`)));
+					if (heldBy && owns(taskId) && _isVoiceTask(heldBy) && shouldReplayDeduped(heldRecord) && !onItsWay) {
+						const earlier = _readResultText(heldBy);
+						if (earlier && !bodyIsSkipMarked(earlier)) {
+							console.log(`${ts()} [TaskBridge] ${taskId} repeats ${heldBy}, whose result was never spoken; speaking it now`);
+							onResult(earlier, REPEATED_REQUEST_NOTE, { taskId: heldBy });
+						}
+					}
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
@@ -1701,10 +1731,11 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					// owner's DM when the core marked it `[dm-only]` — and voice is told which.
 					const taskOrigin = registersTask && !foreignOrigin ? voiceTaskOrigin(taskId) : null;
 					const keptToDm = taskOrigin ? keepVoiceResultToDm(taskId, result, dmOnly) : null;
-					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE);
+					const meta = registersTask && !foreignOrigin ? { taskId } : undefined;
+					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE, meta);
 					else if (taskOrigin) void _deliverOriginBoundResult(taskId, result, taskOrigin, onResult);
-					else if (_cancelledVoiceTasks.has(taskId)) onResult(result, CANCELLED_BUT_FINISHED_NOTE);
-					else onResult(result);
+					else if (_cancelledVoiceTasks.has(taskId)) onResult(result, CANCELLED_BUT_FINISHED_NOTE, meta);
+					else onResult(result, undefined, meta);
 					// Notify agent-api directly (task results only), then delete file
 					if (registersTask) {
 						try {

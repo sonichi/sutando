@@ -19,9 +19,10 @@ import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 import { injectText } from './browser-tools.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
-import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull, frameTaskResult, framedSystem } from './inject-framing.js';
-import { deliverWithRetry } from './inject-delivery.js';
-import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher } from './task-bridge.js';
+import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull } from './inject-framing.js';
+import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, voiceTaskStore } from './task-bridge.js';
+import { createConversationPacer } from './conversation-pacing.js';
+import { createResultQueue, type ResultItem } from './voice-task-manager.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
 
@@ -43,7 +44,7 @@ export interface DurableChannelOptions {
  * text path when the session is live, with the tuned guard markers and
  * fallback semantics preserved exactly.
  */
-export function wireDurableChannels(session: VoiceSession, opts: DurableChannelOptions = {}): void {
+export function wireDurableChannels(session: VoiceSession, opts: DurableChannelOptions = {}): { enqueue: (item: ResultItem) => void } {
 	const { cartesiaApiKey = '', generateSpeech = null } = opts;
 
 	// Watch for context drops (keyboard shortcut)
@@ -94,59 +95,18 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		return false;
 	});
 
-	// Results that land during a meeting wait until it ends: the model must not speak in
-	// meeting mode, and the result must not be lost either.
-	const heldForMeeting: Array<{ result: string; deliveryNote?: string }> = [];
-	let heldTimer: ReturnType<typeof setInterval> | null = null;
-	const holdForMeeting = (result: string, deliveryNote?: string) => {
-		heldForMeeting.push({ result, deliveryNote });
-		console.log(`${ts()} [TaskBridge] Meeting mode: holding the result until the meeting ends (${heldForMeeting.length} held)`);
-		heldTimer ??= setInterval(() => {
-			if (meetingHoldsModel(session)) return;
-			clearInterval(heldTimer!);
-			heldTimer = null;
-			for (const held of heldForMeeting.splice(0)) deliverResult(held.result, held.deliveryNote);
-		}, 2_000);
-		heldTimer.unref?.();
-	};
-
-	const deliverResult = (result: string, deliveryNote?: string) => {
-		if (meetingHoldsModel(session)) {
-			holdForMeeting(result, deliveryNote);
-			return;
-		}
-		console.log(`${ts()} [TaskBridge] Delivering result to user${deliveryNote ? ' (with a delivery note)' : ''}`);
-		// Re-check session state inside the timer rather than at callback
-		// time. Reason: TaskBridge delivers `voice-*.txt` results the
-		// instant the WebSocket reconnects, but Gemini setup completes
-		// ~100ms after that. Without this delay-then-check pattern, a
-		// voice-only push that lands during the connect-but-not-active
-		// window would silently fall through to the Cartesia branch
-		// (which is usually disabled). 2026-05-20 02:36:44 incident:
-		// voice-test-1779244500.txt was "delivered" per the bridge log
-		// but never spoken because isActive was false at callback time
-		// (Gemini setup completed 106ms later). Now the check fires at
-		// T+1500ms when setup is reliably finished.
-		const inject = () => {
-			if (meetingHoldsModel(session)) {
-				holdForMeeting(result, deliveryNote);
-				return true;
-			}
-			if (session.sessionManager.isActive && session.clientConnected) {
-				// The note sits OUTSIDE the TASK_RESULT markers: it is delivery
-				// state the model acts on, not result text it must only summarise.
-				injectText(session, frameTaskResult(result) + (deliveryNote ? `\n\n${framedSystem(deliveryNote)}` : ''));
-				return true;
-			}
-			return false;
-		};
-		// First attempt after 1.5s (matches prior behavior). If still not
-		// active, do one retry at 3s. After that, fall through to Cartesia
-		// — no infinite retry, since a stuck session shouldn't pin the
-		// result forever.
-		deliverWithRetry({
-			attempt: inject,
-			onExhausted: () => {
+	// Every result goes through one queue: held through a meeting, then handed over at a pause,
+	// one batch at a time, so results landing together are all spoken and none cuts into another.
+	const pacer = createConversationPacer();
+	const results = createResultQueue({
+		held: () => meetingHoldsModel(session),
+		canInject: () => session.sessionManager.isActive && session.clientConnected,
+		inject: (text) => injectText(session, text),
+		waitForQuiet: () => pacer.waitForQuiet(),
+		store: voiceTaskStore,
+		log: (msg) => console.log(`${ts()} ${msg}`),
+		fallback: (items) => {
+			for (const { text: result } of items) {
 				// Stuck-voice fallback. Per Susan's PR #924 review (Q3): Cartesia
 				// only reaches the user if they're watching the web client with
 				// audio playback — a user in a stuck voice session is probably
@@ -176,10 +136,20 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 						console.log(`${ts()} [CartesiaTTS] Audio generated: ${audioPath}`);
 					}).catch(err => console.error(`${ts()} [CartesiaTTS] ${err.message}`));
 				}
-			},
-		});
-	};
-	startResultWatcher(deliverResult, () => session.clientConnected);
+			}
+		},
+	});
+	session.eventBus.subscribe('turn.start', () => pacer.onTurnStart());
+	session.eventBus.subscribe('turn.end', () => { pacer.onTurnEnd(); results.onTurnEnd(); });
+	session.eventBus.subscribe('turn.interrupted', () => { pacer.onTurnInterrupted(); results.onTurnInterrupted(); });
+	session.eventBus.subscribe('speech.user_started', () => pacer.onUserSpeechStarted());
+	session.eventBus.subscribe('speech.user_ended', () => pacer.onUserSpeechEnded());
+
+	startResultWatcher((result, deliveryNote, meta) => {
+		console.log(`${ts()} [TaskBridge] Queueing result for the user${deliveryNote ? ' (with a delivery note)' : ''}`);
+		results.enqueue({ text: result, note: deliveryNote, taskId: meta?.taskId });
+	}, () => session.clientConnected);
+	return { enqueue: results.enqueue };
 }
 
 // ── Session observability recorder (step 5a-3) ───────────────────────────────
