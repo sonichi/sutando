@@ -966,6 +966,7 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
+        d["requeued_attempts"] = int(d.get("attempts", 0) or 0)
         _write_item(root, item_id, d)
         return RequeueOutcome.REQUEUED, d["resend_epoch"]
 
@@ -974,15 +975,19 @@ def adopt_resend_payload_locked(root: Path, item_id: str, payload: str) -> bool:
     """Under the caller's `_item_lock`: a requeued record awaiting its resend
     takes the bytes being published now, once per resend epoch, keeping its
     epoch and attempts. Keyed on the epoch every requeue writer has bumped, so a
-    record requeued by an older writer adopts too. False = the normal publish rule."""
+    record requeued by an older writer adopts too. Never after an attempt under
+    this epoch: its idempotency key may already carry the stored body. False =
+    the normal publish rule."""
     root = Path(root)
     d = _read_item(root, item_id)
     try:
         epoch = int(d.get("resend_epoch", 0) or 0)
         adopted = int(d.get("resend_adopted_epoch", 0) or 0)
+        # An older writer recorded no count at requeue; only zero proves no attempt.
+        attempted = int(d.get("attempts", 0) or 0) > int(d.get("requeued_attempts", 0) or 0)
     except (TypeError, ValueError):
         return False
-    if (adopted >= epoch or d.get("status") != "QUEUED"
+    if (attempted or adopted >= epoch or d.get("status") != "QUEUED"
             or read_delivery_claim(root, item_id) is not None):
         return False
     d["payload"] = payload

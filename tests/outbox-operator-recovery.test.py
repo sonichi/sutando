@@ -573,6 +573,24 @@ class ResendFromLive(unittest.TestCase):
             self.assertTrue(self._adopt(root, "C"), "each requeue resends what is live once")
             self.assertEqual(outbox.read_item(root, ITEM)["payload"], "C")
 
+    def test_a_main_requeue_attempted_since_keeps_its_stored_payload(self):
+        """main's requeue (attempts reset), then a failed attempt under the new
+        epoch's key: adopting B now would reuse the key A was sent under."""
+        with TemporaryDirectory() as td:
+            root = Path(td) / "ob"
+            outbox._write_item(root, ITEM, {"item_id": ITEM, "status": "QUEUED", "payload": "A",
+                                            "resend_epoch": 1, "requeued_by": "old-cli",
+                                            "attempts": 1})
+            self.assertFalse(self._adopt(root, "B"))
+            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
+
+    def test_a_requeue_attempted_since_keeps_its_stored_payload(self):
+        with TemporaryDirectory() as td:
+            root = self._requeued(td)
+            outbox.note_attempt(root, ITEM)
+            self.assertFalse(self._adopt(root, "B"))
+            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
+
     def test_an_unreadable_epoch_keeps_the_stored_payload(self):
         with TemporaryDirectory() as td:
             root = Path(td) / "ob"
