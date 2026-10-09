@@ -1,0 +1,364 @@
+{
+ "_comment": "Cross-language parity table for the quota limit-state rule: classify_limit_state in src/quota_availability.py and limitState in skills/quota-tracker/scripts/credential-proxy.ts. tests/quota-limit-state.test.py and tests/credential-proxy-limit-state.test.ts both assert every row. Add a row here, not a per-language assertion.",
+ "limitState": [
+  {
+   "name": "all windows allowed",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "allowed",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-7d-status": "allowed",
+     "anthropic-ratelimit-unified-overage-status": "rejected"
+    },
+    "recent_rejections": [],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "allowed"
+  },
+  {
+   "name": "allowed_warning headline is not a limit",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "allowed_warning",
+     "anthropic-ratelimit-unified-7d-status": "allowed_warning",
+     "anthropic-ratelimit-unified-overage-status": "rejected"
+    },
+    "recent_rejections": [],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "allowed"
+  },
+  {
+   "name": "overage window rejected alone is not a limit",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "allowed",
+     "anthropic-ratelimit-unified-overage-status": "rejected",
+     "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled"
+    },
+    "recent_rejections": [],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "allowed"
+  },
+  {
+   "name": "headline rejected, overage rejected",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-5h-status": "rejected",
+     "anthropic-ratelimit-unified-overage-status": "rejected"
+    },
+    "recent_rejections": [],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "rejected"
+  },
+  {
+   "name": "headline rejected, no overage header",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-5h-status": "rejected"
+    },
+    "recent_rejections": [],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "rejected"
+  },
+  {
+   "name": "headline rejected, overage unknown value",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-overage-status": "disabled"
+    },
+    "recent_rejections": [],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "rejected"
+  },
+  {
+   "name": "issue #5283 incident: 7d rejected, overage allowed",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "overage"
+  },
+  {
+   "name": "7d window rejected under an allowed headline, overage allowed",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "allowed_warning",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "overage"
+  },
+  {
+   "name": "model-scoped 7d_oi rejected, overage allowed",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "allowed",
+     "anthropic-ratelimit-unified-7d_oi-status": "rejected",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "overage"
+  },
+  {
+   "name": "overage allowed_warning",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-overage-status": "allowed_warning"
+    },
+    "recent_rejections": [],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "overage"
+  },
+  {
+   "name": "overage allowed but a newer 429",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [
+     {
+      "ts": "2026-10-09T12:00:05.000Z",
+      "status": 429,
+      "path": "/v1/messages",
+      "snippet": ""
+     }
+    ],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "rejected"
+  },
+  {
+   "name": "overage allowed and a 429 at the same instant",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [
+     {
+      "ts": "2026-10-09T12:00:00.000Z",
+      "status": 429,
+      "path": "/v1/messages",
+      "snippet": ""
+     }
+    ],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "rejected"
+  },
+  {
+   "name": "overage allowed, only an older 429",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [
+     {
+      "ts": "2026-10-09T11:59:00.000Z",
+      "status": 429,
+      "path": "/v1/messages",
+      "snippet": ""
+     }
+    ],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "overage"
+  },
+  {
+   "name": "overage allowed, a newer non-429 rejection",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [
+     {
+      "ts": "2026-10-09T12:00:05.000Z",
+      "status": 529,
+      "path": "/v1/messages",
+      "snippet": ""
+     },
+     {
+      "ts": "2026-10-09T12:00:05.000Z",
+      "status": 400,
+      "path": "/v1/messages",
+      "snippet": ""
+     }
+    ],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "overage"
+  },
+  {
+   "name": "overage allowed, 429 with an unreadable ts",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [
+     {
+      "ts": "not-a-date",
+      "status": 429,
+      "path": "/v1/messages",
+      "snippet": ""
+     }
+    ],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "rejected"
+  },
+  {
+   "name": "overage allowed, 429 and no last_checked",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": [
+     {
+      "ts": "2026-10-09T11:59:00.000Z",
+      "status": 429,
+      "path": "/v1/messages",
+      "snippet": ""
+     }
+    ]
+   },
+   "expect": "rejected"
+  },
+  {
+   "name": "overage allowed, no last_checked and no ledger",
+   "record": {
+    "available": true,
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "recent_rejections": []
+   },
+   "expect": "overage"
+  },
+  {
+   "name": "overage allowed, malformed ledger entries ignored",
+   "record": {
+    "headers": {
+     "anthropic-ratelimit-unified-status": "rejected",
+     "anthropic-ratelimit-unified-7d-status": "rejected",
+     "anthropic-ratelimit-unified-7d-utilization": "1.0",
+     "anthropic-ratelimit-unified-5h-status": "allowed",
+     "anthropic-ratelimit-unified-5h-utilization": "0.2",
+     "anthropic-ratelimit-unified-overage-status": "allowed"
+    },
+    "last_checked": "2026-10-09T12:00:00.000Z",
+    "recent_rejections": [
+     "x",
+     null,
+     {
+      "status": "429",
+      "ts": "2026-10-09T12:00:05.000Z"
+     }
+    ]
+   },
+   "expect": "overage"
+  },
+  {
+   "name": "no headers at all",
+   "record": {
+    "available": false,
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "allowed"
+  },
+  {
+   "name": "headers not an object",
+   "record": {
+    "headers": [
+     "rejected"
+    ],
+    "last_checked": "2026-10-09T12:00:00.000Z"
+   },
+   "expect": "allowed"
+  },
+  {
+   "name": "record not an object",
+   "record": [
+    "rejected"
+   ],
+   "expect": "allowed"
+  },
+  {
+   "name": "record null",
+   "record": null,
+   "expect": "allowed"
+  }
+ ]
+}
