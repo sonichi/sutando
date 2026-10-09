@@ -5976,6 +5976,59 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     return check
 
 
+def check_quota_model_fallback() -> dict:
+    """Report the credential proxy's model-fallback tier (skills/quota-tracker).
+
+    ok while requests run on the models they asked for; warn while a tier is
+    active (the proxy rewrites level-1/2 models to the fallback model); fail when
+    the unified quota is rejected and a Codex runtime switch has been requested.
+    The proxy only records that request — the restart is a manual step until the
+    wiring lands — so the fail is what tells the owner to act.
+    """
+    check = {"name": "quota-model-fallback", "status": "ok"}
+    path = status_read_path("quota-state.json", WORKSPACE_DIR)
+    if not path.exists():
+        check["detail"] = "no quota-state.json (absence handled by quota-telemetry)"
+        return check
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        check["status"] = "warn"
+        check["detail"] = "quota-state.json present but unreadable"
+        return check
+    fb = data.get("fallback") if isinstance(data, dict) else None
+    if not isinstance(fb, dict):
+        check["detail"] = "primary models — no fallback record yet (the proxy writes one on its first quota headers)"
+        return check
+    switch = fb.get("runtime_switch")
+    if isinstance(switch, dict) and switch.get("to") == "codex":
+        check["status"] = "fail"
+        check["detail"] = (
+            f"Claude quota rejected — Codex runtime switch requested at {switch.get('at')}. "
+            "The proxy only records the request; switch manually: set core.runtime=codex in "
+            "sutando.config.local.json and run `bash src/agent/start-cli.sh --restart` from outside "
+            "the core session. No Claude model is swapped: they all share the rejected quota."
+        )
+        return check
+    tier = fb.get("tier")
+    models = fb.get("active_model_map") if isinstance(fb.get("active_model_map"), dict) else {}
+    mapped = ", ".join(f"{k}→{v}" for k, v in sorted(models.items()))
+    low = fb.get("low_priority_tier")
+    if tier in (2, 3):
+        check["status"] = "warn"
+        check["detail"] = (
+            f"model fallback tier {tier} since {fb.get('since')}: {fb.get('reason')}; "
+            f"rewriting {mapped or 'nothing'}. Reverts on hysteresis or a window reset "
+            "(skills/quota-tracker/SKILL.md → Model fallback)."
+        )
+        return check
+    if isinstance(low, int) and low > 1:
+        check["detail"] = f"primary models for normal traffic; low-priority traffic at tier {low} ({fb.get('reason')})"
+        return check
+    check["detail"] = f"primary models (tier 1): {fb.get('reason')}"
+    return check
+
+
 def _window_summary(windows: dict) -> str:
     """Owner-facing per-window line. overage is a flag, not a budget: rendering
     it as `0%` reads as a third window with headroom."""
@@ -12924,6 +12977,9 @@ def run_all_checks() -> list[dict]:
     # A credits/overage rejection leaves every unified-status header "allowed",
     # so the check above cannot see it; the proxy's ledger is the only record.
     checks.append(check_core_request_rejections())
+    # Which models requests actually run on while quota is high, and the
+    # rejected → Codex request the proxy can only signal.
+    checks.append(check_quota_model_fallback())
 
     # G1.5: which Node would JS services resolve to (bundled/app-bundle/
     # system), red when none — the silent-dead-services failure class.

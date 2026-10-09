@@ -1,11 +1,32 @@
 {
   "name": "quota-tracker",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
-  "description": "Track Claude Code quota usage via Anthropic API rate limit headers. Shows 5h and 7d utilization, reset times, and quota status. Works with both subscription and API key auth.",
+  "description": "Track Claude Code quota usage via Anthropic API rate limit headers. Shows 5h and 7d utilization, reset times, and quota status. Works with both subscription and API key auth. The config block declares the credential proxy's model-fallback ladder (read by scripts/credential-proxy.ts; owner overrides via scripts/fallback-config.py).",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "SUTANDO_QUOTA_FALLBACK_ENABLED": "1",
+    "SUTANDO_QUOTA_FALLBACK_5H_LEVEL1": "0.90",
+    "SUTANDO_QUOTA_FALLBACK_5H_LEVEL2": "0.97",
+    "SUTANDO_QUOTA_FALLBACK_7D_LEVEL1": "0.85",
+    "SUTANDO_QUOTA_FALLBACK_7D_LEVEL2": "0.95",
+    "SUTANDO_QUOTA_FALLBACK_HYSTERESIS": "0.03",
+    "SUTANDO_QUOTA_FALLBACK_5H_PROJECTION": "1",
+    "SUTANDO_QUOTA_FALLBACK_5H_PROJECTION_LIMIT": "0.98",
+    "SUTANDO_QUOTA_FALLBACK_5H_PROJECTION_LOOKBACK_SEC": "3600",
+    "SUTANDO_QUOTA_FALLBACK_5H_PROJECTION_MIN_SPAN_SEC": "300",
+    "SUTANDO_QUOTA_FALLBACK_5H_PROJECTION_CLEAR_SAMPLES": "3",
+    "SUTANDO_QUOTA_FALLBACK_5H_PROJECTION_CLEAR_AFTER_SEC": "300",
+    "SUTANDO_QUOTA_FALLBACK_5H_PROJECTION_ESCALATE_AFTER_SEC": "600",
+    "SUTANDO_QUOTA_FALLBACK_LOW_PRIORITY": "0",
+    "SUTANDO_QUOTA_FALLBACK_LOW_LEVEL1": "0.60",
+    "SUTANDO_QUOTA_FALLBACK_LOW_LEVEL2": "0.85",
+    "SUTANDO_QUOTA_FALLBACK_LEVEL2_MODEL": "claude-opus-5-5",
+    "SUTANDO_QUOTA_FALLBACK_LEVEL3_MODEL": "claude-sonnet-5",
+    "SUTANDO_QUOTA_FALLBACK_FAMILY_LEVELS": "fable:1,mythos:1,opus:2,sonnet:3,haiku:3"
   }
 }
