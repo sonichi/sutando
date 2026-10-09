@@ -176,7 +176,13 @@ class ClaimBackend(Protocol):
     def capabilities(self) -> BackendCapabilities: ...
 
     def publish(self, item_id: str, payload: bytes) -> bool:
-        """True = newly published; False = this id is already live.
+        """True = newly published; False = this id is already live, or parked
+        on this very payload.
+
+        A parked id is not poisoned: a DIFFERENT payload is a later reply and
+        starts a fresh cycle whose idempotency key cannot dedupe against the
+        parked attempt. Re-publishing the parked payload stays refused, so a
+        rescanned live file never turns one park into a retry per pass.
 
         Durable backends may expose payload_for_claim(token) so the core sends
         the original published bytes rather than a rebuilt caller payload.

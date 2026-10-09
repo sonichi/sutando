@@ -35,21 +35,36 @@ class DesignAClaimBackend:
                 republish_delivered: Optional[bool] = None) -> bool:
         allow_republish = (self.republish_delivered if republish_delivered is None
                            else republish_delivered)
+        text = payload.decode("utf-8", "replace")
+        record: dict = {}
         with outbox._item_lock(self.root, item_id):
             if outbox._item_path(self.root, item_id).exists():
-                # DELIVERED = completed lifecycle -> fresh cycle (C-parity);
-                # PARKED stays refused: the operator holds it.
-                if (not allow_republish
-                        or outbox._read_item(self.root, item_id).get("status") != "DELIVERED"):
+                prior = outbox._read_item(self.root, item_id)
+                status = prior.get("status")
+                # DELIVERED -> fresh cycle (C-parity). PARKED holds only the payload
+                # that parked; a different one is a later reply with its own key.
+                if status == "PARKED":
+                    if prior.get("payload") == text:
+                        return False
+                    record = {
+                        "resend_epoch": int(prior.get("resend_epoch", 0) or 0) + 1,
+                        "superseded_park": {
+                            "attempts": int(prior.get("attempts", 0) or 0),
+                            "reason": prior.get("reason"),
+                            "published_at": prior.get("published_at"),
+                        },
+                    }
+                elif not allow_republish or status != "DELIVERED":
                     return False
                 if outbox.read_delivery_claim(self.root, item_id) is not None:
                     return False
-            outbox._write_item(self.root, item_id, {
+            record.update({
                 "item_id": item_id,
-                "payload": payload.decode("utf-8", "replace"),
+                "payload": text,
                 "status": "READY",
                 "published_at": time.time(),
             })
+            outbox._write_item(self.root, item_id, record)
             return True
 
     def _incarnation_of(self, item_id: str) -> Optional[str]:
