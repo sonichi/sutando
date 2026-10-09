@@ -19,10 +19,11 @@ import { writeFileSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { resolveWorkspace, statusPath } from '../../../src/workspace_default.js';
+import { resolveHostLabel } from '../../../src/util_paths.js';
 import {
-	decideModel, initialState, nextState, observationFromHeaders, pushSample, requestPriority,
+	decideModel, gateLine, initialState, nextState, observationFromHeaders, pushSample, requestPriority,
 	rewriteModel, samplesFromHistoryRows, stateChanged, transitionLine,
-	type FallbackConfig, type FallbackState, type Sample,
+	type DmGate, type FallbackConfig, type FallbackState, type Sample,
 } from './quota-fallback-policy.js';
 import { createConfigReader, OVERRIDE_BASENAME, SKILL_MANIFEST_PATH } from './quota-fallback-config.js';
 
@@ -420,7 +421,7 @@ export interface ProxyDeps {
 	recordFallback: (state: FallbackState) => void;
 	notifyOwner: (line: string) => void;
 	readHistorySamples: (nowMs: number, lookbackSec: number) => Sample[];
-	}
+}
 
 export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 	const deps: ProxyDeps = {
@@ -442,30 +443,39 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		notifyOwner,
 		readHistorySamples,
 		...overrides,
-		};
-		const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
+	};
+	const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
 
-		// Fallback tier state, seeded from the last persisted record so a proxy
-		// restart keeps its hysteresis; the burn-rate samples seed from the history file.
-		let fallbackState: FallbackState | null = deps.readFallbackState();
-		let samples: Sample[] = [];
-		try { samples = deps.readHistorySamples(deps.now(), deps.fallbackConfig().projection5h.lookbackSec); } catch { samples = []; }
+	// Fallback tier state, seeded from the last persisted record so a proxy
+	// restart keeps its hysteresis; the burn-rate samples seed from the history file.
+	let fallbackState: FallbackState | null = deps.readFallbackState();
+	let samples: Sample[] = [];
+	try { samples = deps.readHistorySamples(deps.now(), deps.fallbackConfig().projection5h.lookbackSec); } catch { samples = []; }
+	let dmGate: DmGate = { last_sent: {}, held: {} };
 
-		function observeQuota(quotaHeaders: Record<string, string>): void {
+	function observeQuota(quotaHeaders: Record<string, string>): void {
 		const cfg = deps.fallbackConfig();
 		const nowMs = deps.now();
 		const obs = observationFromHeaders(quotaHeaders);
 		if (obs.u5 !== null) samples = pushSample(samples, { t: nowMs, u5: obs.u5, r5: obs.r5 }, cfg.projection5h.lookbackSec);
-		const next = nextState(fallbackState, obs, cfg, nowMs, samples);
-		const changed = stateChanged(fallbackState, next);
-		const line = transitionLine(fallbackState, next, cfg);
+		const prev = fallbackState;
+		const next = nextState(prev, obs, cfg, nowMs, samples);
+		const changed = stateChanged(prev, next);
+		const line = transitionLine(prev, next, cfg);
 		fallbackState = next;
 		if (changed) {
 			console.log(`${ts()} [Fallback] tier ${next.tier} (low-priority ${next.low_priority_tier}): ${next.reason}${next.runtime_switch ? ` runtime_switch→${next.runtime_switch.to}` : ''}`);
 			try { deps.recordFallback(next); } catch { /* best effort */ }
 		}
-		if (line) { try { deps.notifyOwner(line); } catch { /* best effort */ } }
+		if (line) {
+			const switched = (next.runtime_switch?.to ?? null) !== (prev?.runtime_switch?.to ?? null);
+			const key = switched ? 'runtime' : (next.fired?.window ?? prev?.fired?.window ?? 'tier');
+			const gated = gateLine(dmGate, key, line, nowMs, cfg.dmMinIntervalSec * 1000);
+			dmGate = gated.gate;
+			if (gated.send) { try { deps.notifyOwner(gated.send); } catch { /* best effort */ } }
+			else console.log(`${ts()} [Fallback] DM held (${key} within ${cfg.dmMinIntervalSec}s): ${line}`);
 		}
+	}
 
 	// Single-flight guard: at most one refresh in progress, so concurrent requests
 	// never race to consume/rotate the refresh token twice.
@@ -771,7 +781,7 @@ function recordRejection(rej: RejectionRecord): void {
 
 const productionFallbackConfig = createConfigReader({
 	manifestPath: SKILL_MANIFEST_PATH,
-	overridePath: statusPath(OVERRIDE_BASENAME),
+	overridePath: join(resolveWorkspace(), 'hosts', resolveHostLabel(), OVERRIDE_BASENAME),
 	env: process.env,
 });
 

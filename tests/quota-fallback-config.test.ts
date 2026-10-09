@@ -51,6 +51,13 @@ test('malformed values fall back per field; an inverted ladder keeps the default
 	assert.strictEqual(c.lowPriorityEnabled, true);
 	assert.strictEqual(c.level2Model, 'claude-opus-5-5');
 	assert.deepStrictEqual(c.familyLevels, D.familyLevels, 'a bad level keeps the default map');
+	assert.strictEqual(c.dmMinIntervalSec, 1800);
+	const typo = parseFallbackConfig({ SUTANDO_QUOTA_FALLBACK_LEVEL2_MODEL: 'claude-opsu-5-5', SUTANDO_QUOTA_FALLBACK_LEVEL3_MODEL: 'claude-opus-5-5', SUTANDO_QUOTA_FALLBACK_DM_MIN_INTERVAL_SEC: '0' });
+	assert.strictEqual(typo.level2Model, 'claude-opus-5-5', 'a typo is refused, never routed');
+	assert.strictEqual(typo.level3Model, 'claude-sonnet-5', 'an Opus id is not a level-3 model');
+	assert.strictEqual(typo.dmMinIntervalSec, 0);
+	const custom = parseFallbackConfig({ SUTANDO_QUOTA_FALLBACK_FAMILY_LEVELS: 'fable:1,opus:2,haiku:3', SUTANDO_QUOTA_FALLBACK_LEVEL3_MODEL: 'claude-haiku-4-5' });
+	assert.strictEqual(custom.level3Model, 'claude-haiku-4-5', 'validated against the configured families');
 	assert.deepStrictEqual(parseFamilyLevels('fable:1, opus:2', D.familyLevels), { fable: 1, opus: 2 });
 });
 

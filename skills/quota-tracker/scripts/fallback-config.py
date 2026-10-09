@@ -2,9 +2,9 @@
 """fallback-config — adjust the credential proxy's model-fallback ladder.
 
 The shipped defaults are the `config` block of this skill's manifest.json; this
-tool writes the owner's overrides to <workspace>/state/quota-fallback-config.json,
-which the running proxy re-reads on change (no restart). Precedence the proxy
-applies: env > that override file > manifest > built-in.
+tool writes the owner's overrides to <workspace>/hosts/<host>/quota-fallback-config.json
+(per host, beside crons.json), which the running proxy re-reads on change (no
+restart). Precedence the proxy applies: env > that override file > manifest > built-in.
 
   fallback-config.py show
   fallback-config.py set 7d level1 0.90        # 7-day window: level-1 requests demote above 90%
@@ -15,12 +15,14 @@ applies: env > that override file > manifest > built-in.
   fallback-config.py set low-priority on|off
   fallback-config.py set hysteresis 0.02
   fallback-config.py set enabled on|off
+  fallback-config.py set dm-min-interval-sec 900  # tier-change DMs: at most one per window per 15 min
   fallback-config.py unset 7d level1           # back to the manifest default
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -30,6 +32,7 @@ _SRC = _SKILL.parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from util_paths import host_label  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 P = "SUTANDO_QUOTA_FALLBACK_"
@@ -37,7 +40,7 @@ OVERRIDE_BASENAME = "quota-fallback-config.json"
 MANIFEST = _SKILL / "manifest.json"
 
 # Friendly spelling → key suffix → value kind. Mirrors CONFIG_KEYS in
-# quota-fallback-config.ts; tests/quota-fallback-config-keys.test.py pins the two.
+# quota-fallback-config.ts; tests/quota-fallback-config-cli.test.py pins the two.
 SETTINGS: dict[tuple[str, ...], tuple[str, str]] = {
     ("enabled",): ("ENABLED", "flag"),
     ("5h", "level1"): ("5H_LEVEL1", "frac"),
@@ -55,17 +58,20 @@ SETTINGS: dict[tuple[str, ...], tuple[str, str]] = {
     ("low-priority",): ("LOW_PRIORITY", "flag"),
     ("low", "level1"): ("LOW_LEVEL1", "frac"),
     ("low", "level2"): ("LOW_LEVEL2", "frac"),
-    ("level2-model",): ("LEVEL2_MODEL", "text"),
-    ("level3-model",): ("LEVEL3_MODEL", "text"),
+    ("level2-model",): ("LEVEL2_MODEL", "model"),
+    ("level3-model",): ("LEVEL3_MODEL", "model"),
     ("family-levels",): ("FAMILY_LEVELS", "text"),
+    ("dm-min-interval-sec",): ("DM_MIN_INTERVAL_SEC", "count"),
 }
+_MODEL_RE = re.compile(r"^claude-([a-z]+)-[0-9][0-9a-z.-]*$")
+_MODEL_LEVEL = {"LEVEL2_MODEL": 2, "LEVEL3_MODEL": 3}
 KEYS = [P + suffix for suffix, _ in SETTINGS.values()]
 _LADDERS = (("5H_LEVEL1", "5H_LEVEL2"), ("7D_LEVEL1", "7D_LEVEL2"), ("LOW_LEVEL1", "LOW_LEVEL2"))
 
 
 def override_path(workspace: Path | None = None) -> Path:
     ws = workspace if workspace is not None else resolve_workspace()
-    return Path(ws) / "state" / OVERRIDE_BASENAME
+    return Path(ws) / "hosts" / host_label() / OVERRIDE_BASENAME
 
 
 def _read_json(path: Path) -> dict:
@@ -129,19 +135,42 @@ def normalize(kind: str, raw: str) -> str:
         if not v.isdigit():
             raise ValueError(f"expected a whole number of seconds/samples, got {raw!r}")
         return str(int(v))
+    if kind == "model":
+        if not _MODEL_RE.match(raw.strip()):
+            raise ValueError(f"expected a Claude model id like claude-opus-5-5, got {raw!r}")
+        return raw.strip()
     if not raw.strip():
         raise ValueError("expected a non-empty value")
     return raw.strip()
 
 
-def validate_ladders(values: dict[str, str]) -> None:
-    """Every ladder must keep level1 < level2 after the merge."""
+def family_levels(values: dict[str, str]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for part in (values.get(P + "FAMILY_LEVELS") or "").split(","):
+        fam, _, lvl = part.strip().partition(":")
+        if fam and lvl in ("1", "2", "3"):
+            out[fam] = int(lvl)
+    return out
+
+
+def validate_merged(values: dict[str, str]) -> None:
+    """After the merge: every ladder keeps level1 < level2, and each target model is a
+    Claude id whose family sits at exactly its level (a typo is refused, never routed)."""
     for lo, hi in _LADDERS:
         a, b = values.get(P + lo), values.get(P + hi)
         if a is None or b is None:
             continue
         if float(a) >= float(b):
             raise ValueError(f"{lo.lower().replace('_', ' ')} ({a}) must be below {hi.lower().replace('_', ' ')} ({b})")
+    fams = family_levels(values)
+    for suffix, level in _MODEL_LEVEL.items():
+        m = values.get(P + suffix)
+        if m is None:
+            continue
+        match = _MODEL_RE.match(m)
+        if not match or fams.get(match.group(1)) != level:
+            raise ValueError(f"{suffix.lower().replace('_', ' ')} {m!r} is not a known level-{level} Claude model "
+                             f"(families at level {level}: {', '.join(f for f, l in fams.items() if l == level) or 'none'})")
 
 
 def resolve_setting(words: list[str]) -> tuple[str, str]:
@@ -173,7 +202,7 @@ def render(manifest: dict[str, str], override: dict[str, str], env: dict[str, st
         f"7d window: level1 > {pct('7D_LEVEL1')} → level 2, level2 > {pct('7D_LEVEL2')} → level 3",
         f"hysteresis: {pct('HYSTERESIS')}   low-priority ladder: {on('LOW_PRIORITY')} "
         f"(level1 > {pct('LOW_LEVEL1')}, level2 > {pct('LOW_LEVEL2')})",
-        f"family levels: {g('FAMILY_LEVELS')[0]}",
+        f"family levels: {g('FAMILY_LEVELS')[0]}   tier-change DMs: at most one per window per {g('DM_MIN_INTERVAL_SEC')[0]}s",
         "",
         "sources:",
     ]
@@ -203,7 +232,7 @@ def main(argv: list[str], workspace: Path | None = None, env: dict[str, str] | N
             key, kind = resolve_setting(rest[:-1])
             new = dict(override)
             new[key] = normalize(kind, rest[-1])
-            validate_ladders({**manifest, **new})
+            validate_merged({**manifest, **new})
             write_override(path, new)
             print(f"set {key} = {new[key]} (override file: {path})\n")
             print(render(manifest, new, env))

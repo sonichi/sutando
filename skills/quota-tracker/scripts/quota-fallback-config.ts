@@ -1,15 +1,16 @@
 /**
  * Model-fallback config for the credential proxy. Keys are declared in this
  * skill's manifest.json `config` block (the shipped defaults); the owner's
- * adjustments live in <workspace>/state/quota-fallback-config.json, written by
- * scripts/fallback-config.py so a long-running proxy picks them up without a
- * restart. Precedence: env > per-host override file > manifest > built-in.
+ * adjustments live in <workspace>/hosts/<host>/quota-fallback-config.json,
+ * written by scripts/fallback-config.py so a long-running proxy picks them up
+ * without a restart. Precedence: env > per-host override file > manifest > built-in.
  */
 import { readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_FALLBACK_CONFIG, type FallbackConfig, type Level } from './quota-fallback-policy.js';
+import { DEFAULT_FALLBACK_CONFIG, validModelForLevel, type FallbackConfig, type Level } from './quota-fallback-policy.js';
 
+/** Owner overrides are per host: <workspace>/hosts/<host>/<basename>, beside crons.json. */
 export const OVERRIDE_BASENAME = 'quota-fallback-config.json';
 const P = 'SUTANDO_QUOTA_FALLBACK_';
 
@@ -24,6 +25,7 @@ export const CONFIG_KEYS = [
 	`${P}5H_PROJECTION_CLEAR_AFTER_SEC`, `${P}5H_PROJECTION_ESCALATE_AFTER_SEC`,
 	`${P}LOW_PRIORITY`, `${P}LOW_LEVEL1`, `${P}LOW_LEVEL2`,
 	`${P}LEVEL2_MODEL`, `${P}LEVEL3_MODEL`, `${P}FAMILY_LEVELS`,
+	`${P}DM_MIN_INTERVAL_SEC`,
 ] as const;
 
 export type RawConfig = Record<string, string>;
@@ -48,9 +50,9 @@ function count(v: string | undefined, dflt: number): number {
 	return Number.isFinite(n) && n >= 0 ? n : dflt;
 }
 
-function text(v: string | undefined, dflt: string): string {
+function model(v: string | undefined, level: Level, families: Record<string, Level>, dflt: string): string {
 	const s = (v ?? '').trim();
-	return s || dflt;
+	return s && validModelForLevel(s, level, families) ? s : dflt;
 }
 
 /** "fable:1,opus:2" → {fable: 1, opus: 2}; a malformed list keeps the default map. */
@@ -73,6 +75,7 @@ export function parseFallbackConfig(raw: RawConfig, dflt: FallbackConfig = DEFAU
 		return t.level1 < t.level2 ? t : d; // an inverted ladder is a typo, not a policy
 	};
 	const low = { level1: frac(g('LOW_LEVEL1'), dflt.lowThresholds.level1), level2: frac(g('LOW_LEVEL2'), dflt.lowThresholds.level2) };
+	const families = parseFamilyLevels(g('FAMILY_LEVELS'), dflt.familyLevels);
 	return {
 		enabled: flag(g('ENABLED'), dflt.enabled),
 		thresholds: { '5h': win('5H', dflt.thresholds['5h']), '7d': win('7D', dflt.thresholds['7d']) },
@@ -88,9 +91,10 @@ export function parseFallbackConfig(raw: RawConfig, dflt: FallbackConfig = DEFAU
 		},
 		lowPriorityEnabled: flag(g('LOW_PRIORITY'), dflt.lowPriorityEnabled),
 		lowThresholds: low.level1 < low.level2 ? low : dflt.lowThresholds,
-		level2Model: text(g('LEVEL2_MODEL'), dflt.level2Model),
-		level3Model: text(g('LEVEL3_MODEL'), dflt.level3Model),
-		familyLevels: parseFamilyLevels(g('FAMILY_LEVELS'), dflt.familyLevels),
+		level2Model: model(g('LEVEL2_MODEL'), 2, families, dflt.level2Model),
+		level3Model: model(g('LEVEL3_MODEL'), 3, families, dflt.level3Model),
+		familyLevels: families,
+		dmMinIntervalSec: count(g('DM_MIN_INTERVAL_SEC'), dflt.dmMinIntervalSec),
 	};
 }
 

@@ -64,6 +64,9 @@ class TestFallbackConfigCli(unittest.TestCase):
         self.assertNotIn("(override)", out)
         self.assertIn("(manifest)", out)
 
+    def test_override_is_per_host(self):
+        self.assertEqual(self.path, self.ws / "hosts" / self.m.host_label() / "quota-fallback-config.json")
+
     def test_set_writes_override_and_proxy_sees_it_as_the_effective_value(self):
         rc, out, _ = self.run_cli("set", "7d", "level1", "0.90")
         self.assertEqual(rc, 0, out)
@@ -79,6 +82,23 @@ class TestFallbackConfigCli(unittest.TestCase):
         rc, _, _ = self.run_cli("set", "5h", "projection-clear-samples", "5")
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.path.read_text())["SUTANDO_QUOTA_FALLBACK_5H_PROJECTION_CLEAR_SAMPLES"], "5")
+        rc, out, _ = self.run_cli("set", "dm-min-interval-sec", "900")
+        self.assertEqual(rc, 0)
+        self.assertIn("at most one per window per 900s", out)
+
+    def test_target_models_are_validated_against_the_family_levels(self):
+        for args in (("set", "level2-model", "claude-opsu-5-5"),      # typo family
+                     ("set", "level2-model", "claude-sonnet-5"),       # wrong level
+                     ("set", "level3-model", "claude-opus-5-5"),
+                     ("set", "level3-model", "gpt-5"),
+                     ("set", "level2-model", "claude-opus-5-5[1m]")):  # variants come from the request
+            rc, _, err = self.run_cli(*args)
+            self.assertEqual(rc, 2, args)
+            self.assertIn("fallback-config:", err)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.run_cli("set", "level2-model", "claude-opus-5")[0], 0)
+        self.assertEqual(self.run_cli("set", "level3-model", "claude-haiku-4-5")[0], 0)
+        self.assertEqual(json.loads(self.path.read_text())["SUTANDO_QUOTA_FALLBACK_LEVEL3_MODEL"], "claude-haiku-4-5")
 
     def test_unset_returns_to_manifest_default(self):
         self.run_cli("set", "7d", "level1", "0.90")

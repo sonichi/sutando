@@ -27,6 +27,7 @@
     "SUTANDO_QUOTA_FALLBACK_LOW_LEVEL2": "0.85",
     "SUTANDO_QUOTA_FALLBACK_LEVEL2_MODEL": "claude-opus-5-5",
     "SUTANDO_QUOTA_FALLBACK_LEVEL3_MODEL": "claude-sonnet-5",
-    "SUTANDO_QUOTA_FALLBACK_FAMILY_LEVELS": "fable:1,mythos:1,opus:2,sonnet:3,haiku:3"
+    "SUTANDO_QUOTA_FALLBACK_FAMILY_LEVELS": "fable:1,mythos:1,opus:2,sonnet:3,haiku:3",
+    "SUTANDO_QUOTA_FALLBACK_DM_MIN_INTERVAL_SEC": "1800"
   }
 }

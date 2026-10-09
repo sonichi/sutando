@@ -6,10 +6,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import {
-	DEFAULT_FALLBACK_CONFIG as D, decideModel, fiveHourTier, initialState, modelLevel, nextState,
+	DEFAULT_FALLBACK_CONFIG as D, clearLine, decideModel, fiveHourTier, gateLine, initialState, modelLevel, nextState,
 	observationFromHeaders, projectFiveHour, pushSample, requestPriority, rewriteModel, samplesFromHistoryRows,
-	splitModel, stateChanged, transitionLine, windowTier,
-	type FallbackConfig, type FallbackState, type QuotaObservation, type Sample,
+	splitModel, stateChanged, transitionLine, validModelForLevel, windowTier,
+	type DmGate, type FallbackConfig, type FallbackState, type QuotaObservation, type Sample,
 } from '../skills/quota-tracker/scripts/quota-fallback-policy.ts';
 
 const T0 = Date.UTC(2026, 9, 9, 0, 0, 0);
@@ -30,6 +30,44 @@ test('shipped defaults: 5h 0.90/0.97 with projection on, 7d 0.85/0.95, hysteresi
 	assert.deepStrictEqual(D.lowThresholds, { level1: 0.60, level2: 0.85 });
 	assert.strictEqual(D.level2Model, 'claude-opus-5-5');
 	assert.strictEqual(D.level3Model, 'claude-sonnet-5');
+	assert.strictEqual(D.dmMinIntervalSec, 1800);
+});
+
+test('a target model must be a Claude id whose family sits at exactly its level', () => {
+	assert.strictEqual(validModelForLevel('claude-opus-5-5', 2, D.familyLevels), true);
+	assert.strictEqual(validModelForLevel('claude-sonnet-5', 3, D.familyLevels), true);
+	assert.strictEqual(validModelForLevel('claude-opus-5-5', 3, D.familyLevels), false, 'wrong level');
+	assert.strictEqual(validModelForLevel('claude-opsu-5-5', 2, D.familyLevels), false, 'typo family');
+	assert.strictEqual(validModelForLevel('gpt-5', 3, D.familyLevels), false);
+	assert.strictEqual(validModelForLevel('claude-opus-5-5[1m]', 2, D.familyLevels), false, 'the variant comes from the request, not the config');
+});
+
+test('hysteresis is bounded: a tier\'s clear line never sinks below the next tier\'s own line', () => {
+	const tight = { level1: 0.90, level2: 0.92 };
+	assert.strictEqual(clearLine(3, tight, 0.03), 0.90, 'level2 − h would be 0.89, under the level1 line');
+	assert.ok(Math.abs(clearLine(3, D.thresholds['7d'], 0.03) - 0.92) < 1e-9);
+	assert.strictEqual(clearLine(2, { level1: 0.02, level2: 0.5 }, 0.03), 0);
+	assert.strictEqual(windowTier(3, 0.905, tight, 0.03, false), 3, 'inside the bounded band: holds');
+	assert.strictEqual(windowTier(3, 0.895, tight, 0.03, false), 2, 'under the level1 line: tier 3 is left even though 0.895 ≥ 0.89');
+	assert.strictEqual(windowTier(2, 0.875, tight, 0.03, false), 2, 'tier 2 keeps its own band down to 0.87');
+	assert.strictEqual(windowTier(2, 0.865, tight, 0.03, false), 1);
+});
+
+test('DM gate: one line per window per interval, held lines summarised in the next, runtime-switch lines exempt', () => {
+	let g: DmGate = { last_sent: {}, held: {} };
+	let r = gateLine(g, '7d', 'A', T0, 1800_000); g = r.gate;
+	assert.strictEqual(r.send, 'A', 'the first line goes out at once');
+	r = gateLine(g, '7d', 'B', T0 + 60_000, 1800_000); g = r.gate;
+	assert.strictEqual(r.send, null, 'inside the interval: held');
+	r = gateLine(g, '5h', 'C', T0 + 61_000, 1800_000); g = r.gate;
+	assert.strictEqual(r.send, 'C', 'another window has its own budget');
+	r = gateLine(g, 'runtime', 'R', T0 + 62_000, 1800_000); g = r.gate;
+	assert.strictEqual(r.send, 'R', 'a runtime switch is never held');
+	r = gateLine(g, '7d', 'D', T0 + 1800_000, 1800_000); g = r.gate;
+	assert.strictEqual(r.send, 'D [1 earlier change(s) held since the last message: B]');
+	r = gateLine(g, '7d', 'E', T0 + 3600_000, 1800_000); g = r.gate;
+	assert.strictEqual(r.send, 'E', 'the held list was flushed');
+	assert.strictEqual(gateLine(g, '7d', 'F', T0 + 3600_001, 0).send, 'F', 'interval 0 disables the gate');
 });
 
 test('model levels by family; the [1m] variant is preserved as a suffix; unknown models have no level', () => {
@@ -128,14 +166,14 @@ test('rejected: no model swap; a Codex runtime switch is requested once and with
 	const s = nextState(null, obs(0.99, 0.99, 'rejected'), noProjection, T0);
 	assert.strictEqual(s.tier, 1, 'every Claude model shares the rejected quota — nothing to swap to');
 	assert.deepStrictEqual(s.runtime_switch, { to: 'codex', reason: 'rejected', at: new Date(T0).toISOString() });
-	assert.match(transitionLine(null, s, D)!, /Codex/);
-	assert.match(transitionLine(null, s, D)!, /不会自动重启/);
+	assert.match(transitionLine(null, s, D)!, /^Claude quota rejected \(status=rejected\): a switch to the Codex runtime has been requested/);
+	assert.match(transitionLine(null, s, D)!, /nothing restarts on its own; switch manually \(core\.runtime=codex, then `bash src\/agent\/start-cli\.sh --restart`\)/);
 	const held = nextState(s, obs(0.99, 0.99, 'rejected'), noProjection, T0 + 60_000);
 	assert.strictEqual(held.runtime_switch?.at, s.runtime_switch?.at, 'the request is not re-stamped every response');
 	assert.strictEqual(transitionLine(s, held, D), null);
 	const back = nextState(held, obs(0.10, 0.50, 'allowed', String(Number(R5) + 18000), R7), noProjection, T0 + 120_000);
 	assert.deepStrictEqual(back.runtime_switch, { to: 'claude', reason: 'window reset', at: new Date(T0 + 120_000).toISOString() });
-	assert.match(transitionLine(held, back, D)!, /Codex 切换请求已撤回/);
+	assert.strictEqual(transitionLine(held, back, D), 'Claude quota allowed again — the Codex runtime-switch request has been withdrawn.');
 	assert.strictEqual(observationFromHeaders({ 'anthropic-ratelimit-unified-5h-status': 'rejected' }).status, 'rejected');
 	assert.strictEqual(observationFromHeaders({ 'anthropic-ratelimit-unified-status': 'allowed_warning' }).status, 'allowed_warning');
 });
@@ -181,9 +219,8 @@ test('projection: a burn rate that runs out before the reset downgrades at 70%',
 	assert.strictEqual(s.fired?.key, 'projection');
 	assert.match(s.reason, /5h window 70% at 60%\/h projects to/);
 	const line = transitionLine(null, s, D)!;
-	assert.match(line, /5 小时窗口按当前速度会在重置前用完（预计 \d\d:\d\d 到 100%）/);
-	assert.match(line, /claude-opus-5-5/);
-	assert.match(line, /fallback-config set 5h projection-limit/);
+	assert.match(line, /^Quota 5h window: at the current burn rate it runs out before the reset \(100% expected at \d\d:\d\d\) — Fable requests now run on claude-opus-5-5; reverts once the rate slows/);
+	assert.match(line, /fallback-config set 5h projection-limit <0\.\.1>/);
 });
 
 test('projection: a slow rate at 92% that lasts to the reset does not downgrade, even above the 90% line', () => {
@@ -202,6 +239,24 @@ test('projection: the 0.97 hard line downgrades to the level-3 model whatever th
 	assert.strictEqual(s.tier, 3);
 	assert.strictEqual(s.fired?.key, 'level2');
 	assert.strictEqual(decideModel('claude-opus-5-5', s, D).model, 'claude-sonnet-5');
+});
+
+test('projection: with no projection a tier set earlier is lowered only through the dwell, never dropped at once', () => {
+	const pc = D.projection5h;
+	const t = D.thresholds['5h'];
+	const w0 = initialState(T0).windows['5h'];
+	const fail = { projected: 1.2, ratePerHour: 0.5, etaFullMs: T0 + H, source: 'slope' as const };
+	let ws = { ...w0, ...fiveHourTier(w0, 0.60, t, 0.03, false, fail, pc, T0) };
+	assert.strictEqual(ws.tier, 2, 'projection set tier 2');
+	ws = { ...ws, ...fiveHourTier(ws, 0.60, t, 0.03, false, null, pc, T0 + 10_000) };
+	assert.strictEqual(ws.tier, 2, 'the projection went null (thin history): the bare 0.90 line alone must not drop the tier');
+	let now = T0 + 10_000;
+	for (let i = 0; i < pc.clearSamples; i++) { now += 10_000; ws = { ...ws, ...fiveHourTier(ws, 0.60, t, 0.03, false, null, pc, now) }; }
+	assert.strictEqual(ws.tier, 2, 'N null samples but the quiet period has not elapsed');
+	ws = { ...ws, ...fiveHourTier(ws, 0.60, t, 0.03, false, null, pc, T0 + pc.clearAfterSec * 1000 + 1000) };
+	assert.strictEqual(ws.tier, 1, 'dwell satisfied: lowered one level');
+	ws = { ...ws, ...fiveHourTier(ws, 0.98, t, 0.03, false, null, pc, T0 + pc.clearAfterSec * 1000 + 2000) };
+	assert.strictEqual(ws.tier, 3, 'a bare line still raises at once');
 });
 
 test('projection: thin history falls back to even pace, and too-young a window falls back to the threshold rule', () => {
@@ -282,14 +337,12 @@ test('stateChanged and transitionLine fire once per tier change, not per respons
 	assert.strictEqual(stateChanged(null, a), true);
 	assert.strictEqual(stateChanged(a, b), false);
 	assert.strictEqual(transitionLine(a, b, D), null);
-	const line = transitionLine(null, a, D)!;
-	assert.match(line, /额度 7 天窗口 86% 超过 85% 阈值/);
-	assert.match(line, /Fable 请求已切到 claude-opus-5-5/);
-	assert.match(line, /回到 82% 以下自动恢复/);
-	assert.match(line, /fallback-config set 7d level1 0\.87/);
+	assert.strictEqual(transitionLine(null, a, D),
+		'Quota 7d window 86% is over the 85% line — Fable requests now run on claude-opus-5-5; reverts below 82% (move the line with `fallback-config set 7d level1 0.87`).');
 	const c = nextState(b, obs(0.30, 0.50), noProjection, T0 + 2000);
-	assert.match(transitionLine(b, c, D)!, /已恢复主模型/);
+	assert.strictEqual(transitionLine(b, c, D), 'Quota eased (5h 30%, 7d 50%) — back on the primary models.');
 	const d: FallbackState = nextState(null, obs(0.30, 0.96), noProjection, T0);
-	assert.match(transitionLine(null, d, D)!, /已切到 claude-sonnet-5 兜底/);
-	assert.match(transitionLine(null, d, D)!, /fallback-config set 7d level2 0\.97/);
+	assert.strictEqual(transitionLine(null, d, D),
+		'Quota 7d window 96% is over the 95% line — Fable and Opus requests now run on claude-sonnet-5; reverts below 92% (move the line with `fallback-config set 7d level2 0.97`).');
+	for (const l of [transitionLine(null, a, D)!, transitionLine(null, d, D)!]) assert.doesNotMatch(l, /[\u4e00-\u9fff]/, 'owner DM lines are English');
 });

@@ -5976,15 +5976,9 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     return check
 
 
-def check_quota_model_fallback() -> dict:
-    """Report the credential proxy's model-fallback tier (skills/quota-tracker).
-
-    ok while requests run on the models they asked for; warn while a tier is
-    active (the proxy rewrites level-1/2 models to the fallback model); fail when
-    the unified quota is rejected and a Codex runtime switch has been requested.
-    The proxy only records that request — the restart is a manual step until the
-    wiring lands — so the fail is what tells the owner to act.
-    """
+def check_quota_model_fallback(fresh_sec: int = 1800) -> dict:
+    """The credential proxy's model-fallback tier (quota-state.json `fallback`): warn while
+    a tier is active, fail on a pending Codex switch request, ok when stale or already reset."""
     check = {"name": "quota-model-fallback", "status": "ok"}
     path = status_read_path("quota-state.json", WORKSPACE_DIR)
     if not path.exists():
@@ -6000,8 +5994,43 @@ def check_quota_model_fallback() -> dict:
     if not isinstance(fb, dict):
         check["detail"] = "primary models — no fallback record yet (the proxy writes one on its first quota headers)"
         return check
+
+    # Only Claude traffic through the proxy refreshes the record: an old one says
+    # nothing about now, and a tier whose window has reset since is already over.
+    now = time.time()
+    age_sec = None
+    try:
+        from datetime import datetime
+        age_sec = now - datetime.fromisoformat(str(data.get("last_checked")).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        pass
+    stale = age_sec is None or age_sec > fresh_sec
+    age_note = f"{int(age_sec / 60)}m old" if age_sec is not None else "of unknown age"
+    windows = fb.get("windows") if isinstance(fb.get("windows"), dict) else {}
+
+    def reset_passed(names) -> "str | None":
+        """The latest reset epoch among `names` as a time, when every one has passed."""
+        epochs = []
+        for w in names:
+            ws = windows.get(w) if isinstance(windows.get(w), dict) else {}
+            try:
+                epochs.append(float(ws.get("reset")))
+            except (TypeError, ValueError):
+                return None
+        if epochs and all(e < now for e in epochs):
+            return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(max(epochs)))
+        return None
+
     switch = fb.get("runtime_switch")
     if isinstance(switch, dict) and switch.get("to") == "codex":
+        if stale:
+            check["detail"] = (f"Codex switch requested at {switch.get('at')} but the record is {age_note} — no Claude "
+                               "traffic through the proxy since (switched already, or idle); not alerting")
+            return check
+        passed = reset_passed(["5h"])
+        if passed:
+            check["detail"] = f"Codex switch requested at {switch.get('at')}; the 5h window reset at {passed} has passed since — cleared"
+            return check
         check["status"] = "fail"
         check["detail"] = (
             f"Claude quota rejected — Codex runtime switch requested at {switch.get('at')}. "
@@ -6015,6 +6044,15 @@ def check_quota_model_fallback() -> dict:
     mapped = ", ".join(f"{k}→{v}" for k, v in sorted(models.items()))
     low = fb.get("low_priority_tier")
     if tier in (2, 3):
+        at_tier = [w for w, ws in windows.items() if isinstance(ws, dict) and ws.get("tier") == tier]
+        if stale:
+            check["detail"] = (f"model fallback tier {tier} recorded ({fb.get('reason')}) but the record is {age_note} — "
+                               "no Claude traffic through the proxy since; stale, not alerting")
+            return check
+        passed = reset_passed(at_tier) if at_tier else None
+        if passed:
+            check["detail"] = f"model fallback tier {tier} recorded ({fb.get('reason')}) but its window reset at {passed} has passed — cleared"
+            return check
         check["status"] = "warn"
         check["detail"] = (
             f"model fallback tier {tier} since {fb.get('since')}: {fb.get('reason')}; "

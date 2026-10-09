@@ -425,6 +425,7 @@ model (above) is the way to keep going before then.
 While quota is high the proxy also rewrites the model requests run on (`skills/quota-tracker/SKILL.md`
 → "Model fallback"): `quota-state.json`'s `fallback.tier` / `fallback.active_model_map` say what is
 actually running, `health-check.py`'s `quota-model-fallback` probe reports it, and
-`python3 skills/quota-tracker/scripts/fallback-config.py show|set …` adjusts the thresholds. A
+`python3 skills/quota-tracker/scripts/fallback-config.py show|set …` adjusts the thresholds (per-host
+override under `<workspace>/hosts/<host>/`). A
 `fallback.runtime_switch.to == "codex"` means the unified quota was rejected and a Codex switch was
 requested — it is a manual step in this version.

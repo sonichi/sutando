@@ -54,6 +54,7 @@ export interface FallbackConfig {
 	level2Model: string;
 	level3Model: string;
 	familyLevels: Record<string, Level>;
+	dmMinIntervalSec: number; // at most one tier-change DM per window per this many seconds
 }
 
 export const DEFAULT_FALLBACK_CONFIG: FallbackConfig = {
@@ -72,6 +73,7 @@ export const DEFAULT_FALLBACK_CONFIG: FallbackConfig = {
 	level2Model: 'claude-opus-5-5',
 	level3Model: 'claude-sonnet-5',
 	familyLevels: { fable: 1, mythos: 1, opus: 2, sonnet: 3, haiku: 3 },
+	dmMinIntervalSec: 1800,
 };
 
 export interface Projection {
@@ -178,14 +180,25 @@ export function modelForLevel(level: Level, cfg: FallbackConfig): string | null 
 	return level === 2 ? cfg.level2Model : level === 3 ? cfg.level3Model : null;
 }
 
+/** A target model must be a Claude id whose family sits at exactly that level — a typo is refused, never routed. */
+export function validModelForLevel(model: string, level: Level, familyLevels: Record<string, Level>): boolean {
+	const { family, suffix } = splitModel(model);
+	return family !== null && suffix === '' && familyLevels[family] === level;
+}
+
+/** Where a tier is left. Bounded so the band never reaches below the next tier's own line. */
+export function clearLine(tier: Level, t: WindowThresholds, hysteresis: number): number {
+	if (tier === 3) return Math.max(t.level2 - hysteresis, t.level1);
+	return Math.max(t.level1 - hysteresis, 0);
+}
+
 /**
  * One window's next tier by thresholds. With hysteresis a tier is left only
- * below (threshold − hysteresis); a reset re-evaluates against the bare lines.
+ * below its clear line; a reset re-evaluates against the bare lines.
  */
 export function windowTier(prev: Level, usage: number, t: WindowThresholds, hysteresis: number, resetObserved: boolean): Level {
-	const threshold = (lvl: Level): number => (lvl === 3 ? t.level2 : t.level1);
 	let tier: Level = resetObserved ? 1 : prev;
-	while (tier > 1 && usage < threshold(tier) - hysteresis) tier = (tier - 1) as Level;
+	while (tier > 1 && usage < clearLine(tier, t, hysteresis)) tier = (tier - 1) as Level;
 	if (usage > t.level2) return 3;
 	if (usage > t.level1) return tier > 2 ? tier : 2;
 	return tier;
@@ -267,21 +280,23 @@ export function fiveHourTier(ws: WindowState, usage: number, t: WindowThresholds
 	let clear = resetObserved ? 0 : ws.clear_count;
 	let lastFail = resetObserved ? 0 : ws.last_fail_at;
 	const fails = proj !== null && proj.projected >= pcfg.limit;
+	const dwellCleared = (): boolean => clear >= pcfg.clearSamples && nowMs - lastFail >= pcfg.clearAfterSec * 1000;
 	if (usage > t.level2) {
 		tier = 3; clear = 0;
-	} else if (tier === 3 && usage >= t.level2 - hysteresis) {
+	} else if (tier === 3 && usage >= clearLine(3, t, hysteresis)) {
 		// hard-line hysteresis: hold
 	} else if (fails) {
 		clear = 0; lastFail = nowMs;
 		if (tier < 2) tier = 2;
 		else if (tier === 2 && nowMs - ws.tier_since >= pcfg.escalateAfterSec * 1000) tier = 3;
 	} else if (proj === null) {
-		tier = windowTier(tier, usage, t, hysteresis, false);
+		// No projection: the bare lines may raise at once, but lower only through the same dwell.
+		const byThreshold = windowTier(tier, usage, t, hysteresis, false);
+		if (byThreshold > tier) { tier = byThreshold; clear = 0; }
+		else { clear += 1; if (byThreshold < tier && dwellCleared()) { tier = (tier - 1) as Level; clear = 0; } }
 	} else {
 		clear += 1;
-		if (tier > 1 && clear >= pcfg.clearSamples && nowMs - lastFail >= pcfg.clearAfterSec * 1000) {
-			tier = (tier - 1) as Level; clear = 0;
-		}
+		if (tier > 1 && dwellCleared()) { tier = (tier - 1) as Level; clear = 0; }
 	}
 	return { tier, clear_count: clear, last_fail_at: lastFail, tier_since: tier !== ws.tier || resetObserved ? nowMs : ws.tier_since };
 }
@@ -431,40 +446,57 @@ export function requestPriority(headers: Record<string, string | string[] | unde
 	return String(Array.isArray(v) ? v[0] : v ?? '').trim().toLowerCase() === 'low' ? 'low' : 'normal';
 }
 
-const WINDOW_ZH: Record<Window, string> = { '5h': '5 小时窗口', '7d': '7 天窗口' };
-
 function hhmm(ms: number): string {
 	const d = new Date(ms);
 	return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-/**
- * The one owner-DM line for a transition, in the owner DM's language; null
- * when nothing the owner would act on changed.
- */
+/** The one owner-DM line for a transition; null when nothing the owner would act on changed. */
 export function transitionLine(prev: FallbackState | null, next: FallbackState, cfg: FallbackConfig): string | null {
 	const prevSwitch = prev?.runtime_switch?.to ?? null;
 	const nextSwitch = next.runtime_switch?.to ?? null;
 	if (prevSwitch !== nextSwitch && nextSwitch === 'codex') {
-		return 'Claude 额度已被拒绝（rejected），已记录切换 Codex 运行时的请求；当前版本只发信号、不会自动重启，请手动切换。';
+		return 'Claude quota rejected (status=rejected): a switch to the Codex runtime has been requested and recorded. '
+			+ 'This version only signals it — nothing restarts on its own; switch manually (core.runtime=codex, then `bash src/agent/start-cli.sh --restart`).';
 	}
 	if (prevSwitch !== nextSwitch && nextSwitch === 'claude') {
-		return 'Claude 额度窗口已恢复（allowed），Codex 切换请求已撤回。';
+		return 'Claude quota allowed again — the Codex runtime-switch request has been withdrawn.';
 	}
 	const prevTier = prev?.tier ?? 1;
 	if (next.tier === prevTier) return null;
 	if (next.tier === 1) {
-		return `额度回落（5 小时 ${pct(next.windows['5h'].utilization)}，7 天 ${pct(next.windows['7d'].utilization)}），已恢复主模型。`;
+		return `Quota eased (5h ${pct(next.windows['5h'].utilization)}, 7d ${pct(next.windows['7d'].utilization)}) — back on the primary models.`;
 	}
 	const f = next.fired;
-	if (!f) return `额度已切到 tier ${next.tier}。`;
-	const what = next.tier === 3 ? `已切到 ${cfg.level3Model} 兜底` : `Fable 请求已切到 ${cfg.level2Model}`;
+	if (!f) return `Quota fallback moved to tier ${next.tier}.`;
+	const what = next.tier === 3 ? `Fable and Opus requests now run on ${cfg.level3Model}` : `Fable requests now run on ${cfg.level2Model}`;
 	if (f.key === 'projection') {
-		const eta = f.eta_full !== null && f.eta_full !== undefined ? `预计 ${hhmm(f.eta_full)} 到 100%` : `预计重置时 ${pct(f.projected)}`;
-		return `5 小时窗口按当前速度会在重置前用完（${eta}），${what}；速度放缓后自动恢复（上限可用 fallback-config set 5h projection-limit 调整）。`;
+		const eta = f.eta_full !== null && f.eta_full !== undefined ? `100% expected at ${hhmm(f.eta_full)}` : `${pct(f.projected)} expected at the reset`;
+		return `Quota 5h window: at the current burn rate it runs out before the reset (${eta}) — ${what}; `
+			+ 'reverts once the rate slows (adjust with `fallback-config set 5h projection-limit <0..1>`).';
 	}
 	const usage = pct(next.windows[f.window].utilization);
-	const back = pct(f.threshold - cfg.hysteresis);
+	const back = pct(clearLine(next.tier, cfg.thresholds[f.window], cfg.hysteresis));
 	const adjust = `fallback-config set ${f.window} ${f.key} ${(f.threshold + 0.02).toFixed(2)}`;
-	return `额度 ${WINDOW_ZH[f.window]} ${usage} 超过 ${pct(f.threshold)} 阈值，${what}；回到 ${back} 以下自动恢复（阈值可用 ${adjust} 调整）。`;
+	return `Quota ${f.window} window ${usage} is over the ${pct(f.threshold)} line — ${what}; reverts below ${back} (move the line with \`${adjust}\`).`;
+}
+
+/** Owner-DM rate gate: at most one line per key per interval; held lines are summarised in the next one. */
+export interface DmGate {
+	last_sent: Record<string, number>;
+	held: Record<string, string[]>;
+}
+
+export function gateLine(gate: DmGate, key: string, line: string, nowMs: number, minIntervalMs: number): { gate: DmGate; send: string | null } {
+	const last = gate.last_sent[key];
+	const exempt = minIntervalMs <= 0 || key === 'runtime';
+	if (!exempt && last !== undefined && nowMs - last < minIntervalMs) {
+		return { gate: { ...gate, held: { ...gate.held, [key]: [...(gate.held[key] ?? []), line] } }, send: null };
+	}
+	const held = gate.held[key] ?? [];
+	const summary = held.length ? ` [${held.length} earlier change(s) held since the last message: ${held.join(' | ')}]` : '';
+	return {
+		gate: { last_sent: { ...gate.last_sent, [key]: nowMs }, held: { ...gate.held, [key]: [] } },
+		send: `${line}${summary}`,
+	};
 }

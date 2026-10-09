@@ -11,7 +11,7 @@ import type { request as httpsRequest } from 'node:https';
 import { createProxyServer, type ProxyDeps } from '../skills/quota-tracker/scripts/credential-proxy.ts';
 import { DEFAULT_FALLBACK_CONFIG, type FallbackConfig, type FallbackState } from '../skills/quota-tracker/scripts/quota-fallback-policy.ts';
 
-const NOW = 1_700_000_000_000;
+let NOW = 1_700_000_000_000;
 const servers: Server[] = [];
 afterEach(async () => {
 	await Promise.all(servers.splice(0).map((s) => new Promise((r) => s.close(r))));
@@ -107,7 +107,7 @@ test('at 0.50 the request goes upstream unchanged; at 0.86 the next Fable reques
 	assert.strictEqual(JSON.parse(h.seen[1].body).model, 'claude-fable-5-1[1m]', 'the response that crossed the line was already sent');
 	assert.strictEqual(h.recorded.at(-1)?.tier, 2);
 	assert.strictEqual(h.notified.length, 1);
-	assert.match(h.notified[0], /7 天窗口 86% 超过 85% 阈值/);
+	assert.match(h.notified[0], /^Quota 7d window 86% is over the 85% line — Fable requests now run on claude-opus-5-5/);
 
 	assert.strictEqual(await call(h.port, fable), 200);
 	const sent = h.seen[2];
@@ -133,7 +133,26 @@ test('above the 7d level2 line every Claude request above Sonnet runs on the lev
 	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
 	assert.strictEqual(JSON.parse(h.seen[1].body).model, 'claude-sonnet-5');
 	assert.strictEqual(JSON.parse(h.seen[2].body).model, 'claude-sonnet-5');
-	assert.match(h.notified[0], /已切到 claude-sonnet-5 兜底/);
+	assert.match(h.notified[0], /Fable and Opus requests now run on claude-sonnet-5/);
+});
+
+test('tier-change DMs are rate-limited per window: the second change inside the interval is held and summarised in the next one', async () => {
+	NOW = 1_700_000_000_000;
+	const h = await start({ ...CFG, dmMinIntervalSec: 1800 });
+	h.setUpstreamHeaders(H7('0.86'));
+	await call(h.port, '{"model":"claude-opus-5-5","messages":[]}');
+	NOW += 60_000;
+	h.setUpstreamHeaders(H7('0.50'));
+	await call(h.port, '{"model":"claude-opus-5-5","messages":[]}');
+	assert.strictEqual(h.notified.length, 1, 'the revert one minute later is held');
+	assert.strictEqual(h.recorded.at(-1)?.tier, 1, '...but the state still moved');
+	NOW += 1800_000;
+	h.setUpstreamHeaders(H7('0.96'));
+	await call(h.port, '{"model":"claude-opus-5-5","messages":[]}');
+	assert.strictEqual(h.notified.length, 2);
+	assert.match(h.notified[1], /^Quota 7d window 96% is over the 95% line/);
+	assert.match(h.notified[1], /\[1 earlier change\(s\) held since the last message: Quota eased \(5h 20%, 7d 50%\) — back on the primary models\.\]$/);
+	NOW = 1_700_000_000_000;
 });
 
 test('rejected: no model is swapped, the Codex runtime-switch request is recorded, and the owner is told once', async () => {
