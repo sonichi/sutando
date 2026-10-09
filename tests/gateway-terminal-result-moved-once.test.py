@@ -688,31 +688,70 @@ class TerminalResultMovedOnce(unittest.TestCase):
         rc, out = self._requeue_with(outbox_cli, lambda: outbox.record_delivered(self.outbox, TID))
         self.assertEqual(rc, 4)
         self.assertEqual(outbox.item_status(self.outbox, TID), 'DELIVERED', 'the peer\'s transition was overwritten')
-        self.assertEqual(out['result'], 'left-moved-on')
+        self.assertEqual(out['result'], 'requeued')
         self.assertEqual(self.quarantined_bodies(), ['BODY-A parked answer'])
 
-    def test_a_reply_published_while_queued_is_never_parked_by_the_rollback(self):
-        # The rollback leaves B live and the record QUEUED for the drain; which
-        # payload the drain then sends under this id is the outbox payload contract.
-        outbox_cli, result = self._parked_on_a_host_that_cannot_restore()
+    def _publish_b(self, result):
+        tmp = result.with_name('.producer.tmp')
+        tmp.write_text('BODY-B newer reply')
+        os.replace(tmp, result)
 
-        def publish_b():
-            tmp = result.with_name('.producer.tmp')
-            tmp.write_text('BODY-B newer reply')
-            os.replace(tmp, result)
-        rc, out = self._requeue_with(outbox_cli, publish_b)
+    def _drain_once_accepting(self):
+        """One real drain pass against a relay that now accepts."""
+        before = len(self.server.calls)
+        self.server.accepting = True
+        gw._post_ready_results({TID})
+        return self.server.calls[before:]
+
+    def _assert_b_was_offered_not_quarantined(self, result):
+        # The send carries the record's stored payload; which bytes a QUEUED id
+        # sends is the outbox payload contract, not this rollback's.
+        sent = self._drain_once_accepting()
+        self.assertEqual(len(sent), 1, 'B got no provider attempt')
+        self.assertEqual(outbox.item_status(self.outbox, TID), 'DELIVERED')
+        self.assertFalse(result.exists(), 'a delivered result stays rescannable')
+        self.assertNotIn('BODY-B newer reply', self.quarantined_bodies(), 'B was quarantined unsent')
+
+    def test_a_reply_published_before_the_failed_restore_returns_is_sent(self):
+        outbox_cli, result = self._parked_on_a_host_that_cannot_restore()
+        rc, out = self._requeue_with(outbox_cli, lambda: self._publish_b(result))
         self.assertEqual(rc, 4)
-        self.assertEqual(out['result'], 'left-live-result')
         self.assertEqual(outbox.item_status(self.outbox, TID), 'QUEUED', 'B was parked unsent')
         self.assertEqual(result.read_text(), 'BODY-B newer reply')
         self.assertEqual(self.quarantined_bodies(), ['BODY-A parked answer'])
+        self._assert_b_was_offered_not_quarantined(result)
 
-    def test_an_unrestorable_body_parks_its_own_queued_record_again(self):
-        outbox_cli, _ = self._parked_on_a_host_that_cannot_restore()
+    def test_a_reply_published_after_the_live_check_is_never_parked(self):
+        """B lands just before any PARKED write the requeue makes (between a
+        live-result check and its write); with no such write, after it returns."""
+        outbox_cli, result = self._parked_on_a_host_that_cannot_restore()
+        real_write, fired = outbox_cli.outbox._write_item, []
+
+        def write(root, item_id, d):
+            if d.get('status') == 'PARKED' and not fired:
+                fired.append(1)
+                self._publish_b(result)
+            return real_write(root, item_id, d)
+        with patch.object(outbox_cli.outbox, '_write_item', write):
+            rc, out = self._requeue_with(outbox_cli, lambda: None)
+        if not fired:
+            self._publish_b(result)
+        self.assertEqual(rc, 4)
+        self.assertEqual(outbox.item_status(self.outbox, TID), 'QUEUED', 'B was parked unsent')
+        self._assert_b_was_offered_not_quarantined(result)
+
+    def test_an_unrestorable_body_leaves_an_inert_queued_record(self):
+        """No live result, no send: the drain and the sweep act only on a
+        result file, and the body waits in undelivered/ for the operator."""
+        outbox_cli, result = self._parked_on_a_host_that_cannot_restore()
         rc, out = self._requeue_with(outbox_cli, lambda: None)
         self.assertEqual(rc, 4)
-        self.assertEqual(out['result'], 'requeue-undone')
-        self.assertEqual(outbox.item_status(self.outbox, TID), 'PARKED')
+        self.assertEqual(out['result'], 'requeued')
+        self.assertEqual(self._drain_once_accepting(), [])
+        gw._reconcile_orphan_results(set())
+        self.assertEqual(len(self.server.calls), 1, 'only the refused first attempt')
+        self.assertEqual(outbox.item_status(self.outbox, TID), 'QUEUED')
+        self.assertEqual(self.quarantined_bodies(), ['BODY-A parked answer'])
 
     def test_a_recovery_precheck_error_never_blocks_delivery(self):
         # EIO from the results-dir precheck, through the real drain entry:

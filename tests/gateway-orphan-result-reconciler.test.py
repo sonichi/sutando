@@ -646,6 +646,36 @@ class ReplacementAtTheMove(_Base):
         self.assertEqual(self.posted, [])
 
 
+class FallbackIsNotTheRequestedDisposition(ReplacementAtTheMove):
+    """The archive placement fails after A is claimed and B retakes the name:
+    A is kept in undelivered/, and the arm must say so rather than "moved aside"."""
+
+    def test_late_duplicate_kept_in_undelivered_is_reported_as_such(self):
+        import os
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
+        (gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt").write_text("the reply")
+        canonical = self._result("BODY-A duplicate")
+        real = gw.disposal._move_into_quarantine
+
+        def move(src, dst, log):
+            if Path(dst).parent == gw.ARCHIVE_RESULTS_DIR:
+                tmp = canonical.with_name(".producer.tmp")
+                tmp.write_text("BODY-B")
+                os.replace(tmp, canonical)
+                raise OSError(5, "EIO")
+            return real(src, dst, log)
+        with patch.object(gw.disposal, "_move_into_quarantine", move):
+            self._sweep()
+        self.assertEqual(canonical.read_text(), "BODY-B")
+        self.assertEqual(self._moved(gw.UNDELIVERABLE_RESULTS_DIR, f"{TID}*.txt"), ["BODY-A duplicate"])
+        self.assertEqual(self._moved(gw.ARCHIVE_RESULTS_DIR, f"{TID}-*-late-duplicate*.txt"), [])
+        self.assertFalse(any("moved aside" in l for l in self.logs), self.logs)
+        said = [l for l in self.logs if "was not moved to archive/" in l]
+        self.assertEqual(len(said), 1, self.logs)
+        self.assertIn("undelivered", said[0])
+        self.assertEqual(self.posted, [])
+
+
 class ReplacementBeforeTheRetire(ReplacementAtTheMove):
     """A producer replaces A with B after the arm classified A and before the
     owner touches the file: only A's generation may be retired, so B stays

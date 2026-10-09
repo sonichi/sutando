@@ -29,10 +29,8 @@ IN_QUARANTINE = {"fallback-links-then-unlinks", "place-replaces-a-taken-name",
                  "restore-trusts-the-link"}
 CLI = [REPO / "src" / "outbox_cli.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox_cli.py"]
 BRIDGE = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"]
-IN_CLI = {"cli-exits-0-on-no-safe-move"}
-IN_BRIDGE = {"orphan-links-then-unlinks"}
-OUTBOX = [REPO / "src" / "outbox.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox.py"]
-IN_OUTBOX = {"undo-parks-unconditionally", "undo-ignores-a-live-result"}
+IN_CLI = {"cli-exits-0-on-no-safe-move", "cli-reads-epoch-after-lock", "cli-parks-on-no-safe-move"}
+IN_BRIDGE = {"orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
 
 MUTANTS: dict[str, tuple[str, str, str]] = {
@@ -133,28 +131,54 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "    if True:\n        return RestoreOutcome.RESTORED, target\n"),
     "retire-recaptures-the-generation": (
         "an orphan retire binds to whatever is at the name when it takes the lock",
-        "    names = list(names)\n    with locked(results_dir):\n        return _retire(",
-        "    names = list(names)\n    with locked(results_dir):\n        _, generation = identity_of(rfile)\n"
-        "        return _retire("),
-    "undo-parks-unconditionally": (
-        "the requeue rollback parks whatever state a peer left",
-        "        if d.get(\"status\") != \"QUEUED\" or int(d.get(\"resend_epoch\", 0) or 0) != int(expect_epoch):\n"
-        "            return UndoOutcome.MOVED_ON\n",
-        "        if False:\n            return UndoOutcome.MOVED_ON\n"),
-    "undo-ignores-a-live-result": (
-        "the requeue rollback parks an item whose result is live",
-        "        if _claim_path(root, item_id).exists() or live_result():\n",
-        "        if False:\n"),
+        "        with locked(results_dir):\n            return _retire(",
+        "        with locked(results_dir):\n            _, generation = identity_of(rfile)\n"
+        "            return _retire("),
+    "missing-destination-is-source-gone": (
+        "a destination that is missing reads as nothing left to move",
+        "    except _SourceGone:\n        return _unless_replaced(",
+        "    except FileNotFoundError:\n        return _unless_replaced("),
+    "retire-ignores-a-post-move-replacement": (
+        "a reply published at the name after the move is not reported",
+        "    if os.path.lexists(rfile):\n        return done._replace(outcome=Retirement.REPLACEMENT_LIVE)\n",
+        "    if False:\n        return done._replace(outcome=Retirement.REPLACEMENT_LIVE)\n"),
+    "busy-lock-raises": (
+        "a busy disposal lock escapes the retirement as an exception",
+        "    except DisposalBusy as e:\n        return Retired(",
+        "    except ZeroDivisionError as e:\n        return Retired("),
+    "retire-fallback-reads-as-placed": (
+        "a body kept outside the requested directory is reported as placed",
+        "    if ended.parent != directory:\n",
+        "    if False:\n"),
+    "cli-parks-on-no-safe-move": (
+        "requeue parks the record again when the body could not be restored",
+        "            _emit(payload, args.json)\n            return 4\n",
+        "            outbox.park_item(args.root, args.item_id, \"requeue undone\")\n"
+        "            _emit(payload, args.json)\n            return 4\n"),
     "cli-exits-0-on-no-safe-move": (
         "requeue reports success when the body could not be restored",
         "            return 4\n",
         "            return 0\n"),
+    "cli-reads-epoch-after-lock": (
+        "requeue reads its rollback epoch after the transition's lock is released",
+        "            payload[\"resend_epoch\"] = epoch_written\n",
+        "            payload[\"resend_epoch\"] = outbox.resend_epoch_for(args.root, args.item_id)\n"),
+    "orphan-trusts-any-retirement": (
+        "an orphan arm counts any retirement outcome as its requested disposition",
+        "left in place\")\n    return done.retired\n",
+        "left in place\")\n    return True\n"),
+    "orphan-decodes-privately": (
+        "the orphan sweep decides readiness of the bytes it read by itself",
+        "        raw = ready_body_of(data)\n        if raw is None:\n",
+        "        try:\n            raw = data.decode(\"utf-8\").strip()\n"
+        "        except UnicodeDecodeError:\n            continue\n        if not raw:\n"),
     "orphan-links-then-unlinks": (
         "an orphan arm moves the canonical result itself: link, then unlink its name",
-        "        disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))\n",
+        "        done = disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))\n",
         "        Path(directory).mkdir(parents=True, exist_ok=True)\n"
         "        os.link(str(rfile), str(Path(directory) / next(_names(base))))\n"
-        "        Path(rfile).unlink()\n"),
+        "        Path(rfile).unlink()\n"
+        "        done = disposal.Retired(disposal.Retirement.PLACED)\n"),
 }
 
 
@@ -163,8 +187,6 @@ def _files(name: str) -> "list[Path]":
         return CLI
     if name in IN_BRIDGE:
         return BRIDGE
-    if name in IN_OUTBOX:
-        return OUTBOX
     return QUARANTINE if name in IN_QUARANTINE else DISPOSAL
 
 

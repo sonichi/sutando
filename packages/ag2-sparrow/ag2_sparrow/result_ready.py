@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 __all__ = ["read_ready_result", "read_ready_result_with_identity", "identity_of",
-           "is_ready_body", "ResultIdentity", "ReadyResult"]
+           "ready_body_of", "is_ready_body", "ResultIdentity", "ReadyResult"]
 
 
 class ResultIdentity(NamedTuple):
@@ -58,6 +58,16 @@ def is_ready_body(text: str | None) -> bool:
     return bool(text and text.strip())
 
 
+def ready_body_of(data: bytes) -> str | None:
+    """The deliverable body of bytes already read (one snapshot, e.g. from
+    `identity_of`), or None: a partial write mid-character, or blank."""
+    try:
+        body = data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    return body or None
+
+
 def read_ready_result(path: str | Path) -> str | None:
     """Return the stripped body of `path`, or None when it is not ready.
 
@@ -73,10 +83,7 @@ def read_ready_result_with_identity(path: str | Path) -> "ReadyResult | None":
     """`read_ready_result` plus the identity of the bytes it returned."""
     try:
         data, identity = identity_of(Path(path))
-        body = data.decode("utf-8")
-    except (OSError, UnicodeDecodeError):
-        # Missing, unreadable, or a partial write mid-character. Never
-        # deliverable, and readable again on a later pass.
-        return None
-    body = body.strip()
-    return ReadyResult(body, identity) if body else None
+    except OSError:
+        return None                     # missing or unreadable: readable again on a later pass
+    body = ready_body_of(data)
+    return ReadyResult(body, identity) if body is not None else None

@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 try:
     from .file_lock import lock_fd
@@ -918,6 +918,14 @@ class RequeueOutcome(str, Enum):
 def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
                  operator: Optional[str] = None,
                  reason: Optional[str] = None) -> RequeueOutcome:
+    """Operator recovery: PARKED -> QUEUED. See `requeue_item_with_epoch`."""
+    return requeue_item_with_epoch(root, item_id, reset_attempts=reset_attempts,
+                                   operator=operator, reason=reason)[0]
+
+
+def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = False,
+                            operator: Optional[str] = None,
+                            reason: Optional[str] = None) -> "tuple[RequeueOutcome, Optional[int]]":
     """Operator recovery: PARKED -> QUEUED as ONE atomic transition.
 
     Refuses anything not PARKED, which is what makes it idempotent AND keeps it
@@ -934,14 +942,17 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
     already at MAX_ATTEMPTS, the next failure re-parks it immediately; that is
     the intended "one more try" semantic, and --reset-attempts is the full
     budget.
+
+    Returns the epoch written under the lock (None unless REQUEUED): a later
+    read can see a peer's re-requeue, and a rollback keyed on it undoes theirs.
     """
     root = Path(root)
     with _item_lock(root, item_id):
         if not _item_path(root, item_id).exists():
-            return RequeueOutcome.ABSENT
+            return RequeueOutcome.ABSENT, None
         d = _read_item(root, item_id)
         if d.get("status") != "PARKED":
-            return RequeueOutcome.NOT_PARKED
+            return RequeueOutcome.NOT_PARKED, None
         _release_locked(root, item_id, force=True)
         d["resend_epoch"] = int(d.get("resend_epoch", 0) or 0) + 1
         d["status"] = "QUEUED"
@@ -953,33 +964,4 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
         _write_item(root, item_id, d)
-        return RequeueOutcome.REQUEUED
-
-
-class UndoOutcome(str, Enum):
-    """Why a requeue was or was not taken back; only UNDONE wrote anything."""
-
-    UNDONE = "undone"
-    MOVED_ON = "moved-on"            # not the QUEUED state the caller left: a peer's transition stands
-    LIVE_RESULT = "live-result"      # a result is live or being sent: it gets its delivery
-
-
-def undo_requeue(root: Path, item_id: str, *, expect_epoch: int, reason: str,
-                 live_result: Callable[[], bool]) -> UndoOutcome:
-    """Park an item again only if it is still exactly the QUEUED state the
-    caller saw (same resend epoch, no claim) and no result is live for it.
-    Checked and written under the item lock, so a peer's DELIVERED or a drain
-    that took the item is never overwritten."""
-    root = Path(root)
-    with _item_lock(root, item_id):
-        if not _item_path(root, item_id).exists():
-            return UndoOutcome.MOVED_ON
-        d = _read_item(root, item_id)
-        if d.get("status") != "QUEUED" or int(d.get("resend_epoch", 0) or 0) != int(expect_epoch):
-            return UndoOutcome.MOVED_ON
-        if _claim_path(root, item_id).exists() or live_result():
-            return UndoOutcome.LIVE_RESULT
-        d["status"] = "PARKED"
-        d["reason"] = reason
-        _write_item(root, item_id, d)
-        return UndoOutcome.UNDONE
+        return RequeueOutcome.REQUEUED, d["resend_epoch"]

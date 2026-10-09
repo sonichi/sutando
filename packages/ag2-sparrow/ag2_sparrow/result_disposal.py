@@ -44,6 +44,13 @@ tick for equal bytes still reads as the same publication, and an inode
 rewritten in place after the post-move check already sits in quarantine with
 the new bytes. The content survives either way; only a report can be wrong.
 
+`retire_generation` answers with a `Retired` record whose `outcome` is one
+`Retirement`: PLACED (in the requested directory, at `path`), SOURCE_GONE
+(nothing of it was left and nothing newer holds the name), REPLACEMENT_LIVE (a
+newer reply holds the name and stays live), FALLBACK (kept, but at `path`
+outside the requested directory, for `cause`) or FAILED (not moved; `cause`).
+Only PLACED and SOURCE_GONE are the requested disposition (`Retired.retired`).
+
 Dependency-light: the caller supplies its results directory and a log callback.
 """
 from __future__ import annotations
@@ -57,6 +64,7 @@ import stat as _stat
 import threading
 import time
 import uuid
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, NamedTuple, Optional
 
@@ -81,7 +89,8 @@ except ImportError:  # pragma: no cover
     from file_lock import lock_fd, unlock_fd
 
 __all__ = ["CLAIM_MAX_S", "LOCK_WAIT_S", "LOCK_NAME", "ACTIVE_CLAIMS",
-           "Claim", "GenerationReplaced", "KeptQuarantined", "DisposalBusy", "locked", "rename_noreplace",
+           "Claim", "GenerationReplaced", "KeptQuarantined", "DisposalBusy",
+           "Retirement", "Retired", "locked", "rename_noreplace",
            "self_token", "parse_claim", "find_claims", "find_malformed", "owner_holds",
            "quarantine_generation", "quarantine_current", "retire_generation", "put_back", "recover_claim", "recover_abandoned_claims",
            "disposed_copy_exists", "report_once"]
@@ -134,6 +143,31 @@ class KeptQuarantined(GenerationReplaced):
 
 class DisposalBusy(OSError):
     """The results directory's disposal lock stayed held for the whole wait."""
+
+
+class _SourceGone(FileNotFoundError):
+    """Nothing was at the name when the claim was taken; a missing destination
+    raises a plain FileNotFoundError instead."""
+
+
+class Retirement(str, Enum):
+    PLACED = "placed"
+    SOURCE_GONE = "source-gone"
+    REPLACEMENT_LIVE = "replacement-live"
+    FALLBACK = "fallback"
+    FAILED = "failed"
+
+
+class Retired(NamedTuple):
+    """How one retirement ended; `path` is where the retired generation is
+    now (None when it was not moved), `cause` why it is not where asked."""
+    outcome: Retirement
+    path: Optional[Path] = None
+    cause: str = ""
+
+    @property
+    def retired(self) -> bool:
+        return self.outcome in (Retirement.PLACED, Retirement.SOURCE_GONE)
 
 
 # One no-replace transition for every move into or out of undelivered/; the
@@ -393,7 +427,10 @@ def _quarantine_generation(results_dir: Path, rfile: Path, generation: ResultIde
     ACTIVE_CLAIMS.add(str(claim))
     undone = False
     try:
-        os.rename(rfile, claim)                       # FileNotFoundError: nothing there
+        try:
+            os.rename(rfile, claim)
+        except FileNotFoundError as e:
+            raise _SourceGone(str(rfile)) from e
         try:
             fd = os.open(claim, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             try:
@@ -442,22 +479,50 @@ def quarantine_current(results_dir: Path, rfile: Path, log: Log) -> Path:
 
 
 def retire_generation(results_dir: Path, rfile: Path, generation: ResultIdentity, log: Log,
-                      directory: Path, names: "Iterable[str]") -> Path:
+                      directory: Path, names: "Iterable[str]") -> Retired:
     """Move `rfile` into `directory` under the first free of `names` only if it
     still IS `generation`, the publication the caller read and acted on. A
-    reply that replaced it meanwhile stays live; raises GenerationReplaced or
-    FileNotFoundError when nothing of that publication is left to move."""
+    reply found at the name, before the move or after it, stays live. Never
+    raises for a filesystem outcome: the `Retired` record says what happened."""
     names = list(names)
-    with locked(results_dir):
-        return _retire(Path(results_dir), Path(rfile), generation, log, directory, names)
+    try:
+        with locked(results_dir):
+            return _retire(Path(results_dir), Path(rfile), generation, log, Path(directory), names)
+    except DisposalBusy as e:
+        return Retired(Retirement.FAILED, None, f"the disposal lock is busy ({e})")
 
 
 def _retire(results_dir: Path, rfile: Path, generation: ResultIdentity, log: Log,
-            directory: Path, names: "list[str]") -> Path:
-    return _quarantine_generation(
-        results_dir, rfile, generation, log,
-        lambda src: undelivered_quarantine.place_as(
-            src, directory, names, lambda s, d: _move_into_quarantine(s, d, log)))
+            directory: Path, names: "list[str]") -> Retired:
+    try:
+        ended = Path(_quarantine_generation(
+            results_dir, rfile, generation, log,
+            lambda src: undelivered_quarantine.place_as(
+                src, directory, names, lambda s, d: _move_into_quarantine(s, d, log))))
+    except KeptQuarantined:
+        return Retired(Retirement.FAILED, None, "a newer reply found at its name was kept in "
+                       f"{undelivered_quarantine.DIRNAME}/ (no no-replace rename here)")
+    except GenerationReplaced:
+        return Retired(Retirement.REPLACEMENT_LIVE)
+    except _SourceGone:
+        return _unless_replaced(rfile, Retired(Retirement.SOURCE_GONE))
+    except OSError as e:
+        return Retired(Retirement.FAILED, None, f"it could not be placed in {directory.name}/ ({e})")
+    if ended.parent != directory:
+        if ended == rfile:
+            return Retired(Retirement.FAILED, None,
+                           f"it could not be placed in {directory.name}/ and no copy was kept elsewhere")
+        return Retired(Retirement.FALLBACK, ended,
+                       f"it could not be placed in {directory.name}/ and was kept as "
+                       f"{ended.parent.name}/{ended.name}")
+    return _unless_replaced(rfile, Retired(Retirement.PLACED, ended))
+
+
+def _unless_replaced(rfile: Path, done: Retired) -> Retired:
+    """A reply published at the name while this one moved is newer and unsent."""
+    if os.path.lexists(rfile):
+        return done._replace(outcome=Retirement.REPLACEMENT_LIVE)
+    return done
 
 
 def put_back(claim: Path, rfile: Path, log: Optional[Log] = None) -> bool:

@@ -84,14 +84,13 @@ def cmd_inspect(args) -> int:
 
 def cmd_requeue(args) -> int:
     """Exit 0 only when this call performed the transition; 3 = nothing to do;
-    4 = the body could not be restored on this host (the item is parked again
-    unless a peer moved it on or a result is live for it).
+    4 = the body could not be restored on this host (the record is left as
+    the requeue made it; the body stays listed in undelivered/).
 
     A distinct code matters for the idempotent re-run: "already queued" is not
     a failure, and a script must be able to tell it from "I recovered it".
     """
-    before = outbox.read_item(args.root, args.item_id) or {}
-    result = outbox.requeue_item(
+    result, epoch_written = outbox.requeue_item_with_epoch(
         args.root, args.item_id,
         reset_attempts=args.reset_attempts,
         operator=args.operator or _default_operator(),
@@ -106,7 +105,7 @@ def cmd_requeue(args) -> int:
         payload["body"] = "not-restored: delivered"
     elif result in (outbox.RequeueOutcome.REQUEUED, outbox.RequeueOutcome.NOT_PARKED):
         if result is outbox.RequeueOutcome.REQUEUED:
-            payload["resend_epoch"] = outbox.resend_epoch_for(args.root, args.item_id)
+            payload["resend_epoch"] = epoch_written
         results_dir = args.results_dir or Path(args.root).parent
         body_id = getattr(args, "body_id", None) or args.item_id
         outcome, path = undelivered_quarantine.restore(results_dir, body_id)
@@ -115,17 +114,12 @@ def cmd_requeue(args) -> int:
         payload["body_path"] = str(path) if path else None
         restored = outcome is undelivered_quarantine.RestoreOutcome.RESTORED
         if outcome is undelivered_quarantine.RestoreOutcome.NO_SAFE_MOVE:
-            # A QUEUED record with no body would read as recovered and never send.
-            epoch = (payload["resend_epoch"] if result is outbox.RequeueOutcome.REQUEUED
-                     else int(before.get("resend_epoch", 0) or 0))
-            undo = outbox.undo_requeue(
-                args.root, args.item_id, expect_epoch=epoch,
-                reason="requeue undone: the body could not be restored on this host",
-                live_result=undelivered_quarantine.canonical_result(results_dir, body_id).exists)
-            payload["result"] = ("requeue-undone" if undo is outbox.UndoOutcome.UNDONE
-                                 else f"left-{undo.value}")
+            # Left QUEUED, never parked again: a reply published under this id meanwhile
+            # must still be sent, and the drain only acts on a live result.
             payload["error"] = (f"the quarantined body {path} could not be moved back on this host; "
-                                "it is untouched — copy it to the results directory by hand")
+                                "it is untouched and the item stays queued — copy it to "
+                                f"{undelivered_quarantine.canonical_result(results_dir, body_id)} "
+                                "by hand, or re-run this requeue where a no-replace rename works")
             _emit(payload, args.json)
             return 4
     _emit(payload, args.json)

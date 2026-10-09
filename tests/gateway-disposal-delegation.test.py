@@ -928,6 +928,132 @@ class CoreContract(unittest.TestCase):
         self.assertIn("never verified", self.lines[0])
 
 
+class RetirementOutcome(unittest.TestCase):
+    """`retire_generation` names how it ended; only PLACED and SOURCE_GONE are
+    the requested disposition."""
+
+    setUp = CoreContract.setUp
+    result = CoreContract.result
+    quarantined = CoreContract.quarantined
+
+    def retire(self, r, gen, directory=None):
+        directory = directory or self.results / "archive"
+        return disposal.retire_generation(self.results, r, gen, self.lines.append,
+                                          directory, ["task-a-x.txt", "task-a-y.txt"])
+
+    def publish(self, r, body):
+        tmp = r.with_name(".producer.tmp")
+        tmp.write_text(body)
+        os.replace(tmp, r)
+
+    def test_placed(self):
+        r = self.result()
+        _, gen = identity_of(r)
+        done = self.retire(r, gen)
+        self.assertIs(done.outcome, disposal.Retirement.PLACED)
+        self.assertEqual(done.path, self.results / "archive" / "task-a-x.txt")
+        self.assertTrue(done.retired)
+
+    def test_source_gone(self):
+        r = self.result()
+        _, gen = identity_of(r)
+        r.unlink()
+        done = self.retire(r, gen)
+        self.assertIs(done.outcome, disposal.Retirement.SOURCE_GONE)
+        self.assertTrue(done.retired)
+
+    def test_a_missing_destination_is_failed_not_source_gone(self):
+        r = self.result()
+        _, gen = identity_of(r)
+        with unittest.mock.patch.object(disposal, "_move_into_quarantine",
+                                        side_effect=FileNotFoundError(errno.ENOENT, "no such dir")):
+            done = self.retire(r, gen)
+        self.assertIs(done.outcome, disposal.Retirement.FAILED)
+        self.assertFalse(done.retired)
+        self.assertEqual(r.read_text(), "answer", "the body goes back live")
+
+    def test_a_reply_published_after_the_move_is_replacement_live(self):
+        r = self.result()
+        _, gen = identity_of(r)
+        real = disposal._move_into_quarantine
+
+        def move_then_publish(src, dst, log):
+            real(src, dst, log)
+            self.publish(r, "BODY-B")
+        with unittest.mock.patch.object(disposal, "_move_into_quarantine", move_then_publish):
+            done = self.retire(r, gen)
+        self.assertIs(done.outcome, disposal.Retirement.REPLACEMENT_LIVE)
+        self.assertFalse(done.retired)
+        self.assertEqual(r.read_text(), "BODY-B")
+        self.assertEqual(done.path.read_text(), "answer")
+
+    def test_a_replacement_before_the_claim_is_replacement_live(self):
+        r = self.result()
+        _, gen = identity_of(r)
+        self.publish(r, "BODY-B")
+        done = self.retire(r, gen)
+        self.assertIs(done.outcome, disposal.Retirement.REPLACEMENT_LIVE)
+        self.assertEqual(r.read_text(), "BODY-B")
+
+    def test_a_busy_lock_is_failed_and_does_not_raise(self):
+        import contextlib
+
+        @contextlib.contextmanager
+        def busy(_results_dir):
+            raise disposal.DisposalBusy(errno.EAGAIN, "held")
+            yield
+        r = self.result()
+        _, gen = identity_of(r)
+        with unittest.mock.patch.object(disposal, "locked", busy):
+            done = self.retire(r, gen)
+        self.assertIs(done.outcome, disposal.Retirement.FAILED)
+        self.assertIn("busy", done.cause)
+        self.assertEqual(r.read_text(), "answer")
+
+    def test_a_placement_that_falls_back_is_fallback_with_its_real_destination(self):
+        r = self.result()
+        _, gen = identity_of(r)
+        real = disposal._move_into_quarantine
+
+        def refuse_archive(src, dst, log):
+            if Path(dst).parent.name == "archive":
+                self.publish(r, "BODY-B")
+                raise OSError(errno.EIO, "EIO")
+            return real(src, dst, log)
+        with unittest.mock.patch.object(disposal, "_move_into_quarantine", refuse_archive):
+            done = self.retire(r, gen)
+        self.assertIs(done.outcome, disposal.Retirement.FALLBACK)
+        self.assertFalse(done.retired)
+        self.assertEqual(done.path.parent.name, "undelivered")
+        self.assertEqual(done.path.read_text(), "answer")
+        self.assertIn(done.path.name, done.cause)
+        self.assertEqual(r.read_text(), "BODY-B")
+
+    def test_a_newer_reply_kept_quarantined_without_a_primitive_is_failed(self):
+        r = self.result()
+        _, gen = identity_of(r)
+        self.publish(r, "BODY-B")
+        with unittest.mock.patch.object(disposal.undelivered_quarantine, "_RENAME", None), \
+                unittest.mock.patch.object(disposal.undelivered_quarantine, "RENAME_PRIMITIVE", "none"):
+            done = self.retire(r, gen)
+        self.assertIs(done.outcome, disposal.Retirement.FAILED)
+        self.assertIn("newer reply", done.cause)
+        self.assertEqual([p.read_text() for p in self.quarantined()], ["BODY-B"])
+
+    def test_a_placement_with_nothing_kept_anywhere_is_failed(self):
+        r = self.result()
+        _, gen = identity_of(r)
+
+        def refuse(src, dst, log):
+            self.publish(r, "BODY-B")
+            raise OSError(errno.EIO, "EIO")
+        with unittest.mock.patch.object(disposal, "_move_into_quarantine", refuse), \
+                unittest.mock.patch.object(disposal, "_recover_claim", return_value=None):
+            done = self.retire(r, gen)
+        self.assertIs(done.outcome, disposal.Retirement.FAILED)
+        self.assertIn("no copy was kept", done.cause)
+
+
 class BridgeDelegates(unittest.TestCase):
     def setUp(self):
         self.tree = ast.parse(BRIDGE.read_text())

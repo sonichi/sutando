@@ -312,7 +312,7 @@ from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core.provider_ag2space import AG2SpaceResultProvider
 from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
-                           ResultIdentity)
+                           ready_body_of, ResultIdentity)
 from . import result_disposal as disposal
 from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
@@ -4892,15 +4892,18 @@ def _names(base: str, tries: int = 64):
 
 def _retire_orphan(rfile, directory, base: str, generation) -> bool:
     """The lifecycle owner moves the generation this pass classified; a reply
-    that replaced it since stays live. False when nothing of it was moved."""
+    that replaced it since stays live. True only for the requested disposition."""
+    stem = Path(rfile).stem
     try:
-        disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))
-        return True
-    except (disposal.GenerationReplaced, FileNotFoundError):
-        return False
+        done = disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))
     except OSError as e:
-        _log(f"orphan sweep: {Path(rfile).stem} could not be moved ({e}); left in place")
+        _log(f"orphan sweep: {stem} could not be moved ({e}); left in place")
         return False
+    if done.outcome is disposal.Retirement.FALLBACK:
+        _log(f"orphan sweep: {stem} was not moved to {Path(directory).name}/: {done.cause}")
+    elif done.outcome is disposal.Retirement.FAILED:
+        _log(f"orphan sweep: {stem} could not be moved ({done.cause}); left in place")
+    return done.retired
 
 
 def _quarantine_orphan(rfile, tid: str, reason: str, generation) -> bool:
@@ -4970,12 +4973,9 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # Genuinely undelivered: ONE labeled attempt — at-least-once by
         # design; the label makes the rare duplicate self-explaining.
-        try:
-            raw = data.decode("utf-8").strip()
-        except UnicodeDecodeError:
-            continue                            # a partial write: readable on a later pass
-        if not raw:
-            continue
+        raw = ready_body_of(data)
+        if raw is None:
+            continue                            # blank or a partial write: readable on a later pass
         delivery = _delivery_tid(tid)
         if delivery is None:
             continue                            # alias ledger unreadable: retry later
