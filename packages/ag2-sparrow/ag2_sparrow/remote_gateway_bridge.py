@@ -4178,7 +4178,8 @@ def _delivery_core() -> DeliveryCore:
     return _DELIVERY_CORE
 
 
-def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None) -> None:
+def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
+                            since_ns=None) -> None:
     """Move a result the outbox has finally refused into results/undelivered/,
     the same quarantine the proactive path uses. Without this the file is
     rescanned every pass and the refusal is invisible.
@@ -4194,9 +4195,22 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None) -> N
              f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
              f"requeue {outbox_item_id or _broker_tid(_delivery_tid(tid) or tid)} --reset-attempts "
              f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
+    except FileNotFoundError:
+        # Two observers can reach a terminal item at once; the loser is quiet
+        # only once the winner's copy is verifiably in quarantine.
+        if since_ns is not None and not Path(rfile).exists() \
+                and _quarantined_since(tid, since_ns):
+            return
+        _log(f"result {tid}: {why} but the result file vanished before "
+             "quarantine and no quarantined copy was found")
     except OSError as e:
         _log(f"result {tid}: {why} but quarantine failed ({e}) — "
              "leaving it in place")
+
+
+def _quarantined_since(tid: str, since_ns: int) -> bool:
+    copies = undelivered_quarantine.find_quarantined(RESULTS_DIR, tid)
+    return bool(copies) and int(copies[-1].stem.rsplit("-", 1)[-1]) >= since_ns
 
 
 def _is_worker_id(value: str) -> bool:
@@ -4426,6 +4440,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     gateway confirmed (server lease closed; caller archives). False = not
     confirmed this pass; leave the result file for the next one."""
     core = _delivery_core()
+    started = time.time_ns()
     # `no_send` is the broker's STRUCTURED suppression field: the lease must
     # close without a user-facing send. It rides the payload, not the body.
     doc = {"id": broker_tid, "body": body}
@@ -4449,9 +4464,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["metadata"] = {"worker_id": worker}
         _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
-    accepted = (read_item(core.backend.root, broker_tid) or {}) if no_send else {}
-    item_id = (f"{broker_tid}.lease-close"
-               if accepted.get("status") == "DELIVERED" else broker_tid)
+    item_id = _effective_item_id(core, broker_tid, no_send)
     if item_id != broker_tid:
         core.backend.publish(item_id, payload, republish_delivered=True)
     else:
@@ -4463,7 +4476,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
             return True
         # The outbox has decided this item; no pass will ever claim it again,
         # so retrying logs forever and hides the failure behind "will retry".
-        _dispose_terminal(core, item_id, tid, record, result_file)
+        _dispose_terminal(core, item_id, tid, record, result_file, started)
         return False
     if res.status is DrainStatus.NOT_CLAIMED:
         # A dead prior incarnation's claim; reclaim-TTL recovers it, and
@@ -4486,7 +4499,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     if record.get("status") == "PARKED":
         # Parked by this very attempt: dispose now, or the next pass logs the
         # refusal a second time before the file leaves the drain's view.
-        _dispose_terminal(core, item_id, tid, record, result_file)
+        _dispose_terminal(core, item_id, tid, record, result_file, started)
         return False
     retry = record.get("retry", {})
     _log(f"result POST not confirmed for {tid} "
@@ -4496,11 +4509,20 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     return False
 
 
-def _dispose_terminal(core, item_id: str, tid: str, record: dict, result_file) -> None:
+def _effective_item_id(core, broker_tid: str, no_send: bool) -> str:
+    """A suppressed close for an already-delivered item rides its own record."""
+    accepted = (read_item(core.backend.root, broker_tid) or {}) if no_send else {}
+    return (f"{broker_tid}.lease-close"
+            if accepted.get("status") == "DELIVERED" else broker_tid)
+
+
+def _dispose_terminal(core, item_id: str, tid: str, record: dict, result_file,
+                      since_ns=None) -> None:
     why = (f"outbox item is terminal: {record.get('reason')} after "
            f"{core.backend.attempts(item_id)} attempt(s)")
     if result_file is not None:
-        _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id)
+        _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id,
+                                since_ns=since_ns)
     else:
         _log(f"result {tid}: {why} — not retrying")
 
@@ -4951,9 +4973,10 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             _archive_result(rfile, tid)
             _log(f"orphan sweep: recovered + gateway accepted {tid}; Matrix delivery unconfirmed")
             continue
-        if _delivery_core().backend.is_terminal(_btid):
+        _item = _effective_item_id(_delivery_core(), _btid, bool(skip))
+        if _delivery_core().backend.is_terminal(_item):
             continue                            # disposed and logged by the delivery call
-        _tries = _delivery_core().backend.attempts(_btid)
+        _tries = _delivery_core().backend.attempts(_item)
         _log(f"orphan sweep: {tid} close not confirmed (attempt {_tries}) — will retry")
 
 

@@ -142,6 +142,70 @@ class TerminalResultMovedOnce(unittest.TestCase):
             gw._post_ready_results(inflight)
         self.assert_once(result, 'lease close')
 
+    def test_competing_observers_dispose_once(self):
+        # The parking pass pauses after its record reads PARKED while a second
+        # observer claims TERMINAL and quarantines first; the loser stays quiet.
+        import threading
+        self.bridge()
+        self.task()
+        result = self.result()
+        payload = f'{{"id": "{TID}", "body": "Existing answer"}}'
+        parked = threading.Event()
+        released = threading.Event()
+        first = threading.current_thread()
+        real_read = gw.read_item
+
+        def paused_read(root, item_id):
+            rec = real_read(root, item_id)
+            if (threading.current_thread() is not first and not parked.is_set()
+                    and (rec or {}).get('status') == 'PARKED'):
+                parked.set()
+                released.wait(5)
+            return rec
+
+        with patch.object(gw, 'read_item', paused_read):
+            loser = threading.Thread(target=gw._deliver_result_payload,
+                                     args=(TID, TID, 'Existing answer'),
+                                     kwargs=dict(result_file=result))
+            loser.start()
+            self.assertTrue(parked.wait(5), 'the first observer never parked the item')
+            gw._deliver_result_payload(TID, TID, 'Existing answer', result_file=result)
+            released.set()
+            loser.join(5)
+        self.assertFalse(loser.is_alive())
+        self.assertEqual(len(self.server.calls), 1)
+        self.assert_once(result, 'competing observers')
+        self.assertFalse(any('vanished' in l or 'leaving it in place' in l for l in self.about()),
+                         '\n'.join(self.about()))
+
+    def test_lease_close_retry_is_not_silenced_by_a_delivered_base_item(self):
+        # A [no-send] close for a delivered item is its own record: while it
+        # retries, the sweep must say so instead of reading the base as terminal.
+        self.server.request = lambda method, path, payload: {'ok': True}
+        core = self.core()
+        payload = b'{"id": "%s", "body": "Existing answer"}' % TID.encode()
+        core.backend.publish(TID, payload)
+        core.deliver_one(TID, payload)
+        self.assertEqual(outbox.read_item(core.backend.root, TID)['status'], 'DELIVERED')
+        self.bridge(core)
+        self.task()
+        result = self.result('[no-send]\ninternal, nothing to say')
+        import os
+        old = self.server.now
+        os.utime(result, (old, old))
+
+        def flaky(method, path, payload):
+            self.server.calls.append(dict(payload))
+            raise urllib.error.HTTPError('https://gateway.invalid', 503, 'busy', None, None)
+        with patch.object(core.provider, '_request', flaky), patch.object(gw, '_req', flaky), \
+                patch.object(gw.time, 'time', lambda: old + gw.ORPHAN_GRACE_S + 60):
+            gw._last_orphan_sweep = 0.0
+            gw._reconcile_orphan_results(set())
+        self.assertTrue(result.exists(), 'a retryable close must keep its result')
+        self.assertFalse(core.backend.is_terminal(f'{TID}.lease-close'))
+        self.assertTrue(any('will retry' in l for l in self.about()),
+                        'sweep stayed quiet for a retryable lease-close:\n' + '\n'.join(self.about()))
+
     def test_orphan_sweep_moves_and_logs_once(self):
         self.bridge()
         self.task()
