@@ -310,5 +310,85 @@ class TestTransportDelegation(unittest.TestCase):
         r.assert_called_once_with(ROOM, SELF, 5)
 
 
+class TestCliAndEdges(unittest.TestCase):
+    def _cli(self, *argv, transport=None, env=None):
+        out = io.StringIO()
+        clean = {k: v for k, v in os.environ.items() if k not in CONFIG_KEYS}
+        with mock.patch.dict(os.environ, {**clean, policy.CONFIG_ROOM: ROOM, **(env or {})},
+                             clear=True), contextlib.redirect_stdout(out):
+            rc = cli.main(list(argv), transport=transport, workspace=Path(tempfile.gettempdir()))
+        return rc, json.loads(out.getvalue())
+
+    def _files(self, tmp, task_text):
+        q, t = Path(tmp) / "q.txt", Path(tmp) / "t.txt"
+        q.write_text("is the build host up?", encoding="utf-8")
+        t.write_text(task_text, encoding="utf-8")
+        return str(q), str(t)
+
+    def test_cli_ask_answers_through_every_gate(self):
+        tr = FakeTransport(replies=[{"sender": SIB, "body": "up", "event_id": "$r", "ts": 9e12}])
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(cli, "load_map", return_value=(ENTS, {})):
+            q, t = self._files(tmp, task())
+            rc, res = self._cli("ask", "--agent", SELF, "--agent-to", SIB, "--domain", "build host",
+                                "--question-file", q, "--task-file", t, transport=tr)
+        self.assertTrue(res["answered"], res)
+        self.assertEqual(res["reply_text"], "up")
+
+    def test_cli_ask_unreadable_input_and_refused_roster(self):
+        rc, res = self._cli("ask", "--agent", SELF, "--agent-to", SIB, "--domain", "x",
+                            "--question-file", "/nonexistent/q", "--task-file", "/nonexistent/t",
+                            transport=FakeTransport())
+        self.assertIn("unreadable input", res["reason"])
+        tr = FakeTransport()
+        tr._members.append({"user_id": STRANGER, "kind": "human"})
+        rc, res = self._cli("roster", "--agent", SELF, transport=tr)
+        self.assertFalse(res["ok"])
+        self.assertIn(STRANGER, res["reason"])
+
+    def test_missing_room_ops_is_named(self):
+        with mock.patch.object(cli, "ROOM_OPS_DIR", Path(tempfile.gettempdir()) / "absent-skill"):
+            rc, res = self._cli("roster", "--agent", SELF)
+        self.assertIn("agent-room-ops", res["reason"])
+
+    def test_map_and_workspace_resolve_through_their_owners(self):
+        with mock.patch.object(cli, "CI_SCRIPTS_DIR", Path(tempfile.gettempdir()) / "absent-skill"):
+            self.assertEqual(cli.load_map(Path(tempfile.gettempdir())), ([], {}))
+        with mock.patch("workspace_default.resolve_workspace", return_value=Path("/ws")) as rw:
+            self.assertEqual(cli._workspace(), Path("/ws"))
+        rw.assert_called_once_with(migrate=False)
+
+    def test_config_edges(self):
+        self.assertEqual(policy.manifest_config(Path(tempfile.gettempdir()) / "absent.json"), {})
+        self.assertEqual(policy.config_value(policy.CONFIG_ROOM, cli=" !r:x ", environ={}), "!r:x")
+        s = policy.settings(environ={policy.CONFIG_ROOM: ROOM, policy.CONFIG_MAX_WAIT: "soon"},
+                            manifest_cfg={})
+        self.assertEqual(s["max_wait_s"], policy.DEFAULT_MAX_WAIT_S)
+
+    def test_guard_edges(self):
+        tr = FakeTransport()
+        tr.agents = lambda: {"ok": False, "reason": "503"}
+        self.assertIn("registry unreadable", policy.guard(ROOM, SELF, tr)["reason"])
+        tr = FakeTransport(members=[{"user_id": OWNER, "kind": "human"}])
+        self.assertIn("not a member", policy.guard(ROOM, SELF, tr)["reason"])
+
+    def test_map_reading_edges(self):
+        ents = ["junk", {"entity_id": "e", "identities": [{"user_id": SIB}], "roles": ["release"]}]
+        quick = {"recent_entities": [{"entity_id": "e", "one_line": "ships builds"},
+                                     {"agent_mxid": SIB}, "junk"]}
+        self.assertEqual(policy.domains_for(SIB, ents, quick), ["release", "ships builds"])
+        self.assertIsNone(policy._ts_ms("2026-01-01"))
+
+    def test_consult_edges(self):
+        self.assertIn("empty question", run_consult(FakeTransport(), question="  ")["reason"])
+        tr = FakeTransport()
+        tr.mention = lambda mxid, body, room: {"ok": False, "reason": "gate denied"}
+        self.assertIn("ask not posted: gate denied", run_consult(tr)["reason"])
+        tr = FakeTransport()
+        tr.read = lambda room, limit: {"ok": False, "reason": "network error"}
+        res = run_consult(tr, max_wait=10)
+        self.assertIn("last read error: network error", res["reason"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
