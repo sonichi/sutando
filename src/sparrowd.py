@@ -36,11 +36,19 @@ def _skill_manifests(workspace=None) -> list:
         except OSError:
             continue  # an unreadable root is skipped, never fatal to the supervisor
         # Only a real skill claims its name, as in skills/install.sh; a leftover folder does not.
-        skills = [d for d in skills if (d / "manifest.json").is_file() or (d / "SKILL.md").is_file()]
-        found += [d / "manifest.json" for d in skills
-                  if d.name not in taken and (d / "manifest.json").is_file()]
-        taken |= {d.name for d in skills}
+        probed = [(d, _has(d, "manifest.json")) for d in skills]
+        probed = [(d, m) for d, m in probed if m or _has(d, "SKILL.md")]
+        found += [d / "manifest.json" for d, m in probed if m and d.name not in taken]
+        taken |= {d.name for d, _ in probed}
     return found
+
+
+def _has(skill_dir, name) -> bool:
+    """Whether skill_dir holds the file; an unreadable folder holds nothing (older Pythons raise EACCES)."""
+    try:
+        return (skill_dir / name).is_file()
+    except OSError:
+        return False
 
 
 def _skill_worker_specs() -> "tuple[list, list[str]]":

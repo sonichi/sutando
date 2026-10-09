@@ -198,6 +198,48 @@ def guarded_scan(mod):
                     os.environ[k] = v
 
 
+def locked_skill_folder(mod):
+    """One unreadable skill folder inside a readable root is skipped; its siblings still load."""
+    import tempfile
+    print("── an unreadable skill folder ──")
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        print("  skip: running as root, chmod 000 does not restrict")
+        return
+    saved_repo, saved_ext = mod.REPO, os.environ.get("SUTANDO_EXTERNAL_PLUGIN_DIRS")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        engine, ws = tmp / "engine" / "sutando", tmp / "workspace"
+        (engine / "skills").mkdir(parents=True)
+        for name in ("good", "lockedskill"):
+            (ws / "skills" / name).mkdir(parents=True)
+            (ws / "skills" / name / "manifest.json").write_text("{}", encoding="utf-8")
+        locked = ws / "skills" / "lockedskill"
+        mod.REPO = engine
+        os.environ.pop("SUTANDO_EXTERNAL_PLUGIN_DIRS", None)
+        locked.chmod(0)
+        try:
+            try:
+                (locked / "manifest.json").is_file()
+                probe_raises = False
+            except OSError:
+                probe_raises = True
+            if not probe_raises and os.access(locked, os.R_OK | os.X_OK):
+                print("  skip: chmod 000 does not restrict on this platform")
+                return
+            print(f"  (this python {'raises' if probe_raises else 'does not raise'} on a locked folder's probe)")
+            try:
+                found, raised = [m.parent.name for m in mod._skill_manifests(workspace=ws)], None
+            except OSError as exc:
+                found, raised = [], exc
+            check("an unreadable skill folder is skipped, not fatal", raised is None, repr(raised))
+            check("...and the readable sibling skill still loads", found == ["good"], str(found))
+        finally:
+            locked.chmod(0o755)
+            mod.REPO = saved_repo
+            if saved_ext is not None:
+                os.environ["SUTANDO_EXTERNAL_PLUGIN_DIRS"] = saved_ext
+
+
 def main() -> int:
     mod = load()
     check("core names no concrete skill",
@@ -297,6 +339,7 @@ def main() -> int:
     workspace_skills(mod)
     outside_the_engine(mod)
     guarded_scan(mod)
+    locked_skill_folder(mod)
 
     print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all sparrowd skill-worker checks ok'}")
     return 1 if FAILS else 0
