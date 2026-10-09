@@ -145,6 +145,9 @@ resolve_claude_credential_proxy
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
 fi
+# Ceiling on one foreground Bash call: when it is reached Claude Code moves the
+# command to the background and the turn continues. A caller-set value wins.
+ENV_ARGS+=(-e "BASH_MAX_TIMEOUT_MS=${BASH_MAX_TIMEOUT_MS:-120000}")
 # Test probe: dump the assembled core env forwarding and exit — lets the
 # regression suite assert the proxy-routing policy (live listener forwards,
 # dead port omits, caller preset wins) against the REAL ENV_ARGS under
