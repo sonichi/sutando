@@ -165,19 +165,21 @@ class GenuinelyUndelivered(_Base):
 
     def test_ok_false_refusal_keeps_result_and_never_archives(self):
         # A 2xx {"ok": false} is a REFUSED close, not a delivery: the sweep
-        # must retain the only retryable copy instead of archiving it.
+        # keeps the only retryable copy, quarantined on the pass that parks it.
         self._archived_task()
         self._result("[no-send]\nDECLINE_SENTINEL")
         gw._req = lambda m, path, payload=None: {"ok": False}
         self._sweep()
-        self.assertTrue((gw.RESULTS_DIR / f"{TID}.txt").exists(),
-                        "refused close must keep its retryable result")
+        from ag2_sparrow import outbox, undelivered_quarantine
+        self.assertFalse((gw.RESULTS_DIR / f"{TID}.txt").exists())
+        self.assertEqual(len(undelivered_quarantine.find_quarantined(gw.RESULTS_DIR, TID)), 1,
+                         "refused close must keep its retryable result")
         self.assertFalse(any("recovered + delivered" in l for l in self.logs),
                          "a refused close must not log as delivered")
         self._sweep()
-        from ag2_sparrow import outbox, undelivered_quarantine
         core = gw._delivery_core()
         self.assertEqual(outbox.read_item(core.backend.root, TID)["reason"], "permanent-refusal")
+        self.assertEqual(len(undelivered_quarantine.find_quarantined(gw.RESULTS_DIR, TID)), 1)
         outbox.requeue_item(core.backend.root, TID, reset_attempts=True, operator="test")
         undelivered_quarantine.restore(gw.RESULTS_DIR, TID)
         _age(gw.RESULTS_DIR / f"{TID}.txt", OLD)

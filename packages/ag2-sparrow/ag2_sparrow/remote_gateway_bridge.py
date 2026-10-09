@@ -4463,12 +4463,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
             return True
         # The outbox has decided this item; no pass will ever claim it again,
         # so retrying logs forever and hides the failure behind "will retry".
-        why = (f"outbox item is terminal: {record.get('reason')} after "
-               f"{core.backend.attempts(item_id)} attempt(s)")
-        if result_file is not None:
-            _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id)
-        else:
-            _log(f"result {tid}: {why} — not retrying")
+        _dispose_terminal(core, item_id, tid, record, result_file)
         return False
     if res.status is DrainStatus.NOT_CLAIMED:
         # A dead prior incarnation's claim; reclaim-TTL recovers it, and
@@ -4488,12 +4483,26 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
              f"backend={type(core.backend).__name__}, worker={core.worker})")
         return True
     record = read_item(core.backend.root, item_id) or {}
+    if record.get("status") == "PARKED":
+        # Parked by this very attempt: dispose now, or the next pass logs the
+        # refusal a second time before the file leaves the drain's view.
+        _dispose_terminal(core, item_id, tid, record, result_file)
+        return False
     retry = record.get("retry", {})
     _log(f"result POST not confirmed for {tid} "
          f"({res.outcome.value if res.outcome else '?'}: {res.detail}) — "
          f"status={record.get('status')}, reason={record.get('reason')}, "
          f"next={retry.get('next_attempt_at')}, deadline={retry.get('deadline')}")
     return False
+
+
+def _dispose_terminal(core, item_id: str, tid: str, record: dict, result_file) -> None:
+    why = (f"outbox item is terminal: {record.get('reason')} after "
+           f"{core.backend.attempts(item_id)} attempt(s)")
+    if result_file is not None:
+        _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id)
+    else:
+        _log(f"result {tid}: {why} — not retrying")
 
 
 def _result_tier(tid: str) -> "str | None":
@@ -4942,6 +4951,8 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             _archive_result(rfile, tid)
             _log(f"orphan sweep: recovered + gateway accepted {tid}; Matrix delivery unconfirmed")
             continue
+        if _delivery_core().backend.is_terminal(_btid):
+            continue                            # disposed and logged by the delivery call
         _tries = _delivery_core().backend.attempts(_btid)
         _log(f"orphan sweep: {tid} close not confirmed (attempt {_tries}) — will retry")
 
