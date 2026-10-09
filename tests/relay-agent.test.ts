@@ -274,6 +274,7 @@ describe('every status answer comes from the one table', () => {
 			const b = block(src(file), start);
 			assert.ok(b.includes('voiceTaskRows()'), `${start} reads the table`);
 			assert.ok(!/readdirSync|readQueueDepth|getPendingToolCalls/.test(b), `${start} does not count files or tool calls`);
+			assert.ok(!b.includes('inProgress:'), `${start} returns states, not a yes/no in-progress flag`);
 		}
 		const cancelList = src('inline-tools.ts').split('// list mode:')[1].split('// Targeting:')[0];
 		assert.ok(cancelList.includes('voiceTaskRows()') && !cancelList.includes('readdirSync'));
