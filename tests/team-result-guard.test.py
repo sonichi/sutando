@@ -383,6 +383,18 @@ def behavioral() -> list:
             fails.append("an archived record stays its body's decision, never a new id")
         if guard.archive_record(live):
             fails.append("archiving a record that is gone reports failure")
+        reviewed = guard.withheld_review_artifact(state, "task-ledger", "B body")
+        if guard.update_record(reviewed, {"withheld_body": "B body", "status": "x"}):
+            fails.append("an archived decision is immutable: no update writes it")
+        twin = guard.withheld_review_path(state, "task-twin")
+        guard._reserve(twin, guard._body_digest("T body"))
+        twin.write_text(json.dumps({"withheld_body": "T body"}), encoding="utf-8")
+        (twin.parent / "archive" / twin.name).write_text(json.dumps({"withheld_body": "T body", "k": 1}),
+                                                         encoding="utf-8")
+        if guard.archive_record(twin) or json.loads((twin.parent / "archive" / twin.name).read_text()).get("k") != 1:
+            fails.append("archive never writes over an existing decision")
+        if guard.update_record(twin, {"withheld_body": "other body"}):
+            fails.append("an update never changes the body a record holds")
         gone = guard.withheld_review_path(state, "task-gone")
         if guard.update_record(gone, {"withheld_body": "x"}) or gone.exists():
             fails.append("an update never recreates a record that is gone or archived")

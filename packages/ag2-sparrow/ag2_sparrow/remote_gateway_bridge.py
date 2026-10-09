@@ -855,19 +855,20 @@ _REVIEW_DECISION_RE = re.compile(
 
 
 def _pending_review_records() -> list[tuple[Path, dict]]:
-    out = []
-    directory = _STATE / "withheld-team-results"
+    """Live reviews that own their id; the guard freezes any that conflict with
+    their id's reservation or archived decision, and the owner is told."""
     try:
-        paths = sorted(directory.glob("wr_*.json"))
+        actionable, frozen = team_result_guard.actionable_records(
+            _STATE / team_result_guard.WITHHELD_RESULT_DIR)
     except OSError:
-        return out
-    for path in paths:
-        record = _read_private_json(path)
-        if record and record.get("status") in (
+        return []
+    for path in frozen:
+        _log(f"withheld review {path.name}: conflicts with its id's decision or reservation; "
+             f"frozen in {path.parent.name}/ for the owner, never acted on")
+    return [(path, record) for path, record in actionable
+            if path.name.startswith("wr_") and record.get("status") in (
                 "awaiting_owner", "publish_pending", "kept_private", "published",
-                "publish_failed"):
-            out.append((path, record))
-    return out
+                "publish_failed")]
 
 
 def _archive_resolved_review(path: Path, record: dict) -> bool:
@@ -4496,10 +4497,14 @@ def _delivered_wire_body(item_id: str) -> "str | None":
     return body if isinstance(body, str) else None
 
 
-def _composed_wire_body(actions, parsed_body: str) -> str:
-    """The body the drain composes for a guarded reply (the redirect rides it)."""
-    redirect = next((a for a in actions if a.kind == "redirect"), None)
-    return f"[channel: {redirect.value}]\n{parsed_body}" if redirect else parsed_body
+REVIEW_UNSENT = "review it; it may already have been sent"
+
+
+def _body_ref(text: "str | None") -> str:
+    """A reference an operator can compare without the body in the log."""
+    if text is None:
+        return "unknown"
+    return f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:12]} ({len(text)} chars)"
 
 
 def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> None:
@@ -4529,8 +4534,8 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
         # The owner-mention leg queues one DM per task; a later reply stays visible.
         _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id, generation=generation,
                                 requeueable=False, not_requeueable_because=(
-                                    "it answers an owner-mention task: review it; it may only "
-                                    "ever reach the owner's DM, never a room"))
+                                    f"{REVIEW_UNSENT}; it answers an owner-mention task, so it may "
+                                    "only ever reach the owner's DM, never a room"))
         return
     body, withheld = _guarded_result_body(tid, raw)
     if body is None:
@@ -4550,27 +4555,16 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
             _log(f"result {tid}: {why}; it is {what} but could not be archived "
                  f"({done.cause}); the next pass retries")
         return
-    # A manual send needs positive evidence independent of any persisted proof: the
-    # body this reply composes to differs from the body the record says went out.
-    sent = _delivered_wire_body(item_id)
-    differs = sent is not None and _composed_wire_body(actions, parsed.body) != sent
-    restriction = next((f"[{a.kind}]" if a.kind == "dm-only" else
-                        f"[channel: {a.value}]" if a.kind == "redirect" else f"[file: {a.value}]"
-                        for a in actions if a.kind in ("dm-only", "redirect", "attach")), None)
-    if any(a.kind == "dm-only" for a in actions):
-        because = ("it is marked [dm-only]: review it; it may only ever reach the owner's DM, "
-                   "never a room")
-    elif any(a.kind == "redirect" for a in actions):
-        where = next(a.value for a in actions if a.kind == "redirect")
-        because = (f"it is addressed to [channel: {where}] only: review it; never post it anywhere else")
-    elif withheld:
-        because = f"the result guard withheld it ({withheld}): review it; do not send it by hand"
-    elif not differs:
-        because = ("its wire body matches the one already delivered"
-                   + (f" ({restriction} aside)" if restriction else "")
-                   + " or cannot be compared: review it; it may already have been sent")
-    else:
-        because = "its outbox id is already delivered, so a requeue cannot resend it: send it by hand"
+    # Whether this reply already went out cannot be told from what is stored (delivery
+    # transforms the wire body), so the operator is always told to review, never to send.
+    markers = [f"[{a.kind}]" if a.kind == "dm-only" else
+               f"[channel: {a.value}]" if a.kind == "redirect" else f"[file: {a.value}]"
+               for a in actions if a.kind in ("dm-only", "redirect", "attach")]
+    because = (REVIEW_UNSENT
+               + (f"; marked {' '.join(markers)}" if markers else "")
+               + (f"; the result guard withheld it ({withheld})" if withheld else "")
+               + f"; delivered wire body {_body_ref(_delivered_wire_body(item_id))}"
+               + f", this reply {_body_ref(ready.body)}")
     _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id, generation=generation,
                             requeueable=False, not_requeueable_because=because)
 

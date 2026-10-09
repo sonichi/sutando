@@ -721,7 +721,17 @@ class TerminalResultMovedOnce(unittest.TestCase):
              'undelivered': ['BODY-A parked answer', 'BODY-B newer reply'], 'b_archived': False})
         said = [l for l in self.lines if TID in l and UNSENT in l]
         self.assertEqual(len(said), 1, '\n'.join(self.lines))
-        self.assertIn('send it by hand', said[0])
+        self._assert_review_line(said[0], delivered='BODY-A parked answer', this='BODY-B newer reply')
+
+    def _assert_review_line(self, line, delivered=None, this=None):
+        """The one operator line for a reply at a delivered id: review it, never send it,
+        with references to the delivered wire body and this reply."""
+        self.assertIn('review it; it may already have been sent', line)
+        self.assertNotIn('by hand', line)
+        self.assertIn('delivered wire body ', line)
+        for text in (delivered, this):
+            if text is not None:
+                self.assertIn(hashlib.sha256(text.encode()).hexdigest()[:12], line)
 
     def test_a_reply_published_before_the_failed_restore_returns_is_kept_visible(self):
         outbox_cli, result = self._parked_on_a_host_that_cannot_restore()
@@ -814,7 +824,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
              'c_live': False, 'c_listed': True, 'c_archived_as_sent': False})
         said = [l for l in self.lines if TID in l and UNSENT in l]
         self.assertEqual(len(said), 1, '\n'.join(self.lines))
-        self.assertIn('send it by hand', said[0])
+        self._assert_review_line(said[0], delivered='BODY-A parked answer', this='BODY-C newest reply')
         self.assertNotIn('restores it', said[0], 'a requeue of a delivered id restores nothing')
 
     def test_a_caller_without_a_result_file_is_told_the_stored_body_went(self):
@@ -1245,20 +1255,56 @@ class TerminalResultMovedOnce(unittest.TestCase):
                                 and any('may already have been sent' in l for l in self.lines))
                     self.assertTrue(archived == 1 or reviewed, (archived, self.lines))
 
-    def test_a_manual_send_needs_a_different_wire_body_whatever_the_proof_says(self):
-        """The proof only decides archive versus quarantine. Even this writer's own
-        trusted proof never yields "send it by hand" for a marked reply whose wire
-        body equals the delivered one; a different wire body does."""
-        result, posts = self._delivered_then_late('[file: /tmp/report.txt]\nBODY-A the reply')
-        self.assertIsNotNone(outbox.source_proof(outbox.read_item(self.outbox, TID)))
-        said = [l for l in self.lines if UNSENT in l]
-        self.assertEqual(len(said), 1, self.lines)
-        self.assertNotIn('by hand', said[0])
-        self.assertIn('[file: /tmp/report.txt] aside', said[0])
-        self.setUp()
-        result, posts = self._delivered_then_late('[file: /tmp/report.txt]\nBODY-C a new answer')
-        said = [l for l in self.lines if UNSENT in l]
-        self.assertIn('send it by hand', said[0])
+    def test_a_reply_at_a_delivered_id_is_never_handed_over_for_sending(self):
+        """No stored state can prove a reply was not already sent (delivery adds
+        attachment notes and recovery labels), so every such reply gets the review
+        line, its markers and both body references, whatever the proof says."""
+        for late in ('[file: /tmp/report.txt]\nBODY-A the reply', '[file: /tmp/report.txt]\nBODY-C a new answer',
+                     'BODY-C a new answer'):
+            with self.subTest(late=late):
+                self.setUp()
+                self._delivered_then_late(late)
+                said = [l for l in self.lines if UNSENT in l]
+                self.assertEqual(len(said), 1, self.lines)
+                self._assert_review_line(said[0], delivered='BODY-A the reply', this=late)
+                if late.startswith('[file:'):
+                    self.assertIn('marked [file: /tmp/report.txt]', said[0])
+
+    def test_delivery_transforms_never_turn_a_delivered_source_into_a_manual_send(self):
+        """Kewei's schedules: an attachment delivered as "(file attached)", and an
+        orphan recovery delivered with its label, then a crash before the archive and
+        a restarted sweep. Same source each time; never a send instruction."""
+        class Crash(BaseException):
+            pass
+        for name, record_body in (('attachment placeholder', '(file attached)'),
+                                  ('recovery label', '(recovered result \u2014 original delivery was lost)\nBODY-A the reply')):
+            with self.subTest(transform=name):
+                self.setUp()
+                self.bridge()
+                self.task()
+                self.server.accepting = True
+                source = '[file: /tmp/report.txt]\nBODY-A the reply' if name.startswith('attach') else 'BODY-A the reply'
+                result = self.result(source)
+                with patch.object(gw, '_archive_result', side_effect=Crash):
+                    with self.assertRaises(Crash):
+                        gw._post_ready_results({TID})
+                rec = outbox.read_item(self.outbox, TID)
+                for field in ('proof_version', 'source_ready_sha256', 'source_payload_sha256', 'publication_id'):
+                    rec.pop(field, None)                          # a record no trusted proof covers
+                rec['payload'] = json.dumps({'id': TID, 'body': record_body})
+                outbox._write_item(self.outbox, TID, rec)
+                posts = len(self.server.calls)
+                self.bridge(self.core())
+                if name.startswith('attach'):
+                    gw._post_ready_results({TID})                 # the drain still holds the id
+                else:
+                    os.utime(result, (time.time() - gw.ORPHAN_GRACE_S - 60,) * 2)
+                    gw._reconcile_orphan_results(set())           # the in-flight id was lost
+                self.assertEqual(len(self.server.calls), posts, 'no second POST')
+                self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
+                said = [l for l in self.lines if UNSENT in l]
+                self.assertTrue(said, self.lines)
+                self._assert_review_line(said[-1], delivered=record_body, this=source)
 
     def _reviewed(self, body):
         """B delivered as a Team result's withheld review through real routing."""
@@ -1344,6 +1390,31 @@ class TerminalResultMovedOnce(unittest.TestCase):
             self._late(result, '[file: /tmp/b.txt]\nBODY-B')
         self.assertEqual(self._messages(), sent, 'B was prompted again despite its decision')
         self.assertTrue(any('already decided in owner review' in l for l in self.lines), self.lines)
+
+    def test_invariant_an_archived_decision_is_immutable_and_a_conflicting_live_record_frozen(self):
+        """Legacy state: B's decision archived and a stale live C under B's id (no
+        ledger). An owner reply to the old id never reaches C, C is frozen for the
+        owner, and B's archived decision survives every later archive."""
+        from ag2_sparrow import team_result_guard as trg
+        hot = self.root / 'state' / trg.WITHHELD_RESULT_DIR
+        old = trg.withheld_review_path(self.root / 'state', TID)
+        (hot / 'archive').mkdir(parents=True)
+        b = {'review_id': old.stem, 'status': 'kept_private', 'withheld_body': 'BODY-B',
+             'owner': '@owner:ag2.space', 'dm_room_id': '!ownerdm:ag2.space', 'dm_event_id': '$b'}
+        (hot / 'archive' / old.name).write_text(json.dumps(b))
+        old.write_text(json.dumps(dict(b, status='awaiting_owner', withheld_body='BODY-C', dm_event_id='$c')))
+        self.bridge()
+        task = {'user_id': '@owner:ag2.space', 'channel_id': '!ownerdm:ag2.space', 'task': f'Yes {old.stem}'}
+        with patch.object(gw, '_tier_for', return_value='owner'):
+            self.assertIsNone(gw._match_review_decision(task), 'an owner reply to the old id matched C')
+        self.assertEqual(gw._pending_review_records(), [])
+        frozen = list((hot / 'conflicts').glob('*.json'))
+        self.assertEqual([json.loads(p.read_text())['withheld_body'] for p in frozen], ['BODY-C'])
+        self.assertFalse(old.exists())
+        self.assertFalse(trg.archive_record(old))
+        self.assertFalse(trg.update_record(old, dict(b, status='published')))
+        self.assertEqual(json.loads((hot / 'archive' / old.name).read_text()), b, "B's decision changed")
+        self.assertTrue(any('frozen' in l for l in self.lines), self.lines)
 
     def test_an_archive_inside_a_lookup_waits_for_it(self):
         """The resolver's archive cannot land between a lookup's archive and live
@@ -1492,7 +1563,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
                     self.assertTrue(any('withheld it (secret redacted)' in l for l in self.lines), self.lines)
 
     def test_a_different_restricted_reply_is_quarantined_for_review_not_sending(self):
-        for body, says in (('[dm-only]\nprivate detail for the owner', "owner's DM"),
+        for body, says in (('[dm-only]\nprivate detail for the owner', "marked [dm-only]"),
                            ('[channel: !other:ag2.space]\nfor that room', '[channel: !other:ag2.space]')):
             with self.subTest(body=body):
                 self.setUp()

@@ -36,9 +36,9 @@ BACKEND = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "delivery_core" /
 IN_BACKEND = {"publish-drops-the-source"}
 GUARD = [REPO / "src" / "policy" / "egress" / "result.py",
          REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "team_result_guard.py"]
-IN_GUARD = {"issue-reissues-a-reserved-id", "record-of-ignores-the-body", "migration-seeds-from-the-live-copy", "archive-outside-the-ledger-lock", "update-recreates-an-archived-record", "ledger-ignores-prior-records", "artifact-claims-another-body"}
-IN_BRIDGE = {"manual-send-on-a-digest-mismatch-alone", "manual-send-ignores-a-destination-marker", "unsent-ignores-a-changed-generation", "verdict-cache-keyed-by-task", "late-duplicate-hashes-the-raw-bytes", "unsent-skips-the-guard", "unsent-skips-owner-mention",
-             "unsent-ignores-suppression", "unsent-ignores-restriction",              "confirmed-archives-another-body", "terminal-delivered-archives-another-body",
+IN_GUARD = {"archive-clobbers-a-decision", "conflicting-record-stays-actionable", "update-ignores-id-ownership", "issue-reissues-a-reserved-id", "record-of-ignores-the-body", "migration-seeds-from-the-live-copy", "archive-outside-the-ledger-lock", "ledger-ignores-prior-records", "artifact-claims-another-body"}
+IN_BRIDGE = {"unsent-brings-back-a-send-instruction", "unsent-drops-the-delivered-body-reference", "unsent-ignores-a-changed-generation", "verdict-cache-keyed-by-task", "late-duplicate-hashes-the-raw-bytes", "unsent-skips-the-guard", "unsent-skips-owner-mention",
+             "unsent-ignores-suppression", "unsent-hides-its-markers",              "confirmed-archives-another-body", "terminal-delivered-archives-another-body",
              "late-duplicate-archives-another-body", "orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
 
@@ -237,10 +237,10 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "a suppressed reply at a delivered id is quarantined and handed over for sending",
         "    if skip is not None:\n        done = disposal.retire_generation(",
         "    if False:\n        done = disposal.retire_generation("),
-    "unsent-ignores-restriction": (
-        "a restricted reply at a delivered id is handed over as one to send by hand",
-        "    if any(a.kind == \"dm-only\" for a in actions):\n        because = (",
-        "    if False:\n        because = ("),
+    "unsent-hides-its-markers": (
+        "the operator line omits a destination or attachment marker the reply carries",
+        "               + (f\"; marked {' '.join(markers)}\" if markers else \"\")\n",
+        "               + \"\"\n"),
     "verdict-cache-keyed-by-task": (
         "the result guard reuses a task's withheld verdict for a different body",
         "    cached = (tid, source_digest(body))\n",
@@ -261,14 +261,6 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "records from before the reservation ledger are not seeded as issued ids",
         "            _reserve(path, _record_digest(existing, field))\n",
         "            return None\n"),
-    "manual-send-on-a-digest-mismatch-alone": (
-        "a reply ruled unsent by the digest is handed over without comparing wire bodies",
-        "    differs = sent is not None and _composed_wire_body(actions, parsed.body) != sent\n",
-        "    differs = True\n"),
-    "manual-send-ignores-a-destination-marker": (
-        "a reply addressed to another channel is handed over as an ordinary manual send",
-        "    elif any(a.kind == \"redirect\" for a in actions):\n        where = next(",
-        "    elif False:\n        where = next("),
     "issue-reissues-a-reserved-id": (
         "an id reserved for this body but whose record moved is issued again",
         "                found = _record_of(path, digest, field)\n                if found is not None:\n                    return found, True\n",
@@ -283,12 +275,28 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "    for existing in (path, _archived(path)):           # a decision owns the id it decided\n"),
     "archive-outside-the-ledger-lock": (
         "archiving a record does not wait for an issuance in progress",
-        "    with _ledger_lock(_record_directory(path)):\n        archive = path.parent / \"archive\"\n",
-        "    with contextlib.nullcontext():\n        archive = path.parent / \"archive\"\n"),
-    "update-recreates-an-archived-record": (
-        "a late record update writes a record that was already archived",
-        "        if not path.is_file():\n            return False\n",
-        "        if False:\n            return False\n"),
+        "    with _ledger_lock(_record_directory(path)):\n        if not path.is_file() or not _owns_its_id(path, field):\n            return False\n        archive",
+        "    with contextlib.nullcontext():\n        if not path.is_file() or not _owns_its_id(path, field):\n            return False\n        archive"),
+    "unsent-brings-back-a-send-instruction": (
+        "a reply at a delivered id is handed over as one to send by hand",
+        "REVIEW_UNSENT = \"review it; it may already have been sent\"\n",
+        "REVIEW_UNSENT = \"its outbox id is already delivered: send it by hand\"\n"),
+    "unsent-drops-the-delivered-body-reference": (
+        "the operator line omits the delivered wire body it must be compared with",
+        "               + f\"; delivered wire body {_body_ref(_delivered_wire_body(item_id))}\"\n",
+        "               + \"\"\n"),
+    "archive-clobbers-a-decision": (
+        "archiving a record writes over an archived decision of the same id",
+        "            os.link(path, archive / path.name)           # no-clobber: an existing decision stays\n            os.unlink(path)\n",
+        "            path.replace(archive / path.name)\n"),
+    "conflicting-record-stays-actionable": (
+        "a live record whose id belongs to another body or decision stays actionable",
+        "            if _owns_its_id(path, field):\n                try:\n",
+        "            if True:\n                try:\n"),
+    "update-ignores-id-ownership": (
+        "an update writes a record that no longer owns its id",
+        "        if not path.is_file() or not _owns_its_id(path, field) or record.get(field) != json.loads(\n",
+        "        if not path.is_file() or record.get(field) != json.loads(\n"),
     "orphan-links-then-unlinks": (
         "an orphan arm moves the canonical result itself: link, then unlink its name",
         "        done = disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))\n",

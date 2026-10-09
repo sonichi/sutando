@@ -404,12 +404,21 @@ def _record_directory(path: Path) -> Path:
     return path.parent.parent if path.parent.name == "archive" else path.parent
 
 
-def update_record(path: Path, record: dict) -> bool:
-    """Rewrite an existing record under the ledger lock; a record already archived
-    (or never written) at `path` is left alone, so a late update cannot recreate it."""
+def _owns_its_id(path: Path, field: str) -> bool:
+    """A live record may act only while its id is reserved to the body it holds
+    and no decision for that id is archived; an archived decision is immutable."""
+    return (path.parent.name != "archive" and not _archived(path).exists()
+            and _issued_to(path, field) == _record_digest(path, field))
+
+
+def update_record(path: Path, record: dict, field: str = "withheld_body") -> bool:
+    """Rewrite a live record under the ledger lock, only while it owns its id: a
+    record already archived, never written, or conflicting with its id's
+    reservation is left alone, so no update recreates or overwrites a decision."""
     path = Path(path)
     with _ledger_lock(_record_directory(path)):
-        if not path.is_file():
+        if not path.is_file() or not _owns_its_id(path, field) or record.get(field) != json.loads(
+                path.read_text(encoding="utf-8")).get(field):
             return False
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         try:
@@ -429,19 +438,54 @@ def update_record(path: Path, record: dict) -> bool:
     return True
 
 
-def archive_record(path: Path) -> bool:
+def archive_record(path: Path, field: str = "withheld_body") -> bool:
     """Move a resolved record into its directory's `archive/`, under the ledger
-    lock: the id stays reserved, so it is never issued again."""
+    lock, never over an existing decision and only for the body its id was
+    issued to: the id stays reserved, so it is never issued again."""
     path = Path(path)
     with _ledger_lock(_record_directory(path)):
+        if not path.is_file() or not _owns_its_id(path, field):
+            return False
         archive = path.parent / "archive"
         try:
             archive.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(archive, 0o700)
-            path.replace(archive / path.name)
+            os.link(path, archive / path.name)           # no-clobber: an existing decision stays
+            os.unlink(path)
         except OSError:
             return False
     return True
+
+
+CONFLICTS_DIR = "conflicts"
+
+
+def actionable_records(directory: Path, field: str = "withheld_body"):
+    """The live records of `directory` that may act, under the ledger lock, and the
+    ones frozen instead: a record whose id is reserved to another body, or whose
+    id already has an archived decision, moves to `conflicts/` for the owner and
+    never acts. Returns (actionable [(path, record)], frozen [path])."""
+    directory = Path(directory)
+    actionable, frozen = [], []
+    if not directory.is_dir():
+        return actionable, frozen
+    with _ledger_lock(directory):
+        for path in sorted(directory.glob("*.json")):
+            if _owns_its_id(path, field):
+                try:
+                    actionable.append((path, json.loads(path.read_text(encoding="utf-8"))))
+                except (OSError, ValueError):
+                    continue
+                continue
+            target = directory / CONFLICTS_DIR / f"{path.stem}.{_record_digest(path, field)[:16]}.json"
+            try:
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                os.link(path, target)
+                os.unlink(path)
+                frozen.append(target)
+            except OSError:
+                continue
+    return actionable, frozen
 
 
 def _find_record(path_of, state_dir: Path, task_id: str, body: str, field: str) -> Path:
