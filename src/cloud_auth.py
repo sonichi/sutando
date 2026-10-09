@@ -246,13 +246,15 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None,
             return CloudAuth(base, tok)
         return CloudAuth(None, None)
     user_id = user_id or credential_user_id
-    tried: set[str] = set()
+    tried: set[tuple[str, str]] = set()
     others: list[str] = []
     for base, tok in _candidates(ws, keychain_auth):
-        if tok in tried:
+        # Keyed like the id cache: one token on an unusable base must still be tried on its real one.
+        key = (normalize_base(base or DEFAULT_CLOUD_ORIGIN), tok)
+        if key in tried:
             continue
-        tried.add(tok)
-        uid = user_id(base or DEFAULT_CLOUD_ORIGIN, tok)
+        tried.add(key)
+        uid = user_id(key[0], tok)
         if uid == stamped:
             return CloudAuth(base, tok, stamp_user_id=stamped, credential_user_ids=(uid,))
         if uid and uid not in others:
@@ -260,6 +262,18 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None,
     if not tried:
         return CloudAuth(None, None)
     return CloudAuth(None, None, "account_changed" if others else "account_unverified", stamped, others)
+
+
+def refusal_message(auth: Any) -> str | None:
+    """Owner-facing words for a refused CloudAuth (see read_cloud_auth), else None."""
+    refused = getattr(auth, "refused", None)
+    if refused == "account_changed":
+        return (f"This agent's AG2 Cloud credentials belong to {', '.join(auth.credential_user_ids)}, not the "
+                f"account the desktop app started it for ({auth.stamp_user_id}): sign in again from the desktop app.")
+    if refused == "account_unverified":
+        return ("Verifying which AG2 Cloud account this agent's credentials belong to is temporarily "
+                "unavailable, so they were not used; try again in a moment.")
+    return None
 
 
 def _metering_env_auth():

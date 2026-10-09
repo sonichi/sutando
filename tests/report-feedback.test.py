@@ -487,6 +487,14 @@ class TestAskFirst(unittest.TestCase):
                     with self.assertRaises(SystemExit) as cm:
                         self._run(["--decide", did, "file"])
                     self.assertEqual(cm.exception.code, 2)
+                refused = type("Refused", (tuple,), {"refused": "account_changed", "stamp_user_id": "u-A",
+                                                      "credential_user_ids": ("u-B",)})((None, None))
+                out = io.StringIO()
+                with mock.patch.object(report_feedback, "read_cloud_auth", return_value=refused), \
+                        contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+                    self._run(["--decide", did, "file"])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("ACCOUNT_REFUSED: This agent's AG2 Cloud credentials belong to u-B", out.getvalue())
             self.assertEqual(len(report_feedback.list_drafts(ws)), 1, "a refused decision keeps the draft parked")
 
     def test_decide_file_attaches_logs_when_allowed_and_explains_their_absence(self):
@@ -1111,6 +1119,17 @@ class TestMain(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             self._run(["--title", "   "])
         self.assertEqual(cm.exception.code, 1)
+
+    def test_a_refused_account_exits_2_with_its_reason(self):
+        refused = type("Refused", (tuple,), {"refused": "account_unverified", "stamp_user_id": "u-A",
+                                              "credential_user_ids": ()})((None, None))
+        out = io.StringIO()
+        with mock.patch.object(report_feedback, "read_cloud_auth", return_value=refused), \
+                contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            self._run(["--title", "hello"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("ACCOUNT_REFUSED: Verifying", out.getvalue())
+        self.assertNotIn("NOT_SIGNED_IN", out.getvalue())
 
     def test_not_signed_in_exits_2(self):
         with mock.patch.object(report_feedback, "read_cloud_auth", return_value=(None, None)):

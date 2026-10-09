@@ -268,17 +268,13 @@ class Cloud:
         return bool(self.token)
 
     def not_signed_in(self) -> Setup:
-        """The Setup to raise when signed_in() is False: wrong_account when cloud_auth refused a
-        credential for another user than the desktop stamped, else not_signed_in."""
+        """The Setup to raise when signed_in() is False: wrong_account / account_unverified when
+        cloud_auth refused a credential against the desktop's stamp, else not_signed_in."""
         r = self.refused
         if r is None:
             return Setup("not_signed_in", "Not signed in to AG2 Cloud: sign in from the desktop app.")
-        if r.refused == "account_changed":
-            found = ", ".join(r.credential_user_ids)
-            return Setup("wrong_account", f"This agent's AG2 Cloud credentials belong to {found}, not the account "
-                         f"the desktop app started it for ({r.stamp_user_id}): sign in again from the desktop app.")
-        return Setup("wrong_account", "Could not confirm this agent's AG2 Cloud credentials belong to the account "
-                     f"the desktop app started it for ({r.stamp_user_id}); not acting as an unknown account.")
+        code = "wrong_account" if r.refused == "account_changed" else "account_unverified"
+        return Setup(code, cloud_auth.refusal_message(r))
 
     def get(self, path: str) -> dict:
         if not self.signed_in():

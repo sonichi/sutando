@@ -139,11 +139,9 @@ class Context:
 def build_context(args: argparse.Namespace) -> Context:
     auth = cloud_auth.read_cloud_auth(_workspace())
     base, token = auth
-    if not token and getattr(auth, "refused", None):
-        raise Usage(
-            f"This agent's Sutando Cloud credentials are not the account the desktop app started it for "
-            f"({auth.stamp_user_id}); refusing to act as another account. Sign in again from the desktop app."
-        )
+    refusal = None if token else cloud_auth.refusal_message(auth)
+    if refusal:
+        raise Usage(refusal)
     if not token:
         raise Usage(
             "Not signed in to Sutando Cloud (probed "

@@ -295,6 +295,36 @@ class TestStampedAccountIsNeverSwapped(unittest.TestCase):
         self.file("sutk_B")
         self.assertEqual(cloud_auth.read_cloud_auth(self.ws, keychain_auth=lambda: (self.BASE, "sutk_A"))[1], "sutk_A")
 
+    def test_one_token_on_an_unusable_base_is_still_tried_on_its_real_base(self):
+        """Codex on #5263: deduping by token alone dropped the Keychain copy of a token first
+        seen in a legacy file with a stale base, refusing a usable credential."""
+        bases = []
+
+        def me(base, token, method, path, **_):
+            bases.append(base)
+            cloud_auth.check_trusted_base(base)
+            return {"id": "u-A"}
+
+        cloud_auth.cloud_request.side_effect = me
+        self.stamp("u-A")
+        (self.ws / "state" / "auth" / "cloud-auth.json").write_text(
+            json.dumps({"apiBase": "https://stale.test.invalid", "token": "synthetic-A"}))
+        self.keychain("synthetic-A")
+        auth = cloud_auth.read_cloud_auth(self.ws)
+        self.assertEqual((tuple(auth), auth.refused), ((self.BASE, "synthetic-A"), None))
+        self.assertEqual(bases, ["https://stale.test.invalid", self.BASE])
+
+    def test_refusal_message_names_a_mismatch_and_a_temporary_failure_differently(self):
+        changed = cloud_auth.CloudAuth(None, None, "account_changed", "u-A", ("u-B",))
+        self.assertIn("u-B", cloud_auth.refusal_message(changed))
+        self.assertIn("sign in again", cloud_auth.refusal_message(changed))
+        unverified = cloud_auth.refusal_message(cloud_auth.CloudAuth(None, None, "account_unverified", "u-A"))
+        self.assertIn("temporarily unavailable", unverified)
+        self.assertIn("try again", unverified)
+        self.assertNotIn("sign in", unverified)
+        self.assertIsNone(cloud_auth.refusal_message(cloud_auth.CloudAuth(None, None)))
+        self.assertIsNone(cloud_auth.refusal_message((None, None)))
+
     def test_credential_user_id_needs_an_id(self):
         cloud_auth.cloud_request.side_effect = lambda *a, **k: {"email": "x"}
         self.assertIsNone(cloud_auth.credential_user_id(self.BASE, "sutk_A"))

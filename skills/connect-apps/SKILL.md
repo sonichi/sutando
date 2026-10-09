@@ -88,7 +88,7 @@ yours, not the owner's: plain sentences, no quotes from their message.
 |---|---|
 | 0 | done: a match, all apps connected, a wait recorded (or `card` found every app connected), a wait claimed, the account verified |
 | 1 | a negative answer: no exact match, an app not connected, nothing claimed, `account_changed`, `account_unknown`, `no_such_wait` |
-| 2 | a setup problem to relay, never retry: `not_signed_in`, `wrong_account`, `connectors_disabled`, `unknown_app`, `coming_soon`, `too_many_apps`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
+| 2 | a setup problem to relay, never retry: `not_signed_in`, `wrong_account`, `account_unverified`, `connectors_disabled`, `unknown_app`, `coming_soon`, `too_many_apps`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
 
 `card` and `await` exit 1 with `"reason": "account_changed"` (plus `cloud_user_id`,
 `stamp_cloud_user_id`, `base`) when this agent's AG2 Cloud credential is not the account the desktop
@@ -369,11 +369,12 @@ The `card` call from step 3 already armed the wait; read its output:
   --room` lists them). Say: "I'll pick this up once <its apps> are connected; for <the other apps>,
   tell me once they're connected and I'll check." In the DM that is the result; from 3b put it on the
   waiting card with `note` and write the result `[no-send]`.
-- **Exit 2 with `"error": "wrong_account"`:** the only AG2 Cloud credentials this agent can find
-  belong to another account than the one your desktop app started it for (or cannot be confirmed),
-  so it refuses to act as them. Relay `detail` in plain words. In the DM that is the result; from
-  3b send it to the owner's confirmed DM and write the result `[no-send]` (no confirmed DM:
-  `[no-send]` alone). Never in the shared room.
+- **Exit 2 with `"error": "wrong_account"` or `"account_unverified"`:** this agent refused its AG2
+  Cloud credentials: `wrong_account`, they belong to another account than the one your desktop app
+  started it for; `account_unverified`, the account check is temporarily unavailable (retry later,
+  nothing to sign in to). Relay `detail` in plain words. In the DM that is the result; from 3b send
+  it to the owner's confirmed DM and write the result `[no-send]` (no confirmed DM: `[no-send]`
+  alone). Never in the shared room.
 - **Any other exit 2:** no automatic resume is possible. Say: "Once you've connected Google
   Calendar, tell me and I'll check." In the DM that is the result; from 3b there is no private card
   to carry it, so send it to the owner's confirmed DM and write the result `[no-send]` (no confirmed
