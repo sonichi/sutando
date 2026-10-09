@@ -19,6 +19,7 @@ journaled, rather than refused.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -356,68 +357,129 @@ def _issued_to(path: Path, field: str) -> "str | None":
         return _reservation(path).read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         pass
-    for existing in (path, _archived(path)):
+    for existing in (_archived(path), path):           # a decision owns the id it decided
         if existing.exists():
-            try:
-                body = json.loads(existing.read_text(encoding="utf-8")).get(field)
-                digest = _body_digest(body) if isinstance(body, str) else "unreadable"
-            except (OSError, ValueError, AttributeError):
-                digest = "unreadable"
-            _reserve(path, digest)
+            _reserve(path, _record_digest(existing, field))
             return _reservation(path).read_text(encoding="utf-8").strip()
     return None
 
 
-def _record_of(path: Path) -> "Path | None":
-    """The record of an issued id: its decision once archived, else the live one."""
+def _record_digest(path: Path, field: str) -> str:
+    """The digest of the body a record holds; "unreadable" matches no body."""
+    try:
+        body = json.loads(path.read_text(encoding="utf-8")).get(field)
+    except (OSError, ValueError, AttributeError):
+        return "unreadable"
+    return _body_digest(body) if isinstance(body, str) else "unreadable"
+
+
+def _record_of(path: Path, digest: str, field: str) -> "Path | None":
+    """The record of an id issued to `digest`, its decision first: only a record
+    holding that very body, never another body's copy under the same id."""
     for existing in (_archived(path), path):
-        if existing.exists():
+        if existing.exists() and _record_digest(existing, field) == digest:
             return existing
     return None
+
+
+@contextlib.contextmanager
+def _ledger_lock(directory: Path):
+    """The one lock under which a record directory's ids are issued, its records
+    written, and its records archived: no transition interleaves with another."""
+    issued = Path(directory) / "issued"
+    issued.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(issued / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        lock_fd(fd)
+        try:
+            yield
+        finally:
+            unlock_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _record_directory(path: Path) -> Path:
+    path = Path(path)
+    return path.parent.parent if path.parent.name == "archive" else path.parent
+
+
+def update_record(path: Path, record: dict) -> bool:
+    """Rewrite an existing record under the ledger lock; a record already archived
+    (or never written) at `path` is left alone, so a late update cannot recreate it."""
+    path = Path(path)
+    with _ledger_lock(_record_directory(path)):
+        if not path.is_file():
+            return False
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            if os.name != "nt":
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(record, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    return True
+
+
+def archive_record(path: Path) -> bool:
+    """Move a resolved record into its directory's `archive/`, under the ledger
+    lock: the id stays reserved, so it is never issued again."""
+    path = Path(path)
+    with _ledger_lock(_record_directory(path)):
+        archive = path.parent / "archive"
+        try:
+            archive.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(archive, 0o700)
+            path.replace(archive / path.name)
+        except OSError:
+            return False
+    return True
 
 
 def _find_record(path_of, state_dir: Path, task_id: str, body: str, field: str) -> Path:
     """Where the record of this exact body is, without issuing an id."""
     digest, unissued = _body_digest(body), None
-    for path in _candidates(path_of, state_dir, task_id, body):
-        owner = _issued_to(path, field)
-        if owner == digest:
-            found = _record_of(path)
-            if found is not None:
-                return found
-        elif owner is None and unissued is None:
-            unissued = path                         # where this body's record would be issued
+    first = path_of(state_dir, task_id)
+    if not first.parent.exists():
+        return first
+    with _ledger_lock(first.parent):
+        for path in _candidates(path_of, state_dir, task_id, body):
+            owner = _issued_to(path, field)
+            if owner == digest:
+                found = _record_of(path, digest, field)
+                if found is not None:
+                    return found
+            elif owner is None and unissued is None:
+                unissued = path                     # where this body's record would be issued
     return unissued or path_of(state_dir, task_id, digest)
 
 
 def _issue_record(path_of, state_dir: Path, task_id: str, body: str, field: str,
                   make_payload) -> "tuple[Path | None, bool]":
     """The record for this exact body, issuing an id only once, ever: an id
-    reserved for this body returns its existing record (its decision once archived)
-    and is never written again; one reserved for another body is skipped. Returns
-    (path, saved); serialized per directory so a reservation and its record land together."""
+    reserved for this body returns its record (its decision first) and is never
+    written again; one reserved for another body is skipped. Returns (path, saved);
+    runs under the ledger lock, as does every archive, so no transition interleaves."""
     first = path_of(state_dir, task_id)
-    issued = first.parent / "issued"
-    issued.mkdir(parents=True, exist_ok=True)
-    os.chmod(issued, 0o700)
     digest = _body_digest(body)
-    fd = os.open(issued / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        lock_fd(fd)
-        try:
-            for path in _candidates(path_of, state_dir, task_id, body):
-                owner = _issued_to(path, field)
-                if owner is None and _reserve(path, digest):
-                    return path, _write_artifact(path, make_payload(path), field)
-                if (owner or _issued_to(path, field)) == digest:
-                    found = _record_of(path)
-                    if found is not None:
-                        return found, True
-            return None, False
-        finally:
-            unlock_fd(fd)
-    finally:
-        os.close(fd)
+    with _ledger_lock(first.parent):
+        for path in _candidates(path_of, state_dir, task_id, body):
+            owner = _issued_to(path, field)
+            if owner is None and _reserve(path, digest):
+                return path, _write_artifact(path, make_payload(path), field)
+            if (owner or _issued_to(path, field)) == digest:
+                found = _record_of(path, digest, field)
+                if found is not None:
+                    return found, True
+        return None, False
 
 
 def withheld_review_artifact(state_dir: Path, task_id: str, body: str) -> Path:

@@ -554,7 +554,7 @@ class DeliveredBodyDiffers(unittest.TestCase):
         dig = outbox.source_digest
 
         def proof(source, payload=env):
-            return dict(outbox.source_proof_fields(dig(source), payload, 7.0), published_at=7.0)
+            return outbox.source_proof_fields(dig(source), payload, "p1")
         for name, fields, live, differs in (
                 ("no record", None, "C", False),
                 ("queued", {"status": "QUEUED", "payload": env, **proof("A")}, "C", False),
@@ -584,18 +584,38 @@ class DeliveredBodyDiffers(unittest.TestCase):
 
     def test_only_this_writers_stamp_with_a_matching_binding_is_trusted(self):
         env = json.dumps({"id": ITEM, "body": "A"})
-        stamped = dict(outbox.source_proof_fields(outbox.source_digest("A"), env, 7.0),
+        stamped = dict(outbox.source_proof_fields(outbox.source_digest("A"), env, "p1"),
                        payload=env, published_at=7.0)
         self.assertEqual(outbox.source_proof(stamped), outbox.source_digest("A"))
         for name, change in (("no stamp", {"proof_version": None}),
                              ("another stamp", {"proof_version": 2}),
                              ("payload rewritten by another writer", {"payload": env + " "}),
-                             ("publish rewritten by another writer", {"published_at": 8.0}),
+                             ("another publication", {"publication_id": "p2"}),
+                             ("no publication id", {"publication_id": None}),
                              ("payload-only binding of an earlier head",
                               {"source_payload_sha256": hashlib.sha256(env.encode()).hexdigest()})):
             with self.subTest(case=name):
                 self.assertIsNone(outbox.source_proof(dict(stamped, **change)))
         self.assertIsNone(outbox.source_proof(None))
+
+    def test_invariant_publication_identity_is_unique_and_written_with_its_proof(self):
+        """Two publications in the same millisecond never share an identity, and a
+        requeue gives the record a new one, re-binding only a proof still trusted."""
+        ids = {outbox.new_publication_id() for _ in range(1000)}
+        self.assertEqual(len(ids), 1000)
+        with TemporaryDirectory() as td:
+            root = Path(td) / "ob"
+            env = json.dumps({"id": ITEM, "body": "A"})
+            outbox._write_item(root, ITEM, {"item_id": ITEM, "status": "PARKED", "payload": env,
+                                            "published_at": 7.0,
+                                            **outbox.source_proof_fields(outbox.source_digest("A"), env, "p1")})
+            outbox.requeue_item(root, ITEM)
+            rec = outbox.read_item(root, ITEM)
+            self.assertNotEqual(rec["publication_id"], "p1")
+            self.assertEqual(outbox.source_proof(rec), outbox.source_digest("A"))
+            outbox._write_item(root, ITEM, dict(rec, status="PARKED", payload=env + " "))
+            outbox.requeue_item(root, ITEM)
+            self.assertIsNone(outbox.source_proof(outbox.read_item(root, ITEM)), "a stale proof is never re-bound")
 
     def test_the_source_digest_is_of_the_ready_body(self):
         self.assertEqual(outbox.source_digest("A"), hashlib.sha256(b"A").hexdigest())

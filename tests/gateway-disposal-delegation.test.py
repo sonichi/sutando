@@ -1100,7 +1100,7 @@ class BridgeDelegates(unittest.TestCase):
         out = set()
         for n in ast.walk(f):
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
-                    and isinstance(n.func.value, ast.Name) and n.func.value.id == "disposal":
+                    and isinstance(n.func.value, ast.Name) and n.func.value.id in ("disposal", "team_result_guard"):
                 out.add(n.func.attr)
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
                 out.add(n.func.id)
@@ -1127,6 +1127,21 @@ class BridgeDelegates(unittest.TestCase):
                    and n.func.id == "delivered_body_differs"]
         self.assertEqual(len(rulings), 2, "the confirmed arm and the terminal-delivered arm")
         self.assertNotIn("_record_sent_this_body", self.names())
+
+    def test_guard_records_have_one_writer_contract(self):
+        """Every write and archive of an owner-review record goes through the guard's
+        ledger-locked owner; the bridge never writes or moves one itself."""
+        self.assertIn("archive_record", self.calls_in("_archive_resolved_review"))
+        for fn in ("_route_withheld_review", "_publish_review", "_resolve_review_card",
+                   "_handle_review_decision"):
+            calls = self.calls_in(fn)
+            self.assertIn("update_record", calls, fn)
+            self.assertNotIn("_atomic_private_json", calls, fn)
+        f = next(n for n in ast.walk(self.tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "_archive_resolved_review")
+        moves = [n.func.attr for n in ast.walk(f) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute) and n.func.attr in ("replace", "rename")]
+        self.assertEqual(moves, [], "the bridge moves a review record itself")
 
     def test_a_reply_ruled_unsent_goes_through_the_delivery_guards(self):
         calls = self.calls_in("_quarantine_unsent")

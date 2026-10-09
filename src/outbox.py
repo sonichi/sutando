@@ -29,6 +29,7 @@ import math
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
@@ -893,10 +894,15 @@ def read_item(root: Path, item_id: str) -> Optional[dict]:
 PROOF_VERSION = 1
 
 
-def _proof_binding(payload: str, published_at) -> str:
+def new_publication_id() -> str:
+    """A fresh identity for one publish or requeue by this writer (never a clock value)."""
+    return uuid.uuid4().hex
+
+
+def _proof_binding(payload: str, publication_id) -> str:
     """What a stamped proof vouches for: this version, the stored payload and the
-    publish that wrote it. Any other writer of the payload rewrites `published_at`."""
-    return hashlib.sha256(json.dumps([PROOF_VERSION, payload, published_at]).encode("utf-8")).hexdigest()
+    publication that wrote them. It only ever decides archive versus quarantine."""
+    return hashlib.sha256(json.dumps([PROOF_VERSION, payload, publication_id]).encode("utf-8")).hexdigest()
 
 
 def source_proof(record: Optional[dict]) -> Optional[str]:
@@ -907,17 +913,19 @@ def source_proof(record: Optional[dict]) -> Optional[str]:
         return None
     proof, payload = record.get("source_ready_sha256"), record.get("payload")
     if (record.get("proof_version") != PROOF_VERSION or not proof or not isinstance(payload, str)
-            or record.get("source_payload_sha256") != _proof_binding(payload, record.get("published_at"))):
+            or not record.get("publication_id")
+            or record.get("source_payload_sha256") != _proof_binding(payload, record.get("publication_id"))):
         return None
     return proof
 
 
-def source_proof_fields(source_ready_sha256: Optional[str], payload: str, published_at) -> dict:
-    """Every source-proof field, written atomically with the payload and publish they vouch for."""
-    if not source_ready_sha256:
-        return {}
-    return {"proof_version": PROOF_VERSION, "source_ready_sha256": source_ready_sha256,
-            "source_payload_sha256": _proof_binding(payload, published_at)}
+def source_proof_fields(source_ready_sha256: Optional[str], payload: str, publication_id: str) -> dict:
+    """Every source-proof field, written atomically with the payload and publication they vouch for."""
+    fields = {"publication_id": publication_id}
+    if source_ready_sha256:
+        fields.update(proof_version=PROOF_VERSION, source_ready_sha256=source_ready_sha256,
+                      source_payload_sha256=_proof_binding(payload, publication_id))
+    return fields
 
 
 def source_digest(ready_body: str) -> str:
@@ -1023,5 +1031,9 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
+        proof = source_proof(d)
+        for field in ("proof_version", "source_ready_sha256", "source_payload_sha256"):
+            d.pop(field, None)
+        d.update(source_proof_fields(proof, d.get("payload") or "", new_publication_id()))
         _write_item(root, item_id, d)
         return RequeueOutcome.REQUEUED, d["resend_epoch"]

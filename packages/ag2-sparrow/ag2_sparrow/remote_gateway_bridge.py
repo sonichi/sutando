@@ -303,7 +303,7 @@ from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
-from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest, source_proof
+from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
@@ -846,7 +846,7 @@ def _route_withheld_review(path: Path) -> bool:
     record.update({"status": "awaiting_owner", "owner": owner, "dm_room_id": room,
                    "dm_event_id": str(answer.get("event_id") or ""),
                    "dm_sent_at": time.time()})
-    _atomic_private_json(path, record)
+    team_result_guard.update_record(path, record)
     return True
 
 
@@ -875,14 +875,7 @@ def _archive_resolved_review(path: Path, record: dict) -> bool:
         return False
     if record.get("card_resolution_pending"):
         return False
-    archive = path.parent / "archive"
-    try:
-        archive.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(archive, 0o700)
-        path.replace(archive / path.name)
-    except OSError:
-        return False
-    return True
+    return team_result_guard.archive_record(path)
 
 
 def _decision_text(task: dict) -> str:
@@ -941,7 +934,7 @@ def _publish_review(path: Path, record: dict) -> bool:
     if not room.startswith("!") or not body:
         record.update({"status": "publish_failed", "publish_error": "invalid origin/body",
                        "card_resolution_pending": True})
-        _atomic_private_json(path, record)
+        team_result_guard.update_record(path, record)
         return False
     answer = _req("POST", "/v1/room", {
         "op": "message", "room_id": room, "body": body,
@@ -952,7 +945,7 @@ def _publish_review(path: Path, record: dict) -> bool:
     record.update({"status": "published", "published_at": time.time(),
                    "published_event_id": str(answer.get("event_id") or ""),
                    "card_resolution_pending": True})
-    _atomic_private_json(path, record)
+    team_result_guard.update_record(path, record)
     return True
 
 
@@ -985,7 +978,7 @@ def _resolve_review_card(path: Path, record: dict) -> bool:
     record.update({"card_resolution_pending": False,
                    "card_resolved_at": time.time(),
                    "card_resolution_event_id": str(answer.get("event_id") or "")})
-    _atomic_private_json(path, record)
+    team_result_guard.update_record(path, record)
     _archive_resolved_review(path, record)
     return True
 
@@ -1043,7 +1036,7 @@ def _handle_review_decision(task: dict) -> bool:
     if answer == "yes":
         record.update({"status": "kept_private", "resolved_at": time.time(),
                        "decision": "sensitive", "card_resolution_pending": True})
-        _atomic_private_json(path, record)
+        team_result_guard.update_record(path, record)
         _queue_review_control_result(task)
         try:
             _resolve_review_card(path, record)
@@ -1054,7 +1047,7 @@ def _handle_review_decision(task: dict) -> bool:
     # dedupe key so they cannot duplicate the disclosure.
     record.update({"status": "publish_pending", "resolved_at": time.time(),
                    "decision": "false_positive", "card_resolution_pending": True})
-    _atomic_private_json(path, record)
+    team_result_guard.update_record(path, record)
     _queue_review_control_result(task)
     try:
         _resolve_review_card(path, record)
@@ -4491,10 +4484,22 @@ def _live_source(result_file, generation) -> "str | None":
     return ready.body
 
 
-def _delivery_provable(item_id: str) -> bool:
-    """The delivered record carries this writer's stamped source proof."""
+def _delivered_wire_body(item_id: str) -> "str | None":
+    """The reply body the delivered record says went out; None when unknown."""
     root = getattr(_delivery_core().backend, "root", None)
-    return root is not None and source_proof(read_item(root, item_id)) is not None
+    record = read_item(root, item_id) if root is not None else None
+    try:
+        stored = json.loads((record or {}).get("payload") or "")
+    except (TypeError, ValueError):
+        return None
+    body = stored.get("body") if isinstance(stored, dict) else None
+    return body if isinstance(body, str) else None
+
+
+def _composed_wire_body(actions, parsed_body: str) -> str:
+    """The body the drain composes for a guarded reply (the redirect rides it)."""
+    redirect = next((a for a in actions if a.kind == "redirect"), None)
+    return f"[channel: {redirect.value}]\n{parsed_body}" if redirect else parsed_body
 
 
 def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> None:
@@ -4531,7 +4536,8 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
     if body is None:
         _log(f"result {tid}: {why}; the result guard is unavailable ({withheld}), left for the next pass")
         return
-    actions = parse_markers(body).actions
+    parsed = parse_markers(body)
+    actions = parsed.actions
     skip = next((a for a in actions if a.kind == "skip"), None)
     if skip is not None:
         done = disposal.retire_generation(RESULTS_DIR, result_file, generation, _log,
@@ -4544,6 +4550,13 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
             _log(f"result {tid}: {why}; it is {what} but could not be archived "
                  f"({done.cause}); the next pass retries")
         return
+    # A manual send needs positive evidence independent of any persisted proof: the
+    # body this reply composes to differs from the body the record says went out.
+    sent = _delivered_wire_body(item_id)
+    differs = sent is not None and _composed_wire_body(actions, parsed.body) != sent
+    restriction = next((f"[{a.kind}]" if a.kind == "dm-only" else
+                        f"[channel: {a.value}]" if a.kind == "redirect" else f"[file: {a.value}]"
+                        for a in actions if a.kind in ("dm-only", "redirect", "attach")), None)
     if any(a.kind == "dm-only" for a in actions):
         because = ("it is marked [dm-only]: review it; it may only ever reach the owner's DM, "
                    "never a room")
@@ -4552,11 +4565,10 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
         because = (f"it is addressed to [channel: {where}] only: review it; never post it anywhere else")
     elif withheld:
         because = f"the result guard withheld it ({withheld}): review it; do not send it by hand"
-    elif any(a.kind != "skip" for a in actions) and not _delivery_provable(item_id):
-        # A marked reply composes to a different wire body; without the stamped proof
-        # its delivery cannot be ruled out.
-        because = ("its outbox record carries no source proof from this writer, so whether it was "
-                   "already delivered cannot be proven: review it; it may already have been sent")
+    elif not differs:
+        because = ("its wire body matches the one already delivered"
+                   + (f" ({restriction} aside)" if restriction else "")
+                   + " or cannot be compared: review it; it may already have been sent")
     else:
         because = "its outbox id is already delivered, so a requeue cannot resend it: send it by hand"
     _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id, generation=generation,
