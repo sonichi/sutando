@@ -1101,6 +1101,28 @@ class TestSeatNotices(unittest.TestCase):
         self.assertEqual(_mod.relay_seat_notices(
             os.path.join(self.d, "core-supervisor.sutando-worker-ab.json"), self.state, dry_run=True), [])
 
+    def test_an_unreadable_seat_signal_is_skipped_not_fatal(self):
+        # A seat's own file can be mid-write (truncated/invalid JSON) when a sibling
+        # scan lands on it; that seat is silently skipped, not a crash for every seat.
+        with open(os.path.join(self.d, "core-supervisor.sutando-worker-bad.json"), "w") as f:
+            f.write("{not json")
+        self._seat("sutando-worker-ab", _FABLE_REFUSED_AUTO)
+        out = _mod.relay_seat_notices(self.core, self.state, dry_run=True)
+        self.assertEqual(len(out), 1)
+        self.assertIn("Pro-fast", out[0])
+
+    def test_an_unopenable_seat_signal_is_skipped_not_fatal(self):
+        # Permission denied on open() raises OSError, not ValueError -- the other
+        # half of the except tuple.
+        self._seat("sutando-worker-ab", _FABLE_REFUSED_AUTO)
+        locked = os.path.join(self.d, "core-supervisor.sutando-worker-locked.json")
+        self._seat("sutando-worker-locked", _FABLE_REFUSED_AUTO)
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o644)
+        out = _mod.relay_seat_notices(self.core, self.state, dry_run=True)
+        self.assertEqual(len(out), 1)
+        self.assertIn("Pro-fast", out[0])
+
 
 if __name__ == "__main__":
     unittest.main()
