@@ -263,6 +263,14 @@ This installs `com.sutando.cron-runner` (launchd, every 60s → `src/cron-runner
 
 ### Mechanical shell jobs
 
+A session cron runs its body inside the core's turn, so owner tasks queue
+behind it until it finishes. Choose by what the body needs:
+
+- **Mechanical** (runs scripts, no judgment): make it a `"launchd": true` entry
+  with `"shell_command"`. It runs outside the core session entirely.
+- **Needs LLM judgment**: keep it a prompt, and have the prompt dispatch the
+  work to a background subagent instead of running it inline.
+
 Launchd-owned entries may set `"shell_command"` for work that should not wake a
 model session (for example, a polling or sync script):
 
@@ -275,10 +283,15 @@ model session (for example, a polling or sync script):
 }
 ```
 
-`src/cron-runner.py` executes the command from the repository root, logs its
-command, stdout, stderr, and exit code to `<workspace>/logs/cron-runner.log`,
-and reports non-zero exits on stderr. A shell job runs even when the core
-heartbeat is absent and never creates a `tasks/` file. If an entry contains
+`src/cron-runner.py` starts the command in a detached child from the repository
+root and returns without waiting, so a slow job never delays other launchd
+crons. The child holds a per-job lock: a fire that lands while the previous run
+is still going is skipped and logged. It enforces `shell_timeout_s` (default
+300) by killing the process tree, and appends command, stdout, stderr and exit
+code to `<workspace>/logs/cron/<name>.log`. A shell job runs even when the core
+heartbeat is absent and never creates a `tasks/` file. A job with something for
+the owner writes `results/proactive-*.txt` itself, as `src/morning-briefing.py`
+does (see "Digest cron delivery" below). If an entry contains
 more than one execution form, precedence is `shell_command` > `prompt_skill` >
 `prompt`; use only one form in new configuration.
 
