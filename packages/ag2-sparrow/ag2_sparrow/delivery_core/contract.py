@@ -58,6 +58,9 @@ class DrainResult:
     status: DrainStatus
     outcome: Optional[DeliveryOutcome] = None   # set iff status is ATTEMPTED
     detail: str = ""
+    # The typed admission proof: sha256 of the bytes this attempt handed the
+    # provider (the stored body), so a caller can tell its own payload from it.
+    dispatched_digest: Optional[str] = None
 
     def __post_init__(self):
         attempted = self.status is DrainStatus.ATTEMPTED
@@ -205,11 +208,17 @@ class ClaimBackend(Protocol):
         classified, so a record written before attempts were tracked (an
         upgrade in place) or a torn record refuses exactly like an ambiguous
         one — fail closed, visible to the operator, never a silent substitution.
-        That evidence is sticky: an attempt made before tracking began marks
-        the record (`attempt_evidence_missing`) the moment it is touched again
-        — a new attempt or an operator requeue, before `--reset-attempts` can
-        zero the only trace of it — so the counters a later retry adds never
-        launder it; only a new cycle (a fresh record) clears the mark. Each
+        That evidence is sticky: every record this code creates carries its
+        counters from zero, and a record with NO counter field — whatever else
+        it holds — is marked (`attempt_evidence_missing`) the moment it is
+        touched again (a new attempt or an operator requeue, before
+        `--reset-attempts` can zero anything), because absence cannot tell a
+        never-sent body from one a worker stored before dying; the counters a
+        later retry adds never launder it, and only a new cycle (a fresh
+        record) clears the mark. Counters are real integers; a boolean is not
+        evidence. The caller must archive a result only when the payload the
+        outbox confirmed is that result's payload: a refused or merely
+        coincident body stays visible through its quarantine. Each
         refusal of a parked id records its cause (`last_refusal`); a delivered
         id records one only when its history refuses the body (a caller's own
         no-republish policy or a live claim leaves the record untouched), and a

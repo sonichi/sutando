@@ -68,7 +68,7 @@ class DesignAClaimBackend:
         was started and exactly as many were classified by complete()."""
         started = prior.get("attempts_started")
         classified = prior.get("attempts_classified")
-        return (isinstance(started, int) and isinstance(classified, int)
+        return (outbox.is_count(started) and outbox.is_count(classified)
                 and started >= 1 and started == classified)
 
     @staticmethod
@@ -96,10 +96,11 @@ class DesignAClaimBackend:
         must itself prove that every attempt it started was classified
         (`attempts_started` == `attempts_classified`), so a record written
         before attempts were tracked, or torn, refuses like an ambiguous one;
-        an attempt made before tracking began leaves a sticky
-        `attempt_evidence_missing` mark the moment the record is touched again
-        (begin_attempt, requeue), so the counters a later retry adds can never
-        launder it. Only a new cycle (fresh record) clears either mark.
+        a record with no counters at all (written before attempts were
+        tracked) gets a sticky `attempt_evidence_missing` mark the moment it is
+        touched again (begin_attempt, requeue), so the counters a later retry
+        adds can never launder it; absence is never read as "never sent".
+        Only a new cycle (fresh record, counters stamped at zero) clears either mark.
         A republish of a DELIVERED id starts a new cycle: the delivered cycle's
         taint does not carry over, its parked history does. Each refusal
         records its cause as `last_refusal`."""
@@ -182,6 +183,7 @@ class DesignAClaimBackend:
                 "status": "READY",
                 "published_at": time.time(),
             })
+            outbox.stamp_attempt_tracking(record)
             outbox._write_item(self.root, item_id, record)
             return True
 

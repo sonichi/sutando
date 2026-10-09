@@ -14,6 +14,8 @@ Delivered evidence is written only AFTER the send returns (evidence is
 risk control, not proof — invariant 8)."""
 from __future__ import annotations
 
+import hashlib
+
 from dataclasses import dataclass
 
 from .contract import (ClaimBackend, DeliveryAttempt, DeliveryOutcome, DeliveryProvider,
@@ -139,7 +141,8 @@ class DeliveryCore:
                               park_at_attempts=self.policy.max_attempts,
                               provider=type(self.provider).__name__,
                               destination=destination, **extra)
-        return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome, detail=detail)
+        return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome, detail=detail,
+                           dispatched_digest=hashlib.sha256(payload).hexdigest())
 
     def recover(self) -> RecoverReport:
         return self.backend.recover()

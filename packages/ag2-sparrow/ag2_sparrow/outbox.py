@@ -947,17 +947,29 @@ def fold_parked_digest(d: dict, digest: str, limit: int = PARKED_HISTORY_LIMIT) 
     return True
 
 
+def is_count(value) -> bool:
+    """A persisted attempt counter: a real integer, never a JSON boolean."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def stamp_attempt_tracking(d: dict) -> None:
+    """Every record this code creates says so: the counters start at zero.
+    Their ABSENCE is what marks a record written before attempts were tracked."""
+    d["attempts_started"] = 0
+    d["attempts_classified"] = 0
+
+
 def mark_untracked_attempts(d: dict) -> bool:
-    """Sticky evidence that an attempt was made before attempts were counted
-    (`attempts` > 0, or a retry record, with no `attempts_started`): the record
-    can never prove that attempt was classified, so a fresh cycle stays refused
-    until a new cycle rebuilds the record. True when the mark was set."""
-    if isinstance(d.get("attempts_started"), int) or d.get("attempt_evidence_missing"):
+    """Sticky evidence that a record predates attempt tracking: it carries no
+    `attempts_started` counter at all. Whatever else it holds (`attempts`, a
+    retry record, nothing) cannot tell a never-sent body from one a dead
+    worker stored, so a fresh cycle stays refused until a new cycle rebuilds
+    the record. Never inferred from `attempts` or `retry`: a schedule writes
+    `retry` on the first claim of a record this code made. True when set."""
+    if is_count(d.get("attempts_started")) or d.get("attempt_evidence_missing"):
         return False
-    tried = int(d.get("attempts", 0) or 0) > 0 or isinstance(d.get("retry"), dict)
-    if tried:
-        d["attempt_evidence_missing"] = True
-    return tried
+    d["attempt_evidence_missing"] = True
+    return True
 
 
 class RequeueOutcome(str, Enum):
