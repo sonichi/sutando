@@ -299,10 +299,14 @@ class ProductionTargetGuard(unittest.TestCase):
         return subprocess.run(["/bin/bash", "-c", script, "guard", str(REPO), *args, *ambient],
                               capture_output=True, text=True)
 
-    def test_default_socket_refused_in_either_spelling(self):
-        for sock in ("/tmp/sutando-tmux.sock", "/private/tmp/sutando-tmux.sock"):
-            with self.subTest(sock=sock):
-                self.assertEqual(self.guard(sock, "witness-x-core").returncode, 2)
+    def test_default_socket_refused(self):
+        self.assertEqual(self.guard("/tmp/sutando-tmux.sock", "witness-x-core").returncode, 2)
+
+    def test_default_socket_refused_in_its_physical_spelling(self):
+        # Only macOS aliases /tmp to /private/tmp; elsewhere that spelling is a different path.
+        if os.path.realpath("/private/tmp") != os.path.realpath("/tmp"):
+            self.skipTest("this host does not alias /private/tmp to /tmp")
+        self.assertEqual(self.guard("/private/tmp/sutando-tmux.sock", "witness-x-core").returncode, 2)
 
     def test_default_session_refused(self):
         self.assertEqual(self.guard("/x/w.sock", "sutando-core").returncode, 2)
