@@ -286,6 +286,22 @@ for label, content in cases.items():
     check(unchanged(case_path, before_state), f"{label}: record bytes or mtime changed")
 bridge._STATE = root / "state"
 
+# 7b. A caller holding one well-formed claim id never publishes a record that carries another.
+bridge._STATE = root / "states" / "other-claim-id"
+directory = bridge._STATE / "withheld-team-results"
+directory.mkdir(parents=True)
+case_path = directory / "wr_0000000000000000.json"
+case_path.write_text(json.dumps({**base_record, **NO, "decision_claim_id": "cd" * 16}))
+before_state = frozen(case_path)
+before = len(shared_posts())
+check(not guard.withheld_claim_publishable(case_path, claim_id),
+      "a different well-formed claim id is not the release claim")
+check(bridge._publish_review(case_path, {**base_record, **NO, "decision_claim_id": claim_id})
+      is False and len(shared_posts()) == before,
+      "a snapshot with another claim id must not post")
+check(unchanged(case_path, before_state), "other-claim-id: record bytes or mtime changed")
+bridge._STATE = root / "state"
+
 # 8. Positive control: a release claimed by this writer, interrupted before its POST,
 # is still published exactly once by the retry loop.
 path, rid = new_review("task-claimed-retry")
