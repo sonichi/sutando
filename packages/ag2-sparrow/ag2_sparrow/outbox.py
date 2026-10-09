@@ -890,18 +890,26 @@ def read_item(root: Path, item_id: str) -> Optional[dict]:
     return _read_item(Path(root), item_id)
 
 
-def delivered_body_differs(root: Path, item_id: str, body: str) -> bool:
-    """True when the id is DELIVERED and its stored result envelope carries a
-    different reply body: a live reply holding `body` was never provably sent.
-    False with no delivered record, or one that stores no envelope."""
+def delivered_body_differs(root: Path, item_id: str, source_sha256: Optional[str],
+                           legacy_bodies: "tuple[str, ...]" = ()) -> bool:
+    """True when the id is DELIVERED and the live result was never provably what
+    was sent. Decided on `source_sha256` (of the raw result file the delivered item
+    was built from, recorded at publish or adoption), so markers and labels a path
+    composes never matter. A record without it falls back conservatively: its
+    stored wire body must equal one of `legacy_bodies`, the bodies the caller would
+    send from the live file. False with no delivered record, or no envelope."""
     d = read_item(root, item_id)
-    if not d or d.get("status") != "DELIVERED" or "payload" not in d:
+    if not d or d.get("status") != "DELIVERED":
+        return False
+    if source_sha256 and d.get("source_sha256"):
+        return d["source_sha256"] != source_sha256
+    if "payload" not in d:
         return False
     try:
         stored = json.loads(d["payload"])
     except (TypeError, ValueError):
         return True
-    return not isinstance(stored, dict) or stored.get("body") != body
+    return not isinstance(stored, dict) or stored.get("body") not in legacy_bodies
 
 
 def list_items(root: Path, status: Optional[str] = None) -> list[dict]:
@@ -986,7 +994,8 @@ def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = 
         return RequeueOutcome.REQUEUED, d["resend_epoch"]
 
 
-def adopt_resend_payload_locked(root: Path, item_id: str, payload: str) -> bool:
+def adopt_resend_payload_locked(root: Path, item_id: str, payload: str,
+                                source_sha256: Optional[str] = None) -> bool:
     """Under the caller's `_item_lock`: a requeued record awaiting its resend
     takes the bytes being published now, once per resend epoch, keeping its
     epoch and attempts. Keyed on the epoch every requeue writer has bumped, so a
@@ -1011,5 +1020,9 @@ def adopt_resend_payload_locked(root: Path, item_id: str, payload: str) -> bool:
     d["payload"] = payload
     d["published_at"] = time.time()
     d["resend_adopted_epoch"] = epoch
+    if source_sha256:
+        d["source_sha256"] = source_sha256
+    else:
+        d.pop("source_sha256", None)                 # a stale source would vouch for these bytes
     _write_item(root, item_id, d)
     return True

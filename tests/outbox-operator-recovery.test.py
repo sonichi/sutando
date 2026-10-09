@@ -668,17 +668,37 @@ class DeliveredBodyDiffers(unittest.TestCase):
 
     def test_cases(self):
         env = json.dumps({"id": ITEM, "body": "A"})
-        for name, fields, body, differs in (
-                ("no record", None, "C", False),
-                ("queued", {"status": "QUEUED", "payload": env}, "C", False),
-                ("delivered, no envelope stored", {"status": "DELIVERED"}, "C", False),
-                ("delivered, same body", {"status": "DELIVERED", "payload": env}, "A", False),
-                ("delivered, other body", {"status": "DELIVERED", "payload": env}, "C", True),
-                ("delivered, unreadable envelope", {"status": "DELIVERED", "payload": "{"}, "A", True),
-                ("delivered, envelope not an object", {"status": "DELIVERED", "payload": "[]"}, "A", True)):
+        for name, fields, source, legacy, differs in (
+                ("no record", None, "s1", ("C",), False),
+                ("queued", {"status": "QUEUED", "payload": env, "source_sha256": "s1"}, "s2", (), False),
+                ("delivered, same source, composed body differs",
+                 {"status": "DELIVERED", "payload": env, "source_sha256": "s1"}, "s1", ("C",), False),
+                ("delivered, other source, composed body equal",
+                 {"status": "DELIVERED", "payload": env, "source_sha256": "s1"}, "s2", ("A",), True),
+                ("legacy delivered, no envelope stored", {"status": "DELIVERED"}, "s1", ("C",), False),
+                ("legacy delivered, a sendable body matches", {"status": "DELIVERED", "payload": env},
+                 "s1", ("[REPLIED] raw", "A"), False),
+                ("legacy delivered, no body matches", {"status": "DELIVERED", "payload": env}, "s1", ("C",), True),
+                ("caller without a source, record with one",
+                 {"status": "DELIVERED", "payload": env, "source_sha256": "s1"}, None, ("A",), False),
+                ("legacy delivered, unreadable envelope", {"status": "DELIVERED", "payload": "{"}, "s1", ("A",), True),
+                ("legacy delivered, envelope not an object", {"status": "DELIVERED", "payload": "[]"},
+                 "s1", ("A",), True)):
             with self.subTest(case=name), TemporaryDirectory() as td:
                 root = self._rec(td, **fields) if fields is not None else Path(td) / "ob"
-                self.assertIs(outbox.delivered_body_differs(root, ITEM, body), differs)
+                self.assertIs(outbox.delivered_body_differs(root, ITEM, source, legacy), differs)
+
+    def test_an_adoption_without_a_source_drops_the_stale_one(self):
+        with TemporaryDirectory() as td:
+            root = self._rec(td, status="QUEUED", payload="A", resend_epoch=1, attempts=0,
+                             source_sha256="sA")
+            with outbox._item_lock(root, ITEM):
+                self.assertTrue(outbox.adopt_resend_payload_locked(root, ITEM, "B"))
+            self.assertNotIn("source_sha256", outbox.read_item(root, ITEM))
+            outbox._write_item(root, ITEM, dict(outbox.read_item(root, ITEM), resend_epoch=2))
+            with outbox._item_lock(root, ITEM):
+                self.assertTrue(outbox.adopt_resend_payload_locked(root, ITEM, "C", "sC"))
+            self.assertEqual(outbox.read_item(root, ITEM)["source_sha256"], "sC")
 
 
 class CliRenderingAndErrorPaths(unittest.TestCase):
