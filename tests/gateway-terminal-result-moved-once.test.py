@@ -101,7 +101,8 @@ class TerminalResultMovedOnce(unittest.TestCase):
                       INFLIGHT_FILE=self.root / 'state' / 'inflight.json',
                       GATEWAY_INSTANCE='', _INST_SUFFIX='', _DELIVERY_CORE=core,
                       _req=self.server.request, _log=self.lines.append,
-                      _last_orphan_sweep=0.0, _orphan_quarantine_logged=set())
+                      _last_orphan_sweep=0.0, _orphan_quarantine_logged=set(),
+                      _WITHHELD_TASK_OUTPUT={})
         if hasattr(gw, 'disposal'):
             values['disposal'] = disposal
         stack = contextlib.ExitStack()
@@ -926,16 +927,53 @@ class TerminalResultMovedOnce(unittest.TestCase):
         outbox._write_item(self.outbox, TID, rec)
 
     def test_an_identical_late_copy_of_a_marked_reply_is_archived_as_a_duplicate(self):
-        for body, legacy in [(b, l) for b in self.MARKED for l in (False, True)]:
-            with self.subTest(body=body, legacy_record=legacy):
+        for body in self.MARKED:
+            with self.subTest(body=body):
                 self.setUp()
-                result, posts = self._delivered_then_late(
-                    body, first=body, before_late=self._forget_the_source if legacy else None)
+                result, posts = self._delivered_then_late(body, first=body)
                 self.assertFalse(result.exists())
                 self.assertEqual(self.quarantined_bodies(), [])
                 self.assertEqual(len(list((self.results / 'archive').rglob(f'{TID}-*-late-duplicate*.txt'))), 1)
                 self.assertEqual(len(self.server.calls), posts, 'no second POST')
                 self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
+
+    def test_a_record_without_a_source_proves_only_an_unmarked_identical_copy(self):
+        """Fail closed: a digest-less record cannot prove a marked source; a skip
+        marker still owes nothing, an action marker goes to review."""
+        cases = (('BODY-A the reply', 'archived'),
+                 ('[REPLIED] Posted it in the room.', 'archived'),
+                 ('[no-send]\ninternal, nothing to say', 'archived'),
+                 ('[dm-only]\nBODY-A the reply', 'review'),
+                 # The redirect rides the wire body unchanged, so its source is provable.
+                 ('[channel: !other:ag2.space]\nBODY-A the reply', 'archived'))
+        for body, outcome in cases:
+            with self.subTest(body=body):
+                self.setUp()
+                result, posts = self._delivered_then_late(body, first=body,
+                                                          before_late=self._forget_the_source)
+                self.assertFalse(result.exists())
+                self.assertEqual(len(self.server.calls), posts, 'no second POST')
+                self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
+                if outcome == 'archived':
+                    self.assertIn(body, self._archived_bodies())
+                    self.assertEqual(self.quarantined_bodies(), [])
+                else:
+                    self.assertIn(body, self.quarantined_bodies())
+                    self.assertTrue(any('review it' in l for l in self.lines), self.lines)
+
+    def test_a_record_without_a_source_never_archives_a_new_action_around_the_old_body(self):
+        """The old wire body under a new [dm-only], [channel:] or [file:]: the action
+        was never performed, so it is not a duplicate."""
+        for late in ('[dm-only]\nBODY-A the reply', '[channel: !other:ag2.space]\nBODY-A the reply',
+                     '[file: /tmp/new-report.txt]\nBODY-A the reply'):
+            with self.subTest(late=late):
+                self.setUp()
+                result, posts = self._delivered_then_late(late, before_late=self._forget_the_source)
+                self.assertFalse(result.exists())
+                self.assertIn(late, self.quarantined_bodies())
+                self.assertNotIn(late, self._archived_bodies())
+                self.assertEqual(len(self.server.calls), posts)
+                self.assertFalse(any('moved aside' in l for l in self.lines), self.lines)
 
     def test_a_different_suppressed_reply_is_archived_never_handed_over(self):
         result, posts = self._delivered_then_late('[no-send]\nsomething internal')
@@ -944,11 +982,18 @@ class TerminalResultMovedOnce(unittest.TestCase):
         self.assertIn('[no-send]\nsomething internal', self._archived_bodies())
         self.assertEqual(len(self.server.calls), posts)
         self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
-        self.assertTrue(any('suppressed' in l and 'owes no delivery' in l for l in self.lines), self.lines)
+        self.assertTrue(any('suppressed' in l and 'owes no room delivery' in l for l in self.lines), self.lines)
 
     def test_a_suppressed_reply_that_cannot_be_archived_stays_for_the_next_pass(self):
         failed = disposal.Retired(disposal.Retirement.FAILED, None, 'the disposal lock is busy')
-        with patch.object(disposal, 'retire_generation', return_value=failed):
+        real = disposal.retire_generation
+
+        def fail_only_the_suppressed_archive(results_dir, rfile, generation, log, directory, names):
+            names = list(names)
+            if names and '-suppressed' in names[0]:
+                return failed
+            return real(results_dir, rfile, generation, log, directory, names)
+        with patch.object(disposal, 'retire_generation', fail_only_the_suppressed_archive):
             result, posts = self._delivered_then_late('[no-send]\nsomething internal')
         self.assertTrue(result.exists(), 'a failed archive leaves it live')
         self.assertTrue(any('could not be archived' in l for l in self.lines), self.lines)
@@ -956,6 +1001,107 @@ class TerminalResultMovedOnce(unittest.TestCase):
         gw._reconcile_orphan_results(set())
         self.assertIn('[no-send]\nsomething internal', self._archived_bodies())
         self.assertEqual((self.quarantined_bodies(), len(self.server.calls)), ([], posts))
+
+    def test_a_late_copy_differing_only_in_surrounding_whitespace_is_a_duplicate(self):
+        for first, late in (('BODY-A the reply', 'BODY-A the reply\n'),
+                            ('BODY-A the reply\n', 'BODY-A the reply'),
+                            ('BODY-A the reply', '\n  BODY-A the reply  \n\n')):
+            with self.subTest(first=first, late=late):
+                self.setUp()
+                result, posts = self._delivered_then_late(late, first=first)
+                self.assertFalse(result.exists())
+                self.assertEqual(self.quarantined_bodies(), [])
+                self.assertEqual(len(list((self.results / 'archive').rglob(f'{TID}-*-late-duplicate*.txt'))), 1)
+                self.assertEqual(len(self.server.calls), posts)
+                self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
+
+    def test_a_whitespace_rewrite_after_a_crash_before_the_archive_is_archived_by_the_drain(self):
+        class Crash(BaseException):
+            pass
+        self.bridge()
+        self.task()
+        self.server.accepting = True
+        result = self.result('BODY-A the reply')
+        with patch.object(gw, '_archive_result', side_effect=Crash):
+            with self.assertRaises(Crash):
+                gw._post_ready_results({TID})
+        posts = len(self.server.calls)
+        result.write_text('BODY-A the reply\n')
+        self.bridge(self.core())
+        gw._post_ready_results({TID})
+        self.assertFalse(result.exists())
+        self.assertEqual(self.quarantined_bodies(), [])
+        self.assertIn('BODY-A the reply\n', self._archived_bodies())
+        self.assertEqual(len(self.server.calls), posts)
+
+    def test_the_stored_source_is_what_tells_a_restricted_rewrite_from_a_duplicate(self):
+        """Same text plus a restriction marker: only the digest the drain stored at
+        publish shows it is another source (without it, the stripped text matches)."""
+        for late in ('[dm-only]\nBODY-A the reply', '[channel: !other:ag2.space]\nBODY-A the reply'):
+            with self.subTest(late=late):
+                self.setUp()
+                result, posts = self._delivered_then_late(late)
+                rec = outbox.read_item(self.outbox, TID)
+                self.assertEqual(rec.get('source_sha256'),
+                                 hashlib.sha256('BODY-A the reply'.encode()).hexdigest())
+                self.assertIn(late, self.quarantined_bodies())
+                self.assertNotIn(late, self._archived_bodies())
+                self.assertTrue(any('review it' in l for l in self.lines), self.lines)
+                self.assertEqual(len(self.server.calls), posts)
+
+    def _team_task(self, **extra):
+        lines = [f'id: {TID}', 'source: ag2space', f'channel_id: {ROOM}', 'user_id: @alice:ag2.space',
+                 'access_tier: team'] + [f'{k}: {v}' for k, v in extra.items()] + ['task: Same question']
+        (self.tasks / f'{TID}.txt').write_text('\n'.join(lines) + '\n')
+
+    def _team_delivered_then_late(self, late, **extra):
+        self.bridge()
+        self._team_task(**extra)
+        gw._record_task_room(TID, ROOM)
+        self.server.accepting = True
+        result = self.result('BODY-A the reply')
+        gw._post_ready_results({TID})
+        self.assertEqual(outbox.item_status(self.outbox, TID), 'DELIVERED')
+        posts = len(self.server.calls)
+        result.write_text(late)
+        os.utime(result, (time.time() - gw.ORPHAN_GRACE_S - 60,) * 2)
+        gw._reconcile_orphan_results(set())
+        return result, posts
+
+    def test_a_team_suppression_at_a_delivered_id_is_journalled_by_the_guard(self):
+        from ag2_sparrow import team_result_guard as trg
+        result, posts = self._team_delivered_then_late('[no-send]')
+        self.assertIn('[no-send]', self._archived_bodies())
+        self.assertEqual(len(self.server.calls), posts)
+        journal = self.root / 'state' / trg.SUPPRESSED_RESULT_DIR
+        self.assertTrue(journal.is_dir() and any(journal.iterdir()), 'no suppression journal')
+        self.assertFalse(any('by hand' in l for l in self.lines), self.lines)
+
+    def test_a_team_attachment_at_a_delivered_id_is_withheld_for_owner_review(self):
+        from ag2_sparrow import team_result_guard as trg
+        routed = []
+        with patch.object(gw, '_route_withheld_review', side_effect=lambda p: routed.append(p) or True):
+            result, posts = self._team_delivered_then_late('[file: /tmp/private-report.txt]\nBODY-C')
+        self.assertFalse(result.exists())
+        self.assertEqual(len(self.server.calls), posts)
+        self.assertTrue(routed, 'the withheld review never reached the owner')
+        self.assertTrue((self.root / 'state' / trg.WITHHELD_RESULT_DIR).is_dir())
+        said = [l for l in self.lines if UNSENT in l]
+        self.assertEqual(len(said), 1, self.lines)
+        self.assertIn('withheld by the result guard', said[0])
+        self.assertNotIn('by hand', said[0])
+
+    def test_an_owner_mention_result_at_a_delivered_id_goes_to_the_owner_dm(self):
+        with patch.object(gw, 'resolve_destination', lambda audience, **kw: '!ownerdm:ag2.space'):
+            result, posts = self._team_delivered_then_late('BODY-C a later answer', owner_mentioned='true')
+        self.assertFalse(result.exists())
+        self.assertEqual(len(self.server.calls), posts, 'nothing reaches the room')
+        self.assertIn('BODY-C a later answer', self.quarantined_bodies())
+        self.assertNotIn('BODY-C a later answer', self._archived_bodies())
+        said = [l for l in self.lines if UNSENT in l]
+        self.assertEqual(len(said), 1, self.lines)
+        self.assertIn("owner's DM", said[0])
+        self.assertNotIn('by hand', said[0])
 
     def test_a_different_restricted_reply_is_quarantined_for_review_not_sending(self):
         for body, says in (('[dm-only]\nprivate detail for the owner', "owner's DM"),
@@ -975,9 +1121,10 @@ class TerminalResultMovedOnce(unittest.TestCase):
         """The sweep recomposes it with its recovery label; the source decides, not the label."""
         class Crash(BaseException):
             pass
-        bodies = ('BODY-A the reply', '[dm-only]\nBODY-A the reply',
-                  '[channel: !other:ag2.space]\nBODY-A the reply')
-        for body, legacy in [(b, l) for b in bodies for l in (False, True)]:
+        cases = [(b, False, True) for b in ('BODY-A the reply', '[dm-only]\nBODY-A the reply',
+                                            '[channel: !other:ag2.space]\nBODY-A the reply')]
+        cases += [('BODY-A the reply', True, True), ('[dm-only]\nBODY-A the reply', True, False)]
+        for body, legacy, archived in cases:
             with self.subTest(body=body, legacy_record=legacy):
                 self.setUp()
                 self.bridge()
@@ -995,9 +1142,12 @@ class TerminalResultMovedOnce(unittest.TestCase):
                 os.utime(result, (time.time() - gw.ORPHAN_GRACE_S - 60,) * 2)
                 gw._reconcile_orphan_results(set())
                 self.assertFalse(result.exists())
-                self.assertEqual(self.quarantined_bodies(), [])
-                self.assertIn(body, self._archived_bodies())
                 self.assertEqual(len(self.server.calls), posts, 'no second POST')
+                if archived:
+                    self.assertEqual(self.quarantined_bodies(), [])
+                    self.assertIn(body, self._archived_bodies())
+                else:                                    # fail closed: a marked source is unprovable
+                    self.assertIn(body, self.quarantined_bodies())
 
     def test_a_byte_identical_late_copy_is_archived_as_a_duplicate(self):
         result, posts = self._delivered_then_late('BODY-A the reply')

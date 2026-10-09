@@ -5,6 +5,7 @@ never manufacture a second delivery.
 Epoch assertions run against the SHIPPED key derivation, not a re-computation.
 """
 import contextlib
+import hashlib
 import json
 import os
 import sys
@@ -668,25 +669,28 @@ class DeliveredBodyDiffers(unittest.TestCase):
 
     def test_cases(self):
         env = json.dumps({"id": ITEM, "body": "A"})
-        for name, fields, source, legacy, differs in (
-                ("no record", None, "s1", ("C",), False),
-                ("queued", {"status": "QUEUED", "payload": env, "source_sha256": "s1"}, "s2", (), False),
-                ("delivered, same source, composed body differs",
-                 {"status": "DELIVERED", "payload": env, "source_sha256": "s1"}, "s1", ("C",), False),
-                ("delivered, other source, composed body equal",
-                 {"status": "DELIVERED", "payload": env, "source_sha256": "s1"}, "s2", ("A",), True),
-                ("legacy delivered, no envelope stored", {"status": "DELIVERED"}, "s1", ("C",), False),
-                ("legacy delivered, a sendable body matches", {"status": "DELIVERED", "payload": env},
-                 "s1", ("[REPLIED] raw", "A"), False),
-                ("legacy delivered, no body matches", {"status": "DELIVERED", "payload": env}, "s1", ("C",), True),
-                ("caller without a source, record with one",
-                 {"status": "DELIVERED", "payload": env, "source_sha256": "s1"}, None, ("A",), False),
-                ("legacy delivered, unreadable envelope", {"status": "DELIVERED", "payload": "{"}, "s1", ("A",), True),
-                ("legacy delivered, envelope not an object", {"status": "DELIVERED", "payload": "[]"},
-                 "s1", ("A",), True)):
+        dig = outbox.source_digest
+        for name, fields, live, differs in (
+                ("no record", None, "C", False),
+                ("queued", {"status": "QUEUED", "payload": env, "source_sha256": dig("A")}, "C", False),
+                ("delivered, same source", {"status": "DELIVERED", "payload": env,
+                                            "source_sha256": dig("[dm-only]\nA")}, "[dm-only]\nA", False),
+                ("delivered, other source, same wire body", {"status": "DELIVERED", "payload": env,
+                                                             "source_sha256": dig("A")}, "[dm-only]\nA", True),
+                ("legacy delivered, identical unmarked source", {"status": "DELIVERED", "payload": env}, "A", False),
+                ("legacy delivered, marked source", {"status": "DELIVERED", "payload": env}, "[dm-only]\nA", True),
+                ("legacy delivered, other source", {"status": "DELIVERED", "payload": env}, "C", True),
+                ("legacy delivered, no envelope stored", {"status": "DELIVERED"}, "A", True),
+                ("legacy delivered, unreadable envelope", {"status": "DELIVERED", "payload": "{"}, "A", True),
+                ("legacy delivered, envelope not an object", {"status": "DELIVERED", "payload": "[]"}, "A", True),
+                ("delivered, nothing readable live", {"status": "DELIVERED", "payload": env,
+                                                      "source_sha256": dig("A")}, None, True)):
             with self.subTest(case=name), TemporaryDirectory() as td:
                 root = self._rec(td, **fields) if fields is not None else Path(td) / "ob"
-                self.assertIs(outbox.delivered_body_differs(root, ITEM, source, legacy), differs)
+                self.assertIs(outbox.delivered_body_differs(root, ITEM, live), differs)
+
+    def test_the_source_digest_is_of_the_ready_body(self):
+        self.assertEqual(outbox.source_digest("A"), hashlib.sha256(b"A").hexdigest())
 
     def test_an_adoption_without_a_source_drops_the_stale_one(self):
         with TemporaryDirectory() as td:

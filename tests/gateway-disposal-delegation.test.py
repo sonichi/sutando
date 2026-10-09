@@ -1128,6 +1128,11 @@ class BridgeDelegates(unittest.TestCase):
         self.assertEqual(len(rulings), 2, "the confirmed arm and the terminal-delivered arm")
         self.assertNotIn("_record_sent_this_body", self.names())
 
+    def test_a_reply_ruled_unsent_goes_through_the_delivery_guards(self):
+        calls = self.calls_in("_quarantine_unsent")
+        for guard in ("_owner_mention_disposition", "_guarded_result_body", "parse_markers"):
+            self.assertIn(guard, calls, guard)
+
     # Every function of the bridge that still moves or removes a file, as of
     # this head; a new one is a private disposal path until proven otherwise.
     MOVERS = {"_atomic_private_json", "_backup_tier_map_to_disk", "_emit_gateway_status",

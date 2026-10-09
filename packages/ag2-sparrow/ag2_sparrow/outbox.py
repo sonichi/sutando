@@ -890,26 +890,30 @@ def read_item(root: Path, item_id: str) -> Optional[dict]:
     return _read_item(Path(root), item_id)
 
 
-def delivered_body_differs(root: Path, item_id: str, source_sha256: Optional[str],
-                           legacy_bodies: "tuple[str, ...]" = ()) -> bool:
-    """True when the id is DELIVERED and the live result was never provably what
-    was sent. Decided on `source_sha256` (of the raw result file the delivered item
-    was built from, recorded at publish or adoption), so markers and labels a path
-    composes never matter. A record without it falls back conservatively: its
-    stored wire body must equal one of `legacy_bodies`, the bodies the caller would
-    send from the live file. False with no delivered record, or no envelope."""
+def source_digest(ready_body: str) -> str:
+    """The digest an outbox record keeps of the result it was built from: the
+    readiness-normalized body, so surrounding whitespace is the same source."""
+    return hashlib.sha256(ready_body.encode("utf-8")).hexdigest()
+
+
+def delivered_body_differs(root: Path, item_id: str, ready_body: Optional[str]) -> bool:
+    """True when the id is DELIVERED and a live result whose ready body is
+    `ready_body` was never provably what was sent (None: nothing provable).
+    Decided on the record's `source_sha256`. A record without it proves only a
+    source identical to its stored wire body; any marker a path strips or acts on
+    ([dm-only], [channel:], [file:]...) makes the source unprovable, so it fails closed."""
     d = read_item(root, item_id)
     if not d or d.get("status") != "DELIVERED":
         return False
-    if source_sha256 and d.get("source_sha256"):
-        return d["source_sha256"] != source_sha256
-    if "payload" not in d:
-        return False
+    if ready_body is None:
+        return True
+    if d.get("source_sha256"):
+        return d["source_sha256"] != source_digest(ready_body)
     try:
-        stored = json.loads(d["payload"])
+        stored = json.loads(d.get("payload") or "")
     except (TypeError, ValueError):
         return True
-    return not isinstance(stored, dict) or stored.get("body") not in legacy_bodies
+    return not isinstance(stored, dict) or stored.get("body") != ready_body
 
 
 def list_items(root: Path, status: Optional[str] = None) -> list[dict]:

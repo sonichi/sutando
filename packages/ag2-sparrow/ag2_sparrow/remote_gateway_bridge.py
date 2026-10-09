@@ -303,7 +303,7 @@ from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
-from .outbox import RetrySchedule, delivered_body_differs, read_item
+from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
@@ -4477,56 +4477,55 @@ def _worker_of(task_id: str) -> str:
 _RECOVERED_LABEL = "(recovered result — original delivery was lost)\n"
 
 
-def _sent_as(body: str) -> "tuple[str, ...]":
-    """The wire bodies one composed `body` stands for: itself, and without the
-    sweep's recovery label (the drain composes the same reply unlabelled)."""
-    plain = body
-    head, sep, rest = body.partition("\n")
-    if sep and head.startswith("[channel:") and rest.startswith(_RECOVERED_LABEL):
-        plain = f"{head}\n{rest[len(_RECOVERED_LABEL):]}"
-    elif body.startswith(_RECOVERED_LABEL):
-        plain = body[len(_RECOVERED_LABEL):]
-    return (body, plain) if plain != body else (body,)
-
-
-def _legacy_wire_bodies(raw: str) -> "tuple[str, ...]":
-    """For a delivered record that predates source digests: what the drain would
-    have sent for these bytes, including a suppressed reply's canonical close."""
-    parsed = parse_markers(raw)
-    skip = next((a for a in parsed.actions if a.kind == "skip"), None)
-    bodies = {raw, parsed.body}
-    redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
-    if redirect:
-        bodies.add(f"[channel: {redirect.value}]\n{parsed.body}")
-    if skip:
-        bodies.add(_lease_close_body(skip))
-    return tuple(sorted(bodies))
-
-
-def _source_digest(generation) -> "str | None":
-    return getattr(generation, "digest", None)
+def _live_source(result_file, generation) -> "str | None":
+    """The ready body of the generation this pass read, or None when the file
+    no longer holds it: the digest an outbox record keeps is of this text."""
+    if result_file is None:
+        return None
+    ready = read_ready_result_with_identity(result_file)
+    if ready is None or (generation is not None and ready.identity != generation):
+        return None
+    return ready.body
 
 
 def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> None:
-    """The outbox owner ruled this live reply never provably sent. Its own markers
-    decide what the operator is told: a suppressed reply owes no delivery and is
-    archived; a restricted one is never handed over as "send it". A failed move
-    leaves it live and the next pass rules again."""
+    """The outbox owner ruled this live reply never provably sent. It goes through
+    the same owner-mention and result-guard policy as a delivery, never resent; the
+    guarded body's markers decide what the operator is told. A failed move leaves
+    it live and the next pass rules again."""
     why = "a different reply was published after this id was delivered"
     if result_file is None:
         _log(f"result {tid}: {why} — not retrying")
         return
     ready = read_ready_result_with_identity(result_file)
-    actions = parse_markers(ready.body if ready else "").actions
+    raw = ready.body if ready else ""
+    mention = _owner_mention_disposition(tid, raw)
+    if mention is None:
+        _log(f"result {tid}: {why}; its owner-mention routing is unavailable, left for the next pass")
+        return
+    if mention:
+        # The owner-mention leg queues one DM per task; a later reply stays visible.
+        _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id, generation=generation,
+                                requeueable=False, not_requeueable_because=(
+                                    "it answers an owner-mention task: review it; it may only "
+                                    "ever reach the owner's DM, never a room"))
+        return
+    body, withheld = _guarded_result_body(tid, raw)
+    if body is None:
+        _log(f"result {tid}: {why}; the result guard is unavailable ({withheld}), left for the next pass")
+        return
+    actions = parse_markers(body).actions
     skip = next((a for a in actions if a.kind == "skip"), None)
     if skip is not None:
         generation = generation or ready.identity     # a skip marker was read, so `ready` is set
         done = disposal.retire_generation(RESULTS_DIR, result_file, generation, _log,
                                           ARCHIVE_RESULTS_DIR, _names(f"{tid}-{int(time.time())}-suppressed"))
+        what = (f"withheld by the result guard ({withheld})" if withheld
+                else f"suppressed ([{skip.value}])")
         if done.retired:
-            _log(f"result {tid}: {why}; it is suppressed ([{skip.value}]), owes no delivery, and is archived")
+            _log(f"result {tid}: {why}; it is {what}, owes no room delivery, and is archived")
         elif done.outcome is not disposal.Retirement.REPLACEMENT_LIVE:
-            _log(f"result {tid}: {why}; it is suppressed ([{skip.value}]) but could not be archived "
+            _log(f"result {tid}: {why}; it is {what} but could not be archived "
                  f"({done.cause}); the next pass retries")
         return
     if any(a.kind == "dm-only" for a in actions):
@@ -4535,6 +4534,8 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
     elif any(a.kind == "redirect" for a in actions):
         where = next(a.value for a in actions if a.kind == "redirect")
         because = (f"it is addressed to [channel: {where}] only: review it; never post it anywhere else")
+    elif withheld:
+        because = f"the result guard withheld it ({withheld}): review it; do not send it by hand"
     else:
         because = "its outbox id is already delivered, so a requeue cannot resend it: send it by hand"
     _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id, generation=generation,
@@ -4573,9 +4574,11 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
     item_id = _effective_item_id(core, broker_tid, no_send)
-    source = ({"source_sha256": _source_digest(generation)}
-              if getattr(core.backend, "records_source_digest", False) and _source_digest(generation)
-              else {})
+    live = _live_source(result_file, generation)
+    # With no result file there is nothing live to protect; the body sent is this call's.
+    ruled = live if result_file is not None else body
+    source = ({"source_sha256": source_digest(live)}
+              if live is not None and getattr(core.backend, "records_source_digest", False) else {})
     if item_id != broker_tid:
         core.backend.publish(item_id, payload, republish_delivered=True, **source)
     else:
@@ -4584,8 +4587,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     if res.status is DrainStatus.TERMINAL:
         record = read_item(core.backend.root, item_id) or {}
         if record.get("status") == "DELIVERED":
-            if delivered_body_differs(core.backend.root, item_id, _source_digest(generation),
-                                      _sent_as(body)):
+            if delivered_body_differs(core.backend.root, item_id, ruled):
                 _quarantine_unsent(result_file, tid, item_id, generation)
                 return False
             return True
@@ -4604,8 +4606,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         return False
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
         root = getattr(core.backend, "root", None)
-        if root is not None and delivered_body_differs(root, item_id, _source_digest(generation),
-                                                       _sent_as(body)):
+        if root is not None and delivered_body_differs(root, item_id, ruled):
             # The outbox sent its stored body, not this one.
             _quarantine_unsent(result_file, tid, item_id, generation)
             return False
@@ -5049,8 +5050,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
                 continue                        # ledger unreadable or not ready: a later sweep decides
             _item = _broker_tid(_delivery)
             _root = getattr(_delivery_core().backend, "root", None)
-            if _root is not None and delivered_body_differs(_root, _item, _source_digest(generation),
-                                                            _legacy_wire_bodies(raw)):
+            if _root is not None and delivered_body_differs(_root, _item, raw):
                 _quarantine_unsent(rfile, tid, _item, generation)
                 continue
             if _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, f"{tid}-{int(now)}-late-duplicate",

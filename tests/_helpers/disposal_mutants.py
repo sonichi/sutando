@@ -33,8 +33,10 @@ OUTBOX = [REPO / "src" / "outbox.py", REPO / "packages" / "ag2-sparrow" / "ag2_s
 IN_OUTBOX = {"delivered-rule-compares-the-composed-body", "adopt-keeps-a-stale-source", "delivered-body-never-differs", "adopt-trusts-an-untagged-baseline", "adopt-after-an-attempt", "adopt-requires-a-marker", "adopt-a-never-requeued-record", "adopt-ignores-a-claim",
              "adopt-every-publish"}
 IN_CLI = {"cli-exits-0-on-no-safe-move", "cli-reads-epoch-after-lock", "cli-parks-on-no-safe-move"}
-IN_BRIDGE = {"unsent-ignores-suppression", "unsent-ignores-restriction", "sweep-drops-the-recovery-label-check",
-             "confirmed-archives-another-body", "terminal-delivered-archives-another-body",
+BACKEND = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "delivery_core" / "backend_a.py"]
+IN_BACKEND = {"publish-drops-the-source"}
+IN_BRIDGE = {"late-duplicate-hashes-the-raw-bytes", "unsent-skips-the-guard", "unsent-skips-owner-mention",
+             "unsent-ignores-suppression", "unsent-ignores-restriction",              "confirmed-archives-another-body", "terminal-delivered-archives-another-body",
              "late-duplicate-archives-another-body", "orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
 
@@ -177,12 +179,16 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "    if (adopted >= epoch or d.get(\"status\") != \"QUEUED\""),
     "delivered-body-never-differs": (
         "the owner rules every live reply at a delivered id as the one that was sent",
-        "    return not isinstance(stored, dict) or stored.get(\"body\") not in legacy_bodies\n",
-        "    return False and stored.get(\"body\") not in legacy_bodies\n"),
+        "    return not isinstance(stored, dict) or stored.get(\"body\") != ready_body\n",
+        "    return False and stored.get(\"body\") != ready_body\n"),
     "delivered-rule-compares-the-composed-body": (
         "the delivered-id rule compares composed wire bodies even when the source digest is known",
-        "    if source_sha256 and d.get(\"source_sha256\"):\n",
-        "    if False and d.get(\"source_sha256\"):\n"),
+        "    if d.get(\"source_sha256\"):\n        return d[\"source_sha256\"] != source_digest(ready_body)\n",
+        "    if False and d.get(\"source_sha256\"):\n        return d[\"source_sha256\"] != source_digest(ready_body)\n"),
+    "publish-drops-the-source": (
+        "the delivery backend's publish never persists the source digest",
+        "            if source_sha256:\n                record[\"source_sha256\"] = source_sha256\n",
+        "            if False:\n                record[\"source_sha256\"] = source_sha256\n"),
     "adopt-keeps-a-stale-source": (
         "an adoption with no known source keeps the digest of the body it replaced",
         "        d.pop(\"source_sha256\", None)                 # a stale source would vouch for these bytes\n",
@@ -223,16 +229,28 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "        except UnicodeDecodeError:\n            continue\n        if not raw:\n"),
     "confirmed-archives-another-body": (
         "a confirmed send of the stored body lets a different live reply be archived as sent",
-        "        if root is not None and delivered_body_differs(root, item_id, _source_digest(generation),\n",
-        "        if False and delivered_body_differs(root, item_id, _source_digest(generation),\n"),
+        "        if root is not None and delivered_body_differs(root, item_id, ruled):\n",
+        "        if False and delivered_body_differs(root, item_id, ruled):\n"),
     "terminal-delivered-archives-another-body": (
         "a later pass at a delivered id archives a different live reply as sent",
-        "            if delivered_body_differs(core.backend.root, item_id, _source_digest(generation),\n",
-        "            if False and delivered_body_differs(core.backend.root, item_id, _source_digest(generation),\n"),
+        "            if delivered_body_differs(core.backend.root, item_id, ruled):\n",
+        "            if False and delivered_body_differs(core.backend.root, item_id, ruled):\n"),
     "late-duplicate-archives-another-body": (
         "the sweep archives a different reply at a delivered id as a late duplicate",
-        "            if _root is not None and delivered_body_differs(_root, _item, _source_digest(generation),\n",
-        "            if False and delivered_body_differs(_root, _item, _source_digest(generation),\n"),
+        "            if _root is not None and delivered_body_differs(_root, _item, raw):\n",
+        "            if False and delivered_body_differs(_root, _item, raw):\n"),
+    "late-duplicate-hashes-the-raw-bytes": (
+        "the late-duplicate arm rules on the raw file bytes, not the ready body",
+        "            if _root is not None and delivered_body_differs(_root, _item, raw):\n",
+        "            if _root is not None and delivered_body_differs(_root, _item, data.decode(\"utf-8\", \"replace\")):\n"),
+    "unsent-skips-the-guard": (
+        "a reply ruled unsent at a delivered id skips the result guard",
+        "    body, withheld = _guarded_result_body(tid, raw)\n",
+        "    body, withheld = raw, None\n"),
+    "unsent-skips-owner-mention": (
+        "a reply ruled unsent at a delivered id skips owner-mention routing",
+        "    mention = _owner_mention_disposition(tid, raw)\n    if mention is None:\n        _log(f\"result {tid}: {why}; its owner",
+        "    mention = False\n    if mention is None:\n        _log(f\"result {tid}: {why}; its owner"),
     "unsent-ignores-suppression": (
         "a suppressed reply at a delivered id is quarantined and handed over for sending",
         "    if skip is not None:\n        generation = generation or ready.identity",
@@ -241,10 +259,6 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "a restricted reply at a delivered id is handed over as one to send by hand",
         "    if any(a.kind == \"dm-only\" for a in actions):\n        because = (",
         "    if False:\n        because = ("),
-    "sweep-drops-the-recovery-label-check": (
-        "a reply the sweep relabels is compared as a different body",
-        "    return (body, plain) if plain != body else (body,)\n",
-        "    return (body,) if plain != body else (body,)\n"),
     "orphan-links-then-unlinks": (
         "an orphan arm moves the canonical result itself: link, then unlink its name",
         "        done = disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))\n",
@@ -262,6 +276,8 @@ def _files(name: str) -> "list[Path]":
         return BRIDGE
     if name in IN_OUTBOX:
         return OUTBOX
+    if name in IN_BACKEND:
+        return BACKEND
     return QUARANTINE if name in IN_QUARANTINE else DISPOSAL
 
 
