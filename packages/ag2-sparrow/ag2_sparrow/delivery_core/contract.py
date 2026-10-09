@@ -200,6 +200,11 @@ class ClaimBackend(Protocol):
         and would report the new one delivered. An attempt that STARTED and
         never classified (`begin_attempt` was written, `complete` never ran:
         the owner died or raised mid-send) is ambiguous for the same reason.
+        Certainty is never inferred from silence: a fresh cycle is admitted
+        only when the record itself proves every started attempt was
+        classified, so a record written before attempts were tracked (an
+        upgrade in place) or a torn record refuses exactly like an ambiguous
+        one — fail closed, visible to the operator, never a silent substitution.
         A backend without the capability treats every park as final for every
         payload. A republish of a DELIVERED id starts a new cycle: the parked
         history carries over, the delivered cycle's ambiguity does not. The

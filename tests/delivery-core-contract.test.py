@@ -146,8 +146,22 @@ class ContractCase(unittest.TestCase):
                          "an ambiguous park refuses even a never-parked payload")
         outbox.park_item(root, ITEM, "permanent-refusal")
         self.assertFalse(self.backend.publish(ITEM, b"x"), "the parked body stays refused")
+        self.assertFalse(self.backend.publish(ITEM, b"y"),
+                         "a park the backend did not drive carries no attempt evidence: "
+                         "certainty is never inferred, so it refuses like an ambiguous one")
+        # A definite refusal the record itself proves: one attempt, started
+        # and classified by this backend, then a never-parked payload.
+        self.assertIs(outbox.requeue_item(root, ITEM, operator="op"),
+                      outbox.RequeueOutcome.REQUEUED)
+        token = self.backend.claim(ITEM, "w1")
+        self.assertIsNotNone(token)
+        self.assertTrue(self.backend.begin_attempt(token))
+        self.assertTrue(self.backend.complete(token, DeliveryOutcome.NOT_DELIVERED,
+                                              terminal_reason="permanent-refusal"))
+        self.assertTrue(self.backend.is_terminal(ITEM))
+        self.assertFalse(self.backend.publish(ITEM, b"x"), "the parked body stays refused")
         self.assertTrue(self.backend.publish(ITEM, b"y"),
-                        "a definite refusal admits a never-parked payload")
+                        "a definite refusal the record proves admits a never-parked payload")
 
     def test_single_owner(self):
         self.backend.publish(ITEM, b"x")
@@ -225,6 +239,18 @@ class ContractCase(unittest.TestCase):
         self.assertTrue(
             self.backend.complete(successor, DeliveryOutcome.CONFIRMED),
             "the live incarnation still owns the claim")
+
+    def test_begin_attempt_writes_nothing_for_a_token_that_lost_its_claim(self):
+        """The started-attempt mark belongs to the incarnation that will send;
+        a token whose claim is gone must not mark its successor's cycle."""
+        self.backend.publish(ITEM, b"x")
+        token = self.backend.claim(ITEM, "w1")
+        self.assertIsNotNone(token)
+        self.assertTrue(self.backend.begin_attempt(token))
+        self.backend.force_release(ITEM)
+        self.assertFalse(self.backend.begin_attempt(token))
+        forged = ClaimToken(item_id=ITEM, worker="w2", incarnation=token.incarnation)
+        self.assertFalse(self.backend.begin_attempt(forged))
 
     def test_a_foreign_item_is_never_retired(self):
         """Retirement authority belongs to the dispatching consumer: a
@@ -456,6 +482,23 @@ class CorePolicy(unittest.TestCase):
                               ProviderCapabilities(reconcile_capable=True))
         with self.assertRaises(KeyError):
             self._core(p).deliver_one(ITEM, b"x")
+
+    def test_an_attempt_that_cannot_be_marked_is_not_sent(self):
+        """A claim lost between claim() and the send is contention, not a
+        delivery: the provider is never called for a cycle nobody owns."""
+        class _LosesTheClaim:
+            def __init__(self, inner):
+                self._b = inner
+
+            def __getattr__(self, name):
+                return getattr(self._b, name)
+
+            def begin_attempt(self, token):
+                return False
+        p = _Recorder([DeliveryOutcome.CONFIRMED])
+        r = DeliveryCore(_LosesTheClaim(self.backend), p).deliver_one(ITEM, b"x")
+        self.assertIs(r.status, DrainStatus.NOT_CLAIMED)
+        self.assertEqual(p.deliver_calls, [], "no send for an unmarked attempt")
 
     def test_unknown_resends_only_with_idempotent_send(self):
         p = _Recorder([ProviderIndeterminate("timeout after send"),

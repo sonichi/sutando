@@ -42,6 +42,8 @@ class DesignAClaimBackend:
         "park-not-definite": "the park was not a definite refusal",
         "parked-cycle-ambiguous": "an attempt in the parked cycle may have landed",
         "attempt-unclassified": "an attempt in the parked cycle started but never classified",
+        "attempt-evidence-missing": "the record does not prove every started attempt was classified "
+                                    "(written before attempts were tracked, or torn)",
         "claim-live-on-park": "a live owner still holds the parked cycle's claim",
     }
 
@@ -59,6 +61,15 @@ class DesignAClaimBackend:
         """Every payload this id has parked on, oldest first; None when the
         park recorded no payload, so no new one can be proven different."""
         return outbox.parked_digests_of(prior)
+
+    @staticmethod
+    def _every_started_attempt_classified(prior: dict) -> bool:
+        """True only when the record explicitly proves it: at least one attempt
+        was started and exactly as many were classified by complete()."""
+        started = prior.get("attempts_started")
+        classified = prior.get("attempts_classified")
+        return (isinstance(started, int) and isinstance(classified, int)
+                and started >= 1 and started == classified)
 
     @staticmethod
     def _refuse(prior: dict, root: Path, item_id: str, why: str) -> bool:
@@ -81,9 +92,13 @@ class DesignAClaimBackend:
         the park; once PARKED_HISTORY_LIMIT bodies have parked, the id is
         saturated and refuses every new payload rather than forgetting one.
         An attempt that started and never classified (its owner died or raised
-        mid-send) counts as ambiguous. A republish of a DELIVERED id starts a
-        new cycle: the delivered cycle's taint does not carry over, its parked
-        history does. Each refusal records its cause as `last_refusal`."""
+        mid-send) counts as ambiguous. Certainty is never inferred: the record
+        must itself prove that every attempt it started was classified
+        (`attempts_started` == `attempts_classified`), so a record written
+        before attempts were tracked, or torn, refuses like an ambiguous one.
+        A republish of a DELIVERED id starts a new cycle: the delivered cycle's
+        taint does not carry over, its parked history does. Each refusal
+        records its cause as `last_refusal`."""
         allow_republish = (self.republish_delivered if republish_delivered is None
                            else republish_delivered)
         text = payload.decode("utf-8", "replace")
@@ -113,6 +128,10 @@ class DesignAClaimBackend:
                         return refuse("parked-cycle-ambiguous")
                     if prior.get("dispatch_pending"):
                         return refuse("attempt-unclassified")
+                    # Missing evidence is not evidence of safety: a record from
+                    # before attempts were tracked may hold a landed body too.
+                    if not self._every_started_attempt_classified(prior):
+                        return refuse("attempt-evidence-missing")
                     rec = outbox.read_delivery_claim(self.root, item_id)
                     if rec is not None:
                         # The cycle ended at the park: a claim here is a crash
@@ -258,7 +277,8 @@ class DesignAClaimBackend:
                 item["cycle_ambiguous"] = True
             # This attempt is classified now; the pending mark it began with
             # would otherwise taint the cycle as an attempt that never returned.
-            item.pop("dispatch_pending", None)
+            if item.pop("dispatch_pending", None):
+                item["attempts_classified"] = int(item.get("attempts_classified", 0) or 0) + 1
             outbox._write_item(self.root, item_id, item)
             if outcome is DeliveryOutcome.CONFIRMED:
                 outbox.record_delivered(self.root, item_id,

@@ -523,6 +523,37 @@ class CliRenderingAndErrorPaths(unittest.TestCase):
             getpass.getuser = real
 
 
+class ParkedHistoryHasOneWriter(unittest.TestCase):
+    """`fold_parked_digest` is the only place an id's parked history grows or
+    saturates; `parked_digests_of` is the only reader of what it means."""
+
+    def test_the_reader_derives_a_legacy_record_from_its_text(self):
+        self.assertIsNone(outbox.parked_digests_of({"item_id": "x"}),
+                          "no payload at all: nothing can be proven different")
+        legacy = outbox.parked_digests_of({"payload": "body"})
+        self.assertEqual(legacy, [outbox.hashlib.sha256(b"body").hexdigest()])
+        self.assertEqual(outbox.parked_digests_of({"payload_digest": "d1", "parked_digests": ["d0"]}),
+                         ["d0", "d1"])
+        self.assertEqual(outbox.parked_digests_of({"payload_digest": "d1", "parked_digests": ["d0", "d1"]}),
+                         ["d0", "d1"], "the current body is listed once")
+
+    def test_the_writer_saturates_at_the_limit_and_logs_once(self):
+        d = {"item_id": "task-x"}
+        for n in range(3):
+            self.assertTrue(outbox.fold_parked_digest(d, f"d{n}", limit=3))
+        self.assertTrue(outbox.fold_parked_digest(d, "d1", limit=3), "a known digest is not re-added")
+        self.assertEqual(d["parked_digests"], ["d0", "d1", "d2"])
+        with self.assertLogs("outbox", level="WARNING") as logs:
+            self.assertFalse(outbox.fold_parked_digest(d, "d3", limit=3))
+        self.assertEqual(len(logs.output), 1, "saturation is logged once")
+        self.assertIn("task-x saturated", logs.output[0])
+        self.assertTrue(d["saturated"])
+        self.assertEqual(d["parked_digests"], ["d0", "d1", "d2"], "nothing forgotten, nothing added")
+        self.assertFalse(outbox.fold_parked_digest(d, "d4", limit=3))
+        self.assertFalse(outbox.fold_parked_digest(d, "d0", limit=3), "saturated: even a known body is refused")
+        self.assertEqual(outbox.PARKED_HISTORY_LIMIT, 128)
+
+
 class OutboxReaderEdges(unittest.TestCase):
     """Malformed and absent state must degrade, never raise: these readers run
     on an operator's machine against a store a crashed writer may have left."""
