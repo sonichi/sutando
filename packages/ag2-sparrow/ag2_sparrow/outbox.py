@@ -890,6 +890,20 @@ def read_item(root: Path, item_id: str) -> Optional[dict]:
     return _read_item(Path(root), item_id)
 
 
+def delivered_body_differs(root: Path, item_id: str, body: str) -> bool:
+    """True when the id is DELIVERED and its stored result envelope carries a
+    different reply body: a live reply holding `body` was never provably sent.
+    False with no delivered record, or one that stores no envelope."""
+    d = read_item(root, item_id)
+    if not d or d.get("status") != "DELIVERED" or "payload" not in d:
+        return False
+    try:
+        stored = json.loads(d["payload"])
+    except (TypeError, ValueError):
+        return True
+    return not isinstance(stored, dict) or stored.get("body") != body
+
+
 def list_items(root: Path, status: Optional[str] = None) -> list[dict]:
     """Every item record, newest id order, optionally filtered by status."""
     d = _items_dir(Path(root))

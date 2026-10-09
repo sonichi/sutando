@@ -30,10 +30,11 @@ IN_QUARANTINE = {"fallback-links-then-unlinks", "place-replaces-a-taken-name",
 CLI = [REPO / "src" / "outbox_cli.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox_cli.py"]
 BRIDGE = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"]
 OUTBOX = [REPO / "src" / "outbox.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox.py"]
-IN_OUTBOX = {"adopt-trusts-an-untagged-baseline", "adopt-after-an-attempt", "adopt-requires-a-marker", "adopt-a-never-requeued-record", "adopt-ignores-a-claim",
+IN_OUTBOX = {"delivered-body-never-differs", "adopt-trusts-an-untagged-baseline", "adopt-after-an-attempt", "adopt-requires-a-marker", "adopt-a-never-requeued-record", "adopt-ignores-a-claim",
              "adopt-every-publish"}
 IN_CLI = {"cli-exits-0-on-no-safe-move", "cli-reads-epoch-after-lock", "cli-parks-on-no-safe-move"}
-IN_BRIDGE = {"confirmed-archives-another-body", "orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
+IN_BRIDGE = {"confirmed-archives-another-body", "terminal-delivered-archives-another-body",
+             "late-duplicate-archives-another-body", "orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
 
 MUTANTS: dict[str, tuple[str, str, str]] = {
@@ -173,6 +174,10 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "a requeued record adopts a new payload after an attempt under its epoch's key",
         "    if (attempted or adopted >= epoch or d.get(\"status\") != \"QUEUED\"",
         "    if (adopted >= epoch or d.get(\"status\") != \"QUEUED\""),
+    "delivered-body-never-differs": (
+        "the owner rules every live reply at a delivered id as the one that was sent",
+        "    return not isinstance(stored, dict) or stored.get(\"body\") != body\n",
+        "    return False and stored.get(\"body\") != body\n"),
     "adopt-trusts-an-untagged-baseline": (
         "a requeue baseline is trusted whatever epoch wrote it",
         "        tagged = int(d.get(\"requeued_attempts_epoch\", -1)) == epoch\n",
@@ -208,9 +213,17 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "        try:\n            raw = data.decode(\"utf-8\").strip()\n"
         "        except UnicodeDecodeError:\n            continue\n        if not raw:\n"),
     "confirmed-archives-another-body": (
-        "a confirmed send of the outbox's stored body lets the live, different reply be archived as sent",
-        "        if \"payload\" in record and not _record_sent_this_body(record, payload):\n",
+        "a confirmed send of the stored body lets a different live reply be archived as sent",
+        "        if root is not None and delivered_body_differs(root, item_id, body):\n",
         "        if False:\n"),
+    "terminal-delivered-archives-another-body": (
+        "a later pass at a delivered id archives a different live reply as sent",
+        "            if delivered_body_differs(core.backend.root, item_id, body):\n",
+        "            if False:\n"),
+    "late-duplicate-archives-another-body": (
+        "the sweep archives a different reply at a delivered id as a late duplicate",
+        "            if _root is not None and delivered_body_differs(_root, _item, raw):\n",
+        "            if False:\n"),
     "orphan-links-then-unlinks": (
         "an orphan arm moves the canonical result itself: link, then unlink its name",
         "        done = disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))\n",

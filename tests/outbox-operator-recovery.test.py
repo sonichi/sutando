@@ -657,6 +657,30 @@ class ResendFromLive(unittest.TestCase):
             self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
 
 
+class DeliveredBodyDiffers(unittest.TestCase):
+    """The owner rule: a live reply at a delivered id is sent only if its body is
+    the one the delivered record stores."""
+
+    def _rec(self, td, **fields):
+        root = Path(td) / "ob"
+        outbox._write_item(root, ITEM, dict(fields, item_id=ITEM))
+        return root
+
+    def test_cases(self):
+        env = json.dumps({"id": ITEM, "body": "A"})
+        for name, fields, body, differs in (
+                ("no record", None, "C", False),
+                ("queued", {"status": "QUEUED", "payload": env}, "C", False),
+                ("delivered, no envelope stored", {"status": "DELIVERED"}, "C", False),
+                ("delivered, same body", {"status": "DELIVERED", "payload": env}, "A", False),
+                ("delivered, other body", {"status": "DELIVERED", "payload": env}, "C", True),
+                ("delivered, unreadable envelope", {"status": "DELIVERED", "payload": "{"}, "A", True),
+                ("delivered, envelope not an object", {"status": "DELIVERED", "payload": "[]"}, "A", True)):
+            with self.subTest(case=name), TemporaryDirectory() as td:
+                root = self._rec(td, **fields) if fields is not None else Path(td) / "ob"
+                self.assertIs(outbox.delivered_body_differs(root, ITEM, body), differs)
+
+
 class CliRenderingAndErrorPaths(unittest.TestCase):
     """The CLI's own output and refusal paths. Calling outbox directly, as the
     other tests do, leaves every line of `_emit` and both readers unrun."""

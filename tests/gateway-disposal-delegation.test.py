@@ -1117,6 +1117,17 @@ class BridgeDelegates(unittest.TestCase):
         self.assertIn("_retire_orphan", self.calls_in("_quarantine_orphan"))
         self.assertIn("_retire_orphan", self.calls_in("_reconcile_orphan_results"))
 
+    def test_an_unsent_reply_at_a_delivered_id_is_ruled_by_the_outbox_owner(self):
+        for fn in ("_deliver_result_payload", "_reconcile_orphan_results"):
+            self.assertIn("delivered_body_differs", self.calls_in(fn), fn)
+            self.assertIn("_quarantine_unsent", self.calls_in(fn), fn)
+        f = next(n for n in ast.walk(self.tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "_deliver_result_payload")
+        rulings = [n for n in ast.walk(f) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                   and n.func.id == "delivered_body_differs"]
+        self.assertEqual(len(rulings), 2, "the confirmed arm and the terminal-delivered arm")
+        self.assertNotIn("_record_sent_this_body", self.names())
+
     # Every function of the bridge that still moves or removes a file, as of
     # this head; a new one is a private disposal path until proven otherwise.
     MOVERS = {"_atomic_private_json", "_backup_tier_map_to_disk", "_emit_gateway_status",

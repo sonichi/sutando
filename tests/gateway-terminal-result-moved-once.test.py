@@ -48,6 +48,7 @@ from ag2_sparrow.delivery_core import DeliveryCore, DesignAClaimBackend, RetryPo
 from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceResultProvider
 
 ROOM = '!same:ag2.space'
+UNSENT = 'a different reply was published after this id was delivered'
 TID = 'task-terminal1'
 PASSES = 3
 
@@ -824,7 +825,7 @@ class TerminalResultMovedOnce(unittest.TestCase):
             {'relay_holds': ['BODY-A parked answer'], 'sent': ['BODY-A parked answer'],
              'status': 'DELIVERED', 'recorded_body': 'BODY-A parked answer',
              'c_live': False, 'c_listed': True, 'c_archived_as_sent': False})
-        said = [l for l in self.lines if TID in l and 'not this one' in l]
+        said = [l for l in self.lines if TID in l and UNSENT in l]
         self.assertEqual(len(said), 1, '\n'.join(self.lines))
         self.assertIn('send it by hand', said[0])
         self.assertNotIn('restores it', said[0], 'a requeue of a delivered id restores nothing')
@@ -832,9 +833,87 @@ class TerminalResultMovedOnce(unittest.TestCase):
     def test_a_caller_without_a_result_file_is_told_the_stored_body_went(self):
         self._legacy_epoch_used_then_c()
         self.assertFalse(gw._deliver_result_payload(TID, TID, 'BODY-C newest reply'))
-        self.assertTrue(any('not this one' in l and 'not retrying' in l for l in self.lines), self.lines)
-        self.assertFalse(gw._record_sent_this_body({'payload': 'not json'}, b'{}'))
-        self.assertFalse(gw._record_sent_this_body({'payload': '{}'}, b'\xff'))
+        self.assertTrue(any(UNSENT in l and 'not retrying' in l for l in self.lines), self.lines)
+
+    def _c_after_a_delivered(self):
+        """The lost-response schedule run up to A being confirmed and recorded
+        DELIVERED; returns before anything rules on the live C."""
+        result, held = self._legacy_epoch_used_then_c()
+        return result, len(self.server.calls)
+
+    def _archived_bodies(self):
+        return sorted(p.read_text() for p in (self.results / 'archive').rglob('*.txt'))
+
+    def _assert_c_quarantined_never_archived(self, result, posts_from):
+        self.assertEqual(
+            {'posts': [c.get('body') for c in self.server.calls[posts_from:]],
+             'status': outbox.item_status(self.outbox, TID), 'c_live': result.exists(),
+             'c_listed': 'BODY-C newest reply' in self.quarantined_bodies(),
+             'c_archived': 'BODY-C newest reply' in self._archived_bodies()},
+            {'posts': ['BODY-A parked answer'], 'status': 'DELIVERED', 'c_live': False,
+             'c_listed': True, 'c_archived': False})
+
+    def test_a_failed_quarantine_is_retried_by_the_next_pass_never_archived(self):
+        result, posts_from = self._c_after_a_delivered()
+        with patch.object(gw.disposal, 'quarantine_generation', side_effect=OSError(5, 'EIO')):
+            gw._post_ready_results({TID})
+        self.assertEqual(result.read_text(), 'BODY-C newest reply', 'a failed move leaves C live')
+        self.assertNotIn('BODY-C newest reply', self._archived_bodies())
+        gw._post_ready_results({TID})
+        self._assert_c_quarantined_never_archived(result, posts_from)
+
+    def _crash_after_the_confirm(self):
+        class Crash(BaseException):
+            pass
+        result, posts_from = self._c_after_a_delivered()
+        # Whichever ruling the bridge makes first after the confirm.
+        ruling = 'delivered_body_differs' if hasattr(gw, 'delivered_body_differs') else '_record_sent_this_body'
+        with patch.object(gw, ruling, side_effect=Crash):
+            with self.assertRaises(Crash):
+                gw._post_ready_results({TID})
+        self.assertEqual(outbox.item_status(self.outbox, TID), 'DELIVERED')
+        self.assertEqual(result.read_text(), 'BODY-C newest reply')
+        self.bridge(self.core())                         # a restarted process: a fresh core
+        return result, posts_from
+
+    def test_a_crash_between_the_confirm_and_the_ruling_then_the_drain(self):
+        result, posts_from = self._crash_after_the_confirm()
+        gw._post_ready_results({TID})
+        self._assert_c_quarantined_never_archived(result, posts_from)
+
+    def test_a_crash_between_the_confirm_and_the_ruling_then_the_sweep(self):
+        result, posts_from = self._crash_after_the_confirm()
+        os.utime(result, (time.time() - gw.ORPHAN_GRACE_S - 60,) * 2)
+        gw._reconcile_orphan_results(set())
+        self._assert_c_quarantined_never_archived(result, posts_from)
+
+    def _delivered_then_late(self, late):
+        self.bridge()
+        self.task()
+        self.server.accepting = True
+        result = self.result('BODY-A the reply')
+        gw._post_ready_results({TID})
+        self.assertEqual(outbox.item_status(self.outbox, TID), 'DELIVERED')
+        posts = len(self.server.calls)
+        result.write_text(late)
+        os.utime(result, (time.time() - gw.ORPHAN_GRACE_S - 60,) * 2)
+        gw._reconcile_orphan_results(set())
+        return result, posts
+
+    def test_a_late_note_at_a_delivered_id_is_quarantined_not_archived(self):
+        result, posts = self._delivered_then_late('Replied in the room; the result was archived.')
+        self.assertFalse(result.exists())
+        self.assertIn('Replied in the room; the result was archived.', self.quarantined_bodies())
+        self.assertNotIn('Replied in the room; the result was archived.', self._archived_bodies())
+        self.assertEqual(len(self.server.calls), posts, 'nothing is posted')
+        self.assertTrue(any(UNSENT in l for l in self.lines), self.lines)
+
+    def test_a_byte_identical_late_copy_is_archived_as_a_duplicate(self):
+        result, posts = self._delivered_then_late('BODY-A the reply')
+        self.assertFalse(result.exists())
+        self.assertEqual(self.quarantined_bodies(), [])
+        self.assertEqual(len(list((self.results / 'archive').rglob(f'{TID}-*-late-duplicate*.txt'))), 1)
+        self.assertEqual(len(self.server.calls), posts)
 
     def _publish_c(self, result):
         tmp = result.with_name('.producer.tmp')

@@ -303,7 +303,7 @@ from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
-from .outbox import RetrySchedule, read_item
+from .outbox import RetrySchedule, delivered_body_differs, read_item
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
@@ -4473,16 +4473,15 @@ def _worker_of(task_id: str) -> str:
     return claimants.pop() if len(claimants) == 1 else ""
 
 
-def _record_sent_this_body(record: dict, payload: bytes) -> bool:
-    """The outbox record's stored envelope carries the same reply body as this one;
-    envelope metadata (attribution) may differ between passes."""
-    try:
-        stored = json.loads(record.get("payload") or "")
-        mine = json.loads(payload.decode("utf-8"))
-    except (TypeError, ValueError):
-        return False
-    return (isinstance(stored, dict) and isinstance(mine, dict)
-            and stored.get("body") == mine.get("body") and stored.get("no_send") == mine.get("no_send"))
+def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> None:
+    """The outbox owner ruled this live reply never provably sent: keep it where the
+    operator looks; a failed move leaves it live and the next pass retries."""
+    why = "a different reply was published after this id was delivered"
+    if result_file is not None:
+        _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id,
+                                generation=generation, requeueable=False)
+    else:
+        _log(f"result {tid}: {why} — not retrying")
 
 
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
@@ -4525,6 +4524,9 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     if res.status is DrainStatus.TERMINAL:
         record = read_item(core.backend.root, item_id) or {}
         if record.get("status") == "DELIVERED":
+            if delivered_body_differs(core.backend.root, item_id, body):
+                _quarantine_unsent(result_file, tid, item_id, generation)
+                return False
             return True
         # The outbox has decided this item; no pass will ever claim it again,
         # so retrying logs forever and hides the failure behind "will retry".
@@ -4541,17 +4543,9 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         return False
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
         root = getattr(core.backend, "root", None)
-        record = (read_item(root, item_id) or {}) if root is not None else {}
-        if "payload" in record and not _record_sent_this_body(record, payload):
-            # The outbox sent its stored body: this one never went out, so it is
-            # kept where the operator looks, never archived as sent.
-            why = (f"the outbox sent the body stored for {item_id} under resend epoch "
-                   f"{record.get('resend_epoch', 0)}, not this one")
-            if result_file is not None:
-                _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id,
-                                        generation=generation, requeueable=False)
-            else:
-                _log(f"result {tid}: {why} — not retrying")
+        if root is not None and delivered_body_differs(root, item_id, body):
+            # The outbox sent its stored body, not this one.
+            _quarantine_unsent(result_file, tid, item_id, generation)
             return False
         _ENGINE_COUNTS["core_confirmed"] += 1
         # A confirmed send was otherwise silent, so nothing on the happy path
@@ -4987,6 +4981,15 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         # Delivered copy = double-write. NEVER re-deliver: the sweep would
         # post agent narration about having answered into the room.
         if _delivered_copy_exists(tid):
+            _delivery = _delivery_tid(tid)
+            raw = ready_body_of(data)
+            if _delivery is None or raw is None:
+                continue                        # ledger unreadable or not ready: a later sweep decides
+            _item = _broker_tid(_delivery)
+            _root = getattr(_delivery_core().backend, "root", None)
+            if _root is not None and delivered_body_differs(_root, _item, raw):
+                _quarantine_unsent(rfile, tid, _item, generation)
+                continue
             if _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, f"{tid}-{int(now)}-late-duplicate",
                               generation):
                 _log(f"orphan sweep: {tid} is a post-delivery duplicate — moved aside")
