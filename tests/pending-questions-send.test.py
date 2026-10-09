@@ -453,6 +453,9 @@ class TestAdversarialText(_Workspace):
                          ["# Request", "# Proposed default action", "# Delivery"])
 
 
+FALLBACK_Q = "Sutando couldn't message you. Question: q?. Reply to Sutando in any chat, or see Pending questions."
+
+
 class TestFailOpen(_Workspace):
     def test_failed_send_keeps_the_record_and_exits_0(self):
         (self.ws / "results").rmdir()
@@ -499,7 +502,7 @@ class TestFailOpen(_Workspace):
         r = self._run("q?")
         self.assertIn("sent: FAILED", r.stdout)
         self.assertIn("macos: notification sent", r.stdout)
-        self.assertIn("Open your Sutando DM to answer: q?", self.calls.read_text())
+        self.assertIn(FALLBACK_Q, self.calls.read_text())
 
     def test_the_core_ask_applies_the_same_rule(self):
         with mock.patch.object(pqa, "notify_macos", return_value=(True, None)) as macos:
@@ -509,7 +512,15 @@ class TestFailOpen(_Workspace):
             self._break_send()
             out = pqa.ask_owner("q?", workspace=self.ws, host=HOST)
         self.assertTrue(out["macos"])
-        macos.assert_called_once_with("Open your Sutando DM to answer: q?")
+        macos.assert_called_once_with(FALLBACK_Q)
+
+    def test_the_fallback_shortens_the_question_never_the_instruction(self):
+        for q in ("x" * 500, '"' * 500, "\\" * 300 + " tail"):
+            text = pqa.fallback_text(q)
+            self.assertLessEqual(len(pqa._applescript_escape(text)), pqa.NOTIFY_MAX, q[:5])
+            self.assertTrue(text.startswith("Sutando couldn't message you. Question: "))
+            self.assertTrue(text.endswith(". Reply to Sutando in any chat, or see Pending questions."))
+            self.assertIn("…", text)
 
     def test_durable_never_notifies(self):
         self._break_send()

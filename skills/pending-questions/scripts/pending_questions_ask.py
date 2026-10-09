@@ -47,6 +47,7 @@ SENT_RE = re.compile(
     r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s*$", re.MULTILINE)
 # Bridges whose drain honours a `[channel:]` room redirect (telegram drops it).
 _ROOM_MARKER_BRIDGES = frozenset({"discord", "slack", "ag2space"})
+NOTIFY_MAX = 200  # escaped body chars notify_macos hands to osascript
 MACOS_FIX = ("allow notifications for your terminal app under System Settings > "
              "Notifications, or run from a session where osascript is permitted")
 
@@ -184,9 +185,13 @@ def write_proactive(results: Path, name: str, body: str) -> Path:
     return write_text_whole(Path(results) / name, body)
 
 
+def _applescript_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def notify_macos(text: str) -> tuple:
     """(ok, fix). A refused or failed osascript names the fix; it never claims ok."""
-    esc = text.replace("\\", "\\\\").replace('"', '\\"')[:200]
+    esc = _applescript_escape(text)[:NOTIFY_MAX]
     try:
         r = subprocess.run(["osascript", "-e",
                             f'display notification "{esc}" with title "Sutando"'],
@@ -207,7 +212,18 @@ def notify_unless_queued(out: dict, question: str) -> None:
     if out.get("proactive_file"):
         out["macos"], out["macos_fix"] = "skipped", None
     else:
-        out["macos"], out["macos_fix"] = notify_macos(f"Open your Sutando DM to answer: {question}")
+        out["macos"], out["macos_fix"] = notify_macos(fallback_text(question))
+
+
+def fallback_text(question: str) -> str:
+    """The question is shortened, never the instruction after it, so the notification keeps its ending."""
+    head, tail = "Sutando couldn't message you. Question: ", ". Reply to Sutando in any chat, or see Pending questions."
+    q = " ".join(question.split())
+    for n in range(min(len(q), NOTIFY_MAX), -1, -1):
+        cut = q if n == len(q) else q[:max(n - 1, 0)] + "…"
+        if len(_applescript_escape(head + cut + tail)) <= NOTIFY_MAX:
+            return head + cut + tail
+    return head + tail
 
 
 def queue_question(question: str, context: Optional[str] = None, task_file: Optional[str] = None,
