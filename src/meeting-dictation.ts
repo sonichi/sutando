@@ -21,11 +21,6 @@ const isFiller = (text: string) =>
 	(text.toLowerCase().match(/[\p{L}\p{N}']+/gu) ?? []).every((w) => FILLER.has(w));
 /** Nothing but fillers before this point, or the previous sentence has ended. */
 const atSentenceStart = (text: string) => isFiller(text) || /[.!?。！？]\s*$/.test(text);
-/**
- * A single English word alone before the vocative is taken as a misheard greeting: live,
- * "Hey/Hi Sutando" came back as "Has Sutando…" and "Kai Sutando…".
- */
-const MISHEARD_GREETING = /^\s*[a-z']+[\s,，]*$/i;
 /** A request joined to the command ("…come back and summarize"). */
 const JOINED_REQUEST = /^[\s,，]*(?:and|then)\b(?:[\s,，]+then\b)?[\s,，]*/i;
 
@@ -68,21 +63,18 @@ export function findExitCommand(text: string): { before: string; after: string; 
 	const rest = text.slice(last.index + last[0].length);
 	const lead = before.replace(ADDRESSED, '');
 	const vocative = lead !== before || /^sutando/i.test(last[0]);
-	const greeted = vocative && MISHEARD_GREETING.test(lead);
-	const startsSentence = greeted || atSentenceStart(lead);
-	const kept = (t: string) => (greeted ? '' : keptLead(t));
 	if (ONLY_FILLER_AFTER.test(rest)) {
-		if (vocative ? !startsSentence : !isFiller(before)) return null;
+		if (vocative ? !atSentenceStart(lead) : !isFiller(before)) return null;
 		return { before: kept(lead), after: '', following: '' };
 	}
-	if (!vocative || !startsSentence) return null;
+	if (!vocative || !atSentenceStart(lead)) return null;
 	const joined = rest.match(JOINED_REQUEST);
 	if (joined) return { before: kept(lead), after: rest.slice(joined[0].length).trim(), following: '' };
 	if (/^\s*[.!?。！？]/.test(rest)) return { before: kept(lead), after: '', following: rest.replace(/^[\s.!?。！？]+/, '').trim() };
 	return null;
 }
 
-const keptLead = (lead: string) => {
+const kept = (lead: string) => {
 	const t = lead.replace(/[\s,，]+$/, '');
 	return isFiller(t) ? '' : t;
 };
