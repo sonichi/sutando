@@ -4,6 +4,7 @@ ClaimBackend seam. Wrapper only — no call-site or disk-format change
 until Phase 2 routes an adapter through DeliveryCore."""
 from __future__ import annotations
 
+import hashlib
 import time
 from pathlib import Path
 from typing import Optional
@@ -22,6 +23,8 @@ class DesignAClaimBackend:
 
     capabilities = BackendCapabilities(supports_force_release=True)
 
+    PARKED_DIGESTS_KEPT = 32   # bound on remembered parked payloads per id
+
     def __init__(self, root: Path, reclaim_ttl_s: float = 300.0,
                  retry_schedule: Optional[outbox.RetrySchedule] = None,
                  clock=time.time, republish_delivered: bool = True):
@@ -31,36 +34,64 @@ class DesignAClaimBackend:
         self.clock = clock
         self.republish_delivered = republish_delivered
 
+    @staticmethod
+    def _parked_digests(prior: dict) -> Optional[list]:
+        """Every payload this id has parked on, oldest first; None when the
+        park recorded no payload, so no new one can be proven different."""
+        own = prior.get("payload_digest")
+        if not isinstance(own, str):
+            text = prior.get("payload")
+            if not isinstance(text, str):
+                return None
+            own = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        earlier = [d for d in prior.get("parked_digests") or [] if isinstance(d, str)]
+        return earlier + [own]
+
     def publish(self, item_id: str, payload: bytes, *,
                 republish_delivered: Optional[bool] = None) -> bool:
+        """A PARKED id accepts a payload it has never parked on (a later reply,
+        with its own idempotency key); any payload it parked on stays refused,
+        so two bodies cannot alternate forever. This includes outcome-unknown
+        parks: the ambiguous attempt's own body is never resent by this path,
+        and the gateway's defer_idempotent_resend governs that body alone."""
         allow_republish = (self.republish_delivered if republish_delivered is None
                            else republish_delivered)
         text = payload.decode("utf-8", "replace")
+        digest = hashlib.sha256(payload).hexdigest()
         record: dict = {}
         with outbox._item_lock(self.root, item_id):
             if outbox._item_path(self.root, item_id).exists():
                 prior = outbox._read_item(self.root, item_id)
                 status = prior.get("status")
-                # DELIVERED -> fresh cycle (C-parity). PARKED holds only the payload
-                # that parked; a different one is a later reply with its own key.
                 if status == "PARKED":
-                    if prior.get("payload") == text:
+                    parked = self._parked_digests(prior)
+                    if parked is None or digest in parked:
                         return False
+                    rec = outbox.read_delivery_claim(self.root, item_id)
+                    if rec is not None:
+                        # The cycle ended at the park, so a claim left here is a
+                        # crash remnant unless its owner still runs; no TTL applies.
+                        if not outbox._record_is_reclaimable(rec, 0.0):
+                            return False
+                        outbox._release_locked(self.root, item_id, rec.drainer_id)
                     record = {
                         "resend_epoch": int(prior.get("resend_epoch", 0) or 0) + 1,
+                        "parked_digests": parked[-self.PARKED_DIGESTS_KEPT:],
                         "superseded_park": {
                             "attempts": int(prior.get("attempts", 0) or 0),
                             "reason": prior.get("reason"),
                             "published_at": prior.get("published_at"),
                         },
                     }
-                elif not allow_republish or status != "DELIVERED":
-                    return False
-                if outbox.read_delivery_claim(self.root, item_id) is not None:
-                    return False
+                else:
+                    if not allow_republish or status != "DELIVERED":
+                        return False
+                    if outbox.read_delivery_claim(self.root, item_id) is not None:
+                        return False
             record.update({
                 "item_id": item_id,
                 "payload": text,
+                "payload_digest": digest,
                 "status": "READY",
                 "published_at": time.time(),
             })

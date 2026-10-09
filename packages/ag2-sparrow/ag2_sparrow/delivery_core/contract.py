@@ -179,10 +179,12 @@ class ClaimBackend(Protocol):
         """True = newly published; False = this id is already live, or parked
         on this very payload.
 
-        A parked id is not poisoned: a DIFFERENT payload is a later reply and
-        starts a fresh cycle whose idempotency key cannot dedupe against the
-        parked attempt. Re-publishing the parked payload stays refused, so a
-        rescanned live file never turns one park into a retry per pass.
+        A parked id is not poisoned: a payload it has never parked on is a
+        later reply and starts a fresh cycle whose idempotency key cannot
+        dedupe against the parked attempt. Every payload the id has parked on
+        stays refused, so a rescanned live file never turns one park into a
+        retry per pass and two bodies cannot alternate. An outcome-unknown park
+        is included: the ambiguous body itself is never resent by this path.
 
         Durable backends may expose payload_for_claim(token) so the core sends
         the original published bytes rather than a rebuilt caller payload.

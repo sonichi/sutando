@@ -7,6 +7,8 @@ turn one park into a retry per pass.
 Run: python3 tests/delivery-core-parked-fresh-publish.test.py"""
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,6 +27,7 @@ from ag2_sparrow import outbox  # noqa: E402
 ITEM = "task-9da728fb8292936bf6"
 FIRST = b'{"id": "task-9da728fb8292936bf6", "body": "first reply"}'
 SECOND = b'{"id": "task-9da728fb8292936bf6", "body": "a later, different reply"}'
+THIRD = b'{"id": "task-9da728fb8292936bf6", "body": "a third reply"}'
 CAP = 3
 
 
@@ -114,7 +117,73 @@ class ParkedIdAcceptsAFreshResult(unittest.TestCase):
         self.assertTrue(backend.publish(ITEM, FIRST))
         self.assertIs(core.deliver_one(ITEM, FIRST).outcome, DeliveryOutcome.CONFIRMED)
         self.assertTrue(backend.publish(ITEM, SECOND), "DELIVERED republishes as before")
-        self.assertFalse(backend.publish(ITEM, SECOND, republish_delivered=False))
+        self.assertIs(core.deliver_one(ITEM, SECOND).outcome, DeliveryOutcome.CONFIRMED)
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "DELIVERED")
+        self.assertFalse(backend.publish(ITEM, THIRD, republish_delivered=False),
+                         "the DELIVERED rule is judged in the DELIVERED state")
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "DELIVERED")
+        self.assertTrue(backend.publish(ITEM, THIRD))
+
+    def test_two_payloads_cannot_alternate_through_the_park(self):
+        prov = _Provider(refusals=CAP * 2)
+        backend, core = _parked(self.tmp, prov)
+        self.assertTrue(backend.publish(ITEM, SECOND))
+        for _ in range(CAP):
+            self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.ATTEMPTED)
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "PARKED")
+        calls = len(prov.calls)
+        for _ in range(6):                      # the reviewer's alternation probe
+            self.assertFalse(backend.publish(ITEM, FIRST), "a body that parked once is parked for good")
+            self.assertIs(core.deliver_one(ITEM, FIRST).status, DrainStatus.TERMINAL)
+            self.assertFalse(backend.publish(ITEM, SECOND))
+            self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.TERMINAL)
+        self.assertEqual(len(prov.calls), calls, "no provider call after both parks")
+        self.assertEqual(backend.resend_epoch(ITEM), 1)
+        self.assertTrue(backend.publish(ITEM, THIRD), "a third, never-parked body still gets its cycle")
+        self.assertEqual(len(outbox._read_item(backend.root, ITEM).get("parked_digests")), 2)
+
+    def test_a_dead_claim_left_on_a_park_does_not_refuse_the_fresh_result(self):
+        prov = _Provider(refusals=CAP)
+        backend, core = _parked(self.tmp, prov)
+        gone = subprocess.Popen(["true"])       # a pid that no longer runs
+        gone.wait()
+        claim = outbox._claim_path(backend.root, ITEM)
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        claim.write_text(json.dumps({"item_id": ITEM, "drainer_id": "crashed",
+                                     "pid": gone.pid, "start_usec": None,
+                                     "claimed_at": outbox.time.time()}))
+        self.assertIsNotNone(outbox.read_delivery_claim(backend.root, ITEM))
+        self.assertTrue(backend.publish(ITEM, SECOND),
+                        "a crash between the park write and the release must not quarantine B")
+        self.assertIsNone(outbox.read_delivery_claim(backend.root, ITEM), "the remnant is retired")
+        self.assertIs(core.deliver_one(ITEM, SECOND).outcome, DeliveryOutcome.CONFIRMED)
+
+    def test_a_live_claim_on_a_park_still_refuses(self):
+        prov = _Provider(refusals=CAP)
+        backend, _ = _parked(self.tmp, prov)
+        with outbox._item_lock(backend.root, ITEM):
+            self.assertTrue(outbox._acquire_locked(backend.root, ITEM, "alive"))
+        self.assertFalse(backend.publish(ITEM, SECOND), "a running owner is never displaced")
+
+    def test_a_park_that_recorded_no_payload_refuses_even_an_empty_one(self):
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        outbox._write_item(backend.root, ITEM, {"item_id": ITEM, "status": "PARKED",
+                                                "attempts": CAP, "reason": "max-attempts"})
+        self.assertFalse(backend.publish(ITEM, b""))
+        self.assertFalse(backend.publish(ITEM, SECOND), "nothing can be proven different")
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "PARKED")
+
+    def test_invalid_utf8_payloads_are_told_apart_by_their_bytes(self):
+        prov = _Provider(refusals=CAP)
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        core = DeliveryCore(backend, prov, policy=RetryPolicy(max_attempts=CAP), worker="w1")
+        self.assertTrue(backend.publish(ITEM, b"\xff"))
+        for _ in range(CAP):
+            core.deliver_one(ITEM, b"\xff")
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "PARKED")
+        self.assertFalse(backend.publish(ITEM, b"\xff"))
+        self.assertTrue(backend.publish(ITEM, b"\xfe"),
+                        "two bodies that both decode to U+FFFD are still different bodies")
 
 
 if __name__ == "__main__":
