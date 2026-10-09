@@ -1038,6 +1038,66 @@ class UntrackedAttemptsStayUnproven(unittest.TestCase):
         self.assertNotIn("cycle_ambiguous", rec)
 
 
+class TornCountersStayUncertain(unittest.TestCase):
+    """A record whose counters are only half present, boolean, or outrun by
+    `attempts` is not evidence; one definite attempt must not launder it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _ready(self, **fields):
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        rec = {"item_id": ITEM, "payload": FIRST.decode(), "status": "READY", "published_at": 1.0}
+        rec.update(fields)
+        outbox._write_item(backend.root, ITEM, rec)
+        return backend
+
+    def _park_then_publish_b(self, backend):
+        core = DeliveryCore(backend, _Provider(refusals=CAP), policy=RetryPolicy(max_attempts=CAP),
+                            worker="w1")
+        while _status(backend) != "PARKED":
+            self.assertIs(core.deliver_one(ITEM, FIRST).status, DrainStatus.ATTEMPTED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual(rec.get("reason"), "permanent-refusal")
+        return rec
+
+    def _refused(self, backend):
+        rec = self._park_then_publish_b(backend)
+        self.assertTrue(rec.get("attempt_evidence_missing"), f"not marked: {rec}")
+        self.assertFalse(backend.publish(ITEM, SECOND), f"B admitted on torn evidence: {rec}")
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("last_refusal"),
+                         "attempt-evidence-missing")
+
+    def test_started_without_classified_is_refused(self):
+        self._refused(self._ready(attempts_started=1))
+
+    def test_started_with_a_none_classified_is_refused(self):
+        self._refused(self._ready(attempts_started=1, attempts_classified=None))
+
+    def test_started_with_a_boolean_classified_is_refused(self):
+        self._refused(self._ready(attempts_started=1, attempts_classified=False))
+
+    def test_a_boolean_started_is_refused(self):
+        self._refused(self._ready(attempts_started=True, attempts_classified=1))
+
+    def test_classified_without_started_is_refused(self):
+        self._refused(self._ready(attempts_classified=1))
+
+    def test_classified_ahead_of_started_is_refused(self):
+        self._refused(self._ready(attempts_started=1, attempts_classified=2))
+
+    def test_attempts_ahead_of_started_is_refused(self):
+        """An older engine draining the same outbox notes `attempts` without
+        starting one here: the extra attempt may have landed A."""
+        self._refused(self._ready(attempts_started=1, attempts_classified=1, attempts=2))
+
+    def test_a_valid_pair_still_admits(self):
+        backend = self._ready(attempts_started=0, attempts_classified=0, attempts=0)
+        rec = self._park_then_publish_b(backend)
+        self.assertFalse(rec.get("attempt_evidence_missing"))
+        self.assertTrue(backend.publish(ITEM, SECOND), "a fully tracked definite park admits B")
+
+
 class TheDeliveredArmNamesItsOwnCause(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())

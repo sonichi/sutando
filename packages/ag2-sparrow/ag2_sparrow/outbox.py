@@ -959,14 +959,29 @@ def stamp_attempt_tracking(d: dict) -> None:
     d["attempts_classified"] = 0
 
 
+def attempt_tracking_is_valid(d: dict) -> bool:
+    """Both counters present as real non-boolean integers, classified never
+    ahead of started, and `attempts` (failures noted by any engine) never ahead
+    of started: an old engine draining the same outbox bumps `attempts` alone."""
+    started = d.get("attempts_started")
+    classified = d.get("attempts_classified")
+    if not (is_count(started) and is_count(classified)):
+        return False
+    if started < 0 or classified < 0 or classified > started:
+        return False
+    attempts = d.get("attempts")
+    if attempts is None:
+        return True
+    return is_count(attempts) and attempts <= started
+
+
 def mark_untracked_attempts(d: dict) -> bool:
-    """Sticky evidence that a record predates attempt tracking: it carries no
-    `attempts_started` counter at all. Whatever else it holds (`attempts`, a
-    retry record, nothing) cannot tell a never-sent body from one a dead
-    worker stored, so a fresh cycle stays refused until a new cycle rebuilds
-    the record. Never inferred from `attempts` or `retry`: a schedule writes
-    `retry` on the first claim of a record this code made. True when set."""
-    if is_count(d.get("attempts_started")) or d.get("attempt_evidence_missing"):
+    """Sticky evidence that an attempt may have escaped tracking: the counters
+    are absent, torn, boolean, or outrun by `attempts`. Whatever else the record
+    holds cannot tell a never-sent body from one a dead or older worker stored,
+    so a fresh cycle stays refused until a new cycle rebuilds the record. Never
+    inferred from `retry`: a schedule writes it on the first claim. True when set."""
+    if attempt_tracking_is_valid(d) or d.get("attempt_evidence_missing"):
         return False
     d["attempt_evidence_missing"] = True
     return True

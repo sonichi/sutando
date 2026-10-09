@@ -66,10 +66,10 @@ class DesignAClaimBackend:
     def _every_started_attempt_classified(prior: dict) -> bool:
         """True only when the record explicitly proves it: at least one attempt
         was started and exactly as many were classified by complete()."""
+        if not outbox.attempt_tracking_is_valid(prior):
+            return False
         started = prior.get("attempts_started")
-        classified = prior.get("attempts_classified")
-        return (outbox.is_count(started) and outbox.is_count(classified)
-                and started >= 1 and started == classified)
+        return started >= 1 and started == prior.get("attempts_classified")
 
     @staticmethod
     def _refuse(prior: dict, root: Path, item_id: str, why: str) -> bool:
