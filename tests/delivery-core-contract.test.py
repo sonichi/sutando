@@ -122,6 +122,27 @@ class ContractCase(unittest.TestCase):
     def test_capabilities_are_declared_not_sniffed(self):
         self.assertIsInstance(self.backend.capabilities, BackendCapabilities)
 
+    def test_a_fresh_payload_after_a_park_follows_the_declared_capability(self):
+        """The parked-id rule is scoped by `fresh_cycle_after_definite_park`,
+        never asserted for a backend that did not declare it."""
+        caps = self.backend.capabilities
+        if not caps.fresh_cycle_after_definite_park:
+            self.assertTrue(self.backend.publish(ITEM, b"x"))
+            self.assertFalse(self.backend.publish(ITEM, b"y"),
+                             "without the capability a live id refuses every other payload")
+            return
+        root = Path(self.tmp.name)
+        self.assertTrue(self.backend.publish(ITEM, b"x"))
+        if not any(r.get("item_id") == ITEM for r in outbox.list_items(root)):
+            self.fail("a backend declaring the capability must keep outbox-visible parks")
+        outbox.park_item(root, ITEM, "max-attempts")
+        self.assertFalse(self.backend.publish(ITEM, b"y"),
+                         "an ambiguous park refuses even a never-parked payload")
+        outbox.park_item(root, ITEM, "permanent-refusal")
+        self.assertFalse(self.backend.publish(ITEM, b"x"), "the parked body stays refused")
+        self.assertTrue(self.backend.publish(ITEM, b"y"),
+                        "a definite refusal admits a never-parked payload")
+
     def test_single_owner(self):
         self.backend.publish(ITEM, b"x")
         t1 = self.backend.claim(ITEM, "w1")

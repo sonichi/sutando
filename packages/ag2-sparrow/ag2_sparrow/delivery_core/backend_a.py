@@ -21,9 +21,12 @@ class DesignAClaimBackend:
 
     persists_receipt_metadata = True   # record_delivered() stores both
 
-    capabilities = BackendCapabilities(supports_force_release=True)
+    capabilities = BackendCapabilities(supports_force_release=True,
+                                       fresh_cycle_after_definite_park=True)
 
-    PARKED_DIGESTS_KEPT = 32   # bound on remembered parked payloads per id
+    # Only a park the broker definitely refused proves the parked body never
+    # landed; any other park may hold a body the broker already accepted.
+    DEFINITE_PARK_REASONS = frozenset({"permanent-refusal"})
 
     def __init__(self, root: Path, reclaim_ttl_s: float = 300.0,
                  retry_schedule: Optional[outbox.RetrySchedule] = None,
@@ -49,11 +52,13 @@ class DesignAClaimBackend:
 
     def publish(self, item_id: str, payload: bytes, *,
                 republish_delivered: Optional[bool] = None) -> bool:
-        """A PARKED id accepts a payload it has never parked on (a later reply,
-        with its own idempotency key); any payload it parked on stays refused,
-        so two bodies cannot alternate forever. This includes outcome-unknown
-        parks: the ambiguous attempt's own body is never resent by this path,
-        and the gateway's defer_idempotent_resend governs that body alone."""
+        """A PARKED id accepts a payload it has never parked on only when the
+        park is a definite refusal (the broker holds nothing for the id); an
+        ambiguous park (lost responses, exhausted retries, outcome-unknown)
+        refuses every payload, because the broker dedupes on the envelope id
+        and would silently keep the parked body in place of the new one. Every
+        payload the id ever parked on stays refused, across later deliveries
+        too, so bodies cannot alternate through the park."""
         allow_republish = (self.republish_delivered if republish_delivered is None
                            else republish_delivered)
         text = payload.decode("utf-8", "replace")
@@ -67,16 +72,18 @@ class DesignAClaimBackend:
                     parked = self._parked_digests(prior)
                     if parked is None or digest in parked:
                         return False
+                    if prior.get("reason") not in self.DEFINITE_PARK_REASONS:
+                        return False
                     rec = outbox.read_delivery_claim(self.root, item_id)
                     if rec is not None:
-                        # The cycle ended at the park, so a claim left here is a
-                        # crash remnant unless its owner still runs; no TTL applies.
+                        # The cycle ended at the park: a claim here is a crash
+                        # remnant unless its owner runs or is torn; no TTL applies.
                         if not outbox._record_is_reclaimable(rec, 0.0):
                             return False
                         outbox._release_locked(self.root, item_id, rec.drainer_id)
                     record = {
                         "resend_epoch": int(prior.get("resend_epoch", 0) or 0) + 1,
-                        "parked_digests": parked[-self.PARKED_DIGESTS_KEPT:],
+                        "parked_digests": parked,
                         "superseded_park": {
                             "attempts": int(prior.get("attempts", 0) or 0),
                             "reason": prior.get("reason"),
@@ -88,6 +95,15 @@ class DesignAClaimBackend:
                         return False
                     if outbox.read_delivery_claim(self.root, item_id) is not None:
                         return False
+                    history = [d for d in prior.get("parked_digests") or []
+                               if isinstance(d, str)]
+                    if digest in history:
+                        return False
+                    # A delivery in between does not forgive a parked body.
+                    record = {
+                        "resend_epoch": int(prior.get("resend_epoch", 0) or 0),
+                        "parked_digests": history,
+                    }
             record.update({
                 "item_id": item_id,
                 "payload": text,

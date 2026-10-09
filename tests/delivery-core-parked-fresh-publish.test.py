@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""A parked item must not poison its id: a LATER result published under the
-same id is a new reply and gets its own delivery cycle; re-publishing the
-very payload that parked stays refused, so a rescanned live file cannot
-turn one park into a retry per pass.
+"""A parked item must not poison its id, but only when the park proves the
+parked body never landed: after a DEFINITE refusal a later, different result
+published under the same id gets its own delivery cycle; after an ambiguous
+park (lost responses, exhausted retries, outcome-unknown) every payload stays
+refused, because the broker dedupes on the envelope id and would keep the
+parked body while reporting the new one delivered. Every payload the id ever
+parked on stays refused, across a later delivery too.
 
 Run: python3 tests/delivery-core-parked-fresh-publish.test.py"""
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -21,7 +26,9 @@ if str(_PKG) not in sys.path:
 
 from ag2_sparrow.delivery_core import (  # noqa: E402
     DeliveryCore, DeliveryOutcome, DeliveryReceipt, DesignAClaimBackend,
-    DrainStatus, ProviderCapabilities, ProviderRefused, RetryPolicy)
+    DrainStatus, ProviderCapabilities, ProviderIndeterminate, ProviderRefused,
+    ProviderPermanentRefused, RetryPolicy)
+from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceResultProvider  # noqa: E402
 from ag2_sparrow import outbox  # noqa: E402
 
 ITEM = "task-9da728fb8292936bf6"
@@ -32,10 +39,12 @@ CAP = 3
 
 
 class _Provider:
-    """Refuses `refusals` times, then confirms; records every call."""
+    """Refuses `refusals` times, then confirms; records every call.
+    `permanent` makes each refusal a definite one (the broker declined)."""
 
-    def __init__(self, refusals: int):
+    def __init__(self, refusals: int, permanent: bool = True):
         self.refusals = refusals
+        self.permanent = permanent
         self.capabilities = ProviderCapabilities()
         self.calls: list[tuple[str, bytes, str]] = []
 
@@ -43,6 +52,8 @@ class _Provider:
         self.calls.append((item_id, bytes(payload), idempotency_key))
         if self.refusals > 0:
             self.refusals -= 1
+            if self.permanent:
+                raise ProviderPermanentRefused("relay declined")
             raise ProviderRefused("relay refused")
         return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED)
 
@@ -50,44 +61,52 @@ class _Provider:
         return None
 
 
-def _parked(tmp: Path, provider: _Provider):
-    """Backend A with ITEM driven to PARKED at the attempt cap."""
+def _core(tmp: Path, provider):
     backend = DesignAClaimBackend(tmp / ".outbox")
-    core = DeliveryCore(backend, provider, policy=RetryPolicy(max_attempts=CAP),
-                        worker="w1")
-    assert backend.publish(ITEM, FIRST)
-    for _ in range(CAP):
-        res = core.deliver_one(ITEM, FIRST)
+    return backend, DeliveryCore(backend, provider, policy=RetryPolicy(max_attempts=CAP),
+                                 worker="w1")
+
+
+def _parked(tmp: Path, provider: _Provider, payload: bytes = FIRST):
+    """Backend A with ITEM driven to PARKED by the provider's refusals."""
+    backend, core = _core(tmp, provider)
+    assert backend.publish(ITEM, payload)
+    while outbox._read_item(backend.root, ITEM).get("status") != "PARKED":
+        res = core.deliver_one(ITEM, payload)
         assert res.status is DrainStatus.ATTEMPTED, res
-    assert outbox._read_item(backend.root, ITEM).get("status") == "PARKED"
     return backend, core
 
 
-class ParkedIdAcceptsAFreshResult(unittest.TestCase):
+def _status(backend):
+    return outbox._read_item(backend.root, ITEM).get("status")
+
+
+class ParkedIdAcceptsAFreshResultAfterADefiniteRefusal(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
 
     def test_the_same_payload_stays_refused_after_the_park(self):
-        prov = _Provider(refusals=CAP)
+        prov = _Provider(refusals=1)
         backend, core = _parked(self.tmp, prov)
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("reason"), "permanent-refusal")
         calls = len(prov.calls)
         for _ in range(5):                      # five drain passes over one live file
             self.assertFalse(backend.publish(ITEM, FIRST),
                              "the payload that parked must not re-enter the queue")
             self.assertIs(core.deliver_one(ITEM, FIRST).status, DrainStatus.TERMINAL)
         self.assertEqual(len(prov.calls), calls, "a park is final for that payload")
-        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "PARKED")
+        self.assertEqual(_status(backend), "PARKED")
 
     def test_a_different_payload_gets_its_own_cycle(self):
-        prov = _Provider(refusals=CAP)
+        prov = _Provider(refusals=1)
         backend, core = _parked(self.tmp, prov)
         parked_keys = {k for _, _, k in prov.calls}
         self.assertTrue(backend.publish(ITEM, SECOND),
-                        "a later result for a parked id is a new publication")
+                        "a later result for a definitely refused id is a new publication")
         rec = outbox._read_item(backend.root, ITEM)
         self.assertEqual(rec.get("status"), "READY")
         self.assertEqual(int(rec.get("attempts", 0)), 0, "the budget starts over")
-        self.assertEqual(rec.get("superseded_park", {}).get("attempts"), CAP,
+        self.assertEqual(rec.get("superseded_park", {}).get("reason"), "permanent-refusal",
                          "the park it replaced stays on the record")
         res = core.deliver_one(ITEM, SECOND)
         self.assertIs(res.status, DrainStatus.ATTEMPTED, "one POST, not a quarantine")
@@ -95,15 +114,41 @@ class ParkedIdAcceptsAFreshResult(unittest.TestCase):
         self.assertEqual(prov.calls[-1][1], SECOND, "the new body went out")
         self.assertNotIn(prov.calls[-1][2], parked_keys,
                          "a new logical send: the key must not dedupe against the park")
-        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "DELIVERED")
+        self.assertEqual(_status(backend), "DELIVERED")
+
+    def test_an_ambiguous_park_refuses_every_payload(self):
+        for reason, provider in (
+                ("max-attempts", _Provider(refusals=CAP, permanent=False)),
+                ("outcome-unknown", None)):
+            with self.subTest(reason=reason):
+                tmp = Path(tempfile.mkdtemp())
+                if provider is not None:
+                    backend, core = _parked(tmp, provider)
+                else:
+                    backend, core = _core(tmp, _Provider(refusals=0))
+                    self.assertTrue(backend.publish(ITEM, FIRST))
+                    backend.park(ITEM, "outcome-unknown")
+                self.assertEqual(outbox._read_item(backend.root, ITEM).get("reason"), reason)
+                self.assertFalse(backend.publish(ITEM, SECOND),
+                                 "the parked body may have landed: a successor would be "
+                                 "deduped away by the broker and reported delivered")
+                self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.TERMINAL,
+                              "the caller quarantines it where an operator can see it")
+                self.assertEqual(_status(backend), "PARKED")
+
+    def test_a_retry_window_exhausted_park_refuses_a_fresh_payload(self):
+        backend, core = _core(self.tmp, _Provider(refusals=0))
+        self.assertTrue(backend.publish(ITEM, FIRST))
+        backend.park(ITEM, "retry-window-exhausted")
+        self.assertFalse(backend.publish(ITEM, SECOND))
+        self.assertEqual(_status(backend), "PARKED")
 
     def test_a_fresh_result_that_fails_parks_again_without_looping(self):
-        prov = _Provider(refusals=CAP * 2)
+        prov = _Provider(refusals=2)
         backend, core = _parked(self.tmp, prov)
         self.assertTrue(backend.publish(ITEM, SECOND))
-        for _ in range(CAP):
-            self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.ATTEMPTED)
-        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "PARKED")
+        self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.ATTEMPTED)
+        self.assertEqual(_status(backend), "PARKED")
         calls = len(prov.calls)
         for _ in range(5):
             self.assertFalse(backend.publish(ITEM, SECOND))
@@ -112,25 +157,33 @@ class ParkedIdAcceptsAFreshResult(unittest.TestCase):
 
     def test_a_delivered_id_is_unchanged_by_this_rule(self):
         prov = _Provider(refusals=0)
-        backend = DesignAClaimBackend(self.tmp / ".outbox")
-        core = DeliveryCore(backend, prov, policy=RetryPolicy(max_attempts=CAP), worker="w1")
+        backend, core = _core(self.tmp, prov)
         self.assertTrue(backend.publish(ITEM, FIRST))
         self.assertIs(core.deliver_one(ITEM, FIRST).outcome, DeliveryOutcome.CONFIRMED)
         self.assertTrue(backend.publish(ITEM, SECOND), "DELIVERED republishes as before")
         self.assertIs(core.deliver_one(ITEM, SECOND).outcome, DeliveryOutcome.CONFIRMED)
-        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "DELIVERED")
+        self.assertEqual(_status(backend), "DELIVERED")
         self.assertFalse(backend.publish(ITEM, THIRD, republish_delivered=False),
                          "the DELIVERED rule is judged in the DELIVERED state")
-        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "DELIVERED")
+        self.assertEqual(_status(backend), "DELIVERED")
         self.assertTrue(backend.publish(ITEM, THIRD))
 
+    def test_a_delivered_id_with_a_live_claim_refuses(self):
+        prov = _Provider(refusals=0)
+        backend, core = _core(self.tmp, prov)
+        self.assertTrue(backend.publish(ITEM, FIRST))
+        self.assertIs(core.deliver_one(ITEM, FIRST).outcome, DeliveryOutcome.CONFIRMED)
+        with outbox._item_lock(backend.root, ITEM):
+            self.assertTrue(outbox._acquire_locked(backend.root, ITEM, "finishing"))
+        self.assertFalse(backend.publish(ITEM, SECOND),
+                         "a delivered item still held by its finisher is not republished")
+
     def test_two_payloads_cannot_alternate_through_the_park(self):
-        prov = _Provider(refusals=CAP * 2)
+        prov = _Provider(refusals=2)
         backend, core = _parked(self.tmp, prov)
         self.assertTrue(backend.publish(ITEM, SECOND))
-        for _ in range(CAP):
-            self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.ATTEMPTED)
-        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "PARKED")
+        self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.ATTEMPTED)
+        self.assertEqual(_status(backend), "PARKED")
         calls = len(prov.calls)
         for _ in range(6):                      # the reviewer's alternation probe
             self.assertFalse(backend.publish(ITEM, FIRST), "a body that parked once is parked for good")
@@ -142,8 +195,49 @@ class ParkedIdAcceptsAFreshResult(unittest.TestCase):
         self.assertTrue(backend.publish(ITEM, THIRD), "a third, never-parked body still gets its cycle")
         self.assertEqual(len(outbox._read_item(backend.root, ITEM).get("parked_digests")), 2)
 
+    def test_a_delivery_in_between_does_not_forgive_a_parked_body(self):
+        """refuse(A), confirm(B), refuse(C): A must stay refused (the reviewer's
+        delivered_reset probe), and C's park keeps A in its history."""
+        prov = _Provider(refusals=1)
+        backend, core = _parked(self.tmp, prov)          # A parks (definite)
+        self.assertTrue(backend.publish(ITEM, SECOND))     # B
+        self.assertIs(core.deliver_one(ITEM, SECOND).outcome, DeliveryOutcome.CONFIRMED)
+        self.assertEqual(_status(backend), "DELIVERED")
+        self.assertFalse(backend.publish(ITEM, FIRST), "A was parked; a delivery of B does not clear it")
+        prov.refusals = 1
+        prov.permanent = True
+        self.assertTrue(backend.publish(ITEM, THIRD))      # C
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual(rec.get("resend_epoch"), 1, "the epoch survives the delivered republish")
+        self.assertIs(core.deliver_one(ITEM, THIRD).status, DrainStatus.ATTEMPTED)
+        self.assertEqual(_status(backend), "PARKED")
+        self.assertFalse(backend.publish(ITEM, FIRST), "A is still refused after C parked")
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("parked_digests"),
+                         [hashlib.sha256(FIRST).hexdigest()],
+                         "C's park carries A's digest")
+        self.assertEqual(len(DesignAClaimBackend._parked_digests(
+            outbox._read_item(backend.root, ITEM))), 2)
+
+    def test_rotating_many_bodies_never_readmits_one(self):
+        """34 distinct bodies cycled three times (the reviewer's cap_rotation
+        probe): each is accepted exactly once, and none is accepted again."""
+        bodies = [json.dumps({"id": ITEM, "n": n}).encode() for n in range(34)]
+        prov = _Provider(refusals=len(bodies) * 3)
+        backend, core = _core(self.tmp, prov)
+        accepted = 0
+        for _ in range(3):
+            for body in bodies:
+                if backend.publish(ITEM, body):
+                    accepted += 1
+                    self.assertIs(core.deliver_one(ITEM, body).status, DrainStatus.ATTEMPTED)
+                    self.assertEqual(_status(backend), "PARKED")
+        self.assertEqual(accepted, len(bodies), "every body gets one cycle, none a second")
+        self.assertEqual(len(prov.calls), len(bodies))
+        self.assertEqual(len(outbox._read_item(backend.root, ITEM).get("parked_digests")),
+                         len(bodies) - 1)
+
     def test_a_dead_claim_left_on_a_park_does_not_refuse_the_fresh_result(self):
-        prov = _Provider(refusals=CAP)
+        prov = _Provider(refusals=1)
         backend, core = _parked(self.tmp, prov)
         gone = subprocess.Popen(["true"])       # a pid that no longer runs
         gone.wait()
@@ -159,31 +253,125 @@ class ParkedIdAcceptsAFreshResult(unittest.TestCase):
         self.assertIs(core.deliver_one(ITEM, SECOND).outcome, DeliveryOutcome.CONFIRMED)
 
     def test_a_live_claim_on_a_park_still_refuses(self):
-        prov = _Provider(refusals=CAP)
+        prov = _Provider(refusals=1)
         backend, _ = _parked(self.tmp, prov)
         with outbox._item_lock(backend.root, ITEM):
             self.assertTrue(outbox._acquire_locked(backend.root, ITEM, "alive"))
         self.assertFalse(backend.publish(ITEM, SECOND), "a running owner is never displaced")
 
+    def test_a_torn_claim_on_a_park_refuses(self):
+        """An unreadable claim names no owner; like every reclaim path, publish
+        never steals it — the fresh result is quarantined, visibly, not lost."""
+        prov = _Provider(refusals=1)
+        backend, core = _parked(self.tmp, prov)
+        claim = outbox._claim_path(backend.root, ITEM)
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        claim.write_text("{not json")
+        self.assertEqual(outbox.read_delivery_claim(backend.root, ITEM).state, "UNKNOWN")
+        self.assertFalse(backend.publish(ITEM, SECOND))
+        self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.TERMINAL)
+        self.assertEqual(_status(backend), "PARKED")
+
     def test_a_park_that_recorded_no_payload_refuses_even_an_empty_one(self):
         backend = DesignAClaimBackend(self.tmp / ".outbox")
         outbox._write_item(backend.root, ITEM, {"item_id": ITEM, "status": "PARKED",
-                                                "attempts": CAP, "reason": "max-attempts"})
+                                                "attempts": 1, "reason": "permanent-refusal"})
         self.assertFalse(backend.publish(ITEM, b""))
         self.assertFalse(backend.publish(ITEM, SECOND), "nothing can be proven different")
-        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "PARKED")
+        self.assertEqual(_status(backend), "PARKED")
+
+    def test_a_legacy_park_without_a_digest_is_judged_by_its_stored_text(self):
+        """Records written before payload digests existed carry only the text."""
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        outbox._write_item(backend.root, ITEM, {"item_id": ITEM, "status": "PARKED",
+                                                "attempts": 1, "reason": "permanent-refusal",
+                                                "payload": FIRST.decode("utf-8")})
+        self.assertFalse(backend.publish(ITEM, FIRST), "the stored text is the parked body")
+        self.assertTrue(backend.publish(ITEM, SECOND))
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("parked_digests"),
+                         [hashlib.sha256(FIRST).hexdigest()])
 
     def test_invalid_utf8_payloads_are_told_apart_by_their_bytes(self):
-        prov = _Provider(refusals=CAP)
-        backend = DesignAClaimBackend(self.tmp / ".outbox")
-        core = DeliveryCore(backend, prov, policy=RetryPolicy(max_attempts=CAP), worker="w1")
+        prov = _Provider(refusals=1)
+        backend, core = _core(self.tmp, prov)
         self.assertTrue(backend.publish(ITEM, b"\xff"))
-        for _ in range(CAP):
-            core.deliver_one(ITEM, b"\xff")
-        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "PARKED")
+        core.deliver_one(ITEM, b"\xff")
+        self.assertEqual(_status(backend), "PARKED")
         self.assertFalse(backend.publish(ITEM, b"\xff"))
         self.assertTrue(backend.publish(ITEM, b"\xfe"),
                         "two bodies that both decode to U+FFFD are still different bodies")
+
+
+class _Broker:
+    """A request double for the real AG2 Space provider: dedupes by envelope
+    id and keeps the FIRST body it stored, like the gateway it stands in for.
+    mode: 'lose' stores then loses the response; 'accept' stores or dedupes;
+    'refuse' declines without storing."""
+
+    def __init__(self, mode: str):
+        self.mode = mode
+        self.stored: dict[str, dict] = {}
+        self.posts: list[dict] = []
+
+    def request(self, method, path, payload):
+        self.posts.append(payload)
+        if self.mode == "refuse":
+            return {"ok": False, "error": "declined"}
+        duplicate = payload["id"] in self.stored
+        if not duplicate:
+            self.stored[payload["id"]] = payload
+        if self.mode == "lose":
+            raise urllib.error.URLError("response lost after the broker stored it")
+        return {"ok": True, "duplicate": duplicate}
+
+
+class ThroughTheRealProvider(unittest.TestCase):
+    """The reviewers' recipe: Backend A + DeliveryCore(defer_idempotent_resend)
+    + the real AG2SpaceResultProvider against a deduping broker."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _core(self, broker):
+        backend = DesignAClaimBackend(self.tmp / ".outbox")
+        core = DeliveryCore(backend, AG2SpaceResultProvider(broker.request),
+                            policy=RetryPolicy(max_attempts=CAP, defer_idempotent_resend=True),
+                            worker="gateway-result-drain")
+        return backend, core
+
+    def test_after_an_ambiguous_park_the_broker_still_holds_a_and_b_is_not_reported_delivered(self):
+        broker = _Broker("lose")
+        backend, core = self._core(broker)
+        self.assertTrue(backend.publish(ITEM, FIRST))
+        for _ in range(CAP):
+            self.assertIs(core.deliver_one(ITEM, FIRST).status, DrainStatus.ATTEMPTED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual((rec.get("status"), rec.get("reason")), ("PARKED", "max-attempts"))
+        self.assertEqual(broker.stored[ITEM]["body"], "first reply", "A landed; only its receipts were lost")
+        broker.mode = "accept"                   # from now on the broker dedupes by id
+        self.assertFalse(backend.publish(ITEM, SECOND),
+                         "B must not start a cycle the broker would dedupe into A")
+        self.assertIs(core.deliver_one(ITEM, SECOND).status, DrainStatus.TERMINAL)
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "PARKED",
+                         "B is not reported DELIVERED while the broker holds A")
+        self.assertEqual(broker.stored[ITEM]["body"], "first reply")
+        self.assertEqual(len(broker.posts), CAP, "no POST for B")
+
+    def test_after_a_definite_refusal_b_is_delivered(self):
+        broker = _Broker("refuse")
+        backend, core = self._core(broker)
+        self.assertTrue(backend.publish(ITEM, FIRST))
+        res = core.deliver_one(ITEM, FIRST)
+        self.assertIs(res.status, DrainStatus.ATTEMPTED)
+        rec = outbox._read_item(backend.root, ITEM)
+        self.assertEqual((rec.get("status"), rec.get("reason")), ("PARKED", "permanent-refusal"))
+        self.assertNotIn(ITEM, broker.stored, "a definite refusal stores nothing")
+        broker.mode = "accept"
+        self.assertTrue(backend.publish(ITEM, SECOND))
+        self.assertIs(core.deliver_one(ITEM, SECOND).outcome, DeliveryOutcome.CONFIRMED)
+        self.assertEqual(outbox._read_item(backend.root, ITEM).get("status"), "DELIVERED")
+        self.assertEqual(broker.stored[ITEM]["body"], "a later, different reply")
+        self.assertEqual(len(broker.posts), 2)
 
 
 if __name__ == "__main__":

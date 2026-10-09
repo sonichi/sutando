@@ -121,6 +121,9 @@ class BackendCapabilities:
     claim is eventually recoverable" holds for every backend — force
     release is one mechanism (A), a requeue-layer path is another (B)."""
     supports_force_release: bool = False
+    # True: a parked id accepts a never-parked payload after a DEFINITE refusal
+    # (publish docstring); False: a park is final for every payload.
+    fresh_cycle_after_definite_park: bool = False
 
 
 @dataclass(frozen=True)
@@ -177,14 +180,19 @@ class ClaimBackend(Protocol):
 
     def publish(self, item_id: str, payload: bytes) -> bool:
         """True = newly published; False = this id is already live, or parked
-        on this very payload.
+        and not eligible for this payload.
 
-        A parked id is not poisoned: a payload it has never parked on is a
-        later reply and starts a fresh cycle whose idempotency key cannot
-        dedupe against the parked attempt. Every payload the id has parked on
-        stays refused, so a rescanned live file never turns one park into a
-        retry per pass and two bodies cannot alternate. An outcome-unknown park
-        is included: the ambiguous body itself is never resent by this path.
+        A park is final for the payload that parked and for every payload the
+        id ever parked on, including after a later delivery of the same id, so
+        a rescanned live file never turns one park into a retry per pass and
+        bodies cannot alternate through the park. A backend that declares
+        `capabilities.fresh_cycle_after_definite_park` additionally accepts a
+        never-parked payload when the park is a DEFINITE refusal (the provider
+        proved it holds nothing for the id); an ambiguous park — lost
+        responses, an exhausted retry window, outcome-unknown — refuses every
+        payload, because a provider that dedupes on the item id would keep the
+        parked body and report the new one delivered. The refused payload stays
+        visible to the operator through the caller's quarantine, never lost.
 
         Durable backends may expose payload_for_claim(token) so the core sends
         the original published bytes rather than a rebuilt caller payload.
