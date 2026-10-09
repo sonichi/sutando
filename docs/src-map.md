@@ -112,6 +112,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-gateway-bridge-launchd.sh`** — Install / uninstall / check the launchd-supervised ag2.space gateway-bridge.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
+- **`installed_skill_roots.py`** — Every directory that holds installed skills, in precedence order: what skills/install.sh links and sparrowd supervises.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
@@ -188,11 +189,12 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`shutdown.py`** — Graceful-shutdown sentinel — a durable, cross-process "we are shutting down on purpose (not crashing)" signal.
 - **`signal_room_tasks.py`** — Signal Room → Sutando task submission.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
+- **`skill-dependency-resolve.ts`** — Lets a skill loaded from outside the engine tree import the engine's dependencies, as a shipped skill does: a bare import that fails from an out-of-tree skill retries from the engine.
 - **`skill-manifest-config.sh`** — Generic, skill-agnostic: reads every installed skill's manifest.json "config" block (skills/MANIFEST.md's own convention, previously Node-only via inline-tools.ts) and prints "KEY=VALUE" for each key, NUL-terminated.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
-- **`skill_roots.py`** — Where installed skills live, and what their manifests declare — the one Python scan of the sanctioned roots: the engine's `<repo>/skills` and the owner's `<workspace>/skills`, the pair `skills/install.sh` links (the TS loader `loadSkillManifestTools` scans the same two).
+- **`skill_roots.py`** — Where installed skills live, and what their manifests declare — the one Python scan of the sanctioned roots: the engine's `<repo>/skills` and the owner's `<workspace>/skills`, the pair a declaration is read from (`skills/install.sh` links the wider src/installed_skill_roots.py set; the TS loader `loadSkillManifestTools` scans the same two).
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
 - **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.

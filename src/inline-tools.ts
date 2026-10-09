@@ -25,6 +25,7 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
+import { allowEngineDependencies } from './skill-dependency-resolve.js';
 import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin } from './task-bridge.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
@@ -1344,6 +1345,10 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 			if (!manifest.tools) continue;
 			const toolsPath = join(skillsDir, dirName, manifest.tools.replace(/^\.\//, ''));
 			const tier = manifest.access_tier === 'any_caller' ? 'any_caller' : 'owner';
+			// A failure here must not cost other skills their tools; this skill's own import reports it.
+			try {
+				if (skillsDir !== join(REPO_ROOT, 'skills')) allowEngineDependencies(REPO_ROOT, join(skillsDir, dirName));
+			} catch { /* see the import below */ }
 			try {
 				// @ts-ignore — dynamic relative import resolved at runtime by tsx
 				// Node's ESM loader rejects raw Windows drive paths (`Q:\...`)

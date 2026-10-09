@@ -16,12 +16,39 @@ for _p in (str(_SRC), str(REPO / "packages" / "ag2-sparrow")):
         sys.path.insert(0, _p)
 
 from workspace_default import resolve_workspace  # noqa: E402
+from installed_skill_roots import installed_skill_roots  # noqa: E402
 from ag2_sparrow.sparrowd import WorkerSpec, run  # noqa: E402
 
 import re  # noqa: E402
 
 # A worker name reaches a state-dir path and a log line; keep it a plain name.
 _WORKER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _skill_manifests(workspace=None) -> list:
+    """Manifests from every skill root (src/installed_skill_roots.py), in its order. The first
+    root holding a skill folder of a name wins it, so a shipped skill wins, as in skills/install.sh."""
+    found, taken = [], set()
+    ws = workspace if workspace is not None else resolve_workspace()
+    for root in installed_skill_roots(REPO, ws):
+        try:
+            skills = [d for d in sorted(root.iterdir()) if d.is_dir()]
+        except OSError:
+            continue  # an unreadable root is skipped, never fatal to the supervisor
+        # Only a real skill claims its name, as in skills/install.sh; a leftover folder does not.
+        probed = [(d, _has(d, "manifest.json")) for d in skills]
+        probed = [(d, m) for d, m in probed if m or _has(d, "SKILL.md")]
+        found += [d / "manifest.json" for d, m in probed if m and d.name not in taken]
+        taken |= {d.name for d, _ in probed}
+    return found
+
+
+def _has(skill_dir, name) -> bool:
+    """Whether skill_dir holds the file; an unreadable folder holds nothing (older Pythons raise EACCES)."""
+    try:
+        return (skill_dir / name).is_file()
+    except OSError:
+        return False
 
 
 def _skill_worker_specs() -> "tuple[list, list[str]]":
@@ -41,7 +68,7 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
     import json
 
     specs, skipped = [], []
-    for manifest in sorted((REPO / "skills").glob("*/manifest.json")):
+    for manifest in _skill_manifests():
         skill_dir = manifest.parent
         try:
             data = json.loads(manifest.read_text(encoding="utf-8"))
@@ -50,6 +77,9 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
             continue
         decl = data.get("supervised_worker")
         if not isinstance(decl, dict):
+            continue
+        if data.get("enabled") is not True:  # same gate as the voice loader
+            skipped.append(f"{skill_dir.name}: not enabled in its manifest")
             continue
         name, rel = decl.get("name"), decl.get("script")
         if not isinstance(name, str) or not _WORKER_NAME.match(name):
@@ -77,7 +107,7 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
             needs = interp.get("needs")
             specs_needs = f" (it needs {needs})" if isinstance(needs, str) and needs else ""
             skipped.append(f"{name}: no interpreter configured: set {key} in "
-                           f"skills/{skill_dir.name}/manifest.json{specs_needs}")
+                           f"{manifest}{specs_needs}")
             continue
         if not Path(py).is_file():
             skipped.append(f"{name}: configured interpreter does not exist: {py}")
