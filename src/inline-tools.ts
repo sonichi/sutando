@@ -851,14 +851,13 @@ export const getCoreStatusTool: ToolDefinition = {
 			// (workspace resolves via the M0 helper; default <repo>/workspace/ post-v0.8).
 			// statusReadPath falls back to the legacy workspace-root location for one release.
 			const corePath = statusReadPath('core-status.json', WORKSPACE_DIR);
-			const queued = readQueueDepth(WORKSPACE_DIR);
 			// The user's own tasks come from the relay agent's table; the core's queue depth also counts
 			// other channels' tasks, cancel instructions and health checks, so it is not quoted to the user.
 			const rows = voiceTaskRows();
 			const queueNote = ` ${describeVoiceTasks(rows)}`;
 			const yourTasks = rows.map((r) => ({ id: r.id, task: r.text.slice(0, 60), state: r.state, heard: r.delivery === 'spoken' || r.delivery === 'injected' }));
 			if (!existsSync(corePath)) {
-				return { status: 'idle', queued, yourTasks, description: 'Core agent is not currently running.' + queueNote };
+				return { status: 'idle', yourTasks, description: 'Core agent is not currently running.' + queueNote };
 			}
 			const raw = readFileSync(corePath, 'utf-8');
 			const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
@@ -869,12 +868,11 @@ export const getCoreStatusTool: ToolDefinition = {
 					status: 'running',
 					step: s.step || '(no step label)',
 					ageSec,
-					queued,
 					yourTasks,
 					description: `Core agent is working on: ${s.step || 'an unlabeled task'} (started ${ageSec}s ago).` + queueNote,
 				};
 			}
-			return { status: 'idle', queued, yourTasks, description: 'Core agent is idle right now.' + queueNote };
+			return { status: 'idle', yourTasks, description: 'Core agent is idle right now.' + queueNote };
 		} catch (e) {
 			return { status: 'unknown', description: `Could not read core status: ${e instanceof Error ? e.message : e}` };
 		}

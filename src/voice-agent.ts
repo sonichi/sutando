@@ -30,9 +30,9 @@
 import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { notify as platformNotify } from './platform.js';
-import { inlineTools, personalSkillSetups, personalVoiceSurface } from './inline-tools.js';
+import { inlineTools, personalSkillSetups, personalVoiceSurface, describeVoiceTasks } from './inline-tools.js';
 import { createClientFrameHub } from './client-frame-hub.js';
 import { runSkillSetups } from './skill-setup-runner.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
@@ -59,7 +59,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, publishResultFile } from './task-bridge.js';
+import { voiceTaskRows, workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, publishResultFile } from './task-bridge.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -399,36 +399,6 @@ let sessionRef: VoiceSession | null = null;
 function ts(): string { return new Date().toISOString().slice(11, 23); }
 
 // =============================================================================
-// Pending tool call tracker
-// =============================================================================
-
-function getPendingToolCalls(toolName?: string) {
-	const items = sessionRef?.conversationContext.items ?? [];
-	const calls = new Map<string, { toolCallId: string; toolName: string; startedAt: number; args: Record<string, unknown> }>();
-	const completed = new Set<string>();
-
-	for (const item of items) {
-		if (item.role === 'tool_call') {
-			try {
-				const p = JSON.parse(item.content) as Partial<{ toolCallId: string; toolName: string; args: Record<string, unknown> }>;
-				if (typeof p.toolCallId === 'string' && typeof p.toolName === 'string') {
-					calls.set(p.toolCallId, { toolCallId: p.toolCallId, toolName: p.toolName, startedAt: item.timestamp, args: p.args ?? {} });
-				}
-			} catch { /* ignore */ }
-		}
-		if (item.role === 'tool_result') {
-			try {
-				const p = JSON.parse(item.content) as Partial<{ toolCallId: string }>;
-				if (typeof p.toolCallId === 'string') completed.add(p.toolCallId);
-			} catch { /* ignore */ }
-		}
-	}
-
-	const pending = [...calls.values()].filter((c) => !completed.has(c.toolCallId));
-	return toolName ? pending.filter((c) => c.toolName === toolName) : pending;
-}
-
-// =============================================================================
 // Meeting mode state — persists across Gemini reconnects
 // =============================================================================
 let meetingActive = false;
@@ -555,27 +525,20 @@ const switchModeTool: ToolDefinition = {
 const getTaskStatus: ToolDefinition = {
 	name: 'get_task_status',
 	description:
-		'Check whether Sutando has in-progress or queued tasks. ' +
-		'Use for status/progress questions like "any pending tasks?", "are you working on something?". ' +
-		'Do NOT call work just to check progress.',
+		'Check the tasks the user asked for by voice and where each stands now (queued, in progress, cancel requested, done, and whether the user heard the result). ' +
+		'Use for status/progress questions like "any pending tasks?", "how many tasks are there?", "are you working on something?". ' +
+		'Always call it for these: never answer from memory, the state changes. Do NOT call work just to check progress.',
 	parameters: z.object({}),
 	execution: 'inline',
 	execute: async () => {
-		const pending = getPendingToolCalls('work');
-		const oldest = pending.length > 0 ? Math.min(...pending.map((c) => c.startedAt)) : null;
-		// Also check tasks/ directory for queued files waiting for core agent
-		let queuedFiles: string[] = [];
-		try {
-			const tasksDir = join(WORKSPACE_DIR, 'tasks');
-			queuedFiles = readdirSync(tasksDir).filter(f => f.endsWith('.txt'));
-		} catch {}
+		// The relay agent's table, the same source as the in-line count and get_core_status.
+		const rows = voiceTaskRows();
+		const open = rows.filter((r) => r.state === 'queued' || r.state === 'started' || r.state === 'cancel_requested');
 		return {
-			inProgress: pending.length > 0 || queuedFiles.length > 0,
-			pendingToolCalls: pending.length,
-			queuedTaskFiles: queuedFiles.length,
-			elapsedSeconds: oldest ? Math.floor((Date.now() - oldest) / 1000) : 0,
-			pendingTasks: pending.map((c) => typeof c.args.task === 'string' ? c.args.task : '').filter(Boolean).slice(0, 3),
-			queuedTasks: queuedFiles.map(f => f.replace('.txt', '')),
+			inProgress: open.length > 0,
+			openTasks: open.length,
+			tasks: rows.map((r) => ({ task: r.text.slice(0, 60), state: r.state, heard: r.delivery === 'spoken' || r.delivery === 'injected' })),
+			description: describeVoiceTasks(rows),
 		};
 	},
 };

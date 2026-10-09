@@ -265,3 +265,28 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 		for (const f of [a, b, 'task-health-9']) rmSync(join(TMP, 'tasks', `${f}.txt`));
 	});
 });
+
+describe('every status answer comes from the one table', () => {
+	const src = (f: string) => readFileSync(join(import.meta.dirname, '..', 'src', f), 'utf-8');
+	const block = (text: string, start: string) => text.slice(text.indexOf(start), text.indexOf('\n};', text.indexOf(start)));
+	it('get_task_status, get_core_status and the cancel list read voiceTaskRows, never tasks/ or the core queue depth', () => {
+		for (const [file, start] of [['voice-agent.ts', "name: 'get_task_status'"], ['inline-tools.ts', "name: 'get_core_status'"]] as const) {
+			const b = block(src(file), start);
+			assert.ok(b.includes('voiceTaskRows()'), `${start} reads the table`);
+			assert.ok(!/readdirSync|readQueueDepth|getPendingToolCalls/.test(b), `${start} does not count files or tool calls`);
+		}
+		const cancelList = src('inline-tools.ts').split('// list mode:')[1].split('// Targeting:')[0];
+		assert.ok(cancelList.includes('voiceTaskRows()') && !cancelList.includes('readdirSync'));
+	});
+
+	it('describeVoiceTasks groups the user\'s tasks by where each stands and whether the result was heard', async () => {
+		const { describeVoiceTasks } = await import('../src/inline-tools.js');
+		const row = (text: string, state: string, delivery?: string) => ({ id: text, text, submittedAt: 1, state, delivery }) as never;
+		const out = describeVoiceTasks([row('check PR 5250', 'started'), row('check PR 5259', 'queued'), row('check PR 3509', 'done', 'dm'), row('check PR 5140', 'done', 'spoken')]);
+		assert.match(out, /1 in progress \("check PR 5250"\)/);
+		assert.match(out, /1 queued \("check PR 5259"\)/);
+		assert.match(out, /1 done but the user has not heard the result yet \("check PR 3509"\)/);
+		assert.match(out, /1 done and already told to the user \("check PR 5140"\)/);
+		assert.match(describeVoiceTasks([]), /no tasks/);
+	});
+});
