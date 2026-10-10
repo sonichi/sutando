@@ -113,9 +113,8 @@ WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
 # An inherited worker identity (instance id + its routing vars) is cleared, not trusted,
-# when the inbox is the core's own <workspace>/tasks BY REALPATH -- never by basename alone.
-CANONICAL_CORE_TASKS_DIR="$(canonical_tasks_dir "$WORKSPACE_DIR/tasks")"
-if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ "$TASKS_DIR_ABS" = "$CANONICAL_CORE_TASKS_DIR" ]; then
+# on the core's own canonical inbox -- via the ONE check every such caller shares.
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && inbox_is_canonical_core_tasks_dir "$TASKS_DIR"; then
   echo "watch-tasks-stream: SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID (and worker routing env) set while serving the core's own canonical inbox ($TASKS_DIR_ABS) -- clearing it to match the inbox, never the calling shell's inherited env" >&2
   unset SUTANDO_INSTANCE_ID SUTANDO_INBOX_KIND SUTANDO_INBOX_RESOLVER SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT
 fi
@@ -1020,6 +1019,10 @@ cleanup() {
   # exits. Only the watcher named by the file may remove it; otherwise the live
   # watcher would look orphaned and recovery would spawn another duplicate.
   sentinel_release_if_owner "$PID_FILE" "$$"
+  if [ -n "${SUTANDO_WATCHER_READY_TOKEN:-}" ] \
+     && [ "$(cat "$PID_FILE.token" 2>/dev/null)" = "$SUTANDO_WATCHER_READY_TOKEN" ]; then
+    rm -f "$PID_FILE.token"
+  fi
   if [ -n "${FSWATCH_PID:-}" ]; then
     kill -TERM "$FSWATCH_PID" 2>/dev/null || true
   fi
@@ -1223,6 +1226,8 @@ fi
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
+# A launcher that set SUTANDO_WATCHER_READY_TOKEN learns readiness from THIS write, never from a pid.
+[ -z "${SUTANDO_WATCHER_READY_TOKEN:-}" ] || printf '%s\n' "$SUTANDO_WATCHER_READY_TOKEN" > "$PID_FILE.token"
 # The sentinel is what a waiting starter's scan will see: the lock's job is done.
 release_start_lock
 # The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
