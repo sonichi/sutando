@@ -11,6 +11,9 @@ Guards:
   5. a plain body and an inline mention of the marker are untouched
   6. skip markers stay terminal; neutralize_markers takes the marker out of play
   7. the vendored package copy parses identically
+  8. a bare [thread] (task result: thread on the ask) emits `thread-ask`, is
+     stripped in any leading order, is distinct from [thread: $id], and is
+     neutralized like the others
 
 Run: python3 tests/result-markers-thread.test.py
 Exit: 0 on pass, 1 on fail.
@@ -105,6 +108,28 @@ spec.loader.exec_module(mod)
 text = f"[thread: {ROOT}]\n[channel: {ROOM}]\nupdate"
 check("vendored copy parses identically",
       acts(text, mod.parse_markers) == acts(text), str(acts(text, mod.parse_markers)))
+text = f"[thread]\n[channel: {ROOM}]\nupdate"
+check("vendored copy parses bare [thread] identically",
+      acts(text, mod.parse_markers) == acts(text), str(acts(text, mod.parse_markers)))
+
+# 8
+a, body = acts("[thread]\nall green")
+check("bare [thread] emits thread-ask", a == [("thread-ask", "")] and body == "all green", f"{a} {body!r}")
+a, body = acts(f"[channel: {ROOM}]\n[thread]\n[file: /tmp/x.txt]\nmoved")
+check("bare [thread] after [channel:], attach kept",
+      a == [("redirect", ROOM), ("thread-ask", ""), ("attach", "/tmp/x.txt")] and body == "moved",
+      f"{a} {body!r}")
+a, body = acts(f"[thread]\n[thread: {ROOT}]\nboth")
+check("bare and rooted forms are distinct actions",
+      a == [("thread-ask", ""), ("thread", ROOT)] and body == "both", f"{a} {body!r}")
+a, body = acts("[Thread]\n[thread]\nonce")
+check("repeated bare [thread] is one action", a == [("thread-ask", "")] and body == "once", f"{a} {body!r}")
+a, body = acts("use [thread] inline")
+check("inline bare [thread] is prose", a == [] and body == "use [thread] inline", f"{a} {body!r}")
+a, body = acts("[no-send]\n[thread]\nx")
+check("skip stays terminal over bare [thread]", a == [("skip", "no-send")], str(a))
+a, _ = acts(neutralize_markers("[thread]\nquoted"))
+check("neutralized bare [thread] emits no action", a == [], str(a))
 
 if failures:
     print(f"\n{len(failures)} failure(s)")

@@ -3805,6 +3805,7 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
                          the room-message op, so the actions are ignored
       * [thread: $root]→ stripped here; the send reads it via
                          _proactive_thread_root and posts in that thread
+      * bare [thread]  → task results only; stripped and ignored here
     """
     parsed = parse_markers(body)
     if any(a.kind == "skip" for a in parsed.actions):
@@ -3831,6 +3832,10 @@ def _proactive_thread_root(body: str, name: str = "") -> "str | None":
         if a.kind == "thread-foreign":
             _log(f"proactive {name}: [thread: {a.value[:80]!r}] may not be in the "
                  f"destination room ({a.extra}) — posting top level")
+            return None
+        if a.kind == "thread-ask":
+            _log(f"proactive {name}: a bare [thread] applies only to a task result "
+                 "— posting top level")
             return None
     return None
 
@@ -4628,7 +4633,7 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
 
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
                             no_send: bool = False, result_file=None,
-                            generation=None) -> bool:
+                            generation=None, thread_ask: bool = False) -> bool:
     """One outbound result POST through the delivery core. True = the
     gateway confirmed (server lease closed; caller archives). False = not
     confirmed this pass; leave the result file for the next one.
@@ -4639,6 +4644,9 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     doc = {"id": broker_tid, "body": body}
     if no_send:
         doc["no_send"] = True
+    if thread_ask:
+        # The broker roots it on this task's own ask; a broker without it ignores the key.
+        doc["thread"] = "ask"
     # Structured attribution, not the "— core-N" prose in the body: the
     # signature is for humans and reformatting it must not change routing.
     worker, refused = _attribution(tid)
@@ -4951,8 +4959,9 @@ def _post_ready_results(inflight: set[str]) -> None:
                 continue
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
+        thread_ask = any(a.kind == "thread-ask" for a in parsed.actions)
         if not _deliver_result_payload(tid, _wire, out_body, result_file=rfile,
-                                       generation=generation):
+                                       generation=generation, thread_ask=thread_ask):
             continue
         _archive_result(rfile, tid)
         inflight.discard(tid)

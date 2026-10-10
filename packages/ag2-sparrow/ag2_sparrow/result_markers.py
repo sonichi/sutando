@@ -47,6 +47,12 @@ Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
   the destination may not be that room: `thread-foreign` replaces `thread`
   and the body is posted top level.
 
+  THREAD-ASK marker — a bare leading line, in any order with the above:
+    [thread]
+  A task result only: the gateway asks the broker to answer in a new thread on
+  the task's own asking message (`"thread": "ask"`). It names no event, so it
+  cannot open a thread anywhere else. Stripped everywhere; ignored elsewhere.
+
   DM-ONLY marker — anywhere in the body:
     [dm-only]
   Privacy guard: suppresses any [channel:] redirect on the same body (no
@@ -81,6 +87,7 @@ Parse contract:
                  ("thread-invalid", raw)  — malformed [thread:]; post top level
                  ("thread-foreign", root) — root may not be the destination's;
                                             post top level (extra: why)
+                 ("thread-ask", "")       — task result: thread on the ask
                  ("attach", path)         — bridge runs its own allowlist
                                             check, then uploads
 
@@ -99,7 +106,7 @@ from typing import Literal
 
 
 ActionKind = Literal["skip", "redirect", "attach", "dm-only", "reply", "thread",
-                     "thread-invalid", "thread-foreign"]
+                     "thread-invalid", "thread-foreign", "thread-ask"]
 
 
 @dataclass
@@ -193,6 +200,8 @@ _REPLY_RE = re.compile(r"^\s*\[reply:\s*(\d{17,20})\]\s*\n?")
 # only a whitespace-free `$...` id is a thread target.
 _THREAD_RE = re.compile(r"^\s*\[thread:\s*([^\]]*)\]\s*\n?", re.IGNORECASE)
 _THREAD_ROOT_RE = re.compile(r"\$\S+")
+# Bare [thread] — a task result asks for a thread on its own ask; no id is read.
+_THREAD_ASK_RE = re.compile(r"^\s*\[thread\]\s*\n?", re.IGNORECASE)
 
 #: STRIPPING is narrower than DETECTION, deliberately. Detection stays
 #: `search()`-anywhere so the privacy guard cannot be defeated by marker
@@ -300,6 +309,12 @@ def parse_markers(text: str) -> ParseResult:
             ok = _THREAD_ROOT_RE.fullmatch(root) is not None
             actions.append(Action(kind="thread" if ok else "thread-invalid", value=root))
             body = body[thread_match.end():]
+            continue
+        ask_match = _THREAD_ASK_RE.match(body)
+        if ask_match:
+            if not any(a.kind == "thread-ask" for a in actions):
+                actions.append(Action(kind="thread-ask", value=""))
+            body = body[ask_match.end():]
             continue
         reply_match = _REPLY_RE.match(body)
         if reply_match:
@@ -603,7 +618,7 @@ def build_requeued_task(
 # Every bracket word the patterns above act on; the inverse of the grammar lives
 # beside it so a new marker is added to both at once.
 _MARKER_OPEN_RE = re.compile(
-    r"\[(?=(?:no-send|REPLIED|deduped:|channel:|thread:|reply:|dm-only|file:|send:|attach:))",
+    r"\[(?=(?:no-send|REPLIED|deduped:|channel:|thread:|thread\]|reply:|dm-only|file:|send:|attach:))",
     re.IGNORECASE)
 
 
