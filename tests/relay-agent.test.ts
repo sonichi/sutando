@@ -45,8 +45,8 @@ function harness(opts: { ready?: boolean; store?: ReturnType<typeof createVoiceT
 describe('result queue', () => {
 	it('two results arriving together go one per turn, each naming the request it answers', async () => {
 		const { q, injected } = harness();
-		q.enqueue({ text: '#5140 is merged.', taskId: 'task-5140', request: 'check PR 5140' });
-		q.enqueue({ text: '#5167 is blocked on CI.', taskId: 'task-5167', request: 'check PR 5167' });
+		q.enqueue({ text: '#5140 is merged.', taskId: 'task-5140', requests: ['check PR 5140'] });
+		q.enqueue({ text: '#5167 is blocked on CI.', taskId: 'task-5167', requests: ['check PR 5167'] });
 		await tick(10);
 		assert.equal(injected.length, 1);
 		assert.match(injected[0], /check PR 5140"[\s\S]*#5140 is merged/);
@@ -128,11 +128,11 @@ describe('result queue', () => {
 	});
 
 	it('each result in a batch names the request it answers, and only the batch ends the turn', () => {
-		const out = frameBatch([{ text: '#5140 merged.', request: 'check PR 5140' }, { text: '#5167 blocked.', request: 'check PR 5167' }]);
+		const out = frameBatch([{ text: '#5140 merged.', requests: ['check PR 5140'] }, { text: '#5167 blocked.', requests: ['check PR 5167'] }]);
 		assert.match(out, /This answers the user's request: "check PR 5140"\.[\s\S]*#5140 merged\.[\s\S]*This answers the user's request: "check PR 5167"\.[\s\S]*#5167 blocked\./);
 		assert.match(out, /Task result 1 of 2[\s\S]*Task result 2 of 2/);
 		assert.equal(out.match(/wait for real input/g)?.length, 1, 'once, in the batch header');
-		assert.match(frameBatch([{ text: 'x', request: 'draw a dog' }]), /This answers the user's request: "draw a dog"\.\]\n\n\[System: Task completed\./);
+		assert.match(frameBatch([{ text: 'x', requests: ['draw a dog'] }]), /This answers the user's request: "draw a dog"\.\]\n\n\[System: Task completed\./);
 	});
 
 	it('one result is framed exactly as before', () => {
@@ -170,7 +170,7 @@ describe('relay agent subagent', () => {
 	it('results go through the relay agent\'s own queue, also ones that land before it is attached', async () => {
 		const store = createVoiceTaskStore(join(TMP, `sc-${Math.random()}.json`));
 		const relay = new RelayAgent({ submit: async () => ({}), store });
-		relay.enqueue({ text: 'early', taskId: 'task-early', request: 'check PR 1' });
+		relay.enqueue({ text: 'early', taskId: 'task-early', requests: ['check PR 1'] });
 		assert.equal(relay.isInFlight('task-early'), true);
 		const injected: string[] = [];
 		const q = relay.attachDelivery({ canInject: () => true, inject: (t) => { injected.push(t); return true; }, fallback: () => {}, sleep: async () => {}, turnTimeoutMs: 1_000 });
@@ -219,6 +219,41 @@ describe('voice task store', () => {
 		assert.equal(typeof row.submittedAt, 'number');
 		assert.equal(row.cancelRequested, true);
 		assert.equal(row.delivery, 'dm');
+	});
+});
+
+describe('a result that answers several requests (the core deduped them into it)', () => {
+	it('the table records which result answered a task, and lists the tasks a result answered', () => {
+		const store = createVoiceTaskStore(join(TMP, `ab-${Math.random()}.json`));
+		store.add('task-a', 'check PR 5308');
+		store.add('task-b', 'check PR 5309');
+		store.add('task-c', 'check PR 5310');
+		store.setAnsweredBy('task-b', 'task-a');
+		store.setAnsweredBy('task-c', 'task-a');
+		store.setAnsweredBy('task-a', 'task-a');
+		assert.equal(store.get('task-b')?.answeredBy, 'task-a');
+		assert.equal(store.get('task-a')?.answeredBy, undefined, 'never answered by itself');
+		assert.deepEqual(store.answeredBy('task-a').map(([id]) => id).sort(), ['task-b', 'task-c']);
+	});
+
+	it('the hand-over names every request it answers and records each of their tasks', async () => {
+		const store = createVoiceTaskStore(join(TMP, `ab2-${Math.random()}.json`));
+		const { q, injected } = harness({ store });
+		q.enqueue({ text: 'All three.', taskId: 'task-a', requests: ['check PR 5308', 'check PR 5309', 'check PR 5310'], alsoFor: ['task-b', 'task-c'] });
+		await tick(10);
+		assert.match(injected[0], /This answers 3 of the user's requests: "check PR 5308"; "check PR 5309"; "check PR 5310"\. Cover each of them\./);
+		assert.equal(q.isInFlight('task-b'), true);
+		q.onTurnEnd();
+		await tick(10);
+		assert.deepEqual(['task-a', 'task-b', 'task-c'].map((id) => store.get(id)?.delivery), ['spoken', 'spoken', 'spoken']);
+	});
+
+	it('parses the task a [deduped: …] result points to', async () => {
+		const { dedupTarget } = await import('../src/skip_marker_ownership.js');
+		assert.equal(dedupTarget('[deduped: task-1791611250258]'), 'task-1791611250258');
+		assert.equal(dedupTarget('**[core: 2]**\n[deduped: task-9]'), 'task-9');
+		assert.equal(dedupTarget('[no-send]'), null);
+		assert.equal(dedupTarget('see [deduped: task-9]'), null);
 	});
 });
 
@@ -332,6 +367,29 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 		rmSync(copy);
 		reconcileVoiceTasks((text) => got.push(text), () => false);
 		assert.equal(got.filter((t) => t.includes('PR 9')).length, 1, 'once the copy is gone, it is owed');
+	});
+
+	it('a task the core answered in another task\'s result is owed that result, labelled for it', () => {
+		const a = `task-${1_800_000_900_000 + ++seq}`;
+		const b = `task-${1_800_000_900_000 + ++seq}`;
+		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${a}.txt`), `id: ${a}\nsource: voice\ntask: check PR 5308\n`);
+		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${b}.txt`), `id: ${b}\nsource: voice\ntask: check PR 5309\n`);
+		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${a}.txt`), 'All three: 5308 merged, 5309 ready.');
+		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${b}.txt`), `[deduped: ${a}]`);
+		voiceTaskStore.add(a, 'check PR 5308');
+		voiceTaskStore.add(b, 'check PR 5309');
+		voiceTaskStore.set(a, 'spoken');      // handed over before the dedup link existed, naming only 5308
+		voiceTaskStore.setAnsweredBy(b, a);
+		const got: Array<{ text: string; taskId?: string }> = [];
+		reconcileVoiceTasks((text, _note, meta) => got.push({ text, taskId: meta.taskId }), () => false);
+		const owed = got.filter((g) => g.taskId === b);
+		assert.equal(owed.length, 1);
+		assert.match(owed[0].text, /5309 ready/);
+		assert.equal(got.filter((g) => g.taskId === a).length, 0, 'the answering task itself was heard');
+		voiceTaskStore.set(b, 'spoken');
+		got.length = 0;
+		reconcileVoiceTasks((text, _note, meta) => got.push({ text, taskId: meta.taskId }), () => false);
+		assert.equal(got.filter((g) => g.taskId === b).length, 0, 'heard now: owes nothing');
 	});
 
 	it('status rows and the count ahead come from the table: a health check in tasks/ is not one of the user\'s', () => {

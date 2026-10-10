@@ -24,6 +24,8 @@ export interface VoiceTaskRecord {
 	replays?: number;
 	/** The user was told the core had not picked it up. */
 	notPickedNoticed?: boolean;
+	/** The core answered this task in another task's result (`[deduped: <id>]`): its outcome is that result. */
+	answeredBy?: string;
 	/** Last change, for the cap. */
 	at: number;
 }
@@ -84,6 +86,15 @@ export function createVoiceTaskStore(path: string, now: () => number = Date.now)
 		noteNotPicked(taskId: string): void {
 			update(taskId, (row) => ({ ...row, notPickedNoticed: true }));
 		},
+		/** The core answered `taskId` in `target`'s result. */
+		setAnsweredBy(taskId: string, target: string): void {
+			if (taskId === target) return;
+			update(taskId, (row) => ({ ...row, answeredBy: target }));
+		},
+		/** The rows the core answered in `target`'s result. */
+		answeredBy(target: string): Array<[string, VoiceTaskRecord]> {
+			return Object.entries(read()).filter(([, row]) => row.answeredBy === target);
+		},
 	};
 }
 
@@ -133,13 +144,21 @@ export interface ResultItem {
 	attempts?: number;
 	/** `text` is already framed for the model (not a task result), e.g. a finished phone call. */
 	framed?: boolean;
-	/** What the user asked for, so the model can match the result to the request. */
-	request?: string;
+	/** What the user asked for, so the model can match the result to each request it answers. */
+	requests?: string[];
+	/** Other voice tasks this result answers (the core deduped them into it): recorded with it. */
+	alsoFor?: string[];
 }
 
 /** The text handed to the model for one batch: one result as before; several, each to be covered. */
 export function frameBatch(items: ResultItem[]): string {
-	const asked = (i: ResultItem) => (i.request ? `${framedSystem(`This answers the user's request: "${i.request.replace(/"/g, "'")}".`)}\n\n` : '');
+	const quote = (r: string) => `"${r.replace(/"/g, "'")}"`;
+	const asked = (i: ResultItem) => {
+		const rs = (i.requests ?? []).filter(Boolean);
+		if (rs.length === 0) return '';
+		if (rs.length === 1) return `${framedSystem(`This answers the user's request: ${quote(rs[0])}.`)}\n\n`;
+		return `${framedSystem(`This answers ${rs.length} of the user's requests: ${rs.map(quote).join('; ')}. Cover each of them.`)}\n\n`;
+	};
 	const note = (i: ResultItem) => (i.note ? `\n\n${framedSystem(i.note)}` : '');
 	if (items.length === 1) {
 		const [i] = items;
@@ -193,9 +212,11 @@ export function createResultQueue(deps: ResultQueueDeps) {
 
 	const record = (items: ResultItem[], delivery: Delivery) => {
 		for (const i of items) {
-			if (!i.taskId) continue;
-			deps.store?.set(i.taskId, delivery);
-			inFlight.delete(i.taskId);
+			for (const id of [i.taskId, ...(i.alsoFor ?? [])]) {
+				if (!id) continue;
+				deps.store?.set(id, delivery);
+				inFlight.delete(id);
+			}
 		}
 	};
 
@@ -264,7 +285,7 @@ export function createResultQueue(deps: ResultQueueDeps) {
 
 	return {
 		enqueue(item: ResultItem): void {
-			if (item.taskId) inFlight.add(item.taskId);
+			for (const id of [item.taskId, ...(item.alsoFor ?? [])]) if (id) inFlight.add(id);
 			queue.push(item);
 			if (!running) void drain();
 		},
@@ -321,7 +342,7 @@ export class RelayAgent implements PersistentSubagentInstance {
 	}
 
 	isInFlight(taskId: string): boolean {
-		return this.queue?.isInFlight(taskId) ?? this.early.some((i) => i.taskId === taskId);
+		return this.queue?.isInFlight(taskId) ?? this.early.some((i) => i.taskId === taskId || i.alsoFor?.includes(taskId));
 	}
 
 	async dispose(): Promise<void> {}

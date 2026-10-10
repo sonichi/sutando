@@ -152,13 +152,22 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			}
 		},
 	});
-	const requestOf = (taskId?: string) => (taskId ? voiceTaskStore.get(taskId)?.text : undefined);
+	// A result answers its own task and every task the core deduped into it that the user has not heard.
+	const answering = (taskId?: string): Pick<ResultItem, 'requests' | 'alsoFor'> => {
+		if (!taskId) return {};
+		const others = voiceTaskStore.answeredBy(taskId).filter(([, row]) => row.delivery !== 'spoken' && row.delivery !== 'injected');
+		const own = voiceTaskStore.get(taskId)?.text;
+		return {
+			requests: [own, ...others.map(([, row]) => row.text)].filter((r): r is string => !!r),
+			alsoFor: others.map(([id]) => id),
+		};
+	};
 	session.eventBus.subscribe('turn.end', () => results.onTurnEnd());
 	session.eventBus.subscribe('turn.interrupted', () => results.onTurnInterrupted());
 
 	startResultWatcher((result, deliveryNote, meta) => {
 		console.log(`${ts()} [TaskBridge] Queueing result for the user${deliveryNote ? ' (with a delivery note)' : ''}`);
-		results.enqueue({ text: result, note: deliveryNote, taskId: meta?.taskId, request: requestOf(meta?.taskId) });
+		results.enqueue({ text: result, note: deliveryNote, taskId: meta?.taskId, ...answering(meta?.taskId) });
 	}, () => session.clientConnected);
 
 	// The relay agent's reconcile loop: whatever the core finished that the user has not heard
@@ -166,7 +175,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	const reconcile = setInterval(() => {
 		if (!session.sessionManager.isActive || !session.clientConnected || meetingHoldsModel(session)) return;
 		try {
-			reconcileVoiceTasks((text, note, meta) => results.enqueue({ text, note, taskId: meta.taskId, framed: meta.framed, request: requestOf(meta.taskId) }), (id) => results.isInFlight(id));
+			reconcileVoiceTasks((text, note, meta) => results.enqueue({ text, note, taskId: meta.taskId, framed: meta.framed, ...answering(meta.taskId) }), (id) => results.isInFlight(id));
 		} catch (err) {
 			console.error(`${ts()} [RelayAgent] reconcile failed (will retry):`, err);
 		}

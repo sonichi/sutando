@@ -99,3 +99,32 @@ describe('relay agent end to end: results lost in a reconnect come back', () => 
 		assert.equal(copiesOf(), 1, 'the second fallback writes no second copy');
 	});
 });
+
+describe('relay agent end to end: three requests the core answered in one result', () => {
+	it('all three requests are named to the model, and every row ends heard', async () => {
+		const { voiceTaskStore } = await import('../src/task-bridge.js');
+		const mode = { value: 'agent' as 'agent' | 'transcription' };
+		const s = fakeSession(mode);
+		const relay = new RelayAgent({ submit: async () => ({}), store: voiceTaskStore });
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		wireDurableChannels(s as any, { relay, notReadyRetriesMs: [10, 10], reconcileMs: 300 });
+		const ids = ['5308', '5309', '5310'].map((pr) => `task-18999${pr}`);
+		for (const [n, pr] of ['5308', '5309', '5310'].entries()) {
+			writeFileSync(join(TMP, 'tasks', `${ids[n]}.txt`), `id: ${ids[n]}\nsource: voice\ntask: check PR ${pr}\n`);
+			voiceTaskStore.add(ids[n], `check PR ${pr}`);
+		}
+		// The core answers all three in the first task's result and dedups the other two into it.
+		writeFileSync(join(TMP, 'results', `${ids[1]}.txt`), `[deduped: ${ids[0]}]`);
+		writeFileSync(join(TMP, 'results', `${ids[2]}.txt`), `[deduped: ${ids[0]}]`);
+		writeFileSync(join(TMP, 'results', `${ids[0]}.txt`), 'All three: 5308 merged; 5309 ready to merge; 5310 blocked.');
+		const named = () => ['5308', '5309', '5310'].filter((pr) => s.sent.join('\n').includes(`"check PR ${pr}"`));
+		for (let w = 0; w < 120 && (named().length < 3 || ids.some((id) => !['spoken', 'injected'].includes(voiceTaskStore.get(id)?.delivery ?? ''))); w++) {
+			await tick(100);
+			if (w % 5 === 4) s.emit('turn.end');
+		}
+		assert.deepEqual(named(), ['5308', '5309', '5310'], 'every request named to the model');
+		assert.ok(s.sent.every((t) => !t.includes('[deduped:')), 'a dedup marker is never spoken');
+		assert.deepEqual(ids.map((id) => voiceTaskStore.get(id)?.answeredBy), [undefined, ids[0], ids[0]]);
+		for (const id of ids) assert.ok(['spoken', 'injected'].includes(voiceTaskStore.get(id)?.delivery ?? ''), `${id} heard`);
+	});
+});

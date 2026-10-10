@@ -16,7 +16,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
-import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
+import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, dedupTarget, type TaskOrigin } from './skip_marker_ownership.js';
 import { createVoiceTaskStore, planReconcile } from './relay-agent.js';
 import { framedSystem } from './inject-framing.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
@@ -602,18 +602,21 @@ export function reconcileVoiceTasks(deliver: RelayDeliver, isInFlight: (taskId: 
 		// A result still in results/ is the watcher's to deliver first.
 		// An offline DM copy still in results/ is on its way (a bridge takes it, or the drain speaks it on reconnect).
 		if (_hasLiveOfflineCopy(id)) continue;
-		const settledResult = existsSync(join(RESULT_DIR, `${id}.txt`)) ? _deliveredResults.has(`${id}.txt`) : _hasResult(id);
-		const text = settledResult ? _readResultText(id) : null;
+		// A task the core answered in another task's result is owed that result.
+		const source = row.answeredBy ?? id;
+		if (source !== id && _hasLiveOfflineCopy(source)) continue;
+		const settledResult = existsSync(join(RESULT_DIR, `${source}.txt`)) ? _deliveredResults.has(`${source}.txt`) : _hasResult(source);
+		const text = settledResult ? _readResultText(source) : null;
 		const action = planReconcile({
 			row,
 			core: voiceTaskState(id),
 			settledResult: settledResult && !!text,
 			resultIsSkip: !!text && bodyIsSkipMarked(text),
-			inFlight: isInFlight(id),
+			inFlight: isInFlight(id) || isInFlight(source),
 			now,
 		});
 		if (action === 'speak_result' && text) {
-			console.log(`${ts()} [RelayAgent] ${id}: result never heard (${row.delivery ?? 'no delivery'}); handing it over again`);
+			console.log(`${ts()} [RelayAgent] ${id}: result never heard (${row.delivery ?? 'no delivery'})${source !== id ? `, answered in ${source}` : ''}; handing it over again`);
 			voiceTaskStore.noteReplay(id);
 			deliver(text.replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '').trim(), row.cancelRequested ? CANCELLED_BUT_FINISHED_NOTE : MISSED_RESULT_NOTE, { taskId: id });
 		} else if (action === 'tell_not_picked') {
@@ -1467,6 +1470,9 @@ function startRelayResultWatcher(onResult: ResultListener): void {
 				if (!bodyIsSkipMarked(result)) {
 					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
 					onResult(`[Task result for ${taskId}]\n${result}`);
+				} else {
+					const answeredIn = dedupTarget(result);
+					if (answeredIn && voiceTaskStore.get(taskId)) voiceTaskStore.setAnsweredBy(taskId, answeredIn);
 				}
 				await _delegation.archiveResultFile(file, taskId);
 			}
@@ -1681,6 +1687,12 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 						continue;   // another consumer's: leave the files for its owner
 					}
 					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker; archiving silently`);
+					// A voice task the core answered in another task's result: the table owes the user that result.
+					const answeredIn = dedupTarget(result);
+					if (answeredIn && voiceTaskStore.get(taskId)) {
+						voiceTaskStore.setAnsweredBy(taskId, answeredIn);
+						console.log(`${ts()} [RelayAgent] ${taskId}: answered in ${answeredIn}`);
+					}
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
