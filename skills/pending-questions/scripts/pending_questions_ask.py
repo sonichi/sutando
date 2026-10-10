@@ -5,8 +5,9 @@ QUEUED as a proactive file — to the task's own conversation only for an owner-
 in the owner's own DM (`.to-<bridge>` name + `[channel:]` marker), to the owner's DM on
 the task's bridge for any other bridge task, else to the owner's DM on the bridge he was
 last active on; a drain delivering the file is what makes it sent; (2) the question and
-its queue record are saved to the outbox (`pending_questions_outbox`), atomically; (3) the
-macOS notification fires last, and a refusal prints the fix instead of a success. The
+its queue record are saved to the outbox (`pending_questions_outbox`), atomically; (3) only
+when nothing was queued is a persistent macOS dialog launched, offering the question's row,
+and a launch failure is printed; a queued question is left to the chat app's own notification. The
 room-database adapter builds its row on top of `queue_question`; with no room, `ask_owner`
 here is the whole ask and the outbox is the record.
 
@@ -46,8 +47,7 @@ SENT_RE = re.compile(
     r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\s*$", re.MULTILINE)
 # Bridges whose drain honours a `[channel:]` room redirect (telegram drops it).
 _ROOM_MARKER_BRIDGES = frozenset({"discord", "slack", "ag2space"})
-MACOS_FIX = ("allow notifications for your terminal app under System Settings > "
-             "Notifications, or run from a session where osascript is permitted")
+MACOS_FIX = "the question is still held; answer it in Pending questions"
 
 # Positive evidence, per bridge, that the task's channel is the owner's own DM.
 _DM_EVIDENCE = {
@@ -183,21 +183,86 @@ def write_proactive(results: Path, name: str, body: str) -> Path:
     return write_text_whole(Path(results) / name, body)
 
 
-def notify_macos(text: str) -> tuple:
-    """(ok, fix). A refused or failed osascript names the fix; it never claims ok."""
-    esc = text.replace("\\", "\\\\").replace('"', '\\"')[:200]
+# Text arrives as argv, never spliced into the script; item 1 is a fixed sentinel so a
+# question starting with "-" is not read as an osascript option.
+_DIALOG_SCRIPT = (
+    "use framework \"AppKit\"",
+    "use scripting additions",
+    "on run argv",
+    "set msg to \"Sutando couldn't message you. Question: \" & item 2 of argv",
+    "if (count of argv) > 2 then",
+    "set r to display dialog msg with title \"Sutando\" buttons {\"Later\", \"Open Pending questions\"} "
+    "default button \"Open Pending questions\"",
+    "if button returned of r is \"Open Pending questions\" then",
+    "set target to item 3 of argv",
+    "if (count of argv) > 3 then",
+    "set deepURL to current application's NSURL's URLWithString:(item 4 of argv)",
+    "if deepURL is not missing value then",
+    "set appURL to current application's NSWorkspace's sharedWorkspace()'s URLForApplicationToOpenURL:deepURL",
+    "if appURL is not missing value then set target to item 4 of argv",
+    "end if",
+    "end if",
+    "open location target",
+    "end if",
+    "else",
+    "display dialog msg with title \"Sutando\" buttons {\"OK\"} default button \"OK\"",
+    "end if",
+    "end run",
+)
+DIALOG_QUESTION_MAX = 1000
+_ROW_PATH_RE = re.compile(r"^/(?:room|home)/(?P<room>[^/?#]+)(?:/(?P<event>[^/?#]+))?/?$")
+
+
+def app_deep_link(link: Optional[str]) -> Optional[str]:
+    """The AG2 Space app's link for a row's https link (hash or path route): scheme ag2space, host
+    home, path <room>[/<event>]/, query surface/page; None when the link does not parse."""
+    from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit  # noqa: PLC0415
     try:
-        r = subprocess.run(["osascript", "-e",
-                            f'display notification "{esc}" with title "Sutando"'],
-                           capture_output=True, text=True, timeout=15)
-    except (FileNotFoundError, OSError):
-        return False, "osascript not found on PATH (not macOS, or a bare PATH); " + MACOS_FIX
-    except subprocess.TimeoutExpired:
-        return False, "osascript did not return within 15s; " + MACOS_FIX
-    if r.returncode != 0:
-        err = " ".join((r.stderr or "").split())[:120]
-        return False, f"osascript exit {r.returncode} ({err or 'no stderr'}); {MACOS_FIX}"
+        u = urlsplit(link or "")
+    except ValueError:
+        return None
+    if u.scheme not in ("https", "http") or not u.netloc:
+        return None
+    route = u.fragment if u.fragment.startswith("/") else u.path + (f"?{u.query}" if u.query else "")
+    path, _, query = route.partition("?")
+    m = _ROW_PATH_RE.match(path)
+    if not m:
+        return None
+    parts = [quote(unquote(m.group(g)), safe="") for g in ("room", "event") if m.group(g)]
+    q = parse_qs(query)
+    params = "&".join(f"{k}={quote(q[k][0], safe='')}" for k in ("surface", "page") if q.get(k))
+    return urlunsplit(("ag2space", "home", "/" + "/".join(parts) + "/", params, ""))
+
+
+def dialog_argv(question: str, link: Optional[str] = None) -> list:
+    """Item 3 is the row's https link, item 4 its app deep link; the script picks at click time."""
+    q = question.strip()
+    if len(q) > DIALOG_QUESTION_MAX:
+        q = q[:DIALOG_QUESTION_MAX - 1] + "…"
+    argv = ["osascript"]
+    for line in _DIALOG_SCRIPT:
+        argv += ["-e", line]
+    deep = app_deep_link(link) if link else None
+    return argv + ["sutando", q] + ([link] if link else []) + ([deep] if deep else [])
+
+
+def show_dialog(question: str, link: Optional[str] = None) -> tuple:
+    """(launched, fix). Detached so the ask returns at once; the dialog stays until dismissed."""
+    try:
+        subprocess.Popen(dialog_argv(question, link), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except (FileNotFoundError, OSError) as e:
+        return False, f"osascript could not start ({type(e).__name__}; not macOS, or a bare PATH); {MACOS_FIX}"
     return True, None
+
+
+def notify_unless_queued(out: dict, question: str) -> None:
+    """Set out["macos"]/["macos_fix"]: "skipped" once a DM file is queued, else a persistent dialog.
+    A notification vanishes and has no click target, so it is never the fallback."""
+    if out.get("proactive_file"):
+        out["macos"], out["macos_fix"] = "skipped", None
+    else:
+        out["macos"], out["macos_fix"] = show_dialog(question, out.get("link"))
 
 
 def queue_question(question: str, context: Optional[str] = None, task_file: Optional[str] = None,
@@ -256,7 +321,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
                 "db_error": out["outbox_error"] or "no room database store", "link": None,
                 "macos": None, "macos_fix": None})
     if urgency == "live":
-        out["macos"], out["macos_fix"] = notify_macos(f"Question: {question}")
+        notify_unless_queued(out, question)
     return out
 
 
@@ -281,8 +346,10 @@ def report_lines(out: dict) -> list:
         lines.append(f"sent: FAILED — {out.get('send_error')} (the record stands; ask by hand)")
     if out.get("send_error") and out.get("proactive_file"):
         lines.append(f"note: {out['send_error']}")
-    if out.get("macos") is True:
-        lines.append("macos: notification sent")
+    if out.get("macos") == "skipped":
+        lines.append("macos: skipped (question queued to your DM; your chat app notifies)")
+    elif out.get("macos") is True:
+        lines.append("macos: dialog launched (DM send failed)")
     elif out.get("macos") is False:
         lines.append(f"macos: FAILED — {out.get('macos_fix')}")
     return lines

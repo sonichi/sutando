@@ -11,6 +11,7 @@ import io
 import json
 import os
 import runpy
+import shutil
 import stat
 import subprocess
 import sys
@@ -464,30 +465,105 @@ class TestFailOpen(_Workspace):
         self.assertIn("**Sent:** FAILED", sent)
         self.assertIsNone(pqa.sent_at(sent), "a failed send is not a send")
 
-    def test_refused_osascript_prints_the_fix(self):
-        self._osascript(1)
-        r = self._run("q?")
-        self.assertEqual(r.returncode, 0)
-        self.assertIn("macos: FAILED", r.stdout)
-        self.assertIn("System Settings > Notifications", r.stdout)
-        self.assertIn("-1743", r.stdout)
-        self.assertNotIn("notification sent", r.stdout)
+    def _break_send(self):
+        shutil.rmtree(self.ws / "results")
+        (self.ws / "results").write_text("not a directory")
 
     def test_missing_osascript_prints_the_fix(self):
+        self._break_send()
         empty = self.ws / "empty-bin"
         empty.mkdir()
         r = self._run("q?", path=empty)
-        self.assertIn("osascript not found", r.stdout)
-        self.assertIn("System Settings > Notifications", r.stdout)
+        self.assertIn("sent: FAILED", r.stdout)
+        self.assertIn("macos: FAILED — osascript could not start", r.stdout)
+        self.assertNotIn("dialog launched", r.stdout)
 
-    def test_live_notifies_and_durable_does_not(self):
-        r = self._run("q?")
-        self.assertIn("macos: notification sent", r.stdout)
-        self.assertIn("Question: q?", self.calls.read_text())
-        self.calls.unlink()
-        r = self._run("q?", "--urgency", "durable")
+    def test_a_queued_dm_launches_no_dialog(self):
+        with mock.patch("subprocess.Popen") as popen:
+            r = self._run("q?")
+        self.assertIn("sent: queued", r.stdout)
+        self.assertIn("macos: skipped (question queued to your DM; your chat app notifies)", r.stdout)
+        popen.assert_not_called()
+        self.assertFalse(self.calls.exists(), "a queued DM runs no osascript")
+
+    def test_a_failed_send_launches_a_detached_dialog(self):
+        self._break_send()
+        with mock.patch("subprocess.Popen") as popen:
+            r = self._run("q?")
+        self.assertIn("sent: FAILED", r.stdout)
+        self.assertIn("macos: dialog launched (DM send failed)", r.stdout)
+        [call] = popen.call_args_list
+        argv = call.args[0]
+        self.assertEqual((argv[0], argv[-2:]), ("osascript", ["sutando", "q?"]), "no row link: OK only")
+        self.assertTrue(call.kwargs["start_new_session"])
+        self.assertEqual({call.kwargs[k] for k in ("stdin", "stdout", "stderr")}, {subprocess.DEVNULL})
+
+    def test_the_dialog_carries_the_row_link_and_offers_open_only_with_one(self):
+        out = {"proactive_file": None, "link": "https://example.test/row"}
+        with mock.patch("subprocess.Popen") as popen:
+            pqa.notify_unless_queued(out, "q?")
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[-3:], ["sutando", "q?", "https://example.test/row"])
+        script = "\n".join(argv[2:-3:2])
+        self.assertIn('buttons {"Later", "Open Pending questions"} default button "Open Pending questions"', script)
+        self.assertIn("if (count of argv) > 2 then", script)
+        self.assertIn('buttons {"OK"}', script)
+        self.assertNotIn("giving up", script)
+        self.assertEqual(out["macos"], True)
+
+    def test_the_app_deep_link_is_derived_from_the_row_link(self):
+        cases = {
+            "https://chat.ag2.space/#/room/!r1:ag2.space?surface=db&page=pendingq":
+                "ag2space://home/%21r1%3Aag2.space/?surface=db&page=pendingq",
+            "https://chat.ag2.space/home/%21r1%3Aag2.space?surface=db&page=pendingq":
+                "ag2space://home/%21r1%3Aag2.space/?surface=db&page=pendingq",
+            "https://chat.ag2.space/#/home/!r1:ag2.space/$ev1/": "ag2space://home/%21r1%3Aag2.space/%24ev1/",
+            "https://chat.ag2.space/#/room/!r1:ag2.space?page=pendingq":
+                "ag2space://home/%21r1%3Aag2.space/?page=pendingq",
+            "https://chat.ag2.space/#/room/!r1:ag2.space": "ag2space://home/%21r1%3Aag2.space/",
+        }
+        for link, deep in cases.items():
+            self.assertEqual(pqa.app_deep_link(link), deep, link)
+        for bad in (None, "", "not a link", "https://chat.ag2.space/#/settings", "ftp://x/#/room/!r:a",
+                    "https://chat.ag2.space/#/room/", "https://example.test/row"):
+            self.assertIsNone(pqa.app_deep_link(bad), bad)
+
+    def test_open_prefers_the_app_only_when_it_handles_the_deep_link(self):
+        link = "https://chat.ag2.space/#/room/!r1:ag2.space?surface=db&page=pendingq"
+        argv = pqa.dialog_argv("q?", link)
+        self.assertEqual(argv[-4:], ["sutando", "q?", link,
+                                     "ag2space://home/%21r1%3Aag2.space/?surface=db&page=pendingq"])
+        script = "\n".join(argv[2:-4:2])
+        self.assertNotIn("ag2space", script, "links are argv, never script text")
+        self.assertIn("set target to item 3 of argv", script)
+        self.assertIn("URLForApplicationToOpenURL:deepURL", script)
+        self.assertIn("if appURL is not missing value then set target to item 4 of argv", script)
+        self.assertIn("open location target", script)
+
+    def test_question_text_is_argv_never_script(self):
+        evil = '-e" & (do shell script "touch /tmp/x") & "'
+        argv = pqa.dialog_argv(evil, None)
+        self.assertEqual(argv[-2:], ["sutando", evil])
+        self.assertNotIn("touch", " ".join(argv[:-1]))
+        long = pqa.dialog_argv("x" * 5000)[-1]
+        self.assertEqual((len(long), long[-1]), (pqa.DIALOG_QUESTION_MAX, "…"))
+
+    def test_the_core_ask_applies_the_same_rule(self):
+        with mock.patch.object(pqa, "show_dialog", return_value=(True, None)) as dialog:
+            out = pqa.ask_owner("q?", workspace=self.ws, host=HOST)
+            self.assertEqual(out["macos"], "skipped")
+            dialog.assert_not_called()
+            self._break_send()
+            out = pqa.ask_owner("q?", workspace=self.ws, host=HOST)
+        self.assertTrue(out["macos"])
+        dialog.assert_called_once_with("q?", None)
+
+    def test_durable_never_notifies(self):
+        self._break_send()
+        with mock.patch("subprocess.Popen") as popen:
+            r = self._run("q?", "--urgency", "durable")
         self.assertNotIn("macos:", r.stdout)
-        self.assertFalse(self.calls.exists())
+        popen.assert_not_called()
 
     def test_an_outbox_save_that_raises_is_reported_and_the_question_still_goes_out(self):
         with mock.patch.object(pqo.Outbox, "save", side_effect=OSError("disk full")):
@@ -519,12 +595,11 @@ class TestEdges(_Workspace):
                 ob.save(pqs.Question("ask-x", "q?"), "**Sent:** x")
         self.assertEqual(list(ob.dir.iterdir()), [])
 
-    def test_osascript_timeout_names_the_fix(self):
-        with mock.patch.object(pqa.subprocess, "run",
-                               side_effect=subprocess.TimeoutExpired("osascript", 15)):
-            ok, fix = pqa.notify_macos("q")
+    def test_a_dialog_that_cannot_start_names_the_fix(self):
+        with mock.patch("subprocess.Popen", side_effect=OSError("no exec")):
+            ok, fix = pqa.show_dialog("q")
         self.assertFalse(ok)
-        self.assertIn("did not return within 15s", fix)
+        self.assertIn("osascript could not start (OSError", fix)
 
     def test_a_non_proactive_name_is_never_drained(self):
         self.assertFalse(pqa.drained(self.ws / "results", "task-1.txt"))

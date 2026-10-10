@@ -78,7 +78,7 @@ def main(argv=None) -> int:
     ap.add_argument("question")
     ap.add_argument("--context", default=None, help="one or two lines of why / options")
     ap.add_argument("--urgency", choices=("live", "durable"), default="live",
-                    help="live also fires the macOS notification; durable sends and records only")
+                    help="live also opens a macOS dialog when the DM could not be queued; durable never does")
     ap.add_argument("--task-file", default=None,
                     help="the task being worked: its source/channel is where the question goes")
     ap.add_argument("--default", "--default-action", dest="default", default=None,
