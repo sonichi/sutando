@@ -289,7 +289,7 @@
   },
   {
    "name": "read_note",
-   "description": "Read a specific note by name or slug. Speak the content to the user.",
+   "description": "Read a note by name or slug; the newest matching note is returned. Speak the content to the user. If the user may mean one of otherMatches instead (e.g. an earlier meeting), ask which.",
    "execution": "inline",
    "params": {
     "name": "Note name or slug to search for"
@@ -297,7 +297,7 @@
   },
   {
    "name": "read_note",
-   "description": "Read a specific note by name or slug. Speak the content to the user.",
+   "description": "Read a note by name or slug; the newest matching note is returned. Speak the content to the user. If the user may mean one of otherMatches instead (e.g. an earlier meeting), ask which.",
    "execution": "inline",
    "params": {
     "name": "Note name or slug to search for"
@@ -554,7 +554,7 @@
    }
   }
  ],
- "instructions_hash_fixed_env": "dacd5abe1dc9c67f075ce5e5e055dabb702f8caed899114547e8a1e4d91efaa0",
+ "instructions_hash_fixed_env": "19d31cc439af91925afe5856c84cfdbbe272b3e889d70ba3d99959b3e9e250d5",
  "meeting_greeting": "[System: MEETING MODE — the meeting is being transcribed into notes and you are not hearing it. Do NOT speak or produce any audio.]\n\n[MODE-MARKER-MEETING]",
  "regions": {
   "tool_table": "4a0c897afbd682d9eace22ed3fe9a28db14d655125b3895f8779aa12c8df9daf"

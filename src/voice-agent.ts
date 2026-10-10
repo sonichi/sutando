@@ -1095,7 +1095,7 @@ async function main() {
 	sessionRef = session;
 	meetingDictation = attachMeetingDictation({
 		session: session as any,
-		notePathFor: (today) => sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR),
+		notePathFor: (stamp) => sharedPersonalPath(`notes/meeting-${stamp}.md`, WORKSPACE_DIR),
 		onExitByVoice: () => {
 			noteMeetingState(false);
 			writeVoiceModeSentinel();
