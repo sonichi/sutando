@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DictationTranscriptEvent } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase } from '../src/meeting-dictation.js';
+import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE } from '../src/meeting-dictation.js';
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
@@ -15,6 +15,13 @@ describe('meeting dictation', () => {
 			assert.ok(isMeetingExitPhrase(t), t);
 		for (const t of ['we should end the quarter strong', 'the meeting starts at noon', 'come back to this later'])
 			assert.ok(!isMeetingExitPhrase(t), t);
+	});
+
+	it('the entry confirmation tells the user an exit phrase that really exits', () => {
+		assert.match(MEETING_ENTRY_SAY, /meeting mode/i);
+		assert.ok(MEETING_ENTRY_SAY.includes(`"${MEETING_EXIT_PHRASE}"`));
+		assert.ok(isMeetingExitPhrase(MEETING_EXIT_PHRASE));
+		assert.ok(isMeetingExitPhrase(`${MEETING_EXIT_PHRASE}.`));
 	});
 
 	it('ignores a command phrase that is only mentioned in meeting speech', () => {

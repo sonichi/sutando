@@ -16,6 +16,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef, narrationSpeakingRef, lastSpokenRef, nextDescRef, scrollPausedRef } from './recording-state.js';
 import { isMacOS, isWindows, macOSOnlyError, resizeImage } from './platform.js';
 import { readCaptureToken } from './util_paths.js';
+import { meetingHoldsModel } from './meeting-input-hold.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -133,6 +134,10 @@ function findFfmpegWithSubtitles(): string | null {
 
 /** Send text to Gemini via sendRealtimeInput when available, otherwise sendContent. */
 function injectText(session: any, text: string) {
+	if (meetingHoldsModel(session)) {
+		console.log(`${ts()} [InjectText] not sent: meeting mode (transcription)`);
+		return;
+	}
 	try {
 		const transport = session?.transport;
 		if (typeof transport?.session?.sendRealtimeInput === 'function') {

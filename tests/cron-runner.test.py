@@ -547,48 +547,294 @@ def test_drop_line_is_timestamped():
               "stamping preserves the searchable message")
 
 
+def _wait_for(pred, timeout=20.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.1)
+    return pred()
+
+
+def _point_runner_at(root: Path) -> None:
+    cr.TASKS_DIR = root / "tasks"
+    cr.CRONS_FILE = root / "crons.json"
+    cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+    cr.REPO_ROOT = root
+    cr.CORE_ALIVE_FILE = root / "state" / "cores" / "absent.alive"
+
+
 def test_run_executes_shell_command_without_core_or_task_file():
+    """A shell job runs with no core heartbeat, emits no task, and its output
+    and non-zero exit land in its own log."""
     import contextlib
     import io
     import json
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         original_repo_root = cr.REPO_ROOT
-        cr.TASKS_DIR = root / "tasks"
-        cr.CRONS_FILE = root / "crons.json"
+        _point_runner_at(root)
+        try:
+            fire = _epoch(2026, 7, 2, 6, 2)
+            cr.CRONS_FILE.write_text(json.dumps([
+                {
+                    "name": "mechanical",
+                    "cron": "2 6 * * *",
+                    "shell_command": (
+                        "python3 -c \"from pathlib import Path; import sys; "
+                        "Path('shell-marker').write_text('ok'); print('stdout-ok'); "
+                        "print('stderr-ok', file=sys.stderr); sys.exit(3)\""
+                    ),
+                    "prompt": "must not become an agent turn",
+                    "launchd": True,
+                },
+            ]))
+            cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cr.STATE_FILE.write_text(json.dumps({"mechanical": fire - 60}))
+            with contextlib.redirect_stdout(io.StringIO()):
+                emitted = cr.run(now_epoch=fire)
+
+            check(emitted == ["mechanical"], "shell command is recorded as launched")
+            log_path = cr._shell_log_path("mechanical")
+            check(_wait_for(lambda: log_path.exists() and "exit_code=" in log_path.read_text()),
+                  "shell job writes its own per-job log")
+            check((root / "shell-marker").read_text() == "ok", "shell command runs from repo root")
+            check(not cr.TASKS_DIR.exists(), "shell command does not emit an agent task")
+            log = log_path.read_text()
+            check("exit_code=3" in log and "stdout-ok" in log and "stderr-ok" in log,
+                  "non-zero exit, stdout and stderr are persisted in the job log")
+        finally:
+            cr.REPO_ROOT = original_repo_root
+
+
+def test_run_does_not_wait_for_a_long_shell_job():
+    """A long mechanical job must not hold the tick (and its state lock), or
+    every other launchd cron waits behind it."""
+    import contextlib
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        _point_runner_at(root)
+        try:
+            fire = _epoch(2026, 7, 2, 6, 2)
+            _mark_core_alive(root, fire)
+            cr.CRONS_FILE.write_text(json.dumps([
+                {"name": "slow", "cron": "2 6 * * *", "launchd": True,
+                 "shell_command": "sleep 4; echo done > slow-marker"},
+                {"name": "digest", "cron": "2 6 * * *", "launchd": True, "prompt": "x"},
+            ]))
+            cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cr.STATE_FILE.write_text(json.dumps({"slow": fire - 60, "digest": fire - 60}))
+            started = time.monotonic()
+            with contextlib.redirect_stdout(io.StringIO()):
+                emitted = cr.run(now_epoch=fire)
+            elapsed = time.monotonic() - started
+            check(elapsed < 2.0, f"tick returns while the shell job still runs ({elapsed:.2f}s)")
+            check(sorted(emitted) == ["digest", "slow"], "both entries fire in the same tick")
+            check(not (root / "slow-marker").exists(), "shell job was still running at tick end")
+            check(len(list(cr.TASKS_DIR.glob("task-cron-digest-*.txt"))) == 1,
+                  "the prompt entry is emitted without waiting for the shell job")
+            check(not list(cr.TASKS_DIR.glob("task-cron-slow-*.txt")),
+                  "the shell job never becomes a task for the core")
+            slow_log = cr._shell_log_path("slow")
+            check(_wait_for(lambda: slow_log.exists() and "exit_code=0" in slow_log.read_text()),
+                  "the detached shell job completes on its own")
+        finally:
+            cr.REPO_ROOT = original_repo_root
+
+
+def test_overlapping_fire_is_skipped():
+    """A fire that lands while the previous run still holds the job lock is
+    skipped and logged, never stacked."""
+    import contextlib
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        _point_runner_at(root)
+        try:
+            first = _epoch(2026, 7, 2, 6, 2)
+            cr.CRONS_FILE.write_text(json.dumps([
+                {"name": "every-minute", "cron": "* * * * *", "launchd": True,
+                 "shell_command": "echo run >> runs.txt; sleep 4"},
+            ]))
+            cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cr.STATE_FILE.write_text(json.dumps({"every-minute": first - 60}))
+            runs = root / "runs.txt"
+            with contextlib.redirect_stdout(io.StringIO()):
+                cr.run(now_epoch=first)
+                check(_wait_for(runs.exists, 10), "first fire starts")
+                cr.run(now_epoch=first + 60)
+            log_path = cr._shell_log_path("every-minute")
+            check(_wait_for(lambda: log_path.exists() and "skipped" in log_path.read_text(), 10),
+                  "overlapping fire is logged as skipped")
+            check(_wait_for(lambda: "exit_code=0" in log_path.read_text()),
+                  "first run still completes")
+            check(runs.read_text().count("run") == 1, "the overlapping fire did not run the command")
+        finally:
+            cr.REPO_ROOT = original_repo_root
+
+
+def test_names_sharing_a_slug_get_separate_locks_and_logs():
+    """Distinct configured names must never share a lock or log, even when the
+    slug collapses them (punctuation, or a non-Latin name)."""
+    import contextlib
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        _point_runner_at(root)
+        try:
+            fire = _epoch(2026, 7, 2, 6, 2)
+            names = ["inbox triage", "inbox-triage", "\u6536\u4ef6\u7bb1", "\u6574\u7406"]
+            cr.CRONS_FILE.write_text(json.dumps([
+                {"name": n, "cron": "2 6 * * *", "launchd": True,
+                 "shell_command": f"sleep 2; echo ran >> done-{i}.txt"}
+                for i, n in enumerate(names)
+            ]))
+            cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cr.STATE_FILE.write_text(json.dumps({n: fire - 60 for n in names}))
+            check(len({cr._shell_lock_path(n) for n in names}) == len(names),
+                  "each distinct name has its own lock path")
+            check(len({cr._shell_log_path(n) for n in names}) == len(names),
+                  "each distinct name has its own log path")
+            with contextlib.redirect_stdout(io.StringIO()):
+                emitted = cr.run(now_epoch=fire)
+            check(sorted(emitted) == sorted(names), "all four entries fire")
+            logs = sorted({cr._shell_log_path(n) for n in names})
+            check(_wait_for(lambda: all(p.exists() and "exit_code=0" in p.read_text()
+                                        for p in logs), 15),
+                  "every job finishes and logs its exit")
+            check(all((root / f"done-{i}.txt").exists() for i in range(len(names))),
+                  "every job's command ran")
+            check(not any("skipped" in p.read_text() for p in logs if p.exists()),
+                  "no job was skipped by another job's lock")
+        finally:
+            cr.REPO_ROOT = original_repo_root
+
+
+def test_held_job_lock_skips_the_fire_in_process():
+    """The lock-held branch of _run_shell_job: returns None, logs the skip,
+    and never runs the command."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original = (cr.STATE_FILE, cr.REPO_ROOT)
         cr.STATE_FILE = root / "state" / "cron-runner-state.json"
         cr.REPO_ROOT = root
-        fire = _epoch(2026, 7, 2, 6, 2)
-        cr.CRONS_FILE.write_text(json.dumps([
-            {
-                "name": "mechanical",
-                "cron": "2 6 * * *",
-                "shell_command": (
-                    "python3 -c \"from pathlib import Path; import sys; "
-                    "Path('shell-marker').write_text('ok'); print('stdout-ok'); "
-                    "print('stderr-ok', file=sys.stderr); sys.exit(3)\""
-                ),
-                "prompt": "must not become an agent turn",
-                "launchd": True,
-            },
-        ]))
-        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        cr.STATE_FILE.write_text(json.dumps({"mechanical": fire - 60}))
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            emitted = cr.run(now_epoch=fire)
+        try:
+            lock = cr._shell_lock_path("busy")
+            check(cr._shell_job_key("busy") in lock.name, "lock path is keyed by _shell_job_key")
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            holder = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o644)
+            # flock is per open file description, so a second open in this
+            # process contends with the held one exactly as another process would.
+            cr.lock_fd(holder)
+            try:
+                rc = cr._run_shell_job("busy", "echo ran > ran.txt", 5)
+            finally:
+                cr.unlock_fd(holder)
+                os.close(holder)
+            check(rc is None, f"held lock returns None (got {rc!r})")
+            check(not (root / "ran.txt").exists(), "the command never ran")
+            check("skipped: previous run still in progress"
+                  in cr._shell_log_path("busy").read_text(), "the skip is logged")
+        finally:
+            cr.STATE_FILE, cr.REPO_ROOT = original
 
-        check(emitted == ["mechanical"], "shell command is recorded as executed")
-        check((root / "shell-marker").read_text() == "ok", "shell command runs from repo root")
-        check(not cr.TASKS_DIR.exists(), "shell command does not emit an agent task")
-        check("stdout-ok" in stdout.getvalue(), "shell stdout is observable")
-        check("stderr-ok" in stderr.getvalue() and "exit code 3" in stderr.getvalue(),
-              "shell stderr and non-zero exit are loud")
-        log = (root / "logs" / "cron-runner.log").read_text()
-        check("exit_code=3" in log and "stdout-ok" in log and "stderr-ok" in log,
-              "shell stdout and stderr are persisted in the runner log")
-        cr.REPO_ROOT = original_repo_root
+
+def test_failed_launch_is_logged_and_not_counted():
+    """run() survives a launch failure, does not count the job, and logs it."""
+    import contextlib
+    import io
+    import json
+    import unittest.mock as _m
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        _point_runner_at(root)
+        try:
+            fire = _epoch(2026, 7, 2, 6, 2)
+            cr.CRONS_FILE.write_text(json.dumps([
+                {"name": "unlaunchable", "cron": "2 6 * * *", "launchd": True,
+                 "shell_command": "true"},
+            ]))
+            cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cr.STATE_FILE.write_text(json.dumps({"unlaunchable": fire - 60}))
+            err = io.StringIO()
+            with _m.patch.object(cr.subprocess, "Popen", side_effect=OSError(24, "too many")), \
+                 contextlib.redirect_stderr(err):
+                emitted = cr.run(now_epoch=fire)
+            check(emitted == [], f"failed launch is not counted (got {emitted})")
+            check("launch failed" in err.getvalue(), "failure is reported on stderr")
+            check("launch failed" in cr._shell_log_path("unlaunchable").read_text(),
+                  "failure is recorded in the job log")
+            check(not cr.TASKS_DIR.exists(), "no task is emitted as a fallback")
+        finally:
+            cr.REPO_ROOT = original_repo_root
+
+
+def test_dash_leading_name_survives_the_child_argv():
+    """A configured name starting with '-' must not be parsed as an option."""
+    import contextlib
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        _point_runner_at(root)
+        try:
+            fire = _epoch(2026, 7, 2, 6, 2)
+            name = "--weird-name"
+            cr.CRONS_FILE.write_text(json.dumps([
+                {"name": name, "cron": "2 6 * * *", "launchd": True,
+                 "shell_command": "echo ran > dash.txt"},
+            ]))
+            cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            cr.STATE_FILE.write_text(json.dumps({name: fire - 60}))
+            with contextlib.redirect_stdout(io.StringIO()):
+                cr.run(now_epoch=fire)
+            log = cr._shell_log_path(name)
+            check(_wait_for(lambda: log.exists() and "exit_code=0" in log.read_text(), 15),
+                  "dash-leading name runs and logs under its own key")
+            check((root / "dash.txt").exists(), "dash-leading name's command ran")
+        finally:
+            cr.REPO_ROOT = original_repo_root
+
+
+def test_shell_job_child_enforces_timeout():
+    """The detached child applies the per-entry timeout and logs the kill."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original = (cr.STATE_FILE, cr.REPO_ROOT)
+        try:
+            started = time.monotonic()
+            rc = cr._shell_job_main([
+                "--name", "hung", "--timeout", "1",
+                "--state-file", str(root / "state" / "cron-runner-state.json"),
+                "--cwd", str(root), "--", "sleep 30",
+            ])
+            elapsed = time.monotonic() - started
+            check(rc == 124, f"timed-out job exits 124 (got {rc})")
+            check(elapsed < 15, f"timeout is enforced ({elapsed:.1f}s)")
+            log = cr._shell_log_path("hung").read_text()
+            check("exit_code=124" in log and "exceeded 1s" in log,
+                  "timeout is recorded in the job log")
+            lock = cr._shell_lock_path("hung")
+            fd = os.open(str(lock), os.O_RDWR)
+            try:
+                cr.lock_fd(fd, blocking=False)
+                cr.unlock_fd(fd)
+                check(True, "job lock is released after the timeout")
+            except OSError:
+                check(False, "job lock is released after the timeout")
+            finally:
+                os.close(fd)
+        finally:
+            cr.STATE_FILE, cr.REPO_ROOT = original
 
 
 def test_run_acquires_shared_state_lock():
@@ -724,7 +970,7 @@ def test_shell_command_output_is_bounded():
     """A chatty command must not grow the log without limit."""
     rc = cr._run_shell_command(
         "chatty", "python3 -c \"print('x' * 200000)\"", timeout_s=60)
-    log = cr._shell_log_path().read_text()
+    log = cr._shell_log_path("chatty").read_text()
     check(rc == 0, "chatty command still succeeds")
     check("[truncated" in log, "output is truncated with a notice")
     check(len(log) < cr.SHELL_OUTPUT_LIMIT * 3, "log stays near the cap")
@@ -799,7 +1045,7 @@ def test_unspawnable_command_is_reported_not_raised():
     with _m.patch.object(cr.subprocess, "Popen", side_effect=OSError(2, "nope")):
         rc = cr._run_shell_command("bad", "irrelevant", timeout_s=5)    # 341-344
     check(rc == 127, f"unspawnable command returns 127 (got {rc})")
-    log = cr._shell_log_path().read_text()
+    log = cr._shell_log_path("bad").read_text()
     # Not the class name: OSError(2, ...) promotes to FileNotFoundError, so assert
     # on the message that actually has to reach an operator.
     check("nope" in log, "the spawn failure detail is persisted in the log")

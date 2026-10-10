@@ -24,6 +24,11 @@ const atSentenceStart = (text: string) => isFiller(text) || /[.!?。！？]\s*$/
 /** A request joined to the command ("…come back and summarize"). */
 const JOINED_REQUEST = /^[\s,，]*(?:and|then)\b(?:[\s,，]+then\b)?[\s,，]*/i;
 
+/** The phrase the user is told to say to end a meeting; findExitCommand must accept it. */
+export const MEETING_EXIT_PHRASE = 'Sutando, come back';
+/** Spoken when meeting mode starts: the user cannot ask the quiesced model how to leave, so the exit comes first. */
+export const MEETING_ENTRY_SAY = `Meeting mode on. To bring me back, say "${MEETING_EXIT_PHRASE}". Until then I'll stay silent and take notes.`;
+
 /** Transcript carried back into the voice session; a longer meeting keeps its end. */
 const MAX_CARRIED_CHARS = 30_000;
 

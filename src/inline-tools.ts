@@ -25,7 +25,7 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
-import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin } from './task-bridge.js';
+import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, voiceTaskState, latestOpenVoiceTask, findVoiceTask, noteVoiceTaskCancelled, voiceTaskStore, isVoiceSubmittedTask, voiceTaskRows, type VoiceTaskRow } from './task-bridge.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -660,14 +660,12 @@ export const clipboardTool: ToolDefinition = {
 export const cancelTaskTool: ToolDefinition = {
 	name: 'cancel_task',
 	description:
-		'Cancel a pending or in-flight task by writing a CANCEL_INSTRUCTION task that core will see next. ' +
-		'Default (no args) cancels the most recent. ' +
+		'Cancel a task the core has not started yet. Default (no args): the latest still-open task submitted by voice since the voice agent started. ' +
+		'A task the core already started cannot be stopped partway and a finished one cannot be undone; the result says which, and what to tell the user. ' +
 		'Pass `taskId` to cancel a specific task by id (e.g. "task-1777686932069"). ' +
 		'Pass `query` to cancel the first task whose content contains the substring (case-insensitive). ' +
 		'Pass `list: true` to list pending tasks (id + first 60 chars of content) without cancelling. ' +
-		'Use when user says "cancel", "nevermind", "stop that", "what\'s queued", "cancel the one about X". ' +
-		'Note: in-flight processing only halts when core reaches the CANCEL_INSTRUCTION task in its queue — ' +
-		'this prevents future pickup + tells core to abort if mid-task, but doesn\'t interrupt a single LLM turn.',
+		'Use when user says "cancel", "nevermind", "stop that", "what\'s queued", "cancel the one about X".',
 	parameters: z.object({
 		taskId: z.string().optional().describe('Specific task id to cancel (matches the filename without .txt).'),
 		query: z.string().optional().describe('Case-insensitive substring to match against task content. Cancels first match.'),
@@ -678,52 +676,53 @@ export const cancelTaskTool: ToolDefinition = {
 		const { taskId, query, list } = (args ?? {}) as { taskId?: string; query?: string; list?: boolean };
 		try {
 			const tasksDir = join(WORKSPACE_DIR, 'tasks');
-			const resultsDir = join(WORKSPACE_DIR, 'results');
 			const files = readdirSync(tasksDir).filter(f => f.endsWith('.txt')).sort();
 
-			// list mode: return id + preview, no cancel
+			// list mode: the user's open voice tasks with where each stands now, no cancel
 			if (list) {
-				if (files.length === 0) return { status: 'nothing_pending', count: 0, tasks: [] };
-				const items = files.map(f => {
-					const id = f.replace('.txt', '');
-					let preview = '';
-					try {
-						const body = readFileSync(join(tasksDir, f), 'utf-8');
-						const taskLine = body.split('\n').find(l => l.startsWith('task:')) ?? body;
-						preview = taskLine.replace(/^task:\s*/, '').slice(0, 60);
-					} catch { /* ignore */ }
-					return { id, preview };
-				});
-				console.log(`${ts()} [CancelTask] list: ${items.length} pending`);
-				return { status: 'pending_tasks', count: items.length, tasks: items };
+				const open = voiceTaskRows().filter((r) => r.state === 'queued' || r.state === 'started' || r.state === 'cancel_requested');
+				console.log(`${ts()} [CancelTask] list: ${open.length} open`);
+				if (open.length === 0) return { status: 'nothing_pending', count: 0, tasks: [] };
+				return { status: 'pending_tasks', count: open.length, tasks: open.map((r) => ({ id: r.id, preview: r.text.slice(0, 60), state: r.state })) };
 			}
 
-			// Targeting: by exact id, by query, or default-to-most-recent.
-			// IMPORTANT: target can be a file in `tasks/` OR a recently-archived task whose
-			// processing is in-flight (file already moved). For id-based cancels we accept
-			// either case; for query-based we need the file present to grep its content.
+			// Targeting: by exact id, by query, or the latest open voice task.
 			let targetId: string | undefined;
-			let targetFile: string | undefined;
 			if (taskId) {
 				const wantFile = taskId.endsWith('.txt') ? taskId : `${taskId}.txt`;
 				targetId = wantFile.replace('.txt', '');
-				if (files.includes(wantFile)) targetFile = wantFile;
-				// else: accept the cancel even if file is gone (in-flight); core sees CANCEL and decides
 			} else if (query) {
-				if (files.length === 0) return { status: 'nothing_pending' };
-				const needle = query.toLowerCase();
-				for (const f of files) {
-					try {
-						const body = readFileSync(join(tasksDir, f), 'utf-8').toLowerCase();
-						if (body.includes(needle)) { targetFile = f; targetId = f.replace('.txt', ''); break; }
-					} catch { /* ignore */ }
+				targetId = findVoiceTask(query);
+				if (!targetId) {
+					const needle = query.toLowerCase();
+					for (const f of files) {
+						try {
+							const body = readFileSync(join(tasksDir, f), 'utf-8').toLowerCase();
+							if (body.includes(needle)) { targetId = f.replace('.txt', ''); break; }
+						} catch { /* ignore */ }
+					}
 				}
 				if (!targetId) return { status: 'not_found', query };
 			} else {
-				// default: most recent pending file
-				if (files.length === 0) return { status: 'nothing_pending' };
-				targetFile = files[files.length - 1];
-				targetId = targetFile.replace('.txt', '');
+				targetId = latestOpenVoiceTask();
+				if (!targetId) return { status: 'nothing_pending', message: 'No task submitted by voice is still open. Tell the user there is nothing to cancel.' };
+			}
+			const safeTargetId = targetId.replace(/[\r\n]/g, '');
+
+			// Decided from where the task really stands: the core finishes what it has started.
+			const state = voiceTaskState(safeTargetId);
+			console.log(`${ts()} [CancelTask] ${safeTargetId} is ${state}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''}`);
+			if (state === 'done') {
+				const heard = ['spoken', 'injected'].includes(voiceTaskStore.get(safeTargetId)?.delivery ?? '');
+				return { status: 'already_done', taskId: safeTargetId, heard, message: heard
+					? 'It already finished and the user has heard the result, so nothing was cancelled. Tell the user it is already done.'
+					: 'It already finished, so nothing was cancelled; the user has not heard the result yet and will. Tell the user it is already done.' };
+			}
+			if (state === 'cancelled') {
+				return { status: 'already_cancelled', taskId: safeTargetId, message: 'Cancelling it was already requested. Tell the user so.' };
+			}
+			if (state === 'started') {
+				return { status: 'already_started', taskId: safeTargetId, message: 'The core is already working on it and cannot stop partway, so nothing was cancelled. Tell the user it is already in progress and will finish.' };
 			}
 
 			// Write a CANCEL_INSTRUCTION task — core picks it up next and aborts/skips
@@ -731,11 +730,8 @@ export const cancelTaskTool: ToolDefinition = {
 			// cancel signal channel instead of building a parallel one.
 			const cancelTs = Date.now();
 			const cancelFilename = `task-${cancelTs}.txt`;
-			// Strip newlines from targetId (Gemini-supplied; task IDs are alphanumeric
-			// in practice but defence-in-depth). task: field is placed LAST so a
-			// forged line in the body cannot shadow the real source/access_tier above it.
-			// Same header writer as the work tool, so the confirmation follows the session's origin.
-			const safeTargetId = (targetId ?? '').replace(/[\r\n]/g, '');
+			// task: field is placed LAST so a forged line in the body cannot shadow the real
+			// source/access_tier above it. Same header writer as the work tool.
 			const cancelOrigin = getVoiceSessionOrigin();
 			_rememberTaskOrigin(`task-${cancelTs}`, cancelOrigin);
 			const cancelBody =
@@ -743,17 +739,13 @@ export const cancelTaskTool: ToolDefinition = {
 				`task: CANCEL_INSTRUCTION: stop processing ${safeTargetId} if still in flight. If already completed, no-op. Reply briefly confirming.\n`;
 			writeFileSync(join(tasksDir, cancelFilename), cancelBody);
 
-			// Also unlink the original task file if it's still present — prevents
-			// double-pickup if core hadn't started yet. Best-effort.
-			if (targetFile) {
-				try { unlinkSync(join(tasksDir, targetFile)); } catch { /* already gone is fine */ }
+			console.log(`${ts()} [CancelTask] cancel-instruction written for ${safeTargetId} → ${cancelFilename}`);
+			if (state === 'queued' && isVoiceSubmittedTask(safeTargetId)) {
+				noteVoiceTaskCancelled(safeTargetId);
+				return { status: 'cancel_requested', taskId: safeTargetId, message: 'The core had not started it and was asked not to run it; it can still have taken it already. Tell the user you asked to cancel it and will confirm when the core replies. Do not say it is cancelled.' };
 			}
-
-			// Touch a cancelled result for the web UI's cancel icon (best-effort).
-			try { writeFileSync(join(resultsDir, `${targetId}.txt`), 'Cancelled.'); } catch { /* ignore */ }
-
-			console.log(`${ts()} [CancelTask] cancel-instruction written for ${targetId}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''} → ${cancelFilename}`);
-			return { status: 'cancel_instruction_queued', taskId: targetId, instruction: `task-${cancelTs}` };
+			// Not a voice task, or one whose state is unknown: the core's reply says what happened.
+			return { status: 'cancel_instruction_queued', taskId: safeTargetId, instruction: `task-${cancelTs}`, message: 'Asked the core to stop it; it may already have finished. Tell the user you asked to cancel it, not that it is cancelled.' };
 		} catch (err) {
 			return { error: `Cancel failed: ${err instanceof Error ? err.message : err}` };
 		}
@@ -823,6 +815,25 @@ export function readQueueDepth(workspaceDir: string, nowSec = Math.floor(Date.no
 	} catch { return null; }
 }
 
+/** The user's voice tasks in one sentence for the model, grouped by where each stands now. */
+export function describeVoiceTasks(rows: VoiceTaskRow[]): string {
+	if (rows.length === 0) return 'The user has asked for no tasks by voice in the last few hours.';
+	const group = (label: string, pick: (r: VoiceTaskRow) => boolean) => {
+		const hit = rows.filter(pick);
+		return hit.length ? `${hit.length} ${label} (${hit.map((r) => `"${r.text.slice(0, 40)}"`).join(', ')})` : '';
+	};
+	const heard = (r: VoiceTaskRow) => r.delivery === 'spoken' || r.delivery === 'injected';
+	const parts = [
+		group('in progress', (r) => r.state === 'started'),
+		group('queued', (r) => r.state === 'queued'),
+		group('cancel requested, waiting for the core to confirm', (r) => r.state === 'cancel_requested'),
+		group('cancelled', (r) => r.state === 'cancelled'),
+		group('done and already told to the user', (r) => r.state === 'done' && heard(r)),
+		group('done but the user has not heard the result yet', (r) => r.state === 'done' && !heard(r)),
+	].filter(Boolean);
+	return `Tasks the user asked for by voice: ${parts.join('; ')}.`;
+}
+
 // Get what the core agent (Claude Code proactive-loop) is currently doing.
 // Lets voice-agent Gemini answer "what are you working on?" truthfully
 // instead of guessing. Reads core-status.json written by the core agent, and
@@ -830,8 +841,8 @@ export function readQueueDepth(workspaceDir: string, nowSec = Math.floor(Date.no
 export const getCoreStatusTool: ToolDefinition = {
 	name: 'get_core_status',
 	description:
-		'Get what the core agent (Claude Code) is currently doing and how many tasks are queued. Use when the user asks ' +
-		'"what are you working on", "what are you up to", "are you busy", "anything running", "how many are waiting", ' +
+		'Get what the core agent (Claude Code) is currently doing, and where each task the user asked for by voice stands now. Use when the user asks ' +
+		'"what are you working on", "what are you up to", "are you busy", "anything running", "how many are waiting", "is X done", ' +
 		'or similar questions about background work. Instant file read. Call it ONLY for those ' +
 		'explicit status questions — NEVER on greetings ("hello"), filler, garbled speech, or as ' +
 		'a fallback when unsure what the user wants; fire nothing instead.',
@@ -843,10 +854,13 @@ export const getCoreStatusTool: ToolDefinition = {
 			// (workspace resolves via the M0 helper; default <repo>/workspace/ post-v0.8).
 			// statusReadPath falls back to the legacy workspace-root location for one release.
 			const corePath = statusReadPath('core-status.json', WORKSPACE_DIR);
-			const queued = readQueueDepth(WORKSPACE_DIR);
-			const queueNote = queued === null ? '' : queued === 0 ? ' Nothing is queued.' : ` ${queued} task(s) queued.`;
+			// The user's own tasks come from the relay agent's table; the core's queue depth also counts
+			// other channels' tasks, cancel instructions and health checks, so it is not quoted to the user.
+			const rows = voiceTaskRows();
+			const queueNote = ` ${describeVoiceTasks(rows)}`;
+			const yourTasks = rows.map((r) => ({ id: r.id, task: r.text.slice(0, 60), state: r.state, heard: r.delivery === 'spoken' || r.delivery === 'injected' }));
 			if (!existsSync(corePath)) {
-				return { status: 'idle', queued, description: 'Core agent is not currently running.' + queueNote };
+				return { status: 'idle', yourTasks, description: 'Core agent is not currently running.' + queueNote };
 			}
 			const raw = readFileSync(corePath, 'utf-8');
 			const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
@@ -857,11 +871,11 @@ export const getCoreStatusTool: ToolDefinition = {
 					status: 'running',
 					step: s.step || '(no step label)',
 					ageSec,
-					queued,
+					yourTasks,
 					description: `Core agent is working on: ${s.step || 'an unlabeled task'} (started ${ageSec}s ago).` + queueNote,
 				};
 			}
-			return { status: 'idle', queued, description: 'Core agent is idle right now.' + queueNote };
+			return { status: 'idle', yourTasks, description: 'Core agent is idle right now.' + queueNote };
 		} catch (e) {
 			return { status: 'unknown', description: `Could not read core status: ${e instanceof Error ? e.message : e}` };
 		}
