@@ -161,7 +161,11 @@ def cron_matches(expression: str, local_dt: datetime) -> bool:
 
 
 def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dict[str, Any]]:
-    raw = json.loads(config_path.read_text())
+    try:
+        text = config_path.read_text()
+    except FileNotFoundError:
+        return []  # A fresh install has no crons.json yet: nothing is configured.
+    raw = json.loads(text)
     if not isinstance(raw, list):
         raise ValueError("crons.json must contain a JSON array")
     jobs: list[dict[str, Any]] = []
@@ -487,7 +491,7 @@ def install(
     *,
     write_only: bool = False,
     include_main_loop: bool | None = None,
-) -> Path:
+) -> Path | None:
     config_path = workspace / "hosts" / host_label / "crons.json"
     jobs = load_jobs(
         config_path,
@@ -496,7 +500,8 @@ def install(
         ),
     )
     if not jobs:
-        raise ValueError("no crons.json entries opt in with execution=codex-task")
+        # The launcher reconciles on every start; an empty schedule is valid, not a failure.
+        return None
     logs = workspace / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     plist_path = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
@@ -578,7 +583,8 @@ def main() -> int:
             print(json.dumps(report, indent=2, sort_keys=True))
             return code
         else:
-            print(install(workspace, host_label, repo, write_only=args.write_only))
+            path = install(workspace, host_label, repo, write_only=args.write_only)
+            print(path or "codex-scheduler: no crons.json entries opt in with execution=codex-task; nothing to install")
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"codex-scheduler: {exc}", file=sys.stderr)
         return 1

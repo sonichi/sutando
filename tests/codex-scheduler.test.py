@@ -325,11 +325,36 @@ def test_minute_slots_health_and_install_edges():
         assert [call.args[0][1] for call in run.call_args_list] == ["bootout", "enable", "bootstrap"]
 
         (ws / "hosts" / "test-host" / "crons.json").write_text("[]")
+        with mock.patch.object(Path, "home", return_value=Path(td) / "home2"):
+            assert scheduler.install(ws, "test-host", REPO, write_only=True) is None
+        assert not (Path(td) / "home2").exists(), "an empty schedule must write no plist"
+
+
+def test_missing_crons_json_means_no_jobs():
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td) / "workspace"
+        missing = ws / "hosts" / "test-host" / "crons.json"
+        for include_main_loop in (False, True):
+            assert scheduler.load_jobs(missing, include_main_loop=include_main_loop) == []
+        result = scheduler.tick(ws, "test-host", at(6, 0), include_main_loop=True)
+        assert result["events"] == []
+        home = Path(td) / "home"
+        with mock.patch.object(Path, "home", return_value=home), \
+             mock.patch.object(scheduler.subprocess, "run") as run:
+            assert scheduler.install(ws, "test-host", REPO, include_main_loop=True) is None
+        assert run.call_count == 0 and not home.exists()
+        with mock.patch.object(sys, "argv", [
+            "codex-scheduler.py", "install", "--workspace", str(ws), "--host-label", "test-host",
+        ]), mock.patch.object(Path, "home", return_value=home):
+            assert scheduler.main() == 0
+
+        missing.parent.mkdir(parents=True)
+        missing.write_text("{not json")
         try:
-            scheduler.install(ws, "test-host", REPO, write_only=True)
-            raise AssertionError("expected install to require an opted-in job")
-        except ValueError as exc:
-            assert "no crons.json entries" in str(exc)
+            scheduler.load_jobs(missing)
+            raise AssertionError("malformed crons.json must still raise")
+        except json.JSONDecodeError:
+            pass
 
 
 def test_main_dispatch_and_error_handling():
@@ -372,6 +397,7 @@ def main():
         test_prompt_cannot_forge_task_headers,
         test_install_plist,
         test_minute_slots_health_and_install_edges,
+        test_missing_crons_json_means_no_jobs,
         test_main_dispatch_and_error_handling,
     ]
     for test in tests:
