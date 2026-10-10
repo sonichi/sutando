@@ -643,7 +643,7 @@ export const pointAtTool: ToolDefinition = {
 						// thinkingBudget:0 is required — gemini-3-flash-preview is a
 						// thinking model and burns the token budget reasoning instead
 						// of answering, truncating the point. Proven in the POC.
-						generationConfig: { temperature: 0, maxOutputTokens: 1200, thinkingConfig: { thinkingBudget: 0 } },
+						generationConfig: { maxOutputTokens: 1200, thinkingConfig: { thinkingBudget: 0 } },
 					}),
 					signal: AbortSignal.timeout(60_000),
 				},
