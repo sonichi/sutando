@@ -1042,7 +1042,7 @@ export const showViewTool: ToolDefinition = {
 
 export const readNoteTool: ToolDefinition = {
 	name: 'read_note',
-	description: 'Read a specific note by name or slug. Speak the content to the user.',
+	description: 'Read a note by name or slug; the newest matching note is returned. Speak the content to the user. If the user may mean one of otherMatches instead (e.g. an earlier meeting), ask which.',
 	parameters: z.object({
 		name: z.string().describe('Note name or slug to search for'),
 	}),
@@ -1050,13 +1050,17 @@ export const readNoteTool: ToolDefinition = {
 	async execute(args) {
 		const { name } = args as { name: string };
 		try {
-			const files = readdirSync(NOTES_DIR).filter(f => f.endsWith('.md'));
 			const query = name.toLowerCase().replace(/\s+/g, '-');
-			const match = files.find(f => f.toLowerCase().includes(query));
-			if (!match) return { error: `No note matching "${name}" found` };
+			const matches = readdirSync(NOTES_DIR)
+				.filter(f => f.endsWith('.md') && f.toLowerCase().includes(query))
+				.map(f => ({ f, mtime: statSync(join(NOTES_DIR, f)).mtimeMs }))
+				.sort((a, b) => b.mtime - a.mtime);
+			if (!matches.length) return { error: `No note matching "${name}" found` };
+			const match = matches[0].f;
 			let content = readFileSync(join(NOTES_DIR, match), 'utf-8');
 			content = content.replace(/^---[\s\S]*?---\n/, ''); // strip frontmatter
-			return { title: match.replace('.md', ''), content: content.slice(0, 2000) };
+			const otherMatches = matches.slice(1, 6).map(m => m.f.replace('.md', ''));
+			return { title: match.replace('.md', ''), content: content.slice(0, 2000), ...(otherMatches.length ? { otherMatches } : {}) };
 		} catch (e) { return { error: String(e) }; }
 	},
 };

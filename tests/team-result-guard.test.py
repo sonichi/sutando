@@ -196,19 +196,34 @@ def behavioral() -> list:
         original_rename = guard.os.rename
         original_fchmod = getattr(guard.os, "fchmod", None)
         try:
-            def raced_link(_temporary, destination):
-                Path(destination).write_text("race winner", encoding="utf-8")
-                raise FileExistsError
+            def raced_link_with(value):
+                def raced_link(_temporary, destination):
+                    Path(destination).write_text(json.dumps({"value": value}), encoding="utf-8")
+                    raise FileExistsError
+                return raced_link
 
-            guard.os.link = raced_link
-            if not guard._write_artifact(directory / "raced.json", {"value": 1}):
-                fails.append("a concurrent artifact winner must count as persisted")
+            (directory / "held.json").write_text(json.dumps({"value": 7}), encoding="utf-8")
+            if guard._write_artifact(directory / "held.json", {"value": 1}, "value"):
+                fails.append("an existing record of another body must not count as written")
+            if not guard._write_artifact(directory / "held.json", {"value": 7}, "value"):
+                fails.append("an existing record of this body counts as written")
+            (directory / "garbled.json").write_text("not json", encoding="utf-8")
+            if guard._write_artifact(directory / "garbled.json", {"value": 1}, "value"):
+                fails.append("an unreadable existing record must not count as written")
+            if guard.withheld_review_id("") == guard.withheld_review_id(""):
+                fails.append("a review with no task id must never share an id")
+            guard.os.link = raced_link_with(1)
+            if not guard._write_artifact(directory / "raced.json", {"value": 1}, "value"):
+                fails.append("a concurrent winner recording the same body must count as persisted")
+            guard.os.link = raced_link_with(9)
+            if guard._write_artifact(directory / "raced-other.json", {"value": 1}, "value"):
+                fails.append("a concurrent winner recording another body must not count as persisted")
 
             def consuming_link(temporary, destination):
                 Path(temporary).replace(destination)
 
             guard.os.link = consuming_link
-            if not guard._write_artifact(directory / "consumed.json", {"value": 2}):
+            if not guard._write_artifact(directory / "consumed.json", {"value": 2}, "value"):
                 fails.append("cleanup must tolerate an already-consumed temporary file")
 
             def consuming_rename(temporary, destination):
@@ -220,7 +235,7 @@ def behavioral() -> list:
             guard.os.rename = consuming_rename
             guard.os.fchmod = lambda *_args: (_ for _ in ()).throw(
                 AssertionError("Windows artifact publication must not require fchmod"))
-            if not guard._write_artifact(directory / "windows.json", {"value": 3}):
+            if not guard._write_artifact(directory / "windows.json", {"value": 3}, "value"):
                 fails.append("Windows artifact publication must use atomic rename")
         finally:
             guard.os.name = original_name
@@ -287,6 +302,137 @@ def behavioral() -> list:
             guard.tempfile.mkstemp = original_mkstemp
         if unsaved.body != guard.TEAM_LEAK_RESULT_UNSAVED:
             fails.append("artifact write exceptions must return the fail-closed verdict")
+
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "state"
+        first = guard.journal_quarantined_attachment("[file: /tmp/b.txt]\nB", state, "task-qa", now=1000)
+        second = guard.journal_quarantined_attachment("[file: /tmp/c.txt]\nC", state, "task-qa", now=1001)
+        kept = sorted(json.loads(p.read_text())["withheld_body"]
+                      for p in (state / guard.SUPPRESSED_RESULT_DIR).glob("qa_*.json"))
+        if not (first and second) or kept != ["[file: /tmp/b.txt]\nB", "[file: /tmp/c.txt]\nC"]:
+            fails.append("each attach-only withheld body of one task needs its own release record")
+
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "state"
+        b_path = guard.withheld_review_artifact(state, "task-arch", "B body")
+        b_path.parent.mkdir(parents=True)
+        (b_path.parent / "archive").mkdir()
+        (b_path.parent / "archive" / b_path.name).write_text(json.dumps({"withheld_body": "B body"}))
+        c_path = guard.withheld_review_artifact(state, "task-arch", "C body")
+        if c_path.name == b_path.name:
+            fails.append("a resolved and archived review id must never be reused for another body")
+        if guard.withheld_review_artifact(state, "task-arch", "B body") != b_path.parent / "archive" / b_path.name:
+            fails.append("an archived body's id is never reissued: a replay points at its decision")
+        leak = guard.classify_result_for_tier("B body", "team", REPO, secret_filter=_leaky)
+        replay = guard.materialize_withheld_verdict(leak, "B body", state, "task-arch", context, now=1000)
+        if "already decided in owner review" not in (replay.reason or "") or b_path.exists():
+            fails.append("a replay of an archived body is suppressed against that decision, no new record")
+
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "state"
+        guard.materialize_withheld_verdict(
+            guard.classify_result_for_tier("A body", "team", REPO, secret_filter=_leaky),
+            "A body", state, "task-unread", context, now=1000)
+        b_digest_id = guard.withheld_review_path(state, "task-unread", guard._body_digest("B body"))
+        (b_digest_id.parent / "archive").mkdir(exist_ok=True)
+        (b_digest_id.parent / "archive" / b_digest_id.name).write_text("not json", encoding="utf-8")
+        guard.materialize_withheld_verdict(
+            guard.classify_result_for_tier("B body", "team", REPO, secret_filter=_leaky),
+            "B body", state, "task-unread", context, now=1001)
+        bodies = {json.loads(p.read_text())["withheld_body"]: p.stem
+                  for p in (state / guard.WITHHELD_RESULT_DIR).glob("wr_*.json")}
+        if "B body" not in bodies or bodies["B body"] == b_digest_id.stem:
+            fails.append("an unreadable archived id is occupied: another body gets a fresh id")
+
+    with tempfile.TemporaryDirectory() as td:
+        state = Path(td) / "state"
+        first = guard.withheld_review_path(state, "task-ledger")
+        if not guard._reserve(first, guard._body_digest("B body")) or guard._reserve(first, "x"):
+            fails.append("an id is reserved exactly once")
+        guard.materialize_withheld_verdict(
+            guard.classify_result_for_tier("B body", "team", REPO, secret_filter=_leaky),
+            "B body", state, "task-ledger", context, now=1000)
+        if first.exists() or not guard.withheld_review_artifact(state, "task-ledger", "B body").exists():
+            fails.append("an id reserved for a body whose record is gone is never written: a fresh id is")
+        for path in guard._candidates(guard.withheld_review_path, state, "task-full", "C body"):
+            guard._reserve(path, "another body")
+        full = guard.materialize_withheld_verdict(
+            guard.classify_result_for_tier("C body", "team", REPO, secret_filter=_leaky),
+            "C body", state, "task-full", context, now=1000)
+        if full.body != guard.TEAM_LEAK_RESULT_UNSAVED:
+            fails.append("with every id taken the result stays withheld, unsaved")
+        if guard.suppressed_record_for(state, "task-none", "D body").exists():
+            fails.append("a body never journalled has no suppression record")
+        stale = guard.withheld_review_path(state, "task-stale")
+        guard._reserve(stale, guard._body_digest("B body"))
+        stale.write_text(json.dumps({"withheld_body": "C body"}), encoding="utf-8")
+        replay = guard.materialize_withheld_verdict(
+            guard.classify_result_for_tier("B body", "team", REPO, secret_filter=_leaky),
+            "B body", state, "task-stale", context, now=1000)
+        if (json.loads(stale.read_text())["withheld_body"] != "C body"
+                or guard.withheld_review_artifact(state, "task-stale", "B body") == stale
+                or "pending private owner review" not in (replay.reason or "")):
+            fails.append("an id's record counts only if it holds the body the id was issued to")
+        live = guard.withheld_review_artifact(state, "task-ledger", "B body")
+        record = json.loads(live.read_text())
+        if not guard.update_record(live, dict(record, status="kept_private")):
+            fails.append("an update of a live record is written")
+        if not guard.archive_record(live) or live.exists() or not (live.parent / "archive" / live.name).exists():
+            fails.append("a resolved record moves into archive/ under the ledger lock")
+        if guard.withheld_review_artifact(state, "task-ledger", "B body") != live.parent / "archive" / live.name:
+            fails.append("an archived record stays its body's decision, never a new id")
+        if guard.archive_record(live):
+            fails.append("archiving a record that is gone reports failure")
+        reviewed = guard.withheld_review_artifact(state, "task-ledger", "B body")
+        if guard.update_record(reviewed, {"withheld_body": "B body", "status": "x"}):
+            fails.append("an archived decision is immutable: no update writes it")
+        twin = guard.withheld_review_path(state, "task-twin")
+        guard._reserve(twin, guard._body_digest("T body"))
+        twin.write_text(json.dumps({"withheld_body": "T body"}), encoding="utf-8")
+        (twin.parent / "archive" / twin.name).write_text(json.dumps({"withheld_body": "T body", "k": 1}),
+                                                         encoding="utf-8")
+        if guard.archive_record(twin) or json.loads((twin.parent / "archive" / twin.name).read_text()).get("k") != 1:
+            fails.append("archive never writes over an existing decision")
+        owns = guard._owns_its_id
+        guard._owns_its_id = lambda *_a: True        # even past the ownership check, the move is no-clobber
+        try:
+            if guard.archive_record(twin) or json.loads(
+                    (twin.parent / "archive" / twin.name).read_text()).get("k") != 1 or not twin.exists():
+                fails.append("the archive move itself never replaces a decision")
+        finally:
+            guard._owns_its_id = owns
+        if guard.update_record(twin, {"withheld_body": "other body"}):
+            fails.append("an update never changes the body a record holds")
+        listing = state / "listing" / guard.WITHHELD_RESULT_DIR
+        acted, frozen = guard.actionable_records(listing)
+        if acted or frozen:
+            fails.append("a directory that does not exist lists nothing")
+        listing.mkdir(parents=True)
+        own = listing / "wr_own.json"
+        guard._reserve(own, guard._body_digest("own body"))
+        own.write_text(json.dumps({"withheld_body": "own body"}), encoding="utf-8")
+        other = listing / "wr_other.json"
+        guard._reserve(other, guard._body_digest("first body"))
+        other.write_text(json.dumps({"withheld_body": "second body"}), encoding="utf-8")
+        acted, frozen = guard.actionable_records(listing)
+        if [p.name for p, _r in acted] != ["wr_own.json"] or len(frozen) != 1 or other.exists():
+            fails.append("a live record conflicting with its id's reservation is frozen, never listed")
+        if json.loads(frozen[0].read_text())["withheld_body"] != "second body":
+            fails.append("a frozen record keeps its body for the owner")
+        (listing / "wr_garbled.json").write_text("not json", encoding="utf-8")
+        acted, frozen = guard.actionable_records(listing)
+        if [p.name for p, _r in acted] != ["wr_own.json"] or len(frozen) != 1:
+            fails.append("an unreadable record never acts and is frozen")
+        blocker = listing / "wr_blocked.json"
+        blocker.write_text("also not json", encoding="utf-8")
+        (listing / guard.CONFLICTS_DIR / f"wr_blocked.{guard._record_digest(blocker, 'withheld_body')[:16]}.json"
+         ).write_text("held", encoding="utf-8")
+        acted, frozen = guard.actionable_records(listing)
+        if frozen or not blocker.exists() or [p.name for p, _r in acted] != ["wr_own.json"]:
+            fails.append("a record that cannot be frozen still never acts")
+        gone = guard.withheld_review_path(state, "task-gone")
+        if guard.update_record(gone, {"withheld_body": "x"}) or gone.exists():
+            fails.append("an update never recreates a record that is gone or archived")
     return fails
 
 

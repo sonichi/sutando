@@ -338,19 +338,35 @@ def _gateway_headers(token: str) -> dict:
             "User-Agent": "sutando-task-progress/1.0"}
 
 
+def _event_id_or_empty(raw: str | None, field: str) -> "str | None":
+    """`raw` stripped, or None on a refused malformed id. Only an empty string
+    (unset $var expanded by the caller) is a legitimate opt-out; whitespace-only
+    is refused, matching agent-room-ops relations._event_id."""
+    text = "" if raw is None else str(raw)
+    value = text.strip()
+    if text and (not value.startswith("$") or len(value) < 2):
+        print(f"[task-progress] {field} must be a Matrix event id like $abc, "
+              f"got {text!r}", file=sys.stderr)
+        return None
+    return value
+
+
 def send_remote_gateway(source: str, channel_id: str, message: str,
-                        thread_root: str | None = None) -> bool:
+                        thread_root: str | None = None, reply_to: str | None = None) -> bool:
     """Generic sender for gateway-bridged channels (any --source with a
-    channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN)."""
-    # Only an empty id (unset $thread_root expanded by the caller) posts unthreaded;
-    # whitespace-only is refused, matching agent-room-ops relations._event_id.
-    raw = "" if thread_root is None else str(thread_root)
-    thread_root = raw.strip()
-    if raw:
-        if not thread_root.startswith("$") or len(thread_root) < 2:
-            print(f"[task-progress] thread_root must be a Matrix event id like $abc, "
-                  f"got {raw!r}", file=sys.stderr)
-            return False
+    channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN).
+
+    `thread_root` nests the post in an existing Matrix thread; `reply_to` only
+    cites the message in the main timeline (`m.in_reply_to`, no `rel_type`) --
+    the same distinction agent-room-ops/relations.py draws. A top-level ask
+    (no `thread_root`) gets `reply_to` so the update still names what it is
+    about without starting a thread under a message the user never threaded."""
+    thread_root = _event_id_or_empty(thread_root, "thread_root")
+    if thread_root is None:
+        return False
+    reply_to = _event_id_or_empty(reply_to, "reply_to")
+    if reply_to is None:
+        return False
     cfg = _gateway_config(source)
     if cfg is None:
         return False
@@ -363,8 +379,12 @@ def send_remote_gateway(source: str, channel_id: str, message: str,
     payload = {"op": "message", "room_id": channel_id, "body": message}
     if worker:
         payload["extra_content"] = {"space.ag2.worker": {"id": worker}}
+    # Independent fields (relations.py's relation_fields): thread_root nests
+    # the post, reply_to is its citation fallback or the only relation at all.
     if thread_root:
         payload["thread_root"] = thread_root
+    if reply_to:
+        payload["reply_to"] = reply_to
     return _post(f"{url}/v1/room", payload, _gateway_headers(token))
 
 
@@ -435,7 +455,7 @@ _delivery_route, _no_route_message, NO_ROUTE_EXIT = _load_progress_route()
 
 
 def _derive_from_task_file(path: str) -> dict:
-    """source/channel_id/chat_id/thread_root/thread_ts from a task file's headers.
+    """source/channel_id/chat_id/thread_root/reply_to/thread_ts from a task file's headers.
     {} (with a stderr note) when the file is unreadable: explicit flags still apply."""
     try:
         text = Path(path).read_text()
@@ -456,8 +476,10 @@ def _derive_from_task_file(path: str) -> dict:
         "source": headers.get("source"),
         "channel_id": headers.get("channel_id") or headers.get("source_room_id"),
         "chat_id": headers.get("chat_id"),
-        # The asking message, never reply_to_event (the post the sender quoted).
-        "thread_root": headers.get("thread_root") or headers.get("source_message_id"),
+        # Only a REAL thread_root header nests the post; the asking message
+        # (never reply_to_event, the post the sender quoted) is always the citation.
+        "thread_root": headers.get("thread_root"),
+        "reply_to": headers.get("source_message_id"),
         # The Slack bridge writes reply_thread_ts; thread_ts is the generic key.
         "thread_ts": headers.get("reply_thread_ts") or headers.get("thread_ts"),
     }
@@ -468,10 +490,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Send a task-progress update to a channel.")
     parser.add_argument("--task-file", default=None,
                         help="Path to the task file being processed; derives --source, "
-                             "--channel-id/--chat-id, --thread-root and --thread-ts from its "
-                             "headers so none of them need to be passed (or remembered) by "
-                             "hand. Any of those flags given explicitly still overrides what "
-                             "the file carries.")
+                             "--channel-id/--chat-id, --thread-root, --reply-to and "
+                             "--thread-ts from its headers so none of them need to be passed "
+                             "(or remembered) by hand. Any of those flags given explicitly "
+                             "still overrides what the file carries.")
     parser.add_argument("--source", default=None,
                         help="Channel source: slack / discord / telegram, or any "
                              "gateway-bridged provider with a channels/<source>/.env. "
@@ -481,7 +503,13 @@ def main() -> int:
     parser.add_argument("--thread-ts", default=None,
                         help="Slack thread timestamp for threaded replies")
     parser.add_argument("--thread-root", default=None,
-                        help="Gateway sources (e.g. ag2space): thread event id ($...) to post in")
+                        help="Gateway sources (e.g. ag2space): thread event id ($...) to nest "
+                             "the post in. Only set this when the ask was already in a "
+                             "thread -- threading is a decision, not this script's default.")
+    parser.add_argument("--reply-to", default=None,
+                        help="Gateway sources: event id ($...) this update is about, cited "
+                             "in the main timeline (not a thread). Defaults to the task's "
+                             "asking message via --task-file.")
     parser.add_argument(
         "--no-validate-mentions",
         action="store_true",
@@ -501,6 +529,7 @@ def main() -> int:
     explicit_channel = args.channel_id if args.channel_id is not None else args.chat_id
     channel = _pick(explicit_channel, derived.get("channel_id") or derived.get("chat_id"))
     thread_root = _pick(args.thread_root, derived.get("thread_root"))
+    reply_to = _pick(args.reply_to, derived.get("reply_to"))
     thread_ts = _pick(args.thread_ts, derived.get("thread_ts"))
 
     if not source:
@@ -538,7 +567,7 @@ def main() -> int:
     elif source == "telegram":
         ok = send_telegram(channel, message)
     else:
-        ok = send_remote_gateway(source, channel, message, thread_root=thread_root)
+        ok = send_remote_gateway(source, channel, message, thread_root=thread_root, reply_to=reply_to)
 
     return 0 if ok else 1
 

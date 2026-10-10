@@ -93,6 +93,36 @@ blocks) before anything is persisted; detected values are replaced with
 placeholders and the task carries an in-band notice so downstream agents
 don't reproduce them.
 
+## Waking your agent
+
+Sparrow writes each task to `AGENT_CONNECT_TASK_DIR/<task-id>.txt`. Set
+`REMOTE_TASK_ON_TASK` and Sparrow also runs that command once for every task
+file it newly queues, so your agent starts its turn without a folder-watching
+hook of its own.
+
+```sh
+REMOTE_TASK_ON_TASK="my-agent run-task" ag2-sparrow
+# for each new task Sparrow runs: my-agent run-task /path/to/task_dir/<task-id>.txt
+```
+
+- The command is split like a shell would split it (`shlex`) but runs **without
+  a shell**: no pipes, redirects or `$VARS`. Point it at a script if you need them.
+- The task file's absolute path is appended as the last argument. The command
+  also gets `SPARROW_TASK_ID` and `SPARROW_TASK_FILE` in its environment.
+- It runs only after the file is completely and durably written.
+- It fires once per task file Sparrow writes. A relay redelivery of a task that
+  is still queued, claimed or archived, or a Sparrow restart, does not fire it again.
+- Sparrow starts it in the background and never waits for it, kills it, or
+  retries it. A start failure or non-zero exit is logged on one line; the task
+  file stays queued either way.
+- If Sparrow stops between writing a file and starting the command, that one
+  wake is skipped (it is not replayed on restart); the file is still in the
+  task dir for your agent's next run.
+- Your relay token is never passed to it: every `REMOTE_*`/`AG2_*` token variable,
+  and any variable holding the token's value, is removed from its environment.
+
+Unset (the default), Sparrow behaves exactly as before.
+
 ## Optional: room-event subscription (0.3.0)
 
 Off by default. With `SPARROW_EVENTS=1` the client also maintains a persistent
