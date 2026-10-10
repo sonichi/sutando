@@ -303,7 +303,11 @@ def api(method, **params):
     except urllib.error.HTTPError as e:
         body = e.read().decode()
         print(f"API error {e.code}: {body}")
-        return {"ok": False}
+        try:
+            description = json.loads(body).get("description", "")
+        except (ValueError, AttributeError):
+            description = ""
+        return {"ok": False, "description": description}
 
 INBOX_DIR = REPO / "telegram-inbox"
 INBOX_DIR.mkdir(exist_ok=True)
@@ -331,7 +335,10 @@ def download_file(file_id, name_hint="file"):
     result = api("getFile", file_id=file_id)
     if not result.get("ok"):
         return None
-    file_path = result["result"]["file_path"]
+    return _save_telegram_file(result["result"]["file_path"], name_hint)
+
+
+def _save_telegram_file(file_path, name_hint="file"):
     url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
     ext = os.path.splitext(file_path)[1] or os.path.splitext(name_hint)[1] or ""
     local_name = f"{int(time.time()*1000)}{ext}"
@@ -344,6 +351,61 @@ def download_file(file_id, name_hint="file"):
     except Exception as e:
         print(f"  Download failed: {e}")
         return None
+
+# The Bot API's getFile refuses anything larger; the file never reaches us.
+TELEGRAM_BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+
+# Attachment kinds downloaded as plain files: (message key, fallback name).
+PLAIN_FILE_KINDS = (
+    ("document", "file"),
+    ("video", "video.mp4"),
+    ("audio", "audio"),
+    ("video_note", "video_note.mp4"),
+)
+
+
+def fetch_inbound(file_id, name_hint="file", size=0):
+    """Download an inbound attachment: (local_path, None), or (None, "too_large" | "failed")."""
+    if size and size > TELEGRAM_BOT_DOWNLOAD_LIMIT:
+        return None, "too_large"
+    result = api("getFile", file_id=file_id)
+    if not result.get("ok"):
+        too_big = "too big" in str(result.get("description", "")).lower()
+        return None, "too_large" if too_big else "failed"
+    local_path = _save_telegram_file(result["result"]["file_path"], name_hint)
+    return (local_path, None) if local_path else (None, "failed")
+
+
+def _mb(size):
+    return f"{size / (1024 * 1024):.0f} MB" if size else "size unknown"
+
+
+def skipped_files_reply(skipped):
+    """What the sender is told when attachments could not be received."""
+    too_large = [(n, sz) for n, sz, why in skipped if why == "too_large"]
+    failed = [n for n, _sz, why in skipped if why != "too_large"]
+    lines = []
+    if too_large:
+        names = ", ".join(f"{n} ({_mb(sz)})" for n, sz in too_large)
+        lines.append(
+            f"I couldn't receive {names}: Telegram only lets bots download files up to 20 MB. "
+            "Send a link to it instead (Google Drive, Dropbox, iCloud), a smaller or compressed "
+            "copy, or drop it into AG2 Space."
+        )
+    if failed:
+        lines.append(f"I couldn't download {', '.join(failed)}. Please try sending it again.")
+    return "\n".join(lines)
+
+
+def skipped_files_note(skipped):
+    """The line the agent sees in the task, so it knows a file was sent but not received."""
+    parts = [
+        f"{n} ({_mb(sz)}, over Telegram's 20 MB bot download limit)" if why == "too_large"
+        else f"{n} (download failed)"
+        for n, sz, why in skipped
+    ]
+    return f"\n[File not received: {'; '.join(parts)}]" if parts else ""
+
 
 def send_file(chat_id, file_path, caption=""):
     """Send a file via Telegram multipart upload."""
@@ -843,9 +905,13 @@ def main():  # pragma: no cover
                 # Structured refs (interaction-model 4D, step 1.5), accumulated
                 # alongside the legacy [*attached:] body line — dual-write.
                 attachment_refs: list = []  # pragma: no cover
+                skipped: list = []  # (name, size, reason) for files Telegram would not hand over
                 if "photo" in msg:
                     file_id = msg["photo"][-1]["file_id"]  # largest size
-                    local_path = download_file(file_id, "photo")
+                    photo_size = msg["photo"][-1].get("file_size", 0) or 0
+                    local_path, why = fetch_inbound(file_id, "photo", photo_size)
+                    if why:
+                        skipped.append(("photo", photo_size, why))
                     if local_path:
                         attachment_note = f"\n[Photo attached: {local_path}]"
                         attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
@@ -859,20 +925,28 @@ def main():  # pragma: no cover
                             _push_vision_image(local_path, source="telegram")
                         except Exception:
                             pass
-                if "document" in msg:
-                    file_id = msg["document"]["file_id"]
-                    fname = msg["document"].get("file_name", "file")
-                    local_path = download_file(file_id, fname)
+                for kind, fallback_name in PLAIN_FILE_KINDS:
+                    part = msg.get(kind)
+                    if not isinstance(part, dict) or not part.get("file_id"):
+                        continue
+                    fname = part.get("file_name") or fallback_name
+                    fsize = part.get("file_size", 0) or 0
+                    local_path, why = fetch_inbound(part["file_id"], fname, fsize)
+                    if why:
+                        skipped.append((fname, fsize, why))
                     if local_path:
                         attachment_note = f"\n[File attached: {local_path}]"
                         attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
                             locator=local_path,
-                            mime=(msg["document"].get("mime_type", "") or ""),
+                            mime=(part.get("mime_type", "") or ""),
                             filename=(fname or os.path.basename(local_path)),
-                            size=(msg["document"].get("file_size", 0) or 0)))
+                            size=fsize))
                 if "voice" in msg:
                     file_id = msg["voice"]["file_id"]
-                    local_path = download_file(file_id, "voice.ogg")
+                    voice_size = msg["voice"].get("file_size", 0) or 0
+                    local_path, why = fetch_inbound(file_id, "voice.ogg", voice_size)
+                    if why:
+                        skipped.append(("voice note", voice_size, why))
                     if local_path:
                         attachment_refs.append(local_task_protocol.AttachmentRef(  # pragma: no cover
                             locator=local_path,
@@ -884,6 +958,12 @@ def main():  # pragma: no cover
                             attachment_note = f"\n[Voice transcript: {transcript}]"
                         else:
                             attachment_note = f"\n[Voice note attached: {local_path}]"
+
+                if skipped:
+                    api("sendMessage", chat_id=chat_id, text=skipped_files_reply(skipped))
+                    attachment_note += skipped_files_note(skipped)
+                    if not text and attachment_note == skipped_files_note(skipped):
+                        continue  # nothing arrived and nothing was said; the sender is told why
 
                 if not text and not attachment_note:
                     continue
