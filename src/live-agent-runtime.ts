@@ -19,9 +19,10 @@ import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 import { injectText } from './browser-tools.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
-import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull, frameTaskResult, framedSystem } from './inject-framing.js';
+import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
-import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher } from './task-bridge.js';
+import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, voiceTaskStore, reconcileVoiceTasks, forwardOfflineVoiceResult } from './task-bridge.js';
+import { frameResult, type RelayAgent, type ResultItem } from './relay-agent.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
 
@@ -35,6 +36,12 @@ export interface DurableChannelOptions {
 	 * other adapters may not). */
 	cartesiaApiKey?: string;
 	generateSpeech?: ((text: string, meta: { category: string; label: string }) => Promise<string>) | null;
+	/** Waits between checks while the session cannot take a result, before the DM fallback. */
+	notReadyRetriesMs?: number[];
+	/** How often the relay agent reconciles the task table with the core. */
+	reconcileMs?: number;
+	/** The `work` subagent, which owns the result queue. */
+	relay: RelayAgent;
 }
 
 /**
@@ -43,7 +50,7 @@ export interface DurableChannelOptions {
  * text path when the session is live, with the tuned guard markers and
  * fallback semantics preserved exactly.
  */
-export function wireDurableChannels(session: VoiceSession, opts: DurableChannelOptions = {}): void {
+export function wireDurableChannels(session: VoiceSession, opts: DurableChannelOptions): { enqueue: (item: ResultItem) => void } {
 	const { cartesiaApiKey = '', generateSpeech = null } = opts;
 
 	// Watch for context drops (keyboard shortcut)
@@ -94,78 +101,69 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		return false;
 	});
 
-	// Results that land during a meeting wait until it ends: the model must not speak in
-	// meeting mode, and the result must not be lost either.
-	const heldForMeeting: Array<{ result: string; deliveryNote?: string }> = [];
-	let heldTimer: ReturnType<typeof setInterval> | null = null;
-	const holdForMeeting = (result: string, deliveryNote?: string) => {
-		heldForMeeting.push({ result, deliveryNote });
-		console.log(`${ts()} [TaskBridge] Meeting mode: holding the result until the meeting ends (${heldForMeeting.length} held)`);
-		heldTimer ??= setInterval(() => {
-			if (meetingHoldsModel(session)) return;
-			clearInterval(heldTimer!);
-			heldTimer = null;
-			for (const held of heldForMeeting.splice(0)) deliverResult(held.result, held.deliveryNote);
-		}, 2_000);
-		heldTimer.unref?.();
+	// A result answers its own task and every task the core deduped into it that the user has not heard.
+	const answering = (taskId?: string): Pick<ResultItem, 'requests' | 'alsoFor'> => {
+		if (!taskId) return {};
+		const others = voiceTaskStore.answeredBy(taskId).filter(([, row]) => row.delivery !== 'spoken' && row.delivery !== 'injected');
+		const own = voiceTaskStore.get(taskId)?.text;
+		return {
+			requests: [own, ...others.map(([, row]) => row.text)].filter((r): r is string => !!r),
+			alsoFor: others.map(([id]) => id),
+		};
 	};
 
-	const deliverResult = (result: string, deliveryNote?: string) => {
+	// A result no work call can carry (its call was cancelled, its connection replaced, or the agent
+	// restarted): a system notice when the session can speak, held through a meeting; else one DM copy.
+	const heldForMeeting: ResultItem[] = [];
+	let stuckSeq = 0;
+	let heldTimer: ReturnType<typeof setInterval> | null = null;
+	const record = (item: ResultItem, delivery: 'injected' | 'dm') => {
+		for (const id of [item.taskId, ...(item.alsoFor ?? [])]) if (id) voiceTaskStore.set(id, delivery);
+	};
+	const deliverElsewhere = (item: ResultItem) => {
 		if (meetingHoldsModel(session)) {
-			holdForMeeting(result, deliveryNote);
+			heldForMeeting.push(item);
+			console.log(`${ts()} [TaskBridge] Meeting mode: holding the result until the meeting ends (${heldForMeeting.length} held)`);
+			heldTimer ??= setInterval(() => {
+				if (meetingHoldsModel(session)) return;
+				clearInterval(heldTimer!);
+				heldTimer = null;
+				for (const held of heldForMeeting.splice(0)) deliverElsewhere(held);
+			}, 2_000);
+			heldTimer.unref?.();
 			return;
 		}
-		console.log(`${ts()} [TaskBridge] Delivering result to user${deliveryNote ? ' (with a delivery note)' : ''}`);
-		// Re-check session state inside the timer rather than at callback
-		// time. Reason: TaskBridge delivers `voice-*.txt` results the
-		// instant the WebSocket reconnects, but Gemini setup completes
-		// ~100ms after that. Without this delay-then-check pattern, a
-		// voice-only push that lands during the connect-but-not-active
-		// window would silently fall through to the Cartesia branch
-		// (which is usually disabled). 2026-05-20 02:36:44 incident:
-		// voice-test-1779244500.txt was "delivered" per the bridge log
-		// but never spoken because isActive was false at callback time
-		// (Gemini setup completed 106ms later). Now the check fires at
-		// T+1500ms when setup is reliably finished.
-		const inject = () => {
-			if (meetingHoldsModel(session)) {
-				holdForMeeting(result, deliveryNote);
-				return true;
-			}
-			if (session.sessionManager.isActive && session.clientConnected) {
-				// The note sits OUTSIDE the TASK_RESULT markers: it is delivery
-				// state the model acts on, not result text it must only summarise.
-				injectText(session, frameTaskResult(result) + (deliveryNote ? `\n\n${framedSystem(deliveryNote)}` : ''));
-				return true;
-			}
-			return false;
-		};
-		// First attempt after 1.5s (matches prior behavior). If still not
-		// active, do one retry at 3s. After that, fall through to Cartesia
-		// — no infinite retry, since a stuck session shouldn't pin the
-		// result forever.
 		deliverWithRetry({
-			attempt: inject,
+			attempt: () => {
+				if (!session.sessionManager.isActive || !session.clientConnected) return false;
+				if (!session.tryPublishSystemNotification(frameResult(item))) return false;
+				record(item, 'injected');
+				return true;
+			},
+			// A reconnect takes seconds; wait up to a minute for it before the DM.
+			delaysMs: [0, ...(opts.notReadyRetriesMs ?? Array(30).fill(2_000))],
 			onExhausted: () => {
-				// Stuck-voice fallback. Per Susan's PR #924 review (Q3): Cartesia
-				// only reaches the user if they're watching the web client with
-				// audio playback — a user in a stuck voice session is probably
-				// looking at the voice surface, not the web UI. So the
-				// stuck-voice result can go into the void. Always also write a
-				// Discord DM via a proactive-*.txt file so the result is never
-				// silently lost. Cartesia stays as a bonus path when available
-				// (some users keep the web UI open).
-				console.log(`${ts()} [TaskBridge] Voice not active after 3s — falling back to Discord DM${cartesiaApiKey && generateSpeech ? ' + Cartesia' : ''}`);
+				const taskId = item.taskId;
+				// A voice task's result: one DM copy, which the drain speaks on reconnect if no bridge takes it.
+				if (taskId?.startsWith('task-')) {
+					if (voiceTaskStore.get(taskId)?.delivery === 'dm') return;
+					void forwardOfflineVoiceResult(taskId, item.text)
+						.then(() => record(item, 'dm'))
+						.catch((e) => console.error(`${ts()} [TaskBridge] offline forward failed for ${taskId}:`, e));
+					return;
+				}
+				// Stuck-voice fallback (Susan's PR #924 review, Q3): always also a DM, so a result is never
+				// silently lost; Cartesia stays a bonus path for a user watching the web client.
+				console.log(`${ts()} [TaskBridge] Voice not active after waiting — falling back to Discord DM${cartesiaApiKey && generateSpeech ? ' + Cartesia' : ''}`);
 				try {
-					const proactiveTs = Math.floor(Date.now() / 1000);
-					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${proactiveTs}.txt`);
-					const dmBody = `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${result}`;
-					writeFileSync(proactivePath, dmBody);
+					// One file per result: two can fall back in the same millisecond.
+					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${Date.now()}-${++stuckSeq}.txt`);
+					writeFileSync(proactivePath, `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${item.text}`);
 				} catch (e) {
 					console.error(`${ts()} [TaskBridge] Failed to write stuck-voice Discord fallback:`, e);
 				}
 				if (cartesiaApiKey && generateSpeech) {
-					const truncated = (result.match(/^[\s\S]{0,500}[.!?]/)?.[0] || result.slice(0, 500)).trim();
+					const truncated = (item.text.match(/^[\s\S]{0,500}[.!?]/)?.[0] || item.text.slice(0, 500)).trim();
 					generateSpeech(truncated, { category: 'result', label: 'task-result' }).then(audioPath => {
 						const relativeSrc = audioPath.startsWith(WORKSPACE_DIR)
 							? audioPath.slice(WORKSPACE_DIR.replace(/\/$/, '').length + 1)
@@ -179,7 +177,35 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			},
 		});
 	};
-	startResultWatcher(deliverResult, () => session.clientConnected);
+	const deliver = (item: ResultItem) => {
+		if (opts.relay.offerResult(item)) {
+			console.log(`${ts()} [RelayAgent] ${item.taskId}: result returned to its work call`);
+			return;
+		}
+		console.log(`${ts()} [TaskBridge] Delivering result to the user${item.note ? ' (with a delivery note)' : ''}`);
+		deliverElsewhere(item);
+	};
+
+	startResultWatcher((result, deliveryNote, meta) => {
+		deliver({ text: result, note: deliveryNote, taskId: meta?.taskId, ...answering(meta?.taskId) });
+	}, () => session.clientConnected);
+
+	// The relay agent's reconcile loop: whatever the core finished that the user has not heard
+	// (sent to the DM, its call gone, the agent restarted) is handed over again once the session can speak.
+	const reconcile = setInterval(() => {
+		if (!session.sessionManager.isActive || !session.clientConnected || meetingHoldsModel(session)) return;
+		try {
+			// A task's own waiting call goes first: a task answered in another's result still has one.
+			reconcileVoiceTasks(
+				(text, note, meta) => deliver({ text, note, taskId: meta.taskId, framed: meta.framed, ...answering(meta.taskId) }),
+				() => false,
+			);
+		} catch (err) {
+			console.error(`${ts()} [RelayAgent] reconcile failed (will retry):`, err);
+		}
+	}, opts.reconcileMs ?? 5_000);
+	reconcile.unref?.();
+	return { enqueue: deliverElsewhere };
 }
 
 // ── Session observability recorder (step 5a-3) ───────────────────────────────

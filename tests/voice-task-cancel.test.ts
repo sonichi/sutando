@@ -71,17 +71,18 @@ beforeEach(() => {
 });
 
 describe('cancel_task decides from the task state', () => {
-	it('a queued task gets a cancel request: instruction written, task file deleted, card closed, no "Cancelled." result', async () => {
+	it('a queued task is cancelled outright: task file deleted, no instruction to the core (whose reply would contradict it), card closed', async () => {
 		const id = submit('draw a car');
 		const out = await cancel();
-		assert.equal(out.status, 'cancel_requested');
-		assert.match(out.message, /Do not say it is cancelled/);
+		assert.equal(out.status, 'cancelled');
+		assert.match(out.message, /Tell the user it is cancelled/);
 		assert.equal(out.taskId, id);
-		assert.equal(cancelInstructions().length, 1);
+		assert.deepEqual(cancelInstructions(), []);
+		assert.equal(voiceTaskState(id), 'cancelled');
 		assert.ok(!existsSync(join(TMP, 'tasks', `${id}.txt`)));
 		assert.ok(!archivedTask(id), 'not in tasks/archive/ either, where a core missing the file would find and run it');
 		assert.ok(!existsSync(join(TMP, 'results', `${id}.txt`)), 'no stub result');
-		assert.ok(statuses.some((s) => s.taskId === id && s.status === 'done' && s.text === 'Cancel requested.'));
+		assert.ok(statuses.some((s) => s.taskId === id && s.status === 'done' && s.text === 'Cancelled.'));
 		assert.ok(!_pendingTasksForTest.has(id), 'out of the timeout sweep');
 	});
 
@@ -89,7 +90,7 @@ describe('cancel_task decides from the task state', () => {
 		const id = submit('draw a statue');
 		announce(id);
 		assert.equal(voiceTaskState(id), 'queued');
-		assert.equal((await cancel()).status, 'cancel_requested');
+		assert.equal((await cancel()).status, 'cancelled');
 	});
 
 	it('a task the core has read but not yet run a tool on is started, not cancelled', async () => {
@@ -143,19 +144,24 @@ describe('cancel_task decides from the task state', () => {
 		assert.ok(existsSync(join(TMP, 'tasks', 'task-health-2.txt')));
 	});
 
+	it('a query also finds a voice task that already finished, and answers done, saying whether it was heard', async () => {
+		const id = `task-${1_800_000_000_000 + ++seq}`;
+		const month = new Date().toISOString().slice(0, 7);
+		mkdirSync(join(TMP, 'results', 'archive', month), { recursive: true });
+		writeFileSync(join(TMP, 'results', 'archive', month, `${id}.txt`), "Here's your mouse.");
+		tb.voiceTaskStore.add(id, 'draw a mouse');
+		tb.voiceTaskStore.set(id, 'spoken');
+		const out = await cancel({ query: 'mouse' });
+		assert.equal(out.status, 'already_done');
+		assert.equal(out.taskId, id);
+		assert.equal(out.heard as unknown as boolean, true);
+		assert.deepEqual(cancelInstructions(), []);
+	});
+
 	it('a query matches the open task by its text', async () => {
 		const dog = submit('draw a dog driving a car');
 		submit('draw a parrot');
 		assert.equal((await cancel({ query: 'dog' })).taskId, dog);
-	});
-
-	it("the core's reply to the cancel is spoken: it is the confirmation the user was promised", async () => {
-		submit('draw an apple');
-		await cancel();
-		const [instruction] = cancelInstructions();
-		writeFileSync(join(TMP, 'results', instruction), 'Cancelled task-x before it started.');
-		await tick(2_500);
-		assert.deepEqual(spoken.map((s) => s.text), ['Cancelled task-x before it started.']);
 	});
 
 	it('a cancelled task the core finished anyway is spoken with a note saying so', async () => {

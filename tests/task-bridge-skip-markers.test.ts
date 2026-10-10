@@ -50,8 +50,8 @@ describe('task-bridge.ts — [no-send]/[REPLIED] skip-marker handling (#1381)', 
 		// would otherwise speak raw marker text via voice.
 		const skipIdx = SRC.indexOf('has skip marker');
 		// Find the second onResult() call (the fallthrough path).
-		const first = SRC.indexOf('onResult(result)');
-		const fallthroughOnResultIdx = SRC.indexOf('onResult(result)', first + 1);
+		const first = SRC.indexOf('onResult(result');
+		const fallthroughOnResultIdx = SRC.indexOf('onResult(result', first + 1);
 		assert.ok(skipIdx !== -1, '"has skip marker" log not found');
 		assert.ok(fallthroughOnResultIdx !== -1, 'fallthrough onResult(result) not found');
 		assert.ok(
@@ -66,7 +66,7 @@ describe('task-bridge.ts — [no-send]/[REPLIED] skip-marker handling (#1381)', 
 		const anchor = 'has skip marker';
 		const afterSkip = afterBlock(anchor);
 		const continueIdx = afterSkip.indexOf('continue;');
-		const onResultIdx = afterSkip.indexOf('onResult(result)');
+		const onResultIdx = afterSkip.indexOf('onResult(result');
 		assert.ok(continueIdx !== -1, 'skip-marker block must call continue;');
 		assert.ok(
 			continueIdx < onResultIdx,
