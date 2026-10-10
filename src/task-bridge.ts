@@ -1469,17 +1469,18 @@ function startRelayResultWatcher(onResult: ResultListener): void {
 				if (_deliveredResults.has(file)) continue;
 				const taskId = file.replace('.txt', '');
 				if (!_pendingTasks.has(taskId)) continue; // not ours — leave it
-				const result = (await _delegation.readResultFile(file)).trim();
-				if (!result) continue;
+				const raw = (await _delegation.readResultFile(file)).trim();
+				if (!raw) continue;
+				const result = stripVoiceControlLines(raw).trim();
 				_deliveredResults.add(file);
 				_pendingTasks.delete(taskId);
 				// Shared predicate, not a local regex: this grammar must stay identical to
 				// src/result_markers.py, which is case-insensitive and accepts `[deduped:]`.
-				if (!bodyIsSkipMarked(result)) {
+				if (!bodyIsSkipMarked(raw)) {
 					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
 					onResult(`[Task result for ${taskId}]\n${result}`);
 				} else {
-					const answeredIn = dedupTarget(result);
+					const answeredIn = dedupTarget(raw);
 					if (answeredIn && voiceTaskStore.get(taskId)) voiceTaskStore.setAnsweredBy(taskId, answeredIn);
 				}
 				await _delegation.archiveResultFile(file, taskId);
@@ -1658,6 +1659,8 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 				// Detected before the strip: an origin-bound result that carries the
 				// marker is kept to the owner's DM (keepVoiceResultToDm).
 				const dmOnly = DM_ONLY_RE.test(rawResult);
+				// Skip and ownership read the raw body; the strip is for speech and logs only.
+				const raw = rawResult.trim();
 				const result = stripVoiceControlLines(rawResult).trim();
 				if (!result) continue;
 				const taskId = file.replace('.txt', '');
@@ -1685,16 +1688,16 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 				// (e.g. Discord bridge already replied) or the result should be suppressed entirely.
 				// Parity with Python bridges: discord-bridge.py and telegram-bridge.py both honor
 				// these via parse_markers(); task-bridge.ts must too (issue #1381).
-				if (isSkipMarked(file, result)) {
+				if (isSkipMarked(file, raw)) {
 					// Ownership must survive a restart (_pendingTasks is in-memory)
 					// and the timeout sweep; suppression applies either way.
 					const owns = (id: string) => _pendingTasks.has(id) || _isVoiceTask(id);
-					if (!mayRetireSkipMarked(file, result, owns, _taskOrigin)) {
+					if (!mayRetireSkipMarked(file, raw, owns, _taskOrigin)) {
 						continue;   // another consumer's: leave the files for its owner
 					}
 					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker; archiving silently`);
 					// A voice task the core answered in another task's result: the table owes the user that result.
-					const answeredIn = dedupTarget(result);
+					const answeredIn = dedupTarget(raw);
 					if (answeredIn && voiceTaskStore.get(taskId)) {
 						voiceTaskStore.setAnsweredBy(taskId, answeredIn);
 						console.log(`${ts()} [RelayAgent] ${taskId}: answered in ${answeredIn}`);

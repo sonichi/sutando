@@ -115,7 +115,7 @@ class TestTaskBridgeTsParity(unittest.TestCase):
     def test_task_bridge_strips_through_the_shared_helper(self):
         src = (REPO / "src" / "task-bridge.ts").read_text()
         self.assertNotRegex(src, r"\.replace\([^\n]*dm-only", "task-bridge.ts must not hand-roll the strip")
-        self.assertGreaterEqual(src.count("stripVoiceControlLines("), 2, "both voice paths use the helper")
+        self.assertGreaterEqual(src.count("stripVoiceControlLines("), 3, "local, reconcile and relay paths use the helper")
 
     def _expr(self) -> str:
         m = re.search(r"\.replace\(\s*(/[^\n]*?dm-only[^\n]*?/[gimsuy]*)", self.TS.read_text())

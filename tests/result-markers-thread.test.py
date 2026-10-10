@@ -134,6 +134,22 @@ check("standalone [thread] with trailing blanks and CRLF", a == [("thread-ask", 
       and body == "CRLF and trailing blanks", f"{a} {body!r}")
 a, body = acts("[thread]")
 check("[thread] alone at end of body", a == [("thread-ask", "")] and body == "", f"{a} {body!r}")
+# 9. the whole-line boundary holds after another leading marker on the same line
+for lead in ("[reply: 12345678901234567]", f"[channel: {ROOM}]", f"[thread: {ROOT}]", "[dm-only]"):
+    text = f"{lead} [thread]\nbody"
+    for label, parse in (("src", parse_markers), ("vendored", mod.parse_markers)):
+        a, body = acts(text, parse)
+        check(f"{label}: {lead} [thread] on one line is not a thread-ask",
+              ("thread-ask", "") not in a and "[thread]" in body, f"{a} {body!r}")
+a, body = acts(f"[channel: {ROOM}]\n[thread]\nbody")
+check("on the next line it still counts", ("thread-ask", "") in a and body == "body", f"{a} {body!r}")
+# 10. neutralize_markers rewrites only what the parser would read
+for prose in ("[thread]ing is a library primitive", "[thread] prose on one line", "use [thread] inline"):
+    for label, fn in (("src", neutralize_markers), ("vendored", mod.neutralize_markers)):
+        check(f"{label}: neutralize leaves prose {prose!r}", fn(prose) == prose, repr(fn(prose)))
+for label, fn, parse in (("src", neutralize_markers, parse_markers), ("vendored", mod.neutralize_markers, mod.parse_markers)):
+    out = fn("[thread]\nquoted")
+    check(f"{label}: a standalone [thread] is neutralized", out != "[thread]\nquoted" and acts(out, parse)[0] == [], repr(out))
 a, body = acts("use [thread] inline")
 check("inline bare [thread] is prose", a == [] and body == "use [thread] inline", f"{a} {body!r}")
 a, body = acts("[no-send]\n[thread]\nx")

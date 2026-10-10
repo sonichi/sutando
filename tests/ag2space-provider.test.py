@@ -113,10 +113,8 @@ def main() -> int:
             return e, gw
 
     r, gw = threaded_outcome(_http_error(400), {"ok": True})
-    check("thread + 400 -> re-posted once without the field, CONFIRMED",
-          getattr(r, "outcome", None) is DeliveryOutcome.CONFIRMED
-          and [c[2] for c in gw.calls] == [{"id": "task-X", "body": "hello", "thread": "ask"},
-                                           {"id": "task-X", "body": "hello"}], str(gw.calls))
+    check("thread + 400 -> Refused after ONE call (single attempt, no private retry)",
+          isinstance(r, ProviderRefused) and len(gw.calls) == 1, str(gw.calls))
     r, gw = threaded_outcome(_http_error(503))
     check("thread + 503 -> Indeterminate, one call, field kept for the retry",
           isinstance(r, ProviderIndeterminate) and len(gw.calls) == 1
@@ -124,9 +122,6 @@ def main() -> int:
     r, gw = threaded_outcome(_http_error(422))
     check("thread + 422 -> Refused, one call (only 400 is the no-side-effect contract)",
           isinstance(r, ProviderRefused) and len(gw.calls) == 1, str(gw.calls))
-    r, gw = threaded_outcome(_http_error(400), _http_error(400))
-    check("thread + 400 twice -> Refused after exactly two calls",
-          isinstance(r, ProviderRefused) and len(gw.calls) == 2, str(gw.calls))
     r, gw = outcome_of(_http_error(400))
     check("no thread field + 400 -> one call", len(gw.calls) == 1, str(gw.calls))
 

@@ -281,9 +281,17 @@ def parse_markers(text: str) -> ParseResult:
     # A bridge that sees the dm-only action (or, equivalently, the ABSENCE of a
     # redirect action) delivers to the DM.
     dm_only = bool(_DMONLY_RE.search(body))
+    # Where a strip glued the rest of its line to a line start: no line boundary there.
+    glued: set[int] = set()
     if dm_only:
         actions.append(Action(kind="dm-only", value=""))
-        body = _DMONLY_STRIP_RE.sub("", body)
+        parts, last = [], 0
+        for m in _DMONLY_STRIP_RE.finditer(body):
+            parts.append(body[last:m.start()])
+            if not m.group(0).endswith("\n") and m.end() < len(body):
+                glued.add(sum(map(len, parts)))
+            last = m.end()
+        body = "".join(parts) + body[last:]
 
     # 3. REDIRECT — must be the first non-empty line (after any D7 header).
     # Suppressed entirely when dm-only is set: strip a leading `[channel:]`
@@ -292,6 +300,7 @@ def parse_markers(text: str) -> ParseResult:
     # 2. LEADING MARKERS — [channel:], [thread:] and [reply:] in any order; order
     # independence keeps an unparsed marker from reaching the user as text.
     named: set[str] = set()
+    lead = body
     while True:
         redirect_match = _REDIRECT_RE.match(body)
         if redirect_match:
@@ -312,7 +321,8 @@ def parse_markers(text: str) -> ParseResult:
             body = body[thread_match.end():]
             continue
         ask_match = _THREAD_ASK_RE.match(body)
-        if ask_match:
+        at = len(lead) - len(body) + (ask_match.group(0).index("[") if ask_match else 0)
+        if ask_match and (at == 0 or lead[at - 1] == "\n") and at not in glued:
             if not any(a.kind == "thread-ask" for a in actions):
                 actions.append(Action(kind="thread-ask", value=""))
             body = body[ask_match.end():]
@@ -619,15 +629,18 @@ def build_requeued_task(
 # Every bracket word the patterns above act on; the inverse of the grammar lives
 # beside it so a new marker is added to both at once.
 _MARKER_OPEN_RE = re.compile(
-    r"\[(?=(?:no-send|REPLIED|deduped:|channel:|thread:|thread\]|reply:|dm-only|file:|send:|attach:))",
+    r"\[(?=(?:no-send|REPLIED|deduped:|channel:|thread:|reply:|dm-only|file:|send:|attach:))",
     re.IGNORECASE)
+
+# A bare [thread] is a marker only as a line of its own, so only that shape is quoted.
+_THREAD_ASK_OPEN_RE = re.compile(r"^([ \t]*)\[(?=thread\][ \t]*\r?$)", re.IGNORECASE | re.MULTILINE)
 
 
 def neutralize_markers(text: str) -> str:
     """Quoted form of `text` for a body that EMBEDS it: a space after each marker's
     opening bracket keeps the words readable and takes the token out of every
     pattern in this module, so parse_markers emits no action for it."""
-    return _MARKER_OPEN_RE.sub("[ ", text or "")
+    return _THREAD_ASK_OPEN_RE.sub(r"\1[ ", _MARKER_OPEN_RE.sub("[ ", text or ""))
 
 
 def first_action(result: ParseResult, kind: ActionKind) -> Action | None:

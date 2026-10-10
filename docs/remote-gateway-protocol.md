@@ -139,7 +139,11 @@ message it was asked in. The broker:
 A broker that predates the field ignores it, so a client may send it before the
 broker supports it. The client sends only `"ask"`, and only on an ordinary
 (non-suppressed, non-redirected) task result whose leading lines carry a bare
-`[thread]` line (`src/result_markers.py`). The field name and value live in one
+`[thread]` line (`src/result_markers.py`). Backend #2138 defines `"ask"` as valid,
+so a `400` (or any other refusal) of a result carrying it is a bug to investigate,
+not something the client degrades around: it parks like any other 4xx (below), with
+no re-post. A retryable failure re-sends the stored payload, field included. The
+field name and value live in one
 place on the client: `RESULT_THREAD_FIELD` / `RESULT_THREAD_ASK` in
 `packages/ag2-sparrow/ag2_sparrow/delivery_core/provider_ag2space.py`.
 
@@ -309,12 +313,7 @@ and broker result ID remain the same. No agent task is created to regenerate
 an answer because its POST failed.
 
 HTTP 401/403 (while polling recovers authentication), 408, 425, 429, 5xx and
-transport failures are retryable. One exception to "one POST per attempt": a
-`400` to a POST that carried `thread` is re-posted once, in the same attempt and
-under the same result ID, without the field, because the broker guarantees that
-400 records nothing and keeps the lease. No other status is treated this way
-(a `422` or any other 4xx with the field parks as below); a retryable failure
-re-sends the stored payload with the field. Other 4xx responses,
+transport failures are retryable. Other 4xx responses,
 malformed envelopes and explicit decline envelopes are permanent refusals and
 park on the first attempt. This policy applies to the gateway **task-result**
 leg only; proactive room sends and other providers keep their existing retry

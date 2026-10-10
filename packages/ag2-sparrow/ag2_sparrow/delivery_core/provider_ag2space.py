@@ -16,7 +16,8 @@ from .contract import (DeliveryAttempt, DeliveryOutcome, DeliveryReceipt,
                        ProviderRefused, ProviderPermanentRefused)
 
 RESULTS_PATH = "/v1/results"
-# Optional result field (docs/remote-gateway-protocol.md): only this value is sent.
+# Optional result field (docs/remote-gateway-protocol.md): only this value is sent;
+# a 400 for it is a bug to investigate and parks like any other 4xx.
 RESULT_THREAD_FIELD, RESULT_THREAD_ASK = "thread", "ask"
 
 
@@ -40,18 +41,8 @@ class AG2SpaceResultProvider:
             raise ProviderPermanentRefused(f"malformed envelope for {item_id}: {e}") from e
         if not isinstance(envelope, dict) or not envelope.get("id"):
             raise ProviderPermanentRefused(f"envelope for {item_id} lacks a result id")
-        unthreaded = False
         try:
-            try:
-                resp = self._request("POST", RESULTS_PATH, envelope) or {}
-            except urllib.error.HTTPError as e:
-                # A 400 records nothing and keeps the lease: an opt-in thread
-                # request must cost the placement, never the answer.
-                if e.code != 400 or RESULT_THREAD_FIELD not in envelope:
-                    raise
-                unthreaded = True
-                plain = {k: v for k, v in envelope.items() if k != RESULT_THREAD_FIELD}
-                resp = self._request("POST", RESULTS_PATH, plain) or {}
+            resp = self._request("POST", RESULTS_PATH, envelope) or {}
         except urllib.error.HTTPError as e:
             # The bridge refreshes credentials through its polling loop.
             if not is_retryable_http_status(e.code, auth_recoverable=True):
@@ -70,8 +61,7 @@ class AG2SpaceResultProvider:
         return DeliveryReceipt(
             outcome=DeliveryOutcome.CONFIRMED,
             provider_ref="duplicate" if resp.get("duplicate") else "accepted",
-            detail="gateway accepted; Matrix delivery unconfirmed"
-                   + ("; thread request refused (HTTP 400), posted unthreaded" if unthreaded else ""))
+            detail="gateway accepted; Matrix delivery unconfirmed")
 
     def reconcile(self, attempt: DeliveryAttempt) -> Optional[DeliveryReceipt]:
         # Declines to answer: the gateway exposes no read-back, so ambiguity is

@@ -11,7 +11,7 @@ the thread on the task's own asking message (no event id is ever sent).
                                           refused attribution -> no POST at all
   e) [thread] + [file:]                -> upload kept, marker stripped, thread "ask"
   f) [channel:] + [thread]             -> redirect re-stitched as today, no thread field
-  g) broker 400 on the thread field    -> re-posted once without it, delivered, archived
+  g) broker 400 on the thread field    -> parks like any other 4xx: one POST, quarantined, never re-posted
   h) proactive file with [thread]      -> stripped, posted top level (task results only)
   i) `[thread]` not alone on its line  -> prose: body untouched, no thread field
 
@@ -182,15 +182,16 @@ def main() -> int:
     check(p.get("body") == f"[channel: {OTHER}]\nmoved", f"f) redirect re-stitched, body clean, got {p.get('body')!r}")
     check("thread" not in p, f"f) a redirected answer never asks for a thread, got {p}")
 
-    # g) a 400 for the field re-posts without it instead of parking the answer
+    # g) only "ask" is sent and backend#2138 defines it as valid: a 400 is a bug, parked as on main
     h = Harness(refuse_thread_400=True)
     left = h.run("tt-g", "[thread]\nall green\n")
-    check(len(h.results) == 2, f"g) two attempts, got {len(h.results)}")
-    check(h.results[:1] and h.results[0].get("thread") == "ask", "g) first attempt asked for the thread")
-    check(len(h.results) == 2 and json.dumps(h.results[1]) == json.dumps({"id": "tt-g", "body": "all green"}),
-          f"g) re-posted without the field, got {h.results[1:]}")
-    check(left == set() and h.archived("tt-g"), "g) delivered and archived, not parked")
-    check(not any(h.mod.UNDELIVERABLE_RESULTS_DIR.rglob("tt-g*")), "g) nothing quarantined")
+    check(len(h.results) == 1 and h.results[0].get("thread") == "ask",
+          f"g) exactly one POST, with the field, got {h.results}")
+    check(not (h.mod.RESULTS_DIR / "tt-g.txt").exists()
+          and any(h.mod.UNDELIVERABLE_RESULTS_DIR.rglob("tt-g*")) and not h.archived("tt-g"),
+          "g) parked to undelivered/, not archived as delivered")
+    h.mod._post_ready_results(left)
+    check(len(h.results) == 1, f"g) a later pass never re-posts, got {len(h.results)}")
 
     # h) valid only on a task result: a proactive file posts top level, marker stripped
     h = Harness()
