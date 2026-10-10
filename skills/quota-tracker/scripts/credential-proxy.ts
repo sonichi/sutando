@@ -15,10 +15,17 @@
 import { createServer, type RequestOptions } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { writeFileSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { statusPath } from '../../../src/workspace_default.js';
+import { resolveWorkspace, statusPath } from '../../../src/workspace_default.js';
+import { resolveHostLabel } from '../../../src/util_paths.js';
+import {
+	EMPTY_DM_GATE, decideModel, flushHeld, gateLine, initialState, nextFlushAt, nextState, observationFromHeaders,
+	pushSample, requestPriority, rewriteModel, samplesFromHistoryRows, stateChanged, transitionLine,
+	type DmGate, type DmKind, type FallbackConfig, type FallbackState, type Sample,
+} from './quota-fallback-policy.js';
+import { createConfigReader, OVERRIDE_BASENAME, SKILL_MANIFEST_PATH } from './quota-fallback-config.js';
 
 const PORT = 7846;
 const UPSTREAM = 'https://api.anthropic.com';
@@ -407,6 +414,13 @@ export interface ProxyDeps {
 	// supervised/unsupervised default without process-env/import-order
 	// tricks; production always gets the env-derived value below.
 	giveUpAfter: number;
+	// Model fallback (quota-fallback-policy.ts): config is a reader so an owner
+	// adjustment lands without a restart; state persists in quota-state.json.
+	fallbackConfig: () => FallbackConfig;
+	readFallbackState: () => FallbackState | null;
+	recordFallback: (state: FallbackState) => void;
+	notifyOwner: (line: string) => void;
+	readHistorySamples: (nowMs: number, lookbackSec: number) => Sample[];
 }
 
 export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
@@ -423,9 +437,63 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
 		exitProcess: (code) => process.exit(code),
 		giveUpAfter: REFRESH_GIVE_UP_AFTER,
+		fallbackConfig: productionFallbackConfig,
+		readFallbackState,
+		recordFallback,
+		notifyOwner,
+		readHistorySamples,
 		...overrides,
 	};
 	const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
+
+	// Fallback tier state, seeded from the last persisted record so a proxy
+	// restart keeps its hysteresis; the burn-rate samples seed from the history file.
+	let fallbackState: FallbackState | null = deps.readFallbackState();
+	let samples: Sample[] = [];
+	try { samples = deps.readHistorySamples(deps.now(), deps.fallbackConfig().projection5h.lookbackSec); } catch { samples = []; }
+	let dmGate: DmGate = EMPTY_DM_GATE;
+	let flushTimer: NodeJS.Timeout | null = null;
+
+	// A held line must not wait for the next event: send it when its interval elapses.
+	function scheduleFlush(): void {
+		const intervalMs = deps.fallbackConfig().dmMinIntervalSec * 1000;
+		const due = nextFlushAt(dmGate, intervalMs);
+		if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+		if (due === null) return;
+		flushTimer = setTimeout(() => {
+			flushTimer = null;
+			const r = flushHeld(dmGate, deps.now(), deps.fallbackConfig().dmMinIntervalSec * 1000);
+			dmGate = r.gate;
+			if (r.send) { try { deps.notifyOwner(r.send); } catch { /* best effort */ } }
+			scheduleFlush();
+		}, Math.max(due - deps.now(), 0) + 50);
+		flushTimer.unref?.();
+	}
+
+	function observeQuota(quotaHeaders: Record<string, string>): void {
+		const cfg = deps.fallbackConfig();
+		const nowMs = deps.now();
+		const obs = observationFromHeaders(quotaHeaders);
+		if (obs.u5 !== null) samples = pushSample(samples, { t: nowMs, u5: obs.u5, r5: obs.r5 }, cfg.projection5h.lookbackSec);
+		const prev = fallbackState;
+		const next = nextState(prev, obs, cfg, nowMs, samples);
+		const changed = stateChanged(prev, next);
+		const line = transitionLine(prev, next, cfg);
+		fallbackState = next;
+		if (changed) {
+			console.log(`${ts()} [Fallback] tier ${next.tier} (low-priority ${next.low_priority_tier}): ${next.reason}${next.runtime_switch ? ` runtime_switch→${next.runtime_switch.to}` : ''}`);
+			try { deps.recordFallback(next); } catch { /* best effort */ }
+		}
+		if (line) {
+			const switched = (next.runtime_switch?.to ?? null) !== (prev?.runtime_switch?.to ?? null);
+			const prevTier = prev?.tier ?? 1;
+			const kind: DmKind = switched ? 'runtime' : next.tier > prevTier ? 'escalation' : next.tier === 1 ? 'recovery' : 'lateral';
+			const gated = gateLine(dmGate, kind, line, nowMs, cfg.dmMinIntervalSec * 1000);
+			dmGate = gated.gate;
+			if (gated.send) { try { deps.notifyOwner(gated.send); } catch { /* best effort */ } }
+			else { console.log(`${ts()} [Fallback] DM held (${kind} within ${cfg.dmMinIntervalSec}s): ${line}`); scheduleFlush(); }
+		}
+	}
 
 	// Single-flight guard: at most one refresh in progress, so concurrent requests
 	// never race to consume/rotate the refresh token twice.
@@ -534,6 +602,19 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 			delete headers['keep-alive'];
 			delete headers['transfer-encoding'];
 
+			// Model fallback: rewrite the body's model to the active tier's model.
+			// The priority marker is ours; it never travels upstream.
+			const priority = requestPriority(req.headers);
+			delete headers['x-sutando-priority'];
+			const requested = requestModel(body);
+			const decision = decideModel(requested, fallbackState, deps.fallbackConfig(), priority);
+			let sendBody: Buffer = body;
+			if (decision.rewritten) {
+				sendBody = rewriteModel(body, decision.model);
+				headers['content-length'] = sendBody.length;
+				console.log(`${ts()} [Fallback] ${requested} → ${decision.model} (tier ${fallbackState?.tier ?? 1}${priority === 'low' ? ', low priority' : ''})`);
+			}
+
 			const hasClientAuth = !!headers['authorization'] || !!headers['x-api-key'];
 
 			// Read token fresh from keychain each request, refreshing it first if it
@@ -593,7 +674,8 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 						}
 						if (Object.keys(quotaHeaders).length > 0) {
 							console.log(`${ts()} [Quota]`, quotaHeaders);
-							deps.updateQuotaState(quotaHeaders, requestModel(body));
+							deps.updateQuotaState(quotaHeaders, requestModel(sendBody));
+							observeQuota(quotaHeaders);
 						}
 
 						if (upRes.statusCode === 401 && injectedToken && attempt === 0) {
@@ -638,7 +720,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 							});
 							upRes.on('end', () => {
 								const snippet = redactForLog(Buffer.concat(rejChunks).toString('utf8').slice(0, REJECTION_SNIPPET_BYTES));
-								const model = requestModel(body);
+								const model = requestModel(sendBody);
 								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url} model=${model || '?'} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
 								try {
 									deps.recordRejection({
@@ -680,7 +762,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					if (!res.writableEnded) upstream.destroy();
 				});
 
-				upstream.write(body);
+				upstream.write(sendBody);
 				upstream.end();
 			};
 
@@ -713,6 +795,64 @@ function recordRejection(rej: RejectionRecord): void {
 		const prev = readQuotaFile();
 		writeQuotaFile({ ...prev, recent_rejections: appendRejection(prev.recent_rejections, rej) });
 	} catch { /* best effort */ }
+}
+
+/** The owner's per-host override; the same label the shell's fallback-config.py resolves. Resolved once. */
+let overridePath: string | null = null;
+export function productionOverridePath(): string {
+	overridePath ??= join(resolveWorkspace(), 'hosts', resolveHostLabel(), OVERRIDE_BASENAME);
+	return overridePath;
+}
+
+// Lazy: resolving the host label (scutil) and reading the override belong to a
+// running proxy, not to importing this module.
+let fallbackReader: (() => FallbackConfig) | null = null;
+function productionFallbackConfig(): FallbackConfig {
+	fallbackReader ??= createConfigReader({ manifestPath: SKILL_MANIFEST_PATH, overridePath: productionOverridePath(), env: process.env });
+	return fallbackReader();
+}
+
+// The persisted record may predate a field; each window is filled from the
+// initial shape so arithmetic on it never sees undefined.
+function readFallbackState(): FallbackState | null {
+	const f = readQuotaFile().fallback as Partial<FallbackState> | undefined;
+	if (!f || typeof f !== 'object' || typeof f.tier !== 'number' || !f.windows || typeof f.windows !== 'object') return null;
+	const init = initialState(Date.now());
+	return {
+		...init, ...f,
+		windows: {
+			'5h': { ...init.windows['5h'], ...(f.windows['5h'] ?? {}) },
+			'7d': { ...init.windows['7d'], ...(f.windows['7d'] ?? {}) },
+		},
+	} as FallbackState;
+}
+
+function recordFallback(state: FallbackState): void {
+	try {
+		const prev = readQuotaFile();
+		writeQuotaFile({ ...prev, fallback: state });
+	} catch { /* best effort */ }
+}
+
+// One owner-DM line per transition: a proactive result file, published by
+// rename so a drain never claims a half-written body.
+function notifyOwner(line: string): void {
+	const dir = join(resolveWorkspace(), 'results');
+	mkdirSync(dir, { recursive: true });
+	const name = `proactive-quota-fallback-${Date.now()}.txt`;
+	const tmp = join(dir, `.${name}.tmp`);
+	writeFileSync(tmp, `${line}\n`);
+	renameSync(tmp, join(dir, name));
+}
+
+function readHistorySamples(nowMs: number, lookbackSec: number): Sample[] {
+	try {
+		const rows = readFileSync(statusPath('quota-history.jsonl'), 'utf8').split('\n').filter(Boolean)
+			.map((l) => { try { return JSON.parse(l) as unknown; } catch { return null; } });
+		return samplesFromHistoryRows(rows, nowMs, lookbackSec);
+	} catch {
+		return [];
+	}
 }
 
 // Terminal credential health for the desktop app's banner: 'exhausted' means
@@ -751,7 +891,8 @@ function updateQuotaState(headers: Record<string, string>, model = ''): void {
 				credential_state_detail: prev.credential_state_detail,
 				credential_state_at: prev.credential_state_at,
 			} : {}),
-		};
+			...(prev.fallback && typeof prev.fallback === 'object' ? { fallback: prev.fallback } : {}),
+			};
 
 		// Parse specific headers
 		const status5h = headers['anthropic-ratelimit-unified-5h-status'];
@@ -791,6 +932,11 @@ if (isMain) {
 		process.exit(1);
 	}
 	console.log(`${ts()} [Proxy] OAuth token loaded from keychain (will re-read on each request)`);
+	const fb = productionFallbackConfig();
+	console.log(`${ts()} [Fallback] ${fb.enabled ? 'on' : 'off'}: 5h level1 ${fb.thresholds['5h'].level1}/level2 ${fb.thresholds['5h'].level2}` +
+		` (projection ${fb.projection5h.enabled ? `on, limit ${fb.projection5h.limit}` : 'off'}), 7d level1 ${fb.thresholds['7d'].level1}/level2 ${fb.thresholds['7d'].level2}` +
+		`, hysteresis ${fb.hysteresis}, → ${fb.level2Model} / ${fb.level3Model}, low-priority ${fb.lowPriorityEnabled ? 'on' : 'off'}`);
+	console.log(`${ts()} [Fallback] owner override: ${productionOverridePath()} (per host — fallback-config.py must resolve the same SUTANDO_HOST_LABEL as this process)`);
 
 	createProxyServer().listen(PORT, '127.0.0.1', () => {
 		console.log(`${ts()} [Proxy] Credential proxy → http://localhost:${PORT}`);

@@ -5976,6 +5976,97 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     return check
 
 
+def check_quota_model_fallback(fresh_sec: int = 1800) -> dict:
+    """The credential proxy's model-fallback tier (quota-state.json `fallback`): warn while
+    a tier is active, fail on a pending Codex switch request, ok when stale or already reset."""
+    check = {"name": "quota-model-fallback", "status": "ok"}
+    path = status_read_path("quota-state.json", WORKSPACE_DIR)
+    if not path.exists():
+        check["detail"] = "no quota-state.json (absence handled by quota-telemetry)"
+        return check
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        check["status"] = "warn"
+        check["detail"] = "quota-state.json present but unreadable"
+        return check
+    fb = data.get("fallback") if isinstance(data, dict) else None
+    if not isinstance(fb, dict):
+        check["detail"] = "primary models — no fallback record yet (the proxy writes one on its first quota headers)"
+        return check
+
+    # Only Claude traffic through the proxy refreshes the record: an old one says
+    # nothing about now, and a tier whose window has reset since is already over.
+    now = time.time()
+    age_sec = None
+    try:
+        from datetime import datetime
+        age_sec = now - datetime.fromisoformat(str(data.get("last_checked")).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        pass
+    stale = age_sec is None or age_sec > fresh_sec
+    age_note = f"{int(age_sec / 60)}m old" if age_sec is not None else "of unknown age"
+    windows = fb.get("windows") if isinstance(fb.get("windows"), dict) else {}
+
+    def reset_passed(names) -> "str | None":
+        """The latest reset epoch among `names` as a time, when every one has passed."""
+        epochs = []
+        for w in names:
+            ws = windows.get(w) if isinstance(windows.get(w), dict) else {}
+            try:
+                epochs.append(float(ws.get("reset")))
+            except (TypeError, ValueError):
+                return None
+        if epochs and all(e < now for e in epochs):
+            return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(max(epochs)))
+        return None
+
+    switch = fb.get("runtime_switch")
+    if isinstance(switch, dict) and switch.get("to") == "codex":
+        if stale:
+            check["detail"] = (f"Codex switch requested at {switch.get('at')} but the record is {age_note} — no Claude "
+                               "traffic through the proxy since (switched already, or idle); not alerting")
+            return check
+        passed = reset_passed(["5h"])
+        if passed:
+            check["detail"] = f"Codex switch requested at {switch.get('at')}; the 5h window reset at {passed} has passed since — cleared"
+            return check
+        check["status"] = "fail"
+        check["detail"] = (
+            f"Claude quota rejected — Codex runtime switch requested at {switch.get('at')}. "
+            "The proxy only records the request; switch manually: set core.runtime=codex in "
+            "sutando.config.local.json and run `bash src/agent/start-cli.sh --restart` from outside "
+            "the core session. No Claude model is swapped: they all share the rejected quota."
+        )
+        return check
+    tier = fb.get("tier")
+    models = fb.get("active_model_map") if isinstance(fb.get("active_model_map"), dict) else {}
+    mapped = ", ".join(f"{k}→{v}" for k, v in sorted(models.items()))
+    low = fb.get("low_priority_tier")
+    if tier in (2, 3):
+        at_tier = [w for w, ws in windows.items() if isinstance(ws, dict) and ws.get("tier") == tier]
+        if stale:
+            check["detail"] = (f"model fallback tier {tier} recorded ({fb.get('reason')}) but the record is {age_note} — "
+                               "no Claude traffic through the proxy since; stale, not alerting")
+            return check
+        passed = reset_passed(at_tier) if at_tier else None
+        if passed:
+            check["detail"] = f"model fallback tier {tier} recorded ({fb.get('reason')}) but its window reset at {passed} has passed — cleared"
+            return check
+        check["status"] = "warn"
+        check["detail"] = (
+            f"model fallback tier {tier} since {fb.get('since')}: {fb.get('reason')}; "
+            f"rewriting {mapped or 'nothing'}. Reverts on hysteresis or a window reset "
+            "(skills/quota-tracker/SKILL.md → Model fallback)."
+        )
+        return check
+    if isinstance(low, int) and low > 1:
+        check["detail"] = f"primary models for normal traffic; low-priority traffic at tier {low} ({fb.get('reason')})"
+        return check
+    check["detail"] = f"primary models (tier 1): {fb.get('reason')}"
+    return check
+
+
 def _window_summary(windows: dict) -> str:
     """Owner-facing per-window line. overage is a flag, not a budget: rendering
     it as `0%` reads as a third window with headroom."""
@@ -12924,6 +13015,9 @@ def run_all_checks() -> list[dict]:
     # A credits/overage rejection leaves every unified-status header "allowed",
     # so the check above cannot see it; the proxy's ledger is the only record.
     checks.append(check_core_request_rejections())
+    # Which models requests actually run on while quota is high, and the
+    # rejected → Codex request the proxy can only signal.
+    checks.append(check_quota_model_fallback())
 
     # G1.5: which Node would JS services resolve to (bundled/app-bundle/
     # system), red when none — the silent-dead-services failure class.
