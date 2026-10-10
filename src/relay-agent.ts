@@ -1,8 +1,8 @@
 /**
  * Sutando's relay agent: the voice side's task manager between the voice model and the core, run
- * as the bodhi subagent behind the `work` tool (a Gemini async, NON_BLOCKING tool). Each `work`
- * call waits for its task's result and returns it as the function response, so Gemini decides
- * when to say it and which call it answers. It keeps a table of every task the user asked for by
+ * as the bodhi subagent behind the `work` tool. The model hears the tool's pending message at once;
+ * each `work` call waits for its task's result and returns it, and bodhi hands it to the model as a
+ * system notification when the model is idle. It keeps a table of every task the user asked for by
  * voice (what, when, cancel asked, how its result reached the user, which result answered it) and
  * answers from it; a result whose call is gone is delivered another way and reconciled.
  */
@@ -176,15 +176,12 @@ export interface RelayAgentDeps {
 interface Waiter {
 	resolve: (text: string) => void;
 	reject: (err: Error) => void;
-	/** The session replaced the connection this call was made on: its response would be dropped. */
-	stale: boolean;
 }
 
 /**
  * The `work` subagent. `invoke` submits the task and, unless the status is the answer (a duplicate,
- * a rejection, the fast path), waits for the task's result and returns it as the function response.
- * `offerResult` hands a landed result to its waiting call; it refuses (the caller delivers another
- * way) when no call waits, or when the call's connection was replaced (`detachAll`).
+ * a rejection, the fast path), waits for the task's result and returns it. `offerResult` hands a
+ * landed result to its waiting call; it refuses (the caller delivers another way) when no call waits.
  */
 export class RelayAgent implements PersistentSubagentInstance {
 	readonly key = 'relay-agent';
@@ -196,12 +193,12 @@ export class RelayAgent implements PersistentSubagentInstance {
 		const submitted = await this.deps.submit(args);
 		const taskId = submitted.taskId;
 		if (submitted.status !== 'pending' || typeof taskId !== 'string') return JSON.stringify(submitted);
-		// The ordinary "working on it" is the model's own; a queue position or an offline core is said now.
+		// The ordinary "working on it" is the tool's pending message; a queue position or an offline core is said now.
 		const unusual = (typeof submitted.queuedAhead === 'number' && submitted.queuedAhead > 0) || submitted.watcherOnline === false;
 		if (unusual && typeof submitted.message === 'string') this.deps.notice?.(framedSystem(submitted.message));
 		if (signal?.aborted) throw new Error('aborted');
 		return new Promise<string>((resolve, reject) => {
-			const waiter: Waiter = { resolve, reject, stale: false };
+			const waiter: Waiter = { resolve, reject };
 			this.waiting.set(taskId, waiter);
 			signal?.addEventListener('abort', () => {
 				if (this.waiting.get(taskId) !== waiter) return;
@@ -212,27 +209,13 @@ export class RelayAgent implements PersistentSubagentInstance {
 		});
 	}
 
-	/** The session opened a fresh connection: responses to calls made before it would be dropped. */
-	detachAll(): void {
-		for (const [taskId, waiter] of this.waiting) {
-			if (waiter.stale) continue;
-			waiter.stale = true;
-			this.deps.log?.(`[RelayAgent] ${taskId}: its call's connection was replaced; the result will be delivered another way`);
-		}
-	}
-
-	/** A result landed. True when its call is waiting on a live connection and now returns it. */
+	/** A result landed. True when its call is waiting and now returns it. */
 	offerResult(item: ResultItem): boolean {
 		const taskId = item.taskId;
 		if (!taskId) return false;
 		const waiter = this.waiting.get(taskId);
 		if (!waiter) return false;
 		this.waiting.delete(taskId);
-		if (waiter.stale) {
-			// Its response would be fenced off; end the call quietly and let the caller deliver.
-			waiter.resolve(JSON.stringify({ status: 'delivered_separately', taskId }));
-			return false;
-		}
 		for (const id of [taskId, ...(item.alsoFor ?? [])]) this.deps.store.set(id, 'injected');
 		waiter.resolve(frameResult(item));
 		// The tasks answered in this result wait on calls whose own result never comes: end them.

@@ -186,9 +186,6 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		deliverElsewhere(item);
 	};
 
-	// A fresh provider connection drops responses to calls made on the old one.
-	session.eventBus.subscribe('session.reconnectBoundary', () => opts.relay.detachAll());
-
 	startResultWatcher((result, deliveryNote, meta) => {
 		deliver({ text: result, note: deliveryNote, taskId: meta?.taskId, ...answering(meta?.taskId) });
 	}, () => session.clientConnected);

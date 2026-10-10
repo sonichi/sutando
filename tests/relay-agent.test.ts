@@ -81,16 +81,6 @@ describe('relay agent subagent: the work call returns its task\'s result', () =>
 		assert.equal(store.get('task-6')?.delivery, undefined);
 	});
 
-	it('after a fresh connection the waiting call ends quietly and the result is delivered another way', async () => {
-		const { relay, store } = agent(pending('task-7'));
-		const call = relay.invoke('w', {});
-		await tick(0);
-		relay.detachAll();
-		assert.equal(relay.offerResult({ text: 'result', taskId: 'task-7' }), false, 'its response would be dropped');
-		assert.match(await call, /delivered_separately/);
-		assert.equal(store.get('task-7')?.delivery, undefined, 'recorded by the path that delivers it');
-	});
-
 	it('a result answering several tasks ends their waiting calls too, and records them all', async () => {
 		const store = createVoiceTaskStore(join(TMP, `multi-${Math.random()}.json`));
 		const ids = ['task-a', 'task-b', 'task-c'];
@@ -343,16 +333,15 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 });
 
 describe('voice runs every work call through the relay agent', () => {
-	it('work is an async (NON_BLOCKING) background tool mapped to the relay agent subagent', () => {
+	it('work is a background tool mapped to the relay agent subagent; the model hears the pending message at once', () => {
 		assert.equal(tb.workTool.execution, 'background');
-		assert.equal(tb.workTool.behavior, 'NON_BLOCKING');
-		assert.equal(tb.workTool.pendingMessage, undefined, 'the result is the call\'s response, not a notification');
+		assert.equal(tb.workTool.pendingMessage, tb.WORK_PENDING_MESSAGE, 'without it the model says nothing until the result');
+		assert.equal(tb.workTool.behavior, undefined);
 		const voice = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/voice-agent.ts'), 'utf-8');
 		assert.match(voice, /subagentConfigs: \{ work: relayAgentSubagentConfig\(relayAgent\) \},/);
 		assert.match(voice, /wireDurableChannels\(session, \{ [^}]*relay: relayAgent \}\);/);
 		const runtime = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/live-agent-runtime.ts'), 'utf-8');
 		assert.match(runtime, /if \(opts\.relay\.offerResult\(item\)\)/);
-		assert.match(runtime, /subscribe\('session\.reconnectBoundary', \(\) => opts\.relay\.detachAll\(\)\)/);
 	});
 });
 

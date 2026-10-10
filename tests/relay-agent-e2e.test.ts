@@ -69,19 +69,6 @@ describe('relay agent end to end', () => {
 		assert.ok(heard(id));
 	});
 
-	it('after a fresh connection (reconnect boundary) the result is delivered as a notice instead', async () => {
-		const id = voiceTask('draw a dog');
-		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
-		const call = relay.invoke('Execute tool: work', { task: 'draw a dog' });
-		await tick(0);
-		session.emit('session.reconnectBoundary');
-		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Here is the dog.');
-		assert.match(await call, /delivered_separately/);
-		await until(() => sent.some((t) => t.includes('Here is the dog.')));
-		assert.ok(sent.some((t) => /"draw a dog"[\s\S]*Here is the dog\./.test(t)));
-		assert.ok(heard(id));
-	});
-
 	it('three requests the core answered in one result: all three named to the model, every row heard', async () => {
 		const ids = ['5308', '5309', '5310'].map((pr) => voiceTask(`check PR ${pr}`));
 		writeFileSync(join(TMP, 'results', `${ids[1]}.txt`), `[deduped: ${ids[0]}]`);

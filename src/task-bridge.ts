@@ -1031,9 +1031,9 @@ export const workTool: ToolDefinition = {
 				'a timeout DM that shouldn\'t have gone through.'
 			),
 	}),
-	// Runs as the relay agent subagent, an async (NON_BLOCKING) call whose response is the result.
+	// Runs as the relay agent subagent: the model hears the pending message now, the result when the core finishes.
 	execution: 'background',
-	behavior: 'NON_BLOCKING',
+	pendingMessage: WORK_PENDING_MESSAGE,
 	async execute(args) {
 		const { task, timeout_minutes, dm_on_timeout } = args as {
 			task: string;
