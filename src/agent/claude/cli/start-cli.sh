@@ -621,7 +621,7 @@ fi
 
 # Auto-install tmux via Homebrew if missing. Sutando.app's
 # watcher-auto-restart depends on a tmux-wrapped CLI pane.
-if ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
+if [ -z "$WITNESS" ] && ! command -v tmux > /dev/null 2>&1 && command -v brew > /dev/null 2>&1; then
   echo "tmux not found — installing via Homebrew (~30s, required for Sutando.app watcher-auto-restart)..."
   brew install tmux 2>&1 | tail -3
 fi
@@ -639,6 +639,8 @@ fi
 
 # Fall back to a bare `exec claude` if tmux is still missing.
 if ! command -v tmux > /dev/null 2>&1; then
+  # A witness exists only on its own tmux server; a bare claude here would be unstoppable.
+  [ -z "$WITNESS" ] || witness_refuse "tmux vanished before launch; clean up with --witness-stop $WITNESS"
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
   [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ] && cd "$SUTANDO_CLAUDE_WORKING_DIR"
@@ -688,6 +690,7 @@ apply_claude_tmux_defaults
 if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
   if ! launch_claude_session; then
+    [ -z "$WITNESS" ] || witness_record_launch || true
     echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1
@@ -695,6 +698,7 @@ if [ -t 1 ]; then
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_task_notifier   # the supervisor needs the core session to exist first
+  [ -z "$WITNESS" ] || witness_record_launch || true
   ensure_core_heartbeat
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
@@ -703,6 +707,7 @@ else
   # exits 0 and Sutando.app reports "Core restarted" while nothing is serving —
   # the same false-success class as the --restart kill race above.
   if ! launch_claude_session; then
+    [ -z "$WITNESS" ] || witness_record_launch || true
     echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1
@@ -713,6 +718,7 @@ else
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   ensure_task_notifier
+  [ -z "$WITNESS" ] || witness_record_launch || true
   ensure_core_heartbeat
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal

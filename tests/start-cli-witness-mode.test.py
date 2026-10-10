@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -99,7 +100,33 @@ class Harness:
 
     def witness(self, name: str):
         base = Path(os.path.realpath(self.tmp)) / "sutando-witness" / name
-        return base, base / "tmux.sock", f"witness-{name}-core", base / "workspace"
+        return base, base / "tmux.sock", self.record(name).get("session", ""), base / "workspace"
+
+    def record(self, name: str) -> dict:
+        rec = Path(os.path.realpath(self.tmp)) / "sutando-witness" / name / "witness.env"
+        if not rec.exists():
+            return {}
+        return dict(line.split("=", 1) for line in rec.read_text().splitlines() if "=" in line)
+
+    def shim_dir(self, **shims: str) -> Path:
+        """A directory of failing stand-ins, put first on PATH for one run."""
+        d = Path(tempfile.mkdtemp(dir=self.td, prefix="shim"))
+        for tool, body in shims.items():
+            (d / tool).write_text("#!/bin/bash\n" + body)
+            (d / tool).chmod(0o755)
+        return d
+
+    def path_without_tmux(self) -> str:
+        """The run PATH with tmux's directory swapped for just a python3."""
+        py = Path(tempfile.mkdtemp(dir=self.td, prefix="py"))
+        (py / "python3").symlink_to(os.path.realpath(sys.executable))
+        path = f"{self.td / 'bin'}:{py}:/usr/bin:/bin:/usr/sbin"
+        if shutil.which("tmux", path=path):
+            raise unittest.SkipTest("tmux is in a system directory on this host")
+        return path
+
+    def server_pid(self, sock) -> int:
+        return int(self.tm(sock, "display-message", "-p", "#{pid}").stdout.strip() or 0)
 
     def run(self, *args, entry="src/agent/claude/cli/start-cli.sh", extra_env=None):
         return subprocess.run(["/bin/bash", str(self.root / entry), *args],
@@ -116,7 +143,7 @@ class Harness:
                          "the decoy production session is gone")
 
     def close(self):
-        for name in ("t1", "t2"):
+        for name in ("t1", "t2", "t3"):
             if self.witness(name)[0].exists():
                 self.run("--witness-stop", name)
         self.tm(self.decoy_sock, "kill-server")
@@ -178,6 +205,15 @@ class WitnessLaunch(unittest.TestCase):
         self.assertNotIn("--chrome", argv)
         self.assertNotIn("/startup", argv)
 
+    def test_session_name_is_unique_to_this_root(self):
+        self.assertRegex(self.session, r"^witness-t1-[0-9]+-core$")
+
+    def test_launch_records_the_processes_it_owns(self):
+        rec = self.h.record("t1")
+        self.assertEqual(int(rec.get("server", "0:").split(":")[0]), self.h.server_pid(self.sock))
+        for role in ("core", "watcher"):
+            self.assertRegex(rec.get(role, ""), r"^[0-9]+:.+", role)
+
     def test_heartbeat_writer_logs_inside_the_witness(self):
         self.assertTrue((self.ws / "logs/core-heartbeat.log").exists(), "heartbeat log went to the shared default")
 
@@ -215,6 +251,60 @@ class WitnessTeardown(unittest.TestCase):
         run = self.h.run("--witness-stop", "t2")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertEqual(cfg.read_text(), '{"workspace": {"path": "/somewhere/else"}}\n')
+
+    def test_stop_with_failing_tmux_keeps_state_and_fails(self):
+        rec = self.h.record("t2")
+        server = self.h.server_pid(self.sock)
+        shims = self.h.shim_dir(tmux="exit 1\n")
+        run = self.h.run("--witness-stop", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotIn("stopped", run.stdout)
+        os.kill(server, 0)
+        self.assertTrue(self.root.exists() and self.sock.exists(), "witness state removed while its server lives")
+        self.assertTrue((self.h.root / "sutando.config.local.json").exists())
+        self.assertEqual(self.h.record("t2"), rec)
+        again = self.h.run("--witness-stop", "t2")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertFalse(self.root.exists())
+
+    def test_stop_without_tmux_keeps_state_and_fails(self):
+        server = self.h.server_pid(self.sock)
+        run = self.h.run("--witness-stop", "t2", extra_env={"PATH": self.h.path_without_tmux()})
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        os.kill(server, 0)
+        self.assertTrue(self.root.exists() and self.sock.exists())
+        self.assertTrue((self.h.root / "sutando.config.local.json").exists())
+
+    def test_stop_with_failing_hash_keeps_the_config(self):
+        shims = self.h.shim_dir(shasum="exit 42\n")
+        run = self.h.run("--witness-stop", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertTrue((self.h.root / "sutando.config.local.json").exists(), "unprovable config deleted")
+        self.assertTrue(self.root.exists(), "the record was dropped before cleanup finished")
+        again = self.h.run("--witness-stop", "t2")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertFalse((self.h.root / "sutando.config.local.json").exists())
+
+    def test_same_name_in_another_root_survives_this_stop(self):
+        other = Harness()
+        try:
+            run = other.run("--witness", "t2")
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            b_root, b_sock, b_session, _ = other.witness("t2")
+            b_claude = int((other.home / "claude.pid").read_text())
+            # This stop's pgrep lists both claudes, as a real host's would.
+            pids = f"{self.h.home}/claude.pid {other.home}/claude.pid"
+            (self.h.td / "bin/pgrep").write_text(
+                '#!/bin/bash\n[ "$*" = "-ax claude" ] || exit 1\n'
+                f'for f in {pids}; do [ -s "$f" ] && echo "$(cat "$f") claude"; done\n')
+            stop = self.h.run("--witness-stop", "t2")
+            self.assertEqual(stop.returncode, 0, stop.stdout + stop.stderr)
+            os.kill(b_claude, 0)
+            self.assertEqual(other.tm(b_sock, "has-session", "-t", f"={b_session}").returncode, 0)
+            self.assertTrue(b_root.exists())
+            self.assertNotEqual(b_session, self.session)
+        finally:
+            other.close()
 
     def test_stop_from_another_checkout_refuses(self):
         other = Harness()
@@ -285,6 +375,20 @@ class WitnessRefusals(unittest.TestCase):
         for name in ("", "../x", "Sutando", "a" * 21, "-x"):
             with self.subTest(name=name):
                 self.assertRefusedCleanly(self.h.run("--witness", name), "name")
+
+    def test_start_without_tmux_refuses(self):
+        run = self.h.run("--witness", "t1", extra_env={"PATH": self.h.path_without_tmux()})
+        self.assertRefusedCleanly(run, "tmux")
+
+    def test_start_with_broken_tmux_refuses(self):
+        shims = self.h.shim_dir(tmux="exit 1\n")
+        run = self.h.run("--witness", "t1", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertRefusedCleanly(run, "tmux")
+
+    def test_start_with_failing_hash_refuses(self):
+        shims = self.h.shim_dir(shasum="exit 42\n")
+        run = self.h.run("--witness", "t1", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertRefusedCleanly(run, "sha")
 
     def test_stop_of_unknown_witness_refuses(self):
         self.assertRefusedCleanly(self.h.run("--witness-stop", "t1"), "no witness")

@@ -1,6 +1,8 @@
 #!/bin/bash
 # --witness <name>: a throwaway core from THIS checkout on its own socket, session and workspace.
-# --witness-stop <name> removes only what it made; every refusal exits 2 before a side effect.
+#
+# --witness-stop <name> removes only what it made, only once its recorded processes are gone (else exit 1,
+# state kept); every refusal exits 2 before a side effect.
 
 WITNESS_DEFAULT_SOCKET="/tmp/sutando-tmux.sock"
 WITNESS_DEFAULT_SESSION="sutando-core"
@@ -9,6 +11,14 @@ witness_refuse() {
   echo "start-cli witness: refusing — $*" >&2
   exit 2
 }
+
+# A stop that could not finish: everything recorded is kept so a rerun can.
+witness_fail() {
+  echo "start-cli witness: stop incomplete — $*; $WITNESS_ROOT is kept, rerun --witness-stop $WITNESS_NAME" >&2
+  exit 1
+}
+
+witness_tmux_usable() { command -v tmux > /dev/null 2>&1 && tmux -V > /dev/null 2>&1; }
 
 # Physical path of a directory that may not exist yet: its nearest existing ancestor
 # is resolved, so /tmp and /private/tmp compare equal.
@@ -25,7 +35,7 @@ witness_physical() {
 # Sets WITNESS_NAME, _ROOT, _WS, _SOCKET, _SESSION, _CONFIG, _RECORD from <name>.
 # The session ends in -core so no witness name is a prefix-match of another's.
 witness_paths() {
-  local name="$1" base
+  local name="$1" base sum
   case "$name" in
     "") witness_refuse "a witness needs a name: --witness <name>" ;;
   esac
@@ -38,7 +48,10 @@ witness_paths() {
   WITNESS_ROOT="$base/sutando-witness/$name"
   WITNESS_WS="$WITNESS_ROOT/workspace"
   WITNESS_SOCKET="$WITNESS_ROOT/tmux.sock"
-  WITNESS_SESSION="witness-$name-core"
+  # The root's checksum in the name keeps a same-name witness under another TMPDIR from matching this one's claude.
+  sum="$(printf '%s' "$WITNESS_ROOT" | cksum | awk '{print $1}')"
+  case "$sum" in ''|*[!0-9]*) witness_refuse "could not checksum $WITNESS_ROOT" ;; esac
+  WITNESS_SESSION="witness-$name-$sum-core"
   WITNESS_CONFIG="$REPO/sutando.config.local.json"
   WITNESS_RECORD="$WITNESS_ROOT/witness.env"
 }
@@ -92,18 +105,62 @@ witness_workspace_has_live_core() {
   [ -n "$(find "$cores" -maxdepth 1 -name '*.alive' -mmin -2 2>/dev/null | head -1)" ]
 }
 
-witness_sha() { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; }
+# Fails unless a real sha256 came back: an empty hash must never prove ownership.
+witness_sha() {
+  local out
+  out="$(shasum -a 256 "$1" 2>/dev/null)" || return 1
+  out="${out%% *}"
+  [[ "$out" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$out"
+}
 
 witness_record_get() { sed -n "s/^$1=//p" "$WITNESS_RECORD" 2>/dev/null | head -1; }
 
+witness_record_set() {
+  sed "/^$1=/d" "$WITNESS_RECORD" > "$WITNESS_RECORD.tmp" && printf '%s=%s\n' "$1" "$2" >> "$WITNESS_RECORD.tmp" \
+    && mv -f "$WITNESS_RECORD.tmp" "$WITNESS_RECORD"
+}
+
+# <pid>:<start time>; the start time keeps a recycled pid from passing as the recorded process.
+witness_proc_id() {
+  local st
+  [ -n "$1" ] || return 1
+  st="$(ps -p "$1" -o lstart= 2>/dev/null)" && [ -n "$st" ] && printf '%s:%s\n' "$1" "$st"
+}
+
+witness_proc_live() {
+  [ -n "$1" ] && [ "$(witness_proc_id "${1%%:*}")" = "$1" ]
+}
+
+# Called by start-cli.sh after launch: the server, core pane, any claude under it, and watcher pane.
+witness_record_launch() {
+  local pid id
+  pid="$(tmux -S "$TMUX_SOCKET" display-message -p -t "=$SESSION" '#{pid}' 2>/dev/null)"
+  id="$(witness_proc_id "$pid")" && witness_record_set server "$id"
+  pid="$(tmux -S "$TMUX_SOCKET" list-panes -t "=$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  if id="$(witness_proc_id "$pid")"; then
+    witness_record_set core "$id"
+    for pid in $(claude_named_pids); do
+      [ "$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')" = "${id%%:*}" ] || continue
+      id="$(witness_proc_id "$pid")" && witness_record_set core_claude "$id"
+    done
+  fi
+  pid="$(tmux -S "$TMUX_SOCKET" list-panes -t "=$WATCHER_SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  id="$(witness_proc_id "$pid")" && witness_record_set watcher "$id"
+  return 0
+}
+
 witness_start() {
-  local name="$1" ws0 ccd py
+  local name="$1" ws0 ccd py sha
   witness_paths "$name"
   witness_assert_not_production "$WITNESS_SOCKET" "$WITNESS_SESSION" \
     "${SUTANDO_TMUX_SOCKET:-}" "${SUTANDO_TMUX_SESSION:-}"
   witness_assert_linked_worktree
   [ -e "$WITNESS_ROOT" ] && witness_refuse "witness '$name' already exists at $WITNESS_ROOT; stop it first: --witness-stop $name"
   [ -e "$WITNESS_CONFIG" ] && witness_refuse "$WITNESS_CONFIG exists; witness mode writes its own and will not overwrite or share one"
+  witness_tmux_usable || witness_refuse "tmux is missing or not runnable; a witness runs only on its own tmux server"
+  witness_sha "$REPO/src/agent/claude/cli/witness-mode.sh" > /dev/null \
+    || witness_refuse "no usable sha256 (shasum); stop could not prove the config it writes is its own"
   ws0="$(witness_resolved_workspace)"
   [ -n "$ws0" ] || witness_refuse "could not resolve this checkout's workspace"
   witness_workspace_has_live_core "$ws0" \
@@ -129,12 +186,16 @@ with open(os.environ["_out"], "x") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")
 PY
+  if ! sha="$(witness_sha "$WITNESS_CONFIG")"; then
+    rm -f "$WITNESS_CONFIG"; rm -rf "$WITNESS_ROOT"
+    witness_refuse "no usable sha256 (shasum) to record $WITNESS_CONFIG's ownership; nothing was launched"
+  fi
   {
     echo "repo=$REPO"
     echo "socket=$WITNESS_SOCKET"
     echo "session=$WITNESS_SESSION"
     echo "workspace=$WITNESS_WS"
-    echo "config_sha=$(witness_sha "$WITNESS_CONFIG")"
+    echo "config_sha=$sha"
   } > "$WITNESS_RECORD"
 
   if [ "$(witness_resolved_workspace)" != "$WITNESS_WS" ]; then
@@ -168,11 +229,12 @@ witness_enter() {
   [ "${SUTANDO_WORKSPACE_DIR:-}" = "$WITNESS_WS" ] || witness_refuse "the launch env does not name the witness workspace"
   witness_assert_not_production "$SUTANDO_TMUX_SOCKET" "$SUTANDO_TMUX_SESSION"
   [ "$(witness_resolved_workspace)" = "$WITNESS_WS" ] || witness_refuse "this checkout no longer resolves to the witness workspace"
+  witness_tmux_usable || witness_refuse "tmux is missing or not runnable; stop this witness: --witness-stop $1"
   WITNESS="$1"
 }
 
 witness_stop() {
-  local name="$1" py pids _ pid args
+  local name="$1" py server role proc left="" want have _
   witness_paths "$name"
   witness_assert_not_production "$WITNESS_SOCKET" "$WITNESS_SESSION"
   [ -f "$WITNESS_RECORD" ] || witness_refuse "no witness '$name' at $WITNESS_ROOT"
@@ -188,24 +250,46 @@ witness_stop() {
       SUTANDO_TMUX_SOCKET="$WITNESS_SOCKET" SUTANDO_TMUX_SESSION="$WITNESS_SESSION" \
       "$py" "$REPO/src/core_heartbeat.py" --stop > /dev/null 2>&1 || true
   fi
-  if command -v tmux > /dev/null 2>&1 && [ -S "$WITNESS_SOCKET" ]; then
-    tmux -S "$WITNESS_SOCKET" kill-server 2>/dev/null || true
+  server="$(witness_record_get server)"
+  if [ -z "$server" ] && [ -S "$WITNESS_SOCKET" ] && witness_tmux_usable; then
+    server="$(witness_proc_id "$(tmux -S "$WITNESS_SOCKET" display-message -p '#{pid}' 2>/dev/null)")" || server=""
   fi
-  # A claude that outlived its pane: only the one carrying this exact witness session name.
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    pids=""
-    while read -r pid _; do
-      [ -n "$pid" ] || continue
-      args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-      case "$args " in *" --name $WITNESS_SESSION "*) pids="$pids $pid" ;; esac
-    done < <(pgrep -ax claude 2>/dev/null || true)
-    [ -n "$pids" ] || break
-    # shellcheck disable=SC2086
-    kill $pids 2>/dev/null || true
-    sleep 0.5
+  if witness_proc_live "$server" || [ -S "$WITNESS_SOCKET" ]; then
+    if witness_tmux_usable; then
+      tmux -S "$WITNESS_SOCKET" kill-server 2>/dev/null || echo "  ⚠ tmux kill-server failed on $WITNESS_SOCKET" >&2
+    else
+      echo "  ⚠ tmux is missing or not runnable; cannot stop the server on $WITNESS_SOCKET" >&2
+    fi
+  fi
+  for _ in $(seq 1 25); do witness_proc_live "$server" || break; sleep 0.2; done
+  witness_proc_live "$server" && witness_fail "the witness tmux server (pid ${server%%:*}) is still running"
+  if [ -S "$WITNESS_SOCKET" ]; then
+    if ! witness_tmux_usable; then
+      [ -n "$server" ] || witness_fail "no recorded server and no tmux to prove $WITNESS_SOCKET is dead"
+    elif tmux -S "$WITNESS_SOCKET" list-sessions > /dev/null 2>&1; then
+      witness_fail "a tmux server still answers on $WITNESS_SOCKET"
+    fi
+  fi
+  # Only the processes this witness recorded at launch; a recycled pid fails the start-time check.
+  for role in core_claude core watcher; do
+    proc="$(witness_record_get "$role")"
+    witness_proc_live "$proc" && { kill "${proc%%:*}" 2>/dev/null || true; }
   done
+  for _ in $(seq 1 25); do
+    left=""
+    for role in core_claude core watcher; do
+      proc="$(witness_record_get "$role")"
+      witness_proc_live "$proc" && left="$left $role=${proc%%:*}"
+    done
+    [ -n "$left" ] || break
+    sleep 0.2
+  done
+  [ -z "$left" ] || witness_fail "recorded witness processes still running:$left"
   if [ -f "$WITNESS_CONFIG" ]; then
-    if [ "$(witness_sha "$WITNESS_CONFIG")" = "$(witness_record_get config_sha)" ]; then
+    want="$(witness_record_get config_sha)"
+    if ! [[ "$want" =~ ^[0-9a-f]{64}$ ]] || ! have="$(witness_sha "$WITNESS_CONFIG")"; then
+      witness_fail "no usable sha256 to prove $WITNESS_CONFIG is the witness's own; it is left in place"
+    elif [ "$have" = "$want" ]; then
       rm -f "$WITNESS_CONFIG"
     else
       echo "  ⚠ $WITNESS_CONFIG changed since the witness wrote it — left in place" >&2

@@ -133,11 +133,11 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
   ```bash
   bash src/agent/start-cli.sh --witness pr<N>        # own tmux socket/session, own temp workspace
   # drop tasks into the workspace it prints (tasks/), read results/, attach with the printed tmux line
-  bash src/agent/start-cli.sh --witness-stop pr<N>   # kills only that tmux server, removes its files
+  bash src/agent/start-cli.sh --witness-stop pr<N>   # stops only what it recorded; keeps its files and exits 1 if any survive
   ```
 
-  It refuses to run from a main checkout, over an existing local config, or beside a live core in the
-  checkout's workspace. It skips the supervisor monitor/relay and the owner's surfaces (remote
+  It refuses to run from a main checkout, over an existing local config, without a runnable tmux or
+  sha256, or beside a live core in the checkout's workspace. It skips the supervisor monitor/relay and the owner's surfaces (remote
   control, Chrome), and boots with a witness prompt instead of `/startup`, so no crons register.
 
   **Pinning `workspace.path` is not always enough, and the failure is silent.** Some probes derive
