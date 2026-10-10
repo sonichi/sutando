@@ -568,6 +568,61 @@ class GateCapabilitySkipIsAnnounced(unittest.TestCase):
         self.assertIn("gate capability NOT CHECKED", buf.getvalue())
 
 
+
+class AskWithoutPrUrlMustNameItsRepo(unittest.TestCase):
+    """A patch reviewed before it is a PR still lives in a repo the reviewer may not see."""
+
+    def _run(self, argv_extra, caps=None, message="patch in room context"):
+        m = _load()
+        seen = []
+        m.gate_capability = lambda repo, login: (seen.append(repo),
+                                                 (caps or {}).get(login, (True, "write")))[1]
+        m._github_login = lambda name, roster: (name, "stubbed")
+        m.load_roster = lambda: {"a": {"stand": "@a:x", "room": "!r"},
+                                 "b": {"stand": "@b:x", "room": "!r"}}
+        m.stand_present_in_room = lambda t: (True, "2 members")
+        ok = json.dumps({"ok": True, "event_id": "$e"})
+        m.subprocess = type("S", (), {"run": staticmethod(lambda *a, **k: type(
+            "R", (), {"stdout": ok, "stderr": "", "returncode": 0})()),
+            "TimeoutExpired": Exception})
+        m.record_asks = lambda *a, **k: 1
+        m._stale_repeat_ask = lambda *a, **k: (False, "")
+        buf = io.StringIO()
+        argv = ["nr", "--reviewers", "a,b", "--kind", "ask",
+                "--message", message, *argv_extra]
+        with patch.object(sys, "argv", argv), contextlib.redirect_stderr(buf), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = m.main()
+        return rc, buf.getvalue(), seen
+
+    def test_a_send_with_no_url_and_no_repo_is_refused(self):
+        rc, err, seen = self._run(["--send"])
+        self.assertEqual(rc, 7)
+        self.assertIn("pass --repo OWNER/NAME", err)
+        self.assertEqual(seen, [])
+
+    def test_repo_flag_checks_access_and_drops_a_non_collaborator(self):
+        rc, err, seen = self._run(["--send", "--repo", "o/private"],
+                                  caps={"a": (False, "not a collaborator")})
+        self.assertEqual(seen, ["o/private", "o/private"])
+        self.assertIn("CANNOT GATE 'a': not a collaborator on o/private", err)
+        self.assertNotEqual(rc, 0)
+
+    def test_a_pr_url_in_the_message_wins_over_the_repo_flag(self):
+        rc, err, seen = self._run(["--repo", "o/other"],
+                                  message="see https://github.com/o/r/pull/7")
+        self.assertEqual(seen, ["o/r", "o/r"])
+
+    def test_no_repo_reason_lets_a_repo_free_ask_through_the_gate(self):
+        rc, err, seen = self._run(["--send", "--no-repo", "design question, no code"])
+        self.assertNotIn("pass --repo OWNER/NAME", err)
+        self.assertEqual(seen, [])
+
+    def test_plan_mode_only_announces_the_skip(self):
+        rc, err, seen = self._run([])
+        self.assertIn("gate capability NOT CHECKED", err)
+        self.assertNotIn("REFUSED: pass --repo", err)
+
 class ProbeFailureDefaultsAreDeliberate(unittest.TestCase):
     """Every probe here can fail, and the three defaults disagree on purpose.
 
