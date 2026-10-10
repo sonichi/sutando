@@ -100,6 +100,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`health_snapshot.py`** — Health snapshot — one read-only answer per agent (core and workers) from existing state files.
 - **`hook_transcript_path.sh`** — Shared resolver for a Claude Code hook's transcript path.
 - **`http-body-limit.ts`** — Shared request-body cap for the two HTTP surfaces that accept a vision frame: the web-client's /vision/frame proxy and the voice-agent's vision control server.
+- **`inbox-events.sh`** — Sourceable: start_inbox_events <python> <fifo> <path>...
 - **`inbox-resolve.sh`** — Inbox-entry resolver — sourceable so a test can invoke it in isolation.
 - **`ingress_identity.py`** — Provider-event ingress admission — the shared policy behind Slice 3.
 - **`init.sh`** — Sutando init — idempotent first-run + every-start bootstrap.
@@ -113,6 +114,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-gateway-bridge-launchd.sh`** — Install / uninstall / check the launchd-supervised ag2.space gateway-bridge.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
+- **`line_relay.py`** — Copy stdin to stdout line by line, never letting a slow stdout stall stdin.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.

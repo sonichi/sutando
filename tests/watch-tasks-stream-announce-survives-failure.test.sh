@@ -3,6 +3,8 @@
 # just direct dispatch — a bare-basename fallback re-points the reader at the empty sentinel.
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=fixtures/clean-watcher-env.sh
+. "$REPO/tests/fixtures/clean-watcher-env.sh"
 pass=0; fail=0
 check() { if [ "$1" = "0" ]; then echo "  ok  $2"; pass=$((pass+1)); else echo "  FAIL $2"; fail=$((fail+1)); fi; }
 

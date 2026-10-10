@@ -15,10 +15,13 @@ Run: python3 tests/watch-tasks-stream-priority-sweep.test.py
 from __future__ import annotations
 
 import os
+import sys
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -64,7 +67,7 @@ class Harness:
         return p
 
     def start(self) -> None:
-        env = dict(os.environ)
+        env = clean_env()
         env["PATH"] = f"{self.tmp/'bin'}:{env['PATH']}"
         env["TMPDIR"] = str(self.tmp)
         env["SUTANDO_RESULTS_DIR"] = str(self.ws / "results")
@@ -130,12 +133,13 @@ def test_helper_failure_falls_back_to_mtime_order_instead_of_dropping_the_backlo
     h = Harness()
     try:
         stub_py = h.tmp / "bin" / "stub-python3"
-        stub_py.write_text("#!/bin/sh\nexit 0\n")
+        # A broken helper interpreter; the event relay is a transport, not a helper, so it still streams.
+        stub_py.write_text(f'#!/bin/sh\ncase "$1" in *line_relay.py) exec {sys.executable} "$@" ;; esac\nexit 0\n')
         stub_py.chmod(0o755)
         h.task("task-a3.txt", "urgent", age_s=10)
         h.task("task-b3.txt", "low")
 
-        env = dict(os.environ)
+        env = clean_env()
         env["PATH"] = f"{h.tmp/'bin'}:{env['PATH']}"
         env["TMPDIR"] = str(h.tmp)
         env["SUTANDO_RESULTS_DIR"] = str(h.ws / "results")

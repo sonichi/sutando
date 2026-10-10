@@ -293,7 +293,7 @@ socket.getaddrinfo = _getaddrinfo_prefer_v4
 # the path (no repo-walking; the old triple-parent form predated the move into
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
-from .task_archive import find_task_file
+from .task_archive import deliveries_root_for, find_task_file, retire_delivery_pointers
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
@@ -3715,7 +3715,8 @@ def _archive_result(path: Path, tid: str) -> None:
         try:
             tfile.rename(archive_dir / f"{tid}.txt")
         except OSError:
-            pass  # best-effort; core may have archived it concurrently
+            return  # best-effort; core may have archived it concurrently
+        retire_delivery_pointers(deliveries_root_for(TASKS_DIR), tid, log=_log)
 
 
 # A legacy bare `.sending` claim carries no owner info, so recovery for those

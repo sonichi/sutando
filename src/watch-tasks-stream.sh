@@ -49,6 +49,8 @@ source "$__SCRIPT_DIR/task-emit.sh"
 source "$__SCRIPT_DIR/bounded-wait.sh"
 # shellcheck source=inbox-resolve.sh
 source "$__SCRIPT_DIR/inbox-resolve.sh"
+# shellcheck source=inbox-events.sh
+source "$__SCRIPT_DIR/inbox-events.sh"
 # shellcheck source=agent/task-event-handler-lookup.sh
 source "$__SCRIPT_DIR/agent/task-event-handler-lookup.sh"
 # shellcheck source=tasks-dir-resolve.sh
@@ -661,7 +663,8 @@ handler_result_is_answer() {
   ready="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" find-ready "$RESULTS_DIR" "$filename" 2>/dev/null)" || return 1
   # The FIRST line, anchored: an answer that merely mentions the phrase is an
   # answer, and mistaking it for a refusal re-runs work that already completed.
-  IFS= read -r first < "$ready" || first=""
+  # A last line with no newline still fills $first; read's EOF status must not clear it.
+  IFS= read -r first < "$ready" || true
   case "$first" in "I $TERMINAL_REFUSAL_MARK"*) return 1 ;; esac
   return 0
 }
@@ -853,7 +856,7 @@ dispatch_task() {
   announce="$(task_announce "$resolved")"
   task_path="$resolved"
   filename="$(basename "$task_path")"
-  # A sentinel nothing retires is re-swept after every restart, and resolution
+  # A pointer whose task is not archived yet is re-swept on every restart, and resolution
   # turns that from re-reading an empty file into RE-RUNNING the real task.
   if handler_result_is_answer "$filename"; then
     printf 'already answered, not dispatching again: %s\n' "$announce" >&2
@@ -1058,18 +1061,50 @@ trap 'cleanup; exit 0' HUP INT TERM
 # restart gap, in priority order. Install cleanup first so an immediately
 # exiting fswatch cannot kill a just-started provider before its durable
 # fallback receipt is emitted.
-startup_sweep() {
-  local fn
-  reconcile_dead_claims
-  while IFS= read -r fn; do
-    dispatch_task "$TASKS_DIR/$fn"
+
+# Once per workspace, before the first plan: retire pointers archived before the archive
+# step retired them. Idempotent and per-inbox locked, so a racing watcher is harmless.
+retire_archived_pointers_once() {
+  local marker="$STATE_DIR/migrations/retire-archived-pointers.v1.done" out tmp
+  [ -e "$marker" ] && return 0
+  mkdir -p "$(dirname "$marker")" 2>/dev/null || return 0
+  out="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/task_archive.py" retire-archived-pointers "$WORKSPACE_DIR" 2>&1)" || {
+    echo "watch-tasks-stream: pointer migration failed; it retries on the next start: $out" >&2
+    return 0
+  }
+  case "$out" in *'"retired": 0,'*) ;; *) echo "watch-tasks-stream: pointer migration: $out" >&2 ;; esac
+  tmp="$(mktemp "$marker.XXXXXX")" && printf '%s\n' "$out" > "$tmp" && mv -f "$tmp" "$marker"
+}
+# One process plans the whole inbox; a plan without its done line falls back to every
+# entry. One printf per line, the relay's shape too, keeps each line whole on the FIFO.
+sweep_entries() {
+  local plan line
+  retire_archived_pointers_once
+  plan="$(mktemp "$WATCH_RUNTIME_DIR/sweep-plan.XXXXXX")" || plan=""
+  if [ -n "$plan" ] && "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" sweep-plan \
+       "$TASKS_DIR_ABS" "$RESULTS_DIR" --workspace "$WORKSPACE_DIR" \
+       --race-window "$RESOLVE_RACE_WINDOW_S" --refusal-prefix "I $TERMINAL_REFUSAL_MARK" \
+       --resolver-timeout "${SUTANDO_INBOX_RESOLVER_TIMEOUT:-5}" \
+       ${SUTANDO_INBOX_RESOLVER:+--resolver "$SUTANDO_INBOX_RESOLVER"} > "$plan" \
+     && [ "$(tail -n 1 "$plan")" = "sweep-plan: done" ]; then
+    while IFS= read -r line; do
+      [ "$line" = "sweep-plan: done" ] || printf '%s\n' "$line"
+    done < "$plan"
+    rm -f "$plan"
+    return 0
+  fi
+  [ -z "$plan" ] || rm -f "$plan"
+  echo "watch-tasks-stream: sweep plan failed; sweeping every entry of $TASKS_DIR_ABS" >&2
+  while IFS= read -r line; do
+    printf '%s/%s\n' "$TASKS_DIR_ABS" "$line"
   done < <(priority_sorted_tasks)
 }
-# A session watcher sweeps only once the standby has stopped (below); any other
-# role has no peer on its inbox and sweeps before it subscribes, as always.
-if [ "$WATCHER_ROLE" != "session" ]; then
-  startup_sweep
-fi
+# The sweep feeds the FIFO fswatch writes, so a task arriving mid-sweep is read in
+# arrival order; a file seen by both is admitted once (dispatch_task's identity dedupe).
+startup_sweep() {
+  reconcile_dead_claims
+  ( trap - EXIT HUP INT TERM; exec 3<&-; sweep_entries > "$WATCH_RUNTIME_DIR/events" ) &
+}
 
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file
@@ -1108,12 +1143,7 @@ fi
 FSWATCH_READER_OPEN=""
 FSWATCH_STARTED_AT=0
 launch_fswatch() {
-  fswatch \
-    -l 0.5 \
-    --event Created \
-    --event Renamed \
-    --event Updated \
-    "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
+  start_inbox_events "$SUTANDO_PY_BIN" "$WATCH_RUNTIME_DIR/events" "${fswatch_paths[@]}"
   FSWATCH_PID=$!
   FSWATCH_STARTED_AT="$(date +%s)"
   if [ -z "$FSWATCH_READER_OPEN" ]; then
@@ -1162,6 +1192,11 @@ restart_fswatch() {
 if ! launch_fswatch; then
   echo "watch-tasks-stream: fswatch failed to start; no sentinel written and no standby touched" >&2
   exit 1
+fi
+# A session watcher sweeps only once the standby has stopped (below); a standby has
+# no peer on its inbox and sweeps as soon as it is subscribed.
+if [ "$WATCHER_ROLE" != "session" ]; then
+  startup_sweep
 fi
 
 # One fswatch line. Shared by the readiness replay and the main loop so a line

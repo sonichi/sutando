@@ -33,6 +33,7 @@ CLI, for bash callers with only an interpreter path:
     task_dispatch.py partial-mark <partial_dir> <filename> <incarnation>   # composer text on stdin, optional
     task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1
     task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>]  # prints key<TAB>payload, exit 0/1
+    task_dispatch.py sweep-plan <inbox> <results_dir> [--resolver R --workspace W] [--race-window S] [--refusal-prefix P]
 
 `announced-entry` is the one reading of a watcher's `TASK_FILE:` line: a bare name is a file in
 `tasks_dir`; an absolute path is what a resolver-backed watcher announces (the payload a delivery
@@ -159,6 +160,105 @@ def ready_result_filenames(results_dir: "Path | str", filenames, *,
         if any(reader(c) is not None for c in candidates):
             ready.update(by_id[task_id])
     return ready
+
+
+# Must match the resolver's own `--batch` header (resolve_inbox_entry.BATCH_HEADER).
+RESOLVER_BATCH_HEADER = "resolve-inbox-entry batch v1"
+
+
+def _resolve_batch(resolver: str, workspace: str, entries: "list[str]", timeout: float):
+    """{entry: (rc, payload)} from ONE `--batch` resolver run, or None when that run
+    cannot be trusted (no header, a crash, a timeout): the caller then resolves per entry."""
+    import subprocess
+    try:
+        proc = subprocess.run([resolver, "--batch", "--workspace", workspace],
+                              input="".join(e + "\n" for e in entries), capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = proc.stdout.split("\n")
+    if proc.returncode != 0 or not lines or lines[0] != RESOLVER_BATCH_HEADER:
+        return None
+    out = {}
+    for line in lines[1:]:
+        parts = line.split("\t", 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            out[parts[2]] = (int(parts[0]), parts[1])
+    return out
+
+
+def _is_answer(results_dir: Path, filename: str, live: "set[str]", refusal_prefix: str) -> bool:
+    """The watcher's `handler_result_is_answer`: a live result file, a READY body found by
+    `find_ready_result`, whose first line is not the watcher's own terminal refusal."""
+    if filename not in live or not (results_dir / filename).is_file():
+        return False
+    ready = find_ready_result_for_filename(results_dir, filename)
+    if ready is None:
+        return False
+    if not refusal_prefix:
+        return True
+    try:
+        with open(ready, encoding="utf-8", errors="replace", newline="") as fh:
+            first = fh.readline().rstrip("\n")
+    except OSError:
+        return False
+    return not first.startswith(refusal_prefix)
+
+
+def sweep_plan(inbox: "Path | str", results_dir: "Path | str", *, resolver: "str | None" = None,
+               workspace: str = "", race_window: int = 10, refusal_prefix: str = "",
+               resolver_timeout: float = 5.0, now: "int | None" = None) -> "tuple[list[str], dict]":
+    """The inbox entries a restart sweep must still dispatch, in priority order.
+
+    One process for the whole inbox: entries are resolved by one `--batch` resolver
+    run, an entry whose payload is gone (typed rc 3) past `race_window` is dropped,
+    and an entry already answered is dropped. Every other entry is kept, so the
+    watcher's own per-entry dispatch still decides it; a batch that cannot be read
+    keeps everything, which is the per-entry sweep this replaces.
+    """
+    import time
+    inbox, results_dir = Path(inbox), Path(results_dir)
+    names = [p.name for p in sort_tasks_by_priority(inbox.glob("*.txt"))]
+    counts = {"entries": len(names), "stale": 0, "answered": 0, "batch": "none"}
+    resolved: "dict[str, tuple[int, str]]" = {}
+    if resolver:
+        paths = [str(inbox / n) for n in names if "\n" not in n and "\t" not in n]
+        got = None
+        if os.access(resolver, os.X_OK):
+            got = _resolve_batch(resolver, workspace, paths,
+                                 resolver_timeout + 0.01 * len(paths))
+        if got is None:
+            counts["batch"] = "unavailable"
+            return names, counts
+        counts["batch"] = "ok"
+        resolved = {Path(k).name: v for k, v in got.items()}
+    try:
+        live = set(os.listdir(results_dir))
+    except OSError:
+        live = set()
+    clock = int(time.time()) if now is None else now
+    keep = []
+    for name in names:
+        if not resolver:
+            rc, payload = 0, str(inbox / name)
+        elif name in resolved:
+            rc, payload = resolved[name]
+        else:
+            keep.append(name)
+            continue
+        if rc == 3 and not payload:
+            try:
+                age = clock - int(os.stat(inbox / name).st_mtime)
+            except OSError:
+                age = 0
+            if age > race_window:
+                counts["stale"] += 1
+                continue
+        if rc == 0 and payload.startswith("/") and _is_answer(results_dir, Path(payload).name, live, refusal_prefix):
+            counts["answered"] += 1
+            continue
+        keep.append(name)
+    return keep, counts
 
 
 _WORKER_HOLD_SUFFIXES = (".txt", ".accepted", ".claimed")
@@ -397,6 +497,7 @@ _USAGE = (
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
     "       task_dispatch.py sort-by-priority <tasks_dir>   # every *.txt, no result/claim/delivery filtering\n"
     "       task_dispatch.py priority-tier <task_file>   # prints urgent|normal|low, the file's own header\n"
+    "       task_dispatch.py sweep-plan <inbox> <results_dir> [--resolver R] [--workspace W] [--race-window S] [--refusal-prefix P] [--resolver-timeout S]\n"
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py worker-holds <deliveries_dir> <filename>   # exit 0 held / 1 not / 2 cannot decide\n"
@@ -427,6 +528,48 @@ def _parse_dir_options(rest: list[str]) -> dict:
     return opts
 
 
+# The plan's last stdout line: an exit 0 without it (a stub, a crash after a partial
+# write) is not a plan, and the caller must sweep every entry instead.
+SWEEP_PLAN_DONE = "sweep-plan: done"
+
+
+def _sweep_plan_cli(args: "list[str]") -> int:
+    """Prints `<inbox>/<name>` per entry to dispatch, then SWEEP_PLAN_DONE; the counts
+    go to stderr when the inbox holds anything."""
+    import time
+    if len(args) < 2:
+        print(_USAGE, file=sys.stderr)
+        return 2
+    inbox, results = args[0], args[1]
+    opts = {"--resolver": None, "--workspace": "", "--race-window": "10",
+            "--refusal-prefix": "", "--resolver-timeout": "5"}
+    rest = args[2:]
+    while rest:
+        if rest[0] not in opts or len(rest) < 2:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        opts[rest[0]], rest = rest[1], rest[2:]
+    try:
+        window, timeout = int(opts["--race-window"]), float(opts["--resolver-timeout"])
+    except ValueError:
+        print(_USAGE, file=sys.stderr)
+        return 2
+    started = time.monotonic()
+    keep, counts = sweep_plan(inbox, results, resolver=opts["--resolver"] or None,
+                              workspace=opts["--workspace"], race_window=window,
+                              refusal_prefix=opts["--refusal-prefix"], resolver_timeout=timeout)
+    if counts["entries"]:
+        print(f"watch-tasks-stream: sweep plan over {counts['entries']} entries: "
+              f"{counts['stale']} stale, {counts['answered']} answered, {len(keep)} to dispatch "
+              f"(batch resolve: {counts['batch']}; {int((time.monotonic() - started) * 1000)} ms)",
+              file=sys.stderr, flush=True)
+    base = str(Path(inbox))
+    for name in keep:
+        print(f"{base}/{name}")
+    print(SWEEP_PLAN_DONE)
+    return 0
+
+
 def _main(argv: list[str]) -> int:
     # A pure sort, no eligibility filtering -- the caller still decides
     # whether a file is eligible; this only changes the offered order.
@@ -438,6 +581,8 @@ def _main(argv: list[str]) -> int:
         for name in names:
             print(name)
         return 0 if names else 1
+    if argv and argv[0] == "sweep-plan":
+        return _sweep_plan_cli(argv[1:])
     if argv and argv[0] == "priority-tier":
         if len(argv) != 2:
             print(_USAGE, file=sys.stderr)
