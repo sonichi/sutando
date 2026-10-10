@@ -31,6 +31,8 @@ ROUTING = (
     "Threading a reply to a top-level message is your call: thread when the exchange is better kept out "
     "of the main timeline, e.g. a side discussion of several messages about one item; when unsure, reply "
     "in the timeline. An ask already in a thread is answered in it.",
+    "Decide before the first progress notify and pass it the same root (`--thread-root '<root>'`), so all "
+    "of a task's messages land in one place.",
 )
 # The audience test replaced this: a room's readers, not the data's origin, decide what it may see.
 ROUTING_GONE = ("however personal the topic",)

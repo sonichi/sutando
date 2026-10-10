@@ -329,7 +329,8 @@ Reply in the conversation the request came from: a task with `channel_id`/`sourc
 answered in that room, replying to `source_message_id`. Threading a reply to a top-level message is
 your call: thread when the exchange is better kept out of the main timeline, e.g. a side discussion
 of several messages about one item; when unsure, reply in the timeline. An ask already in a thread
-is answered in it. Two tests apply:
+is answered in it. Decide before the first progress notify and pass it the same root
+(`--thread-root '<root>'`), so all of a task's messages land in one place. Two tests apply:
 
 - **Audience.** In a room with other people (anything but the owner's own DM), post only what they
   are meant to read: a reply to their message, what the owner asked to be posted there, or work the
@@ -351,14 +352,14 @@ room: 'I sent it to you in our DM.' Never move silently.
 - `[channel: <channel-id>]` — first non-empty line only: deliver the rest to that channel instead. Telegram drops it.
 - `[thread: $<root>]` — lead line, after any skip marker: AG2 Space posts the result (task or proactive) in that thread.
 - `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body; detected anywhere, stripped only when alone on its line.
-- `[file: /path]` / `[send: /path]` / `[attach: /path]` — attach the file to the text body.
+- `[file: /path]` / `[send: /path]` / `[attach: /path]` — attach the file.
 
 **Marker parsing is centralised — do not re-implement it.** A Python result consumer MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`; attachments = actions with `kind == "attach"`). Attachment-path authorization is owned by `src/policy/egress/attachment.py` before the upload sink. One-way dependency: `parse_markers() -> send_allowlist.is_path_sendable() -> transport upload`, where `src/send_allowlist.py` is a transition alias. Private copies drift — guarded by `tests/bridge-marker-no-leak.test.py`.
 
 **Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task — keep it unless you need to push a result to a non-delegating consumer. Use the scoped form ONLY when a result needs to be claimed by a pull-side consumer that didn't delegate the work:
 - phone → key built via `phoneCallKey(callSid)` → `phone-<safe(call-sid)>`
 
-**Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix. The per-consumer prefix is code-enforced (single helper, single source of truth) so cross-consumer namespace collisions are impossible regardless of what ID format a future consumer adopts.
+**Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix; one helper enforces it, so consumer namespaces cannot collide.
 
 Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python). Why the scoped name slides past every existing consumer, and how the phone drain claims it: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Per-channel pull namespace".
 

@@ -128,7 +128,9 @@ python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
 For a Slack @mention (threaded reply), add `--thread-ts <ts>` to keep the update in-thread.
 For AG2 Space, pass the task's own `thread_root:` via `--thread-root '<event id>'` only when
 the ask was already in a thread; otherwise pass `--reply-to '<source_message_id>'` to cite it
-in the main timeline instead. Single-quote the id: it starts with `$`, which double quotes
+in the main timeline instead. If you will answer a top-level ask in a thread (`[thread: <root>]`
+on the result), decide before the first notify and pass that same root, e.g.
+`--thread-root '<source_message_id>'` to open the thread on the ask. Single-quote the id: it starts with `$`, which double quotes
 would expand. An empty value opts out of that relation.
 
 ### Field mapping from task files

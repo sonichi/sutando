@@ -215,6 +215,15 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.assertNotIn("thread_root", sent[0])
         self.assertEqual(sent[0]["reply_to"], "$ask")
 
+    def test_explicit_thread_root_opens_a_thread_on_a_top_level_ask(self):
+        # The agent chose to thread its answer: the "On it" opens the thread on the ask itself.
+        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
+                       "source_message_id: $ask\ntask: x\n")
+        rc, sent, _ = self._send(["--task-file", f, "--thread-root", "$ask"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it",
+                                 "thread_root": "$ask", "reply_to": "$ask"}])
+
     def test_thread_root_and_source_message_id_both_sent(self):
         # The two fields are independent, not mutually exclusive (relations.py).
         f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
