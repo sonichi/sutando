@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """owner-agent-consult policy: config, the trusted-task gate, the owner-only room guard,
-roster, one-hop marker, the correlated ask with its pending record, and matching a reply
-(which arrives as a new task) back to that record. Pure over an injected transport, so
+roster, the consult marker and thread, the chain trace and loop check, the correlated ask
+with its pending record, and matching a reply (which arrives as a new task) to that record. Pure over an injected transport, so
 the rules are testable without a gateway; consult.py supplies the room CLI transport.
 
 The transport is any object with:
   members(room) -> {ok, members: [{user_id, display_name, kind}], unidentified: int, reason}
   agents()      -> {ok, agents: [{id, owner, ...}], reason}   (this account's agents)
-  mention(mxid, body, room, reply_to=None) -> {ok, event_id, reason}
+  mention(mxid, body, room, reply_to=None, thread_root=None) -> {ok, event_id, reason}
   read(room, limit) -> {ok, messages: [{sender, body, event_id, ts, in_reply_to?,
                         thread_root?}] newest first, reason}
 
@@ -30,8 +30,8 @@ _SRC = SKILL_DIR.parent.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-# The one definition of the one-hop marker; a task or question carrying it is never consulted onward.
-MARKER = "[owner-agent-consult:v1]"
+# The one definition of the consult marker prefix; ask and answer lines both start with it.
+MARKER = "[owner-agent-consult:v2"
 _MARKER_FAMILY = "[owner-agent-consult:"
 
 CONFIG_ENABLED = "OWNER_AGENT_CONSULT_ENABLED"
@@ -40,7 +40,7 @@ CONFIG_ROOM_CLI = "OWNER_AGENT_CONSULT_ROOM_CLI"
 CONFIG_NUDGE_AFTER = "OWNER_AGENT_CONSULT_NUDGE_AFTER_S"
 DEFAULT_NUDGE_AFTER_S = 600
 NUDGE_FLOOR_S, NUDGE_CEILING_S = 60, 86400
-READ_LIMIT = 30
+READ_LIMIT = 100
 MAX_TASK_BYTES = 256 * 1024
 _FALSE = ("0", "false", "no", "off")
 _MXID = re.compile(r"^@[^:\s]+:[^\s]+$")
@@ -165,7 +165,7 @@ def roster(verdict: dict, self_mxid: str) -> List[dict]:
     return out
 
 
-# Trusted task gate and one-hop marker
+# Trusted task gate
 def carries_marker(text: str) -> bool:
     return _MARKER_FAMILY in (text or "")
 
@@ -227,7 +227,7 @@ def trusted_task(task_id: str, workspace: Optional[Path]) -> dict:
     if any(v.lower() == "true" for v in _header_values(text, "collaborator")):
         return no("task is a collaborator task, not the owner's")
     if carries_marker(text):
-        return no("task is itself a consult; answer it, never consult onward")
+        return no("task is itself a consult, not an owner task; consult onward with --via-task")
     if ltp.find_result(Path(workspace) / "results", task_id) is not None:
         return no("task already has a result; a replayed task cannot consult")
     origin = {k: headers[k] for k in _ORIGIN_KEYS if headers.get(k)}
@@ -260,10 +260,10 @@ def records(workspace: Path, state: str) -> List[dict]:
     return [r for r in out if r and _CID.match(str(r.get("cid") or ""))]
 
 
-def prior_ask(workspace: Path, task_id: str, agent: str) -> Optional[dict]:
-    """The first earlier ask from this task to this agent, pending or answered."""
+def prior_ask(workspace: Path, key: str, value: str) -> Optional[dict]:
+    """The first earlier posted ask whose `key` (task_id, or via_task) is `value`."""
     same = [r for state in ("pending", "answered") for r in records(workspace, state)
-            if r.get("task_id") == task_id and r.get("agent") == agent and r.get("ask_event")]
+            if r.get(key) == value and r.get("ask_event") and r.get("root")]
     return min(same, key=lambda r: r.get("asked_at") or 0) if same else None
 
 
@@ -291,93 +291,273 @@ def mark_nudged(workspace: Path, cid: str, now: Optional[float] = None) -> dict:
     return {"ok": True, "cid": cid, "reason": None}
 
 
-# Correlated ask and its final answer
+# The consult marker: ask line and answer line
 def new_cid() -> str:
     return secrets.token_hex(8)
 
 
+def ask_line(cid: str, root: Optional[str], chain: List[str]) -> str:
+    return f"{MARKER} consult:{cid} root:{root or '-'} chain:{'>'.join(chain)}]"
+
+
 def answer_tag(cid: str) -> str:
-    return f"{_MARKER_FAMILY}v1 answer:{cid}]"
+    return f"{MARKER} answer:{cid}]"
 
 
-_TAG = re.compile(r"^\[owner-agent-consult:v1 answer:([0-9a-f]{16})\]$")
+_ASK = re.compile(rf"^{re.escape(MARKER)} consult:([0-9a-f]{{16}}) root:(\S+) chain:(\S+)\]$")
+_TAG = re.compile(rf"^{re.escape(MARKER)} answer:([0-9a-f]{{16}})\]$")
+_ORIG_HEAD, _CHAIN_HEAD, _ASK_HEAD = "Original question:", "Chain so far:", "Question for "
 
 
-def ask_body(question: str, cid: str, self_mxid: str) -> str:
-    return (f"{MARKER} consult:{cid}\n{question.strip()}\n\n"
-            f"Answer from what you hold in ONE message that replies to this one and @-mentions "
-            f"{self_mxid}, with this as its first line (after the mention):\n"
+def _first_line(body: str) -> tuple:
+    """(first line with any leading @-mention stripped, rest of the body)."""
+    lines = (body or "").strip().split("\n", 1)
+    first = lines[0].strip()
+    lead = first.split(" ", 1)[0]
+    if _MXID.match(lead):
+        first = first[len(lead):].lstrip(" —–-:")
+    return first, (lines[1] if len(lines) > 1 else "")
+
+
+def parse_ask(body: str) -> Optional[dict]:
+    """{cid, root (None on the thread's first ask), chain, original_question} or None.
+    A chain lists distinct mxids, asker first; anything else is not an ask."""
+    first, rest = _first_line(body)
+    m = _ASK.match(first)
+    if not m:
+        return None
+    chain = m.group(3).split(">")
+    if len(chain) < 2 or len(set(chain)) != len(chain) or not all(_MXID.match(a) for a in chain):
+        return None
+    root = None if m.group(2) == "-" else m.group(2)
+    if root is not None and not root.startswith("$"):
+        return None
+    orig = ""
+    if rest.startswith(_ORIG_HEAD):
+        orig = rest[len(_ORIG_HEAD):].split(f"\n{_CHAIN_HEAD}", 1)[0].strip()
+    return {"cid": m.group(1), "root": root, "chain": chain, "original_question": orig}
+
+
+def ask_body(question: str, cid: str, root: Optional[str], chain: List[str], original: str) -> str:
+    asker, target = chain[-2], chain[-1]
+    return (f"{ask_line(cid, root, chain)}\n"
+            f"{_ORIG_HEAD} {original.strip()}\n"
+            f"{_CHAIN_HEAD} {' > '.join(chain)}\n"
+            f"{_ASK_HEAD}{target}: {question.strip()}\n\n"
+            f"Read this thread first. Answer from what you hold with `consult.py answer`, which posts\n"
+            f"ONE message in this thread @-mentioning {asker}, first line exactly\n"
             f"{answer_tag(cid)}\n"
-            "Anything without that line is read as progress, not your answer. "
-            "This is a one-hop consult: do not consult another agent.")
+            "If you consult another agent first, do it with `consult.py ask --via-task`, in this thread; "
+            "never ask an agent already in this consult's chain.")
 
 
+# The consult thread: what every agent reads before it asks or answers
+def thread_view(transport, room: str, root: str) -> dict:
+    """{ok, root_msg, msgs (oldest first)} for the consult thread rooted at `root`,
+    or a refusal when the root is not visible: an unseen thread cannot be checked."""
+    page = transport.read(room, READ_LIMIT)
+    if not page.get("ok"):
+        return {"ok": False, "reason": f"consult room unreadable: {page.get('reason')}"}
+    msgs = [m for m in page.get("messages") or [] if isinstance(m, dict)]
+    root_msg = next((m for m in msgs if m.get("event_id") == root), None)
+    if root_msg is None:
+        return {"ok": False, "reason": f"consult thread root {root} is not in the last {READ_LIMIT} "
+                                       "messages of the consult room; cannot see the whole thread"}
+    inside = [m for m in msgs if m.get("event_id") == root or m.get("thread_root") == root]
+    return {"ok": True, "root_msg": root_msg, "msgs": list(reversed(inside)), "all": msgs}
+
+
+def asks_in(msgs: List[dict], owner_agents) -> List[dict]:
+    """Every ask in the thread posted by its own chain's asker, an agent of the owner."""
+    out = []
+    for m in msgs:
+        a = parse_ask(m.get("body") if isinstance(m.get("body"), str) else "")
+        if a and m.get("sender") in owner_agents and m.get("sender") == a["chain"][-2]:
+            out.append({**a, "event_id": m.get("event_id"), "sender": m.get("sender")})
+    return out
+
+
+def loop_check(asks: List[dict], self_mxid: str, target: str) -> Optional[str]:
+    """Refusal when `target` is already in this consult's chain and this would not be a
+    follow-up on an existing self->target link. Structural: read from the thread's markers."""
+    seen = {a for ask in asks for a in ask["chain"]}
+    links = {(ask["chain"][-2], ask["chain"][-1]) for ask in asks}
+    if target in seen and (self_mxid, target) not in links:
+        return (f"{target} is already in this consult's chain; answer from what the thread has "
+                "instead of asking it")
+    return None
+
+
+def incoming_ask(transport, room: str, self_mxid: str, task_id: str,
+                 workspace: Optional[Path], owner_agents) -> dict:
+    """The consult ask a live verified task delivered to this agent, traced through the
+    thread to a root ask, which only the verified-owner-task gate posts. Refuses anything
+    whose chain the thread does not show link by link."""
+    def no(reason):
+        return {"ok": False, "reason": reason}
+    got = live_task(task_id, workspace)
+    if not got["ok"]:
+        return no(got["reason"])
+    h = got["headers"]
+    if room not in (h.get("channel_id"), h.get("source_room_id")):
+        return no("task did not come from the consult room")
+    event = h.get("source_message_id")
+    page = transport.read(room, READ_LIMIT)
+    if not page.get("ok"):
+        return no(f"consult room unreadable: {page.get('reason')}")
+    msg = next((m for m in page.get("messages") or [] if isinstance(m, dict)
+                and event and m.get("event_id") == event), None)
+    if msg is None or not isinstance(msg.get("body"), str):
+        return no(f"ask event not in the last {READ_LIMIT} messages of the consult room")
+    ask = parse_ask(msg["body"])
+    if ask is None:
+        return no("task is not a consult ask")
+    sender = msg.get("sender")
+    if ask["chain"][-1] != self_mxid or ask["chain"][-2] != sender or sender not in owner_agents:
+        return no("ask is not addressed to this agent by one of the owner's agents")
+    root = ask["root"] or event
+    if ask["root"] is None and (len(ask["chain"]) != 2 or msg.get("thread_root")):
+        return no("a thread's first ask must be a direct ask from the owner's agent")
+    if ask["root"] is not None and msg.get("thread_root") != root:
+        return no("ask is not posted in its consult thread")
+    view = thread_view(transport, room, root)
+    if not view["ok"]:
+        return no(view["reason"])
+    asks = asks_in(view["msgs"], owner_agents)
+    first = next((a for a in asks if a["event_id"] == root and a["root"] is None), None)
+    if first is None or first["chain"][0] != ask["chain"][0]:
+        return no("the thread root is not a consult ask by this chain's first agent")
+    chains = {tuple(a["chain"]) for a in asks}
+    for k in range(2, len(ask["chain"])):
+        if tuple(ask["chain"][:k]) not in chains:
+            return no(f"the thread shows no ask for {' > '.join(ask['chain'][:k])}; "
+                      "the chain does not trace to the root ask")
+    return {"ok": True, "cid": ask["cid"], "root": root, "chain": ask["chain"], "asker": sender,
+            "ask_event": event, "original_question": ask["original_question"] or first["original_question"],
+            "asks": asks, "reason": None}
+
+
+# Ask: from a verified owner task, or onward from a consult ask this agent received
 def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
-            task_id: str, workspace: Optional[Path], cid: Optional[str] = None,
-            now: Optional[Callable[[], float]] = None) -> dict:
-    """Every gate, then the one post and its pending record; returns at once with
-    {asked, agent, cid, ask_event, follow_up} or {asked: False, reason}. The reply arrives
-    later as a new task and is matched with match_reply. Nothing is posted unless all gates pass."""
+            workspace: Optional[Path], task_id: Optional[str] = None, via_task: Optional[str] = None,
+            cid: Optional[str] = None, now: Optional[Callable[[], float]] = None) -> dict:
+    """Every gate, then the one post in the consult thread and its pending record; returns at
+    once with {asked, agent, cid, ask_event, root, chain, follow_up} or {asked: False, reason}.
+    Nothing is posted unless all gates pass."""
     def no(reason):
         return {"asked": False, "agent": agent, "reason": reason}
     clock = now or time.time
     cid = cid or new_cid()
     if not _CID.match(cid):
         return no("malformed correlation id")
-    gate = trusted_task(task_id, workspace)
-    if not gate["ok"]:
-        return no(gate["reason"])
+    if bool(task_id) == bool(via_task):
+        return no("name exactly one of an owner task (--task-id) or a consult ask (--via-task)")
+    origin, via = {}, None
+    if task_id:
+        gate = trusted_task(task_id, workspace)
+        if not gate["ok"]:
+            return no(gate["reason"])
+        origin = gate["origin"]
     if not question or not question.strip():
         return no("empty question")
     if carries_marker(question):
-        return no("question carries the consult marker; consults are one hop")
+        return no("question carries the consult marker")
     verdict = guard(room, self_mxid, transport)
     if not verdict["ok"]:
         return no(verdict["reason"])
     if agent not in {r["mxid"] for r in roster(verdict, self_mxid)}:
         return no(f"{agent} is not one of the owner's other agents in the consult room")
-    prior = prior_ask(workspace, task_id, agent)
-    thread_event = (prior.get("thread_event") or prior.get("ask_event")) if prior else None
-    path = _record_path(workspace, "pending", cid)
-    if path.exists() or _record_path(workspace, "answered", cid).exists():
+    if task_id:
+        prior = prior_ask(workspace, "task_id", task_id)
+        root = prior["root"] if prior else None
+        chain = [self_mxid, agent]
+        original = (prior or {}).get("original_question") or question.strip()
+        asks = []
+        if root:
+            view = thread_view(transport, room, root)
+            if not view["ok"]:
+                return no(view["reason"])
+            asks = asks_in(view["msgs"], verdict["owner_agents"] | {self_mxid})
+    else:
+        inc = incoming_ask(transport, room, self_mxid, via_task, workspace,
+                           verdict["owner_agents"] | {self_mxid})
+        if not inc["ok"]:
+            return no(inc["reason"])
+        root, asks, original = inc["root"], inc["asks"], inc["original_question"]
+        chain = inc["chain"] + [agent]
+        via = {"task_id": via_task, "cid": inc["cid"], "asker": inc["asker"],
+               "ask_event": inc["ask_event"]}
+    refusal = loop_check(asks, self_mxid, agent)
+    if refusal:
+        return no(refusal)
+    if _record_path(workspace, "pending", cid).exists() or _record_path(workspace, "answered", cid).exists():
         return no("correlation id already used")
-    record = {"cid": cid, "task_id": task_id, "agent": agent, "room": room, "ask_event": None,
-              "thread_event": thread_event, "asked_at": clock(), "origin": gate["origin"],
-              "question": question.strip()[:500]}
+    follow_up = any(a["chain"][-2:] == [self_mxid, agent] for a in asks)
+    path = _record_path(workspace, "pending", cid)
+    record = {"cid": cid, "task_id": task_id, "via_task": via_task, "via": via, "agent": agent,
+              "room": room, "root": root, "chain": chain, "ask_event": None, "asked_at": clock(),
+              "origin": origin, "question": question.strip()[:500], "original_question": original[:500]}
     try:
         _write_record(path, record)
     except OSError as e:
         return no(f"pending record unwritable: {e}")
-    sent = transport.mention(agent, ask_body(question, cid, self_mxid), room, reply_to=thread_event)
+    reply_to = via["ask_event"] if via else None
+    sent = transport.mention(agent, ask_body(question, cid, root, chain, original), room,
+                             reply_to=reply_to, thread_root=root)
     event = sent.get("event_id") if sent.get("ok") else None
     if not event:
         path.unlink(missing_ok=True)
         return no(f"ask not posted: {sent.get('reason') or 'no event id'}")
-    record["ask_event"] = event
+    record.update(ask_event=event, root=root or event)
     _write_record(path, record)
-    return {"asked": True, "agent": agent, "cid": cid, "ask_event": event,
-            "follow_up": bool(prior), "reason": None}
+    return {"asked": True, "agent": agent, "cid": cid, "ask_event": event, "root": record["root"],
+            "chain": chain, "follow_up": follow_up, "reason": None}
 
 
-def _first_line_tag(body: str, self_mxid: str) -> tuple:
-    """(cid, rest) when the body's first line, after an optional leading mention of
-    this agent, is an answer tag; else (None, None)."""
-    lines = body.strip().split("\n", 1)
-    first = lines[0].strip()
-    if self_mxid and first.startswith(self_mxid):
-        first = first[len(self_mxid):].lstrip(" \u2014\u2013-:")
-    m = _TAG.match(first)
-    if not m:
-        return None, None
-    return m.group(1), (lines[1].strip() if len(lines) > 1 else "")
+def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Optional[Path],
+           task_id: Optional[str] = None, up: Optional[str] = None) -> dict:
+    """Post this agent's answer to a consult ask, in its thread, replying to the ask,
+    @-mentioning the asker, first line its answer line. The ask is the one a live task
+    delivered (`task_id`), or, to pass an answer up the chain, the ask an onward consult of
+    this agent's came from (`up`, that consult's id)."""
+    def no(reason):
+        return {"answered": False, "reason": reason}
+    if bool(task_id) == bool(up):
+        return no("name exactly one of the ask's task (--task-id) or an onward consult (--up)")
+    if not text or not text.strip():
+        return no("empty answer")
+    if carries_marker(text):
+        return no("answer text carries the consult marker")
+    verdict = guard(room, self_mxid, transport)
+    if not verdict["ok"]:
+        return no(verdict["reason"])
+    if up:
+        rec = next((r for st in ("answered", "pending") if _CID.match(up)
+                    for r in [_read_record(_record_path(workspace, st, up))] if r), None)
+        via = (rec or {}).get("via")
+        if not via or not rec.get("root"):
+            return no(f"{up} is not an onward consult of this agent")
+        inc = {"cid": via["cid"], "asker": via["asker"], "ask_event": via["ask_event"], "root": rec["root"]}
+    else:
+        inc = incoming_ask(transport, room, self_mxid, task_id, workspace,
+                           verdict["owner_agents"] | {self_mxid})
+        if not inc["ok"]:
+            return no(inc["reason"])
+    sent = transport.mention(inc["asker"], f"{answer_tag(inc['cid'])}\n{text.strip()}", room,
+                             reply_to=inc["ask_event"], thread_root=inc["root"])
+    if not sent.get("ok"):
+        return no(f"answer not posted: {sent.get('reason')}")
+    return {"answered": True, "to": inc["asker"], "cid": inc["cid"], "root": inc["root"],
+            "event_id": sent.get("event_id"), "reason": None}
 
 
 def match_reply(transport, *, room: str, self_mxid: str, task_id: str,
                 workspace: Optional[Path]) -> dict:
-    """Bind a reply task to its pending consult: the reply must be a verified live task
-    from the consult room, whose room event comes from the asked agent, carries that
-    consult's answer line, and replies to (or threads under) that consult's ask.
-    Returns {matched, task_id (the original), origin, reply_text, ...} or {matched: False, reason}."""
+    """Bind a reply task to its pending consult: the reply must be a verified live task from
+    the consult room, whose room event comes from the asked agent, sits in the consult's
+    thread, carries that consult's answer line, and replies to that consult's ask (or the
+    root) when it cites anything. Returns where the answer goes next: the owner (`lead`) or
+    up the chain (`answer_up`)."""
     def no(reason, **extra):
         return {"matched": False, "reason": reason, **extra}
     got = live_task(task_id, workspace)
@@ -396,22 +576,26 @@ def match_reply(transport, *, room: str, self_mxid: str, task_id: str,
                 and m.get("event_id") == event), None)
     if msg is None or not isinstance(msg.get("body"), str):
         return no(f"reply event not in the last {READ_LIMIT} messages of the consult room")
-    cid, text = _first_line_tag(msg["body"], self_mxid)
-    if cid is None:
+    first, rest = _first_line(msg["body"])
+    m = _TAG.match(first)
+    if not m:
+        if parse_ask(msg["body"]):
+            return no("this is a consult ask to you, not an answer; answer it or consult onward")
         return no("not a final answer (no answer line); treat it as progress", progress=True)
+    cid, text = m.group(1), rest.strip()
     rec = _read_record(_record_path(workspace, "pending", cid))
     if rec is None:
         state = "already answered" if _record_path(workspace, "answered", cid).exists() else "unknown"
         return no(f"consult {cid} is {state}")
     if msg.get("sender") != rec.get("agent"):
         return no(f"answer is from {msg.get('sender')}, not {rec.get('agent')}")
-    asks = {rec.get("ask_event"), rec.get("thread_event")} - {None}
     if not rec.get("ask_event"):
         return no("the ask was never confirmed posted")
-    for key in ("in_reply_to", "thread_root"):
-        rel = msg.get(key)
-        if rel and rel not in asks:
-            return no(f"answer {key} is {rel}, not this consult's ask")
+    if msg.get("thread_root") != rec.get("root"):
+        return no("answer is not posted in this consult's thread")
+    rel = msg.get("in_reply_to")
+    if rel and rel not in (rec["ask_event"], rec["root"]):
+        return no(f"answer in_reply_to is {rel}, not this consult's ask")
     if not text:
         return no("answer line carries no answer")
     src = _record_path(workspace, "pending", cid)
@@ -428,10 +612,13 @@ def match_reply(transport, *, room: str, self_mxid: str, task_id: str,
         _write_record(dst, rec)
     except OSError:
         pass
+    out = {"matched": True, "agent": rec["agent"], "cid": cid, "reply_text": text, "event_id": event,
+           "root": rec["root"], "chain": rec.get("chain") or [], "question": rec.get("question") or "",
+           "reason": None}
+    if rec.get("via"):
+        return {**out, "task_id": None, "answer_up": {**rec["via"], "root": rec["root"], "up": cid}}
     origin = rec.get("origin") or {}
-    return {"matched": True, "task_id": rec["task_id"], "agent": rec["agent"], "cid": cid,
-            "reply_text": text, "event_id": event, "origin": origin, "lead": reply_lead(origin),
-            "question": rec.get("question") or "", "reason": None}
+    return {**out, "task_id": rec["task_id"], "origin": origin, "lead": reply_lead(origin)}
 
 
 def reply_lead(origin: dict) -> str:

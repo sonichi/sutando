@@ -166,6 +166,22 @@ class CitationCliTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         m.assert_called_once_with("peer", "ping", ROOM, None, reply_to=EV)
 
+    def test_agents_verb_lists_the_registry(self):
+        with mock.patch.object(room_ops._resolve, "list_agents",
+                               return_value={"ok": True, "agents": []}) as m:
+            with mock.patch("sys.stdout"):
+                rc = room_ops._main(["agents"])
+        self.assertEqual(rc, 0)
+        m.assert_called_once_with()
+
+    def test_mention_thread_root_flag_reaches_mention(self):
+        with mock.patch.object(room_ops._mention, "mention",
+                               return_value={"ok": True, "event_id": "$e"}) as m:
+            with mock.patch("sys.stdout"):
+                rc = room_ops._main(["mention", "peer", "ping", ROOM, "--thread-root", EV])
+        self.assertEqual(rc, 0)
+        m.assert_called_once_with("peer", "ping", ROOM, None, reply_to=None, thread_root=EV)
+
     def test_help_says_a_citation_is_not_a_thread(self):
         # The surface a caller reads first must carry the limitation, not only
         # the module docstring and the skill doc.
