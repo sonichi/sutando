@@ -42,6 +42,8 @@ Config (env / .env):
                         credentials or tier map. Env-only by necessity: the
                         .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
+  REMOTE_TASK_ON_TASK   optional wake command, run once per newly queued task
+                        file (argv split with shlex, no shell; file path appended)
   REMOTE_OUTBOUND_SCAN_S outbound worker scan period seconds (default 1.0)
 
 Stdlib only (urllib) — no new dependencies.
@@ -56,6 +58,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import uuid
 import re
 import shlex
@@ -1338,6 +1341,7 @@ URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+ON_TASK_CMD = os.environ.get("REMOTE_TASK_ON_TASK") or ""
 # A read timeout on the long poll is indistinguishable from the documented
 # `200 {"tasks": []}` hold-window expiry, so it is only an outage once no poll
 POLL_TIMEOUT_GRACE_S = 3 * (POLL_WAIT + 10)
@@ -3285,6 +3289,36 @@ def _signal_task_media_lines(media_dir: str) -> list[str]:
         "Write the prose answer first; a picture is garnish, never the answer.",
     ]
 
+def _on_task_env() -> "dict[str, str]":
+    """The bridge's environment minus every relay credential."""
+    secrets = [v for v in (TOKEN, _RAW, HS_MEDIA_TOKEN) if v]
+    return {k: v for k, v in os.environ.items()
+            if not (k.startswith(("REMOTE_", "AG2_")) and "TOKEN" in k)
+            and not any(sec in v for sec in secrets)}
+
+
+def _fire_on_task(tid: str, path: Path) -> None:
+    """Start REMOTE_TASK_ON_TASK for one newly published task file; never waits on it."""
+    if not ON_TASK_CMD:
+        return
+    try:
+        argv = shlex.split(ON_TASK_CMD) + [str(path)]
+        env = {**_on_task_env(), "SPARROW_TASK_ID": tid, "SPARROW_TASK_FILE": str(path)}
+        proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+    except Exception as exc:  # noqa: BLE001 — a bad wake command never stops the pull loop
+        _log(f"on-task command failed to start for {tid}: {type(exc).__name__}: {exc}")
+        return
+
+    def _reap() -> None:
+        code = proc.wait()
+        if code != 0:
+            _log(f"on-task command exited {code} for {tid}")
+
+    threading.Thread(target=_reap, name=f"on-task-{tid}", daemon=True).start()
+
+
 def _write_task(task: dict) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns (task id, durable) — `durable` says the queue write and its sidecar
@@ -3493,6 +3527,8 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
     # only for owner-tier senders (same resolved tier as the task above).
     _write_owner_activity(task, sender_tier)
+    # Only a fresh publish reaches here, so redelivery and restarts never re-fire.
+    _fire_on_task(tid, dest)
     return tid, True
 
 
