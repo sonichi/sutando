@@ -771,6 +771,28 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
             self._tmux_calls(),
         )
 
+    def test_restart_forwards_embedder_workspace_dir_with_spaces_intact(self):
+        result = self.run_launcher("--restart", env_extra={
+            "SUTANDO_WORKSPACE_DIR": "/embedder/work space",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-e SUTANDO_WORKSPACE_DIR=/embedder/work space", self._tmux_calls())
+
+    def test_restart_forwards_no_workspace_dir_when_unset(self):
+        saved = os.environ.pop("SUTANDO_WORKSPACE_DIR", None)
+        try:
+            result = self.run_launcher("--restart")
+        finally:
+            if saved is not None:
+                os.environ["SUTANDO_WORKSPACE_DIR"] = saved
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("-e SUTANDO_WORKSPACE_DIR", self._tmux_calls())
+
+    def test_restart_forwards_no_workspace_dir_when_empty(self):
+        result = self.run_launcher("--restart", env_extra={"SUTANDO_WORKSPACE_DIR": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("-e SUTANDO_WORKSPACE_DIR", self._tmux_calls())
+
     def test_dispatcher_restarts_when_active_runtime_differs(self):
         result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "claude"})
         self.assertEqual(result.returncode, 0, result.stderr)
