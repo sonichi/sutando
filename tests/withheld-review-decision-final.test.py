@@ -277,6 +277,53 @@ for label in ("stale-published", "direct-resolve"):
           and any(p.read_bytes() == legacy_bytes for p in superseded),
           f"{label}: card restored to the archive and copy retired, archive untouched: {edits}")
 
+# 6c. The reconcile table, every row: only a proven archived (status, decision) pair
+# restores the card and retires the copy; any other archive leaves everything untouched.
+PROVEN = {"kept_private/sensitive": "kept_private", "published/false_positive": "published",
+          "publish_failed/false_positive": "publish_failed"}
+EXPECTED_CARD = {"kept_private": "Kept private", "published": "Published to the original room",
+                 "publish_failed": "publication failed"}
+STATUSES = ("kept_private", "published", "publish_failed", "publish_pending",
+            "awaiting_owner", "pending_dm", None, 7, ["x"])
+DECISIONS = ("sensitive", "false_positive", None, ["x"])
+rows = [(f"{st}/{de}", {"status": st, "decision": de}) for st in STATUSES for de in DECISIONS]
+rows += [("non-dict", []), ("unreadable", None)]
+card = {"review_id": "wr_0000000000000000", "dm_room_id": DM, "dm_event_id": "$table-card",
+        "owner": OWNER, "withheld_body": "SECRET-BODY", "context": {"channel_id": SHARED}}
+for label, archived_fields in rows:
+    bridge._STATE = root / "table" / label.replace("/", "-").replace("'", "")
+    directory = bridge._STATE / "withheld-team-results"
+    (directory / "archive").mkdir(parents=True)
+    archived = directory / "archive" / "wr_0000000000000000.json"
+    if archived_fields is None:
+        archived.write_text("{unreadable")
+    elif isinstance(archived_fields, list):
+        archived.write_text(json.dumps(archived_fields))
+    else:
+        archived.write_text(json.dumps({**card, **archived_fields}))
+    live = directory / "wr_0000000000000000.json"
+    live.write_text(json.dumps({**card, **NO}))
+    legacy_bytes, live_state, archive_state = live.read_bytes(), frozen(live), frozen(archived)
+    expected = PROVEN.get(label)
+    before, mark = len(shared_posts()), len(calls)
+    bridge._retry_withheld_reviews()
+    bridge._retry_withheld_reviews()
+    edits = [p["body"] for _m, u, p in calls[mark:]
+             if u == "/v1/room" and p.get("op") == "edit" and p.get("event_id") == "$table-card"]
+    superseded = list((directory / "archive" / "superseded").glob("wr_0000000000000000.*.json"))
+    check(guard.archived_outcome(json.loads(archived.read_text()) if archived_fields is not None
+                                 else {}) == expected, f"table {label}: outcome {expected}")
+    check(len(shared_posts()) == before and unchanged(archived, archive_state),
+          f"table {label}: nothing posts and the archive is untouched")
+    if expected:
+        check(len(edits) == 1 and EXPECTED_CARD[expected] in edits[0] and not live.exists()
+              and any(p.read_bytes() == legacy_bytes for p in superseded),
+              f"table {label}: card shows {expected} once and the copy is retired: {edits}")
+    else:
+        check(edits == [] and unchanged(live, live_state),
+              f"table {label}: unproven archive leaves card and copy untouched: {edits}")
+bridge._STATE = root / "state"
+
 # 7. Every non-awaiting or unproven state refuses a claim, a publication and the whole
 # retry beat, and is not touched.
 claim_id = "ab" * 16
@@ -406,6 +453,73 @@ check(bridge._defers_to_archive(case_path) and ("retire", case_path) in seen
       "the bridge's archive authority and retirement are the injected guard's")
 for name, function in real.items():
     setattr(guard, name, function)
+bridge._STATE = root / "state"
+
+# 10. Liveness: a retirement that raises (archive/superseded is a regular file) is logged
+# for that record, and the same real poll beat still takes in a new task.
+bridge._STATE = root / "states" / "retire-error"
+directory = bridge._STATE / "withheld-team-results"
+(directory / "archive").mkdir(parents=True)
+(directory / "archive" / "superseded").write_text("not a directory")
+archived = directory / "archive" / "wr_0000000000000000.json"
+archived.write_text(json.dumps({**base_record, **YES, "dm_event_id": "$liveness-card"}))
+live = directory / "wr_0000000000000000.json"
+live.write_text(json.dumps({**base_record, **NO, "dm_event_id": "$liveness-card"}))
+live_state, archive_state = frozen(live), frozen(archived)
+
+
+class _Clock:
+    now = 1_000_000.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+written, alive, beat_logs = [], [True, False], []
+patched = {name: getattr(bridge, name) for name in (
+    "TOKEN", "URL", "time", "_acquire_singleton", "_load_inflight", "_recover_orphan_proactive",
+    "_maybe_start_event_channel", "_heartbeat_singleton", "_post_heartbeat", "_req",
+    "_write_task", "_post_task_ack", "_post_ready_results", "_post_proactive",
+    "_reconcile_abandoned", "_emit_gateway_status", "_save_inflight", "_log",
+    "_push_pool_advertisement", "refresh_routing")}
+
+
+def beat_req(method, url, payload=None, timeout=35):
+    if url.startswith("/v1/tasks?wait="):
+        return {"tasks": [{"id": "task-after-retire-error", "task": "hello",
+                           "channel_id": SHARED, "user_id": OWNER}]}
+    return fake_req(method, url, payload, timeout)
+
+
+bridge.TOKEN, bridge.URL, bridge.time = "secret", "http://relay.invalid", _Clock()
+bridge._acquire_singleton = lambda *a, **k: True
+bridge._load_inflight = lambda *a, **k: set()
+bridge._heartbeat_singleton = lambda *a, **k: alive.pop(0) if alive else False
+for _noop in ("_recover_orphan_proactive", "_maybe_start_event_channel", "_post_heartbeat",
+              "_post_task_ack", "_post_ready_results", "_post_proactive",
+              "_emit_gateway_status", "_save_inflight", "_push_pool_advertisement",
+              "refresh_routing"):
+    setattr(bridge, _noop, lambda *a, **k: None)
+bridge._reconcile_abandoned = lambda inflight, suspects, *a, **k: suspects
+bridge._write_task = lambda task: written.append(task["id"]) or (task["id"], True)
+bridge._req = beat_req
+bridge._log = beat_logs.append
+mark = len(calls)
+try:
+    bridge.main()
+finally:
+    for name, value in patched.items():
+        setattr(bridge, name, value)
+check(written == ["task-after-retire-error"],
+      f"the beat whose retirement raised still took in the new task: {written}")
+check(any("archive reconcile failed" in line for line in beat_logs)
+      and not any(line.startswith("unexpected") for line in beat_logs),
+      "the retirement fault is logged for its record and never aborts the beat")
+check(unchanged(live, live_state) and unchanged(archived, archive_state),
+      "a failed retirement leaves the copy and the archive untouched")
 bridge._STATE = root / "state"
 
 # 5. Race: both replies matched, then released together; exactly one decision wins.

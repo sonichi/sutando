@@ -935,8 +935,8 @@ _REFUSED_REVIEW_PUBLICATIONS: set = set()
 
 def _publish_review(path: Path, record: dict) -> bool:
     if not team_result_guard.withheld_claim_publishable(path, record.get("decision_claim_id")):
-        if path.stem not in _REFUSED_REVIEW_PUBLICATIONS:
-            _REFUSED_REVIEW_PUBLICATIONS.add(path.stem)
+        if str(path) not in _REFUSED_REVIEW_PUBLICATIONS:
+            _REFUSED_REVIEW_PUBLICATIONS.add(str(path))
             _log(f"withheld review {path.stem}: publication refused, no matching release "
                  "claim; the body stays private until the owner acts")
         return False
@@ -991,24 +991,26 @@ def _edit_review_card(record: dict) -> "dict | None":
 
 
 def _defers_to_archive(path: Path) -> bool:
-    """True when an archived decision owns this review: the live copy never acts. The
-    card is restored to the archived outcome first; only then is the copy retired."""
-    archived = team_result_guard.archived_withheld_decision(path)
-    if archived is None:
-        return False
+    """True when an archived decision owns this review: the live copy never acts. Only a
+    proven archived outcome restores the card, then retires the copy; never raises."""
     try:
-        restored = (archived.get("status") in ("kept_private", "published")
-                    and _edit_review_card(archived) is not None)
-    except Exception as exc:  # noqa: BLE001 — both stay untouched; next poll retries
-        restored = False
-        _log(f"withheld review {path.stem}: archived-outcome card edit deferred: {exc}")
-    if restored and team_result_guard.retire_superseded_record(path):
-        _log(f"withheld review {path.stem}: a live copy contradicted its archived "
-             f"{archived.get('status')} decision; card restored and copy retired")
-    elif f"archived:{path.stem}" not in _REFUSED_REVIEW_PUBLICATIONS:
-        _REFUSED_REVIEW_PUBLICATIONS.add(f"archived:{path.stem}")
-        _log(f"withheld review {path.stem}: live copy left untouched; its archived "
-             "decision stands")
+        archived = team_result_guard.archived_withheld_decision(path)
+        if archived is None:
+            return False
+        outcome = team_result_guard.archived_outcome(archived)
+        if (outcome is not None
+                and _edit_review_card(archived) is not None
+                and team_result_guard.retire_superseded_record(path)):
+            _log(f"withheld review {path.stem}: a live copy contradicted its archived "
+                 f"{outcome} decision; card restored and copy retired")
+            return True
+        note = ("its archived decision stands" if outcome is not None else
+                "its archived decision is not a recognised outcome; left for the owner")
+    except Exception as exc:  # noqa: BLE001 — one record's fault must never stop the beat
+        note = f"archive reconcile failed ({exc}); left for the owner"
+    if f"archived:{path}" not in _REFUSED_REVIEW_PUBLICATIONS:
+        _REFUSED_REVIEW_PUBLICATIONS.add(f"archived:{path}")
+        _log(f"withheld review {path.stem}: live copy left untouched; {note}")
     return True
 
 

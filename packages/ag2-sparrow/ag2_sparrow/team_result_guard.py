@@ -451,6 +451,23 @@ def archived_withheld_decision(path: Path) -> "dict | None":
     return record if isinstance(record, dict) else {}
 
 
+# The reconcile table: the only archived (status, decision) pairs a live copy may be
+# reconciled to. Any other pair, or a malformed archive, is left untouched for the owner.
+ARCHIVED_OUTCOMES = {
+    ("kept_private", "sensitive"): "kept_private",
+    ("published", "false_positive"): "published",
+    ("publish_failed", "false_positive"): "publish_failed",
+}
+
+
+def archived_outcome(archived) -> "str | None":
+    """The outcome an archived decision proves, or None when it proves none."""
+    if not isinstance(archived, dict):
+        return None
+    key = (archived.get("status"), archived.get("decision"))
+    return ARCHIVED_OUTCOMES.get(key) if all(isinstance(k, str) for k in key) else None
+
+
 def retire_superseded_record(path: Path) -> bool:
     """Move a live copy that an archived decision outranks into archive/superseded/,
     so the hot directory again agrees with the archive. The archive is untouched."""
