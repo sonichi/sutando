@@ -29,6 +29,9 @@ export const MEETING_EXIT_PHRASE = 'Sutando, come back';
 /** Spoken when meeting mode starts: the user cannot ask the quiesced model how to leave, so the exit comes first. */
 export const MEETING_ENTRY_SAY = `Meeting mode on. To bring me back, say "${MEETING_EXIT_PHRASE}". Until then I'll stay silent and take notes.`;
 
+/** Told to a fresh provider connection after a meeting whose end the model already took in. */
+export const MEETING_OVER_CONTEXT = framedSystem('Meeting mode is over: you are back in a normal conversation. Listen and answer the user as usual.');
+
 /** Transcript carried back into the voice session; a longer meeting keeps its end. */
 const MAX_CARRIED_CHARS = 30_000;
 
@@ -159,6 +162,10 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 	let notePath: string | null = null;
 	let lines: string[] = [];
 	let unsaved = 0;
+	// The meeting-ended context until the model has finished a turn after it: a provider connection
+	// replaced before that took it with it, so the fresh one gets it again.
+	let unacknowledged: string | null = null;
+	let meetingEnded = false;
 	// The note and its header are written with the first line or once transcription is on,
 	// so an entry that fails leaves no empty heading behind.
 	let headerAt: Date | null = null;
@@ -235,18 +242,41 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 		deps.session.clearDictationBuffer();
 		deps.log(`[MeetingDictation] back to agent mode (${transcript.length} lines in ${path})`);
 		if (opts.byVoice) deps.onExitByVoice();
+		meetingEnded = true;
 		if (path) {
-			const delivered = await deps.session.injectText(
-				meetingEndedContext(path, transcript, { unsaved, request: opts.request || undefined }),
-				{ mode: 'live' },
-			);
+			const context = meetingEndedContext(path, transcript, { unsaved, request: opts.request || undefined });
+			unacknowledged = context;
+			const delivered = await deps.session.injectText(context, { mode: 'live' });
 			if (!delivered) deps.log(`[MeetingDictation] transcript not delivered to the session; the note is in ${path}`);
 		}
+	}
+
+	/**
+	 * The session replaced its provider connection (a fresh one, not a resumed one), which keeps only
+	 * the recent conversation. If the meeting just ended and the model never finished a turn on the
+	 * meeting-ended context, that context went with the old connection: send it again. After an earlier
+	 * meeting, say it is over, so a recent line like "I'll stay silent" is not taken as the current mode.
+	 */
+	async function afterConnectionReplaced(): Promise<void> {
+		if (deps.session.getTranscriptionMode() !== 'agent') return;
+		if (unacknowledged) {
+			deps.log('[MeetingDictation] connection replaced before the meeting-ended context was answered; sending it again');
+			const delivered = await deps.session.injectText(unacknowledged, { mode: 'live' });
+			if (!delivered) deps.log('[MeetingDictation] meeting-ended context not delivered to the fresh connection');
+			return;
+		}
+		if (meetingEnded) await deps.session.injectText(MEETING_OVER_CONTEXT, { mode: 'quiet' });
 	}
 
 	return {
 		enter: () => serial(enter),
 		exit: () => serial(() => exit({ byVoice: false })),
+		/** The model finished a turn: the meeting-ended context, if any, was taken in. */
+		noteModelTurnEnded: () => {
+			if (deps.session.getTranscriptionMode() === 'agent') unacknowledged = null;
+		},
+		/** Call once the session is active again on a fresh provider connection. */
+		afterConnectionReplaced: () => serial(afterConnectionReplaced),
 		get notePath() {
 			return notePath;
 		},

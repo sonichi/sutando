@@ -1102,6 +1102,17 @@ async function main() {
 		},
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
+	// A fresh provider connection (a host recovery, not a resumption) keeps only the recent
+	// conversation: once it is active, meeting dictation restores what the old one took with it.
+	// Deferred past bodhi's own recent-context injection, which follows the ACTIVE transition.
+	let connectionReplaced = false;
+	session.eventBus.subscribe('session.reconnectBoundary', () => { connectionReplaced = true; });
+	session.eventBus.subscribe('session.stateChange', (e) => {
+		if ((e as { toState?: string })?.toState !== 'ACTIVE' || !connectionReplaced) return;
+		connectionReplaced = false;
+		setTimeout(() => { void meetingDictation?.afterConnectionReplaced(); }, 250);
+	});
+	session.eventBus.subscribe('turn.end', () => meetingDictation?.noteModelTurnEnded());
 
 	// P7 D7.1: install the session-layer ledger wraps (audio ingress count +
 	// ingress-RMS speech tracker, audio_health heartbeat intercept, egress
