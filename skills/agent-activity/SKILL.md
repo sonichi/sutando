@@ -56,8 +56,8 @@ are for anything extra the owner asks to see.
 ## Working and Thinking rows, automatically (hooks)
 
 The skill declares three Claude Code hooks in `manifest.json` (`./hooks/activity-hook.py` on
-`PreToolUse`, `PostToolUse` and `Stop`); `bash src/install-claude-hooks.sh` registers them like every other
-skill hook. The hook never depends on the agent remembering anything:
+`PreToolUse`, `PostToolUse` and `Stop`); the core's launch settings (`build-core-settings.mjs --skill-hooks`)
+register them like every other skill hook, so they run only in sessions Sutando starts. The hook never depends on the agent remembering anything:
 
 - **Processing, automatically.** The first `PreToolUse` in a session whose input names a task file
   (`tasks/task-….txt`, a Read or a shell command) binds that task to the hook's own `session_id` in

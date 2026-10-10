@@ -69,20 +69,12 @@ T="$(cd "$BUNDLE" && env -u SUTANDO_INSTANCE_ID "$PY" src/watcher_rearm.py targe
 [ "$(printf '%s\n' "$T" | sed -n 1p)" = "$WS/tasks" ] && ok "target line 1 is the core inbox" || bad "target line 1 is the core inbox" "got: $T"
 grep -q 'watcher_rearm.py" target' "$REPO/src/check-pending-tasks.sh" && ok "check-pending-tasks.sh reads its inbox/command from watcher_rearm.py" || bad "check-pending-tasks.sh reads its inbox/command from watcher_rearm.py" "no call found"
 
-echo "installer registers it under SessionStart compact|resume, once:"
-IREPO="$BUNDLE/irepo"
-mkdir -p "$IREPO/scripts" "$IREPO/src"
-cp "$REPO/scripts/install-watcher-rearm-hook.sh" "$REPO/scripts/python-binary.sh" "$IREPO/scripts/"
-cp "$REPO/src/claude_hooks_settings.py" "$REPO/src/watcher-rearm-session-hint.sh" "$IREPO/src/"
-for _ in 1 2; do (env -u SUTANDO_CLAUDE_WORKING_DIR bash "$IREPO/scripts/install-watcher-rearm-hook.sh" >/dev/null 2>"$BUNDLE/ierr") || bad "installer exits 0" "$(cat "$BUNDLE/ierr")"; done
-N="$("$PY" -c '
+echo "the core's launch settings register it under SessionStart compact|resume, once:"
+N="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" /x/guard.py "" --owned-hooks "$REPO" | "$PY" -c '
 import json,sys
-d=json.load(open(sys.argv[1]))
+d=json.load(sys.stdin)
 print(sum(1 for e in d["hooks"].get("SessionStart",[]) if e.get("matcher")=="compact|resume"
-          for h in e["hooks"] if "watcher-rearm-session-hint.sh" in h["command"]))' "$IREPO/.claude/settings.json" 2>&1)"
-[ "$N" = "1" ] && ok "exactly one compact|resume entry after two runs" || bad "exactly one compact|resume entry after two runs" "got: $N"
-
-echo "the Claude launch chokepoint runs the installer:"
-grep -q 'bash "$REPO/scripts/install-watcher-rearm-hook.sh"' "$REPO/src/agent/claude/cli/session-launch.sh" && ok "session-launch.sh calls it" || bad "session-launch.sh calls it" "no call found"
+          for h in e["hooks"] if "watcher-rearm-session-hint.sh" in h["command"]))' 2>&1)"
+[ "$N" = "1" ] && ok "exactly one compact|resume entry in the launch settings" || bad "exactly one compact|resume entry in the launch settings" "got: $N"
 
 [ "$FAILED" = 0 ] && echo "PASS" || { echo "FAIL"; exit 1; }

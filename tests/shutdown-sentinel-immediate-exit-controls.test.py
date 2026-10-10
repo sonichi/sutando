@@ -48,7 +48,9 @@ NEEDED = (
     "scripts/python-binary.sh",
     "scripts/sutando-config.sh",
     # without these the launcher aborts before tmux and the assert is vacuous
-    "scripts/install-personal-claude-hook.sh",
+    "src/install-claude-hooks.sh",
+    "src/claude_hooks_settings.py",
+    "src/skill_hooks.py",
 )
 failures: list[str] = []
 

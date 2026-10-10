@@ -57,9 +57,7 @@ TRANSCRIPT="$1"  # Optional explicit path (manual invocations)
 # NOTE (rebase over #2077): the pre-rebase branch also set
 # STATE_FILE="$REPO/session-state.md" here — dropped; STATE_FILE is now
 # derived from the resolved workspace below, per the workspace contract.
-# Resolution is shared with archive-transcript.sh via src/hook_transcript_path.sh
-# (#4001 review): two readers of one payload drift, and the copy nobody
-# remembers is the one that ships the bug. Empty stays non-fatal HERE — the
+# Resolution lives in src/hook_transcript_path.sh. Empty stays non-fatal HERE — the
 # extraction site below falls through to --latest, which is the pre-existing
 # behaviour on a stock hook config and must not change in a refactor.
 __TP_HELPER="$REPO/src/hook_transcript_path.sh"

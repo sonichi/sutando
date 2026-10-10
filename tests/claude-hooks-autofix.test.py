@@ -1,18 +1,17 @@
-"""--fix must repair unregistered Claude hooks, and must NOT fire on the warn
-branches the installer cannot repair.
-
-The claude-hooks probe has existed since 2026-08-03; every app update strips
-settings.json back to SessionStart alone and it has always taken a human reading
-the warn to restore `PreCompact -> session-handoff.sh`. These tests pin the
-repair, and pin that it stays keyed on a structured field rather than on the
-warn's prose.
+"""--fix for claude-hooks sweeps Sutando-written copies out of settings files, keyed
+on the probe's structured `_project_leftovers`, and re-runs the probe afterwards --
+but only once the running core's launch record proves those copies are no longer its hooks.
 """
 import importlib.util
+import io
 import json
+import os
+import shutil
 import subprocess
-import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -30,191 +29,112 @@ def _load():
 hc = _load()
 
 
-def _fixture(root: Path, hooks_array: str, settings: dict):
-    (root / "src").mkdir(parents=True, exist_ok=True)
-    (root / ".claude").mkdir(parents=True, exist_ok=True)
-    (root / "src" / "install-claude-hooks.sh").write_text(
-        'SETTINGS="$REPO_DIR/.claude/settings.json"\n' + hooks_array + "\n"
-    )
-    (root / ".claude" / "settings.json").write_text(json.dumps(settings))
+class Gating(unittest.TestCase):
+    def _run(self, check, run=None):
+        calls, buf = [], io.StringIO()
 
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="claude-hooks sweep: 1 owned entry removed\n", stderr="")
 
-GOOD_HOOKS = 'HOOKS=(\n  "Stop|src/check-pending-tasks.sh|bash /x/src/check-pending-tasks.sh"\n)'
+        fresh = {"name": "claude-hooks", "status": "ok", "detail": "fresh"}
+        with mock.patch.object(hc.subprocess, "run", side_effect=run or fake_run), \
+                mock.patch.object(hc, "check_claude_hook_registration", return_value=dict(fresh)):
+            checks = [check]
+            hc.apply_claude_hooks_fix(checks, stream=buf)
+        return calls, checks[0], buf.getvalue()
 
-
-class ProbeAttachesStructuredField(unittest.TestCase):
-    def test_missing_hook_carries_the_repairable_marker(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            _fixture(root, GOOD_HOOKS, {"hooks": {}})
-            r = hc.check_claude_hook_registration(repo_dir=root)
-            self.assertEqual(r["status"], "warn")
-            self.assertTrue(
-                r.get("_unregistered_hooks"),
-                "probe warns about an unregistered hook but exposes no structured "
-                "field, so --fix would have to parse the sentence",
-            )
-
-    def test_non_repairable_warn_has_no_marker(self):
-        """A warn the installer cannot fix must not invite a repair attempt."""
-        import tempfile
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            _fixture(root, "HOOKS=NOT_AN_ARRAY", {"hooks": {}})
-            r = hc.check_claude_hook_registration(repo_dir=root)
-            self.assertEqual(r["status"], "warn")
-            self.assertIsNone(r.get("_unregistered_hooks"))
-
-
-class FixHandlerGating(unittest.TestCase):
-    """Positive and negative arms, with the positive one proving the negative
-    zero is meaningful — a handler that never runs would pass the negative test
-    by construction."""
-
-    def _run(self, check, out=None):
-        calls = []
-        self.kwargs = []
-        real = subprocess.run
-
-        def fake(cmd, *a, **k):
-            calls.append(cmd)
-            self.kwargs.append(k)
-            return subprocess.CompletedProcess(cmd, 0, "install-claude-hooks: added=1\n", "")
-
-        real_probe = hc.check_claude_hook_registration
-        hc.subprocess.run = fake
-        hc.check_claude_hook_registration = lambda *a, **k: {
-            "name": "claude-hooks", "status": "ok", "detail": "all owned hooks registered"
-        }
-        try:
-            import io
-            hc.apply_claude_hooks_fix([check], stream=out if out is not None else io.StringIO())
-        finally:
-            # Restore the probe too: leaving it stubbed leaks into every later
-            # test here, which happened on this file's first run.
-            hc.subprocess.run = real
-            hc.check_claude_hook_registration = real_probe
-        return calls
-
-    def test_runs_installer_when_hooks_unregistered(self):
-        calls = self._run({"name": "claude-hooks", "status": "warn",
-                           "detail": "x", "_unregistered_hooks": ["Stop:src/x.sh"]})
-        self.assertEqual(len(calls), 1, "the repairable case did not invoke the installer")
-        self.assertIn("install-claude-hooks.sh", " ".join(map(str, calls[0])))
-
-    def test_installer_failure_warns_instead_of_raising(self):
-        """A failed repair must not take the whole health check down with it."""
-        calls = []
-        real, real_probe = subprocess.run, hc.check_claude_hook_registration
-
-        def boom(cmd, *a, **k):
-            calls.append(cmd)
-            raise OSError("bash vanished")
-
-        hc.subprocess.run = boom
-        hc.check_claude_hook_registration = lambda *a, **k: {
-            "name": "claude-hooks", "status": "warn", "detail": "still broken"
-        }
-        import io
-        buf = io.StringIO()
-        try:
-            check = {"name": "claude-hooks", "status": "warn",
-                     "detail": "x", "_unregistered_hooks": ["Stop:src/x.sh"]}
-            hc.apply_claude_hooks_fix([check], stream=buf)
-        finally:
-            hc.subprocess.run = real
-            hc.check_claude_hook_registration = real_probe
-        self.assertEqual(len(calls), 1, "the installer was never attempted")
-        self.assertIn("could not run", buf.getvalue())
-        self.assertIn("bash vanished", buf.getvalue())
-        self.assertEqual(check["status"], "warn")
-
-    def test_the_unattended_repair_omits_the_desktop_archiver(self):
-        """`--fix` runs on a 30-min Timer in Sutando.app, so it may not install a
-        hook that copies transcripts out of the workspace."""
-        self._run({"name": "claude-hooks", "status": "warn", "detail": "x",
-                   "_unregistered_hooks": ["Stop:src/x.sh", hc._TRANSCRIPT_ARCHIVE_HOOK]})
-        env = self.kwargs[0].get("env") or {}
-        self.assertEqual(env.get("SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE"), "1",
-                         "the installer was invoked without the opt-out")
-        self.assertIn("PATH", env, "env was replaced rather than extended")
-
-    def test_archiver_alone_does_not_run_the_installer_at_all(self):
-        """Nothing repairable remains, so an unattended pass must do nothing and
-        say how to opt in — not install it as a side effect of the other hooks."""
-        import io
-        buf = io.StringIO()
-        calls = self._run({"name": "claude-hooks", "status": "warn", "detail": "x",
-                           "_unregistered_hooks": [hc._TRANSCRIPT_ARCHIVE_HOOK]}, out=buf)
-        self.assertEqual(calls, [], "installed the ~/Desktop archiver unattended")
-        self.assertIn("Opt in with", buf.getvalue())
-
-    def test_control_a_repairable_hook_still_invokes_it(self):
-        """Guards the two cases above from passing by never running anything."""
-        calls = self._run({"name": "claude-hooks", "status": "warn", "detail": "x",
-                           "_unregistered_hooks": ["Stop:src/x.sh"]})
+    def test_leftovers_run_the_sweep_once_and_the_probe_is_rerun(self):
+        calls, after, out = self._run({"name": "claude-hooks", "status": "warn", "detail": "x",
+                                       "_project_leftovers": ["/p: Stop bash x"],
+                                       "_live_core_has_launch_hooks": True})
         self.assertEqual(len(calls), 1)
+        self.assertTrue(str(calls[0][-1]).endswith("src/install-claude-hooks.sh"), calls)
+        self.assertEqual(after["detail"], "fresh")
+        self.assertIn("sweeping 1 owned entry", out)
+        self.assertIn("1 owned entry removed", out)
 
-    def test_skips_warn_without_the_marker(self):
-        calls = self._run({"name": "claude-hooks", "status": "warn",
-                           "detail": "could not parse HOOKS=(...)"})
-        self.assertEqual(calls, [], "ran the installer on a warn it cannot repair")
+    def test_plural_and_silent_sweep_output(self):
+        def quiet(argv, **kw):
+            return subprocess.CompletedProcess(argv, 3, stdout="", stderr="")
+        _calls, _after, out = self._run({"name": "claude-hooks", "status": "warn", "detail": "x",
+                                         "_project_leftovers": ["a", "b"],
+                                         "_live_core_has_launch_hooks": True}, run=quiet)
+        self.assertIn("sweeping 2 owned entries", out)
+        self.assertIn("sweep exited 3", out)
+
+    def test_a_sweep_that_cannot_start_warns_instead_of_raising(self):
+        _calls, _after, out = self._run({"name": "claude-hooks", "status": "warn", "detail": "x",
+                                         "_project_leftovers": ["a"],
+                                         "_live_core_has_launch_hooks": True}, run=OSError("nope"))
+        self.assertIn("could not run install-claude-hooks.sh", out)
+
+    def test_copies_a_pre_update_core_still_runs_are_not_swept(self):
+        for live in (False, None):
+            check = {"name": "claude-hooks", "status": "warn", "detail": "no launch record",
+                     "_project_leftovers": ["/p: Stop bash x"]}
+            if live is not None:
+                check["_live_core_has_launch_hooks"] = live
+            calls, after, out = self._run(check)
+            self.assertEqual(calls, [])
+            self.assertEqual(after["detail"], "no launch record")
+            self.assertIn("not swept", out)
+
+    def test_warns_the_sweep_cannot_repair_are_left_alone(self):
+        for check in ({"name": "claude-hooks", "status": "warn", "detail": "node not found",
+                       "_project_leftovers": []},
+                      {"name": "other", "status": "warn", "detail": "x", "_project_leftovers": ["a"]}):
+            calls, after, _ = self._run(dict(check))
+            self.assertEqual(calls, [])
+            self.assertEqual(after["detail"], check["detail"])
+
+
+@unittest.skipUnless(shutil.which("node"), "node is required to run the launch-settings builder")
+class EndToEnd(unittest.TestCase):
+    def test_fix_sweeps_a_real_project_file_and_the_probe_turns_ok(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            for rel in ("src/install-claude-hooks.sh", "src/claude_hooks_settings.py", "src/skill_hooks.py",
+                        "src/sutando_config.py", "scripts/python-binary.sh",
+                        "src/agent/claude/cli/build-core-settings.mjs", "src/agent/claude/cli/owned-hooks.json"):
+                (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(REPO / rel, repo / rel)
+            for name in ("check-pending-tasks.sh", "turn-start.sh", "session-handoff.sh",
+                         "schedule-crons-session-hint.sh", "personal-claude-compact-hint.sh",
+                         "watcher-rearm-session-hint.sh"):
+                (repo / "src" / name).write_text("#!/bin/bash\n")
+            (repo / "hooks").mkdir()
+            (repo / "hooks" / "skip-ask-user-question.py").write_text("")
+            proj = repo / ".claude" / "settings.json"
+            proj.parent.mkdir()
+            legacy = json.dumps({"hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": f"bash '{repo}/src/check-pending-tasks.sh'"},
+                {"type": "command", "command": "echo operator"}]}]}})
+            proj.write_text(legacy)
+            ws = Path(td) / "ws"
+            env = {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(ws), "SUTANDO_CLAUDE_WORKING_DIR": ""}
+            with mock.patch.dict(os.environ, env), mock.patch.object(hc, "REPO_DIR", repo), \
+                    mock.patch.object(hc, "WORKSPACE_DIR", ws):
+                checks = [hc.check_claude_hook_registration()]
+                self.assertIn("no launch record", checks[0]["detail"])
+                hc.apply_claude_hooks_fix(checks, stream=io.StringIO())
+                self.assertEqual(proj.read_text(), legacy, "a pre-update core's only hooks were swept")
+                settings, _ = hc._core_launch_settings(repo)
+                (ws / "state").mkdir(parents=True)
+                (ws / "state" / "core-launch-settings.json").write_text(json.dumps({"settings": settings}))
+                checks = [hc.check_claude_hook_registration()]
+                self.assertEqual(checks[0]["status"], "warn", checks[0]["detail"])
+                hc.apply_claude_hooks_fix(checks, stream=io.StringIO())
+            self.assertEqual(checks[0]["status"], "ok", checks[0]["detail"])
+            left = [h["command"] for g in json.loads(proj.read_text())["hooks"]["Stop"] for h in g["hooks"]]
+            self.assertEqual(left, ["echo operator"])
 
 
 class DispatchWiring(unittest.TestCase):
     def test_fix_dispatch_calls_the_handler(self):
         src = (REPO / "src" / "health-check.py").read_text()
-        self.assertIn(
-            "apply_claude_hooks_fix(checks, stream=", src,
-            "handler is defined but never dispatched — --fix would be inert",
-        )
-
-
-class TestDeadHookRepair(FixHandlerGating):
-    """Dead entries are repaired by the installer that owns their family, which prunes them."""
-
-    def _dead(self, family, path="/var/folders/x/repo/src/hint.sh"):
-        return {"name": "claude-hooks", "status": "warn", "detail": "x",
-                "_dead_hooks": [{"event": "SessionStart", "command": f'bash "{path}"',
-                                 "path": path, "family": family}]}
-
-    def test_a_dead_compact_hint_runs_its_own_installer_once(self):
-        calls = self._run(self._dead("personal-claude-compact-hint.sh"))
-        self.assertEqual(len(calls), 1, calls)
-        self.assertIn("install-personal-claude-hook.sh", " ".join(map(str, calls[0])))
-
-    def test_two_dead_entries_of_one_family_run_the_installer_once(self):
-        check = self._dead("schedule-crons-session-hint.sh")
-        check["_dead_hooks"].append(dict(check["_dead_hooks"][0], path="/elsewhere/hint.sh"))
-        calls = self._run(check)
-        self.assertEqual(len(calls), 1, calls)
-        self.assertIn("install-session-start-hook.sh", " ".join(map(str, calls[0])))
-
-    def test_an_owning_installer_that_fails_warns_instead_of_raising(self):
-        import io
-        real, real_probe = subprocess.run, hc.check_claude_hook_registration
-
-        def boom(cmd, *a, **k):
-            raise OSError("bash vanished")
-
-        hc.subprocess.run = boom
-        hc.check_claude_hook_registration = lambda *a, **k: {"name": "claude-hooks", "status": "warn", "detail": "still dead"}
-        buf = io.StringIO()
-        try:
-            hc.apply_claude_hooks_fix([self._dead("personal-claude-compact-hint.sh")], stream=buf)
-        finally:
-            hc.subprocess.run = real
-            hc.check_claude_hook_registration = real_probe
-        self.assertIn("could not run install-personal-claude-hook.sh", buf.getvalue())
-        self.assertIn("bash vanished", buf.getvalue())
-
-    def test_a_foreign_family_is_reported_not_deleted(self):
-        import io
-        buf = io.StringIO()
-        calls = self._run(self._dead("someone-elses-tool.sh"), out=buf)
-        self.assertEqual(calls, [])
-        self.assertIn("not a family a Sutando installer owns", buf.getvalue())
+        self.assertIn("apply_claude_hooks_fix(checks, stream=", src,
+                      "handler is defined but never dispatched — --fix would be inert")
 
 
 if __name__ == "__main__":

@@ -1,521 +1,207 @@
 #!/usr/bin/env python3
-"""Regression: nothing verified that the Claude Code hooks we install stay installed.
+"""claude-hooks probe: the core's launch settings are the only registration.
 
-2026-08-03, measured on a live host: ZERO of the four hooks `install-claude-hooks.sh`
-owns were present in its own target file, including BOTH PreCompact entries. So
-session-state.md was never regenerated on compaction and the transcript archiver had
-never run — for days, silently, because no probe looks at hook registration. A peer
-host showed the same shape.
+It must warn when the launch JSON would miss an owned or skill hook, point at a
+missing script, or leave transcripts on the 30-day default; when the running core's
+own launch record lacks them; and when a settings file still holds a Sutando-written
+copy that fires outside the core launch.
 
 Run: python3 tests/health-check-claude-hook-registration.test.py
 """
 from __future__ import annotations
+
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
+BUILDER = "src/agent/claude/cli/build-core-settings.mjs"
+TABLE = "src/agent/claude/cli/owned-hooks.json"
+OWNED = ("check-pending-tasks.sh", "turn-start.sh", "session-handoff.sh",
+         "schedule-crons-session-hint.sh", "personal-claude-compact-hint.sh",
+         "watcher-rearm-session-hint.sh")
 
 
 def _load():
     spec = importlib.util.spec_from_file_location("hc_hooks_test", REPO / "src" / "health-check.py")
     hc = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(hc)
+    try:
+        spec.loader.exec_module(hc)
+    except SystemExit:
+        pass
     return hc
 
 
-INSTALLER = '''#!/usr/bin/env bash
-SETTINGS="$REPO_DIR/.claude/settings.json"
-HOOKS=(
-  "PreCompact|sutando-conversations/|cp \\"\\$TRANSCRIPT_PATH\\" \\"\\$HOME/Desktop/sutando-conversations/\\$(date +%Y).jsonl\\""
-  "PreCompact|src/session-handoff.sh|bash $REPO_DIR/src/session-handoff.sh"
-  "SessionEnd|src/session-handoff.sh|bash $REPO_DIR/src/session-handoff.sh"
-  "Stop|src/check-pending-tasks.sh|bash $REPO_DIR/src/check-pending-tasks.sh"
-)
-'''
+hc = _load()
 
 
-class TestHookRegistration(unittest.TestCase):
+@unittest.skipUnless(shutil.which("node"), "node is required to run the launch-settings builder")
+class Probe(unittest.TestCase):
     def setUp(self):
-        self.hc = _load()
-        self._tmp = tempfile.TemporaryDirectory()
-        self.repo = Path(self._tmp.name)
-        (self.repo / "src").mkdir(parents=True)
-        (self.repo / ".claude").mkdir(parents=True)
-        (self.repo / "src" / "install-claude-hooks.sh").write_text(INSTALLER)
+        self._td = tempfile.TemporaryDirectory()
+        self.repo = Path(self._td.name) / "repo"
+        (self.repo / BUILDER).parent.mkdir(parents=True)
+        shutil.copy(REPO / BUILDER, self.repo / BUILDER)
+        shutil.copy(REPO / TABLE, self.repo / TABLE)
+        for name in OWNED:
+            (self.repo / "src" / name).write_text("#!/bin/bash\n")
+        (self.repo / "hooks").mkdir()
+        (self.repo / "hooks" / "skip-ask-user-question.py").write_text("")
+        skill = self.repo / "skills" / "demo"
+        (skill / "hooks").mkdir(parents=True)
+        (skill / "hooks" / "g.py").write_text("")
+        (skill / "manifest.json").write_text(json.dumps(
+            {"name": "demo", "hooks": [{"event": "PreToolUse", "command": "./hooks/g.py"}]}))
+        self.ccd = Path(self._td.name) / "ccd"
+        self.ccd.mkdir()
+        self.ws = Path(self._td.name) / "ws"
+        settings, why = hc._core_launch_settings(self.repo)
+        assert settings is not None, why
+        self.record(settings)
+        self._env = mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": ""})
+        self._env.start()
 
     def tearDown(self):
-        self._tmp.cleanup()
+        self._env.stop()
+        self._td.cleanup()
 
-    def _settings(self, hooks: dict):
-        (self.repo / ".claude" / "settings.json").write_text(json.dumps({"hooks": hooks}))
+    def record(self, settings):
+        (self.ws / "state").mkdir(parents=True, exist_ok=True)
+        (self.ws / "state" / "core-launch-settings.json").write_text(
+            json.dumps({"ts": 1, "repo": str(self.repo), "settings": settings}))
 
-    def _entry(self, cmd):
-        return [{"hooks": [{"type": "command", "command": cmd}]}]
+    def probe(self, **kw):
+        kw.setdefault("workspace_dir", self.ws)
+        return hc.check_claude_hook_registration(repo_dir=self.repo, config_dir=self.ccd, **kw)
 
-    def _all_registered(self, repo_path=None):
-        r = str(repo_path or self.repo)
-        return {
-            "PreCompact": [{"hooks": [{"command": 'cp "$TRANSCRIPT_PATH" "$HOME/Desktop/sutando-conversations/x.jsonl"'},
-                                      {"command": f"bash {r}/src/session-handoff.sh"}]}],
-            "SessionEnd": self._entry(f"bash {r}/src/session-handoff.sh"),
-            "Stop": self._entry(f"bash {r}/src/check-pending-tasks.sh"),
-        }
-
-    def test_all_registered_is_ok(self):
-        self._settings(self._all_registered())
-        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+    def test_ok_when_the_launch_settings_carry_everything_and_no_file_has_a_copy(self):
+        out = self.probe()
         self.assertEqual(out["status"], "ok", out["detail"])
-        self.assertIn("4", out["detail"])
+        # guard + 7 owned + 1 skill hook
+        self.assertIn("9 hooks registered by the core's launch settings only", out["detail"])
 
-    def test_the_REAL_case_no_hooks_at_all_warns_and_names_them(self):
-        # The live finding: the installer's own target had none of the four.
-        self._settings({})
-        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+    def test_not_a_checkout(self):
+        os.remove(self.repo / BUILDER)
+        self.assertIn("not a sutando checkout", self.probe()["detail"])
+
+    def test_node_missing_warns(self):
+        with mock.patch.object(hc.shutil, "which", return_value=None):
+            out = self.probe()
         self.assertEqual(out["status"], "warn")
-        self.assertIn("4 NOT registered", out["detail"])
-        self.assertIn("PreCompact", out["detail"], "name what is missing, not just a count")
+        self.assertIn("node not found", out["detail"])
 
-    def test_partial_registration_names_only_the_missing(self):
-        h = self._all_registered()
-        del h["PreCompact"]
-        self._settings(h)
-        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+    def test_a_failing_builder_warns_with_its_exit(self):
+        (self.repo / BUILDER).write_text("process.stderr.write('boom'); process.exit(4);\n")
+        out = self.probe()
         self.assertEqual(out["status"], "warn")
-        self.assertIn("2 NOT registered", out["detail"])
-        self.assertNotIn("Stop:", out["detail"], "a registered hook must not be reported missing")
+        self.assertIn("exited 4", out["detail"])
 
-    def test_remedy_omits_the_archive_hook_when_other_hooks_are_missing(self):
-        # The bare installer registers the transcript archiver. Anyone repairing an unrelated
-        # missing hook by following this text would enable an egress the owner has not opted into.
-        h = self._all_registered()
-        del h["Stop"]
-        self._settings(h)
-        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+    def test_a_builder_that_cannot_run_warns(self):
+        with mock.patch.object(hc.subprocess, "run", side_effect=OSError("no exec")):
+            out = self.probe()
+        self.assertIn("build-core-settings.mjs failed", out["detail"])
+
+    def test_a_raising_discovery_warns(self):
+        import skill_hooks
+        with mock.patch.object(skill_hooks, "discover", side_effect=RuntimeError("boom")):
+            out = self.probe()
         self.assertEqual(out["status"], "warn")
-        self.assertIn("SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1", out["detail"])
+        self.assertIn("skill-hook discovery failed", out["detail"])
 
-    def test_remedy_does_not_prescribe_a_repair_when_only_the_archiver_is_missing(self):
-        # --fix already refuses this case; the text used to prescribe the bare command anyway.
-        h = self._all_registered()
-        h["PreCompact"] = [{"hooks": [{"command": f"bash {self.repo}/src/session-handoff.sh"}]}]
-        self._settings(h)
-        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+    def test_a_builder_missing_events_skill_hooks_and_retention_warns_for_each(self):
+        (self.repo / BUILDER).write_text(
+            'process.stdout.write(JSON.stringify({hooks: {Stop: [{hooks: [{type: "command", command: "true"}]}]}}));\n')
+        detail = self.probe()["detail"]
+        self.assertIn("launch settings lack owned hooks: ", detail)
+        self.assertIn("+3 more", detail)
+        self.assertIn("skill hooks missing from launch settings: PreToolUse:", detail)
+        self.assertIn("cleanupPeriodDays", detail)
+
+    def test_one_unrelated_command_per_event_is_not_the_owned_set(self):
+        echoes = {e: [{"matcher": "", "hooks": [{"type": "command", "command": "echo x"}]}]
+                  for e in ("Stop", "UserPromptSubmit", "PreCompact", "SessionEnd", "SessionStart")}
+        (self.repo / BUILDER).write_text(
+            f"process.stdout.write(JSON.stringify({{hooks: {json.dumps(echoes)}, cleanupPeriodDays: 3650}}));\n")
+        out = self.probe()
         self.assertEqual(out["status"], "warn")
-        self.assertIn("explicit opt-in", out["detail"])
-        self.assertIn("only if you intend", out["detail"])
-        self.assertNotIn("re-run", out["detail"], "an opt-in is not a repair instruction")
+        self.assertIn("launch settings lack owned hooks", out["detail"])
 
-    def test_registered_but_pointing_at_ANOTHER_checkout_warns(self):
-        # The failure that looks healthiest: present, so an existence check passes,
-        # but aimed at a stale copy — this host ran a 5-day-old script for days.
-        self._settings(self._all_registered(repo_path="/somewhere/else/sutando"))
-        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+    def test_no_launch_record_means_the_running_core_is_not_proven(self):
+        (self.ws / "state" / "core-launch-settings.json").unlink()
+        out = self.probe()
         self.assertEqual(out["status"], "warn")
-        self.assertIn("NOT running the installer's command", out["detail"])
+        self.assertIn("no launch record for the running core", out["detail"])
+        self.assertFalse(out["_live_core_has_launch_hooks"])
 
-    def test_unparseable_HOOKS_array_warns_rather_than_reporting_clean(self):
-        # An empty owned-list would otherwise mean "0 missing of 0" -> "ok", i.e. a
-        # probe that cannot fail. Fail toward noise instead.
-        (self.repo / "src" / "install-claude-hooks.sh").write_text("#!/usr/bin/env bash\necho hi\n")
-        self._settings({})
-        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+    def test_a_record_from_an_older_launch_is_not_the_builders_output(self):
+        settings, _ = hc._core_launch_settings(self.repo)
+        settings["hooks"].pop("SessionStart")
+        self.record(settings)
+        out = self.probe()
         self.assertEqual(out["status"], "warn")
-        self.assertIn("could not parse", out["detail"])
+        self.assertIn("the running core was launched without", out["detail"])
+        self.assertFalse(out["_live_core_has_launch_hooks"])
 
-    def test_missing_settings_file_warns(self):
-        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+    def test_an_owned_script_that_is_gone_warns(self):
+        os.remove(self.repo / "src" / "turn-start.sh")
+        out = self.probe()
         self.assertEqual(out["status"], "warn")
-        self.assertIn("never run", out["detail"])
+        self.assertIn(f"missing scripts: {self.repo / 'src' / 'turn-start.sh'}", out["detail"])
 
-    def test_malformed_settings_warns_never_raises(self):
-        (self.repo / ".claude" / "settings.json").write_text("{not json")
-        try:
-            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
-        except Exception as e:
-            self.fail(f"must not propagate: {e!r}")
+    def test_copies_in_the_project_file_and_config_dir_are_reported_for_the_fix(self):
+        proj = self.repo / ".claude" / "settings.json"
+        proj.parent.mkdir()
+        proj.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": f"bash '{self.repo}/src/check-pending-tasks.sh'"},
+            {"type": "command", "command": "echo operator"}]}]}}))
+        (self.ccd / "settings.json").write_text(json.dumps({"hooks": {"SessionEnd": [{"hooks": [
+            {"type": "command", "command": f'bash "{self.repo}/src/session-handoff.sh" "${{TRANSCRIPT_PATH:-}}"'}]}]}}))
+        out = self.probe()
         self.assertEqual(out["status"], "warn")
+        self.assertIn("2 Sutando hook copies still in a settings file", out["detail"])
+        self.assertTrue(out["_live_core_has_launch_hooks"])
+        self.assertEqual(len(out["_project_leftovers"]), 2)
+        self.assertNotIn("echo operator", " ".join(out["_project_leftovers"]))
+        # Probing is read-only.
+        self.assertIn("check-pending-tasks.sh", proj.read_text())
 
-    def test_VALID_json_of_the_wrong_shape_warns_and_never_aborts_the_run(self):
-        # Unparseable JSON was covered; PARSEABLE-but-wrong-shape was not, and that is a
-        # different axis. `[]` parses fine and then .get() raises AttributeError, which
-        # takes down every probe after this one in run_all_checks(). Cover the shape axis,
-        # not just the two spellings a reviewer happened to name.
-        for payload in ("[]", '"a string"', "3", "null",
-                        '{"hooks": []}', '{"hooks": "nope"}', '{"hooks": 7}'):
-            with self.subTest(payload=payload):
-                (self.repo / ".claude" / "settings.json").write_text(payload)
-                try:
-                    out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
-                except Exception as e:
-                    self.fail(f"{payload!r} must warn, not propagate {e!r}")
-                self.assertEqual(out["status"], "warn", payload)
+    def test_one_copy_is_singular(self):
+        (self.ccd / "settings.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": f"bash '{self.repo}/src/check-pending-tasks.sh'"}]}]}}))
+        self.assertIn("1 Sutando hook copy still", self.probe()["detail"])
 
-    def _one_hook_repo(self, root_name, command):
-        """A repo with a single owned Stop hook registered to `command`."""
-        repo = Path(self._tmp.name) / root_name
-        (repo / "src").mkdir(parents=True)
-        (repo / ".claude").mkdir(parents=True)
-        (repo / "src" / "install-claude-hooks.sh").write_text(
-            '#!/usr/bin/env bash\nSETTINGS="$REPO_DIR/.claude/settings.json"\n'
-            # production shape: the installer shell-quotes via $(shq ...)
-            'HOOKS=(\n  "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"\n)\n'
-        )
-        (repo / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
-            "Stop": [{"hooks": [{"type": "command", "command": command(repo)}]}]}}))
-        return repo
-
-    def test_a_path_that_merely_SHARES_A_PREFIX_is_a_different_checkout(self):
-        # `str(repo) in command` says these are the same checkout. They are not — and this
-        # is precisely the present-but-pointing-elsewhere case the probe exists to catch,
-        # so a substring test certifying it clean defeats the probe's whole purpose.
-        # Both directions: the stale copy longer than the repo, and shorter.
-        cases = {
-            "sibling-suffix": ("a/sutando", lambda r: f"bash {r}-old/src/check-pending-tasks.sh"),
-            "sibling-prefix": ("b/sutando-new", lambda r: f"bash {str(r)[:-4]}/src/check-pending-tasks.sh"),
-            "same-basename-elsewhere": ("c/sutando", lambda r: "bash /opt/sutando/src/check-pending-tasks.sh"),
-        }
-        for label, (root, cmd) in cases.items():
-            with self.subTest(case=label):
-                repo = self._one_hook_repo(root, cmd)
-                out = self.hc.check_claude_hook_registration(repo_dir=repo)
-                self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
-                self.assertIn("NOT running the installer's command", out["detail"])
-
-    def test_the_foreign_remedy_scopes_the_omit_flag_to_the_archive_family(self):
-        # Measured by qingyun-wu on the real installer: with the flag SET a non-archive
-        # foreign hook still prunes (removed=1). The flag adds ONE deprecated entry.
-        repo = self._one_hook_repo("nonarch", lambda r: "bash /opt/elsewhere/src/check-pending-tasks.sh")
-        out = self.hc.check_claude_hook_registration(repo_dir=repo)
-        self.assertEqual(out["status"], "warn", out["detail"])
-        remedy = out.get("remedy", "") or out["detail"]
-        self.assertIn("SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1", remedy)
-        self.assertNotIn("do NOT pass", remedy,
-                         "a NON-archive foreign hook must keep the opt-out: with the flag set it "
-                         "still prunes, and the plain run would install the ~/Desktop archiver "
-                         f"for nothing. got: {remedy}")
-
-    def test_a_GENUINE_checkout_is_not_reported_foreign(self):
-        # Over-trigger control for the fix above: a warning that fires on healthy hosts is
-        # its own defect. Exact path, and the same path reached through a symlink (macOS
-        # /var -> /private/var makes this the common case, not an exotic one).
-        repo = self._one_hook_repo("real", lambda r: f"bash {r}/src/check-pending-tasks.sh")
-        self.assertEqual(self.hc.check_claude_hook_registration(repo_dir=repo)["status"], "ok")
-
-        link = Path(self._tmp.name) / "linked"
-        link.symlink_to(repo)
-        out = self.hc.check_claude_hook_registration(repo_dir=link)
-        self.assertEqual(out["status"], "ok", f"symlinked checkout must not read as foreign: {out['detail']}")
-
-    def test_a_quoted_path_with_spaces_still_resolves(self):
-        repo = self._one_hook_repo("has space", lambda r: f'bash "{r}/src/check-pending-tasks.sh"')
-        self.assertEqual(self.hc.check_claude_hook_registration(repo_dir=repo)["status"], "ok")
-
-    # --- the fail-soft branches themselves. Arguing a probe "fails toward noise"
-    # and then leaving its error paths unexercised is how the argument stops being
-    # true; each of these was uncovered until CI said so.
-
-    def test_unbalanced_quoting_in_a_hook_command_does_not_raise(self):
-        # shlex.split raises ValueError on an unterminated quote. A settings file is
-        # hand-editable, so this is reachable, and it must degrade rather than take
-        # out the run like the wrong-shape JSON did.
-        cmd = 'bash "{r}/src/check-pending-tasks.sh'
-        # Assert the fixture actually enters the branch. Without this the test could
-        # pass while shlex parsed the string fine, i.e. never exercising the handler
-        # it claims to cover.
-        with self.assertRaises(ValueError):
-            __import__("shlex").split(cmd.format(r="/x"))
-        repo = self._one_hook_repo("unbalanced", lambda r: cmd.format(r=r))
-        try:
-            out = self.hc.check_claude_hook_registration(repo_dir=repo)
-        except Exception as e:
-            self.fail(f"must degrade, not propagate: {e!r}")
+    def test_an_unreadable_settings_file_warns_instead_of_raising(self):
+        (self.ccd / "settings.json").write_text("{nope")
+        out = self.probe()
         self.assertEqual(out["status"], "warn")
+        self.assertIn("could not read a settings file", out["detail"])
 
-    def test_an_unreadable_installer_warns_rather_than_raising(self):
-        # Patched rather than chmod 000: CI runs as root, where 000 is still readable,
-        # so a permissions fixture would pass locally and silently never exercise this.
-        import unittest.mock as mock
-        self._settings(self._all_registered())
-        with mock.patch.object(Path, "read_text", side_effect=OSError("boom")):
-            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
-        self.assertEqual(out["status"], "warn")
-        self.assertIn("cannot read installer", out["detail"])
-
-    def test_settings_with_no_hooks_key_at_all_is_treated_as_none_registered(self):
-        # Distinct from {"hooks": {}}: the key is ABSENT, so conf.get returns None.
-        # A file that has never had hooks written to it takes this path, which makes
-        # it the likely shape on a fresh host — the one this probe exists to catch.
-        (self.repo / ".claude" / "settings.json").write_text(json.dumps({"model": "opus"}))
-        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
-        self.assertEqual(out["status"], "warn")
-        self.assertIn("4 NOT registered", out["detail"])
-
-    def test_a_command_that_only_MENTIONS_the_script_is_not_an_invocation(self):
-        # The nastiest false-clean: the expected path is present, so both a substring
-        # test AND a scan-every-token test say "registered" — while something else
-        # entirely runs. A stale or replaced hook keeps the probe green just by
-        # carrying its old target as inert data.
-        decoys = {
-            "echo": "echo {p}",
-            "printf-with-format": 'printf "%s" {p}',
-            "runs a DIFFERENT script, path as arg": "bash /tmp/other.sh {p}",
-            "path in a comment-ish trailing arg": "bash /tmp/other.sh --note {p}",
-        }
-        for label, tmpl in decoys.items():
-            with self.subTest(decoy=label):
-                repo = self._one_hook_repo(
-                    f"decoy-{abs(hash(label))}",
-                    lambda r, _t=tmpl: _t.format(p=f"{r}/src/check-pending-tasks.sh"),
-                )
-                out = self.hc.check_claude_hook_registration(repo_dir=repo)
-                self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
-                self.assertIn("NOT running the installer's command", out["detail"])
-
-    def test_the_installers_OWN_command_shape_is_what_counts_as_registered(self):
-        # Over-trigger control for the above: the command the installer actually
-        # writes must still read as registered, or the probe just cries wolf.
-        repo = self._one_hook_repo("genuine-cmd", lambda r: f"bash {r}/src/check-pending-tasks.sh")
-        self.assertEqual(self.hc.check_claude_hook_registration(repo_dir=repo)["status"], "ok")
-
-    def test_malformed_shapes_at_EVERY_nesting_level_warn_instead_of_raising(self):
-        # Round one validated the top two containers only. These are the levels below
-        # it, and each raised TypeError straight out of the probe — which, because it
-        # runs inside run_all_checks(), aborted every later check. Cover the DEPTH
-        # axis, not the two shapes a reviewer happened to name.
-        shapes = {
-            "event value is an int": {"Stop": 7},
-            "event value is a string": {"Stop": "nope"},
-            "group is not a dict": {"Stop": [5]},
-            "group.hooks is an int": {"Stop": [{"hooks": 7}]},
-            "group.hooks entry not a dict": {"Stop": [{"hooks": [5]}]},
-            "command is an int": {"Stop": [{"hooks": [{"command": 7}]}]},
-            "command is a list": {"Stop": [{"hooks": [{"command": ["bash"]}]}]},
-        }
-        for label, hooks in shapes.items():
-            with self.subTest(shape=label):
-                self._settings(hooks)
-                try:
-                    out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
-                except Exception as e:
-                    self.fail(f"{label} must warn, not propagate {e!r}")
-                self.assertEqual(out["status"], "warn", label)
-
-    def test_not_a_sutando_checkout_is_ok_not_a_warning(self):
-        (self.repo / "src" / "install-claude-hooks.sh").unlink()
-        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
-        self.assertEqual(out["status"], "ok")
-
-    def test_probe_is_wired_into_run_all_checks(self):
-        # Reachability: a probe defined but never called is invisible.
-        names = [c.get("name") for c in self.hc.run_all_checks() if isinstance(c, dict)]
-        self.assertIn("claude-hooks", names)
+    def test_the_default_config_dir_comes_from_the_shared_resolver(self):
+        ws = Path(self._td.name) / "ws"
+        (ws / ".claude-sutando").mkdir(parents=True)
+        (ws / ".claude-sutando" / "settings.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": f"bash '{self.repo}/src/check-pending-tasks.sh'"}]}]}}))
+        with mock.patch.dict(os.environ, {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(ws)}):
+            out = hc.check_claude_hook_registration(repo_dir=self.repo, workspace_dir=self.ws)
+        self.assertEqual(len(out["_project_leftovers"]), 1, out["detail"])
 
 
-
-class TestAgainstTheRealInstaller(unittest.TestCase):
-    """Everything above uses a SIMPLIFIED fixture, and that is how three rounds of
-    review kept finding false-cleans this suite was green through.
-
-    The real `src/install-claude-hooks.sh` writes its command as
-    `bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")`. The probe reads HOOKS as
-    literal source, so before the unwrap the path was welded into a `$(shq` token and
-    NO production hook resolved positionally — every one took the permissive fallback,
-    which meant `echo <path>` counted as registered on the only path that ships.
-
-    So this class builds its fixture from the repository's OWN installer. If the
-    installer's command shape changes into something the parser can't reduce, these
-    fail — which a hand-written approximation of it could never do.
-    """
-
-    def setUp(self):
-        self.hc = _load()
-        self.installer_src = (REPO / "src" / "install-claude-hooks.sh").read_text()
-        self._tmp = tempfile.TemporaryDirectory()
-
-    def tearDown(self):
-        self._tmp.cleanup()
-
-    def _repo(self, stop_command, archive_command=None):
-        r = Path(self._tmp.name) / f"repo{abs(hash((stop_command, archive_command))) % 99999}"
-        (r / "src").mkdir(parents=True)
-        (r / ".claude").mkdir(parents=True)
-        (r / "src" / "install-claude-hooks.sh").write_text(self.installer_src)
-        handoff = f'bash {r}/src/session-handoff.sh "$TRANSCRIPT_PATH"'
-        (r / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
-            # Must track the installer's CURRENT archive shape: a literal here made
-            # all three over-trigger controls fail on the shape change itself.
-            "PreCompact": [{"hooks": [
-                {"command": archive_command or
-                 f'bash {r}/src/archive-transcript.sh "$HOME/Desktop/sutando-conversations/"'},
-                {"command": handoff}]}],
-            "SessionEnd": [{"hooks": [{"command": handoff}]}],
-            "Stop": [{"hooks": [{"command": stop_command.format(
-                p=f"{r}/src/check-pending-tasks.sh")}]}],
-            "UserPromptSubmit": [{"hooks": [
-                {"command": f"bash {r}/src/turn-start.sh"}]}],
-        }}))
-        return r
-
-    def test_the_installers_real_shq_command_reads_as_registered(self):
-        # Over-trigger control, and the one that matters most: failing closed is only
-        # correct if the genuine production shape still passes. If this breaks, the
-        # probe warns on every healthy host.
-        out = self.hc.check_claude_hook_registration(repo_dir=self._repo("bash {p}"))
-        self.assertEqual(out["status"], "ok", out["detail"])
-        self.assertIn("5", out["detail"])
-
-    def test_decoys_are_rejected_on_the_REAL_installer_shape(self):
-        for label, cmd in {
-            "echo": "echo {p}",
-            "printf": 'printf "%s" {p}',
-            "different script, path as arg": "bash /tmp/other.sh {p}",
-        }.items():
-            with self.subTest(decoy=label):
-                out = self.hc.check_claude_hook_registration(repo_dir=self._repo(cmd))
-                self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
-                self.assertIn("NOT running the installer's command", out["detail"])
-
-    def test_the_ARCHIVE_hook_is_validated_too_not_just_src_paths(self):
-        # I exempted every marker that is not a `src/` path from command-shape
-        # validation, reasoning that a non-repo path has no identity to compare.
-        # That confused path identity with command shape: the archive hook still
-        # has an installer-owned command, and `echo` is not `cp`. Under the old
-        # substring-only test BOTH of these read as a healthy archiver — and the
-        # second is the one that settles it, because a destructive command
-        # certified as a working archive hook inverts the probe's whole purpose.
-        for label, cmd in {
-            "echo": "echo sutando-conversations/",
-            "rm -rf": "rm -rf sutando-conversations/",
-            "a different copier": "rsync x sutando-conversations/",
-        }.items():
-            with self.subTest(decoy=label):
-                out = self.hc.check_claude_hook_registration(
-                    repo_dir=self._repo("bash {p}", archive_command=cmd))
-                self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
-                self.assertIn("sutando-conversations/", out["detail"])
-
-    def test_a_cp_that_carries_the_marker_but_archives_the_WRONG_THING(self):
-        # Program-only validation left these two: both are `cp`, both carry the
-        # marker, neither archives the session transcript to the owned destination.
-        #
-        # I had justified stopping at the program with a "compatibility boundary"
-        # argument — the installer preserves operator-customized archive hooks, so
-        # any cp must be acceptable. That was WRONG, and checkable: Phase 0 does
-        # skip sweeping a custom archiver, but Phase 1 detects presence by EXACT
-        # command string (`index($cmd)`), so a custom cp never satisfies it and the
-        # installer ADDS its own alongside. They coexist — meaning the installer's
-        # own command IS present on any host where it ran, and the probe can say so.
-        cases = {
-            "wrong source": 'cp /tmp/not-the-transcript "$HOME/Desktop/sutando-conversations/x.jsonl"',
-            "wrong destination": 'cp "$TRANSCRIPT_PATH" /tmp/sutando-conversations/not-desktop.jsonl',
-            # Three-operand cp: the owned prefix IS present, just not in the
-            # destination position. cp reads this as two sources plus a target and
-            # fails at runtime unless the last path is a directory — so nothing is
-            # archived. Accepting the prefix in "any token" certified it.
-            "extra operand, prefix not in dest position":
-                'cp "$TRANSCRIPT_PATH" /tmp/not-the-archive "$HOME/Desktop/sutando-conversations/x.jsonl"',
-            # Same shape, fewer operands than the installer writes.
-            "too few operands": 'cp "$HOME/Desktop/sutando-conversations/x.jsonl"',
-        }
-        for label, cmd in cases.items():
-            with self.subTest(case=label):
-                out = self.hc.check_claude_hook_registration(
-                    repo_dir=self._repo("bash {p}", archive_command=cmd))
-                self.assertEqual(out["status"], "warn", f"{label}: {out['detail']}")
-                self.assertIn("sutando-conversations/", out["detail"])
-
-    def test_the_installer_template_parses_into_CLEAN_tokens(self):
-        # The genuine case regressed to `warn` twice while I was fixing the above,
-        # both times because the template failed to tokenize and fell back to a
-        # whitespace split that keeps stray quotes. Pin the parse itself so the
-        # next person sees the cause, not just a mysterious false warning.
-        import re
-        src = (REPO / "src" / "install-claude-hooks.sh").read_text()
-        body = re.search(r"^HOOKS=\((.*?)^\)", src, re.M | re.S).group(1)
-        line = [l.strip() for l in body.split("\n")
-                if l.strip().startswith('"') and "sutando-conversations" in l][0]
-        _ev, _marker, cmd = line.strip('"').split("|", 2)
-        toks = self.hc._shell_tokens(self.hc._unwrap_installer_command(cmd))
-        self.assertEqual(len(toks), 3, f"archive template did not tokenize cleanly: {toks}")
-        self.assertEqual(toks[0], "bash")
-        self.assertTrue(toks[1].endswith("/src/archive-transcript.sh"), toks[1])
-        for t in toks:
-            self.assertNotIn('"', t, f"stray quote survived tokenization: {t!r}")
-
-    def test_the_genuine_archive_command_still_registers(self):
-        # Over-trigger control. The real command interpolates $HOME, so this must not
-        # become a shape-pinning test that warns on healthy hosts.
-        out = self.hc.check_claude_hook_registration(repo_dir=self._repo("bash {p}"))
-        self.assertEqual(out["status"], "ok", out["detail"])
-
-    def test_an_unreducible_template_fails_CLOSED(self):
-        # The fallback used to accept the path anywhere in the first two tokens. A
-        # fallback the real data always took was not a fallback — it was the behaviour.
-        # If a future wrapper defeats the unwrap, warn; never silently accept.
-        self.assertFalse(self.hc._hook_command_targets(
-            "echo /repo/src/x.sh", Path("/repo/src/x.sh"), "somecmd $(unknown_wrapper x)"))
-
-class TestDeadHookPaths(TestHookRegistration):
-    """A registered hook whose script is gone fails on every fire and was invisible to the
-    owned-list check (live host, 2026-09-08: three deleted tmp-repo copies of the compact
-    hint fired at every compaction; the probe reported only the missing archiver)."""
-
-    def test_a_dead_hook_path_warns_and_carries_a_repair_marker(self):
-        hooks = self._all_registered()
-        dead = f"bash \"{self.repo}/gone/repo/src/personal-claude-compact-hint.sh\""
-        hooks.setdefault("SessionStart", []).extend(self._entry(dead))
-        self._settings(hooks)
-        got = self.hc.check_claude_hook_registration(repo_dir=self.repo)
-        self.assertEqual(got["status"], "warn")
-        self.assertIn("no longer exists", got["detail"])
-        self.assertIn("personal-claude-compact-hint.sh", got["detail"])
-        self.assertEqual([r["family"] for r in got["_dead_hooks"]], ["personal-claude-compact-hint.sh"])
-        self.assertNotIn("_unregistered_hooks", got)
-
-    def test_control_a_live_extra_hook_is_not_dead(self):
-        live = self.repo / "src" / "personal-claude-compact-hint.sh"
-        live.write_text("#!/bin/bash\n")
-        hooks = self._all_registered()
-        hooks.setdefault("SessionStart", []).extend(self._entry(f'bash "{live}"'))
-        self._settings(hooks)
-        got = self.hc.check_claude_hook_registration(repo_dir=self.repo)
-        self.assertEqual(got["status"], "ok", got["detail"])
-
-    def test_a_relative_path_is_judged_against_the_project_not_the_cwd(self):
-        (self.repo / "src" / "personal-claude-compact-hint.sh").write_text("#!/bin/bash\n")
-        hooks = self._all_registered()
-        hooks.setdefault("SessionStart", []).extend(self._entry('bash "src/personal-claude-compact-hint.sh"'))
-        self._settings(hooks)
-        got = self.hc.check_claude_hook_registration(repo_dir=self.repo)
-        self.assertEqual(got["status"], "ok", got["detail"])
-
-
-class TestHookScriptPathFallback(unittest.TestCase):
-    """An older checkout without claude_hooks_settings still gets a probe: the fallback parser."""
-
-    def test_fallback_parses_when_the_installer_module_is_unavailable(self):
-        import sys
-        hc = _load()
-        saved = sys.modules.get("claude_hooks_settings")
-        sys.modules["claude_hooks_settings"] = None  # importing a None entry raises ImportError
-        try:
-            self.assertEqual(hc._hook_script_path("bash /x/y.sh"), "/x/y.sh")
-            self.assertEqual(hc._hook_script_path("python3 '/x/y.py' --flag"), "/x/y.py")
-            self.assertIsNone(hc._hook_script_path("bash"))
-            self.assertEqual(hc._hook_script_path("cp a b"), "cp")
-            self.assertIsNone(hc._hook_script_path(""))
-        finally:
-            if saved is None:
-                sys.modules.pop("claude_hooks_settings", None)
-            else:
-                sys.modules["claude_hooks_settings"] = saved
-
-    def test_the_shared_parser_is_used_when_available(self):
-        hc = _load()
-        self.assertEqual(hc._hook_script_path('bash "/x/y z.sh"'), "/x/y z.sh")
+@unittest.skipUnless(shutil.which("node"), "node is required to run the launch-settings builder")
+class LiveTree(unittest.TestCase):
+    def test_this_checkout_builds_launch_settings_with_every_owned_hook(self):
+        settings, why = hc._core_launch_settings(REPO)
+        self.assertIsNotNone(settings, why)
+        commands = " ".join(h["command"] for gs in settings["hooks"].values() for g in gs for h in g["hooks"])
+        for name in OWNED:
+            self.assertIn(f"/src/{name}", commands)
+        self.assertEqual(settings["cleanupPeriodDays"], 3650)
 
 
 if __name__ == "__main__":

@@ -83,7 +83,7 @@ class WatcherIdentityTests(unittest.TestCase):
             self.assertEqual(h.tm("has-session", "-t", "=sutando-core").returncode, 0, "the core itself must still start")
             exists, _, _ = h.watcher()
             self.assertFalse(exists, "a watcher was started with no runnable interpreter")
-            self.assertIn("no runnable python3", run.stderr)
+            self.assertIn("task notifier not started: no runnable Python interpreter", run.stderr)
         finally:
             h.close()
 

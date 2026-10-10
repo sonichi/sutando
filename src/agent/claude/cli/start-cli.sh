@@ -157,10 +157,6 @@ if [ "${1:-}" = "--print-core-env" ]; then
   exit 0
 fi
 
-# Registers the PERSONAL_CLAUDE.md compaction-reinject hook. Below the probe
-# exit: --print-core-env is a pure read and must not write settings.
-install_claude_personal_hook
-
 # Optional working-directory override for the core `claude` process.
 #   - Unset (upstream default): no override — the core launches from $REPO (the
 #     script's cwd), exactly as before. Zero behavior change for OSS installs.
@@ -539,6 +535,10 @@ if [ -z "$RESTART_REQUESTED" ] && claude_named_process_running; then
   echo "To recycle it cleanly: bash $0 --restart"
   exit 0
 fi
+
+# No core is live past the attach/adopt exits, so the copies that were its hooks may go now.
+sweep_legacy_claude_hooks_for_launch
+record_core_launch_settings
 
 if claude_named_tmux_session_exists; then
   # Session alive but the core claude is gone. The old behavior here was

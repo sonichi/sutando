@@ -30,6 +30,18 @@ class SkillHookDiscovery(unittest.TestCase):
             (d / "hooks" / "g.py").write_text(hook_body)
         return d
 
+    def test_the_cli_emits_the_rows_the_launch_settings_register(self):
+        """build-core-settings.mjs --skill-hooks consumes exactly this JSON."""
+        import skill_hooks
+        self._skill("demo", {"name": "demo", "hooks": [
+            {"event": "PreToolUse", "command": "./hooks/g.py"}]})
+        rows = json.loads(skill_hooks.as_json(self.repo))
+        (_e, _t, cmd, prior), = discover(self.repo)
+        self.assertEqual(rows, [{"event": "PreToolUse", "command": cmd, "prior": prior}])
+        out = subprocess.run([sys.executable, str(Path(skill_hooks.__file__)), str(self.repo)],
+                             capture_output=True, text=True, check=True).stdout
+        self.assertEqual(json.loads(out), rows)
+
     def test_a_declared_present_hook_is_discovered(self):
         self._skill("demo", {"name": "demo", "hooks": [
             {"event": "PreToolUse", "command": "./hooks/g.py"}]})
