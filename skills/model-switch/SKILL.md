@@ -7,7 +7,8 @@ user-invocable: true
 # model-switch
 
 `scripts/switch-model.sh <model> [--dry-run] [--confirm] [--accept-timeout S]` — `<model>` is one of the
-CLI's aliases (`default|opus|sonnet|haiku|fable`) or a `claude-*` id with an optional `[1m]` tag;
+CLI's aliases (`default|opus|sonnet|haiku|fable`) or a `claude-*` id, either with an optional `[1m]`
+tag (`default` takes none);
 anything else is refused before any write (exit 2).
 
 Order, under one lock per brain (`<workspace>/state/.model-switch.lock`, held across preflight, send,
