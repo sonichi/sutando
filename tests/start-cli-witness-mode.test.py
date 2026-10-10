@@ -10,6 +10,7 @@ Run: python3 tests/start-cli-witness-mode.test.py
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -24,7 +25,13 @@ TMUX = shutil.which("tmux") or shutil.which("tmux", path="/opt/homebrew/bin:/usr
 PGREP_STUB = ('[ "$*" = "-ax claude" ] || exit 1\n'
               '[ -s "$HOME/claude.pid" ] && echo "$(cat "$HOME/claude.pid") claude"\n')
 CLAUDE_STUB = ('printf "%s\\n" "$@" > "$HOME/claude.argv"\n'
+               'printf "%s" "${CLAUDE_CODE_OAUTH_TOKEN-}" > "$HOME/claude.token"\n'
                'echo $$ > "$HOME/claude.pid"\nsleep 120\n')
+# A fake keychain behind the vault helper: answers only for $HOME/fake-vault-token, never the real one.
+SECURITY_STUB = ('[ "$1" = find-generic-password ] || exit 1\n'
+                 'case " $* " in *" -s CLAUDE_CODE_OAUTH_TOKEN "*) ;; *) exit 44 ;; esac\n'
+                 '[ -s "$HOME/fake-vault-token" ] || exit 44\ncat "$HOME/fake-vault-token"\n')
+FAKE_TOKEN = "sk-ant-oat01-FAKE-witness-token-0123456789"
 SINGLETONS = ("state/shutdown.sentinel", "state/cores/testhost.alive", "state/core-supervisor.json",
               "state/session-starts.log", "logs/restart-attempts.log", "state/core-status.json")
 
@@ -81,7 +88,7 @@ class Harness:
         self.home.mkdir()
         self.ccd = self.td / "ccd"
         self.ccd.mkdir()
-        for stub, body in (("claude", CLAUDE_STUB), ("pgrep", PGREP_STUB),
+        for stub, body in (("claude", CLAUDE_STUB), ("pgrep", PGREP_STUB), ("security", SECURITY_STUB),
                            ("lsof", "exit 1\n"), ("launchctl", "exit 1\n")):
             (bind / stub).write_text("#!/bin/bash\n" + body)
             (bind / stub).chmod(0o755)
@@ -128,9 +135,10 @@ class Harness:
     def server_pid(self, sock) -> int:
         return int(self.tm(sock, "display-message", "-p", "#{pid}").stdout.strip() or 0)
 
-    def run(self, *args, entry="src/agent/claude/cli/start-cli.sh", extra_env=None):
+    def run(self, *args, entry="src/agent/claude/cli/start-cli.sh", extra_env=None, drop=()):
+        env = {k: v for k, v in {**self.env, **(extra_env or {})}.items() if k not in drop}
         return subprocess.run(["/bin/bash", str(self.root / entry), *args],
-                              env={**self.env, **(extra_env or {})}, capture_output=True, text=True, timeout=90)
+                              env=env, capture_output=True, text=True, timeout=90)
 
     def tm(self, sock, *a):
         return subprocess.run([TMUX, "-S", str(sock), *a], capture_output=True, text=True)
@@ -221,10 +229,88 @@ class WitnessLaunch(unittest.TestCase):
         self.assertFalse((self.ws / "state/core-supervisor.json").exists())
         self.assertFalse((self.ws / "state/core-supervisor-relay-loop.pid").exists())
 
+    def test_without_a_vault_token_start_says_how_to_set_one_up(self):
+        self.assertEqual((self.h.home / "claude.token").read_text(), "")
+        self.assertIn("will need /login", self.run_.stderr)
+        self.assertIn("claude setup-token", self.run_.stderr)
+        self.assertIn("vault set CLAUDE_CODE_OAUTH_TOKEN <token>", self.run_.stderr)
+
+    def test_a_callers_config_dir_is_never_given_the_bypass_seed(self):
+        self.assertFalse((self.h.ccd / "settings.json").exists())
+        self.assertIn("is not edited", self.run_.stderr)
+
     def test_second_launch_of_the_same_name_refuses(self):
         run = self.h.run("--witness", "t1")
         self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
         self.assertIn("already exists", run.stderr)
+
+
+class WitnessVaultLogin(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.h = Harness()
+        (cls.h.home / "fake-vault-token").write_text(FAKE_TOKEN)
+        cls.run_ = cls.h.run("--witness", "t1")
+        cls.root, cls.sock, cls.session, cls.ws = cls.h.witness("t1")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.h.close()
+
+    def test_core_claude_gets_the_token_in_its_environment(self):
+        self.assertEqual(self.run_.returncode, 0, self.run_.stdout + self.run_.stderr)
+        self.assertEqual((self.h.home / "claude.token").read_text(), FAKE_TOKEN)
+        self.assertIn("witness login", self.run_.stdout)
+        self.assertNotIn("claude setup-token", self.run_.stderr)
+
+    def test_token_is_never_written_to_disk(self):
+        files = [p for p in self.root.rglob("*") if p.is_file()] + [self.h.root / "sutando.config.local.json"]
+        self.assertIn(self.root / "witness.env", files)
+        for p in files:
+            self.assertNotIn(FAKE_TOKEN.encode(), p.read_bytes(), str(p))
+        self.assertNotIn(FAKE_TOKEN, self.run_.stdout + self.run_.stderr)
+
+    def test_token_is_not_in_tmux_or_any_argv(self):
+        for args in (("show-environment", "-g"), ("show-environment", "-t", f"={self.session}"),
+                     ("show-environment", "-t", f"={self.session}-watcher"), ("show-options", "-g")):
+            self.assertNotIn(FAKE_TOKEN, self.h.tm(self.sock, *args).stdout, args)
+        argv = subprocess.run(["ps", "-axww", "-o", "args="], capture_output=True, text=True).stdout
+        self.assertNotIn(FAKE_TOKEN, argv)
+        self.assertNotIn(FAKE_TOKEN, (self.h.home / "claude.argv").read_text())
+
+    def test_only_the_core_pane_runs_the_login_wrapper(self):
+        def pane_cmd(session):
+            return self.h.tm(self.sock, "list-panes", "-t", f"={session}", "-F", "#{pane_start_command}").stdout
+        self.assertIn("witness-claude.sh", pane_cmd(self.session))
+        self.assertNotIn("witness-claude.sh", pane_cmd(self.session + "-watcher"))
+
+
+class WitnessBypassMirror(unittest.TestCase):
+    """With no CLAUDE_CONFIG_DIR the witness gets a fresh one; the bypass seed mirrors the owner's own."""
+
+    def launch(self, owner_settings):
+        h = Harness()
+        self.addCleanup(h.close)
+        if owner_settings is not None:
+            (h.home / ".claude").mkdir()
+            (h.home / ".claude/settings.json").write_text(owner_settings)
+        run = h.run("--witness", "t1", drop=("CLAUDE_CONFIG_DIR",))
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        return h, run, h.witness("t1")[3] / ".claude-sutando/settings.json"
+
+    def test_seeded_when_the_owner_set_it(self):
+        src = '{"skipDangerousModePermissionPrompt": true}\n'
+        h, run, seeded = self.launch(src)
+        self.assertIs(json.loads(seeded.read_text()).get("skipDangerousModePermissionPrompt"), True)
+        self.assertEqual((h.home / ".claude/settings.json").read_text(), src, "the owner's settings changed")
+        self.assertIn("mirrored", run.stdout)
+
+    def test_not_seeded_when_the_owner_did_not(self):
+        for src in (None, '{"skipDangerousModePermissionPrompt": false}\n'):
+            with self.subTest(src=src):
+                h, run, seeded = self.launch(src)
+                self.assertFalse(seeded.exists() and "skipDangerousModePermissionPrompt" in seeded.read_text())
+                self.assertIn("not seeded", run.stderr)
 
 
 class WitnessTeardown(unittest.TestCase):

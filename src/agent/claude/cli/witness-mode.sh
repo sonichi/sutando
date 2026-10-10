@@ -150,8 +150,35 @@ witness_record_launch() {
   return 0
 }
 
+# The main checkout's resolved CLAUDE_CONFIG_DIR: where the production core keeps its settings.
+witness_production_ccd() {
+  local line common
+  IFS= read -r line < "$REPO/.git" 2>/dev/null || return 1
+  common="${line#gitdir: }"
+  common="${common%/worktrees/*}"
+  [ "${common##*/}" = ".git" ] && [ -r "${common%/.git}/scripts/sutando-config.sh" ] || return 1
+  env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+    bash "${common%/.git}/scripts/sutando-config.sh" claude-sutando-config-dir 2>/dev/null
+}
+
+# True when any given Claude settings.json sets skipDangerousModePermissionPrompt to true.
+witness_settings_skip_bypass_prompt() {
+  local py="$1"; shift
+  "$py" - "$@" <<'PY'
+import json, sys
+for path in sys.argv[1:]:
+    try:
+        with open(path) as f:
+            if json.load(f).get("skipDangerousModePermissionPrompt") is True:
+                sys.exit(0)
+    except Exception:
+        pass
+sys.exit(1)
+PY
+}
+
 witness_start() {
-  local name="$1" ws0 ccd py sha
+  local name="$1" ws0 ccd py sha login="" mirror_bypass="" prod_ccd wccd
   witness_paths "$name"
   witness_assert_not_production "$WITNESS_SOCKET" "$WITNESS_SESSION" \
     "${SUTANDO_TMUX_SOCKET:-}" "${SUTANDO_TMUX_SESSION:-}"
@@ -171,6 +198,13 @@ witness_start() {
   [ -n "$py" ] || witness_refuse "no runnable Python interpreter"
   # Auth comes from the caller's config dir by reference; nothing is copied.
   ccd="${CLAUDE_CONFIG_DIR:-}"
+  /bin/bash "$REPO/src/agent/claude/cli/witness-claude.sh" --check && login=vault
+  # A fresh config dir mirrors the owner's bypass-dialog choice; a caller's dir is used as it stands.
+  if [ -z "$ccd" ]; then
+    prod_ccd="$(witness_production_ccd)" || prod_ccd=""
+    witness_settings_skip_bypass_prompt "$py" "$HOME/.claude/settings.json" \
+      ${prod_ccd:+"$prod_ccd/settings.json"} && mirror_bypass=1
+  fi
 
   mkdir -p "$WITNESS_WS"/tasks "$WITNESS_WS"/results "$WITNESS_WS"/state "$WITNESS_WS"/logs \
     || witness_refuse "cannot create $WITNESS_WS"
@@ -202,16 +236,34 @@ PY
     rm -f "$WITNESS_CONFIG"; rm -rf "$WITNESS_ROOT"
     witness_refuse "the workspace override did not take effect; nothing was launched"
   fi
-  [ -n "$ccd" ] || echo "  ⚠ no CLAUDE_CONFIG_DIR in the caller's env: the witness gets a fresh one and will need /login in its pane" >&2
+  if [ -n "$mirror_bypass" ]; then
+    wccd="$(env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
+      bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>/dev/null)"
+    case "$wccd" in "$WITNESS_ROOT"/*) ;; *) mirror_bypass="" ;; esac
+  fi
+  if [ -n "$ccd" ]; then
+    witness_settings_skip_bypass_prompt "$py" "$ccd/settings.json" \
+      || echo "  ⚠ $ccd/settings.json does not set skipDangerousModePermissionPrompt and is not edited: the witness pane will stop at the Bypass Permissions dialog" >&2
+  elif [ -n "$mirror_bypass" ]; then
+    echo "  ✓ witness gets a fresh CLAUDE_CONFIG_DIR; skipDangerousModePermissionPrompt mirrored from your settings into it"
+  else
+    echo "  ⚠ neither your Claude settings nor production's set skipDangerousModePermissionPrompt, so it is not seeded: the witness pane will stop at the Bypass Permissions dialog" >&2
+  fi
+  if [ -n "$login" ]; then
+    echo "  ✓ witness login: CLAUDE_CODE_OAUTH_TOKEN from the vault, passed only to the core's claude"
+  else
+    echo "  ⚠ no CLAUDE_CODE_OAUTH_TOKEN in the vault: the witness pane will need /login. One-time setup: run \`claude setup-token\`, then send \`vault set CLAUDE_CODE_OAUTH_TOKEN <token>\` via Slack or Discord" >&2
+  fi
   echo "  ✓ witness '$name': workspace $WITNESS_WS"
 
-  local notifier_env=()
-  [ -n "${SUTANDO_NOTIFIER_GRACE_PERIOD:-}" ] && notifier_env+=("SUTANDO_NOTIFIER_GRACE_PERIOD=$SUTANDO_NOTIFIER_GRACE_PERIOD")
-  [ -n "${SUTANDO_NOTIFIER_ROLE_POLL:-}" ] && notifier_env+=("SUTANDO_NOTIFIER_ROLE_POLL=$SUTANDO_NOTIFIER_ROLE_POLL")
+  local launch_env=()
+  [ -n "${SUTANDO_NOTIFIER_GRACE_PERIOD:-}" ] && launch_env+=("SUTANDO_NOTIFIER_GRACE_PERIOD=$SUTANDO_NOTIFIER_GRACE_PERIOD")
+  [ -n "${SUTANDO_NOTIFIER_ROLE_POLL:-}" ] && launch_env+=("SUTANDO_NOTIFIER_ROLE_POLL=$SUTANDO_NOTIFIER_ROLE_POLL")
+  [ -n "$mirror_bypass" ] && launch_env+=("SUTANDO_ACCEPT_BYPASS_PERMISSIONS=1")
   # A clean env, so nothing of the caller's (memory dir, inbox resolver, instance id) reaches the witness.
   exec env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" LOGNAME="${LOGNAME:-}" SHELL="${SHELL:-/bin/bash}" \
     TERM="${TERM:-xterm-256color}" LANG="${LANG:-en_US.UTF-8}" TMPDIR="${TMPDIR:-/tmp}" \
-    ${notifier_env[@]+"${notifier_env[@]}"} \
+    ${launch_env[@]+"${launch_env[@]}"} \
     SUTANDO_TMUX_SOCKET="$WITNESS_SOCKET" SUTANDO_TMUX_SESSION="$WITNESS_SESSION" \
     SUTANDO_WORKSPACE_DIR="$WITNESS_WS" SUTANDO_TASKS_DIR="$WITNESS_WS/tasks" \
     SUTANDO_RESULTS_DIR="$WITNESS_WS/results" SUTANDO_CLAUDE_WORKING_DIR="$REPO" \

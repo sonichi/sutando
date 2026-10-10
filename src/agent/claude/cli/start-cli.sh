@@ -77,6 +77,9 @@ NOTIFIER_SCRIPT="$REPO/src/agent/claude/cli/task-notifier.sh"
 SURFACE_ARGS=(--remote-control "Sutando" --chrome)
 # Remote control and Chrome are the owner's surfaces, held by the production core.
 [ -n "$WITNESS" ] && SURFACE_ARGS=()
+# The witness's claude alone gets the vault login; see witness-claude.sh.
+CLAUDE_LAUNCH_PREFIX=()
+[ -n "$WITNESS" ] && CLAUDE_LAUNCH_PREFIX=(/bin/bash "$REPO/src/agent/claude/cli/witness-claude.sh")
 add_skill_claude_plugins
 # `/startup` is the CANONICAL CORE's ceremony: orphan recovery, session crons,
 # a gate any watcher satisfies. One arg — the skill reads it as $ARGUMENTS.
