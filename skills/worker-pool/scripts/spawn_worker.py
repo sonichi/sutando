@@ -24,17 +24,6 @@ import uuid
 from pathlib import Path
 
 _SCRIPTS = Path(__file__).resolve().parent
-
-
-# The core's own identity: inherited, these stamp a worker's direct posts as
-# "worker-<core id>" while pool delivery stamps the worker's real id.
-_CORE_ONLY_ENV = ("SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_WORKER_SEAT")
-
-
-def inherited_env(drop=()) -> dict:
-    """The spawner's environment minus the core-only identity, for a worker."""
-    return {k: v for k, v in os.environ.items()
-            if k not in _CORE_ONLY_ENV and k not in drop}
 _REPO = _SCRIPTS.parents[2]
 # Sibling skill scripts, then the core's src/ for the delivery-record grammar
 # (repo root is parents[3] of skills/<name>/scripts/<file>.py, symlinks resolved).
@@ -49,6 +38,18 @@ import pool_roster as pr  # noqa: E402
 import tmux_probe  # noqa: E402
 
 import worker_identity as wi  # noqa: E402
+
+
+# The core's own identity: inherited, these stamp a worker's direct posts as
+# "worker-<core id>" while pool delivery stamps the worker's real id.
+_CORE_ONLY_ENV = ("SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_WORKER_SEAT")
+
+
+def inherited_env(drop=()) -> dict:
+    """The spawner's environment minus the core-only identity, for a worker."""
+    return {k: v for k, v in os.environ.items()
+            if k not in _CORE_ONLY_ENV and k not in drop}
+
 
 DEFAULT_SOCKET = "/tmp/sutando-tmux.sock"
 
