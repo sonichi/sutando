@@ -68,6 +68,7 @@ import { createHealthPersistence } from './voice-audio-health-persist.js';
 import { evaluateMatrix, type MatrixBaseline } from './voice-health-matrix.js';
 import { initialGoodbyeGuard, shouldFireGoodbye, createConversationClearHelper, clearStaleResumptionHandle } from './voice-continuity.js';
 import { ConversationLogStore } from './conversation-log-store.js';
+import { createConversationSummarizer, geminiSummarize } from './voice-conversation-summary.js';
 import { classifyFatalExitCode, isFatalExit, markFatalExit, writeCrashRecordAndExit, EXIT_CODE_DUPLICATE_INSTANCE } from './crash-only.js';
 import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLockGuardPath } from './voice-lock.js';
 import { recordToolCall } from './conversation-store.js';
@@ -586,10 +587,19 @@ let voiceSessionRef: VoiceSession | null = null;
 // the sessionEnding turn.end sweep.
 // Runs right before a clear: the call's report keeps what is about to go.
 let beforeConversationClear: () => void = () => {};
+// The compressed summary of the older conversation (bodhi keeps the slot, sutando fills it).
+const conversationSummary = createConversationSummarizer({
+	context: () => voiceSessionRef?.conversationContext ?? null,
+	summarize: geminiSummarize,
+	onEvicted: (n) => { itemsClear.cursor.index = Math.max(0, itemsClear.cursor.index - n); },
+	log: (m) => console.log(`${ts()} ${m}`),
+});
 const itemsClear = createConversationClearHelper(
 	(reason) => {
 		beforeConversationClear();
-		return voiceSessionRef?.resetConversationContext(reason).cleared ?? 0;
+		const cleared = voiceSessionRef?.resetConversationContext(reason).cleared ?? 0;
+		conversationSummary.clear();
+		return cleared;
 	},
 	(m) => console.log(`${ts()} ${m}`),
 );
@@ -1417,6 +1427,7 @@ async function main() {
 		items: session.conversationContext.items,
 		pendingInput: speechHost.transcriptManager?.inputBuffer as string | undefined,
 		lastUserSpeechAt,
+		summary: session.conversationContext.summary,
 	}));
 	session.eventBus.subscribe('turn.end', () => callEnd.collect());
 	session.eventBus.subscribe('turn.end', () => {
@@ -1452,6 +1463,8 @@ async function main() {
 		}
 		itemsClear.cursor.index = items.length;
 	});
+	// After the logger: a summary moves items, and the cursor moves with them (onEvicted).
+	session.eventBus.subscribe('turn.end', () => { if (!sessionEnding) void conversationSummary.onTurnEnd(); });
 
 	// Track user interruption events as a secondary signal for the
 	// end_session gate. bodhi fires turn.interrupted whenever the user's
