@@ -60,7 +60,7 @@ function assertMacOS() {
 	}
 }
 import { voiceTaskRows, workTool, submitWorkTask, voiceTaskStore, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask } from './task-bridge.js';
-import { createSessionEndPipeline, sessionEndTask } from './voice-session-end.js';
+import { createCallEndReporter, sessionEndTask } from './voice-session-end.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -583,9 +583,14 @@ let voiceSessionRef: VoiceSession | null = null;
 // cursor pointing past the emptied array makes the logger skip everything
 // that accumulates after it). Used by end_session, the goodbye detector, and
 // the sessionEnding turn.end sweep.
+// Runs right before a clear: the call's report keeps what is about to go.
+let beforeConversationClear: () => void = () => {};
 const itemsClear = createConversationClearHelper(
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	() => (voiceSessionRef as any)?.conversationContext?.items,
+	() => {
+		beforeConversationClear();
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		return (voiceSessionRef as any)?.conversationContext?.items;
+	},
 	(m) => console.log(`${ts()} ${m}`),
 );
 // P7 D7.3 stale-repeat goodbye guard (Tranche A engine-side). The guard
@@ -964,6 +969,18 @@ async function main() {
 	});
 	setVoiceTaskEndedListener((taskId, why) => { relayAgent.endCall(taskId, why); });
 
+	// When the user hangs up, the core gets a task about that call.
+	const callEnd = createCallEndReporter({
+		sessionId: SESSION_ID,
+		items: () => sessionRef?.conversationContext.items ?? [],
+		onEnded: async (ended) => {
+			const { summary, transcript } = sessionEndTask(ended);
+			await submitVoiceSessionEndTask(summary, transcript);
+		},
+		log: (m) => console.log(`${ts()} ${m}`),
+	});
+	beforeConversationClear = () => callEnd.collect();
+
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
 		userId: 'user',
@@ -971,11 +988,8 @@ async function main() {
 		agents: [mainAgent],
 		initialAgent: 'main',
 		subagentConfigs: { work: relayAgentSubagentConfig(relayAgent) },
-		// When the session closes, the core gets a task about it.
-		postSessionPipeline: createSessionEndPipeline(async (ended) => {
-			const { summary, transcript } = sessionEndTask(ended);
-			await submitVoiceSessionEndTask(summary, transcript);
-		}, (m) => console.log(`${ts()} ${m}`)),
+		// A call still in progress at shutdown is reported through bodhi's post-session pipeline.
+		postSessionPipeline: callEnd.pipeline,
 		// close() runs at shutdown, right before process.exit: wait for the task to be written.
 		drainPostSession: true,
 		port: PORT,
@@ -1001,7 +1015,9 @@ async function main() {
 		},
 		// Frames the core does not own are offered to optional skills' handlers.
 		onClientCommand: (message) => clientFrames.dispatch(message),
+		onClientConnected: () => callEnd.clientConnected(),
 		onClientDisconnected: () => {
+			callEnd.clientDisconnected();
 			// An origin belongs to the client that announced it; the next client announces its own.
 			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
 			setVoiceSessionOrigin(null);
@@ -1394,6 +1410,7 @@ async function main() {
 		pendingInput: speechHost.transcriptManager?.inputBuffer as string | undefined,
 		lastUserSpeechAt,
 	}));
+	session.eventBus.subscribe('turn.end', () => callEnd.collect());
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;
 		// If end_session fired this session, keep clearing items so

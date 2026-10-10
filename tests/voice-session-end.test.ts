@@ -12,10 +12,11 @@ process.env.SUTANDO_TEST_MODE = '1';
 for (const d of ['tasks', 'results', 'state']) mkdirSync(join(TMP, d), { recursive: true });
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
-const { createSessionEndPipeline, sessionEndTask, worthATask, SESSION_END_MAX_CHARS } = await import('../src/voice-session-end.js');
+const { createSessionEndPipeline, createCallEndReporter, sessionEndTask, worthATask, SESSION_END_MAX_CHARS } = await import('../src/voice-session-end.js');
 const { submitVoiceSessionEndTask } = await import('../src/task-bridge.js');
 
-const item = (role: string, content: string) => ({ role, content, timestamp: 0 }) as never;
+const item = (role: string, content: string, timestamp = 0) => ({ role, content, timestamp }) as never;
+const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 function input(items: unknown[], reason = 'client_disconnect') {
 	return {
 		sessionId: 's1', reason,
@@ -93,9 +94,98 @@ describe('the session-end task', () => {
 		assert.match(transcript, /line 399 x+$/);
 	});
 
-	it('voice-agent passes the pipeline to bodhi and writes the task from it', () => {
+	it('voice-agent reports each call on hang-up, and a call in progress at shutdown through bodhi', () => {
 		const src = readFileSync(join(import.meta.dirname, '..', 'src', 'voice-agent.ts'), 'utf-8');
-		assert.match(src, /postSessionPipeline: createSessionEndPipeline\(async \(ended\) => \{\n\t\t\tconst \{ summary, transcript \} = sessionEndTask\(ended\);\n\t\t\tawait submitVoiceSessionEndTask\(summary, transcript\);/);
+		assert.match(src, /postSessionPipeline: callEnd\.pipeline,/);
 		assert.match(src, /drainPostSession: true,/, 'close() is followed by process.exit');
+		assert.match(src, /onClientConnected: \(\) => callEnd\.clientConnected\(\),/);
+		assert.match(src, /onClientDisconnected: \(\) => \{\n\t\t\tcallEnd\.clientDisconnected\(\);/);
+		assert.match(src, /subscribe\('turn\.end', \(\) => callEnd\.collect\(\)\);/);
+		assert.match(src, /beforeConversationClear = \(\) => callEnd\.collect\(\);/);
+		assert.match(src, /await submitVoiceSessionEndTask\(summary, transcript\);/);
+	});
+});
+
+describe('a call ends when the user hangs up', () => {
+	function call() {
+		let t = 1000;
+		const live: unknown[] = [];
+		const ended: Array<{ reason: string; items: string[] }> = [];
+		const r = createCallEndReporter({
+			sessionId: 's1', items: () => live as never, graceMs: 30, now: () => t,
+			onEnded: (s) => { ended.push({ reason: s.reason, items: s.items.map((i) => i.content) }); },
+		});
+		const say = (role: string, content: string) => { t += 10; live.push(item(role, content, t)); };
+		return { r, live, ended, say, advance: (ms: number) => { t += ms; } };
+	}
+
+	it('no client back within the grace period: one task for the call', async () => {
+		const c = call();
+		c.r.clientConnected();
+		c.say('user', 'check PR 5308');
+		c.say('assistant', 'merged');
+		c.r.clientDisconnected();
+		await tick(60);
+		assert.deepEqual(c.ended, [{ reason: 'user_hangup', items: ['check PR 5308', 'merged'] }]);
+	});
+
+	it('a refresh or a blip that reconnects within the grace period is the same call', async () => {
+		const c = call();
+		c.r.clientConnected();
+		c.say('user', 'first');
+		c.r.clientDisconnected();
+		await tick(10);
+		c.r.clientConnected();
+		c.say('user', 'second');
+		c.r.clientDisconnected();
+		await tick(60);
+		assert.deepEqual(c.ended, [{ reason: 'user_hangup', items: ['first', 'second'] }]);
+	});
+
+	it('a goodbye that clears the live conversation before the hang-up still reports what was said', async () => {
+		const c = call();
+		c.r.clientConnected();
+		c.say('user', 'remind me Friday');
+		c.say('assistant', 'done');
+		c.say('user', 'goodbye');
+		c.r.collect(); // right before the clear
+		c.live.length = 0;
+		c.r.clientDisconnected();
+		await tick(60);
+		assert.deepEqual(c.ended[0].items, ['remind me Friday', 'done', 'goodbye']);
+	});
+
+	it('the next call reports only its own lines; earlier lines still in the live context are not repeated', async () => {
+		const c = call();
+		c.r.clientConnected();
+		c.say('user', 'call one');
+		c.r.clientDisconnected();
+		await tick(60);
+		c.advance(100);
+		c.r.clientConnected();
+		c.say('user', 'call two');
+		c.r.clientDisconnected();
+		await tick(60);
+		assert.deepEqual(c.ended.map((e) => e.items), [['call one'], ['call two']]);
+	});
+
+	it('at shutdown a call in progress is reported once through bodhi\'s pipeline; an ended call is not reported again', async () => {
+		const c = call();
+		c.r.clientConnected();
+		c.say('user', 'in progress');
+		const snapItems = [...c.live];
+		await c.r.pipeline.dispatch(input(snapItems, 'user_hangup')).report;
+		assert.deepEqual(c.ended.map((e) => e.items), [['in progress']]);
+		await c.r.pipeline.dispatch(input(snapItems, 'user_hangup')).report;
+		assert.equal(c.ended.length, 1, 'no call left to report');
+	});
+
+	it('a call the owner never spoke in sends nothing', async () => {
+		const c = call();
+		c.r.clientConnected();
+		c.say('assistant', 'Hi!');
+		c.r.clientDisconnected();
+		await tick(60);
+		assert.deepEqual(c.ended, []);
 	});
 });

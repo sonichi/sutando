@@ -1,7 +1,9 @@
 /**
- * After a voice session closes, the core gets a task about it: when it ran, how it ended, and what
- * was said. bodhi runs this as a post-session processor from its frozen close snapshot. bodhi
- * 0.4.5 does not export its own pipeline, so this is a minimal one with the same contract.
+ * When the user hangs up, the core gets a task about that call: when it ran, how it ended, and what
+ * was said. A hang-up is the client leaving and not coming back within a grace period (a page
+ * refresh or a network blip reconnects within it). A sutando voice session outlives its calls and
+ * closes only at shutdown; bodhi's post-session pipeline then reports a call still in progress.
+ * bodhi 0.4.5 does not export its own pipeline, so this is a minimal one with the same contract.
  */
 import type { ConversationItem, VoiceSessionConfig } from 'bodhi-realtime-agent';
 
@@ -93,4 +95,74 @@ export function createSessionEndPipeline(onEnded: (s: EndedSession) => Promise<v
 		events: { onProcessed: (l: (r: Report) => void) => { listeners.add(l); return () => { listeners.delete(l); }; } },
 		stats: () => ({ ...stats }),
 	} as Pipeline;
+}
+
+/** How long a departed client has to come back before the call counts as hung up. */
+export const HANGUP_GRACE_MS = 60_000;
+
+/**
+ * One call = from a client connecting until it hangs up. Reports each call once: on hang-up, or at
+ * shutdown (through bodhi's post-session pipeline) for a call still in progress.
+ */
+export function createCallEndReporter(opts: {
+	sessionId: string;
+	items: () => readonly ConversationItem[];
+	onEnded: (s: EndedSession) => Promise<void> | void;
+	graceMs?: number;
+	now?: () => number;
+	log?: (m: string) => void;
+}) {
+	const now = opts.now ?? Date.now;
+	const log = opts.log ?? (() => {});
+	let callStart: number | null = null;
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	// The call's items, kept as they come: a goodbye clears the live conversation before the hang-up.
+	let kept: ConversationItem[] = [];
+	let seen = new WeakSet<object>();
+	const collect = (all: readonly ConversationItem[]) => {
+		if (callStart === null) return;
+		for (const i of all) if (i.timestamp >= callStart && !seen.has(i)) { seen.add(i); kept.push(i); }
+	};
+	const report = async (reason: string, all: readonly ConversationItem[]): Promise<void> => {
+		if (callStart === null) return;
+		collect(all);
+		const start = callStart;
+		const items = kept.sort((a, b) => a.timestamp - b.timestamp);
+		callStart = null;
+		kept = [];
+		seen = new WeakSet();
+		const ended: EndedSession = {
+			sessionId: opts.sessionId, reason, startedAt: start, endedAt: now(), durationMs: now() - start,
+			turnCount: items.filter((i) => i.role === 'user').length,
+			toolCallCount: items.filter((i) => i.role === 'tool_call').length,
+			items,
+		};
+		if (!worthATask(ended)) return;
+		log(`[SessionEnd] call ended (${reason}); telling the core`);
+		await opts.onEnded(ended);
+	};
+
+	return {
+		/** After each turn, and right before the live conversation is cleared. */
+		collect(): void {
+			collect(opts.items());
+		},
+		clientConnected(): void {
+			if (timer) { clearTimeout(timer); timer = null; }
+			callStart ??= now();
+		},
+		clientDisconnected(): void {
+			if (timer) clearTimeout(timer);
+			timer = setTimeout(() => {
+				timer = null;
+				void Promise.resolve(report('user_hangup', opts.items())).catch((e) => log(`[SessionEnd] session-end task failed: ${(e as Error).message}`));
+			}, opts.graceMs ?? HANGUP_GRACE_MS);
+			timer.unref?.();
+		},
+		/** For bodhi's postSessionPipeline: at shutdown, a call still in progress is reported. */
+		pipeline: createSessionEndPipeline(async (closing) => {
+			if (timer) { clearTimeout(timer); timer = null; }
+			await report(closing.reason, closing.items);
+		}, log),
+	};
 }

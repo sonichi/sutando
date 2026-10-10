@@ -260,7 +260,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`voice-lock.ts`** — voice-lock.ts — TS caller of the guarded PID-lock helper (`scripts/voice-lock.py`), used by voice-agent's `acquirePidLock` (impl plan WS1 Step 4, amendments R1/R3/R4).
 - **`voice-mode-resolver.ts`** — Unified base-mode resolver for the voice agent (issue #1410, supersedes partial fixes #1412 + #1413).
 - **`voice-recovery-config.ts`** — Env settings for bodhi's upstream recovery: whether active-silence recovery is armed and after how many health ticks, and when a stuck dial is replaced.
-- **`voice-session-end.ts`** — After a voice session closes, the core gets a task about it: when it ran, how it ended, and what was said.
+- **`voice-session-end.ts`** — When the user hangs up, the core gets a task about that call: when it ran, how it ended, and what was said.
 - **`voice_room_membership.py`** — The gateway bridge's room-membership verifier for room-bound voice sessions.
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
 - **`watcher-rearm-session-hint.sh`** — SessionStart(compact|resume) hook: when no ready session-role watcher holds this session's inbox, inject the exact command that re-arms it.
