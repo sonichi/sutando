@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DictationTranscriptEvent } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE, MEETING_OVER_CONTEXT } from '../src/meeting-dictation.js';
+import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE, MEETING_OVER_CONTEXT, meetingStamp } from '../src/meeting-dictation.js';
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
@@ -104,6 +104,21 @@ describe('meeting dictation', () => {
 		});
 		return { md, provider, buffer, injected, injectModes, get mode() { return mode; }, get exitedByVoice() { return exitedByVoice; } };
 	}
+
+	it('each meeting gets its own note, named by its local start date and time', async () => {
+		assert.equal(meetingStamp(new Date(2026, 9, 9, 20, 23, 5)), '2026-10-09-2023', 'local, not UTC');
+		const stamps: string[] = [];
+		const t = setup({ notePathFor: (s) => { stamps.push(s); return join(mkdtempSync(join(tmpdir(), 'meet-')), `meeting-${s}.md`); } });
+		await t.md.enter();
+		const first = t.md.notePath!;
+		t.provider.say('weather in Cupertino');
+		t.provider.say('Sutando, come back');
+		await tick();
+		await t.md.enter();
+		assert.notEqual(t.md.notePath, first, 'a second meeting the same day does not append to the first');
+		assert.match(stamps[0], /^\d{4}-\d\d-\d\d-\d{4}$/);
+		assert.match(readFileSync(first, 'utf-8'), /^---\ntitle: Meeting notes — \d{4}-\d\d-\d\d \d\d:\d\d\n/);
+	});
 
 	it('writes each sentence to the note and exits on the phrase', async () => {
 		const t = setup();

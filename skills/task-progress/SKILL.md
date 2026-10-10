@@ -76,9 +76,13 @@ annoying than silence for 2 minutes on a research task.
 ## How to use
 
 **Pass `--task-file <path>`.** It derives `--source`, `--channel-id`/`--chat-id`,
-`--thread-root` (from `thread_root:`, else `source_message_id:`) and `--thread-ts` (from Slack's
-`reply_thread_ts:`) straight from that task file's own headers, so there is nothing left to
-extract or remember by hand — including the thread, the field most often dropped. A task
+`--thread-root` (from `thread_root:` only — threading is a decision the ask already made,
+not this script's default), `--reply-to` (from `source_message_id:`, the asking message —
+never `reply_to_event:`, the post the sender quoted; cites the ask without nesting it in a
+thread the user never started) and `--thread-ts` (from Slack's `reply_thread_ts:`) straight
+from that task file's own headers, so there is nothing left to extract or remember by hand.
+When the ask was already in a thread, both fields are sent together: `thread_root` nests the
+post, `reply_to` is its citation fallback for a client that doesn't render threads. A task
 sends when its source is `slack`/`discord`/`telegram`, or — for ANY other source, known or
 not — when its channel is a valid Matrix room id: strict `!opaque:server`, or a server-less
 room v12 id (e.g. AG2 Space, or a docked voice task). Everything else — undocked `voice`
@@ -106,9 +110,9 @@ python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
   --message "Done with the research — writing up the summary now."
 ```
 
-Any of `--source` / `--channel-id` / `--chat-id` / `--thread-root` / `--thread-ts` given
-explicitly alongside `--task-file` still wins over what the file carries (e.g. to post a
-checkpoint unthreaded on purpose, pass `--thread-root ''`).
+Any of `--source` / `--channel-id` / `--chat-id` / `--thread-root` / `--reply-to` / `--thread-ts`
+given explicitly alongside `--task-file` still wins over what the file carries (e.g. to post a
+checkpoint with no citation at all, pass `--reply-to ''`).
 
 ### When there is no task file to point at
 
@@ -122,7 +126,10 @@ python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
 ```
 
 For a Slack @mention (threaded reply), add `--thread-ts <ts>` to keep the update in-thread.
-For AG2 Space, pass the task's `thread_root:` via `--thread-root '<event id>'` to post the update in that thread. Single-quote the id: it starts with `$`, which double quotes would expand. An empty value posts unthreaded.
+For AG2 Space, pass the task's own `thread_root:` via `--thread-root '<event id>'` only when
+the ask was already in a thread; otherwise pass `--reply-to '<source_message_id>'` to cite it
+in the main timeline instead. Single-quote the id: it starts with `$`, which double quotes
+would expand. An empty value opts out of that relation.
 
 ### Field mapping from task files
 
@@ -136,7 +143,9 @@ For AG2 Space, pass the task's `thread_root:` via `--thread-root '<event id>'` t
 | ag2space  | `channel_id:`       | `--channel-id`  |
 
 Optional for Slack @mentions: `reply_thread_ts:` → `--thread-ts`.
-Optional for AG2 Space threading: `thread_root:` (falls back to `source_message_id:`, the asking message — never `reply_to_event:`, the post the sender quoted) → `--thread-root`.
+Optional for AG2 Space: `thread_root:` → `--thread-root` (only when the ask was already in a
+thread); `source_message_id:` (the asking message — never `reply_to_event:`, the post the
+sender quoted) → `--reply-to`, sent regardless so the update always cites what it's about.
 
 ### AG2 Space rooms
 

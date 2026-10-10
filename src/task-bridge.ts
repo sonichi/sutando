@@ -16,7 +16,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
-import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
+import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, dedupTarget, type TaskOrigin } from './skip_marker_ownership.js';
 import { createVoiceTaskStore, planReconcile } from './relay-agent.js';
 import { framedSystem } from './inject-framing.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
@@ -555,8 +555,8 @@ export interface VoiceTaskRow {
 	id: string;
 	text: string;
 	submittedAt: number;
-	/** queued / started / done / cancelled, read from the core now; cancel_requested until the core replies. */
-	state: VoiceTaskState | 'cancel_requested';
+	/** queued / started / done / cancelled, read from the core now. */
+	state: VoiceTaskState;
 	/** How the result reached the user, once it has. */
 	delivery?: 'spoken' | 'injected' | 'dm';
 }
@@ -567,7 +567,6 @@ export function voiceTaskRows(now = Date.now()): VoiceTaskRow[] {
 	for (const [id, row] of voiceTaskStore.list()) {
 		if (row.submittedAt === undefined || now - row.submittedAt > STATUS_WINDOW_MS) continue;
 		let state: VoiceTaskRow['state'] = voiceTaskState(id);
-		if (row.cancelRequested && state === 'cancelled' && !_hasResult(id) && _activityPhase(id) !== 'CANCELLED') state = 'cancel_requested';
 		if (row.cancelRequested && _hasResult(id)) state = 'done';
 		rows.push({ id, text: row.text ?? '', submittedAt: row.submittedAt, state, delivery: row.delivery });
 	}
@@ -602,18 +601,21 @@ export function reconcileVoiceTasks(deliver: RelayDeliver, isInFlight: (taskId: 
 		// A result still in results/ is the watcher's to deliver first.
 		// An offline DM copy still in results/ is on its way (a bridge takes it, or the drain speaks it on reconnect).
 		if (_hasLiveOfflineCopy(id)) continue;
-		const settledResult = existsSync(join(RESULT_DIR, `${id}.txt`)) ? _deliveredResults.has(`${id}.txt`) : _hasResult(id);
-		const text = settledResult ? _readResultText(id) : null;
+		// A task the core answered in another task's result is owed that result.
+		const source = row.answeredBy ?? id;
+		if (source !== id && _hasLiveOfflineCopy(source)) continue;
+		const settledResult = existsSync(join(RESULT_DIR, `${source}.txt`)) ? _deliveredResults.has(`${source}.txt`) : _hasResult(source);
+		const text = settledResult ? _readResultText(source) : null;
 		const action = planReconcile({
 			row,
 			core: voiceTaskState(id),
 			settledResult: settledResult && !!text,
 			resultIsSkip: !!text && bodyIsSkipMarked(text),
-			inFlight: isInFlight(id),
+			inFlight: isInFlight(id) || isInFlight(source),
 			now,
 		});
 		if (action === 'speak_result' && text) {
-			console.log(`${ts()} [RelayAgent] ${id}: result never heard (${row.delivery ?? 'no delivery'}); handing it over again`);
+			console.log(`${ts()} [RelayAgent] ${id}: result never heard (${row.delivery ?? 'no delivery'})${source !== id ? `, answered in ${source}` : ''}; handing it over again`);
 			voiceTaskStore.noteReplay(id);
 			deliver(text.replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '').trim(), row.cancelRequested ? CANCELLED_BUT_FINISHED_NOTE : MISSED_RESULT_NOTE, { taskId: id });
 		} else if (action === 'tell_not_picked') {
@@ -636,14 +638,22 @@ export function isVoiceSubmittedTask(taskId: string): boolean {
 	return _pendingTasks.has(taskId) || _isVoiceTask(taskId);
 }
 
-/** A queued voice task the user asked to cancel: delete its file; the core's reply to the instruction confirms. */
+/** A queued voice task the user asked to cancel: its file is deleted, so it is cancelled. */
 export function noteVoiceTaskCancelled(taskId: string): void {
+	_onVoiceTaskEnded?.(taskId, 'cancelled');
 	_cancelledVoiceTasks.add(taskId);
 	voiceTaskStore.markCancelRequested(taskId);
 	_pendingTasks.delete(taskId);
 	// Deleted, not archived: a core that misses the file looks in tasks/archive/ and runs what it finds there.
 	try { unlinkSync(join(TASK_DIR, `${taskId}.txt`)); } catch { /* already gone */ }
-	_sendTaskStatus?.(taskId, 'done', 'Cancel requested.');
+	_sendTaskStatus?.(taskId, 'done', 'Cancelled.');
+}
+
+export type VoiceTaskEnd = 'cancelled' | 'delivered_separately';
+let _onVoiceTaskEnded: ((taskId: string, why: VoiceTaskEnd) => void) | null = null;
+/** Told of each voice task whose result never comes back to voice (cancelled, or sent to the DM). */
+export function setVoiceTaskEndedListener(fn: ((taskId: string, why: VoiceTaskEnd) => void) | null): void {
+	_onVoiceTaskEnded = fn;
 }
 
 /** A task the user asked to cancel that the core ran anyway. */
@@ -997,6 +1007,9 @@ export function queuedAheadInstruction(queuedAhead: number): string {
 	return ` ${queuedAhead} task(s) are still running ahead of this one. Tell the user exactly "${line}" and wait; do not narrate the queue again.`;
 }
 
+/** What the model is told when `work` has queued the task; the result follows when the core finishes. */
+export const WORK_PENDING_MESSAGE = 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.';
+
 export const workTool: ToolDefinition = {
 	name: 'work',
 	description:
@@ -1025,7 +1038,9 @@ export const workTool: ToolDefinition = {
 				'a timeout DM that shouldn\'t have gone through.'
 			),
 	}),
-	execution: 'inline',
+	// Runs as the relay agent subagent: the model hears the pending message now, the result when the core finishes.
+	execution: 'background',
+	pendingMessage: WORK_PENDING_MESSAGE,
 	async execute(args) {
 		const { task, timeout_minutes, dm_on_timeout } = args as {
 			task: string;
@@ -1195,13 +1210,16 @@ export const workTool: ToolDefinition = {
 			status: 'pending',
 			taskId,
 			queuedAhead,
-			message: (watcherOnline
-				? 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.'
+			watcherOnline,
+			message: (watcherOnline ? WORK_PENDING_MESSAGE
 				: 'Task has been saved. The processing engine will pick it up on its next pass (within a few minutes). Tell the user the task is queued and will be handled shortly.')
 				+ queuedAheadInstruction(queuedAhead),
 		};
 	},
 };
+
+/** The `work` call as the relay agent runs it: the tool's own submission, then the core's result. */
+export const submitWorkTask = (args: Record<string, unknown>) => workTool.execute(args, undefined as never) as Promise<Record<string, unknown>>;
 
 // cancelTask tool moved — canonical version is `cancelTaskTool` in inline-tools.ts.
 
@@ -1460,6 +1478,9 @@ function startRelayResultWatcher(onResult: ResultListener): void {
 				if (!bodyIsSkipMarked(result)) {
 					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
 					onResult(`[Task result for ${taskId}]\n${result}`);
+				} else {
+					const answeredIn = dedupTarget(result);
+					if (answeredIn && voiceTaskStore.get(taskId)) voiceTaskStore.setAnsweredBy(taskId, answeredIn);
 				}
 				await _delegation.archiveResultFile(file, taskId);
 			}
@@ -1674,6 +1695,12 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 						continue;   // another consumer's: leave the files for its owner
 					}
 					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker; archiving silently`);
+					// A voice task the core answered in another task's result: the table owes the user that result.
+					const answeredIn = dedupTarget(result);
+					if (answeredIn && voiceTaskStore.get(taskId)) {
+						voiceTaskStore.setAnsweredBy(taskId, answeredIn);
+						console.log(`${ts()} [RelayAgent] ${taskId}: answered in ${answeredIn}`);
+					}
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
@@ -1727,6 +1754,8 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 						// Claimed now, delivered once the origin is re-verified; an
 						// unverified origin falls back to the owner DM.
 						void _forwardOfflineThenArchive(taskId, file, result, dmOnly);
+						for (const id of [taskId, ...voiceTaskStore.answeredBy(taskId).map(([other]) => other)])
+							_onVoiceTaskEnded?.(id, 'delivered_separately');
 					}
 					// Chat-path tasks have no bridge consumer — archive them directly
 					// so results/task-chat-*.txt files don't accumulate forever.

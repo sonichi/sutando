@@ -1,5 +1,5 @@
-// The voice task manager: every result goes through one queue (one hand-over at a time, at a
-// pause, confirmed by the model's turn), and a durable record of how each result reached the user.
+// The relay agent: the work subagent whose async call returns its task's result, and the voice task
+// table (how each result reached the user, which result answered it) with the reconcile rule over it.
 // Run: npx tsx --test --test-force-exit tests/relay-agent.test.ts
 import { describe, it, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -13,8 +13,7 @@ process.env.SUTANDO_TEST_MODE = '1';
 const MONTH = new Date().toISOString().slice(0, 7);
 for (const d of ['tasks', 'results', join('tasks', 'archive', MONTH), join('results', 'archive', MONTH), join('state', 'activity')]) mkdirSync(join(TMP, d), { recursive: true });
 
-const { createResultQueue, createVoiceTaskStore, frameBatch, planReconcile, NOT_PICKED_MS, MAX_REPLAYS } = await import('../src/relay-agent.js');
-const { createConversationPacer } = await import('../src/conversation-pacing.js');
+const { RelayAgent, relayAgentSubagentConfig, createVoiceTaskStore, frameResult, planReconcile, NOT_PICKED_MS, MAX_REPLAYS } = await import('../src/relay-agent.js');
 const { frameTaskResult } = await import('../src/inject-framing.js');
 const tb = await import('../src/task-bridge.js');
 const { _pendingTasksForTest, voiceTaskStore, MISSED_RESULT_NOTE, _forwardOfflineThenArchive, reconcileVoiceTasks, voiceTaskRows, voiceTasksAhead } = tb;
@@ -23,140 +22,119 @@ after(() => rmSync(TMP, { recursive: true, force: true }));
 
 const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** A queue with no real waiting: every pause is immediate, the session state is a flag. */
-function harness(opts: { ready?: boolean; store?: ReturnType<typeof createVoiceTaskStore> } = {}) {
-	const injected: string[] = [];
-	const fellBack: string[][] = [];
-	const state = { ready: opts.ready ?? true };
-	const q = createResultQueue({
-		canInject: () => state.ready,
-		inject: (t) => injected.push(t),
-		waitForQuiet: async () => {},
-		fallback: (items) => fellBack.push(items.map((i) => i.text)),
-		store: opts.store,
-		sleep: async () => {},
-		turnTimeoutMs: 1_000,
-	});
-	return { q, injected, fellBack, state };
-}
+describe('relay agent subagent: the work call returns its task\'s result', () => {
+	function agent(submitted: Record<string, unknown>) {
+		const store = createVoiceTaskStore(join(TMP, `relay-${Math.random()}.json`));
+		const notices: string[] = [];
+		const relay = new RelayAgent({ submit: async () => submitted, store, notice: (t) => notices.push(t) });
+		return { relay, store, notices };
+	}
+	const pending = (taskId: string, extra: Record<string, unknown> = {}) => ({ status: 'pending', taskId, queuedAhead: 0, watcherOnline: true, message: 'm', ...extra });
 
-describe('result queue', () => {
-	it('two results arriving together are handed over once, and both are in it', async () => {
-		const { q, injected } = harness();
-		q.enqueue({ text: '#5140 is merged.', taskId: 'task-5140' });
-		q.enqueue({ text: '#5167 is blocked on CI.', taskId: 'task-5167' });
-		await tick(10);
-		assert.equal(injected.length, 1);
-		assert.match(injected[0], /2 task results arrived together/);
-		assert.match(injected[0], /#5140 is merged/);
-		assert.match(injected[0], /#5167 is blocked on CI/);
+	it('runs as the persistent work subagent', async () => {
+		const { relay } = agent({});
+		const config = relayAgentSubagentConfig(relay);
+		assert.equal(config.lifetime, 'persistent_session');
+		assert.equal(await config.persistentFactory!('relay-agent', config), relay);
 	});
 
-	it('a result arriving while the model answers the previous one waits for that turn to end', async () => {
-		const { q, injected } = harness();
-		q.enqueue({ text: 'first' });
-		await tick(10);
-		q.enqueue({ text: 'second' });
-		await tick(10);
-		assert.equal(injected.length, 1, 'held while the first is being spoken');
-		q.onTurnEnd();
-		await tick(10);
-		assert.equal(injected.length, 2);
-		assert.match(injected[1], /second/);
+	it('the call waits for its result and returns it, naming the request; the row is recorded handed over', async () => {
+		const { relay, store } = agent(pending('task-2'));
+		const call = relay.invoke('Execute tool: work', { task: 'draw a cat' });
+		await tick(0);
+		assert.equal(relay.isWaiting('task-2'), true);
+		assert.equal(relay.offerResult({ text: 'x', taskId: 'task-other' }), false, 'another task\'s result is not this call\'s');
+		assert.equal(relay.offerResult({ text: 'a cat', taskId: 'task-2', requests: ['draw a cat'] }), true);
+		const out = await call;
+		assert.match(out, /This answers the user's request: "draw a cat"/);
+		assert.ok(out.includes(frameTaskResult('a cat')));
+		assert.equal(store.get('task-2')?.delivery, 'injected');
+		assert.equal(relay.offerResult({ text: 'a cat', taskId: 'task-2' }), false, 'once only');
 	});
 
-	it('an answer the user cut off is handed over once more, then recorded as not confirmed', async () => {
-		const store = createVoiceTaskStore(join(TMP, 'state', 'cut.json'));
-		const { q, injected } = harness({ store });
-		q.enqueue({ text: 'the weather', taskId: 'task-w' });
-		await tick(10);
-		q.onTurnInterrupted();
-		await tick(10);
-		assert.equal(injected.length, 2);
-		q.onTurnInterrupted();
-		await tick(10);
-		assert.equal(injected.length, 2, 'no third try');
-		assert.equal(store.get('task-w')?.delivery, 'injected');
+	it('a status answer (duplicate, rejected, fast path) returns at once', async () => {
+		const { relay } = agent({ status: 'duplicate', taskId: 'task-3', message: 'already pending' });
+		assert.match(await relay.invoke('w', { task: 'x' }), /"status":"duplicate"/);
+		assert.equal(relay.isWaiting('task-3'), false);
 	});
 
-	it('a finished turn after the hand-over records the result as spoken', async () => {
-		const store = createVoiceTaskStore(join(TMP, 'state', 'spoken.json'));
-		const { q } = harness({ store });
-		q.enqueue({ text: 'done', taskId: 'task-s' });
-		await tick(10);
-		q.onTurnEnd();
-		await tick(10);
-		assert.equal(store.get('task-s')?.delivery, 'spoken');
+	it('a queue position or an offline core is said at submission; the ordinary case says nothing extra', async () => {
+		const ahead = agent(pending('task-4', { queuedAhead: 2, message: 'Got it, 2 in line.' }));
+		void ahead.relay.invoke('w', {}).catch(() => {});
+		await tick(0);
+		assert.deepEqual(ahead.notices.length, 1);
+		assert.match(ahead.notices[0], /Got it, 2 in line\./);
+		const plain = agent(pending('task-5'));
+		void plain.relay.invoke('w', {}).catch(() => {});
+		await tick(0);
+		assert.equal(plain.notices.length, 0);
 	});
 
-	it('a session that cannot take results sends the batch to the fallback and records dm', async () => {
-		const store = createVoiceTaskStore(join(TMP, 'state', 'dm.json'));
-		const { q, injected, fellBack } = harness({ ready: false, store });
-		q.enqueue({ text: 'the car picture', taskId: 'task-car' });
-		await tick(10);
-		assert.deepEqual(injected, []);
-		assert.deepEqual(fellBack, [['the car picture']]);
-		assert.equal(store.get('task-car')?.delivery, 'dm');
+	it('an aborted call ends without a failure (bodhi would read a rejection out as one); the result goes another way', async () => {
+		const { relay, store } = agent(pending('task-6'));
+		const ctl = new AbortController();
+		const call = relay.invoke('w', {}, ctl.signal);
+		await tick(0);
+		ctl.abort();
+		assert.match(await call, /still running; its result will come in a separate message/);
+		assert.equal(relay.offerResult({ text: 'late', taskId: 'task-6' }), false);
+		assert.equal(store.get('task-6')?.delivery, undefined);
 	});
 
-	it('a held queue (meeting) neither injects nor falls back, and sends everything once it ends', async () => {
-		const injected: string[] = [];
-		const fellBack: string[][] = [];
-		const meeting = { on: true };
-		const q = createResultQueue({
-			held: () => meeting.on,
-			canInject: () => true,
-			inject: (t) => injected.push(t),
-			waitForQuiet: async () => {},
-			fallback: (items) => fellBack.push(items.map((i) => i.text)),
-			sleep: () => new Promise((r) => setTimeout(r, 1)),
-			heldPollMs: 5,
-		});
-		q.enqueue({ text: 'build done' });
-		q.enqueue({ text: '[System: call done]', framed: true });
-		await tick(50);
-		assert.deepEqual(injected, []);
-		assert.deepEqual(fellBack, [], 'a meeting is not a reason to send it to the DM');
-		meeting.on = false;
-		await tick(50);
-		assert.equal(injected.length, 1);
-		assert.match(injected[0], /2 task results arrived together/);
-		assert.ok(injected[0].includes('[System: call done]') && !injected[0].includes('TASK_RESULT_START>\n[System: call done]'), 'a framed item is not wrapped as a task result');
+	it('a cancelled task ends its waiting call quietly: the core never answers a cancelled task', async () => {
+		const { relay } = agent(pending('task-7'));
+		const call = relay.invoke('w', {});
+		await tick(0);
+		const ended: string[] = [];
+		tb.setVoiceTaskEndedListener((id, why) => { ended.push(`${id}:${why}`); relay.endCall(id, why); });
+		try {
+			tb.noteVoiceTaskCancelled('task-7');
+		} finally {
+			tb.setVoiceTaskEndedListener(null);
+		}
+		assert.deepEqual(ended, ['task-7:cancelled']);
+		assert.match(await call, /cancelled this task and was already told/);
+		assert.doesNotMatch(await call, /fail/i);
+		assert.equal(relay.isWaiting('task-7'), false);
+		assert.equal(relay.endCall('task-7', 'cancelled'), false, 'nothing left to end');
 	});
 
-	it('a session that comes back mid-speech after a wait gets nothing until the next pause', async () => {
-		const pacer = createConversationPacer({ quietMs: 60, afterInterruptMs: 60, maxWaitMs: 5_000, pollMs: 5 });
-		const state = { ready: false };
-		const injected: Array<{ speaking: boolean }> = [];
-		let speaking = false;
-		const q = createResultQueue({
-			canInject: () => state.ready,
-			inject: () => injected.push({ speaking }),
-			waitForQuiet: () => pacer.waitForQuiet(),
-			fallback: () => assert.fail('no fallback: the session came back'),
-			gatherMs: 1,
-			notReadyRetriesMs: Array(20).fill(20),
-		});
-		q.enqueue({ text: 'PR 3509 status.' });
-		await tick(80);                                   // the queue is in its not-ready wait
-		state.ready = true; speaking = true; pacer.onTurnStart();   // back, and the model is talking
-		await tick(200);
-		assert.deepEqual(injected, [], 'nothing cuts into the turn the session came back to');
-		speaking = false; pacer.onTurnEnd();
-		await tick(300);
-		assert.deepEqual(injected, [{ speaking: false }], 'handed over at the pause after it');
+	it('voice-agent ends the relay call of each task whose result never comes back to voice', () => {
+		const src = readFileSync(join(import.meta.dirname, '..', 'src', 'voice-agent.ts'), 'utf-8');
+		assert.match(src, /setVoiceTaskEndedListener\(\(taskId, why\) => \{ relayAgent\.endCall\(taskId, why\); \}\);/);
 	});
 
-	it('each result in a batch names the request it answers, and only the batch ends the turn', () => {
-		const out = frameBatch([{ text: '#5140 merged.', request: 'check PR 5140' }, { text: '#5167 blocked.', request: 'check PR 5167' }]);
-		assert.match(out, /This answers the user's request: "check PR 5140"\.[\s\S]*#5140 merged\.[\s\S]*This answers the user's request: "check PR 5167"\.[\s\S]*#5167 blocked\./);
-		assert.match(out, /Task result 1 of 2[\s\S]*Task result 2 of 2/);
-		assert.equal(out.match(/wait for real input/g)?.length, 1, 'once, in the batch header');
-		assert.match(frameBatch([{ text: 'x', request: 'draw a dog' }]), /This answers the user's request: "draw a dog"\.\]\n\n\[System: Task completed\./);
+	it('a result answering several tasks ends their waiting calls too, and records them all', async () => {
+		const store = createVoiceTaskStore(join(TMP, `multi-${Math.random()}.json`));
+		const ids = ['task-a', 'task-b', 'task-c'];
+		let n = 0;
+		const relay = new RelayAgent({ submit: async () => pending(ids[n++]), store });
+		const calls = ids.map(() => relay.invoke('w', {}));
+		await tick(0);
+		assert.equal(relay.offerResult({ text: 'All three.', taskId: 'task-a', requests: ['r1', 'r2', 'r3'], alsoFor: ['task-b', 'task-c'] }), true);
+		const [a, b, c] = await Promise.all(calls);
+		assert.match(a, /This answers 3 of the user's requests/);
+		assert.match(b, /answered_together/);
+		assert.match(c, /"answeredIn":"task-a"/);
+		assert.deepEqual(ids.map((id) => store.get(id)?.delivery), ['injected', 'injected', 'injected']);
 	});
 
-	it('one result is framed exactly as before', () => {
-		assert.equal(frameBatch([{ text: 'x' }]), frameTaskResult('x'));
+	it('dispose ends every waiting call', async () => {
+		const { relay } = agent(pending('task-8'));
+		const call = relay.invoke('w', {});
+		await tick(0);
+		await relay.dispose();
+		await assert.rejects(call, /disposed/);
+	});
+});
+
+describe('frameResult', () => {
+	it('one result is framed exactly as before; a note sits outside the result markers', () => {
+		assert.equal(frameResult({ text: 'x' }), frameTaskResult('x'));
+		assert.match(frameResult({ text: 'x', note: 'n' }), /TASK_RESULT_END[\s\S]*n/);
+	});
+	it('a framed item is not wrapped as a task result', () => {
+		assert.equal(frameResult({ text: '[System: call done]', framed: true }), '[System: call done]');
 	});
 });
 
@@ -196,6 +174,33 @@ describe('voice task store', () => {
 		assert.equal(typeof row.submittedAt, 'number');
 		assert.equal(row.cancelRequested, true);
 		assert.equal(row.delivery, 'dm');
+	});
+});
+
+describe('a result that answers several requests (the core deduped them into it)', () => {
+	it('the table records which result answered a task, and lists the tasks a result answered', () => {
+		const store = createVoiceTaskStore(join(TMP, `ab-${Math.random()}.json`));
+		store.add('task-a', 'check PR 5308');
+		store.add('task-b', 'check PR 5309');
+		store.add('task-c', 'check PR 5310');
+		store.setAnsweredBy('task-b', 'task-a');
+		store.setAnsweredBy('task-c', 'task-a');
+		store.setAnsweredBy('task-a', 'task-a');
+		assert.equal(store.get('task-b')?.answeredBy, 'task-a');
+		assert.equal(store.get('task-a')?.answeredBy, undefined, 'never answered by itself');
+		assert.deepEqual(store.answeredBy('task-a').map(([id]) => id).sort(), ['task-b', 'task-c']);
+	});
+
+	it('a result names every request it answers', () => {
+		assert.match(frameResult({ text: 'All three.', requests: ['check PR 5308', 'check PR 5309', 'check PR 5310'] }), /This answers 3 of the user's requests: "check PR 5308"; "check PR 5309"; "check PR 5310"\. Cover each of them\./);
+	});
+
+	it('parses the task a [deduped: …] result points to', async () => {
+		const { dedupTarget } = await import('../src/skip_marker_ownership.js');
+		assert.equal(dedupTarget('[deduped: task-1791611250258]'), 'task-1791611250258');
+		assert.equal(dedupTarget('**[core: 2]**\n[deduped: task-9]'), 'task-9');
+		assert.equal(dedupTarget('[no-send]'), null);
+		assert.equal(dedupTarget('see [deduped: task-9]'), null);
 	});
 });
 
@@ -291,8 +296,47 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 		const notice = got.find((g) => g.text.includes('draw a kite'));
 		assert.ok(notice?.framed, 'framed, so the queue does not wrap it as a task result');
 		assert.match(notice!.text, /^\[System: The user's task "draw a kite" has not been picked up by the core/);
-		assert.doesNotMatch(frameBatch([{ text: notice!.text, framed: true }]), /Task completed/);
+		assert.doesNotMatch(frameResult({ text: notice!.text, framed: true }), /Task completed/);
 		rmSync(join(TMP, 'tasks', `${id}.txt`));
+	});
+
+	it('a task whose offline DM copy is still in results/ is not handed over again (the drain speaks it)', () => {
+		const id = `task-${1_800_000_800_000 + ++seq}`;
+		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${id}.txt`), `id: ${id}\nsource: voice\ntask: check PR 9\n`);
+		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${id}.txt`), 'PR 9 status.');
+		voiceTaskStore.add(id, 'check PR 9');
+		voiceTaskStore.set(id, 'dm');
+		const copy = join(TMP, 'results', `proactive-result-${id}-1800000800.txt`);
+		writeFileSync(copy, 'PR 9 status.');
+		const got: string[] = [];
+		reconcileVoiceTasks((text) => got.push(text), () => false);
+		assert.deepEqual(got.filter((t) => t.includes('PR 9')), [], 'the live copy is on its way');
+		rmSync(copy);
+		reconcileVoiceTasks((text) => got.push(text), () => false);
+		assert.equal(got.filter((t) => t.includes('PR 9')).length, 1, 'once the copy is gone, it is owed');
+	});
+
+	it('a task the core answered in another task\'s result is owed that result, labelled for it', () => {
+		const a = `task-${1_800_000_900_000 + ++seq}`;
+		const b = `task-${1_800_000_900_000 + ++seq}`;
+		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${a}.txt`), `id: ${a}\nsource: voice\ntask: check PR 5308\n`);
+		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${b}.txt`), `id: ${b}\nsource: voice\ntask: check PR 5309\n`);
+		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${a}.txt`), 'All three: 5308 merged, 5309 ready.');
+		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${b}.txt`), `[deduped: ${a}]`);
+		voiceTaskStore.add(a, 'check PR 5308');
+		voiceTaskStore.add(b, 'check PR 5309');
+		voiceTaskStore.set(a, 'spoken');      // handed over before the dedup link existed, naming only 5308
+		voiceTaskStore.setAnsweredBy(b, a);
+		const got: Array<{ text: string; taskId?: string }> = [];
+		reconcileVoiceTasks((text, _note, meta) => got.push({ text, taskId: meta.taskId }), () => false);
+		const owed = got.filter((g) => g.taskId === b);
+		assert.equal(owed.length, 1);
+		assert.match(owed[0].text, /5309 ready/);
+		assert.equal(got.filter((g) => g.taskId === a).length, 0, 'the answering task itself was heard');
+		voiceTaskStore.set(b, 'spoken');
+		got.length = 0;
+		reconcileVoiceTasks((text, _note, meta) => got.push({ text, taskId: meta.taskId }), () => false);
+		assert.equal(got.filter((g) => g.taskId === b).length, 0, 'heard now: owes nothing');
 	});
 
 	it('status rows and the count ahead come from the table: a health check in tasks/ is not one of the user\'s', () => {
@@ -308,6 +352,19 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 		assert.deepEqual(rows.map((r) => r.state), ['queued', 'queued']);
 		assert.ok(!voiceTaskRows().some((r) => r.id === 'task-health-9'));
 		for (const f of [a, b, 'task-health-9']) rmSync(join(TMP, 'tasks', `${f}.txt`));
+	});
+});
+
+describe('voice runs every work call through the relay agent', () => {
+	it('work is a background tool mapped to the relay agent subagent; the model hears the pending message at once', () => {
+		assert.equal(tb.workTool.execution, 'background');
+		assert.equal(tb.workTool.pendingMessage, tb.WORK_PENDING_MESSAGE, 'without it the model says nothing until the result');
+		assert.equal(tb.workTool.behavior, undefined);
+		const voice = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/voice-agent.ts'), 'utf-8');
+		assert.match(voice, /subagentConfigs: \{ work: relayAgentSubagentConfig\(relayAgent\) \},/);
+		assert.match(voice, /wireDurableChannels\(session, \{ [^}]*relay: relayAgent \}\);/);
+		const runtime = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/live-agent-runtime.ts'), 'utf-8');
+		assert.match(runtime, /if \(opts\.relay\.offerResult\(item\)\)/);
 	});
 });
 

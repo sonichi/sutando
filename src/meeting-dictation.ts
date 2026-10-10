@@ -90,10 +90,17 @@ function hhmmss(d: Date): string {
 	return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-export function ensureMeetingNote(notePath: string, today: string): void {
+/** Local date and start time of a meeting, `2026-10-10-1119`: one note file per meeting. */
+export function meetingStamp(d: Date): string {
+	const p = (n: number) => String(n).padStart(2, '0');
+	return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+export function ensureMeetingNote(notePath: string, stamp: string): void {
 	if (existsSync(notePath)) return;
 	mkdirSync(dirname(notePath), { recursive: true });
-	writeFileSync(notePath, `---\ntitle: Meeting notes — ${today}\ndate: ${today}\ntags: [meeting, notes]\n---\n\n`);
+	const [date, hhmm] = [stamp.slice(0, 10), stamp.slice(11)];
+	writeFileSync(notePath, `---\ntitle: Meeting notes — ${date} ${hhmm.slice(0, 2)}:${hhmm.slice(2)}\ndate: ${date}\ntags: [meeting, notes]\n---\n\n`);
 }
 
 export function appendTranscriptLine(notePath: string, text: string, at: Date = new Date()): void {
@@ -146,7 +153,8 @@ export interface MeetingDictationSession {
 export interface MeetingDictationDeps {
 	session: MeetingDictationSession;
 	/** Resolved per meeting so a meeting crossing midnight keeps one file. */
-	notePathFor: (today: string) => string;
+	/** The note file for a meeting starting at `stamp` (see meetingStamp). */
+	notePathFor: (stamp: string) => string;
 	/** Called after an exit phrase returned the session to agent mode. */
 	onExitByVoice: () => void;
 	log: (msg: string) => void;
@@ -206,14 +214,14 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 		if (!notePath || !headerAt) return;
 		const at = headerAt;
 		headerAt = null;
-		ensureMeetingNote(notePath, at.toISOString().slice(0, 10));
+		ensureMeetingNote(notePath, meetingStamp(at));
 		appendTranscriptHeader(notePath, at);
 	}
 
 	async function enter(): Promise<void> {
 		if (deps.session.getTranscriptionMode() === 'transcription') return;
 		headerAt = now();
-		notePath = deps.notePathFor(headerAt.toISOString().slice(0, 10));
+		notePath = deps.notePathFor(meetingStamp(headerAt));
 		lines = [];
 		unsaved = 0;
 		deps.session.clearDictationBuffer();

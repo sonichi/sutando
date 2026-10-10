@@ -19,7 +19,7 @@ def _norm(text: str) -> str:
 
 ROUTING = (
     "Reply in the conversation the request came from: a task with `channel_id`/`source_room_id` is "
-    "answered in that room, threaded to `source_message_id`.",
+    "answered in that room, replying to `source_message_id`.",
     "In a room with other people (anything but the owner's own DM), post only what they are meant to "
     "read: a reply to their message, what the owner asked to be posted there, or work the room asked for.",
     "goes to the owner's DM even when asked in the room or by voice while docked in it; nothing goes in "
