@@ -1236,11 +1236,11 @@ export const submitWorkTask = (args: Record<string, unknown>) => workTool.execut
  *  character can render as multiple bytes. Lifted to LOG_LINE_MAX_CHARS;
  *  override via SUTANDO_LOG_LINE_MAX_CHARS env if a host wants tighter logs. */
 const LOG_LINE_MAX_CHARS = Number(process.env.SUTANDO_LOG_LINE_MAX_CHARS) || 2000;
-export function logConversation(role: string, text: string, sessionId?: string): void {
+export function logConversation(role: string, text: string, sessionId?: string, at: Date = new Date()): void {
 	const capped = text.replace(/\n/g, ' ').slice(0, LOG_LINE_MAX_CHARS);
-	const line = `${new Date().toISOString()}|${role}|${capped}\n`;
+	const line = `${at.toISOString()}|${role}|${capped}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
-	recordConversation(role, capped, sessionId); // #603 sqlite mirror — best-effort, swallowed inside
+	recordConversation(role, capped, sessionId, { tsUnix: at.getTime() / 1000 }); // #603 sqlite mirror — best-effort, swallowed inside
 }
 
 /** Append a session-end boundary marker. Used by voice-agent's
