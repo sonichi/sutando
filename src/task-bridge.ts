@@ -14,6 +14,7 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { renderItems } from './voice-conversation-summary.js';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
@@ -249,6 +250,8 @@ export type VoiceTurnsSnapshot = {
 	pendingInput?: string | null;
 	/** When the runtime last saw the owner speak (ms epoch); undefined when unknown. */
 	lastUserSpeechAt?: number | null;
+	/** The compressed summary of the conversation before `items`, when one was made. */
+	summary?: string | null;
 };
 type VoiceTurnsProvider = () => ReadonlyArray<VoiceTurn> | VoiceTurnsSnapshot | null | undefined;
 let _voiceTurns: VoiceTurnsProvider | null = null;
@@ -269,6 +272,20 @@ function _readSnapshot(): VoiceTurnsSnapshot | null {
 	if (Array.isArray(raw)) return { items: raw };
 	const snap = raw as VoiceTurnsSnapshot;
 	return Array.isArray(snap.items) || snap.pendingInput || typeof snap.lastUserSpeechAt === 'number' ? snap : null;
+}
+
+/** Turns of the live conversation a work task carries, after the summary of what came before them. */
+export const CONTEXT_RECENT_ITEMS = 10;
+
+/** The live session's conversation at the ask: its summary, then the last turns. Null without a session. */
+export function _voiceContextAtAsk(): string | null {
+	const snap = _readSnapshot();
+	if (!snap) return null;
+	const items = Array.isArray(snap.items) ? snap.items : [];
+	const recent = renderItems(items.filter((i) => i.role === 'user' || i.role === 'assistant').slice(-CONTEXT_RECENT_ITEMS));
+	const summary = typeof snap.summary === 'string' ? snap.summary.trim() : '';
+	const parts = [summary ? `summary of the conversation before these turns:\n${summary}` : '', recent].filter(Boolean);
+	return parts.length ? parts.join('\n\n') : null;
 }
 
 /** Longest single utterance the block carries; a longer one (a paste typed into the session) is cut. */
@@ -1053,7 +1070,7 @@ export const workTool: ToolDefinition = {
 		const origin = _voiceSessionOrigin;
 		const originGeneration = _voiceOriginGeneration;
 		let recentAtAsk = '';
-		try { recentAtAsk = getRecentConversation(4); } catch { /* best effort */ }
+		try { recentAtAsk = _voiceContextAtAsk() ?? getRecentConversation(4); } catch { /* best effort */ }
 
 		// Redirect pure screen-viewing tasks to inline tools (faster, no round-trip)
 		// Narrow match: only "describe/look at my screen" — not scroll, screenshot,
@@ -1178,7 +1195,7 @@ export const workTool: ToolDefinition = {
 				const recent = recentAtAsk;
 				if (recent) {
 					contextBlock =
-						`\n\n--- recent voice transcript (may contain ASR errors; if the task above ` +
+						`\n\n--- earlier in this voice conversation: a summary, then the last turns (may contain ASR errors; if the task above ` +
 						`seems garbled or doesn't match this, infer the true intent from it or ask to ` +
 						`confirm before acting) ---\n${confineUserContent(recent)}\n`;
 				}
