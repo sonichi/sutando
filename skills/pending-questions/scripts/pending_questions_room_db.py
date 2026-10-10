@@ -52,12 +52,13 @@ from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFaile
                                      RoomDbStore, ScriptDbClient, StoreError, outbox_items, reconcile_pending,
                                      safe_body, waiting_item, write_question)
 from workspace_default import status_path
+from owner_room_access import agent_identity, capability_scripts, channel_credentials, owner_dm, owner_routing
+from owner_room_access import resolve_credentials as _credentials
 
 # The skill directories that provide the room capability, canonical name first.
 CAPABILITY_SKILLS = ("room-commons", "room-collab")
 CLIENT_MODULE = "room_collab_client.py"
 CLI_MODULE = "room_collab.py"
-IDENTITY_VARS = ("AG2SPACE_USER_ID", "AG2_MATRIX_USER_ID")
 GAP = 1024
 SETTLE_SEC = 1.0
 # The documented room-surface link shape; `page` is the database id.
@@ -68,20 +69,8 @@ URL_KEY = "PENDING_QUESTIONS_COLLAB_URL"
 
 
 def skill_scripts(workspace: Path) -> Optional[Path]:
-    for base in (Path(workspace) / "skills", REPO / "skills"):
-        for name in CAPABILITY_SKILLS:
-            d = base / name / "scripts"
-            if (d / CLIENT_MODULE).is_file() and (d / CLI_MODULE).is_file():
-                return d
-    return None
-
-
-def owner_routing(workspace: Path) -> dict:
-    try:
-        d = json.loads(status_path("owner-routing.json", Path(workspace)).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return capability_scripts((Path(workspace) / "skills", REPO / "skills"), CAPABILITY_SKILLS,
+                              (CLIENT_MODULE, CLI_MODULE))
 
 
 def manifest_config(key: str) -> str:
@@ -134,11 +123,10 @@ def room_store(workspace: Path, environ=None, timeout: float = 90.0, collab_url:
         return None, f"no room capability installed ({' or '.join(CAPABILITY_SKILLS)})"
     routing = owner_routing(workspace)
     shared = configured_room(workspace, env)
-    room = shared or str(routing.get("owner_dm") or "").strip()
+    room = shared or owner_dm(routing)
     if not room:
         return None, "no owner DM room known (state/owner-routing.json has no owner_dm)"
-    user = next((env[v].strip() for v in IDENTITY_VARS if (env.get(v) or "").strip()), "") \
-        or str(routing.get("identity") or "").strip()
+    user = agent_identity(routing, env)
     if not user:
         return None, "no agent identity to sign database writes with"
     url_override = (collab_url or "").strip() or configured(URL_KEY, env)
@@ -492,38 +480,6 @@ def _load_capability(scripts: str):
     import room_collab  # noqa: PLC0415 — the injected capability
     import room_collab_client  # noqa: PLC0415, F401
     return room_collab
-
-
-def channel_credentials(cap, environ=None) -> dict:
-    """The capability's credential variables from the AG2 Space channel env file the shared
-    resolver picks; empty when a variable already names either, so the two never mix."""
-    from channel_env_resolve import resolve_channel_env
-    from channel_token import token_from_env_file
-    from util_paths import claude_home_path
-    env = os.environ if environ is None else environ
-    names = (*getattr(cap, "URL_VARS", ()), *getattr(cap, "TOKEN_VARS", ()))
-    if not names or any(env.get(v) for v in names):
-        return {}
-    path = resolve_channel_env(claude_home_path("channels"), "ag2space")
-    if path is None:
-        return {}
-    found = {v: token_from_env_file(v, path) for v in names}
-    return {v: x for v, x in found.items() if x}
-
-
-def _credentials(cap, collab_url: Optional[str]) -> tuple:
-    """(url, token) by the capability's own order; when that finds neither, from the channel
-    env file the shared resolver picks (a desktop install keeps them there)."""
-    try:
-        return cap.resolve_url(collab_url), cap.resolve_token(None)
-    except Exception:  # noqa: BLE001 — retried below only when the env file has them
-        # Never with --collab-url: that host was named elsewhere, and the channel token
-        # must not go to a host its own file did not name (the capability's no-mix rule).
-        extra = {} if collab_url else channel_credentials(cap)
-        if not extra:
-            raise
-    os.environ.update(extra)
-    return cap.resolve_url(None), cap.resolve_token(None)
 
 
 async def _serve(args, req: dict) -> object:
