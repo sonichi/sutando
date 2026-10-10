@@ -1071,6 +1071,11 @@ if [ "$WATCHER_ROLE" != "session" ]; then
   startup_sweep
 fi
 
+CATCHUP_INTERVAL="${SUTANDO_WATCHER_CATCHUP_SECONDS:-${SUTANDO_HANDLER_POLL_INTERVAL:-30}}"
+case "$CATCHUP_INTERVAL" in
+  ''|*[!0-9]*|0) CATCHUP_INTERVAL=30 ;;
+esac
+
 # Stream subsequent events. -l 0.5 = 500ms latency batch (fswatch coalesces
 # burst events). --event Created --event Renamed catches new file
 # appearance whether it lands as a fresh write or a rename-into-place.
@@ -1262,13 +1267,23 @@ held_read_timeout() {
   left=$(( HELD_RETRY_AT - $(date +%s) ))
   [ "$left" -gt 0 ] && echo "$left" || echo 1
 }
+CATCHUP_NEXT=$(( SECONDS + CATCHUP_INTERVAL ))
 # fd 3 is the one reader: a second open of the FIFO would race it for bytes.
 while :; do
   # A due deadline is served BEFORE the read, so `-t` is never 0 and the held
   # set and deadline are current when the timeout is computed.
   retry_held_tasks_if_due
+  if [ "$SECONDS" -ge "$CATCHUP_NEXT" ]; then
+    startup_sweep
+    CATCHUP_NEXT=$(( SECONDS + CATCHUP_INTERVAL ))
+  fi
   path=""
   t="$(held_read_timeout)"
+  catchup_left=$(( CATCHUP_NEXT - SECONDS ))
+  [ "$catchup_left" -gt 0 ] || catchup_left=1
+  if [ "$t" -eq 0 ] || [ "$t" -gt "$catchup_left" ]; then
+    t="$catchup_left"
+  fi
   if [ "$t" -gt 0 ]; then
     IFS= read -r -t "$t" path <&3; rc=$?
   else
