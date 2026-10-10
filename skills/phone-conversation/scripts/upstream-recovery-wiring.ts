@@ -1,5 +1,6 @@
 // The phone server's upstream-recovery wiring, importable without booting the server.
 import type { EventPayloadMap, IEventBus, UpstreamRecoveryOptions } from 'bodhi-realtime-agent';
+import { fatalCloseForRecovery } from '../../../src/voice-error-classifier.js';
 
 /** Gives bodhi's own close handling time to settle before a parked call is redialed. */
 export const POST_PARK_REDIAL_DELAY_MS = 1500;
@@ -28,6 +29,8 @@ export function phoneUpstreamRecovery(
 		holdSyntheticUntilFreshSpeech: true,
 		parkRedialDelayMs: POST_PARK_REDIAL_DELAY_MS,
 		idleParkMs: 0,
+		// The one Gemini close classifier, the voice agent's.
+		classifyClose: fatalCloseForRecovery,
 	};
 }
 

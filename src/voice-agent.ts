@@ -73,6 +73,7 @@ import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voi
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
 import {
 	classifyTransportClose,
+	fatalCloseForRecovery,
 	isModelUnavailableClose,
 	recordTerminalClassification,
 	lastTerminalClassification,
@@ -90,6 +91,7 @@ import {
 } from './voice-agent-state.js';
 
 import { sharedPersonalPath, claudeHomePath, voiceMemoryProjectSlug } from './util_paths.js';
+import { activeSilenceTicksFromEnv } from './voice-recovery-config.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -172,9 +174,7 @@ const LEGACY_PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
 const CRASH_RECORD_PATH = join(WORKSPACE_DIR, 'logs', 'voice-agent.crash.json');
 const SESSION_ID = `session_${Date.now()}`;
 // Active-silence redial (bodhi upstreamRecovery.activeSilence): opt-in with VOICE_ACTIVE_SILENCE_MODE=armed.
-const ACTIVE_SILENCE_TICKS = process.env.VOICE_ACTIVE_SILENCE_MODE === 'armed'
-	? Math.min(40, Math.max(2, Math.trunc(Number(process.env.VOICE_ACTIVE_SILENCE_TICKS)) || 3))
-	: 0;
+const ACTIVE_SILENCE_TICKS = activeSilenceTicksFromEnv(process.env);
 
 const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
 
@@ -972,10 +972,7 @@ async function main() {
 		upstreamLossPolicy: 'hold',
 		upstreamRecovery: {
 			idleParkMs: IDLE_TEARDOWN_MS,
-			classifyClose: (code, reason) => {
-				const c = classifyTransportClose(code, reason);
-				return c.retryable ? null : { category: c.category, code, reason: c.rawReason };
-			},
+			classifyClose: fatalCloseForRecovery,
 			onFatal: ({ until }) => {
 				voiceFatalBackoffUntil = until;
 				emitAgentState();
@@ -1532,18 +1529,8 @@ async function main() {
 		}
 	};
 
-	// Amendment Z3 — verifier/probe idle restoration. The initial idle timer
-	// above is one-shot and rearmed only by the REAL-client disconnect
-	// wrapper; a probe/verifier that closes after that timer already fired
-	// would otherwise leave a woken upstream connected forever (no real
-	// client will ever rearm it). The isolated restore timer arms on
-	// probe-role close with no real client attached and restores the prior
-	// idle state (upstream → CLOSED); a later real connection fences it
-	// (handleClientConnected wrapper below). SEAM: until the Step-11 bodhi
-	// pin exposes a probe/verifier-close hook, the only in-repo arm point is
-	// the `probeState` callback passed to the VoiceSession constructor —
-	// when bodhi's role close hook lands, wire it to `probeIdleRestore.arm()`
-	// directly.
+	// A probe/verifier that wakes the upstream with no real client attached would keep it connected:
+	// bodhi's idle park arms only on a real client's disconnect. The isolated restore parks it again.
 	const probeIdleRestore = createIsolatedIdleRestore({
 		delayMs: IDLE_TEARDOWN_MS,
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any

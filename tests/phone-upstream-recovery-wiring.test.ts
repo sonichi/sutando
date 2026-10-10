@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventBus } from 'bodhi-realtime-agent';
+import { fatalCloseForRecovery } from '../src/voice-error-classifier.js';
 import {
 	POST_PARK_REDIAL_DELAY_MS,
 	phoneCallIsLive,
@@ -35,6 +36,7 @@ describe('phoneUpstreamRecovery', () => {
 		assert.equal(opts.holdSyntheticUntilFreshSpeech, true);
 		assert.equal(opts.parkRedialDelayMs, POST_PARK_REDIAL_DELAY_MS);
 		assert.equal(opts.idleParkMs, 0);
+		assert.equal(opts.classifyClose, fatalCloseForRecovery, 'the one Gemini classifier, not bodhi\'s copy');
 	});
 });
 

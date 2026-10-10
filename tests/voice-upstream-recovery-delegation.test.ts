@@ -15,7 +15,7 @@ describe('voice-agent.ts delegates upstream recovery to bodhi', () => {
 	});
 
 	it('classifies fatal closes with the one sutando classifier', () => {
-		assert.match(src, /classifyClose: \(code, reason\) => \{\n\t\t\t\tconst c = classifyTransportClose\(code, reason\);/);
+		assert.match(src, /\t\t\tclassifyClose: fatalCloseForRecovery,\n/);
 	});
 
 	it('keeps no private redial, park timer or silence coordinator', () => {
