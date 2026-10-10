@@ -131,6 +131,28 @@ export function createMeetingEntryGate(opts: { fallbackMs: number; onFire: () =>
 	};
 }
 
+/** A client frame that names what the client can render; a client that lists `meeting.cue` plays the cue itself. */
+export const CLIENT_CAPABILITIES_TYPE = 'client.capabilities';
+
+export function announcesMeetingCue(message: unknown): boolean {
+	const m = message as { type?: unknown; capabilities?: unknown } | null;
+	return m?.type === CLIENT_CAPABILITIES_TYPE && Array.isArray(m.capabilities) && m.capabilities.includes('meeting.cue');
+}
+
+/**
+ * switch_mode("meeting"). A cue-capable client: answer first and enter one macrotask later (a tool
+ * result sent after entry is held until the meeting ends); the client speaks the cue. Any other
+ * client: the model speaks it, and entry waits for that turn.
+ */
+export function startMeeting(opts: { clientCues: boolean; enter: () => void; gate: { schedule(): void }; defer?: (fn: () => void) => void }): Record<string, unknown> {
+	if (opts.clientCues) {
+		(opts.defer ?? ((fn) => setTimeout(fn, 0)))(opts.enter);
+		return { status: 'meeting_mode', transcribing: true, instruction: 'Meeting mode is on, and the client has already told the user how to come back. Say nothing.' };
+	}
+	opts.gate.schedule();
+	return { status: 'meeting_mode', transcribing: true, say: MEETING_ENTRY_SAY, instruction: `Say exactly this, then end your turn: "${MEETING_ENTRY_SAY}"` };
+}
+
 export interface MeetingDictationSession {
 	setTranscriptionMode(mode: 'agent' | 'transcription'): Promise<void>;
 	getTranscriptionMode(): 'agent' | 'transcription';

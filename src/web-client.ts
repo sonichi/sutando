@@ -2113,6 +2113,8 @@ function connectWs() {
     onSessionConfig: function (inRate, outRate) {
       INPUT_RATE = inRate;
       OUTPUT_RATE = outRate;
+      // This page plays the meeting-mode cue itself; a client that does not say so gets the model's line.
+      if (voice) voice.sendClientCommand({ type: 'client.capabilities', capabilities: ['meeting.cue'] });
       dbg('Audio format configured: input=' + INPUT_RATE + 'Hz output=' + OUTPUT_RATE + 'Hz', 'event');
     },
     onProtocolMessage: handleProtocolMessage,
@@ -2346,6 +2348,8 @@ function handleProtocolMessage(msg) {
     // sees connected=false → clean path ("Disconnected.", no retry).
     if (voice) { voice.disconnect(); }
     doCleanup();
+  } else if (msg.type === 'meeting.cue') {
+    playMeetingCue(String(msg.text || ''), typeof msg.audio === 'string' ? msg.audio : '');
   } else if (msg.type === 'task.status') {
     updateTask(msg.taskId, msg.status, msg.text, msg.result);
   } else if (msg.type === 'grounding') {
@@ -2723,6 +2727,55 @@ function toggleWatch() {
   }
 }
 window.toggleWatch = toggleWatch;
+
+// ─── Meeting-mode cue ─────────────────────────────────────
+// The meeting-mode confirmation is a fixed cue the page plays itself: the recording in the session's
+// voice when the server has one, else speech synthesis. The mic is muted meanwhile, so no sound can
+// cut it off and the transcriber does not write it into the note.
+var meetingCueSeq = 0;
+function playMeetingCue(text, audio) {
+  if (!text) return;
+  addSystem(text);
+  var canSpeak = !!window.speechSynthesis && typeof SpeechSynthesisUtterance !== 'undefined';
+  var canPlay = !!audio && typeof Audio !== 'undefined';
+  if (!canSpeak && !canPlay) return;
+  // A newer cue owns the mic: an older one finishing must not unmute it mid-cue.
+  var seq = ++meetingCueSeq;
+  var heldMic = !!voice && !muted;
+  if (heldMic) voice.setMicMuted(true);
+  var released = false;
+  function release() {
+    if (released) return;
+    released = true;
+    // A user who muted during the cue stays muted.
+    if (heldMic && voice && !muted && seq === meetingCueSeq) voice.setMicMuted(false);
+  }
+  function speak() {
+    if (!canSpeak) { release(); return; }
+    try {
+      var utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'en-US';
+      utterance.onend = release;
+      utterance.onerror = release;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(utterance);
+    } catch (e) { release(); }
+  }
+  setTimeout(release, 20000);
+  if (canPlay) {
+    try {
+      var clip = new Audio('data:audio/wav;base64,' + audio);
+      var fellBack = false;
+      var fallBack = function () { if (fellBack) return; fellBack = true; speak(); };
+      clip.onended = release;
+      clip.onerror = fallBack;
+      var played = clip.play();
+      if (played && played.catch) played.catch(fallBack);
+      return;
+    } catch (e) { /* fall through to speech synthesis */ }
+  }
+  speak();
+}
 
 // ─── Mute toggle ──────────────────────────────────────────
 function toggleMute() {

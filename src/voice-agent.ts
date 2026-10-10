@@ -42,7 +42,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY } from './meeting-dictation.js';
+import { announcesMeetingCue, attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY, startMeeting } from './meeting-dictation.js';
+import { meetingCueAudio } from './meeting-cue-audio.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
@@ -434,8 +435,10 @@ function getPendingToolCalls(toolName?: string) {
 let meetingActive = false;
 // Meeting mode is bodhi dictation; set once the session exists.
 let meetingDictation: ReturnType<typeof attachMeetingDictation> | null = null;
-// Entering quiesces audio output, so it waits for the spoken confirmation's turn to complete.
+// Entering quiesces audio output, so a model-spoken confirmation waits for its turn to complete.
 const meetingEntry = createMeetingEntryGate({ fallbackMs: 15_000, onFire: () => enterMeetingDictation() });
+// The connected client said it plays the meeting cue itself (client.capabilities); reset per client.
+let clientPlaysMeetingCue = false;
 function noteMeetingState(on: boolean) {
 	if (!on) meetingEntry.cancel();
 	meetingActive = on;
@@ -444,8 +447,15 @@ function noteMeetingState(on: boolean) {
 }
 // Only the latest entry's failure may turn meeting mode off; an older one can fail while a newer one is transcribing.
 let meetingEntrySeq = 0;
+// The cue in the session's own voice, rendered once at startup; until then (or if it fails) the page speaks the text.
+let meetingCueWav: string | null = null;
 function enterMeetingDictation() {
 	const seq = ++meetingEntrySeq;
+	// A cue-capable client speaks the confirmation with the mic muted: spoken by the model, any sound
+	// could cut it off, and the transcriber would write it into the note.
+	if (clientPlaysMeetingCue) {
+		try { sessionRef?.sendJsonToClient({ type: 'meeting.cue', text: MEETING_ENTRY_SAY, audio: meetingCueWav ?? undefined } as never); } catch { /* no client */ }
+	}
 	meetingDictation?.enter().catch((err) => {
 		console.error(`${ts()} [MeetingDictation] enter failed: ${err?.message ?? err}`);
 		if (seq !== meetingEntrySeq) return;
@@ -541,8 +551,7 @@ const switchModeTool: ToolDefinition = {
 		writeVoiceModeSentinel();
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
-			meetingEntry.schedule();
-			return { status: 'meeting_mode', transcribing: true, say: MEETING_ENTRY_SAY, instruction: `Say exactly this, then end your turn: "${MEETING_ENTRY_SAY}"` };
+			return startMeeting({ clientCues: clientPlaysMeetingCue, enter: enterMeetingDictation, gate: meetingEntry });
 		}
 		await meetingDictation?.exit();
 		if (mode === 'presenter') {
@@ -1106,6 +1115,7 @@ async function main() {
 		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
 		// makes every forward a no-op.
 		onClientCommand: (message) => {
+			if (announcesMeetingCue(message)) clientPlaysMeetingCue = true;
 			voiceRecoveryCoordinator?.handleClientCommand(message);
 			// Frames the core does not own are offered to optional skills' handlers.
 			if (message?.type !== 'voice.retryUpstream') clientFrames.dispatch(message);
@@ -1115,6 +1125,7 @@ async function main() {
 			voiceRecoveryCoordinator?.handleClientConnected();
 		},
 		onClientDisconnected: () => {
+			clientPlaysMeetingCue = false;
 			// An origin belongs to the client that announced it; the next client announces its own.
 			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
 			setVoiceSessionOrigin(null);
@@ -1255,6 +1266,8 @@ async function main() {
 	});
 
 	sessionRef = session;
+	void meetingCueAudio({ apiKey: GEMINI_VOICE_API_KEY, voice: VOICE_NAME, text: MEETING_ENTRY_SAY, dir: join(WORKSPACE_DIR, 'state', 'cues') })
+		.then((wav) => { meetingCueWav = wav; console.log(`${ts()} [Meeting] entry cue ${wav ? `ready in voice ${VOICE_NAME}` : 'not rendered; the page will speak it'}`); });
 	meetingDictation = attachMeetingDictation({
 		session: session as any,
 		notePathFor: (today) => sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR),

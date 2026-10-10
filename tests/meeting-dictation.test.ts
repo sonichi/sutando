@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DictationTranscriptEvent } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE } from '../src/meeting-dictation.js';
+import { announcesMeetingCue, attachMeetingDictation, createMeetingEntryGate, findExitCommand, startMeeting, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE } from '../src/meeting-dictation.js';
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
@@ -248,6 +248,18 @@ describe('meeting dictation', () => {
 	});
 });
 
+describe('meeting transcript carried back to the agent', () => {
+	it('keeps a long meeting\'s end and says where the rest is', async () => {
+		const { meetingEndedContext } = await import('../src/meeting-dictation.js');
+		const long = Array.from({ length: 2000 }, (_, i) => `line ${i} ${'x'.repeat(30)}`);
+		const ctx = meetingEndedContext('/n.md', long);
+		assert.match(ctx, /only the end of the meeting/);
+		assert.ok(ctx.includes('line 1999 '));
+		assert.ok(!ctx.includes('line 0 '));
+		assert.match(ctx, /<MEETING_TRANSCRIPT_START>\nline \d+ x/, 'starts on a whole line');
+	});
+});
+
 describe('meeting entry gate', () => {
 	it('enters after the confirmation turn, not the tool-call turn', () => {
 		let fired = 0;
@@ -283,14 +295,42 @@ describe('meeting entry gate', () => {
 	});
 });
 
-describe('meeting transcript carried back to the agent', () => {
-	it('keeps a long meeting\'s end and says where the rest is', async () => {
-		const { meetingEndedContext } = await import('../src/meeting-dictation.js');
-		const long = Array.from({ length: 2000 }, (_, i) => `line ${i} ${'x'.repeat(30)}`);
-		const ctx = meetingEndedContext('/n.md', long);
-		assert.match(ctx, /only the end of the meeting/);
-		assert.ok(ctx.includes('line 1999 '));
-		assert.ok(!ctx.includes('line 0 '));
-		assert.match(ctx, /<MEETING_TRANSCRIPT_START>\nline \d+ x/, 'starts on a whole line');
+describe('starting a meeting (switch_mode)', () => {
+	it('a cue-capable client: the tool answers first and entry runs one macrotask later; the model is told to say nothing', () => {
+		const order: string[] = [];
+		let deferred: (() => void) | null = null;
+		const out = startMeeting({ clientCues: true, enter: () => order.push('enter'), gate: { schedule: () => order.push('gate') }, defer: (fn) => { deferred = fn; } });
+		order.push('tool result');
+		assert.deepEqual(order, ['tool result'], 'nothing entered before the tool result goes out');
+		deferred!();
+		assert.deepEqual(order, ['tool result', 'enter']);
+		assert.match(String(out.instruction), /Say nothing/);
+		assert.equal(out.say, undefined);
+	});
+
+	it('by default the deferral is a real macrotask, after microtasks', async () => {
+		const order: string[] = [];
+		startMeeting({ clientCues: true, enter: () => order.push('enter'), gate: { schedule() {} } });
+		await Promise.resolve();
+		order.push('microtasks done');
+		await new Promise((r) => setTimeout(r, 5));
+		assert.deepEqual(order, ['microtasks done', 'enter']);
+	});
+
+	it('any other client: the model speaks the line and entry waits for that turn (the gate)', () => {
+		let scheduled = 0;
+		let entered = 0;
+		const out = startMeeting({ clientCues: false, enter: () => entered++, gate: { schedule: () => scheduled++ } });
+		assert.equal(scheduled, 1);
+		assert.equal(entered, 0);
+		assert.equal(out.say, MEETING_ENTRY_SAY);
+		assert.match(String(out.instruction), /^Say exactly this, then end your turn: /);
+	});
+
+	it('only a client.capabilities frame listing meeting.cue counts', () => {
+		assert.equal(announcesMeetingCue({ type: 'client.capabilities', capabilities: ['meeting.cue'] }), true);
+		assert.equal(announcesMeetingCue({ type: 'client.capabilities', capabilities: ['ui.navigate'] }), false);
+		assert.equal(announcesMeetingCue({ type: 'session.context', capabilities: ['meeting.cue'] }), false);
+		assert.equal(announcesMeetingCue(null), false);
 	});
 });
