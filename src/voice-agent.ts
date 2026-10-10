@@ -948,8 +948,9 @@ async function main() {
 
 	const meetingTranscriber = new GeminiLiveTranscribeSTTProvider({
 		apiKey: GEMINI_VOICE_API_KEY,
-		// The exit phrase names Sutando; without the hint it transcribes as "Siddhartha"/"Sutanu".
-		customVocabulary: ['Sutando'],
+		// The exit phrase names Sutando; without the hint it transcribes as "Siddhartha"/"Sutanu",
+		// and the greeting before it as "Has"/"Kai".
+		customVocabulary: ['Sutando', 'Hey Sutando', 'Hi Sutando'],
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
 
@@ -1096,6 +1097,7 @@ async function main() {
 	meetingDictation = attachMeetingDictation({
 		session: session as any,
 		notePathFor: (today) => sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR),
+		toClient: (frame) => session.sendJsonToClient(frame),
 		onExitByVoice: () => {
 			noteMeetingState(false);
 			writeVoiceModeSentinel();
