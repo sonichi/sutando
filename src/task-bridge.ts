@@ -555,8 +555,8 @@ export interface VoiceTaskRow {
 	id: string;
 	text: string;
 	submittedAt: number;
-	/** queued / started / done / cancelled, read from the core now; cancel_requested until the core replies. */
-	state: VoiceTaskState | 'cancel_requested';
+	/** queued / started / done / cancelled, read from the core now. */
+	state: VoiceTaskState;
 	/** How the result reached the user, once it has. */
 	delivery?: 'spoken' | 'injected' | 'dm';
 }
@@ -567,7 +567,6 @@ export function voiceTaskRows(now = Date.now()): VoiceTaskRow[] {
 	for (const [id, row] of voiceTaskStore.list()) {
 		if (row.submittedAt === undefined || now - row.submittedAt > STATUS_WINDOW_MS) continue;
 		let state: VoiceTaskRow['state'] = voiceTaskState(id);
-		if (row.cancelRequested && state === 'cancelled' && !_hasResult(id) && _activityPhase(id) !== 'CANCELLED') state = 'cancel_requested';
 		if (row.cancelRequested && _hasResult(id)) state = 'done';
 		rows.push({ id, text: row.text ?? '', submittedAt: row.submittedAt, state, delivery: row.delivery });
 	}
@@ -639,7 +638,7 @@ export function isVoiceSubmittedTask(taskId: string): boolean {
 	return _pendingTasks.has(taskId) || _isVoiceTask(taskId);
 }
 
-/** A queued voice task the user asked to cancel: delete its file; the core's reply to the instruction confirms. */
+/** A queued voice task the user asked to cancel: its file is deleted, so it is cancelled. */
 export function noteVoiceTaskCancelled(taskId: string): void {
 	_onVoiceTaskEnded?.(taskId, 'cancelled');
 	_cancelledVoiceTasks.add(taskId);
@@ -647,7 +646,7 @@ export function noteVoiceTaskCancelled(taskId: string): void {
 	_pendingTasks.delete(taskId);
 	// Deleted, not archived: a core that misses the file looks in tasks/archive/ and runs what it finds there.
 	try { unlinkSync(join(TASK_DIR, `${taskId}.txt`)); } catch { /* already gone */ }
-	_sendTaskStatus?.(taskId, 'done', 'Cancel requested.');
+	_sendTaskStatus?.(taskId, 'done', 'Cancelled.');
 }
 
 export type VoiceTaskEnd = 'cancelled' | 'delivered_separately';

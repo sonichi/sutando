@@ -488,7 +488,7 @@ const getTaskStatus: ToolDefinition = {
 	execute: async () => {
 		// The relay agent's table, the same source as the in-line count and get_core_status.
 		const rows = voiceTaskRows();
-		const open = rows.filter((r) => r.state === 'queued' || r.state === 'started' || r.state === 'cancel_requested');
+		const open = rows.filter((r) => r.state === 'queued' || r.state === 'started');
 		// Counts and states only: a yes/no "in progress" flag was read as "all of them are being worked on".
 		return {
 			openTasks: open.length,
