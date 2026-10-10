@@ -245,7 +245,6 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`verify-setup.sh`** — Sutando setup verification — checks everything a new user needs
 - **`vision-tools.ts`** — Vision pipeline — pipe JPEG frames from a source (screen, webcam) into the Gemini Live voice session.
 - **`vision_push.py`** — Small helper for posting one-shot vision frames to the active voice session.
-- **`voice-active-silence-watchdog.ts`** — ACTIVE-silence recovery policy (#2963 family, fourth guard) — the pure event reducer from docs/design-voice-active-silence-recovery.md (desktop repo).
 - **`voice-agent-config.ts`** — Voice agent tuned-prompt configuration — step 5a-1 of the interaction-planes refactor (LiveAgentRuntime extraction, slice 1).
 - **`voice-agent-state.ts`** — `agent.state` v1 protocol provider + lifecycle snapshot publisher (design 1a′; impl plan WS1 Step 12, amendments R8/A9/A10/S3/Z3).
 - **`voice-agent.ts`** — Sutando — Voice Interface
@@ -254,7 +253,6 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`voice-config-switch.ts`** — Voice tool: switch voice-agent's model + googleSearch preset at runtime.
 - **`voice-config.ts`** — Per-surface voice configuration loader.
 - **`voice-connect-resolver.ts`** — Transparent voice-connection tier resolution — picks the best reachable endpoint for "call your agent" so the user never chooses a tier.
-- **`voice-connect-watchdog.ts`** — Stuck-CONNECTING recovery policy for the voice health monitor (#2963).
 - **`voice-context.ts`** — Builds a system prompt for the Claude Code subprocess that injects Sutando identity and user context from the memory system.
 - **`voice-continuity.ts`** — voice-continuity — P7 D7.3 continuity helpers (Tranche A engine-side): the stale-repeat goodbye guard and the centralized conversation-clear.
 - **`voice-error-classifier.ts`** — Classify Gemini Live transport close events into actionable categories.
@@ -262,11 +260,6 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`voice-key.ts`** — Shared Gemini API-key resolution for voice surfaces (voice-agent, phone-conversation, and any plugin voice surface).
 - **`voice-lock.ts`** — voice-lock.ts — TS caller of the guarded PID-lock helper (`scripts/voice-lock.py`), used by voice-agent's `acquirePidLock` (impl plan WS1 Step 4, amendments R1/R3/R4).
 - **`voice-mode-resolver.ts`** — Unified base-mode resolver for the voice agent (issue #1410, supersedes partial fixes #1412 + #1413).
-- **`voice-redial-scheduler.ts`** — Event-driven redial scheduler with exponential backoff (F5).
-- **`voice-silence-recovery-coordinator.ts`** — ACTIVE-silence recovery coordinator (Phase 1 armed mode) — the impure driver around the pure reducer in voice-active-silence-watchdog.ts: executes effects against the bodhi session surface (recoverUpstream, client JSON), owns retry timers, the terminal voice-stalled push/resend, the retry-ack wire, and the reducer↔transport attempt-epoch correlation.
-- **`voice-upstream-recovery.ts`** — Host-initiated upstream recovery against bodhi >= 0.4's public recovery contract.
-- **`voice-watchdog-ledger.ts`** — Durable append-only ledger for watchdog evidence rows (design §Observability: the shared audio-health mailbox is a lossy one-slot queue, so watchdog rows get their own small bounded channel).
-- **`voice-watchdog-shadow.ts`** — Shadow-mode host for the ACTIVE-silence recovery reducer — Phase 0a of docs/design-voice-active-silence-recovery.md (desktop repo): derives diagnostic events from the health tick, feeds the pure reducer in chronological order, persists would-fire evidence, and never touches the live session.
 - **`voice_room_membership.py`** — The gateway bridge's room-membership verifier for room-bound voice sessions.
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
 - **`watcher-rearm-session-hint.sh`** — SessionStart(compact|resume) hook: when no ready session-role watcher holds this session's inbox, inject the exact command that re-arms it.

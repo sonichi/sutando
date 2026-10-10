@@ -90,25 +90,6 @@ import {
 } from './voice-agent-state.js';
 
 import { sharedPersonalPath, claudeHomePath, voiceMemoryProjectSlug } from './util_paths.js';
-import { connectingWatchdogTick } from './voice-connect-watchdog.js';
-import { VoiceWatchdogShadow, DETECTOR_VERSION, CAPABILITY_SET } from './voice-watchdog-shadow.js';
-import { WatchdogLedger } from './voice-watchdog-ledger.js';
-import { parseActiveSilenceMode, parseActiveSilenceTicks } from './voice-active-silence-watchdog.js';
-import {
-	VoiceSilenceRecoveryCoordinator,
-	recoverySurfaceSupported,
-	type RecoverySessionSurface,
-} from './voice-silence-recovery-coordinator.js';
-import {
-	initialRedialState, isUpstreamDown, noteLifecycle, noteDialed, shouldEventDial, tickMayDial,
-} from './voice-redial-scheduler.js';
-import {
-	createUpstreamRedialer,
-	hostOwnsUpstreamRecovery,
-	parkIdleUpstream,
-	type ParkSurface,
-	type RecoverySurface,
-} from './voice-upstream-recovery.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -190,35 +171,10 @@ const LEGACY_PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
  * rules (design 1d; amendments R1/R2). */
 const CRASH_RECORD_PATH = join(WORKSPACE_DIR, 'logs', 'voice-agent.crash.json');
 const SESSION_ID = `session_${Date.now()}`;
-// ACTIVE-silence watchdog, Phase 0a shadow observer (never touches the live
-// session; see docs/design-voice-active-silence-recovery.md in the desktop
-// repo). Timestamps deliberately share the audio-health snapshot's Date.now
-// domain for this diagnostic phase; the armed implementation migrates to the
-// monotonic domain with the bodhi surface.
-const voiceWatchdogShadow = new VoiceWatchdogShadow({
-	voiceSessionId: SESSION_ID,
-	ledger: new WatchdogLedger({
-		path: join(WORKSPACE_DIR, 'logs', 'voice-watchdog.jsonl'),
-		meta: {
-			detectorVersion: DETECTOR_VERSION,
-			capabilitySet: CAPABILITY_SET,
-			capabilitySetId: JSON.stringify(CAPABILITY_SET),
-			pid: process.pid,
-		},
-		onError: (err) => console.error(`${new Date().toISOString().slice(11, 23)} [SilenceShadow] ledger write failed: ${err.message}`),
-	}),
-});
-
-// ACTIVE-silence recovery, Phase 1 (armed): explicit opt-in via
-// VOICE_ACTIVE_SILENCE_MODE=armed; everything else stays Phase 0a shadow.
-const ACTIVE_SILENCE_MODE = parseActiveSilenceMode(process.env.VOICE_ACTIVE_SILENCE_MODE);
-const ACTIVE_SILENCE_TICKS = parseActiveSilenceTicks(process.env.VOICE_ACTIVE_SILENCE_TICKS);
-let voiceRecoveryCoordinator: VoiceSilenceRecoveryCoordinator | null = null;
-let voiceRecoveryLedger: WatchdogLedger | null = null;
-/** True while the legacy CLOSED guard is inside its cast-call reconnect —
- *  bodhi fires onClientConnected synchronously in there, and that fake
- *  attach must not mint a coordinator client epoch. */
-let legacyReconnectInFlight = false;
+// Active-silence redial (bodhi upstreamRecovery.activeSilence): opt-in with VOICE_ACTIVE_SILENCE_MODE=armed.
+const ACTIVE_SILENCE_TICKS = process.env.VOICE_ACTIVE_SILENCE_MODE === 'armed'
+	? Math.min(40, Math.max(2, Math.trunc(Number(process.env.VOICE_ACTIVE_SILENCE_TICKS)) || 3))
+	: 0;
 
 const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
 
@@ -409,8 +365,6 @@ const meetingEntry = createMeetingEntryGate({ fallbackMs: 15_000, onFire: () => 
 function noteMeetingState(on: boolean) {
 	if (!on) meetingEntry.cancel();
 	meetingActive = on;
-	voiceWatchdogShadow.noteMeetingMode(on);
-	voiceRecoveryCoordinator?.noteMeetingMode(on);
 }
 // Only the latest entry's failure may turn meeting mode off; an older one can fail while a newer one is transcribing.
 let meetingEntrySeq = 0;
@@ -888,59 +842,8 @@ async function main() {
 	// VoiceSession construction so the agent.state provider below can read
 	// it — Step 12's `backoff` upstream mapping.)
 	let voiceFatalBackoffUntil = 0;
-
-	// F5: event-driven redial with exponential backoff (voice-redial-scheduler.ts).
-	// The 30s tick below remains the safety net; these fire on bodhi's
-	// connection-lifecycle events instead of waiting up to 60s of dead air.
-	// Declared before the VoiceSession constructor because the constructor's
-	// onConnectionLifecycle option feeds them; session access is late-bound
-	// via sessionRef (assigned right after construction, before any event).
-	let redialState = initialRedialState();
-	let redialTimer: ReturnType<typeof setTimeout> | null = null;
-	// Shared with the 30s tick's throttle + the CONNECTING watchdog below.
-	let lastReconnectAt = 0;
-	// The one host-initiated dial (F5 timer and 30s tick): UPSTREAM_LOST redials only through
-	// recoverUpstream(); CLOSED keeps the legacy cast-call reconnect.
-	const triggerUpstreamRedial = createUpstreamRedialer({
-		getSession: () => sessionRef as RecoverySurface | null,
-		legacy: (dial) => {
-			legacyReconnectInFlight = true;
-			try { dial(); } finally { legacyReconnectInFlight = false; }
-		},
-		log: (msg) => console.log(`${ts()} ${msg}`),
-		error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
-	});
-	const fireEventRedial = (): void => {
-		redialTimer = null;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const s = sessionRef as any;
-		if (!s) return;
-		const now = Date.now();
-		const state = String(s.sessionManager?.state ?? 'unknown');
-		const clientConnected = Boolean(s.clientConnected);
-		if (!shouldEventDial({ state, clientConnected, now, nextDialAt: redialState.nextDialAt, fatalBackoffUntil: voiceFatalBackoffUntil })) {
-			// Blocked by the fatal gate alone → re-arm for when it lifts.
-			// Any other veto drops the dial: the next lifecycle event or the
-			// 30s tick takes over.
-			if (redialState.nextDialAt > 0 && now <= voiceFatalBackoffUntil && isUpstreamDown(state) && clientConnected) {
-				armRedialTimer(voiceFatalBackoffUntil - now + 100);
-			}
-			return;
-		}
-		// While the armed coordinator owns the episode, F5 stands down: its
-		// dial would be an uncounted attempt, and the fake attach below must
-		// not mint a coordinator client epoch. Lifecycle events resume F5
-		// naturally once the episode resolves.
-		if (voiceRecoveryCoordinator?.ownsRecovery ?? false) return;
-		redialState = noteDialed(redialState);
-		lastReconnectAt = now;
-		console.log(`${ts()} [Redial] event-driven reconnect (failures=${redialState.failures})`);
-		triggerUpstreamRedial('Redial');
-	};
-	const armRedialTimer = (delayMs: number): void => {
-		if (redialTimer) clearTimeout(redialTimer);
-		redialTimer = setTimeout(fireEventRedial, delayMs);
-	};
+	// No client attached for this long parks the upstream (bodhi's upstreamRecovery idle park).
+	const IDLE_TEARDOWN_MS = Number(process.env.SUTANDO_VOICE_IDLE_TEARDOWN_MS) || 60_000;
 
 	// Declared outside the classifier IIFE below so the recovery hook can read it
 	// too; a banner already shown is what makes a recovery notice owed.
@@ -1063,39 +966,30 @@ async function main() {
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
 		whisperProvider: meetingTranscriber,
-		// A lost upstream parks the session in UPSTREAM_LOST with the WS
-		// listener up; the redial paths below call recoverUpstream().
+		orchestrationMode: 'actor',
+		// A lost upstream parks in UPSTREAM_LOST with the WS listener up; bodhi's
+		// upstreamRecovery decides when to redial, park an idle upstream and back off.
 		upstreamLossPolicy: 'hold',
-		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
-		// makes every forward a no-op.
-		onClientCommand: (message) => {
-			voiceRecoveryCoordinator?.handleClientCommand(message);
-			// Frames the core does not own are offered to optional skills' handlers.
-			if (message?.type !== 'voice.retryUpstream') clientFrames.dispatch(message);
+		upstreamRecovery: {
+			idleParkMs: IDLE_TEARDOWN_MS,
+			classifyClose: (code, reason) => {
+				const c = classifyTransportClose(code, reason);
+				return c.retryable ? null : { category: c.category, code, reason: c.rawReason };
+			},
+			onFatal: ({ until }) => {
+				voiceFatalBackoffUntil = until;
+				emitAgentState();
+			},
+			...(ACTIVE_SILENCE_TICKS > 0 ? { activeSilence: { requiredTicks: ACTIVE_SILENCE_TICKS } } : {}),
 		},
-		onClientConnected: () => {
-			if (legacyReconnectInFlight) return; // not a real attach edge
-			voiceRecoveryCoordinator?.handleClientConnected();
-		},
+		// Frames the core does not own are offered to optional skills' handlers.
+		onClientCommand: (message) => clientFrames.dispatch(message),
 		onClientDisconnected: () => {
 			// An origin belongs to the client that announced it; the next client announces its own.
 			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
 			setVoiceSessionOrigin(null);
 			clientFrames.disconnected();
-			voiceRecoveryCoordinator?.handleClientDisconnected();
 		},
-		// Whenever the coordinator owns the episode (restarting, waiting-retry,
-		// terminal, or a recovered origin), bodhi's attach auto-actions —
-		// greeting, context replay and especially the CLOSED auto-reconnect —
-		// would be uncounted bypasses of the attempt budget. The synthetic hold
-		// already gates the injection paths post-recovery; this gates the dial.
-		// A fatal close's 5-min backoff gates the engine's own reconnector too, not just the host dialers.
-		suppressClientAutoActions: () => hostOwnsUpstreamRecovery({
-			coordinatorOwns: voiceRecoveryCoordinator?.ownsRecovery ?? false,
-			state: (voiceSessionRef as any)?.sessionManager?.state,
-			now: Date.now(),
-			fatalBackoffUntil: voiceFatalBackoffUntil,
-		}),
 		// P7 Tranche B: feed the ledger the two provider facts it cannot infer —
 		// context occupancy and connection lineage (design §1.1/§1.4).
 		// The per-modality breakdown rides the same message (design §1.4) but is
@@ -1106,21 +1000,8 @@ async function main() {
 				(u as { promptTokensDetails?: Array<{ modality?: string; tokenCount?: number }> })
 					.promptTokensDetails,
 			),
-		// One lifecycle stream, THREE consumers: the ledger derives lineage and
-		// context facts; F5's redial scheduler reacts to terminal losses; the
-		// armed coordinator correlates activations and closes. While the
-		// coordinator owns the episode, F5 keeps tracking state but must not
-		// arm a dial — that would be an uncounted attempt outside the budget.
-		onConnectionLifecycle: (ev) => {
-			audioHealth.noteLifecycleEvent(ev);
-			voiceRecoveryCoordinator?.handleLifecycleEvent(ev);
-			const r = noteLifecycle(redialState, ev, { now: Date.now(), fatalBackoffUntil: voiceFatalBackoffUntil });
-			redialState = r.state;
-			if (r.scheduleDelayMs !== null && !(voiceRecoveryCoordinator?.ownsRecovery ?? false)) {
-				console.log(`${ts()} [Redial] ${ev.kind}${'code' in ev && ev.code !== undefined ? ` code=${ev.code}` : ''} — dial in ${r.scheduleDelayMs}ms (failures=${redialState.failures})`);
-				armRedialTimer(r.scheduleDelayMs);
-			}
-		},
+		// The ledger derives connection lineage and context facts from the lifecycle stream.
+		onConnectionLifecycle: (ev) => audioHealth.noteLifecycleEvent(ev),
 		// Phase 0.5 seams — spread for REAL key absence (design §2.1: an absent
 		// key lets the server default apply; `undefined` is not absent).
 		...(VOICE_SESSION_TUNING.compressionConfig !== undefined
@@ -1180,8 +1061,6 @@ async function main() {
 			},
 			onToolCall: (e) => {
 				audioHealth.noteModelEvent(); // P7 D7.1: a tool call is model activity
-				voiceWatchdogShadow.noteToolCall(e.toolCallId, e.execution);
-				voiceRecoveryCoordinator?.noteToolCall(e.toolCallId, e.execution);
 				voiceToolIdMap.set(e.toolCallId, e.toolName);
 				// tool_call event push removed per #1052 — canonical record
 				// is the surface-table row written in onToolResult via
@@ -1196,8 +1075,6 @@ async function main() {
 				fetch(`http://localhost:8080/mute-state?state=working&source=tool&label=${encodeURIComponent(e.toolName)}`).catch(() => {});
 			},
 			onToolResult: (e) => {
-				voiceWatchdogShadow.noteToolSettled(e.toolCallId);
-				voiceRecoveryCoordinator?.noteToolSettled(e.toolCallId);
 				const toolName = voiceToolIdMap.get(e.toolCallId) || 'unknown';
 				recorder.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				// tool_result event push removed per #1052 — recordToolCall
@@ -1227,36 +1104,6 @@ async function main() {
 		},
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
-
-	// Armed only with the full bodhi recovery surface; anything less falls
-	// back to shadow with a loud line (the design's capability-validation rule).
-	if (ACTIVE_SILENCE_MODE === 'armed' && ACTIVE_SILENCE_TICKS > 0) {
-		if (recoverySurfaceSupported(session)) {
-			voiceRecoveryLedger = new WatchdogLedger({
-				path: join(WORKSPACE_DIR, 'logs', 'voice-recovery.jsonl'),
-				meta: { detectorVersion: DETECTOR_VERSION, mode: 'armed', pid: process.pid },
-				onError: (err) => console.error(`${ts()} [SilenceRecovery] ledger write failed: ${err.message}`),
-			});
-			voiceRecoveryCoordinator = new VoiceSilenceRecoveryCoordinator({
-				voiceSessionId: SESSION_ID,
-				session: session as unknown as RecoverySessionSurface,
-				requiredTicks: ACTIVE_SILENCE_TICKS,
-				// Reducer clock domain is MONOTONIC; only wire frames and the
-				// ledger use wall time (wallNowFn default).
-				nowFn: () => performance.now(),
-				log: (m) => console.log(`${ts()} [SilenceRecovery] ${m}`),
-				record: (row) => voiceRecoveryLedger?.append(row),
-			});
-			// Seed startup-detected meeting state — the coordinator was not
-			// alive when the boot-time Zoom probe ran.
-			voiceRecoveryCoordinator.noteMeetingMode(meetingActive);
-			console.log(`${ts()} [SilenceRecovery] ARMED (ticks=${ACTIVE_SILENCE_TICKS})`);
-		} else {
-			console.warn(`${ts()} [SilenceRecovery] armed requested but the bodhi surface lacks the recovery capabilities — staying in shadow`);
-		}
-	} else if (ACTIVE_SILENCE_MODE === 'armed') {
-		console.warn(`${ts()} [SilenceRecovery] armed requested but VOICE_ACTIVE_SILENCE_TICKS=0 disables the watchdog — staying in shadow`);
-	}
 
 	// P7 D7.1: install the session-layer ledger wraps (audio ingress count +
 	// ingress-RMS speech tracker, audio_health heartbeat intercept, egress
@@ -1374,16 +1221,6 @@ async function main() {
 			// closes, then emit the upstream transition to any attached
 			// client + the lifecycle snapshot (Step 12).
 			recordTerminalClassification(c);
-			// Push the health-monitor reconnect window out by 5min on every
-			// non-retryable close — including repeats of an already-notified
-			// category — so the 60s retry loop doesn't keep firing while the
-			// upstream issue persists. Without this, a 1011 credit-depleted
-			// loop produces ~6 log lines / 60s indefinitely.
-			voiceFatalBackoffUntil = Date.now() + 5 * 60 * 1000;
-			// The reducer clock domain is MONOTONIC — the wall-time deadline
-			// above (kept for agent-state/UI) must not cross into it, or the
-			// backoff never expires in reducer time.
-			voiceRecoveryCoordinator?.handleFatalBackoff(performance.now() + 5 * 60 * 1000);
 			emitAgentState();
 			if (notifiedCategories.has(c.category)) return;
 			notifiedCategories.add(c.category);
@@ -1618,20 +1455,12 @@ async function main() {
 	// P7 D7.1: the model hop is EVENTS — a text/tool-first turn must count
 	// as model activity even before any audio frame lands.
 	session.eventBus.subscribe('turn.start', () => audioHealth.noteModelEvent());
-	// Armed coordinator: model progress advances the reducer's silence anchor,
-	// generation-fenced by the event's own transport generation (bodhi #35).
-	session.eventBus.subscribe('turn.start', (e: { transportGeneration?: number }) =>
-		voiceRecoveryCoordinator?.handleModelEvent(e?.transportGeneration),
-	);
 	session.eventBus.subscribe('turn.end', () => _duck('off'));
 	session.eventBus.subscribe('turn.interrupted', () => _duck('off'));
 
 	const shutdown = async () => {
 		console.log(`\n${ts()} Shutting down...`);
 		recorder.flush();
-		await voiceWatchdogShadow.flush().catch(() => {});
-		voiceRecoveryCoordinator?.stop();
-		await voiceRecoveryLedger?.flush().catch(() => {});
 		setVisionSession(null);
 		setSessionToolUpdater(null, []);
 		stopVisionControlServer();
@@ -1693,44 +1522,14 @@ async function main() {
 
 	voiceSessionRef = session;
 
-	// Idle teardown — close the upstream Gemini transport when no client has
-	// been connected for IDLE_TEARDOWN_MS. Without this, voice-agent keeps the
-	// Gemini Live session alive 24/7; every ~9-min Gemini reconnect ("GoAway")
-	// produces a phantom assistant turn (sometimes a tool call) with no user
-	// input. Symptoms observed: phantom save_meeting_note polluting markdown
-	// notes, phantom open_url opening browser tabs, phantom work tool calls
-	// writing fake task files. Under bodhi >= 0.4 a closed transport is resumed by
-	// the engine itself, so the upstream is parked instead: UPSTREAM_LOST rests until
-	// a client attaches, and the attach policy's recoverUpstream reopens it.
-	// Tunable via env var per Mini's #602 review note. Defaults to 60s — sane
-	// for the voice / phone reconnect cadence we've observed; raise if a host
-	// has frequent ~70s connect/disconnect churn that re-opens too aggressively.
-	const IDLE_TEARDOWN_MS = Number(process.env.SUTANDO_VOICE_IDLE_TEARDOWN_MS) || 60_000;
-	let idleTeardownTimer: ReturnType<typeof setTimeout> | null = null;
-
-	// Shared teardown body — used by the one-shot idle timer below AND by the
-	// Z3 isolated idle-restore (probe/verifier fence). Re-checks real-client
-	// attachment at fire time so a client that connected while the timer was
-	// pending is never torn down under.
+	// A probe/verifier that wakes the upstream with no real client attached parks it again.
 	const teardownIdleUpstream = async (via: string) => {
-		await parkIdleUpstream(session as unknown as ParkSurface, via, {
-			log: (m) => console.log(`${ts()} [VoiceSession] ${m}`),
-			error: (m, err) => console.error(`${ts()} [VoiceSession] ${m}`, err),
-		});
-	};
-
-	const cancelIdleTeardown = () => {
-		if (idleTeardownTimer) {
-			clearTimeout(idleTeardownTimer);
-			idleTeardownTimer = null;
+		if (session.clientConnected) return;
+		try {
+			await session.parkUpstream(via);
+		} catch (err) {
+			console.error(`${ts()} [VoiceSession] idle park failed:`, (err as Error)?.message ?? err);
 		}
-	};
-	const scheduleIdleTeardown = () => {
-		cancelIdleTeardown();
-		idleTeardownTimer = setTimeout(async () => {
-			idleTeardownTimer = null;
-			await teardownIdleUpstream(`${IDLE_TEARDOWN_MS / 1000}s idle`);
-		}, IDLE_TEARDOWN_MS);
 	};
 
 	// Amendment Z3 — verifier/probe idle restoration. The initial idle timer
@@ -1753,8 +1552,7 @@ async function main() {
 	});
 
 	// Flush metrics on client disconnect — bodhi's handleClientDisconnected()
-	// doesn't trigger onSessionEnd, so metrics would never be written. Also
-	// arms the idle-teardown timer (see above).
+	// doesn't trigger onSessionEnd, so metrics would never be written.
 	const origDisconnect = (session as any).handleClientDisconnected?.bind(session);
 	if (origDisconnect) {
 		(session as any).handleClientDisconnected = () => {
@@ -1771,7 +1569,6 @@ async function main() {
 			// (the crash-evidence rule: end-of-session-only flushes lose it).
 			audioHealth.onClientDisconnected();
 			audioHealth.persistTick('final', false);
-			scheduleIdleTeardown();
 			// Step 12/A9: client detach is a lifecycle transition (and may
 			// flip upstream backoff→idle now that no client is attached).
 			emitAgentState();
@@ -1791,11 +1588,10 @@ async function main() {
 	// the previous logical session has already been flushed, so reset for
 	// the new one. (The very first connect on a fresh process with no idle
 	// phantom has metricsWritten=false and skips the reset — onSessionStart
-	// already did it.) Also cancels any pending idle teardown.
+	// already did it.)
 	const origConnect = (session as any).handleClientConnected?.bind(session);
 	if (origConnect) {
 		(session as any).handleClientConnected = () => {
-			cancelIdleTeardown();
 			// A dead session's resumption handle must not poison the fresh
 			// connect (1008 "Requested entity was not found" staircase — see
 			// clearStaleResumptionHandle). Only the CLOSED path reconnects.
@@ -1827,10 +1623,6 @@ async function main() {
 			emitAgentState({ immediate: true });
 		};
 	}
-
-	// Arm the initial teardown — voice-agent boots with no client; if none
-	// connects within IDLE_TEARDOWN_MS, close the upstream transport.
-	scheduleIdleTeardown();
 
 	// Wire task status → web client
 	setTaskStatusCallback((taskId, status, text, result) => {
@@ -1894,14 +1686,8 @@ async function main() {
 		emitAgentState();
 	}
 
-	// Health monitor — runs regardless of whether initial start() succeeded.
-	// Serialization: bodhi's handleClientConnected() is synchronous and transitions
-	// CLOSED→CONNECTING inline before kicking off the async connect. So the next
-	// 30s tick sees state=CONNECTING (not CLOSED) and skips the guard. If the
-	// connect fails fast and bodhi flips back to CLOSED, the 60s lastReconnectAt
-	// throttle prevents a tight retry loop. (lastReconnectAt is declared with
-	// the F5 redial machinery above — the event-driven path shares it.)
-	let connectingSince = 0;
+	// Health monitor: logging, the audio-health matrix and agent.state. Redials
+	// belong to bodhi's upstreamRecovery.
 	let lastLoggedStatus = '';
 	let matrixBaseline: MatrixBaseline | null = null;
 	let lastMatrixVerdict = '';
@@ -1996,61 +1782,7 @@ async function main() {
 		// otherwise a brief outage that triggered a backoff would suppress
 		// recovery from a later transient close even after the upstream
 		// issue was fixed.
-		if (state === 'ACTIVE' && voiceFatalBackoffUntil > 0) {
-			voiceFatalBackoffUntil = 0;
-			voiceRecoveryCoordinator?.handleFatalBackoffCleared();
-		}
-		// A hung connect never leaves CONNECTING, so the down-state guard below cannot see it; the clock
-		// keys on state, not attachment, so a panel reload cannot restart it (voice-connect-watchdog.ts).
-		connectingSince = connectingWatchdogTick({
-			connectingSince, state, clientConnected, now: Date.now(),
-			lastReconnectAt, fatalBackoffUntil: voiceFatalBackoffUntil,
-			session: session as unknown as RecoverySurface,
-			log: (msg) => console.log(`${ts()} ${msg}`),
-			error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
-		});
-		// Safety net behind the event-driven redial: the upstream is down and a client waits;
-		// tickMayDial defers to a pending scheduled dial so the tick cannot preempt the backoff.
-		if (isUpstreamDown(state) && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil
-			&& tickMayDial({ now: Date.now(), nextDialAt: redialState.nextDialAt })
-			&& !(voiceRecoveryCoordinator?.ownsRecovery ?? false)) {
-			lastReconnectAt = Date.now();
-			redialState = noteDialed(redialState);
-			console.log(`${ts()} [Health] Dead session (state=${state}) — triggering reconnect`);
-			triggerUpstreamRedial('Health');
-		}
-		// ACTIVE-silence shadow observation (Phase 0a): diagnostic only — no
-		// effect on the guards above, ever, in this mode.
-		voiceWatchdogShadow.observeTick({
-			at: Date.now(),
-			sessionState: state,
-			clientConnected,
-			meetingMode: meetingActive,
-			snapshot,
-			facts: matrix.facts,
-		});
-		// Armed coordinator (Phase 1): live feed on the MONOTONIC clock — a
-		// wall-clock jump must not strand waiting-retry or bypass cooldowns.
-		// Snapshot speech timestamps are wall-domain; translate by age.
-		if (voiceRecoveryCoordinator) {
-			const mono = performance.now();
-			const wallAboveFloor = snapshot.speech.lastAboveFloorAt;
-			const monoAboveFloor =
-				wallAboveFloor === null ? null : mono - Math.max(0, Date.now() - wallAboveFloor);
-			voiceRecoveryCoordinator.observeTick({
-				at: mono,
-				sessionState: state,
-				facts: matrix.facts,
-				lastAboveFloorAt: monoAboveFloor,
-				pendingToolCount: 0,
-				delivered: {
-					epoch: snapshot.epoch,
-					chunksEnded: snapshot.clientTotals.chunksEnded,
-					egressFrames: snapshot.egressFrames,
-					heartbeatSeen: snapshot.lastHeartbeat !== null,
-				},
-			});
-		}
+		if (state === 'ACTIVE' && voiceFatalBackoffUntil > 0) voiceFatalBackoffUntil = 0;
 	}, 30_000);
 
 	// P7 D7.1: periodic ledger persistence — a try-enqueue into the worker's

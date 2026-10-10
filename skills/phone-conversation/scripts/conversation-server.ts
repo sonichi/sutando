@@ -69,7 +69,7 @@ import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '
 import { buildPhoneInstructions } from './phone-agent-config.js';
 import { syncTwilioWebhook } from './twilio-webhook-sync.js';
 import { RespawnScheduler, drainMayExit, healthPayload, isDrainBlocked } from './server-lifecycle.js';
-import { wirePhoneUpstreamRecovery, type PhoneRecoverySession } from './upstream-recovery-wiring.js';
+import { phoneUpstreamRecovery, watchPhoneUpstream } from './upstream-recovery-wiring.js';
 import { recordConversation, recordToolCall } from '../../../src/conversation-store.js';
 import { startPhoneTicker } from '../../../src/observability/realtime.js';
 import { createSessionRecorder, type SessionRecorder } from '../../../src/live-agent-runtime.js';
@@ -781,9 +781,9 @@ async function createCallSession(params: {
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: 'Aoede' },
-		// A lost upstream parks in UPSTREAM_LOST (CLOSED is terminal in 0.4); the
-		// wirePhoneUpstreamRecovery below redials it with recoverUpstream().
+		// A lost upstream parks in UPSTREAM_LOST; bodhi redials it while the call is live.
 		upstreamLossPolicy: 'hold',
+		upstreamRecovery: phoneUpstreamRecovery(callSession, activeCalls),
 		// Greet the caller once: a re-attach after a turn has completed is silent.
 		reattachGreeting: 'until-first-turn',
 		hooks: {
@@ -932,15 +932,10 @@ async function createCallSession(params: {
 	// The Twilio stream is this session's client: attaching starts Gemini and greets once.
 	session.notifyClientConnected();
 
-	// bodhi retries a transport close on the resumption handle; once parked, only recoverUpstream()
-	// redials, holding greeting and injected context until the caller speaks again.
-	wirePhoneUpstreamRecovery({
-		session: session as unknown as PhoneRecoverySession,
-		callSession,
-		activeCalls,
-		onActivated: () => { void import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {}); },
+	watchPhoneUpstream({
+		eventBus: session.eventBus,
+		onRecovered: () => { void import('../../../src/browser-tools.js').then(bt => bt.onReconnect(session)).catch(() => {}); },
 		log: (msg) => console.log(`${ts()} ${msg}`),
-		error: (msg, err) => console.error(`${ts()} ${msg}`, err ?? ''),
 	});
 
 	// Narration cleanup placeholder — delegates to skill module if loaded
