@@ -165,19 +165,21 @@ class GenuinelyUndelivered(_Base):
 
     def test_ok_false_refusal_keeps_result_and_never_archives(self):
         # A 2xx {"ok": false} is a REFUSED close, not a delivery: the sweep
-        # must retain the only retryable copy instead of archiving it.
+        # keeps the only retryable copy, quarantined on the pass that parks it.
         self._archived_task()
         self._result("[no-send]\nDECLINE_SENTINEL")
         gw._req = lambda m, path, payload=None: {"ok": False}
         self._sweep()
-        self.assertTrue((gw.RESULTS_DIR / f"{TID}.txt").exists(),
-                        "refused close must keep its retryable result")
+        from ag2_sparrow import outbox, undelivered_quarantine
+        self.assertFalse((gw.RESULTS_DIR / f"{TID}.txt").exists())
+        self.assertEqual(len(undelivered_quarantine.find_quarantined(gw.RESULTS_DIR, TID)), 1,
+                         "refused close must keep its retryable result")
         self.assertFalse(any("recovered + delivered" in l for l in self.logs),
                          "a refused close must not log as delivered")
         self._sweep()
-        from ag2_sparrow import outbox, undelivered_quarantine
         core = gw._delivery_core()
         self.assertEqual(outbox.read_item(core.backend.root, TID)["reason"], "permanent-refusal")
+        self.assertEqual(len(undelivered_quarantine.find_quarantined(gw.RESULTS_DIR, TID)), 1)
         outbox.requeue_item(core.backend.root, TID, reset_attempts=True, operator="test")
         undelivered_quarantine.restore(gw.RESULTS_DIR, TID)
         _age(gw.RESULTS_DIR / f"{TID}.txt", OLD)
@@ -531,6 +533,213 @@ class GuardDelegation(_Base):
         self.assertNotIn("RAW_SENDER_PROSE", body, "the raw file bypassed the guard")
         self.assertTrue(any("tier=team" in m for m in self.logs),
                         "a withheld reason must be logged")
+
+
+class UnreadableOrphan(_Base):
+    def _archived(self):
+        d = gw.TASKS_DIR / "archive"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{TID}.txt").write_text(f"id: {TID}\ntask: hi\nsource: ag2space\n")
+
+    def test_a_partial_utf8_write_is_left_for_a_later_pass(self):
+        self._archived()
+        f = gw.RESULTS_DIR / f"{TID}.txt"
+        f.write_bytes(b"half a character \xe2\x80")
+        _age(f, OLD)
+        self._sweep()
+        self.assertEqual(f.read_bytes(), b"half a character \xe2\x80")
+        self.assertEqual(self.posted, [])
+
+    def test_a_blank_result_is_left_for_a_later_pass(self):
+        self._archived()
+        f = self._result("  \n")
+        self._sweep()
+        self.assertEqual(f.read_text(), "  \n")
+        self.assertEqual(self.posted, [])
+
+class ReplacementAtTheMove(_Base):
+    """A producer replacing the canonical result while an orphan arm moves it:
+    the reply that replaced it must stay live. The hook fires right after the
+    first move of the canonical path (the old mover's link, the owner's claim
+    rename), so the same schedule reaches both the old unlink and the new
+    verification."""
+
+    def setUp(self):
+        super().setUp()
+        # The canonical owner, so the coverage gate (source = src) sees it run
+        # under the bridge; the vendored copy is pinned byte-equal.
+        sys.path.insert(0, str(_REPO / "src"))
+        from delivery import disposal
+        patcher = patch.object(gw, "disposal", disposal)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_move_that_fails_leaves_the_result_and_says_so(self):
+        canonical = self._result("BODY-A orphan")
+        with patch.object(gw.disposal, "retire_generation", side_effect=OSError(5, "EIO")):
+            self._sweep()
+        self.assertEqual(canonical.read_text(), "BODY-A orphan")
+        self.assertTrue(any("could not be moved" in l for l in self.logs), self.logs)
+
+    def _archived(self, age=OLD):
+        d = gw.TASKS_DIR / "archive"
+        d.mkdir(parents=True, exist_ok=True)
+        t = d / f"{TID}.txt"
+        t.write_text(f"id: {TID}\ntask: hi\nsource: ag2space\n")
+        _age(t, age)
+
+    def _race(self, body, age=OLD):
+        import os
+        canonical = gw.RESULTS_DIR / f"{TID}.txt"
+        self._result(body, age)
+        fired = []
+        real_link, real_rename = os.link, os.rename
+
+        def replace_after(real):
+            def move(src, dst, *a, **k):
+                out = real(src, dst, *a, **k)
+                if not fired and Path(src) == canonical:
+                    fired.append(1)
+                    tmp = canonical.with_name(".producer.tmp")
+                    tmp.write_text("BODY-B newer reply")
+                    os.replace(tmp, canonical)
+                return out
+            return move
+
+        with patch("os.link", replace_after(real_link)), patch("os.rename", replace_after(real_rename)):
+            self._sweep()
+        self.assertEqual(fired, [1], "the schedule never reached the move")
+        self.assertTrue(canonical.exists(), "the newer reply was deleted")
+        self.assertEqual(canonical.read_text(), "BODY-B newer reply")
+
+    def _moved(self, directory, pattern):
+        return [p.read_text() for p in directory.glob(pattern)]
+
+    def test_too_old(self):
+        self._archived(age=gw.ORPHAN_MAX_AGE_S + 60)
+        self._race("BODY-A old", age=gw.ORPHAN_MAX_AGE_S + 60)
+        self.assertEqual(self._moved(gw.UNDELIVERABLE_RESULTS_DIR, f"{TID}.too-old.*"), ["BODY-A old"])
+
+    def test_no_task(self):
+        self._race("BODY-A orphan")
+        self.assertEqual(self._moved(gw.UNDELIVERABLE_RESULTS_DIR, f"{TID}.no-task.*"), ["BODY-A orphan"])
+
+    def test_attachments(self):
+        self._archived()
+        self._race("BODY-A [file: /tmp/x.png]")
+        self.assertEqual(self._moved(gw.UNDELIVERABLE_RESULTS_DIR, f"{TID}.has-attachments.*"),
+                         ["BODY-A [file: /tmp/x.png]"])
+        self.assertEqual(self.posted, [])
+
+    def test_deduped(self):
+        self._archived()
+        self._race("[deduped: task-00000000000000000b]\nBODY-A")
+        self.assertEqual(len(self._moved(gw.UNDELIVERABLE_RESULTS_DIR, f"{TID}.deduped-orphan.*")), 1)
+        self.assertEqual(self.posted, [])
+
+    def test_late_duplicate(self):
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
+        (gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt").write_text("the reply")
+        self._race("BODY-A duplicate")
+        self.assertEqual(self._moved(gw.ARCHIVE_RESULTS_DIR, f"{TID}-*-late-duplicate*.txt"),
+                         ["BODY-A duplicate"])
+        self.assertEqual(self.posted, [])
+
+
+class FallbackIsNotTheRequestedDisposition(ReplacementAtTheMove):
+    """The archive placement fails after A is claimed and B retakes the name:
+    A is kept in undelivered/, and the arm must say so rather than "moved aside"."""
+
+    def test_late_duplicate_kept_in_undelivered_is_reported_as_such(self):
+        import os
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
+        (gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt").write_text("the reply")
+        canonical = self._result("BODY-A duplicate")
+        real = gw.disposal._move_into_quarantine
+
+        def move(src, dst, log):
+            if Path(dst).parent == gw.ARCHIVE_RESULTS_DIR:
+                tmp = canonical.with_name(".producer.tmp")
+                tmp.write_text("BODY-B")
+                os.replace(tmp, canonical)
+                raise OSError(5, "EIO")
+            return real(src, dst, log)
+        with patch.object(gw.disposal, "_move_into_quarantine", move):
+            self._sweep()
+        self.assertEqual(canonical.read_text(), "BODY-B")
+        self.assertEqual(self._moved(gw.UNDELIVERABLE_RESULTS_DIR, f"{TID}*.txt"), ["BODY-A duplicate"])
+        self.assertEqual(self._moved(gw.ARCHIVE_RESULTS_DIR, f"{TID}-*-late-duplicate*.txt"), [])
+        self.assertFalse(any("moved aside" in l for l in self.logs), self.logs)
+        said = [l for l in self.logs if "was not moved to archive/" in l]
+        self.assertEqual(len(said), 1, self.logs)
+        self.assertIn("undelivered", said[0])
+        self.assertEqual(self.posted, [])
+
+
+class ReplacementBeforeTheRetire(ReplacementAtTheMove):
+    """A producer replaces A with B after the arm classified A and before the
+    owner touches the file: only A's generation may be retired, so B stays
+    live, untouched, and is judged on its own on the next pass."""
+
+    def _race_before(self, body, age=OLD, b_body="BODY-B plain reply"):
+        import os
+        canonical = self._result(body, age)
+        real = gw.disposal.retire_generation
+        fired = []
+
+        def replace_then_retire(results_dir, rfile, generation, *a, **k):
+            if not fired:
+                fired.append(1)
+                tmp = canonical.with_name(".producer.tmp")
+                tmp.write_text(b_body)
+                os.replace(tmp, canonical)
+            return real(results_dir, rfile, generation, *a, **k)
+
+        with patch.object(gw.disposal, "retire_generation", replace_then_retire):
+            self._sweep()
+        self.assertEqual(fired, [1], "the arm never reached the retire")
+        self.assertTrue(canonical.exists(), "B was moved under A's disposition")
+        self.assertEqual(canonical.read_text(), b_body, "B was rewritten")
+        for d in (gw.UNDELIVERABLE_RESULTS_DIR, gw.ARCHIVE_RESULTS_DIR):
+            moved = [q.read_text() for q in d.rglob("*.txt")] if d.is_dir() else []
+            self.assertNotIn(b_body, moved, f"B was moved into {d.name}")
+        self.assertEqual(self.posted, [])
+        self.assertFalse(any("quarantined" in l or "moved aside" in l for l in self.logs), self.logs)
+        return canonical
+
+    def _next_pass_posts_b(self, canonical):
+        _age(canonical, OLD)
+        self._sweep()
+        self.assertEqual(len(self.posted), 1, "B was never offered for delivery")
+        self.assertIn("BODY-B plain reply", self.posted[0][2]["body"])
+
+    def test_too_old(self):
+        self._archived(age=gw.ORPHAN_MAX_AGE_S + 60)
+        self._race_before("BODY-A old", age=gw.ORPHAN_MAX_AGE_S + 60)
+
+    def test_no_task(self):
+        self._race_before("BODY-A orphan")
+
+    def test_attachments(self):
+        self._archived()
+        self._next_pass_posts_b(self._race_before("BODY-A [file: /tmp/x.png]"))
+
+    def test_deduped(self):
+        self._archived()
+        self._next_pass_posts_b(self._race_before("[deduped: task-00000000000000000b]\nBODY-A"))
+
+    def test_late_duplicate(self):
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
+        (gw.ARCHIVE_RESULTS_DIR / f"{TID}-1786940000.txt").write_text("the reply")
+        self._race_before("BODY-A duplicate")
+
+    def test_too_old_b_is_young_and_waits_out_its_grace(self):
+        self._archived(age=gw.ORPHAN_MAX_AGE_S + 60)
+        canonical = self._race_before("BODY-A old", age=gw.ORPHAN_MAX_AGE_S + 60)
+        self._sweep()
+        self.assertEqual(canonical.read_text(), "BODY-B plain reply")
+        self.assertEqual(self.posted, [])
+        self._next_pass_posts_b(canonical)
 
 
 if __name__ == "__main__":
