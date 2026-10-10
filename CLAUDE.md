@@ -329,8 +329,8 @@ Reply in the conversation the request came from: a task with `channel_id`/`sourc
 answered in that room, replying to `source_message_id`. Threading a reply to a top-level message is
 your call: thread when the exchange is better kept out of the main timeline, e.g. a side discussion
 of several messages about one item; when unsure, reply in the timeline. An ask already in a thread
-is answered in it. To thread, give the first notify `--thread-root '<id>'` and start the result
-with `[thread: <id>]`, `<id>` = `source_message_id`; the asker is then not mentioned. Two tests apply:
+is answered in it. To thread one, post it as a proactive `[thread:]` file, then a `[REPLIED]`
+result (marker docs below); a refused thread post is parked, so check it went out. Two tests apply:
 
 - **Audience.** In a room with other people (anything but the owner's own DM), post only what they
   are meant to read: a reply to their message, what the owner asked to be posted there, or work the
@@ -350,7 +350,7 @@ room: 'I sent it to you in our DM.' Never move silently.
 - `[deduped: task-<other-id>]` — silently archive this task as done; the full reply goes in the other task's result file.
 - `[no-send]` / `[REPLIED]` — skip delivery (still archives): nothing to show / already sent another way.
 - `[channel: <channel-id>]` — first non-empty line only: deliver the rest to that channel instead. Telegram drops it.
-- `[thread: $<root>]` — lead line, after any skip marker: AG2 Space posts the result in that thread.
+- `[thread: $<root>]` — proactive lead line, after any skip marker: AG2 Space posts it in that thread.
 - `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body; detected anywhere, stripped only when alone on its line.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — attach the file.
 

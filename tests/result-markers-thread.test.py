@@ -11,8 +11,6 @@ Guards:
   5. a plain body and an inline mention of the marker are untouched
   6. skip markers stay terminal; neutralize_markers takes the marker out of play
   7. the vendored package copy parses identically
-  8. home_room (a task result's room): a [channel:] naming another room makes
-     the root foreign; the same room, or no [channel:], keeps it
 
 Run: python3 tests/result-markers-thread.test.py
 Exit: 0 on pass, 1 on fail.
@@ -107,36 +105,6 @@ spec.loader.exec_module(mod)
 text = f"[thread: {ROOT}]\n[channel: {ROOM}]\nupdate"
 check("vendored copy parses identically",
       acts(text, mod.parse_markers) == acts(text), str(acts(text, mod.parse_markers)))
-
-# 8
-def home(text):
-    r = parse_markers(text, home_room=ROOM)
-    return [(x.kind, x.value) for x in r.actions], r.body
-
-
-a, body = home(f"[thread: {ROOT}]\nanswer")
-check("home_room, no [channel:]: root kept", ("thread", ROOT) in a, str(a))
-check("home_room, no [channel:]: body clean", body == "answer", repr(body))
-a, _ = home(f"[channel: {ROOM}]\n[thread: {ROOT}]\nanswer")
-check("home_room named by [channel:]: root kept", ("thread", ROOT) in a, str(a))
-a, body = home(f"[channel: {OTHER}]\n[thread: {ROOT}]\nanswer")
-check("home_room, another room named: thread-foreign", ("thread-foreign", ROOT) in a, str(a))
-check("home_room, another room named: no thread action",
-      not any(k == "thread" for k, _ in a), str(a))
-check("home_room, another room named: redirect kept", ("redirect", OTHER) in a, str(a))
-check("home_room, another room named: body clean", body == "answer", repr(body))
-check("home_room, another room named: reason given",
-      [x.extra for x in parse_markers(f"[channel: {OTHER}]\n[thread: {ROOT}]\nx",
-                                      home_room=ROOM).actions
-       if x.kind == "thread-foreign"] == ["not the task's room"])
-a, _ = home(f"[dm-only]\n[thread: {ROOT}]\nanswer")
-check("home_room under dm-only: still foreign", ("thread-foreign", ROOT) in a, str(a))
-check("no home_room: a single named room keeps the root (proactive unchanged)",
-      ("thread", ROOT) in acts(f"[channel: {OTHER}]\n[thread: {ROOT}]\nx")[0])
-check("vendored copy takes home_room identically",
-      [(x.kind, x.value) for x in mod.parse_markers(
-          f"[channel: {OTHER}]\n[thread: {ROOT}]\nx", home_room=ROOM).actions]
-      == home(f"[channel: {OTHER}]\n[thread: {ROOT}]\nx")[0])
 
 if failures:
     print(f"\n{len(failures)} failure(s)")

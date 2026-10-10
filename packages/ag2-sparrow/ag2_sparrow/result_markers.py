@@ -45,9 +45,7 @@ Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
   A root belongs to the room its [channel:] names (the default room without
   one). Under [dm-only], or when the leading lines name two different rooms,
   the destination may not be that room: `thread-foreign` replaces `thread`
-  and the body is posted top level. A caller that knows the room the body
-  must stay in (a task result's room) passes `home_room`; a [channel:] naming
-  any other room makes the root foreign as well.
+  and the body is posted top level.
 
   DM-ONLY marker — anywhere in the body:
     [dm-only]
@@ -208,7 +206,7 @@ _THREAD_ROOT_RE = re.compile(r"\$\S+")
 _DMONLY_STRIP_RE = re.compile(r"^[ \t]*\[dm-only\][ \t]*\r?\n?", re.IGNORECASE | re.MULTILINE)
 
 
-def parse_markers(text: str, *, home_room: "str | None" = None) -> ParseResult:
+def parse_markers(text: str) -> ParseResult:
     """Parse a result-body string and return body + action list.
 
     Order of evaluation:
@@ -311,8 +309,7 @@ def parse_markers(text: str, *, home_room: "str | None" = None) -> ParseResult:
         break
 
     # A root posted outside its room is refused or misthreaded; ambiguity fails to top level.
-    foreign = ("dm-only" if dm_only else "rooms differ" if len(named) > 1
-               else "not the task's room" if home_room and named - {home_room} else None)
+    foreign = "dm-only" if dm_only else ("rooms differ" if len(named) > 1 else None)
     if foreign:
         actions = [Action(kind="thread-foreign", value=a.value, extra=foreign)
                    if a.kind == "thread" else a for a in actions]

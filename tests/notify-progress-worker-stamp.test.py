@@ -145,13 +145,11 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
     an explicit flag, even an empty one, wins over what the file carries."""
 
     def _task(self, body):
-        # Own directory: a remembered thread root is written beside the task file.
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        f = os.path.join(d, "task-t1.txt")
-        with open(f, "w") as fh:
-            fh.write(body)
-        return f
+        f = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        f.write(body)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
 
     def _send(self, argv, env=None):
         sent = []
@@ -216,48 +214,6 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn("thread_root", sent[0])
         self.assertEqual(sent[0]["reply_to"], "$ask")
-
-    def test_explicit_thread_root_opens_a_thread_on_a_top_level_ask(self):
-        # The agent chose to thread its answer: the "On it" opens the thread on the ask itself.
-        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
-                       "source_message_id: $ask\ntask: x\n")
-        rc, sent, _ = self._send(["--task-file", f, "--thread-root", "$ask"])
-        self.assertEqual(rc, 0)
-        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it",
-                                 "thread_root": "$ask", "reply_to": "$ask"}])
-
-    def test_a_chosen_root_carries_to_the_task_s_later_notifies(self):
-        # First notify opens the thread on the ask; a later --task-file-only checkpoint stays in it.
-        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
-                       "source_message_id: $ask\ntask: x\n")
-        self._send(["--task-file", f, "--thread-root", "$ask"])
-        rc, sent, _ = self._send(["--task-file", f])
-        self.assertEqual(rc, 0)
-        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it",
-                                 "thread_root": "$ask", "reply_to": "$ask"}])
-        other = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
-                           "source_message_id: $ask2\ntask: y\n")
-        _, sent, _ = self._send(["--task-file", other])
-        self.assertNotIn("thread_root", sent[0], "another task keeps its own (no) thread")
-        _, sent, _ = self._send(["--task-file", f, "--thread-root", ""])
-        self.assertNotIn("thread_root", sent[0], "an explicit empty root still opts out")
-
-    def test_the_ask_s_own_thread_is_never_replaced_by_a_remembered_root(self):
-        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
-                       "source_message_id: $ask\ntask: x\nthread_root: $t\n")
-        self._send(["--task-file", f, "--thread-root", "$other"])
-        _, sent, _ = self._send(["--task-file", f])
-        self.assertEqual(sent[0]["thread_root"], "$t")
-
-    def test_an_unwritable_choice_is_reported_and_the_notify_still_sends(self):
-        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
-                       "source_message_id: $ask\ntask: x\n")
-        os.chmod(os.path.dirname(f), 0o500)
-        self.addCleanup(os.chmod, os.path.dirname(f), 0o700)
-        rc, sent, err = self._send(["--task-file", f, "--thread-root", "$ask"])
-        self.assertEqual(rc, 0)
-        self.assertEqual(sent[0]["thread_root"], "$ask")
-        self.assertIn("thread choice not saved", err)
 
     def test_thread_root_and_source_message_id_both_sent(self):
         # The two fields are independent, not mutually exclusive (relations.py).

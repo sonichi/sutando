@@ -307,14 +307,13 @@ from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
-from .outbox import may_reclaim_delivery, read_delivery_claim
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
                             RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
-from .delivery_core.provider_ag2space import AG2SpaceResultProvider, AG2SpaceRoomMessageProvider
+from .delivery_core.provider_ag2space import AG2SpaceResultProvider
 from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
                            ready_body_of, ResultIdentity)
 from . import result_disposal as disposal
@@ -4762,7 +4761,7 @@ def _owner_mention_dm_name(tid: str) -> str:
 
 
 def _owner_mention_dm_queued(tid: str) -> bool:
-    """A DM copy already handed to the proactive leg (pending, claimed, sent or parked)."""
+    """A copy already handed to the proactive leg (pending, claimed, sent or parked)."""
     stem = glob.escape(_owner_mention_dm_name(tid))
     return ((RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt").exists()
             or any(RESULTS_DIR.glob(f"{stem}.sending*"))
@@ -4799,111 +4798,6 @@ def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
     return True
 
 
-_THREAD_CORE: "DeliveryCore | None" = None
-# Parks after which the thread post provably never happened; the answer then goes the ordinary way.
-_THREAD_NEVER_POSTED = frozenset({"permanent-refusal", "max-attempts"})
-
-
-def _thread_core() -> DeliveryCore:
-    """The outbox over threaded task-result posts; `/v1/room` is not idempotent, so
-    an ambiguous send parks instead of being repeated."""
-    global _THREAD_CORE
-    root = RESULTS_DIR / f".outbox-thread{_INST_SUFFIX}"
-    if _THREAD_CORE is None or _THREAD_CORE.backend.root != root:
-        _THREAD_CORE = DeliveryCore(
-            # A delivered post is final: republishing it would post the same reply twice.
-            DesignAClaimBackend(root, republish_delivered=False),
-            AG2SpaceRoomMessageProvider(lambda *a, **k: _req(*a, **k),
-                                        trust_ok=lambda: bool(PROACTIVE_TRUST_OK)),
-            policy=RetryPolicy(max_attempts=MAX_TRANSIENT_ATTEMPTS),
-            worker="gateway-thread-drain")
-    return _THREAD_CORE
-
-
-def _task_ask(tid: str) -> "dict | None":
-    """thread_root/source_message_id of the gateway-written task file; {} when there is
-    no task file, None when it exists but cannot be read."""
-    tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
-    if tfile is None:
-        return {}
-    try:
-        headers = local_task_protocol.parse_task_headers_trusted(
-            tfile.read_text(encoding="utf-8", errors="replace")).headers
-    except OSError:
-        return None
-    return {k: headers.get(k, "") for k in ("thread_root", "source_message_id")}
-
-
-def _task_thread_handoff(tid: str, body: str, raw: str) -> "bool | None":
-    """Post a `[thread:]` task result in the thread it opens on its own ask; the result
-    server only cites the ask. True = posted, or possibly posted (caller closes the lease
-    silently); False = deliver the ordinary way; None = retry next pass."""
-    if not any(a.kind.startswith("thread") for a in parse_markers(body).actions):
-        return False
-    room = _load_task_rooms().get(tid, "")
-    parsed = parse_markers(body, home_room=room or None)
-    act = next(a for a in parsed.actions if a.kind.startswith("thread"))
-    if act.kind != "thread":
-        _log(f"result {tid}: [thread: {act.value[:80]!r}] "
-             + ("is malformed" if act.kind == "thread-invalid" else f"dropped ({act.extra})")
-             + " — posted as an ordinary reply")
-        return False
-    delivery = _delivery_tid(tid)
-    media = _load_task_media()
-    ask = _task_ask(tid)
-    if delivery is None or media is None or ask is None:
-        _log(f"result {tid}: thread routing unreadable (alias ledger, media sidecar or "
-             "task file) — retried next pass")
-        return None
-    reply = parsed.body
-    why = ("its room is unknown" if not room
-           else "its room is not a Matrix room of this gateway"
-           if not (_MATRIX_ROOM_RE.match(room) and _room_is_deliverable_here(room))
-           else "it answers a re-asked task" if delivery != tid
-           else "a Signal task answers in its request thread"
-           if (media.get(_broker_tid(tid)) or {}).get("mode") == "task-media"
-           else "the ask is already in a thread, where the ordinary reply goes"
-           if ask.get("thread_root")
-           else "the root is not the asking message" if act.value != ask.get("source_message_id")
-           else "it carries attachments" if any(a.kind == "attach" for a in parsed.actions)
-           else "its body is empty" if not reply.strip()
-           else "its body is too large for one event"
-           if len(reply.encode("utf-8")) > _PROACTIVE_MAX_BODY_B else None)
-    if why:
-        _log(f"result {tid}: [thread:] not honoured, {why} — posted as an ordinary reply")
-        return False
-    core = _thread_core()
-    root = core.backend.root
-    # One item per reply generation: a replacement reply is a new post, never folded into the first.
-    item = f"{_broker_tid(tid)}.thread-{source_digest(raw)[:16]}"
-    payload = json.dumps({"op": "message", "room_id": room, "body": reply,
-                          "thread_root": act.value}).encode("utf-8")
-    core.backend.publish(item, payload)
-    if not core.backend.is_terminal(item):
-        claim = read_delivery_claim(root, item)
-        if claim is not None and claim.state != "UNKNOWN" and may_reclaim_delivery(root, item, 0):
-            # Its sender died after claiming, so the post may be out; never repeat it.
-            core.backend.park(item, "outcome-unknown")
-        else:
-            core.deliver_one(item, payload)
-    record = read_item(root, item) or {}
-    if record.get("status") == "DELIVERED":
-        _log(f"result {tid}: posted in thread {act.value} in {room}")
-        return True
-    if record.get("status") != "PARKED":
-        _log(f"result {tid}: thread post not confirmed yet "
-             f"(attempts={core.backend.attempts(item)}) — retried next pass")
-        return None
-    if record.get("reason") in _THREAD_NEVER_POSTED:
-        _log(f"result {tid}: thread post refused ({record.get('reason')}) — "
-             "posted as an ordinary reply instead")
-        return False
-    _log(f"result {tid}: WARNING thread post outcome unknown — it may already be in thread "
-         f"{act.value}; not resent and not posted again as an ordinary reply. Review outbox "
-         f"item {item} under {root}")
-    return True
-
-
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     _recover_disposing_claims()
@@ -4932,12 +4826,6 @@ def _post_ready_results(inflight: set[str]) -> None:
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
-        handed = skip is None and _task_thread_handoff(tid, body, raw)
-        if handed is None:
-            continue
-        if handed:
-            parsed = parse_markers("[no-send]")
-            skip = parsed.actions[0]
         # Every dedup marker routes through the shared plan, malformed included:
         # it owns the reject-and-report policy (dedup_recovery.plan_dedup_recovery).
         if skip and skip.value == "deduped":
