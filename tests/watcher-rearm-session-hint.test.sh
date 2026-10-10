@@ -14,7 +14,7 @@ BUNDLE="$(mktemp -d "${TMPDIR:-/tmp}/sutando-rearm-hint.XXXXXX")"
 trap 'rm -rf "$BUNDLE"' EXIT
 BUNDLE="$(cd "$BUNDLE" && pwd -P)"
 mkdir -p "$BUNDLE/src" "$BUNDLE/scripts" "$BUNDLE/workspace/tasks" "$BUNDLE/workspace/state"
-for f in src/watcher-rearm-session-hint.sh src/watcher_rearm.py; do
+for f in src/watcher-rearm-session-hint.sh src/watcher_rearm.py src/session_identity.sh; do
   [ -f "$REPO/$f" ] || { echo "FAIL — $f is missing"; exit 1; }
   cp "$REPO/$f" "$BUNDLE/$f"
 done

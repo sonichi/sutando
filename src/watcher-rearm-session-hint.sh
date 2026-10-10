@@ -4,12 +4,11 @@
 
 set -uo pipefail
 
-# Only the marked core or an enrolled pool worker owes a watcher.
-if [ "${SUTANDO_CORE_SESSION:-}" != "1" ] && [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
-  exit 0
-fi
-
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Only the marked core or an enrolled pool worker owes a watcher.
+. "$REPO_DIR/src/session_identity.sh"
+sutando_session_identified || exit 0
+
 WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
 [ -n "$WORKSPACE" ] || WORKSPACE="$REPO_DIR/workspace"
 PYBIN="$(bash "$REPO_DIR/scripts/sutando-config.sh" python-bin 2>/dev/null)" || exit 0

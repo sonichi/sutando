@@ -29,10 +29,9 @@ if [ "${SUTANDO_CORE_SESSION:-}" = "0" ] && [ -z "${SUTANDO_INSTANCE_ID:-}" ]; t
   echo '{}'
   exit 0
 fi
+. "$REPO_DIR/src/session_identity.sh"
 UNIDENTIFIED=""
-if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "${SUTANDO_CORE_SESSION:-}" != "1" ]; then
-  UNIDENTIFIED=1
-fi
+sutando_session_identified || UNIDENTIFIED=1
 WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
 # Fall back to the documented default, never to the repo root: a resolver
 # failure must still leave this pointed at a real queue rather than silently
@@ -44,6 +43,11 @@ WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
 if ! PYBIN="$(bash "$REPO_DIR/scripts/sutando-config.sh" python-bin 2>/dev/null)" \
    || [ -z "$PYBIN" ] || [ ! -x "$PYBIN" ]; then
   PYBIN=""
+fi
+
+# A Stop means this turn reached the API: end it and stamp recovery after a recorded API-error turn.
+if [ -z "$UNIDENTIFIED" ] && [ -n "$PYBIN" ]; then
+  "$PYBIN" "$REPO_DIR/src/delivery/turn_failure.py" record-recovery --state "${SUTANDO_WORKSPACE_DIR:-$WORKSPACE}/state" >/dev/null 2>&1 || true
 fi
 
 TASKS_DIR="$WORKSPACE/tasks"

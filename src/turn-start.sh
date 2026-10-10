@@ -14,5 +14,13 @@ fi
 # Claude Code sets on every subprocess it spawns, hooks included — see
 # turn_ledger.py's SESSION SCOPING note. Absent that env var (a non-Claude-Code
 # context), behavior is exactly the original shared-file default.
-"$PYBIN" "$REPO_DIR/src/turn_ledger.py" turn-start >/dev/null 2>&1
+"$PYBIN" "$REPO_DIR/src/turn_ledger.py" turn-start </dev/null >/dev/null 2>&1
+
+# Which task this turn's prompt delivers, so an API error is blamed on that task only.
+. "$REPO_DIR/src/session_identity.sh"
+if sutando_session_identified; then
+  WORKSPACE="${SUTANDO_WORKSPACE_DIR:-$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)}"
+  [ -n "$WORKSPACE" ] && "$PYBIN" "$REPO_DIR/src/delivery/turn_failure.py" hook-turn-start \
+    --state "$WORKSPACE/state" >/dev/null 2>&1
+fi
 exit 0
