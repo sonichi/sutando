@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """skills/owner-agent-consult: inert until configured; the owner gate reads only a live,
 envelope-verified, unanswered task by id; the owner-only room guard accounts for every
-member; only the correlated final answer is returned; one hop; no other skill imported;
-no identity or room literal shipped. Workspaces are temp dirs; the production-adapter
+member; ask returns at once with a pending record; a reply task matches its consult only
+by consult id, sender and relation to the ask; follow-ups thread under the first ask; one
+hop; no other skill imported; no identity or room literal shipped. Workspaces are temp dirs; the production-adapter
 cases run the real room_ops CLI against a local fake gateway."""
 import contextlib
 import http.server
@@ -45,15 +46,28 @@ SIB = "@sibling.agent:example.test"
 OTHER_AGENT = "@foreign.agent:example.test"
 STRANGER = "@stranger:example.test"
 CONFIG_KEYS = (policy.CONFIG_ROOM, policy.CONFIG_ROOM_CLI, policy.CONFIG_ENABLED,
-               policy.CONFIG_MAX_WAIT)
+               policy.CONFIG_NUDGE_AFTER)
 CID = "0123456789abcdef"
 CID_B = "fedcba9876543210"
 TID = "task-1"
 
 
+OWNER_DM = "!owner-dm:example.test"
+
+
 def task_text(tier="owner", body="what is on the build host?", extra="", tid=TID):
-    head = f"id: {tid}\nsource: ag2space\n" + (f"access_tier: {tier}\n" if tier is not None else "")
+    head = (f"id: {tid}\nsource: ag2space\nchannel_id: {OWNER_DM}\nsource_message_id: $owner-msg\n"
+            + (f"access_tier: {tier}\n" if tier is not None else ""))
     return head + extra + f"task: {body}\n"
+
+
+def reply_task(ws, event, *, tid="task-reply", room=ROOM, sender=SIB, stamp=True, body="answer"):
+    text = (f"id: {tid}\nsource: ag2space\nchannel_id: {room}\nsource_message_id: {event}\n"
+            f"user_id: {sender}\naccess_tier: team\ntask: {SELF} — {body}\n")
+    if stamp:
+        text = te.stamp_text(text, ws)
+    (Path(ws) / "tasks" / f"{tid}.txt").write_text(text, encoding="utf-8")
+    return tid
 
 
 def make_ws(root, text=None, *, stamp=True, tid=TID):
@@ -82,6 +96,7 @@ class FakeTransport:
         self.unidentified = unidentified
         self.replies = replies or []
         self.posted = []
+        self.reply_tos = []
         self.reads = 0
 
     def members(self, room):
@@ -90,9 +105,10 @@ class FakeTransport:
     def agents(self):
         return {"ok": True, "agents": list(self._agents)}
 
-    def mention(self, mxid, body, room):
+    def mention(self, mxid, body, room, reply_to=None):
         self.posted.append((mxid, body, room))
-        return {"ok": True, "event_id": "$ask"}
+        self.reply_tos.append(reply_to)
+        return {"ok": True, "event_id": "$ask" if len(self.posted) == 1 else f"$ask{len(self.posted)}"}
 
     def read(self, room, limit):
         self.reads += 1
@@ -100,28 +116,21 @@ class FakeTransport:
         return {"ok": True, "messages": msgs}
 
 
-class Clock:
-    def __init__(self):
-        self.t = 0.0
-        self.slept = 0.0
-
-    def now(self):
-        return self.t
-
-    def sleep(self, s):
-        self.t += s
-        self.slept += s
-
-
 def run_consult(tr, ws=None, *, text=None, stamp=True, question="is the build host up?",
-                agent=SIB, max_wait=30, clock=None, cid=CID, tid=TID):
-    clock = clock or Clock()
+                agent=SIB, cid=CID, tid=TID, now=1_000.0):
     with contextlib.ExitStack() as stack:
         if ws is None:
             ws = make_ws(stack.enter_context(tempfile.TemporaryDirectory()), text, stamp=stamp, tid=tid)
         return policy.consult(tr, room=ROOM, self_mxid=SELF, agent=agent, question=question,
-                              task_id=tid, max_wait_s=max_wait, workspace=ws, cid=cid,
-                              now_ms=lambda: 1_000_000.0, clock=clock.now, sleep=clock.sleep)
+                              task_id=tid, workspace=ws, cid=cid, now=lambda: now)
+
+
+def match(tr, ws, tid="task-reply"):
+    return policy.match_reply(tr, room=ROOM, self_mxid=SELF, task_id=tid, workspace=ws)
+
+
+def pending_ids(ws):
+    return [r["cid"] for r in policy.records(ws, "pending")]
 
 
 class TestInert(unittest.TestCase):
@@ -164,10 +173,11 @@ class TestInert(unittest.TestCase):
         self.assertTrue(res["ok"], res)
         self.assertEqual([a["mxid"] for a in res["agents"]], [SIB])
 
-    def test_max_wait_is_clamped(self):
-        s = policy.settings(environ={policy.CONFIG_ROOM: ROOM, policy.CONFIG_MAX_WAIT: "99999"},
-                            manifest_cfg={})
-        self.assertEqual(s["max_wait_s"], policy.MAX_WAIT_CEILING_S)
+    def test_nudge_time_is_clamped(self):
+        for raw, want in (("99999999", policy.NUDGE_CEILING_S), ("1", policy.NUDGE_FLOOR_S)):
+            s = policy.settings(environ={policy.CONFIG_ROOM: ROOM, policy.CONFIG_NUDGE_AFTER: raw},
+                                manifest_cfg={})
+            self.assertEqual(s["nudge_after_s"], want)
 
 
 class TestOwnerOnlyGuard(unittest.TestCase):
@@ -180,7 +190,7 @@ class TestOwnerOnlyGuard(unittest.TestCase):
         v = policy.guard(ROOM, SELF, tr)
         self.assertFalse(v["ok"])
         self.assertIn(STRANGER, v["reason"])
-        self.assertFalse(run_consult(tr)["answered"])
+        self.assertFalse(run_consult(tr)["asked"])
         self.assertEqual(tr.posted, [])
 
     def test_refuses_another_owners_agent(self):
@@ -216,7 +226,7 @@ class TestEveryMemberAccountedFor(unittest.TestCase):
         v = policy.guard(ROOM, SELF, tr)
         self.assertFalse(v["ok"])
         self.assertIn("no identity", v["reason"])
-        self.assertFalse(run_consult(tr)["answered"])
+        self.assertFalse(run_consult(tr)["asked"])
         self.assertEqual(tr.posted, [])
 
     def test_transport_that_does_not_report_the_count_refuses(self):
@@ -295,7 +305,7 @@ class TestTrustedTask(unittest.TestCase):
         for tier in ("team", "guest", "other", "ambient", None):
             tr = FakeTransport()
             res = run_consult(tr, text=task_text(tier))
-            self.assertFalse(res["answered"], tier)
+            self.assertFalse(res["asked"], tier)
             self.assertIn("not owner", res["reason"])
             self.assertEqual(tr.posted, [], tier)
 
@@ -315,17 +325,6 @@ class TestTrustedTask(unittest.TestCase):
         self.assertIn("replayed", res["reason"])
         self.assertEqual(tr.posted, [])
 
-    def test_a_task_consults_each_agent_once(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ws = make_ws(tmp)
-            tr = FakeTransport(replies=[{"sender": SIB, "body": final(CID, "up"),
-                                         "event_id": "$r", "ts": 9e12}])
-            self.assertTrue(run_consult(tr, ws)["answered"])
-            again = run_consult(tr, ws, cid=CID_B)
-        self.assertFalse(again["answered"])
-        self.assertIn("once", again["reason"])
-        self.assertEqual(len(tr.posted), 1)
-
 
 class TestRoster(unittest.TestCase):
     def test_excludes_humans_and_self(self):
@@ -335,31 +334,31 @@ class TestRoster(unittest.TestCase):
     def test_ask_refuses_an_agent_not_on_the_roster(self):
         for agent in (OWNER, SELF, OTHER_AGENT):
             tr = FakeTransport()
-            self.assertFalse(run_consult(tr, agent=agent)["answered"])
+            self.assertFalse(run_consult(tr, agent=agent)["asked"])
             self.assertEqual(tr.posted, [])
 
 
 class TestOneHop(unittest.TestCase):
     def test_ask_carries_the_marker_and_correlation_id(self):
-        tr = FakeTransport(replies=[{"sender": SIB, "body": final(CID, "up"), "event_id": "$r",
-                                     "ts": 2_000_000}])
+        tr = FakeTransport()
         res = run_consult(tr)
-        self.assertTrue(res["answered"])
+        self.assertTrue(res["asked"])
         body = tr.posted[0][1]
         self.assertTrue(body.startswith(f"{policy.MARKER} consult:{CID}"))
         self.assertIn(policy.answer_tag(CID), body)
+        self.assertIn(SELF, body)
 
     def test_a_consult_task_is_never_consulted_onward(self):
         tr = FakeTransport()
         res = run_consult(tr, text=task_text(body=f"{policy.MARKER} is the host up?"))
-        self.assertFalse(res["answered"])
+        self.assertFalse(res["asked"])
         self.assertIn("never consult onward", res["reason"])
         self.assertEqual(tr.posted, [])
 
     def test_a_question_carrying_any_marker_is_refused(self):
         for q in (f"{policy.MARKER} relay this", f"{policy.answer_tag(CID)} relay this"):
             tr = FakeTransport()
-            self.assertFalse(run_consult(tr, question=q)["answered"])
+            self.assertFalse(run_consult(tr, question=q)["asked"])
             self.assertEqual(tr.posted, [])
 
     def test_marker_is_defined_once(self):
@@ -368,55 +367,180 @@ class TestOneHop(unittest.TestCase):
         self.assertEqual(hits, ["consult_policy.py"])
 
 
-class TestCorrelatedFinalAnswer(unittest.TestCase):
-    def test_progress_before_final_returns_the_final(self):
-        pages = {2: [{"sender": SIB, "body": "On it — checking now.", "event_id": "$p", "ts": 9e12}],
-                 3: [{"sender": SIB, "body": final(CID, "Final answer."), "event_id": "$f", "ts": 9.1e12},
-                     {"sender": SIB, "body": "On it — checking now.", "event_id": "$p", "ts": 9e12}]}
-        tr = FakeTransport(replies=lambda n: pages.get(n, []))
-        res = run_consult(tr)
-        self.assertTrue(res["answered"], res)
-        self.assertEqual(res["reply_text"], "Final answer.")
-        self.assertEqual(res["event_ids"], ["$f"])
-        self.assertEqual(tr.reads, 3)
+class TestAskReturnsAtOnce(unittest.TestCase):
+    """ask posts, records the pending consult and returns; it never reads the room."""
 
-    def test_progress_only_times_out_and_says_so(self):
-        clock = Clock()
-        tr = FakeTransport(replies=[{"sender": SIB, "body": "On it — checking now.",
-                                     "event_id": "$p", "ts": 9e12}])
-        res = run_consult(tr, max_wait=30, clock=clock)
-        self.assertFalse(res["answered"])
-        self.assertIn("1 progress message", res["reason"])
-        self.assertLessEqual(clock.slept, 30)
+    def test_ask_records_the_pending_consult_and_does_not_wait(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = make_ws(tmp)
+            tr = FakeTransport()
+            res = run_consult(tr, ws, now=1_234.0)
+            self.assertEqual((res["asked"], res["cid"], res["ask_event"], res["follow_up"]),
+                             (True, CID, "$ask", False))
+            self.assertEqual(tr.reads, 0)
+            [rec] = policy.records(ws, "pending")
+        self.assertEqual((rec["task_id"], rec["cid"], rec["agent"], rec["ask_event"], rec["asked_at"]),
+                         (TID, CID, SIB, "$ask", 1_234.0))
+        self.assertEqual(rec["origin"], {"source": "ag2space", "channel_id": OWNER_DM,
+                                         "source_message_id": "$owner-msg"})
+        self.assertIsNone(tr.reply_tos[0])
 
-    def test_concurrent_asks_each_take_only_their_own_answer(self):
-        room = [{"sender": SIB, "body": final(CID_B, "answer for B"), "event_id": "$b", "ts": 9e12}]
-        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
-            res_a = run_consult(FakeTransport(replies=room), make_ws(a), cid=CID, max_wait=10)
-            res_b = run_consult(FakeTransport(replies=room), make_ws(b), cid=CID_B, max_wait=10)
-        self.assertFalse(res_a["answered"])
-        self.assertTrue(res_b["answered"])
-        self.assertEqual(res_b["reply_text"], "answer for B")
+    def test_a_refused_ask_records_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = make_ws(tmp, task_text("team"))
+            run_consult(FakeTransport(), ws)
+            self.assertEqual(pending_ids(ws), [])
 
-    def test_tagged_reply_related_to_another_event_is_not_bound(self):
-        msg = {"sender": SIB, "body": final(CID, "x"), "event_id": "$r", "ts": 9e12,
-               "in_reply_to": "$someone-else"}
-        self.assertFalse(run_consult(FakeTransport(replies=[msg]), max_wait=5)["answered"])
-        msg = dict(msg, in_reply_to="$ask")
-        self.assertTrue(run_consult(FakeTransport(replies=[msg]))["answered"])
+    def test_a_failed_post_leaves_no_pending_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = make_ws(tmp)
+            tr = FakeTransport()
+            tr.mention = lambda *a, **k: {"ok": False, "reason": "gate denied"}
+            self.assertIn("ask not posted: gate denied", run_consult(tr, ws)["reason"])
+            self.assertEqual(pending_ids(ws), [])
 
-    def test_tag_from_another_sender_or_before_the_ask_is_ignored(self):
-        newest_first = [{"sender": OWNER, "body": final(CID, "not the agent"), "event_id": "$o", "ts": 9e12},
-                        {"sender": SIB, "body": final(CID, "stale"), "event_id": "$ask", "ts": 1_000_000},
-                        {"sender": SIB, "body": final(CID, "older"), "event_id": "$r0", "ts": 900_000}]
-        self.assertFalse(run_consult(FakeTransport(replies=newest_first), max_wait=5)["answered"])
 
-    def test_without_the_ask_event_in_window_only_newer_by_time_count(self):
-        msgs = [{"sender": SIB, "body": "new", "event_id": "$n", "ts": 1_500},
-                {"sender": SIB, "body": "old", "event_id": "$x", "ts": 999}]
-        hits = policy.replies_after(msgs, SIB, "$missing", asked_at_ms=1_000_000.0)
-        self.assertEqual([h["body"] for h in hits], ["new"])
+class TestFollowUp(unittest.TestCase):
+    """A second ask to the same agent within a task is allowed and threads under the first."""
 
+    def test_follow_up_to_the_same_agent_is_a_reply_to_the_first_ask(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = make_ws(tmp)
+            tr = FakeTransport()
+            first = run_consult(tr, ws, cid=CID, now=1.0)
+            second = run_consult(tr, ws, cid=CID_B, question="and the disk?", now=2.0)
+            third = run_consult(tr, ws, cid="00000000000000aa", question="and memory?", now=3.0)
+            self.assertTrue(first["asked"] and second["asked"] and third["asked"])
+            self.assertEqual((first["follow_up"], second["follow_up"], third["follow_up"]),
+                             (False, True, True))
+            self.assertEqual(tr.reply_tos, [None, "$ask", "$ask"])
+            self.assertEqual(sorted(pending_ids(ws)), sorted([CID, CID_B, "00000000000000aa"]))
+
+    def test_a_reused_correlation_id_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = make_ws(tmp)
+            tr = FakeTransport()
+            run_consult(tr, ws)
+            self.assertIn("already used", run_consult(tr, ws)["reason"])
+            self.assertEqual(len(tr.posted), 1)
+
+
+def answer_msg(cid=CID, text="host is up", event="$f", sender=SIB, **rel):
+    return {"sender": sender, "body": f"{SELF} — {final(cid, text)}", "event_id": event,
+            "ts": 9e12, **rel}
+
+
+class TestMatchReply(unittest.TestCase):
+    """A reply task binds to its consult only by consult id, sender and relation to the ask."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ws = make_ws(self._tmp.name)
+        run_consult(FakeTransport(), self.ws)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _match(self, *msgs, event="$f", **kw):
+        reply_task(self.ws, event, **kw)
+        return match(FakeTransport(replies=list(msgs)), self.ws)
+
+    def test_the_correlated_answer_returns_the_original_task_and_closes_it(self):
+        res = self._match(answer_msg(in_reply_to="$ask"))
+        self.assertTrue(res["matched"], res)
+        self.assertEqual((res["task_id"], res["agent"], res["cid"], res["reply_text"]),
+                         (TID, SIB, CID, "host is up"))
+        self.assertEqual(res["lead"], f"[channel: {OWNER_DM}]\n")
+        self.assertEqual(pending_ids(self.ws), [])
+        again = match(FakeTransport(replies=[answer_msg(in_reply_to="$ask")]), self.ws)
+        self.assertFalse(again["matched"])
+        self.assertIn("already answered", again["reason"])
+
+    def test_a_threaded_original_gets_a_thread_lead(self):
+        self.assertEqual(policy.reply_lead({"channel_id": OWNER_DM, "thread_root": "$root"}),
+                         f"[channel: {OWNER_DM}]\n[thread: $root]\n")
+
+    def test_wrong_consult_id_does_not_match(self):
+        res = self._match(answer_msg(cid=CID_B, in_reply_to="$ask"))
+        self.assertFalse(res["matched"])
+        self.assertIn(CID_B, res["reason"])
+        self.assertEqual(pending_ids(self.ws), [CID])
+
+    def test_not_a_reply_to_the_ask_does_not_match(self):
+        for rel in ({"in_reply_to": "$someone-else"}, {"thread_root": "$other-thread"}):
+            res = self._match(answer_msg(**rel))
+            self.assertFalse(res["matched"], rel)
+            self.assertIn("not this consult's ask", res["reason"])
+        self.assertEqual(pending_ids(self.ws), [CID])
+
+    def test_a_progress_message_is_progress(self):
+        res = self._match({"sender": SIB, "body": f"{SELF} — On it, checking now.", "event_id": "$f",
+                           "ts": 9e12, "in_reply_to": "$ask"})
+        self.assertEqual((res["matched"], res.get("progress")), (False, True))
+        self.assertEqual(pending_ids(self.ws), [CID])
+
+    def test_an_answer_from_another_sender_does_not_match(self):
+        res = self._match(answer_msg(sender=OWNER, in_reply_to="$ask"))
+        self.assertFalse(res["matched"])
+        self.assertIn("not " + SIB, res["reason"])
+
+    def test_the_reply_task_must_be_verified_and_from_the_consult_room(self):
+        self.assertIn("unsigned", self._match(answer_msg(), stamp=False)["reason"])
+        self.assertIn("consult room", self._match(answer_msg(), room="!elsewhere:example.test")["reason"])
+        self.assertIn("not a live task", match(FakeTransport(), self.ws, tid="task-absent")["reason"])
+        self.assertEqual(pending_ids(self.ws), [CID])
+
+    def test_an_event_outside_the_read_window_says_so(self):
+        res = self._match(answer_msg(event="$elsewhere"))
+        self.assertIn(f"last {policy.READ_LIMIT} messages", res["reason"])
+
+    def test_an_answer_line_with_no_answer_is_refused(self):
+        msg = {"sender": SIB, "body": policy.answer_tag(CID), "event_id": "$f", "ts": 9e12}
+        self.assertIn("no answer", self._match(msg)["reason"])
+
+    def test_a_follow_up_answer_threaded_under_the_first_ask_matches(self):
+        tr = FakeTransport()
+        tr.posted.append(("x", "x", ROOM))  # the first ask was $ask; the follow-up gets $ask2
+        self.assertTrue(run_consult(tr, self.ws, cid=CID_B)["asked"])
+        res = self._match(answer_msg(cid=CID_B, in_reply_to="$ask2", thread_root="$ask"))
+        self.assertTrue(res["matched"], res)
+        self.assertEqual(pending_ids(self.ws), [CID])
+
+    def test_a_follow_up_answer_cannot_cite_another_consults_ask(self):
+        tr = FakeTransport()
+        tr.posted.append(("x", "x", ROOM))
+        run_consult(tr, self.ws, cid=CID_B)
+        self.assertFalse(self._match(answer_msg(cid=CID_B, in_reply_to="$unrelated"))["matched"])
+
+
+class TestPendingListing(unittest.TestCase):
+    def test_overdue_consults_are_due_a_nudge_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = make_ws(tmp)
+            run_consult(FakeTransport(), ws, now=1_000.0)
+            [fresh] = policy.pending(ws, 600, now=1_100.0)
+            self.assertEqual((fresh["overdue"], fresh["nudge_due"], fresh["age_s"]), (False, False, 100))
+            [late] = policy.pending(ws, 600, now=2_000.0)
+            self.assertEqual((late["overdue"], late["nudge_due"], late["task_id"]), (True, True, TID))
+            self.assertTrue(policy.mark_nudged(ws, CID, now=2_001.0)["ok"])
+            [told] = policy.pending(ws, 600, now=3_000.0)
+            self.assertEqual((told["overdue"], told["nudge_due"]), (True, False))
+
+    def test_answered_consults_are_not_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = make_ws(tmp)
+            run_consult(FakeTransport(), ws)
+            reply_task(ws, "$f")
+            self.assertTrue(match(FakeTransport(replies=[answer_msg(in_reply_to="$ask")]), ws)["matched"])
+            self.assertEqual(policy.pending(ws, 600), [])
+
+    def test_mark_nudged_edges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIn("malformed", policy.mark_nudged(Path(tmp), "nope")["reason"])
+            self.assertIn("no pending", policy.mark_nudged(Path(tmp), CID)["reason"])
+
+
+class TestRelationMetadata(unittest.TestCase):
     def test_room_ops_read_keeps_relation_metadata(self):
         sys.path.insert(0, str(ROOM_OPS_CLI.parent))
         read = _load("room_ops_read", ROOM_OPS_CLI.parent / "read.py")
@@ -470,9 +594,12 @@ class TestSkillBoundary(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix=".py") as f:
             tr = cli.RoomCliTransport(f.name, SELF, runner=runner)
             tr.agents(), tr.members(ROOM), tr.mention(SIB, "q", ROOM), tr.read(ROOM, 5)
+            tr.mention(SIB, "q2", ROOM, reply_to="$ask")
             self.assertEqual(calls, [[f.name, "agents"], [f.name, "members", ROOM, "--agent", SELF],
                                      [f.name, "mention", SIB, "q", ROOM, "--agent", SELF],
-                                     [f.name, "read", ROOM, "--limit", "5", "--agent", SELF]])
+                                     [f.name, "read", ROOM, "--limit", "5", "--agent", SELF],
+                                     [f.name, "mention", SIB, "q2", ROOM, "--agent", SELF,
+                                      "--reply-to", "$ask"]])
 
     def test_transport_failures_are_in_band(self):
         with tempfile.NamedTemporaryFile(suffix=".py") as f:
@@ -515,7 +642,8 @@ class FakeGateway(http.server.BaseHTTPRequestHandler):
             return self._send({"ok": True, "members": self.state["members"]})
         if req.get("op") == "message":
             self.state.setdefault("posted", []).append(req)
-            return self._send({"ok": True, "event_id": "$ask"})
+            n = len(self.state["posted"])
+            return self._send({"ok": True, "event_id": "$ask" if n == 1 else f"$ask{n}"})
         self._send({"error": "unknown op"})
 
 
@@ -530,8 +658,9 @@ class TestProductionAdapter(unittest.TestCase):
             "agents": [{"id": SELF, "owner": OWNER}, {"id": SIB, "owner": OWNER}],
             "members": [{"user_id": SELF}, {"user_id": OWNER}, {"user_id": SIB}],
             "messages": [{"event_id": "$f", "sender": SIB, "ts": 9e12, "in_reply_to": "$ask",
-                          "body": final(CID, "host is up")},
-                         {"event_id": "$p", "sender": SIB, "ts": 8e12, "body": "On it — checking now."},
+                          "body": f"{SELF} — {final(CID, 'host is up')}"},
+                         {"event_id": "$p", "sender": SIB, "ts": 8e12, "in_reply_to": "$ask",
+                          "body": f"{SELF} — On it, checking now."},
                          {"event_id": "$ask", "sender": SELF, "ts": 7e12, "body": "ask"}]}
         env = {"GATEWAY_URL": f"http://127.0.0.1:{self.srv.server_address[1]}",
                "GATEWAY_TOKEN": "test-token",
@@ -554,14 +683,25 @@ class TestProductionAdapter(unittest.TestCase):
         self.assertIn("1 member(s) with no identity", v["reason"])
         self.assertNotIn("posted", FakeGateway.state)
 
-    def test_end_to_end_returns_the_correlated_final_not_the_checkpoint(self):
-        res = run_consult(self.tr, self.ws, max_wait=5)
-        self.assertTrue(res["answered"], res)
-        self.assertEqual(res["reply_text"], "host is up")
+    def test_end_to_end_ask_then_the_reply_task_matches_and_the_checkpoint_does_not(self):
+        res = run_consult(self.tr, self.ws)
+        self.assertEqual((res["asked"], res["ask_event"]), (True, "$ask"), res)
         posted = FakeGateway.state["posted"]
         self.assertEqual(len(posted), 1)
         self.assertEqual(posted[0]["mentions"], [SIB])
         self.assertIn(f"consult:{CID}", posted[0]["body"])
+        reply_task(self.ws, "$p", tid="task-progress")
+        self.assertTrue(match(self.tr, self.ws, "task-progress").get("progress"))
+        reply_task(self.ws, "$f")
+        got = match(self.tr, self.ws)
+        self.assertTrue(got["matched"], got)
+        self.assertEqual((got["task_id"], got["reply_text"]), (TID, "host is up"))
+
+    def test_follow_up_posts_as_a_reply_through_the_real_cli(self):
+        run_consult(self.tr, self.ws, cid=CID)
+        res = run_consult(self.tr, self.ws, cid=CID_B, question="and the disk?")
+        self.assertEqual((res["asked"], res["follow_up"]), (True, True), res)
+        self.assertEqual(FakeGateway.state["posted"][1].get("reply_to"), "$ask")
 
 
 class TestCliAndEdges(unittest.TestCase):
@@ -575,18 +715,25 @@ class TestCliAndEdges(unittest.TestCase):
                           workspace=workspace or Path(tempfile.gettempdir()))
         return rc, json.loads(out.getvalue())
 
-    def test_cli_ask_answers_through_every_gate(self):
+    def test_cli_ask_match_and_pending_through_every_gate(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(cli.policy, "new_cid", return_value=CID):
             ws = make_ws(Path(tmp) / "ws")
             q = Path(tmp) / "q.txt"
             q.write_text("is the build host up?", encoding="utf-8")
-            tr = FakeTransport(replies=[{"sender": SIB, "body": final(CID, "up"),
-                                         "event_id": "$r", "ts": 9e12}])
+            tr = FakeTransport(replies=[answer_msg(text="up", in_reply_to="$ask")])
             rc, res = self._cli("ask", "--agent", SELF, "--agent-to", SIB, "--question-file", str(q),
-                                "--task-id", TID, "--max-wait", "1", transport=tr, workspace=ws)
-        self.assertTrue(res["answered"], res)
-        self.assertEqual(res["reply_text"], "up")
+                                "--task-id", TID, transport=tr, workspace=ws)
+            self.assertEqual((res["asked"], tr.reads), (True, 0), res)
+            rc, listed = self._cli("pending", "--nudge-after", "60", workspace=ws)
+            self.assertEqual(([r["cid"] for r in listed["pending"]], listed["nudge_after_s"]), ([CID], 60))
+            rc, nudged = self._cli("pending", "--nudged", CID, workspace=ws)
+            self.assertTrue(nudged["ok"], nudged)
+            reply_task(ws, "$f")
+            rc, got = self._cli("match", "--agent", SELF, "--task-id", "task-reply",
+                                transport=tr, workspace=ws)
+        self.assertTrue(got["matched"], got)
+        self.assertEqual((got["task_id"], got["reply_text"]), (TID, "up"))
 
     def test_cli_unreadable_question_and_refused_roster(self):
         rc, res = self._cli("ask", "--agent", SELF, "--agent-to", SIB, "--question-file",
@@ -611,9 +758,9 @@ class TestCliAndEdges(unittest.TestCase):
     def test_config_edges(self):
         self.assertEqual(policy.manifest_config(Path(tempfile.gettempdir()) / "absent.json"), {})
         self.assertEqual(policy.config_value(policy.CONFIG_ROOM, cli=" !r:x ", environ={}), "!r:x")
-        s = policy.settings(environ={policy.CONFIG_ROOM: ROOM, policy.CONFIG_MAX_WAIT: "soon"},
+        s = policy.settings(environ={policy.CONFIG_ROOM: ROOM, policy.CONFIG_NUDGE_AFTER: "soon"},
                             manifest_cfg={})
-        self.assertEqual(s["max_wait_s"], policy.DEFAULT_MAX_WAIT_S)
+        self.assertEqual(s["nudge_after_s"], policy.DEFAULT_NUDGE_AFTER_S)
 
     def test_guard_edges(self):
         tr = FakeTransport()
@@ -621,18 +768,18 @@ class TestCliAndEdges(unittest.TestCase):
         self.assertIn("registry unreadable", policy.guard(ROOM, SELF, tr)["reason"])
         tr = FakeTransport(members=[{"user_id": OWNER, "kind": "human"}])
         self.assertIn("not a member", policy.guard(ROOM, SELF, tr)["reason"])
-        self.assertIsNone(policy._ts_ms("2026-01-01"))
 
     def test_consult_edges(self):
         self.assertIn("empty question", run_consult(FakeTransport(), question="  ")["reason"])
         self.assertIn("correlation id", run_consult(FakeTransport(), cid="nope")["reason"])
-        tr = FakeTransport()
-        tr.mention = lambda mxid, body, room: {"ok": False, "reason": "gate denied"}
-        self.assertIn("ask not posted: gate denied", run_consult(tr)["reason"])
-        tr = FakeTransport()
-        tr.read = lambda room, limit: {"ok": False, "reason": "network error"}
-        res = run_consult(tr, max_wait=10)
-        self.assertIn("last read error: network error", res["reason"])
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = make_ws(tmp)
+            run_consult(FakeTransport(), ws)
+            reply_task(ws, "$f")
+            tr = FakeTransport()
+            tr.read = lambda room, limit: {"ok": False, "reason": "network error"}
+            self.assertIn("unreadable: network error", match(tr, ws)["reason"])
+            self.assertEqual(pending_ids(ws), [CID])
 
 
 if __name__ == "__main__":
