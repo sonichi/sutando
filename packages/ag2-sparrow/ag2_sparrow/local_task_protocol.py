@@ -221,6 +221,8 @@ KNOWN_HEADER_KEYS = (
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
+    # The owner's wall clock beside the UTC `timestamp`: ISO-8601 with offset, then the IANA zone.
+    "local_time",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it
@@ -838,6 +840,51 @@ def _has_task_line(path: Path) -> bool:
                    path.read_text(errors="replace").split("\n"))
     except OSError:
         return False
+
+
+# ── Owner-local time (the `local_time:` header) ──────────────────────────────
+
+def host_zone_name(localtime_path: str = "/etc/localtime") -> "str | None":
+    """IANA zone of this host: `TZ` when it names one, else the `/etc/localtime`
+    symlink target below a `zoneinfo*/` directory; None when neither loads."""
+    from zoneinfo import ZoneInfo
+    candidates = [os.environ.get("TZ", "").lstrip(":")]
+    for resolve in (os.readlink, os.path.realpath):
+        try:
+            m = re.search(r"/zoneinfo[^/]*/(.+)$", resolve(localtime_path))
+        except OSError:
+            continue
+        if m:
+            candidates.append(m.group(1))
+    for name in candidates:
+        if not name or name.startswith("/"):
+            continue
+        try:
+            ZoneInfo(name)
+        except Exception:
+            continue
+        return name
+    return None
+
+
+def local_time_value(now=None, zone: "str | None" = None) -> str:
+    """`2026-10-08T13:35:44-07:00 America/Los_Angeles`; the bare offset form when
+    no zone resolves. `now` is an aware datetime (default: the current instant)."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    if now is None:
+        now = datetime.now(timezone.utc)
+    name = zone or host_zone_name()
+    local = None
+    if name:
+        try:
+            local = now.astimezone(ZoneInfo(name))
+        except Exception:
+            name = None
+    if local is None:
+        local = now.astimezone()
+    stamp = local.replace(microsecond=0).isoformat()
+    return f"{stamp} {name}" if name else stamp
 
 
 # ── Write side (task-last, the convergence shape) ────────────────────────────

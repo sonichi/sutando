@@ -22,6 +22,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 _SRC = REPO / "src" / "remote-gateway-bridge.py"
 FIXTURES = REPO / "tests" / "fixtures" / "gateway-task-envelopes"
+PINNED_LOCAL_TIME = "2026-10-06T17:00:00-07:00 America/Los_Angeles"
 
 # One envelope per tier shape the broker produces (ag2space-backend
 # governance.task_tier_fields + receiver.py), plus the local-only spellings.
@@ -55,6 +56,8 @@ def _load(tmp: Path):
     # edge): environment, not policy. Identity stamper, so the bytes compare.
     import ag2_sparrow.local_task_protocol as packaged_protocol
     packaged_protocol.set_task_stamper(lambda text: text)
+    # The host clock and zone are environment too.
+    mod.local_task_protocol.local_time_value = lambda: PINNED_LOCAL_TIME
     mod.TASKS_DIR.mkdir(parents=True, exist_ok=True)
     return mod
 
