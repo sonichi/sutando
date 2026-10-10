@@ -305,7 +305,8 @@ exit 0
         # A suite run from inside a core would otherwise inherit the marker
         # and hit the in-session restart guard instead of the path under test.
         env.pop("SUTANDO_CORE_SESSION", None)
-        # A suite run from a core shell must not point the launcher at the live socket or session.
+        # Must not inherit a live socket/session, or fall through to the shared default
+        # either: ensure_core_monitor's host-wide pgrep can match another real core's socket.
         env.pop("SUTANDO_TMUX_SOCKET", None)
         env.pop("SUTANDO_TMUX_SESSION", None)
         env.update({
@@ -314,6 +315,7 @@ exit 0
             "TMUX_STATE": str(Path(self.tmp.name) / "tmux-killed"),
             "HOME": str(Path(self.tmp.name) / "home"),
             "SUTANDO_CORE_RUNTIME": "codex",
+            "SUTANDO_TMUX_SOCKET": str(Path(self.tmp.name) / "tmux.sock"),
             "MONITOR_LOG": str(Path(self.tmp.name) / "monitor.log"),
             "INSTALL_LOG": str(Path(self.tmp.name) / "install.log"),
             "LAUNCHCTL_STATE": str(Path(self.tmp.name) / "launchctl-loaded"),
@@ -339,7 +341,7 @@ exit 0
         # A suite run from inside a core would otherwise inherit the marker
         # and hit the in-session restart guard instead of the path under test.
         env.pop("SUTANDO_CORE_SESSION", None)
-        # A suite run from a core shell must not point the launcher at the live socket or session.
+        # Same collision as run_launcher: use a test-unique socket, never the shared default.
         env.pop("SUTANDO_TMUX_SOCKET", None)
         env.pop("SUTANDO_TMUX_SESSION", None)
         env.pop("TMUX", None)   # inherited from a tmux host, it would route to the detached branch
@@ -349,6 +351,7 @@ exit 0
             "TMUX_STATE": str(Path(self.tmp.name) / "tmux-killed"),
             "HOME": str(Path(self.tmp.name) / "home"),
             "SUTANDO_CORE_RUNTIME": "codex",
+            "SUTANDO_TMUX_SOCKET": str(Path(self.tmp.name) / "tmux.sock"),
             "MONITOR_LOG": str(Path(self.tmp.name) / "monitor.log"),
             "INSTALL_LOG": str(Path(self.tmp.name) / "install.log"),
             "LAUNCHCTL_STATE": str(Path(self.tmp.name) / "launchctl-loaded"),
@@ -698,7 +701,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         line = next((l for l in calls.splitlines() if "new-session -d -s sutando-core-observer" in l), "")
         self.assertIn(f"-e SUTANDO_OBSERVER_VERSION={self._observer_version()}", line)
         self.assertIn(f"{self.bin}/node {self.root}/src/agent/codex/cli/codex-observer.mjs --engine {self.root}", line)
-        self.assertIn("--tmux-socket /tmp/sutando-tmux.sock --session sutando-core", line)
+        self.assertIn(f"--tmux-socket {Path(self.tmp.name) / 'tmux.sock'} --session sutando-core", line)
         self.assertIn("--workspace ", line)
         self.assertLess(calls.index("new-session -d -s sutando-core "), calls.index("new-session -d -s sutando-core-observer"))
 
