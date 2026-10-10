@@ -142,6 +142,25 @@ describe('forwardVoiceResultToOrigin — the result reaches its origin, and voic
 		assert.match('  [channel: 123]', LEADING_REDIRECT_RE);
 	});
 
+	it('a [thread:] root rides only to the room it belongs to: the origin keeps its own, another room\'s is dropped', () => {
+		const parse = (file: string) => {
+			const py = spawnSync('python3', ['-c', [
+				'import sys; sys.path.insert(0, "src")',
+				'from result_markers import parse_markers',
+				`p = parse_markers(open(${JSON.stringify(join(RESULT_DIR, file))}, encoding="utf-8").read())`,
+				'print([(a.kind, a.value) for a in p.actions if a.kind in ("redirect", "thread")])',
+			].join('\n')], { cwd: process.cwd(), encoding: 'utf-8' });
+			assert.equal(py.status, 0, py.stderr);
+			return py.stdout.trim();
+		};
+		const foreign = forwardVoiceResultToOrigin('task-1700000000020', '[thread: $root]\n[channel: !x:ag2.space]\nupdate', origin('!origin:ag2.space'), 1_800_000_020);
+		assert.equal(parse(foreign), "[('redirect', '!origin:ag2.space'), ('redirect', '!x:ag2.space')]", "X's root is never posted in the origin");
+		const own = forwardVoiceResultToOrigin('task-1700000000021', '[thread: $root]\nupdate', origin('!origin:ag2.space'), 1_800_000_021);
+		assert.equal(parse(own), "[('redirect', '!origin:ag2.space'), ('thread', '$root')]", 'a root with no [channel:] is the origin\'s');
+		const dm = forwardVoiceResultToOwnerDm('task-1700000000022', '[thread: $root]\nprivate', 'fakechan', 1_800_000_022);
+		assert.equal(parse(dm), '[]', 'kept to the DM: the origin room\'s root is dropped');
+	});
+
 	it('the owner-DM shape: same bridge tag, no [channel:] line, [dm-only] on top, claimed at once', () => {
 		const file = forwardVoiceResultToOwnerDm('task-1700000000700', 'Private findings.', 'fakechan', 1_800_000_700);
 		assert.equal(file, 'proactive-result-task-1700000000700-1800000700.to-fakechan.txt');

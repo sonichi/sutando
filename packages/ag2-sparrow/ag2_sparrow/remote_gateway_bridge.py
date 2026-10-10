@@ -3828,6 +3828,10 @@ def _proactive_thread_root(body: str, name: str = "") -> "str | None":
             _log(f"proactive {name} has a malformed [thread: {a.value[:80]!r}] "
                  "— posting top level")
             return None
+        if a.kind == "thread-foreign":
+            _log(f"proactive {name}: [thread: {a.value[:80]!r}] may not be in the "
+                 f"destination room ({a.extra}) — posting top level")
+            return None
     return None
 
 

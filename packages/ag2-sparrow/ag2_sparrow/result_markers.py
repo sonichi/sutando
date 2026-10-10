@@ -42,6 +42,10 @@ Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
   Posts the body inside that thread. Only an id starting with `$` counts; any
   other value emits a `thread-invalid` action (posted top level, consumer
   logs it). Stripped either way; consumers without threads just post the body.
+  A root belongs to the room its [channel:] names (the default room without
+  one). Under [dm-only], or when the leading lines name two different rooms,
+  the destination may not be that room: `thread-foreign` replaces `thread`
+  and the body is posted top level.
 
   DM-ONLY marker — anywhere in the body:
     [dm-only]
@@ -75,6 +79,8 @@ Parse contract:
                  ("redirect", channel_id) — deliver to alternate channel
                  ("thread", root_event_id) — post inside that thread
                  ("thread-invalid", raw)  — malformed [thread:]; post top level
+                 ("thread-foreign", root) — root may not be the destination's;
+                                            post top level (extra: why)
                  ("attach", path)         — bridge runs its own allowlist
                                             check, then uploads
 
@@ -93,7 +99,7 @@ from typing import Literal
 
 
 ActionKind = Literal["skip", "redirect", "attach", "dm-only", "reply", "thread",
-                     "thread-invalid"]
+                     "thread-invalid", "thread-foreign"]
 
 
 @dataclass
@@ -275,10 +281,13 @@ def parse_markers(text: str) -> ParseResult:
     # private body stays in the owner's DM.
     # 2. LEADING MARKERS — [channel:], [thread:] and [reply:] in any order; order
     # independence keeps an unparsed marker from reaching the user as text.
+    named: set[str] = set()
     while True:
         redirect_match = _REDIRECT_RE.match(body)
         if redirect_match:
             channel = redirect_match.group(1).strip()
+            if channel:
+                named.add(channel)
             if not dm_only and channel:
                 # Empty target = no action: "" release-loops at the default
                 # sink and raises in Discord's int() conversion.
@@ -298,6 +307,12 @@ def parse_markers(text: str) -> ParseResult:
             body = body[reply_match.end():]
             continue
         break
+
+    # A root posted outside its room is refused or misthreaded; ambiguity fails to top level.
+    foreign = "dm-only" if dm_only else ("rooms differ" if len(named) > 1 else None)
+    if foreign:
+        actions = [Action(kind="thread-foreign", value=a.value, extra=foreign)
+                   if a.kind == "thread" else a for a in actions]
 
     # Restore D7 header so it appears in the user-facing body. (It was only
     # peeled off so it didn't shadow the marker regexes.)

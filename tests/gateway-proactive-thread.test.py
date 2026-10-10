@@ -8,7 +8,8 @@ The send uses the same `thread_root` op:message field `room_ops.py say
   b) [thread: $root] alone             -> owner DM, thread_root sent
   c) no marker                         -> no thread_root key at all
   d) malformed [thread: x]             -> top level, logged, marker never posted
-  e) [dm-only] + [channel:] + [thread:] -> owner DM (redirect still suppressed)
+  e) [dm-only] + [channel:] + [thread:] -> owner DM, top level (the root is the room's)
+  f) voice shape [channel: origin] + [thread:] + [channel: X] -> origin, top level
 
 Imports the vendored module with an isolated env; never execs the wrapper.
 Run: python3 tests/gateway-proactive-thread.test.py
@@ -106,7 +107,15 @@ def main() -> int:
     p = posts[0] if posts else {}
     check(p.get("room_id") == OWNER_DM, f"e) dm-only keeps the owner DM, got {p.get('room_id')!r}")
     check(p.get("body") == "private", f"e) body clean, got {p.get('body')!r}")
-    check(p.get("thread_root") == ROOT, f"e) thread_root survives dm-only, got {p.get('thread_root')!r}")
+    check(p and "thread_root" not in p, f"e) the room's root never reaches the DM, got {p}")
+
+    other = "!VoiceOriginRoom:ag2.space"
+    posts, logs = drain(f"[channel: {other}]\n[thread: {ROOT}]\n[channel: {ROOM}]\nupdate\n")
+    p = posts[0] if posts else {}
+    check(p.get("room_id") == other, f"f) the first [channel:] decides, got {p.get('room_id')!r}")
+    check(p and "thread_root" not in p, f"f) X's root never posted in the origin, got {p}")
+    check(p.get("body") == "update", f"f) body clean, got {p.get('body')!r}")
+    check(any("may not be in the destination room" in line for line in logs), f"f) dropped root logged, got {logs}")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0

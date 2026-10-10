@@ -6,7 +6,8 @@ Guards:
   2. it combines with [channel:] in either order
   3. a malformed value (no `$`, whitespace, empty) emits `thread-invalid`, no
      `thread` action, and is still stripped so it never leaks
-  4. [dm-only] precedence is unaffected: it suppresses the redirect, not the thread
+  4. a root is kept only for the room it belongs to: [dm-only] or a second,
+     different [channel:] turns it into `thread-foreign` (posted top level)
   5. a plain body and an inline mention of the marker are untouched
   6. skip markers stay terminal; neutralize_markers takes the marker out of play
   7. the vendored package copy parses identically
@@ -62,10 +63,24 @@ for raw in ("AbCdEf", "$", "$has space", "", "!RoomIdAbCdEf:ag2.space"):
     check(f"malformed {raw!r}: stripped, never leaks", body == "update", repr(body))
 
 # 4
+OTHER = "!OtherRoomXyZ:ag2.space"
 a, body = acts(f"[dm-only]\n[channel: {ROOM}]\n[thread: {ROOT}]\nprivate")
 check("dm-only still suppresses the redirect", not any(k == "redirect" for k, _ in a), str(a))
-check("dm-only leaves the thread action", ("thread", ROOT) in a, str(a))
+check("dm-only: the room's root is not sent to the DM", not any(k == "thread" for k, _ in a), str(a))
+check("dm-only: flagged thread-foreign", ("thread-foreign", ROOT) in a, str(a))
 check("dm-only body clean", body == "private", repr(body))
+a, _ = acts(f"[thread: {ROOT}]\nfor the owner\n[dm-only]")
+check("dm-only without [channel:]: root dropped too (the DM is not the room it came from)",
+      not any(k == "thread" for k, _ in a), str(a))
+# The voice forwarder prepends the origin's [channel:] to `[thread:]\n[channel: X]`.
+a, body = acts(f"[channel: {OTHER}]\n[thread: {ROOT}]\n[channel: {ROOM}]\nupdate")
+check("two rooms named: the root of one never goes to the other",
+      not any(k == "thread" for k, _ in a), str(a))
+check("two rooms named: flagged thread-foreign", ("thread-foreign", ROOT) in a, str(a))
+check("two rooms named: first redirect still decides", ("redirect", OTHER) in a, str(a))
+check("two rooms named: body clean", body == "update", repr(body))
+a, _ = acts(f"[channel: {ROOM}]\n[thread: {ROOT}]\n[channel: {ROOM}]\nupdate")
+check("the same room named twice keeps the root", ("thread", ROOT) in a, str(a))
 
 # 5
 a, body = acts("plain body")
