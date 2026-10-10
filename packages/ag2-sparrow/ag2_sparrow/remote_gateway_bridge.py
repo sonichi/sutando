@@ -3822,7 +3822,8 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
 def _proactive_thread_root(body: str, name: str = "") -> "str | None":
     """The `[thread:]` root a proactive body names, or None (top level). A
     malformed value is logged and posted top level, never into a guessed thread."""
-    for a in parse_markers(body).actions:
+    actions = parse_markers(body).actions
+    for a in actions:
         if a.kind == "thread":
             return a.value
         if a.kind == "thread-invalid":
@@ -3833,10 +3834,9 @@ def _proactive_thread_root(body: str, name: str = "") -> "str | None":
             _log(f"proactive {name}: [thread: {a.value[:80]!r}] may not be in the "
                  f"destination room ({a.extra}) — posting top level")
             return None
-        if a.kind == "thread-ask":
-            _log(f"proactive {name}: a bare [thread] applies only to a task result "
-                 "— posting top level")
-            return None
+    if any(a.kind == "thread-ask" for a in actions):
+        _log(f"proactive {name}: a bare [thread] applies only to a task result "
+             "— posting top level")
     return None
 
 
