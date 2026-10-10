@@ -19,6 +19,10 @@ _PKG = _REPO / "packages" / "ag2-sparrow"
 if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+
 
 class _Clock:
     """Stands in for the module's `time`, so the grace can expire without waiting."""
@@ -82,7 +86,7 @@ class _Loop:
         # The loop under test is the poll; no results dir on the host may be read or written.
         self._tmp = tempfile.TemporaryDirectory()
         gw.RESULTS_DIR = Path(self._tmp.name) / "results-never-created"
-        gw._save_inflight = lambda *a, **k: None
+        gw._save_inflight = lambda *a, **k: True
         gw._write_task = lambda *a, **k: None
         gw._reconcile_abandoned = lambda inflight, s, *a, **k: s
         gw._req = self._poll
@@ -301,6 +305,11 @@ class DroppedConnectionTest(unittest.TestCase):
         finally:
             gw._req, gw._log, gw._heartbeat_disabled = saved
         self.assertIn("heartbeat network error", " ".join(logs))
+
+
+class BridgeImportIsHermetic(unittest.TestCase):
+    def test_the_bridge_import_reads_no_host_config_token_or_vault(self):
+        assert_hermetic(self, _IMPORT_READS)
 
 
 if __name__ == "__main__":
