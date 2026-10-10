@@ -298,6 +298,7 @@ from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
+from .session_context import Observation as _SessionObservation, SessionLedger
 from . import undelivered_quarantine
 from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
@@ -429,6 +430,9 @@ PENDING_ACK_FILE = _STATE / f"remote-task-acks{_INST_SUFFIX}.json"
 # Re-asked task id -> the id the broker is waiting on. A dedup re-ask gets a
 # fresh local id, but the delivery it answers is still the original one.
 DEDUP_ALIAS_FILE = _STATE / f"remote-dedup-alias{_INST_SUFFIX}.json"
+# Per room + Commons session thread: members' pages and the last few session events.
+SESSION_LEDGER_FILE = _STATE / f"ag2space-sessions{_INST_SUFFIX}.json"
+_SESSION_LEDGER: "SessionLedger | None" = None
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
@@ -3285,6 +3289,40 @@ def _signal_task_media_lines(media_dir: str) -> list[str]:
         "Write the prose answer first; a picture is garnish, never the answer.",
     ]
 
+def _session_ledger() -> SessionLedger:
+    global _SESSION_LEDGER
+    if _SESSION_LEDGER is None or _SESSION_LEDGER.path != SESSION_LEDGER_FILE:
+        _SESSION_LEDGER = SessionLedger(SESSION_LEDGER_FILE)
+    return _SESSION_LEDGER
+
+
+def _observe_session(task: dict) -> _SessionObservation:
+    """Record the task in the session ledger; what the task file gets back."""
+    try:
+        ledger = _session_ledger()
+        out = ledger.observe(task)
+        if not ledger.save():
+            _log(f"session ledger write failed for {task.get('id')} — context not kept")
+        return out
+    except Exception as exc:  # noqa: BLE001 — context is additive, never blocks a task
+        _log(f"session context skipped for {task.get('id')}: {type(exc).__name__}: {exc}")
+        return _SessionObservation()
+
+
+def _consume_session_mark(task: dict) -> bool:
+    """A move or Join/Leave mark in a known session thread is recorded, never queued."""
+    try:
+        mark = _session_ledger().classify(task)
+    except Exception as exc:  # noqa: BLE001 — an unreadable ledger makes it an ordinary task
+        _log(f"session mark check skipped for {task.get('id')}: {type(exc).__name__}: {exc}")
+        return False
+    if mark is None or mark.kind not in ("move", "member"):
+        return False
+    # The ledger keeps a move's page title: filter it the way _write_task filters a body.
+    body = filter_chat_secrets(_local_redact_vault_set(str(task.get("task") or ""))).text
+    return _observe_session({**task, "task": body}).consumed
+
+
 def _write_task(task: dict) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns (task id, durable) — `durable` says the queue write and its sidecar
@@ -3337,6 +3375,7 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     # Resolved once and reused below so routing and owner-activity cannot diverge.
     sender_tier = _tier_for(task.get("user_id"), attested_tier)
     collaborator_enabled = broker_collaborator and sender_tier == "team"
+    _sess = _SessionObservation()
     lines = []
     # Which instance took delivery (shared-room fan-out: each Sutando writes its own
     # task file). Emitted just after id: below; KNOWN_HEADER_KEYS defangs a forged body copy.
@@ -3396,10 +3435,21 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                 _secret_types = tuple(_filtered.secret_types)
                 _log(f"redacted pasted secret(s) in {tid} body: "
                      f"{', '.join(sorted(_secret_types))}")
-            lines.append(f"task: {_one_line(_filtered.text)}")
+            # Only the FILTERED body reaches the session ledger; after the dedup
+            # returns above, so a redelivery is not recorded twice.
+            _sess = _observe_session({**task, "task": _filtered.text})
+            # Session context the bridge derived, above task: so a body cannot claim it.
+            if _sess.page_header:
+                lines.append(f"session_page: {_one_line(_sess.page_header)}")
+            if _sess.session_header:
+                lines.append(f"session_ctx: {_one_line(_sess.session_header)}")
+            _body = _filtered.text
+            if _sess.body_prefix:
+                _body = f"{_one_line(_sess.body_prefix)} {_body}"
+            lines.append(f"task: {_one_line(_body)}")
             # Make the sanitized body authoritative everywhere, not just this task file —
             # _write_owner_activity() re-reads task["task"] independently and isn't vault-aware.
-            task["task"] = _filtered.text
+            task["task"] = _body
             # interaction-model 4D, step 1.5: if a media marker was fetched,
             # stamp structured attachments[]/content_modalities/media_form
             if _media_refs:
@@ -5183,6 +5233,12 @@ def main() -> None:
                     _queue_review_control_result(task)
                     _retry_review_control_results()
                     _log(f"consumed private review decision {task.get('id')}")
+                    continue
+                if _consume_session_mark(task):
+                    # Same consumed-without-a-task path a card click takes.
+                    _queue_review_control_result(task)
+                    _retry_review_control_results()
+                    _log(f"session mark {task.get('id')} recorded, not queued")
                     continue
                 written = _write_task(task)
                 if written:
