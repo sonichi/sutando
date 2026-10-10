@@ -6,13 +6,14 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Before answering its owner, ask another agent of the same owner in an owner-only consult room, wait a bounded time, and fold the reply in. Inert until OWNER_AGENT_CONSULT_ROOM is set; manifest present to DECLARE config per this convention.",
+  "description": "Before answering its owner, ask another agent of the same owner in an owner-only consult room, wait a bounded time, and fold the reply in. Inert until OWNER_AGENT_CONSULT_ROOM and OWNER_AGENT_CONSULT_ROOM_CLI are set; manifest present to DECLARE config per this convention.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   },
   "config": {
     "OWNER_AGENT_CONSULT_ENABLED": "1",
     "OWNER_AGENT_CONSULT_ROOM": "",
+    "OWNER_AGENT_CONSULT_ROOM_CLI": "",
     "OWNER_AGENT_CONSULT_MAX_WAIT_S": "120"
   }
 }

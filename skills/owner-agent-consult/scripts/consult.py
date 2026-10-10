@@ -2,18 +2,19 @@
 """owner-agent-consult CLI — ask another agent of the same owner, in the owner-only
 consult room, before answering the owner. Prints one JSON object; refusals are in-band.
 
-  consult.py roster [--agent SELF] [--room ROOM]
-  consult.py ask --agent-to MXID --domain TEXT --question-file F --task-file T
-                 [--agent SELF] [--room ROOM] [--max-wait S]
+  consult.py roster [--agent SELF] [--room ROOM] [--room-cli CLI]
+  consult.py ask --agent-to MXID --question-file F --task-id TASK_ID
+                 [--agent SELF] [--room ROOM] [--room-cli CLI] [--max-wait S]
 
-Transport is the agent-room-ops skill (its members/read/mention verbs and the
-/v1/agents registry); the policy lives in consult_policy.py.
+The room transport is the CLI named by OWNER_AGENT_CONSULT_ROOM_CLI, run as a subprocess
+through its public verbs (agents, members, read, mention); the policy lives in consult_policy.py.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -21,47 +22,41 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import consult_policy as policy  # noqa: E402
 
-ROOM_OPS_DIR = Path(__file__).resolve().parents[2] / "agent-room-ops"
-CI_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "collaboration-intelligence" / "scripts"
+CLI_TIMEOUT_S = 60
 
 
-class RoomOpsTransport:
-    """The four calls the policy needs, each delegated to the room-ops module that owns it."""
+class RoomCliTransport:
+    """The four calls the policy needs, each one run of the configured room CLI."""
 
-    def __init__(self, self_mxid: Optional[str]):
-        if not (ROOM_OPS_DIR / "room_ops.py").is_file():
-            raise RuntimeError("agent-room-ops skill is not installed")
-        if str(ROOM_OPS_DIR) not in sys.path:
-            sys.path.insert(0, str(ROOM_OPS_DIR))
-        import members as _members
-        import mention as _mention
-        import read as _read
-        import resolve as _resolve
-        self._m, self._mention, self._read, self._resolve = _members, _mention, _read, _resolve
-        self.self_mxid = self_mxid
+    def __init__(self, cli_path: str, self_mxid: Optional[str], runner=subprocess.run):
+        path = Path(cli_path)
+        if not path.is_absolute() or not path.is_file():
+            raise RuntimeError(f"room transport CLI not found ({policy.CONFIG_ROOM_CLI} must be an absolute path)")
+        self.cli, self.self_mxid, self._run = str(path), self_mxid or "", runner
 
-    def members(self, room):
-        return self._m.room_members(room, self.self_mxid)
+    def _call(self, *args) -> dict:
+        argv = [sys.executable, self.cli, *args]
+        try:
+            p = self._run(argv, capture_output=True, text=True, timeout=CLI_TIMEOUT_S)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return {"ok": False, "reason": f"room transport failed: {e}"}
+        try:
+            res = json.loads(p.stdout)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": f"room transport printed no JSON (exit {p.returncode})"}
+        return res if isinstance(res, dict) else {"ok": False, "reason": "room transport output is not an object"}
 
     def agents(self):
-        return self._resolve.list_agents()
+        return self._call("agents")
+
+    def members(self, room):
+        return self._call("members", room, "--agent", self.self_mxid)
 
     def mention(self, mxid, body, room):
-        return self._mention.mention(mxid, body, room, self.self_mxid)
+        return self._call("mention", mxid, body, room, "--agent", self.self_mxid)
 
     def read(self, room, limit):
-        return self._read.read_room(room, self.self_mxid, limit)
-
-
-def load_map(workspace: Path):
-    """(entities, quick_lookup) from the collaboration-intelligence store; empty when absent."""
-    if not (CI_SCRIPTS_DIR / "lookup.py").is_file():
-        return [], {}
-    if str(CI_SCRIPTS_DIR) not in sys.path:
-        sys.path.insert(0, str(CI_SCRIPTS_DIR))
-    import lookup
-    quick, ents = lookup.load(workspace / "data" / "collaboration-intelligence")
-    return ents or [], quick or {}
+        return self._call("read", room, "--limit", str(limit), "--agent", self.self_mxid)
 
 
 def _workspace() -> Path:
@@ -82,39 +77,36 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
         s.add_argument("--agent", dest="self_mxid", default=os.environ.get("AGENT_MXID"),
                        help="this agent's own mxid (room-ops convention)")
         s.add_argument("--room", default=None, help=f"overrides {policy.CONFIG_ROOM}")
+        s.add_argument("--room-cli", default=None, help=f"overrides {policy.CONFIG_ROOM_CLI}")
         if name == "ask":
             s.add_argument("--agent-to", required=True, help="an mxid from `roster`")
-            s.add_argument("--domain", required=True, help="what the map says that agent holds")
             s.add_argument("--question-file", required=True)
-            s.add_argument("--task-file", required=True)
+            s.add_argument("--task-id", required=True,
+                           help="id of the owner task being answered, live in this workspace's inbox")
             s.add_argument("--max-wait", default=None, help=f"overrides {policy.CONFIG_MAX_WAIT}")
     a = p.parse_args(argv)
 
-    conf = policy.settings(room=a.room, max_wait=getattr(a, "max_wait", None))
+    conf = policy.settings(room=a.room, max_wait=getattr(a, "max_wait", None), room_cli=a.room_cli)
     if not conf["active"]:
         return _emit({"ok": False, "inert": True, "answered": False, "reason": conf["reason"]})
     try:
-        transport = transport or RoomOpsTransport(a.self_mxid)
+        transport = transport or RoomCliTransport(conf["room_cli"], a.self_mxid)
     except RuntimeError as e:
         return _emit({"ok": False, "answered": False, "reason": str(e)})
-    ws = workspace or _workspace()
-    ents, quick = load_map(ws)
 
     if a.cmd == "roster":
         verdict = policy.guard(conf["room"], a.self_mxid or "", transport)
         if not verdict["ok"]:
             return _emit({"ok": False, "reason": verdict["reason"]})
-        return _emit({"ok": True, "agents": policy.roster(verdict, a.self_mxid, ents, quick)})
+        return _emit({"ok": True, "agents": policy.roster(verdict, a.self_mxid)})
 
     try:
         question = Path(a.question_file).read_text(encoding="utf-8")
-        task_text = Path(a.task_file).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
-        return _emit({"ok": False, "answered": False, "reason": f"unreadable input: {e}"})
+        return _emit({"ok": False, "answered": False, "reason": f"unreadable question: {e}"})
     res = policy.consult(transport, room=conf["room"], self_mxid=a.self_mxid or "",
-                         agent=a.agent_to, domain=a.domain, question=question,
-                         task_text=task_text, max_wait_s=conf["max_wait_s"],
-                         ents=ents, quick=quick, workspace=ws)
+                         agent=a.agent_to, question=question, task_id=a.task_id,
+                         max_wait_s=conf["max_wait_s"], workspace=workspace or _workspace())
     return _emit({"ok": True, **res})
 
 
