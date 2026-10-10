@@ -50,22 +50,30 @@ export async function meetingCueAudio(opts: CueAudioOptions): Promise<string | n
 		const res = await (opts.fetchImpl ?? fetch)(`https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json', 'x-goog-api-key': opts.apiKey },
+			signal: AbortSignal.timeout(15_000),
 			body: JSON.stringify({
 				contents: [{ parts: [{ text: opts.text }] }],
 				generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: opts.voice } } } },
 			}),
 		});
-		if (!res.ok) return null;
+		if (!res.ok) {
+			console.error(`[MeetingCue] TTS render failed: HTTP ${res.status}`);
+			return null;
+		}
 		const body = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ inlineData?: { data?: string } }> } }> };
 		const data = body.candidates?.[0]?.content?.parts?.find((p) => p.inlineData?.data)?.inlineData?.data;
-		if (!data) return null;
+		if (!data) {
+			console.error('[MeetingCue] TTS render failed: no audio in the response');
+			return null;
+		}
 		const wav = pcmToWav(Buffer.from(data, 'base64'));
 		mkdirSync(opts.dir, { recursive: true });
 		const tmp = `${path}.${process.pid}.tmp`;
 		writeFileSync(tmp, wav);
 		renameSync(tmp, path);
 		return wav.toString('base64');
-	} catch {
+	} catch (err) {
+		console.error(`[MeetingCue] TTS render failed: ${err instanceof Error ? err.message : err}`);
 		return null;
 	}
 }

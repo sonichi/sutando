@@ -42,7 +42,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, MEETING_ENTRY_SAY } from './meeting-dictation.js';
+import { announcesMeetingCue, attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY, startMeeting } from './meeting-dictation.js';
 import { meetingCueAudio } from './meeting-cue-audio.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
@@ -435,7 +435,12 @@ function getPendingToolCalls(toolName?: string) {
 let meetingActive = false;
 // Meeting mode is bodhi dictation; set once the session exists.
 let meetingDictation: ReturnType<typeof attachMeetingDictation> | null = null;
+// Entering quiesces audio output, so a model-spoken confirmation waits for its turn to complete.
+const meetingEntry = createMeetingEntryGate({ fallbackMs: 15_000, onFire: () => enterMeetingDictation() });
+// The connected client said it plays the meeting cue itself (client.capabilities); reset per client.
+let clientPlaysMeetingCue = false;
 function noteMeetingState(on: boolean) {
+	if (!on) meetingEntry.cancel();
 	meetingActive = on;
 	voiceWatchdogShadow.noteMeetingMode(on);
 	voiceRecoveryCoordinator?.noteMeetingMode(on);
@@ -446,9 +451,11 @@ let meetingEntrySeq = 0;
 let meetingCueWav: string | null = null;
 function enterMeetingDictation() {
 	const seq = ++meetingEntrySeq;
-	// The confirmation is a fixed cue the web client speaks with the mic muted: spoken by the model,
-	// any sound could cut it off, and the transcriber would write it into the note.
-	try { sessionRef?.sendJsonToClient({ type: 'meeting.cue', text: MEETING_ENTRY_SAY, audio: meetingCueWav ?? undefined } as never); } catch { /* no client */ }
+	// A cue-capable client speaks the confirmation with the mic muted: spoken by the model, any sound
+	// could cut it off, and the transcriber would write it into the note.
+	if (clientPlaysMeetingCue) {
+		try { sessionRef?.sendJsonToClient({ type: 'meeting.cue', text: MEETING_ENTRY_SAY, audio: meetingCueWav ?? undefined } as never); } catch { /* no client */ }
+	}
 	meetingDictation?.enter().catch((err) => {
 		console.error(`${ts()} [MeetingDictation] enter failed: ${err?.message ?? err}`);
 		if (seq !== meetingEntrySeq) return;
@@ -544,8 +551,7 @@ const switchModeTool: ToolDefinition = {
 		writeVoiceModeSentinel();
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
-			enterMeetingDictation();
-			return { status: 'meeting_mode', transcribing: true, instruction: 'Meeting mode is on, and the client has already told the user how to come back. Say nothing.' };
+			return startMeeting({ clientCues: clientPlaysMeetingCue, enter: enterMeetingDictation, gate: meetingEntry });
 		}
 		await meetingDictation?.exit();
 		if (mode === 'presenter') {
@@ -755,6 +761,7 @@ const mainAgent: MainAgent = {
 	// or apology loops) doesn't match. Real farewell responses to
 	// a user "bye" are almost always a short standalone line.
 	onTurnCompleted: async (ctx, _transcript) => {
+		meetingEntry.noteTurnCompleted();
 		// Clear narration speaking flag + capture what Gemini actually said
 		try {
 			const { narrationSpeakingRef, lastSpokenRef } = await import('./recording-state.js');
@@ -1108,6 +1115,7 @@ async function main() {
 		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
 		// makes every forward a no-op.
 		onClientCommand: (message) => {
+			if (announcesMeetingCue(message)) clientPlaysMeetingCue = true;
 			voiceRecoveryCoordinator?.handleClientCommand(message);
 			// Frames the core does not own are offered to optional skills' handlers.
 			if (message?.type !== 'voice.retryUpstream') clientFrames.dispatch(message);
@@ -1117,6 +1125,7 @@ async function main() {
 			voiceRecoveryCoordinator?.handleClientConnected();
 		},
 		onClientDisconnected: () => {
+			clientPlaysMeetingCue = false;
 			// An origin belongs to the client that announced it; the next client announces its own.
 			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
 			setVoiceSessionOrigin(null);

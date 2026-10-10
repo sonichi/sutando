@@ -2113,6 +2113,8 @@ function connectWs() {
     onSessionConfig: function (inRate, outRate) {
       INPUT_RATE = inRate;
       OUTPUT_RATE = outRate;
+      // This page plays the meeting-mode cue itself; a client that does not say so gets the model's line.
+      if (voice) voice.sendClientCommand({ type: 'client.capabilities', capabilities: ['meeting.cue'] });
       dbg('Audio format configured: input=' + INPUT_RATE + 'Hz output=' + OUTPUT_RATE + 'Hz', 'event');
     },
     onProtocolMessage: handleProtocolMessage,
@@ -2730,12 +2732,15 @@ window.toggleWatch = toggleWatch;
 // The meeting-mode confirmation is a fixed cue the page plays itself: the recording in the session's
 // voice when the server has one, else speech synthesis. The mic is muted meanwhile, so no sound can
 // cut it off and the transcriber does not write it into the note.
+var meetingCueSeq = 0;
 function playMeetingCue(text, audio) {
   if (!text) return;
   addSystem(text);
   var canSpeak = !!window.speechSynthesis && typeof SpeechSynthesisUtterance !== 'undefined';
   var canPlay = !!audio && typeof Audio !== 'undefined';
   if (!canSpeak && !canPlay) return;
+  // A newer cue owns the mic: an older one finishing must not unmute it mid-cue.
+  var seq = ++meetingCueSeq;
   var heldMic = !!voice && !muted;
   if (heldMic) voice.setMicMuted(true);
   var released = false;
@@ -2743,7 +2748,7 @@ function playMeetingCue(text, audio) {
     if (released) return;
     released = true;
     // A user who muted during the cue stays muted.
-    if (heldMic && voice && !muted) voice.setMicMuted(false);
+    if (heldMic && voice && !muted && seq === meetingCueSeq) voice.setMicMuted(false);
   }
   function speak() {
     if (!canSpeak) { release(); return; }

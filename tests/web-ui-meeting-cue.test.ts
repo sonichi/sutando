@@ -15,7 +15,7 @@ const { meetingCueAudio, pcmToWav } = await import('../src/meeting-cue-audio.js'
 
 /** Pull the shipped function out of the served page rather than restating it. */
 function extract(): string {
-	const start = CLIENT.indexOf('function playMeetingCue(text, audio)');
+	const start = CLIENT.indexOf('var meetingCueSeq = 0;\nfunction playMeetingCue(text, audio)');
 	assert.notEqual(start, -1, 'playMeetingCue() is gone or renamed');
 	return CLIENT.slice(start, CLIENT.indexOf('\n}\n', start) + 2);
 }
@@ -116,19 +116,37 @@ describe('meeting-mode cue', () => {
 		assert.equal(b.spoken.length, 1, 'a blocked play() falls back too');
 	});
 
+	it('a second cue owns the mic: the first one ending does not unmute it mid-cue', () => {
+		const h = harness();
+		h.play(CUE);
+		h.play(CUE);
+		h.spoken[0].onend?.();
+		assert.deepEqual(h.mic, [true, true], 'the first cue ending leaves it muted for the second');
+		h.spoken[1].onend?.();
+		assert.deepEqual(h.mic, [true, true, false]);
+	});
+
 	it('the page routes a meeting.cue frame to it, with the recording when there is one', () => {
 		assert.match(CLIENT, /msg\.type === 'meeting\.cue'\) \{\s*playMeetingCue\(String\(msg\.text \|\| ''\), typeof msg\.audio === 'string' \? msg\.audio : ''\);/);
 	});
 });
 
-describe('voice agent: the model no longer speaks the confirmation', () => {
-	it('every entry (switch_mode and the menu bar) sends the fixed cue, and switch_mode tells the model to say nothing', () => {
+// Data pins on voice-agent.ts wiring (it runs only inside main()): the behaviour itself is tested
+// through startMeeting / announcesMeetingCue in meeting-dictation.test.ts and playMeetingCue above.
+describe('voice agent wiring (data pins)', () => {
+	it('the cue goes only to a client that announced meeting.cue, and the flag resets with the client', () => {
 		const enter = AGENT.slice(AGENT.indexOf('function enterMeetingDictation()'), AGENT.indexOf('\n}\n', AGENT.indexOf('function enterMeetingDictation()')));
-		assert.match(enter, /sendJsonToClient\(\{ type: 'meeting\.cue', text: MEETING_ENTRY_SAY, audio: meetingCueWav \?\? undefined \}/);
-		assert.match(AGENT, /meetingCueAudio\(\{ apiKey: GEMINI_VOICE_API_KEY, voice: VOICE_NAME, text: MEETING_ENTRY_SAY/, 'rendered in the session voice from the same text');
-		assert.doesNotMatch(AGENT, /Say exactly this, then end your turn/);
+		assert.match(enter, /if \(clientPlaysMeetingCue\) \{\s*try \{ sessionRef\?\.sendJsonToClient\(\{ type: 'meeting\.cue', text: MEETING_ENTRY_SAY, audio: meetingCueWav \?\? undefined \}/);
+		assert.match(AGENT, /if \(announcesMeetingCue\(message\)\) clientPlaysMeetingCue = true;/);
+		assert.match(AGENT, /onClientDisconnected: \(\) => \{\s*clientPlaysMeetingCue = false;/);
+		assert.match(AGENT, /return startMeeting\(\{ clientCues: clientPlaysMeetingCue, enter: enterMeetingDictation, gate: meetingEntry \}\);/);
+		assert.match(AGENT, /meetingEntry\.noteTurnCompleted\(\);/, 'the gate still serves clients that do not play the cue');
 		assert.match(AGENT, /if \(want\) enterMeetingDictation\(\);/, 'the menu-bar path enters through the same function');
-		assert.doesNotMatch(AGENT, /meetingEntry\./, 'no wait for the model\'s turn before transcribing');
+		assert.match(AGENT, /meetingCueAudio\(\{ apiKey: GEMINI_VOICE_API_KEY, voice: VOICE_NAME, text: MEETING_ENTRY_SAY/, 'rendered in the session voice from the same text');
+	});
+
+	it('the page announces meeting.cue once the session is configured', () => {
+		assert.match(CLIENT, /onSessionConfig: function \(inRate, outRate\) \{[\s\S]{0,300}voice\.sendClientCommand\(\{ type: 'client\.capabilities', capabilities: \['meeting\.cue'\] \}\)/);
 	});
 });
 
@@ -162,6 +180,16 @@ describe('meeting cue audio (Gemini TTS, cached)', () => {
 		await meetingCueAudio({ apiKey: 'k', voice: 'Puck', text: CUE + ' ', dir, fetchImpl: ok(calls) });
 		assert.equal(calls.length, 2);
 		assert.equal(readdirSync(dir).filter((f) => f.endsWith('.wav')).length, 2);
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it('a different voice renders anew', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'cue-'));
+		const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+		await meetingCueAudio({ apiKey: 'k', voice: 'Puck', text: CUE, dir, fetchImpl: ok(calls) });
+		await meetingCueAudio({ apiKey: 'k', voice: 'Kore', text: CUE, dir, fetchImpl: ok(calls) });
+		assert.equal(calls.length, 2);
+		assert.match(JSON.stringify(calls[1].body), /"voiceName":"Kore"/);
 		rmSync(dir, { recursive: true, force: true });
 	});
 
