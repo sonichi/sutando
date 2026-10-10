@@ -3,7 +3,9 @@
 order outbox_log uses. Run: python3 tests/agent-room-ops-doc-sync-writer-id.test.py"""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -34,6 +36,16 @@ class WriterId(unittest.TestCase):
         env = {"SUTANDO_WORKER_ID": "  ", "SUTANDO_CORE_ID": "core-air"}
         self.assertEqual(doc_sync.writer_id(None, env), "core-air")
         self.assertEqual(doc_sync.writer_id(None, {}), "unknown")
+
+
+class WriterHelp(unittest.TestCase):
+    def test_the_writer_help_names_the_stamp_order(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            doc_sync.main(["--help"])
+        self.assertEqual(cm.exception.code, 0)
+        help_text = " ".join(out.getvalue().split())
+        self.assertIn("SUTANDO_WORKER_ID, else SUTANDO_CORE_ID, else 'unknown'", help_text)
 
 
 if __name__ == "__main__":
