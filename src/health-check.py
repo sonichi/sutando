@@ -5944,7 +5944,7 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
 
     # Every limit window can page (7d_oi can be the one rejected while 5h/7d sit
     # low); overage is shown but never pages, it is purchase eligibility.
-    from quota_availability import limit_windows as _limit_windows, quota_windows as _quota_windows
+    from quota_availability import classify_limit_state, limit_windows as _limit_windows, quota_windows as _quota_windows
     windows = _quota_windows(headers)
     full = [w for w, (u, st) in _limit_windows(headers).items()
             if st == "rejected" or (u is not None and u >= 0.9)]
@@ -5958,6 +5958,11 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
             "not paging. If THIS core were stuck, its own passes would stop and "
             "quota-telemetry would go stale."
         )
+        return check
+
+    if classify_limit_state(data) == "overage":
+        # A rejected window with extra usage allowed is served, not stuck.
+        check["detail"] = f"core serving on extra usage (status={status}, {_window_summary(windows)})"
         return check
 
     reset = _fmt_quota_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
