@@ -958,7 +958,6 @@ async function main() {
 	const relayAgent = new RelayAgent({
 		submit: submitWorkTask,
 		store: voiceTaskStore,
-		notice: (text) => { if (sessionRef) injectText(sessionRef, text); },
 		log: (msg) => console.log(`${ts()} ${msg}`),
 	});
 
@@ -1359,7 +1358,7 @@ async function main() {
 	// Durable-channel wiring (context drops, note viewing, task results →
 	// session injection) moved verbatim to live-agent-runtime.ts (step 5a-2).
 	// The Cartesia stuck-session fallback is adapter-provided via opts.
-	wireDurableChannels(session, { cartesiaApiKey: CARTESIA_API_KEY, generateSpeech, relay: relayAgent });
+	const durable = wireDurableChannels(session, { cartesiaApiKey: CARTESIA_API_KEY, generateSpeech, relay: relayAgent });
 
 	// P7 D7.3: the transcript cursor lives in the clear helper so every clear
 	// path rebases it with the items array (G-P7-8).
@@ -1638,14 +1637,15 @@ async function main() {
 	// Watch for phone call results and inject into voice conversation
 	const callResultFile = join(CALL_RESULTS_DIR, 'latest-result.json');
 	setInterval(() => {
-		// In a meeting injectText sends nothing, so the file waits until the meeting ends.
+		// In a meeting the file waits on disk: nothing may be spoken, and a restart must not lose it.
 		if (!session.clientConnected || meetingHoldsModel(session) || !existsSync(callResultFile)) return;
 		try {
 			const data = JSON.parse(readFileSync(callResultFile, 'utf-8'));
 			unlinkSync(callResultFile);
 			const transcript = data.transcript ?? 'No transcript available.';
-			console.log(`${ts()} [CallResult] Injecting call result into conversation`);
-			injectText(session, `[System: The phone call just completed. Tell the user this result naturally.]\n\nCall transcript:\n${transcript}`);
+			console.log(`${ts()} [CallResult] Queueing call result for the conversation`);
+			// Same queue as task results, so a call that lands with them is spoken in turn, not over them.
+			durable.enqueue({ text: `[System: The phone call just completed. Tell the user this result naturally.]\n\nCall transcript:\n${transcript}`, framed: true });
 		} catch (err) { console.error(`${ts()} [CallResult] Error:`, err); }
 	}, 2000);
 

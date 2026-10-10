@@ -1,5 +1,5 @@
-// The relay agent: the work subagent that returns each task's result to its call, the voice task
-// table (a durable record of how each result reached the user), and the reconcile rule over it.
+// The relay agent: the work subagent, its result queue (one hand-over at a time, at a pause,
+// confirmed by the model's turn), and the voice task table with the reconcile rule over it.
 // Run: npx tsx --test --test-force-exit tests/relay-agent.test.ts
 import { describe, it, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -13,7 +13,7 @@ process.env.SUTANDO_TEST_MODE = '1';
 const MONTH = new Date().toISOString().slice(0, 7);
 for (const d of ['tasks', 'results', join('tasks', 'archive', MONTH), join('results', 'archive', MONTH), join('state', 'activity')]) mkdirSync(join(TMP, d), { recursive: true });
 
-const { RelayAgent, relayAgentSubagentConfig, createVoiceTaskStore, planReconcile, NOT_PICKED_MS, MAX_REPLAYS } = await import('../src/relay-agent.js');
+const { RelayAgent, relayAgentSubagentConfig, createResultQueue, createVoiceTaskStore, frameBatch, planReconcile, NOT_PICKED_MS, MAX_REPLAYS } = await import('../src/relay-agent.js');
 const { frameTaskResult } = await import('../src/inject-framing.js');
 const tb = await import('../src/task-bridge.js');
 const { _pendingTasksForTest, voiceTaskStore, MISSED_RESULT_NOTE, _forwardOfflineThenArchive, reconcileVoiceTasks, voiceTaskRows, voiceTasksAhead } = tb;
@@ -22,68 +22,164 @@ after(() => rmSync(TMP, { recursive: true, force: true }));
 
 const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-describe('relay agent subagent', () => {
-	function agent(submitted: Record<string, unknown>) {
-		const store = createVoiceTaskStore(join(TMP, `relay-${Math.random()}.json`));
-		const notices: string[] = [];
-		const relay = new RelayAgent({ submit: async () => submitted, store, notice: (t) => notices.push(t) });
-		return { relay, store, notices };
-	}
+/** A queue with no real waiting: every pause is immediate, the session state is a flag. */
+function harness(opts: { ready?: boolean; store?: ReturnType<typeof createVoiceTaskStore> } = {}) {
+	const injected: string[] = [];
+	const fellBack: string[][] = [];
+	const state = { ready: opts.ready ?? true, takes: true };
+	const q = createResultQueue({
+		canInject: () => state.ready,
+		inject: (t) => {
+			if (!state.takes) return false;
+			injected.push(t);
+			return true;
+		},
+		fallback: (items) => fellBack.push(items.map((i) => i.text)),
+		store: opts.store,
+		sleep: async () => {},
+		turnTimeoutMs: 1_000,
+	});
+	return { q, injected, fellBack, state };
+}
 
+describe('result queue', () => {
+	it('two results arriving together go one per turn, each naming the request it answers', async () => {
+		const { q, injected } = harness();
+		q.enqueue({ text: '#5140 is merged.', taskId: 'task-5140', request: 'check PR 5140' });
+		q.enqueue({ text: '#5167 is blocked on CI.', taskId: 'task-5167', request: 'check PR 5167' });
+		await tick(10);
+		assert.equal(injected.length, 1);
+		assert.match(injected[0], /check PR 5140"[\s\S]*#5140 is merged/);
+		q.onTurnEnd();
+		await tick(10);
+		assert.equal(injected.length, 2);
+		assert.match(injected[1], /check PR 5167"[\s\S]*#5167 is blocked on CI/);
+	});
+
+	it('a result arriving while the model answers the previous one waits for that turn to end', async () => {
+		const { q, injected } = harness();
+		q.enqueue({ text: 'first' });
+		await tick(10);
+		q.enqueue({ text: 'second' });
+		await tick(10);
+		assert.equal(injected.length, 1, 'held while the first is being spoken');
+		q.onTurnEnd();
+		await tick(10);
+		assert.equal(injected.length, 2);
+		assert.match(injected[1], /second/);
+	});
+
+	it('an answer the user cut off is handed over once more, then recorded as not confirmed', async () => {
+		const store = createVoiceTaskStore(join(TMP, 'state', 'cut.json'));
+		const { q, injected } = harness({ store });
+		q.enqueue({ text: 'the weather', taskId: 'task-w' });
+		await tick(10);
+		q.onTurnInterrupted();
+		await tick(10);
+		assert.equal(injected.length, 2);
+		q.onTurnInterrupted();
+		await tick(10);
+		assert.equal(injected.length, 2, 'no third try');
+		assert.equal(store.get('task-w')?.delivery, 'injected');
+	});
+
+	it('a finished turn after the hand-over records the result as spoken', async () => {
+		const store = createVoiceTaskStore(join(TMP, 'state', 'spoken.json'));
+		const { q } = harness({ store });
+		q.enqueue({ text: 'done', taskId: 'task-s' });
+		await tick(10);
+		q.onTurnEnd();
+		await tick(10);
+		assert.equal(store.get('task-s')?.delivery, 'spoken');
+	});
+
+	it('a session that cannot take results sends the batch to the fallback and records dm', async () => {
+		const store = createVoiceTaskStore(join(TMP, 'state', 'dm.json'));
+		const { q, injected, fellBack } = harness({ ready: false, store });
+		q.enqueue({ text: 'the car picture', taskId: 'task-car' });
+		await tick(10);
+		assert.deepEqual(injected, []);
+		assert.deepEqual(fellBack, [['the car picture']]);
+		assert.equal(store.get('task-car')?.delivery, 'dm');
+	});
+
+	it('a held queue (meeting) neither injects nor falls back, and sends everything once it ends', async () => {
+		const injected: string[] = [];
+		const fellBack: string[][] = [];
+		const meeting = { on: true };
+		const q = createResultQueue({
+			held: () => meeting.on,
+			canInject: () => true,
+			inject: (t) => injected.push(t),
+				fallback: (items) => fellBack.push(items.map((i) => i.text)),
+			sleep: () => new Promise((r) => setTimeout(r, 1)),
+			heldPollMs: 5,
+		});
+		q.enqueue({ text: 'build done' });
+		q.enqueue({ text: '[System: call done]', framed: true });
+		await tick(50);
+		assert.deepEqual(injected, []);
+		assert.deepEqual(fellBack, [], 'a meeting is not a reason to send it to the DM');
+		meeting.on = false;
+		await tick(50);
+		assert.equal(injected.length, 1);
+		assert.match(injected[0], /2 task results arrived together/);
+		assert.ok(injected[0].includes('[System: call done]') && !injected[0].includes('TASK_RESULT_START>\n[System: call done]'), 'a framed item is not wrapped as a task result');
+	});
+
+	it('each result in a batch names the request it answers, and only the batch ends the turn', () => {
+		const out = frameBatch([{ text: '#5140 merged.', request: 'check PR 5140' }, { text: '#5167 blocked.', request: 'check PR 5167' }]);
+		assert.match(out, /This answers the user's request: "check PR 5140"\.[\s\S]*#5140 merged\.[\s\S]*This answers the user's request: "check PR 5167"\.[\s\S]*#5167 blocked\./);
+		assert.match(out, /Task result 1 of 2[\s\S]*Task result 2 of 2/);
+		assert.equal(out.match(/wait for real input/g)?.length, 1, 'once, in the batch header');
+		assert.match(frameBatch([{ text: 'x', request: 'draw a dog' }]), /This answers the user's request: "draw a dog"\.\]\n\n\[System: Task completed\./);
+	});
+
+	it('one result is framed exactly as before', () => {
+		assert.equal(frameBatch([{ text: 'x' }]), frameTaskResult('x'));
+	});
+});
+
+describe('result queue: a session that refuses the hand-over', () => {
+	it('a refused batch is retried, then sent to the fallback and recorded dm', async () => {
+		const store = createVoiceTaskStore(join(TMP, `refuse-${Math.random()}.json`));
+		const { q, injected, fellBack, state } = harness({ store });
+		state.takes = false;
+		q.enqueue({ text: 'r1', taskId: 'task-r1' });
+		for (let i = 0; i < 20 && fellBack.length === 0; i++) await tick(5);
+		assert.deepEqual(injected, []);
+		assert.deepEqual(fellBack, [['r1']]);
+		assert.equal(store.get('task-r1')?.delivery, 'dm');
+	});
+});
+
+describe('relay agent subagent', () => {
 	it('runs as the persistent work subagent', async () => {
-		const { relay } = agent({ status: 'pending', taskId: 'task-1' });
+		const relay = new RelayAgent({ submit: async () => ({}), store: createVoiceTaskStore(join(TMP, 'sa.json')) });
 		const config = relayAgentSubagentConfig(relay);
 		assert.equal(config.lifetime, 'persistent_session');
 		assert.equal(await config.persistentFactory!('relay-agent', config), relay);
 	});
 
-	it('a work call returns the core result for its task, framed, and records it handed over', async () => {
-		const { relay, store } = agent({ status: 'pending', taskId: 'task-2', queuedAhead: 0, watcherOnline: true, message: 'm' });
-		const call = relay.invoke('Execute tool: work', { task: 'draw a cat' });
-		await tick(0);
-		assert.equal(relay.isWaiting('task-2'), true);
-		assert.equal(relay.offerResult('task-other', 'x'), false, 'a result for another task is not this call\'s');
-		assert.equal(relay.offerResult('task-2', 'a cat'), true);
-		assert.equal(await call, frameTaskResult('a cat'));
-		assert.equal(store.get('task-2')?.delivery, 'injected');
-		assert.equal(relay.offerResult('task-2', 'a cat'), false, 'once only');
+	it('a work call returns its submission status at once: the model says "working on it" as before', async () => {
+		const status = { status: 'pending', taskId: 'task-1', queuedAhead: 1, message: 'Task has been queued. Got it, right after the one I\'m on.' };
+		const relay = new RelayAgent({ submit: async () => status, store: createVoiceTaskStore(join(TMP, 'sb.json')) });
+		assert.deepEqual(JSON.parse(await relay.invoke('Execute tool: work', { task: 'x' })), status);
 	});
 
-	it('a status answer (rejected, duplicate, fast path) is returned at once', async () => {
-		const { relay } = agent({ status: 'duplicate', taskId: 'task-3', message: 'already pending' });
-		assert.match(await relay.invoke('Execute tool: work', { task: 'x' }), /"status":"duplicate"/);
-		assert.equal(relay.isWaiting('task-3'), false);
-	});
-
-	it('the queue position or an offline core is said at submission; the ordinary case says nothing extra', async () => {
-		const ahead = agent({ status: 'pending', taskId: 'task-4', queuedAhead: 2, watcherOnline: true, message: 'Got it, 2 in line.' });
-		void ahead.relay.invoke('w', {}).catch(() => {});
+	it('results go through the relay agent\'s own queue, also ones that land before it is attached', async () => {
+		const store = createVoiceTaskStore(join(TMP, `sc-${Math.random()}.json`));
+		const relay = new RelayAgent({ submit: async () => ({}), store });
+		relay.enqueue({ text: 'early', taskId: 'task-early', request: 'check PR 1' });
+		assert.equal(relay.isInFlight('task-early'), true);
+		const injected: string[] = [];
+		const q = relay.attachDelivery({ canInject: () => true, inject: (t) => { injected.push(t); return true; }, fallback: () => {}, sleep: async () => {}, turnTimeoutMs: 1_000 });
 		await tick(0);
-		assert.equal(ahead.notices.length, 1);
-		assert.match(ahead.notices[0], /Got it, 2 in line\./);
-		const plain = agent({ status: 'pending', taskId: 'task-5', queuedAhead: 0, watcherOnline: true, message: 'm' });
-		void plain.relay.invoke('w', {}).catch(() => {});
+		assert.equal(injected.length, 1);
+		assert.match(injected[0], /This answers the user's request: "check PR 1"/);
+		q.onTurnEnd();
 		await tick(0);
-		assert.equal(plain.notices.length, 0);
-	});
-
-	it('an aborted call leaves the task to the ordinary path: no waiter, nothing recorded', async () => {
-		const { relay, store } = agent({ status: 'pending', taskId: 'task-6', queuedAhead: 0, watcherOnline: true });
-		const ctl = new AbortController();
-		const call = relay.invoke('w', {}, ctl.signal);
-		await tick(0);
-		ctl.abort();
-		await assert.rejects(call, /aborted/);
-		assert.equal(relay.offerResult('task-6', 'late'), false);
-		assert.equal(store.get('task-6')?.delivery, undefined);
-	});
-
-	it('dispose ends every waiting call', async () => {
-		const { relay } = agent({ status: 'pending', taskId: 'task-7', queuedAhead: 0, watcherOnline: true });
-		const call = relay.invoke('w', {});
-		await tick(0);
-		await relay.dispose();
-		await assert.rejects(call, /disposed/);
+		assert.equal(store.get('task-early')?.delivery, 'spoken');
 	});
 });
 
@@ -216,10 +312,26 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 		const got: Array<{ text: string; framed?: boolean }> = [];
 		reconcileVoiceTasks((text, _note, meta) => got.push({ text, framed: meta.framed }), () => false, Date.now() + NOT_PICKED_MS + 1_000);
 		const notice = got.find((g) => g.text.includes('draw a kite'));
-		assert.ok(notice?.framed, 'framed, so delivery does not wrap it as a task result');
+		assert.ok(notice?.framed, 'framed, so the queue does not wrap it as a task result');
 		assert.match(notice!.text, /^\[System: The user's task "draw a kite" has not been picked up by the core/);
-		assert.doesNotMatch(notice!.text, /Task completed/);
+		assert.doesNotMatch(frameBatch([{ text: notice!.text, framed: true }]), /Task completed/);
 		rmSync(join(TMP, 'tasks', `${id}.txt`));
+	});
+
+	it('a task whose offline DM copy is still in results/ is not handed over again (the drain speaks it)', () => {
+		const id = `task-${1_800_000_800_000 + ++seq}`;
+		writeFileSync(join(TMP, 'tasks', 'archive', MONTH, `${id}.txt`), `id: ${id}\nsource: voice\ntask: check PR 9\n`);
+		writeFileSync(join(TMP, 'results', 'archive', MONTH, `${id}.txt`), 'PR 9 status.');
+		voiceTaskStore.add(id, 'check PR 9');
+		voiceTaskStore.set(id, 'dm');
+		const copy = join(TMP, 'results', `proactive-result-${id}-1800000800.txt`);
+		writeFileSync(copy, 'PR 9 status.');
+		const got: string[] = [];
+		reconcileVoiceTasks((text) => got.push(text), () => false);
+		assert.deepEqual(got.filter((t) => t.includes('PR 9')), [], 'the live copy is on its way');
+		rmSync(copy);
+		reconcileVoiceTasks((text) => got.push(text), () => false);
+		assert.equal(got.filter((t) => t.includes('PR 9')).length, 1, 'once the copy is gone, it is owed');
 	});
 
 	it('status rows and the count ahead come from the table: a health check in tasks/ is not one of the user\'s', () => {
@@ -239,15 +351,15 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 });
 
 describe('voice runs every work call through the relay agent', () => {
-	it('work is a background tool mapped to the relay agent subagent, and results reach it first', async () => {
-		const { workTool, WORK_PENDING_MESSAGE } = tb;
-		assert.equal(workTool.execution, 'background');
-		assert.equal(workTool.pendingMessage, WORK_PENDING_MESSAGE);
+	it('work is a background tool mapped to the relay agent subagent, which owns the result queue', () => {
+		assert.equal(tb.workTool.execution, 'background');
+		assert.equal(tb.workTool.pendingMessage, undefined, 'the status is the tool result, not a pending message');
 		const voice = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/voice-agent.ts'), 'utf-8');
 		assert.match(voice, /subagentConfigs: \{ work: relayAgentSubagentConfig\(relayAgent\) \},/);
 		assert.match(voice, /wireDurableChannels\(session, \{ [^}]*relay: relayAgent \}\);/);
 		const runtime = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/live-agent-runtime.ts'), 'utf-8');
-		assert.match(runtime, /if \(meta\?\.taskId && opts\.relay\?\.offerResult\(meta\.taskId, result, deliveryNote\)\)/);
+		assert.match(runtime, /const results = opts\.relay\.attachDelivery\(\{/);
+		assert.match(runtime, /inject: \(text\) => session\.tryPublishSystemNotification\(text\),/);
 	});
 });
 

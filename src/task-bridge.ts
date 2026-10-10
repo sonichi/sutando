@@ -997,7 +997,7 @@ export function queuedAheadInstruction(queuedAhead: number): string {
 	return ` ${queuedAhead} task(s) are still running ahead of this one. Tell the user exactly "${line}" and wait; do not narrate the queue again.`;
 }
 
-/** What the model is told the moment `work` is called; the result follows when the core finishes. */
+/** What the model is told when `work` has queued the task; the result follows when the core finishes. */
 export const WORK_PENDING_MESSAGE = 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.';
 
 export const workTool: ToolDefinition = {
@@ -1028,9 +1028,8 @@ export const workTool: ToolDefinition = {
 				'a timeout DM that shouldn\'t have gone through.'
 			),
 	}),
-	// Runs as the relay agent subagent: the model hears the pending message now, the result when the core finishes.
+	// Runs as the relay agent subagent: its status returns at once; the result comes through the relay's queue.
 	execution: 'background',
-	pendingMessage: WORK_PENDING_MESSAGE,
 	async execute(args) {
 		const { task, timeout_minutes, dm_on_timeout } = args as {
 			task: string;
