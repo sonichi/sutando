@@ -232,6 +232,8 @@ def _main(argv):
     e.add_argument("--once", action="store_true", help="exit after the first event")
     e.add_argument("--max-events", type=int, default=None)
 
+    sub.add_parser("agents", help="list this account's registered agents with owners (/v1/agents)")
+
     p = sub.add_parser("resolve", help="resolve a friendly handle -> agent mxid (via /v1/agents)")
     p.add_argument("handle")
 
@@ -336,6 +338,8 @@ def _main(argv):
         if a.events_cmd == "stream":
             return _events_stream(a)  # prints JSONL itself; summary is one line
         res = _dispatch_events(a)
+    elif a.cmd == "agents":
+        res = _resolve.list_agents()
     elif a.cmd == "resolve":
         res = _resolve.resolve_user(a.handle)
     elif a.cmd == "mention":

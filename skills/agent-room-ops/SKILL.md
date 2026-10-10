@@ -78,7 +78,8 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `send <room> <path>` | outbound file/image upload | discord outbound `[file:]` |
 | `say <room> <text>` | post plain text, pinging **nobody** by design — status lines, an answer to the room; never a hand-off | discord plain channel message |
 | `mention <handle> <text> <room>` | resolve a handle, label or display name to the one mxid (directory → directory narrowed by the room → broker → roster), refuse on ambiguity, post `<mxid> — <text>` with `mentions` — the hand-off tool | discord `<@id>` ping |
-| `members <room>` | who is present (mxid, display name, kind) — the roster to pick from when `mention` finds no match | discord member list |
+| `members <room>` | who is present (mxid, display name, kind), plus `unidentified`: rows dropped for having no user_id — the roster to pick from when `mention` finds no match | discord member list |
+| `agents` | this account's agent registry (`/v1/agents`), each row with its `owner` | — |
 | `react <room> <event>` | add an `m.reaction` (ack) | discord `add_reaction` (👀/✅) |
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
 | `join <room>` | accept the agent's own pending invite | discord guild-join on invite |
