@@ -108,7 +108,7 @@ describe('bodyIsSkipMarked agrees with parse_markers on the leading block', () =
 		} catch (e) {
 			assert.fail(`python3 parse_markers unavailable: ${e}`);
 		}
-		const mismatches = corpus.filter((t, i) => markers.bodyIsSkipMarked(t) !== py[i]).map((t, i) => t);
+		const mismatches = corpus.filter((t, i) => markers.bodyIsSkipMarked(t) !== py[i]);
 		assert.deepEqual(mismatches, [], 'TS and Python disagree');
 	});
 });
