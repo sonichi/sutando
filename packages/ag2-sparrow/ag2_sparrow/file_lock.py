@@ -37,6 +37,19 @@ def lock_fd(fd: int, *, blocking: bool = True) -> None:
             time.sleep(0.05)
 
 
+def try_lock_fd(fd: int) -> bool:
+    """Non-blocking exclusive lock: False when another holder has it (the contention
+    errno differs per backend), any other failure raises."""
+    contended = (errno.EAGAIN, errno.EWOULDBLOCK) if fcntl is not None else (errno.EACCES,)
+    try:
+        lock_fd(fd, blocking=False)
+    except OSError as exc:
+        if exc.errno in contended:
+            return False
+        raise
+    return True
+
+
 def unlock_fd(fd: int) -> None:
     if fcntl is not None:
         fcntl.flock(fd, fcntl.LOCK_UN)

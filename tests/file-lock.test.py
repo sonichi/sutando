@@ -119,6 +119,49 @@ class LockContract(unittest.TestCase):
             file_lock.unlock_fd(42)
             fake.flock.assert_called_with(42, 8)
 
+    def test_try_lock_contends_across_descriptions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "lock")
+            first = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+            second = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                self.assertTrue(file_lock.try_lock_fd(first))
+                self.assertFalse(file_lock.try_lock_fd(second))
+                file_lock.unlock_fd(first)
+                self.assertTrue(file_lock.try_lock_fd(second))
+                file_lock.unlock_fd(second)
+            finally:
+                os.close(first)
+                os.close(second)
+
+    def test_try_lock_posix_classification(self):
+        fake = Mock(LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
+        with patch.object(file_lock, "fcntl", fake):
+            fake.flock.side_effect = BlockingIOError(errno.EWOULDBLOCK, "busy")
+            self.assertFalse(file_lock.try_lock_fd(42))
+            fake.flock.assert_called_once_with(42, 6)
+            fake.flock.side_effect = OSError(errno.EBADF, "bad descriptor")
+            with self.assertRaises(OSError):
+                file_lock.try_lock_fd(42)
+            fake.flock.side_effect = None
+            self.assertTrue(file_lock.try_lock_fd(42))
+
+    def test_try_lock_windows_classification(self):
+        fake = Mock(LK_NBLCK=1, LK_UNLCK=2)
+        with patch.object(file_lock, "fcntl", None), \
+                patch.object(file_lock, "msvcrt", fake, create=True), \
+                patch.object(file_lock.os, "lseek"), \
+                patch.object(file_lock.time, "sleep") as sleep:
+            fake.locking.side_effect = OSError(errno.EACCES, "busy")
+            self.assertFalse(file_lock.try_lock_fd(42))
+            fake.locking.assert_called_once_with(42, fake.LK_NBLCK, 1)
+            sleep.assert_not_called()
+            fake.locking.side_effect = OSError(errno.EINVAL, "bad descriptor")
+            with self.assertRaises(OSError):
+                file_lock.try_lock_fd(42)
+            fake.locking.side_effect = None
+            self.assertTrue(file_lock.try_lock_fd(42))
+
     def test_windows_delegation_and_retry_policy(self):
         fake = Mock(LK_NBLCK=1, LK_UNLCK=2)
         with patch.object(file_lock, "fcntl", None), \
