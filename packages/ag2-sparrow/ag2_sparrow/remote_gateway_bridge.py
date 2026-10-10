@@ -315,6 +315,7 @@ from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
+from .workspace_lock import retain as _ws_retain
 from .workspace_lock import _host_label as _stable_host_label
 
 TASKS_DIR = _task_dir()
@@ -4968,6 +4969,10 @@ def _release_singleton() -> None:
         _log("singleton: a publication is still in flight — holding the lock so "
              "a successor waits for it to go stale instead of having its "
              "advertisement overwritten by this generation")
+        try:
+            _ws_retain(_LOCK_ROLE, _LOCK_WS)  # else our dead pid gets it reaped at once
+        except Exception:
+            pass
         return
     try:
         _ws_release(_LOCK_ROLE, _LOCK_WS)
