@@ -10,7 +10,9 @@ Usage:
     python3 notify.py --task-file "$WORKSPACE/tasks/task-123.txt" --message "On it..."
 
 With --task-file, --source, --channel-id/--chat-id, --thread-root and --thread-ts
-are read from that task file's headers; any of them given explicitly wins.
+are read from that task file's headers; any of them given explicitly wins. A
+--thread-root given for a top-level task is kept beside its task file and reused
+by that task's later notifies.
 
 Any --source other than slack/discord/telegram is treated as a remote-gateway
 channel: the sender reads channels/<source>/.env (under $CLAUDE_CONFIG_DIR) for
@@ -486,6 +488,32 @@ def _derive_from_task_file(path: str) -> dict:
     return {k: v for k, v in out.items() if v}
 
 
+def _thread_choice_path(task_file: str) -> Path:
+    """Beside the task file, never matching `task-*.txt`, so no task scanner reads it."""
+    p = Path(task_file)
+    return p.parent / ".thread-roots" / p.stem
+
+
+def _remember_thread_root(task_file: str, root: str) -> None:
+    """Keep the thread a top-level task was answered in for its later notifies (fail-open)."""
+    path = _thread_choice_path(task_file)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(root, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"[task-progress] thread choice not saved ({e}); pass --thread-root "
+              "on later notifies", file=sys.stderr)
+
+
+def _remembered_thread_root(task_file: str) -> "str | None":
+    try:
+        return _thread_choice_path(task_file).read_text(encoding="utf-8").strip() or None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Send a task-progress update to a channel.")
     parser.add_argument("--task-file", default=None,
@@ -503,9 +531,11 @@ def main() -> int:
     parser.add_argument("--thread-ts", default=None,
                         help="Slack thread timestamp for threaded replies")
     parser.add_argument("--thread-root", default=None,
-                        help="Gateway sources (e.g. ag2space): thread event id ($...) to nest "
-                             "the post in. Only set this when the ask was already in a "
-                             "thread -- threading is a decision, not this script's default.")
+                        help="Gateway sources (e.g. ag2space): thread root event id ($...) to "
+                             "nest the post in: the ask's own thread, or its source_message_id "
+                             "when you answer a top-level ask in a thread. Threading is a "
+                             "decision, not this script's default. With --task-file the root "
+                             "is kept for that task, so its later notifies stay in the thread.")
     parser.add_argument("--reply-to", default=None,
                         help="Gateway sources: event id ($...) this update is about, cited "
                              "in the main timeline (not a thread). Defaults to the task's "
@@ -528,7 +558,13 @@ def main() -> int:
     message = args.message
     explicit_channel = args.channel_id if args.channel_id is not None else args.chat_id
     channel = _pick(explicit_channel, derived.get("channel_id") or derived.get("chat_id"))
-    thread_root = _pick(args.thread_root, derived.get("thread_root"))
+    # The ask's own thread wins; otherwise a root chosen on an earlier notify carries over.
+    file_root = derived.get("thread_root")
+    if args.task_file and not file_root:
+        if args.thread_root:
+            _remember_thread_root(args.task_file, args.thread_root)
+        file_root = _remembered_thread_root(args.task_file)
+    thread_root = _pick(args.thread_root, file_root)
     reply_to = _pick(args.reply_to, derived.get("reply_to"))
     thread_ts = _pick(args.thread_ts, derived.get("thread_ts"))
 

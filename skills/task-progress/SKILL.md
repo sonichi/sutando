@@ -114,6 +114,12 @@ Any of `--source` / `--channel-id` / `--chat-id` / `--thread-root` / `--reply-to
 given explicitly alongside `--task-file` still wins over what the file carries (e.g. to post a
 checkpoint with no citation at all, pass `--reply-to ''`).
 
+To answer a top-level AG2 Space ask in a thread (`[thread: <source_message_id>]` on the result),
+add `--thread-root '<source_message_id>'` to the first notify. The script keeps that root beside
+the task file (`tasks/.thread-roots/<task id>`), so every later `--task-file` notify for the task
+lands in the same thread without the flag. The gateway threads a task result only on its own
+asking message; any other root is posted as an ordinary reply.
+
 ### When there is no task file to point at
 
 Pass the fields by hand — same flags, same meaning:
@@ -128,10 +134,9 @@ python3 $CLAUDE_CONFIG_DIR/skills/task-progress/scripts/notify.py \
 For a Slack @mention (threaded reply), add `--thread-ts <ts>` to keep the update in-thread.
 For AG2 Space, pass the task's own `thread_root:` via `--thread-root '<event id>'` only when
 the ask was already in a thread; otherwise pass `--reply-to '<source_message_id>'` to cite it
-in the main timeline instead. If you will answer a top-level ask in a thread (`[thread: <root>]`
-on the result), decide before the first notify and pass that same root, e.g.
-`--thread-root '<source_message_id>'` to open the thread on the ask. Single-quote the id: it starts with `$`, which double quotes
-would expand. An empty value opts out of that relation.
+in the main timeline instead. To answer a top-level ask in a thread without a task file, pass
+`--thread-root '<source_message_id>'` on every notify. Single-quote the id: it starts with `$`,
+which double quotes would expand. An empty value opts out of that relation.
 
 ### Field mapping from task files
 
