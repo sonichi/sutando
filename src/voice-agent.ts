@@ -958,6 +958,7 @@ async function main() {
 	const relayAgent = new RelayAgent({
 		submit: submitWorkTask,
 		store: voiceTaskStore,
+		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
 		log: (msg) => console.log(`${ts()} ${msg}`),
 	});
 

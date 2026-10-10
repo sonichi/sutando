@@ -1,9 +1,9 @@
-// The relay agent end to end, in its own process: one live runtime reconciles the global task
-// table, as in production (other test files wire several runtimes in one process).
+// The relay agent end to end, in its own process with one live runtime (the result watcher is
+// process-wide, so a second runtime would claim results meant for this one).
 // Run: npx tsx --test --test-force-exit tests/relay-agent-e2e.test.ts
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,116 +15,101 @@ mkdirSync(join(TMP, 'results'), { recursive: true });
 
 const { wireDurableChannels } = await import('../src/live-agent-runtime.js');
 const { RelayAgent } = await import('../src/relay-agent.js');
+const { voiceTaskStore } = await import('../src/task-bridge.js');
 
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
 const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const until = async (done: () => boolean, ms = 10_000) => {
+	for (let w = 0; w < ms / 100 && !done(); w++) await tick(100);
+};
 
-function fakeSession(mode: { value: 'agent' | 'transcription' }) {
-	const sent: string[] = [];
-	const handlers: Record<string, Array<() => void>> = {};
-	return {
-		sent,
-		emit: (event: string) => { for (const h of handlers[event] ?? []) h(); },
-		eventBus: { subscribe: (event: string, h: () => void) => { (handlers[event] ??= []).push(h); } },
-		getTranscriptionMode: () => mode.value,
-		sessionManager: { isActive: true },
-		clientConnected: true,
-		tryPublishSystemNotification(text: string) {
-			if (!this.sessionManager.isActive) return false;
-			sent.push(text);
-			return true;
-		},
-		transport: {
-			session: { sendRealtimeInput: ({ text }: { text: string }) => sent.push(text) },
-			sendContent: (turns: Array<{ text: string }>) => sent.push(turns[0].text),
-		},
-	};
+const sent: string[] = [];
+const handlers: Record<string, Array<(e?: unknown) => void>> = {};
+const session = {
+	emit: (event: string) => { for (const h of handlers[event] ?? []) h({}); },
+	eventBus: { subscribe: (event: string, h: (e?: unknown) => void) => { (handlers[event] ??= []).push(h); } },
+	getTranscriptionMode: () => 'agent',
+	sessionManager: { isActive: true },
+	clientConnected: true,
+	tryPublishSystemNotification(text: string) {
+		if (!this.sessionManager.isActive) return false;
+		sent.push(text);
+		return true;
+	},
+	transport: { sendContent: () => {} },
+};
+let submitted: Record<string, unknown> = {};
+const relay = new RelayAgent({ submit: async () => submitted, store: voiceTaskStore });
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+wireDurableChannels(session as any, { relay, notReadyRetriesMs: [10, 10], reconcileMs: 300 });
+
+let seq = 0;
+/** A voice task the core is working on: its task file, and its row in the table. */
+function voiceTask(text: string): string {
+	const id = `task-19000${String(++seq).padStart(8, '0')}`;
+	writeFileSync(join(TMP, 'tasks', `${id}.txt`), `id: ${id}\nsource: voice\ntask: ${text}\n`);
+	voiceTaskStore.add(id, text);
+	return id;
 }
+const heard = (id: string) => ['spoken', 'injected'].includes(voiceTaskStore.get(id)?.delivery ?? '');
 
-describe('relay agent end to end: results lost in a reconnect come back', () => {
-	it('three PR results fall back to the DM while the session reconnects; once it can speak, all three are handed over', async () => {
-		const { voiceTaskStore } = await import('../src/task-bridge.js');
-		const month = new Date().toISOString().slice(0, 7);
-		mkdirSync(join(TMP, 'results', 'archive', month), { recursive: true });
-		mkdirSync(join(TMP, 'tasks', 'archive', month), { recursive: true });
-		const mode = { value: 'agent' as 'agent' | 'transcription' };
-		const s = fakeSession(mode);
-		s.sessionManager.isActive = false;   // the reconnect outlasts the wait
-		const relay = new RelayAgent({ submit: async () => ({}), store: voiceTaskStore });
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const durable = wireDurableChannels(s as any, { relay, notReadyRetriesMs: [10, 10], reconcileMs: 200 });
-		const ids = ['3509', '5140', '5167'].map((pr) => `task-19000000${pr}`);
-		for (const [i, pr] of ['3509', '5140', '5167'].entries()) {
-			const id = ids[i];
-			writeFileSync(join(TMP, 'tasks', 'archive', month, `${id}.txt`), `id: ${id}\nsource: voice\ntask: check PR ${pr}\n`);
-			writeFileSync(join(TMP, 'results', 'archive', month, `${id}.txt`), `PR ${pr} status.`);
-			voiceTaskStore.add(id, `check PR ${pr}`);
-			durable.enqueue({ text: `PR ${pr} status.`, taskId: id });
-		}
-		await tick(2_500);
-		assert.deepEqual(s.sent, [], 'nothing spoken while the session is down');
-		assert.deepEqual(ids.map((id) => voiceTaskStore.get(id)?.delivery), ['dm', 'dm', 'dm']);
-		s.sessionManager.isActive = true;   // the reconnect completes
-		// The watcher reads the DM copies back; whatever is waiting together goes in one hand-over per turn.
-		const heard = () => ['3509', '5140', '5167'].filter((pr) => s.sent.join('\n').includes(`PR ${pr} status`));
-		for (let w = 0; w < 80 && heard().length < 3; w++) {
-			await tick(100);
-			if (w % 5 === 4) s.emit('turn.end');
-		}
-		assert.deepEqual(heard(), ['3509', '5140', '5167'], 'all three handed over');
-		assert.match(s.sent.join('\n'), /did not hear this result/);
-		// One DM copy per result: a result already sent to the DM is not copied again while voice is down.
-		const copies = readdirSync(join(TMP, 'results', 'archive', month)).filter((f) => f.startsWith('proactive-result-'));
-		assert.ok(copies.length <= 3, `at most one copy per result, got ${copies.length}`);
+describe('relay agent end to end', () => {
+	it('the result returns through its waiting work call and is not injected', async () => {
+		const id = voiceTask('draw a cat');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'draw a cat' });
+		await tick(0);
+		const before = sent.length;
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Here is the cat.');
+		const out = await Promise.race([call, tick(8_000).then(() => 'timed out')]);
+		assert.match(out, /"draw a cat"[\s\S]*Here is the cat\./);
+		await tick(1_000);
+		assert.equal(sent.length, before, 'returned through the call, never injected');
+		assert.ok(heard(id));
 	});
 
-	it('a result already sent to the DM is not copied again when it falls back a second time', async () => {
-		const { voiceTaskStore } = await import('../src/task-bridge.js');
-		const mode = { value: 'agent' as 'agent' | 'transcription' };
-		const s = fakeSession(mode);
-		s.sessionManager.isActive = false;
-		const relay = new RelayAgent({ submit: async () => ({}), store: voiceTaskStore });
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const durable = wireDurableChannels(s as any, { relay, notReadyRetriesMs: [10, 10], reconcileMs: 600_000 });
-		const id = 'task-1900000009999';
-		voiceTaskStore.add(id, 'check PR 9999');
-		const copiesOf = () => readdirSync(join(TMP, 'results')).filter((f) => f.startsWith(`proactive-result-${id}-`)).length;
-		durable.enqueue({ text: 'PR 9999 status.', taskId: id });
-		for (let i = 0; i < 100 && copiesOf() === 0; i++) await tick(50);
-		assert.equal(copiesOf(), 1);
-		assert.equal(voiceTaskStore.get(id)?.delivery, 'dm');
-		durable.enqueue({ text: 'PR 9999 status.', taskId: id });
-		await tick(3_500);
-		assert.equal(copiesOf(), 1, 'the second fallback writes no second copy');
+	it('after a fresh connection (reconnect boundary) the result is delivered as a notice instead', async () => {
+		const id = voiceTask('draw a dog');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'draw a dog' });
+		await tick(0);
+		session.emit('session.reconnectBoundary');
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Here is the dog.');
+		assert.match(await call, /delivered_separately/);
+		await until(() => sent.some((t) => t.includes('Here is the dog.')));
+		assert.ok(sent.some((t) => /"draw a dog"[\s\S]*Here is the dog\./.test(t)));
+		assert.ok(heard(id));
 	});
-});
 
-describe('relay agent end to end: three requests the core answered in one result', () => {
-	it('all three requests are named to the model, and every row ends heard', async () => {
-		const { voiceTaskStore } = await import('../src/task-bridge.js');
-		const mode = { value: 'agent' as 'agent' | 'transcription' };
-		const s = fakeSession(mode);
-		const relay = new RelayAgent({ submit: async () => ({}), store: voiceTaskStore });
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		wireDurableChannels(s as any, { relay, notReadyRetriesMs: [10, 10], reconcileMs: 300 });
-		const ids = ['5308', '5309', '5310'].map((pr) => `task-18999${pr}`);
-		for (const [n, pr] of ['5308', '5309', '5310'].entries()) {
-			writeFileSync(join(TMP, 'tasks', `${ids[n]}.txt`), `id: ${ids[n]}\nsource: voice\ntask: check PR ${pr}\n`);
-			voiceTaskStore.add(ids[n], `check PR ${pr}`);
-		}
-		// The core answers all three in the first task's result and dedups the other two into it.
+	it('three requests the core answered in one result: all three named to the model, every row heard', async () => {
+		const ids = ['5308', '5309', '5310'].map((pr) => voiceTask(`check PR ${pr}`));
 		writeFileSync(join(TMP, 'results', `${ids[1]}.txt`), `[deduped: ${ids[0]}]`);
 		writeFileSync(join(TMP, 'results', `${ids[2]}.txt`), `[deduped: ${ids[0]}]`);
-		writeFileSync(join(TMP, 'results', `${ids[0]}.txt`), 'All three: 5308 merged; 5309 ready to merge; 5310 blocked.');
-		const named = () => ['5308', '5309', '5310'].filter((pr) => s.sent.join('\n').includes(`"check PR ${pr}"`));
-		for (let w = 0; w < 120 && (named().length < 3 || ids.some((id) => !['spoken', 'injected'].includes(voiceTaskStore.get(id)?.delivery ?? ''))); w++) {
-			await tick(100);
-			if (w % 5 === 4) s.emit('turn.end');
-		}
+		writeFileSync(join(TMP, 'results', `${ids[0]}.txt`), 'All three: 5308 merged; 5309 ready; 5310 blocked.');
+		const named = () => ['5308', '5309', '5310'].filter((pr) => sent.join('\n').includes(`"check PR ${pr}"`));
+		await until(() => named().length === 3 && ids.every(heard), 15_000);
 		assert.deepEqual(named(), ['5308', '5309', '5310'], 'every request named to the model');
-		assert.ok(s.sent.every((t) => !t.includes('[deduped:')), 'a dedup marker is never spoken');
+		assert.ok(sent.every((t) => !t.includes('[deduped:')), 'a dedup marker is never spoken');
 		assert.deepEqual(ids.map((id) => voiceTaskStore.get(id)?.answeredBy), [undefined, ids[0], ids[0]]);
-		for (const id of ids) assert.ok(['spoken', 'injected'].includes(voiceTaskStore.get(id)?.delivery ?? ''), `${id} heard`);
+		assert.ok(ids.every(heard));
+	});
+
+	it('a session that cannot take a result leaves one DM copy; a second fallback writes none', async () => {
+		session.sessionManager.isActive = false;
+		const id = voiceTask('check PR 9999');
+		const copies = () => readdirSync(join(TMP, 'results')).filter((f) => f.startsWith(`proactive-result-${id}-`)).length;
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 9999 status.');
+		await until(() => copies() === 1);
+		assert.equal(copies(), 1);
+		await until(() => voiceTaskStore.get(id)?.delivery === 'dm');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'dm');
+		// The copy read back while the session is still down is not copied again.
+		await tick(3_000);
+		assert.ok(readdirSync(join(TMP, 'results')).filter((f) => f.startsWith(`proactive-result-${id}-`)).length <= 1);
+		session.sessionManager.isActive = true;
+		await until(() => sent.some((t) => t.includes('PR 9999 status.')), 15_000);
+		assert.ok(sent.some((t) => t.includes('PR 9999 status.')), 'spoken once the session can');
+		assert.ok(existsSync(join(TMP, 'results')));
 	});
 });

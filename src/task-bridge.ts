@@ -1031,8 +1031,9 @@ export const workTool: ToolDefinition = {
 				'a timeout DM that shouldn\'t have gone through.'
 			),
 	}),
-	// Runs as the relay agent subagent: its status returns at once; the result comes through the relay's queue.
+	// Runs as the relay agent subagent, an async (NON_BLOCKING) call whose response is the result.
 	execution: 'background',
+	behavior: 'NON_BLOCKING',
 	async execute(args) {
 		const { task, timeout_minutes, dm_on_timeout } = args as {
 			task: string;
