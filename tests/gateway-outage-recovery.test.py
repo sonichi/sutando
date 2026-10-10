@@ -199,6 +199,38 @@ class RecoveryTest(unittest.TestCase):
         self.assertEqual(len(self.server.replies), 1)
         self.assertFalse(inflight)
 
+    def test_a_later_body_after_an_ambiguous_park_is_quarantined_naming_the_refusal(self):
+        """After an ambiguous park the outbox refuses a later body for the id;
+        the quarantine line names that refusal and the parked body's reason."""
+        core = self.bridge()
+        self.task(HOLDER)
+        result = self.results / f'{HOLDER}.txt'
+        result.write_text('Existing answer')
+        self.server.available_at += 900
+        inflight = {HOLDER}
+        gw._post_ready_results(inflight)
+        for _ in range(4):
+            self.next_attempt()
+            gw._post_ready_results(inflight)
+        deadline = outbox.read_item(self.outbox, HOLDER)['retry']['deadline']
+        with patch.object(gw, '_DELIVERY_CORE', self.core()):
+            self.server.now = deadline
+            gw._post_ready_results(inflight)
+        self.assertEqual(outbox.read_item(self.outbox, HOLDER)['reason'], 'retry-window-exhausted')
+        self.server.now = self.server.available_at
+        result.write_text('A later, different answer')
+        inflight = {HOLDER}
+        with patch.object(gw, '_DELIVERY_CORE', self.core()), patch.object(gw, '_log') as log:
+            gw._post_ready_results(inflight)
+        lines = [c.args[0] for c in log.call_args_list if HOLDER in str(c.args[0])]
+        named = [ln for ln in lines if 'a later, different result for a parked outbox id is refused' in ln]
+        self.assertEqual(len(named), 1, lines)
+        self.assertIn('retry-window-exhausted', named[0])
+        self.assertIn('quarantined to undelivered/', named[0])
+        self.assertFalse(result.exists())
+        self.assertEqual(len(self.server.replies), 0, 'no POST for the refused body')
+        self.assertEqual(outbox.read_item(self.outbox, HOLDER)['status'], 'PARKED')
+
     def test_permanent_failures_park_immediately(self):
         for code in (400, 404, 409, 410, 422):
             with self.subTest(code=code):

@@ -58,6 +58,9 @@ class DrainResult:
     status: DrainStatus
     outcome: Optional[DeliveryOutcome] = None   # set iff status is ATTEMPTED
     detail: str = ""
+    # sha256 of the bytes this attempt handed the provider (the stored body),
+    # so a caller can tell whether the body it published is the one that went.
+    dispatched_digest: Optional[str] = None
 
     def __post_init__(self):
         attempted = self.status is DrainStatus.ATTEMPTED
@@ -176,7 +179,15 @@ class ClaimBackend(Protocol):
     def capabilities(self) -> BackendCapabilities: ...
 
     def publish(self, item_id: str, payload: bytes) -> bool:
-        """True = newly published; False = this id is already live.
+        """True = newly published; False = this id is already live, or parked.
+
+        A park is final for every payload, the parked one and any later,
+        different one, until an operator requeues the parked body or restores
+        a quarantined one; admitting a later body after a definite refusal is
+        deferred until attempt evidence survives version skew. A caller must
+        keep a refused payload visible (quarantine it, naming the cause) and
+        must archive a result only when the payload the outbox confirmed is
+        that result's payload.
 
         Durable backends may expose payload_for_claim(token) so the core sends
         the original published bytes rather than a rebuilt caller payload.

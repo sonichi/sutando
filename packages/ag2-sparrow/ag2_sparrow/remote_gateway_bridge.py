@@ -4420,6 +4420,17 @@ def _worker_of(task_id: str) -> str:
     return claimants.pop() if len(claimants) == 1 else ""
 
 
+def _record_holds_payload(record: dict, payload: bytes) -> bool:
+    """The outbox record stores the body this caller asked to publish."""
+    text = record.get("payload")
+    return isinstance(text, str) and text.encode("utf-8") == payload
+
+
+def _other_body_why(record: dict, what: str) -> str:
+    return (f"a later, different result for a {str(record.get('status') or 'live').lower()} "
+            f"outbox id is refused ({what})")
+
+
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
                             no_send: bool = False, result_file=None) -> bool:
     """One outbound result POST through the delivery core. True = the
@@ -4460,11 +4471,21 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     if res.status is DrainStatus.TERMINAL:
         record = read_item(core.backend.root, item_id) or {}
         if record.get("status") == "DELIVERED":
-            return True
+            if _record_holds_payload(record, payload):
+                return True
+            why = _other_body_why(record, "a different body was delivered under this id")
+            if result_file is not None:
+                _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id)
+            else:
+                _log(f"result {tid}: {why} — not retrying")
+            return False
         # The outbox has decided this item; no pass will ever claim it again,
         # so retrying logs forever and hides the failure behind "will retry".
         why = (f"outbox item is terminal: {record.get('reason')} after "
                f"{core.backend.attempts(item_id)} attempt(s)")
+        if not _record_holds_payload(record, payload):
+            # The park's reason describes the parked body, not this one.
+            why = _other_body_why(record, f"the parked body: {why}")
         if result_file is not None:
             _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id)
         else:
@@ -4480,6 +4501,17 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
              f"next={retry.get('next_attempt_at')}, deadline={retry.get('deadline')})")
         return False
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
+        sent = getattr(res, "dispatched_digest", None)
+        if sent is not None and sent != hashlib.sha256(payload).hexdigest():
+            # The outbox sends its stored body; this one was refused
+            # and must stay visible, never archived as if it had gone out.
+            record = read_item(core.backend.root, item_id) or {}
+            why = _other_body_why(record, "the outbox sent its stored body, not this one")
+            if result_file is not None:
+                _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id)
+            else:
+                _log(f"result {tid}: {why} — not retrying")
+            return False
         _ENGINE_COUNTS["core_confirmed"] += 1
         # A confirmed send was otherwise silent, so nothing on the happy path
         # told a live round trip apart from the legacy one it replaces.
