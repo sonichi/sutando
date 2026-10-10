@@ -106,6 +106,7 @@ def main() -> int:
     p = posts[0] if posts else {}
     check(p.get("room_id") == OWNER_DM, f"e) dm-only keeps the owner DM, got {p.get('room_id')!r}")
     check(p.get("body") == "private", f"e) body clean, got {p.get('body')!r}")
+    check(p.get("thread_root") == ROOT, f"e) thread_root survives dm-only, got {p.get('thread_root')!r}")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0
