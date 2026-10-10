@@ -16,6 +16,10 @@ mkdirSync(join(TMP, 'results'), { recursive: true });
 
 const { injectText, injectSilentContext } = await import('../src/browser-tools.js');
 const { wireDurableChannels } = await import('../src/live-agent-runtime.js');
+const { RelayAgent } = await import('../src/relay-agent.js');
+const { voiceTaskStore } = await import('../src/task-bridge.js');
+/** The relay agent owning the result queue, as voice-agent wires it. */
+const relay = () => new RelayAgent({ submit: async () => ({}), store: voiceTaskStore });
 
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
@@ -31,6 +35,8 @@ function fakeSession(mode: { value: 'agent' | 'transcription' }) {
 		getTranscriptionMode: () => mode.value,
 		sessionManager: { isActive: true },
 		clientConnected: true,
+		// The relay queue hands results over through the session's notification path.
+		tryPublishSystemNotification: (text: string) => { sent.push(text); return true; },
 		transport: {
 			session: { sendRealtimeInput: ({ text }: { text: string }) => sent.push(text) },
 			sendContent: (turns: Array<{ text: string }>) => sent.push(turns[0].text),
@@ -55,7 +61,7 @@ describe('meeting mode holds direct model input', () => {
 		const mode = { value: 'transcription' as 'agent' | 'transcription' };
 		const s = fakeSession(mode);
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		wireDurableChannels(s as any);
+		wireDurableChannels(s as any, { relay: relay() });
 		writeFileSync(join(TMP, 'results', 'task-1.txt'), 'Health check: all services up.');
 		await tick(5_000);
 		assert.deepEqual(s.sent, [], 'nothing reaches the model during the meeting');
@@ -65,26 +71,25 @@ describe('meeting mode holds direct model input', () => {
 		assert.match(s.sent[0], /Health check: all services up\./);
 	});
 
-	it('after a meeting, the summary, a held task result and a call result are spoken in turn, not over each other', async () => {
+	it('after a meeting, the held task result and call result are both handed over, none to the DM', async () => {
 		const mode = { value: 'transcription' as 'agent' | 'transcription' };
 		const s = fakeSession(mode);
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const durable = wireDurableChannels(s as any);
+		const durable = wireDurableChannels(s as any, { relay: relay() });
 		// Straight into the queue: the watcher started by the test above would claim a result file.
 		durable.enqueue({ text: 'Test result: the build finished successfully.', taskId: 'task-2' });
 		durable.enqueue({ text: '[System: The phone call just completed.]\n\nCall transcript:\nThe dentist confirmed Tuesday at 3 pm.', framed: true });
 		await tick(5_000);
 		assert.deepEqual(s.sent, [], 'nothing reaches the model during the meeting');
+		// When the model may speak is bodhi's: its notification path delivers after the current turn.
 		mode.value = 'agent';
-		s.emit('turn.start');   // the meeting summary is being spoken
-		await tick(6_000);
-		assert.deepEqual(s.sent, [], 'nothing cuts into the summary');
-		s.emit('turn.end');
-		await tick(8_000);
-		assert.equal(s.sent.length, 1, 'one hand-over, after a pause');
-		assert.match(s.sent[0], /2 task results arrived together/);
-		assert.match(s.sent[0], /the build finished successfully/);
-		assert.match(s.sent[0], /The dentist confirmed Tuesday at 3 pm/);
+		for (let w = 0; w < 40 && !s.sent.join('\n').includes('Tuesday at 3 pm'); w++) {
+			await tick(250);
+			s.emit('turn.end');
+		}
+		const all = s.sent.join('\n');
+		assert.match(all, /the build finished successfully/);
+		assert.match(all, /The dentist confirmed Tuesday at 3 pm/);
 	});
 });
 
@@ -104,7 +109,7 @@ describe('results the session cannot take', () => {
 		const s = fakeSession(mode);
 		s.sessionManager.isActive = false;   // reconnecting, and it does not come back
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const durable = wireDurableChannels(s as any, { notReadyRetriesMs: [10, 10] });
+		const durable = wireDurableChannels(s as any, { relay: relay(), notReadyRetriesMs: [10, 10] });
 		for (const pr of ['3509', '5140', '5167']) durable.enqueue({ text: `PR ${pr} status`, taskId: `task-${pr}` });
 		durable.enqueue({ text: '[System: The phone call just completed.]\n\nCall transcript:\nfirst call', framed: true });
 		durable.enqueue({ text: '[System: The phone call just completed.]\n\nCall transcript:\nsecond call', framed: true });
@@ -127,7 +132,7 @@ describe('results the session cannot take', () => {
 		const s = fakeSession(mode);
 		s.sessionManager.isActive = false;
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const durable = wireDurableChannels(s as any, { notReadyRetriesMs: Array(20).fill(200) });
+		const durable = wireDurableChannels(s as any, { relay: relay(), notReadyRetriesMs: Array(20).fill(200) });
 		durable.enqueue({ text: 'PR 4200 status', taskId: 'task-4200' });
 		await tick(3_000);
 		s.sessionManager.isActive = true;   // the reconnect completes

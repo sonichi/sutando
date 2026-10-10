@@ -42,7 +42,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY } from './meeting-dictation.js';
+import { attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY, restoreAfterFreshConnection } from './meeting-dictation.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
@@ -59,7 +59,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { voiceTaskRows, workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, publishResultFile } from './task-bridge.js';
+import { voiceTaskRows, workTool, submitWorkTask, voiceTaskStore, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile } from './task-bridge.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -71,6 +71,7 @@ import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLoc
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
+import { RelayAgent, relayAgentSubagentConfig } from './relay-agent.js';
 import {
 	classifyTransportClose,
 	fatalCloseForRecovery,
@@ -487,7 +488,7 @@ const getTaskStatus: ToolDefinition = {
 	execute: async () => {
 		// The relay agent's table, the same source as the in-line count and get_core_status.
 		const rows = voiceTaskRows();
-		const open = rows.filter((r) => r.state === 'queued' || r.state === 'started' || r.state === 'cancel_requested');
+		const open = rows.filter((r) => r.state === 'queued' || r.state === 'started');
 		// Counts and states only: a yes/no "in progress" flag was read as "all of them are being worked on".
 		return {
 			openTasks: open.length,
@@ -953,12 +954,22 @@ async function main() {
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
 
+	// The relay agent runs every `work` call as a bodhi subagent: submit, then return the core's result.
+	const relayAgent = new RelayAgent({
+		submit: submitWorkTask,
+		store: voiceTaskStore,
+		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
+		log: (msg) => console.log(`${ts()} ${msg}`),
+	});
+	setVoiceTaskEndedListener((taskId, why) => { relayAgent.endCall(taskId, why); });
+
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
 		userId: 'user',
 		apiKey: GEMINI_VOICE_API_KEY,
 		agents: [mainAgent],
 		initialAgent: 'main',
+		subagentConfigs: { work: relayAgentSubagentConfig(relayAgent) },
 		port: PORT,
 		host: HOST,
 		model: google(VOICE_MODEL),
@@ -1095,13 +1106,15 @@ async function main() {
 	sessionRef = session;
 	meetingDictation = attachMeetingDictation({
 		session: session as any,
-		notePathFor: (today) => sharedPersonalPath(`notes/meeting-${today}.md`, WORKSPACE_DIR),
+		notePathFor: (stamp) => sharedPersonalPath(`notes/meeting-${stamp}.md`, WORKSPACE_DIR),
 		onExitByVoice: () => {
 			noteMeetingState(false);
 			writeVoiceModeSentinel();
 		},
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
+	// A fresh provider connection keeps only the recent conversation: meeting dictation restores the rest.
+	restoreAfterFreshConnection(session.eventBus, meetingDictation);
 
 	// P7 D7.1: install the session-layer ledger wraps (audio ingress count +
 	// ingress-RMS speech tracker, audio_health heartbeat intercept, egress
@@ -1349,7 +1362,7 @@ async function main() {
 	// Durable-channel wiring (context drops, note viewing, task results →
 	// session injection) moved verbatim to live-agent-runtime.ts (step 5a-2).
 	// The Cartesia stuck-session fallback is adapter-provided via opts.
-	const durable = wireDurableChannels(session, { cartesiaApiKey: CARTESIA_API_KEY, generateSpeech });
+	const durable = wireDurableChannels(session, { cartesiaApiKey: CARTESIA_API_KEY, generateSpeech, relay: relayAgent });
 
 	// P7 D7.3: the transcript cursor lives in the clear helper so every clear
 	// path rebases it with the items array (G-P7-8).

@@ -1,9 +1,9 @@
-// The relay agent end to end, in its own process: one live runtime reconciles the global task
-// table, as in production (other test files wire several runtimes in one process).
+// The relay agent end to end, in its own process with one live runtime (the result watcher is
+// process-wide, so a second runtime would claim results meant for this one).
 // Run: npx tsx --test --test-force-exit tests/relay-agent-e2e.test.ts
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -14,54 +14,106 @@ mkdirSync(join(TMP, 'tasks'), { recursive: true });
 mkdirSync(join(TMP, 'results'), { recursive: true });
 
 const { wireDurableChannels } = await import('../src/live-agent-runtime.js');
+const { RelayAgent } = await import('../src/relay-agent.js');
+const { voiceTaskStore, setVoiceTaskEndedListener } = await import('../src/task-bridge.js');
 
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
 const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const until = async (done: () => boolean, ms = 10_000) => {
+	for (let w = 0; w < ms / 100 && !done(); w++) await tick(100);
+};
 
-function fakeSession(mode: { value: 'agent' | 'transcription' }) {
-	const sent: string[] = [];
-	const handlers: Record<string, Array<() => void>> = {};
-	return {
-		sent,
-		emit: (event: string) => { for (const h of handlers[event] ?? []) h(); },
-		eventBus: { subscribe: (event: string, h: () => void) => { (handlers[event] ??= []).push(h); } },
-		getTranscriptionMode: () => mode.value,
-		sessionManager: { isActive: true },
-		clientConnected: true,
-		transport: {
-			session: { sendRealtimeInput: ({ text }: { text: string }) => sent.push(text) },
-			sendContent: (turns: Array<{ text: string }>) => sent.push(turns[0].text),
-		},
-	};
+const sent: string[] = [];
+const handlers: Record<string, Array<(e?: unknown) => void>> = {};
+const session = {
+	emit: (event: string) => { for (const h of handlers[event] ?? []) h({}); },
+	eventBus: { subscribe: (event: string, h: (e?: unknown) => void) => { (handlers[event] ??= []).push(h); } },
+	getTranscriptionMode: () => 'agent',
+	sessionManager: { isActive: true },
+	clientConnected: true,
+	tryPublishSystemNotification(text: string) {
+		if (!this.sessionManager.isActive) return false;
+		sent.push(text);
+		return true;
+	},
+	transport: { sendContent: () => {} },
+};
+let submitted: Record<string, unknown> = {};
+const relay = new RelayAgent({ submit: async () => submitted, store: voiceTaskStore });
+setVoiceTaskEndedListener((taskId, why) => { relay.endCall(taskId, why); });
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+wireDurableChannels(session as any, { relay, notReadyRetriesMs: [10, 10], reconcileMs: 300 });
+
+let seq = 0;
+/** A voice task the core is working on: its task file, and its row in the table. */
+function voiceTask(text: string): string {
+	const id = `task-19000${String(++seq).padStart(8, '0')}`;
+	writeFileSync(join(TMP, 'tasks', `${id}.txt`), `id: ${id}\nsource: voice\ntask: ${text}\n`);
+	voiceTaskStore.add(id, text);
+	return id;
 }
+const heard = (id: string) => ['spoken', 'injected'].includes(voiceTaskStore.get(id)?.delivery ?? '');
 
-describe('relay agent end to end: results lost in a reconnect come back', () => {
-	it('three PR results fall back to the DM while the session reconnects; once it can speak, all three are handed over', async () => {
-		const { voiceTaskStore } = await import('../src/task-bridge.js');
-		const month = new Date().toISOString().slice(0, 7);
-		mkdirSync(join(TMP, 'results', 'archive', month), { recursive: true });
-		mkdirSync(join(TMP, 'tasks', 'archive', month), { recursive: true });
-		const mode = { value: 'agent' as 'agent' | 'transcription' };
-		const s = fakeSession(mode);
-		s.sessionManager.isActive = false;   // the reconnect outlasts the wait
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const durable = wireDurableChannels(s as any, { notReadyRetriesMs: [10, 10], reconcileMs: 200 });
-		const ids = ['3509', '5140', '5167'].map((pr) => `task-19000000${pr}`);
-		for (const [i, pr] of ['3509', '5140', '5167'].entries()) {
-			const id = ids[i];
-			writeFileSync(join(TMP, 'tasks', 'archive', month, `${id}.txt`), `id: ${id}\nsource: voice\ntask: check PR ${pr}\n`);
-			writeFileSync(join(TMP, 'results', 'archive', month, `${id}.txt`), `PR ${pr} status.`);
-			voiceTaskStore.add(id, `check PR ${pr}`);
-			durable.enqueue({ text: `PR ${pr} status.`, taskId: id });
-		}
-		await tick(2_500);
-		assert.deepEqual(s.sent, [], 'nothing spoken while the session is down');
-		assert.deepEqual(ids.map((id) => voiceTaskStore.get(id)?.delivery), ['dm', 'dm', 'dm']);
-		s.sessionManager.isActive = true;   // the reconnect completes
-		await tick(6_000);                    // the watcher reads the DM copies back, then a gather and a pause
-		assert.equal(s.sent.length, 1, 'one hand-over');
-		for (const pr of ['3509', '5140', '5167']) assert.match(s.sent[0], new RegExp(`PR ${pr} status`));
-		assert.match(s.sent[0], /did not hear this result/);
+describe('relay agent end to end', () => {
+	it('the result returns through its waiting work call and is not injected', async () => {
+		const id = voiceTask('draw a cat');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'draw a cat' });
+		await tick(0);
+		const before = sent.length;
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Here is the cat.');
+		const out = await Promise.race([call, tick(8_000).then(() => 'timed out')]);
+		assert.match(out, /"draw a cat"[\s\S]*Here is the cat\./);
+		await tick(1_000);
+		assert.equal(sent.length, before, 'returned through the call, never injected');
+		assert.ok(heard(id));
+	});
+
+	it('three requests the core answered in one result: all three named to the model, every row heard', async () => {
+		const ids = ['5308', '5309', '5310'].map((pr) => voiceTask(`check PR ${pr}`));
+		writeFileSync(join(TMP, 'results', `${ids[1]}.txt`), `[deduped: ${ids[0]}]`);
+		writeFileSync(join(TMP, 'results', `${ids[2]}.txt`), `[deduped: ${ids[0]}]`);
+		writeFileSync(join(TMP, 'results', `${ids[0]}.txt`), 'All three: 5308 merged; 5309 ready; 5310 blocked.');
+		const named = () => ['5308', '5309', '5310'].filter((pr) => sent.join('\n').includes(`"check PR ${pr}"`));
+		await until(() => named().length === 3 && ids.every(heard), 15_000);
+		assert.deepEqual(named(), ['5308', '5309', '5310'], 'every request named to the model');
+		assert.ok(sent.every((t) => !t.includes('[deduped:')), 'a dedup marker is never spoken');
+		assert.deepEqual(ids.map((id) => voiceTaskStore.get(id)?.answeredBy), [undefined, ids[0], ids[0]]);
+		assert.ok(ids.every(heard));
+	});
+
+	it('a session that cannot take a result leaves one DM copy; a second fallback writes none', async () => {
+		session.sessionManager.isActive = false;
+		const id = voiceTask('check PR 9999');
+		const copies = () => readdirSync(join(TMP, 'results')).filter((f) => f.startsWith(`proactive-result-${id}-`)).length;
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 9999 status.');
+		await until(() => copies() === 1);
+		assert.equal(copies(), 1);
+		await until(() => voiceTaskStore.get(id)?.delivery === 'dm');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'dm');
+		// The copy read back while the session is still down is not copied again.
+		await tick(3_000);
+		assert.ok(readdirSync(join(TMP, 'results')).filter((f) => f.startsWith(`proactive-result-${id}-`)).length <= 1);
+		session.sessionManager.isActive = true;
+		await until(() => sent.some((t) => t.includes('PR 9999 status.')), 15_000);
+		assert.ok(sent.some((t) => t.includes('PR 9999 status.')), 'spoken once the session can');
+		assert.ok(existsSync(join(TMP, 'results')));
+	});
+	it('no client connected: the result goes to the DM and its waiting call ends instead of hanging', async () => {
+		session.clientConnected = false;
+		const id = voiceTask('check PR 7777');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'check PR 7777' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 7777 status.');
+		const out = await Promise.race([call, tick(8_000).then(() => 'timed out')]);
+		assert.match(out, /delivered to the user separately/);
+		assert.doesNotMatch(out, /PR 7777 status/, 'not handed to a session nobody hears');
+		assert.equal(relay.isWaiting(id), false);
+		await until(() => voiceTaskStore.get(id)?.delivery === 'dm');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'dm');
+		assert.equal(readdirSync(join(TMP, 'results')).filter((f) => f.startsWith(`proactive-result-${id}-`)).length, 1);
+		session.clientConnected = true;
 	});
 });
