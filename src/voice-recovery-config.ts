@@ -1,6 +1,7 @@
 /**
- * Env settings for bodhi's upstream recovery: whether active-silence recovery is armed, and after
- * how many health ticks. Its own module because voice-agent.ts runs main() at import time.
+ * Env settings for bodhi's upstream recovery: whether active-silence recovery is armed and after
+ * how many health ticks, and when a stuck dial is replaced. Its own module because voice-agent.ts
+ * runs main() at import time.
  */
 
 export const DEFAULT_ACTIVE_SILENCE_TICKS = 3; // >=75s continuous silence
@@ -60,4 +61,28 @@ export function activeSilenceTicksFromEnv(
 	const ticks = parseActiveSilenceTicks(env.VOICE_ACTIVE_SILENCE_TICKS, warn);
 	if (ticks === 0) warn('[voice] VOICE_ACTIVE_SILENCE_MODE=armed but VOICE_ACTIVE_SILENCE_TICKS=0 disables it; staying off');
 	return ticks;
+}
+
+export const DEFAULT_STUCK_CONNECTING_MS = 120_000;
+/** A positive override below twice the dial deadline (30-45 s) would kill dials that are still on time. */
+export const MIN_STUCK_CONNECTING_MS = 60_000;
+
+/** VOICE_STUCK_CONNECTING_MS: 0 disables; a positive value below the floor clamps; invalid warns and defaults. */
+export function parseStuckConnectingMs(
+	raw: string | undefined,
+	warn: (m: string) => void = console.warn,
+): number {
+	if (raw === undefined || raw.trim() === '') return DEFAULT_STUCK_CONNECTING_MS;
+	const n = Number(raw);
+	if (!Number.isFinite(n) || n < 0) {
+		warn(`[voice] VOICE_STUCK_CONNECTING_MS=${JSON.stringify(raw)} is not a non-negative number; `
+			+ `using ${DEFAULT_STUCK_CONNECTING_MS}ms`);
+		return DEFAULT_STUCK_CONNECTING_MS;
+	}
+	if (n > 0 && n < MIN_STUCK_CONNECTING_MS) {
+		warn(`[voice] VOICE_STUCK_CONNECTING_MS=${JSON.stringify(raw)} is below the safe floor `
+			+ `(upstream dial deadline is 30-45s); clamping to ${MIN_STUCK_CONNECTING_MS}ms`);
+		return MIN_STUCK_CONNECTING_MS;
+	}
+	return n;
 }

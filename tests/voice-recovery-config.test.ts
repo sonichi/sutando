@@ -4,8 +4,11 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
 	DEFAULT_ACTIVE_SILENCE_TICKS,
+	DEFAULT_STUCK_CONNECTING_MS,
 	MIN_ACTIVE_SILENCE_TICKS,
+	MIN_STUCK_CONNECTING_MS,
 	activeSilenceTicksFromEnv,
+	parseStuckConnectingMs,
 	parseActiveSilenceMode,
 	parseActiveSilenceTicks,
 } from '../src/voice-recovery-config.js';
@@ -39,6 +42,19 @@ describe('active-silence env', () => {
 		assert.equal(activeSilenceTicksFromEnv({ VOICE_ACTIVE_SILENCE_MODE: 'armed', VOICE_ACTIVE_SILENCE_TICKS: '5' }, w), 5);
 		assert.equal(activeSilenceTicksFromEnv({ VOICE_ACTIVE_SILENCE_MODE: 'armed', VOICE_ACTIVE_SILENCE_TICKS: '0' }, (m) => warns.push(m)), 0);
 		assert.match(warns.join('\n'), /disables it; staying off/);
+	});
+});
+
+describe('stuck-connecting env', () => {
+	it('unset defaults; 0 disables and is never clamped; below the floor clamps; invalid warns and defaults', () => {
+		const warns: string[] = [];
+		const w = (m: string) => warns.push(m);
+		assert.equal(parseStuckConnectingMs(undefined, w), DEFAULT_STUCK_CONNECTING_MS);
+		assert.equal(parseStuckConnectingMs('0', w), 0);
+		assert.equal(parseStuckConnectingMs('5000', w), MIN_STUCK_CONNECTING_MS);
+		assert.equal(parseStuckConnectingMs('300000', w), 300_000);
+		assert.equal(parseStuckConnectingMs('abc', w), DEFAULT_STUCK_CONNECTING_MS);
+		assert.equal(warns.length, 2);
 	});
 });
 

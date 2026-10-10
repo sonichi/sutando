@@ -91,7 +91,7 @@ import {
 } from './voice-agent-state.js';
 
 import { sharedPersonalPath, claudeHomePath, voiceMemoryProjectSlug } from './util_paths.js';
-import { activeSilenceTicksFromEnv } from './voice-recovery-config.js';
+import { activeSilenceTicksFromEnv, parseStuckConnectingMs } from './voice-recovery-config.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -972,6 +972,7 @@ async function main() {
 		upstreamLossPolicy: 'hold',
 		upstreamRecovery: {
 			idleParkMs: IDLE_TEARDOWN_MS,
+			stuckConnectingMs: parseStuckConnectingMs(process.env.VOICE_STUCK_CONNECTING_MS),
 			classifyClose: fatalCloseForRecovery,
 			onFatal: ({ until }) => {
 				voiceFatalBackoffUntil = until;
@@ -1669,7 +1670,7 @@ async function main() {
 		}
 		// A failed first dial leaves the session parked in UPSTREAM_LOST with the listener up; this
 		// call carries the terminal classification (dedup makes a repeat a no-op).
-		console.error(`${ts()} [Startup] session parked (state=${session.sessionManager.state}) — a client attach or the redial scheduler redials it`);
+		console.error(`${ts()} [Startup] session parked (state=${session.sessionManager.state}) — bodhi's upstream recovery redials it when a client is attached`);
 		emitAgentState();
 	}
 

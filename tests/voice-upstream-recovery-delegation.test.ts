@@ -14,8 +14,14 @@ describe('voice-agent.ts delegates upstream recovery to bodhi', () => {
 		assert.match(src, /\t\tupstreamLossPolicy: 'hold',\n\t\tupstreamRecovery: \{\n\t\t\tidleParkMs: IDLE_TEARDOWN_MS,\n/);
 	});
 
-	it('classifies fatal closes with the one sutando classifier', () => {
+	it('classifies fatal closes with the one sutando classifier, and feeds agent.state the backoff', () => {
 		assert.match(src, /\t\t\tclassifyClose: fatalCloseForRecovery,\n/);
+		assert.match(src, /\t\t\tonFatal: \(\{ until \}\) => \{\n\t\t\t\tvoiceFatalBackoffUntil = until;\n\t\t\t\temitAgentState\(\);/);
+		assert.match(src, /backoffUntil: \(\) => voiceFatalBackoffUntil,/);
+	});
+
+	it('reads the stuck-dial override', () => {
+		assert.match(src, /\t\t\tstuckConnectingMs: parseStuckConnectingMs\(process\.env\.VOICE_STUCK_CONNECTING_MS\),\n/);
 	});
 
 	it('keeps no private redial, park timer or silence coordinator', () => {
