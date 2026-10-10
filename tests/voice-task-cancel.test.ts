@@ -103,6 +103,19 @@ describe('cancel_task decides from the task state', () => {
 		assert.ok(existsSync(join(TMP, 'tasks', `${id}.txt`)), 'the file the core has in context stays');
 	});
 
+	it('a task the Stop hook handed to the core inline (task_handover row) is started, not cancelled', async () => {
+		const id = submit('draw a tree');
+		announce(id);
+		const r = spawnSync('python3', [join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'task_handover.py'), join(TMP, 'tasks', `${id}.txt`)],
+			{ env: { ...process.env, SUTANDO_TEST_MODE: '1', SUTANDO_WORKSPACE: TMP }, encoding: 'utf-8' });
+		assert.equal(r.status, 0, r.stderr);
+		assert.equal(rows('processing'), 1);
+		const out = await cancel();
+		assert.equal(out.status, 'already_started');
+		assert.deepEqual(cancelInstructions(), []);
+		assert.ok(existsSync(join(TMP, 'tasks', `${id}.txt`)), 'the file the core has in context stays');
+	});
+
 	it('a task the core is working on is not "cancelled": no files, the user is told it will finish', async () => {
 		const id = submit('draw a kiwi');
 		coreWorks(id);
