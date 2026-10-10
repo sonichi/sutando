@@ -126,6 +126,27 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
   EOF
   ```
 
+  **For the core session itself (launcher, task notifier, anything the core pane runs), do not
+  restart the production core: start a witness core beside it.** From the PR worktree, with no
+  `sutando.config.local.json` of its own:
+
+  ```bash
+  bash src/agent/start-cli.sh --witness pr<N>        # own tmux socket/session, own temp workspace
+  # drop tasks into the workspace it prints (tasks/), read results/, attach with the printed tmux line
+  bash src/agent/start-cli.sh --witness-stop pr<N>   # stops only what it recorded; keeps its files and exits 1 if any survive
+  ```
+
+  It refuses to run from a main checkout, over an existing local config, without a runnable tmux or
+  sha256, or beside a live core in the checkout's workspace. It skips the supervisor monitor/relay and the owner's surfaces (remote
+  control, Chrome), and boots with a witness prompt instead of `/startup`, so no crons register.
+
+  To let a witness run unattended, give it a login once per host: run `claude setup-token`, then
+  send `vault set CLAUDE_CODE_OAUTH_TOKEN <token>` via Slack or Discord. The witness's claude (and
+  nothing else) then gets that token in its environment; it is never written to disk, tmux or argv.
+  Without it, start prints how to set it up and the witness pane needs `/login`. A witness with a
+  fresh `CLAUDE_CONFIG_DIR` also gets `skipDangerousModePermissionPrompt` only when your own or
+  production's Claude settings already set it; production's settings are never edited.
+
   **Pinning `workspace.path` is not always enough, and the failure is silent.** Some probes derive
   their path from the *repo slug*, not the workspace — `MEMORY_DIR` resolves to
   `<workspace>/.claude-sutando/projects/<slug-of-cwd>/memory`, so from a worktree it becomes

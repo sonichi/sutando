@@ -57,6 +57,20 @@ if [ "${1:-}" = "--runtime" ]; then
   shift 2
 fi
 
+# Witness mode is Claude-only and must skip the reap and runtime-switch below,
+# which act on the production socket and session.
+for _arg in "$@"; do
+  case "$_arg" in
+    --witness|--witness-stop|--witness-scrubbed|--witness=*|--witness-stop=*)
+      if [ -n "$requested_runtime" ] && [ "$requested_runtime" != "claude" ]; then
+        echo "start-cli: witness mode is supported only for the claude runtime" >&2
+        exit 2
+      fi
+      exec bash "$REPO/src/agent/claude/cli/start-cli.sh" "$@"
+      ;;
+  esac
+done
+
 if [ -n "$requested_runtime" ]; then
   runtime="$requested_runtime"
 else
