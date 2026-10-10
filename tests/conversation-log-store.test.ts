@@ -13,8 +13,9 @@ const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 function harness(opts: { suppress?: () => boolean; waitMs?: number } = {}) {
 	const lines: string[] = [];
 	const store = new ConversationLogStore({
-		log: (role, text) => lines.push(`${role}|${text}`),
-		boundary: (reason) => lines.push(`SESSION_END|${reason}`),
+		// Slow, uneven async writes: order must still hold.
+		log: async (role, text) => { await tick(text.length % 3); lines.push(`${role}|${text}`); },
+		boundary: async (reason) => { await tick(1); lines.push(`SESSION_END|${reason}`); },
 		suppress: opts.suppress ?? (() => false),
 	}, opts.waitMs ?? 50);
 	const bus = new EventBus();
@@ -32,8 +33,7 @@ describe('conversation log through bodhi\'s history writer', () => {
 		h.ctx.addAssistantMessage('hi there');
 		assert.deepEqual(h.lines, [], 'nothing is written synchronously');
 		h.turnEnd();
-		await h.store.drain();
-		await tick(5);
+		await tick(20);
 		assert.deepEqual(h.lines, ['user|hello', 'assistant|hi there'], 'tool items are not spoken lines');
 		h.turnEnd();
 		await tick(5);
@@ -48,7 +48,7 @@ describe('conversation log through bodhi\'s history writer', () => {
 		await tick(2);
 		h.ctx.addAssistantMessage('talk to you next time');
 		h.turnEnd();
-		await tick(5);
+		await tick(20);
 		assert.deepEqual(h.lines, ['user|goodbye', 'assistant|bye', 'SESSION_END|voice_goodbye', 'assistant|talk to you next time']);
 	});
 
@@ -56,7 +56,7 @@ describe('conversation log through bodhi\'s history writer', () => {
 		const h = harness({ waitMs: 20 });
 		h.ctx.addUserMessage('bye');
 		h.turnEnd();
-		await tick(5);
+		await tick(20);
 		h.store.markBoundary('user_goodbye');
 		assert.deepEqual(h.lines, ['user|bye']);
 		await tick(40);
@@ -70,11 +70,11 @@ describe('conversation log through bodhi\'s history writer', () => {
 		const h = harness({ suppress: () => ending });
 		h.ctx.addUserMessage('please summarize');
 		h.turnEnd();
-		await tick(5);
+		await tick(20);
 		ending = true;
 		h.ctx.addAssistantMessage('Farewell. Talk to you next time.');
 		h.turnEnd();
-		await tick(5);
+		await tick(20);
 		assert.deepEqual(h.lines, ['user|please summarize']);
 	});
 
@@ -84,5 +84,7 @@ describe('conversation log through bodhi\'s history writer', () => {
 		assert.doesNotMatch(src, /logConversation\(item\.role/);
 		assert.doesNotMatch(src, /logSessionBoundary\('(user|voice)_goodbye'\)/, 'the boundary is ordered by the store');
 		assert.match(src, /suppress: \(\) => sessionEnding,/);
+		assert.match(src, /log: \(role, text, sessionId, at\) => logConversationAsync\(role, text, sessionId, at\),/);
+		assert.match(src, /boundary: \(reason\) => logSessionBoundaryAsync\(reason\),/);
 	});
 });

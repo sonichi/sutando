@@ -9,6 +9,7 @@
  */
 
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, statSync, appendFileSync, renameSync } from 'node:fs';
+import { appendFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { z } from 'zod';
@@ -19,7 +20,7 @@ import { claudeHomePath } from './util_paths.js';
 import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, dedupTarget, type TaskOrigin } from './skip_marker_ownership.js';
 import { createVoiceTaskStore, planReconcile } from './relay-agent.js';
 import { framedSystem } from './inject-framing.js';
-import { recordConversation, recordSessionBoundary } from './conversation-store.js';
+import { recordConversation, recordConversationAsync, recordSessionBoundary, recordSessionBoundaryAsync } from './conversation-store.js';
 import {
 	emitTaskProcessed,
 	selectBackend,
@@ -1241,6 +1242,20 @@ export function logConversation(role: string, text: string, sessionId?: string, 
 	const line = `${at.toISOString()}|${role}|${capped}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
 	recordConversation(role, capped, sessionId, { tsUnix: at.getTime() / 1000 }); // #603 sqlite mirror — best-effort, swallowed inside
+}
+
+/** logConversation without blocking: the log line through fs/promises, the sqlite row through
+ *  the store's worker. Resolves when both are written; failures are logged, never thrown. */
+export async function logConversationAsync(role: string, text: string, sessionId?: string, at: Date = new Date()): Promise<void> {
+	const capped = text.replace(/\n/g, ' ').slice(0, LOG_LINE_MAX_CHARS);
+	try { await appendFile(CONVERSATION_LOG, `${at.toISOString()}|${role}|${capped}\n`); } catch { /* best effort */ }
+	await recordConversationAsync(role, capped, sessionId, { tsUnix: at.getTime() / 1000 });
+}
+
+/** logSessionBoundary without blocking. */
+export async function logSessionBoundaryAsync(reason: string = 'user_goodbye'): Promise<void> {
+	try { await appendFile(CONVERSATION_LOG, `${new Date().toISOString()}|SESSION_END|${reason}\n`); } catch { /* best effort */ }
+	await recordSessionBoundaryAsync(reason);
 }
 
 /** Append a session-end boundary marker. Used by voice-agent's

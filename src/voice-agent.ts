@@ -59,7 +59,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { voiceTaskRows, workTool, submitWorkTask, voiceTaskStore, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile } from './task-bridge.js';
+import { voiceTaskRows, workTool, submitWorkTask, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile } from './task-bridge.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
@@ -590,8 +590,8 @@ const itemsClear = createConversationClearHelper(
 // conversation.log + sqlite, written by bodhi's history writer after each turn. A goodbye's
 // remaining lines are not logged, so the next session's replay never picks them up.
 const conversationLogStore = new ConversationLogStore({
-	log: (role, text, sessionId, at) => logConversation(role, text, sessionId, at),
-	boundary: (reason) => logSessionBoundary(reason),
+	log: (role, text, sessionId, at) => logConversationAsync(role, text, sessionId, at),
+	boundary: (reason) => logSessionBoundaryAsync(reason),
 	suppress: () => sessionEnding,
 });
 // P7 D7.3 stale-repeat goodbye guard (Tranche A engine-side). The guard
