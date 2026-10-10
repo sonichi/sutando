@@ -45,7 +45,7 @@ const until = async (cond: () => boolean, ms: number) => {
 };
 
 describe('relay-mode result watcher', () => {
-	it('speaks and logs the answer without the bare [thread] line; a skip after it is not a skip', async () => {
+	it('speaks and logs the answer without the bare [thread] line; a skip right after it is a skip', async () => {
 		for (const f of Object.keys(BODIES)) {
 			_pendingTasksForTest.set(f.replace('.txt', ''), { submittedAt: Date.now(), timeoutMs: 0, dmOnTimeout: false, taskText: f });
 		}
@@ -53,13 +53,11 @@ describe('relay-mode result watcher', () => {
 		setTaskStatusCallback((_id: string, _s: string, _t: string, result?: string) => { if (result) statuses.push(result); });
 		const spoken: string[] = [];
 		startResultWatcher((result: string) => { spoken.push(result); }, () => true);
-		assert.ok(await until(() => archived.length === 2 && spoken.length === 2, 10000),
+		assert.ok(await until(() => archived.length === 2 && spoken.length === 1, 10000),
 			`spoken=${JSON.stringify(spoken)} archived=${JSON.stringify(archived)}`);
 		server.close();
-		assert.deepEqual(spoken.sort(), [
-			'[Task result for task-relay-skip-after-thread]\n[no-send]\nvisible after',
-			'[Task result for task-relay-thread]\nanswer body',
-		]);
+		await new Promise(r => setTimeout(r, 2500));
+		assert.deepEqual(spoken, ['[Task result for task-relay-thread]\nanswer body']);
 		assert.ok(!statuses.some(s => s.includes('[thread]')), `status log carried the marker: ${JSON.stringify(statuses)}`);
 	});
 });

@@ -150,6 +150,33 @@ for prose in ("[thread]ing is a library primitive", "[thread] prose on one line"
 for label, fn, parse in (("src", neutralize_markers, parse_markers), ("vendored", mod.neutralize_markers, mod.parse_markers)):
     out = fn("[thread]\nquoted")
     check(f"{label}: a standalone [thread] is neutralized", out != "[thread]\nquoted" and acts(out, parse)[0] == [], repr(out))
+# 11. a skip marker right after the leading markers is a skip, as on the broker
+for lead in ("[thread]", f"[thread: {ROOT}]", "[dm-only]", "[reply: 12345678901234567]"):
+    for marker, reason in (("[no-send]", "no-send"), ("[REPLIED]", "REPLIED"), ("[deduped: task-9]", "deduped")):
+        for label, parse in (("src", parse_markers), ("vendored", mod.parse_markers)):
+            a, body = acts(f"{lead}\n{marker}\nvisible", parse)
+            check(f"{label}: {lead} then {marker} is a skip", a == [("skip", reason)] and body == "", f"{a} {body!r}")
+# after [channel:] it stays text: the team guard withholds redirect-plus-skip for owner review
+a, body = acts(f"[channel: {ROOM}]\n[no-send]\nvisible")
+check("[channel:] then [no-send] is not turned into a skip", ("redirect", ROOM) in a and body.startswith("[no-send]"), f"{a} {body!r}")
+a, body = acts("[thread]\nsee [no-send] below")
+check("a skip word inside prose is not a skip", ("thread-ask", "") in a and "[no-send]" in body, f"{a} {body!r}")
+# 12. the shared table (tests/fixtures/thread-ask-cases.json), also run by the TS suite
+import json as _json  # noqa: E402
+for case in _json.loads((REPO / "tests" / "fixtures" / "thread-ask-cases.json").read_text())["cases"]:
+    text = case["body"]
+    for label, parse, neutral in (("src", parse_markers, neutralize_markers),
+                                  ("vendored", mod.parse_markers, mod.neutralize_markers)):
+        a, body = acts(text, parse)
+        if case["skip"]:
+            check(f"table {label}: {text!r} is a skip", len(a) == 1 and a[0][0] == "skip", f"{a} {body!r}")
+        else:
+            check(f"table {label}: {text!r} thread-ask={case['thread_ask']}",
+                  (("thread-ask", "") in a) is case["thread_ask"] and not any(k == "skip" for k, _ in a), f"{a} {body!r}")
+        out = neutral(text)
+        check(f"table {label}: neutralize {text!r} quotes [thread]={case['neutralize_quotes_thread']}",
+              ("[ thread]" in out) is case["neutralize_quotes_thread"]
+              and ("thread-ask", "") not in acts(out, parse)[0], repr(out))
 a, body = acts("use [thread] inline")
 check("inline bare [thread] is prose", a == [] and body == "use [thread] inline", f"{a} {body!r}")
 a, body = acts("[no-send]\n[thread]\nx")

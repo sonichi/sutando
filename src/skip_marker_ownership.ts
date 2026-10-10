@@ -33,9 +33,51 @@ export function stripVoiceControlLines(text: string): string {
 	return (header + out.concat(lines.slice(i)).join('\n')).replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '');
 }
 
-/** True iff `result`'s body carries a skip marker, D7 header peeled first. */
+// parse_markers' leading-marker loop, mirrored for the skip decision only.
+const LEAD_REDIRECT_RE = /^\s*\[channel:\s*[^\]]*\]\s*\n?/;
+const LEAD_THREAD_RE = /^\s*\[thread:\s*[^\]]*\]\s*\n?/i;
+const LEAD_THREAD_ASK_RE = /^\s*\[thread\][ \t]*(?:\r?\n|$)/i;
+const LEAD_REPLY_RE = /^\s*\[reply:\s*\d{17,20}\]\s*\n?/;
+const DM_ONLY_STRIP_RE = /^[ \t]*\[dm-only\][ \t]*\r?\n?/gim;
+
+/** The body after the leading markers, as parse_markers reaches it (D7 already peeled). */
+function afterLeadingMarkers(body: string): string {
+	const glued = new Set<number>();
+	let lead = body;
+	if (/\[dm-only\]/i.test(body)) {
+		let out = '';
+		let last = 0;
+		for (const m of body.matchAll(DM_ONLY_STRIP_RE)) {
+			out += body.slice(last, m.index);
+			if (!m[0].endsWith('\n') && m.index! + m[0].length < body.length) glued.add(out.length);
+			last = m.index! + m[0].length;
+		}
+		lead = out + body.slice(last);
+	}
+	let rest = lead;
+	let redirected = false;
+	for (;;) {
+		const channel = LEAD_REDIRECT_RE.exec(rest);
+		if (channel) { redirected ||= /\[channel:\s*[^\]\s]/.test(channel[0]); rest = rest.slice(channel[0].length); continue; }
+		const fixed = [LEAD_THREAD_RE, LEAD_REPLY_RE].map(re => re.exec(rest)).find(Boolean);
+		if (fixed) { rest = rest.slice(fixed[0].length); continue; }
+		const ask = LEAD_THREAD_ASK_RE.exec(rest);
+		const at = lead.length - rest.length + (ask ? ask[0].indexOf('[') : 0);
+		const start = lead.slice(0, at).replace(/[ \t]+$/, '').length;
+		if (ask && (start === 0 || lead[start - 1] === '\n') && !glued.has(at) && !glued.has(start)) {
+			rest = rest.slice(ask[0].length);
+			continue;
+		}
+		// After [channel:] parse_markers keeps a following skip as text (the guard reviews it).
+		return redirected ? '' : rest;
+	}
+}
+
+/** True iff `result`'s body is a skip in parse_markers: a skip marker first, or
+ *  directly after the leading markers. D7 header peeled first. */
 export function bodyIsSkipMarked(result: string): boolean {
-	return SKIP_MARKER_RE.test(String(result ?? "").replace(D7_HEADER_RE, ""));
+	const body = String(result ?? "").replace(D7_HEADER_RE, "");
+	return SKIP_MARKER_RE.test(body) || SKIP_MARKER_RE.test(afterLeadingMarkers(body));
 }
 
 /** The task whose result a `[deduped: <task-id>]` result points to, D7 header peeled first; null otherwise. */

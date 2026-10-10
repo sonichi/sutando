@@ -14,6 +14,8 @@ the thread on the task's own asking message (no event id is ever sent).
   g) broker 400 on the thread field    -> parks like any other 4xx: one POST, quarantined, never re-posted
   h) proactive file with [thread]      -> stripped, posted top level (task results only)
   i) `[thread]` not alone on its line  -> prose: body untouched, no thread field
+  j) [thread] then a skip marker        -> a skip, as on the broker: lease closed no_send, no post, reason logged
+  k) indented [thread] after any leading marker -> still the thread field
 
 Loads src/remote-gateway-bridge.py in-process (its real PROACTIVE_CLAIM_GATE),
 with an isolated workspace and a fake `_req`; never runs the wrapper as a process.
@@ -210,6 +212,28 @@ def main() -> int:
         h.run(f"tt-i{n}", text + "\n")
         p = h.results[0] if h.results else {}
         check(p.get("body") == text and "thread" not in p, f"i) {text!r} delivered verbatim, got {p}")
+
+    # j) a skip marker right after the leading markers is a skip (parse_markers owns it)
+    for n, marker in enumerate(("[no-send]", "[REPLIED]")):
+        h = Harness()
+        left = h.run(f"tt-j{n}", f"[thread]\n{marker}\nvisible\n")
+        check(len(h.results) == 1 and h.results[0].get("no_send") is True and "thread" not in h.results[0]
+              and "visible" not in json.dumps(h.results), f"j) {marker}: lease closed no_send, nothing posted, got {h.results}")
+        check(left == set() and any(f"(marker {marker.strip('[]')}, lease closed, not sent)" in m for m in h.logs),
+              f"j) {marker}: archived with the reason logged, got {[m for m in h.logs if 'tt-j' in m]}")
+    h = Harness()
+    h.run("tt-j2", "[thread]\n[deduped: tt-holder]\nvisible\n")
+    check(not any("visible" in json.dumps(r) or "thread" in r for r in h.results),
+          f"j) [deduped:]: no thread post, never the visible text, got {h.results}")
+    check(any("dedup" in m and "tt-j2" in m for m in h.logs),
+          f"j) [deduped:]: routed through the dedup plan, got {[m for m in h.logs if 'tt-j2' in m]}")
+
+    # k) indentation from the line start still counts, after every leading form
+    for n, lead in enumerate(("", "[reply: 12345678901234567]\n", "[thread: $r:example.org]\n", "[dm-only]\n")):
+        h = Harness()
+        h.run(f"tt-k{n}", f"{lead}  [thread]\nbody\n")
+        p = h.results[0] if h.results else {}
+        check(p.get("thread") == "ask" and p.get("body") == "body", f"k) {lead!r} + indented [thread], got {p}")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0

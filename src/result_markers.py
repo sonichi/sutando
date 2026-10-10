@@ -25,7 +25,8 @@ would stop recognizing the sanitizer and start flagging every upload site.
 
 Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
 
-  SKIP markers — at body start (must be the first non-whitespace chars):
+  SKIP markers — at body start, or directly after the leading markers below
+  ([thread:], [thread], [reply:], a standalone [dm-only]; not after [channel:]):
     [no-send]
     [REPLIED]
     [deduped: <task-id>]
@@ -322,7 +323,8 @@ def parse_markers(text: str) -> ParseResult:
             continue
         ask_match = _THREAD_ASK_RE.match(body)
         at = len(lead) - len(body) + (ask_match.group(0).index("[") if ask_match else 0)
-        if ask_match and (at == 0 or lead[at - 1] == "\n") and at not in glued:
+        start = len(lead[:at].rstrip(" \t"))  # indentation from the physical line start is allowed
+        if ask_match and (start == 0 or lead[start - 1] == "\n") and not glued & {at, start}:
             if not any(a.kind == "thread-ask" for a in actions):
                 actions.append(Action(kind="thread-ask", value=""))
             body = body[ask_match.end():]
@@ -333,6 +335,14 @@ def parse_markers(text: str) -> ParseResult:
             body = body[reply_match.end():]
             continue
         break
+
+    # A skip right after the leading markers is a skip, as the broker reads the body it is sent.
+    # Not after [channel:]: the guard withholds a redirect plus skip for owner review.
+    for pat, reason in (_SKIP_PATTERNS if not named else ()):
+        m = pat.match(body)
+        if m:
+            extra = m.group(1).strip() if reason == "deduped" else None
+            return ParseResult(body="", actions=[Action(kind="skip", value=reason, extra=extra)])
 
     # A root posted outside its room is refused or misthreaded; ambiguity fails to top level.
     foreign = "dm-only" if dm_only else ("rooms differ" if len(named) > 1 else None)
