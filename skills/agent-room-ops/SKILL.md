@@ -97,7 +97,7 @@ python3 skills/agent-room-ops/room_ops.py say    '!room:hs' 'deploy finished, 3 
 #   Use `mention` instead when a specific agent must be triggered; `say` never pings.
 python3 skills/agent-room-ops/room_ops.py say    '!room:hs' $'> the quoted words\n\nis this final?' --extra-content '{"space.ag2.collab.doc.comment": {"anchor": {...}, "v": 1}}'
 #   --extra-content carries a protocol payload on the event beside the body, for a client
-#   that renders it (here: a document comment pinned to the quoted words — the room-collab
+#   that renders it (here: a document comment pinned to the quoted words — the room-commons
 #   skill's `comment` builds and posts this for you). Only space.ag2.* keys survive the gateway.
 #   Pass the extra_content OBJECT only. A wrapper ({room, body, extra_content}), a message field
 #   (body/msgtype/format/formatted_body) or a space.ag2.* card nested under another key is
