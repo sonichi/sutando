@@ -371,8 +371,8 @@ ensure_core_monitor() {
 # migrate schedules and then silently suppress every fire. Start it here (once).
 # Guard on the $REPO-anchored path so the check is per-checkout (won't cross-match
 # a heartbeat from a different checkout/bundle, and stays hermetic under test).
-# One interpreter for the heartbeat, start and stop alike: the repository resolver, never a bare
-# `python3` (on a clean macOS host PATH can hand that name to Apple's developer-tools stub).
+# One interpreter for the heartbeat (start and stop alike) and the schedule helpers: the repository
+# resolver, never a bare `python3` (on a clean macOS host PATH can hand that name to Apple's stub).
 # Resolved ONCE, in this shell, never inside $(...): a subshell's assignment cannot reach the
 # parent, so stop and start would each resolve on their own and could disagree.
 _HB_PY=""
@@ -384,6 +384,11 @@ resolve_heartbeat_python() {
 }
 heartbeat_python() {
   [ -n "$_HB_PY" ] && printf '%s' "$_HB_PY"
+}
+have_launcher_python() {
+  [ -n "$_HB_PY" ] && return 0
+  echo "  ⚠ no runnable python3 — skipped: $1" >&2
+  return 1
 }
 ensure_core_heartbeat() {
   if [ -n "$EXTERNAL_HELPERS" ]; then check_external_helpers; return; fi
@@ -403,8 +408,9 @@ ensure_durable_schedules() {
   # created, otherwise a runtime switch/restart leaves crons.json populated
   # while every custom schedule silently stops.
   [ "$(uname -s)" = "Darwin" ] || return 0
-  local preflight result service
-  preflight="$(python3 "$REPO/skills/schedule-crons/scripts/reconcile_launchd.py" --check)" || {
+  have_launcher_python "durable schedule reconcile" || return 0
+  local preflight result service host
+  preflight="$("$_HB_PY" "$REPO/skills/schedule-crons/scripts/reconcile_launchd.py" --check)" || {
     echo "  ⚠ durable schedule preflight failed" >&2
     return 0
   }
@@ -412,7 +418,13 @@ ensure_durable_schedules() {
     *"runner_needed=1"*)
       service="gui/$(id -u)/com.sutando.cron-runner"
       if ! launchctl print "$service" >/dev/null 2>&1; then
-        bash "$REPO/src/install-cron-runner-launchd.sh" >/dev/null 2>&1 || {
+        # The installer renders and self-tests with this launcher's interpreter and host label.
+        host="$(resolve_schedule_host)" || {
+          echo "  ⚠ durable schedule runner not installed: host label did not resolve" >&2
+          return 0
+        }
+        SUTANDO_PY="$_HB_PY" SUTANDO_HOST_LABEL="$host" \
+          bash "$REPO/src/install-cron-runner-launchd.sh" >/dev/null 2>&1 || {
           echo "  ⚠ durable schedule runner failed to install" >&2
           return 0
         }
@@ -421,7 +433,7 @@ ensure_durable_schedules() {
           return 0
         fi
       fi
-      result="$(python3 "$REPO/skills/schedule-crons/scripts/reconcile_launchd.py")" || {
+      result="$("$_HB_PY" "$REPO/skills/schedule-crons/scripts/reconcile_launchd.py")" || {
         echo "  ⚠ durable schedule reconciliation failed" >&2
         return 0
       }
@@ -430,17 +442,35 @@ ensure_durable_schedules() {
   esac
 }
 
-ensure_codex_scheduler() {
-  local ws host scheduler
-  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
-  host="${SUTANDO_HOST_LABEL:-}"
+resolve_schedule_host() {
+  local host="${SUTANDO_HOST_LABEL:-}"
   # Blank-but-set passes `[ -z ]`; trim so it falls through to the resolver.
   host="${host#"${host%%[![:space:]]*}"}"; host="${host%"${host##*[![:space:]]}"}"
-  if [ -z "$host" ]; then
-    host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)" || return 0
+  [ -n "$host" ] || host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)" || return 1
+  printf '%s\n' "$host"
+}
+
+ensure_crons_seeded() {
+  # Codex never runs /schedule-crons step 1, so a fresh install would have no
+  # per-host crons.json and therefore no proactive loop. A first install gets only
+  # the main loop; the seeder decides what counts as one.
+  local ws host
+  have_launcher_python "per-host crons.json seed" || return 0
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  host="$(resolve_schedule_host)" || return 0
+  if ! "$_HB_PY" "$REPO/skills/schedule-crons/scripts/seed_crons.py" \
+      --workspace "$ws" --host-label "$host" --first-install-only main-loop >/dev/null; then
+    echo "  ⚠ Could not seed the per-host crons.json; run: python3 $REPO/skills/schedule-crons/scripts/seed_crons.py" >&2
   fi
+}
+
+ensure_codex_scheduler() {
+  local ws host scheduler
+  have_launcher_python "Codex scheduler install" || return 0
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  host="$(resolve_schedule_host)" || return 0
   scheduler="${SUTANDO_CODEX_SCHEDULER_SCRIPT:-$REPO/skills/schedule-crons/scripts/codex-scheduler.py}"
-  if ! python3 "$scheduler" install --workspace "$ws" --host-label "$host" >/dev/null; then
+  if ! "$_HB_PY" "$scheduler" install --workspace "$ws" --host-label "$host" >/dev/null; then
     echo "  ⚠ Could not reconcile the durable Codex scheduler; run: python3 $scheduler install" >&2
   fi
 }
@@ -461,7 +491,9 @@ ensure_codex_auto_reset_timer() {
   fi
 }
 
-# Codex has no session CronCreate surface. Two complementary reconcilers run on
+# ensure_crons_seeded first creates a missing per-host crons.json (the seed
+# /schedule-crons step 1 does on Claude). Codex has no session CronCreate
+# surface, so two complementary reconcilers then run on
 # each default invocation, partitioned by reconcile_launchd.py's eligibility
 # rules so no entry is double-owned: ensure_durable_schedules moves ordinary
 # fixed crons.json entries onto the OS-backed cron-runner (skipping main-loop,
@@ -470,6 +502,7 @@ ensure_codex_auto_reset_timer() {
 # five-minute main loop while this runtime is selected.
 resolve_heartbeat_python
 if [ "$RECONCILE_SCHEDULES" = 1 ]; then
+  ensure_crons_seeded
   ensure_durable_schedules
   ensure_codex_scheduler
   ensure_codex_auto_reset_timer
