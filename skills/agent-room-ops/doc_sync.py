@@ -72,8 +72,10 @@ def parse(text: str) -> Tuple[List[str], Dict[str, Record]]:
 
 def writer_id(explicit: Optional[str] = None, env=None) -> str:
     env = os.environ if env is None else env
-    w = (explicit or env.get("SUTANDO_CORE_ID") or "").strip()
-    return w or "unknown"
+    for w in (explicit, env.get("SUTANDO_WORKER_ID"), env.get("SUTANDO_CORE_ID")):
+        if w and w.strip():
+            return w.strip()
+    return "unknown"
 
 
 def stamp(line: str, writer: str) -> str:
