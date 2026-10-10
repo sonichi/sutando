@@ -95,7 +95,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from result_markers import parse_markers  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
+from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 from policy.egress.unfurl import should_unfurl  # noqa: E402
 import local_task_protocol  # noqa: E402
@@ -568,7 +568,7 @@ def _dedup_recover(task_id: str, holder_id, target) -> str:
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id,
-            (target or {}).get("channel", ""), f"task-{int(time.time() * 1000)}")
+            (target or {}).get("channel", ""), fresh_reask_id())
         if action == "requeue":
             _set_pending_reply(payload, dict(target or {}))
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)

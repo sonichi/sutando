@@ -11,6 +11,10 @@ edge makes the policy testable without a live bridge.
 """
 from __future__ import annotations
 
+import os
+import sys
+import time
+import uuid
 from pathlib import Path
 
 # This file is bundled verbatim into ag2_sparrow, where its siblings are
@@ -128,6 +132,17 @@ def plan_dedup_recovery(
     must return True. A re-ask visible to the watcher without its routing
     committed is executed anyway, so a failed commit would leave a live orphan
     and the next pass would add another.
+
+    ``new_task_id`` must belong to this original alone (a hash of ``task_id``,
+    or ``fresh_reask_id()``): an existing task with the same body is taken as
+    this caller's own re-ask, so an id shared across originals hands one
+    original's re-ask, and its route, to another.
+
+    A ``new_task_id`` already published with the body this call builds is not
+    written again: a caller that retries with the same id gets the same re-ask.
+    An id that already holds anything else (another original's re-ask on a
+    colliding id, or an answer whose task cannot be read) is never claimed:
+    the plan is ``defer``, so the caller retries with a fresh id.
     """
     holder = (holder_id or "").strip()
     # `find_result` refuses a malformed id, so recovery would read "delivered
@@ -172,16 +187,26 @@ def plan_dedup_recovery(
         return "report", template.format(holder=holder)
 
     if (decision == "requeue" or cross_channel or cross_sender) and orig_text:
-        if commit_identity is not None and not commit_identity(new_task_id):
-            return "defer", None
         body = build_requeued_task(
             orig_text, new_task_id, dedup_requeue_count(orig_text) + 1,
             destination, holder,
             reason=reason,
             channel_dir=channel_dir,
         )
+        mine = _published_as(Path(tasks_dir), Path(results_dir), new_task_id, body)
+        if mine is False:
+            return "defer", None                         # the id is someone else's
+        if commit_identity is not None and not commit_identity(new_task_id):
+            return "defer", None
+        if mine:
+            return "requeue", new_task_id
         try:
-            (Path(tasks_dir) / f"{new_task_id}.txt").write_text(body)
+            _publish_once(Path(tasks_dir) / f"{new_task_id}.txt", body)
+        except FileExistsError:
+            # A concurrent pass took the name: the same re-ask, or a collision.
+            if _published_as(Path(tasks_dir), Path(results_dir), new_task_id, body):
+                return "requeue", new_task_id
+            return "defer", None
         except OSError:
             # Cannot re-ask; fall through to telling the asker rather than
             # silently archiving against a delivery that never happened.
@@ -189,6 +214,39 @@ def plan_dedup_recovery(
         return "requeue", new_task_id
 
     return "report", template.format(holder=holder)
+
+
+def fresh_reask_id() -> str:
+    """A re-ask id for a caller with no deterministic identity of its own: its
+    millisecond part keeps the shape readers parse, the random part keeps two
+    originals asked in the same millisecond from ever sharing one."""
+    return f"task-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
+
+
+def _published_as(tasks_dir: Path, results_dir: Path, task_id: str, body: str) -> "bool | None":
+    """None when nothing holds the id; True when its task is this very re-ask;
+    False when anything else holds it, including an answer with no readable task."""
+    task = find_task_file(tasks_dir, task_id) or find_archived_task(tasks_dir, task_id)
+    if task is None:
+        return False if find_result(results_dir, task_id) else None
+    try:
+        return task.read_text() == body
+    except OSError:
+        return False
+
+
+def _publish_once(path: Path, body: str) -> None:
+    """Make the task visible complete and never over an existing one: a
+    private temp name, then a hard link that refuses a taken name."""
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    tmp.write_text(body)
+    try:
+        os.link(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError as e:                        # the outcome is the link's, never the cleanup's
+            print(f"dedup re-ask {path.name}: temp {tmp.name} was not removed ({e})", file=sys.stderr)
 
 
 def report_disposition(action: str, delivered=None) -> str:
