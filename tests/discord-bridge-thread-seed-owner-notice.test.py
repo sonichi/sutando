@@ -8,7 +8,7 @@ fix posts an inline @-mention to the owner on first seed — but ONLY when a
 non-owner did the seeding (owner-seeded threads need no ping).
 
 Helpers under test (pure / testable):
-  - _should_notify_owner_on_seed(sender_id, owner_ids): gating predicate
+  - _should_notify_owner_on_seed(sender_id, owner_id): gating predicate
   - _format_seed_notice(owner_id, author_mention, parent_label, thread_id): body
 
 Run: python3 tests/discord-bridge-thread-seed-owner-notice.test.py
@@ -101,24 +101,28 @@ bridge = load_bridge()
 def case_non_owner_seeder_notifies() -> list[str]:
     fails = []
     # Non-owner seeds (sender not in owner list) → notify.
-    if not bridge._should_notify_owner_on_seed("999", ["111", "222"]):
+    if not bridge._should_notify_owner_on_seed("999", "111"):
         fails.append("a) non-owner seeder should notify")
-    # int sender id vs str owner ids → still notifies (type-agnostic compare).
-    if not bridge._should_notify_owner_on_seed(999, ["111"]):
-        fails.append("a) int sender_id vs str owner_ids should still notify")
+    # int sender id vs str owner id → still notifies (type-agnostic compare).
+    if not bridge._should_notify_owner_on_seed(999, "111"):
+        fails.append("a) int sender_id vs str owner_id should still notify")
+    # A team-tier member is NOT the owner: membership in allowFrom must not
+    # suppress the notice, which is what the old list-based gate did.
+    if not bridge._should_notify_owner_on_seed("team-user", "owner-user"):
+        fails.append("a) team-tier seeder should notify the canonical owner")
     return fails
 
 
 def case_owner_seeder_skips() -> list[str]:
     fails = []
     # Owner seeds their own thread → no ping (str match).
-    if bridge._should_notify_owner_on_seed("111", ["111", "222"]):
+    if bridge._should_notify_owner_on_seed("111", "111"):
         fails.append("b) owner seeder should NOT notify")
-    # int owner id in list, str sender → coerced match, no ping.
-    if bridge._should_notify_owner_on_seed("111", [111, 222]):
-        fails.append("b) int owner_ids should coerce-match str sender")
+    # int owner id, str sender → coerced match, no ping.
+    if bridge._should_notify_owner_on_seed("111", 111):
+        fails.append("b) int owner_id should coerce-match str sender")
     # int sender matching int owner → no ping.
-    if bridge._should_notify_owner_on_seed(111, [111]):
+    if bridge._should_notify_owner_on_seed(111, 111):
         fails.append("b) int sender matching int owner should NOT notify")
     return fails
 
@@ -126,10 +130,10 @@ def case_owner_seeder_skips() -> list[str]:
 def case_no_owner_never_notifies() -> list[str]:
     fails = []
     # No owner to mention → never notify (avoid <@> with empty id).
-    if bridge._should_notify_owner_on_seed("999", []):
-        fails.append("c) empty owner list should NOT notify")
+    if bridge._should_notify_owner_on_seed("999", ""):
+        fails.append("c) empty owner id should NOT notify")
     if bridge._should_notify_owner_on_seed("999", None):
-        fails.append("c) None owner list should NOT notify")
+        fails.append("c) None owner id should NOT notify")
     return fails
 
 
