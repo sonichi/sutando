@@ -519,6 +519,12 @@ process_announced_queue() {
       continue
     fi
     wait_for_core_idle || exit 1
+    # Checked after the idle wait so a file archived during that wait is never typed.
+    if "$NOTIFIER_PY" "$DISPATCH_PY" head-abandoned "$RESULTS_DIR" "$filename" "$(task_payload "$filename")"; then
+      log_notifier "dropped $filename from the queue: its task file is gone and no result was found"
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
+      continue
+    fi
     submit_task "$filename" 1
     if has_result "$filename"; then
       mark_worker_stage "$filename" done

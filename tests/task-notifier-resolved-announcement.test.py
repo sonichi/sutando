@@ -226,7 +226,10 @@ class PromptNamesThePayload(unittest.TestCase):
         for runtime, script in NOTIFIERS.items():
             with self.subTest(runtime=runtime):
                 text = script.read_text()
-                self.assertEqual(text.count('rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"'), 2)
+                paired = text.count('rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"')
+                self.assertGreaterEqual(paired, 1)
+                # Every queue-marker removal, however many drop sites there are, takes its payload too.
+                self.assertEqual(text.count('rm -f "$queue_dir/'), paired)
                 self.assertNotIn('rm -f "$queue_dir/$filename"\n', text)
 
 
