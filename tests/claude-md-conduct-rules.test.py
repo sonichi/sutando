@@ -31,8 +31,8 @@ ROUTING = (
     "Threading a reply to a top-level message is your call: thread when the exchange is better kept out "
     "of the main timeline, e.g. a side discussion of several messages about one item; when unsure, reply "
     "in the timeline. An ask already in a thread is answered in it.",
-    "To thread one, post it as a proactive `[thread:]` file, then a `[REPLIED]` result (marker docs "
-    "below); a refused thread post is parked, so check it went out.",
+    "To thread one, post a proactive `[channel:]`+`[thread:]` file, then a `[REPLIED]` result; a refused "
+    "thread post is parked, so check it went out.",
 )
 # The audience test replaced this: a room's readers, not the data's origin, decide what it may see.
 ROUTING_GONE = ("however personal the topic",)

@@ -329,8 +329,8 @@ Reply in the conversation the request came from: a task with `channel_id`/`sourc
 answered in that room, replying to `source_message_id`. Threading a reply to a top-level message is
 your call: thread when the exchange is better kept out of the main timeline, e.g. a side discussion
 of several messages about one item; when unsure, reply in the timeline. An ask already in a thread
-is answered in it. To thread one, post it as a proactive `[thread:]` file, then a `[REPLIED]`
-result (marker docs below); a refused thread post is parked, so check it went out. Two tests apply:
+is answered in it. To thread one, post a proactive `[channel:]`+`[thread:]` file, then a
+`[REPLIED]` result; a refused thread post is parked, so check it went out. Two tests apply:
 
 - **Audience.** In a room with other people (anything but the owner's own DM), post only what they
   are meant to read: a reply to their message, what the owner asked to be posted there, or work the
