@@ -641,12 +641,20 @@ export function isVoiceSubmittedTask(taskId: string): boolean {
 
 /** A queued voice task the user asked to cancel: delete its file; the core's reply to the instruction confirms. */
 export function noteVoiceTaskCancelled(taskId: string): void {
+	_onVoiceTaskEnded?.(taskId, 'cancelled');
 	_cancelledVoiceTasks.add(taskId);
 	voiceTaskStore.markCancelRequested(taskId);
 	_pendingTasks.delete(taskId);
 	// Deleted, not archived: a core that misses the file looks in tasks/archive/ and runs what it finds there.
 	try { unlinkSync(join(TASK_DIR, `${taskId}.txt`)); } catch { /* already gone */ }
 	_sendTaskStatus?.(taskId, 'done', 'Cancel requested.');
+}
+
+export type VoiceTaskEnd = 'cancelled' | 'delivered_separately';
+let _onVoiceTaskEnded: ((taskId: string, why: VoiceTaskEnd) => void) | null = null;
+/** Told of each voice task whose result never comes back to voice (cancelled, or sent to the DM). */
+export function setVoiceTaskEndedListener(fn: ((taskId: string, why: VoiceTaskEnd) => void) | null): void {
+	_onVoiceTaskEnded = fn;
 }
 
 /** A task the user asked to cancel that the core ran anyway. */
@@ -1747,6 +1755,8 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 						// Claimed now, delivered once the origin is re-verified; an
 						// unverified origin falls back to the owner DM.
 						void _forwardOfflineThenArchive(taskId, file, result, dmOnly);
+						for (const id of [taskId, ...voiceTaskStore.answeredBy(taskId).map(([other]) => other)])
+							_onVoiceTaskEnded?.(id, 'delivered_separately');
 					}
 					// Chat-path tasks have no bridge consumer — archive them directly
 					// so results/task-chat-*.txt files don't accumulate forever.

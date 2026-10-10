@@ -15,7 +15,7 @@ mkdirSync(join(TMP, 'results'), { recursive: true });
 
 const { wireDurableChannels } = await import('../src/live-agent-runtime.js');
 const { RelayAgent } = await import('../src/relay-agent.js');
-const { voiceTaskStore } = await import('../src/task-bridge.js');
+const { voiceTaskStore, setVoiceTaskEndedListener } = await import('../src/task-bridge.js');
 
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
@@ -41,6 +41,7 @@ const session = {
 };
 let submitted: Record<string, unknown> = {};
 const relay = new RelayAgent({ submit: async () => submitted, store: voiceTaskStore });
+setVoiceTaskEndedListener((taskId, why) => { relay.endCall(taskId, why); });
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 wireDurableChannels(session as any, { relay, notReadyRetriesMs: [10, 10], reconcileMs: 300 });
 
@@ -98,5 +99,21 @@ describe('relay agent end to end', () => {
 		await until(() => sent.some((t) => t.includes('PR 9999 status.')), 15_000);
 		assert.ok(sent.some((t) => t.includes('PR 9999 status.')), 'spoken once the session can');
 		assert.ok(existsSync(join(TMP, 'results')));
+	});
+	it('no client connected: the result goes to the DM and its waiting call ends instead of hanging', async () => {
+		session.clientConnected = false;
+		const id = voiceTask('check PR 7777');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'check PR 7777' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 7777 status.');
+		const out = await Promise.race([call, tick(8_000).then(() => 'timed out')]);
+		assert.match(out, /delivered to the user separately/);
+		assert.doesNotMatch(out, /PR 7777 status/, 'not handed to a session nobody hears');
+		assert.equal(relay.isWaiting(id), false);
+		await until(() => voiceTaskStore.get(id)?.delivery === 'dm');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'dm');
+		assert.equal(readdirSync(join(TMP, 'results')).filter((f) => f.startsWith(`proactive-result-${id}-`)).length, 1);
+		session.clientConnected = true;
 	});
 });

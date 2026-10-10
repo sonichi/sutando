@@ -70,15 +70,38 @@ describe('relay agent subagent: the work call returns its task\'s result', () =>
 		assert.equal(plain.notices.length, 0);
 	});
 
-	it('an aborted call leaves the result to be delivered another way', async () => {
+	it('an aborted call ends without a failure (bodhi would read a rejection out as one); the result goes another way', async () => {
 		const { relay, store } = agent(pending('task-6'));
 		const ctl = new AbortController();
 		const call = relay.invoke('w', {}, ctl.signal);
 		await tick(0);
 		ctl.abort();
-		await assert.rejects(call, /aborted/);
+		assert.match(await call, /still running; its result will come in a separate message/);
 		assert.equal(relay.offerResult({ text: 'late', taskId: 'task-6' }), false);
 		assert.equal(store.get('task-6')?.delivery, undefined);
+	});
+
+	it('a cancelled task ends its waiting call quietly: the core never answers a cancelled task', async () => {
+		const { relay } = agent(pending('task-7'));
+		const call = relay.invoke('w', {});
+		await tick(0);
+		const ended: string[] = [];
+		tb.setVoiceTaskEndedListener((id, why) => { ended.push(`${id}:${why}`); relay.endCall(id, why); });
+		try {
+			tb.noteVoiceTaskCancelled('task-7');
+		} finally {
+			tb.setVoiceTaskEndedListener(null);
+		}
+		assert.deepEqual(ended, ['task-7:cancelled']);
+		assert.match(await call, /cancelled this task and was already told/);
+		assert.doesNotMatch(await call, /fail/i);
+		assert.equal(relay.isWaiting('task-7'), false);
+		assert.equal(relay.endCall('task-7', 'cancelled'), false, 'nothing left to end');
+	});
+
+	it('voice-agent ends the relay call of each task whose result never comes back to voice', () => {
+		const src = readFileSync(join(import.meta.dirname, '..', 'src', 'voice-agent.ts'), 'utf-8');
+		assert.match(src, /setVoiceTaskEndedListener\(\(taskId, why\) => \{ relayAgent\.endCall\(taskId, why\); \}\);/);
 	});
 
 	it('a result answering several tasks ends their waiting calls too, and records them all', async () => {

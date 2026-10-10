@@ -178,6 +178,13 @@ interface Waiter {
 	reject: (err: Error) => void;
 }
 
+/** How a waiting call ends without its result. bodhi reads a rejection out as a failure, so none rejects. */
+const ENDED: Record<'cancelled' | 'continuing' | 'delivered_separately', string> = {
+	cancelled: 'The user cancelled this task and was already told. Do not mention it again.',
+	continuing: 'The task is still running; its result will come in a separate message.',
+	delivered_separately: 'This task\'s result is delivered to the user separately. Say nothing about it now.',
+};
+
 /**
  * The `work` subagent. `invoke` submits the task and, unless the status is the answer (a duplicate,
  * a rejection, the fast path), waits for the task's result and returns it. `offerResult` hands a
@@ -196,15 +203,13 @@ export class RelayAgent implements PersistentSubagentInstance {
 		// The ordinary "working on it" is the tool's pending message; a queue position or an offline core is said now.
 		const unusual = (typeof submitted.queuedAhead === 'number' && submitted.queuedAhead > 0) || submitted.watcherOnline === false;
 		if (unusual && typeof submitted.message === 'string') this.deps.notice?.(framedSystem(submitted.message));
-		if (signal?.aborted) throw new Error('aborted');
+		if (signal?.aborted) return framedSystem(ENDED.continuing);
 		return new Promise<string>((resolve, reject) => {
 			const waiter: Waiter = { resolve, reject };
 			this.waiting.set(taskId, waiter);
 			signal?.addEventListener('abort', () => {
-				if (this.waiting.get(taskId) !== waiter) return;
-				this.waiting.delete(taskId);
-				this.deps.log?.(`[RelayAgent] ${taskId}: work call ended before its result; delivering it another way`);
-				reject(new Error('aborted'));
+				if (this.endCall(taskId, 'continuing'))
+					this.deps.log?.(`[RelayAgent] ${taskId}: work call ended before its result; delivering it another way`);
 			}, { once: true });
 		});
 	}
@@ -225,6 +230,15 @@ export class RelayAgent implements PersistentSubagentInstance {
 			this.waiting.delete(id);
 			other.resolve(JSON.stringify({ status: 'answered_together', taskId: id, answeredIn: taskId }));
 		}
+		return true;
+	}
+
+	/** Ends the call waiting on `taskId` without its result. False when none waits. */
+	endCall(taskId: string, why: keyof typeof ENDED): boolean {
+		const waiter = this.waiting.get(taskId);
+		if (!waiter) return false;
+		this.waiting.delete(taskId);
+		waiter.resolve(framedSystem(ENDED[why]));
 		return true;
 	}
 
