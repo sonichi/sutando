@@ -25,7 +25,7 @@ import { resolveWorkspace, statusPath, statusReadPath } from './workspace_defaul
 import { isMacOS, isWindows, activateWindowsApp, clipboardRead, clipboardWrite, macOSOnlyError, openWithDefault } from './platform.js';
 import { PLAYBACK_PATH } from './tmp-paths.js';
 import { presenterModeActive } from './presenter-mode.js';
-import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, voiceTaskState, latestOpenVoiceTask, findOpenVoiceTask, noteVoiceTaskCancelled, isVoiceSubmittedTask } from './task-bridge.js';
+import { buildVoiceTaskHeader, getVoiceSessionOrigin, _rememberTaskOrigin, voiceTaskState, latestOpenVoiceTask, findVoiceTask, noteVoiceTaskCancelled, voiceTaskStore, isVoiceSubmittedTask, voiceTaskRows, type VoiceTaskRow } from './task-bridge.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -678,21 +678,12 @@ export const cancelTaskTool: ToolDefinition = {
 			const tasksDir = join(WORKSPACE_DIR, 'tasks');
 			const files = readdirSync(tasksDir).filter(f => f.endsWith('.txt')).sort();
 
-			// list mode: return id + preview, no cancel
+			// list mode: the user's open voice tasks with where each stands now, no cancel
 			if (list) {
-				if (files.length === 0) return { status: 'nothing_pending', count: 0, tasks: [] };
-				const items = files.map(f => {
-					const id = f.replace('.txt', '');
-					let preview = '';
-					try {
-						const body = readFileSync(join(tasksDir, f), 'utf-8');
-						const taskLine = body.split('\n').find(l => l.startsWith('task:')) ?? body;
-						preview = taskLine.replace(/^task:\s*/, '').slice(0, 60);
-					} catch { /* ignore */ }
-					return { id, preview };
-				});
-				console.log(`${ts()} [CancelTask] list: ${items.length} pending`);
-				return { status: 'pending_tasks', count: items.length, tasks: items };
+				const open = voiceTaskRows().filter((r) => r.state === 'queued' || r.state === 'started' || r.state === 'cancel_requested');
+				console.log(`${ts()} [CancelTask] list: ${open.length} open`);
+				if (open.length === 0) return { status: 'nothing_pending', count: 0, tasks: [] };
+				return { status: 'pending_tasks', count: open.length, tasks: open.map((r) => ({ id: r.id, preview: r.text.slice(0, 60), state: r.state })) };
 			}
 
 			// Targeting: by exact id, by query, or the latest open voice task.
@@ -701,7 +692,7 @@ export const cancelTaskTool: ToolDefinition = {
 				const wantFile = taskId.endsWith('.txt') ? taskId : `${taskId}.txt`;
 				targetId = wantFile.replace('.txt', '');
 			} else if (query) {
-				targetId = findOpenVoiceTask(query);
+				targetId = findVoiceTask(query);
 				if (!targetId) {
 					const needle = query.toLowerCase();
 					for (const f of files) {
@@ -722,7 +713,10 @@ export const cancelTaskTool: ToolDefinition = {
 			const state = voiceTaskState(safeTargetId);
 			console.log(`${ts()} [CancelTask] ${safeTargetId} is ${state}${taskId ? ' (by id)' : query ? ` (by query: ${query})` : ''}`);
 			if (state === 'done') {
-				return { status: 'already_done', taskId: safeTargetId, message: 'It already finished, so nothing was cancelled. Tell the user it is already done.' };
+				const heard = ['spoken', 'injected'].includes(voiceTaskStore.get(safeTargetId)?.delivery ?? '');
+				return { status: 'already_done', taskId: safeTargetId, heard, message: heard
+					? 'It already finished and the user has heard the result, so nothing was cancelled. Tell the user it is already done.'
+					: 'It already finished, so nothing was cancelled; the user has not heard the result yet and will. Tell the user it is already done.' };
 			}
 			if (state === 'cancelled') {
 				return { status: 'already_cancelled', taskId: safeTargetId, message: 'Cancelling it was already requested. Tell the user so.' };
@@ -821,6 +815,25 @@ export function readQueueDepth(workspaceDir: string, nowSec = Math.floor(Date.no
 	} catch { return null; }
 }
 
+/** The user's voice tasks in one sentence for the model, grouped by where each stands now. */
+export function describeVoiceTasks(rows: VoiceTaskRow[]): string {
+	if (rows.length === 0) return 'The user has asked for no tasks by voice in the last few hours.';
+	const group = (label: string, pick: (r: VoiceTaskRow) => boolean) => {
+		const hit = rows.filter(pick);
+		return hit.length ? `${hit.length} ${label} (${hit.map((r) => `"${r.text.slice(0, 40)}"`).join(', ')})` : '';
+	};
+	const heard = (r: VoiceTaskRow) => r.delivery === 'spoken' || r.delivery === 'injected';
+	const parts = [
+		group('in progress', (r) => r.state === 'started'),
+		group('queued', (r) => r.state === 'queued'),
+		group('cancel requested, waiting for the core to confirm', (r) => r.state === 'cancel_requested'),
+		group('cancelled', (r) => r.state === 'cancelled'),
+		group('done and already told to the user', (r) => r.state === 'done' && heard(r)),
+		group('done but the user has not heard the result yet', (r) => r.state === 'done' && !heard(r)),
+	].filter(Boolean);
+	return `Tasks the user asked for by voice: ${parts.join('; ')}.`;
+}
+
 // Get what the core agent (Claude Code proactive-loop) is currently doing.
 // Lets voice-agent Gemini answer "what are you working on?" truthfully
 // instead of guessing. Reads core-status.json written by the core agent, and
@@ -828,8 +841,8 @@ export function readQueueDepth(workspaceDir: string, nowSec = Math.floor(Date.no
 export const getCoreStatusTool: ToolDefinition = {
 	name: 'get_core_status',
 	description:
-		'Get what the core agent (Claude Code) is currently doing and how many tasks are queued. Use when the user asks ' +
-		'"what are you working on", "what are you up to", "are you busy", "anything running", "how many are waiting", ' +
+		'Get what the core agent (Claude Code) is currently doing, and where each task the user asked for by voice stands now. Use when the user asks ' +
+		'"what are you working on", "what are you up to", "are you busy", "anything running", "how many are waiting", "is X done", ' +
 		'or similar questions about background work. Instant file read. Call it ONLY for those ' +
 		'explicit status questions — NEVER on greetings ("hello"), filler, garbled speech, or as ' +
 		'a fallback when unsure what the user wants; fire nothing instead.',
@@ -841,10 +854,13 @@ export const getCoreStatusTool: ToolDefinition = {
 			// (workspace resolves via the M0 helper; default <repo>/workspace/ post-v0.8).
 			// statusReadPath falls back to the legacy workspace-root location for one release.
 			const corePath = statusReadPath('core-status.json', WORKSPACE_DIR);
-			const queued = readQueueDepth(WORKSPACE_DIR);
-			const queueNote = queued === null ? '' : queued === 0 ? ' Nothing is queued.' : ` ${queued} task(s) queued.`;
+			// The user's own tasks come from the relay agent's table; the core's queue depth also counts
+			// other channels' tasks, cancel instructions and health checks, so it is not quoted to the user.
+			const rows = voiceTaskRows();
+			const queueNote = ` ${describeVoiceTasks(rows)}`;
+			const yourTasks = rows.map((r) => ({ id: r.id, task: r.text.slice(0, 60), state: r.state, heard: r.delivery === 'spoken' || r.delivery === 'injected' }));
 			if (!existsSync(corePath)) {
-				return { status: 'idle', queued, description: 'Core agent is not currently running.' + queueNote };
+				return { status: 'idle', yourTasks, description: 'Core agent is not currently running.' + queueNote };
 			}
 			const raw = readFileSync(corePath, 'utf-8');
 			const s = JSON.parse(raw) as { status?: string; ts?: number; step?: string };
@@ -855,11 +871,11 @@ export const getCoreStatusTool: ToolDefinition = {
 					status: 'running',
 					step: s.step || '(no step label)',
 					ageSec,
-					queued,
+					yourTasks,
 					description: `Core agent is working on: ${s.step || 'an unlabeled task'} (started ${ageSec}s ago).` + queueNote,
 				};
 			}
-			return { status: 'idle', queued, description: 'Core agent is idle right now.' + queueNote };
+			return { status: 'idle', yourTasks, description: 'Core agent is idle right now.' + queueNote };
 		} catch (e) {
 			return { status: 'unknown', description: `Could not read core status: ${e instanceof Error ? e.message : e}` };
 		}
