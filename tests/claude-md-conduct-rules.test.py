@@ -28,6 +28,9 @@ ROUTING = (
     "history, files from Drive/Dropbox/Notion, credentials, health or financial records) goes to the DM "
     "whatever the audience.",
     "post it in the DM and exactly one line in the room: 'I sent it to you in our DM.' Never move silently.",
+    "Threading a reply to a top-level message is your call: thread when the exchange is better kept out "
+    "of the main timeline, e.g. a side discussion of several messages about one item; when unsure, reply "
+    "in the timeline. An ask already in a thread is answered in it.",
 )
 # The audience test replaced this: a room's readers, not the data's origin, decide what it may see.
 ROUTING_GONE = ("however personal the topic",)

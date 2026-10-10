@@ -4760,13 +4760,17 @@ def _owner_mention_dm_name(tid: str) -> str:
     return proactive_filename(f"owner-mention-{tid}", "ag2space")[:-len(".txt")]
 
 
-def _owner_mention_dm_queued(tid: str) -> bool:
+def _proactive_copy_queued(name: str) -> bool:
     """A copy already handed to the proactive leg (pending, claimed, sent or parked)."""
-    stem = glob.escape(_owner_mention_dm_name(tid))
-    return ((RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt").exists()
+    stem = glob.escape(name)
+    return ((RESULTS_DIR / f"{name}.txt").exists()
             or any(RESULTS_DIR.glob(f"{stem}.sending*"))
             or any(ARCHIVE_RESULTS_DIR.glob(f"{stem}-*.txt"))
             or any(UNDELIVERABLE_RESULTS_DIR.glob(f"{stem}-*.txt")))
+
+
+def _owner_mention_dm_queued(tid: str) -> bool:
+    return _proactive_copy_queued(_owner_mention_dm_name(tid))
 
 
 def _queue_owner_mention_dm(tid: str, text: str) -> bool:
@@ -4798,6 +4802,50 @@ def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
     return True
 
 
+def _task_thread_name(tid: str) -> str:
+    return proactive_filename(f"thread-{tid}", "ag2space")[:-len(".txt")]
+
+
+def _task_thread_handoff(tid: str, body: str) -> "bool | None":
+    """Hand a `[thread:]` result to the proactive leg; the result server only cites the ask.
+    True = handed off (caller closes the lease silently); False = ordinary result; None = retry."""
+    if not any(a.kind.startswith("thread") for a in parse_markers(body).actions):
+        return False
+    try:
+        if _proactive_copy_queued(_task_thread_name(tid)):
+            return True
+    except OSError as exc:
+        _log(f"result {tid}: thread hand-off state unreadable ({exc}) — retried next pass")
+        return None
+    room = _load_task_rooms().get(tid, "")
+    parsed = parse_markers(body, home_room=room or None)
+    act = next(a for a in parsed.actions if a.kind.startswith("thread"))
+    if act.kind != "thread":
+        _log(f"result {tid}: [thread: {act.value[:80]!r}] "
+             + ("is malformed" if act.kind == "thread-invalid" else f"dropped ({act.extra})")
+             + " — posted as an ordinary reply")
+        return False
+    media = (_load_task_media() or {}).get(_broker_tid(_delivery_tid(tid) or tid)) or {}
+    reply = neutralize_markers(parsed.body).strip()
+    why = ("its room is unknown" if not room
+           else "it carries attachments" if any(a.kind == "attach" for a in parsed.actions)
+           else "its body is empty" if not reply
+           else "its body is too large for one event"
+           if len(reply.encode("utf-8")) > _PROACTIVE_MAX_BODY_B
+           else "a Signal task answers in its request thread"
+           if media.get("mode") == "task-media" else None)
+    if why:
+        _log(f"result {tid}: [thread:] not honoured, {why} — posted as an ordinary reply")
+        return False
+    # Addressed to the task's room, so every other bridge's drain leaves this file alone.
+    text = f"[channel: {room}]\n[thread: {act.value}]\n{reply}\n"
+    if not _durable_write(RESULTS_DIR / f"{_task_thread_name(tid)}.txt", text):
+        _log(f"result {tid}: thread hand-off not written — retried next pass")
+        return None
+    _log(f"result {tid}: handed to the proactive leg for thread {act.value} in {room}")
+    return True
+
+
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     _recover_disposing_claims()
@@ -4826,6 +4874,12 @@ def _post_ready_results(inflight: set[str]) -> None:
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        handed = skip is None and _task_thread_handoff(tid, body)
+        if handed is None:
+            continue
+        if handed:
+            parsed = parse_markers("[no-send]")
+            skip = parsed.actions[0]
         # Every dedup marker routes through the shared plan, malformed included:
         # it owns the reject-and-report policy (dedup_recovery.plan_dedup_recovery).
         if skip and skip.value == "deduped":

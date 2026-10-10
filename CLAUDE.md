@@ -326,7 +326,10 @@ Tasks arrive from multiple channels via the same file bridge:
 ### Where replies go
 
 Reply in the conversation the request came from: a task with `channel_id`/`source_room_id` is
-answered in that room, replying to `source_message_id`. Two tests apply:
+answered in that room, replying to `source_message_id`. Threading a reply to a top-level message is
+your call: thread when the exchange is better kept out of the main timeline, e.g. a side discussion
+of several messages about one item; when unsure, reply in the timeline. An ask already in a thread
+is answered in it. Two tests apply:
 
 - **Audience.** In a room with other people (anything but the owner's own DM), post only what they
   are meant to read: a reply to their message, what the owner asked to be posted there, or work the
@@ -334,7 +337,7 @@ answered in that room, replying to `source_message_id`. Two tests apply:
   debugging, anything about the owner the others would not know) goes to the owner's DM even when
   asked in the room or by voice while docked in it; nothing goes in the room unless it was waiting
   for it. By voice while docked, a task whose answer is for the owner starts its result with
-  `[dm-only]`: the task bridge keeps it to the DM, not the room.
+  `[dm-only]`: the task bridge keeps it to the DM.
 - **Data origin, on top.** Data read from the owner's connected accounts or device
   (mail, calendar events, contacts, message history, files from Drive/Dropbox/Notion, credentials,
   health or financial records) goes to the DM whatever the audience.
@@ -342,17 +345,17 @@ answered in that room, replying to `source_message_id`. Two tests apply:
 When you move an answer the room was waiting for, post it in the DM and exactly one line in the
 room: 'I sent it to you in our DM.' Never move silently.
 
-**Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially. Full semantics + history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":
-- `[deduped: task-<other-id>]` — silently archive this task as done; the full reply goes in the other task's result file. Thread-consolidation path.
+**Result-body protocol markers** — a result body STARTING with one of these is delivered specially. Full semantics: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":
+- `[deduped: task-<other-id>]` — silently archive this task as done; the full reply goes in the other task's result file.
 - `[no-send]` / `[REPLIED]` — skip delivery (still archives): nothing to show / already sent another way.
-- `[channel: <channel-id>]` — as first non-empty line only: deliver the rest of the body to that channel instead of the originating one. Telegram silently drops it.
-- `[thread: $<root>]` — proactive lead line, after any skip marker: AG2 Space posts in that thread. For a thread in use; new topics go top level.
+- `[channel: <channel-id>]` — first non-empty line only: deliver the rest to that channel instead. Telegram drops it.
+- `[thread: $<root>]` — lead line, after any skip marker: AG2 Space posts the result (task or proactive) in that thread.
 - `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body; detected anywhere, stripped only when alone on its line.
-- `[file: /path]` / `[send: /path]` / `[attach: /path]` — extract and attach the file alongside the text body.
+- `[file: /path]` / `[send: /path]` / `[attach: /path]` — attach the file to the text body.
 
-**Marker parsing is centralised — do not re-implement it.** A Python result consumer MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`; attachments = actions with `kind == "attach"`). Attachment-path authorization is owned by `src/policy/egress/attachment.py` before the upload sink. One-way dependency: `parse_markers() -> send_allowlist.is_path_sendable() -> transport upload`, where `src/send_allowlist.py` is a transition alias. Private copies drift — guarded by `tests/bridge-marker-no-leak.test.py`; history in [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md).
+**Marker parsing is centralised — do not re-implement it.** A Python result consumer MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`; attachments = actions with `kind == "attach"`). Attachment-path authorization is owned by `src/policy/egress/attachment.py` before the upload sink. One-way dependency: `parse_markers() -> send_allowlist.is_path_sendable() -> transport upload`, where `src/send_allowlist.py` is a transition alias. Private copies drift — guarded by `tests/bridge-marker-no-leak.test.py`.
 
-**Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task — keep using it unless you specifically need to push a result to a non-delegating consumer. Use the scoped form ONLY when a result needs to be claimed by a pull-side consumer that didn't delegate the work:
+**Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task — keep it unless you need to push a result to a non-delegating consumer. Use the scoped form ONLY when a result needs to be claimed by a pull-side consumer that didn't delegate the work:
 - phone → key built via `phoneCallKey(callSid)` → `phone-<safe(call-sid)>`
 
 **Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix. The per-consumer prefix is code-enforced (single helper, single source of truth) so cross-consumer namespace collisions are impossible regardless of what ID format a future consumer adopts.
