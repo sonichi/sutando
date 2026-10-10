@@ -47,7 +47,7 @@ Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
   the destination may not be that room: `thread-foreign` replaces `thread`
   and the body is posted top level.
 
-  THREAD-ASK marker — a bare leading line, in any order with the above:
+  THREAD-ASK marker — a leading line that is exactly this, in any order with the above:
     [thread]
   A task result only: the gateway asks the broker to answer in a new thread on
   the task's own asking message (`"thread": "ask"`). It names no event, so it
@@ -201,7 +201,8 @@ _REPLY_RE = re.compile(r"^\s*\[reply:\s*(\d{17,20})\]\s*\n?")
 _THREAD_RE = re.compile(r"^\s*\[thread:\s*([^\]]*)\]\s*\n?", re.IGNORECASE)
 _THREAD_ROOT_RE = re.compile(r"\$\S+")
 # Bare [thread] — a task result asks for a thread on its own ask; no id is read.
-_THREAD_ASK_RE = re.compile(r"^\s*\[thread\]\s*\n?", re.IGNORECASE)
+# Only a line of its own: "[thread]ing ..." or "[thread] text" is prose.
+_THREAD_ASK_RE = re.compile(r"^\s*\[thread\][ \t]*(?:\r?\n|\Z)", re.IGNORECASE)
 
 #: STRIPPING is narrower than DETECTION, deliberately. Detection stays
 #: `search()`-anywhere so the privacy guard cannot be defeated by marker

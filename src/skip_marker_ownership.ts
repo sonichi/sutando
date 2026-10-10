@@ -9,6 +9,27 @@ export const SKIP_MARKER_RE = /^\s*(?:\[(?:no-send|REPLIED)\]|\[deduped:\s*[^\]]
 // it before any marker scan (result_markers.py:135), so this must too.
 export const D7_HEADER_RE = /^\*\*\[core:\s*[^\]]+\]\*\*\s*\n(?:_[^\n]*_\s*\n)?\s*/;
 
+// Lines voice never speaks: a standalone `[dm-only]` anywhere, and a bare
+// `[thread]` in the leading marker lines (result_markers.py _THREAD_ASK_RE).
+const THREAD_ASK_LINE_RE = /^[ \t]*\[thread\][ \t]*\r?$/i;
+const LEADING_MARKER_LINE_RE = /^[ \t]*\[(?:channel:[^\]\n]*|thread:[^\]\n]*|reply:[ \t]*\d{17,20})\][ \t]*\r?$/i;
+
+/** The text voice/log callbacks may show: control-only lines removed, prose untouched. */
+export function stripVoiceControlLines(text: string): string {
+	const body = String(text ?? '').replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '');
+	const header = D7_HEADER_RE.exec(body)?.[0] ?? '';
+	const lines = body.slice(header.length).split('\n');
+	let i = 0;
+	const out: string[] = [];
+	for (; i < lines.length; i++) {
+		const line = lines[i];
+		if (THREAD_ASK_LINE_RE.test(line)) continue;
+		if (line.trim() !== '' && !LEADING_MARKER_LINE_RE.test(line)) break;
+		out.push(line);
+	}
+	return header + out.concat(lines.slice(i)).join('\n');
+}
+
 /** True iff `result`'s body carries a skip marker, D7 header peeled first. */
 export function bodyIsSkipMarked(result: string): boolean {
 	return SKIP_MARKER_RE.test(String(result ?? "").replace(D7_HEADER_RE, ""));

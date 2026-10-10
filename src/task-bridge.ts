@@ -16,7 +16,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
-import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, dedupTarget, type TaskOrigin } from './skip_marker_ownership.js';
+import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, dedupTarget, stripVoiceControlLines, type TaskOrigin } from './skip_marker_ownership.js';
 import { createVoiceTaskStore, planReconcile } from './relay-agent.js';
 import { framedSystem } from './inject-framing.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
@@ -617,7 +617,7 @@ export function reconcileVoiceTasks(deliver: RelayDeliver, isInFlight: (taskId: 
 		if (action === 'speak_result' && text) {
 			console.log(`${ts()} [RelayAgent] ${id}: result never heard (${row.delivery ?? 'no delivery'})${source !== id ? `, answered in ${source}` : ''}; handing it over again`);
 			voiceTaskStore.noteReplay(id);
-			deliver(text.replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '').trim(), row.cancelRequested ? CANCELLED_BUT_FINISHED_NOTE : MISSED_RESULT_NOTE, { taskId: id });
+			deliver(stripVoiceControlLines(text).trim(), row.cancelRequested ? CANCELLED_BUT_FINISHED_NOTE : MISSED_RESULT_NOTE, { taskId: id });
 		} else if (action === 'tell_not_picked') {
 			const minutes = Math.floor((now - (row.submittedAt ?? now)) / 60000);
 			console.log(`${ts()} [RelayAgent] ${id}: not picked up after ${minutes}m; telling the user`);
@@ -1658,9 +1658,7 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 				// Detected before the strip: an origin-bound result that carries the
 				// marker is kept to the owner's DM (keepVoiceResultToDm).
 				const dmOnly = DM_ONLY_RE.test(rawResult);
-				const result = rawResult
-					.replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '')
-					.trim();
+				const result = stripVoiceControlLines(rawResult).trim();
 				if (!result) continue;
 				const taskId = file.replace('.txt', '');
 

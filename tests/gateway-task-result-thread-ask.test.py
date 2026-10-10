@@ -10,9 +10,10 @@ the thread on the task's own asking message (no event id is ever sent).
   d) worker attribution                -> metadata.worker_id rides with thread "ask";
                                           refused attribution -> no POST at all
   e) [thread] + [file:]                -> upload kept, marker stripped, thread "ask"
-  f) [channel:] + [thread]             -> redirect re-stitched as today
+  f) [channel:] + [thread]             -> redirect re-stitched as today, no thread field
   g) broker 400 on the thread field    -> re-posted once without it, delivered, archived
   h) proactive file with [thread]      -> stripped, posted top level (task results only)
+  i) `[thread]` not alone on its line  -> prose: body untouched, no thread field
 
 Loads src/remote-gateway-bridge.py in-process (its real PROACTIVE_CLAIM_GATE),
 with an isolated workspace and a fake `_req`; never runs the wrapper as a process.
@@ -179,6 +180,7 @@ def main() -> int:
     h.run("tt-f", f"[channel: {OTHER}]\n[thread]\nmoved\n")
     p = h.results[0] if h.results else {}
     check(p.get("body") == f"[channel: {OTHER}]\nmoved", f"f) redirect re-stitched, body clean, got {p.get('body')!r}")
+    check("thread" not in p, f"f) a redirected answer never asks for a thread, got {p}")
 
     # g) a 400 for the field re-posts without it instead of parking the answer
     h = Harness(refuse_thread_400=True)
@@ -200,6 +202,13 @@ def main() -> int:
     p = posts[0] if posts else {}
     check(len(posts) == 1 and p.get("body") == "nudge" and "thread_root" not in p
           and "thread" not in p, f"h) proactive: top level, body clean, got {posts}")
+
+    # i) the marker is the whole line; anything else on it is prose
+    for n, text in enumerate(("[thread]ing is a library primitive", "[thread] prose on one line")):
+        h = Harness()
+        h.run(f"tt-i{n}", text + "\n")
+        p = h.results[0] if h.results else {}
+        check(p.get("body") == text and "thread" not in p, f"i) {text!r} delivered verbatim, got {p}")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0

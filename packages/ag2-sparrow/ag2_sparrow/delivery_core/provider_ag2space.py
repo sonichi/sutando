@@ -16,6 +16,8 @@ from .contract import (DeliveryAttempt, DeliveryOutcome, DeliveryReceipt,
                        ProviderRefused, ProviderPermanentRefused)
 
 RESULTS_PATH = "/v1/results"
+# Optional result field (docs/remote-gateway-protocol.md): only this value is sent.
+RESULT_THREAD_FIELD, RESULT_THREAD_ASK = "thread", "ask"
 
 
 class AG2SpaceResultProvider:
@@ -45,10 +47,10 @@ class AG2SpaceResultProvider:
             except urllib.error.HTTPError as e:
                 # A 400 records nothing and keeps the lease: an opt-in thread
                 # request must cost the placement, never the answer.
-                if e.code != 400 or "thread" not in envelope:
+                if e.code != 400 or RESULT_THREAD_FIELD not in envelope:
                     raise
                 unthreaded = True
-                plain = {k: v for k, v in envelope.items() if k != "thread"}
+                plain = {k: v for k, v in envelope.items() if k != RESULT_THREAD_FIELD}
                 resp = self._request("POST", RESULTS_PATH, plain) or {}
         except urllib.error.HTTPError as e:
             # The bridge refreshes credentials through its polling loop.

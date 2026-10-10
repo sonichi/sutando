@@ -124,6 +124,16 @@ check("bare and rooted forms are distinct actions",
       a == [("thread-ask", ""), ("thread", ROOT)] and body == "both", f"{a} {body!r}")
 a, body = acts("[Thread]\n[thread]\nonce")
 check("repeated bare [thread] is one action", a == [("thread-ask", "")] and body == "once", f"{a} {body!r}")
+for prose in ("[thread]ing is a library primitive", "[thread] prose on one line",
+              "[thread]\t- not alone", "[thread]x\nnext"):
+    for label, parse in (("src", parse_markers), ("vendored", mod.parse_markers)):
+        a, body = acts(prose, parse)
+        check(f"{label}: {prose!r} is prose, not a marker", a == [] and body == prose, f"{a} {body!r}")
+a, body = acts("[thread] \t\r\nCRLF and trailing blanks")
+check("standalone [thread] with trailing blanks and CRLF", a == [("thread-ask", "")]
+      and body == "CRLF and trailing blanks", f"{a} {body!r}")
+a, body = acts("[thread]")
+check("[thread] alone at end of body", a == [("thread-ask", "")] and body == "", f"{a} {body!r}")
 a, body = acts("use [thread] inline")
 check("inline bare [thread] is prose", a == [] and body == "use [thread] inline", f"{a} {body!r}")
 a, body = acts("[no-send]\n[thread]\nx")

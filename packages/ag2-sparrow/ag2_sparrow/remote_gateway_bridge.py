@@ -313,7 +313,8 @@ from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
                             RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
-from .delivery_core.provider_ag2space import AG2SpaceResultProvider
+from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
+                                              RESULT_THREAD_FIELD)
 from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
                            ready_body_of, ResultIdentity)
 from . import result_disposal as disposal
@@ -4646,7 +4647,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["no_send"] = True
     if thread_ask:
         # The broker roots it on this task's own ask; a broker without it ignores the key.
-        doc["thread"] = "ask"
+        doc[RESULT_THREAD_FIELD] = RESULT_THREAD_ASK
     # Structured attribution, not the "— core-N" prose in the body: the
     # signature is for humans and reformatting it must not change routing.
     worker, refused = _attribution(tid)
@@ -4959,7 +4960,8 @@ def _post_ready_results(inflight: set[str]) -> None:
                 continue
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
-        thread_ask = any(a.kind == "thread-ask" for a in parsed.actions)
+        # A redirected answer leaves the asking room, so it never asks for a thread there.
+        thread_ask = redirect is None and any(a.kind == "thread-ask" for a in parsed.actions)
         if not _deliver_result_payload(tid, _wire, out_body, result_file=rfile,
                                        generation=generation, thread_ask=thread_ask):
             continue

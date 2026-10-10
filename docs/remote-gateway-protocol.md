@@ -120,7 +120,28 @@ Return a task's result.
 
 ```
 body: { "id": "task-123", "body": "<result text>" }
+body: { "id": "task-123", "body": "<result text>", "thread": "ask" }   // optional
 ```
+
+**`thread` (optional).** Defined by the broker in
+[ag2-space/ag2space-backend#2138](https://github.com/ag2-space/ag2space-backend/pull/2138).
+`"ask"` asks the broker to answer in a new thread rooted on the task's own asking
+message; no field names an event id, so a result can only open a thread on the
+message it was asked in. The broker:
+
+- answers an ask already in a thread in that thread, with or without the field;
+- ignores the field and posts a plain reply when the task has no source message,
+  the body redirects with `[channel:]`, or the ask cannot root a thread;
+- treats absent, `null` or `false` as today's placement;
+- answers `400 {"error": "invalid thread: ..."}` for any other value and records,
+  sends and completes nothing: the lease stays open.
+
+A broker that predates the field ignores it, so a client may send it before the
+broker supports it. The client sends only `"ask"`, and only on an ordinary
+(non-suppressed, non-redirected) task result whose leading lines carry a bare
+`[thread]` line (`src/result_markers.py`). The field name and value live in one
+place on the client: `RESULT_THREAD_FIELD` / `RESULT_THREAD_ASK` in
+`packages/ag2-sparrow/ag2_sparrow/delivery_core/provider_ag2space.py`.
 
 ### `POST /v1/heartbeat`
 
@@ -288,7 +309,12 @@ and broker result ID remain the same. No agent task is created to regenerate
 an answer because its POST failed.
 
 HTTP 401/403 (while polling recovers authentication), 408, 425, 429, 5xx and
-transport failures are retryable. Other 4xx responses,
+transport failures are retryable. One exception to "one POST per attempt": a
+`400` to a POST that carried `thread` is re-posted once, in the same attempt and
+under the same result ID, without the field, because the broker guarantees that
+400 records nothing and keeps the lease. No other status is treated this way
+(a `422` or any other 4xx with the field parks as below); a retryable failure
+re-sends the stored payload with the field. Other 4xx responses,
 malformed envelopes and explicit decline envelopes are permanent refusals and
 park on the first attempt. This policy applies to the gateway **task-result**
 leg only; proactive room sends and other providers keep their existing retry

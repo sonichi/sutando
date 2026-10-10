@@ -110,11 +110,16 @@ class TestTaskBridgeTsParity(unittest.TestCase):
     delivery is worse than uniformly-wrong delivery. If it must hand-roll, the
     expression is pinned here to the Python semantics."""
 
-    TS = REPO / "src" / "task-bridge.ts"
+    TS = REPO / "src" / "skip_marker_ownership.ts"
+
+    def test_task_bridge_strips_through_the_shared_helper(self):
+        src = (REPO / "src" / "task-bridge.ts").read_text()
+        self.assertNotRegex(src, r"\.replace\([^\n]*dm-only", "task-bridge.ts must not hand-roll the strip")
+        self.assertGreaterEqual(src.count("stripVoiceControlLines("), 2, "both voice paths use the helper")
 
     def _expr(self) -> str:
         m = re.search(r"\.replace\(\s*(/[^\n]*?dm-only[^\n]*?/[gimsuy]*)", self.TS.read_text())
-        self.assertIsNotNone(m, "could not find the dm-only replace() in task-bridge.ts")
+        self.assertIsNotNone(m, "could not find the dm-only replace() in skip_marker_ownership.ts")
         return m.group(1)
 
     def test_expression_is_anchored_multiline_and_case_insensitive(self):
