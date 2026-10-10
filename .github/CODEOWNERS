@@ -36,7 +36,7 @@
 /tests/ @sonichi @qingyun-wu @liususan091219
 
 # Clear per-area leader over the full history (90-day leader in parentheses where it differs).
-/skills/agent-room-ops/    @qingyun-wu
+/skills/agent-room-ops/    @qingyun-wu @marklysze   # owner-assigned 2026-10-02
 /skills/worker-pool/       @qingyun-wu @keweichen @sonichi # Qingyun 29, Chi 19, Kewei 3 commits; Kewei wrote the two largest recent features (#4769 Codex workers, #4783 display names) and reviews every worker-pool PR; @sonichi owner-assigned
 /skills/task-progress/     @qingyun-wu
 /skills/phone-conversation/ @sonichi @liususan091219 @qingyun-wu   # full history: Chi 46, Susan 28, Qingyun 21 (90 days: Qingyun)
@@ -71,3 +71,8 @@
 
 # Mark: co-owner where he's clear 2nd place (added 2026-09-28, owner-assigned: 'add Mark for areas he's 2nd').
 /skills/call-diagnostics/  @liususan091219 @marklysze     # Susan 4, Mark 3, Qingyun 2
+
+# room_ops tests follow the skill's owners (owner-assigned 2026-10-02).
+/tests/agent-room-ops-*    @qingyun-wu @marklysze
+/tests/room-ops-*          @qingyun-wu @marklysze
+/tests/room_ops_*          @qingyun-wu @marklysze
