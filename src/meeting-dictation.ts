@@ -273,15 +273,17 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 			if (!delivered) deps.log('[MeetingDictation] meeting-ended context not delivered to the fresh connection');
 			return;
 		}
-		if (meetingEnded) await deps.session.injectText(MEETING_OVER_CONTEXT, { mode: 'quiet' });
+		if (!meetingEnded) return;
+		meetingEnded = false;
+		await deps.session.injectText(MEETING_OVER_CONTEXT, { mode: 'quiet' });
 	}
 
 	return {
 		enter: () => serial(enter),
 		exit: () => serial(() => exit({ byVoice: false })),
-		/** The model finished a turn: the meeting-ended context, if any, was taken in. */
+		/** The model finished a turn (not an interrupted one): the meeting-ended context, if any, was taken in. */
 		noteModelTurnEnded: () => {
-			if (deps.session.getTranscriptionMode() === 'agent') unacknowledged = null;
+			unacknowledged = null;
 		},
 		/** Call once the session is active again on a fresh provider connection. */
 		afterConnectionReplaced: () => serial(afterConnectionReplaced),
@@ -289,4 +291,36 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 			return notePath;
 		},
 	};
+}
+
+/** The session events `restoreAfterFreshConnection` listens to (bodhi's event bus). */
+export interface MeetingSessionEvents {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	subscribe(event: string, handler: (payload: any) => void): unknown;
+}
+
+/**
+ * Wires meeting dictation to the session: a turn the model finished acknowledges the meeting-ended
+ * context, and a fresh provider connection, once active, gets back what the old one took with it.
+ * bodhi ends the turn it abandons at a reconnect boundary with turn.interrupted then turn.end, before
+ * session.reconnectBoundary: that turn.end is not an answer. Deferred past bodhi's recent-context injection.
+ */
+export function restoreAfterFreshConnection(
+	events: MeetingSessionEvents,
+	md: Pick<ReturnType<typeof attachMeetingDictation>, 'noteModelTurnEnded' | 'afterConnectionReplaced'>,
+	deferMs = 250,
+): void {
+	const interrupted = new Set<string>();
+	let connectionReplaced = false;
+	events.subscribe('turn.interrupted', (e) => { if (e?.turnId) interrupted.add(String(e.turnId)); });
+	events.subscribe('turn.end', (e) => {
+		if (e?.turnId && interrupted.delete(String(e.turnId))) return;
+		md.noteModelTurnEnded();
+	});
+	events.subscribe('session.reconnectBoundary', () => { connectionReplaced = true; });
+	events.subscribe('session.stateChange', (e) => {
+		if (e?.toState !== 'ACTIVE' || !connectionReplaced) return;
+		connectionReplaced = false;
+		setTimeout(() => { void md.afterConnectionReplaced(); }, deferMs);
+	});
 }

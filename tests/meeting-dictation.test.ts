@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DictationTranscriptEvent } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE, MEETING_OVER_CONTEXT, meetingStamp } from '../src/meeting-dictation.js';
+import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE, MEETING_OVER_CONTEXT, meetingStamp, restoreAfterFreshConnection } from '../src/meeting-dictation.js';
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
@@ -317,7 +317,7 @@ describe('a provider connection replaced after a meeting', () => {
 		assert.deepEqual(during.injected, [], 'a model quiesced for the meeting gets nothing');
 	});
 
-	it('a turn that ends while still in the meeting does not count as the answer', async () => {
+	it('a turn that ended before the meeting ended is not the answer to it', async () => {
 		const t = setupMeeting();
 		await t.md.enter();
 		t.md.noteModelTurnEnded();
@@ -328,12 +328,87 @@ describe('a provider connection replaced after a meeting', () => {
 	});
 });
 
-describe('voice-agent restores meeting state on a fresh provider connection', () => {
-	it('a reconnect boundary, then ACTIVE, calls afterConnectionReplaced; turn ends are reported', () => {
+describe('wiring to the session: bodhi\'s event order at a fresh connection', () => {
+	function wired() {
+		const handlers: Record<string, Array<(e: unknown) => void>> = {};
+		const bus = { subscribe: (ev: string, h: (e: unknown) => void) => { (handlers[ev] ??= []).push(h); } };
+		const emit = (ev: string, e: unknown = {}) => { for (const h of handlers[ev] ?? []) h(e); };
+		const dir = mkdtempSync(join(tmpdir(), 'meet-wire-'));
+		let mode: 'agent' | 'transcription' = 'agent';
+		const listeners: Array<(e: DictationTranscriptEvent) => void> = [];
+		const injected: Array<{ text: string; mode: string }> = [];
+		const md = attachMeetingDictation({
+			session: {
+				setTranscriptionMode: async (m: 'agent' | 'transcription') => { mode = m; },
+				getTranscriptionMode: () => mode,
+				clearDictationBuffer: () => {},
+				injectText: async (text: string, o: { mode: string }) => { injected.push({ text, mode: o.mode }); return true; },
+				onDictationTranscript: (l: (e: DictationTranscriptEvent) => void) => { listeners.push(l); return () => {}; },
+			},
+			notePathFor: (d) => join(dir, `meeting-${d}.md`), onExitByVoice: () => {}, log: () => {},
+		});
+		restoreAfterFreshConnection(bus, md, 0);
+		const say = (text: string) => { for (const l of listeners) l({ text, partial: false }); };
+		// bodhi: abandon the active turn (interrupted, then end), then the boundary, then ACTIVE on the new socket.
+		const freshConnection = async (abandoned?: string) => {
+			if (abandoned) { emit('turn.interrupted', { turnId: abandoned }); emit('turn.end', { turnId: abandoned }); }
+			emit('session.reconnectBoundary', { reason: 'human-retry' });
+			emit('session.stateChange', { toState: 'ACTIVE' });
+			await tick(5);
+		};
+		const meeting = async (line: string) => { await md.enter(); say(line); say('Sutando, come back'); await tick(); };
+		return { md, emit, injected, freshConnection, meeting };
+	}
+
+	it('the turn bodhi abandons at the boundary is not an answer: the transcript is sent again, live', async () => {
+		const t = wired();
+		await t.meeting('we ship on Friday');
+		await t.freshConnection('turn_7');
+		assert.equal(t.injected.length, 2);
+		assert.equal(t.injected[1].mode, 'live');
+		assert.match(t.injected[1].text, /we ship on Friday/);
+	});
+
+	it('a turn the model finished is the answer: only the quiet line, and only once', async () => {
+		const t = wired();
+		await t.meeting('we ship on Friday');
+		t.emit('turn.end', { turnId: 'turn_8' });
+		await t.freshConnection();
+		assert.deepEqual(t.injected.slice(1), [{ text: MEETING_OVER_CONTEXT, mode: 'quiet' }]);
+		await t.freshConnection();
+		assert.equal(t.injected.length, 2, 'a later fresh connection hears nothing more');
+	});
+
+	it('nothing happens before ACTIVE, nor on ACTIVE without a boundary (a resumed connection)', async () => {
+		const t = wired();
+		await t.meeting('we ship on Friday');
+		t.emit('session.reconnectBoundary', {});
+		t.emit('session.stateChange', { toState: 'RECONNECTING' });
+		await tick(5);
+		assert.equal(t.injected.length, 1);
+		t.emit('session.stateChange', { toState: 'ACTIVE' });
+		await tick(5);
+		assert.equal(t.injected.length, 2, 'sent once ACTIVE comes');
+		t.emit('session.stateChange', { toState: 'ACTIVE' });
+		await tick(5);
+		assert.equal(t.injected.length, 2, 'an ACTIVE without a boundary sends nothing');
+	});
+
+	it('in a second meeting after one that ended, a fresh connection sends nothing', async () => {
+		const t = wired();
+		await t.meeting('first meeting');
+		t.emit('turn.end', { turnId: 'turn_1' });
+		await t.md.enter();
+		t.emit('turn.end', { turnId: 'turn_2' });
+		await t.freshConnection();
+		assert.equal(t.injected.length, 1, 'the model stays quiet in the meeting');
+	});
+});
+
+describe('voice-agent wires meeting dictation to the session', () => {
+	it('through restoreAfterFreshConnection', () => {
 		const src = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/voice-agent.ts'), 'utf-8');
-		assert.match(src, /subscribe\('session\.reconnectBoundary', \(\) => \{ connectionReplaced = true; \}\);/);
-		assert.match(src, /setTimeout\(\(\) => \{ void meetingDictation\?\.afterConnectionReplaced\(\); \}, 250\);/);
-		assert.match(src, /subscribe\('turn\.end', \(\) => meetingDictation\?\.noteModelTurnEnded\(\)\);/);
+		assert.match(src, /restoreAfterFreshConnection\(session\.eventBus, meetingDictation\);/);
 	});
 });
 
