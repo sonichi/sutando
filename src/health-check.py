@@ -9969,16 +9969,19 @@ def apply_task_watcher_sentinel_fix(checks: list, stream=None) -> None:
             c.update(fresh)
 
 
-# The one owned hook whose effect leaves the workspace; excluded from unattended repair.
 def apply_claude_hooks_fix(checks: list, stream=None) -> None:
     """--fix for claude-hooks: sweep owned copies out of the project/config settings files.
 
-    Safe unattended: the sweep removes only byte-identical installer output (or a copy whose
-    script is gone), and the probe is re-run rather than trusting the sweep's own report.
+    Only once the live core's launch record carries every hook: until then those copies are
+    the running core's hooks. The probe is re-run rather than trusting the sweep's report.
     """
     out = stream if stream is not None else sys.stdout
     for c in checks:
         if c["name"] != "claude-hooks" or not c.get("_project_leftovers"):
+            continue
+        if not c.get("_live_core_has_launch_hooks"):
+            print(f"  {c['name']}: not swept — the running core still depends on those copies; "
+                  "the next core launch removes them", file=out)
             continue
         sweeper = REPO_DIR / "src" / "install-claude-hooks.sh"
         print(f"  {c['name']}: sweeping {len(c['_project_leftovers'])} owned entr"
@@ -11733,9 +11736,6 @@ def check_vault_manifest_integrity(
     }
 
 
-_REQUIRED_HOOK_EVENTS = ("Stop", "UserPromptSubmit", "PreCompact", "SessionEnd", "SessionStart")
-
-
 def _core_launch_settings(repo: Path) -> tuple[Optional[dict], str]:
     """The core's --settings JSON as session-launch.sh builds it, or (None, why not)."""
     builder = repo / "src" / "agent" / "claude" / "cli" / "build-core-settings.mjs"
@@ -11760,11 +11760,18 @@ def _core_launch_settings(repo: Path) -> tuple[Optional[dict], str]:
     return settings, ""
 
 
+def _fmt_records(records) -> str:
+    shown = sorted(records)[:4]
+    more = f", +{len(records) - 4} more" if len(records) > 4 else ""
+    return ", ".join(f"{e}[{m}]:{c}" for e, m, c in shown) + more
+
+
 def check_claude_hook_registration(
     repo_dir: Optional[Path] = None,
     config_dir: Optional[Path] = None,
+    workspace_dir: Optional[Path] = None,
 ) -> dict:
-    """Do the core's launch settings carry every Sutando hook, and no settings file a copy?
+    """Does the live core's launch carry every Sutando hook, and no settings file a copy?
 
     The launch JSON is the only registration; a copy left in a project or config-dir
     settings file fires in sessions Sutando did not start, or twice in the core.
@@ -11773,50 +11780,63 @@ def check_claude_hook_registration(
     repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
     if not (repo / "src" / "agent" / "claude" / "cli" / "build-core-settings.mjs").is_file():
         return {"name": name, "status": "ok", "detail": "no build-core-settings.mjs — not a sutando checkout"}
+    import claude_hooks_settings as chs
     problems: list[str] = []
     settings, why = _core_launch_settings(repo)
     registered: set = set()
+    try:
+        owned_expected = chs.owned_launch_records(repo)
+    except Exception as exc:  # noqa: BLE001 — must warn, not abort the later probes
+        owned_expected = set()
+        problems.append(f"owned-hooks table unreadable ({exc})")
     if settings is None:
         problems.append(why)
     else:
-        for event, groups in (settings.get("hooks") or {}).items():
-            for group in groups or []:
-                for hook in (group or {}).get("hooks") or []:
-                    if isinstance(hook, dict) and isinstance(hook.get("command"), str):
-                        registered.add((event, hook["command"]))
-        events = {e for e, _c in registered}
-        missing = [e for e in _REQUIRED_HOOK_EVENTS if e not in events]
+        registered = chs.records_in(settings)
+        missing = owned_expected - registered
         if missing:
-            problems.append(f"launch settings lack {', '.join(missing)} hooks")
+            problems.append(f"launch settings lack owned hooks: {_fmt_records(missing)}")
         import skill_hooks
-        unreg = [f"{e}:{c}" for e, _t, c, _p in skill_hooks.discover(repo) if (e, c) not in registered]
+        unreg = [f"{e}:{c}" for e, _t, c, _p in skill_hooks.discover(repo) if (e, "", c) not in registered]
         if unreg:
             problems.append(f"skill hooks missing from launch settings: {', '.join(unreg)}")
-        from claude_hooks_settings import script_path_of
-        dead = sorted({p for _e, c in registered for p in [script_path_of(c)]
+        dead = sorted({p for _e, _m, c in registered for p in [chs.script_path_of(c)]
                        if p and os.path.isabs(p) and "$" not in p and not os.path.exists(p)})
         if dead:
             problems.append(f"launch hooks point at missing scripts: {', '.join(dead)}")
         if settings.get("cleanupPeriodDays") is None:
             problems.append("launch settings do not set cleanupPeriodDays (transcripts expire after 30 days)")
-    import claude_hooks_settings as chs
+    ws = Path(workspace_dir) if workspace_dir is not None else WORKSPACE_DIR
+    live_ok = False
+    try:
+        rec = json.loads((ws / "state" / "core-launch-settings.json").read_text(encoding="utf-8"))
+        lacking = chs.launch_records(repo) - chs.records_in(rec.get("settings") or {})
+        if lacking:
+            problems.append(f"the running core was launched without {_fmt_records(lacking)} — restart the core")
+        else:
+            live_ok = bool(owned_expected)
+    except FileNotFoundError:
+        problems.append("no launch record for the running core: it predates launch-time hook "
+                        "registration, so it runs the settings-file copies until restarted")
+    except Exception as exc:  # noqa: BLE001 — a malformed record is reported, not raised
+        problems.append(f"core launch record unreadable ({exc})")
     leftovers: list[str] = []
     targets = chs.default_targets(repo)
     ccd = Path(config_dir) / "settings.json" if config_dir is not None else chs.core_config_settings(repo)
     if ccd is not None:
         targets.append(ccd)
     try:
-        owned = chs.emitted_commands(repo)
+        owned = chs.emitted_records(repo)
         for target in targets:
             leftovers += [f"{target}: {e} {c}" for e, c in chs.sweep_file(target, owned, dry_run=True)]
     except Exception as exc:  # noqa: BLE001 — a malformed settings file is reported, not raised
         problems.append(f"could not read a settings file to check for stale copies ({exc})")
     if leftovers:
         problems.append(f"{len(leftovers)} Sutando hook cop{'y' if len(leftovers) == 1 else 'ies'} still in a "
-                        "settings file, firing outside the core launch — run `bash src/install-claude-hooks.sh`")
+                        "settings file, firing outside the core launch — the next core launch removes them")
     if problems:
         return {"name": name, "status": "warn", "detail": "; ".join(problems),
-                "_project_leftovers": leftovers}
+                "_project_leftovers": leftovers, "_live_core_has_launch_hooks": live_ok}
     return {"name": name, "status": "ok",
             "detail": f"{len(registered)} hooks registered by the core's launch settings only"}
 

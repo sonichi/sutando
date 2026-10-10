@@ -6,21 +6,24 @@ JSON (src/agent/claude/cli/build-core-settings.mjs). Copies an earlier installer
 left in a project ``.claude/settings.json`` fire in every session opened there,
 and copies in the core's config dir fire again in the core, so both are swept.
 
-An entry is removed only when it is byte-identical to a command an installer
-emitted for this checkout under that event, or when it runs one of those scripts
-from a path that no longer exists. Anything else, an operator's edit included,
-stays.
+An entry is removed only when its (event, matcher, command) is exactly a record an
+installer wrote, for this checkout or for the moved checkout its missing script
+path names. Anything else, an operator's edit included, stays.
 
     python3 src/claude_hooks_settings.py sweep --repo <repo> [--settings <file>]... [--dry-run] [--no-core-config]
+    python3 src/claude_hooks_settings.py launch-check --repo <repo> < <launch-settings.json>
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shlex
+import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +38,13 @@ _OWNED_SCRIPTS = (
 )
 _DESKTOP_ARCHIVE_CP = ('cp "$TRANSCRIPT_PATH" '
                        '"$HOME/Desktop/sutando-conversations/$(date +%Y-%m-%dT%H-%M-%S).jsonl"')
+# A retired Stop hook that killed the live task watcher at every turn end.
+_WATCHER_KILL_STOP = ('PID_FILE="${SUTANDO_WORKSPACE:-$HOME/.sutando/workspace}/state/watch-tasks-stream.pid"; '
+                      'if [ -f "$PID_FILE" ]; then PID=$(cat "$PID_FILE" 2>/dev/null); '
+                      '[ -n "$PID" ] && kill "$PID" 2>/dev/null; rm -f "$PID_FILE"; fi; exit 0')
+OWNED_HOOKS_TABLE = Path(__file__).resolve().parent / "agent" / "claude" / "cli" / "owned-hooks.json"
+
+Record = tuple[str, str, str]
 
 
 def script_path_of(command: str) -> Optional[str]:
@@ -53,16 +63,16 @@ def script_path_of(command: str) -> Optional[str]:
     return None
 
 
-def emitted_commands(repo: Path) -> set[tuple[str, str]]:
-    """Every (event, command) a Sutando installer has written for the checkout at ``repo``."""
+def emitted_records(repo: Path) -> set[Record]:
+    """Every (event, matcher, command) a Sutando installer has written for the checkout at ``repo``."""
     # An installer saw the checkout through whatever path it was run by, symlinked or not.
-    out: set[tuple[str, str]] = set()
+    out: set[Record] = set()
     for root in {Path(repo), Path(repo).resolve()}:
         out |= _emitted_for(root)
     return out
 
 
-def _emitted_for(repo: Path) -> set[tuple[str, str]]:
+def _emitted_for(repo: Path, with_skills: bool = True) -> set[Record]:
     src = Path(repo) / "src"
 
     def sq(name: str) -> str:
@@ -72,27 +82,66 @@ def _emitted_for(repo: Path) -> set[tuple[str, str]]:
         return f'"{src / name}"'
 
     out = {
-        ("Stop", f"bash {sq('check-pending-tasks.sh')}"),
-        ("Stop", f"bash {dq('check-pending-tasks.sh')}"),
-        ("Stop", "bash $HOME/Desktop/sutando/src/check-pending-tasks.sh"),
-        ("UserPromptSubmit", f"bash {sq('turn-start.sh')}"),
-        ("PreCompact", f"bash {sq('archive-transcript.sh')} \"$HOME/Desktop/sutando-conversations/\""),
-        ("PreCompact", _DESKTOP_ARCHIVE_CP),
-        ("SessionStart", f"bash {dq('schedule-crons-session-hint.sh')}"),
-        ("SessionStart", f"bash {dq('personal-claude-compact-hint.sh')}"),
-        ("SessionStart", f"bash {dq('watcher-rearm-session-hint.sh')}"),
-        ("SessionEnd", f"bash {dq('session-handoff.sh')} \"${{TRANSCRIPT_PATH:-}}\""),
+        ("Stop", "", f"bash {sq('check-pending-tasks.sh')}"),
+        ("Stop", "", f"bash {dq('check-pending-tasks.sh')}"),
+        ("Stop", "", "bash $HOME/Desktop/sutando/src/check-pending-tasks.sh"),
+        ("Stop", "", _WATCHER_KILL_STOP),
+        ("UserPromptSubmit", "", f"bash {sq('turn-start.sh')}"),
+        ("PreCompact", "", f"bash {sq('archive-transcript.sh')} \"$HOME/Desktop/sutando-conversations/\""),
+        ("PreCompact", "", _DESKTOP_ARCHIVE_CP),
+        ("SessionStart", "", f"bash {dq('schedule-crons-session-hint.sh')}"),
+        ("SessionStart", "compact", f"bash {dq('personal-claude-compact-hint.sh')}"),
+        ("SessionStart", "compact|resume", f"bash {dq('watcher-rearm-session-hint.sh')}"),
+        ("SessionEnd", "", f"bash {dq('session-handoff.sh')} \"${{TRANSCRIPT_PATH:-}}\""),
     }
     for event in ("PreCompact", "SessionEnd"):
-        out.add((event, f"bash {sq('session-handoff.sh')} \"$TRANSCRIPT_PATH\""))
-        out.add((event, f"bash {dq('session-handoff.sh')} \"$TRANSCRIPT_PATH\""))
-        out.add((event, "bash $HOME/Desktop/sutando/src/session-handoff.sh \"$TRANSCRIPT_PATH\""))
+        out.add((event, "", f"bash {sq('session-handoff.sh')} \"$TRANSCRIPT_PATH\""))
+        out.add((event, "", f"bash {dq('session-handoff.sh')} \"$TRANSCRIPT_PATH\""))
+        out.add((event, "", "bash $HOME/Desktop/sutando/src/session-handoff.sh \"$TRANSCRIPT_PATH\""))
+    if with_skills:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from skill_hooks import discover
+        for event, _token, command, prior in discover(Path(repo)):
+            out.add((event, "", command))
+            out.add((event, "", prior))
+    return out
+
+
+def owned_launch_records(repo: Path) -> set[Record]:
+    """The lifecycle hooks build-core-settings.mjs registers for ``repo``, from the shared table."""
+    rows = json.loads(OWNED_HOOKS_TABLE.read_text(encoding="utf-8"))
+    return {(event, matcher, f"bash {_shq(os.path.normpath(os.path.join(str(repo), 'src', script)))}{args}")
+            for event, matcher, script, args in rows}
+
+
+def skill_launch_records(repo: Path) -> set[Record]:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from skill_hooks import discover
-    for event, _token, command, prior in discover(Path(repo)):
-        out.add((event, command))
-        out.add((event, prior))
+    return {(event, "", command) for event, _t, command, _p in discover(Path(repo))}
+
+
+def launch_records(repo: Path) -> set[Record]:
+    """What the core's launch settings must carry before any settings-file copy may be swept."""
+    return owned_launch_records(repo) | skill_launch_records(repo)
+
+
+def records_in(settings: dict) -> set[Record]:
+    """Every (event, matcher, command) a settings object registers."""
+    out: set[Record] = set()
+    hooks = settings.get("hooks") if isinstance(settings, dict) else None
+    for event, groups in (hooks.items() if isinstance(hooks, dict) else ()):
+        for group in groups if isinstance(groups, list) else ():
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                continue
+            for hook in group["hooks"]:
+                if isinstance(hook, dict) and isinstance(hook.get("command"), str):
+                    out.add((event, _matcher(group), hook["command"]))
     return out
+
+
+def _matcher(group: dict) -> str:
+    m = group.get("matcher", "")
+    return m if isinstance(m, str) else repr(m)
 
 
 def _shq(s: str) -> str:
@@ -100,15 +149,18 @@ def _shq(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-def _is_dead_owned_copy(command: str) -> bool:
-    """Runs one of our scripts from a path that no longer exists (and carries no variable)."""
-    path = script_path_of(command)
-    if not path or os.path.basename(path) not in _OWNED_SCRIPTS or "$" in path:
+def _is_moved_checkout_copy(record: Record) -> bool:
+    """Exactly a record an installer wrote for another checkout, whose script path is now gone."""
+    path = script_path_of(record[2])
+    if not path or "$" in path or not os.path.isabs(path) or os.path.exists(path):
         return False
-    return os.path.isabs(path) and not os.path.exists(path)
+    script = Path(path)
+    if script.name not in _OWNED_SCRIPTS or script.parent.name != "src":
+        return False
+    return record in _emitted_for(script.parent.parent, with_skills=False)
 
 
-def sweep(settings: dict, owned: set[tuple[str, str]]) -> list[tuple[str, str]]:
+def sweep(settings: dict, owned: set[Record]) -> list[tuple[str, str]]:
     """Drop owned entries from ``settings`` in place; returns the (event, command) pairs removed."""
     removed: list[tuple[str, str]] = []
     hooks = settings.get("hooks")
@@ -125,8 +177,8 @@ def sweep(settings: dict, owned: set[tuple[str, str]]) -> list[tuple[str, str]]:
             kept = []
             for hook in entry["hooks"]:
                 command = hook.get("command") if isinstance(hook, dict) else None
-                if isinstance(command, str) and ((event, command) in owned
-                                                 or _is_dead_owned_copy(command)):
+                record = (event, _matcher(entry), command)
+                if isinstance(command, str) and (record in owned or _is_moved_checkout_copy(record)):
                     removed.append((event, command))
                     continue
                 kept.append(hook)
@@ -138,7 +190,22 @@ def sweep(settings: dict, owned: set[tuple[str, str]]) -> list[tuple[str, str]]:
     return removed
 
 
-def sweep_file(path: Path, owned: set[tuple[str, str]], dry_run: bool = False) -> list[tuple[str, str]]:
+def write_json_keeping_mode(path: Path, data: dict) -> None:
+    """Atomically replace ``path``; an existing file keeps its mode, a new one is 0600."""
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2) + "\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def sweep_file(path: Path, owned: set[Record], dry_run: bool = False) -> list[tuple[str, str]]:
     """Sweep one settings file; a missing file is a no-op and is never created."""
     if not path.is_file():
         return []
@@ -147,9 +214,7 @@ def sweep_file(path: Path, owned: set[tuple[str, str]], dry_run: bool = False) -
         raise ValueError(f"{path}: top level is not an object")
     removed = sweep(settings, owned)
     if removed and not dry_run:
-        tmp = path.with_name(path.name + ".sweep.tmp")
-        tmp.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        write_json_keeping_mode(path, settings)
     return removed
 
 
@@ -174,6 +239,14 @@ def core_config_settings(repo: Path) -> Optional[Path]:
         return None
 
 
+def launch_check(repo: Path, settings_text: str) -> list[Record]:
+    """The launch records ``settings_text`` lacks; raises when it is not a settings object."""
+    settings = json.loads(settings_text)
+    if not isinstance(settings, dict):
+        raise ValueError("launch settings are not a JSON object")
+    return sorted(launch_records(repo) - records_in(settings))
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -184,9 +257,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-core-config", action="store_true",
                    help="skip the core CLAUDE_CONFIG_DIR settings.json")
+    c = sub.add_parser("launch-check", help="exit 0 only if the launch settings on stdin carry every Sutando hook")
+    c.add_argument("--repo", required=True)
     args = parser.parse_args(argv)
     repo = Path(args.repo)
-    owned = emitted_commands(repo)
+    if args.cmd == "launch-check":
+        try:
+            missing = launch_check(repo, sys.stdin.read())
+        except Exception as exc:  # noqa: BLE001 — any doubt means the copies are kept
+            print(f"claude-hooks launch-check: {exc}", file=sys.stderr)
+            return 1
+        for event, matcher, command in missing:
+            print(f"claude-hooks launch-check: missing {event} [{matcher}] {command!r}", file=sys.stderr)
+        return 1 if missing else 0
+    owned = emitted_records(repo)
     rc = 0
     total = 0
     targets = default_targets(repo) + [Path(s) for s in args.settings]

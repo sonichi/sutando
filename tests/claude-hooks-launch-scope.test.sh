@@ -1,6 +1,6 @@
 #!/bin/bash
-# The launcher's --settings JSON carries every owned and skill hook; after a launch no settings
-# file a guest session reads (project file, core config dir) still holds one.
+# The launcher's --settings JSON carries every owned and skill hook; after a core launch no
+# settings file a guest session reads still holds one; a launch without settings keeps them.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -15,6 +15,7 @@ REPO="$ROOT/repo"; WS="$ROOT/ws"
 mkdir -p "$REPO" "$WS/.claude-sutando" "$ROOT/home"
 REPO="$(cd "$REPO" && pwd)"
 for f in src/agent/claude/cli/session-launch.sh src/agent/claude/cli/build-core-settings.mjs \
+         src/agent/claude/cli/owned-hooks.json \
          src/install-claude-hooks.sh src/claude_hooks_settings.py src/skill_hooks.py src/sutando_config.py \
          scripts/python-binary.sh; do mkdir -p "$(dirname "$REPO/$f")"; cp "$REAL/$f" "$REPO/$f"; done
 OWNED="check-pending-tasks.sh turn-start.sh session-handoff.sh schedule-crons-session-hint.sh personal-claude-compact-hint.sh watcher-rearm-session-hint.sh"
@@ -46,15 +47,40 @@ json.dump({"hooks": {"SessionEnd": [g(f'bash "{r}/src/session-handoff.sh" "${{TR
           open(sys.argv[2], "w"))
 PY
 
-# The same launcher steps start-cli.sh and launch-worker-session.sh run.
+# A launch whose settings cannot be built (node absent) leaves the copies the core still runs.
+LEGACY="$(cat "$REPO/.claude/settings.json" "$WS/.claude-sutando/settings.json")"
+NONODE="$ROOT/nonode-bin"; mkdir -p "$NONODE"
+for b in bash python3 cat dirname mkdir; do ln -s "$(command -v "$b")" "$NONODE/$b"; done
+env -u SUTANDO_CLAUDE_WORKING_DIR PATH="$NONODE" HOME="$ROOT/home" CLAUDE_CONFIG_DIR="$WS/.claude-sutando" \
+  SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$WS" REPO="$REPO" "$NONODE/bash" -c '
+  . "$REPO/src/agent/claude/cli/session-launch.sh"; resolve_claude_py
+  resolve_claude_settings_args; sweep_legacy_claude_hooks_for_launch
+  echo "settings_count=${#SETTINGS_ARGS[@]}"' > "$ROOT/nonode.out" 2>&1
+ok "node absent: no launch settings" "$(grep -q '^settings_count=0$' "$ROOT/nonode.out" && echo 0 || echo 1)" "$(cat "$ROOT/nonode.out")"
+ok "node absent: the legacy copies stay byte-identical" \
+   "$([ "$(cat "$REPO/.claude/settings.json" "$WS/.claude-sutando/settings.json")" = "$LEGACY" ] && echo 0 || echo 1)"
+
+# A builder that fails under the launcher's `set -e` neither aborts the launch nor loses the copies.
+cp -R "$REPO" "$ROOT/broken"; rm "$ROOT/broken/src/agent/claude/cli/owned-hooks.json"
+env -u SUTANDO_CLAUDE_WORKING_DIR HOME="$ROOT/home" CLAUDE_CONFIG_DIR="$WS/.claude-sutando" \
+  SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$WS" REPO="$ROOT/broken" bash -ec '
+  . "$REPO/src/agent/claude/cli/session-launch.sh"; resolve_claude_py
+  resolve_claude_settings_args; sweep_legacy_claude_hooks_for_launch
+  echo "settings_count=${#SETTINGS_ARGS[@]}"' > "$ROOT/broken.out" 2>&1
+ok "a failed settings build: the launch goes on without settings" \
+   "$(grep -q '^settings_count=0$' "$ROOT/broken.out" && echo 0 || echo 1)" "$(tail -3 "$ROOT/broken.out")"
+ok "a failed settings build: the legacy copies stay byte-identical" \
+   "$([ "$(cat "$ROOT/broken/.claude/settings.json")" = "$(cat "$REPO/.claude/settings.json")" ] && echo 0 || echo 1)"
+
+# The steps start-cli.sh runs for a core launch once no core is live.
 OUT="$ROOT/launch.out"
 # CLAUDE_CONFIG_DIR as resolve_claude_config_dir_and_seed exports it before this step.
 env -u SUTANDO_CLAUDE_WORKING_DIR -u SUTANDO_OBS_ENDPOINT HOME="$ROOT/home" CLAUDE_CONFIG_DIR="$WS/.claude-sutando" \
   SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$WS" REPO="$REPO" bash -c '
   . "$REPO/src/agent/claude/cli/session-launch.sh"
   resolve_claude_py
-  sweep_project_claude_hooks >/dev/null
-  resolve_claude_settings_args >/dev/null
+  resolve_claude_settings_args >/dev/null 2>&1
+  sweep_legacy_claude_hooks_for_launch >/dev/null
   [ "${SETTINGS_ARGS[0]:-}" = --settings ] && printf "%s" "${SETTINGS_ARGS[1]}"' > "$OUT" 2>"$ROOT/launch.err"
 ok "the launcher produced a --settings payload" "$([ -s "$OUT" ] && echo 0 || echo 1)" "$(cat "$ROOT/launch.err")"
 
@@ -85,23 +111,65 @@ ok "a guest session does not run the skill hook" "$(echo "$GUEST" | grep -qF "$S
 snap="$(cat "$REPO/.claude/settings.json" "$WS/.claude-sutando/settings.json")"
 env -u SUTANDO_CLAUDE_WORKING_DIR HOME="$ROOT/home" CLAUDE_CONFIG_DIR="$WS/.claude-sutando" SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$WS" \
   REPO="$REPO" bash -c '. "$REPO/src/agent/claude/cli/session-launch.sh"; resolve_claude_py
-  sweep_project_claude_hooks; resolve_claude_settings_args' >/dev/null 2>&1
+  resolve_claude_settings_args; sweep_legacy_claude_hooks_for_launch' >/dev/null 2>&1
 ok "a relaunch leaves both settings files byte-identical" \
    "$([ "$(cat "$REPO/.claude/settings.json" "$WS/.claude-sutando/settings.json")" = "$snap" ] && echo 0 || echo 1)"
 
-# An operator's own retention is kept, and a file the seed cannot parse is left alone.
-seed_once() {
-  env -u SUTANDO_OBS_ENDPOINT HOME="$ROOT/home" CLAUDE_CONFIG_DIR="$1" REPO="$REPO" bash -c '
-    . "$REPO/src/agent/claude/cli/session-launch.sh"; resolve_claude_py; resolve_claude_settings_args' >/dev/null 2>&1
+# Retention: --settings outranks the user and project files, so an operator's value there must
+# still be the effective one. Effective = first source that sets it, in Claude Code's order.
+launch_payload() {
+  env -u SUTANDO_OBS_ENDPOINT -u SUTANDO_CLAUDE_WORKING_DIR HOME="$ROOT/home" CLAUDE_CONFIG_DIR="$1" REPO="$REPO" bash -c '
+    . "$REPO/src/agent/claude/cli/session-launch.sh"; resolve_claude_py; resolve_claude_settings_args >/dev/null 2>&1
+    printf "%s" "${SETTINGS_ARGS[1]:-}"'
 }
-mkdir -p "$ROOT/ccd-own" "$ROOT/ccd-bad"
+effective_days() {
+  python3 - "$@" <<'PY'
+import json, sys
+for src in sys.argv[1:]:
+    try:
+        d = json.loads(src) if src.startswith("{") else json.load(open(src))
+    except Exception:
+        continue
+    if isinstance(d, dict) and "cleanupPeriodDays" in d:
+        print(d["cleanupPeriodDays"]); break
+else:
+    print(30)
+PY
+}
+mkdir -p "$ROOT/ccd-own" "$ROOT/ccd-bad" "$ROOT/ccd-new" "$ROOT/ccd-0600"
 echo '{"cleanupPeriodDays": 45}' > "$ROOT/ccd-own/settings.json"
 printf '{broken' > "$ROOT/ccd-bad/settings.json"
-seed_once "$ROOT/ccd-own"; seed_once "$ROOT/ccd-bad"
-ok "an operator-set cleanupPeriodDays is kept" \
+P="$(launch_payload "$ROOT/ccd-own")"
+ok "an operator-set cleanupPeriodDays is kept in the file" \
    "$(python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["cleanupPeriodDays"] == 45 else 1)' "$ROOT/ccd-own/settings.json"; echo $?)"
+ok "an operator-set cleanupPeriodDays is the effective one" \
+   "$([ "$(effective_days "$P" "$REPO/.claude/settings.local.json" "$REPO/.claude/settings.json" "$ROOT/ccd-own/settings.json")" = 45 ] && echo 0 || echo 1)" \
+   "$(effective_days "$P" "$ROOT/ccd-own/settings.json")"
+python3 - "$REPO/.claude/settings.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1])); d["cleanupPeriodDays"] = 60; json.dump(d, open(sys.argv[1], "w"))
+PY
+P="$(launch_payload "$ROOT/ccd-new")"
+ok "a project-set cleanupPeriodDays is the effective one" \
+   "$([ "$(effective_days "$P" "$REPO/.claude/settings.json" "$ROOT/ccd-new/settings.json")" = 60 ] && echo 0 || echo 1)"
+python3 - "$REPO/.claude/settings.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1])); d.pop("cleanupPeriodDays"); json.dump(d, open(sys.argv[1], "w"))
+PY
+rm -rf "$ROOT/ccd-new"; mkdir -p "$ROOT/ccd-new"
+launch_payload "$ROOT/ccd-bad" >/dev/null
 ok "an unparseable config-dir settings file is left byte-identical" \
    "$([ "$(cat "$ROOT/ccd-bad/settings.json")" = '{broken' ] && echo 0 || echo 1)"
+mode_of() { python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$1"; }
+P="$(umask 022; launch_payload "$ROOT/ccd-new")"
+ok "with no retention anywhere the launch keeps transcripts" \
+   "$([ "$(effective_days "$P")" = 3650 ] && echo 0 || echo 1)"
+ok "a config-dir settings file the seed creates is private" "$([ "$(mode_of "$ROOT/ccd-new/settings.json")" = 0o600 ] && echo 0 || echo 1)" \
+   "$(mode_of "$ROOT/ccd-new/settings.json")"
+echo '{"model": "x"}' > "$ROOT/ccd-0600/settings.json"; chmod 600 "$ROOT/ccd-0600/settings.json"
+(umask 022; launch_payload "$ROOT/ccd-0600" >/dev/null)
+ok "the seed keeps a 0600 settings file 0600" "$([ "$(mode_of "$ROOT/ccd-0600/settings.json")" = 0o600 ] && echo 0 || echo 1)" \
+   "$(mode_of "$ROOT/ccd-0600/settings.json")"
 
 echo "claude-hooks-launch-scope: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

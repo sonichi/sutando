@@ -155,6 +155,7 @@ EOF
   cp "$REAL_REPO/src/agent/restart-guard.sh" "$REPO_FAKE/src/agent/"
   cp "$REAL_REPO/src/agent/task-event-handler-lookup.sh" "$REPO_FAKE/src/agent/"
   cp "$REAL_REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO_FAKE/src/agent/claude/cli/"
+  cp "$REAL_REPO/src/agent/claude/cli/owned-hooks.json" "$REPO_FAKE/src/agent/claude/cli/"
   cp "$REAL_REPO/hooks/skip-ask-user-question.py" "$REPO_FAKE/hooks/"
 
   if [ "$helper_present" = "yes" ]; then

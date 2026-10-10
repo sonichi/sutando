@@ -35,6 +35,7 @@
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 const CLEANUP_PERIOD_DAYS = 3650;
@@ -153,18 +154,9 @@ if (nativePimGuardHook.trim()) {
 	};
 }
 
-// [event, matcher, script under src/, args]. Registered nowhere else, so a session launched
-// without this JSON (a contributor's, a review bot's, a `claude -p` the core spawns) runs none.
-const OWNED_HOOKS = [
-	['Stop', '', 'check-pending-tasks.sh', ''],
-	// begin_turn is the Stop gate's only reset, so without this it never re-arms.
-	['UserPromptSubmit', '', 'turn-start.sh', ''],
-	['PreCompact', '', 'session-handoff.sh', ' "$TRANSCRIPT_PATH"'],
-	['SessionEnd', '', 'session-handoff.sh', ' "$TRANSCRIPT_PATH"'],
-	['SessionStart', '', 'schedule-crons-session-hint.sh', ''],
-	['SessionStart', 'compact', 'personal-claude-compact-hint.sh', ''],
-	['SessionStart', 'compact|resume', 'watcher-rearm-session-hint.sh', ''],
-];
+// [event, matcher, script under src/, args]; the health probe and the sweep read the same table.
+// Registered nowhere else, so a session launched without this JSON runs none of them.
+const OWNED_HOOKS = JSON.parse(readFileSync(new URL('./owned-hooks.json', import.meta.url), 'utf8'));
 const ownedRepo = named['--owned-hooks'] || '';
 let ownedSettings = null;
 if (ownedRepo.trim()) {

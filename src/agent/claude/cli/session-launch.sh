@@ -255,34 +255,56 @@ resolve_claude_settings_args() {
   else
     echo "session hooks: no runnable python — skill hooks NOT registered this session" >&2
   fi
-  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" --owned-hooks "$REPO" --skill-hooks "$SKILL_HOOKS_JSON")"
+  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" --owned-hooks "$REPO" --skill-hooks "$SKILL_HOOKS_JSON")" \
+    || CLAUDE_SETTINGS_JSON=""
   if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
+    apply_claude_transcript_retention
     SETTINGS_ARGS=(--settings "$CLAUDE_SETTINGS_JSON")
     echo "session hooks: AskUserQuestion guard + Sutando lifecycle and skill hooks registered for this session only"
-    seed_claude_transcript_retention
   else
     echo "session hooks: settings build failed — AskUserQuestion guard NOT registered this session" >&2
   fi
 }
 
-# A `claude -p` the core spawns inherits CLAUDE_CONFIG_DIR but not --settings, and runs the
-# transcript cleanup over the same store, so the retention goes there too unless already set.
-seed_claude_transcript_retention() {
-  [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -n "${PY:-}" ] || return 0
-  _settings_json="$CLAUDE_SETTINGS_JSON" "$PY" - "$CLAUDE_CONFIG_DIR/settings.json" <<'PY' \
-    || echo "session hooks: transcript-retention seed skipped (non-fatal)" >&2
-import json, os, sys
-days = json.loads(os.environ["_settings_json"]).get("cleanupPeriodDays")
-path = sys.argv[1]
-st = json.load(open(path)) if os.path.exists(path) else {}
-if days and isinstance(st, dict) and "cleanupPeriodDays" not in st:
-    st["cleanupPeriodDays"] = days
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path + ".tmp", "w") as f:
+# --settings outranks the user and project files, so a retention set in either is honoured by
+# dropping ours; otherwise it is seeded into the config dir that `claude -p` children inherit.
+apply_claude_transcript_retention() {
+  [ -n "${PY:-}" ] || return 0
+  local out
+  out="$(_settings_json="$CLAUDE_SETTINGS_JSON" "$PY" - "${CLAUDE_CONFIG_DIR:-}" "${SUTANDO_CLAUDE_WORKING_DIR:-$REPO}" <<'PY'
+import json, os, stat, sys, tempfile
+payload = json.loads(os.environ["_settings_json"])
+ccd, cwd = sys.argv[1], sys.argv[2]
+user = os.path.join(ccd, "settings.json") if ccd else ""
+files = [f for f in (user, os.path.join(cwd, ".claude", "settings.json"),
+                     os.path.join(cwd, ".claude", "settings.local.json")) if f]
+def load(p):
+    try:
+        d = json.load(open(p))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return None
+    return d if isinstance(d, dict) else None
+loaded = {f: load(f) for f in files}
+own = next((f for f, d in loaded.items() if d and "cleanupPeriodDays" in d), None)
+if own:
+    payload.pop("cleanupPeriodDays", None)
+    print(f"  ✓ transcript retention: {own} sets cleanupPeriodDays; the launch settings defer to it", file=sys.stderr)
+elif user and loaded.get(user) is not None and payload.get("cleanupPeriodDays"):
+    st = dict(loaded[user], cleanupPeriodDays=payload["cleanupPeriodDays"])
+    os.makedirs(ccd, exist_ok=True)
+    mode = stat.S_IMODE(os.stat(user).st_mode) if os.path.exists(user) else 0o600
+    fd, tmp = tempfile.mkstemp(dir=ccd, prefix=".settings.json.")
+    with os.fdopen(fd, "w") as f:
         json.dump(st, f, indent=2)
-    os.replace(path + ".tmp", path)
-    print(f"  ✓ transcript-retention seed: cleanupPeriodDays={days} in {path}")
+    os.chmod(tmp, mode)
+    os.replace(tmp, user)
+    print(f"  ✓ transcript-retention seed: cleanupPeriodDays={payload['cleanupPeriodDays']} in {user}", file=sys.stderr)
+print(json.dumps(payload))
 PY
+)" && [ -n "$out" ] && CLAUDE_SETTINGS_JSON="$out" \
+    || echo "session hooks: transcript-retention step skipped (non-fatal)" >&2
 }
 
 # Claude Code's native OTel token+cost metrics. Hooks give obs EVENTS but no
@@ -385,10 +407,35 @@ forward_skill_manifest_config() {
   unset _mc_seen _mcrec
 }
 
-# Removes the entries older installers wrote into the project settings file; left
-# there they would also fire, a second time here and in every guest session.
-sweep_project_claude_hooks() {
-  bash "$REPO/src/install-claude-hooks.sh" || echo "session-launch: project hook sweep failed (rc=$?) — old project-level copies may still fire" >&2
+# Core launch only, once no core is live: the settings-file copies are the running core's
+# only hooks until a launch whose --settings carries all of them replaces it.
+sweep_legacy_claude_hooks_for_launch() {
+  if [ "${SETTINGS_ARGS[0]:-}" != --settings ] || [ -z "${PY:-}" ]; then
+    echo "session-launch: no launch settings — legacy hook entries kept, this core runs them instead" >&2
+    return 0
+  fi
+  if ! printf '%s' "${SETTINGS_ARGS[1]}" | "$PY" "$REPO/src/claude_hooks_settings.py" launch-check --repo "$REPO"; then
+    echo "session-launch: launch settings lack a Sutando hook — legacy hook entries kept" >&2
+    return 0
+  fi
+  bash "$REPO/src/install-claude-hooks.sh" || echo "session-launch: legacy hook sweep failed (rc=$?) — old copies may still fire" >&2
+}
+
+# The record the health probe reads for what the live core was launched with.
+record_core_launch_settings() {
+  [ "${SETTINGS_ARGS[0]:-}" = --settings ] && [ -n "${PY:-}" ] || return 0
+  local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ] || return 0
+  _settings_json="${SETTINGS_ARGS[1]}" _repo="$REPO" "$PY" - "$ws/state/core-launch-settings.json" <<'PY' \
+    || echo "session-launch: core launch-settings record not written (non-fatal)" >&2
+import json, os, sys, tempfile, time
+path = sys.argv[1]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+rec = {"ts": int(time.time()), "repo": os.environ["_repo"], "settings": json.loads(os.environ["_settings_json"])}
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".core-launch-settings.")
+with os.fdopen(fd, "w") as f:
+    json.dump(rec, f)
+os.replace(tmp, path)
+PY
 }
 
 # Creates a new tmux session running claude with the fully-assembled args, then

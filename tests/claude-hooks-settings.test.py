@@ -37,7 +37,7 @@ class Fixture(unittest.TestCase):
         (self.repo / "src").mkdir(parents=True)
         for name in ("check-pending-tasks.sh", "session-handoff.sh", "turn-start.sh"):
             (self.repo / "src" / name).write_text("#!/bin/bash\n")
-        self.owned = chs.emitted_commands(self.repo)
+        self.owned = chs.emitted_records(self.repo)
         self.q = lambda name: chs._shq(str(self.repo / "src" / name))
         self.dq = lambda name: f'"{self.repo / "src" / name}"'
 
@@ -45,21 +45,22 @@ class Fixture(unittest.TestCase):
         self._td.cleanup()
 
 
-class EmittedCommands(Fixture):
+class EmittedRecords(Fixture):
     def test_every_historical_installer_form_is_recognized(self):
         want = {
-            ("Stop", f"bash {self.q('check-pending-tasks.sh')}"),
-            ("UserPromptSubmit", f"bash {self.q('turn-start.sh')}"),
-            ("PreCompact", f"bash {self.q('session-handoff.sh')} {TP}"),
-            ("SessionEnd", f"bash {self.q('session-handoff.sh')} {TP}"),
-            ("SessionEnd", f'bash {self.dq("session-handoff.sh")} "${{TRANSCRIPT_PATH:-}}"'),
-            ("PreCompact", f'bash {self.q("archive-transcript.sh")} "$HOME/Desktop/sutando-conversations/"'),
-            ("PreCompact", chs._DESKTOP_ARCHIVE_CP),
-            ("Stop", "bash $HOME/Desktop/sutando/src/check-pending-tasks.sh"),
-            ("SessionEnd", f"bash $HOME/Desktop/sutando/src/session-handoff.sh {TP}"),
-            ("SessionStart", f"bash {self.dq('schedule-crons-session-hint.sh')}"),
-            ("SessionStart", f"bash {self.dq('personal-claude-compact-hint.sh')}"),
-            ("SessionStart", f"bash {self.dq('watcher-rearm-session-hint.sh')}"),
+            ("Stop", "", f"bash {self.q('check-pending-tasks.sh')}"),
+            ("UserPromptSubmit", "", f"bash {self.q('turn-start.sh')}"),
+            ("PreCompact", "", f"bash {self.q('session-handoff.sh')} {TP}"),
+            ("SessionEnd", "", f"bash {self.q('session-handoff.sh')} {TP}"),
+            ("SessionEnd", "", f'bash {self.dq("session-handoff.sh")} "${{TRANSCRIPT_PATH:-}}"'),
+            ("PreCompact", "", f'bash {self.q("archive-transcript.sh")} "$HOME/Desktop/sutando-conversations/"'),
+            ("PreCompact", "", chs._DESKTOP_ARCHIVE_CP),
+            ("Stop", "", "bash $HOME/Desktop/sutando/src/check-pending-tasks.sh"),
+            ("Stop", "", chs._WATCHER_KILL_STOP),
+            ("SessionEnd", "", f"bash $HOME/Desktop/sutando/src/session-handoff.sh {TP}"),
+            ("SessionStart", "", f"bash {self.dq('schedule-crons-session-hint.sh')}"),
+            ("SessionStart", "compact", f"bash {self.dq('personal-claude-compact-hint.sh')}"),
+            ("SessionStart", "compact|resume", f"bash {self.dq('watcher-rearm-session-hint.sh')}"),
         }
         self.assertEqual(want - self.owned, set())
 
@@ -68,10 +69,10 @@ class EmittedCommands(Fixture):
         out = subprocess.run(
             ["node", str(REPO / "src/agent/claude/cli/build-core-settings.mjs"), "/g.py",
              "--owned-hooks", str(self.repo)], capture_output=True, text=True, check=True).stdout
-        built = {(ev, h["command"]) for ev, groups in json.loads(out)["hooks"].items()
-                 for g in groups for h in g["hooks"] if ev != "PreToolUse"}
+        built = {r for r in chs.records_in(json.loads(out)) if r[0] != "PreToolUse"}
+        self.assertEqual(built, chs.owned_launch_records(self.repo))
         # Hints were written double-quoted by their installers, so only the core four overlap.
-        core = {(e, c) for e, c in built if e != "SessionStart"}
+        core = {r for r in built if r[0] != "SessionStart"}
         self.assertEqual(core - self.owned, set())
 
     def test_skill_hooks_are_recognized_in_both_emitted_forms(self):
@@ -80,11 +81,11 @@ class EmittedCommands(Fixture):
         (skill / "hooks" / "g.py").write_text("")
         (skill / "manifest.json").write_text(json.dumps(
             {"name": "demo", "hooks": [{"event": "Stop", "command": "./hooks/g.py"}]}))
-        owned = chs.emitted_commands(self.repo)
+        owned = chs.emitted_records(self.repo)
         import shlex
         q = shlex.quote(str(skill.resolve() / "hooks" / "g.py"))
-        self.assertIn(("Stop", f"python3 {q}"), owned)
-        self.assertIn(("Stop", f"[ -f {q} ] || exit 0; exec python3 {q}"), owned)
+        self.assertIn(("Stop", "", f"python3 {q}"), owned)
+        self.assertIn(("Stop", "", f"[ -f {q} ] || exit 0; exec python3 {q}"), owned)
 
 
 class Sweep(Fixture):
@@ -111,17 +112,38 @@ class Sweep(Fixture):
         self.assertEqual(_commands(s, "Notification"), [f"bash {self.q('check-pending-tasks.sh')}"])
         self.assertEqual(s["model"], "keep-me")
 
-    def test_a_dead_copy_of_an_owned_script_is_removed_and_nothing_else_dead(self):
+    def test_a_moved_checkouts_exact_record_is_removed_and_nothing_else_dead(self):
         gone = "/nonexistent-clone/src"
-        s = _settings(SessionStart=[
+        s = {"hooks": {"SessionStart": [{"matcher": "compact", "hooks": [{"type": "command", "command": c} for c in (
             f'bash "{gone}/personal-claude-compact-hint.sh"',
             f'bash "{gone}/someone-elses-hint.sh"',
             'bash "$HOME/gone/src/watcher-rearm-session-hint.sh"',
             "bash src/turn-start.sh",
-        ])
+        )]}]}}
         removed = chs.sweep(s, self.owned)
         self.assertEqual([c for _e, c in removed], [f'bash "{gone}/personal-claude-compact-hint.sh"'])
         self.assertEqual(len(_commands(s, "SessionStart")), 3)
+
+    def test_an_exact_command_under_an_operator_matcher_is_kept(self):
+        cmd = f"bash {self.q('check-pending-tasks.sh')}"
+        s = {"hooks": {"Stop": [{"matcher": "operator-scope", "hooks": [{"type": "command", "command": cmd}]}]}}
+        self.assertEqual(chs.sweep(s, self.owned), [])
+        self.assertEqual(_commands(s, "Stop"), [cmd])
+
+    def test_a_dead_path_is_not_ownership_by_basename(self):
+        keep = [
+            "bash /offline/operator/session-handoff.sh --operator-flag",
+            f'bash "/nonexistent-clone/src/session-handoff.sh" {TP} --operator-flag',
+        ]
+        s = _settings(Notification=keep, PreCompact=list(keep))
+        self.assertEqual(chs.sweep(s, self.owned), [])
+        self.assertEqual(_commands(s, "Notification"), keep)
+        self.assertEqual(_commands(s, "PreCompact"), keep)
+
+    def test_the_retired_watcher_kill_stop_hook_is_removed(self):
+        s = _settings(Stop=[chs._WATCHER_KILL_STOP, "echo operator"])
+        self.assertEqual(chs.sweep(s, self.owned), [("Stop", chs._WATCHER_KILL_STOP)])
+        self.assertEqual(_commands(s, "Stop"), ["echo operator"])
 
     def test_malformed_shapes_are_left_alone(self):
         s = {"hooks": {"Stop": [
@@ -158,6 +180,16 @@ class SweepFile(Fixture):
         self.assertEqual(json.loads(p.read_text())["hooks"]["Stop"], [])
         self.assertEqual([x.name for x in p.parent.iterdir()], ["settings.json"], "no temp file left")
         self.assertEqual(chs.sweep_file(p, self.owned), [], "idempotent")
+
+    def test_a_rewrite_keeps_the_files_mode(self):
+        p = self._write(_settings(Stop=[f"bash {self.q('check-pending-tasks.sh')}"]))
+        os.chmod(p, 0o600)
+        old = os.umask(0o022)
+        try:
+            self.assertEqual(len(chs.sweep_file(p, self.owned)), 1)
+        finally:
+            os.umask(old)
+        self.assertEqual(p.stat().st_mode & 0o777, 0o600)
 
     def test_a_non_object_file_raises(self):
         with self.assertRaises(ValueError):
@@ -239,6 +271,32 @@ class CoreConfig(Fixture):
     def test_an_unresolvable_config_dir_is_skipped(self):
         with mock.patch.dict(sys.modules, {"sutando_config": None}):
             self.assertIsNone(chs.core_config_settings(self.repo))
+
+
+class LaunchCheck(Fixture):
+    def _built(self) -> str:
+        import subprocess
+        return subprocess.run(
+            ["node", str(REPO / "src/agent/claude/cli/build-core-settings.mjs"), "/g.py",
+             "--owned-hooks", str(self.repo)], capture_output=True, text=True, check=True).stdout
+
+    def test_the_builders_output_passes_and_a_partial_or_foreign_one_fails(self):
+        built = self._built()
+        self.assertEqual(chs.launch_check(self.repo, built), [])
+        partial = json.loads(built)
+        partial["hooks"]["SessionStart"] = partial["hooks"]["SessionStart"][:1]
+        self.assertEqual(len(chs.launch_check(self.repo, json.dumps(partial))), 2)
+        echoes = {"hooks": {e: [{"matcher": "", "hooks": [{"type": "command", "command": "echo"}]}]
+                            for e in ("Stop", "UserPromptSubmit", "PreCompact", "SessionEnd", "SessionStart")}}
+        self.assertEqual(len(chs.launch_check(self.repo, json.dumps(echoes))), 7)
+        with self.assertRaises(ValueError):
+            chs.launch_check(self.repo, "")
+
+    def test_the_cli_exits_nonzero_unless_everything_is_carried(self):
+        for text, rc in ((self._built(), 0), ("{}", 1), ("not json", 1)):
+            with mock.patch.object(sys, "stdin", io.StringIO(text)), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(chs.main(["launch-check", "--repo", str(self.repo)]), rc, text[:20])
 
 
 class ScriptPathOf(unittest.TestCase):

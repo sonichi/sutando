@@ -1003,8 +1003,8 @@
 87 tests/start-cli-claude-task-notifier.test.py
 0 tests/start-cli-dangerous-mode-seed.test.py
 0 tests/start-cli-fullscreen-upsell-seed.test.py
+0 tests/start-cli-legacy-hook-sweep-wiring.test.py
 69 tests/start-cli-model-pin.test.py
-0 tests/start-cli-project-hook-sweep-wiring.test.py
 0 tests/start-cli-relay-loop-dies-with-its-repo.test.py
 63 tests/start-cli-restart-verify.test.py
 98 tests/start-cli-worker-bootstrap.test.py

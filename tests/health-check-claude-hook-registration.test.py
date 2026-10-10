@@ -2,8 +2,9 @@
 """claude-hooks probe: the core's launch settings are the only registration.
 
 It must warn when the launch JSON would miss an owned or skill hook, point at a
-missing script, or leave transcripts on the 30-day default, and when a settings
-file still holds a Sutando-written copy that fires outside the core launch.
+missing script, or leave transcripts on the 30-day default; when the running core's
+own launch record lacks them; and when a settings file still holds a Sutando-written
+copy that fires outside the core launch.
 
 Run: python3 tests/health-check-claude-hook-registration.test.py
 """
@@ -22,6 +23,7 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 BUILDER = "src/agent/claude/cli/build-core-settings.mjs"
+TABLE = "src/agent/claude/cli/owned-hooks.json"
 OWNED = ("check-pending-tasks.sh", "turn-start.sh", "session-handoff.sh",
          "schedule-crons-session-hint.sh", "personal-claude-compact-hint.sh",
          "watcher-rearm-session-hint.sh")
@@ -47,6 +49,7 @@ class Probe(unittest.TestCase):
         self.repo = Path(self._td.name) / "repo"
         (self.repo / BUILDER).parent.mkdir(parents=True)
         shutil.copy(REPO / BUILDER, self.repo / BUILDER)
+        shutil.copy(REPO / TABLE, self.repo / TABLE)
         for name in OWNED:
             (self.repo / "src" / name).write_text("#!/bin/bash\n")
         (self.repo / "hooks").mkdir()
@@ -58,6 +61,10 @@ class Probe(unittest.TestCase):
             {"name": "demo", "hooks": [{"event": "PreToolUse", "command": "./hooks/g.py"}]}))
         self.ccd = Path(self._td.name) / "ccd"
         self.ccd.mkdir()
+        self.ws = Path(self._td.name) / "ws"
+        settings, why = hc._core_launch_settings(self.repo)
+        assert settings is not None, why
+        self.record(settings)
         self._env = mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": ""})
         self._env.start()
 
@@ -65,7 +72,13 @@ class Probe(unittest.TestCase):
         self._env.stop()
         self._td.cleanup()
 
+    def record(self, settings):
+        (self.ws / "state").mkdir(parents=True, exist_ok=True)
+        (self.ws / "state" / "core-launch-settings.json").write_text(
+            json.dumps({"ts": 1, "repo": str(self.repo), "settings": settings}))
+
     def probe(self, **kw):
+        kw.setdefault("workspace_dir", self.ws)
         return hc.check_claude_hook_registration(repo_dir=self.repo, config_dir=self.ccd, **kw)
 
     def test_ok_when_the_launch_settings_carry_everything_and_no_file_has_a_copy(self):
@@ -106,9 +119,35 @@ class Probe(unittest.TestCase):
         (self.repo / BUILDER).write_text(
             'process.stdout.write(JSON.stringify({hooks: {Stop: [{hooks: [{type: "command", command: "true"}]}]}}));\n')
         detail = self.probe()["detail"]
-        self.assertIn("lack UserPromptSubmit, PreCompact, SessionEnd, SessionStart hooks", detail)
+        self.assertIn("launch settings lack owned hooks: ", detail)
+        self.assertIn("+3 more", detail)
         self.assertIn("skill hooks missing from launch settings: PreToolUse:", detail)
         self.assertIn("cleanupPeriodDays", detail)
+
+    def test_one_unrelated_command_per_event_is_not_the_owned_set(self):
+        echoes = {e: [{"matcher": "", "hooks": [{"type": "command", "command": "echo x"}]}]
+                  for e in ("Stop", "UserPromptSubmit", "PreCompact", "SessionEnd", "SessionStart")}
+        (self.repo / BUILDER).write_text(
+            f"process.stdout.write(JSON.stringify({{hooks: {json.dumps(echoes)}, cleanupPeriodDays: 3650}}));\n")
+        out = self.probe()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("launch settings lack owned hooks", out["detail"])
+
+    def test_no_launch_record_means_the_running_core_is_not_proven(self):
+        (self.ws / "state" / "core-launch-settings.json").unlink()
+        out = self.probe()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("no launch record for the running core", out["detail"])
+        self.assertFalse(out["_live_core_has_launch_hooks"])
+
+    def test_a_record_from_an_older_launch_is_not_the_builders_output(self):
+        settings, _ = hc._core_launch_settings(self.repo)
+        settings["hooks"].pop("SessionStart")
+        self.record(settings)
+        out = self.probe()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("the running core was launched without", out["detail"])
+        self.assertFalse(out["_live_core_has_launch_hooks"])
 
     def test_an_owned_script_that_is_gone_warns(self):
         os.remove(self.repo / "src" / "turn-start.sh")
@@ -127,6 +166,7 @@ class Probe(unittest.TestCase):
         out = self.probe()
         self.assertEqual(out["status"], "warn")
         self.assertIn("2 Sutando hook copies still in a settings file", out["detail"])
+        self.assertTrue(out["_live_core_has_launch_hooks"])
         self.assertEqual(len(out["_project_leftovers"]), 2)
         self.assertNotIn("echo operator", " ".join(out["_project_leftovers"]))
         # Probing is read-only.
@@ -149,7 +189,7 @@ class Probe(unittest.TestCase):
         (ws / ".claude-sutando" / "settings.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
             {"type": "command", "command": f"bash '{self.repo}/src/check-pending-tasks.sh'"}]}]}}))
         with mock.patch.dict(os.environ, {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(ws)}):
-            out = hc.check_claude_hook_registration(repo_dir=self.repo)
+            out = hc.check_claude_hook_registration(repo_dir=self.repo, workspace_dir=self.ws)
         self.assertEqual(len(out["_project_leftovers"]), 1, out["detail"])
 
 

@@ -1,0 +1,9 @@
+[
+  ["Stop", "", "check-pending-tasks.sh", ""],
+  ["UserPromptSubmit", "", "turn-start.sh", ""],
+  ["PreCompact", "", "session-handoff.sh", " \"$TRANSCRIPT_PATH\""],
+  ["SessionEnd", "", "session-handoff.sh", " \"$TRANSCRIPT_PATH\""],
+  ["SessionStart", "", "schedule-crons-session-hint.sh", ""],
+  ["SessionStart", "compact", "personal-claude-compact-hint.sh", ""],
+  ["SessionStart", "compact|resume", "watcher-rearm-session-hint.sh", ""]
+]
