@@ -77,6 +77,7 @@ import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
 import pool_suspension  # noqa: E402
+import tmux_pane_keys  # noqa: E402
 import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
@@ -839,6 +840,21 @@ def check_cli_wedge() -> dict:
                           "matched_patterns", "current_patterns", "consecutive_pattern_samples",
                           "observation_runs", "median_gap_s", "work_outstanding", "work_detail")}
     return check
+
+def check_pane_key_fence(socket: "str | None" = None) -> dict:
+    # This host's socket: the freshest synced heartbeat may belong to another machine.
+    sock = Path(socket or _local_core_socket() or os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"))
+    sockets = {str(sock)} | {str(lock)[:-len(".pane-keys-lock")]
+                            for lock in sock.parent.glob("*.pane-keys-lock")}
+    states = {path: tmux_pane_keys.fence_status(path) for path in sockets}
+    fenced = sorted(path for path, state in states.items() if state == "uncertain")
+    if fenced:
+        return {"name": "pane-key-fence", "status": "fail", "detail": (
+            f"automated sends blocked on {', '.join(fenced)}; stop the old server and reconcile "
+            "delivery before explicit recovery (docs/codex-core.md)")}
+    return {"name": "pane-key-fence", "status": "ok",
+            "detail": "busy" if "busy" in states.values() else "clear"}
+
 
 def check_secret_scanner_mode() -> dict:
     """Report the secret scanner's DEGRADED mode as standing status.
@@ -12941,6 +12957,7 @@ def run_all_checks() -> list[dict]:
     # Advisory CLI progress detector (pane static with work outstanding / retry
     # loop); reads the pane, never the process, and drives no recovery.
     checks.append(check_cli_wedge())
+    checks.append(check_pane_key_fence())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -14676,8 +14693,8 @@ def _default_cron_nudge(
             return False
         send = subprocess.run(
             # Exact name: a bare target prefix-matches the core's `-watcher` session once the core is gone.
-            [tmux_bin, "-S", sock, "send-keys", "-t", f"={session}:", "/schedule-crons", "Enter"],
-            env=env, capture_output=True, timeout=15,
+            tmux_pane_keys.argv(sock, f"={session}:", "/schedule-crons", "Enter", tmux=tmux_bin),
+            env=env, capture_output=True, timeout=tmux_pane_keys.TIMEOUT_S,
         )
         return send.returncode == 0
     except Exception:

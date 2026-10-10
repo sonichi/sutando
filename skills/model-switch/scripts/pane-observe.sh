@@ -20,16 +20,17 @@ ver="$(printf '%s' "$REQ" | sed -nE 's/^claude-[a-z]+-([0-9]+(-[0-9]+)*).*/\1/p'
 if [ -n "$ver" ]; then ACCEPT="Set model to ${fam} $(printf '%s' "$ver" | sed 's/\./\\./g')([^0-9.]|$)"
 else ACCEPT="Set model to ${fam}( [0-9][0-9.]*)?([^0-9.a-z]|$)"; fi
 DIALOG='Yes, switch'
+PANE_KEYS="$(cd "$(dirname "$0")/../../.." && pwd)/src/tmux-pane-keys.sh"
 # A failed capture is a failed observation, never a zero.
 cap() { tmux -S "$SOCK" capture-pane -p -t "$SESSION" 2>/dev/null || { echo "CAPTURE-FAILED"; return 12; }; }
 count() { out="$(cap)" || { echo "CAPTURE-FAILED"; return 12; }; printf '%s\n' "$out" | grep -Eci -- "$ACCEPT"; return 0; }
 case "$MODE" in
   count) count; exit $?;;
-  cancel) tmux -S "$SOCK" send-keys -t "$SESSION" Escape; echo CANCELLED; exit 0;;
+  cancel) bash "$PANE_KEYS" -S "$SOCK" -t "$SESSION" -- Escape || exit $?; echo CANCELLED; exit 0;;
   wait) ;;
   *) echo "pane-observe: one of --count/--wait/--cancel" >&2; exit 2;;
 esac
-[ -n "$ANSWER" ] && tmux -S "$SOCK" send-keys -t "$SESSION" Enter
+[ -n "$ANSWER" ] && bash "$PANE_KEYS" -S "$SOCK" -t "$SESSION" -- Enter
 # A NEW matching line (count above baseline) is the switch; the dialog means the CLI waits on a human.
 deadline=$(( $(date +%s) + TIMEOUT ))
 while :; do

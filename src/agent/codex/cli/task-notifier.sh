@@ -170,7 +170,7 @@ clear_automation_leftover() {
   target="$(core_target)" || return 1
   pane="$(tmux -S "$TMUX_SOCKET" capture-pane -e -p -t "$target" 2>/dev/null)" || return 1
   leftover="$(printf '%s\n' "$pane" | "$NOTIFIER_PY" "$PANE_GATE_PY" leftover --runtime codex --workspace "$WORKSPACE_DIR" --socket "$TMUX_SOCKET" --session "$SESSION" 2>/dev/null)" || return 1
-  tmux -S "$TMUX_SOCKET" send-keys -t "$target" C-a C-k || return 1
+  bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- C-a C-k || return 1
   log_notifier "cleared rejected automation input '$leftover' from the composer"
 }
 
@@ -253,7 +253,7 @@ wait_for_composer() {
 # the second half, so a swallowed paste read as instant success and the
 # notifier slept out its completion timeout on a task Codex never received.
 deliver_prompt() {
-  local filename="$1" prompt="$2" type_tries=0 attempt=0 waited staged=0 final_state stage_checks target
+  local filename="$1" prompt="$2" type_tries=0 attempt=0 waited staged=0 final_state stage_checks target type_rc=0 submit_rc=0
   # Verification is ADVISORY only when the pane hands us NO information at all --
   # a harness or Codex build we cannot read, where wait_for_composer's own poll
   # never had anything to key on (pane_state fails outright: capture-pane errored).
@@ -274,7 +274,11 @@ deliver_prompt() {
   fi
   while :; do
     target="$(core_target)" || { log_notifier "refusing to type $filename: no core window"; return 1; }
-    tmux -S "$TMUX_SOCKET" send-keys -t "$target" -l -- "$prompt"
+    log_notifier "submitting $filename: typing prompt (attempt $((type_tries + 1)))"
+    type_rc=0
+    bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- -l -- "$prompt" || type_rc=$?
+    [ "$type_rc" = 0 ] || log_notifier "typing $filename failed (rc $type_rc); counted as a failed attempt"
+    [ "$type_rc" != 125 ] || { log_notifier "delivery of $filename blocked pending socket recovery; not retrying"; return 125; }
     stage_checks=0
     while [ "$stage_checks" -lt 4 ]; do
       sleep "$POLL_INTERVAL"
@@ -289,10 +293,18 @@ deliver_prompt() {
   done
   [ "$staged" = 1 ] && [ "$type_tries" -gt 0 ] \
     && log_notifier "prompt staged for $filename after $((type_tries + 1)) attempts"
-  target="$(core_target)" && tmux -S "$TMUX_SOCKET" send-keys -t "$target" C-m
+  if [ "$staged" != 1 ] && [ "$type_rc" != 0 ]; then
+    log_notifier "prompt did not stage for $filename after a typing failure; not pressing C-m"
+    return 1
+  fi
+  log_notifier "submitting $filename: C-m (attempt 1)"
+  submit_rc=0
+  target="$(core_target)" && bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- C-m || submit_rc=$?
+  [ "$submit_rc" = 0 ] || log_notifier "C-m for $filename failed (rc $submit_rc)"
+  [ "$submit_rc" != 125 ] || { log_notifier "delivery of $filename blocked pending socket recovery; not retrying"; return 125; }
   # Nothing observable staged: the submit is sent and unverifiable — never
   # re-press C-m blind into a live session.
-  [ "$staged" = 1 ] || return 0
+  [ "$staged" = 1 ] || return "$submit_rc"
   while :; do
     waited=0
     while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
@@ -306,10 +318,14 @@ deliver_prompt() {
     attempt=$((attempt + 1))
     if [ "$attempt" -ge "$SUBMIT_RETRIES" ]; then
       log_notifier "submit NOT confirmed for $filename after $attempt attempts; prompt still staged (core may need attention)"
+      [ "$submit_rc" = 0 ] || return 1
       return 0
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
-    target="$(core_target)" && tmux -S "$TMUX_SOCKET" send-keys -t "$target" C-m
+    submit_rc=0
+    target="$(core_target)" && bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- C-m || submit_rc=$?
+    [ "$submit_rc" = 0 ] || log_notifier "C-m for $filename failed (rc $submit_rc)"
+    [ "$submit_rc" != 125 ] || { log_notifier "delivery of $filename blocked pending socket recovery; not retrying"; return 125; }
   done
 }
 
@@ -326,7 +342,7 @@ task_payload() {
 }
 
 submit_task() {
-  local filename="$1" wait_for_result="${2:-0}" prompt started
+  local filename="$1" wait_for_result="${2:-0}" prompt started delivery_rc=0
   case "$filename" in
     ""|*/*|*..*) return 0 ;;
   esac
@@ -367,13 +383,19 @@ submit_task() {
     log_notifier "refusing --event $filename: could not record worker ownership"
     return 1
   fi
-  if ! deliver_prompt "$filename" "$prompt"; then
+  deliver_prompt "$filename" "$prompt" || delivery_rc=$?
+  if [ "$delivery_rc" != 0 ]; then
     clear_workstream_context
+    if [ "$delivery_rc" = 125 ]; then
+      log_notifier "delivery blocked for $filename until socket recovery; task retained, automatic sends refused"
+      [ "$wait_for_result" = 1 ] && return 0
+      return 125
+    fi
     if [ "$wait_for_result" = "1" ]; then
-      log_notifier "deferring $filename: composer was not idle-ready, will retry on the next idle cycle"
+      log_notifier "deferring $filename: delivery was not confirmed, will retry on the next idle cycle"
       return 0
     fi
-    log_notifier "refusing --event $filename: composer was not idle-ready"
+    log_notifier "refusing --event $filename: delivery was not confirmed"
     return 1
   fi
 

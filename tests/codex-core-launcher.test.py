@@ -96,6 +96,9 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/start-cli.sh",
             "src/agent/codex/cli/task-notifier.sh",
             "src/agent/codex/cli/task-notifier-supervisor.sh",
+            "src/tmux-pane-keys.sh",
+            "src/tmux_pane_keys.py",
+            "src/bounded-wait.sh",
             "src/agent/codex/cli/codex-observer.mjs",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
@@ -258,7 +261,8 @@ exit 0
     def _write_exe(self, name, body):
         path = self.bin / name
         if name == "tmux" and body.startswith("#!/bin/bash\n"):
-            body = body.replace("#!/bin/bash\n", "#!/bin/bash\n" + self._CORE_WINDOW, 1)
+            unwrap = f'. "{REAL_REPO}/tests/lib/tmux-fake-unwrap.sh"\n'
+            body = body.replace("#!/bin/bash\n", "#!/bin/bash\n" + unwrap + self._CORE_WINDOW, 1)
         path.write_text(body)
         path.chmod(0o755)
 
@@ -861,7 +865,7 @@ exit 23
 ''')
         notifier.chmod(0o755)
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier),
                    SUTANDO_NOTIFIER_RESTART_DELAY="0.01",
@@ -913,7 +917,7 @@ sleep 60
 ''')
         notifier.chmod(0o755)
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier),
                    SUTANDO_NOTIFIER_RESTART_DELAY="0.01",
@@ -949,7 +953,7 @@ sleep 60
         notifier.write_text(f'#!/bin/bash\ntouch "{count}"\n')
         notifier.chmod(0o755)
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier))
         supervisor = self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"
@@ -989,7 +993,7 @@ exit 0
         env = dict(
             os.environ,
             PATH=f"{self.bin}:/usr/bin:/bin",
-            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks),
             SUTANDO_RESULTS_DIR=str(results),
@@ -1021,7 +1025,7 @@ exit 0
     def test_notifier_submits_literal_safe_prompt(self):
         # The one-event mode tests the adapter without starting fswatch.
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         # This stub reports the core session alive for notifier calls.
         self._write_exe("tmux", '''#!/bin/bash
 printf '%s\\n' "$*" >> "$TMUX_LOG"
@@ -1039,6 +1043,133 @@ exit 0
         self.assertIn("/tasks/task-123.txt", calls)
         self.assertIn("send-keys -t =sutando-core:0 C-m", calls)
 
+    def test_notifier_leaves_copy_mode_and_logs_before_each_submit(self):
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
+        # The core pane reports a mode (an owner scrolled it), as copy mode does.
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+for _a in "$@"; do [ "$_a" = capture-pane ] && { printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }; done
+case "$*" in *pane_in_mode*) echo 1; exit 0;; esac
+[ "$3" = has-session ] && exit 0
+exit 0
+''')
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-123.txt"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertLess(calls.index("copy-mode -q -t =sutando-core:0"),
+                        calls.index("send-keys -t =sutando-core:0 -l -- Sutando task ready: task-123.txt"))
+        self.assertIn("submitting task-123.txt: typing prompt (attempt 1)", result.stderr)
+        self.assertIn("submitting task-123.txt: C-m (attempt 1)", result.stderr)
+
+    def test_notifier_does_not_retry_a_claimed_hung_send(self):
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core",
+                   HANG_MARK=str(Path(self.tmp.name) / "hung-once"))
+        # The ticket was claimed before the timeout, so subsequent attempts must not reach tmux.
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+case "$*" in *"send-keys"*"-l --"*) [ -e "$HANG_MARK" ] || { touch "$HANG_MARK"; exec sleep 60; };; esac
+for _a in "$@"; do [ "$_a" = capture-pane ] && { printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }; done
+[ "$3" = has-session ] && exit 0
+exit 0
+''')
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        start = time.monotonic()
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-123.txt"],
+                                env=env, capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - start, 30)
+        self.assertIn("typing task-123.txt failed (rc 125); counted as a failed attempt", result.stderr)
+        self.assertNotIn("submitting task-123.txt: typing prompt (attempt 2)", result.stderr)
+        self.assertEqual(self._tmux_calls().count("-l -- Sutando task ready: task-123.txt"), 1)
+        self.assertNotIn(" C-m", self._tmux_calls())
+        self.assertIn("blocked pending socket recovery; not retrying", result.stderr)
+
+    def _failed_send(self, key, managed=False, claimed=False):
+        stage = Path(self.tmp.name) / "staged"
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core",
+                   STAGE=str(stage), FAIL_KEY=key, SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+                   SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT="1", SUTANDO_NOTIFIER_SUBMIT_RETRIES="1")
+        self._write_exe("tmux", r'''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+case "$1" in
+  capture-pane)
+    if [ -e "$STAGE" ]; then printf '› Sutando task ready: task-123.txt.\n← for agents\n'
+    else printf '› \n← for agents\n'; fi;;
+  send-keys)
+    case "$*" in
+      *"-l --"*) [ "$FAIL_KEY" = literal ] && exec sleep 60; touch "$STAGE";;
+      *C-m*) exec sleep 60;;
+    esac;;
+esac
+exit 0
+''')
+        fake = self.bin / "tmux"
+        guard = r'''_hang_unclaimed=0
+[ "${3:-}" = if-shell ] && case "$5" in
+  *C-m*) _hang_unclaimed=1;;
+  *-l*) [ "$FAIL_KEY" = literal ] && _hang_unclaimed=1;;
+esac
+if [ "$_hang_unclaimed" = 1 ]; then
+  eval "set -- ${5#copy-mode -q -t * ; }"
+  eval "_keys=\${$#}"
+  eval "set -- $_keys"
+  printf '%s\n' "$*" >> "$TMUX_LOG"
+  exec sleep 60
+fi
+'''
+        if not claimed:
+            fake.write_text(fake.read_text().replace("#!/bin/bash\n", "#!/bin/bash\n" + guard, 1))
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        args = ["/bin/bash", str(script), "--event", "task-123.txt"]
+        if managed:
+            tasks = self.root / "workspace/tasks"
+            tasks.mkdir(exist_ok=True)
+            (tasks / "task-123.txt").write_text("task: test\n")
+            (self.root / "src/watch-tasks-stream.sh").write_text("#!/bin/bash\nprintf 'TASK_FILE: task-123.txt\\n'\n")
+            args = args[:2]
+        return subprocess.run(args, env=env, capture_output=True, text=True, timeout=30)
+
+    def test_notifier_rejects_two_literal_timeouts_without_pressing_enter(self):
+        r = self._failed_send("literal")
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._tmux_calls().count("-l -- Sutando task ready: task-123.txt"), 2)
+        self.assertNotIn(" C-m", self._tmux_calls())
+
+    def test_notifier_rejects_enter_timeout_while_prompt_remains_staged(self):
+        r = self._failed_send("enter")
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertIn("C-m for task-123.txt failed (rc 124)", r.stderr)
+        self.assertEqual(self._tmux_calls().count(" C-m"), 1)
+
+    def test_managed_notifier_defers_known_failure_without_waiting_for_result(self):
+        r = self._failed_send("literal", managed=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("will retry on the next idle cycle", r.stderr)
+        self.assertNotIn("timed out waiting for result", r.stderr)
+        self.assertNotIn(" C-m", self._tmux_calls())
+
+    def test_notifier_does_not_repress_enter_after_a_claimed_timeout(self):
+        r = self._failed_send("enter", claimed=True)
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertIn("C-m for task-123.txt failed (rc 125)", r.stderr)
+        self.assertIn("blocked pending socket recovery; not retrying", r.stderr)
+        self.assertNotIn("submit NOT confirmed", r.stderr)
+        self.assertEqual(self._tmux_calls().count(" C-m"), 1)
+
+    def test_managed_notifier_retains_task_after_a_claimed_timeout(self):
+        r = self._failed_send("literal", managed=True, claimed=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("task retained, automatic sends refused", r.stderr)
+        self.assertNotIn("will retry on the next idle cycle", r.stderr)
+        self.assertEqual(self._tmux_calls().count("-l -- Sutando task ready: task-123.txt"), 1)
+        self.assertNotIn(" C-m", self._tmux_calls())
+
     def test_notifier_does_not_replay_completed_task(self):
         workspace = self.root / "workspace"
         (workspace / "tasks").mkdir(exist_ok=True)
@@ -1046,7 +1177,7 @@ exit 0
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         (workspace / "results" / "task-done.txt").write_text("already complete\n")
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
@@ -1062,7 +1193,7 @@ exit 0
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         (archive / "task-done.txt").write_text("already delivered\n")
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
@@ -1087,7 +1218,7 @@ printf '%s\\n' "$*" >> "$TMUX_LOG"
 exit 0
 ''')
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
@@ -1111,7 +1242,7 @@ printf '%s\\n' "$*" >> "$TMUX_LOG"
 exit 0
 ''')
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
@@ -1127,7 +1258,7 @@ exit 0
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         (archive / "task-done-1784690000.txt").write_text("already delivered\n")
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
@@ -1143,7 +1274,7 @@ exit 0
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         (archive / "task-done.txt").write_text("already delivered\n")
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
@@ -1159,7 +1290,7 @@ exit 0
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         (archive / "task-done-1784690000.txt").write_text("already delivered\n")
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
                                 env=env, capture_output=True, text=True)
@@ -1252,7 +1383,7 @@ exit 0
             TMUX_LOG=str(self.log),
             CONTEXT_CAPTURE=str(capture),
             CONTEXT_PATH=str(context_path),
-            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks),
             SUTANDO_RESULTS_DIR=str(results),
@@ -1299,7 +1430,7 @@ exit 0
         self.assertIn(needle, source)
         module.write_text(source.replace(
             needle,
-            needle + "    import time as _slow_history\n    _slow_history.sleep(4)\n",
+            needle + "    import time as _slow_history\n    _slow_history.sleep(8)\n",
             1,
         ))
         watcher = self.root / "src/watch-tasks-stream.sh"
@@ -1323,7 +1454,7 @@ exit 0
             os.environ,
             PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
-            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks),
             SUTANDO_RESULTS_DIR=str(results),
@@ -1333,13 +1464,13 @@ exit 0
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         started = time.monotonic()
         result = subprocess.run(
-            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=8
+            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=12
         )
         elapsed = time.monotonic() - started
 
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        # Well under the injected 4s scan, well over a loaded runner's own overhead.
-        self.assertLess(elapsed, 2.5, f"unassigned delivery took {elapsed:.2f}s")
+        # Half the injected 8s scan: a scan always fails it, a slow runner's bounded sends do not.
+        self.assertLess(elapsed, 4.0, f"unassigned delivery took {elapsed:.2f}s")
         calls = self._tmux_calls()
         self.assertIn("task-unassigned.txt", calls)
         self.assertNotIn("Related prior workstream context", calls)
@@ -1402,7 +1533,7 @@ exit 0
             CALL_COUNT=str(count),
             PANE_BUF=str(buf),
             EMITS=str(emits),
-            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks),
             SUTANDO_RESULTS_DIR=str(results),
@@ -1461,7 +1592,7 @@ fi
 exit 0
 ''')
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
-                   SUBMIT_COUNT=str(count), SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUBMIT_COUNT=str(count), SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core", SUTANDO_TASKS_DIR=str(tasks),
                    SUTANDO_RESULTS_DIR=str(results), SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
                    SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="5")
@@ -1523,7 +1654,7 @@ exit 0
 ''')
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    EARLY_SUBMIT=str(early), BUSY_MARKER=str(busy),
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core", SUTANDO_TASKS_DIR=str(tasks),
                    SUTANDO_RESULTS_DIR=str(results), SUTANDO_CORE_STATUS_FILE=str(status),
                    SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
@@ -1537,7 +1668,8 @@ exit 0
         self.assertIsNotNone(calls_while_busy,
                              "notifier never observed the live core")
         busy.unlink()
-        stdout, stderr = process.communicate(timeout=5)
+        # A hang guard, not a speed bound: each bounded, locked key send costs a Python start.
+        stdout, stderr = process.communicate(timeout=15)
         self.assertEqual(process.returncode, 0, stderr or stdout)
         self.assertNotIn(
             "send-keys", calls_while_busy,
@@ -1580,7 +1712,7 @@ exit 0
             os.environ,
             PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
-            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks),
             SUTANDO_RESULTS_DIR=str(results),
@@ -1630,7 +1762,7 @@ exit 0
             os.environ,
             PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
-            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks),
             SUTANDO_RESULTS_DIR=str(results),
@@ -1693,7 +1825,7 @@ exit 0
             os.environ,
             PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
-            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks),
             SUTANDO_RESULTS_DIR=str(results),
@@ -1760,7 +1892,7 @@ exit 0
             os.environ,
             PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
-            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks),
             SUTANDO_RESULTS_DIR=str(results),
@@ -1815,7 +1947,7 @@ exit 0
             os.environ,
             PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
-            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks),
             SUTANDO_RESULTS_DIR=str(results),
@@ -1872,7 +2004,7 @@ exit 0
             os.environ,
             PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
-            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks),
             SUTANDO_RESULTS_DIR=str(results),
@@ -1946,7 +2078,7 @@ exit 0
 ''')
         env = dict(
             os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log), CLEARED=str(cleared),
-            SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks), SUTANDO_RESULTS_DIR=str(results),
             SUTANDO_NOTIFIER_POLL_INTERVAL="0.02", SUTANDO_NOTIFIER_CORE_READY_TIMEOUT="2",
             SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
@@ -2252,7 +2384,7 @@ exit 0
                    SUTANDO_WORKSPACE_DIR=str(workspace),
                    SUTANDO_TASKS_DIR=str(tasks),
                    SUTANDO_RESULTS_DIR=str(results),
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core")
 
         result = subprocess.run(
@@ -2274,7 +2406,7 @@ exit 0
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
                    TMUX_LOG=str(self.log),
                    SUTANDO_TASKS_DIR=str(tasks),
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core")
 
         result = subprocess.run(
@@ -2302,7 +2434,7 @@ exit 0
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
                    TMUX_LOG=str(self.log),
                    SUTANDO_TASKS_DIR=str(tasks),
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
                    SUTANDO_NOTIFIER_COMPOSER_POLL="0.02",
@@ -2315,7 +2447,7 @@ exit 0
         )
 
         self.assertNotEqual(result.returncode, 0, result.stderr)
-        self.assertIn("refusing --event task-owner.txt: composer was not idle-ready", result.stderr)
+        self.assertIn("refusing --event task-owner.txt: delivery was not confirmed", result.stderr)
         self.assertNotIn("will retry on the next idle cycle", result.stderr)
         self.assertNotIn("send-keys", self._tmux_calls())
 
@@ -2386,7 +2518,7 @@ exit 0
                    SUTANDO_RESULTS_DIR=str(results),
                    SUTANDO_INBOX_RESOLVER="pool-delivery",
                    SUTANDO_INBOX_KIND="deliveries",
-                   SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+                   SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
                    SUTANDO_NOTIFIER_RETRY_INTERVAL="1",

@@ -524,12 +524,13 @@ def capture(socket, session):
 
 def send_keys(socket, session, key):
     """Type one key into the core pane. True only when tmux accepted it."""
+    import tmux_pane_keys
     target = cli_wedge.core_target(socket, session)
     if not target:
         return False
     try:
-        r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", target, key],
-                           capture_output=True, timeout=8)
+        r = subprocess.run(tmux_pane_keys.argv(socket, target, key),
+                           capture_output=True, timeout=tmux_pane_keys.TIMEOUT_S)
         return r.returncode == 0
     except Exception:
         return False

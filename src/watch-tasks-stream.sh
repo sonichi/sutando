@@ -974,7 +974,7 @@ _tmux_wake() {
   local idx
   idx="$(tmux -S "$TMUX_SOCK" list-windows -t "=$TMUX_SESSION" -F '#{window_index}' 2>/dev/null | sort -n | head -1)"
   [ -n "$idx" ] || return 0
-  tmux -S "$TMUX_SOCK" send-keys -t "=$TMUX_SESSION:$idx" '[watcher-ping]' Enter 2>/dev/null || true
+  bash "$__SCRIPT_DIR/tmux-pane-keys.sh" -S "$TMUX_SOCK" -t "=$TMUX_SESSION:$idx" -- '[watcher-ping]' Enter 2>/dev/null || true
 }
 
 # Clean up on exit:

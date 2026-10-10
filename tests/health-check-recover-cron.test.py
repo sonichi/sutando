@@ -444,6 +444,7 @@ def _fake_tmux(td: Path, has_rc: int, send_rc: int) -> "tuple[str, Path]":
     script = td / "tmux"
     script.write_text(
         "#!/bin/sh\n"
+        f'. "{REPO}/tests/lib/tmux-fake-unwrap.sh"\n'
         f'echo "$@" >> "{log}"\n'
         f'case "$*" in *has-session*) exit {has_rc};; *send-keys*) exit {send_rc};; esac\n'
         "exit 0\n"
@@ -459,9 +460,10 @@ def case_n_real_nudge_subprocess_path() -> list[str]:
     fails = []
     with tempfile.TemporaryDirectory() as td:
         tdp = Path(td)
+        sock = str(tdp / "x.sock")
         # Missing session: has-session exits non-zero → False, no send-keys.
         bin_a, log_a = _fake_tmux(tdp, has_rc=1, send_rc=0)
-        if hc._default_cron_nudge(tmux_bin=bin_a, sock="/tmp/x.sock", session="sutando-core"):
+        if hc._default_cron_nudge(tmux_bin=bin_a, sock=sock, session="sutando-core"):
             fails.append("n) missing tmux session should return False")
         if log_a.exists() and "send-keys" in log_a.read_text():
             fails.append("n) must not send-keys when the session is missing")
@@ -469,21 +471,21 @@ def case_n_real_nudge_subprocess_path() -> list[str]:
         # Live session: True, and the send-keys call carries the exact
         # re-arm keystroke on the resolved socket + session.
         bin_b, log_b = _fake_tmux(tdp, has_rc=0, send_rc=0)
-        if not hc._default_cron_nudge(tmux_bin=bin_b, sock="/tmp/x.sock", session="sutando-core"):
+        if not hc._default_cron_nudge(tmux_bin=bin_b, sock=sock, session="sutando-core"):
             fails.append("n) live session should return True")
         sent = log_b.read_text() if log_b.exists() else ""
         send_lines = [ln for ln in sent.splitlines() if "send-keys" in ln]
         if len(send_lines) != 1:
             fails.append(f"n) expected exactly one send-keys call, log: {sent!r}")
-        elif not all(tok in send_lines[0] for tok in ("-S /tmp/x.sock", "-t =sutando-core:", "/schedule-crons", "Enter")):
+        elif not all(tok in send_lines[0] for tok in (f"-S {sock}", "-t =sutando-core:", "/schedule-crons", "Enter")):
             fails.append(f"n) send-keys must type /schedule-crons + Enter at the pane, got: {send_lines[0]!r}")
         log_b.unlink(missing_ok=True)
         # send-keys itself fails → False (nudge did not land).
         bin_c, _ = _fake_tmux(tdp, has_rc=0, send_rc=1)
-        if hc._default_cron_nudge(tmux_bin=bin_c, sock="/tmp/x.sock", session="sutando-core"):
+        if hc._default_cron_nudge(tmux_bin=bin_c, sock=sock, session="sutando-core"):
             fails.append("n) failed send-keys should return False")
         # Binary missing entirely → exception path → False, never raises.
-        if hc._default_cron_nudge(tmux_bin=str(tdp / "no-such-tmux"), sock="/tmp/x.sock", session="s"):
+        if hc._default_cron_nudge(tmux_bin=str(tdp / "no-such-tmux"), sock=sock, session="s"):
             fails.append("n) missing tmux binary should return False")
         # Default sock/session resolution: with only the binary injected, the
         # socket must come from the live heartbeat (via _live_core_socket) and

@@ -36,6 +36,7 @@ def _sibling(name):
 sup = _sibling("pool_supervise")
 ps, cw = sup.ps, sup.cw
 import quota_availability as qa  # noqa: E402  (src/ is on the path via pool_delivery)
+import tmux_pane_keys  # noqa: E402
 
 SOURCE = "pool-wedge"
 ESCAPE_ACTION = "send_escape"
@@ -203,8 +204,8 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
             out[r.id] = "refused"
             continue
         try:
-            sent = runner(["tmux", "-S", str(socket), "send-keys", "-t", f"={session}:0", "Escape"],
-                          capture_output=True, text=True, timeout=8).returncode == 0
+            sent = runner(tmux_pane_keys.argv(socket, f"={session}:0", "Escape"),
+                          capture_output=True, text=True, timeout=tmux_pane_keys.TIMEOUT_S).returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             sent = False
         _note(manager, r.id, escape_sent=sent)

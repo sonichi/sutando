@@ -13,7 +13,7 @@ except ImportError:
 
 
 HEALTH_CAUSES = frozenset("""
-voice-agent voice-watchers voice-transport bodhi-dist cli-wedge secret-scanner
+voice-agent voice-watchers voice-transport bodhi-dist cli-wedge pane-key-fence secret-scanner
 node-runtime cron-runner session-crons memory-dir-override workspace-wiring
 context-read-budget workspace-root-tidy memory-dir-siblings carrier-set memory-index
 memory-sync onboarding-status host-subtrees per-host-config-backup sync-conflicts-unmerged

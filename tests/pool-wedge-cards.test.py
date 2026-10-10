@@ -41,6 +41,7 @@ sup, ps, wi = rem.sup, rem.ps, rem.wi
 wc = getattr(rem, "wc", None)
 from hitl.manager import HitlManager, HitlStore  # noqa: E402
 from hitl.schema import ActionReply  # noqa: E402
+import tmux_pane_keys  # noqa: E402
 
 WID = "7c54b230a8d94ea9b86f52d70134ac68"
 SOCK = "/tmp/pool-wedge-cards.sock"
@@ -72,7 +73,7 @@ class Tmux:
     """Every session alive; capture-pane shows `pane`; anything that could act on a
     session (kill-session, send-keys, new-session) is recorded."""
 
-    ACTING = ("kill-session", "send-keys", "new-session", "respawn-pane", "respawn-window")
+    ACTING = ("kill-session", "send-keys", "new-session", "respawn-pane", "respawn-window", str(tmux_pane_keys.SCRIPT))
 
     def __init__(self, pane):
         self.pane, self.calls = pane, []
@@ -171,7 +172,7 @@ class FrozenCard(unittest.TestCase):
         press(self.ws, req, "send_escape")
         t = Tmux(PANES["frozen"])
         self.assertEqual(wc.drive_escapes(self.ws, runner=t, manager=manager(self.ws)), {req.id: "sent"})
-        self.assertEqual(t.acted(), [["tmux", "-S", SOCK, "send-keys", "-t", f"={NAME}:0", "Escape"]])
+        self.assertEqual(t.acted(), [tmux_pane_keys.argv(SOCK, f"={NAME}:0", "Escape")])
         self.assertEqual(wc.drive_escapes(self.ws, runner=Tmux(PANES["frozen"]),
                                           manager=manager(self.ws)), {}, "typed once")
 
@@ -277,7 +278,7 @@ class CodexCards(unittest.TestCase):
         self.assertEqual(wc.drive_escapes(self.ws, runner=recheck, manager=manager(self.ws)),
                          {req.id: "sent"})
         self.assertEqual(recheck.acted(),
-                         [["tmux", "-S", SOCK, "send-keys", "-t", f"={NAME}:0", "Escape"]])
+                         [tmux_pane_keys.argv(SOCK, f"={NAME}:0", "Escape")])
 
     def test_codex_picker_over_a_working_marker_clears_frozen_card(self):
         # Codex's selected › row is a gate even when the old working marker remains.
@@ -348,7 +349,7 @@ class CardEdges(unittest.TestCase):
         press(self.ws, req, "send_escape")
 
         def send_fails(argv, **kw):
-            if "send-keys" in argv:
+            if str(tmux_pane_keys.SCRIPT) in argv:
                 raise OSError("server exited")
             return Done(0, PANES["frozen"])
         self.assertEqual(wc.drive_escapes(self.ws, runner=send_fails, manager=manager(self.ws)),

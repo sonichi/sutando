@@ -909,7 +909,7 @@ class TestCodexIdleIsNotHung(unittest.TestCase):
         d = tempfile.mkdtemp()
         p = os.path.join(d, "tmux")
         with open(p, "w") as f:
-            f.write("#!/bin/sh\n" + body + "\n")
+            f.write("#!/bin/sh\n. " + json.dumps(os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "tmux-fake-unwrap.sh")) + "\n" + body + "\n")
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return d
 
@@ -1021,7 +1021,7 @@ class TestSendKeys(unittest.TestCase):
         log = os.path.join(d, "argv.log")
         p = os.path.join(d, "tmux")
         with open(p, "w") as f:
-            f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n"
+            f.write("#!/bin/sh\n. " + json.dumps(os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "tmux-fake-unwrap.sh")) + "\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n"
                     + "[ \"$3\" = list-windows ] && { echo 1; " + script + "; }\n" + script + "\n")
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return d, log
@@ -1029,17 +1029,18 @@ class TestSendKeys(unittest.TestCase):
     def test_zero_exit_is_true_and_the_key_reaches_the_session_pane(self):
         from unittest.mock import patch
         d, log = self._with_fake_tmux("exit 0")
+        sock = os.path.join(d, "x.sock")
         with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ.get("PATH", "")}):
-            self.assertTrue(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
+            self.assertTrue(_mod.send_keys(sock, "sutando-core", "Enter"))
         with open(log) as f:
             self.assertEqual(f.read().split("\n")[:6],
-                             ["-S", "/tmp/x.sock", "send-keys", "-t", "=sutando-core:1", "Enter"])
+                             ["-S", sock, "send-keys", "-t", "=sutando-core:1", "Enter"])
 
     def test_non_zero_exit_is_false(self):
         from unittest.mock import patch
         d, _ = self._with_fake_tmux("exit 1")
         with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ.get("PATH", "")}):
-            self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
+            self.assertFalse(_mod.send_keys(os.path.join(d, "x.sock"), "sutando-core", "Enter"))
 
     def test_an_unrunnable_tmux_is_false_not_an_exception(self):
         from unittest.mock import patch
@@ -1172,7 +1173,7 @@ class TestMainOnce(unittest.TestCase):
             self.assertTrue(_mod.send_keys("s.sock", "seat", "Enter"))
         self.assertEqual([c.args for c in target.call_args_list], [("s.sock", "seat")] * 2)
         cap.assert_called_once_with("s.sock", "=seat:1")
-        self.assertEqual(seen, [["tmux", "-S", "s.sock", "send-keys", "-t", "=seat:1", "Enter"]])
+        self.assertEqual(seen, [__import__("tmux_pane_keys").argv("s.sock", "=seat:1", "Enter")])
 
     def test_no_core_window_means_no_capture_and_no_keys(self):
         from unittest.mock import patch

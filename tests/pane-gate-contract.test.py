@@ -873,6 +873,7 @@ class EndToEndThroughTheRealScript(unittest.TestCase):
         shim = self.bin / "tmux"
         shim.write_text(
             "#!/usr/bin/env bash\n"
+            f'. "{REPO}/tests/lib/tmux-fake-unwrap.sh"\n'
             "printf '%s\\n' \"$*\" >> \"$TMUX_LOG\"\n"
             "case \" $* \" in\n"
             "  *' capture-pane '*)\n"

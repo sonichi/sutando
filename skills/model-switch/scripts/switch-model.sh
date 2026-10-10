@@ -92,7 +92,13 @@ case "$BRC:$BASE" in 0:[0-9]*) ;; *) echo "switch-model: could not read the core
 GATE="$REPO/src/self_opened_gate.py"
 "$PY" "$GATE" record --state-dir "$STATE_DIR" --session "$SESSION" --opener model-switch \
   --dismiss-after "${DISMISS_AFTER:-0}" --claim-window "$((ACCEPT_TIMEOUT * 2 + 30))" || echo "switch-model: could not write the picker attribution; a picker left behind will wait for a human" >&2
-bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending > /dev/null || { "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: send failed; nothing recorded" >&2; exit 7; }
+bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending > /dev/null; SEND_RC=$?
+if [ "$SEND_RC" = 125 ]; then
+  "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+  echo "switch-model: send may have applied (rc=125); picker attribution retained, nothing recorded" >&2; exit 7
+elif [ "$SEND_RC" != 0 ]; then
+  "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: send failed; nothing recorded" >&2; exit 7
+fi
 CONFIRMED=false
 VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT")"
 case "$VERDICT" in
@@ -103,7 +109,12 @@ case "$VERDICT" in
       [ "$VERDICT" = ACCEPTED ] || { "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: confirmed the dialog but no acceptance within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8; }
       "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"
     else
-      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel > /dev/null
+      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel > /dev/null; CANCEL_RC=$?
+      if [ "$CANCEL_RC" != 0 ]; then
+        "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+        echo "switch-model: dialog cancel failed (rc=$CANCEL_RC); picker attribution retained, nothing recorded" >&2
+        exit 8
+      fi
       "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"
       echo "switch-model: the core asked to confirm the switch (warm conversation cache); not confirmed — pass --confirm on an owner instruction. Dialog cancelled, nothing recorded" >&2; exit 6
     fi;;

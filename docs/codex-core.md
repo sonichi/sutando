@@ -69,6 +69,55 @@ The Codex implementation:
   observation record (`docs/health-snapshot.md`, "Runtime observation");
 - restarts the core and notifier together, preventing duplicate task consumers.
 
+Task wakeups leave tmux copy mode before typing. The shared sender issues
+`copy-mode -q` and then, in the same tmux command list, an `if-shell -F
+'#{pane_in_mode}'` that sends the keys only if the pane is not in a mode at that
+moment; tmux can run hooks between the commands of a list, so a pane a hook put back
+into a mode gets nothing and the send returns 1. That one call is
+bounded to 5 seconds, then a 1-second TERM grace before KILL. It buffers stdout and stderr in
+private temporary files, so a stopped tmux server cannot keep the caller
+waiting on an output pipe after the client exits. Killing a client does not withdraw
+a request already queued with a stopped server, so the send runs inside `if-shell`
+only if tmux can claim a one-time ticket file when it executes and the sending
+guard process is still alive after the claim: same pid, same start time
+(`ps -o lstart`), not a zombie. Otherwise the claim is renamed
+`ticket.orphaned` and nothing is sent, with or without a later sender. On timeout the
+sender revokes the ticket first, so a request tmux reaches after the sender has
+returned 124 sends nothing. If the ticket was already claimed at timeout, the
+outcome is uncertain: status 125 retains a socket-wide fence at
+`<socket>.pane-keys-lock`. Every caller must acquire the same OS file lock before
+sending, so retries, Enter and recovery keys cannot reach the server
+while an uncertain send is outstanding. The file lock releases automatically on
+process death and is not inherited by tmux. Contention returns 75 (busy), rather
+than 125 (uncertain). A successful tmux reply whose ticket was not claimed, or was orphaned, is a failed send (status 1); any other outcome after a claim, including a signal-killed client, keeps the fence (125).
+The guard stores the unique ticket path before submitting
+the command. TERM cleanup revokes an unclaimed ticket; after SIGKILL, the next
+sender revokes it under the file lock. A claimed or unreadable ticket record
+remains fenced. Normal completion clears the pending record, while the guard's
+mutex stays in place for later senders. A legacy empty fence requires recovery.
+
+An uncertain send blocks automation on every pane of that socket. To recover,
+stop the old tmux server, reconcile the affected task and composer (the send may
+have applied), then explicitly clear the fence before starting a fresh server:
+
+```bash
+PY="$(bash scripts/sutando-config.sh python-bin)"
+"$PY" src/tmux_pane_keys.py recover "$SUTANDO_TMUX_SOCKET"
+```
+
+Recovery takes the same file lock and refuses with 75 while a sender is active;
+never delete the mutex to bypass it. `health-check.py` reports a standing or
+unreadable fence as a `pane-key-fence` failure, with the socket path and recovery
+instruction. Active contention is healthy. Health checks never clear a fence.
+Do not clear the lock while an old request can still run. This state is tied to
+the IPC socket and survives notifier restarts. Only an atomically revoked,
+unclaimed ticket is automatically recovered; uncertainty never expires.
+Explicit typing failures with
+no staged prompt skip Enter and defer the task; an Enter failure with the prompt still staged
+also defers after the configured confirmation retries. An unobservable successful
+send keeps the existing advisory behavior. A race with scrolling can leave the
+attached terminal's jump prompt visible; Escape dismisses that client prompt.
+
 ## Externally managed monitor and heartbeat
 
 An embedder that owns both helpers can opt out of the launcher's helper lifecycle:

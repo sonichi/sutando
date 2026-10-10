@@ -460,7 +460,7 @@ clear_own_leftover() {
   case "$n" in ''|*[!0-9]*) return 1 ;; esac
   [ "$n" -gt 0 ] || return 0
   log_notifier "erasing $n char(s) recorded as $filename's own leftover, about to clear: $text"
-  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -N "$n" BSpace 2>/dev/null || return 1
+  bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$TARGET" -- -N "$n" BSpace 2>/dev/null || { log_notifier "clearing $filename failed (rc $?)"; return 1; }
   # A real CLI renders N backspaces over several redraws, not instantly (measured
   # live) -- polls instead of reading once; still fails closed past the budget.
   while [ -n "$(composer_text "$(capture_raw)")" ]; do
@@ -481,7 +481,7 @@ type_prompt() {
     chunk="${prompt:$i:$n}"; i=$((i + n)); typed="$typed$chunk"
     # tmux reads a trailing ';' as its command separator; '\;' is how one sends it.
     arg="$chunk"; case "$arg" in *';') arg="${arg%;}\;" ;; esac
-    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$arg"
+    bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$TARGET" -- -l -- "$arg" || log_notifier "typing $filename failed (rc $?)"
     sleep "$POLL_INTERVAL"
     cap="$(capture_raw)" || cap=""
     if pane_frame_is_cut "$cap"; then
@@ -632,7 +632,7 @@ press_enter_and_confirm() {
     log_notifier "could not record the in-flight marker for $filename; not pressing Enter (failing closed)"
     return 1
   fi
-  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
+  bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$TARGET" -- C-m || log_notifier "C-m failed (rc $?)"
   while :; do
     waited=0
     while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
@@ -662,7 +662,7 @@ press_enter_and_confirm() {
       return 1
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
-    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
+    bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$TARGET" -- C-m || log_notifier "C-m failed (rc $?)"
   done
 }
 
@@ -741,7 +741,7 @@ nudge_deliver_grown() {
     log_notifier "nudge: composer changed since staged; not pressing Enter (failing closed)"
     return 1
   fi
-  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
+  bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$TARGET" -- C-m || log_notifier "C-m failed (rc $?)"
   while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
     if cap="$(capture_raw)" && ! composer_holds_prompt "$cap" "$prompt"; then
       log_notifier "nudge submitted for $TASKS_DIR"
