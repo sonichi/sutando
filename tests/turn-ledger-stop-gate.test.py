@@ -644,6 +644,9 @@ def main() -> int:
         test_a_dry_run_spends_no_reminder,
         test_an_unrecognised_stop_never_blocks,
         test_a_payload_read_that_times_out_still_gates,
+        test_the_turn_start_is_immutable_across_the_turn,
+        test_the_turn_start_is_per_session_and_strict,
+        test_the_real_hooks_keep_the_start,
     ):
         print(f"{fn.__name__}:")
         fn()
@@ -1312,6 +1315,69 @@ def test_result_after_skips_an_entry_whose_stat_races_away() -> None:
             found = turn_ledger._result_after(0.0, ws)
         check("the raced entry's OSError is swallowed and the good one is still found",
               found is not None and found["target"] == "task-good.txt", repr(found))
+
+
+def test_the_turn_start_is_immutable_across_the_turn() -> None:
+    """`started` is written once per turn and survives the reminder being spent, so a
+    Stop hook running beside the gate still measures the turn from its real start."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        check("no turn recorded reads as None", turn_ledger.turn_started_at(ws) is None, "")
+        turn_ledger.stop_gate(ws)                      # establish the boundary
+        before = time.time()
+        turn_ledger.begin_turn(ws)
+        started = turn_ledger.turn_started_at(ws)
+        check("begin_turn records the start", started is not None and started >= before,
+              repr(started))
+        reply = ws / "results" / "task-mid-turn.txt"
+        reply.write_text("a real reply\n", encoding="utf-8")
+        os.utime(reply, (started + 0.01, started + 0.01))
+        time.sleep(0.05)
+        turn_ledger.spend_reminder(ws)                 # what a reminding Stop gate writes
+        record = json.loads((ws / "state" / turn_ledger.TURN_NAME).read_text())
+        check("spending moved `ts` past this turn's own evidence",
+              record["reminded"] is True and record["ts"] > reply.stat().st_mtime, repr(record))
+        check("... and kept `started`", turn_ledger.turn_started_at(ws) == started, repr(record))
+        check("so the turn's evidence is still found from the start",
+              turn_ledger.delivery_after(turn_ledger.turn_started_at(ws), ws) is not None, "")
+        time.sleep(0.01)
+        turn_ledger.begin_turn(ws)
+        check("the next turn has a new start", (turn_ledger.turn_started_at(ws) or 0) > started, "")
+
+
+def test_the_turn_start_is_per_session_and_strict() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.begin_turn(ws, session="A")
+        a = turn_ledger.turn_started_at(ws, session="A")
+        time.sleep(0.01)
+        turn_ledger.begin_turn(ws, session="B")
+        check("B's turn start leaves A's alone", turn_ledger.turn_started_at(ws, session="A") == a, "")
+        state = ws / "state" / turn_ledger.TURN_NAME
+        state.write_text(json.dumps({"reminded": False, "ts": 123.0}))
+        check("a record from before `started` reads as None, never as `ts`",
+              turn_ledger.turn_started_at(ws) is None, "")
+        turn_ledger.spend_reminder(ws)
+        check("spending such a record invents no start", turn_ledger.turn_started_at(ws) is None, "")
+        for bad in ('{"started": true}', '{"started": "5"}', '[1]', '{not json'):
+            state.write_text(bad)
+            check(f"an unusable record ({bad}) reads as None", turn_ledger.turn_started_at(ws) is None, "")
+
+
+def test_the_real_hooks_keep_the_start() -> None:
+    """turn-start.sh then a reminding check-pending-tasks.sh, as installed: `started` holds."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        stop_hook, turn_start = REPO / "src" / "check-pending-tasks.sh", REPO / "src" / "turn-start.sh"
+        env_extra = {"SUTANDO_STOP_HOOK_WATCHER_GATE": "0", "SUTANDO_CORE_SESSION": "1"}
+        with mock.patch.dict(os.environ, env_extra):
+            _run_hook_script(stop_hook, ws, "S")                          # arms the boundary
+            _run_hook_script(turn_start, ws, "S", stdin_text="{}")
+            started = turn_ledger.turn_started_at(ws, session="S")
+            decision = json.loads(_run_hook_script(stop_hook, ws, "S").stdout or "{}")
+        check("setup: the silent turn was reminded", decision.get("decision") == "block", repr(decision))
+        check("turn-start.sh recorded a start", started is not None, "")
+        check("the reminding Stop kept it", turn_ledger.turn_started_at(ws, session="S") == started, "")
 
 
 if __name__ == "__main__":
