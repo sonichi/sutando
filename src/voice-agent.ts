@@ -67,6 +67,7 @@ import { createAudioHealthLedger } from './voice-audio-health.js';
 import { createHealthPersistence } from './voice-audio-health-persist.js';
 import { evaluateMatrix, type MatrixBaseline } from './voice-health-matrix.js';
 import { initialGoodbyeGuard, shouldFireGoodbye, createConversationClearHelper, clearStaleResumptionHandle } from './voice-continuity.js';
+import { ConversationLogStore } from './conversation-log-store.js';
 import { classifyFatalExitCode, isFatalExit, markFatalExit, writeCrashRecordAndExit, EXIT_CODE_DUPLICATE_INSTANCE } from './crash-only.js';
 import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLockGuardPath } from './voice-lock.js';
 import { recordToolCall } from './conversation-store.js';
@@ -537,7 +538,7 @@ const endSession: ToolDefinition = {
 		// replay goodbye text from this session into the reconnect
 		// greeting. Structural fix for the 2026-04-09 replay-contamination
 		// class of bug.
-		logSessionBoundary('user_goodbye');
+		conversationLogStore.markBoundary('user_goodbye');
 		console.log(`${ts()} [end_session] Sending session_end to client (sendJsonToClient exists: ${!!ctx.sendJsonToClient})`);
 		ctx.sendJsonToClient?.({ type: 'session_end', reason: 'user_goodbye' });
 		// CRITICAL: clear bodhi's in-memory conversationContext so the next
@@ -586,13 +587,19 @@ let voiceSessionRef: VoiceSession | null = null;
 // Runs right before a clear: the call's report keeps what is about to go.
 let beforeConversationClear: () => void = () => {};
 const itemsClear = createConversationClearHelper(
-	() => {
+	(reason) => {
 		beforeConversationClear();
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		return (voiceSessionRef as any)?.conversationContext?.items;
+		return voiceSessionRef?.resetConversationContext(reason).cleared ?? 0;
 	},
 	(m) => console.log(`${ts()} ${m}`),
 );
+// conversation.log + sqlite, written by bodhi's history writer after each turn. A goodbye's
+// remaining lines are not logged, so the next session's replay never picks them up.
+const conversationLogStore = new ConversationLogStore({
+	log: (role, text, sessionId, at) => logConversation(role, text, sessionId, at),
+	boundary: (reason) => logSessionBoundary(reason),
+	suppress: () => sessionEnding,
+});
 // P7 D7.3 stale-repeat goodbye guard (Tranche A engine-side). The guard
 // compares against userTurnCount, which resets per logical session — every
 // reset MUST rebase the guard too, or a legitimate goodbye in the next
@@ -720,7 +727,7 @@ const mainAgent: MainAgent = {
 			}
 			goodbyeGuard = verdict.next;
 			console.log(`${ts()} [Agent] Strict goodbye detected — closing client in 3s`);
-			logSessionBoundary('voice_goodbye');
+			conversationLogStore.markBoundary('voice_goodbye');
 			(ctx as any).sendJsonToClient?.({ type: 'session_end', reason: 'user_goodbye' });
 			setTimeout(() => {
 				try {
@@ -992,6 +999,7 @@ async function main() {
 		postSessionPipeline: callEnd.pipeline,
 		// close() runs at shutdown, right before process.exit: wait for the task to be written.
 		drainPostSession: true,
+		conversationHistoryStores: [conversationLogStore],
 		port: PORT,
 		host: HOST,
 		model: google(VOICE_MODEL),
@@ -1424,10 +1432,9 @@ async function main() {
 		for (const item of items.slice(itemsClear.cursor.index)) {
 			if (item.role === 'user' || item.role === 'assistant') {
 				console.log(`${ts()}   [${item.role}] ${item.content}`);
-				logConversation(item.role, item.content, SESSION_ID);
 				const evtRole = item.role === 'user' ? 'user' : 'sutando';
 				// utterance event push removed per #1052 — canonical record is
-				// the voice-table row written by logConversation() above
+				// the voice-table row ConversationLogStore writes
 				// (kind='user'/'agent', ts_unix). session_events keeps only
 				// lifecycle entries to stop triple-encoding the same atom.
 				recorder.transcript.push({ role: evtRole, text: item.content || '' });
