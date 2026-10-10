@@ -118,7 +118,7 @@ python3 skills/agent-room-ops/room_ops.py say '!room:hs' 'on it' --reply-to '$ev
 #   in the MAIN TIMELINE — it is not thread membership. A malformed event id is REFUSED
 #   before the network rather than posted uncited.
 python3 skills/agent-room-ops/room_ops.py say '!room:hs' 'yes, final' --thread-root '$evt' --agent '@a:hs'
-#   --thread-root (on `say`) posts IN that message's thread: the gateway builds the
+#   --thread-root (on `say` and `mention`) posts IN that message's thread: the gateway builds the
 #   rel_type m.thread relation from the id, so the post leaves the main timeline and
 #   shows under the root — how a reply under a document comment is made. Same id check.
 python3 skills/agent-room-ops/room_ops.py join   '!room:hs' --agent '@a:hs'

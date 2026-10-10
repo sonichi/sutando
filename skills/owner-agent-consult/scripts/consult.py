@@ -4,7 +4,8 @@ consult room, and later match its reply (which arrives as a new task) back to th
 task. Prints one JSON object; refusals are in-band.
 
   consult.py roster  [--agent SELF] [--room ROOM] [--room-cli CLI]
-  consult.py ask     --agent-to MXID --question-file F --task-id OWNER_TASK_ID [--agent SELF] ...
+  consult.py ask     --agent-to MXID --question-file F (--task-id OWNER_TASK | --via-task ASK_TASK) ...
+  consult.py answer  --body-file F (--task-id ASK_TASK | --up ONWARD_CID) [--agent SELF] ...
   consult.py match   --task-id REPLY_TASK_ID [--agent SELF] ...
   consult.py pending [--nudged CID] [--nudge-after S]
 
@@ -54,8 +55,9 @@ class RoomCliTransport:
     def members(self, room):
         return self._call("members", room, "--agent", self.self_mxid)
 
-    def mention(self, mxid, body, room, reply_to=None):
-        extra = ("--reply-to", reply_to) if reply_to else ()
+    def mention(self, mxid, body, room, reply_to=None, thread_root=None):
+        extra = (("--reply-to", reply_to) if reply_to else ()) + \
+            (("--thread-root", thread_root) if thread_root else ())
         return self._call("mention", mxid, body, room, "--agent", self.self_mxid, *extra)
 
     def read(self, room, limit):
@@ -75,7 +77,7 @@ def _emit(obj) -> int:
 def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
     p = argparse.ArgumentParser(prog="consult.py")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("roster", "ask", "match", "pending"):
+    for name in ("roster", "ask", "answer", "match", "pending"):
         s = sub.add_parser(name)
         s.add_argument("--agent", dest="self_mxid", default=os.environ.get("AGENT_MXID"),
                        help="this agent's own mxid (room-ops convention)")
@@ -84,8 +86,14 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
         if name == "ask":
             s.add_argument("--agent-to", required=True, help="an mxid from `roster`")
             s.add_argument("--question-file", required=True)
-            s.add_argument("--task-id", required=True,
-                           help="id of the owner task being answered, live in this workspace's inbox")
+            g = s.add_mutually_exclusive_group(required=True)
+            g.add_argument("--task-id", help="id of the owner task being answered, live in this inbox")
+            g.add_argument("--via-task", help="id of the consult ask task you are consulting onward from")
+        if name == "answer":
+            s.add_argument("--body-file", required=True)
+            g = s.add_mutually_exclusive_group(required=True)
+            g.add_argument("--task-id", help="id of the consult ask task you are answering")
+            g.add_argument("--up", metavar="CID", help="an answered onward consult whose asker you now answer")
         if name == "match":
             s.add_argument("--task-id", required=True,
                            help="id of the task the consulted agent's reply arrived as")
@@ -119,12 +127,16 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
         return _emit({"ok": True, **policy.match_reply(transport, room=conf["room"],
                                                          self_mxid=a.self_mxid or "",
                                                          task_id=a.task_id, workspace=ws)})
+    path = a.question_file if a.cmd == "ask" else a.body_file
     try:
-        question = Path(a.question_file).read_text(encoding="utf-8")
+        text = Path(path).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
-        return _emit({"ok": False, "asked": False, "reason": f"unreadable question: {e}"})
-    res = policy.consult(transport, room=conf["room"], self_mxid=a.self_mxid or "",
-                         agent=a.agent_to, question=question, task_id=a.task_id, workspace=ws)
+        return _emit({"ok": False, "reason": f"unreadable {a.cmd} text: {e}"})
+    if a.cmd == "answer":
+        return _emit({"ok": True, **policy.answer(transport, room=conf["room"], self_mxid=a.self_mxid or "",
+                                                   text=text, workspace=ws, task_id=a.task_id, up=a.up)})
+    res = policy.consult(transport, room=conf["room"], self_mxid=a.self_mxid or "", agent=a.agent_to,
+                         question=text, task_id=a.task_id, via_task=a.via_task, workspace=ws)
     return _emit({"ok": True, **res})
 
 
