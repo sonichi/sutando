@@ -2145,6 +2145,10 @@ sys.stderr = _NeverFatalStream(sys.stderr)
 def _log(msg: str) -> None:
     line = f"[remote-gateway-bridge] {msg}"
     print(line, flush=True)
+    _append_log_file(line)
+
+
+def _append_log_file(line: str) -> None:
     if _LAUNCHED_VIA == "supervised":
         return  # stdout already persisted by the supervisor's redirect
     try:
@@ -5253,10 +5257,20 @@ def _heartbeat_singleton() -> bool:
 
 def _exit_on_signal(signum, _frame) -> None:
     """Exit 0 as before, but say which signal ended the process."""
+    line = f"[remote-gateway-bridge] received {signal.Signals(signum).name} — exiting"
+    # Each sink on its own: a signal that lands inside print makes the next
+    # print raise, and that must cost neither the file line nor the exit.
     try:
-        _log(f"received {signal.Signals(signum).name} — exiting")
-    except Exception:  # noqa: BLE001 — a log failure must not block the exit
+        _append_log_file(line)
+    except Exception:  # noqa: BLE001
         pass
+    try:
+        print(line, flush=True)
+    except Exception:  # noqa: BLE001 — the raw fd is reentrancy-safe
+        try:
+            os.write(1, (line + "\n").encode())
+        except Exception:  # noqa: BLE001
+            pass
     sys.exit(0)
 
 

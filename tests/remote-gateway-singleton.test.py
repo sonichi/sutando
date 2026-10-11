@@ -122,29 +122,53 @@ class SingletonGlueTest(unittest.TestCase):
         finally:
             rgb._ws_acquire = orig
 
+    def _with_signal_sinks(self, stdout):
+        """Route the handler's two sinks: stdout to `stdout`, the file line to a
+        list. Returns the list."""
+        lines = []
+        saved = (sys.stdout, rgb._append_log_file)
+        sys.stdout, rgb._append_log_file = stdout, lines.append
+        self.addCleanup(lambda: setattr(sys, "stdout", saved[0]))
+        self.addCleanup(setattr, rgb, "_append_log_file", saved[1])
+        return lines
+
     def test_signal_exit_names_the_signal_and_exits_0(self):
-        logged = []
-        orig = rgb._log
-        rgb._log = logged.append
-        try:
-            with self.assertRaises(SystemExit) as ctx:
-                rgb._exit_on_signal(signal.SIGTERM, None)
-        finally:
-            rgb._log = orig
+        import io
+        out = io.StringIO()
+        lines = self._with_signal_sinks(out)
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_on_signal(signal.SIGTERM, None)
         self.assertEqual(ctx.exception.code, 0)
-        self.assertEqual(logged, ["received SIGTERM — exiting"])
+        want = "[remote-gateway-bridge] received SIGTERM — exiting"
+        self.assertEqual(lines, [want])
+        self.assertEqual(out.getvalue(), want + "\n")
+
+    def test_signal_exit_logs_the_file_line_when_print_is_reentrant(self):
+        # The signal landed inside print: the next print raises, as the
+        # BufferedWriter does on re-entry. The file line must still be written.
+        class Reentrant:
+            def write(self, _data):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter>")
+
+            def flush(self):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter>")
+        lines = self._with_signal_sinks(Reentrant())
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_on_signal(signal.SIGINT, None)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(lines, ["[remote-gateway-bridge] received SIGINT — exiting"])
 
     def test_signal_exit_survives_a_failing_log(self):
-        def boom(_msg):
-            raise RuntimeError("reentrant print")
-        orig = rgb._log
-        rgb._log = boom
-        try:
-            with self.assertRaises(SystemExit) as ctx:
-                rgb._exit_on_signal(signal.SIGINT, None)
-        finally:
-            rgb._log = orig
+        def boom(_line):
+            raise OSError("disk gone")
+        import io
+        out = io.StringIO()
+        self._with_signal_sinks(out)
+        rgb._append_log_file = boom
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_on_signal(signal.SIGINT, None)
         self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("received SIGINT — exiting", out.getvalue())
 
 
 if __name__ == "__main__":
