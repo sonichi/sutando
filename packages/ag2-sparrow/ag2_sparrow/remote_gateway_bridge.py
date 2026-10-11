@@ -2710,10 +2710,7 @@ def _resolve_host_label() -> None:
     src = _monorepo_src("util_paths.py")
     if src and src not in sys.path:
         sys.path.insert(0, src)
-    try:
-        _stable_host_label()
-    except OSError:
-        pass
+    _profile_host_id()
 
 
 def _profile_host_id() -> str:
