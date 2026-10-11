@@ -264,6 +264,72 @@ def test_child_that_ignores_or_closes_stdin_never_blocks():
             print(f"PASS test_child_that_ignores_or_closes_stdin_never_blocks ({name})")
 
 
+def test_stdin_feed_in_the_calling_thread():
+    """The feeder itself, run synchronously: reader, non-reader, early exit, no pipe."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        m = _load(base, None)
+        m._ON_TASK_STDIN_TIMEOUT_S = 1.0
+        logs = []
+        m._log = logs.append
+        big = b"y" * (512 * 1024)
+        py = sys.executable
+
+        def spawn(code):
+            return subprocess.Popen([py, "-c", code], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        reader = spawn("import sys; sys.stdout.write(str(len(sys.stdin.buffer.read())))")
+        m._feed_and_reap(reader, big, "t-read")
+        assert reader.stdout.read() == str(len(big)).encode()
+        reader.stdout.close()
+        assert reader.stdin.closed
+
+        sleeper = spawn("import time; time.sleep(30)")
+        t0 = time.monotonic()
+        m._feed_on_task_stdin(sleeper, big, "t-sleep")
+        assert time.monotonic() - t0 < 5
+        assert sleeper.stdin.closed
+        assert any("did not read its stdin for t-sleep" in ln for ln in logs), logs
+        sleeper.kill()
+        sleeper.wait()
+        sleeper.stdout.close()
+
+        quitter = spawn("raise SystemExit(4)")
+        quitter.wait()
+        m._feed_and_reap(quitter, big, "t-quit")
+        assert quitter.stdin.closed
+        assert any("exited 4 for t-quit" in ln for ln in logs), logs
+        assert not any("write failed" in ln for ln in logs), logs
+        quitter.stdout.close()
+
+        no_pipe = subprocess.Popen([py, "-c", "pass"], stdin=subprocess.DEVNULL)
+        m._feed_and_reap(no_pipe, big, "t-none")
+
+        closed = spawn("pass")
+        closed.stdin.close()
+        m._feed_and_reap(closed, big, "t-closed")
+        assert any("stdin write failed for t-closed" in ln for ln in logs), logs
+        closed.stdout.close()
+        print("PASS test_stdin_feed_in_the_calling_thread")
+
+
+def test_fire_reads_the_file_when_no_text_is_given():
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        cmd, out = _recorder_cmd(base, STDIN_RECORDER)
+        m = _load(base, None)
+        m.ON_TASK_CMD = cmd
+        path = base / "task-x.txt"
+        path.write_text("id: task-x\nchannel_id: !r:ag2.space\ntask: hello\n")
+        m._fire_on_task("task-x", path)
+        call = _calls(out, 1)[0]
+        assert bytes.fromhex(call["stdin"]) == path.read_bytes()
+        assert call["env"]["SPARROW_ROOM_ID"] == "!r:ag2.space"
+        print("PASS test_fire_reads_the_file_when_no_text_is_given")
+
+
 if __name__ == "__main__":
     test_fires_once_per_new_task_with_its_path()
     test_unset_runs_nothing()
@@ -273,4 +339,6 @@ if __name__ == "__main__":
     test_stdin_carries_the_exact_task_bytes()
     test_env_carries_the_routing_headers()
     test_child_that_ignores_or_closes_stdin_never_blocks()
+    test_stdin_feed_in_the_calling_thread()
+    test_fire_reads_the_file_when_no_text_is_given()
     print("ALL PASS test_on_task_wake")

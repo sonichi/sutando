@@ -55,6 +55,7 @@ from __future__ import annotations
 import atexit
 import glob
 import base64
+import contextlib
 import hashlib
 import http.client
 import json
@@ -3345,7 +3346,7 @@ def _feed_on_task_stdin(proc: "subprocess.Popen", data: bytes, tid: str) -> None
     if pipe is None:
         return
     try:
-        if os.name == "nt":  # Windows pipes do not support select(): a plain blocking write
+        if os.name == "nt":  # pragma: no cover  # no select() on Windows pipes: blocking write
             pipe.write(data)
             return
         fd = pipe.fileno()
@@ -3368,10 +3369,16 @@ def _feed_on_task_stdin(proc: "subprocess.Popen", data: bytes, tid: str) -> None
     except (OSError, ValueError) as exc:
         _log(f"on-task stdin write failed for {tid}: {type(exc).__name__}: {exc}")
     finally:
-        try:
+        with contextlib.suppress(OSError):
             pipe.close()
-        except OSError:
-            pass
+
+
+def _feed_and_reap(proc: "subprocess.Popen", data: bytes, tid: str) -> None:
+    """Hand the wake command its task on stdin, then reap it."""
+    _feed_on_task_stdin(proc, data, tid)
+    code = proc.wait()
+    if code != 0:
+        _log(f"on-task command exited {code} for {tid}")
 
 
 def _fire_on_task(tid: str, path: Path, text: "str | None" = None) -> None:
@@ -3393,13 +3400,8 @@ def _fire_on_task(tid: str, path: Path, text: "str | None" = None) -> None:
         _log(f"on-task command failed to start for {tid}: {type(exc).__name__}: {exc}")
         return
 
-    def _feed_and_reap() -> None:
-        _feed_on_task_stdin(proc, data, tid)
-        code = proc.wait()
-        if code != 0:
-            _log(f"on-task command exited {code} for {tid}")
-
-    threading.Thread(target=_feed_and_reap, name=f"on-task-{tid}", daemon=True).start()
+    threading.Thread(target=_feed_and_reap, args=(proc, data, tid),
+                     name=f"on-task-{tid}", daemon=True).start()
 
 
 def _write_task(task: dict) -> "tuple[str, bool] | None":
