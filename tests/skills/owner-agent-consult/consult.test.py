@@ -1135,7 +1135,7 @@ class TestWindowOnServerTime(unittest.TestCase):
         skew = -3600
         self.w.deliver(SIB, "$ask", "task-b1", at=T0 + skew)
         reason = self.refused(self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 1801 + skew))
-        self.assertIn("behind the room's newest server timestamp", reason)
+        self.assertIn("behind the consult thread's newest server timestamp", reason)
 
     def test_a_receiver_slow_within_the_tolerance_is_still_held_to_the_window(self):
         skew = -100
@@ -1173,9 +1173,22 @@ class TestWindowOnServerTime(unittest.TestCase):
     def test_the_newest_server_timestamp_is_a_floor(self):
         self.w.deliver(SIB, "$ask", "task-b1", at=T0)
         self.w.room.clock = lambda: T0 + 1900
-        self.w.room.post(OWNER, "later message in the room")
+        self.w.room.post(OWNER, "later message in the thread", thread_root="$ask")
         reason = self.refused(self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 1850))
         self.assertIn("window has passed", reason)
+
+    def test_an_event_outside_the_thread_does_not_move_the_floor(self):
+        self.w.deliver(SIB, "$ask", "task-b1", at=T0)
+        self.w.room.clock = lambda: T0 + 3600
+        self.w.room.post(OWNER, "an unrelated message stamped an hour ahead")
+        self.assertTrue(self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 60)["asked"])
+
+    def test_disclosed_an_event_in_the_thread_stamped_ahead_refuses_every_ask(self):
+        self.w.deliver(SIB, "$ask", "task-b1", at=T0)
+        self.w.room.clock = lambda: T0 + 180
+        self.w.room.post(OWNER, "a thread message stamped 180 s ahead", thread_root="$ask")
+        reason = self.refused(self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 30))
+        self.assertIn("behind the consult thread's newest server timestamp", reason)
 
     def test_the_measure_takes_the_largest_term_and_refuses_a_slow_clock(self):
         tol = policy.CLOCK_TOLERANCE_S
@@ -1190,6 +1203,35 @@ class TestWindowOnServerTime(unittest.TestCase):
         with mock.patch.object(policy, "measured_now", return_value=None):
             res = self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0)
         self.assertIn("cannot measure the thread window on server time", res["reason"])
+
+
+class TestWindowResiduals(unittest.TestCase):
+    """Documented residuals, asserting today's behaviour (SKILL.md "Time-window invariant"):
+    the window is correct only within this agent's clock error plus any backward step, and the
+    120 s check sees a slow clock only when the thread has a recent event. Each schedule here
+    lets an ask through that a true clock would refuse."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+        self.w.room.clock = lambda: T0
+        self.w.ask(SELF, SIB, cid=C1, task_id=TID, now=lambda: T0)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def onward(self, arrived_local, now_local):
+        self.w.deliver(SIB, "$ask", "task-b1", at=arrived_local)
+        return self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: now_local)
+
+    def test_residual_a_120s_backward_step_with_1801s_elapsed_is_allowed(self):
+        self.assertTrue(self.onward(arrived_local=T0, now_local=T0 + 1801 - 120)["asked"])
+
+    def test_residual_a_clock_1h_slow_handling_at_t_plus_4000_is_allowed(self):
+        self.assertTrue(self.onward(arrived_local=T0 + 4000 - 3600, now_local=T0 + 4000 - 3600)["asked"])
+
+    def test_residual_a_clock_120s_slow_delivered_at_t_plus_1801_is_allowed(self):
+        self.assertTrue(self.onward(arrived_local=T0 + 1801 - 120, now_local=T0 + 1801 - 120)["asked"])
 
 
 class TestRecordEdges(unittest.TestCase):

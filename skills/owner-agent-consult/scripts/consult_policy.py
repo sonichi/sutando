@@ -450,7 +450,8 @@ def limit_reached(limits: dict, asks_so_far: int, now: float) -> Optional[str]:
 def thread_view(transport, room: str, root: str) -> dict:
     """{ok, root_msg, msgs (oldest first), server_now} for the consult thread rooted at `root`,
     or a refusal when the root is not visible: an unseen thread cannot be checked. `server_now`
-    is the newest server timestamp in the read, the clock thread limits are measured on."""
+    is the newest server timestamp among the thread's own events, so an event elsewhere in the
+    room cannot move the window floor."""
     page = transport.read(room, READ_LIMIT)
     if not page.get("ok"):
         return {"ok": False, "reason": f"consult room unreadable: {page.get('reason')}"}
@@ -461,20 +462,19 @@ def thread_view(transport, room: str, root: str) -> dict:
                                        "messages of the consult room; cannot see the whole thread"}
     inside = [m for m in msgs if m.get("event_id") == root or m.get("thread_root") == root]
     return {"ok": True, "root_msg": root_msg, "msgs": list(reversed(inside)), "all": msgs,
-            "server_now": server_now(msgs)}
+            "server_now": server_now(inside)}
 
 
 CLOCK_TOLERANCE_S = 120
 
 
 def measured_now(server_now_s: Optional[float], anchor: tuple, local_now: float) -> Optional[float]:
-    """An upper-leaning estimate of the server's current time for the thread window (see
-    SKILL.md "Time-window invariant"): the largest of the newest server timestamp read, the
-    anchor's server timestamp plus the local time elapsed since it, and the local clock. Every
-    term is at most the true time or errs early, so the window can close early, never late.
-    `anchor` is (server ts, local time) of one moment, or (None, None). None (refuse) when no
-    server timestamp is known, or when the local clock is provably behind the server by more
-    than CLOCK_TOLERANCE_S."""
+    """An estimate of the server's current time for the thread window (see SKILL.md
+    "Time-window invariant" for what it does and does not guarantee): the largest of the
+    thread's newest server timestamp, the anchor's server timestamp plus local time elapsed
+    since it, and the local clock. `anchor` is (server ts, local time) of one moment, or
+    (None, None). None (refuse) when no server timestamp is known, or when the local clock is
+    more than CLOCK_TOLERANCE_S behind the thread's newest server timestamp."""
     if server_now_s is None or local_now < server_now_s - CLOCK_TOLERANCE_S:
         return None
     terms = [server_now_s, local_now]
@@ -637,7 +637,7 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
         return no("the consult thread's root event has no server timestamp; cannot apply the thread limits")
     if now_s is None:
         return no("cannot measure the thread window on server time: this agent's clock is more than "
-                  f"{CLOCK_TOLERANCE_S}s behind the room's newest server timestamp")
+                  f"{CLOCK_TOLERANCE_S}s behind the consult thread's newest server timestamp")
     refusal = limit_reached(limits, len(asks), now_s)
     if refusal:
         return no(refusal, limit_reached=True)
