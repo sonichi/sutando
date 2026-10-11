@@ -722,7 +722,7 @@ def _close(workspace: Path, binding: dict, event: str, task_id, no) -> dict:
     cid = str(binding["cid"])
     dst = _record_path(workspace, "answered", cid)
     claim = {**binding["record"], "answered_at": time.time(), "answer_event": event,
-             "reply_task": task_id or binding.get("reply_task"), "payload": binding["payload"]}
+             "reply_task": task_id, "payload": binding["payload"]}
     try:
         if not _claim_file(dst, claim):
             return _replay(workspace, cid, task_id, event, no)
