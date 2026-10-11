@@ -80,6 +80,20 @@ jobs:
         run: |
           python3 -m pip install --quiet build
           python3 -m build packages/ag2-sparrow --outdir dist/
+      - name: Built distributions ship every subpackage
+        run: |
+          set -e
+          python3 - <<'PY'
+          import pathlib, tarfile, zipfile
+          root = pathlib.Path("packages/ag2-sparrow")
+          pkgs = sorted(str(p.parent.relative_to(root)) for p in (root / "ag2_sparrow").rglob("__init__.py"))
+          whl = next(pathlib.Path("dist").glob("*.whl")); sd = next(pathlib.Path("dist").glob("*.tar.gz"))
+          wn = set(zipfile.ZipFile(whl).namelist())
+          sn = {n.split("/", 1)[1] for n in tarfile.open(sd).getnames() if "/" in n}
+          missing = [p for p in pkgs if f"{p}/__init__.py" not in wn or f"{p}/__init__.py" not in sn]
+          assert not missing, f"dist lacks packages: {missing}"
+          print("dist ships", pkgs)
+          PY
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
