@@ -75,10 +75,13 @@ describe('result watcher: [thread] is stripped for speech; a skip right after it
 		writeFileSync(join(RESULT_DIR, 'task-skip-then-thread.txt'), '[no-send]\n[thread]\nhidden control\n');
 		_pendingTasksForTest.set('task-dmonly-then-skip', { submittedAt: Date.now(), timeoutMs: 0, dmOnTimeout: false, taskText: 'd' });
 		writeFileSync(join(RESULT_DIR, 'task-dmonly-then-skip.txt'), '[dm-only]\n[no-send]\nhidden dm\n');
+		// The delivery verdict: an owner's skip directly after [channel:] is a skip, as in the gateway.
+		_pendingTasksForTest.set('task-channel-then-skip', { submittedAt: Date.now(), timeoutMs: 0, dmOnTimeout: false, taskText: 'e' });
+		writeFileSync(join(RESULT_DIR, 'task-channel-then-skip.txt'), '[channel: !r:s]\n[no-send]\nhidden redirect\n');
 		const spoken: string[] = [];
 		startResultWatcher((result: string) => { spoken.push(result); }, () => true);
 		const skipped = ['noSend', 'replied', 'deduped'].map(k => `task-thread-then-${k}.txt`)
-			.concat(['task-skip-then-thread.txt', 'task-dmonly-then-skip.txt']);
+			.concat(['task-skip-then-thread.txt', 'task-dmonly-then-skip.txt', 'task-channel-then-skip.txt']);
 		const ok = await until(() => spoken.some(s => s.includes('answer body')) && spoken.some(s => s.includes('nudge body'))
 			&& skipped.every(f => !existsSync(join(RESULT_DIR, f))), 12000);
 		assert.ok(ok, `spoken=${JSON.stringify(spoken)} left=${skipped.filter(f => existsSync(join(RESULT_DIR, f)))}`);
@@ -88,8 +91,8 @@ describe('result watcher: [thread] is stripped for speech; a skip right after it
 	});
 });
 
-describe('bodyIsSkipMarked agrees with parse_markers on the leading block', () => {
-	it('same skip verdict as src/result_markers.py for every corpus body', async () => {
+describe('bodyIsSkipMarked agrees with the delivery verdict of parse_markers on the leading block', () => {
+	it('same skip verdict as src/result_markers.py (skip_after_channel=True) for every corpus body', async () => {
 		const { execFileSync } = await import('node:child_process');
 		const corpus = [];
 		for (const lead of ['', '[thread]\n', '[thread: $r]\n', '[channel: !r:s]\n', '[dm-only]\n', '[reply: 12345678901234567]\n',
@@ -102,7 +105,7 @@ describe('bodyIsSkipMarked agrees with parse_markers on the leading block', () =
 		try {
 			const out = execFileSync('python3', ['-c',
 				'import json,sys; sys.path.insert(0,"src"); from result_markers import parse_markers as p; '
-				+ 'print(json.dumps([any(a.kind=="skip" for a in p(t).actions) for t in json.load(sys.stdin)]))'],
+				+ 'print(json.dumps([any(a.kind=="skip" for a in p(t, skip_after_channel=True).actions) for t in json.load(sys.stdin)]))'],
 			{ input: JSON.stringify(corpus), encoding: 'utf-8' });
 			py = JSON.parse(out);
 		} catch (e) {
@@ -119,7 +122,7 @@ describe('the shared table tests/fixtures/thread-ask-cases.json (also run by res
 		const table = JSON.parse(readFileSync(join(import.meta.dirname, 'fixtures', 'thread-ask-cases.json'), 'utf-8'));
 		const bad: string[] = [];
 		for (const c of table.cases) {
-			if (markers.bodyIsSkipMarked(c.body) !== c.skip) bad.push(`skip ${JSON.stringify(c.body)}`);
+			if (markers.bodyIsSkipMarked(c.body) !== (c.delivery_skip ?? c.skip)) bad.push(`skip ${JSON.stringify(c.body)}`);
 			if (c.voice !== null && strip!(c.body).trim() !== c.voice) bad.push(`voice ${JSON.stringify(c.body)} -> ${JSON.stringify(strip!(c.body).trim())}`);
 		}
 		assert.deepEqual(bad, []);
