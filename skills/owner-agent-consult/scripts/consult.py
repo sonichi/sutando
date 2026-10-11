@@ -89,6 +89,10 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
             g = s.add_mutually_exclusive_group(required=True)
             g.add_argument("--task-id", help="id of the owner task being answered, live in this inbox")
             g.add_argument("--via-task", help="id of the consult ask task you are consulting onward from")
+            s.add_argument("--max-duration", default=None,
+                           help=f"first ask only: the thread's time window in seconds (overrides {policy.CONFIG_MAX_DURATION})")
+            s.add_argument("--max-asks", default=None,
+                           help=f"first ask only: the most asks the thread takes (overrides {policy.CONFIG_MAX_ASKS})")
         if name == "answer":
             s.add_argument("--body-file", required=True)
             g = s.add_mutually_exclusive_group(required=True)
@@ -103,7 +107,8 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
             s.add_argument("--nudge-after", default=None, help=f"overrides {policy.CONFIG_NUDGE_AFTER}")
     a = p.parse_args(argv)
 
-    conf = policy.settings(room=a.room, nudge_after=getattr(a, "nudge_after", None), room_cli=a.room_cli)
+    conf = policy.settings(room=a.room, nudge_after=getattr(a, "nudge_after", None), room_cli=a.room_cli,
+                           max_duration=getattr(a, "max_duration", None), max_asks=getattr(a, "max_asks", None))
     if not conf["active"]:
         return _emit({"ok": False, "inert": True, "reason": conf["reason"]})
     ws = workspace or _workspace()
@@ -138,7 +143,8 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
         return _emit({"ok": True, **policy.answer(transport, room=conf["room"], self_mxid=a.self_mxid or "",
                                                    text=text, workspace=ws, task_id=a.task_id, up=a.up)})
     res = policy.consult(transport, room=conf["room"], self_mxid=a.self_mxid or "", agent=a.agent_to,
-                         question=text, task_id=a.task_id, via_task=a.via_task, workspace=ws)
+                         question=text, task_id=a.task_id, via_task=a.via_task, workspace=ws,
+                         max_duration_s=conf["max_duration_s"], max_asks=conf["max_asks"])
     return _emit({"ok": True, **res})
 
 
