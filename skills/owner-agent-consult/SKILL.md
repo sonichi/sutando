@@ -106,7 +106,8 @@ inside the answer window. It may arrive as a task (when it mentions you), or onl
    The judgement is yours; no text rule decides.
 
 A message can belong only to the consult whose thread it is in or whose ask it cites; a message
-whose thread and reply point at different consults binds nowhere. A later message is refused
+whose thread and reply point at different consults belongs to neither: it binds nowhere and does
+not hold up either consult. A later message is refused
 until the earlier ones are judged. Each message is bound once (`bound/<event>.json`, never
 deleted) and its recorded judgement wins: the opposite flag is refused (`conflict: true`). A
 message bound as the answer holds everything needed to close, so `--final` finishes the close
@@ -128,7 +129,8 @@ a crash between the match and your relay loses nothing.
 ## No answer by the nudge time
 
 `consult.py pending` lists unanswered consults oldest first, with `age_s`, `nudge_due`,
-`unconfirmed`, `expired`, `answer_waiting`, and `claim_only` for a task that claimed its ask but
+`unconfirmed`, `expired`, `answer_waiting` (with `refused`, the reason `match` will give, when it
+falls outside the answer window or the ask has left the room read), and `claim_only` for a task that claimed its ask but
 has no record. Check it on your next pass. For each `nudge_due` consult, tell the owner once, in
 the original conversation (the record's `origin`), that the agent has not answered, answer from
 what you hold, then run `consult.py pending --nudged <cid>`. A reply inside the answer window

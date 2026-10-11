@@ -217,11 +217,7 @@ def live_task(task_id: str, workspace: Optional[Path]) -> dict:
     headers = attested_task_headers(text, Path(workspace)).headers
     if headers.get("id") != task_id:
         return no("task does not carry its own id")
-    try:
-        arrived = path.stat().st_mtime
-    except OSError:
-        arrived = None
-    return {"ok": True, "text": text, "headers": headers, "arrived_at": arrived, "reason": None}
+    return {"ok": True, "text": text, "headers": headers, "reason": None}
 
 
 def trusted_task(task_id: str, workspace: Optional[Path]) -> dict:
@@ -575,9 +571,26 @@ def _consult_of(workspace: Path, msg: dict) -> tuple:
     return rec, None
 
 
-def _in_consult(rec: dict, m: dict) -> bool:
-    return (m.get("sender") == rec.get("agent") and m.get("event_id") != rec.get("ask_event")
-            and (m.get("thread_root") == rec.get("ask_event") or m.get("in_reply_to") == rec.get("ask_event")))
+def _in_consult(workspace: Path, rec: dict, m: dict) -> bool:
+    """The asked agent's message that belongs to this consult and no other: one whose thread
+    and reply disagree belongs to neither, so it never blocks the order of either."""
+    if m.get("sender") != rec.get("agent") or m.get("event_id") == rec.get("ask_event"):
+        return False
+    owner, _ = _consult_of(workspace, m)
+    return bool(owner) and owner.get("cid") == rec.get("cid")
+
+
+def _window_refusal(rec: dict, msg: dict, messages: List[dict], max_duration_s: int) -> Optional[str]:
+    """Why `msg` falls outside the consult's answer window, measured on server timestamps."""
+    ask = next((m for m in messages if m.get("event_id") == rec["ask_event"]), None)
+    ask_ts, msg_ts = _ts_seconds((ask or {}).get("ts")), _ts_seconds(msg.get("ts"))
+    if ask_ts is None or msg_ts is None:
+        return ("the ask or the message has no server timestamp in the last "
+                f"{READ_LIMIT} messages; cannot apply the answer window")
+    window = min(int(rec.get("max_s") or max_duration_s), int(max_duration_s))
+    if msg_ts - ask_ts > window:
+        return f"posted {int(msg_ts - ask_ts)}s after the ask, outside the {window}s answer window"
+    return None
 
 
 def _payload(rec: dict, event: str, text: str) -> dict:
@@ -632,22 +645,18 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
         return no(f"consult {cid} was asked in another room")
     if _record_path(workspace, "answered", cid).exists():
         return _replay(workspace, cid, task_id, event, no)
-    if not _in_consult(rec, msg):
+    if not _in_consult(workspace, rec, msg):
         return no(f"not from {rec['agent']}, the agent consult {cid} asked")
-    ask = next((m for m in messages if m.get("event_id") == rec["ask_event"]), None)
-    ask_ts, msg_ts = _ts_seconds((ask or {}).get("ts")), _ts_seconds(msg.get("ts"))
-    if ask_ts is None or msg_ts is None:
-        return no("the ask or the message has no server timestamp in the read; cannot apply the answer window")
-    window = min(int(rec.get("max_s") or max_duration_s), int(max_duration_s))
-    if msg_ts - ask_ts > window:
-        return no(f"posted {int(msg_ts - ask_ts)}s after the ask, outside the {window}s answer window")
+    late = _window_refusal(rec, msg, messages, max_duration_s)
+    if late:
+        return no(late)
     if _age(rec, time.time() if now is None else now) > expire_after_s:
         return no(f"consult {cid} expired; tell the owner it was not answered in time")
     later = False
     for m in messages:  # newest first: anything after `msg` here is older than it
         if m.get("event_id") == event:
             later = True
-        elif later and _in_consult(rec, m) and not _key_path(workspace, "bound", m.get("event_id")).exists():
+        elif later and _in_consult(workspace, rec, m) and not _key_path(workspace, "bound", m.get("event_id")).exists():
             return no(f"an earlier message from {rec['agent']} in this consult, {m.get('event_id')}, is not "
                       "judged yet; judge it first", earlier=m.get("event_id"))
     text = leading_mention(msg.get("body") or "", self_mxid)
@@ -735,18 +744,21 @@ def mark_relayed(workspace: Path, cid: str) -> dict:
     return {"ok": True, "cid": cid, "reason": None}
 
 
-def waiting_answers(transport, room: str, workspace: Path) -> dict:
-    """{cid: {event_id, text}}: for each confirmed pending consult, the asked agent's oldest
-    message in its thread not yet judged, when no task brought it here. One room read."""
+def waiting_answers(transport, room: str, workspace: Path, max_duration_s: int = DEFAULT_MAX_DURATION_S) -> dict:
+    """{cid: {event_id, text[, refused]}}: for each confirmed pending consult, the asked agent's
+    oldest message in it not yet judged, when no task brought it here. `refused` carries the
+    reason `match` will give when that message falls outside the answer window. One room read."""
     messages, err = _room_page(transport, room)
     out = {}
     for r in records(workspace, "pending") if not err else []:
         if not r.get("ask_event") or r.get("room") != room:
             continue
-        cands = [m for m in reversed(messages) if _in_consult(r, m)
+        cands = [m for m in reversed(messages) if _in_consult(workspace, r, m)
                  and not _key_path(workspace, "bound", m.get("event_id")).exists()]
         if cands:
-            out[r["cid"]] = {"event_id": cands[0].get("event_id"), "text": cands[0].get("body") or ""}
+            row = {"event_id": cands[0].get("event_id"), "text": cands[0].get("body") or ""}
+            late = _window_refusal(r, cands[0], messages, max_duration_s)
+            out[r["cid"]] = {**row, "refused": late} if late else row
     return out
 
 

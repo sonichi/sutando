@@ -284,6 +284,8 @@ class TestTrustedTask(unittest.TestCase):
 
     def test_verified_owner_task_passes(self):
         self.assertTrue(self.gate(task_text())["ok"])
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertNotIn("arrived_at", policy.live_task(TID, make_ws(tmp)))
 
     def test_forged_unsigned_owner_text_is_refused(self):
         res = self.gate("id: task-forged\naccess_tier: owner\ntask: fabricated\n",
@@ -748,6 +750,20 @@ class TestBindingIsPerConsult(WorldCase):
             self.assertIn("different consults", self.w.m(e, **kw)["reason"])
         self.assertFalse(bound_exists(self.w.ws[SELF], e))
 
+    def test_rui_a_cross_reply_belongs_to_neither_consult_and_wedges_neither(self):
+        cross = self.sib("about the other disk", root="$ask", reply_to="$ask2")
+        for kw in ({"final": True}, {"not_final": True}):
+            self.assertIn("different consults", self.w.m(cross, **kw)["reason"])
+        a1 = self.sib("disk one is 91% full")
+        a2 = self.sib("disk two is fine", root="$ask2", reply_to="$ask2")
+        waiting = policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF])
+        one, two = self.w.m(a1, final=True), self.w.m(a2, final=True)
+        self.assertEqual((one.get("matched"), one.get("cid")), (True, C1), one)
+        self.assertEqual((two.get("matched"), two.get("cid")), (True, C2), two)
+        self.assertEqual((waiting[C1]["event_id"], waiting[C2]["event_id"]), (a1, a2))
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [])
+        self.assertFalse(bound_exists(self.w.ws[SELF], cross))
+
     def test_a_reply_citing_the_ask_outside_the_thread_answers_it(self):
         e = self.w.room.post(SIB, f"{SELF} — 91% full", reply_to="$ask2")
         got = self.w.m(e, final=True)
@@ -888,6 +904,23 @@ class TestAnswerWindow(unittest.TestCase):
         s = policy.settings(environ={policy.CONFIG_ROOM: ROOM, policy.CONFIG_MAX_DURATION: "99999999"},
                             manifest_cfg={})
         self.assertEqual(s["max_duration_s"], policy.MAX_DURATION_CEILING_S)
+
+    def test_pending_lists_with_matchs_reason_an_answer_whose_ask_left_the_read(self):
+        self.w.ask(SELF, SIB, cid=C1)
+        for i in range(policy.READ_LIMIT + 5):
+            self.t = T0 + 1
+            self.w.room.post(THIRD, f"noise {i}")
+        e = self.reply_at(5)
+        refused = self.w.m(e, final=True)["reason"]
+        self.assertIn("no server timestamp in the last", refused)
+        self.assertEqual(policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF])[C1],
+                         {"event_id": e, "text": "up", "refused": refused})
+
+    def test_pending_lists_with_matchs_reason_an_answer_outside_the_window(self):
+        self.w.ask(SELF, SIB, cid=C1)
+        e = self.reply_at(1801)
+        got = policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF])[C1]
+        self.assertEqual((got["event_id"], got["refused"]), (e, self.w.m(e, final=True)["reason"]))
 
     def test_no_server_timestamp_refuses(self):
         self.w.ask(SELF, SIB, cid=C1)

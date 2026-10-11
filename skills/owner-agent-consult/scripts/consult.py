@@ -125,7 +125,7 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
         return _emit({"ok": False, "reason": str(e)})
     if a.cmd == "pending":
         rows = policy.pending(ws, conf["nudge_after_s"], expire_after_s=conf["expire_after_s"])
-        waiting = policy.waiting_answers(transport, conf["room"], ws)
+        waiting = policy.waiting_answers(transport, conf["room"], ws, conf["max_duration_s"])
         for r in rows:
             if r.get("cid") in waiting:
                 r["answer_waiting"] = waiting[r["cid"]]
