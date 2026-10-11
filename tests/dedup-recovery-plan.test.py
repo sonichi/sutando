@@ -217,6 +217,25 @@ class PlanTest(unittest.TestCase):
                              "an unsafe id must not produce a re-ask")
 
 
+class ArchivedOriginalTest(unittest.TestCase):
+    """The core archives a task once its result is written, so the deduped
+    task is usually gone from tasks/ when the gateway verifies its holder."""
+
+    def test_archived_original_and_holder_with_accepted_delivery_are_honoured(self):
+        task = "source: ag2space\nchannel_id: !room:ag2.space\nuser_id: @owner:ag2.space\n"
+        for layout in ("flat", "month"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as td:
+                sp = _Space(td); sp.holder("[REPLIED]")
+                arc = sp.tasks / "archive" / ("2026-10" if layout == "month" else "")
+                arc.mkdir(parents=True, exist_ok=True)
+                (arc / f"{TID}.txt").write_text(f"id: {TID}\n{task}task: q\n")
+                (arc / f"{HOLDER}.txt").write_text(f"id: {HOLDER}\n{task}task: q\n")
+                self.assertEqual(plan_dedup_recovery(
+                    sp.results, sp.tasks, TID, HOLDER, "!room:ag2.space", NEW,
+                    holder_delivery_state=lambda _h: "accepted"), ("honour", None))
+                self.assertFalse((sp.tasks / f"{NEW}.txt").exists())
+
+
 class CommitIdentityTest(unittest.TestCase):
     """Routing must be committed before the re-ask becomes visible."""
 
