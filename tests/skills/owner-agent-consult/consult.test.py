@@ -936,7 +936,7 @@ class TestAnswerWindow(unittest.TestCase):
 
 
 class TestExpiryAndPending(WorldCase):
-    def test_an_expired_consult_is_refused_listed_and_pruned(self):
+    def test_an_expired_consult_is_refused_listed_then_hidden_never_deleted(self):
         self.w.ask(SELF, SIB, cid=C1, now=lambda: time.time() - 8 * 86400)
         e = self.sib("late")
         self.assertIn("expired", self.w.m(e, final=True)["reason"])
@@ -945,6 +945,8 @@ class TestExpiryAndPending(WorldCase):
         policy.mark_nudged(self.w.ws[SELF], C1)
         (self.w.ws[SELF] / "results" / f"{TID}.txt").write_text("done")
         self.assertEqual(policy.pending(self.w.ws[SELF], 600), [])
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])  # hidden, not deleted
+        self.assertTrue(policy._record_path(self.w.ws[SELF], "nudged", C1).exists())
         self.assertTrue(policy._root_claim(self.w.ws[SELF], TID).exists())
 
     def test_overdue_consults_are_due_a_nudge_once(self):
@@ -961,13 +963,12 @@ class TestExpiryAndPending(WorldCase):
         self.assertFalse(policy.mark_nudged(self.w.ws[SELF], C1)["ok"])
         self.assertEqual([r.get("closed_unrelayed") for r in policy.pending(self.w.ws[SELF], 0)], [True])
 
-    def test_a_pending_copy_beside_its_answer_is_dropped(self):
+    def test_a_pending_copy_beside_its_answer_is_not_listed(self):
         self.w.ask(SELF, SIB, cid=C1)
         rec = policy._read_record(policy._record_path(self.w.ws[SELF], "pending", C1))
         self.assertTrue(self.w.m(self.sib("up"), final=True)["matched"])
         policy._write_record(policy._record_path(self.w.ws[SELF], "pending", C1), rec)
         self.assertEqual([r.get("closed_unrelayed") for r in policy.pending(self.w.ws[SELF], 0)], [True])
-        self.assertEqual(pending_ids(self.w.ws[SELF]), [])
 
     def test_a_record_stamped_in_the_future_expires(self):
         self.w.ask(SELF, SIB, cid=C1, now=lambda: time.time() + 3600)
@@ -979,13 +980,15 @@ class TestExpiryAndPending(WorldCase):
         self.assertIn("no pending", policy.mark_nudged(self.w.ws[SELF], C1)["reason"])
         self.assertIn("no answered", policy.mark_relayed(self.w.ws[SELF], C1)["reason"])
 
-    def test_old_orphan_nudge_records_are_pruned_and_answered_records_kept(self):
+    def test_pending_deletes_nothing(self):
         old = time.time() - 9 * 86400
         policy._write_record(policy._record_path(self.w.ws[SELF], "answered", C1), {"cid": C1, "asked_at": old})
         policy._write_record(policy._record_path(self.w.ws[SELF], "nudged", C2), {"cid": C2, "asked_at": old})
+        self.w.ask(SELF, SIB, cid="00000000000000aa", now=lambda: old)
+        before = sorted(p.relative_to(self.w.ws[SELF]) for p in (self.w.ws[SELF] / "state").rglob("*.json"))
         policy.pending(self.w.ws[SELF], 600)
-        self.assertEqual([r["cid"] for r in policy.records(self.w.ws[SELF], "answered")], [C1])
-        self.assertEqual(policy.records(self.w.ws[SELF], "nudged"), [])
+        after = sorted(p.relative_to(self.w.ws[SELF]) for p in (self.w.ws[SELF] / "state").rglob("*.json"))
+        self.assertEqual(after, before)
 
 
 class TestKeweiReview5484812051(WorldCase):
@@ -1124,6 +1127,39 @@ class TestDeliveredAtMostOnce(WorldCase):
         self.assertEqual(self.unrelayed(), [])
         again = self.w.m(self.e, final=True)
         self.assertEqual((again["matched"], again.get("closed_unrelayed")), (False, None), again)
+
+    def test_kewei_a_match_racing_the_expiry_pass_orphans_nothing(self):
+        self.assertTrue(policy.mark_nudged(self.w.ws[SELF], C1)["ok"])
+        (self.w.ws[SELF] / "results" / f"{TID}.txt").write_text("done")
+        [rec] = policy.records(self.w.ws[SELF], "pending")
+        boundary = rec["asked_at"] + policy.DEFAULT_EXPIRE_AFTER_S  # match's expiry gate still passes
+        real_scan = policy._answer_bindings
+        raced = []
+
+        def scan_then_match(workspace, cids):  # pending() pauses after its scan; match runs; it resumes
+            seen = real_scan(workspace, cids)
+            if not raced:
+                with crash_on_close():
+                    raced.append(self.w.m(self.e, final=True, now=boundary))
+            return seen
+        with mock.patch.object(policy, "_answer_bindings", scan_then_match):
+            policy.pending(self.w.ws[SELF], 600, now=boundary + 1)
+        self.assertIn("could not be closed", raced[0]["reason"])
+        self.assertTrue(bound_exists(self.w.ws[SELF], self.e))
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])  # the stale pass deleted nothing
+        rows = policy.pending(self.w.ws[SELF], 600, now=boundary + 2)
+        self.assertEqual([(r["cid"], r["expired"]) for r in rows], [(C1, True)])
+        self.assertEqual(policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF])[C1]["event_id"], self.e)
+        self.assertTrue(self.w.m(self.e, final=True, now=boundary + 3)["matched"])
+
+    def test_susan_a_progress_binding_is_not_shown_as_the_answer(self):
+        self.assertTrue(self.w.m(self.e, not_final=True)["progress"])
+        e2 = self.sib("now it is up")
+        shown = policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF], self_mxid=SELF)[C1]
+        self.assertEqual(shown, {"event_id": e2, "text": "now it is up"})
+        self.assertTrue(policy.mark_nudged(self.w.ws[SELF], C1)["ok"])
+        (self.w.ws[SELF] / "results" / f"{TID}.txt").write_text("done")
+        self.assertEqual(policy.pending(self.w.ws[SELF], 600, now=time.time() + 30 * 86400), [])
 
     def test_qingyun_an_event_close_is_not_reported_to_that_events_reply_task(self):
         self.assertTrue(self.w.m(self.e, final=True)["matched"])

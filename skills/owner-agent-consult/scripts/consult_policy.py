@@ -318,26 +318,19 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
     """Unanswered consults, oldest first; `nudge_due` when overdue and the owner was not yet
     told, `unconfirmed` when the ask's post was never confirmed, `expired` past the expiry, plus
     closed consults whose relay is not acknowledged (`closed_unrelayed`) and any live task
-    holding a root claim with no record (`claim_only`). Claims are never pruned; an expired
-    record is pruned once the owner has been told and its task can no longer post, unless a
-    message is bound as its answer and the close has not landed: that record is kept."""
+    holding a root claim with no record (`claim_only`). Read-only: nothing is ever deleted here,
+    so no race with a concurrent match can orphan a record. An expired, nudged consult whose
+    task can no longer post is hidden from the listing, unless a message is bound as its answer."""
     now = time.time() if now is None else now
-    open_recs = records(workspace, "pending")
+    open_recs = [r for r in records(workspace, "pending")
+                 if not _record_path(workspace, "answered", r["cid"]).exists()]
     held = _answer_bindings(workspace, {r["cid"] for r in open_recs})
-    for r in records(workspace, "nudged"):  # answered/ is terminal and never pruned
-        if not _record_path(workspace, "pending", r["cid"]).exists() and _age(r, now) > expire_after_s:
-            _record_path(workspace, "nudged", r["cid"]).unlink(missing_ok=True)
     out, listed = [], set()
     for r in sorted(open_recs, key=lambda r: r.get("asked_at") or 0):
-        if _record_path(workspace, "answered", r["cid"]).exists():
-            _record_path(workspace, "pending", r["cid"]).unlink(missing_ok=True)
-            continue
         age = _age(r, now)
         nudged = _record_path(workspace, "nudged", r["cid"]).exists()
         if nudged and age > expire_after_s and r["cid"] not in held \
                 and not task_can_post(workspace, r.get("task_id")):
-            _record_path(workspace, "pending", r["cid"]).unlink(missing_ok=True)
-            _record_path(workspace, "nudged", r["cid"]).unlink(missing_ok=True)
             continue
         listed.add(r.get("task_id"))
         overdue = age >= nudge_after_s

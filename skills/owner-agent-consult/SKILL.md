@@ -56,7 +56,7 @@ one question out to several agents.
 | `OWNER_AGENT_CONSULT_ROOM_CLI` | empty | absolute path of the room transport CLI (below). Unset: inert. |
 | `OWNER_AGENT_CONSULT_NUDGE_AFTER_S` | `600` | when an unanswered consult is due a note to the owner (60–86400). |
 | `OWNER_AGENT_CONSULT_MAX_DURATION_S` | `1800` | the answer window: a reply counts only if posted within this long after the ask, by server time (60–86400). |
-| `OWNER_AGENT_CONSULT_EXPIRE_AFTER_S` | `604800` | after this, a new match is refused and old pending records are pruned (3600–7776000); answered records are kept. |
+| `OWNER_AGENT_CONSULT_EXPIRE_AFTER_S` | `604800` | after this, a new match is refused, and a nudged consult whose task is done is hidden from `pending` (3600–7776000). No record is deleted. |
 | `OWNER_AGENT_CONSULT_ENABLED` | `1` | `0`/`false`/`off` makes it inert. |
 
 On a desktop install prefer env overrides: the engine tree, manifest included, is replaced on
@@ -181,8 +181,14 @@ Claims are created by an atomic link and never deleted: `roots/<task>` (one ask 
 `threads/<root>` (one consult per thread root), `answers/<ask>` (one answer per ask) and
 `bound/<event>` (one judgement per message). The only release is a refusal the transport reports
 as made before sending (`posted: false`). Never delete `<workspace>/state/owner-agent-consult/`
-by hand; that forfeits the at-most-once guarantees for every live task. Each consult leaves a few
-small files (about 4 KB each on most filesystems).
+by hand; that forfeits the at-most-once guarantees for every live task.
+
+Records are never deleted either, except that closing a consult removes its `pending/` and
+`nudged/` copies once `answered/` exists. `pending` is read-only: an expired consult is hidden
+from the listing, not removed, so a `match` racing it can never leave a binding no listing
+reaches. The cost is the same kind as the claims: each consult leaves four to six small files
+(about 4 KB each on most filesystems, so roughly 20 MB per 1,000 consults), and `pending` reads
+them on each call. There is no reset.
 
 | a crash between | leaves | what happens |
 | --- | --- | --- |
