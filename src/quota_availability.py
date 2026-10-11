@@ -373,7 +373,12 @@ def record_speaks_for_seat(quota: Any, env: SeatEnv, workspace) -> bool:
     A menu alias (`opus`, `sonnet[1m]`, ...) and the full id the proxy reports
     (`claude-opus-5-5`, `claude-sonnet-5`, ...) name the same model but are
     never string-equal, so the family match covers that pairing; `default`
-    carries no family and so can only match a record from a literal `default`."""
+    carries no family and so can only match a record from a literal `default`.
+
+    The family match is coarser than exact equality: an alias also matches a
+    record from an older pinned id of the same family (e.g. `opus` matches a
+    record refreshed on `claude-opus-4-1`), which could misreport a limit if
+    per-model windows ever differ within one family."""
     mine, theirs = seat_model(env, workspace), record_model(quota)
     if mine is None or theirs is None:
         return False
