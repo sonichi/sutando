@@ -1341,6 +1341,7 @@ class TestKeweiRoundNine(unittest.TestCase):
         w.tr[SELF].mention = lambda *a, **k: {"ok": True, "event_id": None}
         self.assertTrue(w.ask(SELF, SIB, cid=C1, task_id=TID)["unconfirmed"])
         w.tr[SELF].mention = FakeTransport.mention.__get__(w.tr[SELF])
+        age_record(w.ws[SELF], C1, policy.LATE_LANDING_S + 1)
         res = w.ask(SELF, SIB, cid=C2, task_id=TID)
         self.assertEqual((res["asked"], res["root"]), (True, "$ask"), res)
         self.assertEqual(pending_ids(w.ws[SELF]), [C2])
@@ -1407,6 +1408,18 @@ class TestKeweiRoundNine(unittest.TestCase):
         self.assertIn("already answered", w.match(SELF, "task-a3")["reason"])
         (w.ws[SELF] / "results" / "task-a2.txt").write_text("[no-send]")
         self.assertIn("already answered", w.match(SELF, "task-a2")["reason"])
+
+
+def age_record(ws, cid, seconds):
+    path = Path(ws) / policy._STATE / "pending" / f"{cid}.json"
+    rec = json.loads(path.read_text())
+    path.write_text(json.dumps({**rec, "asked_at": rec["asked_at"] - seconds}))
+
+
+def age_answer_claim(ws, cid, seconds):
+    path = Path(ws) / policy._STATE / "answers" / f"{cid}.json"
+    rec = json.loads(path.read_text())
+    path.write_text(json.dumps({**rec, "at": rec["at"] - seconds}))
 
 
 class TestPublicationIsOneRecoverableState(unittest.TestCase):
@@ -1508,8 +1521,23 @@ class TestPublicationIsOneRecoverableState(unittest.TestCase):
         w.tr[SIB].mention = lambda *a, **k: {"ok": False, "reason": "room transport failed: timed out"}
         self.assertTrue(w.answer(SIB, "up", task_id="task-b1")["unconfirmed"])
         w.tr[SIB].mention = FakeTransport.mention.__get__(w.tr[SIB])
+        age_answer_claim(w.ws[SIB], C1, policy.LATE_LANDING_S + 1)
         again = w.answer(SIB, "up", task_id="task-b1")
         self.assertEqual((again["answered"], again.get("replay"), again["event_id"]), (True, None, "$ask2"), again)
+
+    def test_an_answer_that_timed_out_and_lands_late_is_not_posted_twice(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.deliver(SIB, "$ask", "task-b1")
+        w.tr[SIB].mention = lambda *a, **k: {"ok": False, "reason": "room transport failed: timed out"}
+        self.assertTrue(w.answer(SIB, "up", task_id="task-b1")["unconfirmed"])
+        w.tr[SIB].mention = FakeTransport.mention.__get__(w.tr[SIB])
+        early = w.answer(SIB, "up", task_id="task-b1")  # 1 s later, the whole room shows nothing yet
+        self.assertIn("earlier answer to this ask is unconfirmed", early["reason"])
+        w.room.post(SIB, f"{SELF} — {final(C1, 'up')}", reply_to="$ask", thread_root="$ask")  # it lands late
+        again = w.answer(SIB, "up", task_id="task-b1")
+        self.assertEqual((again.get("replay"), again["event_id"]), (True, "$ask2"), again)
+        self.assertEqual(len(w.room.msgs), 2)
 
     def test_an_answer_unconfirmed_beyond_the_read_is_not_posted_again(self):
         w = self.w
@@ -1572,6 +1600,20 @@ class TestPublicationIsOneRecoverableState(unittest.TestCase):
         policy.pending(w.ws[SELF], 600, now=later)
         self.assertEqual(list(answers.glob("*.json")), [])
         self.assertFalse((roots / "task-junk.json").exists())
+
+    def test_a_root_ask_that_timed_out_and_lands_late_does_not_start_a_second_thread(self):
+        w = self.w
+        w.tr[SELF].mention = lambda *a, **k: {"ok": False, "reason": "room transport failed: timed out"}
+        self.assertTrue(w.ask(SELF, SIB, cid=C1, task_id=TID)["unconfirmed"])
+        w.tr[SELF].mention = FakeTransport.mention.__get__(w.tr[SELF])
+        early = w.ask(SELF, SIB, cid=C2, task_id=TID)  # 1 s later, the whole room shows nothing yet
+        self.assertFalse(early["asked"], early)
+        self.assertIn("unconfirmed", early["reason"])
+        self.assertEqual(w.room.msgs, [])
+        w.room.post(SELF, f"{SIB} — {policy.ask_line(C1, None, [SELF, SIB])}")  # the timed-out post lands
+        again = w.ask(SELF, SIB, cid=C2, task_id=TID)
+        self.assertEqual((again["asked"], again["root"], again["follow_up"]), (True, "$ask", True), again)
+        self.assertEqual([m.get("thread_root") for m in w.room.msgs], [None, "$ask"])
 
     def test_an_unconfirmed_onward_ask_is_reconciled_before_a_follow_up(self):
         w = self.w

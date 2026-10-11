@@ -286,6 +286,10 @@ def records(workspace: Path, state: str) -> List[dict]:
 
 
 ORPHAN_GRACE_S = 60
+TRANSPORT_TIMEOUT_S = 60
+# A post whose outcome was unknown can still land this long after it was sent: the room CLI's
+# timeout plus delivery slack. Until then, absence from even a whole-room read proves nothing.
+LATE_LANDING_S = TRANSPORT_TIMEOUT_S + 240
 
 
 def _room_page(transport, room: str) -> tuple:
@@ -333,8 +337,8 @@ def reconcile(transport, room: str, self_mxid: str, workspace: Path, *, task_id:
     """Settle every earlier ask from this owner task (or from this ask task to this agent) whose
     post was not confirmed: a failed write, a crash after the post, or an ambiguous transport
     outcome. Found in the room by consult id: the record is completed. Absent from a read that
-    covers the whole room, or expired: nothing was posted, so the record and its root claim are
-    released. Otherwise it may be in the room beyond the read, so this returns a refusal and
+    covers the whole room once LATE_LANDING_S has passed since it was sent, or expired: nothing
+    was posted, so the record and its root claim are released. Otherwise it may be in the room beyond the read, so this returns a refusal and
     no new ask is posted."""
     now = time.time() if now is None else now
     if task_id:
@@ -356,7 +360,7 @@ def reconcile(transport, room: str, self_mxid: str, workspace: Path, *, task_id:
             except OSError:
                 unresolved.append(r["cid"])
                 continue
-        if complete or _age(r, now) > expire_after_s:
+        if (complete and _age(r, now) > LATE_LANDING_S) or _age(r, now) > expire_after_s:
             _record_path(workspace, st, r["cid"]).unlink(missing_ok=True)
             if r.get("task_id") and (_read_record(_root_claim(workspace, r["task_id"])) or {}).get("cid") == r["cid"]:
                 _root_claim(workspace, r["task_id"]).unlink(missing_ok=True)
@@ -872,7 +876,8 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
             if found:
                 held["event_id"] = found
                 _write_record(claim_path, held)
-            elif complete or _age({"asked_at": held.get("at")}, time.time()) > expire_after_s:
+            elif (complete and _age({"asked_at": held.get("at")}, time.time()) > LATE_LANDING_S) \
+                    or _age({"asked_at": held.get("at")}, time.time()) > expire_after_s:
                 claim_path.unlink(missing_ok=True)
                 held = None
             else:
