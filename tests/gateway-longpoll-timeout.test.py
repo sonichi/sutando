@@ -56,8 +56,13 @@ class _Loop:
     def _poll(self, method, path, payload=None, **kw):
         if path.startswith("/v1/tasks?wait="):
             self.clock.now += self.advance
-            if self.poll_raises is not None:
-                raise self.poll_raises
+            # A list is one outcome per poll (None = a healthy empty poll).
+            if isinstance(self.poll_raises, list):
+                exc = self.poll_raises.pop(0) if self.poll_raises else None
+            else:
+                exc = self.poll_raises
+            if exc is not None:
+                raise exc
             return {"tasks": []}
         return {}
 
@@ -155,6 +160,147 @@ class LongPollTimeoutTest(unittest.TestCase):
             loop.run()
         self.assertEqual(loop.clock.slept, [])
         self.assertIn((True, {}), loop.status)
+
+
+class DroppedConnectionTest(unittest.TestCase):
+    """urllib wraps only the send in URLError. A peer or proxy that closes the
+    socket after it raises http.client's own errors bare from getresponse(), and
+    the loop filed those as "unexpected" — a crash-looking line for a dropped link."""
+
+    def setUp(self):
+        try:
+            from ag2_sparrow import remote_gateway_bridge as gw
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            self.skipTest(f"gateway not importable: {str(e)[:60]}")
+        self.gw = gw
+
+    def _assert_network_path(self, loop, cls):
+        logs = " ".join(loop.logs)
+        self.assertEqual(loop.clock.slept, [1], "backs off like any outage")
+        self.assertIn(f"poll network error: {cls}:", logs, "names the exception class")
+        self.assertIn("1 consecutive, 1s since last successful poll", logs)
+        self.assertNotIn("unexpected", logs, "a dropped connection is not a crash")
+        self.assertTrue(any(c is False and "network" in str(k.get("error", ""))
+                            for c, k in loop.status))
+
+    def test_a_connection_closed_before_the_response_is_a_network_error(self):
+        import http.client
+        exc = http.client.RemoteDisconnected("Remote end closed connection without response")
+        with _Loop(self.gw, poll_raises=exc, advance=1.0) as loop:
+            loop.run()                    # returns: the loop went on to its next pass
+        self._assert_network_path(loop, "RemoteDisconnected")
+
+    def test_a_truncated_response_body_is_a_network_error(self):
+        import http.client
+        with _Loop(self.gw, poll_raises=http.client.IncompleteRead(b""), advance=1.0) as loop:
+            loop.run()
+        self._assert_network_path(loop, "IncompleteRead")
+
+    def test_the_counter_climbs_and_a_good_poll_logs_the_recovery(self):
+        import http.client
+        import re
+        outcomes = [http.client.RemoteDisconnected("gone"),
+                    http.client.RemoteDisconnected("gone"), None]
+        with _Loop(self.gw, poll_raises=outcomes, advance=1.0) as loop:
+            loop._alive = [True, True, True, False]
+            loop.run()
+        logs = loop.logs
+        errors = [m for m in logs if m.startswith("poll network error")]
+        self.assertEqual(len(errors), 2)
+        self.assertIn("1 consecutive, 1s since", errors[0])
+        self.assertIn("2 consecutive, 3s since", errors[1], "counts up; clock = 1s + 1s back-off + 1s")
+        self.assertEqual(loop.clock.slept, [1, 2], "back-off doubles across the outage")
+        recovered = [m for m in logs if m.startswith("poll recovered")]
+        self.assertEqual(len(recovered), 1, "one recovery line, after the good poll")
+        self.assertRegex(recovered[0], r"^poll recovered after 2 failures, 6s$")
+        self.assertLess(logs.index(errors[1]), logs.index(recovered[0]))
+        self.assertIn((True, {}), loop.status)
+
+    def test_a_second_good_poll_logs_no_recovery_and_the_next_outage_counts_from_one(self):
+        import urllib.error
+        fail = urllib.error.URLError("no route")
+        with _Loop(self.gw, poll_raises=[fail, None, None, fail, None], advance=1.0) as loop:
+            loop._alive = [True] * 5 + [False]
+            loop.run()
+        recovered = [m for m in loop.logs if m.startswith("poll recovered")]
+        self.assertEqual(len(recovered), 2, "one line per outage, none for a later good poll")
+        for line in recovered:
+            self.assertRegex(line, r"^poll recovered after 1 failures, ")
+        errors = [m for m in loop.logs if m.startswith("poll network error")]
+        self.assertIn("1 consecutive", errors[1], "the good poll reset the counter")
+
+    def test_a_grace_timeout_after_an_outage_is_not_the_recovery(self):
+        import urllib.error
+        outcomes = [urllib.error.URLError("no route"),
+                    TimeoutError("The read operation timed out"), None]
+        with _Loop(self.gw, poll_raises=outcomes, advance=1.0) as loop:
+            loop._alive = [True, True, True, False]
+            loop.run()
+        recovered = [m for m in loop.logs if m.startswith("poll recovered")]
+        # clock: 1s poll + 1s back-off + 1s grace poll + 1s good poll
+        self.assertEqual(recovered, ["poll recovered after 1 failures, 4s"],
+                         "only the poll that answered ends the outage")
+
+    def test_a_reset_while_reading_the_body_is_a_network_error(self):
+        import urllib.request
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                raise ConnectionResetError(54, "Connection reset by peer")
+
+        with _Loop(self.gw) as loop:
+            real_req = loop._saved["_req"]
+
+            def _req(method, path, *a, **k):
+                if not path.startswith("/v1/tasks?wait="):
+                    return {}
+                loop.clock.now += 1.0
+                return real_req(method, path, *a, **k)
+
+            self.gw._req = _req
+            saved_open = urllib.request.urlopen
+            urllib.request.urlopen = lambda *a, **k: _Resp()
+            try:
+                loop.run()
+            finally:
+                urllib.request.urlopen = saved_open
+        self._assert_network_path(loop, "ConnectionResetError")
+
+    def test_an_ack_cut_off_mid_flight_reports_a_network_error_not_a_crash(self):
+        import http.client
+        gw = self.gw
+        logs: list[str] = []
+        saved = (gw._req, gw._log, gw._ack_disabled_until)
+        gw._req = lambda *a, **k: (_ for _ in ()).throw(
+            http.client.RemoteDisconnected("Remote end closed connection without response"))
+        gw._log = lambda m: logs.append(str(m))
+        gw._ack_disabled_until = 0.0
+        try:
+            self.assertFalse(gw._post_task_ack("task-1700000000", False))
+        finally:
+            gw._req, gw._log, gw._ack_disabled_until = saved
+        self.assertIn("task ack network error", " ".join(logs))
+
+    def test_a_heartbeat_cut_off_mid_flight_reports_a_network_error_not_a_crash(self):
+        import http.client
+        gw = self.gw
+        logs: list[str] = []
+        saved = (gw._req, gw._log, gw._heartbeat_disabled)
+        gw._req = lambda *a, **k: (_ for _ in ()).throw(
+            http.client.RemoteDisconnected("Remote end closed connection without response"))
+        gw._log = lambda m: logs.append(str(m))
+        gw._heartbeat_disabled = False
+        try:
+            self.assertFalse(gw._post_heartbeat(set(), force=True))
+        finally:
+            gw._req, gw._log, gw._heartbeat_disabled = saved
+        self.assertIn("heartbeat network error", " ".join(logs))
 
 
 if __name__ == "__main__":

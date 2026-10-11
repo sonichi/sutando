@@ -55,6 +55,7 @@ import atexit
 import glob
 import base64
 import hashlib
+import http.client
 import json
 import os
 import stat
@@ -2169,6 +2170,12 @@ def _append_log_file(line: str) -> None:
         pass
 
 
+# urllib wraps only the send in URLError; a socket closed after it raises http.client's
+# errors bare (RemoteDisconnected is a ConnectionResetError), and those are outages too.
+_NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
+                   http.client.IncompleteRead)
+
+
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty)."""
     data = json.dumps(payload).encode() if payload is not None else None
@@ -2484,7 +2491,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             raise
         _log(f"task ack failed for {tid}: HTTP {e.code} — gateway may redeliver")
         return False
-    except (urllib.error.URLError, TimeoutError) as e:
+    except _NETWORK_ERRORS as e:
         _log(f"task ack network error for {tid}: {e} — gateway may redeliver")
         return False
 
@@ -3009,7 +3016,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             raise
         _log(f"heartbeat failed: HTTP {e.code} — continuing")
         return False
-    except (urllib.error.URLError, TimeoutError) as e:
+    except _NETWORK_ERRORS as e:
         _log(f"heartbeat network error: {e} — continuing")
         return False
 
@@ -5495,6 +5502,7 @@ def main() -> None:
              f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
     last_poll_ok = time.time()
+    poll_failures = 0  # consecutive network failures; the next good poll resets it
     _emit_gateway_status(False, error="starting — not yet connected")
     refresh_routing(force=True)  # the owner's DM comes from the gateway at connect, not from a pin
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
@@ -5519,6 +5527,7 @@ def main() -> None:
             # LAST of the beat's work, on a daemon thread: two optional 15 s
             # requests never delay the next task poll or a durable retry.
             _push_pool_advertisement()
+            prev_ok = last_poll_ok
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
                 last_poll_ok = time.time()
@@ -5528,6 +5537,9 @@ def main() -> None:
                 if not _poll_timeout_is_empty(last_poll_ok, time.time()):
                     raise
                 resp = {"tasks": []}
+            if poll_failures and last_poll_ok != prev_ok:  # a real answer, not the grace path
+                _log(f"poll recovered after {poll_failures} failures, {int(last_poll_ok - prev_ok)}s")
+                poll_failures = 0
             added = False
             pending_ack = []
             for task in resp.get("tasks", []):
@@ -5580,8 +5592,11 @@ def main() -> None:
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)
-        except (urllib.error.URLError, TimeoutError) as e:
-            _log(f"poll network error: {e} — backing off {backoff}s")
+        except _NETWORK_ERRORS as e:
+            poll_failures += 1
+            _log(f"poll network error: {type(e).__name__}: {e} — {poll_failures} consecutive, "
+                 f"{int(time.time() - last_poll_ok)}s since last successful poll — "
+                 f"backing off {backoff}s")
             _emit_gateway_status(False, error=f"network: {e}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)
         except Exception as e:  # noqa: BLE001 — keep the loop alive

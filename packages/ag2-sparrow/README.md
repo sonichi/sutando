@@ -136,6 +136,16 @@ blocks) before anything is persisted; detected values are replaced with
 placeholders and the task carries an in-band notice so downstream agents
 don't reproduce them.
 
+**Behind an HTTP proxy?** Sparrow's task pull is a long-poll (`GET /v1/tasks?wait=25`,
+held open for up to 25 s), and the standard-library HTTP client honours
+`http_proxy` / `https_proxy` (not `ALL_PROXY`, which `urllib` ignores). A proxy
+whose idle or read timeout is shorter than the poll cuts the connection: the log
+shows `Remote end closed connection without response` about once a minute, and a
+task caught in a cut can wait for its lease to expire before the broker re-serves
+it (minutes, not seconds). Either set `REMOTE_TASK_POLL_WAIT` below the
+proxy's timeout (`REMOTE_TASK_POLL_WAIT=10` fits most), or add the relay host to
+`no_proxy` so the poll bypasses the proxy.
+
 ## Waking your agent
 
 Sparrow writes each task to `AGENT_CONNECT_TASK_DIR/<task-id>.txt`. Set
