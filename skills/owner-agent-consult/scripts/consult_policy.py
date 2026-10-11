@@ -285,33 +285,87 @@ def records(workspace: Path, state: str) -> List[dict]:
     return [r for r in out if r and _CID.match(str(r.get("cid") or ""))]
 
 
-def reconcile_task(transport, room: str, self_mxid: str, task_id: str, workspace: Path) -> Optional[str]:
-    """Fill in the ask event and root of every record of this owner task whose post was not
-    confirmed (a failed write, a crash after the post, or a receipt with no event id), from this
-    agent's own ask in the room, found by consult id. Returns a refusal naming any record that
-    still cannot be resolved: no new root is posted while an earlier ask may already be one."""
-    loose = [(st, r) for st in ("pending", "answered") for r in records(workspace, st)
-             if r.get("task_id") == task_id and not (r.get("ask_event") and r.get("root"))]
-    claim = _read_record(_root_claim(workspace, task_id))
-    if not loose and not claim:
-        return None
+ORPHAN_GRACE_S = 60
+
+
+def _room_page(transport, room: str) -> tuple:
+    """(messages, complete): `complete` when the read returned the room's whole history, so an
+    event absent from it was never posted."""
     page = transport.read(room, READ_LIMIT)
-    messages = [m for m in page.get("messages") or [] if isinstance(m, dict)] if page.get("ok") else []
+    if not page.get("ok"):
+        return [], False
+    msgs = [m for m in page.get("messages") or [] if isinstance(m, dict)]
+    return msgs, len(msgs) < READ_LIMIT
+
+
+def _sent_before_publication(sent: dict) -> bool:
+    """True only for a refusal the transport reports as made before anything was sent. A
+    timeout, an output that is not JSON, an HTTP error or a missing event id is ambiguous."""
+    return not sent.get("ok") and sent.get("posted") is False
+
+
+def heal_orphan_claims(workspace: Path, task_id: Optional[str] = None, now: Optional[float] = None) -> List[str]:
+    """Release root claims whose consult has no record. The claim is written before the
+    pending record and the record before the post, so a claim with no record means nothing
+    was posted. A grace period leaves a claim being written right now alone."""
+    now = time.time() if now is None else now
+    roots = Path(workspace) / _STATE / "roots"
+    files = [_root_claim(workspace, task_id)] if task_id else (sorted(roots.glob("*.json")) if roots.is_dir() else [])
+    healed = []
+    for f in files:
+        claim = _read_record(f)
+        try:
+            born = f.stat().st_mtime
+        except OSError:
+            continue
+        cid = str((claim or {}).get("cid") or "")
+        has_record = _CID.match(cid) and any(_record_path(workspace, st, cid).exists()
+                                             for st in ("pending", "answered"))
+        if not has_record and now - born > ORPHAN_GRACE_S:
+            f.unlink(missing_ok=True)
+            healed.append(cid or f.name)
+    return healed
+
+
+def reconcile(transport, room: str, self_mxid: str, workspace: Path, *, task_id: Optional[str] = None,
+              via_task: Optional[str] = None, agent: Optional[str] = None,
+              expire_after_s: float = DEFAULT_EXPIRE_AFTER_S, now: Optional[float] = None) -> Optional[str]:
+    """Settle every earlier ask from this owner task (or from this ask task to this agent) whose
+    post was not confirmed: a failed write, a crash after the post, or an ambiguous transport
+    outcome. Found in the room by consult id: the record is completed. Absent from a read that
+    covers the whole room, or expired: nothing was posted, so the record and its root claim are
+    released. Otherwise it may be in the room beyond the read, so this returns a refusal and
+    no new ask is posted."""
+    now = time.time() if now is None else now
+    if task_id:
+        heal_orphan_claims(workspace, task_id, now)
+    loose = [(st, r) for st in ("pending", "answered") for r in records(workspace, st)
+             if not (r.get("ask_event") and r.get("root"))
+             and ((task_id and r.get("task_id") == task_id)
+                  or (via_task and r.get("via_task") == via_task and r.get("agent") == agent))]
+    if not loose:
+        return None
+    messages, complete = _room_page(transport, room)
     unresolved = []
     for st, r in loose:
         fixed = _recover_ask(r, messages, self_mxid)
-        if not fixed.get("ask_event"):
-            unresolved.append(r["cid"])
+        if fixed.get("ask_event"):
+            try:
+                _write_record(_record_path(workspace, st, r["cid"]), fixed)
+                continue
+            except OSError:
+                unresolved.append(r["cid"])
+                continue
+        if complete or _age(r, now) > expire_after_s:
+            _record_path(workspace, st, r["cid"]).unlink(missing_ok=True)
+            if r.get("task_id") and (_read_record(_root_claim(workspace, r["task_id"])) or {}).get("cid") == r["cid"]:
+                _root_claim(workspace, r["task_id"]).unlink(missing_ok=True)
             continue
-        try:
-            _write_record(_record_path(workspace, st, r["cid"]), fixed)
-        except OSError:
-            unresolved.append(r["cid"])
-    if claim and not prior_ask(workspace, "task_id", task_id) and claim.get("cid") not in unresolved:
-        unresolved.append(claim.get("cid") or "?")
+        unresolved.append(r["cid"])
     if unresolved:
-        return (f"an earlier ask from this task is unconfirmed ({', '.join(unresolved)}): it may already "
-                "be in the room, so no new thread is started; check `pending` and the consult room")
+        return (f"an earlier ask is unconfirmed ({', '.join(unresolved)}): it may already be in the room "
+                "beyond what can be read, so nothing new is posted; `pending` lists it, and it clears "
+                "when found, or at expiry")
     return None
 
 
@@ -321,17 +375,7 @@ def _root_claim(workspace: Path, task_id: str) -> Path:
 
 def claim_root(workspace: Path, task_id: str, cid: str) -> bool:
     """The one durable claim that this task's thread root is `cid`'s ask; False when taken."""
-    path = _root_claim(workspace, task_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}")
-    tmp.write_text(json.dumps({"cid": cid, "task_id": task_id, "asked_at": time.time()}), encoding="utf-8")
-    try:
-        os.link(tmp, path)  # the claim appears complete or not at all
-    except FileExistsError:
-        return False
-    finally:
-        tmp.unlink(missing_ok=True)
-    return True
+    return _claim_file(_root_claim(workspace, task_id), {"cid": cid, "task_id": task_id, "asked_at": time.time()})
 
 
 def prior_ask(workspace: Path, key: str, value: str) -> Optional[dict]:
@@ -357,6 +401,11 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
     told, `expired` past the expiry (match then refuses). Prunes answered and nudge records
     older than the expiry, and an expired consult once the owner has been told."""
     now = time.time() if now is None else now
+    heal_orphan_claims(workspace, now=now)
+    answers = Path(workspace) / _STATE / "answers"
+    for f in sorted(answers.glob("*.json")) if answers.is_dir() else []:
+        if _age({"asked_at": (_read_record(f) or {}).get("at") or f.stat().st_mtime}, now) > expire_after_s:
+            f.unlink(missing_ok=True)
     roots = Path(workspace) / _STATE / "roots"
     for f in sorted(roots.glob("*.json")) if roots.is_dir() else []:
         claim = _read_record(f) or {}
@@ -385,6 +434,7 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
             _record_path(workspace, "nudged", r["cid"]).unlink(missing_ok=True)
             continue
         out.append({**r, "age_s": int(age) if age != float("inf") else None, "overdue": overdue, "nudged": nudged,
+                    "unconfirmed": not r.get("ask_event"),
                     "nudge_due": overdue and not nudged, "expired": age > expire_after_s})
     return out
 
@@ -652,7 +702,8 @@ def incoming_ask(transport, room: str, self_mxid: str, task_id: str,
 def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
             workspace: Optional[Path], task_id: Optional[str] = None, via_task: Optional[str] = None,
             cid: Optional[str] = None, now: Optional[Callable[[], float]] = None,
-            max_duration_s: int = DEFAULT_MAX_DURATION_S, max_asks: int = DEFAULT_MAX_ASKS) -> dict:
+            max_duration_s: int = DEFAULT_MAX_DURATION_S, max_asks: int = DEFAULT_MAX_ASKS,
+            expire_after_s: float = DEFAULT_EXPIRE_AFTER_S) -> dict:
     """Every gate, then the one post in the consult thread and its pending record; returns at
     once with {asked, agent, cid, ask_event, root, chain, limits, follow_up} or {asked: False,
     reason}. The limits given here apply only to a thread's first ask; later asks use the
@@ -684,7 +735,8 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
             and gate["sender"] != verdict["owner"]:
         return no("an owner task from the consult room must be the owner's own message")
     if task_id:
-        refusal = reconcile_task(transport, room, self_mxid, task_id, workspace)
+        refusal = reconcile(transport, room, self_mxid, workspace, task_id=task_id,
+                            expire_after_s=expire_after_s)
         if refusal:
             return no(refusal)
         prior = prior_ask(workspace, "task_id", task_id)
@@ -708,6 +760,10 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
                            verdict["owner_agents"] | {self_mxid}, max_duration_s, max_asks)
         if not inc["ok"]:
             return no(inc["reason"])
+        refusal = reconcile(transport, room, self_mxid, workspace, via_task=via_task, agent=agent,
+                            expire_after_s=expire_after_s)
+        if refusal:
+            return no(refusal)
         root, asks, original = inc["root"], inc["asks"], inc["original_question"]
         limits = effective_limits(inc["root_msg"], inc["limits"], max_duration_s, max_asks)
         now_s = measured_now(inc["server_now"], inc["anchor"], clock())
@@ -748,16 +804,17 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
     reply_to = via["ask_event"] if via else None
     sent = transport.mention(agent, ask_body(question, cid, root, chain, original, limits), room,
                              reply_to=reply_to, thread_root=root)
-    if not sent.get("ok"):
+    if _sent_before_publication(sent):
         path.unlink(missing_ok=True)
         release()
         return no(f"ask not posted: {sent.get('reason') or 'refused'}")
-    event = sent.get("event_id")
+    event = sent.get("event_id") if sent.get("ok") else None
     if not event:
         return {"asked": True, "unconfirmed": True, "agent": agent, "cid": cid, "ask_event": None,
                 "root": root, "chain": chain, "limits": limits, "follow_up": follow_up,
-                "warning": "the post may have landed but returned no event id; the record is kept "
-                           "and `match` or the next ask from this task reconciles it from the room",
+                "warning": f"the post may have landed ({sent.get('reason') or 'no event id'}); the record "
+                           "and any root claim are kept, and `match` or the next ask reconciles it from "
+                           "the room by consult id",
                 "reason": None}
     record.update(ask_event=event, root=root or event)
     warning = None
@@ -772,7 +829,8 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
 
 def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Optional[Path],
            task_id: Optional[str] = None, up: Optional[str] = None,
-           max_duration_s: int = DEFAULT_MAX_DURATION_S, max_asks: int = DEFAULT_MAX_ASKS) -> dict:
+           max_duration_s: int = DEFAULT_MAX_DURATION_S, max_asks: int = DEFAULT_MAX_ASKS,
+           expire_after_s: float = DEFAULT_EXPIRE_AFTER_S) -> dict:
     """Post this agent's answer to a consult ask, in its thread, replying to the ask,
     @-mentioning the asker, first line its answer line. The ask is the one a live task
     delivered (`task_id`), or, to pass an answer up the chain, the ask an onward consult of
@@ -800,15 +858,71 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
                            verdict["owner_agents"] | {self_mxid}, max_duration_s, max_asks)
         if not inc["ok"]:
             return no(inc["reason"])
-    sent = transport.mention(inc["asker"], f"{answer_tag(inc['cid'])}\n{text.strip()}", room,
-                             reply_to=inc["ask_event"], thread_root=inc["root"])
-    if not sent.get("ok"):
-        return no(f"answer not posted: {sent.get('reason')}")
     lim = effective_limits(inc["root_msg"], inc["limits"], max_duration_s, max_asks) if inc.get("root_msg") else None
     now_s = measured_now(inc["server_now"], inc["anchor"], time.time()) if lim else None
     reached = limit_reached(lim, len(inc["asks"]), now_s) if lim and now_s is not None else None
-    return {"answered": True, "to": inc["asker"], "cid": inc["cid"], "root": inc["root"],
-            "event_id": sent.get("event_id"), "limit_reached": reached, "reason": None}
+    base = {"answered": True, "to": inc["asker"], "cid": inc["cid"], "root": inc["root"],
+            "limit_reached": reached, "reason": None}
+    claim_path = _answer_claim(workspace, inc["cid"])
+    held = _read_record(claim_path)
+    if held is not None:
+        if not held.get("event_id"):
+            messages, complete = _room_page(transport, room)
+            found = _own_answer(messages, self_mxid, inc["cid"])
+            if found:
+                held["event_id"] = found
+                _write_record(claim_path, held)
+            elif complete or _age({"asked_at": held.get("at")}, time.time()) > expire_after_s:
+                claim_path.unlink(missing_ok=True)
+                held = None
+            else:
+                return no("an earlier answer to this ask is unconfirmed: it may already be in the room "
+                          "beyond what can be read, so it is not posted again")
+        if held is not None:
+            return {**base, "event_id": held["event_id"], "replay": True}
+    if not _claim_file(claim_path, {"cid": inc["cid"], "to": inc["asker"], "at": time.time(), "event_id": None}):
+        return no("another answer to this ask is being posted")
+    sent = transport.mention(inc["asker"], f"{answer_tag(inc['cid'])}\n{text.strip()}", room,
+                             reply_to=inc["ask_event"], thread_root=inc["root"])
+    if _sent_before_publication(sent):
+        claim_path.unlink(missing_ok=True)
+        return no(f"answer not posted: {sent.get('reason')}")
+    event = sent.get("event_id") if sent.get("ok") else None
+    if not event:
+        return {**base, "event_id": None, "unconfirmed": True,
+                "warning": f"the answer may have landed ({sent.get('reason') or 'no event id'}); a retry "
+                           "reconciles it from the room instead of posting again"}
+    try:
+        _write_record(claim_path, {**_read_record(claim_path), "event_id": event})
+    except (OSError, TypeError):
+        pass
+    return {**base, "event_id": event}
+
+
+def _answer_claim(workspace: Path, cid: str) -> Path:
+    return Path(workspace) / _STATE / "answers" / f"{cid}.json"
+
+
+def _claim_file(path: Path, data: dict) -> bool:
+    """Create `path` holding `data`, whole or not at all; False when it already exists."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    try:
+        os.link(tmp, path)
+    except FileExistsError:
+        return False
+    finally:
+        tmp.unlink(missing_ok=True)
+    return True
+
+
+def _own_answer(messages: List[dict], self_mxid: str, cid: str) -> Optional[str]:
+    """The event id of this agent's own answer to consult `cid` in the room read, if any."""
+    for m in messages:
+        if m.get("sender") == self_mxid and _first_line(m.get("body") or "")[0] == answer_tag(cid):
+            return m.get("event_id")
+    return None
 
 
 def _recover_ask(rec: dict, messages: List[dict], self_mxid: str) -> dict:

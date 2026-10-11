@@ -425,7 +425,7 @@ class TestAskReturnsAtOnce(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ws = make_ws(tmp)
             tr = FakeTransport()
-            tr.mention = lambda *a, **k: {"ok": False, "reason": "gate denied"}
+            tr.mention = lambda *a, **k: {"ok": False, "reason": "gate denied", "posted": False}
             self.assertIn("ask not posted: gate denied", run_consult(tr, ws)["reason"])
             self.assertEqual(pending_ids(ws), [])
 
@@ -776,7 +776,7 @@ class TestThreadAndAnswerEdges(unittest.TestCase):
         w.tr[SIB]._members.append({"user_id": STRANGER, "kind": "human"})
         self.assertIn(STRANGER, w.answer(SIB, "x", task_id="task-b1")["reason"])
         w.tr[SIB]._members.pop()
-        w.tr[SIB].mention = lambda *a, **k: {"ok": False, "reason": "gate denied"}
+        w.tr[SIB].mention = lambda *a, **k: {"ok": False, "reason": "gate denied", "posted": False}
         self.assertIn("answer not posted: gate denied", w.answer(SIB, "x", task_id="task-b1")["reason"])
 
     def test_trace_refusals_on_room_and_read(self):
@@ -1322,20 +1322,33 @@ class TestKeweiRoundNine(unittest.TestCase):
         w.deliver(SELF, "$ask2", "task-a2")
         self.assertTrue(w.match(SELF, "task-a2")["matched"])
 
-    def test_an_unconfirmed_post_that_never_landed_refuses_a_new_root(self):
+    def test_an_unconfirmed_post_beyond_the_read_refuses_a_new_root(self):
+        w = self.w
+        w.tr[SELF].mention = lambda *a, **k: {"ok": True, "event_id": None}
+        self.assertTrue(w.ask(SELF, SIB, cid=C1, task_id=TID)["unconfirmed"])
+        w.tr[SELF].mention = FakeTransport.mention.__get__(w.tr[SELF])
+        w.room.post(OWNER, "filler one")
+        w.room.post(OWNER, "filler two")
+        with mock.patch.object(policy, "READ_LIMIT", 2):  # the read no longer covers the whole room
+            res = w.ask(SELF, SIB, cid=C2, task_id=TID)
+        self.assertFalse(res["asked"])
+        self.assertIn("unconfirmed", res["reason"])
+        self.assertEqual(len(w.room.msgs), 2)
+        self.assertIn(C1, [r["cid"] for r in policy.pending(w.ws[SELF], 600) if r["unconfirmed"]])
+
+    def test_an_unconfirmed_post_absent_from_the_whole_room_is_released(self):
         w = self.w
         w.tr[SELF].mention = lambda *a, **k: {"ok": True, "event_id": None}
         self.assertTrue(w.ask(SELF, SIB, cid=C1, task_id=TID)["unconfirmed"])
         w.tr[SELF].mention = FakeTransport.mention.__get__(w.tr[SELF])
         res = w.ask(SELF, SIB, cid=C2, task_id=TID)
-        self.assertFalse(res["asked"])
-        self.assertIn("unconfirmed", res["reason"])
-        self.assertEqual(w.room.msgs, [])
+        self.assertEqual((res["asked"], res["root"]), (True, "$ask"), res)
+        self.assertEqual(pending_ids(w.ws[SELF]), [C2])
 
     def test_only_one_ask_from_a_task_can_claim_its_root(self):
         self.assertTrue(policy.claim_root(self.w.ws[SELF], TID, C1))
         self.assertFalse(policy.claim_root(self.w.ws[SELF], TID, C2))
-        with mock.patch.object(policy, "reconcile_task", return_value=None):  # a racing ask read first
+        with mock.patch.object(policy, "reconcile", return_value=None):  # a racing ask read first
             res = self.w.ask(SELF, SIB, cid=C2, task_id=TID)
         self.assertIn("already holds its thread root", res["reason"])
         self.assertFalse(res["asked"])
@@ -1343,7 +1356,7 @@ class TestKeweiRoundNine(unittest.TestCase):
 
     def test_a_refused_post_releases_the_root_claim(self):
         w = self.w
-        w.tr[SELF].mention = lambda *a, **k: {"ok": False, "reason": "gate denied"}
+        w.tr[SELF].mention = lambda *a, **k: {"ok": False, "reason": "gate denied", "posted": False}
         self.assertFalse(w.ask(SELF, SIB, cid=C1, task_id=TID)["asked"])
         w.tr[SELF].mention = FakeTransport.mention.__get__(w.tr[SELF])
         self.assertTrue(w.ask(SELF, SIB, cid=C2, task_id=TID)["asked"])
@@ -1394,6 +1407,183 @@ class TestKeweiRoundNine(unittest.TestCase):
         self.assertIn("already answered", w.match(SELF, "task-a3")["reason"])
         (w.ws[SELF] / "results" / "task-a2.txt").write_text("[no-send]")
         self.assertIn("already answered", w.match(SELF, "task-a2")["reason"])
+
+
+class TestPublicationIsOneRecoverableState(unittest.TestCase):
+    """Every post (an ask or an answer) is claimed before it is sent and settled after: a refusal
+    the transport reports as made before sending releases the claim; anything ambiguous keeps it
+    and is reconciled from the room by consult id, so nothing is posted twice."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def landed_then(self, tr, result):
+        real = tr.mention
+
+        def post(*a, **k):
+            real(*a, **k)
+            return result
+        tr.mention = post
+        return real
+
+    def test_a_timeout_after_the_post_landed_does_not_start_a_second_thread(self):
+        w = self.w
+        real = self.landed_then(w.tr[SELF], {"ok": False, "reason": "room transport failed: timed out"})
+        first = w.ask(SELF, SIB, cid=C1, task_id=TID)
+        self.assertEqual((first["asked"], first["unconfirmed"]), (True, True), first)
+        w.tr[SELF].mention = real
+        again = w.ask(SELF, SIB, cid=C2, task_id=TID)
+        self.assertEqual((again["root"], again["follow_up"]), ("$ask", True), again)
+        self.assertEqual([m.get("thread_root") for m in w.room.msgs], [None, "$ask"])
+
+    def test_the_room_cli_reports_timeouts_and_garbled_output_as_ambiguous(self):
+        with tempfile.NamedTemporaryFile(suffix=".py") as f:
+            def boom(argv, **kw):
+                raise subprocess.TimeoutExpired(argv, 60)
+            timed_out = cli.RoomCliTransport(f.name, SELF, runner=boom).mention(SIB, "q", ROOM)
+            garbled = cli.RoomCliTransport(f.name, SELF, runner=lambda argv, **kw:
+                                           subprocess.CompletedProcess(argv, 0, stdout="half", stderr="")
+                                           ).mention(SIB, "q", ROOM)
+        for res in (timed_out, garbled):
+            self.assertFalse(policy._sent_before_publication(res), res)
+        self.assertTrue(policy._sent_before_publication({"ok": False, "posted": False}))
+
+    def test_room_ops_mention_marks_its_pre_send_refusals(self):
+        sys.path.insert(0, str(ROOM_OPS_CLI.parent))
+        mention = _load("room_ops_mention", ROOM_OPS_CLI.parent / "mention.py")
+        self.assertIs(mention.mention("peer", "x", "")["posted"], False)
+        self.assertIs(mention.mention("peer", "x", ROOM, reply_to="not-an-event")["posted"], False)
+
+    def chain_to_up_answer(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.deliver(SIB, "$ask", "task-b1")
+        w.ask(SIB, THIRD, cid=C2, via_task="task-b1")
+        w.deliver(THIRD, "$ask2", "task-c1")
+        w.answer(THIRD, "disk is 80% full", task_id="task-c1")
+        w.deliver(SIB, "$ask3", "task-b2")
+        up = w.match(SIB, "task-b2")
+        self.assertTrue(up["matched"], up)
+        return up
+
+    def test_a_replayed_match_does_not_post_the_up_chain_answer_twice(self):
+        w = self.w
+        up = self.chain_to_up_answer()
+        first = w.answer(SIB, "per third: 80%", up=up["answer_up"]["up"])
+        replayed = w.match(SIB, "task-b2")  # B crashed before writing task-b2's result
+        self.assertTrue(replayed.get("replay"), replayed)
+        second = w.answer(SIB, "per third: 80%", up=replayed["answer_up"]["up"])
+        self.assertEqual((second["answered"], second.get("replay"), second["event_id"]),
+                         (True, True, first["event_id"]), second)
+        self.assertEqual(sum(1 for m in w.room.msgs if m["sender"] == SIB and policy.answer_tag(C1) in m["body"]), 1)
+
+    def test_answering_the_same_ask_twice_posts_once(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.deliver(SIB, "$ask", "task-b1")
+        one = w.answer(SIB, "up", task_id="task-b1")
+        two = w.answer(SIB, "up", task_id="task-b1")
+        self.assertEqual((two.get("replay"), two["event_id"]), (True, one["event_id"]))
+        self.assertEqual(len(w.room.msgs), 2)
+
+    def test_an_answer_that_timed_out_after_landing_is_found_not_reposted(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.deliver(SIB, "$ask", "task-b1")
+        real = self.landed_then(w.tr[SIB], {"ok": False, "reason": "room transport failed: timed out"})
+        self.assertTrue(w.answer(SIB, "up", task_id="task-b1")["unconfirmed"])
+        w.tr[SIB].mention = real
+        again = w.answer(SIB, "up", task_id="task-b1")
+        self.assertEqual((again.get("replay"), again["event_id"]), (True, "$ask2"), again)
+        self.assertEqual(len(w.room.msgs), 2)
+
+    def test_an_answer_that_never_landed_is_posted_once_the_whole_room_shows_it_absent(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.deliver(SIB, "$ask", "task-b1")
+        w.tr[SIB].mention = lambda *a, **k: {"ok": False, "reason": "room transport failed: timed out"}
+        self.assertTrue(w.answer(SIB, "up", task_id="task-b1")["unconfirmed"])
+        w.tr[SIB].mention = FakeTransport.mention.__get__(w.tr[SIB])
+        again = w.answer(SIB, "up", task_id="task-b1")
+        self.assertEqual((again["answered"], again.get("replay"), again["event_id"]), (True, None, "$ask2"), again)
+
+    def test_an_answer_unconfirmed_beyond_the_read_is_not_posted_again(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.deliver(SIB, "$ask", "task-b1")
+        w.tr[SIB].mention = lambda *a, **k: {"ok": False, "reason": "room transport failed: timed out"}
+        w.answer(SIB, "up", task_id="task-b1")
+        w.tr[SIB].mention = FakeTransport.mention.__get__(w.tr[SIB])
+        with mock.patch.object(policy, "_room_page", return_value=([], False)):
+            res = w.answer(SIB, "up", task_id="task-b1")
+        self.assertIn("earlier answer to this ask is unconfirmed", res["reason"])
+        self.assertEqual(len(w.room.msgs), 1)
+
+    def test_a_claim_with_no_record_is_released_after_the_grace_period(self):
+        w = self.w
+        claim = policy._root_claim(w.ws[SELF], TID)
+        policy.claim_root(w.ws[SELF], TID, C1)  # a crash before the pending record was written
+        fresh = w.ask(SELF, SIB, cid=C2, task_id=TID)
+        self.assertIn("already holds its thread root", fresh["reason"])
+        old = time.time() - 2 * policy.ORPHAN_GRACE_S
+        os.utime(claim, (old, old))
+        res = w.ask(SELF, SIB, cid=C2, task_id=TID)
+        self.assertEqual((res["asked"], res["root"]), (True, "$ask"), res)
+
+    def test_pending_heals_an_orphan_claim(self):
+        claim = policy._root_claim(self.w.ws[SELF], TID)
+        policy.claim_root(self.w.ws[SELF], TID, C1)
+        old = time.time() - 2 * policy.ORPHAN_GRACE_S
+        os.utime(claim, (old, old))
+        self.assertEqual(policy.pending(self.w.ws[SELF], 600), [])
+        self.assertFalse(claim.exists())
+
+    def test_reconcile_and_claim_edges(self):
+        w = self.w
+        w.tr[SELF].mention = lambda *a, **k: {"ok": True, "event_id": None}
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.tr[SELF].mention = FakeTransport.mention.__get__(w.tr[SELF])
+        w.tr[SELF].room.post(SELF, f"{SIB} — {policy.ask_line(C1, None, [SELF, SIB])}")
+        with mock.patch.object(policy, "_write_record", side_effect=OSError("ro")):
+            self.assertIn("unconfirmed", policy.reconcile(w.tr[SELF], ROOM, SELF, w.ws[SELF], task_id=TID))
+        w.tr[SELF].read = lambda room, limit: {"ok": False, "reason": "down"}
+        self.assertEqual(policy._room_page(w.tr[SELF], ROOM), ([], False))
+        self.assertIsNone(policy.reconcile(w.tr[SELF], ROOM, SELF, w.ws[SELF], task_id=TID,
+                                           now=time.time() + 10 * 86400))
+        self.assertEqual(pending_ids(w.ws[SELF]), [])
+
+    def test_answer_claim_edges(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.deliver(SIB, "$ask", "task-b1")
+        with mock.patch.object(policy, "_claim_file", return_value=False):
+            self.assertIn("being posted", w.answer(SIB, "up", task_id="task-b1")["reason"])
+        with mock.patch.object(policy, "_write_record", side_effect=OSError("ro")):
+            self.assertTrue(w.answer(SIB, "up", task_id="task-b1")["answered"])
+        answers = w.ws[SIB] / policy._STATE / "answers"
+        roots = w.ws[SELF] / policy._STATE / "roots"
+        (roots / "task-junk.json").write_text("not json")
+        later = time.time() + 30 * 86400
+        policy.pending(w.ws[SIB], 600, now=later)
+        policy.pending(w.ws[SELF], 600, now=later)
+        self.assertEqual(list(answers.glob("*.json")), [])
+        self.assertFalse((roots / "task-junk.json").exists())
+
+    def test_an_unconfirmed_onward_ask_is_reconciled_before_a_follow_up(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.deliver(SIB, "$ask", "task-b1")
+        real = self.landed_then(w.tr[SIB], {"ok": False, "reason": "room transport failed: timed out"})
+        self.assertTrue(w.ask(SIB, THIRD, cid=C2, via_task="task-b1")["unconfirmed"])
+        w.tr[SIB].mention = real
+        again = w.ask(SIB, THIRD, cid=C3, via_task="task-b1")
+        self.assertEqual((again["asked"], again["follow_up"]), (True, True), again)
+        [first] = [r for r in policy.records(w.ws[SIB], "pending") if r["cid"] == C2]
+        self.assertEqual(first["ask_event"], "$ask2")
 
 
 class TestRecordEdges(unittest.TestCase):

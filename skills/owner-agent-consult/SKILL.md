@@ -145,9 +145,9 @@ It does not wait.
 - `{"ok": true, "asked": true, "agent", "cid", "ask_event", "root", "chain", "follow_up"}` —
   finish the owner's task now: tell the owner you have asked that agent and will come back
   with its answer.
-- `{"ok": true, "asked": true, "unconfirmed": true, ...}` — the transport accepted the post but
-  returned no event id, so it may or may not have landed. Treat it as asked; the record is kept,
-  and `match` or the next ask from this task reconciles it from the room by consult id.
+- `{"ok": true, "asked": true, "unconfirmed": true, ...}` — the outcome is unknown: no event id,
+  a timeout, output that is not JSON, or an HTTP error. The ask may have landed. Treat it as
+  asked; see "Crash and timeout recovery" for how it settles.
 - `{"ok": true, "asked": false, "reason"}` — refused. Tell the owner in one line why you could
   not ask, then answer from what you hold.
 
@@ -259,7 +259,7 @@ subprocess, one JSON object per call, through four verbs:
 | `agents` | `{ok, agents: [{id, owner}]}` — this account's agent registry |
 | `members ROOM --agent SELF` | `{ok, members: [{user_id, display_name, kind}], unidentified}` |
 | `read ROOM --limit N --agent SELF` | `{ok, messages}` newest first, with `in_reply_to` / `thread_root` when known |
-| `mention MXID BODY ROOM --agent SELF [--reply-to EVENT] [--thread-root EVENT]` | `{ok, event_id}` |
+| `mention MXID BODY ROOM --agent SELF [--reply-to EVENT] [--thread-root EVENT]` | `{ok, event_id, posted}`; `posted: false` only for a refusal made before anything was sent |
 
 The `agent-room-ops` `room_ops.py` CLI provides these verbs. It is that skill's fallback for
 when the AG2 Space MCP is unreachable; a script cannot call MCP tools, so this is the
@@ -339,3 +339,32 @@ Every code path that computes "now" (`consult_policy.py`):
    ts, task arrival mtime), local)`.
 4. `answer --task-id`, its `limit_reached` report: the same measure as 3. Answers still post.
 5. `answer --up`: reports no limit, so it computes no "now".
+
+## Crash and timeout recovery
+
+Every post (an ask or an answer) is claimed before it is sent and settled after. Only a refusal
+the transport reports as made before sending (`posted: false`) releases a claim; a timeout,
+output that is not JSON, an HTTP error or a missing event id keeps it as **unconfirmed**. An
+unconfirmed post is reconciled from the room by consult id before anything is posted again:
+
+- found there: it is completed, and nothing is reposted;
+- absent from a read that covers the whole room (fewer than `READ_LIMIT` messages), or expired:
+  nothing was posted, so its claim is released;
+- otherwise: it may be beyond the read, so the next ask or answer is refused, and `pending` lists
+  it as `unconfirmed` until it is found or expires.
+
+Every write pair where a crash between the two matters, in order, and its recovery:
+
+| writes, in order | a crash between them leaves | recovery |
+| --- | --- | --- |
+| root claim (`roots/<task>.json`), then pending record (owner task's first ask) | a claim with no record. The record is written before the post, so nothing was posted | `reconcile` and `pending` release a claim with no record once it is 60 s old (`ORPHAN_GRACE_S`) |
+| pending record, then the post (any ask) | a record with no event id; posted or not | reconcile by consult id, as above. For an owner task this runs before any later ask from it; for an onward ask, before any later ask from that ask task to that agent |
+| the post, then the record's event id | a posted ask whose record has no event id | found by consult id: by `match` when the answer arrives, or by the next ask |
+| answer claim (`answers/<cid>.json`), then the answer post | a claim with no event id; posted or not | the next `answer` for that ask (`--task-id` or `--up`) finds its own answer by its answer line and replays it, posts again only if the whole room shows it absent, else refuses |
+| the answer post, then the claim's event id | a posted answer whose claim has no event id | the same: found by its answer line and replayed, never reposted |
+| the answered record with the payload (`answered/<cid>`), then removing `pending/<cid>` | both files | `match` replays to the same reply task; `pending` drops a pending copy beside its answer |
+| `answered/<cid>`, then the caller's result file | a consult closed but not relayed | `match` replays the payload to the same reply task until its result exists; `answer --up` replays its recorded post instead of posting again |
+| claim temp file, then its link | a stray temp file only | the claim does not exist until the link, so nothing is held |
+
+Single writes (`nudged/<cid>`, a reconciled record, the expiry prunes) are one atomic replace or
+unlink each.

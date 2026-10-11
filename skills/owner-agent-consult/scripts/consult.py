@@ -143,10 +143,12 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
         return _emit({"ok": True, **policy.answer(transport, room=conf["room"], self_mxid=a.self_mxid or "",
                                                    text=text, workspace=ws, task_id=a.task_id, up=a.up,
                                                    max_duration_s=conf["max_duration_s"],
-                                                   max_asks=conf["max_asks"])})
+                                                   max_asks=conf["max_asks"],
+                                                   expire_after_s=conf["expire_after_s"])})
     res = policy.consult(transport, room=conf["room"], self_mxid=a.self_mxid or "", agent=a.agent_to,
                          question=text, task_id=a.task_id, via_task=a.via_task, workspace=ws,
-                         max_duration_s=conf["max_duration_s"], max_asks=conf["max_asks"])
+                         max_duration_s=conf["max_duration_s"], max_asks=conf["max_asks"],
+                         expire_after_s=conf["expire_after_s"])
     return _emit({"ok": True, **res})
 
 
