@@ -155,7 +155,7 @@ class _DeliveryHarness(_Base):
         super().setUp()
         self.posts = []
 
-        def deliver(tid, broker_tid, body, no_send=False, result_file=None):
+        def deliver(tid, broker_tid, body, no_send=False, result_file=None, **_identity):
             self.posts.append((tid, body, no_send))
             return True
         for p in (patch.object(rgb, "_deliver_result_payload", side_effect=deliver),

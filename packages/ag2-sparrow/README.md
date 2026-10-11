@@ -30,7 +30,7 @@ profile, not its full definition.
 
 | Path | Responsibility |
 |---|---|
-| **Task relay** | Long-polls the AG2 Space gateway for *your* agent's tasks (identified by its relay token), drops each into the local workspace, scans for results and posts them back |
+| **Task relay** | Long-polls the AG2 Space gateway for *your* agent's tasks (identified by its relay token), drops each into the local workspace, acks each one with the `lease_id` it was served under (omitted when the broker sent none; a `stale lease generation` 404 retires that ack), scans for results and posts them back |
 | **Event channel** | Optionally subscribes to room events, persists them to a durable local inbox, and promotes meaningful batches into ambient tasks |
 | **Delivery outbox** *(library contract — not yet wired into the default relay path)* | For already-published outbound items: single-sender claims, crash recovery, delivery-outcome classification, retry/park, provider adapters |
 
@@ -74,6 +74,49 @@ The boundaries the contract establishes (`outbox.py`, `outbox_adapter.py`,
 pipx install ag2-sparrow        # or: pip install ag2-sparrow
 ```
 
+## Single-file download
+
+No pip or pipx? Each `sparrow-v<version>` GitHub Release also carries the
+package as one file, each with a `.sha256`: a stdlib zipapp
+(`ag2-sparrow-<version>.pyz`, Python 3.9+, no dependencies) and, needing no
+Python at all, Linux binaries (`ag2-sparrow-<version>-linux-x86_64` and
+`-linux-arm64`, glibc 2.31+, e.g. Debian 11 / Ubuntu 20.04 or newer):
+
+```sh
+VER=X.Y.Z   # newest sparrow-v* tag: https://github.com/sonichi/sutando/releases?q=sparrow-v
+BASE=https://github.com/sonichi/sutando/releases/download/sparrow-v$VER
+
+# zipapp
+curl -fLO "$BASE/ag2-sparrow-$VER.pyz" -fLO "$BASE/ag2-sparrow-$VER.pyz.sha256"
+sha256sum -c "ag2-sparrow-$VER.pyz.sha256"   # macOS: shasum -a 256 -c
+mv "ag2-sparrow-$VER.pyz" ag2-sparrow.pyz
+REMOTE_TASK_TOKEN=<token> python3 ag2-sparrow.pyz
+
+# or the Linux binary (ARCH=x86_64 or arm64)
+ARCH=$(uname -m | sed 's/aarch64/arm64/')
+curl -fLO "$BASE/ag2-sparrow-$VER-linux-$ARCH" -fLO "$BASE/ag2-sparrow-$VER-linux-$ARCH.sha256"
+sha256sum -c "ag2-sparrow-$VER-linux-$ARCH.sha256"
+install -m 0755 "ag2-sparrow-$VER-linux-$ARCH" ag2-sparrow
+REMOTE_TASK_TOKEN=<token> ./ag2-sparrow
+```
+
+Both start the bridge, exactly like `ag2-sparrow`; the binary is the bridge
+only. The outbox tool runs from the zipapp: `PYTHONPATH=ag2-sparrow.pyz
+python3 -m ag2_sparrow.outbox_cli --help`. Under systemd, keep the token in an
+`EnvironmentFile` and point `ExecStart` at the file:
+
+```ini
+[Service]
+EnvironmentFile=/etc/ag2-sparrow.env
+ExecStart=/usr/bin/python3 /opt/ag2-sparrow/ag2-sparrow.pyz
+# or, with the binary: ExecStart=/opt/ag2-sparrow/ag2-sparrow
+Restart=on-failure
+```
+
+Build them from a checkout with `python3 packages/ag2-sparrow/tools/build_zipapp.py`
+and, inside `python:3.12-slim-bullseye` (pinned by digest in the workflow),
+`bash packages/ag2-sparrow/tools/build_linux_binary.sh dist/ag2-sparrow`.
+
 ## Run
 
 ```sh
@@ -92,6 +135,46 @@ Inbound message text is scanned for pasted secrets (tokens, keys, PEM
 blocks) before anything is persisted; detected values are replaced with
 placeholders and the task carries an in-band notice so downstream agents
 don't reproduce them.
+
+**Behind an HTTP proxy?** Sparrow's task pull is a long-poll (`GET /v1/tasks?wait=25`,
+held open for up to 25 s), and the standard-library HTTP client honours
+`http_proxy` / `https_proxy` (not `ALL_PROXY`, which `urllib` ignores). A proxy
+whose idle or read timeout is shorter than the poll cuts the connection: the log
+shows `Remote end closed connection without response` about once a minute, and a
+task caught in a cut can wait for its lease to expire before the broker re-serves
+it (minutes, not seconds). Either set `REMOTE_TASK_POLL_WAIT` below the
+proxy's timeout (`REMOTE_TASK_POLL_WAIT=10` fits most), or add the relay host to
+`no_proxy` so the poll bypasses the proxy.
+
+## Waking your agent
+
+Sparrow writes each task to `AGENT_CONNECT_TASK_DIR/<task-id>.txt`. Set
+`REMOTE_TASK_ON_TASK` and Sparrow also runs that command once for every task
+file it newly queues, so your agent starts its turn without a folder-watching
+hook of its own.
+
+```sh
+REMOTE_TASK_ON_TASK="my-agent run-task" ag2-sparrow
+# for each new task Sparrow runs: my-agent run-task /path/to/task_dir/<task-id>.txt
+```
+
+- The command is split like a shell would split it (`shlex`) but runs **without
+  a shell**: no pipes, redirects or `$VARS`. Point it at a script if you need them.
+- The task file's absolute path is appended as the last argument. The command
+  also gets `SPARROW_TASK_ID` and `SPARROW_TASK_FILE` in its environment.
+- It runs only after the file is completely and durably written.
+- It fires once per task file Sparrow writes. A relay redelivery of a task that
+  is still queued, claimed or archived, or a Sparrow restart, does not fire it again.
+- Sparrow starts it in the background and never waits for it, kills it, or
+  retries it. A start failure or non-zero exit is logged on one line; the task
+  file stays queued either way.
+- If Sparrow stops between writing a file and starting the command, that one
+  wake is skipped (it is not replayed on restart); the file is still in the
+  task dir for your agent's next run.
+- Your relay token is never passed to it: every `REMOTE_*`/`AG2_*` token variable,
+  and any variable holding the token's value, is removed from its environment.
+
+Unset (the default), Sparrow behaves exactly as before.
 
 ## Optional: room-event subscription (0.3.0)
 

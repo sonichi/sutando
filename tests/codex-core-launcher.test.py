@@ -96,6 +96,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/start-cli.sh",
             "src/agent/codex/cli/task-notifier.sh",
             "src/agent/codex/cli/task-notifier-supervisor.sh",
+            "src/agent/codex/cli/codex-observer.mjs",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
             "src/agent/task-event-handler-lookup.sh",
@@ -304,6 +305,9 @@ exit 0
         # A suite run from inside a core would otherwise inherit the marker
         # and hit the in-session restart guard instead of the path under test.
         env.pop("SUTANDO_CORE_SESSION", None)
+        # A suite run from a core shell must not point the launcher at the live socket or session.
+        env.pop("SUTANDO_TMUX_SOCKET", None)
+        env.pop("SUTANDO_TMUX_SESSION", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -335,6 +339,9 @@ exit 0
         # A suite run from inside a core would otherwise inherit the marker
         # and hit the in-session restart guard instead of the path under test.
         env.pop("SUTANDO_CORE_SESSION", None)
+        # A suite run from a core shell must not point the launcher at the live socket or session.
+        env.pop("SUTANDO_TMUX_SOCKET", None)
+        env.pop("SUTANDO_TMUX_SESSION", None)
         env.pop("TMUX", None)   # inherited from a tmux host, it would route to the detached branch
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
@@ -511,6 +518,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("--sandbox danger-full-access", calls)
         self.assertIn("--ask-for-approval never", calls)
         self.assertIn("--search", calls)
+        self.assertIn("-c check_for_update_on_startup=false", calls)
         self.assertIn("-m gpt-test", calls)
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
         self.assertIn("task-notifier-supervisor.sh", calls)
@@ -678,6 +686,52 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertLess(calls.index("kill-session -t =sutando-core-watcher"),
                         calls.index("new-session -d -s sutando-core"))
 
+    def _observer_version(self):
+        out = subprocess.check_output(["cksum", str(self.root / "src/agent/codex/cli/codex-observer.mjs")]).decode().split()
+        return f"{out[0]}-{out[1]}"
+
+    def test_launch_starts_the_codex_observer_beside_the_core(self):
+        self._write_exe("node", "#!/bin/bash\nexit 0\n")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        line = next((l for l in calls.splitlines() if "new-session -d -s sutando-core-observer" in l), "")
+        self.assertIn(f"-e SUTANDO_OBSERVER_VERSION={self._observer_version()}", line)
+        self.assertIn(f"{self.bin}/node {self.root}/src/agent/codex/cli/codex-observer.mjs --engine {self.root}", line)
+        self.assertIn("--tmux-socket /tmp/sutando-tmux.sock --session sutando-core", line)
+        self.assertIn("--workspace ", line)
+        self.assertLess(calls.index("new-session -d -s sutando-core "), calls.index("new-session -d -s sutando-core-observer"))
+
+    def test_current_observer_is_left_running_and_a_stale_one_replaced(self):
+        self._write_exe("node", "#!/bin/bash\nexit 0\n")
+        anchor = '[ "${1:-}" = -S ] && shift 2\n'
+        tmux = (self.bin / "tmux").read_text().replace(anchor, anchor
+            + 'if [ "${1:-}" = show-environment ] && [ "${3:-}" = =sutando-core-observer ]; then\n'
+            '  printf \'SUTANDO_OBSERVER_VERSION=%s\\n\' "$TMUX_ACTIVE_OBSERVER_VERSION"; exit 0\nfi\n'
+            'if [ "${1:-}" = has-session ] && [ "${3:-}" = =sutando-core-observer ]; then exit 0; fi\n', 1)
+        (self.bin / "tmux").write_text(tmux)
+        live = {"TMUX_ACTIVE_RUNTIME": "codex", "TMUX_WATCHER_EXISTS": "1",
+                "TMUX_ACTIVE_NOTIFIER_VERSION": self._notifier_version()}
+        result = self.run_launcher(env_extra={**live, "TMUX_ACTIVE_OBSERVER_VERSION": self._observer_version()})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertNotIn("kill-session -t =sutando-core-observer", calls)
+        self.assertNotIn("new-session -d -s sutando-core-observer", calls)
+        self.log.unlink()
+        result = self.run_launcher(env_extra={**live, "TMUX_ACTIVE_OBSERVER_VERSION": "stale"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertLess(calls.index("kill-session -t =sutando-core-observer"),
+                        calls.index("new-session -d -s sutando-core-observer"))
+        self.assertNotIn("kill-session -t =sutando-core\n", calls)
+
+    def test_restart_kills_the_observer_before_launch(self):
+        result = self.run_launcher("--restart")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertLess(calls.index("kill-session -t =sutando-core-observer"),
+                        calls.index("new-session -d -s sutando-core"))
+
     def test_restart_loads_self_development_policy_from_dotenv(self):
         (self.root / ".env").write_text("SUTANDO_SELF_DEVELOPMENT_ENABLED=0\n")
         result = self.run_launcher("--restart", env_extra={})
@@ -732,6 +786,17 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("kill-session -t =sutando-core", calls)
         self.assertIn("new-session -d -s sutando-core", calls)
         self.assertLess(calls.index("kill-session -t =sutando-core-watcher"),
+                        calls.index("new-session -d -s sutando-core"))
+        self.assertLess(calls.index("kill-session -t =sutando-core-observer"),
+                        calls.index("new-session -d -s sutando-core"))
+
+    def test_direct_launcher_replacing_a_foreign_session_kills_the_observer_too(self):
+        # The dispatcher turns this into --restart; called directly, the replace branch itself must reap.
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "unknown"}, launcher="src/agent/codex/cli/start-cli.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertIn("Replacing unmarked or non-Codex sutando-core session.", result.stdout)
+        self.assertLess(calls.index("kill-session -t =sutando-core-observer"),
                         calls.index("new-session -d -s sutando-core"))
 
     def test_stale_notifier_version_is_replaced_without_restarting_core(self):

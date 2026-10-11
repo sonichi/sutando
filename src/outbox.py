@@ -25,9 +25,11 @@ import ctypes.util
 import errno
 import hashlib
 import json
+import math
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
@@ -786,6 +788,76 @@ def attempts_for(root: Path, item_id: str) -> int:
     return int(_read_item(Path(root), item_id).get("attempts", 0))
 
 
+@dataclass(frozen=True)
+class RetrySchedule:
+    window_s: float = 600.0
+    initial_delay_s: float = 2.0
+    max_delay_s: float = 30.0
+    min_attempts: int = 5
+
+    def __post_init__(self):
+        if not all(math.isfinite(v) for v in (
+                self.window_s, self.initial_delay_s, self.max_delay_s)) or not (
+                0 < self.initial_delay_s <= self.max_delay_s <= self.window_s):
+            raise ValueError("retry delays must be positive and within the window")
+        if (not isinstance(self.min_attempts, int) or isinstance(self.min_attempts, bool)
+                or self.min_attempts < 1):
+            raise ValueError("minimum attempts must be a positive integer")
+
+
+def _retry_exhausted(retry: dict, now: float) -> bool:
+    return now >= retry["deadline"] and retry["failures"] >= retry.get("min_attempts", 5)
+
+
+def retry_ready_locked(root: Path, item_id: str, schedule: RetrySchedule,
+                       now: float) -> bool:
+    """Called under the item lock, before acquiring a delivery claim."""
+    d = _read_item(root, item_id)
+    retry = d.get("retry")
+    if retry is None:
+        retry = {"started_at": now, "deadline": now + schedule.window_s,
+                 "next_attempt_at": now, "failures": 0, "min_attempts": schedule.min_attempts,
+                 "initial_delay_s": schedule.initial_delay_s,
+                 "max_delay_s": schedule.max_delay_s}
+        d["retry"] = retry
+        _write_item(root, item_id, d)
+    try:
+        valid = (isinstance(retry, dict)
+                 and all(math.isfinite(retry[k]) for k in (
+                     "started_at", "deadline", "next_attempt_at", "initial_delay_s", "max_delay_s"))
+                 and retry["started_at"] <= retry["next_attempt_at"]
+                 and retry["started_at"] < retry["deadline"]
+                 and 0 < retry["initial_delay_s"] <= retry["max_delay_s"]
+                 and isinstance(retry["failures"], int) and retry["failures"] >= 0
+                 and isinstance(retry.get("min_attempts", 5), int)
+                 and not isinstance(retry.get("min_attempts", 5), bool)
+                 and retry.get("min_attempts", 5) >= 1)
+    except (KeyError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        park_item(root, item_id, "invalid-retry-state")
+        return False
+    if _retry_exhausted(retry, now):
+        park_item(root, item_id, "retry-window-exhausted")
+        return False
+    return now >= retry["next_attempt_at"]
+
+
+def retry_failed_locked(root: Path, item_id: str, now: float) -> None:
+    """Persist failure accounting and the next eligible time under the claim lock."""
+    d = _read_item(root, item_id)
+    retry = d["retry"]
+    retry["failures"] += 1
+    delay = min(retry["max_delay_s"],
+                retry["initial_delay_s"] * 2 ** min(retry["failures"] - 1, 30))
+    retry["next_attempt_at"] = (min(now + delay, retry["deadline"])
+                                if now < retry["deadline"] else now + delay)
+    d["attempts"] = int(d.get("attempts", 0)) + 1
+    if _retry_exhausted(retry, now):
+        d.update(status="PARKED", reason="retry-window-exhausted")
+    _write_item(root, item_id, d)
+
+
 def note_attempt(root: Path, item_id: str) -> int:
     d = _read_item(Path(root), item_id)
     d["attempts"] = int(d.get("attempts", 0)) + 1
@@ -819,6 +891,72 @@ def read_item(root: Path, item_id: str) -> Optional[dict]:
     return _read_item(Path(root), item_id)
 
 
+PROOF_VERSION = 1
+
+
+def new_publication_id() -> str:
+    """A fresh identity for one publish or requeue by this writer (never a clock value)."""
+    return uuid.uuid4().hex
+
+
+def _proof_binding(payload: str, publication_id) -> str:
+    """What a stamped proof vouches for: this version, the stored payload and the
+    publication that wrote them. It only ever decides archive versus quarantine."""
+    return hashlib.sha256(json.dumps([PROOF_VERSION, payload, publication_id]).encode("utf-8")).hexdigest()
+
+
+def source_proof(record: Optional[dict]) -> Optional[str]:
+    """The record's source digest, trusted only from this writer's stamp
+    (`proof_version`) and only while its binding still matches the stored payload
+    and publish; main's records, earlier heads' and unknown shapes have none."""
+    if not record:
+        return None
+    proof, payload = record.get("source_ready_sha256"), record.get("payload")
+    if (record.get("proof_version") != PROOF_VERSION or not proof or not isinstance(payload, str)
+            or not record.get("publication_id")
+            or record.get("source_payload_sha256") != _proof_binding(payload, record.get("publication_id"))):
+        return None
+    return proof
+
+
+def source_proof_fields(source_ready_sha256: Optional[str], payload: str, publication_id: str) -> dict:
+    """Every source-proof field, written atomically with the payload and publication they vouch for."""
+    fields = {"publication_id": publication_id}
+    if source_ready_sha256:
+        fields.update(proof_version=PROOF_VERSION, source_ready_sha256=source_ready_sha256,
+                      source_payload_sha256=_proof_binding(payload, publication_id))
+    return fields
+
+
+def source_digest(ready_body: str) -> str:
+    """The digest an outbox record keeps of the result it was built from: the
+    readiness-normalized body, so surrounding whitespace is the same source."""
+    return hashlib.sha256(ready_body.encode("utf-8")).hexdigest()
+
+
+def delivered_body_differs(root: Path, item_id: str, ready_body: Optional[str]) -> bool:
+    """True when the id is DELIVERED and a live result whose ready body is
+    `ready_body` was never provably what was sent (None: nothing provable).
+    Decided on the record's source proof (`source_proof`), valid only while it
+    describes the stored payload. A record without a valid proof (an earlier
+    `source_sha256`, or a payload replaced without it) proves only a source
+    identical to its stored wire body; any marker a path strips or acts on
+    ([dm-only], [channel:], [file:]...) makes it unprovable."""
+    d = read_item(root, item_id)
+    if not d or d.get("status") != "DELIVERED":
+        return False
+    if ready_body is None:
+        return True
+    proof = source_proof(d)
+    if proof:
+        return proof != source_digest(ready_body)
+    try:
+        stored = json.loads(d.get("payload") or "")
+    except (TypeError, ValueError):
+        return True
+    return not isinstance(stored, dict) or stored.get("body") != ready_body
+
+
 def list_items(root: Path, status: Optional[str] = None) -> list[dict]:
     """Every item record, newest id order, optionally filtered by status."""
     d = _items_dir(Path(root))
@@ -847,6 +985,14 @@ class RequeueOutcome(str, Enum):
 def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
                  operator: Optional[str] = None,
                  reason: Optional[str] = None) -> RequeueOutcome:
+    """Operator recovery: PARKED -> QUEUED. See `requeue_item_with_epoch`."""
+    return requeue_item_with_epoch(root, item_id, reset_attempts=reset_attempts,
+                                   operator=operator, reason=reason)[0]
+
+
+def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = False,
+                            operator: Optional[str] = None,
+                            reason: Optional[str] = None) -> "tuple[RequeueOutcome, Optional[int]]":
     """Operator recovery: PARKED -> QUEUED as ONE atomic transition.
 
     Refuses anything not PARKED, which is what makes it idempotent AND keeps it
@@ -863,22 +1009,31 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
     already at MAX_ATTEMPTS, the next failure re-parks it immediately; that is
     the intended "one more try" semantic, and --reset-attempts is the full
     budget.
+
+    Returns the epoch written under the lock (None unless REQUEUED): a later
+    read can see a peer's re-requeue, and a rollback keyed on it undoes theirs.
+    A requeue never changes the stored payload.
     """
     root = Path(root)
     with _item_lock(root, item_id):
         if not _item_path(root, item_id).exists():
-            return RequeueOutcome.ABSENT
+            return RequeueOutcome.ABSENT, None
         d = _read_item(root, item_id)
         if d.get("status") != "PARKED":
-            return RequeueOutcome.NOT_PARKED
+            return RequeueOutcome.NOT_PARKED, None
         _release_locked(root, item_id, force=True)
         d["resend_epoch"] = int(d.get("resend_epoch", 0) or 0) + 1
         d["status"] = "QUEUED"
         d["reason"] = None
         if reset_attempts:
             d["attempts"] = 0
+            d.pop("retry", None)
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
+        proof = source_proof(d)
+        for field in ("proof_version", "source_ready_sha256", "source_payload_sha256"):
+            d.pop(field, None)
+        d.update(source_proof_fields(proof, d.get("payload") or "", new_publication_id()))
         _write_item(root, item_id, d)
-        return RequeueOutcome.REQUEUED
+        return RequeueOutcome.REQUEUED, d["resend_epoch"]

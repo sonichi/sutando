@@ -100,6 +100,18 @@ class NotifyThreadRootTests(unittest.TestCase):
             self.assertEqual(rc, 1, repr(bad))
             self.assertEqual(sent, [], repr(bad))
 
+    def test_reply_to_flag_cites_without_threading(self):
+        rc, sent = self._send(["--reply-to", "$ask123"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it",
+                                 "reply_to": "$ask123"}])
+
+    def test_malformed_reply_to_is_refused_without_posting(self):
+        for bad in ("ask123", "   ", "$"):
+            rc, sent = self._send(["--reply-to", bad])
+            self.assertEqual(rc, 1, repr(bad))
+            self.assertEqual(sent, [], repr(bad))
+
 
 class EventIdParityTests(unittest.TestCase):
     """notify.py keeps its own copy of the event-id check (agent-room-ops is optional),
@@ -193,22 +205,39 @@ class NotifyTaskFileDeriveTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
 
-    def test_no_thread_root_threads_under_source_message_id_not_reply_to_event(self):
-        # reply_to_event is the post the sender quoted (often someone else's);
-        # the asking message is source_message_id.
+    def test_no_thread_root_cites_source_message_id_as_reply_to_not_thread_root(self):
+        # No real thread_root header: cites the asking message (never
+        # reply_to_event, the post the sender quoted) without nesting a thread.
         f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
                        "source_message_id: $ask\nreply_to_event: $other\ntask: x\n")
         rc, sent, _ = self._send(["--task-file", f])
         self.assertEqual(rc, 0)
-        self.assertEqual(sent[0]["thread_root"], "$ask")
+        self.assertNotIn("thread_root", sent[0])
+        self.assertEqual(sent[0]["reply_to"], "$ask")
 
-    def test_thread_root_wins_over_source_message_id(self):
+    def test_thread_root_and_source_message_id_both_sent(self):
+        # The two fields are independent, not mutually exclusive (relations.py).
         f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
                        "source_message_id: $ask\nreply_to_event: $other\ntask: x\n"
                        "thread_root: $root\n")
         rc, sent, _ = self._send(["--task-file", f])
         self.assertEqual(rc, 0)
         self.assertEqual(sent[0]["thread_root"], "$root")
+        self.assertEqual(sent[0]["reply_to"], "$ask")
+
+    def test_explicit_reply_to_overrides_what_the_task_file_carries(self):
+        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
+                       "source_message_id: $ask\ntask: x\n")
+        rc, sent, _ = self._send(["--task-file", f, "--reply-to", "$explicit"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent[0]["reply_to"], "$explicit")
+
+    def test_empty_explicit_reply_to_opts_out_of_the_file_citation(self):
+        f = self._task("source: local-ag2space\nchannel_id: !r:ag2.space\n"
+                       "source_message_id: $ask\ntask: x\n")
+        rc, sent, _ = self._send(["--task-file", f, "--reply-to", ""])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [{"op": "message", "room_id": ROOM, "body": "on it"}])
 
     def test_missing_task_file_falls_back_to_explicit_flags_without_crashing(self):
         missing = os.path.join(tempfile.gettempdir(), "notify-does-not-exist-xyz.txt")

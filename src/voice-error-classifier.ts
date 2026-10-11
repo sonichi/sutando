@@ -106,6 +106,18 @@ export function classifyTransportClose(
 }
 
 /**
+ * The classifier bodhi's upstream recovery gets (`upstreamRecovery.classifyClose`): a non-retryable
+ * close blocks dialing for the fatal backoff; anything else is left to the redial ladder.
+ */
+export function fatalCloseForRecovery(
+	code: number | undefined,
+	reason: string | undefined,
+): { category: string; code?: number; reason: string } | null {
+	const c = classifyTransportClose(code, reason);
+	return c.retryable ? null : { category: c.category, code, reason: c.rawReason };
+}
+
+/**
  * The configured model itself was refused (unknown or not served for Live), as opposed to a bad
  * key (1007) or a network drop. Gemini sends this as close code 1008 with the model path in the reason.
  */

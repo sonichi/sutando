@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -104,11 +106,72 @@ class SingletonGlueTest(unittest.TestCase):
     def test_deferred_when_live_holder(self):
         lf = self._lockfile()
         lf.parent.mkdir(parents=True, exist_ok=True)
-        lf.write_text(json.dumps({"role": "gateway-bridge", "pid": 999999,
-                                  "host": "testhost", "heartbeat_at": int(time.time()),
+        live = os.getppid()                              # a running process that is not us
+        lf.write_text(json.dumps({"role": "gateway-bridge", "pid": live,
+                                  "host": rgb._stable_host_label(),
+                                  "heartbeat_at": int(time.time()),
                                   "schema_version": 1}))
         self.assertFalse(rgb._acquire_singleton())       # live holder → must defer (no poll)
-        self.assertEqual(json.loads(lf.read_text())["pid"], 999999)  # holder untouched
+        self.assertEqual(json.loads(lf.read_text())["pid"], live)  # holder untouched
+
+    @unittest.skipIf(os.name == "nt", "no pid probe on Windows: heartbeat rule only")
+    def test_dead_holder_on_this_host_is_taken_over_at_once(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"]); child.wait()
+        lf = self._lockfile()
+        lf.parent.mkdir(parents=True, exist_ok=True)
+        lf.write_text(json.dumps({"role": "gateway-bridge", "pid": child.pid,
+                                  "host": rgb._stable_host_label(),   # the label the lock compares
+                                  "heartbeat_at": int(time.time()),
+                                  "schema_version": 1}))
+        self.assertTrue(rgb._acquire_singleton())        # no stale-window wait for a corpse
+        self.assertEqual(json.loads(lf.read_text())["pid"], os.getpid())
+        rgb._release_singleton()
+
+    def test_a_held_exit_retains_the_lock_past_its_own_pid(self):
+        self.assertTrue(rgb._acquire_singleton())
+        orig = rgb._join_push_thread
+        rgb._join_push_thread = lambda *a, **k: False    # a publication still in flight
+        try:
+            rgb._release_singleton()
+        finally:
+            rgb._join_push_thread = orig
+        held = json.loads(self._lockfile().read_text())
+        self.assertEqual(held["pid"], os.getpid())       # not released
+        self.assertTrue(held.get("retained"))            # so a dead-pid probe will not reap it
+
+    def test_a_held_exit_keeps_the_lock_when_retain_fails(self):
+        self.assertTrue(rgb._acquire_singleton())
+        orig_join, orig_retain = rgb._join_push_thread, rgb._ws_retain
+        rgb._join_push_thread = lambda *a, **k: False
+
+        def boom(*a, **k):
+            raise OSError("locks dir unwritable")
+        rgb._ws_retain = boom
+        try:
+            rgb._release_singleton()                     # an exit hook must not raise
+        finally:
+            rgb._join_push_thread, rgb._ws_retain = orig_join, orig_retain
+        held = json.loads(self._lockfile().read_text())
+        self.assertEqual(held["pid"], os.getpid())       # still held, never released
+        self.assertNotIn("retained", held)
+
+    def test_a_held_exit_logs_a_failed_retain_and_returns(self):
+        import io
+        lines = self._with_signal_sinks(io.StringIO())
+        self.assertTrue(rgb._acquire_singleton())
+        orig_join, orig_retain = rgb._join_push_thread, rgb._ws_retain
+        rgb._join_push_thread = lambda *a, **k: False
+
+        def boom(*a, **k):
+            raise OSError("locks dir unwritable")
+        rgb._ws_retain = boom
+        try:
+            rgb._release_singleton()
+        finally:
+            rgb._join_push_thread, rgb._ws_retain = orig_join, orig_retain
+        failed = [l for l in lines if "singleton: retain failed (locks dir unwritable)" in l]
+        self.assertEqual(len(failed), 1, lines)
+        self.assertEqual(json.loads(self._lockfile().read_text())["pid"], os.getpid())
 
     def test_fail_open_on_acquire_error(self):
         orig = rgb._ws_acquire
@@ -120,6 +183,79 @@ class SingletonGlueTest(unittest.TestCase):
             self.assertTrue(rgb._acquire_singleton())    # error → proceed to poll (fail-open)
         finally:
             rgb._ws_acquire = orig
+
+    def _with_signal_sinks(self, stdout):
+        """Route the handler's two sinks: stdout to `stdout`, the file line to a
+        list. Returns the list."""
+        lines = []
+        saved = (sys.stdout, rgb._append_log_file)
+        sys.stdout, rgb._append_log_file = stdout, lines.append
+        self.addCleanup(lambda: setattr(sys, "stdout", saved[0]))
+        self.addCleanup(setattr, rgb, "_append_log_file", saved[1])
+        return lines
+
+    def test_signal_exit_names_the_signal_and_exits_0(self):
+        import io
+        out = io.StringIO()
+        lines = self._with_signal_sinks(out)
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_on_signal(signal.SIGTERM, None)
+        self.assertEqual(ctx.exception.code, 0)
+        want = "[remote-gateway-bridge] received SIGTERM — exiting"
+        self.assertEqual(lines, [want])
+        self.assertEqual(out.getvalue(), want + "\n")
+
+    def test_signal_exit_logs_the_file_line_when_print_is_reentrant(self):
+        # The signal landed inside print: the next print raises, as the
+        # BufferedWriter does on re-entry. The file line must still be written.
+        class Reentrant:
+            def write(self, _data):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter>")
+
+            def flush(self):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter>")
+        lines = self._with_signal_sinks(Reentrant())
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_on_signal(signal.SIGINT, None)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(lines, ["[remote-gateway-bridge] received SIGINT — exiting"])
+
+    def test_signal_exit_survives_a_closed_stdout_fd(self):
+        # Both stdout sinks refuse (stream re-entry, then the raw fd): the file
+        # line is still written and the exit is still 0.
+        class Reentrant:
+            def write(self, _data):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter>")
+
+            def flush(self):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter>")
+
+        class NoFd:
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+            @staticmethod
+            def write(_fd, _data):
+                raise OSError(9, "Bad file descriptor")
+        lines = self._with_signal_sinks(Reentrant())
+        rgb.os = NoFd()
+        self.addCleanup(setattr, rgb, "os", os)
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_on_signal(signal.SIGTERM, None)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(lines, ["[remote-gateway-bridge] received SIGTERM — exiting"])
+
+    def test_signal_exit_survives_a_failing_log(self):
+        def boom(_line):
+            raise OSError("disk gone")
+        import io
+        out = io.StringIO()
+        self._with_signal_sinks(out)
+        rgb._append_log_file = boom
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_on_signal(signal.SIGINT, None)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("received SIGINT — exiting", out.getvalue())
 
 
 if __name__ == "__main__":

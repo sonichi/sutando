@@ -145,6 +145,9 @@ resolve_claude_credential_proxy
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
 fi
+# Ceiling on one foreground Bash call: when it is reached Claude Code moves the
+# command to the background and the turn continues. A caller-set value wins.
+ENV_ARGS+=(-e "BASH_MAX_TIMEOUT_MS=${BASH_MAX_TIMEOUT_MS:-120000}")
 # Test probe: dump the assembled core env forwarding and exit — lets the
 # regression suite assert the proxy-routing policy (live listener forwards,
 # dead port omits, caller preset wins) against the REAL ENV_ARGS under
@@ -240,12 +243,7 @@ release_orchestrator_lock() {
   return 0
 }
 log_restart_attempt() {
-  local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
-  [ -n "$ws" ] || return 0
-  mkdir -p "$ws/logs" 2>/dev/null || true
-  printf '%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1" \
-    >> "$ws/logs/restart-attempts.log" 2>/dev/null || true
+  sutando_restart_attempt_log "$REPO" "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1"
 }
 # Enforces the HAZARD above; the decision and its message are shared with
 # the codex launcher, this adapter keeps only its own attempt logging.
