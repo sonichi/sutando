@@ -128,7 +128,7 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
         rows = policy.pending(ws, conf["nudge_after_s"], expire_after_s=conf["expire_after_s"])
         waiting = policy.waiting_answers(transport, conf["room"], ws, conf["max_duration_s"], a.self_mxid or "")
         for r in rows:
-            if r.get("cid") in waiting:
+            if r.get("cid") in waiting and not r.get("closed_unrelayed"):
                 r["answer_waiting"] = waiting[r["cid"]]
         return _emit({"ok": True, "nudge_after_s": conf["nudge_after_s"],
                       "expire_after_s": conf["expire_after_s"], "pending": rows})

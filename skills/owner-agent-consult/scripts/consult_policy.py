@@ -319,7 +319,7 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
     told, `unconfirmed` when the ask's post was never confirmed, `expired` past the expiry, plus
     closed consults whose relay is not acknowledged (`closed_unrelayed`) and any live task
     holding a root claim with no record (`claim_only`). Read-only: nothing is ever deleted here,
-    so no race with a concurrent match can orphan a record. An expired, nudged consult whose
+    so no race with a concurrent match can orphan a record; a cid closed meanwhile is listed once, as closed. An expired, nudged consult whose
     task can no longer post is hidden from the listing, unless a message is bound as its answer."""
     now = time.time() if now is None else now
     open_recs = [r for r in records(workspace, "pending")
@@ -337,7 +337,14 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
         out.append({**r, "age_s": int(age) if age != float("inf") else None, "overdue": overdue,
                     "nudged": nudged, "unconfirmed": not r.get("ask_event"),
                     "nudge_due": overdue and not nudged, "expired": age > expire_after_s})
-    for r in records(workspace, "answered"):
+    closed = {r["cid"]: r for r in records(workspace, "answered")}
+    for r in out:
+        if r["cid"] not in closed:
+            rec = _read_record(_record_path(workspace, "answered", r["cid"]))
+            if rec:
+                closed[r["cid"]] = rec
+    out = [r for r in out if r["cid"] not in closed]
+    for r in closed.values():
         if not r.get("relayed"):
             out.append({"cid": r["cid"], "task_id": r.get("task_id"), "agent": r.get("agent"),
                         "origin": r.get("origin"), "answer_event": r.get("answer_event"),
@@ -784,7 +791,8 @@ def waiting_answers(transport, room: str, workspace: Path, max_duration_s: int =
     message already bound as the answer whose close did not land. One room read."""
     messages, err = _room_page(transport, room)
     out = {}
-    open_recs = [r for r in records(workspace, "pending") if r.get("ask_event") and r.get("room") == room]
+    open_recs = [r for r in records(workspace, "pending") if r.get("ask_event") and r.get("room") == room
+                 and not _record_path(workspace, "answered", r["cid"]).exists()]
     held_by = _answer_bindings(workspace, {r["cid"] for r in open_recs})  # from files, not the room
     for r in open_recs:
         held = held_by.get(r["cid"])
@@ -801,7 +809,7 @@ def waiting_answers(transport, room: str, workspace: Path, max_duration_s: int =
             row = {"event_id": first.get("event_id"), "text": _reply_text(first, self_mxid)}
             late = _window_refusal(r, first, messages, max_duration_s)
             out[r["cid"]] = {**row, "refused": late} if late else row
-    return out
+    return {c: v for c, v in out.items() if not _record_path(workspace, "answered", c).exists()}
 
 
 def reply_lead(origin: dict) -> str:

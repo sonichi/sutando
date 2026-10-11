@@ -1152,6 +1152,29 @@ class TestDeliveredAtMostOnce(WorldCase):
         self.assertEqual(policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF])[C1]["event_id"], self.e)
         self.assertTrue(self.w.m(self.e, final=True, now=boundary + 3)["matched"])
 
+    def test_kewei_a_crash_after_the_answered_link_shows_only_the_closed_row(self):
+        stale = policy._record_path(self.w.ws[SELF], "pending", C1)
+        copy = stale.read_bytes()
+        self.assertTrue(self.w.m(self.e, final=True)["matched"])
+        stale.write_bytes(copy)  # the crash: answered/ linked, pending/ never unlinked
+        rows = policy.pending(self.w.ws[SELF], 0)
+        self.assertEqual([(r["cid"], r.get("closed_unrelayed")) for r in rows], [(C1, True)])
+        self.assertEqual(policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF], self_mxid=SELF), {})
+
+    def test_kewei_a_close_during_the_binding_scan_lists_the_cid_once(self):
+        real_scan = policy._answer_bindings
+        raced = []
+
+        def scan_then_close(workspace, cids):
+            seen = real_scan(workspace, cids)
+            if not raced:
+                raced.append(self.w.m(self.e, final=True))
+            return seen
+        with mock.patch.object(policy, "_answer_bindings", scan_then_close):
+            rows = policy.pending(self.w.ws[SELF], 0)
+        self.assertTrue(raced[0]["matched"])
+        self.assertEqual([(r["cid"], r.get("closed_unrelayed")) for r in rows], [(C1, True)])
+
     def test_susan_a_progress_binding_is_not_shown_as_the_answer(self):
         self.assertTrue(self.w.m(self.e, not_final=True)["progress"])
         e2 = self.sib("now it is up")
