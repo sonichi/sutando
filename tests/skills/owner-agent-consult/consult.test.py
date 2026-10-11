@@ -1175,6 +1175,35 @@ class TestDeliveredAtMostOnce(WorldCase):
         self.assertTrue(raced[0]["matched"])
         self.assertEqual([(r["cid"], r.get("closed_unrelayed")) for r in rows], [(C1, True)])
 
+    def test_a_close_after_the_answered_scan_lists_the_cid_once(self):
+        real_records = policy.records
+        raced = []
+
+        def records_then_close(workspace, kind):
+            got = real_records(workspace, kind)
+            if kind == "answered" and not raced:
+                raced.append(self.w.m(self.e, final=True))
+            return got
+        with mock.patch.object(policy, "records", records_then_close):
+            rows = policy.pending(self.w.ws[SELF], 0)
+        self.assertTrue(raced[0]["matched"])
+        self.assertEqual([(r["cid"], r.get("closed_unrelayed")) for r in rows], [(C1, True)])
+
+    def test_a_close_during_waiting_answers_hides_its_candidate(self):
+        self.sib("and more")
+        real_scan = policy._answer_bindings
+        raced = []
+
+        def scan_then_close(workspace, cids):
+            seen = real_scan(workspace, cids)
+            if not raced:
+                raced.append(self.w.m(self.e, final=True))
+            return seen
+        with mock.patch.object(policy, "_answer_bindings", scan_then_close):
+            shown = policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF], self_mxid=SELF)
+        self.assertTrue(raced[0]["matched"])
+        self.assertEqual(shown, {})
+
     def test_susan_a_progress_binding_is_not_shown_as_the_answer(self):
         self.assertTrue(self.w.m(self.e, not_final=True)["progress"])
         e2 = self.sib("now it is up")
