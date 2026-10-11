@@ -84,12 +84,19 @@ def _resolve_workspace(override: str | None) -> Path:
     return resolve_workspace()
 
 
+_HOST_LABEL: str | None = None
+
+
 def _host_label() -> str:
-    try:
-        from util_paths import _host_label as hl  # noqa: E402
-        return hl()
-    except Exception:  # pragma: no cover - host-label fallback
-        return socket.gethostname().split(".")[0]
+    # First value wins: a later sys.path change must not rename a lock this process holds.
+    global _HOST_LABEL
+    if _HOST_LABEL is None:
+        try:
+            from util_paths import _host_label as hl  # noqa: E402
+            _HOST_LABEL = hl()
+        except Exception:  # pragma: no cover - host-label fallback
+            _HOST_LABEL = socket.gethostname().split(".")[0]
+    return _HOST_LABEL
 
 
 def _now() -> int:

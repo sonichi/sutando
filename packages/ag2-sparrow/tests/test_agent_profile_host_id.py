@@ -18,6 +18,7 @@ from unittest import mock
 
 PKG = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG))
+from ag2_sparrow import workspace_lock  # noqa: E402
 
 
 def _module(base: Path):
@@ -47,9 +48,11 @@ def test_the_stable_label_does_not_depend_on_src_already_being_importable():
         path = [p for p in sys.path if os.path.abspath(p) != src]
         with mock.patch.object(sys, "path", path), \
                 mock.patch.dict(sys.modules), \
+                mock.patch.object(workspace_lock, "_HOST_LABEL", None), \
                 mock.patch.dict(os.environ, {"SUTANDO_HOST_LABEL": "Stable-Label"}), \
                 mock.patch("socket.gethostname", return_value="Drift-MBP.localdomain"):
             sys.modules.pop("util_paths", None)
+            m._resolve_host_label()
             profile = m._build_agent_profile({})
     assert profile["host"]["host_id"] == "Stable-Label"
 
@@ -58,14 +61,15 @@ def test_an_unreadable_host_still_builds_a_profile():
     with tempfile.TemporaryDirectory() as td:
         m = _module(Path(td))
         with mock.patch.dict(sys.modules, {"util_paths": None}), \
+                mock.patch.object(workspace_lock, "_HOST_LABEL", None), \
                 mock.patch("socket.gethostname", side_effect=OSError("no host")):
             profile = m._build_agent_profile({})
     assert profile["host"] == {"host_id": "unknown-host", "kind": "local"}
 
 
 def test_standalone_label_falls_back_to_the_short_hostname():
-    from ag2_sparrow import workspace_lock
     with mock.patch.dict(sys.modules, {"util_paths": None}), \
+            mock.patch.object(workspace_lock, "_HOST_LABEL", None), \
             mock.patch("socket.gethostname", return_value="Marks-MBP.localdomain"):
         assert workspace_lock._host_label() == "Marks-MBP"
 

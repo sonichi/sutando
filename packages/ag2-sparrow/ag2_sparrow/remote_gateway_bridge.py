@@ -2704,12 +2704,20 @@ def _suspended_row(value) -> "dict | None":
     return {"reason": reason or "suspended", "at": at if numeric else None}
 
 
-def _profile_host_id() -> str:
-    """The host's stable label: gethostname() drifts with the network (a DHCP lease renames
-    it). The monorepo src/ is put on the path first, so the label never depends on call order."""
+def _resolve_host_label() -> None:
+    """Fix the process's host label at startup, from the monorepo src/ when present, so the
+    lock holder and the profile host_id agree for the whole run; gethostname() drifts with DHCP."""
     src = _monorepo_src("util_paths.py")
     if src and src not in sys.path:
         sys.path.insert(0, src)
+    try:
+        _stable_host_label()
+    except OSError:
+        pass
+
+
+def _profile_host_id() -> str:
+    """The host's stable label, as resolved once at startup; never edits sys.path."""
     try:
         return _stable_host_label()
     except OSError:
@@ -5416,6 +5424,7 @@ def main() -> None:
                  "looks missing/corrupted" if TOKEN[:4].lower() == "http" else "")
         sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
                  f"'https://<gateway>|<secret>' onboarding token{_hint}.")
+    _resolve_host_label()
     if not _acquire_singleton():
         # A live bridge already polls this workspace: stand down. 75 tells a
         # supervising wrapper not to relaunch; a plain exit would loop it.
