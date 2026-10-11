@@ -55,6 +55,7 @@ import atexit
 import glob
 import base64
 import hashlib
+import http.client
 import json
 import os
 import stat
@@ -2167,6 +2168,12 @@ def _append_log_file(line: str) -> None:
         pass
 
 
+# urllib wraps only the send in URLError; a socket the peer or a proxy closes
+# after it raises http.client's own errors bare, and those are outages too.
+_NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
+                   http.client.RemoteDisconnected, http.client.IncompleteRead)
+
+
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty)."""
     data = json.dumps(payload).encode() if payload is not None else None
@@ -2428,7 +2435,7 @@ def _post_task_ack(tid: str, durable: bool = False) -> bool:
             raise
         _log(f"task ack failed for {tid}: HTTP {e.code} — gateway may redeliver")
         return False
-    except (urllib.error.URLError, TimeoutError) as e:
+    except _NETWORK_ERRORS as e:
         _log(f"task ack network error for {tid}: {e} — gateway may redeliver")
         return False
 
@@ -2948,7 +2955,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             raise
         _log(f"heartbeat failed: HTTP {e.code} — continuing")
         return False
-    except (urllib.error.URLError, TimeoutError) as e:
+    except _NETWORK_ERRORS as e:
         _log(f"heartbeat network error: {e} — continuing")
         return False
 
@@ -5518,7 +5525,7 @@ def main() -> None:
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)
-        except (urllib.error.URLError, TimeoutError) as e:
+        except _NETWORK_ERRORS as e:
             _log(f"poll network error: {e} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"network: {e}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)

@@ -157,5 +157,69 @@ class LongPollTimeoutTest(unittest.TestCase):
         self.assertIn((True, {}), loop.status)
 
 
+class DroppedConnectionTest(unittest.TestCase):
+    """urllib wraps only the send in URLError. A peer or proxy that closes the
+    socket after it raises http.client's own errors bare from getresponse(), and
+    the loop filed those as "unexpected" — a crash-looking line for a dropped link."""
+
+    def setUp(self):
+        try:
+            from ag2_sparrow import remote_gateway_bridge as gw
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            self.skipTest(f"gateway not importable: {str(e)[:60]}")
+        self.gw = gw
+
+    def _assert_network_path(self, loop):
+        logs = " ".join(loop.logs)
+        self.assertEqual(loop.clock.slept, [1], "backs off like any outage")
+        self.assertIn("poll network error", logs)
+        self.assertNotIn("unexpected", logs, "a dropped connection is not a crash")
+        self.assertTrue(any(c is False and "network" in str(k.get("error", ""))
+                            for c, k in loop.status))
+
+    def test_a_connection_closed_before_the_response_is_a_network_error(self):
+        import http.client
+        exc = http.client.RemoteDisconnected("Remote end closed connection without response")
+        with _Loop(self.gw, poll_raises=exc, advance=1.0) as loop:
+            loop.run()                    # returns: the loop went on to its next pass
+        self._assert_network_path(loop)
+
+    def test_a_truncated_response_body_is_a_network_error(self):
+        import http.client
+        with _Loop(self.gw, poll_raises=http.client.IncompleteRead(b""), advance=1.0) as loop:
+            loop.run()
+        self._assert_network_path(loop)
+
+    def test_an_ack_cut_off_mid_flight_reports_a_network_error_not_a_crash(self):
+        import http.client
+        gw = self.gw
+        logs: list[str] = []
+        saved = (gw._req, gw._log, gw._ack_disabled_until)
+        gw._req = lambda *a, **k: (_ for _ in ()).throw(
+            http.client.RemoteDisconnected("Remote end closed connection without response"))
+        gw._log = lambda m: logs.append(str(m))
+        gw._ack_disabled_until = 0.0
+        try:
+            self.assertFalse(gw._post_task_ack("task-1700000000", False))
+        finally:
+            gw._req, gw._log, gw._ack_disabled_until = saved
+        self.assertIn("task ack network error", " ".join(logs))
+
+    def test_a_heartbeat_cut_off_mid_flight_reports_a_network_error_not_a_crash(self):
+        import http.client
+        gw = self.gw
+        logs: list[str] = []
+        saved = (gw._req, gw._log, gw._heartbeat_disabled)
+        gw._req = lambda *a, **k: (_ for _ in ()).throw(
+            http.client.RemoteDisconnected("Remote end closed connection without response"))
+        gw._log = lambda m: logs.append(str(m))
+        gw._heartbeat_disabled = False
+        try:
+            self.assertFalse(gw._post_heartbeat(set(), force=True))
+        finally:
+            gw._req, gw._log, gw._heartbeat_disabled = saved
+        self.assertIn("heartbeat network error", " ".join(logs))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
