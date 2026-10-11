@@ -151,8 +151,9 @@ def run_consult(tr, ws=None, *, text=None, stamp=True, question="is the build ho
                               now=(lambda: now) if now is not None else None)
 
 
-def match(tr, ws, tid="task-reply"):
-    return policy.match_reply(tr, room=ROOM, self_mxid=SELF, task_id=tid, workspace=ws)
+def match(tr, ws, tid="task-reply", **kw):
+    kw.setdefault("final", True)
+    return policy.match_reply(tr, room=ROOM, self_mxid=SELF, task_id=tid, workspace=ws, **kw)
 
 
 def pending_ids(ws):
@@ -374,7 +375,7 @@ class TestAskReturnsAtOnce(unittest.TestCase):
             res = run_consult(tr, ws, now=1_234.0)
             self.assertEqual((res["asked"], res["cid"], res["ask_event"], res["follow_up"]),
                              (True, CID, "$ask", False))
-            self.assertEqual(tr.reads, 0)
+            self.assertEqual(tr.reads, 1)  # one read for the pre-send boundary; no waiting
             [rec] = policy.records(ws, "pending")
         self.assertEqual((rec["task_id"], rec["cid"], rec["agent"], rec["ask_event"], rec["asked_at"]),
                          (TID, CID, SIB, "$ask", 1_234.0))
@@ -465,8 +466,9 @@ class World:
         return policy.answer(self.tr[me], room=ROOM, self_mxid=me, text=text, workspace=self.ws[me],
                              task_id=task_id, up=up, **kw)
 
-    def match(self, me, tid):
-        return policy.match_reply(self.tr[me], room=ROOM, self_mxid=me, task_id=tid, workspace=self.ws[me])
+    def match(self, me, tid, **kw):
+        kw.setdefault("final", True)
+        return policy.match_reply(self.tr[me], room=ROOM, self_mxid=me, task_id=tid, workspace=self.ws[me], **kw)
 
 
 C1, C2, C3 = "1111111111111111", "2222222222222222", "3333333333333333"
@@ -530,8 +532,16 @@ class TestThreadAndAnswerEdges(unittest.TestCase):
         reply_task(ws, "$nowhere", tid="task-a9", sender=SIB)
         self.assertIn("not in the last", w.match(SELF, "task-a9")["reason"])
         with mock.patch.object(policy.os, "link", side_effect=FileExistsError):
-            self.assertIn("already answered", w.match(SELF, "task-a2")["reason"])
+            self.assertIn("bound by another match", w.match(SELF, "task-a2")["reason"])
         with mock.patch.object(policy.os, "link", side_effect=PermissionError("ro")):
+            self.assertIn("could not be bound", w.match(SELF, "task-a2")["reason"])
+        real_link = os.link
+
+        def answered_link_fails(src, dst):
+            if Path(dst).parent.name == "answered":
+                raise PermissionError("ro")
+            return real_link(src, dst)
+        with mock.patch.object(policy.os, "link", side_effect=answered_link_fails):
             self.assertIn("could not be closed", w.match(SELF, "task-a2")["reason"])
         real = policy._write_record
 
@@ -633,12 +643,13 @@ class TestReviewRoundFour(unittest.TestCase):
                        task_id=TID, cid=C1, now=lambda: 1_000.0)
         self.answered_by_sib()
         res = policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, task_id="task-a2",
-                                 workspace=w.ws[SELF], expire_after_s=3600, now=1_000.0 + 3601)
+                                 workspace=w.ws[SELF], expire_after_s=3600, now=1_000.0 + 3601, final=True)
         self.assertIn("expired", res["reason"])
         [row] = policy.pending(w.ws[SELF], 600, now=1_000.0 + 3601, expire_after_s=3600)
         self.assertEqual((row["expired"], row["nudge_due"]), (True, True))
         self.assertTrue(policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, task_id="task-a2",
-                                           workspace=w.ws[SELF], expire_after_s=3600, now=1_100.0)["matched"])
+                                           workspace=w.ws[SELF], expire_after_s=3600, now=1_100.0,
+                                           final=True)["matched"])
         policy.pending(w.ws[SELF], 600, now=1_000.0 + 3601, expire_after_s=3600)
         self.assertEqual(policy.records(w.ws[SELF], "answered"), [])
 
@@ -1003,7 +1014,8 @@ class TestKeweiRoundNine(unittest.TestCase):
 
         def link_then_crash(src, dst):
             real_link(src, dst)
-            raise Crash()
+            if Path(dst).parent.name == "answered":
+                raise Crash()
         with mock.patch.object(policy.os, "link", side_effect=link_then_crash), self.assertRaises(Crash):
             w.match(SELF, "task-a2")
         again = w.match(SELF, "task-a2")
@@ -1523,12 +1535,15 @@ class TestAnswersByRelation(unittest.TestCase):
         w.room.post(SIB, "Yes.", thread_root="$ask")  # no task arrived for it
         waiting = policy.waiting_answers(w.tr[SELF], ROOM, w.ws[SELF])
         self.assertEqual(waiting[C1]["event_id"], "$ask2")
-        first = policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, event_id="$ask2", workspace=w.ws[SELF])
+        first = policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, event_id="$ask2", workspace=w.ws[SELF],
+                                   final=True)
         self.assertTrue(first["matched"], first)
-        again = policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, event_id="$ask2", workspace=w.ws[SELF])
+        again = policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, event_id="$ask2", workspace=w.ws[SELF],
+                                   final=True)
         self.assertEqual((again["matched"], again.get("replay")), (True, True))
         self.assertTrue(policy.mark_relayed(w.ws[SELF], C1)["ok"])
-        done = policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, event_id="$ask2", workspace=w.ws[SELF])
+        done = policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, event_id="$ask2", workspace=w.ws[SELF],
+                                  final=True)
         self.assertIn("already answered", done["reason"])
         self.assertFalse(policy.mark_relayed(w.ws[SELF], C2)["ok"])
 
@@ -1679,6 +1694,113 @@ class TestPlainMessageEdges(unittest.TestCase):
         self.assertIn("unreadable", w.ask(SIB, THIRD, cid=C3, via_task="task-b1")["reason"])
 
 
+class TestReviewRound20(unittest.TestCase):
+    """Regressions for the 2728c883f review: an event binds to one consult once; matching is
+    two-phase (peek, then --final or --not-final); recovery by text is scoped to one message
+    after the pre-send boundary; an incoming ask must be addressed to this agent."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def m(self, **kw):
+        return policy.match_reply(self.w.tr[SELF], room=ROOM, self_mxid=SELF, workspace=self.w.ws[SELF], **kw)
+
+    def test_kewei_1_one_reply_never_closes_two_consults(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID, question="Is the host up?")
+        follow = w.ask(SELF, SIB, cid=C2, task_id=TID, question="And the disk?")
+        w.room.post(SIB, "Disk is 80% full.", thread_root="$ask", reply_to=follow["ask_event"])
+        event = w.room.msgs[-1]["event_id"]
+        self.assertEqual(self.m(event_id=event, final=True)["cid"], C2)
+        self.assertNotIn(C1, policy.waiting_answers(w.tr[SELF], ROOM, w.ws[SELF]))
+        again = self.m(event_id=event, final=True)
+        self.assertNotEqual(again.get("cid"), C1, again)
+        self.assertEqual(pending_ids(w.ws[SELF]), [C1])
+
+    def test_a_concurrent_binder_wins_and_the_other_consult_stays_open(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID, question="Is the host up?")
+        w.ask(SELF, SIB, cid=C2, task_id=TID, question="And the disk?")
+        w.room.post(SIB, "Both fine.", thread_root="$ask")
+        event = w.room.msgs[-1]["event_id"]
+        policy._claim_file(policy._bind_path(w.ws[SELF], event),
+                           {"event": event, "cid": C2, "disposition": "answer"})  # another process, mid-close
+        got = self.m(event_id=event, final=True)
+        self.assertEqual((got["matched"], got["cid"]), (True, C2), got)
+        self.assertEqual(pending_ids(w.ws[SELF]), [C1])
+
+    def test_kewei_2_the_documented_peek_then_judge_sequence_keeps_the_final_answer(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.room.post(SIB, "On it, checking now.", thread_root="$ask")
+        w.deliver(SELF, "$ask2", "task-a2")
+        peek = self.m(task_id="task-a2")
+        self.assertEqual((peek["matched"], peek["candidate"], peek["reply_text"]),
+                         (False, True, "On it, checking now."), peek)
+        self.assertEqual(pending_ids(w.ws[SELF]), [C1])  # a peek changes nothing
+        self.assertTrue(self.m(task_id="task-a2", not_final=True)["progress"])
+        w.room.post(SIB, "It is up.", thread_root="$ask")
+        w.deliver(SELF, "$ask3", "task-a3")
+        self.assertTrue(self.m(task_id="task-a3")["candidate"])
+        got = self.m(task_id="task-a3", final=True)
+        self.assertEqual((got["matched"], got["reply_text"]), (True, "It is up."), got)
+        self.assertTrue(self.m(task_id="task-a2")["progress"])  # the progress message stays bound
+
+    def test_two_progress_marks_both_hold(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.room.post(SIB, "On it.", thread_root="$ask")
+        w.room.post(SIB, "Still checking.", thread_root="$ask")
+        self.assertTrue(self.m(event_id="$ask2", not_final=True)["progress"])
+        self.assertTrue(self.m(event_id="$ask3", not_final=True)["progress"])
+        self.assertEqual(policy.waiting_answers(w.tr[SELF], ROOM, w.ws[SELF]), {})
+
+    def test_kewei_3_recovery_never_binds_an_older_identical_ask(self):
+        w = self.w
+        w.room.post(SELF, f"{SIB} — is the disk full?")  # an old, identical top-level ask
+        real = w.tr[SELF].mention
+
+        def landed_without_receipt(*a, **k):
+            real(*a, **k)
+            return {"ok": False, "reason": "room transport failed: timed out"}
+        w.tr[SELF].mention = landed_without_receipt
+        self.assertTrue(w.ask(SELF, SIB, cid=C1, task_id=TID)["unconfirmed"])
+        w.tr[SELF].mention = real
+        again = w.ask(SELF, SIB, cid=C2, task_id=TID)
+        self.assertEqual((again["root"], again["follow_up"]), ("$ask2", True), again)
+        self.assertEqual(w.tr[SELF].thread_roots[-1], "$ask2")
+
+    def test_recovery_stays_unconfirmed_when_two_messages_could_be_the_ask(self):
+        rec = {"cid": C1, "agent": SIB, "ask_event": None, "root": None, "body": "is the disk full?",
+               "boundary": {"ts": 100, "ids": ["$old"]}}
+        a = {"sender": SELF, "event_id": "$a", "ts": 200, "body": f"{SIB} — is the disk full?"}
+        b = dict(a, event_id="$b")
+        self.assertIsNone(policy._recover_ask(rec, [a, b], SELF)["ask_event"])
+        self.assertEqual(policy._recover_ask(rec, [a], SELF)["ask_event"], "$a")
+        early = dict(a, ts=50)
+        self.assertIsNone(policy._recover_ask(rec, [early], SELF)["ask_event"])
+        self.assertIsNone(policy._recover_ask({**rec, "boundary": None}, [a], SELF)["ask_event"])
+
+    def test_rui_an_ask_delivered_to_an_agent_it_does_not_address_is_refused(self):
+        w = self.w
+        w.ask(SELF, THIRD, cid=C1, task_id=TID)
+        w.deliver(SIB, "$ask", "task-b1")
+        self.assertIn("not addressed to this agent", w.answer(SIB, "x", task_id="task-b1")["reason"])
+        self.assertIn("not addressed to this agent", w.ask(SIB, FOURTH, cid=C2, via_task="task-b1")["reason"])
+        self.assertEqual(w.tr[SIB].posted, [])
+
+    def test_the_mention_prefix_is_stripped_exactly(self):
+        self.assertEqual(policy._strip_mention(f"{SELF} — - dash first", SELF), "- dash first")
+        self.assertEqual(policy._strip_mention(f"{SELF}: yes", SELF), "yes")
+        self.assertEqual(policy._strip_mention("no mention", SELF), "no mention")
+        self.assertEqual(policy._strip_mention(f"{SELF}", SELF), "")
+        self.assertIn("at most one", self.m(event_id="$x", final=True, not_final=True)["reason"])
+
+
 class TestRecordEdges(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1734,7 +1856,8 @@ class TestRecordEdges(unittest.TestCase):
         self.assertEqual(pending_ids(w.ws[SELF]), [])
 
     def test_recovery_matches_only_this_agents_own_message_with_the_exact_text(self):
-        rec = {"cid": C1, "agent": SIB, "ask_event": None, "root": None, "body": "is the disk full?"}
+        rec = {"cid": C1, "agent": SIB, "ask_event": None, "root": None, "body": "is the disk full?",
+               "boundary": {"ts": 0, "ids": []}}
         forged = {"sender": THIRD, "event_id": "$x", "body": f"{SIB} — is the disk full?"}
         self.assertIsNone(policy._recover_ask(rec, [forged], SELF)["ask_event"])
         other_text = dict(forged, sender=SELF, body=f"{SIB} — is the disk full? (again)")
@@ -1963,15 +2086,19 @@ class TestCliAndEdges(unittest.TestCase):
                                 "--task-id", TID, "--max-asks", "3", "--max-duration", "900",
                                 transport=tr, workspace=ws)
             self.assertEqual((res["asked"], tr.reads, res["limits"]["max_asks"], res["limits"]["max_s"]),
-                             (True, 0, 3, 900), res)
+                             (True, 1, 3, 900), res)
             rc, listed = self._cli("pending", "--nudge-after", "60", transport=tr, workspace=ws)
             self.assertEqual(([r["cid"] for r in listed["pending"]], listed["nudge_after_s"]), ([CID], 60))
             rc, nudged = self._cli("pending", "--nudged", CID, workspace=ws)
             self.assertTrue(nudged["ok"], nudged)
             reply_task(ws, "$f")
-            rc, got = self._cli("match", "--agent", SELF, "--task-id", "task-reply",
+            rc, peek = self._cli("match", "--agent", SELF, "--task-id", "task-reply",
+                                 transport=tr, workspace=ws)
+            self.assertEqual((peek["candidate"], peek["reply_text"]), (True, "up"), peek)
+            rc, got = self._cli("match", "--agent", SELF, "--task-id", "task-reply", "--final",
                                 transport=tr, workspace=ws)
-            rc, again = self._cli("match", "--agent", SELF, "--event-id", "$f", transport=tr, workspace=ws)
+            rc, again = self._cli("match", "--agent", SELF, "--event-id", "$f", "--final",
+                                  transport=tr, workspace=ws)
             rc, rel = self._cli("relayed", CID, workspace=ws)
         self.assertTrue(got["matched"], got)
         self.assertEqual((got["task_id"], got["reply_text"]), (TID, "up"))

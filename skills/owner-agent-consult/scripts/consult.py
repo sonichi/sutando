@@ -6,7 +6,7 @@ owner's task. Prints one JSON object; refusals are in-band.
   consult.py roster  [--agent SELF] [--room ROOM] [--room-cli CLI]
   consult.py ask     --agent-to MXID --question-file F (--task-id OWNER_TASK | --via-task ASK_TASK) ...
   consult.py answer  --body-file F (--task-id ASK_TASK | --up ONWARD_CID) [--agent SELF] ...
-  consult.py match   (--task-id REPLY_TASK_ID | --event-id EVENT) [--not-final] [--agent SELF] ...
+  consult.py match   (--task-id REPLY_TASK_ID | --event-id EVENT) [--final | --not-final] [--agent SELF] ...
   consult.py relayed CID
   consult.py pending [--nudged CID] [--nudge-after S]
 
@@ -103,7 +103,10 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
             g = s.add_mutually_exclusive_group(required=True)
             g.add_argument("--task-id", help="id of the task the consulted agent's reply arrived as")
             g.add_argument("--event-id", help="the reply's event, as `pending` lists it under answer_waiting")
-            s.add_argument("--not-final", action="store_true",
+            j = s.add_mutually_exclusive_group()
+            j.add_argument("--final", action="store_true",
+                           help="you read the reply as the answer: bind it and close the consult")
+            j.add_argument("--not-final", action="store_true",
                            help="you read the reply as progress (or an onward ask), not the answer")
         if name == "relayed":
             s.add_argument("cid", help="a consult matched by --event-id, now relayed to the owner")
@@ -144,7 +147,8 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
     if a.cmd == "match":
         return _emit({"ok": True, **policy.match_reply(transport, room=conf["room"],
                                                          self_mxid=a.self_mxid or "", task_id=a.task_id,
-                                                         event_id=a.event_id, not_final=a.not_final,
+                                                         event_id=a.event_id, final=a.final,
+                                                         not_final=a.not_final,
                                                          workspace=ws, expire_after_s=conf["expire_after_s"])})
     path = a.question_file if a.cmd == "ask" else a.body_file
     try:

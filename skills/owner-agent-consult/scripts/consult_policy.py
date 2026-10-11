@@ -531,6 +531,8 @@ def incoming_ask(transport, room: str, self_mxid: str, task_id: str, workspace: 
     sender = msg.get("sender")
     if sender == self_mxid or sender not in owner_agents:
         return no("the ask is not from another of the owner's agents")
+    if not _mentions_first(msg.get("body") or "", self_mxid):
+        return no("the message is not addressed to this agent")
     root = msg.get("thread_root") or event
     view = thread_view(transport, room, root)
     if not view["ok"]:
@@ -638,7 +640,7 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
     body = question.strip()
     record = {"cid": cid, "task_id": task_id, "via_task": via_task, "via": via, "agent": agent,
               "room": room, "root": root, "ask_event": None, "asked_at": clock(), "origin": origin,
-              "body": body, "limits": own, "skipped": []}
+              "body": body, "limits": own, "boundary": _boundary(transport, room)}
     try:
         _write_record(path, record)
     except OSError as e:
@@ -668,26 +670,57 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
             "limits": own, "follow_up": follow_up, "warning": warning, "reason": None}
 
 
+_MENTION_SEPARATORS = (" \u2014 ", ": ", " ")
+
+
 def _strip_mention(body: str, mxid: str) -> str:
-    """The body without a leading mention of `mxid` (the room CLI's mention form)."""
+    """The body without a leading mention of `mxid` and its one separator (the room CLI writes
+    `<mxid> — <text>`); the text itself is left exactly as written."""
     text = (body or "").strip()
     if mxid and text.startswith(mxid):
-        text = text[len(mxid):].lstrip(" —–-:")
+        rest = text[len(mxid):]
+        for sep in _MENTION_SEPARATORS:
+            if rest.startswith(sep):
+                return rest[len(sep):]
+        return rest.strip()
     return text
 
 
+def _mentions_first(body: str, mxid: str) -> bool:
+    return bool(mxid) and (body or "").strip().startswith(mxid)
+
+
+def _boundary(transport, room: str) -> Optional[dict]:
+    """The room as this agent saw it just before posting: the newest server timestamp and the
+    events carrying it. A post can only be newer. None when the room could not be read."""
+    page = transport.read(room, READ_LIMIT)
+    if not page.get("ok"):
+        return None
+    msgs = [m for m in page.get("messages") or [] if isinstance(m, dict)]
+    newest = server_now(msgs) or 0.0
+    return {"ts": newest, "ids": [m.get("event_id") for m in msgs if _ts_seconds(m.get("ts")) == newest]}
+
+
 def _recover_ask(rec: dict, messages: List[dict], self_mxid: str, used=frozenset()) -> dict:
-    """A record whose post was not recorded gets its ask event (and root) back from this
-    agent's own message in the room: same sender, same thread, the exact text it posted, not
-    already some other record's ask. Identity, not interpretation: the text is compared whole."""
+    """A record whose post was not recorded gets its ask event (and root) back only when exactly
+    one message can be it: this agent's own, not bound to another record, posted after the room
+    boundary recorded before the send, in the expected thread (or a new root), with the exact
+    text it posted. No boundary, no match, or more than one: it stays unconfirmed."""
     if rec.get("ask_event"):
         return rec
-    for m in reversed(messages):  # oldest first
-        if (m.get("sender") == self_mxid and m.get("event_id") not in used
-                and _strip_mention(m.get("body") or "", rec.get("agent") or "") == rec.get("body")
-                and (m.get("thread_root") or None) == (rec.get("root") or None)):
-            return {**rec, "ask_event": m.get("event_id"), "root": rec.get("root") or m.get("event_id")}
-    return rec
+    bound = rec.get("boundary")
+    if not isinstance(bound, dict):
+        return rec
+    hits = [m for m in messages
+            if m.get("sender") == self_mxid and m.get("event_id") not in used
+            and m.get("event_id") not in (bound.get("ids") or [])
+            and (_ts_seconds(m.get("ts")) or 0.0) >= float(bound.get("ts") or 0.0)
+            and (m.get("thread_root") or None) == (rec.get("root") or None)
+            and _strip_mention(m.get("body") or "", rec.get("agent") or "") == rec.get("body")]
+    if len(hits) != 1:
+        return rec
+    event = hits[0].get("event_id")
+    return {**rec, "ask_event": event, "root": rec.get("root") or event}
 
 
 def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Optional[Path],
@@ -809,9 +842,16 @@ def _own_answer(messages: List[dict], self_mxid: str, ask_event: str) -> Optiona
     return None
 
 
-def _candidates(rec: dict, messages: List[dict]) -> List[dict]:
-    """Messages from the asked agent in the consult's thread after its ask, oldest first,
-    minus those this agent judged not final. `messages` is a read, newest first."""
+def _bind_path(workspace: Path, event: str) -> Path:
+    import hashlib
+    key = hashlib.sha256(str(event).encode("utf-8")).hexdigest()[:16]
+    return Path(workspace) / _STATE / "bound" / f"{key}.json"
+
+
+def _candidates(rec: dict, messages: List[dict], workspace: Optional[Path] = None) -> List[dict]:
+    """Messages from the asked agent in the consult's thread (or citing its ask) after its ask,
+    oldest first, minus events already bound (as an answer or as not final). `messages` is a
+    read, newest first."""
     ask = rec.get("ask_event")
     out = []
     for m in messages:
@@ -819,24 +859,28 @@ def _candidates(rec: dict, messages: List[dict]) -> List[dict]:
             break
         in_consult = m.get("thread_root") == rec.get("root") or m.get("in_reply_to") == ask
         if (m.get("sender") == rec.get("agent") and in_consult
-                and m.get("event_id") not in (rec.get("skipped") or [])):
+                and not (workspace and _bind_path(workspace, m.get("event_id")).exists())):
             out.append(m)
     return list(reversed(out))
 
 
 def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Path],
-                task_id: Optional[str] = None, event_id: Optional[str] = None, not_final: bool = False,
-                expire_after_s: float = DEFAULT_EXPIRE_AFTER_S, now: Optional[float] = None) -> dict:
-    """Bind a message to the pending consult it answers: a message from the asked agent, in that
-    consult's thread, after its ask; the first such message this agent has not judged not final.
-    The message is named by the task it arrived as (`task_id`) or by its event (`event_id`).
-    `not_final` records that this agent read the message as progress (or as an onward ask),
-    so the next message from that agent becomes the candidate. Returns where the answer goes:
-    the owner (`lead`) or up the chain (`answer_up`)."""
+                task_id: Optional[str] = None, event_id: Optional[str] = None, final: bool = False,
+                not_final: bool = False, expire_after_s: float = DEFAULT_EXPIRE_AFTER_S,
+                now: Optional[float] = None) -> dict:
+    """Find the pending consult a message answers: a message from the asked agent, in that
+    consult's thread (or citing its ask), after its ask. The message is named by the task it
+    arrived as (`task_id`) or by its event (`event_id`). Two phases: with neither flag it only
+    returns the candidate (`candidate: true`) and changes nothing; the agent reads it, then
+    runs again with `final` (bind it and close the consult; returns where the answer goes) or
+    `not_final` (bind it as progress; the agent's next message becomes the candidate). A
+    message binds to at most one consult, once: the binding is a claim keyed by its event."""
     def no(reason, **extra):
         return {"matched": False, "reason": reason, **extra}
     if bool(task_id) == bool(event_id):
         return no("name exactly one of the message's task (--task-id) or its event (--event-id)")
+    if final and not_final:
+        return no("name at most one of --final and --not-final")
     event = event_id
     if task_id:
         got = live_task(task_id, workspace)
@@ -848,6 +892,12 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
         event = h.get("source_message_id")
         if not event:
             return no("task names no source message")
+    bind_path = _bind_path(workspace, event)
+    bound = _read_record(bind_path)
+    if bound is not None and bound.get("disposition") == "progress":
+        return no("this message was already judged not final", progress=True, cid=bound.get("cid"))
+    if bound is not None and _record_path(workspace, "answered", str(bound.get("cid"))).exists():
+        return _replay(workspace, bound["cid"], task_id, event, no)
     page = transport.read(room, READ_LIMIT)
     if not page.get("ok"):
         return no(f"consult room unreadable: {page.get('reason')}")
@@ -855,31 +905,43 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
     msg = next((m for m in messages if m.get("event_id") == event), None)
     if msg is None:
         return no(f"message not in the last {READ_LIMIT} messages of the consult room")
-    used = {r.get("ask_event") for st in ("pending", "answered") for r in records(workspace, st)} - {None}
-    open_recs = []
-    for r in records(workspace, "pending"):
-        r = _recover_ask(r, messages, self_mxid, used)
-        if r.get("ask_event") and r.get("room") == room and r.get("agent") == msg.get("sender"):
-            open_recs.append(r)
-    owners = [r for r in open_recs if any(c.get("event_id") == event for c in _candidates(r, messages))]
-    if not owners:
-        for st in ("answered",):
-            for r in records(workspace, st):
-                if r.get("answer_event") == event:
-                    return _replay(workspace, r["cid"], task_id, event, no)
-        return no("not an answer to a pending consult of this agent (wrong sender, another thread, "
-                  "before the ask, or already judged not final)")
-    cited = [r for r in owners if r.get("ask_event") == msg.get("in_reply_to")]
-    rec = (cited or sorted(owners, key=lambda r: r.get("asked_at") or 0))[0]
+    if bound is not None:  # bound as this consult's answer before a crash: finish closing it
+        rec = _read_record(_record_path(workspace, "pending", str(bound.get("cid"))))
+        if rec is None:
+            return no(f"consult {bound.get('cid')} is already answered")
+    else:
+        used = {r.get("ask_event") for st in ("pending", "answered") for r in records(workspace, st)} - {None}
+        open_recs = []
+        for r in records(workspace, "pending"):
+            r = _recover_ask(r, messages, self_mxid, used)
+            if r.get("ask_event") and r.get("room") == room and r.get("agent") == msg.get("sender"):
+                open_recs.append(r)
+        owners = [r for r in open_recs
+                  if any(c.get("event_id") == event for c in _candidates(r, messages, workspace))]
+        if not owners:
+            return no("not an answer to a pending consult of this agent (wrong sender, another thread, "
+                      "or before the ask)")
+        cited = [r for r in owners if r.get("ask_event") == msg.get("in_reply_to")]
+        rec = (cited or sorted(owners, key=lambda r: r.get("asked_at") or 0))[0]
     cid = rec["cid"]
     if _age(rec, time.time() if now is None else now) > expire_after_s:
         return no(f"consult {cid} expired; tell the owner it was not answered in time")
+    text = _strip_mention(msg.get("body") or "", self_mxid)
+    if not final and not not_final:
+        return {"matched": False, "candidate": True, "agent": rec["agent"], "cid": cid, "reply_text": text,
+                "event_id": event, "reason": "read it, then run again with --final (the answer) "
+                                              "or --not-final (progress, or an onward ask)"}
+    if bound is None:
+        try:
+            fresh = _claim_file(bind_path, {"event": event, "cid": cid,
+                                            "disposition": "answer" if final else "progress", "at": time.time()})
+        except OSError as e:
+            return no(f"message could not be bound: {e}")
+        if not fresh:
+            return no("this message was bound by another match just now; run it again")
     if not_final:
-        rec["skipped"] = [*(rec.get("skipped") or []), event]
-        _write_record(_record_path(workspace, "pending", cid), rec)
         return no("recorded as not final; the asked agent's next message in the thread is the candidate",
                   progress=True, cid=cid)
-    text = _strip_mention(msg.get("body") or "", self_mxid)
     out = {"matched": True, "agent": rec["agent"], "cid": cid, "reply_text": text, "event_id": event,
            "root": rec["root"], "question": rec.get("body") or "", "reason": None}
     if rec.get("via"):
@@ -940,7 +1002,7 @@ def waiting_answers(transport, room: str, workspace: Path) -> dict:
     out = {}
     for r in records(workspace, "pending"):
         if r.get("ask_event") and r.get("room") == room:
-            cands = _candidates(r, messages)
+            cands = _candidates(r, messages, workspace)
             if cands:
                 out[r["cid"]] = {"event_id": cands[0].get("event_id"), "text": cands[0].get("body") or ""}
     return out
