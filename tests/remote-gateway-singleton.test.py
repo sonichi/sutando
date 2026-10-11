@@ -158,6 +158,31 @@ class SingletonGlueTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 0)
         self.assertEqual(lines, ["[remote-gateway-bridge] received SIGINT — exiting"])
 
+    def test_signal_exit_survives_a_closed_stdout_fd(self):
+        # Both stdout sinks refuse (stream re-entry, then the raw fd): the file
+        # line is still written and the exit is still 0.
+        class Reentrant:
+            def write(self, _data):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter>")
+
+            def flush(self):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter>")
+
+        class NoFd:
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+            @staticmethod
+            def write(_fd, _data):
+                raise OSError(9, "Bad file descriptor")
+        lines = self._with_signal_sinks(Reentrant())
+        rgb.os = NoFd()
+        self.addCleanup(setattr, rgb, "os", os)
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_on_signal(signal.SIGTERM, None)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(lines, ["[remote-gateway-bridge] received SIGTERM — exiting"])
+
     def test_signal_exit_survives_a_failing_log(self):
         def boom(_line):
             raise OSError("disk gone")
