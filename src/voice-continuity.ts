@@ -67,18 +67,18 @@ export function clearStaleResumptionHandle(session: unknown): boolean {
 export interface ConversationClearHelper {
   /** The turn.end logger's cursor into conversationContext.items. */
   cursor: { index: number };
-  /** Empty the items array IN PLACE (it is getter-backed — reassignment
-   *  throws) and rebase the cursor with it. Returns items cleared. */
+  /** Reset the conversation through bodhi and rebase the cursor with it. Returns items cleared. */
   clear(reason: string): number;
 }
 
 /**
  * The ONE way to empty bodhi's conversationContext (used by end_session, the
  * goodbye detector, and the sessionEnding turn.end sweep). Items and cursor
- * move together, always.
+ * move together, always. `reset` is bodhi's resetConversationContext: it writes
+ * the items its history writer has not written yet, then clears items and checkpoint.
  */
 export function createConversationClearHelper(
-  getItems: () => unknown,
+  reset: (reason: string) => number,
   log: (line: string) => void = () => {},
 ): ConversationClearHelper {
   const cursor = { index: 0 };
@@ -87,11 +87,7 @@ export function createConversationClearHelper(
     clear(reason: string): number {
       let cleared = 0;
       try {
-        const items = getItems();
-        if (Array.isArray(items) && items.length > 0) {
-          cleared = items.length;
-          items.length = 0;
-        }
+        cleared = reset(reason);
       } catch (e) {
         log(`[clear-items] ${reason}: could not clear conversationContext: ${e}`);
       }
