@@ -365,27 +365,28 @@ def _model_family(value: Optional[str]) -> Optional[str]:
 
 def record_speaks_for_seat(quota: Any, env: SeatEnv, workspace) -> bool:
     """True only when the seat's model and the record's are both known and name
-    the same model, EXACTLY or by family. A record refreshed on another model
-    may say allowed while THIS seat's model is limited, and the proxy's headers
-    carry no per-model window to catch that (measured: status, 5h, 7d, overage
-    -- nothing per model), so unknown holds.
+    the same model, EXACTLY, or by family when the seat is a bare alias. A
+    record refreshed on another model may say allowed while THIS seat's model
+    is limited, and the proxy's headers carry no per-model window to catch
+    that (measured: status, 5h, 7d, overage -- nothing per model), so unknown
+    holds.
 
     A menu alias (`opus`, `sonnet[1m]`, ...) and the full id the proxy reports
     (`claude-opus-5-5`, `claude-sonnet-5`, ...) name the same model but are
     never string-equal, so the family match covers that pairing; `default`
     carries no family and so can only match a record from a literal `default`.
 
-    The family match is coarser than exact equality: an alias also matches a
-    record from an older pinned id of the same family (e.g. `opus` matches a
-    record refreshed on `claude-opus-4-1`), which could misreport a limit if
-    per-model windows ever differ within one family."""
+    The family match applies only when the SEAT is a bare alias, never between
+    two full ids: a seat pinned to `claude-opus-4-1` and a record refreshed on
+    `claude-opus-5-5` stays unknown, same as before this match existed, because
+    per-model windows may differ within one family and an alias is the only
+    name that cannot already identify its own exact pinned version."""
     mine, theirs = seat_model(env, workspace), record_model(quota)
     if mine is None or theirs is None:
         return False
     if mine == theirs:
         return True
-    family = _model_family(mine)
-    return family is not None and family == _model_family(theirs)
+    return mine in _FAMILY_PREFIX and mine == _model_family(theirs)
 
 
 # ---- refreshing a stale record on purpose ---------------------------------

@@ -780,6 +780,10 @@ class TestRecordSpeaksForSeatFamilyAware(RecordFixture):
         self.assertFalse(self._speaks("not-a-model", "claude-opus-5-5"))
         self.assertFalse(self._speaks("claude-opus-5-5", "not-a-model"))
 
+    def test_two_different_full_ids_of_the_same_family_never_match(self):
+        self.assertFalse(self._speaks("claude-opus-4-1", "claude-opus-5-5"))
+        self.assertFalse(self._speaks("claude-sonnet-4-5[1m]", "claude-sonnet-5"))
+
     def test_model_family_is_none_for_every_falsy_value(self):
         # record_speaks_for_seat never passes a falsy value through; checked here directly.
         for falsy in (None, ""):
