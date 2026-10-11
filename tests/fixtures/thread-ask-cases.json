@@ -1,5 +1,5 @@
 {
- "_doc": "One table for every implementation of the bare [thread] / skip-after-leading grammar: src/result_markers.py, the vendored copy, neutralize_markers, and src/skip_marker_ownership.ts (stripVoiceControlLines, bodyIsSkipMarked).",
+ "_doc": "One table for every implementation of the bare [thread] / skip-after-leading grammar: src/result_markers.py, the vendored copy, neutralize_markers, and src/skip_marker_ownership.ts (stripVoiceControlLines, bodyIsSkipMarked). skip is parse_markers(body); delivery_skip (default: skip) is parse_markers(body, skip_after_channel=True), the verdict of the gateway and voice.",
  "cases": [
   {
    "body": "[thread]\nbody",
@@ -173,6 +173,7 @@
    "body": "[channel: !r:s]\n[no-send]\nx",
    "thread_ask": false,
    "skip": false,
+   "delivery_skip": true,
    "voice": "[channel: !r:s]\n[no-send]\nx",
    "neutralize_quotes_thread": false
   },

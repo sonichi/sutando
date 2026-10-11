@@ -159,6 +159,13 @@ for lead in ("[thread]", f"[thread: {ROOT}]", "[dm-only]", "[reply: 123456789012
 # after [channel:] it stays text: the team guard withholds redirect-plus-skip for owner review
 a, body = acts(f"[channel: {ROOM}]\n[no-send]\nvisible")
 check("[channel:] then [no-send] is not turned into a skip", ("redirect", ROOM) in a and body.startswith("[no-send]"), f"{a} {body!r}")
+# a delivery consumer reads the guarded body: there a skip after [channel:] is a skip
+for marker, reason in (("[no-send]", "no-send"), ("[REPLIED]", "REPLIED"), ("[deduped: task-9]", "deduped")):
+    for label, parse in (("src", parse_markers), ("vendored", mod.parse_markers)):
+        res = parse(f"[channel: {ROOM}]\n{marker}\nvisible", skip_after_channel=True)
+        got = [(x.kind, x.value) for x in res.actions]
+        check(f"{label}: delivery verdict, [channel:] then {marker} is a skip",
+              got == [("skip", reason)] and res.body == "", f"{got} {res.body!r}")
 a, body = acts("[thread]\nsee [no-send] below")
 check("a skip word inside prose is not a skip", ("thread-ask", "") in a and "[no-send]" in body, f"{a} {body!r}")
 # 12. the shared table (tests/fixtures/thread-ask-cases.json), also run by the TS suite
@@ -173,6 +180,9 @@ for case in _json.loads((REPO / "tests" / "fixtures" / "thread-ask-cases.json").
         else:
             check(f"table {label}: {text!r} thread-ask={case['thread_ask']}",
                   (("thread-ask", "") in a) is case["thread_ask"] and not any(k == "skip" for k, _ in a), f"{a} {body!r}")
+        delivery = [x.kind for x in parse(text, skip_after_channel=True).actions]
+        check(f"table {label}: {text!r} delivery skip={case.get('delivery_skip', case['skip'])}",
+              (delivery == ["skip"]) is case.get("delivery_skip", case["skip"]), f"{delivery}")
         out = neutral(text)
         check(f"table {label}: neutralize {text!r} quotes [thread]={case['neutralize_quotes_thread']}",
               ("[ thread]" in out) is case["neutralize_quotes_thread"]

@@ -311,7 +311,7 @@ i = src.find(anchor)
 check(i != -1, "the drain anchor is still present in remote_gateway_bridge.py")
 if i != -1:
     drain = src[i:]
-    gi, pi = drain.find("_guarded_result_body"), drain.find("parse_markers(body)")
+    gi, pi = drain.find("_guarded_result_body"), drain.find("parse_markers(body")
     check(gi != -1 and pi != -1 and gi < pi,
           "in the drain, _guarded_result_body precedes parse_markers")
 

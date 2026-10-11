@@ -3812,7 +3812,7 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
                          _proactive_thread_root and posts in that thread
       * bare [thread]  → task results only; stripped and ignored here
     """
-    parsed = parse_markers(body)
+    parsed = parse_markers(body, skip_after_channel=True)
     if any(a.kind == "skip" for a in parsed.actions):
         return ("drop", None, "")
     redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
@@ -4608,7 +4608,7 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
     if body is None:
         _log(f"result {tid}: {why}; the result guard is unavailable ({withheld}), left for the next pass")
         return
-    parsed = parse_markers(body)
+    parsed = parse_markers(body, skip_after_channel=True)
     actions = parsed.actions
     skip = next((a for a in actions if a.kind == "skip"), None)
     if skip is not None:
@@ -4835,9 +4835,9 @@ def _post_ready_results(inflight: set[str]) -> None:
             continue
         if _withheld:
             _log(f"withheld non-owner result for {tid}: {_withheld}")
-        # Route marker decisions through the unified parser (#873) like the
-        # other bridges — no hand-rolled startswith checks.
-        parsed = parse_markers(body)
+        # Route marker decisions through the unified parser (#873); the guard has run,
+        # so a skip after [channel:] is a skip here, not text posted into that room.
+        parsed = parse_markers(body, skip_after_channel=True)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
         # Every dedup marker routes through the shared plan, malformed included:
         # it owns the reject-and-report policy (dedup_recovery.plan_dedup_recovery).
@@ -5184,7 +5184,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         if _withheld:
             _log(f"orphan sweep: withheld non-owner result for {tid}: {_withheld}")
-        parsed = parse_markers(body)
+        parsed = parse_markers(body, skip_after_channel=True)
         if [a for a in parsed.actions if a.kind == "attach"]:
             # Delivering without the files would silently drop them — park
             # for a human instead of composing a partial delivery.
