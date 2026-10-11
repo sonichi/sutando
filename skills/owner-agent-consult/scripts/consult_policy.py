@@ -285,6 +285,53 @@ def records(workspace: Path, state: str) -> List[dict]:
     return [r for r in out if r and _CID.match(str(r.get("cid") or ""))]
 
 
+def reconcile_task(transport, room: str, self_mxid: str, task_id: str, workspace: Path) -> Optional[str]:
+    """Fill in the ask event and root of every record of this owner task whose post was not
+    confirmed (a failed write, a crash after the post, or a receipt with no event id), from this
+    agent's own ask in the room, found by consult id. Returns a refusal naming any record that
+    still cannot be resolved: no new root is posted while an earlier ask may already be one."""
+    loose = [(st, r) for st in ("pending", "answered") for r in records(workspace, st)
+             if r.get("task_id") == task_id and not (r.get("ask_event") and r.get("root"))]
+    claim = _read_record(_root_claim(workspace, task_id))
+    if not loose and not claim:
+        return None
+    page = transport.read(room, READ_LIMIT)
+    messages = [m for m in page.get("messages") or [] if isinstance(m, dict)] if page.get("ok") else []
+    unresolved = []
+    for st, r in loose:
+        fixed = _recover_ask(r, messages, self_mxid)
+        if not fixed.get("ask_event"):
+            unresolved.append(r["cid"])
+            continue
+        try:
+            _write_record(_record_path(workspace, st, r["cid"]), fixed)
+        except OSError:
+            unresolved.append(r["cid"])
+    if claim and not prior_ask(workspace, "task_id", task_id) and claim.get("cid") not in unresolved:
+        unresolved.append(claim.get("cid") or "?")
+    if unresolved:
+        return (f"an earlier ask from this task is unconfirmed ({', '.join(unresolved)}): it may already "
+                "be in the room, so no new thread is started; check `pending` and the consult room")
+    return None
+
+
+def _root_claim(workspace: Path, task_id: str) -> Path:
+    return Path(workspace) / _STATE / "roots" / f"{task_id}.json"
+
+
+def claim_root(workspace: Path, task_id: str, cid: str) -> bool:
+    """The one durable claim that this task's thread root is `cid`'s ask; False when taken."""
+    path = _root_claim(workspace, task_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"cid": cid, "task_id": task_id, "asked_at": time.time()}, fh)
+    return True
+
+
 def prior_ask(workspace: Path, key: str, value: str) -> Optional[dict]:
     """The first earlier posted ask whose `key` (task_id, or via_task) is `value`."""
     same = [r for state in ("pending", "answered") for r in records(workspace, state)
@@ -308,6 +355,11 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
     told, `expired` past the expiry (match then refuses). Prunes answered and nudge records
     older than the expiry, and an expired consult once the owner has been told."""
     now = time.time() if now is None else now
+    roots = Path(workspace) / _STATE / "roots"
+    for f in sorted(roots.glob("*.json")) if roots.is_dir() else []:
+        claim = _read_record(f) or {}
+        if _age(claim, now) > expire_after_s:
+            f.unlink(missing_ok=True)
     for state in ("answered", "nudged"):
         for r in records(workspace, state):
             orphan = state == "nudged" and not _record_path(workspace, "pending", r["cid"]).exists()
@@ -512,8 +564,26 @@ def loop_check(asks: List[dict], self_mxid: str, target: str) -> Optional[str]:
     return None
 
 
+def _admission(root_msg: dict, marker: dict, msg: dict, asks: List[dict], event: str,
+               max_duration_s: int, max_asks: int) -> Optional[str]:
+    """Why this ask was not admitted by the thread's limits when it was posted, or None: its own
+    server timestamp must fall inside the root's window and its place among the thread's asks,
+    in timeline order, within the ask limit. An ask admitted in time can still be answered
+    after the deadline, so a chain can unwind."""
+    limits = effective_limits(root_msg, marker, max_duration_s, max_asks)
+    posted = _ts_seconds(msg.get("ts"))
+    if limits is None or posted is None:
+        return "no server timestamp on the root or the ask"
+    order = [a["event_id"] for a in asks]
+    if event not in order:
+        return "the ask is not in its thread"
+    reason = limit_reached(limits, order.index(event), posted)
+    return reason.replace("consult limit reached: ", "") if reason else None
+
+
 def incoming_ask(transport, room: str, self_mxid: str, task_id: str,
-                 workspace: Optional[Path], owner_agents) -> dict:
+                 workspace: Optional[Path], owner_agents,
+                 max_duration_s: int = DEFAULT_MAX_DURATION_S, max_asks: int = DEFAULT_MAX_ASKS) -> dict:
     """The consult ask a live verified task delivered to this agent, traced through the
     thread to a root ask posted by the chain's first agent (one of the owner's agents; whether
     its owner-task gate ran cannot be checked from here). Refuses anything whose chain the
@@ -560,6 +630,10 @@ def incoming_ask(transport, room: str, self_mxid: str, task_id: str,
         if tuple(ask["chain"][:k]) not in chains:
             return no(f"the thread shows no ask for {' > '.join(ask['chain'][:k])}; "
                       "the chain does not trace to the root ask")
+    admitted = _admission(view["root_msg"], first["limits"], msg, asks, event, max_duration_s, max_asks)
+    if admitted:
+        return no(f"this ask was posted outside the thread's limits ({admitted}); "
+                  "it is not answered or consulted from")
     return {"ok": True, "cid": ask["cid"], "root": root, "chain": ask["chain"], "asker": sender,
             "ask_event": event, "original_question": ask["original_question"] or first["original_question"],
             "asks": asks, "limits": first["limits"], "root_msg": view["root_msg"],
@@ -603,6 +677,9 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
             and gate["sender"] != verdict["owner"]:
         return no("an owner task from the consult room must be the owner's own message")
     if task_id:
+        refusal = reconcile_task(transport, room, self_mxid, task_id, workspace)
+        if refusal:
+            return no(refusal)
         prior = prior_ask(workspace, "task_id", task_id)
         root = prior["root"] if prior else None
         chain = [self_mxid, agent]
@@ -621,7 +698,7 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
             limits = effective_limits(view["root_msg"], marker, max_duration_s, max_asks)
     else:
         inc = incoming_ask(transport, room, self_mxid, via_task, workspace,
-                           verdict["owner_agents"] | {self_mxid})
+                           verdict["owner_agents"] | {self_mxid}, max_duration_s, max_asks)
         if not inc["ok"]:
             return no(inc["reason"])
         root, asks, original = inc["root"], inc["asks"], inc["original_question"]
@@ -645,6 +722,13 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
         return no("correlation id already used")
     follow_up = any(a["chain"][-2:] == [self_mxid, agent] for a in asks)
     path = _record_path(workspace, "pending", cid)
+    new_root = bool(task_id) and not root
+    if new_root and not claim_root(workspace, task_id, cid):
+        return no("another ask from this task already holds its thread root; retry after it is posted")
+
+    def release():
+        if new_root:
+            _root_claim(workspace, task_id).unlink(missing_ok=True)
     record = {"cid": cid, "task_id": task_id, "via_task": via_task, "via": via, "agent": agent,
               "room": room, "root": root, "chain": chain, "ask_event": None, "asked_at": clock(),
               "origin": origin, "question": question.strip()[:500], "original_question": original[:500],
@@ -652,14 +736,22 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
     try:
         _write_record(path, record)
     except OSError as e:
+        release()
         return no(f"pending record unwritable: {e}")
     reply_to = via["ask_event"] if via else None
     sent = transport.mention(agent, ask_body(question, cid, root, chain, original, limits), room,
                              reply_to=reply_to, thread_root=root)
-    event = sent.get("event_id") if sent.get("ok") else None
-    if not event:
+    if not sent.get("ok"):
         path.unlink(missing_ok=True)
-        return no(f"ask not posted: {sent.get('reason') or 'no event id'}")
+        release()
+        return no(f"ask not posted: {sent.get('reason') or 'refused'}")
+    event = sent.get("event_id")
+    if not event:
+        return {"asked": True, "unconfirmed": True, "agent": agent, "cid": cid, "ask_event": None,
+                "root": root, "chain": chain, "limits": limits, "follow_up": follow_up,
+                "warning": "the post may have landed but returned no event id; the record is kept "
+                           "and `match` or the next ask from this task reconciles it from the room",
+                "reason": None}
     record.update(ask_event=event, root=root or event)
     warning = None
     try:
@@ -698,7 +790,7 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
         inc = {"cid": via["cid"], "asker": via["asker"], "ask_event": via["ask_event"], "root": rec["root"]}
     else:
         inc = incoming_ask(transport, room, self_mxid, task_id, workspace,
-                           verdict["owner_agents"] | {self_mxid})
+                           verdict["owner_agents"] | {self_mxid}, max_duration_s, max_asks)
         if not inc["ok"]:
             return no(inc["reason"])
     sent = transport.mention(inc["asker"], f"{answer_tag(inc['cid'])}\n{text.strip()}", room,
@@ -757,10 +849,11 @@ def match_reply(transport, *, room: str, self_mxid: str, task_id: str,
             return no("this is a consult ask to you, not an answer; answer it or consult onward")
         return no("not a final answer (no answer line); treat it as progress", progress=True)
     cid, text = m.group(1), rest.strip()
+    if _record_path(workspace, "answered", cid).exists():
+        return _replay(workspace, cid, task_id, no)
     rec = _read_record(_record_path(workspace, "pending", cid))
-    if rec is None or _record_path(workspace, "answered", cid).exists():
-        state = "already answered" if _record_path(workspace, "answered", cid).exists() else "unknown"
-        return no(f"consult {cid} is {state}")
+    if rec is None:
+        return no(f"consult {cid} is unknown")
     if rec.get("room") != room:
         return no(f"consult {cid} was asked in {rec.get('room')}, not {room}")
     if _age(rec, time.time() if now is None else now) > expire_after_s:
@@ -777,29 +870,43 @@ def match_reply(transport, *, room: str, self_mxid: str, task_id: str,
         return no(f"answer in_reply_to is {rel}, not this consult's ask")
     if not text:
         return no("answer line carries no answer")
-    src = _record_path(workspace, "pending", cid)
-    dst = _record_path(workspace, "answered", cid)
-    try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        os.link(src, dst)  # the claim: link fails once answered/<cid> exists, whatever pending holds
-    except (FileNotFoundError, FileExistsError):
-        return no(f"consult {cid} is already answered")
-    except OSError as e:
-        return no(f"consult {cid} could not be closed: {e}")
-    src.unlink(missing_ok=True)
-    _record_path(workspace, "nudged", cid).unlink(missing_ok=True)
-    rec.update(answered_at=time.time(), answer_event=event, reply_task=task_id)
-    try:
-        _write_record(dst, rec)
-    except OSError:
-        pass
     out = {"matched": True, "agent": rec["agent"], "cid": cid, "reply_text": text, "event_id": event,
            "root": rec["root"], "chain": rec.get("chain") or [], "question": rec.get("question") or "",
            "reason": None}
     if rec.get("via"):
-        return {**out, "task_id": None, "answer_up": {**rec["via"], "root": rec["root"], "up": cid}}
-    origin = rec.get("origin") or {}
-    return {**out, "task_id": rec["task_id"], "origin": origin, "lead": reply_lead(origin)}
+        out = {**out, "task_id": None, "answer_up": {**rec["via"], "root": rec["root"], "up": cid}}
+    else:
+        origin = rec.get("origin") or {}
+        out = {**out, "task_id": rec["task_id"], "origin": origin, "lead": reply_lead(origin)}
+    src = _record_path(workspace, "pending", cid)
+    dst = _record_path(workspace, "answered", cid)
+    claim = {**rec, "answered_at": time.time(), "answer_event": event, "reply_task": task_id, "payload": out}
+    tmp = dst.with_name(f".{dst.name}.{secrets.token_hex(4)}")
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(claim, indent=2, sort_keys=True), encoding="utf-8")
+        os.link(tmp, dst)  # the claim carries the payload: once linked, a retry can replay it
+    except FileExistsError:
+        tmp.unlink(missing_ok=True)
+        return _replay(workspace, cid, task_id, no)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        return no(f"consult {cid} could not be closed: {e}")
+    tmp.unlink(missing_ok=True)
+    src.unlink(missing_ok=True)
+    _record_path(workspace, "nudged", cid).unlink(missing_ok=True)
+    return out
+
+
+def _replay(workspace: Path, cid: str, task_id: str, no) -> dict:
+    """A closed consult's stored payload, again, for the reply task that closed it while that
+    task has no result yet (its result file is the acknowledgement); anything else is closed."""
+    import local_task_protocol as ltp
+    rec = _read_record(_record_path(workspace, "answered", cid)) or {}
+    if (rec.get("reply_task") == task_id and isinstance(rec.get("payload"), dict)
+            and ltp.find_result(Path(workspace) / "results", task_id) is None):
+        return {**rec["payload"], "replay": True}
+    return no(f"consult {cid} is already answered")
 
 
 def reply_lead(origin: dict) -> str:

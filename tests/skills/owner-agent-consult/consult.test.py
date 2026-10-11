@@ -486,6 +486,7 @@ class TestMatchReply(unittest.TestCase):
                          (TID, SIB, CID, "host is up"))
         self.assertEqual(res["lead"], f"[channel: {OWNER_DM}]\n")
         self.assertEqual(pending_ids(self.ws), [])
+        (self.ws / "results" / "task-reply.txt").write_text("[no-send]")
         again = match(FakeTransport(replies=[answer_msg(in_reply_to="$ask")]), self.ws)
         self.assertFalse(again["matched"])
         self.assertIn("already answered", again["reason"])
@@ -589,9 +590,9 @@ class World:
         return policy.consult(self.tr[me], room=ROOM, self_mxid=me, agent=agent, question=question,
                               workspace=self.ws[me], task_id=task_id, via_task=via_task, cid=cid, **kw)
 
-    def answer(self, me, text, *, task_id=None, up=None):
+    def answer(self, me, text, *, task_id=None, up=None, **kw):
         return policy.answer(self.tr[me], room=ROOM, self_mxid=me, text=text, workspace=self.ws[me],
-                             task_id=task_id, up=up)
+                             task_id=task_id, up=up, **kw)
 
     def match(self, me, tid):
         return policy.match_reply(self.tr[me], room=ROOM, self_mxid=me, task_id=tid, workspace=self.ws[me])
@@ -814,7 +815,7 @@ class TestThreadAndAnswerEdges(unittest.TestCase):
         with mock.patch.object(policy, "_recover_ask", side_effect=lambda r, m, s: r):
             self.assertIn("never confirmed", w.match(SELF, "task-a2")["reason"])
         rec_path.write_text(json.dumps(rec))
-        with mock.patch.object(policy.os, "link", side_effect=FileNotFoundError):
+        with mock.patch.object(policy.os, "link", side_effect=FileExistsError):
             self.assertIn("already answered", w.match(SELF, "task-a2")["reason"])
         with mock.patch.object(policy.os, "link", side_effect=PermissionError("ro")):
             self.assertIn("could not be closed", w.match(SELF, "task-a2")["reason"])
@@ -1232,6 +1233,149 @@ class TestWindowResiduals(unittest.TestCase):
 
     def test_residual_a_clock_120s_slow_delivered_at_t_plus_1801_is_allowed(self):
         self.assertTrue(self.onward(arrived_local=T0 + 1801 - 120, now_local=T0 + 1801 - 120)["asked"])
+
+
+class TestKeweiRoundNine(unittest.TestCase):
+    """Regressions for the 050d4b25c review: an incoming ask is admitted only within the thread's
+    limits; ask publication is one recoverable state (no lost correlation, no second root); and
+    a matched answer stays replayable for its reply task until that task has a result."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def hand_ask(self, cid, limits):
+        self.w.room.post(SELF, f"{SIB} — {policy.ask_line(cid, '$ask', [SELF, SIB], limits)}", thread_root="$ask")
+        return self.w.room.msgs[-1]["event_id"]
+
+    # 1: the thread cap is enforced on the ask being consumed
+    def test_asks_beyond_the_ask_limit_are_not_answered(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID, max_asks=1)
+        lim = {"since": int(time.time()), "max_s": 1800, "max_asks": 1}
+        results = []
+        for i in range(4):
+            ev = self.hand_ask(f"{i + 2:016x}", lim)
+            w.deliver(SIB, ev, f"task-b{i}")
+            results.append(w.answer(SIB, "x", task_id=f"task-b{i}", max_asks=1))
+        self.assertEqual([r["answered"] for r in results], [False] * 4)
+        self.assertIn("1 of 1 asks", results[0]["reason"])
+        self.assertEqual(len(w.room.msgs), 5)
+
+    def test_an_ask_posted_after_the_window_is_not_answered_but_one_inside_it_unwinds_late(self):
+        w = self.w
+        w.room.clock = lambda: T0
+        w.ask(SELF, SIB, cid=C1, task_id=TID, max_duration_s=60, now=lambda: T0)
+        w.room.clock = lambda: T0 + 61
+        ev = self.hand_ask(C2, {"since": int(T0), "max_s": 60, "max_asks": 10})
+        w.deliver(SIB, ev, "task-b1", at=T0 + 61)
+        late = w.answer(SIB, "x", task_id="task-b1", max_duration_s=60)
+        self.assertFalse(late["answered"])
+        self.assertIn("60s window has passed", late["reason"])
+        w.deliver(SIB, "$ask", "task-b0", at=T0)
+        self.assertTrue(w.answer(SIB, "the root ask, answered after the deadline", task_id="task-b0",
+                                 max_duration_s=60)["answered"])
+
+    def test_an_onward_ask_from_an_over_limit_ask_is_refused(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID, max_asks=1)
+        ev = self.hand_ask(C2, {"since": int(time.time()), "max_s": 1800, "max_asks": 1})
+        w.deliver(SIB, ev, "task-b1")
+        self.assertIn("outside the thread's limits", w.ask(SIB, THIRD, cid=C3, via_task="task-b1")["reason"])
+
+    # 2: ask publication is one recoverable state
+    def test_a_failed_final_write_does_not_start_a_second_thread(self):
+        w, real, n = self.w, policy._write_record, {"i": 0}
+
+        def second_fails(path, rec):
+            n["i"] += 1
+            if n["i"] == 2:
+                raise OSError("disk full")
+            return real(path, rec)
+        with mock.patch.object(policy, "_write_record", side_effect=second_fails):
+            self.assertTrue(w.ask(SELF, SIB, cid=C1, task_id=TID)["asked"])
+        again = w.ask(SELF, SIB, cid=C2, task_id=TID)
+        self.assertEqual((again["asked"], again["root"], again["follow_up"]), (True, "$ask", True), again)
+        self.assertEqual(w.tr[SELF].thread_roots, [None, "$ask"])
+
+    def test_a_crash_between_post_and_record_does_not_start_a_second_thread(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        path = w.ws[SELF] / policy._STATE / "pending" / f"{C1}.json"
+        path.write_text(json.dumps({**json.loads(path.read_text()), "ask_event": None, "root": None}))
+        again = w.ask(SELF, SIB, cid=C2, task_id=TID)
+        self.assertEqual((again["root"], again["follow_up"]), ("$ask", True), again)
+        self.assertEqual(json.loads(path.read_text())["ask_event"], "$ask")
+
+    def test_an_unconfirmed_post_keeps_its_record_and_its_reply_matches(self):
+        w = self.w
+        tr = w.tr[SELF]
+        real = tr.mention
+        tr.mention = lambda *a, **k: (real(*a, **k), {"ok": True, "event_id": None})[1]
+        res = w.ask(SELF, SIB, cid=C1, task_id=TID)
+        self.assertEqual((res["asked"], res["unconfirmed"]), (True, True))
+        self.assertEqual(pending_ids(w.ws[SELF]), [C1])
+        w.tr[SIB].mention(SELF, final(C1, "up"), ROOM, reply_to="$ask", thread_root="$ask")
+        w.deliver(SELF, "$ask2", "task-a2")
+        self.assertTrue(w.match(SELF, "task-a2")["matched"])
+
+    def test_an_unconfirmed_post_that_never_landed_refuses_a_new_root(self):
+        w = self.w
+        w.tr[SELF].mention = lambda *a, **k: {"ok": True, "event_id": None}
+        self.assertTrue(w.ask(SELF, SIB, cid=C1, task_id=TID)["unconfirmed"])
+        w.tr[SELF].mention = FakeTransport.mention.__get__(w.tr[SELF])
+        res = w.ask(SELF, SIB, cid=C2, task_id=TID)
+        self.assertFalse(res["asked"])
+        self.assertIn("unconfirmed", res["reason"])
+        self.assertEqual(w.room.msgs, [])
+
+    def test_only_one_ask_from_a_task_can_claim_its_root(self):
+        self.assertTrue(policy.claim_root(self.w.ws[SELF], TID, C1))
+        self.assertFalse(policy.claim_root(self.w.ws[SELF], TID, C2))
+        with mock.patch.object(policy, "reconcile_task", return_value=None):  # a racing ask read first
+            res = self.w.ask(SELF, SIB, cid=C2, task_id=TID)
+        self.assertIn("already holds its thread root", res["reason"])
+        self.assertFalse(res["asked"])
+        self.assertEqual(self.w.room.msgs, [])
+
+    def test_a_refused_post_releases_the_root_claim(self):
+        w = self.w
+        w.tr[SELF].mention = lambda *a, **k: {"ok": False, "reason": "gate denied"}
+        self.assertFalse(w.ask(SELF, SIB, cid=C1, task_id=TID)["asked"])
+        w.tr[SELF].mention = FakeTransport.mention.__get__(w.tr[SELF])
+        self.assertTrue(w.ask(SELF, SIB, cid=C2, task_id=TID)["asked"])
+
+    def test_old_root_claims_are_pruned(self):
+        policy.claim_root(self.w.ws[SELF], TID, C1)
+        policy.pending(self.w.ws[SELF], 600, now=time.time() + 10 * 86400)
+        self.assertFalse(policy._root_claim(self.w.ws[SELF], TID).exists())
+
+    # 3: a matched answer is replayable until its reply task has a result
+    def test_a_crash_after_the_claim_replays_the_answer_to_the_same_reply_task(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.tr[SIB].mention(SELF, final(C1, "up"), ROOM, reply_to="$ask", thread_root="$ask")
+        w.deliver(SELF, "$ask2", "task-a2")
+        w.deliver(SELF, "$ask2", "task-a3")
+        real_link = os.link
+
+        class Crash(Exception):
+            pass
+
+        def link_then_crash(src, dst):
+            real_link(src, dst)
+            raise Crash()
+        with mock.patch.object(policy.os, "link", side_effect=link_then_crash), self.assertRaises(Crash):
+            w.match(SELF, "task-a2")
+        again = w.match(SELF, "task-a2")
+        self.assertEqual((again["matched"], again.get("replay"), again["reply_text"], again["task_id"]),
+                         (True, True, "up", TID), again)
+        self.assertIn("already answered", w.match(SELF, "task-a3")["reason"])
+        (w.ws[SELF] / "results" / "task-a2.txt").write_text("[no-send]")
+        self.assertIn("already answered", w.match(SELF, "task-a2")["reason"])
 
 
 class TestRecordEdges(unittest.TestCase):
