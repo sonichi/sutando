@@ -319,7 +319,18 @@ class FailurePaths(unittest.TestCase):
                patch.object(self.mod.subprocess, "run", side_effect=fake_run),
                patch("sys.argv", ["notify_reviewers.py"] + argv)]
         if record_effect:
-            ctx.append(patch.object(self.mod, "record_asks", side_effect=record_effect))
+            def _rec(*a, **k):
+                # The reservation must succeed or nothing is delivered and this
+                # case is vacuous. Settlements carry `detail`; the claim does not.
+                if "detail" not in k:
+                    return 1
+                # Siblings pass an exception OR a plain callable; honour both.
+                if isinstance(record_effect, BaseException) or (
+                        isinstance(record_effect, type)
+                        and issubclass(record_effect, BaseException)):
+                    raise record_effect
+                return record_effect(*a, **k)
+            ctx.append(patch.object(self.mod, "record_asks", side_effect=_rec))
         for c in ctx:
             c.start()
         try:

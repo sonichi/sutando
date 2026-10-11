@@ -127,18 +127,28 @@ NUMERIC_ROUTE_FIELDS = frozenset(f for g in dict(ROUTE_FIELDS)["discord"]
                                  for f in g)
 
 
-def _names_route(field, value) -> bool:
-    """Whether a routing FIELD names a route, by `declared`'s rule — not a
-    second spelling of it.
+def route_value(field, value):
+    """The value a routing FIELD actually delivers on, or None when it names
+    no route (kewei-red-ag2space, PR #3509 review: classification and the
+    value a caller sends on were two separate reads of the same field, and
+    a malformed value -- a list, a dict, `True` -- could pass one and reach
+    the other). Text that states nothing states no route, so a blank, a
+    list and a dict all fail here rather than reaching a consumer that
+    assumes a string. `false` and `0` are still how a row says "no route";
+    only an id field may be numeric, and a `bool` is never that numeric id
+    even though it subclasses `int`."""
+    text = declared(value)
+    if text:
+        return text
+    if (field in NUMERIC_ROUTE_FIELDS and isinstance(value, int)
+            and not isinstance(value, bool) and value):
+        return value
+    return None
 
-    Text that states nothing states no route, so a blank, a list and a dict all
-    fail here rather than reaching a consumer that assumes a string. `false` and
-    `0` are still how a row says "no route"; only an id field may be numeric.
-    """
-    if declared(value):
-        return True
-    return (field in NUMERIC_ROUTE_FIELDS and isinstance(value, int)
-            and not isinstance(value, bool) and bool(value))
+
+def _names_route(field, value) -> bool:
+    """Whether a routing FIELD names a route -- see `route_value`."""
+    return route_value(field, value) is not None
 
 
 def routing_fields(kinds=None) -> "tuple[str, ...]":
