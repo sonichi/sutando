@@ -979,12 +979,101 @@ class TestExpiryAndPending(WorldCase):
         self.assertIn("no pending", policy.mark_nudged(self.w.ws[SELF], C1)["reason"])
         self.assertIn("no answered", policy.mark_relayed(self.w.ws[SELF], C1)["reason"])
 
-    def test_old_answered_and_orphan_nudge_records_are_pruned(self):
+    def test_old_orphan_nudge_records_are_pruned_and_answered_records_kept(self):
         old = time.time() - 9 * 86400
         policy._write_record(policy._record_path(self.w.ws[SELF], "answered", C1), {"cid": C1, "asked_at": old})
         policy._write_record(policy._record_path(self.w.ws[SELF], "nudged", C2), {"cid": C2, "asked_at": old})
         policy.pending(self.w.ws[SELF], 600)
-        self.assertEqual(policy.records(self.w.ws[SELF], "answered") + policy.records(self.w.ws[SELF], "nudged"), [])
+        self.assertEqual([r["cid"] for r in policy.records(self.w.ws[SELF], "answered")], [C1])
+        self.assertEqual(policy.records(self.w.ws[SELF], "nudged"), [])
+
+
+class TestKeweiReview5484812051(WorldCase):
+    """Kewei's review at c4cde3488: marker isolation, terminal close, reply-only asks,
+    completed reply tasks, AG2 Space origins only, and the window's lower bound."""
+
+    def test_k1_reply_text_cannot_carry_result_markers(self):
+        sys.path.insert(0, str(REPO / "src"))
+        import result_markers as rm
+        self.w.ask(SELF, SIB, cid=C1)
+        bodies = ("[no-send]\nsecret", "[file: /tmp/private.txt]", "[send: /tmp/x]", "[attach: /tmp/y]",
+                  "[channel: !elsewhere:example.test]\nhi", "[thread: $other]\nhi", "[thread]\nhi",
+                  "[reply: 123456789012345678]\nhi", "[dm-only]", "[REPLIED]", "[deduped: task-9]")
+        for i, body in enumerate(bodies):
+            e = self.w.room.post(SIB, f"{SELF} — {body}", thread_root="$ask")
+            look = self.w.m(e)
+            parsed = rm.parse_markers(look.get("candidate") and f"[channel: {OWNER_DM}]\n" + look["reply_text"])
+            self.assertEqual([(a.kind, a.value) for a in parsed.actions], [("redirect", OWNER_DM)], body)
+            self.assertTrue(self.w.m(e, not_final=True)["progress"], body)
+        e = self.w.room.post(SIB, f"{SELF} — [no-send]\nsecret", thread_root="$ask")
+        got = self.w.m(e, final=True)
+        parsed = rm.parse_markers(got["lead"] + got["reply_text"])
+        self.assertEqual([a.kind for a in parsed.actions], ["redirect"])
+        self.assertIn("secret", parsed.body)
+
+    def test_k2_a_relayed_answer_stays_closed_after_expiry_pruning(self):
+        self.w.ask(SELF, SIB, cid=C1)
+        e = self.sib("up")
+        self.assertTrue(self.w.m(e, final=True)["matched"])
+        self.assertTrue(policy.mark_relayed(self.w.ws[SELF], C1)["ok"])
+        policy.pending(self.w.ws[SELF], 600, now=time.time() + 30 * 86400)
+        self.assertTrue(policy._read_record(policy._record_path(self.w.ws[SELF], "answered", C1))["relayed"])
+        again = self.w.m(e, final=True)
+        self.assertEqual((again["matched"], again.get("replay")), (False, None), again)
+        self.assertIn("already answered", again["reason"])
+
+    def test_k3_a_reply_only_message_is_not_an_ask(self):
+        self.w.ask(SELF, SIB, cid=C1)
+        ev = self.w.room.post(THIRD, f"{SIB} — and the other disk?", reply_to="$ask")
+        tid = self.w.deliver(SIB, ev, "task-reply-only")
+        res = self.w.answer(SIB, "x", task_id=tid)
+        self.assertEqual(res["answered"], False, res)
+        self.assertIn("replies to another", res["reason"])
+        self.assertEqual(self.w.tr[SIB].posted, [])
+
+    def test_k4_a_reply_task_with_a_result_binds_nothing_but_its_binding_still_finishes(self):
+        self.w.ask(SELF, SIB, cid=C1)
+        e = self.sib(f"{SELF} — up")
+        tid = self.w.deliver(SELF, e, "task-reply")
+        (self.w.ws[SELF] / "results" / f"{tid}.txt").write_text("done")
+        mr = lambda **kw: policy.match_reply(self.w.tr[SELF], room=ROOM, self_mxid=SELF,  # noqa: E731
+                                             workspace=self.w.ws[SELF], task_id=tid, **kw)
+        for kw in ({}, {"final": True}, {"not_final": True}):
+            self.assertIn("already has a result", mr(**kw)["reason"], kw)
+        self.assertFalse(bound_exists(self.w.ws[SELF], e))
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])
+        policy._claim_file(policy._key_path(self.w.ws[SELF], "bound", e),
+                           {"event": e, "cid": C1, "disposition": "answer", "reply_task": tid,
+                            "payload": {"matched": True, "cid": C1}, "record": {"cid": C1}})
+        self.assertTrue(mr(final=True)["matched"])
+
+    def test_k5_only_ag2space_owner_tasks_may_ask(self):
+        for source in ("slack", "discord", "telegram", None):
+            with tempfile.TemporaryDirectory() as tmp:
+                head = f"source: {source}\n" if source else ""
+                text = (f"id: {TID}\n{head}channel_id: C123\nreply_thread_ts: 1.2\nsource_message_id: m1\n"
+                        "access_tier: owner\ntask: is the build host up?\n")
+                ws = make_ws(tmp, text)
+                tr = FakeTransport()
+                res = run_consult(tr, ws)
+                self.assertEqual(res["asked"], False, source)
+                self.assertIn("is not supported", res["reason"])
+                self.assertEqual((tr.posted, pending_ids(ws)), ([], []))
+                self.assertFalse(policy._root_claim(ws, TID).exists())
+
+    def test_k6_a_reply_stamped_before_its_ask_is_outside_the_window(self):
+        self.w.room.clock = lambda: T0
+        self.w.ask(SELF, SIB, cid=C1)
+        self.w.room.clock = lambda: T0 - 3600
+        e = self.sib("up")
+        got = self.w.m(e, final=True)
+        self.assertIn("before the ask", got["reason"])
+        self.assertEqual(policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF])[C1]["refused"], got["reason"])
+        self.assertFalse(bound_exists(self.w.ws[SELF], e))
+        self.w.room.clock = lambda: T0
+        ok = self.sib("up, same second")  # the early-stamped message cannot bind, so it holds nothing up
+        self.assertEqual(policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF])[C1], {"event_id": ok, "text": "up, same second"})
+        self.assertTrue(self.w.m(ok, final=True)["matched"])
 
 
 class TestReplayUntilRelayed(WorldCase):

@@ -320,11 +320,9 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
     any live task holding a root claim with no record (`claim_only`). Claims are never pruned;
     an expired record is pruned once the owner has been told and its task can no longer post."""
     now = time.time() if now is None else now
-    for state in ("answered", "nudged"):
-        for r in records(workspace, state):
-            orphan = state == "nudged" and not _record_path(workspace, "pending", r["cid"]).exists()
-            if (state == "answered" or orphan) and _age(r, now) > expire_after_s:
-                _record_path(workspace, state, r["cid"]).unlink(missing_ok=True)
+    for r in records(workspace, "nudged"):  # answered/ is terminal and never pruned
+        if not _record_path(workspace, "pending", r["cid"]).exists() and _age(r, now) > expire_after_s:
+            _record_path(workspace, "nudged", r["cid"]).unlink(missing_ok=True)
     out, listed = [], set()
     for r in sorted(records(workspace, "pending"), key=lambda r: r.get("asked_at") or 0):
         if _record_path(workspace, "answered", r["cid"]).exists():
@@ -424,6 +422,9 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
     if not gate["ok"]:
         return no(gate["reason"])
     origin = gate["origin"]
+    if origin.get("source") != "ag2space":
+        return no(f"relaying back to {origin.get('source') or 'unknown'} conversations is not supported; "
+                  "answer without consulting")
     if not question or not question.strip():
         return no("empty question")
     verdict = guard(room, self_mxid, transport)
@@ -503,8 +504,9 @@ def incoming_ask(transport, room: str, self_mxid: str, task_id: str, workspace: 
         return no("the ask is not from another of the owner's agents")
     if leading_mention(msg.get("body") or "", self_mxid) is None:
         return no("the message is not addressed to this agent (its body must start with this agent's exact mxid)")
-    if msg.get("thread_root") not in (None, event):
-        return no("the message is inside a thread, not a consult ask (an ask roots its own thread)")
+    if msg.get("thread_root") not in (None, event) or msg.get("in_reply_to"):
+        return no("the message is inside a thread or replies to another, not a consult ask "
+                  "(an ask roots its own thread and replies to nothing)")
     return {"ok": True, "asker": sender, "ask_event": event, "reason": None}
 
 
@@ -588,6 +590,8 @@ def _window_refusal(rec: dict, msg: dict, messages: List[dict], max_duration_s: 
         return ("the ask or the message has no server timestamp in the last "
                 f"{READ_LIMIT} messages; cannot apply the answer window")
     window = min(int(rec.get("max_s") or max_duration_s), int(max_duration_s))
+    if msg_ts - ask_ts < 0:
+        return f"stamped {int(ask_ts - msg_ts)}s before the ask; outside the answer window"
     if msg_ts - ask_ts > window:
         return f"posted {int(msg_ts - ask_ts)}s after the ask, outside the {window}s answer window"
     return None
@@ -631,6 +635,9 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
     bound = _read_record(bind)
     if bound is not None:
         return _judged(workspace, bound, event, task_id, final, not_final, no)
+    import local_task_protocol as ltp
+    if task_id and ltp.find_result(Path(workspace) / "results", task_id) is not None:
+        return no("the reply task already has a result; a handled task does not bind a message")
     messages, err = _room_page(transport, room)
     if err:
         return no(err)
@@ -656,11 +663,13 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
     for m in messages:  # newest first: anything after `msg` here is older than it
         if m.get("event_id") == event:
             later = True
-        elif later and _in_consult(workspace, rec, m) and not _key_path(workspace, "bound", m.get("event_id")).exists():
+        elif later and _in_consult(workspace, rec, m) and not _key_path(workspace, "bound", m.get("event_id")).exists() \
+                and not _window_refusal(rec, m, messages, max_duration_s):  # one that cannot bind holds nothing up
             return no(f"an earlier message from {rec['agent']} in this consult, {m.get('event_id')}, is not "
                       "judged yet; judge it first", earlier=m.get("event_id"))
+    from result_markers import neutralize_markers
     text = leading_mention(msg.get("body") or "", self_mxid)
-    text = (msg.get("body") or "").strip() if text is None else text
+    text = neutralize_markers((msg.get("body") or "").strip() if text is None else text)
     if not final and not not_final:
         return {"matched": False, "candidate": True, "agent": rec["agent"], "cid": cid, "reply_text": text,
                 "event_id": event, "reason": "read it, then run again with --final (the answer) "
@@ -756,8 +765,9 @@ def waiting_answers(transport, room: str, workspace: Path, max_duration_s: int =
         cands = [m for m in reversed(messages) if _in_consult(workspace, r, m)
                  and not _key_path(workspace, "bound", m.get("event_id")).exists()]
         if cands:
-            row = {"event_id": cands[0].get("event_id"), "text": cands[0].get("body") or ""}
-            late = _window_refusal(r, cands[0], messages, max_duration_s)
+            first = next((m for m in cands if not _window_refusal(r, m, messages, max_duration_s)), cands[0])
+            row = {"event_id": first.get("event_id"), "text": first.get("body") or ""}
+            late = _window_refusal(r, first, messages, max_duration_s)
             out[r["cid"]] = {**row, "refused": late} if late else row
     return out
 
