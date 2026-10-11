@@ -235,6 +235,25 @@ class ArchivedOriginalTest(unittest.TestCase):
                     holder_delivery_state=lambda _h: "accepted"), ("honour", None))
                 self.assertFalse((sp.tasks / f"{NEW}.txt").exists())
 
+    def test_bridge_path_reads_the_archived_original(self):
+        """Discord/Slack/Telegram pass no holder_delivery_state."""
+        for holder_body, holder_user, expected in (("", "9001", "requeue"),
+                                                   ("the answer", "7777", "requeue"),
+                                                   ("the answer", "9001", "honour")):
+            with self.subTest(holder_body=holder_body, holder_user=holder_user), \
+                    tempfile.TemporaryDirectory() as td:
+                sp = _Space(td); sp.holder(holder_body)
+                arc = sp.tasks / "archive"; arc.mkdir()
+                (arc / f"{TID}.txt").write_text(
+                    f"id: {TID}\nsource: discord\nchannel_id: 4242\nuser_id: 9001\ntask: q\n")
+                (arc / f"{HOLDER}.txt").write_text(
+                    f"id: {HOLDER}\nsource: discord\nchannel_id: 4242\nuser_id: {holder_user}\n")
+                action, payload = plan_dedup_recovery(sp.results, sp.tasks, TID, HOLDER, "4242", NEW)
+                self.assertEqual(action, expected)
+                if expected == "requeue":
+                    self.assertEqual(payload, NEW)
+                    self.assertIn("task: q", (sp.tasks / f"{NEW}.txt").read_text())
+
 
 class CommitIdentityTest(unittest.TestCase):
     """Routing must be committed before the re-ask becomes visible."""
