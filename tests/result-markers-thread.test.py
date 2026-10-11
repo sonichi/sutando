@@ -170,6 +170,10 @@ a, body = acts("[thread]\nsee [no-send] below")
 check("a skip word inside prose is not a skip", ("thread-ask", "") in a and "[no-send]" in body, f"{a} {body!r}")
 # 12. the shared table (tests/fixtures/thread-ask-cases.json), also run by the TS suite
 import json as _json  # noqa: E402
+import policy.egress.result as _src_guard  # noqa: E402
+sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+from ag2_sparrow import team_result_guard as _vendored_guard  # noqa: E402
+guards = {"src": _src_guard, "vendored": _vendored_guard}
 for case in _json.loads((REPO / "tests" / "fixtures" / "thread-ask-cases.json").read_text())["cases"]:
     text = case["body"]
     for label, parse, neutral in (("src", parse_markers, neutralize_markers),
@@ -183,6 +187,11 @@ for case in _json.loads((REPO / "tests" / "fixtures" / "thread-ask-cases.json").
         delivery = [x.kind for x in parse(text, skip_after_channel=True).actions]
         check(f"table {label}: {text!r} delivery skip={case.get('delivery_skip', case['skip'])}",
               (delivery == ["skip"]) is case.get("delivery_skip", case["skip"]), f"{delivery}")
+        # The suppression journal classifies with the same flag the drain parses with.
+        for skip_after_channel, want in ((False, case["skip"]),
+                                         (True, case.get("delivery_skip", case["skip"]))):
+            check(f"table {label}: {text!r} journal suppression_only({skip_after_channel})={want}",
+                  guards[label].is_suppression_only(text, skip_after_channel=skip_after_channel) is want)
         out = neutral(text)
         check(f"table {label}: neutralize {text!r} quotes [thread]={case['neutralize_quotes_thread']}",
               ("[ thread]" in out) is case["neutralize_quotes_thread"]

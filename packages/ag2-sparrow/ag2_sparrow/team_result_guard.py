@@ -229,14 +229,15 @@ def scan_team_result(body: str, repo: Path, secret_filter=None,
     return body
 
 
-def is_suppression_only(body: str) -> bool:
+def is_suppression_only(body: str, skip_after_channel: bool = False) -> bool:
     """True when every marker the shared parser executes is suppressive.
 
     Classification, not validation: the guard does not inspect a dedup target,
     because the consumer that dereferences one already rejects an id it cannot
     look up safely. Deciding here would be a second, drifting copy of that rule.
+    skip_after_channel: the parse_markers flag of the delivery verdict to classify.
     """
-    actions = parse_markers(body or "").actions
+    actions = parse_markers(body or "", skip_after_channel=skip_after_channel).actions
     return bool(actions) and all(action.kind == "skip" for action in actions)
 
 
