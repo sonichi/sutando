@@ -20,9 +20,15 @@ This primitive gives the bridge/supervisor a role lock that closes both:
     crashed or hung holder cannot wedge the role forever (incident #1's
     ungraceful/orphan case).
 
-Liveness = **heartbeat freshness**, deliberately NOT pid-alive: the 83188 ghost
-was alive-but-stale, and a hung-but-running holder that stopped heartbeating
-should lose the lock. pid recycling would also make kill(0) unreliable.
+Liveness = **heartbeat freshness**: the 83188 ghost was alive-but-stale, and a
+hung-but-running holder that stopped heartbeating should lose the lock. A live
+pid is therefore never proof of ownership (pid recycling). One narrowing: a
+holder recorded on THIS host whose pid no longer exists cannot be polling, so it
+is reaped at once instead of blocking a successor for the whole stale window.
+A holder on another host is judged by heartbeat alone, and a holder that called
+`retain()` (it exits on purpose while still owning the role) ages out normally.
+Residual risk: no process start time is recorded, so a dead holder whose pid was
+already reused reads as alive and falls back to the heartbeat rule.
 
 Lock file: `<workspace>/state/locks/<role>.lock`
   {"role","pid","host","workspace","acquired_at","heartbeat_at","schema_version":1}
@@ -40,6 +46,7 @@ Python API (bridge/supervisor import this directly):
     if r.status == "deferred": ...defer/exit...
     heartbeat("gateway-bridge")          # call ~every 30s while holding
     release("gateway-bridge")            # on shutdown
+    retain("gateway-bridge")             # exiting but keep the role until stale
 
 CLI (bash consumers, e.g. supervisor):
     workspace_lock.py acquire   --role R [--workspace W] [--stale-seconds N]
@@ -160,6 +167,22 @@ def _is_fresh(holder: dict, stale_seconds: int) -> bool:
     return (_now() - hb) < stale_seconds
 
 
+def _holder_is_dead(holder: dict, host: str) -> bool:
+    """True only for a non-retained holder on THIS host whose pid is gone."""
+    if os.name == "nt" or holder.get("host") != host or holder.get("retained"):
+        return False  # os.kill(pid, 0) terminates the process on Windows
+    pid = holder.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:  # EPERM: the pid exists under another uid
+        return False
+    return False
+
+
 def _write_atomic(path: Path, data: dict) -> None:
     tmp = path.with_suffix(f".lock.tmp.{os.getpid()}")
     tmp.write_text(json.dumps(data))
@@ -184,9 +207,9 @@ def acquire(role: str, workspace: Path | str | None = None,
             data["acquired_at"] = holder.get("acquired_at", data["acquired_at"])
             _write_atomic(path, data)
             return LockResult("acquired")
-        if _is_fresh(holder, stale_seconds):
+        if _is_fresh(holder, stale_seconds) and not _holder_is_dead(holder, data["host"]):
             return LockResult("deferred", holder=holder)
-        # stale / orphaned holder → reap and take it (atomically, under guard)
+        # stale, or a dead same-host holder → reap and take it (atomically, under guard)
         _write_atomic(path, data)
         return LockResult("reaped")
 
@@ -217,6 +240,20 @@ def release(role: str, workspace: Path | str | None = None) -> None:
                 os.unlink(path)
             except FileNotFoundError:  # pragma: no cover - unlink race
                 pass
+
+
+def retain(role: str, workspace: Path | str | None = None) -> bool:
+    """Mark our lock to outlive this process: it then ages out by heartbeat
+    instead of being reaped as soon as our pid is gone. False if not ours."""
+    ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
+    path = _lock_path(ws, role)
+    with _guard(ws, role):
+        holder = _read(path)
+        if not holder or holder.get("pid") != os.getpid() or holder.get("host") != _host_label():
+            return False
+        holder["retained"] = True
+        _write_atomic(path, holder)
+        return True
 
 
 def read_holder(role: str, workspace: Path | str | None = None) -> dict | None:

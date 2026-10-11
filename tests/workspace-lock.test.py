@@ -4,8 +4,10 @@
 Covers acquire on absent / idempotent re-acquire / defer-on-fresh-holder /
 reap-on-stale-holder / corrupt-lock-reaped, heartbeat (holder vs not), release
 (only-if-ours), and a real-subprocess concurrency test asserting O_EXCL yields
-exactly one winner. Liveness is heartbeat-freshness (not pid-alive), so tests
-control it via heartbeat_at; the host label is pinned for determinism.
+exactly one winner. Liveness is heartbeat-freshness, narrowed by one pid rule:
+a same-host holder whose pid is gone is reaped at once. Tests that need a LIVE
+holder therefore plant a pid that is really running (_live_pid); the host label
+is pinned for determinism.
 """
 from __future__ import annotations
 
@@ -25,6 +27,24 @@ REPO = Path(__file__).parent.parent
 SCRIPT = REPO / "src" / "workspace_lock.py"
 HOST = "testhost"
 os.environ["SUTANDO_HOST_LABEL"] = HOST
+
+
+def _live_pid() -> int:
+    """A running process that is not us: the test runner's parent."""
+    return os.getppid()
+
+
+def _dead_pid() -> int:
+    """The pid of a child that has already exited and been reaped."""
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    if os.name == "nt":
+        return p.pid  # os.kill(pid, 0) would terminate a reuser on Windows
+    try:
+        os.kill(p.pid, 0)
+    except ProcessLookupError:
+        return p.pid
+    raise unittest.SkipTest(f"pid {p.pid} was reused before the test could plant it")
 
 
 def _load() -> types.ModuleType:
@@ -68,12 +88,80 @@ class LockTest(unittest.TestCase):
         self.assertEqual(self.mod.acquire("gw", self.ws).status, "acquired")
 
     def test_defer_on_fresh_holder(self):
-        self._plant("gw", pid=999999, hb_age_s=5)          # fresh
+        live = _live_pid()
+        self._plant("gw", pid=live, hb_age_s=5)            # fresh + running
         r = self.mod.acquire("gw", self.ws)
         self.assertEqual(r.status, "deferred")
-        self.assertEqual(r.holder["pid"], 999999)
+        self.assertEqual(r.holder["pid"], live)
         # holder untouched
-        self.assertEqual(json.loads(self._lock_path().read_text())["pid"], 999999)
+        self.assertEqual(json.loads(self._lock_path().read_text())["pid"], live)
+
+    @unittest.skipIf(os.name == "nt", "no pid probe on Windows: heartbeat rule only")
+    def test_dead_same_host_holder_is_reaped_immediately(self):
+        self._plant("gw", pid=_dead_pid(), hb_age_s=1)     # fresh, but nobody behind it
+        r = self.mod.acquire("gw", self.ws)
+        self.assertEqual(r.status, "reaped")
+        self.assertEqual(json.loads(self._lock_path().read_text())["pid"], os.getpid())
+
+    def test_live_same_host_holder_is_still_deferred(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            self._plant("gw", pid=child.pid, hb_age_s=1)
+            self.assertEqual(self.mod.acquire("gw", self.ws).status, "deferred")
+        finally:
+            child.kill(); child.wait()
+
+    def test_holder_alive_under_another_uid_is_deferred(self):
+        # pid 1 exists on every unix host; kill(1, 0) raises EPERM unless root.
+        self._plant("gw", pid=1, hb_age_s=1)
+        self.assertEqual(self.mod.acquire("gw", self.ws).status, "deferred")
+
+    def test_dead_pid_on_another_host_follows_heartbeat_only(self):
+        dead = _dead_pid()
+        self._plant("gw", pid=dead, hb_age_s=1, host="otherhost")
+        self.assertEqual(self.mod.acquire("gw", self.ws).status, "deferred")
+        self._plant("gw", pid=dead, hb_age_s=99999, host="otherhost")
+        self.assertEqual(self.mod.acquire("gw", self.ws).status, "reaped")
+
+    def test_reused_pid_reads_alive_and_falls_back_to_heartbeat(self):
+        # Residual risk, pinned: no start time is recorded, so a dead holder whose
+        # pid now names an unrelated live process is indistinguishable from live.
+        self._plant("gw", pid=_live_pid(), hb_age_s=1)
+        self.assertEqual(self.mod.acquire("gw", self.ws).status, "deferred")
+        self._plant("gw", pid=_live_pid(), hb_age_s=99999)
+        self.assertEqual(self.mod.acquire("gw", self.ws).status, "reaped")
+
+    def test_unprobeable_pid_is_not_reaped_while_fresh(self):
+        for bad in (0, -1, True, "123", None):
+            with self.subTest(pid=bad):
+                self._plant("gw", pid=bad, hb_age_s=1)
+                self.assertEqual(self.mod.acquire("gw", self.ws).status, "deferred")
+
+    def test_retained_dead_holder_ages_out_by_heartbeat(self):
+        p = self._lock_path()
+        self._plant("gw", pid=_dead_pid(), hb_age_s=1)
+        d = json.loads(p.read_text()); d["retained"] = True; p.write_text(json.dumps(d))
+        self.assertEqual(self.mod.acquire("gw", self.ws).status, "deferred")
+        d["heartbeat_at"] -= 99999; p.write_text(json.dumps(d))
+        self.assertEqual(self.mod.acquire("gw", self.ws).status, "reaped")
+
+    def test_retain_marks_only_our_own_lock(self):
+        self._plant("gw", pid=_live_pid(), hb_age_s=1)
+        self.assertFalse(self.mod.retain("gw", self.ws))
+        self.assertNotIn("retained", json.loads(self._lock_path().read_text()))
+        self._lock_path().unlink()
+        self.assertEqual(self.mod.acquire("gw", self.ws).status, "acquired")
+        self.assertTrue(self.mod.retain("gw", self.ws))
+        self.assertTrue(json.loads(self._lock_path().read_text())["retained"])
+
+    def test_retained_lock_survives_its_holder_exiting(self):
+        code = (f"import sys; sys.path.insert(0, {str(SCRIPT.parent)!r});"
+                "import workspace_lock as w;"
+                f"assert w.acquire('gw', w.Path({str(self.ws)!r})).status == 'acquired';"
+                f"assert w.retain('gw', w.Path({str(self.ws)!r}))")
+        env = dict(os.environ); env["SUTANDO_HOST_LABEL"] = HOST
+        subprocess.run([sys.executable, "-c", code], check=True, env=env)
+        self.assertEqual(self.mod.acquire("gw", self.ws).status, "deferred")
 
     def test_reap_on_stale_holder(self):
         self._plant("gw", pid=999999, hb_age_s=99999)      # stale
@@ -117,18 +205,25 @@ class LockTest(unittest.TestCase):
         self.assertEqual(self.mod.acquire("supervisor", self.ws).status, "acquired")
 
     def test_concurrent_acquire_single_winner(self):
-        """Real O_EXCL race: N processes acquire the same role; exactly 1 wins."""
-        def one(_):
-            env = dict(os.environ); env["SUTANDO_HOST_LABEL"] = HOST
-            r = subprocess.run(
-                [sys.executable, str(SCRIPT), "acquire", "--role", "race",
-                 "--workspace", str(self.ws)],
-                capture_output=True, text=True, env=env)
-            return (r.returncode, r.stdout.strip())
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-            results = list(ex.map(one, range(8)))
-        acquired = [o for rc, o in results if rc == 0 and o in ("acquired", "reaped")]
-        deferred = [o for rc, o in results if rc == 3]
+        """Real race: N processes acquire the same role; exactly 1 wins. Each
+        racer stays alive until all have tried, so the winner is a live holder."""
+        done = self.ws / "all-tried"
+        code = (f"import sys, time; sys.path.insert(0, {str(SCRIPT.parent)!r});"
+                "import workspace_lock as w; from pathlib import Path;"
+                f"r = w.acquire('race', Path({str(self.ws)!r}));"
+                "print(r.status, flush=True);"
+                f"[time.sleep(0.02) for _ in iter(lambda: Path({str(done)!r}).exists(), True)]")
+        env = dict(os.environ); env["SUTANDO_HOST_LABEL"] = HOST
+        procs = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                                  text=True, env=env) for _ in range(8)]
+        try:
+            results = [p.stdout.readline().strip() for p in procs]
+        finally:
+            done.write_text("1")
+            for p in procs:
+                p.wait(10)
+        acquired = [o for o in results if o in ("acquired", "reaped")]
+        deferred = [o for o in results if o == "deferred"]
         self.assertEqual(len(acquired), 1, results)      # exactly one poller
         self.assertEqual(len(deferred), 7, results)
 
@@ -172,7 +267,7 @@ class CliTest(unittest.TestCase):
     def test_cli_acquire_deferred_exit3(self):
         p = self._lock_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"role": "r", "pid": 999999, "host": HOST,
+        p.write_text(json.dumps({"role": "r", "pid": _live_pid(), "host": HOST,
                                  "heartbeat_at": int(time.time()), "schema_version": 1}))
         rc, out = self._run("acquire", "--role", "r")
         self.assertEqual(rc, 3)
