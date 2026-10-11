@@ -318,20 +318,24 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
     """Unanswered consults, oldest first; `nudge_due` when overdue and the owner was not yet
     told, `unconfirmed` when the ask's post was never confirmed, `expired` past the expiry, plus
     closed consults whose relay is not acknowledged (`closed_unrelayed`) and any live task
-    holding a root claim with no record (`claim_only`). Claims are never pruned;
-    an expired record is pruned once the owner has been told and its task can no longer post."""
+    holding a root claim with no record (`claim_only`). Claims are never pruned; an expired
+    record is pruned once the owner has been told and its task can no longer post, unless a
+    message is bound as its answer and the close has not landed: that record is kept."""
     now = time.time() if now is None else now
+    open_recs = records(workspace, "pending")
+    held = _answer_bindings(workspace, {r["cid"] for r in open_recs})
     for r in records(workspace, "nudged"):  # answered/ is terminal and never pruned
         if not _record_path(workspace, "pending", r["cid"]).exists() and _age(r, now) > expire_after_s:
             _record_path(workspace, "nudged", r["cid"]).unlink(missing_ok=True)
     out, listed = [], set()
-    for r in sorted(records(workspace, "pending"), key=lambda r: r.get("asked_at") or 0):
+    for r in sorted(open_recs, key=lambda r: r.get("asked_at") or 0):
         if _record_path(workspace, "answered", r["cid"]).exists():
             _record_path(workspace, "pending", r["cid"]).unlink(missing_ok=True)
             continue
         age = _age(r, now)
         nudged = _record_path(workspace, "nudged", r["cid"]).exists()
-        if nudged and age > expire_after_s and not task_can_post(workspace, r.get("task_id")):
+        if nudged and age > expire_after_s and r["cid"] not in held \
+                and not task_can_post(workspace, r.get("task_id")):
             _record_path(workspace, "pending", r["cid"]).unlink(missing_ok=True)
             _record_path(workspace, "nudged", r["cid"]).unlink(missing_ok=True)
             continue
@@ -345,8 +349,8 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
             out.append({"cid": r["cid"], "task_id": r.get("task_id"), "agent": r.get("agent"),
                         "origin": r.get("origin"), "answer_event": r.get("answer_event"),
                         "closed_unrelayed": True,
-                        "reason": "closed, but its relay is not acknowledged: tell the owner once that the "
-                                  "answer may not have been delivered, then run `relayed <cid>`"})
+                        "reason": "closed, but its relay is not acknowledged: tell the owner that the answer "
+                                  "may not have been delivered, then run `relayed <cid>`"})
     roots = Path(workspace) / _STATE / "roots"
     for f in sorted(roots.glob("*.json")) if roots.is_dir() else []:
         task = f.name[:-len(".json")]
@@ -668,7 +672,7 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
     if rec.get("room") != room:
         return no(f"consult {cid} was asked in another room")
     if _record_path(workspace, "answered", cid).exists():
-        return _already_answered(workspace, cid, event, no)
+        return _already_answered(workspace, cid, event, task_id, no)
     if not _in_consult(workspace, rec, msg):
         return no(f"not from {rec['agent']}, the agent consult {cid} asked")
     late = _window_refusal(rec, msg, messages, max_duration_s)
@@ -720,7 +724,7 @@ def _judged(workspace: Path, bound: dict, event: str, task_id, final: bool, not_
         return no("this message was bound as the answer; --not-final conflicts with that judgement "
                   "(run --final to finish closing)", conflict=True, cid=cid)
     if _record_path(workspace, "answered", str(cid)).exists():
-        return _already_answered(workspace, str(cid), event, no)
+        return _already_answered(workspace, str(cid), event, task_id, no)
     if not final:
         return no("this message was bound as the answer; run --final to finish closing", candidate=True,
                   bound="answer", cid=cid, reply_text=bound["payload"].get("reply_text"), event_id=event)
@@ -736,7 +740,7 @@ def _close(workspace: Path, binding: dict, event: str, task_id, no) -> dict:
              "reply_task": task_id, "payload": binding["payload"]}
     try:
         if not _claim_file(dst, claim):
-            return _already_answered(workspace, cid, event, no)
+            return _already_answered(workspace, cid, event, task_id, no)
     except OSError as e:
         return no(f"consult {cid} could not be closed: {e}")
     _record_path(workspace, "pending", cid).unlink(missing_ok=True)
@@ -744,14 +748,15 @@ def _close(workspace: Path, binding: dict, event: str, task_id, no) -> dict:
     return binding["payload"]
 
 
-def _already_answered(workspace: Path, cid: str, event: str, no) -> dict:
-    """Refuse a second delivery. The message that closed the consult, while its relay is not
-    acknowledged by `relayed <cid>`, is told so: the owner must hear the answer may be lost."""
+def _already_answered(workspace: Path, cid: str, event: str, task_id: Optional[str], no) -> dict:
+    """Refuse a second delivery. The route that closed the consult (the same message, through the
+    same reply task or the same --event-id), while `relayed <cid>` is not recorded, is told so:
+    the owner must hear the answer may be lost."""
     rec = _read_record(_record_path(workspace, "answered", cid)) or {}
-    if rec.get("answer_event") == event and not rec.get("relayed"):
-        return no(f"consult {cid} is already answered by this message and its relay is not acknowledged; "
-                  "the answer is never delivered twice. If you did not relay it, tell the owner once that "
-                  "it may not have been delivered; then run `relayed <cid>`",
+    if rec.get("answer_event") == event and rec.get("reply_task") == task_id and not rec.get("relayed"):
+        return no(f"consult {cid} was closed by this route and its relay is not acknowledged; the answer "
+                  "is never delivered twice. If you did not relay it, tell the owner that it may not have "
+                  "been delivered; then run `relayed <cid>`",
                   answered_by=event, closed_unrelayed=True, cid=cid)
     return no(f"consult {cid} is already answered; its answer is never delivered twice",
               answered_by=rec.get("answer_event"))

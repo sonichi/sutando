@@ -1103,9 +1103,10 @@ class TestDeliveredAtMostOnce(WorldCase):
     def test_the_answer_is_returned_once_by_either_route(self):
         first = self.by_task(final=True)
         self.assertEqual((first["matched"], first["reply_text"], first["lead"]), (True, "up", f"[channel: {OWNER_DM}]\n"))
-        for again in (self.by_task(final=True), self.by_task(), self.w.m(self.e, final=True), self.w.m(self.e)):
+        for again, closer in ((self.by_task(final=True), True), (self.by_task(), True),
+                              (self.w.m(self.e, final=True), None), (self.w.m(self.e), None)):
             self.assertEqual((again["matched"], again.get("answered_by"), again.get("closed_unrelayed")),
-                             (False, self.e, True), again)
+                             (False, self.e, closer), again)
             self.assertNotIn("reply_text", again)
         self.assertFalse(hasattr(policy, "_replay"))
 
@@ -1123,6 +1124,26 @@ class TestDeliveredAtMostOnce(WorldCase):
         self.assertEqual(self.unrelayed(), [])
         again = self.w.m(self.e, final=True)
         self.assertEqual((again["matched"], again.get("closed_unrelayed")), (False, None), again)
+
+    def test_qingyun_an_event_close_is_not_reported_to_that_events_reply_task(self):
+        self.assertTrue(self.w.m(self.e, final=True)["matched"])
+        got = self.by_task(final=True)
+        self.assertEqual((got["matched"], got.get("answered_by"), got.get("closed_unrelayed")), (False, self.e, None))
+        self.assertTrue(self.w.m(self.e, final=True)["closed_unrelayed"])  # the closing route is told
+
+    def test_kewei_a_bound_answer_survives_nudge_task_completion_and_expiry(self):
+        with crash_on_close():
+            self.assertFalse(self.w.m(self.e, final=True)["matched"])
+        self.assertTrue(policy.mark_nudged(self.w.ws[SELF], C1)["ok"])
+        (self.w.ws[SELF] / "results" / f"{TID}.txt").write_text("done")  # the original owner task
+        later = time.time() + 30 * 86400
+        rows = policy.pending(self.w.ws[SELF], 600, now=later)  # the pass after a restart
+        self.assertEqual([(r["cid"], r["expired"]) for r in rows], [(C1, True)])
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])
+        shown = policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF], self_mxid=SELF)
+        self.assertEqual(shown[C1]["event_id"], self.e)
+        self.assertTrue(self.w.m(self.e, final=True, now=later)["matched"])
+        self.assertEqual(self.unrelayed(), [(C1, self.e)])
 
     def test_another_message_after_the_close_is_not_told_it_closed_the_consult(self):
         self.assertTrue(self.by_task(final=True)["matched"])
