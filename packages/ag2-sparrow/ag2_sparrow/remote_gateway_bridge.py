@@ -5238,8 +5238,8 @@ _LOCK_STALE_S = _WS_STALE_SECONDS
 _LOCK_LOST = threading.Event()
 _LOCK_HB_MUTEX = threading.Lock()
 _POLL_BACKOFF_MAX_S = 60
-# The longest pass a working loop makes: the long poll at its timeout, the
-# largest backoff sleep and the beat's own requests, doubled for margin.
+# Typical worst case for one pass (a queued retry backlog can exceed it): the
+# long poll at its timeout, the largest backoff and two requests, doubled.
 _LOCK_PASS_MAX_S = 2 * (POLL_WAIT + 10 + _POLL_BACKOFF_MAX_S + 2 * _REQ_TIMEOUT_S)
 _LOOP_TICK = {"at": time.monotonic()}
 

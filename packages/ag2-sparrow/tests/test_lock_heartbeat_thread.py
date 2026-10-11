@@ -34,9 +34,18 @@ gate = pathlib.Path(os.environ["PROBE_GATE"])
 m._LOCK_STALE_S = %d
 m._LOCK_PASS_MAX_S = float(os.environ["PROBE_PASS_MAX"])
 
+warmup = float(os.environ.get("PROBE_WARMUP", "0"))
+first_poll = None
+
 
 def fake_req(method, path, *a, **k):
+    global first_poll
     if path.startswith("/v1/tasks?") and not started.exists():
+        # Quick passes first, so the long pass starts late in the run.
+        first_poll = first_poll or time.monotonic()
+        if time.monotonic() - first_poll < warmup:
+            time.sleep(0.2)
+            return {}
         started.write_text(str(os.getpid()))
         while not gate.exists():
             time.sleep(0.02)
@@ -59,7 +68,7 @@ def _load(base):
     return importlib.reload(mod)
 
 
-def _spawn(base, pass_max):
+def _spawn(base, pass_max, warmup=0):
     for sub in ("tasks", "results", "state"):
         (base / sub).mkdir()
     started, gate = base / "started", base / "gate"
@@ -71,12 +80,12 @@ def _spawn(base, pass_max):
            "REMOTE_TASK_TOKEN": "dummy-secret",
            "SUTANDO_SUPERVISED": "1",
            "PROBE_STARTED": str(started), "PROBE_GATE": str(gate),
-           "PROBE_PASS_MAX": str(pass_max)}
+           "PROBE_PASS_MAX": str(pass_max), "PROBE_WARMUP": str(warmup)}
     env.pop("SUTANDO_BRIDGE_LOCK", None)
     child = subprocess.Popen([sys.executable, "-c", _CHILD % (str(PKG_ROOT), str(SRC_DIR), STALE_S)],
                              env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              text=True)
-    deadline = time.time() + 20
+    deadline = time.time() + 20 + warmup
     while not started.exists() and child.poll() is None and time.time() < deadline:
         time.sleep(0.05)
     assert started.exists(), f"child never reached the task poll (rc={child.poll()})"
@@ -144,6 +153,35 @@ def test_a_hung_loop_pass_lets_a_successor_reap_the_holder():
         print("PASS test_a_hung_loop_pass_lets_a_successor_reap_the_holder")
 
 
+def test_a_late_long_pass_is_covered_by_the_loop_stamp():
+    """The loop stamps progress on every pass. Without that stamp the only
+    tick is the one written at thread start, so a long pass that begins after
+    uptime has passed the pass bound reads as a stall and the lock goes stale."""
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        # Quick passes for 3x the bound, then one pass under the bound but
+        # over the stale window.
+        child, gate = _spawn(base, pass_max=STALE_S * 2, warmup=STALE_S * 3)
+        m2 = _load(base)
+        out = None
+        try:
+            time.sleep(STALE_S + 1.5)
+            assert child.poll() is None, "child exited while its pass was blocked"
+            r = m2._ws_acquire(m2._LOCK_ROLE, m2._LOCK_WS, stale_seconds=STALE_S)
+            assert r.status == "deferred", (
+                f"successor got {r.status!r}: the holder pid={child.pid} was reaped "
+                f"during a bounded pass that began after uptime passed the "
+                f"{STALE_S * 2}s pass bound")
+            assert (r.holder or {}).get("pid") == child.pid, r.holder
+            out = _stop(child, gate)
+            assert "singleton: main loop has made no progress" not in out, out
+        finally:
+            if out is None:
+                _stop(child, gate)
+            m2._ws_release(m2._LOCK_ROLE, m2._LOCK_WS)
+        print("PASS test_a_late_long_pass_is_covered_by_the_loop_stamp")
+
+
 def test_a_lost_lock_still_stops_the_poller():
     """The dual-poll guard is unchanged: once another process owns the lock,
     the holder logs the loss and leaves main() on its next pass."""
@@ -173,5 +211,6 @@ def test_a_lost_lock_still_stops_the_poller():
 if __name__ == "__main__":
     test_a_long_loop_pass_does_not_let_a_successor_reap_the_holder()
     test_a_hung_loop_pass_lets_a_successor_reap_the_holder()
+    test_a_late_long_pass_is_covered_by_the_loop_stamp()
     test_a_lost_lock_still_stops_the_poller()
     print("all ok")

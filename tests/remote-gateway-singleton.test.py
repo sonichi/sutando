@@ -149,6 +149,7 @@ class SingletonGlueTest(unittest.TestCase):
         self.assertEqual(sum("made no progress" in m for m in logged), 1, logged)
 
     def test_pass_bound_covers_a_full_pass_with_margin(self):
+        # Data pin: the bound is twice one pass, and it exceeds the stale window.
         one_pass = rgb.POLL_WAIT + 10 + rgb._POLL_BACKOFF_MAX_S + 2 * rgb._REQ_TIMEOUT_S
         self.assertEqual(rgb._LOCK_PASS_MAX_S, 2 * one_pass)
         self.assertGreater(rgb._LOCK_PASS_MAX_S, rgb._LOCK_STALE_S)
