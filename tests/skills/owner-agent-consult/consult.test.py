@@ -1336,22 +1336,28 @@ class TestKeweiRoundNine(unittest.TestCase):
         self.assertEqual(len(w.room.msgs), 2)
         self.assertIn(C1, [r["cid"] for r in policy.pending(w.ws[SELF], 600) if r["unconfirmed"]])
 
-    def test_an_unconfirmed_post_absent_from_the_whole_room_is_released(self):
+    def test_an_unconfirmed_post_absent_from_an_incomplete_read_stays_unconfirmed(self):
         w = self.w
         w.tr[SELF].mention = lambda *a, **k: {"ok": True, "event_id": None}
         self.assertTrue(w.ask(SELF, SIB, cid=C1, task_id=TID)["unconfirmed"])
         w.tr[SELF].mention = FakeTransport.mention.__get__(w.tr[SELF])
-        age_record(w.ws[SELF], C1, policy.LATE_LANDING_S + 1)
+        w.tr[SELF].read = lambda room, limit: {"ok": True, "messages": [], "complete": False}  # the real adapter
+        age_record(w.ws[SELF], C1, 86400)  # a day old: well past any landing delay, inside the expiry
         res = w.ask(SELF, SIB, cid=C2, task_id=TID)
-        self.assertEqual((res["asked"], res["root"]), (True, "$ask"), res)
-        self.assertEqual(pending_ids(w.ws[SELF]), [C2])
+        self.assertFalse(res["asked"], res)
+        self.assertIn("unconfirmed", res["reason"])
+        self.assertIn("owner can ask again", res["reason"])
+        self.assertEqual((pending_ids(w.ws[SELF]), policy._root_claim(w.ws[SELF], TID).exists()), ([C1], True))
+        self.assertEqual(w.room.msgs, [])
+        age_record(w.ws[SELF], C1, 8 * 86400)  # expired: released
+        self.assertTrue(w.ask(SELF, SIB, cid=C2, task_id=TID)["asked"])
 
     def test_only_one_ask_from_a_task_can_claim_its_root(self):
         self.assertTrue(policy.claim_root(self.w.ws[SELF], TID, C1))
         self.assertFalse(policy.claim_root(self.w.ws[SELF], TID, C2))
         with mock.patch.object(policy, "reconcile", return_value=None):  # a racing ask read first
             res = self.w.ask(SELF, SIB, cid=C2, task_id=TID)
-        self.assertIn("already holds its thread root", res["reason"])
+        self.assertIn("holds its thread root", res["reason"])
         self.assertFalse(res["asked"])
         self.assertEqual(self.w.room.msgs, [])
 
@@ -1514,14 +1520,17 @@ class TestPublicationIsOneRecoverableState(unittest.TestCase):
         self.assertEqual((again.get("replay"), again["event_id"]), (True, "$ask2"), again)
         self.assertEqual(len(w.room.msgs), 2)
 
-    def test_an_answer_that_never_landed_is_posted_once_the_whole_room_shows_it_absent(self):
+    def test_an_answer_that_never_landed_stays_unconfirmed_until_expiry(self):
         w = self.w
         w.ask(SELF, SIB, cid=C1, task_id=TID)
         w.deliver(SIB, "$ask", "task-b1")
         w.tr[SIB].mention = lambda *a, **k: {"ok": False, "reason": "room transport failed: timed out"}
         self.assertTrue(w.answer(SIB, "up", task_id="task-b1")["unconfirmed"])
         w.tr[SIB].mention = FakeTransport.mention.__get__(w.tr[SIB])
-        age_answer_claim(w.ws[SIB], C1, policy.LATE_LANDING_S + 1)
+        age_answer_claim(w.ws[SIB], C1, 86400)
+        self.assertIn("unconfirmed", w.answer(SIB, "up", task_id="task-b1")["reason"])
+        self.assertEqual(len(w.room.msgs), 1)
+        age_answer_claim(w.ws[SIB], C1, 8 * 86400)
         again = w.answer(SIB, "up", task_id="task-b1")
         self.assertEqual((again["answered"], again.get("replay"), again["event_id"]), (True, None, "$ask2"), again)
 
@@ -1539,35 +1548,49 @@ class TestPublicationIsOneRecoverableState(unittest.TestCase):
         self.assertEqual((again.get("replay"), again["event_id"]), (True, "$ask2"), again)
         self.assertEqual(len(w.room.msgs), 2)
 
-    def test_an_answer_unconfirmed_beyond_the_read_is_not_posted_again(self):
+    def test_an_answer_unconfirmed_is_not_posted_again(self):
         w = self.w
         w.ask(SELF, SIB, cid=C1, task_id=TID)
         w.deliver(SIB, "$ask", "task-b1")
         w.tr[SIB].mention = lambda *a, **k: {"ok": False, "reason": "room transport failed: timed out"}
         w.answer(SIB, "up", task_id="task-b1")
         w.tr[SIB].mention = FakeTransport.mention.__get__(w.tr[SIB])
-        with mock.patch.object(policy, "_room_page", return_value=([], False)):
-            res = w.answer(SIB, "up", task_id="task-b1")
+        res = w.answer(SIB, "up", task_id="task-b1")
         self.assertIn("earlier answer to this ask is unconfirmed", res["reason"])
         self.assertEqual(len(w.room.msgs), 1)
 
-    def test_a_claim_with_no_record_is_released_after_the_grace_period(self):
-        w = self.w
-        claim = policy._root_claim(w.ws[SELF], TID)
-        policy.claim_root(w.ws[SELF], TID, C1)  # a crash before the pending record was written
-        fresh = w.ask(SELF, SIB, cid=C2, task_id=TID)
-        self.assertIn("already holds its thread root", fresh["reason"])
-        old = time.time() - 2 * policy.ORPHAN_GRACE_S
-        os.utime(claim, (old, old))
-        res = w.ask(SELF, SIB, cid=C2, task_id=TID)
-        self.assertEqual((res["asked"], res["root"]), (True, "$ask"), res)
+    def test_a_paused_publisher_is_never_displaced_into_a_second_root(self):
+        w, real, seen = self.w, policy._write_record, []
 
-    def test_pending_heals_an_orphan_claim(self):
+        def pause_before_record(path, rec):
+            if not seen and path.parent.name == "pending":
+                seen.append(1)  # A holds the claim and has not written its record: B runs now
+                claim = policy._root_claim(w.ws[SELF], TID)
+                old = time.time() - 3600
+                os.utime(claim, (old, old))
+                seen.append(w.ask(SELF, SIB, cid=C2, task_id=TID))
+            return real(path, rec)
+        with mock.patch.object(policy, "_write_record", side_effect=pause_before_record):
+            a = w.ask(SELF, SIB, cid=C1, task_id=TID)
+        b = seen[1]
+        self.assertFalse(b["asked"], b)
+        self.assertIn("holds its thread root", b["reason"])
+        self.assertTrue(a["asked"], a)
+        self.assertEqual([m.get("thread_root") for m in w.room.msgs], [None])
+
+    def test_the_owner_can_ask_again_with_a_new_task(self):
+        w = self.w
+        policy.claim_root(w.ws[SELF], TID, C1)  # a claim with no record: this task is blocked
+        self.assertFalse(w.ask(SELF, SIB, cid=C2, task_id=TID)["asked"])
+        (w.ws[SELF] / "tasks" / "task-2.txt").write_text(te.stamp_text(task_text(tid="task-2"), w.ws[SELF]))
+        self.assertTrue(w.ask(SELF, SIB, cid=C3, task_id="task-2")["asked"])
+
+    def test_an_orphan_claim_is_released_only_at_expiry(self):
         claim = policy._root_claim(self.w.ws[SELF], TID)
         policy.claim_root(self.w.ws[SELF], TID, C1)
-        old = time.time() - 2 * policy.ORPHAN_GRACE_S
-        os.utime(claim, (old, old))
-        self.assertEqual(policy.pending(self.w.ws[SELF], 600), [])
+        self.assertEqual(policy.pending(self.w.ws[SELF], 600, now=time.time() + 86400), [])
+        self.assertTrue(claim.exists())
+        policy.pending(self.w.ws[SELF], 600, now=time.time() + 8 * 86400)
         self.assertFalse(claim.exists())
 
     def test_reconcile_and_claim_edges(self):
@@ -1579,7 +1602,7 @@ class TestPublicationIsOneRecoverableState(unittest.TestCase):
         with mock.patch.object(policy, "_write_record", side_effect=OSError("ro")):
             self.assertIn("unconfirmed", policy.reconcile(w.tr[SELF], ROOM, SELF, w.ws[SELF], task_id=TID))
         w.tr[SELF].read = lambda room, limit: {"ok": False, "reason": "down"}
-        self.assertEqual(policy._room_page(w.tr[SELF], ROOM), ([], False))
+        self.assertEqual(policy._room_messages(w.tr[SELF], ROOM), [])
         self.assertIsNone(policy.reconcile(w.tr[SELF], ROOM, SELF, w.ws[SELF], task_id=TID,
                                            now=time.time() + 10 * 86400))
         self.assertEqual(pending_ids(w.ws[SELF]), [])

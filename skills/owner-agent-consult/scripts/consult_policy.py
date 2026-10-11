@@ -285,21 +285,11 @@ def records(workspace: Path, state: str) -> List[dict]:
     return [r for r in out if r and _CID.match(str(r.get("cid") or ""))]
 
 
-ORPHAN_GRACE_S = 60
-TRANSPORT_TIMEOUT_S = 60
-# A post whose outcome was unknown can still land this long after it was sent: the room CLI's
-# timeout plus delivery slack. Until then, absence from even a whole-room read proves nothing.
-LATE_LANDING_S = TRANSPORT_TIMEOUT_S + 240
-
-
-def _room_page(transport, room: str) -> tuple:
-    """(messages, complete): `complete` when the read returned the room's whole history, so an
-    event absent from it was never posted."""
+def _room_messages(transport, room: str) -> List[dict]:
+    """The latest room read. It is never proof that something is absent: the gateway cannot
+    say a read covered the whole history."""
     page = transport.read(room, READ_LIMIT)
-    if not page.get("ok"):
-        return [], False
-    msgs = [m for m in page.get("messages") or [] if isinstance(m, dict)]
-    return msgs, len(msgs) < READ_LIMIT
+    return [m for m in page.get("messages") or [] if isinstance(m, dict)] if page.get("ok") else []
 
 
 def _sent_before_publication(sent: dict) -> bool:
@@ -308,48 +298,22 @@ def _sent_before_publication(sent: dict) -> bool:
     return not sent.get("ok") and sent.get("posted") is False
 
 
-def heal_orphan_claims(workspace: Path, task_id: Optional[str] = None, now: Optional[float] = None) -> List[str]:
-    """Release root claims whose consult has no record. The claim is written before the
-    pending record and the record before the post, so a claim with no record means nothing
-    was posted. A grace period leaves a claim being written right now alone."""
-    now = time.time() if now is None else now
-    roots = Path(workspace) / _STATE / "roots"
-    files = [_root_claim(workspace, task_id)] if task_id else (sorted(roots.glob("*.json")) if roots.is_dir() else [])
-    healed = []
-    for f in files:
-        claim = _read_record(f)
-        try:
-            born = f.stat().st_mtime
-        except OSError:
-            continue
-        cid = str((claim or {}).get("cid") or "")
-        has_record = _CID.match(cid) and any(_record_path(workspace, st, cid).exists()
-                                             for st in ("pending", "answered"))
-        if not has_record and now - born > ORPHAN_GRACE_S:
-            f.unlink(missing_ok=True)
-            healed.append(cid or f.name)
-    return healed
-
-
 def reconcile(transport, room: str, self_mxid: str, workspace: Path, *, task_id: Optional[str] = None,
               via_task: Optional[str] = None, agent: Optional[str] = None,
               expire_after_s: float = DEFAULT_EXPIRE_AFTER_S, now: Optional[float] = None) -> Optional[str]:
     """Settle every earlier ask from this owner task (or from this ask task to this agent) whose
     post was not confirmed: a failed write, a crash after the post, or an ambiguous transport
-    outcome. Found in the room by consult id: the record is completed. Absent from a read that
-    covers the whole room once LATE_LANDING_S has passed since it was sent, or expired: nothing
-    was posted, so the record and its root claim are released. Otherwise it may be in the room beyond the read, so this returns a refusal and
-    no new ask is posted."""
+    outcome. Found in the room by consult id: the record is completed. Expired: it is released
+    with its root claim. Otherwise it stays unconfirmed, whatever the read shows, and this
+    returns a refusal: nothing new is posted while it may already be in the room."""
     now = time.time() if now is None else now
-    if task_id:
-        heal_orphan_claims(workspace, task_id, now)
     loose = [(st, r) for st in ("pending", "answered") for r in records(workspace, st)
              if not (r.get("ask_event") and r.get("root"))
              and ((task_id and r.get("task_id") == task_id)
                   or (via_task and r.get("via_task") == via_task and r.get("agent") == agent))]
     if not loose:
         return None
-    messages, complete = _room_page(transport, room)
+    messages = _room_messages(transport, room)
     unresolved = []
     for st, r in loose:
         fixed = _recover_ask(r, messages, self_mxid)
@@ -360,16 +324,16 @@ def reconcile(transport, room: str, self_mxid: str, workspace: Path, *, task_id:
             except OSError:
                 unresolved.append(r["cid"])
                 continue
-        if (complete and _age(r, now) > LATE_LANDING_S) or _age(r, now) > expire_after_s:
+        if _age(r, now) > expire_after_s:
             _record_path(workspace, st, r["cid"]).unlink(missing_ok=True)
             if r.get("task_id") and (_read_record(_root_claim(workspace, r["task_id"])) or {}).get("cid") == r["cid"]:
                 _root_claim(workspace, r["task_id"]).unlink(missing_ok=True)
             continue
         unresolved.append(r["cid"])
     if unresolved:
-        return (f"an earlier ask is unconfirmed ({', '.join(unresolved)}): it may already be in the room "
-                "beyond what can be read, so nothing new is posted; `pending` lists it, and it clears "
-                "when found, or at expiry")
+        return (f"an earlier ask is unconfirmed ({', '.join(unresolved)}): it may already be in the room, "
+                "so nothing new is posted from this task; `pending` lists it, and it clears when found "
+                "or at expiry. Tell the owner it is unconfirmed; the owner can ask again")
     return None
 
 
@@ -405,7 +369,6 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
     told, `expired` past the expiry (match then refuses). Prunes answered and nudge records
     older than the expiry, and an expired consult once the owner has been told."""
     now = time.time() if now is None else now
-    heal_orphan_claims(workspace, now=now)
     answers = Path(workspace) / _STATE / "answers"
     for f in sorted(answers.glob("*.json")) if answers.is_dir() else []:
         if _age({"asked_at": (_read_record(f) or {}).get("at") or f.stat().st_mtime}, now) > expire_after_s:
@@ -791,7 +754,8 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
     path = _record_path(workspace, "pending", cid)
     new_root = bool(task_id) and not root
     if new_root and not claim_root(workspace, task_id, cid):
-        return no("another ask from this task already holds its thread root; retry after it is posted")
+        return no("another ask from this task holds its thread root and has no confirmed post; nothing "
+                  "new is posted from this task until it is found or expires. The owner can ask again")
 
     def release():
         if new_root:
@@ -871,18 +835,16 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
     held = _read_record(claim_path)
     if held is not None:
         if not held.get("event_id"):
-            messages, complete = _room_page(transport, room)
-            found = _own_answer(messages, self_mxid, inc["cid"])
+            found = _own_answer(_room_messages(transport, room), self_mxid, inc["cid"])
             if found:
                 held["event_id"] = found
                 _write_record(claim_path, held)
-            elif (complete and _age({"asked_at": held.get("at")}, time.time()) > LATE_LANDING_S) \
-                    or _age({"asked_at": held.get("at")}, time.time()) > expire_after_s:
+            elif _age({"asked_at": held.get("at")}, time.time()) > expire_after_s:
                 claim_path.unlink(missing_ok=True)
                 held = None
             else:
-                return no("an earlier answer to this ask is unconfirmed: it may already be in the room "
-                          "beyond what can be read, so it is not posted again")
+                return no("an earlier answer to this ask is unconfirmed: it may already be in the room, "
+                          "so it is not posted again until it is found or expires")
         if held is not None:
             return {**base, "event_id": held["event_id"], "replay": True}
     if not _claim_file(claim_path, {"cid": inc["cid"], "to": inc["asker"], "at": time.time(), "event_id": None}):

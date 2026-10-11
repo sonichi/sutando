@@ -25,7 +25,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import consult_policy as policy  # noqa: E402
 
-CLI_TIMEOUT_S = policy.TRANSPORT_TIMEOUT_S
+CLI_TIMEOUT_S = 60
 
 
 class RoomCliTransport:

@@ -146,8 +146,8 @@ It does not wait.
   finish the owner's task now: tell the owner you have asked that agent and will come back
   with its answer.
 - `{"ok": true, "asked": true, "unconfirmed": true, ...}` — the outcome is unknown: no event id,
-  a timeout, output that is not JSON, or an HTTP error. The ask may have landed. Treat it as
-  asked; see "Crash and timeout recovery" for how it settles.
+  a timeout, output that is not JSON, or an HTTP error. The ask may have landed. Tell the owner
+  you asked but could not confirm the post; see "Crash and timeout recovery" for how it settles.
 - `{"ok": true, "asked": false, "reason"}` — refused. Tell the owner in one line why you could
   not ask, then answer from what you hold.
 
@@ -343,26 +343,28 @@ Every code path that computes "now" (`consult_policy.py`):
 ## Crash and timeout recovery
 
 Every post (an ask or an answer) is claimed before it is sent and settled after. Only a refusal
-the transport reports as made before sending (`posted: false`) releases a claim; a timeout,
-output that is not JSON, an HTTP error or a missing event id keeps it as **unconfirmed**. An
-unconfirmed post is reconciled from the room by consult id before anything is posted again:
+the transport reports as made before sending (`posted: false`) releases a claim. A timeout,
+output that is not JSON, an HTTP error or a missing event id keeps the post **unconfirmed**.
 
-- found there: it is completed, and nothing is reposted;
-- absent from a read that covers the whole room (fewer than `READ_LIMIT` messages) once
-  `LATE_LANDING_S` (300 s: the room CLI's 60 s timeout plus delivery slack) has passed since it
-  was sent, or expired: nothing was posted, so its claim is released. Before that, a post that
-  timed out may still land, so it stays unconfirmed;
-- otherwise: it may be beyond the read, so the next ask or answer is refused, and `pending` lists
-  it as `unconfirmed` until it is found or expires.
+An unconfirmed post is never released early and never posted again. It stays unconfirmed until
+it is found in the room by consult id, which completes it, or until it expires
+(`OWNER_AGENT_CONSULT_EXPIRE_AFTER_S`). Absence from a room read proves nothing: the gateway
+cannot say a read covered the whole history.
+
+**The cost, stated plainly.** If a post really never landed, the task stays blocked: no further
+ask from that task, or answer to that ask, is posted until expiry. `ask` and `answer` refuse
+with the reason, and `pending` lists the post as `unconfirmed`. Tell the owner the ask is
+unconfirmed. The owner can ask again with a new message, which is a new task with its own
+thread.
 
 Every write pair where a crash between the two matters, in order, and its recovery:
 
 | writes, in order | a crash between them leaves | recovery |
 | --- | --- | --- |
-| root claim (`roots/<task>.json`), then pending record (owner task's first ask) | a claim with no record. The record is written before the post, so nothing was posted | `reconcile` and `pending` release a claim with no record once it is 60 s old (`ORPHAN_GRACE_S`) |
-| pending record, then the post (any ask) | a record with no event id; posted or not | reconcile by consult id, as above. For an owner task this runs before any later ask from it; for an onward ask, before any later ask from that ask task to that agent |
+| root claim (`roots/<task>.json`), then pending record (owner task's first ask) | a claim with no record; nothing was posted, since the record precedes the post | the claim holds until expiry: the task is blocked and the owner can ask again. It is never healed early, because a publisher paused after its claim could resume and post a second root |
+| pending record, then the post (any ask) | a record with no event id; posted or not | unconfirmed until found by consult id or expired. Checked before any later ask from that owner task, or from that ask task to that agent |
 | the post, then the record's event id | a posted ask whose record has no event id | found by consult id: by `match` when the answer arrives, or by the next ask |
-| answer claim (`answers/<cid>.json`), then the answer post | a claim with no event id; posted or not | the next `answer` for that ask (`--task-id` or `--up`) finds its own answer by its answer line and replays it; it posts again only if the whole room shows it absent after `LATE_LANDING_S`, and otherwise refuses |
+| answer claim (`answers/<cid>.json`), then the answer post | a claim with no event id; posted or not | the next `answer` for that ask (`--task-id` or `--up`) finds its own answer by its answer line and replays it; otherwise it refuses until expiry |
 | the answer post, then the claim's event id | a posted answer whose claim has no event id | the same: found by its answer line and replayed, never reposted |
 | the answered record with the payload (`answered/<cid>`), then removing `pending/<cid>` | both files | `match` replays to the same reply task; `pending` drops a pending copy beside its answer |
 | `answered/<cid>`, then the caller's result file | a consult closed but not relayed | `match` replays the payload to the same reply task until its result exists; `answer --up` replays its recorded post instead of posting again |
