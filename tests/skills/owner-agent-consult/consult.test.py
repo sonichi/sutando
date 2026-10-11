@@ -609,7 +609,7 @@ class TestOneQuestionOneAnswer(WorldCase):
         first = self.w.answer(SIB, "91% full", task_id=self.ask_task)
         again = self.w.answer(SIB, "91% full", task_id=self.ask_task)
         self.assertEqual((first["answered"], first["to"], first["root"]), (True, SELF, "$ask"), first)
-        self.assertEqual((again["replay"], again["event_id"]), (True, first["event_id"]))
+        self.assertEqual((again["already_posted"], again["event_id"]), (True, first["event_id"]))
         self.assertEqual(len(self.w.tr[SIB].posted), 1)
         self.assertEqual((self.w.tr[SIB].reply_tos, self.w.tr[SIB].thread_roots), (["$ask"], ["$ask"]))
         got = self.w.m(first["event_id"], final=True)
@@ -959,14 +959,14 @@ class TestExpiryAndPending(WorldCase):
         self.w.ask(SELF, SIB, cid=C1)
         self.assertTrue(self.w.m(self.sib("up"), final=True)["matched"])
         self.assertFalse(policy.mark_nudged(self.w.ws[SELF], C1)["ok"])
-        self.assertEqual(policy.pending(self.w.ws[SELF], 0), [])
+        self.assertEqual([r.get("closed_unrelayed") for r in policy.pending(self.w.ws[SELF], 0)], [True])
 
     def test_a_pending_copy_beside_its_answer_is_dropped(self):
         self.w.ask(SELF, SIB, cid=C1)
         rec = policy._read_record(policy._record_path(self.w.ws[SELF], "pending", C1))
         self.assertTrue(self.w.m(self.sib("up"), final=True)["matched"])
         policy._write_record(policy._record_path(self.w.ws[SELF], "pending", C1), rec)
-        self.assertEqual(policy.pending(self.w.ws[SELF], 0), [])
+        self.assertEqual([r.get("closed_unrelayed") for r in policy.pending(self.w.ws[SELF], 0)], [True])
         self.assertEqual(pending_ids(self.w.ws[SELF]), [])
 
     def test_a_record_stamped_in_the_future_expires(self):
@@ -1031,7 +1031,7 @@ class TestKeweiReview5484812051(WorldCase):
         self.assertIn("replies to another", res["reason"])
         self.assertEqual(self.w.tr[SIB].posted, [])
 
-    def test_k4_a_reply_task_with_a_result_binds_nothing_but_its_binding_still_finishes(self):
+    def test_k4_a_reply_task_with_a_result_binds_nothing(self):
         self.w.ask(SELF, SIB, cid=C1)
         e = self.sib(f"{SELF} — up")
         tid = self.w.deliver(SELF, e, "task-reply")
@@ -1042,10 +1042,6 @@ class TestKeweiReview5484812051(WorldCase):
             self.assertIn("already has a result", mr(**kw)["reason"], kw)
         self.assertFalse(bound_exists(self.w.ws[SELF], e))
         self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])
-        policy._claim_file(policy._key_path(self.w.ws[SELF], "bound", e),
-                           {"event": e, "cid": C1, "disposition": "answer", "reply_task": tid,
-                            "payload": {"matched": True, "cid": C1}, "record": {"cid": C1}})
-        self.assertTrue(mr(final=True)["matched"])
 
     def test_k5_only_ag2space_owner_tasks_may_ask(self):
         for source in ("slack", "discord", "telegram", None):
@@ -1076,51 +1072,75 @@ class TestKeweiReview5484812051(WorldCase):
         self.assertTrue(self.w.m(ok, final=True)["matched"])
 
 
-class TestKeweiReview5484867928(WorldCase):
-    """A close through a reply task makes it the replay owner, even after an --event-id bind."""
+def crash_on_close():
+    real = policy.os.link
 
-    def test_k7_event_bind_then_task_close_replays_to_that_task(self):
+    def link(src, dst, *a, **k):
+        if Path(dst).parent.name == "answered":
+            raise OSError("crashed before the close")
+        return real(src, dst, *a, **k)
+    return mock.patch.object(policy.os, "link", link)
+
+
+class TestDeliveredAtMostOnce(WorldCase):
+    """The owner's no-recovery rule applied to the relay: an answer is returned once; a crash
+    before its relay is listed as closed_unrelayed and reported, never re-delivered."""
+
+    def setUp(self):
+        super().setUp()
         self.w.ask(SELF, SIB, cid=C1)
-        e = self.sib(f"{SELF} — up")
-        real = policy.os.link
+        self.e = self.sib(f"{SELF} — up")
+        self.tid = self.w.deliver(SELF, self.e, "task-reply")
 
-        def crash_on_close(src, dst, *a, **k):
-            if Path(dst).parent.name == "answered":
-                raise OSError("crashed before the close")
-            return real(src, dst, *a, **k)
-        with mock.patch.object(policy.os, "link", crash_on_close):
-            self.assertFalse(self.w.m(e, final=True)["matched"])
-        tid = self.w.deliver(SELF, e, "task-reply")
-        mr = lambda: policy.match_reply(self.w.tr[SELF], room=ROOM, self_mxid=SELF,  # noqa: E731
-                                        workspace=self.w.ws[SELF], task_id=tid, final=True)
-        first = mr()
-        self.assertEqual((first["matched"], first["cid"]), (True, C1), first)
-        again = mr()  # a crash before the relay: the live task's retry replays
-        self.assertEqual((again.get("matched"), again.get("replay")), (True, True), again)
-        (self.w.ws[SELF] / "results" / f"{tid}.txt").write_text("[no-send]")
-        self.assertIn("already answered", mr()["reason"])
+    def by_task(self, **kw):
+        return policy.match_reply(self.w.tr[SELF], room=ROOM, self_mxid=SELF, workspace=self.w.ws[SELF],
+                                  task_id=self.tid, **kw)
 
-    def test_rui_task_bind_then_event_close_replays_until_relayed(self):
-        self.w.ask(SELF, SIB, cid=C1)
-        e = self.sib(f"{SELF} — up")
-        tid = self.w.deliver(SELF, e, "task-reply")
-        real = policy.os.link
+    def unrelayed(self):
+        return [(r["cid"], r["answer_event"]) for r in policy.pending(self.w.ws[SELF], 600)
+                if r.get("closed_unrelayed")]
 
-        def crash_on_close(src, dst, *a, **k):
-            if Path(dst).parent.name == "answered":
-                raise OSError("crashed before the close")
-            return real(src, dst, *a, **k)
-        with mock.patch.object(policy.os, "link", crash_on_close):
-            self.assertFalse(policy.match_reply(self.w.tr[SELF], room=ROOM, self_mxid=SELF, workspace=self.w.ws[SELF],
-                                                task_id=tid, final=True)["matched"])
-        (self.w.ws[SELF] / "results" / f"{tid}.txt").write_text("[no-send]")  # nothing was relayed
-        first = self.w.m(e, final=True)
-        self.assertEqual((first["matched"], first["cid"]), (True, C1), first)
-        again = self.w.m(e, final=True)  # a crash before the relay: the event route replays
-        self.assertEqual((again.get("matched"), again.get("replay")), (True, True), again)
+    def test_the_answer_is_returned_once_by_either_route(self):
+        first = self.by_task(final=True)
+        self.assertEqual((first["matched"], first["reply_text"], first["lead"]), (True, "up", f"[channel: {OWNER_DM}]\n"))
+        for again in (self.by_task(final=True), self.by_task(), self.w.m(self.e, final=True), self.w.m(self.e)):
+            self.assertEqual((again["matched"], again.get("answered_by")), (False, self.e), again)
+            self.assertNotIn("reply_text", again)
+        self.assertFalse(hasattr(policy, "_replay"))
+
+    def test_a_task_close_lists_closed_unrelayed_until_the_task_has_a_result(self):
+        self.assertTrue(self.by_task(final=True)["matched"])
+        self.assertEqual(self.unrelayed(), [(C1, self.e)])  # a crash here: reported, not re-delivered
+        (self.w.ws[SELF] / "results" / f"{self.tid}.txt").write_text("[no-send]")
+        self.assertEqual(self.unrelayed(), [])
+
+    def test_kewei_2_an_event_close_then_a_crash_is_listed_with_its_event_until_relayed(self):
+        self.assertTrue(self.w.m(self.e, final=True)["matched"])
+        self.assertEqual(self.unrelayed(), [(C1, self.e)])
         self.assertTrue(policy.mark_relayed(self.w.ws[SELF], C1)["ok"])
-        self.assertIn("already answered", self.w.m(e, final=True)["reason"])
+        self.assertEqual(self.unrelayed(), [])
 
+    def test_kewei_2_a_bound_answer_whose_close_failed_is_shown_and_closes_by_event(self):
+        with crash_on_close():
+            self.assertFalse(self.w.m(self.e, final=True)["matched"])
+        shown = policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF], self_mxid=SELF)[C1]
+        self.assertEqual(shown, {"event_id": self.e, "text": "up", "bound": "answer"})
+        self.assertTrue(self.w.m(self.e, final=True)["matched"])
+        self.assertEqual(self.unrelayed(), [(C1, self.e)])
+
+    def test_kewei_1_a_completed_task_cannot_close_an_existing_binding(self):
+        with crash_on_close():
+            self.assertFalse(self.by_task(final=True)["matched"])
+        (self.w.ws[SELF] / "results" / f"{self.tid}.txt").write_text("[no-send]")
+        for kw in ({}, {"final": True}, {"not_final": True}):
+            self.assertIn("already has a result", self.by_task(**kw)["reason"], kw)
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])
+        done = self.w.m(self.e, final=True)
+        self.assertEqual((done["matched"], done["cid"]), (True, C1), done)
+        self.assertEqual(self.unrelayed(), [(C1, self.e)])  # the event route's ack is `relayed`
+
+
+class TestWaitingPreview(WorldCase):
     def test_the_waiting_preview_is_the_text_match_returns(self):
         self.w.ask(SELF, SIB, cid=C1)
         e = self.sib(f"{SELF} — [no-send]\n[file: /tmp/x] up")
@@ -1130,31 +1150,11 @@ class TestKeweiReview5484867928(WorldCase):
         self.assertFalse(preview["text"].startswith(SELF))
 
 
-class TestReplayUntilRelayed(WorldCase):
+class TestMatchRefusals(WorldCase):
     def setUp(self):
         super().setUp()
         self.w.ask(SELF, SIB, cid=C1)
         self.e = self.sib(f"{SELF} — up")
-
-    def test_a_reply_task_replays_until_its_result_exists(self):
-        tid = self.w.deliver(SELF, self.e, "task-reply")
-        first = policy.match_reply(self.w.tr[SELF], room=ROOM, self_mxid=SELF, workspace=self.w.ws[SELF],
-                                   task_id=tid, final=True)
-        again = policy.match_reply(self.w.tr[SELF], room=ROOM, self_mxid=SELF, workspace=self.w.ws[SELF],
-                                   task_id=tid, final=True)
-        self.assertEqual((first["matched"], first["reply_text"], again.get("replay")), (True, "up", True))
-        self.assertEqual(first["lead"], f"[channel: {OWNER_DM}]\n")
-        (self.w.ws[SELF] / "results" / f"{tid}.txt").write_text("[no-send]")
-        done = policy.match_reply(self.w.tr[SELF], room=ROOM, self_mxid=SELF, workspace=self.w.ws[SELF],
-                                  task_id=tid, final=True)
-        self.assertIn("already answered", done["reason"])
-
-    def test_a_match_by_event_replays_until_relayed(self):
-        self.assertTrue(self.w.m(self.e, final=True)["matched"])
-        self.assertTrue(self.w.m(self.e, final=True)["replay"])
-        self.assertTrue(self.w.m(self.e)["replay"])
-        self.assertTrue(policy.mark_relayed(self.w.ws[SELF], C1)["ok"])
-        self.assertIn("already answered", self.w.m(self.e, final=True)["reason"])
 
     def test_match_refusals(self):
         tr, ws = self.w.tr[SELF], self.w.ws[SELF]

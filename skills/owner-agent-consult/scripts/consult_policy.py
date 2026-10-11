@@ -317,7 +317,8 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
             expire_after_s: float = DEFAULT_EXPIRE_AFTER_S) -> List[dict]:
     """Unanswered consults, oldest first; `nudge_due` when overdue and the owner was not yet
     told, `unconfirmed` when the ask's post was never confirmed, `expired` past the expiry, plus
-    any live task holding a root claim with no record (`claim_only`). Claims are never pruned;
+    closed consults whose relay is not acknowledged (`closed_unrelayed`) and any live task
+    holding a root claim with no record (`claim_only`). Claims are never pruned;
     an expired record is pruned once the owner has been told and its task can no longer post."""
     now = time.time() if now is None else now
     for r in records(workspace, "nudged"):  # answered/ is terminal and never pruned
@@ -339,6 +340,13 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
         out.append({**r, "age_s": int(age) if age != float("inf") else None, "overdue": overdue,
                     "nudged": nudged, "unconfirmed": not r.get("ask_event"),
                     "nudge_due": overdue and not nudged, "expired": age > expire_after_s})
+    for r in records(workspace, "answered"):
+        if not _relay_done(workspace, r):
+            out.append({"cid": r["cid"], "task_id": r.get("task_id"), "agent": r.get("agent"),
+                        "origin": r.get("origin"), "answer_event": r.get("answer_event"),
+                        "closed_unrelayed": True,
+                        "reason": "closed, but its relay is not acknowledged: tell the owner once that the "
+                                  "answer may not have been delivered, then run `relayed <cid>`"})
     roots = Path(workspace) / _STATE / "roots"
     for f in sorted(roots.glob("*.json")) if roots.is_dir() else []:
         task = f.name[:-len(".json")]
@@ -532,7 +540,7 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
     if held is not None:
         if not held.get("event_id"):
             return no("an earlier answer to this ask is unconfirmed; it is not posted again", unconfirmed=True)
-        return {**base, "event_id": held["event_id"], "replay": True}
+        return {**base, "event_id": held["event_id"], "already_posted": True}
     if not _claim_file(claim, {"ask_event": inc["ask_event"], "to": inc["asker"], "at": time.time(),
                                "event_id": None, "task_id": task_id}):
         return no("another answer to this ask is being posted")
@@ -620,7 +628,8 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
     arrived as (`task_id`) or by its event (`event_id`). With neither flag it only looks
     (`candidate: true`). `final` binds it as the answer and closes the consult; `not_final`
     binds it as progress. A message is bound once (`bound/<event>`, never deleted); the
-    binding holds what closing needs, so a retry finishes it without reading the room."""
+    binding holds what closing needs, so a failed close finishes without reading the room.
+    A consult closes once and its answer is returned once; nothing is ever replayed."""
     def no(reason, **extra):
         return {"matched": False, "reason": reason, **extra}
     if bool(task_id) == bool(event_id):
@@ -638,13 +647,14 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
         event = h.get("source_message_id")
         if not event:
             return no("task names no source message")
+    import local_task_protocol as ltp
+    if task_id and ltp.find_result(Path(workspace) / "results", task_id) is not None:
+        return no("the reply task already has a result; a handled task binds and closes nothing "
+                  "(use --event-id)")
     bind = _key_path(workspace, "bound", event)
     bound = _read_record(bind)
     if bound is not None:
         return _judged(workspace, bound, event, task_id, final, not_final, no)
-    import local_task_protocol as ltp
-    if task_id and ltp.find_result(Path(workspace) / "results", task_id) is not None:
-        return no("the reply task already has a result; a handled task does not bind a message")
     messages, err = _room_page(transport, room)
     if err:
         return no(err)
@@ -658,7 +668,7 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
     if rec.get("room") != room:
         return no(f"consult {cid} was asked in another room")
     if _record_path(workspace, "answered", cid).exists():
-        return _replay(workspace, cid, task_id, event, no)
+        return _already_answered(workspace, cid, no)
     if not _in_consult(workspace, rec, msg):
         return no(f"not from {rec['agent']}, the agent consult {cid} asked")
     late = _window_refusal(rec, msg, messages, max_duration_s)
@@ -709,23 +719,24 @@ def _judged(workspace: Path, bound: dict, event: str, task_id, final: bool, not_
     if not_final:
         return no("this message was bound as the answer; --not-final conflicts with that judgement "
                   "(run --final to finish closing)", conflict=True, cid=cid)
+    if _record_path(workspace, "answered", str(cid)).exists():
+        return _already_answered(workspace, str(cid), no)
     if not final:
-        if _record_path(workspace, "answered", str(cid)).exists():
-            return _replay(workspace, cid, task_id, event, no)
         return no("this message was bound as the answer; run --final to finish closing", candidate=True,
                   bound="answer", cid=cid, reply_text=bound["payload"].get("reply_text"), event_id=event)
     return _close(workspace, bound, event, task_id, no)
 
 
 def _close(workspace: Path, binding: dict, event: str, task_id, no) -> dict:
-    """Close the binding's consult: link answered/<cid> (once) holding the payload."""
+    """Close the binding's consult once: link answered/<cid>, recording which route closed it.
+    The answer is returned to this caller only; a crash before its relay is reported, not retried."""
     cid = str(binding["cid"])
     dst = _record_path(workspace, "answered", cid)
     claim = {**binding["record"], "answered_at": time.time(), "answer_event": event,
              "reply_task": task_id, "payload": binding["payload"]}
     try:
         if not _claim_file(dst, claim):
-            return _replay(workspace, cid, task_id, event, no)
+            return _already_answered(workspace, cid, no)
     except OSError as e:
         return no(f"consult {cid} could not be closed: {e}")
     _record_path(workspace, "pending", cid).unlink(missing_ok=True)
@@ -733,23 +744,32 @@ def _close(workspace: Path, binding: dict, event: str, task_id, no) -> dict:
     return binding["payload"]
 
 
-def _replay(workspace: Path, cid: str, task_id: Optional[str], event: str, no) -> dict:
-    """A closed consult's stored payload, again, until it is relayed: for the reply task that
-    closed it while that task has no result, or for the same event until `relayed` is recorded."""
-    import local_task_protocol as ltp
+def _already_answered(workspace: Path, cid: str, no) -> dict:
     rec = _read_record(_record_path(workspace, "answered", cid)) or {}
-    if not isinstance(rec.get("payload"), dict) or rec.get("answer_event") != event:
-        return no(f"consult {cid} is already answered by another message", answered_by=rec.get("answer_event"))
-    if task_id and rec.get("reply_task") == task_id \
-            and ltp.find_result(Path(workspace) / "results", task_id) is None:
-        return {**rec["payload"], "replay": True}
-    if not task_id and not rec.get("reply_task") and not rec.get("relayed"):
-        return {**rec["payload"], "replay": True}
-    return no(f"consult {cid} is already answered")
+    return no(f"consult {cid} is already answered; its answer is never delivered twice",
+              answered_by=rec.get("answer_event"))
+
+
+def _relay_done(workspace: Path, rec: dict) -> bool:
+    """The close's relay is acknowledged: `relayed` recorded, or the closing reply task has a result."""
+    import local_task_protocol as ltp
+    task = rec.get("reply_task")
+    return bool(rec.get("relayed")) or bool(
+        task and ltp.find_result(Path(workspace) / "results", task) is not None)
+
+
+def _answer_binding(workspace: Path, cid: str) -> Optional[dict]:
+    """The message bound as this consult's answer whose close has not landed, if any."""
+    d = Path(workspace) / _STATE / "bound"
+    for p in sorted(d.glob("*.json")) if d.is_dir() else []:
+        b = _read_record(p)
+        if b and b.get("cid") == cid and b.get("disposition") == "answer":
+            return b
+    return None
 
 
 def mark_relayed(workspace: Path, cid: str) -> dict:
-    """Record that a consult matched by event (not by a task) has been relayed: no more replays."""
+    """Acknowledge a closed consult's relay (delivered, or reported to the owner as possibly not)."""
     path = _record_path(workspace, "answered", cid) if _CID.match(cid or "") else None
     rec = _read_record(path) if path else None
     if rec is None:
@@ -760,13 +780,19 @@ def mark_relayed(workspace: Path, cid: str) -> dict:
 
 def waiting_answers(transport, room: str, workspace: Path, max_duration_s: int = DEFAULT_MAX_DURATION_S,
                     self_mxid: str = "") -> dict:
-    """{cid: {event_id, text[, refused]}}: for each confirmed pending consult, the asked agent's
-    oldest message in it not yet judged, when no task brought it here. `refused` carries the
-    reason `match` will give when that message falls outside the answer window. One room read."""
+    """{cid: {event_id, text[, refused | bound]}}: for each confirmed pending consult, the asked
+    agent's oldest message in it not yet judged, when no task brought it here. `refused` carries
+    the reason `match` will give when it falls outside the answer window; `bound: "answer"` marks a
+    message already bound as the answer whose close did not land. One room read."""
     messages, err = _room_page(transport, room)
     out = {}
     for r in records(workspace, "pending") if not err else []:
         if not r.get("ask_event") or r.get("room") != room:
+            continue
+        held = _answer_binding(workspace, r["cid"])
+        if held:
+            out[r["cid"]] = {"event_id": held.get("event"), "text": (held.get("payload") or {}).get("reply_text"),
+                             "bound": "answer"}
             continue
         cands = [m for m in reversed(messages) if _in_consult(workspace, r, m)
                  and not _key_path(workspace, "bound", m.get("event_id")).exists()]
