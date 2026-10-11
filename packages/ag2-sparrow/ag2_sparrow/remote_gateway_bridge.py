@@ -2074,6 +2074,9 @@ def _valid_tid(tid: str) -> bool:
     return bool(_TID_RE.fullmatch(tid)) and tid not in (".", "..")
 
 
+_CONTROL_TO_SPACE = {c: " " for c in (*range(0x20), *range(0x7F, 0xA0))}
+
+
 def _one_line(value) -> str:
     """Header-safe single-line value: CR/LF stripped so a gateway-controlled
     field can't inject extra `key: value` lines (e.g. forge a second
@@ -2085,8 +2088,11 @@ def _one_line(value) -> str:
 
     Folds on str.splitlines()' own set, not on CR/LF: readers split with
     splitlines(), so any narrower set leaves a separator that is one line to
-    the writer and two to the reader."""
-    return " ".join(str(value).splitlines())
+    the writer and two to the reader.
+
+    Every other C0/C1 control character (ESC, BEL, NUL, TAB, DEL...) becomes a
+    space too, so no field carries terminal escapes into a header or env value."""
+    return " ".join(str(value).splitlines()).translate(_CONTROL_TO_SPACE)
 
 
 def _redact_url(value: str) -> str:
@@ -3391,7 +3397,7 @@ def _on_task_header_env(text: str) -> "dict[str, str]":
     env = {}
     for name, key in _ON_TASK_ENV_FIELDS:
         value = _one_line(headers.get(key) or "").strip()[:_ON_TASK_ENV_MAX]
-        if value and "\x00" not in value and not any(sec in value for sec in secrets):
+        if value and not any(sec in value for sec in secrets):
             env[name] = value
     return env
 

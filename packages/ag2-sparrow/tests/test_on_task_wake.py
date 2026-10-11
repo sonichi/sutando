@@ -233,6 +233,44 @@ def test_env_carries_the_routing_headers():
         print("PASS test_env_carries_the_routing_headers")
 
 
+def test_header_holding_the_token_is_not_exported():
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        cmd, out = _recorder_cmd(base)
+        m = _load(base, cmd)
+        task = {**_task(), "sender_name": f"Mallory {SECRET}",
+                "thread_root": f"$root-{MEDIA_SECRET}:ag2.space"}
+        m._write_task(task)
+        env = _calls(out, 1)[0]["env"]
+        assert "SPARROW_SENDER_NAME" not in env, env.get("SPARROW_SENDER_NAME")
+        assert "SPARROW_THREAD_ROOT" not in env, env.get("SPARROW_THREAD_ROOT")
+        assert env["SPARROW_SOURCE"] == "ag2space"
+        assert not any(SECRET in v or MEDIA_SECRET in v for v in env.values())
+        print("PASS test_header_holding_the_token_is_not_exported")
+
+
+def test_control_characters_never_reach_env():
+    controls = "".join(chr(c) for c in (*range(0x20), *range(0x7F, 0xA0)))
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        cmd, out = _recorder_cmd(base)
+        m = _load(base, None)
+        assert m._one_line("a\x1b[31mb\x07c\x9bd\te\x00f") == "a [31mb c d e f"
+        assert not any(ch in m._one_line(f"x{controls}y") for ch in controls)
+        m.ON_TASK_CMD = cmd
+        path = base / "task-c.txt"
+        path.write_text("id: task-c\nsender_name: Al\x1b]0;pwn\x07ice\x9b\x7f\n"
+                        "source_message_id: $e\x1b[2J:ag2.space\ntask: hi\n")
+        m._fire_on_task("task-c", path)
+        env = _calls(out, 1)[0]["env"]
+        assert env["SPARROW_SENDER_NAME"] == "Al ]0;pwn ice", env["SPARROW_SENDER_NAME"]
+        assert env["SPARROW_SOURCE_MESSAGE_ID"] == "$e [2J:ag2.space"
+        for k, v in env.items():
+            if k.startswith("SPARROW_"):
+                assert not any(ch in v for ch in controls), (k, v)
+        print("PASS test_control_characters_never_reach_env")
+
+
 def test_child_that_ignores_or_closes_stdin_never_blocks():
     big = "x" * (512 * 1024)  # larger than any pipe buffer
     cases = [
@@ -338,6 +376,8 @@ if __name__ == "__main__":
     test_token_never_reaches_the_command()
     test_stdin_carries_the_exact_task_bytes()
     test_env_carries_the_routing_headers()
+    test_header_holding_the_token_is_not_exported()
+    test_control_characters_never_reach_env()
     test_child_that_ignores_or_closes_stdin_never_blocks()
     test_stdin_feed_in_the_calling_thread()
     test_fire_reads_the_file_when_no_text_is_given()

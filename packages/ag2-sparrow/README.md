@@ -165,7 +165,8 @@ REMOTE_TASK_ON_TASK="my-agent run-task" ag2-sparrow
   watcher. A command that never reads stdin works as before; Sparrow closes the
   pipe after 30 seconds if it is still unread.
 - The task's routing headers are in the environment, each a single line of at
-  most 512 characters and set only when the task file has that header:
+  most 512 characters (control characters become spaces) and set only when
+  the task file has that header:
 
   | Variable | Task header |
   | --- | --- |
@@ -192,8 +193,11 @@ REMOTE_TASK_ON_TASK="my-agent run-task" ag2-sparrow
   Handing the task over on stdin does not change this: the wake is still
   fired once per fresh publish, with no retry and no re-wake after a restart
   (a bounded retry and a re-wake on restart are planned).
-- Your relay token is never passed to it: every `REMOTE_*`/`AG2_*` token variable,
-  and any variable holding the token's value, is removed from its environment.
+- Your relay token is never placed in its argv or environment: every
+  `REMOTE_*`/`AG2_*` token variable, and any variable holding the token's value
+  (including a `SPARROW_*` header that contains it), is removed. Stdin carries
+  the task exactly as written to the task file, so if the message text itself
+  contains the token, stdin does too.
 
 Unset (the default), Sparrow behaves exactly as before.
 
