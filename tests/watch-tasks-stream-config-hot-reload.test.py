@@ -24,6 +24,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -44,7 +46,7 @@ def start_watcher(ws, errf, instance=None, inbox=None):
     # `instance` and `inbox` are set together: a worker's own inbox is
     # <ws>/deliveries/<id>, never the bare <ws>/tasks.
     inbox = inbox or (ws / "tasks")
-    env = dict(os.environ)
+    env = clean_env()
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     if instance:
         env["SUTANDO_INSTANCE_ID"] = instance

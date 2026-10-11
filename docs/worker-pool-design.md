@@ -112,8 +112,24 @@ namesake.
 tasks/task-123.txt                                              the payload: immutable, never copied, never moved until finish
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.txt        a sentinel, 0 bytes — existing IS the assignment
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.accepted   the same sentinel, suffix substituted
-tasks/archive/task-123.txt                                      finish (sentinel removed, payload archived)
+tasks/archive/task-123.txt                                      finish (payload archived; the same step moves the sentinel)
+deliveries/7c54b230a8d94ea9b86f52d70134ac68/archive/task-123.txt  ...into its inbox's archive/, never re-swept
 ```
+
+**Retiring a finished sentinel.** The step that archives a task body (`task_archive.archive_file`
+for the chat bridges, the gateway's `_archive_result`) also renames that task's sentinel, under
+either suffix, into its inbox's `archive/`, holding the inbox's `.lock`. That step is the one
+owner of "this task is done"; nothing else retires a sentinel. Sentinels archived before that
+step existed are retired by `python3 src/task_archive.py retire-archived-pointers <workspace>`:
+
+- **What it moves:** a sentinel whose body is gone from `tasks/` and present in `tasks/archive/`
+  (flat or `YYYY-MM/`) or `tasks/processed/`. A sentinel whose body is still in `tasks/` is pending
+  and is never touched; one whose body is nowhere is kept too (it costs the sweep nothing).
+- **Idempotence:** a second run finds nothing left to move and reports `"retired": 0`.
+- **When it runs:** every watcher runs it once per workspace, before its first sweep plan, and
+  records the run in `state/migrations/retire-archived-pointers.v1.done`; a failed run writes no
+  marker and retries on the next start. It runs in the sweep's background producer, so it never
+  delays reading a new event.
 
 **Files under `deliveries/` are sentinels, not tasks.** A sentinel needs no content:
 the id is its name, the recipient is its folder, and the worker reads the payload from
@@ -287,11 +303,10 @@ a live process is the double-arm the ladder exists to prevent. A session-role
 watcher stamps its sentinel and starts its beat before its startup sweep, so
 inside the sweep it reads as live and events queue rather than drop; its only
 held-and-beatless window is the readiness round-trip, a few seconds the
-three-tick sustain absorbs. A watcher on the non-session order sweeps before it
-subscribes and is deaf for as long as a stale-sentinel backlog stalls that sweep
-(#4588); it is not a session-role holder, so its stale beat counts as a lost
-watcher and the rung acts on it after the sustain, which is the right outcome
-for a watcher that cannot hear. A holder check that could not be told is not
+three-tick sustain absorbs. Every watcher subscribes before it sweeps, and the
+sweep is planned by one process (`task_dispatch.py sweep-plan`, one `--batch`
+resolver run) and fed into the event FIFO, so a task that arrives mid-sweep is
+read in arrival order rather than after the backlog. fswatch never writes that FIFO itself: it writes to `src/line_relay.py`, which drains it at once and forwards each line in one write. fswatch 1.18 on macOS segfaults when a burst backs up behind a full pipe, and one write per line keeps every line whole beside the sweep's. A holder check that could not be told is not
 evidence either way.
 
 **A live session that will not progress is the third rung.** A seat's session can

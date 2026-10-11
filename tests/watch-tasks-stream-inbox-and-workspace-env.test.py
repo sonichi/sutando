@@ -24,6 +24,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -68,7 +70,7 @@ def _run_watcher(root: Path, env: dict, ready, inbox: str, timeout: float = 8.0)
 
 
 def _base_env(**extra) -> dict:
-    env = {**os.environ, **extra}
+    env = {**clean_env(), **extra}
     for k in ("SUTANDO_TASKS_DIR", "SUTANDO_WORKSPACE_DIR"):
         if k not in extra:
             env.pop(k, None)

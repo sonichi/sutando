@@ -22,6 +22,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 W = "a" * 32
@@ -50,7 +52,7 @@ def run(worker_row, bound=True):
         f"id: task-bound\nchannel_id: {room}\nsource: ag2space\n"
         "access_tier: owner\ntask: body\n")
 
-    env = dict(os.environ)
+    env = clean_env()
     env["PATH"] = f"{b}:{env['PATH']}"
     env["TMPDIR"] = str(tmp)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")

@@ -33,6 +33,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -50,10 +52,10 @@ def check(name, cond, detail=""):
 
 
 def start_watcher(inbox, errf, instance=None, role="standby", extra_env=None, workspace=None):
-    # Pin workspace/tasks-dir env explicitly: dict(os.environ) can inherit a
+    # Pin workspace/tasks-dir env explicitly: clean_env() can inherit a
     # REAL SUTANDO_WORKSPACE_DIR from a live worker shell running this test.
     ws = workspace if workspace else inbox.parent
-    env = dict(os.environ)
+    env = clean_env()
     env["SUTANDO_WORKSPACE_DIR"] = str(ws)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env.pop("SUTANDO_TASKS_DIR", None)

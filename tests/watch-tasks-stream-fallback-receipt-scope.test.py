@@ -23,6 +23,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FAILURES: list[str] = []
@@ -46,14 +48,14 @@ def run(watcher_instance, receipt_owner, want_state=False):
     name = "task-demo.txt"
     (inbox / name).write_text("id: task-demo\naccess_tier: owner\ntask: probe\n")
     if receipt_owner is not None:
-        env0 = dict(os.environ)
+        env0 = clean_env()
         if receipt_owner != "default": env0["SUTANDO_INSTANCE_ID"] = receipt_owner
         else: env0.pop("SUTANDO_INSTANCE_ID", None)
         d = subprocess.run(["python3", str(REPO/"src/util_paths.py"), "handler-fallbacks-dir",
                             str(ws/"state")], capture_output=True, text=True, env=env0).stdout.strip()
         Path(d).mkdir(parents=True, exist_ok=True)
         (Path(d) / name).write_text(str(inbox / name) + "\n")
-    env = dict(os.environ)
+    env = clean_env()
     env["PATH"] = f"{b}:{env['PATH']}"; env["TMPDIR"] = str(tmp)
     env["SUTANDO_RESULTS_DIR"] = str(ws / "results")
     env["SUTANDO_TASK_EVENT_HANDLER"] = str(h)
