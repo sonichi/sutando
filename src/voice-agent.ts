@@ -42,7 +42,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY } from './meeting-dictation.js';
+import { attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY, restoreAfterFreshConnection } from './meeting-dictation.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
@@ -1113,6 +1113,8 @@ async function main() {
 		},
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
+	// A fresh provider connection keeps only the recent conversation: meeting dictation restores the rest.
+	restoreAfterFreshConnection(session.eventBus, meetingDictation);
 
 	// P7 D7.1: install the session-layer ledger wraps (audio ingress count +
 	// ingress-RMS speech tracker, audio_health heartbeat intercept, egress
