@@ -29,6 +29,7 @@ lower-precedence candidate.
 | `REMOTE_TASK_TOKEN` | yes | — | Bearer token sent on every request. |
 | `REMOTE_TASK_PROVIDER` | no | `remote` | Label written as a task's `source:` when the task omits one. |
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
+| `REMOTE_TASK_ON_TASK` | no | — | Wake command run once per newly queued task file. Split with `shlex` and run without a shell, the file path appended as the last argument; `SPARROW_TASK_ID` and `SPARROW_TASK_FILE` are set and every relay credential is removed from its environment. Sparrow does not wait for it, kill it, or retry it; a non-zero exit or a start failure is logged once. |
 | `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`guest` for a shared gateway (see Security); `other` is accepted as the legacy spelling of `guest`. |
 | `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one; with no reading yet they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
 | `REMOTE_ALERT_ROOM` | no | none (gateway alert disabled) | Explicit owner-only room id for core-independent health alerts sent by the launchd fallback. Never inferred from last activity because that room may be shared. |
@@ -119,7 +120,32 @@ Return a task's result.
 
 ```
 body: { "id": "task-123", "body": "<result text>" }
+body: { "id": "task-123", "body": "<result text>", "thread": "ask" }   // optional
 ```
+
+**`thread` (optional).** Defined by the broker in
+[ag2-space/ag2space-backend#2138](https://github.com/ag2-space/ag2space-backend/pull/2138).
+`"ask"` asks the broker to answer in a new thread rooted on the task's own asking
+message; no field names an event id, so a result can only open a thread on the
+message it was asked in. The broker:
+
+- answers an ask already in a thread in that thread, with or without the field;
+- ignores the field and posts a plain reply when the task has no source message,
+  the body redirects with `[channel:]`, or the ask cannot root a thread;
+- treats absent, `null` or `false` as today's placement;
+- answers `400 {"error": "invalid thread: ..."}` for any other value and records,
+  sends and completes nothing: the lease stays open.
+
+A broker that predates the field ignores it, so a client may send it before the
+broker supports it. The client sends only `"ask"`, and only on an ordinary
+(non-suppressed, non-redirected) task result whose leading lines carry a bare
+`[thread]` line (`src/result_markers.py`). Backend #2138 defines `"ask"` as valid,
+so a `400` (or any other refusal) of a result carrying it is a bug to investigate,
+not something the client degrades around: it parks like any other 4xx (below), with
+no re-post. A retryable failure re-sends the stored payload, field included. The
+field name and value live in one
+place on the client: `RESULT_THREAD_FIELD` / `RESULT_THREAD_ASK` in
+`packages/ag2-sparrow/ag2_sparrow/delivery_core/provider_ag2space.py`.
 
 ### `POST /v1/heartbeat`
 

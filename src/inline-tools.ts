@@ -680,7 +680,7 @@ export const cancelTaskTool: ToolDefinition = {
 
 			// list mode: the user's open voice tasks with where each stands now, no cancel
 			if (list) {
-				const open = voiceTaskRows().filter((r) => r.state === 'queued' || r.state === 'started' || r.state === 'cancel_requested');
+				const open = voiceTaskRows().filter((r) => r.state === 'queued' || r.state === 'started');
 				console.log(`${ts()} [CancelTask] list: ${open.length} open`);
 				if (open.length === 0) return { status: 'nothing_pending', count: 0, tasks: [] };
 				return { status: 'pending_tasks', count: open.length, tasks: open.map((r) => ({ id: r.id, preview: r.text.slice(0, 60), state: r.state })) };
@@ -725,6 +725,13 @@ export const cancelTaskTool: ToolDefinition = {
 				return { status: 'already_started', taskId: safeTargetId, message: 'The core is already working on it and cannot stop partway, so nothing was cancelled. Tell the user it is already in progress and will finish.' };
 			}
 
+			// Still queued: its file is removed, so the core never runs it. If the core took it in that
+			// instant, its result comes with CANCELLED_BUT_FINISHED_NOTE.
+			if (state === 'queued' && isVoiceSubmittedTask(safeTargetId)) {
+				noteVoiceTaskCancelled(safeTargetId);
+				return { status: 'cancelled', taskId: safeTargetId, message: 'Removed from the queue before the core started it. Tell the user it is cancelled.' };
+			}
+
 			// Write a CANCEL_INSTRUCTION task — core picks it up next and aborts/skips
 			// the named target. Design (Chi 2026-05-13): reuse the task pipeline as the
 			// cancel signal channel instead of building a parallel one.
@@ -740,10 +747,6 @@ export const cancelTaskTool: ToolDefinition = {
 			writeFileSync(join(tasksDir, cancelFilename), cancelBody);
 
 			console.log(`${ts()} [CancelTask] cancel-instruction written for ${safeTargetId} → ${cancelFilename}`);
-			if (state === 'queued' && isVoiceSubmittedTask(safeTargetId)) {
-				noteVoiceTaskCancelled(safeTargetId);
-				return { status: 'cancel_requested', taskId: safeTargetId, message: 'The core had not started it and was asked not to run it; it can still have taken it already. Tell the user you asked to cancel it and will confirm when the core replies. Do not say it is cancelled.' };
-			}
 			// Not a voice task, or one whose state is unknown: the core's reply says what happened.
 			return { status: 'cancel_instruction_queued', taskId: safeTargetId, instruction: `task-${cancelTs}`, message: 'Asked the core to stop it; it may already have finished. Tell the user you asked to cancel it, not that it is cancelled.' };
 		} catch (err) {
@@ -826,7 +829,6 @@ export function describeVoiceTasks(rows: VoiceTaskRow[]): string {
 	const parts = [
 		group('in progress', (r) => r.state === 'started'),
 		group('queued', (r) => r.state === 'queued'),
-		group('cancel requested, waiting for the core to confirm', (r) => r.state === 'cancel_requested'),
 		group('cancelled', (r) => r.state === 'cancelled'),
 		group('done and already told to the user', (r) => r.state === 'done' && heard(r)),
 		group('done but the user has not heard the result yet', (r) => r.state === 'done' && !heard(r)),
@@ -1040,7 +1042,7 @@ export const showViewTool: ToolDefinition = {
 
 export const readNoteTool: ToolDefinition = {
 	name: 'read_note',
-	description: 'Read a specific note by name or slug. Speak the content to the user.',
+	description: 'Read a note by name or slug; the newest matching note is returned. Speak the content to the user. If the user may mean one of otherMatches instead (e.g. an earlier meeting), ask which.',
 	parameters: z.object({
 		name: z.string().describe('Note name or slug to search for'),
 	}),
@@ -1048,13 +1050,17 @@ export const readNoteTool: ToolDefinition = {
 	async execute(args) {
 		const { name } = args as { name: string };
 		try {
-			const files = readdirSync(NOTES_DIR).filter(f => f.endsWith('.md'));
 			const query = name.toLowerCase().replace(/\s+/g, '-');
-			const match = files.find(f => f.toLowerCase().includes(query));
-			if (!match) return { error: `No note matching "${name}" found` };
+			const matches = readdirSync(NOTES_DIR)
+				.filter(f => f.endsWith('.md') && f.toLowerCase().includes(query))
+				.map(f => ({ f, mtime: statSync(join(NOTES_DIR, f)).mtimeMs }))
+				.sort((a, b) => b.mtime - a.mtime);
+			if (!matches.length) return { error: `No note matching "${name}" found` };
+			const match = matches[0].f;
 			let content = readFileSync(join(NOTES_DIR, match), 'utf-8');
 			content = content.replace(/^---[\s\S]*?---\n/, ''); // strip frontmatter
-			return { title: match.replace('.md', ''), content: content.slice(0, 2000) };
+			const otherMatches = matches.slice(1, 6).map(m => m.f.replace('.md', ''));
+			return { title: match.replace('.md', ''), content: content.slice(0, 2000), ...(otherMatches.length ? { otherMatches } : {}) };
 		} catch (e) { return { error: String(e) }; }
 	},
 };

@@ -25,7 +25,8 @@ would stop recognizing the sanitizer and start flagging every upload site.
 
 Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
 
-  SKIP markers — at body start (must be the first non-whitespace chars):
+  SKIP markers — at body start, or directly after the leading markers below
+  ([thread:], [thread], [reply:], a standalone [dm-only]; not after [channel:]):
     [no-send]
     [REPLIED]
     [deduped: <task-id>]
@@ -36,6 +37,22 @@ Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
     [channel: <channel-id>]
   When found, the bridge delivers the body to <channel-id> instead of the
   task's originating channel. The body is the text AFTER this line.
+
+  THREAD marker — a leading line, before or after [channel:]:
+    [thread: <root event id>]
+  Posts the body inside that thread. Only an id starting with `$` counts; any
+  other value emits a `thread-invalid` action (posted top level, consumer
+  logs it). Stripped either way; consumers without threads just post the body.
+  A root belongs to the room its [channel:] names (the default room without
+  one). Under [dm-only], or when the leading lines name two different rooms,
+  the destination may not be that room: `thread-foreign` replaces `thread`
+  and the body is posted top level.
+
+  THREAD-ASK marker — a leading line that is exactly this, in any order with the above:
+    [thread]
+  A task result only: the gateway asks the broker to answer in a new thread on
+  the task's own asking message (`"thread": "ask"`). It names no event, so it
+  cannot open a thread anywhere else. Stripped everywhere; ignored elsewhere.
 
   DM-ONLY marker — anywhere in the body:
     [dm-only]
@@ -67,6 +84,11 @@ Parse contract:
     .actions   list[Action] — what the bridge should do, in priority order:
                  ("skip", reason)         — archive, no delivery
                  ("redirect", channel_id) — deliver to alternate channel
+                 ("thread", root_event_id) — post inside that thread
+                 ("thread-invalid", raw)  — malformed [thread:]; post top level
+                 ("thread-foreign", root) — root may not be the destination's;
+                                            post top level (extra: why)
+                 ("thread-ask", "")       — task result: thread on the ask
                  ("attach", path)         — bridge runs its own allowlist
                                             check, then uploads
 
@@ -84,7 +106,8 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
-ActionKind = Literal["skip", "redirect", "attach", "dm-only"]
+ActionKind = Literal["skip", "redirect", "attach", "dm-only", "reply", "thread",
+                     "thread-invalid", "thread-foreign", "thread-ask"]
 
 
 @dataclass
@@ -174,6 +197,14 @@ _DMONLY_RE = re.compile(r"\[dm-only\]\s*\n?", re.IGNORECASE)
 # digits is a Discord snowflake; anything else is left in place, never eaten.
 _REPLY_RE = re.compile(r"^\s*\[reply:\s*(\d{17,20})\]\s*\n?")
 
+# [thread: <root event id>] — any value is consumed so the marker never leaks;
+# only a whitespace-free `$...` id is a thread target.
+_THREAD_RE = re.compile(r"^\s*\[thread:\s*([^\]]*)\]\s*\n?", re.IGNORECASE)
+_THREAD_ROOT_RE = re.compile(r"\$\S+")
+# Bare [thread] — a task result asks for a thread on its own ask; no id is read.
+# Only a line of its own: "[thread]ing ..." or "[thread] text" is prose.
+_THREAD_ASK_RE = re.compile(r"^\s*\[thread\][ \t]*(?:\r?\n|\Z)", re.IGNORECASE)
+
 #: STRIPPING is narrower than DETECTION, deliberately. Detection stays
 #: `search()`-anywhere so the privacy guard cannot be defeated by marker
 #: ORDER (see the docstring). But removing every occurrence also removed
@@ -251,25 +282,52 @@ def parse_markers(text: str) -> ParseResult:
     # A bridge that sees the dm-only action (or, equivalently, the ABSENCE of a
     # redirect action) delivers to the DM.
     dm_only = bool(_DMONLY_RE.search(body))
+    # Where a strip glued the rest of its line to a line start: no line boundary there.
+    glued: set[int] = set()
     if dm_only:
         actions.append(Action(kind="dm-only", value=""))
-        body = _DMONLY_STRIP_RE.sub("", body)
+        parts, last = [], 0
+        for m in _DMONLY_STRIP_RE.finditer(body):
+            parts.append(body[last:m.start()])
+            if not m.group(0).endswith("\n") and m.end() < len(body):
+                glued.add(sum(map(len, parts)))
+            last = m.end()
+        body = "".join(parts) + body[last:]
 
     # 3. REDIRECT — must be the first non-empty line (after any D7 header).
     # Suppressed entirely when dm-only is set: strip a leading `[channel:]`
     # marker so it can't leak into the DM, but emit NO redirect action so the
     # private body stays in the owner's DM.
-    # 2. LEADING MARKERS — [channel:] and [reply:] in either order; order
+    # 2. LEADING MARKERS — [channel:], [thread:] and [reply:] in any order; order
     # independence keeps an unparsed marker from reaching the user as text.
+    named: set[str] = set()
+    lead = body
     while True:
         redirect_match = _REDIRECT_RE.match(body)
         if redirect_match:
             channel = redirect_match.group(1).strip()
+            if channel:
+                named.add(channel)
             if not dm_only and channel:
                 # Empty target = no action: "" release-loops at the default
                 # sink and raises in Discord's int() conversion.
                 actions.append(Action(kind="redirect", value=channel))
             body = body[redirect_match.end():]
+            continue
+        thread_match = _THREAD_RE.match(body)
+        if thread_match:
+            root = thread_match.group(1).strip()
+            ok = _THREAD_ROOT_RE.fullmatch(root) is not None
+            actions.append(Action(kind="thread" if ok else "thread-invalid", value=root))
+            body = body[thread_match.end():]
+            continue
+        ask_match = _THREAD_ASK_RE.match(body)
+        at = len(lead) - len(body) + (ask_match.group(0).index("[") if ask_match else 0)
+        start = len(lead[:at].rstrip(" \t"))  # indentation from the physical line start is allowed
+        if ask_match and (start == 0 or lead[start - 1] == "\n") and not glued & {at, start}:
+            if not any(a.kind == "thread-ask" for a in actions):
+                actions.append(Action(kind="thread-ask", value=""))
+            body = body[ask_match.end():]
             continue
         reply_match = _REPLY_RE.match(body)
         if reply_match:
@@ -277,6 +335,20 @@ def parse_markers(text: str) -> ParseResult:
             body = body[reply_match.end():]
             continue
         break
+
+    # A skip right after the leading markers is a skip, as the broker reads the body it is sent.
+    # Not after [channel:]: the guard withholds a redirect plus skip for owner review.
+    for pat, reason in (_SKIP_PATTERNS if not named else ()):
+        m = pat.match(body)
+        if m:
+            extra = m.group(1).strip() if reason == "deduped" else None
+            return ParseResult(body="", actions=[Action(kind="skip", value=reason, extra=extra)])
+
+    # A root posted outside its room is refused or misthreaded; ambiguity fails to top level.
+    foreign = "dm-only" if dm_only else ("rooms differ" if len(named) > 1 else None)
+    if foreign:
+        actions = [Action(kind="thread-foreign", value=a.value, extra=foreign)
+                   if a.kind == "thread" else a for a in actions]
 
     # Restore D7 header so it appears in the user-facing body. (It was only
     # peeled off so it didn't shadow the marker regexes.)
@@ -567,15 +639,18 @@ def build_requeued_task(
 # Every bracket word the patterns above act on; the inverse of the grammar lives
 # beside it so a new marker is added to both at once.
 _MARKER_OPEN_RE = re.compile(
-    r"\[(?=(?:no-send|REPLIED|deduped:|channel:|reply:|dm-only|file:|send:|attach:))",
+    r"\[(?=(?:no-send|REPLIED|deduped:|channel:|thread:|reply:|dm-only|file:|send:|attach:))",
     re.IGNORECASE)
+
+# A bare [thread] is a marker only as a line of its own, so only that shape is quoted.
+_THREAD_ASK_OPEN_RE = re.compile(r"^([ \t]*)\[(?=thread\][ \t]*\r?$)", re.IGNORECASE | re.MULTILINE)
 
 
 def neutralize_markers(text: str) -> str:
     """Quoted form of `text` for a body that EMBEDS it: a space after each marker's
     opening bracket keeps the words readable and takes the token out of every
     pattern in this module, so parse_markers emits no action for it."""
-    return _MARKER_OPEN_RE.sub("[ ", text or "")
+    return _THREAD_ASK_OPEN_RE.sub(r"\1[ ", _MARKER_OPEN_RE.sub("[ ", text or ""))
 
 
 def first_action(result: ParseResult, kind: ActionKind) -> Action | None:

@@ -1,0 +1,187 @@
+{
+ "_doc": "One table for every implementation of the bare [thread] / skip-after-leading grammar: src/result_markers.py, the vendored copy, neutralize_markers, and src/skip_marker_ownership.ts (stripVoiceControlLines, bodyIsSkipMarked).",
+ "cases": [
+  {
+   "body": "[thread]\nbody",
+   "thread_ask": true,
+   "skip": false,
+   "voice": "body",
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "  [thread]\nbody",
+   "thread_ask": true,
+   "skip": false,
+   "voice": "body",
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "\t[thread] \nbody",
+   "thread_ask": true,
+   "skip": false,
+   "voice": "body",
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "[channel: !r:s]\n[thread]\nbody",
+   "thread_ask": true,
+   "skip": false,
+   "voice": "[channel: !r:s]\nbody",
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "[channel: !r:s]\n  [thread]\nbody",
+   "thread_ask": true,
+   "skip": false,
+   "voice": "[channel: !r:s]\nbody",
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "[thread: $r]\n  [thread]\nbody",
+   "thread_ask": true,
+   "skip": false,
+   "voice": "[thread: $r]\nbody",
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "[dm-only]\n  [thread]\nbody",
+   "thread_ask": true,
+   "skip": false,
+   "voice": "body",
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "[reply: 12345678901234567]\n  [thread]\nbody",
+   "thread_ask": true,
+   "skip": false,
+   "voice": "[reply: 12345678901234567]\nbody",
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "**[core: 2]**\n  [thread]\nbody",
+   "thread_ask": true,
+   "skip": false,
+   "voice": "**[core: 2]**\n  body",
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "[channel: !r:s] [thread]\nbody",
+   "thread_ask": false,
+   "skip": false,
+   "voice": "[channel: !r:s] [thread]\nbody",
+   "neutralize_quotes_thread": false
+  },
+  {
+   "body": "[thread: $r] [thread]\nbody",
+   "thread_ask": false,
+   "skip": false,
+   "voice": "[thread: $r] [thread]\nbody",
+   "neutralize_quotes_thread": false
+  },
+  {
+   "body": "[reply: 12345678901234567] [thread]\nbody",
+   "thread_ask": false,
+   "skip": false,
+   "voice": "[reply: 12345678901234567] [thread]\nbody",
+   "neutralize_quotes_thread": false
+  },
+  {
+   "body": "[dm-only] [thread]\nbody",
+   "thread_ask": false,
+   "skip": false,
+   "voice": "[thread]\nbody",
+   "neutralize_quotes_thread": false
+  },
+  {
+   "body": "  [dm-only]  [thread]\nbody",
+   "thread_ask": false,
+   "skip": false,
+   "voice": "[thread]\nbody",
+   "neutralize_quotes_thread": false
+  },
+  {
+   "body": "[thread]ing\nbody",
+   "thread_ask": false,
+   "skip": false,
+   "voice": "[thread]ing\nbody",
+   "neutralize_quotes_thread": false
+  },
+  {
+   "body": "[thread] text",
+   "thread_ask": false,
+   "skip": false,
+   "voice": "[thread] text",
+   "neutralize_quotes_thread": false
+  },
+  {
+   "body": "body\n[thread]",
+   "thread_ask": false,
+   "skip": false,
+   "voice": "body\n[thread]",
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "[thread]\nsee [no-send] here",
+   "thread_ask": true,
+   "skip": false,
+   "voice": "see [no-send] here",
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "[thread]\n[no-send]\nx",
+   "thread_ask": true,
+   "skip": true,
+   "voice": null,
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "  [thread]\n[REPLIED]\nx",
+   "thread_ask": true,
+   "skip": true,
+   "voice": null,
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "[thread]\n[deduped: task-9]\nx",
+   "thread_ask": true,
+   "skip": true,
+   "voice": null,
+   "neutralize_quotes_thread": true
+  },
+  {
+   "body": "[thread: $r]\n[no-send]\nx",
+   "thread_ask": false,
+   "skip": true,
+   "voice": null,
+   "neutralize_quotes_thread": false
+  },
+  {
+   "body": "[dm-only]\n[no-send]\nx",
+   "thread_ask": false,
+   "skip": true,
+   "voice": null,
+   "neutralize_quotes_thread": false
+  },
+  {
+   "body": "[reply: 12345678901234567]\n[no-send]\nx",
+   "thread_ask": false,
+   "skip": true,
+   "voice": null,
+   "neutralize_quotes_thread": false
+  },
+  {
+   "body": "[channel: !r:s]\n[no-send]\nx",
+   "thread_ask": false,
+   "skip": false,
+   "voice": "[channel: !r:s]\n[no-send]\nx",
+   "neutralize_quotes_thread": false
+  },
+  {
+   "body": "[no-send]\n[thread]\nx",
+   "thread_ask": false,
+   "skip": true,
+   "voice": null,
+   "neutralize_quotes_thread": true
+  }
+ ]
+}

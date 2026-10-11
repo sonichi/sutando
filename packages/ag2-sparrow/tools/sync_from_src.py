@@ -35,6 +35,9 @@ MAP = {
     "src/local_task_protocol.py": "local_task_protocol.py",
     "src/result_markers.py": "result_markers.py",
     "src/delivery/readiness.py": "result_ready.py",
+    # terminal disposal of a result file (claim / verify / quarantine / recover);
+    # the gateway delegates, tests/gateway-disposal-delegation.test.py pins it
+    "src/delivery/disposal.py": "result_disposal.py",
     "src/dedup_recovery.py": "dedup_recovery.py",
     "src/file_lock.py": "file_lock.py",
     "src/workspace_lock.py": "workspace_lock.py",
