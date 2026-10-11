@@ -3,6 +3,8 @@
 Builds the zipapp with packages/ag2-sparrow/tools/build_zipapp.py, checks the
 archive against the package tree, then runs it from a temp dir with no token.
 """
+import contextlib
+import io
 import os
 import pathlib
 import subprocess
@@ -13,8 +15,9 @@ import zipfile
 REPO = pathlib.Path(__file__).resolve().parents[1]
 PKG_ROOT = REPO / "packages" / "ag2-sparrow"
 SRC = PKG_ROOT / "ag2_sparrow"
-BUILD = PKG_ROOT / "tools" / "build_zipapp.py"
 sys.path.insert(0, str(PKG_ROOT / "tools"))
+import build_zipapp  # noqa: E402
+import smoke_entry  # noqa: E402
 from smoke_entry import check_fails_without_token, minimal_env  # noqa: E402
 
 
@@ -60,12 +63,27 @@ def main():
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d).resolve()
         pyz = tmp / "out" / "ag2-sparrow.pyz"
-        r = subprocess.run([sys.executable, str(BUILD), "--output", str(pyz)],
-                           capture_output=True, text=True, timeout=120)
-        assert r.returncode == 0, r.stderr
-        assert r.stdout.strip() == str(pyz), r.stdout
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert build_zipapp.main(["--output", str(pyz)]) == 0
+        assert out.getvalue().strip() == str(pyz), out.getvalue()
         test_archive_contents(pyz)
         test_runs_without_install(pyz, tmp)
+        test_smoke_cli(pyz)
+
+
+def test_smoke_cli(pyz):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert smoke_entry.main([sys.executable, str(pyz)]) == 0
+    assert out.getvalue().startswith("PASS "), out.getvalue()
+    try:
+        smoke_entry.main([])
+    except SystemExit as e:
+        assert "Usage" in str(e.code), e.code
+    else:
+        raise AssertionError("smoke_entry with no command did not exit")
+    print("PASS smoke_entry CLI passes the pyz and refuses an empty command")
 
 
 if __name__ == "__main__":
