@@ -101,6 +101,20 @@ class HostLabelStableTest(unittest.TestCase):
             self.assertEqual(r["host"], LABEL)
             self.assertEqual(r["host_id"], LABEL)
 
+    def test_an_unreadable_host_does_not_stop_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = _run("""
+                import socket
+                import ag2_sparrow.remote_gateway_bridge as rgb
+                sys.modules["util_paths"] = None
+                def _no_host():
+                    raise OSError("no host")
+                socket.gethostname = _no_host
+                rgb._resolve_host_label()
+                print(json.dumps({"host_id": rgb._profile_host_id()}))
+            """, tmp)
+            self.assertEqual(r["host_id"], "unknown-host")
+
 
 if __name__ == "__main__":
     unittest.main()
