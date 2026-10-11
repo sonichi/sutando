@@ -122,6 +122,36 @@ class SingletonGlueTest(unittest.TestCase):
         self.assertEqual(len(calls), 2, "relinquishing ownership must stop the loop")
         self.assertFalse(rgb._LOCK_LOST.is_set())
 
+    def test_heartbeat_loop_stops_refreshing_while_the_main_loop_stalls(self):
+        import threading
+        calls, logged = [], []
+        saved = (rgb._LOCK_PASS_MAX_S, rgb._LOOP_TICK["at"], rgb._log)
+        self.addCleanup(setattr, rgb, "_LOCK_PASS_MAX_S", saved[0])
+        self.addCleanup(rgb._LOOP_TICK.__setitem__, "at", saved[1])
+        self.addCleanup(setattr, rgb, "_log", saved[2])
+        rgb._log = logged.append
+
+        def held(*a, **k):
+            calls.append(a)
+            rgb._OWNERSHIP_RELINQUISHED.set()
+            return True
+        self._with_heartbeat(held)
+        rgb._LOCK_PASS_MAX_S = 10
+        rgb._LOOP_TICK["at"] = time.monotonic() - 100   # the loop has been stuck
+        # Progress resumes after a few idle intervals; the refresh resumes with it.
+        threading.Timer(1.3, rgb._stamp_loop_progress).start()
+        t0 = time.monotonic()
+        rgb._lock_heartbeat_loop()
+        self.assertGreaterEqual(time.monotonic() - t0, 1.3, "the loop must wait for progress")
+        self.assertEqual(len(calls), 1, "no refresh while stalled; one once progress resumes")
+        self.assertFalse(rgb._LOCK_LOST.is_set())
+        self.assertEqual(sum("made no progress" in m for m in logged), 1, logged)
+
+    def test_pass_bound_covers_a_full_pass_with_margin(self):
+        one_pass = rgb.POLL_WAIT + 10 + rgb._POLL_BACKOFF_MAX_S + 2 * rgb._REQ_TIMEOUT_S
+        self.assertEqual(rgb._LOCK_PASS_MAX_S, 2 * one_pass)
+        self.assertGreater(rgb._LOCK_PASS_MAX_S, rgb._LOCK_STALE_S)
+
     def test_start_lock_heartbeat_runs_the_loop_on_a_daemon_thread(self):
         import threading
         calls = []

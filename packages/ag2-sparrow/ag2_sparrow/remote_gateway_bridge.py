@@ -2162,7 +2162,10 @@ def _log(msg: str) -> None:
         pass
 
 
-def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
+_REQ_TIMEOUT_S = 35
+
+
+def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty)."""
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
@@ -5219,6 +5222,15 @@ _LOCK_STALE_S = _WS_STALE_SECONDS
 # the lock is refreshed off-loop; the loop only reads the verdict.
 _LOCK_LOST = threading.Event()
 _LOCK_HB_MUTEX = threading.Lock()
+_POLL_BACKOFF_MAX_S = 60
+# The longest pass a working loop makes: the long poll at its timeout, the
+# largest backoff sleep and the beat's own requests, doubled for margin.
+_LOCK_PASS_MAX_S = 2 * (POLL_WAIT + 10 + _POLL_BACKOFF_MAX_S + 2 * _REQ_TIMEOUT_S)
+_LOOP_TICK = {"at": time.monotonic()}
+
+
+def _stamp_loop_progress() -> None:
+    _LOOP_TICK["at"] = time.monotonic()
 
 
 def _lock_on() -> bool:
@@ -5264,13 +5276,27 @@ def _heartbeat_singleton() -> bool:
 
 
 def _lock_heartbeat_loop() -> None:
+    """Refresh the lock only while the main loop keeps making passes. A loop
+    stuck past the pass bound is a hung holder, and the lock must go stale for
+    it exactly as it did when the loop refreshed the lock itself."""
     interval = max(0.5, _LOCK_STALE_S / 3)
+    stalled = False
     while not _OWNERSHIP_RELINQUISHED.wait(interval):
+        idle = time.monotonic() - _LOOP_TICK["at"]
+        if idle > _LOCK_PASS_MAX_S:
+            if not stalled:
+                stalled = True
+                _log(f"singleton: main loop has made no progress for {idle:.0f}s "
+                     f"(bound {_LOCK_PASS_MAX_S:.0f}s) — letting the lock go stale "
+                     "so a successor can take over")
+            continue
+        stalled = False
         if not _heartbeat_singleton():
             return
 
 
 def _start_lock_heartbeat() -> None:
+    _stamp_loop_progress()
     if _lock_on():
         threading.Thread(target=_lock_heartbeat_loop, name="sparrow-lock-heartbeat",
                          daemon=True).start()
@@ -5427,6 +5453,7 @@ def main() -> None:
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
     while True:
+        _stamp_loop_progress()
         try:
             if _LOCK_LOST.is_set() or not _heartbeat_singleton():
                 # Lost the poller lock (reaped after being deemed stale). Stop
@@ -5505,15 +5532,15 @@ def main() -> None:
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff)
-            time.sleep(backoff); backoff = min(backoff * 2, 60)
+            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except (urllib.error.URLError, TimeoutError) as e:
             _log(f"poll network error: {e} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"network: {e}", backoff_s=backoff)
-            time.sleep(backoff); backoff = min(backoff * 2, 60)
+            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
             _log(f"unexpected: {e} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"unexpected: {e}", backoff_s=backoff)
-            time.sleep(backoff); backoff = min(backoff * 2, 60)
+            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
 
 
 if __name__ == "__main__":
