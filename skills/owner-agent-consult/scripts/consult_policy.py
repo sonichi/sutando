@@ -303,9 +303,9 @@ def reconcile(transport, room: str, self_mxid: str, workspace: Path, *, task_id:
               expire_after_s: float = DEFAULT_EXPIRE_AFTER_S, now: Optional[float] = None) -> Optional[str]:
     """Settle every earlier ask from this owner task (or from this ask task to this agent) whose
     post was not confirmed: a failed write, a crash after the post, or an ambiguous transport
-    outcome. Found in the room by consult id: the record is completed. Expired: it is released
-    with its root claim. Otherwise it stays unconfirmed, whatever the read shows, and this
-    returns a refusal: nothing new is posted while it may already be in the room."""
+    outcome. Found in the room by consult id: the record is completed. Otherwise it stays
+    unconfirmed, whatever the read shows and however old it is, and this returns a refusal:
+    nothing new is posted from this task while it may already be in the room."""
     now = time.time() if now is None else now
     loose = [(st, r) for st in ("pending", "answered") for r in records(workspace, st)
              if not (r.get("ask_event") and r.get("root"))
@@ -324,16 +324,11 @@ def reconcile(transport, room: str, self_mxid: str, workspace: Path, *, task_id:
             except OSError:
                 unresolved.append(r["cid"])
                 continue
-        if _age(r, now) > expire_after_s:
-            _record_path(workspace, st, r["cid"]).unlink(missing_ok=True)
-            if r.get("task_id") and (_read_record(_root_claim(workspace, r["task_id"])) or {}).get("cid") == r["cid"]:
-                _root_claim(workspace, r["task_id"]).unlink(missing_ok=True)
-            continue
         unresolved.append(r["cid"])
     if unresolved:
         return (f"an earlier ask is unconfirmed ({', '.join(unresolved)}): it may already be in the room, "
-                "so nothing new is posted from this task; `pending` lists it, and it clears when found "
-                "or at expiry. Tell the owner it is unconfirmed; the owner can ask again")
+                "so nothing new is posted from this task; `pending` lists it, and it clears only when "
+                "found. Tell the owner it is unconfirmed; the owner can ask again with a new message")
     return None
 
 
@@ -366,29 +361,31 @@ def _age(rec: dict, now: float) -> float:
 def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
             expire_after_s: float = DEFAULT_EXPIRE_AFTER_S) -> List[dict]:
     """Unanswered consults, oldest first; `nudge_due` when overdue and the owner was not yet
-    told, `expired` past the expiry (match then refuses). Prunes answered and nudge records
-    older than the expiry, and an expired consult once the owner has been told."""
+    told, `expired` past the expiry (match then refuses), plus any task holding a root claim
+    with no record (`claim_only`). Root and answer claims are pruned only once no task that
+    could post from them is live; an expired consult is pruned once the owner has been told
+    and its task can no longer post."""
     now = time.time() if now is None else now
     answers = Path(workspace) / _STATE / "answers"
     for f in sorted(answers.glob("*.json")) if answers.is_dir() else []:
-        if _age({"asked_at": (_read_record(f) or {}).get("at") or f.stat().st_mtime}, now) > expire_after_s:
+        tasks = (_read_record(f) or {}).get("tasks") or []
+        if tasks and not any(task_can_post(workspace, t) for t in tasks):
             f.unlink(missing_ok=True)
     roots = Path(workspace) / _STATE / "roots"
+    claimed = {}
     for f in sorted(roots.glob("*.json")) if roots.is_dir() else []:
-        claim = _read_record(f) or {}
-        if not isinstance(claim.get("asked_at"), (int, float)):
-            try:
-                claim = {"asked_at": f.stat().st_mtime}  # an empty or unreadable claim ages by its file
-            except OSError:
-                continue
-        if _age(claim, now) > expire_after_s:
+        task = f.name[:-len(".json")]
+        if not task_can_post(workspace, task):
             f.unlink(missing_ok=True)
+        else:
+            claimed[task] = (_read_record(f) or {}).get("cid")
     for state in ("answered", "nudged"):
         for r in records(workspace, state):
             orphan = state == "nudged" and not _record_path(workspace, "pending", r["cid"]).exists()
             if (state == "answered" or orphan) and _age(r, now) > expire_after_s:
                 _record_path(workspace, state, r["cid"]).unlink(missing_ok=True)
     out = []
+    listed_tasks = set()
     for r in sorted(records(workspace, "pending"), key=lambda r: r.get("asked_at") or 0):
         if _record_path(workspace, "answered", r["cid"]).exists():
             _record_path(workspace, "pending", r["cid"]).unlink(missing_ok=True)
@@ -396,13 +393,20 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
         age = _age(r, now)
         overdue = age >= nudge_after_s
         nudged = _record_path(workspace, "nudged", r["cid"]).exists()
-        if nudged and age > expire_after_s:
+        owner_task = r.get("task_id") or r.get("via_task")
+        if nudged and age > expire_after_s and not task_can_post(workspace, owner_task):
             _record_path(workspace, "pending", r["cid"]).unlink(missing_ok=True)
             _record_path(workspace, "nudged", r["cid"]).unlink(missing_ok=True)
             continue
+        listed_tasks.add(r.get("task_id"))
         out.append({**r, "age_s": int(age) if age != float("inf") else None, "overdue": overdue, "nudged": nudged,
                     "unconfirmed": not r.get("ask_event"),
                     "nudge_due": overdue and not nudged, "expired": age > expire_after_s})
+    for task, cid in sorted(claimed.items()):
+        if task not in listed_tasks and not prior_ask(workspace, "task_id", task):
+            out.append({"task_id": task, "cid": cid, "claim_only": True, "unconfirmed": True,
+                        "reason": "a root claim with no posted ask: this task cannot consult again; "
+                                  "the owner can ask again with a new message"})
     return out
 
 
@@ -755,7 +759,7 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
     new_root = bool(task_id) and not root
     if new_root and not claim_root(workspace, task_id, cid):
         return no("another ask from this task holds its thread root and has no confirmed post; nothing "
-                  "new is posted from this task until it is found or expires. The owner can ask again")
+                  "new is posted from this task. The owner can ask again with a new message")
 
     def release():
         if new_root:
@@ -821,11 +825,13 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
         if not via or not rec.get("root"):
             return no(f"{up} is not an onward consult of this agent")
         inc = {"cid": via["cid"], "asker": via["asker"], "ask_event": via["ask_event"], "root": rec["root"]}
+        poster = rec.get("reply_task")
     else:
         inc = incoming_ask(transport, room, self_mxid, task_id, workspace,
                            verdict["owner_agents"] | {self_mxid}, max_duration_s, max_asks)
         if not inc["ok"]:
             return no(inc["reason"])
+        poster = task_id
     lim = effective_limits(inc["root_msg"], inc["limits"], max_duration_s, max_asks) if inc.get("root_msg") else None
     now_s = measured_now(inc["server_now"], inc["anchor"], time.time()) if lim else None
     reached = limit_reached(lim, len(inc["asks"]), now_s) if lim and now_s is not None else None
@@ -836,18 +842,15 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
     if held is not None:
         if not held.get("event_id"):
             found = _own_answer(_room_messages(transport, room), self_mxid, inc["cid"])
-            if found:
-                held["event_id"] = found
-                _write_record(claim_path, held)
-            elif _age({"asked_at": held.get("at")}, time.time()) > expire_after_s:
-                claim_path.unlink(missing_ok=True)
-                held = None
-            else:
+            if not found:
                 return no("an earlier answer to this ask is unconfirmed: it may already be in the room, "
-                          "so it is not posted again until it is found or expires")
-        if held is not None:
-            return {**base, "event_id": held["event_id"], "replay": True}
-    if not _claim_file(claim_path, {"cid": inc["cid"], "to": inc["asker"], "at": time.time(), "event_id": None}):
+                          "so it is not posted again")
+            held["event_id"] = found
+            _write_record(claim_path, held)
+        _note_task(claim_path, held, poster)
+        return {**base, "event_id": held["event_id"], "replay": True}
+    if not _claim_file(claim_path, {"cid": inc["cid"], "to": inc["asker"], "at": time.time(), "event_id": None,
+                                    "tasks": [t for t in [poster] if t]}):
         return no("another answer to this ask is being posted")
     sent = transport.mention(inc["asker"], f"{answer_tag(inc['cid'])}\n{text.strip()}", room,
                              reply_to=inc["ask_event"], thread_root=inc["root"])
@@ -864,6 +867,27 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
     except (OSError, TypeError):
         pass
     return {**base, "event_id": event}
+
+
+def _note_task(path: Path, claim: dict, task: Optional[str]) -> None:
+    """Add a task that can post this answer to its claim, so the claim outlives every such task."""
+    if task and task not in claim.get("tasks", []):
+        try:
+            _write_record(path, {**claim, "tasks": [*claim.get("tasks", []), task]})
+        except OSError:
+            pass
+
+
+def task_can_post(workspace: Path, task_id: Optional[str]) -> bool:
+    """True while `task_id` is live in this inbox with no result: something could still post
+    from it, so no claim it holds may be released."""
+    import local_task_protocol as ltp
+    from task_archive import find_task_file
+    if not task_id or not ltp.valid_task_id(task_id):
+        return False
+    if find_task_file(Path(workspace) / "tasks", task_id) is None:
+        return False
+    return ltp.find_result(Path(workspace) / "results", task_id) is None
 
 
 def _answer_claim(workspace: Path, cid: str) -> Path:
