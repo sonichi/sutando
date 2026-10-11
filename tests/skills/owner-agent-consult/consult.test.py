@@ -542,7 +542,8 @@ class TestMatchReply(unittest.TestCase):
         tr = FakeTransport()
         tr.room.post(SELF, "first ask")  # stands in for the $ask already posted
         root = {"ts": int(time.time() * 1000), "body": ""}
-        with mock.patch.object(policy, "thread_view", return_value={"ok": True, "msgs": [], "root_msg": root}):
+        view = {"ok": True, "msgs": [], "root_msg": root, "server_now": root["ts"] / 1000}
+        with mock.patch.object(policy, "thread_view", return_value=view):
             res = run_consult(tr, self.ws, cid=CID_B)
         self.assertEqual((res["asked"], res["ask_event"], res["root"]), (True, "$ask2", "$ask"), res)
         got = self._match(answer_msg(cid=CID_B, in_reply_to="$ask2"))
@@ -574,9 +575,14 @@ class World:
         self.tr = {a: FakeTransport(members=members, agents=agents, me=a, room=self.room)
                    for a in self.AGENTS}
 
-    def deliver(self, to, event, tid, *, stamp=True):
+    def deliver(self, to, event, tid, *, stamp=True, at=None):
+        """The receiving gateway writes the task; `at` is its arrival on the receiver's clock
+        (default: the server's clock, i.e. no skew)."""
         sender = next(m["sender"] for m in self.room.msgs if m["event_id"] == event)
-        return reply_task(self.ws[to], event, tid=tid, sender=sender, stamp=stamp)
+        out = reply_task(self.ws[to], event, tid=tid, sender=sender, stamp=stamp)
+        at = self.room.clock() if at is None else at
+        os.utime(self.ws[to] / "tasks" / f"{tid}.txt", (at, at))
+        return out
 
     def ask(self, me, agent, *, cid, task_id=None, via_task=None, question="is the disk full?", **kw):
         return policy.consult(self.tr[me], room=ROOM, self_mxid=me, agent=agent, question=question,
@@ -664,9 +670,10 @@ class TestOnwardConsult(unittest.TestCase):
         self.assertIsNotNone(policy.loop_check(asks, SELF, THIRD))
 
 
-class TestOnwardTracesToAnOwnerTask(unittest.TestCase):
+class TestOnwardTracesToARootAsk(unittest.TestCase):
     """An onward ask must come from a verified task delivering an ask whose chain the thread
-    shows link by link back to a root ask, which only the verified-owner-task gate posts."""
+    shows link by link back to a root ask by one of the owner's agents (whether its owner-task
+    gate ran is the accepted, documented gap)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1104,6 +1111,64 @@ class TestLimitsCannotBeWidened(unittest.TestCase):
                                                policy.MAX_DURATION_CEILING_S - 1))
 
 
+class TestWindowOnServerTime(unittest.TestCase):
+    """Elapsed time is measured on the server's clock: the anchor's server timestamp plus the
+    local time elapsed since it, never the asking agent's wall clock against the server's."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+        self.w.room.clock = lambda: T0
+        self.w.ask(SELF, SIB, cid=C1, task_id=TID, now=lambda: T0)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_slow_receiver_cannot_ask_past_the_window(self):
+        skew = -3600
+        self.w.deliver(SIB, "$ask", "task-b1", at=T0 + skew)
+        res = self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 1801 + skew)
+        self.assertEqual((res["asked"], res.get("limit_reached")), (False, True), res)
+        self.assertIn("1800s window has passed", res["reason"])
+        self.assertEqual(self.w.tr[SIB].posted, [])
+
+    def test_a_fast_receiver_is_not_refused_early(self):
+        skew = 3600
+        self.w.deliver(SIB, "$ask", "task-b1", at=T0 + skew)
+        res = self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 60 + skew)
+        self.assertTrue(res["asked"], res)
+
+    def test_the_first_askers_own_skew_does_not_move_its_follow_ups(self):
+        for skew, elapsed, allowed in ((3600, 60, True), (-3600, 1801, False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                w = World(tmp)
+                w.room.clock = lambda: T0
+                w.ask(SELF, SIB, cid=C1, task_id=TID, now=lambda: T0 + skew)
+                res = w.ask(SELF, SIB, cid=C2, task_id=TID, now=lambda: T0 + skew + elapsed)
+                self.assertEqual(res["asked"], allowed, (skew, elapsed, res))
+
+    def test_the_newest_server_timestamp_is_a_floor(self):
+        self.w.deliver(SIB, "$ask", "task-b1", at=T0)
+        self.w.room.clock = lambda: T0 + 1900
+        self.w.room.post(OWNER, "later message in the room")
+        res = self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 10)
+        self.assertIn("window has passed", res["reason"])
+
+    def test_without_an_anchor_the_local_clock_must_agree_with_the_server(self):
+        tol = policy.CLOCK_TOLERANCE_S
+        self.assertEqual(policy.measured_now(T0, (None, None), T0 + tol), T0 + tol)
+        self.assertIsNone(policy.measured_now(T0, (None, None), T0 + tol + 1))
+        self.assertIsNone(policy.measured_now(T0, (T0, None), T0 - tol - 1))
+        self.assertIsNone(policy.measured_now(None, (T0, T0), T0))
+        self.assertEqual(policy.measured_now(T0 + 5, (T0, T0 - 3600), T0 - 3600 + 2), T0 + 5)
+
+    def test_an_ask_refused_for_an_unmeasurable_clock_says_so(self):
+        self.w.deliver(SIB, "$ask", "task-b1", at=T0)
+        with mock.patch.object(policy, "measured_now", return_value=None):
+            res = self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0)
+        self.assertIn("cannot measure the thread window on server time", res["reason"])
+
+
 class TestRecordEdges(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1118,6 +1183,16 @@ class TestRecordEdges(unittest.TestCase):
                        task_id=TID, cid=C1, now=lambda: T0 + 10 * 86400)
         [row] = policy.pending(w.ws[SELF], 600, now=T0)
         self.assertTrue(row["expired"])
+
+    def test_an_expired_consult_is_pruned_once_the_owner_was_told(self):
+        w = self.w
+        policy.consult(w.tr[SELF], room=ROOM, self_mxid=SELF, agent=SIB, question="q", workspace=w.ws[SELF],
+                       task_id=TID, cid=C1, now=lambda: T0)
+        [row] = policy.pending(w.ws[SELF], 600, now=T0 + 7200, expire_after_s=3600)
+        self.assertEqual((row["expired"], row["nudge_due"]), (True, True))
+        policy.mark_nudged(w.ws[SELF], C1)
+        self.assertEqual(policy.pending(w.ws[SELF], 600, now=T0 + 7200, expire_after_s=3600), [])
+        self.assertEqual(pending_ids(w.ws[SELF]), [])
 
     def test_a_pending_copy_beside_an_answer_is_not_listed_for_a_nudge(self):
         w = self.w
@@ -1285,7 +1360,8 @@ class FakeGateway(http.server.BaseHTTPRequestHandler):
             self.state.setdefault("posted", []).append(req)
             n = len(self.state["posted"])
             eid = "$ask" if n == 1 else f"$ask{n}"
-            self.state["messages"].insert(0, {"event_id": eid, "sender": SELF, "ts": 7e12, "body": req["body"],
+            self.state["messages"].insert(0, {"event_id": eid, "sender": SELF, "ts": int(time.time() * 1000),
+                                              "body": req["body"],
                                               **({"thread_root": req["thread_root"]}
                                                  if req.get("thread_root") else {})})
             return self._send({"ok": True, "event_id": eid})
@@ -1302,9 +1378,9 @@ class TestProductionAdapter(unittest.TestCase):
         FakeGateway.state = {
             "agents": [{"id": SELF, "owner": OWNER}, {"id": SIB, "owner": OWNER}],
             "members": [{"user_id": SELF}, {"user_id": OWNER}, {"user_id": SIB}],
-            "messages": [{"event_id": "$f", "sender": SIB, "ts": 9e12, "in_reply_to": "$ask",
+            "messages": [{"event_id": "$f", "sender": SIB, "ts": int(time.time() * 1000), "in_reply_to": "$ask",
                           "thread_root": "$ask", "body": f"{SELF} — {final(CID, 'host is up')}"},
-                         {"event_id": "$p", "sender": SIB, "ts": 8e12, "in_reply_to": "$ask",
+                         {"event_id": "$p", "sender": SIB, "ts": int(time.time() * 1000), "in_reply_to": "$ask",
                           "thread_root": "$ask", "body": f"{SELF} — On it, checking now."}]}
         env = {"GATEWAY_URL": f"http://127.0.0.1:{self.srv.server_address[1]}",
                "GATEWAY_TOKEN": "test-token",
