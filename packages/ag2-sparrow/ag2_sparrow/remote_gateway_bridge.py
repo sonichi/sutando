@@ -3803,6 +3803,8 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
                          blocker: claiming it here would leak the raw body)
       * attach markers → stripped by the parser; uploads are unsupported on
                          the room-message op, so the actions are ignored
+      * [thread: $root]→ stripped here; the send reads it via
+                         _proactive_thread_root and posts in that thread
     """
     parsed = parse_markers(body)
     if any(a.kind == "skip" for a in parsed.actions):
@@ -3814,6 +3816,23 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
             return ("send", dest, parsed.body)
         return ("foreign", None, "")
     return ("send", None, parsed.body)
+
+
+def _proactive_thread_root(body: str, name: str = "") -> "str | None":
+    """The `[thread:]` root a proactive body names, or None (top level). A
+    malformed value is logged and posted top level, never into a guessed thread."""
+    for a in parse_markers(body).actions:
+        if a.kind == "thread":
+            return a.value
+        if a.kind == "thread-invalid":
+            _log(f"proactive {name} has a malformed [thread: {a.value[:80]!r}] "
+                 "— posting top level")
+            return None
+        if a.kind == "thread-foreign":
+            _log(f"proactive {name}: [thread: {a.value[:80]!r}] may not be in the "
+                 f"destination room ({a.extra}) — posting top level")
+            return None
+    return None
 
 
 def _own_homeserver() -> str:
@@ -3977,8 +3996,8 @@ def _post_proactive() -> None:
         # Re-read and re-route AFTER the claim, and act only on THIS result.
         # The peek above can observe a writer mid-write (file created, body not
         try:
-            route, room_override, routed_body = _proactive_route(
-                claim.read_text(encoding="utf-8"))
+            claimed_text = claim.read_text(encoding="utf-8")
+            route, room_override, routed_body = _proactive_route(claimed_text)
         except OSError as exc:
             # A TRANSIENT post-claim read failure must not strand the nudge: the
             # file is now `.sending.<our-pid>`, and _recover_orphan_proactive()
@@ -4046,11 +4065,13 @@ def _post_proactive() -> None:
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
         dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
+        thread_root = _proactive_thread_root(claimed_text, f.name)
         try:
             resp = _req("POST", "/v1/room",
                         {"op": "message",
                          "room_id": dest_room,
-                         "body": body},
+                         "body": body,
+                         **({"thread_root": thread_root} if thread_root else {})},
                         timeout=15)
             # A bare 200 is NOT proof of delivery: the gateway can swallow a
             # room-send failure server-side (bad room id, kicked agent,

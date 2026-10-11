@@ -342,11 +342,11 @@ answered in that room, replying to `source_message_id`. Two tests apply:
 When you move an answer the room was waiting for, post it in the DM and exactly one line in the
 room: 'I sent it to you in our DM.' Never move silently.
 
-**Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially (several related tasks, ONE reply). Full per-marker semantics + incident history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":
-- `[deduped: task-<other-id>]` — silently archive this task as done (no narration, no DM); the full reply goes in the other task's result file. The canonical thread-consolidation path.
-- `[no-send]` — skip delivery (still archives); internally handled, no user-visible reply.
-- `[REPLIED]` — skip delivery (already sent through another path).
+**Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially. Full semantics + history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":
+- `[deduped: task-<other-id>]` — silently archive this task as done; the full reply goes in the other task's result file. Thread-consolidation path.
+- `[no-send]` / `[REPLIED]` — skip delivery (still archives): nothing to show / already sent another way.
 - `[channel: <channel-id>]` — as first non-empty line only: deliver the rest of the body to that channel instead of the originating one. Telegram silently drops it.
+- `[thread: $<root>]` — proactive lead line, after any skip marker: AG2 Space posts in that thread. For a thread in use; new topics go top level.
 - `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body; detected anywhere, stripped only when alone on its line.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — extract and attach the file alongside the text body.
 

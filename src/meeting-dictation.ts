@@ -29,6 +29,9 @@ export const MEETING_EXIT_PHRASE = 'Sutando, come back';
 /** Spoken when meeting mode starts: the user cannot ask the quiesced model how to leave, so the exit comes first. */
 export const MEETING_ENTRY_SAY = `Meeting mode on. To bring me back, say "${MEETING_EXIT_PHRASE}". Until then I'll stay silent and take notes.`;
 
+/** Told to a fresh provider connection after a meeting whose end the model already took in. */
+export const MEETING_OVER_CONTEXT = framedSystem('Meeting mode is over: you are back in a normal conversation. Listen and answer the user as usual.');
+
 /** Transcript carried back into the voice session; a longer meeting keeps its end. */
 const MAX_CARRIED_CHARS = 30_000;
 
@@ -87,10 +90,17 @@ function hhmmss(d: Date): string {
 	return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-export function ensureMeetingNote(notePath: string, today: string): void {
+/** Local date and start time of a meeting, `2026-10-10-1119`: one note file per meeting. */
+export function meetingStamp(d: Date): string {
+	const p = (n: number) => String(n).padStart(2, '0');
+	return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+export function ensureMeetingNote(notePath: string, stamp: string): void {
 	if (existsSync(notePath)) return;
 	mkdirSync(dirname(notePath), { recursive: true });
-	writeFileSync(notePath, `---\ntitle: Meeting notes — ${today}\ndate: ${today}\ntags: [meeting, notes]\n---\n\n`);
+	const [date, hhmm] = [stamp.slice(0, 10), stamp.slice(11)];
+	writeFileSync(notePath, `---\ntitle: Meeting notes — ${date} ${hhmm.slice(0, 2)}:${hhmm.slice(2)}\ndate: ${date}\ntags: [meeting, notes]\n---\n\n`);
 }
 
 export function appendTranscriptLine(notePath: string, text: string, at: Date = new Date()): void {
@@ -143,7 +153,8 @@ export interface MeetingDictationSession {
 export interface MeetingDictationDeps {
 	session: MeetingDictationSession;
 	/** Resolved per meeting so a meeting crossing midnight keeps one file. */
-	notePathFor: (today: string) => string;
+	/** The note file for a meeting starting at `stamp` (see meetingStamp). */
+	notePathFor: (stamp: string) => string;
 	/** Called after an exit phrase returned the session to agent mode. */
 	onExitByVoice: () => void;
 	log: (msg: string) => void;
@@ -159,6 +170,10 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 	let notePath: string | null = null;
 	let lines: string[] = [];
 	let unsaved = 0;
+	// The meeting-ended context until the model has finished a turn after it: a provider connection
+	// replaced before that took it with it, so the fresh one gets it again.
+	let unacknowledged: string | null = null;
+	let meetingEnded = false;
 	// The note and its header are written with the first line or once transcription is on,
 	// so an entry that fails leaves no empty heading behind.
 	let headerAt: Date | null = null;
@@ -199,14 +214,14 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 		if (!notePath || !headerAt) return;
 		const at = headerAt;
 		headerAt = null;
-		ensureMeetingNote(notePath, at.toISOString().slice(0, 10));
+		ensureMeetingNote(notePath, meetingStamp(at));
 		appendTranscriptHeader(notePath, at);
 	}
 
 	async function enter(): Promise<void> {
 		if (deps.session.getTranscriptionMode() === 'transcription') return;
 		headerAt = now();
-		notePath = deps.notePathFor(headerAt.toISOString().slice(0, 10));
+		notePath = deps.notePathFor(meetingStamp(headerAt));
 		lines = [];
 		unsaved = 0;
 		deps.session.clearDictationBuffer();
@@ -235,20 +250,77 @@ export function attachMeetingDictation(deps: MeetingDictationDeps) {
 		deps.session.clearDictationBuffer();
 		deps.log(`[MeetingDictation] back to agent mode (${transcript.length} lines in ${path})`);
 		if (opts.byVoice) deps.onExitByVoice();
+		meetingEnded = true;
 		if (path) {
-			const delivered = await deps.session.injectText(
-				meetingEndedContext(path, transcript, { unsaved, request: opts.request || undefined }),
-				{ mode: 'live' },
-			);
+			const context = meetingEndedContext(path, transcript, { unsaved, request: opts.request || undefined });
+			unacknowledged = context;
+			const delivered = await deps.session.injectText(context, { mode: 'live' });
 			if (!delivered) deps.log(`[MeetingDictation] transcript not delivered to the session; the note is in ${path}`);
 		}
+	}
+
+	/**
+	 * The session replaced its provider connection (a fresh one, not a resumed one), which keeps only
+	 * the recent conversation. If the meeting just ended and the model never finished a turn on the
+	 * meeting-ended context, that context went with the old connection: send it again. After an earlier
+	 * meeting, say it is over, so a recent line like "I'll stay silent" is not taken as the current mode.
+	 */
+	async function afterConnectionReplaced(): Promise<void> {
+		if (deps.session.getTranscriptionMode() !== 'agent') return;
+		if (unacknowledged) {
+			deps.log('[MeetingDictation] connection replaced before the meeting-ended context was answered; sending it again');
+			const delivered = await deps.session.injectText(unacknowledged, { mode: 'live' });
+			if (!delivered) deps.log('[MeetingDictation] meeting-ended context not delivered to the fresh connection');
+			return;
+		}
+		if (!meetingEnded) return;
+		meetingEnded = false;
+		await deps.session.injectText(MEETING_OVER_CONTEXT, { mode: 'quiet' });
 	}
 
 	return {
 		enter: () => serial(enter),
 		exit: () => serial(() => exit({ byVoice: false })),
+		/** The model finished a turn (not an interrupted one): the meeting-ended context, if any, was taken in. */
+		noteModelTurnEnded: () => {
+			unacknowledged = null;
+		},
+		/** Call once the session is active again on a fresh provider connection. */
+		afterConnectionReplaced: () => serial(afterConnectionReplaced),
 		get notePath() {
 			return notePath;
 		},
 	};
+}
+
+/** The session events `restoreAfterFreshConnection` listens to (bodhi's event bus). */
+export interface MeetingSessionEvents {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	subscribe(event: string, handler: (payload: any) => void): unknown;
+}
+
+/**
+ * Wires meeting dictation to the session: a turn the model finished acknowledges the meeting-ended
+ * context, and a fresh provider connection, once active, gets back what the old one took with it.
+ * bodhi ends the turn it abandons at a reconnect boundary with turn.interrupted then turn.end, before
+ * session.reconnectBoundary: that turn.end is not an answer. Deferred past bodhi's recent-context injection.
+ */
+export function restoreAfterFreshConnection(
+	events: MeetingSessionEvents,
+	md: Pick<ReturnType<typeof attachMeetingDictation>, 'noteModelTurnEnded' | 'afterConnectionReplaced'>,
+	deferMs = 250,
+): void {
+	const interrupted = new Set<string>();
+	let connectionReplaced = false;
+	events.subscribe('turn.interrupted', (e) => { if (e?.turnId) interrupted.add(String(e.turnId)); });
+	events.subscribe('turn.end', (e) => {
+		if (e?.turnId && interrupted.delete(String(e.turnId))) return;
+		md.noteModelTurnEnded();
+	});
+	events.subscribe('session.reconnectBoundary', () => { connectionReplaced = true; });
+	events.subscribe('session.stateChange', (e) => {
+		if (e?.toState !== 'ACTIVE' || !connectionReplaced) return;
+		connectionReplaced = false;
+		setTimeout(() => { void md.afterConnectionReplaced(); }, deferMs);
+	});
 }

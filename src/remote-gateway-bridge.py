@@ -43,8 +43,8 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from proactive_routing import (BRIDGE_CHANNELS, proactive_destination,  # noqa: E402
-                               should_claim_proactive)
+from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E402
+                               proactive_destination, should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from voice_room_membership import (CHECK_DIR_NAME, VERDICT_TTL_S,  # noqa: E402
@@ -311,6 +311,13 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
     # a destined file strands visibly rather than leak to the gateway room.
     if dest is not None:
         return dest == _CHANNEL
+    # A body addressed to a room outranks activity routing;
+    # the drain has already refused a room on another homeserver.
+    try:
+        if body_target_channel(path.read_text(encoding="utf-8", errors="ignore")) == _CHANNEL:
+            return True
+    except OSError:
+        return False  # racing consumer already claimed it
     state = WS / "state" / "last-owner-activity.json"
     if should_claim_proactive(state, _CHANNEL):
         return True

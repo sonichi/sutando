@@ -289,7 +289,7 @@
   },
   {
    "name": "read_note",
-   "description": "Read a specific note by name or slug. Speak the content to the user.",
+   "description": "Read a note by name or slug; the newest matching note is returned. Speak the content to the user. If the user may mean one of otherMatches instead (e.g. an earlier meeting), ask which.",
    "execution": "inline",
    "params": {
     "name": "Note name or slug to search for"
@@ -297,7 +297,7 @@
   },
   {
    "name": "read_note",
-   "description": "Read a specific note by name or slug. Speak the content to the user.",
+   "description": "Read a note by name or slug; the newest matching note is returned. Speak the content to the user. If the user may mean one of otherMatches instead (e.g. an earlier meeting), ask which.",
    "execution": "inline",
    "params": {
     "name": "Note name or slug to search for"
@@ -546,7 +546,7 @@
   {
    "name": "work",
    "description": "Do the work. Call this for anything beyond simple greetings — questions, actions, research, writing, translation, file changes, system queries, explanations, analysis. This is how Sutando thinks and acts. Results are spoken back when ready.",
-   "execution": "inline",
+   "execution": "background",
    "params": {
     "dm_on_timeout": "If true, send a Discord DM to the owner when this task hits its timeout. Default false (silent UI-only timeout, per Susan PR #578). Use only for tasks the user has explicitly flagged as critical. The Chi-override to default-true (2026-05-03 06:00 PT) was reverted at 06:47 PT after Chi flagged a timeout DM that shouldn't have gone through.",
     "task": "Full description of the task to perform",
@@ -554,7 +554,7 @@
    }
   }
  ],
- "instructions_hash_fixed_env": "dacd5abe1dc9c67f075ce5e5e055dabb702f8caed899114547e8a1e4d91efaa0",
+ "instructions_hash_fixed_env": "19d31cc439af91925afe5856c84cfdbbe272b3e889d70ba3d99959b3e9e250d5",
  "meeting_greeting": "[System: MEETING MODE — the meeting is being transcribed into notes and you are not hearing it. Do NOT speak or produce any audio.]\n\n[MODE-MARKER-MEETING]",
  "regions": {
   "tool_table": "4a0c897afbd682d9eace22ed3fe9a28db14d655125b3895f8779aa12c8df9daf"

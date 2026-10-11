@@ -37,6 +37,16 @@ Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
   When found, the bridge delivers the body to <channel-id> instead of the
   task's originating channel. The body is the text AFTER this line.
 
+  THREAD marker — a leading line, before or after [channel:]:
+    [thread: <root event id>]
+  Posts the body inside that thread. Only an id starting with `$` counts; any
+  other value emits a `thread-invalid` action (posted top level, consumer
+  logs it). Stripped either way; consumers without threads just post the body.
+  A root belongs to the room its [channel:] names (the default room without
+  one). Under [dm-only], or when the leading lines name two different rooms,
+  the destination may not be that room: `thread-foreign` replaces `thread`
+  and the body is posted top level.
+
   DM-ONLY marker — anywhere in the body:
     [dm-only]
   Privacy guard: suppresses any [channel:] redirect on the same body (no
@@ -67,6 +77,10 @@ Parse contract:
     .actions   list[Action] — what the bridge should do, in priority order:
                  ("skip", reason)         — archive, no delivery
                  ("redirect", channel_id) — deliver to alternate channel
+                 ("thread", root_event_id) — post inside that thread
+                 ("thread-invalid", raw)  — malformed [thread:]; post top level
+                 ("thread-foreign", root) — root may not be the destination's;
+                                            post top level (extra: why)
                  ("attach", path)         — bridge runs its own allowlist
                                             check, then uploads
 
@@ -84,7 +98,8 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
-ActionKind = Literal["skip", "redirect", "attach", "dm-only"]
+ActionKind = Literal["skip", "redirect", "attach", "dm-only", "reply", "thread",
+                     "thread-invalid", "thread-foreign"]
 
 
 @dataclass
@@ -174,6 +189,11 @@ _DMONLY_RE = re.compile(r"\[dm-only\]\s*\n?", re.IGNORECASE)
 # digits is a Discord snowflake; anything else is left in place, never eaten.
 _REPLY_RE = re.compile(r"^\s*\[reply:\s*(\d{17,20})\]\s*\n?")
 
+# [thread: <root event id>] — any value is consumed so the marker never leaks;
+# only a whitespace-free `$...` id is a thread target.
+_THREAD_RE = re.compile(r"^\s*\[thread:\s*([^\]]*)\]\s*\n?", re.IGNORECASE)
+_THREAD_ROOT_RE = re.compile(r"\$\S+")
+
 #: STRIPPING is narrower than DETECTION, deliberately. Detection stays
 #: `search()`-anywhere so the privacy guard cannot be defeated by marker
 #: ORDER (see the docstring). But removing every occurrence also removed
@@ -259,17 +279,27 @@ def parse_markers(text: str) -> ParseResult:
     # Suppressed entirely when dm-only is set: strip a leading `[channel:]`
     # marker so it can't leak into the DM, but emit NO redirect action so the
     # private body stays in the owner's DM.
-    # 2. LEADING MARKERS — [channel:] and [reply:] in either order; order
+    # 2. LEADING MARKERS — [channel:], [thread:] and [reply:] in any order; order
     # independence keeps an unparsed marker from reaching the user as text.
+    named: set[str] = set()
     while True:
         redirect_match = _REDIRECT_RE.match(body)
         if redirect_match:
             channel = redirect_match.group(1).strip()
+            if channel:
+                named.add(channel)
             if not dm_only and channel:
                 # Empty target = no action: "" release-loops at the default
                 # sink and raises in Discord's int() conversion.
                 actions.append(Action(kind="redirect", value=channel))
             body = body[redirect_match.end():]
+            continue
+        thread_match = _THREAD_RE.match(body)
+        if thread_match:
+            root = thread_match.group(1).strip()
+            ok = _THREAD_ROOT_RE.fullmatch(root) is not None
+            actions.append(Action(kind="thread" if ok else "thread-invalid", value=root))
+            body = body[thread_match.end():]
             continue
         reply_match = _REPLY_RE.match(body)
         if reply_match:
@@ -277,6 +307,12 @@ def parse_markers(text: str) -> ParseResult:
             body = body[reply_match.end():]
             continue
         break
+
+    # A root posted outside its room is refused or misthreaded; ambiguity fails to top level.
+    foreign = "dm-only" if dm_only else ("rooms differ" if len(named) > 1 else None)
+    if foreign:
+        actions = [Action(kind="thread-foreign", value=a.value, extra=foreign)
+                   if a.kind == "thread" else a for a in actions]
 
     # Restore D7 header so it appears in the user-facing body. (It was only
     # peeled off so it didn't shadow the marker regexes.)
@@ -567,7 +603,7 @@ def build_requeued_task(
 # Every bracket word the patterns above act on; the inverse of the grammar lives
 # beside it so a new marker is added to both at once.
 _MARKER_OPEN_RE = re.compile(
-    r"\[(?=(?:no-send|REPLIED|deduped:|channel:|reply:|dm-only|file:|send:|attach:))",
+    r"\[(?=(?:no-send|REPLIED|deduped:|channel:|thread:|reply:|dm-only|file:|send:|attach:))",
     re.IGNORECASE)
 
 

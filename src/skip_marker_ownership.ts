@@ -14,6 +14,12 @@ export function bodyIsSkipMarked(result: string): boolean {
 	return SKIP_MARKER_RE.test(String(result ?? "").replace(D7_HEADER_RE, ""));
 }
 
+/** The task whose result a `[deduped: <task-id>]` result points to, D7 header peeled first; null otherwise. */
+export function dedupTarget(result: string): string | null {
+	const m = /^\s*\[deduped:\s*(task-[A-Za-z0-9._-]+)\s*\]/i.exec(String(result ?? "").replace(D7_HEADER_RE, ""));
+	return m ? m[1] : null;
+}
+
 export function isSkipMarked(file: string, result: string): boolean {
 	return file.startsWith('task-') && bodyIsSkipMarked(result);
 }

@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DictationTranscriptEvent } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE } from '../src/meeting-dictation.js';
+import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE, MEETING_OVER_CONTEXT, meetingStamp, restoreAfterFreshConnection } from '../src/meeting-dictation.js';
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
@@ -77,6 +77,7 @@ describe('meeting dictation', () => {
 		let mode: 'agent' | 'transcription' = 'agent';
 		const buffer: string[] = [];
 		const injected: string[] = [];
+		const injectModes: string[] = [];
 		let exitedByVoice = 0;
 		const listeners: Array<(e: DictationTranscriptEvent) => void> = [];
 		// Like bodhi: outside agent mode a final is buffered first, then sent to subscribers.
@@ -91,7 +92,7 @@ describe('meeting dictation', () => {
 			setTranscriptionMode: async (m: 'agent' | 'transcription') => { await opts.switching?.(); mode = m; },
 			getTranscriptionMode: () => mode,
 			clearDictationBuffer: () => { buffer.length = 0; },
-			injectText: async (t: string) => { injected.push(t); return opts.inject ?? true; },
+			injectText: async (t: string, o?: { mode: string }) => { injected.push(t); injectModes.push(o?.mode ?? ''); return opts.inject ?? true; },
 			onDictationTranscript: (l: (e: DictationTranscriptEvent) => void) => {
 				listeners.push(l);
 				return () => { listeners.splice(listeners.indexOf(l), 1); };
@@ -101,8 +102,23 @@ describe('meeting dictation', () => {
 			session, notePathFor: opts.notePathFor ?? ((d) => join(dir, `notes/meeting-${d}.md`)),
 			onExitByVoice: () => { exitedByVoice++; }, log: opts.log ?? (() => {}),
 		});
-		return { md, provider, buffer, injected, get mode() { return mode; }, get exitedByVoice() { return exitedByVoice; } };
+		return { md, provider, buffer, injected, injectModes, get mode() { return mode; }, get exitedByVoice() { return exitedByVoice; } };
 	}
+
+	it('each meeting gets its own note, named by its local start date and time', async () => {
+		assert.equal(meetingStamp(new Date(2026, 9, 9, 20, 23, 5)), '2026-10-09-2023', 'local, not UTC');
+		const stamps: string[] = [];
+		const t = setup({ notePathFor: (s) => { stamps.push(s); return join(mkdtempSync(join(tmpdir(), 'meet-')), `meeting-${s}.md`); } });
+		await t.md.enter();
+		const first = t.md.notePath!;
+		t.provider.say('weather in Cupertino');
+		t.provider.say('Sutando, come back');
+		await tick();
+		await t.md.enter();
+		assert.notEqual(t.md.notePath, first, 'a second meeting the same day does not append to the first');
+		assert.match(stamps[0], /^\d{4}-\d\d-\d\d-\d{4}$/);
+		assert.match(readFileSync(first, 'utf-8'), /^---\ntitle: Meeting notes — \d{4}-\d\d-\d\d \d\d:\d\d\n/);
+	});
 
 	it('writes each sentence to the note and exits on the phrase', async () => {
 		const t = setup();
@@ -245,6 +261,154 @@ describe('meeting dictation', () => {
 		assert.equal(t.exitedByVoice, 0);
 		await t.md.exit(); // idempotent
 		assert.equal(t.injected.length, 1);
+	});
+});
+
+describe('a provider connection replaced after a meeting', () => {
+	function setupMeeting() {
+		const dir = mkdtempSync(join(tmpdir(), 'meet-rc-'));
+		let mode: 'agent' | 'transcription' = 'agent';
+		const listeners: Array<(e: DictationTranscriptEvent) => void> = [];
+		const injected: Array<{ text: string; mode: string }> = [];
+		const session = {
+			setTranscriptionMode: async (m: 'agent' | 'transcription') => { mode = m; },
+			getTranscriptionMode: () => mode,
+			clearDictationBuffer: () => {},
+			injectText: async (text: string, o: { mode: string }) => { injected.push({ text, mode: o.mode }); return true; },
+			onDictationTranscript: (l: (e: DictationTranscriptEvent) => void) => { listeners.push(l); return () => {}; },
+		};
+		const md = attachMeetingDictation({ session, notePathFor: (d) => join(dir, `notes/meeting-${d}.md`), onExitByVoice: () => {}, log: () => {} });
+		const say = (text: string) => { if (mode !== 'agent') for (const l of listeners) l({ text, partial: false }); };
+		return { md, say, injected, get mode() { return mode; } };
+	}
+
+	it('replaced before the model answered the meeting-ended context: the fresh connection gets it again, live', async () => {
+		const t = setupMeeting();
+		await t.md.enter();
+		t.say('we ship on Friday');
+		t.say('Sutando, come back');
+		await tick();
+		assert.equal(t.injected.length, 1);
+		await t.md.afterConnectionReplaced();
+		assert.equal(t.injected.length, 2);
+		assert.equal(t.injected[1].text, t.injected[0].text, 'the same context, with the meeting transcript');
+		assert.equal(t.injected[1].mode, 'live', 'so the model says the notes are saved');
+		assert.match(t.injected[1].text, /we ship on Friday/);
+	});
+
+	it('replaced after the model answered it: only a quiet line that the meeting is over', async () => {
+		const t = setupMeeting();
+		await t.md.enter();
+		t.say('Sutando, come back');
+		await tick();
+		t.md.noteModelTurnEnded();
+		await t.md.afterConnectionReplaced();
+		assert.deepEqual(t.injected.slice(1), [{ text: MEETING_OVER_CONTEXT, mode: 'quiet' }]);
+	});
+
+	it('no meeting in this session, or still in the meeting: nothing is sent', async () => {
+		const none = setupMeeting();
+		await none.md.afterConnectionReplaced();
+		assert.deepEqual(none.injected, []);
+		const during = setupMeeting();
+		await during.md.enter();
+		during.md.noteModelTurnEnded();
+		await during.md.afterConnectionReplaced();
+		assert.deepEqual(during.injected, [], 'a model quiesced for the meeting gets nothing');
+	});
+
+	it('a turn that ended before the meeting ended is not the answer to it', async () => {
+		const t = setupMeeting();
+		await t.md.enter();
+		t.md.noteModelTurnEnded();
+		t.say('Sutando, come back');
+		await tick();
+		await t.md.afterConnectionReplaced();
+		assert.equal(t.injected[1].mode, 'live');
+	});
+});
+
+describe('wiring to the session: bodhi\'s event order at a fresh connection', () => {
+	function wired() {
+		const handlers: Record<string, Array<(e: unknown) => void>> = {};
+		const bus = { subscribe: (ev: string, h: (e: unknown) => void) => { (handlers[ev] ??= []).push(h); } };
+		const emit = (ev: string, e: unknown = {}) => { for (const h of handlers[ev] ?? []) h(e); };
+		const dir = mkdtempSync(join(tmpdir(), 'meet-wire-'));
+		let mode: 'agent' | 'transcription' = 'agent';
+		const listeners: Array<(e: DictationTranscriptEvent) => void> = [];
+		const injected: Array<{ text: string; mode: string }> = [];
+		const md = attachMeetingDictation({
+			session: {
+				setTranscriptionMode: async (m: 'agent' | 'transcription') => { mode = m; },
+				getTranscriptionMode: () => mode,
+				clearDictationBuffer: () => {},
+				injectText: async (text: string, o: { mode: string }) => { injected.push({ text, mode: o.mode }); return true; },
+				onDictationTranscript: (l: (e: DictationTranscriptEvent) => void) => { listeners.push(l); return () => {}; },
+			},
+			notePathFor: (d) => join(dir, `meeting-${d}.md`), onExitByVoice: () => {}, log: () => {},
+		});
+		restoreAfterFreshConnection(bus, md, 0);
+		const say = (text: string) => { for (const l of listeners) l({ text, partial: false }); };
+		// bodhi: abandon the active turn (interrupted, then end), then the boundary, then ACTIVE on the new socket.
+		const freshConnection = async (abandoned?: string) => {
+			if (abandoned) { emit('turn.interrupted', { turnId: abandoned }); emit('turn.end', { turnId: abandoned }); }
+			emit('session.reconnectBoundary', { reason: 'human-retry' });
+			emit('session.stateChange', { toState: 'ACTIVE' });
+			await tick(5);
+		};
+		const meeting = async (line: string) => { await md.enter(); say(line); say('Sutando, come back'); await tick(); };
+		return { md, emit, injected, freshConnection, meeting };
+	}
+
+	it('the turn bodhi abandons at the boundary is not an answer: the transcript is sent again, live', async () => {
+		const t = wired();
+		await t.meeting('we ship on Friday');
+		await t.freshConnection('turn_7');
+		assert.equal(t.injected.length, 2);
+		assert.equal(t.injected[1].mode, 'live');
+		assert.match(t.injected[1].text, /we ship on Friday/);
+	});
+
+	it('a turn the model finished is the answer: only the quiet line, and only once', async () => {
+		const t = wired();
+		await t.meeting('we ship on Friday');
+		t.emit('turn.end', { turnId: 'turn_8' });
+		await t.freshConnection();
+		assert.deepEqual(t.injected.slice(1), [{ text: MEETING_OVER_CONTEXT, mode: 'quiet' }]);
+		await t.freshConnection();
+		assert.equal(t.injected.length, 2, 'a later fresh connection hears nothing more');
+	});
+
+	it('nothing happens before ACTIVE, nor on ACTIVE without a boundary (a resumed connection)', async () => {
+		const t = wired();
+		await t.meeting('we ship on Friday');
+		t.emit('session.reconnectBoundary', {});
+		t.emit('session.stateChange', { toState: 'RECONNECTING' });
+		await tick(5);
+		assert.equal(t.injected.length, 1);
+		t.emit('session.stateChange', { toState: 'ACTIVE' });
+		await tick(5);
+		assert.equal(t.injected.length, 2, 'sent once ACTIVE comes');
+		t.emit('session.stateChange', { toState: 'ACTIVE' });
+		await tick(5);
+		assert.equal(t.injected.length, 2, 'an ACTIVE without a boundary sends nothing');
+	});
+
+	it('in a second meeting after one that ended, a fresh connection sends nothing', async () => {
+		const t = wired();
+		await t.meeting('first meeting');
+		t.emit('turn.end', { turnId: 'turn_1' });
+		await t.md.enter();
+		t.emit('turn.end', { turnId: 'turn_2' });
+		await t.freshConnection();
+		assert.equal(t.injected.length, 1, 'the model stays quiet in the meeting');
+	});
+});
+
+describe('voice-agent wires meeting dictation to the session', () => {
+	it('through restoreAfterFreshConnection', () => {
+		const src = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/voice-agent.ts'), 'utf-8');
+		assert.match(src, /restoreAfterFreshConnection\(session\.eventBus, meetingDictation\);/);
 	});
 });
 
