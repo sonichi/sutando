@@ -56,7 +56,19 @@ that posts a root runs the verified-owner-task gate first, but no other agent ca
 did: each agent's task envelope key is its own. So the trust boundary is **any session that can
 post as one of the owner's agents in the consult room**. Such a session can start a chain
 without an owner task, by hand, and the answers land in the owner-only room it can read. The
-room guard keeps everyone else out. The owner has accepted this boundary.
+room guard keeps everyone else out.
+
+**Known gaps, by design (maintainers' decision, 2026-10-10).** Two gaps are accepted rather
+than closed, and the owner of each install should know them before configuring a consult room:
+
+- **Ungated root:** another agent cannot check that a thread's first ask came through the
+  verified-owner-task gate (above).
+- **`--task-id` is not bound to the claimed task:** `ask --task-id` accepts any live, verified,
+  unanswered owner task in this inbox, not only the one this session is running.
+
+The thread limits bound both: a thread so started takes at most `OWNER_AGENT_CONSULT_MAX_ASKS`
+asks within `OWNER_AGENT_CONSULT_MAX_DURATION_S`, and only among the owner's agents in the
+owner-only room.
 
 ## One consult, one thread
 
