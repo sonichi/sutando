@@ -144,7 +144,8 @@ python3 skills/owner-agent-consult/scripts/consult.py ask --agent "<your-mxid>" 
 An onward ask needs no owner task of its own: the thread itself is the chain. Both `answer` and
 `ask --via-task` refuse unless the ask's task is live and verified, came from the consult room,
 has no result yet, and its room event is from another of the owner's agents, mentions you first
-(it is addressed to you), sits in a thread that one of the owner's agents started, and was posted
+(its plain body starts with your mxid, as `ask` writes it; a client pill showing only a display
+name is not recognised, since neither the room read nor the task carries `m.mentions`), sits in a thread that one of the owner's agents started, and was posted
 within your window for that thread. An agent that
 does not run this skill cannot consult onward; it answers from what it holds.
 
@@ -175,8 +176,10 @@ you, as `answer` does), or not at all (a plain reply in the thread). Matching it
 
    There is no text rule; the judgement is yours.
 
-A message binds to at most one consult, once (`bound/<event>.json`, never deleted). A second
-`match` of the same message never answers another consult.
+A message binds to at most one consult, once (`bound/<event>.json`, never deleted), with your
+judgement (answer or not final). A second `match` of the same message never answers another
+consult, and the recorded judgement wins: a message bound as the answer before a crash is
+finished only by `--final`, and the opposite flag is refused (`conflict: true`), never recorded.
 
 - `{"matched": true, "task_id", "lead", "reply_text", ...}` (from `--final`) — you started this
   consult from an owner task. Write `results/proactive-<ts>.txt` starting with `lead` (the original

@@ -2005,6 +2005,50 @@ class FakeGateway(http.server.BaseHTTPRequestHandler):
         self._send({"error": "unknown op"})
 
 
+class TestReviewRound21(unittest.TestCase):
+    """A message's recorded disposition wins on retry: bound as the answer, a crash before the
+    close is finished only by --final; a conflicting flag is refused, never recorded."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+        self.w.ask(SELF, SIB, cid=C1, task_id=TID)
+        self.w.room.post(SIB, "It is up.", thread_root="$ask")
+        self.event = self.w.room.msgs[-1]["event_id"]
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def m(self, **kw):
+        return policy.match_reply(self.w.tr[SELF], room=ROOM, self_mxid=SELF, workspace=self.w.ws[SELF],
+                                  event_id=self.event, **kw)
+
+    def test_qingyun_crash_after_the_answer_bind_then_not_final_is_refused_and_final_closes(self):
+        real = os.link
+
+        def crash_on_close(src, dst, *a, **k):
+            if Path(dst).parent.name == "answered":
+                raise OSError("crashed before the close")
+            return real(src, dst, *a, **k)
+        with mock.patch.object(policy.os, "link", crash_on_close):
+            self.assertFalse(self.m(final=True)["matched"])
+        retry = self.m(not_final=True)
+        self.assertTrue(retry.get("conflict"), retry)
+        self.assertNotIn("progress", retry)
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])
+        look = self.m()
+        self.assertEqual((look.get("bound"), look.get("cid")), ("answer", C1), look)
+        done = self.m(final=True)
+        self.assertEqual((done["matched"], done["cid"], done["reply_text"]), (True, C1, "It is up."), done)
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [])
+
+    def test_final_after_a_not_final_bind_is_refused_as_a_conflict(self):
+        self.assertTrue(self.m(not_final=True)["progress"])
+        got = self.m(final=True)
+        self.assertEqual((got["matched"], got.get("conflict")), (False, True), got)
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])
+
+
 class TestProductionAdapter(unittest.TestCase):
     """consult.py over the real room_ops CLI, against a local fake gateway."""
 

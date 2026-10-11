@@ -895,7 +895,13 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
     bind_path = _bind_path(workspace, event)
     bound = _read_record(bind_path)
     if bound is not None and bound.get("disposition") == "progress":
+        if final:
+            return no("this message was bound as not final; --final conflicts with that judgement",
+                      conflict=True, cid=bound.get("cid"))
         return no("this message was already judged not final", progress=True, cid=bound.get("cid"))
+    if bound is not None and not_final:
+        return no("this message was bound as the answer; --not-final conflicts with that judgement "
+                  "(run --final to finish closing)", conflict=True, cid=bound.get("cid"))
     if bound is not None and _record_path(workspace, "answered", str(bound.get("cid"))).exists():
         return _replay(workspace, bound["cid"], task_id, event, no)
     page = transport.read(room, READ_LIMIT)
@@ -927,6 +933,9 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
     if _age(rec, time.time() if now is None else now) > expire_after_s:
         return no(f"consult {cid} expired; tell the owner it was not answered in time")
     text = _strip_mention(msg.get("body") or "", self_mxid)
+    if bound is not None and not final:  # bound as the answer: only --final finishes it
+        return no("this message was bound as the answer; run --final to finish closing",
+                  candidate=True, bound="answer", cid=cid, reply_text=text, event_id=event)
     if not final and not not_final:
         return {"matched": False, "candidate": True, "agent": rec["agent"], "cid": cid, "reply_text": text,
                 "event_id": event, "reason": "read it, then run again with --final (the answer) "
