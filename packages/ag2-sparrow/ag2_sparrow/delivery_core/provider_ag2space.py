@@ -16,6 +16,9 @@ from .contract import (DeliveryAttempt, DeliveryOutcome, DeliveryReceipt,
                        ProviderRefused, ProviderPermanentRefused)
 
 RESULTS_PATH = "/v1/results"
+# Optional result field (docs/remote-gateway-protocol.md): only this value is sent;
+# a 400 for it is a bug to investigate and parks like any other 4xx.
+RESULT_THREAD_FIELD, RESULT_THREAD_ASK = "thread", "ask"
 
 
 class AG2SpaceResultProvider:

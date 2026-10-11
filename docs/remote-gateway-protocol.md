@@ -120,7 +120,32 @@ Return a task's result.
 
 ```
 body: { "id": "task-123", "body": "<result text>" }
+body: { "id": "task-123", "body": "<result text>", "thread": "ask" }   // optional
 ```
+
+**`thread` (optional).** Defined by the broker in
+[ag2-space/ag2space-backend#2138](https://github.com/ag2-space/ag2space-backend/pull/2138).
+`"ask"` asks the broker to answer in a new thread rooted on the task's own asking
+message; no field names an event id, so a result can only open a thread on the
+message it was asked in. The broker:
+
+- answers an ask already in a thread in that thread, with or without the field;
+- ignores the field and posts a plain reply when the task has no source message,
+  the body redirects with `[channel:]`, or the ask cannot root a thread;
+- treats absent, `null` or `false` as today's placement;
+- answers `400 {"error": "invalid thread: ..."}` for any other value and records,
+  sends and completes nothing: the lease stays open.
+
+A broker that predates the field ignores it, so a client may send it before the
+broker supports it. The client sends only `"ask"`, and only on an ordinary
+(non-suppressed, non-redirected) task result whose leading lines carry a bare
+`[thread]` line (`src/result_markers.py`). Backend #2138 defines `"ask"` as valid,
+so a `400` (or any other refusal) of a result carrying it is a bug to investigate,
+not something the client degrades around: it parks like any other 4xx (below), with
+no re-post. A retryable failure re-sends the stored payload, field included. The
+field name and value live in one
+place on the client: `RESULT_THREAD_FIELD` / `RESULT_THREAD_ASK` in
+`packages/ag2-sparrow/ag2_sparrow/delivery_core/provider_ag2space.py`.
 
 ### `POST /v1/heartbeat`
 

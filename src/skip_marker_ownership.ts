@@ -9,9 +9,75 @@ export const SKIP_MARKER_RE = /^\s*(?:\[(?:no-send|REPLIED)\]|\[deduped:\s*[^\]]
 // it before any marker scan (result_markers.py:135), so this must too.
 export const D7_HEADER_RE = /^\*\*\[core:\s*[^\]]+\]\*\*\s*\n(?:_[^\n]*_\s*\n)?\s*/;
 
-/** True iff `result`'s body carries a skip marker, D7 header peeled first. */
+// Lines voice never speaks: a standalone `[dm-only]` anywhere, and a bare
+// `[thread]` in the leading marker lines (result_markers.py _THREAD_ASK_RE).
+const THREAD_ASK_LINE_RE = /^[ \t]*\[thread\][ \t]*\r?$/i;
+const DM_ONLY_LINE_RE = /^[ \t]*\[dm-only\][ \t]*\r?$/i;
+const LEADING_MARKER_LINE_RE = /^[ \t]*\[(?:channel:[^\]\n]*|thread:[^\]\n]*|reply:[ \t]*\d{17,20})\][ \t]*\r?$/i;
+
+/** The text voice/log callbacks may show: control-only lines removed, prose untouched.
+ *  Presentation only: skip and ownership decisions read the raw body. */
+export function stripVoiceControlLines(text: string): string {
+	const raw = String(text ?? '');
+	const header = D7_HEADER_RE.exec(raw)?.[0] ?? '';
+	const lines = raw.slice(header.length).split('\n');
+	let i = 0;
+	const out: string[] = [];
+	// Lines are judged before the dm-only strip, so "[dm-only] [thread]" stays prose.
+	for (; i < lines.length; i++) {
+		const line = lines[i];
+		if (THREAD_ASK_LINE_RE.test(line)) continue;
+		if (line.trim() !== '' && !LEADING_MARKER_LINE_RE.test(line) && !DM_ONLY_LINE_RE.test(line)) break;
+		out.push(line);
+	}
+	return (header + out.concat(lines.slice(i)).join('\n')).replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '');
+}
+
+// parse_markers' leading-marker loop, mirrored for the skip decision only.
+const LEAD_REDIRECT_RE = /^\s*\[channel:\s*[^\]]*\]\s*\n?/;
+const LEAD_THREAD_RE = /^\s*\[thread:\s*[^\]]*\]\s*\n?/i;
+const LEAD_THREAD_ASK_RE = /^\s*\[thread\][ \t]*(?:\r?\n|$)/i;
+const LEAD_REPLY_RE = /^\s*\[reply:\s*\d{17,20}\]\s*\n?/;
+const DM_ONLY_STRIP_RE = /^[ \t]*\[dm-only\][ \t]*\r?\n?/gim;
+
+/** The body after the leading markers, as parse_markers reaches it (D7 already peeled). */
+function afterLeadingMarkers(body: string): string {
+	const glued = new Set<number>();
+	let lead = body;
+	if (/\[dm-only\]/i.test(body)) {
+		let out = '';
+		let last = 0;
+		for (const m of body.matchAll(DM_ONLY_STRIP_RE)) {
+			out += body.slice(last, m.index);
+			if (!m[0].endsWith('\n') && m.index! + m[0].length < body.length) glued.add(out.length);
+			last = m.index! + m[0].length;
+		}
+		lead = out + body.slice(last);
+	}
+	let rest = lead;
+	let redirected = false;
+	for (;;) {
+		const channel = LEAD_REDIRECT_RE.exec(rest);
+		if (channel) { redirected ||= /\[channel:\s*[^\]\s]/.test(channel[0]); rest = rest.slice(channel[0].length); continue; }
+		const fixed = [LEAD_THREAD_RE, LEAD_REPLY_RE].map(re => re.exec(rest)).find(Boolean);
+		if (fixed) { rest = rest.slice(fixed[0].length); continue; }
+		const ask = LEAD_THREAD_ASK_RE.exec(rest);
+		const at = lead.length - rest.length + (ask ? ask[0].indexOf('[') : 0);
+		const start = lead.slice(0, at).replace(/[ \t]+$/, '').length;
+		if (ask && (start === 0 || lead[start - 1] === '\n') && !glued.has(at) && !glued.has(start)) {
+			rest = rest.slice(ask[0].length);
+			continue;
+		}
+		// After [channel:] parse_markers keeps a following skip as text (the guard reviews it).
+		return redirected ? '' : rest;
+	}
+}
+
+/** True iff `result`'s body is a skip in parse_markers: a skip marker first, or
+ *  directly after the leading markers. D7 header peeled first. */
 export function bodyIsSkipMarked(result: string): boolean {
-	return SKIP_MARKER_RE.test(String(result ?? "").replace(D7_HEADER_RE, ""));
+	const body = String(result ?? "").replace(D7_HEADER_RE, "");
+	return SKIP_MARKER_RE.test(body) || SKIP_MARKER_RE.test(afterLeadingMarkers(body));
 }
 
 /** The task whose result a `[deduped: <task-id>]` result points to, D7 header peeled first; null otherwise. */
