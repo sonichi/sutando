@@ -5440,6 +5440,7 @@ def main() -> None:
              f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
     last_poll_ok = time.time()
+    poll_failures = 0  # consecutive network failures; the next good poll resets it
     _emit_gateway_status(False, error="starting — not yet connected")
     refresh_routing(force=True)  # the owner's DM comes from the gateway at connect, not from a pin
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
@@ -5466,6 +5467,10 @@ def main() -> None:
             _push_pool_advertisement()
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
+                if poll_failures:
+                    _log(f"poll recovered after {poll_failures} failures, "
+                         f"{int(time.time() - last_poll_ok)}s")
+                    poll_failures = 0
                 last_poll_ok = time.time()
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).
@@ -5526,7 +5531,10 @@ def main() -> None:
             _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)
         except _NETWORK_ERRORS as e:
-            _log(f"poll network error: {e} — backing off {backoff}s")
+            poll_failures += 1
+            _log(f"poll network error: {type(e).__name__}: {e} — {poll_failures} consecutive, "
+                 f"{int(time.time() - last_poll_ok)}s since last successful poll — "
+                 f"backing off {backoff}s")
             _emit_gateway_status(False, error=f"network: {e}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, 60)
         except Exception as e:  # noqa: BLE001 — keep the loop alive

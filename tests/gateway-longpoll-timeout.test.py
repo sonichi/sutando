@@ -56,8 +56,13 @@ class _Loop:
     def _poll(self, method, path, payload=None, **kw):
         if path.startswith("/v1/tasks?wait="):
             self.clock.now += self.advance
-            if self.poll_raises is not None:
-                raise self.poll_raises
+            # A list is one outcome per poll (None = a healthy empty poll).
+            if isinstance(self.poll_raises, list):
+                exc = self.poll_raises.pop(0) if self.poll_raises else None
+            else:
+                exc = self.poll_raises
+            if exc is not None:
+                raise exc
             return {"tasks": []}
         return {}
 
@@ -169,10 +174,11 @@ class DroppedConnectionTest(unittest.TestCase):
             self.skipTest(f"gateway not importable: {str(e)[:60]}")
         self.gw = gw
 
-    def _assert_network_path(self, loop):
+    def _assert_network_path(self, loop, cls):
         logs = " ".join(loop.logs)
         self.assertEqual(loop.clock.slept, [1], "backs off like any outage")
-        self.assertIn("poll network error", logs)
+        self.assertIn(f"poll network error: {cls}:", logs, "names the exception class")
+        self.assertIn("1 consecutive, 1s since last successful poll", logs)
         self.assertNotIn("unexpected", logs, "a dropped connection is not a crash")
         self.assertTrue(any(c is False and "network" in str(k.get("error", ""))
                             for c, k in loop.status))
@@ -182,13 +188,33 @@ class DroppedConnectionTest(unittest.TestCase):
         exc = http.client.RemoteDisconnected("Remote end closed connection without response")
         with _Loop(self.gw, poll_raises=exc, advance=1.0) as loop:
             loop.run()                    # returns: the loop went on to its next pass
-        self._assert_network_path(loop)
+        self._assert_network_path(loop, "RemoteDisconnected")
 
     def test_a_truncated_response_body_is_a_network_error(self):
         import http.client
         with _Loop(self.gw, poll_raises=http.client.IncompleteRead(b""), advance=1.0) as loop:
             loop.run()
-        self._assert_network_path(loop)
+        self._assert_network_path(loop, "IncompleteRead")
+
+    def test_the_counter_climbs_and_a_good_poll_logs_the_recovery(self):
+        import http.client
+        import re
+        outcomes = [http.client.RemoteDisconnected("gone"),
+                    http.client.RemoteDisconnected("gone"), None]
+        with _Loop(self.gw, poll_raises=outcomes, advance=1.0) as loop:
+            loop._alive = [True, True, True, False]
+            loop.run()
+        logs = loop.logs
+        errors = [m for m in logs if m.startswith("poll network error")]
+        self.assertEqual(len(errors), 2)
+        self.assertIn("1 consecutive, 1s since", errors[0])
+        self.assertIn("2 consecutive, 3s since", errors[1], "counts up; clock = 1s + 1s back-off + 1s")
+        self.assertEqual(loop.clock.slept, [1, 2], "back-off doubles across the outage")
+        recovered = [m for m in logs if m.startswith("poll recovered")]
+        self.assertEqual(len(recovered), 1, "one recovery line, after the good poll")
+        self.assertRegex(recovered[0], r"^poll recovered after 2 failures, 6s$")
+        self.assertLess(logs.index(errors[1]), logs.index(recovered[0]))
+        self.assertIn((True, {}), loop.status)
 
     def test_an_ack_cut_off_mid_flight_reports_a_network_error_not_a_crash(self):
         import http.client
