@@ -139,12 +139,13 @@ class FakeTransport:
 
 
 def run_consult(tr, ws=None, *, text=None, stamp=True, question="is the build host up?",
-                agent=SIB, cid=CID, tid=TID, now=1_000.0):
+                agent=SIB, cid=CID, tid=TID, now=None):
     with contextlib.ExitStack() as stack:
         if ws is None:
             ws = make_ws(stack.enter_context(tempfile.TemporaryDirectory()), text, stamp=stamp, tid=tid)
         return policy.consult(tr, room=ROOM, self_mxid=SELF, agent=agent, question=question,
-                              task_id=tid, workspace=ws, cid=cid, now=lambda: now)
+                              task_id=tid, workspace=ws, cid=cid,
+                              now=(lambda: now) if now is not None else None)
 
 
 def match(tr, ws, tid="task-reply"):
@@ -493,7 +494,7 @@ class TestMatchReply(unittest.TestCase):
     def test_wrong_consult_id_does_not_match(self):
         res = self._match(answer_msg(cid=CID_B, in_reply_to="$ask"))
         self.assertFalse(res["matched"])
-        self.assertIn(CID_B, res["reason"])
+        self.assertIn(f"consult {CID_B} is unknown", res["reason"])
         self.assertEqual(pending_ids(self.ws), [CID])
 
     def test_not_a_reply_to_the_ask_does_not_match(self):
@@ -576,8 +577,7 @@ class World:
 
     def ask(self, me, agent, *, cid, task_id=None, via_task=None, question="is the disk full?"):
         return policy.consult(self.tr[me], room=ROOM, self_mxid=me, agent=agent, question=question,
-                              workspace=self.ws[me], task_id=task_id, via_task=via_task, cid=cid,
-                              now=lambda: 1.0)
+                              workspace=self.ws[me], task_id=task_id, via_task=via_task, cid=cid)
 
     def answer(self, me, text, *, task_id=None, up=None):
         return policy.answer(self.tr[me], room=ROOM, self_mxid=me, text=text, workspace=self.ws[me],
@@ -799,11 +799,12 @@ class TestThreadAndAnswerEdges(unittest.TestCase):
         rec_path = ws / policy._STATE / "pending" / f"{C1}.json"
         rec = json.loads(rec_path.read_text())
         rec_path.write_text(json.dumps({**rec, "ask_event": None}))
-        self.assertIn("never confirmed", w.match(SELF, "task-a2")["reason"])
+        with mock.patch.object(policy, "_recover_ask", side_effect=lambda r, m, s: r):
+            self.assertIn("never confirmed", w.match(SELF, "task-a2")["reason"])
         rec_path.write_text(json.dumps(rec))
-        with mock.patch.object(policy.os, "rename", side_effect=FileNotFoundError):
+        with mock.patch.object(policy.os, "link", side_effect=FileNotFoundError):
             self.assertIn("already answered", w.match(SELF, "task-a2")["reason"])
-        with mock.patch.object(policy.os, "rename", side_effect=PermissionError("ro")):
+        with mock.patch.object(policy.os, "link", side_effect=PermissionError("ro")):
             self.assertIn("could not be closed", w.match(SELF, "task-a2")["reason"])
         real = policy._write_record
 
@@ -817,6 +818,143 @@ class TestThreadAndAnswerEdges(unittest.TestCase):
     def test_fresh_correlation_ids_are_well_formed(self):
         self.assertRegex(policy.new_cid(), r"^[0-9a-f]{16}$")
         self.assertIsNone(policy.parse_ask(policy.ask_line(C1, "not-an-event", [SELF, SIB])))
+
+
+class TestReviewRoundFour(unittest.TestCase):
+    """Regressions for the 84c0f9903 review: closed consults stay closed, a post whose record
+    write failed is still matched, answers bind to the consult's own room and expire, closed
+    ask tasks are inert, and a consult-room message is an origin only when the owner wrote it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def answered_by_sib(self, cid=C1, tids=("task-a2",)):
+        self.w.tr[SIB].mention(SELF, final(cid, "up"), ROOM, reply_to="$ask", thread_root="$ask")
+        for tid in tids:
+            self.w.deliver(SELF, "$ask2", tid)
+
+    def test_a_nudge_interleaved_with_a_match_cannot_reopen_the_consult(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        self.answered_by_sib(tids=("task-a2", "task-a3"))
+        real, first = policy._read_record, []
+
+        def match_lands_mid_nudge(path):
+            rec = real(path)
+            if rec is not None and path.parent.name == "pending" and not first:
+                first.append(None)
+                first[0] = w.match(SELF, "task-a2")["matched"]
+            return rec
+        with mock.patch.object(policy, "_read_record", side_effect=match_lands_mid_nudge):
+            policy.mark_nudged(w.ws[SELF], C1)
+        self.assertEqual(first, [True])
+        self.assertEqual(pending_ids(w.ws[SELF]), [])
+        again = w.match(SELF, "task-a3")
+        self.assertFalse(again["matched"])
+        self.assertIn("already answered", again["reason"])
+
+    def test_a_stale_pending_copy_cannot_answer_twice(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        self.answered_by_sib(tids=("task-a2", "task-a3"))
+        stale = (w.ws[SELF] / policy._STATE / "pending" / f"{C1}.json").read_text()
+        self.assertTrue(w.match(SELF, "task-a2")["matched"])
+        (w.ws[SELF] / policy._STATE / "pending" / f"{C1}.json").write_text(stale)
+        self.assertIn("already answered", w.match(SELF, "task-a3")["reason"])
+
+    def test_a_failed_record_write_after_the_post_is_recovered_from_the_room(self):
+        w, real, calls = self.w, policy._write_record, []
+
+        def second_write_fails(path, rec):
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError("disk full")
+            return real(path, rec)
+        with mock.patch.object(policy, "_write_record", side_effect=second_write_fails):
+            res = w.ask(SELF, SIB, cid=C1, task_id=TID)
+        self.assertEqual((res["asked"], res["ask_event"]), (True, "$ask"))
+        self.assertIn("was not recorded", res["warning"])
+        self.answered_by_sib()
+        got = w.match(SELF, "task-a2")
+        self.assertTrue(got["matched"], got)
+        self.assertEqual((got["task_id"], got["root"]), (TID, "$ask"))
+
+    def test_a_crash_between_post_and_record_is_recovered_from_the_room(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        path = w.ws[SELF] / policy._STATE / "pending" / f"{C1}.json"
+        path.write_text(json.dumps({**json.loads(path.read_text()), "ask_event": None, "root": None}))
+        self.answered_by_sib()
+        self.assertTrue(w.match(SELF, "task-a2")["matched"])
+
+    def test_an_answer_read_from_another_room_is_refused(self):
+        w, other = self.w, "!other:example.test"
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.tr[SIB].mention(SELF, final(C1, "up"), ROOM, reply_to="$ask", thread_root="$ask")
+        reply_task(w.ws[SELF], "$ask2", tid="task-a2", room=other, sender=SIB)
+        res = policy.match_reply(w.tr[SELF], room=other, self_mxid=SELF, task_id="task-a2", workspace=w.ws[SELF])
+        self.assertFalse(res["matched"])
+        self.assertIn(f"was asked in {ROOM}", res["reason"])
+        self.assertEqual(pending_ids(w.ws[SELF]), [C1])
+
+    def test_an_expired_consult_is_refused_listed_and_pruned(self):
+        w = self.w
+        policy.consult(w.tr[SELF], room=ROOM, self_mxid=SELF, agent=SIB, question="q", workspace=w.ws[SELF],
+                       task_id=TID, cid=C1, now=lambda: 1_000.0)
+        self.answered_by_sib()
+        res = policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, task_id="task-a2",
+                                 workspace=w.ws[SELF], expire_after_s=3600, now=1_000.0 + 3601)
+        self.assertIn("expired", res["reason"])
+        [row] = policy.pending(w.ws[SELF], 600, now=1_000.0 + 3601, expire_after_s=3600)
+        self.assertEqual((row["expired"], row["nudge_due"]), (True, True))
+        self.assertTrue(policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, task_id="task-a2",
+                                           workspace=w.ws[SELF], expire_after_s=3600, now=1_100.0)["matched"])
+        policy.pending(w.ws[SELF], 600, now=1_000.0 + 3601, expire_after_s=3600)
+        self.assertEqual(policy.records(w.ws[SELF], "answered"), [])
+
+    def test_expiry_config_is_clamped(self):
+        for raw, want in (("1", policy.EXPIRE_FLOOR_S), ("9e12", policy.EXPIRE_CEILING_S), ("x", policy.DEFAULT_EXPIRE_AFTER_S)):
+            s = policy.settings(environ={policy.CONFIG_ROOM: ROOM, policy.CONFIG_EXPIRE_AFTER: raw}, manifest_cfg={})
+            self.assertEqual(s["expire_after_s"], want, raw)
+
+    def test_a_closed_ask_task_cannot_be_answered_or_consulted_from(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.deliver(SIB, "$ask", "task-b1")
+        (w.ws[SIB] / "results" / "task-b1.txt").write_text("[no-send]")
+        self.assertIn("already has a result", w.ask(SIB, THIRD, cid=C2, via_task="task-b1")["reason"])
+        self.assertIn("already has a result", w.answer(SIB, "x", task_id="task-b1")["reason"])
+        self.assertEqual(w.tr[SIB].posted, [])
+
+    def test_a_consult_room_message_is_an_origin_only_when_the_owner_wrote_it(self):
+        w = self.w
+        for tid, sender in (("task-s1", THIRD), ("task-o1", OWNER)):
+            txt = te.stamp_text(f"id: {tid}\nsource: ag2space\nchannel_id: {ROOM}\nsource_message_id: $x\n"
+                                f"user_id: {sender}\naccess_tier: owner\ntask: ask B\n", w.ws[SELF])
+            (w.ws[SELF] / "tasks" / f"{tid}.txt").write_text(txt, encoding="utf-8")
+        res = w.ask(SELF, SIB, cid=C1, task_id="task-s1")
+        self.assertIn("must be the owner's own message", res["reason"])
+        self.assertEqual(w.tr[SELF].posted, [])
+        self.assertTrue(w.ask(SELF, SIB, cid=C2, task_id="task-o1")["asked"])
+
+    def test_asks_in_counts_an_ask_only_from_its_own_asker(self):
+        forged = {"sender": THIRD, "event_id": "$f", "body": f"{SIB} — {policy.ask_line(C1, '$r', [SELF, SIB])}"}
+        self.assertEqual(policy.asks_in([forged], {SELF, SIB, THIRD}), [])
+        genuine = dict(forged, sender=SELF)
+        self.assertEqual(len(policy.asks_in([genuine], {SELF, SIB, THIRD})), 1)
+
+    def test_a_chain_started_by_another_agent_inside_this_thread_is_refused(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.room.post(THIRD, f"{SIB} — {policy.ask_line(C3, '$ask', [THIRD, SIB])}", thread_root="$ask")
+        w.deliver(SIB, "$ask2", "task-b1")
+        res = w.ask(SIB, FOURTH, cid=C2, via_task="task-b1")
+        self.assertIn("not a consult ask by this chain's first agent", res["reason"])
+        self.assertEqual(w.tr[SIB].posted, [])
 
 
 class TestPendingListing(unittest.TestCase):

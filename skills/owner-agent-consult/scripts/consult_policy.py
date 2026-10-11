@@ -40,6 +40,9 @@ CONFIG_ROOM_CLI = "OWNER_AGENT_CONSULT_ROOM_CLI"
 CONFIG_NUDGE_AFTER = "OWNER_AGENT_CONSULT_NUDGE_AFTER_S"
 DEFAULT_NUDGE_AFTER_S = 600
 NUDGE_FLOOR_S, NUDGE_CEILING_S = 60, 86400
+CONFIG_EXPIRE_AFTER = "OWNER_AGENT_CONSULT_EXPIRE_AFTER_S"
+DEFAULT_EXPIRE_AFTER_S = 7 * 86400
+EXPIRE_FLOOR_S, EXPIRE_CEILING_S = 3600, 90 * 86400
 READ_LIMIT = 100
 MAX_TASK_BYTES = 256 * 1024
 _FALSE = ("0", "false", "no", "off")
@@ -69,17 +72,24 @@ def config_value(key: str, cli=None, environ=None, manifest_cfg=None) -> str:
     return str(cfg.get(key) or "").strip()
 
 
-def settings(room=None, nudge_after=None, room_cli=None, environ=None, manifest_cfg=None) -> dict:
-    """{active, room, room_cli, nudge_after_s, reason}; inert when disabled, or when no room
-    or no room transport is configured."""
-    get = lambda k, c=None: config_value(k, c, environ, manifest_cfg)  # noqa: E731
+def _seconds(raw: str, default: int, floor: int, ceiling: int) -> int:
     try:
-        nudge = int(float(get(CONFIG_NUDGE_AFTER, nudge_after) or DEFAULT_NUDGE_AFTER_S))
+        value = int(float(raw or default))
     except ValueError:
-        nudge = DEFAULT_NUDGE_AFTER_S
-    nudge = max(NUDGE_FLOOR_S, min(nudge, NUDGE_CEILING_S))
+        value = default
+    return max(floor, min(value, ceiling))
+
+
+def settings(room=None, nudge_after=None, room_cli=None, environ=None, manifest_cfg=None,
+             expire_after=None) -> dict:
+    """{active, room, room_cli, nudge_after_s, expire_after_s, reason}; inert when disabled,
+    or when no room or no room transport is configured."""
+    get = lambda k, c=None: config_value(k, c, environ, manifest_cfg)  # noqa: E731
+    nudge = _seconds(get(CONFIG_NUDGE_AFTER, nudge_after), DEFAULT_NUDGE_AFTER_S, NUDGE_FLOOR_S, NUDGE_CEILING_S)
+    expire = _seconds(get(CONFIG_EXPIRE_AFTER, expire_after), DEFAULT_EXPIRE_AFTER_S,
+                      EXPIRE_FLOOR_S, EXPIRE_CEILING_S)
     out = {"active": False, "room": get(CONFIG_ROOM, room), "room_cli": get(CONFIG_ROOM_CLI, room_cli),
-           "nudge_after_s": nudge, "reason": None}
+           "nudge_after_s": nudge, "expire_after_s": expire, "reason": None}
     if get(CONFIG_ENABLED).lower() in _FALSE:
         out["reason"] = f"disabled ({CONFIG_ENABLED} is off); the skill is inert"
     elif not out["room"]:
@@ -231,7 +241,7 @@ def trusted_task(task_id: str, workspace: Optional[Path]) -> dict:
     if ltp.find_result(Path(workspace) / "results", task_id) is not None:
         return no("task already has a result; a replayed task cannot consult")
     origin = {k: headers[k] for k in _ORIGIN_KEYS if headers.get(k)}
-    return {"ok": True, "origin": origin, "reason": None}
+    return {"ok": True, "origin": origin, "sender": headers.get("user_id") or "", "reason": None}
 
 
 # Pending consult records: <workspace>/state/owner-agent-consult/{pending,answered}/<cid>.json
@@ -267,27 +277,40 @@ def prior_ask(workspace: Path, key: str, value: str) -> Optional[dict]:
     return min(same, key=lambda r: r.get("asked_at") or 0) if same else None
 
 
-def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None) -> List[dict]:
-    """Unanswered consults, oldest first; `nudge_due` when overdue and the owner was not yet told."""
+def _age(rec: dict, now: float) -> float:
+    return max(0.0, now - float(rec.get("asked_at") or now))
+
+
+def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
+            expire_after_s: float = DEFAULT_EXPIRE_AFTER_S) -> List[dict]:
+    """Unanswered consults, oldest first; `nudge_due` when overdue and the owner was not yet
+    told, `expired` past the expiry (match then refuses). Prunes answered and nudge records
+    older than the expiry."""
     now = time.time() if now is None else now
+    for state in ("answered", "nudged"):
+        for r in records(workspace, state):
+            if _age(r, now) > expire_after_s:
+                _record_path(workspace, state, r["cid"]).unlink(missing_ok=True)
     out = []
     for r in sorted(records(workspace, "pending"), key=lambda r: r.get("asked_at") or 0):
-        age = max(0.0, now - float(r.get("asked_at") or now))
+        age = _age(r, now)
         overdue = age >= nudge_after_s
-        out.append({**r, "age_s": int(age), "overdue": overdue,
-                    "nudge_due": overdue and not r.get("nudged_at")})
+        nudged = _record_path(workspace, "nudged", r["cid"]).exists()
+        out.append({**r, "age_s": int(age), "overdue": overdue, "nudged": nudged,
+                    "nudge_due": overdue and not nudged, "expired": age > expire_after_s})
     return out
 
 
 def mark_nudged(workspace: Path, cid: str, now: Optional[float] = None) -> dict:
+    """Record that the owner was told, in its own file: the pending record is never rewritten
+    here, so a nudge cannot bring back a consult a match has closed."""
     if not _CID.match(cid or ""):
         return {"ok": False, "reason": "malformed correlation id"}
-    path = _record_path(workspace, "pending", cid)
-    rec = _read_record(path)
+    rec = _read_record(_record_path(workspace, "pending", cid))
     if rec is None:
         return {"ok": False, "reason": f"no pending consult {cid}"}
-    rec["nudged_at"] = time.time() if now is None else now
-    _write_record(path, rec)
+    _write_record(_record_path(workspace, "nudged", cid),
+                  {"cid": cid, "asked_at": rec.get("asked_at"), "nudged_at": time.time() if now is None else now})
     return {"ok": True, "cid": cid, "reason": None}
 
 
@@ -398,9 +421,12 @@ def incoming_ask(transport, room: str, self_mxid: str, task_id: str,
     got = live_task(task_id, workspace)
     if not got["ok"]:
         return no(got["reason"])
+    import local_task_protocol as ltp
     h = got["headers"]
     if room not in (h.get("channel_id"), h.get("source_room_id")):
         return no("task did not come from the consult room")
+    if ltp.find_result(Path(workspace) / "results", task_id) is not None:
+        return no("the ask's task already has a result; a closed ask cannot be answered or consulted from")
     event = h.get("source_message_id")
     page = transport.read(room, READ_LIMIT)
     if not page.get("ok"):
@@ -467,6 +493,9 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
         return no(verdict["reason"])
     if agent not in {r["mxid"] for r in roster(verdict, self_mxid)}:
         return no(f"{agent} is not one of the owner's other agents in the consult room")
+    if task_id and room in (origin.get("channel_id"), origin.get("source_room_id")) \
+            and gate["sender"] != verdict["owner"]:
+        return no("an owner task from the consult room must be the owner's own message")
     if task_id:
         prior = prior_ask(workspace, "task_id", task_id)
         root = prior["root"] if prior else None
@@ -509,9 +538,14 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
         path.unlink(missing_ok=True)
         return no(f"ask not posted: {sent.get('reason') or 'no event id'}")
     record.update(ask_event=event, root=root or event)
-    _write_record(path, record)
+    warning = None
+    try:
+        if not _record_path(workspace, "answered", cid).exists():
+            _write_record(path, record)
+    except OSError as e:
+        warning = f"ask posted but its event id was not recorded ({e}); match recovers it from the room"
     return {"asked": True, "agent": agent, "cid": cid, "ask_event": event, "root": record["root"],
-            "chain": chain, "follow_up": follow_up, "reason": None}
+            "chain": chain, "follow_up": follow_up, "warning": warning, "reason": None}
 
 
 def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Optional[Path],
@@ -551,8 +585,21 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
             "event_id": sent.get("event_id"), "reason": None}
 
 
+def _recover_ask(rec: dict, messages: List[dict], self_mxid: str) -> dict:
+    """A record whose post was not recorded (a failed write, or a crash after the post) gets
+    its ask event and root back from this agent's own ask in the room, found by consult id."""
+    if rec.get("ask_event"):
+        return rec
+    for m in messages:
+        a = parse_ask(m.get("body") if isinstance(m.get("body"), str) else "")
+        if a and a["cid"] == rec["cid"] and m.get("sender") == self_mxid and a["chain"][-1] == rec.get("agent"):
+            return {**rec, "ask_event": m.get("event_id"), "root": a["root"] or m.get("event_id")}
+    return rec
+
+
 def match_reply(transport, *, room: str, self_mxid: str, task_id: str,
-                workspace: Optional[Path]) -> dict:
+                workspace: Optional[Path], expire_after_s: float = DEFAULT_EXPIRE_AFTER_S,
+                now: Optional[float] = None) -> dict:
     """Bind a reply task to its pending consult: the reply must be a verified live task from
     the consult room, whose room event comes from the asked agent, sits in the consult's
     thread, carries that consult's answer line, and replies to that consult's ask (or the
@@ -572,8 +619,8 @@ def match_reply(transport, *, room: str, self_mxid: str, task_id: str,
     page = transport.read(room, READ_LIMIT)
     if not page.get("ok"):
         return no(f"consult room unreadable: {page.get('reason')}")
-    msg = next((m for m in page.get("messages") or [] if isinstance(m, dict)
-                and m.get("event_id") == event), None)
+    messages = [m for m in page.get("messages") or [] if isinstance(m, dict)]
+    msg = next((m for m in messages if m.get("event_id") == event), None)
     if msg is None or not isinstance(msg.get("body"), str):
         return no(f"reply event not in the last {READ_LIMIT} messages of the consult room")
     first, rest = _first_line(msg["body"])
@@ -584,11 +631,16 @@ def match_reply(transport, *, room: str, self_mxid: str, task_id: str,
         return no("not a final answer (no answer line); treat it as progress", progress=True)
     cid, text = m.group(1), rest.strip()
     rec = _read_record(_record_path(workspace, "pending", cid))
-    if rec is None:
+    if rec is None or _record_path(workspace, "answered", cid).exists():
         state = "already answered" if _record_path(workspace, "answered", cid).exists() else "unknown"
         return no(f"consult {cid} is {state}")
+    if rec.get("room") != room:
+        return no(f"consult {cid} was asked in {rec.get('room')}, not {room}")
+    if _age(rec, time.time() if now is None else now) > expire_after_s:
+        return no(f"consult {cid} expired; tell the owner it was not answered in time")
     if msg.get("sender") != rec.get("agent"):
         return no(f"answer is from {msg.get('sender')}, not {rec.get('agent')}")
+    rec = _recover_ask(rec, messages, self_mxid)
     if not rec.get("ask_event"):
         return no("the ask was never confirmed posted")
     if msg.get("thread_root") != rec.get("root"):
@@ -602,11 +654,13 @@ def match_reply(transport, *, room: str, self_mxid: str, task_id: str,
     dst = _record_path(workspace, "answered", cid)
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(src, dst)  # the claim: a second match of the same answer finds nothing pending
-    except FileNotFoundError:
+        os.link(src, dst)  # the claim: link fails once answered/<cid> exists, whatever pending holds
+    except (FileNotFoundError, FileExistsError):
         return no(f"consult {cid} is already answered")
     except OSError as e:
         return no(f"consult {cid} could not be closed: {e}")
+    src.unlink(missing_ok=True)
+    _record_path(workspace, "nudged", cid).unlink(missing_ok=True)
     rec.update(answered_at=time.time(), answer_event=event, reply_task=task_id)
     try:
         _write_record(dst, rec)
