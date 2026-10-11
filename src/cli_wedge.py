@@ -175,9 +175,9 @@ def raw_state_id(frame: str) -> str:
     return hashlib.sha1(frame.encode("utf-8")).hexdigest()[:12]
 
 
-# Leading decoration before a banner: indent, spinner frames, box rules, the CLI's ⚠.
+# Leading decoration before a banner: indent, spinner frames, box rules.
 # Excludes '>' '*' '-' '\u2022' \u2014 those double as markdown syntax in the agent's own prose.
-_BANNER_DECOR = re.compile(r"^[\s\u00b7\u2500-\u257f\u2713\u2717\u273b\u2733\u23f5\u23bf\u26a0\u28c0-\u28ff]+")
+_BANNER_DECOR = re.compile(r"^[\s\u00b7\u2500-\u257f\u2713\u2717\u273b\u2733\u23f5\u23bf\u28c0-\u28ff]+")
 
 # The CLI's own retry line, whole: an optional cause, one separator, the retry
 # clause, and nothing after it. Prose about a retry has words between or after.
