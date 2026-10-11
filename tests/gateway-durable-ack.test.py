@@ -109,12 +109,12 @@ class DurableAck(unittest.TestCase):
             if written:
                 tid, durable = written
                 inflight.add(tid)
-                pending.append((tid, durable))
+                pending.append((tid, durable, mod._lease_id_of(task)))
         committed = mod._save_inflight(inflight) if pending else True
         if pending and committed:
             committed = mod._record_pending_acks(pending)
-        for tid, durable in pending if committed else ():
-            mod._post_task_ack(tid, durable)
+        for tid, durable, lease in pending if committed else ():
+            mod._post_task_ack(tid, durable, lease)
         return pending
 
     # -- 1. the durable-write sequence -------------------------------------- #
@@ -178,9 +178,9 @@ class DurableAck(unittest.TestCase):
         seen: list[bool] = []
         real = mod._post_task_ack
 
-        def ack(tid, durable=False):
+        def ack(tid, durable=False, lease_id=None):
             seen.append(mod.TASK_MEDIA_FILE.exists())
-            return real(tid, durable)
+            return real(tid, durable, lease_id)
 
         with patch.object(mod, "_post_task_ack", side_effect=ack):
             self._ack_round([self._task("task-old")])
@@ -204,9 +204,9 @@ class DurableAck(unittest.TestCase):
             synced.add(os.fstat(fd).st_ino)
             return real_fsync(fd)
 
-        def ack(tid, durable=False):
+        def ack(tid, durable=False, lease_id=None):
             at_ack.append(want <= synced)
-            return real_ack(tid, durable)
+            return real_ack(tid, durable, lease_id)
 
         class _Watch:
             def __enter__(_self):
@@ -430,6 +430,48 @@ class DurableAck(unittest.TestCase):
         with patch.object(fresh, "_req", side_effect=lambda *a, **k: calls.append(a) or {}):
             fresh._retry_pending_acks({"task-restart"})
         self.assertEqual(calls[0][2], {"id": "task-restart", "durable": True})
+
+    def test_a_served_lease_generation_rides_the_ack_and_its_retry_after_a_restart(self):
+        """A task served with `lease_id` acks under that generation; a lease-less
+        task acks without the key. The ledger keeps the generation, so the retry
+        a fresh process posts after a restart names the serve it answers."""
+        mod = self.mod
+        leased = {**self._task("task-leased"), "lease_id": "gen-2"}
+        self._ack_round([leased, self._task("task-plain")])
+        self.assertEqual([c[2] for c in self._acks()],
+                         [{"id": "task-leased", "lease_id": "gen-2", "durable": True},
+                          {"id": "task-plain", "durable": True}])
+        with patch.object(mod, "_req", side_effect=urllib.error.URLError("down")):
+            self._ack_round([{**self._task("task-lost"), "lease_id": "gen-5"}])
+        fresh = _load(self.ws)
+        self.assertEqual(fresh._load_pending_acks(), {"task-lost": True})
+        self.assertEqual(fresh._load_pending_leases(), {"task-lost": "gen-5"})
+        calls: list = []
+        with patch.object(fresh, "_req", side_effect=lambda *a, **k: calls.append(a) or {}):
+            fresh._retry_pending_acks({"task-lost"})
+        self.assertEqual(calls[0][2], {"id": "task-lost", "lease_id": "gen-5", "durable": True})
+        self.assertEqual(fresh._load_pending_acks(), {})
+
+    def test_a_stale_generation_404_retires_the_record_and_logs_the_task(self):
+        """`404 {"reason": "stale lease generation"}`: the broker re-served the
+        task under a newer generation, so this ack is retired like any other
+        not-leased 404 — one log line names the task, no retry, no cooldown."""
+        mod = self.mod
+        with patch.object(mod, "_req", side_effect=urllib.error.URLError("down")):
+            self._ack_round([{**self._task("task-stale"), "lease_id": "gen-1"}])
+        self.assertEqual(mod._load_pending_leases(), {"task-stale": "gen-1"})
+        stale = _http(404, b'{"error":"not leased to you","reason":"stale lease generation"}')
+        logs: list[str] = []
+        with patch.object(mod, "_req", side_effect=stale), \
+             patch.object(mod, "_log", side_effect=lambda m, *a, **k: logs.append(str(m))):
+            mod._retry_pending_acks({"task-stale"})
+        self.assertEqual(mod._load_pending_acks(), {})
+        self.assertEqual(mod._ack_disabled_until, 0.0)
+        named = [l for l in logs if "task-stale" in l and "lease generation" in l]
+        self.assertEqual(len(named), 1, logs)
+        before = len(self.calls)
+        mod._retry_pending_acks({"task-stale"})
+        self.assertEqual(len(self.calls), before, "a retired ack is never re-posted")
 
 
     # -- 5. the production ack round, driven through main() ------------------ #
