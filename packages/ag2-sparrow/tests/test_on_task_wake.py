@@ -249,6 +249,18 @@ def test_header_holding_the_token_is_not_exported():
         print("PASS test_header_holding_the_token_is_not_exported")
 
 
+def test_token_straddling_the_length_cap_is_not_exported():
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        cmd, out = _recorder_cmd(base)
+        m = _load(base, cmd)
+        pad = "x" * (m._ON_TASK_ENV_MAX - len(SECRET) // 2)
+        m._write_task({**_task(), "sender_name": pad + SECRET})
+        env = _calls(out, 1)[0]["env"]
+        assert "SPARROW_SENDER_NAME" not in env, len(env.get("SPARROW_SENDER_NAME", ""))
+        print("PASS test_token_straddling_the_length_cap_is_not_exported")
+
+
 def test_control_characters_never_reach_env():
     controls = "".join(chr(c) for c in (*range(0x20), *range(0x7F, 0xA0)))
     with tempfile.TemporaryDirectory() as d:
@@ -390,6 +402,7 @@ if __name__ == "__main__":
     test_stdin_carries_the_exact_task_bytes()
     test_env_carries_the_routing_headers()
     test_header_holding_the_token_is_not_exported()
+    test_token_straddling_the_length_cap_is_not_exported()
     test_control_characters_never_reach_env()
     test_task_file_keeps_tab_and_esc_in_headers()
     test_child_that_ignores_or_closes_stdin_never_blocks()

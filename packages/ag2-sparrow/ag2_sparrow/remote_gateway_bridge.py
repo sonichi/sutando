@@ -3398,9 +3398,9 @@ def _on_task_header_env(text: str) -> "dict[str, str]":
     secrets = [v for v in (TOKEN, _RAW, HS_MEDIA_TOKEN) if v]
     env = {}
     for name, key in _ON_TASK_ENV_FIELDS:
-        value = _env_safe(headers.get(key) or "").strip()[:_ON_TASK_ENV_MAX]
+        value = _env_safe(headers.get(key) or "").strip()
         if value and not any(sec in value for sec in secrets):
-            env[name] = value
+            env[name] = value[:_ON_TASK_ENV_MAX]
     return env
 
 
