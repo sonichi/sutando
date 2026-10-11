@@ -359,11 +359,11 @@ records out of `pending`; `pending` lists only claims whose task is still live.
 
 **Cost: claim files accumulate.** Each owner task that consults leaves one root claim (about
 80 bytes), and each ask this agent answers leaves one answer claim (about 150 bytes). On most
-filesystems each takes one block (4 KB), so 1,000 consults use about 8 MB. There is no per-claim
-cleanup. The only supported reset is deleting the whole consult state directory,
-`<workspace>/state/owner-agent-consult/`, and only while no consult task is live (no ask, reply
-or answer task in `tasks/` without a result). A reset forgets every claim and every pending
-consult; a late answer to anything asked before it no longer matches.
+filesystems each takes one block (4 KB), so 1,000 consults use about 8 MB. There is no supported
+reset. Deleting any of `<workspace>/state/owner-agent-consult/` can let a caller that was already
+admitted post twice: a task's result does not prove that such callers have stopped. Do it only
+with every one of the owner's agents fully stopped, and at your own risk. A reset fenced against
+admitted callers would be a separate change.
 
 **The cost, stated plainly.** If a post really never landed, that task cannot consult again: no
 further ask from it, or answer to that ask, is posted. `ask` and `answer` refuse with the
