@@ -220,6 +220,20 @@ class RenotifyTests(unittest.TestCase):
         self.assertTrue(reminders[0].startswith("⚠ Still blocked after 1h 27m — worker pro-dev"),
                         reminders[0])
 
+    def test_a_new_card_inherits_the_seats_backoff(self):
+        self._seat_cards("pro-dev", 1)
+        self.clock.advance(31 * MIN)
+        self.assertEqual(len(self.drive()), 1)  # reminder #1, count -> 1
+        self.clock.advance(2 * HOUR + MIN)
+        self.assertEqual(len(self.drive()), 1)  # reminder #2, count -> 2 (next interval 6h)
+        self.mgr.create(seat_card("pro-dev", "new-card", self.clock.t))
+        self.drive()  # the new card's own creation message, not a renotify notice
+        self.clock.advance(31 * MIN)  # past the new card's own 30m mark
+        self.assertEqual(self.drive(), [], "the seat's clock, not the new card's, governs")
+        self.clock.advance(6 * HOUR)
+        sent = [p for p in self.drive() if p["op"] == "message"]
+        self.assertEqual(len(sent), 1)
+
     def test_a_reminder_for_one_seat_does_not_silence_another(self):
         self._seat_cards("pro-dev", 3)
         self._seat_cards("pro-fast", 3)
