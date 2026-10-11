@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -120,6 +121,30 @@ class SingletonGlueTest(unittest.TestCase):
             self.assertTrue(rgb._acquire_singleton())    # error → proceed to poll (fail-open)
         finally:
             rgb._ws_acquire = orig
+
+    def test_signal_exit_names_the_signal_and_exits_0(self):
+        logged = []
+        orig = rgb._log
+        rgb._log = logged.append
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                rgb._exit_on_signal(signal.SIGTERM, None)
+        finally:
+            rgb._log = orig
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(logged, ["received SIGTERM — exiting"])
+
+    def test_signal_exit_survives_a_failing_log(self):
+        def boom(_msg):
+            raise RuntimeError("reentrant print")
+        orig = rgb._log
+        rgb._log = boom
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                rgb._exit_on_signal(signal.SIGINT, None)
+        finally:
+            rgb._log = orig
+        self.assertEqual(ctx.exception.code, 0)
 
 
 if __name__ == "__main__":
