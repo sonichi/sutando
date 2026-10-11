@@ -322,13 +322,15 @@ def _root_claim(workspace: Path, task_id: str) -> Path:
 def claim_root(workspace: Path, task_id: str, cid: str) -> bool:
     """The one durable claim that this task's thread root is `cid`'s ask; False when taken."""
     path = _root_claim(workspace, task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}")
+    tmp.write_text(json.dumps({"cid": cid, "task_id": task_id, "asked_at": time.time()}), encoding="utf-8")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.link(tmp, path)  # the claim appears complete or not at all
     except FileExistsError:
         return False
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump({"cid": cid, "task_id": task_id, "asked_at": time.time()}, fh)
+    finally:
+        tmp.unlink(missing_ok=True)
     return True
 
 
@@ -358,6 +360,11 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
     roots = Path(workspace) / _STATE / "roots"
     for f in sorted(roots.glob("*.json")) if roots.is_dir() else []:
         claim = _read_record(f) or {}
+        if not isinstance(claim.get("asked_at"), (int, float)):
+            try:
+                claim = {"asked_at": f.stat().st_mtime}  # an empty or unreadable claim ages by its file
+            except OSError:
+                continue
         if _age(claim, now) > expire_after_s:
             f.unlink(missing_ok=True)
     for state in ("answered", "nudged"):

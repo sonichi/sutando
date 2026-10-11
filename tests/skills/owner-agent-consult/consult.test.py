@@ -1348,6 +1348,24 @@ class TestKeweiRoundNine(unittest.TestCase):
         w.tr[SELF].mention = FakeTransport.mention.__get__(w.tr[SELF])
         self.assertTrue(w.ask(SELF, SIB, cid=C2, task_id=TID)["asked"])
 
+    def test_an_empty_root_claim_blocks_until_it_ages_out_by_its_file_time(self):
+        claim = policy._root_claim(self.w.ws[SELF], TID)
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        claim.write_text("")  # a crash between creating the claim and writing it
+        old = time.time() - 10 * 86400
+        os.utime(claim, (old, old))
+        self.assertFalse(policy.claim_root(self.w.ws[SELF], TID, C1))
+        policy.pending(self.w.ws[SELF], 600)
+        self.assertFalse(claim.exists())
+        self.assertTrue(policy.claim_root(self.w.ws[SELF], TID, C1))
+
+    def test_a_crash_while_writing_a_claim_leaves_no_claim(self):
+        with mock.patch.object(policy.os, "link", side_effect=OSError("crash")), self.assertRaises(OSError):
+            policy.claim_root(self.w.ws[SELF], TID, C1)
+        self.assertFalse(policy._root_claim(self.w.ws[SELF], TID).exists())
+        self.assertEqual(list(policy._root_claim(self.w.ws[SELF], TID).parent.iterdir()), [])
+        self.assertTrue(policy.claim_root(self.w.ws[SELF], TID, C1))
+
     def test_old_root_claims_are_pruned(self):
         policy.claim_root(self.w.ws[SELF], TID, C1)
         policy.pending(self.w.ws[SELF], 600, now=time.time() + 10 * 86400)
