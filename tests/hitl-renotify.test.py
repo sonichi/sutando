@@ -130,7 +130,7 @@ class RenotifyTests(unittest.TestCase):
         self.clock.advance(7 * HOUR)
         self.assertEqual(self.drive(), [])  # once, and no reminder after resolution
 
-    # -- one seat, many cards: the 2026-10-11 recovery flood --------------------------
+    # -- one seat, many cards ---------------------------------------------------------
 
     def _seat_cards(self, seat, n, step=MIN):
         ids = []
