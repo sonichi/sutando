@@ -1,8 +1,9 @@
 """REMOTE_TASK_ON_TASK — the optional wake command Sparrow runs per queued task.
 
 Fires once per newly published task file with the path as its last argument,
-never blocks or breaks the pull loop, never re-fires on redelivery or restart,
-and never hands the relay credentials to the command.
+hands it the task's bytes on stdin and its routing headers in env, never
+blocks or breaks the pull loop, never re-fires on redelivery or restart, and
+never hands the relay credentials to the command.
 """
 import importlib
 import json
@@ -21,6 +22,14 @@ import json, os, sys, time
 out = os.environ["ON_TASK_OUT"]
 with open(os.path.join(out, "%d-%d.json" % (os.getpid(), time.time_ns())), "w") as f:
     json.dump({"argv": sys.argv[1:], "env": dict(os.environ)}, f)
+"""
+
+STDIN_RECORDER = """
+import json, os, sys, time
+data = sys.stdin.buffer.read()
+out = os.environ["ON_TASK_OUT"]
+with open(os.path.join(out, "%d-%d.json" % (os.getpid(), time.time_ns())), "w") as f:
+    json.dump({"argv": sys.argv[1:], "env": dict(os.environ), "stdin": data.hex()}, f)
 """
 
 
@@ -52,9 +61,9 @@ def _task(tid="task-1784700000000"):
     }
 
 
-def _recorder_cmd(base):
+def _recorder_cmd(base, source=RECORDER):
     script = base / "recorder.py"
-    script.write_text(RECORDER)
+    script.write_text(source)
     out = base / "calls"
     out.mkdir()
     os.environ["ON_TASK_OUT"] = str(out)
@@ -187,10 +196,81 @@ def test_token_never_reaches_the_command():
         print("PASS test_token_never_reaches_the_command")
 
 
+def test_stdin_carries_the_exact_task_bytes():
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        cmd, out = _recorder_cmd(base, STDIN_RECORDER)
+        m = _load(base, cmd)
+        tid, _ = m._write_task(_task())
+        dest = m.TASKS_DIR / f"{tid}.txt"
+        calls = _calls(out, 1)
+        assert len(calls) == 1, calls
+        assert bytes.fromhex(calls[0]["stdin"]) == dest.read_bytes()
+        assert calls[0]["argv"] == [str(dest)]
+        assert calls[0]["env"]["SPARROW_TASK_FILE"] == str(dest)
+        print("PASS test_stdin_carries_the_exact_task_bytes")
+
+
+def test_env_carries_the_routing_headers():
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        cmd, out = _recorder_cmd(base)
+        m = _load(base, cmd)
+        task = {**_task(), "source_message_id": "$evt1:ag2.space",
+                "thread_root": "$root1:ag2.space", "sender_name": "Q" * 2000}
+        tid, _ = m._write_task(task)
+        headers = m.local_task_protocol.parse_task_headers_trusted(
+            (m.TASKS_DIR / f"{tid}.txt").read_text()).headers
+        env = _calls(out, 1)[0]["env"]
+        assert env["SPARROW_SOURCE"] == "ag2space"
+        assert env["SPARROW_ROOM_ID"] == "!room:ag2.space"
+        assert env["SPARROW_THREAD_ROOT"] == "$root1:ag2.space"
+        assert env["SPARROW_SOURCE_MESSAGE_ID"] == "$evt1:ag2.space"
+        assert env["SPARROW_SENDER"] == "@qingyun:ag2.space"
+        assert env["SPARROW_ACCESS_TIER"] == headers["access_tier"] == "owner"
+        assert env["SPARROW_SENDER_NAME"] == "Q" * 512
+        assert all("\n" not in v for k, v in env.items() if k.startswith("SPARROW_"))
+        print("PASS test_env_carries_the_routing_headers")
+
+
+def test_child_that_ignores_or_closes_stdin_never_blocks():
+    big = "x" * (512 * 1024)  # larger than any pipe buffer
+    cases = [
+        ("never reads", f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(6)'"),
+        ("exits at once", f"{shlex.quote(sys.executable)} -c 'pass'"),
+    ]
+    for i, (name, cmd) in enumerate(cases):
+        with tempfile.TemporaryDirectory() as d:
+            base = pathlib.Path(d)
+            m = _load(base, cmd)
+            m._ON_TASK_STDIN_TIMEOUT_S = 1.0
+            logs = []
+            m._log = logs.append
+            res = m._write_task(_task(f"task-17847000003{i:02d}"))
+            assert res is not None and res[1], f"{name}: task not durably queued"
+            dest = m.TASKS_DIR / f"{res[0]}.txt"
+            t0 = time.monotonic()
+            m._fire_on_task(res[0], dest, dest.read_text() + big)
+            elapsed = time.monotonic() - t0
+            assert elapsed < 1, f"{name}: the pull loop waited {elapsed:.1f}s"
+            if name == "never reads":
+                deadline = time.time() + 10
+                while time.time() < deadline and not any("did not read" in ln for ln in logs):
+                    time.sleep(0.05)
+                assert any("did not read its stdin" in ln for ln in logs), logs
+            else:
+                time.sleep(1.5)
+                assert not any("failed" in ln or "Error" in ln for ln in logs), logs
+            print(f"PASS test_child_that_ignores_or_closes_stdin_never_blocks ({name})")
+
+
 if __name__ == "__main__":
     test_fires_once_per_new_task_with_its_path()
     test_unset_runs_nothing()
     test_failing_or_slow_command_never_blocks_or_loses_the_task()
     test_redelivery_and_restart_do_not_refire()
     test_token_never_reaches_the_command()
+    test_stdin_carries_the_exact_task_bytes()
+    test_env_carries_the_routing_headers()
+    test_child_that_ignores_or_closes_stdin_never_blocks()
     print("ALL PASS test_on_task_wake")

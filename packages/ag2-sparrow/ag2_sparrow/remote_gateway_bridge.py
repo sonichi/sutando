@@ -43,7 +43,8 @@ Config (env / .env):
                         .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
   REMOTE_TASK_ON_TASK   optional wake command, run once per newly queued task
-                        file (argv split with shlex, no shell; file path appended)
+                        file (argv split with shlex, no shell; file path appended;
+                        the task's bytes on stdin, routing headers as SPARROW_* env)
   REMOTE_OUTBOUND_SCAN_S outbound worker scan period seconds (default 1.0)
 
 Stdlib only (urllib) — no new dependencies.
@@ -3315,26 +3316,90 @@ def _on_task_env() -> "dict[str, str]":
             and not any(sec in v for sec in secrets)}
 
 
-def _fire_on_task(tid: str, path: Path) -> None:
-    """Start REMOTE_TASK_ON_TASK for one newly published task file; never waits on it."""
+# Header fields handed to the wake command's environment, as SPARROW_<NAME>.
+_ON_TASK_ENV_FIELDS = (("SPARROW_SOURCE", "source"), ("SPARROW_ROOM_ID", "channel_id"),
+                       ("SPARROW_THREAD_ROOT", "thread_root"),
+                       ("SPARROW_SOURCE_MESSAGE_ID", "source_message_id"),
+                       ("SPARROW_SENDER", "user_id"), ("SPARROW_SENDER_NAME", "sender_name"),
+                       ("SPARROW_ACCESS_TIER", "access_tier"))
+_ON_TASK_ENV_MAX = 512
+# How long a wake command that does not read stdin may hold the pipe open.
+_ON_TASK_STDIN_TIMEOUT_S = 30.0
+
+
+def _on_task_header_env(text: str) -> "dict[str, str]":
+    """SPARROW_* variables for the task file's routing headers; single-line, bounded."""
+    headers = local_task_protocol.parse_task_headers_trusted(text).headers
+    secrets = [v for v in (TOKEN, _RAW, HS_MEDIA_TOKEN) if v]
+    env = {}
+    for name, key in _ON_TASK_ENV_FIELDS:
+        value = _one_line(headers.get(key) or "").strip()[:_ON_TASK_ENV_MAX]
+        if value and "\x00" not in value and not any(sec in value for sec in secrets):
+            env[name] = value
+    return env
+
+
+def _feed_on_task_stdin(proc: "subprocess.Popen", data: bytes, tid: str) -> None:
+    """Write `data` to the child's stdin and close it, giving up after a bounded wait."""
+    pipe = proc.stdin
+    if pipe is None:
+        return
+    try:
+        if os.name == "nt":  # Windows pipes do not support select(): a plain blocking write
+            pipe.write(data)
+            return
+        fd = pipe.fileno()
+        os.set_blocking(fd, False)
+        view = memoryview(data)
+        deadline = time.monotonic() + _ON_TASK_STDIN_TIMEOUT_S
+        while view:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _log(f"on-task command did not read its stdin for {tid}; closed it")
+                break
+            _, ready, _ = select.select([], [fd], [], min(remaining, 1.0))
+            if ready:
+                try:
+                    view = view[os.write(fd, view):]
+                except BlockingIOError:
+                    continue
+    except (BrokenPipeError, ConnectionResetError):
+        pass  # the command exited or closed stdin without reading: it ignores the payload
+    except (OSError, ValueError) as exc:
+        _log(f"on-task stdin write failed for {tid}: {type(exc).__name__}: {exc}")
+    finally:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+def _fire_on_task(tid: str, path: Path, text: "str | None" = None) -> None:
+    """Start REMOTE_TASK_ON_TASK for one newly published task file; never waits on it.
+    The command gets the task's bytes on stdin and its routing headers in env."""
     if not ON_TASK_CMD:
         return
     try:
+        if text is None:
+            text = path.read_text(encoding="utf-8")
+        data = text.encode("utf-8")
         argv = shlex.split(ON_TASK_CMD) + [str(path)]
-        env = {**_on_task_env(), "SPARROW_TASK_ID": tid, "SPARROW_TASK_FILE": str(path)}
-        proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+        env = {**_on_task_env(), **_on_task_header_env(text),
+               "SPARROW_TASK_ID": tid, "SPARROW_TASK_FILE": str(path)}
+        proc = subprocess.Popen(argv, env=env, stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 start_new_session=True)
     except Exception as exc:  # noqa: BLE001 — a bad wake command never stops the pull loop
         _log(f"on-task command failed to start for {tid}: {type(exc).__name__}: {exc}")
         return
 
-    def _reap() -> None:
+    def _feed_and_reap() -> None:
+        _feed_on_task_stdin(proc, data, tid)
         code = proc.wait()
         if code != 0:
             _log(f"on-task command exited {code} for {tid}")
 
-    threading.Thread(target=_reap, name=f"on-task-{tid}", daemon=True).start()
+    threading.Thread(target=_feed_and_reap, name=f"on-task-{tid}", daemon=True).start()
 
 
 def _write_task(task: dict) -> "tuple[str, bool] | None":
@@ -3520,7 +3585,8 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     if task.get("owner_mentioned") == "true":
         lines.extend(owner_mention_lines(f"results/{tid}.txt"))
     from .local_task_protocol import apply_task_stamper
-    tmp = _stage_durable(dest, apply_task_stamper("\n".join(lines) + "\n"))
+    task_text = apply_task_stamper("\n".join(lines) + "\n")
+    tmp = _stage_durable(dest, task_text)
     if tmp is None:
         _log(f"task write FAILED for {tid} — not queued, not acked")
         return None
@@ -3546,7 +3612,7 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     # only for owner-tier senders (same resolved tier as the task above).
     _write_owner_activity(task, sender_tier)
     # Only a fresh publish reaches here, so redelivery and restarts never re-fire.
-    _fire_on_task(tid, dest)
+    _fire_on_task(tid, dest, task_text)
     return tid, True
 
 
