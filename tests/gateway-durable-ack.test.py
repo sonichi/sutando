@@ -534,6 +534,19 @@ class DurableAck(unittest.TestCase):
         self.assertEqual(mod._load_pending_acks(), {"task-main-lost": True},
                          "the ledger must be committed before the ack is posted")
 
+    def test_main_carries_the_served_lease_generation_to_the_ack_and_the_ledger(self):
+        """The production round echoes `lease_id` on the wire and records it for
+        the retry, so a restart still acks under the generation it was served."""
+        mod = self.mod
+        self._drive_main([{**self._task("task-main-gen"), "lease_id": "gen-3"}])
+        self.assertEqual(self._acks()[0][2],
+                         {"id": "task-main-gen", "lease_id": "gen-3", "durable": True})
+        self.calls.clear()
+        self._drive_main([{**self._task("task-main-gen-lost"), "lease_id": "gen-4"}],
+                         ack_raises=urllib.error.URLError("down"))
+        self.assertEqual(_load(self.ws)._load_pending_leases(),
+                         {"task-main-gen-lost": "gen-4"})
+
     def test_main_acks_an_unrepaired_redelivery_without_the_flag(self):
         mod = self.mod
         (mod.TASKS_DIR / "task-main-old.txt").write_text("id: task-main-old\n")
