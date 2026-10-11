@@ -794,6 +794,11 @@ class TestRecordSpeaksForSeatFamilyAware(RecordFixture):
         self.assertEqual(qa._model_family("opus"), "opus")
         self.assertEqual(qa._model_family("claude-opus-5-5"), "opus")
 
+    def test_model_family_direct_on_an_unrecognized_value(self):
+        # non-empty but matching no prefix: the loop's own fall-through, untested elsewhere.
+        self.assertIsNone(qa._model_family("default"))
+        self.assertIsNone(qa._model_family("not-a-model"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
