@@ -366,10 +366,11 @@ class TestRoster(unittest.TestCase):
 class TestMarker(unittest.TestCase):
     def test_ask_carries_the_marker_chain_and_original_question(self):
         tr = FakeTransport()
-        res = run_consult(tr)
+        res = run_consult(tr, now=1_000.0)  # a fixed clock: the marker carries the ask's own time
         self.assertTrue(res["asked"])
         body = tr.posted[0][1]
-        self.assertTrue(body.startswith(policy.ask_line(CID, None, [SELF, SIB])))
+        limits = {"since": 1000, "max_s": policy.DEFAULT_MAX_DURATION_S, "max_asks": policy.DEFAULT_MAX_ASKS}
+        self.assertTrue(body.startswith(policy.ask_line(CID, None, [SELF, SIB], limits)))
         self.assertIn(policy.answer_tag(CID), body)
         self.assertEqual(policy.parse_ask(body)["original_question"], "is the build host up?")
         self.assertIn(f"{SELF} > {SIB}", body)

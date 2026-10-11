@@ -862,8 +862,8 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
 
 
 def _note_tasks(path: Path, claim: dict, tasks: List[Optional[str]]) -> None:
-    """Record every task that could post this answer (the reply task and the original ask task).
-    The claim is never pruned; the list says which tasks it covers, for an owner clearing by hand."""
+    """Record tasks seen posting or replaying this answer (the reply task and the original ask task).
+    Informational only: the claim is never deleted, and this list authorizes nothing."""
     new = [t for t in tasks if t and t not in claim.get("tasks", [])]
     if new:
         try:
