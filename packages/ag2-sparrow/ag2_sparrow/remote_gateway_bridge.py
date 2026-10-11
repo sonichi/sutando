@@ -5465,12 +5465,9 @@ def main() -> None:
             # LAST of the beat's work, on a daemon thread: two optional 15 s
             # requests never delay the next task poll or a durable retry.
             _push_pool_advertisement()
+            prev_ok = last_poll_ok
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
-                if poll_failures:
-                    _log(f"poll recovered after {poll_failures} failures, "
-                         f"{int(time.time() - last_poll_ok)}s")
-                    poll_failures = 0
                 last_poll_ok = time.time()
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).
@@ -5478,6 +5475,9 @@ def main() -> None:
                 if not _poll_timeout_is_empty(last_poll_ok, time.time()):
                     raise
                 resp = {"tasks": []}
+            if poll_failures and last_poll_ok != prev_ok:  # a real answer, not the grace path
+                _log(f"poll recovered after {poll_failures} failures, {int(last_poll_ok - prev_ok)}s")
+                poll_failures = 0
             added = False
             pending_ack = []
             for task in resp.get("tasks", []):
