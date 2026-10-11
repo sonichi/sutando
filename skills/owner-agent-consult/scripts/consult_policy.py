@@ -288,8 +288,14 @@ def prior_ask(workspace: Path, key: str, value: str) -> Optional[dict]:
     return min(same, key=lambda r: r.get("asked_at") or 0) if same else None
 
 
+FUTURE_TOLERANCE_S = 300
+
+
 def _age(rec: dict, now: float) -> float:
-    return max(0.0, now - float(rec.get("asked_at") or now))
+    """Seconds since the ask; a record stamped well in the future reads as infinitely old,
+    so it expires instead of living forever."""
+    age = now - float(rec.get("asked_at") or now)
+    return float("inf") if age < -FUTURE_TOLERANCE_S else max(0.0, age)
 
 
 def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
@@ -304,10 +310,13 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
                 _record_path(workspace, state, r["cid"]).unlink(missing_ok=True)
     out = []
     for r in sorted(records(workspace, "pending"), key=lambda r: r.get("asked_at") or 0):
+        if _record_path(workspace, "answered", r["cid"]).exists():
+            _record_path(workspace, "pending", r["cid"]).unlink(missing_ok=True)
+            continue
         age = _age(r, now)
         overdue = age >= nudge_after_s
         nudged = _record_path(workspace, "nudged", r["cid"]).exists()
-        out.append({**r, "age_s": int(age), "overdue": overdue, "nudged": nudged,
+        out.append({**r, "age_s": int(age) if age != float("inf") else None, "overdue": overdue, "nudged": nudged,
                     "nudge_due": overdue and not nudged, "expired": age > expire_after_s})
     return out
 
@@ -338,7 +347,7 @@ def default_limits(now: Optional[float] = None) -> dict:
 def ask_line(cid: str, root: Optional[str], chain: List[str], limits: Optional[dict] = None) -> str:
     lim = limits or default_limits()
     return (f"{MARKER} consult:{cid} root:{root or '-'} chain:{'>'.join(chain)} "
-            f"limits:{lim['since']}/{lim['max_s']}/{lim['max_asks']}]")
+            f"limits:{int(lim['since'])}/{int(lim['max_s'])}/{int(lim['max_asks'])}]")
 
 
 def answer_tag(cid: str) -> str:
@@ -396,9 +405,29 @@ def ask_body(question: str, cid: str, root: Optional[str], chain: List[str], ori
             "reached, answer with what you have.")
 
 
+def _ts_seconds(ts) -> Optional[float]:
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)) or ts <= 0:
+        return None
+    return float(ts) / 1000.0 if ts > 1e11 else float(ts)
+
+
+def effective_limits(root_msg: dict, marker: Optional[dict], max_duration_s: int, max_asks: int) -> Optional[dict]:
+    """The limits this agent enforces on a thread: the window starts at the root event's
+    server timestamp (never the marker's `since`), and each limit is the smaller of the
+    thread's marker and this agent's own config, so a root can narrow them, never widen them.
+    None when the root event carries no usable timestamp."""
+    since = _ts_seconds((root_msg or {}).get("ts"))
+    if since is None:
+        return None
+    marker = marker or {}
+    return {"since": since,
+            "max_s": min(int(marker.get("max_s", max_duration_s)), int(max_duration_s)),
+            "max_asks": min(int(marker.get("max_asks", max_asks)), int(max_asks))}
+
+
 def limit_reached(limits: dict, asks_so_far: int, now: float) -> Optional[str]:
-    """Why the thread takes no new ask, or None. Limits come from the thread's first ask, so
-    every agent in the chain enforces the same ones; out-of-range values are clamped."""
+    """Why the thread takes no new ask, or None, for limits from effective_limits (or a
+    thread's first ask, before it is posted); out-of-range values are clamped."""
     max_s = max(MAX_DURATION_FLOOR_S, min(int(limits["max_s"]), MAX_DURATION_CEILING_S))
     max_asks = max(MAX_ASKS_FLOOR, min(int(limits["max_asks"]), MAX_ASKS_CEILING))
     if now >= limits["since"] + max_s:
@@ -494,7 +523,7 @@ def incoming_ask(transport, room: str, self_mxid: str, task_id: str,
                       "the chain does not trace to the root ask")
     return {"ok": True, "cid": ask["cid"], "root": root, "chain": ask["chain"], "asker": sender,
             "ask_event": event, "original_question": ask["original_question"] or first["original_question"],
-            "asks": asks, "limits": first["limits"], "reason": None}
+            "asks": asks, "limits": first["limits"], "root_msg": view["root_msg"], "reason": None}
 
 
 # Ask: from a verified owner task, or onward from a consult ask this agent received
@@ -537,26 +566,30 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
         root = prior["root"] if prior else None
         chain = [self_mxid, agent]
         original = (prior or {}).get("original_question") or question.strip()
-        limits = (prior or {}).get("limits") or {"since": int(clock()), "max_s": int(max_duration_s),
-                                                 "max_asks": int(max_asks)}
+        limits = {"since": int(clock()), "max_s": int(max_duration_s), "max_asks": int(max_asks)}
         asks = []
         if root:
             view = thread_view(transport, room, root)
             if not view["ok"]:
                 return no(view["reason"])
             asks = asks_in(view["msgs"], verdict["owner_agents"] | {self_mxid})
+            marker = (parse_ask(view["root_msg"].get("body") or "") or {}).get("limits")
+            limits = effective_limits(view["root_msg"], marker, max_duration_s, max_asks)
     else:
         inc = incoming_ask(transport, room, self_mxid, via_task, workspace,
                            verdict["owner_agents"] | {self_mxid})
         if not inc["ok"]:
             return no(inc["reason"])
-        root, asks, original, limits = inc["root"], inc["asks"], inc["original_question"], inc["limits"]
+        root, asks, original = inc["root"], inc["asks"], inc["original_question"]
+        limits = effective_limits(inc["root_msg"], inc["limits"], max_duration_s, max_asks)
         chain = inc["chain"] + [agent]
         via = {"task_id": via_task, "cid": inc["cid"], "asker": inc["asker"],
                "ask_event": inc["ask_event"]}
     refusal = loop_check(asks, self_mxid, agent)
     if refusal:
         return no(refusal)
+    if limits is None:
+        return no("the consult thread's root event has no server timestamp; cannot apply the thread limits")
     refusal = limit_reached(limits, len(asks), clock())
     if refusal:
         return no(refusal, limit_reached=True)
@@ -591,7 +624,8 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
 
 
 def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Optional[Path],
-           task_id: Optional[str] = None, up: Optional[str] = None) -> dict:
+           task_id: Optional[str] = None, up: Optional[str] = None,
+           max_duration_s: int = DEFAULT_MAX_DURATION_S, max_asks: int = DEFAULT_MAX_ASKS) -> dict:
     """Post this agent's answer to a consult ask, in its thread, replying to the ask,
     @-mentioning the asker, first line its answer line. The ask is the one a live task
     delivered (`task_id`), or, to pass an answer up the chain, the ask an onward consult of
@@ -623,7 +657,8 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
                              reply_to=inc["ask_event"], thread_root=inc["root"])
     if not sent.get("ok"):
         return no(f"answer not posted: {sent.get('reason')}")
-    reached = limit_reached(inc["limits"], len(inc["asks"]), time.time()) if inc.get("limits") else None
+    lim = effective_limits(inc["root_msg"], inc["limits"], max_duration_s, max_asks) if inc.get("root_msg") else None
+    reached = limit_reached(lim, len(inc["asks"]), time.time()) if lim else None
     return {"answered": True, "to": inc["asker"], "cid": inc["cid"], "root": inc["root"],
             "event_id": sent.get("event_id"), "limit_reached": reached, "reason": None}
 

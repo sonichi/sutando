@@ -90,9 +90,9 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
             g.add_argument("--task-id", help="id of the owner task being answered, live in this inbox")
             g.add_argument("--via-task", help="id of the consult ask task you are consulting onward from")
             s.add_argument("--max-duration", default=None,
-                           help=f"first ask only: the thread's time window in seconds (overrides {policy.CONFIG_MAX_DURATION})")
+                           help=f"the thread's time window in seconds; a later ask can only narrow it (overrides {policy.CONFIG_MAX_DURATION})")
             s.add_argument("--max-asks", default=None,
-                           help=f"first ask only: the most asks the thread takes (overrides {policy.CONFIG_MAX_ASKS})")
+                           help=f"the most asks the thread takes; a later ask can only narrow it (overrides {policy.CONFIG_MAX_ASKS})")
         if name == "answer":
             s.add_argument("--body-file", required=True)
             g = s.add_mutually_exclusive_group(required=True)
@@ -141,7 +141,9 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
         return _emit({"ok": False, "reason": f"unreadable {a.cmd} text: {e}"})
     if a.cmd == "answer":
         return _emit({"ok": True, **policy.answer(transport, room=conf["room"], self_mxid=a.self_mxid or "",
-                                                   text=text, workspace=ws, task_id=a.task_id, up=a.up)})
+                                                   text=text, workspace=ws, task_id=a.task_id, up=a.up,
+                                                   max_duration_s=conf["max_duration_s"],
+                                                   max_asks=conf["max_asks"])})
     res = policy.consult(transport, room=conf["room"], self_mxid=a.self_mxid or "", agent=a.agent_to,
                          question=text, task_id=a.task_id, via_task=a.via_task, workspace=ws,
                          max_duration_s=conf["max_duration_s"], max_asks=conf["max_asks"])

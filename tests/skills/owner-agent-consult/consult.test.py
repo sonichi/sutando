@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -93,10 +94,11 @@ class Room:
 
     def __init__(self):
         self.msgs = []  # oldest first
+        self.clock = time.time  # the server's clock: stamps each event's ts in ms
 
     def post(self, sender, body, reply_to=None, thread_root=None):
         eid = "$ask" if not self.msgs else f"$ask{len(self.msgs) + 1}"
-        self.msgs.append({"sender": sender, "body": body, "event_id": eid, "ts": 9e12,
+        self.msgs.append({"sender": sender, "body": body, "event_id": eid, "ts": int(self.clock() * 1000),
                           **({"in_reply_to": reply_to} if reply_to else {}),
                           **({"thread_root": thread_root} if thread_root else {})})
         return eid
@@ -539,7 +541,8 @@ class TestMatchReply(unittest.TestCase):
     def test_a_follow_up_answer_in_the_thread_matches(self):
         tr = FakeTransport()
         tr.room.post(SELF, "first ask")  # stands in for the $ask already posted
-        with mock.patch.object(policy, "thread_view", return_value={"ok": True, "msgs": []}):
+        root = {"ts": int(time.time() * 1000), "body": ""}
+        with mock.patch.object(policy, "thread_view", return_value={"ok": True, "msgs": [], "root_msg": root}):
             res = run_consult(tr, self.ws, cid=CID_B)
         self.assertEqual((res["asked"], res["ask_event"], res["root"]), (True, "$ask2", "$ask"), res)
         got = self._match(answer_msg(cid=CID_B, in_reply_to="$ask2"))
@@ -588,6 +591,7 @@ class World:
 
 
 C1, C2, C3 = "1111111111111111", "2222222222222222", "3333333333333333"
+T0 = 1_760_000_000.0  # a realistic epoch; the room stamps events with it in ms
 
 
 class TestOnwardConsult(unittest.TestCase):
@@ -988,15 +992,16 @@ class TestThreadLimits(unittest.TestCase):
         self.assertEqual(len(w.tr[SELF].posted), 2)
 
     def test_an_onward_ask_obeys_the_threads_limits_not_its_own_config(self):
-        w = self.w
-        w.ask(SELF, SIB, cid=C1, task_id=TID, max_duration_s=600, max_asks=50, now=lambda: 10_000.0)
+        w, t0 = self.w, T0
+        w.room.clock = lambda: t0
+        w.ask(SELF, SIB, cid=C1, task_id=TID, max_duration_s=600, max_asks=50, now=lambda: t0)
         w.deliver(SIB, "$ask", "task-b1")
-        late = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", max_duration_s=86400, now=lambda: 10_601.0)
+        late = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", max_duration_s=86400, now=lambda: t0 + 601)
         self.assertIn("600s window has passed", late["reason"])
         self.assertEqual(w.tr[SIB].posted, [])
-        on_time = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: 10_599.0)
+        on_time = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: t0 + 599)
         self.assertEqual((on_time["asked"], on_time["limits"]["max_s"]), (True, 600))
-        self.assertIn("limits:10000/600/50]", w.tr[SIB].posted[0][1])
+        self.assertIn(f"limits:{int(t0)}/600/{policy.DEFAULT_MAX_ASKS}]", w.tr[SIB].posted[0][1])
 
     def test_an_onward_ask_counts_every_ask_in_the_thread(self):
         w = self.w
@@ -1034,6 +1039,119 @@ class TestThreadLimits(unittest.TestCase):
         shipped = policy.manifest_config()
         self.assertEqual((shipped[policy.CONFIG_MAX_DURATION],
                           shipped[policy.CONFIG_MAX_ASKS]), ("1800", "10"))
+
+
+class TestLimitsCannotBeWidened(unittest.TestCase):
+    """The thread window starts at the root event's server timestamp, never the marker's
+    `since`, and each limit is the smaller of the marker's and the reader's own config."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+        self.w.room.clock = lambda: T0
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_forged_root_cannot_extend_the_window(self):
+        w = self.w
+        line = policy.ask_line(C1, None, [SELF, SIB], {"since": 999999999999, "max_s": 86400, "max_asks": 100})
+        w.room.post(SELF, f"{SIB} — {line}")
+        w.deliver(SIB, "$ask", "task-b1")
+        res = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 365 * 86400)
+        self.assertEqual((res["asked"], res.get("limit_reached")), (False, True), res)
+        self.assertIn(f"{policy.DEFAULT_MAX_DURATION_S}s window has passed", res["reason"])
+        self.assertEqual(w.tr[SIB].posted, [])
+
+    def test_a_slow_clock_on_the_first_asker_does_not_close_the_window(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID, now=lambda: T0 - 3600)
+        w.deliver(SIB, "$ask", "task-b1")
+        res = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 60)
+        self.assertTrue(res["asked"], res)
+        self.assertEqual(res["limits"]["since"], T0)
+
+    def test_a_root_can_narrow_the_limits_but_never_widen_them(self):
+        root = {"ts": int(T0 * 1000)}
+        wide = policy.effective_limits(root, {"since": 1, "max_s": 86400, "max_asks": 100}, 1800, 10)
+        self.assertEqual(wide, {"since": T0, "max_s": 1800, "max_asks": 10})
+        narrow = policy.effective_limits(root, {"since": 1, "max_s": 300, "max_asks": 2}, 1800, 10)
+        self.assertEqual(narrow, {"since": T0, "max_s": 300, "max_asks": 2})
+        self.assertEqual(policy.effective_limits({"ts": 1_760_000_000}, None, 1800, 10)["since"], 1_760_000_000.0)
+
+    def test_the_ask_count_is_capped_by_the_readers_own_config(self):
+        w = self.w
+        w.room.clock = time.time
+        w.ask(SELF, SIB, cid=C1, task_id=TID, max_asks=100)
+        w.ask(SELF, THIRD, cid=C3, task_id=TID, max_asks=100)
+        w.deliver(SIB, "$ask", "task-b1")
+        res = w.ask(SIB, FOURTH, cid=C2, via_task="task-b1", max_asks=2)
+        self.assertIn("2 of 2 asks", res["reason"])
+
+    def test_a_root_without_a_server_timestamp_is_refused(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.room.msgs[0].pop("ts")
+        w.deliver(SIB, "$ask", "task-b1")
+        res = w.ask(SIB, THIRD, cid=C2, via_task="task-b1")
+        self.assertIn("no server timestamp", res["reason"])
+        self.assertIsNone(policy._ts_seconds(True))
+
+    def test_the_window_ceiling_is_clamped(self):
+        self.assertIsNotNone(policy.limit_reached({"since": 0, "max_s": 10**6, "max_asks": 5}, 1,
+                                                  policy.MAX_DURATION_CEILING_S))
+        self.assertIsNone(policy.limit_reached({"since": 0, "max_s": 10**6, "max_asks": 5}, 1,
+                                               policy.MAX_DURATION_CEILING_S - 1))
+
+
+class TestRecordEdges(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_record_stamped_in_the_future_expires(self):
+        w = self.w
+        policy.consult(w.tr[SELF], room=ROOM, self_mxid=SELF, agent=SIB, question="q", workspace=w.ws[SELF],
+                       task_id=TID, cid=C1, now=lambda: T0 + 10 * 86400)
+        [row] = policy.pending(w.ws[SELF], 600, now=T0)
+        self.assertTrue(row["expired"])
+
+    def test_a_pending_copy_beside_an_answer_is_not_listed_for_a_nudge(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        pend = w.ws[SELF] / policy._STATE / "pending" / f"{C1}.json"
+        ans = w.ws[SELF] / policy._STATE / "answered" / f"{C1}.json"
+        ans.parent.mkdir(parents=True, exist_ok=True)
+        ans.write_text(pend.read_text())
+        self.assertEqual(policy.pending(w.ws[SELF], 0), [])
+        self.assertFalse(pend.exists())
+
+    def test_a_match_landing_before_the_final_write_is_not_undone(self):
+        w = self.w
+        tr = w.tr[SELF]
+        real = tr.mention
+
+        def post_then_match_lands(*a, **k):
+            out = real(*a, **k)
+            pend = w.ws[SELF] / policy._STATE / "pending" / f"{C1}.json"
+            ans = w.ws[SELF] / policy._STATE / "answered" / f"{C1}.json"
+            ans.parent.mkdir(parents=True, exist_ok=True)
+            os.link(pend, ans)
+            pend.unlink()
+            return out
+        tr.mention = post_then_match_lands
+        self.assertTrue(w.ask(SELF, SIB, cid=C1, task_id=TID)["asked"])
+        self.assertEqual(pending_ids(w.ws[SELF]), [])
+
+    def test_recovery_ignores_an_ask_with_the_same_id_from_another_sender(self):
+        rec = {"cid": C1, "agent": SIB, "ask_event": None, "root": None}
+        forged = {"sender": THIRD, "event_id": "$x", "body": f"{SIB} — {policy.ask_line(C1, None, [SELF, SIB])}"}
+        self.assertIsNone(policy._recover_ask(rec, [forged], SELF)["ask_event"])
+        own = dict(forged, sender=SELF)
+        self.assertEqual(policy._recover_ask(rec, [own], SELF)["ask_event"], "$x")
 
 
 class TestPendingListing(unittest.TestCase):

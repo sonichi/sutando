@@ -66,9 +66,10 @@ than closed, and the owner of each install should know them before configuring a
 - **`--task-id` is not bound to the claimed task:** `ask --task-id` accepts any live, verified,
   unanswered owner task in this inbox, not only the one this session is running.
 
-The thread limits bound both: a thread so started takes at most `OWNER_AGENT_CONSULT_MAX_ASKS`
-asks within `OWNER_AGENT_CONSULT_MAX_DURATION_S`, and only among the owner's agents in the
-owner-only room.
+The thread limits bound both: whatever its marker claims, a thread so started takes at most
+`OWNER_AGENT_CONSULT_MAX_ASKS` asks (each agent's own setting) within
+`OWNER_AGENT_CONSULT_MAX_DURATION_S` of the root's server timestamp, and only among the owner's
+agents in the owner-only room.
 
 ## One consult, one thread
 
@@ -92,9 +93,18 @@ limits.
 
 A consult thread stops taking new asks at whichever comes first: `max_s` seconds after its
 first ask, or `max_asks` asks in the thread (every ask counts: the first, follow-ups, onward
-asks). The limits are set once, on the first ask, from `--max-duration` / `--max-asks`, else
-the config above, and every later ask copies them from the thread's first ask. So every agent
-in the chain enforces the thread's limits, not its own config.
+asks). The first ask sets the thread's limits from `--max-duration` / `--max-asks`, else the
+config above, and carries them in its marker.
+
+Every later ask enforces them like this, so a thread's first ask can narrow the limits but
+never widen them:
+
+- the window starts at the root event's **server timestamp**, read from the room; the
+  marker's `since` is informational and never used, so neither a forged `since` nor a skewed
+  clock on the first asker moves the window;
+- each limit is the **smaller** of the thread's marker and the asking agent's own config
+  (`--max-*`, env, manifest);
+- a root event with no usable server timestamp refuses the ask.
 
 When the owner's request sets a bound ("give it five minutes", "ask at most two agents"), read
 it yourself and pass the matching flags on the first ask; no code parses the owner's wording.
