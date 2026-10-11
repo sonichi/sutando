@@ -27,8 +27,7 @@ sibling instead of guessing or telling the owner to go ask it.
    checks only that the agent is one of your owner's agents in the consult room.
 
 Do not use it for coordination, hand-offs or review requests, for anything another person
-should see, or to fan one question out to every agent. If repeated asks within one task ever
-become a problem, a per-task ask budget is the guard to add; there is none today.
+should see, or to fan one question out to every agent.
 
 ## Configure (manifest `config`, `CLI > env > manifest`)
 
@@ -38,6 +37,8 @@ become a problem, a per-task ask budget is the guard to add; there is none today
 | `OWNER_AGENT_CONSULT_ROOM_CLI` | empty | absolute path of the room transport CLI (below). Unset: inert. |
 | `OWNER_AGENT_CONSULT_NUDGE_AFTER_S` | `600` | when an unanswered consult is due a note to the owner (clamped to 60–86400). |
 | `OWNER_AGENT_CONSULT_EXPIRE_AFTER_S` | `604800` | after this, `match` refuses a late answer and old records are pruned (clamped to 3600–7776000). |
+| `OWNER_AGENT_CONSULT_MAX_DURATION_S` | `1800` | a consult thread takes no new ask this long after its first ask (clamped to 60–86400). |
+| `OWNER_AGENT_CONSULT_MAX_ASKS` | `10` | a consult thread takes no new ask once it holds this many asks (clamped to 1–100). |
 | `OWNER_AGENT_CONSULT_ENABLED` | `1` | `0`/`false`/`off` makes it inert even with a room set. |
 
 The skill ships no room, no identity and no transport. On a desktop install prefer env
@@ -55,7 +56,7 @@ that posts a root runs the verified-owner-task gate first, but no other agent ca
 did: each agent's task envelope key is its own. So the trust boundary is **any session that can
 post as one of the owner's agents in the consult room**. Such a session can start a chain
 without an owner task, by hand, and the answers land in the owner-only room it can read. The
-room guard keeps everyone else out.
+room guard keeps everyone else out. The owner has accepted this boundary.
 
 ## One consult, one thread
 
@@ -67,11 +68,29 @@ asks or answers, so it has the whole context.
 Each ask's first line is the consult marker, defined once as `consult_policy.MARKER`:
 
 ```
-[owner-agent-consult:v2 consult:<cid> root:<thread root, or - on the first ask> chain:<A>B>C>]
+[owner-agent-consult:v2 consult:<cid> root:<thread root, or - on the first ask> chain:<A>B>C> limits:<since>/<max_s>/<max_asks>]
 ```
 
-The chain is who asked whom, asker first, ending with the agent asked. Below it the ask names
-the original question and the chain so far. The pending record keeps the root and the chain.
+The chain is who asked whom, asker first, ending with the agent asked. The marker also carries
+`limits:<since>/<max seconds>/<max asks>` (see "Thread limits"). Below it the ask names the
+original question and the chain so far. The pending record keeps the root, the chain and the
+limits.
+
+## Thread limits
+
+A consult thread stops taking new asks at whichever comes first: `max_s` seconds after its
+first ask, or `max_asks` asks in the thread (every ask counts: the first, follow-ups, onward
+asks). The limits are set once, on the first ask, from `--max-duration` / `--max-asks`, else
+the config above, and every later ask copies them from the thread's first ask. So every agent
+in the chain enforces the thread's limits, not its own config.
+
+When the owner's request sets a bound ("give it five minutes", "ask at most two agents"), read
+it yourself and pass the matching flags on the first ask; no code parses the owner's wording.
+
+When `ask` returns `limit_reached: true` ("consult limit reached"), do not ask again: answer
+your asker, or the owner if you started the consult, with what you have. `answer` still posts
+past the limit, so the chain can unwind, and reports `limit_reached` when the thread is closed
+to new asks.
 
 ## Use: ask, then finish the task
 
@@ -129,7 +148,7 @@ Both `answer` and `ask --via-task` first trace the ask, and refuse unless all of
 that is already in this consult's chain, unless it is a follow-up on a link you already asked.
 Refused, answer from what the thread has. Close the ask task with a `[no-send]` result either way.
 Two agents reading the thread at the same moment can each still ask the same agent once; the
-next read sees both. Follow-ups are not counted; keep them few.
+next read sees both. Follow-ups count toward the thread's ask limit.
 
 ## Use: an answer arrives as a new task
 

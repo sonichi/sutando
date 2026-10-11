@@ -575,9 +575,9 @@ class World:
         sender = next(m["sender"] for m in self.room.msgs if m["event_id"] == event)
         return reply_task(self.ws[to], event, tid=tid, sender=sender, stamp=stamp)
 
-    def ask(self, me, agent, *, cid, task_id=None, via_task=None, question="is the disk full?"):
+    def ask(self, me, agent, *, cid, task_id=None, via_task=None, question="is the disk full?", **kw):
         return policy.consult(self.tr[me], room=ROOM, self_mxid=me, agent=agent, question=question,
-                              workspace=self.ws[me], task_id=task_id, via_task=via_task, cid=cid)
+                              workspace=self.ws[me], task_id=task_id, via_task=via_task, cid=cid, **kw)
 
     def answer(self, me, text, *, task_id=None, up=None):
         return policy.answer(self.tr[me], room=ROOM, self_mxid=me, text=text, workspace=self.ws[me],
@@ -957,6 +957,85 @@ class TestReviewRoundFour(unittest.TestCase):
         self.assertEqual(w.tr[SIB].posted, [])
 
 
+class TestThreadLimits(unittest.TestCase):
+    """A consult thread takes no new ask past its time window or its ask count, whichever comes
+    first. The limits are set on the first ask and carried in every marker, so every agent in
+    the chain enforces the thread's limits, not its own config."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_the_first_ask_carries_the_limits_in_its_marker_and_record(self):
+        res = self.w.ask(SELF, SIB, cid=C1, task_id=TID, max_duration_s=900, max_asks=3, now=lambda: 5_000.0)
+        self.assertEqual(res["limits"], {"since": 5000, "max_s": 900, "max_asks": 3})
+        self.assertIn("limits:5000/900/3]", self.w.tr[SELF].posted[0][1])
+        self.assertEqual(policy.parse_ask(self.w.tr[SELF].posted[0][1])["limits"]["max_asks"], 3)
+        [rec] = policy.records(self.w.ws[SELF], "pending")
+        self.assertEqual(rec["limits"], {"since": 5000, "max_s": 900, "max_asks": 3})
+
+    def test_the_ask_count_stops_follow_ups(self):
+        w = self.w
+        self.assertTrue(w.ask(SELF, SIB, cid=C1, task_id=TID, max_asks=2)["asked"])
+        self.assertTrue(w.ask(SELF, SIB, cid=C2, task_id=TID)["asked"])
+        res = w.ask(SELF, SIB, cid=C3, task_id=TID)
+        self.assertEqual((res["asked"], res["limit_reached"]), (False, True))
+        self.assertIn("consult limit reached", res["reason"])
+        self.assertIn("2 of 2 asks", res["reason"])
+        self.assertEqual(len(w.tr[SELF].posted), 2)
+
+    def test_an_onward_ask_obeys_the_threads_limits_not_its_own_config(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID, max_duration_s=600, max_asks=50, now=lambda: 10_000.0)
+        w.deliver(SIB, "$ask", "task-b1")
+        late = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", max_duration_s=86400, now=lambda: 10_601.0)
+        self.assertIn("600s window has passed", late["reason"])
+        self.assertEqual(w.tr[SIB].posted, [])
+        on_time = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: 10_599.0)
+        self.assertEqual((on_time["asked"], on_time["limits"]["max_s"]), (True, 600))
+        self.assertIn("limits:10000/600/50]", w.tr[SIB].posted[0][1])
+
+    def test_an_onward_ask_counts_every_ask_in_the_thread(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID, max_asks=2)
+        w.ask(SELF, THIRD, cid=C3, task_id=TID)
+        w.deliver(SIB, "$ask", "task-b1")
+        res = w.ask(SIB, FOURTH, cid=C2, via_task="task-b1")
+        self.assertIn("consult limit reached", res["reason"])
+
+    def test_an_answer_still_posts_past_the_limit_and_says_so(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID, max_asks=1)
+        w.deliver(SIB, "$ask", "task-b1")
+        res = w.answer(SIB, "disk is fine", task_id="task-b1")
+        self.assertTrue(res["answered"], res)
+        self.assertIn("consult limit reached", res["limit_reached"])
+        self.assertIsNone(policy.limit_reached({"since": 0, "max_s": 60, "max_asks": 5}, 1, 30))
+
+    def test_out_of_range_limits_are_clamped(self):
+        self.assertIsNotNone(policy.limit_reached({"since": 0, "max_s": 10**6, "max_asks": 10**3}, 100, 1))
+        self.assertIsNotNone(policy.limit_reached({"since": 0, "max_s": 1, "max_asks": 5}, 1, 60))
+        self.assertIsNone(policy.parse_ask(policy.ask_line(C1, None, [SELF, SIB]).replace("limits:", "limit:")))
+
+    def test_limit_config_precedence_and_clamps(self):
+        get = lambda **kw: policy.settings(environ={policy.CONFIG_ROOM: ROOM, **kw.get("env", {})},
+                                           manifest_cfg=kw.get("cfg", {}), **kw.get("cli", {}))
+        self.assertEqual((get()["max_duration_s"], get()["max_asks"]),
+                         (policy.DEFAULT_MAX_DURATION_S, policy.DEFAULT_MAX_ASKS))
+        cfg = {policy.CONFIG_MAX_ASKS: "4"}
+        self.assertEqual(get(cfg=cfg)["max_asks"], 4)
+        self.assertEqual(get(cfg=cfg, env={policy.CONFIG_MAX_ASKS: "6"})["max_asks"], 6)
+        self.assertEqual(get(cfg=cfg, env={policy.CONFIG_MAX_ASKS: "6"}, cli={"max_asks": "8"})["max_asks"], 8)
+        self.assertEqual(get(cli={"max_asks": "0", "max_duration": "1"})["max_asks"], policy.MAX_ASKS_FLOOR)
+        self.assertEqual(get(cli={"max_duration": "9e9"})["max_duration_s"], policy.MAX_DURATION_CEILING_S)
+        shipped = policy.manifest_config()
+        self.assertEqual((shipped[policy.CONFIG_MAX_DURATION],
+                          shipped[policy.CONFIG_MAX_ASKS]), ("1800", "10"))
+
+
 class TestPendingListing(unittest.TestCase):
     def test_overdue_consults_are_due_a_nudge_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1170,8 +1249,10 @@ class TestCliAndEdges(unittest.TestCase):
             q.write_text("is the build host up?", encoding="utf-8")
             tr = FakeTransport(replies=[answer_msg(text="up", in_reply_to="$ask")])
             rc, res = self._cli("ask", "--agent", SELF, "--agent-to", SIB, "--question-file", str(q),
-                                "--task-id", TID, transport=tr, workspace=ws)
-            self.assertEqual((res["asked"], tr.reads), (True, 0), res)
+                                "--task-id", TID, "--max-asks", "3", "--max-duration", "900",
+                                transport=tr, workspace=ws)
+            self.assertEqual((res["asked"], tr.reads, res["limits"]["max_asks"], res["limits"]["max_s"]),
+                             (True, 0, 3, 900), res)
             rc, listed = self._cli("pending", "--nudge-after", "60", workspace=ws)
             self.assertEqual(([r["cid"] for r in listed["pending"]], listed["nudge_after_s"]), ([CID], 60))
             rc, nudged = self._cli("pending", "--nudged", CID, workspace=ws)

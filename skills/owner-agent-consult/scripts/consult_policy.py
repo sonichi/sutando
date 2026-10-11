@@ -43,6 +43,12 @@ NUDGE_FLOOR_S, NUDGE_CEILING_S = 60, 86400
 CONFIG_EXPIRE_AFTER = "OWNER_AGENT_CONSULT_EXPIRE_AFTER_S"
 DEFAULT_EXPIRE_AFTER_S = 7 * 86400
 EXPIRE_FLOOR_S, EXPIRE_CEILING_S = 3600, 90 * 86400
+CONFIG_MAX_DURATION = "OWNER_AGENT_CONSULT_MAX_DURATION_S"
+DEFAULT_MAX_DURATION_S = 1800
+MAX_DURATION_FLOOR_S, MAX_DURATION_CEILING_S = 60, 86400
+CONFIG_MAX_ASKS = "OWNER_AGENT_CONSULT_MAX_ASKS"
+DEFAULT_MAX_ASKS = 10
+MAX_ASKS_FLOOR, MAX_ASKS_CEILING = 1, 100
 READ_LIMIT = 100
 MAX_TASK_BYTES = 256 * 1024
 _FALSE = ("0", "false", "no", "off")
@@ -81,15 +87,20 @@ def _seconds(raw: str, default: int, floor: int, ceiling: int) -> int:
 
 
 def settings(room=None, nudge_after=None, room_cli=None, environ=None, manifest_cfg=None,
-             expire_after=None) -> dict:
-    """{active, room, room_cli, nudge_after_s, expire_after_s, reason}; inert when disabled,
-    or when no room or no room transport is configured."""
+             expire_after=None, max_duration=None, max_asks=None) -> dict:
+    """{active, room, room_cli, nudge_after_s, expire_after_s, max_duration_s, max_asks, reason};
+    inert when disabled, or when no room or no room transport is configured."""
     get = lambda k, c=None: config_value(k, c, environ, manifest_cfg)  # noqa: E731
     nudge = _seconds(get(CONFIG_NUDGE_AFTER, nudge_after), DEFAULT_NUDGE_AFTER_S, NUDGE_FLOOR_S, NUDGE_CEILING_S)
     expire = _seconds(get(CONFIG_EXPIRE_AFTER, expire_after), DEFAULT_EXPIRE_AFTER_S,
                       EXPIRE_FLOOR_S, EXPIRE_CEILING_S)
     out = {"active": False, "room": get(CONFIG_ROOM, room), "room_cli": get(CONFIG_ROOM_CLI, room_cli),
-           "nudge_after_s": nudge, "expire_after_s": expire, "reason": None}
+           "nudge_after_s": nudge, "expire_after_s": expire,
+           "max_duration_s": _seconds(get(CONFIG_MAX_DURATION, max_duration), DEFAULT_MAX_DURATION_S,
+                                      MAX_DURATION_FLOOR_S, MAX_DURATION_CEILING_S),
+           "max_asks": _seconds(get(CONFIG_MAX_ASKS, max_asks), DEFAULT_MAX_ASKS,
+                                MAX_ASKS_FLOOR, MAX_ASKS_CEILING),
+           "reason": None}
     if get(CONFIG_ENABLED).lower() in _FALSE:
         out["reason"] = f"disabled ({CONFIG_ENABLED} is off); the skill is inert"
     elif not out["room"]:
@@ -319,15 +330,23 @@ def new_cid() -> str:
     return secrets.token_hex(8)
 
 
-def ask_line(cid: str, root: Optional[str], chain: List[str]) -> str:
-    return f"{MARKER} consult:{cid} root:{root or '-'} chain:{'>'.join(chain)}]"
+def default_limits(now: Optional[float] = None) -> dict:
+    return {"since": int(time.time() if now is None else now), "max_s": DEFAULT_MAX_DURATION_S,
+            "max_asks": DEFAULT_MAX_ASKS}
+
+
+def ask_line(cid: str, root: Optional[str], chain: List[str], limits: Optional[dict] = None) -> str:
+    lim = limits or default_limits()
+    return (f"{MARKER} consult:{cid} root:{root or '-'} chain:{'>'.join(chain)} "
+            f"limits:{lim['since']}/{lim['max_s']}/{lim['max_asks']}]")
 
 
 def answer_tag(cid: str) -> str:
     return f"{MARKER} answer:{cid}]"
 
 
-_ASK = re.compile(rf"^{re.escape(MARKER)} consult:([0-9a-f]{{16}}) root:(\S+) chain:(\S+)\]$")
+_ASK = re.compile(rf"^{re.escape(MARKER)} consult:([0-9a-f]{{16}}) root:(\S+) chain:(\S+) "
+                  r"limits:(\d{1,12})/(\d{1,6})/(\d{1,4})\]$")
 _TAG = re.compile(rf"^{re.escape(MARKER)} answer:([0-9a-f]{{16}})\]$")
 _ORIG_HEAD, _CHAIN_HEAD, _ASK_HEAD = "Original question:", "Chain so far:", "Question for "
 
@@ -343,7 +362,7 @@ def _first_line(body: str) -> tuple:
 
 
 def parse_ask(body: str) -> Optional[dict]:
-    """{cid, root (None on the thread's first ask), chain, original_question} or None.
+    """{cid, root (None on the thread's first ask), chain, limits, original_question} or None.
     A chain lists distinct mxids, asker first; anything else is not an ask."""
     first, rest = _first_line(body)
     m = _ASK.match(first)
@@ -358,12 +377,14 @@ def parse_ask(body: str) -> Optional[dict]:
     orig = ""
     if rest.startswith(_ORIG_HEAD):
         orig = rest[len(_ORIG_HEAD):].split(f"\n{_CHAIN_HEAD}", 1)[0].strip()
-    return {"cid": m.group(1), "root": root, "chain": chain, "original_question": orig}
+    limits = {"since": int(m.group(4)), "max_s": int(m.group(5)), "max_asks": int(m.group(6))}
+    return {"cid": m.group(1), "root": root, "chain": chain, "limits": limits, "original_question": orig}
 
 
-def ask_body(question: str, cid: str, root: Optional[str], chain: List[str], original: str) -> str:
+def ask_body(question: str, cid: str, root: Optional[str], chain: List[str], original: str,
+             limits: Optional[dict] = None) -> str:
     asker, target = chain[-2], chain[-1]
-    return (f"{ask_line(cid, root, chain)}\n"
+    return (f"{ask_line(cid, root, chain, limits)}\n"
             f"{_ORIG_HEAD} {original.strip()}\n"
             f"{_CHAIN_HEAD} {' > '.join(chain)}\n"
             f"{_ASK_HEAD}{target}: {question.strip()}\n\n"
@@ -371,7 +392,20 @@ def ask_body(question: str, cid: str, root: Optional[str], chain: List[str], ori
             f"ONE message in this thread @-mentioning {asker}, first line exactly\n"
             f"{answer_tag(cid)}\n"
             "If you consult another agent first, do it with `consult.py ask --via-task`, in this thread; "
-            "never ask an agent already in this consult's chain.")
+            "never ask an agent already in this consult's chain. When `ask` reports the consult limit "
+            "reached, answer with what you have.")
+
+
+def limit_reached(limits: dict, asks_so_far: int, now: float) -> Optional[str]:
+    """Why the thread takes no new ask, or None. Limits come from the thread's first ask, so
+    every agent in the chain enforces the same ones; out-of-range values are clamped."""
+    max_s = max(MAX_DURATION_FLOOR_S, min(int(limits["max_s"]), MAX_DURATION_CEILING_S))
+    max_asks = max(MAX_ASKS_FLOOR, min(int(limits["max_asks"]), MAX_ASKS_CEILING))
+    if now >= limits["since"] + max_s:
+        return f"consult limit reached: the thread's {max_s}s window has passed"
+    if asks_so_far >= max_asks:
+        return f"consult limit reached: the thread already has {asks_so_far} of {max_asks} asks"
+    return None
 
 
 # The consult thread: what every agent reads before it asks or answers
@@ -460,18 +494,20 @@ def incoming_ask(transport, room: str, self_mxid: str, task_id: str,
                       "the chain does not trace to the root ask")
     return {"ok": True, "cid": ask["cid"], "root": root, "chain": ask["chain"], "asker": sender,
             "ask_event": event, "original_question": ask["original_question"] or first["original_question"],
-            "asks": asks, "reason": None}
+            "asks": asks, "limits": first["limits"], "reason": None}
 
 
 # Ask: from a verified owner task, or onward from a consult ask this agent received
 def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
             workspace: Optional[Path], task_id: Optional[str] = None, via_task: Optional[str] = None,
-            cid: Optional[str] = None, now: Optional[Callable[[], float]] = None) -> dict:
+            cid: Optional[str] = None, now: Optional[Callable[[], float]] = None,
+            max_duration_s: int = DEFAULT_MAX_DURATION_S, max_asks: int = DEFAULT_MAX_ASKS) -> dict:
     """Every gate, then the one post in the consult thread and its pending record; returns at
-    once with {asked, agent, cid, ask_event, root, chain, follow_up} or {asked: False, reason}.
-    Nothing is posted unless all gates pass."""
-    def no(reason):
-        return {"asked": False, "agent": agent, "reason": reason}
+    once with {asked, agent, cid, ask_event, root, chain, limits, follow_up} or {asked: False,
+    reason}. The limits given here apply only to a thread's first ask; later asks use the
+    thread's. Nothing is posted unless all gates pass."""
+    def no(reason, **extra):
+        return {"asked": False, "agent": agent, "reason": reason, **extra}
     clock = now or time.time
     cid = cid or new_cid()
     if not _CID.match(cid):
@@ -501,6 +537,8 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
         root = prior["root"] if prior else None
         chain = [self_mxid, agent]
         original = (prior or {}).get("original_question") or question.strip()
+        limits = (prior or {}).get("limits") or {"since": int(clock()), "max_s": int(max_duration_s),
+                                                 "max_asks": int(max_asks)}
         asks = []
         if root:
             view = thread_view(transport, room, root)
@@ -512,26 +550,30 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
                            verdict["owner_agents"] | {self_mxid})
         if not inc["ok"]:
             return no(inc["reason"])
-        root, asks, original = inc["root"], inc["asks"], inc["original_question"]
+        root, asks, original, limits = inc["root"], inc["asks"], inc["original_question"], inc["limits"]
         chain = inc["chain"] + [agent]
         via = {"task_id": via_task, "cid": inc["cid"], "asker": inc["asker"],
                "ask_event": inc["ask_event"]}
     refusal = loop_check(asks, self_mxid, agent)
     if refusal:
         return no(refusal)
+    refusal = limit_reached(limits, len(asks), clock())
+    if refusal:
+        return no(refusal, limit_reached=True)
     if _record_path(workspace, "pending", cid).exists() or _record_path(workspace, "answered", cid).exists():
         return no("correlation id already used")
     follow_up = any(a["chain"][-2:] == [self_mxid, agent] for a in asks)
     path = _record_path(workspace, "pending", cid)
     record = {"cid": cid, "task_id": task_id, "via_task": via_task, "via": via, "agent": agent,
               "room": room, "root": root, "chain": chain, "ask_event": None, "asked_at": clock(),
-              "origin": origin, "question": question.strip()[:500], "original_question": original[:500]}
+              "origin": origin, "question": question.strip()[:500], "original_question": original[:500],
+              "limits": limits}
     try:
         _write_record(path, record)
     except OSError as e:
         return no(f"pending record unwritable: {e}")
     reply_to = via["ask_event"] if via else None
-    sent = transport.mention(agent, ask_body(question, cid, root, chain, original), room,
+    sent = transport.mention(agent, ask_body(question, cid, root, chain, original, limits), room,
                              reply_to=reply_to, thread_root=root)
     event = sent.get("event_id") if sent.get("ok") else None
     if not event:
@@ -545,7 +587,7 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
     except OSError as e:
         warning = f"ask posted but its event id was not recorded ({e}); match recovers it from the room"
     return {"asked": True, "agent": agent, "cid": cid, "ask_event": event, "root": record["root"],
-            "chain": chain, "follow_up": follow_up, "warning": warning, "reason": None}
+            "chain": chain, "limits": limits, "follow_up": follow_up, "warning": warning, "reason": None}
 
 
 def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Optional[Path],
@@ -581,8 +623,9 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
                              reply_to=inc["ask_event"], thread_root=inc["root"])
     if not sent.get("ok"):
         return no(f"answer not posted: {sent.get('reason')}")
+    reached = limit_reached(inc["limits"], len(inc["asks"]), time.time()) if inc.get("limits") else None
     return {"answered": True, "to": inc["asker"], "cid": inc["cid"], "root": inc["root"],
-            "event_id": sent.get("event_id"), "reason": None}
+            "event_id": sent.get("event_id"), "limit_reached": reached, "reason": None}
 
 
 def _recover_ask(rec: dict, messages: List[dict], self_mxid: str) -> dict:
