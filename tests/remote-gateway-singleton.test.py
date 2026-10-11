@@ -89,6 +89,103 @@ class SingletonGlueTest(unittest.TestCase):
             rgb._ws_heartbeat = orig
         rgb._release_singleton()
 
+    def test_heartbeat_thread_records_a_lost_lock_and_stops(self):
+        # The lock is refreshed off the poll loop; a loss it sees must reach the
+        # loop as _LOCK_LOST, and a fresh acquire must clear it.
+        self.assertTrue(rgb._acquire_singleton())
+        rgb._OWNERSHIP_RELINQUISHED.clear()
+        orig_hb, orig_stale = rgb._ws_heartbeat, rgb._LOCK_STALE_S
+        calls = []
+
+        def lost(*a, **k):
+            calls.append(a)
+            return False
+        rgb._ws_heartbeat, rgb._LOCK_STALE_S = lost, 1
+        try:
+            rgb._start_lock_heartbeat()
+            deadline = time.time() + 5
+            while not rgb._LOCK_LOST.is_set() and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(rgb._LOCK_LOST.is_set(), "a lost heartbeat must set the flag")
+            time.sleep(1.5)
+            self.assertEqual(len(calls), 1, "the thread must stop after the loss")
+        finally:
+            rgb._ws_heartbeat, rgb._LOCK_STALE_S = orig_hb, orig_stale
+        self._lockfile().unlink(missing_ok=True)
+        self.assertTrue(rgb._acquire_singleton())
+        self.assertFalse(rgb._LOCK_LOST.is_set(), "a fresh acquire starts un-lost")
+        rgb._release_singleton()
+
+    def test_heartbeat_thread_keeps_the_lock_fresh_until_relinquished(self):
+        self.assertTrue(rgb._acquire_singleton())
+        rgb._OWNERSHIP_RELINQUISHED.clear()
+        orig_hb, orig_stale = rgb._ws_heartbeat, rgb._LOCK_STALE_S
+        calls = []
+
+        def held(*a, **k):
+            calls.append(a)
+            return True
+        rgb._ws_heartbeat, rgb._LOCK_STALE_S = held, 1
+        try:
+            rgb._start_lock_heartbeat()
+            deadline = time.time() + 5
+            while len(calls) < 2 and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertGreaterEqual(len(calls), 2, "the thread must keep refreshing")
+            rgb._OWNERSHIP_RELINQUISHED.set()
+            time.sleep(0.7)
+            n = len(calls)
+            time.sleep(1.2)
+            self.assertEqual(len(calls), n, "relinquishing ownership must stop the thread")
+            self.assertFalse(rgb._LOCK_LOST.is_set())
+        finally:
+            rgb._ws_heartbeat, rgb._LOCK_STALE_S = orig_hb, orig_stale
+        rgb._release_singleton()
+
+    def test_main_loop_stops_on_a_lost_flag_before_polling(self):
+        import threading
+        reached = []
+
+        def must_not_run(name):
+            def _stub(*a, **k):
+                reached.append(name)
+                raise KeyboardInterrupt(name)   # escapes the loop's catch-all
+            return _stub
+
+        def finished_thread(_inflight):
+            t = threading.Thread(target=lambda: None)
+            t.start()
+            return t
+        stubs = {"_acquire_singleton": lambda: True, "_start_lock_heartbeat": lambda: None,
+                 "_load_inflight": set, "_recover_orphan_proactive": lambda: None,
+                 "_emit_gateway_status": lambda *a, **k: None,
+                 "refresh_routing": lambda **k: None,
+                 "_maybe_start_event_channel": lambda: None,
+                 "_start_results_watcher": lambda: None,
+                 "_start_outbound_worker": finished_thread,
+                 "_heartbeat_singleton": must_not_run("_heartbeat_singleton"),
+                 "_req": must_not_run("_req")}
+        saved = {k: getattr(rgb, k) for k in stubs}
+        logged = []
+        saved["_log"] = rgb._log
+        for k, v in stubs.items():
+            setattr(rgb, k, v)
+        rgb._log = logged.append
+        rgb._LOCK_LOST.set()
+        try:
+            th = threading.Thread(target=rgb.main, daemon=True)
+            th.start()
+            th.join(10)
+            self.assertFalse(th.is_alive(), "main() must return once the lock is lost")
+        finally:
+            for k, v in saved.items():
+                setattr(rgb, k, v)
+            rgb._LOCK_LOST.clear()
+            rgb._OUTBOUND_STOP.clear()
+            rgb._OUTBOUND_WAKE.clear()
+        self.assertEqual(reached, [], "the flag must stop the loop before any poll")
+        self.assertTrue(any("lost workspace poller lock" in m for m in logged), logged)
+
     def test_main_stands_down_with_exit_75_when_deferred(self):
         # A supervising wrapper (gateway-bridge-wrapper.sh) relaunches any child
         # that exits, except rc 75: so a deferral must exit 75, not return 0.
