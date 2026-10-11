@@ -216,6 +216,62 @@ class DroppedConnectionTest(unittest.TestCase):
         self.assertLess(logs.index(errors[1]), logs.index(recovered[0]))
         self.assertIn((True, {}), loop.status)
 
+    def test_a_second_good_poll_logs_no_recovery_and_the_next_outage_counts_from_one(self):
+        import urllib.error
+        fail = urllib.error.URLError("no route")
+        with _Loop(self.gw, poll_raises=[fail, None, None, fail, None], advance=1.0) as loop:
+            loop._alive = [True] * 5 + [False]
+            loop.run()
+        recovered = [m for m in loop.logs if m.startswith("poll recovered")]
+        self.assertEqual(len(recovered), 2, "one line per outage, none for a later good poll")
+        for line in recovered:
+            self.assertRegex(line, r"^poll recovered after 1 failures, ")
+        errors = [m for m in loop.logs if m.startswith("poll network error")]
+        self.assertIn("1 consecutive", errors[1], "the good poll reset the counter")
+
+    def test_a_grace_timeout_after_an_outage_is_not_the_recovery(self):
+        import urllib.error
+        outcomes = [urllib.error.URLError("no route"),
+                    TimeoutError("The read operation timed out"), None]
+        with _Loop(self.gw, poll_raises=outcomes, advance=1.0) as loop:
+            loop._alive = [True, True, True, False]
+            loop.run()
+        recovered = [m for m in loop.logs if m.startswith("poll recovered")]
+        # clock: 1s poll + 1s back-off + 1s grace poll + 1s good poll
+        self.assertEqual(recovered, ["poll recovered after 1 failures, 4s"],
+                         "only the poll that answered ends the outage")
+
+    def test_a_reset_while_reading_the_body_is_a_network_error(self):
+        import urllib.request
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                raise ConnectionResetError(54, "Connection reset by peer")
+
+        with _Loop(self.gw) as loop:
+            real_req = loop._saved["_req"]
+
+            def _req(method, path, *a, **k):
+                if not path.startswith("/v1/tasks?wait="):
+                    return {}
+                loop.clock.now += 1.0
+                return real_req(method, path, *a, **k)
+
+            self.gw._req = _req
+            saved_open = urllib.request.urlopen
+            urllib.request.urlopen = lambda *a, **k: _Resp()
+            try:
+                loop.run()
+            finally:
+                urllib.request.urlopen = saved_open
+        self._assert_network_path(loop, "ConnectionResetError")
+
     def test_an_ack_cut_off_mid_flight_reports_a_network_error_not_a_crash(self):
         import http.client
         gw = self.gw
