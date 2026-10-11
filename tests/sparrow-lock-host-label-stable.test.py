@@ -101,6 +101,26 @@ class HostLabelStableTest(unittest.TestCase):
             self.assertEqual(r["host"], LABEL)
             self.assertEqual(r["host_id"], LABEL)
 
+    def test_main_resolves_the_label_before_taking_the_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = _run("""
+                import ag2_sparrow.remote_gateway_bridge as rgb
+                calls = []
+                rgb._resolve_host_label = lambda: calls.append("resolve")
+                def _acquire():
+                    calls.append("acquire")
+                    return False
+                rgb._acquire_singleton = _acquire
+                try:
+                    rgb.main()
+                    code = None
+                except SystemExit as e:
+                    code = e.code
+                print(json.dumps({"calls": calls, "code": code}))
+            """, tmp)
+            self.assertEqual(r["code"], 75)
+            self.assertEqual(r["calls"], ["resolve", "acquire"])
+
     def test_an_unreadable_host_does_not_stop_startup(self):
         with tempfile.TemporaryDirectory() as tmp:
             r = _run("""
