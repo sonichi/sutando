@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""owner-agent-consult CLI — ask another agent of the same owner, in the owner-only
-consult room, with a plain message, and later match its reply in the thread back to the
-owner's task. Prints one JSON object; refusals are in-band.
+"""owner-agent-consult CLI — ask one other agent of the same owner, once per owner task, in
+the owner-only consult room, with a plain message, and later match its reply in the thread
+back to the owner's task. Prints one JSON object; refusals are in-band.
 
   consult.py roster  [--agent SELF] [--room ROOM] [--room-cli CLI]
-  consult.py ask     --agent-to MXID --question-file F (--task-id OWNER_TASK | --via-task ASK_TASK) ...
-  consult.py answer  --body-file F (--task-id ASK_TASK | --up ONWARD_CID) [--agent SELF] ...
+  consult.py ask     --agent-to MXID --question-file F --task-id OWNER_TASK [--max-duration S] ...
+  consult.py answer  --body-file F --task-id ASK_TASK [--agent SELF] ...
   consult.py match   (--task-id REPLY_TASK_ID | --event-id EVENT) [--final | --not-final] [--agent SELF] ...
   consult.py relayed CID
   consult.py pending [--nudged CID] [--nudge-after S]
@@ -87,18 +87,12 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
         if name == "ask":
             s.add_argument("--agent-to", required=True, help="an mxid from `roster`")
             s.add_argument("--question-file", required=True)
-            g = s.add_mutually_exclusive_group(required=True)
-            g.add_argument("--task-id", help="id of the owner task being answered, live in this inbox")
-            g.add_argument("--via-task", help="id of the consult ask task you are consulting onward from")
+            s.add_argument("--task-id", required=True, help="id of the owner task being answered, live in this inbox")
             s.add_argument("--max-duration", default=None,
-                           help=f"this agent's time window in the thread, in seconds (overrides {policy.CONFIG_MAX_DURATION})")
-            s.add_argument("--max-asks", default=None,
-                           help=f"the most asks this agent makes in the thread (overrides {policy.CONFIG_MAX_ASKS})")
+                           help=f"the answer window after the ask, in seconds (overrides {policy.CONFIG_MAX_DURATION})")
         if name == "answer":
             s.add_argument("--body-file", required=True)
-            g = s.add_mutually_exclusive_group(required=True)
-            g.add_argument("--task-id", help="id of the consult ask task you are answering")
-            g.add_argument("--up", metavar="CID", help="an answered onward consult whose asker you now answer")
+            s.add_argument("--task-id", required=True, help="id of the consult ask task you are answering")
         if name == "match":
             g = s.add_mutually_exclusive_group(required=True)
             g.add_argument("--task-id", help="id of the task the consulted agent's reply arrived as")
@@ -107,7 +101,7 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
             j.add_argument("--final", action="store_true",
                            help="you read the reply as the answer: bind it and close the consult")
             j.add_argument("--not-final", action="store_true",
-                           help="you read the reply as progress (or an onward ask), not the answer")
+                           help="you read the reply as progress, not the answer")
         if name == "relayed":
             s.add_argument("cid", help="a consult matched by --event-id, now relayed to the owner")
         if name == "pending":
@@ -117,7 +111,7 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
     a = p.parse_args(argv)
 
     conf = policy.settings(room=a.room, nudge_after=getattr(a, "nudge_after", None), room_cli=a.room_cli,
-                           max_duration=getattr(a, "max_duration", None), max_asks=getattr(a, "max_asks", None))
+                           max_duration=getattr(a, "max_duration", None))
     if not conf["active"]:
         return _emit({"ok": False, "inert": True, "reason": conf["reason"]})
     ws = workspace or _workspace()
@@ -148,8 +142,9 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
         return _emit({"ok": True, **policy.match_reply(transport, room=conf["room"],
                                                          self_mxid=a.self_mxid or "", task_id=a.task_id,
                                                          event_id=a.event_id, final=a.final,
-                                                         not_final=a.not_final,
-                                                         workspace=ws, expire_after_s=conf["expire_after_s"])})
+                                                         not_final=a.not_final, workspace=ws,
+                                                         max_duration_s=conf["max_duration_s"],
+                                                         expire_after_s=conf["expire_after_s"])})
     path = a.question_file if a.cmd == "ask" else a.body_file
     try:
         text = Path(path).read_text(encoding="utf-8")
@@ -157,14 +152,9 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
         return _emit({"ok": False, "reason": f"unreadable {a.cmd} text: {e}"})
     if a.cmd == "answer":
         return _emit({"ok": True, **policy.answer(transport, room=conf["room"], self_mxid=a.self_mxid or "",
-                                                   text=text, workspace=ws, task_id=a.task_id, up=a.up,
-                                                   max_duration_s=conf["max_duration_s"],
-                                                   max_asks=conf["max_asks"],
-                                                   expire_after_s=conf["expire_after_s"])})
+                                                   text=text, workspace=ws, task_id=a.task_id)})
     res = policy.consult(transport, room=conf["room"], self_mxid=a.self_mxid or "", agent=a.agent_to,
-                         question=text, task_id=a.task_id, via_task=a.via_task, workspace=ws,
-                         max_duration_s=conf["max_duration_s"], max_asks=conf["max_asks"],
-                         expire_after_s=conf["expire_after_s"])
+                         question=text, task_id=a.task_id, workspace=ws, max_duration_s=conf["max_duration_s"])
     return _emit({"ok": True, **res})
 
 
