@@ -2145,6 +2145,10 @@ sys.stderr = _NeverFatalStream(sys.stderr)
 def _log(msg: str) -> None:
     line = f"[remote-gateway-bridge] {msg}"
     print(line, flush=True)
+    _append_log_file(line)
+
+
+def _append_log_file(line: str) -> None:
     if _LAUNCHED_VIA == "supervised":
         return  # stdout already persisted by the supervisor's redirect
     try:
@@ -5251,6 +5255,25 @@ def _heartbeat_singleton() -> bool:
         return True
 
 
+def _exit_on_signal(signum, _frame) -> None:
+    """Exit 0 as before, but say which signal ended the process."""
+    line = f"[remote-gateway-bridge] received {signal.Signals(signum).name} — exiting"
+    # Each sink on its own: a signal that lands inside print makes the next
+    # print raise, and that must cost neither the file line nor the exit.
+    try:
+        _append_log_file(line)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        print(line, flush=True)
+    except Exception:  # noqa: BLE001 — the raw fd is reentrancy-safe
+        try:
+            os.write(1, (line + "\n").encode())
+        except Exception:  # noqa: BLE001
+            pass
+    sys.exit(0)
+
+
 def _acquire_singleton() -> bool:
     """True → we hold the poller lock (or it is disabled / errored → fail-open).
     False → a live bridge already owns this workspace and the caller must NOT poll."""
@@ -5269,7 +5292,7 @@ def _acquire_singleton() -> bool:
     atexit.register(_release_singleton)
     for _sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            signal.signal(_sig, lambda *_a: sys.exit(0))
+            signal.signal(_sig, _exit_on_signal)
         except Exception:
             pass  # non-main-thread or platform without the signal — atexit still covers exit
     _log(f"singleton: acquired workspace poller lock ({r.status})")
