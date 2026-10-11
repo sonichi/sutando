@@ -1066,8 +1066,7 @@ def main():  # pragma: no cover
         # and telegram-bridge raced for the SAME proactive-*.txt files
         # and whichever ran first delivered, producing cross-channel
         # surprises. See proactive_routing.py for the decision rule.
-        from proactive_routing import (body_claimable_by,
-                                       should_claim_proactive_file)
+        from proactive_routing import should_claim_proactive_peeked
         try:
             if not presenter_mode_active(REPO):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
@@ -1079,22 +1078,17 @@ def main():  # pragma: no cover
                 # cron-originated results land in the owner's DM regardless
                 # of which bridge is the active channel.
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
-                def _tg_claims(name: str) -> bool:
-                    # Destination outranks activity routing, uniformly;
-                    # discord's DM fallback stays the after-grace catch-all.
-                    return should_claim_proactive_file(
-                        name, OWNER_ACTIVITY_FILE, "telegram")
-
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \
-                            and f.suffix == ".txt" and _tg_claims(f.name):
+                            and f.suffix == ".txt":
                         # Peek before claiming: a body addressed to another bridge
                         # is delivered by that bridge, not sent here as literal text.
                         try:
                             peek = f.read_text(errors="ignore").lstrip()
                         except OSError:
                             continue
-                        if not body_claimable_by(peek, "telegram"):
+                        if not should_claim_proactive_peeked(
+                                f.name, peek, OWNER_ACTIVITY_FILE, "telegram"):
                             continue
                         # Resolve the recipient BEFORE claiming: the claim renames the
                         # file out of the `*.txt` glob every peer bridge polls.

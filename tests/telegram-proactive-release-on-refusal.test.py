@@ -40,6 +40,8 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 sys.path.insert(0, str(REPO / "src"))
 # Imported before the stub replaces sys.modules: it hands back the real gate.
 from proactive_routing import body_claimable_by as _real_body_claimable_by  # noqa: E402
+from proactive_routing import body_target_channel as _real_body_target_channel  # noqa: E402
+from proactive_routing import should_claim_proactive_peeked as _real_peeked  # noqa: E402
 
 
 class _Stop(Exception):
@@ -85,6 +87,10 @@ def _run_one_drain(mod, results: Path, send_result: dict):
     routing.proactive_destination = lambda *_a, **_k: None
     # Stubbed routing claims every file; body_claimable_by stays REAL.
     routing.body_claimable_by = _real_body_claimable_by
+    routing.body_target_channel = _real_body_target_channel
+    # The real pre-claim helper, resolving its legs through this stub.
+    routing.should_claim_proactive_peeked = types.FunctionType(
+        _real_peeked.__code__, routing.__dict__)
     sys.modules["proactive_routing"] = routing
     mod.presenter_mode_active = lambda *_a, **_k: False
     t = threading.Thread(target=lambda: _swallow(mod.main), daemon=True)

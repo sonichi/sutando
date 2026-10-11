@@ -5492,22 +5492,17 @@ async def poll_proactive():
             # state/last-owner-activity.json; default discord on missing
             # state).
             from proactive_routing import (  # noqa: E402
-                body_target_channel, redirect_target_is_foreign,
-                should_claim_proactive_file)
+                redirect_target_is_foreign, should_claim_proactive_peeked)
 
             def _discord_claims(f):
-                # Per-FILE decision: an explicit .to-<channel> destination
-                # outranks activity routing (see proactive_routing).
-                if should_claim_proactive_file(
-                        f.name, STATE_DIR / "last-owner-activity.json", "discord"):
-                    return True
-                # An explicit body [channel:] target also outranks activity
-                # routing, matching slack/telegram's body_claimable_by peek.
+                # Peek before claiming: a claim hides the file from the bridge
+                # its body addresses (#5368). Policy: proactive_routing.
                 try:
                     peek = f.read_text(errors="ignore")
                 except OSError:
                     return False
-                return body_target_channel(peek) == "discord"
+                return should_claim_proactive_peeked(
+                    f.name, peek, STATE_DIR / "last-owner-activity.json", "discord")
 
             for f in RESULTS_DIR.iterdir():
                 if f.name.startswith("proactive-") and f.suffix == ".txt" \
