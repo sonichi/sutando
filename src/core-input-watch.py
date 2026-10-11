@@ -120,13 +120,16 @@ def _load_runtime_health():
 # with the caret on its "Switch to <fallback> and continue" row.
 from delivery.pane_gate import (  # noqa: E402
     ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
-    COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, classify_pane as _pg_classify_pane,
-    composer_text as _pg_composer_text, prompt_line as _pg_prompt_line, gate_evidence,
+    COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, TURN_DONE, TURN_SHORT,
+    classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, finished_turns,
+    gate_evidence, limit_is_stale, prompt_line as _pg_prompt_line, strip_limit_banners,
 )
 
 _FABLE_TEXT = FABLE_TEXT
 #: Lines allowed between the nearest Fable text and the focused switch row (body may wrap).
 _FABLE_CARET_GAP = 3
+#: Lines allowed between "hit your session limit" and the "Continuing automatically" under it.
+_LIMIT_WAIT_GAP = 4
 
 # ---- ESCALATE-detection: interactive-prompt signatures. First match classifies.
 # Specific so the idle "❯ " prompt (ready for a task) is NEVER flagged. This is
@@ -153,11 +156,8 @@ def _refusal_line(line: str) -> bool:
     return bool(_REFUSAL.search(line)) or cli_wedge.needs_login_line(line)
 
 
-# The completed-turn line: "✻ Worked for 0s" / "✻ Cooked for 1s · done 12:32 PM". The spinner
-# reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
-_TURN_DONE = re.compile(
-    r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
-_TURN_SHORT = re.compile(r"[01]s")
+_TURN_DONE = TURN_DONE
+_TURN_SHORT = TURN_SHORT
 _PROMPT_LINE = re.compile(r"^\s*❯")
 # The CLI's hint in an EMPTY composer (`❯ Try "refactor <filepath>"`); it vanishes
 # on the first typed character, so it is never a draft. Plain capture loses its dimming.
@@ -172,7 +172,7 @@ _TURN_WINDOW = 40
 # Gates that need a human (can't be auto-answered): login + any unrecognized
 # selection/permission. The rest (trust/bypass/press-enter) are known-safe.
 # session-limit is a spend/wait decision: never auto-answered, never a login.
-_HUMAN_GATES = {"login", "selection", "permission", "session-limit", "fable-limit-unfocused",
+_HUMAN_GATES = {"login", "selection", "permission", "session-limit", "usage-limit", "fable-limit-unfocused",
                 "turn-rejected", "unknown"}
 
 # --- M4 AUTO-ANSWER (Layer 2): the safe key per gate; `answer_step` in the loop sends it
@@ -225,6 +225,11 @@ def classify(pane: str, styled_pane: "str | None" = None):
             for m in [max(rx.finditer(tail), key=lambda m: m.start(), default=None)] if m]
     if hits:
         start, _, kind = max(hits, key=lambda h: (h[0], -h[1]))
+        # The wait line under "You've hit your session limit" is that screen's, not a new banner.
+        if kind == "usage-limit" and any(
+                k == "session-limit" and tail.count("\n", s, start) <= _LIMIT_WAIT_GAP
+                for s, _, k in hits):
+            kind = "session-limit"
         # A focused switch row is Enter-safe only right under the Fable text (title, body,
         # caret); a resolved Fable dialog higher up must not vouch for some other dialog's row.
         if kind == "fable-limit" and not any(
@@ -332,8 +337,20 @@ _BASE_TO_STATE = {
 }
 
 
+def limit_step(pane, baseline, workspace=None, socket=None, session=None):
+    """(stale, baseline) for this poll's limit banner. `baseline` is the finished turns on
+    the first capture that showed it; a turn finishing after that proves the seat runs."""
+    tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
+    abn = cli_wedge.frame_abnormal(tail)
+    if abn is None or abn.kind != "provider-limit":
+        return False, None
+    if baseline is None:
+        baseline = finished_turns(pane)
+    return limit_is_stale(abn, workspace, socket, session, capture=pane, baseline=baseline), baseline
+
+
 def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime=None,
-                   styled_pane: "str | None" = None):
+                  styled_pane: "str | None" = None, limit_stale=False):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -347,7 +364,10 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     `runtime` is the runtime stamped on the core session (see `session_runtime`).
     `styled_pane` is the same capture taken WITH escapes, when the caller has one
     (see `classify()`); omitted it changes nothing else here.
+    `limit_stale` (from `limit_step`) drops a limit banner the seat has outrun.
     """
+    if limit_stale and pane:
+        pane = strip_limit_banners(pane)
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
     # An ACTIVE interactive gate in the pane is the finest signal — it distinguishes
@@ -848,6 +868,7 @@ def main():
     idle_ticks = 0
     login_since = None
     prev_pane = None
+    limit_baseline = None
     clock = (None, None, None)
     last_runtime = None  # a failed tmux read keeps the last runtime, not "claude"
     state_dir = os.path.dirname(os.path.abspath(a.out))
@@ -860,11 +881,12 @@ def main():
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         runtime = session_runtime(a.socket, a.session) or last_runtime
         last_runtime = runtime
+        limit_stale, limit_baseline = limit_step(pane, limit_baseline, workspace, a.socket, a.session)
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
             process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane,
-            runtime=runtime, styled_pane=styled_pane)
+            runtime=runtime, styled_pane=styled_pane, limit_stale=limit_stale)
         prev_pane = pane
         clock = gate_clock(clock, state, prompt, time.time())
 
