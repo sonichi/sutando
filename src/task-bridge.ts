@@ -866,6 +866,17 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	return lines.join('\n') + '\n';
 }
 
+/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority. */
+export async function submitVoiceSessionEndTask(summary: string, transcript: string): Promise<string> {
+	const taskId = `task-${Date.now()}`;
+	const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
+	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null).replace('priority: urgent', 'priority: low');
+	const body = transcript ? `\n\n--- the session's spoken lines (may contain ASR errors) ---\n${confineUserContent(transcript)}\n` : '\n';
+	await _delegation.submitTask(taskId, `${header}task: ${confineUserContent(summary)}${body}`);
+	console.log(`${ts()} [TaskBridge] Session-end task: ${taskId}`);
+	return taskId;
+}
+
 /** Remember the origin a task was written with, so its result can follow it. */
 export function _rememberTaskOrigin(taskId: string, origin: VoiceSessionOrigin | null): void {
 	if (!origin) return;
