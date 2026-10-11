@@ -1076,6 +1076,39 @@ class TestKeweiReview5484812051(WorldCase):
         self.assertTrue(self.w.m(ok, final=True)["matched"])
 
 
+class TestKeweiReview5484867928(WorldCase):
+    """A close through a reply task makes it the replay owner, even after an --event-id bind."""
+
+    def test_k7_event_bind_then_task_close_replays_to_that_task(self):
+        self.w.ask(SELF, SIB, cid=C1)
+        e = self.sib(f"{SELF} — up")
+        real = policy.os.link
+
+        def crash_on_close(src, dst, *a, **k):
+            if Path(dst).parent.name == "answered":
+                raise OSError("crashed before the close")
+            return real(src, dst, *a, **k)
+        with mock.patch.object(policy.os, "link", crash_on_close):
+            self.assertFalse(self.w.m(e, final=True)["matched"])
+        tid = self.w.deliver(SELF, e, "task-reply")
+        mr = lambda: policy.match_reply(self.w.tr[SELF], room=ROOM, self_mxid=SELF,  # noqa: E731
+                                        workspace=self.w.ws[SELF], task_id=tid, final=True)
+        first = mr()
+        self.assertEqual((first["matched"], first["cid"]), (True, C1), first)
+        again = mr()  # a crash before the relay: the live task's retry replays
+        self.assertEqual((again.get("matched"), again.get("replay")), (True, True), again)
+        (self.w.ws[SELF] / "results" / f"{tid}.txt").write_text("[no-send]")
+        self.assertIn("already answered", mr()["reason"])
+
+    def test_the_waiting_preview_is_the_text_match_returns(self):
+        self.w.ask(SELF, SIB, cid=C1)
+        e = self.sib(f"{SELF} — [no-send]\n[file: /tmp/x] up")
+        preview = policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF], self_mxid=SELF)[C1]
+        self.assertEqual(preview, {"event_id": e, "text": self.w.m(e)["reply_text"]})
+        self.assertNotIn("[no-send]", preview["text"])
+        self.assertFalse(preview["text"].startswith(SELF))
+
+
 class TestReplayUntilRelayed(WorldCase):
     def setUp(self):
         super().setUp()
@@ -1318,9 +1351,9 @@ class TestCliAndEdges(unittest.TestCase):
             self.assertEqual((res["asked"], tr.reads), (True, 0), res)
             self.assertEqual(policy.records(ws, "pending")[0]["max_s"], 900)
             tr.room.post(SIB, f"{SELF} — up", reply_to="$ask", thread_root="$ask")
-            rc, listed = self._cli("pending", "--nudge-after", "60", transport=tr, workspace=ws)
+            rc, listed = self._cli("pending", "--agent", SELF, "--nudge-after", "60", transport=tr, workspace=ws)
             self.assertEqual(([r["cid"] for r in listed["pending"]], listed["nudge_after_s"]), ([CID], 60))
-            self.assertEqual(listed["pending"][0]["answer_waiting"], {"event_id": "$ask2", "text": f"{SELF} — up"})
+            self.assertEqual(listed["pending"][0]["answer_waiting"], {"event_id": "$ask2", "text": "up"})
             rc, nudged = self._cli("pending", "--nudged", CID, workspace=ws)
             self.assertTrue(nudged["ok"], nudged)
             reply_task(ws, "$ask2")

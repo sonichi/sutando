@@ -597,6 +597,13 @@ def _window_refusal(rec: dict, msg: dict, messages: List[dict], max_duration_s: 
     return None
 
 
+def _reply_text(msg: dict, self_mxid: str) -> str:
+    """The message text without a leading mention of this agent, with result markers neutralized."""
+    from result_markers import neutralize_markers
+    text = leading_mention(msg.get("body") or "", self_mxid)
+    return neutralize_markers((msg.get("body") or "").strip() if text is None else text)
+
+
 def _payload(rec: dict, event: str, text: str) -> dict:
     origin = rec.get("origin") or {}
     return {"matched": True, "agent": rec["agent"], "cid": rec["cid"], "reply_text": text, "event_id": event,
@@ -667,9 +674,7 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
                 and not _window_refusal(rec, m, messages, max_duration_s):  # one that cannot bind holds nothing up
             return no(f"an earlier message from {rec['agent']} in this consult, {m.get('event_id')}, is not "
                       "judged yet; judge it first", earlier=m.get("event_id"))
-    from result_markers import neutralize_markers
-    text = leading_mention(msg.get("body") or "", self_mxid)
-    text = neutralize_markers((msg.get("body") or "").strip() if text is None else text)
+    text = _reply_text(msg, self_mxid)
     if not final and not not_final:
         return {"matched": False, "candidate": True, "agent": rec["agent"], "cid": cid, "reply_text": text,
                 "event_id": event, "reason": "read it, then run again with --final (the answer) "
@@ -717,7 +722,7 @@ def _close(workspace: Path, binding: dict, event: str, task_id, no) -> dict:
     cid = str(binding["cid"])
     dst = _record_path(workspace, "answered", cid)
     claim = {**binding["record"], "answered_at": time.time(), "answer_event": event,
-             "reply_task": binding.get("reply_task"), "payload": binding["payload"]}
+             "reply_task": task_id or binding.get("reply_task"), "payload": binding["payload"]}
     try:
         if not _claim_file(dst, claim):
             return _replay(workspace, cid, task_id, event, no)
@@ -753,7 +758,8 @@ def mark_relayed(workspace: Path, cid: str) -> dict:
     return {"ok": True, "cid": cid, "reason": None}
 
 
-def waiting_answers(transport, room: str, workspace: Path, max_duration_s: int = DEFAULT_MAX_DURATION_S) -> dict:
+def waiting_answers(transport, room: str, workspace: Path, max_duration_s: int = DEFAULT_MAX_DURATION_S,
+                    self_mxid: str = "") -> dict:
     """{cid: {event_id, text[, refused]}}: for each confirmed pending consult, the asked agent's
     oldest message in it not yet judged, when no task brought it here. `refused` carries the
     reason `match` will give when that message falls outside the answer window. One room read."""
@@ -766,7 +772,7 @@ def waiting_answers(transport, room: str, workspace: Path, max_duration_s: int =
                  and not _key_path(workspace, "bound", m.get("event_id")).exists()]
         if cands:
             first = next((m for m in cands if not _window_refusal(r, m, messages, max_duration_s)), cands[0])
-            row = {"event_id": first.get("event_id"), "text": first.get("body") or ""}
+            row = {"event_id": first.get("event_id"), "text": _reply_text(first, self_mxid)}
             late = _window_refusal(r, first, messages, max_duration_s)
             out[r["cid"]] = {**row, "refused": late} if late else row
     return out
