@@ -96,7 +96,7 @@ room-specific provider session.
 Claim/acknowledge a task so the server stops redelivering it.
 
 ```
-body: { "id": "task-123", "durable": true }
+body: { "id": "task-123", "lease_id": "<the served task's lease_id>", "durable": true }
 ```
 
 The client acks each task as it is accepted. A server with at-least-once
@@ -113,6 +113,10 @@ task is already queued and its durability could not be repaired. Acks that do
 not confirm are persisted and retried; a per-task `404 {"error": "not leased …"}`
 retires the retry for good, while a bare no-route 404/405 keeps the
 endpoint-unsupported cooldown.
+When the served task carries a `lease_id` (the broker's lease generation, fresh
+on every serve), the ack echoes it — also on a retry after a restart, since the
+pending-ack ledger keeps it — and a `404 {"reason": "stale lease generation"}`
+retires that ack the same way; a task served without one is acked without the key.
 
 ### `POST /v1/results`
 
