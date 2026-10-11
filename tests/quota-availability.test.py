@@ -778,6 +778,11 @@ class TestRecordSpeaksForSeatFamilyAware(RecordFixture):
 
     def test_unknown_names_never_match(self):
         self.assertFalse(self._speaks("not-a-model", "claude-opus-5-5"))
+
+    def test_model_family_is_none_for_every_falsy_value(self):
+        # record_speaks_for_seat never passes a falsy value through; checked here directly.
+        for falsy in (None, ""):
+            self.assertIsNone(qa._model_family(falsy))
         self.assertFalse(self._speaks("claude-opus-5-5", "not-a-model"))
 
 
