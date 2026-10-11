@@ -361,23 +361,15 @@ def _age(rec: dict, now: float) -> float:
 def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
             expire_after_s: float = DEFAULT_EXPIRE_AFTER_S) -> List[dict]:
     """Unanswered consults, oldest first; `nudge_due` when overdue and the owner was not yet
-    told, `expired` past the expiry (match then refuses), plus any task holding a root claim
-    with no record (`claim_only`). Root and answer claims are pruned only once no task that
-    could post from them is live; an expired consult is pruned once the owner has been told
-    and its task can no longer post."""
+    told, `expired` past the expiry (match then refuses), plus any live task holding a root
+    claim with no record (`claim_only`). Root and answer claims are never pruned; an expired
+    consult's record is pruned once the owner has been told and its task can no longer post."""
     now = time.time() if now is None else now
-    answers = Path(workspace) / _STATE / "answers"
-    for f in sorted(answers.glob("*.json")) if answers.is_dir() else []:
-        tasks = (_read_record(f) or {}).get("tasks") or []
-        if tasks and not any(task_can_post(workspace, t) for t in tasks):
-            f.unlink(missing_ok=True)
     roots = Path(workspace) / _STATE / "roots"
-    claimed = {}
+    claimed = {}  # root and answer claims are never removed: a removed claim can be raced
     for f in sorted(roots.glob("*.json")) if roots.is_dir() else []:
         task = f.name[:-len(".json")]
-        if not task_can_post(workspace, task):
-            f.unlink(missing_ok=True)
-        else:
+        if task_can_post(workspace, task):
             claimed[task] = (_read_record(f) or {}).get("cid")
     for state in ("answered", "nudged"):
         for r in records(workspace, state):
@@ -825,13 +817,13 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
         if not via or not rec.get("root"):
             return no(f"{up} is not an onward consult of this agent")
         inc = {"cid": via["cid"], "asker": via["asker"], "ask_event": via["ask_event"], "root": rec["root"]}
-        poster = rec.get("reply_task")
+        posters = [rec.get("reply_task"), via.get("task_id")]
     else:
         inc = incoming_ask(transport, room, self_mxid, task_id, workspace,
                            verdict["owner_agents"] | {self_mxid}, max_duration_s, max_asks)
         if not inc["ok"]:
             return no(inc["reason"])
-        poster = task_id
+        posters = [task_id]
     lim = effective_limits(inc["root_msg"], inc["limits"], max_duration_s, max_asks) if inc.get("root_msg") else None
     now_s = measured_now(inc["server_now"], inc["anchor"], time.time()) if lim else None
     reached = limit_reached(lim, len(inc["asks"]), now_s) if lim and now_s is not None else None
@@ -847,10 +839,10 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
                           "so it is not posted again")
             held["event_id"] = found
             _write_record(claim_path, held)
-        _note_task(claim_path, held, poster)
+        _note_tasks(claim_path, held, posters)
         return {**base, "event_id": held["event_id"], "replay": True}
     if not _claim_file(claim_path, {"cid": inc["cid"], "to": inc["asker"], "at": time.time(), "event_id": None,
-                                    "tasks": [t for t in [poster] if t]}):
+                                    "tasks": [t for t in posters if t]}):
         return no("another answer to this ask is being posted")
     sent = transport.mention(inc["asker"], f"{answer_tag(inc['cid'])}\n{text.strip()}", room,
                              reply_to=inc["ask_event"], thread_root=inc["root"])
@@ -869,11 +861,13 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
     return {**base, "event_id": event}
 
 
-def _note_task(path: Path, claim: dict, task: Optional[str]) -> None:
-    """Add a task that can post this answer to its claim, so the claim outlives every such task."""
-    if task and task not in claim.get("tasks", []):
+def _note_tasks(path: Path, claim: dict, tasks: List[Optional[str]]) -> None:
+    """Record every task that could post this answer (the reply task and the original ask task).
+    The claim is never pruned; the list says which tasks it covers, for an owner clearing by hand."""
+    new = [t for t in tasks if t and t not in claim.get("tasks", [])]
+    if new:
         try:
-            _write_record(path, {**claim, "tasks": [*claim.get("tasks", []), task]})
+            _write_record(path, {**claim, "tasks": [*claim.get("tasks", []), *new]})
         except OSError:
             pass
 

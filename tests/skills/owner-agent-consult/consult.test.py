@@ -1370,18 +1370,14 @@ class TestKeweiRoundNine(unittest.TestCase):
         w.tr[SELF].mention = FakeTransport.mention.__get__(w.tr[SELF])
         self.assertTrue(w.ask(SELF, SIB, cid=C2, task_id=TID)["asked"])
 
-    def test_an_empty_root_claim_blocks_until_its_task_cannot_post(self):
+    def test_an_empty_root_claim_is_never_released(self):
         claim = policy._root_claim(self.w.ws[SELF], TID)
         claim.parent.mkdir(parents=True, exist_ok=True)
         claim.write_text("")  # a crash between creating the claim and writing it (older code)
-        old = time.time() - 10 * 86400
-        os.utime(claim, (old, old))
         self.assertFalse(policy.claim_root(self.w.ws[SELF], TID, C1))
-        policy.pending(self.w.ws[SELF], 600)
-        self.assertTrue(claim.exists())
         (self.w.ws[SELF] / "results" / f"{TID}.txt").write_text("done")
         policy.pending(self.w.ws[SELF], 600)
-        self.assertFalse(claim.exists())
+        self.assertTrue(claim.exists())
 
     def test_a_crash_while_writing_a_claim_leaves_no_claim(self):
         with mock.patch.object(policy.os, "link", side_effect=OSError("crash")), self.assertRaises(OSError):
@@ -1390,11 +1386,11 @@ class TestKeweiRoundNine(unittest.TestCase):
         self.assertEqual(list(policy._root_claim(self.w.ws[SELF], TID).parent.iterdir()), [])
         self.assertTrue(policy.claim_root(self.w.ws[SELF], TID, C1))
 
-    def test_root_claims_of_gone_tasks_are_pruned(self):
+    def test_root_claims_of_gone_tasks_stay_and_leave_the_listing(self):
         policy.claim_root(self.w.ws[SELF], TID, C1)
         (self.w.ws[SELF] / "tasks" / f"{TID}.txt").unlink()  # archived away
-        policy.pending(self.w.ws[SELF], 600)
-        self.assertFalse(policy._root_claim(self.w.ws[SELF], TID).exists())
+        self.assertEqual(policy.pending(self.w.ws[SELF], 600), [])
+        self.assertTrue(policy._root_claim(self.w.ws[SELF], TID).exists())
 
     # 3: a matched answer is replayable until its reply task has a result
     def test_a_crash_after_the_claim_replays_the_answer_to_the_same_reply_task(self):
@@ -1623,9 +1619,10 @@ class TestPublicationIsOneRecoverableState(unittest.TestCase):
         (w.ws[SIB] / "results" / "task-b1.txt").write_text("[no-send]")
         later = time.time() + 30 * 86400
         policy.pending(w.ws[SIB], 600, now=later)
-        policy.pending(w.ws[SELF], 600, now=later)
-        self.assertEqual(list(answers.glob("*.json")), [])
-        self.assertFalse((roots / "task-junk.json").exists())
+        listed = [r.get("task_id") for r in policy.pending(w.ws[SELF], 600, now=later)]
+        self.assertNotIn("task-junk", listed)  # a claim whose task is gone is not listed
+        self.assertEqual(len(list(answers.glob("*.json"))), 1)
+        self.assertTrue((roots / "task-junk.json").exists())
 
     def test_a_root_ask_that_timed_out_and_lands_late_does_not_start_a_second_thread(self):
         w = self.w
@@ -1724,28 +1721,20 @@ class TestOneRootPerTaskEver(unittest.TestCase):
         self.assertIn("unconfirmed", res["reason"])
         self.assertEqual(len(w.room.msgs), 2)
 
-    def test_claims_are_pruned_only_once_their_task_cannot_post(self):
+    def test_a_live_claim_only_task_is_listed(self):
         w = self.w
         policy.claim_root(w.ws[SELF], TID, C1)
         later = time.time() + 30 * 86400
         self.assertEqual([r["claim_only"] for r in policy.pending(w.ws[SELF], 600, now=later)], [True])
-        self.assertTrue(policy._root_claim(w.ws[SELF], TID).exists())
-        (w.ws[SELF] / "results" / f"{TID}.txt").write_text("done")
-        policy.pending(w.ws[SELF], 600, now=later)
-        self.assertFalse(policy._root_claim(w.ws[SELF], TID).exists())
 
-    def test_answer_claims_are_pruned_only_once_their_task_cannot_post(self):
+    def test_answer_claims_are_never_pruned(self):
         w = self.w
         w.ask(SELF, SIB, cid=C1, task_id=TID)
         w.deliver(SIB, "$ask", "task-b1")
         w.answer(SIB, "up", task_id="task-b1")
-        claim = policy._answer_claim(w.ws[SIB], C1)
-        later = time.time() + 30 * 86400
-        policy.pending(w.ws[SIB], 600, now=later)
-        self.assertTrue(claim.exists())
         (w.ws[SIB] / "results" / "task-b1.txt").write_text("[no-send]")
-        policy.pending(w.ws[SIB], 600, now=later)
-        self.assertFalse(claim.exists())
+        policy.pending(w.ws[SIB], 600, now=time.time() + 30 * 86400)
+        self.assertTrue(policy._answer_claim(w.ws[SIB], C1).exists())
 
     def test_an_answer_claim_remembers_every_task_that_posted_through_it(self):
         w = self.w
@@ -1753,10 +1742,10 @@ class TestOneRootPerTaskEver(unittest.TestCase):
         w.deliver(SIB, "$ask", "task-b1")
         w.answer(SIB, "up", task_id="task-b1")
         claim = policy._answer_claim(w.ws[SIB], C1)
-        policy._note_task(claim, json.loads(claim.read_text()), "task-b9")
+        policy._note_tasks(claim, json.loads(claim.read_text()), ["task-b9", None, "task-b1"])
         self.assertEqual(json.loads(claim.read_text())["tasks"], ["task-b1", "task-b9"])
         with mock.patch.object(policy, "_write_record", side_effect=OSError("ro")):
-            policy._note_task(claim, json.loads(claim.read_text()), "task-b10")
+            policy._note_tasks(claim, json.loads(claim.read_text()), ["task-b10"])
         self.assertFalse(policy.task_can_post(w.ws[SIB], "not a task id"))
 
     def test_an_expired_unconfirmed_record_leaves_the_listing_but_still_blocks_the_task(self):
@@ -1770,6 +1759,65 @@ class TestOneRootPerTaskEver(unittest.TestCase):
         self.assertEqual([r.get("claim_only") for r in listed], [None])
         self.assertTrue(listed[0]["expired"])
         self.assertFalse(w.ask(SELF, SIB, cid=C2, task_id=TID)["asked"])
+
+
+class TestClaimsAreNeverReleased(unittest.TestCase):
+    """Root and answer claims are never pruned, so no cleanup can race an admitted publisher."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_kewei_3_cleanup_cannot_let_two_admitted_callers_post_two_roots(self):
+        w, real, out = self.w, policy._write_record, []
+        admitted = policy.trusted_task(TID, w.ws[SELF])  # B passed the task gate before the result
+
+        def a_paused_before_its_record(path, rec):
+            if not out and path.parent.name == "pending":
+                out.append(1)
+                (w.ws[SELF] / "results" / f"{TID}.txt").write_text("done")
+                policy.pending(w.ws[SELF], 600)  # a cleanup pass
+                with mock.patch.object(policy, "trusted_task", return_value=admitted):
+                    out.append(w.ask(SELF, SIB, cid=C2, task_id=TID))
+            return real(path, rec)
+        with mock.patch.object(policy, "_write_record", side_effect=a_paused_before_its_record):
+            a = w.ask(SELF, SIB, cid=C1, task_id=TID)
+        self.assertFalse(out[1]["asked"], out[1])
+        self.assertTrue(a["asked"], a)
+        self.assertEqual([m.get("thread_root") for m in w.room.msgs], [None])
+        self.assertTrue(policy._root_claim(w.ws[SELF], TID).exists())
+
+    def test_kewei_4_an_onward_answer_is_never_posted_twice_from_the_live_original_task(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.deliver(SIB, "$ask", "task-b1")
+        w.ask(SIB, THIRD, cid=C2, via_task="task-b1")
+        w.deliver(THIRD, "$ask2", "task-c1")
+        w.answer(THIRD, "disk is 80% full", task_id="task-c1")
+        w.deliver(SIB, "$ask3", "task-b2")
+        up = w.match(SIB, "task-b2")
+        first = w.answer(SIB, "per third: 80%", up=up["answer_up"]["up"])
+        recorded = json.loads(policy._answer_claim(w.ws[SIB], C1).read_text())["tasks"]
+        self.assertEqual(set(recorded), {"task-b1", "task-b2"})  # the original ask task too
+        (w.ws[SIB] / "results" / "task-b2.txt").write_text("[no-send]")
+        policy.pending(w.ws[SIB], 600)
+        second = w.answer(SIB, "per third: 80%", task_id="task-b1")  # task-b1 is still live
+        self.assertEqual((second.get("replay"), second["event_id"]), (True, first["event_id"]), second)
+        self.assertEqual(sum(1 for m in w.room.msgs if m["sender"] == SIB
+                             and policy.answer_tag(C1) in m["body"]), 1)
+        tasks = json.loads(policy._answer_claim(w.ws[SIB], C1).read_text())["tasks"]
+        self.assertEqual(set(tasks), {"task-b1", "task-b2"})
+
+    def test_claims_of_finished_tasks_stay_on_disk_and_leave_the_listing(self):
+        w = self.w
+        policy.claim_root(w.ws[SELF], TID, C1)
+        self.assertEqual([r.get("claim_only") for r in policy.pending(w.ws[SELF], 600)], [True])
+        (w.ws[SELF] / "results" / f"{TID}.txt").write_text("done")
+        self.assertEqual(policy.pending(w.ws[SELF], 600), [])
+        self.assertTrue(policy._root_claim(w.ws[SELF], TID).exists())
 
 
 class TestRecordEdges(unittest.TestCase):

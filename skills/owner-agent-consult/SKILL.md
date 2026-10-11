@@ -350,11 +350,19 @@ An unconfirmed post is never released and never posted again. It stays unconfirm
 found in the room by consult id, which completes it. Absence from a room read proves nothing:
 the gateway cannot say a read covered the whole history. Age proves nothing either.
 
-**One root per task, ever.** A root claim, or an answer claim, is never released or pruned while
-a task that could post from it is live: in `tasks/` with no result. It is pruned only once that
-task has a result or is gone from `tasks/`, and by then nothing can post from it, because every
-ask needs a live, unanswered task. Expiry (`OWNER_AGENT_CONSULT_EXPIRE_AFTER_S`) only ends
-matching and nudging, and ages records out of `pending`; it never frees a claim.
+**One root per task, and one answer per ask, ever.** Root claims (`roots/<task>.json`) and answer
+claims (`answers/<cid>.json`) are never released or pruned by the skill. A claim that is never
+removed cannot be raced: no cleanup, at any age or task state, can let a second publisher in. An
+answer claim records every task that could post through it (the reply task and the original ask
+task). Expiry (`OWNER_AGENT_CONSULT_EXPIRE_AFTER_S`) only ends matching and nudging, and ages
+records out of `pending`; `pending` lists only claims whose task is still live.
+
+**Cost: claim files accumulate.** Each owner task that consults leaves one root claim (about
+80 bytes), and each ask this agent answers leaves one answer claim (about 150 bytes). On most
+filesystems each takes one block (4 KB), so 1,000 consults use about 8 MB. An owner may clear
+them by hand: delete `roots/<task>.json` only for a task that has a result or is gone from
+`tasks/`, and `answers/<cid>.json` only when no task in its `tasks` list is live, with no
+consult running.
 
 **The cost, stated plainly.** If a post really never landed, that task cannot consult again: no
 further ask from it, or answer to that ask, is posted. `ask` and `answer` refuse with the
@@ -366,10 +374,10 @@ Every write pair where a crash between the two matters, in order, and its recove
 
 | writes, in order | a crash between them leaves | recovery |
 | --- | --- | --- |
-| root claim (`roots/<task>.json`), then pending record (owner task's first ask) | a claim with no record; nothing was posted, since the record precedes the post | the claim holds while the task is live, and `pending` lists the task as `claim_only`. The owner can ask again with a new message. The claim is never healed, because a publisher paused after its claim could resume and post a second root |
+| root claim (`roots/<task>.json`), then pending record (owner task's first ask) | a claim with no record; nothing was posted, since the record precedes the post | the claim holds forever; while the task is live, `pending` lists it as `claim_only`. The owner can ask again with a new message. The claim is never healed or pruned, because a publisher paused after its claim could resume and post a second root |
 | pending record, then the post (any ask) | a record with no event id; posted or not | unconfirmed until found by consult id. Checked before any later ask from that owner task, or from that ask task to that agent |
 | the post, then the record's event id | a posted ask whose record has no event id | found by consult id: by `match` when the answer arrives, or by the next ask |
-| answer claim (`answers/<cid>.json`), then the answer post | a claim with no event id; posted or not | the next `answer` for that ask (`--task-id` or `--up`) finds its own answer by its answer line and replays it; otherwise it refuses. The claim records every task that posted through it and is pruned only once all of them have a result or are gone |
+| answer claim (`answers/<cid>.json`), then the answer post | a claim with no event id; posted or not | the next `answer` for that ask (`--task-id` or `--up`) finds its own answer by its answer line and replays it; otherwise it refuses. The claim records every task that could post through it and is never pruned |
 | the answer post, then the claim's event id | a posted answer whose claim has no event id | the same: found by its answer line and replayed, never reposted |
 | the answered record with the payload (`answered/<cid>`), then removing `pending/<cid>` | both files | `match` replays to the same reply task; `pending` drops a pending copy beside its answer |
 | `answered/<cid>`, then the caller's result file | a consult closed but not relayed | `match` replays the payload to the same reply task until its result exists; `answer --up` replays its recorded post instead of posting again |
