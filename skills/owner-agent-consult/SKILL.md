@@ -1,6 +1,6 @@
 ---
 name: owner-agent-consult
-description: Before answering your OWNER, when the answer genuinely depends on something another agent of the same owner holds and you do not, ask that agent in the owner's owner-only consult room and tell the owner you asked. The whole consult runs in one thread; a consulted agent may consult onward, never to an agent already in the chain; answers arrive as new tasks and flow back up the chain to you, and you relay them to the owner — or, past the nudge time, tell the owner there is no answer. Starts only from a verified owner task; inert until a consult room and room transport are configured.
+description: Before answering your OWNER, when the answer genuinely depends on something another agent of the same owner holds and you do not, ask that agent in the owner's owner-only consult room and tell the owner you asked. The whole consult runs in one thread; a consulted agent may consult onward, never to an agent already in the chain; answers arrive as new tasks and flow back up the chain to you, and you relay them to the owner — or, past the nudge time, tell the owner there is no answer. An agent starts one from a verified owner task, with the known gaps documented below; inert until a consult room and room transport are configured.
 ---
 
 # Owner-agent consult
@@ -66,11 +66,14 @@ than closed, and the owner of each install should know them before configuring a
 - **`--task-id` is not bound to the claimed task:** `ask --task-id` accepts any live, verified,
   unanswered owner task in this inbox, not only the one this session is running.
 
-The thread limits bound both: whatever its marker claims, a thread so started takes at most
-`OWNER_AGENT_CONSULT_MAX_ASKS` asks (each agent's own setting) within
-`OWNER_AGENT_CONSULT_MAX_DURATION_S` of the root's server timestamp, and only among the owner's
-agents in the owner-only room. That bound is per thread: nothing limits how many threads such
-a session starts.
+The thread limits bound both, per thread. Whatever its marker claims, a thread takes no new ask
+from an agent once the thread holds that agent's `OWNER_AGENT_CONSULT_MAX_ASKS` asks or is
+`OWNER_AGENT_CONSULT_MAX_DURATION_S` past its root's server timestamp. Each agent applies its
+own setting, which includes its `--max-*` flags, so a session in the `--task-id` gap can raise
+its own agent's limits to the ceilings (100 asks, 86400 s); every other agent still applies its
+own, smaller setting. Asks happen only among the owner's agents in the owner-only room. Nothing
+limits how many threads such a session starts, and asks that race can overshoot the count (see
+"Loop guard").
 
 ## One consult, one thread
 
@@ -103,6 +106,13 @@ never widen them:
 - the window starts at the root event's **server timestamp**, read from the room; the
   marker's `since` is informational and never used, so neither a forged `since` nor a skewed
   clock on the first asker moves the window;
+- "now" is on the server's clock too, not this agent's: the server timestamp of an anchor
+  event plus the local time elapsed since this agent saw it. The anchor is the ask that
+  reached this agent (its event's server timestamp, and the task's arrival time here), or, for
+  the first asker's follow-ups, its own first ask (the root's server timestamp, and its local
+  send time). Elapsed local time does not depend on clock skew. "Now" is never earlier than the
+  newest server timestamp in the room read. With no anchor, the local clock is used only when
+  it is within 120 s of that newest timestamp; otherwise the ask is refused;
 - each limit is the **smaller** of the thread's marker and the asking agent's own config
   (`--max-*`, env, manifest);
 - a root event with no usable server timestamp refuses the ask.
@@ -174,7 +184,9 @@ Both `answer` and `ask --via-task` first trace the ask, and refuse unless all of
 that is already in this consult's chain, unless it is a follow-up on a link you already asked.
 Refused, answer from what the thread has. Close the ask task with a `[no-send]` result either way.
 Two agents reading the thread at the same moment can each still ask the same agent once; the
-next read sees both. Follow-ups count toward the thread's ask limit.
+next read sees both. Follow-ups count toward the thread's ask limit. The count is checked
+against the thread as last read, not reserved, so asks that race can take a thread past its
+ask limit by up to the number of agents asking at that moment; the next read refuses.
 
 ## Use: an answer arrives as a new task
 
@@ -218,7 +230,8 @@ the room, found by consult id.
 python3 skills/owner-agent-consult/scripts/consult.py pending
 ```
 
-lists unanswered consults oldest first, with `age_s`, `overdue`, `nudge_due` and `expired`. Check it
+lists unanswered consults oldest first, with `age_s`, `overdue`, `nudge_due` and `expired`. An
+expired consult is pruned once its nudge is recorded. Check it
 on your next pass (the proactive loop, or the next task you take). For each `nudge_due`
 consult you started from an owner task, tell the owner once, in the original conversation
 (the record's `origin`), that the agent has not answered and answer from what you hold. For
@@ -253,3 +266,14 @@ owner on this agent's registry row, an unknown own mxid, or this agent not being
 
 Owner aliases: the owner is the single mxid the registry records. A second account of the
 same person in the room is refused.
+
+## Which clock each time check uses
+
+| check | clock | why |
+| --- | --- | --- |
+| thread window (`ask`, and `answer`'s `limit_reached`) | server: anchor event `ts` + local elapsed, floored at the newest server `ts` | crosses agents, so no agent's wall clock may decide it |
+| thread window start | server: the root event's `ts` | the marker's `since` is written by an agent's clock |
+| expiry (`match`, `pending`) | local: this agent's `asked_at` against its own clock | the record and the clock are the same agent's, so skew cancels |
+| nudge due (`pending`) | local, same reason | |
+| a record stamped more than 5 min in the future reads as expired | local, same reason | only a backward jump of this agent's own clock causes it |
+| pruning old answered and nudge records | local, same reason | |

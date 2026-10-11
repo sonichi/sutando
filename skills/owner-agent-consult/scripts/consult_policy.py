@@ -228,7 +228,11 @@ def live_task(task_id: str, workspace: Optional[Path]) -> dict:
     headers = attested_task_headers(text, Path(workspace)).headers
     if headers.get("id") != task_id:
         return no("task does not carry its own id")
-    return {"ok": True, "text": text, "headers": headers, "reason": None}
+    try:
+        arrived = path.stat().st_mtime
+    except OSError:
+        arrived = None
+    return {"ok": True, "text": text, "headers": headers, "arrived_at": arrived, "reason": None}
 
 
 def trusted_task(task_id: str, workspace: Optional[Path]) -> dict:
@@ -302,11 +306,12 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
             expire_after_s: float = DEFAULT_EXPIRE_AFTER_S) -> List[dict]:
     """Unanswered consults, oldest first; `nudge_due` when overdue and the owner was not yet
     told, `expired` past the expiry (match then refuses). Prunes answered and nudge records
-    older than the expiry."""
+    older than the expiry, and an expired consult once the owner has been told."""
     now = time.time() if now is None else now
     for state in ("answered", "nudged"):
         for r in records(workspace, state):
-            if _age(r, now) > expire_after_s:
+            orphan = state == "nudged" and not _record_path(workspace, "pending", r["cid"]).exists()
+            if (state == "answered" or orphan) and _age(r, now) > expire_after_s:
                 _record_path(workspace, state, r["cid"]).unlink(missing_ok=True)
     out = []
     for r in sorted(records(workspace, "pending"), key=lambda r: r.get("asked_at") or 0):
@@ -316,6 +321,10 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
         age = _age(r, now)
         overdue = age >= nudge_after_s
         nudged = _record_path(workspace, "nudged", r["cid"]).exists()
+        if nudged and age > expire_after_s:
+            _record_path(workspace, "pending", r["cid"]).unlink(missing_ok=True)
+            _record_path(workspace, "nudged", r["cid"]).unlink(missing_ok=True)
+            continue
         out.append({**r, "age_s": int(age) if age != float("inf") else None, "overdue": overdue, "nudged": nudged,
                     "nudge_due": overdue and not nudged, "expired": age > expire_after_s})
     return out
@@ -439,8 +448,9 @@ def limit_reached(limits: dict, asks_so_far: int, now: float) -> Optional[str]:
 
 # The consult thread: what every agent reads before it asks or answers
 def thread_view(transport, room: str, root: str) -> dict:
-    """{ok, root_msg, msgs (oldest first)} for the consult thread rooted at `root`,
-    or a refusal when the root is not visible: an unseen thread cannot be checked."""
+    """{ok, root_msg, msgs (oldest first), server_now} for the consult thread rooted at `root`,
+    or a refusal when the root is not visible: an unseen thread cannot be checked. `server_now`
+    is the newest server timestamp in the read, the clock thread limits are measured on."""
     page = transport.read(room, READ_LIMIT)
     if not page.get("ok"):
         return {"ok": False, "reason": f"consult room unreadable: {page.get('reason')}"}
@@ -450,7 +460,35 @@ def thread_view(transport, room: str, root: str) -> dict:
         return {"ok": False, "reason": f"consult thread root {root} is not in the last {READ_LIMIT} "
                                        "messages of the consult room; cannot see the whole thread"}
     inside = [m for m in msgs if m.get("event_id") == root or m.get("thread_root") == root]
-    return {"ok": True, "root_msg": root_msg, "msgs": list(reversed(inside)), "all": msgs}
+    return {"ok": True, "root_msg": root_msg, "msgs": list(reversed(inside)), "all": msgs,
+            "server_now": server_now(msgs)}
+
+
+CLOCK_TOLERANCE_S = 120
+
+
+def measured_now(server_now_s: Optional[float], anchor: tuple, local_now: float) -> Optional[float]:
+    """The current time on the server's clock, without trusting this agent's wall clock.
+    `anchor` is (server ts, local time) of one moment: the event that delivered this agent's
+    ask and that task's arrival here, or this agent's own first ask and its local send time.
+    Elapsed local time since the anchor is skew-free, so now = anchor ts + elapsed, and never
+    earlier than the newest server timestamp read. With no anchor, the local clock is used
+    only when it agrees with the newest server timestamp within CLOCK_TOLERANCE_S; else None."""
+    if server_now_s is None:
+        return None
+    a_server, a_local = anchor if anchor else (None, None)
+    if a_server is not None and a_local is not None:
+        return max(server_now_s, a_server + max(0.0, local_now - a_local))
+    if abs(local_now - server_now_s) > CLOCK_TOLERANCE_S:
+        return None
+    return max(server_now_s, local_now)
+
+
+def server_now(messages: List[dict]) -> Optional[float]:
+    """The newest server timestamp among `messages`, in seconds: a lower bound on the server's
+    current time that no agent's own clock can move. None when no event carries one."""
+    stamps = [t for t in (_ts_seconds(m.get("ts")) for m in messages) if t is not None]
+    return max(stamps) if stamps else None
 
 
 def asks_in(msgs: List[dict], owner_agents) -> List[dict]:
@@ -477,8 +515,9 @@ def loop_check(asks: List[dict], self_mxid: str, target: str) -> Optional[str]:
 def incoming_ask(transport, room: str, self_mxid: str, task_id: str,
                  workspace: Optional[Path], owner_agents) -> dict:
     """The consult ask a live verified task delivered to this agent, traced through the
-    thread to a root ask, which only the verified-owner-task gate posts. Refuses anything
-    whose chain the thread does not show link by link."""
+    thread to a root ask posted by the chain's first agent (one of the owner's agents; whether
+    its owner-task gate ran cannot be checked from here). Refuses anything whose chain the
+    thread does not show link by link."""
     def no(reason):
         return {"ok": False, "reason": reason}
     got = live_task(task_id, workspace)
@@ -523,7 +562,9 @@ def incoming_ask(transport, room: str, self_mxid: str, task_id: str,
                       "the chain does not trace to the root ask")
     return {"ok": True, "cid": ask["cid"], "root": root, "chain": ask["chain"], "asker": sender,
             "ask_event": event, "original_question": ask["original_question"] or first["original_question"],
-            "asks": asks, "limits": first["limits"], "root_msg": view["root_msg"], "reason": None}
+            "asks": asks, "limits": first["limits"], "root_msg": view["root_msg"],
+            "server_now": view["server_now"], "anchor": (_ts_seconds(msg.get("ts")), got["arrived_at"]),
+            "reason": None}
 
 
 # Ask: from a verified owner task, or onward from a consult ask this agent received
@@ -567,11 +608,14 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
         chain = [self_mxid, agent]
         original = (prior or {}).get("original_question") or question.strip()
         limits = {"since": int(clock()), "max_s": int(max_duration_s), "max_asks": int(max_asks)}
-        asks = []
+        asks, now_s = [], clock()  # a first ask opens its own window; nothing to measure yet
         if root:
             view = thread_view(transport, room, root)
             if not view["ok"]:
                 return no(view["reason"])
+            first_own = prior or {}
+            now_s = measured_now(view["server_now"],
+                                 (_ts_seconds(view["root_msg"].get("ts")), first_own.get("asked_at")), clock())
             asks = asks_in(view["msgs"], verdict["owner_agents"] | {self_mxid})
             marker = (parse_ask(view["root_msg"].get("body") or "") or {}).get("limits")
             limits = effective_limits(view["root_msg"], marker, max_duration_s, max_asks)
@@ -582,6 +626,7 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
             return no(inc["reason"])
         root, asks, original = inc["root"], inc["asks"], inc["original_question"]
         limits = effective_limits(inc["root_msg"], inc["limits"], max_duration_s, max_asks)
+        now_s = measured_now(inc["server_now"], inc["anchor"], clock())
         chain = inc["chain"] + [agent]
         via = {"task_id": via_task, "cid": inc["cid"], "asker": inc["asker"],
                "ask_event": inc["ask_event"]}
@@ -590,7 +635,10 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
         return no(refusal)
     if limits is None:
         return no("the consult thread's root event has no server timestamp; cannot apply the thread limits")
-    refusal = limit_reached(limits, len(asks), clock())
+    if now_s is None:
+        return no("cannot measure the thread window on server time: this agent's clock disagrees with "
+                  "the room's newest server timestamp and no anchor is available")
+    refusal = limit_reached(limits, len(asks), now_s)
     if refusal:
         return no(refusal, limit_reached=True)
     if _record_path(workspace, "pending", cid).exists() or _record_path(workspace, "answered", cid).exists():
@@ -658,7 +706,8 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
     if not sent.get("ok"):
         return no(f"answer not posted: {sent.get('reason')}")
     lim = effective_limits(inc["root_msg"], inc["limits"], max_duration_s, max_asks) if inc.get("root_msg") else None
-    reached = limit_reached(lim, len(inc["asks"]), time.time()) if lim else None
+    now_s = measured_now(inc["server_now"], inc["anchor"], time.time()) if lim else None
+    reached = limit_reached(lim, len(inc["asks"]), now_s) if lim and now_s is not None else None
     return {"answered": True, "to": inc["asker"], "cid": inc["cid"], "root": inc["root"],
             "event_id": sent.get("event_id"), "limit_reached": reached, "reason": None}
 
