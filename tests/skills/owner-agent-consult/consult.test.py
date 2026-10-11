@@ -1104,15 +1104,31 @@ class TestDeliveredAtMostOnce(WorldCase):
         first = self.by_task(final=True)
         self.assertEqual((first["matched"], first["reply_text"], first["lead"]), (True, "up", f"[channel: {OWNER_DM}]\n"))
         for again in (self.by_task(final=True), self.by_task(), self.w.m(self.e, final=True), self.w.m(self.e)):
-            self.assertEqual((again["matched"], again.get("answered_by")), (False, self.e), again)
+            self.assertEqual((again["matched"], again.get("answered_by"), again.get("closed_unrelayed")),
+                             (False, self.e, True), again)
             self.assertNotIn("reply_text", again)
         self.assertFalse(hasattr(policy, "_replay"))
 
-    def test_a_task_close_lists_closed_unrelayed_until_the_task_has_a_result(self):
-        self.assertTrue(self.by_task(final=True)["matched"])
-        self.assertEqual(self.unrelayed(), [(C1, self.e)])  # a crash here: reported, not re-delivered
+    def test_close_crash_reemitted_task_result_is_still_listed_until_relayed(self):
+        self.assertTrue(self.by_task(final=True)["matched"])  # then a crash before the relay
+        self.assertTrue((self.w.ws[SELF] / "tasks" / f"{self.tid}.txt").exists())  # re-emitted: still live
+        retry = self.by_task(final=True)
+        self.assertEqual((retry["matched"], retry.get("closed_unrelayed"), retry.get("answered_by")),
+                         (False, True, self.e), retry)
+        self.assertNotIn("reply_text", retry)
+        self.assertIn("tell the owner", retry["reason"])
         (self.w.ws[SELF] / "results" / f"{self.tid}.txt").write_text("[no-send]")
+        self.assertEqual(self.unrelayed(), [(C1, self.e)])  # a result is not an acknowledgement
+        self.assertTrue(policy.mark_relayed(self.w.ws[SELF], C1)["ok"])
         self.assertEqual(self.unrelayed(), [])
+        again = self.w.m(self.e, final=True)
+        self.assertEqual((again["matched"], again.get("closed_unrelayed")), (False, None), again)
+
+    def test_another_message_after_the_close_is_not_told_it_closed_the_consult(self):
+        self.assertTrue(self.by_task(final=True)["matched"])
+        later = self.sib("also fine")
+        got = self.w.m(later, final=True)
+        self.assertEqual((got.get("answered_by"), got.get("closed_unrelayed")), (self.e, None), got)
 
     def test_kewei_2_an_event_close_then_a_crash_is_listed_with_its_event_until_relayed(self):
         self.assertTrue(self.w.m(self.e, final=True)["matched"])
@@ -1125,6 +1141,10 @@ class TestDeliveredAtMostOnce(WorldCase):
             self.assertFalse(self.w.m(self.e, final=True)["matched"])
         shown = policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF], self_mxid=SELF)[C1]
         self.assertEqual(shown, {"event_id": self.e, "text": "up", "bound": "answer"})
+        down = self.w.tr[SELF].read
+        self.w.tr[SELF].read = lambda room, limit: {"ok": False, "reason": "502"}
+        self.assertEqual(policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF], self_mxid=SELF), {C1: shown})
+        self.w.tr[SELF].read = down
         self.assertTrue(self.w.m(self.e, final=True)["matched"])
         self.assertEqual(self.unrelayed(), [(C1, self.e)])
 

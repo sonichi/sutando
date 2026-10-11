@@ -103,7 +103,8 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
             j.add_argument("--not-final", action="store_true",
                            help="you read the reply as progress, not the answer")
         if name == "relayed":
-            s.add_argument("cid", help="a consult matched by --event-id, now relayed to the owner")
+            s.add_argument("cid", help="a closed consult whose answer you relayed, or whose possible loss you "
+                                       "told the owner (clears closed_unrelayed; the only acknowledgement)")
         if name == "pending":
             s.add_argument("--nudged", default=None, metavar="CID",
                            help="record that the owner was told this consult is unanswered")
