@@ -434,6 +434,8 @@ TASK_MEDIA_FILE = _STATE / f"remote-task-media{_INST_SUFFIX}.json"
 # Acks the gateway has not confirmed yet, with the durability each one may claim.
 # The outbound worker retries them; a closed lease retires the record.
 PENDING_ACK_FILE = _STATE / f"remote-task-acks{_INST_SUFFIX}.json"
+# A served `lease_id` longer than this is not echoed: the ack goes without one.
+LEASE_ID_MAX = 256
 # Re-asked task id -> the id the broker is waiting on. A dedup re-ask gets a
 # fresh local id, but the delivery it answers is still the original one.
 DEDUP_ALIAS_FILE = _STATE / f"remote-dedup-alias{_INST_SUFFIX}.json"
@@ -2350,9 +2352,9 @@ def _recover_auth(code: int) -> bool:
             return True
 
 
-def _load_pending_acks() -> "dict[str, bool]":
-    """Acks the gateway never confirmed, mapped to the durability each may
-    claim (fail-open to empty: a lost ledger only costs a redelivery)."""
+def _read_ack_ledger() -> dict:
+    """Raw pending-ack ledger: {tid: durable} or, for a task served with a
+    lease generation, {tid: {"durable", "lease_id"}} (fail-open to empty)."""
     try:
         data = json.loads(PENDING_ACK_FILE.read_text())
     except FileNotFoundError:
@@ -2360,21 +2362,49 @@ def _load_pending_acks() -> "dict[str, bool]":
     except Exception as e:  # noqa: BLE001
         _log(f"pending-ack file unreadable ({e}) — starting empty")
         return {}
-    return {str(k): bool(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    return {str(k): v for k, v in data.items()} if isinstance(data, dict) else {}
 
 
-def _record_pending_acks(pending: "list[tuple[str, bool]]") -> bool:
+def _ack_entry(v) -> "tuple[bool, str | None]":
+    """One ledger value → (durable, lease_id); a bare bool is a lease-less entry."""
+    if isinstance(v, dict):
+        return bool(v.get("durable")), _lease_id_of(v)
+    return bool(v), None
+
+
+def _lease_id_of(d: dict) -> "str | None":
+    """The broker's lease generation when the dict names a usable one."""
+    lease = d.get("lease_id")
+    return lease if isinstance(lease, str) and 0 < len(lease) <= LEASE_ID_MAX else None
+
+
+def _load_pending_acks() -> "dict[str, bool]":
+    """Acks the gateway never confirmed, mapped to the durability each may
+    claim (fail-open to empty: a lost ledger only costs a redelivery)."""
+    return {k: _ack_entry(v)[0] for k, v in _read_ack_ledger().items()}
+
+
+def _load_pending_leases() -> "dict[str, str]":
+    """The lease generation each pending ack was served under, where known."""
+    leases = {k: _ack_entry(v)[1] for k, v in _read_ack_ledger().items()}
+    return {k: v for k, v in leases.items() if v}
+
+
+def _record_pending_acks(pending: "list[tuple]") -> bool:
     """Commit this round's acks before any of them is posted, so a crash between
-    ack and confirmation still leaves a ledger to retry from."""
+    ack and confirmation still leaves a ledger to retry from. Each entry is
+    (tid, durable) or (tid, durable, lease_id)."""
     with _PENDING_ACK_MUTEX:
-        acks = _load_pending_acks()
-        acks.update(dict(pending))
+        acks = _read_ack_ledger()
+        for entry in pending:
+            tid, durable, lease = (tuple(entry) + (None,))[:3]
+            acks[tid] = {"durable": bool(durable), "lease_id": lease} if lease else bool(durable)
         return _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True))
 
 
 def _forget_pending_ack(tid: str) -> None:
     with _PENDING_ACK_MUTEX:
-        acks = _load_pending_acks()
+        acks = _read_ack_ledger()
         if acks.pop(tid, None) is not None:
             _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True))
 
@@ -2385,17 +2415,20 @@ def _retry_pending_acks(inflight: "set[str]") -> None:
     That inference needs a TRUSTWORTHY in-flight set. When the restore degraded
     the set is empty-because-unknown, so post instead and let the gateway's
     'not leased' 404 retire the lease it actually closed."""
+    leases = _load_pending_leases()
     for tid, durable in sorted(_load_pending_acks().items()):
         if tid not in inflight and not _INFLIGHT_DEGRADED:
             _forget_pending_ack(tid)
             continue
-        _post_task_ack(tid, durable)
+        _post_task_ack(tid, durable, leases.get(tid))
 
 
-def _post_task_ack(tid: str, durable: bool = False) -> bool:
+def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = None) -> bool:
     """Tell the gateway a task made it safely into the local queue. `durable`
     says the task file, its media sidecar and the in-flight set are all fsync'd,
-    which is the only thing that lets the relay call the task accepted."""
+    which is the only thing that lets the relay call the task accepted.
+    `lease_id` echoes the generation the task was served under; absent for a
+    broker that served none."""
     global _ack_disabled_until
     # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
     # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
@@ -2407,6 +2440,8 @@ def _post_task_ack(tid: str, durable: bool = False) -> bool:
         wire_tid = _broker_tid(tid)
         safe_tid = urllib.parse.quote(wire_tid, safe="")
         body = {"id": wire_tid}
+        if lease_id:
+            body["lease_id"] = lease_id
         if durable:
             body["durable"] = True
         _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10)
@@ -2417,7 +2452,11 @@ def _post_task_ack(tid: str, durable: bool = False) -> bool:
         if e.code in (404, 405):
             # A 404/405 is ambiguous. The pre-/ack broker returns a bare no-route
             # 404/405 → the endpoint is UNSUPPORTED: back off (cooldown) and retry
-            if e.code == 404 and "not leased" in _http_error_body(e).lower():
+            reason = _http_error_body(e).lower() if e.code == 404 else ""
+            if "not leased" in reason:
+                if "stale lease generation" in reason:
+                    _log(f"task ack for {tid} named a superseded lease generation "
+                         "— the broker re-serves it; not retrying")
                 _forget_pending_ack(tid)  # terminal: the lease is gone for good
                 return False   # per-task lease gone — keep acking the rest
             _ack_disabled_until = time.time() + ACK_UNSUPPORTED_COOLDOWN
@@ -5490,14 +5529,14 @@ def main() -> None:
                     if tid not in inflight:
                         inflight.add(tid)
                         added = True
-                    pending_ack.append((tid, durable))
+                    pending_ack.append((tid, durable, _lease_id_of(task)))
             # Ack only after task file, in-flight set and ack ledger are durable;
             # any failure withholds every ack this round, redeliveries included.
             committed = _save_inflight(inflight) if pending_ack else True
             if pending_ack and committed:
                 committed = _record_pending_acks(pending_ack)
-            for tid, durable in pending_ack if committed else ():
-                _post_task_ack(tid, durable)
+            for tid, durable, lease in pending_ack if committed else ():
+                _post_task_ack(tid, durable, lease)
             if added:
                 wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
