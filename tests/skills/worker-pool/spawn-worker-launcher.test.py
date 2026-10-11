@@ -269,6 +269,21 @@ class TestSpawn(Base):
         self.assertEqual(env["SUTANDO_CLAUDE_SESSION_ID"], got["runtime_session_id"])
         self.assertFalse(any("send-keys" in c for c in t.calls))
 
+    def test_the_worker_stamps_its_own_id_not_the_cores(self):
+        """Direct posts (say/mention/notify) stamp SUTANDO_WORKER_ID, falling back
+        to worker-<SUTANDO_CORE_ID>; pool delivery stamps the bare worker id. A
+        core id inherited from the spawner made the two paths name two workers."""
+        t = FakeTmux()
+        with mock.patch.dict(os.environ, {"SUTANDO_CORE_ID": "legacy",
+                                          "SUTANDO_CORE_POOL_SIZE": "3",
+                                          "SUTANDO_WORKER_SEAT": "2"}):
+            got = sw.spawn(self.ws, REPO, runner=t, require_sentinel=False)
+        env = t.launches()[0]
+        self.assertEqual(env["SUTANDO_WORKER_ID"], got["worker_id"])
+        self.assertEqual(env["SUTANDO_WORKER_ID"], env["SUTANDO_INSTANCE_ID"])
+        for core_only in ("SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_WORKER_SEAT"):
+            self.assertNotIn(core_only, env)
+
     def test_the_delivery_folder_matches_the_identity_record(self):
         """A record naming one id and a folder named another is a silent orphan."""
         got = sw.spawn(self.ws, REPO, runner=FakeTmux(), require_sentinel=False)

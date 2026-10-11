@@ -290,9 +290,10 @@ def ensure_supervisor(workspace, repo, worker_id, *, runner=None) -> dict:
     if runtime not in sw.WORKER_MODE_RUNTIMES:
         return {"worker_id": worker_id, "outcome": INDETERMINATE,
                 "why": f"unknown worker runtime {runtime!r}"}
-    env = {**os.environ,
+    env = {**sw.inherited_env(),
            "SUTANDO_PY": sys.executable,
            "SUTANDO_INSTANCE_ID": worker_id,
+           "SUTANDO_WORKER_ID": worker_id,
            "SUTANDO_WORKER_RUNTIME": runtime,
            "SUTANDO_TASKS_DIR": str(pd.deliveries_dir(workspace, worker_id)),
            "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),

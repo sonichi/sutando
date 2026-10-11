@@ -72,6 +72,9 @@ ENV_ARGS=(-e SUTANDO_CORE_RUNTIME=claude -e SUTANDO_CORE_SESSION=)
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
 ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SESSION")
 ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
+ENV_ARGS+=(-e "SUTANDO_WORKER_ID=${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}")
+# Explicit empties: the core's ids are tmux server-global, so only -e clears them here.
+ENV_ARGS+=(-e SUTANDO_CORE_ID= -e SUTANDO_CORE_POOL_SIZE= -e SUTANDO_WORKER_SEAT=)
 [ -n "${SUTANDO_TASKS_DIR:-}" ] && ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
 # A worker's inbox is <ws>/deliveries/<id>, so the watcher cannot infer the
 # workspace from it: unforwarded, its results/ and state/ land under deliveries/.
