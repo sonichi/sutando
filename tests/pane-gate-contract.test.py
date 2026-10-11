@@ -1416,5 +1416,31 @@ class AStaleLimitBannerYieldsToTheProxyRecord(unittest.TestCase):
             v = pg.classify_pane(self.PANE, pg.CLAUDE, None, self.socket, self.session)
         self.assertEqual(v.reason, "quota-limit")
 
+
+class AUsageLimitBannerTheSeatHasOutrun(unittest.TestCase):
+    """The CLI's "Usage limit reached · … / Continuing automatically at …" banner is its own
+    gate kind, and a turn that finishes after it was first seen makes it stale."""
+
+    PANE = ("✻ Churned for 27s · done 1:55 PM\n"
+            "──────── sutando-worker ─\n❯ \n────────\n"
+            "  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+            "    Continuing automatically at Oct 13 at 11pm · esc to cancel\n"
+            "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents\n")
+    LATER = PANE.replace("done 1:55 PM\n", "done 1:55 PM\n✻ Brewed for 22s · done 1:58 PM\n")
+
+    def test_the_banner_is_a_named_gate_not_unlisted(self):
+        v = pg.classify_pane(self.PANE, pg.CLAUDE, "/nonexistent-ws")
+        self.assertEqual((v.state, v.reason), ("busy", "usage-limit"))
+
+    def test_a_turn_finished_after_first_sight_makes_it_stale(self):
+        abn = pg.frame_abnormal(self.LATER)
+        self.assertEqual(abn.kind, "provider-limit")
+        base = pg.finished_turns(self.PANE)
+        self.assertTrue(pg.limit_is_stale(abn, "/nonexistent-ws", None, None,
+                                          capture=self.LATER, baseline=base))
+        self.assertFalse(pg.limit_is_stale(abn, "/nonexistent-ws", None, None,
+                                           capture=self.PANE, baseline=base))
+        self.assertFalse(pg.limit_is_stale(abn, "/nonexistent-ws", None, None))
+
 if __name__ == "__main__":
     unittest.main()

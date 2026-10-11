@@ -1634,5 +1634,91 @@ class TestMainOnce(unittest.TestCase):
         self.assertEqual(sig["state"], "running")
 
 
+# A worker pane captured live 2026-10-11 (worker 17c6c322): a stale usage-limit banner under
+# the composer while turns kept finishing, with the CLI's optional feedback survey above it.
+_SURVEY = ("● How is Claude doing this session? (optional)\n"
+           "  1: Bad    2: Fine   3: Good   0: Dismiss\n"
+           "                                        ✔ Update installed · Restart to update\n")
+_WORKER_FOOTER = ("──────── sutando-worker-17c6c322 ─\n❯ \n────────\n")
+_LIMIT_BANNER = ("  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+                 "    Continuing automatically at Oct 13 at 11pm · esc to cancel\n")
+_BYPASS_FOOTER = "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents · ↓ to manage"
+_EARLIER_TURN = ("⏺ The task watcher on my inbox hit its 30-minute limit, so I restarted it.\n"
+                 "✻ Churned for 27s · done 1:55 PM · 1 monitor still running\n")
+_LATER_TURN = ("⏺ Monitor(Streaming task watcher (worker 17c6c322 inbox))\n"
+               "  ⎿  Monitor started · task bz8oy6aip · timeout 1800s\n"
+               "✻ Brewed for 22s · done 1:58 PM · 1 monitor still running\n")
+_LIVE_BEFORE = _EARLIER_TURN + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+_LIVE_PANE = _EARLIER_TURN + _LATER_TURN + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+
+
+class TestStaleLimitBanner(unittest.TestCase):
+    """A usage-limit banner the seat has outrun (a turn finished after it was first seen)
+    is not a block; one with no later turn is a session-limit gate, never `unknown`."""
+
+    def _compose(self, pane, before):
+        stale, baseline = _mod.limit_step(before, None, "/nonexistent-ws")
+        self.assertFalse(stale)
+        stale, _ = _mod.limit_step(pane, baseline, "/nonexistent-ws")
+        return compose_state(pane, "idle", True, limit_stale=stale)
+
+    def test_live_pane_with_turns_finishing_under_the_banner_is_not_blocked(self):
+        state = self._compose(_LIVE_PANE, _LIVE_BEFORE)
+        self.assertEqual(state[0], "idle-ready")
+
+    def test_banner_with_no_later_turn_escalates_as_a_usage_limit(self):
+        state = self._compose(_LIVE_BEFORE, _LIVE_BEFORE)
+        self.assertEqual(state[:2], ("blocked-human", "awaiting user: usage-limit"))
+        self.assertEqual(state[3], "usage-limit")
+        self.assertIsNone(auto_answer("usage-limit"))
+
+    def test_first_sight_of_the_banner_is_never_stale(self):
+        stale, _ = _mod.limit_step(_LIVE_PANE, None, "/nonexistent-ws")
+        self.assertFalse(stale)
+        self.assertEqual(compose_state(_LIVE_PANE, "idle", True)[3], "usage-limit")
+
+    def test_the_wait_line_alone_is_a_usage_limit_never_unknown(self):
+        pane = _WORKER_FOOTER + "    Continuing automatically at 11pm · esc to cancel\n" + _BYPASS_FOOTER
+        self.assertEqual(classify(pane)[0], "usage-limit")
+
+    def test_the_wait_line_under_hit_your_session_limit_stays_session_limit(self):
+        self.assertEqual(classify(_SESSION_LIMIT)[0], "session-limit")
+
+    def test_a_refused_turn_under_the_banner_is_no_evidence(self):
+        refused = "❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 1s · done 2:01 PM\n"
+        pane = _EARLIER_TURN + refused + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+        stale, _ = _mod.limit_step(pane, _mod.finished_turns(_LIVE_BEFORE), "/nonexistent-ws")
+        self.assertFalse(stale)
+
+    def test_a_changed_suffix_on_the_same_turn_is_not_a_new_turn(self):
+        pane = _LIVE_BEFORE.replace("1 monitor still running", "2 monitors still running")
+        stale, _ = _mod.limit_step(pane, _mod.finished_turns(_LIVE_BEFORE), "/nonexistent-ws")
+        self.assertFalse(stale)
+
+    def test_stale_banner_never_hides_a_real_prompt_below_the_survey(self):
+        pane = (_EARLIER_TURN + _LATER_TURN + _SURVEY
+                + "  Do you want to proceed?\n  Allow this action\n  Esc to cancel\n"
+                + _LIMIT_BANNER + _BYPASS_FOOTER)
+        stale, _ = _mod.limit_step(pane, _mod.finished_turns(_LIVE_BEFORE), "/nonexistent-ws")
+        self.assertTrue(stale)
+        self.assertEqual(compose_state(pane, "idle", True, limit_stale=stale)[:2],
+                         ("blocked-human", "awaiting user: permission"))
+
+    def test_the_room_notice_reads_a_usage_limit(self):
+        import core_gate_notice
+        self.assertEqual(core_gate_notice.reason("blocked-human", "usage-limit"), "it hit a usage limit")
+
+    def test_survey_alone_is_unchanged(self):
+        self.assertIsNone(classify(_EARLIER_TURN + _SURVEY + _WORKER_FOOTER + _BYPASS_FOOTER))
+
+    def test_survey_with_a_real_permission_prompt_below_still_escalates(self):
+        pane = _SURVEY + "  Do you want to proceed?\n  Allow this action\n  Esc to cancel\n" + _BYPASS_FOOTER
+        self.assertEqual(classify(pane)[0], "permission")
+
+    def test_non_limit_abnormal_lines_are_never_stripped(self):
+        pane = "Paste code here if prompted >\n" + _LIMIT_BANNER
+        self.assertIn("Paste code here", _mod.strip_limit_banners(pane))
+
+
 if __name__ == "__main__":
     unittest.main()

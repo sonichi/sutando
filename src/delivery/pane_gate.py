@@ -84,11 +84,19 @@ def state_is_unsafe(state: str) -> bool:
 # ---- Claude Code pane text. core-input-watch.py imports these three; edit here only.
 FABLE_TEXT = re.compile(r"reached your Fable limit|included Fable usage for this week", re.I)
 CLAUDE_IDLE = re.compile(r"⏵⏵\s*bypass permissions on|←\s*for agents\b", re.I)
+# The CLI's wait-for-the-reset banner ("Usage limit reached · …", "Continuing automatically at …").
+LIMIT_WAIT = re.compile(r"Continuing automatically at\b|\b(?:session|usage|weekly) limit reached\b", re.I)
+# A completed turn ("✻ Cooked for 1s · done 12:32 PM"); the spinner reuses the glyph and must not match.
+TURN_DONE = re.compile(
+    r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
+#: A turn this short (or with no duration) may be the CLI refusing it, not running it.
+TURN_SHORT = re.compile(r"[01]s")
 # First match classifies; the idle "❯ " prompt matches none of them.
 CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
     ("fable-limit", re.compile(r"❯\s*Switch to .{1,80}? and continue", re.I)),
     ("fable-limit-unfocused", FABLE_TEXT),
     ("session-limit", re.compile(r"hit your (?:session|usage|weekly) limit", re.I)),
+    ("usage-limit", LIMIT_WAIT),
     ("folder-trust", re.compile(r"trust the files in this folder|Do you trust", re.I)),
     ("bypass-permissions", re.compile(r"Bypass Permissions mode|Yes, I accept", re.I)),
     ("login", re.compile(r"Select login method|Paste code here|Browser didn'?t open", re.I)),
@@ -100,10 +108,6 @@ CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
 AWAIT_HINT = re.compile(
     r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
     r"|Continuing automatically|❯\s*\d+\.", re.I)
-# The completed-turn line: "✻ Worked for 0s" / "✻ Cooked for 1s · done 12:32 PM". The spinner
-# reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
-TURN_DONE = re.compile(
-    r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
 # A turn's spinner ("✳ Moonwalking… (15s · …)") or completion line: transcript above, live dialog
 # below. Not "esc to interrupt": the busy footer carries it, under any live dialog.
 _SPINNER_ROW = re.compile(r"^\s*[·✢✳✶✻✽*]\s+[A-Za-z][\w-]*(?:…|\.\.\.)\s*\(")
@@ -433,16 +437,39 @@ def accepts_input(verdict: Verdict) -> bool:
     return verdict.state == "busy" and verdict.reason == "working"
 
 
-def _limit_is_stale(abn, workspace, socket, session, probe=False) -> bool:
-    """A quota-only banner beside a FRESH proxy record that says accepted, on a seat
-    whose own traffic is ROUTED through that proxy, is a line from before the reset:
-    scrollback, not a hold. Anything else keeps the hold -- another abnormal family,
-    an unrouted or unobserved seat, or a record absent, stale or rejected. A retry
-    never reaches here: classify_pane returns on it before any gate."""
-    if abn.kind != "provider-limit":
+def finished_turns(capture: str) -> frozenset:
+    """The completed turns on screen that ran (longer than a refusal), keyed by their
+    `✻ … done <time>` text so a changing suffix ("1 monitor still running") is the same turn."""
+    keys = set()
+    for ln in (capture or "").splitlines():
+        m = TURN_DONE.match(_SGR.sub("", ln))
+        if m and m.group("dur") and not TURN_SHORT.fullmatch(m.group("dur")):
+            keys.add(re.sub(r"(\bdone\s+\S+(?:\s*[AP]M)?).*", r"\1", m.group(0).strip()))
+    return frozenset(keys)
+
+
+def strip_limit_banners(capture: str) -> str:
+    """`capture` without its limit-banner lines, for a caller that has judged them stale."""
+    def _limit_only(ln):
+        abn = frame_abnormal(_SGR.sub("", ln))
+        return abn is not None and all(n in PROVIDER_LIMIT_PATTERNS for n in abn.names)
+    return "\n".join(ln for ln in capture.splitlines()
+                     if not (LIMIT_WAIT.search(ln) or _limit_only(ln)))
+
+
+def limit_is_stale(abn, workspace, socket, session, probe=False, capture=None, baseline=None) -> bool:
+    """A quota-only banner is a line from before the reset, scrollback, not a hold, when
+    the seat shows it is not held: a turn finished that `baseline` (the finished_turns of
+    the first capture showing the banner) did not hold, or a FRESH proxy record says
+    accepted for a seat ROUTED through that proxy. Anything else keeps the hold -- another
+    abnormal family, no newer turn, an unrouted or unobserved seat, or a record absent,
+    stale or rejected. A retry never reaches here: classify_pane returns on it before any gate."""
+    if abn is None or abn.kind != "provider-limit":
         return False
     if any(n not in PROVIDER_LIMIT_PATTERNS for n in abn.names):
         return False
+    if capture is not None and baseline is not None and finished_turns(capture) - baseline:
+        return True
     try:
         ws = workspace if workspace is not None else resolve_workspace()
         return provider_allows_now(ws, socket, session, probe=probe)
@@ -474,7 +501,7 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
     gate = _gate(capture, "\n".join(_SGR.sub("", ln) for ln in live_tail(lines)), line, adapter)
     if gate:
         return Verdict("busy", gate)
-    if abn and not _limit_is_stale(abn, workspace, socket, session, probe):
+    if abn and not limit_is_stale(abn, workspace, socket, session, probe):
         return Verdict("abnormal", ",".join(abn.names))
     if frame_working(tail):
         return Verdict("busy", "working")
