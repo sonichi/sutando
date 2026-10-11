@@ -569,7 +569,10 @@ def main() -> int:
         ("", False),
         ("[channel: 123]\nx", False),
         ("[file: /etc/passwd]", False),
-        ("[dm-only]\n[no-send]\nx", False),
+        # A skip directly after the leading markers is a skip (parse_markers): nothing is delivered.
+        ("[dm-only]\n[no-send]\nx", True),
+        ("[channel: 123]\n[no-send]\nx", False),
+        ("[channel: 123]\nx [no-send]", False),
     ):
         assert guard.is_suppression_only(body) is expect, (body, expect)
         if expect:

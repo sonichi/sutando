@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -242,6 +243,79 @@ class SingletonGlueTest(unittest.TestCase):
             self.assertTrue(rgb._acquire_singleton())    # error → proceed to poll (fail-open)
         finally:
             rgb._ws_acquire = orig
+
+    def _with_signal_sinks(self, stdout):
+        """Route the handler's two sinks: stdout to `stdout`, the file line to a
+        list. Returns the list."""
+        lines = []
+        saved = (sys.stdout, rgb._append_log_file)
+        sys.stdout, rgb._append_log_file = stdout, lines.append
+        self.addCleanup(lambda: setattr(sys, "stdout", saved[0]))
+        self.addCleanup(setattr, rgb, "_append_log_file", saved[1])
+        return lines
+
+    def test_signal_exit_names_the_signal_and_exits_0(self):
+        import io
+        out = io.StringIO()
+        lines = self._with_signal_sinks(out)
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_on_signal(signal.SIGTERM, None)
+        self.assertEqual(ctx.exception.code, 0)
+        want = "[remote-gateway-bridge] received SIGTERM — exiting"
+        self.assertEqual(lines, [want])
+        self.assertEqual(out.getvalue(), want + "\n")
+
+    def test_signal_exit_logs_the_file_line_when_print_is_reentrant(self):
+        # The signal landed inside print: the next print raises, as the
+        # BufferedWriter does on re-entry. The file line must still be written.
+        class Reentrant:
+            def write(self, _data):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter>")
+
+            def flush(self):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter>")
+        lines = self._with_signal_sinks(Reentrant())
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_on_signal(signal.SIGINT, None)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(lines, ["[remote-gateway-bridge] received SIGINT — exiting"])
+
+    def test_signal_exit_survives_a_closed_stdout_fd(self):
+        # Both stdout sinks refuse (stream re-entry, then the raw fd): the file
+        # line is still written and the exit is still 0.
+        class Reentrant:
+            def write(self, _data):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter>")
+
+            def flush(self):
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter>")
+
+        class NoFd:
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+            @staticmethod
+            def write(_fd, _data):
+                raise OSError(9, "Bad file descriptor")
+        lines = self._with_signal_sinks(Reentrant())
+        rgb.os = NoFd()
+        self.addCleanup(setattr, rgb, "os", os)
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_on_signal(signal.SIGTERM, None)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertEqual(lines, ["[remote-gateway-bridge] received SIGTERM — exiting"])
+
+    def test_signal_exit_survives_a_failing_log(self):
+        def boom(_line):
+            raise OSError("disk gone")
+        import io
+        out = io.StringIO()
+        self._with_signal_sinks(out)
+        rgb._append_log_file = boom
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_on_signal(signal.SIGINT, None)
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("received SIGINT — exiting", out.getvalue())
 
 
 if __name__ == "__main__":

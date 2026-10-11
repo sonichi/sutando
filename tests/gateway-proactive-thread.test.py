@@ -10,6 +10,7 @@ The send uses the same `thread_root` op:message field `room_ops.py say
   d) malformed [thread: x]             -> top level, logged, marker never posted
   e) [dm-only] + [channel:] + [thread:] -> owner DM, top level (the root is the room's)
   f) voice shape [channel: origin] + [thread:] + [channel: X] -> origin, top level
+  g) bare [thread] above [thread: $root] -> the rooted form wins, in either order
 
 Imports the vendored module with an isolated env; never execs the wrapper.
 Run: python3 tests/gateway-proactive-thread.test.py
@@ -116,6 +117,13 @@ def main() -> int:
     check(p and "thread_root" not in p, f"f) X's root never posted in the origin, got {p}")
     check(p.get("body") == "update", f"f) body clean, got {p.get('body')!r}")
     check(any("may not be in the destination room" in line for line in logs), f"f) dropped root logged, got {logs}")
+
+    for order, body in (("ask-first", f"[channel: {ROOM}]\n[thread]\n[thread: {ROOT}]\nupdate\n"),
+                        ("root-first", f"[channel: {ROOM}]\n[thread: {ROOT}]\n[thread]\nupdate\n")):
+        posts, _ = drain(body)
+        p = posts[0] if posts else {}
+        check(p.get("thread_root") == ROOT, f"g) {order}: the rooted form wins, got {p.get('thread_root')!r}")
+        check(p.get("body") == "update", f"g) {order}: body clean, got {p.get('body')!r}")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0
