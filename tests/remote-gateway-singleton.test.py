@@ -155,6 +155,24 @@ class SingletonGlueTest(unittest.TestCase):
         self.assertEqual(held["pid"], os.getpid())       # still held, never released
         self.assertNotIn("retained", held)
 
+    def test_a_held_exit_logs_a_failed_retain_and_returns(self):
+        import io
+        lines = self._with_signal_sinks(io.StringIO())
+        self.assertTrue(rgb._acquire_singleton())
+        orig_join, orig_retain = rgb._join_push_thread, rgb._ws_retain
+        rgb._join_push_thread = lambda *a, **k: False
+
+        def boom(*a, **k):
+            raise OSError("locks dir unwritable")
+        rgb._ws_retain = boom
+        try:
+            rgb._release_singleton()
+        finally:
+            rgb._join_push_thread, rgb._ws_retain = orig_join, orig_retain
+        failed = [l for l in lines if "singleton: retain failed (locks dir unwritable)" in l]
+        self.assertEqual(len(failed), 1, lines)
+        self.assertEqual(json.loads(self._lockfile().read_text())["pid"], os.getpid())
+
     def test_fail_open_on_acquire_error(self):
         orig = rgb._ws_acquire
 

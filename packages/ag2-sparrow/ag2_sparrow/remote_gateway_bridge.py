@@ -437,6 +437,8 @@ TASK_MEDIA_FILE = _STATE / f"remote-task-media{_INST_SUFFIX}.json"
 # Acks the gateway has not confirmed yet, with the durability each one may claim.
 # The outbound worker retries them; a closed lease retires the record.
 PENDING_ACK_FILE = _STATE / f"remote-task-acks{_INST_SUFFIX}.json"
+# A served `lease_id` longer than this is not echoed: the ack goes without one.
+LEASE_ID_MAX = 256
 # Re-asked task id -> the id the broker is waiting on. A dedup re-ask gets a
 # fresh local id, but the delivery it answers is still the original one.
 DEDUP_ALIAS_FILE = _STATE / f"remote-dedup-alias{_INST_SUFFIX}.json"
@@ -2359,33 +2361,78 @@ def _recover_auth(code: int) -> bool:
             return True
 
 
-def _load_pending_acks() -> "dict[str, bool]":
-    """Acks the gateway never confirmed, mapped to the durability each may
-    claim (fail-open to empty: a lost ledger only costs a redelivery)."""
+def _ack_lease_file() -> Path:
+    # Beside the ledger, not in it: an older Sparrow reads each ledger value as bool(v).
+    return PENDING_ACK_FILE.with_name(f"{PENDING_ACK_FILE.stem}-leases.json")
+
+
+def _read_ack_json(path: Path) -> dict:
+    """One pending-ack file as a dict (fail-open to empty)."""
     try:
-        data = json.loads(PENDING_ACK_FILE.read_text())
+        data = json.loads(path.read_text())
     except FileNotFoundError:
         return {}
     except Exception as e:  # noqa: BLE001
-        _log(f"pending-ack file unreadable ({e}) — starting empty")
+        _log(f"pending-ack file {path.name} unreadable ({e}) — starting empty")
         return {}
-    return {str(k): bool(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    return {str(k): v for k, v in data.items()} if isinstance(data, dict) else {}
 
 
-def _record_pending_acks(pending: "list[tuple[str, bool]]") -> bool:
+def _lease_id_of(d: dict) -> "str | None":
+    """The broker's lease generation when the dict names a usable one."""
+    lease = d.get("lease_id")
+    return lease if isinstance(lease, str) and 0 < len(lease) <= LEASE_ID_MAX else None
+
+
+def _load_pending_acks() -> "dict[str, bool]":
+    """Acks the gateway never confirmed, mapped to the durability each may
+    claim (fail-open to empty: a lost ledger only costs a redelivery)."""
+    return {k: bool(v) for k, v in _read_ack_json(PENDING_ACK_FILE).items()}
+
+
+def _load_pending_leases() -> "dict[str, str]":
+    """The lease generation each pending ack was served under, where known."""
+    acks = _read_ack_json(PENDING_ACK_FILE)
+    leases = {k: _lease_id_of({"lease_id": v})
+              for k, v in _read_ack_json(_ack_lease_file()).items() if k in acks}
+    return {k: v for k, v in leases.items() if v}
+
+
+def _record_pending_acks(pending: "list[tuple]") -> bool:
     """Commit this round's acks before any of them is posted, so a crash between
-    ack and confirmation still leaves a ledger to retry from."""
+    ack and confirmation still leaves a ledger to retry from. Each entry is
+    (tid, durable) or (tid, durable, lease_id). The lease file commits first, so
+    the ledger never names a leased task whose generation is not on disk."""
     with _PENDING_ACK_MUTEX:
         acks = _load_pending_acks()
-        acks.update(dict(pending))
+        stored = _read_ack_json(_ack_lease_file())
+        leases = dict(stored)
+        for entry in pending:
+            tid, durable, lease = (tuple(entry) + (None,))[:3]
+            acks[tid] = bool(durable)
+            if lease:
+                leases[tid] = lease
+            else:
+                leases.pop(tid, None)
+        leases = {k: v for k, v in leases.items() if k in acks}
+        if leases != stored and not _durable_write(
+                _ack_lease_file(), json.dumps(leases, sort_keys=True)):
+            return False
         return _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True))
 
 
-def _forget_pending_ack(tid: str) -> None:
+def _forget_pending_ack(tid: str, lease_id: "str | None" = None) -> None:
+    """Retire tid's record only while it still names `lease_id`: a newer serve
+    re-recorded under another generation keeps its own record."""
     with _PENDING_ACK_MUTEX:
         acks = _load_pending_acks()
-        if acks.pop(tid, None) is not None:
-            _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True))
+        leases = _read_ack_json(_ack_lease_file())
+        if tid not in acks or _lease_id_of({"lease_id": leases.get(tid)}) != lease_id:
+            return
+        acks.pop(tid)
+        if _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True)) \
+                and leases.pop(tid, None) is not None:
+            _durable_write(_ack_lease_file(), json.dumps(leases, sort_keys=True))
 
 
 def _retry_pending_acks(inflight: "set[str]") -> None:
@@ -2394,17 +2441,20 @@ def _retry_pending_acks(inflight: "set[str]") -> None:
     That inference needs a TRUSTWORTHY in-flight set. When the restore degraded
     the set is empty-because-unknown, so post instead and let the gateway's
     'not leased' 404 retire the lease it actually closed."""
+    leases = _load_pending_leases()
     for tid, durable in sorted(_load_pending_acks().items()):
         if tid not in inflight and not _INFLIGHT_DEGRADED:
-            _forget_pending_ack(tid)
+            _forget_pending_ack(tid, leases.get(tid))
             continue
-        _post_task_ack(tid, durable)
+        _post_task_ack(tid, durable, leases.get(tid))
 
 
-def _post_task_ack(tid: str, durable: bool = False) -> bool:
+def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = None) -> bool:
     """Tell the gateway a task made it safely into the local queue. `durable`
     says the task file, its media sidecar and the in-flight set are all fsync'd,
-    which is the only thing that lets the relay call the task accepted."""
+    which is the only thing that lets the relay call the task accepted.
+    `lease_id` echoes the generation the task was served under; absent for a
+    broker that served none."""
     global _ack_disabled_until
     # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
     # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
@@ -2416,18 +2466,24 @@ def _post_task_ack(tid: str, durable: bool = False) -> bool:
         wire_tid = _broker_tid(tid)
         safe_tid = urllib.parse.quote(wire_tid, safe="")
         body = {"id": wire_tid}
+        if lease_id:
+            body["lease_id"] = lease_id
         if durable:
             body["durable"] = True
         _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
-        _forget_pending_ack(tid)
+        _forget_pending_ack(tid, lease_id)
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
             # A 404/405 is ambiguous. The pre-/ack broker returns a bare no-route
             # 404/405 → the endpoint is UNSUPPORTED: back off (cooldown) and retry
-            if e.code == 404 and "not leased" in _http_error_body(e).lower():
-                _forget_pending_ack(tid)  # terminal: the lease is gone for good
+            reason = _http_error_body(e).lower() if e.code == 404 else ""
+            if "not leased" in reason:
+                if "stale lease generation" in reason:
+                    _log(f"task ack for {tid} named a superseded lease generation "
+                         "— the broker re-serves it; not retrying")
+                _forget_pending_ack(tid, lease_id)  # terminal: the lease is gone for good
                 return False   # per-task lease gone — keep acking the rest
             _ack_disabled_until = time.time() + ACK_UNSUPPORTED_COOLDOWN
             _log(f"gateway does not support task ack — retrying in "
@@ -5327,8 +5383,8 @@ def _release_singleton() -> None:
              "advertisement overwritten by this generation")
         try:
             _ws_retain(_LOCK_ROLE, _LOCK_WS)  # else our dead pid gets it reaped at once
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"singleton: retain failed ({e}) — the held lock can be reaped once this pid exits")
         return
     try:
         _ws_release(_LOCK_ROLE, _LOCK_WS)
@@ -5576,14 +5632,14 @@ def main() -> None:
                     if tid not in inflight:
                         inflight.add(tid)
                         added = True
-                    pending_ack.append((tid, durable))
+                    pending_ack.append((tid, durable, _lease_id_of(task)))
             # Ack only after task file, in-flight set and ack ledger are durable;
             # any failure withholds every ack this round, redeliveries included.
             committed = _save_inflight(inflight) if pending_ack else True
             if pending_ack and committed:
                 committed = _record_pending_acks(pending_ack)
-            for tid, durable in pending_ack if committed else ():
-                _post_task_ack(tid, durable)
+            for tid, durable, lease in pending_ack if committed else ():
+                _post_task_ack(tid, durable, lease)
             if added:
                 wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
