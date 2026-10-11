@@ -150,8 +150,8 @@ proxy's timeout (`REMOTE_TASK_POLL_WAIT=10` fits most), or add the relay host to
 
 Sparrow writes each task to `AGENT_CONNECT_TASK_DIR/<task-id>.txt`. Set
 `REMOTE_TASK_ON_TASK` and Sparrow also runs that command once for every task
-file it newly queues, so your agent starts its turn without a folder-watching
-hook of its own.
+file it newly queues, and hands it the task itself, so your agent can start
+its turn without watching or reading the task folder.
 
 ```sh
 REMOTE_TASK_ON_TASK="my-agent run-task" ag2-sparrow
@@ -160,8 +160,27 @@ REMOTE_TASK_ON_TASK="my-agent run-task" ag2-sparrow
 
 - The command is split like a shell would split it (`shlex`) but runs **without
   a shell**: no pipes, redirects or `$VARS`. Point it at a script if you need them.
-- The task file's absolute path is appended as the last argument. The command
-  also gets `SPARROW_TASK_ID` and `SPARROW_TASK_FILE` in its environment.
+- The full task arrives on the command's **stdin**: the same bytes as the task
+  file, then end-of-file. A runtime can consume it directly and needs no folder
+  watcher. A command that never reads stdin works as before; Sparrow closes the
+  pipe after 30 seconds if it is still unread.
+- The task's routing headers are in the environment, each a single line of at
+  most 512 characters (control characters become spaces) and set only when
+  the task file has that header:
+
+  | Variable | Task header |
+  | --- | --- |
+  | `SPARROW_SOURCE` | `source` |
+  | `SPARROW_ROOM_ID` | `channel_id` |
+  | `SPARROW_THREAD_ROOT` | `thread_root` |
+  | `SPARROW_SOURCE_MESSAGE_ID` | `source_message_id` |
+  | `SPARROW_SENDER` | `user_id` |
+  | `SPARROW_SENDER_NAME` | `sender_name` |
+  | `SPARROW_ACCESS_TIER` | `access_tier` (the tier Sparrow resolved) |
+
+- The task file's absolute path is still appended as the last argument, and the
+  command also gets `SPARROW_TASK_ID` and `SPARROW_TASK_FILE`. The file stays
+  the durable record: it is what survives a crash of Sparrow or your agent.
 - It runs only after the file is completely and durably written.
 - It fires once per task file Sparrow writes. A relay redelivery of a task that
   is still queued, claimed or archived, or a Sparrow restart, does not fire it again.
@@ -171,8 +190,14 @@ REMOTE_TASK_ON_TASK="my-agent run-task" ag2-sparrow
 - If Sparrow stops between writing a file and starting the command, that one
   wake is skipped (it is not replayed on restart); the file is still in the
   task dir for your agent's next run.
-- Your relay token is never passed to it: every `REMOTE_*`/`AG2_*` token variable,
-  and any variable holding the token's value, is removed from its environment.
+  Handing the task over on stdin does not change this: the wake is still
+  fired once per fresh publish, with no retry and no re-wake after a restart
+  (a bounded retry and a re-wake on restart are planned).
+- Your relay token is never placed in its argv or environment: every
+  `REMOTE_*`/`AG2_*` token variable, and any variable holding the token's value
+  (including a `SPARROW_*` header that contains it), is removed. Stdin carries
+  the task exactly as written to the task file, so if the message text itself
+  contains the token, stdin does too.
 
 Unset (the default), Sparrow behaves exactly as before.
 

@@ -43,7 +43,8 @@ Config (env / .env):
                         .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
   REMOTE_TASK_ON_TASK   optional wake command, run once per newly queued task
-                        file (argv split with shlex, no shell; file path appended)
+                        file (argv split with shlex, no shell; file path appended;
+                        the task's bytes on stdin, routing headers as SPARROW_* env)
   REMOTE_OUTBOUND_SCAN_S outbound worker scan period seconds (default 1.0)
 
 Stdlib only (urllib) — no new dependencies.
@@ -54,6 +55,7 @@ from __future__ import annotations
 import atexit
 import glob
 import base64
+import contextlib
 import hashlib
 import http.client
 import json
@@ -323,6 +325,7 @@ from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
+from .workspace_lock import DEFAULT_STALE_SECONDS as _WS_STALE_SECONDS
 from .workspace_lock import retain as _ws_retain
 from .workspace_lock import _host_label as _stable_host_label
 
@@ -2170,13 +2173,15 @@ def _append_log_file(line: str) -> None:
         pass
 
 
+_REQ_TIMEOUT_S = 35
+
 # urllib wraps only the send in URLError; a socket closed after it raises http.client's
 # errors bare (RemoteDisconnected is a ConnectionResetError), and those are outages too.
 _NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
                    http.client.IncompleteRead)
 
 
-def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
+def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty)."""
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
@@ -3371,26 +3376,99 @@ def _on_task_env() -> "dict[str, str]":
             and not any(sec in v for sec in secrets)}
 
 
-def _fire_on_task(tid: str, path: Path) -> None:
-    """Start REMOTE_TASK_ON_TASK for one newly published task file; never waits on it."""
+# Header fields handed to the wake command's environment, as SPARROW_<NAME>.
+_ON_TASK_ENV_FIELDS = (("SPARROW_SOURCE", "source"), ("SPARROW_ROOM_ID", "channel_id"),
+                       ("SPARROW_THREAD_ROOT", "thread_root"),
+                       ("SPARROW_SOURCE_MESSAGE_ID", "source_message_id"),
+                       ("SPARROW_SENDER", "user_id"), ("SPARROW_SENDER_NAME", "sender_name"),
+                       ("SPARROW_ACCESS_TIER", "access_tier"))
+_ON_TASK_ENV_MAX = 512
+# How long a wake command that does not read stdin may hold the pipe open.
+_ON_TASK_STDIN_TIMEOUT_S = 30.0
+
+
+_CONTROL_TO_SPACE = {c: " " for c in (*range(0x20), *range(0x7F, 0xA0))}
+
+
+def _env_safe(value) -> str:
+    """_one_line, then every C0/C1 control character (ESC, BEL, TAB, DEL...) as a space."""
+    return _one_line(value).translate(_CONTROL_TO_SPACE)
+
+
+def _on_task_header_env(text: str) -> "dict[str, str]":
+    """SPARROW_* variables for the task file's routing headers; single-line, bounded."""
+    headers = local_task_protocol.parse_task_headers_trusted(text).headers
+    secrets = [v for v in (TOKEN, _RAW, HS_MEDIA_TOKEN) if v]
+    env = {}
+    for name, key in _ON_TASK_ENV_FIELDS:
+        value = _env_safe(headers.get(key) or "").strip()
+        if value and not any(sec in value for sec in secrets):
+            env[name] = value[:_ON_TASK_ENV_MAX]
+    return env
+
+
+def _feed_on_task_stdin(proc: "subprocess.Popen", data: bytes, tid: str) -> None:
+    """Write `data` to the child's stdin and close it, giving up after a bounded wait."""
+    pipe = proc.stdin
+    if pipe is None:
+        return
+    try:
+        if os.name == "nt":  # pragma: no cover  # no select() on Windows pipes: blocking write
+            pipe.write(data)
+            return
+        fd = pipe.fileno()
+        os.set_blocking(fd, False)
+        view = memoryview(data)
+        deadline = time.monotonic() + _ON_TASK_STDIN_TIMEOUT_S
+        while view:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _log(f"on-task command did not read its stdin for {tid}; closed it")
+                break
+            _, ready, _ = select.select([], [fd], [], min(remaining, 1.0))
+            if ready:
+                try:
+                    view = view[os.write(fd, view):]
+                except BlockingIOError:
+                    continue
+    except (BrokenPipeError, ConnectionResetError):
+        pass  # the command exited or closed stdin without reading: it ignores the payload
+    except (OSError, ValueError) as exc:
+        _log(f"on-task stdin write failed for {tid}: {type(exc).__name__}: {exc}")
+    finally:
+        with contextlib.suppress(OSError):
+            pipe.close()
+
+
+def _feed_and_reap(proc: "subprocess.Popen", data: bytes, tid: str) -> None:
+    """Hand the wake command its task on stdin, then reap it."""
+    _feed_on_task_stdin(proc, data, tid)
+    code = proc.wait()
+    if code != 0:
+        _log(f"on-task command exited {code} for {tid}")
+
+
+def _fire_on_task(tid: str, path: Path, text: "str | None" = None) -> None:
+    """Start REMOTE_TASK_ON_TASK for one newly published task file; never waits on it.
+    The command gets the task's bytes on stdin and its routing headers in env."""
     if not ON_TASK_CMD:
         return
     try:
+        if text is None:
+            text = path.read_text(encoding="utf-8")
+        data = text.encode("utf-8")
         argv = shlex.split(ON_TASK_CMD) + [str(path)]
-        env = {**_on_task_env(), "SPARROW_TASK_ID": tid, "SPARROW_TASK_FILE": str(path)}
-        proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+        env = {**_on_task_env(), **_on_task_header_env(text),
+               "SPARROW_TASK_ID": tid, "SPARROW_TASK_FILE": str(path)}
+        proc = subprocess.Popen(argv, env=env, stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 start_new_session=True)
     except Exception as exc:  # noqa: BLE001 — a bad wake command never stops the pull loop
         _log(f"on-task command failed to start for {tid}: {type(exc).__name__}: {exc}")
         return
 
-    def _reap() -> None:
-        code = proc.wait()
-        if code != 0:
-            _log(f"on-task command exited {code} for {tid}")
-
-    threading.Thread(target=_reap, name=f"on-task-{tid}", daemon=True).start()
+    threading.Thread(target=_feed_and_reap, args=(proc, data, tid),
+                     name=f"on-task-{tid}", daemon=True).start()
 
 
 def _write_task(task: dict) -> "tuple[str, bool] | None":
@@ -3576,7 +3654,8 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     if task.get("owner_mentioned") == "true":
         lines.extend(owner_mention_lines(f"results/{tid}.txt"))
     from .local_task_protocol import apply_task_stamper
-    tmp = _stage_durable(dest, apply_task_stamper("\n".join(lines) + "\n"))
+    task_text = apply_task_stamper("\n".join(lines) + "\n")
+    tmp = _stage_durable(dest, task_text)
     if tmp is None:
         _log(f"task write FAILED for {tid} — not queued, not acked")
         return None
@@ -3602,7 +3681,7 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     # only for owner-tier senders (same resolved tier as the task above).
     _write_owner_activity(task, sender_tier)
     # Only a fresh publish reaches here, so redelivery and restarts never re-fire.
-    _fire_on_task(tid, dest)
+    _fire_on_task(tid, dest, task_text)
     return tid, True
 
 
@@ -5297,6 +5376,22 @@ _LOCK_ROLE = f"gateway-bridge{_INST_SUFFIX}"  # per-instance: dual-poller guard 
 _LOCK_WS = _STATE.parent  # _STATE = <workspace>/state (injected) or ~/.ag2-sparrow/state
 
 
+_LOCK_STALE_S = _WS_STALE_SECONDS
+# A loop pass (long poll + backoff + retries) can outlast the stale window, so
+# the lock is refreshed off-loop; the loop only reads the verdict.
+_LOCK_LOST = threading.Event()
+_LOCK_HB_MUTEX = threading.Lock()
+_POLL_BACKOFF_MAX_S = 60
+# Typical worst case for one pass (a queued retry backlog can exceed it): the
+# long poll at its timeout, the largest backoff and two requests, doubled.
+_LOCK_PASS_MAX_S = 2 * (POLL_WAIT + 10 + _POLL_BACKOFF_MAX_S + 2 * _REQ_TIMEOUT_S)
+_LOOP_TICK = {"at": time.monotonic()}
+
+
+def _stamp_loop_progress() -> None:
+    _LOOP_TICK["at"] = time.monotonic()
+
+
 def _lock_on() -> bool:
     return os.environ.get("SUTANDO_BRIDGE_LOCK", "1") != "0"
 
@@ -5333,10 +5428,41 @@ def _heartbeat_singleton() -> bool:
     → True) so a lock bug never wedges task delivery."""
     if not _lock_on():
         return True
-    try:
-        return bool(_ws_heartbeat(_LOCK_ROLE, _LOCK_WS))
-    except Exception:
-        return True
+    with _LOCK_HB_MUTEX:
+        try:
+            held = bool(_ws_heartbeat(_LOCK_ROLE, _LOCK_WS))
+        except Exception:
+            return True
+        if not held:
+            _LOCK_LOST.set()
+        return held
+
+
+def _lock_heartbeat_loop() -> None:
+    """Refresh the lock only while the main loop keeps making passes. A loop
+    stuck past the pass bound is a hung holder, and the lock must go stale for
+    it exactly as it did when the loop refreshed the lock itself."""
+    interval = max(0.5, _LOCK_STALE_S / 3)
+    stalled = False
+    while not _OWNERSHIP_RELINQUISHED.wait(interval):
+        idle = time.monotonic() - _LOOP_TICK["at"]
+        if idle > _LOCK_PASS_MAX_S:
+            if not stalled:
+                stalled = True
+                _log(f"singleton: main loop has made no progress for {idle:.0f}s "
+                     f"(bound {_LOCK_PASS_MAX_S:.0f}s) — letting the lock go stale "
+                     "so a successor can take over")
+            continue
+        stalled = False
+        if not _heartbeat_singleton():
+            return
+
+
+def _start_lock_heartbeat() -> None:
+    _stamp_loop_progress()
+    if _lock_on():
+        threading.Thread(target=_lock_heartbeat_loop, name="sparrow-lock-heartbeat",
+                         daemon=True).start()
 
 
 def _exit_on_signal(signum, _frame) -> None:
@@ -5364,7 +5490,7 @@ def _acquire_singleton() -> bool:
     if not _lock_on():
         return True
     try:
-        r = _ws_acquire(_LOCK_ROLE, _LOCK_WS)
+        r = _ws_acquire(_LOCK_ROLE, _LOCK_WS, stale_seconds=_LOCK_STALE_S)
     except Exception as e:  # fail-open — never wedge task delivery on a lock bug
         _log(f"singleton: acquire error ({e}) — proceeding without lock")
         return True
@@ -5373,6 +5499,7 @@ def _acquire_singleton() -> bool:
         _log(f"singleton: another live gateway-bridge owns this workspace "
              f"(host={h.get('host')} pid={h.get('pid')}) — exiting to avoid dual-poll")
         return False
+    _LOCK_LOST.clear()
     atexit.register(_release_singleton)
     for _sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -5489,6 +5616,7 @@ def main() -> None:
         # A live bridge already polls this workspace: stand down. 75 tells a
         # supervising wrapper not to relaunch; a plain exit would loop it.
         sys.exit(75)
+    _start_lock_heartbeat()
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
     abandoned_suspects: set[str] = set()
@@ -5509,8 +5637,9 @@ def main() -> None:
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
     while True:
+        _stamp_loop_progress()
         try:
-            if not _heartbeat_singleton():
+            if _LOCK_LOST.is_set() or not _heartbeat_singleton():
                 # Lost the poller lock (reaped after being deemed stale). Stop
                 # polling immediately so we don't dual-poll the relay bearer with
                 _log("singleton: lost workspace poller lock (reaped after stale takeover) "
@@ -5591,18 +5720,18 @@ def main() -> None:
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff)
-            time.sleep(backoff); backoff = min(backoff * 2, 60)
+            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _NETWORK_ERRORS as e:
             poll_failures += 1
             _log(f"poll network error: {type(e).__name__}: {e} — {poll_failures} consecutive, "
                  f"{int(time.time() - last_poll_ok)}s since last successful poll — "
                  f"backing off {backoff}s")
             _emit_gateway_status(False, error=f"network: {e}", backoff_s=backoff)
-            time.sleep(backoff); backoff = min(backoff * 2, 60)
+            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
             _log(f"unexpected: {e} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"unexpected: {e}", backoff_s=backoff)
-            time.sleep(backoff); backoff = min(backoff * 2, 60)
+            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
 
 
 if __name__ == "__main__":
