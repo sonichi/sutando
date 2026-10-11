@@ -16,9 +16,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 PKG_ROOT = REPO / "packages" / "ag2-sparrow"
 SRC = PKG_ROOT / "ag2_sparrow"
 sys.path.insert(0, str(PKG_ROOT / "tools"))
-import build_zipapp  # noqa: E402
-import smoke_entry  # noqa: E402
-from smoke_entry import check_fails_without_token, minimal_env  # noqa: E402
+import build_zipapp, smoke_entry  # noqa: E401,E402
 
 
 def _sources():
@@ -44,8 +42,8 @@ def test_archive_contents(pyz):
 
 
 def test_runs_without_install(pyz, tmp):
-    check_fails_without_token([sys.executable, str(pyz)], str(tmp))
-    env = minimal_env(str(tmp))
+    smoke_entry.check_fails_without_token([sys.executable, str(pyz)], str(tmp))
+    env = smoke_entry.minimal_env(str(tmp))
     env["PYTHONPATH"] = str(pyz)
     r = subprocess.run([sys.executable, "-c",
                         "import ag2_sparrow.remote_gateway_bridge as b, ag2_sparrow.outbox_cli;"
