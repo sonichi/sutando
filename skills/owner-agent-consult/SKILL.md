@@ -106,13 +106,7 @@ never widen them:
 - the window starts at the root event's **server timestamp**, read from the room; the
   marker's `since` is informational and never used, so neither a forged `since` nor a skewed
   clock on the first asker moves the window;
-- "now" is on the server's clock too, not this agent's: the server timestamp of an anchor
-  event plus the local time elapsed since this agent saw it. The anchor is the ask that
-  reached this agent (its event's server timestamp, and the task's arrival time here), or, for
-  the first asker's follow-ups, its own first ask (the root's server timestamp, and its local
-  send time). Elapsed local time does not depend on clock skew. "Now" is never earlier than the
-  newest server timestamp in the room read. With no anchor, the local clock is used only when
-  it is within 120 s of that newest timestamp; otherwise the ask is refused;
+- "now" is measured as in "Time-window invariant" below, not read off this agent's clock alone;
 - each limit is the **smaller** of the thread's marker and the asking agent's own config
   (`--max-*`, env, manifest);
 - a root event with no usable server timestamp refuses the ask.
@@ -271,9 +265,45 @@ same person in the room is refused.
 
 | check | clock | why |
 | --- | --- | --- |
-| thread window (`ask`, and `answer`'s `limit_reached`) | server: anchor event `ts` + local elapsed, floored at the newest server `ts` | crosses agents, so no agent's wall clock may decide it |
+| thread window (`ask`, and `answer`'s `limit_reached`) | the largest of: newest server `ts`, anchor `ts` + local elapsed, local clock (see "Time-window invariant") | crosses agents; each term can only close the window early, never late |
 | thread window start | server: the root event's `ts` | the marker's `since` is written by an agent's clock |
 | expiry (`match`, `pending`) | local: this agent's `asked_at` against its own clock | the record and the clock are the same agent's, so skew cancels |
 | nudge due (`pending`) | local, same reason | |
 | a record stamped more than 5 min in the future reads as expired | local, same reason | only a backward jump of this agent's own clock causes it |
 | pruning old answered and nudge records | local, same reason | |
+
+## Time-window invariant
+
+**Property.** An ask is refused once the true time since the thread root's server timestamp
+exceeds the thread's window, provided this agent's clock is not slow by more than 120 s
+(`CLOCK_TOLERANCE_S`). A clock found more than 120 s behind the newest server timestamp in the
+room is refused outright. A slow clock that goes undetected can let the window run late by at
+most the smaller of its slowness and how late the anchor's task was delivered.
+
+"Now" is `max(newest server ts, anchor ts + local elapsed, local clock)`. Each input, the error it
+can carry, and why the max bounds it:
+
+| input | error it can carry | why the max bounds it |
+| --- | --- | --- |
+| root server ts (window start) | none from agents; forgery is not possible through the marker, whose `since` is never used. Trusted as the homeserver's `origin_server_ts` (unverified, above) | it is the start, not a term of "now" |
+| newest server ts in the room read | lag: in an idle room it is older than now | always at or before true now, so it only raises the floor |
+| anchor ts + local elapsed | delivery delay (a task written late makes it early by the delay); a later rewrite of the task file (early). Clock skew cancels: elapsed is read on one clock | at or before true now (plus seconds, for a follow-up's own-root anchor), so it can only make the result early, which the local term covers |
+| local clock | skew. Fast: too late, so the window closes early (fails closed). Slow: too early | refused when more than 120 s behind the newest server ts; otherwise the anchor term covers it unless delivery was also late |
+
+The result is below true now only when the local clock is slow **and** the anchor was delivered
+late, by at most the smaller of the two. It is above true now only by a fast local clock, which
+refuses early.
+
+Every code path that computes "now" (`consult_policy.py`):
+
+1. `consult`, a thread's first ask: no root exists yet, so nothing is measured; the window opens
+   at that ask (its marker `since` is the local clock, informational only).
+2. `consult`, a follow-up from the owner task: `measured_now(newest ts, (root ts, own first-ask
+   asked_at), local)`.
+3. `consult`, an onward ask (`--via-task`): `measured_now(newest ts, (delivering event ts, task
+   arrival mtime), local)`.
+4. `answer --task-id`, its `limit_reached` report: the same measure as 3. Answers still post.
+5. `answer --up`: reports no limit, so it computes no "now".
+
+No other path compares time against the thread window. The only residual is the slow-and-late
+case above.

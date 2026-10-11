@@ -437,9 +437,10 @@ class TestFollowUp(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ws = make_ws(tmp)
             tr = FakeTransport()
-            first = run_consult(tr, ws, cid=CID, now=1.0)
-            second = run_consult(tr, ws, cid=CID_B, question="and the disk?", now=2.0)
-            third = run_consult(tr, ws, cid="00000000000000aa", question="and memory?", now=3.0)
+            t = time.time()
+            first = run_consult(tr, ws, cid=CID, now=t)
+            second = run_consult(tr, ws, cid=CID_B, question="and the disk?", now=t + 1)
+            third = run_consult(tr, ws, cid="00000000000000aa", question="and memory?", now=t + 2)
             self.assertTrue(first["asked"] and second["asked"] and third["asked"])
             self.assertEqual((first["follow_up"], second["follow_up"], third["follow_up"]),
                              (False, True, True))
@@ -1112,8 +1113,9 @@ class TestLimitsCannotBeWidened(unittest.TestCase):
 
 
 class TestWindowOnServerTime(unittest.TestCase):
-    """Elapsed time is measured on the server's clock: the anchor's server timestamp plus the
-    local time elapsed since it, never the asking agent's wall clock against the server's."""
+    """The window closes once true time since the root's server timestamp passes it: "now" is
+    the largest of the newest server timestamp, the anchor's server timestamp plus local time
+    elapsed since it, and the local clock. A clock provably behind the server is refused."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -1124,43 +1126,64 @@ class TestWindowOnServerTime(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_a_slow_receiver_cannot_ask_past_the_window(self):
+    def refused(self, res):
+        self.assertFalse(res["asked"], res)
+        self.assertEqual(self.w.tr[SIB].posted, [])
+        return res["reason"]
+
+    def test_rui_1_a_slow_receiver_cannot_ask_past_the_window(self):
         skew = -3600
         self.w.deliver(SIB, "$ask", "task-b1", at=T0 + skew)
-        res = self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 1801 + skew)
-        self.assertEqual((res["asked"], res.get("limit_reached")), (False, True), res)
-        self.assertIn("1800s window has passed", res["reason"])
-        self.assertEqual(self.w.tr[SIB].posted, [])
+        reason = self.refused(self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 1801 + skew))
+        self.assertIn("behind the room's newest server timestamp", reason)
 
-    def test_a_fast_receiver_is_not_refused_early(self):
+    def test_a_receiver_slow_within_the_tolerance_is_still_held_to_the_window(self):
+        skew = -100
+        self.w.deliver(SIB, "$ask", "task-b1", at=T0 + skew)
+        reason = self.refused(self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 1801 + skew))
+        self.assertIn("1800s window has passed", reason)
+
+    def test_rui_2_a_fast_receiver_fails_closed(self):
         skew = 3600
         self.w.deliver(SIB, "$ask", "task-b1", at=T0 + skew)
-        res = self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 60 + skew)
-        self.assertTrue(res["asked"], res)
+        reason = self.refused(self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 60 + skew))
+        self.assertIn("1800s window has passed", reason)
 
-    def test_the_first_askers_own_skew_does_not_move_its_follow_ups(self):
-        for skew, elapsed, allowed in ((3600, 60, True), (-3600, 1801, False)):
+    def test_an_ask_delivered_hours_late_is_measured_on_true_time(self):
+        w = self.w
+        w.room.clock = lambda: T0 + 60
+        self.assertTrue(w.ask(SELF, SIB, cid=C3, task_id=TID, now=lambda: T0 + 60)["asked"])
+        w.deliver(SIB, "$ask2", "task-b2", at=T0 + 6 * 3600)
+        reason = self.refused(w.ask(SIB, THIRD, cid=C2, via_task="task-b2", now=lambda: T0 + 6 * 3600 + 30))
+        self.assertIn("1800s window has passed", reason)
+
+    def test_an_on_time_receiver_with_a_true_clock_is_allowed(self):
+        self.w.deliver(SIB, "$ask", "task-b1", at=T0 + 5)
+        self.assertTrue(self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 65)["asked"])
+
+    def test_the_first_askers_own_skew_fails_closed_both_ways(self):
+        for skew, elapsed in ((3600, 60), (-3600, 1801)):
             with tempfile.TemporaryDirectory() as tmp:
                 w = World(tmp)
                 w.room.clock = lambda: T0
                 w.ask(SELF, SIB, cid=C1, task_id=TID, now=lambda: T0 + skew)
                 res = w.ask(SELF, SIB, cid=C2, task_id=TID, now=lambda: T0 + skew + elapsed)
-                self.assertEqual(res["asked"], allowed, (skew, elapsed, res))
+                self.assertFalse(res["asked"], (skew, elapsed, res))
 
     def test_the_newest_server_timestamp_is_a_floor(self):
         self.w.deliver(SIB, "$ask", "task-b1", at=T0)
         self.w.room.clock = lambda: T0 + 1900
         self.w.room.post(OWNER, "later message in the room")
-        res = self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 10)
-        self.assertIn("window has passed", res["reason"])
+        reason = self.refused(self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 1850))
+        self.assertIn("window has passed", reason)
 
-    def test_without_an_anchor_the_local_clock_must_agree_with_the_server(self):
+    def test_the_measure_takes_the_largest_term_and_refuses_a_slow_clock(self):
         tol = policy.CLOCK_TOLERANCE_S
-        self.assertEqual(policy.measured_now(T0, (None, None), T0 + tol), T0 + tol)
-        self.assertIsNone(policy.measured_now(T0, (None, None), T0 + tol + 1))
+        self.assertEqual(policy.measured_now(T0, (None, None), T0 + tol + 1), T0 + tol + 1)
+        self.assertEqual(policy.measured_now(T0, (T0, T0 - 100), T0 - 70), T0 + 30)
+        self.assertEqual(policy.measured_now(T0, (T0 - 60, T0 - 60), T0 + 5), T0 + 5)
         self.assertIsNone(policy.measured_now(T0, (T0, None), T0 - tol - 1))
         self.assertIsNone(policy.measured_now(None, (T0, T0), T0))
-        self.assertEqual(policy.measured_now(T0 + 5, (T0, T0 - 3600), T0 - 3600 + 2), T0 + 5)
 
     def test_an_ask_refused_for_an_unmeasurable_clock_says_so(self):
         self.w.deliver(SIB, "$ask", "task-b1", at=T0)

@@ -468,20 +468,20 @@ CLOCK_TOLERANCE_S = 120
 
 
 def measured_now(server_now_s: Optional[float], anchor: tuple, local_now: float) -> Optional[float]:
-    """The current time on the server's clock, without trusting this agent's wall clock.
-    `anchor` is (server ts, local time) of one moment: the event that delivered this agent's
-    ask and that task's arrival here, or this agent's own first ask and its local send time.
-    Elapsed local time since the anchor is skew-free, so now = anchor ts + elapsed, and never
-    earlier than the newest server timestamp read. With no anchor, the local clock is used
-    only when it agrees with the newest server timestamp within CLOCK_TOLERANCE_S; else None."""
-    if server_now_s is None:
+    """An upper-leaning estimate of the server's current time for the thread window (see
+    SKILL.md "Time-window invariant"): the largest of the newest server timestamp read, the
+    anchor's server timestamp plus the local time elapsed since it, and the local clock. Every
+    term is at most the true time or errs early, so the window can close early, never late.
+    `anchor` is (server ts, local time) of one moment, or (None, None). None (refuse) when no
+    server timestamp is known, or when the local clock is provably behind the server by more
+    than CLOCK_TOLERANCE_S."""
+    if server_now_s is None or local_now < server_now_s - CLOCK_TOLERANCE_S:
         return None
+    terms = [server_now_s, local_now]
     a_server, a_local = anchor if anchor else (None, None)
     if a_server is not None and a_local is not None:
-        return max(server_now_s, a_server + max(0.0, local_now - a_local))
-    if abs(local_now - server_now_s) > CLOCK_TOLERANCE_S:
-        return None
-    return max(server_now_s, local_now)
+        terms.append(a_server + max(0.0, local_now - a_local))
+    return max(terms)
 
 
 def server_now(messages: List[dict]) -> Optional[float]:
@@ -636,8 +636,8 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
     if limits is None:
         return no("the consult thread's root event has no server timestamp; cannot apply the thread limits")
     if now_s is None:
-        return no("cannot measure the thread window on server time: this agent's clock disagrees with "
-                  "the room's newest server timestamp and no anchor is available")
+        return no("cannot measure the thread window on server time: this agent's clock is more than "
+                  f"{CLOCK_TOLERANCE_S}s behind the room's newest server timestamp")
     refusal = limit_reached(limits, len(asks), now_s)
     if refusal:
         return no(refusal, limit_reached=True)
