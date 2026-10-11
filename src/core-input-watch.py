@@ -121,9 +121,9 @@ def _load_runtime_health():
 from delivery.pane_gate import (  # noqa: E402
     ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
     COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, TURN_DONE, TURN_SHORT,
-    classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, finished_turns,
-    gate_evidence, limit_is_stale, live_tail, prompt_line as _pg_prompt_line,
-    strip_limit_banners,
+    classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, gate_evidence,
+    limit_banner, limit_baseline, limit_is_stale, live_tail, prompt_line as _pg_prompt_line,
+    refusal_line, strip_limit_banners,
 )
 
 _FABLE_TEXT = FABLE_TEXT
@@ -144,18 +144,7 @@ _IDLE = CLAUDE_IDLE
 #: A pane-border/rule row (box-drawing chars only) -- never legitimate composer text.
 _BORDER_LINE = BORDER_LINE
 
-# A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
-# pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
-_REFUSAL = re.compile(
-    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
-    # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
-    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b", re.I)
-
-
-def _refusal_line(line: str) -> bool:
-    """A limit refusal, or the CLI's needs-login line (cli_wedge's one grammar)."""
-    return bool(_REFUSAL.search(line)) or cli_wedge.needs_login_line(line)
-
+_refusal_line = refusal_line
 
 _TURN_DONE = TURN_DONE
 _TURN_SHORT = TURN_SHORT
@@ -405,14 +394,14 @@ _BASE_TO_STATE = {
 
 
 def limit_step(pane, baseline, workspace=None, socket=None, session=None):
-    """(stale, baseline) for this poll's limit banner. `baseline` is the finished turns on
-    the first capture that showed it; a turn finishing after that proves the seat runs."""
-    tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
-    abn = cli_wedge.frame_abnormal(tail)
-    if abn is None or abn.kind != "provider-limit":
+    """(stale, baseline) for this poll's limit banner. The baseline is taken when a banner
+    first shows, and again when its text changes; the newest turn since then decides."""
+    abn = limit_banner(pane or "")
+    if abn is None:
         return False, None
-    if baseline is None:
-        baseline = finished_turns(pane)
+    current = limit_baseline(pane)
+    if baseline is None or baseline.banner != current.banner:
+        baseline = current
     return limit_is_stale(abn, workspace, socket, session, capture=pane, baseline=baseline), baseline
 
 

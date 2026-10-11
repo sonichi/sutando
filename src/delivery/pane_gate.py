@@ -46,8 +46,8 @@ from typing import Callable, List, Optional, Tuple
 
 _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC))
-from cli_wedge import (PROVIDER_LIMIT_PATTERNS, capture_pane, core_target,  # noqa: E402
-                       frame_abnormal, frame_working)
+from cli_wedge import (PROVIDER_LIMIT_PATTERNS, FrameAbnormal, capture_pane,  # noqa: E402
+                       core_target, frame_abnormal, frame_working, needs_login_line)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
@@ -91,6 +91,17 @@ TURN_DONE = re.compile(
     r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
 #: A turn this short (or with no duration) may be the CLI refusing it, not running it.
 TURN_SHORT = re.compile(r"[01]s")
+# A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
+# pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
+REFUSAL = re.compile(
+    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
+    # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
+    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b", re.I)
+
+
+def refusal_line(line: str) -> bool:
+    """A limit refusal, or the CLI's needs-login line (cli_wedge's one grammar)."""
+    return bool(REFUSAL.search(line)) or needs_login_line(line)
 # First match classifies; the idle "❯ " prompt matches none of them.
 CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
     ("fable-limit", re.compile(r"❯\s*Switch to .{1,80}? and continue", re.I)),
@@ -437,39 +448,90 @@ def accepts_input(verdict: Verdict) -> bool:
     return verdict.state == "busy" and verdict.reason == "working"
 
 
-def finished_turns(capture: str) -> frozenset:
-    """The completed turns on screen that ran (longer than a refusal), keyed by their
-    `✻ … done <time>` text so a changing suffix ("1 monitor still running") is the same turn."""
-    keys = set()
+def _turns(capture: str) -> List[Tuple[str, bool]]:
+    """(key, ran) per completed turn on screen, oldest first. `ran`: longer than 1s and no
+    refusal line in its output. Keyed by `✻ … done <time>` so a changing suffix is one turn."""
+    turns, refused = [], False
     for ln in (capture or "").splitlines():
-        m = TURN_DONE.match(_SGR.sub("", ln))
-        if m and m.group("dur") and not TURN_SHORT.fullmatch(m.group("dur")):
-            keys.add(re.sub(r"(\bdone\s+\S+(?:\s*[AP]M)?).*", r"\1", m.group(0).strip()))
-    return frozenset(keys)
+        plain = _SGR.sub("", ln)
+        m = TURN_DONE.match(plain)
+        if not m:
+            # A prompt row starts the next turn; a refusal above it was the last one's.
+            refused = (refused and not plain.lstrip().startswith("❯")) or refusal_line(plain.strip())
+            continue
+        ran = bool(m.group("dur")) and not TURN_SHORT.fullmatch(m.group("dur")) and not refused
+        turns.append((re.sub(r"(\bdone\s+\S+(?:\s*[AP]M)?).*", r"\1", m.group(0).strip()), ran))
+        refused = False
+    return turns
+
+
+def finished_turns(capture: str) -> frozenset:
+    """The completed turns on screen that ran (see `_turns`)."""
+    return frozenset(key for key, ran in _turns(capture) if ran)
+
+
+def _below_composer(capture: str) -> List[str]:
+    """The rows under the last prompt row: where the CLI draws its status banners."""
+    lines = (capture or "").splitlines()
+    last = max((i for i, ln in enumerate(lines) if _SGR.sub("", ln).lstrip().startswith("❯")),
+               default=len(lines) - 1)
+    return lines[last + 1:]
+
+
+def _limit_row(ln: str) -> bool:
+    plain = _SGR.sub("", ln)
+    abn = frame_abnormal(plain)
+    return bool(LIMIT_WAIT.search(plain)) or (
+        abn is not None and all(n in PROVIDER_LIMIT_PATTERNS for n in abn.names))
+
+
+def limit_banner(capture: str) -> Optional[FrameAbnormal]:
+    """The provider-limit verdict for the banner under the composer, else None. The CLI's
+    "Usage limit reached" banner is not one of cli_wedge's whole-line banners, so its own
+    signature vouches for the family here only; dispatch verdicts are unchanged."""
+    below = "\n".join(_below_composer(capture))
+    abn = frame_abnormal(below)
+    if abn is not None:
+        return abn if abn.kind == "provider-limit" else None
+    return FrameAbnormal("provider-limit", ("quota-limit",), False) if LIMIT_WAIT.search(below) else None
+
+
+@dataclass(frozen=True)
+class LimitBaseline:
+    banner: Tuple[str, ...]   # the banner rows, reset time included
+    seen: frozenset           # every completed turn on screen when that banner was first seen
+
+
+def limit_baseline(capture: str) -> LimitBaseline:
+    return LimitBaseline(tuple(_SGR.sub("", ln).strip() for ln in _below_composer(capture)
+                               if _limit_row(ln)),
+                         frozenset(key for key, _ in _turns(capture)))
 
 
 def strip_limit_banners(capture: str) -> str:
-    """`capture` without its limit-banner lines, for a caller that has judged them stale."""
-    def _limit_only(ln):
-        abn = frame_abnormal(_SGR.sub("", ln))
-        return abn is not None and all(n in PROVIDER_LIMIT_PATTERNS for n in abn.names)
-    return "\n".join(ln for ln in capture.splitlines()
-                     if not (LIMIT_WAIT.search(ln) or _limit_only(ln)))
+    """`capture` without the limit banner under its composer, for a caller that has judged
+    it stale. Rows inside turns (a refusal) are evidence and stay."""
+    lines = capture.splitlines()
+    first_below = len(lines) - len(_below_composer(capture))
+    return "\n".join(ln for i, ln in enumerate(lines) if i < first_below or not _limit_row(ln))
 
 
 def limit_is_stale(abn, workspace, socket, session, probe=False, capture=None, baseline=None) -> bool:
     """A quota-only banner is a line from before the reset, scrollback, not a hold, when
-    the seat shows it is not held: a turn finished that `baseline` (the finished_turns of
-    the first capture showing the banner) did not hold, or a FRESH proxy record says
-    accepted for a seat ROUTED through that proxy. Anything else keeps the hold -- another
-    abnormal family, no newer turn, an unrouted or unobserved seat, or a record absent,
-    stale or rejected. A retry never reaches here: classify_pane returns on it before any gate."""
+    the seat shows it is not held: the newest turn finished since `baseline` (limit_baseline
+    of the first capture showing the banner) ran, or a FRESH proxy record says accepted for a
+    seat ROUTED through that proxy. A newest turn that was refused holds whatever the record
+    says. Anything else keeps the hold -- another abnormal family, no newer turn, an
+    unrouted or unobserved seat, or a record absent, stale or rejected. A retry never
+    reaches here: classify_pane returns on it before any gate."""
     if abn is None or abn.kind != "provider-limit":
         return False
     if any(n not in PROVIDER_LIMIT_PATTERNS for n in abn.names):
         return False
-    if capture is not None and baseline is not None and finished_turns(capture) - baseline:
-        return True
+    if capture is not None and baseline is not None:
+        new = [ran for key, ran in _turns(capture) if key not in baseline.seen]
+        if new:
+            return new[-1]
     try:
         ws = workspace if workspace is not None else resolve_workspace()
         return provider_allows_now(ws, socket, session, probe=probe)

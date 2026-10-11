@@ -1687,19 +1687,72 @@ class TestStaleLimitBanner(unittest.TestCase):
     def test_a_refused_turn_under_the_banner_is_no_evidence(self):
         refused = "❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 1s · done 2:01 PM\n"
         pane = _EARLIER_TURN + refused + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
-        stale, _ = _mod.limit_step(pane, _mod.finished_turns(_LIVE_BEFORE), "/nonexistent-ws")
+        stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
         self.assertFalse(stale)
+
+    def test_a_refused_turn_of_two_seconds_or_more_is_no_evidence(self):
+        for line in ("  ⎿  You've hit your usage limit · resets Oct 13 at 11pm",
+                     "  ⎿  You're out of usage credits. Run /usage-credits to keep going."):
+            refused = f"❯ /startup\n{line}\n✻ Cooked for 2s · done 2:01 PM\n"
+            pane = _EARLIER_TURN + refused + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+            stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
+            self.assertFalse(stale, line)
+            self.assertEqual(compose_state(pane, "idle", True, limit_stale=stale)[3], "usage-limit")
+
+    def test_a_refusal_in_an_earlier_turn_does_not_discount_a_later_one(self):
+        pane = ("❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 2s · done 1:57 PM\n"
+                + _LATER_TURN + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER)
+        stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
+        self.assertTrue(stale)
+
+    def _polls(self, panes):
+        """Drive limit_step + compose_state over successive captures, as the loop does."""
+        baseline, out = None, []
+        for pane in panes:
+            stale, baseline = _mod.limit_step(pane, baseline, "/nonexistent-ws")
+            st = compose_state(pane, "idle", True, limit_stale=stale)
+            out.append((st[0], st[3]))
+        return out
+
+    def test_a_refused_turn_after_the_stale_verdict_turns_it_off(self):
+        refused = "❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 2s · done 2:05 PM\n"
+        third = _EARLIER_TURN + _LATER_TURN + refused + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+        self.assertEqual(self._polls([_LIVE_BEFORE, _LIVE_PANE, third]),
+                         [("blocked-human", "usage-limit"), ("idle-ready", None),
+                          ("blocked-human", "usage-limit")])
+
+    def test_a_new_banner_after_the_stale_verdict_turns_it_off(self):
+        third = _LIVE_PANE.replace("Oct 13", "Oct 20")
+        self.assertEqual(self._polls([_LIVE_BEFORE, _LIVE_PANE, third]),
+                         [("blocked-human", "usage-limit"), ("idle-ready", None),
+                          ("blocked-human", "usage-limit")])
+
+    def test_a_turn_that_runs_after_a_refusal_makes_it_stale_again(self):
+        refused = "❯ /startup\n  ⎿  You've hit your usage limit\n✻ Cooked for 2s · done 2:05 PM\n"
+        ran = "⏺ Done.\n✻ Worked for 9s · done 2:30 PM\n"
+        body = _EARLIER_TURN + _LATER_TURN + refused
+        tail = _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
+        self.assertEqual(self._polls([_LIVE_BEFORE, body + tail, body + ran + tail])[1:],
+                         [("blocked-human", "usage-limit"), ("idle-ready", None)])
+
+    def test_stripping_a_stale_banner_keeps_refusals_inside_turns(self):
+        refusal = "  ⎿  You've hit your usage limit"
+        stripped = _mod.strip_limit_banners(f"❯ /startup\n{refusal}\n✻ Cooked for 2s · done 2:05 PM\n"
+                                            + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER)
+        self.assertIn(refusal, stripped)
+        self.assertNotIn("Usage limit reached", stripped)
+        self.assertNotIn("Continuing automatically", stripped)
 
     def test_a_changed_suffix_on_the_same_turn_is_not_a_new_turn(self):
         pane = _LIVE_BEFORE.replace("1 monitor still running", "2 monitors still running")
-        stale, _ = _mod.limit_step(pane, _mod.finished_turns(_LIVE_BEFORE), "/nonexistent-ws")
+        stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
         self.assertFalse(stale)
 
     def test_stale_banner_never_hides_a_real_prompt_below_the_survey(self):
-        pane = (_EARLIER_TURN + _LATER_TURN + _SURVEY
+        pane = (_EARLIER_TURN + _LATER_TURN + _SURVEY + _WORKER_FOOTER
                 + "  Do you want to proceed?\n  Allow this action\n  Esc to cancel\n"
                 + _LIMIT_BANNER + _BYPASS_FOOTER)
-        stale, _ = _mod.limit_step(pane, _mod.finished_turns(_LIVE_BEFORE), "/nonexistent-ws")
+        stale, _ = _mod.limit_step(pane, _mod.limit_baseline(_LIVE_BEFORE), "/nonexistent-ws")
         self.assertTrue(stale)
         self.assertEqual(compose_state(pane, "idle", True, limit_stale=stale)[:2],
                          ("blocked-human", "awaiting user: permission"))
