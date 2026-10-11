@@ -17,7 +17,10 @@ fam="$(printf '%s' "$REQ" | sed -E 's/^claude-([a-z]+)-?.*/\1/; s/\[1m\]$//')"
 ver="$(printf '%s' "$REQ" | sed -nE 's/^claude-[a-z]+-([0-9]+(-[0-9]+)*).*/\1/p' | tr '-' '.')"
 # Exact display name at a boundary: "Opus 5" must not accept "Opus 5.1"; an alias
 # (no version) accepts whichever version the CLI chose for that family.
-if [ -n "$ver" ]; then ACCEPT="Set model to ${fam} $(printf '%s' "$ver" | sed 's/\./\\./g')([^0-9.]|$)"
+# `default` names no family — it resolves to whatever the CLI's default is, so the
+# echo says "Set model to Opus 5" and a ${fam}-anchored pattern can never match.
+if [ "$fam" = default ]; then ACCEPT="Set model to [A-Za-z]"
+elif [ -n "$ver" ]; then ACCEPT="Set model to ${fam} $(printf '%s' "$ver" | sed 's/\./\\./g')([^0-9.]|$)"
 else ACCEPT="Set model to ${fam}( [0-9][0-9.]*)?([^0-9.a-z]|$)"; fi
 DIALOG='Yes, switch'
 # A failed capture is a failed observation, never a zero.
