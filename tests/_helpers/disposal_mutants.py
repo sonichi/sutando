@@ -30,6 +30,9 @@ IN_QUARANTINE = {"fallback-links-then-unlinks", "place-replaces-a-taken-name",
 CLI = [REPO / "src" / "outbox_cli.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox_cli.py"]
 BRIDGE = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"]
 OUTBOX = [REPO / "src" / "outbox.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "outbox.py"]
+DEDUP = [REPO / "src" / "dedup_recovery.py", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "dedup_recovery.py"]
+IN_DEDUP = {"reask-republished", "reask-cleanup-fails-the-publication", "reask-claims-a-colliding-id",
+            "reask-claims-a-colliding-id-after-a-race", "reask-id-from-the-clock-alone"}
 IN_OUTBOX = {"proof-ignores-its-stamp", "binding-ignores-the-publication", "reader-trusts-the-earlier-digest", "delivered-rule-compares-the-composed-body", "delivered-body-never-differs"}
 IN_CLI = {"cli-exits-0-on-no-safe-move", "cli-reads-epoch-after-lock", "cli-parks-on-no-safe-move"}
 BACKEND = [REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "delivery_core" / "backend_a.py"]
@@ -39,7 +42,18 @@ GUARD = [REPO / "src" / "policy" / "egress" / "result.py",
 IN_GUARD = {"archive-clobbers-a-decision", "conflicting-record-stays-actionable", "update-ignores-id-ownership", "issue-reissues-a-reserved-id", "record-of-ignores-the-body", "migration-seeds-from-the-live-copy", "archive-outside-the-ledger-lock", "ledger-ignores-prior-records", "artifact-claims-another-body"}
 IN_BRIDGE = {"unsent-brings-back-a-send-instruction", "unsent-drops-the-delivered-body-reference", "unsent-ignores-a-changed-generation", "verdict-cache-keyed-by-task", "late-duplicate-hashes-the-raw-bytes", "unsent-skips-the-guard", "unsent-skips-owner-mention",
              "unsent-ignores-suppression", "unsent-hides-its-markers",              "confirmed-archives-another-body", "terminal-delivered-archives-another-body",
-             "late-duplicate-archives-another-body", "orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately"}
+             "late-duplicate-archives-another-body", "orphan-links-then-unlinks", "orphan-trusts-any-retirement", "orphan-decodes-privately",
+             "archive-by-pathname", "archive-replaced-drops-bookkeeping", "archive-error-retires",
+             "archive-fallback-retires",
+             "reask-id-per-pass", "reask-published-before-tracked",
+             "archive-warning-is-not-placed", "unsent-strands-the-task", "settle-under-a-live-reply",
+             "settle-an-undelivered-id", "reask-plan-unlocked",
+             "settle-forgets-a-live-task", "settle-never-retried",
+             "archive-result-ignores-the-task", "alias-never-retried", "alias-settles-on-its-primary",
+             "orphan-moves-before-tracking", "orphan-recovery-sends-before-tracking",
+             "track-keeps-a-non-durable-id", "track-exposes-before-durable", "settle-intent-not-restored",
+             "archive-moves-before-the-settle-intent", "settle-save-forgets-a-previous-process",
+             "ledger-marked-read-before-the-read", "unreadable-ledger-written-over"}
 STATE = Path(__file__).with_name(".disposal_mutant_applied")
 
 MUTANTS: dict[str, tuple[str, str, str]] = {
@@ -304,6 +318,148 @@ MUTANTS: dict[str, tuple[str, str, str]] = {
         "        os.link(str(rfile), str(Path(directory) / next(_names(base))))\n"
         "        Path(rfile).unlink()\n"
         "        done = disposal.Retired(disposal.Retirement.PLACED)\n"),
+    "archive-by-pathname": (
+        "a sent result is archived by renaming whatever holds its name",
+        "    done = disposal.retire_generation(RESULTS_DIR, path, generation, _log, ARCHIVE_RESULTS_DIR,\n"
+        "                                      _names(f\"{tid}-{int(time.time())}\"))\n",
+        "    ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)\n"
+        "    path.rename(ARCHIVE_RESULTS_DIR / f\"{tid}-{int(time.time())}.txt\")\n"
+        "    done = disposal.Retired(disposal.Retirement.PLACED)\n"),
+    "archive-rereads-generation": (
+        "the archive retires the generation it finds at the name, not the one that was sent",
+        "            done = _retire(Path(results_dir), Path(rfile), generation,",
+        "            done = _retire(Path(results_dir), Path(rfile), identity_of(rfile)[1],"),
+    "archive-replaced-drops-bookkeeping": (
+        "a replacement found at archive time is treated as retired",
+        "             \"archived; the newer one stays live\")\n        return False\n",
+        "             \"archived; the newer one stays live\")\n        return True\n"),
+    "archive-error-retires": (
+        "an archive the filesystem refuses still forgets the sent result",
+        "f\"result {tid}: sent, but could not be archived ({done.cause})\")\n        return False\n",
+        "f\"result {tid}: sent, but could not be archived ({done.cause})\")\n        return True\n"),
+    "archive-fallback-retires": (
+        "a sent result kept outside the archive still forgets the id",
+        "f\"result {tid}: sent, but kept outside the archive: {done.cause}\")\n        return False\n",
+        "f\"result {tid}: sent, but kept outside the archive: {done.cause}\")\n        return True\n"),
+    "no-primitive-calls-the-replacement-live": (
+        "without a no-replace rename, a replacement kept aside is reported as still live",
+        "            if _cannot_put_back():\n                log(",
+        "            if False:\n                log("),
+    "reask-id-per-pass": (
+        "every retried dedup decision mints a fresh re-ask id",
+        "        _reask_id(tid), commit_identity=_commit,",
+        "        f\"task-{uuid.uuid4().hex[:18]}\", commit_identity=_commit,"),
+    "reask-published-before-tracked": (
+        "a re-ask is published although its in-flight entry did not commit",
+        "            if not _save_inflight(inflight):\n                inflight.discard(new_id)\n                return False\n",
+        "            bool(_save_inflight(inflight))\n"),
+
+    "archive-warning-is-not-placed": (
+        "a placed archive with an unlock warning keeps the id looked for",
+        "    if not done.retired:\n        disposal.report_once(f\"archive:{tid}\"",
+        "    if not done.retired or done.warning:\n        disposal.report_once(f\"archive:{tid}\""),
+
+    "reask-cleanup-fails-the-publication": (
+        "a temp-file cleanup error after the re-ask was linked reads as a failed publication",
+        "        try:\n            tmp.unlink()\n        except OSError as e:",
+        "        try:\n            tmp.unlink()\n        except ZeroDivisionError as e:"),
+
+    "unsent-strands-the-task": (
+        "a reply kept for a person at a delivered id leaves its task pending and its id in flight",
+        "    if root is None or os.path.lexists(rfile):\n        return False",
+        "    if True:\n        return False"),
+    "settle-under-a-live-reply": (
+        "a task is retired although a newer reply is live at its name",
+        "    if root is None or os.path.lexists(rfile):\n        return False",
+        "    if root is None:\n        return False"),
+    "reask-plan-unlocked": (
+        "two planners may check and link the same re-ask at once",
+        "        with disposal.locked(RESULTS_DIR):\n            action, payload = plan_dedup_recovery(",
+        "        if True:\n            action, payload = plan_dedup_recovery("),
+
+
+    "settle-an-undelivered-id": (
+        "a task is retired although its id was never delivered",
+        "    if (read_item(root, item_id) or {}).get(\"status\") != \"DELIVERED\":\n        return False\n    return _settle_task(tid, inflight)\n",
+        "    if False:\n        return False\n    return _settle_task(tid, inflight)\n"),
+    "settle-never-retried": (
+        "a disposed-of id whose task could not be archived is never settled again",
+        "                    changed |= _settle_task(tid, inflight)\n",
+        "                    changed |= bool(0 and rfile)\n"),
+    "archive-result-ignores-the-task": (
+        "a sent result whose task could not be archived still retires every guard",
+        "    if not _archive_task_file(tid):\n        _task_left_executable(tid)\n        return False\n    _settled(tid)\n    return True\n",
+        "    _archive_task_file(tid)\n    _settled(tid)\n    return bool(tid)\n"),
+    "alias-never-retried": (
+        "only an id that is its own delivery is retried",
+        "                if tid in _SETTLE_PENDING or (tid not in _SETTLE_SCANNED and _result_disposed(tid)):\n",
+        "                if _delivery_tid(tid) == tid and (tid in _SETTLE_PENDING or (tid not in _SETTLE_SCANNED and _result_disposed(tid))):\n"),
+    "orphan-moves-before-tracking": (
+        "the late-duplicate arm moves the only live reply before the id is durably tracked",
+        "            if find_task_file(TASKS_DIR, tid) is not None and not _track_durably(tid, inflight):\n",
+        "            if find_task_file(TASKS_DIR, tid) is not None and not (_track_durably(tid, inflight) or True):\n"),
+    "orphan-recovery-sends-before-tracking": (
+        "orphan recovery delivers and moves the result before the id is durably tracked",
+        "        if not _track_durably(tid, inflight):\n            _log(f\"orphan sweep: {tid} could not be saved as in flight; its result stays \"\n                 \"live for a later sweep\")\n            continue\n",
+        "        if not (_track_durably(tid, inflight) or True):\n            _log(f\"orphan sweep: {tid} could not be saved as in flight; its result stays \"\n                 \"live for a later sweep\")\n            continue\n"),
+
+    "settle-forgets-a-live-task": (
+        "bookkeeping is forgotten although the task file is still in the executable queue",
+        "    if not _archive_task_file(tid):\n        _task_left_executable(tid)              # every caller",
+        "    if False:\n        _task_left_executable(tid)              # every caller"),
+    "alias-settles-on-its-primary": (
+        "an alias counts its primary's delivered record as its own",
+        "    return (root is not None and delivery == tid\n",
+        "    return (root is not None and delivery is not None\n"),
+
+
+    "reask-republished": (
+        "a retried decision writes its re-ask task again",
+        "        if mine:\n            return \"requeue\", new_task_id\n",
+        "        if False:\n            return \"requeue\", new_task_id\n"),
+    "reask-claims-a-colliding-id": (
+        "an id that holds another original's re-ask is handed to this caller",
+        "        if mine is False:\n            return \"defer\", None                         # the id is someone else's\n",
+        "        if mine is False and not mine is False:\n            return \"defer\", None                         # the id is someone else's\n"),
+    "reask-claims-a-colliding-id-after-a-race": (
+        "an id another pass took first is handed to this caller whatever it holds",
+        "            if _published_as(Path(tasks_dir), Path(results_dir), new_task_id, body):\n                return \"requeue\", new_task_id\n            return \"defer\", None\n",
+        "            if _published_as(Path(tasks_dir), Path(results_dir), new_task_id, body) is not None:\n                return \"requeue\", new_task_id\n            return \"defer\", None\n"),
+    "track-keeps-a-non-durable-id": (
+        "an id whose in-flight save failed is left in memory",
+        "        if not _save_inflight(set(inflight) | {tid}):\n            return False\n        inflight.add(tid)\n        return True\n",
+        "        inflight.add(tid)\n        if not _save_inflight(set(inflight) | {tid}):\n            return False\n        return True\n"),
+    "track-exposes-before-durable": (
+        "the id is visible to other threads before the write that holds it commits",
+        "        if not _save_inflight(set(inflight) | {tid}):\n            return False\n        inflight.add(tid)\n        return True\n",
+        "        inflight.add(tid)\n        if not _save_inflight(set(inflight) | {tid}):\n            inflight.discard(tid)\n            return False\n        return True\n"),
+    "settle-intent-not-restored": (
+        "a restart forgets the ids a previous process could not settle",
+        "        if _SETTLE_LOADED:\n            return True\n",
+        "        if True:\n            return True\n"),
+
+    "reask-id-from-the-clock-alone": (
+        "two originals asked in one millisecond are handed one re-ask id",
+        "    return f\"task-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}\"\n",
+        "    return f\"task-{int(time.time() * 1000)}\"\n"),
+    "archive-moves-before-the-settle-intent": (
+        "the sent result is moved although the intent proving it was served could not be saved",
+        "    if not _intend_settle(tid):\n",
+        "    if not (_intend_settle(tid) or True):\n"),
+
+    "settle-save-forgets-a-previous-process": (
+        "a save before the first drain overwrites the ids a previous process left",
+        "        if not _load_settle_pending():\n            return False\n        return _durable_write(",
+        "        if False:\n            return False\n        return _durable_write("),
+    "ledger-marked-read-before-the-read": (
+        "the ledger is marked read before its read resolves, so a failed or racing read loses its ids",
+        "        try:\n            text = _read_settle_ledger(_settle_pending_file())\n",
+        "        _SETTLE_LOADED = True\n        try:\n            text = _read_settle_ledger(_settle_pending_file())\n"),
+    "unreadable-ledger-written-over": (
+        "a ledger that could not be read is written over with this process's ids",
+        "        if not _load_settle_pending():\n            return False\n        return _durable_write(",
+        "        if not (_load_settle_pending() or True):\n            return False\n        return _durable_write("),
+
 }
 
 
@@ -318,6 +474,8 @@ def _files(name: str) -> "list[Path]":
         return BACKEND
     if name in IN_GUARD:
         return GUARD
+    if name in IN_DEDUP:
+        return DEDUP
     return QUARANTINE if name in IN_QUARANTINE else DISPOSAL
 
 

@@ -163,7 +163,7 @@ from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
+from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
@@ -560,7 +560,7 @@ def _dedup_recover(task_id: str, holder_id, channel_id):
     the caller routes or sends, because those are async here."""
     try:
         return plan_dedup_recovery(RESULTS_DIR, TASKS_DIR, task_id, holder_id,
-                                   channel_id, f"task-{int(time.time() * 1000)}")
+                                   channel_id, fresh_reask_id())
     except Exception as exc:  # noqa: BLE001 - never block the skip path
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
         # A planner that raised proved nothing about the asker being answered.

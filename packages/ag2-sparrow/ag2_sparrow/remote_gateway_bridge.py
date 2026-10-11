@@ -3736,22 +3736,164 @@ def _upload_task_attachment(wire_id: str, ordinal: int, path_str: str) -> "tuple
     return "ok", ""
 
 
-def _archive_result(path: Path, tid: str) -> None:
-    ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        path.rename(ARCHIVE_RESULTS_DIR / f"{tid}-{int(time.time())}.txt")
-    except OSError:
-        path.unlink(missing_ok=True)
-    # The delivered task's queue file comes along too — otherwise served tasks
-    # sit in tasks/ forever and the health-check counts them as a stuck queue.
+def _archive_result(path: Path, tid: str, generation) -> bool:
+    """Retire a sent result: the lifecycle owner moves only the publication
+    this pass read and sent, so a reply that replaced it meanwhile stays live.
+    False = the id must stay looked for; the caller keeps its bookkeeping."""
+    if not _intend_settle(tid):
+        disposal.report_once(f"intent:{tid}", _log,
+                             f"result {tid}: sent, but its settle intent could not be saved; nothing "
+                             "was moved, and the next pass tries again")
+        return False
+    done = disposal.retire_generation(RESULTS_DIR, path, generation, _log, ARCHIVE_RESULTS_DIR,
+                                      _names(f"{tid}-{int(time.time())}"))
+    if done.outcome is disposal.Retirement.REPLACEMENT_LIVE:
+        _log(f"result {tid}: the reply this pass sent was replaced at its name before it was "
+             "archived; the newer one stays live")
+        return False
+    if done.outcome is disposal.Retirement.FALLBACK:
+        disposal.report_once(f"archive:{tid}", _log,
+                             f"result {tid}: sent, but kept outside the archive: {done.cause}")
+        return False
+    if not done.retired:
+        disposal.report_once(f"archive:{tid}", _log,
+                             f"result {tid}: sent, but could not be archived ({done.cause})")
+        return False
+    if not _archive_task_file(tid):
+        _task_left_executable(tid)
+        return False
+    _settled(tid)
+    return True
+
+
+def _archive_task_file(tid: str) -> bool:
+    """Move a served task out of the queue. True once no file of it is left there;
+    a rename the core raced to first counts, one that failed does not."""
     tfile = find_task_file(TASKS_DIR, tid)
     if tfile is not None:
         archive_dir = TASKS_DIR / "archive"
-        archive_dir.mkdir(parents=True, exist_ok=True)
         try:
+            archive_dir.mkdir(parents=True, exist_ok=True)
             tfile.rename(archive_dir / f"{tid}.txt")
         except OSError:
-            pass  # best-effort; core may have archived it concurrently
+            pass
+    return find_task_file(TASKS_DIR, tid) is None
+
+
+# Ids whose result is disposed of but whose task could not be archived yet; each
+# drain pass retries them. A restart rebuilds the set by scanning each tracked id once.
+_SETTLE_PENDING: "set[str]" = set()
+_SETTLE_SCANNED: "set[str]" = set()
+_SETTLE_LOADED = False
+_SETTLE_MUTEX = threading.RLock()
+
+
+def _settle_pending_file() -> Path:
+    return _STATE / f"remote-task-settle-pending{_INST_SUFFIX}.json"
+
+
+def _read_settle_ledger(path: Path) -> "str | None":
+    """The ledger's text, None when there is none; any other failure raises."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+
+
+def _load_settle_pending() -> bool:
+    """Merge, once per process, the ids a previous process could not settle.
+    False while an existing ledger cannot be read: it must not be overwritten."""
+    global _SETTLE_LOADED
+    with _SETTLE_MUTEX:
+        if _SETTLE_LOADED:
+            return True
+        try:
+            text = _read_settle_ledger(_settle_pending_file())
+            ids = [] if text is None else json.loads(text)["ids"]
+            if not isinstance(ids, list):
+                raise ValueError("ids is not a list")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            disposal.report_once("settle-ledger", _log,
+                                 f"the settle-intent ledger could not be read ({e}); it is left as it is "
+                                 "and nothing is written over it until it can be")
+            return False
+        _SETTLE_PENDING.update(t for t in ids if isinstance(t, str) and _valid_local_tid(t))
+        _SETTLE_LOADED = True                   # published only once the read is resolved
+        return True
+
+
+def _save_settle_pending() -> bool:
+    """Load, merge and write as one transition; never over an unread ledger."""
+    with _SETTLE_MUTEX:
+        if not _load_settle_pending():
+            return False
+        return _durable_write(_settle_pending_file(), json.dumps({"ids": sorted(_SETTLE_PENDING)}))
+
+
+def _intend_settle(tid: str) -> bool:
+    """Record, before the sent result is moved, that this id was served: an
+    alias whose result then vanishes has no copy of its own to prove it."""
+    with _SETTLE_MUTEX:
+        _SETTLE_PENDING.add(tid)
+        return _save_settle_pending()
+
+
+def _settled(tid: str) -> None:
+    with _SETTLE_MUTEX:
+        if tid in _SETTLE_PENDING:
+            _SETTLE_PENDING.discard(tid)
+            _save_settle_pending()
+
+
+def _task_left_executable(tid: str) -> None:
+    """The settle intent is itself durable: after a restart an alias whose result
+    vanished has no copy of its own that would prove it disposed of."""
+    with _SETTLE_MUTEX:
+        _SETTLE_PENDING.add(tid)
+        saved = _save_settle_pending()
+    disposal.report_once(f"settle:{tid}", _log,
+                         f"result {tid}: its result is disposed of but its task could not be "
+                         "archived; it stays tracked and is retried each pass"
+                         + ("" if saved else " (the retry intent could not be saved)"))
+
+
+def _track_durably(tid: str, inflight: "set[str]") -> bool:
+    """Make the id restart-durable in flight before anything of it is removed.
+    Other threads see it only once the write holding it has committed."""
+    with _INFLIGHT_MUTEX:
+        if not _save_inflight(set(inflight) | {tid}):
+            return False
+        inflight.add(tid)
+        return True
+
+
+def _result_disposed(tid: str) -> bool:
+    """This id's own result was archived or kept, or its own delivery succeeded;
+    an alias is judged only by its own copies, never by its primary's record."""
+    if _delivered_copy_exists(tid) or undelivered_quarantine.find_quarantined(RESULTS_DIR, tid):
+        return True
+    root = getattr(_delivery_core().backend, "root", None)
+    delivery = _delivery_tid(tid)
+    return (root is not None and delivery == tid
+            and (read_item(root, _broker_tid(delivery)) or {}).get("status") == "DELIVERED")
+
+
+def _settle_task(tid: str, inflight: "set[str] | None" = None) -> bool:
+    """Retire the task of an id whose result is already disposed of. Nothing is
+    forgotten until its file has left the executable queue."""
+    if not _archive_task_file(tid):
+        _task_left_executable(tid)              # every caller made the id durable before this
+        return False
+    _settled(tid)
+    if inflight is not None:
+        inflight.discard(tid)
+    _forget_task_room(tid)
+    aliases = _load_dedup_aliases() or {}
+    if _delivery_tid(tid) == tid and not any(v == tid for k, v in aliases.items() if k != tid):
+        _forget_task_media(tid)
+    _forget_dedup_alias(tid)
+    _log(f"result {tid}: its result is disposed of and its task is archived; the task is retired")
+    return True
 
 
 # A legacy bare `.sending` claim carries no owner info, so recovery for those
@@ -4173,12 +4315,18 @@ def _holder_delivery_state(holder_id: str) -> str:
                                     (RESULTS_DIR / f"{holder_id}.txt").exists())
 
 
-def _dedup_plan(tid: str, holder_id: str | None):
+def _reask_id(tid: str) -> str:
+    """One re-ask per task: a pass that retries the decision reuses it."""
+    return "task-" + hashlib.sha256(f"dedup-reask\0{tid}".encode()).hexdigest()[:18]
+
+
+def _dedup_plan(tid: str, holder_id: str | None, inflight: "set[str] | None" = None):
     """Shared dedup recovery, bound to this adapter's directories.
 
     A requeue carries the delivery forward: the re-ask keeps the room, stays
     in flight, and aliases back to the id the broker is waiting on. Without
-    that the re-ask is written and its answer is never looked for.
+    that the re-ask is written and its answer is never looked for. With
+    `inflight`, the re-ask is durably in flight before it is published.
     """
     room = _load_task_rooms().get(tid, "")
 
@@ -4194,12 +4342,24 @@ def _dedup_plan(tid: str, holder_id: str | None):
         rooms = _load_task_rooms()
         rooms[new_id] = room
         _save_task_rooms(rooms)
+        if inflight is not None and new_id not in inflight:
+            inflight.add(new_id)
+            if not _save_inflight(inflight):
+                inflight.discard(new_id)
+                return False
         return True
 
-    action, payload = plan_dedup_recovery(
-        RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
-        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit,
-        channel_dir=CHANNEL_DIR, holder_delivery_state=_holder_delivery_state)
+    # One planner at a time: the published check and the link are not atomic
+    # across a watcher that claims or archives the re-ask in between.
+    try:
+        with disposal.locked(RESULTS_DIR):
+            action, payload = plan_dedup_recovery(
+                RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
+                _reask_id(tid), commit_identity=_commit,
+                channel_dir=CHANNEL_DIR, holder_delivery_state=_holder_delivery_state)
+    except OSError as e:
+        _log(f"dedup decision for {tid} deferred: {e}")
+        return "defer", None, room
     return action, payload, room
 
 
@@ -4715,6 +4875,17 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     return False
 
 
+def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None" = None) -> bool:
+    """A delivered id whose remaining reply the owner kept for a person or
+    archived has nothing left to deliver: its task is settled."""
+    root = getattr(_delivery_core().backend, "root", None)
+    if root is None or os.path.lexists(rfile):
+        return False                            # something is still live at the name: keep looking
+    if (read_item(root, item_id) or {}).get("status") != "DELIVERED":
+        return False
+    return _settle_task(tid, inflight)
+
+
 def _effective_item_id(core, broker_tid: str, no_send: bool) -> str:
     """A suppressed close for an already-delivered item rides its own record."""
     accepted = (read_item(core.backend.root, broker_tid) or {}) if no_send else {}
@@ -4801,6 +4972,7 @@ def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     _recover_disposing_claims()
+    _load_settle_pending()
     changed = False
     for tid in list(inflight):
         if not _valid_local_tid(tid):  # defense-in-depth: never read an unsafe path (local ids may carry the instance encoding)
@@ -4809,6 +4981,11 @@ def _post_ready_results(inflight: set[str]) -> None:
         rfile = RESULTS_DIR / f"{tid}.txt"
         raw, generation = _read_ready_generation(rfile)
         if raw is None:
+            # A disposed-of id whose task could not be archived earlier is retried here.
+            if not os.path.lexists(rfile):
+                if tid in _SETTLE_PENDING or (tid not in _SETTLE_SCANNED and _result_disposed(tid)):
+                    changed |= _settle_task(tid, inflight)
+                _SETTLE_SCANNED.add(tid)
             continue
         # Before the tier guard: a withheld review would name the shared room as its release target.
         mention = _owner_mention_disposition(tid, raw)
@@ -4829,7 +5006,7 @@ def _post_ready_results(inflight: set[str]) -> None:
         # Every dedup marker routes through the shared plan, malformed included:
         # it owns the reject-and-report policy (dedup_recovery.plan_dedup_recovery).
         if skip and skip.value == "deduped":
-            action, payload, room = _dedup_plan(tid, skip.extra)
+            action, payload, room = _dedup_plan(tid, skip.extra, inflight)
             if action == "wait":
                 inflight.add(payload)
                 changed = True
@@ -4856,6 +5033,7 @@ def _post_ready_results(inflight: set[str]) -> None:
                                                   "[no-send]" if mention else payload,
                                                   no_send=bool(mention), result_file=rfile,
                                                   generation=generation):
+                        changed |= _settle_delivered(tid, _broker_tid(_delivery), rfile, inflight)
                         continue
                 _holder = (skip.extra or "").strip()
                 # An out-of-grammar holder is sender-controlled; name its shape,
@@ -4863,7 +5041,8 @@ def _post_ready_results(inflight: set[str]) -> None:
                 _shown = (_holder if local_task_protocol.valid_archive_lookup_id(_holder)
                           else f"<malformed, {len(_holder)} chars>")
                 _log(f"dedup {action} for {tid} (holder {_shown} is not a valid delivery for this task)")
-                _archive_result(rfile, tid)
+                if not _archive_result(rfile, tid, generation):
+                    continue
                 inflight.discard(tid)
                 _forget_task_room(tid)
                 # A requeue carries the SAME delivery forward under a fresh local
@@ -4886,8 +5065,10 @@ def _post_ready_results(inflight: set[str]) -> None:
                                            _lease_close_body(skip),
                                            no_send=True, result_file=rfile,
                                            generation=generation):
+                changed |= _settle_delivered(tid, _broker_tid(_delivery), rfile, inflight)
                 continue
-            _archive_result(rfile, tid)
+            if not _archive_result(rfile, tid, generation):
+                continue
             # Retire the provenance WITH the result, never at read: this line is
             # only reached once the lease-closing POST has actually succeeded.
             _REDELIVERED.discard(tid)
@@ -4953,8 +5134,10 @@ def _post_ready_results(inflight: set[str]) -> None:
                 out_body = "(file attached)"
         if not _deliver_result_payload(tid, _wire, out_body, result_file=rfile,
                                        generation=generation):
+            changed |= _settle_delivered(tid, _wire, rfile, inflight)
             continue
-        _archive_result(rfile, tid)
+        if not _archive_result(rfile, tid, generation):
+            continue
         inflight.discard(tid)
         _forget_task_room(tid)
         _forget_task_media(tid)
@@ -5133,13 +5316,18 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             if _delivery is None or raw is None:
                 continue                        # ledger unreadable or not ready: a later sweep decides
             _item = _broker_tid(_delivery)
+            if find_task_file(TASKS_DIR, tid) is not None and not _track_durably(tid, inflight):
+                _log(f"orphan sweep: {tid} could not be saved as in flight; its reply stays "
+                     "live for a later sweep")
+                continue                        # the live reply is the only restart-durable trace
             _root = getattr(_delivery_core().backend, "root", None)
             if _root is not None and delivered_body_differs(_root, _item, raw):
                 _quarantine_unsent(rfile, tid, _item, generation)
-                continue
-            if _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, f"{tid}-{int(now)}-late-duplicate",
-                              generation):
+            elif _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, f"{tid}-{int(now)}-late-duplicate",
+                                generation):
                 _log(f"orphan sweep: {tid} is a post-delivery duplicate — moved aside")
+            if _settle_delivered(tid, _item, rfile, inflight):
+                _save_inflight(inflight)
             continue
         # No task anywhere: nothing resolves a destination — quarantine,
         # never a labeled re-delivery (permanent sweep error otherwise).
@@ -5195,14 +5383,25 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         # Same outcome owner as the live drain: a 2xx {"ok": false} is a
         # refusal, and an unconfirmed close must keep its retryable result.
         _btid = _broker_tid(delivery)
+        # Delivery may move the result; the id is restart-durable before anything can.
+        if not _track_durably(tid, inflight):
+            _log(f"orphan sweep: {tid} could not be saved as in flight; its result stays "
+                 "live for a later sweep")
+            continue
         if _deliver_result_payload(tid, _btid, labeled, no_send=bool(skip), result_file=rfile,
                                    generation=generation):
-            _archive_result(rfile, tid)
             _log(f"orphan sweep: recovered + gateway accepted {tid}; Matrix delivery unconfirmed")
+            if _archive_result(rfile, tid, generation):
+                inflight.discard(tid)           # settled: the in-flight entry was only a marker
+                _save_inflight(inflight)
             continue
         _item = _effective_item_id(_delivery_core(), _btid, bool(skip))
         if _delivery_core().backend.is_terminal(_item):
-            continue                            # disposed and logged by the delivery call
+            if _settle_delivered(tid, _btid, rfile, inflight):
+                _save_inflight(inflight)        # disposed and logged by the delivery call
+            continue
+        inflight.discard(tid)                   # a retryable failure: the sweep tries again
+        _save_inflight(inflight)
         _tries = _delivery_core().backend.attempts(_item)
         _log(f"orphan sweep: {tid} close not confirmed (attempt {_tries}) — will retry")
 
