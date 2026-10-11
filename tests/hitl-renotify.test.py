@@ -40,6 +40,16 @@ class Sender:
         return {"ok": True, "event_id": f"$ev{len(self.sent)}"}
 
 
+def seat_card(seat, guard, created=T0):
+    """A worker seat's core-blocked card, as core-input-watch raises one per repaint."""
+    return HumanRequirement(
+        kind="core-blocked", runtime="claude", message=f"worker {seat}\n\nI am blocked.",
+        title=f"worker {seat} · blocked-human", guard=guard,
+        device={"id": f"sutando-worker-{seat}", "name": f"worker {seat}"},
+        subject={"source": "tui", "session": f"sutando-worker-{seat}"},
+        created_at=created, updated_at=created)
+
+
 def blocking(kind="auth", guard="g1"):
     return HumanRequirement(
         kind=kind, runtime="claude", message="Claude Code needs to sign in again",
@@ -115,9 +125,72 @@ class RenotifyTests(unittest.TestCase):
         sent = self.drive()
         self.assertEqual([p["op"] for p in sent], ["edit", "message"])
         self.assertEqual(sent[0]["extra_content"][WIRE_FIELD]["status"], "resolved")
-        self.assertIn("Reconnected — resuming 3 queued tasks", sent[1]["body"])
+        self.assertIn("✓ Reconnected — Claude Code needs to sign in again; resuming 3 queued tasks.",
+                      sent[1]["body"])
         self.clock.advance(7 * HOUR)
         self.assertEqual(self.drive(), [])  # once, and no reminder after resolution
+
+    # -- one seat, many cards: the 2026-10-11 recovery flood --------------------------
+
+    def _seat_cards(self, seat, n, step=MIN):
+        ids = []
+        for i in range(n):
+            ids.append(self.mgr.create(seat_card(seat, f"{seat}-g{i}", self.clock.t)).id)
+            self.drive()
+            self.clock.advance(step)
+        return ids
+
+    def test_many_cards_for_one_seat_resolved_at_once_send_one_recovery(self):
+        ids = self._seat_cards("pro-dev", 58)
+        for i in ids:
+            self.mgr.resolve(i)
+        sent = self.drive()
+        messages = [p for p in sent if p["op"] == "message"]
+        self.assertEqual(len([p for p in sent if p["op"] == "edit"]), 58)
+        self.assertEqual(len(messages), 1, [m["body"] for m in messages])
+        self.assertEqual(messages[0]["body"],
+                         "✓ Cleared — worker pro-dev · blocked-human; Sutando has continued its work.")
+        self.assertTrue(all(self.mgr.store.projection(i).get("recovered") for i in ids))
+        self.clock.advance(7 * HOUR)
+        self.assertEqual(self.drive(), [])
+        self.assertEqual(pending_ids(self.mgr, clock=self.clock), [])
+
+    def test_one_recovery_per_seat(self):
+        seats = ("pro-dev", "pro-fast", "pro-comm")
+        ids = [i for seat in seats for i in self._seat_cards(seat, 4)]
+        for i in ids:
+            self.mgr.resolve(i)
+        bodies = sorted(p["body"] for p in self.drive() if p["op"] == "message")
+        self.assertEqual(bodies, sorted(
+            f"✓ Cleared — worker {s} · blocked-human; Sutando has continued its work." for s in seats))
+
+    def test_a_seat_still_blocked_owes_no_recovery_yet(self):
+        old, new = self._seat_cards("pro-dev", 2)
+        self.mgr.resolve(old)
+        self.assertEqual([p["op"] for p in self.drive()], ["edit"])
+        self.mgr.resolve(new)
+        sent = self.drive()
+        self.assertEqual([p["op"] for p in sent], ["edit", "message"])
+        self.assertIn("✓ Cleared — worker pro-dev", sent[1]["body"])
+
+    def test_many_open_cards_for_one_seat_share_one_reminder_clock(self):
+        self._seat_cards("pro-dev", 20, step=3 * MIN)
+        reminders = []
+        for _ in range(int(4 * HOUR // MIN)):
+            self.clock.advance(MIN)
+            reminders += [p["body"] for p in self.drive() if p["op"] == "message"]
+        # 30m after the newest card, then 2h later: two notices, not two per card.
+        self.assertEqual(len(reminders), 2, reminders)
+        self.assertTrue(reminders[0].startswith("⚠ Still blocked after 1h 27m — worker pro-dev"),
+                        reminders[0])
+
+    def test_a_reminder_for_one_seat_does_not_silence_another(self):
+        self._seat_cards("pro-dev", 3)
+        self._seat_cards("pro-fast", 3)
+        self.clock.advance(31 * MIN)
+        bodies = [p["body"] for p in self.drive() if p["op"] == "message"]
+        self.assertEqual(len(bodies), 2)
+        self.assertTrue(any("pro-dev" in b for b in bodies) and any("pro-fast" in b for b in bodies))
 
     def test_schedule_survives_a_restart(self):
         self.mgr.create(blocking())
