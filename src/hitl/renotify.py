@@ -90,6 +90,19 @@ def _current(req: HumanRequirement, projection: Dict) -> bool:
     return bool(projection.get("event_id")) and projection.get("revision", 0) >= req.revision
 
 
+def _pending_resolve(req: HumanRequirement, projection: Dict) -> bool:
+    """A resolved, notified, not-yet-recovered card whose own edit hasn't landed.
+
+    Its seat's recovery must wait for it, not fire around it: a rejected send
+    retries on the next drive, and skipping ahead here is what splits one
+    seat's recovery into two messages."""
+    if req.status != STATUS_RESOLVED or not projection.get("event_id"):
+        return False
+    if projection.get("revision", 0) >= req.revision:
+        return False
+    return bool(projection.get("notified_at")) and not projection.get("recovered")
+
+
 def _tasks(members: Iterable[Tuple[HumanRequirement, Dict]]) -> int:
     return len({t for r, _ in members for t in (r.blocked_task_ids or [])})
 
@@ -119,7 +132,7 @@ def plan(entries: Iterable[Tuple[HumanRequirement, Dict]], now: float) -> List[N
                               _tasks(open_), count + 1))
             continue
         owed = [(r, pj) for r, pj in members if due(r, pj, now) == RECOVERY]
-        if owed:
+        if owed and not any(_pending_resolve(r, pj) for r, pj in members):
             newest = max(owed, key=lambda m: m[0].created_at)[0]
             out.append(Notice(RECOVERY, newest, owed, min(r.created_at for r, _ in owed),
                               _tasks(owed), 0))

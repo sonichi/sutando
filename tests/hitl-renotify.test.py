@@ -40,6 +40,22 @@ class Sender:
         return {"ok": True, "event_id": f"$ev{len(self.sent)}"}
 
 
+class FlakySender(Sender):
+    """Rejects a chosen requirement's send exactly once, then accepts it."""
+
+    def __init__(self, reject_req_id):
+        super().__init__()
+        self._reject = reject_req_id
+        self._rejected_once = False
+
+    def __call__(self, payload):
+        if not self._rejected_once and self._reject in payload.get("dedupe_key", ""):
+            self._rejected_once = True
+            self.sent.append(payload)
+            return {"ok": False}
+        return super().__call__(payload)
+
+
 def seat_card(seat, guard, created=T0):
     """A worker seat's core-blocked card, as core-input-watch raises one per repaint."""
     return HumanRequirement(
@@ -154,6 +170,26 @@ class RenotifyTests(unittest.TestCase):
         self.clock.advance(7 * HOUR)
         self.assertEqual(self.drive(), [])
         self.assertEqual(pending_ids(self.mgr, clock=self.clock), [])
+
+    def test_a_rejected_resolve_edit_does_not_split_the_recovery(self):
+        ids = self._seat_cards("pro-dev", 3)
+        for i in ids:
+            self.mgr.resolve(i)
+        straggler = ids[0]
+        flaky = FlakySender(straggler)
+
+        first = project(self.mgr, flaky, ROOM, clock=self.clock)
+        self.assertEqual([p["op"] for p in flaky.sent if p["op"] == "message"], [],
+                         "no recovery yet: the straggler's edit hasn't landed")
+        self.assertFalse(self.mgr.store.projection(straggler).get("recovered"))
+
+        self.clock.advance(MIN)
+        second_sent_before = len(flaky.sent)
+        project(self.mgr, flaky, ROOM, clock=self.clock)
+        second = flaky.sent[second_sent_before:]
+        messages = [p for p in second if p["op"] == "message"]
+        self.assertEqual(len(messages), 1, [m["body"] for m in messages])
+        self.assertTrue(all(self.mgr.store.projection(i).get("recovered") for i in ids))
 
     def test_one_recovery_per_seat(self):
         seats = ("pro-dev", "pro-fast", "pro-comm")
