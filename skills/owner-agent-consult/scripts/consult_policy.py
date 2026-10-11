@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """owner-agent-consult policy: config, the trusted-task gate, the owner-only room guard,
-roster, the consult marker and thread, the chain trace and loop check, the correlated ask
-with its pending record, and matching a reply (which arrives as a new task) to that record. Pure over an injected transport, so
-the rules are testable without a gateway; consult.py supplies the room CLI transport.
+roster, plain asks and answers in a consult thread, the loop check and thread limits, the
+pending records and claims, and matching an answer to its consult. Correlation is by Matrix
+relations and this agent's own records only; no message carries anything but its text. Pure
+over an injected transport; consult.py supplies the room CLI transport.
 
 The transport is any object with:
   members(room) -> {ok, members: [{user_id, display_name, kind}], unidentified: int, reason}
@@ -29,10 +30,6 @@ SKILL_DIR = Path(__file__).resolve().parent.parent  # lint-workspace-resolution:
 _SRC = SKILL_DIR.parent.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
-
-# The one definition of the consult marker prefix; ask and answer lines both start with it.
-MARKER = "[owner-agent-consult:v2"
-_MARKER_FAMILY = "[owner-agent-consult:"
 
 CONFIG_ENABLED = "OWNER_AGENT_CONSULT_ENABLED"
 CONFIG_ROOM = "OWNER_AGENT_CONSULT_ROOM"
@@ -187,10 +184,6 @@ def roster(verdict: dict, self_mxid: str) -> List[dict]:
 
 
 # Trusted task gate
-def carries_marker(text: str) -> bool:
-    return _MARKER_FAMILY in (text or "")
-
-
 def _header_values(text: str, key: str) -> List[str]:
     prefix = f"{key}:"
     return [ln[len(prefix):].strip() for ln in text.split("\n") if ln.startswith(prefix)]
@@ -251,8 +244,6 @@ def trusted_task(task_id: str, workspace: Optional[Path]) -> dict:
         return no(f"task access_tier is {tier or 'absent'!r}, not owner")
     if any(v.lower() == "true" for v in _header_values(text, "collaborator")):
         return no("task is a collaborator task, not the owner's")
-    if carries_marker(text):
-        return no("task is itself a consult, not an owner task; consult onward with --via-task")
     if ltp.find_result(Path(workspace) / "results", task_id) is not None:
         return no("task already has a result; a replayed task cannot consult")
     origin = {k: headers[k] for k in _ORIGIN_KEYS if headers.get(k)}
@@ -303,7 +294,8 @@ def reconcile(transport, room: str, self_mxid: str, workspace: Path, *, task_id:
               expire_after_s: float = DEFAULT_EXPIRE_AFTER_S, now: Optional[float] = None) -> Optional[str]:
     """Settle every earlier ask from this owner task (or from this ask task to this agent) whose
     post was not confirmed: a failed write, a crash after the post, or an ambiguous transport
-    outcome. Found in the room by consult id: the record is completed. Otherwise it stays
+    outcome. Found in the room (this agent's own message, same thread, same text): the record
+    is completed. Otherwise it stays
     unconfirmed, whatever the read shows and however old it is, and this returns a refusal:
     nothing new is posted from this task while it may already be in the room."""
     now = time.time() if now is None else now
@@ -314,9 +306,10 @@ def reconcile(transport, room: str, self_mxid: str, workspace: Path, *, task_id:
     if not loose:
         return None
     messages = _room_messages(transport, room)
+    used = {r.get("ask_event") for st in ("pending", "answered") for r in records(workspace, st)} - {None}
     unresolved = []
     for st, r in loose:
-        fixed = _recover_ask(r, messages, self_mxid)
+        fixed = _recover_ask(r, messages, self_mxid, used)
         if fixed.get("ask_event"):
             try:
                 _write_record(_record_path(workspace, st, r["cid"]), fixed)
@@ -415,75 +408,9 @@ def mark_nudged(workspace: Path, cid: str, now: Optional[float] = None) -> dict:
     return {"ok": True, "cid": cid, "reason": None}
 
 
-# The consult marker: ask line and answer line
+# Asks and answers: plain messages, correlated only by Matrix relations and this agent's records
 def new_cid() -> str:
     return secrets.token_hex(8)
-
-
-def default_limits(now: Optional[float] = None) -> dict:
-    return {"since": int(time.time() if now is None else now), "max_s": DEFAULT_MAX_DURATION_S,
-            "max_asks": DEFAULT_MAX_ASKS}
-
-
-def ask_line(cid: str, root: Optional[str], chain: List[str], limits: Optional[dict] = None) -> str:
-    lim = limits or default_limits()
-    return (f"{MARKER} consult:{cid} root:{root or '-'} chain:{'>'.join(chain)} "
-            f"limits:{int(lim['since'])}/{int(lim['max_s'])}/{int(lim['max_asks'])}]")
-
-
-def answer_tag(cid: str) -> str:
-    return f"{MARKER} answer:{cid}]"
-
-
-_ASK = re.compile(rf"^{re.escape(MARKER)} consult:([0-9a-f]{{16}}) root:(\S+) chain:(\S+) "
-                  r"limits:(\d{1,12})/(\d{1,6})/(\d{1,4})\]$")
-_TAG = re.compile(rf"^{re.escape(MARKER)} answer:([0-9a-f]{{16}})\]$")
-_ORIG_HEAD, _CHAIN_HEAD, _ASK_HEAD = "Original question:", "Chain so far:", "Question for "
-
-
-def _first_line(body: str) -> tuple:
-    """(first line with any leading @-mention stripped, rest of the body)."""
-    lines = (body or "").strip().split("\n", 1)
-    first = lines[0].strip()
-    lead = first.split(" ", 1)[0]
-    if _MXID.match(lead):
-        first = first[len(lead):].lstrip(" —–-:")
-    return first, (lines[1] if len(lines) > 1 else "")
-
-
-def parse_ask(body: str) -> Optional[dict]:
-    """{cid, root (None on the thread's first ask), chain, limits, original_question} or None.
-    A chain lists distinct mxids, asker first; anything else is not an ask."""
-    first, rest = _first_line(body)
-    m = _ASK.match(first)
-    if not m:
-        return None
-    chain = m.group(3).split(">")
-    if len(chain) < 2 or len(set(chain)) != len(chain) or not all(_MXID.match(a) for a in chain):
-        return None
-    root = None if m.group(2) == "-" else m.group(2)
-    if root is not None and not root.startswith("$"):
-        return None
-    orig = ""
-    if rest.startswith(_ORIG_HEAD):
-        orig = rest[len(_ORIG_HEAD):].split(f"\n{_CHAIN_HEAD}", 1)[0].strip()
-    limits = {"since": int(m.group(4)), "max_s": int(m.group(5)), "max_asks": int(m.group(6))}
-    return {"cid": m.group(1), "root": root, "chain": chain, "limits": limits, "original_question": orig}
-
-
-def ask_body(question: str, cid: str, root: Optional[str], chain: List[str], original: str,
-             limits: Optional[dict] = None) -> str:
-    asker, target = chain[-2], chain[-1]
-    return (f"{ask_line(cid, root, chain, limits)}\n"
-            f"{_ORIG_HEAD} {original.strip()}\n"
-            f"{_CHAIN_HEAD} {' > '.join(chain)}\n"
-            f"{_ASK_HEAD}{target}: {question.strip()}\n\n"
-            f"Read this thread first. Answer from what you hold with `consult.py answer`, which posts\n"
-            f"ONE message in this thread @-mentioning {asker}, first line exactly\n"
-            f"{answer_tag(cid)}\n"
-            "If you consult another agent first, do it with `consult.py ask --via-task`, in this thread; "
-            "never ask an agent already in this consult's chain. When `ask` reports the consult limit "
-            "reached, answer with what you have.")
 
 
 def _ts_seconds(ts) -> Optional[float]:
@@ -492,38 +419,34 @@ def _ts_seconds(ts) -> Optional[float]:
     return float(ts) / 1000.0 if ts > 1e11 else float(ts)
 
 
-def effective_limits(root_msg: dict, marker: Optional[dict], max_duration_s: int, max_asks: int) -> Optional[dict]:
-    """The limits this agent enforces on a thread: the window starts at the root event's
-    server timestamp (never the marker's `since`), and each limit is the smaller of the
-    thread's marker and this agent's own config, so a root can narrow them, never widen them.
-    None when the root event carries no usable timestamp."""
+def effective_limits(root_msg: dict, own: Optional[dict], max_duration_s: int, max_asks: int) -> Optional[dict]:
+    """This agent's limits on a thread: the window starts at the root event's server timestamp,
+    and each limit is the smaller of the one recorded with this agent's first ask in the thread
+    and this agent's own config. None when the root event carries no usable timestamp."""
     since = _ts_seconds((root_msg or {}).get("ts"))
     if since is None:
         return None
-    marker = marker or {}
+    own = own or {}
     return {"since": since,
-            "max_s": min(int(marker.get("max_s", max_duration_s)), int(max_duration_s)),
-            "max_asks": min(int(marker.get("max_asks", max_asks)), int(max_asks))}
+            "max_s": min(int(own.get("max_s", max_duration_s)), int(max_duration_s)),
+            "max_asks": min(int(own.get("max_asks", max_asks)), int(max_asks))}
 
 
 def limit_reached(limits: dict, asks_so_far: int, now: float) -> Optional[str]:
-    """Why the thread takes no new ask, or None, for limits from effective_limits (or a
-    thread's first ask, before it is posted); out-of-range values are clamped."""
+    """Why the thread takes no new ask from this agent, or None; out-of-range values are clamped."""
     max_s = max(MAX_DURATION_FLOOR_S, min(int(limits["max_s"]), MAX_DURATION_CEILING_S))
     max_asks = max(MAX_ASKS_FLOOR, min(int(limits["max_asks"]), MAX_ASKS_CEILING))
     if now >= limits["since"] + max_s:
         return f"consult limit reached: the thread's {max_s}s window has passed"
     if asks_so_far >= max_asks:
-        return f"consult limit reached: the thread already has {asks_so_far} of {max_asks} asks"
+        return f"consult limit reached: this agent has made {asks_so_far} of {max_asks} asks in the thread"
     return None
 
 
-# The consult thread: what every agent reads before it asks or answers
 def thread_view(transport, room: str, root: str) -> dict:
-    """{ok, root_msg, msgs (oldest first), server_now} for the consult thread rooted at `root`,
-    or a refusal when the root is not visible: an unseen thread cannot be checked. `server_now`
-    is the newest server timestamp among the thread's own events, so an event elsewhere in the
-    room cannot move the window floor."""
+    """{ok, root_msg, msgs (oldest first), all (newest first), server_now} for the consult thread
+    rooted at `root`, or a refusal when the root is not in the read: an unseen thread cannot be
+    checked. `server_now` is the newest server timestamp among the thread's own events."""
     page = transport.read(room, READ_LIMIT)
     if not page.get("ok"):
         return {"ok": False, "reason": f"consult room unreadable: {page.get('reason')}"}
@@ -542,11 +465,9 @@ CLOCK_TOLERANCE_S = 120
 
 def measured_now(server_now_s: Optional[float], anchor: tuple, local_now: float) -> Optional[float]:
     """An estimate of the server's current time for the thread window (see SKILL.md
-    "Time-window invariant" for what it does and does not guarantee): the largest of the
-    thread's newest server timestamp, the anchor's server timestamp plus local time elapsed
-    since it, and the local clock. `anchor` is (server ts, local time) of one moment, or
-    (None, None). None (refuse) when no server timestamp is known, or when the local clock is
-    more than CLOCK_TOLERANCE_S behind the thread's newest server timestamp."""
+    "Time-window invariant"): the largest of the thread's newest server timestamp, the anchor's
+    server timestamp plus local time elapsed since it, and the local clock. None (refuse) when
+    no server timestamp is known, or the local clock is more than CLOCK_TOLERANCE_S behind it."""
     if server_now_s is None or local_now < server_now_s - CLOCK_TOLERANCE_S:
         return None
     terms = [server_now_s, local_now]
@@ -557,63 +478,43 @@ def measured_now(server_now_s: Optional[float], anchor: tuple, local_now: float)
 
 
 def server_now(messages: List[dict]) -> Optional[float]:
-    """The newest server timestamp among `messages`, in seconds: a lower bound on the server's
-    current time that no agent's own clock can move. None when no event carries one."""
+    """The newest server timestamp among `messages`, in seconds; None when no event has one."""
     stamps = [t for t in (_ts_seconds(m.get("ts")) for m in messages) if t is not None]
     return max(stamps) if stamps else None
 
 
-def asks_in(msgs: List[dict], owner_agents) -> List[dict]:
-    """Every ask in the thread posted by its own chain's asker, an agent of the owner."""
-    out = []
-    for m in msgs:
-        a = parse_ask(m.get("body") if isinstance(m.get("body"), str) else "")
-        if a and m.get("sender") in owner_agents and m.get("sender") == a["chain"][-2]:
-            out.append({**a, "event_id": m.get("event_id"), "sender": m.get("sender")})
-    return out
+def own_asks(workspace: Path, root: Optional[str]) -> List[dict]:
+    """This agent's posted asks in the thread rooted at `root`, oldest first (its own records)."""
+    if not root:
+        return []
+    mine = [r for st in ("pending", "answered") for r in records(workspace, st)
+            if r.get("root") == root and r.get("ask_event")]
+    return sorted(mine, key=lambda r: r.get("asked_at") or 0)
 
 
-def loop_check(asks: List[dict], self_mxid: str, target: str) -> Optional[str]:
-    """Refusal when `target` is already in this consult's chain and this would not be a
-    follow-up on an existing self->target link. Structural: read from the thread's markers."""
-    seen = {a for ask in asks for a in ask["chain"]}
-    links = {(ask["chain"][-2], ask["chain"][-1]) for ask in asks}
-    if target in seen and (self_mxid, target) not in links:
-        return (f"{target} is already in this consult's chain; answer from what the thread has "
-                "instead of asking it")
+def loop_check(thread_msgs: List[dict], mine: List[dict], target: str) -> Optional[str]:
+    """Refusal when `target` has already posted in this consult thread and this agent never
+    asked it there: it is already part of the consult (it asked, or was asked by someone
+    else). A follow-up to an agent this agent asked is allowed. Structural: senders only."""
+    posted = {m.get("sender") for m in thread_msgs}
+    if target in posted and target not in {r.get("agent") for r in mine}:
+        return (f"{target} has already taken part in this consult thread; answer from what the "
+                "thread has instead of asking it")
     return None
 
 
-def _admission(root_msg: dict, marker: dict, msg: dict, asks: List[dict], event: str,
-               max_duration_s: int, max_asks: int) -> Optional[str]:
-    """Why this ask was not admitted by the thread's limits when it was posted, or None: its own
-    server timestamp must fall inside the root's window and its place among the thread's asks,
-    in timeline order, within the ask limit. An ask admitted in time can still be answered
-    after the deadline, so a chain can unwind."""
-    limits = effective_limits(root_msg, marker, max_duration_s, max_asks)
-    posted = _ts_seconds(msg.get("ts"))
-    if limits is None or posted is None:
-        return "no server timestamp on the root or the ask"
-    order = [a["event_id"] for a in asks]
-    if event not in order:
-        return "the ask is not in its thread"
-    reason = limit_reached(limits, order.index(event), posted)
-    return reason.replace("consult limit reached: ", "") if reason else None
-
-
-def incoming_ask(transport, room: str, self_mxid: str, task_id: str,
-                 workspace: Optional[Path], owner_agents,
-                 max_duration_s: int = DEFAULT_MAX_DURATION_S, max_asks: int = DEFAULT_MAX_ASKS) -> dict:
-    """The consult ask a live verified task delivered to this agent, traced through the
-    thread to a root ask posted by the chain's first agent (one of the owner's agents; whether
-    its owner-task gate ran cannot be checked from here). Refuses anything whose chain the
-    thread does not show link by link."""
+def incoming_ask(transport, room: str, self_mxid: str, task_id: str, workspace: Optional[Path],
+                 owner_agents, max_duration_s: int = DEFAULT_MAX_DURATION_S) -> dict:
+    """The consult ask a live verified task delivered to this agent: the gateway delivered it
+    because the message mentions this agent. The message must be from another of the owner's
+    agents, in the consult room, in (or rooting) a thread whose root is an owner's agent's
+    message, and posted within this agent's window for that thread."""
     def no(reason):
         return {"ok": False, "reason": reason}
+    import local_task_protocol as ltp
     got = live_task(task_id, workspace)
     if not got["ok"]:
         return no(got["reason"])
-    import local_task_protocol as ltp
     h = got["headers"]
     if room not in (h.get("channel_id"), h.get("source_room_id")):
         return no("task did not come from the consult room")
@@ -625,52 +526,38 @@ def incoming_ask(transport, room: str, self_mxid: str, task_id: str,
         return no(f"consult room unreadable: {page.get('reason')}")
     msg = next((m for m in page.get("messages") or [] if isinstance(m, dict)
                 and event and m.get("event_id") == event), None)
-    if msg is None or not isinstance(msg.get("body"), str):
+    if msg is None:
         return no(f"ask event not in the last {READ_LIMIT} messages of the consult room")
-    ask = parse_ask(msg["body"])
-    if ask is None:
-        return no("task is not a consult ask")
     sender = msg.get("sender")
-    if ask["chain"][-1] != self_mxid or ask["chain"][-2] != sender or sender not in owner_agents:
-        return no("ask is not addressed to this agent by one of the owner's agents")
-    root = ask["root"] or event
-    if ask["root"] is None and (len(ask["chain"]) != 2 or msg.get("thread_root")):
-        return no("a thread's first ask must be a direct ask from the owner's agent")
-    if ask["root"] is not None and msg.get("thread_root") != root:
-        return no("ask is not posted in its consult thread")
+    if sender == self_mxid or sender not in owner_agents:
+        return no("the ask is not from another of the owner's agents")
+    root = msg.get("thread_root") or event
     view = thread_view(transport, room, root)
     if not view["ok"]:
         return no(view["reason"])
-    asks = asks_in(view["msgs"], owner_agents)
-    first = next((a for a in asks if a["event_id"] == root and a["root"] is None), None)
-    if first is None or first["chain"][0] != ask["chain"][0]:
-        return no("the thread root is not a consult ask by this chain's first agent")
-    chains = {tuple(a["chain"]) for a in asks}
-    for k in range(2, len(ask["chain"])):
-        if tuple(ask["chain"][:k]) not in chains:
-            return no(f"the thread shows no ask for {' > '.join(ask['chain'][:k])}; "
-                      "the chain does not trace to the root ask")
-    admitted = _admission(view["root_msg"], first["limits"], msg, asks, event, max_duration_s, max_asks)
-    if admitted:
-        return no(f"this ask was posted outside the thread's limits ({admitted}); "
+    if view["root_msg"].get("sender") not in owner_agents:
+        return no("the consult thread's root is not from one of the owner's agents")
+    window = effective_limits(view["root_msg"], None, max_duration_s, MAX_ASKS_CEILING)
+    posted = _ts_seconds(msg.get("ts"))
+    if window is None or posted is None:
+        return no("no server timestamp on the thread root or the ask")
+    late = limit_reached(window, 0, posted)
+    if late:
+        return no(f"this ask was posted outside the thread's window ({late.replace('consult limit reached: ', '')}); "
                   "it is not answered or consulted from")
-    return {"ok": True, "cid": ask["cid"], "root": root, "chain": ask["chain"], "asker": sender,
-            "ask_event": event, "original_question": ask["original_question"] or first["original_question"],
-            "asks": asks, "limits": first["limits"], "root_msg": view["root_msg"],
-            "server_now": view["server_now"], "anchor": (_ts_seconds(msg.get("ts")), got["arrived_at"]),
-            "reason": None}
+    return {"ok": True, "root": root, "asker": sender, "ask_event": event, "root_msg": view["root_msg"],
+            "msgs": view["msgs"], "server_now": view["server_now"],
+            "anchor": (posted, got["arrived_at"]), "reason": None}
 
 
-# Ask: from a verified owner task, or onward from a consult ask this agent received
 def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
             workspace: Optional[Path], task_id: Optional[str] = None, via_task: Optional[str] = None,
             cid: Optional[str] = None, now: Optional[Callable[[], float]] = None,
             max_duration_s: int = DEFAULT_MAX_DURATION_S, max_asks: int = DEFAULT_MAX_ASKS,
             expire_after_s: float = DEFAULT_EXPIRE_AFTER_S) -> dict:
-    """Every gate, then the one post in the consult thread and its pending record; returns at
-    once with {asked, agent, cid, ask_event, root, chain, limits, follow_up} or {asked: False,
-    reason}. The limits given here apply only to a thread's first ask; later asks use the
-    thread's. Nothing is posted unless all gates pass."""
+    """Every gate, then the one post (a plain message mentioning `agent`, in the consult thread)
+    and its pending record; returns at once with {asked, agent, cid, ask_event, root, limits,
+    follow_up} or {asked: False, reason}. Nothing is posted unless all gates pass."""
     def no(reason, **extra):
         return {"asked": False, "agent": agent, "reason": reason, **extra}
     clock = now or time.time
@@ -679,7 +566,7 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
         return no("malformed correlation id")
     if bool(task_id) == bool(via_task):
         return no("name exactly one of an owner task (--task-id) or a consult ask (--via-task)")
-    origin, via = {}, None
+    origin, via, gate = {}, None, None
     if task_id:
         gate = trusted_task(task_id, workspace)
         if not gate["ok"]:
@@ -687,8 +574,6 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
         origin = gate["origin"]
     if not question or not question.strip():
         return no("empty question")
-    if carries_marker(question):
-        return no("question carries the consult marker")
     verdict = guard(room, self_mxid, transport)
     if not verdict["ok"]:
         return no(verdict["reason"])
@@ -697,56 +582,50 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
     if task_id and room in (origin.get("channel_id"), origin.get("source_room_id")) \
             and gate["sender"] != verdict["owner"]:
         return no("an owner task from the consult room must be the owner's own message")
+    owner_agents = verdict["owner_agents"] | {self_mxid}
+    own = {"max_s": int(max_duration_s), "max_asks": int(max_asks)}
     if task_id:
-        refusal = reconcile(transport, room, self_mxid, workspace, task_id=task_id,
-                            expire_after_s=expire_after_s)
+        refusal = reconcile(transport, room, self_mxid, workspace, task_id=task_id)
         if refusal:
             return no(refusal)
         prior = prior_ask(workspace, "task_id", task_id)
         root = prior["root"] if prior else None
-        chain = [self_mxid, agent]
-        original = (prior or {}).get("original_question") or question.strip()
-        limits = {"since": int(clock()), "max_s": int(max_duration_s), "max_asks": int(max_asks)}
-        asks, now_s = [], clock()  # a first ask opens its own window; nothing to measure yet
+        msgs, root_msg, now_s = [], None, clock()  # a first ask opens its own window
         if root:
             view = thread_view(transport, room, root)
             if not view["ok"]:
                 return no(view["reason"])
-            first_own = prior or {}
-            now_s = measured_now(view["server_now"],
-                                 (_ts_seconds(view["root_msg"].get("ts")), first_own.get("asked_at")), clock())
-            asks = asks_in(view["msgs"], verdict["owner_agents"] | {self_mxid})
-            marker = (parse_ask(view["root_msg"].get("body") or "") or {}).get("limits")
-            limits = effective_limits(view["root_msg"], marker, max_duration_s, max_asks)
+            msgs, root_msg = view["msgs"], view["root_msg"]
+            now_s = measured_now(view["server_now"], (_ts_seconds(root_msg.get("ts")), prior.get("asked_at")),
+                                 clock())
     else:
-        inc = incoming_ask(transport, room, self_mxid, via_task, workspace,
-                           verdict["owner_agents"] | {self_mxid}, max_duration_s, max_asks)
+        inc = incoming_ask(transport, room, self_mxid, via_task, workspace, owner_agents, max_duration_s)
         if not inc["ok"]:
             return no(inc["reason"])
-        refusal = reconcile(transport, room, self_mxid, workspace, via_task=via_task, agent=agent,
-                            expire_after_s=expire_after_s)
+        refusal = reconcile(transport, room, self_mxid, workspace, via_task=via_task, agent=agent)
         if refusal:
             return no(refusal)
-        root, asks, original = inc["root"], inc["asks"], inc["original_question"]
-        limits = effective_limits(inc["root_msg"], inc["limits"], max_duration_s, max_asks)
+        root, msgs, root_msg = inc["root"], inc["msgs"], inc["root_msg"]
         now_s = measured_now(inc["server_now"], inc["anchor"], clock())
-        chain = inc["chain"] + [agent]
-        via = {"task_id": via_task, "cid": inc["cid"], "asker": inc["asker"],
-               "ask_event": inc["ask_event"]}
-    refusal = loop_check(asks, self_mxid, agent)
+        via = {"task_id": via_task, "asker": inc["asker"], "ask_event": inc["ask_event"]}
+    mine = own_asks(workspace, root)
+    refusal = loop_check(msgs, mine, agent)
     if refusal:
         return no(refusal)
-    if limits is None:
-        return no("the consult thread's root event has no server timestamp; cannot apply the thread limits")
-    if now_s is None:
-        return no("cannot measure the thread window on server time: this agent's clock is more than "
-                  f"{CLOCK_TOLERANCE_S}s behind the consult thread's newest server timestamp")
-    refusal = limit_reached(limits, len(asks), now_s)
-    if refusal:
-        return no(refusal, limit_reached=True)
+    if root:
+        first_limits = (mine[0].get("limits") if mine else None) or own
+        limits = effective_limits(root_msg, first_limits, max_duration_s, max_asks)
+        if limits is None:
+            return no("the consult thread's root event has no server timestamp; cannot apply the thread limits")
+        if now_s is None:
+            return no("cannot measure the thread window on server time: this agent's clock is more than "
+                      f"{CLOCK_TOLERANCE_S}s behind the consult thread's newest server timestamp")
+        refusal = limit_reached(limits, len(mine), now_s)
+        if refusal:
+            return no(refusal, limit_reached=True)
     if _record_path(workspace, "pending", cid).exists() or _record_path(workspace, "answered", cid).exists():
         return no("correlation id already used")
-    follow_up = any(a["chain"][-2:] == [self_mxid, agent] for a in asks)
+    follow_up = agent in {r.get("agent") for r in mine}
     path = _record_path(workspace, "pending", cid)
     new_root = bool(task_id) and not root
     if new_root and not claim_root(workspace, task_id, cid):
@@ -756,18 +635,16 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
     def release():
         if new_root:
             _root_claim(workspace, task_id).unlink(missing_ok=True)
+    body = question.strip()
     record = {"cid": cid, "task_id": task_id, "via_task": via_task, "via": via, "agent": agent,
-              "room": room, "root": root, "chain": chain, "ask_event": None, "asked_at": clock(),
-              "origin": origin, "question": question.strip()[:500], "original_question": original[:500],
-              "limits": limits}
+              "room": room, "root": root, "ask_event": None, "asked_at": clock(), "origin": origin,
+              "body": body, "limits": own, "skipped": []}
     try:
         _write_record(path, record)
     except OSError as e:
         release()
         return no(f"pending record unwritable: {e}")
-    reply_to = via["ask_event"] if via else None
-    sent = transport.mention(agent, ask_body(question, cid, root, chain, original, limits), room,
-                             reply_to=reply_to, thread_root=root)
+    sent = transport.mention(agent, body, room, reply_to=via["ask_event"] if via else None, thread_root=root)
     if _sent_before_publication(sent):
         path.unlink(missing_ok=True)
         release()
@@ -775,10 +652,10 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
     event = sent.get("event_id") if sent.get("ok") else None
     if not event:
         return {"asked": True, "unconfirmed": True, "agent": agent, "cid": cid, "ask_event": None,
-                "root": root, "chain": chain, "limits": limits, "follow_up": follow_up,
+                "root": root, "limits": own, "follow_up": follow_up,
                 "warning": f"the post may have landed ({sent.get('reason') or 'no event id'}); the record "
                            "and any root claim are kept, and `match` or the next ask reconciles it from "
-                           "the room by consult id",
+                           "the room",
                 "reason": None}
     record.update(ask_event=event, root=root or event)
     warning = None
@@ -788,25 +665,45 @@ def consult(transport, *, room: str, self_mxid: str, agent: str, question: str,
     except OSError as e:
         warning = f"ask posted but its event id was not recorded ({e}); match recovers it from the room"
     return {"asked": True, "agent": agent, "cid": cid, "ask_event": event, "root": record["root"],
-            "chain": chain, "limits": limits, "follow_up": follow_up, "warning": warning, "reason": None}
+            "limits": own, "follow_up": follow_up, "warning": warning, "reason": None}
+
+
+def _strip_mention(body: str, mxid: str) -> str:
+    """The body without a leading mention of `mxid` (the room CLI's mention form)."""
+    text = (body or "").strip()
+    if mxid and text.startswith(mxid):
+        text = text[len(mxid):].lstrip(" —–-:")
+    return text
+
+
+def _recover_ask(rec: dict, messages: List[dict], self_mxid: str, used=frozenset()) -> dict:
+    """A record whose post was not recorded gets its ask event (and root) back from this
+    agent's own message in the room: same sender, same thread, the exact text it posted, not
+    already some other record's ask. Identity, not interpretation: the text is compared whole."""
+    if rec.get("ask_event"):
+        return rec
+    for m in reversed(messages):  # oldest first
+        if (m.get("sender") == self_mxid and m.get("event_id") not in used
+                and _strip_mention(m.get("body") or "", rec.get("agent") or "") == rec.get("body")
+                and (m.get("thread_root") or None) == (rec.get("root") or None)):
+            return {**rec, "ask_event": m.get("event_id"), "root": rec.get("root") or m.get("event_id")}
+    return rec
 
 
 def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Optional[Path],
            task_id: Optional[str] = None, up: Optional[str] = None,
            max_duration_s: int = DEFAULT_MAX_DURATION_S, max_asks: int = DEFAULT_MAX_ASKS,
            expire_after_s: float = DEFAULT_EXPIRE_AFTER_S) -> dict:
-    """Post this agent's answer to a consult ask, in its thread, replying to the ask,
-    @-mentioning the asker, first line its answer line. The ask is the one a live task
-    delivered (`task_id`), or, to pass an answer up the chain, the ask an onward consult of
-    this agent's came from (`up`, that consult's id)."""
+    """Post this agent's answer to a consult ask, once: a plain message in the thread, replying
+    to the ask and mentioning the asker. The ask is the one a live task delivered (`task_id`), or,
+    to pass an answer up, the ask an onward consult of this agent's came from (`up`, its id).
+    Any agent may instead just reply in the thread; this is the at-most-once path."""
     def no(reason):
         return {"answered": False, "reason": reason}
     if bool(task_id) == bool(up):
         return no("name exactly one of the ask's task (--task-id) or an onward consult (--up)")
     if not text or not text.strip():
         return no("empty answer")
-    if carries_marker(text):
-        return no("answer text carries the consult marker")
     verdict = guard(room, self_mxid, transport)
     if not verdict["ok"]:
         return no(verdict["reason"])
@@ -816,24 +713,26 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
         via = (rec or {}).get("via")
         if not via or not rec.get("root"):
             return no(f"{up} is not an onward consult of this agent")
-        inc = {"cid": via["cid"], "asker": via["asker"], "ask_event": via["ask_event"], "root": rec["root"]}
+        inc = {"asker": via["asker"], "ask_event": via["ask_event"], "root": rec["root"]}
         posters = [rec.get("reply_task"), via.get("task_id")]
     else:
         inc = incoming_ask(transport, room, self_mxid, task_id, workspace,
-                           verdict["owner_agents"] | {self_mxid}, max_duration_s, max_asks)
+                           verdict["owner_agents"] | {self_mxid}, max_duration_s)
         if not inc["ok"]:
             return no(inc["reason"])
         posters = [task_id]
-    lim = effective_limits(inc["root_msg"], inc["limits"], max_duration_s, max_asks) if inc.get("root_msg") else None
-    now_s = measured_now(inc["server_now"], inc["anchor"], time.time()) if lim else None
-    reached = limit_reached(lim, len(inc["asks"]), now_s) if lim and now_s is not None else None
-    base = {"answered": True, "to": inc["asker"], "cid": inc["cid"], "root": inc["root"],
+    reached = None
+    if inc.get("root_msg"):
+        lim = effective_limits(inc["root_msg"], None, max_duration_s, max_asks)
+        now_s = measured_now(inc["server_now"], inc["anchor"], time.time()) if lim else None
+        reached = limit_reached(lim, 0, now_s) if lim and now_s is not None else None
+    base = {"answered": True, "to": inc["asker"], "ask_event": inc["ask_event"], "root": inc["root"],
             "limit_reached": reached, "reason": None}
-    claim_path = _answer_claim(workspace, inc["cid"])
+    claim_path = _answer_claim(workspace, inc["ask_event"])
     held = _read_record(claim_path)
     if held is not None:
         if not held.get("event_id"):
-            found = _own_answer(_room_messages(transport, room), self_mxid, inc["cid"])
+            found = _own_answer(_room_messages(transport, room), self_mxid, inc["ask_event"])
             if not found:
                 return no("an earlier answer to this ask is unconfirmed: it may already be in the room, "
                           "so it is not posted again")
@@ -841,11 +740,10 @@ def answer(transport, *, room: str, self_mxid: str, text: str, workspace: Option
             _write_record(claim_path, held)
         _note_tasks(claim_path, held, posters)
         return {**base, "event_id": held["event_id"], "replay": True}
-    if not _claim_file(claim_path, {"cid": inc["cid"], "to": inc["asker"], "at": time.time(), "event_id": None,
-                                    "tasks": [t for t in posters if t]}):
+    if not _claim_file(claim_path, {"ask_event": inc["ask_event"], "to": inc["asker"], "at": time.time(),
+                                    "event_id": None, "tasks": [t for t in posters if t]}):
         return no("another answer to this ask is being posted")
-    sent = transport.mention(inc["asker"], f"{answer_tag(inc['cid'])}\n{text.strip()}", room,
-                             reply_to=inc["ask_event"], thread_root=inc["root"])
+    sent = transport.mention(inc["asker"], text.strip(), room, reply_to=inc["ask_event"], thread_root=inc["root"])
     if _sent_before_publication(sent):
         claim_path.unlink(missing_ok=True)
         return no(f"answer not posted: {sent.get('reason')}")
@@ -873,8 +771,7 @@ def _note_tasks(path: Path, claim: dict, tasks: List[Optional[str]]) -> None:
 
 
 def task_can_post(workspace: Path, task_id: Optional[str]) -> bool:
-    """True while `task_id` is live in this inbox with no result: something could still post
-    from it, so no claim it holds may be released."""
+    """True while `task_id` is live in this inbox with no result."""
     import local_task_protocol as ltp
     from task_archive import find_task_file
     if not task_id or not ltp.valid_task_id(task_id):
@@ -884,8 +781,10 @@ def task_can_post(workspace: Path, task_id: Optional[str]) -> bool:
     return ltp.find_result(Path(workspace) / "results", task_id) is None
 
 
-def _answer_claim(workspace: Path, cid: str) -> Path:
-    return Path(workspace) / _STATE / "answers" / f"{cid}.json"
+def _answer_claim(workspace: Path, ask_event: str) -> Path:
+    import hashlib
+    key = hashlib.sha256(str(ask_event).encode("utf-8")).hexdigest()[:16]
+    return Path(workspace) / _STATE / "answers" / f"{key}.json"
 
 
 def _claim_file(path: Path, data: dict) -> bool:
@@ -902,83 +801,87 @@ def _claim_file(path: Path, data: dict) -> bool:
     return True
 
 
-def _own_answer(messages: List[dict], self_mxid: str, cid: str) -> Optional[str]:
-    """The event id of this agent's own answer to consult `cid` in the room read, if any."""
+def _own_answer(messages: List[dict], self_mxid: str, ask_event: str) -> Optional[str]:
+    """The event id of this agent's own reply to `ask_event` in the room read, if any."""
     for m in messages:
-        if m.get("sender") == self_mxid and _first_line(m.get("body") or "")[0] == answer_tag(cid):
+        if m.get("sender") == self_mxid and m.get("in_reply_to") == ask_event:
             return m.get("event_id")
     return None
 
 
-def _recover_ask(rec: dict, messages: List[dict], self_mxid: str) -> dict:
-    """A record whose post was not recorded (a failed write, or a crash after the post) gets
-    its ask event and root back from this agent's own ask in the room, found by consult id."""
-    if rec.get("ask_event"):
-        return rec
+def _candidates(rec: dict, messages: List[dict]) -> List[dict]:
+    """Messages from the asked agent in the consult's thread after its ask, oldest first,
+    minus those this agent judged not final. `messages` is a read, newest first."""
+    ask = rec.get("ask_event")
+    out = []
     for m in messages:
-        a = parse_ask(m.get("body") if isinstance(m.get("body"), str) else "")
-        if a and a["cid"] == rec["cid"] and m.get("sender") == self_mxid and a["chain"][-1] == rec.get("agent"):
-            return {**rec, "ask_event": m.get("event_id"), "root": a["root"] or m.get("event_id")}
-    return rec
+        if m.get("event_id") == ask:
+            break
+        in_consult = m.get("thread_root") == rec.get("root") or m.get("in_reply_to") == ask
+        if (m.get("sender") == rec.get("agent") and in_consult
+                and m.get("event_id") not in (rec.get("skipped") or [])):
+            out.append(m)
+    return list(reversed(out))
 
 
-def match_reply(transport, *, room: str, self_mxid: str, task_id: str,
-                workspace: Optional[Path], expire_after_s: float = DEFAULT_EXPIRE_AFTER_S,
-                now: Optional[float] = None) -> dict:
-    """Bind a reply task to its pending consult: the reply must be a verified live task from
-    the consult room, whose room event comes from the asked agent, sits in the consult's
-    thread, carries that consult's answer line, and replies to that consult's ask (or the
-    root) when it cites anything. Returns where the answer goes next: the owner (`lead`) or
-    up the chain (`answer_up`)."""
+def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Path],
+                task_id: Optional[str] = None, event_id: Optional[str] = None, not_final: bool = False,
+                expire_after_s: float = DEFAULT_EXPIRE_AFTER_S, now: Optional[float] = None) -> dict:
+    """Bind a message to the pending consult it answers: a message from the asked agent, in that
+    consult's thread, after its ask; the first such message this agent has not judged not final.
+    The message is named by the task it arrived as (`task_id`) or by its event (`event_id`).
+    `not_final` records that this agent read the message as progress (or as an onward ask),
+    so the next message from that agent becomes the candidate. Returns where the answer goes:
+    the owner (`lead`) or up the chain (`answer_up`)."""
     def no(reason, **extra):
         return {"matched": False, "reason": reason, **extra}
-    got = live_task(task_id, workspace)
-    if not got["ok"]:
-        return no(got["reason"])
-    h = got["headers"]
-    if room not in (h.get("channel_id"), h.get("source_room_id")):
-        return no("task did not come from the consult room")
-    event = h.get("source_message_id")
-    if not event:
-        return no("task names no source message")
+    if bool(task_id) == bool(event_id):
+        return no("name exactly one of the message's task (--task-id) or its event (--event-id)")
+    event = event_id
+    if task_id:
+        got = live_task(task_id, workspace)
+        if not got["ok"]:
+            return no(got["reason"])
+        h = got["headers"]
+        if room not in (h.get("channel_id"), h.get("source_room_id")):
+            return no("task did not come from the consult room")
+        event = h.get("source_message_id")
+        if not event:
+            return no("task names no source message")
     page = transport.read(room, READ_LIMIT)
     if not page.get("ok"):
         return no(f"consult room unreadable: {page.get('reason')}")
     messages = [m for m in page.get("messages") or [] if isinstance(m, dict)]
     msg = next((m for m in messages if m.get("event_id") == event), None)
-    if msg is None or not isinstance(msg.get("body"), str):
-        return no(f"reply event not in the last {READ_LIMIT} messages of the consult room")
-    first, rest = _first_line(msg["body"])
-    m = _TAG.match(first)
-    if not m:
-        if parse_ask(msg["body"]):
-            return no("this is a consult ask to you, not an answer; answer it or consult onward")
-        return no("not a final answer (no answer line); treat it as progress", progress=True)
-    cid, text = m.group(1), rest.strip()
-    if _record_path(workspace, "answered", cid).exists():
-        return _replay(workspace, cid, task_id, no)
-    rec = _read_record(_record_path(workspace, "pending", cid))
-    if rec is None:
-        return no(f"consult {cid} is unknown")
-    if rec.get("room") != room:
-        return no(f"consult {cid} was asked in {rec.get('room')}, not {room}")
+    if msg is None:
+        return no(f"message not in the last {READ_LIMIT} messages of the consult room")
+    used = {r.get("ask_event") for st in ("pending", "answered") for r in records(workspace, st)} - {None}
+    open_recs = []
+    for r in records(workspace, "pending"):
+        r = _recover_ask(r, messages, self_mxid, used)
+        if r.get("ask_event") and r.get("room") == room and r.get("agent") == msg.get("sender"):
+            open_recs.append(r)
+    owners = [r for r in open_recs if any(c.get("event_id") == event for c in _candidates(r, messages))]
+    if not owners:
+        for st in ("answered",):
+            for r in records(workspace, st):
+                if r.get("answer_event") == event:
+                    return _replay(workspace, r["cid"], task_id, event, no)
+        return no("not an answer to a pending consult of this agent (wrong sender, another thread, "
+                  "before the ask, or already judged not final)")
+    cited = [r for r in owners if r.get("ask_event") == msg.get("in_reply_to")]
+    rec = (cited or sorted(owners, key=lambda r: r.get("asked_at") or 0))[0]
+    cid = rec["cid"]
     if _age(rec, time.time() if now is None else now) > expire_after_s:
         return no(f"consult {cid} expired; tell the owner it was not answered in time")
-    if msg.get("sender") != rec.get("agent"):
-        return no(f"answer is from {msg.get('sender')}, not {rec.get('agent')}")
-    rec = _recover_ask(rec, messages, self_mxid)
-    if not rec.get("ask_event"):
-        return no("the ask was never confirmed posted")
-    if msg.get("thread_root") != rec.get("root"):
-        return no("answer is not posted in this consult's thread")
-    rel = msg.get("in_reply_to")
-    if rel and rel not in (rec["ask_event"], rec["root"]):
-        return no(f"answer in_reply_to is {rel}, not this consult's ask")
-    if not text:
-        return no("answer line carries no answer")
+    if not_final:
+        rec["skipped"] = [*(rec.get("skipped") or []), event]
+        _write_record(_record_path(workspace, "pending", cid), rec)
+        return no("recorded as not final; the asked agent's next message in the thread is the candidate",
+                  progress=True, cid=cid)
+    text = _strip_mention(msg.get("body") or "", self_mxid)
     out = {"matched": True, "agent": rec["agent"], "cid": cid, "reply_text": text, "event_id": event,
-           "root": rec["root"], "chain": rec.get("chain") or [], "question": rec.get("question") or "",
-           "reason": None}
+           "root": rec["root"], "question": rec.get("body") or "", "reason": None}
     if rec.get("via"):
         out = {**out, "task_id": None, "answer_up": {**rec["via"], "root": rec["root"], "up": cid}}
     else:
@@ -994,7 +897,7 @@ def match_reply(transport, *, room: str, self_mxid: str, task_id: str,
         os.link(tmp, dst)  # the claim carries the payload: once linked, a retry can replay it
     except FileExistsError:
         tmp.unlink(missing_ok=True)
-        return _replay(workspace, cid, task_id, no)
+        return _replay(workspace, cid, task_id, event, no)
     except OSError as e:
         tmp.unlink(missing_ok=True)
         return no(f"consult {cid} could not be closed: {e}")
@@ -1004,15 +907,43 @@ def match_reply(transport, *, room: str, self_mxid: str, task_id: str,
     return out
 
 
-def _replay(workspace: Path, cid: str, task_id: str, no) -> dict:
-    """A closed consult's stored payload, again, for the reply task that closed it while that
-    task has no result yet (its result file is the acknowledgement); anything else is closed."""
+def _replay(workspace: Path, cid: str, task_id: Optional[str], event: str, no) -> dict:
+    """A closed consult's stored payload, again, until it is relayed: for the reply task that
+    closed it while that task has no result, or for the same event until `relayed` is recorded."""
     import local_task_protocol as ltp
     rec = _read_record(_record_path(workspace, "answered", cid)) or {}
-    if (rec.get("reply_task") == task_id and isinstance(rec.get("payload"), dict)
-            and ltp.find_result(Path(workspace) / "results", task_id) is None):
+    if not isinstance(rec.get("payload"), dict) or rec.get("answer_event") != event:
+        return no(f"consult {cid} is already answered")
+    if task_id and rec.get("reply_task") == task_id \
+            and ltp.find_result(Path(workspace) / "results", task_id) is None:
+        return {**rec["payload"], "replay": True}
+    if not task_id and not rec.get("reply_task") and not rec.get("relayed"):
         return {**rec["payload"], "replay": True}
     return no(f"consult {cid} is already answered")
+
+
+def mark_relayed(workspace: Path, cid: str) -> dict:
+    """Record that a consult matched by event (not by a task) has been relayed: no more replays."""
+    path = _record_path(workspace, "answered", cid) if _CID.match(cid or "") else None
+    rec = _read_record(path) if path else None
+    if rec is None:
+        return {"ok": False, "reason": f"no answered consult {cid}"}
+    _write_record(path, {**rec, "relayed": True})
+    return {"ok": True, "cid": cid, "reason": None}
+
+
+def waiting_answers(transport, room: str, workspace: Path) -> dict:
+    """{cid: {event_id, text}} for pending consults whose asked agent has posted in the thread
+    after the ask: answers that did not arrive as a task. One room read."""
+    page = transport.read(room, READ_LIMIT)
+    messages = [m for m in page.get("messages") or [] if isinstance(m, dict)] if page.get("ok") else []
+    out = {}
+    for r in records(workspace, "pending"):
+        if r.get("ask_event") and r.get("room") == room:
+            cands = _candidates(r, messages)
+            if cands:
+                out[r["cid"]] = {"event_id": cands[0].get("event_id"), "text": cands[0].get("body") or ""}
+    return out
 
 
 def reply_lead(origin: dict) -> str:

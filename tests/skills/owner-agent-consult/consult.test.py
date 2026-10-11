@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """skills/owner-agent-consult: inert until configured; the owner gate reads only a live,
 envelope-verified, unanswered task by id; the owner-only room guard accounts for every
-member; ask returns at once with a pending record; a whole consult, onward asks included,
-runs in one thread; an onward ask must trace through the thread to a root ask; an agent
-already in the chain is not asked again; a reply task matches its consult only by consult
-id, sender and thread; no other skill imported; no identity or room literal shipped. Workspaces are temp dirs; the production-adapter
+member; an ask is a plain message mentioning the agent, in one consult thread, and returns
+at once with a pending record; an answer is any message from the asked agent in that thread
+after the ask, correlated by Matrix relations and this agent's own records only; onward asks
+stay in the thread; no other skill imported; no identity or room literal shipped. Workspaces are temp dirs; the production-adapter
 cases run the real room_ops CLI against a local fake gateway."""
 import contextlib
 import http.server
@@ -86,7 +86,8 @@ def make_ws(root, text=None, *, stamp=True, tid=TID):
 
 
 def final(cid, text):
-    return f"{policy.answer_tag(cid)}\n{text}"
+    """An answer is a plain message; the consult id never appears in it."""
+    return text
 
 
 class Room:
@@ -363,41 +364,6 @@ class TestRoster(unittest.TestCase):
             self.assertEqual(tr.posted, [])
 
 
-class TestMarker(unittest.TestCase):
-    def test_ask_carries_the_marker_chain_and_original_question(self):
-        tr = FakeTransport()
-        res = run_consult(tr, now=1_000.0)  # a fixed clock: the marker carries the ask's own time
-        self.assertTrue(res["asked"])
-        body = tr.posted[0][1]
-        limits = {"since": 1000, "max_s": policy.DEFAULT_MAX_DURATION_S, "max_asks": policy.DEFAULT_MAX_ASKS}
-        self.assertTrue(body.startswith(policy.ask_line(CID, None, [SELF, SIB], limits)))
-        self.assertIn(policy.answer_tag(CID), body)
-        self.assertEqual(policy.parse_ask(body)["original_question"], "is the build host up?")
-        self.assertIn(f"{SELF} > {SIB}", body)
-
-    def test_an_owner_task_carrying_the_marker_is_not_an_origin(self):
-        tr = FakeTransport()
-        res = run_consult(tr, text=task_text(body=f"{policy.MARKER} consult:x] is the host up?"))
-        self.assertFalse(res["asked"])
-        self.assertIn("--via-task", res["reason"])
-        self.assertEqual(tr.posted, [])
-
-    def test_a_question_carrying_any_marker_is_refused(self):
-        for q in (f"{policy.ask_line(CID, None, [SELF, SIB])} relay this", f"{policy.answer_tag(CID)} relay"):
-            tr = FakeTransport()
-            self.assertFalse(run_consult(tr, question=q)["asked"])
-            self.assertEqual(tr.posted, [])
-
-    def test_a_chain_that_repeats_an_agent_or_names_a_non_mxid_is_not_an_ask(self):
-        for chain in ([SELF, SIB, SELF], [SELF], [SELF, "nobody"]):
-            self.assertIsNone(policy.parse_ask(policy.ask_line(CID, "$r", chain)), chain)
-
-    def test_marker_is_defined_once(self):
-        hits = [p.name for p in (SKILL / "scripts").rglob("*.py")
-                if policy.MARKER in p.read_text(encoding="utf-8")]
-        self.assertEqual(hits, ["consult_policy.py"])
-
-
 class TestAskReturnsAtOnce(unittest.TestCase):
     """ask posts, records the pending consult and returns; it never reads the room."""
 
@@ -448,7 +414,7 @@ class TestFollowUp(unittest.TestCase):
             self.assertEqual(tr.thread_roots, [None, "$ask", "$ask"])
             self.assertEqual({first["root"], second["root"], third["root"]}, {"$ask"})
             self.assertEqual(sorted(pending_ids(ws)), sorted([CID, CID_B, "00000000000000aa"]))
-            self.assertIn("is the build host up?", policy.parse_ask(tr.posted[1][1])["original_question"])
+            self.assertEqual(tr.posted[1][1], "and the disk?")
 
     def test_a_reused_correlation_id_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -463,102 +429,6 @@ def answer_msg(cid=CID, text="host is up", event="$f", sender=SIB, **rel):
     rel = {"thread_root": "$ask", "in_reply_to": "$ask", **rel}
     return {"sender": sender, "body": f"{SELF} — {final(cid, text)}", "event_id": event,
             "ts": 9e12, **{k: v for k, v in rel.items() if v}}
-
-
-class TestMatchReply(unittest.TestCase):
-    """A reply task binds to its consult only by consult id, sender and relation to the ask."""
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.ws = make_ws(self._tmp.name)
-        run_consult(FakeTransport(), self.ws)
-
-    def tearDown(self):
-        self._tmp.cleanup()
-
-    def _match(self, *msgs, event="$f", **kw):
-        reply_task(self.ws, event, **kw)
-        return match(FakeTransport(replies=list(msgs)), self.ws)
-
-    def test_the_correlated_answer_returns_the_original_task_and_closes_it(self):
-        res = self._match(answer_msg(in_reply_to="$ask"))
-        self.assertTrue(res["matched"], res)
-        self.assertEqual((res["task_id"], res["agent"], res["cid"], res["reply_text"]),
-                         (TID, SIB, CID, "host is up"))
-        self.assertEqual(res["lead"], f"[channel: {OWNER_DM}]\n")
-        self.assertEqual(pending_ids(self.ws), [])
-        (self.ws / "results" / "task-reply.txt").write_text("[no-send]")
-        again = match(FakeTransport(replies=[answer_msg(in_reply_to="$ask")]), self.ws)
-        self.assertFalse(again["matched"])
-        self.assertIn("already answered", again["reason"])
-
-    def test_a_threaded_original_gets_a_thread_lead(self):
-        self.assertEqual(policy.reply_lead({"channel_id": OWNER_DM, "thread_root": "$root"}),
-                         f"[channel: {OWNER_DM}]\n[thread: $root]\n")
-
-    def test_wrong_consult_id_does_not_match(self):
-        res = self._match(answer_msg(cid=CID_B, in_reply_to="$ask"))
-        self.assertFalse(res["matched"])
-        self.assertIn(f"consult {CID_B} is unknown", res["reason"])
-        self.assertEqual(pending_ids(self.ws), [CID])
-
-    def test_not_a_reply_to_the_ask_does_not_match(self):
-        res = self._match(answer_msg(in_reply_to="$someone-else"))
-        self.assertFalse(res["matched"])
-        self.assertIn("not this consult's ask", res["reason"])
-        self.assertEqual(pending_ids(self.ws), [CID])
-
-    def test_an_answer_outside_the_consult_thread_does_not_match(self):
-        for root in ("$other-thread", None):
-            res = self._match(answer_msg(thread_root=root))
-            self.assertFalse(res["matched"], root)
-            self.assertIn("not posted in this consult's thread", res["reason"])
-        self.assertEqual(pending_ids(self.ws), [CID])
-
-    def test_a_progress_message_is_progress(self):
-        res = self._match({"sender": SIB, "body": f"{SELF} — On it, checking now.", "event_id": "$f",
-                           "ts": 9e12, "in_reply_to": "$ask"})
-        self.assertEqual((res["matched"], res.get("progress")), (False, True))
-        self.assertEqual(pending_ids(self.ws), [CID])
-
-    def test_an_answer_from_another_sender_does_not_match(self):
-        res = self._match(answer_msg(sender=OWNER, in_reply_to="$ask"))
-        self.assertFalse(res["matched"])
-        self.assertIn("not " + SIB, res["reason"])
-
-    def test_the_reply_task_must_be_verified_and_from_the_consult_room(self):
-        self.assertIn("unsigned", self._match(answer_msg(), stamp=False)["reason"])
-        self.assertIn("consult room", self._match(answer_msg(), room="!elsewhere:example.test")["reason"])
-        self.assertIn("not a live task", match(FakeTransport(), self.ws, tid="task-absent")["reason"])
-        self.assertEqual(pending_ids(self.ws), [CID])
-
-    def test_an_event_outside_the_read_window_says_so(self):
-        res = self._match(answer_msg(event="$elsewhere"))
-        self.assertIn(f"last {policy.READ_LIMIT} messages", res["reason"])
-
-    def test_an_answer_line_with_no_answer_is_refused(self):
-        msg = {"sender": SIB, "body": policy.answer_tag(CID), "event_id": "$f", "ts": 9e12,
-               "thread_root": "$ask"}
-        self.assertIn("no answer", self._match(msg)["reason"])
-
-    def test_a_follow_up_answer_in_the_thread_matches(self):
-        tr = FakeTransport()
-        tr.room.post(SELF, "first ask")  # stands in for the $ask already posted
-        root = {"ts": int(time.time() * 1000), "body": ""}
-        view = {"ok": True, "msgs": [], "root_msg": root, "server_now": root["ts"] / 1000}
-        with mock.patch.object(policy, "thread_view", return_value=view):
-            res = run_consult(tr, self.ws, cid=CID_B)
-        self.assertEqual((res["asked"], res["ask_event"], res["root"]), (True, "$ask2", "$ask"), res)
-        got = self._match(answer_msg(cid=CID_B, in_reply_to="$ask2"))
-        self.assertTrue(got["matched"], got)
-        self.assertEqual(pending_ids(self.ws), [CID])
-
-    def test_an_ask_delivered_as_a_reply_is_not_an_answer(self):
-        msg = {"sender": SIB, "body": f"{SELF} — {policy.ask_line(CID_B, '$ask', [SIB, SELF])}",
-               "event_id": "$f", "thread_root": "$ask"}
-        res = self._match(msg)
-        self.assertFalse(res["matched"])
-        self.assertIn("consult ask to you", res["reason"])
 
 
 class World:
@@ -603,160 +473,6 @@ C1, C2, C3 = "1111111111111111", "2222222222222222", "3333333333333333"
 T0 = 1_760_000_000.0  # a realistic epoch; the room stamps events with it in ms
 
 
-class TestOnwardConsult(unittest.TestCase):
-    """A consulted agent may consult another of the owner's agents; the whole consult runs in
-    the thread rooted on the first ask, and answers flow back up the chain to the owner."""
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.w = World(self._tmp.name)
-        self.root = self.w.ask(SELF, SIB, cid=C1, task_id=TID, question="what is on the build host?")
-        self.w.deliver(SIB, "$ask", "task-b1")
-
-    def tearDown(self):
-        self._tmp.cleanup()
-
-    def test_an_onward_consult_is_allowed_and_names_the_original_question_and_chain(self):
-        res = self.w.ask(SIB, THIRD, cid=C2, via_task="task-b1")
-        self.assertEqual((res["asked"], res["root"], res["chain"]), (True, "$ask", [SELF, SIB, THIRD]), res)
-        body = self.w.tr[SIB].posted[0][1]
-        parsed = policy.parse_ask(body)
-        self.assertEqual((parsed["root"], parsed["chain"]), ("$ask", [SELF, SIB, THIRD]))
-        self.assertEqual(parsed["original_question"], "what is on the build host?")
-        self.assertIn(f"{SELF} > {SIB} > {THIRD}", body)
-        [rec] = policy.records(self.w.ws[SIB], "pending")
-        self.assertEqual((rec["root"], rec["chain"], rec["via"]["asker"], rec["via"]["cid"], rec["task_id"]),
-                         ("$ask", [SELF, SIB, THIRD], SELF, C1, None))
-
-    def test_every_post_of_a_chained_consult_is_in_the_one_thread(self):
-        w = self.w
-        self.assertTrue(w.ask(SIB, THIRD, cid=C2, via_task="task-b1")["asked"])
-        w.deliver(THIRD, "$ask2", "task-c1")
-        self.assertTrue(w.answer(THIRD, "disk is 80% full", task_id="task-c1")["answered"])
-        w.deliver(SIB, "$ask3", "task-b2")
-        up = w.match(SIB, "task-b2")
-        self.assertTrue(up["matched"], up)
-        self.assertEqual((up["task_id"], up["answer_up"]["asker"], up["answer_up"]["cid"], up["reply_text"]),
-                         (None, SELF, C1, "disk is 80% full"))
-        self.assertTrue(w.answer(SIB, "per third: disk is 80% full", up=up["answer_up"]["up"])["answered"])
-        w.deliver(SELF, "$ask4", "task-a2")
-        top = w.match(SELF, "task-a2")
-        self.assertTrue(top["matched"], top)
-        self.assertEqual((top["task_id"], top["reply_text"], top["lead"]),
-                         (TID, "per third: disk is 80% full", f"[channel: {OWNER_DM}]\n"))
-        root, *rest = w.room.msgs
-        self.assertNotIn("thread_root", root)
-        self.assertEqual([m["thread_root"] for m in rest], ["$ask"] * 3)
-        self.assertEqual([m["sender"] for m in w.room.msgs], [SELF, SIB, THIRD, SIB])
-
-    def test_an_agent_already_in_the_chain_is_not_asked_again(self):
-        w = self.w
-        w.ask(SIB, THIRD, cid=C2, via_task="task-b1")
-        w.deliver(THIRD, "$ask2", "task-c1")
-        for upstream in (SELF, SIB):
-            res = w.ask(THIRD, upstream, cid=C3, via_task="task-c1")
-            self.assertFalse(res["asked"], upstream)
-            self.assertIn("already in this consult's chain", res["reason"])
-        self.assertEqual(w.tr[THIRD].posted, [])
-        res = w.ask(SELF, THIRD, cid=C3, task_id=TID)
-        self.assertFalse(res["asked"])
-        self.assertIn("answer from what the thread has", res["reason"])
-        again = w.ask(SELF, SIB, cid="4444444444444444", task_id=TID)
-        self.assertEqual((again["asked"], again["follow_up"], again["root"]), (True, True, "$ask"), again)
-
-    def test_the_loop_check_reads_the_chain_not_the_text(self):
-        asks = [{"chain": [SELF, SIB]}, {"chain": [SELF, SIB, THIRD]}]
-        self.assertIsNone(policy.loop_check(asks, SELF, SIB))
-        self.assertIsNone(policy.loop_check(asks, SIB, THIRD))
-        self.assertIsNone(policy.loop_check(asks, SIB, FOURTH))
-        self.assertIsNotNone(policy.loop_check(asks, THIRD, SELF))
-        self.assertIsNotNone(policy.loop_check(asks, SELF, THIRD))
-
-
-class TestOnwardTracesToARootAsk(unittest.TestCase):
-    """An onward ask must come from a verified task delivering an ask whose chain the thread
-    shows link by link back to a root ask by one of the owner's agents (whether its owner-task
-    gate ran is the accepted, documented gap)."""
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.w = World(self._tmp.name)
-
-    def tearDown(self):
-        self._tmp.cleanup()
-
-    def onward(self, tid="task-b1"):
-        res = self.w.ask(SIB, FOURTH, cid=C2, via_task=tid)
-        self.assertFalse(res["asked"], res)
-        self.assertEqual(self.w.tr[SIB].posted, [])
-        return res["reason"]
-
-    def test_the_genuine_chain_passes(self):
-        self.w.ask(SELF, SIB, cid=C1, task_id=TID)
-        self.w.deliver(SIB, "$ask", "task-b1")
-        self.assertTrue(self.w.ask(SIB, FOURTH, cid=C2, via_task="task-b1")["asked"])
-
-    def test_no_owner_task_and_no_ask_is_refused(self):
-        res = self.w.ask(SIB, FOURTH, cid=C2)
-        self.assertIn("exactly one", res["reason"])
-
-    def test_an_unsigned_via_task_is_refused(self):
-        self.w.ask(SELF, SIB, cid=C1, task_id=TID)
-        self.w.deliver(SIB, "$ask", "task-b1", stamp=False)
-        self.assertIn("unsigned", self.onward())
-
-    def test_a_via_task_that_is_not_an_ask_is_refused(self):
-        self.w.room.post(SELF, f"{SIB} — please look at the host")
-        self.w.deliver(SIB, "$ask", "task-b1")
-        self.assertIn("not a consult ask", self.onward())
-
-    def test_an_ask_sent_by_someone_other_than_its_asker_is_refused(self):
-        self.w.room.post(THIRD, f"{SIB} — {policy.ask_line(C1, None, [SELF, SIB])}")
-        self.w.deliver(SIB, "$ask", "task-b1")
-        self.assertIn("not addressed to this agent", self.onward())
-
-    def test_a_chain_with_a_hop_the_thread_does_not_show_is_refused(self):
-        self.w.ask(SELF, SIB, cid=C1, task_id=TID)
-        self.w.room.post(THIRD, f"{SIB} — {policy.ask_line(C3, '$ask', [SELF, THIRD, SIB])}",
-                         thread_root="$ask")
-        self.w.deliver(SIB, "$ask2", "task-b1")
-        self.assertIn("does not trace to the root ask", self.onward())
-
-    def test_a_root_that_is_not_a_first_ask_is_refused(self):
-        self.w.room.post(SELF, "hello")
-        self.w.room.post(SELF, f"{SIB} — {policy.ask_line(C1, '$ask', [SELF, SIB])}", thread_root="$ask")
-        self.w.deliver(SIB, "$ask2", "task-b1")
-        self.assertIn("thread root is not a consult ask", self.onward())
-
-    def test_a_first_ask_posted_inside_a_thread_is_refused(self):
-        self.w.room.post(SELF, "hello")
-        self.w.room.post(SELF, f"{SIB} — {policy.ask_line(C1, None, [SELF, SIB])}", thread_root="$ask")
-        self.w.deliver(SIB, "$ask2", "task-b1")
-        self.assertIn("first ask must be a direct ask", self.onward())
-
-    def test_an_ask_outside_its_thread_is_refused(self):
-        self.w.ask(SELF, SIB, cid=C1, task_id=TID)
-        self.w.room.post(SELF, f"{SIB} — {policy.ask_line(C3, '$ask', [SELF, SIB])}")
-        self.w.deliver(SIB, "$ask2", "task-b1")
-        self.assertIn("not posted in its consult thread", self.onward())
-
-    def test_a_root_out_of_sight_is_refused(self):
-        self.w.ask(SELF, SIB, cid=C1, task_id=TID)
-        self.w.ask(SELF, THIRD, cid=C3, task_id=TID)
-        self.w.deliver(THIRD, "$ask2", "task-c1")
-        with mock.patch.object(policy, "READ_LIMIT", 1):
-            res = self.w.ask(THIRD, FOURTH, cid=C2, via_task="task-c1")
-        self.assertIn("cannot see the whole thread", res["reason"])
-
-    def test_answer_also_requires_a_traceable_ask(self):
-        self.w.room.post(THIRD, f"{SIB} — {policy.ask_line(C1, None, [SELF, SIB])}")
-        self.w.deliver(SIB, "$ask", "task-b1")
-        res = self.w.answer(SIB, "x", task_id="task-b1")
-        self.assertFalse(res["answered"])
-        self.assertEqual(self.w.tr[SIB].posted, [])
-        self.assertIn("is not an onward consult", self.w.answer(SIB, "x", up=C2)["reason"])
-
-
 class TestThreadAndAnswerEdges(unittest.TestCase):
     """Every refusal on the answer, trace and match paths is in-band and posts nothing."""
 
@@ -773,7 +489,6 @@ class TestThreadAndAnswerEdges(unittest.TestCase):
         w = self.w
         self.assertIn("exactly one", w.answer(SIB, "x")["reason"])
         self.assertIn("empty answer", w.answer(SIB, "  ", task_id="task-b1")["reason"])
-        self.assertIn("carries the consult marker", w.answer(SIB, policy.answer_tag(C1), task_id="task-b1")["reason"])
         w.tr[SIB]._members.append({"user_id": STRANGER, "kind": "human"})
         self.assertIn(STRANGER, w.answer(SIB, "x", task_id="task-b1")["reason"])
         w.tr[SIB]._members.pop()
@@ -810,12 +525,10 @@ class TestThreadAndAnswerEdges(unittest.TestCase):
         self.assertIn("no source message", w.match(SELF, "task-nosrc")["reason"])
         w.tr[SIB].mention(SELF, final(C1, "up"), ROOM, reply_to="$ask", thread_root="$ask")
         w.deliver(SELF, "$ask2", "task-a2")
-        rec_path = ws / policy._STATE / "pending" / f"{C1}.json"
-        rec = json.loads(rec_path.read_text())
-        rec_path.write_text(json.dumps({**rec, "ask_event": None}))
-        with mock.patch.object(policy, "_recover_ask", side_effect=lambda r, m, s: r):
-            self.assertIn("never confirmed", w.match(SELF, "task-a2")["reason"])
-        rec_path.write_text(json.dumps(rec))
+        self.assertIn("exactly one", policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF,
+                                                         workspace=ws)["reason"])
+        reply_task(ws, "$nowhere", tid="task-a9", sender=SIB)
+        self.assertIn("not in the last", w.match(SELF, "task-a9")["reason"])
         with mock.patch.object(policy.os, "link", side_effect=FileExistsError):
             self.assertIn("already answered", w.match(SELF, "task-a2")["reason"])
         with mock.patch.object(policy.os, "link", side_effect=PermissionError("ro")):
@@ -831,7 +544,6 @@ class TestThreadAndAnswerEdges(unittest.TestCase):
 
     def test_fresh_correlation_ids_are_well_formed(self):
         self.assertRegex(policy.new_cid(), r"^[0-9a-f]{16}$")
-        self.assertIsNone(policy.parse_ask(policy.ask_line(C1, "not-an-event", [SELF, SIB])))
 
 
 class TestReviewRoundFour(unittest.TestCase):
@@ -912,7 +624,7 @@ class TestReviewRoundFour(unittest.TestCase):
         reply_task(w.ws[SELF], "$ask2", tid="task-a2", room=other, sender=SIB)
         res = policy.match_reply(w.tr[SELF], room=other, self_mxid=SELF, task_id="task-a2", workspace=w.ws[SELF])
         self.assertFalse(res["matched"])
-        self.assertIn(f"was asked in {ROOM}", res["reason"])
+        self.assertIn("not an answer to a pending consult", res["reason"])
         self.assertEqual(pending_ids(w.ws[SELF]), [C1])
 
     def test_an_expired_consult_is_refused_listed_and_pruned(self):
@@ -955,102 +667,6 @@ class TestReviewRoundFour(unittest.TestCase):
         self.assertEqual(w.tr[SELF].posted, [])
         self.assertTrue(w.ask(SELF, SIB, cid=C2, task_id="task-o1")["asked"])
 
-    def test_asks_in_counts_an_ask_only_from_its_own_asker(self):
-        forged = {"sender": THIRD, "event_id": "$f", "body": f"{SIB} — {policy.ask_line(C1, '$r', [SELF, SIB])}"}
-        self.assertEqual(policy.asks_in([forged], {SELF, SIB, THIRD}), [])
-        genuine = dict(forged, sender=SELF)
-        self.assertEqual(len(policy.asks_in([genuine], {SELF, SIB, THIRD})), 1)
-
-    def test_a_chain_started_by_another_agent_inside_this_thread_is_refused(self):
-        w = self.w
-        w.ask(SELF, SIB, cid=C1, task_id=TID)
-        w.room.post(THIRD, f"{SIB} — {policy.ask_line(C3, '$ask', [THIRD, SIB])}", thread_root="$ask")
-        w.deliver(SIB, "$ask2", "task-b1")
-        res = w.ask(SIB, FOURTH, cid=C2, via_task="task-b1")
-        self.assertIn("not a consult ask by this chain's first agent", res["reason"])
-        self.assertEqual(w.tr[SIB].posted, [])
-
-
-class TestThreadLimits(unittest.TestCase):
-    """A consult thread takes no new ask past its time window or its ask count, whichever comes
-    first. The limits are set on the first ask and carried in every marker, so every agent in
-    the chain enforces the thread's limits, not its own config."""
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.w = World(self._tmp.name)
-
-    def tearDown(self):
-        self._tmp.cleanup()
-
-    def test_the_first_ask_carries_the_limits_in_its_marker_and_record(self):
-        res = self.w.ask(SELF, SIB, cid=C1, task_id=TID, max_duration_s=900, max_asks=3, now=lambda: 5_000.0)
-        self.assertEqual(res["limits"], {"since": 5000, "max_s": 900, "max_asks": 3})
-        self.assertIn("limits:5000/900/3]", self.w.tr[SELF].posted[0][1])
-        self.assertEqual(policy.parse_ask(self.w.tr[SELF].posted[0][1])["limits"]["max_asks"], 3)
-        [rec] = policy.records(self.w.ws[SELF], "pending")
-        self.assertEqual(rec["limits"], {"since": 5000, "max_s": 900, "max_asks": 3})
-
-    def test_the_ask_count_stops_follow_ups(self):
-        w = self.w
-        self.assertTrue(w.ask(SELF, SIB, cid=C1, task_id=TID, max_asks=2)["asked"])
-        self.assertTrue(w.ask(SELF, SIB, cid=C2, task_id=TID)["asked"])
-        res = w.ask(SELF, SIB, cid=C3, task_id=TID)
-        self.assertEqual((res["asked"], res["limit_reached"]), (False, True))
-        self.assertIn("consult limit reached", res["reason"])
-        self.assertIn("2 of 2 asks", res["reason"])
-        self.assertEqual(len(w.tr[SELF].posted), 2)
-
-    def test_an_onward_ask_obeys_the_threads_limits_not_its_own_config(self):
-        w, t0 = self.w, T0
-        w.room.clock = lambda: t0
-        w.ask(SELF, SIB, cid=C1, task_id=TID, max_duration_s=600, max_asks=50, now=lambda: t0)
-        w.deliver(SIB, "$ask", "task-b1")
-        late = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", max_duration_s=86400, now=lambda: t0 + 601)
-        self.assertIn("600s window has passed", late["reason"])
-        self.assertEqual(w.tr[SIB].posted, [])
-        on_time = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: t0 + 599)
-        self.assertEqual((on_time["asked"], on_time["limits"]["max_s"]), (True, 600))
-        self.assertIn(f"limits:{int(t0)}/600/{policy.DEFAULT_MAX_ASKS}]", w.tr[SIB].posted[0][1])
-
-    def test_an_onward_ask_counts_every_ask_in_the_thread(self):
-        w = self.w
-        w.ask(SELF, SIB, cid=C1, task_id=TID, max_asks=2)
-        w.ask(SELF, THIRD, cid=C3, task_id=TID)
-        w.deliver(SIB, "$ask", "task-b1")
-        res = w.ask(SIB, FOURTH, cid=C2, via_task="task-b1")
-        self.assertIn("consult limit reached", res["reason"])
-
-    def test_an_answer_still_posts_past_the_limit_and_says_so(self):
-        w = self.w
-        w.ask(SELF, SIB, cid=C1, task_id=TID, max_asks=1)
-        w.deliver(SIB, "$ask", "task-b1")
-        res = w.answer(SIB, "disk is fine", task_id="task-b1")
-        self.assertTrue(res["answered"], res)
-        self.assertIn("consult limit reached", res["limit_reached"])
-        self.assertIsNone(policy.limit_reached({"since": 0, "max_s": 60, "max_asks": 5}, 1, 30))
-
-    def test_out_of_range_limits_are_clamped(self):
-        self.assertIsNotNone(policy.limit_reached({"since": 0, "max_s": 10**6, "max_asks": 10**3}, 100, 1))
-        self.assertIsNotNone(policy.limit_reached({"since": 0, "max_s": 1, "max_asks": 5}, 1, 60))
-        self.assertIsNone(policy.parse_ask(policy.ask_line(C1, None, [SELF, SIB]).replace("limits:", "limit:")))
-
-    def test_limit_config_precedence_and_clamps(self):
-        get = lambda **kw: policy.settings(environ={policy.CONFIG_ROOM: ROOM, **kw.get("env", {})},
-                                           manifest_cfg=kw.get("cfg", {}), **kw.get("cli", {}))
-        self.assertEqual((get()["max_duration_s"], get()["max_asks"]),
-                         (policy.DEFAULT_MAX_DURATION_S, policy.DEFAULT_MAX_ASKS))
-        cfg = {policy.CONFIG_MAX_ASKS: "4"}
-        self.assertEqual(get(cfg=cfg)["max_asks"], 4)
-        self.assertEqual(get(cfg=cfg, env={policy.CONFIG_MAX_ASKS: "6"})["max_asks"], 6)
-        self.assertEqual(get(cfg=cfg, env={policy.CONFIG_MAX_ASKS: "6"}, cli={"max_asks": "8"})["max_asks"], 8)
-        self.assertEqual(get(cli={"max_asks": "0", "max_duration": "1"})["max_asks"], policy.MAX_ASKS_FLOOR)
-        self.assertEqual(get(cli={"max_duration": "9e9"})["max_duration_s"], policy.MAX_DURATION_CEILING_S)
-        shipped = policy.manifest_config()
-        self.assertEqual((shipped[policy.CONFIG_MAX_DURATION],
-                          shipped[policy.CONFIG_MAX_ASKS]), ("1800", "10"))
-
-
 class TestLimitsCannotBeWidened(unittest.TestCase):
     """The thread window starts at the root event's server timestamp, never the marker's
     `since`, and each limit is the smaller of the marker's and the reader's own config."""
@@ -1063,10 +679,9 @@ class TestLimitsCannotBeWidened(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_a_forged_root_cannot_extend_the_window(self):
+    def test_a_root_posted_by_hand_cannot_extend_the_window(self):
         w = self.w
-        line = policy.ask_line(C1, None, [SELF, SIB], {"since": 999999999999, "max_s": 86400, "max_asks": 100})
-        w.room.post(SELF, f"{SIB} — {line}")
+        w.room.post(SELF, f"{SIB} — is the disk full?")
         w.deliver(SIB, "$ask", "task-b1")
         res = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 365 * 86400)
         self.assertEqual((res["asked"], res.get("limit_reached")), (False, True), res)
@@ -1079,7 +694,6 @@ class TestLimitsCannotBeWidened(unittest.TestCase):
         w.deliver(SIB, "$ask", "task-b1")
         res = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", now=lambda: T0 + 60)
         self.assertTrue(res["asked"], res)
-        self.assertEqual(res["limits"]["since"], T0)
 
     def test_a_root_can_narrow_the_limits_but_never_widen_them(self):
         root = {"ts": int(T0 * 1000)}
@@ -1089,14 +703,15 @@ class TestLimitsCannotBeWidened(unittest.TestCase):
         self.assertEqual(narrow, {"since": T0, "max_s": 300, "max_asks": 2})
         self.assertEqual(policy.effective_limits({"ts": 1_760_000_000}, None, 1800, 10)["since"], 1_760_000_000.0)
 
-    def test_the_ask_count_is_capped_by_the_readers_own_config(self):
+    def test_the_ask_count_is_this_agents_own_asks_in_the_thread(self):
         w = self.w
         w.room.clock = time.time
         w.ask(SELF, SIB, cid=C1, task_id=TID, max_asks=100)
-        w.ask(SELF, THIRD, cid=C3, task_id=TID, max_asks=100)
+        w.ask(SELF, THIRD, cid=C3, task_id=TID, max_asks=100)  # SELF's asks do not count for SIB
         w.deliver(SIB, "$ask", "task-b1")
-        res = w.ask(SIB, FOURTH, cid=C2, via_task="task-b1", max_asks=2)
-        self.assertIn("2 of 2 asks", res["reason"])
+        self.assertTrue(w.ask(SIB, FOURTH, cid=C2, via_task="task-b1", max_asks=1)["asked"])
+        res = w.ask(SIB, FOURTH, cid="4444444444444444", via_task="task-b1", max_asks=1)
+        self.assertIn("1 of 1 asks", res["reason"])
 
     def test_a_root_without_a_server_timestamp_is_refused(self):
         w = self.w
@@ -1248,44 +863,25 @@ class TestKeweiRoundNine(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def hand_ask(self, cid, limits):
-        self.w.room.post(SELF, f"{SIB} — {policy.ask_line(cid, '$ask', [SELF, SIB], limits)}", thread_root="$ask")
+    def hand_ask(self, question="and the disk?"):
+        self.w.room.post(SELF, f"{SIB} — {question}", thread_root="$ask")
         return self.w.room.msgs[-1]["event_id"]
 
     # 1: the thread cap is enforced on the ask being consumed
-    def test_asks_beyond_the_ask_limit_are_not_answered(self):
-        w = self.w
-        w.ask(SELF, SIB, cid=C1, task_id=TID, max_asks=1)
-        lim = {"since": int(time.time()), "max_s": 1800, "max_asks": 1}
-        results = []
-        for i in range(4):
-            ev = self.hand_ask(f"{i + 2:016x}", lim)
-            w.deliver(SIB, ev, f"task-b{i}")
-            results.append(w.answer(SIB, "x", task_id=f"task-b{i}", max_asks=1))
-        self.assertEqual([r["answered"] for r in results], [False] * 4)
-        self.assertIn("1 of 1 asks", results[0]["reason"])
-        self.assertEqual(len(w.room.msgs), 5)
-
     def test_an_ask_posted_after_the_window_is_not_answered_but_one_inside_it_unwinds_late(self):
         w = self.w
         w.room.clock = lambda: T0
         w.ask(SELF, SIB, cid=C1, task_id=TID, max_duration_s=60, now=lambda: T0)
         w.room.clock = lambda: T0 + 61
-        ev = self.hand_ask(C2, {"since": int(T0), "max_s": 60, "max_asks": 10})
+        ev = self.hand_ask()
         w.deliver(SIB, ev, "task-b1", at=T0 + 61)
         late = w.answer(SIB, "x", task_id="task-b1", max_duration_s=60)
         self.assertFalse(late["answered"])
         self.assertIn("60s window has passed", late["reason"])
+        self.assertIn("outside the thread's window", late["reason"])
         w.deliver(SIB, "$ask", "task-b0", at=T0)
         self.assertTrue(w.answer(SIB, "the root ask, answered after the deadline", task_id="task-b0",
                                  max_duration_s=60)["answered"])
-
-    def test_an_onward_ask_from_an_over_limit_ask_is_refused(self):
-        w = self.w
-        w.ask(SELF, SIB, cid=C1, task_id=TID, max_asks=1)
-        ev = self.hand_ask(C2, {"since": int(time.time()), "max_s": 1800, "max_asks": 1})
-        w.deliver(SIB, ev, "task-b1")
-        self.assertIn("outside the thread's limits", w.ask(SIB, THIRD, cid=C3, via_task="task-b1")["reason"])
 
     # 2: ask publication is one recoverable state
     def test_a_failed_final_write_does_not_start_a_second_thread(self):
@@ -1424,8 +1020,8 @@ def age_record(ws, cid, seconds):
     path.write_text(json.dumps({**rec, "asked_at": rec["asked_at"] - seconds}))
 
 
-def age_answer_claim(ws, cid, seconds):
-    path = Path(ws) / policy._STATE / "answers" / f"{cid}.json"
+def age_answer_claim(ws, ask_event, seconds):
+    path = policy._answer_claim(ws, ask_event)
     rec = json.loads(path.read_text())
     path.write_text(json.dumps({**rec, "at": rec["at"] - seconds}))
 
@@ -1500,7 +1096,7 @@ class TestPublicationIsOneRecoverableState(unittest.TestCase):
         second = w.answer(SIB, "per third: 80%", up=replayed["answer_up"]["up"])
         self.assertEqual((second["answered"], second.get("replay"), second["event_id"]),
                          (True, True, first["event_id"]), second)
-        self.assertEqual(sum(1 for m in w.room.msgs if m["sender"] == SIB and policy.answer_tag(C1) in m["body"]), 1)
+        self.assertEqual(sum(1 for m in w.room.msgs if m["sender"] == SIB and m["body"].startswith(SELF)), 1)
 
     def test_answering_the_same_ask_twice_posts_once(self):
         w = self.w
@@ -1530,7 +1126,7 @@ class TestPublicationIsOneRecoverableState(unittest.TestCase):
         self.assertTrue(w.answer(SIB, "up", task_id="task-b1")["unconfirmed"])
         w.tr[SIB].mention = FakeTransport.mention.__get__(w.tr[SIB])
         for age in (86400, 8 * 86400):
-            age_answer_claim(w.ws[SIB], C1, age)
+            age_answer_claim(w.ws[SIB], "$ask", age)
             self.assertIn("unconfirmed", w.answer(SIB, "up", task_id="task-b1")["reason"])
         self.assertEqual(len(w.room.msgs), 1)
 
@@ -1597,7 +1193,7 @@ class TestPublicationIsOneRecoverableState(unittest.TestCase):
         w.tr[SELF].mention = lambda *a, **k: {"ok": True, "event_id": None}
         w.ask(SELF, SIB, cid=C1, task_id=TID)
         w.tr[SELF].mention = FakeTransport.mention.__get__(w.tr[SELF])
-        w.tr[SELF].room.post(SELF, f"{SIB} — {policy.ask_line(C1, None, [SELF, SIB])}")
+        w.tr[SELF].room.post(SELF, f"{SIB} — is the disk full?")
         with mock.patch.object(policy, "_write_record", side_effect=OSError("ro")):
             self.assertIn("unconfirmed", policy.reconcile(w.tr[SELF], ROOM, SELF, w.ws[SELF], task_id=TID))
         w.tr[SELF].read = lambda room, limit: {"ok": False, "reason": "down"}
@@ -1634,7 +1230,7 @@ class TestPublicationIsOneRecoverableState(unittest.TestCase):
         self.assertFalse(early["asked"], early)
         self.assertIn("unconfirmed", early["reason"])
         self.assertEqual(w.room.msgs, [])
-        w.room.post(SELF, f"{SIB} — {policy.ask_line(C1, None, [SELF, SIB])}")  # the timed-out post lands
+        w.room.post(SELF, f"{SIB} — is the disk full?")  # the timed-out post lands
         again = w.ask(SELF, SIB, cid=C2, task_id=TID)
         self.assertEqual((again["asked"], again["root"], again["follow_up"]), (True, "$ask", True), again)
         self.assertEqual([m.get("thread_root") for m in w.room.msgs], [None, "$ask"])
@@ -1681,7 +1277,7 @@ class TestOneRootPerTaskEver(unittest.TestCase):
         with mock.patch.object(policy, "READ_LIMIT", 2):  # the first ask has scrolled out of the read
             res = w.ask(SELF, SIB, cid=C2, task_id=TID)
         self.assertFalse(res["asked"], res)
-        self.assertEqual([m for m in w.room.msgs if m.get("sender") == SELF and "consult:" in m["body"]].__len__(), 1)
+        self.assertEqual(len([m for m in w.room.msgs if m.get("sender") == SELF and not m.get("thread_root")]), 1)
 
     def test_kewei_2_expiry_cleanup_never_displaces_a_paused_publisher(self):
         w, real, seen = self.w, policy._write_record, []
@@ -1715,7 +1311,7 @@ class TestOneRootPerTaskEver(unittest.TestCase):
         w.tr[SIB].mention = landed_without_receipt
         self.assertTrue(w.answer(SIB, "up", task_id="task-b1")["unconfirmed"])
         w.tr[SIB].mention = real
-        age_answer_claim(w.ws[SIB], C1, 8 * 86400)
+        age_answer_claim(w.ws[SIB], "$ask", 8 * 86400)
         policy.pending(w.ws[SIB], 600)
         with mock.patch.object(policy, "_room_messages", return_value=[]):  # the answer is beyond the read
             res = w.answer(SIB, "up", task_id="task-b1")
@@ -1735,14 +1331,14 @@ class TestOneRootPerTaskEver(unittest.TestCase):
         w.answer(SIB, "up", task_id="task-b1")
         (w.ws[SIB] / "results" / "task-b1.txt").write_text("[no-send]")
         policy.pending(w.ws[SIB], 600, now=time.time() + 30 * 86400)
-        self.assertTrue(policy._answer_claim(w.ws[SIB], C1).exists())
+        self.assertTrue(policy._answer_claim(w.ws[SIB], "$ask").exists())
 
     def test_an_answer_claim_remembers_every_task_that_posted_through_it(self):
         w = self.w
         w.ask(SELF, SIB, cid=C1, task_id=TID)
         w.deliver(SIB, "$ask", "task-b1")
         w.answer(SIB, "up", task_id="task-b1")
-        claim = policy._answer_claim(w.ws[SIB], C1)
+        claim = policy._answer_claim(w.ws[SIB], "$ask")
         policy._note_tasks(claim, json.loads(claim.read_text()), ["task-b9", None, "task-b1"])
         self.assertEqual(json.loads(claim.read_text())["tasks"], ["task-b1", "task-b9"])
         with mock.patch.object(policy, "_write_record", side_effect=OSError("ro")):
@@ -1801,15 +1397,14 @@ class TestClaimsAreNeverReleased(unittest.TestCase):
         w.deliver(SIB, "$ask3", "task-b2")
         up = w.match(SIB, "task-b2")
         first = w.answer(SIB, "per third: 80%", up=up["answer_up"]["up"])
-        recorded = json.loads(policy._answer_claim(w.ws[SIB], C1).read_text())["tasks"]
+        recorded = json.loads(policy._answer_claim(w.ws[SIB], "$ask").read_text())["tasks"]
         self.assertEqual(set(recorded), {"task-b1", "task-b2"})  # the original ask task too
         (w.ws[SIB] / "results" / "task-b2.txt").write_text("[no-send]")
         policy.pending(w.ws[SIB], 600)
         second = w.answer(SIB, "per third: 80%", task_id="task-b1")  # task-b1 is still live
         self.assertEqual((second.get("replay"), second["event_id"]), (True, first["event_id"]), second)
-        self.assertEqual(sum(1 for m in w.room.msgs if m["sender"] == SIB
-                             and policy.answer_tag(C1) in m["body"]), 1)
-        tasks = json.loads(policy._answer_claim(w.ws[SIB], C1).read_text())["tasks"]
+        self.assertEqual(sum(1 for m in w.room.msgs if m["sender"] == SIB and m["body"].startswith(SELF)), 1)
+        tasks = json.loads(policy._answer_claim(w.ws[SIB], "$ask").read_text())["tasks"]
         self.assertEqual(set(tasks), {"task-b1", "task-b2"})
 
     def test_claims_of_finished_tasks_stay_on_disk_and_leave_the_listing(self):
@@ -1819,6 +1414,269 @@ class TestClaimsAreNeverReleased(unittest.TestCase):
         (w.ws[SELF] / "results" / f"{TID}.txt").write_text("done")
         self.assertEqual(policy.pending(w.ws[SELF], 600), [])
         self.assertTrue(policy._root_claim(w.ws[SELF], TID).exists())
+
+
+class TestPlainMessages(unittest.TestCase):
+    """An ask is the question alone, mentioning the agent; the correlation lives in this
+    agent's own records, keyed by thread root and ask event."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_an_ask_is_the_question_alone_and_roots_a_new_thread(self):
+        w = self.w
+        res = w.ask(SELF, SIB, cid=C1, task_id=TID, question="Is the build host up?")
+        self.assertEqual((res["asked"], res["root"], res["ask_event"]), (True, "$ask", "$ask"), res)
+        self.assertEqual(w.tr[SELF].posted, [(SIB, "Is the build host up?", ROOM)])
+        self.assertEqual(w.tr[SELF].thread_roots, [None])
+        self.assertEqual(w.room.msgs[0]["body"], f"{SIB} — Is the build host up?")
+
+    def test_the_record_holds_the_correlation_and_no_message_carries_it(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID, question="Is the build host up?")
+        [rec] = policy.records(w.ws[SELF], "pending")
+        self.assertEqual((rec["root"], rec["ask_event"], rec["agent"], rec["body"]),
+                         ("$ask", "$ask", SIB, "Is the build host up?"))
+        for m in w.room.msgs:
+            self.assertNotIn(C1, m["body"])
+            self.assertNotIn("owner-agent-consult", m["body"])
+
+    def test_the_skill_ships_no_marker_parser(self):
+        for name in ("MARKER", "parse_ask", "ask_line", "answer_tag"):
+            self.assertFalse(hasattr(policy, name), name)
+
+
+class TestAnswersByRelation(unittest.TestCase):
+    """An answer is any message from the asked agent in the consult thread after the ask, or
+    a reply citing the ask. What reads as progress is judged by the agent, not by text rules."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+        self.w.ask(SELF, SIB, cid=C1, task_id=TID, question="Is the build host up?")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def reply(self, body, *, sender=SIB, tid="task-a2", **rel):
+        rel = rel or {"thread_root": "$ask"}
+        self.w.room.post(sender, body, **rel)
+        event = self.w.room.msgs[-1]["event_id"]
+        self.w.deliver(SELF, event, tid)
+        return event
+
+    def test_any_plain_message_from_the_asked_agent_in_the_thread_answers(self):
+        self.reply("Yes, it has been up since 09:00.")
+        got = self.w.match(SELF, "task-a2")
+        self.assertEqual((got["matched"], got["task_id"], got["reply_text"]),
+                         (True, TID, "Yes, it has been up since 09:00."), got)
+        self.assertEqual(got["lead"], f"[channel: {OWNER_DM}]\n")
+
+    def test_a_reply_citing_the_ask_outside_the_thread_answers(self):
+        self.reply("Yes.", reply_to="$ask")
+        self.assertTrue(self.w.match(SELF, "task-a2")["matched"])
+
+    def test_a_message_judged_not_final_leaves_the_consult_open_for_the_next_one(self):
+        self.reply("On it, checking now.", tid="task-a2")
+        held = policy.match_reply(self.w.tr[SELF], room=ROOM, self_mxid=SELF, task_id="task-a2",
+                                  workspace=self.w.ws[SELF], not_final=True)
+        self.assertEqual((held["matched"], held["progress"]), (False, True), held)
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])
+        self.reply("Yes, it is up.", tid="task-a3")
+        got = self.w.match(SELF, "task-a3")
+        self.assertEqual((got["matched"], got["reply_text"]), (True, "Yes, it is up."), got)
+        self.assertFalse(self.w.match(SELF, "task-a2")["matched"])
+
+    def test_messages_that_are_not_this_consults_answer_do_not_match(self):
+        self.reply("Yes.", sender=OWNER, tid="task-o")
+        self.reply("Yes.", tid="task-x", thread_root="$elsewhere")
+        for tid in ("task-o", "task-x"):
+            got = self.w.match(SELF, tid)
+            self.assertFalse(got["matched"], tid)
+            self.assertIn("not an answer to a pending consult", got["reason"])
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])
+
+    def test_a_message_from_before_the_ask_does_not_answer_it(self):
+        w = self.w
+        w.room.post(SIB, "unrelated, before the follow-up", thread_root="$ask")
+        early = w.room.msgs[-1]["event_id"]
+        w.deliver(SELF, early, "task-a2")
+        self.assertTrue(w.match(SELF, "task-a2")["matched"])  # it answers the first ask
+        w.ask(SELF, SIB, cid=C2, task_id=TID, question="And the disk?")
+        w.deliver(SELF, early, "task-a3")
+        self.assertIn("already answered", w.match(SELF, "task-a3")["reason"])
+        self.assertEqual(pending_ids(w.ws[SELF]), [C2])
+
+    def test_a_reply_citing_a_follow_up_answers_that_follow_up(self):
+        w = self.w
+        follow = w.ask(SELF, SIB, cid=C2, task_id=TID, question="And the disk?")
+        self.reply("Disk is 80% full.", thread_root="$ask", reply_to=follow["ask_event"])
+        got = w.match(SELF, "task-a2")
+        self.assertEqual((got["cid"], got["reply_text"]), (C2, "Disk is 80% full."), got)
+
+    def test_an_answer_found_by_pending_matches_by_event_and_replays_until_relayed(self):
+        w = self.w
+        w.room.post(SIB, "Yes.", thread_root="$ask")  # no task arrived for it
+        waiting = policy.waiting_answers(w.tr[SELF], ROOM, w.ws[SELF])
+        self.assertEqual(waiting[C1]["event_id"], "$ask2")
+        first = policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, event_id="$ask2", workspace=w.ws[SELF])
+        self.assertTrue(first["matched"], first)
+        again = policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, event_id="$ask2", workspace=w.ws[SELF])
+        self.assertEqual((again["matched"], again.get("replay")), (True, True))
+        self.assertTrue(policy.mark_relayed(w.ws[SELF], C1)["ok"])
+        done = policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, event_id="$ask2", workspace=w.ws[SELF])
+        self.assertIn("already answered", done["reason"])
+        self.assertFalse(policy.mark_relayed(w.ws[SELF], C2)["ok"])
+
+
+class TestOnwardInTheThread(unittest.TestCase):
+    """B, running this skill, may consult C in the same thread; the thread is the chain. The
+    loop check reads only who has posted in the thread and this agent's own asks."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+        self.w.ask(SELF, SIB, cid=C1, task_id=TID, question="What is on the build host?")
+        self.w.deliver(SIB, "$ask", "task-b1")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_an_onward_ask_stays_in_the_thread_and_the_answer_flows_back(self):
+        w = self.w
+        onward = w.ask(SIB, THIRD, cid=C2, via_task="task-b1", question="Which jobs run on the build host?")
+        self.assertEqual((onward["asked"], onward["root"]), (True, "$ask"), onward)
+        self.assertEqual((w.tr[SIB].thread_roots, w.tr[SIB].reply_tos), (["$ask"], ["$ask"]))
+        w.room.post(THIRD, "Nightly builds and the docs job.", thread_root="$ask")  # Muse-style reply
+        w.deliver(SIB, "$ask3", "task-b2")
+        up = w.match(SIB, "task-b2")
+        self.assertEqual((up["matched"], up["answer_up"]["asker"]), (True, SELF), up)
+        posted = w.answer(SIB, "Nightly builds and the docs job, per Third.", up=up["answer_up"]["up"])
+        self.assertTrue(posted["answered"], posted)
+        self.assertEqual((w.room.msgs[-1]["in_reply_to"], w.room.msgs[-1]["thread_root"]), ("$ask", "$ask"))
+        w.deliver(SELF, posted["event_id"], "task-a2")
+        top = w.match(SELF, "task-a2")
+        self.assertEqual((top["matched"], top["task_id"]), (True, TID), top)
+        self.assertEqual({m.get("thread_root") for m in w.room.msgs[1:]}, {"$ask"})
+
+    def test_the_onward_ask_is_judged_not_final_by_the_first_asker(self):
+        w = self.w
+        w.ask(SIB, THIRD, cid=C2, via_task="task-b1", question="Which jobs run there?")
+        waiting = policy.waiting_answers(w.tr[SELF], ROOM, w.ws[SELF])
+        self.assertEqual(waiting[C1]["event_id"], "$ask2")  # B's onward ask is B's first message
+        held = policy.match_reply(w.tr[SELF], room=ROOM, self_mxid=SELF, event_id="$ask2",
+                                  workspace=w.ws[SELF], not_final=True)
+        self.assertTrue(held["progress"])
+        self.assertEqual(policy.waiting_answers(w.tr[SELF], ROOM, w.ws[SELF]), {})
+
+    def test_no_agent_that_has_taken_part_is_asked_by_another(self):
+        w = self.w
+        w.ask(SIB, THIRD, cid=C2, via_task="task-b1", question="Which jobs?")
+        w.room.post(THIRD, "Nightly builds.", thread_root="$ask")
+        w.deliver(THIRD, "$ask2", "task-c1")
+        for target in (SELF, SIB):
+            res = w.ask(THIRD, target, cid=C3, via_task="task-c1")
+            self.assertIn("already taken part", res["reason"], target)
+        self.assertIn("already taken part", w.ask(SIB, SELF, cid=C3, via_task="task-b1")["reason"])
+        self.assertIn("already taken part", w.ask(SELF, THIRD, cid=C3, task_id=TID)["reason"])
+        self.assertTrue(w.ask(SELF, SIB, cid="4444444444444444", task_id=TID)["follow_up"])
+
+    def test_the_loop_check_reads_senders_and_own_asks_only(self):
+        msgs = [{"sender": SELF}, {"sender": SIB}]
+        self.assertIsNone(policy.loop_check(msgs, [{"agent": SIB}], SIB))
+        self.assertIsNone(policy.loop_check(msgs, [], THIRD))
+        self.assertIsNotNone(policy.loop_check(msgs, [], SIB))
+
+
+class TestIncomingAskGate(unittest.TestCase):
+    """An incoming ask is answered or consulted from only if a verified task from the consult
+    room delivered it, from another of the owner's agents, in a thread an owner's agent rooted,
+    within this agent's window."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def refused(self, tid="task-b1"):
+        res = self.w.ask(SIB, FOURTH, cid=C2, via_task=tid)
+        self.assertFalse(res["asked"], res)
+        self.assertEqual(self.w.tr[SIB].posted, [])
+        return res["reason"]
+
+    def test_the_genuine_ask_passes(self):
+        self.w.ask(SELF, SIB, cid=C1, task_id=TID)
+        self.w.deliver(SIB, "$ask", "task-b1")
+        self.assertTrue(self.w.ask(SIB, FOURTH, cid=C2, via_task="task-b1")["asked"])
+
+    def test_an_unsigned_task_is_refused(self):
+        self.w.ask(SELF, SIB, cid=C1, task_id=TID)
+        self.w.deliver(SIB, "$ask", "task-b1", stamp=False)
+        self.assertIn("unsigned", self.refused())
+
+    def test_a_task_from_another_room_is_refused(self):
+        self.w.ask(SELF, SIB, cid=C1, task_id=TID)
+        reply_task(self.w.ws[SIB], "$ask", tid="task-b1", room="!elsewhere:example.test", sender=SELF)
+        self.assertIn("consult room", self.refused())
+
+    def test_a_message_from_the_owner_human_is_not_an_agents_ask(self):
+        self.w.room.post(OWNER, f"{SIB} — please check the host")
+        self.w.deliver(SIB, "$ask", "task-b1")
+        self.assertIn("not from another of the owner's agents", self.refused())
+
+    def test_a_thread_rooted_by_the_owner_human_is_refused(self):
+        self.w.room.post(OWNER, "a thread the owner started")
+        self.w.room.post(SELF, f"{SIB} — please check", thread_root="$ask")
+        self.w.deliver(SIB, "$ask2", "task-b1")
+        self.assertIn("root is not from one of the owner's agents", self.refused())
+
+    def test_a_closed_ask_task_is_refused(self):
+        self.w.ask(SELF, SIB, cid=C1, task_id=TID)
+        self.w.deliver(SIB, "$ask", "task-b1")
+        (self.w.ws[SIB] / "results" / "task-b1.txt").write_text("[no-send]")
+        self.assertIn("already has a result", self.refused())
+
+
+class TestPlainMessageEdges(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.w = World(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_refusals_on_the_ask_answer_and_match_paths(self):
+        w = self.w
+        self.assertIn("exactly one", w.ask(SELF, SIB, cid=C1, task_id=TID, via_task="task-b1")["reason"])
+        self.assertIn("is not an onward consult", w.answer(SIB, "x", up=C2)["reason"])
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.room.post(SIB, "Yes.", thread_root="$ask")
+        w.deliver(SELF, "$ask2", "task-a2", stamp=False)
+        self.assertIn("unsigned", w.match(SELF, "task-a2")["reason"])
+        reply_task(w.ws[SELF], "$ask2", tid="task-a3", room="!elsewhere:example.test", sender=SIB)
+        self.assertIn("consult room", w.match(SELF, "task-a3")["reason"])
+        self.assertEqual(policy.reply_lead({"channel_id": OWNER_DM, "thread_root": "$root"}),
+                         f"[channel: {OWNER_DM}]\n[thread: $root]\n")
+
+    def test_a_thread_out_of_sight_or_without_a_server_timestamp_refuses(self):
+        w = self.w
+        w.ask(SELF, SIB, cid=C1, task_id=TID)
+        w.room.post(OWNER, "later one")
+        w.room.post(OWNER, "later two")
+        with mock.patch.object(policy, "READ_LIMIT", 2):
+            self.assertIn("cannot see the whole thread", w.ask(SELF, SIB, cid=C2, task_id=TID)["reason"])
+        w.room.msgs[0].pop("ts")
+        self.assertIn("no server timestamp", w.ask(SELF, SIB, cid=C2, task_id=TID)["reason"])
+        w.deliver(SIB, "$ask", "task-b1")
+        self.assertIn("no server timestamp", w.ask(SIB, THIRD, cid=C3, via_task="task-b1")["reason"])
+        w.tr[SIB].read = lambda room, limit: {"ok": False, "reason": "down"}
+        self.assertIn("unreadable", w.ask(SIB, THIRD, cid=C3, via_task="task-b1")["reason"])
 
 
 class TestRecordEdges(unittest.TestCase):
@@ -1875,13 +1733,15 @@ class TestRecordEdges(unittest.TestCase):
         self.assertTrue(w.ask(SELF, SIB, cid=C1, task_id=TID)["asked"])
         self.assertEqual(pending_ids(w.ws[SELF]), [])
 
-    def test_recovery_ignores_an_ask_with_the_same_id_from_another_sender(self):
-        rec = {"cid": C1, "agent": SIB, "ask_event": None, "root": None}
-        forged = {"sender": THIRD, "event_id": "$x", "body": f"{SIB} — {policy.ask_line(C1, None, [SELF, SIB])}"}
+    def test_recovery_matches_only_this_agents_own_message_with_the_exact_text(self):
+        rec = {"cid": C1, "agent": SIB, "ask_event": None, "root": None, "body": "is the disk full?"}
+        forged = {"sender": THIRD, "event_id": "$x", "body": f"{SIB} — is the disk full?"}
         self.assertIsNone(policy._recover_ask(rec, [forged], SELF)["ask_event"])
+        other_text = dict(forged, sender=SELF, body=f"{SIB} — is the disk full? (again)")
+        self.assertIsNone(policy._recover_ask(rec, [other_text], SELF)["ask_event"])
         own = dict(forged, sender=SELF)
         self.assertEqual(policy._recover_ask(rec, [own], SELF)["ask_event"], "$x")
-
+        self.assertIsNone(policy._recover_ask(rec, [own], SELF, used={"$x"})["ask_event"])
 
 class TestPendingListing(unittest.TestCase):
     def test_overdue_consults_are_due_a_nudge_once(self):
@@ -2014,7 +1874,7 @@ class FakeGateway(http.server.BaseHTTPRequestHandler):
             self.state.setdefault("posted", []).append(req)
             n = len(self.state["posted"])
             eid = "$ask" if n == 1 else f"$ask{n}"
-            self.state["messages"].insert(0, {"event_id": eid, "sender": SELF, "ts": int(time.time() * 1000),
+            self.state["messages"].append({"event_id": eid, "sender": SELF, "ts": int(time.time() * 1000),
                                               "body": req["body"],
                                               **({"thread_root": req["thread_root"]}
                                                  if req.get("thread_root") else {})})
@@ -2057,15 +1917,18 @@ class TestProductionAdapter(unittest.TestCase):
         self.assertIn("1 member(s) with no identity", v["reason"])
         self.assertNotIn("posted", FakeGateway.state)
 
-    def test_end_to_end_ask_then_the_reply_task_matches_and_the_checkpoint_does_not(self):
+    def test_end_to_end_ask_then_the_reply_task_matches_after_a_judged_progress_message(self):
         res = run_consult(self.tr, self.ws)
         self.assertEqual((res["asked"], res["ask_event"]), (True, "$ask"), res)
         posted = FakeGateway.state["posted"]
         self.assertEqual(len(posted), 1)
         self.assertEqual(posted[0]["mentions"], [SIB])
-        self.assertIn(f"consult:{CID}", posted[0]["body"])
+        self.assertTrue(posted[0]["body"].endswith("is the build host up?"))
+        self.assertNotIn("owner-agent-consult", posted[0]["body"])
         reply_task(self.ws, "$p", tid="task-progress")
-        self.assertTrue(match(self.tr, self.ws, "task-progress").get("progress"))
+        progress = policy.match_reply(self.tr, room=ROOM, self_mxid=SELF, task_id="task-progress",
+                                      workspace=self.ws, not_final=True)  # the agent read it as progress
+        self.assertTrue(progress.get("progress"), progress)
         reply_task(self.ws, "$f")
         got = match(self.tr, self.ws)
         self.assertTrue(got["matched"], got)
@@ -2101,18 +1964,19 @@ class TestCliAndEdges(unittest.TestCase):
                                 transport=tr, workspace=ws)
             self.assertEqual((res["asked"], tr.reads, res["limits"]["max_asks"], res["limits"]["max_s"]),
                              (True, 0, 3, 900), res)
-            rc, listed = self._cli("pending", "--nudge-after", "60", workspace=ws)
+            rc, listed = self._cli("pending", "--nudge-after", "60", transport=tr, workspace=ws)
             self.assertEqual(([r["cid"] for r in listed["pending"]], listed["nudge_after_s"]), ([CID], 60))
             rc, nudged = self._cli("pending", "--nudged", CID, workspace=ws)
             self.assertTrue(nudged["ok"], nudged)
             reply_task(ws, "$f")
             rc, got = self._cli("match", "--agent", SELF, "--task-id", "task-reply",
                                 transport=tr, workspace=ws)
-            rc, ans = self._cli("answer", "--agent", SELF, "--task-id", "task-reply", "--body-file", str(q),
-                                transport=tr, workspace=ws)
+            rc, again = self._cli("match", "--agent", SELF, "--event-id", "$f", transport=tr, workspace=ws)
+            rc, rel = self._cli("relayed", CID, workspace=ws)
         self.assertTrue(got["matched"], got)
-        self.assertEqual((ans["answered"], ans["reason"]), (False, "task is not a consult ask"))
         self.assertEqual((got["task_id"], got["reply_text"]), (TID, "up"))
+        self.assertIn("already answered", again["reason"])  # matched by a task: its result is the ack
+        self.assertTrue(rel["ok"], rel)
 
     def test_cli_unreadable_question_and_refused_roster(self):
         rc, res = self._cli("ask", "--agent", SELF, "--agent-to", SIB, "--question-file",

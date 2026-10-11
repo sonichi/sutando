@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """owner-agent-consult CLI — ask another agent of the same owner, in the owner-only
-consult room, and later match its reply (which arrives as a new task) back to the owner's
-task. Prints one JSON object; refusals are in-band.
+consult room, with a plain message, and later match its reply in the thread back to the
+owner's task. Prints one JSON object; refusals are in-band.
 
   consult.py roster  [--agent SELF] [--room ROOM] [--room-cli CLI]
   consult.py ask     --agent-to MXID --question-file F (--task-id OWNER_TASK | --via-task ASK_TASK) ...
   consult.py answer  --body-file F (--task-id ASK_TASK | --up ONWARD_CID) [--agent SELF] ...
-  consult.py match   --task-id REPLY_TASK_ID [--agent SELF] ...
+  consult.py match   (--task-id REPLY_TASK_ID | --event-id EVENT) [--not-final] [--agent SELF] ...
+  consult.py relayed CID
   consult.py pending [--nudged CID] [--nudge-after S]
 
 The room transport is the CLI named by OWNER_AGENT_CONSULT_ROOM_CLI, run as a subprocess
@@ -77,7 +78,7 @@ def _emit(obj) -> int:
 def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
     p = argparse.ArgumentParser(prog="consult.py")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("roster", "ask", "answer", "match", "pending"):
+    for name in ("roster", "ask", "answer", "match", "relayed", "pending"):
         s = sub.add_parser(name)
         s.add_argument("--agent", dest="self_mxid", default=os.environ.get("AGENT_MXID"),
                        help="this agent's own mxid (room-ops convention)")
@@ -90,17 +91,22 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
             g.add_argument("--task-id", help="id of the owner task being answered, live in this inbox")
             g.add_argument("--via-task", help="id of the consult ask task you are consulting onward from")
             s.add_argument("--max-duration", default=None,
-                           help=f"the thread's time window in seconds; a later ask can only narrow it (overrides {policy.CONFIG_MAX_DURATION})")
+                           help=f"this agent's time window in the thread, in seconds (overrides {policy.CONFIG_MAX_DURATION})")
             s.add_argument("--max-asks", default=None,
-                           help=f"the most asks the thread takes; a later ask can only narrow it (overrides {policy.CONFIG_MAX_ASKS})")
+                           help=f"the most asks this agent makes in the thread (overrides {policy.CONFIG_MAX_ASKS})")
         if name == "answer":
             s.add_argument("--body-file", required=True)
             g = s.add_mutually_exclusive_group(required=True)
             g.add_argument("--task-id", help="id of the consult ask task you are answering")
             g.add_argument("--up", metavar="CID", help="an answered onward consult whose asker you now answer")
         if name == "match":
-            s.add_argument("--task-id", required=True,
-                           help="id of the task the consulted agent's reply arrived as")
+            g = s.add_mutually_exclusive_group(required=True)
+            g.add_argument("--task-id", help="id of the task the consulted agent's reply arrived as")
+            g.add_argument("--event-id", help="the reply's event, as `pending` lists it under answer_waiting")
+            s.add_argument("--not-final", action="store_true",
+                           help="you read the reply as progress (or an onward ask), not the answer")
+        if name == "relayed":
+            s.add_argument("cid", help="a consult matched by --event-id, now relayed to the owner")
         if name == "pending":
             s.add_argument("--nudged", default=None, metavar="CID",
                            help="record that the owner was told this consult is unanswered")
@@ -112,17 +118,22 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
     if not conf["active"]:
         return _emit({"ok": False, "inert": True, "reason": conf["reason"]})
     ws = workspace or _workspace()
-    if a.cmd == "pending":
-        if a.nudged:
-            return _emit(policy.mark_nudged(ws, a.nudged))
-        return _emit({"ok": True, "nudge_after_s": conf["nudge_after_s"],
-                      "expire_after_s": conf["expire_after_s"],
-                      "pending": policy.pending(ws, conf["nudge_after_s"],
-                                                expire_after_s=conf["expire_after_s"])})
+    if a.cmd == "relayed":
+        return _emit(policy.mark_relayed(ws, a.cid))
+    if a.cmd == "pending" and a.nudged:
+        return _emit(policy.mark_nudged(ws, a.nudged))
     try:
         transport = transport or RoomCliTransport(conf["room_cli"], a.self_mxid)
     except RuntimeError as e:
         return _emit({"ok": False, "reason": str(e)})
+    if a.cmd == "pending":
+        rows = policy.pending(ws, conf["nudge_after_s"], expire_after_s=conf["expire_after_s"])
+        waiting = policy.waiting_answers(transport, conf["room"], ws)
+        for r in rows:
+            if r.get("cid") in waiting:
+                r["answer_waiting"] = waiting[r["cid"]]
+        return _emit({"ok": True, "nudge_after_s": conf["nudge_after_s"],
+                      "expire_after_s": conf["expire_after_s"], "pending": rows})
 
     if a.cmd == "roster":
         verdict = policy.guard(conf["room"], a.self_mxid or "", transport)
@@ -133,6 +144,7 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
     if a.cmd == "match":
         return _emit({"ok": True, **policy.match_reply(transport, room=conf["room"],
                                                          self_mxid=a.self_mxid or "", task_id=a.task_id,
+                                                         event_id=a.event_id, not_final=a.not_final,
                                                          workspace=ws, expire_after_s=conf["expire_after_s"])})
     path = a.question_file if a.cmd == "ask" else a.body_file
     try:

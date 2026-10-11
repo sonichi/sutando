@@ -6,7 +6,7 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Before answering its owner, ask another agent of the same owner in an owner-only consult room; the reply arrives as a new task and is matched back to the owner's task. Inert until OWNER_AGENT_CONSULT_ROOM and OWNER_AGENT_CONSULT_ROOM_CLI are set; manifest present to DECLARE config per this convention.",
+  "description": "Before answering its owner, ask another agent of the same owner, with a plain message in an owner-only consult room; its reply in the thread is matched back to the owner's task by Matrix relations. Inert until OWNER_AGENT_CONSULT_ROOM and OWNER_AGENT_CONSULT_ROOM_CLI are set; manifest present to DECLARE config per this convention.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   },
