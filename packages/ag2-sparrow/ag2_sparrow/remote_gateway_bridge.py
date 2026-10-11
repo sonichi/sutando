@@ -2074,9 +2074,6 @@ def _valid_tid(tid: str) -> bool:
     return bool(_TID_RE.fullmatch(tid)) and tid not in (".", "..")
 
 
-_CONTROL_TO_SPACE = {c: " " for c in (*range(0x20), *range(0x7F, 0xA0))}
-
-
 def _one_line(value) -> str:
     """Header-safe single-line value: CR/LF stripped so a gateway-controlled
     field can't inject extra `key: value` lines (e.g. forge a second
@@ -2088,11 +2085,8 @@ def _one_line(value) -> str:
 
     Folds on str.splitlines()' own set, not on CR/LF: readers split with
     splitlines(), so any narrower set leaves a separator that is one line to
-    the writer and two to the reader.
-
-    Every other C0/C1 control character (ESC, BEL, NUL, TAB, DEL...) becomes a
-    space too, so no field carries terminal escapes into a header or env value."""
-    return " ".join(str(value).splitlines()).translate(_CONTROL_TO_SPACE)
+    the writer and two to the reader."""
+    return " ".join(str(value).splitlines())
 
 
 def _redact_url(value: str) -> str:
@@ -3390,13 +3384,21 @@ _ON_TASK_ENV_MAX = 512
 _ON_TASK_STDIN_TIMEOUT_S = 30.0
 
 
+_CONTROL_TO_SPACE = {c: " " for c in (*range(0x20), *range(0x7F, 0xA0))}
+
+
+def _env_safe(value) -> str:
+    """_one_line, then every C0/C1 control character (ESC, BEL, TAB, DEL...) as a space."""
+    return _one_line(value).translate(_CONTROL_TO_SPACE)
+
+
 def _on_task_header_env(text: str) -> "dict[str, str]":
     """SPARROW_* variables for the task file's routing headers; single-line, bounded."""
     headers = local_task_protocol.parse_task_headers_trusted(text).headers
     secrets = [v for v in (TOKEN, _RAW, HS_MEDIA_TOKEN) if v]
     env = {}
     for name, key in _ON_TASK_ENV_FIELDS:
-        value = _one_line(headers.get(key) or "").strip()[:_ON_TASK_ENV_MAX]
+        value = _env_safe(headers.get(key) or "").strip()[:_ON_TASK_ENV_MAX]
         if value and not any(sec in value for sec in secrets):
             env[name] = value
     return env

@@ -255,8 +255,9 @@ def test_control_characters_never_reach_env():
         base = pathlib.Path(d)
         cmd, out = _recorder_cmd(base)
         m = _load(base, None)
-        assert m._one_line("a\x1b[31mb\x07c\x9bd\te\x00f") == "a [31mb c d e f"
-        assert not any(ch in m._one_line(f"x{controls}y") for ch in controls)
+        assert m._env_safe("a\x1b[31mb\x07c\x9bd\te\x00f") == "a [31mb c d e f"
+        assert not any(ch in m._env_safe(f"x{controls}y") for ch in controls)
+        assert m._one_line("a\tb\x1bc") == "a\tb\x1bc"  # task-file headers unchanged
         m.ON_TASK_CMD = cmd
         path = base / "task-c.txt"
         path.write_text("id: task-c\nsender_name: Al\x1b]0;pwn\x07ice\x9b\x7f\n"
@@ -269,6 +270,18 @@ def test_control_characters_never_reach_env():
             if k.startswith("SPARROW_"):
                 assert not any(ch in v for ch in controls), (k, v)
         print("PASS test_control_characters_never_reach_env")
+
+
+def test_task_file_keeps_tab_and_esc_in_headers():
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        cmd, out = _recorder_cmd(base)
+        m = _load(base, cmd)
+        tid, _ = m._write_task({**_task(), "sender_name": "Al\tice\x1b[1m"})
+        text = (m.TASKS_DIR / f"{tid}.txt").read_text()
+        assert "sender_name: Al\tice\x1b[1m\n" in text, text
+        assert _calls(out, 1)[0]["env"]["SPARROW_SENDER_NAME"] == "Al ice [1m"
+        print("PASS test_task_file_keeps_tab_and_esc_in_headers")
 
 
 def test_child_that_ignores_or_closes_stdin_never_blocks():
@@ -378,6 +391,7 @@ if __name__ == "__main__":
     test_env_carries_the_routing_headers()
     test_header_holding_the_token_is_not_exported()
     test_control_characters_never_reach_env()
+    test_task_file_keeps_tab_and_esc_in_headers()
     test_child_that_ignores_or_closes_stdin_never_blocks()
     test_stdin_feed_in_the_calling_thread()
     test_fire_reads_the_file_when_no_text_is_given()
