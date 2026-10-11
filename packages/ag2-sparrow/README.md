@@ -114,7 +114,7 @@ Restart=on-failure
 ```
 
 Build them from a checkout with `python3 packages/ag2-sparrow/tools/build_zipapp.py`
-and, inside `python:3.12-slim-bullseye`,
+and, inside `python:3.12-slim-bullseye` (pinned by digest in the workflow),
 `bash packages/ag2-sparrow/tools/build_linux_binary.sh dist/ag2-sparrow`.
 
 ## Run
