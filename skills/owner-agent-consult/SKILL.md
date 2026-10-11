@@ -69,7 +69,8 @@ than closed, and the owner of each install should know them before configuring a
 The thread limits bound both: whatever its marker claims, a thread so started takes at most
 `OWNER_AGENT_CONSULT_MAX_ASKS` asks (each agent's own setting) within
 `OWNER_AGENT_CONSULT_MAX_DURATION_S` of the root's server timestamp, and only among the owner's
-agents in the owner-only room.
+agents in the owner-only room. That bound is per thread: nothing limits how many threads such
+a session starts.
 
 ## One consult, one thread
 
@@ -105,6 +106,9 @@ never widen them:
 - each limit is the **smaller** of the thread's marker and the asking agent's own config
   (`--max-*`, env, manifest);
 - a root event with no usable server timestamp refuses the ask.
+
+Unverified: the server timestamp is the homeserver's `origin_server_ts` as the gateway returns
+it in the room read; this skill trusts that value and does not check it independently.
 
 When the owner's request sets a bound ("give it five minutes", "ask at most two agents"), read
 it yourself and pass the matching flags on the first ask; no code parses the owner's wording.
