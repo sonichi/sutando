@@ -111,7 +111,9 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
         if a.nudged:
             return _emit(policy.mark_nudged(ws, a.nudged))
         return _emit({"ok": True, "nudge_after_s": conf["nudge_after_s"],
-                      "pending": policy.pending(ws, conf["nudge_after_s"])})
+                      "expire_after_s": conf["expire_after_s"],
+                      "pending": policy.pending(ws, conf["nudge_after_s"],
+                                                expire_after_s=conf["expire_after_s"])})
     try:
         transport = transport or RoomCliTransport(conf["room_cli"], a.self_mxid)
     except RuntimeError as e:
@@ -125,8 +127,8 @@ def main(argv=None, transport=None, workspace: Optional[Path] = None) -> int:
 
     if a.cmd == "match":
         return _emit({"ok": True, **policy.match_reply(transport, room=conf["room"],
-                                                         self_mxid=a.self_mxid or "",
-                                                         task_id=a.task_id, workspace=ws)})
+                                                         self_mxid=a.self_mxid or "", task_id=a.task_id,
+                                                         workspace=ws, expire_after_s=conf["expire_after_s"])})
     path = a.question_file if a.cmd == "ask" else a.body_file
     try:
         text = Path(path).read_text(encoding="utf-8")
