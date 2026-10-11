@@ -74,6 +74,49 @@ The boundaries the contract establishes (`outbox.py`, `outbox_adapter.py`,
 pipx install ag2-sparrow        # or: pip install ag2-sparrow
 ```
 
+## Single-file download
+
+No pip or pipx? Each `sparrow-v<version>` GitHub Release also carries the
+package as one file, each with a `.sha256`: a stdlib zipapp
+(`ag2-sparrow-<version>.pyz`, Python 3.9+, no dependencies) and, needing no
+Python at all, Linux binaries (`ag2-sparrow-<version>-linux-x86_64` and
+`-linux-arm64`, glibc 2.31+, e.g. Debian 11 / Ubuntu 20.04 or newer):
+
+```sh
+VER=X.Y.Z   # newest sparrow-v* tag: https://github.com/sonichi/sutando/releases?q=sparrow-v
+BASE=https://github.com/sonichi/sutando/releases/download/sparrow-v$VER
+
+# zipapp
+curl -fLO "$BASE/ag2-sparrow-$VER.pyz" -fLO "$BASE/ag2-sparrow-$VER.pyz.sha256"
+sha256sum -c "ag2-sparrow-$VER.pyz.sha256"   # macOS: shasum -a 256 -c
+mv "ag2-sparrow-$VER.pyz" ag2-sparrow.pyz
+REMOTE_TASK_TOKEN=<token> python3 ag2-sparrow.pyz
+
+# or the Linux binary (ARCH=x86_64 or arm64)
+ARCH=$(uname -m | sed 's/aarch64/arm64/')
+curl -fLO "$BASE/ag2-sparrow-$VER-linux-$ARCH" -fLO "$BASE/ag2-sparrow-$VER-linux-$ARCH.sha256"
+sha256sum -c "ag2-sparrow-$VER-linux-$ARCH.sha256"
+install -m 0755 "ag2-sparrow-$VER-linux-$ARCH" ag2-sparrow
+REMOTE_TASK_TOKEN=<token> ./ag2-sparrow
+```
+
+Both start the bridge, exactly like `ag2-sparrow`; the binary is the bridge
+only. The outbox tool runs from the zipapp: `PYTHONPATH=ag2-sparrow.pyz
+python3 -m ag2_sparrow.outbox_cli --help`. Under systemd, keep the token in an
+`EnvironmentFile` and point `ExecStart` at the file:
+
+```ini
+[Service]
+EnvironmentFile=/etc/ag2-sparrow.env
+ExecStart=/usr/bin/python3 /opt/ag2-sparrow/ag2-sparrow.pyz
+# or, with the binary: ExecStart=/opt/ag2-sparrow/ag2-sparrow
+Restart=on-failure
+```
+
+Build them from a checkout with `python3 packages/ag2-sparrow/tools/build_zipapp.py`
+and, inside `python:3.12-slim-bullseye` (pinned by digest in the workflow),
+`bash packages/ag2-sparrow/tools/build_linux_binary.sh dist/ag2-sparrow`.
+
 ## Run
 
 ```sh

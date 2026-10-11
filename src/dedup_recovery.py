@@ -134,7 +134,8 @@ def plan_dedup_recovery(
     # nothing" and carry these bytes into the re-ask. Reject; never echo them.
     if holder and not valid_archive_lookup_id(holder):
         return "report", MALFORMED_TEMPLATE
-    orig_text = _read(find_task_file(Path(tasks_dir), task_id))
+    orig_text = _read(find_task_file(Path(tasks_dir), task_id)
+                      or find_archived_task(Path(tasks_dir), task_id))
     holder_text = _read(find_result(Path(results_dir), holder)) if holder else None
 
     decision = dedup_decision(holder_text, orig_text)
