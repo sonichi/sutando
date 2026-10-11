@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -228,11 +229,54 @@ class SingletonGlueTest(unittest.TestCase):
     def test_deferred_when_live_holder(self):
         lf = self._lockfile()
         lf.parent.mkdir(parents=True, exist_ok=True)
-        lf.write_text(json.dumps({"role": "gateway-bridge", "pid": 999999,
-                                  "host": "testhost", "heartbeat_at": int(time.time()),
+        live = os.getppid()                              # a running process that is not us
+        lf.write_text(json.dumps({"role": "gateway-bridge", "pid": live,
+                                  "host": rgb._stable_host_label(),
+                                  "heartbeat_at": int(time.time()),
                                   "schema_version": 1}))
         self.assertFalse(rgb._acquire_singleton())       # live holder → must defer (no poll)
-        self.assertEqual(json.loads(lf.read_text())["pid"], 999999)  # holder untouched
+        self.assertEqual(json.loads(lf.read_text())["pid"], live)  # holder untouched
+
+    @unittest.skipIf(os.name == "nt", "no pid probe on Windows: heartbeat rule only")
+    def test_dead_holder_on_this_host_is_taken_over_at_once(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"]); child.wait()
+        lf = self._lockfile()
+        lf.parent.mkdir(parents=True, exist_ok=True)
+        lf.write_text(json.dumps({"role": "gateway-bridge", "pid": child.pid,
+                                  "host": rgb._stable_host_label(),   # the label the lock compares
+                                  "heartbeat_at": int(time.time()),
+                                  "schema_version": 1}))
+        self.assertTrue(rgb._acquire_singleton())        # no stale-window wait for a corpse
+        self.assertEqual(json.loads(lf.read_text())["pid"], os.getpid())
+        rgb._release_singleton()
+
+    def test_a_held_exit_retains_the_lock_past_its_own_pid(self):
+        self.assertTrue(rgb._acquire_singleton())
+        orig = rgb._join_push_thread
+        rgb._join_push_thread = lambda *a, **k: False    # a publication still in flight
+        try:
+            rgb._release_singleton()
+        finally:
+            rgb._join_push_thread = orig
+        held = json.loads(self._lockfile().read_text())
+        self.assertEqual(held["pid"], os.getpid())       # not released
+        self.assertTrue(held.get("retained"))            # so a dead-pid probe will not reap it
+
+    def test_a_held_exit_keeps_the_lock_when_retain_fails(self):
+        self.assertTrue(rgb._acquire_singleton())
+        orig_join, orig_retain = rgb._join_push_thread, rgb._ws_retain
+        rgb._join_push_thread = lambda *a, **k: False
+
+        def boom(*a, **k):
+            raise OSError("locks dir unwritable")
+        rgb._ws_retain = boom
+        try:
+            rgb._release_singleton()                     # an exit hook must not raise
+        finally:
+            rgb._join_push_thread, rgb._ws_retain = orig_join, orig_retain
+        held = json.loads(self._lockfile().read_text())
+        self.assertEqual(held["pid"], os.getpid())       # still held, never released
+        self.assertNotIn("retained", held)
 
     def test_fail_open_on_acquire_error(self):
         orig = rgb._ws_acquire

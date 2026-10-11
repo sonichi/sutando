@@ -33,7 +33,8 @@ export function stripVoiceControlLines(text: string): string {
 	return (header + out.concat(lines.slice(i)).join('\n')).replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '');
 }
 
-// parse_markers' leading-marker loop, mirrored for the skip decision only.
+// parse_markers' leading-marker loop, mirrored for the skip decision only
+// (skip_after_channel=True: voice delivers owner results, which no guard holds for review).
 const LEAD_REDIRECT_RE = /^\s*\[channel:\s*[^\]]*\]\s*\n?/;
 const LEAD_THREAD_RE = /^\s*\[thread:\s*[^\]]*\]\s*\n?/i;
 const LEAD_THREAD_ASK_RE = /^\s*\[thread\][ \t]*(?:\r?\n|$)/i;
@@ -55,10 +56,9 @@ function afterLeadingMarkers(body: string): string {
 		lead = out + body.slice(last);
 	}
 	let rest = lead;
-	let redirected = false;
 	for (;;) {
 		const channel = LEAD_REDIRECT_RE.exec(rest);
-		if (channel) { redirected ||= /\[channel:\s*[^\]\s]/.test(channel[0]); rest = rest.slice(channel[0].length); continue; }
+		if (channel) { rest = rest.slice(channel[0].length); continue; }
 		const fixed = [LEAD_THREAD_RE, LEAD_REPLY_RE].map(re => re.exec(rest)).find(Boolean);
 		if (fixed) { rest = rest.slice(fixed[0].length); continue; }
 		const ask = LEAD_THREAD_ASK_RE.exec(rest);
@@ -68,13 +68,12 @@ function afterLeadingMarkers(body: string): string {
 			rest = rest.slice(ask[0].length);
 			continue;
 		}
-		// After [channel:] parse_markers keeps a following skip as text (the guard reviews it).
-		return redirected ? '' : rest;
+		return rest;
 	}
 }
 
-/** True iff `result`'s body is a skip in parse_markers: a skip marker first, or
- *  directly after the leading markers. D7 header peeled first. */
+/** True iff `result`'s body is a skip in parse_markers(..., skip_after_channel=True): a skip
+ *  marker first, or directly after the leading markers. D7 header peeled first. */
 export function bodyIsSkipMarked(result: string): boolean {
 	const body = String(result ?? "").replace(D7_HEADER_RE, "");
 	return SKIP_MARKER_RE.test(body) || SKIP_MARKER_RE.test(afterLeadingMarkers(body));

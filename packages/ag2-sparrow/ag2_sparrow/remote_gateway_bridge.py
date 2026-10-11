@@ -323,6 +323,7 @@ from . import pool_record
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 from .workspace_lock import DEFAULT_STALE_SECONDS as _WS_STALE_SECONDS
+from .workspace_lock import retain as _ws_retain
 from .workspace_lock import _host_label as _stable_host_label
 
 TASKS_DIR = _task_dir()
@@ -3816,7 +3817,7 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
                          _proactive_thread_root and posts in that thread
       * bare [thread]  → task results only; stripped and ignored here
     """
-    parsed = parse_markers(body)
+    parsed = parse_markers(body, skip_after_channel=True)
     if any(a.kind == "skip" for a in parsed.actions):
         return ("drop", None, "")
     redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
@@ -4612,7 +4613,7 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
     if body is None:
         _log(f"result {tid}: {why}; the result guard is unavailable ({withheld}), left for the next pass")
         return
-    parsed = parse_markers(body)
+    parsed = parse_markers(body, skip_after_channel=True)
     actions = parsed.actions
     skip = next((a for a in actions if a.kind == "skip"), None)
     if skip is not None:
@@ -4839,9 +4840,9 @@ def _post_ready_results(inflight: set[str]) -> None:
             continue
         if _withheld:
             _log(f"withheld non-owner result for {tid}: {_withheld}")
-        # Route marker decisions through the unified parser (#873) like the
-        # other bridges — no hand-rolled startswith checks.
-        parsed = parse_markers(body)
+        # Route marker decisions through the unified parser (#873); the guard has run,
+        # so a skip after [channel:] is a skip here, not text posted into that room.
+        parsed = parse_markers(body, skip_after_channel=True)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
         # Every dedup marker routes through the shared plan, malformed included:
         # it owns the reject-and-report policy (dedup_recovery.plan_dedup_recovery).
@@ -5188,7 +5189,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         if _withheld:
             _log(f"orphan sweep: withheld non-owner result for {tid}: {_withheld}")
-        parsed = parse_markers(body)
+        parsed = parse_markers(body, skip_after_channel=True)
         if [a for a in parsed.actions if a.kind == "attach"]:
             # Delivering without the files would silently drop them — park
             # for a human instead of composing a partial delivery.
@@ -5264,6 +5265,10 @@ def _release_singleton() -> None:
         _log("singleton: a publication is still in flight — holding the lock so "
              "a successor waits for it to go stale instead of having its "
              "advertisement overwritten by this generation")
+        try:
+            _ws_retain(_LOCK_ROLE, _LOCK_WS)  # else our dead pid gets it reaped at once
+        except Exception:
+            pass
         return
     try:
         _ws_release(_LOCK_ROLE, _LOCK_WS)

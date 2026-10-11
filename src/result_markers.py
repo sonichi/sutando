@@ -26,7 +26,8 @@ would stop recognizing the sanitizer and start flagging every upload site.
 Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
 
   SKIP markers — at body start, or directly after the leading markers below
-  ([thread:], [thread], [reply:], a standalone [dm-only]; not after [channel:]):
+  ([thread:], [thread], [reply:], a standalone [dm-only]; after [channel:] only
+  with skip_after_channel=True, the delivery verdict on an already-guarded body):
     [no-send]
     [REPLIED]
     [deduped: <task-id>]
@@ -217,7 +218,7 @@ _THREAD_ASK_RE = re.compile(r"^\s*\[thread\][ \t]*(?:\r?\n|\Z)", re.IGNORECASE)
 _DMONLY_STRIP_RE = re.compile(r"^[ \t]*\[dm-only\][ \t]*\r?\n?", re.IGNORECASE | re.MULTILINE)
 
 
-def parse_markers(text: str) -> ParseResult:
+def parse_markers(text: str, skip_after_channel: bool = False) -> ParseResult:
     """Parse a result-body string and return body + action list.
 
     Order of evaluation:
@@ -231,6 +232,9 @@ def parse_markers(text: str) -> ParseResult:
          that line and add a redirect action — UNLESS dm-only suppressed it.
       4. ATTACH last. Scan the remaining body for `[file:|send:|attach:]`
          markers, collect paths in document order, strip from body.
+
+    skip_after_channel: a skip after [channel:] is a skip too. Delivery consumers
+    pass it on a guarded body; the guard itself must not, so it still sees the redirect.
 
     Returns:
       ParseResult(body=stripped_text, actions=[...])
@@ -337,8 +341,8 @@ def parse_markers(text: str) -> ParseResult:
         break
 
     # A skip right after the leading markers is a skip, as the broker reads the body it is sent.
-    # Not after [channel:]: the guard withholds a redirect plus skip for owner review.
-    for pat, reason in (_SKIP_PATTERNS if not named else ()):
+    # After [channel:] only on request: the guard withholds a redirect plus skip for owner review.
+    for pat, reason in (_SKIP_PATTERNS if skip_after_channel or not named else ()):
         m = pat.match(body)
         if m:
             extra = m.group(1).strip() if reason == "deduped" else None
