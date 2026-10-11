@@ -789,6 +789,11 @@ class TestRecordSpeaksForSeatFamilyAware(RecordFixture):
         for falsy in (None, ""):
             self.assertIsNone(qa._model_family(falsy))
 
+    def test_model_family_direct_on_a_bare_alias_and_on_a_full_id(self):
+        # record_speaks_for_seat only passes a full id here; the alias branch needs a direct call.
+        self.assertEqual(qa._model_family("opus"), "opus")
+        self.assertEqual(qa._model_family("claude-opus-5-5"), "opus")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
