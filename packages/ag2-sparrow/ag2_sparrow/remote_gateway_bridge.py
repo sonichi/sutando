@@ -2168,10 +2168,10 @@ def _append_log_file(line: str) -> None:
         pass
 
 
-# urllib wraps only the send in URLError; a socket the peer or a proxy closes
-# after it raises http.client's own errors bare, and those are outages too.
+# urllib wraps only the send in URLError; a socket closed after it raises http.client's
+# errors bare (RemoteDisconnected is a ConnectionResetError), and those are outages too.
 _NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
-                   http.client.RemoteDisconnected, http.client.IncompleteRead)
+                   http.client.IncompleteRead)
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
