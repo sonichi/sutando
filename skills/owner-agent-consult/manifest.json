@@ -1,0 +1,22 @@
+{
+  "name": "owner-agent-consult",
+  "enabled": true,
+  "access_tier": "owner",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Before answering its owner, ask another agent of the same owner in an owner-only consult room; the reply arrives as a new task and is matched back to the owner's task. Inert until OWNER_AGENT_CONSULT_ROOM and OWNER_AGENT_CONSULT_ROOM_CLI are set; manifest present to DECLARE config per this convention.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "OWNER_AGENT_CONSULT_ENABLED": "1",
+    "OWNER_AGENT_CONSULT_ROOM": "",
+    "OWNER_AGENT_CONSULT_ROOM_CLI": "",
+    "OWNER_AGENT_CONSULT_NUDGE_AFTER_S": "600",
+    "OWNER_AGENT_CONSULT_EXPIRE_AFTER_S": "604800",
+    "OWNER_AGENT_CONSULT_MAX_DURATION_S": "1800",
+    "OWNER_AGENT_CONSULT_MAX_ASKS": "10"
+  }
+}

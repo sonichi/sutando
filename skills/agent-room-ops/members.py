@@ -43,14 +43,15 @@ def classify_member(user_id: str) -> str:
     return "human"
 
 
-def _result(ok, *, members=None, reason=None):
-    # `members` is always a list so consumers need no None-check, matching the
-    # shape rooms.joined_rooms() established.
-    return {"ok": bool(ok), "members": members or [], "reason": reason}
+def _result(ok, *, members=None, reason=None, unidentified=0):
+    # `unidentified` counts gateway rows dropped for lacking a user_id, so a caller that
+    # must account for every member can tell a short list from a complete one.
+    return {"ok": bool(ok), "members": members or [], "reason": reason,
+            "unidentified": unidentified}
 
 
 def room_members(room_id: str, agent_mxid=None):
-    """→ {ok, members, reason}; each member is {user_id, display_name, kind}."""
+    """→ {ok, members, reason, unidentified}; each member is {user_id, display_name, kind}."""
     base, headers = gateway()
     if not base:
         return _result(False, reason="no gateway configured")
@@ -67,14 +68,13 @@ def room_members(room_id: str, agent_mxid=None):
         return _result(False, reason=str(res["error"]))
     if res.get("ok") is False:
         return _result(False, reason=str(res.get("reason") or "gateway declined"))
-    out = []
+    out, unidentified = [], 0
     for m in res.get("members") or []:
-        if not isinstance(m, dict):
-            continue
-        uid = str(m.get("user_id") or "")
+        uid = str(m.get("user_id") or "") if isinstance(m, dict) else ""
         if not uid:
+            unidentified += 1
             continue
         out.append({"user_id": uid,
                     "display_name": str(m.get("display_name") or ""),
                     "kind": classify_member(uid)})
-    return _result(True, members=out)
+    return _result(True, members=out, unidentified=unidentified)

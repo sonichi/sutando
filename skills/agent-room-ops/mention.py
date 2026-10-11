@@ -137,8 +137,9 @@ def _resolve_from_room(handle: str, room_id: str, agent_mxid: str | None,
 
 def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = None,
             *, gate=None, agents: list | None = None,
-            reply_to: str | None = None) -> dict:
-    """Resolve `handle` → mxid and post a triggering @-mention into `room_id`.
+            reply_to: str | None = None, thread_root: str | None = None) -> dict:
+    """Resolve `handle` → mxid and post a triggering @-mention into `room_id`
+    (inside the thread rooted at `thread_root` when given).
 
     Returns {ok, room_id, mxid, event_id, candidates, reason, resolved_by}. On
     an ambiguous handle it does NOT post — it returns ok:false + the candidate
@@ -153,7 +154,7 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
     # Validated before resolve/gate/network for the same reason as in `say`: a
     # mention citing the wrong event is worse than one that is refused.
     try:
-        rel = relation_fields(reply_to=reply_to)
+        rel = relation_fields(reply_to=reply_to, thread_root=thread_root)
     except RelationError as e:
         return _result(False, room_id=room_id, reason=str(e))
 
