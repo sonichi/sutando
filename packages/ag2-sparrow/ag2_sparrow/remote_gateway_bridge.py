@@ -2352,24 +2352,21 @@ def _recover_auth(code: int) -> bool:
             return True
 
 
-def _read_ack_ledger() -> dict:
-    """Raw pending-ack ledger: {tid: durable} or, for a task served with a
-    lease generation, {tid: {"durable", "lease_id"}} (fail-open to empty)."""
+def _ack_lease_file() -> Path:
+    # Beside the ledger, not in it: an older Sparrow reads each ledger value as bool(v).
+    return PENDING_ACK_FILE.with_name(f"{PENDING_ACK_FILE.stem}-leases.json")
+
+
+def _read_ack_json(path: Path) -> dict:
+    """One pending-ack file as a dict (fail-open to empty)."""
     try:
-        data = json.loads(PENDING_ACK_FILE.read_text())
+        data = json.loads(path.read_text())
     except FileNotFoundError:
         return {}
     except Exception as e:  # noqa: BLE001
-        _log(f"pending-ack file unreadable ({e}) — starting empty")
+        _log(f"pending-ack file {path.name} unreadable ({e}) — starting empty")
         return {}
     return {str(k): v for k, v in data.items()} if isinstance(data, dict) else {}
-
-
-def _ack_entry(v) -> "tuple[bool, str | None]":
-    """One ledger value → (durable, lease_id); a bare bool is a lease-less entry."""
-    if isinstance(v, dict):
-        return bool(v.get("durable")), _lease_id_of(v)
-    return bool(v), None
 
 
 def _lease_id_of(d: dict) -> "str | None":
@@ -2381,32 +2378,52 @@ def _lease_id_of(d: dict) -> "str | None":
 def _load_pending_acks() -> "dict[str, bool]":
     """Acks the gateway never confirmed, mapped to the durability each may
     claim (fail-open to empty: a lost ledger only costs a redelivery)."""
-    return {k: _ack_entry(v)[0] for k, v in _read_ack_ledger().items()}
+    return {k: bool(v) for k, v in _read_ack_json(PENDING_ACK_FILE).items()}
 
 
 def _load_pending_leases() -> "dict[str, str]":
     """The lease generation each pending ack was served under, where known."""
-    leases = {k: _ack_entry(v)[1] for k, v in _read_ack_ledger().items()}
+    acks = _read_ack_json(PENDING_ACK_FILE)
+    leases = {k: _lease_id_of({"lease_id": v})
+              for k, v in _read_ack_json(_ack_lease_file()).items() if k in acks}
     return {k: v for k, v in leases.items() if v}
 
 
 def _record_pending_acks(pending: "list[tuple]") -> bool:
     """Commit this round's acks before any of them is posted, so a crash between
     ack and confirmation still leaves a ledger to retry from. Each entry is
-    (tid, durable) or (tid, durable, lease_id)."""
+    (tid, durable) or (tid, durable, lease_id). The lease file commits first, so
+    the ledger never names a leased task whose generation is not on disk."""
     with _PENDING_ACK_MUTEX:
-        acks = _read_ack_ledger()
+        acks = _load_pending_acks()
+        stored = _read_ack_json(_ack_lease_file())
+        leases = dict(stored)
         for entry in pending:
             tid, durable, lease = (tuple(entry) + (None,))[:3]
-            acks[tid] = {"durable": bool(durable), "lease_id": lease} if lease else bool(durable)
+            acks[tid] = bool(durable)
+            if lease:
+                leases[tid] = lease
+            else:
+                leases.pop(tid, None)
+        leases = {k: v for k, v in leases.items() if k in acks}
+        if leases != stored and not _durable_write(
+                _ack_lease_file(), json.dumps(leases, sort_keys=True)):
+            return False
         return _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True))
 
 
-def _forget_pending_ack(tid: str) -> None:
+def _forget_pending_ack(tid: str, lease_id: "str | None" = None) -> None:
+    """Retire tid's record only while it still names `lease_id`: a newer serve
+    re-recorded under another generation keeps its own record."""
     with _PENDING_ACK_MUTEX:
-        acks = _read_ack_ledger()
-        if acks.pop(tid, None) is not None:
-            _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True))
+        acks = _load_pending_acks()
+        leases = _read_ack_json(_ack_lease_file())
+        if tid not in acks or _lease_id_of({"lease_id": leases.get(tid)}) != lease_id:
+            return
+        acks.pop(tid)
+        if _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True)) \
+                and leases.pop(tid, None) is not None:
+            _durable_write(_ack_lease_file(), json.dumps(leases, sort_keys=True))
 
 
 def _retry_pending_acks(inflight: "set[str]") -> None:
@@ -2418,7 +2435,7 @@ def _retry_pending_acks(inflight: "set[str]") -> None:
     leases = _load_pending_leases()
     for tid, durable in sorted(_load_pending_acks().items()):
         if tid not in inflight and not _INFLIGHT_DEGRADED:
-            _forget_pending_ack(tid)
+            _forget_pending_ack(tid, leases.get(tid))
             continue
         _post_task_ack(tid, durable, leases.get(tid))
 
@@ -2446,7 +2463,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             body["durable"] = True
         _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
-        _forget_pending_ack(tid)
+        _forget_pending_ack(tid, lease_id)
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
@@ -2457,7 +2474,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
                 if "stale lease generation" in reason:
                     _log(f"task ack for {tid} named a superseded lease generation "
                          "— the broker re-serves it; not retrying")
-                _forget_pending_ack(tid)  # terminal: the lease is gone for good
+                _forget_pending_ack(tid, lease_id)  # terminal: the lease is gone for good
                 return False   # per-task lease gone — keep acking the rest
             _ack_disabled_until = time.time() + ACK_UNSUPPORTED_COOLDOWN
             _log(f"gateway does not support task ack — retrying in "

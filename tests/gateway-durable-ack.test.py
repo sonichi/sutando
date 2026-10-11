@@ -474,6 +474,53 @@ class DurableAck(unittest.TestCase):
         self.assertEqual(len(self.calls), before, "a retired ack is never re-posted")
 
 
+    def test_an_older_reader_takes_a_leased_ledger_entry_at_its_durability(self):
+        """A downgraded Sparrow reads every ledger value as `bool(v)`; a leased,
+        non-durable entry must still read False there, never a durable claim."""
+        mod = self.mod
+        self.assertTrue(mod._record_pending_acks([("task-nd", False, "gen-1"),
+                                                  ("task-d", True, "gen-2")]))
+        raw = json.loads(mod.PENDING_ACK_FILE.read_text())
+        older = {str(k): bool(v) for k, v in raw.items()}
+        self.assertEqual(older, {"task-nd": False, "task-d": True})
+        self.assertEqual(mod._load_pending_leases(), {"task-nd": "gen-1", "task-d": "gen-2"})
+
+    def test_a_late_stale_404_does_not_drop_the_newer_generations_record(self):
+        """A gen-1 retry answered `stale lease generation` after the task was
+        re-served and recorded under gen-2 keeps the gen-2 record for its ack."""
+        mod = self.mod
+        self.assertTrue(mod._record_pending_acks([("task-regen", True, "gen-1")]))
+        stale = _http(404, b'{"error":"not leased to you","reason":"stale lease generation"}')
+
+        def req(method, path, payload=None, timeout=35):
+            self.calls.append((method, path, payload))
+            mod._record_pending_acks([("task-regen", True, "gen-2")])
+            raise stale
+
+        with patch.object(mod, "_req", side_effect=req):
+            self.assertFalse(mod._post_task_ack("task-regen", True, "gen-1"))
+        self.assertEqual(mod._load_pending_acks(), {"task-regen": True})
+        self.assertEqual(mod._load_pending_leases(), {"task-regen": "gen-2"})
+        mod._retry_pending_acks({"task-regen"})
+        self.assertEqual(self._acks()[-1][2],
+                         {"id": "task-regen", "lease_id": "gen-2", "durable": True})
+        self.assertEqual(mod._load_pending_acks(), {})
+
+
+    def test_a_lease_file_that_did_not_commit_withholds_the_round(self):
+        """The ledger must never name a leased task whose generation is not on
+        disk; an unreadable lease file fails open to no generations."""
+        mod = self.mod
+        real = mod._durable_write
+        with patch.object(mod, "_durable_write",
+                          side_effect=lambda p, t: False if p == mod._ack_lease_file() else real(p, t)):
+            self.assertFalse(mod._record_pending_acks([("task-wl", True, "gen-1")]))
+        self.assertEqual(mod._load_pending_acks(), {})
+        self.assertTrue(mod._record_pending_acks([("task-wl", True, "gen-1")]))
+        mod._ack_lease_file().write_text("{not json")
+        self.assertEqual(mod._load_pending_leases(), {})
+        self.assertEqual(mod._load_pending_acks(), {"task-wl": True})
+
     # -- 5. the production ack round, driven through main() ------------------ #
 
     def _drive_main(self, tasks: list, ack_raises: BaseException | None = None) -> None:
