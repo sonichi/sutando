@@ -5247,8 +5247,8 @@ def _release_singleton() -> None:
              "advertisement overwritten by this generation")
         try:
             _ws_retain(_LOCK_ROLE, _LOCK_WS)  # else our dead pid gets it reaped at once
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"singleton: retain failed ({e}) — the held lock can be reaped once this pid exits")
         return
     try:
         _ws_release(_LOCK_ROLE, _LOCK_WS)
