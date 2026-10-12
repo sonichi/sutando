@@ -792,6 +792,7 @@ class ClaudeConstantsHaveOneOwner(unittest.TestCase):
         self.assertIs(ciw._IDLE, pg.CLAUDE_IDLE)
         self.assertIs(ciw._AWAIT_HINT, pg.AWAIT_HINT)
         self.assertIs(ciw._FABLE_TEXT, pg.FABLE_TEXT)
+        self.assertIs(ciw._ANSI_SGR, pg.SGR_STRIP)
         self.assertEqual(ciw._SIGNATURES, pg.CLAUDE_GATE_SIGNATURES)
         self.assertTrue(ciw._is_idle_ready(f"❯ \n{FOOTER}\n"))
 
