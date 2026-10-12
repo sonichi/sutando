@@ -11999,6 +11999,10 @@ def check_claude_hook_registration(
         failure that looks healthiest.
     """
     name = "claude-hooks"
+    # These hooks only fire inside a Claude core; under Codex there is nothing to register.
+    if _codex_runtime_selected():
+        return {"name": name, "status": "ok",
+                "detail": "not applicable — core runtime is codex; Claude hooks are not used"}
     repo = Path(repo_dir or REPO_DIR)
     installer = repo / "src" / "install-claude-hooks.sh"
     if not installer.is_file():
