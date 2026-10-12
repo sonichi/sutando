@@ -298,15 +298,15 @@ class DroppedConnectionTest(unittest.TestCase):
         import http.client
         gw = self.gw
         logs: list[str] = []
-        saved = (gw._req, gw._log, gw._heartbeat_disabled)
+        saved = (gw._req, gw._log, gw._heartbeat_retry_at)
         gw._req = lambda *a, **k: (_ for _ in ()).throw(
             http.client.RemoteDisconnected("Remote end closed connection without response"))
         gw._log = lambda m: logs.append(str(m))
-        gw._heartbeat_disabled = False
+        gw._heartbeat_retry_at = 0.0
         try:
             self.assertFalse(gw._post_heartbeat(set(), force=True))
         finally:
-            gw._req, gw._log, gw._heartbeat_disabled = saved
+            gw._req, gw._log, gw._heartbeat_retry_at = saved
         self.assertIn("heartbeat network error", " ".join(logs))
 
 

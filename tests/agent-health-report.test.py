@@ -37,7 +37,7 @@ class HealthReportTests(unittest.TestCase):
         (self.state / 'core-status.json').write_text(json.dumps({'status': 'running', 'step': 'private task'}))
 
     def heartbeat(self):
-        with patch.object(bridge, '_req') as post, patch.object(bridge, '_heartbeat_disabled', False):
+        with patch.object(bridge, '_req') as post, patch.object(bridge, '_heartbeat_retry_at', 0.0, create=True):
             self.assertTrue(bridge._post_heartbeat(set(), force=True))
         return post.call_args.args[2]
 
@@ -63,7 +63,7 @@ class HealthReportTests(unittest.TestCase):
         try:
             with patch.object(bridge, 'URL', f'http://127.0.0.1:{server.server_port}'), \
                     patch.object(bridge, 'TOKEN', 'test-token'), \
-                    patch.object(bridge, '_heartbeat_disabled', False):
+                    patch.object(bridge, '_heartbeat_retry_at', 0.0, create=True):
                 for status in ('down', 'ok'):
                     self.publish(status)
                     self.assertTrue(bridge._post_heartbeat(set(), force=True))
@@ -95,9 +95,27 @@ class HealthReportTests(unittest.TestCase):
         self.publish('warn')
         self.assertEqual(self.heartbeat()['status'], 'running')
 
-    def test_expired_future_and_invalid_reports_are_unknown(self):
+    def test_expired_report_passes_core_status_through(self):
+        # Regression: an expired report sent the literal 'unknown' over a valid core status, and
+        # nothing on a desktop install reruns health-check, so the agent read 'unknown' forever.
+        old = time.time() - bridge._HEALTH_REPORT_MAX_AGE - 1
+        for failures in (0, 1):
+            with self.subTest(failures=failures):
+                (self.state / 'agent-health.json').write_text(json.dumps(
+                    {'version': 1, 'checked_at': old, 'total': 1, 'failures': failures}))
+                payload = self.heartbeat()
+                self.assertEqual((payload['status'], payload['step']), ('running', 'private task'))
+
+    def test_fresh_report_still_decides(self):
+        for failures, expected in ((1, 'error'), (0, 'running')):
+            with self.subTest(failures=failures):
+                (self.state / 'agent-health.json').write_text(json.dumps(
+                    {'version': 1, 'checked_at': time.time(), 'total': 2, 'failures': failures}))
+                self.assertEqual(self.heartbeat()['status'], expected)
+
+    def test_future_and_invalid_reports_are_unknown(self):
         valid = {'version': 1, 'checked_at': time.time(), 'total': 1, 'failures': 1}
-        invalid = [[], {}, None, {**valid, 'checked_at': time.time() - bridge._HEALTH_REPORT_MAX_AGE - 1},
+        invalid = [[], {}, None,
                    {**valid, 'checked_at': time.time() + 60}, {**valid, 'checked_at': float('nan')},
                    {**valid, 'failures': True}, {**valid, 'failures': -1}, {**valid, 'total': 0}]
         for report in invalid:
@@ -168,6 +186,111 @@ class HealthReportTests(unittest.TestCase):
                     self.assertEqual(e.code, 1)
                 publish.assert_called_once_with(checks)
                 self.assertEqual(self.heartbeat()['status'], 'error')
+
+
+STALE_STATUS_AGE = getattr(bridge, '_CORE_STATUS_MAX_AGE', 3600) + 60
+
+
+class CoreLivenessTests(unittest.TestCase):
+    """The core's beat (health snapshot `alive`) stands in for a missing or stale self-report."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name)
+        for name, value in (('_STATE', self.state), ('_heartbeat_retry_at', 0.0),
+                            ('_heartbeat_backoff', 0.0)):
+            p = patch.object(bridge, name, value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def heartbeat(self, alive):
+        snap = {'agents': [{'role': 'core', 'alive': alive}]} if alive is not None else None
+        with patch.object(bridge, '_health_snapshot', return_value=snap), \
+                patch.object(bridge, '_req') as post:
+            self.assertTrue(bridge._post_heartbeat(set(), force=True))
+        return post.call_args.args[2]
+
+    def write_status(self, status, age):
+        (self.state / 'core-status.json').write_text(
+            json.dumps({'status': status, 'step': 'x', 'ts': time.time() - age}))
+
+    def test_missing_core_status_reports_the_beat(self):
+        # Regression: no core-status.json meant a status-less heartbeat, so the broker never
+        # recorded a status for the agent and showed it 'unknown' forever.
+        self.assertEqual(self.heartbeat(True).get('status'), 'idle')
+        self.assertEqual(self.heartbeat(False).get('status'), 'offline')
+
+    def test_malformed_core_status_reports_the_beat(self):
+        for body in ('[1, 2]', '{ nope', json.dumps({'status': 7})):
+            with self.subTest(body=body):
+                (self.state / 'core-status.json').write_text(body)
+                self.assertEqual(self.heartbeat(True).get('status'), 'idle')
+
+    def test_no_beat_to_judge_claims_nothing(self):
+        self.assertNotIn('status', self.heartbeat(None))
+
+    def test_a_dead_beat_overrides_an_old_self_report(self):
+        self.write_status('idle', STALE_STATUS_AGE)
+        payload = self.heartbeat(False)
+        self.assertEqual(payload['status'], 'offline')
+        self.assertNotIn('step', payload)
+
+    def test_a_dead_beat_does_not_override_a_recent_self_report(self):
+        self.write_status('running', 30)
+        self.assertEqual(self.heartbeat(False)['status'], 'running')
+
+    def test_an_old_self_report_stands_while_the_core_beats(self):
+        for status in ('idle', 'running'):
+            with self.subTest(status=status):
+                self.write_status(status, STALE_STATUS_AGE)
+                self.assertEqual(self.heartbeat(True)['status'], status)
+
+    def test_a_fresh_failing_report_still_wins_over_the_beat(self):
+        (self.state / 'agent-health.json').write_text(json.dumps(
+            {'version': 1, 'checked_at': time.time(), 'total': 1, 'failures': 1}))
+        self.assertEqual(self.heartbeat(True)['status'], 'error')
+
+
+class UnsupportedHeartbeatTests(unittest.TestCase):
+    """A 404/405 backs off and retries; it no longer switches heartbeats off until restart."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for name, value in (('_STATE', Path(self.tmp.name)), ('_heartbeat_retry_at', 0.0),
+                            ('_heartbeat_backoff', 0.0), ('_heartbeat_disabled', False),
+                            ('_last_heartbeat_at', 0.0), ('_log', lambda m: None)):
+            p = patch.object(bridge, name, value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def not_found(*a, **k):
+        import urllib.error
+        raise urllib.error.HTTPError('http://gw/v1/heartbeat', 404, 'Not Found', {}, None)
+
+    def test_404_backs_off_then_retries_and_recovers(self):
+        # Regression: one 404/405 switched heartbeats off until the bridge restarted.
+        now = [1_000_000.0]
+        with patch.object(bridge.time, 'time', side_effect=lambda: now[0]), \
+                patch.object(bridge, '_req', side_effect=self.not_found) as req:
+            self.assertFalse(bridge._post_heartbeat(set(), force=True))
+            self.assertEqual(bridge._heartbeat_retry_at - now[0], bridge.HEARTBEAT_INTERVAL)
+            self.assertFalse(bridge._post_heartbeat(set(), force=True))
+            self.assertEqual(req.call_count, 1)  # inside the backoff: not sent
+            now[0] = bridge._heartbeat_retry_at
+            self.assertFalse(bridge._post_heartbeat(set(), force=True))
+            self.assertEqual(req.call_count, 2)  # retried after the window
+            self.assertEqual(bridge._heartbeat_retry_at - now[0], 2 * bridge.HEARTBEAT_INTERVAL)
+            for _ in range(20):
+                now[0] = bridge._heartbeat_retry_at
+                bridge._post_heartbeat(set(), force=True)
+            self.assertEqual(bridge._heartbeat_retry_at - now[0], bridge.HEARTBEAT_UNSUPPORTED_MAX_BACKOFF)
+            now[0] = bridge._heartbeat_retry_at
+            req.side_effect = None
+            self.assertTrue(bridge._post_heartbeat(set(), force=True))
+            self.assertEqual((bridge._heartbeat_retry_at, bridge._heartbeat_backoff), (0.0, 0.0))
 
 
 hc_publish = hc.publish_health_report

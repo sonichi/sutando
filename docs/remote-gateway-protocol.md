@@ -166,6 +166,18 @@ body: {
 }
 ```
 
+`status` and `step` come from the core's
+`state/core-status.json`, with the health-check overlay described under
+[Independent health-check reporting](#independent-health-check-reporting). When
+that file is missing or malformed, the core's beat in the `health` row below
+supplies the status: `alive: true` sends `idle`, `alive: false` sends `offline`,
+and `alive: null` (or no row) sends no status. A self-report older than an hour
+gives way to `offline` when the beat has stopped; a beating core keeps its last
+self-report, because an idle core rewrites nothing.
+
+A relay that answers the heartbeat with `404` or `405` is retried after 60 s, doubling to at most
+30 minutes, so a relay that deploys the route is picked up without a restart.
+
 `team-collaborator` tells the AG2 Space control plane that this gateway
 understands the per-agent Collaborator control layered over Team. Gateways
 without it safely keep Team on their prior restricted path.
@@ -467,8 +479,10 @@ A later passing check removes the override and resumes the core's status.
 Repair attempts do not imply recovery: another completed check must verify it.
 
 Reports expire after 35 minutes, allowing the app's 30-minute cadence as well
-as the five-minute fallback. Expired, malformed, or empty reports emit
-`status: unknown`, preventing cached health from being refreshed indefinitely.
+as the five-minute fallback. An expired report gives no opinion: the core status
+passes through exactly as with no report, so a cached failure is never refreshed
+and a host that stops running the checker is not pinned to `unknown`. Malformed,
+empty, or future-dated reports emit `status: unknown`.
 An absent report preserves legacy core-status reporting for installations
 without the health checker. A passing report alone does not invent a core
 status. If the gateway or host is down, no heartbeat can be sent; the broker's

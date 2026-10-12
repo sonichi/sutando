@@ -653,10 +653,11 @@ def main() -> int:
     rtc._ack_disabled_until = 0.0   # clear so later calls aren't skipped
     STATE["force_ack_404"] = False
     STATE["force_heartbeat_404"] = True
-    rtc._heartbeat_disabled = False
-    check(not rtc._post_heartbeat(set(), force=True) and rtc._heartbeat_disabled,
-          "heartbeat 404 disables heartbeat support")
+    rtc._heartbeat_retry_at = 0.0
+    check(not rtc._post_heartbeat(set(), force=True) and rtc._heartbeat_retry_at > 0,
+          "heartbeat 404 backs off heartbeat support (retryable)")
     STATE["force_heartbeat_404"] = False
+    rtc._heartbeat_retry_at = 0.0   # clear so later calls aren't skipped
 
     # SECURITY (review 2026-06-13)
     # Blocker 1 — unsafe task ids are rejected (path traversal write side)
