@@ -10,6 +10,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -32,6 +33,10 @@ SPARROW_STATUS_MAX_AGE_S = 180
 RELEASED_SCRIPT_SHA256 = frozenset({
     "c68a6fce020a5aaea9f5c593021daccb95aeaf15ba6962d0303e42933ee23fb7",
 })
+# Same charset as remote_gateway_bridge._INSTANCE_RE.
+INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+# `sparrow` exit codes, read by the hook; 1 stays a crash, 2 a usage error.
+SPARROW_OK, SPARROW_DOWN, SPARROW_NOT_CONNECTED = 0, 10, 11
 
 
 def _shipped(name: str) -> str:
@@ -117,10 +122,10 @@ def _install_file(path: Path, text: str, mode: int, *, refuse_drift: bool, force
 
 
 def render_config(mxid: str, task_dir: Path, result_dir: Path, activity_file: Path,
-                  python: str, state_dir: Path) -> str:
+                  python: str, state_dir: Path, gateway_instance: str = "") -> str:
     rows = (("AGENT_MXID", mxid), ("TASK_DIR", str(task_dir)), ("RESULT_DIR", str(result_dir)),
             ("ACTIVITY_FILE", str(activity_file)), ("SPARROW_PYTHON", python),
-            ("STATE_DIR", str(state_dir)))
+            ("STATE_DIR", str(state_dir)), ("GATEWAY_INSTANCE", gateway_instance))
     return "".join(f"{k}={shlex.quote(v)}\n" for k, v in rows)
 
 
@@ -143,6 +148,13 @@ def install(args) -> int:
     if not valid_mxid(args.mxid):
         print(f"error: {args.mxid!r} is not an MXID like @my-agent:ag2.space", file=sys.stderr)
         return 2
+    instance = (os.environ.get("GATEWAY_INSTANCE") if args.gateway_instance is None
+                else args.gateway_instance)
+    instance = (instance or "").strip()
+    if instance and not INSTANCE_RE.fullmatch(instance):
+        print(f"error: GATEWAY_INSTANCE {instance!r} must match {INSTANCE_RE.pattern}",
+              file=sys.stderr)
+        return 2
     task_dir = Path(args.task_dir) if args.task_dir else _dirs.task_dir()
     result_dir = Path(args.result_dir) if args.result_dir else _dirs.result_dir()
     state_dir = Path(args.state_dir) if args.state_dir else _dirs.state_dir()
@@ -157,7 +169,7 @@ def install(args) -> int:
     _install_file(definitions_dir() / f"{HOOK_ID}.json", definition, 0o644,
                   refuse_drift=False, force=True)
     config = render_config(args.mxid, task_dir.resolve(), result_dir.resolve(),
-                           activity, sys.executable, state_dir.resolve())
+                           activity, sys.executable, state_dir.resolve(), instance)
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
     print(f"\nNext: register the hook with hooks.add using {definitions_dir() / f'{HOOK_ID}.json'}, "
@@ -174,34 +186,42 @@ RESTART_HINT = ("restart it: systemctl --user restart ag2-sparrow under the READ
                 "service, else start ag2-sparrow again as at install")
 
 
-def sparrow_status_path(state_dir: Path) -> Path:
-    instance = (os.environ.get("GATEWAY_INSTANCE") or "").strip()
+def sparrow_status_path(state_dir: Path, instance: str | None = None) -> Path:
+    """`instance` None reads GATEWAY_INSTANCE from the environment, as Sparrow does."""
+    instance = (os.environ.get("GATEWAY_INSTANCE") if instance is None else instance) or ""
+    instance = instance.strip()
     return state_dir / f"gateway-status{'.' + instance if instance else ''}.json"
 
 
-def check_sparrow(state_dir: Path, now: float | None = None) -> tuple[bool, str]:
-    """Is Sparrow running and connected, judged by the status file it rewrites each poll?"""
-    path = sparrow_status_path(state_dir)
+def check_sparrow(state_dir: Path, now: float | None = None,
+                  instance: str | None = None) -> tuple[int, str]:
+    """SPARROW_OK, SPARROW_DOWN or SPARROW_NOT_CONNECTED, with a detail, judged by the
+    status file Sparrow rewrites each poll."""
+    path = sparrow_status_path(state_dir, instance)
     try:
         status = json.loads(path.read_text(encoding="utf-8"))
         ts = float(status["ts"])
     except (OSError, ValueError, KeyError, TypeError) as e:
-        return False, (f"{path} unreadable ({type(e).__name__}); Sparrow has not run with "
+        return SPARROW_DOWN, (f"{path} unreadable ({type(e).__name__}); Sparrow has not run with "
                        f"this state dir; {RESTART_HINT}")
     age = int((time.time() if now is None else now) - ts)
     if age > SPARROW_STATUS_MAX_AGE_S:
-        return False, (f"{path} last written {age}s ago; Sparrow is not running, so no task "
+        return SPARROW_DOWN, (f"{path} last written {age}s ago; Sparrow is not running, so no task "
                        f"reaches the hook; {RESTART_HINT}")
     if not status.get("connected"):
-        return False, (f"Sparrow is running but not connected: "
-                       f"{status.get('error') or 'no error given'}")
-    return True, f"running and connected ({path} written {max(age, 0)}s ago)"
+        return SPARROW_NOT_CONNECTED, (
+            f"Sparrow is running but not connected: {status.get('error') or 'no error given'}; "
+            "a restart does not fix a rejected token: put a valid relay token from the AG2 "
+            "Space Agent Portal in REMOTE_TASK_TOKEN (the .env file AG2_DEVICE_ENV names), "
+            "then restart Sparrow; any other error clears by itself once Sparrow reconnects")
+    return SPARROW_OK, f"running and connected ({path} written {max(age, 0)}s ago)"
 
 
 def sparrow(args) -> int:
-    ok, detail = check_sparrow(Path(args.state_dir) if args.state_dir else _dirs.state_dir())
+    code, detail = check_sparrow(Path(args.state_dir) if args.state_dir else _dirs.state_dir(),
+                                 instance=args.gateway_instance)
     print(detail)
-    return 0 if ok else 1
+    return code
 
 
 def verify(_args) -> int:
@@ -256,8 +276,8 @@ def verify(_args) -> int:
            "ag2-sparrow with the same AGENT_CONNECT_TASK_DIR")
 
     state_dir = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
-    ok, detail = check_sparrow(state_dir)
-    _check(results, ok, "sparrow", detail)
+    code, detail = check_sparrow(state_dir, instance=cfg.get("GATEWAY_INSTANCE"))
+    _check(results, code == SPARROW_OK, "sparrow", detail)
 
     missing = [tool for tool in ("jq", "flock", "timeout") if shutil.which(tool) is None]
     _check(results, not missing, "tools",
@@ -291,12 +311,17 @@ def main(argv=None) -> int:
     p.add_argument("--result-dir", help="Sparrow's result dir (default: as ag2-sparrow resolves it)")
     p.add_argument("--state-dir", help="Sparrow's state dir (default: as ag2-sparrow resolves it)")
     p.add_argument("--activity-file", help="activity marker (default: ~/.muse/last_active)")
+    p.add_argument("--gateway-instance", help="Sparrow's GATEWAY_INSTANCE (default: from the "
+                   "environment, as ag2-sparrow reads it)")
     p.add_argument("--force", action="store_true", help="replace a locally modified hook script")
     p.set_defaults(func=install)
     v = sub.add_parser("verify", help="check the installed hook")
     v.set_defaults(func=verify)
-    s = sub.add_parser("sparrow", help="check that Sparrow is running (exit 1 if not)")
+    s = sub.add_parser("sparrow", help=f"check that Sparrow is running (exit {SPARROW_DOWN}) "
+                       f"and connected (exit {SPARROW_NOT_CONNECTED})")
     s.add_argument("--state-dir", help="Sparrow's state dir (default: as ag2-sparrow resolves it)")
+    s.add_argument("--gateway-instance", help="Sparrow's GATEWAY_INSTANCE (default: from the "
+                   "environment)")
     s.set_defaults(func=sparrow)
     args = ap.parse_args(argv)
     return args.func(args)
