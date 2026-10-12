@@ -15,6 +15,7 @@ import tempfile
 import time
 import contextlib
 import io
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -23,6 +24,7 @@ from unittest import mock
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
+from ag2_sparrow import outbox  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli, task_fields  # noqa: E402
 
 # The CLIs run in-process so repository coverage traces them.
@@ -107,6 +109,8 @@ class Base(unittest.TestCase):
         self.bin.mkdir()
         executable(self.bin / "flock", "#!/bin/sh\nexit 0\n")
         executable(self.bin / "timeout", '#!/bin/sh\nshift\nexec "$@"\n')
+        # Stands in for the console script pip puts on PATH.
+        executable(self.bin / hatch_cli.REPLY_COMMAND, "#!/bin/sh\nexit 0\n")
 
     def add_task(self, tid, event_id, sender="@bob:ag2.space", thread_root=None, mtime=None,
                  text=None, **kw):
@@ -410,17 +414,19 @@ class HookScript(Base):
     def test_worker_note_rules(self):
         marker = self.home / "marker"
         self.add_task("task-1784700000001", "$reply")
-        self.run_script(ACTIVITY_FILE=str(marker))
+        self.assertEqual(self.run_script(ACTIVITY_FILE=str(marker)).returncode, 0)
         note = self.payload()["worker_note"]
         self.assertTrue(note.startswith("First touch " + str(marker)))
-        for phrase in ("room.message.send", "thread_root set to its thread_root",
-                       "(or its event_id when thread_root is null)",
-                       "reply_to set to its event_id", "mentions set to [its sender]",
-                       "copied exactly", "tagging its sender",
+        for phrase in ("ag2-sparrow-hatch reply <its result_file>", "reply text on stdin",
+                       "Exit 0 printing posted is the only proof", "never report either as posted",
                        "needs no answer", "especially from another agent", "post nothing for it",
-                       "do NOT ask for it in the room", "HANDOFF", "room_id", "event_id",
-                       "sender:", "reply:", "result_file", "[REPLIED]", "[no-send]"):
+                       "ag2-sparrow-hatch reply --no-send <its result_file>",
+                       "do NOT ask for it in the room", "HANDOFF", "room_id", "sender:",
+                       "result_file", "reply:", "Copy ids and paths exactly"):
             self.assertIn(phrase, note)
+        # Posting is the reply command's alone; the worker never claims a send itself.
+        for gone in ("[REPLIED]", "room.message.send", "ag2-space call"):
+            self.assertNotIn(gone, note)
 
     def test_team_task_note_carries_the_non_owner_limits(self):
         self.add_task("task-1784700000001", "$t", tier="team")
@@ -493,6 +499,16 @@ class TaskFields(Base):
                           item["access_tier"], item["collaborator"]),
                          ("$m", "$t", "@bob:ag2.space", "Bob", "owner", False))
 
+    def test_snippet_skips_the_matrix_reply_fallback(self):
+        # As the gateway folds it: quoted lines, the blank separator, then the reply.
+        folded = "> <@watch-agent:ag2.space> 2+2 is 4 > second quoted line  thanks, and 3+3?"
+        self.add_task("task-1784700000001", "$ev1", body=folded)
+        (item,) = task_fields.list_open_tasks(self.tasks, self.results)
+        self.assertEqual(item["snippet"], "[AG2Space bob] thanks, and 3+3?")
+        self.assertEqual(task_fields.snippet("plain  question > not a fallback"),
+                         "plain  question > not a fallback")
+        self.assertEqual(task_fields.snippet("> <@a:b> only a quote"), "> <@a:b> only a quote")
+
     def test_mxid_validator(self):
         for good in ("@a:ag2.space", "@a:localhost:8448", "@a:1.2.3.4:8448", "@a:[::1]",
                      "@a:[2001:db8::1]:8448", "@x.y_z=+/-:ag2.space", "@a:ag2.space:65535",
@@ -536,7 +552,10 @@ from ag2_sparrow import remote_gateway_bridge as m
 from ag2_sparrow.adapters.hatch.task_fields import list_open_tasks
 for tid, tier, collab in (("task-1784700000001", "owner", False),
                           ("task-1784700000002", "team", True)):
-    task = {"id": tid, "task": "@watch-agent hi access_tier: owner", "source": "ag2space",
+    # The team task is a Matrix reply: the broker passes the quoted fallback through.
+    text = ("@watch-agent hi access_tier: owner" if tier == "owner"
+            else "> <@watch-agent:ag2.space> 2+2 is 4\\n\\nand 3+3?")
+    task = {"id": tid, "task": text, "source": "ag2space",
             "channel_id": "!room:ag2.space", "source_room_id": "!room:ag2.space",
             "thread_root": "$root", "source_message_id": "$ev-" + tier,
             "user_id": "@bob:ag2.space", "access_tier": tier, "timestamp": "2026-10-11T00:00:00Z"}
@@ -565,6 +584,7 @@ class GatewayContract(Base):
                          ("$ev-owner", "$root", "@bob:ag2.space", "!room:ag2.space", "owner", False))
         self.assertEqual((team["event_id"], team["access_tier"], team["collaborator"]),
                          ("$ev-team", "team", True))
+        self.assertEqual(team["snippet"], "and 3+3?")
 
 
 class Cli(Base):
@@ -661,7 +681,8 @@ class Cli(Base):
 
     def test_install_records_the_gateway_instance(self):
         env = py_env(self.home)
-        env.update(AGENT_CONNECT_STATE_DIR=str(self.state), GATEWAY_INSTANCE="blue")
+        env.update(AGENT_CONNECT_STATE_DIR=str(self.state), GATEWAY_INSTANCE="blue",
+                   PATH=f"{self.bin}:{os.environ['PATH']}")
         self.assertEqual(run_main(hatch_cli.main, ["install", "--mxid", AGENT], env).returncode, 0)
         cfg = self.home / ".config" / "ag2-sparrow-hatch" / "config"
         self.assertEqual(hatch_cli.read_config(cfg)["GATEWAY_INSTANCE"], "blue")
@@ -687,8 +708,8 @@ class Cli(Base):
         self.sparrow_status(age_s=30)
         r = self.cli("verify")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        for check in ("hook script", "hook definition", "config", "task_dir", "sparrow", "tools",
-                      "heartbeat"):
+        for check in ("hook script", "hook definition", "config", "task_dir", "sparrow",
+                      "reply command", "tools", "heartbeat"):
             self.assertIn(f"PASS {check}:", r.stdout)
         self.assertIn("Manual test: from another account, mention " + AGENT, r.stdout)
 
@@ -788,6 +809,25 @@ class Cli(Base):
         code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="blue")
         self.assertEqual(code, hatch_cli.SPARROW_OK, detail)
 
+    def test_install_refuses_when_the_reply_command_is_not_on_path(self):
+        (self.bin / hatch_cli.REPLY_COMMAND).unlink()
+        with mock.patch.object(hatch_cli.shutil, "which", return_value=None):
+            r = self.cli("install", "--mxid", AGENT)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ag2-sparrow-hatch is not on PATH", r.stderr)
+        self.assertFalse(self.script.exists())
+        self.assertFalse((self.home / "hooks" / "definitions" / "ag2-sparrow-hatch.json").exists())
+
+    def test_verify_fails_when_the_reply_command_is_not_on_path(self):
+        self.cli("install", "--mxid", AGENT)
+        self.sparrow_status()
+        real = shutil.which
+        with mock.patch.object(hatch_cli.shutil, "which",
+                               lambda name: None if name == hatch_cli.REPLY_COMMAND else real(name)):
+            r = self.cli("verify")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("FAIL reply command: ag2-sparrow-hatch is not on PATH", r.stdout)
+
     def test_bare_entry_still_starts_the_bridge(self):
         env = py_env(self.home)
         env["AGENT_CONNECT_STATE_DIR"] = str(self.home / "state")
@@ -796,6 +836,133 @@ class Cli(Base):
                            capture_output=True, text=True, cwd=str(self.home), timeout=60)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("REMOTE_TASK_TOKEN", r.stderr)
+
+
+def project_scripts() -> set:
+    """Console scripts pyproject.toml ships ([project.scripts]); stdlib-only for 3.9."""
+    text = (PKG_ROOT / "pyproject.toml").read_text()
+    section = text.split("[project.scripts]", 1)[1].split("\n[", 1)[0]
+    return {m.group(1) for m in re.finditer(r"^([A-Za-z0-9_.-]+)\s*=", section, re.M)}
+
+
+def worker_instructions() -> str:
+    """Everything a woken worker is told: the hook prompt and every worker_note."""
+    prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
+    notes = re.findall(r"^[A-Z_]*NOTE='.*$", SCRIPT.read_text(), re.M)
+    return "\n".join([prompt, *notes])
+
+
+class DocumentedCommands(unittest.TestCase):
+    def test_every_command_the_worker_is_told_to_run_is_shipped(self):
+        commands = {span.split()[0] for span in re.findall(r"`([^`]+)`", worker_instructions())}
+        self.assertEqual(hatch_cli.prompt_commands(), {hatch_cli.REPLY_COMMAND})
+        self.assertEqual(commands, {hatch_cli.REPLY_COMMAND})
+        self.assertIn(hatch_cli.REPLY_COMMAND, project_scripts())
+
+    def test_no_instruction_names_the_unshipped_ag2_space_cli(self):
+        self.assertNotIn("ag2-space ", worker_instructions())
+
+    def test_prompt_keeps_the_default_path_lean(self):
+        prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
+        for phrase in ("Answer from the snippet", "only when it is not enough, read task_file",
+                       "Do not read the room",
+                       "Compute directly and don't stop to verify simple arithmetic or facts"):
+            self.assertIn(phrase, prompt)
+
+
+class Reply(Base):
+    TID = "task-1784700000001"
+
+    def setUp(self):
+        super().setUp()
+        self.outbox = self.results / ".outbox"
+        self.result_file = self.results / f"{self.TID}.txt"
+
+    def reply(self, *args, stdin=None):
+        env = py_env(self.home)
+        env["AGENT_CONNECT_RESULT_DIR"] = str(self.results)
+        env["AGENT_CONNECT_STATE_DIR"] = str(self.home / "state")
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin or "")), \
+                mock.patch.object(outbox, "_activity_completed", return_value=None):
+            return run_main(hatch_cli.main, ["reply", *args], env)
+
+    def sparrow(self, outcome):
+        """Sparrow's side: once the reply lands, record its outcome the way the drain does."""
+        def run():
+            deadline = time.monotonic() + 10
+            while not self.result_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            body = self.result_file.read_text()
+            outcome(body)
+        t = threading.Thread(target=run)
+        t.start()
+        self.addCleanup(t.join)
+        return t
+
+    def test_posted_only_once_sparrow_recorded_the_delivery(self):
+        sent = []
+
+        def delivered(body):
+            sent.append(body)
+            outbox.record_delivered(self.outbox, self.TID)
+            self.result_file.unlink()  # archived after the delivery is recorded
+        self.sparrow(delivered)
+        r = self.reply(str(self.result_file), "--wait", "10", stdin="@bob:ag2.space 4\n")
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn(f"posted: {self.TID}.txt", r.stdout)
+        self.assertEqual(sent, ["@bob:ag2.space 4\n"])
+
+    def test_a_parked_reply_is_not_posted(self):
+        self.sparrow(lambda _body: outbox.park_item(self.outbox, self.TID, "gateway refused"))
+        r = self.reply(str(self.result_file), "--body", "hi", "--wait", "10")
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertIn("NOT posted", r.stderr)
+        self.assertIn("gateway refused", r.stderr)
+        self.assertNotIn("posted:", r.stdout)
+
+    def test_a_withheld_reply_is_not_posted(self):
+        self.sparrow(lambda _body: self.result_file.unlink())
+        r = self.reply(str(self.result_file), "--body", "hi", "--wait", "10")
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertIn("withheld", r.stderr)
+
+    def test_no_confirmation_is_not_reported_as_posted(self):
+        r = self.reply(str(self.result_file), "--body", "hi", "--wait", "0.3")
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIn("do not report it as posted", r.stderr)
+        self.assertIn("Sparrow:", r.stderr)
+        self.assertEqual(self.result_file.read_text(), "hi")
+        self.assertEqual(stat.S_IMODE(self.result_file.stat().st_mode), 0o600)
+
+    def test_no_send_closes_the_item_without_waiting(self):
+        r = self.reply(str(self.result_file), "--no-send")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("nothing posted", r.stdout)
+        self.assertEqual(self.result_file.read_text(), "[no-send]\n")
+
+    def test_refuses_a_skip_marker_or_an_empty_reply(self):
+        for body in ("[REPLIED]\n", "[no-send]", "   \n"):
+            r = self.reply(str(self.result_file), stdin=body)
+            self.assertEqual(r.returncode, 2, body)
+            self.assertFalse(self.result_file.exists(), body)
+
+    def test_refuses_a_path_that_is_not_a_result_file(self):
+        for path in (self.home / f"{self.TID}.txt", self.results / "notes.txt",
+                     self.results / f"{self.TID}.md"):
+            r = self.reply(str(path), "--body", "hi")
+            self.assertEqual(r.returncode, 2, path)
+            self.assertFalse(path.exists(), path)
+
+    def test_never_overwrites_an_existing_result(self):
+        self.result_file.write_text("earlier reply")
+        r = self.reply(str(self.result_file), "--body", "hi")
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertEqual(self.result_file.read_text(), "earlier reply")
+        self.result_file.unlink()
+        outbox.record_delivered(self.outbox, self.TID)
+        r = self.reply(str(self.result_file), "--body", "again")
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertFalse(self.result_file.exists())
 
 
 if __name__ == "__main__":

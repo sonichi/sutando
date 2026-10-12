@@ -1,8 +1,9 @@
-"""`ag2-sparrow-hatch install|verify|sparrow`: set up and check the Hatch hook on this host.
+"""`ag2-sparrow-hatch install|verify|sparrow|reply`: set up, check and answer through the Hatch hook.
 
 install writes the hook script to ~/hooks/scripts/, the hook definition to
 ~/hooks/definitions/ and the config the script reads; verify checks that setup;
-sparrow checks only that Sparrow is running (the hook's heartbeat runs it)."""
+sparrow checks only that Sparrow is running (the hook's heartbeat runs it); reply
+writes a worker's answer to its result_file and waits until Sparrow has sent it."""
 from __future__ import annotations
 
 import argparse
@@ -20,7 +21,8 @@ import time
 from importlib import resources
 from pathlib import Path
 
-from ... import _dirs
+from ... import _dirs, local_task_protocol, outbox
+from ...result_markers import has_skip_action, parse_markers
 from .task_fields import valid_mxid
 
 HOOK_ID = "ag2-sparrow-hatch"
@@ -37,6 +39,11 @@ RELEASED_SCRIPT_SHA256 = frozenset({
 INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 # `sparrow` exit codes, read by the hook; 1 stays a crash, 2 a usage error.
 SPARROW_OK, SPARROW_DOWN, SPARROW_NOT_CONNECTED = 0, 10, 11
+# The one command the hook prompt and worker_note tell a worker to run.
+REPLY_COMMAND = "ag2-sparrow-hatch"
+# `reply` exit codes: posted, not posted, usage, sent to Sparrow but not yet confirmed.
+REPLY_POSTED, REPLY_NOT_POSTED, REPLY_UNCONFIRMED = 0, 1, 3
+REPLY_WAIT_S = 30.0
 
 
 def _shipped(name: str) -> str:
@@ -144,7 +151,27 @@ def read_config(path: Path) -> dict:
     return out
 
 
+def prompt_commands() -> set:
+    """The commands the shipped hook prompt tells a worker to run (its backticked spans)."""
+    prompt = json.loads(_shipped("hook-definition.json"))["prompt"]
+    return {span.split()[0] for span in re.findall(r"`([^`]+)`", prompt)}
+
+
+def reply_command_problem() -> str:
+    """Why a worker could not run a command the hook prompt names; empty when it can."""
+    missing = sorted(cmd for cmd in prompt_commands() if shutil.which(cmd) is None)
+    if not missing:
+        return ""
+    return (f"{', '.join(missing)} is not on PATH, so a woken worker cannot post a reply; add "
+            f"the directory pip installed it to (python3 -m site --user-base, then /bin) to "
+            f"PATH and run this again")
+
+
 def install(args) -> int:
+    problem = reply_command_problem()
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 1
     if not valid_mxid(args.mxid):
         print(f"error: {args.mxid!r} is not an MXID like @my-agent:ag2.space", file=sys.stderr)
         return 2
@@ -279,6 +306,10 @@ def verify(_args) -> int:
     code, detail = check_sparrow(state_dir, instance=cfg.get("GATEWAY_INSTANCE"))
     _check(results, code == SPARROW_OK, "sparrow", detail)
 
+    problem = reply_command_problem()
+    _check(results, not problem, "reply command",
+           problem or f"{REPLY_COMMAND} at {shutil.which(REPLY_COMMAND)}")
+
     missing = [tool for tool in ("jq", "flock", "timeout") if shutil.which(tool) is None]
     _check(results, not missing, "tools",
            "jq, flock, timeout on PATH" if not missing else f"missing on PATH: {', '.join(missing)}")
@@ -299,6 +330,68 @@ def verify(_args) -> int:
           "few polls a task file appears in the task_dir, the hook wakes the worker, and the "
           "reply lands in that message's thread tagging you. hooks.logs shows the wake.")
     return 0 if all(results) else 1
+
+
+def _installed_config() -> dict:
+    try:
+        return read_config(config_path())
+    except OSError:
+        return {}
+
+
+def reply(args) -> int:
+    cfg = _installed_config()
+    result_dir = Path(cfg.get("RESULT_DIR") or _dirs.result_dir())
+    result_file = Path(args.result_file).expanduser()
+    if not (result_file.suffix == ".txt" and local_task_protocol.valid_task_id(result_file.stem)
+            and result_file.parent.resolve() == result_dir.resolve()):
+        print(f"error: {result_file} is not a result_file from the wake payload "
+              f"(task-<id>.txt in {result_dir})", file=sys.stderr)
+        return 2
+    if args.no_send:
+        body = "[no-send]\n"
+    else:
+        body = args.body if args.body is not None else sys.stdin.read()
+        if not body.strip():
+            print("error: empty reply; pass the text on stdin, or use --no-send", file=sys.stderr)
+            return 2
+        if has_skip_action(parse_markers(body).actions):
+            print("error: the reply starts with a skip marker such as [REPLIED], so nothing would "
+                  "be posted; send the reply text itself, or use --no-send", file=sys.stderr)
+            return 2
+    # task_fields lists only plain task ids, which Sparrow's outbox keys verbatim.
+    root, item = result_file.parent / ".outbox", result_file.stem
+    if result_file.exists() or outbox.item_status(root, item) is not None:
+        print(f"NOT posted: {result_file.name} already has a result; nothing written",
+              file=sys.stderr)
+        return REPLY_NOT_POSTED
+    _write(result_file, body, 0o600)
+    if args.no_send:
+        print(f"closed: {result_file.name}, nothing posted")
+        return REPLY_POSTED
+    deadline = time.monotonic() + args.wait
+    while True:
+        record = outbox.read_item(root, item) or {}
+        status = record.get("status")
+        if status == "DELIVERED":
+            print(f"posted: {result_file.name} (accepted by the AG2 Space gateway)")
+            return REPLY_POSTED
+        if status == "PARKED":
+            print(f"NOT posted: Sparrow gave up on {result_file.name}: "
+                  f"{record.get('reason') or 'no reason given'}", file=sys.stderr)
+            return REPLY_NOT_POSTED
+        if not result_file.exists() and outbox.item_status(root, item) != "DELIVERED":
+            print(f"NOT posted: Sparrow withheld {result_file.name} (held for review or "
+                  f"quarantined in {result_file.parent / 'undelivered'})", file=sys.stderr)
+            return REPLY_NOT_POSTED
+        if time.monotonic() >= deadline:
+            _, detail = check_sparrow(Path(cfg.get("STATE_DIR") or _dirs.state_dir()),
+                                      instance=cfg.get("GATEWAY_INSTANCE"))
+            print(f"NOT confirmed after {args.wait:g}s: {result_file.name} is queued and Sparrow "
+                  f"will keep trying; do not report it as posted. Sparrow: {detail}",
+                  file=sys.stderr)
+            return REPLY_UNCONFIRMED
+        time.sleep(0.25)
 
 
 def main(argv=None) -> int:
@@ -323,6 +416,15 @@ def main(argv=None) -> int:
     s.add_argument("--gateway-instance", help="Sparrow's GATEWAY_INSTANCE (default: from the "
                    "environment)")
     s.set_defaults(func=sparrow)
+    r = sub.add_parser("reply", help=f"answer one wake item: write its result_file and wait until "
+                       f"Sparrow posted it (exit {REPLY_POSTED} posted, {REPLY_NOT_POSTED} not "
+                       f"posted, {REPLY_UNCONFIRMED} queued but not confirmed)")
+    r.add_argument("result_file", help="the item's result_file from the wake payload")
+    r.add_argument("--body", help="the reply text (default: read from stdin)")
+    r.add_argument("--no-send", action="store_true", help="close the item without posting")
+    r.add_argument("--wait", type=float, default=REPLY_WAIT_S,
+                   help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
+    r.set_defaults(func=reply)
     args = ap.parse_args(argv)
     return args.func(args)
 

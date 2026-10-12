@@ -20,6 +20,10 @@ _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 MXID_RE = re.compile(r"@[A-Za-z0-9._=+/-]+:(?:\[(?P<ipv6>[0-9A-Fa-f:.]+)\]|"
                      rf"{_LABEL}(?:\.{_LABEL})*)(?::(?P<port>[0-9]{{1,5}}))?")
 EXIT_BAD_AGENT = 3
+_SENDER_PREFIX = re.compile(r"\[AG2Space\s+[^\]]+\]\s*")
+# The gateway folds a message onto one line, so a reply fallback ("> <@sender> quoted"
+# lines, a blank line, the reply) arrives as "> <@sender> quoted  reply".
+_REPLY_FALLBACK = re.compile(r">\s?<[^>\s]+>.*?\s{2,}(?=\S)")
 
 
 def valid_mxid(value: str) -> bool:
@@ -44,6 +48,17 @@ def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":
     return strict
 
 
+def snippet(body: str) -> str:
+    """The message's first line without a Matrix reply fallback, which is the quoted
+    message replied to, not the reply."""
+    first = body.split("\n", 1)[0].strip()
+    prefix = _SENDER_PREFIX.match(first)
+    head = prefix.group(0) if prefix else ""
+    rest = first[len(head):]
+    fallback = _REPLY_FALLBACK.match(rest)
+    return (head + (rest[fallback.end():] if fallback else rest))[:SNIPPET_MAX]
+
+
 def _field(headers: dict, key: str) -> "str | None":
     value = (headers.get(key) or "").strip()
     return value or None
@@ -62,7 +77,6 @@ def task_fields(task_file: Path, result_dir: Path) -> "dict | None":
     tier = local_task_protocol.canonical_access_tier(h.get("access_tier"))
     if tier not in local_task_protocol.BROKER_WIRE_TIERS:
         tier = "guest"  # absent or unknown: the most restricted tier
-    first_line = parsed.body.split("\n", 1)[0].strip()
     return {
         "task_id": tid,
         "room_id": _field(h, "channel_id") or _field(h, "source_room_id"),
@@ -72,7 +86,7 @@ def task_fields(task_file: Path, result_dir: Path) -> "dict | None":
         "sender_name": _field(h, "sender_name"),
         "access_tier": tier,
         "collaborator": tier == "team" and (h.get("collaborator") or "").strip() == "true",
-        "snippet": first_line[:SNIPPET_MAX],
+        "snippet": snippet(parsed.body),
         "task_file": str(task_file),
         "result_file": str(result_dir / f"{tid}.txt"),
     }

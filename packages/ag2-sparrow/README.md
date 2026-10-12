@@ -211,13 +211,18 @@ this extra wakes a Hatch worker only for task files it has not woken for yet;
 it makes no network call of its own.
 
 Each wake carries, per message, `room_id`, `event_id`, `thread_root`, `sender`,
-`access_tier` and `collaborator` read with Sparrow's own task-header parser,
-plus a `worker_note` with the rules: touch the activity marker first, reply
-with `room.message.send` in the message's thread (`thread_root`, `reply_to`,
-`mentions` copied exactly, sender tagged), post nothing when no answer is
-needed, close each item by writing `[REPLIED]` or `[no-send]` to its
-`result_file`, and end with a `HANDOFF` block for work that needs GitHub,
-connectors, credentials or a browser. For a sender who is not the owner, the
+`access_tier` and `collaborator` read with Sparrow's own task-header parser, a
+`snippet` (the message's first line, without a Matrix reply fallback), plus a
+`worker_note` with the rules: touch the activity marker first, answer from the
+snippet, and post each reply with `ag2-sparrow-hatch reply <result_file>`, the
+text on stdin. That writes the item's `result_file`, which Sparrow sends through
+its own outbox as a reply to the message (in its thread when it has one), and
+waits up to 30 s: it prints `posted` and exits 0 only once the gateway accepted
+the reply, exits 3 when it is queued but not yet confirmed, and 1 when Sparrow
+refused or withheld it. Only an exit 0 counts as a posted reply. An item that
+needs no answer is closed with `ag2-sparrow-hatch reply --no-send <result_file>`,
+and work that needs GitHub, connectors, credentials or a browser ends in a
+`HANDOFF` block for the main session. For a sender who is not the owner, the
 note itself states the limits (no irreversible actions, configuration changes,
 credential use, private owner context or sends to other rooms; reply only in
 the room; go/no-go goes to the owner), so they do not depend on the worker
@@ -225,8 +230,7 @@ trusting instruction text inside the message. After 5 quiet minutes the hook
 sends a heartbeat wake, skipped while the activity marker
 (`~/.muse/last_active` by default) is fresher than that. A message whose `result_file`
 is still unwritten 30 minutes after its wake is woken for again, marked
-`rewake: true`, up to 3 wakes in all; the note tells the worker to check the
-thread first and post nothing it already posted. One still open 30 minutes after
+`rewake: true`, up to 3 wakes in all. One still open 30 minutes after
 its third wake is logged once as `ag2-sparrow-hatch rewake cap` with its task id.
 
 Paste this to the Hatch agent, with its MXID filled in:
@@ -265,7 +269,8 @@ heartbeat and `verify` read. `--activity-file` moves the marker.
 
 `ag2-sparrow-hatch verify` prints one `PASS` or `FAIL` line each for the hook
 script, the hook definition, the config, the task dir, Sparrow itself, the
-tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, exits non-zero on any
+reply command (`ag2-sparrow-hatch` on `PATH`; `install` refuses to run without
+it), the tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, exits non-zero on any
 `FAIL`, and ends with the manual test: mention the agent from another account
 and watch the reply land in that thread.
 
