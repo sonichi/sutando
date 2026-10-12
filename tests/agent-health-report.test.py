@@ -89,7 +89,8 @@ class HealthReportTests(unittest.TestCase):
         self.publish('down')
         self.assertEqual(self.heartbeat()['status'], 'error')
         self.publish('ok')
-        self.assertNotIn('status', self.heartbeat())
+        # A passing report alone does not invent a positive core status.
+        self.assertNotIn(self.heartbeat().get('status'), ('idle', 'running'))
 
     def test_warnings_are_not_failures(self):
         self.publish('warn')
@@ -121,9 +122,9 @@ class HealthReportTests(unittest.TestCase):
         for report in invalid:
             with self.subTest(report=report):
                 (self.state / 'agent-health.json').write_text(json.dumps(report))
-                self.assertEqual(self.heartbeat()['status'], 'unknown')
+                self.assertEqual(self.heartbeat().get('status'), 'unknown')
         (self.state / 'agent-health.json').write_text('{')
-        self.assertEqual(self.heartbeat()['status'], 'unknown')
+        self.assertEqual(self.heartbeat().get('status'), 'unknown')
 
     def test_invalid_diagnostics_do_not_hide_explicit_core_failure(self):
         (self.state / 'agent-health.json').write_text('{')
@@ -227,8 +228,11 @@ class CoreLivenessTests(unittest.TestCase):
                 (self.state / 'core-status.json').write_text(body)
                 self.assertEqual(self.heartbeat(True).get('status'), 'idle')
 
-    def test_no_beat_to_judge_claims_nothing(self):
+    def test_without_a_health_snapshot_nothing_is_claimed(self):
+        # A standalone sparrow has no snapshot and so no liveness source: legacy behaviour.
         self.assertNotIn('status', self.heartbeat(None))
+        self.write_status('idle', STALE_STATUS_AGE)
+        self.assertEqual(self.heartbeat(None)['status'], 'idle')
 
     def test_a_dead_beat_overrides_an_old_self_report(self):
         self.write_status('idle', STALE_STATUS_AGE)
@@ -250,6 +254,87 @@ class CoreLivenessTests(unittest.TestCase):
         (self.state / 'agent-health.json').write_text(json.dumps(
             {'version': 1, 'checked_at': time.time(), 'total': 1, 'failures': 1}))
         self.assertEqual(self.heartbeat(True)['status'], 'error')
+
+
+class RealBeatTests(unittest.TestCase):
+    """The real health snapshot over a real `.alive` file: what core_heartbeat leaves behind."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name) / 'state'
+        self.cores = self.state / 'cores'
+        self.cores.mkdir(parents=True)
+        self.label = bridge._profile_host_id()
+        self.alive = self.cores / f'{self.label}.alive'
+        for name, value in (('_STATE', self.state), ('_heartbeat_retry_at', 0.0),
+                            ('_heartbeat_backoff', 0.0),
+                            ('_health_cache', {'at': None, 'value': None, 'error': None})):
+            p = patch.object(bridge, name, value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
+        self.env = patch.dict(os.environ, {'SUTANDO_HOST_LABEL': self.label})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def heartbeat(self):
+        bridge._health_cache.update(at=None)
+        with patch.object(bridge, '_req') as post:
+            self.assertTrue(bridge._post_heartbeat(set(), force=True))
+        return post.call_args.args[2]
+
+    def beat(self, age=0):
+        self.alive.write_text(json.dumps({'ts': time.time()}))
+        os.utime(self.alive, (time.time() - age,) * 2)
+
+    def write_status(self, status, age):
+        (self.state / 'core-status.json').write_text(
+            json.dumps({'status': status, 'step': 'x', 'ts': time.time() - age}))
+
+    def expired_failing_report(self):
+        (self.state / 'agent-health.json').write_text(json.dumps(
+            {'version': 1, 'total': 1, 'failures': 1,
+             'checked_at': time.time() - bridge._HEALTH_REPORT_MAX_AGE - 60}))
+
+    def test_a_removed_beat_does_not_refresh_an_old_self_report(self):
+        # Regression: core_heartbeat DELETES `.alive` when the core pane goes, so alive reads
+        # null, and an old 'idle' plus an expired report was sent on as a healthy 'idle'.
+        self.write_status('idle', 2 * 3600)
+        self.expired_failing_report()
+        self.beat()
+        payload = self.heartbeat()
+        self.assertEqual((payload['status'], payload['health']['alive']), ('idle', True))
+        self.alive.unlink()
+        payload = self.heartbeat()
+        self.assertIsNone(payload['health']['alive'])
+        self.assertEqual(payload['status'], 'unknown')
+
+    def test_a_graceful_stop_reads_offline(self):
+        self.write_status('idle', 2 * 3600)
+        self.beat()
+        self.assertEqual(self.heartbeat()['status'], 'idle')
+        (self.cores / f'{self.label}.stopped').write_text(str(time.time()))
+        self.alive.unlink()
+        self.assertEqual(self.heartbeat()['status'], 'offline')
+
+    def test_no_self_report_and_no_beat_is_unknown_not_silent(self):
+        # Omitting `status` leaves the broker's last presence status standing.
+        self.assertEqual(self.heartbeat().get('status'), 'unknown')
+
+    def test_startup_before_the_first_beat_keeps_a_fresh_self_report(self):
+        self.write_status('running', 5)
+        payload = self.heartbeat()
+        self.assertEqual((payload['status'], payload['health']['alive']), ('running', None))
+
+    def test_a_stale_beat_reads_offline(self):
+        self.write_status('idle', 2 * 3600)
+        self.beat(age=600)
+        self.assertEqual(self.heartbeat()['status'], 'offline')
+
+    def test_a_fresh_beat_keeps_an_old_idle(self):
+        self.write_status('idle', 2 * 3600)
+        self.beat()
+        self.assertEqual(self.heartbeat()['status'], 'idle')
 
 
 class UnsupportedHeartbeatTests(unittest.TestCase):

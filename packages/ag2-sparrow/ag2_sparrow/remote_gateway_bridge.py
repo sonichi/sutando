@@ -2977,8 +2977,8 @@ def _maybe_pull_worker_labels(record) -> bool:
 
 # The primary app checks every 30 minutes; the fallback checks every five.
 _HEALTH_REPORT_MAX_AGE = 35 * 60
-# A self-report older than this cannot outvote the beat file: a dead core leaves its last
-# "idle" behind. An idle core rewrites nothing, so only a dead beat overrides an old status.
+# A self-report older than this needs a live beat to stand: a dead core leaves its last
+# "idle" behind, while an idle core rewrites nothing, so a beating core keeps it.
 _CORE_STATUS_MAX_AGE = 60 * 60
 
 
@@ -2989,14 +2989,28 @@ def _liveness_status(alive) -> str | None:
     return {True: "idle", False: "offline"}.get(alive)
 
 
+def _core_stopped() -> bool:
+    """This host's graceful-stop tombstone (core_heartbeat.mark_stopped); the next beat run
+    clears it, so it cannot outlive a core that came back."""
+    try:
+        return (_STATE / "cores" / f"{_profile_host_id()}.stopped").exists()
+    except OSError:
+        return False
+
+
 def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None, str | None]:
     """Overlay independent diagnostics without exporting their private details."""
     status, step = _read_core_status()
     alive = core_health.get("alive") if isinstance(core_health, dict) else None
-    if status is None:
-        status = _liveness_status(alive)
-    elif alive is False and (_core_status_age() or 0) > _CORE_STATUS_MAX_AGE:
-        status, step = "offline", None
+    unvouched = status is None or (alive is not True
+                                   and (_core_status_age() or 0) > _CORE_STATUS_MAX_AGE)
+    if unvouched and core_health is not None:
+        # A stopped core deletes its beat, so a missing beat vouches for nothing; omitting the
+        # field would leave the broker's last presence status standing.
+        status, step = _liveness_status(alive), None
+        if status is None:
+            status, step = ("offline", None) if _core_stopped() \
+                else ("unknown", "Core liveness unavailable")
     if status in ("error", "offline"):
         return status, step
     try:

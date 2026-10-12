@@ -168,12 +168,21 @@ body: {
 
 `status` and `step` come from the core's
 `state/core-status.json`, with the health-check overlay described under
-[Independent health-check reporting](#independent-health-check-reporting). When
-that file is missing or malformed, the core's beat in the `health` row below
-supplies the status: `alive: true` sends `idle`, `alive: false` sends `offline`,
-and `alive: null` (or no row) sends no status. A self-report older than an hour
-gives way to `offline` when the beat has stopped; a beating core keeps its last
-self-report, because an idle core rewrites nothing.
+[Independent health-check reporting](#independent-health-check-reporting). The
+core's beat in the `health` row below decides when that self-report cannot:
+
+| `core-status.json` | `alive` | sent `status` |
+|---|---|---|
+| present, under an hour old | any | the self-report |
+| present, older than an hour | `true` | the self-report (an idle core rewrites nothing) |
+| missing, malformed, or older than an hour | `false` (beat stale) | `offline` |
+| missing or malformed | `true` | `idle` |
+| missing, malformed, or older than an hour | `null` (no beat file) | `offline` with this host's graceful-stop tombstone `state/cores/<host>.stopped`, else `unknown` |
+
+`core_heartbeat` deletes `.alive` when the core stops, so a missing beat vouches
+for nothing. `unknown` is sent rather than omitting the field because the broker
+keeps its last presence status when `status` is absent. A gateway with no
+Sutando checkout (no `health` row) forwards the self-report unchanged, or nothing.
 
 A relay that answers the heartbeat with `404` or `405` is retried after 60 s, doubling to at most
 30 minutes, so a relay that deploys the route is picked up without a restart.

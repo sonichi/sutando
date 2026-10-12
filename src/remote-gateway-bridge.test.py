@@ -592,8 +592,8 @@ def main() -> int:
               and "result-markers" not in h.get("capabilities", []),
               "heartbeat advertises only local skip-marker handling")
         check("core-status" in h.get("capabilities", [])
-              and "status" not in h and "step" not in h,
-              "no core-status.json → capability advertised, status/step omitted (no-clobber)")
+              and h.get("status") not in ("idle", "running"),
+              "no core-status.json and no core beat → capability advertised, no positive status")
         check("team-collaborator" in h.get("capabilities", []),
               "heartbeat advertises explicit Team collaborator support")
 
@@ -601,7 +601,7 @@ def main() -> int:
     # broker's presence sweep can derive the agent's activity + human text.
     (rtc.WS / "state").mkdir(parents=True, exist_ok=True)
     (rtc.WS / "state" / "core-status.json").write_text(
-        json.dumps({"status": "running", "step": "opening PR #20", "ts": 1}))
+        json.dumps({"status": "running", "step": "opening PR #20", "ts": time.time()}))
     STATE["heartbeats"].clear()
     rtc._last_heartbeat_at = 0.0
     rtc._post_heartbeat({"task-MOCK1"}, force=True)
@@ -610,7 +610,7 @@ def main() -> int:
           "heartbeat carries core-status status+step when core-status.json present")
     # An idle status drops the (stale) step so the sweep reads 'available'.
     (rtc.WS / "state" / "core-status.json").write_text(
-        json.dumps({"status": "idle", "ts": 2}))
+        json.dumps({"status": "idle", "ts": time.time()}))
     STATE["heartbeats"].clear()
     rtc._last_heartbeat_at = 0.0
     rtc._post_heartbeat(set(), force=True)
@@ -640,8 +640,8 @@ def main() -> int:
     STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
     check(rtc._post_heartbeat(set(), force=True), "heartbeat still fires despite malformed core-status")
     hb3 = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
-    check("status" not in hb3 and "step" not in hb3,
-          "malformed core-status → heartbeat omits status/step (liveness-only)")
+    check(hb3.get("status") not in ("idle", "running"),
+          "malformed core-status and no core beat → no positive status")
 
     # Backwards compatibility: old gateways that only implement pull/results can
     # 404 optional protocol extensions; the client backs off (time-gated, so a
