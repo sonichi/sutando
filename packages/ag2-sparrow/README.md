@@ -201,6 +201,66 @@ REMOTE_TASK_ON_TASK="my-agent run-task" ag2-sparrow
 
 Unset (the default), Sparrow behaves exactly as before.
 
+## Meta Hatch agents (`ag2-sparrow[hatch]`)
+
+A Meta Hatch agent (for example Muse) can let Sparrow do the receiving and keep
+Hatch for the answering. Sparrow long-polls the relay, acks, dedups and writes
+one durable task file per message, so a message that arrives while the agent
+is busy, idle or restarting is still there afterwards. The Hatch hook added by
+this extra wakes a Hatch worker only for task files it has not woken for yet;
+it makes no network call of its own.
+
+Each wake carries, per message, `room_id`, `event_id`, `thread_root`, `sender`,
+`access_tier` and `collaborator` read with Sparrow's own task-header parser,
+plus a `worker_note` with the rules: touch the activity marker first, reply
+with `room.message.send` in the message's thread (`thread_root`, `reply_to`,
+`mentions` copied exactly, sender tagged), post nothing when no answer is
+needed, close each item by writing `[REPLIED]` or `[no-send]` to its
+`result_file`, and end with a `HANDOFF` block for work that needs GitHub,
+connectors, credentials or a browser. For a sender who is not the owner, the
+note itself states the limits (no irreversible actions, configuration changes,
+credential use, private owner context or sends to other rooms; reply only in
+the room; go/no-go goes to the owner), so they do not depend on the worker
+trusting instruction text inside the message. After 5 quiet minutes the hook
+sends a heartbeat wake, skipped while the activity marker
+(`~/.muse/last_active` by default) is fresher than that.
+
+Paste this to the Hatch agent, with its MXID filled in:
+
+> Install the AG2 Space listener: `pip install "ag2-sparrow[hatch]"`. Put my
+> relay token in `~/.config/ag2-sparrow/relay.env` as one line
+> `REMOTE_TASK_TOKEN=<token>`, and `chmod 600` it. Start Sparrow in the
+> background with `AG2_DEVICE_ENV="$HOME/.config/ag2-sparrow/relay.env" ag2-sparrow`
+> and keep it running. Run `ag2-sparrow hatch install --mxid @my-agent:ag2.space`,
+> register the hook with `hooks.add` from the definition file it names, check it
+> with `hooks.dry_run`, start it with `hooks.enable`, then run
+> `ag2-sparrow hatch verify` and show me its output.
+
+The token stays out of the hook, its config and the wake payload. Sparrow
+reads `REMOTE_TASK_TOKEN` from its environment or, failing that, from the
+`.env` file named by `AG2_DEVICE_ENV` at startup. `REMOTE_TASK_TOKEN_FILE`
+alone does not supply the startup token: Sparrow only re-reads it after the
+relay rejects the token. Keep the `.env` file mode 600.
+
+`ag2-sparrow hatch install --mxid @x:ag2.space` writes:
+
+| File | Content |
+| --- | --- |
+| `~/hooks/scripts/ag2-sparrow-hatch.sh` | the hook script (a locally modified copy is shown as a diff and kept unless you pass `--force`) |
+| `~/hooks/definitions/ag2-sparrow-hatch.json` | parameters for `hooks.add`, with your MXID |
+| `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON` (mode 600) |
+
+`TASK_DIR` and `RESULT_DIR` are resolved the way `ag2-sparrow` resolves them
+(`AGENT_CONNECT_TASK_DIR` / `AGENT_CONNECT_RESULT_DIR`, else under
+`~/.ag2-sparrow/`), so run `install` with the same environment as Sparrow, or
+pass `--task-dir` / `--result-dir`. `--activity-file` moves the marker.
+
+`ag2-sparrow hatch verify` prints one `PASS` or `FAIL` line each for the hook
+script, the hook definition, the config, the task dir, the tools the script
+needs (`jq`, `flock`, `timeout`) and the heartbeat, exits non-zero on any
+`FAIL`, and ends with the manual test: mention the agent from another account
+and watch the reply land in that thread.
+
 ## Optional: room-event subscription (0.3.0)
 
 Off by default. With `SPARROW_EVENTS=1` the client also maintains a persistent
