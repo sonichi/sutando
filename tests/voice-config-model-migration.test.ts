@@ -44,7 +44,10 @@ test('it happens once: a user who switches back to 3.1 afterwards keeps 3.1', ()
 
 test('every model an install was ever seeded with moves to 3.8: the 2.5 native-audio defaults too, backed up as .bak-2.5', () => {
 	// 2026-10-11: a desktop install seeded with the 2.5 native-audio default was never moved (the migration knew only 3.1).
-	for (const from of LEGACY_SEEDED_MODELS.filter((m) => m !== LEGACY_SEEDED_MODEL)) {
+	// Spelled out, not read from LEGACY_SEEDED_MODELS: a list shrunk back to 3.1 must fail here, not loop zero times.
+	const seeded25 = ['gemini-2.5-flash-native-audio-preview-12-2025', 'gemini-2.5-flash-native-audio'];
+	for (const from of seeded25) assert.ok(LEGACY_SEEDED_MODELS.includes(from), `${from} is a seeded model`);
+	for (const from of seeded25) {
 		const path = configWith({ model: from, googleSearch: true, _comment: 'keep' });
 		const result = migrateLegacyModel(path, new Date('2026-10-12T00:00:00Z'));
 		assert.equal(result.migrated, true, from);
