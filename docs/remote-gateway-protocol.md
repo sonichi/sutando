@@ -169,15 +169,21 @@ body: {
 `status` and `step` come from the core's
 `state/core-status.json`, with the health-check overlay described under
 [Independent health-check reporting](#independent-health-check-reporting). The
-core's beat in the `health` row below decides when that self-report cannot:
+core's beat in the `health` row below decides when that self-report cannot; the first
+matching row wins:
 
 | `core-status.json` | `alive` | sent `status` |
 |---|---|---|
+| missing, or written before this host's graceful-stop tombstone `state/cores/<host>.stopped` | `false` or `null` | `offline` |
 | present, under an hour old | any | the self-report |
 | present, older than an hour | `true` | the self-report (an idle core rewrites nothing) |
 | missing, malformed, or older than an hour | `false` (beat stale) | `offline` |
 | missing or malformed | `true` | `idle` |
-| missing, malformed, or older than an hour | `null` (no beat file) | `offline` with this host's graceful-stop tombstone `state/cores/<host>.stopped`, else `unknown` |
+| missing, malformed, or older than an hour | `null` (no beat file) | `unknown` |
+
+The tombstone is written by `core_heartbeat` on a graceful stop and deleted by its
+next run, and a self-report written after it (a restart before the first beat)
+supersedes it.
 
 `core_heartbeat` deletes `.alive` when the core stops, so a missing beat vouches
 for nothing. `unknown` is sent rather than omitting the field because the broker

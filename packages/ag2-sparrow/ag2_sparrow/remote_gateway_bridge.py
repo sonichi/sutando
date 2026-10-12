@@ -2524,19 +2524,19 @@ def _core_str(v) -> str | None:
     return v[:_CORE_STEP_MAX] if v else None
 
 
-def _core_status_age() -> float | None:
-    """Seconds since core-status.json was last written: its `ts` stamp, else the file
-    mtime; None when neither can be read. Never raises."""
+def _core_status_written_at() -> float | None:
+    """When core-status.json was last written: its `ts` stamp, else the file mtime; None
+    when neither can be read. Never raises."""
     path = _STATE / "core-status.json"
     try:
         with open(path) as f:
             ts = json.load(f).get("ts")
         if type(ts) in (int, float) and ts == ts:
-            return time.time() - ts
+            return float(ts)
     except Exception:  # noqa: BLE001 — fall back to the mtime
         pass
     try:
-        return time.time() - path.stat().st_mtime
+        return path.stat().st_mtime
     except OSError:
         return None
 
@@ -2989,28 +2989,31 @@ def _liveness_status(alive) -> str | None:
     return {True: "idle", False: "offline"}.get(alive)
 
 
-def _core_stopped() -> bool:
-    """This host's graceful-stop tombstone (core_heartbeat.mark_stopped); the next beat run
-    clears it, so it cannot outlive a core that came back."""
+def _core_stopped_at() -> float | None:
+    """mtime of this host's graceful-stop tombstone (core_heartbeat.mark_stopped), or None.
+    The next beat run deletes it, so it cannot outlive a core that came back and beat."""
     try:
-        return (_STATE / "cores" / f"{_profile_host_id()}.stopped").exists()
+        return (_STATE / "cores" / f"{_profile_host_id()}.stopped").stat().st_mtime
     except OSError:
-        return False
+        return None
 
 
 def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None, str | None]:
     """Overlay independent diagnostics without exporting their private details."""
     status, step = _read_core_status()
     alive = core_health.get("alive") if isinstance(core_health, dict) else None
-    unvouched = status is None or (alive is not True
-                                   and (_core_status_age() or 0) > _CORE_STATUS_MAX_AGE)
-    if unvouched and core_health is not None:
+    written_at = _core_status_written_at() if status is not None else None
+    stopped_at = _core_stopped_at() if core_health is not None and alive is not True else None
+    if stopped_at is not None and (written_at is None or written_at < stopped_at):
+        # A stop newer than the self-report outranks it; a later start supersedes the stop.
+        status, step = "offline", None
+    elif core_health is not None and (written_at is None or (
+            alive is not True and time.time() - written_at > _CORE_STATUS_MAX_AGE)):
         # A stopped core deletes its beat, so a missing beat vouches for nothing; omitting the
         # field would leave the broker's last presence status standing.
         status, step = _liveness_status(alive), None
         if status is None:
-            status, step = ("offline", None) if _core_stopped() \
-                else ("unknown", "Core liveness unavailable")
+            status, step = "unknown", "Core liveness unavailable"
     if status in ("error", "offline"):
         return status, step
     try:

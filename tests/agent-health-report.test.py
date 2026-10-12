@@ -317,6 +317,36 @@ class RealBeatTests(unittest.TestCase):
         self.alive.unlink()
         self.assertEqual(self.heartbeat()['status'], 'offline')
 
+    def stop(self, age=0):
+        """What core_heartbeat does on SIGTERM: tombstone first, then unlink `.alive`."""
+        tomb = self.cores / f'{self.label}.stopped'
+        tomb.write_text(str(time.time()))
+        os.utime(tomb, (time.time() - age,) * 2)
+        self.alive.unlink(missing_ok=True)
+
+    def test_a_stop_after_a_fresh_self_report_reads_offline(self):
+        # Regression: the tombstone was only consulted for a self-report over an hour old,
+        # so a core stopped seconds after writing 'idle' went on reading 'idle'.
+        self.write_status('idle', 5)
+        self.beat()
+        self.assertEqual(self.heartbeat()['status'], 'idle')
+        self.stop()
+        payload = self.heartbeat()
+        self.assertEqual((payload['status'], payload['health']['alive']), ('offline', None))
+
+    def test_a_restart_newer_than_the_stop_keeps_its_self_report_before_the_first_beat(self):
+        self.write_status('idle', 3600)
+        self.stop(age=600)
+        self.write_status('running', 5)
+        payload = self.heartbeat()
+        self.assertEqual((payload['status'], payload['health']['alive']), ('running', None))
+
+    def test_a_restart_that_beats_keeps_its_self_report(self):
+        self.stop(age=600)
+        self.write_status('idle', 900)
+        self.beat()
+        self.assertEqual(self.heartbeat()['status'], 'idle')
+
     def test_no_self_report_and_no_beat_is_unknown_not_silent(self):
         # Omitting `status` leaves the broker's last presence status standing.
         self.assertEqual(self.heartbeat().get('status'), 'unknown')
