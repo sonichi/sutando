@@ -255,7 +255,7 @@ class TestSignedOutSeatAcrossTicks(unittest.TestCase):
                 return {"health": health}
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--session", "sutando-worker-1",
                 "--out", out, "--once", "--stable", "1", "--seat", "worker comm"]
-        with patch.object(M, "capture", lambda s, sess: pane), \
+        with patch.object(M, "capture_styled", lambda s, sess: pane), \
                 patch.object(M, "_load_runtime_health", lambda: _RH()), \
                 patch.object(M, "gateway_alive", lambda *a: True), \
                 patch.object(M, "_ensure_tmux_on_path", lambda: None), \

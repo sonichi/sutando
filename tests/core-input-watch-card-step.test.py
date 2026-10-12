@@ -67,7 +67,7 @@ class TestCardStep(unittest.TestCase):
             if ticks["n"] >= len(panes):
                 raise _Done()
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--stable", "2", "--interval", "0"]
-        with patch.object(M, "capture", capture), \
+        with patch.object(M, "capture_styled", capture), \
                 patch.object(M, "_load_runtime_health", lambda: _RH()), \
                 patch.object(M, "gateway_alive", lambda *a: True), \
                 patch.object(M, "session_runtime", lambda *a: None), \
@@ -94,7 +94,7 @@ class TestCardStep(unittest.TestCase):
         seen = []
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--stable", "1",
                 "--interval", "0", "--once"]
-        with patch.object(M, "capture", lambda s, sess: _DIALOG_A), \
+        with patch.object(M, "capture_styled", lambda s, sess: _DIALOG_A), \
                 patch.object(M, "_load_runtime_health", lambda: _RH()), \
                 patch.object(M, "gateway_alive", lambda *a: True), \
                 patch.object(M, "session_runtime", lambda *a: "codex"), \
@@ -125,7 +125,7 @@ class TestCardStep(unittest.TestCase):
             if ticks["n"] >= 2:
                 raise _Done()
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--stable", "1", "--interval", "0"]
-        with patch.object(M, "capture", lambda s, sess: _DIALOG_A), \
+        with patch.object(M, "capture_styled", lambda s, sess: _DIALOG_A), \
                 patch.object(M, "_load_runtime_health", lambda: _RH()), \
                 patch.object(M, "gateway_alive", lambda *a: True), \
                 patch.object(M, "session_runtime", lambda *a: next(reads)), \
@@ -167,7 +167,7 @@ class TestCardStep(unittest.TestCase):
                 return {"health": "working"}
         calls = []
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--once", "--stable", "1"]
-        with patch.object(M, "capture", lambda s, sess: pane), \
+        with patch.object(M, "capture_styled", lambda s, sess: pane), \
                 patch.object(M, "_load_runtime_health", lambda: _RH()), \
                 patch.object(M, "gateway_alive", lambda *a: True), \
                 patch.object(M, "_ensure_tmux_on_path", lambda: None), \

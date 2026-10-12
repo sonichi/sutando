@@ -208,8 +208,12 @@ def classify(pane: str, styled_pane: "str | None" = None):
     """Return (kind, excerpt) if the pane is awaiting user input, else None.
 
     `styled_pane` (an escaped capture) feeds exactly one check below; omitted,
-    every matcher reads plain `pane` only -- unchanged from before."""
-    tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
+    every matcher reads plain `pane` only -- unchanged from before. It must be
+    the SAME capture as `pane` (e.g. `pane = _ANSI_SGR.sub("", styled_pane)`),
+    so stripping never shifts a line out of the window the two share."""
+    plain_lines = pane.splitlines()
+    kept = [i for i, ln in enumerate(plain_lines) if ln.strip()][-14:]
+    tail = "\n".join(plain_lines[i] for i in kept)
     if not _AWAIT_HINT.search(tail):
         return None
     # Idle-footer suppression: the normal footer ("⏵⏵ bypass permissions on … ←
@@ -246,7 +250,9 @@ def classify(pane: str, styled_pane: "str | None" = None):
     if composer_i is not None:
         rest = "\n".join(tail_lines[:composer_i] + tail_lines[composer_i + 1:])
         if not _AWAIT_HINT.search(rest):
-            line = _pg_prompt_line(styled_pane if styled_pane is not None else pane, CLAUDE)
+            styled_tail = ("\n".join(styled_pane.splitlines()[i] for i in kept)
+                           if styled_pane is not None else tail)
+            line = _pg_prompt_line(styled_tail, CLAUDE)
             if line is not None and line.placeholder and not line.text.strip():
                 return None
     # No signature, no idle ghost composer: an unforeseen prompt, surfaced rather
@@ -852,8 +858,10 @@ def main():
     state_dir = os.path.dirname(os.path.abspath(a.out))
     workspace = _Path(os.path.dirname(state_dir))
     while True:
-        pane = capture(a.socket, a.session)
+        # One capture, not two: deriving `pane` from `styled_pane` guarantees
+        # both views describe the exact same frame (no plain/styled race).
         styled_pane = capture_styled(a.socket, a.session)
+        pane = _ANSI_SGR.sub("", styled_pane) if styled_pane is not None else None
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         runtime = session_runtime(a.socket, a.session) or last_runtime
         last_runtime = runtime

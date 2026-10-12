@@ -500,7 +500,7 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
             if len(states) == 2:
                 raise _Stop
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--no-chat-escalation"]
-        with patch.object(_mod, "capture", lambda s, sess: next(panes)), \
+        with patch.object(_mod, "capture_styled", lambda s, sess: next(panes)), \
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "session_runtime", lambda *a: None), \
@@ -1010,7 +1010,7 @@ class TestCodexIdleIsNotHung(unittest.TestCase):
                 return {"health": "unknown", "signals": {"process": True}}
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
                 "--once", "--no-chat-escalation"]
-        with patch.object(_mod, "capture", lambda s, sess: _CODEX_IDLE), \
+        with patch.object(_mod, "capture_styled", lambda s, sess: _CODEX_IDLE), \
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
@@ -1040,7 +1040,7 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
                 return {"health": "working"}
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
                 "--once", "--stable", "1"] + extra_args
-        with patch.object(_mod, "capture", lambda s, sess: pane), \
+        with patch.object(_mod, "capture_styled", lambda s, sess: pane), \
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
@@ -1264,8 +1264,8 @@ class TestMainOnce(unittest.TestCase):
             def derive(self):
                 return {"health": "working"}
 
-        orig_cap, orig_load = _mod.capture, _mod._load_runtime_health
-        _mod.capture = lambda sock, sess: _BYPASS          # a recognized gate
+        orig_cap, orig_load = _mod.capture_styled, _mod._load_runtime_health
+        _mod.capture_styled = lambda sock, sess: _BYPASS   # a recognized gate
         _mod._load_runtime_health = lambda: _FakeRH()
         try:
             with tempfile.TemporaryDirectory() as td:
@@ -1281,7 +1281,7 @@ class TestMainOnce(unittest.TestCase):
                 with open(out) as f:
                     sig = json.load(f)
         finally:
-            _mod.capture, _mod._load_runtime_health = orig_cap, orig_load
+            _mod.capture_styled, _mod._load_runtime_health = orig_cap, orig_load
         # stable=2, first tick → prompt seen once (< 2) → debounced to running.
         self.assertEqual(sig["state"], "running")
 
