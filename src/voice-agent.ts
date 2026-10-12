@@ -59,7 +59,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { voiceTaskRows, workTool, submitWorkTask, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask } from './task-bridge.js';
+import { voiceTaskRows, workTool, submitWorkTask, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask, setVoiceWorkerResolver, createCallOriginLatch } from './task-bridge.js';
 import { createCallEndReporter, sessionEndTask } from './voice-session-end.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
@@ -986,13 +986,14 @@ async function main() {
 	});
 	setVoiceTaskEndedListener((taskId, why) => { relayAgent.endCall(taskId, why); });
 
-	// When the user hangs up, the core gets a task about that call.
+	// When the user hangs up, the core gets a task about that call, routed by the room it ended in.
+	const callOrigin = createCallOriginLatch(getVoiceSessionOrigin);
 	const callEnd = createCallEndReporter({
 		sessionId: SESSION_ID,
 		items: () => sessionRef?.conversationContext.items ?? [],
 		onEnded: async (ended) => {
 			const { summary, transcript } = sessionEndTask(ended);
-			await submitVoiceSessionEndTask(summary, transcript);
+			await submitVoiceSessionEndTask(summary, transcript, callOrigin.take());
 		},
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
@@ -1033,8 +1034,12 @@ async function main() {
 		},
 		// Frames the core does not own are offered to optional skills' handlers.
 		onClientCommand: (message) => clientFrames.dispatch(message),
-		onClientConnected: () => callEnd.clientConnected(),
+		onClientConnected: () => {
+			callOrigin.clientConnected();
+			callEnd.clientConnected();
+		},
 		onClientDisconnected: () => {
+			callOrigin.clientLeaving();
 			callEnd.clientDisconnected();
 			// An origin belongs to the client that announced it; the next client announces its own.
 			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
@@ -1497,6 +1502,7 @@ async function main() {
 		setVoiceSessionOrigin,
 		getVoiceSessionOrigin,
 		setVoiceTaskOriginResolver,
+		setVoiceWorkerResolver,
 	}, (msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
 	// Audio-duck relay: flag the slide server (localhost:7877) when Sutando is

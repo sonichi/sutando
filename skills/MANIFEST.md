@@ -87,6 +87,7 @@ exists. `ctx` (`SkillSetupCtx`, `src/skill-setup-runner.ts`) carries:
 | `injectContext(text)` | a framed system line the model should know, retried until the session is live |
 | `setVoiceSessionOrigin(origin)`, `getVoiceSessionOrigin()` | where delegated work came from (`VoiceSessionOrigin`, `src/task-bridge.ts`); `null` is the owner DM |
 | `setVoiceTaskOriginResolver(fn)` | recover a task's origin from its header lines after a restart |
+| `setVoiceWorkerResolver(fn)` | resolve a worker the user names to `work` (`requested_worker`); with none set, a named worker is refused |
 
 A handler that throws or rejects is logged and never reaches another skill's handler.
 

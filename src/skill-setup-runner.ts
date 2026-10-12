@@ -3,7 +3,7 @@
 
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import type { ClientFrame, ClientFrameHandler, ClientDisconnectedHandler } from './client-frame-hub.js';
-import type { VoiceSessionOrigin, VoiceTaskOriginResolver } from './task-bridge.js';
+import type { VoiceSessionOrigin, VoiceTaskOriginResolver, VoiceWorkerResolver } from './task-bridge.js';
 
 export type SkillSetupCtx = {
 	session: unknown;
@@ -22,6 +22,8 @@ export type SkillSetupCtx = {
 	getVoiceSessionOrigin: () => VoiceSessionOrigin | null;
 	/** Recover the origin of a task written before a restart from its header lines. */
 	setVoiceTaskOriginResolver: (resolver: VoiceTaskOriginResolver | null) => void;
+	/** Resolve a worker named by voice ("ask Pro-dev to …"); with none set, a named worker is refused. */
+	setVoiceWorkerResolver?: (resolver: VoiceWorkerResolver | null) => void;
 };
 export type SkillSetup = (ctx: SkillSetupCtx) => void;
 
