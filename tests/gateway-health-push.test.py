@@ -52,7 +52,7 @@ class Base(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.ws = Path(tmp.name)
         (self.ws / "state").mkdir()
-        for name, value in (("_STATE", self.ws / "state"), ("_heartbeat_disabled", False),
+        for name, value in (("_STATE", self.ws / "state"), ("_heartbeat_retry_at", 0.0),
                             ("_last_heartbeat_at", 0.0), ("_last_core_health", None),
                             ("_workers_pushed_identity", ""), ("_workers_push_retry_at", 0.0),
                             ("_workers_pushed_at", None),
@@ -70,7 +70,8 @@ class Snapshot(Base):
         self.assertEqual(first["agents"][0]["role"], "core")
         (self.ws / "state" / "pool-suspended").unlink()
         self.assertIs(rgb._health_snapshot(), first)
-        with mock.patch.object(rgb.time, "monotonic", return_value=rgb._health_cache["at"] + rgb.HEALTH_TTL_S):
+        # Past the TTL, not on it: (at + ttl) - at rounds below ttl for some float `at`.
+        with mock.patch.object(rgb.time, "monotonic", return_value=rgb._health_cache["at"] + 2 * rgb.HEALTH_TTL_S):
             self.assertIsNone(rgb._health_snapshot()["suspended"])
 
     def test_no_monorepo_src_means_no_health(self):

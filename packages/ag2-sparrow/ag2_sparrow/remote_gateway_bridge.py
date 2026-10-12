@@ -1618,6 +1618,9 @@ def _start_results_watcher() -> "threading.Thread | None":
 
 
 HEARTBEAT_INTERVAL = 60
+# A relay without /v1/heartbeat (404/405) is retried on a doubling backoff up to this cap,
+# so a broker that deploys or restores the route is picked up without a bridge restart.
+HEARTBEAT_UNSUPPORTED_MAX_BACKOFF = 1800.0
 # When the gateway lacks /v1/tasks/<id>/ack it returns 404/405; we back off
 # instead of hammering it — but only for this cooldown, then retry. A permanent
 ACK_UNSUPPORTED_COOLDOWN = int(os.environ.get("REMOTE_ACK_RETRY_COOLDOWN") or "300")
@@ -1751,7 +1754,8 @@ def _auth_probe() -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
-_heartbeat_disabled = False
+_heartbeat_retry_at = 0.0  # 0 = enabled; else epoch before which heartbeats are skipped
+_heartbeat_backoff = 0.0
 _last_heartbeat_at = 0.0
 _last_core_health: "dict | None" = None
 
@@ -2520,6 +2524,23 @@ def _core_str(v) -> str | None:
     return v[:_CORE_STEP_MAX] if v else None
 
 
+def _core_status_written_at() -> float | None:
+    """When core-status.json was last written: its `ts` stamp, else the file mtime; None
+    when neither can be read. Never raises."""
+    path = _STATE / "core-status.json"
+    try:
+        with open(path) as f:
+            ts = json.load(f).get("ts")
+        if type(ts) in (int, float) and ts == ts:
+            return float(ts)
+    except Exception:  # noqa: BLE001 — fall back to the mtime
+        pass
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _read_core_status() -> tuple[str | None, str | None]:
     """Read this node's core-status.json → (status, step) for the presence layer.
     core-status is written by the proactive loop / task handlers (status =
@@ -2956,11 +2977,43 @@ def _maybe_pull_worker_labels(record) -> bool:
 
 # The primary app checks every 30 minutes; the fallback checks every five.
 _HEALTH_REPORT_MAX_AGE = 35 * 60
+# A self-report older than this needs a live beat to stand: a dead core leaves its last
+# "idle" behind, while an idle core rewrites nothing, so a beating core keeps it.
+_CORE_STATUS_MAX_AGE = 60 * 60
 
 
-def _reported_core_status() -> tuple[str | None, str | None]:
+def _liveness_status(alive) -> str | None:
+    """The status the core's beat alone supports: idle when it beats, offline when it
+    stopped, nothing when there is no beat to judge (a standalone sparrow, or a core
+    that has not started its heartbeat yet)."""
+    return {True: "idle", False: "offline"}.get(alive)
+
+
+def _core_stopped_at() -> float | None:
+    """mtime of this host's graceful-stop tombstone (core_heartbeat.mark_stopped), or None.
+    The next beat run deletes it, so it cannot outlive a core that came back and beat."""
+    try:
+        return (_STATE / "cores" / f"{_profile_host_id()}.stopped").stat().st_mtime
+    except OSError:
+        return None
+
+
+def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None, str | None]:
     """Overlay independent diagnostics without exporting their private details."""
     status, step = _read_core_status()
+    alive = core_health.get("alive") if isinstance(core_health, dict) else None
+    written_at = _core_status_written_at() if status is not None else None
+    stopped_at = _core_stopped_at() if core_health is not None and alive is not True else None
+    if stopped_at is not None and (written_at is None or written_at < stopped_at):
+        # A stop newer than the self-report outranks it; a later start supersedes the stop.
+        status, step = "offline", None
+    elif core_health is not None and (written_at is None or (
+            alive is not True and time.time() - written_at > _CORE_STATUS_MAX_AGE)):
+        # A stopped core deletes its beat, so a missing beat vouches for nothing; omitting the
+        # field would leave the broker's last presence status standing.
+        status, step = _liveness_status(alive), None
+        if status is None:
+            status, step = "unknown", "Core liveness unavailable"
     if status in ("error", "offline"):
         return status, step
     try:
@@ -2972,10 +3025,13 @@ def _reported_core_status() -> tuple[str | None, str | None]:
     try:
         ts, total, failures = (report[k] for k in ("checked_at", "total", "failures"))
         if (report.get("version") != 1 or type(ts) not in (int, float)
-                or not 0 <= time.time() - ts <= _HEALTH_REPORT_MAX_AGE
+                or not 0 <= time.time() - ts
                 or type(total) is not int or total <= 0
                 or type(failures) is not int or not 0 <= failures <= total):
             return "unknown", "Health check unavailable"
+        if time.time() - ts > _HEALTH_REPORT_MAX_AGE:
+            # An old report is no opinion; a host that stopped checking must not read unknown forever.
+            return status, step
         if failures:
             return "error", f"Health check: {failures} failing check(s)"
     except Exception:
@@ -2986,17 +3042,17 @@ def _reported_core_status() -> tuple[str | None, str | None]:
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
-    global _heartbeat_disabled, _last_heartbeat_at, _last_core_health
-    if _heartbeat_disabled:
-        return False
+    global _heartbeat_retry_at, _heartbeat_backoff, _last_heartbeat_at, _last_core_health
     now = time.time()
+    if _heartbeat_retry_at and now < _heartbeat_retry_at:
+        return False
     health = _core_health(_health_snapshot())
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
-    _status, _step = _reported_core_status()
+    _status, _step = _reported_core_status(health)
     try:
         payload = {
             "client": "sutando-gateway-client",
@@ -3017,11 +3073,14 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             payload["health"] = health
             payload["capabilities"].append("worker_health.v1")
         _req("POST", "/v1/heartbeat", payload, timeout=10)
+        _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
-            _heartbeat_disabled = True
-            _log("gateway does not support heartbeat — continuing without")
+            _heartbeat_backoff = min(max(_heartbeat_backoff * 2, HEARTBEAT_INTERVAL),
+                                     HEARTBEAT_UNSUPPORTED_MAX_BACKOFF)
+            _heartbeat_retry_at = time.time() + _heartbeat_backoff
+            _log(f"gateway does not support heartbeat — retrying in {_heartbeat_backoff:.0f}s")
             return False
         if e.code in (401, 403):
             raise
