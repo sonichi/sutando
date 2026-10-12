@@ -46,8 +46,8 @@ from typing import Callable, List, Optional, Tuple
 
 _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC))
-from cli_wedge import (PROVIDER_LIMIT_PATTERNS, capture_pane, core_target,  # noqa: E402
-                       frame_abnormal, frame_working)
+from cli_wedge import (PROVIDER_LIMIT_PATTERNS, WORKING, capture_pane,  # noqa: E402
+                       core_target, frame_abnormal, frame_working)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
@@ -100,6 +100,21 @@ CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
 AWAIT_HINT = re.compile(
     r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
     r"|Continuing automatically|❯\s*\d+\.", re.I)
+# The completed-turn line: "✻ Worked for 0s" / "✻ Cooked for 1s · done 12:32 PM". The spinner
+# reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
+TURN_DONE = re.compile(
+    r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
+# A turn's spinner or its completion line: transcript sits above it, a live dialog below.
+_TURN_ROW = re.compile(rf"{WORKING.pattern}|{TURN_DONE.pattern}", re.I)
+
+
+def live_tail(lines: List[str]) -> List[str]:
+    """`lines` below the last turn spinner / completion row, else all of them. Tool output
+    above that row may quote a dialog's caret or key hints; only a dialog below it is live."""
+    for i in range(len(lines) - 1, -1, -1):
+        if _TURN_ROW.search(_SGR.sub("", lines[i])):
+            return lines[i + 1:]
+    return lines
 
 
 @dataclass(frozen=True)
@@ -426,7 +441,7 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
     line = prompt_line(capture, adapter)
     # _gate's after_prompt() must see the same capture line was found in, or
     # it computes "below" from a view that never contained that line at all.
-    gate = _gate(capture, tail, line, adapter)
+    gate = _gate(capture, "\n".join(_SGR.sub("", ln) for ln in live_tail(lines)), line, adapter)
     if gate:
         return Verdict("busy", gate)
     if abn and not _limit_is_stale(abn, workspace, socket, session, probe):

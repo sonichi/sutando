@@ -120,8 +120,9 @@ def _load_runtime_health():
 # with the caret on its "Switch to <fallback> and continue" row.
 from delivery.pane_gate import (  # noqa: E402
     ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
-    COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, classify_pane as _pg_classify_pane,
-    composer_text as _pg_composer_text, prompt_line as _pg_prompt_line,
+    COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, TURN_DONE,
+    classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, live_tail,
+    prompt_line as _pg_prompt_line,
 )
 
 _FABLE_TEXT = FABLE_TEXT
@@ -153,10 +154,7 @@ def _refusal_line(line: str) -> bool:
     return bool(_REFUSAL.search(line)) or cli_wedge.needs_login_line(line)
 
 
-# The completed-turn line: "✻ Worked for 0s" / "✻ Cooked for 1s · done 12:32 PM". The spinner
-# reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
-_TURN_DONE = re.compile(
-    r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
+_TURN_DONE = TURN_DONE
 _TURN_SHORT = re.compile(r"[01]s")
 _PROMPT_LINE = re.compile(r"^\s*❯")
 # The CLI's hint in an EMPTY composer (`❯ Try "refactor <filepath>"`); it vanishes
@@ -210,9 +208,11 @@ def classify(pane: str, styled_pane: "str | None" = None):
     `styled_pane` (an escaped capture) feeds exactly one check below; omitted,
     every matcher reads plain `pane` only -- unchanged from before. It must be
     the SAME capture as `pane` (e.g. `pane = _ANSI_SGR.sub("", styled_pane)`),
-    so stripping never shifts a line out of the window the two share."""
+    so stripping never shifts a line out of the window the two share.
+    Only rows below the last turn spinner / completion line are read (pane_gate.live_tail)."""
     plain_lines = pane.splitlines()
     kept = [i for i, ln in enumerate(plain_lines) if ln.strip()][-14:]
+    kept = kept[len(kept) - len(live_tail([plain_lines[i] for i in kept])):]
     tail = "\n".join(plain_lines[i] for i in kept)
     if not _AWAIT_HINT.search(tail):
         return None

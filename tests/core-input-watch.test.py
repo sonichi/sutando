@@ -314,6 +314,50 @@ class TestGhostComposerComposeState(unittest.TestCase):
         self.assertNotEqual(st, "blocked-human")
 
 
+
+# The core reading a test file mid-turn: its tool output quotes a boxed selection
+# dialog, caret and key hints included, above the live spinner and empty composer.
+_TOOL_OUTPUT_DIALOG = (
+    "⏺ Read(tests/core-input-watch.test.py)\n"
+    "  ⎿  ╭───────────────────────────────────────────────────╮\n"
+    "     │ Overwrite the existing config file?               │\n"
+    "     │ ❯ 1. Yes                                          │\n"
+    "     │   2. No                                           │\n"
+    "     │ Enter to select · ↑/↓ to navigate · Esc to cancel │\n"
+    "     ╰───────────────────────────────────────────────────╯\n")
+_SPINNER = "✻ Perambulating… (1m 46s · ↓ 2.1k tokens · esc to interrupt)\n"
+_LIVE_SELECTION = ("  Overwrite the existing config file?\n"
+                   "  ❯ 1. Yes\n    2. No\n"
+                   "  Enter to select · ↑/↓ to navigate · Esc to cancel")
+
+
+class TestToolOutputIsNotAGate(unittest.TestCase):
+    """A dialog quoted in tool output is transcript; only rows below the turn's
+    spinner or completion line are the live input region."""
+
+    def test_working_pane_quoting_a_dialog_is_running_not_blocked_human(self):
+        pane = _TOOL_OUTPUT_DIALOG + _SPINNER + _IDLE_FOOTER
+        self.assertIsNone(classify(pane))
+        st, _d, prompt, kind = compose_state(pane, "working", True)
+        self.assertEqual((st, kind, prompt), ("running", None, None))
+
+    def test_finished_turn_quoting_a_dialog_is_idle_ready(self):
+        pane = _TOOL_OUTPUT_DIALOG + "✻ Worked for 2m 14s · done 12:55 PM\n" + _IDLE_FOOTER
+        self.assertIsNone(classify(pane))
+        self.assertEqual(compose_state(pane, "idle", True)[0], "idle-ready")
+
+    def test_a_real_selection_below_quoted_output_still_flags(self):
+        pane = _TOOL_OUTPUT_DIALOG + _SPINNER + _LIVE_SELECTION
+        kind, excerpt = classify(pane)
+        self.assertEqual(kind, "selection")
+        self.assertNotIn("Read(", excerpt)
+        self.assertEqual(compose_state(pane, "working", True)[0], "blocked-human")
+
+    def test_a_real_permission_prompt_mid_turn_still_flags(self):
+        pane = (_TOOL_OUTPUT_DIALOG + _SPINNER + "⏺ Bash(rm -rf build)\n"
+                "  Do you want to proceed?\n  Allow this action\n  Esc to cancel")
+        self.assertEqual(compose_state(pane, "working", True)[:4:3], ("blocked-human", "permission"))
+
 class TestUnobservedProbeIsNotHung(unittest.TestCase):
     """An unobserved process probe (tmux refused the client, binary missing) must
     hold, never become the RECOVER-facing `hung`; only a SEEN session with stale
