@@ -748,5 +748,57 @@ class TestProviderAllowsNowWithProbe(RecordFixture):
         self.assertEqual(len(calls), 1)
 
 
+class TestRecordSpeaksForSeatFamilyAware(RecordFixture):
+    """A menu alias and the proxy's full id for the same model are never
+    string-equal; record_speaks_for_seat must still agree they're the same
+    seat, or every quota-banner recovery that used an alias regresses."""
+
+    def _speaks(self, seat_model_value, record_model_value):
+        (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": seat_model_value}))
+        env = qa.SeatEnv(True, PROXY, None, None)
+        return qa.record_speaks_for_seat({"last_request": {"model": record_model_value}}, env, self.ws)
+
+    def test_exact_full_ids_still_match(self):
+        self.assertTrue(self._speaks("claude-opus-5-5", "claude-opus-5-5"))
+
+    def test_an_alias_matches_its_own_family_s_full_id(self):
+        # The exact pairs from Susan's review (pullrequestreview on #5245).
+        self.assertTrue(self._speaks("opus", "claude-opus-5-5"))
+        self.assertTrue(self._speaks("sonnet[1m]", "claude-sonnet-5"))
+        self.assertTrue(self._speaks("fable[1m]", "claude-fable-5-1"))
+        self.assertTrue(self._speaks("haiku", "claude-haiku-4-5-20251001"))
+
+    def test_an_alias_does_not_match_a_different_family(self):
+        self.assertFalse(self._speaks("opus", "claude-sonnet-5"))
+        self.assertFalse(self._speaks("sonnet[1m]", "claude-fable-5-1"))
+
+    def test_default_has_no_family_and_matches_only_itself(self):
+        self.assertFalse(self._speaks("default", "claude-opus-5-5"))
+        self.assertTrue(self._speaks("default", "default"))
+
+    def test_unknown_names_never_match(self):
+        self.assertFalse(self._speaks("not-a-model", "claude-opus-5-5"))
+        self.assertFalse(self._speaks("claude-opus-5-5", "not-a-model"))
+
+    def test_two_different_full_ids_of_the_same_family_never_match(self):
+        self.assertFalse(self._speaks("claude-opus-4-1", "claude-opus-5-5"))
+        self.assertFalse(self._speaks("claude-sonnet-4-5[1m]", "claude-sonnet-5"))
+
+    def test_model_family_is_none_for_every_falsy_value(self):
+        # record_speaks_for_seat never passes a falsy value through; checked here directly.
+        for falsy in (None, ""):
+            self.assertIsNone(qa._model_family(falsy))
+
+    def test_model_family_direct_on_a_bare_alias_and_on_a_full_id(self):
+        # record_speaks_for_seat only passes a full id here; the alias branch needs a direct call.
+        self.assertEqual(qa._model_family("opus"), "opus")
+        self.assertEqual(qa._model_family("claude-opus-5-5"), "opus")
+
+    def test_model_family_direct_on_an_unrecognized_value(self):
+        # non-empty but matching no prefix: the loop's own fall-through, untested elsewhere.
+        self.assertIsNone(qa._model_family("default"))
+        self.assertIsNone(qa._model_family("not-a-model"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

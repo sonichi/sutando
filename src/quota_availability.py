@@ -344,13 +344,49 @@ def record_model(quota: Any) -> Optional[str]:
     return _norm_model(last.get("model")) if isinstance(last, dict) else None
 
 
+#: skills/model-switch's bare aliases, mapped to the proxy's full-id prefix.
+#: `default` names no family on purpose (fail-closed: unknown, not a guess).
+_FAMILY_PREFIX = {"opus": "claude-opus-", "sonnet": "claude-sonnet-",
+                   "haiku": "claude-haiku-", "fable": "claude-fable-"}
+
+
+def _model_family(value: Optional[str]) -> Optional[str]:
+    """The model family `value` belongs to (a menu alias or a full proxy id),
+    or None when it names no known family (e.g. `default`, or anything else)."""
+    if not value:
+        return None
+    if value in _FAMILY_PREFIX:
+        return value
+    for family, prefix in _FAMILY_PREFIX.items():
+        if value.startswith(prefix):
+            return family
+    return None
+
+
 def record_speaks_for_seat(quota: Any, env: SeatEnv, workspace) -> bool:
-    """True only when the seat's model and the record's are both known and equal.
-    A record refreshed on another model may say allowed while THIS seat's model
-    is limited, and the proxy's headers carry no per-model window to catch that
-    (measured: status, 5h, 7d, overage -- nothing per model), so unknown holds."""
+    """True only when the seat's model and the record's are both known and name
+    the same model, EXACTLY, or by family when the seat is a bare alias. A
+    record refreshed on another model may say allowed while THIS seat's model
+    is limited, and the proxy's headers carry no per-model window to catch
+    that (measured: status, 5h, 7d, overage -- nothing per model), so unknown
+    holds.
+
+    A menu alias (`opus`, `sonnet[1m]`, ...) and the full id the proxy reports
+    (`claude-opus-5-5`, `claude-sonnet-5`, ...) name the same model but are
+    never string-equal, so the family match covers that pairing; `default`
+    carries no family and so can only match a record from a literal `default`.
+
+    The family match applies only when the SEAT is a bare alias, never between
+    two full ids: a seat pinned to `claude-opus-4-1` and a record refreshed on
+    `claude-opus-5-5` stays unknown, same as before this match existed, because
+    per-model windows may differ within one family and an alias is the only
+    name that cannot already identify its own exact pinned version."""
     mine, theirs = seat_model(env, workspace), record_model(quota)
-    return mine is not None and theirs is not None and mine == theirs
+    if mine is None or theirs is None:
+        return False
+    if mine == theirs:
+        return True
+    return mine in _FAMILY_PREFIX and mine == _model_family(theirs)
 
 
 # ---- refreshing a stale record on purpose ---------------------------------
