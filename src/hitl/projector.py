@@ -125,7 +125,8 @@ def _send_notices(manager: HitlManager, send: Sender, room_id: str,
         # a client tie this message to its cards and drop it once they are all cleared.
         device = n.req.wire_device() or {}
         notice = {"notice": n.notice, "ids": [r.id for r, _ in n.members],
-                  "runtime": n.req.runtime, "host": device.get("host") or ""}
+                  "runtime": n.req.runtime, "device": device.get("id") or "",
+                  "host": device.get("host") or ""}
         answer = send({"room_id": room_id, "op": "message",
                        "body": renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued),
                        "dedupe_key": renotify.dedupe_key(n.notice, n.req, ledger, n.reminders),

@@ -104,7 +104,7 @@ class RenotifyTests(unittest.TestCase):
         self.assertNotIn(WIRE_FIELD, sent[0]["extra_content"])  # never a second card
         self.assertEqual(sent[0]["extra_content"][NOTICE_FIELD],
                          {"notice": "reminder", "ids": [req.id], "runtime": "claude",
-                          "host": req.wire_device().get("host") or ""})
+                          "device": "core-1", "host": req.wire_device().get("host") or ""})
         self.assertIn("Still blocked after 31m", sent[0]["body"])
         self.assertIn("2 tasks are waiting", sent[0]["body"])
 
@@ -172,6 +172,7 @@ class RenotifyTests(unittest.TestCase):
                          "✓ Cleared — worker pro-dev · blocked-human; Sutando has continued its work.")
         notice = messages[0]["extra_content"][NOTICE_FIELD]
         self.assertEqual((notice["notice"], sorted(notice["ids"])), ("recovery", sorted(ids)))
+        self.assertEqual(notice["device"], "sutando-worker-pro-dev")  # the seat's device id
         self.assertTrue(all(self.mgr.store.projection(i).get("recovered") for i in ids))
         self.clock.advance(7 * HOUR)
         self.assertEqual(self.drive(), [])
