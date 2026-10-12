@@ -12,11 +12,19 @@ import subprocess
 import sys
 import tempfile
 import time
+import contextlib
+import io
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
+sys.path.insert(0, str(PKG_ROOT))
+from ag2_sparrow.adapters.hatch import cli as hatch_cli, task_fields  # noqa: E402
+
+# The CLIs run in-process so repository coverage traces them.
 SCRIPT = HATCH / "ag2-sparrow-hatch.sh"
 AGENT = "@watch-agent:ag2.space"
 
@@ -61,6 +69,18 @@ NON_OWNER_LIMITS = (
 def executable(path, text):
     path.write_text(text)
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+
+def run_main(main, args, env):
+    """Call a CLI main() in this process with `env` as the whole environment."""
+    out, err = io.StringIO(), io.StringIO()
+    with mock.patch.dict(os.environ, env, clear=True), \
+            contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            rc = main(list(args))
+        except SystemExit as e:
+            rc = e.code
+    return types.SimpleNamespace(returncode=rc, stdout=out.getvalue(), stderr=err.getvalue())
 
 
 def py_env(home):
@@ -288,9 +308,8 @@ class TaskFields(Base):
     def test_helper_reads_headers_with_sparrows_parser(self):
         self.add_task("task-1784700000001", "$m", thread_root="$t")
         (self.tasks / "not-a-task.txt").write_text("task: x\n")
-        r = subprocess.run([sys.executable, "-m", "ag2_sparrow.adapters.hatch.task_fields",
-                            "--task-dir", str(self.tasks), "--result-dir", str(self.results)],
-                           env=py_env(self.home), capture_output=True, text=True)
+        r = run_main(task_fields.main, ["--task-dir", str(self.tasks),
+                                        "--result-dir", str(self.results)], py_env(self.home))
         self.assertEqual(r.returncode, 0, r.stderr)
         (item,) = json.loads(r.stdout)
         self.assertEqual((item["event_id"], item["thread_root"], item["sender"], item["sender_name"],
@@ -298,10 +317,21 @@ class TaskFields(Base):
                          ("$m", "$t", "@bob:ag2.space", "Bob", "owner", False))
 
     def test_missing_task_dir_fails(self):
-        r = subprocess.run([sys.executable, "-m", "ag2_sparrow.adapters.hatch.task_fields",
-                            "--task-dir", str(self.home / "nope"), "--result-dir", str(self.results)],
-                           env=py_env(self.home), capture_output=True, text=True)
+        r = run_main(task_fields.main, ["--task-dir", str(self.home / "nope"),
+                                        "--result-dir", str(self.results)], py_env(self.home))
         self.assertEqual(r.returncode, 2)
+
+    def test_closed_unreadable_and_unattested_tasks(self):
+        self.add_task("task-1784700000001", "$closed", mtime=1000)
+        (self.results / "task-1784700000001.txt").write_text("[REPLIED]")
+        self.add_task("task-1784700000002", "$open", tier="root", mtime=2000)
+        (self.tasks / "task-bad id.txt").write_text("task: x\n")
+        self.assertIsNone(task_fields.task_fields(self.tasks / "task-1784700000009.txt",
+                                                  self.results))
+        (item,) = task_fields.list_open_tasks(self.tasks, self.results)
+        self.assertEqual((item["event_id"], item["access_tier"]), ("$open", "guest"))
+        strict = "id: task-1\ntask: hi\naccess_tier: owner\n"
+        self.assertEqual(task_fields.attested_headers(strict).headers.get("task_layout"), None)
 
 
 GATEWAY_WRITER = """
@@ -349,8 +379,7 @@ class Cli(Base):
         env["AGENT_CONNECT_TASK_DIR"] = str(self.tasks)
         env["AGENT_CONNECT_RESULT_DIR"] = str(self.results)
         env["AGENT_CONNECT_STATE_DIR"] = str(self.state)
-        return subprocess.run([sys.executable, "-m", "ag2_sparrow.adapters.hatch.cli", *args],
-                              env=env, capture_output=True, text=True, cwd=str(self.home))
+        return run_main(hatch_cli.main, args, env)
 
     @property
     def state(self):
@@ -442,6 +471,51 @@ class Cli(Base):
         r = self.cli("verify")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("PASS sparrow: running and connected", r.stdout)
+
+    def test_verify_names_each_broken_part(self):
+        self.cli("install", "--mxid", AGENT)
+        self.sparrow_status()
+        self.script.chmod(0o644)
+        self.assertIn("FAIL hook script:", self.cli("verify").stdout)
+        self.script.write_text("# edited\n")
+        self.script.chmod(0o755)
+        self.assertIn("differs from this ag2-sparrow's copy", self.cli("verify").stdout)
+        definition = self.home / "hooks" / "definitions" / "ag2-sparrow-hatch.json"
+        definition.write_text('{"script_path": "/elsewhere.sh", "poll_interval_secs": 900}')
+        r = self.cli("verify")
+        self.assertIn("FAIL hook definition:", r.stdout)
+        self.assertIn("FAIL heartbeat: poll_interval_secs 900", r.stdout)
+        definition.write_text("not json")
+        self.assertIn("FAIL hook definition:", self.cli("verify").stdout)
+        cfg = self.home / ".config" / "ag2-sparrow-hatch" / "config"
+        executable(self.bin / "nopy", "#!/bin/sh\nexit 1\n")
+        cfg.write_text(f"# comment\nAGENT_MXID=nobody\nSPARROW_PYTHON={self.bin / 'nopy'}\nBAD='\n")
+        r = self.cli("verify")
+        self.assertIn("AGENT_MXID is not an MXID", r.stdout)
+        self.assertIn("TASK_DIR missing", r.stdout)
+        self.assertIn("nopy cannot import ag2_sparrow", r.stdout)
+        cfg.unlink()
+        self.assertIn("FAIL config:", self.cli("verify").stdout)
+
+    def test_verify_reports_missing_tools_and_unwritable_marker_dir(self):
+        self.cli("install", "--mxid", AGENT, "--activity-file",
+                 str(self.home / "no" / "such" / "dir" / "marker"))
+        self.sparrow_status()
+        (self.home / "no" / "such" / "dir").rmdir()
+        with mock.patch.object(hatch_cli.shutil, "which", return_value=None):
+            r = self.cli("verify")
+        self.assertIn("FAIL tools: missing on PATH: jq, flock, timeout", r.stdout)
+        self.assertIn("(activity marker dir) is not writable", r.stdout)
+
+    def test_sparrow_status_honours_the_gateway_instance(self):
+        self.state.mkdir()
+        (self.state / "gateway-status.blue.json").write_text(
+            json.dumps({"connected": True, "ts": 1000}))
+        with mock.patch.dict(os.environ, {"GATEWAY_INSTANCE": "blue"}):
+            ok, detail = hatch_cli.check_sparrow(self.state, now=1010)
+        self.assertTrue(ok, detail)
+        ok, detail = hatch_cli.check_sparrow(self.state, now=1010)
+        self.assertFalse(ok)
 
     def test_bare_entry_still_starts_the_bridge(self):
         env = py_env(self.home)
