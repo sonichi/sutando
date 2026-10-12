@@ -291,7 +291,7 @@ and loads whichever repo it reviews.
     approval read clean on every cheap signal (tests green, diff sensible); only exercising
     the restarted delivery loop end-to-end could have shown whether a recreated result is
     actually suppressed after a real delivery. The publication rule: #5293's first
-    witness comments redacted room, agent and task identities yet quoted the owner's
+    witness comments redacted room, agent and task IDs yet quoted the owner's
     question and two agents' answers, and were deleted and reposted with functional labels.
 
 16. **An authorization or approval is a statement about the object as it stood at its
