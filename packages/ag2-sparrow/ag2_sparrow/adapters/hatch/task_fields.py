@@ -5,6 +5,7 @@ with Sparrow's own header parser, never prose scraped by the shell."""
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 import sys
@@ -13,14 +14,24 @@ from pathlib import Path
 from ... import local_task_protocol
 
 SNIPPET_MAX = 500
-# Matrix user id: @localpart:server_name, where server_name may be a DNS name, IPv4 or
-# [IPv6] literal, each with an optional :port.
-MXID_RE = re.compile(r"^@[A-Za-z0-9._=+/-]+:(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?::[0-9]{1,5})?$")
+# Matrix user id: @localpart:server_name (DNS name, IPv4 or [IPv6], optional :port).
+# fullmatch only: `$` would also match before a trailing newline.
+_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+MXID_RE = re.compile(r"@[A-Za-z0-9._=+/-]+:(?:\[(?P<ipv6>[0-9A-Fa-f:.]+)\]|"
+                     rf"{_LABEL}(?:\.{_LABEL})*)(?::(?P<port>[0-9]{{1,5}}))?")
 EXIT_BAD_AGENT = 3
 
 
 def valid_mxid(value: str) -> bool:
-    return bool(MXID_RE.match(value or ""))
+    m = MXID_RE.fullmatch(value or "")
+    if m is None:
+        return False
+    if m["ipv6"] is not None:
+        try:
+            ipaddress.IPv6Address(m["ipv6"])
+        except ValueError:
+            return False
+    return m["port"] is None or 0 < int(m["port"]) <= 65535
 
 
 def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":

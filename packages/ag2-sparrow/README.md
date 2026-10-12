@@ -226,7 +226,8 @@ sends a heartbeat wake, skipped while the activity marker
 (`~/.muse/last_active` by default) is fresher than that. A message whose `result_file`
 is still unwritten 30 minutes after its wake is woken for again, marked
 `rewake: true`, up to 3 wakes in all; the note tells the worker to check the
-thread first and post nothing it already posted.
+thread first and post nothing it already posted. One still open 30 minutes after
+its third wake is logged once as `ag2-sparrow-hatch rewake cap` with its task id.
 
 Paste this to the Hatch agent, with its MXID filled in:
 

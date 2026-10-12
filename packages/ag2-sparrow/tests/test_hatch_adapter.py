@@ -207,7 +207,28 @@ class HookScript(Base):
             "woken": {"task-1784700000001": {"at": 1, "n": 3}}}))
         self.run_script()
         self.assertNotIn("WAKE", self.events_list())
-        self.assertEqual(self.stored()["woken"]["task-1784700000001"], {"at": 1, "n": 3})
+        self.assertEqual(self.stored()["woken"]["task-1784700000001"],
+                         {"at": 1, "n": 3, "capped": True})
+
+    def test_an_item_at_the_cap_is_logged_once(self):
+        self.add_task("task-1784700000001", "$reply")
+        now_ms = int(time.time()) * 1000  # the hook counts whole seconds
+        self.state.write_text(json.dumps({
+            "seen_ids": ["task-1784700000001"], "last_wake_ms": now_ms,
+            "woken": {"task-1784700000001": {"at": now_ms, "n": 3}}}))
+        self.run_script()
+        self.assertNotIn("cap", self.events_list())
+        st = self.stored()
+        st["woken"]["task-1784700000001"]["at"] -= 1800000
+        self.state.write_text(json.dumps(st))
+        self.reset()
+        self.run_script()
+        self.assertEqual(self.events_list()[:4], ["LOG", "ag2-sparrow-hatch", "rewake", "cap"])
+        self.assertNotIn("WAKE", self.events_list())
+        self.reset()
+        self.run_script()
+        self.assertNotIn("cap", self.events_list())
+        self.assertTrue(self.stored()["woken"]["task-1784700000001"]["capped"])
 
     def test_fresh_item_note_has_no_rewake_rule(self):
         self.add_task("task-1784700000001", "$reply")
@@ -391,10 +412,13 @@ class TaskFields(Base):
 
     def test_mxid_validator(self):
         for good in ("@a:ag2.space", "@a:localhost:8448", "@a:1.2.3.4:8448", "@a:[::1]",
-                     "@a:[2001:db8::1]:8448", "@x.y_z=+/-:ag2.space"):
+                     "@a:[2001:db8::1]:8448", "@x.y_z=+/-:ag2.space", "@a:ag2.space:65535",
+                     "@a:my-host.example"):
             self.assertTrue(task_fields.valid_mxid(good), good)
         for bad in ("", "a:ag2.space", "@a", "@a:", "@:ag2.space", "@a:host:port",
-                    "@a:host:8448:1", "@a b:ag2.space", None):
+                    "@a:host:8448:1", "@a b:ag2.space", None, "@a:ag2.space\n", "@a:b\n",
+                    "@a:[:]", "@a:[1.2.3]", "@a:ag2.space:99999", "@a:ag2.space:0", "@a:-host-",
+                    "@a:host-", "@a:a..b", "@a:.ag2.space", "@a:ag2.space."):
             self.assertFalse(task_fields.valid_mxid(bad), bad)
 
     def test_helper_rejects_a_bad_agent(self):
@@ -553,6 +577,7 @@ class Cli(Base):
 
     def test_install_rejects_a_bad_mxid(self):
         self.assertEqual(self.cli("install", "--mxid", "watch-agent").returncode, 2)
+        self.assertEqual(self.cli("install", "--mxid", AGENT + "\n").returncode, 2)
         self.assertFalse(self.script.exists())
 
     def test_verify_passes_after_install(self):

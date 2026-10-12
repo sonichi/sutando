@@ -69,12 +69,16 @@ result="$(printf '%s' "$items" | jq -c --arg agent "$AGENT" --argjson st "$state
   | ([$items[] | select((.task_id | seen) and (own | not))]) as $open
   | ([$open[] | woken as $w | select($now - $w.at >= $after and $w.n < $max)
       | . + {rewake: true, wakes: $w.n}]) as $due
+  # Still open a full delay after its last allowed wake: reported once, then marked.
+  | ([$open[] | woken as $w | select($now - $w.at >= $after and $w.n >= $max and ($w.capped | not))
+      | .task_id]) as $capped
   | ([$fresh[] | select(own | not)] + $due) as $want
   | ($want[0:$lim]) as $matches
   | ([$matches[].task_id]) as $hit
   | {
       matches: $matches,
       has_more: (($want | length) > $lim),
+      capped: $capped,
       new_state: {seen_ids: (([$items[].task_id | select(seen)]
                               + [$fresh[] | select(own) | .task_id]
                               + $hit) | unique),
@@ -82,6 +86,8 @@ result="$(printf '%s' "$items" | jq -c --arg agent "$AGENT" --argjson st "$state
                            | {key: .task_id,
                               value: (if ($hit | index($m.task_id)) != null
                                       then {at: $now, n: (if $m.rewake then $w.n + 1 else 1 end)}
+                                      elif ($capped | index($m.task_id)) != null
+                                      then $w + {capped: true}
                                       else $w end)}]
                           | from_entries)}
     }
@@ -91,6 +97,12 @@ commit_state() { # $1 = last_wake_ms to record
   [[ "$DRY_RUN" == "1" ]] && return 0
   hook_state_set "$(printf '%s' "$result" | jq -c --argjson lw "$1" '.new_state + {last_wake_ms: $lw}')"
 }
+
+capped="$(printf '%s' "$result" | jq -c '.capped')"
+if [[ "$capped" != "[]" ]]; then
+  log "ag2-sparrow-hatch rewake cap" "$(jq -cn --argjson ids "$capped" --argjson max "$MAX_WAKES" \
+    '{task_ids: $ids, max_wakes: $max, hint: "still open after the last wake; check its thread"}')"
+fi
 
 n="$(printf '%s' "$result" | jq '.matches | length')"
 if [[ "$n" -eq 0 ]]; then
