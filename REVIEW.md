@@ -277,6 +277,10 @@ and loads whichever repo it reviews.
     author's to run; if it needs an owner-scheduled service window, that is an ASK with
     its cost named (which service goes down, for how long, whether inbound is replayed) —
     never grounds to approve without it, and never a disclosure footnote on an approval.
+    A posted witness is public: it names agents by role and describes messages by kind,
+    and never quotes the owner's or an agent's real message text. Redacting ids is not
+    enough when the quoted words say what the owner asked or what their agents do; an
+    edit keeps the original in GitHub's history, so a leaked comment is deleted, not edited.
     *Grounded by:* #3174 (`fix(discord): suppress recreated task results after delivery`)
     — a Discord delivery-path change approved on its unit suite, then blocked back to
     CHANGES_REQUESTED on review because the delivery path had no post-restart witness. The
