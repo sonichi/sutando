@@ -121,7 +121,7 @@ def _load_runtime_health():
 from delivery.pane_gate import (  # noqa: E402
     ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
     COMPOSER_PLACEHOLDER, FABLE_TEXT, classify_pane as _pg_classify_pane,
-    composer_text as _pg_composer_text,
+    composer_text as _pg_composer_text, prompt_line as _pg_prompt_line,
 )
 
 _FABLE_TEXT = FABLE_TEXT
@@ -204,8 +204,15 @@ def auto_answer(kind):
     return _AUTO_ANSWER.get(kind)
 
 
-def classify(pane: str):
-    """Return (kind, excerpt) if the pane is awaiting user input, else None."""
+def classify(pane: str, styled_pane: "str | None" = None):
+    """Return (kind, excerpt) if the pane is awaiting user input, else None.
+
+    `styled_pane` is the SAME capture taken WITH escapes (``capture_pane(...,
+    escapes=True)``), when the caller has one. It is used for exactly one
+    check below (a dim ghost suggestion vs. a real draft) and never changes
+    any other matcher here, which all keep reading the plain `pane` — this
+    function's existing behaviour is unchanged for a caller that passes only
+    `pane` (tests included)."""
     tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
     if not _AWAIT_HINT.search(tail):
         return None
@@ -235,11 +242,17 @@ def classify(pane: str):
                 for m in _FABLE_TEXT.finditer(tail)):
             return "unknown", tail
         return kind, tail
-    # No specific signature — but an input affordance IS present and this is NOT
-    # the idle prompt. That means an UNFORESEEN prompt. Surface it rather than
-    # leave a silent dead-end (owner's no-dead-end requirement 2026-07-14): we
-    # cannot enumerate every possible TUI question, so ANY await-affordance that
-    # isn't the known idle-ready state is treated as needing the user.
+    # A dim ghost suggestion matches the same hint but isn't real input (#5415);
+    # only when no dialog sits above the composer row (else stays unknown).
+    tail_lines = tail.splitlines()
+    composer_i = next((i for i in range(len(tail_lines) - 1, -1, -1)
+                        if _PROMPT_LINE.match(tail_lines[i])), None)
+    if composer_i is not None and not _AWAIT_HINT.search("\n".join(tail_lines[:composer_i])):
+        line = _pg_prompt_line(styled_pane if styled_pane is not None else pane, CLAUDE)
+        if line is not None and not line.text.strip():
+            return None
+    # No signature, no idle ghost composer: an unforeseen prompt, surfaced rather
+    # than a silent dead-end (owner's no-dead-end rule 2026-07-14).
     return "unknown", tail
 
 
@@ -338,7 +351,8 @@ _BASE_TO_STATE = {
 }
 
 
-def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime=None):
+def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime=None,
+                   styled_pane: "str | None" = None):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -350,6 +364,8 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     seen), False (server answered "no session"), None (the probe could not run).
     `prev_pane` is the previous poll's capture, the only evidence a turn is moving.
     `runtime` is the runtime stamped on the core session (see `session_runtime`).
+    `styled_pane` is the same capture taken WITH escapes, when the caller has one
+    (see `classify()`); omitted it changes nothing else here.
     """
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
@@ -357,7 +373,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     # "sitting at a prompt waiting for input" from the coarse health (e.g. the live
     # /login MENU, which runtime-health's needs_login markers don't match). Check it
     # first so we carry the prompt text + kind for ESCALATE / AUTO-ANSWER.
-    hit = classify(pane) if pane else None
+    hit = classify(pane, styled_pane) if pane else None
     if hit:
         kind, excerpt = hit
         if kind in _HUMAN_GATES:
@@ -520,6 +536,16 @@ def session_runtime(socket, session):
 def capture(socket, session):
     target = cli_wedge.core_target(socket, session)
     return cli_wedge.capture_pane(socket, target) if target else None
+
+
+def capture_styled(socket, session):
+    """The same pane as `capture()`, captured WITH escapes (SGR codes kept) so a
+    dim/ghost composer suggestion can be told apart from real typed input
+    (classify()'s ghost-composer check, #5415). A separate tmux call rather than
+    deriving `capture()`'s plain text from this one, so every existing matcher in
+    this file keeps reading byte-identical plain text — nothing else changes."""
+    target = cli_wedge.core_target(socket, session)
+    return cli_wedge.capture_pane(socket, target, escapes=True) if target else None
 
 
 def send_keys(socket, session, key):
@@ -832,6 +858,7 @@ def main():
     workspace = _Path(os.path.dirname(state_dir))
     while True:
         pane = capture(a.socket, a.session)
+        styled_pane = capture_styled(a.socket, a.session)
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         runtime = session_runtime(a.socket, a.session) or last_runtime
         last_runtime = runtime
@@ -839,7 +866,7 @@ def main():
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
             process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane,
-            runtime=runtime)
+            runtime=runtime, styled_pane=styled_pane)
         prev_pane = pane
         clock = gate_clock(clock, state, prompt, time.time())
 

@@ -213,6 +213,52 @@ class TestClassify(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit[0], "unknown")
 
+    # #5415: a dim composer ghost suggestion with no idle footer in view, styled
+    # as TestComposerIsEmpty's GHOST fixture (SGR 2, Claude Code v2.1.276).
+    GHOST_NO_FOOTER_STYLED = (
+        "❯ \x1b[2mresume normal self-development\x1b[0m\n"
+        "  Tab to accept · ↑↓ to navigate · Esc to dismiss"
+    )
+    GHOST_NO_FOOTER_PLAIN = _mod._ANSI_SGR.sub("", GHOST_NO_FOOTER_STYLED)
+
+    def test_ghost_suggestion_with_no_footer_is_idle_when_styled_capture_given(self):
+        self.assertIsNone(classify(self.GHOST_NO_FOOTER_PLAIN, self.GHOST_NO_FOOTER_STYLED))
+
+    def test_ghost_suggestion_with_no_footer_without_a_styled_capture_stays_unknown(self):
+        # Documents the prior (unfixed) behavior for a caller with no styled capture
+        # to offer: unchanged, not silently "fixed" by this feature.
+        hit = classify(self.GHOST_NO_FOOTER_PLAIN)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "unknown")
+
+    def test_a_real_typed_draft_with_no_footer_still_surfaces_as_unknown(self):
+        # The ghost check must not swallow a genuine owner draft sitting in the
+        # composer just because it also lacks a footer in view.
+        styled = self.GHOST_NO_FOOTER_STYLED.replace(
+            "\x1b[2mresume normal self-development\x1b[0m", "do the thing")
+        plain = _mod._ANSI_SGR.sub("", styled)
+        hit = classify(plain, styled)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "unknown")
+
+
+class TestGhostComposerComposeState(unittest.TestCase):
+    """compose_state()-level regression for #5415: with the real monitor loop now
+    passing a styled capture through, the ghost suggestion must compose to a
+    non-blocking state instead of blocked-human/unknown."""
+
+    STYLED = TestClassify.GHOST_NO_FOOTER_STYLED
+    PLAIN = TestClassify.GHOST_NO_FOOTER_PLAIN
+
+    def test_without_styled_pane_it_falsely_blocks(self):
+        st, _d, _p, kind = compose_state(self.PLAIN, "idle", True)
+        self.assertEqual(st, "blocked-human")
+        self.assertEqual(kind, "unknown")
+
+    def test_with_styled_pane_it_does_not_block(self):
+        st, *_ = compose_state(self.PLAIN, "idle", True, styled_pane=self.STYLED)
+        self.assertNotEqual(st, "blocked-human")
+
 
 class TestUnobservedProbeIsNotHung(unittest.TestCase):
     """An unobserved process probe (tmux refused the client, binary missing) must
