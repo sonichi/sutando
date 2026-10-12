@@ -213,12 +213,9 @@ class TestClassify(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit[0], "unknown")
 
-    # A dim composer ghost suggestion with no idle footer in view, styled as
-    # TestComposerIsEmpty's GHOST fixture (SGR 2, Claude Code v2.1.276).
-    GHOST_NO_FOOTER_STYLED = (
-        "❯ \x1b[2mresume normal self-development\x1b[0m\n"
-        "  Tab to accept · ↑↓ to navigate · Esc to dismiss"
-    )
+    # Real `tmux capture-pane -e -p` byte format (nbsp after the glyph, SGR 2
+    # dim): text coincidentally contains an await-hint phrase, nothing else around.
+    GHOST_NO_FOOTER_STYLED = "❯\xa0\x1b[2mshow me how to navigate the codebase\x1b[0m"
     GHOST_NO_FOOTER_PLAIN = _mod._ANSI_SGR.sub("", GHOST_NO_FOOTER_STYLED)
 
     def test_ghost_suggestion_with_no_footer_is_idle_when_styled_capture_given(self):
@@ -232,12 +229,10 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(hit[0], "unknown")
 
     def test_a_real_typed_draft_with_no_footer_still_surfaces_as_unknown(self):
-        # The ghost check must not swallow a genuine owner draft sitting in the
-        # composer just because it also lacks a footer in view.
-        styled = self.GHOST_NO_FOOTER_STYLED.replace(
-            "\x1b[2mresume normal self-development\x1b[0m", "do the thing")
-        plain = _mod._ANSI_SGR.sub("", styled)
-        hit = classify(plain, styled)
+        # Same text, typed for real (no dim span to strip): must not be
+        # suppressed just because it happens to contain an await-hint phrase.
+        draft = "❯\xa0show me how to navigate the codebase"
+        hit = classify(draft, draft)
         self.assertIsNotNone(hit)
         self.assertEqual(hit[0], "unknown")
 
@@ -254,6 +249,17 @@ class TestClassify(unittest.TestCase):
         # Same pane as both plain and styled: no SGR anywhere, so there is no
         # dim span to find regardless of which capture mode produced it.
         hit = classify(self.EMPTY_COMPOSER_REAL_DIALOG, self.EMPTY_COMPOSER_REAL_DIALOG)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "unknown")
+
+    def test_an_unforeseen_dialog_above_a_ghost_composer_stays_blocked(self):
+        # A real dialog sitting in scrollback above an unrelated ghost
+        # suggestion must not be silenced by the composer's own placeholder.
+        dlg = ("Allow the frobnicator to rewrite settings?\n  1. Yes\n  2. No\n"
+               "Enter to confirm · Esc to cancel\n")
+        styled = dlg + self.GHOST_NO_FOOTER_STYLED
+        plain = _mod._ANSI_SGR.sub("", styled)
+        hit = classify(plain, styled)
         self.assertIsNotNone(hit)
         self.assertEqual(hit[0], "unknown")
 

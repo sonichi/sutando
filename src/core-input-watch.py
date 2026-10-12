@@ -238,11 +238,17 @@ def classify(pane: str, styled_pane: "str | None" = None):
                 for m in _FABLE_TEXT.finditer(tail)):
             return "unknown", tail
         return kind, tail
-    # A dim ghost/placeholder span, once stripped, can leave an empty composer;
-    # a REAL empty "❯ " has no such span, so `line.placeholder` alone discriminates.
-    line = _pg_prompt_line(styled_pane if styled_pane is not None else pane, CLAUDE)
-    if line is not None and line.placeholder and not line.text.strip():
-        return None
+    # A dim ghost span leaves an empty composer; a real empty one has no span.
+    # Requires BOTH that AND nothing else nearby also awaits an answer.
+    tail_lines = tail.splitlines()
+    composer_i = next((i for i in range(len(tail_lines) - 1, -1, -1)
+                        if _PROMPT_LINE.match(tail_lines[i])), None)
+    if composer_i is not None:
+        rest = "\n".join(tail_lines[:composer_i] + tail_lines[composer_i + 1:])
+        if not _AWAIT_HINT.search(rest):
+            line = _pg_prompt_line(styled_pane if styled_pane is not None else pane, CLAUDE)
+            if line is not None and line.placeholder and not line.text.strip():
+                return None
     # No signature, no idle ghost composer: an unforeseen prompt, surfaced rather
     # than a silent dead-end (owner's no-dead-end rule 2026-07-14).
     return "unknown", tail
