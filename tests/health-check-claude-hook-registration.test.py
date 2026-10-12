@@ -39,11 +39,20 @@ HOOKS=(
 '''
 
 
+# The probe is Claude-only (#5414); pin the runtime so a codex host still exercises it.
+_RUNTIME_PIN = mock.patch.dict(os.environ, {"SUTANDO_CORE_RUNTIME": "claude"})
+
+
+def setUpModule():
+    _RUNTIME_PIN.start()
+
+
+def tearDownModule():
+    _RUNTIME_PIN.stop()
+
+
 class TestHookRegistration(unittest.TestCase):
     def setUp(self):
-        env = mock.patch.dict(os.environ, {"SUTANDO_CORE_RUNTIME": "claude"})
-        env.start()
-        self.addCleanup(env.stop)
         self.hc = _load()
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
