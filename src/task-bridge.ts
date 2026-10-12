@@ -1013,11 +1013,12 @@ export const WORK_PENDING_MESSAGE = 'Task has been queued and is being processed
 export const workTool: ToolDefinition = {
 	name: 'work',
 	description:
-		'Do the work. Call this for anything beyond simple greetings — questions, actions, ' +
-		'research, writing, translation, file changes, system queries, explanations, analysis. ' +
-		'This is how Sutando thinks and acts. Results are spoken back when ready.',
+		'Send a request to the core (Claude Code), which does it; the result is spoken when ready. ' +
+		'For lookups you cannot do yourself, actions (write, send, change, create, delete), files, code, and the user\'s own accounts and systems. ' +
+		'The request must be complete: it names the thing it is about (which PR, which file, which person). ' +
+		'If the user left that out and this conversation does not say, ask them first; do not call this with the blank in it.',
 	parameters: z.object({
-		task: z.string().describe('Full description of the task to perform'),
+		task: z.string().describe('Full description of the task to perform, naming the thing it is about'),
 		timeout_minutes: z
 			.number()
 			.optional()
