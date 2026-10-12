@@ -24,6 +24,7 @@ from typing import Dict, List, Optional
 from file_lock import lock_fd, unlock_fd
 from workspace_default import resolve_workspace
 
+from . import renotify
 from .schema import (
     Action,
     ActionReply,
@@ -68,6 +69,8 @@ class HitlStore:
     def __init__(self, root: Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        # Settled records move here so `all()` stays the size of the live set.
+        self.archive_root = self.root.with_name(self.root.name + "-archive")
         self._lock_fd: Optional[int] = None
         self._lock_depth = 0
         self.last_skipped: tuple = ()
@@ -121,8 +124,20 @@ class HitlStore:
             return {}  # a wire-supplied id that is not ours: no record, never an error
         p = self._path(req_id)
         if not p.exists():
-            return {}
+            p = self.archive_root / p.name  # a late click on an old card is "already answered"
+            if not p.exists():
+                return {}
         return json.loads(p.read_text())
+
+    def archive(self, req_id: str) -> bool:
+        """Move a record out of the live set, atomically, under the store lock."""
+        src = self._path(req_id)
+        with self.locked():
+            if not src.exists():
+                return False
+            self.archive_root.mkdir(parents=True, exist_ok=True)
+            os.replace(src, self.archive_root / src.name)
+            return True
 
     def load(self, req_id: str) -> Optional[HumanRequirement]:
         raw = self._load_raw(req_id)
@@ -275,6 +290,18 @@ class HitlManager:
             if req is None:
                 return
             self.store.save(req, projection={**self.store.projection(req_id), **fields})
+
+    def archive_if_settled(self, req_id: str, now: float) -> bool:
+        """Archive a terminal record whose card is current and owes no follow-up notice."""
+        with self.store.locked():
+            req = self.store.load(req_id)
+            if req is None or req.status not in TERMINAL_STATUSES:
+                return False
+            if self.needs_projection(req_id):
+                return False
+            if renotify.due(req, self.store.projection(req_id), now) is not None:
+                return False
+            return self.store.archive(req_id)
 
     def projection_target(self, req_id: str) -> Optional[str]:
         """Event id of the CREATE projection — the target for status EDITs."""

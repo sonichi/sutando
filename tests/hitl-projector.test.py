@@ -2,8 +2,10 @@
 retry-whole on a rejected send, dedupe keys stable per (requirement, revision).
 """
 
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -13,11 +15,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from hitl.manager import HitlManager, HitlStore  # noqa: E402
 from hitl.projector import (  # noqa: E402
     fallback_body,
+    pending_ids,
     project,
 )
 from hitl.schema import (  # noqa: E402
     Action, CATEGORY_BLOCKED, CATEGORY_DECISION, HumanRequirement, KINDS,
-    WIRE_FIELD, category_of,
+    STATUS_RESOLVED, WIRE_FIELD, category_of,
 )
 
 ROOM = "!room:ag2.space"
@@ -177,6 +180,103 @@ class FallbackWhereTests(unittest.TestCase):
         with mock.patch.object(SCHEMA, "device_host", return_value=""):
             self.assertIn("(on Qingyun's Air)", fallback_body(make_req()))
             self.assertNotIn("(on ", fallback_body(make_req(device=None)))
+
+
+class ArchiveTests(unittest.TestCase):
+    """A settled record leaves the live set, so the per-pulse scan does not grow."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "requirements"
+        self.mgr = HitlManager(HitlStore(self.root))
+        self.send = RecordingSender()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def live(self):
+        return sorted(p.stem for p in self.root.glob("hitl_*.json"))
+
+    def settled(self, kind="choice"):
+        req = self.mgr.create(make_req(kind=kind))
+        project(self.mgr, self.send, ROOM)
+        self.mgr.resolve(req.id)
+        project(self.mgr, self.send, ROOM)
+        return req
+
+    def test_resolved_and_caught_up_is_archived(self):
+        req = self.settled()
+        self.assertEqual(pending_ids(self.mgr), [])
+        self.assertEqual(self.live(), [])
+        self.assertTrue((self.mgr.store.archive_root / f"{req.id}.json").exists())
+        self.assertEqual(self.mgr.store.archive_root, self.root.with_name("requirements-archive"))
+
+    def test_a_card_whose_recovery_was_sent_is_archived(self):
+        req = self.settled(kind="auth")
+        self.assertTrue(self.mgr.store.projection(req.id).get("recovered"))
+        pending_ids(self.mgr)
+        self.assertEqual(self.live(), [])
+
+    def test_archived_record_still_loads(self):
+        req = self.settled()
+        pending_ids(self.mgr)
+        got = self.mgr.get(req.id)
+        self.assertIsNotNone(got)
+        self.assertEqual(got.status, STATUS_RESOLVED)
+        self.assertEqual(self.mgr.store.projection(req.id)["event_id"], "$ev1")
+        self.assertEqual(self.mgr.resolve(req.id), [])  # a late click: already answered
+        self.assertEqual(self.live(), [])
+
+    def test_all_no_longer_returns_archived(self):
+        done = self.settled()
+        open_ = self.mgr.create(make_req(guard="g2", device={"id": "d2"}))
+        pending_ids(self.mgr)
+        self.assertEqual([r.id for r in self.mgr.store.all()], [open_.id])
+        self.assertNotEqual(done.id, open_.id)
+
+    def test_resolved_with_edit_owed_stays(self):
+        req = self.mgr.create(make_req(kind="choice"))
+        project(self.mgr, self.send, ROOM)
+        self.mgr.resolve(req.id)
+        self.assertEqual(pending_ids(self.mgr), [req.id])
+        self.assertEqual(self.live(), [req.id])
+
+    def test_resolved_with_recovery_owed_stays(self):
+        req = self.mgr.create(make_req(kind="auth"))
+        project(self.mgr, self.send, ROOM)
+        self.mgr.resolve(req.id)
+        refuse_notices = lambda payload: (  # noqa: E731
+            self.send(payload) if WIRE_FIELD in payload["extra_content"] else {"ok": False})
+        project(self.mgr, refuse_notices, ROOM)
+        self.assertFalse(self.mgr.needs_projection(req.id))
+        self.assertEqual(pending_ids(self.mgr), [req.id])
+        self.assertEqual(self.live(), [req.id])
+
+    def test_open_stays(self):
+        req = self.mgr.create(make_req(kind="choice"))
+        project(self.mgr, self.send, ROOM)
+        self.assertEqual(pending_ids(self.mgr), [])
+        self.assertEqual(self.live(), [req.id])
+
+    def test_the_move_waits_for_the_store_lock(self):
+        req = self.settled()
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl, os, sys, time\n"
+             "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)\n"
+             "fcntl.flock(fd, fcntl.LOCK_EX); print('held', flush=True); time.sleep(0.6)",
+             str(self.root / ".lock")],
+            stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            start = time.monotonic()
+            self.assertTrue(self.mgr.archive_if_settled(req.id, time.time()))
+            self.assertGreaterEqual(time.monotonic() - start, 0.3)
+        finally:
+            holder.wait(timeout=5)
+            holder.stdout.close()
+        self.assertEqual(self.live(), [])
+        self.assertIsNotNone(self.mgr.get(req.id))
 
 
 if __name__ == "__main__":
