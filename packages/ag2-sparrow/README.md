@@ -223,7 +223,10 @@ credential use, private owner context or sends to other rooms; reply only in
 the room; go/no-go goes to the owner), so they do not depend on the worker
 trusting instruction text inside the message. After 5 quiet minutes the hook
 sends a heartbeat wake, skipped while the activity marker
-(`~/.muse/last_active` by default) is fresher than that.
+(`~/.muse/last_active` by default) is fresher than that. A message whose `result_file`
+is still unwritten 30 minutes after its wake is woken for again, marked
+`rewake: true`, up to 3 wakes in all; the note tells the worker to check the
+thread first and post nothing it already posted.
 
 Paste this to the Hatch agent, with its MXID filled in:
 

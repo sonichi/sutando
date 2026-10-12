@@ -178,6 +178,63 @@ class HookScript(Base):
         self.run_script()
         self.assertEqual([m["task_id"] for m in self.payload()["matches"]], ["task-1784700000003"])
 
+    def stored(self):
+        return json.loads(self.state.read_text())
+
+    def test_open_item_is_woken_again_after_the_rewake_delay(self):
+        self.add_task("task-1784700000001", "$reply")
+        self.run_script()
+        self.assertEqual(self.stored()["woken"]["task-1784700000001"]["n"], 1)
+        self.reset()
+        self.run_script()
+        self.assertNotIn("WAKE", self.events_list())
+        st = self.stored()
+        st["woken"]["task-1784700000001"]["at"] -= 1800000
+        self.state.write_text(json.dumps(st))
+        self.reset()
+        self.run_script()
+        p = self.payload()
+        (m,) = p["matches"]
+        self.assertEqual((m["task_id"], m["rewake"], m["wakes"]), ("task-1784700000001", True, 1))
+        self.assertIn("rewake: true", p["worker_note"])
+        self.assertIn("repeat its HANDOFF block", p["worker_note"])
+        self.assertEqual(self.stored()["woken"]["task-1784700000001"]["n"], 2)
+
+    def test_rewakes_stop_at_the_cap(self):
+        self.add_task("task-1784700000001", "$reply")
+        self.state.write_text(json.dumps({
+            "seen_ids": ["task-1784700000001"], "last_wake_ms": int(time.time() * 1000),
+            "woken": {"task-1784700000001": {"at": 1, "n": 3}}}))
+        self.run_script()
+        self.assertNotIn("WAKE", self.events_list())
+        self.assertEqual(self.stored()["woken"]["task-1784700000001"], {"at": 1, "n": 3})
+
+    def test_fresh_item_note_has_no_rewake_rule(self):
+        self.add_task("task-1784700000001", "$reply")
+        self.run_script()
+        self.assertNotIn("rewake", self.payload()["worker_note"])
+        self.assertNotIn("rewake", self.payload()["matches"][0])
+
+    def test_items_seen_before_woken_was_recorded_wait_a_full_delay(self):
+        self.add_task("task-1784700000001", "$reply")
+        self.add_task("task-1784700000002", "$mine", sender=AGENT)
+        self.state.write_text(json.dumps({
+            "seen_ids": ["task-1784700000001", "task-1784700000002"],
+            "last_wake_ms": int(time.time() * 1000)}))
+        self.run_script()
+        self.assertNotIn("WAKE", self.events_list())
+        woken = self.stored()["woken"]
+        self.assertEqual(list(woken), ["task-1784700000001"])
+        self.assertEqual(woken["task-1784700000001"]["n"], 1)
+
+    def test_closed_item_leaves_the_woken_record(self):
+        self.add_task("task-1784700000001", "$reply")
+        self.run_script()
+        (self.results / "task-1784700000001.txt").write_text("[REPLIED]\n")
+        self.reset()
+        self.run_script()
+        self.assertEqual(self.stored()["woken"], {})
+
     def test_seen_set_advances_only_after_the_wake(self):
         self.add_task("task-1784700000001", "$reply")
         self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 5}))
