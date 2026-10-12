@@ -12,7 +12,8 @@ from hitl.manager import HitlManager, HitlStore  # noqa: E402
 from hitl.projector import pending_ids, project  # noqa: E402
 
 from hitl import renotify  # noqa: E402
-from hitl.schema import STATUS_CANCELLED, Action, HumanRequirement, WIRE_FIELD  # noqa: E402
+from hitl.schema import (  # noqa: E402
+    NOTICE_FIELD, STATUS_CANCELLED, Action, HumanRequirement, WIRE_FIELD)
 
 ROOM = "!room:ag2.space"
 T0 = 1_000_000.0
@@ -100,7 +101,10 @@ class RenotifyTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["op"], "message")
         self.assertNotIn("event_id", sent[0])  # not an edit of the card
-        self.assertNotIn("extra_content", sent[0])
+        self.assertNotIn(WIRE_FIELD, sent[0]["extra_content"])  # never a second card
+        self.assertEqual(sent[0]["extra_content"][NOTICE_FIELD],
+                         {"notice": "reminder", "ids": [req.id], "runtime": "claude",
+                          "host": req.wire_device().get("host") or ""})
         self.assertIn("Still blocked after 31m", sent[0]["body"])
         self.assertIn("2 tasks are waiting", sent[0]["body"])
 
@@ -166,6 +170,8 @@ class RenotifyTests(unittest.TestCase):
         self.assertEqual(len(messages), 1, [m["body"] for m in messages])
         self.assertEqual(messages[0]["body"],
                          "✓ Cleared — worker pro-dev · blocked-human; Sutando has continued its work.")
+        notice = messages[0]["extra_content"][NOTICE_FIELD]
+        self.assertEqual((notice["notice"], sorted(notice["ids"])), ("recovery", sorted(ids)))
         self.assertTrue(all(self.mgr.store.projection(i).get("recovered") for i in ids))
         self.clock.advance(7 * HOUR)
         self.assertEqual(self.drive(), [])

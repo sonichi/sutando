@@ -109,7 +109,8 @@ class ProjectorTests(unittest.TestCase):
         project(self.mgr, self.send, ROOM)
         self.mgr.resolve(req.id)
         project(self.mgr, self.send, ROOM)
-        ops = [(p["op"], p.get("event_id")) for p in self.send.sent if "extra_content" in p]
+        ops = [(p["op"], p.get("event_id")) for p in self.send.sent
+               if WIRE_FIELD in p.get("extra_content", {})]
         self.assertEqual(ops, [("message", None), ("edit", "$ev1"), ("edit", "$ev1")])
 
     def test_fallback_body_terminal_states(self):
