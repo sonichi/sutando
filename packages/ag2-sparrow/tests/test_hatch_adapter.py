@@ -6,6 +6,7 @@ real task-field helper; `flock` and `timeout` are stubbed. Run:
 """
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -462,7 +463,9 @@ class Cli(Base):
         r = self.cli("verify")
         self.assertEqual(r.returncode, 1)
         self.assertIn("FAIL sparrow:", r.stdout)
-        self.assertIn("last written 600s ago", r.stdout)
+        age = re.search(r"last written (\d+)s ago", r.stdout)
+        self.assertIsNotNone(age, r.stdout)
+        self.assertTrue(600 <= int(age.group(1)) <= 605, r.stdout)
         self.sparrow_status(connected=False, error="auth rejected HTTP 401")
         r = self.cli("verify")
         self.assertEqual(r.returncode, 1)
