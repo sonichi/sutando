@@ -827,12 +827,14 @@ def main():
     idle_ticks = 0
     prev_pane = None
     clock = (None, None, None)
+    last_runtime = None  # a failed tmux read keeps the last runtime, not "claude"
     state_dir = os.path.dirname(os.path.abspath(a.out))
     workspace = _Path(os.path.dirname(state_dir))
     while True:
         pane = capture(a.socket, a.session)
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
-        runtime = session_runtime(a.socket, a.session)
+        runtime = session_runtime(a.socket, a.session) or last_runtime
+        last_runtime = runtime
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
