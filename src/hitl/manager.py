@@ -123,11 +123,13 @@ class HitlStore:
         if not self.valid_id(req_id):
             return {}  # a wire-supplied id that is not ours: no record, never an error
         p = self._path(req_id)
-        if not p.exists():
-            p = self.archive_root / p.name  # a late click on an old card is "already answered"
-            if not p.exists():
-                return {}
-        return json.loads(p.read_text())
+        # Live first, then the archive: a record may be moved between the two reads.
+        for candidate in (p, self.archive_root / p.name):
+            try:
+                return json.loads(candidate.read_text())
+            except (FileNotFoundError, NotADirectoryError):
+                continue  # a broken archive dir reads as "no archived copy"
+        return {}
 
     def archive(self, req_id: str) -> bool:
         """Move a record out of the live set, atomically, under the store lock."""
@@ -154,6 +156,8 @@ class HitlStore:
         for p in sorted(self.root.glob("hitl_*.json")):
             try:
                 out.append(_req_from_dict(json.loads(p.read_text())["requirement"]))
+            except FileNotFoundError:
+                continue  # archived mid-scan: moved, not unreadable
             except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
                 skipped.append(p.name)
         # An empty store reads as "nothing needs the human", so a dropped
@@ -255,7 +259,8 @@ class HitlManager:
     def link_blocked_task(self, req_id: str, task_id: str) -> None:
         with self.store.locked():
             req = self.store.load(req_id)
-            if req is None or task_id in req.blocked_task_ids:
+            # A terminal record resumes nothing, and saving it would revive an archived one.
+            if req is None or req.terminal or task_id in req.blocked_task_ids:
                 return
             req.blocked_task_ids.append(task_id)
             self.store.save(req)

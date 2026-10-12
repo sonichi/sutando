@@ -278,6 +278,92 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(self.live(), [])
         self.assertIsNotNone(self.mgr.get(req.id))
 
+    def test_a_failed_archive_never_blocks_delivery(self):
+        settled = self.settled()
+        self.mgr.store.archive_root.write_text("not a dir")
+        card = self.mgr.create(make_req(kind="choice", guard="g2"))
+        with self.assertLogs("hitl.projector", level="WARNING"):
+            self.assertEqual(pending_ids(self.mgr), [card.id])
+        self.assertEqual(self.live(), sorted([settled.id, card.id]))
+
+    def archive_on_first_read(self, req_id):
+        """Read the live file only after another writer has archived it."""
+        live, real, store = self.root / f"{req_id}.json", Path.read_text, self.mgr.store
+
+        def read_text(path, *a, **kw):
+            if path == live and path.exists():
+                store.archive(req_id)
+            return real(path, *a, **kw)
+        return mock.patch.object(Path, "read_text", read_text)
+
+    def test_load_survives_an_archive_between_check_and_read(self):
+        req = self.settled()
+        with self.archive_on_first_read(req.id):
+            got = self.mgr.get(req.id)
+        self.assertEqual(got.status, STATUS_RESOLVED)
+        self.assertEqual(self.live(), [])
+
+    def test_all_treats_a_mid_scan_archive_as_moved(self):
+        req = self.settled()
+        with self.archive_on_first_read(req.id), self.assertNoLogs("hitl.store"):
+            self.assertEqual(self.mgr.store.all(), [])
+        self.assertEqual(self.mgr.store.last_skipped, ())
+
+    def test_archive_if_settled_refuses_an_open_record(self):
+        req = self.mgr.create(make_req(kind="choice"))
+        project(self.mgr, self.send, ROOM)
+        self.assertFalse(self.mgr.archive_if_settled(req.id, time.time()))
+        self.assertEqual(self.live(), [req.id])
+
+    def test_archive_if_settled_refuses_an_owed_edit(self):
+        req = self.mgr.create(make_req(kind="choice"))
+        project(self.mgr, self.send, ROOM)
+        self.mgr.resolve(req.id)
+        self.assertFalse(self.mgr.archive_if_settled(req.id, time.time()))
+        self.assertEqual(self.live(), [req.id])
+
+    def test_archive_if_settled_refuses_an_owed_recovery(self):
+        req = self.mgr.create(make_req(kind="auth"))
+        project(self.mgr, self.send, ROOM)
+        self.mgr.resolve(req.id)
+        self.mgr.record_projection(req.id, self.mgr.get(req.id).revision, None)
+        self.assertFalse(self.mgr.needs_projection(req.id))
+        self.assertFalse(self.mgr.archive_if_settled(req.id, time.time()))
+        self.assertEqual(self.live(), [req.id])
+
+    def test_cancelled_and_expired_are_archived(self):
+        a = self.mgr.create(make_req(kind="choice", guard="ga"))
+        b = self.mgr.create(make_req(kind="choice", guard="gb"))
+        project(self.mgr, self.send, ROOM)
+        self.mgr.cancel(a.id)
+        self.mgr.expire(b.id)
+        project(self.mgr, self.send, ROOM)
+        self.assertEqual(pending_ids(self.mgr), [])
+        self.assertEqual(self.live(), [])
+        self.assertEqual(self.mgr.get(a.id).status, "cancelled")
+        self.assertEqual(self.mgr.get(b.id).status, "expired")
+
+    def test_recovery_owed_beside_an_open_sibling_stays(self):
+        a = self.mgr.create(make_req(kind="core-blocked", guard="ga"))
+        b = self.mgr.create(make_req(kind="core-blocked", guard="gb"))
+        project(self.mgr, self.send, ROOM)
+        self.mgr.resolve(a.id)
+        project(self.mgr, self.send, ROOM)
+        self.assertFalse(self.mgr.needs_projection(a.id))
+        pending_ids(self.mgr)
+        self.assertEqual(self.live(), sorted([a.id, b.id]))
+        self.mgr.resolve(b.id)
+        project(self.mgr, self.send, ROOM)  # b's edit, then one recovery for the seat
+        self.assertEqual(pending_ids(self.mgr), [])
+        self.assertEqual(self.live(), [])
+
+    def test_linking_a_task_never_revives_an_archived_record(self):
+        req = self.settled()
+        pending_ids(self.mgr)
+        self.mgr.link_blocked_task(req.id, "task-late")
+        self.assertEqual(self.live(), [])
+        self.assertNotIn("task-late", self.mgr.get(req.id).blocked_task_ids)
+
 
 if __name__ == "__main__":
     unittest.main()
