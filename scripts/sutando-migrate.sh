@@ -1822,8 +1822,8 @@ commit_main() {
     fi  # DELETE_SOURCE gate for slug-rename bridge
 
     # Hook bridge — Option D from owner's #design 2026-06-07 design discussion.
-    # Auto-re-install Sutando-owned hooks into the per-runtime CLAUDE_CONFIG_DIR/settings.json
-    # and print a notice listing any third-party hooks that referenced
+    # Sutando-owned hooks register at core launch, so this only prints a notice
+    # listing any third-party hooks that referenced
     # ~/.claude/hooks/... paths (which can't move automatically). See
     # scripts/sutando-config-hooks.sh header for the full rationale.
     # Opt out with --no-hook-bridge.
@@ -1845,9 +1845,6 @@ commit_main() {
             if [ -n "$_new_ccd" ]; then
                 echo
                 echo "sutando-migrate: bridging hooks via sutando-config-hooks.sh ..."
-                # Idempotent install of catchup hook; project hooks are repo-level (already in repo's .claude/settings.json).
-                bash "$_hook_helper" install "$_new_settings" --with-catchup-hook || \
-                    echo "  hook install: failed (rc=$?) — re-run manually: bash scripts/sutando-config-hooks.sh install \"$_new_settings\"" >&2
                 # Show dropped third-party hooks (non-Sutando) the user needs to re-add.
                 bash "$_hook_helper" migration-notice "$_old_settings" "$_new_settings" || true
             else

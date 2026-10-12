@@ -473,14 +473,8 @@ fi
 # still there as a fallback (mentioned in README).
 bash "$REPO/scripts/install-git-hooks.sh" >/dev/null 2>&1 || true
 
-# Wire the SessionStart hook that reminds the core agent to run /schedule-crons
-# on every session start (including post-compaction). Idempotent — safe to run
-# on every start. Crons are session-only, so without this, recurring jobs go
-# dark whenever a session restarts without an explicit /schedule-crons invocation.
-bash "$REPO/scripts/install-session-start-hook.sh" 2>&1 || true
-
-# PERSONAL_CLAUDE.md compaction-reinject hook is Claude-only policy — wired
-# at src/agent/claude/cli/start-cli.sh, the Claude launch chokepoint, not here.
+# The Claude SessionStart hints (schedule-crons, PERSONAL_CLAUDE re-inject, watcher
+# re-arm) register in the core's launch settings, src/agent/claude/cli/session-launch.sh.
 
 # The sentinel is NOT cleared here. This runs ~850 lines before the
 # `exec start-cli.sh` below, which clears it once a core is verified live.

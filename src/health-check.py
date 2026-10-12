@@ -9969,80 +9969,29 @@ def apply_task_watcher_sentinel_fix(checks: list, stream=None) -> None:
             c.update(fresh)
 
 
-# The one owned hook whose effect leaves the workspace; excluded from unattended repair.
-_TRANSCRIPT_ARCHIVE_HOOK = "PreCompact:sutando-conversations/"
-_TRANSCRIPT_ARCHIVE_FAMILY = "sutando-conversations/"
-
-
 def apply_claude_hooks_fix(checks: list, stream=None) -> None:
-    """--fix dispatch for claude-hooks: warn-level, so it never reaches the issues
-    loop and needs its own pass (same shape as the task-watcher one).
+    """--fix for claude-hooks: sweep owned copies out of the project/config settings files.
 
-    An app update replaces the engine tree and strips settings.json back to
-    SessionStart alone, which silently disables `PreCompact -> session-handoff.sh`
-    until a human reads the warn and re-runs the installer. Detecting that has
-    never been the gap; repairing it was.
-
-    Keys on `_unregistered_hooks`, not the detail text. The check is RE-RUN rather
-    than assumed repaired — a fixer's self-report is not evidence of the result.
-
-    Scoped: the ~/Desktop transcript archiver is the one owned hook whose effect
-    leaves the workspace, and the dominant caller of `--fix` is an unattended
-    30-minute Timer in Sutando.app (`src/Sutando/main.swift`), not a terminal. A
-    routine timer must not make that egress decision, so it is left to explicit
-    opt-in and its absence keeps warning.
+    Only once the live core's launch record carries every hook: until then those copies are
+    the running core's hooks. The probe is re-run rather than trusting the sweep's report.
     """
     out = stream if stream is not None else sys.stdout
     for c in checks:
-        if c["name"] != "claude-hooks" or not (c.get("_unregistered_hooks") or c.get("_dead_hooks")):
+        if c["name"] != "claude-hooks" or not c.get("_project_leftovers"):
             continue
-        for rec in c.get("_dead_hooks") or []:
-            owner_script = _HOOK_FAMILY_INSTALLERS.get(str(rec.get("family")))
-            if not owner_script:
-                print(f"  {c['name']}: not repairing dead {rec.get('event')} hook "
-                      f"{rec.get('path')} — not a family a Sutando installer owns", file=out)
-                continue
-        for owner_script in sorted({_HOOK_FAMILY_INSTALLERS[r["family"]]
-                                    for r in c.get("_dead_hooks") or []
-                                    if r.get("family") in _HOOK_FAMILY_INSTALLERS}):
-            print(f"  {c['name']}: pruning dead entries via {Path(owner_script).name}", file=out)
-            try:
-                proc = subprocess.run(["bash", str(REPO_DIR / owner_script)],
-                                      capture_output=True, text=True, timeout=60)
-                emitted = (proc.stdout or "") + (proc.stderr or "")
-                lines = [ln for ln in emitted.splitlines() if ln.strip()]
-                print(f"  {c['name']}: " + (lines[-1].strip() if lines
-                                           else f"installer exited {proc.returncode}"), file=out)
-            except Exception as exc:  # noqa: BLE001 — a failed repair must warn, not raise
-                print(f"  {c['name']}: could not run {Path(owner_script).name} ({exc})", file=out)
-        if not c.get("_unregistered_hooks"):
-            fresh = check_claude_hook_registration()
-            c.clear()
-            c.update(fresh)
+        if not c.get("_live_core_has_launch_hooks"):
+            print(f"  {c['name']}: not swept — the running core still depends on those copies; "
+                  "the next core launch removes them", file=out)
             continue
-        installer = REPO_DIR / "src" / "install-claude-hooks.sh"
-        # Sutando.app runs `--fix` on a 30-minute Timer, so this repair is normally
-        # unattended: it may restore only hooks whose effects stay in the workspace.
-        scoped = [h for h in c["_unregistered_hooks"] if h != _TRANSCRIPT_ARCHIVE_HOOK]
-        if not scoped:
-            print(f"  {c['name']}: not repairing — the only unregistered hook copies full "
-                  f"transcripts to ~/Desktop. Opt in with `bash src/{installer.name}`",
-                  file=out)
-            continue
-        print(f"  {c['name']}: repairing {', '.join(scoped)} via {installer.name}"
-              + (f" (leaving {_TRANSCRIPT_ARCHIVE_HOOK} to explicit opt-in)"
-                 if len(scoped) != len(c["_unregistered_hooks"]) else ""), file=out)
+        sweeper = REPO_DIR / "src" / "install-claude-hooks.sh"
+        print(f"  {c['name']}: sweeping {len(c['_project_leftovers'])} owned entr"
+              f"{'y' if len(c['_project_leftovers']) == 1 else 'ies'} via {sweeper.name}", file=out)
         try:
-            proc = subprocess.run(
-                ["bash", str(installer)],
-                capture_output=True, text=True, timeout=60,
-                env={**os.environ, "SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE": "1"},
-            )
-            emitted = (proc.stdout or "") + (proc.stderr or "")
-            lines = [ln for ln in emitted.splitlines() if ln.strip()]
-            msg = lines[-1].strip() if lines else f"installer exited {proc.returncode}"
+            proc = subprocess.run(["bash", str(sweeper)], capture_output=True, text=True, timeout=60)
+            lines = [ln for ln in ((proc.stdout or "") + (proc.stderr or "")).splitlines() if ln.strip()]
+            msg = lines[-1].strip() if lines else f"sweep exited {proc.returncode}"
         except Exception as exc:  # noqa: BLE001 — a failed repair must warn, not raise
-            msg = f"could not run install-claude-hooks.sh ({exc})"
+            msg = f"could not run {sweeper.name} ({exc})"
         print(f"  {c['name']}: {msg}", file=out)
         fresh = check_claude_hook_registration()
         c.clear()
@@ -11633,154 +11582,6 @@ def _as_list(value) -> list:
 #: before writing them into settings.json. Reading HOOKS as literal source text means
 #: the substitution is still unevaluated, so the path is welded into a token like
 #: `$(shq` + `<path>)` and never compares equal to anything.
-_SHQ_CALL = re.compile(r"\$\(\s*shq\s+(\"[^\"]*\"|'[^']*'|[^)]*)\)")
-
-
-def _unwrap_installer_command(command: str) -> str:
-    """Reduce an installer HOOKS command template to the shape it actually WRITES.
-
-    The template is bash SOURCE, not the stored command. `bash $(shq "$REPO_DIR/x.sh")`
-    is written to settings.json as `bash /abs/path/x.sh`, so comparing against the raw
-    source can never match — which is exactly how every production hook slipped past
-    the positional check and into a permissive fallback.
-    """
-    # Re-quote rather than inline raw: `shq` IS shell-quoting, and a repo path
-    # containing a space would otherwise split across tokens and fail closed on a
-    # perfectly healthy host — which is the whole reason the installer uses shq.
-    out = _SHQ_CALL.sub(lambda m: shlex.quote(m.group(1).strip("\"'")), command)
-    # The array literal is itself quoted in shell, so inner quotes arrive escaped.
-    out = out.replace('\\"', '"').replace("\\$", "$")
-    # The HOOKS entry is a quoted shell string, so parsing it strips the entry's
-    # own closing quote and leaves the backslash that escaped it dangling. That
-    # makes shlex raise and drop us into the whitespace fallback, where a token
-    # keeps a stray opening quote and no comparison can match — it cost a GENUINE
-    # archive hook a false warning. The dangling backslash WAS that closing quote,
-    # so restore it rather than deleting it: deleting leaves the quote unbalanced,
-    # which is the same failure one step later.
-    if out.endswith("\\") and not out.endswith("\\\\"):
-        out = out[:-1] + '"'
-    return out
-
-
-def _shell_tokens(command: str) -> list:
-    """Shell-split, degrading to whitespace split on unbalanced quoting.
-
-    The fallback keeps surrounding quotes on each token, so tokens are normalized
-    either way — otherwise a comparison silently depends on WHICH split path ran.
-    """
-    try:
-        toks = shlex.split(command)
-    except ValueError:  # a hand-edited settings file can be unquotable
-        toks = command.split()
-    out = []
-    for tok in toks:
-        if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
-            tok = tok[1:-1]
-        out.append(tok)
-    return out
-
-
-def _same_path(a: str, b_norm: str, b_real: str) -> bool:
-    a = os.path.expanduser(a)
-    if not os.path.isabs(a):
-        # Unresolvable without knowing the hook's cwd, so it never counts as a
-        # match: unprovable identity warns, like every other branch here.
-        return False
-    return os.path.normpath(a) == b_norm or os.path.realpath(a) == b_real
-
-
-def _hook_command_targets(command: str, expected, owned_cmd: str, marker: str = "") -> bool:
-    """Does this command INVOKE `expected` — not merely mention it, not merely contain it?
-
-    Two false-cleans this has to reject, both found in review, both of which let a
-    stale or replaced hook keep the probe green:
-
-    1. **Substring containment is not checkout identity.** `/tmp/sutando` is a
-       substring of `/tmp/sutando-old/src/check-pending-tasks.sh`, so `str(repo) in
-       command` certifies a sibling checkout as this one.
-    2. **A path in argument position is not an invocation.** Scanning every absolute
-       token accepts `echo <path>`, `printf "%s" <path>`, and
-       `bash /tmp/other.sh <path>` — the expected script appears as inert data while
-       something else entirely runs.
-
-    So the comparison is positional, against the command the INSTALLER itself writes
-    (the third field of its `HOOKS` entry). The installer stays the single source of
-    truth for the command shape exactly as it already is for the hook list: whatever
-    interpreter it uses, and whichever position it puts its script in, is what a
-    registered hook must match. Leading tokens must agree, so `echo` cannot stand in
-    for `bash`, and the script position must be the same path.
-    """
-    owned = _shell_tokens(_unwrap_installer_command(owned_cmd))
-    got = _shell_tokens(command)
-    if not owned or not got:
-        return False
-
-    # PROGRAM CHECK — applies to EVERY owned hook, not just repo-relative ones.
-    # This was previously skipped for markers that are not `src/` paths, on the
-    # reasoning that a non-repo path has no identity to compare. That conflated
-    # path identity with command-shape validation: the archive hook still has an
-    # installer-owned shape, and `echo` is not `cp`. With only the substring test,
-    # BOTH of these certified as a healthy archive hook:
-    #     echo sutando-conversations/
-    #     rm -rf sutando-conversations/
-    # The second is the one that settles it — a destructive command reported as a
-    # working archiver is the opposite of what this probe is for.
-    if got[0] != owned[0]:
-        return False
-
-    if expected is None:
-        # Marker is not repo-relative (the archive hook writes outside the repo),
-        # so there is no repo path to compare positionally. Program alone is NOT
-        # enough: `cp /tmp/other "$HOME/Desktop/sutando-conversations/x"` and
-        # `cp "$TRANSCRIPT_PATH" /tmp/sutando-conversations/y` both pass a program
-        # check while archiving the wrong thing, or to the wrong place.
-        #
-        # An earlier revision of this comment called that an intentional
-        # "compatibility boundary", on the reasoning that the installer preserves
-        # operator-customized archive hooks. That reasoning was WRONG, and it is
-        # worth recording why, because it read as principled: Phase 0 does skip
-        # sweeping a custom archiver (install-claude-hooks.sh:170-185), but Phase 1
-        # detects presence by EXACT command-string match — `index($cmd)` at :262 —
-        # so a custom `cp` never satisfies it and the installer ADDS its own
-        # command alongside. The two COEXIST. On any host where the installer has
-        # run, its own command is therefore present, and this probe should say so.
-        #
-        # Compared: the program, the SOURCE argument the installer writes, and the
-        # destination prefix up through the marker. Everything after the marker is
-        # free — that is where the installer's own $(date …) filename varies, so
-        # pinning it would warn on healthy hosts.
-        d_idx = next((i for i, tok in enumerate(owned) if marker and marker in tok), None)
-        if len(owned) < 2 or d_idx is None:
-            return False
-        # POSITION and ARITY, not "the prefix appears somewhere". Accepting the
-        # prefix in any token certified a three-operand
-        #     cp "$TRANSCRIPT_PATH" /tmp/not-the-archive ".../sutando-conversations/x"
-        # which cp treats as two SOURCES and a destination — and which fails at
-        # runtime unless that last path is a directory, so nothing is archived while
-        # the probe reports clean. The installer writes exactly program/source/dest
-        # and Phase 1 requires that exact string, so anything of a different arity
-        # is not the command it installs.
-        if len(got) != len(owned) or got[1] != owned[1]:
-            return False
-        prefix = owned[d_idx][: owned[d_idx].index(marker) + len(marker)]
-        return got[d_idx].startswith(prefix)
-
-    want = os.path.normpath(os.path.expanduser(str(expected)))
-    want_real = os.path.realpath(want)
-    idx = next((i for i, t in enumerate(owned) if _same_path(t, want, want_real)), None)
-    if idx is None:
-        # FAIL CLOSED. This branch used to accept the path anywhere in the first two
-        # tokens, which read as a safe fallback and was not: the real installer writes
-        # `bash $(shq "$REPO_DIR/x.sh")`, so before the unwrap above NO production hook
-        # resolved positionally and EVERY one landed here — making `echo <path>` count
-        # as registered on the only path that ships. A fallback that the real data
-        # always takes is not a fallback, it is the behaviour.
-        return False
-    if len(got) <= idx:
-        return False
-    return _same_path(got[idx], want, want_real) and got[:idx] == owned[:idx]
-
-
 def check_vault_manifest_integrity(
     manifest_path: Optional[Path] = None,
     keychain_probe: Optional[Callable[[str, str], bool]] = None,
@@ -11935,248 +11736,109 @@ def check_vault_manifest_integrity(
     }
 
 
-def _hook_script_path(command: str) -> Optional[str]:
-    """The script a hook command runs; the installer module owns the parse, this is a fallback."""
+def _core_launch_settings(repo: Path) -> tuple[Optional[dict], str]:
+    """The core's --settings JSON as session-launch.sh builds it, or (None, why not)."""
+    builder = repo / "src" / "agent" / "claude" / "cli" / "build-core-settings.mjs"
+    node = shutil.which("node")
+    if not node:
+        return None, "node not found — the core launches with no Sutando hooks"
+    import skill_hooks
     try:
-        sys.path.insert(0, str(REPO_DIR / "src"))
-        from claude_hooks_settings import script_path_of
-        return script_path_of(command)
-    except Exception:  # noqa: BLE001 — an older checkout without the module still gets a probe
-        parts = command.split()
-        for i, tok in enumerate(parts):
-            if tok in ("bash", "sh", "python3", "python", "node"):
-                return parts[i + 1].strip("'\"") if i + 1 < len(parts) else None
-        return parts[0].strip("'\"") if parts else None
+        rows = skill_hooks.as_json(repo)
+    except Exception as exc:  # noqa: BLE001 — must warn, not abort the later probes
+        return None, f"skill-hook discovery failed ({exc}); skill hooks would not register"
+    try:
+        proc = subprocess.run(
+            [node, str(builder), str(repo / "hooks" / "skip-ask-user-question.py"), "",
+             "--owned-hooks", str(repo), "--skill-hooks", rows],
+            capture_output=True, text=True, timeout=30)
+        settings = json.loads(proc.stdout) if proc.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return None, f"build-core-settings.mjs failed ({exc})"
+    if not isinstance(settings, dict):
+        return None, f"build-core-settings.mjs exited {proc.returncode}: {(proc.stderr or '').strip()[:200]}"
+    return settings, ""
 
 
-def _runs_a_script(command: str) -> bool:
-    """True when the command hands a script FILE to an interpreter (bash/sh/python/node).
-
-    `bash -c '…'` runs inline text, not a file, and a command carrying an unexpanded `$VAR`
-    cannot be judged by path existence; both are skipped rather than read as dead.
-    """
-    parts = command.split()
-    if len(parts) < 2 or Path(parts[0]).name not in ("bash", "sh", "zsh", "python", "python3", "node"):
-        return False
-    return not parts[1].startswith("-") and "$" not in command
-
-
-#: Which installer re-adds (and, since it prunes, repairs) each Sutando-owned hook family.
-_HOOK_FAMILY_INSTALLERS = {
-    "personal-claude-compact-hint.sh": "scripts/install-personal-claude-hook.sh",
-    "schedule-crons-session-hint.sh": "scripts/install-session-start-hook.sh",
-    "watcher-rearm-session-hint.sh": "scripts/install-watcher-rearm-hook.sh",
-}
+def _fmt_records(records) -> str:
+    shown = sorted(records)[:4]
+    more = f", +{len(records) - 4} more" if len(records) > 4 else ""
+    return ", ".join(f"{e}[{m}]:{c}" for e, m, c in shown) + more
 
 
 def check_claude_hook_registration(
     repo_dir: Optional[Path] = None,
+    config_dir: Optional[Path] = None,
+    workspace_dir: Optional[Path] = None,
 ) -> dict:
-    """Are the Claude Code hooks `install-claude-hooks.sh` owns actually registered?
+    """Does the live core's launch carry every Sutando hook, and no settings file a copy?
 
-    Nothing checked this before. On 2026-08-03 this host was found with **zero of
-    the four owned hooks** in the installer's own target — including both PreCompact
-    entries, so `session-state.md` was never regenerated on compaction and the
-    transcript archiver had never run at all. It had been that way for days, silently,
-    because no probe looks at hook registration. A peer host showed the same shape.
-
-    The owned list is READ FROM THE INSTALLER's `HOOKS=(...)` array rather than
-    duplicated here: a second copy would drift from the script that does the
-    installing, and a stale allow-list is how a probe starts lying. Same reason the
-    target file is read from its `SETTINGS=` line instead of being assumed.
-
-    Fails toward NOISE, never toward a false clean:
-      * installer absent          -> ok, not a sutando checkout (nothing to verify)
-      * HOOKS array unparseable   -> WARN. A parse that yields zero hooks would
-                                     otherwise report "all registered" over an empty
-                                     population, which is the exact shape of a probe
-                                     that cannot fail.
-      * settings.json absent      -> warn (installer has never run here)
-      * settings.json malformed   -> warn, never raise
-      * a hook registered but its command points at a DIFFERENT checkout -> warn.
-        This host had a SessionEnd entry aimed at a five-day-old `Desktop/sutando`
-        copy, so fixes to the live script never executed — present-but-wrong is the
-        failure that looks healthiest.
+    The launch JSON is the only registration; a copy left in a project or config-dir
+    settings file fires in sessions Sutando did not start, or twice in the core.
     """
     name = "claude-hooks"
-    repo = Path(repo_dir or REPO_DIR)
-    installer = repo / "src" / "install-claude-hooks.sh"
-    if not installer.is_file():
-        return {"name": name, "status": "ok", "detail": "no install-claude-hooks.sh — not a sutando checkout"}
+    repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
+    if not (repo / "src" / "agent" / "claude" / "cli" / "build-core-settings.mjs").is_file():
+        return {"name": name, "status": "ok", "detail": "no build-core-settings.mjs — not a sutando checkout"}
+    import claude_hooks_settings as chs
+    problems: list[str] = []
+    settings, why = _core_launch_settings(repo)
+    registered: set = set()
     try:
-        src = installer.read_text(errors="ignore")
-    except OSError as exc:
-        return {"name": name, "status": "warn", "detail": f"cannot read installer ({exc})"}
-
-    m = re.search(r"^HOOKS=\((.*?)^\)", src, re.M | re.S)
-    owned = []
-    if m:
-        for line in m.group(1).split("\n"):
-            line = line.strip()
-            if not line.startswith('"'):
-                continue
-            parts = line.strip('"').split("|", 2)
-            if len(parts) == 3:
-                # third field is the command the installer WRITES — kept so the probe
-                # compares against the real command shape rather than guessing one.
-                owned.append((parts[0], parts[1], parts[2]))
-    if not owned:
-        return {"name": name, "status": "warn",
-                "detail": "could not parse HOOKS=(...) from install-claude-hooks.sh — "
-                          "cannot verify registration (reporting rather than assuming clean)"}
-
-    # Skill-declared hooks are appended to HOOKS at run time, so the static parse
-    # above cannot see them. Same discovery the installer uses — a second copy here
-    # would drift and quietly stop verifying whatever the installer registered.
-    try:
-        sys.path.insert(0, str(repo / "src"))
-        from skill_hooks import discover as _discover_skill_hooks
-        # [:3] — the 4th field is the prior command, which only the installer's
-        # migration sweep uses; `owned` also holds 3-tuples parsed from the script.
-        owned.extend(r[:3] for r in _discover_skill_hooks(repo))
-    except Exception as exc:
-        return {"name": name, "status": "warn",
-                "detail": f"skill-hook discovery failed ({exc}) — "
-                          f"cannot verify skill-declared hooks"}
-
-    sm = re.search(r'^SETTINGS="([^"]+)"', src, re.M)
-    settings = Path(sm.group(1).replace("$REPO_DIR", str(repo))) if sm else repo / ".claude" / "settings.json"
-    if not settings.is_file():
-        return {"name": name, "status": "warn",
-                "detail": f"{settings} missing — install-claude-hooks.sh has never run here; "
-                          f"{len(owned)} hook(s) unregistered"}
-    try:
-        conf = json.loads(settings.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        return {"name": name, "status": "warn", "detail": f"{settings.name} unreadable ({exc})"}
-
-    # Parseable is not the same as well-shaped: `[]` is valid JSON, and `.get()` on it
-    # raises AttributeError, which would abort every remaining probe in run_all_checks().
-    # A malformed schema has to fail toward a warning like every other ambiguous branch.
-    if not isinstance(conf, dict):
-        return {"name": name, "status": "warn",
-                "detail": f"{settings.name} top level is {type(conf).__name__}, not an object — "
-                          f"cannot verify {len(owned)} hook(s)"}
-    hooks = conf.get("hooks")
-    if hooks is None:
-        hooks = {}
-    elif not isinstance(hooks, dict):
-        return {"name": name, "status": "warn",
-                "detail": f"{settings.name} \"hooks\" is {type(hooks).__name__}, not an object — "
-                          f"cannot verify {len(owned)} hook(s)"}
-
-    missing, foreign = [], []
-    for event, marker, owned_cmd in owned:
-        # Every container on this path is type-checked, at EVERY level. Validating
-        # only the top two left `{"hooks":{"Stop":7}}`, `{"hooks":{"Stop":[{"hooks":7}]}}`
-        # and a numeric `command` still raising TypeError straight out of the probe —
-        # and since this runs inside run_all_checks(), a raise aborts every later check.
-        # A malformed shape yields no commands, so the hook reads as unregistered: the
-        # promised warning, not a crash and not a false clean.
-        cmds = []
-        for g in _as_list(hooks.get(event)):
-            if not isinstance(g, dict):
-                continue
-            for h in _as_list(g.get("hooks")):
-                if not isinstance(h, dict):
-                    continue
-                c = h.get("command")
-                if isinstance(c, str):
-                    cmds.append(c)
-        hit = [c for c in cmds if marker in c]
-        if not hit:
-            missing.append(f"{event}:{marker}")
-        elif not any(
-            _hook_command_targets(
-                c,
-                (repo / marker) if marker.startswith("src/") else None,
-                owned_cmd.replace("$REPO_DIR", str(repo)),
-                marker,
-            )
-            for c in hit
-        ):
-            # Present, but not actually invoking this checkout's script — either aimed
-            # at another checkout or carrying the path as an inert argument.
-            foreign.append(f"{event}:{marker}")
-    # Present-but-dead is invisible to the owned-list check above: a registered hook whose
-    # script is gone fails on every fire. Relative paths resolve against the project.
-    dead: list[str] = []
-    dead_records: list[dict] = []
-    project_dir = settings.resolve().parent.parent
-    # Owned families are judged above (present / missing / foreign); the dead scan covers
-    # the rest, and only commands that run a script through an interpreter.
-    owned_families = {Path(marker).name for _e, marker, _c in owned}
-    for event, groups in hooks.items():
-        for g in _as_list(groups):
-            if not isinstance(g, dict):
-                continue
-            for h in _as_list(g.get("hooks")):
-                if not isinstance(h, dict):
-                    continue
-                cmd = str(h.get("command", ""))
-                if not _runs_a_script(cmd):
-                    continue
-                script = _hook_script_path(cmd)
-                if not script or Path(script).name in owned_families:
-                    continue
-                target = Path(script) if Path(script).is_absolute() else project_dir / script
-                if not target.exists():
-                    family = Path(script).name
-                    dead.append(f"{event}:{family} -> {script}")
-                    dead_records.append({"event": event, "command": cmd,
-                                         "path": script, "family": family})
-    if missing or foreign or dead:
-        bits = []
+        owned_expected = chs.owned_launch_records(repo)
+    except Exception as exc:  # noqa: BLE001 — must warn, not abort the later probes
+        owned_expected = set()
+        problems.append(f"owned-hooks table unreadable ({exc})")
+    if settings is None:
+        problems.append(why)
+    else:
+        registered = chs.records_in(settings)
+        missing = owned_expected - registered
         if missing:
-            bits.append(f"{len(missing)} NOT registered ({', '.join(missing)})")
+            problems.append(f"launch settings lack owned hooks: {_fmt_records(missing)}")
+        import skill_hooks
+        unreg = [f"{e}:{c}" for e, _t, c, _p in skill_hooks.discover(repo) if (e, "", c) not in registered]
+        if unreg:
+            problems.append(f"skill hooks missing from launch settings: {', '.join(unreg)}")
+        dead = sorted({p for _e, _m, c in registered for p in [chs.script_path_of(c)]
+                       if p and os.path.isabs(p) and "$" not in p and not os.path.exists(p)})
         if dead:
-            bits.append(f"{len(dead)} registered but the script no longer exists — every fire "
-                        f"fails 'No such file' ({', '.join(dead)})")
-        if foreign:
-            bits.append(f"{len(foreign)} registered but NOT running the installer's command "
-                        f"— a different program, another checkout, or the path is "
-                        f"only an argument ({', '.join(foreign)})")
-        # The bare installer registers the opt-in-only transcript archiver, so the remedy
-        # must not prescribe it when that hook is the only thing missing.
-        only_archive = bool(missing) and set(missing) == {_TRANSCRIPT_ARCHIVE_HOOK} and not foreign
-        remedy = ("that hook copies full transcripts to ~/Desktop and is left to explicit opt-in — "
-                  "it is not repaired automatically; run `bash src/install-claude-hooks.sh` only if "
-                  "you intend to enable it"
-                  if only_archive else
-                  "re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash src/install-claude-hooks.sh`")
-        # The omit flag gates DEPRECATED_HOOKS, so prescribing it skips the very pruning a
-        # foreign entry needs and reports `removed=0`, which reads as a successful run.
-        if foreign:
-            # The flag gates ONE deprecated entry (the legacy archive `cp`), not pruning
-            # at large — every other DEPRECATED_HOOKS entry is pruned with it set.
-            archive_foreign = [f for f in foreign if _TRANSCRIPT_ARCHIVE_FAMILY in f]
-            if archive_foreign:
-                remedy = ("for the archive family, do NOT pass SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 "
-                          "— that flag is what adds the legacy archive form to the prune list, so with "
-                          f"it set {', '.join(archive_foreign)} is never cleared. Run `bash "
-                          "src/install-claude-hooks.sh` plain, which also REGISTERS the ~/Desktop "
-                          "archiver: if this host does not want it, delete that one PreCompact entry "
-                          "afterwards")
-            else:
-                remedy = ("re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "
-                          "src/install-claude-hooks.sh` — the flag scopes out only the archive entry, "
-                          f"so {', '.join(foreign)} is still pruned and the ~/Desktop archiver is not "
-                          "installed. If an entry is genuinely foreign (another program or checkout) "
-                          "the installer cannot own it — remove that one by hand")
-        if dead and not missing and not foreign:
-            remedy = ("re-run the installer that owns each family — it prunes dead copies "
-                      "(`bash scripts/install-personal-claude-hook.sh`, "
-                      "`bash scripts/install-session-start-hook.sh`)")
-        result = {"name": name, "status": "warn",
-                  "detail": f"{'; '.join(bits)} in {settings} — {remedy}"}
-        if missing:
-            # Keyed structurally so --fix cannot fire on the warn branches the
-            # installer can't repair; `foreign` excluded (displacement unverified).
-            result["_unregistered_hooks"] = list(missing)
-        if dead_records:
-            result["_dead_hooks"] = dead_records
-        return result
-    return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}
+            problems.append(f"launch hooks point at missing scripts: {', '.join(dead)}")
+        if settings.get("cleanupPeriodDays") is None:
+            problems.append("launch settings do not set cleanupPeriodDays (transcripts expire after 30 days)")
+    ws = Path(workspace_dir) if workspace_dir is not None else WORKSPACE_DIR
+    live_ok = False
+    try:
+        rec = json.loads((ws / "state" / "core-launch-settings.json").read_text(encoding="utf-8"))
+        lacking = chs.launch_records(repo) - chs.records_in(rec.get("settings") or {})
+        if lacking:
+            problems.append(f"the running core was launched without {_fmt_records(lacking)} — restart the core")
+        else:
+            live_ok = bool(owned_expected)
+    except FileNotFoundError:
+        problems.append("no launch record for the running core: it predates launch-time hook "
+                        "registration, so it runs the settings-file copies until restarted")
+    except Exception as exc:  # noqa: BLE001 — a malformed record is reported, not raised
+        problems.append(f"core launch record unreadable ({exc})")
+    leftovers: list[str] = []
+    targets = chs.default_targets(repo)
+    ccd = Path(config_dir) / "settings.json" if config_dir is not None else chs.core_config_settings(repo)
+    if ccd is not None:
+        targets.append(ccd)
+    try:
+        owned = chs.emitted_records(repo)
+        for target in targets:
+            leftovers += [f"{target}: {e} {c}" for e, c in chs.sweep_file(target, owned, dry_run=True)]
+    except Exception as exc:  # noqa: BLE001 — a malformed settings file is reported, not raised
+        problems.append(f"could not read a settings file to check for stale copies ({exc})")
+    if leftovers:
+        problems.append(f"{len(leftovers)} Sutando hook cop{'y' if len(leftovers) == 1 else 'ies'} still in a "
+                        "settings file, firing outside the core launch — the next core launch removes them")
+    if problems:
+        return {"name": name, "status": "warn", "detail": "; ".join(problems),
+                "_project_leftovers": leftovers, "_live_core_has_launch_hooks": live_ok}
+    return {"name": name, "status": "ok",
+            "detail": f"{len(registered)} hooks registered by the core's launch settings only"}
 
 
 def check_comm_sweep_freshness(

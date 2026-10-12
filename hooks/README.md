@@ -168,8 +168,8 @@ if/when the connector's scopes are fixed upstream). Fail-OPEN on hook errors.
 JSON. Nothing to install per node.
 
 The registration rides `--settings` rather than a written `settings.json`, so it
-survives an app update that replaces the engine tree (the failure mode issue
-#3221 describes for the `install-claude-hooks.sh` set).
+survives an app update that replaces the engine tree. Every Sutando-owned hook
+now registers this way (`--owned-hooks`, `--skill-hooks`); none is written to a settings file.
 
 To register it in a non-core session (e.g. an interactive Claude Code), add the
 same `PreToolUse` entry to `~/.claude/settings.json` by hand:
@@ -449,7 +449,7 @@ sp = os.path.expanduser("~/.claude/settings.json"); s = json.load(open(sp))
 # reparses it when the hook fires, so an unquoted path containing a space --
 # e.g. the app install shape ~/Library/Application Support/.../sutando -- is
 # split before _repo_root() ever sees it, and the hook goes silently INERT.
-# Same class the repo already guards in src/install-claude-hooks.sh.
+# Same class build-core-settings.mjs guards with its shq().
 hook = shlex.quote(os.path.expanduser("~/.claude/hooks/result-file-marker-guard.py"))
 cmd = f"python3 {hook} --repo {shlex.quote(os.environ['REPO'])}"
 pre = s.setdefault("hooks", {}).setdefault("PreToolUse", [])

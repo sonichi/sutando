@@ -1,12 +1,8 @@
 #!/bin/bash
 # tests/sutando-config-hooks.test.sh — E2E smoke for scripts/sutando-config-hooks.sh
 #
-# Coverage:
-#   1. detect-missing returns 1 on empty settings, 0 after install
-#   2. install is idempotent (re-run doesn't duplicate the entry)
-#   3. install --with-project-hooks adds PreCompact + Stop entries
-#   4. migration-notice flags non-Sutando hooks while filtering Sutando-owned
-#
+# Coverage: `install` / `detect-missing` are gone (Sutando hooks register at launch);
+# migration-notice flags non-Sutando hooks while filtering Sutando-owned ones.
 # Run: bash tests/sutando-config-hooks.test.sh
 # Exit: 0 = all pass, 1 = failure
 
@@ -24,31 +20,13 @@ report() {
   fi
 }
 
-# Test 1: detect-missing on empty returns 1
+# Test 1: Sutando hooks register only at core launch; this helper writes none.
 T="$(mktemp -d)"
 echo '{}' > "$T/s.json"
-bash "$SCRIPT" detect-missing "$T/s.json" >/dev/null 2>&1
-[ "$?" = "1" ]; report "$?" "detect-missing returns 1 on empty settings"
-
-# Test 2: install adds the catchup hook
-bash "$SCRIPT" install "$T/s.json" >/dev/null 2>&1
-catchup_count="$(jq '[.hooks.SessionEnd[].hooks[] | select(.command | contains("session-handoff.sh"))] | length' "$T/s.json")"
-[ "$catchup_count" -ge 1 ]; report "$?" "install adds SessionEnd catchup hook"
-
-# Test 3: detect-missing returns 0 after install
-bash "$SCRIPT" detect-missing "$T/s.json" >/dev/null 2>&1
-[ "$?" = "0" ]; report "$?" "detect-missing returns 0 after install"
-
-# Test 4: idempotent re-install (count stays at 1)
-bash "$SCRIPT" install "$T/s.json" >/dev/null 2>&1
-catchup_count_after="$(jq '[.hooks.SessionEnd[].hooks[] | select(.command | contains("session-handoff.sh"))] | length' "$T/s.json")"
-[ "$catchup_count_after" = "$catchup_count" ]; report "$?" "install is idempotent (catchup count unchanged on re-run)"
-
-# Test 5: --with-project-hooks adds PreCompact + Stop
-bash "$SCRIPT" install "$T/s.json" --with-project-hooks >/dev/null 2>&1
-precompact_count="$(jq '[.hooks.PreCompact[].hooks[]] | length' "$T/s.json" 2>/dev/null || echo 0)"
-stop_count="$(jq '[.hooks.Stop[].hooks[]] | length' "$T/s.json" 2>/dev/null || echo 0)"
-[ "$precompact_count" -ge 2 ] && [ "$stop_count" -ge 1 ]; report "$?" "--with-project-hooks adds PreCompact + Stop entries"
+for sub in install detect-missing; do
+  bash "$SCRIPT" "$sub" "$T/s.json" >/dev/null 2>&1
+  [ "$?" = "3" ] && [ "$(cat "$T/s.json")" = "{}" ]; report "$?" "$sub is gone (exit 3) and leaves the settings file untouched"
+done
 
 # Test 6: migration-notice filters Sutando hooks, flags third-party
 cat > "$T/old.json" << 'EOJ'
@@ -66,29 +44,12 @@ notice_out="$(bash "$SCRIPT" migration-notice "$T/old.json" "$T/new.json" 2>&1)"
 echo "$notice_out" | grep -q "third-party.sh"; report "$?" "migration-notice flags third-party hook"
 echo "$notice_out" | grep -qv "session-handoff.sh"; report "$?" "migration-notice filters out Sutando hook (session-handoff.sh)"
 
-# Test 7: detect-missing on non-existent file returns 1
-bash "$SCRIPT" detect-missing "$T/does-not-exist.json" >/dev/null 2>&1
-[ "$?" = "1" ]; report "$?" "detect-missing returns 1 on missing file"
-
 # Test 8: invalid subcommand exits 3
 bash "$SCRIPT" bogus-subcommand >/dev/null 2>&1
 [ "$?" = "3" ]; report "$?" "invalid subcommand exits 3"
 
-# Test 9: malformed JSON in detect-missing — explicit error + exit 1
-# (per Mini's PR #1500 review — previously this silently fell through)
-echo 'not valid json {{{' > "$T/malformed.json"
-err_out="$(bash "$SCRIPT" detect-missing "$T/malformed.json" 2>&1)"
-rc="$?"
-[ "$rc" = "1" ] && echo "$err_out" | grep -q "not valid JSON"
-report "$?" "detect-missing emits explicit error + exit 1 on malformed JSON"
-
-# Test 10: malformed JSON in install — refuses to edit
-err_out2="$(bash "$SCRIPT" install "$T/malformed.json" 2>&1)"
-rc2="$?"
-[ "$rc2" = "1" ] && echo "$err_out2" | grep -q "not valid JSON"
-report "$?" "install refuses to edit malformed JSON (exit 1)"
-
 # Test 11: malformed JSON in migration-notice — skip cleanly, exit 0
+echo 'not valid json {{{' > "$T/malformed.json"
 err_out3="$(bash "$SCRIPT" migration-notice "$T/malformed.json" "$T/new.json" 2>&1)"
 rc3="$?"
 [ "$rc3" = "0" ] && echo "$err_out3" | grep -q "malformed"
