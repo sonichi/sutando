@@ -11,7 +11,7 @@ import re
 import sys
 from pathlib import Path
 
-from ... import local_task_protocol
+from ... import gateway_instance, local_task_protocol
 
 SNIPPET_MAX = 500
 # Matrix user id: @localpart:server_name (DNS name, IPv4 or [IPv6], optional :port).
@@ -64,9 +64,18 @@ def _field(headers: dict, key: str) -> "str | None":
     return value or None
 
 
-def task_fields(task_file: Path, result_dir: Path) -> "dict | None":
+def item_id(tid: str, instance: str = "") -> "str | None":
+    """The id `instance`'s bridge delivers this task's result under, or None when the
+    task is not that instance's or not a valid task id."""
+    if not gateway_instance.owns(tid, instance):
+        return None
+    broker = gateway_instance.broker_tid(tid, instance)
+    return broker if local_task_protocol.valid_task_id(broker) else None
+
+
+def task_fields(task_file: Path, result_dir: Path, instance: str = "") -> "dict | None":
     tid = task_file.stem
-    if not local_task_protocol.valid_task_id(tid):
+    if item_id(tid, instance) is None:
         return None
     try:
         text = task_file.read_text(encoding="utf-8", errors="replace")
@@ -92,7 +101,7 @@ def task_fields(task_file: Path, result_dir: Path) -> "dict | None":
     }
 
 
-def list_open_tasks(task_dir: Path, result_dir: Path) -> list:
+def list_open_tasks(task_dir: Path, result_dir: Path, instance: str = "") -> list:
     """Task files with no result yet, oldest first."""
     def mtime(p: Path) -> float:
         try:
@@ -104,7 +113,7 @@ def list_open_tasks(task_dir: Path, result_dir: Path) -> list:
     for path in sorted(task_dir.glob("task-*.txt"), key=lambda p: (mtime(p), p.name)):
         if (result_dir / path.name).exists():
             continue
-        item = task_fields(path, result_dir)
+        item = task_fields(path, result_dir, instance)
         if item is not None:
             items.append(item)
     return items
@@ -115,6 +124,7 @@ def main(argv=None) -> int:
     ap.add_argument("--task-dir", required=True, type=Path)
     ap.add_argument("--result-dir", required=True, type=Path)
     ap.add_argument("--agent", help="exit %d unless this is a valid MXID" % EXIT_BAD_AGENT)
+    ap.add_argument("--gateway-instance", default="", help="list only this instance's tasks")
     args = ap.parse_args(argv)
     if args.agent is not None and not valid_mxid(args.agent):
         print(f"not an MXID: {args.agent!r}", file=sys.stderr)
@@ -122,7 +132,7 @@ def main(argv=None) -> int:
     if not args.task_dir.is_dir():
         print(f"task dir not found: {args.task_dir}", file=sys.stderr)
         return 2
-    json.dump(list_open_tasks(args.task_dir, args.result_dir), sys.stdout)
+    json.dump(list_open_tasks(args.task_dir, args.result_dir, args.gateway_instance), sys.stdout)
     sys.stdout.write("\n")
     return 0
 

@@ -23,9 +23,9 @@ import time
 from importlib import resources
 from pathlib import Path
 
-from ... import _dirs, local_task_protocol, outbox
+from ... import _dirs, gateway_instance, outbox
 from ...result_markers import parse_markers
-from .task_fields import valid_mxid
+from .task_fields import item_id, valid_mxid
 
 HOOK_ID = "ag2-sparrow-hatch"
 SCRIPT_NAME = f"{HOOK_ID}.sh"
@@ -37,8 +37,7 @@ SPARROW_STATUS_MAX_AGE_S = 180
 RELEASED_SCRIPT_SHA256 = frozenset({
     "c68a6fce020a5aaea9f5c593021daccb95aeaf15ba6962d0303e42933ee23fb7",
 })
-# Same charset as remote_gateway_bridge._INSTANCE_RE.
-INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+INSTANCE_RE = gateway_instance.INSTANCE_RE
 # `sparrow` exit codes, read by the hook; 1 stays a crash, 2 a usage error.
 SPARROW_OK, SPARROW_DOWN, SPARROW_NOT_CONNECTED = 0, 10, 11
 # The one command the hook prompt and worker_note tell a worker to run.
@@ -393,9 +392,24 @@ def _read_body(args) -> "tuple[str | None, str]":
     return body, ""
 
 
+def _claims_dir(result_dir: Path) -> Path:
+    return result_dir / ".hatch-reply-claims"
+
+
+def _prune_claims(result_dir: Path, task_dir: Path) -> None:
+    """Drop the claims of tasks Sparrow has archived; reply refuses those tasks anyway."""
+    try:
+        claims = list(_claims_dir(result_dir).iterdir())
+    except OSError:
+        return
+    for claim in claims:
+        if not (task_dir / f"{claim.name}.txt").exists():
+            claim.unlink(missing_ok=True)
+
+
 def _claim(result_dir: Path, tid: str) -> bool:
-    """One reply per task, ever: the first caller's O_EXCL claim wins."""
-    claims = result_dir / ".hatch-reply-claims"
+    """One reply per task while it is open: the first caller's O_EXCL claim wins."""
+    claims = _claims_dir(result_dir)
     claims.mkdir(mode=0o700, exist_ok=True)
     try:
         os.close(os.open(claims / tid, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
@@ -425,7 +439,11 @@ def reply(args) -> int:
     task_dir = Path(cfg.get("TASK_DIR") or _dirs.task_dir())
     result_file = Path(args.result_file).expanduser()
     tid = result_file.stem
-    if not (result_file.suffix == ".txt" and local_task_protocol.valid_task_id(tid)
+    # The instance the bridge runs as, read as install recorded it (else as the bridge reads it).
+    instance = (cfg["GATEWAY_INSTANCE"] if "GATEWAY_INSTANCE" in cfg
+                else os.environ.get("GATEWAY_INSTANCE") or "").strip()
+    item = item_id(tid, instance)
+    if not (result_file.suffix == ".txt" and item is not None
             and result_file.parent.resolve() == result_dir.resolve()):
         print(f"error: {result_file} is not a result_file from the wake payload "
               f"(task-<id>.txt in {result_dir})", file=sys.stderr)
@@ -440,8 +458,8 @@ def reply(args) -> int:
     if body is None:
         print(f"error: {why}", file=sys.stderr)
         return 2
-    # task_fields lists only plain task ids, which Sparrow's outbox keys verbatim.
-    root, item = result_dir / ".outbox", tid
+    root = gateway_instance.outbox_root(result_dir, instance)
+    _prune_claims(result_dir, task_dir)
     if (not _claim(result_dir, tid) or outbox.item_status(root, item) is not None
             or not _publish_once(result_file, body)):
         print(f"NOT posted: {result_file.name} already has a reply or result; nothing written",

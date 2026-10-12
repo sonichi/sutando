@@ -271,7 +271,9 @@ resolves them (`AGENT_CONNECT_TASK_DIR` / `AGENT_CONNECT_RESULT_DIR` /
 the same environment as Sparrow, or pass `--task-dir` / `--result-dir` /
 `--state-dir`. `GATEWAY_INSTANCE` (empty for the primary gateway) is taken from
 the environment, or from `--gateway-instance`; it names the status file the
-heartbeat and `verify` read. `--activity-file` moves the marker.
+heartbeat and `verify` read, picks which tasks the hook wakes for (a named
+instance's are `task-<instance>~<id>`), and the outbox `reply` waits on
+(`.outbox.<instance>`), both read through the bridge's own `gateway_instance` rules. `--activity-file` moves the marker.
 
 `ag2-sparrow-hatch verify` prints one `PASS` or `FAIL` line each for the hook
 script, the hook definition, the config, the task dir, Sparrow itself, the

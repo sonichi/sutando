@@ -45,7 +45,8 @@ fi
 # task_fields validates AGENT_MXID, so the hook and `install` accept the same MXIDs.
 rc=0
 items="$(timeout 25 "$PY" -m ag2_sparrow.adapters.hatch.task_fields --agent "$AGENT" \
-  --task-dir "$TASK_DIR" --result-dir "$RESULT_DIR" 2>/dev/null)" || rc=$?
+  --task-dir "$TASK_DIR" --result-dir "$RESULT_DIR" --gateway-instance "${GATEWAY_INSTANCE:-}" \
+  2>/dev/null)" || rc=$?
 if [[ "$rc" -eq 3 ]]; then
   log "ag2-sparrow-hatch not configured" '{"hint":"run: ag2-sparrow-hatch install --mxid @your-agent:ag2.space"}'
   silent "AGENT_MXID not configured; run ag2-sparrow-hatch install" '{}'

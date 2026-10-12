@@ -386,6 +386,16 @@ class HookScript(Base):
         self.assertNotIn("sparrow_down", self.payload())
         self.assertNotIn("down", self.events_list())
 
+    def test_a_named_instance_wakes_for_its_own_tasks_only(self):
+        self.config.write_text(self.config.read_text() + "GATEWAY_INSTANCE=blue\n")
+        self.add_task("task-blue~task-1784700000001", "$blue")
+        self.add_task("task-1784700000002", "$primary")
+        self.add_task("task-green~task-1784700000003", "$green")
+        self.assertEqual(self.run_script().returncode, 0)
+        (m,) = self.payload()["matches"]
+        self.assertEqual((m["task_id"], m["event_id"]), ("task-blue~task-1784700000001", "$blue"))
+        self.assertEqual(m["result_file"], str(self.results / "task-blue~task-1784700000001.txt"))
+
     def test_heartbeat_with_sparrow_running_carries_no_sparrow_field(self):
         self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 1}))
         self.run_script(ACTIVITY_FILE=str(self.home / "absent"))
@@ -1034,6 +1044,51 @@ class Reply(Base):
             r = self.reply(str(self.result_file), "--body", "mine", "--wait", "0")
         self.assertEqual(r.returncode, 1)
         self.assertEqual(self.result_file.read_text(), "the other call's reply")
+
+    def test_a_withheld_task_takes_no_second_reply(self):
+        # Only the claim stops this one: the result file is gone and no outbox record exists.
+        self.sparrow(lambda _body: self.result_file.unlink())
+        self.assertEqual(self.reply(str(self.result_file), "--body", "hi", "--wait", "10")
+                         .returncode, 1)
+        r = self.reply(str(self.result_file), "--body", "again", "--wait", "0")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("already has a reply", r.stderr)
+        self.assertFalse(self.result_file.exists())
+
+    def test_claims_of_archived_tasks_are_pruned(self):
+        claims = self.results / ".hatch-reply-claims"
+        claims.mkdir()
+        (claims / "task-1784700000077").write_text("")
+        self.assertEqual(self.reply(str(self.result_file), "--no-send").returncode, 0)
+        self.assertEqual(sorted(p.name for p in claims.iterdir()), [self.TID])
+        (self.tasks / f"{self.TID}.txt").unlink()  # Sparrow archived it
+        self.add_task("task-1784700000002", "$ev2")
+        self.reply(str(self.results / "task-1784700000002.txt"), "--no-send")
+        self.assertEqual(sorted(p.name for p in claims.iterdir()), ["task-1784700000002"])
+
+    def test_a_named_instance_reply_waits_on_that_instances_outbox(self):
+        local = "task-blue~task-1784700000005"
+        self.add_task(local, "$ev5")
+        rfile = self.results / f"{local}.txt"
+        cfg = self.home / ".config" / "ag2-sparrow-hatch" / "config"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(hatch_cli.render_config(AGENT, self.tasks, self.results, self.home / "m",
+                                               sys.executable, self.home / "state", "blue"))
+
+        def delivered():
+            deadline = time.monotonic() + 10
+            while not rfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            outbox.record_delivered(self.results / ".outbox.blue", "task-1784700000005")
+            rfile.unlink()
+        t = threading.Thread(target=delivered)
+        t.start()
+        self.addCleanup(t.join)
+        r = self.reply(str(rfile), "--body", "4", "--wait", "10")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"posted: {local}.txt", r.stdout)
+        # The primary's id space is not this instance's.
+        self.assertEqual(self.reply(str(self.result_file), "--body", "x").returncode, 2)
 
     def test_two_concurrent_replies_publish_exactly_one(self):
         cmd = [sys.executable, "-m", "ag2_sparrow.adapters.hatch.cli", "reply",
