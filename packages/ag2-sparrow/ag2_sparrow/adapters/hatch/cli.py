@@ -32,8 +32,6 @@ SPARROW_STATUS_MAX_AGE_S = 180
 RELEASED_SCRIPT_SHA256 = frozenset({
     "c68a6fce020a5aaea9f5c593021daccb95aeaf15ba6962d0303e42933ee23fb7",
 })
-RESTART_HINT = ("restart it: systemctl --user restart ag2-sparrow under the README's user "
-                "service, else start ag2-sparrow again as at install")
 
 
 def _shipped(name: str) -> str:
@@ -170,6 +168,10 @@ def install(args) -> int:
 def _check(results: list, ok: bool, name: str, detail: str) -> None:
     results.append(ok)
     print(f"{'PASS' if ok else 'FAIL'} {name}: {detail}")
+
+
+RESTART_HINT = ("restart it: systemctl --user restart ag2-sparrow under the README's user "
+                "service, else start ag2-sparrow again as at install")
 
 
 def sparrow_status_path(state_dir: Path) -> Path:
