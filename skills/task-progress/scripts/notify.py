@@ -352,7 +352,8 @@ def _event_id_or_empty(raw: str | None, field: str) -> "str | None":
 
 
 def send_remote_gateway(source: str, channel_id: str, message: str,
-                        thread_root: str | None = None, reply_to: str | None = None) -> bool:
+                        thread_root: str | None = None, reply_to: str | None = None,
+                        extra: dict | None = None) -> bool:
     """Generic sender for gateway-bridged channels (any --source with a
     channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN).
 
@@ -377,8 +378,11 @@ def send_remote_gateway(source: str, channel_id: str, message: str,
         f"worker-{os.environ.get('SUTANDO_WORKER_SEAT') or os.environ['SUTANDO_CORE_ID']}"
         if os.environ.get("SUTANDO_WORKER_SEAT") or os.environ.get("SUTANDO_CORE_ID") else None)
     payload = {"op": "message", "room_id": channel_id, "body": message}
+    content = dict(extra or {})
     if worker:
-        payload["extra_content"] = {"space.ag2.worker": {"id": worker}}
+        content["space.ag2.worker"] = {"id": worker}
+    if content:
+        payload["extra_content"] = content
     # Independent fields (relations.py's relation_fields): thread_root nests
     # the post, reply_to is its citation fallback or the only relation at all.
     if thread_root:
@@ -516,7 +520,19 @@ def main() -> int:
         help="Discord only: allow intentional plain-text @handles and skip mention checks",
     )
     parser.add_argument("--message", required=True, help="Text to send")
+    parser.add_argument("--extra-content", default=None,
+                        help="Gateway sources: a JSON object of extra event content "
+                             "(e.g. a structured tag a client reads); ignored elsewhere.")
     args = parser.parse_args()
+    extra = None
+    if args.extra_content:
+        try:
+            extra = json.loads(args.extra_content)
+        except ValueError:
+            extra = None
+        if not isinstance(extra, dict):
+            print("[task-progress] --extra-content must be a JSON object", file=sys.stderr)
+            return 1
 
     derived = _derive_from_task_file(args.task_file) if args.task_file else {}
 
@@ -567,7 +583,8 @@ def main() -> int:
     elif source == "telegram":
         ok = send_telegram(channel, message)
     else:
-        ok = send_remote_gateway(source, channel, message, thread_root=thread_root, reply_to=reply_to)
+        ok = send_remote_gateway(source, channel, message, thread_root=thread_root,
+                                 reply_to=reply_to, extra=extra)
 
     return 0 if ok else 1
 

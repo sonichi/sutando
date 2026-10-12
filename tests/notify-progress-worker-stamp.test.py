@@ -55,6 +55,12 @@ class NotifyWorkerStampTests(unittest.TestCase):
         p = self._payload({"SUTANDO_CORE_ID": "3", "SUTANDO_WORKER_ID": ""})
         self.assertEqual(p["extra_content"], {"space.ag2.worker": {"id": "worker-3"}})
 
+    def test_extra_content_merges_with_the_stamp(self):
+        tag = {"space.ag2.agent_alert": {"agent": "core@mac"}}
+        p = self._payload({"SUTANDO_WORKER_ID": "core-7"}, extra=tag)
+        self.assertEqual(p["extra_content"],
+                         {**tag, "space.ag2.worker": {"id": "core-7"}})
+
     def test_no_worker_env_sends_no_stamp(self):
         p = self._payload({})
         self.assertNotIn("extra_content", p)
@@ -77,6 +83,16 @@ class NotifyThreadRootTests(unittest.TestCase):
                 os.environ.pop(k, None)
             rc = notify.main()
         return rc, sent
+
+    def test_extra_content_flag_reaches_the_payload(self):
+        rc, sent = self._send(["--extra-content", '{"space.ag2.agent_alert": {"agent": "a"}}'])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent[0]["extra_content"], {"space.ag2.agent_alert": {"agent": "a"}})
+
+    def test_extra_content_must_be_a_json_object(self):
+        for bad in ("[1]", "not json"):
+            rc, sent = self._send(["--extra-content", bad])
+            self.assertEqual((rc, sent), (1, []), bad)
 
     def test_thread_root_flag_threads_the_message(self):
         rc, sent = self._send(["--thread-root", "$root123"])
