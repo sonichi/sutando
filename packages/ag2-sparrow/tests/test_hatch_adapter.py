@@ -304,6 +304,21 @@ class HookScript(Base):
         for phrase in NON_OWNER_LIMITS:
             self.assertIn(phrase, p["worker_note"])
 
+    def test_agent_with_a_port_is_configured(self):
+        self.config.write_text(self.config.read_text().replace(AGENT, "@watch-agent:localhost:8448"))
+        self.add_task("task-1784700000001", "$reply")
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("WAKE", self.events_list())
+
+    def test_bad_agent_is_not_configured(self):
+        self.config.write_text(self.config.read_text().replace(AGENT, "watch-agent"))
+        self.add_task("task-1784700000001", "$reply")
+        self.run_script()
+        self.assertEqual(self.events_list(), ["LOG", "ag2-sparrow-hatch", "not", "configured",
+                                              "SILENT"])
+        self.assertFalse(self.wake_out.exists())
+
 
 class TaskFields(Base):
     def test_helper_reads_headers_with_sparrows_parser(self):
@@ -316,6 +331,21 @@ class TaskFields(Base):
         self.assertEqual((item["event_id"], item["thread_root"], item["sender"], item["sender_name"],
                           item["access_tier"], item["collaborator"]),
                          ("$m", "$t", "@bob:ag2.space", "Bob", "owner", False))
+
+    def test_mxid_validator(self):
+        for good in ("@a:ag2.space", "@a:localhost:8448", "@a:1.2.3.4:8448", "@a:[::1]",
+                     "@a:[2001:db8::1]:8448", "@x.y_z=+/-:ag2.space"):
+            self.assertTrue(task_fields.valid_mxid(good), good)
+        for bad in ("", "a:ag2.space", "@a", "@a:", "@:ag2.space", "@a:host:port",
+                    "@a:host:8448:1", "@a b:ag2.space", None):
+            self.assertFalse(task_fields.valid_mxid(bad), bad)
+
+    def test_helper_rejects_a_bad_agent(self):
+        args = ["--task-dir", str(self.tasks), "--result-dir", str(self.results)]
+        r = run_main(task_fields.main, args + ["--agent", "nobody"], py_env(self.home))
+        self.assertEqual(r.returncode, task_fields.EXIT_BAD_AGENT)
+        r = run_main(task_fields.main, args + ["--agent", "@a:host:8448"], py_env(self.home))
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_missing_task_dir_fails(self):
         r = run_main(task_fields.main, ["--task-dir", str(self.home / "nope"),
@@ -424,9 +454,45 @@ class Cli(Base):
         self.assertIn("-# local edit", r.stdout)
         self.assertIn("REFUSED", r.stderr)
         self.assertEqual(self.script.read_text(), edited)
+        self.assertEqual(self.marker.read_text().strip(), hatch_cli._sha256(SCRIPT.read_text()))
         forced = self.cli("install", "--mxid", AGENT, "--force")
         self.assertEqual(forced.returncode, 0, forced.stderr)
         self.assertEqual(self.script.read_text(), SCRIPT.read_text())
+
+    @property
+    def marker(self):
+        return self.home / ".config" / "ag2-sparrow-hatch" / "installed-script.sha256"
+
+    def test_install_upgrades_a_copy_it_wrote(self):
+        self.cli("install", "--mxid", AGENT)
+        self.assertEqual(self.marker.read_text().strip(),
+                         hatch_cli._sha256(SCRIPT.read_text()))
+        older = "#!/usr/bin/env bash\n# an earlier ag2-sparrow hook\n"
+        self.script.write_text(older)
+        self.marker.write_text(hatch_cli._sha256(older) + "\n")
+        r = self.cli("install", "--mxid", AGENT)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"upgraded: {self.script}", r.stdout)
+        self.assertNotIn("DIFF", r.stdout)
+        self.assertEqual(self.script.read_text(), SCRIPT.read_text())
+        self.assertEqual(self.marker.read_text().strip(), hatch_cli._sha256(SCRIPT.read_text()))
+
+    def test_install_upgrades_a_released_copy_without_a_marker(self):
+        released = "#!/usr/bin/env bash\n# the 0.5.0 hook\n"
+        self.script.parent.mkdir(parents=True)
+        self.script.write_text(released)
+        with mock.patch.object(hatch_cli, "RELEASED_SCRIPT_SHA256",
+                               frozenset({hatch_cli._sha256(released)})):
+            r = self.cli("install", "--mxid", AGENT)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"upgraded: {self.script}", r.stdout)
+        self.assertEqual(self.script.read_text(), SCRIPT.read_text())
+
+    def test_install_accepts_a_server_name_with_a_port(self):
+        r = self.cli("install", "--mxid", "@watch-agent:localhost:8448")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.sparrow_status()
+        self.assertIn("PASS config:", self.cli("verify").stdout)
 
     def test_install_rejects_a_bad_mxid(self):
         self.assertEqual(self.cli("install", "--mxid", "watch-agent").returncode, 2)

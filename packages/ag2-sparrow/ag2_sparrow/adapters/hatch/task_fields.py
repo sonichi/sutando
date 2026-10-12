@@ -6,12 +6,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 from ... import local_task_protocol
 
 SNIPPET_MAX = 500
+# Matrix user id: @localpart:server_name, where server_name may be a DNS name, IPv4 or
+# [IPv6] literal, each with an optional :port.
+MXID_RE = re.compile(r"^@[A-Za-z0-9._=+/-]+:(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?::[0-9]{1,5})?$")
+EXIT_BAD_AGENT = 3
+
+
+def valid_mxid(value: str) -> bool:
+    return bool(MXID_RE.match(value or ""))
 
 
 def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":
@@ -80,7 +89,11 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m ag2_sparrow.adapters.hatch.task_fields")
     ap.add_argument("--task-dir", required=True, type=Path)
     ap.add_argument("--result-dir", required=True, type=Path)
+    ap.add_argument("--agent", help="exit %d unless this is a valid MXID" % EXIT_BAD_AGENT)
     args = ap.parse_args(argv)
+    if args.agent is not None and not valid_mxid(args.agent):
+        print(f"not an MXID: {args.agent!r}", file=sys.stderr)
+        return EXIT_BAD_AGENT
     if not args.task_dir.is_dir():
         print(f"task dir not found: {args.task_dir}", file=sys.stderr)
         return 2

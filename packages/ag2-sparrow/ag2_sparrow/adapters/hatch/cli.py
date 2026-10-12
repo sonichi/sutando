@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -19,6 +19,7 @@ from importlib import resources
 from pathlib import Path
 
 from ... import _dirs
+from .task_fields import valid_mxid
 
 HOOK_ID = "ag2-sparrow-hatch"
 SCRIPT_NAME = f"{HOOK_ID}.sh"
@@ -26,7 +27,10 @@ HEARTBEAT_INTERVAL_S = 300
 # Sparrow rewrites its status file every poll round (long poll or backoff, each
 # at most about a minute), so an older file means it is not running.
 SPARROW_STATUS_MAX_AGE_S = 180
-MXID_RE = re.compile(r"^@[A-Za-z0-9._=+/-]+:[A-Za-z0-9.:-]+$")
+# sha256 of hook scripts shipped before install recorded what it wrote (0.5.0).
+RELEASED_SCRIPT_SHA256 = frozenset({
+    "c68a6fce020a5aaea9f5c593021daccb95aeaf15ba6962d0303e42933ee23fb7",
+})
 
 
 def _shipped(name: str) -> str:
@@ -50,6 +54,24 @@ def config_path() -> Path:
     return Path(env) if env else _home() / ".config" / HOOK_ID / "config"
 
 
+def installed_marker_path() -> Path:
+    """sha256 of the hook script install last wrote, so an upgrade can tell its own
+    earlier copy from a local edit."""
+    return config_path().with_name("installed-script.sha256")
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _ours() -> frozenset:
+    try:
+        recorded = installed_marker_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        recorded = ""
+    return RELEASED_SCRIPT_SHA256 | ({recorded} if recorded else set())
+
+
 def _diff(old: str, new: str, path: Path) -> str:
     return "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
                                         f"{path} (installed)", f"{path} (ag2-sparrow)"))
@@ -68,13 +90,19 @@ def _write(path: Path, text: str, mode: int) -> None:
         raise
 
 
-def _install_file(path: Path, text: str, mode: int, *, refuse_drift: bool, force: bool) -> bool:
-    """Write `text` to `path`; print a diff for a differing copy. False = refused."""
+def _install_file(path: Path, text: str, mode: int, *, refuse_drift: bool, force: bool,
+                  ours: frozenset = frozenset()) -> bool:
+    """Write `text` to `path`; print a diff for a differing copy that is not one of
+    `ours` (sha256 of copies ag2-sparrow wrote). False = refused."""
     if path.exists():
         old = path.read_text(encoding="utf-8", errors="replace")
         if old == text:
             os.chmod(path, mode)
             print(f"unchanged: {path}")
+            return True
+        if _sha256(old) in ours:
+            _write(path, text, mode)
+            print(f"upgraded: {path}")
             return True
         print(f"DIFF: {path} differs from the ag2-sparrow copy:")
         print(_diff(old, text, path), end="")
@@ -111,7 +139,7 @@ def read_config(path: Path) -> dict:
 
 
 def install(args) -> int:
-    if not MXID_RE.match(args.mxid):
+    if not valid_mxid(args.mxid):
         print(f"error: {args.mxid!r} is not an MXID like @my-agent:ag2.space", file=sys.stderr)
         return 2
     task_dir = Path(args.task_dir) if args.task_dir else _dirs.task_dir()
@@ -119,8 +147,11 @@ def install(args) -> int:
     state_dir = Path(args.state_dir) if args.state_dir else _dirs.state_dir()
     activity = Path(args.activity_file) if args.activity_file else _home() / ".muse" / "last_active"
     script = scripts_dir() / SCRIPT_NAME
-    if not _install_file(script, _shipped(SCRIPT_NAME), 0o755, refuse_drift=True, force=args.force):
+    shipped = _shipped(SCRIPT_NAME)
+    if not _install_file(script, shipped, 0o755, refuse_drift=True, force=args.force,
+                         ours=_ours()):
         return 1
+    _write(installed_marker_path(), _sha256(shipped) + "\n", 0o644)
     definition = _shipped("hook-definition.json").replace("<AGENT_MXID>", args.mxid)
     _install_file(definitions_dir() / f"{HOOK_ID}.json", definition, 0o644,
                   refuse_drift=False, force=True)
@@ -191,7 +222,7 @@ def verify(_args) -> int:
     try:
         cfg = read_config(cfg_path)
         problems = []
-        if not MXID_RE.match(cfg.get("AGENT_MXID", "")):
+        if not valid_mxid(cfg.get("AGENT_MXID", "")):
             problems.append("AGENT_MXID is not an MXID")
         for key in ("TASK_DIR", "RESULT_DIR", "STATE_DIR", "ACTIVITY_FILE", "SPARROW_PYTHON"):
             if not cfg.get(key):
