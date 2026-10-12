@@ -70,7 +70,8 @@ class Snapshot(Base):
         self.assertEqual(first["agents"][0]["role"], "core")
         (self.ws / "state" / "pool-suspended").unlink()
         self.assertIs(rgb._health_snapshot(), first)
-        with mock.patch.object(rgb.time, "monotonic", return_value=rgb._health_cache["at"] + rgb.HEALTH_TTL_S):
+        # Past the TTL, not on it: (at + ttl) - at rounds below ttl for some float `at`.
+        with mock.patch.object(rgb.time, "monotonic", return_value=rgb._health_cache["at"] + 2 * rgb.HEALTH_TTL_S):
             self.assertIsNone(rgb._health_snapshot()["suspended"])
 
     def test_no_monorepo_src_means_no_health(self):

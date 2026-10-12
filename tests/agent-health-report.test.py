@@ -256,6 +256,33 @@ class CoreLivenessTests(unittest.TestCase):
         self.assertEqual(self.heartbeat(True)['status'], 'error')
 
 
+class CoreStatusWrittenAtTests(unittest.TestCase):
+    """When the self-report was written: its `ts`, else the file mtime, else unknown."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name)
+        p = patch.object(bridge, '_STATE', self.state)
+        p.start()
+        self.addCleanup(p.stop)
+        self.path = self.state / 'core-status.json'
+
+    def test_ts_wins_over_mtime(self):
+        self.path.write_text(json.dumps({'status': 'idle', 'ts': 1234.5}))
+        self.assertEqual(bridge._core_status_written_at(), 1234.5)
+
+    def test_without_a_usable_ts_the_mtime_is_used(self):
+        for body in (json.dumps({'status': 'idle'}), json.dumps({'ts': 'x'}), '[1]', '{ nope'):
+            with self.subTest(body=body):
+                self.path.write_text(body)
+                os.utime(self.path, (1000.0, 1000.0))
+                self.assertEqual(bridge._core_status_written_at(), 1000.0)
+
+    def test_no_file_is_unknown(self):
+        self.assertIsNone(bridge._core_status_written_at())
+
+
 class RealBeatTests(unittest.TestCase):
     """The real health snapshot over a real `.alive` file: what core_heartbeat leaves behind."""
 
