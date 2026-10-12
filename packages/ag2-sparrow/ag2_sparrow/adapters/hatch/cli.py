@@ -211,9 +211,9 @@ def check_sparrow(state_dir: Path, now: float | None = None,
     if not status.get("connected"):
         return SPARROW_NOT_CONNECTED, (
             f"Sparrow is running but not connected: {status.get('error') or 'no error given'}; "
-            "a restart does not fix a rejected token: put a valid relay token from the AG2 "
-            "Space Agent Portal in REMOTE_TASK_TOKEN (the .env file AG2_DEVICE_ENV names), "
-            "then restart Sparrow; any other error clears by itself once Sparrow reconnects")
+            "if the token was rejected, a restart does not help: put a valid relay token from "
+            "the AG2 Space Agent Portal in REMOTE_TASK_TOKEN (the .env file AG2_DEVICE_ENV "
+            "names), then restart Sparrow")
     return SPARROW_OK, f"running and connected ({path} written {max(age, 0)}s ago)"
 
 

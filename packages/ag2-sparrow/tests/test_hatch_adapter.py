@@ -322,9 +322,10 @@ class HookScript(Base):
         self.assertIn("401 token rejected", p["sparrow_not_connected"])
         self.assertIn("REMOTE_TASK_TOKEN", p["sparrow_not_connected"])
         note = p["worker_note"]
-        self.assertIn("running but not connected to AG2 Space", note)
-        self.assertIn("A restart alone does not fix this; tell your owner", note)
+        self.assertIn("running but not connected: 401 token rejected", note)
+        self.assertIn("Restarting Sparrow alone will not fix this: tell your owner", note)
         self.assertNotIn("Sparrow is not running", note)
+        self.assertEqual(note.count("not connected"), 1, note)
         self.assertNotIn("Do that", note)
         self.assertNotIn("restart it", self.reason())
         self.assertIn("not connected; report it to your owner", self.reason())

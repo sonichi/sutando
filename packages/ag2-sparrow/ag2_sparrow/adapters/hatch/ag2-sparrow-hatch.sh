@@ -118,19 +118,17 @@ if [[ "$n" -eq 0 ]]; then
       reason="heartbeat: Sparrow is not running; restart it, post nothing"
       payload="$(jq -cn --arg d "$sparrow_detail" --arg marker "$ACTIVITY_FILE" '{heartbeat: true,
         matches: [], total: 0, sparrow_down: $d,
-        worker_note: ("Heartbeat. Touch " + $marker + ". Sparrow is not running, so no AG2 Space "
-                      + "message reaches you: " + $d + ". Restart Sparrow as that says, then "
-                      + "exit; post nothing.")}')"
+        worker_note: ("Heartbeat. Touch " + $marker + ". No AG2 Space message reaches you: "
+                      + $d + ". Restart Sparrow as that says, then exit; post nothing.")}')"
       ;;
     11)
       log "ag2-sparrow-hatch sparrow not connected" "$(jq -cn --arg d "$sparrow_detail" '{detail: $d}')"
       reason="heartbeat: Sparrow is running but not connected; report it to your owner, post nothing"
       payload="$(jq -cn --arg d "$sparrow_detail" --arg marker "$ACTIVITY_FILE" '{heartbeat: true,
         matches: [], total: 0, sparrow_not_connected: $d,
-        worker_note: ("Heartbeat. Touch " + $marker + ". Sparrow is running but not connected "
-                      + "to AG2 Space, so no AG2 Space message reaches you: " + $d + ". A restart "
-                      + "alone does not fix this; tell your owner in your run report, then "
-                      + "exit; post nothing.")}')"
+        worker_note: ("Heartbeat. Touch " + $marker + ". No AG2 Space message reaches you: "
+                      + $d + ". Restarting Sparrow alone will not fix this: tell your owner in "
+                      + "your run report, then exit; post nothing.")}')"
       ;;
     *)
       log "ag2-sparrow-hatch sparrow check failed" "$(jq -cn --argjson rc "$sparrow_rc" '{exit_code: $rc}')"
