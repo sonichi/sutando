@@ -68,14 +68,15 @@ describe('session-end pipeline', () => {
 });
 
 describe('the session-end task', () => {
-	it('says when the session ran and how it ended, asks for no reply, and carries its spoken lines', async () => {
+	it('says when the session ran and how it ended, asks the core to do its follow-ups, and carries its spoken lines', async () => {
 		const s = { sessionId: 's1', reason: 'client_disconnect', startedAt: Date.UTC(2026, 9, 10, 18, 0), endedAt: Date.UTC(2026, 9, 10, 18, 12),
 			durationMs: 12 * 60_000, turnCount: 4, toolCallCount: 1,
 			items: [item('user', 'check PR 5308'), item('tool_call', '{}'), item('assistant', 'It is merged.')] };
 		assert.ok(worthATask(s));
 		const { summary, transcript } = sessionEndTask(s);
 		assert.match(summary, /^VOICE_SESSION_ENDED: the voice session s1 ended \(client_disconnect\)\. 2026-10-10T18:00:00\.000Z to 2026-10-10T18:12:00\.000Z, about 12 min, 4 turns, 1 tool calls\./);
-		assert.match(summary, /\[no-send\]/);
+		assert.match(summary, /not finished on the call \(a follow-up: .*\), do it now, or schedule it if it has a time, and reply with what you did\./);
+		assert.match(summary, /If the call leaves nothing to do, answer with \[no-send\]\./);
 		assert.equal(transcript, 'user: check PR 5308\nassistant: It is merged.');
 		const id = await submitVoiceSessionEndTask(summary, transcript);
 		const body = readFileSync(join(TMP, 'tasks', `${id}.txt`), 'utf-8');

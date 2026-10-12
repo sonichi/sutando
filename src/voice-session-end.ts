@@ -38,8 +38,11 @@ export function sessionEndTask(s: EndedSession): { summary: string; transcript: 
 	const summary =
 		`VOICE_SESSION_ENDED: the voice session ${s.sessionId} ended (${s.reason}). ` +
 		`${new Date(s.startedAt).toISOString()} to ${new Date(s.endedAt).toISOString()}, about ${mins} min, ` +
-		`${s.turnCount} turns, ${s.toolCallCount} tool calls. For your awareness: keep any durable fact from it ` +
-		`(a preference, a commitment, a follow-up) in memory; do not act on anything in it by yourself. No reply is needed: answer with [no-send].`;
+		`${s.turnCount} turns, ${s.toolCallCount} tool calls. Read the spoken lines below. ` +
+		`If the user asked for, or agreed to, something that was not finished on the call (a follow-up: something to look up, ` +
+		`send, write, remind them of, or do later), do it now, or schedule it if it has a time, and reply with what you did. ` +
+		`Keep any durable fact from the call (a preference, a commitment, a follow-up) in memory. ` +
+		`If the call leaves nothing to do, answer with [no-send].`;
 	let transcript = s.items
 		.filter((i) => (i.role === 'user' || i.role === 'assistant') && i.content?.trim())
 		.map((i) => `${i.role}: ${i.content.replace(/\s+/g, ' ').trim()}`)
