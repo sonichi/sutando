@@ -287,6 +287,14 @@ class TestEscapeStrippingIsComplete(unittest.TestCase):
         plain = _mod._ANSI_SGR.sub("", styled)
         self.assertEqual(classify(plain, styled)[0], "bypass-permissions")
 
+    def test_a_stray_line_outside_the_tail_window_is_not_consulted(self):
+        # A `styled_pane` one line longer than `pane` -- never a real
+        # co-derived capture -- must not let that extra line decide anything.
+        plain = TestClassify.GHOST_NO_FOOTER_PLAIN
+        mismatched_styled = TestClassify.GHOST_NO_FOOTER_STYLED + "\n❯ a totally different later line"
+        # Scoped to the one real line: the ghost suggestion, correctly idle.
+        self.assertIsNone(classify(plain, mismatched_styled))
+
 
 class TestGhostComposerComposeState(unittest.TestCase):
     """compose_state()-level regression: with the real monitor loop now passing a

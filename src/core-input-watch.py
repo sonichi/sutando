@@ -252,8 +252,11 @@ def classify(pane: str, styled_pane: "str | None" = None):
     if composer_i is not None:
         rest = "\n".join(tail_lines[:composer_i] + tail_lines[composer_i + 1:])
         if not _AWAIT_HINT.search(rest):
-            styled_tail = ("\n".join(styled_pane.splitlines()[i] for i in kept)
-                           if styled_pane is not None else tail)
+            styled_lines = styled_pane.splitlines() if styled_pane is not None else None
+            if styled_lines is not None and kept and max(kept) < len(styled_lines):
+                styled_tail = "\n".join(styled_lines[i] for i in kept)
+            else:
+                styled_tail = tail  # mismatched or absent: no styled line to trust here
             line = _pg_prompt_line(styled_tail, CLAUDE)
             if line is not None and line.placeholder and not line.text.strip():
                 return None
@@ -540,13 +543,15 @@ def session_runtime(socket, session):
 
 
 def capture(socket, session):
+    """Plain capture. Kept for its own direct tests; the main loop now calls
+    `capture_styled()` once and derives this text from it instead (below)."""
     target = cli_wedge.core_target(socket, session)
     return cli_wedge.capture_pane(socket, target) if target else None
 
 
 def capture_styled(socket, session):
-    """Same pane as `capture()`, captured WITH escapes (for classify()'s ghost
-    check). A separate tmux call, so capture()'s plain text is unaffected."""
+    """Styled capture (escapes kept) -- the one tmux call the main loop makes;
+    its plain text is derived via `_ANSI_SGR.sub()`, not a second capture."""
     target = cli_wedge.core_target(socket, session)
     return cli_wedge.capture_pane(socket, target, escapes=True) if target else None
 
