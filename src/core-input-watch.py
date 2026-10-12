@@ -634,7 +634,7 @@ def _name_seat(req, session, seat):
     return req
 
 
-def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0):
+def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None):
     """Raise ONE requirement per episode. The Manager dedups on
     (runtime, kind, device) + guard, so the prompt IS the episode key: the same
     prompt returns the same record, a different one mints a new card.
@@ -646,7 +646,8 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0)
     try:
         from hitl import tui_gate
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
-                                       escalation_message(state, detail, kind, prompt))
+                                       escalation_message(state, detail, kind, prompt),
+                                       runtime=runtime)
         if queued:
             req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
         if seat:
@@ -831,11 +832,12 @@ def main():
     while True:
         pane = capture(a.socket, a.session)
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
+        runtime = session_runtime(a.socket, a.session)
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
             process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane,
-            runtime=session_runtime(a.socket, a.session))
+            runtime=runtime)
         prev_pane = pane
         clock = gate_clock(clock, state, prompt, time.time())
 
@@ -886,7 +888,8 @@ def main():
                                   lambda k: send_keys(a.socket, a.session, k))
                 # Only the core's own seat owns tasks/; a worker's queue lives elsewhere.
                 queued = 0 if a.seat else core_gate_notice.queued_count(workspace)
-                req = escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None, queued=queued)
+                req = escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None,
+                               queued=queued, runtime=runtime)
                 if not a.seat:
                     notice_queued(hitl, req, workspace, state, kind)
             elif verdict == "resolve":

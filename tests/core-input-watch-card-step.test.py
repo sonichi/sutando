@@ -83,6 +83,31 @@ class TestCardStep(unittest.TestCase):
         self.assertEqual(ticks["n"], 5)
         self.assertNotIn("resolve", calls, f"an alternating dialog resolved a card: {calls}")
 
+    def test_the_loop_passes_the_sessions_runtime_to_the_card(self):
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "working"}
+        seen = []
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--stable", "1",
+                "--interval", "0", "--once"]
+        with patch.object(M, "capture", lambda s, sess: _DIALOG_A), \
+                patch.object(M, "_load_runtime_health", lambda: _RH()), \
+                patch.object(M, "gateway_alive", lambda *a: True), \
+                patch.object(M, "session_runtime", lambda *a: "codex"), \
+                patch.object(M, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(M, "_hitl_manager", lambda out_path: object()), \
+                patch.object(M, "escalate", lambda *a, **k: seen.append(k.get("runtime"))), \
+                patch.object(M, "drive_escalations", lambda *a, **k: None), \
+                patch.object(M, "notice_queued", lambda *a, **k: None), \
+                patch.object(M.core_gate_notice, "queued_count", lambda ws: 0), \
+                patch.object(sys, "argv", argv):
+            M.main()
+        self.assertEqual(seen, ["codex"])
+
     def test_blocked_escalates_and_resets_the_idle_count(self):
         self.assertEqual(M.card_step(True, "blocked-human", 1, 2), ("escalate", 0))
 

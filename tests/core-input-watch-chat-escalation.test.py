@@ -512,5 +512,35 @@ class TestPartialSend(unittest.TestCase):
         self.assertEqual(sent, ["Down", "Down"])
 
 
+class TestCodexSeatRuntime(unittest.TestCase):
+    """A Codex session's card, reminder and recovery carry runtime "codex" and one seat key,
+    the same key the runtime-event path gives that session."""
+
+    def test_codex_card_reminder_and_recovery_share_one_seat(self):
+        from hitl import events, renotify
+        from hitl.projector import project
+        from hitl.schema import NOTICE_FIELD
+        m, t, sent = _mgr(), [1_000_000.0], []
+        drive = lambda: project(m, lambda p: sent.append(p) or {"ok": True, "event_id": f"$e{len(sent)}"},
+                                "!room:example.org", clock=lambda: t[0])
+        req = M.escalate(m, "blocked-human", "d", None, "Something waits", "sutando-core", runtime="codex")
+        self.assertEqual(req.runtime, "codex")
+        ev = events._requirement_for({"session": "sutando-core", "runtime": "codex", "kind": "choice"})
+        self.assertEqual(renotify.seat_key(req), renotify.seat_key(ev))
+        drive()
+        t[0] += 31 * 60
+        drive()
+        m.resolve(req.id)
+        drive()
+        notices = [p["extra_content"][NOTICE_FIELD] for p in sent
+                   if p["op"] == "message" and NOTICE_FIELD in p.get("extra_content", {})]
+        self.assertEqual([n["notice"] for n in notices], ["reminder", "recovery"])
+        self.assertEqual({(n["runtime"], n["device"]) for n in notices}, {("codex", "sutando-core")})
+
+    def test_an_unstamped_session_stays_claude(self):
+        req = M.escalate(_mgr(), "blocked-human", "d", None, "Something waits", "s")
+        self.assertEqual(req.runtime, "claude")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
