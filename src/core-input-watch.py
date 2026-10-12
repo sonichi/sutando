@@ -164,7 +164,9 @@ _PROMPT_LINE = re.compile(r"^\s*❯")
 _COMPOSER_PLACEHOLDER = COMPOSER_PLACEHOLDER
 # With `capture-pane -e` the CLI's ghost text (that hint, a suggested reply) is dimmed:
 # SGR 2 on some builds, a 256-colour grey (232-255) on others. Typed text never is.
-_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+#: Mirrors pane_gate._SGR: colon-or-semicolon CSI SGR, or a BEL/ST-terminated OSC
+#: hyperlink -- both appear in `capture-pane -e` on newer tmux (#5418 review).
+_ANSI_SGR = re.compile(r"\x1b\[[0-9:;]*m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _DIM_SPAN = re.compile(r"\x1b\[(?:2|38;5;2(?:3[2-9]|4\d|5[0-5]))m.*?(?=\x1b\[(?:0|22|39)m|$)")
 #: Non-empty pane lines searched for the nearest completed turn (a result line may wrap).
 _TURN_WINDOW = 40

@@ -264,6 +264,30 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(hit[0], "unknown")
 
 
+class TestEscapeStrippingIsComplete(unittest.TestCase):
+    """qingyun-wu's PR review: tmux 3.6a's `-e` can emit colon-separated SGR
+    params and OSC 8 hyperlinks, neither of which the plain `\\x1b\\[[0-9;]*m`
+    pattern matched -- residual bytes would reach every matcher, not just the
+    ghost check."""
+
+    def test_colon_separated_sgr_is_stripped(self):
+        self.assertEqual(_mod._ANSI_SGR.sub("", "\x1b[4:3mhello\x1b[0m"), "hello")
+
+    def test_osc8_hyperlink_is_stripped_bel_and_st_terminated(self):
+        st = "\x1b]8;;http://example.com\x1b\\click\x1b]8;;\x1b\\"
+        bel = "\x1b]8;;http://example.com\x07click\x1b]8;;\x07"
+        self.assertEqual(_mod._ANSI_SGR.sub("", st), "click")
+        self.assertEqual(_mod._ANSI_SGR.sub("", bel), "click")
+
+    def test_a_known_gate_beside_an_osc8_link_still_classifies(self):
+        # The link text sits right next to the gate's own row; stray escape
+        # bytes left behind would break the `^\s*❯` / signature matchers.
+        link = "\x1b]8;;https://code.claude.com/docs\x1b\\docs\x1b]8;;\x1b\\"
+        styled = _BYPASS.replace("https://code.claude.com/docs/en/security", link)
+        plain = _mod._ANSI_SGR.sub("", styled)
+        self.assertEqual(classify(plain, styled)[0], "bypass-permissions")
+
+
 class TestGhostComposerComposeState(unittest.TestCase):
     """compose_state()-level regression: with the real monitor loop now passing a
     styled capture through, the ghost suggestion must compose to a non-blocking
