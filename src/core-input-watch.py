@@ -207,12 +207,8 @@ def auto_answer(kind):
 def classify(pane: str, styled_pane: "str | None" = None):
     """Return (kind, excerpt) if the pane is awaiting user input, else None.
 
-    `styled_pane` is the SAME capture taken WITH escapes (``capture_pane(...,
-    escapes=True)``), when the caller has one. It is used for exactly one
-    check below (a dim ghost suggestion vs. a real draft) and never changes
-    any other matcher here, which all keep reading the plain `pane` — this
-    function's existing behaviour is unchanged for a caller that passes only
-    `pane` (tests included)."""
+    `styled_pane` (an escaped capture) feeds exactly one check below; omitted,
+    every matcher reads plain `pane` only -- unchanged from before."""
     tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
     if not _AWAIT_HINT.search(tail):
         return None
@@ -242,15 +238,11 @@ def classify(pane: str, styled_pane: "str | None" = None):
                 for m in _FABLE_TEXT.finditer(tail)):
             return "unknown", tail
         return kind, tail
-    # A dim ghost suggestion matches the same hint but isn't real input (#5415);
-    # only when no dialog sits above the composer row (else stays unknown).
-    tail_lines = tail.splitlines()
-    composer_i = next((i for i in range(len(tail_lines) - 1, -1, -1)
-                        if _PROMPT_LINE.match(tail_lines[i])), None)
-    if composer_i is not None and not _AWAIT_HINT.search("\n".join(tail_lines[:composer_i])):
-        line = _pg_prompt_line(styled_pane if styled_pane is not None else pane, CLAUDE)
-        if line is not None and not line.text.strip():
-            return None
+    # A dim ghost/placeholder span, once stripped, can leave an empty composer;
+    # a REAL empty "❯ " has no such span, so `line.placeholder` alone discriminates.
+    line = _pg_prompt_line(styled_pane if styled_pane is not None else pane, CLAUDE)
+    if line is not None and line.placeholder and not line.text.strip():
+        return None
     # No signature, no idle ghost composer: an unforeseen prompt, surfaced rather
     # than a silent dead-end (owner's no-dead-end rule 2026-07-14).
     return "unknown", tail
@@ -539,11 +531,8 @@ def capture(socket, session):
 
 
 def capture_styled(socket, session):
-    """The same pane as `capture()`, captured WITH escapes (SGR codes kept) so a
-    dim/ghost composer suggestion can be told apart from real typed input
-    (classify()'s ghost-composer check, #5415). A separate tmux call rather than
-    deriving `capture()`'s plain text from this one, so every existing matcher in
-    this file keeps reading byte-identical plain text — nothing else changes."""
+    """Same pane as `capture()`, captured WITH escapes (for classify()'s ghost
+    check). A separate tmux call, so capture()'s plain text is unaffected."""
     target = cli_wedge.core_target(socket, session)
     return cli_wedge.capture_pane(socket, target, escapes=True) if target else None
 

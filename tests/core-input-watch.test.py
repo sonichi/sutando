@@ -213,8 +213,8 @@ class TestClassify(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit[0], "unknown")
 
-    # #5415: a dim composer ghost suggestion with no idle footer in view, styled
-    # as TestComposerIsEmpty's GHOST fixture (SGR 2, Claude Code v2.1.276).
+    # A dim composer ghost suggestion with no idle footer in view, styled as
+    # TestComposerIsEmpty's GHOST fixture (SGR 2, Claude Code v2.1.276).
     GHOST_NO_FOOTER_STYLED = (
         "❯ \x1b[2mresume normal self-development\x1b[0m\n"
         "  Tab to accept · ↑↓ to navigate · Esc to dismiss"
@@ -241,11 +241,27 @@ class TestClassify(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit[0], "unknown")
 
+    # An empty "❯ " (no dim span -- nothing stripped) with a real dialog's hint
+    # below it: no ghost/placeholder span here to vouch for it, so stays blocked.
+    EMPTY_COMPOSER_REAL_DIALOG = "❯ \nEnter to confirm · Esc to cancel"
+
+    def test_empty_composer_with_a_real_dialog_hint_below_stays_blocked(self):
+        hit = classify(self.EMPTY_COMPOSER_REAL_DIALOG)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "unknown")
+
+    def test_empty_composer_with_a_real_dialog_hint_below_stays_blocked_even_styled(self):
+        # Same pane as both plain and styled: no SGR anywhere, so there is no
+        # dim span to find regardless of which capture mode produced it.
+        hit = classify(self.EMPTY_COMPOSER_REAL_DIALOG, self.EMPTY_COMPOSER_REAL_DIALOG)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "unknown")
+
 
 class TestGhostComposerComposeState(unittest.TestCase):
-    """compose_state()-level regression for #5415: with the real monitor loop now
-    passing a styled capture through, the ghost suggestion must compose to a
-    non-blocking state instead of blocked-human/unknown."""
+    """compose_state()-level regression: with the real monitor loop now passing a
+    styled capture through, the ghost suggestion must compose to a non-blocking
+    state instead of blocked-human/unknown."""
 
     STYLED = TestClassify.GHOST_NO_FOOTER_STYLED
     PLAIN = TestClassify.GHOST_NO_FOOTER_PLAIN
