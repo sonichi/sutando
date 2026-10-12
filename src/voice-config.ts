@@ -279,9 +279,28 @@ export function loadVoiceConfig(configPath: string): VoiceConfig {
 	}
 }
 
-/** The model every install was seeded with before 3.8, and what it moves to. */
+/** The model the template seeded before 3.8, and what every seeded model moves to. */
 export const LEGACY_SEEDED_MODEL = 'gemini-3.1-flash-live-preview';
 export const MIGRATED_MODEL = 'gemini-3.8-live';
+/**
+ * Every model an install may have been seeded with before 3.8: the 3.1 template, and the 2.5
+ * native-audio default that the code seeded when no template was copied (2026-10-11: a desktop
+ * install still on it, a second slower than 3.8, because the migration knew only 3.1).
+ */
+export const LEGACY_SEEDED_MODELS: readonly string[] = [
+	LEGACY_SEEDED_MODEL,
+	'gemini-2.5-flash-native-audio-preview-12-2025',
+	'gemini-2.5-flash-native-audio',
+];
+/** The backup copy a migration leaves beside the config: `.bak-3.1` for 3.1 (as before), `.bak-2.5` for the 2.5 models. */
+export function legacyBackupPath(configPath: string, model: string): string {
+	return `${configPath}.bak-${model === LEGACY_SEEDED_MODEL ? '3.1' : model.startsWith('gemini-2.5') ? '2.5' : model.replace(/[^a-z0-9.]+/gi, '-')}`;
+}
+/** The model a migration stamp says the install came from, or null when the stamp is not ours. */
+export function migratedFromModel(stamp: unknown): string | null {
+	const m = typeof stamp === 'string' ? /^(\S+) -> /.exec(stamp) : null;
+	return m ? m[1] : null;
+}
 /** Written once the move is made, so it is made once: a user who switches back to 3.1 keeps it. */
 export const MODEL_MIGRATION_KEY = 'modelMigration';
 
@@ -292,7 +311,7 @@ export interface ModelMigration {
 }
 
 /**
- * Move a config still on the old seeded 3.1 model to 3.8, once.
+ * Move a config still on a model an install was seeded with (3.1, or the 2.5 native-audio default) to 3.8, once.
  *
  * The config is per-user data that an app update never rewrites, and the template is copied only
  * when the file is missing, so a new default reaches new installs only. This is the one place an
@@ -312,10 +331,11 @@ export function migrateLegacyModel(configPath: string, now: Date = new Date()): 
 	}
 	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { migrated: false, reason: 'config is not an object' };
 	if (raw[MODEL_MIGRATION_KEY] !== undefined) return { migrated: false, reason: 'already migrated once' };
-	if (raw.model !== LEGACY_SEEDED_MODEL) return { migrated: false, reason: `model is ${String(raw.model)}, not the old default` };
-	const backup = `${configPath}.bak-3.1`;
+	const from = typeof raw.model === 'string' && LEGACY_SEEDED_MODELS.includes(raw.model) ? raw.model : null;
+	if (!from) return { migrated: false, reason: `model is ${String(raw.model)}, not an old default` };
+	const backup = legacyBackupPath(configPath, from);
 	if (!existsSync(backup)) copyFileSync(configPath, backup);
-	const next = { ...raw, model: MIGRATED_MODEL, [MODEL_MIGRATION_KEY]: `${LEGACY_SEEDED_MODEL} -> ${MIGRATED_MODEL} on ${now.toISOString().slice(0, 10)}` };
+	const next = { ...raw, model: MIGRATED_MODEL, [MODEL_MIGRATION_KEY]: `${from} -> ${MIGRATED_MODEL} on ${now.toISOString().slice(0, 10)}` };
 	const tmp = `${configPath}.tmp`;
 	writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
 	renameSync(tmp, configPath);
@@ -353,11 +373,12 @@ export function revertModelMigration(configPath: string, now: Date = new Date())
 	if (raw[MODEL_REVERT_KEY] !== undefined) return { reverted: false, reason: 'already reverted once' };
 	if (raw.model !== MIGRATED_MODEL) return { reverted: false, reason: `model is ${String(raw.model)}, not the migrated one` };
 	if (raw[MODEL_CHOSEN_KEY] === raw.model) return { reverted: false, reason: 'model was chosen with the voice switch' };
-	let model = LEGACY_SEEDED_MODEL;
+	// Back to the model it came from: the stamp names it; else the backup copy; else the 3.1 template.
+	let model = migratedFromModel(raw[MODEL_MIGRATION_KEY]) ?? LEGACY_SEEDED_MODEL;
 	try {
-		const backupModel = JSON.parse(readFileSync(`${configPath}.bak-3.1`, 'utf-8'))?.model;
+		const backupModel = JSON.parse(readFileSync(legacyBackupPath(configPath, model), 'utf-8'))?.model;
 		if (typeof backupModel === 'string' && backupModel && backupModel !== MIGRATED_MODEL) model = backupModel;
-	} catch { /* no usable backup: the migration only ever moved the legacy model */ }
+	} catch { /* no usable backup: the stamp (or the template model) stands */ }
 	const next = { ...raw, model, [MODEL_REVERT_KEY]: `${MIGRATED_MODEL} -> ${model} on ${now.toISOString().slice(0, 10)} (model unavailable)` };
 	const tmp = `${configPath}.tmp`;
 	writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
