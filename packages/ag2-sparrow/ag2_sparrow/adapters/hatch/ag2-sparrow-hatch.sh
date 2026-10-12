@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # ag2-sparrow Hatch hook: wakes a Hatch worker for each task file Sparrow queued that it
-# has not woken for yet. Installed by `ag2-sparrow hatch install`; see the package README.
+# has not woken for yet. Installed by `ag2-sparrow-hatch install`; see the package README.
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
 CONFIG_FILE="${SPARROW_HATCH_CONFIG:-$HOME/.config/ag2-sparrow-hatch/config}"
 if [[ -f "$CONFIG_FILE" ]]; then
-  # Written by `ag2-sparrow hatch install`: KEY=VALUE lines, values shell-quoted.
+  # Written by `ag2-sparrow-hatch install`: KEY=VALUE lines, values shell-quoted.
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 fi
 AGENT="${AGENT_MXID:-}"
 if [[ ! "$AGENT" =~ ^@[^:]+:[^:]+$ ]]; then
-  log "ag2-sparrow-hatch not configured" '{"hint":"run: ag2-sparrow hatch install --mxid @your-agent:ag2.space"}'
-  silent "AGENT_MXID not configured; run ag2-sparrow hatch install" '{}'
+  log "ag2-sparrow-hatch not configured" '{"hint":"run: ag2-sparrow-hatch install --mxid @your-agent:ag2.space"}'
+  silent "AGENT_MXID not configured; run ag2-sparrow-hatch install" '{}'
 fi
 TASK_DIR="${TASK_DIR:-$HOME/.ag2-sparrow/task_dir}"
 RESULT_DIR="${RESULT_DIR:-$HOME/.ag2-sparrow/result_dir}"

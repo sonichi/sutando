@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -347,8 +348,18 @@ class Cli(Base):
         env["PATH"] = f"{self.bin}:{os.environ['PATH']}"
         env["AGENT_CONNECT_TASK_DIR"] = str(self.tasks)
         env["AGENT_CONNECT_RESULT_DIR"] = str(self.results)
-        return subprocess.run([sys.executable, "-m", "ag2_sparrow", "hatch", *args],
+        env["AGENT_CONNECT_STATE_DIR"] = str(self.state)
+        return subprocess.run([sys.executable, "-m", "ag2_sparrow.adapters.hatch.cli", *args],
                               env=env, capture_output=True, text=True, cwd=str(self.home))
+
+    @property
+    def state(self):
+        return self.home / "state"
+
+    def sparrow_status(self, age_s=0, connected=True, error=None):
+        self.state.mkdir(exist_ok=True)
+        (self.state / "gateway-status.json").write_text(json.dumps(
+            {"connected": connected, "ts": int(time.time()) - age_s, "error": error}))
 
     @property
     def script(self):
@@ -369,6 +380,7 @@ class Cli(Base):
         self.assertIn(f"AGENT_MXID={AGENT}", text)
         self.assertIn(f"TASK_DIR={self.tasks.resolve()}", text)
         self.assertIn(f"RESULT_DIR={self.results.resolve()}", text)
+        self.assertIn(f"STATE_DIR={self.state.resolve()}", text)
         again = self.cli("install", "--mxid", AGENT)
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertIn(f"unchanged: {self.script}", again.stdout)
@@ -392,9 +404,11 @@ class Cli(Base):
 
     def test_verify_passes_after_install(self):
         self.cli("install", "--mxid", AGENT)
+        self.sparrow_status(age_s=30)
         r = self.cli("verify")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        for check in ("hook script", "hook definition", "config", "task_dir", "tools", "heartbeat"):
+        for check in ("hook script", "hook definition", "config", "task_dir", "sparrow", "tools",
+                      "heartbeat"):
             self.assertIn(f"PASS {check}:", r.stdout)
         self.assertIn("Manual test: from another account, mention " + AGENT, r.stdout)
 
@@ -408,6 +422,26 @@ class Cli(Base):
         self.assertEqual(r.returncode, 1)
         self.assertIn("FAIL task_dir:", r.stdout)
         self.assertIn("PASS hook script:", r.stdout)
+
+    def test_verify_fails_when_sparrow_is_not_running(self):
+        self.cli("install", "--mxid", AGENT)
+        r = self.cli("verify")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("FAIL sparrow:", r.stdout)
+        self.assertIn("start ag2-sparrow", r.stdout)
+        self.sparrow_status(age_s=600)
+        r = self.cli("verify")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("FAIL sparrow:", r.stdout)
+        self.assertIn("last written 600s ago", r.stdout)
+        self.sparrow_status(connected=False, error="auth rejected HTTP 401")
+        r = self.cli("verify")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not connected: auth rejected HTTP 401", r.stdout)
+        self.sparrow_status()
+        r = self.cli("verify")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("PASS sparrow: running and connected", r.stdout)
 
     def test_bare_entry_still_starts_the_bridge(self):
         env = py_env(self.home)

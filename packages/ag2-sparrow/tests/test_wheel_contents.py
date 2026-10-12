@@ -81,10 +81,10 @@ def main():
         assert "ModuleNotFoundError" not in r.stderr, r.stderr
         assert "REMOTE_TASK_TOKEN" in r.stderr, f"expected the missing-token message:\n{r.stderr}"
         print("PASS installed wheel imports and ag2-sparrow fails cleanly without a token")
-        r = subprocess.run([str(bindir / "ag2-sparrow"), "hatch", "--help"], capture_output=True,
+        r = subprocess.run([str(bindir / "ag2-sparrow-hatch"), "--help"], capture_output=True,
                            text=True, cwd=d, env=env, timeout=60)
         assert r.returncode == 0 and "install" in r.stdout, f"{r.stdout}\n{r.stderr}"
-        print("PASS installed ag2-sparrow dispatches `hatch` to the Hatch adapter")
+        print("PASS installed ag2-sparrow-hatch runs the Hatch adapter")
 
 
 if __name__ == "__main__":

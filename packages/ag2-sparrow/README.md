@@ -231,10 +231,10 @@ Paste this to the Hatch agent, with its MXID filled in:
 > relay token in `~/.config/ag2-sparrow/relay.env` as one line
 > `REMOTE_TASK_TOKEN=<token>`, and `chmod 600` it. Start Sparrow in the
 > background with `AG2_DEVICE_ENV="$HOME/.config/ag2-sparrow/relay.env" ag2-sparrow`
-> and keep it running. Run `ag2-sparrow hatch install --mxid @my-agent:ag2.space`,
+> and keep it running. Run `ag2-sparrow-hatch install --mxid @my-agent:ag2.space`,
 > register the hook with `hooks.add` from the definition file it names, check it
 > with `hooks.dry_run`, start it with `hooks.enable`, then run
-> `ag2-sparrow hatch verify` and show me its output.
+> `ag2-sparrow-hatch verify` and show me its output.
 
 The token stays out of the hook, its config and the wake payload. Sparrow
 reads `REMOTE_TASK_TOKEN` from its environment or, failing that, from the
@@ -242,24 +242,31 @@ reads `REMOTE_TASK_TOKEN` from its environment or, failing that, from the
 alone does not supply the startup token: Sparrow only re-reads it after the
 relay rejects the token. Keep the `.env` file mode 600.
 
-`ag2-sparrow hatch install --mxid @x:ag2.space` writes:
+`ag2-sparrow-hatch install --mxid @x:ag2.space` writes:
 
 | File | Content |
 | --- | --- |
 | `~/hooks/scripts/ag2-sparrow-hatch.sh` | the hook script (a locally modified copy is shown as a diff and kept unless you pass `--force`) |
 | `~/hooks/definitions/ag2-sparrow-hatch.json` | parameters for `hooks.add`, with your MXID |
-| `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON` (mode 600) |
+| `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON` (mode 600) |
 
-`TASK_DIR` and `RESULT_DIR` are resolved the way `ag2-sparrow` resolves them
-(`AGENT_CONNECT_TASK_DIR` / `AGENT_CONNECT_RESULT_DIR`, else under
-`~/.ag2-sparrow/`), so run `install` with the same environment as Sparrow, or
-pass `--task-dir` / `--result-dir`. `--activity-file` moves the marker.
+`TASK_DIR`, `RESULT_DIR` and `STATE_DIR` are resolved the way `ag2-sparrow`
+resolves them (`AGENT_CONNECT_TASK_DIR` / `AGENT_CONNECT_RESULT_DIR` /
+`AGENT_CONNECT_STATE_DIR`, else under `~/.ag2-sparrow/`), so run `install` with
+the same environment as Sparrow, or pass `--task-dir` / `--result-dir` /
+`--state-dir`. `--activity-file` moves the marker.
 
-`ag2-sparrow hatch verify` prints one `PASS` or `FAIL` line each for the hook
-script, the hook definition, the config, the task dir, the tools the script
-needs (`jq`, `flock`, `timeout`) and the heartbeat, exits non-zero on any
+`ag2-sparrow-hatch verify` prints one `PASS` or `FAIL` line each for the hook
+script, the hook definition, the config, the task dir, Sparrow itself, the
+tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, exits non-zero on any
 `FAIL`, and ends with the manual test: mention the agent from another account
 and watch the reply land in that thread.
+
+Nothing restarts Sparrow for you: after a reboot or a crash the hook sees no
+new task files and only sends heartbeat wakes. `verify` fails its `sparrow`
+check when Sparrow's `state/gateway-status.json` is missing, not connected, or
+older than 3 minutes (Sparrow rewrites it every poll), so run it again after a
+restart.
 
 ## Optional: room-event subscription (0.3.0)
 

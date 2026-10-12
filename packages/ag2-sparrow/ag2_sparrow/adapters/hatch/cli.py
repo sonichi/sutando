@@ -1,4 +1,4 @@
-"""`ag2-sparrow hatch install|verify`: set up and check the Hatch hook on this host.
+"""`ag2-sparrow-hatch install|verify`: set up and check the Hatch hook on this host.
 
 install writes the hook script to ~/hooks/scripts/, the hook definition to
 ~/hooks/definitions/ and the config the script reads; verify checks that setup."""
@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from importlib import resources
 from pathlib import Path
 
@@ -22,6 +23,9 @@ from ... import _dirs
 HOOK_ID = "ag2-sparrow-hatch"
 SCRIPT_NAME = f"{HOOK_ID}.sh"
 HEARTBEAT_INTERVAL_S = 300
+# Sparrow rewrites its status file every poll round (long poll or backoff, each
+# at most about a minute), so an older file means it is not running.
+SPARROW_STATUS_MAX_AGE_S = 180
 MXID_RE = re.compile(r"^@[A-Za-z0-9._=+/-]+:[A-Za-z0-9.:-]+$")
 
 
@@ -84,9 +88,10 @@ def _install_file(path: Path, text: str, mode: int, *, refuse_drift: bool, force
 
 
 def render_config(mxid: str, task_dir: Path, result_dir: Path, activity_file: Path,
-                  python: str) -> str:
+                  python: str, state_dir: Path) -> str:
     rows = (("AGENT_MXID", mxid), ("TASK_DIR", str(task_dir)), ("RESULT_DIR", str(result_dir)),
-            ("ACTIVITY_FILE", str(activity_file)), ("SPARROW_PYTHON", python))
+            ("ACTIVITY_FILE", str(activity_file)), ("SPARROW_PYTHON", python),
+            ("STATE_DIR", str(state_dir)))
     return "".join(f"{k}={shlex.quote(v)}\n" for k, v in rows)
 
 
@@ -111,6 +116,7 @@ def install(args) -> int:
         return 2
     task_dir = Path(args.task_dir) if args.task_dir else _dirs.task_dir()
     result_dir = Path(args.result_dir) if args.result_dir else _dirs.result_dir()
+    state_dir = Path(args.state_dir) if args.state_dir else _dirs.state_dir()
     activity = Path(args.activity_file) if args.activity_file else _home() / ".muse" / "last_active"
     script = scripts_dir() / SCRIPT_NAME
     if not _install_file(script, _shipped(SCRIPT_NAME), 0o755, refuse_drift=True, force=args.force):
@@ -119,11 +125,11 @@ def install(args) -> int:
     _install_file(definitions_dir() / f"{HOOK_ID}.json", definition, 0o644,
                   refuse_drift=False, force=True)
     config = render_config(args.mxid, task_dir.resolve(), result_dir.resolve(),
-                           activity, sys.executable)
+                           activity, sys.executable, state_dir.resolve())
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
     print(f"\nNext: register the hook with hooks.add using {definitions_dir() / f'{HOOK_ID}.json'}, "
-          "test it with hooks.dry_run, start it with hooks.enable, then run: ag2-sparrow hatch verify")
+          "test it with hooks.dry_run, start it with hooks.enable, then run: ag2-sparrow-hatch verify")
     return 0
 
 
@@ -132,11 +138,35 @@ def _check(results: list, ok: bool, name: str, detail: str) -> None:
     print(f"{'PASS' if ok else 'FAIL'} {name}: {detail}")
 
 
+def sparrow_status_path(state_dir: Path) -> Path:
+    instance = (os.environ.get("GATEWAY_INSTANCE") or "").strip()
+    return state_dir / f"gateway-status{'.' + instance if instance else ''}.json"
+
+
+def check_sparrow(state_dir: Path, now: float | None = None) -> tuple[bool, str]:
+    """Is Sparrow running and connected, judged by the status file it rewrites each poll?"""
+    path = sparrow_status_path(state_dir)
+    try:
+        status = json.loads(path.read_text(encoding="utf-8"))
+        ts = float(status["ts"])
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return False, (f"{path} unreadable ({type(e).__name__}); Sparrow has not run with "
+                       "this state dir; start ag2-sparrow and keep it running")
+    age = int((time.time() if now is None else now) - ts)
+    if age > SPARROW_STATUS_MAX_AGE_S:
+        return False, (f"{path} last written {age}s ago; Sparrow is not running, so no task "
+                       "reaches the hook; restart ag2-sparrow")
+    if not status.get("connected"):
+        return False, (f"Sparrow is running but not connected: "
+                       f"{status.get('error') or 'no error given'}")
+    return True, f"running and connected ({path} written {max(age, 0)}s ago)"
+
+
 def verify(_args) -> int:
     results: list = []
     script = scripts_dir() / SCRIPT_NAME
     if not script.is_file():
-        _check(results, False, "hook script", f"{script} missing; run ag2-sparrow hatch install")
+        _check(results, False, "hook script", f"{script} missing; run ag2-sparrow-hatch install")
     elif not os.access(script, os.X_OK):
         _check(results, False, "hook script", f"{script} is not executable")
     elif script.read_text(encoding="utf-8", errors="replace") != _shipped(SCRIPT_NAME):
@@ -163,7 +193,7 @@ def verify(_args) -> int:
         problems = []
         if not MXID_RE.match(cfg.get("AGENT_MXID", "")):
             problems.append("AGENT_MXID is not an MXID")
-        for key in ("TASK_DIR", "RESULT_DIR", "ACTIVITY_FILE", "SPARROW_PYTHON"):
+        for key in ("TASK_DIR", "RESULT_DIR", "STATE_DIR", "ACTIVITY_FILE", "SPARROW_PYTHON"):
             if not cfg.get(key):
                 problems.append(f"{key} missing")
         if cfg.get("SPARROW_PYTHON"):
@@ -182,6 +212,10 @@ def verify(_args) -> int:
     _check(results, readable, "task_dir",
            str(task_dir) if readable else f"{task_dir} is not a readable directory; start "
            "ag2-sparrow with the same AGENT_CONNECT_TASK_DIR")
+
+    state_dir = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
+    ok, detail = check_sparrow(state_dir)
+    _check(results, ok, "sparrow", detail)
 
     missing = [tool for tool in ("jq", "flock", "timeout") if shutil.which(tool) is None]
     _check(results, not missing, "tools",
@@ -206,13 +240,14 @@ def verify(_args) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="ag2-sparrow hatch",
+    ap = argparse.ArgumentParser(prog="ag2-sparrow-hatch",
                                  description="Meta Hatch adapter for ag2-sparrow.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="install the Hatch hook script, definition and config")
     p.add_argument("--mxid", required=True, help="the agent's AG2 Space MXID")
     p.add_argument("--task-dir", help="Sparrow's task dir (default: as ag2-sparrow resolves it)")
     p.add_argument("--result-dir", help="Sparrow's result dir (default: as ag2-sparrow resolves it)")
+    p.add_argument("--state-dir", help="Sparrow's state dir (default: as ag2-sparrow resolves it)")
     p.add_argument("--activity-file", help="activity marker (default: ~/.muse/last_active)")
     p.add_argument("--force", action="store_true", help="replace a locally modified hook script")
     p.set_defaults(func=install)
