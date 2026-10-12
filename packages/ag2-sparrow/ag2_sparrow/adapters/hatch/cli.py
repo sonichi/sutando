@@ -10,19 +10,21 @@ import argparse
 import difflib
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 from importlib import resources
 from pathlib import Path
 
 from ... import _dirs, local_task_protocol, outbox
-from ...result_markers import has_skip_action, parse_markers
+from ...result_markers import parse_markers
 from .task_fields import valid_mxid
 
 HOOK_ID = "ag2-sparrow-hatch"
@@ -41,9 +43,11 @@ INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 SPARROW_OK, SPARROW_DOWN, SPARROW_NOT_CONNECTED = 0, 10, 11
 # The one command the hook prompt and worker_note tell a worker to run.
 REPLY_COMMAND = "ag2-sparrow-hatch"
+# install writes the absolute path here, so the worker's own PATH never decides it.
+REPLY_PLACEHOLDER = "<REPLY_COMMAND>"
 # `reply` exit codes: posted, not posted, usage, sent to Sparrow but not yet confirmed.
 REPLY_POSTED, REPLY_NOT_POSTED, REPLY_UNCONFIRMED = 0, 1, 3
-REPLY_WAIT_S = 30.0
+REPLY_WAIT_S, REPLY_WAIT_MAX_S, REPLY_MAX_BYTES = 30.0, 300.0, 64 * 1024
 
 
 def _shipped(name: str) -> str:
@@ -129,10 +133,12 @@ def _install_file(path: Path, text: str, mode: int, *, refuse_drift: bool, force
 
 
 def render_config(mxid: str, task_dir: Path, result_dir: Path, activity_file: Path,
-                  python: str, state_dir: Path, gateway_instance: str = "") -> str:
+                  python: str, state_dir: Path, gateway_instance: str = "",
+                  reply_command: str = "") -> str:
     rows = (("AGENT_MXID", mxid), ("TASK_DIR", str(task_dir)), ("RESULT_DIR", str(result_dir)),
             ("ACTIVITY_FILE", str(activity_file)), ("SPARROW_PYTHON", python),
-            ("STATE_DIR", str(state_dir)), ("GATEWAY_INSTANCE", gateway_instance))
+            ("STATE_DIR", str(state_dir)), ("GATEWAY_INSTANCE", gateway_instance),
+            ("REPLY_COMMAND", reply_command))
     return "".join(f"{k}={shlex.quote(v)}\n" for k, v in rows)
 
 
@@ -151,24 +157,47 @@ def read_config(path: Path) -> dict:
     return out
 
 
-def prompt_commands() -> set:
-    """The commands the shipped hook prompt tells a worker to run (its backticked spans)."""
-    prompt = json.loads(_shipped("hook-definition.json"))["prompt"]
-    return {span.split()[0] for span in re.findall(r"`([^`]+)`", prompt)}
+def _script_dirs() -> list:
+    """Where pip put this interpreter's console scripts (venv, system, then --user)."""
+    dirs = []
+    for scheme in (None, f"{os.name}_user", "osx_framework_user"):
+        try:
+            d = sysconfig.get_path("scripts", *(() if scheme is None else (scheme,)))
+        except KeyError:
+            continue
+        if d and d not in dirs:
+            dirs.append(d)
+    return dirs
 
 
-def reply_command_problem() -> str:
-    """Why a worker could not run a command the hook prompt names; empty when it can."""
-    missing = sorted(cmd for cmd in prompt_commands() if shutil.which(cmd) is None)
-    if not missing:
-        return ""
-    return (f"{', '.join(missing)} is not on PATH, so a woken worker cannot post a reply; add "
-            f"the directory pip installed it to (python3 -m site --user-base, then /bin) to "
-            f"PATH and run this again")
+def _runnable(path: "str | Path") -> bool:
+    return Path(path).is_file() and os.access(path, os.X_OK)
+
+
+def find_reply_command() -> str:
+    """Absolute path of the reply command beside this interpreter, else on PATH; '' if none."""
+    for d in _script_dirs():
+        if _runnable(Path(d) / REPLY_COMMAND):
+            return str(Path(d) / REPLY_COMMAND)
+    found = shutil.which(REPLY_COMMAND)
+    return os.path.abspath(found) if found else ""
+
+
+def reply_command_problem(path: str) -> str:
+    """Why a worker could not run `path` as the reply command; empty when it can."""
+    if not path:
+        return (f"{REPLY_COMMAND} was not found beside {sys.executable} or on PATH, so a woken "
+                "worker could not post a reply; reinstall ag2-sparrow[hatch] for this Python")
+    if not _runnable(path):
+        return f"{path} is not an executable file"
+    if path != shlex.quote(path):
+        return f"{path} needs shell quoting; install ag2-sparrow under a path without spaces"
+    return ""
 
 
 def install(args) -> int:
-    problem = reply_command_problem()
+    reply_command = find_reply_command()
+    problem = reply_command_problem(reply_command)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return 1
@@ -192,11 +221,13 @@ def install(args) -> int:
                          ours=_ours()):
         return 1
     _write(installed_marker_path(), _sha256(shipped) + "\n", 0o644)
-    definition = _shipped("hook-definition.json").replace("<AGENT_MXID>", args.mxid)
+    definition = (_shipped("hook-definition.json").replace("<AGENT_MXID>", args.mxid)
+                  .replace(REPLY_PLACEHOLDER, reply_command))
     _install_file(definitions_dir() / f"{HOOK_ID}.json", definition, 0o644,
                   refuse_drift=False, force=True)
     config = render_config(args.mxid, task_dir.resolve(), result_dir.resolve(),
-                           activity, sys.executable, state_dir.resolve(), instance)
+                           activity, sys.executable, state_dir.resolve(), instance,
+                           reply_command)
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
     print(f"\nNext: register the hook with hooks.add using {definitions_dir() / f'{HOOK_ID}.json'}, "
@@ -267,7 +298,7 @@ def verify(_args) -> int:
     definition: dict = {}
     try:
         definition = json.loads(definition_path.read_text(encoding="utf-8"))
-        bad = "<AGENT_MXID>" in json.dumps(definition) or \
+        bad = any(p in json.dumps(definition) for p in ("<AGENT_MXID>", REPLY_PLACEHOLDER)) or \
             Path(os.path.expanduser(definition.get("script_path", ""))) != script
         _check(results, not bad, "hook definition",
                str(definition_path) if not bad else f"{definition_path} has a placeholder or "
@@ -306,9 +337,13 @@ def verify(_args) -> int:
     code, detail = check_sparrow(state_dir, instance=cfg.get("GATEWAY_INSTANCE"))
     _check(results, code == SPARROW_OK, "sparrow", detail)
 
-    problem = reply_command_problem()
+    reply_command = cfg.get("REPLY_COMMAND", "")
+    problem = reply_command_problem(reply_command) if reply_command else \
+        "REPLY_COMMAND missing from the config; run ag2-sparrow-hatch install again"
+    if not problem and reply_command not in definition.get("prompt", ""):
+        problem = f"the hook prompt does not name {reply_command}; run install again"
     _check(results, not problem, "reply command",
-           problem or f"{REPLY_COMMAND} at {shutil.which(REPLY_COMMAND)}")
+           problem or f"{reply_command} (by absolute path, so the worker's PATH does not matter)")
 
     missing = [tool for tool in ("jq", "flock", "timeout") if shutil.which(tool) is None]
     _check(results, not missing, "tools",
@@ -339,33 +374,79 @@ def _installed_config() -> dict:
         return {}
 
 
+def _read_body(args) -> "tuple[str | None, str]":
+    """The reply text and, when it cannot be sent as a plain reply, why."""
+    if args.no_send:
+        return "[no-send]\n", ""
+    body = args.body if args.body is not None else sys.stdin.read(REPLY_MAX_BYTES + 1)
+    if not body.strip():
+        return None, "empty reply; pass the text on stdin, or use --no-send"
+    if len(body.encode("utf-8")) > REPLY_MAX_BYTES:
+        return None, f"reply over {REPLY_MAX_BYTES} bytes"
+    # Parsed exactly as the bridge's delivery path parses it (skip_after_channel=True).
+    actions = parse_markers(body, skip_after_channel=True).actions
+    if actions:
+        kinds = ", ".join(sorted({a.kind for a in actions}))
+        return None, (f"the reply carries a delivery marker ({kinds}) such as [REPLIED], "
+                      "[channel:], [thread] or [file:]; a reply is plain text to the asker's "
+                      "message only. Use --no-send to post nothing")
+    return body, ""
+
+
+def _claim(result_dir: Path, tid: str) -> bool:
+    """One reply per task, ever: the first caller's O_EXCL claim wins."""
+    claims = result_dir / ".hatch-reply-claims"
+    claims.mkdir(mode=0o700, exist_ok=True)
+    try:
+        os.close(os.open(claims / tid, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        return False
+    return True
+
+
+def _publish_once(result_file: Path, body: str) -> bool:
+    """Write `body` at `result_file` unless something already holds that name."""
+    fd, tmp = tempfile.mkstemp(dir=str(result_file.parent), prefix=f".{result_file.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.chmod(tmp, 0o600)
+        os.link(tmp, result_file)
+        return True
+    except FileExistsError:
+        return False
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
 def reply(args) -> int:
     cfg = _installed_config()
     result_dir = Path(cfg.get("RESULT_DIR") or _dirs.result_dir())
+    task_dir = Path(cfg.get("TASK_DIR") or _dirs.task_dir())
     result_file = Path(args.result_file).expanduser()
-    if not (result_file.suffix == ".txt" and local_task_protocol.valid_task_id(result_file.stem)
+    tid = result_file.stem
+    if not (result_file.suffix == ".txt" and local_task_protocol.valid_task_id(tid)
             and result_file.parent.resolve() == result_dir.resolve()):
         print(f"error: {result_file} is not a result_file from the wake payload "
               f"(task-<id>.txt in {result_dir})", file=sys.stderr)
         return 2
-    if args.no_send:
-        body = "[no-send]\n"
-    else:
-        body = args.body if args.body is not None else sys.stdin.read()
-        if not body.strip():
-            print("error: empty reply; pass the text on stdin, or use --no-send", file=sys.stderr)
-            return 2
-        if has_skip_action(parse_markers(body).actions):
-            print("error: the reply starts with a skip marker such as [REPLIED], so nothing would "
-                  "be posted; send the reply text itself, or use --no-send", file=sys.stderr)
-            return 2
+    if not (task_dir / f"{tid}.txt").is_file():
+        print(f"error: no open task {tid} in {task_dir}", file=sys.stderr)
+        return 2
+    if not (math.isfinite(args.wait) and 0 <= args.wait <= REPLY_WAIT_MAX_S):
+        print(f"error: --wait must be 0 to {REPLY_WAIT_MAX_S:g} seconds", file=sys.stderr)
+        return 2
+    body, why = _read_body(args)
+    if body is None:
+        print(f"error: {why}", file=sys.stderr)
+        return 2
     # task_fields lists only plain task ids, which Sparrow's outbox keys verbatim.
-    root, item = result_file.parent / ".outbox", result_file.stem
-    if result_file.exists() or outbox.item_status(root, item) is not None:
-        print(f"NOT posted: {result_file.name} already has a result; nothing written",
+    root, item = result_dir / ".outbox", tid
+    if (not _claim(result_dir, tid) or outbox.item_status(root, item) is not None
+            or not _publish_once(result_file, body)):
+        print(f"NOT posted: {result_file.name} already has a reply or result; nothing written",
               file=sys.stderr)
         return REPLY_NOT_POSTED
-    _write(result_file, body, 0o600)
     if args.no_send:
         print(f"closed: {result_file.name}, nothing posted")
         return REPLY_POSTED
@@ -382,7 +463,7 @@ def reply(args) -> int:
             return REPLY_NOT_POSTED
         if not result_file.exists() and outbox.item_status(root, item) != "DELIVERED":
             print(f"NOT posted: Sparrow withheld {result_file.name} (held for review or "
-                  f"quarantined in {result_file.parent / 'undelivered'})", file=sys.stderr)
+                  f"quarantined in {result_dir / 'undelivered'})", file=sys.stderr)
             return REPLY_NOT_POSTED
         if time.monotonic() >= deadline:
             _, detail = check_sparrow(Path(cfg.get("STATE_DIR") or _dirs.state_dir()),

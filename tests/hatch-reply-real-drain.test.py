@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -47,7 +48,8 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
-        self.home, self.results, tasks = root / 'home', root / 'results', root / 'tasks'
+        self.home, self.results = root / 'home', root / 'results'
+        self.tasks = tasks = root / 'tasks'
         for d in (self.home, self.results, tasks):
             d.mkdir()
         self.server = Gateway(refuse)
@@ -83,20 +85,23 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
                and k != 'CLAUDE_CONFIG_DIR'}
         env.update(HOME=str(self.home), PYTHONPATH=str(PKG),
                    AGENT_CONNECT_RESULT_DIR=str(self.results),
+                   AGENT_CONNECT_TASK_DIR=str(self.tasks),
                    AGENT_CONNECT_STATE_DIR=str(self.home / 'state'))
         proc = subprocess.Popen(
             [sys.executable, '-m', 'ag2_sparrow.adapters.hatch.cli', 'reply',
              str(self.results / f'{TID}.txt'), '--wait', '20'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=env, cwd=str(self.home))
-        proc.stdin.write(body)
-        proc.stdin.close()
-        deadline = time.monotonic() + 20
-        while proc.poll() is None and time.monotonic() < deadline:
+        done = {}
+        waiter = threading.Thread(target=lambda: done.update(
+            out=proc.communicate(input=body, timeout=30)))
+        waiter.start()
+        while waiter.is_alive():
             if (self.results / f'{TID}.txt').exists():
                 gw._post_ready_results({TID})
             time.sleep(0.05)
-        out, err = proc.communicate(timeout=30)
+        waiter.join()
+        out, err = done['out']
         return proc.returncode, out, err
 
     def test_posted_after_the_gateway_accepted_it(self):
@@ -113,6 +118,20 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         self.assertIn('NOT posted', err)
         self.assertNotIn('posted:', out)
         self.assertEqual(len(self.server.calls), 1)
+
+    def test_a_skip_behind_a_redirect_is_refused_before_anything_is_sent(self):
+        self.start()
+        rc, out, err = self.reply('[channel: !r:ag2.space]\n[REPLIED]\n')
+        self.assertEqual(rc, 2, out + err)
+        self.assertNotIn('posted:', out)
+        self.assertFalse((self.results / f'{TID}.txt').exists())
+        self.assertEqual(self.server.calls, [])
+
+    def test_a_redirect_to_another_room_is_refused(self):
+        self.start()
+        rc, out, err = self.reply('[channel: !other:ag2.space]\nhello\n')
+        self.assertEqual(rc, 2, out + err)
+        self.assertEqual(self.server.calls, [])
 
 
 if __name__ == '__main__':
