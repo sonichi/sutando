@@ -11,9 +11,10 @@ first (narrowed to the room's members when it over-matches), then the broker's
 room-scoped resolver, then the room's own member list — and posts an
 op:message with that mxid leading the body plus `mentions:[mxid]`.
 The broker routes on the mxid either way: it stamps `mentions` into `m.mentions`,
-and a member mxid in the plain body is matched as a whole token, auto-mentioned
-and rendered as a pill — so the peer is actually triggered and a human reading
-the room sees who was asked.
+and a member's FULL mxid in the plain body is matched as a whole token,
+auto-mentioned and rendered as a pill — so the peer is actually triggered and a
+human reading the room sees who was asked. A short @handle without :server is
+never linked and must not be relied on.
 
 Ambiguity never posts: two candidates from any source is a refusal carrying the
 candidate list, because mentioning the wrong agent is worse than mentioning
