@@ -105,7 +105,7 @@ When you review a PR (including another agent's), you MUST follow `CONTRIBUTING.
 - Review the current head and, for a stack, the child-only layer plus cumulative interaction. Re-check CI and approval freshness after every update/rebase.
 - Scan added lines for hardcoded host paths on every review; keep fixture exclusions token-specific so they cannot hide another real path on the same line.
 - Once a requested change is verified fixed, dismiss or replace the stale REQUEST_CHANGES state. If it remains, cite the exact unresolved behavior.
-- Merge only when the current head is mergeable, required CI + CLA are green, and two maintainers have recorded formal approvals. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
+- Merge only when the current head is mergeable, required CI + CLA are green, and it has the approvals the `main` ruleset requires. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
 
 **Review criteria live in `REVIEW.md` (single source of truth).** Don't duplicate the lessons here — read them from `REVIEW.md`. **Before reviewing, run `python3 skills/review-preflight/scripts/review-preflight.py <PR>`** — it reads `REVIEW.md` and prints the criteria inline; `scripts/review-checks.sh` runs the machine-readable `checks:` block (hardcoded-path scan) in CI; and Claude Code's managed GitHub-App reviewer reads `REVIEW.md` directly. Adding or editing a lesson is a PR to `REVIEW.md` only.
 

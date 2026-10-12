@@ -7,7 +7,8 @@
 # sort | uniq -c`. Full methodology and the areas considered and left out:
 # the "Sutando codeowners" doc (ww room) and its Product-core copy.
 #
-# GOVERNANCE: main requires code-owner review + 2 approvals, no self-approval.
+# GOVERNANCE: main requires code-owner review + the approval count the main
+# ruleset sets (currently 1), no self-approval.
 # @sonichi and @qingyun-wu are the only bypass actors (pull_request mode). A
 # singleton owner below is a hard block on their own PRs, and on anyone
 # else's if they're unavailable; the default recovery path is a bypass merge

@@ -317,7 +317,7 @@ and loads whichever repo it reviews.
     remembered one, is what authorizes.
 
 17. **`reviewDecision: APPROVED` is not the merge gate — check the base branch and
-    whether the approvers can approve.** The ruleset that requires two approvals scopes
+    whether the approvers can approve.** The ruleset's approval requirement scopes
     `ref_name.include` to `refs/heads/main` only, and GitHub counts an approval toward it
     only from an account with write access. `reviewDecision` is GitHub's summary of the
     review conversation, so it reads `APPROVED` on a single approval when the PR targets a
