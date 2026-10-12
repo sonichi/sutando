@@ -19,6 +19,7 @@ REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allo
 
 DISCORD = "src/discord-bridge.py"
 AG2 = "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"
+AG2_INSTANCE = "packages/ag2-sparrow/ag2_sparrow/gateway_instance.py"
 SLACK = "src/slack-bridge.py"
 
 # Each cell: (claim, [(path, pattern), ...]) — the anchors are what --verify
@@ -46,7 +47,8 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
                      (DISCORD, r"from ingress_identity import provider_task_id, already_admitted")]),
         "ag2space": ("`task-<inst>~<broker_id>` — injective mapping from the "
                      "provider id, so a replayed lease maps to the same file",
-                     [(AG2, r'return f"task-\{GATEWAY_INSTANCE\}~\{broker_tid\}"')]),
+                     [(AG2, r"gateway_instance\.local_tid\(broker_tid, GATEWAY_INSTANCE\)"),
+                      (AG2_INSTANCE, r'return f"task-\{instance\}~\{broker_tid\}" if instance')]),
         "slack": ("`task-sl<team>~<channel>-<ts>` via provider_task_id — "
                   "injective from the provider event, replay-deduped by "
                   "already_admitted",
