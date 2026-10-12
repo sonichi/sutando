@@ -121,11 +121,19 @@ class HookScript(Base):
         super().setUp()
         (self.home / "runtime.sh").write_text(RUNTIME)
         self.config = self.home / "config"
+        self.sparrow_state = self.home / "sparrow_state"
         self.config.write_text(f"AGENT_MXID={AGENT}\nTASK_DIR={self.tasks}\n"
-                               f"RESULT_DIR={self.results}\nSPARROW_PYTHON={sys.executable}\n")
+                               f"RESULT_DIR={self.results}\nSPARROW_PYTHON={sys.executable}\n"
+                               f"STATE_DIR={self.sparrow_state}\n")
+        self.sparrow_status()
         self.state = self.home / "state.json"
         self.events = self.home / "events"
         self.wake_out = self.home / "wake.json"
+
+    def sparrow_status(self, age_s=0):
+        self.sparrow_state.mkdir(exist_ok=True)
+        (self.sparrow_state / "gateway-status.json").write_text(
+            json.dumps({"connected": True, "ts": int(time.time()) - age_s}))
 
     def run_script(self, **env_extra):
         env = py_env(self.home)
@@ -279,6 +287,26 @@ class HookScript(Base):
         self.assertEqual(p["total"], 0)
         self.assertIn("Do nothing", p["worker_note"])
         self.assertGreater(json.loads(self.state.read_text())["last_wake_ms"], 1)
+
+    def test_heartbeat_reports_a_stopped_sparrow_and_how_to_restart(self):
+        self.sparrow_status(age_s=600)
+        self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 1}))
+        r = self.run_script(ACTIVITY_FILE=str(self.home / "absent"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.events_list()[-6:],
+                         ["LOG", "ag2-sparrow-hatch", "sparrow", "down", "WAKE", "STATE_SET"])
+        p = self.payload()
+        self.assertTrue(p["heartbeat"])
+        self.assertIn("Sparrow is not running", p["sparrow_down"])
+        self.assertIn("systemctl --user restart ag2-sparrow", p["worker_note"])
+        self.assertIn("post nothing", p["worker_note"])
+        self.assertIn(str(self.home / "absent"), p["worker_note"])
+
+    def test_heartbeat_with_sparrow_running_carries_no_sparrow_field(self):
+        self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 1}))
+        self.run_script(ACTIVITY_FILE=str(self.home / "absent"))
+        self.assertNotIn("sparrow_down", self.payload())
+        self.assertNotIn("sparrow down", " ".join(self.events_list()))
 
     def test_no_heartbeat_inside_window(self):
         self.add_task("task-1784700000001", "$reply")
@@ -581,7 +609,7 @@ class Cli(Base):
         r = self.cli("verify")
         self.assertEqual(r.returncode, 1)
         self.assertIn("FAIL sparrow:", r.stdout)
-        self.assertIn("start ag2-sparrow", r.stdout)
+        self.assertIn("start ag2-sparrow again", r.stdout)
         self.sparrow_status(age_s=600)
         r = self.cli("verify")
         self.assertEqual(r.returncode, 1)
@@ -597,6 +625,15 @@ class Cli(Base):
         r = self.cli("verify")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("PASS sparrow: running and connected", r.stdout)
+
+    def test_sparrow_subcommand(self):
+        r = self.cli("sparrow")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("systemctl --user restart ag2-sparrow", r.stdout)
+        self.sparrow_status()
+        r = self.cli("sparrow", "--state-dir", str(self.state))
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("running and connected", r.stdout)
 
     def test_verify_names_each_broken_part(self):
         self.cli("install", "--mxid", AGENT)

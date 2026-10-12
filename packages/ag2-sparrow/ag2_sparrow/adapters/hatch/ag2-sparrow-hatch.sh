@@ -14,6 +14,7 @@ AGENT="${AGENT_MXID:-}"
 TASK_DIR="${TASK_DIR:-$HOME/.ag2-sparrow/task_dir}"
 RESULT_DIR="${RESULT_DIR:-$HOME/.ag2-sparrow/result_dir}"
 PY="${SPARROW_PYTHON:-python3}"
+SPARROW_STATE_DIR="${STATE_DIR:-$HOME/.ag2-sparrow/state}"
 
 HOOK_ID="${HATCH_HOOK_ID:-ag2-sparrow-hatch}"
 STATE_DIR="$HOME/hooks/state"
@@ -105,6 +106,18 @@ if [[ "$n" -eq 0 ]]; then
   log "ag2-sparrow-hatch heartbeat wake" "{\"interval_ms\":$HEARTBEAT_INTERVAL_MS,\"activity_idle_ms\":$ACTIVITY_IDLE_MS}"
   reason="heartbeat: do nothing, exit immediately, post nothing"
   payload="$(jq -cn --arg note "$HEARTBEAT_NOTE" '{heartbeat: true, matches: [], total: 0, worker_note: $note}')"
+  # A dead Sparrow writes no task files, so the heartbeat is where it gets noticed.
+  sparrow_rc=0
+  sparrow_detail="$(timeout 10 "$PY" -m ag2_sparrow.adapters.hatch.cli sparrow \
+    --state-dir "$SPARROW_STATE_DIR" 2>/dev/null)" || sparrow_rc=$?
+  if [[ "$sparrow_rc" -eq 1 ]]; then
+    log "ag2-sparrow-hatch sparrow down" "$(jq -cn --arg d "$sparrow_detail" '{detail: $d}')"
+    reason="heartbeat: Sparrow is not running; restart it, post nothing"
+    payload="$(jq -cn --arg d "$sparrow_detail" --arg marker "$ACTIVITY_FILE" '{heartbeat: true,
+      matches: [], total: 0, sparrow_down: $d,
+      worker_note: ("Heartbeat. Touch " + $marker + ". Sparrow is not running, so no AG2 Space "
+                    + "message reaches you: " + $d + ". Do that, then exit; post nothing.")}')"
+  fi
 else
   reason="$n AG2 Space task(s) need answers"
   payload="$(printf '%s' "$result" | jq -c --arg note "$REMAINING_WORK_NOTE" --arg limits "$NON_OWNER_NOTE" \

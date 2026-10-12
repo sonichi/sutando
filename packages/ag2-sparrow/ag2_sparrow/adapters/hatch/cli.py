@@ -1,7 +1,8 @@
-"""`ag2-sparrow-hatch install|verify`: set up and check the Hatch hook on this host.
+"""`ag2-sparrow-hatch install|verify|sparrow`: set up and check the Hatch hook on this host.
 
 install writes the hook script to ~/hooks/scripts/, the hook definition to
-~/hooks/definitions/ and the config the script reads; verify checks that setup."""
+~/hooks/definitions/ and the config the script reads; verify checks that setup;
+sparrow checks only that Sparrow is running (the hook's heartbeat runs it)."""
 from __future__ import annotations
 
 import argparse
@@ -31,6 +32,8 @@ SPARROW_STATUS_MAX_AGE_S = 180
 RELEASED_SCRIPT_SHA256 = frozenset({
     "c68a6fce020a5aaea9f5c593021daccb95aeaf15ba6962d0303e42933ee23fb7",
 })
+RESTART_HINT = ("restart it: systemctl --user restart ag2-sparrow under the README's user "
+                "service, else start ag2-sparrow again as at install")
 
 
 def _shipped(name: str) -> str:
@@ -182,15 +185,21 @@ def check_sparrow(state_dir: Path, now: float | None = None) -> tuple[bool, str]
         ts = float(status["ts"])
     except (OSError, ValueError, KeyError, TypeError) as e:
         return False, (f"{path} unreadable ({type(e).__name__}); Sparrow has not run with "
-                       "this state dir; start ag2-sparrow and keep it running")
+                       f"this state dir; {RESTART_HINT}")
     age = int((time.time() if now is None else now) - ts)
     if age > SPARROW_STATUS_MAX_AGE_S:
         return False, (f"{path} last written {age}s ago; Sparrow is not running, so no task "
-                       "reaches the hook; restart ag2-sparrow")
+                       f"reaches the hook; {RESTART_HINT}")
     if not status.get("connected"):
         return False, (f"Sparrow is running but not connected: "
                        f"{status.get('error') or 'no error given'}")
     return True, f"running and connected ({path} written {max(age, 0)}s ago)"
+
+
+def sparrow(args) -> int:
+    ok, detail = check_sparrow(Path(args.state_dir) if args.state_dir else _dirs.state_dir())
+    print(detail)
+    return 0 if ok else 1
 
 
 def verify(_args) -> int:
@@ -284,6 +293,9 @@ def main(argv=None) -> int:
     p.set_defaults(func=install)
     v = sub.add_parser("verify", help="check the installed hook")
     v.set_defaults(func=verify)
+    s = sub.add_parser("sparrow", help="check that Sparrow is running (exit 1 if not)")
+    s.add_argument("--state-dir", help="Sparrow's state dir (default: as ag2-sparrow resolves it)")
+    s.set_defaults(func=sparrow)
     args = ap.parse_args(argv)
     return args.func(args)
 
