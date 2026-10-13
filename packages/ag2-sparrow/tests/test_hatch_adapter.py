@@ -27,6 +27,8 @@ sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import outbox  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli, task_fields  # noqa: E402
 
+REAL_SYSTEMD_RUN = hatch_cli._systemd_run
+
 # The CLIs run in-process so repository coverage traces them.
 SCRIPT = HATCH / "ag2-sparrow-hatch.sh"
 AGENT = "@watch-agent:ag2.space"
@@ -990,11 +992,14 @@ class Service(Base):
                      f"Environment=AGENT_CONNECT_RESULT_DIR={self.results.resolve()}",
                      f"Environment=AGENT_CONNECT_STATE_DIR={self.state.resolve()}",
                      "Restart=always", "RestartSec=10", "RestartPreventExitStatus=75",
+                     "StartLimitIntervalSec=300", "StartLimitBurst=5",
                      "WantedBy=default.target"):
             self.assertIn(line + "\n", text)
         self.assertNotIn("GATEWAY_INSTANCE", text)
         self.assertNotIn("s3cret", text)
         self.assertNotIn("REMOTE_TASK_TOKEN", text)
+        unit_section = text.split("[Service]")[0]
+        self.assertIn("StartLimitBurst=5", unit_section)  # [Unit] keys, not [Service]
         self.assertEqual(fake.ran("daemon-reload"), [["--user", "daemon-reload"]])
         self.assertEqual(fake.ran("enable"), [["--user", "enable", "--now", "ag2-sparrow.service"]])
         self.assertIn(["loginctl", "enable-linger", "hatch"], fake.calls)
@@ -1068,6 +1073,59 @@ class Service(Base):
         self.assertEqual(fake.ran("enable"), [])
         r = self.with_systemd(fake, "install", "--mxid", AGENT, "--force", env={"USER": "hatch"})
         self.assertTrue(self.unit.read_text().startswith(hatch_cli.SERVICE_MARKER))
+
+    def test_no_systemd_call_can_prompt_for_a_password(self):
+        fake, seen = FakeSystemd(linger_ok=False), []
+
+        def run(cmd, **kw):
+            seen.append((cmd, kw))
+            self.assertEqual(cmd[1], "--no-ask-password", cmd)
+            return fake([cmd[0], *cmd[2:]])
+        with mock.patch.object(hatch_cli, "_systemd_run", REAL_SYSTEMD_RUN), \
+                mock.patch.object(hatch_cli.subprocess, "run", side_effect=run):
+            r = self.cli("install", "--mxid", AGENT)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.cli("uninstall", "--service")
+        tools = {cmd[0] for cmd, _ in seen}
+        self.assertEqual(tools, {"systemctl", "loginctl"})
+        self.assertGreaterEqual(len(seen), 8)
+        for cmd, kw in seen:
+            self.assertEqual(cmd[1], "--no-ask-password", cmd)
+            self.assertIs(kw.get("stdin"), subprocess.DEVNULL, cmd)
+            self.assertEqual(kw.get("timeout"), hatch_cli.SYSTEMD_TIMEOUT_S, cmd)
+
+    def test_a_token_file_others_can_read_or_another_user_owns_is_flagged(self):
+        self.device_env.chmod(0o644)
+        r = self.with_systemd(FakeSystemd(), "install", "--mxid", AGENT, env={"USER": "hatch"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"holds your relay token but is mode 644; run: chmod 600 {self.device_env}",
+                      r.stdout)
+        self.assertNotIn("not owned by you", r.stdout)
+        self.device_env.chmod(0o600)
+        with mock.patch.object(hatch_cli.os, "getuid", return_value=os.getuid() + 1):
+            r = self.with_systemd(FakeSystemd(), "install", "--mxid", AGENT, env={"USER": "hatch"})
+        self.assertIn(f"{self.device_env} is not owned by you", r.stdout)
+        self.assertNotIn("is mode", r.stdout)
+
+    def test_uninstall_service(self):
+        fake = FakeSystemd()
+        self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+        fake.calls.clear()
+        r = self.with_systemd(fake, "uninstall", "--service")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(self.unit.exists())
+        self.assertEqual(fake.ran("disable"), [["--user", "disable", "--now", "ag2-sparrow.service"]])
+        self.assertEqual(len(fake.ran("daemon-reload")), 1)
+        self.assertEqual([c for c in fake.calls if c[0] == "loginctl"], [])
+        r = self.with_systemd(fake, "uninstall", "--service")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("nothing to remove", r.stdout)
+        self.assertEqual(self.with_systemd(fake, "uninstall").returncode, 2)
+        self.unit.parent.mkdir(parents=True, exist_ok=True)
+        self.unit.write_text("[Service]\nExecStart=/opt/mine\n")
+        r = self.with_systemd(fake, "uninstall", "--service")
+        self.assertEqual(r.returncode, 1)
+        self.assertTrue(self.unit.exists())
 
     def test_no_service_flag(self):
         fake = FakeSystemd()

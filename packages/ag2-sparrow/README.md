@@ -300,6 +300,9 @@ user service so it restarts after a crash or a reboot. It writes
 # Written by ag2-sparrow-hatch install; re-run install to update it.
 [Unit]
 Description=ag2-sparrow (AG2 Space listener)
+# A Sparrow that dies 5 times in 5 minutes (e.g. a rejected token) is left failed.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Environment=AG2_DEVICE_ENV=/home/you/.config/ag2-sparrow/relay.env
@@ -323,7 +326,10 @@ the hook always agree. The token never goes in the unit: Sparrow reads it from
 the `.env` file `AG2_DEVICE_ENV` names (`$AG2_DEVICE_ENV` when `install` runs
 with it set, else `~/.config/ag2-sparrow/relay.env`). `Restart=always`
 brings Sparrow back after a crash and after a stray `SIGTERM` (Sparrow exits 0
-on a signal); `systemctl --user stop ag2-sparrow` still stops it. A path with
+on a signal); `systemctl --user stop ag2-sparrow` still stops it. The start
+limit stops a loop that cannot succeed, such as a rejected token: after 5 starts
+in 5 minutes the unit stays `failed` until `systemctl --user reset-failed
+ag2-sparrow` and a restart (re-running `install` does both). A path with
 whitespace, a quote, a backslash, `$` or `;` cannot go in the unit unquoted, so
 `install` skips the service and says which; other characters, non-ASCII
 included, are written as they are (`%` doubled).
@@ -335,7 +341,10 @@ changed), `systemctl --user enable --now ag2-sparrow.service`, and
 `install` runs as root).
 Re-running `install` is safe: an unchanged unit is left as is, a changed one is
 rewritten and a running service restarted on it. None of these steps fails the
-install; each problem prints a `NOTE service:` line saying what was not done:
+install; each problem prints a `NOTE service:` line saying what was not done.
+Every `systemctl` and `loginctl` call runs with `--no-ask-password` and no
+stdin, so over SSH a polkit check fails at once instead of waiting for a
+password:
 
 - No systemd user manager (macOS, a container, no user bus): nothing is
   written. Keep `ag2-sparrow` running another way.
@@ -354,6 +363,14 @@ install; each problem prints a `NOTE service:` line saying what was not done:
   starts at your next login until `loginctl enable-linger "$USER"` succeeds.
 - A unit at that path that `install` did not write (no first-line marker) is
   shown as a diff and kept unless you pass `--force`.
+- The `.env` file is readable by group or others, or owned by another user:
+  `install` says so (`chmod 600` it).
+
+`ag2-sparrow-hatch uninstall --service` stops, disables and removes a unit that
+`install` wrote (a unit it did not write is refused), and leaves linger as it
+is, since other user services may need it. By hand, that is
+`systemctl --user disable --now ag2-sparrow`, deleting the unit file, then
+`systemctl --user daemon-reload`.
 
 Pass `--no-service` to skip all of this. Run `install` and `verify` with the
 same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE` variables as Sparrow.
@@ -366,8 +383,9 @@ when Sparrow is not running and 11 when it is running but not connected. The
 
 - Not running: the hook logs `ag2-sparrow-hatch sparrow down`, and the
   heartbeat wake carries `sparrow_down` and tells the worker to restart it
-  (`systemctl --user restart ag2-sparrow` under the service `install` set up,
-  or start `ag2-sparrow` again as at install).
+  (`systemctl --user reset-failed ag2-sparrow; systemctl --user restart
+  ag2-sparrow` under the service `install` set up, or start `ag2-sparrow` again
+  as at install).
 - Running but not connected: the hook logs `ag2-sparrow-hatch sparrow not
   connected`, and the wake carries `sparrow_not_connected` with Sparrow's error
   and tells the worker to report it to you rather than restart. A rejected

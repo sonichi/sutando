@@ -1,4 +1,4 @@
-"""`ag2-sparrow-hatch install|verify|sparrow|reply`: set up, check and answer through the Hatch hook.
+"""`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply`: set up, check and answer through the Hatch hook.
 
 install writes the hook script to ~/hooks/scripts/, the hook definition to
 ~/hooks/definitions/ and the config the script reads, and where systemd runs a user
@@ -215,9 +215,11 @@ def device_env_path() -> Path:
 
 
 def _systemd_run(cmd: list) -> "subprocess.CompletedProcess | None":
-    """Run a systemctl/loginctl command; None when it could not run at all."""
+    """Run a systemctl/loginctl command; None when it could not run at all.
+    Never prompts: over SSH a polkit password prompt would hang until the timeout."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=SYSTEMD_TIMEOUT_S)
+        return subprocess.run([cmd[0], "--no-ask-password", *cmd[1:]], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=SYSTEMD_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -241,7 +243,9 @@ def systemd_user_available() -> bool:
 
 def render_service(exec_start: str, env: dict) -> str:
     rows = "".join(f"Environment={k}={v}\n" for k, v in env.items())
-    return (f"{SERVICE_MARKER}\n[Unit]\nDescription=ag2-sparrow (AG2 Space listener)\n\n"
+    return (f"{SERVICE_MARKER}\n[Unit]\nDescription=ag2-sparrow (AG2 Space listener)\n"
+            "# A Sparrow that dies 5 times in 5 minutes (e.g. a rejected token) is left failed.\n"
+            "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
             f"[Service]\n{rows}ExecStart={exec_start}\nRestart=always\nRestartSec=10\n"
             "# 75: another Sparrow already polls this workspace; do not relaunch over it.\n"
             "RestartPreventExitStatus=75\n\n[Install]\nWantedBy=default.target\n")
@@ -310,6 +314,16 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
              "was set up. Reinstall ag2-sparrow for this Python and run install again")
         return
     device_env = device_env_path()
+    try:
+        st = device_env.stat()
+    except OSError:
+        st = None
+    if st is not None and st.st_mode & 0o077:
+        note(f"{device_env} holds your relay token but is mode {oct(st.st_mode & 0o777)[2:]}; "
+             f"run: chmod 600 {shlex.quote(str(device_env))}")
+    if st is not None and hasattr(os, "getuid") and st.st_uid != os.getuid():
+        note(f"{device_env} is not owned by you (uid {st.st_uid}); another user can change "
+             "the token Sparrow uses")
     env = {"AG2_DEVICE_ENV": str(device_env), "AGENT_CONNECT_TASK_DIR": str(task_dir),
            "AGENT_CONNECT_RESULT_DIR": str(result_dir), "AGENT_CONNECT_STATE_DIR": str(state_dir)}
     if instance:
@@ -461,8 +475,9 @@ def _check(results: list, ok: bool, name: str, detail: str) -> None:
     print(f"{'PASS' if ok else 'FAIL'} {name}: {detail}")
 
 
-RESTART_HINT = ("restart it: systemctl --user restart ag2-sparrow under the user service "
-                "install sets up, else start ag2-sparrow again as at install")
+RESTART_HINT = ("restart it: systemctl --user reset-failed ag2-sparrow; systemctl --user "
+                "restart ag2-sparrow under the user service install sets up, else start "
+                "ag2-sparrow again as at install")
 
 
 def sparrow_status_path(state_dir: Path, instance: str | None = None) -> Path:
@@ -592,6 +607,34 @@ def verify(_args) -> int:
           "few polls a task file appears in the task_dir, the hook wakes the worker, and the "
           "reply lands in that message's thread tagging you. hooks.logs shows the wake.")
     return 0 if all(results) else 1
+
+
+def uninstall(args) -> int:
+    """Stop, disable and remove the ag2-sparrow user service install wrote."""
+    if not args.service:
+        print("error: name what to remove: uninstall --service", file=sys.stderr)
+        return 2
+    unit = service_path()
+    if not unit.is_file():
+        print(f"nothing to remove: {unit} is not installed")
+        return 0
+    if not unit.read_text(encoding="utf-8", errors="replace").startswith(SERVICE_MARKER):
+        print(f"error: {unit} was not written by install; remove it yourself", file=sys.stderr)
+        return 1
+    if systemd_user_available():
+        r = _systemd_run(["systemctl", "--user", "disable", "--now", SERVICE_NAME])
+        if not _ok(r):
+            print(f"error: systemctl --user disable --now {SERVICE_NAME} failed ({_why(r)}); "
+                  f"{unit} was kept", file=sys.stderr)
+            return 1
+        print(f"stopped and disabled: {SERVICE_NAME}")
+    unit.unlink()
+    print(f"removed: {unit}")
+    if systemd_user_available():
+        _systemd_run(["systemctl", "--user", "daemon-reload"])
+    print("Linger was left as it is (other user services may need it); nothing restarts Sparrow "
+          "now, so keep ag2-sparrow running another way or run install again.")
+    return 0
 
 
 def _installed_config() -> dict:
@@ -738,6 +781,10 @@ def main(argv=None) -> int:
     p.add_argument("--no-service", action="store_true", help="do not set up the ag2-sparrow "
                    "systemd user service that restarts Sparrow")
     p.set_defaults(func=install)
+    u = sub.add_parser("uninstall", help="remove what install set up")
+    u.add_argument("--service", action="store_true", help="stop, disable and remove the "
+                   "ag2-sparrow user service")
+    u.set_defaults(func=uninstall)
     v = sub.add_parser("verify", help="check the installed hook")
     v.set_defaults(func=verify)
     s = sub.add_parser("sparrow", help=f"check that Sparrow is running (exit {SPARROW_DOWN}) "
