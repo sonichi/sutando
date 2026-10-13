@@ -4264,7 +4264,7 @@ function isLoopbackAddress(address: string | undefined): boolean {
 
 /** /voice-tasks/view: the task table on one page, refreshed every second from /voice-tasks. */
 const VOICE_TASKS_VIEW_HTML = `<!doctype html>
-<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Voice tasks</title>
 <style>
 body{font:14px/1.4 -apple-system,system-ui,sans-serif;margin:16px;background:#111;color:#eee}
@@ -4440,6 +4440,12 @@ const server = createServer((req, res) => {
 	// The relay agent's task table, live: what the voice agent last wrote to state/voice-task-status.json
 	// (every row with where the core stands and whether the user heard the answer, plus the pending count
 	// get_task_status reports). /voice-tasks is the JSON; /voice-tasks/view is a page that refreshes itself.
+	// The rows are the owner's spoken requests: local-only, like /api/task-history (review of #5348, B2).
+	if ((url.pathname === '/voice-tasks' || url.pathname === '/voice-tasks/view') && !LAN_SHARE && !isLoopbackAddress(req.socket.remoteAddress)) {
+		res.writeHead(403, { 'Content-Type': 'application/json' });
+		res.end(JSON.stringify({ error: 'voice tasks are local-only' }));
+		return;
+	}
 	if (url.pathname === '/voice-tasks') {
 		let body = '{"at":0,"pending":null,"working":0,"doneNotHeard":0,"tasks":[],"note":"the voice agent has not written state/voice-task-status.json yet"}';
 		try { body = readFileSync(join(STATE_DIR, 'voice-task-status.json'), 'utf-8'); } catch {}

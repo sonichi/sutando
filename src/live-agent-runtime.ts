@@ -22,7 +22,7 @@ import { meetingHoldsModel } from './meeting-input-hold.js';
 import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, voiceTaskStore, reconcileVoiceTasks, forwardOfflineVoiceResult, notPickedStillTrue } from './task-bridge.js';
-import { coveredTasks, createHandoffPacer, frameResult, resultIsMoot, type Handoff, type RelayAgent, type ResultItem } from './relay-agent.js';
+import { createHandoffPacer, frameResult, resultIsMoot, type Handoff, type RelayAgent, type ResultItem } from './relay-agent.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
 
@@ -138,8 +138,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	const record = (item: ResultItem, delivery: 'injected' | 'dm') => {
 		for (const id of [item.taskId, ...(item.alsoFor ?? [])]) if (id) voiceTaskStore.set(id, delivery);
 	};
-	const deliverElsewhere = (item: ResultItem) => {
-		if (meetingHoldsModel(session)) {
+	const holdForMeeting = (item: ResultItem) => {
 			heldForMeeting.push(item);
 			console.log(`${ts()} [TaskBridge] Meeting mode: holding the result until the meeting ends (${heldForMeeting.length} held)`);
 			heldTimer ??= setInterval(() => {
@@ -149,28 +148,33 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				for (const held of heldForMeeting.splice(0)) deliverElsewhere(held);
 			}, 2_000);
 			heldTimer.unref?.();
-			return;
-		}
+	};
+	const deliverElsewhere = (item: ResultItem) => {
+		if (meetingHoldsModel(session)) { holdForMeeting(item); return; }
 		pacer.submit(viaNotice(item));
 	};
 	const canSpeak = () => session.sessionManager.isActive && session.clientConnected;
 	const notice = (item: ResultItem) => canSpeak() && session.tryPublishSystemNotification(frameResult(item));
-	const ids = (item: ResultItem) =>
-		item.taskId ? [item.taskId, ...(item.alsoFor ?? [])] : (item.covers ?? []);
+	const ids = (item: ResultItem) => (item.taskId ? [item.taskId, ...(item.alsoFor ?? [])] : []);
 	const moot = (item: ResultItem) => (item.about ? !notPickedStillTrue(item.about) : resultIsMoot(voiceTaskStore, ids(item)));
 	// A result handed to the model as a system notice; it waits for a reconnect, then goes to the DM.
 	// Which tasks a result answers is read when it is handed: the core may mark one deduped into it after it landed.
 	const current = (item: ResultItem): ResultItem => (item.taskId ? { ...item, ...answering(item.taskId) } : item);
 	const viaNotice = (item: ResultItem): Handoff => ({
 		ids: ids(item), label: item.taskId ?? 'result', moot: () => moot(item),
-		hand: () => { const now = current(item); if (!notice(now)) return false; record(now, 'injected'); return true; },
-		fallback: () => retryThenDm(item),
+		hand: () => {
+			// A meeting that began while this waited its turn: not said into it (bodhi's notifications do not check).
+			if (meetingHoldsModel(session)) return false;
+			const now = current(item); if (!notice(now)) return false; record(now, 'injected'); return true;
+		},
+		fallback: () => (meetingHoldsModel(session) ? holdForMeeting(item) : retryThenDm(item)),
 	});
 	const retryThenDm = (item: ResultItem) => {
 		deliverWithRetry({
 			attempt: () => {
+				if (meetingHoldsModel(session)) { holdForMeeting(item); return true; }
 				if (!canSpeak()) return false;
-				pacer.submit({ ...viaNotice(item), fallback: () => toDm(item) });
+				pacer.submit({ ...viaNotice(item), fallback: () => (meetingHoldsModel(session) ? holdForMeeting(item) : toDm(item)) });
 				return true;
 			},
 			// A reconnect takes seconds; wait up to a minute for it before the DM.
@@ -212,7 +216,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		}
 	};
 	const deliver = (item: ResultItem) => {
-		// Corrected, or already said (e.g. in a summary that covered it): end its call, say nothing.
+		// Corrected, or already said: end its call, say nothing.
 		if (moot(item)) {
 			for (const id of ids(item)) opts.relay.endCall(id, 'delivered_separately');
 			console.log(`${ts()} [RelayAgent] ${item.taskId ?? 'result'}: already heard or corrected; not said`);
@@ -244,10 +248,9 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	};
 
 	startResultWatcher((result, deliveryNote, meta) => {
-		// A message with no task of its own (a summary) may speak for open voice tasks.
-		const covers = meta?.taskId ? [] : coveredTasks(voiceTaskStore, result);
-		if (covers.length) console.log(`${ts()} [RelayAgent] a message speaks for ${covers.join(', ')}`);
-		deliver({ text: result, note: deliveryNote, taskId: meta?.taskId, covers, ...answering(meta?.taskId) });
+		// A message with no task of its own (a summary) never stands in for a voice task's own result: numbers
+		// in common prove the two mention the same thing, not that one answers the other (review of #5348, B3).
+		deliver({ text: result, note: deliveryNote, taskId: meta?.taskId, ...answering(meta?.taskId) });
 	}, () => session.clientConnected);
 
 	// The relay agent's reconcile loop: whatever the core finished that the user has not heard

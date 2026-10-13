@@ -164,8 +164,6 @@ export interface ResultItem {
 	requests?: string[];
 	/** Other voice tasks this result answers (the core deduped them into it): recorded with it. */
 	alsoFor?: string[];
-	/** A message with no task of its own that speaks for these voice tasks (see coveredTasks). */
-	covers?: string[];
 	/** A status notice about this task (not its result): not said once it is no longer true. */
 	about?: string;
 }
@@ -196,25 +194,11 @@ export function resultIsMoot(store: VoiceTaskStore, ids: string[]): boolean {
 	return ids.every((id) => store.get(id)?.delivery === 'spoken');
 }
 
-/** What identifies a request beyond doubt: numbers of three or more digits, and quoted names. */
+/** What identifies a request beyond doubt: numbers of three or more digits, and quoted names (a correction names one). */
 export function requestMarks(request: string): string[] {
 	const numbers = request.match(/\d{3,}/g) ?? [];
 	const quoted = [...request.matchAll(/["“「]([^"”」]{2,})["”」]/g)].map((m) => m[1].toLowerCase());
 	return [...new Set([...numbers, ...quoted])];
-}
-
-/**
- * The open voice tasks a message with no task of its own (a summary the core wrote) speaks for:
- * those whose request marks all appear in it. A request with no such mark is never matched, so
- * an unmatched result is said as usual; a guess could only drop one.
- */
-export function coveredTasks(store: VoiceTaskStore, text: string, now = Date.now()): string[] {
-	const lower = text.toLowerCase();
-	const has = (mark: string) => /^\d+$/.test(mark) ? new RegExp(`(?<!\\d)${mark}(?!\\d)`).test(text) : lower.includes(mark);
-	return store.list()
-		.filter(([, row]) => row.delivery !== 'spoken' && !row.supersededBy && now - (row.submittedAt ?? 0) < SUPERSEDE_WINDOW_MS)
-		.filter(([, row]) => { const marks = requestMarks(row.text ?? ''); return marks.length > 0 && marks.every(has); })
-		.map(([id]) => id);
 }
 
 /** How long a handed-over result waits for the model's turn before the next one goes anyway. */
@@ -450,6 +434,9 @@ export interface RelayAgentDeps {
 	log?: (msg: string) => void;
 }
 
+/** After the user was asked about a request, the next call within this window is sent as it is. */
+export const ONE_ASK_WINDOW_MS = 2 * 60_000;
+
 /** A request sent this long ago and still unanswered is compared with new ones (a repeat is not sent twice). */
 export const OPEN_TASK_WINDOW_MS = 30 * 60_000;
 
@@ -459,7 +446,8 @@ interface Waiter {
 }
 
 /** How a waiting call ends without its result. bodhi reads a rejection out as a failure, so none rejects. */
-const ENDED: Record<'cancelled' | 'continuing' | 'delivered_separately' | 'continued_in_next', string> = {
+const ENDED: Record<'cancelled' | 'continuing' | 'delivered_separately' | 'continued_in_next' | 'not_sent', string> = {
+	not_sent: 'This call was cancelled before the request was sent; nothing was submitted.',
 	continued_in_next: 'The user was not finished: this request was sent together with what they said next. Say nothing about it.',
 	cancelled: 'The user cancelled this task and was already told. Do not mention it again.',
 	continuing: 'The task is still running; its result will come in a separate message.',
@@ -479,6 +467,8 @@ export class RelayAgent implements PersistentSubagentInstance {
 
 	/** When the voice model last called `work`: a turn it covered itself is not sent again by the turn check. */
 	private lastWorkCallAt = 0;
+	/** When the work check last had the user asked: the next call's answer is sent as it is. */
+	private askedAt = 0;
 	/** User turns waiting for the turn check (several when the user went on speaking). */
 	private turns: Array<{ text: string; at: number }> = [];
 	private turnsRunning = false;
@@ -576,11 +566,19 @@ export class RelayAgent implements PersistentSubagentInstance {
 			if (mine.joined) return framedSystem(ENDED.continued_in_next);
 			if (this.holding === mine) this.holding = null;
 		}
+		// bodhi cancelled the call (tool cancellation, the session closing) while it waited for the user or the check.
+		if (signal?.aborted) return framedSystem(ENDED.not_sent);
 		if (this.deps.check) {
 			// A request with a blank in it (which PR? which file?) is not submitted: the user is asked.
 			const verdict = await this.deps.check({ task: String(args.task ?? ''), recentConversation: this.deps.recentConversation?.() ?? '', openTasks: this.openTasks() }, signal)
 				.catch(() => ({ action: 'submit' as const }));
-			if (verdict.action === 'ask') {
+			if (signal?.aborted) return framedSystem(ENDED.not_sent);
+			// One question per request: the answer is sent as it is, even if the check still finds it vague
+			// ("the latest one") - the user is not interrogated (review of #5348).
+			if (verdict.action === 'ask' && Date.now() - this.askedAt < ONE_ASK_WINDOW_MS) {
+				this.deps.log?.(`[RelayAgent] the user was already asked about this; sending it as it is`);
+			} else if (verdict.action === 'ask') {
+				this.askedAt = Date.now();
 				this.deps.log?.(`[RelayAgent] not submitted, asking the user: ${verdict.question}`);
 				return framedSystem(`Nothing was submitted: the request does not say what it is about. Ask the user now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}" Then, with their answer, call work again.`);
 			}
@@ -595,6 +593,7 @@ export class RelayAgent implements PersistentSubagentInstance {
 				});
 			}
 		}
+		this.askedAt = 0; // this request goes; the next vague one may be asked about again
 		const submitted = await this.deps.submit(args);
 		const taskId = submitted.taskId;
 		if (submitted.status !== 'pending' || typeof taskId !== 'string') return JSON.stringify(submitted);
@@ -635,20 +634,31 @@ export class RelayAgent implements PersistentSubagentInstance {
 	}
 
 	/**
-	 * The model said this task corrects an earlier request (`replaces` names it, e.g. a misheard
-	 * number). The table marks every recent request containing those words, not yet heard, as
-	 * superseded: its result is not said, and its waiting call ends.
+	 * The model said this task corrects an earlier request (`replaces` names it: a task id, or the
+	 * misheard number or quoted name). Only a whole mark counts, never a word like "PR" (review of
+	 * #5348, B4: `replaces: 'pr'` superseded every unheard request), and only the most recent unheard
+	 * request that carries it is superseded: its result is not said, and its waiting call ends.
 	 */
 	private supersede(taskId: string, replaces: string): void {
-		const needle = replaces.toLowerCase();
 		const since = Date.now() - SUPERSEDE_WINDOW_MS;
-		for (const [id, row] of this.deps.store.list()) {
-			if (id === taskId || row.delivery === 'spoken' || row.supersededBy || (row.submittedAt ?? 0) < since) continue;
-			if (!row.text?.toLowerCase().includes(needle)) continue;
-			this.deps.store.setSupersededBy(id, taskId);
-			this.endCall(id, 'delivered_separately');
-			this.deps.log?.(`[RelayAgent] ${id}: corrected by ${taskId}; its result will not be said`);
+		const byId = /^task-\d+$/.test(replaces);
+		const marks = byId ? [] : requestMarks(replaces);
+		if (!byId && marks.length === 0) {
+			this.deps.log?.(`[RelayAgent] ${taskId}: "replaces" names no task or number (${replaces}); nothing corrected`);
+			return;
 		}
+		const target = this.deps.store.list()
+			.filter(([id, row]) => id !== taskId && row.delivery !== 'spoken' && !row.supersededBy && (row.submittedAt ?? 0) >= since)
+			.filter(([id, row]) => byId ? id === replaces : marks.every((m) => requestMarks(row.text ?? '').includes(m)))
+			.pop();
+		if (!target) {
+			this.deps.log?.(`[RelayAgent] ${taskId}: no unheard request carries "${replaces}"; nothing corrected`);
+			return;
+		}
+		const [id] = target;
+		this.deps.store.setSupersededBy(id, taskId);
+		this.endCall(id, 'delivered_separately');
+		this.deps.log?.(`[RelayAgent] ${id}: corrected by ${taskId}; its result will not be said`);
 	}
 
 	/** Ends the call waiting on `taskId` without its result. False when none waits. */

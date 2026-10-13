@@ -15,7 +15,7 @@ mkdirSync(join(TMP, 'results'), { recursive: true });
 
 const { wireDurableChannels } = await import('../src/live-agent-runtime.js');
 const { RelayAgent, NOT_PICKED_MS } = await import('../src/relay-agent.js');
-const { voiceTaskStore, setVoiceTaskEndedListener, voiceTaskRows } = await import('../src/task-bridge.js');
+const { voiceTaskStore, setVoiceTaskEndedListener, voiceTaskRows, voiceTaskState } = await import('../src/task-bridge.js');
 const { voiceTaskCounts } = await import('../src/inline-tools.js');
 
 after(() => rmSync(TMP, { recursive: true, force: true }));
@@ -125,12 +125,13 @@ describe('relay agent end to end', () => {
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
 		const call = relay.invoke('Execute tool: work', { task: 'check PR 5167' });
 		await tick(0);
-		const talking = setInterval(() => session.emit('speech.user_started'), 50); // the user keeps talking
+		// The user has just spoken and the model has not answered: the result waits its turn (reply wait, 8 s).
+		session.emit('speech.user_started');
+		session.emit('speech.user_ended');
 		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 5167 is open.');
-		await tick(2_600); // the watcher (2 s) has taken the result; it waits in the pacer for the user's turn to end
-		assert.equal(heard(id), false, 'waits while the user talks');
+		await tick(2_600); // the watcher (2 s) has taken the result; it waits in the pacer for the model's turn
+		assert.equal(heard(id), false, 'waits while the user\'s turn is open');
 		assert.equal(relay.isWaiting(id), true);
-		clearInterval(talking);
 		session.clientConnected = false; // the user closes the page
 		session.emit('speech.user_ended');
 		session.emit('turn.start'); session.emit('response.first_audio'); session.emit('turn.end', { turnId: 't5167' } as never);
@@ -213,23 +214,22 @@ describe('relay agent end to end', () => {
 		assert.ok(!sent.slice(before).some((t) => t.includes('51167')), 'the corrected request\'s result is never said');
 	});
 
-	it('a summary naming open voice tasks\' requests: once it is said, their own results are not said again', async () => {
-		const [a, b] = ['5302', '5229'].map((pr) => voiceTask(`check PR ${pr}`));
-		const calls = [a, b].map((id) => { submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true }; return relay.invoke('Execute tool: work', {}); });
+	it('a summary that names an open task\'s PR does not stand in for its result: the task\'s own answer is still said', async () => {
+		// Review of #5348, B3: "[proactive] CI failed on PR 5302" made the task "check PR 5302" count as heard, and
+		// its real answer was then dropped, not said and not sent to the DM.
+		const a = voiceTask('check the review status of PR 5302');
+		submitted = { status: 'pending', taskId: a, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', {});
 		await tick(0);
 		const before = sent.length;
-		writeFileSync(join(TMP, 'results', `proactive-summary-${Date.now()}.txt`), 'Both PRs: 5302 waits for review; 5229 conflicts.');
-		await until(() => sent.slice(before).some((t) => t.includes('Both PRs')));
+		writeFileSync(join(TMP, 'results', `proactive-summary-${Date.now()}.txt`), 'CI failed on PR 5302 (lint).');
+		await until(() => sent.slice(before).some((t) => t.includes('CI failed on PR 5302')));
 		session.emit('turn.start');
 		session.emit('response.first_audio');
 		session.emit('turn.end', { turnId: 't21' } as never);
-		assert.equal(voiceTaskStore.get(a)?.delivery, 'spoken');
-		assert.equal(voiceTaskStore.get(b)?.delivery, 'spoken');
-		writeFileSync(join(TMP, 'results', `${a}.txt`), 'PR 5302 detail.');
-		writeFileSync(join(TMP, 'results', `${b}.txt`), 'PR 5229 detail.');
-		for (const c of calls) assert.match(await c, /delivered to the user separately/, 'their calls end without saying them');
-		await tick(800);
-		assert.ok(!sent.slice(before).some((t) => /PR 5302 detail|PR 5229 detail/.test(t)), 'not said again');
+		assert.notEqual(voiceTaskStore.get(a)?.delivery, 'spoken', 'the task is not heard because a message mentioned its PR');
+		writeFileSync(join(TMP, 'results', `${a}.txt`), 'PR 5302 waits for one approval.');
+		assert.match(await call, /waits for one approval/, 'its own answer comes back through its call');
 	});
 
 	it('the core answers three requests in one result and marks the other two deduped while it waits its turn: said once, all three named, nothing handed over again', async () => {
@@ -237,14 +237,16 @@ describe('relay agent end to end', () => {
 		const calls = [a, b, c].map((id) => { submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true }; return relay.invoke('Execute tool: work', {}); });
 		await tick(0);
 		const before = sent.length;
-		// The user keeps talking, so the result waits in the queue while the markers land.
-		const talking = setInterval(() => session.emit('speech.user_started'), 50);
+		// The user has just spoken and the model has not answered: the result waits in the queue while the markers land.
+		session.emit('speech.user_started');
+		session.emit('speech.user_ended');
 		writeFileSync(join(TMP, 'results', `${a}.txt`), 'Three PRs: 5302 waits for review; 5229 needs a rebase; 5167 waits for you.');
 		await until(() => !existsSync(join(TMP, 'results', `${a}.txt`)) || sent.length > before, 3_000);
 		writeFileSync(join(TMP, 'results', `${b}.txt`), `[deduped: ${a}]`);
 		writeFileSync(join(TMP, 'results', `${c}.txt`), `[deduped: ${a}]`);
 		await until(() => [b, c].every((id) => voiceTaskStore.get(id)?.answeredBy === a));
-		clearInterval(talking);
+		// The model answers the user: the queue moves.
+		session.emit('turn.start'); session.emit('response.first_audio'); session.emit('turn.end', { turnId: 't-reply' } as never);
 		const said = await calls[0];
 		for (const pr of ['5302', '5229', '5167']) assert.ok(said.includes(`"check PR ${pr}"`), `request ${pr} named to the model`);
 		for (const call of calls.slice(1)) assert.match(await call, /answered_together/);
@@ -281,13 +283,18 @@ describe('relay agent end to end', () => {
 		const call = relay.invoke('Execute tool: work', {});
 		await tick(0);
 		const before = sent.length;
-		// The user keeps talking, so nothing queued is handed over yet.
-		const talking = setInterval(() => session.emit('speech.user_started'), 50);
+		// The user has just spoken and the model has not answered yet: nothing queued is handed over until it does
+		// (the reply wait, 8 s by default). One explicit turn, no stream of events a loaded runner can delay (review B1).
+		session.emit('speech.user_started');
+		session.emit('speech.user_ended');
 		await until(() => !!voiceTaskStore.get(id)?.notPickedNoticed, 3_000);
 		assert.ok(voiceTaskStore.get(id)?.notPickedNoticed, 'the notice is queued');
 		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The fish is a safe choice.');
-		await tick(400);
-		clearInterval(talking);
+		await until(() => voiceTaskState(id) !== 'queued', 4_000);
+		// The model answers the user: the queue moves. The notice is no longer true and is dropped; the result goes.
+		session.emit('turn.start');
+		session.emit('response.first_audio');
+		session.emit('turn.end', { turnId: 't-fish' } as never);
 		assert.match(await call, /safe choice/, 'the answer goes back through its call');
 		await tick(400);
 		assert.ok(!sent.slice(before).some((t) => t.includes('has not been picked up')), 'the stale notice is not said');

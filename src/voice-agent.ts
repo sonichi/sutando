@@ -76,7 +76,7 @@ import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voi
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
 import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines } from './relay-agent.js';
 import { createVoiceTaskStatusWriter } from './voice-task-status-writer.js';
-import { createGeminiTurnClassifier, createGeminiWorkCheck } from './work-request-check.js';
+import { createGeminiTurnClassifier, createGeminiWorkCheck, WORK_CHECK_MODEL } from './work-request-check.js';
 import {
 	classifyTransportClose,
 	fatalCloseForRecovery,
@@ -282,7 +282,7 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 // googleSearch=false for low-latency voice conversations; this PR does not
 // claim a new code-heavy workload benchmark. Phone inherits the
 // package default (2.5+search) unless its own config overrides it.
-import { loadVoiceConfig, migrateLegacyModel, revertModelMigration, resolveSessionTuning } from './voice-config.js';
+import { loadVoiceConfig, migrateLegacyModel, revertModelMigration, resolveSessionTuning, resolveRelayCheck } from './voice-config.js';
 import { fireGuardedRestart, isVoiceAgentLaunchdManaged, restartAfterModelRevert } from './voice-config-switch.js';
 const _voiceAgentDir = dirname(fileURLToPath(import.meta.url));
 const VOICE_AGENT_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'voice-agent.json');
@@ -313,6 +313,8 @@ const VOICE_SHADOW_STT = VOICE_AGENT_CONFIG.shadowStt === true;
 // "divergenceCorrection": true additionally speaks a self-correction when
 // the shadow pass disagrees. Requires shadowStt.
 const VOICE_DIVERGENCE_CORRECTION = VOICE_AGENT_CONFIG.divergenceCorrection === true;
+// The relay agent's text-model checks: on by default; "relayCheck": false turns them off, {"model": …} picks the model.
+const RELAY_CHECK = resolveRelayCheck(VOICE_AGENT_CONFIG, WORK_CHECK_MODEL);
 // Phase 0.5 seams (design §2.1/§2.2): OFF unless configured — with nothing
 // set the VoiceSession config carries neither key and the wire behaviour is
 // byte-identical to the previous build (the Phase 0.5 gate). A half-set or
@@ -994,13 +996,13 @@ async function main() {
 		store: voiceTaskStore,
 		speech: speechGate,
 		// A text model, not the voice model, decides whether a request is complete enough to submit.
-		check: createGeminiWorkCheck({ apiKey: () => GEMINI_VOICE_API_KEY, log: (m) => console.log(`${ts()} ${m}`) }),
+		check: RELAY_CHECK ? createGeminiWorkCheck({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`) }) : undefined,
 		// From the live conversation, not conversation.log: the log is written asynchronously, so a check that
 		// starts right after a turn would miss the voice model's own reply (2026-10-12 00:06: it missed "哪一个餐馆？"
 		// and sent "那个餐馆的 menu" with the blank in it).
 		recentConversation: () => recentConversationLines(sessionRef?.conversationContext.items ?? [], 8) || getRecentConversation(8),
 		// Every finished user turn too, whatever tool the voice model chose: is it a request for the core?
-		classify: createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, log: (m) => console.log(`${ts()} ${m}`) }),
+		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`) }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
 		log: (msg) => console.log(`${ts()} ${msg}`),
 	});

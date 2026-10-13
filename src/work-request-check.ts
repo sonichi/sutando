@@ -29,7 +29,8 @@ export interface WorkCheckInput {
 
 export type WorkRequestCheck = (input: WorkCheckInput, signal?: AbortSignal) => Promise<WorkCheck>;
 
-export const WORK_CHECK_MODEL = process.env.WORK_CHECK_MODEL || 'gemini-3-flash-preview';
+/** The default model of the relay checks; voice-agent.json `relayCheck.model` overrides it. */
+export const WORK_CHECK_MODEL = 'gemini-3-flash-preview';
 export const WORK_CHECK_TIMEOUT_MS = 4_000;
 
 export function workCheckPrompt(i: WorkCheckInput): string {
@@ -153,9 +154,10 @@ async function geminiJson(opts: { apiKey: string; model: string; timeoutMs: numb
 	const timer = setTimeout(() => ctl.abort(), opts.timeoutMs);
 	opts.signal?.addEventListener('abort', () => ctl.abort(), { once: true });
 	try {
-		const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${opts.model}:generateContent?key=${opts.apiKey}`, {
+		// The key in a header, never the URL, so it cannot end up in a logged URL.
+		const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${opts.model}:generateContent`, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: { 'Content-Type': 'application/json', 'x-goog-api-key': opts.apiKey },
 			body: JSON.stringify({
 				contents: [{ parts: [{ text: opts.prompt }] }],
 				// A thinking model spends the output budget on thinking and returns a cut-off "{"action":" (seen 2026-10-12):

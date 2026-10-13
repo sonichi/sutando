@@ -13,7 +13,7 @@ process.env.SUTANDO_TEST_MODE = '1';
 const MONTH = new Date().toISOString().slice(0, 7);
 for (const d of ['tasks', 'results', join('tasks', 'archive', MONTH), join('results', 'archive', MONTH), join('state', 'activity')]) mkdirSync(join(TMP, d), { recursive: true });
 
-const { RelayAgent, createHandoffPacer, coveredTasks, requestMarks, relayAgentSubagentConfig, createVoiceTaskStore, frameResult, planReconcile, NOT_PICKED_MS, MAX_REPLAYS, SAY_WHICH_ONE, SAY_WHICH_EACH, createSpeechGate } = await import('../src/relay-agent.js');
+const { RelayAgent, createHandoffPacer, requestMarks, relayAgentSubagentConfig, createVoiceTaskStore, frameResult, planReconcile, NOT_PICKED_MS, MAX_REPLAYS, SAY_WHICH_ONE, SAY_WHICH_EACH, createSpeechGate } = await import('../src/relay-agent.js');
 const { frameTaskResult } = await import('../src/inject-framing.js');
 const tb = await import('../src/task-bridge.js');
 const { _pendingTasksForTest, voiceTaskStore, MISSED_RESULT_NOTE, _forwardOfflineThenArchive, reconcileVoiceTasks, voiceTaskRows, voiceTasksAhead } = tb;
@@ -176,6 +176,57 @@ describe('relay agent: a text model checks a request before it is submitted', ()
 		assert.deepEqual(parseWorkCheck('{"action":"submit"}'), { action: 'submit' });
 		assert.deepEqual(parseWorkCheck('{"action":"ask"}'), { action: 'submit' }, 'an ask with no question is not an ask');
 		assert.deepEqual(parseWorkCheck('sure, go ahead'), { action: 'submit' });
+	});
+});
+
+describe('relay agent: review of #5348, should-fixes', () => {
+	it('the user is asked once per request: the next call\'s answer is sent as it is', async () => {
+		const store = createVoiceTaskStore();
+		const submitted: string[] = [];
+		const relay = new RelayAgent({
+			store,
+			check: async () => ({ action: 'ask', question: '哪个 PR？' }),
+			submit: async (args) => { submitted.push(String(args.task)); return { status: 'pending', taskId: 'task-q1', queuedAhead: 0, watcherOnline: true, message: 'm' }; },
+		});
+		assert.match(await relay.invoke('w', { task: '查一下那个 PR' }), /Ask the user now/);
+		void relay.invoke('w', { task: '查一下最新的那个 PR' });
+		await tick(5);
+		assert.deepEqual(submitted, ['查一下最新的那个 PR'], 'not asked a second time');
+	});
+
+	it('a call bodhi cancels while it waits is not submitted', async () => {
+		const store = createVoiceTaskStore();
+		const submitted: string[] = [];
+		const speech = createSpeechGate({ quietMs: 60, maxHoldMs: 2_000 });
+		const relay = new RelayAgent({ store, speech, submit: async (args) => { submitted.push(String(args.task)); return {}; } });
+		const ctl = new AbortController();
+		speech.onUserSpeechStarted();
+		const call = relay.invoke('w', { task: 'check PR 1' }, ctl.signal);
+		await tick(10);
+		ctl.abort();
+		assert.match(await call, /nothing was submitted/);
+		assert.deepEqual(submitted, []);
+	});
+
+	it('relayCheck in voice-agent.json: absent = on with the default model, false or enabled:false = off, model picks it', async () => {
+		const { resolveRelayCheck } = await import('../src/voice-config.js');
+		assert.deepEqual(resolveRelayCheck({}, 'm0'), { model: 'm0' });
+		assert.equal(resolveRelayCheck({ relayCheck: false }, 'm0'), null);
+		assert.equal(resolveRelayCheck({ relayCheck: { enabled: false } }, 'm0'), null);
+		assert.deepEqual(resolveRelayCheck({ relayCheck: { model: ' gemini-x ' } }, 'm0'), { model: 'gemini-x' });
+		assert.deepEqual(resolveRelayCheck({ relayCheck: 'yes' as never }, 'm0'), { model: 'm0' }, 'malformed means the default');
+		const src = (f: string) => readFileSync(join(import.meta.dirname ?? '.', '..', 'src', f), 'utf-8');
+		assert.ok(!src('work-request-check.ts').includes('process.env'), 'no undocumented env var');
+		assert.ok(src('voice-agent.config.json.example').includes('_comment_relayCheck'));
+		assert.ok(src('work-request-check.ts').includes("'x-goog-api-key': opts.apiKey") && !src('work-request-check.ts').includes('?key='), 'the key goes in a header');
+	});
+
+	it('the task page is local-only, and a result waiting its turn is not said into a meeting that began meanwhile', () => {
+		const src = (f: string) => readFileSync(join(import.meta.dirname ?? '.', '..', 'src', f), 'utf-8');
+		assert.match(src('web-client.ts'), /\(url\.pathname === '\/voice-tasks' \|\| url\.pathname === '\/voice-tasks\/view'\) && !LAN_SHARE && !isLoopbackAddress\(req\.socket\.remoteAddress\)/);
+		const rt = src('live-agent-runtime.ts');
+		assert.match(rt, /hand: \(\) => \{\n\t\t\t\/\/[^\n]*\n\t\t\tif \(meetingHoldsModel\(session\)\) return false;/);
+		assert.match(rt, /attempt: \(\) => \{\n\t\t\t\tif \(meetingHoldsModel\(session\)\) \{ holdForMeeting\(item\); return true; \}/);
 	});
 });
 
@@ -349,7 +400,7 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 	it('the voice agent hands every real user turn to the relay agent', () => {
 		const agentSrc = readFileSync(join(import.meta.dirname ?? '.', '..', 'src', 'voice-agent.ts'), 'utf-8');
 		assert.match(agentSrc, /relayAgent\.onUserTurn\(item\.content\)/);
-		assert.match(agentSrc, /classify: createGeminiTurnClassifier\(/);
+		assert.match(agentSrc, /classify: RELAY_CHECK \? createGeminiTurnClassifier\(/);
 	});
 });
 
@@ -933,19 +984,52 @@ describe('hand-off pacer: one result at a time, confirmed by the model\'s turn',
 	});
 });
 
-describe('which open voice tasks a summary speaks for', () => {
+describe('a correction supersedes one request, by a whole mark', () => {
 	it('a request is matched only by its sure marks: numbers of three or more digits, quoted names', () => {
 		assert.deepEqual(requestMarks('Check the status and details of PR #5302.'), ['5302']);
 		assert.deepEqual(requestMarks('查一下 "Meeting notes" 那封邮件'), ['meeting notes']);
 		assert.deepEqual(requestMarks('what is the weather tomorrow'), [], 'no sure mark: never matched');
 	});
 
-	it('5167 is not 51167; every mark must appear; heard and corrected rows are left out', () => {
+	function agent() {
 		const store = createVoiceTaskStore();
-		store.add('task-a', 'Check PR #5302'); store.add('task-b', 'Check PR #5167'); store.add('task-c', 'weather');
-		store.add('task-d', 'Check PR #5229'); store.set('task-d', 'spoken');
-		store.add('task-e', 'Check PR #51167'); store.setSupersededBy('task-e', 'task-b');
-		assert.deepEqual(coveredTasks(store, 'PR 5302 waits for review; PR 51167 does not exist; 5229 conflicts.'), ['task-a']);
-		assert.deepEqual(coveredTasks(store, 'PR 5167 is blocked.').sort(), ['task-b']);
+		let n = 0;
+		const logs: string[] = [];
+		const relay = new RelayAgent({ store, log: (m) => logs.push(m), submit: async (args) => { const id = `task-new${++n}`; store.add(id, String(args.task)); return { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true, message: 'm' }; } });
+		return { relay, store, logs };
+	}
+
+	it('"replaces: pr" supersedes nothing (it was every unheard request)', async () => {
+		// Review of #5348, B4: three unheard tasks and replaces:'pr' superseded all three.
+		const { relay, store, logs } = agent();
+		store.add('task-1', 'Check PR 5302'); store.add('task-2', 'Summarize PR 5251 review'); store.add('task-3', 'Email Bob the PR list');
+		void relay.invoke('w', { task: 'Check PR 5320', replaces: 'pr' });
+		await tick(5);
+		assert.deepEqual(['task-1', 'task-2', 'task-3'].map((id) => store.get(id)?.supersededBy), [undefined, undefined, undefined]);
+		assert.ok(logs.some((l) => l.includes('names no task or number')));
+	});
+
+	it('5167 is not 51167, and only the most recent request with the mark is superseded', async () => {
+		const { relay, store } = agent();
+		store.add('task-a', 'Check PR #51167', Date.now() - 2_000);
+		store.add('task-b', 'Check PR #5167', Date.now() - 1_500);
+		store.add('task-c', 'Summarize PR #51167 again', Date.now() - 1_000);
+		void relay.invoke('w', { task: 'Check PR 5167', replaces: '51167' });
+		await tick(5);
+		assert.equal(store.get('task-a')?.supersededBy, undefined, 'an older one stays');
+		assert.equal(store.get('task-b')?.supersededBy, undefined, '5167 is not 51167');
+		assert.equal(store.get('task-c')?.supersededBy, 'task-new1');
+	});
+
+	it('a task id names exactly that task; a heard request is never superseded', async () => {
+		const { relay, store } = agent();
+		store.add('task-1001', 'Check PR 7001');
+		store.add('task-1002', 'Check PR 7001'); store.set('task-1002', 'spoken');
+		void relay.invoke('w', { task: 'Check PR 7002', replaces: 'task-1001' });
+		await tick(5);
+		assert.equal(store.get('task-1001')?.supersededBy, 'task-new1');
+		void relay.invoke('w', { task: 'Check PR 7003', replaces: '7001' });
+		await tick(5);
+		assert.equal(store.get('task-1002')?.supersededBy, undefined);
 	});
 });
