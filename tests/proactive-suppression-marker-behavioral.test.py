@@ -49,6 +49,8 @@ sys.path.insert(0, str(REPO / "src"))
 import proactive_routing as _real_proactive_routing_module  # noqa: E402
 from proactive_routing import redirect_target_is_foreign as _real_redirect_target_is_foreign  # noqa: E402
 from proactive_routing import body_target_channel as _real_body_target_channel  # noqa: E402
+from proactive_routing import body_claimable_by as _real_body_claimable_by  # noqa: E402
+from proactive_routing import should_claim_proactive_peeked as _real_peeked  # noqa: E402
 
 _CFG = tempfile.mkdtemp(prefix="suppression-behavioral-ccd-")
 os.environ["CLAUDE_CONFIG_DIR"] = _CFG
@@ -173,6 +175,10 @@ def _run_proactive_pass(db, results_dir: Path) -> tuple[list[str], list[str]]:
     routing.should_claim_proactive_file = lambda *_a, **_k: True
     routing.redirect_target_is_foreign = _real_redirect_target_is_foreign
     routing.body_target_channel = _real_body_target_channel
+    routing.body_claimable_by = _real_body_claimable_by
+    # The real pre-claim helper, resolving its legs through this stub.
+    routing.should_claim_proactive_peeked = types.FunctionType(
+        _real_peeked.__code__, routing.__dict__)
     sys.modules["proactive_routing"] = routing
 
     delivered: list[str] = []

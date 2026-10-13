@@ -436,7 +436,7 @@ class AssignmentAttribution(unittest.TestCase):
         self._sentinel(W1, tid)
         self._counting_core()
         seen = {}
-        self.mod._quarantine_undelivered = lambda rf, t, why: seen.update(
+        self.mod._quarantine_undelivered = lambda rf, t, why, **kw: seen.update(
             {"file": rf, "tid": t, "why": why})
         rf = Path(self.workspace) / f"{tid}.txt"
         rf.write_text("done!")

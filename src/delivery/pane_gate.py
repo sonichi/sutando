@@ -57,7 +57,12 @@ SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
 #: Non-blank lines a verdict reads — the same window core-input-watch.py reads.
 TAIL_LINES = 14
 
-_SGR = re.compile(r"\x1b\[[0-9;]*m")
+#: A CSI SGR run (colon or semicolon params, newer tmux emits both) or an OSC
+#: hyperlink (BEL- or ST-terminated) -- anything else is left as real content.
+_SGR = re.compile(r"\x1b\[[0-9:;]*m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+#: Public alias for strip-to-plain outside this module (core-input-watch.py's
+#: own derivation) -- one pattern, not a second copy that can drift.
+SGR_STRIP = _SGR
 # Dim (SGR 2) or the 256-colour GREYSCALE RAMP (232-255): styled runs are hint/ghost
 # text only. 200-231 are colour-cube entries, so real coloured input must not match.
 _GHOST = re.compile(

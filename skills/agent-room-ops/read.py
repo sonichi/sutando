@@ -106,6 +106,21 @@ def _redactor():
     return _REDACTOR
 
 
+def _relation(m):
+    """(in_reply_to, thread_root) event ids the gateway item carries, flat or Matrix-nested."""
+    rel = m.get("relates_to") or m.get("m.relates_to")
+    if not isinstance(rel, dict):
+        content = m.get("content")
+        rel = content.get("m.relates_to") if isinstance(content, dict) else None
+    rel = rel if isinstance(rel, dict) else {}
+    nested = rel.get("m.in_reply_to")
+    reply = (m.get("in_reply_to") or m.get("reply_to")
+             or (nested.get("event_id") if isinstance(nested, dict) else None))
+    thread = m.get("thread_root") or (rel.get("event_id") if rel.get("rel_type") == "m.thread" else None)
+    return (reply if isinstance(reply, str) and reply else None,
+            thread if isinstance(thread, str) and thread else None)
+
+
 def _normalize(items):
     out = []
     redact = _redactor()
@@ -133,6 +148,12 @@ def _normalize(items):
                 norm["msgtype"] = mt
             if (mime := m.get("mimetype")):
                 norm["mimetype"] = mime
+        # Conditional like media_ref: a reader binding a reply to its question needs these.
+        reply, thread = _relation(m)
+        if reply:
+            norm["in_reply_to"] = reply
+        if thread:
+            norm["thread_root"] = thread
         out.append(norm)
     return out
 

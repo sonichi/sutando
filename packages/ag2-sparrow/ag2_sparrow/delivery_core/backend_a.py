@@ -19,6 +19,7 @@ class DesignAClaimBackend:
     (declared) as the administrative-destruction mechanism."""
 
     persists_receipt_metadata = True   # record_delivered() stores both
+    records_source_digest = True       # publish(source_ready_sha256=) persists the source
 
     capabilities = BackendCapabilities(supports_force_release=True)
 
@@ -32,7 +33,8 @@ class DesignAClaimBackend:
         self.republish_delivered = republish_delivered
 
     def publish(self, item_id: str, payload: bytes, *,
-                republish_delivered: Optional[bool] = None) -> bool:
+                republish_delivered: Optional[bool] = None,
+                source_ready_sha256: Optional[str] = None) -> bool:
         allow_republish = (self.republish_delivered if republish_delivered is None
                            else republish_delivered)
         with outbox._item_lock(self.root, item_id):
@@ -44,12 +46,15 @@ class DesignAClaimBackend:
                     return False
                 if outbox.read_delivery_claim(self.root, item_id) is not None:
                     return False
-            outbox._write_item(self.root, item_id, {
+            text = payload.decode("utf-8", "replace")
+            record = {
                 "item_id": item_id,
-                "payload": payload.decode("utf-8", "replace"),
+                "payload": text,
                 "status": "READY",
                 "published_at": time.time(),
-            })
+                **outbox.source_proof_fields(source_ready_sha256, text, outbox.new_publication_id()),
+            }
+            outbox._write_item(self.root, item_id, record)
             return True
 
     def _incarnation_of(self, item_id: str) -> Optional[str]:

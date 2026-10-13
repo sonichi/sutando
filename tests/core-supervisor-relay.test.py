@@ -515,7 +515,7 @@ class TestRunCycleAndCli(unittest.TestCase):
         calls = []
         orig_m, orig_c = _mod._macos_notify, _mod._channel_notify
         _mod._macos_notify = lambda m: calls.append(("macos", m))
-        _mod._channel_notify = lambda m, s, c: calls.append(("chan", s, c))
+        _mod._channel_notify = lambda m, s, c, **kw: calls.append(("chan", s, c, kw))
         try:
             with tempfile.TemporaryDirectory() as td:
                 run_cycle(_LOGIN, os.path.join(td, "s.state"),
@@ -525,6 +525,9 @@ class TestRunCycleAndCli(unittest.TestCase):
         kinds = [c[0] for c in calls]
         self.assertIn("macos", kinds)
         self.assertIn("chan", kinds)
+        tag = next(c for c in calls if c[0] == "chan")[3]["extra"][_mod.ALERT_FIELD]
+        self.assertEqual(tag["agent"], f"core@{_mod._core_host_label()}")
+        self.assertEqual(tag["state"], _LOGIN.get("state"))
 
     def test_failed_channel_send_does_not_debounce(self):
         # #2101 review (High): when a channel is selected but its send FAILS, the
@@ -532,7 +535,7 @@ class TestRunCycleAndCli(unittest.TestCase):
         # instead of being silently marked as already-notified.
         orig_m, orig_c = _mod._macos_notify, _mod._channel_notify
         _mod._macos_notify = lambda m: None
-        _mod._channel_notify = lambda m, s, c: False   # selected channel send fails
+        _mod._channel_notify = lambda m, s, c, **kw: False   # selected channel send fails
         try:
             with tempfile.TemporaryDirectory() as td:
                 sf = os.path.join(td, "s.state")
@@ -551,7 +554,7 @@ class TestRunCycleAndCli(unittest.TestCase):
         # Complement: a channel send that LANDS persists the hash → suppressed next cycle.
         orig_m, orig_c = _mod._macos_notify, _mod._channel_notify
         _mod._macos_notify = lambda m: None
-        _mod._channel_notify = lambda m, s, c: True    # selected channel send lands
+        _mod._channel_notify = lambda m, s, c, **kw: True    # selected channel send lands
         try:
             with tempfile.TemporaryDirectory() as td:
                 sf = os.path.join(td, "s.state")
@@ -571,7 +574,7 @@ class TestRunCycleAndCli(unittest.TestCase):
         # escalation routes there.
         calls = []
         orig_c = _mod._channel_notify
-        _mod._channel_notify = lambda m, s, c: calls.append((s, c))
+        _mod._channel_notify = lambda m, s, c, **kw: calls.append((s, c))
         try:
             with tempfile.TemporaryDirectory() as td:
                 sig = os.path.join(td, "core-supervisor.json")
@@ -1075,7 +1078,7 @@ class TestProgressRouteDelegation(unittest.TestCase):
     def test_explicit_no_route_target_degrades_to_macos_only(self):
         calls = []
         orig_c = _mod._channel_notify
-        _mod._channel_notify = lambda m, s, c: calls.append((s, c)) or True
+        _mod._channel_notify = lambda m, s, c, **kw: calls.append((s, c)) or True
         try:
             with tempfile.TemporaryDirectory() as td:
                 sig = os.path.join(td, "core-supervisor.json")
@@ -1155,7 +1158,7 @@ class TestDebounceNeedsAConfirmedDelivery(unittest.TestCase):
             argv.append("--no-macos")
         calls = []
         with patch.object(_mod, "_macos_notify", lambda m: calls.append("macos") or macos_ok), \
-                patch.object(_mod, "_channel_notify", lambda m, s, c: calls.append("chan") or channel_ok), \
+                patch.object(_mod, "_channel_notify", lambda m, s, c, **kw: calls.append("chan") or channel_ok), \
                 contextlib.redirect_stdout(io.StringIO()) as out, \
                 contextlib.redirect_stderr(io.StringIO()):
             rc = main(argv)
@@ -1189,7 +1192,7 @@ class TestDebounceNeedsAConfirmedDelivery(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             sf = os.path.join(td, "s.state")
             with patch.object(_mod, "_macos_notify", lambda m: True), \
-                    patch.object(_mod, "_channel_notify", lambda m, s, c: False):
+                    patch.object(_mod, "_channel_notify", lambda m, s, c, **kw: False):
                 run_cycle(_LOGIN, sf, macos=True, source="discord", channel="42")
             self.assertFalse(os.path.exists(sf))
 

@@ -232,6 +232,8 @@ def _main(argv):
     e.add_argument("--once", action="store_true", help="exit after the first event")
     e.add_argument("--max-events", type=int, default=None)
 
+    sub.add_parser("agents", help="list this account's registered agents with owners (/v1/agents)")
+
     p = sub.add_parser("resolve", help="resolve a friendly handle -> agent mxid (via /v1/agents)")
     p.add_argument("handle")
 
@@ -244,6 +246,9 @@ def _main(argv):
                    help="event id ($abc) to cite as the message replied to. This is a "
                         "CITATION: the post stays in the main timeline. It does NOT put "
                         "the post in a Matrix thread — the gateway has no field for that.")
+    p.add_argument("--thread-root", dest="thread_root", default=None, metavar="EVENT",
+                   help="event id ($abc) of the thread to post the mention IN (rel_type "
+                        "m.thread, built by the gateway); it leaves the main timeline.")
 
     p = sub.add_parser("say", help="post a plain message into a room (mentions no one)")
     p.add_argument("room_id")
@@ -336,11 +341,13 @@ def _main(argv):
         if a.events_cmd == "stream":
             return _events_stream(a)  # prints JSONL itself; summary is one line
         res = _dispatch_events(a)
+    elif a.cmd == "agents":
+        res = _resolve.list_agents()
     elif a.cmd == "resolve":
         res = _resolve.resolve_user(a.handle)
     elif a.cmd == "mention":
-        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid,
-                               reply_to=a.reply_to)
+        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid, reply_to=a.reply_to,
+                               **({"thread_root": a.thread_root} if a.thread_root else {}))
     elif a.cmd == "history":
         try:
             start = datetime.datetime.fromisoformat(a.since.replace("Z", "+00:00"))
