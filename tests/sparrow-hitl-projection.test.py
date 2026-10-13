@@ -15,6 +15,7 @@ records nothing so the next pulse retries it.
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 import tempfile
@@ -122,6 +123,20 @@ class ProjectHitl(unittest.TestCase):
         B._HITL_BACKOFF["until"] = 0.0
         self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
         self.assertEqual(B._HITL_BACKOFF["delay"], 0.0, "an idle pulse must reset the backoff")
+
+    def test_a_refused_card_is_logged_with_its_response_body(self):
+        req = self._requirement()
+
+        def refuse(method, path, payload=None, timeout=None):
+            self.calls.append((method, path, payload))
+            raise B.urllib.error.HTTPError(path, 400, "Bad Request", {},
+                                           io.BytesIO(b'{"error": "edit target gone"}'))
+
+        B._req = refuse
+        lines = []
+        with self.assertRaises(B.urllib.error.HTTPError):
+            B._project_hitl(log=lines.append)
+        self.assertTrue(any(req.id in l and "edit target gone" in l for l in lines), lines)
 
     def test_no_proactive_room_posts_nothing(self):
         self._requirement()

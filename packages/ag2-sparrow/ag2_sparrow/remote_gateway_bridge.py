@@ -1275,7 +1275,7 @@ def _project_hitl(log=print) -> int:
         return 0
     try:
         done = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20),
-                       room)
+                       room, log=log, error_body=_http_error_body)
     except Exception:
         _hitl_backoff_bump(log)  # a raising sender is a refusal too
         raise

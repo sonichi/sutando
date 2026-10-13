@@ -2,7 +2,9 @@
 retry-whole on a rejected send, dedupe keys stable per (requirement, revision).
 """
 
+import io
 import subprocess
+import urllib.error
 import sys
 import tempfile
 import time
@@ -20,7 +22,7 @@ from hitl.projector import (  # noqa: E402
 )
 from hitl.schema import (  # noqa: E402
     Action, CATEGORY_BLOCKED, CATEGORY_DECISION, HumanRequirement, KINDS,
-    STATUS_RESOLVED, WIRE_FIELD, category_of,
+    NOTICE_FIELD, STATUS_RESOLVED, WIRE_FIELD, category_of,
 )
 
 ROOM = "!room:ag2.space"
@@ -364,6 +366,165 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(self.live(), [])
         self.assertNotIn("task-late", self.mgr.get(req.id).blocked_task_ids)
 
+
+
+def http_error(code, body=b""):
+    return urllib.error.HTTPError("https://relay.invalid/v1/room", code, "refused", {},
+                                  io.BytesIO(body))
+
+
+def read_body(e):
+    return e.read().decode() if hasattr(e, "read") else ""
+
+
+class PerCardIsolationTests(unittest.TestCase):
+    """One card whose send raises must not abort the pass for every later card."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.mgr = HitlManager(HitlStore(Path(self.tmp.name)))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _drive(self, send, now=None):
+        clock = (lambda: now) if now is not None else time.time
+        return project(self.mgr, send, ROOM, clock=clock)
+
+    def test_a_poison_card_that_sorts_first_does_not_block_later_cards_or_notices(self):
+        due = self.mgr.create(make_req(guard="due", device={"id": "d-due"}))
+        project(self.mgr, RecordingSender(), ROOM, clock=lambda: 1000.0)
+        a = self.mgr.create(make_req(kind="choice", guard="a", device={"id": "d-a"}))
+        b = self.mgr.create(make_req(kind="choice", guard="b", device={"id": "d-b"}))
+        poison, later = sorted([a.id, b.id])
+        self.assertEqual([r.id for r in self.mgr.store.all()
+                          if self.mgr.needs_projection(r.id)][0], poison)
+        good = RecordingSender()
+
+        def send(payload):
+            if payload["dedupe_key"].startswith(f"hitl:{poison}:"):
+                raise http_error(400, b'{"error": "bad edit"}')
+            return good(payload)
+
+        done = self._drive(send, now=1000.0 + 31 * 60)
+        self.assertIn(later, [rid for rid, _ in done], "the card after the poison was not sent")
+        self.assertTrue(any(NOTICE_FIELD in p["extra_content"] for p in good.sent),
+                        "the reminder notice never went out")
+        self.assertTrue(self.mgr.needs_projection(poison), "a non-terminal card stays retryable")
+
+    def test_a_notice_build_failure_is_logged_and_does_not_block_a_later_notice(self):
+        # A bug building the notice body/dedupe_key must be logged, not
+        # swallowed, and must not stop a later card's own due notice.
+        bad = self.mgr.create(make_req(guard="bad", device={"id": "d-bad"}))
+        good = self.mgr.create(make_req(guard="good", device={"id": "d-good"}))
+        project(self.mgr, RecordingSender(), ROOM, clock=lambda: 1000.0)
+        import hitl.renotify as renotify_mod
+        real_body = renotify_mod.body
+
+        def flaky_body(notice, req, now, **kw):
+            if req.id == bad.id:
+                raise RuntimeError("bad renotify body")
+            return real_body(notice, req, now, **kw)
+
+        logged = []
+        sender = RecordingSender()
+        with mock.patch.object(renotify_mod, "body", side_effect=flaky_body):
+            project(self.mgr, sender, ROOM, clock=lambda: 1000.0 + 31 * 60, log=logged.append)
+        self.assertTrue(any(bad.id in line and "bad renotify body" in line for line in logged), logged)
+        self.assertTrue(any(NOTICE_FIELD in p["extra_content"] for p in sender.sent),
+                        "the good card's own notice was blocked by the bad one")
+
+    def test_a_failed_send_is_logged_with_its_card_id_and_response_body(self):
+        req = self.mgr.create(make_req(kind="choice"))
+        ok = self.mgr.create(make_req(kind="choice", guard="g2"))
+        logged = []
+
+        def send(payload):
+            if payload["dedupe_key"].startswith(f"hitl:{req.id}:"):
+                raise http_error(400, b'{"error": "bad edit"}')
+            return RecordingSender()(payload)
+
+        done = project(self.mgr, send, ROOM, log=logged.append, error_body=read_body)
+        self.assertEqual([rid for rid, _ in done], [ok.id])
+        self.assertTrue(any(req.id in line and "bad edit" in line for line in logged), logged)
+
+    def test_a_long_error_body_is_truncated_to_200_chars_in_the_log(self):
+        req = self.mgr.create(make_req(kind="choice"))
+        long_body = ("x" * 500).encode()
+        logged = []
+
+        def send(payload):
+            raise http_error(400, long_body)
+
+        with self.assertRaises(urllib.error.HTTPError):
+            project(self.mgr, send, ROOM, log=logged.append, error_body=read_body)
+        line = next(l for l in logged if req.id in l)
+        self.assertLessEqual(line.count("x"), 200, line)
+
+    def _resolved_card(self, guard="g1"):
+        req = self.mgr.create(make_req(kind="choice", guard=guard))
+        project(self.mgr, RecordingSender(), ROOM)
+        self.mgr.resolve(req.id)
+        return req
+
+    def test_a_terminal_card_whose_edit_gets_a_4xx_stops_being_retried(self):
+        req = self._resolved_card()
+        attempts = []
+
+        def send(payload):
+            attempts.append(payload)
+            raise http_error(400, b"already resolved")
+
+        with self.assertRaises(urllib.error.HTTPError):
+            self._drive(send)
+        self.assertFalse(self.mgr.needs_projection(req.id))
+        self.assertEqual(self._drive(send), [])
+        self.assertEqual(len(attempts), 1, "the refused edit was retried")
+        self.assertEqual(pending_ids(self.mgr), [], "the settled card must not stay pending")
+
+    def test_a_5xx_on_a_terminal_card_is_retried(self):
+        req = self._resolved_card()
+
+        def send(payload):
+            raise http_error(503, b"unavailable")
+
+        with self.assertRaises(urllib.error.HTTPError):
+            self._drive(send)
+        self.assertTrue(self.mgr.needs_projection(req.id), "a 5xx must stay retryable")
+        ok = RecordingSender()
+        self._drive(ok)
+        self.assertEqual([p["op"] for p in ok.sent], ["edit"])
+        self.assertFalse(self.mgr.needs_projection(req.id))
+
+    def test_auth_timeout_and_ratelimit_on_a_terminal_card_stay_retryable(self):
+        # 401/403/408/429 are blips, not refusals that will never change --
+        # settling on them would archive a card whose edit never landed.
+        for code in (401, 403, 408, 429):
+            req = self._resolved_card(guard=f"g-{code}")
+
+            def send(payload, _code=code):
+                raise http_error(_code, b"blip")
+
+            with self.assertRaises(urllib.error.HTTPError):
+                self._drive(send)
+            self.assertTrue(self.mgr.needs_projection(req.id), code)
+            ok = RecordingSender()
+            self._drive(ok)
+            self.assertEqual([p["op"] for p in ok.sent], ["edit"], code)
+            self.assertFalse(self.mgr.needs_projection(req.id), code)
+
+    def test_a_pass_where_every_send_fails_still_raises(self):
+        self.mgr.create(make_req(kind="choice", guard="a"))
+        self.mgr.create(make_req(kind="choice", guard="b"))
+        calls = []
+
+        def send(payload):
+            calls.append(payload)
+            raise RuntimeError("relay down")
+
+        with self.assertRaises(RuntimeError):
+            self._drive(send)
+        self.assertEqual(len(calls), 2, "every card is still attempted before the pass raises")
 
 if __name__ == "__main__":
     unittest.main()
