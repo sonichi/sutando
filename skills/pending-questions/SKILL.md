@@ -29,8 +29,8 @@ python3 skills/pending-questions/scripts/pq.py remind [--force]
 ```
 
 **Trigger: any time you would write a question for the owner into terminal or summary text, file
-it instead** with `ask` (or `scripts/ask-owner.py`, which reports `already open: [<id>]` and files
-nothing when an open row has that question). The terminal and a compaction summary reach no one.
+it instead** with `ask` (or `scripts/ask-owner.py`; add `--unless-open` to file nothing when an
+open row already has that question — it reports `already open: [<id>]`). The terminal and a compaction summary reach no one.
 This skill's `hooks/compact-carry.py` keeps owner questions out of compaction summaries and, after
 one, has the core file any never-asked question it carried; `session-state.md` shows only the
 count (`python3 src/pending_questions_reader.py summary`).

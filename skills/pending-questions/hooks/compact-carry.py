@@ -6,7 +6,7 @@ re-printed and grew the list. PreCompact stdout is appended to the summarizer's 
 so this tells it to leave owner questions out (the Pending questions database is their record)
 and to keep any never-filed one only as a to-file item. After the compaction, SessionStart
 (source "compact") adds the instruction to file those items through scripts/ask-owner.py,
-which skips a question already open. Core sessions only; never blocks, never fails a hook.
+which with --unless-open skips a question already open. Core sessions only; never blocks, never fails a hook.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ SUMMARY_RULE = (
 AFTER_COMPACT = (
     "Owner questions after this compaction: if the summary has the heading "
     f"'{TO_FILE}', file each item now with `python3 scripts/ask-owner.py \"<question>\" "
-    "[--context \"<why / options>\"]` (it does not file one that is already open), then drop the "
+    "--unless-open [--context \"<why / options>\"]` (it files nothing already open), then drop the "
     "heading. Never list owner questions in terminal or summary text; file them. Open questions: "
     "`python3 src/pending_questions_reader.py summary`.")
 

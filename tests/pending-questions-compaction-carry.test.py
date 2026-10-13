@@ -80,16 +80,16 @@ class SnapshotCarriesACountNotTheQuestions(Base):
 
 
 class AskOwnerFilesNoDuplicate(Base):
-    def ask(self, question):
+    def ask(self, question, *flags):
         return _run([str(REPO / "scripts" / "ask-owner.py"), question, "--urgency", "durable",
-                     "--workspace", str(self.ws)])
+                     "--workspace", str(self.ws), *flags])
 
     def proactive(self):
         return sorted(p.name for p in (self.ws / "results").glob("proactive-*.txt"))
 
     def test_an_open_question_is_reported_and_not_filed_again(self):
         _hold(self.ws, "ask-held", HELD)
-        r = self.ask("  restart the ag2 space connection for the live test once #5444   merges?")
+        r = self.ask("  restart the ag2 space connection for the live test once #5444   merges?", "--unless-open")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("already open: [ask-held]", r.stdout)
         self.assertEqual(self.proactive(), [])
@@ -98,11 +98,21 @@ class AskOwnerFilesNoDuplicate(Base):
 
     def test_a_new_question_is_still_filed(self):
         _hold(self.ws, "ask-held", HELD)
-        r = self.ask("Merge #5430 once it has an approval?")
+        r = self.ask("Merge #5430 once it has an approval?", "--unless-open")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("already open", r.stdout)
         self.assertIn("sent: queued", r.stdout)
         self.assertEqual(len(self.proactive()), 1)
+
+    def test_without_the_flag_a_repeat_is_filed_as_before(self):
+        _hold(self.ws, "ask-held", HELD)
+        r = self.ask(HELD)
+        self.assertNotIn("already open", r.stdout)
+        self.assertEqual(len(self.proactive()), 1)
+
+    def test_the_after_compaction_instruction_uses_the_flag(self):
+        hook = _load("compact_carry_flag", HOOK)
+        self.assertIn("--unless-open", hook.AFTER_COMPACT)
 
     def test_open_duplicate_is_none_when_the_store_cannot_be_read(self):
         reader = _load("pqr_carry3", SRC / "pending_questions_reader.py")

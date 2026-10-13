@@ -217,7 +217,7 @@ def summary_line(g: dict) -> str:
     if g["pending_close"]:
         head += f", {len(g['pending_close'])} closed locally"
     return (f"{head}. Not listed here: read them with `python3 src/pending_questions_reader.py list`. "
-            "File a new owner question with `python3 scripts/ask-owner.py \"<question>\"` "
+            "File a new owner question with `python3 scripts/ask-owner.py \"<question>\" --unless-open` "
             "(an open duplicate is not filed again); never carry owner questions as text.")
 
 
