@@ -14,6 +14,7 @@ returning the gateway's dict answer) — this module never imports a bridge.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -74,10 +75,24 @@ def pending_ids(manager: HitlManager, clock: Clock = time.time) -> List[str]:
 
     A caller owning retry cadence needs to tell "nothing to send" from "every
     send was refused"; `project()` returns an empty list for both.
+
+    This WRITES: every terminal record that owes nothing is moved to the
+    archive on the way, so the per-pulse scan stays the size of the live set.
+    A failed move is logged and skipped; cleanup never blocks delivery.
     """
-    owed = {r.id for n in _notices(manager, clock()) for r, _ in n.members}
-    return [r.id for r in manager.store.all()
-            if manager.needs_projection(r.id) or r.id in owed]
+    now = clock()
+    owed = {r.id for n in _notices(manager, now) for r, _ in n.members}
+    out: List[str] = []
+    for r in manager.store.all():
+        if manager.needs_projection(r.id) or r.id in owed:
+            out.append(r.id)
+        elif r.terminal:
+            try:
+                manager.archive_if_settled(r.id, now)
+            except OSError as e:
+                logging.getLogger("hitl.projector").warning(
+                    "hitl: could not archive %s: %s", r.id, e)
+    return out
 
 
 def project(manager: HitlManager, send: Sender, room_id: str,

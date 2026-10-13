@@ -211,13 +211,24 @@ this extra wakes a Hatch worker only for task files it has not woken for yet;
 it makes no network call of its own.
 
 Each wake carries, per message, `room_id`, `event_id`, `thread_root`, `sender`,
-`access_tier` and `collaborator` read with Sparrow's own task-header parser,
-plus a `worker_note` with the rules: touch the activity marker first, reply
-with `room.message.send` in the message's thread (`thread_root`, `reply_to`,
-`mentions` copied exactly, sender tagged), post nothing when no answer is
-needed, close each item by writing `[REPLIED]` or `[no-send]` to its
-`result_file`, and end with a `HANDOFF` block for work that needs GitHub,
-connectors, credentials or a browser. For a sender who is not the owner, the
+`access_tier` and `collaborator` read with Sparrow's own task-header parser, a
+`snippet` (the message's first line, without a Matrix reply fallback), plus a
+`worker_note` with the rules: touch the activity marker first, answer from the
+snippet, and post each reply with `ag2-sparrow-hatch reply <result_file>`, the
+text on stdin. `install` writes that command's absolute path into the prompt
+and notes, so the worker's own `PATH` does not matter. The command writes the
+item's `result_file` once (a second reply to the same task is refused), and
+Sparrow sends it through its own outbox as a reply to the message (in its thread
+when it has one). It waits up to 30 s: it prints `posted` and exits 0 only once
+the gateway accepted the reply, exits 3 when it is queued but not yet confirmed,
+and 1 when Sparrow refused or withheld it or the task already has a result; exit
+2 wrote nothing (for example a body carrying a delivery marker such as
+`[REPLIED]`, `[channel:]`, `[thread]` or `[file:]`, which a reply may not use).
+Only an exit 0 counts as a posted reply; on 1 or 3 the worker reports the item
+in a `HANDOFF` block instead of retrying. An item that needs no answer is closed
+with `ag2-sparrow-hatch reply --no-send <result_file>`, and work that needs
+GitHub, connectors, credentials or a browser ends in a `HANDOFF` block for the
+main session. For a sender who is not the owner, the
 note itself states the limits (no irreversible actions, configuration changes,
 credential use, private owner context or sends to other rooms; reply only in
 the room; go/no-go goes to the owner), so they do not depend on the worker
@@ -225,8 +236,7 @@ trusting instruction text inside the message. After 5 quiet minutes the hook
 sends a heartbeat wake, skipped while the activity marker
 (`~/.muse/last_active` by default) is fresher than that. A message whose `result_file`
 is still unwritten 30 minutes after its wake is woken for again, marked
-`rewake: true`, up to 3 wakes in all; the note tells the worker to check the
-thread first and post nothing it already posted. One still open 30 minutes after
+`rewake: true`, up to 3 wakes in all. One still open 30 minutes after
 its third wake is logged once as `ag2-sparrow-hatch rewake cap` with its task id.
 
 Paste this to the Hatch agent, with its MXID filled in:
@@ -252,7 +262,7 @@ relay rejects the token. Keep the `.env` file mode 600.
 | --- | --- |
 | `~/hooks/scripts/ag2-sparrow-hatch.sh` | the hook script (a copy an earlier `install` wrote is replaced, so re-run `install` after upgrading ag2-sparrow; a locally modified copy is shown as a diff and kept unless you pass `--force`) |
 | `~/hooks/definitions/ag2-sparrow-hatch.json` | parameters for `hooks.add`, with your MXID |
-| `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON`, `GATEWAY_INSTANCE` (mode 600) |
+| `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON`, `GATEWAY_INSTANCE`, `REPLY_COMMAND` (mode 600) |
 | `~/.config/ag2-sparrow-hatch/installed-script.sha256` | the sha256 of the hook script `install` wrote, which tells an upgrade from a local edit |
 
 `TASK_DIR`, `RESULT_DIR` and `STATE_DIR` are resolved the way `ag2-sparrow`
@@ -261,11 +271,14 @@ resolves them (`AGENT_CONNECT_TASK_DIR` / `AGENT_CONNECT_RESULT_DIR` /
 the same environment as Sparrow, or pass `--task-dir` / `--result-dir` /
 `--state-dir`. `GATEWAY_INSTANCE` (empty for the primary gateway) is taken from
 the environment, or from `--gateway-instance`; it names the status file the
-heartbeat and `verify` read. `--activity-file` moves the marker.
+heartbeat and `verify` read, picks which tasks the hook wakes for (a named
+instance's are `task-<instance>~<id>`), and the outbox `reply` waits on
+(`.outbox.<instance>`), both read through the bridge's own `gateway_instance` rules. `--activity-file` moves the marker.
 
 `ag2-sparrow-hatch verify` prints one `PASS` or `FAIL` line each for the hook
 script, the hook definition, the config, the task dir, Sparrow itself, the
-tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, exits non-zero on any
+reply command (the absolute path `install` recorded, still executable; `install`
+refuses to run when it finds none beside its Python or on `PATH`), the tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, exits non-zero on any
 `FAIL`, and ends with the manual test: mention the agent from another account
 and watch the reply land in that thread.
 

@@ -11,7 +11,7 @@ import re
 import sys
 from pathlib import Path
 
-from ... import local_task_protocol
+from ... import gateway_instance, local_task_protocol
 
 SNIPPET_MAX = 500
 # Matrix user id: @localpart:server_name (DNS name, IPv4 or [IPv6], optional :port).
@@ -20,6 +20,10 @@ _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 MXID_RE = re.compile(r"@[A-Za-z0-9._=+/-]+:(?:\[(?P<ipv6>[0-9A-Fa-f:.]+)\]|"
                      rf"{_LABEL}(?:\.{_LABEL})*)(?::(?P<port>[0-9]{{1,5}}))?")
 EXIT_BAD_AGENT = 3
+_SENDER_PREFIX = re.compile(r"\[AG2Space\s+[^\]]+\]\s*")
+# The gateway folds a message onto one line, so a reply fallback ("> <@sender> quoted"
+# lines, a blank line, the reply) arrives as "> <@sender> quoted  reply".
+_REPLY_FALLBACK = re.compile(r">\s?<[^>\s]+>.*?\s{2,}(?=\S)")
 
 
 def valid_mxid(value: str) -> bool:
@@ -44,14 +48,34 @@ def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":
     return strict
 
 
+def snippet(body: str) -> str:
+    """The message's first line without a Matrix reply fallback, which is the quoted
+    message replied to, not the reply."""
+    first = body.split("\n", 1)[0].strip()
+    prefix = _SENDER_PREFIX.match(first)
+    head = prefix.group(0) if prefix else ""
+    rest = first[len(head):]
+    fallback = _REPLY_FALLBACK.match(rest)
+    return (head + (rest[fallback.end():] if fallback else rest))[:SNIPPET_MAX]
+
+
 def _field(headers: dict, key: str) -> "str | None":
     value = (headers.get(key) or "").strip()
     return value or None
 
 
-def task_fields(task_file: Path, result_dir: Path) -> "dict | None":
+def item_id(tid: str, instance: str = "") -> "str | None":
+    """The id `instance`'s bridge delivers this task's result under, or None when the
+    task is not that instance's or not a valid task id."""
+    if not gateway_instance.owns(tid, instance):
+        return None
+    broker = gateway_instance.broker_tid(tid, instance)
+    return broker if local_task_protocol.valid_task_id(broker) else None
+
+
+def task_fields(task_file: Path, result_dir: Path, instance: str = "") -> "dict | None":
     tid = task_file.stem
-    if not local_task_protocol.valid_task_id(tid):
+    if item_id(tid, instance) is None:
         return None
     try:
         text = task_file.read_text(encoding="utf-8", errors="replace")
@@ -62,7 +86,6 @@ def task_fields(task_file: Path, result_dir: Path) -> "dict | None":
     tier = local_task_protocol.canonical_access_tier(h.get("access_tier"))
     if tier not in local_task_protocol.BROKER_WIRE_TIERS:
         tier = "guest"  # absent or unknown: the most restricted tier
-    first_line = parsed.body.split("\n", 1)[0].strip()
     return {
         "task_id": tid,
         "room_id": _field(h, "channel_id") or _field(h, "source_room_id"),
@@ -72,13 +95,13 @@ def task_fields(task_file: Path, result_dir: Path) -> "dict | None":
         "sender_name": _field(h, "sender_name"),
         "access_tier": tier,
         "collaborator": tier == "team" and (h.get("collaborator") or "").strip() == "true",
-        "snippet": first_line[:SNIPPET_MAX],
+        "snippet": snippet(parsed.body),
         "task_file": str(task_file),
         "result_file": str(result_dir / f"{tid}.txt"),
     }
 
 
-def list_open_tasks(task_dir: Path, result_dir: Path) -> list:
+def list_open_tasks(task_dir: Path, result_dir: Path, instance: str = "") -> list:
     """Task files with no result yet, oldest first."""
     def mtime(p: Path) -> float:
         try:
@@ -90,7 +113,7 @@ def list_open_tasks(task_dir: Path, result_dir: Path) -> list:
     for path in sorted(task_dir.glob("task-*.txt"), key=lambda p: (mtime(p), p.name)):
         if (result_dir / path.name).exists():
             continue
-        item = task_fields(path, result_dir)
+        item = task_fields(path, result_dir, instance)
         if item is not None:
             items.append(item)
     return items
@@ -101,6 +124,7 @@ def main(argv=None) -> int:
     ap.add_argument("--task-dir", required=True, type=Path)
     ap.add_argument("--result-dir", required=True, type=Path)
     ap.add_argument("--agent", help="exit %d unless this is a valid MXID" % EXIT_BAD_AGENT)
+    ap.add_argument("--gateway-instance", default="", help="list only this instance's tasks")
     args = ap.parse_args(argv)
     if args.agent is not None and not valid_mxid(args.agent):
         print(f"not an MXID: {args.agent!r}", file=sys.stderr)
@@ -108,7 +132,7 @@ def main(argv=None) -> int:
     if not args.task_dir.is_dir():
         print(f"task dir not found: {args.task_dir}", file=sys.stderr)
         return 2
-    json.dump(list_open_tasks(args.task_dir, args.result_dir), sys.stdout)
+    json.dump(list_open_tasks(args.task_dir, args.result_dir, args.gateway_instance), sys.stdout)
     sys.stdout.write("\n")
     return 0
 
