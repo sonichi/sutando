@@ -152,7 +152,7 @@ with tempfile.TemporaryDirectory() as td:
     room_post = next(p for m, u, p in calls
                      if u == "/v1/room" and p.get("room_id") == "!shared:ag2.space")
     check(room_post["body"] == "sensitive candidate"
-          and room_post["dedupe_key"].startswith("withheld-publish:wr_"),
+          and room_post["dedupe_key"] == f"{published['review_id']}.{published['decision_claim_id']}#0",
           "publication restores the exact body with idempotency")
     control_path = bridge._control_result_path("decision-no")
     check(control_path.is_file(),
