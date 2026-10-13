@@ -9,7 +9,9 @@ tells the core to file any it carried.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -17,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src"
@@ -123,6 +126,66 @@ class AskOwnerFilesNoDuplicate(Base):
                 return {"waiting": [{"ask_id": "a", "title": HELD}], "done": None, "pending_close": [],
                         "unavailable": True, "reason": "down", "notes": []}
         self.assertIsNone(reader.open_duplicate(self.ws, HELD, Down))
+
+
+class InProcess(Base):
+    """The same paths in-process, so the coverage gate sees the lines the subprocess runs exercise."""
+
+    def setUp(self):
+        super().setUp()
+        self.reader = _load("pqr_inproc", SRC / "pending_questions_reader.py")
+        _hold(self.ws, "ask-held", HELD)
+
+    def cli(self, mod, argv):
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            rc = mod.main(argv)
+        return rc, out.getvalue()
+
+    def test_reader_summary_and_open_duplicate(self):
+        rc, out = self.cli(self.reader, ["summary", "--workspace", str(self.ws)])
+        self.assertEqual((rc, out.startswith("1 open in")), (0, True), out)
+        self.assertNotIn(HELD, out)
+        adapter = SKILL / "scripts" / "pending_questions_room_db.py"
+        self.assertEqual(self.reader.open_duplicate(self.ws, HELD.upper(), adapter)["ask_id"], "ask-held")
+        self.assertIsNone(self.reader.open_duplicate(self.ws, "Something else?", adapter))
+
+    def test_summary_line_names_the_store_and_local_closes(self):
+        line = self.reader.summary_line({"waiting": [{}], "pending_close": ["a"], "unavailable": False,
+                                         "reason": None, "store": "room X"})
+        self.assertTrue(line.startswith("1 open in the owner's Pending questions database (room X), 1 closed locally."))
+
+    def test_ask_owner_unless_open(self):
+        ask = _load("ask_owner_inproc", REPO / "scripts" / "ask-owner.py")
+        rc, out = self.cli(ask, [HELD, "--unless-open", "--urgency", "durable", "--workspace", str(self.ws)])
+        self.assertEqual(rc, 0)
+        self.assertIn("already open: [ask-held]", out)
+        self.assertFalse((self.ws / "results").exists())
+
+    def test_hook_main_reads_stdin_and_prints_only_for_the_core(self):
+        hook = _load("compact_carry_inproc", HOOK)
+
+        def main_with(payload, env):
+            r, w = os.pipe()
+            os.write(w, payload.encode())
+            os.close(w)
+            with os.fdopen(r) as stdin, mock.patch.object(sys, "stdin", stdin), \
+                    mock.patch.dict(os.environ, env, clear=False), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                for k in ("SUTANDO_CORE_SESSION", "SUTANDO_INSTANCE_ID"):
+                    if k not in env:
+                        os.environ.pop(k, None)
+                rc = hook.main()
+            return rc, out.getvalue()
+
+        self.assertEqual(main_with('{"hook_event_name": "PreCompact"}', CORE), (0, hook.SUMMARY_RULE))
+        rc, out = main_with('{"hook_event_name": "SessionStart", "source": "compact"}', CORE)
+        self.assertIn("--unless-open", json.loads(out)["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(main_with('{"hook_event_name": "SessionStart", "source": "startup"}', CORE), (0, ""))
+        self.assertEqual(main_with('{"hook_event_name": "PreCompact"}', {}), (0, ""))
+        self.assertEqual(main_with("[1]", CORE), (0, ""))
+        self.assertEqual(main_with("not json", CORE), (0, ""))
+        with mock.patch.object(hook.select, "select", return_value=([], [], [])):
+            self.assertEqual(main_with('{"hook_event_name": "PreCompact"}', CORE), (0, ""))
 
 
 class CompactionHook(unittest.TestCase):
