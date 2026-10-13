@@ -1135,11 +1135,22 @@ class BridgeDelegates(unittest.TestCase):
         """Every write and archive of an owner-review record goes through the guard's
         ledger-locked owner; the bridge never writes or moves one itself."""
         self.assertIn("archive_record", self.calls_in("_archive_resolved_review"))
-        for fn in ("_route_withheld_review", "_publish_review", "_resolve_review_card",
-                   "_handle_review_decision"):
+        for fn in ("_route_withheld_review", "_resolve_review_card", "_handle_review_decision",
+                   "_record_publish_failure", "_commit_publication"):
             calls = self.calls_in(fn)
-            self.assertIn("update_record", calls, fn)
+            self.assertTrue(calls & {"update_record", "_claim_review_decision"}, fn)
             self.assertNotIn("_atomic_private_json", calls, fn)
+        publish = self.calls_in("_publish_review")
+        self.assertTrue({"_record_publish_failure", "_commit_landed"} <= publish)
+        self.assertIn("_commit_publication", self.calls_in("_commit_landed"))
+        self.assertNotIn("_atomic_private_json", publish)
+        self.assertIn("claim_withheld_decision", self.calls_in("_claim_review_decision"))
+        guard = ast.parse((REPO / "src" / "policy" / "egress" / "result.py").read_text(encoding="utf-8"))
+        writers = {n.name for n in ast.walk(guard) if isinstance(n, ast.FunctionDef)
+                   and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                           and c.func.id == "_write_owned_record" for c in ast.walk(n))}
+        self.assertEqual(writers, {"update_record", "claim_withheld_decision", "record_release_receipt",
+                                   "establish_decision"})
         f = next(n for n in ast.walk(self.tree)
                  if isinstance(n, ast.FunctionDef) and n.name == "_archive_resolved_review")
         moves = [n.func.attr for n in ast.walk(f) if isinstance(n, ast.Call)

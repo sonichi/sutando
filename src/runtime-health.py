@@ -498,6 +498,14 @@ def _refresh_station(workspace, *, now=None, ttl=_STATION_TTL,
     return result
 
 
+def _session_runtime():
+    """The core session's stamped runtime, or None when it cannot be read."""
+    try:
+        return session_runtime.parse(*_run(["tmux", "-S", _tmux_socket(), *session_runtime.argv(SESSION)]))
+    except Exception:  # noqa: BLE001 — unreadable: the default (Claude) reading applies
+        return None
+
+
 def _pane_text():
     sock = _tmux_socket()
     target = cli_wedge.core_target(sock, SESSION)
@@ -534,7 +542,7 @@ def _pane_blocks_dispatch(workspace):
         return None
 
 
-def needs_login(pane_text):
+def needs_login(pane_text, runtime=None):
     """Pure predicate: does the core pane show claude's auth prompt? Testable
     without a live tmux — this is the load-bearing 'stuck vs thinking' decision.
     Only the latest marker counts, and only while nothing after it shows the CLI
@@ -546,7 +554,7 @@ def needs_login(pane_text):
                default=None)
     if last is None:
         return False
-    return not signed_in_since("\n".join(lines[last + 1:]))
+    return not signed_in_since("\n".join(lines[last + 1:]), runtime)
 
 
 def _core_status(workspace):
@@ -616,7 +624,7 @@ def derive():
         # so it must NOT license overriding a login marker — that would be the
         # same absence-of-evidence mistake in the other direction.
         acting = status in ("running", "idle") and ts is not None and not stale
-        login = needs_login(_pane_text())
+        login = needs_login(_pane_text(), _session_runtime())
         # status_fresh: True = advanced within the window, False = stale,
         # None = no record to judge (can't prove either way).
         status_fresh = None if ts is None else (not stale)

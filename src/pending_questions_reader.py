@@ -17,7 +17,8 @@ does, on demand; the two are the adapter's separate entry points). Never read an
 (False, why) and records nothing — the caller keeps the answer it holds (agent-api files the
 answer task before it asks for the close).
 
-CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] | count`; and the
+CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] | count | summary`
+(`summary` is the count and where the questions live, never their text); and the
 one write a core caller makes through the same contract, `resolve <ask-id> [--answered]`
 (Resolved, or Answered), which is `resolve` above and nothing else. `--store-adapter <path>`
 injects an adapter file in place of the declared one.
@@ -190,6 +191,36 @@ def resolve(workspace, ask_id: str, status: str, adapter=None) -> tuple:
         return False, f"not closed: adapter failed ({type(e).__name__}: {e}); nothing records the close"
 
 
+def _norm_title(text: str) -> str:
+    from result_markers import neutralize_markers  # noqa: PLC0415 — the rows' title rule
+    return " ".join(neutralize_markers(text or "").split())[:120].casefold()
+
+
+def open_duplicate(workspace, question: str, adapter=None) -> Optional[dict]:
+    """The open item whose title is this question's (whitespace and case aside), or None —
+    also None when the store cannot be read: an unread store proves no duplicate."""
+    g = gather(workspace, adapter)
+    if g["unavailable"]:
+        return None
+    want = _norm_title(question)
+    return next((it for it in g["waiting"] if _norm_title(it.get("title", "")) == want), None)
+
+
+def summary_line(g: dict) -> str:
+    """Where the owner's questions live and how many are open — never their text, so a snapshot
+    that prints this cannot carry them forward as prose."""
+    where = "the owner's Pending questions database" + (f" ({g['store']})" if g.get("store") else "")
+    if g["unavailable"]:
+        head = f"pending questions: count UNKNOWN — {g['reason']}; {len(g['waiting'])} held locally"
+    else:
+        head = f"{len(g['waiting'])} open in {where}"
+    if g["pending_close"]:
+        head += f", {len(g['pending_close'])} closed locally"
+    return (f"{head}. Not listed here: read them with `python3 src/pending_questions_reader.py list`. "
+            "File a new owner question with `python3 scripts/ask-owner.py \"<question>\" --unless-open` "
+            "(an open duplicate is not filed again); never carry owner questions as text.")
+
+
 def unknown_line(g: dict) -> str:
     return f"pending questions: UNKNOWN — room unreachable ({g['reason']}); {len(g['waiting'])} held locally"
 
@@ -198,7 +229,7 @@ def main(argv=None) -> int:
     import argparse  # noqa: PLC0415
     ap = argparse.ArgumentParser(description="List or count the owner's pending questions (read-only), "
                                  "or resolve one through the declared store.")
-    ap.add_argument("command", choices=("list", "count", "resolve"))
+    ap.add_argument("command", choices=("list", "count", "summary", "resolve"))
     ap.add_argument("ask_id", nargs="?", default=None, help="resolve: the question's ask id")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--answered", action="store_true", help="resolve: mark it Answered, not Resolved")
@@ -219,6 +250,9 @@ def main(argv=None) -> int:
     g = gather(args.workspace, store)
     for note in g["notes"]:
         print(note, file=sys.stderr)
+    if args.command == "summary":
+        print(summary_line(g))
+        return 0
     if args.command == "count":
         print(json.dumps({"open": None if g["unavailable"] else len(g["waiting"]), "done": g["done"],
                           "pending_close": len(g["pending_close"]), "unavailable": g["unavailable"],

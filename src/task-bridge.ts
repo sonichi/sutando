@@ -223,17 +223,25 @@ function _usableOrigin(origin: VoiceSessionOrigin | null | undefined): VoiceSess
 }
 
 let _voiceSessionOrigin: VoiceSessionOrigin | null = null;
-// Bumped whenever the bound origin changes, so a call can tell its session has moved.
-let _voiceOriginGeneration = 0;
 let _voiceTaskOriginResolver: VoiceTaskOriginResolver | null = null;
 const _taskOrigins = new Map<string, VoiceSessionOrigin>();
+// Bumped when the words a waiting call would read may belong to another session or origin.
+let _voiceContextRevision = 0;
 
 /** Bind (or, with null, release) the origin of the live voice session. A task carries the
  *  origin current when it was asked for; a malformed origin binds nothing. */
 export function setVoiceSessionOrigin(origin: VoiceSessionOrigin | null): void {
 	const next = _usableOrigin(origin);
-	if (next?.channel !== _voiceSessionOrigin?.channel || next?.target !== _voiceSessionOrigin?.target) _voiceOriginGeneration += 1;
+	// A re-announce of the same origin is not a move: an in-flight call keeps its words.
+	if (next?.channel !== _voiceSessionOrigin?.channel || next?.target !== _voiceSessionOrigin?.target) _voiceContextRevision++;
 	_voiceSessionOrigin = next;
+}
+
+/** The live client is gone: release its origin and close every open transcript window,
+ *  bound origin or not, since the next client reads through the same turns provider. */
+export function endVoiceClientSession(): void {
+	_voiceSessionOrigin = null;
+	_voiceContextRevision++;
 }
 
 /** One turn of the live voice session as the runtime keeps it: `user` items are the
@@ -255,6 +263,11 @@ export type VoiceTurnsSnapshot = {
 };
 type VoiceTurnsProvider = () => ReadonlyArray<VoiceTurn> | VoiceTurnsSnapshot | null | undefined;
 let _voiceTurns: VoiceTurnsProvider | null = null;
+type VoiceTurnsBinding = { provider: VoiceTurnsProvider | null; revision: number };
+
+function captureVoiceTurns(): VoiceTurnsBinding {
+	return { provider: _voiceTurns, revision: _voiceContextRevision };
+}
 
 /** Bind (or, with null, release) a reader of the live session's turns. A task written
  *  afterwards carries the owner's last spoken words verbatim, beside the model's own
@@ -263,11 +276,12 @@ let _voiceTurns: VoiceTurnsProvider | null = null;
  *  the tool ran, so the transcript block structurally lacked the utterance itself). */
 export function setVoiceTurnsProvider(fn: VoiceTurnsProvider | null): void {
 	_voiceTurns = fn;
+	_voiceContextRevision++;
 }
 
-function _readSnapshot(): VoiceTurnsSnapshot | null {
+function _readSnapshot(provider: VoiceTurnsProvider | null = _voiceTurns): VoiceTurnsSnapshot | null {
 	let raw: ReturnType<VoiceTurnsProvider>;
-	try { raw = _voiceTurns?.(); } catch { return null; }
+	try { raw = provider?.(); } catch { return null; }
 	if (!raw) return null;
 	if (Array.isArray(raw)) return { items: raw };
 	const snap = raw as VoiceTurnsSnapshot;
@@ -298,8 +312,8 @@ const _NOT_OWNER_WORDS = ['[System:', '[Uploaded file:'];
 /** The real user utterances of the CURRENT turn (newest last): user items after the last
  *  assistant item, plus the transcription still buffered by the runtime. Bound to the turn
  *  that triggered the call: a previous turn's words never stand in for this one's. */
-export function _spokenTurns(count = 2): string[] {
-	const snap = _readSnapshot();
+export function _spokenTurns(count = 2, provider: VoiceTurnsProvider | null = _voiceTurns): string[] {
+	const snap = _readSnapshot(provider);
 	if (!snap) return [];
 	const items = Array.isArray(snap.items) ? snap.items : [];
 	const spoken: string[] = [];
@@ -325,8 +339,8 @@ export const RECENT_SPEECH_MS = 10_000;
 
 /** Whether waiting for a transcription makes sense: the owner spoke recently, or the
  *  runtime cannot say. A model-initiated turn (no recent speech) has nothing to wait for. */
-export function _speechMayBeLanding(now = Date.now()): boolean {
-	const snap = _readSnapshot();
+export function _speechMayBeLanding(now = Date.now(), provider: VoiceTurnsProvider | null = _voiceTurns): boolean {
+	const snap = _readSnapshot(provider);
 	const at = snap?.lastUserSpeechAt;
 	if (typeof at !== 'number' || !Number.isFinite(at)) return true;
 	return now - at <= RECENT_SPEECH_MS;
@@ -335,13 +349,22 @@ export function _speechMayBeLanding(now = Date.now()): boolean {
 /** The current turn's utterances, waiting up to `maxMs` for a late transcription chunk
  *  when none has arrived yet (the runtime flushes only what it has when the tool fires);
  *  no wait for a turn the model started on its own. */
-export async function _awaitSpokenTurns(count = 2, maxMs = SPOKEN_WAIT_MS, sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)), isCurrent: () => boolean = () => true): Promise<string[]> {
-	if (!_voiceTurns) return [];
-	// Words read after the session moved belong to the new session, not to this call.
-	const read = () => { const spoken = _spokenTurns(count); return isCurrent() ? spoken : null; };
+export async function _awaitSpokenTurns(
+	count = 2, maxMs = SPOKEN_WAIT_MS,
+	sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+	binding = captureVoiceTurns(),
+): Promise<string[]> {
+	const { provider, revision } = binding;
+	if (!provider) return [];
+	// Re-checked after every read: the session can move during the read itself.
+	const read = () => {
+		if (revision !== _voiceContextRevision) return null;
+		const spoken = _spokenTurns(count, provider);
+		return revision === _voiceContextRevision ? spoken : null;
+	};
 	const first = read();
 	if (first === null) return [];
-	if (first.length > 0 || !_speechMayBeLanding()) return first;
+	if (first.length > 0 || !_speechMayBeLanding(Date.now(), provider)) return first;
 	const deadline = Date.now() + maxMs;
 	for (;;) {
 		await sleep(SPOKEN_POLL_MS);
@@ -1047,6 +1070,18 @@ export function queuedAheadInstruction(queuedAhead: number): string {
 /** What the model is told when `work` has queued the task; the result follows when the core finishes. */
 export const WORK_PENDING_MESSAGE = 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.';
 
+/** What a `work` call carries from the moment it was made: where it was asked, and the words around it. */
+export type WorkOrigin = { origin: VoiceSessionOrigin | null; turns: VoiceTurnsBinding; recentAtAsk: string };
+const WORK_ORIGIN = Symbol('workOrigin');
+
+/** The task belongs to the origin, and the words, it was asked from, even if the session moves or the adapter mutates its record later. */
+export function captureWorkOrigin(): WorkOrigin {
+	const origin = _voiceSessionOrigin ? { ..._voiceSessionOrigin, headers: { ..._voiceSessionOrigin.headers } } : null;
+	let recentAtAsk = '';
+	try { recentAtAsk = _voiceContextAtAsk() ?? getRecentConversation(4); } catch { /* best effort */ }
+	return { origin, turns: captureVoiceTurns(), recentAtAsk };
+}
+
 export const workTool: ToolDefinition = {
 	name: 'work',
 	description:
@@ -1091,12 +1126,6 @@ export const workTool: ToolDefinition = {
 			timeout_minutes?: number;
 			dm_on_timeout?: boolean;
 		};
-		// Read before the first await: the session can move to another origin while this call
-		// waits, and the task belongs to the origin, and the words, it was asked from.
-		const origin = _voiceSessionOrigin;
-		const originGeneration = _voiceOriginGeneration;
-		let recentAtAsk = '';
-		try { recentAtAsk = _voiceContextAtAsk() ?? getRecentConversation(4); } catch { /* best effort */ }
 
 		// Redirect pure screen-viewing tasks to inline tools (faster, no round-trip)
 		// Narrow match: only "describe/look at my screen" — not scroll, screenshot,
@@ -1105,6 +1134,9 @@ export const workTool: ToolDefinition = {
 		if (screenViewOnly.test(task)) {
 			return { status: 'rejected', message: 'Use describe_screen inline tool directly for screen viewing.' };
 		}
+
+		// Read before the first await, unless the relay agent captured it when the call began.
+		const { origin, turns, recentAtAsk } = (args as { [WORK_ORIGIN]?: WorkOrigin })[WORK_ORIGIN] ?? captureWorkOrigin();
 
 		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
 		// Same pattern as conversation-server's tryFastPath.
@@ -1208,7 +1240,7 @@ export const workTool: ToolDefinition = {
 			// wording against real speech instead of trusting it.
 			let spokenBlock = '';
 			try {
-				const spoken = await _awaitSpokenTurns(2, SPOKEN_WAIT_MS, undefined, () => _voiceOriginGeneration === originGeneration);
+				const spoken = await _awaitSpokenTurns(2, SPOKEN_WAIT_MS, undefined, turns);
 				if (spoken.length > 0) {
 					spokenBlock =
 						`\n\n--- spoken (the owner's last words, verbatim as transcribed, or as typed into the voice session; the task line ` +
@@ -1263,7 +1295,8 @@ export const workTool: ToolDefinition = {
 };
 
 /** The `work` call as the relay agent runs it: the tool's own submission, then the core's result. */
-export const submitWorkTask = (args: Record<string, unknown>) => workTool.execute(args, undefined as never) as Promise<Record<string, unknown>>;
+export const submitWorkTask = (args: Record<string, unknown>, at?: WorkOrigin) =>
+	workTool.execute(at ? { ...args, [WORK_ORIGIN]: at } : args, undefined as never) as Promise<Record<string, unknown>>;
 
 // cancelTask tool moved — canonical version is `cancelTaskTool` in inline-tools.ts.
 
@@ -1312,6 +1345,8 @@ export async function logSessionBoundaryAsync(reason: string = 'user_goodbye'): 
  *  The `SESSION_END` sentinel is unique so the reader can locate
  *  it without regex gymnastics. */
 export function logSessionBoundary(reason: string = 'user_goodbye'): void {
+	// A farewell is said inside the session ("research X, bye"): words still landing stay with
+	// that task. The client leaving afterwards closes the window (endVoiceClientSession).
 	const line = `${new Date().toISOString()}|SESSION_END|${reason}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
 	recordSessionBoundary(reason); // #603 sqlite mirror

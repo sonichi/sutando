@@ -5944,7 +5944,7 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
 
     # Every limit window can page (7d_oi can be the one rejected while 5h/7d sit
     # low); overage is shown but never pages, it is purchase eligibility.
-    from quota_availability import limit_windows as _limit_windows, quota_windows as _quota_windows
+    from quota_availability import classify_limit_state, limit_windows as _limit_windows, quota_windows as _quota_windows
     windows = _quota_windows(headers)
     full = [w for w, (u, st) in _limit_windows(headers).items()
             if st == "rejected" or (u is not None and u >= 0.9)]
@@ -5958,6 +5958,11 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
             "not paging. If THIS core were stuck, its own passes would stop and "
             "quota-telemetry would go stale."
         )
+        return check
+
+    if classify_limit_state(data) == "overage":
+        # A rejected window with extra usage allowed is served, not stuck.
+        check["detail"] = f"core serving on extra usage (status={status}, {_window_summary(windows)})"
         return check
 
     reset = _fmt_quota_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
@@ -9756,6 +9761,28 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
 
 
 
+def check_withheld_reviews_readable(workspace_dir: Optional[Path] = None) -> dict:
+    """A withheld-review record the bridge cannot read as a record makes every owner Yes/No
+    in the DM answer "please reply again" until it is inspected or removed."""
+    name = "withheld-reviews-readable"
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    try:
+        from policy.egress import result as guard  # noqa: PLC0415 - the bridge's own strict rule
+    except ImportError as exc:
+        return {"name": name, "status": "warn", "detail": f"cannot load the review guard ({exc})"}
+    base = workspace / "state" / guard.WITHHELD_RESULT_DIR
+    bad = []
+    for path, reason in guard.namespace_problems(base):
+        shown = path.relative_to(workspace) if path.is_relative_to(workspace) else path.name
+        bad.append(f"{shown} ({reason})")
+    if bad:
+        shown = ", ".join(bad[:4]) + (f" (+{len(bad) - 4} more)" if len(bad) > 4 else "")
+        return {"name": name, "status": "warn",
+                "detail": f"{len(bad)} withheld-review record(s) unreadable; owner replies get "
+                          f"'please reply again' until each is inspected or removed: {shown}"}
+    return {"name": name, "status": "ok", "detail": "every withheld-review record reads"}
+
+
 def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     """A PARKED outbound item is a reply the owner never received, and nothing
     retries it: `outbox_cli`'s own header calls PARKED a durable terminal state
@@ -9780,7 +9807,7 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     except ImportError as exc:
         return {"name": name, "status": "warn",
                 "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
-    parked: list[tuple[str, str]] = []  # (root.name, item_id) -- roots differ, see below
+    parked: list[tuple[str, str, str]] = []  # (root.name, item_id, reason) -- roots differ, see below
     unreadable: list[str] = []
     for root in roots:
         # An unreadable ROOT reaches here too, and a raise would abort every
@@ -9794,20 +9821,31 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
             unreadable.append(f"{root.name} ({exc})")
             continue
         for d in outbox.list_items(root, status="PARKED"):
-            parked.append((root.name, str(d.get("item_id") or "?")))
+            parked.append((root.name, str(d.get("item_id") or "?"), str(d.get("reason") or "")))
     if unreadable:
         return {"name": name, "status": "warn",
                 "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
                           + "; ".join(unreadable)}
     if parked:
         parked.sort()
-        shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
-                           for root_name, item_id in parked[:4])
-        more = f" (+{len(parked) - 4} more)" if len(parked) > 4 else ""
+
+        def listing(items):
+            shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
+                               for root_name, item_id, _reason in items[:4])
+            return shown + (f" (+{len(items) - 4} more)" if len(items) > 4 else "")
+        # An outcome-unknown park may have landed: a requeue sends again and can post twice.
+        unknown = [p for p in parked if p[2] == "outcome-unknown"]
+        undelivered = [p for p in parked if p[2] != "outcome-unknown"]
+        parts = []
+        if undelivered:
+            parts.append(f"{len(undelivered)} never delivered — nothing retries them: "
+                         f"{listing(undelivered)}")
+        if unknown:
+            parts.append(f"{len(unknown)} may have been delivered — do not requeue without "
+                         f"checking the room: {listing(unknown)}")
         return {"name": name, "status": "warn",
-                "detail": f"{len(parked)} reply/replies PARKED and never delivered — "
-                          f"nothing retries them: {shown}{more}. Recover with "
-                          f"`python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
+                "detail": f"{len(parked)} reply/replies PARKED; " + "; ".join(parts) + ". "
+                          f"Recover with `python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
                           f"(the root varies per item; a single hardcoded root under-reports)"}
     return {"name": name, "status": "ok",
             "detail": f"no parked replies across {len(roots)} outbox root(s)"}
@@ -13408,6 +13446,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_outbox_parked())
+    checks.append(check_withheld_reviews_readable())
     checks.append(check_codex_task_notifier())
     checks.append(check_claude_task_notifier())
     checks.append(check_codex_presence())

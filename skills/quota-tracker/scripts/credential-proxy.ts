@@ -388,6 +388,33 @@ export function appendRejection(prev: unknown, rej: RejectionRecord, max: number
 	return list.slice(-max);
 }
 
+export type LimitState = 'allowed' | 'overage' | 'rejected';
+
+/** Same rule as `classify_limit_state` in src/quota_availability.py; both run
+ *  tests/fixtures/quota-limit-state.parity.json. `overage` is served, not paused. */
+export function limitState(record: unknown): LimitState {
+	const rec = (record && typeof record === 'object' && !Array.isArray(record)) ? record as Record<string, unknown> : {};
+	const h = (rec.headers && typeof rec.headers === 'object' && !Array.isArray(rec.headers)) ? rec.headers as Record<string, unknown> : {};
+	const prefix = 'anthropic-ratelimit-unified-';
+	const limited = h[`${prefix}status`] === 'rejected' || Object.entries(h).some(([k, v]) => {
+		if (!k.startsWith(prefix) || !k.endsWith('-status')) return false;
+		const w = k.slice(prefix.length, -'-status'.length);
+		return w !== '' && w !== 'overage' && v === 'rejected';
+	});
+	if (!limited) return 'allowed';
+	const overage = h[`${prefix}overage-status`];
+	if (overage !== 'allowed' && overage !== 'allowed_warning') return 'rejected';
+	const checked = typeof rec.last_checked === 'string' ? Date.parse(rec.last_checked) : NaN;
+	const ledger = Array.isArray(rec.recent_rejections) ? rec.recent_rejections : [];
+	for (const r of ledger) {
+		if (!r || typeof r !== 'object' || (r as RejectionRecord).status !== 429) continue;
+		const at = typeof (r as RejectionRecord).ts === 'string' ? Date.parse((r as RejectionRecord).ts) : NaN;
+		// An unordered 429 (either stamp unreadable) is not known to be older.
+		if (Number.isNaN(checked) || Number.isNaN(at) || at >= checked) return 'rejected';
+	}
+	return 'overage';
+}
+
 export type CredentialState = 'ok' | 'exhausted';
 
 export interface ProxyDeps {
@@ -708,10 +735,20 @@ function writeQuotaFile(state: Record<string, unknown>): void {
 	writeFileSync(QUOTA_FILE, JSON.stringify(state, null, 2));
 }
 
+/** The record after one rejection is appended. A 429 after the headers ends an
+ *  overage reading, which the header write cannot see. */
+export function recordWithRejection(prev: Record<string, unknown>, rej: RejectionRecord): Record<string, unknown> {
+	const next: Record<string, unknown> = { ...prev, recent_rejections: appendRejection(prev.recent_rejections, rej) };
+	if (prev.limit_state === 'overage' && limitState(next) === 'rejected') {
+		next.limit_state = 'rejected';
+		next.available = false;
+	}
+	return next;
+}
+
 function recordRejection(rej: RejectionRecord): void {
 	try {
-		const prev = readQuotaFile();
-		writeQuotaFile({ ...prev, recent_rejections: appendRejection(prev.recent_rejections, rej) });
+		writeQuotaFile(recordWithRejection(readQuotaFile(), rej));
 	} catch { /* best effort */ }
 }
 
@@ -732,46 +769,52 @@ function recordCredentialState(state: CredentialState, detail = ''): void {
 	} catch { /* best effort */ }
 }
 
+/** The record one header-bearing response writes; it replaces the file. */
+export function quotaStateFromHeaders(
+	prev: Record<string, unknown>, headers: Record<string, string>, model: string, nowIso: string,
+): Record<string, unknown> {
+	// The header write replaces the file, so carry the rejection ledger across it.
+	const prevLedger = prev.recent_rejections;
+	const lastRequest = withLastRequest(prev, model, nowIso);
+	const state: Record<string, unknown> = {
+		available: true,
+		last_checked: nowIso,
+		headers,
+		recent_rejections: Array.isArray(prevLedger) ? prevLedger.filter(isRejectionRecord) : [],
+		...(lastRequest ? { last_request: lastRequest } : {}),
+		// The header write replaces the file — carry credential health across it
+		// the same way as the rejection ledger.
+		...(typeof prev.credential_state === 'string' ? {
+			credential_state: prev.credential_state,
+			credential_state_detail: prev.credential_state_detail,
+			credential_state_at: prev.credential_state_at,
+		} : {}),
+	};
+
+	// Parse specific headers
+	const status5h = headers['anthropic-ratelimit-unified-5h-status'];
+	const util5h = headers['anthropic-ratelimit-unified-5h-utilization'];
+	const reset5h = headers['anthropic-ratelimit-unified-5h-reset'];
+	const util7d = headers['anthropic-ratelimit-unified-7d-utilization'];
+	const reset7d = headers['anthropic-ratelimit-unified-7d-reset'];
+	const overallStatus = headers['anthropic-ratelimit-unified-status'];
+
+	if (util5h) state.utilization_5h = parseFloat(util5h);
+	if (util7d) state.utilization_7d = parseFloat(util7d);
+	if (reset5h) state.resets_at_5h = new Date(parseInt(reset5h) * 1000).toISOString();
+	if (reset7d) state.resets_at_7d = new Date(parseInt(reset7d) * 1000).toISOString();
+
+	state.limit_state = limitState(state);
+	if (state.limit_state !== 'overage' && (overallStatus === 'rejected' || status5h === 'rejected')) {
+		state.available = false;
+		state.exhausted_since = nowIso;
+	}
+	return state;
+}
+
 function updateQuotaState(headers: Record<string, string>, model = ''): void {
 	try {
-		// The header write replaces the file, so carry the rejection ledger across it.
-		const prev = readQuotaFile();
-		const prevLedger = prev.recent_rejections;
-		const lastRequest = withLastRequest(prev, model, new Date().toISOString());
-		const state: Record<string, unknown> = {
-			available: true,
-			last_checked: new Date().toISOString(),
-			headers,
-			recent_rejections: Array.isArray(prevLedger) ? prevLedger.filter(isRejectionRecord) : [],
-			...(lastRequest ? { last_request: lastRequest } : {}),
-			// The header write replaces the file — carry credential health across it
-			// the same way as the rejection ledger.
-			...(typeof prev.credential_state === 'string' ? {
-				credential_state: prev.credential_state,
-				credential_state_detail: prev.credential_state_detail,
-				credential_state_at: prev.credential_state_at,
-			} : {}),
-		};
-
-		// Parse specific headers
-		const status5h = headers['anthropic-ratelimit-unified-5h-status'];
-		const util5h = headers['anthropic-ratelimit-unified-5h-utilization'];
-		const reset5h = headers['anthropic-ratelimit-unified-5h-reset'];
-		const util7d = headers['anthropic-ratelimit-unified-7d-utilization'];
-		const reset7d = headers['anthropic-ratelimit-unified-7d-reset'];
-		const overallStatus = headers['anthropic-ratelimit-unified-status'];
-
-		if (util5h) state.utilization_5h = parseFloat(util5h);
-		if (util7d) state.utilization_7d = parseFloat(util7d);
-		if (reset5h) state.resets_at_5h = new Date(parseInt(reset5h) * 1000).toISOString();
-		if (reset7d) state.resets_at_7d = new Date(parseInt(reset7d) * 1000).toISOString();
-
-		if (overallStatus === 'rejected' || status5h === 'rejected') {
-			state.available = false;
-			state.exhausted_since = new Date().toISOString();
-		}
-
-		writeQuotaFile(state);
+		writeQuotaFile(quotaStateFromHeaders(readQuotaFile(), headers, model, new Date().toISOString()));
 	} catch { /* best effort */ }
 }
 

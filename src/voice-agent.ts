@@ -59,7 +59,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { voiceTaskRows, workTool, submitWorkTask, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask } from './task-bridge.js';
+import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask } from './task-bridge.js';
 import { createCallEndReporter, sessionEndTask } from './voice-session-end.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
@@ -281,7 +281,7 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 // src/voice-config.ts. voice-agent ships with Gemini 3.8 Live and
 // googleSearch=false for low-latency voice conversations; this PR does not
 // claim a new code-heavy workload benchmark. Phone inherits the
-// package default (2.5+search) unless its own config overrides it.
+// package default (3.8 Live + search) unless its own config overrides it.
 import { loadVoiceConfig, migrateLegacyModel, revertModelMigration, resolveSessionTuning, resolveRelayCheck } from './voice-config.js';
 import { fireGuardedRestart, isVoiceAgentLaunchdManaged, restartAfterModelRevert } from './voice-config-switch.js';
 const _voiceAgentDir = dirname(fileURLToPath(import.meta.url));
@@ -999,6 +999,7 @@ async function main() {
 	});
 	const relayAgent = new RelayAgent({
 		submit: submitWorkTask,
+		captureOrigin: captureWorkOrigin,
 		store: voiceTaskStore,
 		speech: speechGate,
 		// A text model, not the voice model, decides whether a request is complete enough to submit.
@@ -1079,7 +1080,7 @@ async function main() {
 			callEnd.clientDisconnected();
 			// An origin belongs to the client that announced it; the next client announces its own.
 			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
-			setVoiceSessionOrigin(null);
+			endVoiceClientSession();
 			clientFrames.disconnected();
 		},
 		// P7 Tranche B: feed the ledger the two provider facts it cannot infer —

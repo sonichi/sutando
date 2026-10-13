@@ -67,7 +67,7 @@ import os.path as _osp
 import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
-from worker_auth_state import authenticated_turn, login_expired  # noqa: E402
+from worker_auth_state import authenticated_turn, login_expired, refusal_answered  # noqa: E402
 import cli_wedge  # noqa: E402
 import core_gate_notice  # noqa: E402
 import self_opened_gate  # noqa: E402
@@ -388,7 +388,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         return "blocked-known", f"at known gate: {kind}", excerpt, kind
     # A refused login leaves no gate and the idle footer, and the shared health can read a
     # seat off the CORE's status file: the pane's own refusal stands until it shows a turn ran.
-    expired = login_expired(pane) if pane else None
+    expired = login_expired(pane, runtime) if pane else None
     if expired:
         return ("logged-out", "core not authenticated (login expired; no signed-in turn since)",
                 expired, "login")
@@ -608,6 +608,9 @@ AUTO_ANSWER_CARRY_S = 120.0
 # ESCALATE (Layer 3): a blocked core IS a HumanRequirement, so it goes through
 # `src/hitl` — the Manager dedups, the projector renders the card.
 _CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
+#: How long a signed-out reading must hold before it is carded. A refusal or 401 banner
+#: the CLI recovers from on its own (a token refresh, a boot race) clears well inside it.
+LOGIN_CONFIRM_S = 60.0
 HITL_KIND = "core-blocked"
 _TUI_SOURCE = "tui"
 #: a driven click that has not moved the core by then expires as "did not take".
@@ -690,6 +693,15 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
         return None
 
 
+def login_confirm_step(since, state, kind, now, confirm_s=LOGIN_CONFIRM_S):
+    """(settling, since) for a signed-out reading: it settles until it has held for
+    `confirm_s`; any other reading resets the clock."""
+    if state != "logged-out" and kind != "login":
+        return False, None
+    since = now if since is None else since
+    return now - since < confirm_s, since
+
+
 def card_step(pane_present, state, idle_ticks, stable, settling=False):
     """One tick's verdict for the session's cards: ("hold"|"escalate"|"resolve", idle_ticks).
     A failed capture is no evidence (hold); a prompt still settling (a dialog re-rendering
@@ -703,21 +715,21 @@ def card_step(pane_present, state, idle_ticks, stable, settling=False):
     return ("resolve" if idle_ticks >= max(1, int(stable)) else "hold"), idle_ticks
 
 
-def resolve_escalations(manager, session, pane=None):
+def resolve_escalations(manager, session, pane=None, runtime=None):
     """Clear THIS session's requirements once its core is no longer blocked —
     the card says answered because the core moved, not because anyone clicked.
 
     Scoped by session: one worker recovering must not clear a sibling's card.
-    A signed-out card clears only on positive proof in `pane` that a turn ran
-    (worker_auth_state.authenticated_turn): a newer prompt, a spinner, an empty
-    capture or a health verdict read off another session's status file is not
-    "Sutando has continued its work".
+    A signed-out card clears only on positive proof in `pane` that the CLI is signed in:
+    a turn that ran, or output after the refusal (worker_auth_state). A newer prompt, a
+    spinner, an empty capture or a health verdict read off another session's status
+    file is not "Sutando has continued its work".
     """
     if manager is None:
         return []
     try:
         from hitl.manager import AUTH_KIND
-        signed_in = authenticated_turn(pane)
+        signed_in = authenticated_turn(pane, runtime) or refusal_answered(pane, runtime)
         done = []
         for r in manager.active():
             subj = r.subject or {}
@@ -823,6 +835,8 @@ def main():
     ap.add_argument("--interval", type=float, default=3.0)
     ap.add_argument("--stable", type=int, default=2,
                     help="consecutive identical prompt polls before escalating (debounce)")
+    ap.add_argument("--login-confirm-s", type=float, default=LOGIN_CONFIRM_S,
+                    help="seconds a signed-out reading must hold before it is carded")
     ap.add_argument("--once", action="store_true", help="one tick then exit (for tests/probes)")
     ap.add_argument("--no-auto-answer", dest="auto_answer", action="store_false",
                     help="report allowlisted gates without typing their safe answer")
@@ -857,6 +871,7 @@ def main():
     answered_prompt = None
     last_answered = None
     idle_ticks = 0
+    login_since = None
     prev_pane = None
     clock = (None, None, None)
     last_runtime = None  # a failed tmux read keeps the last runtime, not "claude"
@@ -881,6 +896,8 @@ def main():
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
         settling = False
+        login_settling, login_since = login_confirm_step(login_since, state, kind, time.time(),
+                                                         a.login_confirm_s)
         if state in ("blocked-human", "blocked-known"):
             stable_prompt = stable_prompt + 1 if prompt == last_prompt else 1
             last_prompt = prompt
@@ -890,6 +907,9 @@ def main():
         else:
             stable_prompt = 0
             last_prompt = None
+        if login_settling:
+            settling = True
+            state, detail, prompt, kind = "running", "processing (sign-in check settling)", None, None
         if state != "blocked-known":
             answered_prompt = None
 
@@ -930,7 +950,7 @@ def main():
                 if not a.seat:
                     notice_queued(hitl, req, workspace, state, kind)
             elif verdict == "resolve":
-                resolve_escalations(hitl, a.session, pane)
+                resolve_escalations(hitl, a.session, pane, runtime)
                 if not a.seat:
                     core_gate_notice.end_outage(workspace)
         if a.once:

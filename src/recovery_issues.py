@@ -22,7 +22,7 @@ tcc-documents-access quota-telemetry core-request-rejections core-quota quota-ac
 battery memory cron-schedule core-proactive-loop core-supervisor gateway-bridge runtime-identity
 daily-cron-punctuality live-tree-drift disk-space skill-symlinks task-queue pool-advertisement pool-suspended held-no-consumer
 orphaned-results stranded-destined-proactive proactive-quarantine stale-proactive-backlog
-task-watcher a-fallback-hits outbox-parked task-claims codex-task-notifier claude-task-notifier
+task-watcher a-fallback-hits outbox-parked withheld-reviews-readable task-claims codex-task-notifier claude-task-notifier
 codex-presence notes-split-brain
 vendored-resolver-env legacy-notes-divergence vault-manifest claude-hooks comm-sweep
 core-model-pin web-client memory-dir tailscale-funnel sutando-app telegram-bridge
