@@ -93,9 +93,16 @@ cap; `125` = stalled (no output for `--stall` s); other non-zero = gh/codex erro
 
 **Timing:** `codex exec` is agentic — even with the diff inlined it may explore related
 code, so a real review often takes 100s+ (147s observed on #1754). Keep `--max` ≥180;
-do NOT drop it near 120 or you'll kill legitimate reviews. This is the path the team-tier
-`===SUTANDO SYSTEM INSTRUCTIONS===` block runs to auto-review a non-owner PR-review request
-(owner-ping only on failure).
+do NOT drop it near 120 or you'll kill legitimate reviews.
+
+**Non-owner requests — `--non-owner`.** `codex exec --sandbox read-only` can still read any
+file the user can, so a review asked for by anyone but the owner must not use it. With
+`--non-owner`, `scripts/review_pr_sandbox.py` copies the PR's diff and its changed files at
+the head commit into a fresh temp dir outside the repo and workspace, and runs the safe runner
+from `src/policy/sandbox_runner.py` there with Read/Grep/Glob confined to that dir (no
+command, network or MCP). Exit `3` = no safe runner installed. The team-tier
+`===SUTANDO SYSTEM INSTRUCTIONS===` block runs `review-pr.sh <N> --non-owner` to auto-review
+a non-owner PR-review request (owner-ping only on failure).
 
 ## Bounded runner — `scripts/codex-bounded.sh`
 

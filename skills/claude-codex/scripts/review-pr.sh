@@ -18,6 +18,10 @@
 # request did not come from this checkout. Either way the resolved repo and title are
 # printed after the marker, so the verdict names what it actually reviewed.
 #
+# --non-owner: for a request from anyone but the owner. Codex is not used (its
+# read-only sandbox still reads every file the user can); review_pr_sandbox.py runs
+# the safe runner in a temp dir holding only the PR's diff and changed files.
+#
 # stdout is NOT the verdict: take only what follows the LAST `VERDICT-MARKER:` line.
 # The stream, or its tail, picks up codex trace or truncates the checks. See SKILL.md.
 #
@@ -28,11 +32,12 @@
 # codex explores, not diff size.
 set -u
 
-[[ $# -ge 1 && -n "${1:-}" ]] || { echo "usage: review-pr <pr-number|owner/repo#N> [--repo owner/repo] [--max secs] [--stall secs]" >&2; exit 2; }
+[[ $# -ge 1 && -n "${1:-}" ]] || { echo "usage: review-pr <pr-number|owner/repo#N> [--repo owner/repo] [--max secs] [--stall secs] [--non-owner]" >&2; exit 2; }
 PR="$1"; shift
 MAX=240
 STALL=60
 REPO=""
+NON_OWNER=0
 # `owner/repo#N` carries its own repo; a bare number does not and defers to cwd.
 if [[ "$PR" == */*#* ]]; then
     REPO="${PR%%#*}"
@@ -43,6 +48,7 @@ while [[ $# -gt 0 ]]; do
         --max)   MAX="${2:?--max needs a value}";   shift 2;;
         --stall) STALL="${2:?--stall needs a value}"; shift 2;;
         --repo)  REPO="${2:?--repo needs a value}";  shift 2;;
+        --non-owner) NON_OWNER=1; shift;;
         *)       echo "review-pr: unknown arg '$1'" >&2; exit 2;;
     esac
 done
@@ -70,7 +76,7 @@ VERDICT_MARKER="===CODEX-VERDICT-${VERDICT_NONCE}==="
 # FIRST line of stdout, before codex runs: the consumer reads the token here. codex is
 # never shown the nonce, so neither its trace nor the diff-derived verdict can contain it.
 printf 'VERDICT-MARKER: %s\n' "$VERDICT_MARKER"
-trap 'rm -f "$OUT"' EXIT   # clean up even on interrupt / non-zero exit, not just the happy path
+trap 'rm -f "$OUT" "${DIFF_FILE:-}"' EXIT   # clean up even on interrupt / non-zero exit, not just the happy path
 
 # Captured now, emitted AFTER the marker: a consumer keeps only post-marker text,
 # so printing here would drop a FAIL. Patterns live in REVIEW.md, not here.
@@ -79,11 +85,19 @@ MECH=""
 if [[ -x "$CHECKS_SH" ]]; then
     MECH="$(printf '%s' "$DIFF" | bash "$CHECKS_SH" 2>&1 || true)"
 fi
+if [[ $NON_OWNER -eq 1 ]]; then
+    DIFF_FILE="$(mktemp -t review-pr-diff.XXXXXX)"
+    printf '%s' "$DIFF" > "$DIFF_FILE"
+    python3 "$HERE/review_pr_sandbox.py" --pr "$PR" ${REPO:+--repo "$REPO"} \
+        --diff-file "$DIFF_FILE" --out "$OUT" --max "$MAX" < /dev/null
+    rc=$?
+else
 bash "$HERE/codex-bounded.sh" --stall "$STALL" --max "$MAX" -- \
     codex exec --sandbox read-only -o "$OUT" -- "Concisely review this PR diff. List only real bugs, correctness issues, or security problems as bullets; if there are none, say 'no blocking issues'. Be specific (file + what's wrong).
 
 $DIFF" < /dev/null
 rc=$?
+fi
 
 # codex's trace shares this stdout and --stall watches it, so it cannot be
 # silenced; the marker is what separates that trace from the review output.
@@ -95,6 +109,6 @@ printf '%s\n' "$VERDICT_MARKER"
 if [[ $rc -eq 0 && -s "$OUT" ]]; then
     cat "$OUT"
 else
-    echo "review-pr: no verdict for #$PR (codex exit $rc — 125=stalled, 124=hit --max, other=error)" >&2
+    echo "review-pr: no verdict for #$PR (exit $rc — 125=stalled, 124=hit --max, 3=no safe runner, other=error)" >&2
 fi
 exit "$rc"

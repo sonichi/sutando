@@ -32,7 +32,9 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import sys
 import tempfile
+import types
 from pathlib import Path
 
 STUB_TOKEN = "DISCORD_BOT_TOKEN=test-stub-token\n"
@@ -94,3 +96,19 @@ def temp_config_root():
         else:
             os.environ["CLAUDE_CONFIG_DIR"] = prior
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def install_discord_stub() -> None:
+    """Put a minimal `discord` module in sys.modules when discord.py is not installed."""
+    try:  # pragma: no cover - present in dev, absent in clean CI
+        import discord  # noqa: F401
+    except Exception:
+        stub = types.ModuleType("discord")
+        stub.Intents = type("Intents", (), {"default": staticmethod(
+            lambda: type("I", (), {"message_content": False})())})
+        stub.Client = type("Client", (), {"__init__": lambda self, **kw: None,
+                                          "event": staticmethod(lambda fn: fn)})
+        stub.File = type("File", (), {"__init__": lambda self, *a, **kw: None})
+        stub.Message = type("Message", (), {})
+        stub.DMChannel = type("DMChannel", (), {})
+        sys.modules["discord"] = stub

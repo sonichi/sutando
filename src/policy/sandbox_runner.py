@@ -39,6 +39,9 @@ USER_BIN_DIRS = (Path.home() / ".local" / "bin",)
 
 # Empty = no built-in tool at all: a file tool would read any path the user can.
 CLAUDE_TOOLS = ""
+# Read-only file tools for `confined_invocation`; --restricted holds them to the cwd,
+# refusing absolute paths, `..` and symlinks that resolve outside it.
+CLAUDE_READ_TOOLS = "Read,Grep,Glob"
 # Unresolved: inside a zipapp the importer matches the literal __file__ prefix.
 FAQ_PATH = Path(__file__).parent / "sandbox_faq.md"
 
@@ -143,11 +146,11 @@ def select_runner(order: Optional[Sequence] = None, which: Callable = shutil.whi
     return None
 
 
-def _base_args(runner: Runner) -> list:
+def _base_args(runner: Runner, tools: str = CLAUDE_TOOLS) -> list:
     if runner.safe and runner.name == "claude":
         # --tools "" leaves no built-in tool; --strict-mcp-config with no --mcp-config
         # loads no MCP server; --restricted ignores user/project/local settings.
-        return ["-p", "--restricted", "--strict-mcp-config", "--tools", CLAUDE_TOOLS,
+        return ["-p", "--restricted", "--strict-mcp-config", "--tools", tools,
                 "--permission-mode", "dontAsk", "--disable-slash-commands",
                 "--no-session-persistence"]
     raise ValueError(f"no safe invocation for runner {runner.name!r}")
@@ -170,6 +173,20 @@ def invocation(runner: Runner, binary: str, prompt: str, *, cwd: str) -> Invocat
     if not cwd or any(Path(cwd).iterdir()):
         raise ValueError("a sandbox run needs a fresh empty directory as its cwd")
     return Invocation(runner, [binary, *_base_args(runner), "--", prompt], cwd)
+
+
+def confined_invocation(runner: Runner, binary: str, prompt: str, *, cwd: str) -> Invocation:
+    """argv for a run that may READ `cwd` and nothing else: Read/Grep/Glob, no
+    command, network, MCP or settings. The caller fills `cwd`, a fresh dir outside
+    the repo and workspace, with public material only; a symlink in it is refused."""
+    root = Path(cwd) if cwd else None
+    if root is None or not root.is_dir() or root.is_symlink():
+        raise ValueError("a confined run needs an existing directory as its cwd")
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            if (Path(dirpath) / name).is_symlink():
+                raise ValueError(f"a confined run's cwd may not hold a symlink: {name}")
+    return Invocation(runner, [binary, *_base_args(runner, CLAUDE_READ_TOOLS), "--", prompt], cwd)
 
 
 def _read_faq() -> str:
