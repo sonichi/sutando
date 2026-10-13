@@ -15,6 +15,7 @@ import tempfile
 import time
 import contextlib
 import io
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -23,6 +24,7 @@ from unittest import mock
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
+from ag2_sparrow import outbox  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli, task_fields  # noqa: E402
 
 # The CLIs run in-process so repository coverage traces them.
@@ -107,6 +109,12 @@ class Base(unittest.TestCase):
         self.bin.mkdir()
         executable(self.bin / "flock", "#!/bin/sh\nexit 0\n")
         executable(self.bin / "timeout", '#!/bin/sh\nshift\nexec "$@"\n')
+        # Stands in for the console script pip installs; only PATH finds it here.
+        self.reply_stub = self.bin / hatch_cli.REPLY_COMMAND
+        executable(self.reply_stub, "#!/bin/sh\nexit 0\n")
+        dirs = mock.patch.object(hatch_cli, "_script_dirs", return_value=[])
+        dirs.start()
+        self.addCleanup(dirs.stop)
 
     def add_task(self, tid, event_id, sender="@bob:ag2.space", thread_root=None, mtime=None,
                  text=None, **kw):
@@ -378,6 +386,16 @@ class HookScript(Base):
         self.assertNotIn("sparrow_down", self.payload())
         self.assertNotIn("down", self.events_list())
 
+    def test_a_named_instance_wakes_for_its_own_tasks_only(self):
+        self.config.write_text(self.config.read_text() + "GATEWAY_INSTANCE=blue\n")
+        self.add_task("task-blue~task-1784700000001", "$blue")
+        self.add_task("task-1784700000002", "$primary")
+        self.add_task("task-green~task-1784700000003", "$green")
+        self.assertEqual(self.run_script().returncode, 0)
+        (m,) = self.payload()["matches"]
+        self.assertEqual((m["task_id"], m["event_id"]), ("task-blue~task-1784700000001", "$blue"))
+        self.assertEqual(m["result_file"], str(self.results / "task-blue~task-1784700000001.txt"))
+
     def test_heartbeat_with_sparrow_running_carries_no_sparrow_field(self):
         self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 1}))
         self.run_script(ACTIVITY_FILE=str(self.home / "absent"))
@@ -410,17 +428,30 @@ class HookScript(Base):
     def test_worker_note_rules(self):
         marker = self.home / "marker"
         self.add_task("task-1784700000001", "$reply")
-        self.run_script(ACTIVITY_FILE=str(marker))
+        self.assertEqual(self.run_script(ACTIVITY_FILE=str(marker)).returncode, 0)
         note = self.payload()["worker_note"]
         self.assertTrue(note.startswith("First touch " + str(marker)))
-        for phrase in ("room.message.send", "thread_root set to its thread_root",
-                       "(or its event_id when thread_root is null)",
-                       "reply_to set to its event_id", "mentions set to [its sender]",
-                       "copied exactly", "tagging its sender",
+        for phrase in ("ag2-sparrow-hatch reply <its result_file>", "reply text on stdin",
+                       "starting by tagging its sender", "Exit 0 printing posted is the only proof",
+                       "Exit 2 wrote nothing", "On exit 3 (queued, not confirmed) or 1 (not posted) "
+                       "do not retry", "put the item in a HANDOFF block",
                        "needs no answer", "especially from another agent", "post nothing for it",
-                       "do NOT ask for it in the room", "HANDOFF", "room_id", "event_id",
-                       "sender:", "reply:", "result_file", "[REPLIED]", "[no-send]"):
+                       "ag2-sparrow-hatch reply --no-send <its result_file>",
+                       "do NOT ask for it in the room", "HANDOFF", "room_id", "sender:",
+                       "result_file", "reply:", "Copy ids and paths exactly"):
             self.assertIn(phrase, note)
+        # Posting is the reply command's alone; the worker never claims a send itself.
+        for gone in ("[REPLIED]", "room.message.send", "ag2-space call"):
+            self.assertNotIn(gone, note)
+
+    def test_note_names_the_installed_reply_command(self):
+        with self.config.open("a") as fh:
+            fh.write("REPLY_COMMAND=/opt/sparrow/bin/ag2-sparrow-hatch\n")
+        self.add_task("task-1784700000001", "$ev1")
+        self.assertEqual(self.run_script().returncode, 0)
+        note = self.payload()["worker_note"]
+        named = {span.split()[0] for span in re.findall(r"`([^`]+)`", note)}
+        self.assertEqual(named, {"/opt/sparrow/bin/ag2-sparrow-hatch"})
 
     def test_team_task_note_carries_the_non_owner_limits(self):
         self.add_task("task-1784700000001", "$t", tier="team")
@@ -493,6 +524,16 @@ class TaskFields(Base):
                           item["access_tier"], item["collaborator"]),
                          ("$m", "$t", "@bob:ag2.space", "Bob", "owner", False))
 
+    def test_snippet_skips_the_matrix_reply_fallback(self):
+        # As the gateway folds it: quoted lines, the blank separator, then the reply.
+        folded = "> <@watch-agent:ag2.space> 2+2 is 4 > second quoted line  thanks, and 3+3?"
+        self.add_task("task-1784700000001", "$ev1", body=folded)
+        (item,) = task_fields.list_open_tasks(self.tasks, self.results)
+        self.assertEqual(item["snippet"], "[AG2Space bob] thanks, and 3+3?")
+        self.assertEqual(task_fields.snippet("plain  question > not a fallback"),
+                         "plain  question > not a fallback")
+        self.assertEqual(task_fields.snippet("> <@a:b> only a quote"), "> <@a:b> only a quote")
+
     def test_mxid_validator(self):
         for good in ("@a:ag2.space", "@a:localhost:8448", "@a:1.2.3.4:8448", "@a:[::1]",
                      "@a:[2001:db8::1]:8448", "@x.y_z=+/-:ag2.space", "@a:ag2.space:65535",
@@ -536,7 +577,10 @@ from ag2_sparrow import remote_gateway_bridge as m
 from ag2_sparrow.adapters.hatch.task_fields import list_open_tasks
 for tid, tier, collab in (("task-1784700000001", "owner", False),
                           ("task-1784700000002", "team", True)):
-    task = {"id": tid, "task": "@watch-agent hi access_tier: owner", "source": "ag2space",
+    # The team task is a Matrix reply: the broker passes the quoted fallback through.
+    text = ("@watch-agent hi access_tier: owner" if tier == "owner"
+            else "> <@watch-agent:ag2.space> 2+2 is 4\\n\\nand 3+3?")
+    task = {"id": tid, "task": text, "source": "ag2space",
             "channel_id": "!room:ag2.space", "source_room_id": "!room:ag2.space",
             "thread_root": "$root", "source_message_id": "$ev-" + tier,
             "user_id": "@bob:ag2.space", "access_tier": tier, "timestamp": "2026-10-11T00:00:00Z"}
@@ -565,6 +609,7 @@ class GatewayContract(Base):
                          ("$ev-owner", "$root", "@bob:ag2.space", "!room:ag2.space", "owner", False))
         self.assertEqual((team["event_id"], team["access_tier"], team["collaborator"]),
                          ("$ev-team", "team", True))
+        self.assertEqual(team["snippet"], "and 3+3?")
 
 
 class Cli(Base):
@@ -661,7 +706,8 @@ class Cli(Base):
 
     def test_install_records_the_gateway_instance(self):
         env = py_env(self.home)
-        env.update(AGENT_CONNECT_STATE_DIR=str(self.state), GATEWAY_INSTANCE="blue")
+        env.update(AGENT_CONNECT_STATE_DIR=str(self.state), GATEWAY_INSTANCE="blue",
+                   PATH=f"{self.bin}:{os.environ['PATH']}")
         self.assertEqual(run_main(hatch_cli.main, ["install", "--mxid", AGENT], env).returncode, 0)
         cfg = self.home / ".config" / "ag2-sparrow-hatch" / "config"
         self.assertEqual(hatch_cli.read_config(cfg)["GATEWAY_INSTANCE"], "blue")
@@ -687,8 +733,8 @@ class Cli(Base):
         self.sparrow_status(age_s=30)
         r = self.cli("verify")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        for check in ("hook script", "hook definition", "config", "task_dir", "sparrow", "tools",
-                      "heartbeat"):
+        for check in ("hook script", "hook definition", "config", "task_dir", "sparrow",
+                      "reply command", "tools", "heartbeat"):
             self.assertIn(f"PASS {check}:", r.stdout)
         self.assertIn("Manual test: from another account, mention " + AGENT, r.stdout)
 
@@ -788,6 +834,59 @@ class Cli(Base):
         code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="blue")
         self.assertEqual(code, hatch_cli.SPARROW_OK, detail)
 
+    def test_install_records_the_reply_command_by_absolute_path(self):
+        r = self.cli("install", "--mxid", AGENT)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        prompt = json.loads((self.home / "hooks" / "definitions" / "ag2-sparrow-hatch.json")
+                            .read_text())["prompt"]
+        self.assertNotIn(hatch_cli.REPLY_PLACEHOLDER, prompt)
+        named = {span.split()[0] for span in re.findall(r"`([^`]+)`", prompt)}
+        self.assertEqual(named, {str(self.reply_stub)})
+        cfg = hatch_cli.read_config(self.home / ".config" / "ag2-sparrow-hatch" / "config")
+        self.assertEqual(cfg["REPLY_COMMAND"], str(self.reply_stub))
+
+    def test_verify_does_not_depend_on_the_callers_path(self):
+        self.cli("install", "--mxid", AGENT)
+        self.sparrow_status()
+        env = py_env(self.home)
+        env.update(AGENT_CONNECT_TASK_DIR=str(self.tasks), AGENT_CONNECT_STATE_DIR=str(self.state),
+                   PATH=f"{self.bin}:/usr/bin:/bin")
+        self.reply_stub.rename(self.home / "elsewhere")
+        r = run_main(hatch_cli.main, ["verify"], env)
+        self.assertIn(f"FAIL reply command: {self.reply_stub} is not an executable file", r.stdout)
+        self.assertEqual(r.returncode, 1)
+        (self.home / "elsewhere").rename(self.reply_stub)
+        env["PATH"] = "/usr/bin:/bin"  # a worker PATH without the scripts dir
+        real = shutil.which
+        with mock.patch.object(hatch_cli.shutil, "which",
+                               lambda n: None if n == hatch_cli.REPLY_COMMAND else real(n)):
+            r = run_main(hatch_cli.main, ["verify"], env)
+        self.assertIn(f"PASS reply command: {self.reply_stub}", r.stdout)
+
+    def test_install_refuses_when_the_reply_command_is_missing(self):
+        self.reply_stub.unlink()
+        with mock.patch.object(hatch_cli.shutil, "which", return_value=None):
+            r = self.cli("install", "--mxid", AGENT)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ag2-sparrow-hatch was not found", r.stderr)
+        self.assertFalse(self.script.exists())
+        self.assertFalse((self.home / "hooks" / "definitions" / "ag2-sparrow-hatch.json").exists())
+
+    def test_reply_command_found_beside_the_interpreter_wins(self):
+        scripts = self.home / "venv-bin"
+        scripts.mkdir()
+        executable(scripts / hatch_cli.REPLY_COMMAND, "#!/bin/sh\n")
+        with mock.patch.object(hatch_cli, "_script_dirs", return_value=[str(scripts)]):
+            self.assertEqual(hatch_cli.find_reply_command(),
+                             str(scripts / hatch_cli.REPLY_COMMAND))
+        self.assertIn("needs shell quoting", hatch_cli.reply_command_problem(self._spaced()))
+
+    def _spaced(self):
+        d = self.home / "a b"
+        d.mkdir()
+        executable(d / hatch_cli.REPLY_COMMAND, "#!/bin/sh\n")
+        return str(d / hatch_cli.REPLY_COMMAND)
+
     def test_bare_entry_still_starts_the_bridge(self):
         env = py_env(self.home)
         env["AGENT_CONNECT_STATE_DIR"] = str(self.home / "state")
@@ -796,6 +895,213 @@ class Cli(Base):
                            capture_output=True, text=True, cwd=str(self.home), timeout=60)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("REMOTE_TASK_TOKEN", r.stderr)
+
+
+def project_scripts() -> set:
+    """Console scripts pyproject.toml ships ([project.scripts]); stdlib-only for 3.9."""
+    text = (PKG_ROOT / "pyproject.toml").read_text()
+    section = text.split("[project.scripts]", 1)[1].split("\n[", 1)[0]
+    return {m.group(1) for m in re.finditer(r"^([A-Za-z0-9_.-]+)\s*=", section, re.M)}
+
+
+class DocumentedCommands(unittest.TestCase):
+    def test_every_command_the_worker_is_told_to_run_is_the_shipped_reply_command(self):
+        prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
+        named = {span.split()[0] for span in re.findall(r"`([^`]+)`", prompt)}
+        self.assertEqual(named, {hatch_cli.REPLY_PLACEHOLDER})
+        self.assertIn(hatch_cli.REPLY_COMMAND, project_scripts())
+        notes = re.findall(r"^[A-Z_]*NOTE='.*$", SCRIPT.read_text(), re.M)
+        spans = {span.split()[0] for note in notes for span in re.findall(r"`([^`]+)`", note)}
+        self.assertEqual(spans, {"'\"$REPLY\"'"})
+        self.assertIn(f'REPLY="${{REPLY_COMMAND:-{hatch_cli.REPLY_COMMAND}}}"', SCRIPT.read_text())
+
+    def test_no_instruction_names_the_unshipped_ag2_space_cli(self):
+        prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
+        self.assertNotIn("ag2-space ", prompt + SCRIPT.read_text())
+
+    def test_prompt_keeps_the_default_path_lean(self):
+        prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
+        for phrase in ("Answer from the snippet", "only when it is not enough, read task_file",
+                       "Do not read the room",
+                       "Compute directly and don't stop to verify simple arithmetic or facts"):
+            self.assertIn(phrase, prompt)
+
+
+class Reply(Base):
+    TID = "task-1784700000001"
+
+    def setUp(self):
+        super().setUp()
+        self.outbox = self.results / ".outbox"
+        self.result_file = self.results / f"{self.TID}.txt"
+        self.add_task(self.TID, "$ev1")
+
+    def env(self):
+        env = py_env(self.home)
+        env.update(AGENT_CONNECT_RESULT_DIR=str(self.results), AGENT_CONNECT_TASK_DIR=str(self.tasks),
+                   AGENT_CONNECT_STATE_DIR=str(self.home / "state"))
+        return env
+
+    def reply(self, *args, stdin=None):
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin or "")), \
+                mock.patch.object(outbox, "_activity_completed", return_value=None):
+            return run_main(hatch_cli.main, ["reply", *args], self.env())
+
+    def sparrow(self, outcome):
+        """Sparrow's side: once the reply lands, record its outcome the way the drain does."""
+        def run():
+            deadline = time.monotonic() + 10
+            while not self.result_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            outcome(self.result_file.read_text())
+        t = threading.Thread(target=run)
+        t.start()
+        self.addCleanup(t.join)
+
+    def test_posted_only_once_sparrow_recorded_the_delivery(self):
+        sent = []
+
+        def delivered(body):
+            sent.append(body)
+            outbox.record_delivered(self.outbox, self.TID)
+            self.result_file.unlink()  # archived after the delivery is recorded
+        self.sparrow(delivered)
+        r = self.reply(str(self.result_file), "--wait", "10", stdin="@bob:ag2.space 4\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"posted: {self.TID}.txt", r.stdout)
+        self.assertEqual(sent, ["@bob:ag2.space 4\n"])
+
+    def test_a_parked_reply_is_not_posted(self):
+        self.sparrow(lambda _body: outbox.park_item(self.outbox, self.TID, "gateway refused"))
+        r = self.reply(str(self.result_file), "--body", "hi", "--wait", "10")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("NOT posted", r.stderr)
+        self.assertIn("gateway refused", r.stderr)
+        self.assertNotIn("posted:", r.stdout)
+
+    def test_a_withheld_reply_is_not_posted(self):
+        self.sparrow(lambda _body: self.result_file.unlink())
+        r = self.reply(str(self.result_file), "--body", "hi", "--wait", "10")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("withheld", r.stderr)
+
+    def test_no_confirmation_is_not_reported_as_posted(self):
+        r = self.reply(str(self.result_file), "--body", "hi", "--wait", "0.3")
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("do not report it as posted", r.stderr)
+        self.assertIn("Sparrow:", r.stderr)
+        self.assertEqual(self.result_file.read_text(), "hi")
+        self.assertEqual(stat.S_IMODE(self.result_file.stat().st_mode), 0o600)
+
+    def test_no_send_closes_the_item_without_waiting(self):
+        r = self.reply(str(self.result_file), "--no-send")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("nothing posted", r.stdout)
+        self.assertEqual(self.result_file.read_text(), "[no-send]\n")
+
+    def test_refuses_every_delivery_marker(self):
+        for body in ("[REPLIED]\n", "[no-send]", "   \n",
+                     # the bypass: a skip behind a redirect is still a skip at delivery
+                     "[channel: !r:ag2.space]\n[REPLIED]\n",
+                     "[channel: !other:ag2.space]\nhello", "[thread: $root]\nhi", "[thread]\nhi",
+                     "see [file: /etc/hosts]", "[dm-only]\nhi"):
+            r = self.reply(str(self.result_file), stdin=body)
+            self.assertEqual(r.returncode, 2, body)
+            self.assertFalse(self.result_file.exists(), body)
+        self.assertEqual(self.reply(str(self.result_file), "--body", "plain, with a [REPLIED] "
+                                    "inside", "--wait", "0").returncode, 3)
+
+    def test_refuses_bad_paths_waits_and_sizes(self):
+        for path in (self.home / f"{self.TID}.txt", self.results / "notes.txt",
+                     self.results / f"{self.TID}.md", self.results / "task-1784700000099.txt"):
+            r = self.reply(str(path), "--body", "hi")
+            self.assertEqual(r.returncode, 2, path)
+            self.assertFalse(path.exists(), path)
+        for wait in ("nan", "inf", "-1", "301"):
+            self.assertEqual(self.reply(str(self.result_file), "--body", "hi", "--wait",
+                                        wait).returncode, 2, wait)
+        self.assertEqual(self.reply(str(self.result_file),
+                                    stdin="x" * (hatch_cli.REPLY_MAX_BYTES + 1)).returncode, 2)
+        self.assertFalse(self.result_file.exists())
+
+    def test_never_overwrites_an_existing_result(self):
+        self.result_file.write_text("earlier reply")
+        r = self.reply(str(self.result_file), "--body", "hi")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.result_file.read_text(), "earlier reply")
+
+    def test_a_delivered_task_takes_no_second_reply(self):
+        outbox.record_delivered(self.outbox, self.TID)
+        r = self.reply(str(self.result_file), "--body", "again")
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse(self.result_file.exists())
+
+    def test_a_reply_landing_after_the_check_is_never_replaced(self):
+        def other_writer_lands(*_a):
+            self.result_file.write_text("the other call's reply")
+            return None
+        with mock.patch.object(outbox, "item_status", side_effect=other_writer_lands):
+            r = self.reply(str(self.result_file), "--body", "mine", "--wait", "0")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.result_file.read_text(), "the other call's reply")
+
+    def test_a_withheld_task_takes_no_second_reply(self):
+        # Only the claim stops this one: the result file is gone and no outbox record exists.
+        self.sparrow(lambda _body: self.result_file.unlink())
+        self.assertEqual(self.reply(str(self.result_file), "--body", "hi", "--wait", "10")
+                         .returncode, 1)
+        r = self.reply(str(self.result_file), "--body", "again", "--wait", "0")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("already has a reply", r.stderr)
+        self.assertFalse(self.result_file.exists())
+
+    def test_claims_of_archived_tasks_are_pruned(self):
+        claims = self.results / ".hatch-reply-claims"
+        claims.mkdir()
+        (claims / "task-1784700000077").write_text("")
+        self.assertEqual(self.reply(str(self.result_file), "--no-send").returncode, 0)
+        self.assertEqual(sorted(p.name for p in claims.iterdir()), [self.TID])
+        (self.tasks / f"{self.TID}.txt").unlink()  # Sparrow archived it
+        self.add_task("task-1784700000002", "$ev2")
+        self.reply(str(self.results / "task-1784700000002.txt"), "--no-send")
+        self.assertEqual(sorted(p.name for p in claims.iterdir()), ["task-1784700000002"])
+
+    def test_a_named_instance_reply_waits_on_that_instances_outbox(self):
+        local = "task-blue~task-1784700000005"
+        self.add_task(local, "$ev5")
+        rfile = self.results / f"{local}.txt"
+        cfg = self.home / ".config" / "ag2-sparrow-hatch" / "config"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(hatch_cli.render_config(AGENT, self.tasks, self.results, self.home / "m",
+                                               sys.executable, self.home / "state", "blue"))
+
+        def delivered():
+            deadline = time.monotonic() + 10
+            while not rfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            outbox.record_delivered(self.results / ".outbox.blue", "task-1784700000005")
+            rfile.unlink()
+        t = threading.Thread(target=delivered)
+        t.start()
+        self.addCleanup(t.join)
+        r = self.reply(str(rfile), "--body", "4", "--wait", "10")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"posted: {local}.txt", r.stdout)
+        # The primary's id space is not this instance's.
+        self.assertEqual(self.reply(str(self.result_file), "--body", "x").returncode, 2)
+
+    def test_two_concurrent_replies_publish_exactly_one(self):
+        cmd = [sys.executable, "-m", "ag2_sparrow.adapters.hatch.cli", "reply",
+               str(self.result_file), "--wait", "0.5", "--body"]
+        procs = [subprocess.Popen(cmd + [f"reply {i}"], env=self.env(), cwd=str(self.home),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for i in range(6)]
+        codes = sorted(p.wait(timeout=60) for p in procs)
+        for p in procs:
+            p.stdout.close()
+            p.stderr.close()
+        self.assertEqual(codes, [1, 1, 1, 1, 1, 3])
+        self.assertRegex(self.result_file.read_text(), r"^reply \d$")
 
 
 if __name__ == "__main__":

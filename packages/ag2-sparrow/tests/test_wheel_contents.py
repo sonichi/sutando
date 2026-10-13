@@ -5,8 +5,10 @@ wheel or sdist and the installed ag2-sparrow died at import. This builds both
 distributions in a throwaway venv, checks every package directory is inside
 them, installs the wheel and runs the console entry point.
 """
+import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tarfile
@@ -85,7 +87,23 @@ def main():
                            text=True, cwd=d, env=env, timeout=60)
         assert r.returncode == 0 and "install" in r.stdout, f"{r.stdout}\n{r.stderr}"
         print("PASS installed ag2-sparrow-hatch runs the Hatch adapter")
-
+        # install runs with a PATH that lacks the venv's bin, as a Hatch worker's may.
+        home = d / "home"
+        home.mkdir()
+        ienv = dict(env, HOME=str(home), PATH="/usr/bin:/bin",
+                    AGENT_CONNECT_TASK_DIR=str(d / "tasks"), AGENT_CONNECT_RESULT_DIR=str(d / "results"))
+        r = subprocess.run([str(bindir / "ag2-sparrow-hatch"), "install", "--mxid", "@w:ag2.space"],
+                           capture_output=True, text=True, cwd=d, env=ienv, timeout=60)
+        assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+        prompt = json.loads((home / "hooks" / "definitions" / "ag2-sparrow-hatch.json")
+                            .read_text())["prompt"]
+        named = {span.split()[0] for span in re.findall(r"`([^`]+)`", prompt)}
+        assert {str(pathlib.Path(n).resolve()) for n in named} == \
+            {str((bindir / "ag2-sparrow-hatch").resolve())}, named
+        r = subprocess.run([*named, "reply", "--help"],
+                           capture_output=True, text=True, cwd=d, env=ienv, timeout=60)
+        assert r.returncode == 0 and "result_file" in r.stdout, f"{r.stdout}\n{r.stderr}"
+        print(f"PASS installed hook prompt names the reply command by absolute path: {named.pop()}")
 
 if __name__ == "__main__":
     main()

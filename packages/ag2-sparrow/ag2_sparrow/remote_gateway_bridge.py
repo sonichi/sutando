@@ -301,7 +301,7 @@ from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir a
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
-from . import local_task_protocol
+from . import gateway_instance, local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
@@ -358,13 +358,13 @@ except ImportError:  # pragma: no cover - flat src/ import path
 UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / "undelivered"
 # Named-instance support (multi-gateway): one core may run SEVERAL bridge
 # processes, each pointed at a different gateway (e.g. prod + dev homeservers)
-_INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+_INSTANCE_RE = gateway_instance.INSTANCE_RE
 
 GATEWAY_INSTANCE = (os.environ.get("GATEWAY_INSTANCE") or "").strip()
 if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
     sys.exit("FATAL: GATEWAY_INSTANCE must match "
              f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
-_INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
+_INST_SUFFIX = gateway_instance.suffix(GATEWAY_INSTANCE)
 
 
 def _local_tid(broker_tid: str) -> str:
@@ -385,19 +385,12 @@ def _local_tid(broker_tid: str) -> str:
       consumers therefore gate on `_valid_local_tid`, and the wire id is
       re-derived and `_valid_tid`-checked at the ack/result egress points.
     Unset instance → identity (legacy single-gateway installs unchanged)."""
-    if not GATEWAY_INSTANCE:
-        return broker_tid
-    return f"task-{GATEWAY_INSTANCE}~{broker_tid}"
+    return gateway_instance.local_tid(broker_tid, GATEWAY_INSTANCE)
 
 
 def _broker_tid(local_tid: str) -> str:
     """Reverse of `_local_tid` — the id the GATEWAY knows this task by."""
-    if not GATEWAY_INSTANCE:
-        return local_tid
-    prefix = f"task-{GATEWAY_INSTANCE}~"
-    if local_tid.startswith(prefix):
-        return local_tid[len(prefix):]
-    return local_tid
+    return gateway_instance.broker_tid(local_tid, GATEWAY_INSTANCE)
 
 
 _LOCAL_TID_RE = re.compile(rf"task-{_INSTANCE_RE.pattern}~([A-Za-z0-9._-]{{1,64}})")
@@ -4605,7 +4598,7 @@ _DELIVERY_CORE: "DeliveryCore | None" = None
 def _delivery_core() -> DeliveryCore:
     """Compose a persisted retry window over idempotent gateway result POSTs."""
     global _DELIVERY_CORE
-    root = RESULTS_DIR / f".outbox{_INST_SUFFIX}"
+    root = gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE)
     if _DELIVERY_CORE is None or _DELIVERY_CORE.backend.root != root:
         _DELIVERY_CORE = DeliveryCore(
             DesignAClaimBackend(root, retry_schedule=RetrySchedule(), republish_delivered=False),
@@ -4666,7 +4659,7 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
             return
         _log(f"result {tid}: {why} — quarantined to "
              f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
-             f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
+             f"--root {gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE)} "
              f"requeue {outbox_item_id or _broker_tid(_delivery_tid(tid) or tid)} --reset-attempts "
              f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
     except disposal.KeptQuarantined:
