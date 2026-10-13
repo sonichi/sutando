@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from contextlib import contextmanager
 import dataclasses
 from dataclasses import asdict
@@ -58,30 +59,46 @@ def _activity(task_ids, to_phase: str, reason: str) -> None:
         pass
 
 
-# Per process, keyed by store root: ids already warned about, and the failure
-# count last published for health-check.
-_ARCHIVE_WARNED: set = set()
-_ARCHIVE_PUBLISHED: Dict[str, int] = {}
-ARCHIVE_STATUS_NAME = ".archive-status.json"  # in the root: no glob sees it
+# Per process, keyed by store root: ids warned about while still failing, and
+# the (count, error, time) last published for health-check.
+_ARCHIVE_WARNED: Dict[str, set] = {}
+_ARCHIVE_PUBLISHED: Dict[str, tuple] = {}
+# While failures persist the status is rewritten this often, so a reader can
+# tell a stopped writer (older than ARCHIVE_STATUS_STALE_S) from a steady failure.
+ARCHIVE_STATUS_REFRESH_S = 300
+ARCHIVE_STATUS_STALE_S = 600
 
 
-def archive_health(store_root: Path) -> Optional[Dict]:
+def archive_status_path(store_root: Path) -> Path:
+    """Beside the store, like the archive dir, so the store holds only records."""
+    root = Path(store_root)
+    return root.with_name(root.name + "-archive-status.json")
+
+
+def archive_health(store_root: Path, now: Optional[float] = None) -> Optional[Dict]:
     """What health-check reads: live record count plus the published archive
-    failures, or None when this host has no store."""
+    failures, or None when this host has no store. `stale` means failures were
+    reported but the writer stopped refreshing them, so the count is unknown."""
     root = Path(store_root)
     if not root.is_dir():
         return None
     status: Dict = {}
     try:
-        status = json.loads((root / ARCHIVE_STATUS_NAME).read_text())
+        status = json.loads(archive_status_path(root).read_text())
     except (OSError, ValueError):
         pass
     if not isinstance(status, dict):
         status = {}
+    failures = int(status.get("failures") or 0)
+    updated = status.get("updated_at")
+    now = time.time() if now is None else now
+    stale = failures > 0 and (not isinstance(updated, (int, float))
+                              or now - updated > ARCHIVE_STATUS_STALE_S)
     return {"live": sum(1 for _ in root.glob("hitl_*.json")),
-            "failures": int(status.get("failures") or 0),
+            "failures": failures,
             "error": str(status.get("error") or ""),
-            "updated_at": status.get("updated_at")}
+            "updated_at": updated,
+            "stale": stale}
 
 
 def default_store(workspace: Optional[Path] = None) -> Path:
@@ -168,29 +185,33 @@ class HitlStore:
             return True
 
     def report_archive_failures(self, failures: Dict[str, BaseException], now: float) -> None:
-        """Take one pulse's archive failures: warn once per id per process, and
-        publish the count for health-check when it changed."""
+        """Take one pulse's archive failures: warn once per failing spell of an id,
+        and publish the status for health-check when it changed or needs a refresh."""
         key = str(self.root)
+        warned = _ARCHIVE_WARNED.setdefault(key, set())
         for req_id, err in failures.items():
-            if (key, req_id) not in _ARCHIVE_WARNED:
-                _ARCHIVE_WARNED.add((key, req_id))
+            if req_id not in warned:
                 logging.getLogger("hitl.store").warning("hitl: could not archive %s: %s", req_id, err)
-        if _ARCHIVE_PUBLISHED.get(key) == len(failures):
-            return
+        # An id that succeeded or left the live set warns again if it fails later.
+        _ARCHIVE_WARNED[key] = set(failures)
         first = next(iter(failures.values()), None)
-        payload = {"failures": len(failures),
-                   "error": f"{type(first).__name__}: {first}" if first else "", "updated_at": now}
+        error = f"{type(first).__name__}: {first}" if first is not None else ""
+        last = _ARCHIVE_PUBLISHED.get(key)
+        if last and last[:2] == (len(failures), error) and not (
+                failures and now - last[2] >= ARCHIVE_STATUS_REFRESH_S):
+            return
+        target = archive_status_path(self.root)
         tmp = None
         try:
-            fd, tmp = tempfile.mkstemp(dir=key, prefix=".tmp-")
+            fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".tmp-archive-status-")
             with os.fdopen(fd, "w") as f:
-                json.dump(payload, f)
-            os.replace(tmp, self.root / ARCHIVE_STATUS_NAME)
+                json.dump({"failures": len(failures), "error": error, "updated_at": now}, f)
+            os.replace(tmp, target)
         except OSError:
             if tmp and os.path.exists(tmp):
                 os.unlink(tmp)
             return  # reporting never blocks delivery; retried next pulse
-        _ARCHIVE_PUBLISHED[key] = len(failures)
+        _ARCHIVE_PUBLISHED[key] = (len(failures), error, now)
 
     def load(self, req_id: str) -> Optional[HumanRequirement]:
         raw = self._load_raw(req_id)

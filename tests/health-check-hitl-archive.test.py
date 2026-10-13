@@ -5,6 +5,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -42,6 +43,10 @@ class HitlArchiveCheckTest(unittest.TestCase):
         self.assertEqual((out["name"], out["status"]), ("hitl-archive", "ok"))
         self.assertIn("3 live", out["detail"])
 
+    def test_a_live_store_at_the_threshold_is_ok(self):
+        self.fill(hc.HITL_LIVE_WARN)
+        self.assertEqual(hc.check_hitl_archive()["status"], "ok")
+
     def test_a_live_store_past_the_threshold_warns(self):
         self.fill(hc.HITL_LIVE_WARN + 1)
         out = hc.check_hitl_archive()
@@ -50,11 +55,20 @@ class HitlArchiveCheckTest(unittest.TestCase):
 
     def test_published_archive_failures_warn(self):
         self.fill(1)
-        (self.root / ".archive-status.json").write_text(
-            json.dumps({"failures": 2, "error": "PermissionError: denied"}))
+        hm.archive_status_path(self.root).write_text(json.dumps(
+            {"failures": 2, "error": "PermissionError: denied", "updated_at": time.time()}))
         out = hc.check_hitl_archive()
         self.assertEqual(out["status"], "warn")
         self.assertIn("2 settled record(s) failing to archive", out["detail"])
+
+    def test_a_stale_failure_status_warns_as_stale(self):
+        self.fill(1)
+        hm.archive_status_path(self.root).write_text(json.dumps(
+            {"failures": 1, "error": "PermissionError: denied",
+             "updated_at": time.time() - hm.ARCHIVE_STATUS_STALE_S - 60}))
+        out = hc.check_hitl_archive()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("archive status stale", out["detail"])
 
     def test_a_real_archive_failure_reaches_health(self):
         mgr = hm.HitlManager(hm.HitlStore(self.root))
@@ -72,7 +86,7 @@ class HitlArchiveCheckTest(unittest.TestCase):
 
     def test_an_unreadable_status_file_degrades_to_the_live_count(self):
         self.fill(1)
-        (self.root / ".archive-status.json").write_text("[not json")
+        hm.archive_status_path(self.root).write_text("[not json")
         self.assertEqual(hc.check_hitl_archive()["status"], "ok")
 
 

@@ -2940,7 +2940,10 @@ def check_hitl_archive() -> "dict | None":
     if h is None:
         return None
     problems = []
-    if h["failures"]:
+    if h["stale"]:
+        problems.append(f"archive status stale: {h['failures']} failure(s) last reported, "
+                        "not refreshed since (is the gateway pulsing?)")
+    elif h["failures"]:
         problems.append(f"{h['failures']} settled record(s) failing to archive ({h['error']})")
     if h["live"] > HITL_LIVE_WARN:
         problems.append(f"{h['live']} live records (> {HITL_LIVE_WARN}); the gateway re-reads "
