@@ -21,9 +21,9 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-# The fixtures carry the codex command; which runner a host has installed is
+# The fixtures carry the claude command; which runner a host has installed is
 # tests/sandbox-runner.test.py's concern, so pin it here.
-os.environ["SUTANDO_SANDBOX_RUNNERS"] = "codex"
+os.environ["SUTANDO_SANDBOX_RUNNERS"] = "claude"
 _SRC = REPO / "src" / "remote-gateway-bridge.py"
 FIXTURES = REPO / "tests" / "fixtures" / "gateway-task-envelopes"
 

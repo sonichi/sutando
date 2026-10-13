@@ -81,7 +81,8 @@ class CodexPresence(unittest.TestCase):
         self.assertEqual(r["status"], "warn")
         self.assertIn("wiped binary", r["detail"])
         self.assertIn("--prefix ~/.local", r["detail"])
-        self.assertIn("non-owner", r["detail"])
+        self.assertIn("Non-owner sandbox answers do not need it", r["detail"])
+        self.assertNotIn("only permitted path", r["detail"])
 
     def test_absent_without_config_reads_as_never_installed(self):
         with patch.object(Path, "is_dir", return_value=False):

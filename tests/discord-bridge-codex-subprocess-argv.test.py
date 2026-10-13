@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""_run_codex_subprocess builds a --skip-git-repo-check argv (PR #2155 coverage).
+"""_run_codex_subprocess spawns the sandbox runner with no tools in an empty dir.
 
-The mod-judge codex wrapper spawns `codex exec` from the repo cwd, which codex
-refuses ("Not inside a trusted directory") without --skip-git-repo-check. This
-covers the argv-construction line by patching create_subprocess_exec and
-asserting the flag is present (and -m <model> is appended only when given).
+The mod-judge wrapper reads untrusted Discord text, so its runner must not be able
+to read any file: claude with `--tools ""`, cwd a fresh empty temp dir that is
+removed afterwards, stdin closed. Codex is never spawned (no read-denying policy).
 
 Run: python3 tests/discord-bridge-codex-subprocess-argv.test.py  (exit 0/1)
 """
@@ -50,29 +49,48 @@ class _FakeProc:
     returncode = 0
 
     async def communicate(self):
-        return (b"", b"")
+        return (b"{}", b"")
 
 
 async def _fake_exec(*argv, **kwargs):
     captured["argv"] = list(argv)
+    captured["kwargs"] = kwargs
+    cwd = kwargs.get("cwd")
+    captured["cwd_listing"] = sorted(os.listdir(cwd)) if cwd and os.path.isdir(cwd) else None
     return _FakeProc()
 
 
 async def _run():
     mod.asyncio.create_subprocess_exec = _fake_exec  # patch the spawn
+    sr = mod.sandbox_runner
     # Pin the runner: which one is installed is the host's business, not this test's.
-    mod.sandbox_runner.select_runner = lambda *a, **k: (mod.sandbox_runner.RUNNERS["codex"], "codex")
-    # model=None path
-    await mod._run_codex_subprocess("hello prompt", None, 5)
-    argv1 = captured["argv"]
-    check("argv includes --skip-git-repo-check", "--skip-git-repo-check" in argv1, str(argv1))
-    check("argv starts with codex exec --sandbox read-only",
-          argv1[:4] == ["codex", "exec", "--sandbox", "read-only"], str(argv1[:4]))
-    check("no -m when model is None", "-m" not in argv1)
-    # model set path
-    await mod._run_codex_subprocess("hello", "gpt-x", 5)
-    argv2 = captured["argv"]
-    check("argv appends -m <model> when model given", "-m" in argv2 and "gpt-x" in argv2, str(argv2))
+    orig = sr.select_runner
+    sr.select_runner = lambda *a, **k: (sr.RUNNERS["claude"], "/fake/claude")
+    try:
+        raw = await mod._run_codex_subprocess("hello prompt", "gpt-x", 5)
+    finally:
+        sr.select_runner = orig
+    argv, kw = captured["argv"], captured["kwargs"]
+    check("answer read from stdout", raw == "{}", repr(raw))
+    check("argv starts with claude -p", argv[:2] == ["/fake/claude", "-p"], str(argv[:2]))
+    check("--tools is empty", "--tools" in argv and argv[argv.index("--tools") + 1] == "", str(argv))
+    check("no MCP config", "--strict-mcp-config" in argv and "--mcp-config" not in argv, str(argv))
+    check("model is not forwarded", "gpt-x" not in argv, str(argv))
+    check("prompt is the last argv after --", argv[-2:] == ["--", "hello prompt"], str(argv[-2:]))
+    check("stdin closed", kw.get("stdin") is asyncio.subprocess.DEVNULL)
+    cwd = kw.get("cwd") or ""
+    check("cwd is a fresh empty temp dir", captured["cwd_listing"] == [] and
+          os.path.basename(cwd).startswith("sutando-sandbox-"), cwd)
+    check("cwd is outside the repo", not os.path.realpath(cwd).startswith(str(REPO.resolve())), cwd)
+    check("cwd removed afterwards", not os.path.exists(cwd), cwd)
+    # No safe runner: nothing is spawned.
+    captured.clear()
+    sr.select_runner = lambda *a, **k: None
+    try:
+        raw = await mod._run_codex_subprocess("hello", None, 5)
+    finally:
+        sr.select_runner = orig
+    check("no runner -> empty answer, no spawn", raw == "" and not captured)
 
 
 asyncio.run(_run())
@@ -81,4 +99,4 @@ print()
 if failures:
     print(f"FAIL — {len(failures)}: {failures}")
     sys.exit(1)
-print("PASS — codex subprocess argv (skip-git-repo-check)")
+print("PASS — sandbox judge argv (no tools, empty cwd)")

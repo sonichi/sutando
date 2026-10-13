@@ -16,7 +16,7 @@ Telegram tasks include an `access_tier` field set by the bridge (same tiers as D
 
 Discord tasks include an `access_tier` field set by the bridge:
 - **owner**: Full access — process normally with all capabilities
-- **team**: Delegate to sandboxed agent (`codex exec --sandbox read-only --skip-git-repo-check -- <prompt> < /dev/null` — the redirect is required or codex waits on stdin and can hang; assert its OUTPUT is non-empty, since it exits 0 on refusal too). The runner is the first safe one installed in the order `SUTANDO_SANDBOX_RUNNERS` gives (declared in `skills/claude-codex/manifest.json`, default `agy,codex,claude`; agy is skipped because it has no flag-only read-only, no-network mode) — see `src/policy/sandbox_runner.py`. No system mutations. **Exception — a per-channel collaborator.** A team sender listed under a channel's `collaborators` in `access.json` gets the `team-collaborator` engage rulebook in THAT channel only. That list is the owner's attestation for this surface: it is hand-configured, per-channel, and is a deliberate owner act rather than a wire flag a sender can set. Scope is strictly per-channel — membership in another channel's list does not carry over, and it grants engagement, not owner authority.
+- **team**: Delegate to the sandboxed agent, using the command `src/policy/sandbox_runner.py` renders (macOS/Linux bridges; the Windows dispatcher is the exception above) (stdin from `/dev/null`; assert its OUTPUT is non-empty, since a refusal also exits 0). The sandbox reads no file: it runs in a fresh empty temp dir with no tools and no MCP, and its only context is the prompt (the question plus the public FAQ in `src/policy/sandbox_faq.md`). The runner is the first safe one installed in the order `SUTANDO_SANDBOX_RUNNERS` gives (declared in `skills/claude-codex/manifest.json`); today only `claude` is safe — agy and codex are skipped because neither can be confined to read nothing. No system mutations. **Exception — a per-channel collaborator.** A team sender listed under a channel's `collaborators` in `access.json` gets the `team-collaborator` engage rulebook in THAT channel only. That list is the owner's attestation for this surface: it is hand-configured, per-channel, and is a deliberate owner act rather than a wire flag a sender can set. Scope is strictly per-channel — membership in another channel's list does not carry over, and it grants engagement, not owner authority.
 - **guest**: Delegate to sandboxed agent. Information only — answer questions about Sutando. This is the fail-closed default for any sender no allowlist names. `other` is the legacy spelling of this tier: the Discord bridge no longer emits it, and readers resolve it to `guest` through `local_task_protocol.canonical_access_tier` (a `tierMap` value of `other` is written out as `guest`).
 
 Owner is determined by `allowFrom` in `$CLAUDE_CONFIG_DIR/channels/discord/access.json` (set via `/discord:access`).
@@ -45,7 +45,9 @@ The bridge and dispatcher must resolve the same workspace and
 `CLAUDE_CONFIG_DIR`, including the task envelope key and Discord access file.
 After updating code, restart both services through the host's normal launcher.
 Unsigned or invalid tasks, revoked collaborators, and other non-owner tasks
-use the Windows dispatcher's read-only sandbox path. If the sandbox is unavailable
+use the Windows dispatcher's read-only sandbox path (`codex exec --sandbox read-only`,
+which still lets the answer read owner files: the no-file sandbox below covers the
+macOS/Linux bridges only, #5459). If the sandbox is unavailable
 or fails, the dispatcher returns its failure result without granting normal
 capabilities. Owner processing is unchanged. No access-file migration or automatic
 collaborator grant is performed.
@@ -64,7 +66,7 @@ The `context-source-guard` PreToolUse hook — **which is deployed per node, not
 
 Slack tasks include an `access_tier` field set by the bridge:
 - **owner**: Full access — process normally with all capabilities.
-- **team**: Delegate to sandboxed agent (`codex exec --sandbox read-only --skip-git-repo-check -- <prompt> < /dev/null` — the redirect is required or codex waits on stdin and can hang; assert its OUTPUT is non-empty, since it exits 0 on refusal too). No system mutations. Slack Team mappings retain this existing contract.
+- **team**: Delegate to the same no-file sandbox as Discord team (see above, `src/policy/sandbox_runner.py`). No system mutations.
 - **other**: Delegate to sandboxed agent. Information only — answer questions about Sutando. (Slack still emits this legacy spelling; readers resolve it to `guest`.)
 
 Tier resolution is per-user: `tierMap` in `$CLAUDE_CONFIG_DIR/channels/slack/access.json` maps Slack user IDs to tiers. Users in `allowFrom` without a `tierMap` entry default to `"owner"` (preserves pre-tierMap behavior).

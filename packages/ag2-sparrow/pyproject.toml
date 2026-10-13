@@ -47,6 +47,8 @@ include = ["ag2_sparrow*"]
 # Non-Python files the Hatch adapter installs; they must ship in the wheel.
 [tool.setuptools.package-data]
 "ag2_sparrow.adapters.hatch" = ["*.sh", "*.json"]
+# sandbox_runner inlines this public FAQ into every sandboxed prompt.
+"ag2_sparrow" = ["sandbox_faq.md"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ag2_sparrow.__version__" }
