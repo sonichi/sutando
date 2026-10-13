@@ -520,6 +520,10 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		// voice model was asking "which PR?"; a noise "A" made the user be asked again.
 		const { turnClassifierPrompt, workCheckPrompt } = await import('../src/work-request-check.js');
 		const turn = turnClassifierPrompt({ utterance: 'A', recentConversation: '' });
+		// 2026-10-13 20:54: "Sutando Triage 里其他的 conversation 是啥" was sent to the core although the voice model reads rooms itself.
+		const withRooms = turnClassifierPrompt({ utterance: 'A', recentConversation: '' }, ['- none: a room question, the assistant reads the room itself.']);
+		assert.ok(withRooms.indexOf('- none: a room question') < withRooms.indexOf('Reply with JSON only'), 'a skill\'s rule sits with the rules');
+		assert.doesNotMatch(turn, /room question/);
 		assert.match(turn, /"那个 PR".*is never filled in, not even from the request just before it/);
 		assert.match(turn, /If it asks the user something about this request .* decide none/);
 		assert.match(turn, /A fragment that is not a sentence .* is none/);
@@ -546,6 +550,7 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		assert.match(agentSrc, /relayAgent\.onUserTurn\(item\.content\)/);
 		assert.match(agentSrc, /if \(answeringTools\.has\(e\.toolName\)\) relayAgent\.noteAnsweringTool\(e\.toolName\)/);
 		assert.match(agentSrc, /classify: RELAY_CHECK \? createGeminiTurnClassifier\(/);
+		assert.match(agentSrc, /extraRules: personalVoiceSurface\.turnCheckRules/, 'the turn check is told what the skills answer themselves');
 	});
 });
 

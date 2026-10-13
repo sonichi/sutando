@@ -6,7 +6,7 @@ import type { SkillSetupCtx, VoiceSurfaceContribution } from '../../src/skill-se
 import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './session-context.js';
 import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateClient, navigateUiAvailable, navigateUiTool, resolveUiNavigated } from './navigate.js';
 import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
-import { ROOM_READ_PROMPT_RULE, createListRoomsTool, createMcpStdioClient, createReadRoomTool, createRoomIndex, createSearchRoomTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
+import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadRoomTool, createRoomIndex, createSearchRoomTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
 
 export const tools: ToolDefinition[] = [];
 
@@ -65,9 +65,9 @@ export function setup(ctx: SkillSetupCtx): void {
 }
 
 /** read_room is declared only where the core has the ag2-space MCP registered; the voice agent starts the same server. */
-function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; contextLines: () => string[] } {
+function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; turnCheckRules: string[]; contextLines: () => string[] } {
 	const entry = findAg2SpaceMcpEntry();
-	if (!entry) return { tools: [], promptRules: [], contextLines: () => [] };
+	if (!entry) return { tools: [], promptRules: [], turnCheckRules: [], contextLines: () => [] };
 	const log = (m: string) => console.log(`${ts()} ${m}`);
 	if (!_mcp) {
 		_mcp = createMcpStdioClient(entry, { log });
@@ -83,7 +83,7 @@ function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; co
 	const read = createReadRoomTool(deps);
 	const search = createSearchRoomTool(deps);
 	const list = createListRoomsTool({ index, log });
-	return { tools: [read, search, list], promptRules: [ROOM_READ_PROMPT_RULE], contextLines: () => roomIndexContextLines(index) };
+	return { tools: [read, search, list], promptRules: [ROOM_READ_PROMPT_RULE], turnCheckRules: [ROOM_TURN_CHECK_RULE], contextLines: () => roomIndexContextLines(index) };
 }
 
 export function voiceSurface(): VoiceSurfaceContribution {
@@ -95,5 +95,6 @@ export function voiceSurface(): VoiceSurfaceContribution {
 		promptRules: [...(navigate ? [NAVIGATION_PROMPT_RULE] : []), ...roomRead.promptRules],
 		contextLines: () => [...roomContextLines(_binding?.current() ?? null), ...roomRead.contextLines()],
 		answeringTools: roomRead.tools.map((t) => t.name),
+		turnCheckRules: roomRead.turnCheckRules,
 	};
 }

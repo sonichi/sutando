@@ -24,7 +24,7 @@ if (PRESENT) {
 const {
 	findAg2SpaceMcpEntry, createMcpStdioClient, mcpPayload, pickRoom, toMessageLines, readRoom, createReadRoomTool,
 	listRooms, createRoomIndex, roomIndexContextLines, createListRoomsTool, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_READ_CALL_TIMEOUT_MS,
-	searchRoom, createSearchRoomTool, toHitLines, ROOM_SEARCH_DEFAULT_LIMIT,
+	searchRoom, createSearchRoomTool, toHitLines, ROOM_SEARCH_DEFAULT_LIMIT, ROOM_TURN_CHECK_RULE,
 	ROOM_READ_BODY_MAX, ROOM_READ_DEFAULT_LIMIT, ROOM_READ_PROMPT_RULE,
 } = await import(pathToFileURL(join(PLUGIN_DIR, 'room-read.ts')).href);
 
@@ -329,7 +329,7 @@ describe('readRoom: every outcome is something the model can say', () => {
 			['$new', 'liususan091219-susan-s-bot.agent', 'Re-reviewed 5473 at b8844ca4: Ready to approve.', false],
 			['$old', 'sutando-sonichi', 'Could you review 5473?', true],
 		]);
-		assert.equal(lines[0].at, 'Oct 13, 16:49');
+		assert.equal(lines[0].at, 'Oct 13, 16:49 UTC', 'the zone is in the stamp, so the model never guesses one (2026-10-13 20:50: "that is Eastern Time")');
 	});
 	it('read_room is declared as a tool that fetches the answer, so the turn check does not also send the turn', () => {
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
@@ -400,8 +400,13 @@ describe('searchRoom: what was said about something, however far back', () => {
 		assert.equal(out.hits[0].event_id, '$r');
 		assert.match(ROOM_READ_PROMPT_RULE, /"What was said about <PR\/topic\/person> in <room>".*→ search_room, then read_room with `around`/);
 		assert.match(ROOM_READ_PROMPT_RULE, /never from memory or an earlier answer/);
+		assert.match(ROOM_READ_PROMPT_RULE, /What a message in a room means, or why someone said it, is answered from that message: read_room with `around`/);
+		assert.match(ROOM_READ_PROMPT_RULE, /submit work only when the room's messages do not hold the answer/);
+		assert.match(ROOM_TURN_CHECK_RULE, /^- none: a question about an AG2 Space room's messages/);
+		assert.match(ROOM_TURN_CHECK_RULE, /never work, even when it names a PR/);
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
 		assert.match(src, /tools: \[read, search, list\]/, 'search_room is declared with read_room, and is an answering tool through the same map');
+		assert.match(src, /turnCheckRules: \[ROOM_TURN_CHECK_RULE\]/, 'the turn check is told');
 	});
 });
 

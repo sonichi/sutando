@@ -243,7 +243,7 @@ export function toMessageLines(messages: unknown[], tz?: string): RoomMessageLin
 		if (typeof msg.body !== 'string' || !msg.body.trim()) continue;
 		const from = (msg.sender ?? '?').replace(/^@/, '').replace(/:.*$/, '');
 		const at = typeof msg.ts === 'number'
-			? new Date(msg.ts).toLocaleString('en-US', { timeZone: tz, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
+			? new Date(msg.ts).toLocaleString('en-US', { timeZone: tz, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short' })
 			: '';
 		const body = msg.body.replace(/\s+/g, ' ').trim();
 		out.push({
@@ -328,7 +328,7 @@ export function toHitLines(hits: unknown[], tz?: string): RoomHit[] {
 		if (typeof hit.event_id !== 'string' || typeof hit.snippet !== 'string' || !hit.snippet.trim()) continue;
 		const from = (hit.sender ?? '?').replace(/^@/, '').replace(/:.*$/, '');
 		const at = typeof hit.origin_server_ts === 'number'
-			? new Date(hit.origin_server_ts).toLocaleString('en-US', { timeZone: tz, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
+			? new Date(hit.origin_server_ts).toLocaleString('en-US', { timeZone: tz, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short' })
 			: '';
 		const text = hit.snippet.replace(/\s+/g, ' ').trim();
 		out.push({ at, from, text: text.length > ROOM_READ_BODY_MAX ? `${text.slice(0, ROOM_READ_BODY_MAX)}…` : text, event_id: hit.event_id, ...(hit.thread_root ? { thread: true } : {}) });
@@ -439,4 +439,7 @@ export function createListRoomsTool(deps: { index: RoomIndex; log?: (m: string) 
 }
 
 /** The prompt rule that goes with the tool; present only when the tool is declared. */
-export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about an AG2 Space room is answered from the room, every time, never from memory or an earlier answer — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now. "What\'s new in <room>", "did <person> reply there" → read_room. "What was said about <PR/topic/person> in <room>", "what was the review of <PR> there", anything that may be earlier than the latest messages → search_room, then read_room with `around` for the discussion. Never submit work just to read or search a room. Pass the room name as it appears in the ROOMS line, not as it was heard; a "not_found" lists the rooms — pick the one meant and call again.';
+export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about an AG2 Space room is answered from the room, every time, never from memory or an earlier answer — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now. "What\'s new in <room>", "did <person> reply there" → read_room. "What was said about <PR/topic/person> in <room>", "what was the review of <PR> there", anything that may be earlier than the latest messages → search_room, then read_room with `around` for the discussion. What a message in a room means, or why someone said it, is answered from that message: read_room with `around` for its full text, then explain. Never submit work to read, search or explain a room; submit work only when the room\'s messages do not hold the answer and the user wants it looked up elsewhere. Pass the room name as it appears in the ROOMS line, not as it was heard; a "not_found" lists the rooms — pick the one meant and call again.';
+
+/** What the relay agent\'s turn check is told: a room question is the voice model\'s own, never a task for the core. */
+export const ROOM_TURN_CHECK_RULE = '- none: a question about an AG2 Space room\'s messages — what is new there, who replied, what someone said there about a PR, topic or person, what a message there means — is answered by the assistant itself, which reads and searches the room. It is never work, even when it names a PR. Only an action (post, reply, review, merge, change something) is work.';

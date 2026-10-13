@@ -1008,7 +1008,8 @@ async function main() {
 		// and sent "那个餐馆的 menu" with the blank in it).
 		recentConversation: () => recentConversationLines(sessionRef?.conversationContext.items ?? [], 8) || getRecentConversation(8),
 		// Every finished user turn too, whatever tool the voice model chose: is it a request for the core?
-		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`) }) : undefined,
+		// A skill's tools answer some turns themselves (read_room): the check is told, so it does not send those to the core.
+		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), extraRules: personalVoiceSurface.turnCheckRules }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
 		// A question for the user is said as live input once the model stops speaking, not queued as a notification.
 		ask: (text) => relayAsk.ask(text),
