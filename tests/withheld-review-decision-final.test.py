@@ -2545,6 +2545,122 @@ check(live.is_file() and live.read_bytes() == before_bytes and not outside_files
       f"superseded/ rebound just before the unlink: the record is put back, nothing outside "
       f"({outside_files(outside)})")
 
+# Each rollback is durable, in order: through the production move and the _fsync_fd seam, a rebind
+# before the unlink undoes the copy and syncs it away; one after it puts the record back first.
+def move_ops(swap_on):
+    namespace = root / f"rollback-{swap_on}" / guard.WITHHELD_RESULT_DIR
+    (namespace / "archive" / "superseded").mkdir(parents=True)
+    source, target = namespace / "wr_5.json", namespace / "archive" / "superseded" / "wr_5.json"
+    source.write_text('{"withheld_body": "SECRET-BODY"}')
+    outside = namespace.parent / "outside"
+    outside.mkdir()
+    held = {"T": os.stat(target.parent).st_ino, "S": os.stat(namespace).st_ino}
+    names = {ino: key for key, ino in held.items()}
+    ops, real_link, real_unlink, real_fd_sync = [], os.link, os.unlink, guard._fsync_fd
+
+    def rebind():
+        if not target.parent.is_symlink():
+            target.parent.rename(outside / "superseded-moved")
+            target.parent.symlink_to(outside / "elsewhere")
+
+    def link(*args, **kwargs):
+        if swap_on == "link":
+            rebind()
+        ops.append(("link", pathlib.Path(args[1]).name))
+        return real_link(*args, **kwargs)
+
+    def unlink(name, *args, **kwargs):
+        if swap_on == "unlink" and str(name) == source.name and kwargs.get("dir_fd") is not None:
+            rebind()
+        ops.append(("unlink", pathlib.Path(name).name))
+        return real_unlink(name, *args, **kwargs)
+
+    def fd_sync(fd):
+        ops.append(("sync", names.get(os.fstat(fd).st_ino, "?")))
+        return real_fd_sync(fd)
+
+    os.link, os.unlink, guard._fsync_fd = link, unlink, fd_sync
+    try:
+        raises_unknown(lambda: guard._durable_move(source, target))
+    finally:
+        os.link, os.unlink, guard._fsync_fd = real_link, real_unlink, real_fd_sync
+    left_outside = sorted(p.name for p in outside.rglob("*") if p.is_file())
+    return ops, source.is_file() and "SECRET-BODY" in source.read_text(), left_outside
+
+
+first, kept_first, outside_first = move_ops("link")
+second, kept_second, outside_second = move_ops("unlink")
+check(first == [("link", "wr_5.json"), ("sync", "T"), ("unlink", "wr_5.json"), ("sync", "T")]
+      and kept_first and not outside_first,
+      f"a rebind before the unlink: undo the copy, then sync it away, record kept: {first}")
+check(second == [("link", "wr_5.json"), ("sync", "T"), ("unlink", "wr_5.json"), ("sync", "S"),
+                 ("link", "wr_5.json"), ("sync", "S"), ("unlink", "wr_5.json"), ("sync", "T")]
+      and kept_second and not outside_second,
+      f"a rebind after the unlink: the record is linked back and synced before the copy goes: {second}")
+
+# An ancestor of the target (archive/) renamed out and its name replaced by a link back to it: the
+# path still reaches the same inode, so only the walk's link check catches it. Nothing escapes.
+bridge._STATE = root / "write-ancestor-rebound"
+directory = bridge._STATE / "withheld-team-results"
+outside = root / "outside-ancestor-rebound"
+outside.mkdir()
+(directory / "archive" / "superseded").mkdir(parents=True)
+(directory / "archive" / "wr_0000000000000000.json").write_text(
+    json.dumps({**base_record, **YES, "dm_event_id": "$ancestor-rebound"}))
+live = directory / "wr_0000000000000000.json"
+live.write_text(json.dumps({**base_record, **NO, "dm_event_id": "$ancestor-rebound"}))
+before_bytes, real_link = live.read_bytes(), os.link
+
+
+def rebind_ancestor_then_link(*args, **kwargs):
+    archive = directory / "archive"
+    if kwargs.get("dst_dir_fd") is not None and not archive.is_symlink():
+        archive.rename(outside / "archive-moved")
+        archive.symlink_to(outside / "archive-moved")
+    return real_link(*args, **kwargs)
+
+
+os.link = rebind_ancestor_then_link
+try:
+    bridge._retry_withheld_reviews()
+finally:
+    os.link = real_link
+check(live.is_file() and live.read_bytes() == before_bytes and not outside_files(outside / "archive-moved" / "superseded"),
+      f"archive/ rebound to a link back to itself: the record stays, nothing moved out "
+      f"({outside_files(outside / 'archive-moved' / 'superseded')})")
+
+# Without directory-fd confinement a move is refused, never made by path: the record stays, nothing
+# is linked anywhere, and the owner's reply is still answered.
+bridge._STATE = root / "no-dir-fds"
+directory = bridge._STATE / "withheld-team-results"
+outside = root / "outside-no-dir-fds"
+outside.mkdir()
+(directory / "archive" / "superseded").mkdir(parents=True)
+(directory / "archive" / "wr_0000000000000000.json").write_text(
+    json.dumps({**base_record, **YES, "dm_event_id": "$no-dir-fds"}))
+live = directory / "wr_0000000000000000.json"
+live.write_text(json.dumps({**base_record, **NO, "dm_event_id": "$no-dir-fds"}))
+before_bytes, real_link, links, saved_flag = live.read_bytes(), os.link, [], os.O_DIRECTORY
+
+
+def recording_link(*args, **kwargs):
+    links.append(args)
+    return real_link(*args, **kwargs)
+
+
+del os.O_DIRECTORY
+os.link = recording_link
+try:
+    for _beat in range(2):
+        bridge._retry_withheld_reviews()
+    handled = bridge._handle_review_decision(decision("No", "wr_0000000000000000", "no-dir-fds"))
+finally:
+    os.O_DIRECTORY, os.link = saved_flag, real_link
+check(live.is_file() and live.read_bytes() == before_bytes and not links
+      and not outside_files(outside) and handled is True and control_body("no-dir-fds"),
+      f"no directory fds: the move is refused, the record stays, nothing linked ({len(links)}), "
+      f"the reply is answered ({handled})")
+
 # A Windows junction is not S_ISLNK; the walk refuses its reparse-point attribute at every step.
 junction_dir = root / "junction" / guard.WITHHELD_RESULT_DIR / "conflicts"
 junction_dir.mkdir(parents=True)

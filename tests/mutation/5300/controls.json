@@ -106,12 +106,6 @@
    "new": "                    present(path)"
   },
   {
-   "name": "a move links by path, not through the verified directory fds",
-   "file": "src/policy/egress/result.py",
-   "old": "    if not hasattr(os, \"O_DIRECTORY\"):                   # no dir_fd walk on this platform",
-   "new": "    if True:"
-  },
-  {
    "name": "the suppression journal creates its folder through a link",
    "file": "src/policy/egress/result.py",
    "old": "        os.chmod(_ensure_dir(directory), 0o700)\n    except OSError:\n        return TeamResultVerdict(VERDICT_SUPPRESS",
@@ -144,7 +138,7 @@
   {
    "name": "the move does not re-verify the held folders before the unlink",
    "file": "src/policy/egress/result.py",
-   "old": "            if not (_still_at(target_fd, target.parent) and _still_at(source_fd, source.parent)):\n                os.unlink(target.name, dir_fd=target_fd)  # rebound after the open: undo, keep the source\n                raise OSError(f\"{target.parent}: moved after it was opened; the record stays\")\n",
+   "old": "            if not (_still_at(target_fd, target.parent) and _still_at(source_fd, source.parent)):\n                os.unlink(target.name, dir_fd=target_fd)  # rebound after the open: undo, keep the source\n                _fsync_fd(target_fd)\n                raise OSError(f\"{target.parent}: moved after it was opened; the record stays\")\n",
    "new": ""
   },
   {
@@ -164,6 +158,36 @@
    "file": "src/policy/egress/result.py",
    "old": "        if stat.S_ISLNK(mode) or getattr(status, \"st_file_attributes\", 0) & _REPARSE_POINT:",
    "new": "        if stat.S_ISLNK(mode):"
+  },
+  {
+   "name": "without directory fds a move falls back to moving by path",
+   "file": "src/policy/egress/result.py",
+   "old": "    if not hasattr(os, \"O_DIRECTORY\"):                   # no fd confinement here: refuse, never by path\n        raise OSError(f\"{source}: a confined move needs directory fds; the record stays\")",
+   "new": "    if not hasattr(os, \"O_DIRECTORY\"):\n        os.link(source, target)\n        _fsync_directory(target.parent)\n        os.unlink(source)\n        _fsync_directory(source.parent)\n        return"
+  },
+  {
+   "name": "the first rollback does not sync the removed copy",
+   "file": "src/policy/egress/result.py",
+   "old": "                _fsync_fd(target_fd)\n                raise OSError(f\"{target.parent}: moved after it was opened; the record stays\")",
+   "new": "                raise OSError(f\"{target.parent}: moved after it was opened; the record stays\")"
+  },
+  {
+   "name": "the second rollback does not sync the restored record",
+   "file": "src/policy/egress/result.py",
+   "old": "                _fsync_fd(source_fd)                     # the record is back before the copy goes\n",
+   "new": ""
+  },
+  {
+   "name": "the second rollback does not sync the removed copy",
+   "file": "src/policy/egress/result.py",
+   "old": "                _fsync_fd(target_fd)\n                raise OSError(f\"{target.parent}: moved during the move; the record was put back\")",
+   "new": "                raise OSError(f\"{target.parent}: moved during the move; the record was put back\")"
+  },
+  {
+   "name": "the held-folder re-check skips the walk",
+   "file": "src/policy/egress/result.py",
+   "old": "        if not present(directory, stat.S_IFDIR):\n            return False\n        held, there = os.fstat(fd), os.lstat(directory)",
+   "new": "        held, there = os.fstat(fd), os.lstat(directory)"
   }
  ]
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mutation controls for #5300's strict review-namespace rule.
+"""Mutation controls for the strict review-namespace rule.
 
 Runs in a throwaway export of HEAD (`git archive`), never in the checkout. A passing baseline
 comes first; bytecode is disabled; a mutant whose run fails with a syntax or import error is

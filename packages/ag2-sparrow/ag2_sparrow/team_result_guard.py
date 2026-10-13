@@ -627,8 +627,8 @@ def _write_owned_record(path: Path, record: dict, field: str, expect: dict,
 
 def _ensure_dir(directory: Path) -> Path:
     """`directory` as a real directory, created only when genuinely absent; a link or an odd entry
-    on the way raises. Known limit: only moves and reads use verified directory fds; other writes
-    check the path first, so a concurrent swapper with state-dir write access could redirect them."""
+    on the way raises. Moves use verified directory fds or are refused; other writes check the
+    path first, so a concurrent swapper with state-dir write access could redirect those."""
     if not present(directory, stat.S_IFDIR):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not present(directory, stat.S_IFDIR):
@@ -642,12 +642,8 @@ def _durable_move(source: Path, target: Path) -> None:
     if not present(source, stat.S_IFREG):                # a real file, reached through no link
         raise FileNotFoundError(2, "No such file or directory", str(source))
     _ensure_dir(target.parent)
-    if not hasattr(os, "O_DIRECTORY"):                   # no dir_fd walk on this platform
-        os.link(source, target)
-        _fsync_directory(target.parent)
-        os.unlink(source)
-        _fsync_directory(source.parent)
-        return
+    if not hasattr(os, "O_DIRECTORY"):                   # no fd confinement here: refuse, never by path
+        raise OSError(f"{source}: a confined move needs directory fds; the record stays")
     source_fd = _open_dir(source.parent)
     try:
         target_fd = _open_dir(target.parent)             # a folder swapped for a link is refused here
@@ -657,13 +653,17 @@ def _durable_move(source: Path, target: Path) -> None:
             _fsync_fd(target_fd)                         # the directory linked into, by fd, not name
             if not (_still_at(target_fd, target.parent) and _still_at(source_fd, source.parent)):
                 os.unlink(target.name, dir_fd=target_fd)  # rebound after the open: undo, keep the source
+                _fsync_fd(target_fd)
                 raise OSError(f"{target.parent}: moved after it was opened; the record stays")
             os.unlink(source.name, dir_fd=source_fd)
             _fsync_fd(source_fd)
+            # The source is gone now, so only the target's place decides whether the copy escaped.
             if not _still_at(target_fd, target.parent):    # rebound between the check and the unlink
                 os.link(target.name, source.name, src_dir_fd=target_fd, dst_dir_fd=source_fd,
                         follow_symlinks=False)
+                _fsync_fd(source_fd)                     # the record is back before the copy goes
                 os.unlink(target.name, dir_fd=target_fd)
+                _fsync_fd(target_fd)
                 raise OSError(f"{target.parent}: moved during the move; the record was put back")
         finally:
             os.close(target_fd)

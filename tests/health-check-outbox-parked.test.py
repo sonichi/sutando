@@ -292,6 +292,8 @@ class WithheldReviewsReadable(unittest.TestCase):
                     self.assertIn(f"state/withheld-team-results/{folder} (", r["detail"])
 
     def test_it_agrees_with_the_guard(self):
+        """A structural delegation pin: the check calls the guard's shared preflight and scans
+        nothing itself; the behavioural tests above cover what that preflight reports."""
         source = (REPO / "src" / "health-check.py").read_text()
         body = source[source.index("def check_withheld_reviews_readable"):]
         body = body[:body.index("\ndef ")]
@@ -343,10 +345,14 @@ class WithheldReviewsReadable(unittest.TestCase):
                     self.assertEqual(r["status"], "warn")
                     self.assertIn(f"{folder}/wr_0000000000000007.odd", r["detail"])
 
-    def test_the_check_is_registered(self):
-        source = (REPO / "src" / "health-check.py").read_text()
-        self.assertTrue("checks.append(check_withheld_reviews_readable())" in source,
-                        "check_withheld_reviews_readable is not registered")
+    def test_run_all_checks_registers_the_row(self):
+        sentinel = {"name": "withheld-reviews-readable", "status": "ok",
+                    "detail": "registration sentinel"}
+        with unittest.mock.patch.object(self.hc, "check_withheld_reviews_readable",
+                                        return_value=sentinel) as probe:
+            checks = self.hc.run_all_checks()
+        probe.assert_called_once_with()
+        self.assertIn(sentinel, checks)
 
 
 if __name__ == "__main__":
