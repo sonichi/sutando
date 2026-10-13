@@ -905,26 +905,39 @@ class Cli(Base):
 class FakeSystemd:
     """Stands in for systemctl --user and loginctl, recording each call."""
 
-    def __init__(self, available=True, linger_ok=True, active=False, enabled=False):
-        self.available, self.linger_ok = available, linger_ok
-        self.active, self.enabled = active, enabled
+    def __init__(self, available=True, linger_ok=True, linger="no", state="inactive",
+                 enabled=False, main_pid=0, ran=False):
+        self.available, self.linger_ok, self.linger = available, linger_ok, linger
+        self.state, self.enabled, self.main_pid, self.ran_before = state, enabled, main_pid, ran
         self.calls = []
+
+    @property
+    def active(self):
+        return self.state == "active"
 
     def __call__(self, cmd):
         self.calls.append(cmd[1:] if cmd[0] == "systemctl" else cmd)
-        rc, err = 0, ""
-        if cmd[0] == "loginctl":
+        rc, out, err = 0, "", ""
+        if cmd[:2] == ["loginctl", "show-user"]:
+            out = self.linger + "\n"
+        elif cmd[0] == "loginctl":
             rc, err = (0, "") if self.linger_ok else (1, "Could not enable linger: Access denied")
         elif not self.available:
             rc, err = 1, "Failed to connect to bus: No medium found"
+        elif cmd[2] == "show":
+            out = (f"ActiveState={self.state}\nMainPID={self.main_pid}\n"
+                   f"ExecMainStartTimestampMonotonic={123456 if self.ran_before else 0}\n")
         elif cmd[2] == "is-active":
             rc = 0 if self.active else 3
         elif cmd[2] == "is-enabled":
             rc = 0 if self.enabled else 1
+        elif cmd[2] == "reset-failed":
+            self.state = "inactive" if self.state == "failed" else self.state
         elif cmd[2] == "enable":
             self.enabled = True
-            self.active = self.active or "--now" in cmd
-        return subprocess.CompletedProcess(cmd, rc, "", err)
+            if "--now" in cmd:
+                self.state = "active"
+        return subprocess.CompletedProcess(cmd, rc, out, err)
 
     def ran(self, *verb):
         return [c for c in self.calls if tuple(c[1:1 + len(verb)]) == verb]
@@ -976,7 +989,7 @@ class Service(Base):
                      f"Environment=AGENT_CONNECT_TASK_DIR={self.tasks.resolve()}",
                      f"Environment=AGENT_CONNECT_RESULT_DIR={self.results.resolve()}",
                      f"Environment=AGENT_CONNECT_STATE_DIR={self.state.resolve()}",
-                     "Restart=on-failure", "RestartSec=10", "RestartPreventExitStatus=75",
+                     "Restart=always", "RestartSec=10", "RestartPreventExitStatus=75",
                      "WantedBy=default.target"):
             self.assertIn(line + "\n", text)
         self.assertNotIn("GATEWAY_INSTANCE", text)
@@ -1003,6 +1016,20 @@ class Service(Base):
         self.assertFalse(self.unit.exists())
         self.assertIn("NOTE service: systemctl --user is not available", r.stdout)
         self.assertEqual(fake.calls, [["--user", "show-environment"]])
+
+    def test_a_path_systemd_cannot_carry_is_refused_and_non_ascii_is_kept(self):
+        self.assertEqual(hatch_cli._unit_value("/home/zoë/.local/bin/ag2-sparrow"),
+                         "/home/zoë/.local/bin/ag2-sparrow")
+        self.assertEqual(hatch_cli._unit_value("/srv/50%/x"), "/srv/50%%/x")
+        for bad in ("/home/a b/x", "/x/'q", "/x/\\y", "/x/$HOME", "/x;y", "/x\ty"):
+            with self.assertRaises(ValueError, msg=bad):
+                hatch_cli._unit_value(bad)
+        spaced = self.home / "my dir" / "relay.env"
+        r = self.with_systemd(FakeSystemd(), "install", "--mxid", AGENT,
+                              env={"USER": "zoë", "AG2_DEVICE_ENV": str(spaced)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(self.unit.exists())
+        self.assertIn("contains ' ' (whitespace, a quote, a backslash, $ or ;)", r.stdout)
 
     def test_rerun_is_idempotent(self):
         fake = FakeSystemd()
@@ -1060,15 +1087,74 @@ class Service(Base):
                       "linger: Access denied)", r.stdout)
         self.assertIn("Next: register the hook", r.stdout)
 
+    def test_linger_already_on_or_root_is_not_enabled_again(self):
+        fake = FakeSystemd(linger="yes")
+        r = self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+        self.assertIn("linger: already on for hatch", r.stdout)
+        self.assertIn(["loginctl", "show-user", "hatch", "--property=Linger", "--value"],
+                      fake.calls)
+        self.assertNotIn(["loginctl", "enable-linger", "hatch"], fake.calls)
+        fake = FakeSystemd()
+        with mock.patch.object(hatch_cli.os, "geteuid", return_value=0):
+            r = self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "root"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("linger: skipped (running as root)", r.stdout)
+        self.assertEqual([c for c in fake.calls if c[0] == "loginctl"], [])
+
+    def lock(self, pid, heartbeat_age=0):
+        path = self.state / "locks" / "gateway-bridge.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"role": "gateway-bridge", "pid": pid,
+                                    "host": hatch_cli.workspace_lock._host_label(),
+                                    "heartbeat_at": int(time.time()) - heartbeat_age}))
+
     def test_a_sparrow_already_running_outside_systemd_is_left_alone(self):
         self.sparrow_status(age_s=5)
-        fake = FakeSystemd()
+        self.lock(os.getpid())  # a live pid the unit does not own
+        fake = FakeSystemd(ran=True)
         r = self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(fake.ran("enable"), [["--user", "enable", "ag2-sparrow.service"]])
         self.assertEqual([c for c in fake.calls if c[1:2] in (["stop"], ["kill"], ["restart"])], [])
         self.assertIn("already running outside systemd", r.stdout)
         self.assertIn("systemctl --user start ag2-sparrow.service", r.stdout)
+        # Without a lock file, a fresh status file counts only when the unit never ran.
+        (self.state / "locks" / "gateway-bridge.lock").unlink()
+        fake = FakeSystemd()
+        self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+        self.assertEqual(fake.ran("enable"), [["--user", "enable", "ag2-sparrow.service"]])
+
+    def test_a_second_sparrow_exits_75_which_the_unit_does_not_restart(self):
+        from ag2_sparrow import workspace_lock
+        self.assertEqual(workspace_lock.acquire("gateway-bridge", self.home).status, "acquired")
+        env = py_env(self.home)
+        env.update(AGENT_CONNECT_TASK_DIR=str(self.tasks), AGENT_CONNECT_RESULT_DIR=str(self.results),
+                   AGENT_CONNECT_STATE_DIR=str(self.state),
+                   REMOTE_TASK_URL="https://gw.invalid/relay",
+                   REMOTE_TASK_TOKEN="fake-relay-token-0123456789abcdef")
+        r = subprocess.run([sys.executable, "-m", "ag2_sparrow"], env=env, capture_output=True,
+                           text=True, cwd=str(self.home), timeout=60)
+        self.assertEqual(r.returncode, 75, r.stdout + r.stderr)
+        self.assertIn("RestartPreventExitStatus=75\n", hatch_cli.render_service("/x", {}))
+
+    def test_a_just_crashed_service_is_started_not_mistaken_for_an_outside_sparrow(self):
+        self.sparrow_status(age_s=20)  # still inside check_sparrow's freshness window
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        for state in ("failed", "activating", "inactive"):
+            with self.subTest(state=state):
+                self.lock(dead.pid)
+                fake = FakeSystemd(state=state, ran=True, enabled=True)
+                r = self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(fake.ran("enable"),
+                                 [["--user", "enable", "--now", "ag2-sparrow.service"]])
+                self.assertNotIn("outside systemd", r.stdout)
+                self.assertEqual(len(fake.ran("reset-failed")), state == "failed")
+        (self.state / "locks" / "gateway-bridge.lock").unlink()
+        fake = FakeSystemd(state="inactive", ran=True)  # no lock: the unit ran, so it is ours
+        self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+        self.assertEqual(fake.ran("enable"), [["--user", "enable", "--now", "ag2-sparrow.service"]])
 
     def test_a_missing_token_file_enables_without_starting(self):
         self.device_env.unlink()
@@ -1100,7 +1186,7 @@ class Service(Base):
     def test_verify_reports_the_service(self):
         self.with_systemd(FakeSystemd(), "install", "--mxid", AGENT, env={"USER": "hatch"})
         self.sparrow_status()
-        r = self.with_systemd(FakeSystemd(enabled=True, active=True), "verify")
+        r = self.with_systemd(FakeSystemd(enabled=True, state="active"), "verify")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn(f"PASS service: {self.unit} installed and enabled (active)", r.stdout)
         r = self.with_systemd(FakeSystemd(enabled=False), "verify")

@@ -24,7 +24,7 @@ import time
 from importlib import resources
 from pathlib import Path
 
-from ... import _dirs, gateway_instance, outbox
+from ... import _dirs, gateway_instance, outbox, workspace_lock
 from ...result_markers import parse_markers
 from .task_fields import item_id, valid_mxid
 
@@ -242,15 +242,55 @@ def systemd_user_available() -> bool:
 def render_service(exec_start: str, env: dict) -> str:
     rows = "".join(f"Environment={k}={v}\n" for k, v in env.items())
     return (f"{SERVICE_MARKER}\n[Unit]\nDescription=ag2-sparrow (AG2 Space listener)\n\n"
-            f"[Service]\n{rows}ExecStart={exec_start}\nRestart=on-failure\nRestartSec=10\n"
+            f"[Service]\n{rows}ExecStart={exec_start}\nRestart=always\nRestartSec=10\n"
             "# 75: another Sparrow already polls this workspace; do not relaunch over it.\n"
             "RestartPreventExitStatus=75\n\n[Install]\nWantedBy=default.target\n")
 
 
-def _unit_value_problem(value: str) -> str:
-    if value != shlex.quote(value) or "%" in value:
-        return f"{value} needs quoting in a systemd unit; use a path without spaces or %"
-    return ""
+# Characters an unquoted Environment=/ExecStart= value cannot carry as themselves.
+_UNIT_UNSAFE = re.compile(r"[\s\"'\\$;]|[\x00-\x1f\x7f]")
+
+
+def _unit_value(value: str) -> str:
+    """`value` as an unquoted unit value ('%' escaped); ValueError names what cannot be."""
+    bad = _UNIT_UNSAFE.search(value)
+    if bad:
+        raise ValueError(f"{value!r} contains {bad.group()!r} (whitespace, a quote, a "
+                         "backslash, $ or ;), which a systemd unit cannot carry unquoted; "
+                         "use a path without it")
+    return value.replace("%", "%%")
+
+
+def _unit_props(*names: str) -> dict:
+    r = _systemd_run(["systemctl", "--user", "show", SERVICE_NAME,
+                      *(f"--property={n}" for n in names)])
+    if not _ok(r):
+        return {}
+    return dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+
+
+def _outside_sparrow(state_dir: Path, instance: str, main_pid: int, ran: bool) -> bool:
+    """Whether a Sparrow this service does not own polls the workspace now."""
+    lock = state_dir.parent / "state" / "locks" / \
+        f"gateway-bridge{gateway_instance.suffix(instance)}.lock"
+    try:
+        holder = json.loads(lock.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        holder = None
+    if isinstance(holder, dict) and holder.get("host") == workspace_lock._host_label():
+        pid = holder.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or pid == main_pid:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False  # its holder crashed; the fresh status file is a corpse
+        except OSError:
+            pass
+        return workspace_lock._is_fresh(holder, workspace_lock.DEFAULT_STALE_SECONDS)
+    # No lock to read: a fresh status file is another Sparrow's only if this unit never ran.
+    code, _ = check_sparrow(state_dir, instance=instance)
+    return code != SPARROW_DOWN and not ran
 
 
 def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance: str,
@@ -274,9 +314,11 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
            "AGENT_CONNECT_RESULT_DIR": str(result_dir), "AGENT_CONNECT_STATE_DIR": str(state_dir)}
     if instance:
         env["GATEWAY_INSTANCE"] = instance
-    problem = next(filter(None, map(_unit_value_problem, [exec_start, *env.values()])), "")
-    if problem:
-        note(f"{problem}; no service was set up")
+    try:
+        exec_start = _unit_value(exec_start)
+        env = {k: _unit_value(v) for k, v in env.items()}
+    except ValueError as e:
+        note(f"{e}; no service was set up")
         return
     unit, text = service_path(), render_service(exec_start, env)
     changed = True
@@ -299,11 +341,20 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
             note(f"systemctl --user daemon-reload failed ({_why(r)}); run it, then "
                  f"systemctl --user enable --now {SERVICE_NAME}")
             return
-    active = _ok(_systemd_run(["systemctl", "--user", "is-active", "--quiet", SERVICE_NAME]))
-    code, _ = check_sparrow(state_dir, instance=instance)
-    outside = not active and code != SPARROW_DOWN
+    props = _unit_props("ActiveState", "MainPID", "ExecMainStartTimestampMonotonic")
+    state = props.get("ActiveState", "inactive")
+    active = state in ("active", "reloading")
+    try:
+        main_pid = int(props.get("MainPID") or 0)
+    except ValueError:
+        main_pid = 0
+    ran = props.get("ExecMainStartTimestampMonotonic", "0") not in ("", "0")
+    # failed/activating/deactivating: the unit's own Sparrow crashed or is restarting.
+    outside = state == "inactive" and _outside_sparrow(state_dir, instance, main_pid, ran)
     has_token = device_env.is_file()
     start = has_token and not outside
+    if start and state == "failed":
+        _systemd_run(["systemctl", "--user", "reset-failed", SERVICE_NAME])
     r = _systemd_run(["systemctl", "--user", "enable", *(["--now"] if start else []),
                       SERVICE_NAME])
     if not _ok(r):
@@ -325,6 +376,14 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
              f"in it as one line REMOTE_TASK_TOKEN=<token>, chmod 600 it, then run: "
              f"systemctl --user start {SERVICE_NAME}")
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        print("linger: skipped (running as root)")
+        return
+    r = _systemd_run(["loginctl", "show-user", user, "--property=Linger", "--value"]) \
+        if user else None
+    if _ok(r) and r.stdout.strip() == "yes":
+        print(f"linger: already on for {user}")
+        return
     r = _systemd_run(["loginctl", "enable-linger", user]) if user else None
     if _ok(r):
         print(f"linger: enabled for {user}, so Sparrow runs while you are logged out")

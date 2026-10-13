@@ -307,7 +307,7 @@ Environment=AGENT_CONNECT_TASK_DIR=/home/you/.ag2-sparrow/task_dir
 Environment=AGENT_CONNECT_RESULT_DIR=/home/you/.ag2-sparrow/result_dir
 Environment=AGENT_CONNECT_STATE_DIR=/home/you/.ag2-sparrow/state
 ExecStart=/home/you/.local/bin/ag2-sparrow
-Restart=on-failure
+Restart=always
 RestartSec=10
 # 75: another Sparrow already polls this workspace; do not relaunch over it.
 RestartPreventExitStatus=75
@@ -321,20 +321,30 @@ three directories are the ones `install` resolved for the hook, and a named
 `GATEWAY_INSTANCE` is added as one more `Environment=` line, so the service and
 the hook always agree. The token never goes in the unit: Sparrow reads it from
 the `.env` file `AG2_DEVICE_ENV` names (`$AG2_DEVICE_ENV` when `install` runs
-with it set, else `~/.config/ag2-sparrow/relay.env`).
+with it set, else `~/.config/ag2-sparrow/relay.env`). `Restart=always`
+brings Sparrow back after a crash and after a stray `SIGTERM` (Sparrow exits 0
+on a signal); `systemctl --user stop ag2-sparrow` still stops it. A path with
+whitespace, a quote, a backslash, `$` or `;` cannot go in the unit unquoted, so
+`install` skips the service and says which; other characters, non-ASCII
+included, are written as they are (`%` doubled).
 
 Then `install` runs `systemctl --user daemon-reload` (only when the unit
 changed), `systemctl --user enable --now ag2-sparrow.service`, and
-`loginctl enable-linger "$USER"` so Sparrow runs while you are logged out.
+`loginctl enable-linger "$USER"` so Sparrow runs while you are logged out
+(skipped when `loginctl show-user` already reports `Linger=yes`, and when
+`install` runs as root).
 Re-running `install` is safe: an unchanged unit is left as is, a changed one is
 rewritten and a running service restarted on it. None of these steps fails the
 install; each problem prints a `NOTE service:` line saying what was not done:
 
 - No systemd user manager (macOS, a container, no user bus): nothing is
   written. Keep `ag2-sparrow` running another way.
-- Sparrow already running outside systemd (its status file is fresh but the
-  service is not active): the service is enabled but not started, and the
-  running Sparrow is left alone. To switch over, stop that process, then run
+- Sparrow already running outside systemd (the service is inactive and a live
+  process other than the service's holds Sparrow's single-instance lock, or,
+  with no lock to read, the status file is fresh and the service has not run
+  since boot): the service is enabled but not started, and the running Sparrow
+  is left alone. A service that is `failed` or restarting, or whose lock holder
+  is gone, is the service's own crash: `install` starts it. To switch over, stop that process, then run
   `systemctl --user start ag2-sparrow.service`. Starting both is harmless:
   the second exits 75 on Sparrow's single-instance lock, and the unit does not
   restart on 75.
