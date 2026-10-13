@@ -18,7 +18,7 @@ import sys
 TO_FILE = "Owner questions to file with ask-owner (not yet asked)"
 
 SUMMARY_RULE = (
-    "Owner questions are not carried in this summary: the owner's open questions are rows in his "
+    "Owner questions are not carried in this summary: open owner questions are rows in the owner's "
     "Pending questions database, which is their record. Do not write a 'Decisions for you' list or "
     "any list of questions or decisions for the owner. Only an owner question from this conversation "
     "that was never filed with scripts/ask-owner.py may appear, once, under the heading "
