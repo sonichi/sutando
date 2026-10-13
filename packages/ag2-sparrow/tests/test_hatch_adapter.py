@@ -432,7 +432,8 @@ class HookScript(Base):
         note = self.payload()["worker_note"]
         self.assertTrue(note.startswith("First touch " + str(marker)))
         for phrase in ("ag2-sparrow-hatch reply <its result_file>", "reply text on stdin",
-                       "starting by tagging its sender", "Exit 0 printing posted is the only proof",
+                       "starting by tagging its sender", "full Matrix ID (@name:server",
+                       "Exit 0 printing posted is the only proof",
                        "Exit 2 wrote nothing", "On exit 3 (queued, not confirmed) or 1 (not posted) "
                        "do not retry", "put the item in a HANDOFF block",
                        "needs no answer", "especially from another agent", "post nothing for it",
