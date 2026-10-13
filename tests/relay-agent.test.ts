@@ -376,10 +376,10 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		// voice model was asking "which PR?"; a noise "A" made the user be asked again.
 		const { turnClassifierPrompt, workCheckPrompt } = await import('../src/work-request-check.js');
 		const turn = turnClassifierPrompt({ utterance: 'A', recentConversation: '' });
-		assert.match(turn, /Never fill in "那个 PR".*from something that came up earlier in a different request/);
+		assert.match(turn, /"那个 PR".*is never filled in, not even from the request just before it/);
 		assert.match(turn, /If it asks the user something about this request .* decide none/);
 		assert.match(turn, /A fragment that is not a sentence .* is none/);
-		assert.match(workCheckPrompt({ task: 't', recentConversation: '' }), /Do NOT fill it in from a PR, file or meeting that came up earlier in a different request: ask/);
+		assert.match(workCheckPrompt({ task: "t", recentConversation: "" }), /Do NOT fill it in from a PR, file or meeting that came up earlier, not even in the request just before: ask/);
 	});
 
 	it('the checks read the live conversation, so the voice model\'s own question is there at once', async () => {
