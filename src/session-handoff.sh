@@ -235,14 +235,15 @@ record_compaction_event "${TRANSCRIPT:-}" "${SUTANDO_HANDOFF_TRIGGER:-precompact
   gh pr list --repo sonichi/sutando --state open --limit 5 2>/dev/null || echo "(couldn't fetch)"
   echo ""
 
-  # Pending questions — through the one reader (the skill's adapter); never the file.
+  # Pending questions — through the one reader (the skill's adapter); never the file. The count
+  # and where they live, never their text: a listed question is re-read as prose next session.
   echo "## Pending Questions"
-  if pq_out=$(python3 "$REPO/src/pending_questions_reader.py" list --workspace "$WORKSPACE_DIR" 2>/dev/null) \
+  if pq_out=$(python3 "$REPO/src/pending_questions_reader.py" summary --workspace "$WORKSPACE_DIR" 2>/dev/null) \
       && [ -n "$pq_out" ]; then
     echo "$pq_out"
   else
     # A broken extractor must never read as an empty queue.
-    echo "(pending-questions reader failed: python3 $REPO/src/pending_questions_reader.py list — section unavailable, NOT necessarily empty)"
+    echo "(pending-questions reader failed: python3 $REPO/src/pending_questions_reader.py summary — section unavailable, NOT necessarily empty)"
   fi
   echo ""
 

@@ -28,9 +28,12 @@ python3 skills/pending-questions/scripts/pq.py resolve <ask-id> [--answered]
 python3 skills/pending-questions/scripts/pq.py remind [--force]
 ```
 
-Never list owner questions in terminal output — it reaches no one; file each with `ask`
-(or `scripts/ask-owner.py`) and keep the terminal to a status line. The skill's Stop hook
-(`hooks/terminal-questions.py`) refuses a core turn once when its final text lists them unfiled.
+**Trigger: any time you would write a question for the owner into terminal or summary text, file
+it instead** with `ask` (or `scripts/ask-owner.py`, which reports `already open: [<id>]` and files
+nothing when an open row has that question). The terminal and a compaction summary reach no one.
+This skill's `hooks/compact-carry.py` keeps owner questions out of compaction summaries and, after
+one, has the core file any never-asked question it carried; `session-state.md` shows only the
+count (`python3 src/pending_questions_reader.py summary`).
 
 - `ask` reconciles, queues the question to the owner (the task's conversation only for an
   owner-tier task in his DM; otherwise his DM), saves it to the outbox, writes the row born

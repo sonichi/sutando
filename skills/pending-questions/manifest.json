@@ -8,8 +8,12 @@
   "pending_questions_store": "scripts/pending_questions_room_db.py",
   "hooks": [
     {
-      "event": "Stop",
-      "command": "./hooks/terminal-questions.py"
+      "event": "PreCompact",
+      "command": "./hooks/compact-carry.py"
+    },
+    {
+      "event": "SessionStart",
+      "command": "./hooks/compact-carry.py"
     }
   ],
   "provenance": {

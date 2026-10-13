@@ -12,7 +12,9 @@ The ask belongs to the store adapter an installed skill declares, resolved here 
 installed roots (src/skill_roots.py; --store-adapter overrides): with --task-file it routes
 the question to that task's own conversation, records it as a row of the owner's room
 database, holds it in the workspace outbox while the room is unreachable, and reminds.
-Always exits 0 after a non-empty question: every failure is printed, never raised.
+Always exits 0 after a non-empty question: every failure is printed, never raised. A question
+whose title matches one the store already holds open is reported (`already open: [<id>]`) and
+not filed again, so a list carried across a compaction can be filed without doubling rows.
 
 With no adapter this entry does only what core can: it queues the question to the
 owner's DM on the bridge he was last active on (the proactive path; --task-file and the
@@ -105,6 +107,10 @@ def main(argv=None) -> int:
         print(f"ask-owner: NO STORE ({why}); the owner is asked, and nothing holds the question — "
               "ask by hand if he does not answer", file=sys.stderr)
         print("\n".join(ask_without_store(args.question, args.context, ws, why)))
+        return 0
+    dup = reader.open_duplicate(ws, args.question, mod)
+    if dup is not None:
+        print(f"already open: [{dup.get('ask_id')}] {dup.get('title')} — not filed again")
         return 0
     kw = dict(context=args.context, urgency=args.urgency, task_file=args.task_file, workspace=ws,
               default_action=args.default, reason=args.reason, options=args.option, priority=args.priority)
