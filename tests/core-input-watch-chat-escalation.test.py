@@ -552,7 +552,7 @@ class TestSignedOutMustHold(unittest.TestCase):
     A signed-out reading is carded only once it has held, and clears on the first frame
     that shows the CLI signed in after it."""
 
-    def _run(self, frames, td):
+    def _run(self, frames, td, runtime="claude"):
         """main() over (t, pane) frames against a real store; returns the store and the
         state written after each frame."""
         from unittest.mock import patch
@@ -578,7 +578,7 @@ class TestSignedOutMustHold(unittest.TestCase):
                 patch.object(M.time, "time", lambda: 1000.0 + frames[i["n"]][0]), \
                 patch.object(M, "_load_runtime_health", lambda: _RH()), \
                 patch.object(M, "gateway_alive", lambda *a: True), \
-                patch.object(M, "session_runtime", lambda *a: "claude"), \
+                patch.object(M, "session_runtime", lambda *a: runtime), \
                 patch.object(M, "_ensure_tmux_on_path", lambda: None), \
                 patch.object(M.core_gate_notice, "queued_count", lambda ws: 0), \
                 patch.object(M.time, "sleep", sleep), \
@@ -612,6 +612,30 @@ class TestSignedOutMustHold(unittest.TestCase):
             m, states = self._run(frames, td)
             self.assertIn("logged-out", states)
             self.assertEqual(m.active(), [], "the card waited for a completed turn")
+
+    _CODEX_TAIL = "\n» Ask Codex to do anything\n\n  GPT-6-Sol ultra · ~/agents/x  ⚠ 1 warning · f2 to view"
+    _CODEX_REFUSED = "› /startup\nAuthentication required\n" + _CODEX_TAIL
+    _CODEX_BACK = "› /startup\nAuthentication required\n› hi\n• Hello — starting up.\n" + _CODEX_TAIL
+
+    def test_a_codex_core_that_recovers_inside_the_window_is_never_carded(self):
+        frames = [(t, self._CODEX_REFUSED) for t in range(0, 45, 3)] + [(45, self._CODEX_BACK), (48, self._CODEX_BACK)]
+        with tempfile.TemporaryDirectory() as td:
+            m, states = self._run(frames, td, runtime="codex")
+            self.assertNotIn("logged-out", states)
+            self.assertEqual(m.store.all(), [])
+
+    def test_a_codex_card_resolves_on_its_first_signed_in_frame(self):
+        frames = ([(t, self._CODEX_REFUSED) for t in range(0, 66, 3)]
+                  + [(66, self._CODEX_BACK), (69, self._CODEX_BACK)])
+        with tempfile.TemporaryDirectory() as td:
+            m, states = self._run(frames, td, runtime="codex")
+            self.assertIn("logged-out", states)
+            self.assertNotEqual(m.store.all(), [], "control: the held refusal raised a card")
+            self.assertEqual(m.active(), [], "a Codex auth card never closed")
+
+    def test_compose_state_reads_a_codex_recovery(self):
+        self.assertEqual(M.compose_state(self._CODEX_BACK, "idle", True, runtime="codex")[0], "idle-ready")
+        self.assertEqual(M.compose_state(self._CODEX_REFUSED, "idle", True, runtime="codex")[0], "logged-out")
 
 
 class TestLoginConfirmStep(unittest.TestCase):

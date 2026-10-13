@@ -202,5 +202,54 @@ class TheRefusalIsAnswered(unittest.TestCase):
             self.assertFalse(refusal_answered(pane), repr(pane))
 
 
+CODEX_FOOTER = "  GPT-6-Sol ultra · ~/agents/x  ⚠ 1 warning · f2 to view"
+CODEX_IDLE = "\n» Ask Codex to do anything\n\n" + CODEX_FOOTER
+CODEX_REFUSED = "› /startup\nAuthentication required\n"
+
+
+class CodexSignsInWithItsOwnGrammar(unittest.TestCase):
+    """Codex verification of #5479: a Codex `•` response is the positive evidence a
+    Claude `●` is, read only for the codex runtime, and never from a spinner, a typed
+    prompt or an indented quote."""
+
+    def test_a_response_after_the_refusal_ends_it(self):
+        pane = CODEX_REFUSED + "› hi\n• Done — PR #5169 updated.\n" + CODEX_IDLE
+        self.assertIsNone(login_expired(pane, "codex"))
+        self.assertTrue(refusal_answered(pane, "codex"))
+        self.assertTrue(authenticated_turn(pane, "codex"))
+        self.assertTrue(signed_in_since("• Ran ls\n" + CODEX_IDLE, "codex"))
+
+    def test_the_claude_reading_is_unchanged(self):
+        pane = CODEX_REFUSED + "› hi\n• Done — PR #5169 updated.\n" + CODEX_IDLE
+        self.assertEqual(login_expired(pane), "Authentication required")
+        self.assertFalse(refusal_answered(pane))
+        self.assertFalse(authenticated_turn(pane))
+
+    def test_what_does_not_end_it(self):
+        for name, tail in (("typed prompt", "› try again\n"),
+                           ("spinner", "› try again\n• Working (0m 12s • esc to interrupt)\n› \n"),
+                           ("indented quote", "› hi\n  └ • Done — PR #5169 updated.\n    • Done.\n"),
+                           ("nothing", "")):
+            pane = CODEX_REFUSED + tail + CODEX_IDLE
+            self.assertEqual(login_expired(pane, "codex"), "Authentication required", name)
+            self.assertFalse(refusal_answered(pane, "codex"), name)
+            self.assertFalse(authenticated_turn(pane, "codex"), name)
+
+    def test_a_refusal_quoted_inside_a_turn_that_ran_is_not_one(self):
+        pane = ("› check auth\n• Ran cat diagnostic.txt\n  └ Authentication required\n"
+                "• The diagnostic was read.\n" + CODEX_IDLE)
+        self.assertIsNone(login_expired(pane, "codex"))
+
+    def test_an_earlier_turns_response_does_not_void_a_later_refusal(self):
+        pane = "› hi\n• Done.\n" + CODEX_REFUSED + CODEX_IDLE
+        self.assertEqual(login_expired(pane, "codex"), "Authentication required")
+
+    def test_proof_of_a_signed_in_codex_turn(self):
+        self.assertTrue(authenticated_turn("› hi\n• Done.\n" + CODEX_IDLE, "codex"))
+        for pane in (CODEX_IDLE, "› hi\n• Working (3m 02s • esc to interrupt)\n\n› \n" + CODEX_FOOTER,
+                     "› hi\n• Done.\n" + CODEX_FOOTER):
+            self.assertFalse(authenticated_turn(pane, "codex"), pane)
+
+
 if __name__ == "__main__":
     unittest.main()

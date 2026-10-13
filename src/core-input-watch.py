@@ -388,7 +388,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         return "blocked-known", f"at known gate: {kind}", excerpt, kind
     # A refused login leaves no gate and the idle footer, and the shared health can read a
     # seat off the CORE's status file: the pane's own refusal stands until it shows a turn ran.
-    expired = login_expired(pane) if pane else None
+    expired = login_expired(pane, runtime) if pane else None
     if expired:
         return ("logged-out", "core not authenticated (login expired; no signed-in turn since)",
                 expired, "login")
@@ -715,7 +715,7 @@ def card_step(pane_present, state, idle_ticks, stable, settling=False):
     return ("resolve" if idle_ticks >= max(1, int(stable)) else "hold"), idle_ticks
 
 
-def resolve_escalations(manager, session, pane=None):
+def resolve_escalations(manager, session, pane=None, runtime=None):
     """Clear THIS session's requirements once its core is no longer blocked —
     the card says answered because the core moved, not because anyone clicked.
 
@@ -729,7 +729,7 @@ def resolve_escalations(manager, session, pane=None):
         return []
     try:
         from hitl.manager import AUTH_KIND
-        signed_in = authenticated_turn(pane) or refusal_answered(pane)
+        signed_in = authenticated_turn(pane, runtime) or refusal_answered(pane, runtime)
         done = []
         for r in manager.active():
             subj = r.subject or {}
@@ -950,7 +950,7 @@ def main():
                 if not a.seat:
                     notice_queued(hitl, req, workspace, state, kind)
             elif verdict == "resolve":
-                resolve_escalations(hitl, a.session, pane)
+                resolve_escalations(hitl, a.session, pane, runtime)
                 if not a.seat:
                     core_gate_notice.end_outage(workspace)
         if a.once:
