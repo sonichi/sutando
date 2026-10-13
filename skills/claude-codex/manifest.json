@@ -9,6 +9,7 @@
     "source_repo": "https://github.com/sonichi/sutando"
   },
   "config": {
-    "SUTANDO_SANDBOX_RUNNERS": "agy,codex,claude"
+    "SUTANDO_SANDBOX_RUNNERS": "agy,claude",
+    "SUTANDO_SANDBOX_ALLOW_CLAUDE": "0"
   }
 }

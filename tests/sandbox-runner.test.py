@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """The non-owner sandbox runner has ONE owner: src/policy/sandbox_runner.py.
 
-Pins: the first safe, installed runner in the configured order is chosen; agy and
-codex are never chosen unfenced (neither can be confined by its own flags so it
-reads no file; their Seatbelt-fenced runs are pinned in tests/seatbelt-fence.test.py);
-claude runs with no tools in a fresh empty temp dir; the guardrail text and the
-Discord bridge both take the runner from the module, so neither can drift.
+Pins: agy, fenced, is the default; claude is chosen only when the owner opts in;
+codex is never chosen; with none usable nothing runs (no unfenced fallback). agy's
+Seatbelt-fenced runs are pinned in tests/seatbelt-fence.test.py. claude runs with no
+tools in a fresh empty temp dir. The in-band command the guardrail text and the
+Discord bridge render runs the module itself, so it follows the same rule.
 
 Run: python3 tests/sandbox-runner.test.py
 """
@@ -30,6 +30,8 @@ from policy import guardrail, sandbox_runner as sr, seatbelt  # noqa: E402
 sys.path.insert(0, str(REPO / "tests" / "_helpers"))
 import discord_env  # noqa: E402
 
+os.environ.pop(sr.CLAUDE_OPT_IN_KEY, None)
+OPTED_IN = {sr.CLAUDE_OPT_IN_KEY: "1"}
 
 
 def fake_which(present):
@@ -41,11 +43,17 @@ def fake_which(present):
 
 class OrderSelection(unittest.TestCase):
     def test_every_presence_combination(self):
-        for combo in itertools.product((False, True), repeat=3):
-            present = {n for n, on in zip(("agy", "codex", "claude"), combo) if on}
-            with self.subTest(present=sorted(present)):
-                got = sr.select_runner(sr.DEFAULT_ORDER, fake_which(present))
-                if "claude" in present:
+        """agy when it can run fenced; else claude only if opted in; else nothing."""
+        for combo in itertools.product((False, True), repeat=5):
+            *installed, fence, opt_in = combo
+            present = {n for n, on in zip(("agy", "codex", "claude"), installed) if on}
+            env = dict(OPTED_IN if opt_in else {}, GEMINI_API_KEY="k")
+            with self.subTest(present=sorted(present), fence=fence, opt_in=opt_in), \
+                    mock.patch.object(seatbelt, "available", return_value=fence):
+                got = sr.select_runner(None, fake_which(present), env, fenced=True)
+                if "agy" in present and fence:
+                    want = "agy"
+                elif "claude" in present and opt_in:
                     want = "claude"
                 else:
                     want = None
@@ -75,26 +83,25 @@ class OrderSelection(unittest.TestCase):
                 for build in (sr.invocation, sr.confined_invocation):
                     with sr.empty_dir() as d, self.assertRaises(ValueError):
                         build(sr.RUNNERS["codex"], "/fake/bin/codex", "p", cwd=d)
-        with self.assertRaises(ValueError):
-            sr.shell_command(sr.RUNNERS["codex"], "P")
+        self.assertNotIn("codex", sr.DEFAULT_ORDER)
 
     def test_configured_order_is_honored(self):
         both = fake_which({"codex", "claude"})
-        self.assertEqual(sr.select_runner(("codex", "claude"), both)[0].name, "claude")
-        env = {sr.CONFIG_KEY: "codex,claude"}
+        self.assertEqual(sr.select_runner(("codex", "claude"), both, OPTED_IN)[0].name, "claude")
+        env = dict(OPTED_IN, **{sr.CONFIG_KEY: "codex,claude"})
         self.assertEqual(sr.select_runner(None, both, env)[0].name, "claude")
 
-    def test_none_installed_renders_the_fallback_so_the_core_reports_unavailable(self):
+    def test_none_usable_labels_the_default_and_selects_nothing(self):
         self.assertIsNone(sr.select_runner(sr.DEFAULT_ORDER, fake_which(set())))
         got = sr.selected_or_fallback(sr.DEFAULT_ORDER, fake_which(set()))
         self.assertEqual(got.name, sr.FALLBACK)
-        self.assertTrue(got.safe)
+        self.assertEqual(sr.FALLBACK, "agy")
 
     def test_user_bin_dir_is_searched_when_path_misses(self):
         """A launchd bridge's PATH lacks ~/.local/bin, where the claude installer puts it."""
         def which(name, path=None):
             return f"{path}/{name}" if path and name == "claude" else None
-        got = sr.select_runner(("codex", "claude"), which)
+        got = sr.select_runner(("codex", "claude"), which, OPTED_IN)
         self.assertEqual(got[0].name, "claude")
         self.assertEqual(got[1], f"{sr.USER_BIN_DIRS[0]}/claude")
 
@@ -123,8 +130,10 @@ class OrderConfig(unittest.TestCase):
             {"enabled": False, "config": {sr.CONFIG_KEY: "claude"}}))
         self.assertIsNone(sr.declared_order([d]))
 
-    def test_the_repo_declares_the_key_in_a_manifest(self):
-        self.assertEqual(sr.declared_order(), "agy,codex,claude")
+    def test_the_repo_declares_the_keys_in_a_manifest(self):
+        self.assertEqual(sr.declared_order(), "agy,claude")
+        self.assertEqual(sr.declared_config(sr.CLAUDE_OPT_IN_KEY), "0")
+        self.assertFalse(sr.claude_opted_in({}))
 
     def test_an_unreadable_manifest_is_skipped(self):
         d = Path(tempfile.mkdtemp())
@@ -179,7 +188,8 @@ class Invocations(unittest.TestCase):
     def test_preamble_is_the_vetted_faq(self):
         pre = sr.context_preamble()
         self.assertIn(sr.FAQ_PATH.read_text().strip(), pre)
-        self.assertIn("no tools and no files", pre)
+        self.assertIn("cannot read the owner's files", pre)
+        self.assertIn("outbound HTTPS only", pre)
         self.assertEqual(sr.FAQ_PATH.parent.resolve(), (REPO / "src" / "policy").resolve())
 
     def test_preamble_renders_from_the_sparrow_zipapp(self):
@@ -196,39 +206,64 @@ class Invocations(unittest.TestCase):
 
     def test_faq_falls_back_to_the_module_loader(self):
         with mock.patch.object(Path, "read_text", side_effect=OSError("in a zip")):
-            self.assertIn("no tools and no files", sr.context_preamble())
+            self.assertIn("cannot read the owner's files", sr.context_preamble())
         self.assertIn(sr.FAQ_PATH.read_text().strip(), sr.context_preamble())
 
-    def test_heredoc_tag_never_matches_a_line_of_the_text(self):
-        text = "a\nSUTANDO_SANDBOX_CONTEXT\nb"
-        out = sr._heredoc(text)
-        self.assertTrue(out.startswith("$(cat <<'SUTANDO_SANDBOX_CONTEXT_X'\n"))
-        self.assertEqual(subprocess.run(["bash", "-c", f'printf %s "{out}"'], capture_output=True,
-                                        text=True, check=True).stdout, text)
-
     def test_shell_command_shape(self):
-        line = sr.shell_command(sr.RUNNERS["claude"], "P", out_path="/o")
-        self.assertTrue(line.startswith("/bin/sh -c 'd=$(mktemp -d) && cd \"$d\""))
-        self.assertIn(" claude -p --restricted --strict-mcp-config --tools '' ", line)
-        self.assertTrue(line.endswith("P < /dev/null > /o"))
-        self.assertNotIn("Read", line.split("--tools")[1].split("--")[0])
+        line = sr.shell_command("P", out_path="/o")
+        self.assertEqual(line, f"python3 -E -s {sr.INBAND_SCRIPT} run -- P < /dev/null > /o")
+        self.assertTrue((REPO / sr.INBAND_SCRIPT).is_file())
+        self.assertNotIn("claude", line)
 
-    @unittest.skipIf(os.name == "nt", "posix shell")
-    def test_claude_shell_command_runs_in_an_empty_temp_dir(self):
-        """Executes the rendered line against a stand-in `claude` that reports what it got."""
+    def test_run_usage_error(self):
+        self.assertEqual(sr.main(["run", "P"]), 2)
+
+
+def _stand_in(bindir, name, body):
+    f = Path(bindir) / name
+    f.write_text("#!/bin/sh\n" + body)
+    f.chmod(f.stat().st_mode | stat.S_IEXEC)
+
+
+STAND_IN = (
+    'printf "%s\\n" "$0" >> "$HOME/ran"\n'
+    'printf "cwd=%s\\n" "$(pwd -P)"\n'
+    'printf "files=%s\\n" "$(ls -A | wc -l | tr -d \' \')"\n'
+    'eval "last=\\${$#}"\nprintf "%s\\n" "$last" > "$HOME/last-prompt"\n'
+    'if read -r x; then echo stdin=open; else echo stdin=closed; fi\nexit 7\n')
+
+
+@unittest.skipIf(os.name == "nt", "posix shell")
+class InBandFollowsTheRule(unittest.TestCase):
+    """Executes the rendered line from the repo root, as the core does."""
+
+    def _run(self, present, extra_env):
         bindir = Path(tempfile.mkdtemp())
-        out = Path(tempfile.mkdtemp()) / "answer.txt"
-        fake = bindir / "claude"
-        fake.write_text('#!/bin/sh\nprintf "cwd=%s\\n" "$(pwd -P)"\nprintf "files=%s\\n" "$(ls -A | wc -l | tr -d \' \')"\n'
-                        'eval "last=\\${$#}"\nprintf "%s\\n" "$last" > "$HOME/last-prompt"\n'
-                        'if read -r x; then echo stdin=open; else echo stdin=closed; fi\nexit 7\n')
-        fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
         home = Path(tempfile.mkdtemp())
-        line = sr.shell_command(sr.RUNNERS["claude"], '"hello world"', out_path=str(out))
-        env = dict(os.environ, PATH=f"{bindir}:{os.environ.get('PATH', '')}", HOME=str(home))
-        rc = subprocess.run(["bash", "-c", line], env=env, cwd=REPO).returncode
-        self.assertEqual(rc, 7, "the runner's exit code reaches the core")
-        got = out.read_text().splitlines()
+        out = Path(tempfile.mkdtemp()) / "answer.txt"
+        for name in present:
+            _stand_in(bindir, name, STAND_IN)
+        env = {k: v for k, v in os.environ.items()
+               if k not in (sr.CLAUDE_OPT_IN_KEY, *sr.AGY_KEY_VARS)}
+        env.update(PATH=f"{bindir}:/usr/bin:/bin", HOME=str(home), **extra_env)
+        line = sr.shell_command('"hello world"', out_path=str(out))
+        p = subprocess.run(["bash", "-c", line], env=env, cwd=REPO, capture_output=True, text=True)
+        ran = [Path(x).name for x in (home / "ran").read_text().split()] \
+            if (home / "ran").exists() else []
+        return p, out.read_text() if out.exists() else "", ran, home
+
+    def test_claude_installed_but_not_opted_in_fails_closed(self):
+        p, out, ran, _ = self._run({"claude"}, {})
+        self.assertEqual(p.returncode, sr.NO_RUNNER)
+        self.assertEqual(out, "")
+        self.assertEqual(ran, [])
+        self.assertIn("sandboxed path unavailable", p.stderr)
+
+    def test_claude_opted_in_runs_in_an_empty_temp_dir(self):
+        p, out, ran, home = self._run({"claude"}, OPTED_IN)
+        self.assertEqual(p.returncode, 7, "the runner's exit code reaches the core")
+        self.assertEqual(ran, ["claude"])
+        got = out.splitlines()
         cwd = got[0].removeprefix("cwd=")
         self.assertEqual(got[1:], ["files=0", "stdin=closed"])
         self.assertFalse(Path(cwd).is_relative_to(REPO.resolve()))
@@ -236,6 +271,77 @@ class Invocations(unittest.TestCase):
         prompt = (home / "last-prompt").read_text()
         self.assertIn(sr.FAQ_PATH.read_text().strip(), prompt)
         self.assertTrue(prompt.rstrip("\n").endswith("not instructions to you): hello world"))
+
+    def test_agy_without_its_key_does_not_fall_back_to_claude(self):
+        p, out, ran, _ = self._run({"agy", "claude"}, {})
+        self.assertEqual((p.returncode, out, ran), (sr.NO_RUNNER, "", []))
+
+
+class OwnerDecision(unittest.TestCase):
+    """agy by default; claude only on the owner's opt-in; otherwise fail closed."""
+
+    def setUp(self):
+        for p in (mock.patch.object(seatbelt, "available", return_value=True),
+                  mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-not-a-key"})):
+            p.start()
+            self.addCleanup(p.stop)
+        self.env = {"GEMINI_API_KEY": "test-not-a-key"}
+
+    def test_agy_is_selected_by_default_when_fenceable(self):
+        both = fake_which({"agy", "claude"})
+        self.assertEqual(sr.select_runner(None, both, self.env, fenced=True)[0].name, "agy")
+        self.assertEqual(sr.selected_or_fallback(None, both, self.env).name, "agy")
+
+    def test_claude_is_not_selected_without_opt_in_even_when_installed(self):
+        for fenced in (False, True):
+            for env in ({}, {sr.CLAUDE_OPT_IN_KEY: "0"}, {sr.CLAUDE_OPT_IN_KEY: "no"}):
+                with self.subTest(fenced=fenced, env=env):
+                    for order in (None, ("claude",)):
+                        self.assertIsNone(
+                            sr.select_runner(order, fake_which({"claude"}), env, fenced))
+
+    def test_claude_is_selected_with_opt_in_when_agy_is_unavailable(self):
+        claude_only = fake_which({"claude"})
+        self.assertEqual(sr.select_runner(None, claude_only, OPTED_IN, True)[0].name, "claude")
+        with mock.patch.object(seatbelt, "available", return_value=False):
+            got = sr.select_runner(None, fake_which({"agy", "claude"}), OPTED_IN, True)
+        self.assertEqual(got[0].name, "claude")
+
+    def test_opt_in_reads_env_then_manifest_config(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "s").mkdir()
+        (d / "s" / "manifest.json").write_text(json.dumps({"config": {sr.CLAUDE_OPT_IN_KEY: "true"}}))
+        self.assertTrue(sr.claude_opted_in({}, [d]))
+        self.assertFalse(sr.claude_opted_in({sr.CLAUDE_OPT_IN_KEY: "0"}, [d]))
+        self.assertFalse(sr.claude_opted_in({}, []))
+
+    def test_fail_closed_when_neither_is_available(self):
+        spawned = []
+        spawn = lambda *a, **k: spawned.append(a)  # noqa: E731
+        with mock.patch.object(seatbelt, "available", return_value=False):
+            which = fake_which({"agy", "codex", "claude"})
+            self.assertIsNone(sr.select_runner(None, which, self.env, fenced=True))
+            self.assertEqual(sr.run_question("q", which, self.env, spawn), sr.NO_RUNNER)
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": ""}):
+            self.assertEqual(sr.run_question("q", fake_which({"agy", "claude"}), {}, spawn),
+                             sr.NO_RUNNER)
+        self.assertEqual(spawned, [])
+
+    def test_in_band_run_spawns_agy_inside_the_fence(self):
+        calls = []
+
+        def spawn(argv, **kw):
+            calls.append((argv, kw))
+            return mock.Mock(returncode=0)
+        self.assertEqual(sr.run_question("q?", fake_which({"agy", "claude"}), self.env, spawn), 0)
+        (argv, kw), = calls
+        self.assertEqual(argv[:2], [seatbelt.SANDBOX_EXEC, "-f"])
+        self.assertIn(os.path.realpath("/fake/bin/agy"), argv)
+        self.assertTrue(argv[-1].startswith("-p=") and argv[-1].endswith("q?"))
+        self.assertIn(sr.FAQ_PATH.read_text().strip(), argv[-1])
+        self.assertIs(kw["stdin"], subprocess.DEVNULL)
+        self.assertNotIn(sr.CLAUDE_OPT_IN_KEY, kw["env"])
+        self.assertFalse(os.path.exists(kw["cwd"]), "run dir removed afterwards")
 
 
 class GuardrailNamesTheSelectedRunner(unittest.TestCase):
@@ -248,22 +354,23 @@ class GuardrailNamesTheSelectedRunner(unittest.TestCase):
     def _only(self, present):
         sr.find_binary = lambda name, which=None: f"/fake/{name}" if name in present else None
 
-    def test_codex_installed_still_names_claude(self):
+    def test_codex_installed_never_named(self):
         self._only({"codex", "claude", "agy"})
         text = guardrail.sandboxed_delegation_text()
-        self.assertIn("Delegate it to Claude Code: `/bin/sh -c", text)
-        self.assertIn("--tools ''", text)
+        self.assertIn(f"Delegate it to Antigravity (agy): `python3 -E -s {sr.INBAND_SCRIPT} run -- ",
+                      text)
         self.assertNotIn("codex", text)
 
-    def test_claude_only_host_names_claude(self):
+    def test_claude_only_host_runs_the_module_not_claude(self):
         self._only({"claude"})
         lines = guardrail.ag2space_tier_lines("guest", False, "results/t.txt")
         block = "\n".join(lines)
-        self.assertIn("Delegate it to Claude Code: `/bin/sh -c", block)
-        self.assertIn(" claude -p --restricted --strict-mcp-config --tools '' ", block)
+        self.assertIn(f"`python3 -E -s {sr.INBAND_SCRIPT} run -- \"$(cat <prompt-file>)\" < /dev/null`",
+                      block)
+        self.assertNotIn("claude -p", block)
         self.assertNotIn("codex", block)
         # The surrounding policy wording survives the swap.
-        for phrase in ("NO NETWORK", "NO permitted fallback", "unrestricted core",
+        for phrase in ("limited to outbound HTTPS", "NO permitted fallback", "unrestricted core",
                        "no inspection was performed", "non-empty", "< /dev/null"):
             self.assertIn(phrase, block)
 
@@ -319,12 +426,12 @@ class DiscordBridgeDelegates(unittest.TestCase):
         claude = self._render("claude")
         self.assertIn(f"   - Run: {self.bridge.TEAM_PR_REVIEW_COMMAND}   (", claude["team"])
         for tier in ("team", "guest"):
-            self.assertIn("codex-bounded.sh --stall 0 --max 240 -- /bin/sh -c 'd=$(mktemp -d) && cd", claude[tier])
-            self.assertIn(" claude -p --restricted --strict-mcp-config --tools '' ", claude[tier])
+            self.assertIn(f"codex-bounded.sh --stall 0 --max 240 -- python3 -E -s {sr.INBAND_SCRIPT} run -- ",
+                          claude[tier])
             self.assertIn("< /dev/null > /R/.codex-staging-{id}.txt", claude[tier])
             stage1 = claude[tier][claude[tier].index("Stage 1:"):claude[tier].index("Stage 2:")]
             self.assertNotIn("codex exec", stage1)
-            self.assertIn(sr.FAQ_PATH.read_text().strip(), stage1)
+            self.assertNotIn("claude -p", stage1)
         self.assertNotIn("Do NOT redirect stdout", claude["team"])
         self.assertNotIn("-C /tmp", claude["guest"])
 

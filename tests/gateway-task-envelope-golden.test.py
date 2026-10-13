@@ -21,9 +21,10 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-# The fixtures carry the claude command; which runner a host has installed is
-# tests/sandbox-runner.test.py's concern, so pin it here.
+# The fixtures carry the in-band command and the runner label; which runner a host
+# can use is tests/sandbox-runner.test.py's concern, so pin the label here.
 os.environ["SUTANDO_SANDBOX_RUNNERS"] = "claude"
+os.environ.pop("SUTANDO_SANDBOX_ALLOW_CLAUDE", None)
 _SRC = REPO / "src" / "remote-gateway-bridge.py"
 FIXTURES = REPO / "tests" / "fixtures" / "gateway-task-envelopes"
 

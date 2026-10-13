@@ -190,10 +190,13 @@ class FencedInvocations(unittest.TestCase):
             with self.subTest(build=build.__name__), sr.empty_dir() as d, \
                     self.assertRaises(ValueError):
                 build(codex, str(self.codex), "move auth.json here", cwd=d)
+        which = lambda n, path=None: {"codex": str(self.codex), "claude": "/b/claude"}.get(n) \
+            if path is None else None  # noqa: E731
         with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}):
-            which = lambda n, path=None: {"codex": str(self.codex), "claude": "/b/claude"}.get(n) \
-                if path is None else None  # noqa: E731
-            self.assertEqual(sr.select_runner(sr.DEFAULT_ORDER, which, fenced=True)[0].name,
+            self.assertIsNone(sr.select_runner(("codex",), which, fenced=True))
+            self.assertIsNone(sr.select_runner(sr.DEFAULT_ORDER, which, fenced=True))
+            opted = {sr.CLAUDE_OPT_IN_KEY: "1"}
+            self.assertEqual(sr.select_runner(("codex", "claude"), which, opted, fenced=True)[0].name,
                              "claude")
         self.assertEqual(self.auth.read_bytes(), before)
 
@@ -241,10 +244,14 @@ class FencedInvocations(unittest.TestCase):
         def which(name, path=None):
             return {"agy": str(self.agy), "codex": str(self.codex), "claude": "/b/claude"}.get(name) \
                 if path is None else None
+        opted = dict(os.environ, **{sr.CLAUDE_OPT_IN_KEY: "1"})
         self.assertEqual(sr.select_runner(sr.DEFAULT_ORDER, which, fenced=True)[0].name, "agy")
-        self.assertEqual(sr.select_runner(sr.DEFAULT_ORDER, which)[0].name, "claude")
+        self.assertEqual(sr.select_runner(sr.DEFAULT_ORDER, which, opted, fenced=True)[0].name, "agy")
+        self.assertIsNone(sr.select_runner(sr.DEFAULT_ORDER, which))
+        self.assertEqual(sr.select_runner(sr.DEFAULT_ORDER, which, opted)[0].name, "claude")
         with mock.patch.object(seatbelt, "available", return_value=False):
-            self.assertEqual(sr.select_runner(sr.DEFAULT_ORDER, which, fenced=True)[0].name,
+            self.assertIsNone(sr.select_runner(sr.DEFAULT_ORDER, which, fenced=True))
+            self.assertEqual(sr.select_runner(sr.DEFAULT_ORDER, which, opted, fenced=True)[0].name,
                              "claude")
 
 
