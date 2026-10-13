@@ -294,7 +294,19 @@ def _macos_notify(message: str) -> bool:  # pragma: no cover - external I/O (osa
         return False
 
 
-def _channel_notify(message: str, source: str, channel: str) -> bool:  # pragma: no cover - external I/O (notify.py subprocess)
+ALERT_FIELD = "space.ag2.agent_alert"
+
+
+def alert_content(signal: dict) -> dict:
+    """The structured tag a client groups this agent's alerts by; the relay never announces
+    a clear, so the tag names only the agent and what it is stuck on."""
+    return {ALERT_FIELD: {"agent": f"core@{_core_host_label()}",
+                          "state": str(signal.get("state") or ""),
+                          "kind": str(signal.get("kind") or "")}}
+
+
+def _channel_notify(message: str, source: str, channel: str,
+                    extra: "dict | None" = None) -> bool:  # pragma: no cover - external I/O (notify.py subprocess)
     """Route through the existing task-progress relay (notify.py). Returns True
     only when the send actually landed (notify.py exit 0), so the caller can
     decide whether to debounce — a failed or no-route send must NOT suppress a retry."""
@@ -303,9 +315,11 @@ def _channel_notify(message: str, source: str, channel: str) -> bool:  # pragma:
     if not os.path.isfile(notify):
         return False
     try:
-        r = subprocess.run([sys.executable, notify, "--source", source,
-                            "--channel-id", channel, "--message", message],
-                           capture_output=True, timeout=20)
+        cmd = [sys.executable, notify, "--source", source, "--channel-id", channel,
+               "--message", message]
+        if extra:
+            cmd += ["--extra-content", json.dumps(extra)]
+        r = subprocess.run(cmd, capture_output=True, timeout=20)
         return r.returncode == 0
     except Exception:
         return False
@@ -355,7 +369,7 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
     # Debounce only on a confirmed delivery: the selected channel when there is
     # one (macOS alone must not suppress it), else the macOS notification.
     if source and channel:
-        delivered = _channel_notify(msg, source, channel)
+        delivered = _channel_notify(msg, source, channel, extra=alert_content(signal))
         reason = "channel send failed"
     else:
         delivered = macos_ok

@@ -9,10 +9,12 @@ warn's prose.
 """
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -28,6 +30,17 @@ def _load():
 
 
 hc = _load()
+
+# The probe is Claude-only (#5414); pin the runtime so a codex host still exercises it.
+_RUNTIME_PIN = mock.patch.dict(os.environ, {"SUTANDO_CORE_RUNTIME": "claude"})
+
+
+def setUpModule():
+    _RUNTIME_PIN.start()
+
+
+def tearDownModule():
+    _RUNTIME_PIN.stop()
 
 
 def _fixture(root: Path, hooks_array: str, settings: dict):

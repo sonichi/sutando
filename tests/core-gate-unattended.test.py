@@ -378,7 +378,7 @@ class TestMonitorLoop(unittest.TestCase):
         argv = ["core-input-watch.py", "--socket", "/x.sock", "--session", SESSION, "--out", str(out)]
         if seat:
             argv += ["--seat", seat]
-        with patch.object(M, "capture", lambda s, sess: screen["pane"]), \
+        with patch.object(M, "capture_styled", lambda s, sess: screen["pane"]), \
                 patch.object(M, "send_keys", send), \
                 patch.object(M, "_load_runtime_health", lambda: _RH()), \
                 patch.object(M, "gateway_alive", lambda *a: True), \

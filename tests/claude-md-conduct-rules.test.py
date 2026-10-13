@@ -29,6 +29,10 @@ ROUTING = (
     "whatever the audience.",
     "post it in the DM and exactly one line in the room: 'I sent it to you in our DM.' Never move silently.",
 )
+THREADING = (
+    "- `[thread]` — task-result lead line: AG2 Space threads the answer on the ask. Threading is your call, "
+    "e.g. a side discussion that would crowd the timeline; when unsure, reply in the timeline.",
+)
 # The audience test replaced this: a room's readers, not the data's origin, decide what it may see.
 ROUTING_GONE = ("however personal the topic",)
 LANGUAGE = (
@@ -63,7 +67,8 @@ class ConductRulesArePinned(unittest.TestCase):
     def _check(self, name):
         s = _norm((REPO / name).read_text(encoding="utf-8"))
         for group, sentences in (("routing", ROUTING), ("language", LANGUAGE), ("blockers", BLOCKERS),
-                                 ("skills-before-refusing", SKILLS_FIRST), ("queue", QUEUE)):
+                                 ("skills-before-refusing", SKILLS_FIRST), ("queue", QUEUE),
+                                 ("threading", THREADING)):
             for sentence in sentences:
                 self.assertIn(_norm(sentence), s, f"{name}: the {group} rule lost: {sentence[:60]!r}")
         for gone in ROUTING_GONE:

@@ -59,13 +59,16 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { voiceTaskRows, workTool, submitWorkTask, voiceTaskStore, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile } from './task-bridge.js';
+import { voiceTaskRows, workTool, submitWorkTask, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask } from './task-bridge.js';
+import { createCallEndReporter, sessionEndTask } from './voice-session-end.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { createAudioHealthLedger } from './voice-audio-health.js';
 import { createHealthPersistence } from './voice-audio-health-persist.js';
 import { evaluateMatrix, type MatrixBaseline } from './voice-health-matrix.js';
 import { initialGoodbyeGuard, shouldFireGoodbye, createConversationClearHelper, clearStaleResumptionHandle } from './voice-continuity.js';
+import { ConversationLogStore } from './conversation-log-store.js';
+import { createConversationSummarizer, geminiSummarize } from './voice-conversation-summary.js';
 import { classifyFatalExitCode, isFatalExit, markFatalExit, writeCrashRecordAndExit, EXIT_CODE_DUPLICATE_INSTANCE } from './crash-only.js';
 import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLockGuardPath } from './voice-lock.js';
 import { recordToolCall } from './conversation-store.js';
@@ -545,7 +548,7 @@ const endSession: ToolDefinition = {
 		// replay goodbye text from this session into the reconnect
 		// greeting. Structural fix for the 2026-04-09 replay-contamination
 		// class of bug.
-		logSessionBoundary('user_goodbye');
+		conversationLogStore.markBoundary('user_goodbye');
 		console.log(`${ts()} [end_session] Sending session_end to client (sendJsonToClient exists: ${!!ctx.sendJsonToClient})`);
 		ctx.sendJsonToClient?.({ type: 'session_end', reason: 'user_goodbye' });
 		// CRITICAL: clear bodhi's in-memory conversationContext so the next
@@ -591,11 +594,31 @@ let voiceSessionRef: VoiceSession | null = null;
 // cursor pointing past the emptied array makes the logger skip everything
 // that accumulates after it). Used by end_session, the goodbye detector, and
 // the sessionEnding turn.end sweep.
+// Runs right before a clear: the call's report keeps what is about to go.
+let beforeConversationClear: () => void = () => {};
+// The compressed summary of the older conversation (bodhi keeps the slot, sutando fills it).
+const conversationSummary = createConversationSummarizer({
+	context: () => voiceSessionRef?.conversationContext ?? null,
+	summarize: geminiSummarize,
+	onEvicted: (n) => { itemsClear.cursor.index = Math.max(0, itemsClear.cursor.index - n); },
+	log: (m) => console.log(`${ts()} ${m}`),
+});
 const itemsClear = createConversationClearHelper(
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	() => (voiceSessionRef as any)?.conversationContext?.items,
+	(reason) => {
+		beforeConversationClear();
+		const cleared = voiceSessionRef?.resetConversationContext(reason).cleared ?? 0;
+		conversationSummary.clear();
+		return cleared;
+	},
 	(m) => console.log(`${ts()} ${m}`),
 );
+// conversation.log + sqlite, written by bodhi's history writer after each turn. A goodbye's
+// remaining lines are not logged, so the next session's replay never picks them up.
+const conversationLogStore = new ConversationLogStore({
+	log: (role, text, sessionId, at) => logConversationAsync(role, text, sessionId, at),
+	boundary: (reason) => logSessionBoundaryAsync(reason),
+	suppress: () => sessionEnding,
+});
 // P7 D7.3 stale-repeat goodbye guard (Tranche A engine-side). The guard
 // compares against userTurnCount, which resets per logical session — every
 // reset MUST rebase the guard too, or a legitimate goodbye in the next
@@ -723,7 +746,7 @@ const mainAgent: MainAgent = {
 			}
 			goodbyeGuard = verdict.next;
 			console.log(`${ts()} [Agent] Strict goodbye detected — closing client in 3s`);
-			logSessionBoundary('voice_goodbye');
+			conversationLogStore.markBoundary('voice_goodbye');
 			(ctx as any).sendJsonToClient?.({ type: 'session_end', reason: 'user_goodbye' });
 			setTimeout(() => {
 				try {
@@ -983,6 +1006,18 @@ async function main() {
 	});
 	setVoiceTaskEndedListener((taskId, why) => { relayAgent.endCall(taskId, why); });
 
+	// When the user hangs up, the core gets a task about that call.
+	const callEnd = createCallEndReporter({
+		sessionId: SESSION_ID,
+		items: () => sessionRef?.conversationContext.items ?? [],
+		onEnded: async (ended) => {
+			const { summary, transcript } = sessionEndTask(ended);
+			await submitVoiceSessionEndTask(summary, transcript);
+		},
+		log: (m) => console.log(`${ts()} ${m}`),
+	});
+	beforeConversationClear = () => callEnd.collect();
+
 	// The task table lives in memory; the status page (/voice-tasks on the web client) reads a copy,
 	// written asynchronously after each change, as bodhi's history stores write the conversation.
 	const voiceTaskStatus = createVoiceTaskStatusWriter({
@@ -1000,6 +1035,11 @@ async function main() {
 		agents: [mainAgent],
 		initialAgent: 'main',
 		subagentConfigs: { work: relayAgentSubagentConfig(relayAgent) },
+		// A call still in progress at shutdown is reported through bodhi's post-session pipeline.
+		postSessionPipeline: callEnd.pipeline,
+		// close() runs at shutdown, right before process.exit: wait for the task to be written.
+		drainPostSession: true,
+		conversationHistoryStores: [conversationLogStore],
 		port: PORT,
 		host: HOST,
 		model: google(VOICE_MODEL),
@@ -1023,7 +1063,9 @@ async function main() {
 		},
 		// Frames the core does not own are offered to optional skills' handlers.
 		onClientCommand: (message) => clientFrames.dispatch(message),
+		onClientConnected: () => callEnd.clientConnected(),
 		onClientDisconnected: () => {
+			callEnd.clientDisconnected();
 			// An origin belongs to the client that announced it; the next client announces its own.
 			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
 			setVoiceSessionOrigin(null);
@@ -1416,7 +1458,9 @@ async function main() {
 		items: session.conversationContext.items,
 		pendingInput: speechHost.transcriptManager?.inputBuffer as string | undefined,
 		lastUserSpeechAt,
+		summary: session.conversationContext.summary,
 	}));
+	session.eventBus.subscribe('turn.end', () => callEnd.collect());
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;
 		// If end_session fired this session, keep clearing items so
@@ -1430,10 +1474,9 @@ async function main() {
 		for (const item of items.slice(itemsClear.cursor.index)) {
 			if (item.role === 'user' || item.role === 'assistant') {
 				console.log(`${ts()}   [${item.role}] ${item.content}`);
-				logConversation(item.role, item.content, SESSION_ID);
 				const evtRole = item.role === 'user' ? 'user' : 'sutando';
 				// utterance event push removed per #1052 — canonical record is
-				// the voice-table row written by logConversation() above
+				// the voice-table row ConversationLogStore writes
 				// (kind='user'/'agent', ts_unix). session_events keeps only
 				// lifecycle entries to stop triple-encoding the same atom.
 				recorder.transcript.push({ role: evtRole, text: item.content || '' });
@@ -1453,6 +1496,8 @@ async function main() {
 		}
 		itemsClear.cursor.index = items.length;
 	});
+	// After the logger: a summary moves items, and the cursor moves with them (onEvicted).
+	session.eventBus.subscribe('turn.end', () => { if (!sessionEnding) void conversationSummary.onTurnEnd(); });
 
 	// Track user interruption events as a secondary signal for the
 	// end_session gate. bodhi fires turn.interrupted whenever the user's

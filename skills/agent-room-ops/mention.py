@@ -11,9 +11,10 @@ first (narrowed to the room's members when it over-matches), then the broker's
 room-scoped resolver, then the room's own member list — and posts an
 op:message with that mxid leading the body plus `mentions:[mxid]`.
 The broker routes on the mxid either way: it stamps `mentions` into `m.mentions`,
-and a member mxid in the plain body is matched as a whole token, auto-mentioned
-and rendered as a pill — so the peer is actually triggered and a human reading
-the room sees who was asked.
+and a member's FULL mxid in the plain body is matched as a whole token,
+auto-mentioned and rendered as a pill — so the peer is actually triggered and a
+human reading the room sees who was asked. A short @handle without :server is
+never linked and must not be relied on.
 
 Ambiguity never posts: two candidates from any source is a refusal carrying the
 candidate list, because mentioning the wrong agent is worse than mentioning
@@ -31,11 +32,13 @@ from relations import RelationError, relation_fields
 
 
 def _result(ok, *, room_id=None, mxid=None, event_id=None, candidates=None, reason=None,
-            resolved_by=None):
+            resolved_by=None, posted=None):
     # `resolved_by` names the source that produced `mxid` OR refused the handle —
     # directory | directory+room | broker | room — so both are traceable.
+    # `posted`: False = refused before any send, True = sent, None = sent with unknown outcome.
     return {"ok": bool(ok), "room_id": room_id, "mxid": mxid, "event_id": event_id,
-            "candidates": candidates or [], "reason": reason, "resolved_by": resolved_by}
+            "candidates": candidates or [], "reason": reason, "resolved_by": resolved_by,
+            "posted": posted}
 
 
 def build_body(mxid: str, message: str) -> str:
@@ -137,8 +140,9 @@ def _resolve_from_room(handle: str, room_id: str, agent_mxid: str | None,
 
 def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = None,
             *, gate=None, agents: list | None = None,
-            reply_to: str | None = None) -> dict:
-    """Resolve `handle` → mxid and post a triggering @-mention into `room_id`.
+            reply_to: str | None = None, thread_root: str | None = None) -> dict:
+    """Resolve `handle` → mxid and post a triggering @-mention into `room_id`
+    (inside the thread rooted at `thread_root` when given).
 
     Returns {ok, room_id, mxid, event_id, candidates, reason, resolved_by}. On
     an ambiguous handle it does NOT post — it returns ok:false + the candidate
@@ -146,16 +150,16 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
     """
     agent_mxid = agent_mxid or os.environ.get("AGENT_MXID")
     if not room_id:
-        return _result(False, room_id=room_id, reason="room_id required")
+        return _result(False, room_id=room_id, reason="room_id required", posted=False)
     if not handle:
-        return _result(False, room_id=room_id, reason="handle required")
+        return _result(False, room_id=room_id, reason="handle required", posted=False)
 
     # Validated before resolve/gate/network for the same reason as in `say`: a
     # mention citing the wrong event is worse than one that is refused.
     try:
-        rel = relation_fields(reply_to=reply_to)
+        rel = relation_fields(reply_to=reply_to, thread_root=thread_root)
     except RelationError as e:
-        return _result(False, room_id=room_id, reason=str(e))
+        return _result(False, room_id=room_id, reason=str(e), posted=False)
 
     res = resolve_user(handle, agents=agents)
     # A full mxid counts as the directory's answer: resolve_user short-circuits it.
@@ -177,18 +181,18 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
     if not res.get("ok"):
         return _result(False, room_id=room_id, candidates=res.get("candidates"),
                        reason=res.get("reason") or "could not resolve handle",
-                       resolved_by=source)
+                       resolved_by=source, posted=False)
     mxid = res["mxid"]
 
     gate = load_gate() if gate is None else gate
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, room_id=room_id, mxid=mxid, resolved_by=source,
-                       reason=f"client gate denied for {agent_mxid}")
+                       reason=f"client gate denied for {agent_mxid}", posted=False)
 
     base, headers = gateway()
     if not base:
         return _result(False, room_id=room_id, mxid=mxid, resolved_by=source,
-                       reason="no gateway configured")
+                       reason="no gateway configured", posted=False)
 
     body = build_body(mxid, message)
     try:
@@ -221,4 +225,4 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
                        reason=f"network error: {e}")
     # Same envelope as `say`, so the same reading — see receipt.py.
     _state, event_id, _reason = _receipt.classify(parsed)
-    return _result(True, room_id=room_id, mxid=mxid, event_id=event_id, resolved_by=source)
+    return _result(True, room_id=room_id, mxid=mxid, event_id=event_id, resolved_by=source, posted=True)

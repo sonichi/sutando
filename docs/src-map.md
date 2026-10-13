@@ -50,6 +50,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`cloud_auth.py`** — Sutando Cloud session: find the owner's sutk_ bearer and call the cloud API.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
+- **`conversation-log-store.ts`** — The voice session's conversation log (conversation.log + the sqlite mirror) as a bodhi ConversationHistoryStore, written like bodhi's own Markdown store: bodhi's history writer calls it asynchronously after each turn, it appends the spoken lines without blocking (fs/promises, sqlite in a worker) on its own serial queue, and a failed write is logged, never thrown.
 - **`conversation-store-migrations.ts`** — Startup-only SQLite migration policy for the conversation store.
 - **`conversation-store.ts`** — SQLite mirror of conversation.log — per-surface tables.
 - **`core-input-watch.py`** — core-input-watch.py — the core supervisor MONITOR (M1).
@@ -254,12 +255,14 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`voice-connect-resolver.ts`** — Transparent voice-connection tier resolution — picks the best reachable endpoint for "call your agent" so the user never chooses a tier.
 - **`voice-context.ts`** — Builds a system prompt for the Claude Code subprocess that injects Sutando identity and user context from the memory system.
 - **`voice-continuity.ts`** — voice-continuity — P7 D7.3 continuity helpers (Tranche A engine-side): the stale-repeat goodbye guard and the centralized conversation-clear.
+- **`voice-conversation-summary.ts`** — The voice session's compressed conversation summary.
 - **`voice-error-classifier.ts`** — Classify Gemini Live transport close events into actionable categories.
 - **`voice-health-matrix.ts`** — voice-health-matrix — P7 D7.2: the failure-localization matrix.
 - **`voice-key.ts`** — Shared Gemini API-key resolution for voice surfaces (voice-agent, phone-conversation, and any plugin voice surface).
 - **`voice-lock.ts`** — voice-lock.ts — TS caller of the guarded PID-lock helper (`scripts/voice-lock.py`), used by voice-agent's `acquirePidLock` (impl plan WS1 Step 4, amendments R1/R3/R4).
 - **`voice-mode-resolver.ts`** — Unified base-mode resolver for the voice agent (issue #1410, supersedes partial fixes #1412 + #1413).
 - **`voice-recovery-config.ts`** — Env settings for bodhi's upstream recovery: whether active-silence recovery is armed and after how many health ticks, and when a stuck dial is replaced.
+- **`voice-session-end.ts`** — When the user hangs up, the core gets a task about that call: when it ran, how it ended, and what was said.
 - **`voice-task-status-writer.ts`** — Writes the relay agent's task table out for the status page, the way bodhi's history stores write the conversation: the table lives in memory and calls back after each change; this writes asynchronously, one write at a time, coalescing changes that arrive while a write is in flight (the last state wins).
 - **`voice_room_membership.py`** — The gateway bridge's room-membership verifier for room-bound voice sessions.
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.

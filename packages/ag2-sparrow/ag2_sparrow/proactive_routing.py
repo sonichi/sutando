@@ -225,6 +225,22 @@ def body_claimable_by(body, this_channel: str) -> bool:
     return kind is None or kind == this_channel
 
 
+def should_claim_proactive_peeked(name, body, state_file_path: Path,
+                                  this_channel: str) -> bool:
+    """Pre-claim decision for an activity-routed bridge, given the peeked body.
+
+    A body addressed to ANOTHER bridge is never claimed, whatever the tag or
+    activity routing says: a claim renames it out of the glob that bridge polls,
+    so claim-then-release every pass starves it (#5368). Otherwise the filename
+    tag / activity routing decides, and a body addressed to this bridge claims.
+    """
+    if not body_claimable_by(body, this_channel):
+        return False
+    if should_claim_proactive_file(name, state_file_path, this_channel):
+        return True
+    return body_target_channel(body) == this_channel
+
+
 def redirect_target_is_foreign(target, this_channel: str) -> bool:
     """Strict form: anything not POSITIVELY this bridge's address is foreign.
 

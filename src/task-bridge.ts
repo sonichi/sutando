@@ -9,17 +9,19 @@
  */
 
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, statSync, appendFileSync, renameSync } from 'node:fs';
+import { appendFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { renderItems } from './voice-conversation-summary.js';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
-import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, dedupTarget, type TaskOrigin } from './skip_marker_ownership.js';
+import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, dedupTarget, stripVoiceControlLines, type TaskOrigin } from './skip_marker_ownership.js';
 import { createVoiceTaskStore, planReconcile } from './relay-agent.js';
 import { framedSystem } from './inject-framing.js';
-import { recordConversation, recordSessionBoundary } from './conversation-store.js';
+import { recordConversation, recordConversationAsync, recordSessionBoundary, recordSessionBoundaryAsync } from './conversation-store.js';
 import {
 	emitTaskProcessed,
 	selectBackend,
@@ -248,6 +250,8 @@ export type VoiceTurnsSnapshot = {
 	pendingInput?: string | null;
 	/** When the runtime last saw the owner speak (ms epoch); undefined when unknown. */
 	lastUserSpeechAt?: number | null;
+	/** The compressed summary of the conversation before `items`, when one was made. */
+	summary?: string | null;
 };
 type VoiceTurnsProvider = () => ReadonlyArray<VoiceTurn> | VoiceTurnsSnapshot | null | undefined;
 let _voiceTurns: VoiceTurnsProvider | null = null;
@@ -268,6 +272,20 @@ function _readSnapshot(): VoiceTurnsSnapshot | null {
 	if (Array.isArray(raw)) return { items: raw };
 	const snap = raw as VoiceTurnsSnapshot;
 	return Array.isArray(snap.items) || snap.pendingInput || typeof snap.lastUserSpeechAt === 'number' ? snap : null;
+}
+
+/** Turns of the live conversation a work task carries, after the summary of what came before them. */
+export const CONTEXT_RECENT_ITEMS = 10;
+
+/** The live session's conversation at the ask: its summary, then the last turns. Null without a session. */
+export function _voiceContextAtAsk(): string | null {
+	const snap = _readSnapshot();
+	if (!snap) return null;
+	const items = Array.isArray(snap.items) ? snap.items : [];
+	const recent = renderItems(items.filter((i) => i.role === 'user' || i.role === 'assistant').slice(-CONTEXT_RECENT_ITEMS));
+	const summary = typeof snap.summary === 'string' ? snap.summary.trim() : '';
+	const parts = [summary ? `summary of the conversation before these turns:\n${summary}` : '', recent].filter(Boolean);
+	return parts.length ? parts.join('\n\n') : null;
 }
 
 /** Longest single utterance the block carries; a longer one (a paste typed into the session) is cut. */
@@ -625,7 +643,7 @@ export function reconcileVoiceTasks(deliver: RelayDeliver, isInFlight: (taskId: 
 		if (action === 'speak_result' && text) {
 			console.log(`${ts()} [RelayAgent] ${id}: result never heard (${row.delivery ?? 'no delivery'})${source !== id ? `, answered in ${source}` : ''}; handing it over again`);
 			voiceTaskStore.noteReplay(id);
-			deliver(text.replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '').trim(), row.cancelRequested ? CANCELLED_BUT_FINISHED_NOTE : MISSED_RESULT_NOTE, { taskId: id });
+			deliver(stripVoiceControlLines(text).trim(), row.cancelRequested ? CANCELLED_BUT_FINISHED_NOTE : MISSED_RESULT_NOTE, { taskId: id });
 		} else if (action === 'tell_not_picked') {
 			const minutes = Math.floor((now - (row.submittedAt ?? now)) / 60000);
 			console.log(`${ts()} [RelayAgent] ${id}: not picked up after ${minutes}m; telling the user`);
@@ -874,6 +892,17 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	return lines.join('\n') + '\n';
 }
 
+/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority. */
+export async function submitVoiceSessionEndTask(summary: string, transcript: string): Promise<string> {
+	const taskId = `task-${Date.now()}`;
+	const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
+	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null).replace('priority: urgent', 'priority: low');
+	const body = transcript ? `\n\n--- the session's spoken lines (may contain ASR errors) ---\n${confineUserContent(transcript)}\n` : '\n';
+	await _delegation.submitTask(taskId, `${header}task: ${confineUserContent(summary)}${body}`);
+	console.log(`${ts()} [TaskBridge] Session-end task: ${taskId}`);
+	return taskId;
+}
+
 /** Remember the origin a task was written with, so its result can follow it. */
 export function _rememberTaskOrigin(taskId: string, origin: VoiceSessionOrigin | null): void {
 	if (!origin) return;
@@ -1067,7 +1096,7 @@ export const workTool: ToolDefinition = {
 		const origin = _voiceSessionOrigin;
 		const originGeneration = _voiceOriginGeneration;
 		let recentAtAsk = '';
-		try { recentAtAsk = getRecentConversation(4); } catch { /* best effort */ }
+		try { recentAtAsk = _voiceContextAtAsk() ?? getRecentConversation(4); } catch { /* best effort */ }
 
 		// Redirect pure screen-viewing tasks to inline tools (faster, no round-trip)
 		// Narrow match: only "describe/look at my screen" — not scroll, screenshot,
@@ -1192,7 +1221,7 @@ export const workTool: ToolDefinition = {
 				const recent = recentAtAsk;
 				if (recent) {
 					contextBlock =
-						`\n\n--- recent voice transcript (may contain ASR errors; if the task above ` +
+						`\n\n--- earlier in this voice conversation: a summary, then the last turns (may contain ASR errors; if the task above ` +
 						`seems garbled or doesn't match this, infer the true intent from it or ask to ` +
 						`confirm before acting) ---\n${confineUserContent(recent)}\n`;
 				}
@@ -1251,11 +1280,25 @@ export const submitWorkTask = (args: Record<string, unknown>) => workTool.execut
  *  character can render as multiple bytes. Lifted to LOG_LINE_MAX_CHARS;
  *  override via SUTANDO_LOG_LINE_MAX_CHARS env if a host wants tighter logs. */
 const LOG_LINE_MAX_CHARS = Number(process.env.SUTANDO_LOG_LINE_MAX_CHARS) || 2000;
-export function logConversation(role: string, text: string, sessionId?: string): void {
+export function logConversation(role: string, text: string, sessionId?: string, at: Date = new Date()): void {
 	const capped = text.replace(/\n/g, ' ').slice(0, LOG_LINE_MAX_CHARS);
-	const line = `${new Date().toISOString()}|${role}|${capped}\n`;
+	const line = `${at.toISOString()}|${role}|${capped}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
-	recordConversation(role, capped, sessionId); // #603 sqlite mirror — best-effort, swallowed inside
+	recordConversation(role, capped, sessionId, { tsUnix: at.getTime() / 1000 }); // #603 sqlite mirror — best-effort, swallowed inside
+}
+
+/** logConversation without blocking: the log line through fs/promises, the sqlite row through
+ *  the store's worker. Resolves when both are written; failures are logged, never thrown. */
+export async function logConversationAsync(role: string, text: string, sessionId?: string, at: Date = new Date()): Promise<void> {
+	const capped = text.replace(/\n/g, ' ').slice(0, LOG_LINE_MAX_CHARS);
+	try { await appendFile(CONVERSATION_LOG, `${at.toISOString()}|${role}|${capped}\n`); } catch { /* best effort */ }
+	await recordConversationAsync(role, capped, sessionId, { tsUnix: at.getTime() / 1000 });
+}
+
+/** logSessionBoundary without blocking. */
+export async function logSessionBoundaryAsync(reason: string = 'user_goodbye'): Promise<void> {
+	try { await appendFile(CONVERSATION_LOG, `${new Date().toISOString()}|SESSION_END|${reason}\n`); } catch { /* best effort */ }
+	await recordSessionBoundaryAsync(reason);
 }
 
 /** Append a session-end boundary marker. Used by voice-agent's
@@ -1484,17 +1527,18 @@ function startRelayResultWatcher(onResult: ResultListener): void {
 				if (_deliveredResults.has(file)) continue;
 				const taskId = file.replace('.txt', '');
 				if (!_pendingTasks.has(taskId)) continue; // not ours — leave it
-				const result = (await _delegation.readResultFile(file)).trim();
-				if (!result) continue;
+				const raw = (await _delegation.readResultFile(file)).trim();
+				if (!raw) continue;
+				const result = stripVoiceControlLines(raw).trim();
 				_deliveredResults.add(file);
 				_pendingTasks.delete(taskId);
 				// Shared predicate, not a local regex: this grammar must stay identical to
 				// src/result_markers.py, which is case-insensitive and accepts `[deduped:]`.
-				if (!bodyIsSkipMarked(result)) {
+				if (!bodyIsSkipMarked(raw)) {
 					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
 					onResult(`[Task result for ${taskId}]\n${result}`);
 				} else {
-					const answeredIn = dedupTarget(result);
+					const answeredIn = dedupTarget(raw);
 					if (answeredIn && voiceTaskStore.get(taskId)) voiceTaskStore.setAnsweredBy(taskId, answeredIn);
 				}
 				await _delegation.archiveResultFile(file, taskId);
@@ -1673,9 +1717,9 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 				// Detected before the strip: an origin-bound result that carries the
 				// marker is kept to the owner's DM (keepVoiceResultToDm).
 				const dmOnly = DM_ONLY_RE.test(rawResult);
-				const result = rawResult
-					.replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '')
-					.trim();
+				// Skip and ownership read the raw body; the strip is for speech and logs only.
+				const raw = rawResult.trim();
+				const result = stripVoiceControlLines(rawResult).trim();
 				if (!result) continue;
 				const taskId = file.replace('.txt', '');
 
@@ -1702,16 +1746,16 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 				// (e.g. Discord bridge already replied) or the result should be suppressed entirely.
 				// Parity with Python bridges: discord-bridge.py and telegram-bridge.py both honor
 				// these via parse_markers(); task-bridge.ts must too (issue #1381).
-				if (isSkipMarked(file, result)) {
+				if (isSkipMarked(file, raw)) {
 					// Ownership must survive a restart (_pendingTasks is in-memory)
 					// and the timeout sweep; suppression applies either way.
 					const owns = (id: string) => _pendingTasks.has(id) || _isVoiceTask(id);
-					if (!mayRetireSkipMarked(file, result, owns, _taskOrigin)) {
+					if (!mayRetireSkipMarked(file, raw, owns, _taskOrigin)) {
 						continue;   // another consumer's: leave the files for its owner
 					}
 					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker; archiving silently`);
 					// A voice task the core answered in another task's result: the table owes the user that result.
-					const answeredIn = dedupTarget(result);
+					const answeredIn = dedupTarget(raw);
 					if (answeredIn && voiceTaskStore.get(taskId)) {
 						voiceTaskStore.setAnsweredBy(taskId, answeredIn);
 						console.log(`${ts()} [RelayAgent] ${taskId}: answered in ${answeredIn}`);

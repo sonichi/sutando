@@ -7,7 +7,8 @@
 # sort | uniq -c`. Full methodology and the areas considered and left out:
 # the "Sutando codeowners" doc (ww room) and its Product-core copy.
 #
-# GOVERNANCE: main requires code-owner review + 2 approvals, no self-approval.
+# GOVERNANCE: main requires code-owner review + the approval count the main
+# ruleset sets (currently 1), no self-approval.
 # @sonichi and @qingyun-wu are the only bypass actors (pull_request mode). A
 # singleton owner below is a hard block on their own PRs, and on anyone
 # else's if they're unavailable; the default recovery path is a bypass merge
@@ -41,6 +42,7 @@
 /skills/task-progress/     @qingyun-wu
 /skills/phone-conversation/ @sonichi @liususan091219 @qingyun-wu   # full history: Chi 46, Susan 28, Qingyun 21 (90 days: Qingyun)
 /packages/                 @qingyun-wu
+/packages/ag2-sparrow/ag2_sparrow/adapters/hatch/ @qingyun-wu @sonichi  # Meta Hatch adapter; owner-assigned (Chi) at creation, no history yet
 
 # Susan: areas she leads or co-leads over the full history.
 # (no line for skills/discord-voice/ -- zero currently-tracked files, same

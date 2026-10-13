@@ -59,7 +59,7 @@ import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
+from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
@@ -497,7 +497,7 @@ def _dedup_recover(task_id: str, holder_id, chat_id) -> tuple[str | None, str]:
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id, chat_id,
-            f"task-{int(time.time() * 1000)}")
+            fresh_reask_id())
         if action == "requeue":
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
             requeued = payload
@@ -1066,8 +1066,7 @@ def main():  # pragma: no cover
         # and telegram-bridge raced for the SAME proactive-*.txt files
         # and whichever ran first delivered, producing cross-channel
         # surprises. See proactive_routing.py for the decision rule.
-        from proactive_routing import (body_claimable_by,
-                                       should_claim_proactive_file)
+        from proactive_routing import should_claim_proactive_peeked
         try:
             if not presenter_mode_active(REPO):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
@@ -1079,22 +1078,17 @@ def main():  # pragma: no cover
                 # cron-originated results land in the owner's DM regardless
                 # of which bridge is the active channel.
                 PROACTIVE_PREFIXES = ("proactive-", "briefing-", "insight-", "friction-")
-                def _tg_claims(name: str) -> bool:
-                    # Destination outranks activity routing, uniformly;
-                    # discord's DM fallback stays the after-grace catch-all.
-                    return should_claim_proactive_file(
-                        name, OWNER_ACTIVITY_FILE, "telegram")
-
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \
-                            and f.suffix == ".txt" and _tg_claims(f.name):
+                            and f.suffix == ".txt":
                         # Peek before claiming: a body addressed to another bridge
                         # is delivered by that bridge, not sent here as literal text.
                         try:
                             peek = f.read_text(errors="ignore").lstrip()
                         except OSError:
                             continue
-                        if not body_claimable_by(peek, "telegram"):
+                        if not should_claim_proactive_peeked(
+                                f.name, peek, OWNER_ACTIVITY_FILE, "telegram"):
                             continue
                         # Resolve the recipient BEFORE claiming: the claim renames the
                         # file out of the `*.txt` glob every peer bridge polls.
