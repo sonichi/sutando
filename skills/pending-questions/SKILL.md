@@ -28,6 +28,10 @@ python3 skills/pending-questions/scripts/pq.py resolve <ask-id> [--answered]
 python3 skills/pending-questions/scripts/pq.py remind [--force]
 ```
 
+Never list owner questions in terminal output — it reaches no one; file each with `ask`
+(or `scripts/ask-owner.py`) and keep the terminal to a status line. The skill's Stop hook
+(`hooks/terminal-questions.py`) refuses a core turn once when its final text lists them unfiled.
+
 - `ask` reconciles, queues the question to the owner (the task's conversation only for an
   owner-tier task in his DM; otherwise his DM), saves it to the outbox, writes the row born
   with its `**Sent:**` record, and once that exact row is confirmed complete commits the
