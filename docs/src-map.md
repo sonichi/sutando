@@ -263,6 +263,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`voice-mode-resolver.ts`** — Unified base-mode resolver for the voice agent (issue #1410, supersedes partial fixes #1412 + #1413).
 - **`voice-recovery-config.ts`** — Env settings for bodhi's upstream recovery: whether active-silence recovery is armed and after how many health ticks, and when a stuck dial is replaced.
 - **`voice-session-end.ts`** — When the user hangs up, the core gets a task about that call: when it ran, how it ended, and what was said.
+- **`voice-task-status-writer.ts`** — Writes the relay agent's task table out for the status page, the way bodhi's history stores write the conversation: the table lives in memory and calls back after each change; this writes asynchronously, one write at a time, coalescing changes that arrive while a write is in flight (the last state wins).
 - **`voice_room_membership.py`** — The gateway bridge's room-membership verifier for room-bound voice sessions.
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
 - **`watcher-rearm-session-hint.sh`** — SessionStart(compact|resume) hook: when no ready session-role watcher holds this session's inbox, inject the exact command that re-arms it.
@@ -271,6 +272,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`watcher_sentinel.sh`** — Ownership protocol for state/watch-tasks-stream.pid — the ONE writer contract.
 - **`web-client.ts`** — Web Audio Client for Sutando
 - **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
+- **`work-request-check.ts`** — The relay agent's text-model decisions.
 - **`worker_auth_state.py`** — Is a Claude CLI pane still signed out?
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.

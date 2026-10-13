@@ -502,7 +502,7 @@ function _hasResult(taskId: string): boolean {
 }
 
 /** The relay agent's task table: one row per voice task; survives a voice-agent restart. */
-export const voiceTaskStore = createVoiceTaskStore(join(REPO_DIR, 'state', 'voice-tasks.json'));
+export const voiceTaskStore = createVoiceTaskStore();
 
 /** The task's result text, live or archived (this month or last); null when there is none. */
 function _readResultText(taskId: string): string | null {
@@ -577,6 +577,8 @@ export interface VoiceTaskRow {
 	state: VoiceTaskState;
 	/** How the result reached the user, once it has. */
 	delivery?: 'spoken' | 'injected' | 'dm';
+	/** Ended with nothing to hear: nothing is pending for the user. */
+	retired?: boolean;
 }
 
 /** The relay agent's view for status answers: voice tasks from the last few hours, oldest first. */
@@ -586,7 +588,7 @@ export function voiceTaskRows(now = Date.now()): VoiceTaskRow[] {
 		if (row.submittedAt === undefined || now - row.submittedAt > STATUS_WINDOW_MS) continue;
 		let state: VoiceTaskRow['state'] = voiceTaskState(id);
 		if (row.cancelRequested && _hasResult(id)) state = 'done';
-		rows.push({ id, text: row.text ?? '', submittedAt: row.submittedAt, state, delivery: row.delivery });
+		rows.push({ id, text: row.text ?? '', submittedAt: row.submittedAt, state, delivery: row.delivery, ...(row.retired ? { retired: true } : {}) });
 	}
 	return rows;
 }
@@ -607,7 +609,13 @@ function _hasLiveOfflineCopy(taskId: string): boolean {
 }
 
 /** Delivers an owed result or notice to the user (the relay agent's queue). */
-export type RelayDeliver = (text: string, note: string | undefined, meta: { taskId?: string; framed?: boolean }) => void;
+export type RelayDeliver = (text: string, note: string | undefined, meta: { taskId?: string; framed?: boolean; about?: string }) => void;
+
+/** The "not picked up" notice for this task still holds: still queued, and nothing about it reached the user. */
+export function notPickedStillTrue(taskId: string): boolean {
+	const row = voiceTaskStore.get(taskId);
+	return !row?.delivery && !row?.supersededBy && !row?.cancelRequested && voiceTaskState(taskId) === 'queued';
+}
 
 /**
  * The relay agent's reconcile pass: for every recent voice task, compare what the core did with
@@ -640,7 +648,7 @@ export function reconcileVoiceTasks(deliver: RelayDeliver, isInFlight: (taskId: 
 			const minutes = Math.floor((now - (row.submittedAt ?? now)) / 60000);
 			console.log(`${ts()} [RelayAgent] ${id}: not picked up after ${minutes}m; telling the user`);
 			voiceTaskStore.noteNotPicked(id);
-			deliver(framedSystem(`The user's task "${(row.text ?? '').slice(0, 80).replace(/"/g, "'")}" has not been picked up by the core after ${minutes} minutes. It is still queued; the core may be busy or down. Tell the user in one sentence.`), undefined, { framed: true });
+			deliver(framedSystem(`The user's task "${(row.text ?? '').slice(0, 80).replace(/"/g, "'")}" has not been picked up by the core after ${minutes} minutes. It is still queued; the core may be busy or down. Tell the user in one sentence.`), undefined, { framed: true, about: id });
 		}
 	}
 }
@@ -1047,6 +1055,13 @@ export const workTool: ToolDefinition = {
 		'This is how Sutando thinks and acts. Results are spoken back when ready.',
 	parameters: z.object({
 		task: z.string().describe('Full description of the task to perform'),
+		replaces: z
+			.string()
+			.optional()
+			.describe(
+				'Only when this request corrects one the user made earlier in this conversation ' +
+				'(e.g. a misheard number): the words that identify that earlier request, e.g. "51167".'
+			),
 		timeout_minutes: z
 			.number()
 			.optional()
@@ -1744,6 +1759,13 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					if (answeredIn && voiceTaskStore.get(taskId)) {
 						voiceTaskStore.setAnsweredBy(taskId, answeredIn);
 						console.log(`${ts()} [RelayAgent] ${taskId}: answered in ${answeredIn}`);
+						// That result already reached the model: this task's call has nothing more coming.
+						const went = voiceTaskStore.get(taskId)?.delivery;
+						if (went === 'spoken' || went === 'injected') _onVoiceTaskEnded?.(taskId, 'delivered_separately');
+					} else if (voiceTaskStore.get(taskId)) {
+						// Nothing to hear for this task: the table must not count it as pending (2026-10-12 00:33:
+						// two tasks retired this way were counted, and the user heard "6" for 4).
+						voiceTaskStore.markRetired(taskId);
 					}
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
