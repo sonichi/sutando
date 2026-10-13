@@ -7,10 +7,9 @@
  * answers from it; a result whose call is gone is delivered another way and reconciled.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
 import type { PersistentSubagentInstance, SubagentConfig } from 'bodhi-realtime-agent';
 import { frameTaskResult, framedSystem } from './inject-framing.js';
+import type { OpenTask, TurnClassifier, WorkRequestCheck } from './work-request-check.js';
 
 /** How a voice task's result reached the user. `injected`: handed to the model, turn never confirmed. */
 export type Delivery = 'spoken' | 'injected' | 'dm';
@@ -27,51 +26,54 @@ export interface VoiceTaskRecord {
 	notPickedNoticed?: boolean;
 	/** The core answered this task in another task's result (`[deduped: <id>]`): its outcome is that result. */
 	answeredBy?: string;
+	/** The user corrected this request with a later task: its own result is not said. */
+	supersededBy?: string;
+	/** The core ended it with nothing for the user to hear (a skip-marked result that answers no other task). */
+	retired?: boolean;
 	/** Last change, for the cap. */
 	at: number;
 }
 
-const STORE_VERSION = 2;
 const STORE_CAP = 200;
 
-/** `state/voice-tasks.json`: the voice task table. One writer, atomic, capped; survives a restart. */
-export function createVoiceTaskStore(path: string, now: () => number = Date.now) {
-	const read = (): Record<string, VoiceTaskRecord> => {
-		try {
-			const d = JSON.parse(readFileSync(path, 'utf-8')) as { version?: unknown; tasks?: unknown };
-			if (d.version !== STORE_VERSION || !d.tasks || typeof d.tasks !== 'object') return {};
-			return d.tasks as Record<string, VoiceTaskRecord>;
-		} catch {
-			return {};
-		}
-	};
+/**
+ * The voice task table, in memory: one row per `work` task the user asked for by voice, with where the
+ * core stands and whether the user heard the answer. The voice agent owns it, like bodhi's
+ * ConversationContext; copies go out through `onChange` listeners, the way bodhi's history stores
+ * write the conversation (the status page reads one). Capped at the newest STORE_CAP rows.
+ */
+export function createVoiceTaskStore(now: () => number = Date.now) {
+	const tasks = new Map<string, VoiceTaskRecord>();
+	// Called after every change, like bodhi's history stores after a turn: they copy the table out
+	// (asynchronously, on their own schedule); the table never waits for them.
+	const listeners = new Set<() => void>();
 	const update = (taskId: string, change: (row: VoiceTaskRecord) => VoiceTaskRecord | null) => {
-		const tasks = read();
-		const next = change(tasks[taskId] ?? { at: 0 });
+		const next = change(tasks.get(taskId) ?? { at: 0 });
 		if (!next) return;
-		tasks[taskId] = { ...next, at: now() };
-		const kept = Object.entries(tasks).sort((a, b) => b[1].at - a[1].at).slice(0, STORE_CAP);
-		try {
-			if (!existsSync(dirname(path))) mkdirSync(dirname(path), { recursive: true });
-			const tmp = `${path}.${process.pid}.tmp`;
-			writeFileSync(tmp, JSON.stringify({ version: STORE_VERSION, tasks: Object.fromEntries(kept) }));
-			renameSync(tmp, path);
-		} catch (err) {
-			// A row that cannot be written costs a possible repeat, never a lost result.
-			console.error(`[RelayAgent] task table write failed: ${err instanceof Error ? err.message : err}`);
+		tasks.set(taskId, { ...next, at: now() });
+		if (tasks.size > STORE_CAP) {
+			for (const [id] of [...tasks.entries()].sort((a, b) => a[1].at - b[1].at).slice(0, tasks.size - STORE_CAP)) tasks.delete(id);
+		}
+		for (const l of listeners) {
+			try { l(); } catch (err) { console.error(`[RelayAgent] task table listener failed: ${err instanceof Error ? err.message : err}`); }
 		}
 	};
 	return {
+		/** Called after each change to the table; returns the unsubscribe. */
+		onChange(listener: () => void): () => void {
+			listeners.add(listener);
+			return () => listeners.delete(listener);
+		},
 		get(taskId: string): VoiceTaskRecord | undefined {
-			return read()[taskId];
+			return tasks.get(taskId);
 		},
 		/** Every row, oldest submission first. */
 		list(): Array<[string, VoiceTaskRecord]> {
-			return Object.entries(read()).sort((a, b) => (a[1].submittedAt ?? a[1].at) - (b[1].submittedAt ?? b[1].at));
+			return [...tasks.entries()].sort((a, b) => (a[1].submittedAt ?? a[1].at) - (b[1].submittedAt ?? b[1].at));
 		},
-		/** A `work` task was submitted. */
-		add(taskId: string, text: string): void {
-			update(taskId, (row) => ({ ...row, text: text.slice(0, 200), submittedAt: now() }));
+		/** A `work` task was submitted (`submittedAt` for a row rebuilt from an older submission). */
+		add(taskId: string, text: string, submittedAt: number = now()): void {
+			update(taskId, (row) => ({ ...row, text: text.slice(0, 200), submittedAt }));
 		},
 		/** The user asked to cancel it. */
 		markCancelRequested(taskId: string): void {
@@ -79,7 +81,10 @@ export function createVoiceTaskStore(path: string, now: () => number = Date.now)
 		},
 		set(taskId: string, delivery: Delivery): void {
 			// A confirmed delivery is never downgraded by a later, weaker one.
-			update(taskId, (row) => (row.delivery === 'spoken' && delivery !== 'spoken' ? null : { ...row, delivery }));
+			const deliver = (row: VoiceTaskRecord) => (row.delivery === 'spoken' && delivery !== 'spoken' ? null : { ...row, delivery });
+			update(taskId, deliver);
+			// The tasks answered in this one's result reached the user with it, whichever way it went.
+			for (const [id, row] of [...tasks.entries()]) if (row.answeredBy === taskId) update(id, deliver);
 		},
 		noteReplay(taskId: string): void {
 			update(taskId, (row) => ({ ...row, replays: (row.replays ?? 0) + 1 }));
@@ -90,11 +95,21 @@ export function createVoiceTaskStore(path: string, now: () => number = Date.now)
 		/** The core answered `taskId` in `target`'s result. */
 		setAnsweredBy(taskId: string, target: string): void {
 			if (taskId === target) return;
-			update(taskId, (row) => ({ ...row, answeredBy: target }));
+			// The answering result may already have been handed over: this task went with it.
+			const reached = tasks.get(target)?.delivery;
+			update(taskId, (row) => ({ ...row, answeredBy: target, ...(reached && row.delivery !== 'spoken' ? { delivery: reached } : {}) }));
+		},
+		/** The user corrected `taskId` with `by`. */
+		markRetired(taskId: string): void {
+			update(taskId, (row) => ({ ...row, retired: true }));
+		},
+		setSupersededBy(taskId: string, by: string): void {
+			if (taskId === by) return;
+			update(taskId, (row) => ({ ...row, supersededBy: by }));
 		},
 		/** The rows the core answered in `target`'s result. */
 		answeredBy(target: string): Array<[string, VoiceTaskRecord]> {
-			return Object.entries(read()).filter(([, row]) => row.answeredBy === target);
+			return [...tasks.entries()].filter(([, row]) => row.answeredBy === target);
 		},
 	};
 }
@@ -128,6 +143,7 @@ export const NOT_PICKED_MS = 3 * 60 * 1000;
  * the core did with what the user was told and returns what is still owed.
  */
 export function planReconcile(i: ReconcileInput): ReconcileAction {
+	if (i.row.supersededBy) return 'none';
 	if (i.settledResult) {
 		if (i.resultIsSkip || i.inFlight) return 'none';
 		if (i.row.delivery === 'spoken' || i.row.delivery === 'injected') return 'none';
@@ -148,7 +164,13 @@ export interface ResultItem {
 	requests?: string[];
 	/** Other voice tasks this result answers (the core deduped them into it): recorded with it. */
 	alsoFor?: string[];
+	/** A status notice about this task (not its result): not said once it is no longer true. */
+	about?: string;
 }
+
+// Results can arrive minutes later and several in a row: the user hears which request each one answers.
+export const SAY_WHICH_ONE = 'Start by saying in a few words, in the user\'s language, which request this answers (e.g. "About the PR 5200 comment: …"), then the answer.';
+export const SAY_WHICH_EACH = 'Name each request, in a few words in the user\'s language, before its answer.';
 
 /** The text handed to the model for one result: the requests it answers, the result, any note. */
 export function frameResult(i: ResultItem): string {
@@ -157,9 +179,270 @@ export function frameResult(i: ResultItem): string {
 	const asked = rs.length === 0
 		? ''
 		: rs.length === 1
-			? `${framedSystem(`This answers the user's request: ${quote(rs[0])}.`)}\n\n`
-			: `${framedSystem(`This answers ${rs.length} of the user's requests: ${rs.map(quote).join('; ')}. Cover each of them.`)}\n\n`;
+			? `${framedSystem(`This answers the user's request: ${quote(rs[0])}. ${SAY_WHICH_ONE}`)}\n\n`
+			: `${framedSystem(`This answers ${rs.length} of the user's requests: ${rs.map(quote).join('; ')}. Cover each of them. ${SAY_WHICH_EACH}`)}\n\n`;
 	return asked + (i.framed ? i.text : frameTaskResult(i.text)) + (i.note ? `\n\n${framedSystem(i.note)}` : '');
+}
+
+/** A correction reaches back this far for the request it replaces. */
+export const SUPERSEDE_WINDOW_MS = 60 * 60_000;
+
+/** A result the table says needs no saying: its task was corrected, or every task it answers was heard. */
+export function resultIsMoot(store: VoiceTaskStore, ids: string[]): boolean {
+	if (!ids.length) return false;
+	if (store.get(ids[0])?.supersededBy) return true;
+	return ids.every((id) => store.get(id)?.delivery === 'spoken');
+}
+
+/** What identifies a request beyond doubt: numbers of three or more digits, and quoted names (a correction names one). */
+export function requestMarks(request: string): string[] {
+	const numbers = request.match(/\d{3,}/g) ?? [];
+	const quoted = [...request.matchAll(/["“「]([^"”」]{2,})["”」]/g)].map((m) => m[1].toLowerCase());
+	return [...new Set([...numbers, ...quoted])];
+}
+
+/** How long a handed-over result waits for the model's turn before the next one goes anyway. */
+export const HANDOFF_CONFIRM_MS = 60_000;
+
+/** How long a result waits for the model to answer what the user just said (noise can end a user turn no reply follows). */
+export const USER_REPLY_WAIT_MS = 8_000;
+
+/** How long the user stays quiet before a `work` call is submitted: a pause mid-sentence is shorter. */
+export const QUIET_BEFORE_SUBMIT_MS = 1_500;
+
+/** A `work` call is never held longer than this, whatever the speech events say. */
+export const MAX_SUBMIT_HOLD_MS = 30_000;
+
+/**
+ * Whether the user has finished their turn. The model can end the user's turn mid-sentence (a short
+ * pause) and call `work` with half a request; the relay agent waits on this before it submits. The
+ * turn is over once the user has been quiet a moment, or once the model has spoken to them: what the
+ * user says after the model's reply is a new request, never the rest of this one.
+ */
+/** A speech event's origin. Gemini's provider events mark a start on every transcription chunk and never an end. */
+export interface SpeechEvent { source?: string }
+
+/** Only the client's own microphone detection says when the user starts and stops: a provider start has no end. */
+export const fromClient = (e?: SpeechEvent): boolean => e?.source !== 'provider';
+
+export interface SpeechGate {
+	onUserSpeechStarted(e?: SpeechEvent): void;
+	onUserSpeechEnded(e?: SpeechEvent): void;
+	/** The model started speaking to the user. */
+	onModelAudio(): void;
+	/** Resolves once the user's turn is over, or the hold limit or `signal` ends the wait. */
+	waitTurnOver(signal?: AbortSignal): Promise<void>;
+}
+
+export function createSpeechGate(opts: { quietMs?: number; maxHoldMs?: number; now?: () => number } = {}): SpeechGate {
+	const now = opts.now ?? Date.now;
+	const quietMs = opts.quietMs ?? QUIET_BEFORE_SUBMIT_MS;
+	const maxHoldMs = opts.maxHoldMs ?? MAX_SUBMIT_HOLD_MS;
+	let speaking = false;
+	let startedAt = 0;
+	let endedAt: number | null = null;
+	let modelAudioAt: number | null = null;
+	// Every wait looks again on each event, so the model's first word releases a call at once.
+	const waits = new Set<() => void>();
+	const wake = () => { for (const look of [...waits]) look(); };
+	return {
+		onUserSpeechStarted(e) { if (!fromClient(e)) return; speaking = true; startedAt = now(); wake(); },
+		onUserSpeechEnded(e) { if (!fromClient(e)) return; speaking = false; endedAt = now(); wake(); },
+		onModelAudio() { modelAudioAt = now(); wake(); },
+		waitTurnOver(signal) {
+			const since = now();
+			return new Promise<void>((resolve) => {
+				let timer: ReturnType<typeof setTimeout> | null = null;
+				const done = () => { waits.delete(look); if (timer) clearTimeout(timer); resolve(); };
+				function look() {
+					const t = now();
+					if (signal?.aborted || t - since >= maxHoldMs) return done();
+					// The model answered: the user's turn is over, whatever the microphone picks up now.
+					if (modelAudioAt !== null && modelAudioAt >= since) return done();
+					// A speech start with no end (a sound too short to be speech) does not hold the call for good.
+					const stillSpeaking = speaking && t - startedAt < maxHoldMs;
+					const quietFrom = stillSpeaking ? null : (endedAt ?? 0) + quietMs;
+					if (quietFrom !== null && t >= quietFrom) return done();
+					if (timer) clearTimeout(timer);
+					timer = setTimeout(look, quietFrom === null ? Math.max(10, since + maxHoldMs - t) : Math.max(10, quietFrom - t));
+				}
+				waits.add(look);
+				signal?.addEventListener('abort', look, { once: true });
+				look();
+			});
+		},
+	};
+}
+
+/** The request a cut-off call sent, joined to the one the user went on to say. */
+export function joinCutOffRequest(earlier: string, later: string): string {
+	return `${later} (the user also said, just before, cut off mid-sentence: "${earlier.replace(/"/g, "'")}"; if that asks for something else, do it too)`;
+}
+
+/** One result on its way to the model. */
+export interface Handoff {
+	/** The tasks it answers: recorded spoken once the model has said it. */
+	ids: string[];
+	label: string;
+	/** Hands it to the model now (its waiting work call or a system notice). False when it cannot. */
+	hand(): boolean;
+	/** It could not be handed: deliver it another way. */
+	fallback(): void;
+	/** The table says it no longer needs saying (checked when its turn comes). */
+	moot?(): boolean;
+}
+
+/**
+ * Hands results to the model one at a time and confirms each from the model's next turn: a turn
+ * the model began saying records it spoken, also when it was cut off: said once is said (2026-10-12,
+ * a 213 ms sound after a finished sentence counted as a cut-off and the answer was read again). Two results landing at
+ * once would otherwise reach the model together, and it may answer only one. A result also waits
+ * while the user speaks and until the model has answered them, so it never takes the user's turn.
+ * Only a turn the model spoke in counts: a turn that was only a tool call answered no one.
+ */
+export function createHandoffPacer(deps: {
+	markSpoken: (ids: string[]) => void;
+	confirmMs?: number;
+	userReplyWaitMs?: number;
+	now?: () => number;
+	log?: (msg: string) => void;
+}) {
+	const now = deps.now ?? Date.now;
+	let userSpeaking = false;
+	let userStartedAt = 0;
+	let userEndedAt: number | null = null;
+	let userTimer: ReturnType<typeof setTimeout> | null = null;
+	let spoke = false;
+	// A speech start with no end (a dropped event) must not hold results for good.
+	const speakingHold = () => userSpeaking && now() - userStartedAt < (deps.confirmMs ?? HANDOFF_CONFIRM_MS);
+	const userTurnOpen = () =>
+		speakingHold() || (userEndedAt !== null && now() - userEndedAt < (deps.userReplyWaitMs ?? USER_REPLY_WAIT_MS));
+	const queue: Handoff[] = [];
+	let current: { h: Handoff; started: boolean; timer: ReturnType<typeof setTimeout> } | null = null;
+	const busyWith = (ids: string[]) =>
+		[...(current ? [current.h] : []), ...queue].some((h) => h.ids.some((id) => ids.includes(id)));
+	const release = () => {
+		if (current) clearTimeout(current.timer);
+		current = null;
+		pump();
+	};
+	const arm = () => {
+		const timer = setTimeout(() => {
+			deps.log?.(`[RelayAgent] ${current?.h.label}: no turn after the hand-off; moving on`);
+			release();
+		}, deps.confirmMs ?? HANDOFF_CONFIRM_MS);
+		timer.unref?.();
+		return timer;
+	};
+	function pump(): void {
+		if (!current && queue.length && userTurnOpen()) {
+			// Look again when the wait runs out; every user turn that ends starts it over.
+			const until = speakingHold()
+				? userStartedAt + (deps.confirmMs ?? HANDOFF_CONFIRM_MS)
+				: (userEndedAt ?? now()) + (deps.userReplyWaitMs ?? USER_REPLY_WAIT_MS);
+			if (userTimer) clearTimeout(userTimer);
+			userTimer = setTimeout(() => { userTimer = null; pump(); }, Math.max(0, until - now()));
+			userTimer.unref?.();
+			return;
+		}
+		while (!current && queue.length) {
+			const h = queue.shift()!;
+			if (h.moot?.()) { deps.log?.(`[RelayAgent] ${h.label}: already heard or corrected; not said`); continue; }
+			if (!h.hand()) { h.fallback(); continue; }
+			current = { h, started: false, timer: arm() };
+		}
+	}
+	return {
+		/** Queue a result; one already queued or on its way for the same task is not queued twice. */
+		submit(h: Handoff): void {
+			if (h.ids.length && busyWith(h.ids)) return;
+			queue.push(h);
+			pump();
+		},
+		onUserSpeechStarted(e?: SpeechEvent): void {
+			if (!fromClient(e)) return;
+			userSpeaking = true;
+			userStartedAt = now();
+		},
+		onUserSpeechEnded(e?: SpeechEvent): void {
+			if (!fromClient(e)) return;
+			userSpeaking = false;
+			userEndedAt = now();
+			if (!current) pump();
+		},
+		onTurnStart(): void {
+			spoke = false;
+			if (current) current.started = true;
+		},
+		/** The model's audio began in this turn. */
+		onModelAudio(): void {
+			spoke = true;
+		},
+		onTurnEnd(interrupted: boolean): void {
+			const spokeInTurn = spoke;
+			spoke = false;
+			// A silent turn (a tool call only) answered nothing and said nothing.
+			if (!spokeInTurn) return;
+			// A finished, spoken model turn answered whatever the user had said.
+			if (!interrupted && !userSpeaking) {
+				userEndedAt = null;
+				if (userTimer) { clearTimeout(userTimer); userTimer = null; }
+				if (!current) pump();
+			}
+			if (!current?.started) return;
+			// The model began saying it: said once is said. A cut-off is not a reason to say it again (a
+			// short sound after a finished sentence counts as a cut-off), and the table reads it as heard.
+			if (interrupted) deps.log?.(`[RelayAgent] ${current.h.label}: answer cut off; not said again`);
+			deps.markSpoken(current.h.ids);
+			release();
+		},
+		/** Whether a result for this task is queued or on its way to the model. */
+		has(taskId: string): boolean {
+			return busyWith([taskId]);
+		},
+		get pending(): number {
+			return queue.length + (current ? 1 : 0);
+		},
+	};
+}
+
+/** The last `n` spoken lines of the live conversation, oldest first, as "user: …" / "assistant: …". System lines are left out. */
+export function recentConversationLines(items: ReadonlyArray<{ role?: string; content?: string }>, n: number): string {
+	return items
+		.filter((i) => (i.role === 'user' || i.role === 'assistant') && i.content?.trim() && !i.content.startsWith('[System:'))
+		.slice(-n)
+		.map((i) => `${i.role}: ${i.content!.replace(/\s+/g, ' ').trim()}`)
+		.join('\n');
+}
+
+/** A question waiting for the model to stop speaking is put anyway after this long. */
+export const ASK_WAIT_MAX_MS = 15_000;
+
+/**
+ * Puts the relay's question to the user as live input as soon as the model is not speaking: at once when it
+ * is quiet, else when its turn ends (or after ASK_WAIT_MAX_MS). Only the newest question waits.
+ */
+export function createAskDelivery(deps: { inject: (text: string) => void; maxWaitMs?: number; log?: (m: string) => void }) {
+	let speaking = false;
+	let waiting: { text: string; timer: ReturnType<typeof setTimeout> } | null = null;
+	const flush = () => {
+		if (!waiting) return;
+		const { text, timer } = waiting;
+		clearTimeout(timer);
+		waiting = null;
+		deps.inject(text);
+	};
+	return {
+		ask(text: string): void {
+			if (!speaking) { deps.inject(text); return; }
+			if (waiting) clearTimeout(waiting.timer);
+			const timer = setTimeout(() => { deps.log?.('[RelayAgent] the model is still speaking; asking anyway'); flush(); }, deps.maxWaitMs ?? ASK_WAIT_MAX_MS);
+			timer.unref?.();
+			waiting = { text, timer };
+		},
+		onModelAudio(): void { speaking = true; },
+		onTurnEnd(): void { speaking = false; flush(); },
+	};
 }
 
 /** Submits one `work` call to the core: the tool's own execute, returning its status object. */
@@ -170,8 +453,24 @@ export interface RelayAgentDeps {
 	store: VoiceTaskStore;
 	/** Says a line to the model now (the queue position at submission). */
 	notice?: (text: string) => void;
+	/** Holds each call until the user has finished speaking. Without it, calls are submitted at once. */
+	speech?: SpeechGate;
+	/** Decides, before a request is submitted, whether the user must first be asked for a missing piece. */
+	check?: WorkRequestCheck;
+	/** The recent conversation the check reads. */
+	recentConversation?: () => string;
+	/** Looks at every finished user turn, whatever tool the voice model chose: is it a request for the core? */
+	classify?: TurnClassifier;
+	/** Has the voice model put a question to the user as soon as it stops speaking (falls back to `notice`). */
+	ask?: (text: string) => void;
 	log?: (msg: string) => void;
 }
+
+/** After the user was asked about a request, the next call within this window is sent as it is. */
+export const ONE_ASK_WINDOW_MS = 2 * 60_000;
+
+/** A request sent this long ago and still unanswered is compared with new ones (a repeat is not sent twice). */
+export const OPEN_TASK_WINDOW_MS = 30 * 60_000;
 
 interface Waiter {
 	resolve: (text: string) => void;
@@ -179,7 +478,9 @@ interface Waiter {
 }
 
 /** How a waiting call ends without its result. bodhi reads a rejection out as a failure, so none rejects. */
-const ENDED: Record<'cancelled' | 'continuing' | 'delivered_separately', string> = {
+const ENDED: Record<'cancelled' | 'continuing' | 'delivered_separately' | 'continued_in_next' | 'not_sent', string> = {
+	not_sent: 'This call was cancelled before the request was sent; nothing was submitted.',
+	continued_in_next: 'The user was not finished: this request was sent together with what they said next. Say nothing about it.',
 	cancelled: 'The user cancelled this task and was already told. Do not mention it again.',
 	continuing: 'The task is still running; its result will come in a separate message.',
 	delivered_separately: 'This task\'s result is delivered to the user separately. Say nothing about it now.',
@@ -193,13 +494,147 @@ const ENDED: Record<'cancelled' | 'continuing' | 'delivered_separately', string>
 export class RelayAgent implements PersistentSubagentInstance {
 	readonly key = 'relay-agent';
 	private readonly waiting = new Map<string, Waiter>();
+	/** The call waiting for the user to finish speaking, not yet submitted. */
+	private holding: { args: Record<string, unknown>; joined: boolean } | null = null;
+
+	/** When the voice model last called `work`: a turn it covered itself is not sent again by the turn check. */
+	private lastWorkCallAt = 0;
+	/** When the work check last had the user asked: the next call's answer is sent as it is. */
+	private askedAt = 0;
+	/** User turns waiting for the turn check (several when the user went on speaking). */
+	private turns: Array<{ text: string; at: number }> = [];
+	private turnsRunning = false;
+	/** When the last turn the turn check took ended: a `work` call after it belongs to the next turn. */
+	private lastTurnAt = 0;
 
 	constructor(private readonly deps: RelayAgentDeps) {}
 
+	/** Tasks sent and not answered yet, newest last: what a new request is compared with. */
+	openTasks(now = Date.now()): OpenTask[] {
+		return this.deps.store.list()
+			.filter(([, r]) => !!r.text && !r.delivery && !r.cancelRequested && !r.retired && !r.supersededBy && !r.answeredBy && (r.submittedAt ?? r.at) > now - OPEN_TASK_WINDOW_MS)
+			.map(([id, r]) => ({ id, text: r.text as string }));
+	}
+
+	/**
+	 * The user finished a turn. The turn check decides whether it asks the core for something, whichever
+	 * tool the voice model chose (2026-10-12: "帮我查一下 5334 的状态" went to get_task_status and was lost).
+	 * A turn the voice model already sent with `work` is left to that call.
+	 */
+	onUserTurn(text: string, at = Date.now()): void {
+		const t = text.trim();
+		if (!this.deps.classify || !t || t.startsWith('[System:')) return;
+		this.turns.push({ text: t, at });
+		if (!this.turnsRunning) void this.drainTurns();
+	}
+
+	private async drainTurns(): Promise<void> {
+		this.turnsRunning = true;
+		try {
+			while (this.turns.length) {
+				// One request may span several turns: wait until the user is done, then take them together.
+				if (this.deps.speech) await this.deps.speech.waitTurnOver();
+				const taken = this.turns.splice(0);
+				const since = this.lastTurnAt;
+				this.lastTurnAt = taken[taken.length - 1].at;
+				if (this.lastWorkCallAt > since) continue; // the voice model sent it itself
+				const openTasks = this.openTasks();
+				const verdict = await this.deps.classify!({
+					utterance: taken.map((x) => x.text).join(' '),
+					recentConversation: this.deps.recentConversation?.() ?? '',
+					openTasks,
+				}).catch(() => ({ action: 'none' as const }));
+				if (this.lastWorkCallAt > since) continue; // the voice model's own call came in while the check ran
+				await this.actOnTurn(verdict);
+			}
+		} catch (err) {
+			this.deps.log?.(`[RelayAgent] turn check failed: ${err instanceof Error ? err.message : String(err)}`);
+		} finally {
+			this.turnsRunning = false;
+		}
+	}
+
+	private async actOnTurn(verdict: Awaited<ReturnType<TurnClassifier>>): Promise<void> {
+		if (verdict.action === 'none') return;
+		if (verdict.action === 'duplicate') {
+			this.deps.log?.(`[RelayAgent] the user asked again for ${verdict.of}; not sent twice`);
+			return;
+		}
+		if (verdict.action === 'ask') {
+			this.deps.log?.(`[RelayAgent] turn not sent, asking the user: ${verdict.question}`);
+			const line = framedSystem(`What the user just asked cannot be sent to the core yet. Ask them now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}"`);
+			// Not the notification queue: it can sit behind the model's own answer and the next turn (2026-10-13 00:41:
+			// decided at :16, said at :35, after an unrelated noise turn).
+			(this.deps.ask ?? this.deps.notice)?.(line);
+			return;
+		}
+		const submitted = await this.deps.submit({ task: verdict.task });
+		const taskId = submitted.taskId;
+		if (submitted.status !== 'pending' || typeof taskId !== 'string') {
+			this.deps.log?.(`[RelayAgent] turn check: the request was not taken (${String(submitted.status)})`);
+			return;
+		}
+		this.deps.log?.(`[RelayAgent] ${taskId}: sent by the turn check (the voice model had not called work): ${verdict.task}`);
+		// Its result comes like any other with no call waiting: handed to the model when it can speak.
+		this.deps.notice?.(framedSystem(`This request was sent to the core for the user: "${verdict.task.replace(/"/g, "'")}". If you have not already, tell the user in one short sentence that it is being looked into. Do not call work for it.`));
+	}
+
 	async invoke(_task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+		this.lastWorkCallAt = Date.now();
+		if (this.deps.speech) {
+			// A call made while an earlier one still waits for the user's turn to end: the model has not
+			// answered in between, the user went on speaking, so the two are one request. The earlier
+			// call ends; this one carries both.
+			const earlier = this.holding;
+			if (earlier) {
+				earlier.joined = true;
+				args = {
+					...earlier.args,
+					...args,
+					task: joinCutOffRequest(String(earlier.args.task ?? ''), String(args.task ?? '')),
+				};
+				this.deps.log?.('[RelayAgent] the user went on speaking: the earlier request is sent with this one');
+			}
+			const mine = { args, joined: false };
+			this.holding = mine;
+			await this.deps.speech.waitTurnOver(signal);
+			if (mine.joined) return framedSystem(ENDED.continued_in_next);
+			if (this.holding === mine) this.holding = null;
+		}
+		// bodhi cancelled the call (tool cancellation, the session closing) while it waited for the user or the check.
+		if (signal?.aborted) return framedSystem(ENDED.not_sent);
+		if (this.deps.check) {
+			// A request with a blank in it (which PR? which file?) is not submitted: the user is asked.
+			const verdict = await this.deps.check({ task: String(args.task ?? ''), recentConversation: this.deps.recentConversation?.() ?? '', openTasks: this.openTasks() }, signal)
+				.catch(() => ({ action: 'submit' as const }));
+			if (signal?.aborted) return framedSystem(ENDED.not_sent);
+			// One question per request: the answer is sent as it is, even if the check still finds it vague
+			// ("the latest one") - the user is not interrogated (review of #5348).
+			if (verdict.action === 'ask' && Date.now() - this.askedAt < ONE_ASK_WINDOW_MS) {
+				this.deps.log?.(`[RelayAgent] the user was already asked about this; sending it as it is`);
+			} else if (verdict.action === 'ask') {
+				this.askedAt = Date.now();
+				this.deps.log?.(`[RelayAgent] not submitted, asking the user: ${verdict.question}`);
+				return framedSystem(`Nothing was submitted: the request does not say what it is about. Ask the user now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}" Then, with their answer, call work again.`);
+			}
+			if (verdict.action === 'duplicate') {
+				// The same request is already with the core (2026-10-12: PR 5333 was sent twice). This call
+				// waits for that task's result instead, unless another call already does.
+				this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again; not sent twice`);
+				if (this.waiting.has(verdict.of)) return framedSystem('This request was already sent to the core and its result will be told when it comes. Tell the user so in one short sentence.');
+				return new Promise<string>((resolve, reject) => {
+					this.waiting.set(verdict.of, { resolve, reject });
+					signal?.addEventListener('abort', () => { this.endCall(verdict.of, 'continuing'); }, { once: true });
+				});
+			}
+		}
+		this.askedAt = 0; // this request goes; the next vague one may be asked about again
 		const submitted = await this.deps.submit(args);
 		const taskId = submitted.taskId;
 		if (submitted.status !== 'pending' || typeof taskId !== 'string') return JSON.stringify(submitted);
+		const replaces = typeof args.replaces === 'string' ? args.replaces.trim() : '';
+		if (replaces) this.supersede(taskId, replaces);
+
 		// The ordinary "working on it" is the tool's pending message; a queue position or an offline core is said now.
 		const unusual = (typeof submitted.queuedAhead === 'number' && submitted.queuedAhead > 0) || submitted.watcherOnline === false;
 		if (unusual && typeof submitted.message === 'string') this.deps.notice?.(framedSystem(submitted.message));
@@ -231,6 +666,34 @@ export class RelayAgent implements PersistentSubagentInstance {
 			other.resolve(JSON.stringify({ status: 'answered_together', taskId: id, answeredIn: taskId }));
 		}
 		return true;
+	}
+
+	/**
+	 * The model said this task corrects an earlier request (`replaces` names it: a task id, or the
+	 * misheard number or quoted name). Only a whole mark counts, never a word like "PR" (review of
+	 * #5348, B4: `replaces: 'pr'` superseded every unheard request), and only the most recent unheard
+	 * request that carries it is superseded: its result is not said, and its waiting call ends.
+	 */
+	private supersede(taskId: string, replaces: string): void {
+		const since = Date.now() - SUPERSEDE_WINDOW_MS;
+		const byId = /^task-\d+$/.test(replaces);
+		const marks = byId ? [] : requestMarks(replaces);
+		if (!byId && marks.length === 0) {
+			this.deps.log?.(`[RelayAgent] ${taskId}: "replaces" names no task or number (${replaces}); nothing corrected`);
+			return;
+		}
+		const target = this.deps.store.list()
+			.filter(([id, row]) => id !== taskId && row.delivery !== 'spoken' && !row.supersededBy && (row.submittedAt ?? 0) >= since)
+			.filter(([id, row]) => byId ? id === replaces : marks.every((m) => requestMarks(row.text ?? '').includes(m)))
+			.pop();
+		if (!target) {
+			this.deps.log?.(`[RelayAgent] ${taskId}: no unheard request carries "${replaces}"; nothing corrected`);
+			return;
+		}
+		const [id] = target;
+		this.deps.store.setSupersededBy(id, taskId);
+		this.endCall(id, 'delivered_separately');
+		this.deps.log?.(`[RelayAgent] ${id}: corrected by ${taskId}; its result will not be said`);
 	}
 
 	/** Ends the call waiting on `taskId` without its result. False when none waits. */

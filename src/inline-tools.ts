@@ -819,21 +819,55 @@ export function readQueueDepth(workspaceDir: string, nowSec = Math.floor(Date.no
 }
 
 /** The user's voice tasks in one sentence for the model, grouped by where each stands now. */
+const heardByUser = (r: VoiceTaskRow) => r.delivery === 'spoken' || r.delivery === 'injected';
+
+/**
+ * What "pending" means to the user: tasks whose answer they have not heard yet. The core may have
+ * finished one whose result still waits to be read to them; to the user it is pending until then.
+ */
+export function voiceTaskCounts(rows: VoiceTaskRow[]): { pending: number; working: number; doneNotHeard: number } {
+	const live = rows.filter((r) => r.state !== 'cancelled' && !r.retired);
+	const working = live.filter((r) => r.state === 'queued' || r.state === 'started').length;
+	const doneNotHeard = live.filter((r) => r.state !== 'queued' && r.state !== 'started' && !heardByUser(r)).length;
+	return { pending: working + doneNotHeard, working, doneNotHeard };
+}
+
+/**
+ * The relay agent's table as the user can see it live: `state/voice-task-status.json`, written by the
+ * voice agent whenever it changes and served by the web client at /voice-tasks. Same rows, same counts
+ * as get_task_status, so there is one number.
+ */
+export function voiceTaskStatusSnapshot(rows: VoiceTaskRow[], now = Date.now()): {
+	at: number; pending: number; working: number; doneNotHeard: number;
+	tasks: Array<{ id: string; text: string; submittedAt: number; state: string; delivery: string | null; heard: boolean; retired: boolean; pending: boolean }>;
+} {
+	const c = voiceTaskCounts(rows);
+	const tasks = [...rows].sort((a, b) => b.submittedAt - a.submittedAt).map((r) => {
+		const heard = heardByUser(r);
+		const live = r.state !== 'cancelled' && !r.retired;
+		return { id: r.id, text: r.text, submittedAt: r.submittedAt, state: r.state, delivery: r.delivery ?? null, heard, retired: !!r.retired, pending: live && !heard };
+	});
+	return { at: now, ...c, tasks };
+}
+
 export function describeVoiceTasks(rows: VoiceTaskRow[]): string {
 	if (rows.length === 0) return 'The user has asked for no tasks by voice in the last few hours.';
 	const group = (label: string, pick: (r: VoiceTaskRow) => boolean) => {
 		const hit = rows.filter(pick);
 		return hit.length ? `${hit.length} ${label} (${hit.map((r) => `"${r.text.slice(0, 40)}"`).join(', ')})` : '';
 	};
-	const heard = (r: VoiceTaskRow) => r.delivery === 'spoken' || r.delivery === 'injected';
+	const heard = heardByUser;
+	const c = voiceTaskCounts(rows);
+	const headline = `Pending for the user: ${c.pending} (they have not heard an answer to these yet: ${c.working} the core is still working on, ${c.doneNotHeard} finished and waiting to be read to them). `;
 	const parts = [
-		group('in progress', (r) => r.state === 'started'),
-		group('queued', (r) => r.state === 'queued'),
+		group('the core is working on', (r) => r.state === 'started' && !r.retired),
+		group('queued at the core', (r) => r.state === 'queued' && !r.retired),
 		group('cancelled', (r) => r.state === 'cancelled'),
-		group('done and already told to the user', (r) => r.state === 'done' && heard(r)),
-		group('done but the user has not heard the result yet', (r) => r.state === 'done' && !heard(r)),
+		group('ended with nothing to say', (r) => !!r.retired && r.state !== 'cancelled'),
+		group('done and already told to the user', (r) => r.state === 'done' && !r.retired && heard(r)),
+		group('done but the user has not heard the result yet', (r) => r.state !== 'queued' && r.state !== 'started' && r.state !== 'cancelled' && !r.retired && !heard(r)),
 	].filter(Boolean);
-	return `Tasks the user asked for by voice: ${parts.join('; ')}.`;
+	return `${headline}Tasks the user asked for by voice: ${parts.join('; ')}.`;
 }
 
 // Get what the core agent (Claude Code proactive-loop) is currently doing.

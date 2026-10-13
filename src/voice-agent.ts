@@ -32,7 +32,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { notify as platformNotify } from './platform.js';
-import { inlineTools, personalSkillSetups, personalVoiceSurface, describeVoiceTasks } from './inline-tools.js';
+import { inlineTools, personalSkillSetups, personalVoiceSurface, describeVoiceTasks, voiceTaskCounts, voiceTaskStatusSnapshot } from './inline-tools.js';
 import { createClientFrameHub } from './client-frame-hub.js';
 import { runSkillSetups } from './skill-setup-runner.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
@@ -74,7 +74,9 @@ import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLoc
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
-import { RelayAgent, relayAgentSubagentConfig } from './relay-agent.js';
+import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines, createAskDelivery } from './relay-agent.js';
+import { createVoiceTaskStatusWriter } from './voice-task-status-writer.js';
+import { createGeminiTurnClassifier, createGeminiWorkCheck, WORK_CHECK_MODEL } from './work-request-check.js';
 import {
 	classifyTransportClose,
 	fatalCloseForRecovery,
@@ -280,7 +282,7 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 // googleSearch=false for low-latency voice conversations; this PR does not
 // claim a new code-heavy workload benchmark. Phone inherits the
 // package default (2.5+search) unless its own config overrides it.
-import { loadVoiceConfig, migrateLegacyModel, revertModelMigration, resolveSessionTuning } from './voice-config.js';
+import { loadVoiceConfig, migrateLegacyModel, revertModelMigration, resolveSessionTuning, resolveRelayCheck } from './voice-config.js';
 import { fireGuardedRestart, isVoiceAgentLaunchdManaged, restartAfterModelRevert } from './voice-config-switch.js';
 const _voiceAgentDir = dirname(fileURLToPath(import.meta.url));
 const VOICE_AGENT_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'voice-agent.json');
@@ -311,6 +313,8 @@ const VOICE_SHADOW_STT = VOICE_AGENT_CONFIG.shadowStt === true;
 // "divergenceCorrection": true additionally speaks a self-correction when
 // the shadow pass disagrees. Requires shadowStt.
 const VOICE_DIVERGENCE_CORRECTION = VOICE_AGENT_CONFIG.divergenceCorrection === true;
+// The relay agent's text-model checks: on by default; "relayCheck": false turns them off, {"model": …} picks the model.
+const RELAY_CHECK = resolveRelayCheck(VOICE_AGENT_CONFIG, WORK_CHECK_MODEL);
 // Phase 0.5 seams (design §2.1/§2.2): OFF unless configured — with nothing
 // set the VoiceSession config carries neither key and the wire behaviour is
 // byte-identical to the previous build (the Phase 0.5 gate). A half-set or
@@ -485,17 +489,24 @@ const getTaskStatus: ToolDefinition = {
 	description:
 		'Check the tasks the user asked for by voice and where each stands now (queued, in progress, cancel requested, done, and whether the user heard the result). ' +
 		'Use for status/progress questions like "any pending tasks?", "how many tasks are there?", "are you working on something?". ' +
+		'pendingTasks is the number to give for "how many pending": tasks whose answer the user has not heard yet, whether the core is still working on them or finished and the result is still to be read. ' +
 		'Always call it for these: never answer from memory, the state changes. Do NOT call work just to check progress.',
 	parameters: z.object({}),
 	execution: 'inline',
 	execute: async () => {
 		// The relay agent's table, the same source as the in-line count and get_core_status.
 		const rows = voiceTaskRows();
-		const open = rows.filter((r) => r.state === 'queued' || r.state === 'started');
+		// Pending as the user counts it: not heard an answer yet. 2026-10-11: the core had finished a task
+		// whose result still waited to be read, the count left it out, and the user heard "2" for 3.
+		const counts = voiceTaskCounts(rows);
+		// What the tool said, so a wrong number out loud can be laid against it (2026-10-12: "one" for 4).
+		console.log(`${ts()} [RelayAgent] get_task_status: pending ${counts.pending} (the core is working on ${counts.working}, done not heard ${counts.doneNotHeard})`);
 		// Counts and states only: a yes/no "in progress" flag was read as "all of them are being worked on".
 		return {
-			openTasks: open.length,
-			tasks: rows.map((r) => ({ task: r.text.slice(0, 60), state: r.state, heard: r.delivery === 'spoken' || r.delivery === 'injected' })),
+			pendingTasks: counts.pending,
+			stillBeingWorkedOn: counts.working,
+			doneNotYetHeard: counts.doneNotHeard,
+			tasks: rows.map((r) => ({ task: r.text.slice(0, 60), state: r.state, heard: r.delivery === 'spoken' || r.delivery === 'injected', ...(r.retired ? { endedWithNothingToSay: true } : {}) })),
 			description: describeVoiceTasks(rows),
 		};
 	},
@@ -978,10 +989,27 @@ async function main() {
 	});
 
 	// The relay agent runs every `work` call as a bodhi subagent: submit, then return the core's result.
+	// A `work` call waits until the user has finished speaking (subscribed once the session exists).
+	const speechGate = createSpeechGate();
+	const relayAsk = createAskDelivery({
+		inject: (text) => { void sessionRef?.injectText(text, { mode: 'live' }); },
+		log: (m) => console.log(`${ts()} ${m}`),
+	});
 	const relayAgent = new RelayAgent({
 		submit: submitWorkTask,
 		store: voiceTaskStore,
+		speech: speechGate,
+		// A text model, not the voice model, decides whether a request is complete enough to submit.
+		check: RELAY_CHECK ? createGeminiWorkCheck({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`) }) : undefined,
+		// From the live conversation, not conversation.log: the log is written asynchronously, so a check that
+		// starts right after a turn would miss the voice model's own reply (2026-10-12 00:06: it missed "哪一个餐馆？"
+		// and sent "那个餐馆的 menu" with the blank in it).
+		recentConversation: () => recentConversationLines(sessionRef?.conversationContext.items ?? [], 8) || getRecentConversation(8),
+		// Every finished user turn too, whatever tool the voice model chose: is it a request for the core?
+		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`) }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
+		// A question for the user is said as live input once the model stops speaking, not queued as a notification.
+		ask: (text) => relayAsk.ask(text),
 		log: (msg) => console.log(`${ts()} ${msg}`),
 	});
 	setVoiceTaskEndedListener((taskId, why) => { relayAgent.endCall(taskId, why); });
@@ -997,6 +1025,16 @@ async function main() {
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
 	beforeConversationClear = () => callEnd.collect();
+
+	// The task table lives in memory; the status page (/voice-tasks on the web client) reads a copy,
+	// written asynchronously after each change, as bodhi's history stores write the conversation.
+	const voiceTaskStatus = createVoiceTaskStatusWriter({
+		path: statusPath('voice-task-status.json', WORKSPACE_DIR),
+		snapshot: () => voiceTaskStatusSnapshot(voiceTaskRows()),
+		log: (m) => console.error(`${ts()} ${m}`),
+	});
+	voiceTaskStore.onChange(() => voiceTaskStatus.changed());
+	voiceTaskStatus.changed();
 
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
@@ -1419,8 +1457,12 @@ async function main() {
 	// tells the bridge whether a transcription may still be landing (no stamp within
 	// 10 s = the model started this turn itself, so the task write does not wait).
 	let lastUserSpeechAt: number | undefined;
-	session.eventBus.subscribe('speech.user_started', () => { lastUserSpeechAt = Date.now(); });
-	session.eventBus.subscribe('speech.user_ended', () => { lastUserSpeechAt = Date.now(); });
+	session.eventBus.subscribe('speech.user_started', (e: { source?: string }) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechStarted(e); });
+	session.eventBus.subscribe('speech.user_ended', (e: { source?: string }) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechEnded(e); });
+	session.eventBus.subscribe('response.first_audio', () => speechGate.onModelAudio());
+	// The relay's question for the user waits only while the model is speaking.
+	session.eventBus.subscribe('response.first_audio', () => relayAsk.onModelAudio());
+	session.eventBus.subscribe('turn.end', () => relayAsk.onTurnEnd());
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const speechHost = session as any;
 	setVoiceTurnsProvider(() => ({
@@ -1458,6 +1500,8 @@ async function main() {
 				// speech and shouldn't unlock end_session.
 				if (item.role === 'user' && item.content && !item.content.startsWith('[System:')) {
 					userTurnCount++;
+					// The relay agent looks at every request, not only the ones the voice model sent with work.
+					relayAgent.onUserTurn(item.content);
 				}
 			}
 		}

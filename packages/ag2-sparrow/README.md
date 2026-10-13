@@ -215,7 +215,8 @@ Each wake carries, per message, `room_id`, `event_id`, `thread_root`, `sender`,
 `snippet` (the message's first line, without a Matrix reply fallback), plus a
 `worker_note` with the rules: touch the activity marker first, answer from the
 snippet, and post each reply with `ag2-sparrow-hatch reply <result_file>`, the
-text on stdin. `install` writes that command's absolute path into the prompt
+text on stdin, tagging anyone by full Matrix ID (`@name:server`), never a
+short `@name`. `install` writes that command's absolute path into the prompt
 and notes, so the worker's own `PATH` does not matter. The command writes the
 item's `result_file` once (a second reply to the same task is refused), and
 Sparrow sends it through its own outbox as a reply to the message (in its thread

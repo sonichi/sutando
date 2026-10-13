@@ -52,6 +52,10 @@ export interface VoiceConfig {
 	divergenceCorrection: boolean;
 	/** Per-channel overrides, keyed by voice channel id. */
 	channels: Record<string, VoiceChannelConfig>;
+	/** The relay agent's text-model checks (is a request complete, is it a request for the core, was it
+	 *  already sent). ABSENT = on with the default model. `false` = off: requests go as the voice model
+	 *  writes them. `{ "model": "…" }` picks the model; `{ "enabled": false }` is also off. */
+	relayCheck?: { enabled?: boolean; model?: string } | false;
 	/** Phase 0.5 seam (design §2.1): context-window compression. ABSENT = take
 	 *  whatever the built-in default says. `{}` = on with the SERVER's defaults
 	 *  (trigger at 80% of the model limit, target half the trigger). Explicit
@@ -384,4 +388,16 @@ export function revertModelMigration(configPath: string, now: Date = new Date())
 	writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
 	renameSync(tmp, configPath);
 	return { reverted: true, model, reason: 'migrated model unavailable' };
+}
+
+/** The relay check's model, or null when the owner turned the check off. Anything malformed means the default. */
+export function resolveRelayCheck(cfg: Pick<VoiceConfig, 'relayCheck'>, defaultModel: string): { model: string } | null {
+	const rc = cfg.relayCheck as unknown;
+	if (rc === false) return null;
+	if (rc && typeof rc === 'object') {
+		const o = rc as { enabled?: unknown; model?: unknown };
+		if (o.enabled === false) return null;
+		if (typeof o.model === 'string' && o.model.trim()) return { model: o.model.trim() };
+	}
+	return { model: defaultModel };
 }
