@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from hitl.manager import HitlManager, HitlStore  # noqa: E402
+from hitl.manager import HitlManager, HitlStore, archive_health  # noqa: E402
 from hitl.projector import (  # noqa: E402
     fallback_body,
     pending_ids,
@@ -282,9 +282,53 @@ class ArchiveTests(unittest.TestCase):
         settled = self.settled()
         self.mgr.store.archive_root.write_text("not a dir")
         card = self.mgr.create(make_req(kind="choice", guard="g2"))
-        with self.assertLogs("hitl.projector", level="WARNING"):
+        with self.assertLogs("hitl.store", level="WARNING"):
             self.assertEqual(pending_ids(self.mgr), [card.id])
         self.assertEqual(self.live(), sorted([settled.id, card.id]))
+
+    def test_a_persistent_failure_warns_once_per_id(self):
+        a = self.settled()
+        b = self.mgr.create(make_req(kind="choice", guard="gb"))
+        project(self.mgr, self.send, ROOM)
+        self.mgr.resolve(b.id)
+        project(self.mgr, self.send, ROOM)
+        self.mgr.store.archive_root.write_text("not a dir")
+        with self.assertLogs("hitl.store", level="WARNING") as logs:
+            pending_ids(self.mgr)
+        self.assertEqual(len(logs.records), 2)
+        for _ in range(3):  # later pulses, and a fresh store object as the gateway makes
+            with self.assertNoLogs("hitl.store"):
+                pending_ids(HitlManager(HitlStore(self.root)))
+        self.assertEqual(self.live(), sorted([a.id, b.id]))
+
+    def test_failures_are_published_for_health_and_clear_when_fixed(self):
+        self.settled()
+        self.mgr.store.archive_root.write_text("not a dir")
+        with self.assertLogs("hitl.store", level="WARNING"):
+            pending_ids(self.mgr)
+        h = archive_health(self.root)
+        self.assertEqual((h["live"], h["failures"]), (1, 1))
+        self.assertIn("FileExistsError", h["error"])
+        self.mgr.store.archive_root.unlink()
+        pending_ids(self.mgr)
+        self.assertEqual((archive_health(self.root)["live"], archive_health(self.root)["failures"]),
+                         (0, 0))
+
+    def test_a_failing_record_that_leaves_the_live_set_stops_counting(self):
+        req = self.settled()
+        self.mgr.store.archive_root.write_text("not a dir")
+        with self.assertLogs("hitl.store", level="WARNING"):
+            pending_ids(self.mgr)
+        self.mgr.store._path(req.id).unlink()
+        pending_ids(self.mgr)
+        self.assertEqual(archive_health(self.root)["failures"], 0)
+
+    def test_a_healthy_store_publishes_zero_failures(self):
+        self.settled()
+        pending_ids(self.mgr)
+        self.assertEqual(archive_health(self.root)["failures"], 0)
+        self.assertTrue((self.root / ".archive-status.json").exists())
+        self.assertIsNone(archive_health(self.root.parent / "absent"))
 
     def archive_on_first_read(self, req_id):
         """Read the live file only after another writer has archived it."""

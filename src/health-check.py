@@ -2921,6 +2921,35 @@ def check_onboarding_status() -> "dict | None":
             "detail": f"all checklist rows satisfied ({_age_phrase(age_s)})"}
 
 
+#: A live HITL store this large means settled records stopped being archived;
+#: the gateway re-reads every live record each second.
+HITL_LIVE_WARN = 200
+
+
+def check_hitl_archive() -> "dict | None":
+    """Warn when the HITL archive step is failing or the live store regrew.
+
+    None when this host has no HITL store. Read-only; never raises.
+    """
+    name = "hitl-archive"
+    try:
+        from hitl.manager import archive_health, default_store
+        h = archive_health(default_store(WORKSPACE_DIR))
+    except Exception as e:  # noqa: BLE001 — an optional tier never breaks the report
+        return {"name": name, "status": "warn", "detail": f"hitl store unreadable ({e})"}
+    if h is None:
+        return None
+    problems = []
+    if h["failures"]:
+        problems.append(f"{h['failures']} settled record(s) failing to archive ({h['error']})")
+    if h["live"] > HITL_LIVE_WARN:
+        problems.append(f"{h['live']} live records (> {HITL_LIVE_WARN}); the gateway re-reads "
+                        f"each one every second")
+    if problems:
+        return {"name": name, "status": "warn", "detail": "; ".join(problems)}
+    return {"name": name, "status": "ok", "detail": f"{h['live']} live records, archive healthy"}
+
+
 def check_host_subtrees() -> dict:
     """Surface per-host subtrees (hosts/<host>/) that have stopped syncing.
 
@@ -13025,6 +13054,9 @@ def run_all_checks() -> list[dict]:
     checks.append(check_skills_driver_code_drift())
     checks.append(check_sync_conflicts_unmerged())
     checks.append(check_engine_revision_drift())
+    hitl_archive_check = check_hitl_archive()
+    if hitl_archive_check is not None:
+        checks.append(hitl_archive_check)
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
         checks.append(onboarding_check)

@@ -58,6 +58,32 @@ def _activity(task_ids, to_phase: str, reason: str) -> None:
         pass
 
 
+# Per process, keyed by store root: ids already warned about, and the failure
+# count last published for health-check.
+_ARCHIVE_WARNED: set = set()
+_ARCHIVE_PUBLISHED: Dict[str, int] = {}
+ARCHIVE_STATUS_NAME = ".archive-status.json"  # in the root: no glob sees it
+
+
+def archive_health(store_root: Path) -> Optional[Dict]:
+    """What health-check reads: live record count plus the published archive
+    failures, or None when this host has no store."""
+    root = Path(store_root)
+    if not root.is_dir():
+        return None
+    status: Dict = {}
+    try:
+        status = json.loads((root / ARCHIVE_STATUS_NAME).read_text())
+    except (OSError, ValueError):
+        pass
+    if not isinstance(status, dict):
+        status = {}
+    return {"live": sum(1 for _ in root.glob("hitl_*.json")),
+            "failures": int(status.get("failures") or 0),
+            "error": str(status.get("error") or ""),
+            "updated_at": status.get("updated_at")}
+
+
 def default_store(workspace: Optional[Path] = None) -> Path:
     """Where every hitl component on a host keeps requirements: the hook driver
     writes here, the supervisor projects from here. One store, one card."""
@@ -140,6 +166,31 @@ class HitlStore:
             self.archive_root.mkdir(parents=True, exist_ok=True)
             os.replace(src, self.archive_root / src.name)
             return True
+
+    def report_archive_failures(self, failures: Dict[str, BaseException], now: float) -> None:
+        """Take one pulse's archive failures: warn once per id per process, and
+        publish the count for health-check when it changed."""
+        key = str(self.root)
+        for req_id, err in failures.items():
+            if (key, req_id) not in _ARCHIVE_WARNED:
+                _ARCHIVE_WARNED.add((key, req_id))
+                logging.getLogger("hitl.store").warning("hitl: could not archive %s: %s", req_id, err)
+        if _ARCHIVE_PUBLISHED.get(key) == len(failures):
+            return
+        first = next(iter(failures.values()), None)
+        payload = {"failures": len(failures),
+                   "error": f"{type(first).__name__}: {first}" if first else "", "updated_at": now}
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=key, prefix=".tmp-")
+            with os.fdopen(fd, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, self.root / ARCHIVE_STATUS_NAME)
+        except OSError:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+            return  # reporting never blocks delivery; retried next pulse
+        _ARCHIVE_PUBLISHED[key] = len(failures)
 
     def load(self, req_id: str) -> Optional[HumanRequirement]:
         raw = self._load_raw(req_id)
