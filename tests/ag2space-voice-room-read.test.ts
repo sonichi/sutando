@@ -23,6 +23,7 @@ if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => 
 if (PRESENT) {
 const {
 	findAg2SpaceMcpEntry, createMcpStdioClient, mcpPayload, pickRoom, toMessageLines, readRoom, createReadRoomTool,
+	listRooms, createRoomIndex, roomIndexContextLines, createListRoomsTool, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_READ_CALL_TIMEOUT_MS,
 	ROOM_READ_BODY_MAX, ROOM_READ_DEFAULT_LIMIT, ROOM_READ_PROMPT_RULE,
 } = await import(pathToFileURL(join(PLUGIN_DIR, 'room-read.ts')).href);
 
@@ -115,10 +116,13 @@ describe('a spoken room name → one room', () => {
 	it('an exact name wins over other matches, ignoring case and spacing', () => {
 		assert.deepEqual(pickRoom('sutando  triage', rooms), { ok: true, room: rooms[0] });
 	});
-	it('one candidate is that room; several are ambiguous with their names; none is not_found', () => {
-		assert.deepEqual(pickRoom('triage sys', [rooms[1]]), { ok: true, room: rooms[1] });
+	it('one room containing what was said is it; several are ambiguous with their names; none is not_found', () => {
+		assert.deepEqual(pickRoom('triage sys', rooms), { ok: true, room: rooms[1] });
+		assert.deepEqual(pickRoom('the Sutando Triage room', rooms), { ok: true, room: rooms[0] }, 'the name inside more words');
 		assert.deepEqual(pickRoom('triage', rooms), { ok: false, error: 'ambiguous', candidates: ['Sutando Triage', 'triage system'] });
 		assert.deepEqual(pickRoom('GTM', []), { ok: false, error: 'not_found' });
+		// 2026-10-13 17:41: "Sutando Triage" was heard as "Sutando Triaging"; no guessing here — the model sees the index.
+		assert.deepEqual(pickRoom('Sutando Triaging', rooms), { ok: false, error: 'not_found' });
 	});
 });
 
@@ -137,6 +141,77 @@ describe('messages are given oldest first and short enough to retell', () => {
 	});
 });
 
+describe('the room index: the rooms the agent can read, with their real names', () => {
+	type Call = { name: string; args: Record<string, unknown>; timeoutMs?: number };
+	const fake = (handler: (name: string, args: Record<string, unknown>) => unknown) => {
+		const calls: Call[] = [];
+		return {
+			calls,
+			client: { async callTool(name: string, args: Record<string, unknown>, timeoutMs?: number) { calls.push({ name, args, timeoutMs }); const r = handler(name, args); if (r instanceof Error) throw r; return r; }, close() {} },
+		};
+	};
+
+	it('lists the rooms the agent is in, following pages, named rooms only', async () => {
+		const f = fake((_n, args) => args.cursor
+			? { structuredContent: { rooms: [{ room_id: '!c:x', name: 'Bodhi-migration' }], next_cursor: null } }
+			: { structuredContent: { rooms: [{ room_id: '!a:x', name: 'Sutando Triage' }, { room_id: '!dm:x', name: '' }, { room_id: '!b:x', name: ' triage system ' }], next_cursor: 'p2' } });
+		assert.deepEqual(await listRooms(f.client), [{ room_id: '!a:x', name: 'Sutando Triage' }, { room_id: '!b:x', name: 'triage system' }, { room_id: '!c:x', name: 'Bodhi-migration' }]);
+		assert.deepEqual(f.calls.map(c => c.args), [{ scope: 'self', limit: 50 }, { scope: 'self', limit: 50, cursor: 'p2' }]);
+		const bad = fake(() => ({ isError: true, content: [{ type: 'text', text: '{"code":"UNAUTHENTICATED"}' }] }));
+		await assert.rejects(listRooms(bad.client), /room.list: UNAUTHENTICATED/);
+	});
+
+	it('is empty before the first fetch, refreshed once at a time, kept when a refresh fails, and refreshed again when stale', async () => {
+		let now = 1_000_000;
+		let fail = false;
+		const f = fake(() => fail ? new Error('ag2-space MCP exited (1)') : { structuredContent: { rooms: [{ room_id: '!a:x', name: 'Sutando Triage' }] } });
+		const logs: string[] = [];
+		const index = createRoomIndex({ client: () => f.client, log: (m) => logs.push(m), ttlMs: 1000, now: () => now });
+		assert.deepEqual(index.rooms(), [], 'nothing yet; a fetch starts');
+		assert.equal(index.fetchedAt(), 0);
+		const [a, b] = await Promise.all([index.refresh(), index.refresh()]);
+		assert.equal(a, b);
+		assert.equal(f.calls.length, 1, 'one fetch for the first rooms() and both refresh()es');
+		assert.deepEqual(index.rooms().map(r => r.name), ['Sutando Triage']);
+		assert.equal(index.fetchedAt(), now);
+		assert.equal(f.calls.length, 1, 'fresh: no fetch');
+		fail = true;
+		await assert.rejects(index.refresh(), /exited/);
+		assert.deepEqual(index.rooms().map(r => r.name), ['Sutando Triage'], 'the last list is kept');
+		assert.ok(logs.some(l => l.includes('[RoomIndex] refresh failed')));
+		fail = false;
+		now += 1001;
+		index.rooms();
+		await new Promise(r => setImmediate(r));
+		assert.equal(f.calls.length, 3, 'stale: a background fetch');
+		assert.equal(index.fetchedAt(), now);
+		// The first fetch mints the token and lists cold (6.7 s measured): it waits longer; later ones do not.
+		assert.deepEqual(f.calls.map(c => c.timeoutMs), [ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_READ_CALL_TIMEOUT_MS, ROOM_READ_CALL_TIMEOUT_MS]);
+		assert.deepEqual(roomIndexContextLines({ rooms: () => [], refresh: async () => [], fetchedAt: () => 0 }), []);
+	});
+
+	it('the context line names every room exactly and says a heard name is matched to one of them', () => {
+		const index = { rooms: () => [{ room_id: '!a:x', name: 'Sutando Triage' }, { room_id: '!b:x', name: 'open.space launch video' }], refresh: async () => [], fetchedAt: () => 1 };
+		const [line, ...rest] = roomIndexContextLines(index);
+		assert.deepEqual(rest, []);
+		assert.match(line, /^ROOMS: AG2 Space rooms you can read with read_room: Sutando Triage \| open\.space launch video\./);
+		assert.match(line, /often misheard/);
+		assert.match(line, /spelled exactly like this/);
+	});
+
+	it('list_rooms fetches now and is inline; when the fetch fails it says so with the last list', async () => {
+		let fail = false;
+		const f = fake(() => fail ? new Error('tools/call timed out after 6000ms') : { structuredContent: { rooms: [{ room_id: '!a:x', name: 'Sutando Triage' }] } });
+		const index = createRoomIndex({ client: () => f.client });
+		const tool = createListRoomsTool({ index });
+		assert.equal(tool.name, 'list_rooms');
+		assert.equal(tool.execution, 'inline');
+		assert.deepEqual(await tool.execute({}, {} as never), { ok: true, rooms: ['Sutando Triage'] });
+		fail = true;
+		assert.deepEqual(await tool.execute({}, {} as never), { ok: false, error: 'unavailable', rooms: ['Sutando Triage'] });
+	});
+});
+
 describe('readRoom: every outcome is something the model can say', () => {
 	type Call = { name: string; args: Record<string, unknown> };
 	const fake = (handler: (name: string, args: Record<string, unknown>) => unknown) => {
@@ -148,58 +223,84 @@ describe('readRoom: every outcome is something the model can say', () => {
 	};
 	const listed = (rooms: Array<{ room_id: string; name: string }>) => ({ structuredContent: { rooms } });
 	const read = (messages: unknown[]) => ({ structuredContent: { status: 'completed', result: { messages } } });
+	/** An index already holding these rooms; refresh() fetches through the client like the real one. */
+	const idx = (rooms: Array<{ room_id: string; name: string }>, client: { callTool: (n: string, a: Record<string, unknown>) => Promise<unknown>; close(): void }) => {
+		const index = createRoomIndex({ client: () => client as never, ttlMs: 1e9, now: () => 1 });
+		let list = rooms;
+		return { rooms: () => list, refresh: async () => { list = await index.refresh(); return list; }, fetchedAt: () => 1 };
+	};
 
-	it('a named room is resolved, then read with the default limit', async () => {
-		const f = fake((name) => name === 'room.list'
-			? listed([{ room_id: '!a:ag2.space', name: 'Sutando Triage' }])
-			: read([{ sender: '@pro:ag2.space', body: 'Approved #5453.', ts: 1 }]));
-		const r = await readRoom({ room: 'Sutando Triage' }, { client: () => f.client, currentRoom: () => null });
+	it('a named room is found in the index, then read with the default limit — no room.list on the way', async () => {
+		const f = fake(() => read([{ sender: '@pro:ag2.space', body: 'Approved #5453.', ts: 1 }]));
+		const index = idx([{ room_id: '!a:ag2.space', name: 'Sutando Triage' }], f.client);
+		const r = await readRoom({ room: 'Sutando Triage' }, { client: () => f.client, currentRoom: () => null, index });
 		assert.equal(r.ok, true);
 		assert.equal(r.room, 'Sutando Triage');
 		assert.deepEqual(r.messages.map((m: { text: string }) => m.text), ['Approved #5453.']);
-		assert.deepEqual(f.calls[1], { name: 'room.action.read', args: { room_id: '!a:ag2.space', action: 'room.context.read', arguments: { limit: ROOM_READ_DEFAULT_LIMIT } } });
+		assert.deepEqual(f.calls, [{ name: 'room.action.read', args: { room_id: '!a:ag2.space', action: 'room.context.read', arguments: { limit: ROOM_READ_DEFAULT_LIMIT } } }]);
+	});
+
+	it('a name not in the index refreshes it once: a newly joined room is read; a miss lists every room', async () => {
+		const f = fake((name) => name === 'room.list' ? listed([{ room_id: '!a:x', name: 'Sutando Triage' }, { room_id: '!new:x', name: 'GTM' }]) : read([]));
+		const index = idx([{ room_id: '!a:x', name: 'Sutando Triage' }], f.client);
+		const r = await readRoom({ room: 'GTM' }, { client: () => f.client, currentRoom: () => null, index });
+		assert.equal(r.ok && r.room, 'GTM');
+		assert.deepEqual(f.calls.map(c => c.name), ['room.list', 'room.action.read']);
+		// 2026-10-13 17:41: heard as "Sutando Triaging" — the answer carries the names so the model can say the right one.
+		assert.deepEqual(await readRoom({ room: 'Sutando Triaging' }, { client: () => f.client, currentRoom: () => null, index }),
+			{ ok: false, error: 'not_found', rooms: ['Sutando Triage', 'GTM'] });
 	});
 
 	it('no room named → the room this session is in; none → no_room', async () => {
 		const f = fake(() => read([]));
-		const r = await readRoom({}, { client: () => f.client, currentRoom: () => ({ id: '!cur:ag2.space', name: 'GTM' }) });
+		const index = idx([], f.client);
+		const r = await readRoom({}, { client: () => f.client, currentRoom: () => ({ id: '!cur:ag2.space', name: 'GTM' }), index });
 		assert.equal(r.ok && r.room, 'GTM');
 		assert.equal(f.calls[0].args.room_id, '!cur:ag2.space');
-		assert.deepEqual(await readRoom({}, { client: () => f.client, currentRoom: () => null }), { ok: false, error: 'no_room' });
+		assert.deepEqual(await readRoom({}, { client: () => f.client, currentRoom: () => null, index }), { ok: false, error: 'no_room' });
 	});
 
 	it('a room id is read directly; the limit is capped', async () => {
 		const f = fake(() => read([]));
-		await readRoom({ room: '!cAAaogVSFcIYaNmohw:ag2.space', limit: 500 }, { client: () => f.client, currentRoom: () => null });
+		await readRoom({ room: '!cAAaogVSFcIYaNmohw:ag2.space', limit: 500 }, { client: () => f.client, currentRoom: () => null, index: idx([], f.client) });
 		assert.equal(f.calls.length, 1, 'no room.list for an id');
 		assert.equal((f.calls[0].args.arguments as { limit: number }).limit, 40);
 	});
 
-	it('ambiguous and not_found come back with what to say', async () => {
+	it('ambiguous comes back with the candidates; a miss on an empty index is not_found with no rooms', async () => {
 		const two = fake(() => listed([{ room_id: '!a:x', name: 'GTM' }, { room_id: '!b:x', name: 'GTM planning' }]));
-		assert.deepEqual(await readRoom({ room: 'gt' }, { client: () => two.client, currentRoom: () => null }), { ok: false, error: 'ambiguous', candidates: ['GTM', 'GTM planning'] });
+		const index = idx([{ room_id: '!a:x', name: 'GTM' }, { room_id: '!b:x', name: 'GTM planning' }], two.client);
+		assert.deepEqual(await readRoom({ room: 'gt' }, { client: () => two.client, currentRoom: () => null, index }), { ok: false, error: 'ambiguous', candidates: ['GTM', 'GTM planning'] });
+		assert.equal(two.calls.length, 0, 'ambiguous does not refresh');
 		const none = fake(() => listed([]));
-		assert.deepEqual(await readRoom({ room: 'nope' }, { client: () => none.client, currentRoom: () => null }), { ok: false, error: 'not_found' });
+		assert.deepEqual(await readRoom({ room: 'nope' }, { client: () => none.client, currentRoom: () => null, index: idx([], none.client) }), { ok: false, error: 'not_found', rooms: [] });
 	});
 
 	it('no MCP, a server error, a timeout and a refused read are errors, never throws', async () => {
-		assert.deepEqual(await readRoom({ room: 'x' }, { client: () => null, currentRoom: () => null }), { ok: false, error: 'not_connected' });
+		const noClient = idx([], { callTool: async () => { throw new Error('x'); }, close() {} });
+		assert.deepEqual(await readRoom({ room: 'x' }, { client: () => null, currentRoom: () => null, index: noClient }), { ok: false, error: 'not_connected' });
 		const slow = fake(() => new Error('tools/call timed out after 6000ms'));
-		assert.deepEqual(await readRoom({ room: '!a:x' }, { client: () => slow.client, currentRoom: () => null }), { ok: false, error: 'timeout' });
+		assert.deepEqual(await readRoom({ room: '!a:x' }, { client: () => slow.client, currentRoom: () => null, index: idx([], slow.client) }), { ok: false, error: 'timeout' });
 		const down = fake(() => new Error('ag2-space MCP exited (1)'));
-		assert.deepEqual(await readRoom({ room: '!a:x' }, { client: () => down.client, currentRoom: () => null }), { ok: false, error: 'unavailable' });
+		assert.deepEqual(await readRoom({ room: '!a:x' }, { client: () => down.client, currentRoom: () => null, index: idx([], down.client) }), { ok: false, error: 'unavailable' });
 		const refused = fake(() => ({ isError: true, content: [{ type: 'text', text: '{"code":"ROOM_ACCESS_DENIED"}' }] }));
-		assert.deepEqual(await readRoom({ room: '!a:x' }, { client: () => refused.client, currentRoom: () => null }), { ok: false, error: 'ROOM_ACCESS_DENIED' });
+		assert.deepEqual(await readRoom({ room: '!a:x' }, { client: () => refused.client, currentRoom: () => null, index: idx([], refused.client) }), { ok: false, error: 'ROOM_ACCESS_DENIED' });
+		// A miss whose refresh fails is still not_found, with what the index last held.
+		const stale = idx([{ room_id: '!a:x', name: 'Sutando Triage' }], down.client);
+		assert.deepEqual(await readRoom({ room: 'Sutando Triaging' }, { client: () => down.client, currentRoom: () => null, index: stale }), { ok: false, error: 'not_found', rooms: ['Sutando Triage'] });
 	});
 
 	it('the tool is inline and returns readRoom\'s answer', async () => {
 		const f = fake(() => read([{ sender: '@a:x', body: 'hi', ts: 1 }]));
-		const tool = createReadRoomTool({ client: () => f.client, currentRoom: () => ({ id: '!c:x', name: 'C' }) });
+		const tool = createReadRoomTool({ client: () => f.client, currentRoom: () => ({ id: '!c:x', name: 'C' }), index: idx([], f.client) });
 		assert.equal(tool.name, 'read_room');
 		assert.equal(tool.execution, 'inline');
 		assert.match(tool.description, /every time the user asks about a room/, 'the model reads again instead of reusing an earlier answer');
+		assert.match(tool.description, /"not_found" with rooms .* call read_room again with that exact name/, 'a miss is not the end: the names come back');
+		assert.doesNotMatch(tool.description, /say there is no room by that name/);
 		assert.match(ROOM_READ_PROMPT_RULE, /every time/);
 		assert.match(ROOM_READ_PROMPT_RULE, /earlier answer or task result about a room is never the answer now/);
+		assert.match(ROOM_READ_PROMPT_RULE, /as it appears in the ROOMS line, not as it was heard/);
 		const out = await tool.execute({}, {} as never);
 		assert.equal(out.ok, true);
 		assert.equal(out.messages[0].text, 'hi');
@@ -208,6 +309,9 @@ describe('readRoom: every outcome is something the model can say', () => {
 	it('read_room is declared as a tool that fetches the answer, so the turn check does not also send the turn', () => {
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
 		assert.match(src, /answeringTools: roomRead\.tools\.map\(\(t\) => t\.name\)/);
+		assert.match(src, /tools: \[read, list\]/, 'list_rooms is declared with read_room');
+		assert.match(src, /roomIndexContextLines\(index\)/, 'the room names are in every prompt');
+		assert.match(src, /_rooms\.refresh\(\)\.then\(/, 'the index is the warm-up');
 	});
 });
 }

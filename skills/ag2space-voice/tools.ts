@@ -6,12 +6,13 @@ import type { SkillSetupCtx, VoiceSurfaceContribution } from '../../src/skill-se
 import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './session-context.js';
 import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateClient, navigateUiAvailable, navigateUiTool, resolveUiNavigated } from './navigate.js';
 import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
-import { ROOM_READ_PROMPT_RULE, createMcpStdioClient, createReadRoomTool, findAg2SpaceMcpEntry, type McpClient } from './room-read.js';
+import { ROOM_READ_PROMPT_RULE, createListRoomsTool, createMcpStdioClient, createReadRoomTool, createRoomIndex, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
 
 export const tools: ToolDefinition[] = [];
 
 let _binding: RoomBinding | null = null;
 let _mcp: McpClient | null = null;
+let _rooms: RoomIndex | null = null;
 
 const ts = () => new Date().toISOString().slice(11, 19);
 
@@ -64,23 +65,23 @@ export function setup(ctx: SkillSetupCtx): void {
 }
 
 /** read_room is declared only where the core has the ag2-space MCP registered; the voice agent starts the same server. */
-function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[] } {
+function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; contextLines: () => string[] } {
 	const entry = findAg2SpaceMcpEntry();
-	if (!entry) return { tools: [], promptRules: [] };
+	if (!entry) return { tools: [], promptRules: [], contextLines: () => [] };
+	const log = (m: string) => console.log(`${ts()} ${m}`);
 	if (!_mcp) {
-		_mcp = createMcpStdioClient(entry, { log: (m) => console.log(`${ts()} ${m}`) });
-		// Mint the token now so the first question does not wait for it.
-		_mcp.callTool('room.list', { limit: 1 }).then(
+		_mcp = createMcpStdioClient(entry, { log });
+		// The room index doubles as the warm-up: the token is minted and the model's first prompt has the room names.
+		_rooms = createRoomIndex({ client: () => _mcp, log });
+		_rooms.refresh().then(
 			() => console.log(`${ts()} [RoomRead] ag2-space MCP ready`),
 			(err) => console.warn(`${ts()} [RoomRead] ag2-space MCP warm-up failed: ${err instanceof Error ? err.message : err}`),
 		);
 	}
-	const tool = createReadRoomTool({
-		client: () => _mcp,
-		currentRoom: () => _binding?.current() ?? null,
-		log: (m) => console.log(`${ts()} ${m}`),
-	});
-	return { tools: [tool], promptRules: [ROOM_READ_PROMPT_RULE] };
+	const index = _rooms!;
+	const read = createReadRoomTool({ client: () => _mcp, currentRoom: () => _binding?.current() ?? null, index, log });
+	const list = createListRoomsTool({ index, log });
+	return { tools: [read, list], promptRules: [ROOM_READ_PROMPT_RULE], contextLines: () => roomIndexContextLines(index) };
 }
 
 export function voiceSurface(): VoiceSurfaceContribution {
@@ -90,7 +91,7 @@ export function voiceSurface(): VoiceSurfaceContribution {
 	return {
 		tools: [...(navigate ? [navigateUiTool] : []), ...roomRead.tools],
 		promptRules: [...(navigate ? [NAVIGATION_PROMPT_RULE] : []), ...roomRead.promptRules],
-		contextLines: () => roomContextLines(_binding?.current() ?? null),
+		contextLines: () => [...roomContextLines(_binding?.current() ?? null), ...roomRead.contextLines()],
 		answeringTools: roomRead.tools.map((t) => t.name),
 	};
 }

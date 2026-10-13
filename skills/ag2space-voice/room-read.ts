@@ -21,6 +21,13 @@ export const ROOM_READ_DEFAULT_LIMIT = 15;
 export const ROOM_READ_MAX_LIMIT = 40;
 /** A spoken answer needs the gist, not a pasted log. */
 export const ROOM_READ_BODY_MAX = 400;
+/** room.list refuses more than 50 per page (measured); the agent's rooms are a dozen or two, paged just in case. */
+export const ROOM_INDEX_PAGE = 50;
+export const ROOM_INDEX_MAX_PAGES = 4;
+/** How long the room index is trusted before the next question refreshes it in the background. */
+export const ROOM_INDEX_TTL_MS = 5 * 60_000;
+/** The first fetch mints the token and lists cold (6.7 s measured on 2026-10-13); after that a list is well under a second. */
+export const ROOM_INDEX_COLD_TIMEOUT_MS = 15_000;
 
 export interface McpStdioEntry { command: string; args?: string[]; env?: Record<string, string> }
 
@@ -141,16 +148,85 @@ export interface RoomRef { room_id: string; name: string }
 
 export type RoomResolution = { ok: true; room: RoomRef } | { ok: false; error: 'not_found' | 'ambiguous'; candidates?: string[] };
 
-/** A spoken room name to one room: an exact name match wins, else a single candidate; more is ambiguous. */
+const normName = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+
+/**
+ * A spoken room name against the rooms the agent is in: an exact name wins; else the rooms whose name
+ * contains what was said (or the reverse) — one is it, several are ambiguous; none is not_found.
+ * What was misheard ("Sutando Triaging") is not guessed here: the model sees the index and says the name again.
+ */
 export function pickRoom(query: string, rooms: RoomRef[]): RoomResolution {
-	const norm = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
-	const q = norm(query);
-	const exact = rooms.filter(r => norm(r.name) === q);
+	const q = normName(query);
+	const exact = rooms.filter(r => normName(r.name) === q);
 	if (exact.length === 1) return { ok: true, room: exact[0] };
-	const pool = exact.length > 1 ? exact : rooms;
+	const pool = exact.length > 1 ? exact : rooms.filter(r => { const n = normName(r.name); return n.includes(q) || q.includes(n); });
 	if (pool.length === 1) return { ok: true, room: pool[0] };
 	if (pool.length === 0) return { ok: false, error: 'not_found' };
 	return { ok: false, error: 'ambiguous', candidates: pool.slice(0, 6).map(r => r.name) };
+}
+
+/** Every room the agent is a member of (room.list, scope self), named rooms only; pages followed. */
+export async function listRooms(client: McpClient, timeoutMs = ROOM_READ_CALL_TIMEOUT_MS): Promise<RoomRef[]> {
+	const out: RoomRef[] = [];
+	let cursor: string | undefined;
+	for (let page = 0; page < ROOM_INDEX_MAX_PAGES; page++) {
+		const res = await client.callTool('room.list', { scope: 'self', limit: ROOM_INDEX_PAGE, ...(cursor ? { cursor } : {}) }, timeoutMs);
+		const payload = mcpPayload(res);
+		if (res.isError || !payload) throw new Error(`room.list: ${String((payload as { code?: string } | null)?.code ?? 'failed')}`);
+		for (const r of Array.isArray(payload.rooms) ? payload.rooms : []) {
+			const room = r as { room_id?: unknown; name?: unknown };
+			if (typeof room.room_id === 'string' && typeof room.name === 'string' && room.name.trim()) out.push({ room_id: room.room_id, name: room.name.trim() });
+		}
+		cursor = typeof payload.next_cursor === 'string' && payload.next_cursor ? payload.next_cursor : undefined;
+		if (!cursor) break;
+	}
+	return out;
+}
+
+export interface RoomIndex {
+	/** The rooms as last fetched (possibly stale); a stale index is refreshed in the background. */
+	rooms(): RoomRef[];
+	/** Fetch now; one fetch at a time. Rejects when the MCP cannot answer, keeping the last list. */
+	refresh(): Promise<RoomRef[]>;
+	/** When the list was last fetched, 0 before the first. */
+	fetchedAt(): number;
+}
+
+/**
+ * The rooms the agent can read, kept so the voice model sees their real names: a room name is often
+ * misheard, and a name it can see it can say back exactly (2026-10-13 17:41: "Sutando Triaging").
+ */
+export function createRoomIndex(deps: { client: () => McpClient | null; log?: (m: string) => void; ttlMs?: number; now?: () => number }): RoomIndex {
+	const ttl = deps.ttlMs ?? ROOM_INDEX_TTL_MS;
+	const now = deps.now ?? Date.now;
+	let rooms: RoomRef[] = [];
+	let fetchedAt = 0;
+	let inflight: Promise<RoomRef[]> | null = null;
+	const refresh = (): Promise<RoomRef[]> => {
+		if (inflight) return inflight;
+		const client = deps.client();
+		if (!client) return Promise.reject(new Error('not_connected'));
+		inflight = listRooms(client, fetchedAt === 0 ? ROOM_INDEX_COLD_TIMEOUT_MS : ROOM_READ_CALL_TIMEOUT_MS).then(
+			(list) => { rooms = list; fetchedAt = now(); inflight = null; deps.log?.(`[RoomIndex] ${list.length} rooms`); return list; },
+			(err) => { inflight = null; deps.log?.(`[RoomIndex] refresh failed: ${err instanceof Error ? err.message : String(err)}`); throw err; },
+		);
+		return inflight;
+	};
+	return {
+		rooms() {
+			if (now() - fetchedAt > ttl) refresh().catch(() => {});
+			return rooms;
+		},
+		refresh,
+		fetchedAt: () => fetchedAt,
+	};
+}
+
+/** The prompt line that carries the index; nothing before the first fetch. */
+export function roomIndexContextLines(index: RoomIndex): string[] {
+	const names = index.rooms().map(r => r.name);
+	if (!names.length) return [];
+	return [`ROOMS: AG2 Space rooms you can read with read_room: ${names.join(' | ')}. A room name you hear is often misheard: when the user names a room, pass the one of these it clearly is, spelled exactly like this; ask which only when none clearly is.`];
 }
 
 export interface RoomMessageLine { at: string; from: string; text: string; reply?: boolean; thread?: boolean }
@@ -180,12 +256,23 @@ export function toMessageLines(messages: unknown[], tz?: string): RoomMessageLin
 export interface ReadRoomDeps {
 	client: () => McpClient | null;
 	currentRoom: () => VoiceSessionRoom | null;
+	index: RoomIndex;
 	log?: (m: string) => void;
 }
 
 export type ReadRoomResult =
 	| { ok: true; room: string; messages: RoomMessageLine[]; ms: number }
-	| { ok: false; error: string; candidates?: string[] };
+	/** not_found carries every room the agent can read, so the model can say the right name next. */
+	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
+
+/** A spoken name against the index; a miss refreshes it once (the room may be newly joined) before giving up. */
+async function resolveRoom(query: string, index: RoomIndex): Promise<RoomResolution & { rooms?: string[] }> {
+	const first = pickRoom(query, index.rooms());
+	if (first.ok || first.error === 'ambiguous') return first;
+	const fresh = await index.refresh().catch(() => index.rooms());
+	const again = pickRoom(query, fresh);
+	return again.ok ? again : { ...again, rooms: fresh.map(r => r.name) };
+}
 
 export async function readRoom(args: { room?: string; limit?: number }, deps: ReadRoomDeps): Promise<ReadRoomResult> {
 	const t0 = Date.now();
@@ -202,11 +289,7 @@ export async function readRoom(args: { room?: string; limit?: number }, deps: Re
 		} else if (MATRIX_ROOM_ID.test(query)) {
 			room = { room_id: query, name: query };
 		} else {
-			const listed = mcpPayload(await client.callTool('room.list', { query, limit: 10 }));
-			const rooms = (Array.isArray(listed?.rooms) ? listed!.rooms : [])
-				.filter((r): r is RoomRef => !!r && typeof (r as RoomRef).room_id === 'string')
-				.map(r => ({ room_id: r.room_id, name: typeof r.name === 'string' && r.name ? r.name : r.room_id }));
-			const picked = pickRoom(query, rooms);
+			const picked = await resolveRoom(query, deps.index);
 			if (!picked.ok) return picked;
 			room = picked.room;
 		}
@@ -232,14 +315,15 @@ export function createReadRoomTool(deps: ReadRoomDeps): ToolDefinition {
 			'A room\'s messages and who can read it change at any time: call read_room every time the user asks about a room, even if you answered about that room earlier or a task result said something about it — never answer from an earlier answer. ' +
 			'Pass `room` = the room name as spoken; leave it out for the room this session is in. ' +
 			'Returns {ok:true, room, messages:[{at, from, text}]} oldest first — answer from them in a sentence or two; do not read them all out. ' +
-			'Errors: "ambiguous" with candidates — ask which one; "not_found" — say there is no room by that name; ' +
-			'"no_room" — ask which room; "not_connected", "timeout" or "unavailable" — say you cannot read the room right now.',
+			'Errors: "not_found" with rooms (every room you can read) — the name you passed is not one of them; room names are often misheard, so if one of rooms is clearly the room the user meant, call read_room again with that exact name, and ask which only when none clearly is; ' +
+			'"ambiguous" with candidates — ask which one; "no_room" — ask which room; "not_connected", "timeout" or "unavailable" — say you cannot read the room right now.',
 		parameters: z.object({
 			room: z.string().optional().describe('The room name as spoken, e.g. "Sutando Triage". Omit for the current room.'),
 			limit: z.number().int().min(1).max(ROOM_READ_MAX_LIMIT).optional().describe(`How many recent messages (default ${ROOM_READ_DEFAULT_LIMIT}).`),
 		}),
 		execution: 'inline',
-		timeout: ROOM_READ_CALL_TIMEOUT_MS * 2 + 1000,
+		// A miss while the index is still cold refetches it (cold) and then reads.
+		timeout: ROOM_INDEX_COLD_TIMEOUT_MS + ROOM_READ_CALL_TIMEOUT_MS + 1000,
 		async execute(args) {
 			const a = (args ?? {}) as { room?: string; limit?: number };
 			const r = await readRoom(a, deps);
@@ -249,5 +333,28 @@ export function createReadRoomTool(deps: ReadRoomDeps): ToolDefinition {
 	};
 }
 
+/** list_rooms: the rooms the agent can read, fetched now — for "which rooms are you in", and to refresh the index. */
+export function createListRoomsTool(deps: { index: RoomIndex; log?: (m: string) => void }): ToolDefinition {
+	return {
+		name: 'list_rooms',
+		description:
+			'List the AG2 Space rooms you can read, right now. Call it when the user asks which rooms you are in or can read, ' +
+			'or when a room they name is not in the ROOMS line and may be newly joined. Returns {ok:true, rooms:[names]}; "unavailable" when the list cannot be fetched.',
+		parameters: z.object({}),
+		execution: 'inline',
+		timeout: ROOM_INDEX_COLD_TIMEOUT_MS + 1000,
+		async execute() {
+			try {
+				const rooms = (await deps.index.refresh()).map(r => r.name);
+				deps.log?.(`[RoomRead] list_rooms: ${rooms.length} rooms`);
+				return { ok: true, rooms };
+			} catch (err) {
+				deps.log?.(`[RoomRead] list_rooms failed: ${err instanceof Error ? err.message : String(err)}`);
+				return { ok: false, error: 'unavailable', rooms: deps.index.rooms().map(r => r.name) };
+			}
+		},
+	};
+}
+
 /** The prompt rule that goes with the tool; present only when the tool is declared. */
-export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about what was said in an AG2 Space room ("what\'s new in <room>", "did <person> reply in <room>", "what are they discussing there") → call read_room and answer from what it returns, every time — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now; never submit work just to read a room.';
+export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about what was said in an AG2 Space room ("what\'s new in <room>", "did <person> reply in <room>", "what are they discussing there") → call read_room and answer from what it returns, every time — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now; never submit work just to read a room. Pass the room name as it appears in the ROOMS line, not as it was heard; a read_room "not_found" lists the rooms — pick the one meant and read again.';
