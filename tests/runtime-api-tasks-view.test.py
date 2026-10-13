@@ -624,6 +624,70 @@ class DispatchTests(unittest.TestCase):
         def __getattr__(self, name):
             raise AssertionError(f"task.* reached {name}")
 
+    def _dispatcher(self, base):
+        return RuntimeDispatcher(
+            self._No(), self._No(), "@me:x", executors={},
+            tasks_view=TasksView(base / "tasks", base / "results", "@me:x"))
+
+    def test_submit_idempotency_retry_after_restart_and_completion(self):
+        for lifecycle in ("completion", "archive"):
+            with self.subTest(lifecycle=lifecycle), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                params = {"task": "do it", "idempotencyKey": "request-42"}
+                first = asyncio.run(self._dispatcher(base).handle("task.submit", params))
+                tid = first["taskId"]
+                task_file = base / "tasks" / f"{tid}.txt"
+                original = task_file.read_bytes()
+                retry = asyncio.run(self._dispatcher(base).handle("task.submit", params))
+                self.assertEqual(retry, first)
+                self.assertEqual(list((base / "tasks").glob("task-*.txt")), [task_file])
+                self.assertEqual(task_file.read_bytes(), original)
+                if lifecycle == "completion":
+                    (base / "results").mkdir()
+                    (base / "results" / f"{tid}.txt").write_text("done")
+                    task_file.unlink()
+                else:
+                    archive = base / "tasks" / "archive"
+                    archive.mkdir()
+                    task_file.rename(archive / task_file.name)
+                finished = asyncio.run(self._dispatcher(base).handle("task.submit", params))
+                self.assertEqual(finished, {"taskId": tid, "state": "done"})
+                self.assertEqual(list((base / "tasks").glob("task-*.txt")), [])
+
+    def test_submit_idempotency_rejects_invalid_keys_and_collisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for key in ("", "   ", None, False, 42, [], {}, "x" * 1025,
+                        "é" * 513):
+                with self.subTest(key=repr(key)[:30]):
+                    with self.assertRaises(ProtocolError) as raised:
+                        asyncio.run(self._dispatcher(base).handle(
+                            "task.submit", {"task": "work", "idempotencyKey": key}))
+                    self.assertEqual(raised.exception.code, -32602)
+                    self.assertEqual(list((base / "tasks").glob("task-*.txt")), [])
+            params = {"task": "work", "idempotencyKey": "request-42"}
+            first = asyncio.run(self._dispatcher(base).handle("task.submit", params))
+            task_file = base / "tasks" / f"{first['taskId']}.txt"
+            original = task_file.read_bytes()
+            for change in ({"task": "different"}, {"priority": "low"}):
+                with self.subTest(change=change):
+                    with self.assertRaises(ProtocolError) as raised:
+                        asyncio.run(self._dispatcher(base).handle(
+                            "task.submit", {**params, **change}))
+                    self.assertEqual(raised.exception.code, -32602)
+                    self.assertEqual(list((base / "tasks").glob("task-*.txt")), [task_file])
+                    self.assertEqual(task_file.read_bytes(), original)
+
+    def test_submit_without_key_remains_non_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            first = asyncio.run(self._dispatcher(base).handle("task.submit", {"task": "hi"}))
+            second = asyncio.run(self._dispatcher(base).handle("task.submit", {"task": "hi"}))
+            self.assertNotEqual(first["taskId"], second["taskId"])
+            self.assertEqual(
+                {p.name for p in (base / "tasks").glob("task-*.txt")},
+                {f"{first['taskId']}.txt", f"{second['taskId']}.txt"})
+
     def test_submit_status_result_dispatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
