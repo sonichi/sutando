@@ -6,7 +6,7 @@ import type { SkillSetupCtx, VoiceSurfaceContribution } from '../../src/skill-se
 import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './session-context.js';
 import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateClient, navigateUiAvailable, navigateUiTool, resolveUiNavigated } from './navigate.js';
 import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
-import { ROOM_READ_PROMPT_RULE, createListRoomsTool, createMcpStdioClient, createReadRoomTool, createRoomIndex, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
+import { ROOM_READ_PROMPT_RULE, createListRoomsTool, createMcpStdioClient, createReadRoomTool, createRoomIndex, createSearchRoomTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
 
 export const tools: ToolDefinition[] = [];
 
@@ -79,9 +79,11 @@ function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; co
 		);
 	}
 	const index = _rooms!;
-	const read = createReadRoomTool({ client: () => _mcp, currentRoom: () => _binding?.current() ?? null, index, log });
+	const deps = { client: () => _mcp, currentRoom: () => _binding?.current() ?? null, index, log };
+	const read = createReadRoomTool(deps);
+	const search = createSearchRoomTool(deps);
 	const list = createListRoomsTool({ index, log });
-	return { tools: [read, list], promptRules: [ROOM_READ_PROMPT_RULE], contextLines: () => roomIndexContextLines(index) };
+	return { tools: [read, search, list], promptRules: [ROOM_READ_PROMPT_RULE], contextLines: () => roomIndexContextLines(index) };
 }
 
 export function voiceSurface(): VoiceSurfaceContribution {

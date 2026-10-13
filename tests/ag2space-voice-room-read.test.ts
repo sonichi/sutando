@@ -24,6 +24,7 @@ if (PRESENT) {
 const {
 	findAg2SpaceMcpEntry, createMcpStdioClient, mcpPayload, pickRoom, toMessageLines, readRoom, createReadRoomTool,
 	listRooms, createRoomIndex, roomIndexContextLines, createListRoomsTool, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_READ_CALL_TIMEOUT_MS,
+	searchRoom, createSearchRoomTool, toHitLines, ROOM_SEARCH_DEFAULT_LIMIT,
 	ROOM_READ_BODY_MAX, ROOM_READ_DEFAULT_LIMIT, ROOM_READ_PROMPT_RULE,
 } = await import(pathToFileURL(join(PLUGIN_DIR, 'room-read.ts')).href);
 
@@ -290,6 +291,16 @@ describe('readRoom: every outcome is something the model can say', () => {
 		assert.deepEqual(await readRoom({ room: 'Sutando Triaging' }, { client: () => down.client, currentRoom: () => null, index: stale }), { ok: false, error: 'not_found', rooms: ['Sutando Triage'] });
 	});
 
+	it('around a search hit: the read is placed at that message, not the latest', async () => {
+		const f = fake(() => read([{ sender: '@a:x', body: 'before', ts: 1 }, { sender: '@b:x', body: 'the hit', ts: 2 }]));
+		const index = idx([{ room_id: '!a:x', name: 'Sutando Triage' }], f.client);
+		const r = await readRoom({ room: 'Sutando Triage', around: '$hit', limit: 10 }, { client: () => f.client, currentRoom: () => null, index });
+		assert.equal(r.ok, true);
+		assert.deepEqual(f.calls[0].args.arguments, { limit: 10, around_event_id: '$hit' });
+		await readRoom({ room: 'Sutando Triage', around: '  ' }, { client: () => f.client, currentRoom: () => null, index });
+		assert.deepEqual(f.calls[1].args.arguments, { limit: ROOM_READ_DEFAULT_LIMIT }, 'a blank around is no around');
+	});
+
 	it('the tool is inline and returns readRoom\'s answer', async () => {
 		const f = fake(() => read([{ sender: '@a:x', body: 'hi', ts: 1 }]));
 		const tool = createReadRoomTool({ client: () => f.client, currentRoom: () => ({ id: '!c:x', name: 'C' }), index: idx([], f.client) });
@@ -306,12 +317,93 @@ describe('readRoom: every outcome is something the model can say', () => {
 		assert.equal(out.messages[0].text, 'hi');
 	});
 
+	it('search hits become lines newest first, each with the id to read around; a hit without a snippet is dropped', () => {
+		const hits = [
+			{ event_id: '$new', sender: '@liususan091219-susan-s-bot.agent:ag2.space', origin_server_ts: 1791910190908, snippet: 'Re-reviewed 5473 at b8844ca4:  Ready to approve.' },
+			{ event_id: '$old', sender: '@sutando-sonichi:ag2.space', origin_server_ts: 1791908065772, snippet: 'Could you review 5473?', thread_root: '$t' },
+			{ event_id: '$blank', sender: '@x:y', origin_server_ts: 1, snippet: '  ' },
+			{ sender: '@noid:y', snippet: 'no id' },
+		];
+		const lines = toHitLines(hits, 'UTC');
+		assert.deepEqual(lines.map(l => [l.event_id, l.from, l.text, l.thread ?? false]), [
+			['$new', 'liususan091219-susan-s-bot.agent', 'Re-reviewed 5473 at b8844ca4: Ready to approve.', false],
+			['$old', 'sutando-sonichi', 'Could you review 5473?', true],
+		]);
+		assert.equal(lines[0].at, 'Oct 13, 16:49');
+	});
 	it('read_room is declared as a tool that fetches the answer, so the turn check does not also send the turn', () => {
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
 		assert.match(src, /answeringTools: roomRead\.tools\.map\(\(t\) => t\.name\)/);
-		assert.match(src, /tools: \[read, list\]/, 'list_rooms is declared with read_room');
+		assert.match(src, /tools: \[read, search, list\]/, 'list_rooms and search_room are declared with read_room');
 		assert.match(src, /roomIndexContextLines\(index\)/, 'the room names are in every prompt');
 		assert.match(src, /_rooms\.refresh\(\)\.then\(/, 'the index is the warm-up');
 	});
+describe('searchRoom: what was said about something, however far back', () => {
+	type Call = { name: string; args: Record<string, unknown> };
+	const fake = (handler: (name: string, args: Record<string, unknown>) => unknown) => {
+		const calls: Call[] = [];
+		return {
+			calls,
+			client: { async callTool(name: string, args: Record<string, unknown>) { calls.push({ name, args }); const r = handler(name, args); if (r instanceof Error) throw r; return r; }, close() {} },
+		};
+	};
+	const found = (results: unknown[]) => ({ structuredContent: { status: 'completed', result: { results, cursor: null } } });
+	const idx = (rooms: Array<{ room_id: string; name: string }>, client: { callTool: (n: string, a: Record<string, unknown>) => Promise<unknown>; close(): void }) => {
+		const index = createRoomIndex({ client: () => client as never, ttlMs: 1e9, now: () => 1 });
+		let list = rooms;
+		return { rooms: () => list, refresh: async () => { list = await index.refresh(); return list; }, fetchedAt: () => 1 };
+	};
+	const triage = [{ room_id: '!cAAaogVSFcIYaNmohw:ag2.space', name: 'Sutando Triage' }];
+
+	it('searches the named room with the words and the default limit; hits come back with their ids', async () => {
+		// 2026-10-13 20:19: the #5473 review was the 37th-42nd newest message in Sutando Triage, past read_room's reach.
+		const f = fake(() => found([{ event_id: '$r', sender: '@liususan091219-susan-s-bot.agent:ag2.space', origin_server_ts: 1791910190908, snippet: 'Re-reviewed 5473 at b8844ca4: Ready to approve.' }]));
+		const r = await searchRoom({ room: 'Sutando Triage', query: ' 5473 ' }, { client: () => f.client, currentRoom: () => null, index: idx(triage, f.client) });
+		assert.equal(r.ok, true);
+		assert.equal(r.room, 'Sutando Triage');
+		assert.equal(r.query, '5473');
+		assert.deepEqual(r.hits.map(h => [h.event_id, h.text]), [['$r', 'Re-reviewed 5473 at b8844ca4: Ready to approve.']]);
+		assert.deepEqual(f.calls, [{ name: 'room.action.read', args: { room_id: '!cAAaogVSFcIYaNmohw:ag2.space', action: 'room.events.search', arguments: { query: '5473', limit: ROOM_SEARCH_DEFAULT_LIMIT } } }]);
+	});
+
+	it('no words → no_query; the current room when none is named; the limit is capped at the server\'s 50', async () => {
+		const f = fake(() => found([]));
+		const index = idx([], f.client);
+		assert.deepEqual(await searchRoom({ query: '  ' }, { client: () => f.client, currentRoom: () => null, index }), { ok: false, error: 'no_query' });
+		const r = await searchRoom({ query: 'guest line', limit: 500 }, { client: () => f.client, currentRoom: () => ({ id: '!cur:x', name: 'GTM' }), index });
+		assert.equal(r.ok && r.room, 'GTM');
+		assert.deepEqual(f.calls[0].args, { room_id: '!cur:x', action: 'room.events.search', arguments: { query: 'guest line', limit: 50 } });
+		assert.deepEqual(await searchRoom({ query: 'x' }, { client: () => f.client, currentRoom: () => null, index }), { ok: false, error: 'no_room' });
+	});
+
+	it('a misheard room name lists the rooms; a failed or refused search is an error the model can say', async () => {
+		const f = fake((name) => name === 'room.list' ? ({ structuredContent: { rooms: triage } }) : found([]));
+		assert.deepEqual(await searchRoom({ room: 'Sutando Triaging', query: '5473' }, { client: () => f.client, currentRoom: () => null, index: idx(triage, f.client) }), { ok: false, error: 'not_found', rooms: ['Sutando Triage'] });
+		const slow = fake(() => new Error('tools/call timed out after 6000ms'));
+		assert.deepEqual(await searchRoom({ room: '!a:x', query: '5473' }, { client: () => slow.client, currentRoom: () => null, index: idx([], slow.client) }), { ok: false, error: 'timeout' });
+		const refused = fake(() => ({ isError: true, content: [{ type: 'text', text: '{"code":"ROOM_ACCESS_DENIED"}' }] }));
+		assert.deepEqual(await searchRoom({ room: '!a:x', query: '5473' }, { client: () => refused.client, currentRoom: () => null, index: idx([], refused.client) }), { ok: false, error: 'ROOM_ACCESS_DENIED' });
+		assert.deepEqual(await searchRoom({ room: '!a:x', query: '5473' }, { client: () => null, currentRoom: () => null, index: idx([], refused.client) }), { ok: false, error: 'not_connected' });
+	});
+
+	it('the tool is inline; its description and the prompt rule send "about <PR/topic>" questions here, never to memory', async () => {
+		const f = fake(() => found([{ event_id: '$r', sender: '@a:x', origin_server_ts: 1, snippet: 'hit' }]));
+		const tool = createSearchRoomTool({ client: () => f.client, currentRoom: () => ({ id: '!c:x', name: 'C' }), index: idx([], f.client) });
+		assert.equal(tool.name, 'search_room');
+		assert.equal(tool.execution, 'inline');
+		assert.match(tool.description, /about a particular PR, issue, topic or person/);
+		assert.match(tool.description, /never answer such a question from memory or from an earlier answer; search every time/);
+		assert.match(tool.description, /call read_room with `around` = its event_id/);
+		assert.match(tool.description, /"not_found" with rooms .* call search_room again with that exact name/);
+		const out = await tool.execute({ query: '5473' }, {} as never);
+		assert.equal(out.ok, true);
+		assert.equal(out.hits[0].event_id, '$r');
+		assert.match(ROOM_READ_PROMPT_RULE, /"What was said about <PR\/topic\/person> in <room>".*→ search_room, then read_room with `around`/);
+		assert.match(ROOM_READ_PROMPT_RULE, /never from memory or an earlier answer/);
+		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
+		assert.match(src, /tools: \[read, search, list\]/, 'search_room is declared with read_room, and is an answering tool through the same map');
+	});
+});
+
 });
 }
