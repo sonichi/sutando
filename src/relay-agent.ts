@@ -445,11 +445,13 @@ export function createAskDelivery(deps: { inject: (text: string) => void; maxWai
 	};
 }
 
-/** Submits one `work` call to the core: the tool's own execute, returning its status object. */
-export type SubmitWork = (args: Record<string, unknown>) => Promise<Record<string, unknown>>;
+/** Submits one `work` call to the core: the tool's own execute, returning its status object. `origin` is what `captureOrigin` took when the call began. */
+export type SubmitWork<O = unknown> = (args: Record<string, unknown>, origin?: O) => Promise<Record<string, unknown>>;
 
-export interface RelayAgentDeps {
-	submit: SubmitWork;
+export interface RelayAgentDeps<O = unknown> {
+	submit(args: Record<string, unknown>, origin?: O): ReturnType<SubmitWork<O>>;
+	/** Takes where a request was asked from (room, words around it) the moment it is made, before any wait. */
+	captureOrigin?: () => O;
 	store: VoiceTaskStore;
 	/** Says a line to the model now (the queue position at submission). */
 	notice?: (text: string) => void;
@@ -491,23 +493,23 @@ const ENDED: Record<'cancelled' | 'continuing' | 'delivered_separately' | 'conti
  * a rejection, the fast path), waits for the task's result and returns it. `offerResult` hands a
  * landed result to its waiting call; it refuses (the caller delivers another way) when no call waits.
  */
-export class RelayAgent implements PersistentSubagentInstance {
+export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	readonly key = 'relay-agent';
 	private readonly waiting = new Map<string, Waiter>();
 	/** The call waiting for the user to finish speaking, not yet submitted. */
-	private holding: { args: Record<string, unknown>; joined: boolean } | null = null;
+	private holding: { args: Record<string, unknown>; origin: O | undefined; joined: boolean } | null = null;
 
 	/** When the voice model last called `work`: a turn it covered itself is not sent again by the turn check. */
 	private lastWorkCallAt = 0;
 	/** When the work check last had the user asked: the next call's answer is sent as it is. */
 	private askedAt = 0;
 	/** User turns waiting for the turn check (several when the user went on speaking). */
-	private turns: Array<{ text: string; at: number }> = [];
+	private turns: Array<{ text: string; at: number; origin: O | undefined }> = [];
 	private turnsRunning = false;
 	/** When the last turn the turn check took ended: a `work` call after it belongs to the next turn. */
 	private lastTurnAt = 0;
 
-	constructor(private readonly deps: RelayAgentDeps) {}
+	constructor(private readonly deps: RelayAgentDeps<O>) {}
 
 	/** Tasks sent and not answered yet, newest last: what a new request is compared with. */
 	openTasks(now = Date.now()): OpenTask[] {
@@ -524,7 +526,7 @@ export class RelayAgent implements PersistentSubagentInstance {
 	onUserTurn(text: string, at = Date.now()): void {
 		const t = text.trim();
 		if (!this.deps.classify || !t || t.startsWith('[System:')) return;
-		this.turns.push({ text: t, at });
+		this.turns.push({ text: t, at, origin: this.deps.captureOrigin?.() });
 		if (!this.turnsRunning) void this.drainTurns();
 	}
 
@@ -545,7 +547,7 @@ export class RelayAgent implements PersistentSubagentInstance {
 					openTasks,
 				}).catch(() => ({ action: 'none' as const }));
 				if (this.lastWorkCallAt > since) continue; // the voice model's own call came in while the check ran
-				await this.actOnTurn(verdict);
+				await this.actOnTurn(verdict, taken[0].origin);
 			}
 		} catch (err) {
 			this.deps.log?.(`[RelayAgent] turn check failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -554,7 +556,7 @@ export class RelayAgent implements PersistentSubagentInstance {
 		}
 	}
 
-	private async actOnTurn(verdict: Awaited<ReturnType<TurnClassifier>>): Promise<void> {
+	private async actOnTurn(verdict: Awaited<ReturnType<TurnClassifier>>, origin: O | undefined): Promise<void> {
 		if (verdict.action === 'none') return;
 		if (verdict.action === 'duplicate') {
 			this.deps.log?.(`[RelayAgent] the user asked again for ${verdict.of}; not sent twice`);
@@ -568,7 +570,7 @@ export class RelayAgent implements PersistentSubagentInstance {
 			(this.deps.ask ?? this.deps.notice)?.(line);
 			return;
 		}
-		const submitted = await this.deps.submit({ task: verdict.task });
+		const submitted = await this.deps.submit({ task: verdict.task }, origin);
 		const taskId = submitted.taskId;
 		if (submitted.status !== 'pending' || typeof taskId !== 'string') {
 			this.deps.log?.(`[RelayAgent] turn check: the request was not taken (${String(submitted.status)})`);
@@ -581,6 +583,8 @@ export class RelayAgent implements PersistentSubagentInstance {
 
 	async invoke(_task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
 		this.lastWorkCallAt = Date.now();
+		// Taken before the waits below: a room switch during them must not re-address the request.
+		let origin = this.deps.captureOrigin?.();
 		if (this.deps.speech) {
 			// A call made while an earlier one still waits for the user's turn to end: the model has not
 			// answered in between, the user went on speaking, so the two are one request. The earlier
@@ -588,6 +592,7 @@ export class RelayAgent implements PersistentSubagentInstance {
 			const earlier = this.holding;
 			if (earlier) {
 				earlier.joined = true;
+				origin = earlier.origin; // the request began with the earlier call
 				args = {
 					...earlier.args,
 					...args,
@@ -595,7 +600,7 @@ export class RelayAgent implements PersistentSubagentInstance {
 				};
 				this.deps.log?.('[RelayAgent] the user went on speaking: the earlier request is sent with this one');
 			}
-			const mine = { args, joined: false };
+			const mine = { args, origin, joined: false };
 			this.holding = mine;
 			await this.deps.speech.waitTurnOver(signal);
 			if (mine.joined) return framedSystem(ENDED.continued_in_next);
@@ -629,7 +634,7 @@ export class RelayAgent implements PersistentSubagentInstance {
 			}
 		}
 		this.askedAt = 0; // this request goes; the next vague one may be asked about again
-		const submitted = await this.deps.submit(args);
+		const submitted = await this.deps.submit(args, origin);
 		const taskId = submitted.taskId;
 		if (submitted.status !== 'pending' || typeof taskId !== 'string') return JSON.stringify(submitted);
 		const replaces = typeof args.replaces === 'string' ? args.replaces.trim() : '';

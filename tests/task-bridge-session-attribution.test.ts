@@ -171,10 +171,12 @@ describe('a voice task retains the context that invoked it', () => {
 			replacementReads++;
 			return [{ role: 'user', content: 'replacement session speech' }];
 		});
+		// The old provider still answers: only the replacement bump keeps its late words out.
+		speech.setInput('late words on the replaced provider');
 		const { taskId } = await pending;
 		await assertOrigin(taskId, 'unchanged-room');
 		assert.equal(replacementReads, 0);
-		assert.doesNotMatch(taskBody(taskId), /replacement session|--- spoken/);
+		assert.doesNotMatch(taskBody(taskId), /replacement session|late words on the replaced|--- spoken/);
 	});
 
 	it('a farewell in the same breath keeps the owner\'s words; the client leaving after it drops later ones', { timeout: 5000 }, async () => {

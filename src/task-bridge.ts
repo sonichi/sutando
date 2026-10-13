@@ -1070,6 +1070,18 @@ export function queuedAheadInstruction(queuedAhead: number): string {
 /** What the model is told when `work` has queued the task; the result follows when the core finishes. */
 export const WORK_PENDING_MESSAGE = 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.';
 
+/** What a `work` call carries from the moment it was made: where it was asked, and the words around it. */
+export type WorkOrigin = { origin: VoiceSessionOrigin | null; turns: VoiceTurnsBinding; recentAtAsk: string };
+const WORK_ORIGIN = Symbol('workOrigin');
+
+/** The task belongs to the origin, and the words, it was asked from, even if the session moves or the adapter mutates its record later. */
+export function captureWorkOrigin(): WorkOrigin {
+	const origin = _voiceSessionOrigin ? { ..._voiceSessionOrigin, headers: { ..._voiceSessionOrigin.headers } } : null;
+	let recentAtAsk = '';
+	try { recentAtAsk = _voiceContextAtAsk() ?? getRecentConversation(4); } catch { /* best effort */ }
+	return { origin, turns: captureVoiceTurns(), recentAtAsk };
+}
+
 export const workTool: ToolDefinition = {
 	name: 'work',
 	description:
@@ -1123,12 +1135,8 @@ export const workTool: ToolDefinition = {
 			return { status: 'rejected', message: 'Use describe_screen inline tool directly for screen viewing.' };
 		}
 
-		// Read before the first await: the task belongs to the origin, and the words, it was
-		// asked from, even if the session moves or the adapter mutates its record meanwhile.
-		const origin = _voiceSessionOrigin ? { ..._voiceSessionOrigin, headers: { ..._voiceSessionOrigin.headers } } : null;
-		const turns = captureVoiceTurns();
-		let recentAtAsk = '';
-		try { recentAtAsk = _voiceContextAtAsk() ?? getRecentConversation(4); } catch { /* best effort */ }
+		// Read before the first await, unless the relay agent captured it when the call began.
+		const { origin, turns, recentAtAsk } = (args as { [WORK_ORIGIN]?: WorkOrigin })[WORK_ORIGIN] ?? captureWorkOrigin();
 
 		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
 		// Same pattern as conversation-server's tryFastPath.
@@ -1287,7 +1295,8 @@ export const workTool: ToolDefinition = {
 };
 
 /** The `work` call as the relay agent runs it: the tool's own submission, then the core's result. */
-export const submitWorkTask = (args: Record<string, unknown>) => workTool.execute(args, undefined as never) as Promise<Record<string, unknown>>;
+export const submitWorkTask = (args: Record<string, unknown>, at?: WorkOrigin) =>
+	workTool.execute(at ? { ...args, [WORK_ORIGIN]: at } : args, undefined as never) as Promise<Record<string, unknown>>;
 
 // cancelTask tool moved — canonical version is `cancelTaskTool` in inline-tools.ts.
 
