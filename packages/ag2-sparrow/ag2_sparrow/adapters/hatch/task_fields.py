@@ -49,15 +49,25 @@ def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":
     return strict
 
 
-def snippet(body: str) -> str:
-    """The message's first line without a Matrix reply fallback, which is the quoted
-    message replied to, not the reply."""
-    first = body.split("\n", 1)[0].strip()
-    prefix = _SENDER_PREFIX.match(first)
+def _split(text: str) -> "tuple[str, str]":
+    """(sender prefix, the message after it without a Matrix reply fallback, which is
+    the quoted message replied to, not the reply)."""
+    prefix = _SENDER_PREFIX.match(text)
     head = prefix.group(0) if prefix else ""
-    rest = first[len(head):]
+    rest = text[len(head):]
     fallback = _REPLY_FALLBACK.match(rest)
-    return (head + (rest[fallback.end():] if fallback else rest))[:SNIPPET_MAX]
+    return head, rest[fallback.end():] if fallback else rest
+
+
+def snippet(body: str) -> str:
+    """The message's first line, sender prefix kept, without a reply fallback."""
+    head, rest = _split(body.split("\n", 1)[0].strip())
+    return (head + rest)[:SNIPPET_MAX]
+
+
+def message_text(body: str) -> str:
+    """The whole message as its sender wrote it: no sender prefix, no reply fallback."""
+    return _split(body.strip())[1]
 
 
 def _field(headers: dict, key: str) -> "str | None":
