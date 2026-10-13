@@ -230,6 +230,55 @@ describe('relay agent: review of #5348, should-fixes', () => {
 	});
 });
 
+describe('relay agent: a question for the user is said as soon as the model stops speaking', () => {
+	it('at once when the model is quiet; after its turn ends when it is speaking; only the newest waits', async () => {
+		// 2026-10-13 00:41: decided at :16, said at :35, queued behind the model's answer and a noise turn.
+		const { createAskDelivery } = await import('../src/relay-agent.js');
+		const said: string[] = [];
+		const a = createAskDelivery({ inject: (t) => said.push(t), maxWaitMs: 5_000 });
+		a.ask('q1');
+		assert.deepEqual(said, ['q1'], 'quiet model: at once');
+		a.onModelAudio();
+		a.ask('q2');
+		a.ask('q3');
+		assert.deepEqual(said, ['q1'], 'waits while the model speaks');
+		a.onTurnEnd();
+		assert.deepEqual(said, ['q1', 'q3'], 'the newest, when the turn ends');
+		a.onTurnEnd();
+		assert.deepEqual(said, ['q1', 'q3'], 'said once');
+	});
+
+	it('a model that keeps speaking does not hold the question past the cap', async () => {
+		const { createAskDelivery } = await import('../src/relay-agent.js');
+		const said: string[] = [];
+		const a = createAskDelivery({ inject: (t) => said.push(t), maxWaitMs: 30 });
+		a.onModelAudio();
+		a.ask('q');
+		await tick(60);
+		assert.deepEqual(said, ['q']);
+	});
+
+	it('the turn check\'s question goes through the ask channel, not the notification queue', async () => {
+		const asked: string[] = [];
+		const notices: string[] = [];
+		const relay = new RelayAgent({
+			store: createVoiceTaskStore(),
+			classify: async () => ({ action: 'ask', question: '哪一个 PR？' }),
+			ask: (t) => asked.push(t),
+			notice: (t) => notices.push(t),
+			submit: async () => ({}),
+		});
+		relay.onUserTurn('帮我查一下那个 PR 的状态');
+		await tick(10);
+		assert.equal(asked.length, 1);
+		assert.match(asked[0], /exactly: "哪一个 PR？"/);
+		assert.deepEqual(notices, []);
+		const agentSrc = readFileSync(join(import.meta.dirname ?? '.', '..', 'src', 'voice-agent.ts'), 'utf-8');
+		assert.match(agentSrc, /inject: \(text\) => \{ void sessionRef\?\.injectText\(text, \{ mode: 'live' \}\); \}/);
+		assert.match(agentSrc, /subscribe\('turn\.end', \(\) => relayAsk\.onTurnEnd\(\)\)/);
+	});
+});
+
 describe('relay agent: the same request is not sent twice', () => {
 	it('a work call the check finds already open waits for that task\'s result instead of submitting', async () => {
 		// 2026-10-12 22:10: "333PR53" and then "PR5333 Sultando Repo" became two tasks for PR 5333.

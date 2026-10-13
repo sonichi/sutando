@@ -415,6 +415,36 @@ export function recentConversationLines(items: ReadonlyArray<{ role?: string; co
 		.join('\n');
 }
 
+/** A question waiting for the model to stop speaking is put anyway after this long. */
+export const ASK_WAIT_MAX_MS = 15_000;
+
+/**
+ * Puts the relay's question to the user as live input as soon as the model is not speaking: at once when it
+ * is quiet, else when its turn ends (or after ASK_WAIT_MAX_MS). Only the newest question waits.
+ */
+export function createAskDelivery(deps: { inject: (text: string) => void; maxWaitMs?: number; log?: (m: string) => void }) {
+	let speaking = false;
+	let waiting: { text: string; timer: ReturnType<typeof setTimeout> } | null = null;
+	const flush = () => {
+		if (!waiting) return;
+		const { text, timer } = waiting;
+		clearTimeout(timer);
+		waiting = null;
+		deps.inject(text);
+	};
+	return {
+		ask(text: string): void {
+			if (!speaking) { deps.inject(text); return; }
+			if (waiting) clearTimeout(waiting.timer);
+			const timer = setTimeout(() => { deps.log?.('[RelayAgent] the model is still speaking; asking anyway'); flush(); }, deps.maxWaitMs ?? ASK_WAIT_MAX_MS);
+			timer.unref?.();
+			waiting = { text, timer };
+		},
+		onModelAudio(): void { speaking = true; },
+		onTurnEnd(): void { speaking = false; flush(); },
+	};
+}
+
 /** Submits one `work` call to the core: the tool's own execute, returning its status object. */
 export type SubmitWork = (args: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -431,6 +461,8 @@ export interface RelayAgentDeps {
 	recentConversation?: () => string;
 	/** Looks at every finished user turn, whatever tool the voice model chose: is it a request for the core? */
 	classify?: TurnClassifier;
+	/** Has the voice model put a question to the user as soon as it stops speaking (falls back to `notice`). */
+	ask?: (text: string) => void;
 	log?: (msg: string) => void;
 }
 
@@ -530,7 +562,10 @@ export class RelayAgent implements PersistentSubagentInstance {
 		}
 		if (verdict.action === 'ask') {
 			this.deps.log?.(`[RelayAgent] turn not sent, asking the user: ${verdict.question}`);
-			this.deps.notice?.(framedSystem(`What the user just asked cannot be sent to the core yet. Ask them now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}"`));
+			const line = framedSystem(`What the user just asked cannot be sent to the core yet. Ask them now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}"`);
+			// Not the notification queue: it can sit behind the model's own answer and the next turn (2026-10-13 00:41:
+			// decided at :16, said at :35, after an unrelated noise turn).
+			(this.deps.ask ?? this.deps.notice)?.(line);
 			return;
 		}
 		const submitted = await this.deps.submit({ task: verdict.task });

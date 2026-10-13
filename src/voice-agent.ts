@@ -74,7 +74,7 @@ import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLoc
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
-import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines } from './relay-agent.js';
+import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines, createAskDelivery } from './relay-agent.js';
 import { createVoiceTaskStatusWriter } from './voice-task-status-writer.js';
 import { createGeminiTurnClassifier, createGeminiWorkCheck, WORK_CHECK_MODEL } from './work-request-check.js';
 import {
@@ -991,6 +991,10 @@ async function main() {
 	// The relay agent runs every `work` call as a bodhi subagent: submit, then return the core's result.
 	// A `work` call waits until the user has finished speaking (subscribed once the session exists).
 	const speechGate = createSpeechGate();
+	const relayAsk = createAskDelivery({
+		inject: (text) => { void sessionRef?.injectText(text, { mode: 'live' }); },
+		log: (m) => console.log(`${ts()} ${m}`),
+	});
 	const relayAgent = new RelayAgent({
 		submit: submitWorkTask,
 		store: voiceTaskStore,
@@ -1004,6 +1008,8 @@ async function main() {
 		// Every finished user turn too, whatever tool the voice model chose: is it a request for the core?
 		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`) }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
+		// A question for the user is said as live input once the model stops speaking, not queued as a notification.
+		ask: (text) => relayAsk.ask(text),
 		log: (msg) => console.log(`${ts()} ${msg}`),
 	});
 	setVoiceTaskEndedListener((taskId, why) => { relayAgent.endCall(taskId, why); });
@@ -1454,6 +1460,9 @@ async function main() {
 	session.eventBus.subscribe('speech.user_started', (e: { source?: string }) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechStarted(e); });
 	session.eventBus.subscribe('speech.user_ended', (e: { source?: string }) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechEnded(e); });
 	session.eventBus.subscribe('response.first_audio', () => speechGate.onModelAudio());
+	// The relay's question for the user waits only while the model is speaking.
+	session.eventBus.subscribe('response.first_audio', () => relayAsk.onModelAudio());
+	session.eventBus.subscribe('turn.end', () => relayAsk.onTurnEnd());
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const speechHost = session as any;
 	setVoiceTurnsProvider(() => ({
