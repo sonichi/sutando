@@ -422,6 +422,15 @@ export function createHandoffPacer(deps: {
 	};
 }
 
+/** The last `n` spoken lines of the live conversation, oldest first, as "user: …" / "assistant: …". System lines are left out. */
+export function recentConversationLines(items: ReadonlyArray<{ role?: string; content?: string }>, n: number): string {
+	return items
+		.filter((i) => (i.role === 'user' || i.role === 'assistant') && i.content?.trim() && !i.content.startsWith('[System:'))
+		.slice(-n)
+		.map((i) => `${i.role}: ${i.content!.replace(/\s+/g, ' ').trim()}`)
+		.join('\n');
+}
+
 /** Submits one `work` call to the core: the tool's own execute, returning its status object. */
 export type SubmitWork = (args: Record<string, unknown>) => Promise<Record<string, unknown>>;
 

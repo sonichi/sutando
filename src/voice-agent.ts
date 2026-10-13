@@ -71,7 +71,7 @@ import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLoc
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
-import { RelayAgent, relayAgentSubagentConfig, createSpeechGate } from './relay-agent.js';
+import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines } from './relay-agent.js';
 import { createVoiceTaskStatusWriter } from './voice-task-status-writer.js';
 import { createGeminiTurnClassifier, createGeminiWorkCheck } from './work-request-check.js';
 import {
@@ -972,7 +972,10 @@ async function main() {
 		speech: speechGate,
 		// A text model, not the voice model, decides whether a request is complete enough to submit.
 		check: createGeminiWorkCheck({ apiKey: () => GEMINI_VOICE_API_KEY, log: (m) => console.log(`${ts()} ${m}`) }),
-		recentConversation: () => getRecentConversation(8),
+		// From the live conversation, not conversation.log: the log is written asynchronously, so a check that
+		// starts right after a turn would miss the voice model's own reply (2026-10-12 00:06: it missed "哪一个餐馆？"
+		// and sent "那个餐馆的 menu" with the blank in it).
+		recentConversation: () => recentConversationLines(sessionRef?.conversationContext.items ?? [], 8) || getRecentConversation(8),
 		// Every finished user turn too, whatever tool the voice model chose: is it a request for the core?
 		classify: createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, log: (m) => console.log(`${ts()} ${m}`) }),
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },

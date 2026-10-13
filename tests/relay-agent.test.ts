@@ -331,6 +331,21 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		assert.match(workCheckPrompt({ task: 't', recentConversation: '' }), /Do NOT fill it in from a PR, file or meeting that came up earlier in a different request: ask/);
 	});
 
+	it('the checks read the live conversation, so the voice model\'s own question is there at once', async () => {
+		const { recentConversationLines } = await import('../src/relay-agent.js');
+		const items = [
+			{ role: 'user', content: '帮我查一下 5334 的状态。' },
+			{ role: 'assistant', content: '[System: something]' },
+			{ role: 'tool_call', content: '{}' },
+			{ role: 'user', content: '帮我查一下那个餐馆的 menu。' },
+			{ role: 'assistant', content: '请问您是指哪一个餐馆呢？' },
+		];
+		assert.equal(recentConversationLines(items, 2), 'user: 帮我查一下那个餐馆的 menu。\nassistant: 请问您是指哪一个餐馆呢？');
+		assert.equal(recentConversationLines(items, 8).split('\n').length, 3, 'system lines and tool items left out');
+		const agentSrc = readFileSync(join(import.meta.dirname ?? '.', '..', 'src', 'voice-agent.ts'), 'utf-8');
+		assert.match(agentSrc, /recentConversation: \(\) => recentConversationLines\(sessionRef\?\.conversationContext\.items/);
+	});
+
 	it('the voice agent hands every real user turn to the relay agent', () => {
 		const agentSrc = readFileSync(join(import.meta.dirname ?? '.', '..', 'src', 'voice-agent.ts'), 'utf-8');
 		assert.match(agentSrc, /relayAgent\.onUserTurn\(item\.content\)/);
