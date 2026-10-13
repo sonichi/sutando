@@ -6,7 +6,7 @@ import type { SkillSetupCtx, VoiceSurfaceContribution } from '../../src/skill-se
 import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './session-context.js';
 import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateClient, navigateUiAvailable, navigateUiTool, resolveUiNavigated } from './navigate.js';
 import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
-import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createSearchCommonsTool, createSearchRoomTool, createWritePageTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
+import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createAddCommentTool, createSearchCommonsTool, createSearchRoomTool, createWritePageTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
 
 export const tools: ToolDefinition[] = [];
 
@@ -85,8 +85,9 @@ function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; tu
 	const commons = createSearchCommonsTool(deps);
 	const page = createReadPageTool(deps);
 	const write = createWritePageTool(deps);
+	const comment = createAddCommentTool(deps);
 	const list = createListRoomsTool({ index, log });
-	return { tools: [read, search, commons, page, write, list], promptRules: [ROOM_READ_PROMPT_RULE], turnCheckRules: [ROOM_TURN_CHECK_RULE], contextLines: () => roomIndexContextLines(index) };
+	return { tools: [read, search, commons, page, write, comment, list], promptRules: [ROOM_READ_PROMPT_RULE], turnCheckRules: [ROOM_TURN_CHECK_RULE], contextLines: () => roomIndexContextLines(index) };
 }
 
 export function voiceSurface(): VoiceSurfaceContribution {
