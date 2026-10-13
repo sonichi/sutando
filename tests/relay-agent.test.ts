@@ -147,7 +147,8 @@ describe('relay agent: a text model checks a request before it is submitted', ()
 		// 2026-10-12 03:08 and 03:17: "帮我查一下那个 PR 的状态" became the task "查一下PR的状态".
 		const seen: Array<{ task: string; recentConversation: string }> = [];
 		const { relay, submitted, logs } = agent(async (input) => { seen.push(input); return { action: 'ask', question: '你说的是哪个 PR？' }; });
-		const out = await relay.invoke('w', { task: '查一下PR的状态' });
+		// Raced against a timer: with the ask path removed the call waits on a submit that never ends, so the test fails instead of hanging.
+		const out = await Promise.race([relay.invoke('w', { task: '查一下PR的状态' }), tick(3_000).then(() => 'timed out')]);
 		assert.deepEqual(submitted, [], 'nothing submitted');
 		assert.match(out, /Nothing was submitted/);
 		assert.match(out, /Ask the user now, in their language, exactly: "你说的是哪个 PR？"/);
@@ -176,6 +177,66 @@ describe('relay agent: a text model checks a request before it is submitted', ()
 		assert.deepEqual(parseWorkCheck('{"action":"submit"}'), { action: 'submit' });
 		assert.deepEqual(parseWorkCheck('{"action":"ask"}'), { action: 'submit' }, 'an ask with no question is not an ask');
 		assert.deepEqual(parseWorkCheck('sure, go ahead'), { action: 'submit' });
+	});
+});
+
+describe('the Gemini check call: every failure lets the request through', () => {
+	const realFetch = globalThis.fetch;
+	after(() => { globalThis.fetch = realFetch; });
+	const input = { task: 'check PR 5302', recentConversation: 'user: check PR 5302', openTasks: [] };
+	const reply = (body: unknown, status = 200) => async () => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status });
+
+	it('a model that never answers is cut off at the timeout: work submits, turn check is none', async () => {
+		const { createGeminiWorkCheck, createGeminiTurnClassifier } = await import('../src/work-request-check.js');
+		globalThis.fetch = ((_url: unknown, init?: RequestInit) => new Promise((_r, reject) => {
+			init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+		})) as typeof fetch;
+		const logs: string[] = [];
+		const t0 = Date.now();
+		const work = await createGeminiWorkCheck({ apiKey: () => 'k', timeoutMs: 50, log: (m) => logs.push(m) })(input);
+		const turn = await createGeminiTurnClassifier({ apiKey: () => 'k', timeoutMs: 50, log: (m) => logs.push(m) })({ utterance: 'check PR 5302', recentConversation: input.recentConversation, openTasks: [] });
+		assert.deepEqual(work, { action: 'submit' });
+		assert.deepEqual(turn, { action: 'none' });
+		assert.ok(Date.now() - t0 < 1_000, 'the timeout ends the wait');
+		assert.ok(logs.some((l) => l.includes('work check failed')) && logs.some((l) => l.includes('turn check failed')));
+	});
+
+	it('a call the session aborts ends at once and submits nothing extra', async () => {
+		const { createGeminiWorkCheck } = await import('../src/work-request-check.js');
+		globalThis.fetch = ((_url: unknown, init?: RequestInit) => new Promise((_r, reject) => {
+			init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+		})) as typeof fetch;
+		const ctl = new AbortController();
+		const p = createGeminiWorkCheck({ apiKey: () => 'k', timeoutMs: 10_000 })(input, ctl.signal);
+		ctl.abort();
+		assert.deepEqual(await Promise.race([p, tick(1_000).then(() => 'hung')]), { action: 'submit' });
+	});
+
+	it('an HTTP error, a non-JSON body, an empty answer and a missing key all submit', async () => {
+		const { createGeminiWorkCheck } = await import('../src/work-request-check.js');
+		const check = createGeminiWorkCheck({ apiKey: () => 'k', timeoutMs: 1_000 });
+		globalThis.fetch = reply({ error: { message: 'quota exceeded' } }, 429) as typeof fetch;
+		assert.deepEqual(await check(input), { action: 'submit' }, 'HTTP error');
+		globalThis.fetch = reply('<html>bad gateway</html>', 502) as typeof fetch;
+		assert.deepEqual(await check(input), { action: 'submit' }, 'non-JSON body');
+		globalThis.fetch = reply({ candidates: [] }) as typeof fetch;
+		assert.deepEqual(await check(input), { action: 'submit' }, 'empty answer');
+		let called = false;
+		globalThis.fetch = (async () => { called = true; return new Response('{}'); }) as typeof fetch;
+		assert.deepEqual(await createGeminiWorkCheck({ apiKey: () => undefined })(input), { action: 'submit' }, 'no key');
+		assert.equal(called, false, 'no key, no call');
+	});
+
+	it('a real answer is read, and the key goes in a header, never the URL', async () => {
+		const { createGeminiWorkCheck } = await import('../src/work-request-check.js');
+		let url = ''; let key = '';
+		globalThis.fetch = (async (u: unknown, init?: RequestInit) => {
+			url = String(u); key = String((init?.headers as Record<string, string>)['x-goog-api-key']);
+			return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: '{"action":"ask","question":"哪个 PR？"}' }] } }] }));
+		}) as typeof fetch;
+		assert.deepEqual(await createGeminiWorkCheck({ apiKey: () => 'secret-k' })(input), { action: 'ask', question: '哪个 PR？' });
+		assert.equal(key, 'secret-k');
+		assert.ok(!url.includes('secret-k'));
 	});
 });
 
