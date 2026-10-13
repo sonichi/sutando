@@ -26,7 +26,7 @@ const {
 	listRooms, createRoomIndex, roomIndexContextLines, createListRoomsTool, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_READ_CALL_TIMEOUT_MS,
 	searchRoom, createSearchRoomTool, toHitLines, ROOM_SEARCH_DEFAULT_LIMIT, ROOM_TURN_CHECK_RULE,
 	searchCommons, readPage, toCommonsHits, createSearchCommonsTool, createReadPageTool, ROOM_COMMONS_DEFAULT_LIMIT, ROOM_COMMONS_TIMEOUT_MS, ROOM_PAGE_MAX_BYTES, ROOM_PAGE_MAX_CHARS,
-	writePage, createWritePageTool, ROOM_WRITE_TEXT_MAX, addComment, createAddCommentTool,
+	writePage, createWritePageTool, ROOM_WRITE_TEXT_MAX, addComment, createAddCommentTool, sendMessage, createSendMessageTool,
 	ROOM_READ_BODY_MAX, ROOM_READ_DEFAULT_LIMIT, ROOM_READ_PROMPT_RULE,
 } = await import(pathToFileURL(join(PLUGIN_DIR, 'room-read.ts')).href);
 
@@ -336,7 +336,7 @@ describe('readRoom: every outcome is something the model can say', () => {
 	it('read_room is declared as a tool that fetches the answer, so the turn check does not also send the turn', () => {
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
 		assert.match(src, /answeringTools: roomRead\.tools\.map\(\(t\) => t\.name\)/);
-		assert.match(src, /tools: \[read, search, commons, page, write, comment, list\]/, 'list_rooms, search_room, search_commons, read_page, write_page and add_comment are declared with read_room');
+		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list\]/, 'list_rooms, search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room');
 		assert.match(src, /roomIndexContextLines\(index\)/, 'the room names are in every prompt');
 		assert.match(src, /_rooms\.refresh\(\)\.then\(/, 'the index is the warm-up');
 	});
@@ -407,7 +407,7 @@ describe('searchRoom: what was said about something, however far back', () => {
 		assert.match(ROOM_TURN_CHECK_RULE, /^- none: a question about an AG2 Space room's messages/);
 		assert.match(ROOM_TURN_CHECK_RULE, /never work, even when it names a PR/);
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
-		assert.match(src, /tools: \[read, search, commons, page, write, comment, list\]/, 'search_room, search_commons, read_page, write_page and add_comment are declared with read_room, all answering tools through the same map');
+		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list\]/, 'search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room, all answering tools through the same map');
 		assert.match(src, /turnCheckRules: \[ROOM_TURN_CHECK_RULE\]/, 'the turn check is told');
 	});
 });
@@ -559,8 +559,9 @@ describe('write_page: a spoken note into a room\'s Commons, after the user\'s ye
 		const out = await tool.execute({ title: 'T', text: 'n' }, {} as never);
 		assert.equal(out.ok && out.room, 'C', 'the session\'s room when none is named');
 		assert.match(ROOM_READ_PROMPT_RULE, /→ say back the exact title, text and room, and call write_page only after a clear yes/);
-		assert.match(ROOM_READ_PROMPT_RULE, /or to write a note or comment into one/);
-		assert.match(ROOM_TURN_CHECK_RULE, /A note or comment the user wants written into a room's documents .* is also the assistant's own .*: none, even while the text is still missing — never ask/);
+		assert.match(ROOM_READ_PROMPT_RULE, /or to write a note, a comment or a message into one/);
+		assert.match(ROOM_TURN_CHECK_RULE, /A note, comment or message the user wants written into a room .* is also the assistant's own .*: none, even while the text is still missing — never ask/);
+		assert.match(ROOM_TURN_CHECK_RULE, /Only another action \(review a PR, merge, change code or settings, anything outside the room\) is work/);
 		assert.match(tool.description, /Once they have said yes, call this tool in that same turn: saying you will write it, without the call, writes nothing/);
 		assert.match(tool.description, /A comment or remark on a page \("leave a comment", "留言"\) is add_comment, not this/);
 	});
@@ -590,6 +591,12 @@ describe('add_comment: a comment on a page, as the web client leaves one', () =>
 		assert.equal(f.calls[0].timeoutMs, ROOM_COMMONS_TIMEOUT_MS);
 		await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'Agreed.', quote: 'the record' }, deps(f.client));
 		assert.deepEqual((f.calls[1].args as { arguments: unknown }).arguments, { kind: 'markdown', text: 'Agreed.', quote: 'the record' });
+		// A reply in a comment thread: the root's event_id, no kind.
+		const rep = await addComment({ room: 'open.space launch video', reply_to: '$root', text: 'Thanks.' }, deps(f.client));
+		assert.equal(rep.ok, true);
+		assert.deepEqual((f.calls[2].args as { action: string; arguments: unknown }).action, 'room.commons.comments.reply');
+		assert.deepEqual((f.calls[2].args as { arguments: unknown }).arguments, { root_event_id: '$root', text: 'Thanks.' });
+		assert.deepEqual(await addComment({ room: 'open.space launch video', reply_to: 'root', text: 'x' }, deps(f.client)), { ok: false, error: 'no_thread' });
 	});
 
 	it('nothing is sent without text, with a kind that is not a page, with a quote on a non-Doc page, or to a misheard room; refusals and a missing passage are said', async () => {
@@ -618,6 +625,57 @@ describe('add_comment: a comment on a page, as the web client leaves one', () =>
 		assert.equal(out.ok && out.room, 'C');
 		assert.match(ROOM_READ_PROMPT_RULE, /a comment or 留言 on a page → add_comment the same way, never an appended line/);
 		assert.match(ROOM_READ_PROMPT_RULE, /After the yes, the call comes in that same turn/);
+	});
+});
+
+describe('send_message: a message in a room\'s chat, as the agent, after the user\'s yes', () => {
+	type Call = { name: string; args: Record<string, unknown>; timeoutMs?: number };
+	const fake = (handler: (name: string, args: Record<string, unknown>) => unknown) => {
+		const calls: Call[] = [];
+		return {
+			calls,
+			client: { async callTool(name: string, args: Record<string, unknown>, timeoutMs?: number) { calls.push({ name, args, timeoutMs }); const r = handler(name, args); if (r instanceof Error) throw r; return r; }, close() {} },
+		};
+	};
+	const done = (result: Record<string, unknown>) => ({ structuredContent: { status: 'completed', result } });
+	const triage = [{ room_id: '!cAAaogVSFcIYaNmohw:ag2.space', name: 'Sutando Triage' }];
+	const deps = (client: { callTool: (n: string, a: Record<string, unknown>, t?: number) => Promise<unknown>; close(): void }, rooms = triage) => ({ client: () => client as never, currentRoom: () => null, index: { rooms: () => rooms, refresh: async () => rooms, fetchedAt: () => 1 } });
+
+	it('a plain message, a reply, a thread post and mentions go through room.message.send with a fresh operation_id', async () => {
+		const f = fake(() => done({ event_id: '$sent' }));
+		const r = await sendMessage({ room: 'Sutando Triage', text: ' Looking at 5473 now. ' }, deps(f.client));
+		assert.deepEqual(r, { ok: true, room: 'Sutando Triage', event_id: '$sent', reply: false, mentions: 0, ms: r.ok ? r.ms : -1 });
+		const { operation_id, ...rest } = f.calls[0].args as { operation_id: string };
+		assert.match(operation_id, /^[0-9a-f-]{36}$/);
+		assert.deepEqual(rest, { room_id: '!cAAaogVSFcIYaNmohw:ag2.space', action: 'room.message.send', arguments: { body: 'Looking at 5473 now.' } });
+		assert.equal(f.calls[0].timeoutMs, ROOM_COMMONS_TIMEOUT_MS);
+		const r2 = await sendMessage({ room: 'Sutando Triage', text: 'Yes.', reply_to: '$q', thread: '$t', mentions: ['@sutando-sonichi:ag2.space'] }, deps(f.client));
+		assert.deepEqual(r2.ok && [r2.reply, r2.mentions], [true, 1]);
+		assert.deepEqual((f.calls[1].args as { arguments: unknown }).arguments, { body: 'Yes.', reply_to: '$q', thread_root: '$t', mentions: ['@sutando-sonichi:ag2.space'] });
+	});
+
+	it('nothing is sent without text, with a reply or thread that is not an event id, with a mention that is not a user id, or to a misheard room; refusals are said', async () => {
+		const f = fake(() => done({ event_id: '$x' }));
+		assert.deepEqual(await sendMessage({ room: 'Sutando Triage', text: ' ' }, deps(f.client)), { ok: false, error: 'no_text' });
+		assert.deepEqual(await sendMessage({ room: 'Sutando Triage', text: 'x', reply_to: 'chi' }, deps(f.client)), { ok: false, error: 'no_message' });
+		assert.deepEqual(await sendMessage({ room: 'Sutando Triage', text: 'x', mentions: ['Chi'] }, deps(f.client)), { ok: false, error: 'no_user' });
+		assert.deepEqual(await sendMessage({ room: 'Sutando Triaging', text: 'x' }, deps(f.client)), { ok: false, error: 'not_found', rooms: ['Sutando Triage'] });
+		assert.equal(f.calls.length, 0);
+		const refused = fake(() => ({ isError: true, content: [{ type: 'text', text: '{"code":"FORBIDDEN"}' }] }));
+		assert.deepEqual(await sendMessage({ room: '!a:x', text: 'x' }, deps(refused.client, [])), { ok: false, error: 'FORBIDDEN' });
+	});
+
+	it('the tool is inline; its description requires the read-back and the yes, the call in the same turn, and no mention the user did not ask for', async () => {
+		const f = fake(() => done({ event_id: '$sent' }));
+		const tool = createSendMessageTool({ client: () => f.client, currentRoom: () => ({ id: '!c:x', name: 'C' }), index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 1 } });
+		assert.equal(tool.name, 'send_message');
+		assert.equal(tool.execution, 'inline');
+		assert.match(tool.description, /only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own/);
+		assert.match(tool.description, /say back the exact text you will write, in which room, and whom it replies to or mentions, and call only after the user has clearly said yes/);
+		assert.match(tool.description, /Once they have said yes, call this tool in that same turn/);
+		const out = await tool.execute({ text: 'hi' }, {} as never);
+		assert.equal(out.ok && out.room, 'C');
+		assert.match(ROOM_READ_PROMPT_RULE, /something to say or post in a room's chat .* → send_message the same way, @-mentioning someone only when the user asked to/);
 	});
 });
 
