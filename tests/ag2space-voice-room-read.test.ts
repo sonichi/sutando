@@ -25,6 +25,7 @@ const {
 	findAg2SpaceMcpEntry, createMcpStdioClient, mcpPayload, pickRoom, toMessageLines, readRoom, createReadRoomTool,
 	listRooms, createRoomIndex, roomIndexContextLines, createListRoomsTool, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_READ_CALL_TIMEOUT_MS,
 	searchRoom, createSearchRoomTool, toHitLines, ROOM_SEARCH_DEFAULT_LIMIT, ROOM_TURN_CHECK_RULE,
+	searchCommons, readPage, toCommonsHits, createSearchCommonsTool, createReadPageTool, ROOM_COMMONS_DEFAULT_LIMIT, ROOM_COMMONS_TIMEOUT_MS, ROOM_PAGE_MAX_BYTES, ROOM_PAGE_MAX_CHARS,
 	ROOM_READ_BODY_MAX, ROOM_READ_DEFAULT_LIMIT, ROOM_READ_PROMPT_RULE,
 } = await import(pathToFileURL(join(PLUGIN_DIR, 'room-read.ts')).href);
 
@@ -334,7 +335,7 @@ describe('readRoom: every outcome is something the model can say', () => {
 	it('read_room is declared as a tool that fetches the answer, so the turn check does not also send the turn', () => {
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
 		assert.match(src, /answeringTools: roomRead\.tools\.map\(\(t\) => t\.name\)/);
-		assert.match(src, /tools: \[read, search, list\]/, 'list_rooms and search_room are declared with read_room');
+		assert.match(src, /tools: \[read, search, commons, page, list\]/, 'list_rooms, search_room, search_commons and read_page are declared with read_room');
 		assert.match(src, /roomIndexContextLines\(index\)/, 'the room names are in every prompt');
 		assert.match(src, /_rooms\.refresh\(\)\.then\(/, 'the index is the warm-up');
 	});
@@ -405,8 +406,81 @@ describe('searchRoom: what was said about something, however far back', () => {
 		assert.match(ROOM_TURN_CHECK_RULE, /^- none: a question about an AG2 Space room's messages/);
 		assert.match(ROOM_TURN_CHECK_RULE, /never work, even when it names a PR/);
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
-		assert.match(src, /tools: \[read, search, list\]/, 'search_room is declared with read_room, and is an answering tool through the same map');
+		assert.match(src, /tools: \[read, search, commons, page, list\]/, 'search_room, search_commons and read_page are declared with read_room, all answering tools through the same map');
 		assert.match(src, /turnCheckRules: \[ROOM_TURN_CHECK_RULE\]/, 'the turn check is told');
+	});
+});
+
+describe('the room\'s Commons: its documents, pages and tables', () => {
+	type Call = { name: string; args: Record<string, unknown>; timeoutMs?: number };
+	const fake = (handler: (name: string, args: Record<string, unknown>) => unknown) => {
+		const calls: Call[] = [];
+		return {
+			calls,
+			client: { async callTool(name: string, args: Record<string, unknown>, timeoutMs?: number) { calls.push({ name, args, timeoutMs }); const r = handler(name, args); if (r instanceof Error) throw r; return r; }, close() {} },
+		};
+	};
+	const ok = (result: Record<string, unknown>) => ({ structuredContent: { status: 'completed', result } });
+	const idx = (rooms: Array<{ room_id: string; name: string }>) => ({ rooms: () => rooms, refresh: async () => rooms, fetchedAt: () => 1 });
+	const launch = [{ room_id: '!tdhHBCseqxerbZwbfm:ag2.space', name: 'open.space launch video' }];
+	const docHit = { surface: 'doc', kind: 'markdown-4m8ay3mg', page_id: '4m8ay3mg', title: 'open.space launch video — design', snippet: '…e launch  video — design Draft v1 by Echo…', score: 1, database: null, database_name: null, row: null, sheet_row: null, link: 'https://ag2.space/home/x?surface=doc&page=4m8ay3mg' };
+
+	it('hits say where they are: a page keeps its kind and link, a database row and a sheet row say so; an empty hit is dropped', () => {
+		const hits = toCommonsHits([docHit, { surface: 'database', kind: null, title: 'todo', snippet: 'fix the test', database_name: 'room-todo', row: 7 }, { surface: 'sheet', title: 'plan', snippet: 'Q4', sheet_row: 3 }, { surface: 'doc', title: ' ', snippet: '' }, null]);
+		assert.deepEqual(hits, [
+			{ title: 'open.space launch video — design', where: 'doc', text: '…e launch video — design Draft v1 by Echo…', kind: 'markdown-4m8ay3mg', link: 'https://ag2.space/home/x?surface=doc&page=4m8ay3mg' },
+			{ title: 'todo', where: 'database room-todo row 7', text: 'fix the test' },
+			{ title: 'plan', where: 'sheet row 3', text: 'Q4' },
+		]);
+	});
+
+	it('searches the named room\'s Commons with the words and a longer timeout; the server\'s INTERNAL is passed on as the error', async () => {
+		const f = fake(() => ok({ hits: [docHit], searched: ['doc'], failed_surfaces: [] }));
+		const r = await searchCommons({ room: 'open.space launch video', query: ' launch video ' }, { client: () => f.client, currentRoom: () => null, index: idx(launch) });
+		assert.equal(r.ok, true);
+		assert.deepEqual(r.hits.map(h => h.kind), ['markdown-4m8ay3mg']);
+		assert.deepEqual(f.calls, [{ name: 'room.action.read', args: { room_id: '!tdhHBCseqxerbZwbfm:ag2.space', action: 'room.commons.search', arguments: { query: 'launch video', limit: ROOM_COMMONS_DEFAULT_LIMIT } }, timeoutMs: ROOM_COMMONS_TIMEOUT_MS }]);
+		// 2026-10-13: several rooms answer INTERNAL to a Commons search; the model is told the documents cannot be searched now.
+		const broken = fake(() => ({ isError: true, content: [{ type: 'text', text: '{"code":"INTERNAL","message":"internal error"}' }] }));
+		assert.deepEqual(await searchCommons({ room: 'open.space launch video', query: 'x' }, { client: () => broken.client, currentRoom: () => null, index: idx(launch) }), { ok: false, error: 'INTERNAL' });
+		assert.deepEqual(await searchCommons({ query: '  ' }, { client: () => f.client, currentRoom: () => null, index: idx([]) }), { ok: false, error: 'no_query' });
+		assert.deepEqual(await searchCommons({ room: 'Launch Vido', query: 'x' }, { client: () => f.client, currentRoom: () => null, index: idx(launch) }), { ok: false, error: 'not_found', rooms: ['open.space launch video'] });
+	});
+
+	it('reads one page by its kind, asks for a bounded slice, and cuts what the model gets; a bad kind or no such page is an error', async () => {
+		const long = 'word '.repeat(ROOM_PAGE_MAX_CHARS);
+		const f = fake(() => ok({ kind: 'markdown-4m8ay3mg', surface: 'doc', title: 'design', text: long, offset: 0, next_offset: 32768, total_bytes: 99999, content_hash: 'h' }));
+		const r = await readPage({ room: 'open.space launch video', kind: 'markdown-4m8ay3mg' }, { client: () => f.client, currentRoom: () => null, index: idx(launch) });
+		assert.equal(r.ok, true);
+		assert.equal(r.title, 'design');
+		assert.equal(r.text.length, ROOM_PAGE_MAX_CHARS + 1);
+		assert.equal(r.more, true);
+		assert.deepEqual(f.calls[0].args, { room_id: '!tdhHBCseqxerbZwbfm:ag2.space', action: 'room.commons.pages.read', arguments: { kind: 'markdown-4m8ay3mg', max_bytes: ROOM_PAGE_MAX_BYTES } });
+		assert.equal(f.calls[0].timeoutMs, ROOM_COMMONS_TIMEOUT_MS);
+		const short = fake(() => ok({ title: 't', text: 'all of it', next_offset: null }));
+		const r2 = await readPage({ kind: 'html', room: '!a:x' }, { client: () => short.client, currentRoom: () => null, index: idx([]) });
+		assert.deepEqual(r2.ok && [r2.text, r2.more], ['all of it', false]);
+		assert.deepEqual(await readPage({ kind: 'page 7', room: '!a:x' }, { client: () => short.client, currentRoom: () => null, index: idx([]) }), { ok: false, error: 'no_page' });
+		const missing = fake(() => ({ isError: true, content: [{ type: 'text', text: '{"code":"NOT_FOUND","message":"no such page"}' }] }));
+		assert.deepEqual(await readPage({ kind: 'markdown-nope0000', room: '!a:x' }, { client: () => missing.client, currentRoom: () => null, index: idx([]) }), { ok: false, error: 'NOT_FOUND' });
+	});
+
+	it('both tools are inline; the descriptions and rules send document questions here, chat questions to search_room', async () => {
+		const f = fake(() => ok({ hits: [docHit] }));
+		const deps = { client: () => f.client, currentRoom: () => ({ id: '!c:x', name: 'C' }), index: idx([]) };
+		const search = createSearchCommonsTool(deps);
+		const page = createReadPageTool(deps);
+		assert.deepEqual([search.name, search.execution, page.name, page.execution], ['search_commons', 'inline', 'read_page', 'inline']);
+		assert.match(search.description, /documents \(Doc pages\), HTML pages, database rows and sheet rows/);
+		assert.match(search.description, /never answer from memory; search every time/);
+		assert.match(search.description, /For what was said in the room's chat, use search_room instead/);
+		assert.match(search.description, /"INTERNAL", "not_connected", "timeout" or "unavailable" — say the room's documents cannot be searched right now/);
+		assert.match(page.description, /Pass `kind` exactly as the search hit gave it/);
+		assert.match(page.description, /summarize it in a few sentences, never read it out/);
+		const out = await search.execute({ query: 'design' }, {} as never);
+		assert.equal(out.ok && out.hits[0].kind, 'markdown-4m8ay3mg');
+		assert.match(ROOM_READ_PROMPT_RULE, /documents, pages, notes, plans or tables .* → search_commons, then read_page/);
+		assert.match(ROOM_TURN_CHECK_RULE, /whether the room has a doc, page, note or table about something and what it says/);
 	});
 });
 

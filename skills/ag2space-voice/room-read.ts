@@ -31,6 +31,13 @@ export const ROOM_INDEX_MAX_PAGES = 4;
 export const ROOM_INDEX_TTL_MS = 5 * 60_000;
 /** The first fetch mints the token and lists cold (6.7 s measured on 2026-10-13); after that a list is well under a second. */
 export const ROOM_INDEX_COLD_TIMEOUT_MS = 15_000;
+/** room.commons.search / room.commons.pages.read: the room's docs, pages and tables. A page read took 9 s once (2026-10-13). */
+export const ROOM_COMMONS_TIMEOUT_MS = 15_000;
+export const ROOM_COMMONS_DEFAULT_LIMIT = 10;
+export const ROOM_COMMONS_MAX_LIMIT = 50;
+/** One page read asks the server for this much and hands the model at most ROOM_PAGE_MAX_CHARS of it. */
+export const ROOM_PAGE_MAX_BYTES = 32_768;
+export const ROOM_PAGE_MAX_CHARS = 8_000;
 
 export interface McpStdioEntry { command: string; args?: string[]; env?: Record<string, string> }
 
@@ -290,9 +297,9 @@ async function targetRoom(name: string | undefined, deps: ReadRoomDeps): Promise
 }
 
 /** One room action that reads: a thrown error is "timeout" or "unavailable"; an error answer is its code. */
-async function roomRead(client: McpClient, room: RoomRef, action: string, args: Record<string, unknown>, deps: ReadRoomDeps): Promise<{ ok: true; result: Record<string, unknown> } | { ok: false; error: string }> {
+async function roomRead(client: McpClient, room: RoomRef, action: string, args: Record<string, unknown>, deps: ReadRoomDeps, timeoutMs?: number): Promise<{ ok: true; result: Record<string, unknown> } | { ok: false; error: string }> {
 	try {
-		const res = await client.callTool('room.action.read', { room_id: room.room_id, action, arguments: args });
+		const res = await client.callTool('room.action.read', { room_id: room.room_id, action, arguments: args }, timeoutMs);
 		const payload = mcpPayload(res);
 		if (res.isError || !payload) return { ok: false, error: String((payload as { code?: string } | null)?.code ?? 'read_failed') };
 		return { ok: true, result: (payload.result ?? payload) as Record<string, unknown> };
@@ -359,6 +366,75 @@ export async function searchRoom(args: { room?: string; query: string; limit?: n
 	return { ok: true, room: target.room.name, query, hits, ms: Date.now() - t0 };
 }
 
+export interface CommonsHit { title: string; where: string; text: string; kind?: string; link?: string }
+
+/** Commons hits (best first) → lines the model can retell; a page hit keeps the kind read_page needs. */
+export function toCommonsHits(hits: unknown[]): CommonsHit[] {
+	const out: CommonsHit[] = [];
+	for (const h of hits) {
+		if (!h || typeof h !== 'object') continue;
+		const hit = h as { surface?: string; kind?: string | null; title?: string; snippet?: string; database_name?: string | null; row?: unknown; sheet_row?: unknown; link?: string };
+		const title = typeof hit.title === 'string' ? hit.title.trim() : '';
+		const text = typeof hit.snippet === 'string' ? hit.snippet.replace(/\s+/g, ' ').trim() : '';
+		if (!title && !text) continue;
+		const where = hit.database_name ? `database ${hit.database_name}${hit.row != null ? ` row ${String(hit.row)}` : ''}`
+			: hit.sheet_row != null ? `sheet row ${String(hit.sheet_row)}`
+			: String(hit.surface ?? 'page');
+		out.push({
+			title, where, text: text.length > ROOM_READ_BODY_MAX ? `${text.slice(0, ROOM_READ_BODY_MAX)}…` : text,
+			...(typeof hit.kind === 'string' && hit.kind ? { kind: hit.kind } : {}),
+			...(typeof hit.link === 'string' && hit.link ? { link: hit.link } : {}),
+		});
+	}
+	return out;
+}
+
+export type SearchCommonsResult =
+	| { ok: true; room: string; query: string; hits: CommonsHit[]; ms: number }
+	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
+
+/** Search a room's Commons — its Doc pages, HTML pages, database and sheet rows — through room.commons.search. */
+export async function searchCommons(args: { room?: string; query: string; limit?: number }, deps: ReadRoomDeps): Promise<SearchCommonsResult> {
+	const t0 = Date.now();
+	const client = deps.client();
+	if (!client) return { ok: false, error: 'not_connected' };
+	const query = (args.query ?? '').trim().slice(0, 200);
+	if (!query) return { ok: false, error: 'no_query' };
+	const limit = Math.min(ROOM_COMMONS_MAX_LIMIT, Math.max(1, Math.floor(args.limit ?? ROOM_COMMONS_DEFAULT_LIMIT)));
+	const target = await targetRoom(args.room, deps);
+	if (!target.ok) return target;
+	const found = await roomRead(client, target.room, 'room.commons.search', { query, limit }, deps, ROOM_COMMONS_TIMEOUT_MS);
+	if (!found.ok) return found;
+	const hits = toCommonsHits(Array.isArray(found.result.hits) ? found.result.hits : []);
+	return { ok: true, room: target.room.name, query, hits, ms: Date.now() - t0 };
+}
+
+export type ReadPageResult =
+	| { ok: true; room: string; title: string; text: string; more: boolean; ms: number }
+	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
+
+/** Read one Commons page (a search hit's kind) through room.commons.pages.read; the model gets its start, cut at ROOM_PAGE_MAX_CHARS. */
+export async function readPage(args: { room?: string; kind: string }, deps: ReadRoomDeps): Promise<ReadPageResult> {
+	const t0 = Date.now();
+	const client = deps.client();
+	if (!client) return { ok: false, error: 'not_connected' };
+	const kind = (args.kind ?? '').trim();
+	if (!/^(markdown|html)(-[a-z0-9]{8})?$/.test(kind)) return { ok: false, error: 'no_page' };
+	const target = await targetRoom(args.room, deps);
+	if (!target.ok) return target;
+	const read = await roomRead(client, target.room, 'room.commons.pages.read', { kind, max_bytes: ROOM_PAGE_MAX_BYTES }, deps, ROOM_COMMONS_TIMEOUT_MS);
+	if (!read.ok) return read;
+	const full = typeof read.result.text === 'string' ? read.result.text : '';
+	const cut = full.length > ROOM_PAGE_MAX_CHARS;
+	return {
+		ok: true, room: target.room.name,
+		title: typeof read.result.title === 'string' ? read.result.title : '',
+		text: cut ? `${full.slice(0, ROOM_PAGE_MAX_CHARS)}…` : full,
+		more: cut || read.result.next_offset != null,
+		ms: Date.now() - t0,
+	};
+}
+
 export function createReadRoomTool(deps: ReadRoomDeps): ToolDefinition {
 	return {
 		name: 'read_room',
@@ -415,6 +491,60 @@ export function createSearchRoomTool(deps: ReadRoomDeps): ToolDefinition {
 	};
 }
 
+const ROOM_NAME_ERRORS = '"not_found" with rooms (every room you can read) — the name you passed is not one of them; room names are often misheard, so if one of rooms is clearly the room the user meant, call again with that exact name, and ask which only when none clearly is; "ambiguous" with candidates — ask which one; "no_room" — ask which room; ';
+
+export function createSearchCommonsTool(deps: ReadRoomDeps): ToolDefinition {
+	return {
+		name: 'search_commons',
+		description:
+			'Search an AG2 Space room\'s Commons — its documents (Doc pages), HTML pages, database rows and sheet rows — for words, right now (a few seconds). ' +
+			'Call it when the user asks about a room\'s documents, pages, notes, plans, tables or records ("is there a doc about X in <room>", "what does the design page say", "what is in the todo table") — never answer from memory; search every time. ' +
+			'For what was said in the room\'s chat, use search_room instead. ' +
+			'Pass `query` = the words to find, `room` = the room name as listed in ROOMS; leave `room` out for the room this session is in. ' +
+			'Returns {ok:true, room, hits:[{title, where, text, kind, link}]} best first, each a snippet around the match — answer from them in a sentence or two; to read a whole page, call read_page with its `kind`. ' +
+			'No hits means the room\'s Commons has nothing about it; say so. ' +
+			'Errors: ' + ROOM_NAME_ERRORS +
+			'"INTERNAL", "not_connected", "timeout" or "unavailable" — say the room\'s documents cannot be searched right now; "ROOM_ACCESS_DENIED" or "FORBIDDEN" — say you cannot read that room\'s documents.',
+		parameters: z.object({
+			query: z.string().min(1).max(200).describe('The words to find, e.g. "launch video design" or "pending questions".'),
+			room: z.string().optional().describe('The room name, e.g. "Sutando Triage". Omit for the current room.'),
+			limit: z.number().int().min(1).max(ROOM_COMMONS_MAX_LIMIT).optional().describe(`How many hits (default ${ROOM_COMMONS_DEFAULT_LIMIT}).`),
+		}),
+		execution: 'inline',
+		timeout: ROOM_INDEX_COLD_TIMEOUT_MS + ROOM_COMMONS_TIMEOUT_MS + 1000,
+		async execute(args) {
+			const a = (args ?? {}) as { room?: string; query: string; limit?: number };
+			const r = await searchCommons(a, deps);
+			deps.log?.(`[RoomRead] commons ${a.room ? `"${a.room}"` : '(current room)'} for "${a.query}" → ${r.ok ? `${r.room}: ${r.hits.length} hits in ${r.ms}ms` : r.error}`);
+			return r;
+		},
+	};
+}
+
+export function createReadPageTool(deps: ReadRoomDeps): ToolDefinition {
+	return {
+		name: 'read_page',
+		description:
+			'Read one page of an AG2 Space room\'s Commons — a document or HTML page found by search_commons — right now (a few seconds). ' +
+			'Pass `kind` exactly as the search hit gave it (e.g. "markdown-4m8ay3mg"), and `room` = the same room; leave `room` out for the room this session is in. ' +
+			`Returns {ok:true, room, title, text, more} — the page's text, cut after ${ROOM_PAGE_MAX_CHARS} characters (more:true when there is more); summarize it in a few sentences, never read it out. ` +
+			'Errors: "no_page" — the kind is not a page kind; "NOT_FOUND" — no such page; ' + ROOM_NAME_ERRORS +
+			'"INTERNAL", "not_connected", "timeout" or "unavailable" — say the page cannot be read right now.',
+		parameters: z.object({
+			kind: z.string().describe('The page\'s kind from a search_commons hit, e.g. "markdown-4m8ay3mg".'),
+			room: z.string().optional().describe('The room name, e.g. "Sutando Triage". Omit for the current room.'),
+		}),
+		execution: 'inline',
+		timeout: ROOM_INDEX_COLD_TIMEOUT_MS + ROOM_COMMONS_TIMEOUT_MS + 1000,
+		async execute(args) {
+			const a = (args ?? {}) as { room?: string; kind: string };
+			const r = await readPage(a, deps);
+			deps.log?.(`[RoomRead] page ${a.kind} in ${a.room ? `"${a.room}"` : '(current room)'} → ${r.ok ? `"${r.title}": ${r.text.length} chars${r.more ? ' (more)' : ''} in ${r.ms}ms` : r.error}`);
+			return r;
+		},
+	};
+}
+
 /** list_rooms: the rooms the agent can read, fetched now — for "which rooms are you in", and to refresh the index. */
 export function createListRoomsTool(deps: { index: RoomIndex; log?: (m: string) => void }): ToolDefinition {
 	return {
@@ -439,7 +569,7 @@ export function createListRoomsTool(deps: { index: RoomIndex; log?: (m: string) 
 }
 
 /** The prompt rule that goes with the tool; present only when the tool is declared. */
-export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about an AG2 Space room is answered from the room, every time, never from memory or an earlier answer — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now. "What\'s new in <room>", "did <person> reply there" → read_room. "What was said about <PR/topic/person> in <room>", "what was the review of <PR> there", anything that may be earlier than the latest messages → search_room, then read_room with `around` for the discussion. What a message in a room means, or why someone said it, is answered from that message: read_room with `around` for its full text, then explain. Never submit work to read, search or explain a room; submit work only when the room\'s messages do not hold the answer and the user wants it looked up elsewhere. Pass the room name as it appears in the ROOMS line, not as it was heard; a "not_found" lists the rooms — pick the one meant and call again.';
+export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about an AG2 Space room is answered from the room, every time, never from memory or an earlier answer — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now. "What\'s new in <room>", "did <person> reply there" → read_room. "What was said about <PR/topic/person> in <room>", "what was the review of <PR> there", anything that may be earlier than the latest messages → search_room, then read_room with `around` for the discussion. What a message in a room means, or why someone said it, is answered from that message: read_room with `around` for its full text, then explain. A room\'s documents, pages, notes, plans or tables ("is there a doc about X in <room>", "what does the design page say") → search_commons, then read_page for a whole page. Never submit work to read, search or explain a room or its documents; submit work only when the room\'s messages do not hold the answer and the user wants it looked up elsewhere. Pass the room name as it appears in the ROOMS line, not as it was heard; a "not_found" lists the rooms — pick the one meant and call again.';
 
 /** What the relay agent\'s turn check is told: a room question is the voice model\'s own, never a task for the core. */
-export const ROOM_TURN_CHECK_RULE = '- none: a question about an AG2 Space room\'s messages — what is new there, who replied, what someone said there about a PR, topic or person, what a message there means — is answered by the assistant itself, which reads and searches the room. It is never work, even when it names a PR. Only an action (post, reply, review, merge, change something) is work.';
+export const ROOM_TURN_CHECK_RULE = '- none: a question about an AG2 Space room\'s messages or documents — what is new there, who replied, what someone said there about a PR, topic or person, what a message there means, whether the room has a doc, page, note or table about something and what it says — is answered by the assistant itself, which reads and searches the room. It is never work, even when it names a PR. Only an action (post, reply, review, merge, change something) is work.';
