@@ -22,6 +22,9 @@ clears the state:
   holds a completed turn that did work, or the CLI's "Login successful" line.
   A newer typed prompt, a spinner or an empty capture prove nothing.
 
+- `refusal_answered(pane)` is True when a refusal is on the pane and something after it
+  shows the CLI signed in again: the first frame that proves the refusal is over.
+
 - `signed_in_since(text)` is the clearing rule on its own: does `text`, the pane
   below a login marker, show "Login successful", the agent's `●` output, a `⏺`
   tool call, or a completed turn that outran a refusal (one finishes in 0-1 s
@@ -111,6 +114,14 @@ def login_expired(pane: Optional[str]) -> Optional[str]:
 
 def auth_expired(pane: Optional[str]) -> bool:
     return login_expired(pane) is not None
+
+
+def refusal_answered(pane: Optional[str]) -> bool:
+    """A login refusal is on the pane and the CLI signed in after it ("Login successful",
+    the agent's `●`, a `⏺` tool call, or a completed turn that did work), in this one frame."""
+    lines = _lines(pane)
+    last = max((i for i, ln in enumerate(lines) if login_refusal(ln)), default=None)
+    return last is not None and _signed_in_after(lines, last)
 
 
 def authenticated_turn(pane: Optional[str]) -> bool:

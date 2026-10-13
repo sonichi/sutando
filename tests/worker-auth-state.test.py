@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from cli_wedge import live_banner_lines  # noqa: E402
 from worker_auth_state import (auth_expired, authenticated_turn, login_expired,  # noqa: E402
-                               login_refusal, signed_in_since)
+                               login_refusal, refusal_answered, signed_in_since)
 
 FOOTER = ("────────\n❯ \n────────\n"
           "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
@@ -182,6 +182,24 @@ class ProofOfASignedInTurn(unittest.TestCase):
     def test_a_completed_turn_without_a_duration_counts_only_if_it_ran(self):
         self.assertTrue(authenticated_turn("❯ hi\n● Done.\n✻ Cooked · done 1:00 PM\n" + FOOTER))
         self.assertFalse(authenticated_turn("❯ hi\n  ⎿  x\n✻ Cooked · done 1:00 PM\n" + FOOTER))
+
+
+class TheRefusalIsAnswered(unittest.TestCase):
+    """#5478: the first frame showing the CLI signed in after a refusal ends it, so a card
+    clears on that frame instead of waiting for the next completed turn."""
+
+    def test_output_after_the_refusal_answers_it(self):
+        for tail in ("❯ hi\n● Hello.\n", "❯ hi\n⏺ Bash(ls)\n", "  ⎿  Login successful\n",
+                     "❯ hi\n● Checking.\n✻ Perambulating… (1m 46s · ↓ 5.9k tokens)\n"):
+            self.assertTrue(refusal_answered(REFUSED + tail + FOOTER), tail)
+
+    def test_nothing_after_the_refusal_does_not(self):
+        for tail in ("", "❯ try again\n", "❯ try again\n✻ Perambulating… (1m 46s)\n"):
+            self.assertFalse(refusal_answered(REFUSED + tail + FOOTER), tail)
+
+    def test_no_refusal_on_the_pane_is_not_an_answer(self):
+        for pane in (None, "", FOOTER, "● Earlier answer.\n" + FOOTER):
+            self.assertFalse(refusal_answered(pane), repr(pane))
 
 
 if __name__ == "__main__":
