@@ -1,7 +1,8 @@
 """`ag2-sparrow-hatch install|verify|sparrow|reply`: set up, check and answer through the Hatch hook.
 
 install writes the hook script to ~/hooks/scripts/, the hook definition to
-~/hooks/definitions/ and the config the script reads; verify checks that setup;
+~/hooks/definitions/ and the config the script reads, and where systemd runs a user
+manager, the ag2-sparrow user service that restarts Sparrow; verify checks that setup;
 sparrow checks only that Sparrow is running (the hook's heartbeat runs it); reply
 writes a worker's answer to its result_file and waits until Sparrow has sent it."""
 from __future__ import annotations
@@ -47,6 +48,11 @@ REPLY_PLACEHOLDER = "<REPLY_COMMAND>"
 # `reply` exit codes: posted, not posted, usage, sent to Sparrow but not yet confirmed.
 REPLY_POSTED, REPLY_NOT_POSTED, REPLY_UNCONFIRMED = 0, 1, 3
 REPLY_WAIT_S, REPLY_WAIT_MAX_S, REPLY_MAX_BYTES = 30.0, 300.0, 64 * 1024
+SPARROW_COMMAND = "ag2-sparrow"
+SERVICE_NAME = "ag2-sparrow.service"
+# First line of every unit install writes: a unit without it is the owner's and is kept.
+SERVICE_MARKER = "# Written by ag2-sparrow-hatch install; re-run install to update it."
+SYSTEMD_TIMEOUT_S = 30
 
 
 def _shipped(name: str) -> str:
@@ -173,13 +179,17 @@ def _runnable(path: "str | Path") -> bool:
     return Path(path).is_file() and os.access(path, os.X_OK)
 
 
-def find_reply_command() -> str:
-    """Absolute path of the reply command beside this interpreter, else on PATH; '' if none."""
+def _find_console_script(name: str) -> str:
+    """Absolute path of console script `name` beside this interpreter, else on PATH; '' if none."""
     for d in _script_dirs():
-        if _runnable(Path(d) / REPLY_COMMAND):
-            return str(Path(d) / REPLY_COMMAND)
-    found = shutil.which(REPLY_COMMAND)
+        if _runnable(Path(d) / name):
+            return str(Path(d) / name)
+    found = shutil.which(name)
     return os.path.abspath(found) if found else ""
+
+
+def find_reply_command() -> str:
+    return _find_console_script(REPLY_COMMAND)
 
 
 def reply_command_problem(path: str) -> str:
@@ -192,6 +202,153 @@ def reply_command_problem(path: str) -> str:
     if path != shlex.quote(path):
         return f"{path} needs shell quoting; install ag2-sparrow under a path without spaces"
     return ""
+
+
+def service_path() -> Path:
+    return _home() / ".config" / "systemd" / "user" / SERVICE_NAME
+
+
+def device_env_path() -> Path:
+    """The .env file holding REMOTE_TASK_TOKEN that Sparrow reads at startup."""
+    env = os.environ.get("AG2_DEVICE_ENV")
+    return Path(env).expanduser() if env else _home() / ".config" / "ag2-sparrow" / "relay.env"
+
+
+def _systemd_run(cmd: list) -> "subprocess.CompletedProcess | None":
+    """Run a systemctl/loginctl command; None when it could not run at all."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=SYSTEMD_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _ok(r) -> bool:
+    return r is not None and r.returncode == 0
+
+
+def _why(r) -> str:
+    if r is None:
+        return "could not run"
+    lines = (r.stderr or r.stdout or "").strip().splitlines()
+    return lines[-1] if lines else f"exit {r.returncode}"
+
+
+def systemd_user_available() -> bool:
+    """Whether `systemctl --user` reaches a running user manager."""
+    return shutil.which("systemctl") is not None and \
+        _ok(_systemd_run(["systemctl", "--user", "show-environment"]))
+
+
+def render_service(exec_start: str, env: dict) -> str:
+    rows = "".join(f"Environment={k}={v}\n" for k, v in env.items())
+    return (f"{SERVICE_MARKER}\n[Unit]\nDescription=ag2-sparrow (AG2 Space listener)\n\n"
+            f"[Service]\n{rows}ExecStart={exec_start}\nRestart=on-failure\nRestartSec=10\n"
+            "# 75: another Sparrow already polls this workspace; do not relaunch over it.\n"
+            "RestartPreventExitStatus=75\n\n[Install]\nWantedBy=default.target\n")
+
+
+def _unit_value_problem(value: str) -> str:
+    if value != shlex.quote(value) or "%" in value:
+        return f"{value} needs quoting in a systemd unit; use a path without spaces or %"
+    return ""
+
+
+def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance: str,
+                    force: bool) -> None:
+    """Write, enable and start the ag2-sparrow user service. Never fails the install:
+    each problem prints a NOTE saying what was not done and how to finish by hand."""
+    def note(text: str) -> None:
+        print(f"NOTE service: {text}")
+
+    if not systemd_user_available():
+        note("systemctl --user is not available here, so no service was set up and nothing "
+             "restarts Sparrow after a crash or reboot; keep ag2-sparrow running another way")
+        return
+    exec_start = _find_console_script(SPARROW_COMMAND)
+    if not exec_start:
+        note(f"{SPARROW_COMMAND} was not found beside {sys.executable} or on PATH; no service "
+             "was set up. Reinstall ag2-sparrow for this Python and run install again")
+        return
+    device_env = device_env_path()
+    env = {"AG2_DEVICE_ENV": str(device_env), "AGENT_CONNECT_TASK_DIR": str(task_dir),
+           "AGENT_CONNECT_RESULT_DIR": str(result_dir), "AGENT_CONNECT_STATE_DIR": str(state_dir)}
+    if instance:
+        env["GATEWAY_INSTANCE"] = instance
+    problem = next(filter(None, map(_unit_value_problem, [exec_start, *env.values()])), "")
+    if problem:
+        note(f"{problem}; no service was set up")
+        return
+    unit, text = service_path(), render_service(exec_start, env)
+    changed = True
+    if unit.exists():
+        old = unit.read_text(encoding="utf-8", errors="replace")
+        if old == text:
+            changed = False
+            print(f"unchanged: {unit}")
+        elif not old.startswith(SERVICE_MARKER) and not force:
+            print(f"DIFF: {unit} differs from the ag2-sparrow unit:")
+            print(_diff(old, text, unit), end="")
+            note(f"{unit} was not written by install, so it was kept; re-run with --force to "
+                 "replace it with the unit above")
+            return
+    if changed:
+        _write(unit, text, 0o644)
+        print(f"installed: {unit}")
+        r = _systemd_run(["systemctl", "--user", "daemon-reload"])
+        if not _ok(r):
+            note(f"systemctl --user daemon-reload failed ({_why(r)}); run it, then "
+                 f"systemctl --user enable --now {SERVICE_NAME}")
+            return
+    active = _ok(_systemd_run(["systemctl", "--user", "is-active", "--quiet", SERVICE_NAME]))
+    code, _ = check_sparrow(state_dir, instance=instance)
+    outside = not active and code != SPARROW_DOWN
+    has_token = device_env.is_file()
+    start = has_token and not outside
+    r = _systemd_run(["systemctl", "--user", "enable", *(["--now"] if start else []),
+                      SERVICE_NAME])
+    if not _ok(r):
+        note(f"systemctl --user enable {SERVICE_NAME} failed ({_why(r)}); fix that and run "
+             f"systemctl --user enable --now {SERVICE_NAME}")
+        return
+    if active and changed:
+        r = _systemd_run(["systemctl", "--user", "restart", SERVICE_NAME])
+        print(f"restarted: {SERVICE_NAME} with the new unit" if _ok(r) else
+              f"NOTE service: restart failed ({_why(r)}); run systemctl --user restart "
+              f"{SERVICE_NAME}")
+    print(f"enabled: {SERVICE_NAME}" + (" (running)" if start or active else " (not started)"))
+    if outside:
+        note("Sparrow is already running outside systemd, so the service was enabled but not "
+             "started, and the running Sparrow was left alone. To switch over, stop that "
+             f"ag2-sparrow process, then run: systemctl --user start {SERVICE_NAME}")
+    elif not has_token:
+        note(f"{device_env} is missing, so the service was not started. Put your relay token "
+             f"in it as one line REMOTE_TASK_TOKEN=<token>, chmod 600 it, then run: "
+             f"systemctl --user start {SERVICE_NAME}")
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    r = _systemd_run(["loginctl", "enable-linger", user]) if user else None
+    if _ok(r):
+        print(f"linger: enabled for {user}, so Sparrow runs while you are logged out")
+    else:
+        note(f"loginctl enable-linger {user or '$USER'} failed ({_why(r)}), so Sparrow stops "
+             "when you log out and starts again at your next login. Ask an administrator to "
+             f"run: loginctl enable-linger {user or '$USER'}")
+
+
+def service_status() -> "tuple[bool | None, str]":
+    """(True, detail) installed and enabled; (False, detail) installed but not enabled;
+    (None, detail) when there is nothing to judge (no systemd, or no unit)."""
+    unit = service_path()
+    if not systemd_user_available():
+        return None, "systemctl --user is not available; nothing restarts Sparrow by itself"
+    if not unit.is_file():
+        return None, (f"{unit} not installed; nothing restarts Sparrow after a crash or reboot. "
+                      "Run ag2-sparrow-hatch install to set it up")
+    enabled = _systemd_run(["systemctl", "--user", "is-enabled", SERVICE_NAME])
+    if not _ok(enabled):
+        return False, (f"{unit} installed but not enabled; run systemctl --user enable --now "
+                       f"{SERVICE_NAME}")
+    active = _ok(_systemd_run(["systemctl", "--user", "is-active", "--quiet", SERVICE_NAME]))
+    return True, f"{unit} installed and enabled ({'active' if active else 'not active'})"
 
 
 def install(args) -> int:
@@ -229,6 +386,12 @@ def install(args) -> int:
                            reply_command)
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
+    if args.no_service:
+        print("skipped: the ag2-sparrow user service (--no-service); nothing restarts Sparrow "
+              "after a crash or reboot unless you keep it running another way")
+    else:
+        install_service(task_dir.resolve(), result_dir.resolve(), state_dir.resolve(), instance,
+                        args.force)
     print(f"\nNext: register the hook with hooks.add using {definitions_dir() / f'{HOOK_ID}.json'}, "
           "test it with hooks.dry_run, start it with hooks.enable, then run: ag2-sparrow-hatch verify")
     return 0
@@ -239,8 +402,8 @@ def _check(results: list, ok: bool, name: str, detail: str) -> None:
     print(f"{'PASS' if ok else 'FAIL'} {name}: {detail}")
 
 
-RESTART_HINT = ("restart it: systemctl --user restart ag2-sparrow under the README's user "
-                "service, else start ag2-sparrow again as at install")
+RESTART_HINT = ("restart it: systemctl --user restart ag2-sparrow under the user service "
+                "install sets up, else start ag2-sparrow again as at install")
 
 
 def sparrow_status_path(state_dir: Path, instance: str | None = None) -> Path:
@@ -335,6 +498,12 @@ def verify(_args) -> int:
     state_dir = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
     code, detail = check_sparrow(state_dir, instance=cfg.get("GATEWAY_INSTANCE"))
     _check(results, code == SPARROW_OK, "sparrow", detail)
+
+    ok, detail = service_status()
+    if ok is None:
+        print(f"NOTE service: {detail}")
+    else:
+        _check(results, ok, "service", detail)
 
     reply_command = cfg.get("REPLY_COMMAND", "")
     problem = reply_command_problem(reply_command) if reply_command else \
@@ -505,7 +674,10 @@ def main(argv=None) -> int:
     p.add_argument("--activity-file", help="activity marker (default: ~/.muse/last_active)")
     p.add_argument("--gateway-instance", help="Sparrow's GATEWAY_INSTANCE (default: from the "
                    "environment, as ag2-sparrow reads it)")
-    p.add_argument("--force", action="store_true", help="replace a locally modified hook script")
+    p.add_argument("--force", action="store_true", help="replace a locally modified hook script "
+                   "or ag2-sparrow.service")
+    p.add_argument("--no-service", action="store_true", help="do not set up the ag2-sparrow "
+                   "systemd user service that restarts Sparrow")
     p.set_defaults(func=install)
     v = sub.add_parser("verify", help="check the installed hook")
     v.set_defaults(func=verify)
