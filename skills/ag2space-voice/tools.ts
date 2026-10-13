@@ -6,10 +6,12 @@ import type { SkillSetupCtx, VoiceSurfaceContribution } from '../../src/skill-se
 import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './session-context.js';
 import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateClient, navigateUiAvailable, navigateUiTool, resolveUiNavigated } from './navigate.js';
 import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
+import { ROOM_READ_PROMPT_RULE, createMcpStdioClient, createReadRoomTool, findAg2SpaceMcpEntry, type McpClient } from './room-read.js';
 
 export const tools: ToolDefinition[] = [];
 
 let _binding: RoomBinding | null = null;
+let _mcp: McpClient | null = null;
 
 const ts = () => new Date().toISOString().slice(11, 19);
 
@@ -61,12 +63,33 @@ export function setup(ctx: SkillSetupCtx): void {
 	});
 }
 
+/** read_room is declared only where the core has the ag2-space MCP registered; the voice agent starts the same server. */
+function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[] } {
+	const entry = findAg2SpaceMcpEntry();
+	if (!entry) return { tools: [], promptRules: [] };
+	if (!_mcp) {
+		_mcp = createMcpStdioClient(entry, { log: (m) => console.log(`${ts()} ${m}`) });
+		// Mint the token now so the first question does not wait for it.
+		_mcp.callTool('room.list', { limit: 1 }).then(
+			() => console.log(`${ts()} [RoomRead] ag2-space MCP ready`),
+			(err) => console.warn(`${ts()} [RoomRead] ag2-space MCP warm-up failed: ${err instanceof Error ? err.message : err}`),
+		);
+	}
+	const tool = createReadRoomTool({
+		client: () => _mcp,
+		currentRoom: () => _binding?.current() ?? null,
+		log: (m) => console.log(`${ts()} ${m}`),
+	});
+	return { tools: [tool], promptRules: [ROOM_READ_PROMPT_RULE] };
+}
+
 export function voiceSurface(): VoiceSurfaceContribution {
 	// navigate_ui is declared only where a client can answer it: the gateway channel is provisioned.
 	const navigate = navigateUiAvailable();
+	const roomRead = roomReadSurface();
 	return {
-		tools: navigate ? [navigateUiTool] : [],
-		promptRules: navigate ? [NAVIGATION_PROMPT_RULE] : [],
+		tools: [...(navigate ? [navigateUiTool] : []), ...roomRead.tools],
+		promptRules: [...(navigate ? [NAVIGATION_PROMPT_RULE] : []), ...roomRead.promptRules],
 		contextLines: () => roomContextLines(_binding?.current() ?? null),
 	};
 }
