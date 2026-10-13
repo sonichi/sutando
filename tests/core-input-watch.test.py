@@ -358,6 +358,46 @@ class TestToolOutputIsNotAGate(unittest.TestCase):
                 "  Do you want to proceed?\n  Allow this action\n  Esc to cancel")
         self.assertEqual(compose_state(pane, "working", True)[:4:3], ("blocked-human", "permission"))
 
+# Live Claude Code v2.1.296 shapes: the spinner row carries no "esc to interrupt";
+# the busy footer below it does.
+_LIVE_SPINNER = "✳ Moonwalking… (15s · ↓ 237 tokens)\n"
+_BUSY_FOOTER = "  ⏵⏵ bypass permissions on · 1 monitor · esc to interrupt · ← for agents\n"
+
+
+class TestTheBusyFooterIsNotTheTurnRow(unittest.TestCase):
+    """The live region is cut at the spinner, never at the footer: a dialog drawn
+    between them is live, and tool output above the spinner is transcript."""
+
+    LOGIN_PANE = (
+        "───────────────────────────────── sutando-core ─\n"
+        "Browser didn't open? Use the url below to sign in:\n"
+        "https://claude.ai/oauth/authorize?code=true&client_id=abc&scope=user%3Aprofile\n"
+        "Paste code here if prompted > \n"
+        "Esc to cancel\n"
+        "  ⏵⏵ bypass permissions on · 1 monitor · esc to interrupt · ← for agents\n"
+        "[sutando-c0:2.1.261* 2:monitor                       \"✳ sutando-core\" 00:55 06-Sep-26\n")
+    PERMISSION_UNDER_SPINNER = (
+        _TOOL_OUTPUT_DIALOG + _LIVE_SPINNER + "⏺ Bash(rm -rf build)\n"
+        "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n"
+        "  Esc to cancel · Tab to amend\n" + _BUSY_FOOTER)
+
+    def verdicts(self, pane):
+        v = _mod._pg_classify_pane(pane, _mod.CLAUDE)
+        return (classify(pane) or (None,))[0], compose_state(pane, "working", True)[0], f"{v.state}:{v.reason}"
+
+    def test_login_dialog_above_the_busy_footer_is_login(self):
+        self.assertEqual(self.verdicts(self.LOGIN_PANE), ("login", "blocked-human", "busy:login"))
+
+    def test_permission_dialog_between_spinner_and_busy_footer_is_blocked_human(self):
+        kind, state, verdict = self.verdicts(self.PERMISSION_UNDER_SPINNER)
+        self.assertIn(kind, ("selection", "permission"))
+        self.assertEqual((state, verdict), ("blocked-human", "busy:selection"))
+
+    def test_quoted_dialog_above_the_live_spinner_is_running(self):
+        pane = _TOOL_OUTPUT_DIALOG + _LIVE_SPINNER + _BUSY_FOOTER
+        self.assertEqual(self.verdicts(pane), (None, "running", "busy:working"))
+
+
 class TestUnobservedProbeIsNotHung(unittest.TestCase):
     """An unobserved process probe (tmux refused the client, binary missing) must
     hold, never become the RECOVER-facing `hung`; only a SEEN session with stale

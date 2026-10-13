@@ -46,8 +46,8 @@ from typing import Callable, List, Optional, Tuple
 
 _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC))
-from cli_wedge import (PROVIDER_LIMIT_PATTERNS, WORKING, capture_pane,  # noqa: E402
-                       core_target, frame_abnormal, frame_working)
+from cli_wedge import (PROVIDER_LIMIT_PATTERNS, capture_pane, core_target,  # noqa: E402
+                       frame_abnormal, frame_working)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
@@ -104,8 +104,10 @@ AWAIT_HINT = re.compile(
 # reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
 TURN_DONE = re.compile(
     r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
-# A turn's spinner or its completion line: transcript sits above it, a live dialog below.
-_TURN_ROW = re.compile(rf"{WORKING.pattern}|{TURN_DONE.pattern}", re.I)
+# A turn's spinner ("✳ Moonwalking… (15s · …)") or completion line: transcript above, live dialog
+# below. Not "esc to interrupt": the busy footer carries it, under any live dialog.
+_SPINNER_ROW = re.compile(r"^\s*[·✢✳✶✻✽*]\s+[A-Za-z][\w-]*(?:…|\.\.\.)\s*\(")
+_TURN_ROW = re.compile(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
 
 
 def live_tail(lines: List[str]) -> List[str]:
