@@ -645,6 +645,8 @@ function resolveCurrentMode(): ModeState {
 }
 
 const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, ...inlineTools, ...personalVoiceSurface.tools];
+/** Skill tools that fetch the answer themselves: the relay agent's turn check leaves those turns alone. */
+const answeringTools = new Set(personalVoiceSurface.answeringTools);
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
@@ -1156,6 +1158,7 @@ async function main() {
 				// recordToolCall(). Pushing here would duplicate in
 				// session_events.
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
+				if (answeringTools.has(e.toolName)) relayAgent.noteAnsweringTool(e.toolName);
 				// Flag the web-client that a tool is in flight so the avatar
 				// can show the blue `.working` pulse and the menu bar can
 				// switch to the slow-deep-swing signature. `source=tool` pins

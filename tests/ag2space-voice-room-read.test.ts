@@ -10,7 +10,7 @@
  */
 import { describe, it, test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -203,6 +203,11 @@ describe('readRoom: every outcome is something the model can say', () => {
 		const out = await tool.execute({}, {} as never);
 		assert.equal(out.ok, true);
 		assert.equal(out.messages[0].text, 'hi');
+	});
+
+	it('read_room is declared as a tool that fetches the answer, so the turn check does not also send the turn', () => {
+		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
+		assert.match(src, /answeringTools: roomRead\.tools\.map\(\(t\) => t\.name\)/);
 	});
 });
 }

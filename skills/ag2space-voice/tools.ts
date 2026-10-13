@@ -91,5 +91,6 @@ export function voiceSurface(): VoiceSurfaceContribution {
 		tools: [...(navigate ? [navigateUiTool] : []), ...roomRead.tools],
 		promptRules: [...(navigate ? [NAVIGATION_PROMPT_RULE] : []), ...roomRead.promptRules],
 		contextLines: () => roomContextLines(_binding?.current() ?? null),
+		answeringTools: roomRead.tools.map((t) => t.name),
 	};
 }
