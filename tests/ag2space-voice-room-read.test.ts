@@ -23,7 +23,7 @@ if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => 
 if (PRESENT) {
 const {
 	findAg2SpaceMcpEntry, createMcpStdioClient, mcpPayload, pickRoom, toMessageLines, readRoom, createReadRoomTool,
-	ROOM_READ_BODY_MAX, ROOM_READ_DEFAULT_LIMIT,
+	ROOM_READ_BODY_MAX, ROOM_READ_DEFAULT_LIMIT, ROOM_READ_PROMPT_RULE,
 } = await import(pathToFileURL(join(PLUGIN_DIR, 'room-read.ts')).href);
 
 const dirs: string[] = [];
@@ -197,6 +197,9 @@ describe('readRoom: every outcome is something the model can say', () => {
 		const tool = createReadRoomTool({ client: () => f.client, currentRoom: () => ({ id: '!c:x', name: 'C' }) });
 		assert.equal(tool.name, 'read_room');
 		assert.equal(tool.execution, 'inline');
+		assert.match(tool.description, /every time the user asks about a room/, 'the model reads again instead of reusing an earlier answer');
+		assert.match(ROOM_READ_PROMPT_RULE, /every time/);
+		assert.match(ROOM_READ_PROMPT_RULE, /earlier answer or task result about a room is never the answer now/);
 		const out = await tool.execute({}, {} as never);
 		assert.equal(out.ok, true);
 		assert.equal(out.messages[0].text, 'hi');

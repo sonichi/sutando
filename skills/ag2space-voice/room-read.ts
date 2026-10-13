@@ -229,6 +229,7 @@ export function createReadRoomTool(deps: ReadRoomDeps): ToolDefinition {
 		description:
 			'Read the recent messages of an AG2 Space room, right now (about a second). ' +
 			'Call it when the user asks what was said in a room, what is new there, or whether someone replied or posted something there. ' +
+			'A room\'s messages and who can read it change at any time: call read_room every time the user asks about a room, even if you answered about that room earlier or a task result said something about it — never answer from an earlier answer. ' +
 			'Pass `room` = the room name as spoken; leave it out for the room this session is in. ' +
 			'Returns {ok:true, room, messages:[{at, from, text}]} oldest first — answer from them in a sentence or two; do not read them all out. ' +
 			'Errors: "ambiguous" with candidates — ask which one; "not_found" — say there is no room by that name; ' +
@@ -249,4 +250,4 @@ export function createReadRoomTool(deps: ReadRoomDeps): ToolDefinition {
 }
 
 /** The prompt rule that goes with the tool; present only when the tool is declared. */
-export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about what was said in an AG2 Space room ("what\'s new in <room>", "did <person> reply in <room>", "what are they discussing there") → call read_room and answer from what it returns; never submit work just to read a room.';
+export const ROOM_READ_PROMPT_RULE = '- ROOM MESSAGES: a question about what was said in an AG2 Space room ("what\'s new in <room>", "did <person> reply in <room>", "what are they discussing there") → call read_room and answer from what it returns, every time — what a room holds and who can read it change, so an earlier answer or task result about a room is never the answer now; never submit work just to read a room.';
