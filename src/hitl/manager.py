@@ -63,8 +63,8 @@ def _activity(task_ids, to_phase: str, reason: str) -> None:
 # the (count, error, time) last published for health-check.
 _ARCHIVE_WARNED: Dict[str, set] = {}
 _ARCHIVE_PUBLISHED: Dict[str, tuple] = {}
-# While failures persist the status is rewritten this often, so a reader can
-# tell a stopped writer (older than ARCHIVE_STATUS_STALE_S) from a steady failure.
+# The status is rewritten at least this often, so a reader can tell a stopped
+# writer (older than ARCHIVE_STATUS_STALE_S) from a steady state.
 ARCHIVE_STATUS_REFRESH_S = 300
 ARCHIVE_STATUS_STALE_S = 600
 
@@ -77,8 +77,8 @@ def archive_status_path(store_root: Path) -> Path:
 
 def archive_health(store_root: Path, now: Optional[float] = None) -> Optional[Dict]:
     """What health-check reads: live record count plus the published archive
-    failures, or None when this host has no store. `stale` means failures were
-    reported but the writer stopped refreshing them, so the count is unknown."""
+    failures, or None when this host has no store. `stale` means a report exists
+    but the writer stopped refreshing it, so its count is unknown."""
     root = Path(store_root)
     if not root.is_dir():
         return None
@@ -92,12 +92,13 @@ def archive_health(store_root: Path, now: Optional[float] = None) -> Optional[Di
     failures = int(status.get("failures") or 0)
     updated = status.get("updated_at")
     now = time.time() if now is None else now
-    stale = failures > 0 and (not isinstance(updated, (int, float))
+    stale = bool(status) and (not isinstance(updated, (int, float))
                               or now - updated > ARCHIVE_STATUS_STALE_S)
     return {"live": sum(1 for _ in root.glob("hitl_*.json")),
             "failures": failures,
             "error": str(status.get("error") or ""),
             "updated_at": updated,
+            "reported": bool(status),
             "stale": stale}
 
 
@@ -197,8 +198,7 @@ class HitlStore:
         first = next(iter(failures.values()), None)
         error = f"{type(first).__name__}: {first}" if first is not None else ""
         last = _ARCHIVE_PUBLISHED.get(key)
-        if last and last[:2] == (len(failures), error) and not (
-                failures and now - last[2] >= ARCHIVE_STATUS_REFRESH_S):
+        if last and last[:2] == (len(failures), error) and now - last[2] < ARCHIVE_STATUS_REFRESH_S:
             return
         target = archive_status_path(self.root)
         tmp = None

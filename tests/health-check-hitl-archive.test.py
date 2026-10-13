@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -69,6 +70,27 @@ class HitlArchiveCheckTest(unittest.TestCase):
         out = hc.check_hitl_archive()
         self.assertEqual(out["status"], "warn")
         self.assertIn("archive status stale", out["detail"])
+
+    def test_a_zero_failure_status_from_a_stopped_writer_warns_as_stale(self):
+        self.fill(5)
+        hm.archive_status_path(self.root).write_text(json.dumps(
+            {"failures": 0, "error": "", "updated_at": time.time() - 86400}))
+        out = hc.check_hitl_archive()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("archive status stale", out["detail"])
+
+    def test_an_unreadable_store_warns_instead_of_raising(self):
+        with mock.patch.object(hm, "archive_health", side_effect=PermissionError("denied")):
+            out = hc.check_hitl_archive()
+        self.assertEqual((out["name"], out["status"]), ("hitl-archive", "warn"))
+        self.assertIn("hitl store unreadable", out["detail"])
+
+    def test_run_all_checks_registers_the_row(self):
+        sentinel = {"name": "hitl-archive", "status": "ok", "detail": "registration sentinel"}
+        with mock.patch.object(hc, "check_hitl_archive", return_value=sentinel) as probe:
+            checks = hc.run_all_checks()
+        probe.assert_called_once_with()
+        self.assertIn(sentinel, checks)
 
     def test_a_real_archive_failure_reaches_health(self):
         mgr = hm.HitlManager(hm.HitlStore(self.root))

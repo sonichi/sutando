@@ -356,19 +356,42 @@ class ArchiveTests(unittest.TestCase):
         h = archive_health(self.root, now=1002.0)
         self.assertEqual((h["failures"], h["error"]), (1, "OSError: disk full"))
 
-    def test_a_steady_failure_is_refreshed_and_a_stopped_writer_reads_stale(self):
-        store, err = self.mgr.store, {"hitl_a": PermissionError("denied")}
-        with self.assertLogs("hitl.store", level="WARNING"):
-            store.report_archive_failures(err, 1000.0)
-        store.report_archive_failures(err, 1000.0 + hm.ARCHIVE_STATUS_REFRESH_S - 1)
-        self.assertEqual(archive_health(self.root, now=1000.0)["updated_at"], 1000.0)
-        store.report_archive_failures(err, 1000.0 + hm.ARCHIVE_STATUS_REFRESH_S)
-        t = 1000.0 + hm.ARCHIVE_STATUS_REFRESH_S
-        self.assertEqual(archive_health(self.root, now=t)["updated_at"], t)
-        self.assertFalse(archive_health(self.root, now=t + hm.ARCHIVE_STATUS_STALE_S)["stale"])
-        self.assertTrue(archive_health(self.root, now=t + hm.ARCHIVE_STATUS_STALE_S + 1)["stale"])
-        store.report_archive_failures({}, t + 1)
-        self.assertFalse(archive_health(self.root, now=t + 10 * hm.ARCHIVE_STATUS_STALE_S)["stale"])
+    def test_a_steady_status_is_refreshed_and_a_stopped_writer_reads_stale(self):
+        self.assertLess(hm.ARCHIVE_STATUS_REFRESH_S, hm.ARCHIVE_STATUS_STALE_S)
+        for failures in ({"hitl_a": PermissionError("denied")}, {}):
+            store = HitlStore(self.root / f"r{len(failures)}")
+            with self.subTest(failures=len(failures)):
+                store.report_archive_failures(failures, 1000.0)
+                t = 1000.0 + hm.ARCHIVE_STATUS_REFRESH_S
+                store.report_archive_failures(failures, t - 1)
+                self.assertEqual(archive_health(store.root, now=1000.0)["updated_at"], 1000.0)
+                store.report_archive_failures(failures, t)
+                self.assertEqual(archive_health(store.root, now=t)["updated_at"], t)
+                stale = hm.ARCHIVE_STATUS_STALE_S
+                self.assertFalse(archive_health(store.root, now=t + stale)["stale"])
+                self.assertTrue(archive_health(store.root, now=t + stale + 1)["stale"])
+
+    def test_a_report_without_updated_at_reads_stale(self):
+        hm.archive_status_path(self.root).write_text(json.dumps({"failures": 2, "error": "x"}))
+        self.assertTrue(archive_health(self.root)["stale"])
+
+    def test_no_report_or_a_non_object_report_reads_as_not_reported(self):
+        self.assertEqual(
+            (archive_health(self.root)["reported"], archive_health(self.root)["stale"]), (False, False))
+        hm.archive_status_path(self.root).write_text("[1]")
+        h = archive_health(self.root)
+        self.assertEqual((h["reported"], h["stale"], h["failures"]), (False, False, 0))
+
+    def test_a_failed_status_write_leaves_no_temp_and_retries(self):
+        store = self.mgr.store
+        with mock.patch("hitl.manager.os.replace", side_effect=OSError("read-only")):
+            store.report_archive_failures({}, 1.0)
+        status = hm.archive_status_path(self.root)
+        self.assertEqual(sorted(p.name for p in status.parent.iterdir()
+                                if p.name.startswith(".tmp-archive-status-")), [])
+        self.assertFalse(status.exists())
+        store.report_archive_failures({}, 2.0)
+        self.assertEqual(json.loads(status.read_text())["updated_at"], 2.0)
 
     def test_an_id_that_recovers_and_fails_again_warns_again(self):
         store, err = self.mgr.store, {"hitl_a": PermissionError("denied")}

@@ -2933,7 +2933,7 @@ def check_hitl_archive() -> "dict | None":
     """
     name = "hitl-archive"
     try:
-        from hitl.manager import archive_health, default_store
+        from hitl.manager import ARCHIVE_STATUS_STALE_S, archive_health, default_store
         h = archive_health(default_store(WORKSPACE_DIR))
     except Exception as e:  # noqa: BLE001 — an optional tier never breaks the report
         return {"name": name, "status": "warn", "detail": f"hitl store unreadable ({e})"}
@@ -2941,8 +2941,9 @@ def check_hitl_archive() -> "dict | None":
         return None
     problems = []
     if h["stale"]:
-        problems.append(f"archive status stale: {h['failures']} failure(s) last reported, "
-                        "not refreshed since (is the gateway pulsing?)")
+        problems.append(f"archive status stale: not refreshed in over "
+                        f"{ARCHIVE_STATUS_STALE_S // 60} min (last reported "
+                        f"{h['failures']} failure(s)); is the gateway pulsing?")
     elif h["failures"]:
         problems.append(f"{h['failures']} settled record(s) failing to archive ({h['error']})")
     if h["live"] > HITL_LIVE_WARN:
@@ -2950,7 +2951,8 @@ def check_hitl_archive() -> "dict | None":
                         f"each one every second")
     if problems:
         return {"name": name, "status": "warn", "detail": "; ".join(problems)}
-    return {"name": name, "status": "ok", "detail": f"{h['live']} live records, archive healthy"}
+    state = "archive healthy" if h["reported"] else "no archive report yet"
+    return {"name": name, "status": "ok", "detail": f"{h['live']} live records, {state}"}
 
 
 def check_host_subtrees() -> dict:
