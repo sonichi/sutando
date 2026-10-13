@@ -10,9 +10,13 @@ Order: the first runner that is both SAFE and installed, from
 `SUTANDO_SANDBOX_RUNNERS` (env override, then the value a skill manifest's `config`
 declares, then DEFAULT_ORDER). A runner is SAFE only when its flags alone, with no
 persisted settings, give a session that can read NO file, write nothing and reach no
-network; one that cannot is listed with the reason and always skipped. None
-installed: `select_runner` returns None and callers render the FALLBACK command,
-whose absence the core reports as "unavailable".
+network; one that cannot is listed with the reason and skipped, unless it is FENCED:
+on macOS, a spawned run (`invocation`, `confined_invocation`) of agy is
+wrapped in a per-run Seatbelt profile (seatbelt.py) that is the boundary instead of
+its flags. The in-band text (`shell_command`) is one shell line with no fence, so
+it only ever names a flag-safe runner. None usable: `select_runner` returns None
+and callers render the FALLBACK command, whose absence the core reports as
+"unavailable".
 
 Every run starts in a fresh, empty temp directory and has no tools, so the only
 context it sees is its prompt: the question plus `context_preamble()`, a vetted
@@ -29,6 +33,11 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Sequence
+
+try:  # vendored into ag2_sparrow as a package module; `policy` package in src/
+    from . import seatbelt
+except ImportError:  # pragma: no cover - loaded as a top-level file
+    import seatbelt
 
 CONFIG_KEY = "SUTANDO_SANDBOX_RUNNERS"
 DEFAULT_ORDER = ("agy", "codex", "claude")
@@ -55,6 +64,8 @@ class Runner(NamedTuple):
     # True: the answer is the process's stdout. False: the CLI writes it to `-o`.
     answer_on_stdout: bool
     unsafe_reason: str = ""
+    # Safe when spawned under the Seatbelt fence (macOS only), though not by its flags.
+    fenceable: bool = False
 
 
 RUNNERS = {
@@ -65,13 +76,16 @@ RUNNERS = {
             "terminal commands only (its own scratch dirs stay writable), --mode plan is a "
             "planning mode not a write ban, search_web/read_url_content stay available, and "
             "headless runs honor whatever persisted settings.json permissions allow"),
+        fenceable=True,
     ),
     "codex": Runner(
         "codex", safe=False, stall_seconds=45, answer_on_stdout=False,
         unsafe_reason=(
             "codex has no sandbox policy that denies reads outside its working directory: "
             "read-only leaves every user-readable file readable, and the :minimal permission "
-            "profile still leaves temp dirs readable and writable"),
+            "profile still leaves temp dirs readable and writable; and fenced, its in-process "
+            "apply_patch can still read or move the login (auth.json) it must hold, with no "
+            "flag in codex 0.160 to turn it off"),
     ),
     "claude": Runner("claude", safe=True, stall_seconds=0, answer_on_stdout=True),
 }
@@ -86,6 +100,10 @@ class Invocation(NamedTuple):
     argv: list
     # Process cwd the caller must set: an empty dir from `empty_dir()`.
     cwd: str
+    # The process env for a fenced run (None: inherit) and its private scratch dir,
+    # which the caller removes with `release()` when the run ends.
+    env: Optional[dict] = None
+    scratch: Optional[str] = None
 
 
 def _skills_dirs() -> list:
@@ -133,15 +151,33 @@ def find_binary(name: str, which: Callable = shutil.which) -> Optional[str]:
     return which(name, path=extra)
 
 
+def _fence_ready(runner: Runner, binary: str, env) -> bool:
+    """A fenceable runner can run fenced here: macOS fence present and its login in
+    the env it will be handed (agy: an API key), never in a file it could move."""
+    if not (runner.fenceable and seatbelt.available()):
+        return False
+    if runner.name == "agy":
+        return any(env.get(k) for k in AGY_KEY_VARS)
+    return False
+
+
+def usable(runner: Runner, binary: str, env=None, fenced: bool = False) -> bool:
+    """Safe by its flags, or (`fenced`) fenceable and ready to run fenced."""
+    env = os.environ if env is None else env
+    return runner.safe or (fenced and _fence_ready(runner, binary, env))
+
+
 def select_runner(order: Optional[Sequence] = None, which: Callable = shutil.which,
-                  env=None) -> Optional[tuple]:
-    """(Runner, absolute binary) for the first safe, installed runner; None if none."""
+                  env=None, fenced: bool = False) -> Optional[tuple]:
+    """(Runner, absolute binary) for the first usable, installed runner; None if none.
+    `fenced`: the caller spawns via `invocation`/`confined_invocation`, so a fenced
+    runner counts; in-band text never passes it."""
     for name in (resolve_order(env) if order is None else order):
         runner = RUNNERS.get(name)
-        if runner is None or not runner.safe:
+        if runner is None or not (runner.safe or (fenced and runner.fenceable)):
             continue
         path = find_binary(name, which)
-        if path:
+        if path and usable(runner, path, env, fenced):
             return runner, path
     return None
 
@@ -167,11 +203,13 @@ def empty_dir():
 
 
 def invocation(runner: Runner, binary: str, prompt: str, *, cwd: str) -> Invocation:
-    """argv for a spawn in `cwd` (from `empty_dir()`). Callers close stdin and read
-    stdout. The prompt is passed as-is: callers that answer a person prepend
-    `context_preamble()` themselves."""
+    """argv for a spawn in `cwd` (from `empty_dir()`). Callers close stdin, read
+    stdout, pass `env`, and `release()` it afterwards. The prompt is passed as-is:
+    callers that answer a person prepend `context_preamble()` themselves."""
     if not cwd or any(Path(cwd).iterdir()):
         raise ValueError("a sandbox run needs a fresh empty directory as its cwd")
+    if not runner.safe:
+        return _fenced(runner, binary, prompt, cwd, tools=False)
     return Invocation(runner, [binary, *_base_args(runner), "--", prompt], cwd)
 
 
@@ -186,7 +224,50 @@ def confined_invocation(runner: Runner, binary: str, prompt: str, *, cwd: str) -
         for name in dirnames + filenames:
             if (Path(dirpath) / name).is_symlink():
                 raise ValueError(f"a confined run's cwd may not hold a symlink: {name}")
+    if not runner.safe:
+        return _fenced(runner, binary, prompt, cwd, tools=True)
     return Invocation(runner, [binary, *_base_args(runner, CLAUDE_READ_TOOLS), "--", prompt], cwd)
+
+
+def release(inv: Invocation) -> None:
+    """Remove a fenced run's private scratch dir; a no-op for an unfenced one."""
+    if inv.scratch:
+        shutil.rmtree(inv.scratch, ignore_errors=True)
+
+
+# --- the Seatbelt-fenced runners (macOS) -------------------------------------
+
+AGY_KEY_VARS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+FENCE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+def _fenced(runner: Runner, binary: str, prompt: str, cwd: str, *, tools: bool) -> Invocation:
+    if not _fence_ready(runner, binary, os.environ):
+        raise ValueError(f"no safe invocation for runner {runner.name!r} on this host")
+    cwd = os.path.realpath(cwd)
+    scratch = os.path.realpath(tempfile.mkdtemp(prefix="sutando-fence-"))
+    try:
+        tool_home = Path(scratch) / "tool"
+        tmp = Path(scratch) / "tmp"
+        tool_home.mkdir()
+        tmp.mkdir()
+        base = {"PATH": FENCE_PATH, "TMPDIR": str(tmp), "LANG": "en_US.UTF-8"}
+        agy = os.path.realpath(binary)
+        settings = tool_home / ".gemini" / "antigravity-cli" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"modelProvider": "gemini", "trustedWorkspaces": [cwd]}))
+        argv = [agy, "--disable-slash-commands", "--log-file", str(tool_home / "cli.log"),
+                f"-p={prompt}"]
+        env = dict(base, HOME=str(tool_home),
+                   **{k: os.environ[k] for k in AGY_KEY_VARS if os.environ.get(k)})
+        # No exec at all: agy's file tools run in its own process, so a terminal
+        # is the only way its key (in its env) could reach a child.
+        text = seatbelt.profile(cwd=cwd, scratch=tmp, tool_binary=agy, tool_dir=agy,
+                                tool_rw=[tool_home], loopback=True, exec_children=False)
+        prof = Path(scratch) / "fence.sb"
+        prof.write_text(text)
+        return Invocation(runner, seatbelt.wrap(str(prof), argv), cwd, env, scratch)
+    except BaseException:
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise
 
 
 def _read_faq() -> str:

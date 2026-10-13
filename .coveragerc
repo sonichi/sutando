@@ -44,6 +44,7 @@ omit =
     packages/ag2-sparrow/ag2_sparrow/team_result_guard.py
     packages/ag2-sparrow/ag2_sparrow/team_guardrail.py
     packages/ag2-sparrow/ag2_sparrow/sandbox_runner.py
+    packages/ag2-sparrow/ag2_sparrow/seatbelt.py
     packages/ag2-sparrow/ag2_sparrow/vault_set_grammar.py
     packages/ag2-sparrow/ag2_sparrow/send_failure_policy.py
     packages/ag2-sparrow/ag2_sparrow/proactive_recovery.py
