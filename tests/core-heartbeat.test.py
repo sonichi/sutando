@@ -66,6 +66,17 @@ def _portable_run(command, *args, **kwargs):
     return _REAL_RUN(command, *args, **kwargs)
 
 
+def _reap(proc):
+    """Stop a child this test started, on every path: TERM, then KILL past the timeout."""
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
 def _wait_file(path, deadline_s=5.0):
     end = time.monotonic() + deadline_s
     while time.monotonic() < end:
@@ -631,10 +642,27 @@ class TestHeartbeatCli(unittest.TestCase):
         self.env = {**os.environ, "SUTANDO_WORKSPACE": str(self.tmp),
                     "SUTANDO_TEST_MODE": "1",
                     "SUTANDO_HOST_LABEL": _short_host()}
+        # Registered first so it runs last: a child reaped later must not recreate the tree.
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def tearDown(self):
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
+    def _spawn(self, argv, **kwargs):
+        proc = subprocess.Popen(argv, **kwargs)
+        self.addCleanup(_reap, proc)
+        return proc
+
+    def _core_env(self):
+        """A toolchain that reports a live core, so the writer publishes a beat."""
+        _bin = self.tmp / "fakebin"
+        _bin.mkdir(parents=True, exist_ok=True)
+        for _name, _body in (
+            ("tmux",  "#!/bin/sh\nexit 0\n"),
+            ("pgrep", "#!/bin/sh\necho 4242\n"),
+            ("ps",    "#!/bin/sh\necho 'claude --name sutando-core --resume'\n"),
+        ):
+            _f = _bin / _name
+            _f.write_text(_body)
+            _f.chmod(0o755)
+        return {**self.env, "PATH": f"{_bin}:{self.env.get('PATH', '')}"}
 
     def test_once_flag_writes_single_beat_and_exits(self):
         script = ROOT / "src" / "core_heartbeat.py"
@@ -691,22 +719,7 @@ class TestHeartbeatCli(unittest.TestCase):
         # healthy). This test is about SIGTERM cleanup, and it needs a file to
         # clean up — so give the child a toolchain that reports a real core
         # instead of asserting the pre-4fda4a4b fail-open behaviour.
-        _bin = self.tmp / "fakebin"
-        _bin.mkdir(parents=True, exist_ok=True)
-        for _name, _body in (
-            ("tmux",  "#!/bin/sh\nexit 0\n"),
-            ("pgrep", "#!/bin/sh\necho 4242\n"),
-            ("ps",    "#!/bin/sh\necho 'claude --name sutando-core --resume'\n"),
-        ):
-            _f = _bin / _name
-            _f.write_text(_body)
-            _f.chmod(0o755)
-        _env = dict(self.env)
-        _env["PATH"] = f"{_bin}:{_env.get('PATH', '')}"
-        proc = subprocess.Popen(
-            [sys.executable, str(script), "--interval", "0.5"],
-            env=_env,
-        )
+        proc = self._spawn([sys.executable, str(script), "--interval", "0.5"], env=self._core_env())
         # Wait for first beat to land.
         alive = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
         for _ in range(40):
@@ -719,6 +732,44 @@ class TestHeartbeatCli(unittest.TestCase):
         proc.send_signal(_signal.SIGTERM)
         proc.wait(timeout=5)
         self.assertFalse(alive.exists(), ".alive should have been unlinked on SIGTERM")
+
+    @unittest.skipIf(os.name == "nt", "POSIX SIGTERM cleanup")
+    def test_a_failing_sigterm_test_leaves_no_writer_behind(self):
+        # An assertion that fails before the SIGTERM must still stop the writer it started.
+        spawned = []
+        real_popen = subprocess.Popen
+
+        def recording_popen(*a, **k):
+            proc = real_popen(*a, **k)
+            spawned.append(proc)
+            return proc
+        self.addCleanup(lambda: [_reap(p) for p in spawned])
+
+        class Failing(TestHeartbeatCli):
+            def assertTrue(self, expr, msg=None):
+                raise self.failureException("forced failure before SIGTERM")
+        result = unittest.TestResult()
+        with patch.object(subprocess, "Popen", recording_popen):
+            Failing("test_sigterm_cleans_up_alive_file").run(result)
+        self.assertEqual(len(result.failures), 1, result.errors)
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].poll(), "the writer outlived its failed test")
+
+    @unittest.skipIf(os.name == "nt", "POSIX advisory lock")
+    def test_a_second_writer_for_the_same_host_exits_and_leaves_the_first_beating(self):
+        script = ROOT / "src" / "core_heartbeat.py"
+        env = self._core_env()
+        first = self._spawn([sys.executable, str(script), "--interval", "0.5"], env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        alive = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
+        self.assertIsNotNone(_wait_file(alive), "the first writer never beat")
+        second = subprocess.run([sys.executable, str(script), "--interval", "0.5"], env=env,
+                                capture_output=True, text=True, timeout=8)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("another writer already beats", second.stderr)
+        self.assertIsNone(first.poll(), "the first writer must keep running")
+        time.sleep(1.0)
+        self.assertEqual(json.loads(_wait_file(alive))["heartbeat_pid"], first.pid)
 
 
 if __name__ == "__main__":

@@ -827,6 +827,25 @@ def ensure_running(log_path: Path = ENSURE_LOG) -> tuple[bool, int]:
             unlock_fd(handle.fileno())
 
 
+_WRITER_LOCK = None
+
+
+def _take_writer_lock() -> bool:
+    """One beating writer per host and workspace, held until exit (the OS releases it on any death)."""
+    global _WRITER_LOCK
+    from file_lock import lock_fd
+    lock_dir = WORKSPACE / "state" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_dir / f"core-heartbeat-{_hostname()}.lock", "a")
+    try:
+        lock_fd(handle.fileno(), blocking=False)
+    except OSError:
+        handle.close()
+        return False
+    _WRITER_LOCK = handle
+    return True
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--interval", type=float, default=30.0, help="seconds between beats (default: 30)")
@@ -845,6 +864,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    writer = not (args.once or args.stop or args.mark_stopped or args.ensure)
+    if writer and not _take_writer_lock():
+        print(f"core_heartbeat: another writer already beats {_hostname()} for this workspace; exiting",
+              file=sys.stderr, flush=True)
+        return 0
     if args.helper_receipt_dir:
         from external_core_helpers import publish
         publish(args.helper_receipt_dir, "heartbeat", __file__, WORKSPACE,
