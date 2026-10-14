@@ -11,6 +11,7 @@ there, including the daily morning briefing and the email-triage digest (#4259).
   d) membership unreadable for a new DM  -> not adopted: held
   e) a persisted reading not marked private (pre-fix file) is not loaded
   f) a withheld-result review never goes to a shared room the registry names
+  g) the membership read raises (gateway unreachable) -> undecided: held
 
 Loads src/remote-gateway-bridge.py in-process with an isolated workspace and a
 fake `_req`. Run: python3 tests/gateway-owner-dm-must-be-private.test.py
@@ -48,6 +49,7 @@ class Gateway:
         self.members = {DM: [AGENT, OWNER], TEAM: [AGENT, OWNER, "@chi:example.org",
                                                    "@a1:example.org", "@a2:example.org", "@a3:example.org"]}
         self.unreadable: set[str] = set()
+        self.unreachable: set[str] = set()
         self.posts: list[dict] = []
 
     def req(self, method, path, payload=None, timeout=None):
@@ -55,6 +57,8 @@ class Gateway:
         if path == "/v1/agents":
             return {"agents": [{"id": AGENT, "owner": OWNER, "owner_dm_room": self.dm_room}]}
         if path == "/v1/room" and op == "members":
+            if payload["room_id"] in self.unreachable:
+                raise OSError("gateway unreachable")
             if payload["room_id"] in self.unreadable:
                 return {"error": "not supported"}
             return {"members": [{"user_id": m} for m in self.members.get(payload["room_id"], [])]}
@@ -133,6 +137,11 @@ def main() -> int:
     mod._gateway_owner()
     room = mod._owner_review_dm(OWNER)
     check(room != TEAM, f"f) a withheld review does not go to the shared room: {room!r}")
+
+    ws = workspace(); gw = Gateway(DM); gw.unreachable.add(DM); mod = load(ws, gw)
+    queued = drain(mod, ws, "proactive-morning-5.txt")
+    check(queued and gw.posts == [] and mod._owner_dm_is_private(DM, OWNER) is None,
+          f"g) a members read that raises is undecided and adopts nothing: posts={gw.posts}")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0
