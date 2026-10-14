@@ -114,7 +114,13 @@ class Handler(BaseHTTPRequestHandler):
             if STATE["force_room_502"]:
                 self.send_response(502); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
-            STATE["room_posts"].append(json.loads(self.rfile.read(n).decode()))
+            req = json.loads(self.rfile.read(n).decode())
+            if req.get("op") == "members":  # a membership read is not a post
+                members = STATE.get("room_members", {}).get(req.get("room_id"), ["@agent-t:example.org", "@owner:example.org"])
+                body = json.dumps({"members": [{"user_id": m} for m in members]}).encode()
+                self.send_response(200); self.send_header("Content-Type", "application/json")
+                self.end_headers(); self.wfile.write(body); return
+            STATE["room_posts"].append(req)
             if STATE["force_room_empty_200"]:
                 # Deployed-broker failure shape: room-send swallowed server-side,
                 # 200 with no event_id — must NOT count as delivered.
@@ -1235,7 +1241,7 @@ def main() -> int:
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["room_id"] == "!dm:example.org",
           "proactive delivery goes to the gateway's owner_dm_room, not the pinned room")
-    check(json.loads(rtc._routing_file().read_text()) == {"identity": "@agent-t:example.org", "gateway": rtc.URL, "owner_dm": "!dm:example.org"},
+    check(json.loads(rtc._routing_file().read_text()) == {"identity": "@agent-t:example.org", "gateway": rtc.URL, "owner_dm": "!dm:example.org", "private": True},
           "the reading is persisted under the state dir, bound to this identity and this gateway")
     _real_replace = rtc.os.replace; _faults = []
     def _fail_routing_once(src, dst):
