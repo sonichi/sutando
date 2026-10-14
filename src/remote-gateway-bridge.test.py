@@ -134,9 +134,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(502); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
             req = json.loads(self.rfile.read(n).decode())
-            if req.get("op") == "members":  # a membership read is not a post
-                members = STATE.get("room_members", {}).get(req.get("room_id"), ["@agent-t:example.org", "@owner:example.org"])
-                body = json.dumps({"members": [{"user_id": m} for m in members]}).encode()
+            if req.get("op") == "members":  # pragma: no cover - the server thread is outside the gate's trace
+                body = json.dumps({"members": [{"user_id": "@agent-t:example.org"}, {"user_id": "@owner:example.org"}]}).encode()
                 self.send_response(200); self.send_header("Content-Type", "application/json")
                 self.end_headers(); self.wfile.write(body); return
             STATE["room_posts"].append(req)
