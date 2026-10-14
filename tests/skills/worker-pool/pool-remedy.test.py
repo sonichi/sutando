@@ -354,6 +354,16 @@ class APartialCloseIsBounded(Base):
 
 
 class ApplyingATick(Base):
+    def test_human_dispatch_rechecks_pause_and_suspension(self):
+        marker = wi.worker_dir(self.ws, self.wid) / sup.PAUSED_MARKER
+        with mock.patch.object(rem.wc, "raise_card") as raised:
+            marker.touch()
+            rem.apply(self.ws, REPO, {self.wid: ps.CARD_HUMAN}, runner=self.t)
+            marker.unlink()
+            rem.suspend(self.ws, "test")
+            rem.apply(self.ws, REPO, {self.wid: ps.CARD_HUMAN}, runner=self.t)
+            raised.assert_not_called()
+
     def test_only_recover_acts_and_escalate_passes_through(self):
         other = wi.new_worker_id()
         seen = []

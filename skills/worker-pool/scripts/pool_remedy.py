@@ -409,7 +409,9 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
         if decision == ps.RECOVER:
             done[worker_id] = recover(workspace, repo, worker_id,
                                       runner=runner, spawn=spawn)
-        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN, ps.CARD_LOGIN):
+        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN, ps.CARD_LOGIN, ps.CARD_HUMAN):
+            if decision == ps.CARD_HUMAN and sup.is_paused(workspace, worker_id):
+                continue
             cards[worker_id] = wc.raise_card(workspace, worker_id, decision,
                                              runner=runner or subprocess.run)
         elif decision == ps.REARM_WATCHER:
@@ -458,6 +460,32 @@ def main(argv=None) -> int:
         return _sweep(a)
 
 
+def _repair_human_cards(workspace, tick) -> None:
+    """Reconcile acknowledged episodes only against positive, eligible observations."""
+    if tick.get("resumed"):
+        return
+    state = sup.load_state(workspace)
+    active = None
+    for w, o in tick["observations"].items():
+        ev = state.workers.get(w)
+        if (ev is None or ev.wedge_kind != "human" or not ev.wedge_escalated
+                or o.get("paused") or sup.is_paused(workspace, w)
+                or o.get("session_alive") is not True
+                or o.get("work_outstanding") is not True
+                or o.get("pane") not in (ps.PANE_GATE, ps.PANE_LIMIT)):
+            continue
+        if active is None:
+            active = wc.manager_for(workspace).active()
+        socket, session = sup._open_tmux(workspace, w)
+        matching = any((r.subject or {}).get("source") == wc.SOURCE
+                       and (r.subject or {}).get("worker_id") == w
+                       and (r.subject or {}).get("wedge") == ps.CARD_HUMAN
+                       and (r.subject or {}).get("session") == session
+                       and (r.device or {}).get("socket") == str(socket) for r in active)
+        if not matching:
+            tick["decisions"][w] = ps.CARD_HUMAN
+
+
 def _sweep(a) -> int:
     try:
         resumed = resume(a.workspace, a.repo) if a.resume else None
@@ -470,6 +498,8 @@ def _sweep(a) -> int:
         return 2
     idle = {"recoveries": {}, "rearms": {}, "cards": {}, "escalations": []}
     escalations = sorted(w for w, d in tick["decisions"].items() if d == ps.ESCALATE)
+    if not a.dry_run and not held:
+        _repair_human_cards(a.workspace, tick)
     acted = ({**idle, "dry_run": True} if a.dry_run
              else {**idle, "escalations": escalations, "suspended": held} if held
              else apply(a.workspace, a.repo, tick["decisions"]))
@@ -482,7 +512,8 @@ def _sweep(a) -> int:
         clear = {w for w, o in tick["observations"].items()
                  if o.get("session_alive") is True and w not in tick.get("wedged", [])}
         now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
-        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear, wedges=now_asks)
+        acted["cards_closed"] = wc.resolve_cleared(
+            a.workspace, clear, wedges=now_asks, observations=tick["observations"])
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
                       **acted}, indent=2, sort_keys=True))
     outcomes = list(acted["recoveries"].values()) + list(((resumed or {}).get("restarted") or {}).values())
