@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
 sys.path.insert(0, str(ROOT / "src"))
 
+from task_priority import parse_priority_from_file, sort_tasks_by_priority
 from tasks_view import TasksView  # noqa: E402
 from dispatcher import RuntimeDispatcher  # noqa: E402
 
@@ -53,6 +54,29 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(th.get("access_tier"), "owner")
         self.assertEqual(th.get("user_id"), "@me:example.org")
         self.assertEqual(th.body, "review the PR")
+
+    def test_queue_priority_roundtrip_order_and_body_confinement(self):
+        import os
+        for keyed in (False, True):
+            paths = []
+            for index, priority in enumerate(("low", "normal", "urgent")):
+                with self.subTest(keyed=keyed, priority=priority):
+                    text = "work\npriority: urgent"
+                    if keyed:
+                        out = self.view.submit_idempotent(
+                            text, priority=priority, idempotency_key=priority)
+                    else:
+                        out = self.view.submit(text, priority=priority)
+                    path = self._task_file(out["taskId"])
+                    self.assertEqual(parse_priority_from_file(path), priority)
+                    os.utime(path, (100 + index, 100 + index))
+                    paths.append(path)
+            self.assertEqual(sort_tasks_by_priority(paths), paths[::-1])
+            older = self._task_file(self.view.submit("older")["taskId"])
+            newer = self._task_file(self.view.submit("newer")["taskId"])
+            os.utime(older, (200, 200))
+            os.utime(newer, (201, 201))
+            self.assertEqual(sort_tasks_by_priority([newer, older]), [older, newer])
 
     def test_get_result_no_id_returns_newest_runtime_api_only(self):
         import os
@@ -281,6 +305,7 @@ class TasksViewTests(unittest.TestCase):
         th = parse_task_headers_lenient(cancel_file.read_text())
         self.assertTrue(th.body.startswith(f"CANCEL_INSTRUCTION: {tid}"))
         self.assertEqual(th.get("priority"), "urgent")
+        self.assertEqual(parse_priority_from_file(cancel_file), "urgent")
         # the original task file is untouched — the consumer decides
         self.assertTrue(self._task_file(tid).exists())
 
@@ -290,7 +315,9 @@ class TasksViewTests(unittest.TestCase):
         self.tasks.mkdir(parents=True, exist_ok=True)
         (self.tasks / "task-rtapi-done1.txt").write_text(
             "id: task-rtapi-done1\ntask: x\n")
+        before = set(self.tasks.iterdir())
         out = self.view.cancel("task-rtapi-done1")
+        self.assertEqual(set(self.tasks.iterdir()), before)
         self.assertIs(out["cancelled"], False)
         with self.assertRaises(ValueError):
             self.view.cancel("task-rtapi-never-existed")
@@ -309,6 +336,58 @@ class TasksViewIdempotencyTests(unittest.TestCase):
 
     def _receipts(self):
         return list((self.tasks / ".runtime-api-idempotency").glob("*.task"))
+
+    def test_pre_change_receipts_preserve_identity_and_reject_conflicts(self):
+        import hashlib
+        import os
+        for instance in (None, "worker-1"):
+            for state in ("pending", "claimed", "archived", "result-only"):
+                with self.subTest(instance=instance, state=state):
+                    key = f"legacy-{instance}-{state}"
+                    digest = hashlib.sha256(key.encode()).hexdigest()
+                    tid = f"task-rtapi-{digest}"
+                    raw = (f"id: {tid}\ntimestamp: 2026-09-01T00:00:00Z\n"
+                           "task: original\nsource: runtime-api\n"
+                           "channel_id: runtime-api\nuser_id: @owner:example.org\n"
+                           "access_tier: owner\npriority: low\n"
+                           + (f"instance_id: {instance}\n" if instance else ""))
+                    receipt = self.tasks / ".runtime-api-idempotency" / f"{digest}.task"
+                    receipt.parent.mkdir(parents=True, exist_ok=True)
+                    receipt.write_text(raw)
+                    if state == "result-only":
+                        self.results.mkdir(exist_ok=True)
+                        (self.results / f"{tid}.txt").write_text("done")
+                    else:
+                        destination = self.tasks / f"{tid}.txt"
+                        if state == "claimed":
+                            destination = self.tasks / f"{tid}.claimed-worker.txt"
+                        elif state == "archived":
+                            destination = self.tasks / "archive" / "2026-09" / f"{tid}.txt"
+                            destination.parent.mkdir(parents=True, exist_ok=True)
+                        os.link(receipt, destination)
+                    before = set(self.tasks.rglob("*.txt"))
+                    view = TasksView(self.tasks, self.results, "@owner:example.org",
+                                     instance=instance)
+                    out = view.submit_idempotent("original", idempotency_key=key,
+                                                 priority="low")
+                    self.assertEqual(out["taskId"], tid)
+                    self.assertEqual(out["state"], {"pending": "pending",
+                        "claimed": "in_progress", "archived": "done",
+                        "result-only": "done"}[state])
+                    self.assertEqual(set(self.tasks.rglob("*.txt")), before)
+                    self.assertEqual(receipt.read_text(), raw)
+                    for text, priority, actor, scope in (
+                        ("different", "low", "@owner:example.org", instance),
+                        ("original", "urgent", "@owner:example.org", instance),
+                        ("original", "low", "@other:example.org", instance),
+                        ("original", "low", "@owner:example.org", "other-worker"),
+                    ):
+                        other = TasksView(self.tasks, self.results, actor, instance=scope)
+                        with self.assertRaisesRegex(ValueError, "already bound"):
+                            other.submit_idempotent(text, idempotency_key=key,
+                                                    priority=priority)
+                    self.assertEqual(receipt.read_text(), raw)
+                    self.assertEqual(set(self.tasks.rglob("*.txt")), before)
 
     def test_same_key_survives_restart_and_archive_without_a_second_task(self):
         first = self.view.submit_idempotent(
@@ -623,6 +702,70 @@ class DispatchTests(unittest.TestCase):
     class _No:
         def __getattr__(self, name):
             raise AssertionError(f"task.* reached {name}")
+
+    def _dispatcher(self, base):
+        return RuntimeDispatcher(
+            self._No(), self._No(), "@me:x", executors={},
+            tasks_view=TasksView(base / "tasks", base / "results", "@me:x"))
+
+    def test_submit_idempotency_retry_after_restart_and_completion(self):
+        for lifecycle in ("completion", "archive"):
+            with self.subTest(lifecycle=lifecycle), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                params = {"task": "do it", "idempotencyKey": "request-42"}
+                first = asyncio.run(self._dispatcher(base).handle("task.submit", params))
+                tid = first["taskId"]
+                task_file = base / "tasks" / f"{tid}.txt"
+                original = task_file.read_bytes()
+                retry = asyncio.run(self._dispatcher(base).handle("task.submit", params))
+                self.assertEqual(retry, first)
+                self.assertEqual(list((base / "tasks").glob("task-*.txt")), [task_file])
+                self.assertEqual(task_file.read_bytes(), original)
+                if lifecycle == "completion":
+                    (base / "results").mkdir()
+                    (base / "results" / f"{tid}.txt").write_text("done")
+                    task_file.unlink()
+                else:
+                    archive = base / "tasks" / "archive"
+                    archive.mkdir()
+                    task_file.rename(archive / task_file.name)
+                finished = asyncio.run(self._dispatcher(base).handle("task.submit", params))
+                self.assertEqual(finished, {"taskId": tid, "state": "done"})
+                self.assertEqual(list((base / "tasks").glob("task-*.txt")), [])
+
+    def test_submit_idempotency_rejects_invalid_keys_and_collisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for key in ("", "   ", None, False, 42, [], {}, "x" * 1025,
+                        "é" * 513):
+                with self.subTest(key=repr(key)[:30]):
+                    with self.assertRaises(ProtocolError) as raised:
+                        asyncio.run(self._dispatcher(base).handle(
+                            "task.submit", {"task": "work", "idempotencyKey": key}))
+                    self.assertEqual(raised.exception.code, -32602)
+                    self.assertEqual(list((base / "tasks").glob("task-*.txt")), [])
+            params = {"task": "work", "idempotencyKey": "request-42"}
+            first = asyncio.run(self._dispatcher(base).handle("task.submit", params))
+            task_file = base / "tasks" / f"{first['taskId']}.txt"
+            original = task_file.read_bytes()
+            for change in ({"task": "different"}, {"priority": "low"}):
+                with self.subTest(change=change):
+                    with self.assertRaises(ProtocolError) as raised:
+                        asyncio.run(self._dispatcher(base).handle(
+                            "task.submit", {**params, **change}))
+                    self.assertEqual(raised.exception.code, -32602)
+                    self.assertEqual(list((base / "tasks").glob("task-*.txt")), [task_file])
+                    self.assertEqual(task_file.read_bytes(), original)
+
+    def test_submit_without_key_remains_non_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            first = asyncio.run(self._dispatcher(base).handle("task.submit", {"task": "hi"}))
+            second = asyncio.run(self._dispatcher(base).handle("task.submit", {"task": "hi"}))
+            self.assertNotEqual(first["taskId"], second["taskId"])
+            self.assertEqual(
+                {p.name for p in (base / "tasks").glob("task-*.txt")},
+                {f"{first['taskId']}.txt", f"{second['taskId']}.txt"})
 
     def test_submit_status_result_dispatch(self):
         with tempfile.TemporaryDirectory() as tmp:
