@@ -43,6 +43,7 @@ Runs forever until killed. Exit codes:
 """
 from __future__ import annotations
 import argparse
+import errno
 import json
 import os
 import re
@@ -822,7 +823,17 @@ def ensure_running(log_path: Path = ENSURE_LOG) -> tuple[bool, int]:
                 if child.poll() is not None:
                     break
                 time.sleep(0.05)
-            return True, child.pid
+            # Started means the child holds the writer lock, not merely that it was spawned.
+            deadline = time.monotonic() + 5
+            while child.poll() is None and time.monotonic() < deadline:
+                if _writer_lock_holder() == child.pid:
+                    return True, child.pid
+                time.sleep(0.05)
+            if child.poll() is None:
+                return True, child.pid
+            if child.returncode == 0:
+                return False, _writer_lock_holder() or 0
+            raise RuntimeError(f"writer exited {child.returncode} at start; see {log_path}")
         finally:
             unlock_fd(handle.fileno())
 
@@ -830,18 +841,37 @@ def ensure_running(log_path: Path = ENSURE_LOG) -> tuple[bool, int]:
 _WRITER_LOCK = None
 
 
+def _writer_lock_path() -> Path:
+    return WORKSPACE / "state" / "locks" / f"core-heartbeat-{_hostname()}.lock"
+
+
+def _writer_lock_holder() -> int | None:
+    """The pid the current lock holder wrote into the lock file; read-only, so it never contends."""
+    try:
+        head = _writer_lock_path().read_text().strip()
+    except OSError:
+        return None
+    return int(head) if head.isdigit() else None
+
+
 def _take_writer_lock() -> bool:
-    """One beating writer per host and workspace, held until exit (the OS releases it on any death)."""
+    """One beating writer per host and workspace, held until exit (the OS releases it on any death).
+    False only on real contention; any other lock error propagates."""
     global _WRITER_LOCK
     from file_lock import lock_fd
-    lock_dir = WORKSPACE / "state" / "locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_dir / f"core-heartbeat-{_hostname()}.lock", "a")
+    path = _writer_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a")
     try:
         lock_fd(handle.fileno(), blocking=False)
-    except OSError:
+    except OSError as exc:
         handle.close()
-        return False
+        if isinstance(exc, BlockingIOError) or (os.name == "nt" and exc.errno in (errno.EACCES, errno.EDEADLK)):
+            return False
+        raise
+    handle.truncate(0)
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
     _WRITER_LOCK = handle
     return True
 
@@ -865,10 +895,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     writer = not (args.once or args.stop or args.mark_stopped or args.ensure)
-    if writer and not _take_writer_lock():
-        print(f"core_heartbeat: another writer already beats {_hostname()} for this workspace; exiting",
-              file=sys.stderr, flush=True)
-        return 0
+    if writer:
+        try:
+            held = _take_writer_lock()
+        except OSError as exc:
+            print(f"core_heartbeat: cannot take the writer lock {_writer_lock_path()}: {exc}",
+                  file=sys.stderr, flush=True)
+            return 1
+        if not held:
+            print(f"core_heartbeat: another writer already beats {_hostname()} for this workspace; exiting",
+                  file=sys.stderr, flush=True)
+            return 0
     if args.helper_receipt_dir:
         from external_core_helpers import publish
         publish(args.helper_receipt_dir, "heartbeat", __file__, WORKSPACE,
@@ -881,7 +918,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"core_heartbeat: stopped {stop_other_writers()} writer(s)", flush=True)
         return 0
     if args.ensure:
-        started, pid = ensure_running(Path(args.log))
+        try:
+            started, pid = ensure_running(Path(args.log))
+        except RuntimeError as exc:
+            print(f"core_heartbeat: {exc}", file=sys.stderr, flush=True)
+            return 1
         print(f"core_heartbeat: {'started writer' if started else 'writer already running'}"
               f" (pid {pid})", flush=True)
         return 0

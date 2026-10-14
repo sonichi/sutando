@@ -613,6 +613,105 @@ class TestHeartbeatWrite(unittest.TestCase):
         # last_beat_at should advance.
         self.assertGreater(second_data["last_beat_at"], first_data["last_beat_at"])
 
+    def _main_quietly(self, argv):
+        import contextlib
+        import io
+        import core_heartbeat
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+             patch.object(core_heartbeat, "run_forever", side_effect=AssertionError("must not beat")):
+            rc = core_heartbeat.main(argv)
+        return rc, err.getvalue()
+
+    def test_a_contended_writer_lock_exits_0_and_leaves_alive_untouched(self):
+        import core_heartbeat
+        import file_lock
+        cores = self.tmp / "state" / "cores"; cores.mkdir(parents=True)
+        alive = cores / f"{_short_host()}.alive"
+        alive.write_text('{"heartbeat_pid": 4242}')
+        with patch.object(file_lock, "lock_fd", side_effect=BlockingIOError(11, "busy")):
+            rc, err = self._main_quietly(["--interval", "0.5"])
+        self.assertEqual(rc, 0)
+        self.assertIn("another writer already beats", err)
+        self.assertEqual(alive.read_text(), '{"heartbeat_pid": 4242}')
+        self.assertFalse(alive.with_suffix(".stopped").exists())
+        self.assertIsNone(core_heartbeat._WRITER_LOCK)
+
+    def test_a_lock_error_that_is_not_contention_fails_loudly(self):
+        import errno as _errno
+        import core_heartbeat
+        import file_lock
+        with patch.object(file_lock, "lock_fd", side_effect=OSError(_errno.ENOLCK, "No locks available")):
+            rc, err = self._main_quietly(["--interval", "0.5"])
+        self.assertEqual(rc, 1)
+        self.assertIn("cannot take the writer lock", err)
+        self.assertNotIn("another writer", err)
+        self.assertFalse((self.tmp / "state" / "cores").exists())
+        self.assertIsNone(core_heartbeat._WRITER_LOCK)
+
+    @unittest.skipIf(os.name == "nt", "POSIX advisory lock")
+    def test_the_writer_lock_records_its_holder_and_refuses_a_second_taker(self):
+        import core_heartbeat
+        self.assertIsNone(core_heartbeat._writer_lock_holder())
+        self.assertTrue(core_heartbeat._take_writer_lock())
+        self.addCleanup(core_heartbeat._WRITER_LOCK.close)
+        self.assertEqual(core_heartbeat._writer_lock_holder(), os.getpid())
+        held = core_heartbeat._WRITER_LOCK
+        self.assertFalse(core_heartbeat._take_writer_lock())   # flock is per open file: a second fd contends
+        self.assertIs(core_heartbeat._WRITER_LOCK, held)
+
+    def _ensure_with_child(self, child, holder=None):
+        import core_heartbeat
+        lock = core_heartbeat._writer_lock_path()
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        if holder is not None:
+            lock.write_text(f"{holder}\n")
+        calls = []
+
+        def writers():  # none before the spawn, the child's own argv after it
+            calls.append(1)
+            return [] if len(calls) == 1 else [child.pid]
+        with patch.object(core_heartbeat, "running_writer_pids", side_effect=writers), \
+             patch.object(core_heartbeat.subprocess, "Popen", return_value=child):
+            return core_heartbeat.ensure_running(self.tmp / "hb.log")
+
+    def test_ensure_reports_started_only_once_the_child_holds_the_lock(self):
+        from unittest.mock import MagicMock
+        child = MagicMock(pid=777001, returncode=None)
+        child.poll.return_value = None
+        self.assertEqual(self._ensure_with_child(child, holder=777001), (True, 777001))
+
+    def test_ensure_reports_the_holder_when_its_child_lost_the_lock(self):
+        from unittest.mock import MagicMock
+        child = MagicMock(pid=777002, returncode=0)
+        child.poll.return_value = 0
+        self.assertEqual(self._ensure_with_child(child, holder=4242), (False, 4242))
+
+    def test_ensure_fails_when_its_child_dies_with_an_error(self):
+        import contextlib
+        import io
+        from unittest.mock import MagicMock
+        import core_heartbeat
+        child = MagicMock(pid=777003, returncode=1)
+        child.poll.return_value = 1
+        with self.assertRaisesRegex(RuntimeError, "writer exited 1 at start"):
+            self._ensure_with_child(child)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+             patch.object(core_heartbeat, "ensure_running", side_effect=RuntimeError("writer exited 1 at start")):
+            self.assertEqual(core_heartbeat.main(["--ensure"]), 1)
+        self.assertIn("writer exited 1 at start", err.getvalue())
+
+    def test_ensure_waits_out_a_slow_child_and_reports_it_started(self):
+        from unittest.mock import MagicMock
+        import core_heartbeat
+        child = MagicMock(pid=777004, returncode=None)
+        child.poll.return_value = None
+        clock = iter(range(0, 1000, 2))
+        with patch.object(core_heartbeat.time, "monotonic", side_effect=lambda: next(clock)), \
+             patch.object(core_heartbeat.time, "sleep"):
+            self.assertEqual(self._ensure_with_child(child), (True, 777004))
+
     def test_write_beat_creates_cores_dir(self):
         """The cores/ dir must be created if it doesn't yet exist — fresh
         install case."""
@@ -639,7 +738,10 @@ class TestHeartbeatCli(unittest.TestCase):
         # — the #1745 drift, and both CLI cases fail locally. CI/Linux (no
         # scutil) matched already; this makes the subprocess path deterministic
         # on drifting hosts too.
-        self.env = {**os.environ, "SUTANDO_WORKSPACE": str(self.tmp),
+        # A worker's own tmux identity must not leak in: the children probe a stand-in core.
+        _leaky = ("TMUX", "TMUX_PANE", "SUTANDO_TMUX_SESSION", "SUTANDO_TMUX_SOCKET")
+        self.env = {**{k: v for k, v in os.environ.items() if k not in _leaky},
+                    "SUTANDO_WORKSPACE": str(self.tmp),
                     "SUTANDO_TEST_MODE": "1",
                     "SUTANDO_HOST_LABEL": _short_host()}
         # Registered first so it runs last: a child reaped later must not recreate the tree.
