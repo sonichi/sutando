@@ -18,9 +18,11 @@ import { join } from 'node:path';
 import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 import { injectText } from './browser-tools.js';
-import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull, frameTaskResult, framedSystem } from './inject-framing.js';
+import { meetingHoldsModel } from './meeting-input-hold.js';
+import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
-import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher } from './task-bridge.js';
+import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, voiceTaskStore, reconcileVoiceTasks, forwardOfflineVoiceResult, notPickedStillTrue } from './task-bridge.js';
+import { createHandoffPacer, frameResult, resultIsMoot, type Handoff, type RelayAgent, type ResultItem } from './relay-agent.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
 
@@ -34,6 +36,14 @@ export interface DurableChannelOptions {
 	 * other adapters may not). */
 	cartesiaApiKey?: string;
 	generateSpeech?: ((text: string, meta: { category: string; label: string }) => Promise<string>) | null;
+	/** Waits between checks while the session cannot take a result, before the DM fallback. */
+	notReadyRetriesMs?: number[];
+	/** How often the relay agent reconciles the task table with the core. */
+	reconcileMs?: number;
+	/** How long a handed-over result waits for the model's turn before the next one goes. */
+	handoffConfirmMs?: number;
+	/** The `work` subagent, which owns the result queue. */
+	relay: RelayAgent;
 }
 
 /**
@@ -42,7 +52,7 @@ export interface DurableChannelOptions {
  * text path when the session is live, with the tuned guard markers and
  * fallback semantics preserved exactly.
  */
-export function wireDurableChannels(session: VoiceSession, opts: DurableChannelOptions = {}): void {
+export function wireDurableChannels(session: VoiceSession, opts: DurableChannelOptions): { enqueue: (item: ResultItem) => void } {
 	const { cartesiaApiKey = '', generateSpeech = null } = opts;
 
 	// Watch for context drops (keyboard shortcut)
@@ -93,67 +103,173 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		return false;
 	});
 
-	startResultWatcher((result, deliveryNote) => {
-		console.log(`${ts()} [TaskBridge] Delivering result to user${deliveryNote ? ' (with a delivery note)' : ''}`);
-		// Re-check session state inside the timer rather than at callback
-		// time. Reason: TaskBridge delivers `voice-*.txt` results the
-		// instant the WebSocket reconnects, but Gemini setup completes
-		// ~100ms after that. Without this delay-then-check pattern, a
-		// voice-only push that lands during the connect-but-not-active
-		// window would silently fall through to the Cartesia branch
-		// (which is usually disabled). 2026-05-20 02:36:44 incident:
-		// voice-test-1779244500.txt was "delivered" per the bridge log
-		// but never spoken because isActive was false at callback time
-		// (Gemini setup completed 106ms later). Now the check fires at
-		// T+1500ms when setup is reliably finished.
-		const inject = () => {
-			if (session.sessionManager.isActive && session.clientConnected) {
-				// The note sits OUTSIDE the TASK_RESULT markers: it is delivery
-				// state the model acts on, not result text it must only summarise.
-				injectText(session, frameTaskResult(result) + (deliveryNote ? `\n\n${framedSystem(deliveryNote)}` : ''));
-				return true;
-			}
-			return false;
+	// A result answers its own task and every task the core deduped into it that the user has not heard.
+	const answering = (taskId?: string): Pick<ResultItem, 'requests' | 'alsoFor'> => {
+		if (!taskId) return {};
+		const others = voiceTaskStore.answeredBy(taskId).filter(([, row]) => row.delivery !== 'spoken' && row.delivery !== 'injected');
+		const own = voiceTaskStore.get(taskId)?.text;
+		return {
+			requests: [own, ...others.map(([, row]) => row.text)].filter((r): r is string => !!r),
+			alsoFor: others.map(([id]) => id),
 		};
-		// First attempt after 1.5s (matches prior behavior). If still not
-		// active, do one retry at 3s. After that, fall through to Cartesia
-		// — no infinite retry, since a stuck session shouldn't pin the
-		// result forever.
+	};
+
+	// A result no work call can carry (its call was cancelled, its connection replaced, or the agent
+	// restarted): a system notice when the session can speak, held through a meeting; else one DM copy.
+	const heldForMeeting: ResultItem[] = [];
+	// One result at a time, each confirmed by the model's next turn (spoken) or handed over again once.
+	const pacer = createHandoffPacer({
+		markSpoken: (spoken) => { for (const id of spoken) voiceTaskStore.set(id, 'spoken'); },
+		confirmMs: opts.handoffConfirmMs,
+		log: (m) => console.log(`${ts()} ${m}`),
+	});
+	const interruptedTurns = new Set<string>();
+	session.eventBus.subscribe('turn.start', () => pacer.onTurnStart());
+	session.eventBus.subscribe('response.first_audio', () => pacer.onModelAudio());
+	// Only the client's microphone detection counts: Gemini marks a start on every transcription chunk and no end.
+	session.eventBus.subscribe('speech.user_started', (e: { source?: string }) => pacer.onUserSpeechStarted(e));
+	session.eventBus.subscribe('speech.user_ended', (e: { source?: string }) => pacer.onUserSpeechEnded(e));
+	session.eventBus.subscribe('turn.interrupted', (e: { turnId?: string }) => { if (e?.turnId) interruptedTurns.add(String(e.turnId)); });
+	session.eventBus.subscribe('turn.end', (e: { turnId?: string }) => {
+		pacer.onTurnEnd(!!e?.turnId && interruptedTurns.delete(String(e.turnId)));
+	});
+	let stuckSeq = 0;
+	let heldTimer: ReturnType<typeof setInterval> | null = null;
+	const record = (item: ResultItem, delivery: 'injected' | 'dm') => {
+		for (const id of [item.taskId, ...(item.alsoFor ?? [])]) if (id) voiceTaskStore.set(id, delivery);
+	};
+	const holdForMeeting = (item: ResultItem) => {
+			heldForMeeting.push(item);
+			console.log(`${ts()} [TaskBridge] Meeting mode: holding the result until the meeting ends (${heldForMeeting.length} held)`);
+			heldTimer ??= setInterval(() => {
+				if (meetingHoldsModel(session)) return;
+				clearInterval(heldTimer!);
+				heldTimer = null;
+				for (const held of heldForMeeting.splice(0)) deliverElsewhere(held);
+			}, 2_000);
+			heldTimer.unref?.();
+	};
+	const deliverElsewhere = (item: ResultItem) => {
+		if (meetingHoldsModel(session)) { holdForMeeting(item); return; }
+		pacer.submit(viaNotice(item));
+	};
+	const canSpeak = () => session.sessionManager.isActive && session.clientConnected;
+	const notice = (item: ResultItem) => canSpeak() && session.tryPublishSystemNotification(frameResult(item));
+	const ids = (item: ResultItem) => (item.taskId ? [item.taskId, ...(item.alsoFor ?? [])] : []);
+	const moot = (item: ResultItem) => (item.about ? !notPickedStillTrue(item.about) : resultIsMoot(voiceTaskStore, ids(item)));
+	// A result handed to the model as a system notice; it waits for a reconnect, then goes to the DM.
+	// Which tasks a result answers is read when it is handed: the core may mark one deduped into it after it landed.
+	const current = (item: ResultItem): ResultItem => (item.taskId ? { ...item, ...answering(item.taskId) } : item);
+	const viaNotice = (item: ResultItem): Handoff => ({
+		ids: ids(item), label: item.taskId ?? 'result', moot: () => moot(item),
+		hand: () => {
+			// A meeting that began while this waited its turn: not said into it (bodhi's notifications do not check).
+			if (meetingHoldsModel(session)) return false;
+			const now = current(item); if (!notice(now)) return false; record(now, 'injected'); return true;
+		},
+		fallback: () => (meetingHoldsModel(session) ? holdForMeeting(item) : retryThenDm(item)),
+	});
+	const retryThenDm = (item: ResultItem) => {
 		deliverWithRetry({
-			attempt: inject,
-			onExhausted: () => {
-				// Stuck-voice fallback. Per Susan's PR #924 review (Q3): Cartesia
-				// only reaches the user if they're watching the web client with
-				// audio playback — a user in a stuck voice session is probably
-				// looking at the voice surface, not the web UI. So the
-				// stuck-voice result can go into the void. Always also write a
-				// Discord DM via a proactive-*.txt file so the result is never
-				// silently lost. Cartesia stays as a bonus path when available
-				// (some users keep the web UI open).
-				console.log(`${ts()} [TaskBridge] Voice not active after 3s — falling back to Discord DM${cartesiaApiKey && generateSpeech ? ' + Cartesia' : ''}`);
-				try {
-					const proactiveTs = Math.floor(Date.now() / 1000);
-					const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${proactiveTs}.txt`);
-					const dmBody = `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${result}`;
-					writeFileSync(proactivePath, dmBody);
-				} catch (e) {
-					console.error(`${ts()} [TaskBridge] Failed to write stuck-voice Discord fallback:`, e);
-				}
-				if (cartesiaApiKey && generateSpeech) {
-					const truncated = (result.match(/^[\s\S]{0,500}[.!?]/)?.[0] || result.slice(0, 500)).trim();
-					generateSpeech(truncated, { category: 'result', label: 'task-result' }).then(audioPath => {
-						const relativeSrc = audioPath.startsWith(WORKSPACE_DIR)
-							? audioPath.slice(WORKSPACE_DIR.replace(/\/$/, '').length + 1)
-							: audioPath;
-						writeFileSync(statusPath('dynamic-content.json', WORKSPACE_DIR), JSON.stringify({
-							type: 'audio', src: relativeSrc, title: 'Task Complete',
-						}));
-						console.log(`${ts()} [CartesiaTTS] Audio generated: ${audioPath}`);
-					}).catch(err => console.error(`${ts()} [CartesiaTTS] ${err.message}`));
-				}
+			attempt: () => {
+				if (meetingHoldsModel(session)) { holdForMeeting(item); return true; }
+				if (!canSpeak()) return false;
+				pacer.submit({ ...viaNotice(item), fallback: () => (meetingHoldsModel(session) ? holdForMeeting(item) : toDm(item)) });
+				return true;
 			},
+			// A reconnect takes seconds; wait up to a minute for it before the DM.
+			delaysMs: [0, ...(opts.notReadyRetriesMs ?? Array(30).fill(2_000))],
+			onExhausted: () => toDm(item),
 		});
+	};
+	const toDm = (item: ResultItem) => {
+		const taskId = item.taskId;
+		// A voice task's result: one DM copy, which the drain speaks on reconnect if no bridge takes it.
+		if (taskId?.startsWith('task-')) {
+			if (voiceTaskStore.get(taskId)?.delivery === 'dm') return;
+			void forwardOfflineVoiceResult(taskId, item.text)
+				.then(() => record(item, 'dm'))
+				.catch((e) => console.error(`${ts()} [TaskBridge] offline forward failed for ${taskId}:`, e));
+			return;
+		}
+		// Stuck-voice fallback (Susan's PR #924 review, Q3): always also a DM, so a result is never
+		// silently lost; Cartesia stays a bonus path for a user watching the web client.
+		console.log(`${ts()} [TaskBridge] Voice not active after waiting — falling back to Discord DM${cartesiaApiKey && generateSpeech ? ' + Cartesia' : ''}`);
+		try {
+			// One file per result: two can fall back in the same millisecond.
+			const proactivePath = join(WORKSPACE_DIR, 'results', `proactive-voice-stuck-${Date.now()}-${++stuckSeq}.txt`);
+			writeFileSync(proactivePath, `🎤 Voice session was stuck — couldn't speak this. Task result:\n\n${item.text}`);
+		} catch (e) {
+			console.error(`${ts()} [TaskBridge] Failed to write stuck-voice Discord fallback:`, e);
+		}
+		if (cartesiaApiKey && generateSpeech) {
+			const truncated = (item.text.match(/^[\s\S]{0,500}[.!?]/)?.[0] || item.text.slice(0, 500)).trim();
+			generateSpeech(truncated, { category: 'result', label: 'task-result' }).then(audioPath => {
+				const relativeSrc = audioPath.startsWith(WORKSPACE_DIR)
+					? audioPath.slice(WORKSPACE_DIR.replace(/\/$/, '').length + 1)
+					: audioPath;
+				writeFileSync(statusPath('dynamic-content.json', WORKSPACE_DIR), JSON.stringify({
+					type: 'audio', src: relativeSrc, title: 'Task Complete',
+				}));
+				console.log(`${ts()} [CartesiaTTS] Audio generated: ${audioPath}`);
+			}).catch(err => console.error(`${ts()} [CartesiaTTS] ${err.message}`));
+		}
+	};
+	const deliver = (item: ResultItem) => {
+		// Corrected, or already said: end its call, say nothing.
+		if (moot(item)) {
+			for (const id of ids(item)) opts.relay.endCall(id, 'delivered_separately');
+			console.log(`${ts()} [RelayAgent] ${item.taskId ?? 'result'}: already heard or corrected; not said`);
+			return;
+		}
+		if (item.taskId && opts.relay.isWaiting(item.taskId)) {
+			pacer.submit({
+				ids: ids(item), label: item.taskId,
+				// Its turn came after it stopped mattering: its call still waits and must end.
+				moot: () => {
+					if (!moot(item)) return false;
+					for (const id of ids(item)) opts.relay.endCall(id, 'delivered_separately');
+					return true;
+				},
+				hand: () => {
+					// The result waited its turn and the client left meanwhile (2026-10-11 00:14): a result handed
+					// to a session nobody hears would be recorded heard. It goes the offline way instead.
+					if (!canSpeak()) return false;
+					if (!opts.relay.offerResult(current(item))) return false;
+					console.log(`${ts()} [RelayAgent] ${item.taskId}: result returned to its work call`);
+					return true;
+				},
+				fallback: () => deliverElsewhere(item),
+			});
+			return;
+		}
+		console.log(`${ts()} [TaskBridge] Delivering result to the user${item.note ? ' (with a delivery note)' : ''}`);
+		deliverElsewhere(item);
+	};
+
+	startResultWatcher((result, deliveryNote, meta) => {
+		// A message with no task of its own (a summary) never stands in for a voice task's own result: numbers
+		// in common prove the two mention the same thing, not that one answers the other (review of #5348, B3).
+		deliver({ text: result, note: deliveryNote, taskId: meta?.taskId, ...answering(meta?.taskId) });
 	}, () => session.clientConnected);
+
+	// The relay agent's reconcile loop: whatever the core finished that the user has not heard
+	// (sent to the DM, its call gone, the agent restarted) is handed over again once the session can speak.
+	const reconcile = setInterval(() => {
+		if (!session.sessionManager.isActive || !session.clientConnected || meetingHoldsModel(session)) return;
+		try {
+			// A task's own waiting call goes first: a task answered in another's result still has one.
+			reconcileVoiceTasks(
+				(text, note, meta) => deliver({ text, note, taskId: meta.taskId, framed: meta.framed, about: meta.about, ...answering(meta.taskId) }),
+				// Queued in the pacer: on its way, not lost.
+				(id) => pacer.has(id),
+			);
+		} catch (err) {
+			console.error(`${ts()} [RelayAgent] reconcile failed (will retry):`, err);
+		}
+	}, opts.reconcileMs ?? 5_000);
+	reconcile.unref?.();
+	return { enqueue: deliverElsewhere };
 }
 
 // ── Session observability recorder (step 5a-3) ───────────────────────────────

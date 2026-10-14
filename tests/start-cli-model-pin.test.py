@@ -324,7 +324,9 @@ def case_bare_invocation_still_warns_on_a_pinned_live_core() -> list[str]:
             # core_claude_pids() reads `pgrep -ax claude`; report the staged pid so the
             # script takes its already-running attach path instead of launching.
             pg = bind / "pgrep"
-            pg.write_text("#!/bin/bash\necho '%s claude'\n" % pids[0])
+            # The heartbeat writer probe is answered "running" so the launcher spawns none.
+            pg.write_text("#!/bin/bash\ncase \"$*\" in *core_heartbeat*) exit 0;; esac\n"
+                          "echo '%s claude'\n" % pids[0])
             pg.chmod(0o755)
             tm("setenv", "-g", "SUTANDO_CORE_MODEL", "opus")
             tm("setenv", "-t", "=sutando-core", "SUTANDO_CORE_MODEL", "opus")

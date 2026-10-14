@@ -234,6 +234,21 @@ check("image: managed generation reported verbatim", resolve_credential("gemini-
 _reset_env(); os.environ["GEMINI_VOICE_API_KEY"] = "vk"; os.environ["SUTANDO_VOICE_CREDENTIAL_GENERATION"] = "cg1-injected"
 check("image: env key never carries the voice generation", resolve_credential("gemini-image", _missing()), {"key": "vk", "source": "env"})
 
+# 31. desktop: the supervisor injects the managed Live token as GEMINI_VOICE_API_KEY into every child;
+#     the image walk never spends it (by `auth_tokens/` shape or by equality with the managed voice entry)
+_reset_env(); os.environ["GEMINI_VOICE_API_KEY"] = "auth_tokens/injected"
+check("image: env VOICE Live token, no managed file -> none", resolve_credential("gemini-image", _missing()), {"key": "", "source": "none"})
+check("voice: env VOICE Live token still serves voice (unchanged)", resolve_credential("gemini-voice", _missing()), {"key": "auth_tokens/injected", "source": "env"})
+_reset_env(); os.environ["GEMINI_VOICE_API_KEY"] = "auth_tokens/managed-v"
+check("image: desktop shape (managed VOICE + same token injected in env) -> none", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "auth_tokens/managed-v"}})), {"key": "", "source": "none"})
+check("voice: desktop shape still resolves the managed voice token (unchanged)", resolve_credential("gemini-voice", _write_managed({"gemini-voice": {"key": "auth_tokens/managed-v"}})), {"key": "auth_tokens/managed-v", "source": "managed"})
+os.environ["GEMINI_API_KEY"] = "mk"
+check("image: desktop shape + real GEMINI_API_KEY -> the real key", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "auth_tokens/managed-v"}})), {"key": "mk", "source": "env"})
+_reset_env(); os.environ["GEMINI_VOICE_API_KEY"] = "managed-v"
+check("image: env VOICE equal to the managed voice entry -> none", resolve_credential("gemini-image", _write_managed({"gemini-voice": {"key": "managed-v"}})), {"key": "", "source": "none"})
+_reset_env(); os.environ["GEMINI_API_KEY"] = "auth_tokens/misplaced"
+check("image: a Live token in GEMINI_API_KEY -> none", resolve_credential("gemini-image", _missing()), {"key": "", "source": "none"})
+
 # 24. credential_source_label: the design's user-facing vocabulary
 _reset_env()
 for _src, _label in (("managed", "managed"), ("env", "byok"), ("none", "none")):

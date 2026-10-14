@@ -37,6 +37,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import datetime
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 import read as _read       # noqa: E402
@@ -49,6 +51,7 @@ import say as _say         # noqa: E402
 import rooms as _rooms     # noqa: E402
 import members as _members # noqa: E402
 import events as _events   # noqa: E402
+import history as _history # noqa: E402
 
 
 def _record_say(res):
@@ -229,6 +232,8 @@ def _main(argv):
     e.add_argument("--once", action="store_true", help="exit after the first event")
     e.add_argument("--max-events", type=int, default=None)
 
+    sub.add_parser("agents", help="list this account's registered agents with owners (/v1/agents)")
+
     p = sub.add_parser("resolve", help="resolve a friendly handle -> agent mxid (via /v1/agents)")
     p.add_argument("handle")
 
@@ -241,10 +246,14 @@ def _main(argv):
                    help="event id ($abc) to cite as the message replied to. This is a "
                         "CITATION: the post stays in the main timeline. It does NOT put "
                         "the post in a Matrix thread — the gateway has no field for that.")
+    p.add_argument("--thread-root", dest="thread_root", default=None, metavar="EVENT",
+                   help="event id ($abc) of the thread to post the mention IN (rel_type "
+                        "m.thread, built by the gateway); it leaves the main timeline.")
 
     p = sub.add_parser("say", help="post a plain message into a room (mentions no one)")
     p.add_argument("room_id")
-    p.add_argument("message")
+    p.add_argument("message", nargs="?")
+    p.add_argument("--body-file", help="UTF-8 message file; exclusive with positional message")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
     p.add_argument("--worker", default=None,
                    help="worker id to stamp on the event (space.ag2.worker) so the "
@@ -272,6 +281,12 @@ def _main(argv):
                    help="tier for members not named by --tier")
     p.add_argument("--revoke", action="store_true",
                    help="disable the grant (authoritative=false); leaves other policy fields intact")
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
+    p = sub.add_parser("history", help="read all joined rooms with window pagination and coverage receipts")
+    p.add_argument("--since", required=True, help="ISO 8601 time with timezone")
+    p.add_argument("--until", help="ISO 8601 time with timezone; default now")
+    p.add_argument("--pages", type=int, default=20)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
     sub.add_parser("capabilities", help="print, as JSON, the subcommands and `say` flags this "
@@ -326,12 +341,32 @@ def _main(argv):
         if a.events_cmd == "stream":
             return _events_stream(a)  # prints JSONL itself; summary is one line
         res = _dispatch_events(a)
+    elif a.cmd == "agents":
+        res = _resolve.list_agents()
     elif a.cmd == "resolve":
         res = _resolve.resolve_user(a.handle)
     elif a.cmd == "mention":
-        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid,
-                               reply_to=a.reply_to)
+        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid, reply_to=a.reply_to,
+                               **({"thread_root": a.thread_root} if a.thread_root else {}))
+    elif a.cmd == "history":
+        try:
+            start = datetime.datetime.fromisoformat(a.since.replace("Z", "+00:00"))
+            end = datetime.datetime.fromisoformat(a.until.replace("Z", "+00:00")) if a.until else datetime.datetime.now(datetime.timezone.utc)
+            if not start.tzinfo or not end.tzinfo:
+                raise ValueError("timestamps require timezone")
+            res = _history.history(start.timestamp() * 1000, end.timestamp() * 1000, a.pages, a.agent_mxid)
+        except (ValueError, TypeError):
+            res = {"ok": False, "complete_available_history": False, "reason": "Invalid history window or membership data"}
     elif a.cmd == "say":
+        if (a.message is None) == (a.body_file is None):
+            print(json.dumps({"ok": False, "reason": "say requires exactly one positional message or --body-file"}))
+            return 2
+        if a.body_file is not None:
+            try:
+                a.message = Path(a.body_file).read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                print(json.dumps({"ok": False, "reason": "Cannot read UTF-8 message file"}))
+                return 2
         _kw = {"reply_to": a.reply_to}
         if a.worker:
             _kw["worker"] = a.worker

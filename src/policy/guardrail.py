@@ -120,6 +120,29 @@ def engage_rulebook(surface: str, provenance: str, result_path: str) -> str:
     )
 
 
+# The per-tier scope a GUEST task is limited to on AG2 Space.
+AG2SPACE_GUEST_SCOPE = (
+    "Research, inspect, explain, and draft only. Do not modify files or external systems."
+)
+
+
+def ag2space_tier_lines(tier: str, collaborator: bool, result_path: str) -> list[str]:
+    """The SYSTEM INSTRUCTIONS an AG2 Space task carries for its effective tier.
+
+    `tier` is the tier after any local cap; `collaborator` is the broker's attested
+    flag. Owner and unknown tiers get no block here: owner needs none, and callers
+    resolve unknown values to guest before calling.
+    """
+    if tier == "team":
+        if collaborator:
+            return [engage_rulebook("room", AG2SPACE_PROVENANCE, result_path)]
+        return team_guardrail_lines(result_path)
+    if tier == "guest":
+        return sandboxed_delegation_lines(
+            "AG2 Space", "GUEST tier", result_path, AG2SPACE_GUEST_SCOPE)
+    return []
+
+
 def owner_mention_lines(result_path: str) -> list[str]:
     """The owner-mention instruction as in-band SYSTEM INSTRUCTIONS lines for a task file.
 

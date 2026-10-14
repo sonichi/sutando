@@ -284,11 +284,13 @@ resolve_claude_credential_proxy() {
     lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1
   }
   if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
-    # A loaded launchd job means the proxy is EXPECTED on this host even when
-    # its listener hasn't bound yet.
+    # The proxy is EXPECTED, though not yet bound, under either supervisor: a loaded
+    # launchd job, or a live proxy process (the desktop app supervises it without launchd).
     PROXY_EXPECTED=""
     if launchctl print "gui/$(id -u)/com.sutando.credential-proxy" > /dev/null 2>&1; then
-      PROXY_EXPECTED=1
+      PROXY_EXPECTED="launchd job loaded"
+    elif pgrep -f 'credential-proxy\.(js|ts)( |$)' > /dev/null 2>&1; then
+      PROXY_EXPECTED="proxy process running"
     fi
     if [ -n "$PROXY_EXPECTED" ]; then
       # Bounded wait (~10s): a supervised proxy can bind seconds after this
@@ -301,7 +303,7 @@ resolve_claude_credential_proxy() {
     if _proxy_listener_up; then
       export ANTHROPIC_BASE_URL=http://localhost:7846
     elif [ -n "$PROXY_EXPECTED" ]; then
-      echo "  ⚠ credential proxy expected (launchd job loaded) but :7846 never bound within ~10s — session runs unrouted this launch (no proxy protection, no quota telemetry)" >&2
+      echo "  ⚠ credential proxy expected ($PROXY_EXPECTED) but :7846 never bound within ~10s — session runs unrouted this launch (no proxy protection, no quota telemetry)" >&2
     fi
   fi
 }
@@ -353,9 +355,11 @@ forward_skill_manifest_config() {
   unset _mc_seen _mcrec
 }
 
-# Registers the PERSONAL_CLAUDE.md compaction-reinject hook. Idempotent.
+# Registers the post-compaction SessionStart hooks: PERSONAL_CLAUDE.md re-inject
+# and the task-watcher re-arm hint. Idempotent.
 install_claude_personal_hook() {
   bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "session-launch: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
+  bash "$REPO/scripts/install-watcher-rearm-hook.sh" || echo "session-launch: watcher re-arm hook install failed (rc=$?) — hook may be absent" >&2
 }
 
 # Creates a new tmux session running claude with the fully-assembled args, then

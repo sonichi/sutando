@@ -152,7 +152,7 @@ with tempfile.TemporaryDirectory() as td:
     room_post = next(p for m, u, p in calls
                      if u == "/v1/room" and p.get("room_id") == "!shared:ag2.space")
     check(room_post["body"] == "sensitive candidate"
-          and room_post["dedupe_key"].startswith("withheld-publish:wr_"),
+          and room_post["dedupe_key"] == f"{published['review_id']}.{published['decision_claim_id']}#0",
           "publication restores the exact body with idempotency")
     control_path = bridge._control_result_path("decision-no")
     check(control_path.is_file(),
@@ -324,12 +324,15 @@ with tempfile.TemporaryDirectory() as td:
     check(len(list(starvation.glob("wr_*.json"))) == 1
           and len(list((starvation / "archive").glob("wr_*.json"))) == 512,
           "resolved audit records must leave the hot scan without being deleted")
-    original_read = bridge._read_private_json
-    hot_reads = []
-    bridge._read_private_json = lambda p: (hot_reads.append(p), original_read(p))[1]
-    pending_after_archive = bridge._pending_review_records()
-    bridge._read_private_json = original_read
-    check(len(hot_reads) == 1 and pending_after_archive[0][1].get("review_id") == target_id,
+    original_read = pathlib.Path.read_text
+    reads = []
+    pathlib.Path.read_text = lambda p, *a, **k: (reads.append(p), original_read(p, *a, **k))[1]
+    try:
+        pending_after_archive = bridge._pending_review_records()
+    finally:
+        pathlib.Path.read_text = original_read
+    check(not any("archive" in p.parts for p in reads)
+          and pending_after_archive[0][1].get("review_id") == target_id,
           "archived history must add no reads to the hot pending scan")
 
     bridge._STATE = old["state"]

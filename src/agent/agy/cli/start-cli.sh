@@ -1,6 +1,6 @@
 #!/bin/bash
-# Standalone persistent tmux launcher for `agy` (Google's Antigravity CLI);
-# not wired into core selection — see src/agent/agy/README.md for scope.
+# Standalone persistent tmux launcher for `agy` (Google's Antigravity CLI).
+# Not wired into core selection — see src/agent/agy/README.md for scope.
 set -euo pipefail
 
 # This script lives at src/agent/agy/cli/ — four levels under the repo root.
@@ -11,9 +11,7 @@ cd "$REPO"
 # with the real sutando-core session (claude or codex) on the same host.
 TMUX_SOCKET="${SUTANDO_AGY_TMUX_SOCKET:-${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}}"
 SESSION="${SUTANDO_AGY_TMUX_SESSION:-sutando-agy}"
-WATCHER_SESSION="${SESSION}-watcher"
 ONBOARDING_PATH="${SUTANDO_AGY_ONBOARDING_PATH:-$HOME/.gemini/antigravity-cli/cache/onboarding.json}"
-NOTIFIER="${SUTANDO_AGY_NOTIFIER_SCRIPT:-$REPO/src/agent/agy/cli/task-notifier.sh}"
 
 PY=""
 if [ -r "$REPO/scripts/python-binary.sh" ]; then
@@ -35,66 +33,17 @@ EOF
 
 tmux_available() { command -v tmux >/dev/null 2>&1; }
 session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; }
-watcher_session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$WATCHER_SESSION" 2>/dev/null; }
 
-# Starts task-notifier.sh in its own tmux session, once per core session.
-# fresh_core=1 recycles a surviving-but-stale watcher; its initial sweep re-arms durable pending work.
-ensure_task_notifier() {
-  local fresh_core="${1:-0}"
-  if watcher_session_exists; then
-    [ "$fresh_core" = 1 ] || return 0
-    tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
-    for _ in $(seq 1 25); do
-      watcher_session_exists || break
-      sleep 0.2
-    done
-    if watcher_session_exists; then
-      echo "  ⚠ stale agy task notifier would not terminate — leaving it running, tasks may lag" >&2
-      return 0
-    fi
+# Task injection was removed, but an update leaves a running "<session>-watcher" from it;
+# retire it on every run, since the early return below skips everything else.
+retire_stale_watcher() {
+  local watcher="${SESSION}-watcher"
+  tmux -S "$TMUX_SOCKET" has-session -t "=$watcher" 2>/dev/null || return 0
+  if tmux -S "$TMUX_SOCKET" kill-session -t "=$watcher" 2>/dev/null; then
+    echo "Retired stale $watcher (task injection is no longer part of this launcher)."
+  elif tmux -S "$TMUX_SOCKET" has-session -t "=$watcher" 2>/dev/null; then
+    echo "  ⚠ could not retire stale $watcher on $TMUX_SOCKET" >&2
   fi
-  [ -x "$NOTIFIER" ] || { echo "  ⚠ agy task notifier not found/executable: $NOTIFIER — tasks will not reach this session" >&2; return 0; }
-  # task-notifier.sh hard-requires fswatch; without it the pane process dies
-  # within ~1s, so a tmux new-session that "succeeds" leaves nothing alive.
-  if ! command -v fswatch >/dev/null 2>&1; then
-    echo "  ⚠ fswatch not found — required by the agy task notifier (brew install fswatch); tasks will not reach this session" >&2
-    return 0
-  fi
-  # Bind every queue-related var explicitly, never omit -e: the tmux server's
-  # global env can carry a foreign value that only an explicit -e overrides.
-  NOTIFIER_ENV_ARGS=(-e "SUTANDO_AGY_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_AGY_TMUX_SESSION=$SESSION" -e "SUTANDO_INSTANCE_ID=agy-task-notifier")
-  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=${SUTANDO_TASKS_DIR:-}")
-  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=${SUTANDO_RESULTS_DIR:-}")
-  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=${SUTANDO_WORKSPACE_DIR:-}")
-  # The sentinel name carries the actor identity too: bind it the same way, so
-  # the watcher stamps the path this launcher will poll.
-  for _v in SUTANDO_AGENT_ID AGENT_MXID AGENT_ID; do
-    NOTIFIER_ENV_ARGS+=(-e "$_v=${!_v:-}")
-  done
-  # A fresh nonce per launch: the notifier publishes it in its receipt only once its own
-  # watcher child owns the ready sentinel, so no earlier generation can answer for this one.
-  local launch_nonce; launch_nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
-  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_AGY_LAUNCH_NONCE=$launch_nonce")
-  if ! tmux -S "$TMUX_SOCKET" new-session -d -s "$WATCHER_SESSION" \
-      "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER"; then
-    echo "  ⚠ could not start the agy task notifier — tasks will not reach this session" >&2
-    return 0
-  fi
-  # tmux accepting the session proves nothing: ready means the notifier published this
-  # launch's receipt (its watcher child owns the ready sentinel), or the session is gone.
-  local deadline
-  deadline=$(( $(date +%s) + ${SUTANDO_WATCHER_READY_TIMEOUT:-10} + 2 ))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if ! watcher_session_exists; then
-      echo "  ⚠ agy task notifier exited: its watcher did not report ready — tasks will not reach this session" >&2
-      return 0
-    fi
-    if bash "$NOTIFIER" --launch-ready "$launch_nonce" 2>/dev/null; then
-      return 0
-    fi
-    sleep 0.2
-  done
-  echo "  ⚠ agy task notifier's watcher did not report ready within $(( ${SUTANDO_WATCHER_READY_TIMEOUT:-10} + 2 ))s — tasks may not reach this session" >&2
 }
 
 attach_or_report_existing() {
@@ -159,10 +108,11 @@ if ! tmux_available; then
   exit 127
 fi
 
+retire_stale_watcher
+
 # Idempotency guard: a second invocation attaches (or reports) instead of
 # starting a duplicate session.
 if session_exists; then
-  ensure_task_notifier
   attach_or_report_existing
 fi
 
@@ -179,7 +129,6 @@ fi
 # or a peer that won the race above — recheck before treating it as ours.
 if ! tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" agy --dangerously-skip-permissions; then
   if session_exists; then
-    ensure_task_notifier
     attach_or_report_existing
   fi
   echo "  ⚠ failed to start $SESSION." >&2
@@ -197,8 +146,6 @@ if ! session_exists; then
   echo "  ⚠ $SESSION did not come up within ~5s." >&2
   exit 1
 fi
-
-ensure_task_notifier 1
 
 if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"

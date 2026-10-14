@@ -42,7 +42,10 @@
  * ephemeral token (`auth_tokens/...`), accepted by the Live API alone, so
  * spending it on `generateContent` is rejected as an invalid API key. It is
  * not a voice surface, so a 'managed' preference never blocks its env fallback,
- * and quarantine hides every managed entry as always.
+ * and quarantine hides every managed entry as always. A desktop supervisor also
+ * injects that token into every child as GEMINI_VOICE_API_KEY, so no capability
+ * but voice accepts an `auth_tokens/` value, or the managed voice key, from ANY
+ * tier; with nothing else left it resolves `{ key: '', source: 'none' }`.
  * Twin: src/credential_resolver.py.
  *
  * With no managed file present (every pre-managed install), resolution is
@@ -104,6 +107,9 @@ const ENV_SLOTS: Record<Capability, string[]> = {
 	'gemini-image': ['gemini-text', 'gemini-voice'],
 };
 
+/** Cloud-minted Gemini Live ephemeral tokens carry this prefix; only the Live API accepts them. */
+const LIVE_TOKEN_PREFIX = 'auth_tokens/';
+
 /** Env-var names per capability slot, in existing-chain order. */
 const ENV_VARS: Record<string, string> = {
 	'gemini-voice': 'GEMINI_VOICE_API_KEY',
@@ -152,11 +158,15 @@ export function resolveCredential(
 	// S1: the preference governs the VOICE capability; quarantine hides
 	// managed entries from every capability in every mode.
 	const preference = capability === 'gemini-voice' ? managed.voicePreference : undefined;
+	const managedVoiceKey = managed.caps['gemini-voice']?.key;
+	// A Live token (or its injected env copy) is spendable by the voice capability alone.
+	const spendable = (key: string): boolean =>
+		capability === 'gemini-voice' || !(key.startsWith(LIVE_TOKEN_PREFIX) || key === managedVoiceKey);
 	if (preference !== 'byok' && !managed.quarantined) {
 		for (const slot of MANAGED_SLOTS[capability]) {
 			const entry = managed.caps[slot];
 			const key = entry?.key;
-			if (typeof key === 'string' && key) {
+			if (typeof key === 'string' && key && spendable(key)) {
 				// S3: managed entries may carry an opaque Rust-minted `generation`.
 				// Report it verbatim; legacy entries without one omit the field.
 				const generation = entry?.generation;
@@ -178,7 +188,7 @@ export function resolveCredential(
 	}
 	for (const slot of ENV_SLOTS[capability]) {
 		const key = process.env[ENV_VARS[slot]];
-		if (key) {
+		if (key && spendable(key)) {
 			// S3/U4: for the voice capability the launcher injects
 			// SUTANDO_VOICE_CREDENTIAL_GENERATION beside a materialized BYOK
 			// key. Report it verbatim; manual/legacy .env keys (no injected

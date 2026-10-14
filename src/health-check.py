@@ -64,6 +64,7 @@ from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
+import session_runtime  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_platform import (  # noqa: E402
     find_pids,
@@ -1072,6 +1073,10 @@ def check_launchd(label: str) -> dict:
         return {"name": label, "status": "error", "detail": str(e)}
 
 
+# A core restart briefly removes .alive; a hold that outlives one is an outage, not a restart.
+CRON_HOLD_DOWN_AFTER_S = 300
+
+
 def check_cron_runner(
     workspace_dir: Optional[Path] = None,
     host_label: Optional[str] = None,
@@ -1158,6 +1163,21 @@ def check_cron_runner(
             "name": name,
             "status": "down",
             "detail": f"runner state is stale ({int(age)}s; expected <=180s)",
+        }
+    # A runner that ticks on time can still emit nothing: it holds every prompt-backed fire
+    # while the core heartbeat is missing, and records that hold here.
+    try:
+        hold = json.loads((workspace / "state" / "cron-runner-hold.json").read_text())
+    except (OSError, ValueError):
+        hold = None
+    if isinstance(hold, dict) and isinstance(hold.get("since"), (int, float)):
+        held_for = max(0, int(float(time.time() if now is None else now) - hold["since"]))
+        names = ", ".join(str(n) for n in hold.get("held", [])) or "due schedules"
+        return {
+            "name": name,
+            "status": "down" if held_for >= CRON_HOLD_DOWN_AFTER_S else "warn",
+            "detail": (f"cron-runner has held {names} for {held_for}s and emitted no task: "
+                       f"{hold.get('reason', 'core heartbeat not fresh')}"),
         }
     return {
         "name": name,
@@ -2899,6 +2919,40 @@ def check_onboarding_status() -> "dict | None":
         }
     return {"name": name, "status": "ok",
             "detail": f"all checklist rows satisfied ({_age_phrase(age_s)})"}
+
+
+#: A live HITL store this large means settled records stopped being archived;
+#: the gateway re-reads every live record each second.
+HITL_LIVE_WARN = 200
+
+
+def check_hitl_archive() -> "dict | None":
+    """Warn when the HITL archive step is failing or the live store regrew.
+
+    None when this host has no HITL store. Read-only; never raises.
+    """
+    name = "hitl-archive"
+    try:
+        from hitl.manager import ARCHIVE_STATUS_STALE_S, archive_health, default_store
+        h = archive_health(default_store(WORKSPACE_DIR))
+    except Exception as e:  # noqa: BLE001 — an optional tier never breaks the report
+        return {"name": name, "status": "warn", "detail": f"hitl store unreadable ({e})"}
+    if h is None:
+        return None
+    problems = []
+    if h["stale"]:
+        problems.append(f"archive status stale: not refreshed in over "
+                        f"{ARCHIVE_STATUS_STALE_S // 60} min (last reported "
+                        f"{h['failures']} failure(s)); is the gateway pulsing?")
+    elif h["failures"]:
+        problems.append(f"{h['failures']} settled record(s) failing to archive ({h['error']})")
+    if h["live"] > HITL_LIVE_WARN:
+        problems.append(f"{h['live']} live records (> {HITL_LIVE_WARN}); the gateway re-reads "
+                        f"each one every second")
+    if problems:
+        return {"name": name, "status": "warn", "detail": "; ".join(problems)}
+    state = "archive healthy" if h["reported"] else "no archive report yet"
+    return {"name": name, "status": "ok", "detail": f"{h['live']} live records, {state}"}
 
 
 def check_host_subtrees() -> dict:
@@ -5924,7 +5978,7 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
 
     # Every limit window can page (7d_oi can be the one rejected while 5h/7d sit
     # low); overage is shown but never pages, it is purchase eligibility.
-    from quota_availability import limit_windows as _limit_windows, quota_windows as _quota_windows
+    from quota_availability import classify_limit_state, limit_windows as _limit_windows, quota_windows as _quota_windows
     windows = _quota_windows(headers)
     full = [w for w, (u, st) in _limit_windows(headers).items()
             if st == "rejected" or (u is not None and u >= 0.9)]
@@ -5938,6 +5992,11 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
             "not paging. If THIS core were stuck, its own passes would stop and "
             "quota-telemetry would go stale."
         )
+        return check
+
+    if classify_limit_state(data) == "overage":
+        # A rejected window with extra usage allowed is served, not stuck.
+        check["detail"] = f"core serving on extra usage (status={status}, {_window_summary(windows)})"
         return check
 
     reset = _fmt_quota_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
@@ -9736,6 +9795,28 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
 
 
 
+def check_withheld_reviews_readable(workspace_dir: Optional[Path] = None) -> dict:
+    """A withheld-review record the bridge cannot read as a record makes every owner Yes/No
+    in the DM answer "please reply again" until it is inspected or removed."""
+    name = "withheld-reviews-readable"
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    try:
+        from policy.egress import result as guard  # noqa: PLC0415 - the bridge's own strict rule
+    except ImportError as exc:
+        return {"name": name, "status": "warn", "detail": f"cannot load the review guard ({exc})"}
+    base = workspace / "state" / guard.WITHHELD_RESULT_DIR
+    bad = []
+    for path, reason in guard.namespace_problems(base):
+        shown = path.relative_to(workspace) if path.is_relative_to(workspace) else path.name
+        bad.append(f"{shown} ({reason})")
+    if bad:
+        shown = ", ".join(bad[:4]) + (f" (+{len(bad) - 4} more)" if len(bad) > 4 else "")
+        return {"name": name, "status": "warn",
+                "detail": f"{len(bad)} withheld-review record(s) unreadable; owner replies get "
+                          f"'please reply again' until each is inspected or removed: {shown}"}
+    return {"name": name, "status": "ok", "detail": "every withheld-review record reads"}
+
+
 def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     """A PARKED outbound item is a reply the owner never received, and nothing
     retries it: `outbox_cli`'s own header calls PARKED a durable terminal state
@@ -9760,7 +9841,7 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     except ImportError as exc:
         return {"name": name, "status": "warn",
                 "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
-    parked: list[tuple[str, str]] = []  # (root.name, item_id) -- roots differ, see below
+    parked: list[tuple[str, str, str]] = []  # (root.name, item_id, reason) -- roots differ, see below
     unreadable: list[str] = []
     for root in roots:
         # An unreadable ROOT reaches here too, and a raise would abort every
@@ -9774,20 +9855,31 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
             unreadable.append(f"{root.name} ({exc})")
             continue
         for d in outbox.list_items(root, status="PARKED"):
-            parked.append((root.name, str(d.get("item_id") or "?")))
+            parked.append((root.name, str(d.get("item_id") or "?"), str(d.get("reason") or "")))
     if unreadable:
         return {"name": name, "status": "warn",
                 "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
                           + "; ".join(unreadable)}
     if parked:
         parked.sort()
-        shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
-                           for root_name, item_id in parked[:4])
-        more = f" (+{len(parked) - 4} more)" if len(parked) > 4 else ""
+
+        def listing(items):
+            shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
+                               for root_name, item_id, _reason in items[:4])
+            return shown + (f" (+{len(items) - 4} more)" if len(items) > 4 else "")
+        # An outcome-unknown park may have landed: a requeue sends again and can post twice.
+        unknown = [p for p in parked if p[2] == "outcome-unknown"]
+        undelivered = [p for p in parked if p[2] != "outcome-unknown"]
+        parts = []
+        if undelivered:
+            parts.append(f"{len(undelivered)} never delivered — nothing retries them: "
+                         f"{listing(undelivered)}")
+        if unknown:
+            parts.append(f"{len(unknown)} may have been delivered — do not requeue without "
+                         f"checking the room: {listing(unknown)}")
         return {"name": name, "status": "warn",
-                "detail": f"{len(parked)} reply/replies PARKED and never delivered — "
-                          f"nothing retries them: {shown}{more}. Recover with "
-                          f"`python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
+                "detail": f"{len(parked)} reply/replies PARKED; " + "; ".join(parts) + ". "
+                          f"Recover with `python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
                           f"(the root varies per item; a single hardcoded root under-reports)"}
     return {"name": name, "status": "ok",
             "detail": f"no parked replies across {len(roots)} outbox root(s)"}
@@ -10116,18 +10208,7 @@ def _local_codex_core_target(target: "dict | None" = None) -> "dict | None":
     exists = _run_tmux(socket_path, "has-session", "-t", f"={session}")
     if exists is None or exists.returncode != 0:
         return None
-    runtime = _run_tmux(
-        socket_path,
-        "show-environment",
-        "-t",
-        f"={session}",
-        "SUTANDO_CORE_RUNTIME",
-    )
-    if (
-        runtime is None
-        or runtime.returncode != 0
-        or runtime.stdout.strip() != "SUTANDO_CORE_RUNTIME=codex"
-    ):
+    if session_runtime.read(session, lambda *a: _run_tmux(socket_path, *a)) != "codex":
         return None
     return target
 
@@ -10496,10 +10577,9 @@ def fix_claude_task_notifier() -> str:
         return "not repaired — the live Claude core session could not be verified"
     # The shared launcher injects --restart when the session records another
     # runtime, and spawns a new core when the heartbeat's process is gone.
-    recorded = _run_tmux(target["socket"], "show-environment", "-t", f"={target['session']}", "SUTANDO_CORE_RUNTIME")
-    if recorded is None or recorded.returncode != 0 or recorded.stdout.strip() != "SUTANDO_CORE_RUNTIME=claude":
-        seen = (recorded.stdout.strip() if recorded is not None and recorded.returncode == 0 else "unreadable")
-        return f"not repaired — the live core records a different runtime ({seen})"
+    recorded = session_runtime.read(target["session"], lambda *a: _run_tmux(target["socket"], *a))
+    if recorded != "claude":
+        return f"not repaired — the live core records a different runtime ({recorded or 'unreadable'})"
     core_pid = heartbeat.get("pid")
     if not isinstance(core_pid, int) or isinstance(core_pid, bool) or not _process_alive(core_pid):
         return f"not repaired — the heartbeat's core process (pid {core_pid}) is not running"
@@ -11957,6 +12037,7 @@ def _runs_a_script(command: str) -> bool:
 _HOOK_FAMILY_INSTALLERS = {
     "personal-claude-compact-hint.sh": "scripts/install-personal-claude-hook.sh",
     "schedule-crons-session-hint.sh": "scripts/install-session-start-hook.sh",
+    "watcher-rearm-session-hint.sh": "scripts/install-watcher-rearm-hook.sh",
 }
 
 
@@ -11990,6 +12071,10 @@ def check_claude_hook_registration(
         failure that looks healthiest.
     """
     name = "claude-hooks"
+    # These hooks only fire inside a Claude core; under Codex there is nothing to register.
+    if _codex_runtime_selected():
+        return {"name": name, "status": "ok",
+                "detail": "not applicable — core runtime is codex; Claude hooks are not used"}
     repo = Path(repo_dir or REPO_DIR)
     installer = repo / "src" / "install-claude-hooks.sh"
     if not installer.is_file():
@@ -12427,15 +12512,9 @@ def _live_core_runtime(socket: str, sessions) -> "str | None":
     """
     seen = set()
     for sess in sessions:
-        res = _run_tmux(socket, "show-environment", "-t", f"={sess}",
-                        "SUTANDO_CORE_RUNTIME")
-        if res is None or res.returncode != 0:
-            continue
-        out = (res.stdout or "").strip()
-        if out.startswith("SUTANDO_CORE_RUNTIME="):
-            val = out.split("=", 1)[1].strip()
-            if val:
-                seen.add(val)
+        val = session_runtime.read(sess, lambda *a: _run_tmux(socket, *a))
+        if val:
+            seen.add(val)
     return seen.pop() if len(seen) == 1 else None
 
 
@@ -13018,6 +13097,9 @@ def run_all_checks() -> list[dict]:
     checks.append(check_skills_driver_code_drift())
     checks.append(check_sync_conflicts_unmerged())
     checks.append(check_engine_revision_drift())
+    hitl_archive_check = check_hitl_archive()
+    if hitl_archive_check is not None:
+        checks.append(hitl_archive_check)
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
         checks.append(onboarding_check)
@@ -13401,6 +13483,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_outbox_parked())
+    checks.append(check_withheld_reviews_readable())
     checks.append(check_codex_task_notifier())
     checks.append(check_claude_task_notifier())
     checks.append(check_codex_presence())

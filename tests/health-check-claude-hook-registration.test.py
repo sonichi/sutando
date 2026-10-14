@@ -13,8 +13,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import tempfile
+import os
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -35,6 +37,18 @@ HOOKS=(
   "Stop|src/check-pending-tasks.sh|bash $REPO_DIR/src/check-pending-tasks.sh"
 )
 '''
+
+
+# The probe is Claude-only (#5414); pin the runtime so a codex host still exercises it.
+_RUNTIME_PIN = mock.patch.dict(os.environ, {"SUTANDO_CORE_RUNTIME": "claude"})
+
+
+def setUpModule():
+    _RUNTIME_PIN.start()
+
+
+def tearDownModule():
+    _RUNTIME_PIN.stop()
 
 
 class TestHookRegistration(unittest.TestCase):
@@ -516,6 +530,34 @@ class TestHookScriptPathFallback(unittest.TestCase):
     def test_the_shared_parser_is_used_when_available(self):
         hc = _load()
         self.assertEqual(hc._hook_script_path('bash "/x/y z.sh"'), "/x/y z.sh")
+
+
+class TestHookRegistrationRuntimeGate(unittest.TestCase):
+    """#5414: a Codex core never runs Claude hooks, so their absence is not a defect."""
+
+    def setUp(self):
+        self.hc = _load()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name)
+        (self.repo / "src").mkdir(parents=True)
+        (self.repo / "src" / "install-claude-hooks.sh").write_text(INSTALLER)
+
+    def _run(self, runtime):
+        with mock.patch.dict(os.environ, {"SUTANDO_CORE_RUNTIME": runtime}):
+            return self.hc.check_claude_hook_registration(repo_dir=self.repo)
+
+    def test_codex_runtime_does_not_warn_about_missing_claude_hooks(self):
+        out = self._run("codex")
+        self.assertEqual(out["status"], "ok", out["detail"])
+        self.assertIn("not applicable", out["detail"])
+        self.assertNotIn("install-claude-hooks", out["detail"])
+        self.assertNotIn("_unregistered_hooks", out, "--fix must not install Claude hooks under codex")
+
+    def test_control_claude_runtime_still_warns_on_the_same_repo(self):
+        out = self._run("claude")
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("never run", out["detail"])
 
 
 if __name__ == "__main__":

@@ -26,15 +26,27 @@ dependencies = []
 Homepage = "https://ag2.space"
 Source = "https://github.com/sonichi/sutando"
 
+[project.optional-dependencies]
+# Meta Hatch adapter (ag2_sparrow/adapters/hatch): stdlib-only, so the extra
+# only names the feature; `ag2-sparrow-hatch install` sets it up.
+hatch = []
+
 [project.scripts]
 ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:main"
 # Separate entry, not a subcommand: remote_gateway_bridge.main() reads no
 # argv, so every current invocation starts the bridge and any dispatcher
 # would change one of them.
 ag2-sparrow-outbox = "ag2_sparrow.outbox_cli:main"
+ag2-sparrow-hatch = "ag2_sparrow.adapters.hatch.cli:main"
 
-[tool.setuptools]
-packages = ["ag2_sparrow"]
+# Discovered, not listed: a hand-written list silently drops a new subpackage.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ag2_sparrow*"]
+
+# Non-Python files the Hatch adapter installs; they must ship in the wheel.
+[tool.setuptools.package-data]
+"ag2_sparrow.adapters.hatch" = ["*.sh", "*.json"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ag2_sparrow.__version__" }

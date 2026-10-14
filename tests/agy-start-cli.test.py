@@ -20,6 +20,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -325,6 +326,7 @@ printf '%s\\n' "$*" >> "{self.tmux_log}"
 [ "${{1:-}}" = -S ] && shift 2
 case "${{1:-}}" in
   has-session)
+    case "$*" in *-watcher*) exit 1 ;; esac
     [ -f "{self.tmux_state}" ] && exit 0
     exit 1
     ;;
@@ -349,6 +351,7 @@ esac
 [ "${{1:-}}" = -S ] && shift 2
 case "${{1:-}}" in
   has-session)
+    case "$*" in *-watcher*) exit 1 ;; esac
     [ -d "{lock_dir}" ] && exit 0
     exit 1
     ;;
@@ -377,8 +380,6 @@ esac
             "SUTANDO_AGY_TMUX_SESSION": "sutando-agy-test",
             "SUTANDO_AGY_ONBOARDING_PATH": str(self.onboarding_path),
             "HOME": str(self.root),
-            # The stub tmux never runs the notifier, so no sentinel can appear.
-            "SUTANDO_WATCHER_READY_TIMEOUT": "0",
         })
         if extra:
             env.update(extra)
@@ -502,6 +503,81 @@ esac
         )
         self.assertTrue((self.root / "tmux-session.lock").is_dir(),
                          "exactly one session should exist after the race")
+
+
+class StaleWatcherRetirementTests(unittest.TestCase):
+    """A real tmux server on an isolated socket, seeded with the session pair the
+    removed task notifier left running; a stub agy stands in for the CLI."""
+
+    SESSION = "agy-rt"
+
+    def setUp(self):
+        if not shutil.which("tmux"):
+            self.skipTest("tmux not installed")
+        # Short /tmp path: tmux socket paths are length-limited on macOS.
+        self.root = Path(tempfile.mkdtemp(prefix="agyrt-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.sock = str(self.root / "s")
+        self.addCleanup(subprocess.run, ["tmux", "-S", self.sock, "kill-server"],
+                        capture_output=True)
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        agy = bindir / "agy"
+        agy.write_text("#!/bin/bash\nexec sleep 300\n")
+        agy.chmod(0o755)
+        tmux_dir = str(Path(shutil.which("tmux")).parent)
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith("SUTANDO_") and k != "TMUX"}
+        self.env.update({
+            "PATH": f"{bindir}:{tmux_dir}:/usr/bin:/bin",
+            "HOME": str(self.root),
+            "SUTANDO_AGY_TMUX_SOCKET": self.sock,
+            "SUTANDO_AGY_TMUX_SESSION": self.SESSION,
+            "SUTANDO_AGY_ONBOARDING_PATH": str(self.root / "onboarding.json"),
+        })
+
+    def _tmux(self, *args):
+        return subprocess.run(["tmux", "-S", self.sock, *args],
+                              capture_output=True, text=True, env=self.env)
+
+    def _start(self, name):
+        self.assertEqual(self._tmux("new-session", "-d", "-s", name, "sleep 300").returncode, 0)
+
+    def _alive(self, name):
+        return self._tmux("has-session", "-t", f"={name}").returncode == 0
+
+    def _launch(self):
+        return subprocess.run(["/bin/bash", str(LAUNCHER)], env=self.env, cwd=str(self.root),
+                              capture_output=True, text=True, timeout=30)
+
+    def test_rerun_over_a_running_core_retires_the_leftover_watcher(self):
+        self._start(self.SESSION)
+        self._start(f"{self.SESSION}-watcher")
+        result = self._launch()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("already running", result.stdout)
+        self.assertIn(f"Retired stale {self.SESSION}-watcher", result.stdout)
+        self.assertFalse(self._alive(f"{self.SESSION}-watcher"))
+        self.assertTrue(self._alive(self.SESSION), "the core session must survive")
+
+    def test_fresh_launch_retires_an_orphan_watcher_and_starts_the_core(self):
+        self._start(f"{self.SESSION}-watcher")
+        result = self._launch()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"Started {self.SESSION} detached", result.stdout)
+        self.assertFalse(self._alive(f"{self.SESSION}-watcher"))
+        self.assertTrue(self._alive(self.SESSION))
+
+    def test_only_the_exact_watcher_name_is_killed_and_reruns_are_quiet(self):
+        self._start(self.SESSION)
+        self._start(f"{self.SESSION}-watcher2")
+        for _ in range(2):
+            result = self._launch()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("Retired", result.stdout)
+            self.assertEqual(result.stderr, "")
+        self.assertTrue(self._alive(f"{self.SESSION}-watcher2"))
+        self.assertTrue(self._alive(self.SESSION))
 
 
 if __name__ == "__main__":

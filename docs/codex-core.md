@@ -64,6 +64,9 @@ The Codex implementation:
   paths;
 - runs the shared core supervisor so dashboard/runtime health signals continue
   to update when Codex is selected;
+- runs a separate `sutando-core-observer` tmux session (`cli/codex-observer.mjs`)
+  that follows the core's rollout file and writes its HealthStatus runtime
+  observation record (`docs/health-snapshot.md`, "Runtime observation");
 - restarts the core and notifier together, preventing duplicate task consumers.
 
 ## Externally managed monitor and heartbeat

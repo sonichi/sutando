@@ -76,7 +76,7 @@ def main(argv: "list[str] | None" = None) -> int:
         if dest == "UNKNOWN":
             print("    ^ no channel in the header — do NOT guess a room")
         print()
-    print("Review each body before sending; this script never delivers.")
+    print("Review each body: it may already have been delivered. This script never delivers.")
     return 0
 
 

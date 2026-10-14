@@ -233,7 +233,8 @@ class DesignCClaimBackend:
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,
-                 destination: Optional[str] = None) -> bool:
+                 destination: Optional[str] = None,
+                 terminal_reason: Optional[str] = None) -> bool:
         parts = token.incarnation.split(SEP)
         if len(parts) != TOKEN_PARTS or parts[1] != _safe_component(token.worker):
             return False                    # forged: worker != the record's
@@ -265,8 +266,8 @@ class DesignCClaimBackend:
                 self._quarantine(src, key, "outcome-unknown", str(time.time_ns()))
                 return True
             n = self._note_attempt(key)
-            if park_at_attempts is not None and n >= park_at_attempts:
-                self._quarantine(src, key, "max-attempts", str(time.time_ns()))
+            if terminal_reason or (park_at_attempts is not None and n >= park_at_attempts):
+                self._quarantine(src, key, terminal_reason or "max-attempts", str(time.time_ns()))
                 return True
             # retryable: back to the single ready slot; a re-publish racing us
             # into that slot quarantines this copy (duplicate precursor).

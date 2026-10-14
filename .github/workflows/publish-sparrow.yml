@@ -3,7 +3,9 @@
 # Release flow:
 #   1. bump packages/ag2-sparrow/ag2_sparrow/__init__.py __version__ (PR, merge)
 #   2. tag the merge commit:  git tag sparrow-v<version> && git push origin sparrow-v<version>
-#   3. this workflow builds sdist+wheel from packages/ag2-sparrow and publishes.
+#   3. this workflow builds sdist+wheel from packages/ag2-sparrow and publishes,
+#      then attaches ag2-sparrow-<version>.pyz and ag2-sparrow-<version>-linux-<arch>
+#      (x86_64, arm64; glibc >= 2.31), each with a .sha256, to the tag's GitHub Release.
 #
 # Guards:
 #   - the tag MUST equal the packaged __version__ (fail loudly on mismatch);
@@ -23,7 +25,10 @@ on:
   push:
     tags: ["sparrow-v*"]
   pull_request:
-    paths: ["packages/ag2-sparrow/**"]
+    paths:
+      - "packages/ag2-sparrow/**"
+      - "tests/sparrow-zipapp.test.py"
+      - ".github/workflows/publish-sparrow.yml"
 
 permissions:
   contents: read
@@ -34,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         with: {python-version: "3.11"}
       - name: Warn when package changes ride an already-published version
         run: |
@@ -55,7 +60,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         with: {python-version: "3.11"}
       - name: Tag must match the packaged version
         run: |
@@ -80,7 +85,100 @@ jobs:
         run: |
           python3 -m pip install --quiet build
           python3 -m build packages/ag2-sparrow --outdir dist/
+      - name: Built distributions ship every subpackage
+        run: |
+          set -e
+          python3 - <<'PY'
+          import pathlib, tarfile, zipfile
+          root = pathlib.Path("packages/ag2-sparrow")
+          pkgs = sorted(str(p.parent.relative_to(root)) for p in (root / "ag2_sparrow").rglob("__init__.py"))
+          whl = next(pathlib.Path("dist").glob("*.whl")); sd = next(pathlib.Path("dist").glob("*.tar.gz"))
+          wn = set(zipfile.ZipFile(whl).namelist())
+          sn = {n.split("/", 1)[1] for n in tarfile.open(sd).getnames() if "/" in n}
+          missing = [p for p in pkgs if f"{p}/__init__.py" not in wn or f"{p}/__init__.py" not in sn]
+          assert not missing, f"dist lacks packages: {missing}"
+          print("dist ships", pkgs)
+          PY
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+
+  # One-file Linux binaries. PRs build x86_64 only; a tag builds both arches.
+  # Bullseye (LTS ended) is kept on purpose: it fixes the glibc floor at 2.31; digest = multi-arch index.
+  linux-binary:
+    if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/tags/sparrow-v')
+    strategy:
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"arch":"x86_64","runner":"ubuntu-latest"}]' || '[{"arch":"x86_64","runner":"ubuntu-latest"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]') }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + smoke on glibc 2.31 (python:3.12-slim-bullseye, pinned)
+        env:
+          BUILD_IMAGE: python:3.12-slim-bullseye@sha256:411fa4dcfdce7e7a3057c45662beba9dcd4fa36b2e50a2bfcd6c9333e59bf0db
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$BUILD_IMAGE" \
+            bash packages/ag2-sparrow/tools/build_linux_binary.sh "dist/ag2-sparrow-linux-${{ matrix.arch }}"
+      - name: Smoke on the runner's own distro
+        run: python3 packages/ag2-sparrow/tools/smoke_entry.py "dist/ag2-sparrow-linux-${{ matrix.arch }}"
+      - if: startsWith(github.ref, 'refs/tags/sparrow-v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ag2-sparrow-linux-${{ matrix.arch }}
+          path: dist/ag2-sparrow-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  # Runs after PyPI so a failed publish leaves no orphan download.
+  release-assets:
+    if: startsWith(github.ref, 'refs/tags/sparrow-v')
+    needs: [publish, linux-binary]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the GitHub Release and upload its assets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - name: Zipapp guard (contents + bare-interpreter start)
+        run: python3 tests/sparrow-zipapp.test.py
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ag2-sparrow-linux-*
+          path: bin
+          merge-multiple: true
+      - name: Name every asset by version + sha256 each
+        run: |
+          set -e
+          VER=$(python3 -c "import sys; sys.path.insert(0, 'packages/ag2-sparrow'); import ag2_sparrow; print(ag2_sparrow.__version__)")
+          mkdir -p release
+          python3 packages/ag2-sparrow/tools/build_zipapp.py --output "release/ag2-sparrow-$VER.pyz"
+          for arch in x86_64 arm64; do
+            install -m 0755 "bin/ag2-sparrow-linux-$arch" "release/ag2-sparrow-$VER-linux-$arch"
+          done
+          python3 packages/ag2-sparrow/tools/smoke_entry.py python3 "release/ag2-sparrow-$VER.pyz"
+          cd release
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+          cat ./*.sha256
+          echo "VER=$VER" >> "$GITHUB_ENV"
+      # --latest=false: the repo's "latest" release is the engine's, not sparrow's.
+      # No --clobber: an existing same-named asset fails the run; delete it on the release to retry.
+      - name: Attach to the GitHub Release for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --verify-tag --latest=false --title "ag2-sparrow $VER" \
+              --notes "ag2-sparrow $VER — PyPI: https://pypi.org/project/ag2-sparrow/$VER/"
+          EXISTING=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          CLASH=""
+          for f in release/*; do
+            if printf '%s\n' "$EXISTING" | grep -qxF "$(basename "$f")"; then CLASH="$CLASH $(basename "$f")"; fi
+          done
+          if [ -n "$CLASH" ]; then
+            echo "::error::release $TAG already has:$CLASH. Delete them on the release, then re-run."; exit 1
+          fi
+          gh release upload "$TAG" release/*

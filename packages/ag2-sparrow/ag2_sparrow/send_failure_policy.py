@@ -62,6 +62,12 @@ def failure_status(exc: BaseException) -> int | None:
     return status if isinstance(status, int) and not isinstance(status, bool) else None
 
 
+def is_retryable_http_status(status: int, *, auth_recoverable: bool = False) -> bool:
+    """Adapters opt into auth retries when their transport can refresh credentials."""
+    return (status in TRANSIENT_STATUSES or 500 <= status <= 599
+            or (auth_recoverable and status in (401, 403)))
+
+
 def is_transient(exc: BaseException) -> bool:
     """True when retrying the same send could plausibly succeed.
 
@@ -84,7 +90,7 @@ def is_transient(exc: BaseException) -> bool:
         status = failure_status(exc)
         if status is not None:
             # Whole 5xx range: the server failed, not the payload.
-            return status in TRANSIENT_STATUSES or 500 <= status <= 599
+            return is_retryable_http_status(status)
         if isinstance(exc, (TimeoutError, ConnectionError)):
             return True
         reason = getattr(exc, "reason", None)

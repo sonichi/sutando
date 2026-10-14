@@ -290,9 +290,10 @@ def ensure_supervisor(workspace, repo, worker_id, *, runner=None) -> dict:
     if runtime not in sw.WORKER_MODE_RUNTIMES:
         return {"worker_id": worker_id, "outcome": INDETERMINATE,
                 "why": f"unknown worker runtime {runtime!r}"}
-    env = {**os.environ,
+    env = {**sw.inherited_env(),
            "SUTANDO_PY": sys.executable,
            "SUTANDO_INSTANCE_ID": worker_id,
+           "SUTANDO_WORKER_ID": worker_id,
            "SUTANDO_WORKER_RUNTIME": runtime,
            "SUTANDO_TASKS_DIR": str(pd.deliveries_dir(workspace, worker_id)),
            "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),
@@ -408,7 +409,9 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
         if decision == ps.RECOVER:
             done[worker_id] = recover(workspace, repo, worker_id,
                                       runner=runner, spawn=spawn)
-        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN, ps.CARD_LOGIN):
+        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN, ps.CARD_LOGIN, ps.CARD_HUMAN):
+            if decision == ps.CARD_HUMAN and sup.is_paused(workspace, worker_id):
+                continue
             cards[worker_id] = wc.raise_card(workspace, worker_id, decision,
                                              runner=runner or subprocess.run)
         elif decision == ps.REARM_WATCHER:
@@ -457,18 +460,60 @@ def main(argv=None) -> int:
         return _sweep(a)
 
 
+def _repair_human_cards(workspace, tick) -> None:
+    """Reconcile acknowledged episodes only against positive, eligible observations."""
+    if tick.get("resumed"):
+        return
+    state = sup.load_state(workspace)
+    active = None
+    for w, o in tick["observations"].items():
+        ev = state.workers.get(w)
+        if (ev is None or ev.wedge_kind != "human" or not ev.wedge_escalated
+                or o.get("paused") or sup.is_paused(workspace, w)
+                or o.get("session_alive") is not True
+                or o.get("work_outstanding") is not True
+                or o.get("pane") not in (ps.PANE_GATE, ps.PANE_LIMIT)):
+            continue
+        if active is None:
+            active = wc.manager_for(workspace).active()
+        socket, session = sup._open_tmux(workspace, w)
+        matching = any((r.subject or {}).get("source") == wc.SOURCE
+                       and (r.subject or {}).get("worker_id") == w
+                       and (r.subject or {}).get("wedge") == ps.CARD_HUMAN
+                       and (r.subject or {}).get("session") == session
+                       and (r.device or {}).get("socket") == str(socket) for r in active)
+        if not matching:
+            tick["decisions"][w] = ps.CARD_HUMAN
+
+
 def _sweep(a) -> int:
     try:
         resumed = resume(a.workspace, a.repo) if a.resume else None
         held = suspension(a.workspace)
+        before = sup.load_state(a.workspace)
         tick = sup.tick(a.workspace, time.time(),
                         worker_ids=[a.recipient] if a.recipient else None,
                         persist=not a.dry_run and not held)
     except (wi.IdentityError, ValueError) as e:
         print(f"refused: {e}", file=sys.stderr)
         return 2
+    recovered = set()
+    if not a.dry_run and not held and not tick.get("resumed"):
+        after = sup.load_state(a.workspace)
+        for w, o in tick["observations"].items():
+            current = after.workers.get(w, ps.WorkerEvidence()).last_pane_id
+            previous = before.workers.get(w, ps.WorkerEvidence()).last_pane_id
+            if (o.get("session_alive") is True and not o.get("paused")
+                    and w not in tick.get("wedged", [])
+                    and o.get("work_outstanding") is not None and current
+                    and (o.get("pane") == ps.PANE_IDLE
+                         or (o.get("pane") == ps.PANE_WORKING
+                             and previous and current != previous))):
+                recovered.add(w)
     idle = {"recoveries": {}, "rearms": {}, "cards": {}, "escalations": []}
     escalations = sorted(w for w, d in tick["decisions"].items() if d == ps.ESCALATE)
+    if not a.dry_run and not held:
+        _repair_human_cards(a.workspace, tick)
     acted = ({**idle, "dry_run": True} if a.dry_run
              else {**idle, "escalations": escalations, "suspended": held} if held
              else apply(a.workspace, a.repo, tick["decisions"]))
@@ -481,7 +526,8 @@ def _sweep(a) -> int:
         clear = {w for w, o in tick["observations"].items()
                  if o.get("session_alive") is True and w not in tick.get("wedged", [])}
         now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
-        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear, wedges=now_asks)
+        acted["cards_closed"] = wc.resolve_cleared(
+            a.workspace, clear, wedges=now_asks, observations=tick["observations"], recovered=recovered)
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
                       **acted}, indent=2, sort_keys=True))
     outcomes = list(acted["recoveries"].values()) + list(((resumed or {}).get("restarted") or {}).values())

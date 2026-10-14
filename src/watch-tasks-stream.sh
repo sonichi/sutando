@@ -1020,10 +1020,6 @@ cleanup() {
   # exits. Only the watcher named by the file may remove it; otherwise the live
   # watcher would look orphaned and recovery would spawn another duplicate.
   sentinel_release_if_owner "$PID_FILE" "$$"
-  if [ -n "${SUTANDO_WATCHER_READY_TOKEN:-}" ] \
-     && [ "$(cat "$PID_FILE.token" 2>/dev/null)" = "$SUTANDO_WATCHER_READY_TOKEN" ]; then
-    rm -f "$PID_FILE.token"
-  fi
   if [ -n "${FSWATCH_PID:-}" ]; then
     kill -TERM "$FSWATCH_PID" 2>/dev/null || true
   fi
@@ -1227,8 +1223,6 @@ fi
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
-# A launcher that set SUTANDO_WATCHER_READY_TOKEN learns readiness from THIS write, never from a pid.
-[ -z "${SUTANDO_WATCHER_READY_TOKEN:-}" ] || printf '%s\n' "$SUTANDO_WATCHER_READY_TOKEN" > "$PID_FILE.token"
 # The sentinel is what a waiting starter's scan will see: the lock's job is done.
 release_start_lock
 # The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
