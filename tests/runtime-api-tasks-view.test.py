@@ -30,6 +30,7 @@ from dispatcher import RuntimeDispatcher  # noqa: E402
 
 from protocol import ProtocolError  # noqa: E402
 from local_task_protocol import parse_task_headers_lenient  # noqa: E402
+from activity_bus import cancel_target  # noqa: E402
 
 
 class TasksViewTests(unittest.TestCase):
@@ -299,15 +300,21 @@ class TasksViewTests(unittest.TestCase):
 
     def test_cancel_writes_cancel_instruction_signal(self):
         tid = self.view.submit("long job")["taskId"]
+        original = self._task_file(tid).read_bytes()
         out = self.view.cancel(tid)
         self.assertEqual(out["cancelled"], "requested")
         cancel_file = self._task_file(out["cancelTaskId"])
         th = parse_task_headers_lenient(cancel_file.read_text())
-        self.assertTrue(th.body.startswith(f"CANCEL_INSTRUCTION: {tid}"))
+        self.assertEqual(cancel_target(th.body), tid)
+        self.assertEqual(th.get("source"), "runtime-api")
+        self.assertEqual(th.get("channel_id"), "runtime-api")
+        self.assertEqual(th.get("user_id"), "@me:example.org")
+        self.assertEqual(th.get("access_tier"), "owner")
         self.assertEqual(th.get("priority"), "urgent")
         self.assertEqual(parse_priority_from_file(cancel_file), "urgent")
         # the original task file is untouched — the consumer decides
         self.assertTrue(self._task_file(tid).exists())
+        self.assertEqual(self._task_file(tid).read_bytes(), original)
 
     def test_cancel_done_task_is_noop_and_unknown_raises(self):
         self.results.mkdir(parents=True)

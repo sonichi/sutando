@@ -386,7 +386,7 @@ class TasksView:
         if st == "done":
             return {"taskId": task_id, "state": "done", "cancelled": False,
                     "note": "already completed — nothing to cancel"}
-        sub = self.submit(f"CANCEL_INSTRUCTION: {task_id}", priority="urgent")
+        sub = self.submit(f"CANCEL_INSTRUCTION: stop processing {task_id}", priority="urgent")
         return {"taskId": task_id, "state": st, "cancelled": "requested",
                 "cancelTaskId": sub["taskId"]}
 
