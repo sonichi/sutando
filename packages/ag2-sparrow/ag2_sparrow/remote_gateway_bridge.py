@@ -756,12 +756,12 @@ def _owner_dm_is_private(room: str, owner: str) -> "bool | None":
 def _owner_review_dm(owner: str) -> str:
     if _GATEWAY_OWNER_DM_HINT and _owner_dm_is_private(_GATEWAY_OWNER_DM_HINT, owner) is True:
         _atomic_private_json(_WITHHELD_DM_CACHE,
-                             {"owner": owner, "room_id": _GATEWAY_OWNER_DM_HINT})
+                             {"owner": owner, "room_id": _GATEWAY_OWNER_DM_HINT, "private": True})
         return _GATEWAY_OWNER_DM_HINT
     cached = _read_private_json(_WITHHELD_DM_CACHE) or {}
     room = str(cached.get("room_id") or "")
-    if cached.get("owner") == owner and room.startswith("!"):
-        return room
+    if cached.get("owner") == owner and room.startswith("!") and cached.get("private") is True:
+        return room  # an unmarked cache predates the membership check and may name a shared room
     answer = _req("POST", "/v1/room", {
         "op": "create", "invite": [owner], "is_direct": True,
         "name": "Private result reviews",
@@ -770,7 +770,7 @@ def _owner_review_dm(owner: str) -> str:
     room = str((answer or {}).get("room_id") or "")
     if not room.startswith("!"):
         raise RuntimeError("gateway did not return a private review room")
-    _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room})
+    _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room, "private": True})
     return room
 
 
