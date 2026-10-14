@@ -71,6 +71,36 @@ Two entries worth calling out, because both have been overstated before:
 Install only the packages for the surfaces you actually use. A text/core install
 needs none of them.
 
+## Durable schedules on Windows
+
+`src/startup.ps1` registers **Sutando Cron Runner** in Windows Task Scheduler by
+default. It runs `src/cron-runner.ps1` every minute and at sign-in, using the
+resolved Python executable and repository directory. The timer has no expiry,
+allows battery operation, and skips overlapping ticks. It runs as the signed-in
+user, not SYSTEM; the PC must be on and that user signed in.
+
+The optional `schedule-crons` skill migrates ordinary fixed schedules in the
+per-host `crons.json` to the shared runner's legacy `launchd: true` ownership
+flag. Dynamic loops, worker-owned schedules, `codex-task` entries, and the
+main proactive loop retain their existing owners. Migration seeds the runner's
+state before changing ownership, preventing replay of old actions. Close old
+session-scheduled copies when migrating a running installation to avoid duplicate
+fires. On later startups the skill skips OS-owned entries automatically.
+
+Prompt-backed schedules wait for this installation's Windows task consumer;
+registration alone does not mean a message has been delivered. Shell-backed
+schedules use the existing independent shell runner. Tick output is recorded in
+`<workspace>/logs/cron-runner.log`.
+
+```powershell
+pwsh -NoProfile -File src/install-cron-runner-task.ps1 -Status
+pwsh -NoProfile -File src/install-cron-runner-task.ps1 -Uninstall
+```
+
+Installation/permission errors are reported by startup instead of claiming that
+schedules are active. Removing the task stops its ticks; it preserves schedule
+configuration and run state. Re-running normal startup reinstalls it.
+
 ## Not required — macOS ships these
 
 Nothing to install: `osascript`, `open`, `pgrep`, `lsof`, `ps`, `sips`,
