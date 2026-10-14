@@ -102,8 +102,10 @@ def task_fields(task_file: Path, result_dir: Path, instance: str = "") -> "dict 
         "result_file": str(result_dir / f"{tid}.txt"),
     }
     if reply is not None:
+        label = reply["label"]
         item["reply_context"] = {"sender": reply["sender"][:SNIPPET_MAX],
-                                 "body": reply["body"][:REPLY_CONTEXT_MAX]}
+                                 "body": reply["body"][:REPLY_CONTEXT_MAX],
+                                 "label": label[:REPLY_CONTEXT_MAX] if label else None}
     return item
 
 

@@ -304,16 +304,18 @@ def task_body(text: str) -> str:
     return ""
 
 
-_QUOTED_BLOCK = re.compile(r"\[AG2 Space (reply context|room metadata);[^\]\n]*\]\s*")
+_QUOTED_BLOCK = re.compile(r"\[AG2 Space (reply context|room metadata);([^\]\n]*)\]\s*")
 _JSON_DECODER = json.JSONDecoder()
 
 
 def split_reply_context(text: str) -> "tuple[dict | None, str]":
-    """({"sender", "body"} of the message an ag2space task replies to, the message after
-    the broker's quoted blocks), or (None, text) when there is no well-formed reply block.
+    """({"sender", "body", "label"} of the message an ag2space task replies to, the
+    message after the broker's quoted blocks), or (None, text) when there is no
+    well-formed reply block.
 
-    The record is quoted untrusted room data, never instructions. The JSON is decoded
-    whole, so a closing marker inside the quoted body cannot end the block early."""
+    `label` is the broker's own wording from the opening tag, verbatim (None when
+    empty). The JSON is decoded whole, so a closing marker inside the quoted body
+    cannot end the block early."""
     rest, reply = text.lstrip(), None
     for kind in ("room metadata", "reply context"):
         m = _QUOTED_BLOCK.match(rest)
@@ -331,7 +333,7 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
             sender, body = record.get("sender"), record.get("body")
             if not isinstance(sender, str) or not isinstance(body, str):
                 return None, text
-            reply = {"sender": sender, "body": body}
+            reply = {"sender": sender, "body": body, "label": m.group(2).strip() or None}
     return (reply, rest) if reply is not None else (None, text)
 
 
