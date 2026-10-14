@@ -293,6 +293,63 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(by_id[b]["source"], "runtime-api")
         self.assertNotIn("truncated", out)
 
+    def test_list_tasks_disappearing_during_metadata_access(self):
+        real_stat = Path.stat
+        for mode in ("control", "claim", "archive"):
+            with self.subTest(mode=mode):
+                victim_id = self.view.submit("being processed")["taskId"]
+                queued_id = self.view.submit("still queued")["taskId"]
+                victim = self._task_file(victim_id)
+                mutated = False
+
+                def checked_stat(path, *args, **kwargs):
+                    nonlocal mutated
+                    if path == victim and not mutated:
+                        mutated = True
+                        if mode == "claim":
+                            path.rename(path.with_name(f"{victim_id}.claimed-worker-1.txt"))
+                        elif mode == "archive":
+                            path.unlink()
+                    return real_stat(path, *args, **kwargs)
+
+                with unittest.mock.patch.object(Path, "stat", checked_stat):
+                    rows = self.view.list_tasks()["tasks"]
+                ids = {row["taskId"] for row in rows}
+                self.assertTrue(mutated)
+                self.assertIn(queued_id, ids)
+                if mode == "control":
+                    self.assertIn(victim_id, ids)
+
+    def test_list_tasks_retains_mtime_and_limit_semantics(self):
+        import os
+        older = self.view.submit("older")["taskId"]
+        newer = self.view.submit("newer")["taskId"]
+        os.utime(self._task_file(older), (1000.1, 1000.1))
+        os.utime(self._task_file(newer), (1000.9, 1000.9))
+        (self.tasks / "task-other.txt").write_text("private")
+        (self.tasks / "task-rtapi-directory.txt").mkdir()
+        real_stat = Path.stat
+        seen = set()
+
+        def checked_stat(path, *args, **kwargs):
+            metadata = real_stat(path, *args, **kwargs)
+            if path in (self._task_file(older), self._task_file(newer)):
+                self.assertNotIn(path, seen, "enumeration must retain metadata")
+                seen.add(path)
+                if path == self._task_file(newer):
+                    path.unlink()
+            return metadata
+
+        with unittest.mock.patch.object(Path, "stat", checked_stat), \
+                unittest.mock.patch.object(self.view, "status", return_value={"state": "pending"}):
+            rows = self.view.list_tasks(limit=1)
+        self.assertEqual([row["taskId"] for row in rows["tasks"]], [newer])
+        self.assertTrue(rows["truncated"])
+        self.assertEqual(seen, {self._task_file(older), self._task_file(newer)})
+        rows = self.view.list_tasks()
+        self.assertEqual([row["taskId"] for row in rows["tasks"]], [older])
+        self.assertNotIn("truncated", rows)
+
     def test_list_tasks_empty_dir(self):
         view = TasksView(self.tasks / "nope", self.results, "@me:x")
         self.assertEqual(view.list_tasks(), {"tasks": []})

@@ -346,11 +346,17 @@ class TasksView:
         deliberately not walked: done work is fetched per-id, not listed."""
         entries = []
         if self.tasks_dir.is_dir():
-            files = [f for f in self.tasks_dir.glob(f"{TASK_PREFIX}*.txt")
-                     if f.is_file()]
-            files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+            files = []
+            for f in self.tasks_dir.glob(f"{TASK_PREFIX}*.txt"):
+                try:
+                    metadata = f.stat()
+                except OSError:
+                    continue
+                if stat_module.S_ISREG(metadata.st_mode):
+                    files.append((f, metadata.st_mtime))
+            files.sort(key=lambda item: item[1], reverse=True)
             truncated = len(files) > limit
-            for f in files[:limit]:
+            for f, _mtime in files[:limit]:
                 # Not a .claimed- split: the lead also renames to .assigned-<inst>,
                 # and a compound id has no result written under it, ever.
                 task_id = task_id_from_filename(f.name)
