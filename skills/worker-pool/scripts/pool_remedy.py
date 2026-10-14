@@ -462,12 +462,26 @@ def _sweep(a) -> int:
     try:
         resumed = resume(a.workspace, a.repo) if a.resume else None
         held = suspension(a.workspace)
+        before = sup.load_state(a.workspace)
         tick = sup.tick(a.workspace, time.time(),
                         worker_ids=[a.recipient] if a.recipient else None,
                         persist=not a.dry_run and not held)
     except (wi.IdentityError, ValueError) as e:
         print(f"refused: {e}", file=sys.stderr)
         return 2
+    recovered = set()
+    if not a.dry_run and not held and not tick.get("resumed"):
+        after = sup.load_state(a.workspace)
+        for w, o in tick["observations"].items():
+            current = after.workers.get(w, ps.WorkerEvidence()).last_pane_id
+            previous = before.workers.get(w, ps.WorkerEvidence()).last_pane_id
+            if (o.get("session_alive") is True and not o.get("paused")
+                    and w not in tick.get("wedged", [])
+                    and o.get("work_outstanding") is not None and current
+                    and (o.get("pane") == ps.PANE_IDLE
+                         or (o.get("pane") == ps.PANE_WORKING
+                             and previous and current != previous))):
+                recovered.add(w)
     idle = {"recoveries": {}, "rearms": {}, "cards": {}, "escalations": []}
     escalations = sorted(w for w, d in tick["decisions"].items() if d == ps.ESCALATE)
     acted = ({**idle, "dry_run": True} if a.dry_run
@@ -482,7 +496,8 @@ def _sweep(a) -> int:
         clear = {w for w, o in tick["observations"].items()
                  if o.get("session_alive") is True and w not in tick.get("wedged", [])}
         now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
-        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear, wedges=now_asks)
+        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear, wedges=now_asks,
+                                                   recovered=recovered)
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
                       **acted}, indent=2, sort_keys=True))
     outcomes = list(acted["recoveries"].values()) + list(((resumed or {}).get("restarted") or {}).values())

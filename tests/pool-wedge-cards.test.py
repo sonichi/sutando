@@ -241,6 +241,18 @@ class CauseCard(unittest.TestCase):
             self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [])
         self.assertEqual(t.acted(), [])
 
+    def test_separate_recovery_evidence_only_gates_pressed_proxy(self):
+        _, _, req = card(self.ws, CAUSE, PANES["abnormal"], routed=True)
+        press(self.ws, req, wc.PROXY_ACTION)
+        self.assertEqual(wc.resolve_cleared(self.ws, {WID}, recovered=set()), [])
+        self.assertEqual(manager(self.ws).get(req.id).status, "in_progress")
+        self.assertEqual(wc.resolve_cleared(self.ws, set(), recovered={WID},
+                                           wedges={WID: FROZEN}), [])
+        self.assertEqual(wc.resolve_cleared(self.ws, {WID}, recovered={WID}), [req.id])
+        self.assertEqual(wc.resolve_cleared(self.ws, {WID}, recovered={WID}), [])
+        _, _, pending = card(self.ws, CAUSE, PANES["abnormal"])
+        self.assertEqual(wc.resolve_cleared(self.ws, {WID}, recovered=set()), [pending.id])
+
     def test_positive_clear_does_not_complete_other_pressed_cards(self):
         for fields in ({"source": "other"}, {"wedge": LOGIN},
                        {"chosen_action": "open_terminal"}):
