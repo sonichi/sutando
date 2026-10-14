@@ -660,6 +660,30 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertFalse(core_heartbeat._take_writer_lock())   # flock is per open file: a second fd contends
         self.assertIs(core_heartbeat._WRITER_LOCK, held)
 
+    @unittest.skipIf(os.name == "nt", "POSIX advisory lock")
+    def test_ensure_takes_over_only_from_a_verified_writer_holding_the_lock(self):
+        import errno as _errno
+        import core_heartbeat as ch
+        import file_lock
+        writer = subprocess.CompletedProcess([], 0, "python3 src/core_heartbeat.py\n", "")
+        stranger = subprocess.CompletedProcess([], 0, "bash -c sleep 60\n", "")
+        with patch.object(ch, "_terminate") as term:
+            self.assertIsNone(ch._take_over_from_another_checkout())              # nobody holds it
+            with patch.object(file_lock, "lock_fd", side_effect=OSError(_errno.ENOLCK, "No locks")):
+                self.assertIsNone(ch._take_over_from_another_checkout())          # cannot tell: leave it
+            self.assertTrue(ch._take_writer_lock())
+            self.addCleanup(ch._WRITER_LOCK.close)
+            self.assertIsNone(ch._take_over_from_another_checkout())              # the holder is this process
+            ch._writer_lock_path().write_text("777001\n")
+            with patch.object(ch.subprocess, "run", side_effect=OSError("no ps")):
+                self.assertIsNone(ch._take_over_from_another_checkout())
+            with patch.object(ch.subprocess, "run", return_value=stranger):
+                self.assertIsNone(ch._take_over_from_another_checkout())
+            term.assert_not_called()
+            with patch.object(ch.subprocess, "run", return_value=writer):
+                self.assertEqual(ch._take_over_from_another_checkout(timeout_s=0.1), 777001)
+            term.assert_called_once_with([777001], 0.1)
+
     def _ensure_with_child(self, child, holder=None):
         import core_heartbeat
         lock = core_heartbeat._writer_lock_path()
