@@ -60,7 +60,7 @@ class TestAsk(_Ws):
                               "--urgency", "durable", "--workspace", str(self.ws))
         self.assertEqual(rc, 0, out)
         self.assertIn("recorded: Pending questions database", out)
-        self.assertIn("row: https://collab.test.invalid/home/!ownerdm%3Atest.invalid?surface=database", out)
+        self.assertIn("row: https://collab.test.invalid/home/!ownerdm%3Atest.invalid?surface=database&page=pendingq", out)
         [body] = json.loads(self.state.read_text())["bodies"].values()
         self.assertIn("**Approve** -> merge\n**Hold** -> wait", body)
         self.assertIn("**Sent:** queued owner-dm", body)

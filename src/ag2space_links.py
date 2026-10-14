@@ -15,8 +15,8 @@ MATRIX_TO = "https://matrix.to/#/"
 ROOM_ROUTE = "home"
 _ORIGIN = re.compile(r"^(https?://[^/?#\s]+)")
 _ROOM = re.compile(r"^[!#][^\s:]+:\S+$")
-# The app reads a database page only in this shape; any other id would be dropped on arrival.
-_DB_PAGE = re.compile(r"d[a-z0-9]{1,24}")
+# The database ids a link may name in the app; it opens one only if the room has it.
+_DB_PAGE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
 
 def room_link(room_id: str, event_id: str = "", via: str = DEFAULT_VIA) -> str:
@@ -40,6 +40,6 @@ def surface_link(origin: str, room_id: str, surface: str, page: str | None = Non
 
 
 def database_link(origin: str, room_id: str, db_id: str | None = None) -> str:
-    """The room's Database surface, on database `db_id` when the app can read that id as a page."""
+    """The room's Database surface, on database `db_id` when that id is one a link may name."""
     page = (db_id or "").strip().lower()
     return surface_link(origin, room_id, "database", page if _DB_PAGE.fullmatch(page) else None)

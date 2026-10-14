@@ -44,7 +44,10 @@ class TestShapes(unittest.TestCase):
         self.assertEqual(links.database_link("https://x.test", "!r:x.test", "d1ab"),
                          "https://x.test/home/!r%3Ax.test?surface=database&page=d1ab")
         self.assertEqual(links.database_link("https://x.test", "!r:x.test", "pendingq"),
-                         "https://x.test/home/!r%3Ax.test?surface=database")
+                         "https://x.test/home/!r%3Ax.test?surface=database&page=pendingq")
+        for bad in ("a|b", "-x", "a/b", "x" * 65):
+            self.assertEqual(links.database_link("https://x.test", "!r:x.test", bad),
+                             "https://x.test/home/!r%3Ax.test?surface=database", bad)
 
     def test_an_unusable_origin_or_room_is_refused(self):
         for origin, room in (("chat.ag2.space", "!r:x"), ("https://x.test", "r:x"), ("https://x.test", "!r")):
