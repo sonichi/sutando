@@ -114,12 +114,12 @@ class Handler(BaseHTTPRequestHandler):
             if STATE["force_room_502"]:
                 self.send_response(502); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
-            req = json.loads(self.rfile.read(n).decode())
-            if req.get("op") == "members":  # pragma: no cover - the server thread is outside the gate's trace
+            STATE["room_posts"].append(json.loads(self.rfile.read(n).decode()))
+            if STATE["room_posts"][-1].get("op") == "members":  # pragma: no cover - the server thread is outside the gate's trace
+                STATE["room_posts"].pop()
                 body = json.dumps({"members": [{"user_id": "@agent-t:example.org"}, {"user_id": "@owner:example.org"}]}).encode()
                 self.send_response(200); self.send_header("Content-Type", "application/json")
                 self.end_headers(); self.wfile.write(body); return
-            STATE["room_posts"].append(req)
             if STATE["force_room_empty_200"]:
                 # Deployed-broker failure shape: room-send swallowed server-side,
                 # 200 with no event_id — must NOT count as delivered.
