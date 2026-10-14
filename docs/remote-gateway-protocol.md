@@ -250,7 +250,9 @@ revisions. Unchanged, it is re-sent every 600 s, not at the workers' 20 s refres
 ```
 body: {
   "display": { "name": "<display name>" },
-  "host":    { "host_id": "<short hostname>", "kind": "local" },
+  "host":    { "host_id": "<short hostname>", "kind": "local",
+               "placement": "desktop" },
+             // placement only when SUTANDO_PLACEMENT is "desktop"; display-only
   "workers": { "<worker id>": { "label": "<name>", "runtime": "<runtime>" } }
              // label always; runtime when the publisher knows it
 }

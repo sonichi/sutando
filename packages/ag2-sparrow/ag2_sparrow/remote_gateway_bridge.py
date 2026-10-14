@@ -3258,9 +3258,11 @@ def _build_agent_profile(workers: "dict") -> "dict":
     AVAILABLE: the broker REPLACES the profile document, so this function must
     never be reached with a map it could not read."""
     name = (os.environ.get("SUTANDO_DISPLAY_NAME") or "Sutando").strip()
-    return {"display": {"name": name},
-            "host": {"host_id": _profile_host_id(), "kind": "local"},
-            "workers": workers}
+    host = {"host_id": _profile_host_id(), "kind": "local"}
+    # Display-only hint; any value but "desktop" is dropped so the broker never sees junk.
+    if (os.environ.get("SUTANDO_PLACEMENT") or "").strip().lower() == "desktop":
+        host["placement"] = "desktop"
+    return {"display": {"name": name}, "host": host, "workers": workers}
 
 
 def _maybe_push_agent_profile(record) -> bool:
