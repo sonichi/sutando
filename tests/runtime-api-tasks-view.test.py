@@ -14,6 +14,9 @@ import asyncio
 import concurrent.futures
 import contextlib
 import sys
+import json
+import select
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -764,6 +767,96 @@ class DispatchTests(unittest.TestCase):
         return RuntimeDispatcher(
             self._No(), self._No(), "@me:x", executors={},
             tasks_view=TasksView(base / "tasks", base / "results", "@me:x"))
+
+    def _list_with_process_mutation(self, mode, boundary, acknowledgment="done"):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            d = self._dispatcher(base)
+            victim_id = asyncio.run(d.handle("task.submit", {"task": "victim"}))["taskId"]
+            queued_id = asyncio.run(d.handle("task.submit", {"task": "queued"}))["taskId"]
+            victim = base / "tasks" / f"{victim_id}.txt"
+            caller = r"""
+import asyncio, json, sys, time
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, sys.argv[1])
+from tasks_view import TasksView
+from dispatcher import RuntimeDispatcher
+base, victim, boundary = Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
+real_stat = Path.stat
+seen = False
+def coordinated_stat(path, *args, **kwargs):
+    global seen
+    if path != victim or seen:
+        return real_stat(path, *args, **kwargs)
+    seen = True
+    metadata = real_stat(path, *args, **kwargs) if boundary == "after" else None
+    print(json.dumps({"boundary": boundary, "at": time.time_ns()}), flush=True)
+    if sys.stdin.readline().strip() != "done":
+        raise RuntimeError("mutation acknowledgment missing")
+    return metadata if boundary == "after" else real_stat(path, *args, **kwargs)
+d = RuntimeDispatcher(None, None, "@me:x", executors={},
+    tasks_view=TasksView(base / "tasks", base / "results", "@me:x"))
+with patch.object(Path, "stat", coordinated_stat):
+    rows = asyncio.run(d.handle("task.list", {}))
+print(json.dumps({"rows": rows, "at": time.time_ns()}), flush=True)
+"""
+            with subprocess.Popen(
+                    [sys.executable, "-B", "-c", caller,
+                     str(ROOT / "src" / "runtime-api"), str(base), str(victim), boundary],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True) as child:
+                try:
+                    self.assertTrue(select.select([child.stdout], [], [], 10)[0],
+                                    "caller did not reach metadata boundary")
+                    line = child.stdout.readline()
+                    self.assertTrue(line, "caller exited before metadata boundary")
+                    event = json.loads(line)
+                    self.assertEqual(event["boundary"], boundary)
+                    mutation = subprocess.run(
+                        [sys.executable, "-B", "-c", r"""
+import json, sys, time
+from pathlib import Path
+p, mode = Path(sys.argv[1]), sys.argv[2]
+if mode == "claim":
+    p.rename(p.with_name(p.stem + ".claimed-worker-1.txt"))
+elif mode == "archive":
+    p.unlink()
+print(json.dumps({"mode": mode, "at": time.time_ns()}))
+""", str(victim), mode], capture_output=True, text=True, timeout=10)
+                    self.assertEqual(mutation.returncode, 0, mutation.stderr)
+                    changed = json.loads(mutation.stdout)
+                    output, error = child.communicate(acknowledgment + "\n", timeout=10)
+                    if acknowledgment != "done":
+                        self.assertNotEqual(child.returncode, 0)
+                        self.assertIn("mutation acknowledgment missing", error)
+                        return
+                    self.assertEqual(child.returncode, 0, error)
+                    result = json.loads(output)
+                    self.assertLessEqual(event["at"], changed["at"])
+                    self.assertLessEqual(changed["at"], result["at"])
+                    ids = {r["taskId"] for r in result["rows"]["tasks"]}
+                    self.assertIn(queued_id, ids)
+                    if mode == "control" or boundary == "after":
+                        self.assertEqual(ids, {victim_id, queued_id})
+                    later = asyncio.run(self._dispatcher(base).handle("task.list", {}))
+                    expected = {queued_id} if mode == "archive" else {victim_id, queued_id}
+                    self.assertEqual({r["taskId"] for r in later["tasks"]}, expected)
+                    print("process task.list:", mode, boundary,
+                          event["at"], changed["at"], result["at"])
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.communicate(timeout=10)
+
+    def test_list_separate_process_claim_archive_and_control(self):
+        for mode in ("control", "claim", "archive"):
+            for boundary in ("before", "after"):
+                with self.subTest(mode=mode, boundary=boundary):
+                    self._list_with_process_mutation(mode, boundary)
+
+    def test_list_process_missing_acknowledgment_fails(self):
+        self._list_with_process_mutation("control", "before", acknowledgment="")
 
     def test_submit_idempotency_retry_after_restart_and_completion(self):
         for lifecycle in ("completion", "archive"):
