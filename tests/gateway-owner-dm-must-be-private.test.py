@@ -12,6 +12,8 @@ there, including the daily morning briefing and the email-triage digest (#4259).
   e) a persisted reading not marked private (pre-fix file) is not loaded
   f) a withheld-result review never goes to a shared room the registry names
   g) the membership read raises (gateway unreachable) -> undecided: held
+  h) a review-DM cache written before the check is not reused (shared or unreadable hint)
+  i) a review-DM cache marked private is reused when the hint is unreadable (positive control)
 
 Loads src/remote-gateway-bridge.py in-process with an isolated workspace and a
 fake `_req`. Run: python3 tests/gateway-owner-dm-must-be-private.test.py
@@ -142,6 +144,24 @@ def main() -> int:
     queued = drain(mod, ws, "proactive-morning-5.txt")
     check(queued and gw.posts == [] and mod._owner_dm_is_private(DM, OWNER) is None,
           f"g) a members read that raises is undecided and adopts nothing: posts={gw.posts}")
+
+    for label, hint, unreadable in (("shared", TEAM, False), ("unreadable", DM, True)):
+        ws = workspace(); gw = Gateway(hint); mod = load(ws, gw)
+        if unreadable:
+            gw.unreadable.add(DM)
+        mod._WITHHELD_DM_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        mod._WITHHELD_DM_CACHE.write_text(json.dumps({"owner": OWNER, "room_id": TEAM}))
+        mod._gateway_owner()
+        room = mod._owner_review_dm(OWNER)
+        cache = json.loads(mod._WITHHELD_DM_CACHE.read_text())
+        check(room == CREATED and cache == {"owner": OWNER, "room_id": CREATED, "private": True},
+              f"h) {label} hint + pre-fix cache: a fresh private room, not the cached one: {room!r} {cache}")
+
+    ws = workspace(); gw = Gateway(DM); gw.unreadable.add(DM); mod = load(ws, gw)
+    mod._WITHHELD_DM_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    mod._WITHHELD_DM_CACHE.write_text(json.dumps({"owner": OWNER, "room_id": "!kept:example.org", "private": True}))
+    mod._gateway_owner()
+    check(mod._owner_review_dm(OWNER) == "!kept:example.org", "i) a cache marked private is reused")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0
