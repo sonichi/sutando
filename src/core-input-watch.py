@@ -121,7 +121,7 @@ def _load_runtime_health():
 from delivery.pane_gate import (  # noqa: E402
     ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
     COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, classify_pane as _pg_classify_pane,
-    composer_text as _pg_composer_text, prompt_line as _pg_prompt_line,
+    composer_text as _pg_composer_text, prompt_line as _pg_prompt_line, gate_evidence,
 )
 
 _FABLE_TEXT = FABLE_TEXT
@@ -207,28 +207,18 @@ def auto_answer(kind):
 def classify(pane: str, styled_pane: "str | None" = None):
     """Return (kind, excerpt) if the pane is awaiting user input, else None.
 
-    `styled_pane` (an escaped capture) feeds exactly one check below; omitted,
-    every matcher reads plain `pane` only -- unchanged from before. It must be
+    `styled_pane` supplies placeholder evidence to the shared filter. It must be
     the SAME capture as `pane` (e.g. `pane = _ANSI_SGR.sub("", styled_pane)`),
     so stripping never shifts a line out of the window the two share."""
     plain_lines = pane.splitlines()
     kept = [i for i, ln in enumerate(plain_lines) if ln.strip()][-14:]
     tail = "\n".join(plain_lines[i] for i in kept)
+    styled_lines = styled_pane.splitlines() if styled_pane is not None else None
+    styled_tail = ("\n".join(styled_lines[i] for i in kept)
+                   if styled_lines is not None and kept and max(kept) < len(styled_lines)
+                   else tail)
+    tail = gate_evidence(tail, styled_tail, CLAUDE)
     if not _AWAIT_HINT.search(tail):
-        return None
-    # Idle-footer suppression: the normal footer ("⏵⏵ bypass permissions on … ←
-    # for agents") also carries an await-affordance, so a genuinely idle pane would
-    # otherwise fall through to "unknown". Suppress it ONLY when NO real gate
-    # signature matches — check ALL of _SIGNATURES, not a prefix. (Bug caught in
-    # review 2026-07-14: slicing [:5] excluded `permission` (index 5), so a real
-    # mid-session "Do you want to proceed? / Allow this action" prompt rendered
-    # above the footer was hidden — a false negative on a MAIN escalation case. The
-    # footer itself matches none of the signatures, so idle still suppresses.)
-    # The footer vouches only for itself: a hint on any OTHER line is a live
-    # prompt sharing the window with an old footer, and must not be suppressed.
-    beyond_footer = "\n".join(ln for ln in tail.splitlines() if not _IDLE.search(ln))
-    if (_IDLE.search(tail) and not _AWAIT_HINT.search(beyond_footer)
-            and not any(rx.search(tail) for _, rx in _SIGNATURES)):
         return None
     # Two gates in one pane (one in scrollback): the live one is nearest the bottom.
     hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(_SIGNATURES)
@@ -242,22 +232,6 @@ def classify(pane: str, styled_pane: "str | None" = None):
                 for m in _FABLE_TEXT.finditer(tail)):
             return "unknown", tail
         return kind, tail
-    # A dim ghost span leaves an empty composer; a real empty one has no span.
-    # Requires BOTH that AND nothing else nearby also awaits an answer.
-    tail_lines = tail.splitlines()
-    composer_i = next((i for i in range(len(tail_lines) - 1, -1, -1)
-                        if _PROMPT_LINE.match(tail_lines[i])), None)
-    if composer_i is not None:
-        rest = "\n".join(tail_lines[:composer_i] + tail_lines[composer_i + 1:])
-        if not _AWAIT_HINT.search(rest):
-            styled_lines = styled_pane.splitlines() if styled_pane is not None else None
-            if styled_lines is not None and kept and max(kept) < len(styled_lines):
-                styled_tail = "\n".join(styled_lines[i] for i in kept)
-            else:
-                styled_tail = tail  # mismatched or absent: no styled line to trust here
-            line = _pg_prompt_line(styled_tail, CLAUDE)
-            if line is not None and line.placeholder and not line.text.strip():
-                return None
     # No signature, no idle ghost composer: an unforeseen prompt, surfaced rather
     # than a silent dead-end (owner's no-dead-end rule 2026-07-14).
     return "unknown", tail

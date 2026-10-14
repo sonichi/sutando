@@ -87,6 +87,51 @@ _STARTUP_OK_TURN = ("❯ /startup\n"
 
 
 class TestClassify(unittest.TestCase):
+    def test_completed_recap_and_control_are_idle(self):
+        pane = ("❯ /proactive-loop\n"
+                "※ recap: if you typed X in a worker window, press Enter there to send it.\n"
+                "Nothing needs you this round.\n❯ \n⏵⏵ bypass permissions on · ← for agents")
+        for frame in (pane, pane.replace("press Enter", "submit it")):
+            with self.subTest(frame=frame):
+                result = compose_state(frame, "idle", True, styled_pane=frame)
+                self.assertEqual((result[0], result[2], result[3]), ("idle-ready", None, None))
+
+    def test_real_unknown_dialogs_near_idle_chrome(self):
+        footer = "⏵⏵ bypass permissions on · ← for agents"
+        ghost = "❯ \x1b[2mshow me how to navigate\x1b[0m"
+        for hint in ("Enter to confirm · Esc to cancel", "Keyboard: Enter to confirm",
+                     "Keyboard: Enter to confirm.", "Keyboard: Enter to confirm your choice",
+                     "Please press Enter to overwrite the file.",
+                     "※ Please press Enter to overwrite the file.",
+                     "※ recap: Please press Enter to overwrite the file."):
+            for dialog in (hint, "Overwrite the existing config file?\n" + hint):
+                for prefix, suffix in (("", ""), ("", "\n" + footer),
+                                       ("", "\n" + ghost), ("", "\n❯ \n" + footer),
+                                       (footer + "\n", "\n❯ ")):
+                    styled = prefix + dialog + suffix
+                    with self.subTest(frame=styled):
+                        result = compose_state(_mod._ANSI_SGR.sub("", styled), "idle", True,
+                                               styled_pane=styled)
+                        self.assertEqual((result[0], result[3]), ("blocked-human", "unknown"))
+                        self.assertIsNone(auto_answer(result[3]))
+
+    def test_recap_requires_completion_and_preserves_other_dialogs(self):
+        recap = "※ recap: if you typed X, press Enter there to send it."
+        self.assertEqual(classify(recap + "\n❯ ")[0], "unknown")
+        pane = recap + "\nNothing needs you this round.\nOverwrite the file?\nEnter to confirm\n❯ "
+        self.assertEqual(compose_state(pane, "idle", True)[3], "unknown")
+
+    def test_gate_composition_preserves_answer_policy(self):
+        for pane, kind, state, answer in (
+                (_PERMISSION_WITH_FOOTER, "permission", "blocked-human", None),
+                (_LOGIN_MENU, "login", "blocked-human", None),
+                (_BYPASS, "bypass-permissions", "blocked-known", None),
+                (_PRESS_ENTER, "press-enter", "blocked-known", "Enter")):
+            with self.subTest(kind=kind):
+                result = compose_state(pane, "idle", True)
+                self.assertEqual((result[0], result[3]), (state, kind))
+                self.assertEqual(auto_answer(kind), answer)
+
     def test_bypass_flags(self):
         self.assertEqual(classify(_BYPASS)[0], "bypass-permissions")
 
