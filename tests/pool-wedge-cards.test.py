@@ -18,6 +18,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -169,6 +170,8 @@ class FrozenCard(unittest.TestCase):
     def test_pressed_and_still_frozen_types_one_escape(self):
         _, _, req = card(self.ws, FROZEN, PANES["frozen"])
         press(self.ws, req, "send_escape")
+        self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [])
+        self.assertEqual(manager(self.ws).get(req.id).status, "in_progress")
         t = Tmux(PANES["frozen"])
         self.assertEqual(wc.drive_escapes(self.ws, runner=t, manager=manager(self.ws)), {req.id: "sent"})
         self.assertEqual(t.acted(), [["tmux", "-S", SOCK, "send-keys", "-t", f"={NAME}:0", "Escape"]])
@@ -223,6 +226,39 @@ class CauseCard(unittest.TestCase):
     def test_a_cleared_seat_closes_its_pending_card(self):
         _, _, req = card(self.ws, CAUSE, PANES["abnormal"])
         self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [req.id])
+
+    def test_pressed_proxy_card_requires_positive_clear_and_persists_resolution(self):
+        _, t, req = card(self.ws, CAUSE, PANES["abnormal"], routed=True)
+        with patch.object(wc.subprocess, "run", side_effect=AssertionError("no command allowed")):
+            press(self.ws, req, wc.PROXY_ACTION)
+            for wedges in ({WID: CAUSE}, {WID: FROZEN}, {WID: None}, {}):
+                self.assertEqual(wc.resolve_cleared(self.ws, set(), manager=manager(self.ws),
+                                                    wedges=wedges), [])
+                self.assertEqual(manager(self.ws).get(req.id).status, "in_progress")
+            self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)),
+                             [req.id])
+            self.assertEqual(manager(self.ws).get(req.id).status, "resolved")
+            self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [])
+        self.assertEqual(t.acted(), [])
+
+    def test_positive_clear_does_not_complete_other_pressed_cards(self):
+        for fields in ({"source": "other"}, {"wedge": LOGIN},
+                       {"chosen_action": "open_terminal"}):
+            with self.subTest(fields=fields):
+                _, _, req = card(self.ws, CAUSE, PANES["abnormal"], routed=True)
+                press(self.ws, req, wc.PROXY_ACTION)
+                m = manager(self.ws)
+                with m.store.locked():
+                    cur = m.get(req.id)
+                    for key, value in fields.items():
+                        if key == "chosen_action":
+                            cur.chosen_action = value
+                        else:
+                            cur.subject[key] = value
+                    m.store.save(cur)
+                self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [])
+                self.assertEqual(manager(self.ws).get(req.id).status, "in_progress")
+                manager(self.ws).expire(req.id)
 
 
 class LoginCard(unittest.TestCase):
