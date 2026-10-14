@@ -429,6 +429,9 @@ class MainLoopWiringTest(FakeTmuxHarness):
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
         self.pane_file.write_text(DRAFT_FOOTER + "\n")
+        # Startup announces this task without depending on fswatch subscription timing.
+        # Observe its refusal before clearing the draft so only the retry can deliver it.
+        self.write_task("task-p.txt")
         # A real file, not PIPE: nothing here ever read proc.stderr, so a FAIL
         # had none of the notifier's own log_notifier lines to diagnose from (#4703).
         errf_path = self.root / "notifier.stderr"
@@ -447,14 +450,14 @@ class MainLoopWiringTest(FakeTmuxHarness):
 
         try:
             try:
-                self.assertTrue(
-                    self._wait_for_fswatch_attach(),
-                    with_stderr("fswatch never attached to the watched tasks dir"),
-                )
-                self.write_task("task-p.txt")
-                # Let the (failing) first wake pass, then clear the draft -- no
-                # new task file is EVER written from here on.
-                time.sleep(1.5)
+                deadline = time.time() + 20
+                while time.time() < deadline:
+                    if "composer not empty for task-p.txt; leaving it queued" in errf_path.read_text(errors="replace"):
+                        break
+                    time.sleep(0.1)
+                else:
+                    self.fail(with_stderr("the initial wake never reached the busy-composer guard"))
+                self.assertTrue(self._queue_entry("task-p.txt").is_file())
                 self.assertNotIn("TYPE", self.sendkeys_log_text(),
                                   with_stderr("a busy composer must not have been typed over"))
                 self.pane_file.write_text(IDLE_FOOTER + "\n")
