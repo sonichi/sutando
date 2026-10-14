@@ -592,8 +592,8 @@ def main() -> int:
               and "result-markers" not in h.get("capabilities", []),
               "heartbeat advertises only local skip-marker handling")
         check("core-status" in h.get("capabilities", [])
-              and "status" not in h and "step" not in h,
-              "no core-status.json → capability advertised, status/step omitted (no-clobber)")
+              and h.get("status") not in ("idle", "running"),
+              "no core-status.json and no core beat → capability advertised, no positive status")
         check("team-collaborator" in h.get("capabilities", []),
               "heartbeat advertises explicit Team collaborator support")
 
@@ -601,7 +601,7 @@ def main() -> int:
     # broker's presence sweep can derive the agent's activity + human text.
     (rtc.WS / "state").mkdir(parents=True, exist_ok=True)
     (rtc.WS / "state" / "core-status.json").write_text(
-        json.dumps({"status": "running", "step": "opening PR #20", "ts": 1}))
+        json.dumps({"status": "running", "step": "opening PR #20", "ts": time.time()}))
     STATE["heartbeats"].clear()
     rtc._last_heartbeat_at = 0.0
     rtc._post_heartbeat({"task-MOCK1"}, force=True)
@@ -610,7 +610,7 @@ def main() -> int:
           "heartbeat carries core-status status+step when core-status.json present")
     # An idle status drops the (stale) step so the sweep reads 'available'.
     (rtc.WS / "state" / "core-status.json").write_text(
-        json.dumps({"status": "idle", "ts": 2}))
+        json.dumps({"status": "idle", "ts": time.time()}))
     STATE["heartbeats"].clear()
     rtc._last_heartbeat_at = 0.0
     rtc._post_heartbeat(set(), force=True)
@@ -640,8 +640,8 @@ def main() -> int:
     STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
     check(rtc._post_heartbeat(set(), force=True), "heartbeat still fires despite malformed core-status")
     hb3 = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
-    check("status" not in hb3 and "step" not in hb3,
-          "malformed core-status → heartbeat omits status/step (liveness-only)")
+    check(hb3.get("status") not in ("idle", "running"),
+          "malformed core-status and no core beat → no positive status")
 
     # Backwards compatibility: old gateways that only implement pull/results can
     # 404 optional protocol extensions; the client backs off (time-gated, so a
@@ -653,10 +653,11 @@ def main() -> int:
     rtc._ack_disabled_until = 0.0   # clear so later calls aren't skipped
     STATE["force_ack_404"] = False
     STATE["force_heartbeat_404"] = True
-    rtc._heartbeat_disabled = False
-    check(not rtc._post_heartbeat(set(), force=True) and rtc._heartbeat_disabled,
-          "heartbeat 404 disables heartbeat support")
+    rtc._heartbeat_retry_at = 0.0
+    check(not rtc._post_heartbeat(set(), force=True) and rtc._heartbeat_retry_at > 0,
+          "heartbeat 404 backs off heartbeat support (retryable)")
     STATE["force_heartbeat_404"] = False
+    rtc._heartbeat_retry_at = 0.0   # clear so later calls aren't skipped
 
     # SECURITY (review 2026-06-13)
     # Blocker 1 — unsafe task ids are rejected (path traversal write side)
@@ -1097,12 +1098,23 @@ def main() -> int:
             raise OSError("simulated transient post-claim read failure")
         return _real_read_text(self, *a, **k)
 
+    # The post-claim read goes through the readiness owner, which opens the file itself.
+    _ready_mod = sys.modules[rtc.read_ready_result.__module__]
+    _real_identity_of = _ready_mod.identity_of
+
+    def _identity_of_fail_on_claim(path):
+        if ".sending." in _pl.Path(path).name:
+            raise OSError("simulated transient post-claim read failure")
+        return _real_identity_of(path)
+
     posts_rf = len(STATE["room_posts"])
     _pl.Path.read_text = _read_text_fail_on_claim
+    _ready_mod.identity_of = _identity_of_fail_on_claim
     try:
         rtc._post_proactive()
     finally:
         _pl.Path.read_text = _real_read_text
+        _ready_mod.identity_of = _real_identity_of
     check((rtc.RESULTS_DIR / "proactive-readfail.txt").exists()
           and not list(rtc.RESULTS_DIR.glob("proactive-readfail.sending.*"))
           and len(STATE["room_posts"]) == posts_rf,

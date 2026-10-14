@@ -18,7 +18,8 @@ process.env.TMPDIR = TMP;
 const RESULTS = join(TMP, 'results');
 for (const d of ['tasks', 'results', join('state', 'activity')]) mkdirSync(join(TMP, d), { recursive: true });
 
-const { _sweepTimeouts, _pendingTasksForTest, _resultFileOps } = await import('../src/task-bridge.js');
+const { _sweepTimeouts, _pendingTasksForTest, _resultFileOps, voiceTaskStore } = await import('../src/task-bridge.js');
+const { RelayAgent } = await import('../src/relay-agent.js');
 const { wireDurableChannels } = await import('../src/live-agent-runtime.js');
 
 type Op = { op: 'write' | 'rename'; from: string; to?: string; visibleAtWrite?: string[] };
@@ -66,9 +67,16 @@ describe('TS proactive writers publish whole', () => {
 	});
 
 	it('the stuck-voice fallback (live-agent-runtime)', async () => {
-		const session = { sessionManager: { isActive: false }, clientConnected: true };
-		wireDurableChannels(session as never, {});
-		writeFileSync(join(RESULTS, 'voice-1.txt'), 'the answer the voice session could not speak');
+		const session = {
+			eventBus: { subscribe: () => {} },
+			getTranscriptionMode: () => 'agent',
+			sessionManager: { isActive: false },
+			clientConnected: true,
+			tryPublishSystemNotification: () => false,
+		};
+		const relay = new RelayAgent({ submit: async () => ({}), store: voiceTaskStore });
+		const durable = wireDurableChannels(session as never, { relay, notReadyRetriesMs: [10, 10], handoffConfirmMs: 100 });
+		durable.enqueue({ text: 'the answer the voice session could not speak', framed: true });
 		const t0 = Date.now();
 		while (Date.now() - t0 < 12_000 && !drainVisible().some((n) => n.startsWith('proactive-voice-stuck-'))) {
 			await new Promise((r) => setTimeout(r, 100));

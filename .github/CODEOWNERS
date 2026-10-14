@@ -7,7 +7,8 @@
 # sort | uniq -c`. Full methodology and the areas considered and left out:
 # the "Sutando codeowners" doc (ww room) and its Product-core copy.
 #
-# GOVERNANCE: main requires code-owner review + 2 approvals, no self-approval.
+# GOVERNANCE: main requires code-owner review + the approval count the main
+# ruleset sets (currently 1), no self-approval.
 # @sonichi and @qingyun-wu are the only bypass actors (pull_request mode). A
 # singleton owner below is a hard block on their own PRs, and on anyone
 # else's if they're unavailable; the default recovery path is a bypass merge
@@ -39,8 +40,9 @@
 /skills/agent-room-ops/    @qingyun-wu
 /skills/worker-pool/       @qingyun-wu @keweichen @sonichi # Qingyun 29, Chi 19, Kewei 3 commits; Kewei wrote the two largest recent features (#4769 Codex workers, #4783 display names) and reviews every worker-pool PR; @sonichi owner-assigned
 /skills/task-progress/     @qingyun-wu
-/skills/phone-conversation/ @sonichi @liususan091219 @qingyun-wu   # full history: Chi 46, Susan 28, Qingyun 21 (90 days: Qingyun)
+/skills/phone-conversation/ @sonichi @liususan091219 @qingyun-wu @yixuan-ag2   # full history: Chi 46, Susan 28, Qingyun 21 (90 days: Qingyun); Yixuan added for the 3.8 voice-default work
 /packages/                 @qingyun-wu
+/packages/ag2-sparrow/ag2_sparrow/adapters/hatch/ @qingyun-wu @sonichi  # Meta Hatch adapter; owner-assigned (Chi) at creation, no history yet
 
 # Susan: areas she leads or co-leads over the full history.
 # (no line for skills/discord-voice/ -- zero currently-tracked files, same
@@ -48,6 +50,10 @@
 /skills/screen-companion/  @liususan091219                # Susan 6, Qingyun 4, James 3, Chi 2
 /skills/screen-record/     @liususan091219 @sonichi       # Susan 8, Chi 8
 /src/browser-tools.ts      @sonichi @liususan091219       # Chi 27, Susan 18
+/src/voice-*               @sonichi @liususan091219 @yixuan-ag2       # voice modules; most per-file history is Susan and Yixuan
+/src/meeting-*             @sonichi @liususan091219 @yixuan-ag2       # meeting-dictation 4/4, meeting-tools 4/11, meeting-input-hold 1/1 by Susan
+/src/conversation-store.ts @sonichi @liususan091219 @yixuan-ag2       # Susan 6 of 7
+/src/conversation-log-store.ts @sonichi @liususan091219 @yixuan-ag2   # Susan 1 of 1
 /src/voice-agent.ts        @sonichi @liususan091219 @yixuan-ag2       # Chi 56, Susan 14, yixuan 13, Qingyun 12
 /src/inline-tools.ts       @sonichi @liususan091219       # Chi 66, Susan 12
 

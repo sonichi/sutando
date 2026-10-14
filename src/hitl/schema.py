@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional
 from .host import device_host
 
 WIRE_FIELD = "space.ag2.hitl"
+# Follow-up notice tag: which cards a reminder or recovery message is about.
+NOTICE_FIELD = "space.ag2.hitl_notice"
 
 KINDS = frozenset(
     {"auth", "permission", "choice", "confirmation", "billing", "external_action",

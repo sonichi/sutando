@@ -98,6 +98,33 @@ def main() -> int:
     r, _ = outcome_of(TimeoutError("t"))
     check("timeout -> Indeterminate", isinstance(r, ProviderIndeterminate))
 
+    # -- the optional thread field (docs/remote-gateway-protocol.md) -------
+    from ag2_sparrow.delivery_core import provider_ag2space as pa
+    check("one owner for the thread field: RESULT_THREAD_FIELD/ASK constants",
+          getattr(pa, "RESULT_THREAD_FIELD", None) == "thread"
+          and getattr(pa, "RESULT_THREAD_ASK", None) == "ask")
+    threaded = json.dumps({"id": "task-X", "body": "hello", "thread": "ask"}).encode()
+
+    def threaded_outcome(*answers):
+        gw = ScriptedGateway(*answers)
+        try:
+            return AG2SpaceResultProvider(gw).deliver("task-X", threaded, "task-X#0"), gw
+        except (ProviderRefused, ProviderIndeterminate) as e:
+            return e, gw
+
+    r, gw = threaded_outcome(_http_error(400), {"ok": True})
+    check("thread + 400 -> Refused after ONE call (single attempt, no private retry)",
+          isinstance(r, ProviderRefused) and len(gw.calls) == 1, str(gw.calls))
+    r, gw = threaded_outcome(_http_error(503))
+    check("thread + 503 -> Indeterminate, one call, field kept for the retry",
+          isinstance(r, ProviderIndeterminate) and len(gw.calls) == 1
+          and gw.calls[0][2].get("thread") == "ask", str(gw.calls))
+    r, gw = threaded_outcome(_http_error(422))
+    check("thread + 422 -> Refused, one call (only 400 is the no-side-effect contract)",
+          isinstance(r, ProviderRefused) and len(gw.calls) == 1, str(gw.calls))
+    r, gw = outcome_of(_http_error(400))
+    check("no thread field + 400 -> one call", len(gw.calls) == 1, str(gw.calls))
+
     gw = ScriptedGateway({"ok": True})
     p = AG2SpaceResultProvider(gw)
     try:

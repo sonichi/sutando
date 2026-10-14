@@ -344,9 +344,8 @@ class DelegationTest(unittest.TestCase):
         self.assertIn("_publish_staged_whole(tmp, path)", src)
         self.assertNotIn("uuid.uuid4().hex}.tmp\")\n        with open(tmp", src)
 
-    def test_ts_cancel_result_goes_through_publishResultFile(self):
+    def test_ts_cancel_writes_no_result_body_directly(self):
         src = (REPO / "src" / "inline-tools.ts").read_text(encoding="utf-8")
-        self.assertIn("publishResultFile(`${targetId}.txt`, 'Cancelled.')", src)
         self.assertNotIn("writeFileSync(join(resultsDir", src)
 
     def test_sparrow_bundle_matches_src(self):

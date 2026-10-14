@@ -156,14 +156,14 @@ class TasksView:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         content = (f"id: {task_id}\n"
                    f"timestamp: {stamp}\n"
-                   f"task: {text}\n"
                    f"source: runtime-api\n"
                    f"channel_id: runtime-api\n"
                    f"user_id: {_one_line(self.actor_id)}\n"
                    f"access_tier: owner\n"
                    f"priority: {priority}\n"
                    + (f"instance_id: {_one_line(self.instance)}\n"
-                      if self.instance else ""))
+                      if self.instance else "")
+                   + f"task: {text}\n")
         # HMAC envelope (#3014 writer census): stamp at this writer's edge,
         # fail-open so a stamping error costs the stamp, never the submit.
         try:
@@ -208,12 +208,13 @@ class TasksView:
                          "user_id", "access_tier", "priority"]
         if expected_instance is not None:
             expected_keys.append("instance_id")
+        task_last_keys = [key for key in expected_keys if key != "task"] + ["task"]
         known = set(KNOWN_HEADER_KEYS)
         record_keys = [line.partition(":")[0] for line in raw.splitlines()
                        if line.partition(":")[0] in known and ":" in line]
         same = (
             raw == canonical_raw
-            and record_keys == expected_keys
+            and record_keys in (expected_keys, task_last_keys)
             and parsed.get("id") == task_id
             and parsed.get("source") == "runtime-api"
             and parsed.get("channel_id") == "runtime-api"

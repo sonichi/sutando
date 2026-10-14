@@ -17,6 +17,10 @@ _PKG = _REPO / "packages" / "ag2-sparrow"
 if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+
 TID = "task-633325612fbde6e777"
 HOLDER = "task-22d83e59601f3a1fef"
 ROOM = "!room:ag2.space"
@@ -46,7 +50,7 @@ class _Harness:
         gw.DEDUP_ALIAS_FILE = state / "remote-dedup-alias.json"
         gw._req = lambda m, p, payload=None, **k: (
             self.posts.append({"path": p, "payload": payload}) or {})
-        gw._save_inflight = lambda *a, **k: None
+        gw._save_inflight = lambda *a, **k: True
         gw._forget_task_room = lambda *a, **k: None
         gw._load_task_rooms = lambda *a, **k: dict(self.rooms)
         gw._save_task_rooms = lambda r, *a, **k: self.rooms.update(r)
@@ -329,6 +333,11 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
                 inflight = {TID}
                 self.gw._post_ready_results(inflight)
                 self.assertEqual(len(h.requeued_tasks()), 1)
+
+
+class BridgeImportIsHermetic(unittest.TestCase):
+    def test_the_bridge_import_reads_no_host_config_token_or_vault(self):
+        assert_hermetic(self, _IMPORT_READS)
 
 
 if __name__ == "__main__":

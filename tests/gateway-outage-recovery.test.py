@@ -18,6 +18,11 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'packages' / 'ag2-sparrow'))
 from ag2_sparrow import outbox, remote_gateway_bridge as gw, undelivered_quarantine
+
+
+def _park_in_quarantine(rfile, results, when=None):
+    """Fixture: put a result where the quarantine reader lists it."""
+    return undelivered_quarantine.place(Path(rfile), results, Path(rfile).stem, when=when)
 from ag2_sparrow.delivery_core import DeliveryCore, DesignAClaimBackend, RetryPolicy, DrainStatus
 from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceResultProvider
 from ag2_sparrow.delivery_core import ProviderPermanentRefused
@@ -405,7 +410,7 @@ class RecoveryTest(unittest.TestCase):
     def test_quarantined_holder_is_reported_never_regenerated_or_replayed(self):
         self.bridge()
         inflight = self.seed_duplicates()
-        undelivered_quarantine.quarantine(self.results / f'{HOLDER}.txt', self.results)
+        _park_in_quarantine(self.results / f'{HOLDER}.txt', self.results)
         gw._post_ready_results(inflight)
         self.assertEqual(len(list(self.tasks.rglob('*.txt'))), 3)
         self.assertNotIn(HOLDER, self.server.accepted)

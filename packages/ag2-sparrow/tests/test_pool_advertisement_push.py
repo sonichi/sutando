@@ -479,8 +479,13 @@ def test_the_production_loop_calls_both_relays():
     assert calls.count("_push_pool_advertisement") >= beats, calls
     # Each retry's FIRST call precedes the first push, so two optional 15 s
     # requests cannot delay an owner-approved publication.
-    watched = ("_push_pool_advertisement", "_retry_pending_publications",
-               "_retry_review_card_resolutions", "_retry_review_control_results")
+    watched = ("_push_pool_advertisement", "_retry_withheld_reviews")
+    beat = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "_retry_withheld_reviews")
+    retries = [n.func.id for n in ast.walk(beat)
+               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    assert retries == ["_retry_pending_publications", "_retry_review_card_resolutions",
+                       "_retry_review_control_results"], retries
     lines = {}
     for n in ast.walk(main_fn):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in watched:
