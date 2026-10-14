@@ -13,10 +13,10 @@ Exit: 0 on pass, 1 on fail.
 import asyncio
 import concurrent.futures
 import contextlib
-import sys
 import json
-import select
+import queue
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -322,6 +322,42 @@ class TasksViewTests(unittest.TestCase):
                 self.assertIn(queued_id, ids)
                 if mode == "control":
                     self.assertIn(victim_id, ids)
+
+    def test_metadata_scans_propagate_operational_errors(self):
+        import errno
+        task_id = self.view.submit("queued")["taskId"]
+        result = self.results / f"{task_id}.txt"
+        self.results.mkdir(exist_ok=True)
+        result.write_text("ready")
+        real_stat = Path.stat
+        for victim, scan in ((self._task_file(task_id), self.view.list_tasks),
+                             (result, self.view.list_results)):
+            for fault in (PermissionError("denied"), OSError(errno.EIO, "I/O fault")):
+                with self.subTest(scan=scan.__name__, fault=type(fault).__name__):
+                    def checked_stat(path, *args, **kwargs):
+                        if path == victim:
+                            raise fault
+                        return real_stat(path, *args, **kwargs)
+
+                    with unittest.mock.patch.object(Path, "stat", checked_stat):
+                        with self.assertRaises(type(fault)) as raised:
+                            scan()
+                    self.assertIs(raised.exception, fault)
+
+    def test_result_disappearing_during_metadata_access(self):
+        task_id = self.view.submit("finished")["taskId"]
+        self.results.mkdir(exist_ok=True)
+        victim = self.results / f"{task_id}.txt"
+        victim.write_text("ready")
+        real_stat = Path.stat
+
+        def checked_stat(path, *args, **kwargs):
+            if path == victim:
+                path.unlink()
+            return real_stat(path, *args, **kwargs)
+
+        with unittest.mock.patch.object(Path, "stat", checked_stat):
+            self.assertEqual(self.view.list_results(), {"results": []})
 
     def test_list_tasks_retains_mtime_and_limit_semantics(self):
         import os
@@ -807,9 +843,14 @@ print(json.dumps({"rows": rows, "at": time.time_ns()}), flush=True)
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True) as child:
                 try:
-                    self.assertTrue(select.select([child.stdout], [], [], 10)[0],
-                                    "caller did not reach metadata boundary")
-                    line = child.stdout.readline()
+                    lines = queue.Queue()
+                    reader = threading.Thread(
+                        target=lambda: lines.put(child.stdout.readline()), daemon=True)
+                    reader.start()
+                    try:
+                        line = lines.get(timeout=10)
+                    except queue.Empty:
+                        self.fail("caller did not reach metadata boundary")
                     self.assertTrue(line, "caller exited before metadata boundary")
                     event = json.loads(line)
                     self.assertEqual(event["boundary"], boundary)
@@ -842,8 +883,6 @@ print(json.dumps({"mode": mode, "at": time.time_ns()}))
                     later = asyncio.run(self._dispatcher(base).handle("task.list", {}))
                     expected = {queued_id} if mode == "archive" else {victim_id, queued_id}
                     self.assertEqual({r["taskId"] for r in later["tasks"]}, expected)
-                    print("process task.list:", mode, boundary,
-                          event["at"], changed["at"], result["at"])
                 finally:
                     if child.poll() is None:
                         child.kill()

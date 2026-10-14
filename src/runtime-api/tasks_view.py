@@ -284,7 +284,7 @@ class TasksView:
         for f in self.results_dir.glob(f"{TASK_PREFIX}*.txt"):
             try:
                 st = f.stat()
-            except OSError:
+            except FileNotFoundError:
                 continue  # archived mid-scan — absent, not an error
             if stat_module.S_ISREG(st.st_mode):
                 found.append((f, int(st.st_mtime)))
@@ -350,7 +350,7 @@ class TasksView:
             for f in self.tasks_dir.glob(f"{TASK_PREFIX}*.txt"):
                 try:
                     metadata = f.stat()
-                except OSError:
+                except FileNotFoundError:
                     continue
                 if stat_module.S_ISREG(metadata.st_mode):
                     files.append((f, metadata.st_mtime))
