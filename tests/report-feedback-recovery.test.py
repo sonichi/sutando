@@ -155,25 +155,41 @@ class RecoveryTests(unittest.TestCase):
         self.assertIs(payload['context']['recovery']['historical'], False)
 
     def test_legacy_draft_age_is_unknown(self):
-        self.clock.return_value = 1767225600
-        incident = self.queue()
-        rec = rf.load_draft(self.ws, incident)
-        del rec['created']
-        rf.save_draft(self.ws, rec)
-        self.clock.return_value = 1768608000
-        self.run_cli('--apply')
-        self.post.assert_called_once()
-        payload = self.post.call_args.args[1]
-        self.assertIn('Original observation (UTC): unknown', payload['body'])
-        self.assertIn('Released (UTC): 2026-01-17T00:00:00Z', payload['body'])
-        self.assertIn('Elapsed hold duration: unknown', payload['body'])
-        self.assertNotIn('Historical report', payload['body'])
-        recovery = payload['context']['recovery']
-        self.assertIsNone(recovery['observed_at'])
-        self.assertIsNone(recovery['held_seconds'])
-        self.assertIsNone(recovery['historical'])
-        self.assertEqual(recovery['released'], 1768608000)
-        self.assertNotIn('created', json.loads(rf.filed_receipt(self.ws, incident).read_text()))
+        released = 1768608000
+        for created, observed_at, observation_text in (
+            (None, None, 'unknown'),
+            ('invalid timestamp', None, 'unknown'),
+            (released + 1, released + 1, '2026-01-17T00:00:01Z'),
+        ):
+            with self.subTest(created=created):
+                self.post.reset_mock()
+                self.clock.return_value = 1767225600
+                incident = self.queue(f'unknown age {created!r}')
+                rec = rf.load_draft(self.ws, incident)
+                if created is None:
+                    del rec['created']
+                else:
+                    rec['created'] = created
+                rf.save_draft(self.ws, rec)
+                self.clock.return_value = released
+                self.run_cli('--apply')
+                self.run_cli('--apply')
+                self.post.assert_called_once()
+                payload = self.post.call_args.args[1]
+                self.assertIn(f'Original observation (UTC): {observation_text}', payload['body'])
+                self.assertIn('Released (UTC): 2026-01-17T00:00:00Z', payload['body'])
+                self.assertIn('Elapsed hold duration: unknown', payload['body'])
+                self.assertNotIn('Historical report', payload['body'])
+                recovery = payload['context']['recovery']
+                self.assertEqual(recovery['observed_at'], observed_at)
+                self.assertIsNone(recovery['held_seconds'])
+                self.assertIsNone(recovery['historical'])
+                self.assertEqual(recovery['released'], released)
+                persisted = json.loads(rf.filed_receipt(self.ws, incident).read_text())
+                if created is None:
+                    self.assertNotIn('created', persisted)
+                else:
+                    self.assertEqual(persisted['created'], created)
 
     def test_manual_submission_body_remains_unchanged(self):
         versions_body = ('\n\n### Build versions\n'
