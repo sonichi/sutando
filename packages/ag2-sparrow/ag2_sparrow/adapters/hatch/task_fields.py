@@ -75,6 +75,18 @@ def _field(headers: dict, key: str) -> "str | None":
     return value or None
 
 
+def _reply_and_message(parsed: "local_task_protocol.TaskHeaders") -> "tuple[dict | None, str]":
+    # Only an attested reply gets a reply_context; a block a sender typed stays their text.
+    if _field(parsed.headers, "reply_to_event"):
+        return local_task_protocol.split_reply_context(parsed.body)
+    return None, parsed.body
+
+
+def message_body(text: str) -> str:
+    """A task file's message: its body without a quoted reply-context block."""
+    return _reply_and_message(attested_headers(text))[1]
+
+
 def item_id(tid: str, instance: str = "") -> "str | None":
     """The id `instance`'s bridge delivers this task's result under, or None when the
     task is not that instance's or not a valid task id."""
@@ -94,12 +106,10 @@ def task_fields(task_file: Path, result_dir: Path, instance: str = "") -> "dict 
         return None
     parsed = attested_headers(text)
     h = parsed.headers
+    reply, message = _reply_and_message(parsed)
     tier = local_task_protocol.canonical_access_tier(h.get("access_tier"))
     if tier not in local_task_protocol.BROKER_WIRE_TIERS:
         tier = "guest"  # absent or unknown: the most restricted tier
-    # Only an attested reply gets a reply_context; a block a sender typed stays their text.
-    reply, message = (local_task_protocol.split_reply_context(parsed.body)
-                      if _field(h, "reply_to_event") else (None, parsed.body))
     item = {
         "task_id": tid,
         "room_id": _field(h, "channel_id") or _field(h, "source_room_id"),

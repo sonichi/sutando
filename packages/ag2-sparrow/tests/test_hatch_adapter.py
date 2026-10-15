@@ -217,9 +217,12 @@ class HookScript(Base):
         self.add_task("task-1784700000001", "$room", mtime=1000,
                       body="@watch-agent what is 6 times 7?")
         self.add_task("task-1784700000002", "$dm", mtime=2000,
-                      body="remind me to renew the passport")
+                      text=task_text("task-1784700000002", "$dm", "@bob:ag2.space",
+                                     body="remind me to renew the passport")
+                      .replace("!room:", "!dm:"))
         self.assertEqual(self.run_script().returncode, 0)
         room, dm = self.payload()["matches"]
+        self.assertNotEqual(room["room_id"], dm["room_id"])
         words = room["snippet"].split("] ", 1)[1]
         env = py_env(self.home)
         env["SPARROW_HATCH_CONFIG"] = str(self.config)
@@ -228,6 +231,7 @@ class HookScript(Base):
                                           "--body", "@bob:ag2.space 42", "--wait", "0"], env)
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertFalse(Path(dm["result_file"]).exists())
+            self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
             self.assertIn(room["result_file"], r.stderr)
             r = run_main(hatch_cli.main, ["reply", "--answering", words, room["result_file"],
                                           "--body", "@bob:ag2.space 42", "--wait", "0"], env)
@@ -1611,6 +1615,8 @@ class ReplyBinding(Base):
         self.assertIn(f"not the message of {self.DM}", r.stderr)
         self.assertIn(str(self.room_result), r.stderr)
         self.assertIn("remind me to renew the passport", r.stderr)
+        # Nothing reached the outbox or any result file.
+        self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
         # The same reply against its own item goes through.
         r = self.reply(str(self.room_result), "--answering", "what is 6 times 7",
                        "--body", "@chi:ag2.space 42", "--wait", "0")
@@ -1630,6 +1636,41 @@ class ReplyBinding(Base):
         self.assertEqual(self.reply(str(self.dm_result), "--no-send", "--answering",
                                     "renew the passport").returncode, hatch_cli.REPLY_POSTED)
 
+    def test_text_without_spaces_is_matched_on_characters(self):
+        a, b = "task-1784700000003", "task-1784700000004"
+        self.add_task(a, "$a", sender="@susan:ag2.space", mtime=1002,
+                      body="你好，帮我查一下明天纽约的天气，谢谢")
+        self.add_task(b, "$b", text=task_text(b, "$b", "@susan:ag2.space",
+                                              body="明日の会議は何時からですか")
+                      .replace("!room:", "!dm:"), mtime=1003)
+        a_result, b_result = self.results / f"{a}.txt", self.results / f"{b}.txt"
+        # A's words against B's result_file: refused, and the error names A.
+        r = self.reply(str(b_result), "--answering", "明天纽约的天气",
+                       "--body", "@susan:ag2.space 晴", "--wait", "0")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn(str(a_result), r.stderr)
+        self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
+        # A part of A's message, not the whole of it, binds the reply to A.
+        r = self.reply(str(a_result), "--answering", "帮我查一下明天纽约的天气",
+                       "--body", "@susan:ag2.space 晴", "--wait", "0")
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
+        self.assertEqual(a_result.read_text(), "@susan:ag2.space 晴")
+        self.assertEqual(self.reply(str(b_result), "--no-send", "--answering",
+                                    "明日の会議").returncode, hatch_cli.REPLY_POSTED)
+
+    def test_the_message_replied_to_does_not_bind_the_reply(self):
+        tid = "task-1784700000005"
+        body = broker_reply_body("@ann:ag2.space", "please review the hatch pull request",
+                                 "sure, looking at it now")
+        self.add_task(tid, "$r", text=task_text(tid, "$r", "@bob:ag2.space", body=body,
+                                                prefix="", reply_to="$orig"), mtime=1004)
+        result = self.results / f"{tid}.txt"
+        r = self.reply(str(result), "--no-send", "--answering", "review the hatch")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertFalse(result.exists())
+        self.assertEqual(self.reply(str(result), "--no-send", "--answering",
+                                    "looking at it").returncode, hatch_cli.REPLY_POSTED)
+
     def test_what_counts_as_the_message(self):
         ok = ("What is 6 times 7", "  what IS 6, times 7?! ", "6 times 7")
         for words in ok:
@@ -1645,6 +1686,14 @@ class ReplyBinding(Base):
         self.assertTrue(hatch_cli.answers("[AG2Space bob] @a:b approve?", "approve"))
         self.assertTrue(hatch_cli.answers("[AG2Space bob] \U0001F44D", "\U0001F44D"))
         # A Matrix reply fallback quotes an earlier message, not this one.
+        cjk = "[AG2Space Susan] 帮我查一下明天的天气"
+        for words in ("明天的天气", "帮我查一下", "明天的天气。", "帮我查一下明天的天气"):
+            self.assertTrue(hatch_cli.answers(cjk, words), words)
+        # Too few characters; characters not in that order; another message's characters.
+        for words in ("天气", "的天气", "天气的明天", "后天的天气", "Susan 帮我查"):
+            self.assertFalse(hatch_cli.answers(cjk, words), words)
+        self.assertTrue(hatch_cli.answers("[AG2Space s] 明日の天気を教えて", "明日の天気"))
+        self.assertTrue(hatch_cli.answers("[AG2Space s] 好的", "好的"))
         folded = "[AG2Space bob] > <@a:b> what is 6 times 7  thanks a lot"
         self.assertFalse(hatch_cli.answers(folded, "what is 6 times 7"))
         self.assertTrue(hatch_cli.answers(folded, "thanks a lot"))
