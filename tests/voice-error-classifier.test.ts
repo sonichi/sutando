@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
 	classifyTransportClose,
+	formatVoiceOfflineNotification,
 	protocolFailureFor,
 	recordTerminalClassification,
 	lastTerminalClassification,
@@ -50,6 +51,17 @@ test('model_not_found: configured model unavailable', () => {
 	);
 	assert.equal(r.category, 'model_not_found');
 	assert.equal(r.retryable, false);
+});
+
+test('model_not_found: the fix it names is the workspace voice config, where voice-agent reads its model', () => {
+	const r = classifyTransportClose(
+		1008,
+		'models/gemini-3.8-live is not found for API version v1beta, or is not supported for bidiGenerateContent.',
+	);
+	assert.equal(r.category, 'model_not_found');
+	assert.match(r.userMessage, /config\/voice-agent\.json/);
+	assert.doesNotMatch(r.userMessage, /\.env\b|VOICE_NATIVE_AUDIO_MODEL/);
+	assert.match(formatVoiceOfflineNotification(r.userMessage, new Date(0)), /config\/voice-agent\.json/);
 });
 
 test('rate_limit: transient 429 stays retryable', () => {

@@ -104,7 +104,8 @@ export interface TurnInput {
 
 export type TurnClassifier = (input: TurnInput, signal?: AbortSignal) => Promise<TurnVerdict>;
 
-export function turnClassifierPrompt(i: TurnInput): string {
+/** @param extraRules rule lines from the voice surface: what the voice model answers itself (a skill's tools), so the core is not asked too. */
+export function turnClassifierPrompt(i: TurnInput, extraRules: readonly string[] = []): string {
 	return [
 		'You sit behind a voice assistant. It talks with the user; a back-end agent (the core) does the real work: anything about the user\'s own accounts, files, code repositories and PRs, email, calendar, messages, notes, and any action or lookup that needs them. The voice assistant itself can only talk, search the public web, and answer from general knowledge or from this conversation.',
 		'The user just finished saying something. Decide whether it asks the core to do something.',
@@ -118,6 +119,7 @@ export function turnClassifierPrompt(i: TurnInput): string {
 		'- none: chit-chat, thanks, any other yes/no reply, a question about the assistant\'s own task list ("how many tasks are pending", "is it done yet") with no new thing named, a public fact or general-knowledge question, or anything already being answered.',
 		'- duplicate: the same request as one of the open tasks below (same thing, same ask, worded differently or misheard).',
 		'- ask: it is a request for the core but a specific thing is missing and the recent words do not supply it, or you cannot tell whether they want the core to act. One short question in the user\'s language.',
+		...extraRules,
 		'Reply with JSON only, one of:',
 		'{"action":"work","task":"..."}',
 		'{"action":"none"}',
@@ -195,13 +197,13 @@ export function createGeminiWorkCheck(opts: { apiKey: () => string | undefined; 
 	};
 }
 
-export function createGeminiTurnClassifier(opts: { apiKey: () => string | undefined; model?: string; timeoutMs?: number; log?: (m: string) => void }): TurnClassifier {
+export function createGeminiTurnClassifier(opts: { apiKey: () => string | undefined; model?: string; timeoutMs?: number; log?: (m: string) => void; extraRules?: readonly string[] }): TurnClassifier {
 	const model = opts.model ?? WORK_CHECK_MODEL;
 	return async (input, signal) => {
 		const apiKey = opts.apiKey();
 		if (!apiKey) return { action: 'none' };
 		const t0 = Date.now();
-		const text = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: turnClassifierPrompt(input), signal, log: opts.log, what: 'turn check' });
+		const text = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: turnClassifierPrompt(input, opts.extraRules), signal, log: opts.log, what: 'turn check' });
 		if (text === null) return { action: 'none' };
 		const verdict = parseTurnVerdict(text, input.openTasks);
 		const detail = verdict.action === 'work' ? ` (${verdict.task})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';

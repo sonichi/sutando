@@ -2,6 +2,7 @@
 retry-whole on a rejected send, dedupe keys stable per (requirement, revision).
 """
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -12,7 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from hitl.manager import HitlManager, HitlStore  # noqa: E402
+from hitl import manager as hm  # noqa: E402
+from hitl.manager import HitlManager, HitlStore, archive_health  # noqa: E402
 from hitl.projector import (  # noqa: E402
     fallback_body,
     pending_ids,
@@ -282,9 +284,124 @@ class ArchiveTests(unittest.TestCase):
         settled = self.settled()
         self.mgr.store.archive_root.write_text("not a dir")
         card = self.mgr.create(make_req(kind="choice", guard="g2"))
-        with self.assertLogs("hitl.projector", level="WARNING"):
+        with self.assertLogs("hitl.store", level="WARNING"):
             self.assertEqual(pending_ids(self.mgr), [card.id])
         self.assertEqual(self.live(), sorted([settled.id, card.id]))
+
+    def test_a_persistent_failure_warns_once_per_id(self):
+        a = self.settled()
+        b = self.mgr.create(make_req(kind="choice", guard="gb"))
+        project(self.mgr, self.send, ROOM)
+        self.mgr.resolve(b.id)
+        project(self.mgr, self.send, ROOM)
+        self.mgr.store.archive_root.write_text("not a dir")
+        with self.assertLogs("hitl.store", level="WARNING") as logs:
+            pending_ids(self.mgr)
+        self.assertEqual(len(logs.records), 2)
+        for _ in range(3):  # later pulses, and a fresh store object as the gateway makes
+            with self.assertNoLogs("hitl.store"):
+                pending_ids(HitlManager(HitlStore(self.root)))
+        self.assertEqual(self.live(), sorted([a.id, b.id]))
+
+    def test_failures_are_published_for_health_and_clear_when_fixed(self):
+        self.settled()
+        self.mgr.store.archive_root.write_text("not a dir")
+        with self.assertLogs("hitl.store", level="WARNING"):
+            pending_ids(self.mgr)
+        h = archive_health(self.root)
+        self.assertEqual((h["live"], h["failures"]), (1, 1))
+        self.assertIn("FileExistsError", h["error"])
+        self.mgr.store.archive_root.unlink()
+        pending_ids(self.mgr)
+        self.assertEqual((archive_health(self.root)["live"], archive_health(self.root)["failures"]),
+                         (0, 0))
+
+    def test_a_failing_record_that_leaves_the_live_set_stops_counting(self):
+        req = self.settled()
+        self.mgr.store.archive_root.write_text("not a dir")
+        with self.assertLogs("hitl.store", level="WARNING"):
+            pending_ids(self.mgr)
+        self.mgr.store._path(req.id).unlink()
+        pending_ids(self.mgr)
+        self.assertEqual(archive_health(self.root)["failures"], 0)
+
+    def test_a_healthy_store_publishes_zero_failures_outside_the_store(self):
+        self.settled()
+        pending_ids(self.mgr)
+        self.assertEqual(archive_health(self.root)["failures"], 0)
+        status = hm.archive_status_path(self.root)
+        self.assertTrue(status.exists())
+        self.assertEqual(status.parent, self.root.parent)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir() if p.name != ".lock"), [])
+        self.assertEqual(self.mgr.store.all(), [])
+        self.assertIsNone(archive_health(self.root.parent / "absent"))
+
+    def test_the_status_is_written_only_when_it_changes(self):
+        self.settled()
+        self.mgr.store.archive_root.write_text("not a dir")
+        with self.assertLogs("hitl.store", level="WARNING"):
+            pending_ids(self.mgr)
+        status = hm.archive_status_path(self.root)
+        status.unlink()
+        pending_ids(self.mgr)
+        self.assertFalse(status.exists())
+        self.mgr.store.archive_root.unlink()
+        pending_ids(self.mgr)
+        self.assertEqual(json.loads(status.read_text())["failures"], 0)
+
+    def test_a_new_error_text_rewrites_the_status(self):
+        store = self.mgr.store
+        store.report_archive_failures({"hitl_a": PermissionError("denied")}, 1000.0)
+        store.report_archive_failures({"hitl_a": OSError("disk full")}, 1001.0)
+        h = archive_health(self.root, now=1002.0)
+        self.assertEqual((h["failures"], h["error"]), (1, "OSError: disk full"))
+
+    def test_a_steady_status_is_refreshed_and_a_stopped_writer_reads_stale(self):
+        self.assertLess(hm.ARCHIVE_STATUS_REFRESH_S, hm.ARCHIVE_STATUS_STALE_S)
+        for failures in ({"hitl_a": PermissionError("denied")}, {}):
+            store = HitlStore(self.root / f"r{len(failures)}")
+            with self.subTest(failures=len(failures)):
+                store.report_archive_failures(failures, 1000.0)
+                t = 1000.0 + hm.ARCHIVE_STATUS_REFRESH_S
+                store.report_archive_failures(failures, t - 1)
+                self.assertEqual(archive_health(store.root, now=1000.0)["updated_at"], 1000.0)
+                store.report_archive_failures(failures, t)
+                self.assertEqual(archive_health(store.root, now=t)["updated_at"], t)
+                stale = hm.ARCHIVE_STATUS_STALE_S
+                self.assertFalse(archive_health(store.root, now=t + stale)["stale"])
+                self.assertTrue(archive_health(store.root, now=t + stale + 1)["stale"])
+
+    def test_a_report_without_updated_at_reads_stale(self):
+        hm.archive_status_path(self.root).write_text(json.dumps({"failures": 2, "error": "x"}))
+        self.assertTrue(archive_health(self.root)["stale"])
+
+    def test_no_report_or_a_non_object_report_reads_as_not_reported(self):
+        self.assertEqual(
+            (archive_health(self.root)["reported"], archive_health(self.root)["stale"]), (False, False))
+        hm.archive_status_path(self.root).write_text("[1]")
+        h = archive_health(self.root)
+        self.assertEqual((h["reported"], h["stale"], h["failures"]), (False, False, 0))
+
+    def test_a_failed_status_write_leaves_no_temp_and_retries(self):
+        store = self.mgr.store
+        with mock.patch("hitl.manager.os.replace", side_effect=OSError("read-only")):
+            store.report_archive_failures({}, 1.0)
+        status = hm.archive_status_path(self.root)
+        self.assertEqual(sorted(p.name for p in status.parent.iterdir()
+                                if p.name.startswith(".tmp-archive-status-")), [])
+        self.assertFalse(status.exists())
+        store.report_archive_failures({}, 2.0)
+        self.assertEqual(json.loads(status.read_text())["updated_at"], 2.0)
+
+    def test_an_id_that_recovers_and_fails_again_warns_again(self):
+        store, err = self.mgr.store, {"hitl_a": PermissionError("denied")}
+        with self.assertLogs("hitl.store", level="WARNING"):
+            store.report_archive_failures(err, 1.0)
+        with self.assertNoLogs("hitl.store"):
+            store.report_archive_failures(err, 2.0)
+            store.report_archive_failures({}, 3.0)
+        with self.assertLogs("hitl.store", level="WARNING"):
+            store.report_archive_failures(err, 4.0)
 
     def archive_on_first_read(self, req_id):
         """Read the live file only after another writer has archived it."""

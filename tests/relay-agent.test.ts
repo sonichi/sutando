@@ -433,6 +433,40 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		assert.deepEqual(submitted, ['from the voice model']);
 	});
 
+	it('a turn the voice model answered with a tool that fetches the answer is not sent to the core', async () => {
+		// 2026-10-13 17:08: "open.space launch video 那个 room 里最近发生了什么" was read with read_room and also sent as a task.
+		let asked = 0;
+		const { relay, submitted, logs } = agent(async () => { asked++; return { action: 'work', task: 'x' }; });
+		relay.noteAnsweringTool('read_room');
+		relay.onUserTurn('open.space launch video 那个 room 里最近发生了什么');
+		await tick(10);
+		assert.equal(asked, 0, 'not even checked');
+		assert.deepEqual(submitted, []);
+		assert.ok(logs.some((l) => l.includes('read_room answers this turn')));
+	});
+
+	it('a read that starts while the turn is being checked wins too', async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((r) => { release = r; });
+		const { relay, submitted } = agent(async () => { await gate; return { action: 'work', task: 'from the turn check' }; });
+		relay.onUserTurn('Sutando Triage 里 5473 那个 guest line 是怎么回事');
+		await tick(1);
+		relay.noteAnsweringTool('read_room');
+		release();
+		await tick(10);
+		assert.deepEqual(submitted, []);
+	});
+
+	it('the next turn, with no such tool, is checked as usual', async () => {
+		const { relay, submitted } = agent(async () => ({ action: 'work', task: '查一下 PR 5473 的 review' }));
+		relay.noteAnsweringTool('read_room');
+		relay.onUserTurn('Sutando Triage 里有什么新消息');
+		await tick(10);
+		relay.onUserTurn('帮我查一下 5473 的 review');
+		await tick(10);
+		assert.deepEqual(submitted, ['查一下 PR 5473 的 review']);
+	});
+
 	it('chit-chat and task-list questions send nothing; an ask is put to the user; a repeat is not sent', async () => {
 		const verdicts = [{ action: 'none' }, { action: 'ask', question: '你说的是哪个 PR？' }, { action: 'duplicate', of: 'task-t9' }];
 		const { relay, submitted, notices, logs } = agent(async () => verdicts.shift());
@@ -486,6 +520,10 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		// voice model was asking "which PR?"; a noise "A" made the user be asked again.
 		const { turnClassifierPrompt, workCheckPrompt } = await import('../src/work-request-check.js');
 		const turn = turnClassifierPrompt({ utterance: 'A', recentConversation: '' });
+		// 2026-10-13 20:54: "Sutando Triage 里其他的 conversation 是啥" was sent to the core although the voice model reads rooms itself.
+		const withRooms = turnClassifierPrompt({ utterance: 'A', recentConversation: '' }, ['- none: a room question, the assistant reads the room itself.']);
+		assert.ok(withRooms.indexOf('- none: a room question') < withRooms.indexOf('Reply with JSON only'), 'a skill\'s rule sits with the rules');
+		assert.doesNotMatch(turn, /room question/);
 		assert.match(turn, /"那个 PR".*is never filled in, not even from the request just before it/);
 		assert.match(turn, /If it asks the user something about this request .* decide none/);
 		assert.match(turn, /A fragment that is not a sentence .* is none/);
@@ -510,7 +548,9 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 	it('the voice agent hands every real user turn to the relay agent', () => {
 		const agentSrc = readFileSync(join(import.meta.dirname ?? '.', '..', 'src', 'voice-agent.ts'), 'utf-8');
 		assert.match(agentSrc, /relayAgent\.onUserTurn\(item\.content\)/);
+		assert.match(agentSrc, /if \(answeringTools\.has\(e\.toolName\)\) relayAgent\.noteAnsweringTool\(e\.toolName\)/);
 		assert.match(agentSrc, /classify: RELAY_CHECK \? createGeminiTurnClassifier\(/);
+		assert.match(agentSrc, /extraRules: personalVoiceSurface\.turnCheckRules/, 'the turn check is told what the skills answer themselves');
 	});
 });
 

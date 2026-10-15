@@ -14,7 +14,6 @@ returning the gateway's dict answer) — this module never imports a bridge.
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -78,11 +77,13 @@ def pending_ids(manager: HitlManager, clock: Clock = time.time) -> List[str]:
 
     This WRITES: every terminal record that owes nothing is moved to the
     archive on the way, so the per-pulse scan stays the size of the live set.
-    A failed move is logged and skipped; cleanup never blocks delivery.
+    A failed move is skipped, warned once per id, and counted in the status
+    health-check reads (`archive_health`); cleanup never blocks delivery.
     """
     now = clock()
     owed = {r.id for n in _notices(manager, now) for r, _ in n.members}
     out: List[str] = []
+    failed: Dict[str, BaseException] = {}
     for r in manager.store.all():
         if manager.needs_projection(r.id) or r.id in owed:
             out.append(r.id)
@@ -90,8 +91,8 @@ def pending_ids(manager: HitlManager, clock: Clock = time.time) -> List[str]:
             try:
                 manager.archive_if_settled(r.id, now)
             except OSError as e:
-                logging.getLogger("hitl.projector").warning(
-                    "hitl: could not archive %s: %s", r.id, e)
+                failed[r.id] = e
+    manager.store.report_archive_failures(failed, now)
     return out
 
 

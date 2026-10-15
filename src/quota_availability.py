@@ -86,14 +86,49 @@ def limit_windows(headers: dict) -> dict:
     return {w: v for w, v in quota_windows(headers).items() if w != "overage"}
 
 
-def resolve_available(status: str, proxy_available: Any, headers: Optional[dict] = None) -> bool:
+OVERAGE_STATUS = "anthropic-ratelimit-unified-overage-status"
+OVERAGE_OK = ("allowed", "allowed_warning")
+
+
+def classify_limit_state(record: Any) -> str:
+    """`allowed`, `overage` or `rejected` for a quota-state record. `overage`: a
+    limit is rejected but extra usage is allowed and no 429 has landed since the
+    headers were written. The proxy's `limitState` implements the same rule;
+    tests/fixtures/quota-limit-state.parity.json pins both."""
+    payload = record if isinstance(record, dict) else {}
+    headers = payload.get("headers")
+    headers = headers if isinstance(headers, dict) else {}
+    limited = headers.get("anthropic-ratelimit-unified-status") == "rejected" or any(
+        st == "rejected" for _u, st in limit_windows(headers).values())
+    if not limited:
+        return "allowed"
+    if headers.get(OVERAGE_STATUS) not in OVERAGE_OK:
+        return "rejected"
+    checked = _parse_when(payload.get("last_checked"))
+    ledger = payload.get("recent_rejections")
+    for rej in ledger if isinstance(ledger, list) else []:
+        if not isinstance(rej, dict) or rej.get("status") != 429:
+            continue
+        at = _parse_when(rej.get("ts"))
+        # An unordered 429 (either stamp unreadable) is not known to be older.
+        if checked is None or at is None or at >= checked:
+            return "rejected"
+    return "overage"
+
+
+def resolve_available(status: str, proxy_available: Any, headers: Optional[dict] = None,
+                      limit_state: Optional[str] = None) -> bool:
     """Resolve the proxy's persisted availability signal without coercion.
 
     `headers`, when given, gates on EVERY reported window, not just the
     headline: the proxy's `available` flag only reflects the overall/5h
     windows, so a per-model or weekly window (e.g. `7d_oi`) can be rejected
     while the headline and `available` both still read allowed.
+    `limit_state` "overage" (from `classify_limit_state`) is available: the
+    provider is serving on extra usage.
     """
+    if limit_state == "overage":
+        return True
     if status == "rejected":
         return False
     if headers and any(st == "rejected" for _u, st in limit_windows(headers).values()):
@@ -115,12 +150,14 @@ def availability_decision(
     headers = headers if isinstance(headers, dict) else {}
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
     routed = points_at_credential_proxy(base_url)
-    accepted = resolve_available(str(status), payload.get("available"), headers)
+    limit_state = classify_limit_state(payload)
+    accepted = resolve_available(str(status), payload.get("available"), headers, limit_state)
     available = accepted and routed and not stale
     return {
         "available": available,
         "routed": routed,
         "status": status,
+        "limit_state": limit_state,
         "unavailable_reason": (
             None if available
             else "not-routed" if not routed

@@ -15,7 +15,7 @@
  * missing. Schema:
  *
  *   {
- *     "model": "gemini-2.5-flash-native-audio-preview-12-2025",
+ *     "model": "gemini-3.8-live",
  *     "googleSearch": true,
  *     "owner_mode": false,
  *     "channels": { "<voice_channel_id>": { "owner_mode": true } }
@@ -23,13 +23,11 @@
  *
  * Missing file → defaults. Partial file → fill in missing keys from defaults.
  *
- * Defaults: 2.5 + search:true. Rationale: 2.5+search is the only combo that
- * works on BOTH the MAIN and VOICE Gemini keys (3.1+search needs paid-tier
- * entitlement that only MAIN currently has on most setups; 3.1 without search
- * works on either key but loses Web grounding by default — that's degrading
- * capability rather than picking a safe baseline). The browser voice-agent
- * surface explicitly ships a newer `.example` template; phone inherits this
- * package default unless its own config overrides it.
+ * Defaults: 3.8 Live + search:true. The model is MIGRATED_MODEL, the one every
+ * seeded install moves to; search stays true because that migration keeps each
+ * install's search setting, so a config-less install runs what a migrated
+ * install seeded with the old 2.5 + search:true default runs. The browser
+ * voice-agent template turns search off; phone's template carries this default.
  */
 
 import { readFileSync, existsSync, writeFileSync, renameSync, copyFileSync } from 'fs';
@@ -80,7 +78,7 @@ export interface VoiceConfig {
 }
 
 export const VOICE_CONFIG_DEFAULTS: VoiceConfig = {
-	model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+	model: 'gemini-3.8-live',
 	googleSearch: true,
 	owner_mode: false,
 	shadowStt: false,

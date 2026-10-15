@@ -5,7 +5,7 @@ A worker whose session answers alive never reaches the death ladder, so a limit
 menu, a permission dialog or a frozen turn used to hold its work with nobody
 acting. The wedge rung reads the pane the caller captured (pane_gate + cli_wedge)
 and what the worker owes (task_dispatch): sustained past the stale line it asks
-once per episode for the owner — a gate or limit escalates, abnormal text asks for
+once per episode for the owner — a gate or limit asks for a terminal card, abnormal text asks for
 a card naming its cause, a frozen turn for a card offering Escape. No wedge kind
 restarts a session. Every subprocess here is a stub answered by argv.
 """
@@ -46,6 +46,7 @@ def check(name, got, want):
 
 CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
 FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
+HUMAN = ps.CARD_HUMAN
 LOGIN = getattr(ps, "CARD_LOGIN", "card_login")
 LOGGED_OUT = getattr(ps, "PANE_LOGGED_OUT", "logged-out")
 GATE, LIMIT, ABN, WORK, IDLE = (getattr(ps, n, v) for n, v in (
@@ -70,7 +71,7 @@ def run(seq, period=300.0, ack=True):
     for o in seq:
         st, d = ps.evaluate(st, {"w": o}, t)
         out.append(d["w"])
-        if ack and d["w"] in (CAUSE, FROZEN, LOGIN):
+        if ack and d["w"] in (CAUSE, FROZEN, LOGIN, HUMAN):
             st = ps.acknowledge(st, ["w"])
         t += period
     return out, st
@@ -82,11 +83,11 @@ E = ps.ESCALATE
 # --- the policy ----------------------------------------------------------------
 
 got, _ = run([obs(GATE)] * 5)
-check("a gate held with work outstanding escalates at the sustain, once, never restarts",
-      got, [N, N, E, N, N])
+check("a gate held with work outstanding asks for a card at the sustain, once, never restarts",
+      got, [N, N, HUMAN, N, N])
 
 got, _ = run([obs(LIMIT)] * 4)
-check("a limit is a human's wait-or-spend decision: escalate, never restart", got, [N, N, E, N])
+check("a limit is a human's wait-or-spend decision: card, never restart", got, [N, N, HUMAN, N])
 
 got, _ = run([obs(ABN)] * 5)
 check("abnormal text sustained asks once for a card naming its cause, never a restart",
@@ -156,7 +157,7 @@ check("an acknowledged login card does not silence the abnormal text that follow
       (got, getattr(st.workers["w"], "wedge_kind", None)), ([LOGIN, N, CAUSE, N], "abnormal"))
 
 got, _ = run([obs(LOGGED_OUT, work=False), obs(LIMIT), obs(LIMIT), obs(LIMIT)])
-check("...nor a limit that follows it: that escalates at the episode's sustain", got, [LOGIN, N, E, N])
+check("...nor a limit that follows it: that cards at the episode's sustain", got, [LOGIN, N, HUMAN, N])
 
 got, _ = run([obs(ABN)] * 3 + [obs(LOGGED_OUT)] * 2)
 check("an expiry after an acknowledged cause card is carded on the tick that reads it",

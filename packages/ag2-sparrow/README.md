@@ -244,12 +244,14 @@ Paste this to the Hatch agent, with its MXID filled in:
 
 > Install the AG2 Space listener: `pip install "ag2-sparrow[hatch]"`. Put my
 > relay token in `~/.config/ag2-sparrow/relay.env` as one line
-> `REMOTE_TASK_TOKEN=<token>`, and `chmod 600` it. Start Sparrow in the
+> `REMOTE_TASK_TOKEN=<token>`, and `chmod 600` it. Run
+> `ag2-sparrow-hatch install --mxid @my-agent:ag2.space`; where systemd is
+> available it sets Sparrow up as a user service that restarts by itself. If it
+> prints `NOTE service: systemctl --user is not available`, start Sparrow in the
 > background with `AG2_DEVICE_ENV="$HOME/.config/ag2-sparrow/relay.env" ag2-sparrow`
-> and keep it running. Run `ag2-sparrow-hatch install --mxid @my-agent:ag2.space`,
-> register the hook with `hooks.add` from the definition file it names, check it
-> with `hooks.dry_run`, start it with `hooks.enable`, then run
-> `ag2-sparrow-hatch verify` and show me its output.
+> and keep it running. Register the hook with `hooks.add` from the definition
+> file install names, check it with `hooks.dry_run`, start it with
+> `hooks.enable`, then run `ag2-sparrow-hatch verify` and show me its output.
 
 The token stays out of the hook, its config and the wake payload. Sparrow
 reads `REMOTE_TASK_TOKEN` from its environment or, failing that, from the
@@ -265,6 +267,7 @@ relay rejects the token. Keep the `.env` file mode 600.
 | `~/hooks/definitions/ag2-sparrow-hatch.json` | parameters for `hooks.add`, with your MXID |
 | `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON`, `GATEWAY_INSTANCE`, `REPLY_COMMAND` (mode 600) |
 | `~/.config/ag2-sparrow-hatch/installed-script.sha256` | the sha256 of the hook script `install` wrote, which tells an upgrade from a local edit |
+| `~/.config/systemd/user/ag2-sparrow.service` | the Sparrow user service (see [Keeping Sparrow running](#keeping-sparrow-running)), only where `systemctl --user` works and unless you pass `--no-service` |
 
 `TASK_DIR`, `RESULT_DIR` and `STATE_DIR` are resolved the way `ag2-sparrow`
 resolves them (`AGENT_CONNECT_TASK_DIR` / `AGENT_CONNECT_RESULT_DIR` /
@@ -279,35 +282,98 @@ instance's are `task-<instance>~<id>`), and the outbox `reply` waits on
 `ag2-sparrow-hatch verify` prints one `PASS` or `FAIL` line each for the hook
 script, the hook definition, the config, the task dir, Sparrow itself, the
 reply command (the absolute path `install` recorded, still executable; `install`
-refuses to run when it finds none beside its Python or on `PATH`), the tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, exits non-zero on any
+refuses to run when it finds none beside its Python or on `PATH`), the tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, plus a `service`
+line: `PASS` when `ag2-sparrow.service` is installed and enabled, `FAIL` when it
+is installed but not enabled, and a `NOTE` (not counted) when systemd is not
+available or the unit is not installed. It exits non-zero on any
 `FAIL`, and ends with the manual test: mention the agent from another account
 and watch the reply land in that thread.
 
 ### Keeping Sparrow running
 
 The hook cannot start Sparrow, and a stopped Sparrow writes no task files.
-Where systemd is available, run Sparrow as a user service so it restarts after
-a crash or a reboot. Put this in `~/.config/systemd/user/ag2-sparrow.service`,
-with `ExecStart` set to the output of `command -v ag2-sparrow`:
+Where `systemctl --user` reaches a user manager, `install` runs Sparrow as a
+user service so it restarts after a crash or a reboot. It writes
+`~/.config/systemd/user/ag2-sparrow.service`:
 
 ```ini
+# Written by ag2-sparrow-hatch install; re-run install to update it.
 [Unit]
 Description=ag2-sparrow (AG2 Space listener)
+# A Sparrow that dies 5 times in 5 minutes (e.g. a rejected token) is left failed.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
-Environment=AG2_DEVICE_ENV=%h/.config/ag2-sparrow/relay.env
-ExecStart=%h/.local/bin/ag2-sparrow
-Restart=on-failure
+Environment=AG2_DEVICE_ENV=/home/you/.config/ag2-sparrow/relay.env
+Environment=AGENT_CONNECT_TASK_DIR=/home/you/.ag2-sparrow/task_dir
+Environment=AGENT_CONNECT_RESULT_DIR=/home/you/.ag2-sparrow/result_dir
+Environment=AGENT_CONNECT_STATE_DIR=/home/you/.ag2-sparrow/state
+ExecStart=/home/you/.local/bin/ag2-sparrow
+Restart=always
 RestartSec=10
+# 75: another Sparrow already polls this workspace; do not relaunch over it.
+RestartPreventExitStatus=75
 
 [Install]
 WantedBy=default.target
 ```
 
-Then run `systemctl --user daemon-reload && systemctl --user enable --now ag2-sparrow`,
-and `loginctl enable-linger "$USER"` so it runs while you are logged out. Run
-`install` and `verify` with the same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE`
-variables as the service, if it sets any.
+`ExecStart` is the `ag2-sparrow` beside `install`'s Python, else on `PATH`; the
+three directories are the ones `install` resolved for the hook, and a named
+`GATEWAY_INSTANCE` is added as one more `Environment=` line, so the service and
+the hook always agree. The token never goes in the unit: Sparrow reads it from
+the `.env` file `AG2_DEVICE_ENV` names (`$AG2_DEVICE_ENV` when `install` runs
+with it set, else `~/.config/ag2-sparrow/relay.env`). `Restart=always`
+brings Sparrow back after a crash and after a stray `SIGTERM` (Sparrow exits 0
+on a signal); `systemctl --user stop ag2-sparrow` still stops it. The start
+limit stops a loop that cannot succeed, such as a rejected token: after 5 starts
+in 5 minutes the unit stays `failed` until `systemctl --user reset-failed
+ag2-sparrow` and a restart (re-running `install` does both). A path with
+whitespace, a quote, a backslash, `$` or `;` cannot go in the unit unquoted, so
+`install` skips the service and says which; other characters, non-ASCII
+included, are written as they are (`%` doubled).
+
+Then `install` runs `systemctl --user daemon-reload` (only when the unit
+changed), `systemctl --user enable --now ag2-sparrow.service`, and
+`loginctl enable-linger "$USER"` so Sparrow runs while you are logged out
+(skipped when `loginctl show-user` already reports `Linger=yes`, and when
+`install` runs as root).
+Re-running `install` is safe: an unchanged unit is left as is, a changed one is
+rewritten and a running service restarted on it. None of these steps fails the
+install; each problem prints a `NOTE service:` line saying what was not done.
+Every `systemctl` and `loginctl` call runs with `--no-ask-password` and no
+stdin, so over SSH a polkit check fails at once instead of waiting for a
+password:
+
+- No systemd user manager (macOS, a container, no user bus): nothing is
+  written. Keep `ag2-sparrow` running another way.
+- Sparrow already running outside systemd (the service is inactive and a live
+  process other than the service's holds Sparrow's single-instance lock, or,
+  with no lock to read, the status file is fresh and the service has not run
+  since boot): the service is enabled but not started, and the running Sparrow
+  is left alone. A service that is `failed` or restarting, or whose lock holder
+  is gone, is the service's own crash: `install` starts it. To switch over, stop that process, then run
+  `systemctl --user start ag2-sparrow.service`. Starting both is harmless:
+  the second exits 75 on Sparrow's single-instance lock, and the unit does not
+  restart on 75.
+- The `.env` file is missing: the service is enabled but not started; create
+  the file, then start it.
+- Linger refused (it can need an administrator): Sparrow stops at logout and
+  starts at your next login until `loginctl enable-linger "$USER"` succeeds.
+- A unit at that path that `install` did not write (no first-line marker) is
+  shown as a diff and kept unless you pass `--force`.
+- The `.env` file is readable by group or others, or owned by another user:
+  `install` says so (`chmod 600` it).
+
+`ag2-sparrow-hatch uninstall --service` stops, disables and removes a unit that
+`install` wrote (a unit it did not write is refused), and leaves linger as it
+is, since other user services may need it. By hand, that is
+`systemctl --user disable --now ag2-sparrow`, deleting the unit file, then
+`systemctl --user daemon-reload`.
+
+Pass `--no-service` to skip all of this. Run `install` and `verify` with the
+same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE` variables as Sparrow.
 
 Sparrow rewrites `state/gateway-status.json` every poll. `verify` fails its
 `sparrow` check when that file is missing, not connected, or older than 3
@@ -317,8 +383,9 @@ when Sparrow is not running and 11 when it is running but not connected. The
 
 - Not running: the hook logs `ag2-sparrow-hatch sparrow down`, and the
   heartbeat wake carries `sparrow_down` and tells the worker to restart it
-  (`systemctl --user restart ag2-sparrow`, or start `ag2-sparrow` again as at
-  install).
+  (`systemctl --user reset-failed ag2-sparrow; systemctl --user restart
+  ag2-sparrow` under the service `install` set up, or start `ag2-sparrow` again
+  as at install).
 - Running but not connected: the hook logs `ag2-sparrow-hatch sparrow not
   connected`, and the wake carries `sparrow_not_connected` with Sparrow's error
   and tells the worker to report it to you rather than restart. A rejected

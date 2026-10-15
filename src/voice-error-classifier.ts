@@ -67,7 +67,7 @@ const PATTERNS: Array<{
 		rx: /is not found for API version|not supported for|\bmodels?\/\S+\s+(is\s+)?not\s+found|\b404\b|\bdeprecated\b/i,
 		category: 'model_not_found',
 		retryable: false,
-		userMessage: 'Voice is offline — configured Gemini voice model is unavailable. Update VOICE_NATIVE_AUDIO_MODEL in .env.',
+		userMessage: 'Voice is offline — configured Gemini voice model is unavailable. Change the model in config/voice-agent.json in the Sutando workspace, then restart Sutando.',
 		userActionUrl: 'https://ai.google.dev/gemini-api/docs/models',
 	},
 	{
