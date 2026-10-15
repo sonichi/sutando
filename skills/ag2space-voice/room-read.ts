@@ -249,7 +249,10 @@ export function roomIndexContextLines(index: RoomIndex): string[] {
 	return [`ROOMS: AG2 Space rooms you can read with read_room: ${names.join(' | ')}. A name the user says that is one of these exactly (ignoring case) is that room — never swap it for a similar one ("triage system" is not "Sutando Triage"). A room name you hear is often misheard: only when it is none of these exactly, pass the one of these it clearly is, spelled exactly like this; ask which only when none clearly is. When you read back an action, say the room\'s name as listed.`];
 }
 
-export interface RoomMessageLine { at: string; from: string; text: string; event_id?: string; reply?: boolean; thread?: boolean; in_thread_of?: string; reactions?: string[]; from_last?: number }
+export interface RoomMessageLine { at: string; from: string; text: string; event_id?: string; reply?: boolean; thread?: boolean; in_thread_of?: string; reactions?: string[]; from_last?: number; system?: boolean }
+
+/** The server's own notice prefix ("Agent Native: @chi changed @x access …"): the client shows it as a system row, not a message. */
+const SYSTEM_NOTICE_PREFIX = 'Agent Native: ';
 
 /** Server messages (newest first) → oldest-first lines a voice model can retell; `self` marks this agent's own reactions. */
 export function toMessageLines(messages: unknown[], tz?: string, self?: string | null): RoomMessageLine[] {
@@ -271,6 +274,7 @@ export function toMessageLines(messages: unknown[], tz?: string, self?: string |
 			...(typeof msg.event_id === 'string' && msg.event_id ? { event_id: msg.event_id } : {}),
 			...(msg.reply_to_event ? { reply: true } : {}),
 			...(msg.thread_root ? { thread: true, ...(typeof msg.thread_root === 'string' ? { in_thread_of: msg.thread_root } : {}) } : {}),
+			...(msg.body.startsWith(SYSTEM_NOTICE_PREFIX) ? { system: true } : {}),
 			...reactionsOf(msg.reactions, self),
 		});
 	}
@@ -297,7 +301,7 @@ export function latestInMainTimeline(messages: unknown[], limit: number): unknow
 	for (const m of messages) {
 		out.push(m);
 		const x = (m && typeof m === 'object' ? m : {}) as { body?: unknown; thread_root?: unknown };
-		if (!x.thread_root && typeof x.body === 'string' && x.body.trim() && ++main >= limit) break;
+		if (!x.thread_root && typeof x.body === 'string' && x.body.trim() && !x.body.startsWith(SYSTEM_NOTICE_PREFIX) && ++main >= limit) break;
 	}
 	return out;
 }
@@ -388,9 +392,12 @@ export async function readRoom(args: { room?: string; limit?: number; around?: s
 	// The main timeline as the user sees it, so "the latest" or "the second to last" counts there (live 2026-10-15
 	// 22:57: "the last but one message" was counted with thread replies and landed in a thread); thread replies apart.
 	// Positions numbered, not left to the model to count (live 22:57/23:06: "the last but one" landed 4th from last).
-	const main = messages.filter(m => !m.thread).map((m, i, all) => ({ ...m, from_last: all.length - i }));
+	// System rows are not messages to the user (live 23:18: "the third from last" landed on one): no position.
+	const main = messages.filter(m => !m.thread);
+	let pos = main.filter(m => !m.system).length;
+	for (const m of main) if (!m.system) m.from_last = pos--;
 	const threadReplies = messages.filter(m => m.thread);
-	const latest = main[main.length - 1];
+	const latest = main.find(m => m.from_last === 1);
 	return { ok: true, room: target.room.name, messages: main, ...(threadReplies.length ? { thread_replies: threadReplies } : {}), ...(latest ? { latest } : {}), ms: Date.now() - t0 };
 }
 
@@ -644,8 +651,8 @@ export function createReadRoomTool(deps: ReadRoomDeps): ToolDefinition {
 			'For what was said about a particular PR, topic or person — which may be far back — call search_room instead, then read_room with `around` = a hit\'s event_id to read the discussion around it. ' +
 			'A room\'s messages and who can read it change at any time: call read_room every time the user asks about a room, even if you answered about that room earlier or a task result said something about it — never answer from an earlier answer. ' +
 			'Pass `room` = the room name as spoken; leave it out for the room this session is in. ' +
-			'Returns {ok:true, room, messages:[{at, from, text, event_id, reactions, from_last}], thread_replies, latest} — answer from them in a sentence or two; do not read them all out. A message\'s event_id is what reply_to, a reaction or any other action on that message takes. ' +
-				'`messages` is the room\'s main timeline, oldest first, as the user sees it, each with from_last (1 = the latest, 2 = the second to last …): "the latest message" is from_last 1 (also `latest`), "the last but one" / "the second to last" is from_last 2 — never count the list yourself; "Chi\'s message" is found there too. `thread_replies` are replies inside threads (each with in_thread_of, its thread\'s root event_id), not in the main timeline: use them only when the user speaks of a thread. ' +
+			'Returns {ok:true, room, messages:[{at, from, text, event_id, reactions, from_last, system}], thread_replies, latest} — answer from them in a sentence or two; do not read them all out. A message\'s event_id is what reply_to, a reaction or any other action on that message takes. ' +
+				'`messages` is the room\'s main timeline, oldest first, as the user sees it, each message with from_last (1 = the latest, 2 = the second to last …): "the latest message" is from_last 1 (also `latest`), "the last but one" / "the second to last" is from_last 2, "the third from last" from_last 3 — never count the list yourself. A line with system:true is a system row the user does not see as a message: it has no from_last and is never what "the Nth message" means. "Chi\'s message" is found there too. `thread_replies` are replies inside threads (each with in_thread_of, its thread\'s root event_id), not in the main timeline: use them only when the user speaks of a thread. ' +
 				'`reactions` lists a message\'s reactions, "(you)" marking yours: if the user asks for one that is already yours, say it is already there and do not add it again. ' +
 			'Errors: "not_found" with rooms (every room you can read) — the name you passed is not one of them; room names are often misheard, so if one of rooms is clearly the room the user meant, call read_room again with that exact name, and ask which only when none clearly is; ' +
 			'"ambiguous" with candidates — ask which one; "no_room" — ask which room; "not_connected", "timeout" or "unavailable" — say you cannot read the room right now.',

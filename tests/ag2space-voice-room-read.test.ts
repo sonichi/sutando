@@ -731,6 +731,21 @@ describe('read_room lines carry each message\'s event_id and its time, whatever 
 		}
 	});
 
+	it('a system row ("Agent Native: …") gets no position: the third from last is the message before it (live 23:18)', async () => {
+		const client = { async callTool() { return { structuredContent: { result: { messages: [
+			{ sender: '@susan:x', body: '@dot hi', event_id: '$1', ts: 4 },
+			{ sender: '@chi:x', body: '@susan', event_id: '$2', ts: 3 },
+			{ sender: '@chi:x', body: 'Agent Native: @chi changed @dot access from Team to Guest.', event_id: '$sys', ts: 2 },
+			{ sender: '@chi:x', body: '> Point the ingestion at the new store.', event_id: '$3', ts: 1 },
+		] } } }; }, close() {} };
+		const r = await readRoom({ room: '!a:ag2.space', limit: 3 }, { client: () => client as never, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never);
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.deepEqual(r.messages.map(m => [m.event_id, m.from_last ?? null, m.system ?? false]), [['$3', 3, false], ['$sys', null, true], ['$2', 2, false], ['$1', 1, false]]);
+			assert.equal(r.latest?.event_id, '$1');
+		}
+	});
+
 	it('no reactions: no whoami call', async () => {
 		const calls: string[] = [];
 		const client = { async callTool(name: string) { calls.push(name); return { structuredContent: { result: { messages: [{ sender: '@a:x', body: 'hi', event_id: '$1', ts: 1 }] } } }; }, close() {} };
@@ -759,9 +774,10 @@ describe('read_room lines carry each message\'s event_id and its time, whatever 
 		const [line] = toMessageLines([{ sender: '@b:ag2.space', body: 'in a thread', event_id: '$t', ts: 1, thread_root: '$root' }]);
 		assert.equal(line.thread, true);
 		const d = createReadRoomTool({ client: () => null, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never).description;
-		assert.match(d, /`messages` is the room\'s main timeline, oldest first, as the user sees it, each with from_last/);
+		assert.match(d, /`messages` is the room\'s main timeline, oldest first, as the user sees it, each message with from_last/);
 		assert.match(d, /`thread_replies` are replies inside threads/);
-		assert.match(d, /"the last but one" \/ "the second to last" is from_last 2 — never count the list yourself/);
+		assert.match(d, /"the last but one" \/ "the second to last" is from_last 2, "the third from last" from_last 3 — never count the list yourself/);
+		assert.match(d, /system:true is a system row the user does not see as a message: it has no from_last/);
 	});
 
 	it('event_id kept; ts as a numeric string still gives a time', () => {
