@@ -32,8 +32,8 @@ caps this file and refuses date stamps in it).
 ## Per pass
 `WORKSPACE="$(bash scripts/sutando-config.sh workspace)"` once; quote every `"$WORKSPACE/..."` path.
 
-0. **Status.** `bash scripts/core-status.sh running "<what the owner is waiting on>"`; rewrite on every
-   pivot; `bash scripts/core-status.sh idle` at the end. Never `>` the JSON yourself.
+0. **Status.** `bash scripts/core-status.sh running "<work>"` on each pivot.
+   Finish with step 1’s idle command; never redirect the JSON.
 0.5. **Quota tier** (Claude core):
    `python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py | python3 skills/proactive-loop/scripts/quota-tier.py`
    → `TIER <FULL|MEDIUM|LIGHT|MINIMAL> (bound by …)`. Then
@@ -58,7 +58,7 @@ caps this file and refuses date stamps in it).
    When this core consumes a task itself, move `$WORKSPACE/tasks/<id>.txt` to
    `$WORKSPACE/tasks/archive/<id>.txt` after writing its result; bridges and the Windows dispatcher
    archive their own claims.
-   Before idle: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle`
+   Before idle: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle "" --loop-complete`
    (1 = a task got no result, so idle does not run).
 1.5. **Connect waits.** `python3 skills/connect-apps/scripts/connectors.py rearm` restarts the waiter of
    any pending connector wait that lost it; idempotent, and a failure never blocks the pass.

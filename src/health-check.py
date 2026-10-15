@@ -74,6 +74,10 @@ from sutando_platform import (  # noqa: E402
 )
 from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
+from loop_completion import completion_path, read_completion  # noqa: E402
+from cron_loop_policy import (  # noqa: E402
+    _cron_field_values, _cron_can_never_fire, _entry_marked_parked, main_loop_problem, core_loop_is_parked,
+)
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
 import pool_suspension  # noqa: E402
@@ -1088,11 +1092,14 @@ def check_cron_runner(
     workspace = Path(workspace_dir or WORKSPACE_DIR)
     host = host_label or _host_label()
     crons_file = workspace / "hosts" / host / "crons.json"
+    runtime = runtime or resolve_core_runtime(repo_root=REPO_DIR)
     name = "cron-runner"
     try:
         crons = json.loads(crons_file.read_text())
     except FileNotFoundError:
-        return {"name": name, "status": "ok", "detail": "no schedules configured"}
+        problem = main_loop_problem([], runtime)
+        return {"name": name, "status": "down" if problem else "ok",
+                "detail": problem or "no schedules configured"}
     except (OSError, json.JSONDecodeError) as exc:
         return {"name": name, "status": "fail", "detail": f"cannot read crons.json ({exc})"}
     if not isinstance(crons, list):
@@ -1118,6 +1125,9 @@ def check_cron_runner(
             "status": "down",
             "detail": f"{orphaned} configured schedule(s) have no durable Codex owner",
         }
+    problem = main_loop_problem(crons, runtime)
+    if problem:
+        return {"name": name, "status": "down", "detail": problem}
     if not launchd_count:
         return {"name": name, "status": "ok", "detail": "no launchd-owned schedules"}
 
@@ -1185,93 +1195,6 @@ def check_cron_runner(
         "detail": f"{launchd_count} durable schedule(s), state {int(age)}s old",
     }
 
-
-_MONTH_MAX_DAYS = {1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30,
-                   7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
-
-
-def _cron_field_values(field: str, lo: int, hi: int) -> "set[int] | None":
-    """Expand one numeric cron field to its value set, or None if not understood.
-
-    None means "do not reason about this expression" — every caller below treats
-    an unparseable field as schedulable, so a parser gap can never invent a
-    never-fires verdict.
-    """
-    out: "set[int]" = set()
-    for part in field.split(","):
-        part = part.strip()
-        if not part:
-            return None
-        step = 1
-        if "/" in part:
-            part, _, raw_step = part.partition("/")
-            if not raw_step.isdigit() or int(raw_step) < 1:
-                return None
-            step = int(raw_step)
-        if part in ("*", "?"):
-            start, end = lo, hi
-        elif "-" in part.lstrip("-"):
-            start_s, _, end_s = part.partition("-")
-            if not (start_s.isdigit() and end_s.isdigit()):
-                return None
-            start, end = int(start_s), int(end_s)
-        elif part.isdigit():
-            start = end = int(part)
-        else:
-            return None  # names (JAN/MON), L, W, # — not our business
-        if start > end or start < lo or end > hi:
-            return None
-        out.update(range(start, end + 1, step))
-    return out or None
-
-
-def _cron_can_never_fire(expr: str) -> bool:
-    """True only when a 5-field cron's day-of-month/month pair is impossible.
-
-    A deliberately-parked entry is the real case: this host carries
-    `wire-newsroom-nightly-DISABLED-...` at `0 0 31 2 *` — February 31st, which
-    is syntactically valid and can never occur. /schedule-crons cannot register
-    it, so it was counted as expected-but-missing and the session-crons guard
-    warned on every run, permanently. A guard that always warns is a guard
-    nobody reads, and this one exists to catch a SILENT failure (a peer
-    instance registered 2/18 with no error) — so a standing false positive
-    disables exactly the signal it was built to raise.
-
-    Deliberately conservative: day-of-week must be unrestricted, because cron
-    ORs day-of-month with day-of-week — `0 0 31 2 MON` still fires on Mondays.
-    Anything unparseable returns False (schedulable).
-    """
-    parts = expr.split()
-    if len(parts) != 5:
-        return False
-    _, _, dom_f, month_f, dow_f = parts
-    if dow_f.strip() not in ("*", "?"):
-        return False  # OR-semantics with day-of-week — it can still fire
-    doms = _cron_field_values(dom_f, 1, 31)
-    months = _cron_field_values(month_f, 1, 12)
-    if doms is None or months is None:
-        return False
-    return not any(d <= _MONTH_MAX_DAYS[m] for m in months for d in doms)
-
-
-def _entry_marked_parked(entry: dict) -> bool:
-    """True when the entry carries an explicit "deliberately disabled" signal.
-
-    An impossible date alone must NOT qualify. `0 0 31 2 *` is equally the
-    signature of a parked job and of an active typo — someone meaning "the 31st,
-    monthly" and writing February. Excluding on the date alone would let a
-    mistyped ACTIVE schedule vanish from `expected`, so CronCreate silently
-    omits it and this guard reports green forever: the precise silent-miss class
-    the check exists to surface.
-
-    Two accepted signals: an explicit `disabled: true` field, and the
-    established convention of DISABLED in the entry name (used by this host's
-    `wire-newsroom-nightly-DISABLED-2026-06-09-...`, which also records why).
-    """
-    if entry.get("disabled") is True:
-        return True
-    name = entry.get("name")
-    return isinstance(name, str) and "DISABLED" in name
 
 
 def check_session_cron_registration(
@@ -6643,31 +6566,11 @@ def check_memory() -> dict:
 # re-armed). Each check is a *consequence* signal that fires regardless of
 # which underlying mechanism died.
 
-def _state_in_use_age_h(state_dir: "Path") -> "float | None":
-    """Age of the OLDEST top-level file in state/, or None when unknowable.
-
-    Top level only: state/cores/ is synced across hosts, so a peer's file would
-    date a workspace this host created minutes ago.
-    """
-    try:
-        ages = [time.time() - p.stat().st_mtime
-                for p in state_dir.iterdir() if p.is_file()]
-    except OSError:
-        return None
-    return max(ages) / 3600 if ages else None
-
-
-def _stamper_age_h() -> "float | None":
-    """Hours since the marker-WRITING code was installed here, or None if it is
-    not installed at all.
-
-    A missing marker only indicts the loop once the code that writes it has been
-    present long enough for a pass to close. At merge that code is younger than
-    every existing workspace, so workspace age alone convicts every host.
-    """
+def _stamper_age_h() -> Optional[float]:
+    """Bound first-proof migration grace by installation of the explicit writer."""
     p = REPO_DIR / "scripts" / "core-status.sh"
     try:
-        if "last-loop-ok" not in p.read_text(encoding="utf-8", errors="replace"):
+        if "--loop-complete" not in p.read_text(encoding="utf-8", errors="replace"):
             return None
         return (time.time() - p.stat().st_mtime) / 3600
     except OSError:
@@ -6675,68 +6578,55 @@ def _stamper_age_h() -> "float | None":
 
 
 def check_cron_schedule() -> dict:
-    """Smoke detector for a session cron schedule that stopped firing.
-
-    CronCreate jobs expire 7 days after registration, and the mechanism that
-    would re-register them (/schedule-crons via /proactive-loop) is itself one of
-    the expiring crons, so nothing self-heals.
-
-    The signal is `state/last-loop-ok`, stamped by scripts/core-status.sh on
-    `idle`. Deliberately NOT core-status.json, which owner turns also refresh and
-    which would therefore stay fresh through any conversation — masking a dead
-    schedule exactly when someone is around to be misled.
-    """
+    """Detect absent or stale host-specific proof of a completed proactive pass."""
     name = "cron-schedule"
-    marker = Path(WORKSPACE_DIR) / "state" / "last-loop-ok"
+    workspace = Path(WORKSPACE_DIR)
+    host = _host_label()
+    try:
+        entries = json.loads((workspace / "hosts" / host / "crons.json").read_text())
+    except (OSError, ValueError):
+        entries = []
+    if isinstance(entries, list) and core_loop_is_parked(entries):
+        return {"name": name, "status": "ok", "detail": "core loop deliberately parked; completion not expected"}
 
     def _h(env_name: str, default: float) -> float:
         try:
-            return float(os.environ.get(env_name, str(default)))
+            value = float(os.environ.get(env_name, str(default)))
+            return value if 0 < value < float("inf") else default
         except ValueError:
             return default
 
     warn_h = _h("SUTANDO_CRON_STALE_WARN_H", 7.0)
-    fail_h = _h("SUTANDO_CRON_STALE_FAIL_H", 26.0)
-
-    try:
-        age_h = (time.time() - marker.stat().st_mtime) / 3600
-    except OSError:
-        # Absence has two opposite meanings: a genuinely fresh workspace, or a loop
-        # that NEVER STARTED — the deadlock above, which writes no marker at all.
-        in_use_h = _state_in_use_age_h(marker.parent)
-        stamper_h = _stamper_age_h()
-        if stamper_h is None:
-            # This build cannot stamp the marker, so its absence says nothing at all.
-            return {"name": name, "status": "ok",
-                    "detail": "no loop marker, and this build does not stamp one"}
-        if stamper_h <= warn_h:
-            # A writer younger than the warn band cannot have had a pass close since
-            # it arrived, so its absence is explained without indicting the loop.
-            return {"name": name, "status": "ok",
-                    "detail": (f"no loop marker yet, but the stamping code is only "
-                               f"{stamper_h:.1f}h old (<{warn_h:.0f}h) — no pass has had "
-                               f"time to close since it was installed")}
-        if in_use_h is not None and in_use_h > warn_h:
+    fail_h = max(warn_h, _h("SUTANDO_CRON_STALE_FAIL_H", 26.0))
+    completed_at = read_completion(workspace, host)
+    if completed_at is None:
+        if completion_path(workspace, host).exists():
             return {"name": name, "status": "warn",
-                    "detail": (f"no loop marker in the {stamper_h:.1f}h since the stamping code "
-                               f"was installed, and state/ has been written for {in_use_h:.1f}h "
-                               f"(>{warn_h:.0f}h) — a pass should have closed by now, so the loop "
-                               f"may never have STARTED. Check CronList against crons.json")}
-        # Nothing rules out "fresh", and a missing marker must never be louder
-        # than a stale one.
-        return {"name": name, "status": "ok",
-                "detail": "no loop marker yet (fresh install, or no pass closed since restore)"}
+                    "detail": f"invalid or unreadable loop completion record for {host}"}
+        stamper_h = _stamper_age_h()
+        if stamper_h is not None and 0 <= stamper_h <= warn_h:
+            return {"name": name, "status": "ok",
+                    "detail": (f"awaiting first loop completion for {host}; writer installed "
+                               f"{stamper_h:.1f}h ago (grace <= {warn_h:.0f}h)")}
+        return {"name": name, "status": "warn",
+                "detail": (f"no loop completion proof for {host}; the loop may never have STARTED. "
+                           "Check the configured driver and complete one proactive pass")}
 
+    age_h = (time.time() - completed_at) / 3600
+    if age_h < 0:
+        return {"name": name, "status": "warn",
+                "detail": f"loop completion for {host} is future-dated; cannot verify liveness"}
     if age_h > fail_h:
         return {"name": name, "status": "fail",
-                "detail": (f"no proactive-loop pass has closed in {age_h:.1f}h (>{fail_h:.0f}h) — the model "
-                           f"cron schedule is almost certainly dead. CronCreate jobs expire after 7d; "
-                           f"re-register from hosts/<host>/crons.json via /schedule-crons")}
+                "detail": (f"no proactive-loop pass has closed for {host} in {age_h:.1f}h "
+                           f"(>{fail_h:.0f}h). Check the configured driver; Claude CronCreate "
+                           "jobs expire after 7d")}
     if age_h > warn_h:
         return {"name": name, "status": "warn",
-                "detail": (f"no proactive-loop pass has closed in {age_h:.1f}h (>{warn_h:.0f}h). "
-                           f"Check CronList against crons.json")}
-    return {"name": name, "status": "ok", "detail": f"last loop pass closed {age_h:.1f}h ago"}
+                "detail": (f"no proactive-loop pass has closed for {host} in {age_h:.1f}h "
+                           f"(>{warn_h:.0f}h). Check the configured driver")}
+    return {"name": name, "status": "ok",
+            "detail": f"last loop pass for {host} closed {age_h:.1f}h ago"}
 
 
 def check_core_proactive_loop(threshold_sec: int = 600) -> dict:

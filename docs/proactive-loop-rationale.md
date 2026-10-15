@@ -1,5 +1,41 @@
 # Proactive loop — rationale and measurements
 
+## Completion and missing-driver health
+
+A completed pass publishes `state/loop-completions/<host>.json` through
+the core `loop_completion` module. This host-scoped record contains `version: 1`, `host`,
+and a finite, nonnegative Unix `completed_at` timestamp. The writer locks and
+atomically replaces the record, preserving the newest completion under concurrent
+writers. Ordinary `core-status.sh idle` only records work status. A proactive
+pass finishes with `core-status.sh idle "" --loop-complete`; the durable Codex
+scheduler also records completion when it finds the scheduled pass's result,
+using its publication mtime (capped at observation time). A delayed result cannot
+renew proof to the later polling time; foreign-host scheduler state is discarded.
+Enqueueing a task, a scheduler heartbeat, and completing an unrelated task are
+not proof that a proactive pass finished.
+
+The `cron-schedule` health probe reads only this host's record. It warns after
+7 hours without completion and fails after 26 hours. Existing
+`SUTANDO_CRON_STALE_WARN_H` and `SUTANDO_CRON_STALE_FAIL_H` overrides remain
+supported. Missing first proof has a bounded grace period after installation of
+the explicit writer; the health detail says it is awaiting proof. Once that
+period expires, absence warns even if ordinary conversations continue. Invalid,
+unreadable, or future-dated proof warns immediately. The legacy shared
+`state/last-loop-ok` marker and peer-host records cannot establish liveness.
+
+For a Codex core, `cron-runner` and the scheduler's `health` command also require
+one canonical core-owned `main-loop` / `prompt_skill: proactive-loop` entry in the
+host's `crons.json`; an hourly-only config or worker-owned loop cannot satisfy
+that requirement. Shared policy lives in the core `cron_loop_policy` module. An explicit
+disabled marker plus a proven impossible cron date is deliberate parking and
+exempts completion health. A disabled marker alone does not stop a schedulable
+entry. Autonomy pause and self-development settings do not exempt the health
+pass. These checks diagnose missing configuration; they do not recreate a driver
+or modify the host's schedules.
+
+The archived rationale below predates this completion contract where it refers
+to ordinary `idle` as the final pass command.
+
 Every paragraph below is the verbatim text that lived in `skills/proactive-loop/SKILL.md` until
 it was reduced to commands (sonichi/sutando PR: commands, not lessons). The skill now names a step
 number; the matching section here carries the measurement, the incident and the reasoning. This

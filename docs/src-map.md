@@ -66,6 +66,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`credential_resolver.py`** — Credential resolver — capability, not key (G8, desktop-parity plan).
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`cron_entry_digest.py`** — Stable per-entry digests for `crons.json`, so config drift is DETECTABLE.
+- **`cron_loop_policy.py`** — Core loop identity and deliberate parking shared by schedule adapters.
 - **`cron_ownership.py`** — Which crons.json entries a given session may register.
 - **`cron_task_id.py`** — Canonical naming contract for a cron job's task id and result filename.
 - **`current_track.py`** — The one writer for a host's current-track.md: append and rotate share a lock.
@@ -117,6 +118,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
+- **`loop_completion.py`** — Host-specific proof that a proactive-loop pass completed.
 - **`meeting-dictation.ts`** — Meeting mode on bodhi's dictation (transcription) mode: while a meeting runs the voice model is quiesced, each final transcript line is appended to the day's meeting note, and an exit phrase returns the session to agent mode.
 - **`meeting-input-hold.ts`** — In meeting mode bodhi runs the session in transcription mode: the voice model must not speak.
 - **`meeting-tools.ts`** — Meeting tools — Google Meet, phone call, and meeting ID lookup.
