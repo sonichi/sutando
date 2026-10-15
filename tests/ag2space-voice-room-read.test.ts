@@ -543,7 +543,9 @@ describe('write_page: a spoken note into a room\'s Commons, after the user\'s ye
 		const failed = fake(() => ({ structuredContent: { status: 'failed' } }));
 		assert.deepEqual(await writePage({ room: '!a:x', title: 't', text: 'n' }, deps(failed.client, [])), { ok: false, error: 'failed' });
 		const slow = fake(() => new Error('tools/call timed out after 15000ms'));
-		assert.deepEqual(await writePage({ room: '!a:x', title: 't', text: 'n' }, deps(slow.client, [])), { ok: false, error: 'timeout' });
+		const unknown = await writePage({ room: '!a:x', title: 't', text: 'n' }, deps(slow.client, []));
+		assert.equal(unknown.ok, false);
+		assert.equal((unknown as { error: string }).error, 'outcome_unknown');
 		assert.equal(slow.calls.length, 1);
 	});
 

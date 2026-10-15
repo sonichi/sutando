@@ -5,7 +5,7 @@
  * a read runs through room.action.read, a change through room.action.execute, high risk or an
  * outside effect is refused before anything runs; every failure is an answer, never a throw.
  */
-import { describe, it, test } from 'node:test';
+import { describe, it, test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -16,9 +16,9 @@ if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => 
 
 if (PRESENT) {
 const {
-	voicePolicy, findActions, describeAction, runAction, compactResult,
+	voicePolicy, findActions, describeAction, runAction, compactResult, canonicalJson, resetPendingConfirmations,
 	createFindActionsTool, createDescribeActionTool, createRunActionTool,
-	ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, ACTION_RESULT_MAX_CHARS,
+	ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, ACTION_RESULT_MAX_CHARS, CONFIRM_MIN_AGE_MS, CONFIRM_TTL_MS,
 } = await import('../skills/ag2space-voice/room-actions.ts');
 
 type Call = { name: string; args: Record<string, unknown> };
@@ -44,6 +44,14 @@ describe('the policy comes from the effect and risk the server declares', () => 
 		assert.equal(voicePolicy('zero_effect', 'critical'), 'no');
 		assert.equal(voicePolicy('external_effect', 'low'), 'no');
 		assert.equal(voicePolicy(undefined, undefined), 'no');
+	});
+
+	it('a missing, new or differently spelled risk is refused, like an unknown effect', () => {
+		for (const risk of [undefined, null, '', 'severe', 'HIGH', 'Low', 'unknown']) {
+			assert.equal(voicePolicy('mutation', risk), 'no', String(risk));
+			assert.equal(voicePolicy('zero_effect', risk), 'no', String(risk));
+		}
+		assert.equal(voicePolicy('weird', 'low'), 'no');
 	});
 });
 
@@ -109,15 +117,11 @@ describe('run_room_action: the server\'s description decides, before anything ru
 		if (r.ok) assert.deepEqual(r.result, { done: 'room.action.read' });
 	});
 
-	it('a change runs through room.action.execute with a fresh operation_id', async () => {
-		const f = fake(describeAs('mutation', 'medium'));
-		const r = await runAction({ action: 'room.commons.comments.resolve', arguments_json: '{"root_event_id":"$a"}', room: '!r:ag2.space' }, f.deps);
-		assert.deepEqual(f.calls.map(c => c.name), ['room.actions.describe', 'room.action.execute']);
-		assert.equal(typeof f.calls[1].args.operation_id, 'string');
-		assert.equal(f.calls[1].args.room_id, '!r:ag2.space');
-		assert.ok(r.ok);
+	it('a read passes the revision it checked', async () => {
+		const f = fake((n) => n === 'room.actions.describe' ? ok({ effect: 'zero_effect', risk: 'low', action_revision: 'sha256:r1' }) : ok({ result: {} }));
+		await runAction({ action: 'room.members.list' }, f.deps);
+		assert.equal(f.calls[1].args.expected_action_revision, 'sha256:r1');
 	});
-
 	it('an account action targets the account', async () => {
 		const f = fake(describeAs('zero_effect', 'low'));
 		const r = await runAction({ action: 'room.invites.list', scope: 'account' }, f.deps);
@@ -143,8 +147,6 @@ describe('run_room_action: the server\'s description decides, before anything ru
 		assert.deepEqual(await runAction({ action: 'x' }, { ...f.deps, client: () => null }), { ok: false, error: 'not_connected' });
 		assert.equal(f.calls.length, 0);
 		assert.deepEqual(await runAction({ action: 'x' }, fake(() => err('NOT_FOUND')).deps), { ok: false, error: 'NOT_FOUND' });
-		const approval = fake((n) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'low' }) : ok({ status: 'pending_approval', approval_id: 'ap1' }));
-		assert.deepEqual(await runAction({ action: 'x' }, approval.deps), { ok: false, error: 'needs_approval' });
 		const noRoom = fake(describeAs('zero_effect', 'low'));
 		assert.deepEqual(await runAction({ action: 'x' }, { ...noRoom.deps, currentRoom: () => null }), { ok: false, error: 'no_room' });
 	});
@@ -154,6 +156,130 @@ describe('run_room_action: the server\'s description decides, before anything ru
 		const long = compactResult({ text: 'x'.repeat(ACTION_RESULT_MAX_CHARS * 2) });
 		assert.equal(typeof long, 'string');
 		assert.equal((long as string).length, ACTION_RESULT_MAX_CHARS + 1);
+	});
+});
+
+describe('a change runs only on a confirmation token bound to what was confirmed', () => {
+	let t = 1_000_000;
+	const now = () => t;
+	beforeEach(() => { resetPendingConfirmations(); t = 1_000_000; });
+	const change = (exec: (a: Record<string, unknown>) => unknown = () => ok({ status: 'completed', result: { resolved: true } }), extra: Record<string, unknown> = {}) =>
+		fake((n, a) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'medium', title: 'Resolve a comment thread', action_revision: 'sha256:r1', idempotency_requirement: 'required', ...extra }) : exec(a));
+	const RUN = { action: 'room.commons.comments.resolve', arguments_json: '{"root_event_id":"$a"}', room: '!r:ag2.space' };
+	const first = async (f: ReturnType<typeof change>) => {
+		const r = await runAction(RUN, f.deps, now);
+		assert.equal(r.ok, false);
+		assert.equal((r as { error: string }).error, 'needs_confirmation');
+		return r as { confirm_token: string; will_do: { action: string; title: string; room: string | null; arguments: Record<string, unknown> } };
+	};
+
+	it('the first call runs nothing and hands back what it will do, with a token', async () => {
+		const f = change();
+		const r = await first(f);
+		assert.deepEqual(f.calls.map(c => c.name), ['room.actions.describe']);
+		assert.match(r.confirm_token, /^[0-9a-f]{12}$/);
+		assert.deepEqual(r.will_do, { action: RUN.action, title: 'Resolve a comment thread', room: '!r:ag2.space', arguments: { root_event_id: '$a' } });
+	});
+
+	it('the same call with the token, after a read-back\'s worth of time, runs once with the checked revision', async () => {
+		const f = change();
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		const r = await runAction({ ...RUN, arguments_json: '{ "root_event_id" : "$a" }', confirm_token }, f.deps, now);
+		assert.ok(r.ok);
+		const ex = f.calls.filter(c => c.name === 'room.action.execute');
+		assert.equal(ex.length, 1);
+		assert.equal(ex[0].args.expected_action_revision, 'sha256:r1');
+		assert.equal(typeof ex[0].args.operation_id, 'string');
+		t += 1000;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_expired' });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 1);
+	});
+
+	it('a token used at once was not confirmed by anyone: refused, and still usable after the read-back', async () => {
+		const f = change();
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS - 1;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_too_soon' });
+		t += 1;
+		assert.ok((await runAction({ ...RUN, confirm_token }, f.deps, now)).ok);
+	});
+
+	it('other arguments, another room or another action with the token are refused, and the token is spent', async () => {
+		for (const other of [{ arguments_json: '{"root_event_id":"$b"}' }, { room: '!other:ag2.space' }, { action: 'room.commons.comments.reopen' }]) {
+			resetPendingConfirmations();
+			const f = change();
+			const { confirm_token } = await first(f);
+			t += CONFIRM_MIN_AGE_MS;
+			assert.deepEqual(await runAction({ ...RUN, ...other, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_mismatch' });
+			assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_expired' });
+			assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+		}
+	});
+
+	it('a made-up or stale token runs nothing', async () => {
+		const f = change();
+		assert.deepEqual(await runAction({ ...RUN, confirm_token: 'abcabcabcabc' }, f.deps, now), { ok: false, error: 'confirmation_expired' });
+		const { confirm_token } = await first(f);
+		t += CONFIRM_TTL_MS + 1;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_expired' });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+	});
+
+	it('an action updated since the yes is refused', async () => {
+		let rev = 'sha256:r1';
+		const f = fake((n) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'low', action_revision: rev }) : ok({ status: 'completed', result: {} }));
+		const { confirm_token } = await first(f as never);
+		rev = 'sha256:r2';
+		t += CONFIRM_MIN_AGE_MS;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'action_changed' });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+	});
+
+	it('an unknown outcome keeps the token; a retry reuses the operation_id, so it cannot run twice', async () => {
+		let n = 0;
+		const f = change(() => (++n === 1 ? { isError: true, structuredContent: { code: 'ACTION_OUTCOME_UNKNOWN' } } : ok({ status: 'completed', result: {} })));
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		const r1 = await runAction({ ...RUN, confirm_token }, f.deps, now);
+		assert.equal((r1 as { error: string }).error, 'outcome_unknown');
+		const r2 = await runAction({ ...RUN, confirm_token }, f.deps, now);
+		assert.ok(r2.ok);
+		const ops = f.calls.filter(c => c.name === 'room.action.execute').map(c => c.args.operation_id);
+		assert.equal(ops.length, 2);
+		assert.equal(ops[0], ops[1]);
+		assert.equal((r1 as { operation_id?: string }).operation_id, ops[0]);
+	});
+
+	it('a timeout after the call was sent is an unknown outcome too; without server dedup the token is spent', async () => {
+		const f = change(() => new Error('tools/call timed out after 15000ms'), { idempotency_requirement: 'none' });
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		assert.equal(((await runAction({ ...RUN, confirm_token }, f.deps, now)) as { error: string }).error, 'outcome_unknown');
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_expired' });
+	});
+
+	it('an approval the room requires is said, and the token is spent', async () => {
+		const f = change(() => ok({ status: 'pending_approval', approval_id: 'ap1' }));
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'needs_approval' });
+	});
+
+	it('the arguments are bound whatever their key order', () => {
+		assert.equal(canonicalJson({ b: 1, a: [{ d: 2, c: 3 }] }), canonicalJson({ a: [{ c: 3, d: 2 }], b: 1 }));
+		assert.notEqual(canonicalJson({ a: 1 }), canonicalJson({ a: '1' }));
+	});
+});
+
+describe('the description fails closed: nothing runs when the server cannot describe the action', () => {
+	it('an error, a timeout, NOT_FOUND or an empty answer from describe runs nothing', async () => {
+		for (const d of [err('NOT_FOUND'), err('INTERNAL'), new Error('tools/call timed out after 6000ms'), new Error('boom'), {}]) {
+			const f = fake((n) => n === 'room.actions.describe' ? d : ok({ status: 'completed', result: {} }));
+			const r = await runAction({ action: 'room.commons.comments.resolve', arguments_json: '{"root_event_id":"$a"}' }, f.deps);
+			assert.equal(r.ok, false);
+			assert.deepEqual(f.calls.map(c => c.name), ['room.actions.describe']);
+		}
 	});
 });
 
