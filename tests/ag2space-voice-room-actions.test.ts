@@ -179,6 +179,9 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		assert.deepEqual(f.calls.map(c => c.name), ['room.actions.describe']);
 		assert.match(r.confirm_token, /^[0-9a-f]{12}$/);
 		assert.deepEqual(r.will_do, { action: RUN.action, title: 'Resolve a comment thread', room: '!r:ag2.space', arguments: { root_event_id: '$a' } });
+		// Live 2026-10-15 20:38: after the yes the model said "added" without the second call.
+		assert.equal((r as unknown as { done: boolean }).done, false);
+		assert.match((r as unknown as { next: string }).next, /until that call returns ok:true, do not say it is done/);
 	});
 
 	it('the same call with the token, after a read-back\'s worth of time, runs once with the checked revision', async () => {

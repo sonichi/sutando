@@ -684,6 +684,13 @@ describe('send_message: a message in a room\'s chat, as the agent, after the use
 });
 
 describe('read_room lines carry each message\'s event_id and its time, whatever type ts comes in', () => {
+	it('a thread reply is marked, and the description says the latest message is the latest outside threads', () => {
+		const [line] = toMessageLines([{ sender: '@b:ag2.space', body: 'in a thread', event_id: '$t', ts: 1, thread_root: '$root' }]);
+		assert.equal(line.thread, true);
+		const d = createReadRoomTool({ client: () => null, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never).description;
+		assert.match(d, /"the latest message" in a room is the latest one without thread:true/);
+	});
+
 	it('event_id kept; ts as a numeric string still gives a time', () => {
 		const lines = toMessageLines([
 			{ sender: '@yixuan-desktop.agent:ag2.space', body: 'latest', event_id: '$new', ts: '1792047886394' },

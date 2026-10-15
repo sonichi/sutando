@@ -332,7 +332,7 @@ export async function readRoom(args: { room?: string; limit?: number; around?: s
 	const target = await targetRoom(args.room, deps);
 	if (!target.ok) return target;
 	const around = (args.around ?? '').trim();
-	const read = await roomRead(client, target.room, 'room.context.read', { limit, ...(around ? { around_event_id: around } : {}) }, deps);
+	const read = await roomRead(client, target.room, 'room.context.read', { limit, ...(around ? { around_event_id: around } : {}) }, deps, ROOM_COMMONS_TIMEOUT_MS);
 	if (!read.ok) return read;
 	const messages = toMessageLines(Array.isArray(read.result.messages) ? read.result.messages : []);
 	return { ok: true, room: target.room.name, messages, ms: Date.now() - t0 };
@@ -588,7 +588,8 @@ export function createReadRoomTool(deps: ReadRoomDeps): ToolDefinition {
 			'For what was said about a particular PR, topic or person — which may be far back — call search_room instead, then read_room with `around` = a hit\'s event_id to read the discussion around it. ' +
 			'A room\'s messages and who can read it change at any time: call read_room every time the user asks about a room, even if you answered about that room earlier or a task result said something about it — never answer from an earlier answer. ' +
 			'Pass `room` = the room name as spoken; leave it out for the room this session is in. ' +
-			'Returns {ok:true, room, messages:[{at, from, text, event_id}]} oldest first, the last one the latest — answer from them in a sentence or two; do not read them all out. A message\'s event_id is what reply_to, a reaction or any other action on that message takes. ' +
+			'Returns {ok:true, room, messages:[{at, from, text, event_id, thread}]} oldest first — answer from them in a sentence or two; do not read them all out. A message\'s event_id is what reply_to, a reaction or any other action on that message takes. ' +
+				'thread:true marks a reply inside a thread, not shown in the room\'s main timeline: "the latest message" in a room is the latest one without thread:true, unless the user names the thread. ' +
 			'Errors: "not_found" with rooms (every room you can read) — the name you passed is not one of them; room names are often misheard, so if one of rooms is clearly the room the user meant, call read_room again with that exact name, and ask which only when none clearly is; ' +
 			'"ambiguous" with candidates — ask which one; "no_room" — ask which room; "not_connected", "timeout" or "unavailable" — say you cannot read the room right now.',
 		parameters: z.object({

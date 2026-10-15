@@ -111,7 +111,7 @@ export async function describeAction(args: { action: string; room?: string; scop
 
 export type RunActionResult =
 	| { ok: true; action: string; room: string | null; result: unknown; ms: number }
-	| { ok: false; error: 'needs_confirmation'; confirm_token: string; will_do: { action: string; title: string; room: string | null; arguments: Record<string, unknown> } }
+	| { ok: false; error: 'needs_confirmation'; done: false; next: string; confirm_token: string; will_do: { action: string; title: string; room: string | null; arguments: Record<string, unknown> } }
 	| { ok: false; error: string; operation_id?: string; candidates?: string[]; rooms?: string[] };
 
 /** A result the model can read: as is when short, else its JSON cut to ACTION_RESULT_MAX_CHARS. */
@@ -126,6 +126,9 @@ export function canonicalJson(v: unknown): string {
 	if (v && typeof v === 'object') return `{${Object.keys(v as object).sort().map(k => `${JSON.stringify(k)}:${canonicalJson((v as Record<string, unknown>)[k])}`).join(',')}}`;
 	return JSON.stringify(v ?? null);
 }
+
+/** Said in the answer itself, where the model reads it: after the yes, the token goes back in a call, and only ok:true is done. */
+export const NEEDS_CONFIRMATION_NEXT = 'Nothing has been done yet. Say will_do back to the user and wait. When they say yes, call run_room_action again with the same action, room and arguments_json plus this confirm_token; until that call returns ok:true, do not say it is done.';
 
 interface Pending { key: string; issued: number; spoken: number; revision: string | null; operationId: string; retryable: boolean }
 const pending = new Map<string, Pending>();
@@ -184,7 +187,7 @@ export async function runAction(args: { action: string; room?: string; scope?: s
 		const at = now();
 		if (!token) {
 			const confirm_token = issueToken({ key, spoken: spoken ?? 0, revision, operationId: randomUUID(), retryable: d.ok && d.d.idempotency_requirement === 'required' }, at);
-			return { answer: { ok: false, error: 'needs_confirmation', confirm_token, will_do: { action, title: cut(d.ok ? d.d.title : '', 80), room: target.ok ? target.room?.name ?? null : null, arguments: callArgs } } };
+			return { answer: { ok: false, error: 'needs_confirmation', done: false, next: NEEDS_CONFIRMATION_NEXT, confirm_token, will_do: { action, title: cut(d.ok ? d.d.title : '', 80), room: target.ok ? target.room?.name ?? null : null, arguments: callArgs } } };
 		}
 		const p = pending.get(token);
 		if (!p || at - p.issued > CONFIRM_TTL_MS) { pending.delete(token); return { ok: false, error: 'confirmation_expired' }; }
