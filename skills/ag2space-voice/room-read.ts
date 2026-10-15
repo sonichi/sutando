@@ -20,6 +20,8 @@ export const AG2_MCP_SERVER_NAME = 'ag2-space';
 export const ROOM_READ_CALL_TIMEOUT_MS = 6_000;
 export const ROOM_READ_DEFAULT_LIMIT = 15;
 export const ROOM_READ_MAX_LIMIT = 40;
+/** Thread replies are interleaved with the main timeline; reading this many lets `limit` main messages through. */
+export const ROOM_READ_FETCH_MAX = 200;
 /** room.events.search: full-text over the room's messages, newest first; the server caps a page at 50. */
 export const ROOM_SEARCH_DEFAULT_LIMIT = 10;
 export const ROOM_SEARCH_MAX_LIMIT = 50;
@@ -274,6 +276,18 @@ export function toMessageLines(messages: unknown[], tz?: string): RoomMessageLin
 	return out.reverse();
 }
 
+/** Server messages (newest first) up to and including the `limit`-th main-timeline message with a body; thread replies kept. */
+export function latestInMainTimeline(messages: unknown[], limit: number): unknown[] {
+	const out: unknown[] = [];
+	let main = 0;
+	for (const m of messages) {
+		out.push(m);
+		const x = (m && typeof m === 'object' ? m : {}) as { body?: unknown; thread_root?: unknown };
+		if (!x.thread_root && typeof x.body === 'string' && x.body.trim() && ++main >= limit) break;
+	}
+	return out;
+}
+
 export interface ReadRoomDeps {
 	client: () => McpClient | null;
 	currentRoom: () => VoiceSessionRoom | null;
@@ -332,9 +346,13 @@ export async function readRoom(args: { room?: string; limit?: number; around?: s
 	const target = await targetRoom(args.room, deps);
 	if (!target.ok) return target;
 	const around = (args.around ?? '').trim();
-	const read = await roomRead(client, target.room, 'room.context.read', { limit, ...(around ? { around_event_id: around } : {}) }, deps, ROOM_COMMONS_TIMEOUT_MS);
+	// The latest messages: enough for `limit` in the main timeline, with the thread replies between them (live
+	// 2026-10-15 20:45: with limit 1 the only line was a thread reply, and the reaction went there).
+	const fetch = around ? limit : Math.min(ROOM_READ_FETCH_MAX, limit * 4 + 20);
+	const read = await roomRead(client, target.room, 'room.context.read', { limit: fetch, ...(around ? { around_event_id: around } : {}) }, deps, ROOM_COMMONS_TIMEOUT_MS);
 	if (!read.ok) return read;
-	const messages = toMessageLines(Array.isArray(read.result.messages) ? read.result.messages : []);
+	const raw = Array.isArray(read.result.messages) ? read.result.messages : [];
+	const messages = toMessageLines(around ? raw : latestInMainTimeline(raw, limit));
 	return { ok: true, room: target.room.name, messages, ms: Date.now() - t0 };
 }
 

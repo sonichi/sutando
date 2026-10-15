@@ -273,7 +273,10 @@ export function createRunActionTool(deps: ReadRoomDeps): ToolDefinition {
 		async execute(args) {
 			const a = (args ?? {}) as { action: string; arguments_json?: string; room?: string; scope?: string; confirm_token?: string };
 			const r = await runAction(a, deps);
-			deps.log?.(`[RoomActions] run ${a.action} → ${r.ok ? `done in ${r.ms}ms` : r.error}`);
+			// Which message it acted on, by id only (never arguments' text): what a wrong target is traced by.
+			let onEvent = '';
+			try { const e = (JSON.parse(a.arguments_json || '{}') as { event_id?: unknown }).event_id; if (typeof e === 'string') onEvent = ` on ${e}`; } catch { /* not JSON */ }
+			deps.log?.(`[RoomActions] run ${a.action}${onEvent} → ${r.ok ? `done in ${r.ms}ms` : r.error}`);
 			return r;
 		},
 	};

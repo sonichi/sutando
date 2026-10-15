@@ -240,7 +240,8 @@ describe('readRoom: every outcome is something the model can say', () => {
 		assert.equal(r.ok, true);
 		assert.equal(r.room, 'Sutando Triage');
 		assert.deepEqual(r.messages.map((m: { text: string }) => m.text), ['Approved #5453.']);
-		assert.deepEqual(f.calls, [{ name: 'room.action.read', args: { room_id: '!a:ag2.space', action: 'room.context.read', arguments: { limit: ROOM_READ_DEFAULT_LIMIT } } }]);
+		// Read past interleaved thread replies: 4× the limit plus 20, then cut to the limit in the main timeline.
+		assert.deepEqual(f.calls, [{ name: 'room.action.read', args: { room_id: '!a:ag2.space', action: 'room.context.read', arguments: { limit: ROOM_READ_DEFAULT_LIMIT * 4 + 20 } } }]);
 	});
 
 	it('a name not in the index refreshes it once: a newly joined room is read; a miss lists every room', async () => {
@@ -267,7 +268,7 @@ describe('readRoom: every outcome is something the model can say', () => {
 		const f = fake(() => read([]));
 		await readRoom({ room: '!cAAaogVSFcIYaNmohw:ag2.space', limit: 500 }, { client: () => f.client, currentRoom: () => null, index: idx([], f.client) });
 		assert.equal(f.calls.length, 1, 'no room.list for an id');
-		assert.equal((f.calls[0].args.arguments as { limit: number }).limit, 40);
+		assert.equal((f.calls[0].args.arguments as { limit: number }).limit, 40 * 4 + 20);
 	});
 
 	it('ambiguous comes back with the candidates; a miss on an empty index is not_found with no rooms', async () => {
@@ -300,7 +301,7 @@ describe('readRoom: every outcome is something the model can say', () => {
 		assert.equal(r.ok, true);
 		assert.deepEqual(f.calls[0].args.arguments, { limit: 10, around_event_id: '$hit' });
 		await readRoom({ room: 'Sutando Triage', around: '  ' }, { client: () => f.client, currentRoom: () => null, index });
-		assert.deepEqual(f.calls[1].args.arguments, { limit: ROOM_READ_DEFAULT_LIMIT }, 'a blank around is no around');
+		assert.deepEqual(f.calls[1].args.arguments, { limit: ROOM_READ_DEFAULT_LIMIT * 4 + 20 }, 'a blank around is no around');
 	});
 
 	it('the tool is inline and returns readRoom\'s answer', async () => {
@@ -684,6 +685,18 @@ describe('send_message: a message in a room\'s chat, as the agent, after the use
 });
 
 describe('read_room lines carry each message\'s event_id and its time, whatever type ts comes in', () => {
+	it('the latest read reaches the main timeline past newer thread replies', async () => {
+		const { latestInMainTimeline } = await import('../skills/ag2space-voice/room-read.ts');
+		const raw = [
+			{ body: 'thread reply', event_id: '$t1', thread_root: '$r' },
+			{ body: 'another', event_id: '$t2', thread_root: '$r' },
+			{ body: 'main latest', event_id: '$m1' },
+			{ body: 'main earlier', event_id: '$m2' },
+		];
+		assert.deepEqual((latestInMainTimeline(raw, 1) as Array<{ event_id: string }>).map(m => m.event_id), ['$t1', '$t2', '$m1']);
+		assert.deepEqual((latestInMainTimeline(raw, 5) as Array<{ event_id: string }>).map(m => m.event_id), ['$t1', '$t2', '$m1', '$m2']);
+	});
+
 	it('a thread reply is marked, and the description says the latest message is the latest outside threads', () => {
 		const [line] = toMessageLines([{ sender: '@b:ag2.space', body: 'in a thread', event_id: '$t', ts: 1, thread_root: '$root' }]);
 		assert.equal(line.thread, true);
