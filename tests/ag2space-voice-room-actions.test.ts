@@ -412,6 +412,15 @@ describe('the tools as the voice model sees them', () => {
 		}
 	});
 
+	it('the run description: call before asking, done only on ok:true, emoji as the character (live 2026-10-15 20:07–20:09)', () => {
+		const d = createRunActionTool(fake(() => null).deps).description;
+		assert.match(d, /do not ask the user first/);
+		assert.match(d, /a yes given before the first call does not count/);
+		assert.match(d, /Say it is done only after a call returned ok:true/);
+		assert.match(d, /the emoji character itself \(👍/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /say it is done only after ok:true/);
+	});
+
 	it('a no means call nothing, and a message is acted on by its read_room event_id', () => {
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /not cancel_task/);
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /event_id from read_room/);
