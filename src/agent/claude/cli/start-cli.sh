@@ -145,6 +145,9 @@ resolve_claude_credential_proxy
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
 fi
+# Ceiling on one foreground Bash call: when it is reached Claude Code moves the
+# command to the background and the turn continues. A caller-set value wins.
+ENV_ARGS+=(-e "BASH_MAX_TIMEOUT_MS=${BASH_MAX_TIMEOUT_MS:-120000}")
 # Test probe: dump the assembled core env forwarding and exit — lets the
 # regression suite assert the proxy-routing policy (live listener forwards,
 # dead port omits, caller preset wins) against the REAL ENV_ARGS under
@@ -531,10 +534,17 @@ fi
 # claude seen here is either still dying (the SIGKILL escalation above should
 # have reaped it) or one a competing launcher spawned in the race window.
 # Reusing it would defeat the restart and re-introduce the false-success path.
+#
+# On a private socket an orphan cannot be told from another install's core, and
+# adopting one leaves this socket with no server; launch fresh, kill nothing.
 if [ -z "$RESTART_REQUESTED" ] && claude_named_process_running; then
-  echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
-  echo "To recycle it cleanly: bash $0 --restart"
-  exit 0
+  if claude_private_socket_in_use; then
+    echo "  ⚠ $SESSION claude pid(s) $(claude_named_pids | tr '\n' ' ')running outside $TMUX_SOCKET — not reusing; starting a session on this socket." >&2
+  else
+    echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
+    echo "To recycle it cleanly: bash $0 --restart"
+    exit 0
+  fi
 fi
 
 if claude_named_tmux_session_exists; then

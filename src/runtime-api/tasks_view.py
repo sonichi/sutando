@@ -156,14 +156,14 @@ class TasksView:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         content = (f"id: {task_id}\n"
                    f"timestamp: {stamp}\n"
-                   f"task: {text}\n"
                    f"source: runtime-api\n"
                    f"channel_id: runtime-api\n"
                    f"user_id: {_one_line(self.actor_id)}\n"
                    f"access_tier: owner\n"
                    f"priority: {priority}\n"
                    + (f"instance_id: {_one_line(self.instance)}\n"
-                      if self.instance else ""))
+                      if self.instance else "")
+                   + f"task: {text}\n")
         # HMAC envelope (#3014 writer census): stamp at this writer's edge,
         # fail-open so a stamping error costs the stamp, never the submit.
         try:
@@ -208,12 +208,13 @@ class TasksView:
                          "user_id", "access_tier", "priority"]
         if expected_instance is not None:
             expected_keys.append("instance_id")
+        task_last_keys = [key for key in expected_keys if key != "task"] + ["task"]
         known = set(KNOWN_HEADER_KEYS)
         record_keys = [line.partition(":")[0] for line in raw.splitlines()
                        if line.partition(":")[0] in known and ":" in line]
         same = (
             raw == canonical_raw
-            and record_keys == expected_keys
+            and record_keys in (expected_keys, task_last_keys)
             and parsed.get("id") == task_id
             and parsed.get("source") == "runtime-api"
             and parsed.get("channel_id") == "runtime-api"
@@ -283,7 +284,7 @@ class TasksView:
         for f in self.results_dir.glob(f"{TASK_PREFIX}*.txt"):
             try:
                 st = f.stat()
-            except OSError:
+            except FileNotFoundError:
                 continue  # archived mid-scan — absent, not an error
             if stat_module.S_ISREG(st.st_mode):
                 found.append((f, int(st.st_mtime)))
@@ -345,11 +346,17 @@ class TasksView:
         deliberately not walked: done work is fetched per-id, not listed."""
         entries = []
         if self.tasks_dir.is_dir():
-            files = [f for f in self.tasks_dir.glob(f"{TASK_PREFIX}*.txt")
-                     if f.is_file()]
-            files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+            files = []
+            for f in self.tasks_dir.glob(f"{TASK_PREFIX}*.txt"):
+                try:
+                    metadata = f.stat()
+                except FileNotFoundError:
+                    continue
+                if stat_module.S_ISREG(metadata.st_mode):
+                    files.append((f, metadata.st_mtime))
+            files.sort(key=lambda item: item[1], reverse=True)
             truncated = len(files) > limit
-            for f in files[:limit]:
+            for f, _mtime in files[:limit]:
                 # Not a .claimed- split: the lead also renames to .assigned-<inst>,
                 # and a compound id has no result written under it, ever.
                 task_id = task_id_from_filename(f.name)
@@ -385,7 +392,7 @@ class TasksView:
         if st == "done":
             return {"taskId": task_id, "state": "done", "cancelled": False,
                     "note": "already completed — nothing to cancel"}
-        sub = self.submit(f"CANCEL_INSTRUCTION: {task_id}", priority="urgent")
+        sub = self.submit(f"CANCEL_INSTRUCTION: stop processing {task_id}", priority="urgent")
         return {"taskId": task_id, "state": st, "cancelled": "requested",
                 "cancelTaskId": sub["taskId"]}
 

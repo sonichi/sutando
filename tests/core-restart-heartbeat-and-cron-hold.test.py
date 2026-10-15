@@ -179,10 +179,10 @@ class EnsureRunningIsIdempotent(unittest.TestCase):
         (Path(ws) / "state" / "cores").mkdir(parents=True, exist_ok=True)
         return Path(ws)
 
-    def _relative_writer(self, root: Path, tag: str) -> subprocess.Popen:
+    def _relative_writer(self, root: Path, tag: str, env=None) -> subprocess.Popen:
         with open(self.td / f"{tag}.log", "w") as log:
             proc = subprocess.Popen([sys.executable, "src/core_heartbeat.py"], cwd=root,
-                                    env=self.env, stdout=log, stderr=subprocess.STDOUT)
+                                    env=env or self.env, stdout=log, stderr=subprocess.STDOUT)
         self.started.append(proc.pid)
         self.addCleanup(proc.wait)
         return proc
@@ -222,23 +222,51 @@ class EnsureRunningIsIdempotent(unittest.TestCase):
         self.assertIn("stopped 0 writer(s)", self._stop())
         self.assertIsNone(proc.poll(), "--stop killed another checkout's writer")
 
-    def test_ensure_starts_its_own_writer_past_another_checkouts(self):
-        other = self.td / "other"
-        shutil.copytree(self.root / "src", other / "src", symlinks=True)
-        shutil.copytree(self.root / "scripts", other / "scripts", symlinks=True)
-        self._workspace(other)
-        proc = self._relative_writer(other, "other")
-        time.sleep(1)
-        ws = self._workspace(self.root)
-        # A stale .alive here names the foreign writer; adopting it would leave this core unbeaten.
+    def _alive_naming(self, ws: Path, pid: int) -> None:
         host = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, 'src');"
                                "import core_heartbeat; print(core_heartbeat._alive_path().name)"],
                               cwd=self.root, env=self.env, capture_output=True, text=True).stdout.strip()
-        (ws / "state" / "cores" / host).write_text(json.dumps({"heartbeat_pid": proc.pid}))
+        (ws / "state" / "cores" / host).write_text(json.dumps({"heartbeat_pid": pid}))
+
+    def _other_checkout(self) -> Path:
+        other = self.td / "other"
+        shutil.copytree(self.root / "src", other / "src", symlinks=True)
+        shutil.copytree(self.root / "scripts", other / "scripts", symlinks=True)
+        return other
+
+    def test_ensure_starts_its_own_writer_past_another_checkouts(self):
+        # The foreign writer beats ANOTHER workspace: a stale .alive here naming it must not be adopted.
+        other = self._other_checkout()
+        other_env = {**self.env, "SUTANDO_DEFAULT_WORKSPACE": str(self.td / "other-ws")}
+        (self.td / "other-ws" / "state" / "cores").mkdir(parents=True)
+        proc = self._relative_writer(other, "other", env=other_env)
+        time.sleep(1)
+        ws = self._workspace(self.root)
+        self.assertNotEqual(ws.resolve(), (self.td / "other-ws").resolve())
+        self._alive_naming(ws, proc.pid)
         out = self._ensure()
         self.assertIn("started writer", out)
         self.assertNotIn(f"(pid {proc.pid})", out)
-        self.assertIsNone(proc.poll(), "--ensure disturbed another checkout's writer")
+        self.assertIsNone(proc.poll(), "--ensure disturbed another workspace's writer")
+
+    def test_ensure_takes_over_from_another_checkouts_writer_on_the_same_workspace(self):
+        # Both checkouts resolve one workspace, so one .alive: the launching checkout's writer replaces
+        # the foreign one, and at no moment do two writers hold the lock.
+        other = self._other_checkout()
+        ws = self._workspace(self.root)
+        self.assertEqual(self._workspace(other), ws)
+        proc = self._relative_writer(other, "other")
+        lock = next(iter((ws / "state" / "locks").glob("core-heartbeat-*.lock")), None)
+        deadline = time.monotonic() + 10
+        while (lock is None or lock.read_text().strip() != str(proc.pid)) and time.monotonic() < deadline:
+            time.sleep(0.1)
+            lock = next(iter((ws / "state" / "locks").glob("core-heartbeat-*.lock")), None)
+        self.assertEqual(lock.read_text().strip(), str(proc.pid), (self.td / "other.log").read_text())
+        self._alive_naming(ws, proc.pid)
+        out = self._ensure()
+        self.assertIn("started writer", out)
+        self.assertIsNotNone(proc.wait(timeout=10), "the foreign writer still beats beside ours")
+        self.assertEqual(lock.read_text().strip(), str(self.started[-1]))
 
     def test_writer_exits_when_its_checkout_is_removed(self):
         self._ensure()
@@ -340,8 +368,9 @@ class EnsureInProcess(unittest.TestCase):
         self.ch = core_heartbeat
         self.td = Path(tempfile.mkdtemp())
         self._saved = {k: getattr(core_heartbeat, k) for k in (
-            "WORKSPACE", "_recorded_writer_pids", "running_writer_pids", "ensure_running", "_SCRIPT")}
+            "WORKSPACE", "_recorded_writer_pids", "running_writer_pids", "ensure_running", "_SCRIPT", "_hostname")}
         core_heartbeat.WORKSPACE = self.td
+        core_heartbeat._hostname = lambda: "host"
         core_heartbeat._recorded_writer_pids = lambda: []
 
     def tearDown(self):
@@ -433,9 +462,14 @@ class EnsureInProcess(unittest.TestCase):
         ch.running_writer_pids = lambda: next(answers)
         child = unittest.mock.Mock(pid=4242)
         child.poll.return_value = None
-        with unittest.mock.patch.object(ch.subprocess, "Popen", return_value=child) as popen, \
+
+        def spawn(*a, **kw):  # the child takes the writer lock and records itself
+            ch._writer_lock_path().write_text("4242\n")
+            return child
+        with unittest.mock.patch.object(ch.subprocess, "Popen", side_effect=spawn) as popen, \
                 unittest.mock.patch.object(ch.time, "sleep"):
             self.assertEqual(ch.ensure_running(self.td / "hb.log"), (True, 4242))
+        self.assertEqual(popen.call_count, 1)
         argv = popen.call_args[0][0]
         self.assertEqual(argv, [sys.executable, str(ch._SCRIPT)])
         self.assertTrue(popen.call_args[1]["start_new_session"])
@@ -443,11 +477,13 @@ class EnsureInProcess(unittest.TestCase):
     def test_ensure_stops_waiting_for_a_child_that_exited(self):
         ch = self.ch
         ch.running_writer_pids = lambda: []
-        child = unittest.mock.Mock(pid=4343)
+        child = unittest.mock.Mock(pid=4343, returncode=1)
         child.poll.return_value = 1
-        with unittest.mock.patch.object(ch.subprocess, "Popen", return_value=child):
-            self.assertEqual(ch.ensure_running(self.td / "hb.log"), (True, 4343))
-        child.poll.assert_called_once()
+        with unittest.mock.patch.object(ch.subprocess, "Popen", return_value=child), \
+                unittest.mock.patch.object(ch.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "writer exited 1 at start"):
+                ch.ensure_running(self.td / "hb.log")
+        sleep.assert_not_called()   # an exited child is never waited on
 
     def test_main_ensure_reports_both_outcomes(self):
         ch = self.ch

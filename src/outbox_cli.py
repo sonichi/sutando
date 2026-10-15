@@ -83,12 +83,14 @@ def cmd_inspect(args) -> int:
 
 
 def cmd_requeue(args) -> int:
-    """Exit 0 only when this call performed the transition; 3 = nothing to do.
+    """Exit 0 only when this call performed the transition; 3 = nothing to do;
+    4 = the body could not be restored on this host (the record is left as
+    the requeue made it; the body stays listed in undelivered/).
 
     A distinct code matters for the idempotent re-run: "already queued" is not
     a failure, and a script must be able to tell it from "I recovered it".
     """
-    result = outbox.requeue_item(
+    result, epoch_written = outbox.requeue_item_with_epoch(
         args.root, args.item_id,
         reset_attempts=args.reset_attempts,
         operator=args.operator or _default_operator(),
@@ -97,9 +99,13 @@ def cmd_requeue(args) -> int:
     # NOT_PARKED too, not just REQUEUED: the two halves commit separately, so
     # gating the restore on the transition strands the body on every retry.
     restored = False
-    if result in (outbox.RequeueOutcome.REQUEUED, outbox.RequeueOutcome.NOT_PARKED):
+    if (result is outbox.RequeueOutcome.NOT_PARKED
+            and outbox.item_status(args.root, args.item_id) == "DELIVERED"):
+        # A copy still listed in undelivered/ is not owed again once delivered.
+        payload["body"] = "not-restored: delivered"
+    elif result in (outbox.RequeueOutcome.REQUEUED, outbox.RequeueOutcome.NOT_PARKED):
         if result is outbox.RequeueOutcome.REQUEUED:
-            payload["resend_epoch"] = outbox.resend_epoch_for(args.root, args.item_id)
+            payload["resend_epoch"] = epoch_written
         results_dir = args.results_dir or Path(args.root).parent
         body_id = getattr(args, "body_id", None) or args.item_id
         outcome, path = undelivered_quarantine.restore(results_dir, body_id)
@@ -107,6 +113,15 @@ def cmd_requeue(args) -> int:
         payload["body"] = outcome.value
         payload["body_path"] = str(path) if path else None
         restored = outcome is undelivered_quarantine.RestoreOutcome.RESTORED
+        if outcome is undelivered_quarantine.RestoreOutcome.NO_SAFE_MOVE:
+            # Left QUEUED, never parked again: a reply published under this id meanwhile
+            # must still be sent, and the drain only acts on a live result.
+            payload["error"] = (f"the quarantined body {path} could not be moved back on this host; "
+                                "it is untouched and the item stays queued — copy it to "
+                                f"{undelivered_quarantine.canonical_result(results_dir, body_id)} "
+                                "by hand, or re-run this requeue where a no-replace rename works")
+            _emit(payload, args.json)
+            return 4
     _emit(payload, args.json)
     if result is outbox.RequeueOutcome.REQUEUED or restored:
         return 0

@@ -197,6 +197,38 @@ class BridgeWrapperTest(unittest.TestCase):
                         mod.RESULTS_DIR, mod.TASKS_DIR = saved
         self.assertEqual(seen, set(BRIDGES), "every affected adapter must be exercised")
 
+    def test_two_askers_in_one_millisecond_get_their_own_reasks_and_routes(self):
+        """Two originals identical but for `id:`, asked in one millisecond from
+        different Slack threads: the re-ask bodies match, so only the id can
+        keep them apart."""
+        mod = next((m for n, m in self._each() if n == "slack"), None)
+        if mod is None:
+            self.skipTest("slack bridge not importable here")
+        import dedup_recovery
+        saved = (mod.RESULTS_DIR, mod.TASKS_DIR, mod._set_pending_reply, mod.time, dedup_recovery.time)
+        routes = {}
+        frozen = types.SimpleNamespace(time=lambda: 1791600000.0)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                results, tasks = self._seed(mod, td, "", orig=None)
+                other = "task-bbbbbbbbbbbbbbbbbb"
+                for tid in (TID, other):
+                    (tasks / f"{tid}.txt").write_text(
+                        f"id: {tid}\nsource: slack\nchannel_id: C1\naccess_tier: owner\ntask: same question\n")
+                mod._set_pending_reply = lambda i, info: routes.__setitem__(i, info["thread_ts"])
+                mod.time = dedup_recovery.time = frozen
+                first = mod._dedup_recover(TID, HOLDER, {"channel": "C1", "thread_ts": "thread-A"})
+                second = mod._dedup_recover(other, HOLDER, {"channel": "C1", "thread_ts": "thread-B"})
+                self.assertEqual((first, second), ("archive", "archive"))
+                self.assertEqual(sorted(routes.values()), ["thread-A", "thread-B"],
+                                 "one re-ask was routed to both askers' threads")
+                self.assertEqual(len(routes), 2, "both askers were handed one re-ask id")
+                for reask in routes:
+                    self.assertTrue((tasks / f"{reask}.txt").exists(), f"{reask} was never published")
+                    self.assertTrue(reask.startswith("task-1791600000000-"), reask)
+        finally:
+            (mod.RESULTS_DIR, mod.TASKS_DIR, mod._set_pending_reply, mod.time, dedup_recovery.time) = saved
+
     def test_wrapper_never_raises_into_the_delivery_loop(self):
         """A recovery failure must not take the poll loop down with it."""
         for name, mod in self._each():

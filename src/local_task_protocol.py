@@ -304,6 +304,39 @@ def task_body(text: str) -> str:
     return ""
 
 
+_QUOTED_BLOCK = re.compile(r"\[AG2 Space (reply context|room metadata);([^\]\n]*)\]\s*")
+_JSON_DECODER = json.JSONDecoder()
+
+
+def split_reply_context(text: str) -> "tuple[dict | None, str]":
+    """({"sender", "body", "label"} of the message an ag2space task replies to, the
+    message after the broker's quoted blocks), or (None, text) when there is no
+    well-formed reply block.
+
+    `label` is the broker's own wording from the opening tag, verbatim (None when
+    empty). The JSON is decoded whole, so a closing marker inside the quoted body
+    cannot end the block early."""
+    rest, reply = text.lstrip(), None
+    for kind in ("room metadata", "reply context"):
+        m = _QUOTED_BLOCK.match(rest)
+        if m is None or m.group(1) != kind:
+            continue
+        try:
+            record, end = _JSON_DECODER.raw_decode(rest, m.end())
+        except ValueError:
+            return None, text
+        tail, closer = rest[end:].lstrip(), f"[End AG2 Space {kind}]"
+        if not isinstance(record, dict) or not tail.startswith(closer):
+            return None, text
+        rest = tail[len(closer):].lstrip()
+        if kind == "reply context":
+            sender, body = record.get("sender"), record.get("body")
+            if not isinstance(sender, str) or not isinstance(body, str):
+                return None, text
+            reply = {"sender": sender, "body": body, "label": m.group(2).strip() or None}
+    return (reply, rest) if reply is not None else (None, text)
+
+
 def parse_task_headers(text: str) -> TaskHeaders:
     """Parse a **task-last** file: collect `key: value` lines strictly BEFORE
     the first `task:` line; everything from `task:` onward is untrusted body.

@@ -39,6 +39,18 @@ import tmux_probe  # noqa: E402
 
 import worker_identity as wi  # noqa: E402
 
+
+# The core's own identity: inherited, these stamp a worker's direct posts as
+# "worker-<core id>" while pool delivery stamps the worker's real id.
+_CORE_ONLY_ENV = ("SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_WORKER_SEAT")
+
+
+def inherited_env(drop=()) -> dict:
+    """The spawner's environment minus the core-only identity, for a worker."""
+    return {k: v for k, v in os.environ.items()
+            if k not in _CORE_ONLY_ENV and k not in drop}
+
+
 DEFAULT_SOCKET = "/tmp/sutando-tmux.sock"
 
 
@@ -181,6 +193,9 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
         "env": {"SUTANDO_TMUX_SOCKET": socket,
                 "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),
                 "SUTANDO_INSTANCE_ID": worker_id,
+                # What say/mention/notify stamp as space.ag2.worker; pool delivery
+                # stamps the same bare id, so both paths name one worker.
+                "SUTANDO_WORKER_ID": worker_id,
                 "SUTANDO_WORKER_RUNTIME": runtime,
                 "SUTANDO_TASKS_DIR": delivery_dir,
                 # The inbox holds sentinels, not task bodies. The reader is TOLD
@@ -362,8 +377,7 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
 
     # start-cli prefers RESUME, so an INHERITED one would beat the SESSION_ID a
     # fresh spawn sets: drop both, then state the single intent.
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("SUTANDO_CLAUDE_RESUME", "SUTANDO_CLAUDE_SESSION_ID")}
+    env = inherited_env(drop=("SUTANDO_CLAUDE_RESUME", "SUTANDO_CLAUDE_SESSION_ID"))
     env.update(p["env"])
     if runtime == "claude":
         env.update({"SUTANDO_CLAUDE_RESUME": session_id} if resumed_id

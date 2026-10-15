@@ -354,6 +354,16 @@ class APartialCloseIsBounded(Base):
 
 
 class ApplyingATick(Base):
+    def test_human_dispatch_rechecks_pause_and_suspension(self):
+        marker = wi.worker_dir(self.ws, self.wid) / sup.PAUSED_MARKER
+        with mock.patch.object(rem.wc, "raise_card") as raised:
+            marker.touch()
+            rem.apply(self.ws, REPO, {self.wid: ps.CARD_HUMAN}, runner=self.t)
+            marker.unlink()
+            rem.suspend(self.ws, "test")
+            rem.apply(self.ws, REPO, {self.wid: ps.CARD_HUMAN}, runner=self.t)
+            raised.assert_not_called()
+
     def test_only_recover_acts_and_escalate_passes_through(self):
         other = wi.new_worker_id()
         seen = []
@@ -457,6 +467,103 @@ class TheSweepOnALoggedOutWorker(Base):
         active = rem.wc.manager_for(self.ws).active()
         self.assertEqual([r.subject["wedge"] for r in active], [ps.CARD_CAUSE])
         self.assertIn("API Error: 500", active[0].message)
+
+
+
+class PressedProxyRecovery(Base):
+    def sweep(self, pane, frame, pending, *, previous="old", alive=True,
+              sample_at=1000.0, dry_run=False, held=None, paused=False):
+        sup.save_state(self.ws, ps.SupervisionState(
+            last_sample_at=sample_at, workers={self.wid: ps.WorkerEvidence(
+                wedge_consecutive=3, wedge_first_detected_at=100.0,
+                wedge_escalated=True, wedge_kind="abnormal", last_pane_id=previous)}))
+        args = types.SimpleNamespace(workspace=self.ws, repo=REPO, resume=False,
+                                     recipient=None, dry_run=dry_run)
+        with contextlib.ExitStack() as stack:
+            for obj, name, value in (
+                (sup, "probe_session", alive), (sup, "session_watcher_holds", True),
+                (sup, "observe_pane", (pane, frame)), (sup, "work_outstanding", pending),
+                (sup, "is_paused", paused), (rem, "suspension", held),
+                (rem, "ensure_supervisors", {}), (rem, "ensure_input_watches", {}),
+                (rem.wc, "raise_card", {"outcome": "refused"})):
+                stack.enter_context(mock.patch.object(obj, name, return_value=value))
+            stack.enter_context(mock.patch.object(rem, "time", types.SimpleNamespace(time=lambda: 1300.0)))
+            stack.enter_context(mock.patch.object(rem.subprocess, "run",
+                                                  side_effect=AssertionError("no external action")))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            self.assertEqual(rem._sweep(args), 0)
+        out = json.loads(output.getvalue())
+        self.assertEqual(out["recoveries"], {})
+        return out
+
+    def pressed_card(self):
+        from hitl.schema import ActionReply
+        def capture(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, API_PANE, "")
+        out = rem.wc.raise_card(self.ws, self.wid, ps.CARD_CAUSE,
+                                 runner=capture, routed=lambda *a: True)
+        manager = rem.wc.manager_for(self.ws)
+        req = manager.get(out["hitl_id"])
+        manager.apply_action(ActionReply(hitl_id=req.id, expected_revision=req.revision,
+                                         action_id=rem.wc.PROXY_ACTION, guard=req.guard))
+        return req.id
+
+    def test_uncertain_or_wedged_observations_retain_pressed_proxy(self):
+        cases = [(None, None, True, "old", True),
+                 (ps.PANE_UNKNOWN, "new", True, "old", True),
+                 (ps.PANE_IDLE, "new", None, "old", True),
+                 (ps.PANE_ABNORMAL, "new", True, "old", True),
+                 (ps.PANE_LOGGED_OUT, "new", True, "old", True),
+                 (ps.PANE_GATE, "new", True, "old", True),
+                 (ps.PANE_LIMIT, "new", True, "old", True),
+                 (ps.PANE_WORKING, "old", True, "old", True),
+                 (ps.PANE_WORKING, "new", True, None, True),
+                 (ps.PANE_WORKING, None, False, "old", True),
+                 (ps.PANE_IDLE, None, False, "old", True),
+                 (ps.PANE_IDLE, "new", False, "old", None)]
+        for pane, frame, pending, previous, alive in cases:
+            with self.subTest(pane=pane, frame=frame, pending=pending, previous=previous, alive=alive):
+                rid = self.pressed_card()
+                out = self.sweep(pane, frame, pending, previous=previous, alive=alive)
+                self.assertNotIn(rid, out["cards_closed"])
+                manager = rem.wc.manager_for(self.ws)
+                self.assertEqual(manager.get(rid).status, "in_progress")
+                manager.expire(rid)
+
+    def test_healthy_recovery_persists_and_closes_only_once(self):
+        for pane, pending in ((ps.PANE_IDLE, False), (ps.PANE_IDLE, True),
+                              (ps.PANE_WORKING, True), (ps.PANE_WORKING, False)):
+            with self.subTest(pane=pane, pending=pending):
+                rid = self.pressed_card()
+                self.assertEqual(self.sweep(pane, "new", pending)["cards_closed"], [rid])
+                self.assertEqual(rem.wc.manager_for(self.ws).get(rid).status, "resolved")
+                self.assertEqual(self.sweep(pane, "newer", pending)["cards_closed"], [])
+
+    def test_ineligible_sweeps_retain_pressed_proxy(self):
+        for options in ({"sample_at": 1.0}, {"dry_run": True},
+                        {"held": "held"}, {"paused": True}):
+            with self.subTest(options=options):
+                rid = self.pressed_card()
+                self.assertNotIn(rid, self.sweep(ps.PANE_IDLE, "new", False,
+                                               **options).get("cards_closed", []))
+                manager = rem.wc.manager_for(self.ws)
+                self.assertEqual(manager.get(rid).status, "in_progress")
+                manager.expire(rid)
+
+    def test_failed_and_empty_capture_retain_pressed_proxy(self):
+        real_observe = sup.observe_pane
+        for result in (subprocess.CompletedProcess([], 1, "", "failed"),
+                       subprocess.CompletedProcess([], 0, "", "")):
+            with self.subTest(returncode=result.returncode):
+                with mock.patch.object(sup, "_open_tmux", return_value=(SOCK, "seat")):
+                    pane, frame = real_observe(self.ws, self.wid,
+                                               runner=lambda *a, **k: result)
+                self.assertEqual((pane, frame), (None, None))
+                rid = self.pressed_card()
+                self.assertEqual(self.sweep(pane, frame, True)["cards_closed"], [])
+                manager = rem.wc.manager_for(self.ws)
+                self.assertEqual(manager.get(rid).status, "in_progress")
+                manager.expire(rid)
 
 
 class OneCopyOfEachModule(unittest.TestCase):

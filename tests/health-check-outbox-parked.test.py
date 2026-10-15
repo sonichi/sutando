@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import os
 import sys
 import tempfile
@@ -92,6 +93,15 @@ class OutboxParkedProbe(unittest.TestCase):
         self.assertEqual(r["status"], "warn")
         self.assertIn("task-abc", r["detail"])
         self.assertIn("requeue", r["detail"])
+
+    def test_an_unknown_outcome_park_warns_against_a_blind_requeue(self):
+        self._items(".outbox-withheld-review").joinpath("wr_1.c.json").write_text(json.dumps(
+            {"item_id": "wr_1.c", "status": "PARKED", "reason": "outcome-unknown"}), encoding="utf-8")
+        self._write("task-abc", "PARKED")
+        r = self.hc.check_outbox_parked(self.ws)
+        self.assertIn("1 may have been delivered — do not requeue without checking the room: wr_1.c",
+                      r["detail"])
+        self.assertIn("1 never delivered — nothing retries them: task-abc", r["detail"])
 
     def test_a_delivered_item_is_not_counted(self):
         self._write("task-abc", "PARKED")
@@ -226,6 +236,123 @@ class OutboxParkedProbe(unittest.TestCase):
     def test_the_probe_is_registered(self):
         src = (REPO / "src" / "health-check.py").read_text(encoding="utf-8")
         self.assertIn("checks.append(check_outbox_parked())", src)
+
+
+class WithheldReviewsReadable(unittest.TestCase):
+    def setUp(self):
+        self.hc = _load_health_check()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        self.base = self.ws / "state" / "withheld-team-results"
+        (self.base / "conflicts").mkdir(parents=True)
+
+    def test_no_reviews_is_ok(self):
+        self.assertEqual(self.hc.check_withheld_reviews_readable(self.ws)["status"], "ok")
+
+    def test_records_that_read_are_ok(self):
+        (self.base / "wr_0000000000000001.json").write_text(json.dumps({"status": "awaiting_owner"}))
+        self.assertEqual(self.hc.check_withheld_reviews_readable(self.ws)["status"], "ok")
+
+    def test_each_unreadable_record_is_named(self):
+        frozen = self.base / "conflicts" / "wr_0000000000000002.abcd.json"
+        for content in ("{not json", "[]", '"str"', ""):
+            with self.subTest(content=content):
+                frozen.write_text(content)
+                r = self.hc.check_withheld_reviews_readable(self.ws)
+                self.assertEqual(r["status"], "warn")
+                self.assertIn("withheld-team-results/conflicts/wr_0000000000000002.abcd.json", r["detail"])
+                self.assertIn("please reply again", r["detail"])
+
+    def test_a_symlinked_record_is_named(self):
+        (self.base / "archive").mkdir()
+        (self.base / "archive" / "real.json").write_text(json.dumps({"status": "kept_private"}))
+        (self.base / "archive" / "wr_0000000000000003.json").symlink_to("real.json")
+        r = self.hc.check_withheld_reviews_readable(self.ws)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("archive/wr_0000000000000003.json", r["detail"])
+
+    def test_a_linked_or_odd_review_folder_is_named(self):
+        real = self.ws / "elsewhere"
+        real.mkdir()
+        (real / "wr_0000000000000004.json").write_text(json.dumps({"status": "awaiting_owner"}))
+        (self.base / "conflicts").rmdir()
+        for label, make in (("linked", lambda f: f.symlink_to(real)),
+                            ("dangling", lambda f: f.symlink_to(self.ws / "missing")),
+                            ("a file", lambda f: f.write_text("x"))):
+            for folder in ("conflicts", "archive"):
+                with self.subTest(folder=folder, kind=label):
+                    target = self.base / folder
+                    make(target)
+                    try:
+                        r = self.hc.check_withheld_reviews_readable(self.ws)
+                    finally:
+                        target.unlink()
+                    self.assertEqual(r["status"], "warn")
+                    self.assertIn(f"state/withheld-team-results/{folder} (", r["detail"])
+
+    def test_it_agrees_with_the_guard(self):
+        """A structural delegation pin: the check calls the guard's shared preflight and scans
+        nothing itself; the behavioural tests above cover what that preflight reports."""
+        source = (REPO / "src" / "health-check.py").read_text()
+        body = source[source.index("def check_withheld_reviews_readable"):]
+        body = body[:body.index("\ndef ")]
+        self.assertTrue("guard.namespace_problems(" in body and "os.listdir" not in body
+                        and ".glob(" not in body and "read_text" not in body,
+                        "the health check must use the guard's own read-only preflight")
+
+    def test_linked_claims_or_issued_is_named(self):
+        for folder in ("claims", "issued"):
+            with self.subTest(folder=folder):
+                real = self.ws / f"{folder}-real"
+                real.mkdir()
+                (real / "wr_0000000000000005.c0ffee").write_text("")
+                target = self.base / folder
+                target.symlink_to(real)
+                try:
+                    r = self.hc.check_withheld_reviews_readable(self.ws)
+                finally:
+                    target.unlink()
+                self.assertEqual(r["status"], "warn")
+                self.assertIn(f"state/withheld-team-results/{folder} (", r["detail"])
+
+    def test_a_linked_entry_inside_claims_or_issued_is_named(self):
+        for folder in ("claims", "issued"):
+            with self.subTest(folder=folder):
+                inside = self.base / folder
+                inside.mkdir()
+                (self.ws / "elsewhere-file").write_text("")
+                (inside / "wr_0000000000000006.entry").symlink_to(self.ws / "elsewhere-file")
+                try:
+                    r = self.hc.check_withheld_reviews_readable(self.ws)
+                finally:
+                    shutil.rmtree(inside)
+                self.assertEqual(r["status"], "warn")
+                self.assertIn(f"{folder}/wr_0000000000000006.entry", r["detail"])
+
+    def test_a_directory_or_fifo_entry_in_claims_or_issued_is_named(self):
+        for folder in ("claims", "issued"):
+            for kind in ("directory", "fifo"):
+                with self.subTest(folder=folder, kind=kind):
+                    inside = self.base / folder
+                    inside.mkdir()
+                    entry = inside / "wr_0000000000000007.odd"
+                    entry.mkdir() if kind == "directory" else os.mkfifo(entry)
+                    try:
+                        r = self.hc.check_withheld_reviews_readable(self.ws)
+                    finally:
+                        shutil.rmtree(inside)
+                    self.assertEqual(r["status"], "warn")
+                    self.assertIn(f"{folder}/wr_0000000000000007.odd", r["detail"])
+
+    def test_run_all_checks_registers_the_row(self):
+        sentinel = {"name": "withheld-reviews-readable", "status": "ok",
+                    "detail": "registration sentinel"}
+        with unittest.mock.patch.object(self.hc, "check_withheld_reviews_readable",
+                                        return_value=sentinel) as probe:
+            checks = self.hc.run_all_checks()
+        probe.assert_called_once_with()
+        self.assertIn(sentinel, checks)
 
 
 if __name__ == "__main__":

@@ -67,7 +67,7 @@ const PATTERNS: Array<{
 		rx: /is not found for API version|not supported for|\bmodels?\/\S+\s+(is\s+)?not\s+found|\b404\b|\bdeprecated\b/i,
 		category: 'model_not_found',
 		retryable: false,
-		userMessage: 'Voice is offline — configured Gemini voice model is unavailable. Update VOICE_NATIVE_AUDIO_MODEL in .env.',
+		userMessage: 'Voice is offline — configured Gemini voice model is unavailable. Change the model in config/voice-agent.json in the Sutando workspace, then restart Sutando.',
 		userActionUrl: 'https://ai.google.dev/gemini-api/docs/models',
 	},
 	{
@@ -103,6 +103,18 @@ export function classifyTransportClose(
 		rawCode: code,
 		rawReason: text,
 	};
+}
+
+/**
+ * The classifier bodhi's upstream recovery gets (`upstreamRecovery.classifyClose`): a non-retryable
+ * close blocks dialing for the fatal backoff; anything else is left to the redial ladder.
+ */
+export function fatalCloseForRecovery(
+	code: number | undefined,
+	reason: string | undefined,
+): { category: string; code?: number; reason: string } | null {
+	const c = classifyTransportClose(code, reason);
+	return c.retryable ? null : { category: c.category, code, reason: c.rawReason };
 }
 
 /**

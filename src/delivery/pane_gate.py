@@ -57,7 +57,12 @@ SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
 #: Non-blank lines a verdict reads — the same window core-input-watch.py reads.
 TAIL_LINES = 14
 
-_SGR = re.compile(r"\x1b\[[0-9;]*m")
+#: A CSI SGR run (colon or semicolon params, newer tmux emits both) or an OSC
+#: hyperlink (BEL- or ST-terminated) -- anything else is left as real content.
+_SGR = re.compile(r"\x1b\[[0-9:;]*m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+#: Public alias for strip-to-plain outside this module (core-input-watch.py's
+#: own derivation) -- one pattern, not a second copy that can drift.
+SGR_STRIP = _SGR
 # Dim (SGR 2) or the 256-colour GREYSCALE RAMP (232-255): styled runs are hint/ghost
 # text only. 200-231 are colour-cube entries, so real coloured input must not match.
 _GHOST = re.compile(
@@ -322,6 +327,32 @@ def _tail_lines(capture: str) -> List[str]:
     return [ln for ln in capture.splitlines() if _SGR.sub("", ln).strip()][-TAIL_LINES:]
 
 
+def gate_evidence(tail: str, styled_tail: Optional[str] = None,
+                  adapter: RuntimeAdapter = CLAUDE) -> str:
+    """Exclude idle chrome, verified ghost suggestions and completed conditional recaps."""
+    rows = tail.splitlines()
+    line = prompt_line(styled_tail if styled_tail is not None else tail, adapter)
+    composer_i = next((i for i in range(len(rows) - 1, -1, -1)
+                       if _prompt_glyph(rows[i], adapter) is not None), None)
+    completed = (composer_i is not None and line is not None and not line.text.strip()
+                 and any(row.strip() == "Nothing needs you this round."
+                         for row in rows[:composer_i]))
+    kept = []
+    for i, row in enumerate(rows):
+        signatures = any(rx.search(row) for _, rx in adapter.gate_signatures)
+        if adapter.idle_ready.search(row) and not signatures:
+            continue
+        if i == composer_i and line and line.placeholder and not line.text.strip():
+            continue
+        # A marker alone cannot distinguish a live instruction from completed output.
+        if (completed and i < composer_i and not signatures
+                and re.fullmatch(r"\s*※ recap: if .+, press Enter there to send it\.\s*", row)
+                and len(list(adapter.await_hint.finditer(row))) == 1):
+            continue
+        kept.append(row)
+    return "\n".join(kept)
+
+
 def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeAdapter) -> Optional[str]:
     """The gate kind holding the pane, or None. An empty composer at the bottom means no
     dialog owns the input -- UNLESS a gate has appeared BELOW that composer line since it
@@ -336,6 +367,7 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
         footer_hits = list(adapter.idle_ready.finditer(tail))
         beyond_footer = tail[footer_hits[-1].end():] if footer_hits else ""
         newer = "\n".join(part for part in (following, beyond_footer) if part.strip())
+        newer = gate_evidence(newer, adapter=adapter)
         if not newer or not adapter.await_hint.search(newer):
             return None
         for kind, rx in adapter.gate_signatures:
@@ -344,6 +376,7 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
         # An await hint we cannot name is an UNRECOGNISED dialog, not the absence of one.
         # Falling through to "no gate" let a stale empty composer vouch for a live dialog.
         return "unlisted"
+    tail = gate_evidence(tail, "\n".join(_tail_lines(capture)), adapter)
     if not adapter.await_hint.search(tail):
         return None
     for kind, rx in adapter.gate_signatures:

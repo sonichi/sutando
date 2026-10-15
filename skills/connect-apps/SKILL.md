@@ -88,7 +88,12 @@ yours, not the owner's: plain sentences, no quotes from their message.
 |---|---|
 | 0 | done: a match, all apps connected, a wait recorded (or `card` found every app connected), a wait claimed, the account verified |
 | 1 | a negative answer: no exact match, an app not connected, nothing claimed, `account_changed`, `account_unknown`, `no_such_wait` |
-| 2 | a setup problem to relay, never retry: `not_signed_in`, `connectors_disabled`, `unknown_app`, `coming_soon`, `too_many_apps`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
+| 2 | a setup problem to relay, never retry: `not_signed_in`, `wrong_account`, `connectors_disabled`, `unknown_app`, `coming_soon`, `too_many_apps`, `not_owner_task`, `invalid_arguments`, `cloud_error` |
+
+`card` and `await` exit 1 with `"reason": "account_changed"` (plus `cloud_user_id`,
+`stamp_cloud_user_id`, `base`) when this agent's AG2 Cloud credential is not the account the desktop
+started the core's station for: no wait and no card are made. Post no card; Step 4 says what to
+tell the owner and where.
 
 `card` prints everything `await` prints plus `mode` (`dm` or `private`), `apps` (each with
 `connected`), `all_connected`, and for `mode: dm` a `message` object (`body`, `extra_content`,
@@ -364,10 +369,23 @@ The `card` call from step 3 already armed the wait; read its output:
   --room` lists them). Say: "I'll pick this up once <its apps> are connected; for <the other apps>,
   tell me once they're connected and I'll check." In the DM that is the result; from 3b put it on the
   waiting card with `note` and write the result `[no-send]`.
+- **Exit 2 with `"error": "wrong_account"`:** the only AG2 Cloud credentials this agent can find
+  belong to another account than the one your desktop app started it for, so it refuses to act as
+  them. Relay `detail` in plain words. In the DM that is the result; from 3b send it to the owner's
+  confirmed DM and write the result `[no-send]` (no confirmed DM: `[no-send]` alone). Never in the
+  shared room.
+- **Exit 2 with `"error": "cloud_error"`, `"code": "account_unverified"`:** AG2 Cloud could not be
+  reached to check which account the credentials belong to. It is temporary: say so and that you
+  can try again shortly; nothing to sign in to. Same destinations as the bullet above.
 - **Any other exit 2:** no automatic resume is possible. Say: "Once you've connected Google
   Calendar, tell me and I'll check." In the DM that is the result; from 3b there is no private card
   to carry it, so send it to the owner's confirmed DM and write the result `[no-send]` (no confirmed
   DM: `[no-send]` alone). Never in the shared room.
+- **Exit 1 with `"reason": "account_changed"`:** no card and no wait were made. Say: "I'm signed in
+  to a different AG2 Cloud account (`<cloud_user_id>`) than your desktop app (`<stamp_cloud_user_id>`),
+  so I can't see what Settings → Integrations shows as connected." In the DM that is the result; from
+  3b there is no private card to carry it, so send it to the owner's confirmed DM and write the
+  result `[no-send]` (no confirmed DM: `[no-send]` alone). Never in the shared room.
 
 ## Step 5: resume
 

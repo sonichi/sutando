@@ -9,15 +9,19 @@
  */
 
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, readdirSync, statSync, appendFileSync, renameSync } from 'node:fs';
+import { appendFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { renderItems } from './voice-conversation-summary.js';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
-import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
-import { recordConversation, recordSessionBoundary } from './conversation-store.js';
+import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, dedupTarget, stripVoiceControlLines, type TaskOrigin } from './skip_marker_ownership.js';
+import { createVoiceTaskStore, planReconcile } from './relay-agent.js';
+import { framedSystem } from './inject-framing.js';
+import { recordConversation, recordConversationAsync, recordSessionBoundary, recordSessionBoundaryAsync } from './conversation-store.js';
 import {
 	emitTaskProcessed,
 	selectBackend,
@@ -219,17 +223,25 @@ function _usableOrigin(origin: VoiceSessionOrigin | null | undefined): VoiceSess
 }
 
 let _voiceSessionOrigin: VoiceSessionOrigin | null = null;
-// Bumped whenever the bound origin changes, so a call can tell its session has moved.
-let _voiceOriginGeneration = 0;
 let _voiceTaskOriginResolver: VoiceTaskOriginResolver | null = null;
 const _taskOrigins = new Map<string, VoiceSessionOrigin>();
+// Bumped when the words a waiting call would read may belong to another session or origin.
+let _voiceContextRevision = 0;
 
 /** Bind (or, with null, release) the origin of the live voice session. A task carries the
  *  origin current when it was asked for; a malformed origin binds nothing. */
 export function setVoiceSessionOrigin(origin: VoiceSessionOrigin | null): void {
 	const next = _usableOrigin(origin);
-	if (next?.channel !== _voiceSessionOrigin?.channel || next?.target !== _voiceSessionOrigin?.target) _voiceOriginGeneration += 1;
+	// A re-announce of the same origin is not a move: an in-flight call keeps its words.
+	if (next?.channel !== _voiceSessionOrigin?.channel || next?.target !== _voiceSessionOrigin?.target) _voiceContextRevision++;
 	_voiceSessionOrigin = next;
+}
+
+/** The live client is gone: release its origin and close every open transcript window,
+ *  bound origin or not, since the next client reads through the same turns provider. */
+export function endVoiceClientSession(): void {
+	_voiceSessionOrigin = null;
+	_voiceContextRevision++;
 }
 
 /** One turn of the live voice session as the runtime keeps it: `user` items are the
@@ -246,9 +258,16 @@ export type VoiceTurnsSnapshot = {
 	pendingInput?: string | null;
 	/** When the runtime last saw the owner speak (ms epoch); undefined when unknown. */
 	lastUserSpeechAt?: number | null;
+	/** The compressed summary of the conversation before `items`, when one was made. */
+	summary?: string | null;
 };
 type VoiceTurnsProvider = () => ReadonlyArray<VoiceTurn> | VoiceTurnsSnapshot | null | undefined;
 let _voiceTurns: VoiceTurnsProvider | null = null;
+type VoiceTurnsBinding = { provider: VoiceTurnsProvider | null; revision: number };
+
+function captureVoiceTurns(): VoiceTurnsBinding {
+	return { provider: _voiceTurns, revision: _voiceContextRevision };
+}
 
 /** Bind (or, with null, release) a reader of the live session's turns. A task written
  *  afterwards carries the owner's last spoken words verbatim, beside the model's own
@@ -257,15 +276,30 @@ let _voiceTurns: VoiceTurnsProvider | null = null;
  *  the tool ran, so the transcript block structurally lacked the utterance itself). */
 export function setVoiceTurnsProvider(fn: VoiceTurnsProvider | null): void {
 	_voiceTurns = fn;
+	_voiceContextRevision++;
 }
 
-function _readSnapshot(): VoiceTurnsSnapshot | null {
+function _readSnapshot(provider: VoiceTurnsProvider | null = _voiceTurns): VoiceTurnsSnapshot | null {
 	let raw: ReturnType<VoiceTurnsProvider>;
-	try { raw = _voiceTurns?.(); } catch { return null; }
+	try { raw = provider?.(); } catch { return null; }
 	if (!raw) return null;
 	if (Array.isArray(raw)) return { items: raw };
 	const snap = raw as VoiceTurnsSnapshot;
 	return Array.isArray(snap.items) || snap.pendingInput || typeof snap.lastUserSpeechAt === 'number' ? snap : null;
+}
+
+/** Turns of the live conversation a work task carries, after the summary of what came before them. */
+export const CONTEXT_RECENT_ITEMS = 10;
+
+/** The live session's conversation at the ask: its summary, then the last turns. Null without a session. */
+export function _voiceContextAtAsk(): string | null {
+	const snap = _readSnapshot();
+	if (!snap) return null;
+	const items = Array.isArray(snap.items) ? snap.items : [];
+	const recent = renderItems(items.filter((i) => i.role === 'user' || i.role === 'assistant').slice(-CONTEXT_RECENT_ITEMS));
+	const summary = typeof snap.summary === 'string' ? snap.summary.trim() : '';
+	const parts = [summary ? `summary of the conversation before these turns:\n${summary}` : '', recent].filter(Boolean);
+	return parts.length ? parts.join('\n\n') : null;
 }
 
 /** Longest single utterance the block carries; a longer one (a paste typed into the session) is cut. */
@@ -278,8 +312,8 @@ const _NOT_OWNER_WORDS = ['[System:', '[Uploaded file:'];
 /** The real user utterances of the CURRENT turn (newest last): user items after the last
  *  assistant item, plus the transcription still buffered by the runtime. Bound to the turn
  *  that triggered the call: a previous turn's words never stand in for this one's. */
-export function _spokenTurns(count = 2): string[] {
-	const snap = _readSnapshot();
+export function _spokenTurns(count = 2, provider: VoiceTurnsProvider | null = _voiceTurns): string[] {
+	const snap = _readSnapshot(provider);
 	if (!snap) return [];
 	const items = Array.isArray(snap.items) ? snap.items : [];
 	const spoken: string[] = [];
@@ -305,8 +339,8 @@ export const RECENT_SPEECH_MS = 10_000;
 
 /** Whether waiting for a transcription makes sense: the owner spoke recently, or the
  *  runtime cannot say. A model-initiated turn (no recent speech) has nothing to wait for. */
-export function _speechMayBeLanding(now = Date.now()): boolean {
-	const snap = _readSnapshot();
+export function _speechMayBeLanding(now = Date.now(), provider: VoiceTurnsProvider | null = _voiceTurns): boolean {
+	const snap = _readSnapshot(provider);
 	const at = snap?.lastUserSpeechAt;
 	if (typeof at !== 'number' || !Number.isFinite(at)) return true;
 	return now - at <= RECENT_SPEECH_MS;
@@ -315,13 +349,22 @@ export function _speechMayBeLanding(now = Date.now()): boolean {
 /** The current turn's utterances, waiting up to `maxMs` for a late transcription chunk
  *  when none has arrived yet (the runtime flushes only what it has when the tool fires);
  *  no wait for a turn the model started on its own. */
-export async function _awaitSpokenTurns(count = 2, maxMs = SPOKEN_WAIT_MS, sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)), isCurrent: () => boolean = () => true): Promise<string[]> {
-	if (!_voiceTurns) return [];
-	// Words read after the session moved belong to the new session, not to this call.
-	const read = () => { const spoken = _spokenTurns(count); return isCurrent() ? spoken : null; };
+export async function _awaitSpokenTurns(
+	count = 2, maxMs = SPOKEN_WAIT_MS,
+	sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+	binding = captureVoiceTurns(),
+): Promise<string[]> {
+	const { provider, revision } = binding;
+	if (!provider) return [];
+	// Re-checked after every read: the session can move during the read itself.
+	const read = () => {
+		if (revision !== _voiceContextRevision) return null;
+		const spoken = _spokenTurns(count, provider);
+		return revision === _voiceContextRevision ? spoken : null;
+	};
 	const first = read();
 	if (first === null) return [];
-	if (first.length > 0 || !_speechMayBeLanding()) return first;
+	if (first.length > 0 || !_speechMayBeLanding(Date.now(), provider)) return first;
 	const deadline = Date.now() + maxMs;
 	for (;;) {
 		await sleep(SPOKEN_POLL_MS);
@@ -424,10 +467,12 @@ export const _pendingTasksForTest = _pendingTasks;
 // task. A snapshot without engagement is still queued; no snapshot at all (a
 // runtime that never writes one) keeps the submission clock.
 export type TaskActivity = 'started' | 'queued' | 'none';
-const ENGAGED_ROW_KINDS = new Set(['working']);
+const ENGAGED_ROW_KINDS: ReadonlySet<string> = new Set(['working']);
+// The core has read the task: too late to cancel it, though it is not yet engaged.
+const HANDED_OVER_ROW_KINDS: ReadonlySet<string> = new Set(['processing', 'working']);
 
-/** Whether the session's own activity hook recorded real work on the task. */
-export function _taskHasWorkingRow(taskId: string): boolean {
+/** Whether the session's own activity hook recorded a row of `kinds` (default: real work) on the task. */
+export function _taskHasWorkingRow(taskId: string, kinds: ReadonlySet<string> = ENGAGED_ROW_KINDS): boolean {
 	const log = join(REPO_DIR, 'state', 'agent-activity.jsonl');
 	if (!existsSync(log)) return false;
 	try {
@@ -436,7 +481,7 @@ export function _taskHasWorkingRow(taskId: string): boolean {
 			let rec: { projection?: unknown; kind?: unknown; task?: { id?: unknown } };
 			try { rec = JSON.parse(line); } catch { continue; }
 			if (!rec || rec.projection === 'TASK_STATUS' || rec.task?.id !== taskId) continue;
-			if (typeof rec.kind === 'string' && ENGAGED_ROW_KINDS.has(rec.kind)) return true;
+			if (typeof rec.kind === 'string' && kinds.has(rec.kind)) return true;
 		}
 	} catch { /* unreadable log: no evidence */ }
 	return false;
@@ -454,6 +499,218 @@ export function _taskActivity(taskId: string): TaskActivity {
 	} catch {
 		return 'none';
 	}
+}
+
+// Where a voice task stands, from the core's own records, so a cancel reports what the core really did.
+export type VoiceTaskState = 'queued' | 'started' | 'done' | 'cancelled' | 'unknown';
+
+// Queued voice tasks the user asked to cancel.
+const _cancelledVoiceTasks = new Set<string>();
+
+function _activityPhase(taskId: string): string | null {
+	try {
+		const d = JSON.parse(readFileSync(join(REPO_DIR, 'state', 'activity', `${taskId}.json`), 'utf-8')) as { phase?: unknown };
+		return typeof d.phase === 'string' ? d.phase : null;
+	} catch {
+		return null;
+	}
+}
+
+/** A result for the task exists, live or archived (results/archive/YYYY-MM/, this month or last). */
+function _hasResult(taskId: string): boolean {
+	if (existsSync(join(RESULT_DIR, `${taskId}.txt`))) return true;
+	const now = new Date();
+	const last = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+	return [now, last].some((d) => existsSync(join(RESULT_DIR, 'archive', d.toISOString().slice(0, 7), `${taskId}.txt`)));
+}
+
+/** The relay agent's task table: one row per voice task; survives a voice-agent restart. */
+export const voiceTaskStore = createVoiceTaskStore();
+
+/** The task's result text, live or archived (this month or last); null when there is none. */
+function _readResultText(taskId: string): string | null {
+	const now = new Date();
+	const last = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+	const paths = [join(RESULT_DIR, `${taskId}.txt`), ...[now, last].map((d) => join(RESULT_DIR, 'archive', d.toISOString().slice(0, 7), `${taskId}.txt`))];
+	for (const p of paths) {
+		try { if (existsSync(p)) return readFileSync(p, 'utf-8').trim(); } catch { /* next */ }
+	}
+	return null;
+}
+
+/** Said with a result the relay hands over again because the user never heard it. */
+export const MISSED_RESULT_NOTE = 'The user did not hear this result when it arrived (it went to their DM, or the answer was lost or cut off). Tell them now, briefly.';
+
+/** Where the task stands now. "started" means the core has read it (a processing row) or is engaged. */
+export function voiceTaskState(taskId: string): VoiceTaskState {
+	if (_cancelledVoiceTasks.has(taskId) || voiceTaskStore.get(taskId)?.cancelRequested) return 'cancelled';
+	if (_hasResult(taskId)) return 'done';
+	const phase = _activityPhase(taskId);
+	if (phase === 'COMPLETED' || phase === 'FAILED') return 'done';
+	if (phase === 'CANCELLED') return 'cancelled';
+	if (_taskHasWorkingRow(taskId, HANDED_OVER_ROW_KINDS)) return 'started';
+	const activity = _taskActivity(taskId);
+	if (activity !== 'none') return activity;
+	// No snapshot: a task file still in tasks/ is queued; one the core took may be running.
+	if (existsSync(join(TASK_DIR, `${taskId}.txt`))) return 'queued';
+	return _pendingTasks.has(taskId) ? 'started' : 'unknown';
+}
+
+/** Voice tasks still awaiting a result, latest first: this process's pending ones plus the table's (after a restart). */
+function _openVoiceTasks(): Array<{ id: string; text: string; submittedAt: number }> {
+	const open = new Map<string, { id: string; text: string; submittedAt: number }>();
+	for (const [id, row] of voiceTaskStore.list()) {
+		if (row.submittedAt === undefined || row.cancelRequested) continue;
+		const state = voiceTaskState(id);
+		if (state === 'queued' || state === 'started') open.set(id, { id, text: row.text ?? '', submittedAt: row.submittedAt });
+	}
+	for (const [id, p] of _pendingTasks) open.set(id, { id, text: p.taskText, submittedAt: p.submittedAt });
+	return [...open.values()].filter((t) => !_cancelledVoiceTasks.has(t.id)).sort((a, b) => b.submittedAt - a.submittedAt);
+}
+
+/** The task "cancel it" means: the latest voice task that is still open. */
+export function latestOpenVoiceTask(): string | undefined {
+	return _openVoiceTasks()[0]?.id;
+}
+
+/** The open voice task whose text contains `query` (case-insensitive), latest first. */
+export function findOpenVoiceTask(query: string): string | undefined {
+	const needle = query.toLowerCase();
+	return _openVoiceTasks().find((t) => t.text.toLowerCase().includes(needle))?.id;
+}
+
+/** The voice task whose text contains `query`: an open one first, else the latest recent one, finished or not. */
+export function findVoiceTask(query: string, now = Date.now()): string | undefined {
+	const open = findOpenVoiceTask(query);
+	if (open) return open;
+	const needle = query.toLowerCase();
+	return voiceTaskStore.list()
+		.filter(([, row]) => row.submittedAt !== undefined && now - row.submittedAt <= STATUS_WINDOW_MS && (row.text ?? '').toLowerCase().includes(needle))
+		.sort((a, b) => (b[1].submittedAt ?? 0) - (a[1].submittedAt ?? 0))[0]?.[0];
+}
+
+/** How long a finished row stays in status answers. */
+const STATUS_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+export interface VoiceTaskRow {
+	id: string;
+	text: string;
+	submittedAt: number;
+	/** queued / started / done / cancelled, read from the core now. */
+	state: VoiceTaskState;
+	/** How the result reached the user, once it has. */
+	delivery?: 'spoken' | 'injected' | 'dm';
+	/** Ended with nothing to hear: nothing is pending for the user. */
+	retired?: boolean;
+}
+
+/** The relay agent's view for status answers: voice tasks from the last few hours, oldest first. */
+export function voiceTaskRows(now = Date.now()): VoiceTaskRow[] {
+	const rows: VoiceTaskRow[] = [];
+	for (const [id, row] of voiceTaskStore.list()) {
+		if (row.submittedAt === undefined || now - row.submittedAt > STATUS_WINDOW_MS) continue;
+		let state: VoiceTaskRow['state'] = voiceTaskState(id);
+		if (row.cancelRequested && _hasResult(id)) state = 'done';
+		rows.push({ id, text: row.text ?? '', submittedAt: row.submittedAt, state, delivery: row.delivery, ...(row.retired ? { retired: true } : {}) });
+	}
+	return rows;
+}
+
+const OFFLINE_COPY_RE = /^proactive-result-(task-[A-Za-z0-9._-]+?)-\d+\.txt$/;
+
+/** The task an untagged offline DM copy (forwardOfflineVoiceResult) answers, or null. */
+export function _offlineCopyTask(file: string): string | null {
+	return OFFLINE_COPY_RE.exec(file)?.[1] ?? null;
+}
+
+function _hasLiveOfflineCopy(taskId: string): boolean {
+	try {
+		return readdirSync(RESULT_DIR).some((f) => _offlineCopyTask(f) === taskId && !_deliveredResults.has(f));
+	} catch {
+		return false;
+	}
+}
+
+/** Delivers an owed result or notice to the user (the relay agent's queue). */
+export type RelayDeliver = (text: string, note: string | undefined, meta: { taskId?: string; framed?: boolean; about?: string }) => void;
+
+/** The "not picked up" notice for this task still holds: still queued, and nothing about it reached the user. */
+export function notPickedStillTrue(taskId: string): boolean {
+	const row = voiceTaskStore.get(taskId);
+	return !row?.delivery && !row?.supersededBy && !row?.cancelRequested && voiceTaskState(taskId) === 'queued';
+}
+
+/**
+ * The relay agent's reconcile pass: for every recent voice task, compare what the core did with
+ * what the user heard, and hand over whatever is still owed. Called while the session can speak.
+ */
+export function reconcileVoiceTasks(deliver: RelayDeliver, isInFlight: (taskId: string) => boolean, now = Date.now()): void {
+	for (const [id, row] of voiceTaskStore.list()) {
+		if (row.submittedAt === undefined || now - row.submittedAt > STATUS_WINDOW_MS) continue;
+		// A result still in results/ is the watcher's to deliver first.
+		// An offline DM copy still in results/ is on its way (a bridge takes it, or the drain speaks it on reconnect).
+		if (_hasLiveOfflineCopy(id)) continue;
+		// A task the core answered in another task's result is owed that result.
+		const source = row.answeredBy ?? id;
+		if (source !== id && _hasLiveOfflineCopy(source)) continue;
+		const settledResult = existsSync(join(RESULT_DIR, `${source}.txt`)) ? _deliveredResults.has(`${source}.txt`) : _hasResult(source);
+		const text = settledResult ? _readResultText(source) : null;
+		const action = planReconcile({
+			row,
+			core: voiceTaskState(id),
+			settledResult: settledResult && !!text,
+			resultIsSkip: !!text && bodyIsSkipMarked(text),
+			inFlight: isInFlight(id) || isInFlight(source),
+			now,
+		});
+		if (action === 'speak_result' && text) {
+			console.log(`${ts()} [RelayAgent] ${id}: result never heard (${row.delivery ?? 'no delivery'})${source !== id ? `, answered in ${source}` : ''}; handing it over again`);
+			voiceTaskStore.noteReplay(id);
+			deliver(stripVoiceControlLines(text).trim(), row.cancelRequested ? CANCELLED_BUT_FINISHED_NOTE : MISSED_RESULT_NOTE, { taskId: id });
+		} else if (action === 'tell_not_picked') {
+			const minutes = Math.floor((now - (row.submittedAt ?? now)) / 60000);
+			console.log(`${ts()} [RelayAgent] ${id}: not picked up after ${minutes}m; telling the user`);
+			voiceTaskStore.noteNotPicked(id);
+			deliver(framedSystem(`The user's task "${(row.text ?? '').slice(0, 80).replace(/"/g, "'")}" has not been picked up by the core after ${minutes} minutes. It is still queued; the core may be busy or down. Tell the user in one sentence.`), undefined, { framed: true, about: id });
+		}
+	}
+}
+
+/** How many of the user's other voice tasks are still open ahead of `taskId`. */
+export function voiceTasksAhead(taskId: string): number {
+	const self = voiceTaskStore.get(taskId)?.submittedAt ?? Date.now();
+	return _openVoiceTasks().filter((t) => t.id !== taskId && t.submittedAt <= self).length;
+}
+
+/** A task the voice agent submitted: only these may be reported as cancelled outright. */
+export function isVoiceSubmittedTask(taskId: string): boolean {
+	return _pendingTasks.has(taskId) || _isVoiceTask(taskId);
+}
+
+/** A queued voice task the user asked to cancel: its file is deleted, so it is cancelled. */
+export function noteVoiceTaskCancelled(taskId: string): void {
+	_onVoiceTaskEnded?.(taskId, 'cancelled');
+	_cancelledVoiceTasks.add(taskId);
+	voiceTaskStore.markCancelRequested(taskId);
+	_pendingTasks.delete(taskId);
+	// Deleted, not archived: a core that misses the file looks in tasks/archive/ and runs what it finds there.
+	try { unlinkSync(join(TASK_DIR, `${taskId}.txt`)); } catch { /* already gone */ }
+	_sendTaskStatus?.(taskId, 'done', 'Cancelled.');
+}
+
+export type VoiceTaskEnd = 'cancelled' | 'delivered_separately';
+let _onVoiceTaskEnded: ((taskId: string, why: VoiceTaskEnd) => void) | null = null;
+/** Told of each voice task whose result never comes back to voice (cancelled, or sent to the DM). */
+export function setVoiceTaskEndedListener(fn: ((taskId: string, why: VoiceTaskEnd) => void) | null): void {
+	_onVoiceTaskEnded = fn;
+}
+
+/** A task the user asked to cancel that the core ran anyway. */
+export const CANCELLED_BUT_FINISHED_NOTE = 'The user asked to cancel this task, but the core had already taken it and it finished. Tell them in one sentence that it finished anyway.';
+
+/** Test-only: forget cancels between cases. */
+export function _resetVoiceTaskCancelsForTest(): void {
+	_cancelledVoiceTasks.clear();
 }
 
 // Dedup window: identical task text within 2 minutes → return existing taskId.
@@ -623,6 +880,7 @@ export function _forwardOfflineThenArchive(
 	_deliveredResults.add(file);
 	_pendingTasks.delete(taskId);
 	return forward(taskId, result, undefined, dmOnly).then(() => {
+		voiceTaskStore.set(taskId, 'dm');
 		setTimeout(() => {
 			archiveFile(join(RESULT_DIR, file), 'results', taskId);
 			const taskFile = join(TASK_DIR, `${taskId}.txt`);
@@ -655,6 +913,17 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	}
 	lines.push(`user_id: ${ownerId}`, 'access_tier: owner', 'priority: urgent');
 	return lines.join('\n') + '\n';
+}
+
+/** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority. */
+export async function submitVoiceSessionEndTask(summary: string, transcript: string): Promise<string> {
+	const taskId = `task-${Date.now()}`;
+	const ownerId = process.env.SUTANDO_DM_OWNER_ID || 'voice-local';
+	const header = buildVoiceTaskHeader(taskId, new Date().toISOString(), ownerId, null).replace('priority: urgent', 'priority: low');
+	const body = transcript ? `\n\n--- the session's spoken lines (may contain ASR errors) ---\n${confineUserContent(transcript)}\n` : '\n';
+	await _delegation.submitTask(taskId, `${header}task: ${confineUserContent(summary)}${body}`);
+	console.log(`${ts()} [TaskBridge] Session-end task: ${taskId}`);
+	return taskId;
 }
 
 /** Remember the origin a task was written with, so its result can follow it. */
@@ -789,20 +1058,6 @@ export function setTaskStatusCallback(fn: (taskId: string, status: string, text:
 // Main agent tool — writes task file directly, no subagent needed
 // ---------------------------------------------------------------------------
 
-// The core's own bookkeeping files are not the owner's queue. Mirrors
-// src/task_queue.py BOOKKEEPING_PREFIXES, the pending list's single owner.
-const QUEUE_BOOKKEEPING_PREFIXES = ['task-cron-', 'task-bench-', 'task-workstream-', 'task-project-grouping-'];
-
-/** How many owner tasks are pending in `dir` besides `excludeId`: the voice
- *  agent's "N ahead of this one". A directory it cannot read counts as 0 —
- *  the number is a courtesy line, never a reason to fail the delegation. */
-export function countQueuedAhead(dir: string, excludeId: string): number {
-	let names: string[];
-	try { names = readdirSync(dir); } catch { return 0; }
-	return names.filter(f => f.startsWith('task-') && f.endsWith('.txt') && f !== `${excludeId}.txt`
-		&& !QUEUE_BOOKKEEPING_PREFIXES.some(p => f.startsWith(p))).length;
-}
-
 /** The sentence the voice agent says when other tasks are ahead; empty when none are. */
 export function queuedAheadInstruction(queuedAhead: number): string {
 	if (queuedAhead <= 0) return '';
@@ -810,6 +1065,21 @@ export function queuedAheadInstruction(queuedAhead: number): string {
 		? 'Got it, right after the one I\'m on.'
 		: `Got it, ${queuedAhead} in line before this one.`;
 	return ` ${queuedAhead} task(s) are still running ahead of this one. Tell the user exactly "${line}" and wait; do not narrate the queue again.`;
+}
+
+/** What the model is told when `work` has queued the task; the result follows when the core finishes. */
+export const WORK_PENDING_MESSAGE = 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.';
+
+/** What a `work` call carries from the moment it was made: where it was asked, and the words around it. */
+export type WorkOrigin = { origin: VoiceSessionOrigin | null; turns: VoiceTurnsBinding; recentAtAsk: string };
+const WORK_ORIGIN = Symbol('workOrigin');
+
+/** The task belongs to the origin, and the words, it was asked from, even if the session moves or the adapter mutates its record later. */
+export function captureWorkOrigin(): WorkOrigin {
+	const origin = _voiceSessionOrigin ? { ..._voiceSessionOrigin, headers: { ..._voiceSessionOrigin.headers } } : null;
+	let recentAtAsk = '';
+	try { recentAtAsk = _voiceContextAtAsk() ?? getRecentConversation(4); } catch { /* best effort */ }
+	return { origin, turns: captureVoiceTurns(), recentAtAsk };
 }
 
 export const workTool: ToolDefinition = {
@@ -820,6 +1090,13 @@ export const workTool: ToolDefinition = {
 		'This is how Sutando thinks and acts. Results are spoken back when ready.',
 	parameters: z.object({
 		task: z.string().describe('Full description of the task to perform'),
+		replaces: z
+			.string()
+			.optional()
+			.describe(
+				'Only when this request corrects one the user made earlier in this conversation ' +
+				'(e.g. a misheard number): the words that identify that earlier request, e.g. "51167".'
+			),
 		timeout_minutes: z
 			.number()
 			.optional()
@@ -840,19 +1117,15 @@ export const workTool: ToolDefinition = {
 				'a timeout DM that shouldn\'t have gone through.'
 			),
 	}),
-	execution: 'inline',
+	// Runs as the relay agent subagent: the model hears the pending message now, the result when the core finishes.
+	execution: 'background',
+	pendingMessage: WORK_PENDING_MESSAGE,
 	async execute(args) {
 		const { task, timeout_minutes, dm_on_timeout } = args as {
 			task: string;
 			timeout_minutes?: number;
 			dm_on_timeout?: boolean;
 		};
-		// Read before the first await: the session can move to another origin while this call
-		// waits, and the task belongs to the origin, and the words, it was asked from.
-		const origin = _voiceSessionOrigin;
-		const originGeneration = _voiceOriginGeneration;
-		let recentAtAsk = '';
-		try { recentAtAsk = getRecentConversation(4); } catch { /* best effort */ }
 
 		// Redirect pure screen-viewing tasks to inline tools (faster, no round-trip)
 		// Narrow match: only "describe/look at my screen" — not scroll, screenshot,
@@ -861,6 +1134,9 @@ export const workTool: ToolDefinition = {
 		if (screenViewOnly.test(task)) {
 			return { status: 'rejected', message: 'Use describe_screen inline tool directly for screen viewing.' };
 		}
+
+		// Read before the first await, unless the relay agent captured it when the call began.
+		const { origin, turns, recentAtAsk } = (args as { [WORK_ORIGIN]?: WorkOrigin })[WORK_ORIGIN] ?? captureWorkOrigin();
 
 		// Fast path: handle known patterns inline for ~3s vs ~15s via file bridge.
 		// Same pattern as conversation-server's tryFastPath.
@@ -964,7 +1240,7 @@ export const workTool: ToolDefinition = {
 			// wording against real speech instead of trusting it.
 			let spokenBlock = '';
 			try {
-				const spoken = await _awaitSpokenTurns(2, SPOKEN_WAIT_MS, undefined, () => _voiceOriginGeneration === originGeneration);
+				const spoken = await _awaitSpokenTurns(2, SPOKEN_WAIT_MS, undefined, turns);
 				if (spoken.length > 0) {
 					spokenBlock =
 						`\n\n--- spoken (the owner's last words, verbatim as transcribed, or as typed into the voice session; the task line ` +
@@ -977,7 +1253,7 @@ export const workTool: ToolDefinition = {
 				const recent = recentAtAsk;
 				if (recent) {
 					contextBlock =
-						`\n\n--- recent voice transcript (may contain ASR errors; if the task above ` +
+						`\n\n--- earlier in this voice conversation: a summary, then the last turns (may contain ASR errors; if the task above ` +
 						`seems garbled or doesn't match this, infer the true intent from it or ask to ` +
 						`confirm before acting) ---\n${confineUserContent(recent)}\n`;
 				}
@@ -999,24 +1275,28 @@ export const workTool: ToolDefinition = {
 		// default was producing unwanted DMs). Caller must explicitly pass
 		// dm_on_timeout: true on critical tasks where they want the fallback.
 		_pendingTasks.set(taskId, pendingEntry());
+		voiceTaskStore.add(taskId, task);
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);
 		console.log(`${ts()} [TaskBridge] Task ${taskId}: ${task.slice(0, 100)}`);
 		_sendTaskStatus?.(taskId, 'working', task.slice(0, 60));
-		// Counted after the write, so the file just written is excluded by id and
-		// everything older in tasks/ is what stands ahead of it.
-		const queuedAhead = countQueuedAhead(TASK_DIR, taskId);
+		// The user's own voice tasks still open ahead of this one, from the relay agent's table.
+		const queuedAhead = voiceTasksAhead(taskId);
 		return {
 			status: 'pending',
 			taskId,
 			queuedAhead,
-			message: (watcherOnline
-				? 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.'
+			watcherOnline,
+			message: (watcherOnline ? WORK_PENDING_MESSAGE
 				: 'Task has been saved. The processing engine will pick it up on its next pass (within a few minutes). Tell the user the task is queued and will be handled shortly.')
 				+ queuedAheadInstruction(queuedAhead),
 		};
 	},
 };
+
+/** The `work` call as the relay agent runs it: the tool's own submission, then the core's result. */
+export const submitWorkTask = (args: Record<string, unknown>, at?: WorkOrigin) =>
+	workTool.execute(at ? { ...args, [WORK_ORIGIN]: at } : args, undefined as never) as Promise<Record<string, unknown>>;
 
 // cancelTask tool moved — canonical version is `cancelTaskTool` in inline-tools.ts.
 
@@ -1033,11 +1313,25 @@ export const workTool: ToolDefinition = {
  *  character can render as multiple bytes. Lifted to LOG_LINE_MAX_CHARS;
  *  override via SUTANDO_LOG_LINE_MAX_CHARS env if a host wants tighter logs. */
 const LOG_LINE_MAX_CHARS = Number(process.env.SUTANDO_LOG_LINE_MAX_CHARS) || 2000;
-export function logConversation(role: string, text: string, sessionId?: string): void {
+export function logConversation(role: string, text: string, sessionId?: string, at: Date = new Date()): void {
 	const capped = text.replace(/\n/g, ' ').slice(0, LOG_LINE_MAX_CHARS);
-	const line = `${new Date().toISOString()}|${role}|${capped}\n`;
+	const line = `${at.toISOString()}|${role}|${capped}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
-	recordConversation(role, capped, sessionId); // #603 sqlite mirror — best-effort, swallowed inside
+	recordConversation(role, capped, sessionId, { tsUnix: at.getTime() / 1000 }); // #603 sqlite mirror — best-effort, swallowed inside
+}
+
+/** logConversation without blocking: the log line through fs/promises, the sqlite row through
+ *  the store's worker. Resolves when both are written; failures are logged, never thrown. */
+export async function logConversationAsync(role: string, text: string, sessionId?: string, at: Date = new Date()): Promise<void> {
+	const capped = text.replace(/\n/g, ' ').slice(0, LOG_LINE_MAX_CHARS);
+	try { await appendFile(CONVERSATION_LOG, `${at.toISOString()}|${role}|${capped}\n`); } catch { /* best effort */ }
+	await recordConversationAsync(role, capped, sessionId, { tsUnix: at.getTime() / 1000 });
+}
+
+/** logSessionBoundary without blocking. */
+export async function logSessionBoundaryAsync(reason: string = 'user_goodbye'): Promise<void> {
+	try { await appendFile(CONVERSATION_LOG, `${new Date().toISOString()}|SESSION_END|${reason}\n`); } catch { /* best effort */ }
+	await recordSessionBoundaryAsync(reason);
 }
 
 /** Append a session-end boundary marker. Used by voice-agent's
@@ -1051,6 +1345,8 @@ export function logConversation(role: string, text: string, sessionId?: string):
  *  The `SESSION_END` sentinel is unique so the reader can locate
  *  it without regex gymnastics. */
 export function logSessionBoundary(reason: string = 'user_goodbye'): void {
+	// A farewell is said inside the session ("research X, bye"): words still landing stay with
+	// that task. The client leaving afterwards closes the window (endVoiceClientSession).
 	const line = `${new Date().toISOString()}|SESSION_END|${reason}\n`;
 	try { appendFileSync(CONVERSATION_LOG, line); } catch { /* best effort */ }
 	recordSessionBoundary(reason); // #603 sqlite mirror
@@ -1266,15 +1562,19 @@ function startRelayResultWatcher(onResult: ResultListener): void {
 				if (_deliveredResults.has(file)) continue;
 				const taskId = file.replace('.txt', '');
 				if (!_pendingTasks.has(taskId)) continue; // not ours — leave it
-				const result = (await _delegation.readResultFile(file)).trim();
-				if (!result) continue;
+				const raw = (await _delegation.readResultFile(file)).trim();
+				if (!raw) continue;
+				const result = stripVoiceControlLines(raw).trim();
 				_deliveredResults.add(file);
 				_pendingTasks.delete(taskId);
 				// Shared predicate, not a local regex: this grammar must stay identical to
 				// src/result_markers.py, which is case-insensitive and accepts `[deduped:]`.
-				if (!bodyIsSkipMarked(result)) {
+				if (!bodyIsSkipMarked(raw)) {
 					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
 					onResult(`[Task result for ${taskId}]\n${result}`);
+				} else {
+					const answeredIn = dedupTarget(raw);
+					if (answeredIn && voiceTaskStore.get(taskId)) voiceTaskStore.setAnsweredBy(taskId, answeredIn);
 				}
 				await _delegation.archiveResultFile(file, taskId);
 			}
@@ -1387,7 +1687,7 @@ export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Da
 
 /** The drain's listener: the result text, plus an optional delivery note injected under it
  *  when the written copy went somewhere other than the session was told to expect. */
-export type ResultListener = (result: string, deliveryNote?: string) => void;
+export type ResultListener = (result: string, deliveryNote?: string, meta?: { taskId?: string }) => void;
 
 export function startResultWatcher(onResult: ResultListener, isClientConnected: () => boolean): void {
 	if (_delegation.mode === 'relay') {
@@ -1452,9 +1752,9 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 				// Detected before the strip: an origin-bound result that carries the
 				// marker is kept to the owner's DM (keepVoiceResultToDm).
 				const dmOnly = DM_ONLY_RE.test(rawResult);
-				const result = rawResult
-					.replace(/^[ \t]*\[dm-only\][ \t]*\r?\n?/gim, '')
-					.trim();
+				// Skip and ownership read the raw body; the strip is for speech and logs only.
+				const raw = rawResult.trim();
+				const result = stripVoiceControlLines(rawResult).trim();
 				if (!result) continue;
 				const taskId = file.replace('.txt', '');
 
@@ -1481,14 +1781,27 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 				// (e.g. Discord bridge already replied) or the result should be suppressed entirely.
 				// Parity with Python bridges: discord-bridge.py and telegram-bridge.py both honor
 				// these via parse_markers(); task-bridge.ts must too (issue #1381).
-				if (isSkipMarked(file, result)) {
+				if (isSkipMarked(file, raw)) {
 					// Ownership must survive a restart (_pendingTasks is in-memory)
 					// and the timeout sweep; suppression applies either way.
 					const owns = (id: string) => _pendingTasks.has(id) || _isVoiceTask(id);
-					if (!mayRetireSkipMarked(file, result, owns, _taskOrigin)) {
+					if (!mayRetireSkipMarked(file, raw, owns, _taskOrigin)) {
 						continue;   // another consumer's: leave the files for its owner
 					}
 					console.log(`${ts()} [TaskBridge] ${taskId} has skip marker; archiving silently`);
+					// A voice task the core answered in another task's result: the table owes the user that result.
+					const answeredIn = dedupTarget(raw);
+					if (answeredIn && voiceTaskStore.get(taskId)) {
+						voiceTaskStore.setAnsweredBy(taskId, answeredIn);
+						console.log(`${ts()} [RelayAgent] ${taskId}: answered in ${answeredIn}`);
+						// That result already reached the model: this task's call has nothing more coming.
+						const went = voiceTaskStore.get(taskId)?.delivery;
+						if (went === 'spoken' || went === 'injected') _onVoiceTaskEnded?.(taskId, 'delivered_separately');
+					} else if (voiceTaskStore.get(taskId)) {
+						// Nothing to hear for this task: the table must not count it as pending (2026-10-12 00:33:
+						// two tasks retired this way were counted, and the user heard "6" for 4).
+						voiceTaskStore.markRetired(taskId);
+					}
 					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 					_deliveredResults.add(file);
 					_pendingTasks.delete(taskId);
@@ -1542,6 +1855,8 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 						// Claimed now, delivered once the origin is re-verified; an
 						// unverified origin falls back to the owner DM.
 						void _forwardOfflineThenArchive(taskId, file, result, dmOnly);
+						for (const id of [taskId, ...voiceTaskStore.answeredBy(taskId).map(([other]) => other)])
+							_onVoiceTaskEnded?.(id, 'delivered_separately');
 					}
 					// Chat-path tasks have no bridge consumer — archive them directly
 					// so results/task-chat-*.txt files don't accumulate forever.
@@ -1619,9 +1934,12 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					// owner's DM when the core marked it `[dm-only]` — and voice is told which.
 					const taskOrigin = registersTask && !foreignOrigin ? voiceTaskOrigin(taskId) : null;
 					const keptToDm = taskOrigin ? keepVoiceResultToDm(taskId, result, dmOnly) : null;
-					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE);
+					const offlineCopyOf = _offlineCopyTask(file);
+					const meta = registersTask && !foreignOrigin ? { taskId } : offlineCopyOf ? { taskId: offlineCopyOf } : undefined;
+					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE, meta);
 					else if (taskOrigin) void _deliverOriginBoundResult(taskId, result, taskOrigin, onResult);
-					else onResult(result);
+					else if (_cancelledVoiceTasks.has(taskId)) onResult(result, CANCELLED_BUT_FINISHED_NOTE, meta);
+					else onResult(result, offlineCopyOf ? MISSED_RESULT_NOTE : undefined, meta);
 					// Notify agent-api directly (task results only), then delete file
 					if (registersTask) {
 						try {

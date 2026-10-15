@@ -29,6 +29,7 @@ lower-precedence candidate.
 | `REMOTE_TASK_TOKEN` | yes | — | Bearer token sent on every request. |
 | `REMOTE_TASK_PROVIDER` | no | `remote` | Label written as a task's `source:` when the task omits one. |
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
+| `REMOTE_TASK_ON_TASK` | no | — | Wake command run once per newly queued task file. Split with `shlex` and run without a shell, the file path appended as the last argument; `SPARROW_TASK_ID` and `SPARROW_TASK_FILE` are set and every relay credential is removed from its environment. Sparrow does not wait for it, kill it, or retry it; a non-zero exit or a start failure is logged once. |
 | `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`guest` for a shared gateway (see Security); `other` is accepted as the legacy spelling of `guest`. |
 | `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one; with no reading yet they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
 | `REMOTE_ALERT_ROOM` | no | none (gateway alert disabled) | Explicit owner-only room id for core-independent health alerts sent by the launchd fallback. Never inferred from last activity because that room may be shared. |
@@ -95,7 +96,7 @@ room-specific provider session.
 Claim/acknowledge a task so the server stops redelivering it.
 
 ```
-body: { "id": "task-123", "durable": true }
+body: { "id": "task-123", "lease_id": "<the served task's lease_id>", "durable": true }
 ```
 
 The client acks each task as it is accepted. A server with at-least-once
@@ -112,6 +113,10 @@ task is already queued and its durability could not be repaired. Acks that do
 not confirm are persisted and retried; a per-task `404 {"error": "not leased …"}`
 retires the retry for good, while a bare no-route 404/405 keeps the
 endpoint-unsupported cooldown.
+When the served task carries a `lease_id` (the broker's lease generation, fresh
+on every serve), the ack echoes it — also on a retry after a restart, since the
+pending-ack ledger keeps it — and a `404 {"reason": "stale lease generation"}`
+retires that ack the same way; a task served without one is acked without the key.
 
 ### `POST /v1/results`
 
@@ -119,7 +124,32 @@ Return a task's result.
 
 ```
 body: { "id": "task-123", "body": "<result text>" }
+body: { "id": "task-123", "body": "<result text>", "thread": "ask" }   // optional
 ```
+
+**`thread` (optional).** Defined by the broker in
+[ag2-space/ag2space-backend#2138](https://github.com/ag2-space/ag2space-backend/pull/2138).
+`"ask"` asks the broker to answer in a new thread rooted on the task's own asking
+message; no field names an event id, so a result can only open a thread on the
+message it was asked in. The broker:
+
+- answers an ask already in a thread in that thread, with or without the field;
+- ignores the field and posts a plain reply when the task has no source message,
+  the body redirects with `[channel:]`, or the ask cannot root a thread;
+- treats absent, `null` or `false` as today's placement;
+- answers `400 {"error": "invalid thread: ..."}` for any other value and records,
+  sends and completes nothing: the lease stays open.
+
+A broker that predates the field ignores it, so a client may send it before the
+broker supports it. The client sends only `"ask"`, and only on an ordinary
+(non-suppressed, non-redirected) task result whose leading lines carry a bare
+`[thread]` line (`src/result_markers.py`). Backend #2138 defines `"ask"` as valid,
+so a `400` (or any other refusal) of a result carrying it is a bug to investigate,
+not something the client degrades around: it parks like any other 4xx (below), with
+no re-post. A retryable failure re-sends the stored payload, field included. The
+field name and value live in one
+place on the client: `RESULT_THREAD_FIELD` / `RESULT_THREAD_ASK` in
+`packages/ag2-sparrow/ag2_sparrow/delivery_core/provider_ag2space.py`.
 
 ### `POST /v1/heartbeat`
 
@@ -135,6 +165,33 @@ body: {
   "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status", "team-collaborator"]
 }
 ```
+
+`status` and `step` come from the core's
+`state/core-status.json`, with the health-check overlay described under
+[Independent health-check reporting](#independent-health-check-reporting). The
+core's beat in the `health` row below decides when that self-report cannot; the first
+matching row wins:
+
+| `core-status.json` | `alive` | sent `status` |
+|---|---|---|
+| missing, or written before this host's graceful-stop tombstone `state/cores/<host>.stopped` | `false` or `null` | `offline` |
+| present, under an hour old | any | the self-report |
+| present, older than an hour | `true` | the self-report (an idle core rewrites nothing) |
+| missing, malformed, or older than an hour | `false` (beat stale) | `offline` |
+| missing or malformed | `true` | `idle` |
+| missing, malformed, or older than an hour | `null` (no beat file) | `unknown` |
+
+The tombstone is written by `core_heartbeat` on a graceful stop and deleted by its
+next run, and a self-report written after it (a restart before the first beat)
+supersedes it.
+
+`core_heartbeat` deletes `.alive` when the core stops, so a missing beat vouches
+for nothing. `unknown` is sent rather than omitting the field because the broker
+keeps its last presence status when `status` is absent. A gateway with no
+Sutando checkout (no `health` row) forwards the self-report unchanged, or nothing.
+
+A relay that answers the heartbeat with `404` or `405` is retried after 60 s, doubling to at most
+30 minutes, so a relay that deploys the route is picked up without a restart.
 
 `team-collaborator` tells the AG2 Space control plane that this gateway
 understands the per-agent Collaborator control layered over Team. Gateways
@@ -437,8 +494,10 @@ A later passing check removes the override and resumes the core's status.
 Repair attempts do not imply recovery: another completed check must verify it.
 
 Reports expire after 35 minutes, allowing the app's 30-minute cadence as well
-as the five-minute fallback. Expired, malformed, or empty reports emit
-`status: unknown`, preventing cached health from being refreshed indefinitely.
+as the five-minute fallback. An expired report gives no opinion: the core status
+passes through exactly as with no report, so a cached failure is never refreshed
+and a host that stops running the checker is not pinned to `unknown`. Malformed,
+empty, or future-dated reports emit `status: unknown`.
 An absent report preserves legacy core-status reporting for installations
 without the health checker. A passing report alone does not invent a core
 status. If the gateway or host is down, no heartbeat can be sent; the broker's
