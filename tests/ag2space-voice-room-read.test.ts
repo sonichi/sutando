@@ -703,10 +703,29 @@ describe('read_room lines carry each message\'s event_id and its time, whatever 
 		assert.ok(r.ok);
 		if (r.ok) {
 			assert.equal(r.latest?.event_id, '$m');
-			const thread = r.messages.find(m => m.event_id === '$t')!;
+			// The main timeline alone in messages; the thread reply apart, with its root.
+			assert.deepEqual(r.messages.map(m => m.event_id), ['$m']);
+			const thread = r.thread_replies!.find(m => m.event_id === '$t')!;
+			assert.equal(thread.in_thread_of, '$root');
 			assert.deepEqual(thread.reactions, ['👍 (you)', '❤️']);
 		}
 		assert.ok(calls.includes('ag2.whoami'));
+	});
+
+	it('"the second to last" counts in the main timeline: thread replies are not in messages (live 2026-10-15 22:57)', async () => {
+		const client = { async callTool() { return { structuredContent: { result: { messages: [
+			{ sender: '@bot:x', body: 'thread 1', event_id: '$t1', ts: 5, thread_root: '$m2' },
+			{ sender: '@dot:x', body: 'thread 2', event_id: '$t2', ts: 4, thread_root: '$m2' },
+			{ sender: '@susan:x', body: 'main latest', event_id: '$m2', ts: 3 },
+			{ sender: '@chi:x', body: 'main earlier', event_id: '$m1', ts: 2 },
+		] } } }; }, close() {} };
+		const r = await readRoom({ room: '!a:ag2.space', limit: 2 }, { client: () => client as never, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never);
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.deepEqual(r.messages.map(m => m.event_id), ['$m1', '$m2']);
+			assert.equal(r.messages[r.messages.length - 2].event_id, '$m1', 'the second to last is Chi\'s, not a thread reply');
+			assert.deepEqual(r.thread_replies!.map(m => m.event_id), ['$t2', '$t1']);
+		}
 	});
 
 	it('no reactions: no whoami call', async () => {
@@ -737,7 +756,8 @@ describe('read_room lines carry each message\'s event_id and its time, whatever 
 		const [line] = toMessageLines([{ sender: '@b:ag2.space', body: 'in a thread', event_id: '$t', ts: 1, thread_root: '$root' }]);
 		assert.equal(line.thread, true);
 		const d = createReadRoomTool({ client: () => null, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never).description;
-		assert.match(d, /"the latest message" means `latest` and its event_id, never a newer thread reply/);
+		assert.match(d, /`messages` is the room\'s main timeline, oldest first, as the user sees it: "the latest message", "the second to last"/);
+		assert.match(d, /`thread_replies` are replies inside threads/);
 	});
 
 	it('event_id kept; ts as a numeric string still gives a time', () => {
