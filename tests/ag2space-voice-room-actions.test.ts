@@ -7,7 +7,7 @@
  */
 import { describe, it, test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const PLUGIN_DIR = join(process.cwd(), 'skills', 'ag2space-voice');
@@ -269,6 +269,56 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 	it('the arguments are bound whatever their key order', () => {
 		assert.equal(canonicalJson({ b: 1, a: [{ d: 2, c: 3 }] }), canonicalJson({ a: [{ c: 3, d: 2 }], b: 1 }));
 		assert.notEqual(canonicalJson({ a: 1 }), canonicalJson({ a: '1' }));
+	});
+});
+
+describe('an action the code has never named: whatever the server\'s catalog lists is reachable', () => {
+	// A stand-in for an action the server adds later: no tool, no name, no list in the plugin knows it.
+	const NEW = 'room.future.widgets.list';
+	const NEW_CHANGE = 'room.future.widgets.pin';
+	const catalog = (n: string, a: Record<string, unknown>) => {
+		if (n === 'room.actions.search') return ok({ items: [
+			{ action: NEW, title: 'List widgets', summary: 'List the room widgets.', effect: 'zero_effect', risk: 'low', target_kind: 'room', required_arguments: [] },
+			{ action: NEW_CHANGE, title: 'Pin a widget', summary: 'Pin one widget.', effect: 'mutation', risk: 'low', target_kind: 'room', required_arguments: ['widget_id'] },
+		] });
+		if (n === 'room.actions.describe') return a.action === NEW
+			? ok({ action: NEW, effect: 'zero_effect', risk: 'low', input_schema: { type: 'object', properties: {} } })
+			: ok({ action: NEW_CHANGE, effect: 'mutation', risk: 'low', title: 'Pin a widget', input_schema: { type: 'object', properties: { widget_id: { type: 'string' } }, required: ['widget_id'] } });
+		return ok({ status: 'completed', result: { widgets: ['w1'] } });
+	};
+
+	it('is found, described and run — a read at once, a change only after its token', async () => {
+		resetPendingConfirmations();
+		const f = fake(catalog);
+		const found = await findActions({ query: 'widgets' }, f.deps);
+		assert.ok(found.ok);
+		if (found.ok) assert.deepEqual(found.actions.map(x => [x.action, x.by_voice]), [[NEW, 'read'], [NEW_CHANGE, 'confirm']]);
+		const desc = await describeAction({ action: NEW_CHANGE }, f.deps);
+		assert.ok(desc.ok && desc.by_voice === 'confirm');
+		const read = await runAction({ action: NEW }, f.deps);
+		assert.ok(read.ok);
+		if (read.ok) assert.deepEqual(read.result, { widgets: ['w1'] });
+		const reads = f.calls.filter(c => c.name === 'room.action.read');
+		assert.equal(reads.length, 1);
+		assert.equal(reads[0].args.action, NEW);
+		let t = 5_000_000;
+		const first = await runAction({ action: NEW_CHANGE, arguments_json: '{"widget_id":"w1"}' }, f.deps, () => t);
+		assert.equal((first as { error: string }).error, 'needs_confirmation');
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+		t += CONFIRM_MIN_AGE_MS;
+		const done = await runAction({ action: NEW_CHANGE, arguments_json: '{"widget_id":"w1"}', confirm_token: (first as { confirm_token: string }).confirm_token }, f.deps, () => t);
+		assert.ok(done.ok);
+		const ex = f.calls.filter(c => c.name === 'room.action.execute');
+		assert.equal(ex.length, 1);
+		assert.equal(ex[0].args.action, NEW_CHANGE);
+		assert.deepEqual(ex[0].args.arguments, { widget_id: 'w1' });
+	});
+
+	it('the plugin names no catalog action of its own: only the catalog tools and the two ways to run', () => {
+		const src = readFileSync(join(PLUGIN_DIR, 'room-actions.ts'), 'utf-8');
+		const named = [...src.matchAll(/'((?:room|space|mentions|browser|commons|agent|devapp)\.[a-z_.]+)'/g)].map(m => m[1]);
+		assert.ok(named.includes('room.actions.search') && named.includes('room.actions.describe'));
+		for (const n of named) assert.ok(/^room\.actions?\.(search|describe|read|execute)$/.test(n), n);
 	});
 });
 
