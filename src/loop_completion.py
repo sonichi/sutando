@@ -17,23 +17,31 @@ def completion_path(workspace: Path, host: str) -> Path:
     return Path(workspace) / "state" / "loop-completions" / (host + ".json")
 
 
+def _timestamp(value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (float, int)):
+        raise ValueError("completion time must be finite")
+    try:
+        ts = float(value)
+    except OverflowError as exc:
+        raise ValueError("completion time must be finite") from exc
+    if not math.isfinite(ts) or ts < 0:
+        raise ValueError("completion time must be finite")
+    return ts
+
+
 def read_completion(workspace: Path, host: str) -> Optional[float]:
     try:
         value = json.loads(completion_path(workspace, host).read_text())
-        ts = value.get("completed_at")
+        ts = _timestamp(value.get("completed_at"))
         if type(value.get("version")) is not int or value["version"] != 1 or value.get("host") != host:
             return None
-        if isinstance(ts, bool) or not isinstance(ts, (float, int)) or not math.isfinite(ts) or ts < 0:
-            return None
-        return float(ts)
+        return ts
     except (OSError, ValueError, TypeError, AttributeError):
         return None
 
 
 def write_completion(workspace: Path, host: str, *, now: Optional[float] = None) -> Path:
-    ts = time.time() if now is None else now
-    if isinstance(ts, bool) or not isinstance(ts, (float, int)) or not math.isfinite(ts) or ts < 0:
-        raise ValueError("completion time must be finite")
+    ts = _timestamp(time.time() if now is None else now)
     target = completion_path(workspace, host)
     target.parent.mkdir(parents=True, exist_ok=True)
     with locked_file(target.with_suffix(".lock")):

@@ -32,7 +32,8 @@ class LoopCompletionTest(unittest.TestCase):
             path = completion_path(ws, "alpha")
             path.parent.mkdir(parents=True)
             for value in ([], {}, {"version": True, "host": "alpha", "completed_at": 1}, {"version": 1, "host": "other", "completed_at": 1},
-                          {"version": 1, "host": "alpha", "completed_at": True}):
+                          {"version": 1, "host": "alpha", "completed_at": True},
+                          {"version": 1, "host": "alpha", "completed_at": 10**400}):
                 path.write_text(json.dumps(value))
                 self.assertIsNone(read_completion(ws, "alpha"))
 
@@ -42,7 +43,7 @@ class LoopCompletionTest(unittest.TestCase):
             for host in (None, 3, "", "..", "../other", "other/host"):
                 with self.assertRaises(ValueError):
                     write_completion(ws, host)
-            for ts in (True, -1, float("inf"), float("nan")):
+            for ts in (True, -1, float("inf"), float("nan"), 10**400):
                 with self.assertRaises(ValueError):
                     write_completion(ws, "alpha", now=ts)
 
