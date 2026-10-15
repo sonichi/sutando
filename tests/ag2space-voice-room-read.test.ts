@@ -724,6 +724,9 @@ describe('read_room lines carry each message\'s event_id and its time, whatever 
 		if (r.ok) {
 			assert.deepEqual(r.messages.map(m => m.event_id), ['$m1', '$m2']);
 			assert.equal(r.messages[r.messages.length - 2].event_id, '$m1', 'the second to last is Chi\'s, not a thread reply');
+			// Numbered from the end, so the model never counts (live 23:06: it picked the 4th from last).
+			assert.deepEqual(r.messages.map(m => [m.event_id, m.from_last]), [['$m1', 2], ['$m2', 1]]);
+			assert.equal(r.latest?.from_last, 1);
 			assert.deepEqual(r.thread_replies!.map(m => m.event_id), ['$t2', '$t1']);
 		}
 	});
@@ -756,8 +759,9 @@ describe('read_room lines carry each message\'s event_id and its time, whatever 
 		const [line] = toMessageLines([{ sender: '@b:ag2.space', body: 'in a thread', event_id: '$t', ts: 1, thread_root: '$root' }]);
 		assert.equal(line.thread, true);
 		const d = createReadRoomTool({ client: () => null, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never).description;
-		assert.match(d, /`messages` is the room\'s main timeline, oldest first, as the user sees it: "the latest message", "the second to last"/);
+		assert.match(d, /`messages` is the room\'s main timeline, oldest first, as the user sees it, each with from_last/);
 		assert.match(d, /`thread_replies` are replies inside threads/);
+		assert.match(d, /"the last but one" \/ "the second to last" is from_last 2 — never count the list yourself/);
 	});
 
 	it('event_id kept; ts as a numeric string still gives a time', () => {
