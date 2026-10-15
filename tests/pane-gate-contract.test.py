@@ -58,6 +58,44 @@ def state(text, runtime):
     return pg.classify_pane(text, pg.ADAPTERS[runtime]).state
 
 
+class GateEvidence(unittest.TestCase):
+    def test_completed_recap_requires_completion_context(self):
+        recap = "※ recap: if you typed X, press Enter there to send it."
+        pane = recap + "\nNothing needs you this round.\n❯ \n" + FOOTER
+        self.assertNotRegex(pg.gate_evidence(pane), pg.AWAIT_HINT)
+        self.assertEqual(state(pane, "claude"), "idle-ready")
+        self.assertIn(recap, pg.gate_evidence(recap + "\n❯ "))
+
+    def test_unknown_dialog_evidence_survives_idle_chrome(self):
+        for hint in ("Enter to confirm · Esc to cancel", "Keyboard: Enter to confirm",
+                     "Keyboard: Enter to confirm.", "Keyboard: Enter to confirm your choice",
+                     "Please press Enter to overwrite the file.",
+                     "※ Please press Enter to overwrite the file.",
+                     "※ recap: Please press Enter to overwrite the file."):
+            dialog = "Overwrite the existing config file?\n" + hint
+            for suffix in ("\n❯ ", "\n❯ \x1b[2mshow me how to navigate\x1b[0m",
+                           "\n" + FOOTER, "\n❯ \n" + FOOTER):
+                styled = dialog + suffix
+                with self.subTest(frame=styled):
+                    evidence = pg.gate_evidence(pg._SGR.sub("", styled), styled)
+                    self.assertIn(dialog, evidence)
+                    self.assertNotIn(FOOTER, evidence)
+
+    def test_footer_boundary_survives_filtering(self):
+        dialog = "Overwrite the existing config file?\nEnter to confirm · Esc to cancel"
+        for composer in ("❯ ", "❯ \x1b[2mshow me how to navigate\x1b[0m"):
+            for frame in (FOOTER + "\n" + dialog + "\n" + composer,
+                          composer + "\n" + FOOTER + "\n" + dialog):
+                with self.subTest(frame=frame):
+                    verdict = pg.classify_pane(frame, pg.CLAUDE)
+                    self.assertEqual((verdict.state, verdict.reason), ("busy", "unlisted"))
+
+    def test_no_footer_ghost_is_not_gate_evidence(self):
+        styled = "❯ \x1b[2mshow me how to navigate\x1b[0m"
+        self.assertEqual(pg.gate_evidence(pg._SGR.sub("", styled), styled), "")
+        self.assertEqual(state(styled, "claude"), "idle-ready")
+
+
 class SGRStrippingIsComplete(unittest.TestCase):
     """sonichi/sutando#5418 review: tmux 3.6a's `-e` can emit colon-separated
     SGR params and OSC 8 hyperlinks; `_SGR` must strip both, or residual

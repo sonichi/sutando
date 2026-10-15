@@ -295,7 +295,7 @@ class TestDiscoveryAndScriptClient(_Ws):
         self.assertEqual(where, ROOM)
         self.assertIn(AGENT, store.client.argv)
         self.assertEqual(store.lock, self.ws / "state" / "pending-questions-db.lock")
-        self.assertEqual(store.link, f"https://collab.test.invalid/#/room/{ROOM}?surface=db&page=pendingq")
+        self.assertEqual(store.link, "https://collab.test.invalid/home/!ownerdm%3Atest.invalid?surface=database&page=pendingq")
 
     def test_the_script_client_round_trips_through_the_adapter(self):
         _install_fake_capability(self.ws)
