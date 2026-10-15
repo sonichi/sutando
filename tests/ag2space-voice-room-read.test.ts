@@ -682,4 +682,18 @@ describe('send_message: a message in a room\'s chat, as the agent, after the use
 });
 
 });
+
+describe('read_room lines carry each message\'s event_id and its time, whatever type ts comes in', () => {
+	it('event_id kept; ts as a numeric string still gives a time', () => {
+		const lines = toMessageLines([
+			{ sender: '@yixuan-desktop.agent:ag2.space', body: 'latest', event_id: '$new', ts: '1792047886394' },
+			{ sender: '@yixuan:ag2.space', body: 'earlier', event_id: '$old', ts: 1792047864226 },
+			{ sender: '@x:ag2.space', body: 'no id' },
+		]);
+		assert.deepEqual(lines.map(l => l.event_id), [undefined, '$old', '$new']);
+		assert.ok(lines[2].at && lines[1].at);
+		assert.equal(lines[0].at, '');
+	});
+});
+
 }

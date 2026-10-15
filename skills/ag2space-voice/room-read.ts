@@ -247,23 +247,26 @@ export function roomIndexContextLines(index: RoomIndex): string[] {
 	return [`ROOMS: AG2 Space rooms you can read with read_room: ${names.join(' | ')}. A room name you hear is often misheard: when the user names a room, pass the one of these it clearly is, spelled exactly like this; ask which only when none clearly is.`];
 }
 
-export interface RoomMessageLine { at: string; from: string; text: string; reply?: boolean; thread?: boolean }
+export interface RoomMessageLine { at: string; from: string; text: string; event_id?: string; reply?: boolean; thread?: boolean }
 
 /** Server messages (newest first) → oldest-first lines a voice model can retell. */
 export function toMessageLines(messages: unknown[], tz?: string): RoomMessageLine[] {
 	const out: RoomMessageLine[] = [];
 	for (const m of messages) {
 		if (!m || typeof m !== 'object') continue;
-		const msg = m as { sender?: string; body?: string; ts?: number | null; reply_to_event?: string | null; thread_root?: string | null };
+		const msg = m as { sender?: string; body?: string; ts?: number | string | null; event_id?: unknown; reply_to_event?: string | null; thread_root?: string | null };
 		if (typeof msg.body !== 'string' || !msg.body.trim()) continue;
 		const from = (msg.sender ?? '?').replace(/^@/, '').replace(/:.*$/, '');
-		const at = typeof msg.ts === 'number'
-			? new Date(msg.ts).toLocaleString('en-US', { timeZone: tz, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short' })
+		// The server sends ts as a number or a numeric string.
+		const t = msg.ts === null || msg.ts === undefined || msg.ts === '' ? NaN : Number(msg.ts);
+		const at = Number.isFinite(t)
+			? new Date(t).toLocaleString('en-US', { timeZone: tz, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short' })
 			: '';
 		const body = msg.body.replace(/\s+/g, ' ').trim();
 		out.push({
 			at, from,
 			text: body.length > ROOM_READ_BODY_MAX ? `${body.slice(0, ROOM_READ_BODY_MAX)}…` : body,
+			...(typeof msg.event_id === 'string' && msg.event_id ? { event_id: msg.event_id } : {}),
 			...(msg.reply_to_event ? { reply: true } : {}),
 			...(msg.thread_root ? { thread: true } : {}),
 		});
@@ -458,7 +461,8 @@ export async function roomExecute(client: McpClient, room: RoomRef | null, actio
 		const payload = mcpPayload(res);
 		const code = String((payload as { code?: string } | null)?.code ?? '');
 		const status = String(payload?.status ?? '');
-		if (code === 'ACTION_OUTCOME_UNKNOWN' || /unknown/i.test(String(payload?.dispatch_state ?? '')) || /unknown/i.test(status)) return { ok: false, error: OUTCOME_UNKNOWN, operation_id };
+		// The upstream failing while the write was in flight leaves it unknown too (seen live: UPSTREAM_UNAVAILABLE on a reaction).
+		if (code === 'ACTION_OUTCOME_UNKNOWN' || code === 'UPSTREAM_UNAVAILABLE' || /unknown/i.test(String(payload?.dispatch_state ?? '')) || /unknown/i.test(status)) return { ok: false, error: OUTCOME_UNKNOWN, operation_id };
 		if (res.isError || !payload) return { ok: false, error: code || 'write_failed' };
 		if (payload.approval_id || /approval/i.test(status)) return { ok: false, error: 'needs_approval' };
 		if (status && !/completed|succeeded|ok|done/i.test(status)) return { ok: false, error: status };
@@ -584,7 +588,7 @@ export function createReadRoomTool(deps: ReadRoomDeps): ToolDefinition {
 			'For what was said about a particular PR, topic or person — which may be far back — call search_room instead, then read_room with `around` = a hit\'s event_id to read the discussion around it. ' +
 			'A room\'s messages and who can read it change at any time: call read_room every time the user asks about a room, even if you answered about that room earlier or a task result said something about it — never answer from an earlier answer. ' +
 			'Pass `room` = the room name as spoken; leave it out for the room this session is in. ' +
-			'Returns {ok:true, room, messages:[{at, from, text}]} oldest first — answer from them in a sentence or two; do not read them all out. ' +
+			'Returns {ok:true, room, messages:[{at, from, text, event_id}]} oldest first, the last one the latest — answer from them in a sentence or two; do not read them all out. A message\'s event_id is what reply_to, a reaction or any other action on that message takes. ' +
 			'Errors: "not_found" with rooms (every room you can read) — the name you passed is not one of them; room names are often misheard, so if one of rooms is clearly the room the user meant, call read_room again with that exact name, and ask which only when none clearly is; ' +
 			'"ambiguous" with candidates — ask which one; "no_room" — ask which room; "not_connected", "timeout" or "unavailable" — say you cannot read the room right now.',
 		parameters: z.object({

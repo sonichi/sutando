@@ -16,7 +16,7 @@ if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => 
 
 if (PRESENT) {
 const {
-	voicePolicy, findActions, describeAction, runAction, compactResult, canonicalJson, resetPendingConfirmations,
+	voicePolicy, findActions, describeAction, runAction, compactResult, canonicalJson, resetPendingConfirmations, noteUserSpoke,
 	createFindActionsTool, createDescribeActionTool, createRunActionTool,
 	ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, ACTION_RESULT_MAX_CHARS, CONFIRM_MIN_AGE_MS, CONFIRM_TTL_MS,
 } = await import('../skills/ag2space-voice/room-actions.ts');
@@ -259,6 +259,49 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_expired' });
 	});
 
+	it('with the host\'s speech signal, the token runs only after the user has spoken since it was issued', async () => {
+		resetPendingConfirmations(true);
+		const f = change();
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS * 4;
+		// The model calls again on its own, long after: no speech, nothing runs (live 2026-10-15 19:40:51).
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_too_soon' });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+		noteUserSpoke();
+		assert.ok((await runAction({ ...RUN, confirm_token }, f.deps, now)).ok);
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 1);
+	});
+
+	it('speech before the token was issued does not count as the yes', async () => {
+		resetPendingConfirmations(true);
+		noteUserSpoke();
+		const f = change();
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_too_soon' });
+	});
+
+	it('an upstream failure on the write is an unknown outcome, kept for a retry the server deduplicates', async () => {
+		let n = 0;
+		const f = change(() => (++n === 1 ? { isError: true, structuredContent: { code: 'UPSTREAM_UNAVAILABLE' } } : ok({ status: 'completed', result: {} })));
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		assert.equal(((await runAction({ ...RUN, confirm_token }, f.deps, now)) as { error: string }).error, 'outcome_unknown');
+		assert.ok((await runAction({ ...RUN, confirm_token }, f.deps, now)).ok);
+		const ops = f.calls.filter(c => c.name === 'room.action.execute').map(c => c.args.operation_id);
+		assert.equal(ops[0], ops[1]);
+	});
+
+	it('the plugin listens for the host\'s speech signal, and the voice agent sends it from input transcription', async () => {
+		const { setup } = await import('../skills/ag2space-voice/tools.ts');
+		let handler: (() => void) | null = null;
+		setup({ onUserSpoke: (h: () => void) => { handler = h; } } as never);
+		assert.equal(handler, noteUserSpoke);
+		const src = readFileSync(join(process.cwd(), 'src', 'voice-agent.ts'), 'utf-8');
+		assert.match(src, /onUserSpoke: \(handler\) => \{ userSpokeHandlers\.push\(handler\); \}/);
+		assert.match(src, /transport\.onInputTranscription = \(text: string\) => \{\s*orig\?\.\(text\);[\s\S]{0,120}for \(const h of userSpokeHandlers\)/);
+	});
+
 	it('two calls with one token at the same time run once', async () => {
 		let release!: () => void;
 		const gate = new Promise<void>(r => { release = r; });
@@ -367,6 +410,11 @@ describe('the tools as the voice model sees them', () => {
 		for (const t of [createFindActionsTool(down), createDescribeActionTool(down), createRunActionTool(down)]) {
 			assert.equal(((await t.execute({ query: 'x', action: 'x' }, {} as never)) as { ok: boolean }).ok, false);
 		}
+	});
+
+	it('a no means call nothing, and a message is acted on by its read_room event_id', () => {
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /not cancel_task/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /event_id from read_room/);
 	});
 
 	it('the rules name the tools', () => {
