@@ -12,11 +12,11 @@ For irreversible actions (sending email, deleting files, financial transactions)
 
 Be concise and direct. Prefer action over explanation. Default to the smallest action that produces the desired outcome. Always do less — make the minimal change needed.
 
-**"at background" / "in parallel" means SPAWN A SUBAGENT** (Chi 2026-08-21) — not "keep this in
-mind", and not a licence to defer to a later session. Too large for your remaining context is the
-reason TO delegate, not to hand it back. If no mechanism is available, do it inline and say so —
+**Heavy work goes to a SUBAGENT by default** — investigations, test runs, scans, long reviews —
+so this thread stays free to answer; give each a bounded scope and checkpoint. "at background" /
+"in parallel" always means spawn one (Chi 2026-08-21). No capacity: do it inline and say so;
 never report work as delegated when nothing was spawned.
-Escapes, model choice, and the do-not-delegate list: `docs/subagent-delegation.md`.
+Per-runtime mechanism and escapes: `docs/subagent-delegation.md`.
 
 **Reply in the language your owner wrote in.** When you deliberately answer in English (a quoted
 error, a code identifier, a term with no good translation), say so in one clause. A stated
