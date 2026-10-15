@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DictationTranscriptEvent } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE, MEETING_OVER_CONTEXT, meetingStamp, restoreAfterFreshConnection } from '../src/meeting-dictation.js';
+import { announcesMeetingCue, attachMeetingDictation, createMeetingEntryGate, findExitCommand, isMeetingExitPhrase, MEETING_ENTRY_SAY, MEETING_EXIT_PHRASE, MEETING_OVER_CONTEXT, meetingStamp, restoreAfterFreshConnection, startMeeting } from '../src/meeting-dictation.js';
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
@@ -456,5 +456,95 @@ describe('meeting transcript carried back to the agent', () => {
 		assert.ok(ctx.includes('line 1999 '));
 		assert.ok(!ctx.includes('line 0 '));
 		assert.match(ctx, /<MEETING_TRANSCRIPT_START>\nline \d+ x/, 'starts on a whole line');
+	});
+});
+
+describe('meeting entry gate', () => {
+	it('enters after the confirmation turn, not the tool-call turn', () => {
+		let fired = 0;
+		const g = createMeetingEntryGate({ fallbackMs: 10_000, onFire: () => fired++ });
+		g.schedule();
+		g.noteTurnCompleted(); // turn that carried switch_mode
+		assert.equal(fired, 0);
+		g.noteTurnCompleted(); // "I have switched to meeting mode."
+		assert.equal(fired, 1);
+		g.noteTurnCompleted();
+		assert.equal(fired, 1, 'fires once');
+	});
+
+	it('falls back when no confirmation turn arrives', async () => {
+		let fired = 0;
+		const g = createMeetingEntryGate({ fallbackMs: 10, onFire: () => fired++ });
+		g.schedule();
+		g.noteTurnCompleted();
+		await tick(20);
+		assert.equal(fired, 1);
+	});
+
+	it('cancel (switching back before entry) prevents entering', async () => {
+		let fired = 0;
+		const g = createMeetingEntryGate({ fallbackMs: 10, onFire: () => fired++ });
+		g.schedule();
+		g.cancel();
+		g.noteTurnCompleted();
+		g.noteTurnCompleted();
+		await tick(20);
+		assert.equal(fired, 0);
+		assert.equal(g.pending, false);
+	});
+});
+
+describe('starting a meeting (switch_mode)', () => {
+	it('a cue-capable client: the tool answers first and entry runs one macrotask later; the model is told to say nothing', () => {
+		const order: string[] = [];
+		let deferred: (() => void) | null = null;
+		const out = startMeeting({ clientCues: true, enter: () => order.push('enter'), gate: { schedule: () => order.push('gate') }, defer: (fn) => { deferred = fn; } });
+		order.push('tool result');
+		assert.deepEqual(order, ['tool result'], 'nothing entered before the tool result goes out');
+		deferred!();
+		assert.deepEqual(order, ['tool result', 'enter']);
+		assert.match(String(out.instruction), /Say nothing/);
+		assert.equal(out.say, undefined);
+	});
+
+	it('a deferred entry re-checks before entering: an exit in between wins', () => {
+		// REVIEW.md lesson 21: switch_mode("active") in the same batch, or the menu-bar poll, ran exit() before the deferred entry.
+		let entered = 0;
+		let wanted = true;
+		let deferred: (() => void) | null = null;
+		startMeeting({ clientCues: true, enter: () => entered++, gate: { schedule() {} }, defer: (fn) => { deferred = fn; }, stillWanted: () => wanted });
+		wanted = false;
+		deferred!();
+		assert.equal(entered, 0, 'not entered: the meeting was ended before the deferral ran');
+		wanted = true;
+		startMeeting({ clientCues: true, enter: () => entered++, gate: { schedule() {} }, defer: (fn) => { deferred = fn; }, stillWanted: () => wanted });
+		deferred!();
+		assert.equal(entered, 1);
+	});
+
+	it('by default the deferral is a real macrotask, after microtasks', async () => {
+		const order: string[] = [];
+		startMeeting({ clientCues: true, enter: () => order.push('enter'), gate: { schedule() {} } });
+		await Promise.resolve();
+		order.push('microtasks done');
+		await new Promise((r) => setTimeout(r, 5));
+		assert.deepEqual(order, ['microtasks done', 'enter']);
+	});
+
+	it('any other client: the model speaks the line and entry waits for that turn (the gate)', () => {
+		let scheduled = 0;
+		let entered = 0;
+		const out = startMeeting({ clientCues: false, enter: () => entered++, gate: { schedule: () => scheduled++ } });
+		assert.equal(scheduled, 1);
+		assert.equal(entered, 0);
+		assert.equal(out.say, MEETING_ENTRY_SAY);
+		assert.match(String(out.instruction), /^Say exactly this, then end your turn: /);
+	});
+
+	it('only a client.capabilities frame listing meeting.cue counts', () => {
+		assert.equal(announcesMeetingCue({ type: 'client.capabilities', capabilities: ['meeting.cue'] }), true);
+		assert.equal(announcesMeetingCue({ type: 'client.capabilities', capabilities: ['ui.navigate'] }), false);
+		assert.equal(announcesMeetingCue({ type: 'session.context', capabilities: ['meeting.cue'] }), false);
+		assert.equal(announcesMeetingCue(null), false);
 	});
 });
