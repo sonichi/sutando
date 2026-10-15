@@ -246,17 +246,17 @@ export function createRoomIndex(deps: { client: () => McpClient | null; log?: (m
 export function roomIndexContextLines(index: RoomIndex): string[] {
 	const names = index.rooms().map(r => r.name);
 	if (!names.length) return [];
-	return [`ROOMS: AG2 Space rooms you can read with read_room: ${names.join(' | ')}. A room name you hear is often misheard: when the user names a room, pass the one of these it clearly is, spelled exactly like this; ask which only when none clearly is.`];
+	return [`ROOMS: AG2 Space rooms you can read with read_room: ${names.join(' | ')}. A name the user says that is one of these exactly (ignoring case) is that room — never swap it for a similar one ("triage system" is not "Sutando Triage"). A room name you hear is often misheard: only when it is none of these exactly, pass the one of these it clearly is, spelled exactly like this; ask which only when none clearly is. When you read back an action, say the room\'s name as listed.`];
 }
 
-export interface RoomMessageLine { at: string; from: string; text: string; event_id?: string; reply?: boolean; thread?: boolean }
+export interface RoomMessageLine { at: string; from: string; text: string; event_id?: string; reply?: boolean; thread?: boolean; reactions?: string[] }
 
-/** Server messages (newest first) → oldest-first lines a voice model can retell. */
-export function toMessageLines(messages: unknown[], tz?: string): RoomMessageLine[] {
+/** Server messages (newest first) → oldest-first lines a voice model can retell; `self` marks this agent's own reactions. */
+export function toMessageLines(messages: unknown[], tz?: string, self?: string | null): RoomMessageLine[] {
 	const out: RoomMessageLine[] = [];
 	for (const m of messages) {
 		if (!m || typeof m !== 'object') continue;
-		const msg = m as { sender?: string; body?: string; ts?: number | string | null; event_id?: unknown; reply_to_event?: string | null; thread_root?: string | null };
+		const msg = m as { sender?: string; body?: string; ts?: number | string | null; event_id?: unknown; reply_to_event?: string | null; thread_root?: string | null; reactions?: unknown };
 		if (typeof msg.body !== 'string' || !msg.body.trim()) continue;
 		const from = (msg.sender ?? '?').replace(/^@/, '').replace(/:.*$/, '');
 		// The server sends ts as a number or a numeric string.
@@ -271,9 +271,23 @@ export function toMessageLines(messages: unknown[], tz?: string): RoomMessageLin
 			...(typeof msg.event_id === 'string' && msg.event_id ? { event_id: msg.event_id } : {}),
 			...(msg.reply_to_event ? { reply: true } : {}),
 			...(msg.thread_root ? { thread: true } : {}),
+			...reactionsOf(msg.reactions, self),
 		});
 	}
 	return out.reverse();
+}
+
+/** A message's reactions as "👍" or "👍 (you)", so an action can see what is already there. */
+function reactionsOf(raw: unknown, self?: string | null): { reactions?: string[] } {
+	if (!Array.isArray(raw)) return {};
+	const out: string[] = [];
+	for (const r of raw) {
+		const x = (r && typeof r === 'object' ? r : {}) as { key?: unknown; sender?: unknown };
+		if (typeof x.key !== 'string' || !x.key) continue;
+		const label = self && x.sender === self ? `${x.key} (you)` : x.key;
+		if (!out.includes(label)) out.push(label);
+	}
+	return out.length ? { reactions: out } : {};
 }
 
 /** Server messages (newest first) up to and including the `limit`-th main-timeline message with a body; thread replies kept. */
@@ -296,7 +310,7 @@ export interface ReadRoomDeps {
 }
 
 export type ReadRoomResult =
-	| { ok: true; room: string; messages: RoomMessageLine[]; ms: number }
+	| { ok: true; room: string; messages: RoomMessageLine[]; latest?: RoomMessageLine; ms: number }
 	/** not_found carries every room the agent can read, so the model can say the right name next. */
 	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
 
@@ -338,6 +352,20 @@ export async function roomRead(client: McpClient, room: RoomRef | null, action: 
 	}
 }
 
+/** This agent's own id, from ag2.whoami, kept per client; null when it cannot say. */
+const selfIds = new WeakMap<McpClient, string | null>();
+async function selfId(client: McpClient): Promise<string | null> {
+	if (selfIds.has(client)) return selfIds.get(client)!;
+	let id: string | null = null;
+	try {
+		const res = await client.callTool('ag2.whoami', {}, ROOM_READ_CALL_TIMEOUT_MS);
+		const a = ((res.structuredContent ?? null) as { actor?: { id?: unknown } } | null)?.actor?.id;
+		id = typeof a === 'string' && a ? a : null;
+	} catch { /* reactions are shown without "(you)" */ }
+	selfIds.set(client, id);
+	return id;
+}
+
 export async function readRoom(args: { room?: string; limit?: number; around?: string }, deps: ReadRoomDeps): Promise<ReadRoomResult> {
 	const t0 = Date.now();
 	const client = deps.client();
@@ -352,8 +380,13 @@ export async function readRoom(args: { room?: string; limit?: number; around?: s
 	const read = await roomRead(client, target.room, 'room.context.read', { limit: fetch, ...(around ? { around_event_id: around } : {}) }, deps, ROOM_COMMONS_TIMEOUT_MS);
 	if (!read.ok) return read;
 	const raw = Array.isArray(read.result.messages) ? read.result.messages : [];
-	const messages = toMessageLines(around ? raw : latestInMainTimeline(raw, limit));
-	return { ok: true, room: target.room.name, messages, ms: Date.now() - t0 };
+	const kept = around ? raw : latestInMainTimeline(raw, limit);
+	// Who "(you)" is, asked only when a message has reactions to mark.
+	const hasReactions = kept.some(m => Array.isArray((m as { reactions?: unknown } | null)?.reactions) && ((m as { reactions: unknown[] }).reactions.length > 0));
+	const messages = toMessageLines(kept, undefined, hasReactions ? await selfId(client) : null);
+	// "The latest message" is the main timeline's; named outright (live 2026-10-15 20:56: a thread reply was picked twice).
+	const latest = around ? undefined : [...messages].reverse().find(m => !m.thread);
+	return { ok: true, room: target.room.name, messages, ...(latest ? { latest } : {}), ms: Date.now() - t0 };
 }
 
 export interface RoomHit { at: string; from: string; text: string; event_id: string; thread?: boolean }
@@ -606,8 +639,9 @@ export function createReadRoomTool(deps: ReadRoomDeps): ToolDefinition {
 			'For what was said about a particular PR, topic or person — which may be far back — call search_room instead, then read_room with `around` = a hit\'s event_id to read the discussion around it. ' +
 			'A room\'s messages and who can read it change at any time: call read_room every time the user asks about a room, even if you answered about that room earlier or a task result said something about it — never answer from an earlier answer. ' +
 			'Pass `room` = the room name as spoken; leave it out for the room this session is in. ' +
-			'Returns {ok:true, room, messages:[{at, from, text, event_id, thread}]} oldest first — answer from them in a sentence or two; do not read them all out. A message\'s event_id is what reply_to, a reaction or any other action on that message takes. ' +
-				'thread:true marks a reply inside a thread, not shown in the room\'s main timeline: "the latest message" in a room is the latest one without thread:true, unless the user names the thread. ' +
+			'Returns {ok:true, room, messages:[{at, from, text, event_id, thread, reactions}], latest} oldest first — answer from them in a sentence or two; do not read them all out. A message\'s event_id is what reply_to, a reaction or any other action on that message takes. ' +
+				'thread:true marks a reply inside a thread, not shown in the room\'s main timeline. `latest` is the room\'s latest message in the main timeline: "the latest message" means `latest` and its event_id, never a newer thread reply, unless the user names the thread. ' +
+				'`reactions` lists a message\'s reactions, "(you)" marking yours: if the user asks for one that is already yours, say it is already there and do not add it again. ' +
 			'Errors: "not_found" with rooms (every room you can read) — the name you passed is not one of them; room names are often misheard, so if one of rooms is clearly the room the user meant, call read_room again with that exact name, and ask which only when none clearly is; ' +
 			'"ambiguous" with candidates — ask which one; "no_room" — ask which room; "not_connected", "timeout" or "unavailable" — say you cannot read the room right now.',
 		parameters: z.object({

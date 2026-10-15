@@ -685,6 +685,42 @@ describe('send_message: a message in a room\'s chat, as the agent, after the use
 });
 
 describe('read_room lines carry each message\'s event_id and its time, whatever type ts comes in', () => {
+	it('latest is the newest main-timeline line, and reactions show which are this agent\'s (live 2026-10-15: a thread reply was reacted to twice)', async () => {
+		const calls: string[] = [];
+		const client = {
+			async callTool(name: string) {
+				calls.push(name);
+				if (name === 'ag2.whoami') return { structuredContent: { actor: { id: '@me.agent:ag2.space' } } };
+				return { structuredContent: { result: { messages: [
+					{ sender: '@bot:ag2.space', body: 'in a thread', event_id: '$t', ts: 3, thread_root: '$root', reactions: [{ key: '👍', sender: '@me.agent:ag2.space' }, { key: '❤️', sender: '@x:ag2.space' }] },
+					{ sender: '@susan:ag2.space', body: 'main latest', event_id: '$m', ts: 2 },
+					{ sender: '@chi:ag2.space', body: 'older', event_id: '$o', ts: 1 },
+				] } } };
+			},
+			close() {},
+		};
+		const r = await readRoom({ room: '!a:ag2.space', limit: 1 }, { client: () => client as never, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never);
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.equal(r.latest?.event_id, '$m');
+			const thread = r.messages.find(m => m.event_id === '$t')!;
+			assert.deepEqual(thread.reactions, ['👍 (you)', '❤️']);
+		}
+		assert.ok(calls.includes('ag2.whoami'));
+	});
+
+	it('no reactions: no whoami call', async () => {
+		const calls: string[] = [];
+		const client = { async callTool(name: string) { calls.push(name); return { structuredContent: { result: { messages: [{ sender: '@a:x', body: 'hi', event_id: '$1', ts: 1 }] } } }; }, close() {} };
+		await readRoom({ room: '!a:ag2.space', limit: 1 }, { client: () => client as never, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never);
+		assert.deepEqual(calls, ['room.action.read']);
+	});
+
+	it('the ROOMS line: a name said exactly is that room, never a similar one', () => {
+		const lines = roomIndexContextLines({ rooms: () => [{ room_id: '!a', name: 'Sutando Triage' }, { room_id: '!b', name: 'triage system' }], refresh: async () => [], fetchedAt: () => 1 } as never);
+		assert.match(lines[0], /is one of these exactly \(ignoring case\) is that room — never swap it for a similar one/);
+	});
+
 	it('the latest read reaches the main timeline past newer thread replies', async () => {
 		const { latestInMainTimeline } = await import('../skills/ag2space-voice/room-read.ts');
 		const raw = [
@@ -701,7 +737,7 @@ describe('read_room lines carry each message\'s event_id and its time, whatever 
 		const [line] = toMessageLines([{ sender: '@b:ag2.space', body: 'in a thread', event_id: '$t', ts: 1, thread_root: '$root' }]);
 		assert.equal(line.thread, true);
 		const d = createReadRoomTool({ client: () => null, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never).description;
-		assert.match(d, /"the latest message" in a room is the latest one without thread:true/);
+		assert.match(d, /"the latest message" means `latest` and its event_id, never a newer thread reply/);
 	});
 
 	it('event_id kept; ts as a numeric string still gives a time', () => {
