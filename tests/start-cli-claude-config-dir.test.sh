@@ -129,6 +129,11 @@ case "\$1" in
     # it must report the session so #2418's post-launch verify can pass.
     [ -f "$CORE_UP_MARKER" ] || exit 1
     ;;
+  list-panes)
+    # The launched core runs inside the session's pane (a private-socket
+    # liveness check only counts a core found in a pane of its server).
+    [ -f "$CORE_UP_MARKER" ] && echo "424242"
+    ;;
   kill-session|start-server|set-option|bind|attach)
     :  # no-op
     ;;

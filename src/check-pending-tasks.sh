@@ -24,6 +24,11 @@
 # looped forever. The earlier rule read identity from the cwd's git repo instead,
 # which cannot tell a guest in the checkout from the core in the checkout.
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# An explicit non-core session owns no inbox unless enrolled as a pool worker.
+if [ "${SUTANDO_CORE_SESSION:-}" = "0" ] && [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
+  echo '{}'
+  exit 0
+fi
 UNIDENTIFIED=""
 if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "${SUTANDO_CORE_SESSION:-}" != "1" ]; then
   UNIDENTIFIED=1
@@ -299,18 +304,15 @@ fi
 # A turn must not end with this session's own inbox unwatched: nothing announces
 # a delivery then, and a turn end is the one moment the session can re-arm.
 if [ "${SUTANDO_STOP_HOOK_WATCHER_GATE:-1}" != "0" ]; then
-  if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
-    COVERAGE_INBOX="$WORKSPACE/deliveries/$SUTANDO_INSTANCE_ID"
-    COVERAGE_REARM='bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR" --role session --inbox "$SUTANDO_TASKS_DIR"'
-  else
-    COVERAGE_INBOX="$TASKS_DIR"
-    # Absolute: the core may run from a foreign cwd (SUTANDO_CLAUDE_WORKING_DIR).
-    COVERAGE_REARM="bash \"$REPO_DIR/src/watch-tasks-stream.sh\" --role session --inbox \"$TASKS_DIR\""
-  fi
+  # Inbox and re-arm command are shared with the SessionStart re-arm hint.
+  COVERAGE_TARGET="$("$PYBIN" "$REPO_DIR/src/watcher_rearm.py" target --repo "$REPO_DIR" --workspace "$WORKSPACE" 2>/dev/null)" || COVERAGE_TARGET=""
+  COVERAGE_INBOX="$(printf '%s\n' "$COVERAGE_TARGET" | sed -n 1p)"
+  COVERAGE_REARM="$(printf '%s\n' "$COVERAGE_TARGET" | sed -n 2p)"
   # Consecutive unwatched turn ends, per runtime instance: a watcher that cannot
   # start must not wedge the session, so the gate fails open past the cap, logged.
   COVERAGE_FAIL_OPEN_AFTER="${SUTANDO_STOP_HOOK_UNWATCHED_FAIL_OPEN_AFTER:-3}"
-  COVERAGE_VERDICT="$("$PYBIN" "$REPO_DIR/src/watcher_identity.py" role-present session --inbox "$COVERAGE_INBOX" --ready "$WORKSPACE/state" 2>/dev/null)" || COVERAGE_VERDICT=""
+  COVERAGE_VERDICT=""
+  [ -n "$COVERAGE_INBOX" ] && { COVERAGE_VERDICT="$("$PYBIN" "$REPO_DIR/src/watcher_identity.py" role-present session --inbox "$COVERAGE_INBOX" --ready "$WORKSPACE/state" 2>/dev/null)" || COVERAGE_VERDICT=""; }
   case "$COVERAGE_VERDICT" in
     yes) "$PYBIN" "$REPO_DIR/src/stop_hook_unwatched.py" clear --state "$WORKSPACE/state" 2>/dev/null || true ;;
     no)

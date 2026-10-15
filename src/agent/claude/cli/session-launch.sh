@@ -73,6 +73,28 @@ claude_named_process_running() {
   [ -n "$(claude_named_pids)" ]
 }
 
+# A private socket (SUTANDO_TMUX_SOCKET set, e.g. a desktop install) is shared
+# with no other install, so a same-name claude outside its server is foreign.
+claude_private_socket_in_use() {
+  [ -n "${SUTANDO_TMUX_SOCKET:-}" ]
+}
+
+# claude_named_pids restricted to processes running inside a pane of the tmux
+# server on $TMUX_SOCKET (the pane pid itself or one of its descendants).
+claude_named_pids_on_socket() {
+  local panes pid p depth
+  panes="$(tmux -S "$TMUX_SOCKET" list-panes -a -F '#{pane_pid}' 2>/dev/null)" || return 0
+  [ -n "$panes" ] || return 0
+  for pid in $(claude_named_pids); do
+    p="$pid"; depth=0
+    while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$depth" -lt 16 ]; do
+      if printf '%s\n' "$panes" | grep -qx "$p"; then echo "$pid"; break; fi
+      p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+      depth=$((depth + 1))
+    done
+  done
+}
+
 claude_named_tmux_session_exists() {
   command -v tmux > /dev/null 2>&1 || return 1
   tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null
@@ -80,7 +102,11 @@ claude_named_tmux_session_exists() {
 
 claude_named_session_running() {
   claude_named_tmux_session_exists || return 1
-  claude_named_process_running
+  if claude_private_socket_in_use; then
+    [ -n "$(claude_named_pids_on_socket)" ]
+  else
+    claude_named_process_running
+  fi
 }
 
 # Optional working-directory override. Unset: no override, launches from cwd.
@@ -284,11 +310,13 @@ resolve_claude_credential_proxy() {
     lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1
   }
   if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
-    # A loaded launchd job means the proxy is EXPECTED on this host even when
-    # its listener hasn't bound yet.
+    # The proxy is EXPECTED, though not yet bound, under either supervisor: a loaded
+    # launchd job, or a live proxy process (the desktop app supervises it without launchd).
     PROXY_EXPECTED=""
     if launchctl print "gui/$(id -u)/com.sutando.credential-proxy" > /dev/null 2>&1; then
-      PROXY_EXPECTED=1
+      PROXY_EXPECTED="launchd job loaded"
+    elif pgrep -f 'credential-proxy\.(js|ts)( |$)' > /dev/null 2>&1; then
+      PROXY_EXPECTED="proxy process running"
     fi
     if [ -n "$PROXY_EXPECTED" ]; then
       # Bounded wait (~10s): a supervised proxy can bind seconds after this
@@ -301,7 +329,7 @@ resolve_claude_credential_proxy() {
     if _proxy_listener_up; then
       export ANTHROPIC_BASE_URL=http://localhost:7846
     elif [ -n "$PROXY_EXPECTED" ]; then
-      echo "  ⚠ credential proxy expected (launchd job loaded) but :7846 never bound within ~10s — session runs unrouted this launch (no proxy protection, no quota telemetry)" >&2
+      echo "  ⚠ credential proxy expected ($PROXY_EXPECTED) but :7846 never bound within ~10s — session runs unrouted this launch (no proxy protection, no quota telemetry)" >&2
     fi
   fi
 }
@@ -353,9 +381,11 @@ forward_skill_manifest_config() {
   unset _mc_seen _mcrec
 }
 
-# Registers the PERSONAL_CLAUDE.md compaction-reinject hook. Idempotent.
+# Registers the post-compaction SessionStart hooks: PERSONAL_CLAUDE.md re-inject
+# and the task-watcher re-arm hint. Idempotent.
 install_claude_personal_hook() {
   bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "session-launch: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
+  bash "$REPO/scripts/install-watcher-rearm-hook.sh" || echo "session-launch: watcher re-arm hook install failed (rc=$?) — hook may be absent" >&2
 }
 
 # Creates a new tmux session running claude with the fully-assembled args, then

@@ -122,6 +122,19 @@
       "description": "Manifest-loaded skills: env defaults exported at startup, only if the var is not already set (user override wins).",
       "additionalProperties": { "type": "string" }
     },
+    "hooks": {
+      "type": "array",
+      "description": "Claude Code hooks this skill declares, registered by src/install-claude-hooks.sh through src/skill_hooks.py discovery; `command` is relative to the skill directory and must resolve inside it.",
+      "items": {
+        "type": "object",
+        "required": ["event", "command"],
+        "additionalProperties": false,
+        "properties": {
+          "event": { "type": "string", "minLength": 1 },
+          "command": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
     "pending_questions_store": {
       "type": "string",
       "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$))[^\\s]+\\.py$",

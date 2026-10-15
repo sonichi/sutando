@@ -87,6 +87,51 @@ _STARTUP_OK_TURN = ("❯ /startup\n"
 
 
 class TestClassify(unittest.TestCase):
+    def test_completed_recap_and_control_are_idle(self):
+        pane = ("❯ /proactive-loop\n"
+                "※ recap: if you typed X in a worker window, press Enter there to send it.\n"
+                "Nothing needs you this round.\n❯ \n⏵⏵ bypass permissions on · ← for agents")
+        for frame in (pane, pane.replace("press Enter", "submit it")):
+            with self.subTest(frame=frame):
+                result = compose_state(frame, "idle", True, styled_pane=frame)
+                self.assertEqual((result[0], result[2], result[3]), ("idle-ready", None, None))
+
+    def test_real_unknown_dialogs_near_idle_chrome(self):
+        footer = "⏵⏵ bypass permissions on · ← for agents"
+        ghost = "❯ \x1b[2mshow me how to navigate\x1b[0m"
+        for hint in ("Enter to confirm · Esc to cancel", "Keyboard: Enter to confirm",
+                     "Keyboard: Enter to confirm.", "Keyboard: Enter to confirm your choice",
+                     "Please press Enter to overwrite the file.",
+                     "※ Please press Enter to overwrite the file.",
+                     "※ recap: Please press Enter to overwrite the file."):
+            for dialog in (hint, "Overwrite the existing config file?\n" + hint):
+                for prefix, suffix in (("", ""), ("", "\n" + footer),
+                                       ("", "\n" + ghost), ("", "\n❯ \n" + footer),
+                                       (footer + "\n", "\n❯ ")):
+                    styled = prefix + dialog + suffix
+                    with self.subTest(frame=styled):
+                        result = compose_state(_mod._ANSI_SGR.sub("", styled), "idle", True,
+                                               styled_pane=styled)
+                        self.assertEqual((result[0], result[3]), ("blocked-human", "unknown"))
+                        self.assertIsNone(auto_answer(result[3]))
+
+    def test_recap_requires_completion_and_preserves_other_dialogs(self):
+        recap = "※ recap: if you typed X, press Enter there to send it."
+        self.assertEqual(classify(recap + "\n❯ ")[0], "unknown")
+        pane = recap + "\nNothing needs you this round.\nOverwrite the file?\nEnter to confirm\n❯ "
+        self.assertEqual(compose_state(pane, "idle", True)[3], "unknown")
+
+    def test_gate_composition_preserves_answer_policy(self):
+        for pane, kind, state, answer in (
+                (_PERMISSION_WITH_FOOTER, "permission", "blocked-human", None),
+                (_LOGIN_MENU, "login", "blocked-human", None),
+                (_BYPASS, "bypass-permissions", "blocked-known", None),
+                (_PRESS_ENTER, "press-enter", "blocked-known", "Enter")):
+            with self.subTest(kind=kind):
+                result = compose_state(pane, "idle", True)
+                self.assertEqual((result[0], result[3]), (state, kind))
+                self.assertEqual(auto_answer(kind), answer)
+
     def test_bypass_flags(self):
         self.assertEqual(classify(_BYPASS)[0], "bypass-permissions")
 
@@ -213,6 +258,106 @@ class TestClassify(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit[0], "unknown")
 
+    # Real `tmux capture-pane -e -p` byte format (nbsp after the glyph, SGR 2
+    # dim): text coincidentally contains an await-hint phrase, nothing else around.
+    GHOST_NO_FOOTER_STYLED = "❯\xa0\x1b[2mshow me how to navigate the codebase\x1b[0m"
+    GHOST_NO_FOOTER_PLAIN = _mod._ANSI_SGR.sub("", GHOST_NO_FOOTER_STYLED)
+
+    def test_ghost_suggestion_with_no_footer_is_idle_when_styled_capture_given(self):
+        self.assertIsNone(classify(self.GHOST_NO_FOOTER_PLAIN, self.GHOST_NO_FOOTER_STYLED))
+
+    def test_ghost_suggestion_with_no_footer_without_a_styled_capture_stays_unknown(self):
+        # Documents the prior (unfixed) behavior for a caller with no styled capture
+        # to offer: unchanged, not silently "fixed" by this feature.
+        hit = classify(self.GHOST_NO_FOOTER_PLAIN)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "unknown")
+
+    def test_a_real_typed_draft_with_no_footer_still_surfaces_as_unknown(self):
+        # Same text, typed for real (no dim span to strip): must not be
+        # suppressed just because it happens to contain an await-hint phrase.
+        draft = "❯\xa0show me how to navigate the codebase"
+        hit = classify(draft, draft)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "unknown")
+
+    # An empty "❯ " (no dim span -- nothing stripped) with a real dialog's hint
+    # below it: no ghost/placeholder span here to vouch for it, so stays blocked.
+    EMPTY_COMPOSER_REAL_DIALOG = "❯ \nEnter to confirm · Esc to cancel"
+
+    def test_empty_composer_with_a_real_dialog_hint_below_stays_blocked(self):
+        hit = classify(self.EMPTY_COMPOSER_REAL_DIALOG)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "unknown")
+
+    def test_empty_composer_with_a_real_dialog_hint_below_stays_blocked_even_styled(self):
+        # Same pane as both plain and styled: no SGR anywhere, so there is no
+        # dim span to find regardless of which capture mode produced it.
+        hit = classify(self.EMPTY_COMPOSER_REAL_DIALOG, self.EMPTY_COMPOSER_REAL_DIALOG)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "unknown")
+
+    def test_an_unforeseen_dialog_above_a_ghost_composer_stays_blocked(self):
+        # A real dialog sitting in scrollback above an unrelated ghost
+        # suggestion must not be silenced by the composer's own placeholder.
+        dlg = ("Allow the frobnicator to rewrite settings?\n  1. Yes\n  2. No\n"
+               "Enter to confirm · Esc to cancel\n")
+        styled = dlg + self.GHOST_NO_FOOTER_STYLED
+        plain = _mod._ANSI_SGR.sub("", styled)
+        hit = classify(plain, styled)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], "unknown")
+
+
+class TestEscapeStrippingIsComplete(unittest.TestCase):
+    """qingyun-wu's PR review: tmux 3.6a's `-e` can emit colon-separated SGR
+    params and OSC 8 hyperlinks, neither of which the plain `\\x1b\\[[0-9;]*m`
+    pattern matched -- residual bytes would reach every matcher, not just the
+    ghost check."""
+
+    def test_colon_separated_sgr_is_stripped(self):
+        self.assertEqual(_mod._ANSI_SGR.sub("", "\x1b[4:3mhello\x1b[0m"), "hello")
+
+    def test_osc8_hyperlink_is_stripped_bel_and_st_terminated(self):
+        st = "\x1b]8;;http://example.com\x1b\\click\x1b]8;;\x1b\\"
+        bel = "\x1b]8;;http://example.com\x07click\x1b]8;;\x07"
+        self.assertEqual(_mod._ANSI_SGR.sub("", st), "click")
+        self.assertEqual(_mod._ANSI_SGR.sub("", bel), "click")
+
+    def test_a_known_gate_beside_an_osc8_link_still_classifies(self):
+        # The link text sits right next to the gate's own row; stray escape
+        # bytes left behind would break the `^\s*❯` / signature matchers.
+        link = "\x1b]8;;https://code.claude.com/docs\x1b\\docs\x1b]8;;\x1b\\"
+        styled = _BYPASS.replace("https://code.claude.com/docs/en/security", link)
+        plain = _mod._ANSI_SGR.sub("", styled)
+        self.assertEqual(classify(plain, styled)[0], "bypass-permissions")
+
+    def test_a_stray_line_outside_the_tail_window_is_not_consulted(self):
+        # A `styled_pane` one line longer than `pane` -- never a real
+        # co-derived capture -- must not let that extra line decide anything.
+        plain = TestClassify.GHOST_NO_FOOTER_PLAIN
+        mismatched_styled = TestClassify.GHOST_NO_FOOTER_STYLED + "\n❯ a totally different later line"
+        # Scoped to the one real line: the ghost suggestion, correctly idle.
+        self.assertIsNone(classify(plain, mismatched_styled))
+
+
+class TestGhostComposerComposeState(unittest.TestCase):
+    """compose_state()-level regression: with the real monitor loop now passing a
+    styled capture through, the ghost suggestion must compose to a non-blocking
+    state instead of blocked-human/unknown."""
+
+    STYLED = TestClassify.GHOST_NO_FOOTER_STYLED
+    PLAIN = TestClassify.GHOST_NO_FOOTER_PLAIN
+
+    def test_without_styled_pane_it_falsely_blocks(self):
+        st, _d, _p, kind = compose_state(self.PLAIN, "idle", True)
+        self.assertEqual(st, "blocked-human")
+        self.assertEqual(kind, "unknown")
+
+    def test_with_styled_pane_it_does_not_block(self):
+        st, *_ = compose_state(self.PLAIN, "idle", True, styled_pane=self.STYLED)
+        self.assertNotEqual(st, "blocked-human")
+
 
 class TestUnobservedProbeIsNotHung(unittest.TestCase):
     """An unobserved process probe (tmux refused the client, binary missing) must
@@ -310,6 +455,14 @@ class TestComposeState(unittest.TestCase):
     def test_running_when_base_working(self):
         st, *_ = compose_state(_WORKING, "working", True)
         self.assertEqual(st, "running")
+
+    def test_blocked_base_is_never_hung(self):
+        # runtime-health "blocked" (queued tasks held behind the composer) must not fall
+        # through to "unknown" -> hung, which reads as a wedge and invites a restart.
+        st, detail, _p, kind = compose_state(_WORKING, "blocked", True)
+        self.assertEqual(st, "blocked-known")
+        self.assertIn("queued", detail)
+        self.assertIsNone(kind)
 
     def test_hung_when_base_unknown(self):
         # runtime-health "unknown" = live session but stale/absent core-status
@@ -424,9 +577,10 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
             if len(states) == 2:
                 raise _Stop
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--no-chat-escalation"]
-        with patch.object(_mod, "capture", lambda s, sess: next(panes)), \
+        with patch.object(_mod, "capture_styled", lambda s, sess: next(panes)), \
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "session_runtime", lambda *a: None), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
                 patch.object(_mod.time, "sleep", _sleep), \
                 patch.object(sys, "argv", argv), self.assertRaises(_Stop):
@@ -860,6 +1014,90 @@ class TestAnswerStep(unittest.TestCase):
         self.assertIsNone(_mod.answer_step("blocked-known", "fable-limit", "p1", None, enabled=False))
 
 
+# An idle Codex core as the monitor captures it: plain text, so the composer's dim
+# placeholder arrives as ordinary characters. Footer from a live Codex 0.157 pane.
+_CODEX_FOOTER = "  GPT-6-Sol ultra · ~/Library/Application Support/sp…  ⚠ 1 warning · f2 to view"
+_CODEX_IDLE = f"• Done — PR #5169 updated.\n\n» Ask Codex to do anything\n\n{_CODEX_FOOTER}"
+_CODEX_IDLE_CARET = f"• Done.\n\n› Improve documentation in @filename\n\n{_CODEX_FOOTER}"
+_CODEX_WORKING = f"• Working (3m 02s • esc to interrupt)\n\n› \n\n{_CODEX_FOOTER}"
+_CODEX_PICKER = f"  Select Model and Effort\n› 4. gpt-5.5 (current)  Proven model\n\n{_CODEX_FOOTER}"
+
+
+class TestCodexIdleIsNotHung(unittest.TestCase):
+    """After a switch to Codex an idle core writes core-status rarely, exactly as
+    Claude's does, so the stale-status `hung` must yield to Codex's own idle footer."""
+
+    def test_an_idle_codex_pane_with_stale_status_is_idle_ready(self):
+        for pane in (_CODEX_IDLE, _CODEX_IDLE_CARET):
+            with self.subTest(pane=pane.splitlines()[2]):
+                st, detail, prompt, _k = compose_state(pane, "unknown", True, runtime="codex")
+                self.assertEqual((st, detail, prompt), ("idle-ready", "ready for a task", None))
+
+    def test_a_codex_pane_that_is_not_at_rest_stays_hung(self):
+        for name, pane in (("working", _CODEX_WORKING), ("picker", _CODEX_PICKER),
+                           ("no footer", "» Ask Codex to do anything"),
+                           ("no prompt", f"Running step 3...\n{_CODEX_FOOTER}")):
+            with self.subTest(name):
+                st, *_ = compose_state(pane, "unknown", True, runtime="codex")
+                self.assertEqual(st, "hung")
+
+    def test_the_claude_rule_is_unchanged(self):
+        idle = "prior output\n\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        for runtime in (None, "claude", "something-new"):
+            with self.subTest(runtime=runtime):
+                self.assertEqual(compose_state(idle, "unknown", True, runtime=runtime)[0], "idle-ready")
+                self.assertEqual(compose_state(_CODEX_IDLE, "unknown", True, runtime=runtime)[0], "hung")
+
+    def _fake_tmux(self, body):
+        import stat
+        import tempfile
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "tmux")
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
+        return d
+
+    def test_session_runtime_reads_the_sessions_own_stamp(self):
+        from unittest.mock import patch
+        cases = (('[ "$3" = show-environment ] && echo SUTANDO_CORE_RUNTIME=codex', "codex"),
+                 ("echo -SUTANDO_CORE_RUNTIME", None),
+                 ("echo SUTANDO_CORE_RUNTIME=codex; exit 1", None),
+                 ("echo SUTANDO_CORE_RUNTIME=", None))
+        for body, want in cases:
+            with self.subTest(body=body), \
+                    patch.dict(os.environ, {"PATH": self._fake_tmux(body) + os.pathsep + os.environ["PATH"]}):
+                self.assertEqual(_mod.session_runtime("/tmp/x.sock", "sutando-core"), want)
+        with patch.object(_mod.subprocess, "run", side_effect=OSError("no tmux")):
+            self.assertIsNone(_mod.session_runtime("/tmp/x.sock", "sutando-core"))
+
+    def test_a_monitor_started_for_claude_reads_the_codex_core_that_replaced_it(self):
+        # The watcher re-reads the stamp each poll: a switch keeps the socket, so the
+        # running monitor is the Claude one. Here tmux is the only runtime source.
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+        tmux = self._fake_tmux('[ "$3" = show-environment ] && echo SUTANDO_CORE_RUNTIME=codex')
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "unknown", "signals": {"process": True}}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
+                "--once", "--no-chat-escalation"]
+        with patch.object(_mod, "capture_styled", lambda s, sess: _CODEX_IDLE), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.dict(os.environ, {"PATH": tmux + os.pathsep + os.environ["PATH"]}), \
+                patch.object(sys, "argv", argv):
+            main()
+        with open(out) as f:
+            self.assertEqual(json.load(f)["state"], "idle-ready")
+
+
 class TestMainAutoAnswerWiring(unittest.TestCase):
     """One --once tick against a Fable-limit pane: the key is typed through send_keys
     and the signal file records it; --no-auto-answer only reports."""
@@ -879,7 +1117,7 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
                 return {"health": "working"}
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
                 "--once", "--stable", "1"] + extra_args
-        with patch.object(_mod, "capture", lambda s, sess: pane), \
+        with patch.object(_mod, "capture_styled", lambda s, sess: pane), \
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
@@ -1103,8 +1341,8 @@ class TestMainOnce(unittest.TestCase):
             def derive(self):
                 return {"health": "working"}
 
-        orig_cap, orig_load = _mod.capture, _mod._load_runtime_health
-        _mod.capture = lambda sock, sess: _BYPASS          # a recognized gate
+        orig_cap, orig_load = _mod.capture_styled, _mod._load_runtime_health
+        _mod.capture_styled = lambda sock, sess: _BYPASS   # a recognized gate
         _mod._load_runtime_health = lambda: _FakeRH()
         try:
             with tempfile.TemporaryDirectory() as td:
@@ -1120,7 +1358,7 @@ class TestMainOnce(unittest.TestCase):
                 with open(out) as f:
                     sig = json.load(f)
         finally:
-            _mod.capture, _mod._load_runtime_health = orig_cap, orig_load
+            _mod.capture_styled, _mod._load_runtime_health = orig_cap, orig_load
         # stable=2, first tick → prompt seen once (< 2) → debounced to running.
         self.assertEqual(sig["state"], "running")
 

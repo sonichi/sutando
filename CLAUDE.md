@@ -105,7 +105,7 @@ When you review a PR (including another agent's), you MUST follow `CONTRIBUTING.
 - Review the current head and, for a stack, the child-only layer plus cumulative interaction. Re-check CI and approval freshness after every update/rebase.
 - Scan added lines for hardcoded host paths on every review; keep fixture exclusions token-specific so they cannot hide another real path on the same line.
 - Once a requested change is verified fixed, dismiss or replace the stale REQUEST_CHANGES state. If it remains, cite the exact unresolved behavior.
-- Merge only when the current head is mergeable, required CI + CLA are green, and two maintainers have recorded formal approvals. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
+- Merge only when the current head is mergeable, required CI + CLA are green, and it has the approvals the `main` ruleset requires. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
 
 **Review criteria live in `REVIEW.md` (single source of truth).** Don't duplicate the lessons here — read them from `REVIEW.md`. **Before reviewing, run `python3 skills/review-preflight/scripts/review-preflight.py <PR>`** — it reads `REVIEW.md` and prints the criteria inline; `scripts/review-checks.sh` runs the machine-readable `checks:` block (hardcoded-path scan) in CI; and Claude Code's managed GitHub-App reviewer reads `REVIEW.md` directly. Adding or editing a lesson is a PR to `REVIEW.md` only.
 
@@ -272,11 +272,11 @@ analysis, or anything likely to take more than ~60 seconds:
 
 ```bash
 python3 skills/task-progress/scripts/notify.py \
-  --source <source> --channel-id <channel_id> \
+  --task-file "$WORKSPACE/tasks/task-<id>.txt" \
   --message "On it — looking into that now. Back in a minute."
 ```
 
-Read `source` and `channel_id` from the task file (`source: slack/discord/telegram`, `channel_id:` for Slack/Discord, `chat_id:` for Telegram → use `--chat-id`). To thread it, add `--thread-ts <reply_thread_ts>` (Slack @mention) or `--thread-root '<thread_root>'` (AG2 Space). An AG2 Space task (`source: ag2space`) takes `--source ag2space --channel-id <room>` (its `channel_id`); the update lands in that room through the gateway.
+`--task-file` derives `source`, `channel_id`/`chat_id` and the thread (`thread_root`; Slack `reply_thread_ts`) from the task's headers; an explicit flag overrides it. Without a task file pass `--source <source> --channel-id <channel_id>` (`--chat-id` Telegram; `--thread-ts <reply_thread_ts>` Slack; `--thread-root '<thread_root>'` AG2 Space); an AG2 Space task (`source: ag2space`) takes `--source ag2space --channel-id <room>`.
 
 **Queue position.** When the `QUEUE:` line (or `activity.py queue`) says more than one task is
 pending, the first line to that task's conversation names the position: one ahead, "Got it, right
@@ -326,7 +326,7 @@ Tasks arrive from multiple channels via the same file bridge:
 ### Where replies go
 
 Reply in the conversation the request came from: a task with `channel_id`/`source_room_id` is
-answered in that room, threaded to `source_message_id`. Two tests apply:
+answered in that room, replying to `source_message_id`. Two tests apply:
 
 - **Audience.** In a room with other people (anything but the owner's own DM), post only what they
   are meant to read: a reply to their message, what the owner asked to be posted there, or work the
@@ -342,11 +342,12 @@ answered in that room, threaded to `source_message_id`. Two tests apply:
 When you move an answer the room was waiting for, post it in the DM and exactly one line in the
 room: 'I sent it to you in our DM.' Never move silently.
 
-**Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially (several related tasks, ONE reply). Full per-marker semantics + incident history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":
-- `[deduped: task-<other-id>]` — silently archive this task as done (no narration, no DM); the full reply goes in the other task's result file. The canonical thread-consolidation path.
-- `[no-send]` — skip delivery (still archives); internally handled, no user-visible reply.
-- `[REPLIED]` — skip delivery (already sent through another path).
+**Result-body protocol markers** — when the result body STARTS with one of these, the bridge handles delivery specially. Full semantics + history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Result-marker semantics":
+- `[deduped: task-<other-id>]` — silently archive this task as done; the full reply goes in the other task's result file. Thread-consolidation path.
+- `[no-send]` / `[REPLIED]` — skip delivery (still archives): nothing to show / already sent another way.
 - `[channel: <channel-id>]` — as first non-empty line only: deliver the rest of the body to that channel instead of the originating one. Telegram silently drops it.
+- `[thread: $<root>]` — proactive lead line, after any skip marker: AG2 Space posts in that thread. For a thread in use; new topics go top level.
+- `[thread]` — task-result lead line: AG2 Space threads the answer on the ask. Threading is your call, e.g. a side discussion that would crowd the timeline; when unsure, reply in the timeline.
 - `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body; detected anywhere, stripped only when alone on its line.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — extract and attach the file alongside the text body.
 
@@ -355,9 +356,9 @@ room: 'I sent it to you in our DM.' Never move silently.
 **Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task — keep using it unless you specifically need to push a result to a non-delegating consumer. Use the scoped form ONLY when a result needs to be claimed by a pull-side consumer that didn't delegate the work:
 - phone → key built via `phoneCallKey(callSid)` → `phone-<safe(call-sid)>`
 
-**Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix. The per-consumer prefix is code-enforced (single helper, single source of truth) so cross-consumer namespace collisions are impossible regardless of what ID format a future consumer adopts.
+**Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix.
 
-Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python). Why the scoped name slides past every existing consumer, and how the phone drain claims it: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Per-channel pull namespace".
+Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python). Why the scoped name slides past existing consumers, and how the phone drain claims it: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Per-channel pull namespace".
 
 **IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"` (`$SUTANDO_TASKS_DIR` as the inbox when set; the tag is what lets the external standby supervisor see this watcher and stand down) — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification, followed by `QUEUE: <n> pending after this` only when other tasks are waiting. When a notification arrives, Read the named file, process it, and write a result to `results/`. Pass `timeout_ms: 1800000` and re-arm on the expiry or early-exit notice (`Monitor` has no `persistent` option).
 

@@ -38,10 +38,10 @@ stale="$(grep -vxF -f "$ALL" "$WANT" || true)"
 if [ "$MODE" = only ]; then
   { grep -xF -f "$WANT" "$ALL" || true; } | { grep -vxF -f "$SER" || true; } > "$OUT"
   # An empty leg must fail, not run nothing and pass.
-  [ -s "$OUT" ] || { echo "leg 6: the selector emitted no load-sensitive suites; the list must name at least one suite without \`serial\`, or leg 6 must be removed" >&2; exit 3; }
+  [ -s "$OUT" ] || { echo "leg 8: the selector emitted no load-sensitive suites; the list must name at least one suite without \`serial\`, or leg 8 must be removed" >&2; exit 3; }
 elif [ "$MODE" = serial ]; then
   grep -xF -f "$SER" "$ALL" > "$OUT" || true
-  [ -s "$OUT" ] || { echo "leg 7: the selector emitted no serial suites; the list must tag at least one suite serial, or leg 7 must be removed" >&2; exit 3; }
+  [ -s "$OUT" ] || { echo "leg 9: the selector emitted no serial suites; the list must tag at least one suite serial, or leg 9 must be removed" >&2; exit 3; }
 else
   grep -vxF -f "$WANT" "$ALL" > "$OUT" || true
 fi

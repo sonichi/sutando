@@ -34,6 +34,9 @@ class CronScheduleLivenessTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.ws = Path(self._tmp.name).resolve()
         (self.ws / "state").mkdir(parents=True)
+        self._host = unittest.mock.patch.object(hc, "_host_label", return_value="test-host")
+        self._host.start()
+        self.addCleanup(self._host.stop)
         self._orig = hc.WORKSPACE_DIR
         hc.WORKSPACE_DIR = self.ws
 
@@ -41,153 +44,92 @@ class CronScheduleLivenessTest(unittest.TestCase):
         hc.WORKSPACE_DIR = self._orig
         self._tmp.cleanup()
 
-    def _stamper(self, age_h: "float | None", stamps: bool = True):
-        """Stand in for the installed scripts/core-status.sh at a given age.
-
-        `age_h=None` or `stamps=False` models a build whose core-status.sh does
-        not write the marker at all — the absence then proves nothing.
-        """
+    def _stamper(self, age_h, stamps=True):
         d = self.ws / "fake_repo"
         (d / "scripts").mkdir(parents=True, exist_ok=True)
         f = d / "scripts" / "core-status.sh"
-        f.write_text("last-loop-ok\n" if stamps else "no stamping here\n")
+        f.write_text("--loop-complete\n" if stamps else "no completion writer\n")
         if age_h is not None:
             t = time.time() - age_h * 3600
             os.utime(f, (t, t))
         return unittest.mock.patch.object(hc, "REPO_DIR", d)
 
-    def _age_state_file(self, rel: str, age_h: float) -> None:
-        """A state/ file of a given age, standing in for prior workspace use."""
-        f = self.ws / "state" / rel
-        f.touch()
-        t = time.time() - age_h * 3600
-        os.utime(f, (t, t))
+    def _mark(self, age_h, host="test-host"):
+        from loop_completion import write_completion
+        write_completion(self.ws, host, now=time.time() - age_h * 3600)
 
-    def _mark(self, age_h: float) -> None:
-        m = self.ws / "state" / "last-loop-ok"
-        m.touch()
-        t = time.time() - age_h * 3600
-        os.utime(m, (t, t))
-
-    # --- the three bands -------------------------------------------------
-
-    def test_a_recent_pass_is_ok(self) -> None:
+    def test_a_recent_pass_is_ok(self):
         self._mark(0.2)
-        r = hc.check_cron_schedule()
-        self.assertEqual(r["status"], "ok", r)
+        self.assertEqual(hc.check_cron_schedule()["status"], "ok")
 
-    def test_a_schedule_quiet_past_the_warn_band_warns(self) -> None:
+    def test_a_schedule_quiet_past_the_warn_band_warns(self):
         self._mark(9)
         r = hc.check_cron_schedule()
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("9.0h", r["detail"])
 
-    def test_a_schedule_quiet_past_the_fail_band_fails(self) -> None:
-        """The band that matters: CronCreate jobs expire after 7 days."""
+    def test_a_schedule_quiet_past_the_fail_band_fails(self):
         self._mark(101)
         r = hc.check_cron_schedule()
         self.assertEqual(r["status"], "fail", r)
         self.assertIn("101.0h", r["detail"])
-        self.assertIn("expire", r["detail"])
 
-    # --- the failure this probe exists for -------------------------------
-
-    def test_a_fresh_core_status_does_not_mask_a_dead_schedule(self) -> None:
-        """core-status.json is refreshed by owner turns; the marker is not.
-
-        This is the whole reason the probe reads its own marker: a host in
-        conversation looks healthiest to a core-status-based check exactly
-        when its schedule is dead.
-        """
+    def test_owner_status_and_legacy_marker_cannot_mask_dead_loop(self):
         self._mark(101)
-        (self.ws / "state" / "core-status.json").write_text(
-            '{"status": "running", "ts": %d}' % int(time.time()))
-        r = hc.check_cron_schedule()
-        self.assertEqual(r["status"], "fail", r)
+        (self.ws / "state/core-status.json").write_text(json.dumps({"status": "idle", "ts": time.time()}))
+        (self.ws / "state/last-loop-ok").touch()
+        self.assertEqual(hc.check_cron_schedule()["status"], "fail")
 
-    # --- absence is not staleness ----------------------------------------
-
-    def test_a_missing_marker_is_ok_not_a_failure(self) -> None:
-        """Fresh install, or no pass has closed yet. Never louder than stale."""
-        r = hc.check_cron_schedule()
-        self.assertEqual(r["status"], "ok", r)
-        self.assertIn("no loop marker", r["detail"])
-
-    def test_absent_marker_on_a_worked_in_state_dir_warns_never_started(self) -> None:
-        """The failure the docstring names but the probe could not see.
-
-        The deadlock is: /schedule-crons is itself one of the expiring crons, so
-        when it lapses the loop never closes a pass and NO marker is ever written.
-        Reporting ok there means the motivating case is the one blind spot.
-        """
-        self._age_state_file("core-status.json", 30)
-        # The stamper must predate the warn band, or its youth explains the
-        # absence on its own — see the merge-day test below.
-        with self._stamper(400.0):
-            r = hc.check_cron_schedule()
-        self.assertEqual(r["status"], "warn", r)
-        self.assertIn("never have STARTED", r["detail"])
-        self.assertIn("30.0h", r["detail"])
-
-    def test_a_newly_installed_stamper_does_not_convict_an_old_workspace(self) -> None:
-        """THE MERGE-DAY CASE. Reported by @qingyun-wu on #3669 against a host whose
-        loop had closed a pass every few minutes all night: state/ was 1227.4h old,
-        the marker could not exist yet because its writer had only just shipped, and
-        the probe warned. Workspace age is not evidence about a code path younger
-        than the workspace."""
-        self._age_state_file("old.json", 1227.4)
+    def test_first_proof_grace_is_bounded_by_writer_installation(self):
         with self._stamper(0.2):
             r = hc.check_cron_schedule()
-        self.assertEqual(r["status"], "ok", r["detail"])
-        self.assertIn("stamping code is only", r["detail"])
-
-    def test_an_old_stamper_with_no_marker_still_warns(self) -> None:
-        """The control for the case above: once the writer HAS been installed long
-        enough for a pass to close, a missing marker is evidence again."""
-        self._age_state_file("old.json", 1227.4)
-        with self._stamper(400.0):
-            r = hc.check_cron_schedule()
-        self.assertEqual(r["status"], "warn", r["detail"])
-        self.assertIn("may never have STARTED", r["detail"])
-
-    def test_a_build_that_cannot_stamp_is_ok_not_a_warn(self) -> None:
-        """An older core-status.sh writes no marker, so its absence is not a signal."""
-        self._age_state_file("old.json", 1227.4)
-        with self._stamper(400.0, stamps=False):
-            r = hc.check_cron_schedule()
-        self.assertEqual(r["status"], "ok", r["detail"])
-        self.assertIn("does not stamp", r["detail"])
-
-    def test_absent_marker_on_a_young_state_dir_stays_ok(self) -> None:
-        """The discriminator: a real fresh install must not warn on day one."""
-        self._age_state_file("core-status.json", 0.5)
-        r = hc.check_cron_schedule()
-        self.assertEqual(r["status"], "ok", r)
-        self.assertIn("no loop marker", r["detail"])
-
-    def test_a_peers_synced_core_file_does_not_age_a_fresh_workspace(self) -> None:
-        """state/cores/ is synced across hosts, so it cannot date THIS host."""
-        cores = self.ws / "state" / "cores"
-        cores.mkdir()
-        self._age_state_file("cores/peer.alive", 200)
-        self.assertEqual(hc.check_cron_schedule()["status"], "ok")
-
-    def test_an_unreadable_state_dir_is_ok_not_a_warn(self) -> None:
-        """Unknowable age must fail toward quiet, like the missing marker itself."""
-        self.assertIsNone(hc._state_in_use_age_h(self.ws / "state" / "nope"))
-
-    def test_the_never_started_band_follows_the_warn_override(self) -> None:
-        """It reuses warn_h, so widening the band must widen this too."""
-        self._age_state_file("core-status.json", 9)
-        with self._stamper(400.0):
+            self.assertEqual(r["status"], "ok", r)
+            self.assertIn("awaiting first", r["detail"])
+        with self._stamper(8):
             self.assertEqual(hc.check_cron_schedule()["status"], "warn")
-            with unittest.mock.patch.dict(os.environ, {"SUTANDO_CRON_STALE_WARN_H": "12"}):
-                self.assertEqual(hc.check_cron_schedule()["status"], "ok")
-        # And the stamper gate follows the same override: a 10h-old stamper is
-        # inside a widened 12h band, so it suppresses rather than warns.
-        with self._stamper(10.0):
-            with unittest.mock.patch.dict(os.environ, {"SUTANDO_CRON_STALE_WARN_H": "12"}):
-                self.assertEqual(hc.check_cron_schedule()["status"], "ok")
+            (self.ws / "state/core-status.json").write_text("{}")
+            (self.ws / "state/last-loop-ok").touch()
+            self.assertEqual(hc.check_cron_schedule()["status"], "warn")
+
+    def test_unavailable_writer_is_not_success(self):
+        with self._stamper(400, stamps=False):
+            self.assertEqual(hc.check_cron_schedule()["status"], "warn")
+
+    def test_peer_completion_cannot_heal_missing_or_stale_local_proof(self):
+        self._mark(0.1, host="peer-host")
+        with self._stamper(400):
+            self.assertEqual(hc.check_cron_schedule()["status"], "warn")
+        self._mark(101)
+        self.assertEqual(hc.check_cron_schedule()["status"], "fail")
+
+    def test_invalid_and_future_records_are_never_healthy(self):
+        from loop_completion import completion_path
+        target = completion_path(self.ws, "test-host")
+        target.parent.mkdir(parents=True)
+        for value in ("{", "[]", json.dumps({"version": 1, "host": "peer-host", "completed_at": time.time()}),
+                      json.dumps({"version": 1, "host": "test-host", "completed_at": time.time() + 3600})):
+            with self.subTest(value=value):
+                target.write_text(value)
+                self.assertEqual(hc.check_cron_schedule()["status"], "warn")
+
+    def test_only_explicit_parking_exempts_liveness(self):
+        target = self.ws / "hosts/test-host/crons.json"
+        target.parent.mkdir(parents=True)
+        entry = {"name": "main-loop", "prompt_skill": "proactive-loop", "cron": "0 0 31 2 *"}
+        self._mark(101)
+        target.write_text(json.dumps([entry]))
+        self.assertEqual(hc.check_cron_schedule()["status"], "fail")
+        entry["disabled"] = True
+        target.write_text(json.dumps([entry]))
+        self.assertEqual(hc.check_cron_schedule()["status"], "ok")
+        entry["cron"] = "*/5 * * * *"
+        target.write_text(json.dumps([entry]))
+        self.assertEqual(hc.check_cron_schedule()["status"], "fail")
+
+    def test_autonomy_pause_does_not_exempt_health_pass(self):
+        self._mark(101)
+        (self.ws / "state/loop-paused-until.sentinel").write_text(str(time.time() + 3600))
+        self.assertEqual(hc.check_cron_schedule()["status"], "fail")
 
     # --- band overrides ---------------------------------------------------
 
@@ -220,7 +162,8 @@ class CronScheduleLivenessTest(unittest.TestCase):
         (repo / "src").mkdir(parents=True)
         (repo / "scripts").mkdir(parents=True)
         for rel in ("src/workspace_default.py", "src/sutando_config.py",
-                    "scripts/python-binary.sh", "scripts/core-status.sh"):
+                    "src/loop_completion.py", "src/file_lock.py", "src/util_paths.py",
+                    "scripts/sutando-config.sh", "scripts/python-binary.sh", "scripts/core-status.sh"):
             shutil.copy(REPO / rel, repo / rel)
         shutil.copy(REPO / "sutando.config.json", repo / "sutando.config.json")
         (repo / "sutando.config.local.json").write_text(
@@ -236,8 +179,8 @@ class CronScheduleLivenessTest(unittest.TestCase):
                         f"wrote outside the temp workspace: {done.stdout!r}")
 
 
-    def test_core_status_idle_stamps_the_marker_and_running_does_not(self) -> None:
-        """The probe is only as good as the stamp; assert both polarities."""
+    def test_ordinary_core_status_idle_does_not_claim_loop_completion(self) -> None:
+        """An owner conversation can finish while the proactive loop is absent."""
         repo = self._minimal_repo()
         marker = self.ws / "state" / "last-loop-ok"
 
@@ -248,7 +191,18 @@ class CronScheduleLivenessTest(unittest.TestCase):
         idle_stamped = marker.exists()
 
         self.assertFalse(running_stamped, "running must not stamp the pass-closed marker")
-        self.assertTrue(idle_stamped, "idle closes a pass and must stamp it")
+        self.assertFalse(idle_stamped, "ordinary idle must not claim a loop pass completed")
+
+    def test_explicit_loop_completion_is_host_specific_and_idle_does_not_refresh_it(self) -> None:
+        repo = self._minimal_repo()
+        with unittest.mock.patch.dict(os.environ, {"SUTANDO_HOST_LABEL": "test-host"}):
+            self._core_status(repo, "idle", "", "--loop-complete")
+        marker = self.ws / "state" / "loop-completions" / "test-host.json"
+        before = marker.read_bytes()
+        self.assertEqual(json.loads(before)["host"], "test-host")
+        self._core_status(repo, "idle")
+        self.assertEqual(marker.read_bytes(), before)
+        self.assertFalse((self.ws / "state" / "last-loop-ok").exists())
 
     # --- wiring -----------------------------------------------------------
 

@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 # Slack's token family has one owner; a private copy here missed xapp-/xoxe- tokens.
-from chat_secret_filter import SLACK_TOKEN_PATTERN
+from chat_secret_filter import PRIVATE_KEY_PATTERN, SLACK_TOKEN_PATTERN
 
 # Guarded: a module-scope import let detect-secrets' ABSENCE disable the
 # repo-local rules written to cover its blind spots (issue #3100).
@@ -86,9 +86,7 @@ _FULL_PATTERNS: dict[str, re.Pattern] = {
     "GitHub Token": re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}"),
     "JSON Web Token": re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
     "Slack Token": SLACK_TOKEN_PATTERN,
-    "Private Key": re.compile(
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z ]*PRIVATE KEY-----"
-    ),
+    "Private Key": PRIVATE_KEY_PATTERN,
     "OpenAI Token": re.compile(r"sk-[A-Za-z0-9_-]*[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}"),  # matches detect-secrets OpenAIDetector pattern
     "Stripe Access Key": re.compile(r"sk_(?:live|test)_[A-Za-z0-9]{24,}"),
     "Discord Bot Token": re.compile(
@@ -191,7 +189,7 @@ def redact_secrets(text: str, hits: Iterable[SecretHit]) -> str:
             continue
         if h.secret_type == "Private Key":
             # Find END marker on or after the hit line.
-            end_idx = idx
+            end_idx = len(lines) - 1
             for j in range(idx, len(lines)):
                 if "-----END " in lines[j] and "PRIVATE KEY-----" in lines[j]:
                     end_idx = j

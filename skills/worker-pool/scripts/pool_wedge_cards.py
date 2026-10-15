@@ -123,7 +123,16 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
     subject = {"source": SOURCE, "worker_id": worker_id, "session": session, "wedge": which,
                "frame": frame}
     device = {"id": session, "name": seat, "socket": str(socket)}
-    if which == ps.CARD_FROZEN:
+    if which == ps.CARD_HUMAN:
+        if pane not in (ps.PANE_GATE, ps.PANE_LIMIT):
+            return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
+        req = HumanRequirement(
+            kind="core-blocked", runtime=runtime, device=device, subject=subject,
+            title=f"{seat} · needs your decision",
+            message=(f"{seat} (tmux session {session}) owes work and is waiting at a gate "
+                     "or usage limit. Open its terminal to review the decision."),
+            guard=f"{SOURCE}:{session}:human", actions=[_jump(session)])
+    elif which == ps.CARD_FROZEN:
         if pane != ps.PANE_WORKING:
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
         req = HumanRequirement(
@@ -213,20 +222,36 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
     return out
 
 
-def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None) -> list:
+def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, observations=None, recovered=None) -> list:
     """Close the pending cards of seats that are no longer wedged, and of seats still
     wedged whose card is not the one their pane asks for now (`wedges`: worker ->
-    that card, None for a gate or limit); a pressed one is left to `drive_escapes`,
-    which refuses it once the frame has moved."""
+    that card). Pressed proxy cause cards require positive recovery evidence
+    (`recovered`, defaulting to `worker_ids`); Escape stays with `drive_escapes`."""
     from hitl.schema import STATUS_IN_PROGRESS
     manager = manager or manager_for(workspace)
     wedges = wedges or {}
+    recovered = worker_ids if recovered is None else recovered
     closed = []
     for r in manager.active():
         subj = r.subject or {}
         w = subj.get("worker_id")
-        stale = w in worker_ids or (w in wedges and subj.get("wedge") != wedges[w])
-        if subj.get("source") == SOURCE and stale and r.status != STATUS_IN_PROGRESS:
+        if subj.get("wedge") == ps.CARD_HUMAN and observations is not None:
+            o = observations.get(w, {})
+            if (o.get("paused") or o.get("session_alive") is not True
+                    or o.get("pane") in (None, ps.PANE_UNKNOWN)
+                    or (o.get("pane") in (ps.PANE_GATE, ps.PANE_LIMIT)
+                        and o.get("work_outstanding") is None)):
+                continue
+        # The HITL guard can deduplicate a login request onto its older cause card.
+        legacy_login = (wedges.get(w) == ps.CARD_LOGIN and subj.get("wedge") == ps.CARD_CAUSE
+                        and isinstance(subj.get("cause"), list) and "needs-login" in subj["cause"])
+        stale = w in worker_ids or (w in wedges and subj.get("wedge") != wedges[w]
+                                   and not legacy_login)
+        cleared_proxy = (w in worker_ids and w in recovered
+                         and subj.get("wedge") == ps.CARD_CAUSE
+                         and r.chosen_action == PROXY_ACTION)
+        if (subj.get("source") == SOURCE and stale
+                and (r.status != STATUS_IN_PROGRESS or cleared_proxy)):
             manager.resolve(r.id)
             closed.append(r.id)
     return closed

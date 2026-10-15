@@ -31,6 +31,7 @@ idle / wedged":
     needs_login             →   logged-out        (unless an ACTIVE gate shows, below)
     working                 →   running
     idle                    →   idle-ready
+    blocked (queue held)    →   blocked-known     (never hung: a restart is not the remedy)
     unknown (status stale)  →   hung              (only when the process probe SAW a session)
     unknown (unobserved)    →   unobserved        (probe could not run: hold, never RECOVER)
     (any, + gateway down)   →   gateway-down       (gateway probe is bundled-specific)
@@ -66,7 +67,7 @@ import os.path as _osp
 import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
-from worker_auth_state import authenticated_turn, login_expired  # noqa: E402
+from worker_auth_state import authenticated_turn, login_expired, refusal_answered  # noqa: E402
 import cli_wedge  # noqa: E402
 import core_gate_notice  # noqa: E402
 import self_opened_gate  # noqa: E402
@@ -118,8 +119,9 @@ def _load_runtime_health():
 # Claude Code's weekly Fable-consent dialog (title / body); Enter is safe there only
 # with the caret on its "Switch to <fallback> and continue" row.
 from delivery.pane_gate import (  # noqa: E402
-    AWAIT_HINT, BORDER_LINE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE, COMPOSER_PLACEHOLDER, FABLE_TEXT,
-    composer_text as _pg_composer_text,
+    ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
+    COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, classify_pane as _pg_classify_pane,
+    composer_text as _pg_composer_text, prompt_line as _pg_prompt_line, gate_evidence,
 )
 
 _FABLE_TEXT = FABLE_TEXT
@@ -142,11 +144,15 @@ _BORDER_LINE = BORDER_LINE
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
 _REFUSAL = re.compile(
     r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
-    r"|Please run /login|OAuth access token has expired"
-    # "not logged in" is three common words: only the CLI's own line-start form, or
-    # the phrase beside a /login token, is a refusal; a tool result quoting it is not.
-    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b|not logged in\b.{0,60}/login\b|/login\b.{0,60}not logged in\b",
-    re.I)
+    # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
+    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b", re.I)
+
+
+def _refusal_line(line: str) -> bool:
+    """A limit refusal, or the CLI's needs-login line (cli_wedge's one grammar)."""
+    return bool(_REFUSAL.search(line)) or cli_wedge.needs_login_line(line)
+
+
 # The completed-turn line: "✻ Worked for 0s" / "✻ Cooked for 1s · done 12:32 PM". The spinner
 # reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
 _TURN_DONE = re.compile(
@@ -158,7 +164,7 @@ _PROMPT_LINE = re.compile(r"^\s*❯")
 _COMPOSER_PLACEHOLDER = COMPOSER_PLACEHOLDER
 # With `capture-pane -e` the CLI's ghost text (that hint, a suggested reply) is dimmed:
 # SGR 2 on some builds, a 256-colour grey (232-255) on others. Typed text never is.
-_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+# `_ANSI_SGR` is `pane_gate.SGR_STRIP`, imported above -- one pattern, not a copy.
 _DIM_SPAN = re.compile(r"\x1b\[(?:2|38;5;2(?:3[2-9]|4\d|5[0-5]))m.*?(?=\x1b\[(?:0|22|39)m|$)")
 #: Non-empty pane lines searched for the nearest completed turn (a result line may wrap).
 _TURN_WINDOW = 40
@@ -198,24 +204,21 @@ def auto_answer(kind):
     return _AUTO_ANSWER.get(kind)
 
 
-def classify(pane: str):
-    """Return (kind, excerpt) if the pane is awaiting user input, else None."""
-    tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
+def classify(pane: str, styled_pane: "str | None" = None):
+    """Return (kind, excerpt) if the pane is awaiting user input, else None.
+
+    `styled_pane` supplies placeholder evidence to the shared filter. It must be
+    the SAME capture as `pane` (e.g. `pane = _ANSI_SGR.sub("", styled_pane)`),
+    so stripping never shifts a line out of the window the two share."""
+    plain_lines = pane.splitlines()
+    kept = [i for i, ln in enumerate(plain_lines) if ln.strip()][-14:]
+    tail = "\n".join(plain_lines[i] for i in kept)
+    styled_lines = styled_pane.splitlines() if styled_pane is not None else None
+    styled_tail = ("\n".join(styled_lines[i] for i in kept)
+                   if styled_lines is not None and kept and max(kept) < len(styled_lines)
+                   else tail)
+    tail = gate_evidence(tail, styled_tail, CLAUDE)
     if not _AWAIT_HINT.search(tail):
-        return None
-    # Idle-footer suppression: the normal footer ("⏵⏵ bypass permissions on … ←
-    # for agents") also carries an await-affordance, so a genuinely idle pane would
-    # otherwise fall through to "unknown". Suppress it ONLY when NO real gate
-    # signature matches — check ALL of _SIGNATURES, not a prefix. (Bug caught in
-    # review 2026-07-14: slicing [:5] excluded `permission` (index 5), so a real
-    # mid-session "Do you want to proceed? / Allow this action" prompt rendered
-    # above the footer was hidden — a false negative on a MAIN escalation case. The
-    # footer itself matches none of the signatures, so idle still suppresses.)
-    # The footer vouches only for itself: a hint on any OTHER line is a live
-    # prompt sharing the window with an old footer, and must not be suppressed.
-    beyond_footer = "\n".join(ln for ln in tail.splitlines() if not _IDLE.search(ln))
-    if (_IDLE.search(tail) and not _AWAIT_HINT.search(beyond_footer)
-            and not any(rx.search(tail) for _, rx in _SIGNATURES)):
         return None
     # Two gates in one pane (one in scrollback): the live one is nearest the bottom.
     hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(_SIGNATURES)
@@ -229,21 +232,27 @@ def classify(pane: str):
                 for m in _FABLE_TEXT.finditer(tail)):
             return "unknown", tail
         return kind, tail
-    # No specific signature — but an input affordance IS present and this is NOT
-    # the idle prompt. That means an UNFORESEEN prompt. Surface it rather than
-    # leave a silent dead-end (owner's no-dead-end requirement 2026-07-14): we
-    # cannot enumerate every possible TUI question, so ANY await-affordance that
-    # isn't the known idle-ready state is treated as needing the user.
+    # No signature, no idle ghost composer: an unforeseen prompt, surfaced rather
+    # than a silent dead-end (owner's no-dead-end rule 2026-07-14).
     return "unknown", tail
 
 
-def _is_idle_ready(pane: str) -> bool:
+def _is_idle_ready(pane: str, runtime: "str | None" = None) -> bool:
     """True when the pane POSITIVELY shows the idle-ready prompt (the bypass /
     for-agents footer) and no gate signature — the core is sitting ready for a
     task. Distinct from `classify(pane) is None`, which is ALSO None for a
     no-affordance pane (mid-processing / blank / frozen); that must NOT be read as
-    idle. Mirrors classify()'s idle-footer suppression."""
+    idle. Mirrors classify()'s idle-footer suppression.
+
+    `runtime` is the session's own stamp. A non-Claude pane draws a different idle
+    footer, which pane_gate's adapter for that runtime reads; None keeps Claude's.
+    The capture is unstyled, so a dim placeholder reads as a draft: under the footer
+    both are a composer at rest, as Claude's footer rule already treats them."""
     tail = "\n".join([ln for ln in pane.splitlines() if ln.strip()][-14:])
+    adapter = ADAPTERS.get(runtime or "")
+    if adapter is not None and adapter is not CLAUDE:
+        state = _pg_classify_pane(pane, adapter).state
+        return state == "idle-ready" or (state == "pending" and bool(adapter.idle_ready.search(tail)))
     return bool(_IDLE.search(tail)) and classify(pane) is None
 
 
@@ -275,7 +284,7 @@ def _composer_text(pane: str) -> "str | None":
 def refused_turn(pane: str):
     """(kind, line) when the pane sits at the idle footer and the turn that ended there —
     the last completed one, with nothing newer below it — was refused: a short turn (≤1s
-    or no duration) whose only content is a `⎿` result carrying a _REFUSAL line. Else
+    or no duration) whose only content is a `⎿` result carrying a _refusal_line. Else
     None — a long turn that merely mentions the words, a turn that ran (any `●`/`⏺`
     line, so a tool result that quoted a refusal stays the tool's), a completion with a
     newer prompt or active turn below it, or a pane not at the footer all stay as they were."""
@@ -304,7 +313,7 @@ def refused_turn(pane: str):
     for core in turn:
         if core.startswith("⎿"):
             in_result = True
-        if in_result and _REFUSAL.search(core):
+        if in_result and _refusal_line(core):
             return "turn-rejected", core.lstrip("⎿").strip()
     return None
 
@@ -315,13 +324,16 @@ _BASE_TO_STATE = {
     "needs_login": ("logged-out", "core not authenticated (needs /login)"),
     "idle": ("idle-ready", "ready for a task"),
     "working": ("running", "actively processing"),
+    # Queued tasks held by the pane (a draft, an abnormal frame): visible, never a restart.
+    "blocked": ("blocked-known", "tasks queued but held by the pane (composer text or abnormal frame)"),
     # "unknown" = runtime-health saw a live session but a stale/absent core-status
     # ("running" that never advanced) → wedged. That IS the supervisor's `hung`.
     "unknown": ("hung", "core alive but stalled (status stale, no recognized prompt)"),
 }
 
 
-def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None):
+def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime=None,
+                   styled_pane: "str | None" = None):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
@@ -332,6 +344,9 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     `process` is runtime-health's `signals.process` tri-state: True (session
     seen), False (server answered "no session"), None (the probe could not run).
     `prev_pane` is the previous poll's capture, the only evidence a turn is moving.
+    `runtime` is the runtime stamped on the core session (see `session_runtime`).
+    `styled_pane` is the same capture taken WITH escapes, when the caller has one
+    (see `classify()`); omitted it changes nothing else here.
     """
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
@@ -339,7 +354,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     # "sitting at a prompt waiting for input" from the coarse health (e.g. the live
     # /login MENU, which runtime-health's needs_login markers don't match). Check it
     # first so we carry the prompt text + kind for ESCALATE / AUTO-ANSWER.
-    hit = classify(pane) if pane else None
+    hit = classify(pane, styled_pane) if pane else None
     if hit:
         kind, excerpt = hit
         if kind in _HUMAN_GATES:
@@ -347,7 +362,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         return "blocked-known", f"at known gate: {kind}", excerpt, kind
     # A refused login leaves no gate and the idle footer, and the shared health can read a
     # seat off the CORE's status file: the pane's own refusal stands until it shows a turn ran.
-    expired = login_expired(pane) if pane else None
+    expired = login_expired(pane, runtime) if pane else None
     if expired:
         return ("logged-out", "core not authenticated (login expired; no signed-in turn since)",
                 expired, "login")
@@ -371,7 +386,7 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         # direct evidence over the stale status file: it's idle, not wedged. Only
         # a positive idle match overrides — a no-affordance pane (mid-work or truly
         # frozen) still reads hung, preserving genuine wedge detection.
-        if pane and _is_idle_ready(pane):
+        if pane and _is_idle_ready(pane, runtime):
             return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
         if pane and _turn_moving(pane, prev_pane):
             return "running", _BASE_TO_STATE["working"][1], None, None
@@ -485,9 +500,32 @@ def gateway_alive(app_data, state_dir=None):
     return _pgrep("remote-gateway-bridge")
 
 
+def session_runtime(socket, session):
+    """The runtime the start-cli launcher stamped on the core session, or None.
+
+    Read every poll: a runtime switch relaunches the core on the same socket, so a
+    monitor started for the previous runtime keeps watching the new one."""
+    try:
+        r = subprocess.run(["tmux", "-S", socket, "show-environment", "-t", f"={session}",
+                            "SUTANDO_CORE_RUNTIME"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (r.stdout or "").strip() if r.returncode == 0 else ""
+    return out.split("=", 1)[1].strip() or None if out.startswith("SUTANDO_CORE_RUNTIME=") else None
+
+
 def capture(socket, session):
+    """Plain capture. Kept for its own direct tests; the main loop now calls
+    `capture_styled()` once and derives this text from it instead (below)."""
     target = cli_wedge.core_target(socket, session)
     return cli_wedge.capture_pane(socket, target) if target else None
+
+
+def capture_styled(socket, session):
+    """Styled capture (escapes kept) -- the one tmux call the main loop makes;
+    its plain text is derived via `_ANSI_SGR.sub()`, not a second capture."""
+    target = cli_wedge.core_target(socket, session)
+    return cli_wedge.capture_pane(socket, target, escapes=True) if target else None
 
 
 def send_keys(socket, session, key):
@@ -544,6 +582,9 @@ AUTO_ANSWER_CARRY_S = 120.0
 # ESCALATE (Layer 3): a blocked core IS a HumanRequirement, so it goes through
 # `src/hitl` — the Manager dedups, the projector renders the card.
 _CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
+#: How long a signed-out reading must hold before it is carded. A refusal or 401 banner
+#: the CLI recovers from on its own (a token refresh, a boot race) clears well inside it.
+LOGIN_CONFIRM_S = 60.0
 HITL_KIND = "core-blocked"
 _TUI_SOURCE = "tui"
 #: a driven click that has not moved the core by then expires as "did not take".
@@ -602,7 +643,7 @@ def _name_seat(req, session, seat):
     return req
 
 
-def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0):
+def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None):
     """Raise ONE requirement per episode. The Manager dedups on
     (runtime, kind, device) + guard, so the prompt IS the episode key: the same
     prompt returns the same record, a different one mints a new card.
@@ -614,7 +655,8 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0)
     try:
         from hitl import tui_gate
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
-                                       escalation_message(state, detail, kind, prompt))
+                                       escalation_message(state, detail, kind, prompt),
+                                       runtime=runtime)
         if queued:
             req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
         if seat:
@@ -623,6 +665,15 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0)
     except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
         print(f"hitl escalation failed: {exc}", file=_sys.stderr)
         return None
+
+
+def login_confirm_step(since, state, kind, now, confirm_s=LOGIN_CONFIRM_S):
+    """(settling, since) for a signed-out reading: it settles until it has held for
+    `confirm_s`; any other reading resets the clock."""
+    if state != "logged-out" and kind != "login":
+        return False, None
+    since = now if since is None else since
+    return now - since < confirm_s, since
 
 
 def card_step(pane_present, state, idle_ticks, stable, settling=False):
@@ -638,21 +689,21 @@ def card_step(pane_present, state, idle_ticks, stable, settling=False):
     return ("resolve" if idle_ticks >= max(1, int(stable)) else "hold"), idle_ticks
 
 
-def resolve_escalations(manager, session, pane=None):
+def resolve_escalations(manager, session, pane=None, runtime=None):
     """Clear THIS session's requirements once its core is no longer blocked —
     the card says answered because the core moved, not because anyone clicked.
 
     Scoped by session: one worker recovering must not clear a sibling's card.
-    A signed-out card clears only on positive proof in `pane` that a turn ran
-    (worker_auth_state.authenticated_turn): a newer prompt, a spinner, an empty
-    capture or a health verdict read off another session's status file is not
-    "Sutando has continued its work".
+    A signed-out card clears only on positive proof in `pane` that the CLI is signed in:
+    a turn that ran, or output after the refusal (worker_auth_state). A newer prompt, a
+    spinner, an empty capture or a health verdict read off another session's status
+    file is not "Sutando has continued its work".
     """
     if manager is None:
         return []
     try:
         from hitl.manager import AUTH_KIND
-        signed_in = authenticated_turn(pane)
+        signed_in = authenticated_turn(pane, runtime) or refusal_answered(pane, runtime)
         done = []
         for r in manager.active():
             subj = r.subject or {}
@@ -758,6 +809,8 @@ def main():
     ap.add_argument("--interval", type=float, default=3.0)
     ap.add_argument("--stable", type=int, default=2,
                     help="consecutive identical prompt polls before escalating (debounce)")
+    ap.add_argument("--login-confirm-s", type=float, default=LOGIN_CONFIRM_S,
+                    help="seconds a signed-out reading must hold before it is carded")
     ap.add_argument("--once", action="store_true", help="one tick then exit (for tests/probes)")
     ap.add_argument("--no-auto-answer", dest="auto_answer", action="store_false",
                     help="report allowlisted gates without typing their safe answer")
@@ -792,23 +845,33 @@ def main():
     answered_prompt = None
     last_answered = None
     idle_ticks = 0
+    login_since = None
     prev_pane = None
     clock = (None, None, None)
+    last_runtime = None  # a failed tmux read keeps the last runtime, not "claude"
     state_dir = os.path.dirname(os.path.abspath(a.out))
     workspace = _Path(os.path.dirname(state_dir))
     while True:
-        pane = capture(a.socket, a.session)
+        # One capture, not two: deriving `pane` from `styled_pane` guarantees
+        # both views describe the exact same frame (no plain/styled race).
+        styled_pane = capture_styled(a.socket, a.session)
+        pane = _ANSI_SGR.sub("", styled_pane) if styled_pane is not None else None
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
+        runtime = session_runtime(a.socket, a.session) or last_runtime
+        last_runtime = runtime
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
-            process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane)
+            process=(base.get("signals") or {}).get("process", True), prev_pane=prev_pane,
+            runtime=runtime, styled_pane=styled_pane)
         prev_pane = pane
         clock = gate_clock(clock, state, prompt, time.time())
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
         settling = False
+        login_settling, login_since = login_confirm_step(login_since, state, kind, time.time(),
+                                                         a.login_confirm_s)
         if state in ("blocked-human", "blocked-known"):
             stable_prompt = stable_prompt + 1 if prompt == last_prompt else 1
             last_prompt = prompt
@@ -818,6 +881,9 @@ def main():
         else:
             stable_prompt = 0
             last_prompt = None
+        if login_settling:
+            settling = True
+            state, detail, prompt, kind = "running", "processing (sign-in check settling)", None, None
         if state != "blocked-known":
             answered_prompt = None
 
@@ -853,11 +919,12 @@ def main():
                                   lambda k: send_keys(a.socket, a.session, k))
                 # Only the core's own seat owns tasks/; a worker's queue lives elsewhere.
                 queued = 0 if a.seat else core_gate_notice.queued_count(workspace)
-                req = escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None, queued=queued)
+                req = escalate(hitl, state, detail, kind, prompt, a.session, seat=a.seat or None,
+                               queued=queued, runtime=runtime)
                 if not a.seat:
                     notice_queued(hitl, req, workspace, state, kind)
             elif verdict == "resolve":
-                resolve_escalations(hitl, a.session, pane)
+                resolve_escalations(hitl, a.session, pane, runtime)
                 if not a.seat:
                     core_gate_notice.end_outage(workspace)
         if a.once:

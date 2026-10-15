@@ -145,6 +145,9 @@ resolve_claude_credential_proxy
 if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
   ENV_ARGS+=(-e "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL")
 fi
+# Ceiling on one foreground Bash call: when it is reached Claude Code moves the
+# command to the background and the turn continues. A caller-set value wins.
+ENV_ARGS+=(-e "BASH_MAX_TIMEOUT_MS=${BASH_MAX_TIMEOUT_MS:-120000}")
 # Test probe: dump the assembled core env forwarding and exit — lets the
 # regression suite assert the proxy-routing policy (live listener forwards,
 # dead port omits, caller preset wins) against the REAL ENV_ARGS under
@@ -240,12 +243,7 @@ release_orchestrator_lock() {
   return 0
 }
 log_restart_attempt() {
-  local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
-  [ -n "$ws" ] || return 0
-  mkdir -p "$ws/logs" 2>/dev/null || true
-  printf '%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1" \
-    >> "$ws/logs/restart-attempts.log" 2>/dev/null || true
+  sutando_restart_attempt_log "$REPO" "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1"
 }
 # Enforces the HAZARD above; the decision and its message are shared with
 # the codex launcher, this adapter keeps only its own attempt logging.
@@ -301,6 +299,12 @@ if [ -n "$RESTART_REQUESTED" ]; then
       release_orchestrator_lock
       exit 1
     fi
+  fi
+  # Hand the heartbeat over too: the old writer is still in its absence grace window, so an
+  # ensure would adopt it and it would then exit, leaving the new core with no .alive.
+  if [ -n "$PY" ] && [ -f "$REPO/src/core_heartbeat.py" ]; then
+    "$PY" "$REPO/src/core_heartbeat.py" --stop > /dev/null 2>&1 \
+      || echo "  ⚠ heartbeat handoff (--stop) failed — the old writer may still be running" >&2
   fi
   log_restart_attempt "kill-complete; creating fresh core"
 fi
@@ -426,6 +430,17 @@ ensure_task_notifier() {
     "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
 }
 
+# The heartbeat writer exits once its core pane is gone, so every launch of the core must
+# re-ensure it; cron-runner holds every prompt-backed fire while .alive is missing.
+ensure_core_heartbeat() {
+  if [ -z "$PY" ] || [ ! -f "$REPO/src/core_heartbeat.py" ]; then
+    echo "  ⚠ core heartbeat not ensured: no runnable Python interpreter; cron-runner fires stay held" >&2
+    return 0
+  fi
+  "$PY" "$REPO/src/core_heartbeat.py" --ensure > /dev/null 2>&1 \
+    || echo "  ⚠ core heartbeat --ensure failed; cron-runner fires stay held until it runs" >&2
+}
+
 # Core-only: a pool worker is never the subject of the Agent Shepherd monitor.
 ensure_core_monitor() {
   local ws mon_out relay_pid_file relay_state
@@ -493,6 +508,7 @@ ensure_core_monitor() {
 if claude_named_session_running; then
   apply_claude_tmux_defaults
   ensure_core_monitor   # re-ensure the supervisor monitor on every attach/re-run
+  ensure_core_heartbeat
   ensure_task_notifier
   if [ -t 1 ] && command -v tmux > /dev/null 2>&1; then
     echo "Attaching to existing $SESSION (Ctrl-b d to detach)..."
@@ -518,10 +534,17 @@ fi
 # claude seen here is either still dying (the SIGKILL escalation above should
 # have reaped it) or one a competing launcher spawned in the race window.
 # Reusing it would defeat the restart and re-introduce the false-success path.
+#
+# On a private socket an orphan cannot be told from another install's core, and
+# adopting one leaves this socket with no server; launch fresh, kill nothing.
 if [ -z "$RESTART_REQUESTED" ] && claude_named_process_running; then
-  echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
-  echo "To recycle it cleanly: bash $0 --restart"
-  exit 0
+  if claude_private_socket_in_use; then
+    echo "  ⚠ $SESSION claude pid(s) $(claude_named_pids | tr '\n' ' ')running outside $TMUX_SOCKET — not reusing; starting a session on this socket." >&2
+  else
+    echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
+    echo "To recycle it cleanly: bash $0 --restart"
+    exit 0
+  fi
 fi
 
 if claude_named_tmux_session_exists; then
@@ -657,6 +680,7 @@ if [ -t 1 ]; then
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_task_notifier   # the supervisor needs the core session to exist first
+  ensure_core_heartbeat
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   # Verify the core actually came up before reporting success. Without this a
@@ -674,6 +698,7 @@ else
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   ensure_task_notifier
+  ensure_core_heartbeat
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
     echo "Started $SESSION detached — opened a Terminal window attached to it."

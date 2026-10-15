@@ -86,7 +86,8 @@ exit 0
 
 
 def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: bool = False,
-         slow_death_s: float = 0, gr_rid: str = "", lock_rid: str = "", grace_s: str = "2"):
+         slow_death_s: float = 0, gr_rid: str = "", lock_rid: str = "", grace_s: str = "2",
+         private_socket: bool = True):
     """Run start-cli.sh in the stub env with the given initial state.
 
     force  → invoke --force-restart instead of --restart.
@@ -124,6 +125,8 @@ def _run(restart: bool, session: bool, core: bool, force: bool = False, wedged: 
         # The post-kill wait is bounded by SUTANDO_RESTART_GRACE_S (90s in production);
         # 2s keeps the wedged cases fast while still exceeding a 1s slow death.
         env["SUTANDO_RESTART_GRACE_S"] = grace_s
+        if not private_socket:
+            del env["SUTANDO_TMUX_SOCKET"]
         if wedged:
             env["WEDGED"] = "1"
         if slow_death_s:
@@ -164,8 +167,9 @@ def case_restart_core_down_exits_nonzero():
 
 def case_non_restart_reuses_orphan_exits_zero():
     """(Guard against Fix 2 over-reach) NON-restart, orphan core alive, no
-    session → the reuse path must still fire (exit 0, 'reusing it')."""
-    rc, out = _run(restart=False, session=False, core=True)
+    session → the reuse path must still fire (exit 0, 'reusing it'). Default
+    socket only: a private socket never adopts a core outside its server."""
+    rc, out = _run(restart=False, session=False, core=True, private_socket=False)
     fails = []
     if rc != 0:
         fails.append(f"non-restart orphan-reuse should exit 0, got {rc}: out={out!r}")

@@ -12,6 +12,7 @@ each leg through it is pinned by running the step: tests/python-ci-legs-partitio
 
 Run: python3 tests/python-load-sensitive-selector.test.py
 """
+import importlib.util
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,11 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "select-load-sensitive-suites.sh"
 DISCOVER = REPO / "scripts" / "discover-python-tests.sh"
 LIST = REPO / "tests" / "python-load-sensitive-suites.txt"
+# The leg numbers come from the partition pin, the one place the layout is named in tests.
+_spec = importlib.util.spec_from_file_location("ci_legs", REPO / "tests" / "python-ci-legs-partition.test.py")
+_legs = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_legs)
+SHARED, LOAD, SERIAL = _legs.SHARED_LEGS, _legs.LOAD_LEG, _legs.SERIAL_LEG
 
 
 RECEIPTS = Path(tempfile.mkdtemp())
@@ -79,7 +85,7 @@ def main() -> int:
         untagged = td / "untagged.txt"
         untagged.write_text("tests/sb.test.py\n")
         r = select("serial", untagged, disc)
-        if r.returncode != 3 or "leg 7: the selector emitted no serial suites" not in r.stderr:
+        if r.returncode != 3 or f"leg {SERIAL}: the selector emitted no serial suites" not in r.stderr:
             fails.append(f"an empty serial leg did not fail with its reason: rc={r.returncode} err={r.stderr.strip()!r}")
         badtag = td / "badtag.txt"
         badtag.write_text("tests/sb.test.py later\n")
@@ -129,12 +135,12 @@ def main() -> int:
     if r.returncode != 0 or ser.returncode != 0:
         fails.append(f"the committed list does not select cleanly: {(r.stderr + ser.stderr).strip()}")
     elif sorted(r.stdout.split() + ser.stdout.split()) != sorted(listed):
-        fails.append(f"legs 6-7 would run {len(r.stdout.split() + ser.stdout.split())} suites for {len(listed)} listed")
+        fails.append(f"legs {LOAD}-{SERIAL} would run {len(r.stdout.split() + ser.stdout.split())} suites for {len(listed)} listed")
     rest = select("without", LIST, discovered)
     if set(rest.stdout.split()) & set(listed):
         fails.append("a listed suite is still in the shared legs")
     if sorted(rest.stdout.split() + r.stdout.split() + ser.stdout.split()) != sorted(discovered):
-        fails.append("legs 6-7 + legs 1-5 is not the real discovery list")
+        fails.append(f"legs {LOAD}-{SERIAL} + legs 1-{SHARED[-1]} is not the real discovery list")
 
     for f in fails:
         print("  FAIL", f)

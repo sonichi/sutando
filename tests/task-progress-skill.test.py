@@ -880,12 +880,12 @@ class TestCLI(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
 
     def test_unconfigured_gateway_source_fails_open(self):
-        # A source outside the built-ins routes to the remote-gateway sender;
+        # A non-built-in source with a gateway room id routes to the gateway sender;
         # with no channels/<source>/.env it must fail (exit 1) with a hint —
         # never traceback, never block.
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--source", "whatsapp",
-             "--channel-id", "D123", "--message", "hi"],
+             "--channel-id", "!room:server", "--message", "hi"],
             capture_output=True, text=True,
             env={"PATH": "/usr/bin:/bin", "CLAUDE_CONFIG_DIR": "/nonexistent"},
         )

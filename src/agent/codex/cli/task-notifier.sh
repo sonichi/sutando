@@ -163,12 +163,28 @@ core_is_idle() {
   core_pane_is_idle_ready
 }
 
+# A composer holding only text automation types (pane_gate.py's list) is cleared;
+# anything else is the owner's draft and is never touched.
+clear_automation_leftover() {
+  local pane target leftover
+  target="$(core_target)" || return 1
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -e -p -t "$target" 2>/dev/null)" || return 1
+  leftover="$(printf '%s\n' "$pane" | "$NOTIFIER_PY" "$PANE_GATE_PY" leftover --runtime codex --workspace "$WORKSPACE_DIR" --socket "$TMUX_SOCKET" --session "$SESSION" 2>/dev/null)" || return 1
+  tmux -S "$TMUX_SOCKET" send-keys -t "$target" C-a C-k || return 1
+  log_notifier "cleared rejected automation input '$leftover' from the composer"
+}
+
 wait_for_core_idle() {
-  local started
+  local started cleared=0
   started="$(date +%s)"
   while ! core_is_idle; do
     if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
       return 1
+    fi
+    # Once per wait: a leftover that survives the clear is reported by the timeout below.
+    if [ "$cleared" = 0 ] && clear_automation_leftover; then
+      cleared=1
+      continue
     fi
     if [ $(( $(date +%s) - started )) -ge "$CORE_READY_TIMEOUT" ]; then
       echo "task-notifier: core did not become idle within ${CORE_READY_TIMEOUT}s; restarting notifier without submitting" >&2

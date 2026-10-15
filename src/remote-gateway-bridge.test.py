@@ -45,7 +45,7 @@ STATE = {"tasks_served": 0, "results": [], "acks": [], "heartbeats": [],
          "room_posts": [], "force_room_502": False, "force_room_empty_200": False,
          "force_room_ok_only": False,
          "force_heartbeat_404": False, "force_media_redirect": False,
-         "force_results_502_once": False, "force_results_400": False}
+         "force_results_502_once": False, "force_results_503": False}
 TASK = {"id": "task-MOCK1", "timestamp": "2026-05-23T00:00:00Z",
         "task": "hello from gateway", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
@@ -96,8 +96,8 @@ class Handler(BaseHTTPRequestHandler):
             if STATE["force_results_502_once"]:
                 STATE["force_results_502_once"] = False
                 self.send_response(502); self.end_headers(); return
-            if STATE["force_results_400"]:
-                self.send_response(400); self.end_headers(); return
+            if STATE["force_results_503"]:
+                self.send_response(503); self.end_headers(); return
             n = int(self.headers.get("Content-Length") or 0)
             STATE["results"].append(json.loads(self.rfile.read(n).decode()))
             self.send_response(200); self.end_headers()
@@ -592,8 +592,8 @@ def main() -> int:
               and "result-markers" not in h.get("capabilities", []),
               "heartbeat advertises only local skip-marker handling")
         check("core-status" in h.get("capabilities", [])
-              and "status" not in h and "step" not in h,
-              "no core-status.json → capability advertised, status/step omitted (no-clobber)")
+              and h.get("status") not in ("idle", "running"),
+              "no core-status.json and no core beat → capability advertised, no positive status")
         check("team-collaborator" in h.get("capabilities", []),
               "heartbeat advertises explicit Team collaborator support")
 
@@ -601,7 +601,7 @@ def main() -> int:
     # broker's presence sweep can derive the agent's activity + human text.
     (rtc.WS / "state").mkdir(parents=True, exist_ok=True)
     (rtc.WS / "state" / "core-status.json").write_text(
-        json.dumps({"status": "running", "step": "opening PR #20", "ts": 1}))
+        json.dumps({"status": "running", "step": "opening PR #20", "ts": time.time()}))
     STATE["heartbeats"].clear()
     rtc._last_heartbeat_at = 0.0
     rtc._post_heartbeat({"task-MOCK1"}, force=True)
@@ -610,7 +610,7 @@ def main() -> int:
           "heartbeat carries core-status status+step when core-status.json present")
     # An idle status drops the (stale) step so the sweep reads 'available'.
     (rtc.WS / "state" / "core-status.json").write_text(
-        json.dumps({"status": "idle", "ts": 2}))
+        json.dumps({"status": "idle", "ts": time.time()}))
     STATE["heartbeats"].clear()
     rtc._last_heartbeat_at = 0.0
     rtc._post_heartbeat(set(), force=True)
@@ -640,8 +640,8 @@ def main() -> int:
     STATE["heartbeats"].clear(); rtc._last_heartbeat_at = 0.0
     check(rtc._post_heartbeat(set(), force=True), "heartbeat still fires despite malformed core-status")
     hb3 = STATE["heartbeats"][-1] if STATE["heartbeats"] else {}
-    check("status" not in hb3 and "step" not in hb3,
-          "malformed core-status → heartbeat omits status/step (liveness-only)")
+    check(hb3.get("status") not in ("idle", "running"),
+          "malformed core-status and no core beat → no positive status")
 
     # Backwards compatibility: old gateways that only implement pull/results can
     # 404 optional protocol extensions; the client backs off (time-gated, so a
@@ -653,10 +653,11 @@ def main() -> int:
     rtc._ack_disabled_until = 0.0   # clear so later calls aren't skipped
     STATE["force_ack_404"] = False
     STATE["force_heartbeat_404"] = True
-    rtc._heartbeat_disabled = False
-    check(not rtc._post_heartbeat(set(), force=True) and rtc._heartbeat_disabled,
-          "heartbeat 404 disables heartbeat support")
+    rtc._heartbeat_retry_at = 0.0
+    check(not rtc._post_heartbeat(set(), force=True) and rtc._heartbeat_retry_at > 0,
+          "heartbeat 404 backs off heartbeat support (retryable)")
     STATE["force_heartbeat_404"] = False
+    rtc._heartbeat_retry_at = 0.0   # clear so later calls aren't skipped
 
     # SECURITY (review 2026-06-13)
     # Blocker 1 — unsafe task ids are rejected (path traversal write side)
@@ -741,14 +742,16 @@ def main() -> int:
     (rtc.TASKS_DIR / "task-CORE1.txt").write_text(
         "id: task-CORE1\naccess_tier: owner\ntask: fixture\n")
     (rtc.RESULTS_DIR / "task-CORE1.txt").write_text("core answer")
-    STATE["force_results_400"] = True
+    STATE["force_results_503"] = True
     rtc._post_ready_results({"task-CORE1"})
     check((rtc.RESULTS_DIR / "task-CORE1.txt").exists()
           and len(STATE["results"]) == _before,
           "refused POST leaves the result file for the next pass")
     check(rtc._delivery_core().backend.attempts("task-CORE1") == 1,
           "the refusal is recorded in the outbox (drain ran through the seam)")
-    STATE["force_results_400"] = False
+    STATE["force_results_503"] = False
+    backend = rtc._delivery_core().backend
+    backend.clock = lambda: rtc.read_item(backend.root, "task-CORE1")["retry"]["next_attempt_at"]
     STATE["force_results_502_once"] = True
     _ifc = {"task-CORE1"}
     import contextlib
@@ -756,9 +759,12 @@ def main() -> int:
     _cap = _io.StringIO()
     with contextlib.redirect_stdout(_cap):
         rtc._post_ready_results(_ifc)
+        check((rtc.RESULTS_DIR / "task-CORE1.txt").exists(),
+              "ambiguous 502 defers the safe resend to its scheduled retry")
+        rtc._post_ready_results(_ifc)
     _out = _cap.getvalue()
     print(_out, end="")
-    check("delivered via DeliveryCore" in _out
+    check("accepted by gateway; Matrix delivery unconfirmed" in _out
           and "AG2SpaceResultProvider" in _out,
           "a CONFIRMED delivery announces the seam it went through "
           "(the live-path evidence CONTRIBUTING asks for)")
@@ -766,12 +772,13 @@ def main() -> int:
           and STATE["results"][-1]["id"] == "task-CORE1"
           and STATE["results"][-1]["body"] == "core answer"
           and not (rtc.RESULTS_DIR / "task-CORE1.txt").exists(),
-          "ambiguous 502 resolved by the idempotent re-send in ONE pass "
+          "ambiguous 502 resolved by the scheduled idempotent re-send "
           "(delivered + archived)")
     check(not _ifc, "confirmed delivery retires the task from inflight")
     STATE["results"].pop()
     (rtc.TASKS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
     (rtc.ARCHIVE_RESULTS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
+    backend.clock = time.time
     # Destined filenames outrank the gate's activity/grace logic entirely.
     check(rtc._ag2space_proactive_claim_gate(
               Path("proactive-1.to-ag2space.txt")) is True,
@@ -783,23 +790,28 @@ def main() -> int:
     # Guarded-tier suppression: team skip-only results post the marker
     # line alone; the remainder never leaves the host.
     _before = len(STATE["results"])
-    (rtc.TASKS_DIR / "task-TSKIP.txt").write_text(
-        "id: task-TSKIP\naccess_tier: team\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TSKIP.txt").write_text(
+    (rtc.TASKS_DIR / "task-TSKIP2.txt").write_text(
+        "id: task-TSKIP2\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TSKIP2.txt").write_text(
         "[no-send] internal bookkeeping note that must not reach the wire\n")
-    rtc._post_ready_results({"task-TSKIP"})
+    rtc._post_ready_results({"task-TSKIP2"})
     _posted = STATE["results"][_before:]
-    check(len(_posted) == 1 and not (rtc.RESULTS_DIR / "task-TSKIP.txt").exists(),
+    check(len(_posted) == 1 and not (rtc.RESULTS_DIR / "task-TSKIP2.txt").exists(),
           "team [no-send] POSTs (closes lease) and archives")
     check(bool(_posted) and (_posted[0].get("body") or "").strip() == "[no-send]",
           "team skip wire body is the marker line ALONE — remainder withheld")
     # Control: a side-effectful marker from a guarded tier is still withheld.
     _before = len(STATE["results"])
-    (rtc.TASKS_DIR / "task-TREDIR.txt").write_text(
-        "id: task-TREDIR\naccess_tier: team\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TREDIR.txt").write_text(
+    (rtc.TASKS_DIR / "task-TREDIR2.txt").write_text(
+        "id: task-TREDIR2\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TREDIR2.txt").write_text(
         "[channel: 12345678901234567] exfil attempt\n")
-    rtc._post_ready_results({"task-TREDIR"})
+    _real_route_withheld_review = rtc._route_withheld_review
+    rtc._route_withheld_review = lambda _path: True
+    try:
+        rtc._post_ready_results({"task-TREDIR2"})
+    finally:
+        rtc._route_withheld_review = _real_route_withheld_review
     _posted = STATE["results"][_before:]
     check(bool(_posted) and "[channel:" not in (_posted[0].get("body") or ""),
           "team redirect marker still withheld (canned body, no redirect)")
@@ -807,10 +819,10 @@ def main() -> int:
     # class admits newlines, so a forged extra must hit the guard, not repost.
     _hostile = "[deduped: task-123\nSECRET sk-live-abcdef0123456789\nstolen]"
     _before = len(STATE["results"])
-    (rtc.TASKS_DIR / "task-TDEXF.txt").write_text(
-        "id: task-TDEXF\naccess_tier: team\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-TDEXF.txt").write_text(_hostile + "\n")
-    rtc._post_ready_results({"task-TDEXF"})
+    (rtc.TASKS_DIR / "task-TDEXF2.txt").write_text(
+        "id: task-TDEXF2\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TDEXF2.txt").write_text(_hostile + "\n")
+    rtc._post_ready_results({"task-TDEXF2"})
     _posted = STATE["results"][_before:]
     check(bool(_posted) and "SECRET" not in (_posted[0].get("body") or "")
           and "sk-live" not in (_posted[0].get("body") or ""),
@@ -853,30 +865,34 @@ def main() -> int:
     # DeliveryCore wiring, proven by side effects only the seam produces:
     # outbox attempt accounting + UNKNOWN resolved by the idempotent re-send.
     _before = len(STATE["results"])
-    (rtc.TASKS_DIR / "task-CORE1.txt").write_text(
-        "id: task-CORE1\naccess_tier: owner\ntask: fixture\n")
-    (rtc.RESULTS_DIR / "task-CORE1.txt").write_text("core answer")
-    STATE["force_results_400"] = True
-    rtc._post_ready_results({"task-CORE1"})
-    check((rtc.RESULTS_DIR / "task-CORE1.txt").exists()
+    (rtc.TASKS_DIR / "task-CORE2.txt").write_text(
+        "id: task-CORE2\naccess_tier: owner\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-CORE2.txt").write_text("core answer")
+    STATE["force_results_503"] = True
+    rtc._post_ready_results({"task-CORE2"})
+    check((rtc.RESULTS_DIR / "task-CORE2.txt").exists()
           and len(STATE["results"]) == _before,
           "refused POST leaves the result file for the next pass")
-    check(rtc._delivery_core().backend.attempts("task-CORE1") == 1,
+    check(rtc._delivery_core().backend.attempts("task-CORE2") == 1,
           "the refusal is recorded in the outbox (drain ran through the seam)")
-    STATE["force_results_400"] = False
+    STATE["force_results_503"] = False
+    backend = rtc._delivery_core().backend
+    backend.clock = lambda: rtc.read_item(backend.root, "task-CORE2")["retry"]["next_attempt_at"]
     STATE["force_results_502_once"] = True
-    _ifc = {"task-CORE1"}
+    _ifc = {"task-CORE2"}
+    rtc._post_ready_results(_ifc)
     rtc._post_ready_results(_ifc)
     check(len(STATE["results"]) == _before + 1
-          and STATE["results"][-1]["id"] == "task-CORE1"
+          and STATE["results"][-1]["id"] == "task-CORE2"
           and STATE["results"][-1]["body"] == "core answer"
-          and not (rtc.RESULTS_DIR / "task-CORE1.txt").exists(),
-          "ambiguous 502 resolved by the idempotent re-send in ONE pass "
+          and not (rtc.RESULTS_DIR / "task-CORE2.txt").exists(),
+          "ambiguous 502 resolved by the scheduled idempotent re-send "
           "(delivered + archived)")
     check(not _ifc, "confirmed delivery retires the task from inflight")
     STATE["results"].pop()
-    (rtc.TASKS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
-    (rtc.ARCHIVE_RESULTS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
+    (rtc.TASKS_DIR / "task-CORE2.txt").unlink(missing_ok=True)
+    (rtc.ARCHIVE_RESULTS_DIR / "task-CORE2.txt").unlink(missing_ok=True)
+    backend.clock = time.time
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content

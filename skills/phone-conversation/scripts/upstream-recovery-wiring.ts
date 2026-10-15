@@ -1,11 +1,9 @@
 // The phone server's upstream-recovery wiring, importable without booting the server.
-import type { EventPayloadMap, IEventBus } from 'bodhi-realtime-agent';
-import { createPostParkRedialer, type RecoveryLog, type RecoverySurface } from '../../../src/voice-upstream-recovery.js';
+import type { EventPayloadMap, IEventBus, UpstreamRecoveryOptions } from 'bodhi-realtime-agent';
+import { fatalCloseForRecovery } from '../../../src/voice-error-classifier.js';
 
-/** Gives bodhi's own close handling time to settle before the host redials a parked session. */
+/** Gives bodhi's own close handling time to settle before a parked call is redialed. */
 export const POST_PARK_REDIAL_DELAY_MS = 1500;
-
-export type PhoneRecoverySession = RecoverySurface & { eventBus: Pick<IEventBus, 'subscribe'> };
 
 export interface PhoneCallRef {
 	callSid: string;
@@ -17,30 +15,39 @@ export function phoneCallIsLive(call: PhoneCallRef, activeCalls: { has(callSid: 
 	return !call.hangingUp && activeCalls.has(call.callSid);
 }
 
-/** Subscribes to `session.upstreamLost` and redials the parked call, holding greeting and context until the caller speaks. */
-export function wirePhoneUpstreamRecovery(
-	deps: {
-		session: PhoneRecoverySession;
-		callSession: PhoneCallRef;
-		activeCalls: { has(callSid: string): boolean };
-		onActivated?: () => void;
-		schedule?: (fn: () => void, ms: number) => unknown;
-	} & RecoveryLog,
-): () => 'recover' | 'none' | 'skipped' {
-	const { session, callSession, activeCalls } = deps;
-	const redialAfterPark = createPostParkRedialer({
-		getSession: () => session,
+/**
+ * bodhi's `upstreamRecovery` for one call: a parked upstream is redialed while the call is live,
+ * with greeting and injected context held until the caller speaks. The Twilio stream stays attached
+ * for the whole call, so there is no idle park.
+ */
+export function phoneUpstreamRecovery(
+	callSession: PhoneCallRef,
+	activeCalls: { has(callSid: string): boolean },
+): UpstreamRecoveryOptions {
+	return {
 		isLive: () => phoneCallIsLive(callSession, activeCalls),
-		origin: `Phone ${callSession.callSid}`,
-		hold: true,
-		onActivated: deps.onActivated,
-		log: deps.log,
-		error: deps.error,
-	});
-	const schedule = deps.schedule ?? ((fn, ms) => setTimeout(fn, ms));
-	session.eventBus.subscribe('session.upstreamLost', (e: EventPayloadMap['session.upstreamLost']) => {
+		holdSyntheticUntilFreshSpeech: true,
+		parkRedialDelayMs: POST_PARK_REDIAL_DELAY_MS,
+		idleParkMs: 0,
+		// The one Gemini close classifier, the voice agent's.
+		classifyClose: fatalCloseForRecovery,
+	};
+}
+
+/** Logs each park, and runs `onRecovered` when a parked call is back to ACTIVE. */
+export function watchPhoneUpstream(deps: {
+	eventBus: Pick<IEventBus, 'subscribe'>;
+	onRecovered?: () => void;
+	log: (msg: string) => void;
+}): void {
+	let parked = false;
+	deps.eventBus.subscribe('session.upstreamLost', (e: EventPayloadMap['session.upstreamLost']) => {
+		parked = true;
 		deps.log(`[Phone] upstream lost: reason=${e.reason} code=${e.code ?? '-'} detail=${e.detail ?? '-'}`);
-		schedule(redialAfterPark, POST_PARK_REDIAL_DELAY_MS);
 	});
-	return redialAfterPark;
+	deps.eventBus.subscribe('session.stateChange', (e: EventPayloadMap['session.stateChange']) => {
+		if (e.toState !== 'ACTIVE' || !parked) return;
+		parked = false;
+		deps.onRecovered?.();
+	});
 }

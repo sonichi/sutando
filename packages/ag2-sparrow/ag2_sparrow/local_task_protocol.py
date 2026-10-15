@@ -137,6 +137,27 @@ def canonical_access_tier(value) -> str:
     tier = str(value or "").strip().lower()
     return LEGACY_ACCESS_TIER_ALIASES.get(tier, tier)
 
+
+# The tiers the AG2 Space broker puts on the wire; the fuller ACCESS_TIERS above
+# also names the local-only spellings.
+BROKER_WIRE_TIERS = ("owner", "team", "guest")
+
+
+def broker_attested_tier(access_tier, requested_access_tier, collaborator) -> tuple[str, bool]:
+    """The tier the AG2 Space broker attests on a task, and whether it is a collaborator.
+
+    Team travels as wire `guest` plus `requested_access_tier: team`; only the exact
+    boolean `collaborator: true` promotes it, so body text cannot opt itself in.
+    Unknown tiers resolve to guest. Any local cap is the caller's, applied after.
+    """
+    def known(value):
+        tier = canonical_access_tier(value)
+        return tier if tier in BROKER_WIRE_TIERS else "guest"
+
+    broker, requested = known(access_tier), known(requested_access_tier)
+    is_collaborator = collaborator is True and "team" in (broker, requested)
+    return ("team" if is_collaborator else broker), is_collaborator
+
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
 # ENFORCED in two places that must stay in lockstep (Codex P2 on PR #1954):
@@ -155,7 +176,7 @@ KNOWN_HEADER_KEYS = (
     "author_id", "chat_id",
     # Reply addressing: header status means only the trusted bridge writes
     # them, and the guard defangs forged body copies of the same names.
-    "thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
+    "thread_ts", "reply_thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
     "addressed_to", "callSid", "caller",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
@@ -281,6 +302,39 @@ def task_body(text: str) -> str:
         if line.startswith("task:"):
             return "\n".join([line[len("task:"):].lstrip()] + lines[i + 1:])
     return ""
+
+
+_QUOTED_BLOCK = re.compile(r"\[AG2 Space (reply context|room metadata);([^\]\n]*)\]\s*")
+_JSON_DECODER = json.JSONDecoder()
+
+
+def split_reply_context(text: str) -> "tuple[dict | None, str]":
+    """({"sender", "body", "label"} of the message an ag2space task replies to, the
+    message after the broker's quoted blocks), or (None, text) when there is no
+    well-formed reply block.
+
+    `label` is the broker's own wording from the opening tag, verbatim (None when
+    empty). The JSON is decoded whole, so a closing marker inside the quoted body
+    cannot end the block early."""
+    rest, reply = text.lstrip(), None
+    for kind in ("room metadata", "reply context"):
+        m = _QUOTED_BLOCK.match(rest)
+        if m is None or m.group(1) != kind:
+            continue
+        try:
+            record, end = _JSON_DECODER.raw_decode(rest, m.end())
+        except ValueError:
+            return None, text
+        tail, closer = rest[end:].lstrip(), f"[End AG2 Space {kind}]"
+        if not isinstance(record, dict) or not tail.startswith(closer):
+            return None, text
+        rest = tail[len(closer):].lstrip()
+        if kind == "reply context":
+            sender, body = record.get("sender"), record.get("body")
+            if not isinstance(sender, str) or not isinstance(body, str):
+                return None, text
+            reply = {"sender": sender, "body": body, "label": m.group(2).strip() or None}
+    return (reply, rest) if reply is not None else (None, text)
 
 
 def parse_task_headers(text: str) -> TaskHeaders:

@@ -3,10 +3,10 @@
 
 The selector writes a receipt (mode, list hash, output hash) when it selects, and the
 step's unconditional `verify` exits 4 unless the files about to run match that receipt.
-This runs ci.yml's real step for legs 1 (`without`), 6 (`only`) and 7 (`serial`): with the real
+This runs ci.yml's real step for legs 1 (`without`), 8 (`only`) and 9 (`serial`): with the real
 selector each leg verifies and reaches the lane with its receipt; with a selector that
 drops its receipt, or whose output is altered after it is hashed, each leg must stop with
-exit 4 before the lane runs; and legs 6-7 must stop when one file is added to or dropped
+exit 4 before the lane runs; and legs 8-9 must stop when one file is added to or dropped
 from their run list after sharding, the selection left intact. A workflow that skips
 verification passes those spoiled runs and fails here; one that skips the selector has no receipt and fails in CI itself.
 
@@ -55,9 +55,10 @@ def main() -> int:
     listed = [ln.split()[0] for ln in real.splitlines() if ln.strip() and not ln.startswith("#")]
     with tempfile.TemporaryDirectory() as td:
         fx = legs_mod.build_fixture(Path(td), disc)
-        legs = legs_mod.run_legs(fx, real, 8, (1, 6, 7))
-        for shard, receipt in ((1, "selector.without.receipt"), (6, "selector.only.receipt"),
-                               (7, "selector.serial.receipt")):
+        L, S = legs_mod.LOAD_LEG, legs_mod.SERIAL_LEG
+        legs = legs_mod.run_legs(fx, real, 8, (1, L, S))
+        for shard, receipt in ((1, "selector.without.receipt"), (L, "selector.only.receipt"),
+                               (S, "selector.serial.receipt")):
             rc, files, _w, err, receipts = legs[shard]
             if rc != 0 or files is None:
                 fails.append(f"real selector: leg {shard} did not reach the lane (rc={rc}): {err.strip()}")
@@ -68,9 +69,9 @@ def main() -> int:
         (fx / SEL).write_text(WRAPPER)
         import os
         unlisted = next(f for f in disc if f not in listed)
-        for spoil, extra_by_leg in (("drop", {1: "", 6: "", 7: ""}),
-                                    ("extra", {1: listed[0], 6: unlisted, 7: unlisted})):
-            for shard in (1, 6, 7):
+        for spoil, extra_by_leg in (("drop", {1: "", L: "", S: ""}),
+                                    ("extra", {1: listed[0], L: unlisted, S: unlisted})):
+            for shard in (1, L, S):
                 os.environ["SPOIL"], os.environ["EXTRA"] = spoil, extra_by_leg[shard]
                 rc, files, _w, err, _r = legs_mod.run_legs(fx, real, 8, (shard,))[shard]
                 if rc != 4 or files is not None:
@@ -80,12 +81,12 @@ def main() -> int:
                 elif "selector receipt check" not in err:
                     fails.append(f"leg {shard} exited 4 without the receipt-check message: {err.strip()!r}")
 
-        # Legs 6-7 must run exactly the selection: one file added to or dropped from the run
+        # The load-sensitive legs must run exactly the selection: one file added to or dropped from the run
         # list after sharding, with the selection and its receipt intact, stops the leg.
         (fx / "scripts" / "shard-by-cost.sh").rename(fx / "scripts" / "shard-real.sh")
         (fx / "scripts" / "shard-by-cost.sh").write_text(SHARD_WRAPPER)
         for spoil in ("files-add", "files-drop"):
-            for shard in (6, 7):
+            for shard in (L, S):
                 os.environ["SPOIL"], os.environ["EXTRA"] = spoil, unlisted
                 rc, files, _w, err, _r = legs_mod.run_legs(fx, real, 8, (shard,))[shard]
                 if rc != 4 or files is not None or "is not exactly the selected suites" not in err:
@@ -99,9 +100,9 @@ def main() -> int:
         print("  FAIL", f)
     if fails:
         return 1
-    print("PASS: legs 1, 6 and 7 run only selector-receipted lists; a missing receipt or an output "
-          "altered after selection stops each leg with exit 4 before the lane; legs 6-7 also stop when "
-          "their run list gains or loses a file after sharding")
+    print(f"PASS: legs 1, {legs_mod.LOAD_LEG} and {legs_mod.SERIAL_LEG} run only selector-receipted lists; a missing "
+          "receipt or an output altered after selection stops each leg with exit 4 before the lane; legs "
+          f"{legs_mod.LOAD_LEG}-{legs_mod.SERIAL_LEG} also stop when their run list gains or loses a file after sharding")
     return 0
 
 
