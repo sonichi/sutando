@@ -259,6 +259,22 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_expired' });
 	});
 
+	it('two calls with one token at the same time run once', async () => {
+		let release!: () => void;
+		const gate = new Promise<void>(r => { release = r; });
+		const f = change(async () => { await gate; return ok({ status: 'completed', result: {} }); }, { idempotency_requirement: 'none' });
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		const a = runAction({ ...RUN, confirm_token }, f.deps, now);
+		const b = runAction({ ...RUN, confirm_token }, f.deps, now);
+		await new Promise(r => setTimeout(r, 20));
+		release();
+		const results = await Promise.all([a, b]);
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 1);
+		assert.deepEqual(results.map(r => r.ok).sort(), [false, true]);
+		assert.ok(results.some(r => !r.ok && (r as { error: string }).error === 'confirmation_expired'));
+	});
+
 	it('an approval the room requires is said, and the token is spent', async () => {
 		const f = change(() => ok({ status: 'pending_approval', approval_id: 'ap1' }));
 		const { confirm_token } = await first(f);

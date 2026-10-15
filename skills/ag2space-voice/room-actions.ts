@@ -168,27 +168,29 @@ export async function runAction(args: { action: string; room?: string; scope?: s
 	const done = d.policy === 'read'
 		? await roomRead(client, target.room, action, callArgs, deps, ROOM_COMMONS_TIMEOUT_MS, revision ?? undefined)
 		: await confirmedExecute();
-	if ('confirm_token' in done) return done;
+	if ('answer' in done) return done.answer;
 	if (!done.ok) return done;
 	deps.log?.(`[RoomActions] ${action}${target.room ? ` in ${target.room.name}` : ' (account)'} (${d.policy})`);
 	return { ok: true, action, room: target.room?.name ?? null, result: compactResult(done.result), ms: Date.now() - t0 };
 
-	async function confirmedExecute(): Promise<RunActionResult | { ok: true; result: Record<string, unknown> }> {
+	async function confirmedExecute(): Promise<{ answer: RunActionResult } | { ok: true; result: Record<string, unknown> } | { ok: false; error: string; operation_id?: string }> {
 		const key = bindingKey(action, scope, target.ok ? target.room : null, callArgs);
 		const token = (args.confirm_token ?? '').trim();
 		const at = now();
 		if (!token) {
 			const confirm_token = issueToken({ key, revision, operationId: randomUUID(), retryable: d.ok && d.d.idempotency_requirement === 'required' }, at);
-			return { ok: false, error: 'needs_confirmation', confirm_token, will_do: { action, title: cut(d.ok ? d.d.title : '', 80), room: target.ok ? target.room?.name ?? null : null, arguments: callArgs } };
+			return { answer: { ok: false, error: 'needs_confirmation', confirm_token, will_do: { action, title: cut(d.ok ? d.d.title : '', 80), room: target.ok ? target.room?.name ?? null : null, arguments: callArgs } } };
 		}
 		const p = pending.get(token);
 		if (!p || at - p.issued > CONFIRM_TTL_MS) { pending.delete(token); return { ok: false, error: 'confirmation_expired' }; }
 		if (p.key !== key) { pending.delete(token); return { ok: false, error: 'confirmation_mismatch' }; }
 		if (at - p.issued < CONFIRM_MIN_AGE_MS) return { ok: false, error: 'confirmation_too_soon' };
 		if (p.revision !== revision) { pending.delete(token); return { ok: false, error: 'action_changed' }; }
+		// Spent before the call, with no await since the checks: a second call with this token now finds none.
+		pending.delete(token);
 		const r = await roomExecute(client!, target.ok ? target.room : null, action, callArgs, deps, { operationId: p.operationId, revision: revision ?? undefined });
-		// Kept only for a retry the server deduplicates by operation_id; anything else spends it.
-		if (!(r.ok === false && r.error === OUTCOME_UNKNOWN && p.retryable)) pending.delete(token);
+		// Given back only for a retry the server deduplicates by operation_id.
+		if (r.ok === false && r.error === OUTCOME_UNKNOWN && p.retryable) pending.set(token, p);
 		return r;
 	}
 }
@@ -248,7 +250,7 @@ export function createRunActionTool(deps: ReadRoomDeps): ToolDefinition {
 			'Returns {ok:true, action, room, result} — tell the user in a sentence what happened or what it found. ' +
 			'Errors: "not_by_voice" — the user must do it in the app, say so; "confirmation_mismatch" or "confirmation_expired" — the arguments changed or too much time passed: read the new version back and ask again; "confirmation_too_soon" — you have not asked the user yet: ask, then call again; "action_changed" — the action was updated since you asked: ask again; ' +
 			'"bad_arguments" — arguments_json is not a JSON object; "needs_approval" — the room requires an approval first; "TOOL_INPUT_INVALID" — the arguments do not fit, check describe_room_action; ' + ROOM_NAME_ERRORS +
-			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not do that there; "not_connected", "timeout" or "unavailable" — say it could not be done right now; ' + OUTCOME_UNKNOWN_ERROR + ' If the user then asks to try again, call with the same confirm_token: it reuses the same operation, so it cannot happen twice.',
+			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not do that there; "not_connected", "timeout" or "unavailable" — say it could not be done right now; ' + OUTCOME_UNKNOWN_ERROR + ' If the user then asks to try again, call with the same confirm_token: for an action the server deduplicates it reuses the same operation, so it cannot happen twice; otherwise the token is spent ("confirmation_expired") — tell the user to check in the app before asking again.',
 		parameters: z.object({
 			action: z.string().min(1).describe('The action, e.g. "room.commons.comments.resolve".'),
 			arguments_json: z.string().optional().describe('The arguments as a JSON object, e.g. {"root_event_id":"$abc"}. Omit when it takes none.'),
