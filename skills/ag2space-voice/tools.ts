@@ -7,6 +7,7 @@ import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextC
 import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateClient, navigateUiAvailable, navigateUiTool, resolveUiNavigated } from './navigate.js';
 import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
 import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createAddCommentTool, createSearchCommonsTool, createSearchRoomTool, createSendMessageTool, createWritePageTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
+import { INBOX_PROMPT_RULE, INBOX_TURN_CHECK_RULE, createReadInboxTool } from './inbox.js';
 
 export const tools: ToolDefinition[] = [];
 
@@ -64,7 +65,7 @@ export function setup(ctx: SkillSetupCtx): void {
 	});
 }
 
-/** read_room is declared only where the core has the ag2-space MCP registered; the voice agent starts the same server. */
+/** The room tools are declared only where the core has the ag2-space MCP registered; the voice agent starts the same server. */
 function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; turnCheckRules: string[]; contextLines: () => string[] } {
 	const entry = findAg2SpaceMcpEntry();
 	if (!entry) return { tools: [], promptRules: [], turnCheckRules: [], contextLines: () => [] };
@@ -88,7 +89,13 @@ function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; tu
 	const comment = createAddCommentTool(deps);
 	const message = createSendMessageTool(deps);
 	const list = createListRoomsTool({ index, log });
-	return { tools: [read, search, commons, page, write, comment, message, list], promptRules: [ROOM_READ_PROMPT_RULE], turnCheckRules: [ROOM_TURN_CHECK_RULE], contextLines: () => roomIndexContextLines(index) };
+	const inbox = createReadInboxTool(deps);
+	return {
+		tools: [read, search, commons, page, write, comment, message, list, inbox],
+		promptRules: [ROOM_READ_PROMPT_RULE, INBOX_PROMPT_RULE],
+		turnCheckRules: [ROOM_TURN_CHECK_RULE, INBOX_TURN_CHECK_RULE],
+		contextLines: () => roomIndexContextLines(index),
+	};
 }
 
 export function voiceSurface(): VoiceSurfaceContribution {
