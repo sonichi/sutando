@@ -23,6 +23,19 @@ only the actions its transport supports, but must NOT recognise, strip, or prior
 markers with local regexes or `startswith` checks. Attachment-path authorization is a
 separate concern owned by `src/send_allowlist.py`, applied immediately before the
 upload sink. 
+## Vault recipes
+
+Moved verbatim from CLAUDE.md "Vault — secure secret storage" (2026-10-16 context-budget diet):
+
+Python: import `get_vault_key`/`list_vault_keys` from `src/vault_intercept.py` (path-bootstrap snippet: [Vault python usage](#vault-python-usage)).
+
+**CLI (for subprocesses):**
+```bash
+python3 skills/secret-vault/secret-vault.py list                           # list stored key names
+python3 skills/secret-vault/secret-vault.py get KEY                        # print value
+python3 skills/secret-vault/secret-vault.py env KEY1 KEY2 -- python3 x.py  # inject as env vars
+```
+
 ## Vault python usage
 
 ```python
@@ -136,6 +149,99 @@ Moved verbatim from CLAUDE.md "Workspace contract" (2026-08-21 context-budget di
 
 Current policy + protection layers: `docs/workspace-config.md`.
 
+## PR checklists
+
+Moved verbatim from CLAUDE.md "Repo rules" (2026-10-16 context-budget diet):
+
+### Creating a PR or issue
+
+`CONTRIBUTING.md` is the canonical process and you MUST follow it. Before opening
+a PR, read and adhere to its "Before starting a PR", "The PR body should answer",
+and "After opening the PR" sections. The short checklist:
+
+- Search existing open + recently-closed PRs/issues for duplicates (`gh pr list --search "closes #N"`)
+- Confirm your git author email is GH-mapped — not `*.local` (macOS hostname auto-fill) or `noreply@anthropic.com` (Claude Code default). CLA-Assistant silently leaves the check PENDING on unmappable emails.
+- Single concern per PR; no bundled refactors
+- Confirm the bug exists on `upstream/main` before adding a fix
+- **Paste before/after evidence** — the actual command output at the parent commit and at HEAD, not a description of it. This is the #1 change-request on this repo. Every claim in the body must be checkable from the diff or that output.
+- **Live path (bridge / network / delivery loop / startup)?** Include a real post-restart round trip, not just unit tests — reviewers reject harness-only proof for these.
+- **Stacked PR?** Name the parent and merge order; after the parent lands, rebase/update the child and rerun its full checks.
+- Scan added lines for hardcoded host paths and inline path fallbacks; production code must use the repo's path helpers.
+- `license/cla` missing after a push or `update-branch`? It is SHA-bound and the auto-recheck comment is unreliable — **close+reopen the PR** is the retry that works. Full ABSENT-vs-FAILING triage: `CONTRIBUTING.md` → "Check the CLA status"
+
+### Reviewing a PR
+
+When you review a PR (including another agent's), you MUST follow `CONTRIBUTING.md`'s
+"Reviewing PRs" section. In short:
+
+- Be evidence-first: cite the commit, file, line, repro, or failing test. If you did not verify a claim, say so explicitly.
+- Distinguish blockers from nits so the author knows what gates merge.
+- Add evidence, not noise — don't stack a bare "LGTM" under an existing approval.
+- APPROVE / REQUEST_CHANGES is a formal GitHub review action (`gh pr review`), not a Discord 👍 or a plain comment.
+- Review the current head and, for a stack, the child-only layer plus cumulative interaction. Re-check CI and approval freshness after every update/rebase.
+- Scan added lines for hardcoded host paths on every review; keep fixture exclusions token-specific so they cannot hide another real path on the same line.
+- Once a requested change is verified fixed, dismiss or replace the stale REQUEST_CHANGES state. If it remains, cite the exact unresolved behavior.
+- Merge only when the current head is mergeable, required CI + CLA are green, and it has the approvals the `main` ruleset requires. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
+
+## Chat-path task and result recipes
+
+Moved verbatim from CLAUDE.md "Chat-path task tracking" (2026-10-16 context-budget diet):
+
+**How:**
+```bash
+WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
+local _ts="$(date +%s)"
+cat > "$WORKSPACE/tasks/task-chat-${_ts}.txt" << EOF
+id: task-chat-${_ts}
+timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+source: chat
+interaction_type: message
+channel_id: local-chat
+user_id: ${SUTANDO_DM_OWNER_ID:-chat-local}
+access_tier: owner
+priority: normal
+task: <concise description of what you're doing>
+EOF
+```
+
+**When done:**
+Write a result file using the same task ID (re-use the `WORKSPACE` from above).
+**Write it atomically** — a drain can claim `results/task-*.txt` the moment it appears, so a file
+built in place is published half-written:
+```bash
+_out="$WORKSPACE/results/task-chat-${_ts}.txt"
+_tmp="$(mktemp "$WORKSPACE/results/.task-chat-${_ts}.XXXXXX")"
+cat > "$_tmp" << EOF
+<result summary>
+EOF
+mv -f "$_tmp" "$_out"    # rename within one directory is atomic; no drain's glob
+                         # matches a name without `.txt` (pathlib `*` sees dotfiles)
+```
+
+## Workspace resolution
+
+Moved verbatim from CLAUDE.md "Workspace contract" (2026-10-16 context-budget diet):
+
+**Resolution (every service reads the same):**
+
+**Default:** the workspace lives at `<repo>/workspace/` (in-repo). To override, edit `sutando.config.local.json` (per-clone, gitignored). `$SUTANDO_WORKSPACE` is no longer honored as of v0.8 / #1440 — see [`docs/workspace-config.md`](workspace-config.md) for its deprecation behaviour and the repo-root fallback anti-pattern.
+
+**Use the helper, don't reinvent the fallback:**
+- Python: `from workspace_default import resolve_workspace` → returns a `Path`.
+- TypeScript: `import { resolveWorkspace } from './workspace_default.js'` → returns a `string` (added in #821).
+- Swift: `AppDelegate.workspace` property in `src/Sutando/main.swift` (added in #837 — split alongside `repoRoot` for code-adjacent paths).
+
+## Per-channel pull namespace
+
+Moved verbatim from CLAUDE.md "Task bridge" (2026-10-16 context-budget diet):
+
+**Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task — keep using it unless you specifically need to push a result to a non-delegating consumer. Use the scoped form ONLY when a result needs to be claimed by a pull-side consumer that didn't delegate the work:
+- phone → key built via `phoneCallKey(callSid)` → `phone-<safe(call-sid)>`
+
+**Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix.
+
+Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python). Why the scoped name slides past existing consumers, and how the phone drain claims it: [Per-channel pull namespace — existing consumers](#per-channel-pull-namespace--existing-consumers) "Per-channel pull namespace".
+
 ## Per-channel pull namespace — existing consumers
 
 Moved verbatim from CLAUDE.md "Task bridge" (2026-09-21 context-budget diet):
@@ -143,3 +249,33 @@ Moved verbatim from CLAUDE.md "Task bridge" (2026-09-21 context-budget diet):
 > The per-consumer prefix is code-enforced (single helper, single source of truth) so cross-consumer namespace collisions are impossible regardless of what ID format a future consumer adopts.
 >
 > Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses.
+
+## Core liveness signal
+
+Each running sutando-core writes `<workspace>/state/cores/<hostname>.alive`
+every 30 seconds (started by `src/startup.sh` as a background process; source
+at `src/core_heartbeat.py`). The file is per-host so multiple cores on
+different machines coexist; mtime is the cross-host "is this core alive?"
+signal (younger than ~90s → alive). On SIGTERM/SIGINT the .alive file is
+unlinked so peers see a graceful shutdown immediately.
+
+Payload schema + locality/socket field semantics: [Core liveness payload schema](#core-liveness-payload-schema).
+
+## Session Continuity
+
+On each context compaction, `src/session-handoff.sh` saves a snapshot to `<workspace>/session-state.md` (system status, recent commits, open PRs, quota, tasks). Read this file at session start to understand what the previous session was doing. It lives under the workspace (per the workspace contract), not the repo root.
+
+## Voice session context
+
+Moved verbatim from CLAUDE.md "Task bridge" (2026-10-16 context-budget diet):
+
+**Voice session context.** Voice-agent's Gemini context window rolls off after ~10 minutes of turns; voice forgets specifics like "the post" or "Mini Draft A" that landed earlier in your session. Whenever you make a durable decision the voice agent may need to reference later — picking a draft, writing text to clipboard for a pending paste, committing to an active task — update `state/voice-session-context.json`. Schema:
+```json
+{
+  "updated_at": "<ISO ts>",
+  "active_drafts": [{"name": "...", "summary": "...", "path": "..."}],
+  "pending_action": {"kind": "paste|review|other", "what": "...", "where": "..."} | null,
+  "last_results": [{"task_id": "...", "subject": "...", "ts": "..."}]
+}
+```
+Keep `active_drafts` and `last_results` to ~3 entries each (drop oldest). Voice can call the `recent_context` tool to read this file when it senses confusion ("what was the post?" / "what's pending?"). Per Chi 2026-05-13.

@@ -55,6 +55,8 @@ count (`python3 src/pending_questions_reader.py summary`).
   an outage, not an empty outbox — whatever became of the one-time introduction message.
 - `reconcile` is the explicit pass: outbox replay, local close records, stale marks, the
   transitional legacy ingest, and the history backfill for rows that predate the marker.
+  Legacy ingest refuses an archive boundary hidden by damaged Markdown before creating
+  rows or marking source entries moved; it reports the affected line numbers.
   Every step commits the history marker before it releases local evidence (an outbox entry,
   a close record, a legacy file entry), and keeps that evidence when the commit fails. `ask`
   and `remind` run it; `list` does not.

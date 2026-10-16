@@ -346,6 +346,14 @@ def _dividers_hidden_by_damage(text: str, divider: re.Pattern) -> list[tuple[int
     return hidden
 
 
+def archive_boundary_damage(text: str) -> list[tuple[int, str]]:
+    """Damaged archive candidates before the boundary the reader would use."""
+    visible = DIVIDER_RE.search(mask_markup(text))
+    stop_line = text.count("\n", 0, visible.start()) + 1 if visible else text.count("\n") + 2
+    return [(line, label) for line, label in _dividers_hidden_by_damage(text, DIVIDER_RE)
+            if line < stop_line]
+
+
 def active_region(text: str, divider: re.Pattern = DIVIDER_RE) -> str:
     """`text` up to the first real (non-quoted) archive divider.
 

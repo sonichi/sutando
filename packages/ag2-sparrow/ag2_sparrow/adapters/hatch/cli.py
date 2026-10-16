@@ -21,12 +21,14 @@ import sys
 import sysconfig
 import tempfile
 import time
+import unicodedata
 from importlib import resources
 from pathlib import Path
 
 from ... import _dirs, gateway_instance, outbox, workspace_lock
 from ...result_markers import parse_markers
-from .task_fields import item_id, valid_mxid
+from .task_fields import (item_id, list_open_tasks, message_body, message_text, snippet,
+                          valid_mxid)
 
 HOOK_ID = "ag2-sparrow-hatch"
 SCRIPT_NAME = f"{HOOK_ID}.sh"
@@ -53,6 +55,14 @@ SERVICE_NAME = "ag2-sparrow.service"
 # First line of every unit install writes: a unit without it is the owner's and is kept.
 SERVICE_MARKER = "# Written by ag2-sparrow-hatch install; re-run install to update it."
 SYSTEMD_TIMEOUT_S = 30
+# --answering must quote this many consecutive words of the message (all of a shorter one);
+# in scripts written without spaces each character is a token, and this many count as the words.
+ANSWERING_MIN_WORDS, ANSWERING_MIN_CHARS = 3, 4
+_MENTION = re.compile(r"@\S+")
+_UNSPACED = ("\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff\u3040-\u30ff\u31f0-\u31ff"
+             "\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f\U00020000-\U0003ffff")
+_UNSPACED_CHAR = re.compile(f"[{_UNSPACED}]")
+_TOKEN = re.compile(rf"[{_UNSPACED}]|(?:(?![{_UNSPACED}])\w)+")
 
 
 def _shipped(name: str) -> str:
@@ -663,6 +673,58 @@ def _read_body(args) -> "tuple[str | None, str]":
     return body, ""
 
 
+def _normalized(text: str) -> str:
+    return unicodedata.normalize("NFKC", _MENTION.sub(" ", text)).casefold()
+
+
+def _words(text: str) -> list:
+    return _TOKEN.findall(_normalized(text))
+
+
+def _weight(tokens: list) -> int:
+    """How much of a quote `tokens` is, in units where ANSWERING_MIN_WORDS words or
+    ANSWERING_MIN_CHARS unspaced characters are each the minimum."""
+    chars = sum(1 for t in tokens if _UNSPACED_CHAR.fullmatch(t))
+    return (len(tokens) - chars) * ANSWERING_MIN_CHARS + chars * ANSWERING_MIN_WORDS
+
+
+def answers(body: str, quoted: str) -> bool:
+    """Whether `quoted` is ANSWERING_MIN_WORDS or more consecutive words of the message in
+    `body` (ANSWERING_MIN_CHARS characters of text written without spaces, such as Chinese,
+    Japanese or Thai; all of it when shorter); case, punctuation and @-mentions do not count.
+    A message with no words (e.g. only emoji) is named only by all of it, punctuation included."""
+    message = message_text(body)
+    have, want = _words(message), _words(quoted)
+    if not have:  # no words at all, e.g. a lone emoji: only the whole message names it
+        squeeze = "".join(_normalized(quoted).split())
+        return bool(squeeze) and squeeze == "".join(_normalized(message).split())
+    if not want or _weight(want) < min(ANSWERING_MIN_WORDS * ANSWERING_MIN_CHARS,
+                                       _weight(have)):
+        return False
+    return any(have[i:i + len(want)] == want for i in range(len(have) - len(want) + 1))
+
+
+def _task_body(task_file: Path) -> str:
+    try:
+        return message_body(task_file.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return ""
+
+
+def _misrouted(tid: str, task_dir: Path, result_dir: Path, instance: str, quoted: str) -> str:
+    """Why `quoted` does not bind this reply to task `tid`, naming the items it does fit."""
+    body = _task_body(task_dir / f"{tid}.txt")
+    fits = [item["result_file"] for item in list_open_tasks(task_dir, result_dir, instance)
+            if item["task_id"] != tid and answers(_task_body(Path(item["task_file"])), quoted)]
+    where = (f" Those words are from the message of {', '.join(fits)}: answer it with that "
+             "result_file." if fits else
+             f" Copy {ANSWERING_MIN_WORDS} or more consecutive words (or {ANSWERING_MIN_CHARS} "
+             "characters of text written without spaces) of the message you answer from its "
+             "snippet.")
+    return (f"--answering {quoted!r} is not the message of {tid} "
+            f"({snippet(body)[:200]!r}); nothing written.{where}")
+
+
 def _claims_dir(result_dir: Path) -> Path:
     return result_dir / ".hatch-reply-claims"
 
@@ -721,6 +783,16 @@ def reply(args) -> int:
         return 2
     if not (task_dir / f"{tid}.txt").is_file():
         print(f"error: no open task {tid} in {task_dir}", file=sys.stderr)
+        return 2
+    if args.answering is None:
+        print(f"error: name the message this answers: --answering '<{ANSWERING_MIN_WORDS} or "
+              f"more consecutive words ({ANSWERING_MIN_CHARS} characters of text written "
+              "without spaces) copied from its snippet>'; nothing written",
+              file=sys.stderr)
+        return 2
+    if not answers(_task_body(task_dir / f"{tid}.txt"), args.answering):
+        print(f"error: {_misrouted(tid, task_dir, result_dir, instance, args.answering)}",
+              file=sys.stderr)
         return 2
     if not (math.isfinite(args.wait) and 0 <= args.wait <= REPLY_WAIT_MAX_S):
         print(f"error: --wait must be 0 to {REPLY_WAIT_MAX_S:g} seconds", file=sys.stderr)
@@ -797,6 +869,11 @@ def main(argv=None) -> int:
                        f"Sparrow posted it (exit {REPLY_POSTED} posted, {REPLY_NOT_POSTED} not "
                        f"posted, {REPLY_UNCONFIRMED} queued but not confirmed)")
     r.add_argument("result_file", help="the item's result_file from the wake payload")
+    r.add_argument("--answering", metavar="WORDS",
+                   help=f"{ANSWERING_MIN_WORDS} or more consecutive words ({ANSWERING_MIN_CHARS} "
+                   "characters of text written without spaces) of the message this "
+                   "answers, copied from its snippet (required: a reply to another item's "
+                   "message is refused)")
     r.add_argument("--body", help="the reply text (default: read from stdin)")
     r.add_argument("--no-send", action="store_true", help="close the item without posting")
     r.add_argument("--wait", type=float, default=REPLY_WAIT_S,

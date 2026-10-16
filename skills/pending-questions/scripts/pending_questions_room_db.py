@@ -503,18 +503,9 @@ def _load_capability(scripts: str):
 def channel_credentials(cap, environ=None) -> dict:
     """The capability's credential variables from the AG2 Space channel env file the shared
     resolver picks; empty when a variable already names either, so the two never mix."""
-    from channel_env_resolve import resolve_channel_env
-    from channel_token import token_from_env_file
-    from util_paths import claude_home_path
-    env = os.environ if environ is None else environ
+    from channel_credentials import channel_credentials as shared
     names = (*getattr(cap, "URL_VARS", ()), *getattr(cap, "TOKEN_VARS", ()))
-    if not names or any(env.get(v) for v in names):
-        return {}
-    path = resolve_channel_env(claude_home_path("channels"), "ag2space")
-    if path is None:
-        return {}
-    found = {v: token_from_env_file(v, path) for v in names}
-    return {v: x for v, x in found.items() if x}
+    return shared(names, environ)
 
 
 def _credentials(cap, collab_url: Optional[str]) -> tuple:
