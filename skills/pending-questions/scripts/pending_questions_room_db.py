@@ -280,14 +280,15 @@ def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
     if store is None:
         return _close_locally(ws, ask_id, status, f"room database: not used ({where})")
     try:
-        reconcile_pending(store, ws, host_label())
-        if not store_history(ws) and store.status_of(ask_id) is not None:
-            try:
-                Outbox(ws).commit_history(ask_id)
-            except StoreError as e:
-                return _close_locally(ws, ask_id, status, f"room database: left open — {e}", "its row is in view")
-        store.close(ask_id, status)
-        return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
+        with getattr(store, "operation", nullcontext)():
+            reconcile_pending(store, ws, host_label())
+            if not store_history(ws) and store.status_of(ask_id) is not None:
+                try:
+                    Outbox(ws).commit_history(ask_id)
+                except StoreError as e:
+                    return _close_locally(ws, ask_id, status, f"room database: left open — {e}", "its row is in view")
+            store.close(ask_id, status)
+            return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
     except GuardFailed as g:
         if not g.current and any(e["ask_id"] == ask_id for e in Outbox(ws).entries()):
             return _close_locally(ws, ask_id, status, "its held entry has no row yet")

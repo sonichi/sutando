@@ -214,17 +214,21 @@ class ScriptDbClient:
         finally:
             self._deadline = previous
 
-    def _call(self, req: dict):
+    def remaining_timeout(self):
         timeout = self.timeout
         if self._deadline is not None:
             timeout = min(timeout, self._deadline - time.monotonic())
             if timeout <= 0:
                 raise StoreError("room database: operation deadline exceeded")
+        return timeout
+
+    def _call(self, req: dict):
+        timeout = self.remaining_timeout()
         try:
             r = subprocess.run(self.argv, input=json.dumps(req), capture_output=True,
                                text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            raise StoreError(f"room database: no reply within {self.timeout:.0f}s") from None
+            raise StoreError(f"room database: no reply within {timeout:.2f}s") from None
         except OSError as e:
             raise StoreError(f"room database: could not run the adapter ({e})") from None
         try:
@@ -351,6 +355,9 @@ class RoomDbStore:
         return True
 
     def _locked(self, fn):
+        remaining = getattr(self.client, "remaining_timeout", None)
+        if remaining is not None:
+            remaining()
         if self.lock is None:
             raise StoreError("the room database store has no lock; refusing an unserialized write")
         err, result = ledger.under_lock(self.lock, fn)
@@ -522,23 +529,24 @@ def reconcile_pending(store, workspace, host: Optional[str]) -> dict:
     single call site). A row landed commits the history marker before its local evidence
     goes (flush, replay, ingest); a row merely observed commits it here — the one backfill
     for a workspace whose rows predate the marker, so no read ever has to write."""
-    ob = Outbox(workspace)
-    flushed, errors = ob.flush(store)
-    closed, close_errors = ob.replay_closes(store)
-    errors += close_errors
-    seen = []
-    try:
-        for r in store.entries():
-            seen.append(r["ask_id"])
-            if r["stale"]:
-                store.clear(r["ask_id"], r["stale"])
-    except Exception as e:  # noqa: BLE001
-        errors.append(f"stale marks: {type(e).__name__}: {e}")
-    import pending_questions_compat as compat  # noqa: PLC0415 — transitional; see its docstring
-    moved, ingest_errors = compat.ingest_legacy_file_entries(workspace, host, store)
-    if seen:
+    with getattr(store, "operation", nullcontext)():
+        ob = Outbox(workspace)
+        flushed, errors = ob.flush(store)
+        closed, close_errors = ob.replay_closes(store)
+        errors += close_errors
+        seen = []
         try:
-            mark_store_used(workspace, min(seen))
-        except OSError as e:
-            errors.append(f"store history: {type(e).__name__}: {e}")
-    return {"flushed": flushed, "closed": closed, "moved": moved, "errors": errors + ingest_errors}
+            for r in store.entries():
+                seen.append(r["ask_id"])
+                if r["stale"]:
+                    store.clear(r["ask_id"], r["stale"])
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"stale marks: {type(e).__name__}: {e}")
+        import pending_questions_compat as compat  # noqa: PLC0415 — transitional; see its docstring
+        moved, ingest_errors = compat.ingest_legacy_file_entries(workspace, host, store)
+        if seen:
+            try:
+                mark_store_used(workspace, min(seen))
+            except OSError as e:
+                errors.append(f"store history: {type(e).__name__}: {e}")
+        return {"flushed": flushed, "closed": closed, "moved": moved, "errors": errors + ingest_errors}
