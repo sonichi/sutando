@@ -23,6 +23,7 @@ Run: python3 tests/gateway-relay-result-no-ceiling.test.py
 from __future__ import annotations
 
 import contextlib
+import errno
 import glob
 import io
 import json
@@ -315,6 +316,30 @@ class TheRule(_Bridge):
         typed_waits = [line for line in self.lines if line.startswith(f"result {typed}: pending retry")]
         self.assertEqual(len(typed_waits), 8, "a typed result's wait is no longer logged as before")
 
+    def test_a_refused_payload_that_names_no_task_is_retried_as_it_is(self):
+        for stored in ("not json", json.dumps({"body": "no id"}), json.dumps({"id": ""})):
+            self.assertEqual(gw._failed_in_place_of(stored), stored)
+        self.assertEqual(json.loads(gw._failed_in_place_of(json.dumps(ANSWER))), FAILED)
+        # Through the outbox: a malformed envelope is refused for good, and kept and retried as it is.
+        core = gw._delivery_core("relay")
+        core.backend.publish(ASK_A, b"not json")
+        core.deliver_one(ASK_A, b"not json")
+        record = item(self.outbox_root, ASK_A)
+        self.assertEqual((record["status"], record["payload"], record["retry"]["failures"]),
+                         ("READY", "not json", 1))
+        self.assertNotIn("refused_payload", record)
+
+    def test_only_a_parked_result_is_reopened(self):
+        ask = self.serve(voice_ask())
+        self.answer(ask)
+        self.broker.result = "down"
+        self.drain()
+        core = gw._delivery_core("relay")
+        before = item(self.outbox_root, ASK_A)
+        gw._reopen_relay_result(core, ASK_A, ask, {"status": "QUEUED"})
+        self.assertEqual(item(self.outbox_root, ASK_A), before, "a live item was requeued")
+        self.assertFalse(any("was parked" in line for line in self.lines))
+
     def transient_failures_keep_the_same_result(self, answer: str) -> None:
         ask = self.serve(voice_ask())
         self.answer(ask)
@@ -447,6 +472,73 @@ class TheReclaim(_Bridge):
         self.assertEqual(self.quarantined(), [])
         self.drain()
         self.assertEqual(self.broker.results(), [{"id": ASK_A, "body": TEXT}])
+
+    def assert_left_parked_or_resumable(self, ask: str) -> None:
+        """Nothing moved: the copy waits in quarantine, nothing is live at the ask's name."""
+        self.assertEqual(len(self.quarantined()), 1)
+        self.assertFalse((gw.RESULTS_DIR / f"{ask}.txt").exists())
+
+    def test_a_quarantine_that_cannot_be_listed_leaves_the_parked_item_for_the_operator(self):
+        ask = self.parked_by_an_older_bridge()
+
+        class _Unlistable(type(gw.UNDELIVERABLE_RESULTS_DIR)):
+            def glob(self, pattern):
+                raise OSError(errno.EACCES, "Permission denied")
+        with patch.object(gw, "UNDELIVERABLE_RESULTS_DIR", _Unlistable(gw.UNDELIVERABLE_RESULTS_DIR)):
+            self.assertIsNone(gw._parked_copy(ask))
+            gw._reclaim_parked_relay_results(set())
+        self.assert_left_parked_or_resumable(ask)
+        self.assertEqual(item(self.outbox_root, ASK_A)["status"], "PARKED", "requeued with no copy to send")
+        self.assertIn(f"result {ask}: its relay result is parked and no quarantined copy of it was found; "
+                      "left for the operator", self.lines)
+
+    def test_a_mark_that_names_no_valid_task_is_passed_over(self):
+        ask = self.parked_by_an_older_bridge()
+        gw._save_inflight(set())
+        # Malformed entries beside the real one: an id the broker never issues, a local id not a string.
+        gw.ACK_FIRST_FILE.write_text(json.dumps({ASK_A: ask, "../escape": "task-x", "ask-7d4e2f1a9b8c": 7}))
+        (gw.RESULTS_DIR / "task-x.txt").write_text("not a relay answer")
+        inflight: "set[str]" = set()
+        gw._reclaim_parked_relay_results(inflight)
+        self.assertEqual(inflight, {ask}, "only the valid mark is reclaimed")
+        self.assertFalse(gw._keep_relay_results_in_flight(inflight), "a malformed mark was followed")
+        self.assertEqual(inflight, {ask})
+
+    def test_a_parked_item_someone_else_requeued_first_is_left_to_them(self):
+        ask = self.parked_by_an_older_bridge()
+        gw._save_inflight(set())
+        inflight: "set[str]" = set()
+        with patch.object(gw, "requeue_item_with_epoch",
+                          return_value=(outbox.RequeueOutcome.NOT_PARKED, None)) as requeue:
+            gw._reclaim_parked_relay_results(inflight)
+        requeue.assert_called_once()
+        self.assertEqual(inflight, set(), "put in flight without its requeue")
+        self.assert_left_parked_or_resumable(ask)
+
+    def test_an_id_that_cannot_be_put_back_in_flight_moves_nothing_until_the_next_start(self):
+        ask = self.parked_by_an_older_bridge()
+        gw._save_inflight(set())
+        with patch.object(gw, "_save_inflight", return_value=False):
+            gw._reclaim_parked_relay_results(set())
+        self.assert_left_parked_or_resumable(ask)
+        self.assertIn(f"result {ask}: its parked relay result could not be put back in flight; "
+                      "the next start reclaims it", self.lines)
+        record = item(self.outbox_root, ASK_A)
+        self.assertEqual((record["status"], record["requeue_reason"]), ("QUEUED", gw._RELAY_RECLAIMED))
+        gw._reclaim_parked_relay_results(set())          # the next start
+        self.assertEqual((gw.RESULTS_DIR / f"{ask}.txt").read_text(), PRIVATE)
+        self.assertEqual(gw._load_inflight(), {ask})
+
+    def test_a_name_taken_in_the_move_or_no_no_replace_rename_keeps_the_copy(self):
+        ask = self.parked_by_an_older_bridge()
+        for code, why in ((errno.EEXIST, f"a live result already holds {ask}.txt"),
+                          (errno.ENOTSUP, "this platform has no no-replace rename")):
+            with patch.object(gw.undelivered_quarantine, "rename_noreplace",
+                              side_effect=FileExistsError(code, os.strerror(code))):
+                gw._reclaim_parked_relay_results(set())
+            self.assert_left_parked_or_resumable(ask)
+            [kept] = self.quarantined()
+            self.assertIn(f"result {ask}: its parked relay result stays as {kept}: {why}", self.lines)
 
 
 # ── through the real poll loop ───────────────────────────────────────────────

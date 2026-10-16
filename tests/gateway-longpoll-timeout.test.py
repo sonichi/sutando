@@ -239,6 +239,54 @@ class AckFirstInTheLoopTest(unittest.TestCase):
         self.assertEqual(len(loop.polls), 1)
 
 
+class RelayResultsInTheLoopTest(unittest.TestCase):
+    """What `main()` does for a voice relay ask's result: reclaimed at start, and put back in
+    flight on every pass when it lands outside the in-flight set."""
+
+    ASK = "ask-5f3c9e0a1b2c"
+
+    def setUp(self):
+        try:
+            from ag2_sparrow import remote_gateway_bridge as gw
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            self.skipTest(f"gateway not importable: {str(e)[:60]}")
+        self.gw = gw
+        self.calls: list = []
+
+    def test_a_reclaim_that_fails_is_logged_and_the_loop_still_starts(self):
+        def _reclaim_parked_relay_results(inflight):
+            raise RuntimeError("outbox")
+
+        with _Loop(self.gw) as loop, \
+                patch.object(self.gw, "_reclaim_parked_relay_results", new=_reclaim_parked_relay_results):
+            loop.run()
+        self.assertIn("relay result reclaim failed (RuntimeError: outbox) — continuing", loop.logs)
+        self.assertEqual(len(loop.polls), 1)
+
+    def test_a_relay_result_landing_outside_the_in_flight_set_wakes_the_outbound_worker(self):
+        with tempfile.TemporaryDirectory() as d, _Loop(self.gw) as loop, \
+                patch.multiple(self.gw, ACK_FIRST_FILE=Path(d) / "marks.json",
+                               DEDUP_ALIAS_FILE=Path(d) / "aliases.json"):
+            self.gw.ACK_FIRST_FILE.write_text(f'{{"{self.ASK}": "{self.ASK}"}}')
+            self.gw.RESULTS_DIR.mkdir()
+            saved: list = []
+            self.gw._save_inflight = lambda ids: saved.append(set(ids)) or True
+            poll = self.gw._req
+
+            def lands_during_the_poll(method, path, *a, **k):
+                if path.startswith("/v1/tasks?"):
+                    (self.gw.RESULTS_DIR / f"{self.ASK}.txt").write_text("Your calendar is clear.")
+                return poll(method, path, *a, **k)
+            self.gw._req = lands_during_the_poll
+            with patch.object(self.gw, "wake_outbound", new=lambda: self.calls.append(
+                    ("woken", threading.current_thread() is threading.main_thread(), len(loop.polls),
+                     any(self.ASK in ids for ids in saved)))):
+                loop.run()
+        # At start nothing was live; after the poll the result is back in flight, then the worker woken.
+        self.assertIn(("woken", True, 1, True), self.calls)
+        self.assertEqual([ids for ids in saved if self.ASK in ids][:1], [{self.ASK}])
+
+
 class DroppedConnectionTest(unittest.TestCase):
     """urllib wraps only the send in URLError. A peer or proxy that closes the
     socket after it raises http.client's own errors bare from getresponse(), and
