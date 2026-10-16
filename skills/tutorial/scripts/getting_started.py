@@ -55,7 +55,7 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tour_page  # noqa: E402,F401
 from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these names are this CLI's API)
-    AUDIENCES, CONNECT_PROMPT, owner_marker, CORES, IMPORT_PROMPT, IMPORT_SECTION, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
+    AUDIENCES, CONNECT_PROMPT, PROMPT_SLOTS, clean_prompts, owner_marker, CORES, IMPORT_PROMPT, IMPORT_SECTION, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
     render_page, sections_for,
 )
 
@@ -194,6 +194,17 @@ def chunks(text: str, limit: int = 0) -> List[str]:
     if part:
         out.append("".join(part))
     return out
+
+
+def load_prompts(path: Optional[Path]) -> Dict[str, str]:
+    """The usable prompts in a --prompts JSON file; {} when there is none or it cannot be read, so
+    a bad file never fails the run (every slot keeps its default)."""
+    if path is None:
+        return {}
+    try:
+        return clean_prompts(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return {}
 
 
 def content_hash(text: str) -> str:
@@ -364,8 +375,8 @@ def _fill(commons: Commons, kind: str, page: str) -> None:
 
 def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = None,
             summon: bool = False, core: str = "unknown", audience: str = "dm",
-            agent: Optional[str] = None) -> dict:
-    page = render_page(name, core, audience, agent)
+            agent: Optional[str] = None, prompts: object = None, roles: object = None) -> dict:
+    page = render_page(name, core, audience, agent, prompts, roles)
     with _locked(marker):
         rooms = load_marker(marker)
         pages = commons.listed_pages()
@@ -424,6 +435,12 @@ def _workspace() -> Path:
     return resolve_workspace()
 
 
+def _personal_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--prompts", type=Path, help="JSON object of tailored prompts by slot ("
+                        + ", ".join(PROMPT_SLOTS) + "); bad or missing entries keep the default")
+    parser.add_argument("--roles", default="", help="the owner's onboarding roles, comma-separated slugs")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="getting_started.py", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
@@ -435,6 +452,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     r.add_argument("--audience", choices=AUDIENCES, default="dm",
                    help="dm: the owner's DM, which names the agent; room: any other room, which says "
                         "\"your agent\"")
+    _personal_args(r)
     r.add_argument("--core", choices=CORES + ("auto",), default="unknown",
                    help="the Sutando core; claude adds the Claude Code import section")
     p = sub.add_parser("plan", help="what publish would do in this room, from the marker alone")
@@ -450,6 +468,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "Claude Code import section, unknown leaves it out")
     u.add_argument("--audience", choices=AUDIENCES, default="dm",
                    help="dm (default): the owner's DM; room: any other room, where the page says \"your agent\"")
+    _personal_args(u)
     u.add_argument("--summon", action="store_true", help="summon the owner on a refresh too")
     u.add_argument("--room-commons", type=Path, default=None,
                    help="path to room_commons.py (default: beside this skill, else the installed skill)")
@@ -462,7 +481,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         name = clean_name(resolve_name(args.name, args.agent_mxid))
         if args.command == "render":
             core = detect_core() if args.core == "auto" else args.core
-            sys.stdout.write(render_page(name, core, args.audience))
+            sys.stdout.write(render_page(name, core, args.audience, None, load_prompts(args.prompts),
+                                         args.roles.split(",")))
             return 0
     except ValueError as exc:
         print(f"getting_started: {exc}", file=sys.stderr)
@@ -475,7 +495,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         result = publish(Commons(script, args.room, commons_env(script)), marker_path(_workspace()),
                          name, args.owner, args.summon,
                          detect_core() if args.core == "auto" else args.core, args.audience,
-                         args.agent_mxid or agent_mxid() or None)
+                         args.agent_mxid or agent_mxid() or None, load_prompts(args.prompts),
+                         args.roles.split(","))
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": str(exc)}))
         return 4

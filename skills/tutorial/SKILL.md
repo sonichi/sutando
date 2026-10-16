@@ -37,7 +37,22 @@ not retry the page in the same turn.
    - `Sutando`.
 
    Your mxid is `$AGENT_MXID`, else the AG2 Space channel env file's, else `--agent-mxid`.
-2. Create or refresh the page and summon the owner to it:
+2. Tailor the prompts when you know the owner's work. You know it when either:
+   - the first-contact message names their onboarding roles (a line such as "I picked:
+     researcher, founder"), or
+   - `user_profile.md` already says what they do.
+
+   In that case write your own prompts for this owner into a temporary JSON file, one per slot:
+   `dm`, `commons`, `teamwork`, `apps`, `import`, `finale`. Write 4–6 of them.
+   - Each is first person, practical, one line, at most 200 characters, with no links or markup.
+   - Each must run on a fresh install: only the `apps` slot may assume a connected app.
+   - The slot decides where the prompt is pasted (your DM or a room), not the wording.
+
+   Pass the file as `--prompts <file>` and any role slugs as `--roles researcher,founder`; the
+   roles add a "Picked for: Researcher, Founder" line under the heading. Otherwise leave both
+   out. A missing, bad or partly bad file never fails the run: each slot without a usable prompt
+   keeps the generic one.
+3. Create or refresh the page and summon the owner to it:
 
    ```bash
    python3 skills/tutorial/scripts/getting_started.py publish \
@@ -61,7 +76,7 @@ not retry the page in the same turn.
    On `created` it summons the owner, so the card in the DM is the one line that
    carries the page: post no other message about it. On `updated` / `unchanged` it summons no one
    (`--summon` forces it, e.g. when the owner asks for the tutorial again).
-3. Exit 3 (room-commons not installed) or 4 (a room-commons call failed): leave the greeting as is
+4. Exit 3 (room-commons not installed) or 4 (a room-commons call failed): leave the greeting as is
    and say nothing about the page unless the owner asks. A failure that is a Sutando or AG2 Space
    defect goes to `report-feedback`.
 

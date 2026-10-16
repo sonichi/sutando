@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import base64
 import html
+import re
 from pathlib import Path
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 PAGE_TITLE = "Getting started"
 NAME_MAX = 64
@@ -94,6 +95,11 @@ IMPORT_SECTION = Section(
     IMPORT_PROMPT, "dm",
 )
 FINALE_PROMPT = "Help me plan my week."
+# Slots a --prompts file may fill; the slot, not the text, decides where the prompt is pasted.
+PROMPT_SLOTS = ("dm", "commons", "teamwork", "apps", "import", "finale")
+PROMPT_MAX = 200
+BAD_PROMPT = re.compile(r"[\r\n<>]|://|\bwww\.", re.I)
+ROLE_SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
 AUDIENCES = ("dm", "room")
 WHERE = {"dm": "your DM", "room": "a room"}
 ASSETS = Path(__file__).resolve().parent.parent / "assets"  # lint-workspace-resolution: allow-repo-root
@@ -211,8 +217,31 @@ def _shots(images) -> str:
     return f'<div class="shots">{figs}</div>'
 
 
-def _section(sec: Section, first: bool, who: str) -> str:
-    prompt = _prompt(sec.id, sec.prompt, sec.where) if sec.prompt else ""
+def clean_prompts(raw: object) -> Dict[str, str]:
+    """The usable per-slot prompts from `raw`: known slots only, each a single line of 1-200
+    characters with no link or markup. Anything else is dropped, so its slot keeps the default."""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for slot, text in raw.items():
+        if slot not in PROMPT_SLOTS or not isinstance(text, str):
+            continue
+        text = text.strip()
+        if 0 < len(text) <= PROMPT_MAX and not BAD_PROMPT.search(text):
+            out[slot] = text
+    return out
+
+
+def role_labels(roles: object) -> List[str]:
+    """Display labels for the onboarding role slugs: `product-manager` reads `Product Manager`."""
+    if not isinstance(roles, (list, tuple)):
+        return []
+    slugs = [r.strip().lower() for r in roles if isinstance(r, str) and ROLE_SLUG.fullmatch(r.strip().lower())]
+    return [" ".join(w.capitalize() for w in re.split(r"[-_]", s) if w) for s in dict.fromkeys(slugs)][:6]
+
+
+def _section(sec: Section, first: bool, who: str, prompts: Dict[str, str]) -> str:
+    prompt = _prompt(sec.id, prompts.get(sec.id, sec.prompt), sec.where) if sec.prompt else ""
     return (
         f'<section class="sec card{" cur" if first else ""}" id="s-{sec.id}" data-id="{sec.id}" '
         f'aria-labelledby="h-{sec.id}" style="--accent:var(--a-{sec.id})">'
@@ -225,13 +254,13 @@ def _section(sec: Section, first: bool, who: str) -> str:
     )
 
 
-def _finale(who: str) -> str:
+def _finale(who: str, prompts: Dict[str, str]) -> str:
     return (
         '<section class="card finale" id="finale" aria-labelledby="h-finale" hidden '
         'style="--accent:var(--brand)"><div class="body">'
         f'<h2 id="h-finale" tabindex="-1">You&rsquo;re set &mdash; ask {who} anything</h2>'
         f'<p class="how">That was the whole tour. Start with something real:</p>'
-        f'{_prompt("finale", FINALE_PROMPT, "dm")}</div></section>'
+        f'{_prompt("finale", prompts.get("finale", FINALE_PROMPT), "dm")}</div></section>'
     )
 
 
@@ -260,6 +289,7 @@ h1 { font-size:28px; line-height:1.2; margin:0 0 6px; }
 h2 { font-size:19px; margin:0 0 4px; }
 p { margin:0 0 6px; }
 .lead, .how { color:var(--muted); }
+.roles { font-size:14px; font-weight:600; color:var(--brand); margin:6px 0 0; }
 .progress { margin:4px 0 16px; }
 .progress-label { font-size:14px; color:var(--muted); margin-bottom:4px; }
 .bar { height:8px; border-radius:99px; background:var(--track); overflow:hidden; }
@@ -491,14 +521,19 @@ def owner_marker(agent: str) -> str:
     return f'<meta name="sutando-tutorial" content="{html.escape(agent, quote=True)}">'
 
 
-def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: Optional[str] = None) -> str:
-    """The whole page as one HTML string; depends on nothing but the agent's name, core, audience
-    and mxid (the ownership marker). In a room other than the owner's DM the agent is "your agent"."""
+def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: Optional[str] = None,
+                prompts: object = None, roles: object = None) -> str:
+    """The whole page as one HTML string; depends on nothing but its arguments: the agent's name,
+    core, audience, mxid (the ownership marker), per-slot prompts (`clean_prompts`) and the owner's
+    onboarding roles. In a room other than the owner's DM the agent is "your agent"."""
+    prompts = clean_prompts(prompts)
+    labels = role_labels(roles)
+    picked = (f'<p class="roles">Picked for: {html.escape(", ".join(labels))}</p>' if labels else "")
     if audience not in AUDIENCES:
         raise ValueError(f"audience must be one of {', '.join(AUDIENCES)}, got {audience!r}")
     who = html.escape(clean_name(name)) if audience == "dm" else "your agent"
     secs = sections_for(core)
-    body = "".join(_section(s, i == 0, who) for i, s in enumerate(secs))
+    body = "".join(_section(s, i == 0, who, prompts) for i, s in enumerate(secs))
     light, dark = _palette()
     return (
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
@@ -508,7 +543,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
         "<main id=\"tour\" data-mode=\"step\">"
         f"<header class=\"hero\">{HERO}<div><h1>Getting started with {who}</h1>"
         f"<p class=\"lead\">A short tour of AG2 Space. Each part has one thing to try; Copy puts "
-        f"a prompt on your clipboard to paste into a chat with {who}.</p></div></header>"
+        f"a prompt on your clipboard to paste into a chat with {who}.</p>{picked}</div></header>"
         "<div class=\"progress\"><div class=\"progress-label\" id=\"progress-label\" aria-hidden=\"true\">"
         f"0 of {len(secs)} done</div>"
         f"<div class=\"bar\" id=\"progress-bar\" role=\"progressbar\" aria-label=\"Tour progress\" "
@@ -520,6 +555,6 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
         "<button type=\"button\" id=\"back\" aria-label=\"Previous step\">Back</button>"
         "<button type=\"button\" id=\"next\" aria-label=\"Next step\">Next</button>"
         "<button type=\"button\" id=\"all\" aria-pressed=\"false\">Show all</button></nav>"
-        f"{_finale(who)}{body}<div id=\"status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\"></div>"
+        f"{_finale(who, prompts)}{body}<div id=\"status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\"></div>"
         f"</main>{SCRIPT}{COPY_SCRIPT}</body></html>\n"
     )

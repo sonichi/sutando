@@ -800,6 +800,17 @@ class MainTest(unittest.TestCase):
                                      "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
 
+    def test_publish_with_tailored_prompts_and_roles(self):
+        f = self.tmp / "p.json"
+        f.write_text(json.dumps({"dm": "Draft my weekly update."}))
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                 "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test",
+                                 "--prompts", str(f), "--roles", "founder")
+        self.assertEqual(code, 0)
+        page = json.loads((self.tmp / "room.json").read_text())["pages"][json.loads(out)["kind"]]
+        self.assertIn("Draft my weekly update.", page)
+        self.assertIn("Picked for: Founder", page)
+
     def test_publish_without_room_commons_exits_3(self):
         with mock.patch.object(gs, "find_room_commons", return_value=self.tmp / "missing.py"):
             code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex")
@@ -811,6 +822,69 @@ class MainTest(unittest.TestCase):
                                  "--room-commons", str(self.stub))
         self.assertEqual(code, 4)
         self.assertIn("pages failed", json.loads(out)["reason"])
+
+
+class PersonalTest(unittest.TestCase):
+    """Prompts the agent writes for the owner's work (--prompts) and the roles line (--roles)."""
+
+    def test_valid_prompts_override_their_slots_and_are_escaped(self):
+        mine = {"dm": "Summarise the papers I send you & flag open questions",
+                "commons": "Make a reading list for my thesis in Commons.",
+                "finale": "Help me plan this week's experiments."}
+        page = gs.render_page("Blue", "codex", prompts=mine)
+        buttons = [b for b in parse(page).buttons if b]
+        self.assertEqual(buttons[0], mine["finale"])
+        self.assertIn(mine["dm"], buttons)
+        self.assertIn(mine["commons"], buttons)
+        self.assertIn(html.escape(mine["dm"]), page)
+        self.assertNotIn(gs.SECTIONS[0].prompt, buttons)  # the default dm prompt is replaced
+        self.assertIn(gs.SECTIONS[4].prompt, buttons)  # teamwork kept its default
+
+    def test_invalid_entries_fall_back_per_slot(self):
+        bad = {"dm": "see https://example.test", "commons": "x" * (gs.tour_page.PROMPT_MAX + 1),
+               "teamwork": "line one\nline two", "apps": 42, "import": "<b>bold</b>", "finale": "   ",
+               "unknown-slot": "ignored", "mobile": "not a prompt slot"}
+        self.assertEqual(gs.tour_page.clean_prompts(bad), {})
+        self.assertEqual(gs.render_page("Blue", "claude", prompts=bad), gs.render_page("Blue", "claude"))
+        self.assertEqual(gs.tour_page.clean_prompts({"dm": " ok ", "apps": "www.example.test"}), {"dm": "ok"})
+        self.assertEqual(gs.tour_page.clean_prompts(["dm", "x"]), {})
+
+    def test_the_slot_decides_where_to_paste_not_the_text(self):
+        page = gs.render_page("Blue", "codex", prompts={"commons": "Ask in your DM: plan my week."})
+        block = page[page.index('id="s-commons"'):]
+        block = block[:block.index("</section>")]
+        self.assertIn('<p class="paste">Paste in: a room</p>', block)
+
+    def test_prompt_files_never_fail_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good, broken, wrong = (Path(tmp) / n for n in ("good.json", "broken.json", "list.json"))
+            good.write_text(json.dumps({"dm": "Draft my weekly update.", "apps": "http://x.test"}))
+            broken.write_text("{not json")
+            wrong.write_text("[1, 2]")
+            self.assertEqual(gs.load_prompts(good), {"dm": "Draft my weekly update."})
+            self.assertEqual(gs.load_prompts(broken), {})
+            self.assertEqual(gs.load_prompts(wrong), {})
+            self.assertEqual(gs.load_prompts(Path(tmp) / "missing.json"), {})
+            self.assertEqual(gs.load_prompts(None), {})
+
+    def test_roles_line(self):
+        page = gs.render_page("Blue", "codex", roles=["researcher", "product-manager", "researcher"])
+        self.assertIn('<p class="roles">Picked for: Researcher, Product Manager</p>', page)
+        self.assertNotIn('class="roles"', gs.render_page("Blue", "codex", roles=[""]))
+        self.assertNotIn('class="roles"', gs.render_page("Blue", "codex"))
+        self.assertEqual(gs.tour_page.role_labels(["<script>", "ok_role", 7]), ["Ok Role"])
+        self.assertEqual(gs.tour_page.role_labels("researcher"), [])
+
+    def test_cli_passes_prompts_and_roles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "p.json"
+            f.write_text(json.dumps({"dm": "Draft my weekly update."}))
+            done = subprocess.run([sys.executable, str(SCRIPT), "render", "--name", "Blue", "--core", "codex",
+                                   "--prompts", str(f), "--roles", "founder,researcher"],
+                                  capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, gs.render_page("Blue", "codex", prompts={"dm": "Draft my weekly update."},
+                                                     roles=["founder", "researcher"]))
 
 
 class MarkerTest(unittest.TestCase):
