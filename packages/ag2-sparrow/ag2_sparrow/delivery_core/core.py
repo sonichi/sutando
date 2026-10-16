@@ -36,7 +36,8 @@ class RetryPolicy:
 
 def idempotency_key(item_id: str, resend_epoch: int = 0) -> str:
     """Stable per logical side effect; NEVER derived from claim material.
-    resend_epoch changes only on a DELIBERATE operator re-send."""
+    resend_epoch changes on a DELIBERATE operator re-send, and when backend A's
+    `replace_refused` swaps a new payload in for a refused one."""
     return f"{item_id}#{resend_epoch}"
 
 

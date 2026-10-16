@@ -201,6 +201,19 @@ def publish_at(tmp, path):
 
 gw._post_ack_first, gw._publish_staged, gw._put_held, gw._record_ack_first = (
     ack_at, publish_at, put_at, mark_at)
+
+# The end of a relay result refused for good, cut short before a step or after it.
+END_STEPS = {"end:before-quarantine": ("_dispose_terminal", True), "end:before-settle": ("_settle_task", True),
+             "end:after-settle": ("_settle_task", False), "end:before-mark": ("_forget_ack_first", True)}
+if crash in END_STEPS:
+    step, before = END_STEPS[crash]
+    real_step = getattr(gw, step)
+
+    def step_at(*a, **k):
+        if not before:
+            real_step(*a, **k)
+        os._exit(17)
+    setattr(gw, step, step_at)
 gw.main()
 """
 

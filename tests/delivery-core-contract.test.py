@@ -490,7 +490,7 @@ class CorePolicy(unittest.TestCase):
                          ("DELIVERED", "y", "x"))
         self.assertEqual(outbox.source_proof(record), "ab" * 32)
         self.assertEqual(keys, [idempotency_key(ITEM, 0), idempotency_key(ITEM, 1)],
-                         "the replacement shares the refused payload's idempotency key")
+                         "the replacement did not get an idempotency key of its own")
 
     def test_a_refused_replacement_or_none_to_offer_parks_as_refused_for_good(self):
         from ag2_sparrow.delivery_core import REFUSED_FOR_GOOD

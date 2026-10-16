@@ -4427,6 +4427,29 @@ def _parked_copy(local: str) -> "Path | None":
     return newest[1] if newest else None
 
 
+def _finish_relay_end(core, broker_id: str, local: str, record: dict, inflight: "set[str]") -> None:
+    """At start, finish the end of a relay result the broker refused for good that a crash cut
+    short: its mark is retired last, so it is still here. In the same order as the drain: each
+    live result quarantined, each task settled and out of flight on disk, then the mark."""
+    aliases = _load_dedup_aliases()
+    if aliases is None:
+        return                                  # a re-ask cannot be told: the next start finishes it
+    answers = {local} | {k for k, v in aliases.items() if v == local and _valid_local_tid(k)}
+    for tid in sorted(answers):
+        rfile = RESULTS_DIR / f"{tid}.txt"
+        if os.path.lexists(rfile):
+            _dispose_terminal(core, broker_id, tid, record, rfile)
+            if os.path.lexists(rfile):
+                return                          # not quarantined yet: the next start tries again
+        if (tid in inflight or _task_pending(tid)) and not _settle_task(tid, inflight):
+            return
+    if not _save_inflight(inflight):
+        return
+    _forget_ack_first(broker_id)
+    _log(f"result {local}: finished the end of a relay result the broker refused for good "
+         f"({REFUSED_FOR_GOOD}); its task and relay mark are retired")
+
+
 def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
     """At start, take back each relay ask's result an older bridge parked after a downgrade.
 
@@ -4455,7 +4478,7 @@ def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
                    and record.get("requeue_reason") == _RELAY_RECLAIMED)
         target = RESULTS_DIR / f"{local}.txt"
         if parked and record.get("reason") == REFUSED_FOR_GOOD:
-            _forget_ack_first(broker_id)            # the rule's own end: its mark outlived a crash
+            _finish_relay_end(core, broker_id, local, record, inflight)
             continue
         if not (parked or resumed) or os.path.lexists(target):
             continue
@@ -6126,12 +6149,12 @@ def _reopen_relay_result(core, item_id: str, tid: str, record: dict, result_file
 
 def _end_relay_result(core, item_id: str, tid: str, record: dict, result_file, generation) -> None:
     """The broker refused the answer and the `failed` in its place for good: no retry can
-    change that. The result is quarantined as any park is, and the mark retired, so neither the
-    reclaim nor the keep pass revives it; the drain then settles the task and its in-flight id."""
+    change that. The result is quarantined as any park is; the drain then settles the task and
+    its in-flight id, and retires the mark last (`_settle_delivered`), so a crash between the
+    steps leaves the mark for start-up to finish the end by (`_finish_relay_end`)."""
     _dispose_terminal(core, item_id, tid, record, result_file, generation)
-    _forget_ack_first(item_id)
     _log(f"ERROR result {tid}: the broker refused the answer and the `failed` sent in its place "
-         f"for good ({REFUSED_FOR_GOOD}); it is not retried, and its relay mark is retired")
+         f"for good ({REFUSED_FOR_GOOD}); it is not retried, and its task and relay mark are retired")
 
 
 def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None" = None) -> bool:
@@ -6142,10 +6165,15 @@ def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None"
     if root is None or os.path.lexists(rfile):
         return False                            # something is still live at the name: keep looking
     record = read_item(root, item_id) or {}
-    if not (record.get("status") == "DELIVERED"
-            or (record.get("status") == "PARKED" and record.get("reason") == REFUSED_FOR_GOOD)):
+    if record.get("status") == "DELIVERED":
+        return _settle_task(tid, inflight)
+    if record.get("status") != "PARKED" or record.get("reason") != REFUSED_FOR_GOOD:
         return False
-    return _settle_task(tid, inflight)
+    # A relay result's end: its task and in-flight id retired on disk, the mark last.
+    settled = _settle_task(tid, inflight)
+    if settled and (inflight is None or _save_inflight(inflight)):
+        _forget_ack_first(item_id)
+    return settled
 
 
 def _effective_item_id(core, broker_tid: str, no_send: bool) -> str:

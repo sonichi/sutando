@@ -549,10 +549,12 @@ its place (below).
 - If the broker refuses that `failed` for good too (it no longer knows the task,
   say), no retry can change it, and the result ends. The item is parked as
   `refused-for-good`, the result is quarantined to `results/undelivered/` with the
-  outbox's requeue command, as any park is, and the task's mark and in-flight id are
-  retired, logged once as an `ERROR`. Neither the drain, the pass that puts results
-  back in flight, nor the reclaim at start revives it. A refused payload that names
-  no task, so that no `failed` can be built, ends the same way at once.
+  outbox's requeue command, as any park is, and the task is settled: archived, its
+  id out of the in-flight set on disk, and its mark retired last, logged once as an
+  `ERROR`. A crash between those steps leaves the mark, so the next start finishes
+  the end in the same order. Neither the drain, the pass that puts results back in
+  flight, nor the reclaim at start revives it. A refused payload that names no
+  task, so that no `failed` can be built, ends the same way at once.
 - A park the rule could not prevent, such as the 10-minute window an older bridge
   started before the Mac updated, is requeued with its retry state reset when the
   drain meets it, rather than quarantined.

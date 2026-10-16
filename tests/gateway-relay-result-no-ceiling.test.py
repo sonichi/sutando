@@ -234,7 +234,7 @@ class TheRule(_Bridge):
         self.assertEqual((record["status"], record["reason"]), ("PARKED", gw.REFUSED_FOR_GOOD))
         self.assertEqual((json.loads(record["payload"]), json.loads(record["refused_payload"])),
                          (FAILED, ANSWER))
-        self.assertEqual(record["resend_epoch"], 1, "the `failed` shares the refused answer's epoch")
+        self.assertEqual(record["resend_epoch"], 1, "the `failed` did not get an epoch of its own")
         self.assertEqual(sorted(n.split("-")[0] for n in self.quarantined()), ["ask", "task"])
         self.assertFalse((gw.RESULTS_DIR / f"{ask}.txt").exists())
         self.assertEqual(gw._load_ack_first(), {}, "the mark outlived the end")
@@ -575,6 +575,76 @@ class TheReclaim(_Bridge):
             self.assertIn(f"result {ask}: its parked relay result stays as {kept}: {why}", self.lines)
 
 
+class _Crash(Exception):
+    """A process that died at this step."""
+
+
+class EndCutShort(_Bridge):
+    """The end of a relay result the broker refused for good, cut short at each of its steps:
+    a start-up finishes it once, and nothing is posted again."""
+
+    def refused_for_good_until(self, step: str, before: bool) -> str:
+        ask = self.serve(voice_ask())
+        self.answer(ask)
+        self.broker.result = "400"
+        clock = [time.time()]
+        gw._delivery_core("relay").backend.clock = lambda: clock[0]
+        real = getattr(gw, step)
+
+        def dies(*a, **k):
+            if not before:
+                real(*a, **k)
+            raise _Crash(step)
+        with patch.object(gw, step, new=dies), self.assertRaises(_Crash):
+            for _pass in range(4):
+                self.drain()
+                clock[0] += 60.0
+        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+        self.assertEqual(gw._load_ack_first(), {ASK_A: ask}, "the mark went before the rest")
+        return ask
+
+    def assert_finished_by_a_start(self, ask: str) -> None:
+        with patch.multiple(gw, _SETTLE_PENDING=set(), _SETTLE_SCANNED=set(), _SETTLE_LOADED=False):
+            gw._reclaim_parked_relay_results(set(gw._load_inflight()))
+            self.assertEqual(gw._load_ack_first(), {})
+            self.assertNotIn(ask, gw._load_inflight())
+            self.assertIsNone(gw.find_task_file(gw.TASKS_DIR, ask), "the task was left in the queue")
+            self.assertEqual(len(self.quarantined()), 1)
+            self.assertFalse((gw.RESULTS_DIR / f"{ask}.txt").exists())
+            for _pass in range(3):
+                self.drain()
+        self.assertEqual(self.broker.results(), [ANSWER, FAILED], "posted again")
+        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+
+    def test_cut_short_before_the_quarantine(self):
+        self.assert_finished_by_a_start(self.refused_for_good_until("_dispose_terminal", before=True))
+
+    def test_cut_short_before_the_task_is_settled(self):
+        self.assert_finished_by_a_start(self.refused_for_good_until("_settle_task", before=True))
+
+    def test_cut_short_after_the_task_is_settled_before_the_ledger_is_saved(self):
+        ask = self.refused_for_good_until("_settle_task", before=False)
+        self.assertIn(ask, gw._load_inflight(), "the ledger was saved before the cut")
+        self.assert_finished_by_a_start(ask)
+
+    def test_cut_short_before_the_mark_is_retired(self):
+        ask = self.refused_for_good_until("_forget_ack_first", before=True)
+        self.assertNotIn(ask, gw._load_inflight())
+        self.assert_finished_by_a_start(ask)
+
+    def test_an_unreadable_alias_ledger_leaves_the_end_for_the_next_start(self):
+        ask = self.refused_for_good_until("_dispose_terminal", before=True)
+        gw.DEDUP_ALIAS_FILE.write_text("{not json")
+        gw._reclaim_parked_relay_results(set(gw._load_inflight()))
+        self.assertEqual(gw._load_ack_first(), {ASK_A: ask})
+        gw.DEDUP_ALIAS_FILE.unlink()
+        self.assert_finished_by_a_start(ask)
+
+
+class EndCutShortOnANamedInstance(EndCutShort):
+    INSTANCE = "dev"
+
+
 # ── through the real poll loop ───────────────────────────────────────────────
 
 class _Loop(unittest.TestCase):
@@ -839,6 +909,46 @@ class AfterADowngradeOnANamedInstance(AfterADowngrade):
     def test_the_older_bridge_restarted_and_the_mac_updated_a_day_later(self):
         # A named instance's local id starts with `task-`, so the older bridge settles it.
         self.assertEqual(self.run_case(restart=True, days_late=1.5), [self.local])
+
+
+class EndCutShortThroughTheLoop(_Loop):
+    """The same, with the real loop dying at each step and a fresh process starting."""
+
+    def cut_short_then_restarted(self, crash: str) -> None:
+        self.relay.on_result = lambda p: (400, {"error": "unknown task"})
+        self.relay.queue.append(voice_ask())
+        first = self.bridges.start(crash=crash)
+        self.bridges.wait_for((self.ws / "tasks" / f"{self.local}.txt").exists, first, "the relay ask published")
+        (self.results / f"{self.local}.txt").write_text(PRIVATE)
+        self.bridges.crashed(first, crash)
+        self.assertEqual(self.posted(), [ANSWER, FAILED])
+        self.assertEqual(self.state("remote-task-ack-first"), {ASK_A: self.local})
+        second = self.bridges.start()
+        self.bridges.wait_for(lambda: not self.state("remote-task-ack-first")
+                              and self.local not in self.state("remote-task-inflight"), second, "the end finished")
+        self.bridges.polls_after(second, 3)
+        self.bridges.stop(second)
+        self.assertEqual(self.posted(), [ANSWER, FAILED], "posted again after the restart")
+        record = item(self.outbox_root, ASK_A)
+        self.assertEqual((record["status"], record["reason"]), ("PARKED", gw.REFUSED_FOR_GOOD))
+        self.assertEqual(len(self.quarantined()), 1)
+        self.assertFalse((self.ws / "tasks" / f"{self.local}.txt").exists(), "the task was left in the queue")
+
+    def test_cut_short_before_the_quarantine(self):
+        self.cut_short_then_restarted("end:before-quarantine")
+
+    def test_cut_short_before_the_task_is_settled(self):
+        self.cut_short_then_restarted("end:before-settle")
+
+    def test_cut_short_after_the_task_is_settled(self):
+        self.cut_short_then_restarted("end:after-settle")
+
+    def test_cut_short_before_the_mark_is_retired(self):
+        self.cut_short_then_restarted("end:before-mark")
+
+
+class EndCutShortThroughTheLoopOnANamedInstance(EndCutShortThroughTheLoop):
+    INSTANCE = "dev"
 
 
 class OutsideTheInFlightSet(_Loop):
