@@ -895,18 +895,31 @@ class PersonalTest(unittest.TestCase):
         self.assertNotIn('class="roles"', gs.render_page("Blue", "codex", roles=[""]))
         self.assertNotIn('class="roles"', gs.render_page("Blue", "codex"))
         self.assertEqual(gs.tour_page.role_labels(["<script>", "ok_role", 7]), ["Ok Role"])
-        self.assertEqual(gs.tour_page.role_labels("researcher"), [])
+        self.assertEqual(gs.tour_page.role_labels(None), [])
+
+    def test_roles_take_the_first_contact_payload_as_given(self):
+        labels = gs.tour_page.role_labels
+        self.assertEqual(labels("Founder, Sales."), ["Founder", "Sales"])  # cinny-webclient#2231's line
+        self.assertEqual(labels("Product Manager, Designer."), ["Product Manager", "Designer"])
+        self.assertEqual(labels("founder,sales"), ["Founder", "Sales"])  # slugs, when labels were missing
+        self.assertEqual(labels("product-manager"), ["Product Manager"])
+        self.assertEqual(labels("Founder, founder, FOUNDER"), ["Founder"])  # de-duplicated, first kept
+        self.assertEqual(labels("<b>x</b>, " + "a" * 41 + ", ., , Sr. Engineer, R&D, Ingenier\u00eda"),
+                         ["Sr. Engineer", "R&D", "Ingenier\u00eda"])
+        self.assertEqual(len(labels(",".join(f"role{i}" for i in range(9)))), gs.tour_page.ROLES_MAX)
+        page = gs.render_page("Blue", "codex", roles="R&D, Product Manager.")
+        self.assertIn('<p class="roles">Picked for: R&amp;D, Product Manager</p>', page)
 
     def test_cli_passes_prompts_and_roles(self):
         with tempfile.TemporaryDirectory() as tmp:
             f = Path(tmp) / "p.json"
             f.write_text(json.dumps({"dm": "Draft my weekly update."}))
             done = subprocess.run([sys.executable, str(SCRIPT), "render", "--name", "Blue", "--core", "codex",
-                                   "--prompts", str(f), "--roles", "founder,researcher"],
+                                   "--prompts", str(f), "--roles", "Founder, Product Manager."],
                                   capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, gs.render_page("Blue", "codex", prompts={"dm": "Draft my weekly update."},
-                                                     roles=["founder", "researcher"]))
+                                                     roles=["Founder", "Product Manager"]))
 
 
 class MarkerTest(unittest.TestCase):

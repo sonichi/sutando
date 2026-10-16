@@ -451,7 +451,8 @@ def _workspace() -> Path:
 def _personal_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prompts", type=Path, help="JSON object of tailored prompts by slot ("
                         + ", ".join(PROMPT_SLOTS) + "); bad or missing entries keep the default")
-    parser.add_argument("--roles", default="", help="the owner's onboarding roles, comma-separated slugs")
+    parser.add_argument("--roles", default="", help="the first-contact \"I picked: ...\" payload as given, "
+                        "e.g. \"Founder, Product Manager.\" (labels, or slugs)")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -495,7 +496,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.command == "render":
             core = detect_core() if args.core == "auto" else args.core
             sys.stdout.write(render_page(name, core, args.audience, None, load_prompts(args.prompts),
-                                         args.roles.split(",")))
+                                         args.roles))
             return 0
     except ValueError as exc:
         print(f"getting_started: {exc}", file=sys.stderr)
@@ -509,7 +510,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                          name, args.owner, args.summon,
                          detect_core() if args.core == "auto" else args.core, args.audience,
                          args.agent_mxid or agent_mxid() or None, load_prompts(args.prompts),
-                         args.roles.split(","))
+                         args.roles)
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": str(exc)}))
         return 4

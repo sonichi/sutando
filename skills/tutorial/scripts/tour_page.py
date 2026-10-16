@@ -99,7 +99,9 @@ FINALE_PROMPT = "Help me plan my week."
 PROMPT_SLOTS = ("dm", "commons", "teamwork", "apps", "import", "finale")
 PROMPT_MAX = 200
 BAD_PROMPT = re.compile(r"[\r\n<>]|://|\bwww\.", re.I)
-ROLE_SLUG = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
+ROLE_SLUG = re.compile(r"[a-z0-9][a-z0-9_-]*")
+ROLE_TEXT = re.compile(r"[\w &'.-]{1,40}")
+ROLES_MAX = 6
 AUDIENCES = ("dm", "room")
 WHERE = {"dm": "your DM", "room": "a room"}
 ASSETS = Path(__file__).resolve().parent.parent / "assets"  # lint-workspace-resolution: allow-repo-root
@@ -233,11 +235,25 @@ def clean_prompts(raw: object) -> Dict[str, str]:
 
 
 def role_labels(roles: object) -> List[str]:
-    """Display labels for the onboarding role slugs: `product-manager` reads `Product Manager`."""
+    """Display labels from the first-contact "I picked: ..." payload, as given: a comma-separated
+    string (or a list) of persona labels, or slugs when the client had no labels. A slug such as
+    `product-manager` reads `Product Manager`; a label keeps its own words. Junk is dropped."""
+    if isinstance(roles, str):
+        roles = roles.split(",")
     if not isinstance(roles, (list, tuple)):
         return []
-    slugs = [r.strip().lower() for r in roles if isinstance(r, str) and ROLE_SLUG.fullmatch(r.strip().lower())]
-    return [" ".join(w.capitalize() for w in re.split(r"[-_]", s) if w) for s in dict.fromkeys(slugs)][:6]
+    out: Dict[str, str] = {}
+    for raw in roles:
+        if not isinstance(raw, str):
+            continue
+        text = " ".join(raw.split())
+        text = " ".join(text[:-1].split()) if text.endswith(".") else text
+        if not ROLE_TEXT.fullmatch(text) or not any(ch.isalnum() for ch in text):
+            continue
+        if ROLE_SLUG.fullmatch(text):
+            text = " ".join(w.capitalize() for w in re.split(r"[-_]", text) if w)
+        out.setdefault(text.casefold(), text)
+    return list(out.values())[:ROLES_MAX]
 
 
 def _section(sec: Section, first: bool, who: str, prompts: Dict[str, str]) -> str:

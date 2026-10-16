@@ -38,8 +38,9 @@ not retry the page in the same turn.
 
    Your mxid is `$AGENT_MXID`, else the AG2 Space channel env file's, else `--agent-mxid`.
 2. Tailor the prompts when you know the owner's work. You know it when either:
-   - the first-contact message names their onboarding roles (a line such as "I picked:
-     researcher, founder"), or
+   - the first-contact message ends with a line `I picked: <labels>.`, for example
+     `I picked: Founder, Product Manager.`. These are the persona labels the owner chose at
+     onboarding, or their slugs when the client had no labels; or
    - `user_profile.md` already says what they do.
 
    In that case write your own prompts for this owner into a temporary JSON file, one per slot:
@@ -48,8 +49,9 @@ not retry the page in the same turn.
    - Each must run on a fresh install: only the `apps` slot may assume a connected app.
    - The slot decides where the prompt is pasted (your DM or a room), not the wording.
 
-   Pass the file as `--prompts <file>` and any role slugs as `--roles researcher,founder`; the
-   roles add a "Picked for: Researcher, Founder" line under the heading. Otherwise leave both
+   Pass the file as `--prompts <file>`, and pass the `I picked:` payload verbatim as
+   `--roles "Founder, Product Manager."`. Do not map it to slugs; the script takes labels or slugs
+   and adds a "Picked for: Founder, Product Manager" line under the heading. Otherwise leave both
    out. A missing, bad or partly bad file never fails the run: each slot without a usable prompt
    keeps the generic one.
 3. Create or refresh the page and summon the owner to it:
