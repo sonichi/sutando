@@ -451,6 +451,8 @@ VOICE_OUTCOME_CONTRACT = "voice-outcome-v1"
 _POLL_PROOF = f"&capabilities={VOICE_OUTCOME_CONTRACT}"
 # The only source the broker serves with `ack_first`.
 _VOICE_ASK_SOURCE = "matrixrtc-voice"
+# The lane's `ask_sutando` correlation ids, under which a relay ask is served.
+_RELAY_ASK_PREFIX = "ask-"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
@@ -4344,7 +4346,7 @@ def _load_ack_first() -> "dict | None":
     try:
         loaded = json.loads(ACK_FIRST_FILE.read_text())
     except (OSError, ValueError) as exc:
-        _log(f"ack_first marks unreadable ({exc}) — deferring")
+        _log_backoff(("ack-first-marks",), f"ack_first marks unreadable ({exc}) — deferring")
         return None
     return loaded if isinstance(loaded, dict) else None
 
@@ -6014,9 +6016,13 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         # with an idempotent provider nothing parks on ambiguity.
         record = read_item(core.backend.root, item_id) or {}
         retry = record.get("retry", {})
-        _log(f"result {tid}: pending retry or delivery claim "
-             f"(attempts={core.backend.attempts(item_id)}, "
-             f"next={retry.get('next_attempt_at')}, deadline={retry.get('deadline')})")
+        line = (f"result {tid}: pending retry or delivery claim "
+                f"(attempts={core.backend.attempts(item_id)}, "
+                f"next={retry.get('next_attempt_at')}, deadline={retry.get('deadline')})")
+        if relay:
+            _log_backoff((item_id, "pending"), line)    # no ceiling: not once a second
+        else:
+            _log(line)
         return False
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
         root = getattr(core.backend, "root", None)
@@ -6041,25 +6047,42 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         _dispose_terminal(core, item_id, tid, record, result_file, generation)
         return False
     retry = record.get("retry", {})
-    _log(f"result POST not confirmed for {tid} "
-         f"({res.outcome.value if res.outcome else '?'}: {res.detail}) — "
-         f"status={record.get('status')}, reason={record.get('reason')}, "
-         f"next={retry.get('next_attempt_at')}, deadline={retry.get('deadline')}")
+    line = (f"result POST not confirmed for {tid} "
+            f"({res.outcome.value if res.outcome else '?'}: {res.detail}) — "
+            f"status={record.get('status')}, reason={record.get('reason')}, "
+            f"next={retry.get('next_attempt_at')}, deadline={retry.get('deadline')}")
+    if relay:
+        _log_backoff((item_id, "unconfirmed"), line)
+    else:
+        _log(line)
     return False
 
 
 def _relay_result(tid: str, broker_id: str) -> "bool | None":
     """Whether a result posted under `broker_id` answers a task served with `ack_first`
-    (its mark is kept), so its delivery has no ceiling. None while the marks cannot be read
-    and `tid` is a voice ask, which then waits; only a voice ask can carry a mark, so every
-    other task goes on under today's policy. A re-ask answers under its original's id."""
+    (its mark is kept), so its delivery has no ceiling. A re-ask answers under its
+    original's id. None while the marks cannot be read and the task may be marked, which
+    then waits. Only a voice ask (`ask-…`, the lane's `ask_sutando` id) can be: the
+    session-end task (`voice-end-…`) and every other task go on under today's policy."""
     marks = _load_ack_first()
     if marks is None:
-        if _task_source(tid) != _VOICE_ASK_SOURCE:
+        if not (broker_id.startswith(_RELAY_ASK_PREFIX) and _task_source(tid) == _VOICE_ASK_SOURCE):
             return False
-        _log(f"delivery deferred for {tid} — ack_first marks unreadable")
+        _log_backoff((tid, "deferred"), f"delivery deferred for {tid} — ack_first marks unreadable")
         return None
     return broker_id in marks
+
+
+# Times each waiting line recurred in this process, for `_log_backoff`.
+_LOG_COUNTS: "dict[tuple, int]" = {}
+
+
+def _log_backoff(key: tuple, line: str) -> None:
+    """Log `line` the 1st, 2nd, 4th, 8th ... time `key` recurs in this process, with the count:
+    a wait with no ceiling would otherwise log every second for as long as it lasts."""
+    n = _LOG_COUNTS[key] = _LOG_COUNTS.get(key, 0) + 1
+    if not n & (n - 1):
+        _log(line + (f" (seen {n} times)" if n > 1 else ""))
 
 
 def _reopen_relay_result(core, item_id: str, tid: str, record: dict) -> None:
@@ -6480,6 +6503,39 @@ def _quarantine_orphan(rfile, tid: str, reason: str, generation) -> bool:
                           generation)
 
 
+def _relay_orphan(tid: str, inflight: "set[str]") -> "bool | None":
+    """A result outside the in-flight set that answers a relay ask: True once its id is back
+    in flight, None while that cannot be told for a voice ask, False for any other result."""
+    delivery = _delivery_tid(tid)
+    if delivery is None:
+        return None if _task_source(tid) == _VOICE_ASK_SOURCE else False
+    relay = _relay_result(tid, _broker_tid(delivery))
+    if relay and _track_durably(tid, inflight):
+        _log(f"orphan sweep: {tid} answers a relay ask — back in flight for the drain, not handled here")
+    return relay
+
+
+def _keep_relay_results_in_flight(inflight: "set[str]") -> bool:
+    """Put back in flight each live result a kept mark names, a re-ask's included, so the
+    drain posts it under the relay rule. Its id leaves flight when the task is dropped as
+    abandoned before the result lands, or when the ledger is lost; on the primary lane no
+    other pass ever reads an `ask-…` result. True when an id was added."""
+    marks = _load_ack_first()
+    if not marks:
+        return False
+    aliases = _load_dedup_aliases() or {}
+    added = False
+    for broker_id, local in sorted(marks.items()):
+        if not (_valid_tid(broker_id) and isinstance(local, str) and _valid_local_tid(local)):
+            continue
+        answers = {local} | {k for k, v in aliases.items() if v == local and _valid_local_tid(k)}
+        for tid in sorted(answers - set(inflight)):
+            if os.path.lexists(RESULTS_DIR / f"{tid}.txt") and _track_durably(tid, inflight):
+                _log(f"result {tid}: a relay ask's result outside the in-flight set — back in flight")
+                added = True
+    return added
+
+
 def _reconcile_orphan_results(inflight: "set[str]") -> None:
     global _last_orphan_sweep
     now = time.time()
@@ -6494,6 +6550,10 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
     for rfile in candidates:
         tid = rfile.stem
         if not _valid_local_tid(tid) or tid in inflight:
+            continue
+        # Before any orphan policy: a relay ask's result goes back in flight for the drain,
+        # and waits while that cannot be told; it is never relabelled or quarantined here.
+        if _relay_orphan(tid, inflight) is not False:
             continue
         task = find_task_file(TASKS_DIR, tid) or _archived_task_file(tid)
         if task is not None:
@@ -6615,11 +6675,6 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         if _delivery_core().backend.is_terminal(_item):
             if _settle_delivered(tid, _btid, rfile, inflight):
                 _save_inflight(inflight)        # disposed and logged by the delivery call
-            continue
-        if _item == _btid and _relay_result(tid, _btid):
-            # Kept in flight, where the drain retries it until it is accepted: a later
-            # sweep would quarantine it once it is a day old.
-            _log(f"orphan sweep: {tid} is a relay ask's result, not confirmed — kept in flight")
             continue
         inflight.discard(tid)                   # a retryable failure: the sweep tries again
         _save_inflight(inflight)
@@ -6884,6 +6939,7 @@ def main() -> None:
     try:
         # Before the drain and the orphan sweep, so the body is back in flight under its id.
         _reclaim_parked_relay_results(inflight)
+        _keep_relay_results_in_flight(inflight)
     except Exception as e:  # noqa: BLE001 — a parked result left behind waits for the next start
         _log(f"relay result reclaim failed ({type(e).__name__}: {e}) — continuing")
     abandoned_suspects: set[str] = set()
@@ -6978,6 +7034,8 @@ def main() -> None:
             if added:
                 wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
+            if _keep_relay_results_in_flight(inflight):
+                wake_outbound()
             _reconcile_orphan_results(inflight)
             _post_heartbeat(inflight)
             # The pool's advertisement rides the same beat: push-on-change, never

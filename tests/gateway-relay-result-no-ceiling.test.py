@@ -46,15 +46,17 @@ sys.path.insert(0, str(_TESTS))
 from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
 _GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
-from _helpers import older_bridge  # noqa: E402
-from _helpers.gateway_relay import Bridges, Relay  # noqa: E402
+from _helpers import gateway_relay, older_bridge  # noqa: E402
 from ag2_sparrow import gateway_instance, outbox, remote_gateway_bridge as gw  # noqa: E402
+
+Bridges, Relay = gateway_relay.Bridges, gateway_relay.Relay
 
 CONTRACT = ["voice-outcome-v1"]
 OWNER = "@owner:ag2.space"
 ROOM = "!room:ag2.space"
 ASK_A = "ask-5f3c9e0a1b2c"
 TYPED_A = "task-22d83e59601f3a1fef"
+SESSION_END = "voice-end-0123456789abcdef01234567"
 EMPTY_HOLDER = "task-0e5d1c2b3a4f5e6d7c"
 PRIVATE, TEXT = "[dm-only]\nYour 3pm is with Dana.", "Your 3pm is with Dana."
 ANSWER = {"id": ASK_A, "body": TEXT, "capabilities": CONTRACT, "dm_only": True}
@@ -148,6 +150,7 @@ class _Bridge(unittest.TestCase):
             _fire_on_task=lambda *a, **k: None,
             _WITHHELD_TASK_OUTPUT={}, _SETTLE_PENDING=set(), _SETTLE_SCANNED=set(),
             _SETTLE_LOADED=False, _REDELIVERED=set(), _HELD_TASKS={}, _HELD_REPORTED=set(),
+            _LOG_COUNTS={},
             **{name: state / f"{stem}{suffix}.json" for name, stem in _LEDGERS.items()})
         stack = contextlib.ExitStack()
         for name, value in values.items():
@@ -234,6 +237,10 @@ class TheRule(_Bridge):
         self.assertEqual(relay_posts, [ANSWER] + [FAILED] * 7, "the answer was sent more than once")
         self.assertEqual(sum("is sent in its place" in line for line in self.lines), 1,
                          "a refused `failed` was swapped again")
+        # Eight misses log on a backoff (the 1st, 2nd, 4th, 8th), not each one; a typed result as before.
+        unconfirmed = [line for line in self.lines if line.startswith("result POST not confirmed for ask-")]
+        self.assertEqual([line.rsplit("(seen ", 1)[-1] for line in unconfirmed[1:]],
+                         ["2 times)", "4 times)", "8 times)"])
         self.broker.result = "ok"
         self.assertNotIn(ask, self.drain())
         self.assertEqual(self.broker.results()[-1], FAILED)
@@ -254,45 +261,133 @@ class TheRule(_Bridge):
         self.assertEqual((record["status"], record["reason"]), ("PARKED", "permanent-refusal"))
         self.assertEqual([p.get("status") for p in self.broker.results()], [None, None])
 
-    def test_unreadable_marks_hold_a_voice_asks_result_and_never_a_typed_one(self):
+    def test_unreadable_marks_hold_only_a_result_that_may_be_a_relay_asks(self):
         ask = self.serve(voice_ask())
         typed = self.serve(typed_task())
+        # Sutando's session-end note: a voice task too, but never a relay ask.
+        end = self.serve({**typed_task(SESSION_END), "source": "matrixrtc-voice", "priority": "low"})
         gw.ACK_FIRST_FILE.write_text("{not json")
         self.answer(ask)
         self.answer(typed, "A collaborative workspace.")
-        self.drain()
-        self.assertEqual([p["id"] for p in self.broker.results()], [TYPED_A])
+        self.answer(end, "Noted the call.")
+        for _pass in range(5):
+            self.drain()
+        self.assertEqual(sorted(p["id"] for p in self.broker.results()), sorted([SESSION_END, TYPED_A]))
         self.assertIsNone(item(self.outbox_root, ASK_A).get("status"), "published without its rule")
-        self.assertIn(f"delivery deferred for {ask} — ack_first marks unreadable", self.lines)
+        deferred = [line for line in self.lines if line.startswith(f"delivery deferred for {ask}")]
+        self.assertEqual(len(deferred), 3, "the wait is not logged on a backoff (passes 1, 2 and 4)")
+        unreadable = [line for line in self.lines if line.startswith("ack_first marks unreadable")]
+        self.assertTrue(1 <= len(unreadable) <= 5, f"not on a backoff: {len(unreadable)} lines")
         gw.ACK_FIRST_FILE.write_text(json.dumps({ASK_A: ask}))
         self.drain()
         self.assertEqual(self.broker.results()[-1], ANSWER)
+
+    def test_a_re_asks_answer_outside_the_ledger_goes_back_in_flight(self):
+        ask = self.serve(voice_ask())
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        (gw.ARCHIVE_RESULTS_DIR / f"{EMPTY_HOLDER}-1785976425.txt").write_text("")
+        self.answer(ask, f"[deduped: {EMPTY_HOLDER}]")
+        self.drain()
+        reask = gw._reask_id(ask)
+        gw._save_inflight(set())                     # the re-ask left the ledger
+        self.answer(reask)
+        inflight: "set[str]" = set()
+        self.assertTrue(gw._keep_relay_results_in_flight(inflight))
+        self.assertEqual((inflight, gw._load_inflight()), ({reask}, {reask}))
+        gw._post_ready_results(inflight)
+        self.assertEqual(self.broker.results(), [ANSWER])
+        self.assertFalse(gw._keep_relay_results_in_flight(set()), "a delivered result was put back")
+
+    def test_a_wait_inside_the_backoff_is_logged_on_a_backoff(self):
+        ask = self.serve(voice_ask())
+        typed = self.serve(typed_task())
+        self.answer(ask)
+        self.answer(typed, "A collaborative workspace.")
+        self.broker.result = "down"
+        self.drain()                                 # one failed send each, then their backoff
+        now = time.time()
+        gw._delivery_core("relay").backend.clock = lambda: now
+        gw._delivery_core().backend.clock = lambda: now
+        for _pass in range(8):
+            self.drain()
+        waits = [line for line in self.lines if line.startswith(f"result {ask}: pending retry")]
+        self.assertEqual(len(waits), 4, "not the 1st, 2nd, 4th and 8th wait")
+        typed_waits = [line for line in self.lines if line.startswith(f"result {typed}: pending retry")]
+        self.assertEqual(len(typed_waits), 8, "a typed result's wait is no longer logged as before")
+
+    def transient_failures_keep_the_same_result(self, answer: str) -> None:
+        ask = self.serve(voice_ask())
+        self.answer(ask)
+        self.broker.result = answer
+        self.drain()
+        age_retry(self.outbox_root, ASK_A, 700)              # failing past the 10-minute window
+        self.drain()
+        record = item(self.outbox_root, ASK_A)
+        self.assertEqual((record["status"], json.loads(record["payload"])), ("READY", ANSWER))
+        self.assertNotIn("requeue_reason", record, "it was parked on the way")
+        self.broker.result = "ok"
+        gw._delivery_core("relay").backend.clock = lambda: time.time() + 60.0
+        self.drain()
+        self.assertEqual(self.broker.results(), [ANSWER] * 3)
+
+
+for _answer in ("408", "425", "429", "502", "down"):
+    setattr(TheRule, f"test_a_{_answer}_keeps_the_same_result_past_the_window",
+            lambda self, answer=_answer: self.transient_failures_keep_the_same_result(answer))
 
 
 class TheRuleOnANamedInstance(_Bridge):
     INSTANCE = "dev"
 
-    def test_the_orphan_sweep_keeps_a_relay_result_in_flight(self):
+    def outside_the_in_flight_set(self, age: float) -> "tuple[str, str]":
         ask = self.serve(voice_ask())
         typed = self.serve(typed_task())
         gw._save_inflight(set())                     # the ledger lost both; only the sweep looks
         for tid in (ask, typed):
             self.answer(tid)
-            landed = time.time() - 3600
+            landed = time.time() - age
             os.utime(gw.RESULTS_DIR / f"{tid}.txt", (landed, landed))
-        self.broker.result = "503"
         inflight: "set[str]" = set()
         with patch.object(gw, "_last_orphan_sweep", 0.0):
             gw._reconcile_orphan_results(inflight)
-        self.assertEqual(inflight, {ask}, "a typed result is kept or a relay result dropped")
+        self.assertEqual(inflight, {ask})
         self.assertEqual(gw._load_inflight(), {ask})
-        self.broker.result = "ok"
-        gw._delivery_core("relay").backend.clock = lambda: time.time() + 60.0   # past its backoff
+        self.assertTrue((gw.RESULTS_DIR / f"{ask}.txt").exists(), "the sweep moved the relay result")
+        self.assertNotIn(ASK_A, [p["id"] for p in self.broker.results()], "the sweep posted it")
         gw._post_ready_results(inflight)
-        self.assertEqual([p["id"] for p in self.broker.results()].count(ASK_A), 2)
-        self.assertEqual(self.broker.results()[-1]["body"], gw._RECOVERED_LABEL + TEXT,
-                         "the drain did not resend the sweep's stored payload")
+        self.assertEqual([p for p in self.broker.results() if p["id"] == ASK_A], [ANSWER],
+                         "not posted once by the drain, unlabelled")
         self.assertEqual(item(self.outbox_root, ASK_A)["status"], "DELIVERED")
+        return ask, typed
+
+    def test_the_orphan_sweep_never_relabels_a_relay_result(self):
+        _ask, typed = self.outside_the_in_flight_set(age=3600.0)
+        # A typed result in the same state keeps today's labelled recovery.
+        self.assertEqual([p["body"] for p in self.broker.results() if p["id"] == TYPED_A],
+                         [gw._RECOVERED_LABEL + TEXT])
+
+    def test_the_orphan_sweep_never_quarantines_a_day_old_relay_result(self):
+        _ask, typed = self.outside_the_in_flight_set(age=1.5 * DAY)
+        self.assertEqual([n.split(".")[1] for n in self.quarantined()], ["too-old"])
+        self.assertTrue(self.quarantined()[0].startswith(typed))
+
+    def unreadable_then_swept(self, ledger) -> None:
+        ask = self.serve(voice_ask())
+        gw._save_inflight(set())
+        self.answer(ask)
+        landed = time.time() - 1.5 * DAY
+        os.utime(gw.RESULTS_DIR / f"{ask}.txt", (landed, landed))
+        ledger.write_text("{not json")
+        with patch.object(gw, "_last_orphan_sweep", 0.0):
+            gw._reconcile_orphan_results(set())
+        self.assertTrue((gw.RESULTS_DIR / f"{ask}.txt").exists())
+        self.assertEqual((self.quarantined(), self.broker.results()), ([], []))
+
+    def test_while_the_marks_cannot_be_read_the_sweep_leaves_a_voice_asks_result(self):
+        self.unreadable_then_swept(gw.ACK_FIRST_FILE)
+
+    def test_while_the_alias_ledger_cannot_be_read_the_sweep_leaves_a_voice_asks_result(self):
+        self.unreadable_then_swept(gw.DEDUP_ALIAS_FILE)
 
 
 class TheReclaim(_Bridge):
@@ -566,6 +661,8 @@ class AfterADowngrade(_Loop):
         updated = self.bridges.start()
         self.bridges.wait_for(lambda: self.relay.results, updated, "the reclaimed result accepted")
         self.bridges.wait_for(lambda: not self.state("remote-task-ack-first"), updated, "its mark retired")
+        self.bridges.wait_for(lambda: self.local not in self.state("remote-task-inflight"), updated,
+                              "out of flight")
         self.bridges.polls_after(updated, 3)
         self.bridges.stop(updated)
         # Posted once, under the relay ask's id, with the older bridge's stored payload: no
@@ -599,6 +696,60 @@ class AfterADowngradeOnANamedInstance(AfterADowngrade):
     def test_the_older_bridge_restarted_and_the_mac_updated_a_day_later(self):
         # A named instance's local id starts with `task-`, so the older bridge settles it.
         self.assertEqual(self.run_case(restart=True, days_late=1.5), [self.local])
+
+
+class OutsideTheInFlightSet(_Loop):
+    """A relay ask's result whose id left the in-flight set is posted by the drain, once and
+    unlabelled, never handled by the orphan sweep (which reads only `task-*` names, so on
+    the primary lane nothing else would ever post it)."""
+
+    def assert_posted_once_by_the_drain(self, bridge) -> None:
+        self.bridges.wait_for(lambda: self.relay.results, bridge, "the relay result accepted")
+        self.bridges.wait_for(lambda: not self.state("remote-task-ack-first"), bridge, "its mark retired")
+        self.bridges.polls_after(bridge, 3)
+        self.bridges.stop(bridge)
+        self.assertEqual(self.relay.results, [ANSWER], "relabelled, or not posted exactly once")
+        self.assertEqual([p for p, _b in self.relay.posted], [ANSWER])
+        self.assertEqual(self.quarantined(), [], "quarantined as an orphan")
+        self.assertEqual(self.archived(self.local), [PRIVATE])
+
+    def lands(self, days_late: float) -> None:
+        rfile = self.results / f"{self.local}.txt"
+        rfile.write_text(PRIVATE)
+        if days_late:
+            landed = time.time() - days_late * DAY
+            os.utime(rfile, (landed, landed))
+
+    def lost_from_the_ledger_then_restarted(self, days_late: float) -> None:
+        self.bridges.stop(self.serve(voice_ask()))
+        suffix = f".{self.INSTANCE}" if self.INSTANCE else ""
+        (self.ws / "state" / f"remote-task-inflight{suffix}.json").write_text("[]")
+        self.lands(days_late)
+        self.assert_posted_once_by_the_drain(self.bridges.start())
+        self.assertEqual(self.logged("(restored 1 in-flight)"), 1, "not back in flight at start")
+
+    def test_a_fresh_result_outside_the_ledger_after_a_restart(self):
+        self.lost_from_the_ledger_then_restarted(days_late=0.0)
+
+    def test_a_day_old_result_outside_the_ledger_after_a_restart(self):
+        self.lost_from_the_ledger_then_restarted(days_late=1.5)
+
+    def test_a_result_that_lands_after_its_id_was_dropped_as_abandoned(self):
+        bridge = self.serve(voice_ask())
+        # The task left the queue long ago with no result: two passes later the id is dropped.
+        archive = self.ws / "tasks" / "archive"
+        archive.mkdir(parents=True, exist_ok=True)
+        moved = archive / f"{self.local}.txt"
+        (self.ws / "tasks" / f"{self.local}.txt").rename(moved)
+        long_ago = time.time() - 7200
+        os.utime(moved, (long_ago, long_ago))
+        self.bridges.wait_logged(bridge, f"dropped abandoned in-flight id {self.local}")
+        self.lands(days_late=1.5)
+        self.assert_posted_once_by_the_drain(bridge)
+
+
+class OutsideTheInFlightSetOnANamedInstance(OutsideTheInFlightSet):
+    INSTANCE = "dev"
 
 
 class BridgeImportIsHermetic(unittest.TestCase):
