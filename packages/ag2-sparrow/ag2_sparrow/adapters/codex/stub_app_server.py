@@ -67,7 +67,7 @@ for line in sys.stdin:
             continue
         if meth == "thread/resume" and tid.startswith("hang-"):
             continue   # never answers: the client's timeout must fall back
-        THREADS[tid] = {"cwd": p.get("cwd", "/"), "params": p}
+        THREADS[tid] = {"cwd": p.get("cwd", "/"), "params": p, "emptied": THREADS.get(tid, {}).get("emptied")}
         send({"jsonrpc": "2.0", "id": rid, "result": {"thread": thread_obj(tid), "model": p.get("model") or "stub-model",
                                                       "modelProvider": "stub", "cwd": THREADS[tid]["cwd"],
                                                       "approvalPolicy": "never", "sandbox": "read-only", "approvalsReviewer": None}})
@@ -80,7 +80,13 @@ for line in sys.stdin:
         tid = p["threadId"]
         turn_id = str(uuid.uuid4())
         text = next((i.get("text", "") for i in p.get("input", []) if i.get("type") == "text"), "")
-        reply = "STUB echo: " + (text.strip().split("\n")[0][:80])
+        tp = THREADS[tid]["params"]
+        # The echo names the thread's settings, so a test can pin sandbox and lifetime.
+        reply = "STUB echo: " + (text.strip().split("\n")[0][:80]) + " [sandbox=%s ephemeral=%s]" % (
+            tp.get("sandbox"), tp.get("ephemeral"))
+        if "[[empty]]" in text:
+            reply = "" if not THREADS[tid].get("emptied") else "STUB second try"
+            THREADS[tid]["emptied"] = True
         send({"jsonrpc": "2.0", "id": rid, "result": {"turn": {"id": turn_id, "status": "inProgress", "items": []}}})
         send({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": tid, "turn": {"id": turn_id, "status": "inProgress", "items": []}}})
         item_id = str(uuid.uuid4())
