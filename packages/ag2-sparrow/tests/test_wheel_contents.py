@@ -20,7 +20,9 @@ PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = PKG_ROOT / "ag2_sparrow"
 # Non-Python files the code reads at run time (package-data in pyproject.toml).
 DATA_FILES = ("ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh",
-              "ag2_sparrow/adapters/hatch/hook-definition.json")
+              "ag2_sparrow/adapters/hatch/hook-definition.json",
+              "ag2_sparrow/adapters/claude_routine/routine-prompt.md",
+              "ag2_sparrow/adapters/claude_routine/README.md")
 
 
 def _expected_packages():

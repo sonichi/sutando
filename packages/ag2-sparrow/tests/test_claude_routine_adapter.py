@@ -8,6 +8,7 @@ import http.server
 import io
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -248,38 +249,79 @@ class FireLoopTest(unittest.TestCase):
             run_adapter(d, base, once=1)
             self.assertIn("(HTTP 400, error)", result(d, "task-f"))
 
-    def test_5xx_retries_with_backoff_then_succeeds(self):
-        with tempfile.TemporaryDirectory() as d, fake_server([err(500, "api_error"), err(503, "overloaded_error"),
-                                                              ok(3)]) as (srv, base):
+    def test_503_with_retry_after_is_retried_then_succeeds(self):
+        busy = err(503, "overloaded_error", {"Retry-After": "5"})
+        with tempfile.TemporaryDirectory() as d, fake_server([busy, busy, ok(3)]) as (srv, base):
             write_task(d, "task-5", "x")
             clock = FakeClock()
             run_adapter(d, base, clock=clock, once=1, backoff=2, backoff_max=3)
             self.assertEqual(len(srv.requests), 3)
             self.assertIn("session_3", result(d, "task-5"))
-            self.assertGreaterEqual(sum(clock.sleeps), 2 + 3)
+            self.assertGreaterEqual(sum(clock.sleeps), 5 + 5)
 
-    def test_5xx_gives_up_after_max_retries(self):
-        with tempfile.TemporaryDirectory() as d, fake_server([err(502, "api_error")]) as (srv, base):
+    def test_503_gives_up_after_max_retries(self):
+        with tempfile.TemporaryDirectory() as d, fake_server([err(503, "overloaded_error", {"Retry-After": "1"})]) as (srv, base):
             write_task(d, "task-5", "x")
-            run_adapter(d, base, once=1, max_retries=2, backoff=1)
-            self.assertEqual(len(srv.requests), 3)
-            self.assertEqual(result(d, "task-5"), "The cloud agent could not be reached for this message after several tries (502).\n")
+            run_adapter(d, base, once=1, backoff=1)
+            self.assertEqual(len(srv.requests), 3, "default --max-retries is 2")
+            self.assertEqual(result(d, "task-5"), "The cloud agent could not be reached for this message after several tries (503).\n")
 
-    def test_network_error_is_retried(self):
+    def test_ambiguous_5xx_is_never_retried(self):
+        for status in (500, 502, 504, 503):
+            with tempfile.TemporaryDirectory() as d, fake_server([err(status, "api_error"), ok()]) as (srv, base):
+                write_task(d, "task-5", "x")
+                run_adapter(d, base, once=1)
+                self.assertEqual(len(srv.requests), 1, status)
+                self.assertEqual(result(d, "task-5"), "This message may or may not have reached the cloud agent "
+                                                      "(%d); it was not retried.\n" % status)
+
+    def run_with_opener(self, exc, **kw):
         calls = []
 
         def opener(req, timeout):
             calls.append(req)
-            raise urllib.error.URLError("refused")
+            raise exc
         clock = FakeClock()
         with tempfile.TemporaryDirectory() as d:
             write_task(d, "task-n", "x")
-            ad = ra.Adapter(args_for(d, "http://127.0.0.1:9", max_retries=1, backoff=1), TOKEN, opener=opener,
+            ad = ra.Adapter(args_for(d, "http://127.0.0.1:9", backoff=1, **kw), TOKEN, opener=opener,
                             clock=clock, sleep=clock.sleep, note=NOTE)
             with contextlib.redirect_stderr(io.StringIO()):
                 ad.serve()
-            self.assertEqual(len(calls), 2)
-            self.assertIn("(URLError)", result(d, "task-n"))
+            return len(calls), result(d, "task-n")
+
+    def test_refused_and_dns_failure_are_retried(self):
+        for exc, name in ((urllib.error.URLError(ConnectionRefusedError()), "ConnectionRefusedError"),
+                          (urllib.error.URLError(socket.gaierror(8, "x")), "gaierror")):
+            n, body = self.run_with_opener(exc, max_retries=1)
+            self.assertEqual(n, 2)
+            self.assertIn("after several tries (%s)" % name, body)
+
+    def test_timeout_and_reset_are_ambiguous_and_not_retried(self):
+        for exc in (TimeoutError("read"), socket.timeout("read"), urllib.error.URLError(socket.timeout()),
+                    ConnectionResetError(), urllib.error.URLError("other")):
+            n, body = self.run_with_opener(exc)
+            self.assertEqual(n, 1, exc)
+            self.assertIn("may or may not have reached the cloud agent", body)
+
+    def test_repeated_429_gives_up_and_the_hold_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as d, fake_server([err(429, "rate_limit_error", {"Retry-After": "600"})]) as (srv, base):
+            write_task(d, "task-r", "x")
+            clock = FakeClock()
+            run_adapter(d, base, clock=clock, once=1, max_rate_limited=2)
+            self.assertEqual(len(srv.requests), 2)
+            self.assertEqual(result(d, "task-r"), "The cloud agent is over its hourly limit, so this message was not sent to it.\n")
+            ad = ra.Adapter(args_for(d, base), TOKEN, clock=clock, sleep=clock.sleep, note=NOTE)
+            self.assertEqual(ad.blocked_until, clock.t + 600)
+            clock.t -= 2 * 3600
+            ad = ra.Adapter(args_for(d, base), TOKEN, clock=clock, sleep=clock.sleep, note=NOTE)
+            self.assertEqual(ad.blocked_until, 0.0, "a hold beyond an hour away is from a stepped clock")
+
+    def test_echo_mode_keeps_the_url_out_of_non_owner_rooms(self):
+        with tempfile.TemporaryDirectory() as d, fake_server([ok(9)]) as (_, base):
+            write_task(d, "task-g", "x", tier="team")
+            run_adapter(d, base, once=1, result_mode="echo")
+            self.assertTrue(result(d, "task-g").startswith("[no-send]\n"))
 
     def test_task_without_room_is_not_fired(self):
         with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (srv, base):
@@ -321,6 +363,9 @@ class FireLoopTest(unittest.TestCase):
             self.assertEqual(again.wait_seconds(), 3600)
             clock.t += 3601
             self.assertEqual(again.wait_seconds(), 0)
+            clock.t -= 2 * 3600
+            lim.record()
+            self.assertEqual(len(lim.times), 1, "entries dated in the future are dropped")
             Path(path).write_text("{bad")
             self.assertEqual(ra.RateLimiter(path, 2, clock).times, [])
 
@@ -367,6 +412,8 @@ class MainTest(unittest.TestCase):
             write_task(d, "task-m", "x")
             env = {"CLAUDE_ROUTINE_TOKEN": TOKEN}
             argv = ["--work", d, "--trigger-id", TRIGGER, "--api-base", base, "--once", "1", "--poll", "0.01"]
+            self.assertEqual(self.run_main(argv, env)[0], 2, "http is refused by default")
+            argv.append("--allow-insecure-api-base")
             rc, out = self.run_main(argv, env)
             self.assertEqual(rc, 0)
             self.assertNotIn(TOKEN, out)

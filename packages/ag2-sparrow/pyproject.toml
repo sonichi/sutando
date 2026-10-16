@@ -47,6 +47,7 @@ include = ["ag2_sparrow*"]
 # Non-Python files the Hatch adapter installs; they must ship in the wheel.
 [tool.setuptools.package-data]
 "ag2_sparrow.adapters.hatch" = ["*.sh", "*.json"]
+"ag2_sparrow.adapters.claude_routine" = ["*.md"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ag2_sparrow.__version__" }

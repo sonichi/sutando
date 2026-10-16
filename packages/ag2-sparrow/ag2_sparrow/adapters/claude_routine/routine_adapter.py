@@ -14,6 +14,7 @@ import http.client
 import json
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -73,7 +74,7 @@ def retry_after_seconds(value, now=None, default=60.0):
 
 
 class Outcome:
-    """kind: ok | rate_limited | rejected | retry."""
+    """kind: ok | rate_limited | rejected | retry (provably not accepted) | ambiguous (may have been)."""
 
     def __init__(self, kind, status=None, url=None, session_id=None, retry_after=None, detail=""):
         self.kind, self.status, self.url = kind, status, url
@@ -101,9 +102,16 @@ def fire(endpoint, token, text, timeout=30.0, opener=urllib.request.urlopen):
                            detail=etype)
         if 400 <= e.code < 500:
             return Outcome("rejected", e.code, detail=etype)
-        return Outcome("retry", e.code, detail=etype)
-    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
-        return Outcome("retry", detail=type(e).__name__)
+        if e.code == 503 and e.headers.get("Retry-After"):
+            return Outcome("retry", 503, retry_after=retry_after_seconds(e.headers.get("Retry-After")), detail=etype)
+        return Outcome("ambiguous", e.code, detail=etype)
+    except urllib.error.URLError as e:
+        # Only a refused connection or a failed name lookup proves the request was never sent.
+        if isinstance(e.reason, (ConnectionRefusedError, socket.gaierror)):
+            return Outcome("retry", detail=type(e.reason).__name__)
+        return Outcome("ambiguous", detail=type(e.reason).__name__)
+    except (OSError, http.client.HTTPException) as e:
+        return Outcome("ambiguous", detail=type(e).__name__)
     try:
         data = json.loads(raw.decode("utf-8", "replace"))
     except ValueError:
@@ -127,7 +135,7 @@ class RateLimiter:
 
     def _prune(self):
         now = self.clock()
-        self.times = [t for t in self.times if now - t < HOUR]
+        self.times = [t for t in self.times if 0 <= now - t < HOUR]
 
     def wait_seconds(self):
         self._prune()
@@ -141,14 +149,19 @@ class RateLimiter:
         write_atomic(self.path, json.dumps(self.times))
 
 
-def result_body(outcome, mode):
+def result_body(outcome, mode, owner=True):
     url = outcome.url or "unknown"
     if outcome.kind == "ok":
-        if mode == "echo":
+        if mode == "echo" and owner:
             return "Sent to the cloud agent: %s\n" % url
         return "[no-send]\n# claude routine session: %s\n" % url
     if outcome.kind == "rejected":
         return "The cloud agent could not take this message (HTTP %s, %s).\n" % (outcome.status, outcome.detail)
+    if outcome.kind == "rate_limited":
+        return "The cloud agent is over its hourly limit, so this message was not sent to it.\n"
+    if outcome.kind == "ambiguous":
+        return ("This message may or may not have reached the cloud agent (%s); it was not retried.\n"
+                % (outcome.status or outcome.detail))
     return ("The cloud agent could not be reached for this message after several tries (%s).\n"
             % (outcome.status or outcome.detail))
 
@@ -164,9 +177,17 @@ class Adapter:
         self.endpoint = "%s/v1/claude_code/routines/%s/fire" % (args.api_base.rstrip("/"), args.trigger_id)
         self.limiter = RateLimiter(os.path.join(args.state, "fires.json"), args.max_per_hour, clock)
         self.done_path = os.path.join(args.state, "done")
-        self.attempts = {}     # task id -> failed attempts (5xx / network)
+        self.attempts = {}     # task id -> failed pre-send attempts
+        self.limited = {}      # task id -> 429s received
         self.not_before = {}   # task id -> earliest next try
-        self.blocked_until = 0.0
+        self.hold_path = os.path.join(args.state, "hold.json")
+        try:
+            with open(self.hold_path, encoding="utf-8") as f:
+                self.blocked_until = float(json.load(f))
+        except (OSError, ValueError, TypeError):
+            self.blocked_until = 0.0
+        if self.blocked_until > self.clock() + HOUR:
+            self.blocked_until = 0.0
 
     def pending(self, seen):
         names = [n for n in os.listdir(self.args.inbox)
@@ -180,6 +201,7 @@ class Adapter:
         record_done(self.done_path, name[:-4])
         seen.add(name[:-4])
         self.attempts.pop(name[:-4], None)
+        self.limited.pop(name[:-4], None)
         self.not_before.pop(name[:-4], None)
 
     def step(self, name, seen):
@@ -195,20 +217,23 @@ class Adapter:
         out = fire(self.endpoint, self.token, text, self.args.timeout, self.opener)
         if out.kind == "rate_limited":
             self.blocked_until = self.clock() + out.retry_after
-            log("429; holding all fires for %.0fs" % out.retry_after)
-            return False
-        self.limiter.record()
+            write_atomic(self.hold_path, json.dumps(self.blocked_until))
+            n = self.limited[task_id] = self.limited.get(task_id, 0) + 1
+            log("429 %d/%d; holding all fires for %.0fs" % (n, self.args.max_rate_limited, out.retry_after))
+            if n < self.args.max_rate_limited:
+                return False
+        else:
+            self.limiter.record()
         if out.kind == "retry":
-            n = self.attempts.get(task_id, 0) + 1
-            self.attempts[task_id] = n
+            n = self.attempts[task_id] = self.attempts.get(task_id, 0) + 1
             if n <= self.args.max_retries:
-                delay = min(self.args.backoff * (2 ** (n - 1)), self.args.backoff_max)
+                delay = max(min(self.args.backoff * (2 ** (n - 1)), self.args.backoff_max), out.retry_after or 0)
                 self.not_before[task_id] = self.clock() + delay
                 log("retry %d/%d for %s in %.1fs (%s)" % (n, self.args.max_retries, task_id, delay,
                                                          out.status or out.detail))
                 return False
         log("result <-", task_id, out.kind, out.status, out.session_id or "")
-        self.finish(name, result_body(out, self.args.result_mode), seen)
+        self.finish(name, result_body(out, self.args.result_mode, headers.get("access_tier") == "owner"), seen)
         return True
 
     def next_ready(self, names):
@@ -255,10 +280,13 @@ def build_parser():
     ap.add_argument("--token-env", default="CLAUDE_ROUTINE_TOKEN",
                     help="name of the env var holding the routine's bearer token (the token is never an argument)")
     ap.add_argument("--api-base", default=API_BASE)
+    ap.add_argument("--allow-insecure-api-base", action="store_true", help="accept a non-https --api-base (tests only)")
     ap.add_argument("--result-mode", choices=["no-send", "echo"], default="no-send")
     ap.add_argument("--max-per-hour", type=int, default=25,
                     help="local fire cap, 1-%d (the routine's own cap)" % ROUTINE_CAP_PER_HOUR)
-    ap.add_argument("--max-retries", type=int, default=5, help="5xx/network retries per task")
+    ap.add_argument("--max-retries", type=int, default=2,
+                    help="retries per task for failures that prove the fire was not sent; anything ambiguous is never retried")
+    ap.add_argument("--max-rate-limited", type=int, default=5, help="429s per task before it gets a failure result")
     ap.add_argument("--backoff", type=float, default=2.0, help="first retry delay, doubled per retry")
     ap.add_argument("--backoff-max", type=float, default=60.0)
     ap.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout per fire")
@@ -273,6 +301,8 @@ def main(argv=None, environ=None, opener=urllib.request.urlopen):
     args = ap.parse_args(argv)
     if not TRIGGER_RE.fullmatch(args.trigger_id):
         ap.error("--trigger-id must look like trig_...")
+    if not args.api_base.startswith("https://") and not args.allow_insecure_api_base:
+        ap.error("--api-base must be https")
     if not 1 <= args.max_per_hour <= ROUTINE_CAP_PER_HOUR:
         ap.error("--max-per-hour must be 1-%d" % ROUTINE_CAP_PER_HOUR)
     token = (os.environ if environ is None else environ).get(args.token_env, "").strip()

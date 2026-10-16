@@ -9,7 +9,7 @@ python3 skills/secret-vault/secret-vault.py env CLAUDE_ROUTINE_TOKEN -- \
   python3 -m ag2_sparrow.adapters.claude_routine.routine_adapter --work <dir> --trigger-id trig_... [options]
 ```
 
-`<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out, `<dir>/state/{done,fires.json,connector.pid}`.
+`<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out, `<dir>/state/{done,fires.json,hold.json,connector.pid}`.
 One adapter per work dir (`state/connector.pid`, liveness-checked; exit 3 if another holds it), one fire in flight.
 
 ## Setup
@@ -56,7 +56,8 @@ The routine posts the reply, so the local bridge must not post a second one. A s
 ```
 
 `--result-mode echo` writes `Sent to the cloud agent: <url>` instead, which the bridge does deliver; use
-it only to debug the wiring. A fire refused with a 4xx other than 429 writes a one-line plain-text failure
+it only to debug the wiring. Echo applies to owner tasks only: a non-owner room still gets `[no-send]`,
+so the session URL is never posted where others read it. A fire refused with a 4xx other than 429 writes a one-line plain-text failure
 (status and error type), which the bridge delivers to the room.
 
 ## Errors and limits
@@ -64,16 +65,19 @@ it only to debug the wiring. A fire refused with a 4xx other than 429 writes a o
 | response | action |
 |---|---|
 | 200 | result written, task done (even if the body is unreadable: the session exists) |
-| 429 | nothing written; every fire held for `Retry-After` (seconds or HTTP date, clamped 1 s–1 h, default 60 s), then the same task is retried |
+| 429 | every fire held for `Retry-After` (seconds or HTTP date, clamped 1 s–1 h, default 60 s; kept in `state/hold.json`, so a restart honours it), then the same task is retried; after `--max-rate-limited` (default 5) 429s the task gets a plain-text failure result |
 | other 4xx | plain-text failure result, task done |
-| 5xx, network error | retried after `--backoff` × 2ⁿ (cap `--backoff-max`), up to `--max-retries`, then a failure result |
+| connection refused, DNS failure, 503 with `Retry-After` | the fire provably was not accepted: retried after `--backoff` × 2ⁿ (cap `--backoff-max`, at least `Retry-After`), up to `--max-retries` (default 2), then a failure result |
+| timeout, reset, any other 5xx or network error | the fire may have been accepted: never retried; the result says the message may or may not have reached the cloud agent |
 
-The endpoint has no idempotency key: a network error after the server accepted a fire, then a retry,
-starts a second session, and the routine posts twice. Lower `--max-retries` if that matters more than delivery.
+The endpoint has no idempotency key, so a retry after an accepted fire would start a second session
+and a second room post; that is why only provably unsent fires are retried. One window remains: a crash
+between a 200 and the result write leaves the task unanswered locally, and it is fired again on restart.
 
 Hourly caps on the server: 30 fires per routine (shared with **Run now**), 100 API fires per account.
 Locally `--max-per-hour` (default 25, at most 30) caps fires in a sliding hour kept in `state/fires.json`,
-so a restart does not reset it.
+so a restart does not reset it; entries dated in the future (a clock stepped back) are dropped.
+`--api-base` must be https (`--allow-insecure-api-base` exists for the local test server only).
 
 ## Trust
 
