@@ -855,6 +855,35 @@ class WithdrawnAccess(_Bridge):
         self.assertEqual(self.broker.results(), [FAILED])
         self.assertEqual((gw._load_held(), gw._load_ack_first()), ({}, {}))
 
+    def test_an_end_whose_steps_cannot_complete_waits_for_the_next_pass(self):
+        staged = self.withheld_on_a_drop()
+        landed = time.time() - 700.0
+        os.utime(staged, (landed, landed))
+        real_put = gw._put_held
+        with patch.object(gw, "_put_held", new=lambda tid, entry: False if entry and entry.get("ending")
+                          else real_put(tid, entry)):
+            self.advance(cap="guest")                    # the decision cannot be recorded: nothing sent
+        self.assertEqual((self.broker.results(), gw._load_held()[ASK_A].get("ending")), ([], None))
+        self.broker.result = "down"
+        self.advance(cap="guest")                        # decided; the `failed` cannot be sent yet
+        root = self.outbox_root
+        outbox.park_item(root, ASK_A, "invalid-retry-state")
+        self.advance(cap="guest")                        # a park the relay rule could not prevent: reopened
+        self.assertEqual((item(root, ASK_A)["status"], item(root, ASK_A)["requeue_reason"]),
+                         ("QUEUED", gw._RELAY_REOPENED))
+        self.broker.result = "ok"
+        with patch.object(gw, "_save_inflight", return_value=False):
+            self.advance(cap="guest")                    # sent, but the ledger cannot be saved
+        self.assertIs(gw._load_held()[ASK_A]["ending"], True, "the entry went before the ledger")
+        with patch.object(gw, "_forget_ack_first", return_value=False):
+            self.advance(cap="guest")                    # done, but the mark cannot be retired
+        self.assertIn(f"ack_first task {ASK_A}: ended unpublished, but its relay mark could not be "
+                      "retired; the next start retires it", self.lines)
+        self.assertEqual(gw._load_held(), {})
+        gw._retire_delivered_marks()                     # the next start
+        self.assert_ended()
+        self.assertEqual([p["id"] for p in self.broker.results()].count(ASK_A), 2, "sent more than retried")
+
     def test_an_end_cut_short_is_finished_by_the_next_pass_or_start(self):
         real_put = gw._put_held
 
