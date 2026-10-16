@@ -57,13 +57,11 @@ class _Loop:
         self.clock = _Clock()
         self.status: list[tuple] = []
         self.logs: list[str] = []
-        self.polls: list[str] = []
         self._saved: dict = {}
         self._alive = [True, False]
 
     def _poll(self, method, path, payload=None, **kw):
         if path.startswith("/v1/tasks?wait="):
-            self.polls.append(path)
             self.clock.now += self.advance
             # A list is one outcome per poll (None = a healthy empty poll).
             if isinstance(self.poll_raises, list):
@@ -169,15 +167,6 @@ class LongPollTimeoutTest(unittest.TestCase):
             loop.run()
         self.assertEqual(loop.clock.slept, [])
         self.assertIn((True, {}), loop.status)
-
-    def test_every_poll_carries_the_voice_outcome_contract(self):
-        # One agent's credential may serve more than one bridge, so the broker serves
-        # a voice relay ask only to a poll that names the contract itself.
-        with _Loop(self.gw, poll_raises=None, advance=1.0) as loop:
-            loop._alive = [True, True, False]
-            loop.run()
-        self.assertEqual(loop.polls, [f"/v1/tasks?wait={self.gw.POLL_WAIT}"
-                                      "&capabilities=voice-outcome-v1"] * 2)
 
 
 class DroppedConnectionTest(unittest.TestCase):

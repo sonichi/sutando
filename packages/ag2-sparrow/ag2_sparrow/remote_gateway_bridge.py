@@ -12,7 +12,7 @@ exposes a tiny HTTP protocol; this client pulls *your* tasks down into the local
 Full spec: docs/remote-gateway-protocol.md
 
   Protocol (versioned, Bearer-auth):
-  GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>&capabilities=voice-outcome-v1
+  GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>
        → 200 {"tasks": [ {<task fields...>}, ... ]}   (long-poll; [] on timeout)
   POST {REMOTE_TASK_URL}/v1/tasks/<task-id>/ack
        → body {"id": "<task-id>"}  → 200 on accepted
@@ -439,17 +439,11 @@ LEASE_ID_MAX = 256
 # Re-asked task id -> the id the broker is waiting on. A dedup re-ask gets a
 # fresh local id, but the delivery it answers is still the original one.
 DEDUP_ALIAS_FILE = _STATE / f"remote-dedup-alias{_INST_SUFFIX}.json"
-# Broker id -> the local id it was published under, for each task the broker served
-# with `ack_first` (an AG2 Space voice relay ask), committed before the task is.
-# A file of its own, never the media sidecar: an older bridge prunes that when it
-# settles a task, and a fold answered after a restart must still name its holder.
-ACK_FIRST_FILE = _STATE / f"remote-task-ack-first{_INST_SUFFIX}.json"
-# The voice-outcome contract: declared in the heartbeat and carried on every poll and
-# every result. It stands for `dm_only`, `consolidated_into` for an honoured fold, and
-# acknowledging an `ack_first` task before publishing it.
+# The voice-outcome contract every result carries beside an explicit `dm_only`.
 VOICE_OUTCOME_CONTRACT = "voice-outcome-v1"
-# The poll's proof of it, appended to every GET /v1/tasks query.
-_POLL_PROOF = f"&capabilities={VOICE_OUTCOME_CONTRACT}"
+# Broker ids this process saw served with `ack_first`; held in memory only, so after
+# a restart an honoured fold of one closes with the bare marker, as before.
+_ACK_FIRST_SERVED: "set[str]" = set()
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
@@ -1894,11 +1888,10 @@ _INFLIGHT_MUTEX = threading.RLock()
 # True when the in-flight restore FAILED rather than finding no file. Both cases
 # yield an empty set, but only the second one means "nothing is in flight".
 _INFLIGHT_DEGRADED = False
-# Same hazard as the in-flight set: these ledgers are read-modify-written by the
+# Same hazard as the in-flight set: both ledgers are read-modify-written by the
 # poll loop and the outbound worker, so each load->mutate->write runs under a lock.
 _TASK_MEDIA_MUTEX = threading.RLock()
 _PENDING_ACK_MUTEX = threading.RLock()
-_ACK_FIRST_MUTEX = threading.RLock()
 
 
 def wake_outbound() -> None:
@@ -3455,7 +3448,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
-                             "core-status", "team-collaborator", VOICE_OUTCOME_CONTRACT],
+                             "core-status", "team-collaborator"],
         }
         # Only include when present so a status-less node never clobbers the
         # broker's last-known core-status (the broker only records on presence).
@@ -3798,15 +3791,14 @@ def _fsync_in_place(tid: str, *targets: Path) -> bool:
 
 def _repair_pending_task(tid: str, task: dict) -> bool:
     """A task the gateway redelivered while it is still queued here: fsync the
-    queued file and its directory and (re)commit the media sidecar and the
-    `ack_first` mark, so a task written by a pre-durability client can still
-    earn a `durable` ack."""
+    queued file and its directory and (re)commit the media sidecar, so a task
+    written by a pre-durability client can still earn a `durable` ack."""
     tfile = find_task_file(TASKS_DIR, tid)
     if tfile is None:
         return False
     if not _fsync_in_place(tid, tfile, TASKS_DIR):
         return False
-    return _record_task_media(tid, task) and _record_ack_first(tid, task)
+    return _record_task_media(tid, task)
 
 
 
@@ -3942,6 +3934,8 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     if not _valid_tid(broker_tid):
         _log(f"dropping task with unsafe id {broker_tid!r}")
         return None
+    if task.get("ack_first") is True:          # the broker's exact boolean only
+        _ACK_FIRST_SERVED.add(broker_tid)
     # Everything from here down — filenames, ledgers, archives, the serialized
     # id: header the core echoes back as the result filename — uses the LOCAL
     tid = _local_tid(broker_tid)
@@ -4125,10 +4119,6 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         tmp.unlink(missing_ok=True)
         _log(f"media sidecar FAILED for {tid} — not queued, not acked")
         return None
-    if not _record_ack_first(tid, task):
-        tmp.unlink(missing_ok=True)
-        _log(f"ack_first mark FAILED for {tid} — not queued, not acked")
-        return None
     if not _publish_staged(tmp, dest):  # atomic publish: never a partial file
         tmp.unlink(missing_ok=True)
         return None
@@ -4288,61 +4278,16 @@ def _forget_task_media(tid: str) -> None:
             _durable_write(TASK_MEDIA_FILE, json.dumps(media, sort_keys=True))
 
 
-def _load_ack_first() -> "dict | None":
-    """The `ack_first` marks, or None when the file exists but cannot be read.
-
-    None is not "no mark": guessing none closes a relay ask's honoured fold as a
-    bare suppression, and the broker can no longer say where its answer went.
-    """
-    if not ACK_FIRST_FILE.exists():
-        return {}
-    try:
-        loaded = json.loads(ACK_FIRST_FILE.read_text())
-    except (OSError, ValueError) as exc:
-        _log(f"ack_first marks unreadable ({exc}) — deferring")
-        return None
-    return loaded if isinstance(loaded, dict) else None
-
-
-def _record_ack_first(tid: str, task: dict) -> bool:
-    """Commit the mark of a task served with `ack_first` (the exact broker boolean),
-    BEFORE the task is published: a fold the core answers at once must find it.
-    True when there is nothing to record (every other task)."""
-    if task.get("ack_first") is not True:
-        return True
-    # Re-committed when already present, for the media sidecar's reason: on the
-    # repair path an entry can be visible from a rename whose fsync never landed.
-    with _ACK_FIRST_MUTEX:
-        marks = _load_ack_first()
-        if marks is None:
-            return False
-        marks[_broker_tid(tid)] = tid
-        return _durable_write(ACK_FIRST_FILE, json.dumps(marks, sort_keys=True))
-
-
-def _forget_ack_first(broker_id: str) -> None:
-    """Retire a mark once the broker has accepted its task's result, and never
-    before (best-effort: a mark left behind names a task that posts nothing more)."""
-    with _ACK_FIRST_MUTEX:
-        marks = _load_ack_first()
-        if marks and marks.pop(broker_id, None) is not None:
-            _durable_write(ACK_FIRST_FILE, json.dumps(marks, sort_keys=True))
-
-
 def _fold_target(tid: str, wire: str, holder: "str | None") -> "str | None":
     """What an honoured fold posted under `wire` sends as `consolidated_into`.
 
     The holder's BROKER id, resolved as result egress resolves its own, for a task
-    served with `ack_first`; "" for every other task, which closes with the bare
-    marker as before (the broker already acts on the field for any task, so typed
-    and Signal tasks must never get it); None to defer while the marks or the
-    alias ledger cannot be read.
+    this process saw served with `ack_first`; "" for every other task, which
+    closes with the bare marker as before (the broker already acts on the field
+    for any task, so typed and Signal tasks must never get it); None to defer
+    while the alias ledger cannot be read.
     """
-    marks = _load_ack_first()
-    if marks is None:
-        _log(f"delivery deferred for {tid} — ack_first marks unreadable")
-        return None
-    if wire not in marks:
+    if wire not in _ACK_FIRST_SERVED:
         return ""
     delivery = _delivery_tid((holder or "").strip())
     if delivery is None:
@@ -4993,7 +4938,10 @@ def _holder_delivery_state(holder_id: str) -> str:
     body = None
     if record and record.get("payload"):
         try:
-            body = json.loads(record["payload"]).get("body")
+            stored = json.loads(record["payload"])
+            folded = stored.get("consolidated_into")
+            # A fold is stored with an empty body: read it as the marker it replaces.
+            body = f"[deduped: {folded}]" if folded else stored.get("body")
         except (ValueError, TypeError, AttributeError):
             return "failed"
     if body is None:
@@ -5502,8 +5450,8 @@ def _result_contract(dm_only: bool) -> dict:
 
 
 def _dm_only(parsed) -> bool:
-    """Whether the core marked this result private. The `[dm-only]` line itself is
-    stripped from the body sent, so this is the only place the broker can learn it."""
+    """Whether the body carries `[dm-only]` anywhere. A standalone marker line is
+    stripped from the body sent, so this is how the broker learns the answer is private."""
     return any(a.kind == "dm-only" for a in parsed.actions)
 
 
@@ -5565,7 +5513,6 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
             if delivered_body_differs(core.backend.root, item_id, ruled):
                 _quarantine_unsent(result_file, tid, item_id, generation)
                 return False
-            _forget_ack_first(broker_tid)
             return True
         # The outbox has decided this item; no pass will ever claim it again,
         # so retrying logs forever and hides the failure behind "will retry".
@@ -5592,7 +5539,6 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         _log(f"result {tid} accepted by gateway; Matrix delivery unconfirmed "
              f"(provider={type(core.provider).__name__}, "
              f"backend={type(core.backend).__name__}, worker={core.worker})")
-        _forget_ack_first(broker_tid)
         return True
     record = read_item(core.backend.root, item_id) or {}
     if record.get("status") == "PARKED":
@@ -6434,9 +6380,7 @@ def main() -> None:
             _push_pool_advertisement()
             prev_ok = last_poll_ok
             try:
-                # The poll carries the contract itself: one agent's credential may serve
-                # more than one bridge, so only a poll that names it is served a relay ask.
-                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_POLL_PROOF}", timeout=POLL_WAIT + 10)
+                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
                 last_poll_ok = time.time()
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).
