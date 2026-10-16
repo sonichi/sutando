@@ -49,7 +49,7 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tour_page  # noqa: E402,F401
 from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these names are this CLI's API)
-    CONNECT_PROMPT, CORES, IMPORT_PROMPT, IMPORT_SECTION, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
+    AUDIENCES, CONNECT_PROMPT, CORES, IMPORT_PROMPT, IMPORT_SECTION, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
     render_page, sections_for,
 )
 
@@ -269,8 +269,8 @@ class Commons:
 
 
 def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = None,
-            summon: bool = False, core: str = "unknown") -> dict:
-    page = render_page(name, core)
+            summon: bool = False, core: str = "unknown", audience: str = "dm") -> dict:
+    page = render_page(name, core, audience)
     with _locked(marker):
         rooms = load_marker(marker)
         step = plan(rooms, commons.room, commons.listed_kinds() if commons.room in rooms else None)
@@ -328,6 +328,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="the agent's own name; auto: its Matrix profile name, else its mxid's localpart")
     r.add_argument("--agent-mxid", help="with --name auto: this agent's mxid (default $AGENT_MXID or the "
                                         "channel env file's)")
+    r.add_argument("--audience", choices=AUDIENCES, default="dm",
+                   help="dm: the owner's DM, which names the agent; room: any other room, which says "
+                        "\"your agent\"")
     r.add_argument("--core", choices=CORES + ("auto",), default="unknown",
                    help="the Sutando core; claude adds the Claude Code import section")
     p = sub.add_parser("plan", help="what publish would do in this room, from the marker alone")
@@ -341,6 +344,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     u.add_argument("--core", choices=CORES + ("auto",), default="auto",
                    help="the Sutando core (default auto: what the engine resolves); claude adds the "
                         "Claude Code import section, unknown leaves it out")
+    u.add_argument("--audience", choices=AUDIENCES, default="dm",
+                   help="dm (default): the owner's DM; room: any other room, where the page says \"your agent\"")
     u.add_argument("--summon", action="store_true", help="summon the owner on a refresh too")
     u.add_argument("--room-commons", type=Path, default=None,
                    help="path to room_commons.py (default: beside this skill, else the installed skill)")
@@ -353,7 +358,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         name = clean_name(resolve_name(args.name, args.agent_mxid))
         if args.command == "render":
             core = detect_core() if args.core == "auto" else args.core
-            sys.stdout.write(render_page(name, core))
+            sys.stdout.write(render_page(name, core, args.audience))
             return 0
     except ValueError as exc:
         print(f"getting_started: {exc}", file=sys.stderr)
@@ -365,7 +370,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         result = publish(Commons(script, args.room, commons_env(script)), marker_path(_workspace()),
                          name, args.owner, args.summon,
-                         detect_core() if args.core == "auto" else args.core)
+                         detect_core() if args.core == "auto" else args.core, args.audience)
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": str(exc)}))
         return 4

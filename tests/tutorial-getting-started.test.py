@@ -3,6 +3,7 @@
 and the room-commons calls publish makes, against a stub room_commons.py that keeps a fake room."""
 from __future__ import annotations
 
+import hashlib
 import html
 import importlib.util
 import json
@@ -158,7 +159,10 @@ class RenderTest(unittest.TestCase):
     def test_step_title_replaces_step_numbers(self):
         page = gs.render_page("Blue", "codex")
         self.assertNotRegex(page, r"Step \d+ of \d+")
-        self.assertIn('<p class="step-title" id="step-title" aria-live="polite">Your DM</p>', page)
+        self.assertIn('<p class="step-title"><span id="step-title">Your DM</span>'
+                      '<span class="pos" id="step-pos" aria-hidden="true">1/9</span></p>', page)
+        self.assertNotRegex(page, r'id="step-title"[^>]*aria-live')  # announced once, by heading focus
+        self.assertIn("stepPos.textContent = (cur + 1) + '/' + ids.length", gs.tour_page.SCRIPT)
         self.assertIn("stepTitle.textContent = titles[cur]", gs.tour_page.SCRIPT)
 
     def test_reviewed_wording(self):
@@ -171,6 +175,25 @@ class RenderTest(unittest.TestCase):
         self.assertIn("headphone icon in the room header", by["calls"].how)
         self.assertIn("Bring an agent?", by["calls"].how)
         self.assertIn("+ at the top of the room list", by["rooms"].how)
+
+    def test_second_review_wording(self):
+        by = {s.id: s for s in gs.sections_for("claude")}
+        self.assertIn("Docs, HTML pages, PDFs, whiteboards, sheets and databases", by["commons"].what)
+        self.assertIn("start the call and pick your agent under &ldquo;Bring an agent?&rdquo;", by["calls"].how)
+        self.assertIn("open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords",
+                      by["activity"].how)
+        self.assertIn(("settings-integrations.jpg", "Settings \u2192 Apps \u2192 Integrations"), by["apps"].images)
+
+    def test_room_audience_says_your_agent(self):
+        room = gs.render_page("Blue", "claude", "room")
+        self.assertIn("<h1>Getting started with your agent</h1>", room)
+        self.assertIn("ask your agent anything", room)
+        self.assertNotIn("Blue", re.sub(r'src="data:[^"]*"', "", room))
+        dm = gs.render_page("Blue", "claude", "dm")
+        self.assertIn("<h1>Getting started with Blue</h1>", dm)
+        self.assertEqual(gs.render_page("Blue", "claude"), dm)
+        with self.assertRaises(ValueError):
+            gs.render_page("Blue", "claude", "everyone")
 
     def test_no_microphone_or_user_card_voice_button(self):
         for core in gs.CORES:
@@ -232,6 +255,16 @@ class InteractiveTest(unittest.TestCase):
         self.assertIn(".controls { display:none; }", head)
         self.assertEqual(body.count('class="sec card cur"'), 1)
 
+    def test_progress_and_mark_done_are_hidden_without_js(self):
+        head = self.page.split("</head>", 1)[0]
+        self.assertIn(".progress, .done { display:none; }", head)
+        self.assertIn(".js .progress { display:block; }", head)
+        self.assertIn(".js .done { display:inline-flex;", head)
+
+    def test_show_all_pressed_style_and_awaited_set(self):
+        self.assertIn('#all[aria-pressed="true"] {', self.page)
+        self.assertIn("await art.state.set(store.key, v)", gs.tour_page.SCRIPT)
+
     def test_checkboxes_start_disabled_until_progress_loads(self):
         self.assertEqual(self.page.count('data-done="'), 10)
         self.assertEqual(len(re.findall(r'type="checkbox" data-done="[a-z]+" disabled>', self.page)), 10)
@@ -273,6 +306,9 @@ class InteractiveTest(unittest.TestCase):
 
     def test_dark_mode_and_reduced_motion(self):
         self.assertIn("prefers-color-scheme: dark", self.page)
+        self.assertIn(':root:not([data-theme="light"]) {', self.page)  # an explicit light theme wins
+        self.assertIn(':root[data-theme="dark"] { color-scheme: dark;', self.page)
+        self.assertIn("document.body.getAttribute('data-theme')", gs.tour_page.SCRIPT)
         self.assertIn("prefers-reduced-motion: reduce", self.page)
         self.assertIn("@media (max-width: 520px)", self.page)
 
@@ -375,9 +411,23 @@ const mark = (i) => { const b = d.querySelectorAll('input[data-done]')[i]; b.che
     out.focused = d.activeElement && d.activeElement.id;
     out.mode = d.getElementById('tour').dataset.mode;
   }
+  if (scenario === 'keys') {
+    const key = (target) => target.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    key(d.body);
+    out.afterBody = d.querySelector('.sec.cur').id;
+    key(d.getElementById('next'));
+    out.afterButton = d.querySelector('.sec.cur').id;
+    key(d.querySelector('.sec.cur h2'));
+    out.afterHeading = d.querySelector('.sec.cur').id;
+  }
   if (scenario.startsWith('copy')) {
     d.querySelector('button[data-prompt]').click();
-    await sleep(30);
+    await sleep(100);
+    out.first = d.getElementById('status').textContent;
+    d.querySelector('button[data-prompt]').click();
+    await sleep(10);
+    out.between = d.getElementById('status').textContent;
+    await sleep(100);
     out.button = d.querySelector('button[data-prompt]').textContent;
     out.status = d.getElementById('status').textContent;
   }
@@ -461,8 +511,14 @@ class PageBehaviourTest(unittest.TestCase):
                          (True, False, "h-finale"))
         self.assertEqual(out["progressAfter"], "10 of 10 done")
 
+    def test_arrow_keys_only_inside_the_tour_and_not_on_controls(self):
+        out = self.run_page("keys")
+        self.assertEqual((out["afterBody"], out["afterButton"], out["afterHeading"]), ("s-dm", "s-dm", "s-rooms"))
+
     def test_copy_outcomes_are_announced(self):
         ok = self.run_page("copy-ok")
+        self.assertEqual(ok["between"], "")  # cleared first, so a repeat copy is announced again
+        self.assertEqual(ok["first"], ok["status"])
         self.assertEqual(ok["button"], "Copied")
         self.assertEqual(ok["status"], "Copied: " + gs.tour_page.FINALE_PROMPT)
         fail = self.run_page("copy-fail")
@@ -582,6 +638,16 @@ class ChunkTest(unittest.TestCase):
 
 
 class AssetTest(unittest.TestCase):
+    def test_no_two_steps_share_an_image(self):
+        tp = gs.tour_page
+        seen = {}
+        for s in tp.sections_for("claude"):
+            for f, _ in s.images:
+                digest = hashlib.sha256((tp.ASSETS / f).read_bytes()).hexdigest()
+                self.assertNotIn(digest, seen, f"{s.id} reuses {seen.get(digest)}'s image {f}")
+                seen[digest] = s.id
+
+
     def test_every_step_image_exists_and_is_small(self):
         tp = gs.tour_page
         used = {f for s in tp.sections_for("claude") for f, _ in s.images}

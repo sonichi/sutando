@@ -41,12 +41,12 @@ SECTIONS = [
             "Humans and agents talk in the same chat.",
             "Press + at the top of the room list and choose Room. Then open the room menu "
             "(&#8942;), choose Invite, and add {name}.",
-            images=(("room-list-top.jpg", "The + button at the top of the room list"),
+            images=(("room-list-add.jpg", "The + button at the top of the room list"),
                     ("new-room-dialog.jpg", "The New Chat Room dialog"),
                     ("room-menu-invite.jpg", "The room menu, with Invite"))),
     Section("commons", "Commons",
-            "Each room's shared Doc, HTML pages, whiteboard, sheets and databases. Open them with "
-            "the Commons icon in the room header.",
+            "Each room's shared Docs, HTML pages, PDFs, whiteboards, sheets and databases. Open them "
+            "with the Commons icon in the room header.",
             "Ask {name} in a room:",
             "Make a plan for our team offsite in Commons.", "room",
             (("room-header-commons.jpg", "The room header; Commons is the second icon"),
@@ -65,7 +65,7 @@ SECTIONS = [
     Section("calls", "Calls &amp; voice",
             "Talk live with {name} in your DM, or with people in any room.",
             "Press the headphone icon in the room header (Start call). In your DM, {name} answers; "
-            "in a room, pick {name} under Bring an agent? to bring it into the call.",
+            "in a room, start the call and pick your agent under &ldquo;Bring an agent?&rdquo;.",
             images=(("room-header-call.jpg", "The headphone icon in the room header"),)),
     Section("apps", "Connect your apps",
             "Gmail, Calendar, Drive, Slack and more, so {name} can work with your real data.",
@@ -73,13 +73,13 @@ SECTIONS = [
             "Integrations, or ask {name} and a Connect button appears:",
             CONNECT_PROMPT, "dm",
             (("user-card-plug.jpg", "The plug icon in your user card"),
-             ("settings-integrations.jpg", "Settings, Apps: Integrations"))),
+             ("settings-integrations.jpg", "Settings \u2192 Apps \u2192 Integrations"))),
     Section("activity", "Activity &amp; notices",
             "The bell at the top of the room list and each room's Activity tab show what needs "
             "you and what your agents are working on. The unread badge follows each room's "
             "notification setting.",
             "Try it: open a room's Activity tab while an agent works on something you asked for, "
-            "then set the room's notifications to Mention &amp; Keywords.",
+            "then open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords.",
             images=(("room-list-top.jpg", "The bell at the top of the room list"),)),
     Section("mobile", "Mobile",
             "The same rooms and agents on your phone.",
@@ -94,6 +94,7 @@ IMPORT_SECTION = Section(
     IMPORT_PROMPT, "dm",
 )
 FINALE_PROMPT = "Help me plan my week."
+AUDIENCES = ("dm", "room")
 WHERE = {"dm": "your DM", "room": "a room"}
 ASSETS = Path(__file__).resolve().parent / "assets"
 
@@ -236,7 +237,9 @@ def _finale(who: str) -> str:
 
 def _palette() -> tuple:
     light = "".join(f"--a-{k}:{v[0]};" for k, v in ACCENTS.items())
-    dark = "".join(f"--a-{k}:{v[1]};" for k, v in ACCENTS.items())
+    dark = ("--bg:#151618; --fg:#ececec; --muted:#a9adb3; --card:#202225; --line:#34373b; --brand:#7aa7ff; "
+            "--code:#2b2d31; --hero-ring:#1d2433; --track:#34373b; "
+            + "".join(f"--a-{k}:{v[1]};" for k, v in ACCENTS.items()))
     return light, dark
 
 
@@ -244,9 +247,10 @@ STYLE = """<style>
 :root { color-scheme: light dark; --bg:#f7f6f3; --fg:#1d1d1f; --muted:#5a5e63; --card:#ffffff; --line:#e3e1dc;
   --brand:#1f5fcc; --code:#f2f1ee; --hero-ring:#eaf0fb; --track:#e6e4df; %(light)s }
 @media (prefers-color-scheme: dark) {
-  :root { --bg:#151618; --fg:#ececec; --muted:#a9adb3; --card:#202225; --line:#34373b;
-    --brand:#7aa7ff; --code:#2b2d31; --hero-ring:#1d2433; --track:#34373b; %(dark)s }
+  :root:not([data-theme="light"]) { %(darkvars)s }
 }
+:root[data-theme="dark"] { color-scheme: dark; %(darkvars)s }
+:root[data-theme="light"] { color-scheme: light; }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 main { max-width:760px; margin:0 auto; padding:24px 16px 48px; }
@@ -264,6 +268,7 @@ p { margin:0 0 6px; }
 .js .controls { display:flex; flex-wrap:wrap; gap:10px 8px; align-items:center; margin:0 0 12px; }
 .dots { display:flex; flex-wrap:wrap; gap:6px; flex-basis:100%%; }
 #all { margin-left:auto; }
+#all[aria-pressed="true"] { background:var(--brand); color:var(--card); }
 .dot { width:28px; height:28px; padding:0; border-radius:50%%; font-size:12px; border:2px solid var(--line); color:var(--muted); background:var(--card); }
 .dot[aria-current="step"] { border-color:var(--brand); color:var(--fg); }
 .dot.is-done { background:var(--brand); border-color:var(--brand); color:var(--card); }
@@ -274,6 +279,9 @@ p { margin:0 0 6px; }
 .icon svg { width:52px; height:52px; position:relative; }
 .body { min-width:0; flex:1; }
 .step-title { flex-basis:100%%; margin:0; font-weight:600; }
+.pos { font-weight:400; color:var(--muted); margin-left:6px; font-size:14px; }
+.progress, .done { display:none; }
+.js .progress { display:block; }
 .js main[data-mode="all"] .step-title { display:none; }
 .paste { font-size:13px; color:var(--muted); margin:4px 0 0; }
 .shots { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; align-items:flex-start; }
@@ -288,7 +296,7 @@ button:disabled { opacity:.45; cursor:default; }
 button:focus-visible, input:focus-visible { outline:3px solid var(--brand); outline-offset:2px; }
 .copy { border-color:var(--accent); color:var(--accent); }
 .copy:hover { background:var(--accent); color:var(--card); }
-.done { display:inline-flex; gap:8px; align-items:center; margin-top:10px; font-size:14px; cursor:pointer; }
+.js .done { display:inline-flex; gap:8px; align-items:center; margin-top:10px; font-size:14px; cursor:pointer; }
 .done input { width:18px; height:18px; accent-color:var(--accent); }
 .js main[data-mode="step"] .sec { display:none; }
 .js main[data-mode="step"] .sec.cur { display:flex; animation:enter .22s ease-out; }
@@ -325,6 +333,11 @@ SCRIPT = """<script>
   const fill = document.getElementById('progress-fill');
   const bar = document.getElementById('progress-bar');
   const stepTitle = document.getElementById('step-title');
+  const stepPos = document.getElementById('step-pos');
+  const theme = document.body.getAttribute('data-theme');
+  if ((theme === 'dark' || theme === 'light') && !document.documentElement.hasAttribute('data-theme')) {
+    document.documentElement.setAttribute('data-theme', theme);
+  }
   const finale = document.getElementById('finale');
   const done = new Set();
   let cur = 0;
@@ -355,9 +368,9 @@ SCRIPT = """<script>
     }
     return [];
   };
-  const save = () => {
+  const save = async () => {
     const v = ids.filter((x) => done.has(x));
-    if (store.kind === 'state') { try { art.state.set(store.key, v); } catch (e) { /* memory only */ } }
+    if (store.kind === 'state') { try { await art.state.set(store.key, v); } catch (e) { /* memory only */ } }
     if (store.kind === 'local') { try { local.setItem(store.key, JSON.stringify(v)); } catch (e) { /* memory only */ } }
   };
 
@@ -387,6 +400,7 @@ SCRIPT = """<script>
     });
     const stepping = main.dataset.mode === 'step';
     stepTitle.textContent = titles[cur];
+    stepPos.textContent = (cur + 1) + '/' + ids.length;
     finale.hidden = n !== ids.length;
     back.hidden = next.hidden = !stepping;
     back.disabled = cur === 0;
@@ -415,8 +429,9 @@ SCRIPT = """<script>
   });
   document.addEventListener('keydown', (ev) => {
     if (main.dataset.mode !== 'step' || ev.altKey || ev.metaKey || ev.ctrlKey) return;
-    const t = ev.target && ev.target.tagName;
-    if (t === 'INPUT' || t === 'TEXTAREA') return;
+    const t = ev.target;
+    if (!t || !main.contains(t) || t.isContentEditable) return;
+    if (/^(INPUT|TEXTAREA|SELECT|BUTTON|A)$/.test(t.tagName)) return;
     if (ev.key === 'ArrowRight') { show(cur + 1, true); ev.preventDefault(); }
     if (ev.key === 'ArrowLeft') { show(cur - 1, true); ev.preventDefault(); }
   });
@@ -459,7 +474,9 @@ COPY_SCRIPT = """<script>
     if (!ok) ok = legacy(text);
     if (!ok) pick(btn.parentElement.querySelector('code'));
     btn.textContent = ok ? 'Copied' : keys;
-    status.textContent = ok ? 'Copied: ' + text : 'Prompt selected. ' + keys + ' to copy it.';
+    const said = ok ? 'Copied: ' + text : 'Prompt selected. ' + keys + ' to copy it.';
+    status.textContent = '';
+    setTimeout(() => { status.textContent = said; }, 60);
     setTimeout(() => { btn.textContent = 'Copy'; }, 2500);
   });
 })();
@@ -469,16 +486,19 @@ COPY_SCRIPT = """<script>
 HEAD_SCRIPT = "<script>document.documentElement.classList.add('js');</script>"
 
 
-def render_page(name: str, core: str = "unknown") -> str:
-    """The whole page as one HTML string; depends on nothing but the agent's name and core."""
-    who = html.escape(clean_name(name))
+def render_page(name: str, core: str = "unknown", audience: str = "dm") -> str:
+    """The whole page as one HTML string; depends on nothing but the agent's name, core and
+    audience. In a room other than the owner's DM the agent is "your agent" throughout."""
+    if audience not in AUDIENCES:
+        raise ValueError(f"audience must be one of {', '.join(AUDIENCES)}, got {audience!r}")
+    who = html.escape(clean_name(name)) if audience == "dm" else "your agent"
     secs = sections_for(core)
     body = "".join(_section(s, i == 0, who) for i, s in enumerate(secs))
     light, dark = _palette()
     return (
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-        f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'light': light, 'dark': dark}}</head><body>"
+        f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'light': light, 'darkvars': dark}}</head><body>"
         "<main id=\"tour\" data-mode=\"step\">"
         f"<header class=\"hero\">{HERO}<div><h1>Getting started with {who}</h1>"
         f"<p class=\"lead\">A short tour of AG2 Space. Each part has one thing to try; Copy puts "
@@ -489,7 +509,8 @@ def render_page(name: str, core: str = "unknown") -> str:
         f"aria-valuemin=\"0\" aria-valuemax=\"{len(secs)}\" aria-valuenow=\"0\"><span id=\"progress-fill\"></span></div></div>"
         "<nav class=\"controls\" id=\"controls\" aria-label=\"Tour steps\">"
         "<div class=\"dots\" id=\"dots\"></div>"
-        f"<p class=\"step-title\" id=\"step-title\" aria-live=\"polite\">{secs[0].title}</p>"
+        f"<p class=\"step-title\"><span id=\"step-title\">{secs[0].title}</span>"
+        f"<span class=\"pos\" id=\"step-pos\" aria-hidden=\"true\">1/{len(secs)}</span></p>"
         "<button type=\"button\" id=\"back\" aria-label=\"Previous step\">Back</button>"
         "<button type=\"button\" id=\"next\" aria-label=\"Next step\">Next</button>"
         "<button type=\"button\" id=\"all\" aria-pressed=\"false\">Show all</button></nav>"
