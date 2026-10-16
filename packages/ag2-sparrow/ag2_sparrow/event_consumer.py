@@ -22,6 +22,7 @@ import os
 import time
 
 from .chat_secret_filter import filter_chat_secrets
+from .local_task_protocol import local_time_value
 
 MEANINGFUL_TYPES = frozenset({
     "message.created", "message.edited", "reaction.added",
@@ -140,6 +141,7 @@ class TaskifyHandler:
         body = "\n".join([
             f"id: {task_id}",
             "timestamp: " + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "local_time: " + local_time_value(),
             f"task: [taskify] {n} room events — review and act if needed "
             f"(promoted from {n} subscribed events in {room})",
             "source: events-promotion",

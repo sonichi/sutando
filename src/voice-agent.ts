@@ -598,6 +598,8 @@ let voiceSessionRef: VoiceSession | null = null;
 // the sessionEnding turn.end sweep.
 // Runs right before a clear: the call's report keeps what is about to go.
 let beforeConversationClear: () => void = () => {};
+// Skills told each time the user's speech is transcribed (onUserSpoke).
+const userSpokeHandlers: Array<() => void> = [];
 // The compressed summary of the older conversation (bodhi keeps the slot, sutando fills it).
 const conversationSummary = createConversationSummarizer({
 	context: () => voiceSessionRef?.conversationContext ?? null,
@@ -1401,6 +1403,17 @@ async function main() {
 			} catch { /* test-only */ }
 		}, 250);
 	}
+	// Skills told when the user speaks (onUserSpoke): a change held for a spoken yes is not released by the model alone.
+	(() => {
+		const transport = (session as unknown as { transport?: { onInputTranscription?: (text: string) => void } }).transport;
+		if (!transport) return;
+		const orig = typeof transport.onInputTranscription === 'function' ? transport.onInputTranscription.bind(transport) : null;
+		transport.onInputTranscription = (text: string) => {
+			orig?.(text);
+			if (typeof text !== 'string' || !text.trim()) return;
+			for (const h of userSpokeHandlers) { try { h(); } catch { /* a skill's own fault */ } }
+		};
+	})();
 	// Native audio streams transcript and audio concurrently, so suppression reaches only
 	// the REMAINING chunks of a turn — anything already sent cannot be recalled.
 	(() => {
@@ -1546,6 +1559,7 @@ async function main() {
 		setVoiceSessionOrigin,
 		getVoiceSessionOrigin,
 		setVoiceTaskOriginResolver,
+		onUserSpoke: (handler) => { userSpokeHandlers.push(handler); },
 	}, (msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
 	// Audio-duck relay: flag the slide server (localhost:7877) when Sutando is

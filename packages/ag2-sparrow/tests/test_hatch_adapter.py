@@ -212,6 +212,32 @@ class HookScript(Base):
         self.assertEqual(first["result_file"], str(self.results / "task-1784700000001.txt"))
         self.assertEqual((second["event_id"], second["thread_root"]), ("$mention", "$thread"))
 
+    def test_a_batch_wake_reply_bound_to_the_wrong_item_is_refused(self):
+        # Words of the first item's snippet against the second item's result_file.
+        self.add_task("task-1784700000001", "$room", mtime=1000,
+                      body="@watch-agent what is 6 times 7?")
+        self.add_task("task-1784700000002", "$dm", mtime=2000,
+                      text=task_text("task-1784700000002", "$dm", "@bob:ag2.space",
+                                     body="remind me to renew the passport")
+                      .replace("!room:", "!dm:"))
+        self.assertEqual(self.run_script().returncode, 0)
+        room, dm = self.payload()["matches"]
+        self.assertNotEqual(room["room_id"], dm["room_id"])
+        words = room["snippet"].split("] ", 1)[1]
+        env = py_env(self.home)
+        env["SPARROW_HATCH_CONFIG"] = str(self.config)
+        with mock.patch.object(outbox, "_activity_completed", return_value=None):
+            r = run_main(hatch_cli.main, ["reply", "--answering", words, dm["result_file"],
+                                          "--body", "@bob:ag2.space 42", "--wait", "0"], env)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertFalse(Path(dm["result_file"]).exists())
+            self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
+            self.assertIn(room["result_file"], r.stderr)
+            r = run_main(hatch_cli.main, ["reply", "--answering", words, room["result_file"],
+                                          "--body", "@bob:ag2.space 42", "--wait", "0"], env)
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
+        self.assertEqual(Path(room["result_file"]).read_text(), "@bob:ag2.space 42")
+
     def test_seen_task_does_not_wake_again(self):
         self.add_task("task-1784700000001", "$reply")
         self.run_script()
@@ -455,13 +481,17 @@ class HookScript(Base):
         self.assertEqual(self.run_script(ACTIVITY_FILE=str(marker)).returncode, 0)
         note = self.payload()["worker_note"]
         self.assertTrue(note.startswith("First touch " + str(marker)))
-        for phrase in ("ag2-sparrow-hatch reply <its result_file>", "reply text on stdin",
+        for phrase in ("ag2-sparrow-hatch reply --answering '<words>' <its result_file>",
+                       "3 or more consecutive words copied from that item's own snippet",
+                       "refuses words that are not that item's message",
+                       "answer with the result_file it names", "reply text on stdin",
                        "starting by tagging its sender", "full Matrix ID (@name:server",
                        "Exit 0 printing posted is the only proof",
                        "Exit 2 wrote nothing", "On exit 3 (queued, not confirmed) or 1 (not posted) "
                        "do not retry", "put the item in a HANDOFF block",
                        "needs no answer", "especially from another agent", "post nothing for it",
-                       "ag2-sparrow-hatch reply --no-send <its result_file>",
+                       "ag2-sparrow-hatch reply --no-send --answering '<words>' <its result_file>",
+                       "answering: the <words> from its snippet",
                        "do NOT ask for it in the room", "HANDOFF", "room_id", "sender:",
                        "result_file", "reply:", "Copy ids and paths exactly"):
             self.assertIn(phrase, note)
@@ -1367,7 +1397,9 @@ class DocumentedCommands(unittest.TestCase):
         prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
         for phrase in ("Answer from the snippet", "only when it is not enough, read task_file",
                        "Do not read the room",
-                       "Compute directly and don't stop to verify simple arithmetic or facts"):
+                       "Compute directly and don't stop to verify simple arithmetic or facts",
+                       "reply --answering '<words>' <result_file>",
+                       "take result_file and words from one item"):
             self.assertIn(phrase, prompt)
 
 
@@ -1387,9 +1419,11 @@ class Reply(Base):
         return env
 
     def reply(self, *args, stdin=None):
+        # Every task here says "approve?"; ReplyBinding covers the words themselves.
         with mock.patch.object(sys, "stdin", io.StringIO(stdin or "")), \
                 mock.patch.object(outbox, "_activity_completed", return_value=None):
-            return run_main(hatch_cli.main, ["reply", *args], self.env())
+            return run_main(hatch_cli.main, ["reply", "--answering", "approve", *args],
+                            self.env())
 
     def sparrow(self, outcome):
         """Sparrow's side: once the reply lands, record its outcome the way the drain does."""
@@ -1535,8 +1569,8 @@ class Reply(Base):
         self.assertEqual(self.reply(str(self.result_file), "--body", "x").returncode, 2)
 
     def test_two_concurrent_replies_publish_exactly_one(self):
-        cmd = [sys.executable, "-m", "ag2_sparrow.adapters.hatch.cli", "reply",
-               str(self.result_file), "--wait", "0.5", "--body"]
+        cmd = [sys.executable, "-m", "ag2_sparrow.adapters.hatch.cli", "reply", "--answering",
+               "approve", str(self.result_file), "--wait", "0.5", "--body"]
         procs = [subprocess.Popen(cmd + [f"reply {i}"], env=self.env(), cwd=str(self.home),
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                  for i in range(6)]
@@ -1546,6 +1580,179 @@ class Reply(Base):
             p.stderr.close()
         self.assertEqual(codes, [1, 1, 1, 1, 1, 3])
         self.assertRegex(self.result_file.read_text(), r"^reply \d$")
+
+
+class ReplyBinding(Base):
+    """A batch wake lists several items; a reply is refused unless the message it says it
+    answers is the one whose result_file it names."""
+    ROOM, DM = "task-1784700000001", "task-1784700000002"
+
+    def setUp(self):
+        super().setUp()
+        self.add_task(self.ROOM, "$room", sender="@chi:ag2.space", mtime=1000,
+                      body="@chi-muse:ag2.space what is 6 times 7?")
+        dm = task_text(self.DM, "$dm", "@chi:ag2.space",
+                       body="remind me to renew the passport").replace("!room:", "!dm:")
+        self.add_task(self.DM, "$dm", text=dm, mtime=1001)
+        self.room_result = self.results / f"{self.ROOM}.txt"
+        self.dm_result = self.results / f"{self.DM}.txt"
+
+    def reply(self, *args):
+        env = py_env(self.home)
+        env.update(AGENT_CONNECT_RESULT_DIR=str(self.results),
+                   AGENT_CONNECT_TASK_DIR=str(self.tasks),
+                   AGENT_CONNECT_STATE_DIR=str(self.home / "state"))
+        with mock.patch.object(sys, "stdin", io.StringIO("")), \
+                mock.patch.object(outbox, "_activity_completed", return_value=None):
+            return run_main(hatch_cli.main, ["reply", *args], env)
+
+    def test_the_room_answer_sent_to_the_dm_result_file_is_refused(self):
+        # The incident: the room's answer, run against the DM item's result_file.
+        r = self.reply(str(self.dm_result), "--answering", "what is 6 times 7",
+                       "--body", "@chi:ag2.space 42", "--wait", "0")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertFalse(self.dm_result.exists())
+        self.assertIn(f"not the message of {self.DM}", r.stderr)
+        self.assertIn(str(self.room_result), r.stderr)
+        self.assertIn("remind me to renew the passport", r.stderr)
+        # Nothing reached the outbox or any result file.
+        self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
+        # The same reply against its own item goes through.
+        r = self.reply(str(self.room_result), "--answering", "what is 6 times 7",
+                       "--body", "@chi:ag2.space 42", "--wait", "0")
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
+        self.assertEqual(self.room_result.read_text(), "@chi:ag2.space 42")
+
+    def test_a_reply_that_names_no_message_writes_nothing(self):
+        r = self.reply(str(self.dm_result), "--body", "@chi:ag2.space 42", "--wait", "0")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--answering", r.stderr)
+        self.assertFalse(self.dm_result.exists())
+
+    def test_no_send_is_bound_the_same_way(self):
+        r = self.reply(str(self.dm_result), "--no-send", "--answering", "what is 6 times 7")
+        self.assertEqual(r.returncode, 2)
+        self.assertFalse(self.dm_result.exists())
+        self.assertEqual(self.reply(str(self.dm_result), "--no-send", "--answering",
+                                    "renew the passport").returncode, hatch_cli.REPLY_POSTED)
+
+    def test_text_without_spaces_is_matched_on_characters(self):
+        a, b = "task-1784700000003", "task-1784700000004"
+        self.add_task(a, "$a", sender="@susan:ag2.space", mtime=1002,
+                      body="你好，帮我查一下明天纽约的天气，谢谢")
+        self.add_task(b, "$b", text=task_text(b, "$b", "@susan:ag2.space",
+                                              body="明日の会議は何時からですか")
+                      .replace("!room:", "!dm:"), mtime=1003)
+        a_result, b_result = self.results / f"{a}.txt", self.results / f"{b}.txt"
+        # A's words against B's result_file: refused, and the error names A.
+        r = self.reply(str(b_result), "--answering", "明天纽约的天气",
+                       "--body", "@susan:ag2.space 晴", "--wait", "0")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn(str(a_result), r.stderr)
+        self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
+        # A part of A's message, not the whole of it, binds the reply to A.
+        r = self.reply(str(a_result), "--answering", "帮我查一下明天纽约的天气",
+                       "--body", "@susan:ag2.space 晴", "--wait", "0")
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
+        self.assertEqual(a_result.read_text(), "@susan:ag2.space 晴")
+        self.assertEqual(self.reply(str(b_result), "--no-send", "--answering",
+                                    "明日の会議").returncode, hatch_cli.REPLY_POSTED)
+
+    def emoji_tasks(self):
+        a, b = "task-1784700000006", "task-1784700000007"
+        self.add_task(a, "$a", sender="@chi:ag2.space", mtime=1005, body="\U0001F44D")
+        self.add_task(b, "$b", sender="@chi:ag2.space", mtime=1006,
+                      body="\U0001F44D\U0001F44E")
+        return self.results / f"{a}.txt", self.results / f"{b}.txt"
+
+    def test_an_emoji_answer_sent_to_a_longer_emoji_message_writes_nothing(self):
+        a_result, b_result = self.emoji_tasks()
+        r = self.reply(str(b_result), "--answering", "\U0001F44D",
+                       "--body", "@chi:ag2.space yes", "--wait", "0")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn(str(a_result), r.stderr)
+        self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
+        r = self.reply(str(a_result), "--answering", "\U0001F44D",
+                       "--body", "@chi:ag2.space yes", "--wait", "0")
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
+        self.assertEqual(a_result.read_text(), "@chi:ag2.space yes")
+
+    def test_no_send_with_an_emoji_of_another_message_writes_nothing(self):
+        a_result, b_result = self.emoji_tasks()
+        r = self.reply(str(b_result), "--no-send", "--answering", "\U0001F44D")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
+        self.assertEqual(self.reply(str(b_result), "--no-send", "--answering",
+                                    "\U0001F44D \U0001F44E").returncode, hatch_cli.REPLY_POSTED)
+
+    def test_a_message_without_words_is_named_only_in_full(self):
+        up, both = "\U0001F44D", "\U0001F44D\U0001F44E"
+        for body in (both, f"[AG2Space Chi] {both}", f"[AG2Space Chi] @a:b {both}"):
+            self.assertFalse(hatch_cli.answers(body, up), body)
+            self.assertFalse(hatch_cli.answers(body, "\U0001F44E"), body)
+            self.assertTrue(hatch_cli.answers(body, both), body)
+            self.assertTrue(hatch_cli.answers(body, f" {up} \U0001F44E "), body)
+        for body in (up, f"[AG2Space Chi] {up}", f"[AG2Space Chi] @a:b {up}"):
+            self.assertTrue(hatch_cli.answers(body, up), body)
+            self.assertFalse(hatch_cli.answers(body, both), body)
+            self.assertFalse(hatch_cli.answers(body, ""), body)
+        # The sender prefix is not part of the message, as for a message with words.
+        self.assertFalse(hatch_cli.answers(f"[AG2Space Chi] {both}", f"[AG2Space Chi] {up}"))
+        self.assertFalse(hatch_cli.answers(f"[AG2Space Chi] {up}", f"[AG2Space Chi] {up}"))
+
+    def test_a_message_without_words_counts_its_punctuation(self):
+        up = "\U0001F44D"
+        self.assertFalse(hatch_cli.answers(f"[AG2Space Chi] {up}!", up))
+        self.assertTrue(hatch_cli.answers(f"[AG2Space Chi] {up}!", f"{up}!"))
+        self.assertFalse(hatch_cli.answers(f"[AG2Space Chi] {up}?", f"{up}!"))
+
+    def test_an_emoji_answer_without_its_punctuation_writes_nothing(self):
+        tid = "task-1784700000008"
+        self.add_task(tid, "$a", sender="@chi:ag2.space", mtime=1007, body="\U0001F44D!")
+        r = self.reply(str(self.results / f"{tid}.txt"), "--answering", "\U0001F44D",
+                       "--body", "@chi:ag2.space yes", "--wait", "0")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
+
+    def test_the_message_replied_to_does_not_bind_the_reply(self):
+        tid = "task-1784700000005"
+        body = broker_reply_body("@ann:ag2.space", "please review the hatch pull request",
+                                 "sure, looking at it now")
+        self.add_task(tid, "$r", text=task_text(tid, "$r", "@bob:ag2.space", body=body,
+                                                prefix="", reply_to="$orig"), mtime=1004)
+        result = self.results / f"{tid}.txt"
+        r = self.reply(str(result), "--no-send", "--answering", "review the hatch")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertFalse(result.exists())
+        self.assertEqual(self.reply(str(result), "--no-send", "--answering",
+                                    "looking at it").returncode, hatch_cli.REPLY_POSTED)
+
+    def test_what_counts_as_the_message(self):
+        ok = ("What is 6 times 7", "  what IS 6, times 7?! ", "6 times 7")
+        for words in ok:
+            self.assertTrue(hatch_cli.answers("@chi-muse:ag2.space what is 6 times 7?", words),
+                            words)
+        # Too few words; a mention or the sender prefix, which many messages share; a miss.
+        bad = ("times 7", "chi-muse ag2 space what", "AG2Space bob what is",
+               "what is 6 times 8", "")
+        for words in bad:
+            self.assertFalse(hatch_cli.answers("[AG2Space bob] @chi-muse:ag2.space what is 6 "
+                                               "times 7?", words), words)
+        # A message shorter than the minimum is named in full.
+        self.assertTrue(hatch_cli.answers("[AG2Space bob] @a:b approve?", "approve"))
+        self.assertTrue(hatch_cli.answers("[AG2Space bob] \U0001F44D", "\U0001F44D"))
+        # A Matrix reply fallback quotes an earlier message, not this one.
+        cjk = "[AG2Space Susan] 帮我查一下明天的天气"
+        for words in ("明天的天气", "帮我查一下", "明天的天气。", "帮我查一下明天的天气"):
+            self.assertTrue(hatch_cli.answers(cjk, words), words)
+        # Too few characters; characters not in that order; another message's characters.
+        for words in ("天气", "的天气", "天气的明天", "后天的天气", "Susan 帮我查"):
+            self.assertFalse(hatch_cli.answers(cjk, words), words)
+        self.assertTrue(hatch_cli.answers("[AG2Space s] 明日の天気を教えて", "明日の天気"))
+        self.assertTrue(hatch_cli.answers("[AG2Space s] 好的", "好的"))
+        folded = "[AG2Space bob] > <@a:b> what is 6 times 7  thanks a lot"
+        self.assertFalse(hatch_cli.answers(folded, "what is 6 times 7"))
+        self.assertTrue(hatch_cli.answers(folded, "thanks a lot"))
 
 
 if __name__ == "__main__":

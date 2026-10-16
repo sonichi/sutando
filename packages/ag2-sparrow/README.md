@@ -218,9 +218,19 @@ vouches for a `reply_context` (`sender` and
 `body` of the message replied to, and `label`, the broker's own wording for that
 block, passed through verbatim), plus a
 `worker_note` with the rules: touch the activity marker first, answer from the
-snippet, and post each reply with `ag2-sparrow-hatch reply <result_file>`, the
-text on stdin, tagging anyone by full Matrix ID (`@name:server`), never a
-short `@name`. `install` writes that command's absolute path into the prompt
+snippet, and post each reply with
+`ag2-sparrow-hatch reply --answering '<words>' <result_file>`, the text on stdin,
+tagging anyone by full Matrix ID (`@name:server`), never a short `@name`.
+`--answering` names the message the reply answers: 3 or more consecutive words
+of it, or 4 or more consecutive characters of text written without spaces such
+as Chinese, Japanese or Thai (the whole message when shorter; case, punctuation and @-mentions do not
+count, and neither do the sender prefix or a quoted reply fallback). A message
+with no words, such as one that is only emoji, is named by quoting all of it
+exactly, punctuation included: `👍!` is not answered by `👍`. A wake can
+list several items, and the command refuses, writing nothing, a reply whose
+words are not the message of the item whose `result_file` it names, and points
+to the item they do belong to; so an answer run against another item's
+`result_file` is never posted into that item's room. `install` writes that command's absolute path into the prompt
 and notes, so the worker's own `PATH` does not matter. The command writes the
 item's `result_file` once (a second reply to the same task is refused), and
 Sparrow sends it through its own outbox as a reply to the message (in its thread
@@ -231,7 +241,7 @@ and 1 when Sparrow refused or withheld it or the task already has a result; exit
 `[REPLIED]`, `[channel:]`, `[thread]` or `[file:]`, which a reply may not use).
 Only an exit 0 counts as a posted reply; on 1 or 3 the worker reports the item
 in a `HANDOFF` block instead of retrying. An item that needs no answer is closed
-with `ag2-sparrow-hatch reply --no-send <result_file>`, and work that needs
+with `ag2-sparrow-hatch reply --no-send --answering '<words>' <result_file>`, and work that needs
 GitHub, connectors, credentials or a browser ends in a `HANDOFF` block for the
 main session. For a sender who is not the owner, the
 note itself states the limits (no irreversible actions, configuration changes,
