@@ -1,6 +1,6 @@
 ---
 name: tutorial
-description: "Show a new owner what to try first. Voice: on \"tutorial\", \"walk me through\" or \"show me what you can do\", walk the workspace tutorial one short section at a time. AG2 Space: right after the first-contact greeting in the owner's DM, create (or refresh) one \"Getting started\" HTML page there, a short AG2 Space tour with one thing to try per part, and summon the owner to it."
+description: "Show a new owner what to try first. Voice: on \"tutorial\", \"walk me through\" or \"show me what you can do\", walk the workspace tutorial one short section at a time. AG2 Space: on an owner DM message with a line `/tutorial` (the setup app ends the first-contact message with one), after the greeting, create (or refresh) one \"Getting started\" HTML page there, a short AG2 Space tour with one thing to try per part, and summon the owner to it."
 user-invocable: true
 ---
 
@@ -23,8 +23,11 @@ morning briefing) gets one sentence on connecting it, not the full step.
 
 ## AG2 Space mode: the Getting started page
 
-Used at first contact with the owner (the engine's "First contact with your owner" rules), and
-whenever the owner asks for the tutorial in their AG2 Space DM.
+Used when an owner message in their AG2 Space DM has a line that is exactly `/tutorial`, or the owner
+asks for the tutorial there. The setup app ends the automatic first-contact message with that line,
+so the page follows the first greeting; the owner can send `/tutorial` again at any time. Run the
+script below by its path: a core that cannot find skills by name still has it. The line asks for
+this page and nothing else.
 
 **The greeting comes first.** Send the first-contact reply in the DM before anything here. The page
 is extra: if any step below fails, the greeting stands. Do not edit, retract or repeat it, and do
@@ -38,7 +41,7 @@ not retry the page in the same turn.
 
    Your mxid is `$AGENT_MXID`, else the AG2 Space channel env file's, else `--agent-mxid`.
 2. Tailor the prompts when you know the owner's work. You know it when either:
-   - the first-contact message ends with a line `I picked: <labels>.`, for example
+   - the first-contact message has a line `I picked: <labels>.`, for example
      `I picked: Founder, Product Manager.`. These are the persona labels the owner chose at
      onboarding, or their slugs when the client had no labels; or
    - `user_profile.md` already says what they do.
@@ -52,8 +55,8 @@ not retry the page in the same turn.
    Pass the file as `--prompts <file>`, and pass the `I picked:` payload verbatim as
    `--roles "Founder, Product Manager."` (the whole line, `I picked:` included, works too). Do not
    map it to slugs: the script takes labels or slugs and adds a "Picked for: Founder, Product
-   Manager" line under the heading. Otherwise leave both
-   out. A missing, bad or partly bad file never fails the run: each slot without a usable prompt
+   Manager" line under the heading. Without `--roles`, the saved inputs' `roles` are used (step 3).
+   Otherwise leave both out. A missing, bad or partly bad file never fails the run: each slot without a usable prompt
    keeps the generic one.
 3. Create or refresh the page and summon the owner to it:
 
@@ -61,6 +64,13 @@ not retry the page in the same turn.
    python3 skills/tutorial/scripts/getting_started.py publish \
      --room '<owner DM room id>' --name '<your name or auto>' --owner '<owner mxid>'
    ```
+
+   Every flag is optional when the setup app saved the inputs:
+   `<workspace>/state/onboarding/tutorial-inputs.json` holds `room` (the owner's DM), `owner`,
+   `agent_mxid` and `roles` (the picked personas), and `publish` fills whatever the command line
+   leaves out from it; `--name` defaults to `auto`. The file's `owner` and `roles` apply only when
+   publishing in its own `room`. A missing or malformed file, or a field of the wrong shape, is
+   ignored; with no `--room` and no usable saved room, the script exits 2.
 
    You need not source any env file. `room_commons.py` is found beside this skill, else in the
    installed skills directory. When the environment names none of its credentials, they are read
