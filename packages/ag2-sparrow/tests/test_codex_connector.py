@@ -184,6 +184,25 @@ class EndToEndStubTest(unittest.TestCase):
             self.assertNotEqual(metrics(d)[0]["thread"], "stale-0001")
             self.assertTrue(any("thread/resume failed" in " ".join(map(str, c.args)) for c in spy.call_args_list))
 
+    def test_hanging_resume_times_out_and_falls_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_task(d, "task-chat-1", "one")
+            with mock.patch.object(cc, "log", wraps=cc.log) as spy:
+                rc = run_connector(d, once=1, extra=["--thread-id", "hang-0001", "--turn-timeout", "1"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(metrics(d)[0]["status"], "completed")
+            self.assertTrue(any("thread/resume failed" in " ".join(map(str, c.args)) for c in spy.call_args_list))
+
+    def test_turn_completing_before_the_interrupt_does_not_restart_the_server(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_task(d, "task-chat-1", "[[stall-late]] finishes as the interrupt lands")
+            with mock.patch.object(cc, "log", wraps=cc.log) as spy:
+                self.assertEqual(run_connector(d, once=1, extra=["--turn-timeout", "0.5"]), 0)
+            one = (Path(d) / "results" / "task-chat-1.txt").read_text()
+            self.assertIn("STUB late finish", one)
+            self.assertNotIn("restarted", one)
+            self.assertEqual(len([c for c in spy.call_args_list if c.args and c.args[0] == "spawned"]), 1)
+
     def test_stalled_turn_is_interrupted_before_the_next_task(self):
         with tempfile.TemporaryDirectory() as d:
             now = time.time()

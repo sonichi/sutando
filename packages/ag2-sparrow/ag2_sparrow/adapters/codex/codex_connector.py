@@ -117,6 +117,8 @@ def parse_task(path):
     headers["access_tier"] = tier if tier in local_task_protocol.BROKER_WIRE_TIERS else "guest"
     body = parsed.body.strip()
     if (headers.get("task_layout") or "").strip() == "mid":
+        # The gateway folds the message onto one line, so line 1 is the message and
+        # every later non-header line is bridge-written (guardrail, secret notice).
         message, _, rest = body.partition("\n")
         return headers, message.strip(), [l for l in rest.split("\n") if l.strip()]
     return headers, body, []
@@ -203,11 +205,11 @@ class Connector:
         if thread_id:
             params = dict(self.thread_params(), threadId=thread_id)
             try:
-                res = self.rpc.request("thread/resume", params)
+                res = self.rpc.request("thread/resume", params, timeout=self.args.turn_timeout)
                 self.thread_id = res["thread"]["id"]
                 log("resumed thread", self.thread_id)
                 return
-            except RuntimeError as e:
+            except (RuntimeError, TimeoutError) as e:
                 log("thread/resume failed, starting a new thread:", str(e)[:200])
         params = dict(self.thread_params(), ephemeral=self.args.ephemeral)
         if self.args.developer_instructions:
@@ -305,10 +307,11 @@ class Connector:
         try:
             self.rpc.request("turn/interrupt", {"threadId": self.thread_id, "turnId": turn_id},
                              timeout=self.args.interrupt_grace)
-            done = self.wait_turn(turn_id, self.args.interrupt_grace)
         except (TimeoutError, RuntimeError) as e:
             log("turn/interrupt failed:", str(e)[:200])
-            done = None
+        # A turn that completed between the deadline and the interrupt is already queued
+        # as turn/completed; reading it here is what keeps the server from a needless restart.
+        done = self.wait_turn(turn_id, self.args.interrupt_grace)
         if done is not None:
             return "timeout", done[1], {"message": "turn timeout; interrupted (%s)" % done[0]}
         if self.args.server == "proxy":

@@ -59,6 +59,8 @@ for line in sys.stdin:
         if meth == "thread/resume" and tid.startswith("stale-"):
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "no rollout found for thread id " + tid}})
             continue
+        if meth == "thread/resume" and tid.startswith("hang-"):
+            continue   # never answers: the client's timeout must fall back
         THREADS[tid] = {"cwd": p.get("cwd", "/"), "params": p}
         send({"jsonrpc": "2.0", "id": rid, "result": {"thread": thread_obj(tid), "model": p.get("model") or "stub-model",
                                                       "modelProvider": "stub", "cwd": THREADS[tid]["cwd"],
@@ -77,7 +79,7 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": tid, "turn": {"id": turn_id, "status": "inProgress", "items": []}}})
         item_id = str(uuid.uuid4())
         if "[[stall" in text:
-            STALLED[turn_id] = (tid, "[[stall-hard]]" in text)
+            STALLED[turn_id] = (tid, "late" if "[[stall-late]]" in text else "[[stall-hard]]" in text)
         elif "[[approval]]" in text:
             REQ_ID += 1
             PENDING[REQ_ID] = (tid, turn_id, item_id, reply)
@@ -86,6 +88,12 @@ for line in sys.stdin:
         else:
             finish_turn(tid, turn_id, item_id, reply)
     elif meth == "turn/interrupt":
+        late = STALLED.get(p.get("turnId"), (None, None))[1] == "late"
+        if late:   # completed just before the interrupt landed: finish, then refuse it
+            tid = STALLED.pop(p["turnId"])[0]
+            finish_turn(tid, p["turnId"], str(uuid.uuid4()), "STUB late finish")
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32600, "message": "no active turn"}})
+            continue
         send({"jsonrpc": "2.0", "id": rid, "result": {}})
         tid, hard = STALLED.get(p.get("turnId"), (None, True))
         if tid is not None and not hard:
