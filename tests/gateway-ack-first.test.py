@@ -865,6 +865,41 @@ class ThroughTheLoop(unittest.TestCase):
         self.assertEqual((self.relay.acks, self.relay.status_reads), ([ASK_A, ASK_A], [ASK_A]))
         self.assertEqual((self.staged(), self.entry()), ([], {}))
 
+    def test_a_cap_lowered_while_an_ask_was_staged_keeps_it_held_instead_of_replaying_it(self):
+        """A staged ask freezes its whole policy envelope — the `access_tier` line, that
+        tier's in-band guardrail, the owner-only prelude — and a resume publishes that
+        text verbatim. So an operator who lowers the gateway's cap between the stage and
+        the publish must not be overridden by replay: the ask had never been acked or
+        exposed to the core, and republishing it would grant exactly the capability that
+        was just withdrawn."""
+        self.relay.queue.append(voice_ask(ASK_A))              # owner-attested
+        self.bridges.crashed(self.bridges.start(crash="before-publish"), "the publish")
+        self.assertEqual(len(self.staged()), 1, "nothing was staged to replay")
+        self.bridges.env["REMOTE_TASK_TIER"] = "guest"         # the operator restricts it
+        bridge = self.bridges.start()
+        self.bridges.wait_logged(bridge, "kept staged, not published")
+        self.bridges.polls_after(bridge)
+        self.bridges.stop(bridge)
+        self.assertEqual(self.bridges.fired(), [],
+                         "the owner-tier envelope was published under a guest cap")
+        self.assertFalse(self.task.exists(), "the frozen owner envelope reached the core")
+        self.assertEqual(len(self.staged()), 1, "the ask was dropped instead of kept held")
+        self.assertIn(ASK_A, self.state("gateway-status").get("ack_first_unresolved", [None])[0]
+                      or "", "a withheld ask was not reported in the gateway status")
+
+    def test_an_unchanged_cap_still_publishes_the_staged_ask(self):
+        """The control for the test above: the withholding must key on the cap actually
+        dropping, not merely on a restart having happened — otherwise every resume would
+        stall and the stall would look like the fix working."""
+        self.relay.queue.append(voice_ask(ASK_A))
+        self.bridges.crashed(self.bridges.start(crash="before-publish"), "the publish")
+        bridge = self.bridges.start()                          # same cap, no env change
+        self.bridges.wait_for(lambda: self.bridges.fired(), bridge, "the publish after restart")
+        self.bridges.polls_after(bridge)
+        self.bridges.stop(bridge)
+        self.assertEqual(self.bridges.fired(), [f"{ASK_A}.txt"], "the ask did not publish once")
+        self.assertEqual((self.staged(), self.entry()), ([], {}))
+
     def test_a_crash_after_the_staged_file_and_before_its_entry_leaves_nothing_behind(self):
         self.relay.queue.append(voice_ask(ASK_A))
         self.bridges.crashed(self.bridges.start(crash="before-entry"), "the entry")

@@ -4615,6 +4615,10 @@ def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
             _drop_staged(staged)
             _clear_held(tid, "already published — the staged copy left beside it was dropped")
             return False
+    # After the ack, before the publish: the entry stays held and accepted, so
+    # exactly-once is untouched and only the publication waits.
+    if _staged_tier_withdrawn(tid, staged):
+        return False
     if not _publish_staged(staged, dest):
         return False
     served = _HELD_TASKS.pop(tid, None)
@@ -4648,6 +4652,54 @@ def _advance_held_tasks(inflight: "set[str]") -> bool:
                          f"{ACK_FIRST_UNRESOLVED_AFTER_S} s after it was staged — reported in the "
                          "gateway status, still retrying")
     return published
+
+
+def _staged_policy_tier(staged: Path) -> "tuple[str, str] | None":
+    """The access tier frozen into a staged task and the sender it names, or None when
+    the file cannot be read or carries no tier.
+
+    Read from the ARTIFACT, not from the manifest entry: the staged body is what a
+    resume publishes, so it is what has to be re-examined, and a task staged by an
+    older build is then covered by the same check without a schema migration. The
+    trusted parser is the correct one by writer — this module wrote the file and
+    newline-strips every value, and it writes the locally-decided `access_tier`
+    last precisely so it beats anything the remote side claimed earlier.
+    """
+    try:
+        text = staged.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    headers = local_task_protocol.parse_task_headers_trusted(text).headers
+    frozen = headers.get("access_tier")
+    if not frozen:
+        return None
+    return _normalized_tier(frozen), (headers.get("user_id") or "")
+
+
+def _staged_tier_withdrawn(tid: str, staged: Path) -> bool:
+    """True when the capability a staged task froze is no longer granted locally.
+
+    A staged task freezes its whole policy envelope at stage time — the
+    `access_tier` line, that tier's in-band guardrail, the owner-only prelude —
+    and a resume publishes the text verbatim, so a cap the operator lowered in
+    between would be bypassed by replay alone. Re-resolving the frozen tier
+    through `_tier_for` cannot escalate it (the resolver takes the lower of
+    attested and local), so a drop means local access was genuinely withdrawn.
+    Unreadable or tier-less files answer False: refusing to publish on a failed
+    read would strand a task on a transient error.
+    """
+    frozen = _staged_policy_tier(staged)
+    if frozen is None:
+        return False
+    now = _tier_for(frozen[1], frozen[0])
+    if _TIER_RANK[now] >= _TIER_RANK[frozen[0]]:
+        return False
+    _HELD_UNRESOLVED.add(tid)
+    _log_backoff((tid, "tier-withdrawn"),
+                 f"ERROR ack_first task {tid}: staged as {frozen[0]} but local access is now "
+                 f"{now} — kept staged, not published; publishing would hand it the capability "
+                 "that was withdrawn. Reported in the gateway status")
+    return True
 
 
 def _held_overdue(staged: Path) -> bool:
