@@ -76,8 +76,10 @@ not retry the page in the same turn.
    - `name`: the name it used.
 
    On `created` it summons the owner, so the card in the DM is the one line that
-   carries the page: post no other message about it. On `updated` / `unchanged` it summons no one
-   (`--summon` forces it, e.g. when the owner asks for the tutorial again).
+   carries the page: post no other message about it. On `updated` / `unchanged` it summons no one,
+   including when it adopts a page it found by its ownership marker. The one exception is
+   finishing a page an earlier run created but did not complete. `--summon` forces a summon, e.g.
+   when the owner asks for the tutorial again.
 4. Exit 3 (room-commons not installed) or 4 (a room-commons call failed): leave the greeting as is
    and say nothing about the page unless the owner asks. A failure that is a Sutando or AG2 Space
    defect goes to `report-feedback`.

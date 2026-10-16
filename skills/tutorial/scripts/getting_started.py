@@ -423,7 +423,10 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
     result = {"ok": True, "action": action, "kind": kind, "summoned": False}
     if step["action"] == "adopt":
         result["adopted"] = True
-    if owner and (summon or action == "created" or step["pending"]):
+    # Summoned once: when this page's creation finishes (here, or resumed from our own pending
+    # entry). Adopting a page found by its ownership marker is not a creation.
+    first = action == "created" or step["action"] == "update" and step["pending"]
+    if owner and (summon or first):
         try:
             commons.run("summon", commons.room, owner, "--context", SUMMON_CONTEXT,
                         "--page-title", PAGE_TITLE, kind=kind)

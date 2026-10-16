@@ -1168,12 +1168,21 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(list(self.room()["pages"]), ["html-p1"])
 
     def test_lost_marker_recovers_the_page_by_its_ownership_marker(self):
-        self.publish()
+        self.publish(owner="@chi:ag2.space")
         self.marker.unlink()
-        out = self.publish()
+        out = self.publish(owner="@chi:ag2.space")
         self.assertEqual((out["action"], out["kind"], out.get("adopted")), ("unchanged", "html-p1", True))
+        self.assertFalse(out["summoned"])  # adopting is not a first creation: no second card
+        self.assertEqual([c[0] for c in self.room()["calls"]].count("summon"), 1)
         self.assertEqual(list(self.room()["pages"]), ["html-p1"])
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "complete")
+
+    def test_adopted_page_is_summoned_only_on_request(self):
+        self.publish(owner="@chi:ag2.space")
+        self.marker.unlink()
+        out = self.publish(owner="@chi:ag2.space", summon=True)
+        self.assertEqual((out.get("adopted"), out["summoned"]), (True, True))
+        self.assertEqual([c[0] for c in self.room()["calls"]].count("summon"), 2)
 
     def test_failed_append_stays_pending_and_the_next_run_finishes_it(self):
         os.environ["STUB_FAIL"] = "append"
