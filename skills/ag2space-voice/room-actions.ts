@@ -136,6 +136,8 @@ const pending = new Map<string, Pending>();
 let spoken: number | null = null;
 /** The host calls this each time the user's speech is transcribed. */
 export function noteUserSpoke(): void { spoken = (spoken ?? 0) + 1; }
+/** The host has a speech signal: from now on a yes needs speech, even before the user's first words (null stays "no signal"). */
+export function armSpeechGate(): void { if (spoken === null) spoken = 0; }
 /** Tests: no pending tokens, and (with `speech`) a host that reports speech, not yet spoken. */
 export function resetPendingConfirmations(speech = false): void { pending.clear(); spoken = speech ? 0 : null; }
 
@@ -193,7 +195,13 @@ export async function runAction(args: { action: string; room?: string; scope?: s
 		if (!p || at - p.issued > CONFIRM_TTL_MS) { pending.delete(token); return { ok: false, error: 'confirmation_expired' }; }
 		if (p.key !== key) { pending.delete(token); return { ok: false, error: 'confirmation_mismatch' }; }
 		// The yes is the user's: with the host's speech signal, the user must have spoken since the token was issued.
-		if (at - p.issued < CONFIRM_MIN_AGE_MS || (spoken !== null && spoken <= p.spoken)) return { ok: false, error: 'confirmation_too_soon' };
+		const tooYoung = at - p.issued < CONFIRM_MIN_AGE_MS;
+		const unspoken = spoken !== null && spoken <= p.spoken;
+		if (tooYoung || unspoken) {
+			// Which gate held it: the floor, or no speech since the token (null: the host has no speech signal).
+			deps.log?.(`[RoomActions] ${action} confirmation_too_soon (age ${at - p.issued}ms, spoken since issue ${spoken === null ? 'n/a' : spoken - p.spoken})`);
+			return { ok: false, error: 'confirmation_too_soon' };
+		}
 		if (p.revision !== revision) { pending.delete(token); return { ok: false, error: 'action_changed' }; }
 		// Spent before the call, with no await since the checks: a second call with this token now finds none.
 		pending.delete(token);

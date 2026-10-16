@@ -16,7 +16,7 @@ if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => 
 
 if (PRESENT) {
 const {
-	voicePolicy, findActions, describeAction, runAction, compactResult, canonicalJson, resetPendingConfirmations, noteUserSpoke,
+	voicePolicy, findActions, describeAction, runAction, compactResult, canonicalJson, resetPendingConfirmations, noteUserSpoke, armSpeechGate,
 	createFindActionsTool, createDescribeActionTool, createRunActionTool,
 	ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, ACTION_RESULT_MAX_CHARS, CONFIRM_MIN_AGE_MS, CONFIRM_TTL_MS,
 } = await import('../skills/ag2space-voice/room-actions.ts');
@@ -273,6 +273,33 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		noteUserSpoke();
 		assert.ok((await runAction({ ...RUN, confirm_token }, f.deps, now)).ok);
 		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 1);
+	});
+
+	it('a host with a speech signal arms the gate at registration: before the first words, a yes still needs speech', async () => {
+		resetPendingConfirmations();
+		const { setup } = await import('../skills/ag2space-voice/tools.ts');
+		setup({ onUserSpoke: () => {} } as never);
+		const f = change();
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS * 4;
+		// A typed first request: no transcript ever arrived, and the model calls again on its own.
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'confirmation_too_soon' });
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+		noteUserSpoke();
+		assert.ok((await runAction({ ...RUN, confirm_token }, f.deps, now)).ok);
+	});
+
+	it('arming leaves an existing count alone, and the held call logs which gate held it', async () => {
+		resetPendingConfirmations(true);
+		noteUserSpoke();
+		armSpeechGate();
+		const logs: string[] = [];
+		const f = change();
+		const deps = { ...f.deps, log: (m: string) => { logs.push(m); } };
+		const r = await runAction(RUN, deps, now) as { confirm_token: string };
+		t += CONFIRM_MIN_AGE_MS;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token: r.confirm_token }, deps, now), { ok: false, error: 'confirmation_too_soon' });
+		assert.ok(logs.some(l => /confirmation_too_soon \(age \d+ms, spoken since issue 0\)/.test(l)), logs.join('\n'));
 	});
 
 	it('speech before the token was issued does not count as the yes', async () => {
