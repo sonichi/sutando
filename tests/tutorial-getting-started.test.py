@@ -49,11 +49,9 @@ STUB = textwrap.dedent('''
         save(); print("boom", file=sys.stderr); sys.exit(1)
     if cmd == "pages":
         listed = [{"id": None, "kind": "html", "title": "Main"}]
-        listed += [{"id": k[5:], "kind": k, "title": "Getting started"} for k in db["pages"]]
+        listed += [{"id": k[5:], "kind": k, "title": db.get("titles", {}).get(k, "Getting started"),
+                    "by": db.get("by", {}).get(k, ""), "copy_of": None} for k in db["pages"]]
         print(json.dumps(listed))
-    elif cmd == "page-add":
-        k = "html-p%d" % db["next"]; db["next"] += 1; db["pages"][k] = ""
-        print(json.dumps({"ok": True, "id": k[5:], "kind": k, "title": rest[0]}))
     elif cmd == "read":
         print(json.dumps({"chars": 0, "peers": [], "text": db["pages"][kind]}))
     elif cmd == "append":
@@ -62,8 +60,6 @@ STUB = textwrap.dedent('''
         cur = db["pages"][kind]
         assert rest[0] in cur, "old text absent"
         db["pages"][kind] = cur.replace(rest[0], rest[1], 1)
-    elif cmd == "page-remove":
-        db["pages"].pop(rest[0], None)
     elif cmd == "summon":
         pass
     else:
@@ -725,12 +721,6 @@ class EdgeTest(unittest.TestCase):
             with self.assertRaisesRegex(gs.PublishError, "timed out"):
                 commons.run("pages", "!r:x")
 
-    def test_page_add_without_an_html_kind_is_refused(self):
-        commons = gs.Commons(Path("/nonexistent/rc.py"), "!r:x")
-        with mock.patch.object(gs.Commons, "run", return_value='{"ok": true, "kind": "markdown-x"}'):
-            with self.assertRaisesRegex(gs.PublishError, "no html page kind"):
-                commons.add_page("Getting started")
-
     def test_rewrite_of_an_empty_page_appends(self):
         commons = gs.Commons(Path("/nonexistent/rc.py"), "!r:x")
         calls = []
@@ -765,6 +755,10 @@ class MainTest(unittest.TestCase):
         ws = mock.patch.object(gs, "_workspace", return_value=self.tmp / "ws")
         ws.start()
         self.addCleanup(ws.stop)
+        self.door = FakeActions(self.tmp / "room.json", by="@kai.agent:example.test")
+        door = mock.patch.object(gs, "connect_actions", return_value=self.door)
+        door.start()
+        self.addCleanup(door.stop)
 
     def main(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -792,17 +786,18 @@ class MainTest(unittest.TestCase):
 
     def test_plan_reads_the_marker(self):
         code, out, _ = self.main("plan", "--room", self.ROOM)
-        self.assertEqual((code, json.loads(out)), (0, {"action": "create", "kind": None}))
+        self.assertEqual((code, json.loads(out)), (0, {"action": "create", "kind": None, "pending": False}))
 
     def test_publish_creates_then_reports_unchanged(self):
         code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
-                                 "--owner", "@owner:example.test", "--room-commons", str(self.stub))
+                                 "--owner", "@owner:example.test", "--room-commons", str(self.stub),
+                                 "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out), {"ok": True, "action": "created", "kind": "html-p1",
                                            "summoned": True, "name": "Blue"})
         with mock.patch.object(gs, "detect_core", return_value="codex"):
             code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue",
-                                     "--room-commons", str(self.stub))
+                                     "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
 
     def test_publish_without_room_commons_exits_3(self):
@@ -811,11 +806,11 @@ class MainTest(unittest.TestCase):
         self.assertEqual((code, json.loads(out)["reason"]), (3, "room-commons not installed"))
 
     def test_publish_failure_exits_4(self):
-        os.environ["STUB_FAIL"] = "page-add"
+        os.environ["STUB_FAIL"] = "pages"
         code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
                                  "--room-commons", str(self.stub))
         self.assertEqual(code, 4)
-        self.assertIn("page-add failed", json.loads(out)["reason"])
+        self.assertIn("pages failed", json.loads(out)["reason"])
 
 
 class MarkerTest(unittest.TestCase):
@@ -840,16 +835,67 @@ class MarkerTest(unittest.TestCase):
         self.assertEqual([p.name for p in self.path.parent.iterdir()], ["getting-started.json"])
 
     def test_plan(self):
-        rooms = {"!r:x": {"kind": "html-a"}}
-        self.assertEqual(gs.plan({}, "!r:x"), {"action": "create", "kind": None})
-        self.assertEqual(gs.plan(rooms, "!r:x"), {"action": "update", "kind": "html-a"})
-        self.assertEqual(gs.plan(rooms, "!r:x", ["html-a"]), {"action": "update", "kind": "html-a"})
-        self.assertEqual(gs.plan(rooms, "!r:x", ["html-b"]), {"action": "create", "kind": None})
-        self.assertEqual(gs.plan(rooms, "!other:x"), {"action": "create", "kind": None})
+        rooms = {"!r:x": {"kind": "html-a"}, "!p:x": {"kind": "html-p", "state": "pending"}}
+        create = {"action": "create", "kind": None, "pending": False}
+        listed = lambda *kinds: [{"kind": k, "title": "Other"} for k in kinds]  # noqa: E731
+        self.assertEqual(gs.plan({}, "!r:x"), create)
+        self.assertEqual(gs.plan(rooms, "!r:x"), {"action": "update", "kind": "html-a", "pending": False})
+        self.assertEqual(gs.plan(rooms, "!r:x", listed("html-a")), {"action": "update", "kind": "html-a", "pending": False})
+        self.assertEqual(gs.plan(rooms, "!p:x", listed("html-p")), {"action": "update", "kind": "html-p", "pending": True})
+        self.assertEqual(gs.plan(rooms, "!r:x", listed("html-b")), create)
+        self.assertEqual(gs.plan(rooms, "!other:x"), create)
+
+    def test_ownership_needs_this_agents_marker(self):
+        me, page = "@me:x", lambda by, **kw: {"kind": "html-g", "title": "Getting started", "by": by, **kw}  # noqa: E731
+        mark = gs.owner_marker(me)
+        self.assertTrue(gs.owned(page(me), "<html>" + mark, me))
+        self.assertTrue(gs.owned(page(""), mark, me))  # listing without a writer: the text decides
+        self.assertFalse(gs.owned(page(""), "<html>someone's notes</html>", me))
+        self.assertFalse(gs.owned(page(me), gs.owner_marker("@other:x"), me))
+        self.assertFalse(gs.owned(page("@other:x"), mark, me))
+        self.assertFalse(gs.owned(page(me), "", me))  # an empty page is never the tutorial's
+        self.assertFalse(gs.owned(page(""), "", me))
+        self.assertIsNone(gs.owned(page(me), mark, None))
+        self.assertEqual(gs.candidates([page(me), page(me, copy_of={"room": "!a:x"}),
+                                        {"kind": "html-n", "title": "Notes"}]), [page(me)])
+        self.assertEqual(gs.plan({}, "!r:x", [page(me)]), {"action": "reconcile", "kind": None, "pending": True})
+        creating = {"!r:x": {"state": "creating", "operation_id": "op-1"}}
+        self.assertEqual(gs.plan(creating, "!r:x", []),
+                         {"action": "resume", "kind": None, "pending": True, "operation_id": "op-1"})
+
+
+class FakeActions:
+    """room.commons.pages.create as the server keeps it: one page per operation_id, its first body
+    written once. `fail` = "before" refuses without creating; "after" creates, then loses the answer."""
+
+    def __init__(self, state: Path, by: str = "@agent:example.test"):
+        self.state, self.by, self.fail, self.ops, self.kind = state, by, None, [], None
+
+    def execute(self, room, action, arguments, operation_id=None):
+        assert action == gs.CREATE_ACTION and arguments["kind"] == "html", (action, arguments)
+        self.ops.append(operation_id)
+        if self.fail == "before":
+            self.fail = None
+            raise RuntimeError("connection reset")
+        db = json.loads(self.state.read_text()) if self.state.exists() else {"pages": {}, "calls": [], "next": 1}
+        made = db.setdefault("ops", {})
+        if operation_id not in made:
+            k = "html-p%d" % db["next"]
+            db["next"] += 1
+            db["pages"][k] = arguments["body"]
+            db.setdefault("by", {})[k] = self.by
+            made[operation_id] = k
+        db["calls"].append(["create", made[operation_id], operation_id])
+        self.state.write_text(json.dumps(db))
+        if self.fail == "after":
+            self.fail = None
+            raise TimeoutError("timed out after the server answered")
+        return {"kind": self.kind or made[operation_id], "surface": "html", "operation_id": operation_id}
 
 
 class PublishTest(unittest.TestCase):
     ROOM = "!dm:ag2.space"
+    ME = "@agent:example.test"
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -858,6 +904,7 @@ class PublishTest(unittest.TestCase):
         self.stub.write_text(STUB)
         self.state = base / "room.json"
         self.marker = gs.marker_path(base / "ws")
+        self.door = FakeActions(self.state)
         os.environ["STUB_STATE"] = str(self.state)
         os.environ.pop("STUB_FAIL", None)
 
@@ -871,41 +918,49 @@ class PublishTest(unittest.TestCase):
 
     def publish(self, name="Sutando", **kw):
         kw.setdefault("core", "codex")
-        return gs.publish(gs.Commons(self.stub, self.ROOM), self.marker, name, **kw)
+        kw.setdefault("agent", self.ME)
+        return gs.publish(gs.Commons(self.stub, self.ROOM, actions=lambda: self.door), self.marker, name, **kw)
+
+    def page(self, name="Sutando", core="codex", audience="dm"):
+        return gs.render_page(name, core, audience, self.ME)
+
+    def ops(self):
+        return [c for c in self.room()["calls"] if c[0] == "create"]
 
     def test_first_run_creates_writes_and_summons(self):
         out = self.publish(owner="@chi:ag2.space")
         self.assertEqual(out, {"ok": True, "action": "created", "kind": "html-p1", "summoned": True})
         room = self.room()
-        self.assertEqual(room["pages"], {"html-p1": gs.render_page("Sutando", "codex")})
-        parts = gs.chunks(gs.render_page("Sutando", "codex"))
+        self.assertEqual(room["pages"], {"html-p1": self.page()})
+        parts = gs.chunks(self.page())
         self.assertGreater(len(parts), 1)  # the page is over one write's limit
-        self.assertEqual([c[0] for c in room["calls"]], ["page-add"] + ["append"] * len(parts) + ["summon"])
-        self.assertTrue(all(c[2] <= gs.CHUNK_BYTES for c in room["calls"] if c[0] == "append"))
+        self.assertIn(gs.owner_marker(self.ME), parts[0])  # the create's own body carries ownership
+        self.assertEqual([c[0] for c in room["calls"]],
+                         ["pages", "create", "read", "append", "summon"])
+        appended = [c for c in room["calls"] if c[0] == "append"]
+        self.assertTrue(all(c[2] <= gs.CHUNK_BYTES for c in appended))
         self.assertEqual(room["calls"][-1], ["summon", "html-p1", "@chi:ag2.space"])
-        self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["kind"], "html-p1")
+        entry = gs.load_marker(self.marker)[self.ROOM]
+        self.assertEqual((entry["kind"], entry["state"]), ("html-p1", "complete"))
 
     def test_second_run_is_idempotent(self):
         self.publish(owner="@chi:ag2.space")
+        n = len(self.room()["calls"])
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual(out["action"], "unchanged")
-        self.assertFalse(out["summoned"])
-        room = self.room()
-        self.assertEqual(list(room["pages"]), ["html-p1"])
-        first = 1 + len(gs.chunks(gs.render_page("Sutando", "codex"))) + 1
-        self.assertEqual([c[0] for c in room["calls"]][first:], ["pages", "read"])
+        self.assertEqual((out["action"], out["summoned"]), ("unchanged", False))
+        self.assertEqual(list(self.room()["pages"]), ["html-p1"])
+        self.assertEqual([c[0] for c in self.room()["calls"]][n:], ["pages", "read"])
 
     def test_changed_content_rewrites_the_same_page(self):
         self.publish()
         out = self.publish(name="Kai")
         self.assertEqual(out["action"], "updated")
-        self.assertEqual(self.room()["pages"], {"html-p1": gs.render_page("Kai", "codex")})
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page("Kai")})
 
     def test_a_large_change_clears_in_pieces_then_appends_in_pieces(self):
         self.publish()
         before = len(self.room()["calls"])
-        old = gs.render_page("Sutando", "codex")
-        new = gs.render_page("Sutando", "claude")
+        old, new = self.page(), self.page(core="claude")
         self.assertGreater(len(old.encode()), gs.CHUNK_BYTES)
         out = self.publish(core="claude")
         self.assertEqual(out["action"], "updated")
@@ -938,14 +993,122 @@ class PublishTest(unittest.TestCase):
         self.assertEqual((out["action"], out["kind"]), ("created", "html-p2"))
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["kind"], "html-p2")
 
-    def test_failed_write_removes_the_empty_page_and_keeps_no_marker(self):
-        os.environ["STUB_FAIL"] = "append"
-        with self.assertRaises(gs.PublishError):
+    # --- create-once recovery -------------------------------------------------------------
+
+    def test_ambiguous_create_is_retried_with_the_same_operation_id(self):
+        self.door.fail = "after"
+        with self.assertRaisesRegex(gs.PublishError, "did not complete"):
             self.publish(owner="@chi:ag2.space")
-        room = self.room()
-        self.assertEqual(room["pages"], {})
-        self.assertNotIn("summon", [c[0] for c in room["calls"]])
+        entry = gs.load_marker(self.marker)[self.ROOM]
+        self.assertEqual(entry["state"], "creating")
+        out = self.publish(owner="@chi:ag2.space")
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("created", "html-p1", True))
+        self.assertEqual(self.door.ops, [entry["operation_id"]] * 2)
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
+
+    def test_resumed_create_with_changed_content_rewrites_the_first_body(self):
+        self.door.fail = "after"
+        with self.assertRaises(gs.PublishError):
+            self.publish(name="Old")
+        out = self.publish(name="New")
+        self.assertEqual((out["action"], out["kind"]), ("created", "html-p1"))
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page("New")})
+        self.assertEqual(len(set(self.door.ops)), 1)
+
+    def test_create_refused_before_landing_is_retried_with_the_same_operation_id(self):
+        self.door.fail = "before"
+        with self.assertRaises(gs.PublishError):
+            self.publish()
+        self.assertEqual(self.room()["pages"], {})
+        self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "creating")
+        out = self.publish()
+        self.assertEqual((out["action"], out["kind"]), ("created", "html-p1"))
+        self.assertEqual(len(set(self.door.ops)), 1)
+
+    def test_crash_after_create_before_recording_its_kind(self):
+        real, n = gs.save_marker, {"i": 0}
+
+        def flaky(path, rooms):
+            n["i"] += 1
+            if n["i"] == 2:  # the "pending" write, right after the create returned
+                raise OSError("killed")
+            real(path, rooms)
+        with mock.patch.object(gs, "save_marker", flaky):
+            with self.assertRaisesRegex(gs.PublishError, "could not record html-p1"):
+                self.publish()
+        self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "creating")
+        out = self.publish()
+        self.assertEqual((out["action"], out["kind"]), ("created", "html-p1"))
+        self.assertEqual(list(self.room()["pages"]), ["html-p1"])
+        self.assertEqual(self.room()["pages"]["html-p1"], self.page())
+        self.assertEqual(len(set(self.door.ops)), 1)
+
+    def test_marker_write_failure_after_the_page_is_whole(self):
+        real, n = gs.save_marker, {"i": 0}
+
+        def flaky(path, rooms):
+            n["i"] += 1
+            if n["i"] == 3:  # the "complete" write
+                raise OSError("disk full")
+            real(path, rooms)
+        with mock.patch.object(gs, "save_marker", flaky):
+            with self.assertRaisesRegex(gs.PublishError, "could not record html-p1"):
+                self.publish()
+        out = self.publish(owner="@chi:ag2.space")
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("unchanged", "html-p1", True))
+        self.assertEqual(list(self.room()["pages"]), ["html-p1"])
+
+    def test_lost_marker_recovers_the_page_by_its_ownership_marker(self):
+        self.publish()
+        self.marker.unlink()
+        out = self.publish()
+        self.assertEqual((out["action"], out["kind"], out.get("adopted")), ("unchanged", "html-p1", True))
+        self.assertEqual(list(self.room()["pages"]), ["html-p1"])
+        self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "complete")
+
+    def test_failed_append_stays_pending_and_the_next_run_finishes_it(self):
+        os.environ["STUB_FAIL"] = "append"
+        with self.assertRaises(gs.PublishError) as caught:
+            self.publish(owner="@chi:ag2.space")
+        self.assertIn("html-p1 stays recorded as pending", str(caught.exception))
+        self.assertNotIn("taken off", str(caught.exception))
+        self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "pending")
+        os.environ.pop("STUB_FAIL")
+        out = self.publish(owner="@chi:ag2.space")
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("updated", "html-p1", True))
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
+        self.assertEqual(len(self.door.ops), 1)
+
+    def test_a_create_answer_without_an_html_kind_is_refused(self):
+        self.door.kind = "markdown-abcdefgh"
+        with self.assertRaisesRegex(gs.PublishError, "returned no html page kind"):
+            self.publish()
+        self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "creating")
+
+    def test_unrelated_same_title_pages_are_never_adopted_or_touched(self):
+        db = {"pages": {"html-p1": "<p>someone's own getting-started notes</p>", "html-p2": ""},
+              "calls": [], "next": 3, "by": {"html-p1": "@someone:example.test", "html-p2": self.ME}}
+        self.state.write_text(json.dumps(db))
+        out = self.publish()
+        self.assertEqual((out["action"], out["kind"]), ("created", "html-p3"))
+        pages = self.room()["pages"]
+        self.assertEqual((pages["html-p1"], pages["html-p2"]), ("<p>someone's own getting-started notes</p>", ""))
+        self.assertFalse([c for c in self.room()["calls"] if c[0] in ("replace", "append") and c[1] != "html-p3"])
+
+    def test_two_tutorial_pages_stop_with_a_reason(self):
+        db = {"pages": {"html-p1": self.page(), "html-p2": self.page()}, "calls": [], "next": 3,
+              "by": {"html-p1": self.ME, "html-p2": self.ME}}
+        self.state.write_text(json.dumps(db))
+        with self.assertRaisesRegex(gs.PublishError, r"2 carry its marker: \['html-p1', 'html-p2'\]"):
+            self.publish()
+        self.assertEqual([c[0] for c in self.room()["calls"]], ["pages", "read", "read"])
         self.assertEqual(gs.load_marker(self.marker), {})
+
+    def test_unknown_agent_id_with_a_candidate_stops(self):
+        db = {"pages": {"html-p1": "<p>x</p>"}, "calls": [], "next": 2, "by": {"html-p1": "@someone:example.test"}}
+        self.state.write_text(json.dumps(db))
+        with self.assertRaisesRegex(gs.PublishError, "pass --agent-mxid"):
+            self.publish(agent=None)
 
     def test_failed_summon_still_reports_the_page(self):
         os.environ["STUB_FAIL"] = "summon"
@@ -953,6 +1116,17 @@ class PublishTest(unittest.TestCase):
         self.assertEqual((out["action"], out["summoned"]), ("created", False))
         self.assertIn("summon", out["summon_error"])
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["kind"], "html-p1")
+
+    def test_connect_actions_uses_room_commons_own_client_and_restores_the_env(self):
+        fake = Path(self.tmp.name) / "rc" / "room_commons.py"
+        fake.parent.mkdir()
+        fake.write_text("import os\ndef mcp_door(args):\n"
+                        "    return lambda: ('door', os.environ.get('AG2_REMOTE_TOKEN'), args.token)\n")
+        os.environ.pop("AG2_REMOTE_TOKEN", None)
+        got = gs.connect_actions(fake, {"AG2_REMOTE_TOKEN": "fixture-token"})
+        self.assertEqual(got, ("door", "fixture-token", None))
+        self.assertNotIn("AG2_REMOTE_TOKEN", os.environ)
+        self.assertNotIn(str(fake.parent), sys.path)
 
 
 class CliTest(unittest.TestCase):

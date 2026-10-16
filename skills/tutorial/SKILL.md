@@ -68,10 +68,22 @@ not retry the page in the same turn.
 Run it only in the owner's own DM. The page holds your name and fixed text, nothing from the
 owner's accounts, and the question about their work stays in chat.
 
-**One page per room.** `<workspace>/state/tutorial/getting-started.json` records the page's kind per
-room. A re-link or reinstall that reuses the DM rewrites that page in place; a page someone removed
-from the list is created again. `getting_started.py plan --room <room>` shows what `publish` would
-do; `render --name <name>` prints the HTML.
+**One page per room, created once.** `<workspace>/state/tutorial/getting-started.json` keeps
+each room's entry.
+- Before the page is made, the entry records `creating` and an operation id.
+- The page is made with `room.commons.pages.create`, whose first body already carries the
+  ownership marker (`<meta name="sutando-tutorial" content="<agent mxid>">`). A retry with the
+  same operation id returns the same page, so an unclear create is retried, never repeated.
+- The entry is `pending` until the rest of the page is appended, then `complete`. Any failure
+  leaves an entry the next run resumes; nothing is created twice.
+- A re-link or reinstall that reuses the DM rewrites the page in place. A page someone removed
+  from the list is created again.
+- If the marker file is lost, a listed "Getting started" page is reused only when its text
+  carries this agent's ownership marker. A same-titled page without it is never touched. More
+  than one marked page, or no agent id to check with, stops with exit 4 and the reason.
+
+`getting_started.py plan --room <room>` shows what `publish` would do; `render --name <name>`
+prints the HTML.
 
 **What the page says.** A short, interactive AG2 Space tour (`scripts/tour_page.py`). Each step is
 one line on what it is and one thing to try, in this order:

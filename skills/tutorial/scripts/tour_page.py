@@ -486,9 +486,14 @@ COPY_SCRIPT = """<script>
 HEAD_SCRIPT = "<script>document.documentElement.classList.add('js');</script>"
 
 
-def render_page(name: str, core: str = "unknown", audience: str = "dm") -> str:
-    """The whole page as one HTML string; depends on nothing but the agent's name, core and
-    audience. In a room other than the owner's DM the agent is "your agent" throughout."""
+def owner_marker(agent: str) -> str:
+    """The tag that marks a page as this agent's tutorial page, so a later run can recognise it."""
+    return f'<meta name="sutando-tutorial" content="{html.escape(agent, quote=True)}">'
+
+
+def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: Optional[str] = None) -> str:
+    """The whole page as one HTML string; depends on nothing but the agent's name, core, audience
+    and mxid (the ownership marker). In a room other than the owner's DM the agent is "your agent"."""
     if audience not in AUDIENCES:
         raise ValueError(f"audience must be one of {', '.join(AUDIENCES)}, got {audience!r}")
     who = html.escape(clean_name(name)) if audience == "dm" else "your agent"
@@ -498,6 +503,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm") -> str:
     return (
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"{owner_marker(agent) if agent else ''}"
         f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'light': light, 'darkvars': dark}}</head><body>"
         "<main id=\"tour\" data-mode=\"step\">"
         f"<header class=\"hero\">{HERO}<div><h1>Getting started with {who}</h1>"

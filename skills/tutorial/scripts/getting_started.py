@@ -17,12 +17,17 @@ room_commons.py is found beside this skill, else in the installed skills directo
 credentials come from the environment, else from the AG2 Space channel env file
 (src/channel_credentials.py); nothing here prints them.
 
-One page per room. The marker at <workspace>/state/tutorial/getting-started.json records the page's
-kind per room, so a re-link or reinstall rewrites that page instead of adding a second one. The page
-holds the agent's name and fixed text only; nothing read from the owner's accounts goes on it.
+One page per room, created once. <workspace>/state/tutorial/getting-started.json records each
+room's entry under a lock: `creating` with an operation_id before the page is made through
+`room.commons.pages.create` (a retry with the same id returns the same page and writes its body at
+most once), `pending` with its kind until every piece is written, then `complete`. A rerun resumes
+whatever it finds. With no entry, a listed "Getting started" page is reused only when its text
+carries this agent's ownership marker; more than one such page, or no agent id to check with,
+stops the run. The page holds the agent's name and fixed text only; nothing read from the
+owner's accounts goes on it.
 
 Exit codes: 0 done, 2 bad arguments, 3 the room-commons skill is not installed, 4 a room-commons
-call failed (the marker is unchanged; an empty page this run added is removed again).
+call failed or ownership was unclear (the marker keeps what is known, so the next run resumes).
 """
 from __future__ import annotations
 
@@ -39,6 +44,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import uuid
 import urllib.request
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional
@@ -49,12 +55,13 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tour_page  # noqa: E402,F401
 from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these names are this CLI's API)
-    AUDIENCES, CONNECT_PROMPT, CORES, IMPORT_PROMPT, IMPORT_SECTION, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
+    AUDIENCES, CONNECT_PROMPT, owner_marker, CORES, IMPORT_PROMPT, IMPORT_SECTION, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
     render_page, sections_for,
 )
 
 SUMMON_CONTEXT = "A short tour of AG2 Space, with one thing to try in each part."
 PROFILE_TIMEOUT = 5
+CREATE_ACTION = "room.commons.pages.create"
 # Each piece is one argv string: under Linux's 131,072-byte per-argument cap and Room Commons'
 # 196,608-byte write.
 CHUNK_BYTES = 120_000
@@ -91,6 +98,25 @@ def capability_names(script: Path) -> tuple:
         with contextlib.suppress(ValueError):
             sys.path.remove(str(script.parent))
     return (*getattr(mod, "URL_VARS", ()), *getattr(mod, "TOKEN_VARS", ()))
+
+
+def connect_actions(script: Path, env: Optional[Dict[str, str]] = None):
+    """room-commons' own Actions client (hosted MCP), opened with the credentials `env` names;
+    the process environment is restored once the client holds its token."""
+    import argparse as _argparse
+    sys.path.insert(0, str(script.parent))
+    saved = dict(os.environ)
+    try:
+        os.environ.update({k: v for k, v in (env or {}).items() if k not in os.environ})
+        spec = importlib.util.spec_from_file_location("room_commons", script)
+        rc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rc)
+        return rc.mcp_door(_argparse.Namespace(token=None, workspace=None, url=None))()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        with contextlib.suppress(ValueError):
+            sys.path.remove(str(script.parent))
 
 
 def commons_env(script: Path, environ: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
@@ -187,8 +213,9 @@ def load_marker(path: Path) -> Dict[str, dict]:
     rooms = data.get("rooms") if isinstance(data, dict) else None
     if not isinstance(rooms, dict):
         return {}
-    return {r: v for r, v in rooms.items()
-            if isinstance(v, dict) and isinstance(v.get("kind"), str) and v["kind"].startswith("html-")}
+    return {r: v for r, v in rooms.items() if isinstance(v, dict) and (
+        isinstance(v.get("kind"), str) and v["kind"].startswith("html-")
+        or v.get("state") == "creating" and isinstance(v.get("operation_id"), str))}
 
 
 def save_marker(path: Path, rooms: Dict[str, dict]) -> None:
@@ -200,12 +227,35 @@ def save_marker(path: Path, rooms: Dict[str, dict]) -> None:
     os.replace(tmp, str(path))
 
 
-def plan(rooms: Dict[str, dict], room: str, listed_kinds: Optional[List[str]] = None) -> dict:
-    """Create unless this room already has a page; a recorded page no longer listed is created anew."""
+def candidates(pages: List[dict]) -> List[dict]:
+    """Listed pages that could be an unrecorded tutorial page: titled "Getting started", not a
+    published copy."""
+    return [p for p in pages if p.get("title") == PAGE_TITLE and not p.get("copy_of")
+            and str(p.get("kind", "")).startswith("html-")]
+
+
+def owned(page: dict, text: str, agent: Optional[str]) -> Optional[bool]:
+    """Whether a candidate is this agent's tutorial page: its text carries this agent's marker (the
+    create writes it with the first body, so an empty page is never one). None: no agent id."""
+    if not agent:
+        return None
+    by = page.get("by") or ""
+    if by and by != agent:
+        return False
+    return owner_marker(agent) in text
+
+
+def plan(rooms: Dict[str, dict], room: str, pages: Optional[List[dict]] = None) -> dict:
+    """Rewrite the recorded page while it is listed (`pending` when its first write never
+    finished); with no usable entry, reconcile against unrecorded candidates, else create."""
     entry = rooms.get(room)
-    if entry and (listed_kinds is None or entry["kind"] in listed_kinds):
-        return {"action": "update", "kind": entry["kind"]}
-    return {"action": "create", "kind": None}
+    if entry and entry.get("state") == "creating":
+        return {"action": "resume", "kind": None, "pending": True, "operation_id": entry["operation_id"]}
+    if entry and (pages is None or entry["kind"] in [p.get("kind") for p in pages]):
+        return {"action": "update", "kind": entry["kind"], "pending": entry.get("state") == "pending"}
+    if candidates(pages or []):
+        return {"action": "reconcile", "kind": None, "pending": True}
+    return {"action": "create", "kind": None, "pending": False}
 
 
 @contextlib.contextmanager
@@ -219,8 +269,24 @@ def _locked(path: Path):
 class Commons:
     """The room-commons CLI, one call per subprocess."""
 
-    def __init__(self, script: Path, room: str, env: Optional[Dict[str, str]] = None):
+    def __init__(self, script: Path, room: str, env: Optional[Dict[str, str]] = None, actions=None):
         self.script, self.room, self.env = script, room, env
+        self._actions, self._door = actions, None
+
+    def create_page(self, title: str, body: str, operation_id: str) -> str:
+        """`room.commons.pages.create` with a first body. The same operation_id again returns the
+        same page and writes its body at most once, so an unclear outcome is retried, never redone."""
+        try:
+            if self._door is None:
+                self._door = (self._actions or (lambda: connect_actions(self.script, self.env)))()
+            got = self._door.execute(self.room, CREATE_ACTION, {"title": title, "kind": "html", "body": body},
+                                     operation_id=operation_id)
+        except Exception as exc:  # noqa: BLE001 - any failure leaves the create unresolved, not redone
+            raise PublishError(f"page create {operation_id} did not complete: {exc}") from None
+        kind = got.get("kind") if isinstance(got, dict) else None
+        if not isinstance(kind, str) or not kind.startswith("html-"):
+            raise PublishError(f"page create {operation_id} returned no html page kind: {kind!r}")
+        return kind
 
     def run(self, *args: str, kind: Optional[str] = None, as_json: bool = False) -> str:
         argv = [sys.executable, str(self.script)]
@@ -238,15 +304,23 @@ class Commons:
                                f"{(done.stderr or done.stdout).strip()[:400]}")
         return done.stdout
 
-    def listed_kinds(self) -> List[str]:
-        pages = json.loads(self.run("pages", self.room, as_json=True))
-        return [p["kind"] for p in pages if isinstance(p, dict) and p.get("id")]
+    def reconcile(self, pages: List[dict], agent: Optional[str]) -> Optional[str]:
+        """The one unrecorded page that is this agent's tutorial page, else None; refuses to guess
+        when ownership is unclear or more than one page qualifies."""
+        mine, unclear = [], []
+        for p in candidates(pages):
+            verdict = owned(p, self.read(p["kind"]), agent)
+            (mine if verdict else unclear if verdict is None else []).append(p["kind"])
+        if unclear or len(mine) > 1:
+            raise PublishError(
+                f"cannot tell which \"{PAGE_TITLE}\" page is this agent's ({len(mine)} carry its "
+                f"marker: {mine}; ownership unknown for {unclear})"
+                + ("; pass --agent-mxid" if not agent else "; remove the extra page(s) or record one"))
+        return mine[0] if mine else None
 
-    def add_page(self, title: str) -> str:
-        kind = json.loads(self.run("page-add", self.room, title, as_json=True)).get("kind")
-        if not isinstance(kind, str) or not kind.startswith("html-"):
-            raise PublishError(f"room-commons page-add returned no html page kind: {kind!r}")
-        return kind
+    def listed_pages(self) -> List[dict]:
+        pages = json.loads(self.run("pages", self.room, as_json=True))
+        return [p for p in pages if isinstance(p, dict) and p.get("id")]
 
     def read(self, kind: str) -> str:
         return json.loads(self.run("read", self.room, kind=kind, as_json=True)).get("text") or ""
@@ -268,34 +342,64 @@ class Commons:
             self.append(kind, new)
 
 
+def _record(marker: Path, rooms: Dict[str, dict], room: str, entry: dict) -> None:
+    """Write this room's entry. A marker that cannot be written fails the run; the next run resumes
+    from the last entry written, or finds the page again by its ownership marker."""
+    rooms[room] = {**entry, "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    try:
+        save_marker(marker, rooms)
+    except OSError as exc:
+        raise PublishError(f"could not record {entry.get('kind') or entry['state']} in {marker}: {exc}") from None
+
+
+def _fill(commons: Commons, kind: str, page: str) -> None:
+    """Bring a page the create just wrote (or wrote earlier) to `page`: append the rest after a
+    first body that matches, else rewrite whatever is there."""
+    current, first = commons.read(kind), chunks(page)[0]
+    if current == first:
+        commons.append(kind, page[len(first):])
+    elif current != page:
+        commons.rewrite(kind, current, page)
+
+
 def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = None,
-            summon: bool = False, core: str = "unknown", audience: str = "dm") -> dict:
-    page = render_page(name, core, audience)
+            summon: bool = False, core: str = "unknown", audience: str = "dm",
+            agent: Optional[str] = None) -> dict:
+    page = render_page(name, core, audience, agent)
     with _locked(marker):
         rooms = load_marker(marker)
-        step = plan(rooms, commons.room, commons.listed_kinds() if commons.room in rooms else None)
-        if step["action"] == "update":
-            kind = step["kind"]
+        pages = commons.listed_pages()
+        step = plan(rooms, commons.room, pages)
+        if step["action"] == "reconcile":
+            found = commons.reconcile(pages, agent)
+            step = ({"action": "adopt", "kind": found, "pending": True} if found
+                    else {"action": "create", "kind": None, "pending": False})
+        kind = step["kind"]
+        if step["action"] in ("create", "resume"):
+            op = step.get("operation_id") or f"tutorial-{uuid.uuid4().hex}"
+            _record(marker, rooms, commons.room, {"state": "creating", "operation_id": op})
+            kind = commons.create_page(PAGE_TITLE, chunks(page)[0], op)
+            _record(marker, rooms, commons.room, {"kind": kind, "state": "pending", "operation_id": op})
+            try:
+                _fill(commons, kind, page)
+            except PublishError as exc:
+                raise PublishError(f"{exc}; {kind} stays recorded as pending and the next run "
+                                   "finishes it") from None
+            action = "created"
+        else:
+            if step["action"] == "adopt":
+                _record(marker, rooms, commons.room, {"kind": kind, "state": "pending"})
             current = commons.read(kind)
             if current == page:
                 action = "unchanged"
             else:
                 commons.rewrite(kind, current, page)
                 action = "updated"
-        else:
-            kind = commons.add_page(PAGE_TITLE)
-            try:
-                commons.append(kind, page)
-            except PublishError as exc:
-                with contextlib.suppress(PublishError):
-                    commons.run("page-remove", commons.room, kind)
-                raise PublishError(f"{exc}; the empty page was taken off the list again") from None
-            action = "created"
-        rooms[commons.room] = {"kind": kind, "hash": content_hash(page),
-                               "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-        save_marker(marker, rooms)
+        _record(marker, rooms, commons.room, {"kind": kind, "state": "complete", "hash": content_hash(page)})
     result = {"ok": True, "action": action, "kind": kind, "summoned": False}
-    if owner and (summon or action == "created"):
+    if step["action"] == "adopt":
+        result["adopted"] = True
+    if owner and (summon or action == "created" or step["pending"]):
         try:
             commons.run("summon", commons.room, owner, "--context", SUMMON_CONTEXT,
                         "--page-title", PAGE_TITLE, kind=kind)
@@ -370,7 +474,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         result = publish(Commons(script, args.room, commons_env(script)), marker_path(_workspace()),
                          name, args.owner, args.summon,
-                         detect_core() if args.core == "auto" else args.core, args.audience)
+                         detect_core() if args.core == "auto" else args.core, args.audience,
+                         args.agent_mxid or agent_mxid() or None)
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": str(exc)}))
         return 4
