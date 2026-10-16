@@ -119,13 +119,12 @@ if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ "$TASKS_DIR_ABS" = "$CANONICAL_CORE_TA
   echo "watch-tasks-stream: SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID (and worker routing env) set while serving the core's own canonical inbox ($TASKS_DIR_ABS) -- clearing it to match the inbox, never the calling shell's inherited env" >&2
   unset SUTANDO_INSTANCE_ID SUTANDO_INBOX_KIND SUTANDO_INBOX_RESOLVER SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT
 fi
-# A delivery inbox <ws>/deliveries/<id> is worker <id>'s seat: its sentinel is that
-# worker's even when the launcher passed no instance id, never the core's.
-SENTINEL_INSTANCE="${SUTANDO_INSTANCE_ID:-}"
-if [ -z "$SENTINEL_INSTANCE" ] \
+# A delivery inbox <ws>/deliveries/<id> is worker <id>'s seat: with no id passed, the
+# inbox names it, so the sentinel, handler, claims and beat are never the core's.
+if [ -z "${SUTANDO_INSTANCE_ID:-}" ] \
    && [ "$(dirname "$TASKS_DIR_ABS")" = "$(canonical_tasks_dir "$WORKSPACE_DIR/deliveries")" ]; then
-  SENTINEL_INSTANCE="$(basename "$TASKS_DIR_ABS")"
-  echo "watch-tasks-stream: no SUTANDO_INSTANCE_ID on delivery inbox $TASKS_DIR_ABS; stamping worker $SENTINEL_INSTANCE's sentinel, not the core's" >&2
+  SUTANDO_INSTANCE_ID="$(basename "$TASKS_DIR_ABS")"; export SUTANDO_INSTANCE_ID
+  echo "watch-tasks-stream: no SUTANDO_INSTANCE_ID on delivery inbox $TASKS_DIR_ABS; serving it as worker $SUTANDO_INSTANCE_ID" >&2
 fi
 
 # shellcheck source=../scripts/python-binary.sh
@@ -225,7 +224,7 @@ case "$__holders" in
         if [ "$__my_kind" = "session" ] && [ "$__hrole" = "session" ] \
            && [ "${SUTANDO_INSTANCE_ID:-}" = "$(basename "$TASKS_DIR_ABS")" -o -z "${SUTANDO_INSTANCE_ID:-}" ] \
            && [ "$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/watcher_identity.py" sentinel-names-pid "$__hpid" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" = "no" ] \
-           && __hsent="$(SUTANDO_INSTANCE_ID="$SENTINEL_INSTANCE" sentinel_path_for "$WORKSPACE_DIR/state" 2>/dev/null)"; then
+           && __hsent="$(sentinel_path_for "$WORKSPACE_DIR/state" 2>/dev/null)"; then
           __hprev="$(cat "$__hsent" 2>/dev/null)"
           # Never overwrite a LIVE pid: that file is another watcher's readiness,
           # and taking it is the clobber this whole change exists to undo.
@@ -948,7 +947,7 @@ STATE_DIR="$WORKSPACE_DIR/state"
 mkdir -p "$STATE_DIR"
 # Per instance: N watchers on one host each stamped the same file, so the
 # readers tracked only the newest. Unset $SUTANDO_INSTANCE keeps the old name.
-PID_FILE="$(SUTANDO_INSTANCE_ID="$SENTINEL_INSTANCE" sentinel_path_for "$STATE_DIR")"
+PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 # Stamped only once fswatch is confirmed up (below the launch): until then the
 # file may still name a live standby that this watcher must not displace.
 WATCHER_BEAT_PID=""
