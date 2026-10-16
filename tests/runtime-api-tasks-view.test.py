@@ -282,8 +282,13 @@ class TasksViewTests(unittest.TestCase):
         self.assertIsNone(self.view.details("task-ghost"))
 
     def test_list_tasks_enumerates_live_only(self):
+        first_body = "first   request\twith\n  multiple\u2003spaces"
+        second_body = "second " + "界" * 200
         a = self.view.submit("first")["taskId"]
-        b = self.view.submit("second")["taskId"]
+        first_file = self._task_file(a)
+        first_file.write_text(first_file.read_text().replace(
+            "task: first\n", f"task: {first_body}\n"))
+        b = self.view.submit(second_body)["taskId"]
         # claimed task still listed (as in_progress); done task drops off
         (self.tasks / f"{a}.txt").rename(self.tasks / f"{a}.claimed-core-1.txt")
         c = self.view.submit("third")["taskId"]
@@ -291,10 +296,17 @@ class TasksViewTests(unittest.TestCase):
         (self.results / f"{c}.txt").write_text("done")
         out = self.view.list_tasks()
         by_id = {t["taskId"]: t for t in out["tasks"]}
+        self.assertEqual(set(by_id), {a, b, c})
         self.assertEqual(by_id[a]["state"], "in_progress")
         self.assertEqual(by_id[b]["state"], "pending")
         self.assertEqual(by_id[c]["state"], "done")  # file still live until archived
         self.assertEqual(by_id[b]["source"], "runtime-api")
+        self.assertEqual(by_id[a]["preview"], "first request with multiple spaces")
+        self.assertEqual(by_id[b]["preview"], "second " + "界" * 153)
+        self.assertEqual(len(by_id[b]["preview"]), 160)
+        self.assertEqual(by_id[c]["preview"], "third")
+        self.assertEqual(self.view.details(a)["task"], first_body)
+        self.assertEqual(self.view.details(b)["task"], second_body)
         self.assertNotIn("truncated", out)
 
     def test_list_tasks_disappearing_during_metadata_access(self):
@@ -384,10 +396,12 @@ class TasksViewTests(unittest.TestCase):
                 unittest.mock.patch.object(self.view, "status", return_value={"state": "pending"}):
             rows = self.view.list_tasks(limit=1)
         self.assertEqual([row["taskId"] for row in rows["tasks"]], [newer])
+        self.assertNotIn("preview", rows["tasks"][0])
         self.assertTrue(rows["truncated"])
         self.assertEqual(seen, {self._task_file(older), self._task_file(newer)})
         rows = self.view.list_tasks()
         self.assertEqual([row["taskId"] for row in rows["tasks"]], [older])
+        self.assertEqual(rows["tasks"][0]["preview"], "older")
         self.assertNotIn("truncated", rows)
 
     def test_list_tasks_empty_dir(self):
