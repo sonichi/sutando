@@ -174,6 +174,25 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 8)
         self.assertIn("1 of 3000", err)
 
+    def test_gh_failing_to_run_is_refused(self):
+        def boom(argv, **kw):
+            raise OSError("no gh on PATH")
+        rc, err = self._run(boom)
+        self.assertEqual(rc, 8)
+        self.assertIn("no gh on PATH", err)
+
+    def test_an_unparseable_PR_reply_is_refused(self):
+        gh = FakeGitHub(["src/a.py"], fail={"pulls/7": _R(out="not tsv\n")})
+        rc, err = self._run(gh)
+        self.assertEqual(rc, 8)
+        self.assertIn("unreadable PR facts", err)
+
+    def test_an_unowned_file_needs_no_owner(self):
+        gh = FakeGitHub(["src/a.py", "vendor/x.c"],
+                        codeowners={".github/CODEOWNERS": "# owners\n\n* @alice-gh\n/vendor/\n"})
+        rc, err = self._run(gh)
+        self.assertEqual(rc, 0, err)
+
     def test_a_notice_is_not_gated(self):
         gh = FakeGitHub(["src/a.py"], codeowners={".github/CODEOWNERS": "* @carol\n"})
         rc, err = self._run(gh, ("--kind", "notice"))
@@ -192,6 +211,11 @@ class Matching(unittest.TestCase):
         self.assertEqual(self.owners("docs/* @a\n", "docs/sub/x.md"), [])
         self.assertEqual(self.owners("docs/** @a\n", "docs/sub/x.md"), ["@a"])
         self.assertEqual(self.owners("**/logs @a\n", "deep/er/logs/x"), ["@a"])
+
+    def test_question_mark_and_escaped_hash(self):
+        self.assertEqual(self.owners("a?.md @a\n", "ab.md"), ["@a"])
+        self.assertEqual(self.owners("a?.md @a\n", "a/.md"), [])
+        self.assertEqual(self.owners("\\#notes @a\n", "#notes"), ["@a"])
 
     def test_a_leading_slash_anchors_to_the_root(self):
         self.assertEqual(self.owners("/build/ @a\n", "build/x"), ["@a"])
