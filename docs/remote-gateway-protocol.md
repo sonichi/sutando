@@ -194,7 +194,7 @@ body: {
   "provider": "<REMOTE_TASK_PROVIDER>",
   "tier": "<REMOTE_TASK_TIER>",
   "inflight": <int>,            // tasks currently claimed but not yet resulted
-  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status", "team-collaborator"]
+  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status", "team-collaborator", "health-wait"]
 }
 ```
 
@@ -242,6 +242,27 @@ from [`GET /health`](health-snapshot.md) and the `worker_health.v1` capability:
 the broker times freshness by when it received the heartbeat. A change in the row
 sends the heartbeat at once, without waiting for the interval. A gateway with no
 Sutando checkout around it sends neither field.
+
+### `GET /v1/health/wait?wait=<sec>` and `POST /v1/health/<check_id>` *(optional)*
+
+A dedicated health-check channel, so the relay can ask for a status report when it
+wants one. The gateway holds `GET /v1/health/wait` open on its own thread, apart from the
+task poll. The relay answers it with `{"check_id": "<id>"}` when it wants a report, or `{}`
+on timeout. The gateway answers each check at once:
+
+```
+POST /v1/health/<check_id>
+body: { ...the heartbeat's fields..., "check_id": "<id>", "task_loop_idle_s": <int> }
+```
+
+`task_loop_idle_s` is how long the task loop has gone without finishing a pass. Because the
+channel has its own thread, a gateway whose task loop is busy or wedged still answers, and
+this field tells "alive but stuck" apart from dead, which answers nothing. A `check_id` is
+`[A-Za-z0-9._:-]{1,128}`; anything else is ignored.
+
+A relay without the route (`404`/`405`) is retried on the heartbeat's backoff: 60 s,
+doubling to at most 30 minutes. Other errors are retried after 1 s, doubling to 60 s. The
+heartbeat's `health-wait` capability tells the relay the gateway can answer checks.
 
 ### `POST /v1/workers` *(optional)*
 

@@ -21,6 +21,10 @@ Full spec: docs/remote-gateway-protocol.md
                "capabilities": ["voice-outcome-v1"], "dm_only": false}  → 200 on accepted
   POST {REMOTE_TASK_URL}/v1/heartbeat
        → body {"client": "...", "inflight": N, ...}  → 200 on accepted
+  GET  {REMOTE_TASK_URL}/v1/health/wait?wait=<sec>
+       → 200 {"check_id": "<id>"} when the gateway wants a status report, {} on timeout
+  POST {REMOTE_TASK_URL}/v1/health/<check-id>
+       → body: the heartbeat's fields + "check_id", "task_loop_idle_s"  → 200 on accepted
 
 Each task object uses the same schema Sutando's other bridges write, so this
 client just serializes it to `tasks/task-<id>.txt` and the core handles it like
@@ -3426,6 +3430,30 @@ def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None
     return status, step
 
 
+def _heartbeat_payload(inflight: set[str], health: "dict | None") -> dict:
+    """The heartbeat body; a health-check report sends the same fields."""
+    _status, _step = _reported_core_status(health)
+    payload = {
+        "client": "sutando-gateway-client",
+        "protocol_version": 1,
+        "provider": PROVIDER,
+        "tier": LOCAL_TIER,
+        "inflight": len(inflight),
+        "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
+                         "core-status", "team-collaborator", "health-wait"],
+    }
+    # Only include when present so a status-less node never clobbers the
+    # broker's last-known core-status (the broker only records on presence).
+    if _status is not None:
+        payload["status"] = _status
+    if _step is not None:
+        payload["step"] = _step
+    if health is not None:
+        payload["health"] = health
+        payload["capabilities"].append("worker_health.v1")
+    return payload
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -3439,27 +3467,8 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
-    _status, _step = _reported_core_status(health)
     try:
-        payload = {
-            "client": "sutando-gateway-client",
-            "protocol_version": 1,
-            "provider": PROVIDER,
-            "tier": LOCAL_TIER,
-            "inflight": len(inflight),
-            "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
-                             "core-status", "team-collaborator"],
-        }
-        # Only include when present so a status-less node never clobbers the
-        # broker's last-known core-status (the broker only records on presence).
-        if _status is not None:
-            payload["status"] = _status
-        if _step is not None:
-            payload["step"] = _step
-        if health is not None:
-            payload["health"] = health
-            payload["capabilities"].append("worker_health.v1")
-        _req("POST", "/v1/heartbeat", payload, timeout=10)
+        _req("POST", "/v1/heartbeat", _heartbeat_payload(inflight, health), timeout=10)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
         return True
     except urllib.error.HTTPError as e:
@@ -3476,6 +3485,68 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     except _NETWORK_ERRORS as e:
         _log(f"heartbeat network error: {e} — continuing")
         return False
+
+
+# Dedicated health-check channel, on its own thread: a task loop that is busy or wedged still
+# answers, and task_loop_idle_s tells "alive but stuck" from dead (which answers nothing).
+HEALTH_WAIT_S = POLL_WAIT
+_HEALTH_CHECK_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_HEALTH_STOP = threading.Event()
+
+
+def _answer_health_check(check_id: str, inflight: set[str]) -> None:
+    payload = _heartbeat_payload(inflight, _core_health(_health_snapshot()))
+    payload["check_id"] = check_id
+    payload["task_loop_idle_s"] = int(time.monotonic() - _LOOP_TICK["at"])
+    _req("POST", f"/v1/health/{urllib.parse.quote(check_id, safe='')}", payload, timeout=10)
+
+
+def _health_wait_loop(inflight: set[str]) -> None:
+    """Hold GET /v1/health/wait open; answer each check_id at once with POST /v1/health/<id>.
+    A relay without the route (404/405) is retried on the heartbeat's doubling backoff, so a
+    broker that deploys it is picked up without a restart. Auth is the task loop's to recover."""
+    backoff = 0.0
+    while not (_HEALTH_STOP.is_set() or _LOCK_LOST.is_set()):
+        started = time.monotonic()
+        try:
+            resp = _req("GET", f"/v1/health/wait?wait={HEALTH_WAIT_S}", timeout=HEALTH_WAIT_S + 10)
+            backoff = 0.0
+        except (TimeoutError, socket.timeout):
+            continue
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 405):
+                backoff = min(max(backoff * 2, HEARTBEAT_INTERVAL), HEARTBEAT_UNSUPPORTED_MAX_BACKOFF)
+                _log(f"gateway does not support health-wait — retrying in {backoff:.0f}s")
+            else:
+                backoff = min(max(backoff * 2, 1), _POLL_BACKOFF_MAX_S)
+                _log(f"health-wait HTTP {e.code} — retrying in {backoff:.0f}s")
+            _HEALTH_STOP.wait(backoff)
+            continue
+        except Exception as e:  # noqa: BLE001 — never let this thread die
+            backoff = min(max(backoff * 2, 1), _POLL_BACKOFF_MAX_S)
+            _log(f"health-wait error: {type(e).__name__}: {e} — retrying in {backoff:.0f}s")
+            _HEALTH_STOP.wait(backoff)
+            continue
+        check_id = resp.get("check_id") if isinstance(resp, dict) else None
+        if not check_id:
+            pass
+        elif not isinstance(check_id, str) or not _HEALTH_CHECK_ID.match(check_id):
+            _log("health-wait returned an invalid check_id — ignored")
+        else:
+            try:
+                _answer_health_check(check_id, inflight)
+            except Exception as e:  # noqa: BLE001 — a lost report is the broker's timeout to judge
+                _log(f"health report {check_id} failed: {type(e).__name__}: {e}")
+        # Any answer that came back at once, empty, invalid or a real check, must not spin the loop.
+        if time.monotonic() - started < 1:
+            _HEALTH_STOP.wait(1)
+
+
+def _start_health_wait(inflight: set[str]) -> threading.Thread:
+    t = threading.Thread(target=_health_wait_loop, args=(inflight,),
+                         name="health-wait", daemon=True)
+    t.start()
+    return t
 
 
 def _emit_gateway_status(connected: bool, *, error: str | None = None,
@@ -6364,6 +6435,7 @@ def main() -> None:
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
+    _start_health_wait(inflight)
     while True:
         _stamp_loop_progress()
         try:
@@ -6372,7 +6444,7 @@ def main() -> None:
                 # polling immediately so we don't dual-poll the relay bearer with
                 _log("singleton: lost workspace poller lock (reaped after stale takeover) "
                      "— exiting to avoid dual-poll")
-                _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set()
+                _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set(); _HEALTH_STOP.set()
                 _outbound_thread.join(timeout=OUTBOUND_SCAN_S * 3 + 5)
                 if _results_watcher is not None:
                     _results_watcher.join(timeout=5)
