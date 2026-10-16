@@ -62,6 +62,7 @@ from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these 
 SUMMON_CONTEXT = "A short tour of AG2 Space, with one thing to try in each part."
 PROFILE_TIMEOUT = 5
 CREATE_ACTION = "room.commons.pages.create"
+SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.I)
 # Each piece is one argv string: under Linux's 131,072-byte per-argument cap and Room Commons'
 # 196,608-byte write.
 CHUNK_BYTES = 120_000
@@ -196,6 +197,18 @@ def chunks(text: str, limit: int = 0) -> List[str]:
     return out
 
 
+def redact(text: str, env: Optional[Mapping[str, str]]) -> str:
+    """`text` with the value of every credential-like variable in `env` (and each half of a
+    `url|secret` token) replaced, so an error message never carries a secret."""
+    secrets = set()
+    for key, value in (env or {}).items():
+        if SECRET_NAME.search(key) and value:
+            secrets.update(v for v in (value, *value.split("|")) if len(v) >= 8)
+    for value in sorted(secrets, key=len, reverse=True):
+        text = text.replace(value, "[redacted]")
+    return text
+
+
 def load_prompts(path: Optional[Path]) -> Dict[str, str]:
     """The usable prompts in a --prompts JSON file; {} when there is none or it cannot be read, so
     a bad file never fails the run (every slot keeps its default)."""
@@ -311,8 +324,8 @@ class Commons:
         except subprocess.TimeoutExpired:
             raise PublishError(f"room-commons {args[0]} timed out") from None
         if done.returncode != 0:
-            raise PublishError(f"room-commons {args[0]} failed ({done.returncode}): "
-                               f"{(done.stderr or done.stdout).strip()[:400]}")
+            said = redact((done.stderr or done.stdout).strip(), self.env)
+            raise PublishError(f"room-commons {args[0]} failed ({done.returncode}): {said[:400]}")
         return done.stdout
 
     def reconcile(self, pages: List[dict], agent: Optional[str]) -> Optional[str]:

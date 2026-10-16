@@ -80,8 +80,11 @@ not retry the page in the same turn.
    and say nothing about the page unless the owner asks. A failure that is a Sutando or AG2 Space
    defect goes to `report-feedback`.
 
-Run it only in the owner's own DM. The page holds your name and fixed text, nothing from the
-owner's accounts, and the question about their work stays in chat.
+Run it in the owner's own DM (the default, `--audience dm`). Only when the owner asks for the page
+in another room, publish it there with `--audience room`: the page then says "your agent" instead
+of your name. Summon only whoever the owner asked for. Either way the page holds your name or "your
+agent" and fixed text, nothing from the owner's accounts, and the question about their work stays
+in chat.
 
 **One page per room, created once.** `<workspace>/state/tutorial/getting-started.json` keeps
 each room's entry.
@@ -137,10 +140,11 @@ step names its images in `Section.images` as (file, alt).
 - Copy outcomes are announced in a live status region. Animations stop under
   `prefers-reduced-motion`. Without scripts, every step shows.
 
-**Size.** With its screenshots the page is about 220 KB, over the 196,608 bytes Room Commons
-takes in one write. `publish` therefore appends it in pieces of at most 150,000 bytes. A refresh
-is one `replace` when the change is small; otherwise it clears the old text in pieces and appends
-the new.
+**Size.** With its screenshots the page is about 215 KB, over the 196,608 bytes Room Commons
+takes in one write. The first piece goes in the create's own body; the rest are appended in pieces
+of at most 120,000 bytes (`CHUNK_BYTES`). Each piece is passed to `room_commons.py` as one argument,
+and Linux caps a single argument at 131,072 bytes. A refresh is one `replace` when both the old and
+new text fit one piece; otherwise it clears the old text in pieces and appends the new.
 
 **The prompts.** Each card's Copy button puts its prompt on the clipboard; where the page's sandbox
 refuses the clipboard, the prompt is selected instead and the button says to press ⌘C. The page

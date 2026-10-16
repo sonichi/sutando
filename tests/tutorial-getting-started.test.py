@@ -601,15 +601,25 @@ class CredentialTest(unittest.TestCase):
 
     def test_the_token_is_never_printed(self):
         stub = self.tmp / "rc_fail.py"
-        stub.write_text('import sys\nTOKEN_VARS = ("AG2_REMOTE_TOKEN",)\nURL_VARS = ()\n'
-                        'if __name__ == "__main__":\n    print("boom", file=sys.stderr)\n    sys.exit(1)\n')
+        stub.write_text('import os, sys\nTOKEN_VARS = ("AG2_REMOTE_TOKEN",)\nURL_VARS = ()\n'
+                        'if __name__ == "__main__":\n'
+                        '    print("boom", os.environ.get("AG2_REMOTE_TOKEN"), file=sys.stderr)\n'
+                        '    sys.exit(1)\n')  # a child that leaks its credential into its error
         env = {**self.base, "HOME": str(self.tmp)}
         done = subprocess.run([sys.executable, str(SCRIPT), "publish", "--room", "!r:x", "--name", "Blue",
                                "--core", "codex", "--room-commons", str(stub)],
                               capture_output=True, text=True, env=env)
         self.assertEqual(done.returncode, 4, done.stdout + done.stderr)
-        self.assertIn("boom", done.stdout)
+        self.assertIn("boom [redacted]", done.stdout)
         self.assertNotIn("not-a-real-secret", done.stdout + done.stderr)
+        self.assertNotIn("relay.test.invalid/relay|", done.stdout + done.stderr)
+
+    def test_redact_hides_credential_values_and_token_halves(self):
+        env = {"AG2_REMOTE_TOKEN": "https://relay.test.invalid/r|s3cr3t-value", "ROOM_KEY": "short",
+               "PATH": "/usr/bin:/bin"}
+        said = gs.redact("token s3cr3t-value and https://relay.test.invalid/r|s3cr3t-value in /usr/bin", env)
+        self.assertEqual(said, "token [redacted] and [redacted] in /usr/bin")
+        self.assertEqual(gs.redact("nothing", None), "nothing")
 
 
 class FinderTest(unittest.TestCase):
@@ -623,6 +633,18 @@ class FinderTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(tmp)}):
             found = gs.find_room_commons()
         self.assertEqual(found, beside if beside.is_file() else installed)
+
+
+class DocTest(unittest.TestCase):
+    def test_skill_md_states_the_real_chunk_size(self):
+        text = (REPO / "skills" / "tutorial" / "SKILL.md").read_text()
+        self.assertIn(f"{gs.CHUNK_BYTES:,} bytes", text)
+        self.assertIn("131,072", text)
+        self.assertLess(gs.CHUNK_BYTES, 131_072)
+        self.assertNotRegex(text, r"at most (?!" + re.escape(f"{gs.CHUNK_BYTES:,}") + r")[\d,]+ bytes")
+
+    def test_skill_md_documents_the_room_audience(self):
+        self.assertIn("--audience room", (REPO / "skills" / "tutorial" / "SKILL.md").read_text())
 
 
 class ChunkTest(unittest.TestCase):
