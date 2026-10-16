@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -58,6 +60,7 @@ class _Loop:
         self.status: list[tuple] = []
         self.logs: list[str] = []
         self.polls: list[str] = []
+        self.served: "list[list[dict]]" = []      # the tasks each poll is served, in order
         self._saved: dict = {}
         self._alive = [True, False]
 
@@ -72,7 +75,7 @@ class _Loop:
                 exc = self.poll_raises
             if exc is not None:
                 raise exc
-            return {"tasks": []}
+            return {"tasks": self.served.pop(0) if self.served else []}
         return {}
 
     def __enter__(self):
@@ -178,6 +181,62 @@ class LongPollTimeoutTest(unittest.TestCase):
             loop.run()
         self.assertEqual(loop.polls, [f"/v1/tasks?wait={self.gw.POLL_WAIT}"
                                       "&capabilities=voice-outcome-v1"] * 2)
+
+
+class AckFirstInTheLoopTest(unittest.TestCase):
+    """What `main()` itself does for a relay ask served with `ack_first`."""
+
+    def setUp(self):
+        try:
+            from ag2_sparrow import remote_gateway_bridge as gw
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            self.skipTest(f"gateway not importable: {str(e)[:60]}")
+        self.gw = gw
+        self.calls: list = []
+
+    def woken(self, mark):
+        """A wake recorder for the loop's own thread (the results watcher wakes from another)."""
+        def wake():
+            if threading.current_thread() is threading.main_thread():
+                self.calls.append(mark() if callable(mark) else mark)
+        return wake
+
+    def test_a_relay_ask_is_taken_on_its_own_before_the_rest_of_the_batch(self):
+        relay = {"id": "ask-5f3c9e0a1b2c", "task": "calendar?", "ack_first": True}
+        typed = {"id": "task-22d83e59601f3a1fef", "task": "What is AG2Space?", "ack_first": "true"}
+        with _Loop(self.gw) as loop:
+            loop.served = [[typed, relay]]
+            self.gw._write_task = lambda task, *a, **k: self.calls.append(("write", task["id"]))
+            with patch.object(self.gw, "_take_ack_first",
+                              side_effect=lambda task, inflight: self.calls.append(("take", task["id"])) or True), \
+                    patch.object(self.gw, "wake_outbound", new=self.woken("wake")):
+                loop.run()
+        # Taken first even though served second; only the exact boolean is a relay ask.
+        self.assertEqual(self.calls, [("take", relay["id"]), ("write", typed["id"]), "wake"])
+
+    def test_a_publish_from_a_retried_ack_wakes_the_outbound_worker_before_the_poll(self):
+        with _Loop(self.gw) as loop, \
+                patch.object(self.gw, "_advance_held_tasks", return_value=True), \
+                patch.object(self.gw, "wake_outbound", new=self.woken(lambda: len(loop.polls))):
+            loop.run()
+        self.assertEqual(self.calls, [0])
+        with _Loop(self.gw) as loop, \
+                patch.object(self.gw, "_advance_held_tasks", return_value=False), \
+                patch.object(self.gw, "wake_outbound", new=self.woken("woken")):
+            loop.run()
+        self.assertEqual(self.calls, [0], "nothing published, nothing to wake")
+
+    def test_a_start_sweep_that_fails_is_logged_and_the_loop_still_starts(self):
+        def _retire_delivered_marks():
+            raise RuntimeError("marks")
+
+        with _Loop(self.gw) as loop, \
+                patch.object(self.gw, "_retire_delivered_marks", new=_retire_delivered_marks), \
+                patch.object(self.gw, "_sweep_held_dir", new=lambda: self.calls.append("swept")):
+            loop.run()
+        self.assertIn("_retire_delivered_marks failed (RuntimeError: marks) — continuing", loop.logs)
+        self.assertEqual(self.calls, ["swept"], "one sweep's failure skipped the next")
+        self.assertEqual(len(loop.polls), 1)
 
 
 class DroppedConnectionTest(unittest.TestCase):
