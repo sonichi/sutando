@@ -319,7 +319,9 @@ def fetch_codeowners(repo: str, base: str) -> "tuple[str, str] | None":
                  "-H", "Accept: application/vnd.github.raw"])
         if p.returncode == 0:
             return path, p.stdout
-        if "HTTP 404" in (p.stderr or "") or "HTTP 404" in (p.stdout or ""):
+        # 404 also means "repo unreadable"; it is read as "no CODEOWNERS" only
+        # because pr_facts reads the same repo first and would have failed.
+        if "HTTP 404" in (p.stderr or ""):
             continue
         raise CodeownerCheckError(f"reading {repo}:{path}@{base} rc={p.returncode}: "
                                   f"{(p.stderr or '').strip()[:200]}")
@@ -328,7 +330,8 @@ def fetch_codeowners(repo: str, base: str) -> "tuple[str, str] | None":
 
 def _codeowners_regex(pattern: str) -> "re.Pattern":
     """GitHub's gitignore-style match. `*`/`?` stop at `/`; `**` crosses it; a slash
-    anywhere but the end anchors to the root; `docs/*` does not reach nested files."""
+    anywhere but the end anchors to the root; `docs/*` does not reach nested files,
+    but `room-*` owns a matching directory's contents, as in gitignore."""
     anchored = "/" in pattern.rstrip("/")
     dir_only = pattern.endswith("/")
     body = pattern.strip("/")
@@ -347,7 +350,7 @@ def _codeowners_regex(pattern: str) -> "re.Pattern":
     last = body.rsplit("/", 1)[-1]
     if dir_only:
         tail = "/.*"
-    elif "*" in last or "?" in last:
+    elif last == "*":
         tail = ""
     else:
         tail = "(?:/.*)?"
@@ -711,17 +714,6 @@ def main() -> int:
                           file=sys.stderr)
                 kept.append(t)
             targets = kept
-    # The two-reviewer rule exists so one person being busy cannot stall a PR.
-    # A notice asks for nothing, so it cannot stall anything by going to one.
-    if a.send and a.kind == "ask" and len(targets) < 2 and not a.allow_single:
-        print(f"REFUSED: {len(targets)} reviewer(s) resolved from {names!r}; the rule is at "
-              "least TWO, so one being busy cannot stall the PR. Name another reviewer, "
-              "or pass --allow-single '<reason>'.", file=sys.stderr)
-        # A failed name is WHY the count is short and is the actionable half.
-        # `> 0` not `or`: refusal codes are positive, 0 means nothing refused.
-        return refusal_rc if refusal_rc > 0 else 5
-    if a.allow_single and len(targets) < 2:
-        print(f"single-reviewer ask allowed: {a.allow_single}", file=sys.stderr)
     if a.send and a.kind == "ask":
         loose = unrecordable_pr_refs(a.message)
         if loose:
@@ -730,26 +722,10 @@ def main() -> int:
                   "read the PR as never asked. Refused reference(s), and the form that works: "
                   + "; ".join(f"{tok} -> {fix}" for tok, fix in loose), file=sys.stderr)
             return 7
-    stale, why = _stale_repeat_ask(a.message, targets, load_roster()) if a.kind == "ask" else (False, "")
-    if stale and not a.widen_override:
-        print(f"REFUSED: {why} Re-asking the same people is not escalation — "
-              "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
-        return 6
-    # Send-only like the two-reviewer rule: a plan cannot strand a PR, an ask can.
-    if a.send and a.kind == "ask" and targets:
-        if a.no_codeowner:
-            print(f"code-owner rule overridden: {a.no_codeowner}", file=sys.stderr)
-        else:
-            owned, lines = codeowner_gate(a.message, targets, load_roster())
-            if not owned:
-                print("REFUSED: code-owner rule — where the base branch has CODEOWNERS, "
-                      "an ask must include a non-author code owner.", file=sys.stderr)
-                for line in lines:
-                    print(line, file=sys.stderr)
-                print("Add a non-author code owner as a reviewer, or pass "
-                      "--no-codeowner '<reason>'.", file=sys.stderr)
-                return 8
+    # Gates judge only who a send would reach: a target dropped after them
+    # could be the one code owner, leaving the rest asked without one.
     failures = unlogged = 0
+    reachable = []
     for t in targets:
         if a.room and t["room"] != a.room:
             # Not an error: the pair is valid, but the Stand does not live in
@@ -793,6 +769,39 @@ def main() -> int:
                   "Resolve the room's own Stand for this person.", file=sys.stderr)
             failures += 1
             continue
+        reachable.append(t)
+    targets = reachable
+    # The two-reviewer rule exists so one person being busy cannot stall a PR.
+    # A notice asks for nothing, so it cannot stall anything by going to one.
+    if a.send and a.kind == "ask" and len(targets) < 2 and not a.allow_single:
+        print(f"REFUSED: {len(targets)} reviewer(s) resolved from {names!r}; the rule is at "
+              "least TWO, so one being busy cannot stall the PR. Name another reviewer, "
+              "or pass --allow-single '<reason>'.", file=sys.stderr)
+        # A failed name is WHY the count is short and is the actionable half.
+        # `> 0` not `or`: refusal codes are positive, 0 means nothing refused.
+        return refusal_rc if refusal_rc > 0 else 5
+    if a.allow_single and len(targets) < 2:
+        print(f"single-reviewer ask allowed: {a.allow_single}", file=sys.stderr)
+    stale, why = _stale_repeat_ask(a.message, targets, load_roster()) if a.kind == "ask" else (False, "")
+    if stale and not a.widen_override:
+        print(f"REFUSED: {why} Re-asking the same people is not escalation — "
+              "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
+        return 6
+    # Send-only like the two-reviewer rule: a plan cannot strand a PR, an ask can.
+    if a.send and a.kind == "ask" and targets:
+        if a.no_codeowner:
+            print(f"code-owner rule overridden: {a.no_codeowner}", file=sys.stderr)
+        else:
+            owned, lines = codeowner_gate(a.message, targets, load_roster())
+            if not owned:
+                print("REFUSED: code-owner rule — where the base branch has CODEOWNERS, "
+                      "an ask must include a non-author code owner.", file=sys.stderr)
+                for line in lines:
+                    print(line, file=sys.stderr)
+                print("Add a non-author code owner as a reviewer, or pass "
+                      "--no-codeowner '<reason>'.", file=sys.stderr)
+                return 8
+    for t in targets:
         argv = command_for(t, a.message)
         if not a.send:
             print("PLAN:", " ".join(argv))

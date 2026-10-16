@@ -36,15 +36,19 @@ class _R:
 class FakeGitHub:
     """Answers the gh calls the gate makes; anything else is a room_ops send."""
 
-    def __init__(self, files, author="dave", codeowners=None, fail=None):
+    def __init__(self, files, author="dave", codeowners=None, fail=None, members=None):
         self.files, self.author = files, author
         self.codeowners = codeowners or {}
         self.fail = fail or {}
+        self.members = members or {}
         self.calls, self.mentions = [], []
 
     def __call__(self, argv, **kw):
         self.calls.append(argv)
         if argv[0] != "gh":
+            if "members" in argv and argv[-1] in self.members:
+                return _R(out=json.dumps({"ok": True, "members": [
+                    {"user_id": u} for u in self.members[argv[-1]]]}))
             if "mention" in argv:
                 self.mentions.append(argv)
             return _R(out=json.dumps({"ok": True, "event_id": "$e"}))
@@ -74,13 +78,13 @@ class Gate(unittest.TestCase):
         d = Path(self.tmp.name)
         self.ledger = d / "review-asks.jsonl"
         roster = {k: {"stand": f"@{k}-stand:x", "room": "!r:x", "gh": f"{k}-gh"}
-                  for k in ("alice", "bob")}
+                  for k in ("alice", "bob", "erin")}
         self.roster_file = d / "roster.json"
         self.roster_file.write_text(json.dumps(roster))
 
-    def _run(self, gh, extra=()):
+    def _run(self, gh, extra=(), reviewers="alice,bob"):
         err = io.StringIO()
-        argv = ["notify_reviewers.py", "--reviewers", "alice,bob",
+        argv = ["notify_reviewers.py", "--reviewers", reviewers,
                 "--message", f"please review {PR}", "--send", *extra]
         with patch.object(self.mod, "ledger_path", lambda: self.ledger), \
              patch.object(self.mod, "roster_path", lambda: self.roster_file), \
@@ -193,6 +197,33 @@ class Gate(unittest.TestCase):
         rc, err = self._run(gh)
         self.assertEqual(rc, 0, err)
 
+    def test_an_owner_unreachable_in_the_room_is_not_counted(self):
+        # alice is the only owner and is not in --room; bob and erin are. The ask
+        # must be refused whole, not delivered to the two non-owners.
+        gh = FakeGitHub(["src/a.py"], codeowners={".github/CODEOWNERS": "* @alice-gh\n"},
+                        members={"!here:x": ["@bob-stand:x", "@erin-stand:x"],
+                                 "!r:x": ["@alice-stand:x", "@bob-stand:x", "@erin-stand:x"]})
+        rc, err = self._run(gh, ("--room", "!here:x"), reviewers="alice,bob,erin")
+        self.assertIn("alice: NOT REACHABLE in !here:x", err)
+        self.assertEqual(gh.mentions, [], "the non-owners must not be asked alone")
+        self.assertEqual(rc, 8, err)
+        self.assertIn("no asked reviewer (bob-gh, erin-gh)", err)
+
+    def test_an_absent_owner_is_not_counted(self):
+        gh = FakeGitHub(["src/a.py"], codeowners={".github/CODEOWNERS": "* @alice-gh\n"},
+                        members={"!r:x": ["@bob-stand:x", "@erin-stand:x"]})
+        rc, err = self._run(gh, reviewers="alice,bob,erin")
+        self.assertIn("alice: ABSENT from !r:x", err)
+        self.assertEqual(gh.mentions, [])
+        self.assertEqual(rc, 8, err)
+
+    def test_an_unreachable_reviewer_counts_against_the_two_reviewer_rule(self):
+        gh = FakeGitHub(["src/a.py"], members={"!r:x": ["@bob-stand:x"]})
+        rc, err = self._run(gh)
+        self.assertIn("alice: ABSENT from !r:x", err)
+        self.assertEqual(gh.mentions, [])
+        self.assertEqual(rc, 5, err)
+
     def test_a_notice_is_not_gated(self):
         gh = FakeGitHub(["src/a.py"], codeowners={".github/CODEOWNERS": "* @carol\n"})
         rc, err = self._run(gh, ("--kind", "notice"))
@@ -211,6 +242,18 @@ class Matching(unittest.TestCase):
         self.assertEqual(self.owners("docs/* @a\n", "docs/sub/x.md"), [])
         self.assertEqual(self.owners("docs/** @a\n", "docs/sub/x.md"), ["@a"])
         self.assertEqual(self.owners("**/logs @a\n", "deep/er/logs/x"), ["@a"])
+
+    def test_a_partial_wildcard_owns_a_matching_directory(self):
+        self.assertEqual(self.owners("/skills/room-* @a\n", "skills/room-commons/x.py"), ["@a"])
+        self.assertEqual(self.owners("/skills/room-* @a\n", "skills/room-x.md"), ["@a"])
+        self.assertEqual(self.owners("/skills/room-* @a\n", "skills/other/x.py"), [])
+        self.assertEqual(self.owners("/src/ @b\n/src/voice-* @a\n", "src/voice-x/y.ts"), ["@a"])
+        self.assertEqual(self.owners("src/a?/ @a\n", "src/ab/c/d.py"), ["@a"])
+
+    def test_docs_star_reaches_neither_nested_files_nor_a_deeper_docs(self):
+        self.assertEqual(self.owners("docs/* @a\n", "docs/a/b.md"), [])
+        self.assertEqual(self.owners("docs/* @a\n", "x/docs/a.md"), [], "a middle slash anchors")
+        self.assertEqual(self.owners("/docs/* @a\n", "docs/a.md"), ["@a"])
 
     def test_question_mark_and_escaped_hash(self):
         self.assertEqual(self.owners("a?.md @a\n", "ab.md"), ["@a"])
