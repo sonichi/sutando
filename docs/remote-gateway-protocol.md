@@ -91,6 +91,22 @@ older brokers, bridges, and Sutando installations. An optional task handler may
 use the header with `source: ag2space` and `channel_id` to select a durable
 room-specific provider session.
 
+**`capabilities` (the poll's proof).** Every poll carries
+`&capabilities=voice-outcome-v1`, the voice-outcome contract the heartbeat also
+declares (below). One agent's credential may be used by more than one bridge, so
+an AG2 Space broker serves a voice relay ask only to a poll that names the
+contract itself; a relay that predates the parameter ignores it.
+
+**`ack_first`.** An AG2 Space broker marks a voice relay ask it serves with
+`"ack_first": true`. For a task served with that exact boolean, the bridge
+records the mark in `state/remote-task-ack-first[.<instance>].json`, keyed by the
+broker id and naming the local id the task is queued under, before the task is
+queued, as it does the media sidecar; a redelivery re-commits it. It is a file of
+its own because an older bridge prunes the media sidecar when it settles a task,
+and the mark must survive a restart: it decides whether an honoured fold sends
+`consolidated_into` (see `POST /v1/results`). The mark is retired once the broker
+has accepted that task's result. A task served without the mark is unchanged.
+
 ### `POST /v1/tasks/<id>/ack`
 
 Claim/acknowledge a task so the server stops redelivering it.
@@ -103,9 +119,10 @@ The client acks each task as it is accepted. A server with at-least-once
 delivery should treat ack as "stop redelivering"; the client is idempotent and
 will not re-queue a task it already claimed or archived.
 
-`durable: true` is sent only once the task file, its media sidecar and the
-in-flight set are all fsync'd, so the task survives a crash of this host. When a
-fresh queue write, its media sidecar, the in-flight set or the pending-ack
+`durable: true` is sent only once the task file, its media sidecar, its
+`ack_first` mark (for a task served with one) and the in-flight set are all
+fsync'd, so the task survives a crash of this host. When a fresh queue write,
+its media sidecar, its `ack_first` mark, the in-flight set or the pending-ack
 ledger does not commit, the client withholds the ack entirely rather than
 claiming a task it could still lose. The flag is merely absent — a plain ack the
 server should treat as "stop redelivering" and nothing more — when a redelivered
@@ -123,9 +140,39 @@ retires that ack the same way; a task served without one is acked without the ke
 Return a task's result.
 
 ```
-body: { "id": "task-123", "body": "<result text>" }
-body: { "id": "task-123", "body": "<result text>", "thread": "ask" }   // optional
+body: { "id": "task-123", "body": "<result text>",
+        "capabilities": ["voice-outcome-v1"], "dm_only": false }
+body: { ..., "thread": "ask" }                                  // optional
+body: { "id": "ask-…", "body": "", "consolidated_into": "ask-…",
+        "capabilities": ["voice-outcome-v1"], "dm_only": false }  // an honoured fold
 ```
+
+**The voice-outcome contract (`capabilities`, `dm_only`).** Every result carries
+`"capabilities": ["voice-outcome-v1"]` and an explicit boolean `dm_only`: `true`
+when the core marked the answer private with a `[dm-only]` line, `false`
+otherwise, a skip and a fold included. The `[dm-only]` line itself is still
+stripped from `body`, so the field is the only place the broker can learn it. An
+AG2 Space broker reads the two only for a voice relay ask, and treats such an
+ask's result without them as private: an older bridge strips the line and sends
+no `dm_only`, so its private answers still reach only the owner. Both ride the
+outbox's stored payload, so a retry, also after a restart, resends them; a
+payload an older bridge stored carries neither. A broker that predates the
+contract ignores both keys.
+
+**`consolidated_into` (an honoured fold).** When the core folds a task into
+another (`[deduped: <holder>]`) and the dedup planner honours the fold, a task the
+broker served with `ack_first`, or a re-ask answering one, closes with
+`consolidated_into`: the holder's **broker** id, resolved as a result's own id is
+(the dedup alias first, then the instance prefix stripped), so a named instance
+sends `ask-…`, never `task-<instance>~ask-…` or a re-ask's `task-<hash>`. It
+carries an empty `body` and no `no_send`: the broker records the ask as merged
+into the holder and posts nothing for it. While the alias ledger or the
+`ack_first` marks cannot be read, the result waits for a later pass; a holder that
+is not a task of this gateway is never named. Every other task, typed and Signal
+tasks included, closes an honoured fold with the bare `[deduped: <holder>]` and
+`no_send` as before, because the broker already acts on `consolidated_into` for any
+task. A fold the planner re-asks or reports is unchanged: the re-ask's answer goes
+under the original id, and the report is a warning posted as the answer.
 
 **`thread` (optional).** Defined by the broker in
 [ag2-space/ag2space-backend#2138](https://github.com/ag2-space/ag2space-backend/pull/2138).
@@ -162,9 +209,16 @@ body: {
   "provider": "<REMOTE_TASK_PROVIDER>",
   "tier": "<REMOTE_TASK_TIER>",
   "inflight": <int>,            // tasks currently claimed but not yet resulted
-  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status", "team-collaborator"]
+  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status",
+                   "team-collaborator", "voice-outcome-v1"]
 }
 ```
+
+`voice-outcome-v1` declares the voice-outcome contract: the poll's proof under
+`GET /v1/tasks`, and `dm_only` and `consolidated_into` under `POST /v1/results`.
+An AG2 Space broker keeps the declaration to decide whether a new call may use the
+voice relay; the poll and every result carry the contract again, because a Mac can
+be downgraded after the declaration was read.
 
 `status` and `step` come from the core's
 `state/core-status.json`, with the health-check overlay described under
