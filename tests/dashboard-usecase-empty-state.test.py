@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Use Cases card must show a real empty state, not a bare "?".
+"""Use Cases card is hidden when there is no score, never a bare "?".
 
 ## Why this test exists
 
@@ -43,14 +43,14 @@ def render_with_score(value):
 
 def test_no_score_shows_empty_state_not_question_mark():
     html = render_with_score("?")
-    assert "Nothing scored yet" in html, "empty-state copy missing"
+    assert "<h2>Use Cases</h2>" not in html, "empty Use Cases card still rendered"
     assert '<div class="score">?</div>' not in html, 'bare "?" still rendered'
 
 
 def test_real_score_still_renders_big():
     html = render_with_score("7/10")
     assert '<div class="score">7/10</div>' in html, "score display regressed"
-    assert "Nothing scored yet" not in html, "empty state shown despite a score"
+    assert "<h2>Use Cases</h2>" in html, "card hidden despite a score"
 
 
 def main():
