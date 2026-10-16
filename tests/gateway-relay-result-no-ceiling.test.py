@@ -641,6 +641,15 @@ class EndCutShort(_Bridge):
         self.assert_finished_by_a_start(ask)
 
 
+    def test_a_finish_that_cannot_complete_a_step_leaves_the_end_for_the_next_start(self):
+        ask = self.refused_for_good_until("_dispose_terminal", before=True)
+        for step, stuck in (("_dispose_terminal", None), ("_settle_task", False), ("_save_inflight", False)):
+            with patch.object(gw, step, return_value=stuck):
+                gw._reclaim_parked_relay_results(set(gw._load_inflight()))
+            self.assertEqual(gw._load_ack_first(), {ASK_A: ask}, f"the mark went with {step} undone")
+        self.assert_finished_by_a_start(ask)
+
+
 class EndCutShortOnANamedInstance(EndCutShort):
     INSTANCE = "dev"
 
