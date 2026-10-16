@@ -47,6 +47,22 @@ def gateway_mid_task(tid, message, tier="team"):
     return "\n".join(lines) + "\n"
 
 
+REPO_ROOT = PKG_ROOT.parents[1]
+REAL_SERVER_ARGV = cc.server_argv
+
+
+def covered_server_argv(server):
+    """Under the coverage gate the stub child is traced too; its fragment lands in the
+    cwd, where the gate's `coverage combine` picks it up."""
+    argv = REAL_SERVER_ARGV(server)
+    if server == "stub" and os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+        return [sys.executable, "-m", "coverage", "run", "--rcfile=%s" % (REPO_ROOT / ".coveragerc")] + argv[1:]
+    return argv
+
+
+cc.server_argv = covered_server_argv
+
+
 def run_connector(work, once, extra=()):
     return cc.main(["--server", "stub", "--work", str(work), "--once", str(once),
                     "--idle-exit", "3", "--poll", "0.05", "--turn-timeout", "10",
@@ -233,6 +249,107 @@ class EndToEndStubTest(unittest.TestCase):
             self.assertEqual(recs[0]["thread"], recs[1]["thread"], "the thread was resumed on the new server")
             spawned = [c for c in spy.call_args_list if c.args and c.args[0] == "spawned"]
             self.assertEqual(len(spawned), 2)
+
+
+class FakeRpc:
+    """A server that accepts turn/start and then says nothing: the proxy branch cannot
+    restart a shared daemon, so a stuck turn there must raise."""
+
+    def __init__(self):
+        self.events = __import__("queue").Queue()
+        self.calls = []
+
+    def request(self, method, params=None, timeout=120):
+        self.calls.append(method)
+        if method == "turn/interrupt":
+            raise RuntimeError("stuck")
+        return {"turn": {"id": "t1"}, "thread": {"id": "th1"}}
+
+    def notify(self, method, params=None):
+        pass
+
+
+class EdgePathTest(unittest.TestCase):
+    def test_list_models_and_loaded_threads_print_json(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cc.main(["--server", "stub", "--work", d, "--list-models"]), 0)
+            self.assertEqual(json.loads(out.getvalue())["id"], "stub-model")
+            # thread/read needs a loaded thread: start one on the same server first.
+            rpc = cc.Rpc(cc.server_argv("stub"), cc.child_env(), os.path.join(d, "stub.err"))
+            args = cc.build_parser().parse_args(["--work", d, "--list-loaded", "--model", "m1",
+                                                 "--developer-instructions", "be brief"])
+            args.cwd = d
+            args.state = os.path.join(d, "state")
+            os.makedirs(args.state, exist_ok=True)
+            c = cc.Connector(lambda: rpc, args)
+            c.handshake()
+            c.open_thread(None)
+            self.assertEqual(rpc.p.poll(), None)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertFalse(c.start())
+            row = json.loads(out.getvalue())
+            self.assertEqual(row["threadId"], c.thread_id)
+            self.assertTrue(row["canAcceptDirectInput"])
+            rpc.close()
+
+    def test_server_exit_mid_turn_is_reported_not_hung(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_task(d, "task-chat-1", "[[die]] server goes away")
+            self.assertEqual(run_connector(d, once=1), 0)
+            self.assertIn("server-exited", (Path(d) / "results" / "task-chat-1.txt").read_text())
+
+    def test_other_server_requests_are_answered_and_warnings_logged(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_task(d, "task-chat-1", "[[ask]] [[warn]] odd requests")
+            with mock.patch.object(cc, "log", wraps=cc.log) as spy:
+                self.assertEqual(run_connector(d, once=1), 0)
+            self.assertTrue((Path(d) / "results" / "task-chat-1.txt").read_text().startswith("STUB echo:"))
+            logged = [" ".join(map(str, c.args)) for c in spy.call_args_list]
+            for needle in ("item/tool/requestUserInput", "currentTime/read", "stub/unknownRequest", "error notification"):
+                self.assertTrue(any(needle in l for l in logged), needle)
+
+    def test_idle_exit_without_tasks(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(cc, "log", wraps=cc.log) as spy:
+                self.assertEqual(cc.main(["--server", "stub", "--work", d, "--idle-exit", "0.3", "--poll", "0.05"]), 0)
+            self.assertTrue(any(c.args and c.args[0] == "idle-exit" for c in spy.call_args_list))
+
+    def test_proxy_server_cannot_restart_so_a_stuck_turn_raises(self):
+        args = cc.build_parser().parse_args(["--server", "proxy", "--work", "w", "--turn-timeout", "0.05",
+                                             "--interrupt-grace", "0.05"])
+        c = cc.Connector(FakeRpc, args)
+        c.thread_id = "th1"
+        with self.assertRaises(RuntimeError):
+            c.run_turn("hello")
+        self.assertEqual(c.rpc.calls, ["turn/start", "turn/interrupt"])
+
+    def test_done_list_is_bounded_and_deduplicated(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "done")
+            with mock.patch.object(cc, "DONE_KEEP", 3):
+                for tid in ("a", "b", "a", "c", "d"):
+                    cc.record_done(p, tid)
+            self.assertEqual(cc.load_done(p), ["a", "c", "d"])
+            self.assertEqual(cc.load_done(os.path.join(d, "missing")), [])
+
+    def test_rpc_close_kills_a_child_that_ignores_eof(self):
+        with tempfile.TemporaryDirectory() as d:
+            rpc = cc.Rpc([sys.executable, "-c", "import time; time.sleep(30)"], cc.child_env(), os.path.join(d, "e"))
+            rpc.close()
+            self.assertNotEqual(rpc.p.returncode, 0)
+
+    def test_child_env_falls_back_without_path(self):
+        with mock.patch.dict(cc.os.environ, {}, clear=True):
+            self.assertEqual(cc.child_env(), {"PATH": "/usr/bin:/bin", "HOME": ""})
+
+    def test_work_is_required_without_push(self):
+        with self.assertRaises(SystemExit):
+            cc.main(["--server", "stub"])
 
 
 class PushTest(unittest.TestCase):

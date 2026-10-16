@@ -28,6 +28,10 @@ def thread_obj(tid):
 
 
 def finish_turn(tid, turn_id, item_id, reply):
+    # Noise a real server also emits: another thread's event and a non-message item.
+    send({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": "other-thread", "turn": {"id": "x"}}})
+    send({"jsonrpc": "2.0", "method": "item/completed",
+          "params": {"threadId": tid, "turnId": turn_id, "completedAtMs": 0, "item": {"type": "reasoning", "id": "r1"}}})
     for chunk in (reply[:10], reply[10:]):
         send({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
               "params": {"threadId": tid, "turnId": turn_id, "itemId": item_id, "delta": chunk}})
@@ -48,6 +52,8 @@ for line in sys.stdin:
     if meth is None and rid in PENDING:
         tid, turn_id, item_id, reply = PENDING.pop(rid)
         finish_turn(tid, turn_id, item_id, reply + " approval=" + str((m.get("result") or {}).get("decision")))
+    elif meth is None:
+        pass   # a response to a request this stub does not track
     elif meth == "initialize":
         send({"jsonrpc": "2.0", "id": rid, "result": {"userAgent": "stub-app-server/0", "codexVersion": "stub"}})
     elif meth == "initialized":
@@ -78,6 +84,14 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": rid, "result": {"turn": {"id": turn_id, "status": "inProgress", "items": []}}})
         send({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": tid, "turn": {"id": turn_id, "status": "inProgress", "items": []}}})
         item_id = str(uuid.uuid4())
+        if "[[die]]" in text:
+            sys.exit(0)
+        if "[[warn]]" in text:
+            send({"jsonrpc": "2.0", "method": "error", "params": {"threadId": tid, "message": "stub warning"}})
+        if "[[ask]]" in text:
+            for n, (method, params) in enumerate((("item/tool/requestUserInput", {"questions": []}),
+                                                  ("currentTime/read", {}), ("stub/unknownRequest", {}))):
+                send({"jsonrpc": "2.0", "id": REQ_ID + 100 + n, "method": method, "params": params})
         if "[[stall" in text:
             STALLED[turn_id] = (tid, "late" if "[[stall-late]]" in text else "[[stall-hard]]" in text)
         elif "[[approval]]" in text:
