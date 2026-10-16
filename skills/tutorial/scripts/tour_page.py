@@ -2,8 +2,8 @@
 
 Pure: `render_page(name, core)` depends on nothing else. No external URL appears anywhere in the
 page (the HTML surface's sandbox may block them), so every graphic is inline SVG. Progress is kept
-in the page runtime's `window.artifact.state`, keyed by the viewer's page id; without that runtime
-it falls back to localStorage, then to memory, and every storage access is guarded.
+in the page runtime's `window.artifact.state` under a per-viewer key; when the runtime names no
+viewer it uses this browser's localStorage, then memory, and every storage access is guarded.
 """
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ ICONS = {
 }
 
 HERO = (
-    '<svg class="hero-art" viewBox="0 0 200 120" role="img" aria-hidden="true">'
+    '<svg class="hero-art" viewBox="0 0 200 120" aria-hidden="true" focusable="false">'
     '<circle cx="100" cy="60" r="56" fill="var(--hero-ring)"/>'
     f'<g style="color:var(--a-rooms)"><circle {_S} cx="66" cy="46" r="12"/>'
     f'<path {_S} d="M44 92c3-18 41-18 44 0"/></g>'
@@ -166,17 +166,17 @@ def _section(sec: Section, n: int, total: int, who: str) -> str:
     prompt = ""
     if sec.prompt:
         esc = html.escape(sec.prompt, quote=True)
-        prompt = (f'<div class="prompt"><code>{html.escape(sec.prompt)}</code>'
+        prompt = (f'<div class="prompt"><code id="p-{sec.id}">{html.escape(sec.prompt)}</code>'
                   f'<button type="button" class="copy" data-prompt="{esc}" '
-                  f'aria-label="Copy prompt: {esc}">Copy</button></div>')
+                  f'aria-describedby="p-{sec.id}">Copy</button></div>')
     return (
-        f'<section class="sec card" id="s-{sec.id}" data-id="{sec.id}" aria-labelledby="h-{sec.id}" '
+        f'<section class="sec card{" cur" if n == 1 else ""}" id="s-{sec.id}" data-id="{sec.id}" aria-labelledby="h-{sec.id}" '
         f'style="--accent:var(--a-{sec.id})">'
         f'<div class="icon" aria-hidden="true"><svg viewBox="0 0 64 64" focusable="false">{ICONS[sec.id]}</svg></div>'
         f'<div class="body"><p class="step">Step {n} of {total}</p>'
         f'<h2 id="h-{sec.id}">{sec.title}</h2>'
         f'<p>{sec.what.format(name=who)}</p><p class="how">{sec.how.format(name=who)}</p>{prompt}'
-        f'<label class="done"><input type="checkbox" data-done="{sec.id}"> Mark done</label>'
+        f'<label class="done"><input type="checkbox" data-done="{sec.id}" disabled> Mark done</label>'
         '</div></section>'
     )
 
@@ -207,7 +207,8 @@ p { margin:0 0 6px; }
 .progress-label { font-size:14px; color:var(--muted); margin-bottom:4px; }
 .bar { height:8px; border-radius:99px; background:var(--track); overflow:hidden; }
 .bar > span { display:block; height:100%%; width:0; background:var(--brand); border-radius:99px; transition:width .3s ease; }
-.controls { display:flex; flex-wrap:wrap; gap:10px 8px; align-items:center; margin:0 0 12px; }
+.controls { display:none; }
+.js .controls { display:flex; flex-wrap:wrap; gap:10px 8px; align-items:center; margin:0 0 12px; }
 .dots { display:flex; flex-wrap:wrap; gap:6px; flex-basis:100%%; }
 #all { margin-left:auto; }
 .dot { width:28px; height:28px; padding:0; border-radius:50%%; font-size:12px; border:2px solid var(--line); color:var(--muted); background:var(--card); }
@@ -229,11 +230,13 @@ button:focus-visible, input:focus-visible { outline:3px solid var(--brand); outl
 .copy:hover { background:var(--accent); color:var(--card); }
 .done { display:inline-flex; gap:8px; align-items:center; margin-top:10px; font-size:14px; cursor:pointer; }
 .done input { width:18px; height:18px; accent-color:var(--accent); }
-main[data-mode="step"] .sec { display:none; }
-main[data-mode="step"] .sec.cur { display:flex; animation:enter .22s ease-out; }
+.js main[data-mode="step"] .sec { display:none; }
+.js main[data-mode="step"] .sec.cur { display:flex; animation:enter .22s ease-out; }
+.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
+.done input:disabled { opacity:.5; }
 @keyframes enter { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
 @media (prefers-reduced-motion: reduce) {
-  main[data-mode="step"] .sec.cur { animation:none; }
+  .js main[data-mode="step"] .sec.cur { animation:none; }
   .bar > span { transition:none; }
 }
 @media (max-width: 520px) {
@@ -245,15 +248,15 @@ main[data-mode="step"] .sec.cur { display:flex; animation:enter .22s ease-out; }
 }
 </style>"""
 
-# Storage: the page runtime's per-page state (keyed by the viewer's page id), else localStorage,
-# else memory; each access is guarded because the sandbox may refuse it.
+# Storage: the page runtime's state under a per-viewer key when the runtime names the viewer, else
+# this browser's localStorage, else memory. Every access is guarded: the sandbox may refuse it.
 SCRIPT = """<script>
 (() => {
   const main = document.getElementById('tour');
   const secs = Array.from(main.querySelectorAll('section.sec'));
   const ids = secs.map((s) => s.dataset.id);
   const titles = secs.map((s) => s.querySelector('h2').textContent);
-  const controls = document.getElementById('controls');
+  const boxes = secs.map((s) => s.querySelector('input[data-done]'));
   const dotsBox = document.getElementById('dots');
   const back = document.getElementById('back');
   const next = document.getElementById('next');
@@ -263,34 +266,48 @@ SCRIPT = """<script>
   const bar = document.getElementById('progress-bar');
   const done = new Set();
   let cur = 0;
-  let key = 'gs-done';
+  let store = { kind: 'memory', key: 'gs-done' };
 
   const art = (() => { try { return window.artifact && window.artifact.state ? window.artifact : null; } catch (e) { return null; } })();
   const local = (() => { try { const s = window.localStorage; s.setItem('gs-probe', '1'); s.removeItem('gs-probe'); return s; } catch (e) { return null; } })();
+  const reduce = (() => { try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { return false; } })();
   const valid = (v) => Array.isArray(v) ? v.filter((x) => ids.includes(x)) : [];
+  const settle = async (v) => (v && typeof v.then === 'function' ? await v : v);
 
-  const load = async () => {
+  const pickStore = async () => {
     if (art) {
       try {
         await Promise.race([art.ready, new Promise((r) => setTimeout(r, 1500))]);
-        if (art.me && art.me.id) key = 'gs-done-' + art.me.id;
-        const v = art.state.get(key);
-        if (v !== undefined) return valid(v);
-      } catch (e) { /* fall through */ }
+        const id = art.me && art.me.id;
+        if (typeof id === 'string' && id) return { kind: 'state', key: 'gs-done-' + id };
+      } catch (e) { /* no viewer id: never the shared key */ }
     }
-    if (local) { try { return valid(JSON.parse(local.getItem(key) || '[]')); } catch (e) { /* fall through */ } }
+    return local ? { kind: 'local', key: 'gs-done' } : { kind: 'memory', key: 'gs-done' };
+  };
+  const load = async () => {
+    if (store.kind === 'state') {
+      try { return valid(await settle(art.state.get(store.key))); } catch (e) { return []; }
+    }
+    if (store.kind === 'local') {
+      try { return valid(JSON.parse(local.getItem(store.key) || '[]')); } catch (e) { return []; }
+    }
     return [];
   };
   const save = () => {
     const v = ids.filter((x) => done.has(x));
-    if (art) { try { art.state.set(key, v); return; } catch (e) { /* fall through */ } }
-    if (local) { try { local.setItem(key, JSON.stringify(v)); } catch (e) { /* memory only */ } }
+    if (store.kind === 'state') { try { art.state.set(store.key, v); } catch (e) { /* memory only */ } }
+    if (store.kind === 'local') { try { local.setItem(store.key, JSON.stringify(v)); } catch (e) { /* memory only */ } }
   };
 
+  const reveal = (i) => {
+    const sec = secs[i];
+    try { sec.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' }); } catch (e) { /* old engine */ }
+    try { sec.querySelector('h2').focus({ preventScroll: true }); } catch (e) { sec.querySelector('h2').focus(); }
+  };
   const dots = ids.map((id, i) => {
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'dot'; b.textContent = String(i + 1);
-    b.addEventListener('click', () => show(i, true));
+    b.addEventListener('click', () => (main.dataset.mode === 'step' ? show(i, true) : (cur = i, paint(), reveal(i))));
     dotsBox.appendChild(b); return b;
   });
 
@@ -300,11 +317,7 @@ SCRIPT = """<script>
     fill.style.width = Math.round((n / ids.length) * 100) + '%';
     bar.setAttribute('aria-valuenow', String(n));
     bar.setAttribute('aria-valuetext', label.textContent);
-    secs.forEach((s, i) => {
-      const box = s.querySelector('input[data-done]');
-      box.checked = done.has(ids[i]);
-      s.classList.toggle('cur', i === cur);
-    });
+    secs.forEach((s, i) => { boxes[i].checked = done.has(ids[i]); s.classList.toggle('cur', i === cur); });
     dots.forEach((d, i) => {
       d.classList.toggle('is-done', done.has(ids[i]));
       d.setAttribute('aria-label', 'Step ' + (i + 1) + ': ' + titles[i] + (done.has(ids[i]) ? ' (done)' : ''));
@@ -315,7 +328,6 @@ SCRIPT = """<script>
     back.disabled = cur === 0;
     next.disabled = cur === ids.length - 1;
     all.setAttribute('aria-pressed', stepping ? 'false' : 'true');
-    all.textContent = stepping ? 'Show all' : 'Step by step';
   };
   const show = (i, focus) => {
     cur = Math.max(0, Math.min(ids.length - 1, i));
@@ -341,22 +353,28 @@ SCRIPT = """<script>
     if (ev.key === 'ArrowLeft') { show(cur - 1, true); ev.preventDefault(); }
   });
 
-  controls.hidden = false;
   main.dataset.mode = 'step';
   paint();
-  load().then((v) => {
-    v.forEach((id) => done.add(id));
+  (async () => {
+    store = await pickStore();
+    (await load()).forEach((id) => done.add(id));
     const first = ids.findIndex((id) => !done.has(id));
     show(first < 0 ? 0 : first, false);
-    if (art) { try { art.state.on(key, (val) => { done.clear(); valid(val).forEach((id) => done.add(id)); paint(); }); } catch (e) { /* no live sync */ } }
-  });
+    boxes.forEach((b) => { b.disabled = false; });
+    if (store.kind === 'state') {
+      try { art.state.on(store.key, async (val) => { const v = valid(await settle(val)); done.clear(); v.forEach((id) => done.add(id)); paint(); }); } catch (e) { /* no live sync */ }
+    }
+  })();
 })();
 </script>"""
 
 # The frame is sandboxed to allow-scripts; the Clipboard API may be refused there, so the prompt
-# is also selected for a manual copy.
+# is also selected for a manual copy, and the outcome is announced in the status region.
 COPY_SCRIPT = """<script>
 (() => {
+  const status = document.getElementById('status');
+  const plat = (() => { try { return (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || ''; } catch (e) { return ''; } })();
+  const keys = /mac|iphone|ipad/i.test(plat) ? 'Press \\u2318C' : (plat ? 'Press Ctrl+C' : 'Press Ctrl/\\u2318+C');
   const pick = (el) => { const r = document.createRange(); r.selectNodeContents(el);
     const s = getSelection(); s.removeAllRanges(); s.addRange(r); };
   const legacy = (text) => { const t = document.createElement('textarea'); t.value = text;
@@ -372,11 +390,15 @@ COPY_SCRIPT = """<script>
     try { if (navigator.clipboard) { await navigator.clipboard.writeText(text); ok = true; } } catch (e) { ok = false; }
     if (!ok) ok = legacy(text);
     if (!ok) pick(btn.parentElement.querySelector('code'));
-    btn.textContent = ok ? 'Copied' : 'Press \\u2318C';
+    btn.textContent = ok ? 'Copied' : keys;
+    status.textContent = ok ? 'Copied: ' + text : 'Prompt selected. ' + keys + ' to copy it.';
     setTimeout(() => { btn.textContent = 'Copy'; }, 2500);
   });
 })();
 </script>"""
+
+# Set before the body paints, so a scripted page opens on one step instead of flashing all of them.
+HEAD_SCRIPT = "<script>document.documentElement.classList.add('js');</script>"
 
 
 def render_page(name: str, core: str = "unknown") -> str:
@@ -388,8 +410,8 @@ def render_page(name: str, core: str = "unknown") -> str:
     return (
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-        f"<title>{PAGE_TITLE}</title>{STYLE % {'light': light, 'dark': dark}}</head><body>"
-        "<main id=\"tour\" data-mode=\"all\">"
+        f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'light': light, 'dark': dark}}</head><body>"
+        "<main id=\"tour\" data-mode=\"step\">"
         f"<header class=\"hero\">{HERO}<div><h1>Getting started with {who}</h1>"
         f"<p class=\"lead\">A short tour of AG2 Space. Each part has one thing to try; Copy puts "
         f"a prompt on your clipboard to paste into a chat with {who}.</p></div></header>"
@@ -397,10 +419,11 @@ def render_page(name: str, core: str = "unknown") -> str:
         f"0 of {len(secs)} done</div>"
         f"<div class=\"bar\" id=\"progress-bar\" role=\"progressbar\" aria-label=\"Tour progress\" "
         f"aria-valuemin=\"0\" aria-valuemax=\"{len(secs)}\" aria-valuenow=\"0\"><span id=\"progress-fill\"></span></div></div>"
-        "<nav class=\"controls\" id=\"controls\" aria-label=\"Tour steps\" hidden>"
+        "<nav class=\"controls\" id=\"controls\" aria-label=\"Tour steps\">"
         "<div class=\"dots\" id=\"dots\"></div>"
         "<button type=\"button\" id=\"back\" aria-label=\"Previous step\">Back</button>"
         "<button type=\"button\" id=\"next\" aria-label=\"Next step\">Next</button>"
         "<button type=\"button\" id=\"all\" aria-pressed=\"false\">Show all</button></nav>"
-        f"{body}</main>{SCRIPT}{COPY_SCRIPT}</body></html>\n"
+        f"{body}<div id=\"status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\"></div>"
+        f"</main>{SCRIPT}{COPY_SCRIPT}</body></html>\n"
     )

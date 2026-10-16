@@ -166,8 +166,43 @@ class InteractiveTest(unittest.TestCase):
             self.assertIn(marker, self.page)
         self.assertEqual(self.page.count('type="checkbox" data-done='), 9)
         self.assertEqual(self.page.count("Mark done"), 9)
-        self.assertIn('main id="tour" data-mode="all"', self.page)  # every section shows without JS
         self.assertIn("ArrowRight", self.page)
+
+    def test_js_class_is_set_in_head_and_no_js_shows_every_section(self):
+        head, body = self.page.split("</head>", 1)
+        self.assertIn("document.documentElement.classList.add('js')", head)
+        self.assertLess(head.index("classList.add('js')"), head.index("<style>"))
+        self.assertIn('main id="tour" data-mode="step"', body)
+        self.assertIn('.js main[data-mode="step"] .sec { display:none; }', head)
+        self.assertNotRegex(head, r"(?m)^main\[data-mode")  # step hiding only under .js
+        self.assertIn(".controls { display:none; }", head)
+        self.assertEqual(body.count('class="sec card cur"'), 1)
+
+    def test_checkboxes_start_disabled_until_progress_loads(self):
+        self.assertEqual(self.page.count('data-done="'), 9)
+        self.assertEqual(len(re.findall(r'type="checkbox" data-done="[a-z]+" disabled>', self.page)), 9)
+        self.assertIn("b.disabled = false", gs.tour_page.SCRIPT)
+
+    def test_show_all_toggle_keeps_one_label(self):
+        self.assertIn('<button type="button" id="all" aria-pressed="false">Show all</button>', self.page)
+        self.assertNotIn("Step by step", self.page)
+        self.assertNotIn("all.textContent", gs.tour_page.SCRIPT)
+
+    def test_status_region_announces_copy_and_copy_has_no_static_label(self):
+        self.assertIn('role="status" aria-live="polite"', self.page)
+        self.assertIn("status.textContent", gs.tour_page.COPY_SCRIPT)
+        self.assertNotRegex(self.page, r'class="copy"[^>]*aria-label=')
+        self.assertIn('aria-describedby="p-commons"', self.page)
+
+    def test_copy_fallback_names_the_platform_keys(self):
+        script = gs.tour_page.COPY_SCRIPT
+        for text in ("Press \\u2318C", "Press Ctrl+C", "Press Ctrl/\\u2318+C", "userAgentData"):
+            self.assertIn(text, script)
+
+    def test_no_svg_pairs_role_img_with_aria_hidden(self):
+        for tag in re.findall(r"<svg\b[^>]*>", self.page):
+            self.assertFalse('role="img"' in tag and 'aria-hidden="true"' in tag, tag)
+        self.assertNotIn('role="img"', self.page)
 
     def test_an_svg_per_section_and_a_hero(self):
         self.assertEqual(self.page.count('<div class="icon" aria-hidden="true"><svg'), 9)
@@ -195,9 +230,11 @@ class InteractiveTest(unittest.TestCase):
 
     def test_progress_uses_the_page_runtime_keyed_per_viewer(self):
         script = gs.tour_page.SCRIPT
-        self.assertIn("'gs-done-' + art.me.id", script)
-        self.assertIn("art.state.set(key, v)", script)
-        self.assertIn("art.state.on(key", script)
+        self.assertIn("'gs-done-' + id", script)
+        self.assertIn("art.state.set(store.key, v)", script)
+        self.assertIn("art.state.on(store.key", script)
+        self.assertNotIn("art.state.set('gs-done'", script)
+        self.assertIn("typeof v.then === 'function'", script)
 
     def test_accent_palette_meets_aa_on_cards_in_both_themes(self):
         tp = gs.tour_page
@@ -210,13 +247,141 @@ class InteractiveTest(unittest.TestCase):
         if not node:
             self.skipTest("node not installed")
         bodies = re.findall(r"<script>(.*?)</script>", self.page, re.S)
-        self.assertEqual(len(bodies), 2)
+        self.assertEqual(len(bodies), 3)
         for body in bodies:
             with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
                 fh.write(body)
             done = subprocess.run([node, "--check", fh.name], capture_output=True, text=True)
             os.unlink(fh.name)
             self.assertEqual(done.returncode, 0, done.stderr)
+
+
+JSDOM_HARNESS = r"""
+const { JSDOM } = require('jsdom');
+const html = require('fs').readFileSync(process.argv[2], 'utf8');
+const scenario = process.argv[3];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const out = { errors: [], sets: [] };
+const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerously', pretendToBeVisual: true,
+  beforeParse(w) {
+    w.addEventListener('error', (e) => out.errors.push(String(e.message)));
+    w.Element.prototype.scrollIntoView = function (o) { out.scrolled = [this.id, o && o.behavior]; };
+    w.matchMedia = () => ({ matches: false });
+    const runtime = (me, get) => ({ ready: Promise.resolve(), me,
+      state: { get, set: (k, v) => out.sets.push([k, v]), on: () => {} } });
+    if (scenario === 'me') w.artifact = runtime({ id: 'u42' }, () => Promise.resolve(['rooms']));
+    if (scenario === 'nome') w.artifact = runtime(null, () => ['rooms']);
+    if (scenario === 'slow') w.artifact = { ready: new Promise(() => {}), me: null, state: { get: () => undefined, set: () => {}, on: () => {} } };
+    if (scenario === 'copy-ok') Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: () => Promise.resolve() } });
+    if (scenario === 'copy-fail') {
+      Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: () => Promise.reject(new Error('denied')) } });
+      Object.defineProperty(w.navigator, 'platform', { value: 'Win32' });
+      w.document.execCommand = () => false;
+    }
+  } });
+const w = dom.window, d = w.document;
+const mark = (i) => { const b = d.querySelectorAll('input[data-done]')[i]; b.checked = true; b.dispatchEvent(new w.Event('change', { bubbles: true })); };
+(async () => {
+  out.jsClass = d.documentElement.classList.contains('js');
+  out.disabledEarly = Array.from(d.querySelectorAll('input[data-done]')).every((b) => b.disabled);
+  await sleep(scenario === 'slow' ? 1800 : 60);
+  out.enabled = Array.from(d.querySelectorAll('input[data-done]')).every((b) => !b.disabled);
+  out.progress = d.getElementById('progress-label').textContent;
+  if (scenario === 'me' || scenario === 'nome' || scenario === 'slow') {
+    mark(2);
+    out.local = w.localStorage.getItem('gs-done');
+  }
+  if (scenario === 'showall') {
+    const all = d.getElementById('all');
+    out.labelBefore = all.textContent;
+    all.click();
+    out.pressed = all.getAttribute('aria-pressed');
+    out.labelAfter = all.textContent;
+    d.querySelectorAll('.dot')[4].click();
+    out.focused = d.activeElement && d.activeElement.id;
+    out.mode = d.getElementById('tour').dataset.mode;
+  }
+  if (scenario.startsWith('copy')) {
+    d.querySelector('button[data-prompt]').click();
+    await sleep(30);
+    out.button = d.querySelector('button[data-prompt]').textContent;
+    out.status = d.getElementById('status').textContent;
+  }
+  out.progressAfter = d.getElementById('progress-label').textContent;
+  console.log(JSON.stringify(out));
+  process.exit(0);
+})();
+"""
+
+
+def _jsdom_node():
+    """(node, env) when node can require jsdom (NODE_PATH may point at a node_modules), else None."""
+    node = shutil.which("node")
+    if not node:
+        return None
+    probe = subprocess.run([node, "-e", "require('jsdom')"], capture_output=True, text=True)
+    return (node, dict(os.environ)) if probe.returncode == 0 else None
+
+
+class PageBehaviourTest(unittest.TestCase):
+    """The page's script in jsdom; skipped where node cannot load jsdom (set NODE_PATH to run)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = _jsdom_node()
+        if cls.node is None:
+            raise unittest.SkipTest("node with jsdom not available")
+        cls.tmp = Path(tempfile.mkdtemp(prefix="tutorial-jsdom-"))
+        cls.page = cls.tmp / "page.html"
+        cls.page.write_text(gs.render_page("Blue", "claude"))
+        cls.harness = cls.tmp / "harness.cjs"
+        cls.harness.write_text(JSDOM_HARNESS)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def run_page(self, scenario):
+        node, env = self.node
+        done = subprocess.run([node, str(self.harness), str(self.page), scenario],
+                              capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = json.loads(done.stdout)
+        self.assertEqual(out["errors"], [])
+        return out
+
+    def test_js_class_is_set_before_the_body_and_boxes_wait_for_load(self):
+        out = self.run_page("slow")
+        self.assertTrue(out["jsClass"])
+        self.assertTrue(out["disabledEarly"])
+        self.assertTrue(out["enabled"])
+
+    def test_viewer_key_is_used_and_a_thenable_get_is_awaited(self):
+        out = self.run_page("me")
+        self.assertEqual(out["progress"], "1 of 9 done")
+        self.assertEqual(out["sets"], [["gs-done-u42", ["rooms", "teamwork"]]])
+        self.assertIsNone(out["local"])
+
+    def test_without_a_viewer_id_the_shared_state_is_never_written(self):
+        for scenario in ("nome", "slow"):
+            out = self.run_page(scenario)
+            self.assertEqual(out["sets"], [], scenario)
+            self.assertEqual(json.loads(out["local"]), ["teamwork"], scenario)
+
+    def test_show_all_keeps_one_label_and_dots_scroll_and_focus(self):
+        out = self.run_page("showall")
+        self.assertEqual((out["labelBefore"], out["labelAfter"], out["pressed"]), ("Show all", "Show all", "true"))
+        self.assertEqual(out["mode"], "all")
+        self.assertEqual(out["scrolled"], ["s-agents", "smooth"])
+        self.assertEqual(out["focused"], "h-agents")
+
+    def test_copy_outcomes_are_announced(self):
+        ok = self.run_page("copy-ok")
+        self.assertEqual(ok["button"], "Copied")
+        self.assertEqual(ok["status"], "Copied: " + gs.SECTIONS[1].prompt)
+        fail = self.run_page("copy-fail")
+        self.assertEqual(fail["button"], "Press Ctrl+C")
+        self.assertIn("Press Ctrl+C", fail["status"])
 
 
 class NameTest(unittest.TestCase):
