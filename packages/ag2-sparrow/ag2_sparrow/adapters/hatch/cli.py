@@ -673,9 +673,12 @@ def _read_body(args) -> "tuple[str | None, str]":
     return body, ""
 
 
+def _normalized(text: str) -> str:
+    return unicodedata.normalize("NFKC", _MENTION.sub(" ", text)).casefold()
+
+
 def _words(text: str) -> list:
-    text = unicodedata.normalize("NFKC", _MENTION.sub(" ", text)).casefold()
-    return _TOKEN.findall(text)
+    return _TOKEN.findall(_normalized(text))
 
 
 def _weight(tokens: list) -> int:
@@ -691,9 +694,9 @@ def answers(body: str, quoted: str) -> bool:
     Japanese or Thai; all of it when shorter); case, punctuation and @-mentions do not count."""
     message = message_text(body)
     have, want = _words(message), _words(quoted)
-    if not have:  # no words at all, e.g. a lone emoji: match it character for character
-        squeeze = "".join(quoted.split()).casefold()
-        return bool(squeeze) and squeeze in "".join(message.split()).casefold()
+    if not have:  # no words at all, e.g. a lone emoji: only the whole message names it
+        squeeze = "".join(_normalized(quoted).split())
+        return bool(squeeze) and squeeze == "".join(_normalized(message).split())
     if not want or _weight(want) < min(ANSWERING_MIN_WORDS * ANSWERING_MIN_CHARS,
                                        _weight(have)):
         return False

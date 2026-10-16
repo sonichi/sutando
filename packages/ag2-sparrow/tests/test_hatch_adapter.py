@@ -1658,6 +1658,48 @@ class ReplyBinding(Base):
         self.assertEqual(self.reply(str(b_result), "--no-send", "--answering",
                                     "明日の会議").returncode, hatch_cli.REPLY_POSTED)
 
+    def emoji_tasks(self):
+        a, b = "task-1784700000006", "task-1784700000007"
+        self.add_task(a, "$a", sender="@chi:ag2.space", mtime=1005, body="\U0001F44D")
+        self.add_task(b, "$b", sender="@chi:ag2.space", mtime=1006,
+                      body="\U0001F44D\U0001F44E")
+        return self.results / f"{a}.txt", self.results / f"{b}.txt"
+
+    def test_an_emoji_answer_sent_to_a_longer_emoji_message_writes_nothing(self):
+        a_result, b_result = self.emoji_tasks()
+        r = self.reply(str(b_result), "--answering", "\U0001F44D",
+                       "--body", "@chi:ag2.space yes", "--wait", "0")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn(str(a_result), r.stderr)
+        self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
+        r = self.reply(str(a_result), "--answering", "\U0001F44D",
+                       "--body", "@chi:ag2.space yes", "--wait", "0")
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
+        self.assertEqual(a_result.read_text(), "@chi:ag2.space yes")
+
+    def test_no_send_with_an_emoji_of_another_message_writes_nothing(self):
+        a_result, b_result = self.emoji_tasks()
+        r = self.reply(str(b_result), "--no-send", "--answering", "\U0001F44D")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
+        self.assertEqual(self.reply(str(b_result), "--no-send", "--answering",
+                                    "\U0001F44D \U0001F44E").returncode, hatch_cli.REPLY_POSTED)
+
+    def test_a_message_without_words_is_named_only_in_full(self):
+        up, both = "\U0001F44D", "\U0001F44D\U0001F44E"
+        for body in (both, f"[AG2Space Chi] {both}", f"[AG2Space Chi] @a:b {both}"):
+            self.assertFalse(hatch_cli.answers(body, up), body)
+            self.assertFalse(hatch_cli.answers(body, "\U0001F44E"), body)
+            self.assertTrue(hatch_cli.answers(body, both), body)
+            self.assertTrue(hatch_cli.answers(body, f" {up} \U0001F44E "), body)
+        for body in (up, f"[AG2Space Chi] {up}", f"[AG2Space Chi] @a:b {up}"):
+            self.assertTrue(hatch_cli.answers(body, up), body)
+            self.assertFalse(hatch_cli.answers(body, both), body)
+            self.assertFalse(hatch_cli.answers(body, ""), body)
+        # The sender prefix is not part of the message, as for a message with words.
+        self.assertFalse(hatch_cli.answers(f"[AG2Space Chi] {both}", f"[AG2Space Chi] {up}"))
+        self.assertFalse(hatch_cli.answers(f"[AG2Space Chi] {up}", f"[AG2Space Chi] {up}"))
+
     def test_the_message_replied_to_does_not_bind_the_reply(self):
         tid = "task-1784700000005"
         body = broker_reply_body("@ann:ag2.space", "please review the hatch pull request",
