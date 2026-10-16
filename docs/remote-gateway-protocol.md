@@ -128,7 +128,11 @@ own, and publishes it to the core only once its ack is accepted:
    fsync'd, and only then is the entry removed, so a power loss cannot bring the
    staged name back without the entry that says it was published. An acceptance
    that cannot be recorded keeps the task staged and unpublished; the next pass
-   acks again.
+   acks again. Before the publish, the `access_tier` the staged file froze is
+   resolved again under the local policy in force now; if access has dropped, or
+   the file cannot be read or parsed or names no known tier, nothing is
+   published: the task stays staged and accepted, is reported under
+   `ack_first_unresolved` (below), and is checked again on every pass.
    Refused: the decision is recorded in the entry first, then the staged file,
    the mark and the in-flight entry go, and the entry goes last, so a crash in
    between finishes the discard on the next pass. The task never reaches the core.

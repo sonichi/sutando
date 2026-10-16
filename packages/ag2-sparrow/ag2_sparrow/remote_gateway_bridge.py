@@ -4656,7 +4656,7 @@ def _advance_held_tasks(inflight: "set[str]") -> bool:
 
 def _staged_policy_tier(staged: Path) -> "tuple[str, str] | None":
     """The access tier frozen into a staged task and the sender it names, or None when
-    the file cannot be read or carries no tier.
+    that cannot be proven: the file cannot be read or parsed, or names no known tier.
 
     Read from the ARTIFACT, not from the manifest entry: the staged body is what a
     resume publishes, so it is what has to be re-examined, and a task staged by an
@@ -4667,17 +4667,18 @@ def _staged_policy_tier(staged: Path) -> "tuple[str, str] | None":
     """
     try:
         text = staged.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        headers = local_task_protocol.parse_task_headers_trusted(text).headers
+    except Exception:  # noqa: BLE001 — unprovable, so withheld by the caller, never published
         return None
-    headers = local_task_protocol.parse_task_headers_trusted(text).headers
-    frozen = headers.get("access_tier")
-    if not frozen:
-        return None
-    return _normalized_tier(frozen), (headers.get("user_id") or "")
+    frozen = local_task_protocol.canonical_access_tier(headers.get("access_tier"))
+    if frozen not in _TIER_RANK:
+        return None     # every render writes a known tier, so a missing one is damage
+    return frozen, (headers.get("user_id") or "")
 
 
 def _staged_tier_withdrawn(tid: str, staged: Path) -> bool:
-    """True when the capability a staged task froze is no longer granted locally.
+    """True when a staged task must wait: the capability it froze is no longer granted
+    locally, or what it froze cannot be proven.
 
     A staged task freezes its whole policy envelope at stage time — the
     `access_tier` line, that tier's in-band guardrail, the owner-only prelude —
@@ -4685,12 +4686,18 @@ def _staged_tier_withdrawn(tid: str, staged: Path) -> bool:
     between would be bypassed by replay alone. Re-resolving the frozen tier
     through `_tier_for` cannot escalate it (the resolver takes the lower of
     attested and local), so a drop means local access was genuinely withdrawn.
-    Unreadable or tier-less files answer False: refusing to publish on a failed
-    read would strand a task on a transient error.
+    An envelope that cannot be proven (unreadable, unparsable, no known tier) is
+    withheld too and checked again on every pass: a transient read error delays
+    the task and never publishes an envelope nobody could check.
     """
     frozen = _staged_policy_tier(staged)
     if frozen is None:
-        return False
+        _HELD_UNRESOLVED.add(tid)
+        _log_backoff((tid, "tier-unproven"),
+                     f"ERROR ack_first task {tid}: the tier its staged file froze cannot be read "
+                     "— kept staged, not published, checked again every pass. Reported in the "
+                     "gateway status")
+        return True
     now = _tier_for(frozen[1], frozen[0])
     if _TIER_RANK[now] >= _TIER_RANK[frozen[0]]:
         return False

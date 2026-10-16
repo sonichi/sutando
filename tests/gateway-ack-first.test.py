@@ -705,6 +705,74 @@ class AcknowledgingFirst(_Bridge):
         self.assertEqual(self.broker.acks(), [], "written tasks are acked after the batch, as before")
 
 
+class StagedPolicyGate(_Bridge):
+    """Before a held task is published, the tier its staged file froze must be proven and still
+    granted; anything else withholds it, reports it and checks it again on the next pass."""
+
+    def staged_once(self) -> Path:
+        self.broker.answers[ASK_A] = ["down"]
+        self.take(voice_ask(ASK_A))
+        [staged] = self.staged(ASK_A)
+        self.assertEqual(staged.read_text().count("\naccess_tier: owner\n"), 1)
+        return staged
+
+    def unreadable(self, staged: Path) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-000 file")
+        staged.chmod(0)
+        self.addCleanup(lambda: staged.exists() and staged.chmod(0o600))
+
+    def withheld(self) -> None:
+        """Nothing published; the staged file and the accepted entry kept; the ask reported."""
+        self.assertFalse((gw.TASKS_DIR / f"{ASK_A}.txt").exists(), "an unproven envelope was published")
+        self.assertEqual((len(self.staged(ASK_A)), self.fired), (1, []))
+        self.assertIs(self.manifest()[ASK_A]["accepted"], True)
+        gw._emit_gateway_status(True)
+        self.assertEqual(json.loads(gw.GATEWAY_STATUS_FILE.read_text()).get("ack_first_unresolved"), [ASK_A])
+
+    def test_a_staged_file_that_cannot_be_read_is_withheld_until_it_can(self):
+        staged = self.staged_once()
+        self.unreadable(staged)
+        for _ in range(2):                              # checked again on every pass
+            self.assertFalse(gw._advance_held_tasks(self.inflight))
+            self.withheld()
+        self.assertEqual(sum("cannot be read" in line for line in self.lines), 2)
+        staged.chmod(0o600)                             # readable again, the cap unchanged
+        self.assertTrue(gw._advance_held_tasks(self.inflight))
+        self.assertEqual((self.fired, self.manifest(), len(self.broker.acks())), ([ASK_A], {}, 2))
+        gw._emit_gateway_status(True)
+        self.assertIsNone(json.loads(gw.GATEWAY_STATUS_FILE.read_text()).get("ack_first_unresolved"))
+
+    def test_a_staged_file_read_again_under_a_lowered_cap_stays_withheld(self):
+        staged = self.staged_once()
+        self.unreadable(staged)
+        self.assertFalse(gw._advance_held_tasks(self.inflight))
+        self.withheld()
+        staged.chmod(0o600)
+        with patch.object(gw, "LOCAL_TIER", "guest"):
+            self.assertFalse(gw._advance_held_tasks(self.inflight))
+        self.withheld()
+        self.assertTrue(any("staged as owner but local access is now guest" in line for line in self.lines))
+
+    def test_a_staged_file_naming_no_known_tier_is_withheld(self):
+        staged = self.staged_once()
+        original = staged.read_text()
+        cases = {"no access_tier line": original.replace("\naccess_tier: owner\n", "\n"),
+                 "an unknown tier": original.replace("access_tier: owner", "access_tier: superuser")}
+        for name, text in cases.items():
+            with self.subTest(name):
+                staged.write_text(text)
+                self.assertFalse(gw._advance_held_tasks(self.inflight))
+                self.withheld()
+        staged.write_text(original)
+        with self.subTest("a parse that raises"), patch.object(
+                gw.local_task_protocol, "parse_task_headers_trusted", side_effect=ValueError("bad")):
+            self.assertFalse(gw._advance_held_tasks(self.inflight))
+            self.withheld()
+        self.assertTrue(gw._advance_held_tasks(self.inflight))         # proven again: published once
+        self.assertEqual((self.fired, self.manifest()), ([ASK_A], {}))
+
+
 class TheMark(_Bridge):
     """The `ack_first` mark: broker id -> the local id, in a file of its own."""
 
@@ -899,6 +967,45 @@ class ThroughTheLoop(unittest.TestCase):
         self.bridges.stop(bridge)
         self.assertEqual(self.bridges.fired(), [f"{ASK_A}.txt"], "the ask did not publish once")
         self.assertEqual((self.staged(), self.entry()), ([], {}))
+
+    def unreadable_after_a_crash(self) -> Path:
+        if os.geteuid() == 0:
+            self.skipTest("root reads a mode-000 file")
+        self.relay.queue.append(voice_ask(ASK_A))              # owner-attested
+        self.bridges.crashed(self.bridges.start(crash="before-publish"), "the publish")
+        [staged] = self.staged()
+        staged.chmod(0)
+        self.addCleanup(lambda: staged.exists() and staged.chmod(0o600))
+        return staged
+
+    def test_an_unreadable_staged_file_restarted_under_a_lower_cap_is_never_published(self):
+        staged = self.unreadable_after_a_crash()
+        self.bridges.env["REMOTE_TASK_TIER"] = "guest"
+        bridge = self.bridges.start()
+        self.bridges.wait_logged(bridge, "cannot be read")
+        self.bridges.polls_after(bridge)
+        self.assertFalse(self.task.exists(), "an envelope nobody could check reached the core")
+        self.assertEqual((self.staged(), self.bridges.fired()), ([staged], []))
+        self.assertEqual(self.state("gateway-status").get("ack_first_unresolved"), [ASK_A])
+        staged.chmod(0o600)                                    # readable again: the drop is seen
+        self.bridges.wait_logged(bridge, "staged as owner but local access is now guest")
+        self.bridges.polls_after(bridge)
+        self.bridges.stop(bridge)
+        self.assertFalse(self.task.exists(), "the frozen owner envelope reached the core")
+        self.assertEqual((self.staged(), self.bridges.fired()), ([staged], []))
+
+    def test_an_unreadable_staged_file_under_the_same_cap_publishes_once_it_reads(self):
+        staged = self.unreadable_after_a_crash()
+        bridge = self.bridges.start()
+        self.bridges.wait_logged(bridge, "cannot be read")
+        self.bridges.polls_after(bridge)
+        self.assertFalse(self.task.exists())
+        staged.chmod(0o600)
+        self.bridges.wait_for(lambda: self.bridges.fired(), bridge, "the publish once it reads")
+        self.bridges.polls_after(bridge)
+        self.bridges.stop(bridge)
+        self.assertEqual(self.bridges.fired(), [f"{ASK_A}.txt"], "the ask did not publish exactly once")
+        self.assertEqual((self.staged(), self.entry(), self.relay.acks), ([], {}, [ASK_A]))
 
     def test_a_crash_after_the_staged_file_and_before_its_entry_leaves_nothing_behind(self):
         self.relay.queue.append(voice_ask(ASK_A))
