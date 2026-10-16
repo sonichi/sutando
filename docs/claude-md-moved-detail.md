@@ -143,3 +143,18 @@ Moved verbatim from CLAUDE.md "Task bridge" (2026-09-21 context-budget diet):
 > The per-consumer prefix is code-enforced (single helper, single source of truth) so cross-consumer namespace collisions are impossible regardless of what ID format a future consumer adopts.
 >
 > Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses.
+
+## Core liveness signal
+
+Each running sutando-core writes `<workspace>/state/cores/<hostname>.alive`
+every 30 seconds (started by `src/startup.sh` as a background process; source
+at `src/core_heartbeat.py`). The file is per-host so multiple cores on
+different machines coexist; mtime is the cross-host "is this core alive?"
+signal (younger than ~90s → alive). On SIGTERM/SIGINT the .alive file is
+unlinked so peers see a graceful shutdown immediately.
+
+Payload schema + locality/socket field semantics: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md).
+
+## Session Continuity
+
+On each context compaction, `src/session-handoff.sh` saves a snapshot to `<workspace>/session-state.md` (system status, recent commits, open PRs, quota, tasks). Read this file at session start to understand what the previous session was doing. It lives under the workspace (per the workspace contract), not the repo root.

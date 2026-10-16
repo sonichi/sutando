@@ -28,6 +28,10 @@ and stop the work that depends on the blocker; work that does not depend on it p
 reply says which part was not done. No silent retries, no wording that implies success. If several
 requests are pending, say how many are ahead of this one.
 
+## Privacy
+
+Before anything leaves for a place others can read (a public repo's PRs, issues, commits or code; a room; a post; a message to someone other than the owner), check it against who can read it there. Never include what that audience shouldn't see: private repository or room names and IDs, people's and agents' names and accounts, private message content (quoted or paraphrased), the owner's account data, credentials, or local paths. Describe evidence by function ("the owner's DM", "agent A", "a test room"). Check before the first send: commits, merges and edit history can't be taken back.
+
 ## Architecture rules
 
 Rationale + worked examples for every boundary rule below (quoted section names) live in [`docs/architecture-boundaries.md`](docs/architecture-boundaries.md) — read the named section before working on that boundary.
@@ -196,14 +200,7 @@ This ensures the dashboard, result-watcher, and timeout logic work the same rega
 
 ## Core liveness signal
 
-Each running sutando-core writes `<workspace>/state/cores/<hostname>.alive`
-every 30 seconds (started by `src/startup.sh` as a background process; source
-at `src/core_heartbeat.py`). The file is per-host so multiple cores on
-different machines coexist; mtime is the cross-host "is this core alive?"
-signal (younger than ~90s → alive). On SIGTERM/SIGINT the .alive file is
-unlinked so peers see a graceful shutdown immediately.
-
-Payload schema + locality/socket field semantics: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md).
+Per-host heartbeat file: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md#core-liveness-signal).
 
 ## Migration transition window
 
@@ -412,7 +409,7 @@ When the user says "learn this" / "remember my preference" / demonstrates a patt
 
 ## Session Continuity
 
-On each context compaction, `src/session-handoff.sh` saves a snapshot to `<workspace>/session-state.md` (system status, recent commits, open PRs, quota, tasks). Read this file at session start to understand what the previous session was doing. It lives under the workspace (per the workspace contract), not the repo root.
+Read `<workspace>/session-state.md` at session start: [detail](docs/claude-md-moved-detail.md#session-continuity).
 
 ## Startup
 
