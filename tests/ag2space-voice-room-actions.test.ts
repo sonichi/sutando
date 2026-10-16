@@ -324,7 +324,7 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 
 	it('"open the page": a summon naming no one calls the owner, and the yes binds that invitee', async () => {
 		const SUMMON = { action: 'room.commons.summon', arguments_json: '{"kind":"markdown-a1ud0njz"}', room: '!r:ag2.space' };
-		const f = fake((n, a) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'medium', title: 'Summon', action_revision: 'sha256:s1', idempotency_requirement: 'required' })
+		const f = fake((n) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'medium', title: 'Summon', action_revision: 'sha256:s1', idempotency_requirement: 'required' })
 			: n === 'ag2.whoami' ? ok({ actor: { id: '@bot:ag2.space' }, runtime: { owner_id: '@owner:ag2.space' } })
 			: ok({ status: 'completed', result: { event_id: '$card' } }));
 		const r = await runAction(SUMMON, f.deps, now) as { error: string; confirm_token: string; will_do: { arguments: Record<string, unknown> } };
