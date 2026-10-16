@@ -161,7 +161,7 @@ export function mcpPayload(r: McpToolResult): Record<string, unknown> | null {
 const MATRIX_ROOM_ID = /^![A-Za-z0-9._=\-/+]+:[A-Za-z0-9.\-]+(:\d+)?$/;
 /** A Matrix event id, as read_room, search_room and add_comment return them. */
 const EVENT_ID = /^\$[^\s]{1,255}$/;
-/** A full Matrix user id — what room.message.send's mentions take. */
+/** A full Matrix user id — what room.message.send's and the comment actions' mentions take. */
 const MATRIX_USER_ID = /^@[^\s:]+:[A-Za-z0-9.\-]+(:\d+)?$/;
 
 export interface RoomRef { room_id: string; name: string }
@@ -584,31 +584,35 @@ export async function writePage(args: { room?: string; title?: string; kind?: st
 }
 
 export type AddCommentResult =
-	| { ok: true; room: string; kind: string; quote: string | null; event_id: string | null; ms: number }
+	| { ok: true; room: string; kind: string; quote: string | null; event_id: string | null; mentions: number; ms: number }
 	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
 
 /**
  * A comment on a Commons page (room.commons.comments.add), as the web client leaves one: on the whole
  * page, or anchored to a passage of a Doc page with `quote`. 2026-10-13 21:16: "make a comment" was
- * appended to the page's text instead, and the user found no comment.
+ * appended to the page's text instead, and the user found no comment. `mentions` are named first and
+ * notified, as on room.message.send.
  */
-export async function addComment(args: { room?: string; kind?: string; text: string; quote?: string; reply_to?: string }, deps: ReadRoomDeps): Promise<AddCommentResult> {
+export async function addComment(args: { room?: string; kind?: string; text: string; quote?: string; reply_to?: string; mentions?: string[] }, deps: ReadRoomDeps): Promise<AddCommentResult> {
 	const t0 = Date.now();
 	const client = deps.client();
 	if (!client) return { ok: false, error: 'not_connected' };
 	const text = (args.text ?? '').trim();
 	if (!text) return { ok: false, error: 'no_text' };
 	if (text.length > ROOM_WRITE_TEXT_MAX) return { ok: false, error: 'too_long' };
+	const mentions = (args.mentions ?? []).map(m => String(m).trim()).filter(Boolean);
+	if (mentions.some(m => !MATRIX_USER_ID.test(m))) return { ok: false, error: 'no_user' };
+	const mentioned = mentions.length ? { mentions } : {};
 	const replyTo = (args.reply_to ?? '').trim();
 	if (replyTo) {
 		// A reply in a comment thread: the thread's root, from a comment's event_id.
 		if (!EVENT_ID.test(replyTo)) return { ok: false, error: 'no_thread' };
 		const target = await targetRoom(args.room, deps);
 		if (!target.ok) return target;
-		const done = await roomExecute(client, target.room, 'room.commons.comments.reply', { root_event_id: replyTo, text }, deps);
+		const done = await roomExecute(client, target.room, 'room.commons.comments.reply', { root_event_id: replyTo, text, ...mentioned }, deps);
 		if (!done.ok) return done;
-		deps.log?.(`[RoomRead] room.commons.comments.reply in ${target.room.name}: ${text.length} chars`);
-		return { ok: true, room: target.room.name, kind: '', quote: null, event_id: typeof done.result.event_id === 'string' ? done.result.event_id : null, ms: Date.now() - t0 };
+		deps.log?.(`[RoomRead] room.commons.comments.reply in ${target.room.name}: ${text.length} chars${mentions.length ? ` @${mentions.length}` : ''}`);
+		return { ok: true, room: target.room.name, kind: '', quote: null, event_id: typeof done.result.event_id === 'string' ? done.result.event_id : null, mentions: mentions.length, ms: Date.now() - t0 };
 	}
 	const kind = (args.kind ?? '').trim();
 	if (!/^((markdown|html|board|sheet)(-[a-z0-9]{8})?|readme)$/.test(kind)) return { ok: false, error: 'no_page' };
@@ -616,11 +620,11 @@ export async function addComment(args: { room?: string; kind?: string; text: str
 	if (quote && !/^markdown/.test(kind)) return { ok: false, error: 'no_quote' };
 	const target = await targetRoom(args.room, deps);
 	if (!target.ok) return target;
-	const done = await roomExecute(client, target.room, 'room.commons.comments.add', { kind, text, ...(quote ? { quote } : {}) }, deps);
+	const done = await roomExecute(client, target.room, 'room.commons.comments.add', { kind, text, ...(quote ? { quote } : {}), ...mentioned }, deps);
 	if (!done.ok) return done;
 	const event_id = typeof done.result.event_id === 'string' ? done.result.event_id : null;
-	deps.log?.(`[RoomRead] room.commons.comments.add on ${kind} in ${target.room.name}: ${text.length} chars${quote ? ' (on a passage)' : ''}`);
-	return { ok: true, room: target.room.name, kind, quote, event_id, ms: Date.now() - t0 };
+	deps.log?.(`[RoomRead] room.commons.comments.add on ${kind} in ${target.room.name}: ${text.length} chars${quote ? ' (on a passage)' : ''}${mentions.length ? ` @${mentions.length}` : ''}`);
+	return { ok: true, room: target.room.name, kind, quote, event_id, mentions: mentions.length, ms: Date.now() - t0 };
 }
 
 export type SendMessageResult =
@@ -812,22 +816,24 @@ export function createAddCommentTool(deps: ReadRoomDeps): ToolDefinition {
 			'Call it when the user wants to comment, remark or 留言 on a document or page ("comment on the design doc: Susan has reviewed"). To change the page\'s own text, use write_page instead. ' +
 			'Pass `kind` from a search_commons hit (e.g. "markdown-4m8ay3mg"), "markdown" for the main Doc, "html" for the main HTML page, or "readme"; `quote` = the exact passage to anchor to (Doc pages only), left out for a comment on the whole page. ' +
 			'To answer in an existing comment thread instead, pass `reply_to` = that comment\'s event_id and no kind. ' +
-			WRITE_CONFIRMATION +
+			'`mentions` = full user ids (e.g. "@sutando-sonichi:ag2.space", from a message\'s sender) only when the user explicitly asks to @ someone in the comment: they are named first and notified, and mentioned agents act on being mentioned, so never add one on your own. ' +
+			WRITE_CONFIRMATION.replace('on which page and in which room', 'on which page and in which room, and whom it mentions') +
 			'Leave `room` out for the room this session is in. ' +
-			'Returns {ok:true, room, kind, quote, event_id} — then tell the user in one sentence that the comment is on that page. ' +
-			'Errors: "no_text" — nothing to write; "too_long" — keep it under 4000 characters; "no_page" — the kind is not a page kind; "no_quote" — a quote anchors only on a Doc page; "no_thread" — reply_to is not a comment\'s event_id; "NOT_FOUND" — no such page, passage or thread; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
+			'Returns {ok:true, room, kind, quote, event_id, mentions} — then tell the user in one sentence that the comment is on that page. ' +
+			'Errors: "no_text" — nothing to write; "too_long" — keep it under 4000 characters; "no_page" — the kind is not a page kind; "no_quote" — a quote anchors only on a Doc page; "no_thread" — reply_to is not a comment\'s event_id; "no_user" — a mention is not a full user id; "NOT_FOUND" — no such page, passage or thread; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not comment in that room; "not_connected" or "unavailable" — say the comment could not be left right now and nothing was written; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({
 			text: z.string().min(1).max(ROOM_WRITE_TEXT_MAX).describe('The exact comment, as the user confirmed it.'),
 			kind: z.string().optional().describe('The page\'s kind from a search_commons hit (e.g. "markdown-4m8ay3mg"), or "markdown" for the main Doc. Omit when replying in a thread.'),
 			quote: z.string().max(2000).optional().describe('A passage of the page to anchor the comment to, exactly as it reads there. Omit for the whole page.'),
 			reply_to: z.string().optional().describe('To reply in a comment thread: the comment\'s event_id.'),
+			mentions: z.array(z.string()).max(10).optional().describe('Full user ids to @ in the comment, only when the user asked to @ them.'),
 			room: z.string().optional().describe('The room name, e.g. "Sutando Triage". Omit for the current room.'),
 		}),
 		execution: 'inline',
 		timeout: ROOM_INDEX_COLD_TIMEOUT_MS + ROOM_COMMONS_TIMEOUT_MS + 1000,
 		async execute(args) {
-			const a = (args ?? {}) as { room?: string; kind?: string; text: string; quote?: string; reply_to?: string };
+			const a = (args ?? {}) as { room?: string; kind?: string; text: string; quote?: string; reply_to?: string; mentions?: string[] };
 			const r = await addComment(a, deps);
 			deps.log?.(`[RoomRead] add_comment ${a.reply_to ? 'reply in a thread' : `on ${a.kind ?? ''}`} in ${a.room ? `"${a.room}"` : '(current room)'} → ${r.ok ? `left in ${r.ms}ms` : r.error}`);
 			return r;

@@ -587,7 +587,7 @@ describe('add_comment: a comment on a page, as the web client leaves one', () =>
 		// 2026-10-13 21:16: "make a comment: Susan has reviewed" was appended to the page's text; the comments list stayed empty.
 		const f = fake(() => done({ event_id: '$root', comment: {} }));
 		const r = await addComment({ room: 'open.space launch video', kind: 'markdown-4m8ay3mg', text: ' Susan has reviewed. ' }, deps(f.client));
-		assert.deepEqual(r, { ok: true, room: 'open.space launch video', kind: 'markdown-4m8ay3mg', quote: null, event_id: '$root', ms: r.ok ? r.ms : -1 });
+		assert.deepEqual(r, { ok: true, room: 'open.space launch video', kind: 'markdown-4m8ay3mg', quote: null, event_id: '$root', mentions: 0, ms: r.ok ? r.ms : -1 });
 		const { operation_id, ...rest } = f.calls[0].args as { operation_id: string };
 		assert.match(operation_id, /^[0-9a-f-]{36}$/);
 		assert.deepEqual(rest, { room_id: '!tdhHBCseqxerbZwbfm:ag2.space', action: 'room.commons.comments.add', arguments: { kind: 'markdown-4m8ay3mg', text: 'Susan has reviewed.' } });
@@ -600,6 +600,19 @@ describe('add_comment: a comment on a page, as the web client leaves one', () =>
 		assert.deepEqual((f.calls[2].args as { action: string; arguments: unknown }).action, 'room.commons.comments.reply');
 		assert.deepEqual((f.calls[2].args as { arguments: unknown }).arguments, { root_event_id: '$root', text: 'Thanks.' });
 		assert.deepEqual(await addComment({ room: 'open.space launch video', reply_to: 'root', text: 'x' }, deps(f.client)), { ok: false, error: 'no_thread' });
+	});
+
+	it('mentions the user asked for go to room.commons.comments.add and .reply as full user ids; a bare name is refused before anything is sent', async () => {
+		const f = fake(() => done({ event_id: '$root' }));
+		const r = await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'Please review.', quote: 'the record', mentions: [' @sutando-sonichi:ag2.space '] }, deps(f.client));
+		assert.equal(r.ok && r.mentions, 1);
+		assert.deepEqual((f.calls[0].args as { arguments: unknown }).arguments, { kind: 'markdown', text: 'Please review.', quote: 'the record', mentions: ['@sutando-sonichi:ag2.space'] });
+		const rep = await addComment({ room: 'open.space launch video', reply_to: '$root', text: 'Done?', mentions: ['@sutando-qingyun-001:ag2.space'] }, deps(f.client));
+		assert.equal(rep.ok && rep.mentions, 1);
+		assert.deepEqual((f.calls[1].args as { arguments: unknown }).arguments, { root_event_id: '$root', text: 'Done?', mentions: ['@sutando-qingyun-001:ag2.space'] });
+		assert.deepEqual(await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'x', mentions: ['Chi'] }, deps(f.client)), { ok: false, error: 'no_user' });
+		assert.deepEqual(await addComment({ room: 'open.space launch video', reply_to: '$root', text: 'x', mentions: ['@chi'] }, deps(f.client)), { ok: false, error: 'no_user' });
+		assert.equal(f.calls.length, 2);
 	});
 
 	it('nothing is sent without text, with a kind that is not a page, with a quote on a non-Doc page, or to a misheard room; refusals and a missing passage are said', async () => {
@@ -624,6 +637,8 @@ describe('add_comment: a comment on a page, as the web client leaves one', () =>
 		assert.match(tool.description, /To change the page's own text, use write_page instead/);
 		assert.match(tool.description, /call only after the user has clearly said yes/);
 		assert.match(tool.description, /Once they have said yes, call this tool in that same turn/);
+		assert.match(tool.description, /say back the exact text you will write, on which page and in which room, and whom it mentions, and call only after/);
+		assert.match(tool.description, /only when the user explicitly asks to @ someone in the comment: .*never add one on your own/);
 		const out = await tool.execute({ kind: 'markdown', text: 'c' }, {} as never);
 		assert.equal(out.ok && out.room, 'C');
 		assert.match(ROOM_READ_PROMPT_RULE, /a comment or 留言 on a page → add_comment the same way, never an appended line/);
