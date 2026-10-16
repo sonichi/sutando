@@ -322,6 +322,29 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		assert.equal(ops[0], ops[1]);
 	});
 
+	it('"open the page": a summon naming no one calls the owner, and the yes binds that invitee', async () => {
+		const SUMMON = { action: 'room.commons.summon', arguments_json: '{"kind":"markdown-a1ud0njz"}', room: '!r:ag2.space' };
+		const f = fake((n, a) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'medium', title: 'Summon', action_revision: 'sha256:s1', idempotency_requirement: 'required' })
+			: n === 'ag2.whoami' ? ok({ actor: { id: '@bot:ag2.space' }, runtime: { owner_id: '@owner:ag2.space' } })
+			: ok({ status: 'completed', result: { event_id: '$card' } }));
+		const r = await runAction(SUMMON, f.deps, now) as { error: string; confirm_token: string; will_do: { arguments: Record<string, unknown> } };
+		assert.equal(r.error, 'needs_confirmation');
+		assert.deepEqual(r.will_do.arguments, { kind: 'markdown-a1ud0njz', invitee: '@owner:ag2.space' });
+		t += CONFIRM_MIN_AGE_MS;
+		assert.ok((await runAction({ ...SUMMON, confirm_token: r.confirm_token }, f.deps, now)).ok);
+		const exec = f.calls.filter(c => c.name === 'room.action.execute');
+		assert.equal(exec.length, 1);
+		assert.deepEqual((exec[0].args as { arguments: unknown }).arguments, { kind: 'markdown-a1ud0njz', invitee: '@owner:ag2.space' });
+	});
+
+	it('a summon names its invitee when given one, and is refused when the owner is unknown', async () => {
+		const f = fake((n) => n === 'room.actions.describe' ? ok({ effect: 'mutation', risk: 'medium', title: 'Summon', action_revision: 'sha256:s1' }) : ok({ actor: { id: '@bot2:ag2.space' }, runtime: {} }));
+		const named = await runAction({ action: 'room.commons.summon', arguments_json: '{"kind":"board","invitee":"@chi:ag2.space"}', room: '!r:ag2.space' }, f.deps, now) as { will_do: { arguments: Record<string, unknown> } };
+		assert.equal(named.will_do.arguments.invitee, '@chi:ag2.space');
+		assert.deepEqual(await runAction({ action: 'room.commons.summon', arguments_json: '{"kind":"board"}', room: '!r:ag2.space' }, f.deps, now), { ok: false, error: 'no_invitee' });
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /room\.commons\.summon/);
+	});
+
 	it('the plugin listens for the host\'s speech signal, and the voice agent sends it from input transcription', async () => {
 		const { setup } = await import('../skills/ag2space-voice/tools.ts');
 		let handler: (() => void) | null = null;
@@ -407,7 +430,8 @@ describe('an action the code has never named: whatever the server\'s catalog lis
 		const src = readFileSync(join(PLUGIN_DIR, 'room-actions.ts'), 'utf-8');
 		const named = [...src.matchAll(/'((?:room|space|mentions|browser|commons|agent|devapp)\.[a-z_.]+)'/g)].map(m => m[1]);
 		assert.ok(named.includes('room.actions.search') && named.includes('room.actions.describe'));
-		for (const n of named) assert.ok(/^room\.actions?\.(search|describe|read|execute)$/.test(n), n);
+		// The one exception: a summon naming no one is filled with the owner; its policy still comes from describe.
+		for (const n of named) assert.ok(/^room\.actions?\.(search|describe|read|execute)$/.test(n) || n === 'room.commons.summon', n);
 	});
 });
 

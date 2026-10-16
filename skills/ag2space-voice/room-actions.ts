@@ -5,7 +5,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import {
-	mcpPayload, roomExecute, roomRead, targetRoom, OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_ERROR, ROOM_COMMONS_TIMEOUT_MS, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_NAME_ERRORS,
+	mcpPayload, ownerId, roomExecute, roomRead, targetRoom, OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_ERROR, ROOM_COMMONS_TIMEOUT_MS, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_NAME_ERRORS,
 	type ReadRoomDeps, type RoomRef,
 } from './room-read.js';
 
@@ -174,6 +174,12 @@ export async function runAction(args: { action: string; room?: string; scope?: s
 	const d = await describeRaw(action, scope, target.room, deps);
 	if (!d.ok) return d;
 	if (d.policy === 'no') return { ok: false, error: 'not_by_voice' };
+	// "Open the page" summons the user: the model cannot know the user's id, so a summon naming no one → the owner.
+	if (action === SUMMON_ACTION && !(typeof callArgs.invitee === 'string' && callArgs.invitee.trim())) {
+		const owner = await ownerId(client);
+		if (!owner) return { ok: false, error: 'no_invitee' };
+		callArgs = { ...callArgs, invitee: owner };
+	}
 	const revision = typeof d.d.action_revision === 'string' && d.d.action_revision ? d.d.action_revision : null;
 	const done = d.policy === 'read'
 		? await roomRead(client, target.room, action, callArgs, deps, ROOM_COMMONS_TIMEOUT_MS, revision ?? undefined)
@@ -290,6 +296,9 @@ export function createRunActionTool(deps: ReadRoomDeps): ToolDefinition {
 	};
 }
 
-export const ROOM_ACTIONS_PROMPT_RULE = '- OTHER AG2 SPACE ACTIONS: anything in AG2 Space that none of your room tools does (resolve a comment, list members, react, page versions, invites…) → find_room_actions, describe_room_action for its arguments, then run_room_action; one that changes something answers needs_confirmation first — call it before asking, say its will_do back, and only after the user\'s clear yes call again with its confirm_token; say it is done only after ok:true; a no ("算了", "never mind") means call nothing, not cancel_task — and "not_by_voice" means the user does it in the app. To act on a message, take its event_id from read_room — for "the latest message", read_room\'s `latest`, never a thread reply — never from a text search; and check its reactions first: one already marked "(you)" is there, so say so instead of adding it again. Never submit work for these.';
+/** Calls a room member into a Commons page with a card; for the owner viewing the room, the client opens the page itself. */
+export const SUMMON_ACTION = 'room.commons.summon';
+
+export const ROOM_ACTIONS_PROMPT_RULE = '- OTHER AG2 SPACE ACTIONS: anything in AG2 Space that none of your room tools does (resolve a comment, list members, react, page versions, invites…) → find_room_actions, describe_room_action for its arguments, then run_room_action; one that changes something answers needs_confirmation first — call it before asking, say its will_do back, and only after the user\'s clear yes call again with its confirm_token; say it is done only after ok:true; a no ("算了", "never mind") means call nothing, not cancel_task — and "not_by_voice" means the user does it in the app. To act on a message, take its event_id from read_room — for "the latest message", read_room\'s `latest`, never a thread reply — never from a text search; and check its reactions first: one already marked "(you)" is there, so say so instead of adding it again. To open or show the user a page or surface ("open the design doc", "打开 Hello World", "show me the whiteboard") → search_commons for its kind (a page is like markdown-a1b2c3d4; a whole surface is markdown, board, sheet…), then run_room_action room.commons.summon in that page\'s room with arguments_json {"kind": …} — leave out invitee, it is the user — confirmed like any change; never read a link out in its place. Never submit work for these.';
 
 export const ROOM_ACTIONS_TURN_CHECK_RULE = '- none: any other AG2 Space action the assistant can run itself (resolve a comment, list members, react, invites) is the assistant\'s own, never work.';

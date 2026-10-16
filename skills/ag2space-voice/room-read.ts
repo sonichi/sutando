@@ -370,6 +370,20 @@ async function selfId(client: McpClient): Promise<string | null> {
 	return id;
 }
 
+const ownerIds = new WeakMap<McpClient, string | null>();
+/** The user this agent acts for (whoami's runtime.owner_id), cached per client; null when whoami does not say. */
+export async function ownerId(client: McpClient): Promise<string | null> {
+	if (ownerIds.has(client)) return ownerIds.get(client)!;
+	let id: string | null = null;
+	try {
+		const res = await client.callTool('ag2.whoami', {}, ROOM_READ_CALL_TIMEOUT_MS);
+		const o = ((res.structuredContent ?? null) as { runtime?: { owner_id?: unknown } } | null)?.runtime?.owner_id;
+		id = typeof o === 'string' && o ? o : null;
+	} catch { /* the summon then needs an invitee */ }
+	if (id) ownerIds.set(client, id);
+	return id;
+}
+
 export async function readRoom(args: { room?: string; limit?: number; around?: string }, deps: ReadRoomDeps): Promise<ReadRoomResult> {
 	const t0 = Date.now();
 	const client = deps.client();
