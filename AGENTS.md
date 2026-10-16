@@ -321,7 +321,7 @@ Tasks arrive from multiple channels via the same file bridge:
 - **Discord bridge** (`src/discord-bridge.py`) writes tasks from Discord DMs and channel @mentions (+ file attachments)
 - This session reads and executes them, writes results to `results/task-{ts}.txt`
 - Each bridge polls `results/` and sends the reply back to the originating channel
-- Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
+- Proactive messages: write to `results/proactive-{ts}.txt`. A follow-up to an ask that came in a thread (its task had `thread_root`, or the ask is the root) leads with `[thread: $<root>]`; only a new topic goes top level.
 
 ### Where replies go
 
@@ -346,14 +346,14 @@ room: 'I sent it to you in our DM.' Never move silently.
 - `[deduped: task-<other-id>]` — silently archive this task as done; the full reply goes in the other task's result file. Thread-consolidation path.
 - `[no-send]` / `[REPLIED]` — skip delivery (still archives): nothing to show / already sent another way.
 - `[channel: <channel-id>]` — as first non-empty line only: deliver the rest of the body to that channel instead of the originating one. Telegram silently drops it.
-- `[thread: $<root>]` — proactive lead line, after any skip marker: AG2 Space posts in that thread. For a thread in use; new topics go top level.
+- `[thread: $<root>]` — proactive lead line, after any skip marker: AG2 Space posts in that thread.
 - `[thread]` — task-result lead line: AG2 Space threads the answer on the ask. Threading is your call, e.g. a side discussion that would crowd the timeline; when unsure, reply in the timeline.
 - `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body; detected anywhere, stripped only when alone on its line.
 - `[file: /path]` / `[send: /path]` / `[attach: /path]` — extract and attach the file alongside the text body.
 
 **Marker parsing is centralised — do not re-implement it.** A Python result consumer MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`; attachments = actions with `kind == "attach"`). Attachment-path authorization is owned by `src/policy/egress/attachment.py` before the upload sink. One-way dependency: `parse_markers() -> send_allowlist.is_path_sendable() -> transport upload`, where `src/send_allowlist.py` is a transition alias. Private copies drift — guarded by `tests/bridge-marker-no-leak.test.py`; history in [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md).
 
-**Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task — keep using it unless you specifically need to push a result to a non-delegating consumer. Use the scoped form ONLY when a result needs to be claimed by a pull-side consumer that didn't delegate the work:
+**Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task. Use the scoped form ONLY when a result needs to be claimed by a pull-side consumer that didn't delegate the work:
 - phone → key built via `phoneCallKey(callSid)` → `phone-<safe(call-sid)>`
 
 **Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix.
