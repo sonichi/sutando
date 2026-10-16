@@ -197,7 +197,8 @@ def notify_voice(questions):
         path,
         f"You have {len(questions)} pending question{'s' if len(questions) > 1 else ''} waiting for your answer: "
         + "; ".join(titles)
-        + ". Check the Questions tab in the web UI."
+        + ". Check the Questions tab in the web UI.",
+        mode=0o600,
     )
 
 

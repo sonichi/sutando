@@ -69,6 +69,9 @@ with tempfile.TemporaryDirectory() as td:
     ok("proactive content lists the question set", "Q1" in body and "Q2" in body)
     mode = files[0].stat().st_mode & 0o777 if files else None
     ok("reminder body is owner-only (0600), as the mkstemp it replaced", mode == 0o600)
+    _mod.notify_voice(Q_AB)
+    voice = list(Path(td).glob("question-*.txt"))
+    ok("voice reminder is owner-only (0600) too", bool(voice) and (voice[0].stat().st_mode & 0o777) == 0o600)
 
 # T5: a changed set supersedes the earlier undelivered reminder rather than
 # queueing beside it — the old body states a count that is no longer true.
