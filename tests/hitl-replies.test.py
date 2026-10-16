@@ -260,6 +260,17 @@ class ReplyHandlerTests(unittest.TestCase):
         self.assertEqual(self.h.offer_task(task), "ignored")
         self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
 
+    def test_yes_rich_reply_answers_only_the_projected_tui_permission(self):
+        from hitl import tui_gate
+        prompt = "Allow harmless echo?\n❯ 1. Yes\n  2. No"
+        req = self.mgr.create(tui_gate.requirement_for(
+            "blocked-human", "selection", prompt, "test-core", "selection", "blocked"))
+        self.mgr.record_projection(req.id, req.revision, "$tui-card")
+        text = "> <@agent:ag2.space> Allow harmless echo?\n\nYes"
+        self.assertEqual(self.h.offer_task(self._task(reply_to_event="$tui-card", task=text)), "applied")
+        self.assertEqual(self.mgr.get(req.id).chosen_action, "allow")
+        self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+
     def test_task_reply_to_an_unrelated_event_or_no_reply_stays_a_message(self):
         self.mgr.record_projection(self.req.id, self.req.revision, "$card")
         self.assertFalse(self.h.offer_task(self._task(reply_to_event="$other", task="Allow")))
