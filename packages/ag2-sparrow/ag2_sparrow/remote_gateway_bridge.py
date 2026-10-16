@@ -2906,6 +2906,18 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
         return False
 
 
+# Times each waiting line recurred in this process, for `_log_backoff`.
+_LOG_COUNTS: "dict[tuple, int]" = {}
+
+
+def _log_backoff(key: tuple, line: str) -> None:
+    """Log `line` the 1st, 2nd, 4th, 8th ... time `key` recurs in this process, with the count:
+    a wait with no ceiling would otherwise log every second for as long as it lasts."""
+    n = _LOG_COUNTS[key] = _LOG_COUNTS.get(key, 0) + 1
+    if not n & (n - 1):
+        _log(line + (f" (seen {n} times)" if n > 1 else ""))
+
+
 def _post_ack_first(tid: str, lease_id: "str | None") -> str:
     """The durable ack of a staged `ack_first` task: "accepted" (a repeat answers
     `duplicate`); "stale", a newer serve holds the lease, so this one was never accepted;
@@ -2922,11 +2934,13 @@ def _post_ack_first(tid: str, lease_id: "str | None") -> str:
         reason = _http_error_body(e).lower() if e.code == 404 else ""
         if "not leased" in reason:
             return "stale" if "stale lease generation" in reason else "gone"
-        _log(f"ack_first task {tid}: ack answered HTTP {e.code} — kept staged, retrying")
+        _log_backoff((tid, "ack-retry"), f"ack_first task {tid}: ack answered HTTP {e.code} "
+                     "— kept staged, retrying")
         return "retry"
     except (OSError, ValueError, http.client.HTTPException) as e:
         # A re-ack of an accepted task answers `duplicate`, so retrying is always safe.
-        _log(f"ack_first task {tid}: ack failed ({type(e).__name__}: {e}) — kept staged, retrying")
+        _log_backoff((tid, "ack-retry"), f"ack_first task {tid}: ack failed "
+                     f"({type(e).__name__}: {e}) — kept staged, retrying")
         return "retry"
 
 
@@ -2937,7 +2951,8 @@ def _ack_first_state(tid: str) -> "str | None":
     try:
         doc = _req("GET", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/status", timeout=10)
     except (OSError, ValueError, http.client.HTTPException) as e:
-        _log(f"ack_first task {tid}: status unreadable ({type(e).__name__}: {e}) — kept staged")
+        _log_backoff((tid, "ack-status"), f"ack_first task {tid}: status unreadable "
+                     f"({type(e).__name__}: {e}) — kept staged")
         return None
     state = doc.get("state") if isinstance(doc, dict) else None
     return state if isinstance(state, str) else None
@@ -4398,6 +4413,8 @@ _HELD_TASKS: "dict[str, tuple[dict, str, str]]" = {}
 _HELD_REPORTED: "set[str]" = set()
 # Entries the last pass could neither publish nor clear, reported in the gateway status.
 _HELD_UNRESOLVED: "set[str]" = set()
+# A task still staged this long after it was staged is reported too; it keeps being retried.
+ACK_FIRST_UNRESOLVED_AFTER_S = 600
 
 
 def _held_dir() -> Path:
@@ -4611,7 +4628,21 @@ def _advance_held_tasks(inflight: "set[str]") -> bool:
             _HELD_REPORTED.add(tid)
             _log(f"ERROR ack_first manifest entry for {tid!r} is malformed — left as it is; "
                  "reported in the gateway status")
+    for tid, entry in (_load_held() or {}).items():
+        if _held_entry_ok(tid, entry) and _held_overdue(_held_dir() / entry["staged"]):
+            _HELD_UNRESOLVED.add(tid)
+            _log_backoff((tid, "overdue"), f"ERROR ack_first task {tid}: still staged "
+                         f"{ACK_FIRST_UNRESOLVED_AFTER_S} s after it was staged — reported in the "
+                         "gateway status, still retrying")
     return published
+
+
+def _held_overdue(staged: Path) -> bool:
+    """Staged longer than `ACK_FIRST_UNRESOLVED_AFTER_S`: its file is written once, when staged."""
+    try:
+        return time.time() - staged.stat().st_mtime >= ACK_FIRST_UNRESOLVED_AFTER_S
+    except OSError:
+        return False
 
 
 def _take_ack_first(task: dict, inflight: "set[str]") -> bool:

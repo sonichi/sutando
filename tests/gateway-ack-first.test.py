@@ -21,8 +21,10 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -136,7 +138,7 @@ class _Bridge(unittest.TestCase):
             _fire_on_task=lambda tid, path, text=None: self.fired.append(tid),
             _WITHHELD_TASK_OUTPUT={}, _SETTLE_PENDING=set(), _SETTLE_SCANNED=set(),
             _SETTLE_LOADED=False, _REDELIVERED=set(), _HELD_TASKS={}, _HELD_REPORTED=set(),
-            _HELD_UNRESOLVED=set(), GATEWAY_STATUS_FILE=state / "gateway-status.json",
+            _HELD_UNRESOLVED=set(), _LOG_COUNTS={}, GATEWAY_STATUS_FILE=state / "gateway-status.json",
             **{name: state / f"{stem}.json" for name, stem in _LEDGERS.items()})
         stack = contextlib.ExitStack()
         for name, value in values.items():
@@ -607,6 +609,52 @@ class AcknowledgingFirst(_Bridge):
         gw.ACK_FIRST_MANIFEST_FILE.write_text("{not json")
         self.assertFalse(self.take(voice_ask(ASK_A, lease="gen-3")))
         self.assertEqual(len(self.broker.acks()), 2)
+
+    def age(self, tid: str, seconds: float) -> None:
+        """Make the staged file look `seconds` old: its mtime is when it was staged."""
+        [staged] = self.staged(tid)
+        then = time.time() - seconds
+        os.utime(staged, (then, then))
+
+    def test_a_task_still_staged_past_the_threshold_is_reported_and_still_retried(self):
+        limit = gw.ACK_FIRST_UNRESOLVED_AFTER_S
+        self.broker.answers[ASK_A] = ["busy", "busy", "busy", "ok"]
+        self.take(voice_ask(ASK_A))
+        self.age(ASK_A, limit - 30)
+        gw._advance_held_tasks(self.inflight)
+        gw._emit_gateway_status(True)
+        self.assertIsNone(self.reported(), "reported before the threshold")
+        self.age(ASK_A, limit + 1)
+        gw._advance_held_tasks(self.inflight)
+        gw._emit_gateway_status(True)
+        self.assertEqual(self.reported(), [ASK_A])
+        self.assertEqual(len(self.broker.acks()), 3, "a reported task stopped being retried")
+        self.assertEqual(sum("still staged" in line for line in self.lines), 1)
+        self.assertTrue(gw._advance_held_tasks(self.inflight))      # accepted at last: published
+        gw._emit_gateway_status(True)
+        self.assertIsNone(self.reported(), "a resolved task stayed reported")
+        self.assertEqual(self.fired, [ASK_A])
+
+    def test_a_task_whose_mark_cannot_be_written_is_reported_past_the_threshold_too(self):
+        # Not only an ack that keeps failing: any step that keeps it staged.
+        self.broker.answers[ASK_A] = ["down"]
+        self.take(voice_ask(ASK_A))
+        gw.ACK_FIRST_FILE.write_text("{not json")
+        self.age(ASK_A, gw.ACK_FIRST_UNRESOLVED_AFTER_S + 1)
+        self.assertFalse(gw._advance_held_tasks(self.inflight))
+        gw._emit_gateway_status(True)
+        self.assertEqual((self.reported(), len(self.broker.acks())), ([ASK_A], 1))
+        self.assertFalse(gw._held_overdue(gw._held_dir() / "gone.txt.1.tmp"), "a missing file is not overdue")
+
+    def test_a_retrying_ack_logs_on_a_backoff(self):
+        self.broker.answers[ASK_A] = ["busy"] * 9
+        self.take(voice_ask(ASK_A))
+        for _ in range(8):
+            gw._advance_held_tasks(self.inflight)
+        retries = [line for line in self.lines if "kept staged, retrying" in line]
+        self.assertEqual(len(self.broker.acks()), 9)
+        self.assertEqual([line.rsplit("retrying", 1)[1] for line in retries],
+                         ["", " (seen 2 times)", " (seen 4 times)", " (seen 8 times)"])
 
     def test_a_staged_task_is_never_dropped_as_abandoned(self):
         self.broker.answers[ASK_A] = ["down"]
