@@ -2908,8 +2908,9 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
 
 def _post_ack_first(tid: str, lease_id: "str | None") -> str:
     """The durable ack of a staged `ack_first` task: "accepted" (a repeat answers
-    `duplicate`), "refused" (its lease is gone: withdrawn, expired or served again),
-    or "retry", which keeps the task staged. Never raises: the poll meets an auth failure."""
+    `duplicate`); "stale", a newer serve holds the lease, so this one was never accepted;
+    "gone", no lease at all; or "retry" for any other answer. Never raises: the poll
+    meets an auth failure."""
     wire_tid = _broker_tid(tid)
     body = {"id": wire_tid, "durable": True}
     if lease_id:
@@ -2918,14 +2919,28 @@ def _post_ack_first(tid: str, lease_id: "str | None") -> str:
         _req("POST", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/ack", body, timeout=10)
         return "accepted"
     except urllib.error.HTTPError as e:
-        if e.code == 404 and "not leased" in _http_error_body(e).lower():
-            return "refused"
+        reason = _http_error_body(e).lower() if e.code == 404 else ""
+        if "not leased" in reason:
+            return "stale" if "stale lease generation" in reason else "gone"
         _log(f"ack_first task {tid}: ack answered HTTP {e.code} — kept staged, retrying")
         return "retry"
     except (OSError, ValueError, http.client.HTTPException) as e:
         # A re-ack of an accepted task answers `duplicate`, so retrying is always safe.
         _log(f"ack_first task {tid}: ack failed ({type(e).__name__}: {e}) — kept staged, retrying")
         return "retry"
+
+
+def _ack_first_state(tid: str) -> "str | None":
+    """The broker's state for the ask behind a staged task (`GET /v1/tasks/<id>/status`),
+    or None when it cannot be read."""
+    wire_tid = _broker_tid(tid)
+    try:
+        doc = _req("GET", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/status", timeout=10)
+    except (OSError, ValueError, http.client.HTTPException) as e:
+        _log(f"ack_first task {tid}: status unreadable ({type(e).__name__}: {e}) — kept staged")
+        return None
+    state = doc.get("state") if isinstance(doc, dict) else None
+    return state if isinstance(state, str) else None
 
 
 _CORE_STEP_MAX = 500
@@ -3542,6 +3557,9 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
                         **_ENGINE_COUNTS},
         }
+        if _HELD_UNRESOLVED:
+            # Staged relay asks the bridge can neither publish nor clear without a person.
+            payload["ack_first_unresolved"] = sorted(_one_line(t)[:128] for t in _HELD_UNRESOLVED)[:20]
         # Recovery surface: recovered ONLY via the probe-success terminal; a
         # missing block means "no episode known", never success.
         if _reenroll_state.get("code"):
@@ -4139,7 +4157,7 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
         lines.extend(owner_mention_lines(f"results/{tid}.txt"))
     from .local_task_protocol import apply_task_stamper
     task_text = apply_task_stamper("\n".join(lines) + "\n")
-    tmp = _stage_durable(dest, task_text)
+    tmp = _stage_durable(_held_dir() / dest.name if hold else dest, task_text)
     if tmp is None:
         _log(f"task write FAILED for {tid} — not queued, not acked")
         return None
@@ -4342,12 +4360,15 @@ def _record_ack_first(tid: str) -> bool:
         return _durable_write(ACK_FIRST_FILE, json.dumps(marks, sort_keys=True))
 
 
-def _forget_ack_first(broker_id: str) -> None:
-    """Retire a mark (best-effort: one left behind names a task that posts nothing more)."""
+def _forget_ack_first(broker_id: str) -> bool:
+    """Retire a mark. True once it is gone; False while the marks cannot be read or written."""
     with _ACK_FIRST_MUTEX:
         marks = _load_ack_first()
-        if marks and marks.pop(broker_id, None) is not None:
-            _durable_write(ACK_FIRST_FILE, json.dumps(marks, sort_keys=True))
+        if marks is None:
+            return False
+        if marks.pop(broker_id, None) is None:
+            return True
+        return _durable_write(ACK_FIRST_FILE, json.dumps(marks, sort_keys=True))
 
 
 def _retire_delivered_marks() -> None:
@@ -4356,8 +4377,10 @@ def _retire_delivered_marks() -> None:
     marks = _load_ack_first()
     if not marks:
         return
+    aliases = _load_dedup_aliases()
+    if aliases is None:
+        return              # a re-ask's live result cannot be ruled out: the marks wait
     root = _delivery_core().backend.root
-    aliases = _load_dedup_aliases() or {}
     for broker_id, local in sorted(marks.items()):
         if not (_valid_tid(broker_id) and isinstance(local, str) and _valid_local_tid(local)):
             continue
@@ -4447,8 +4470,15 @@ def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
 
 # The served task behind each staged `ack_first` task, for the publish that follows its ack.
 _HELD_TASKS: "dict[str, tuple[dict, str, str]]" = {}
-# Manifest problems already logged by this process, so a stuck entry logs once.
+# Entries this process already logged as unresolved, so a stuck entry logs once.
 _HELD_REPORTED: "set[str]" = set()
+# Entries the last pass could neither publish nor clear, reported in the gateway status.
+_HELD_UNRESOLVED: "set[str]" = set()
+
+
+def _held_dir() -> Path:
+    """Where `ack_first` tasks wait for their ack: on the queue's filesystem, outside its globs."""
+    return TASKS_DIR / f".ack-first{_INST_SUFFIX}"
 
 
 def _load_held() -> "dict | None":
@@ -4476,7 +4506,7 @@ def _put_held(tid: str, entry: "dict | None") -> bool:
 
 
 def _held_entry_ok(tid: str, entry) -> bool:
-    """An entry names only its own task's files, in the task queue."""
+    """An entry names only its own task's files: its staged file and its queue file."""
     if not (_valid_local_tid(tid) and isinstance(entry, dict)):
         return False
     staged = entry.get("staged")
@@ -4494,22 +4524,41 @@ def _drop_staged(staged: Path) -> None:
     staged.unlink(missing_ok=True)
 
 
+def _sweep_held_dir() -> None:
+    """At start, remove each staged file no manifest entry names: a crash came before its
+    entry, or after a discard or a newer serve had moved the entry on."""
+    held = _load_held()
+    if held is None:
+        return
+    named = {e.get("staged") for e in held.values() if isinstance(e, dict)}
+    try:
+        files = [f for f in _held_dir().iterdir() if f.is_file()]
+    except OSError:
+        return
+    for staged in files:
+        if staged.name not in named:
+            _drop_staged(staged)
+            _log(f"removed staged file {staged.name}: no ack_first manifest entry names it")
+
+
 def _hold_staged(tid: str, tmp: Path, task_text: str, task: dict,
                  sender_tier: str) -> "tuple[str, bool] | None":
-    """Commit the mark and the manifest entry of a staged `ack_first` task, which stays
-    unpublished until its ack is accepted. None, with nothing staged, when either fails."""
+    """Commit the manifest entry of a staged `ack_first` task, which stays unpublished until
+    its ack is accepted; every later step resumes from the entry. None, with nothing staged,
+    when the staged file's directory entry or the manifest entry does not commit."""
     held = _load_held()
     entry = {"broker_id": _broker_tid(tid), "lease_id": _lease_id_of(task),
              "staged": tmp.name, "dest": f"{tid}.txt", "sha256": _held_digest(task_text),
              "accepted": False}
-    if held is None or not _record_ack_first(tid) or not _put_held(tid, entry):
+    if (held is None or not _fsync_in_place(tid, _held_dir(), TASKS_DIR)
+            or not _put_held(tid, entry)):
         _drop_staged(tmp)
-        _log(f"ack_first mark or manifest FAILED for {tid} — not staged, not acked")
+        _log(f"ack_first stage FAILED for {tid} — not staged, not acked")
         return None
     previous = held.get(tid)
     if _held_entry_ok(tid, previous) and previous["staged"] != tmp.name:
         # Served again before its ack: only the newest serve is acked and published.
-        _drop_staged(TASKS_DIR / previous["staged"])
+        _drop_staged(_held_dir() / previous["staged"])
     _HELD_TASKS[tid] = (task, sender_tier, task_text)
     _log(f"staged {tid} until its ack is accepted (ack_first)")
     return tid, True
@@ -4527,49 +4576,91 @@ def _held_published(tid: str, entry: dict, dest: Path) -> bool:
             or bool(undelivered_quarantine.find_quarantined(RESULTS_DIR, tid)))
 
 
+def _ack_verdict(tid: str, entry: dict) -> str:
+    """The verdict on a staged task's ack (accepted, refused or retry), asking the broker's
+    state when the ack cannot settle it. Never refused for an ask the broker holds acknowledged."""
+    outcome = _post_ack_first(tid, entry.get("lease_id"))
+    if outcome == "accepted":
+        return "accepted"
+    if outcome == "stale":
+        return "refused"        # an acknowledged ask is never served again, so this one was not
+    state = _ack_first_state(tid)
+    if state in ("withdrawn", "dead", "result_ready"):
+        return "refused"        # ended, or answered elsewhere: this copy never ran
+    # With no lease at all, `acknowledged` is this serve's; any other serve's would answer stale.
+    if state == "acknowledged" and outcome == "gone":
+        return "accepted"
+    return "retry"
+
+
 def _discard_held(tid: str, entry: dict, staged: Path, inflight: "set[str]") -> None:
-    """A refused ack: the task never reached the core, so nothing of it is kept, its
-    mark included, since no result can ever be posted under it."""
-    if not _put_held(tid, None):
-        return                                  # the next pass re-acks and discards again
+    """A refused ack: the task never reached the core, so nothing of it is kept. The entry
+    records the decision first and goes last, so a crash midway resumes the discard."""
+    if entry.get("refused") is not True and not _put_held(tid, {**entry, "refused": True}):
+        return                                  # the next pass re-acks and decides again
     _drop_staged(staged)
     _HELD_TASKS.pop(tid, None)
-    _forget_ack_first(entry["broker_id"])
     _forget_task_media(tid)
+    # Marks outlive tasks whose result may still come; a task refused before it ran has none.
+    if not _forget_ack_first(entry["broker_id"]):
+        return
     inflight.discard(tid)
-    _save_inflight(inflight)
+    if not (_save_inflight(inflight) and _put_held(tid, None)):
+        return
     _log(f"ack_first task {tid}: ack refused (withdrawn, expired or served again) "
          "— discarded, never published")
 
 
+def _clear_held(tid: str, why: str = "") -> bool:
+    """Remove a published task's entry, only once both directories hold its rename: a power
+    loss could otherwise bring the staged name back with no entry to say it was published."""
+    if not (_fsync_in_place(tid, _held_dir(), TASKS_DIR) and _put_held(tid, None)):
+        return False
+    _HELD_TASKS.pop(tid, None)
+    if why:
+        _log(f"ack_first task {tid}: {why}")
+    return True
+
+
 def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
-    """Move a staged `ack_first` task on: published once its ack is accepted, discarded
-    once it is refused, otherwise left staged for the next pass. True once published."""
-    staged, dest = TASKS_DIR / entry["staged"], TASKS_DIR / entry["dest"]
+    """Move a staged `ack_first` task on: published once its ack is accepted and recorded,
+    discarded once it is refused, otherwise left staged for the next pass. True once published."""
+    staged, dest = _held_dir() / entry["staged"], TASKS_DIR / entry["dest"]
+    if entry.get("refused") is True:
+        _discard_held(tid, entry, staged, inflight)
+        return False
     if not staged.exists():
         # `_publish_staged` consumes the staged file, so only a publish removes it.
         if _held_published(tid, entry, dest):
-            _put_held(tid, None)
-            _HELD_TASKS.pop(tid, None)
-            _log(f"ack_first task {tid}: already published — manifest entry cleared")
-        elif tid not in _HELD_REPORTED:
+            _clear_held(tid, "already published — manifest entry cleared")
+            return False
+        _HELD_UNRESOLVED.add(tid)
+        if tid not in _HELD_REPORTED:
             _HELD_REPORTED.add(tid)
-            _log(f"ERROR ack_first task {tid}: staged file gone and no copy of the task "
-                 "or its result found — manifest entry kept, nothing guessed")
-        return False
-    # The in-flight set is on disk before the ack, as `durable` claims.
-    if tid not in inflight and not _track_durably(tid, inflight):
+            _log(f"ERROR ack_first task {tid}: staged file gone and no copy of the task or its "
+                 "result found — manifest entry kept, nothing guessed; reported in the gateway status")
         return False
     if entry.get("accepted") is not True:
-        outcome = _post_ack_first(tid, entry.get("lease_id"))
-        if outcome == "refused":
+        # The mark and the in-flight set are on disk before the ack, as `durable` claims.
+        if not _record_ack_first(tid):
+            return False
+        if tid not in inflight and not _track_durably(tid, inflight):
+            return False
+        verdict = _ack_verdict(tid, entry)
+        if verdict == "refused":
             _discard_held(tid, entry, staged, inflight)
             return False
-        if outcome != "accepted":
+        # An acceptance that is not on disk keeps the task staged: the next pass acks again.
+        if verdict != "accepted" or not _put_held(tid, {**entry, "accepted": True}):
             return False
-        # Recorded, so a crash before the publish needs no re-ack: the broker refuses
-        # one once an acknowledged lease has ended, and the task must still run.
-        _put_held(tid, {**entry, "accepted": True})
+    else:
+        if tid not in inflight and not _track_durably(tid, inflight):
+            return False
+        if _held_published(tid, entry, dest):
+            # A power loss brought the staged name back after its publish: never publish twice.
+            _drop_staged(staged)
+            _clear_held(tid, "already published — the staged copy left beside it was dropped")
+            return False
     if not _publish_staged(staged, dest):
         return False
     served = _HELD_TASKS.pop(tid, None)
@@ -4578,7 +4669,7 @@ def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
     else:
         _log(f"queued {tid} (staged and acknowledged before a restart)")
         _fire_on_task(tid, dest)
-    _put_held(tid, None)
+    _clear_held(tid)
     return True
 
 
@@ -4586,12 +4677,16 @@ def _advance_held_tasks(inflight: "set[str]") -> bool:
     """Every pass: retry a staged `ack_first` task's ack, and after a restart publish an
     accepted one once or discard a refused one. True when any was published."""
     published = False
+    _HELD_UNRESOLVED.clear()
     for tid, entry in sorted((_load_held() or {}).items()):
         if _held_entry_ok(tid, entry):
             published |= _advance_held(tid, entry, inflight)
-        elif tid not in _HELD_REPORTED:
+            continue
+        _HELD_UNRESOLVED.add(tid)
+        if tid not in _HELD_REPORTED:
             _HELD_REPORTED.add(tid)
-            _log(f"ERROR ack_first manifest entry for {tid!r} is malformed — left as it is")
+            _log(f"ERROR ack_first manifest entry for {tid!r} is malformed — left as it is; "
+                 "reported in the gateway status")
     return published
 
 
@@ -6781,10 +6876,11 @@ def main() -> None:
     _start_lock_heartbeat()
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
-    try:
-        _retire_delivered_marks()
-    except Exception as e:  # noqa: BLE001 — a mark left behind only waits for the next start
-        _log(f"ack_first mark sweep failed ({type(e).__name__}: {e}) — continuing")
+    for sweep in (_retire_delivered_marks, _sweep_held_dir):
+        try:
+            sweep()
+        except Exception as e:  # noqa: BLE001 — what a sweep leaves waits for the next start
+            _log(f"{sweep.__name__} failed ({type(e).__name__}: {e}) — continuing")
     try:
         # Before the drain and the orphan sweep, so the body is back in flight under its id.
         _reclaim_parked_relay_results(inflight)

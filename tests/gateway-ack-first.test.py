@@ -78,30 +78,41 @@ def _not_leased(path: str, stale: bool) -> urllib.error.HTTPError:
 
 class _Broker:
     """The broker's side of the wire. `answers[broker id]` lists what its next acks get:
-    "ok", "withdrawn" or "stale" (404 not leased), "down" (no connection), "busy" (503)
-    or "auth" (401); an ack with nothing listed is accepted."""
+    "ok", "gone" (404 not leased), "stale" (404 stale lease generation), "down" (no
+    connection), "busy" (503) or "auth" (401); an ack with nothing listed is accepted.
+    `states[broker id]` is what `GET /v1/tasks/<id>/status` answers (404 when absent)."""
 
     def __init__(self):
         self.calls: "list[tuple]" = []
         self.answers: "dict[str, list[str]]" = {}
+        self.states: "dict[str, str]" = {}
 
     def request(self, method, path, payload=None, **_kw):
         self.calls.append((method, path, None if payload is None else json.loads(json.dumps(payload))))
+        wire = urllib.parse.unquote(path.split("/")[-2]) if path.startswith("/v1/tasks/") else ""
+        if path.endswith("/status"):
+            if wire not in self.states:
+                raise urllib.error.HTTPError(f"http://relay{path}", 404, "Not Found", {},
+                                             io.BytesIO(b'{"error": "unknown task"}'))
+            return {"id": wire, "state": self.states[wire]}
         if path.endswith("/ack"):
-            pending = self.answers.get(urllib.parse.unquote(path.split("/")[-2])) or ["ok"]
-            answer = pending.pop(0)
+            answer = (self.answers.get(wire) or ["ok"]).pop(0)
             if answer == "down":
                 raise urllib.error.URLError("connection refused")
             if answer in ("busy", "auth"):
                 code = 503 if answer == "busy" else 401
                 raise urllib.error.HTTPError(f"http://relay{path}", code, answer, {}, io.BytesIO(b"{}"))
-            if answer in ("withdrawn", "stale"):
+            if answer in ("gone", "stale"):
                 raise _not_leased(path, stale=answer == "stale")
+            self.states[wire] = "acknowledged"
             return {"ok": True, "durable": True}
         return {"agents": []} if path == "/v1/agents" else {"ok": True, "delivery_readable": True}
 
     def acks(self) -> "list[dict]":
         return [p for _m, path, p in self.calls if path.endswith("/ack")]
+
+    def status_reads(self) -> int:
+        return sum(path.endswith("/status") for _m, path, _p in self.calls)
 
 
 class _Bridge(unittest.TestCase):
@@ -126,6 +137,7 @@ class _Bridge(unittest.TestCase):
             _fire_on_task=lambda tid, path, text=None: self.fired.append(tid),
             _WITHHELD_TASK_OUTPUT={}, _SETTLE_PENDING=set(), _SETTLE_SCANNED=set(),
             _SETTLE_LOADED=False, _REDELIVERED=set(), _HELD_TASKS={}, _HELD_REPORTED=set(),
+            _HELD_UNRESOLVED=set(), GATEWAY_STATUS_FILE=state / "gateway-status.json",
             **{name: state / f"{stem}.json" for name, stem in _LEDGERS.items()})
         stack = contextlib.ExitStack()
         for name, value in values.items():
@@ -138,7 +150,7 @@ class _Bridge(unittest.TestCase):
         return gw._take_ack_first(dict(task), self.inflight)
 
     def staged(self, tid: str) -> "list[Path]":
-        return sorted(gw.TASKS_DIR.glob(f"{tid}.txt.*.tmp"))
+        return sorted(gw._held_dir().glob(f"{tid}.txt.*.tmp"))
 
     def manifest(self) -> dict:
         return json.loads(gw.ACK_FIRST_MANIFEST_FILE.read_text()) if gw.ACK_FIRST_MANIFEST_FILE.exists() else {}
@@ -190,20 +202,79 @@ class AcknowledgingFirst(_Bridge):
         self.assertIn("source: matrixrtc-voice", published.read_text())
         self.assertEqual((self.staged(ASK_A), self.manifest(), self.fired), ([], {}, [ASK_A]))
         self.assertEqual(self.marks(), {ASK_A: ASK_A}, "the mark went before any result")
-        self.assertEqual(self.inflight, {ASK_A})
+        self.assertEqual((self.inflight, self.broker.status_reads()), ({ASK_A}, 0))
+
+    def assert_discarded(self, ask: str) -> None:
+        self.assert_never_reached_the_core(ask)
+        self.assertNotIn(ask, self.marks(), "a task that never ran kept its mark")
+        self.assertNotIn(ask, self.inflight)
+        self.assertNotIn(ask, self.on_disk_inflight())
+        acks = len(self.broker.acks())
+        self.assertFalse(gw._advance_held_tasks(self.inflight))
+        self.assertEqual(len(self.broker.acks()), acks, "a discarded task was acked again")
+
+    def test_a_stale_refusal_discards_the_staged_task_without_asking_the_broker(self):
+        # A newer serve holds the lease, and an acknowledged ask is never served again.
+        self.broker.answers[ASK_A] = ["stale"]
+        self.broker.states[ASK_A] = "acknowledged"          # that other serve's
+        self.assertFalse(self.take(voice_ask(ASK_A)))
+        self.assert_discarded(ASK_A)
+        self.assertEqual(self.broker.status_reads(), 0)
 
     def test_a_refused_acknowledgement_discards_the_staged_task(self):
-        for answer in ("stale", "withdrawn"):
-            with self.subTest(answer=answer):
-                self.broker.answers[ASK_A] = [answer]
-                self.assertFalse(self.take(voice_ask(ASK_A)))
-                self.assert_never_reached_the_core(ASK_A)
-                self.assertEqual(self.marks(), {}, "a task that never ran kept its mark")
-                self.assertNotIn(ASK_A, self.inflight)
-                self.assertNotIn(ASK_A, self.on_disk_inflight())
-                acks = len(self.broker.acks())
-                self.assertFalse(gw._advance_held_tasks(self.inflight))
-                self.assertEqual(len(self.broker.acks()), acks, "a discarded task was acked again")
+        for n, state in enumerate(("withdrawn", "dead", "result_ready")):
+            with self.subTest(state=state):
+                ask = f"{ASK_B}{n}"
+                self.broker.answers[ask] = ["gone"]
+                self.broker.states[ask] = state
+                self.assertFalse(self.take(voice_ask(ask)))
+                self.assert_discarded(ask)
+        self.assertEqual(self.broker.status_reads(), 3)
+
+    def test_an_acknowledged_ask_is_never_discarded_when_its_acceptance_was_not_kept(self):
+        real = gw._put_held
+        for n, reack in enumerate(("gone", "ok")):
+            with self.subTest(reack=reack):
+                ask = f"{ASK_C}{n}"
+                failing = {"left": 1}
+
+                def put(tid, entry):
+                    if isinstance(entry, dict) and entry.get("accepted") and failing["left"]:
+                        failing["left"] -= 1
+                        return False                   # the acceptance does not reach the disk
+                    return real(tid, entry)
+
+                with patch.object(gw, "_put_held", side_effect=put):
+                    self.assertFalse(self.take(voice_ask(ask)))
+                self.assertEqual(self.broker.states[ask], "acknowledged")
+                self.assertFalse((gw.TASKS_DIR / f"{ask}.txt").exists())
+                self.assertEqual(len(self.staged(ask)), 1, "an acknowledged task was discarded")
+                self.assertIs(self.manifest()[ask]["accepted"], False)
+                # The next pass acks again: the broker either answers `duplicate`, or has
+                # ended the lease and says, when asked, that the ask is acknowledged.
+                self.broker.answers[ask] = [reack]
+                self.assertTrue(gw._advance_held_tasks(self.inflight))
+                self.assertTrue((gw.TASKS_DIR / f"{ask}.txt").exists())
+                self.assertEqual((self.fired.count(ask), self.staged(ask)), (1, []))
+                self.assertNotIn(ask, self.manifest())
+        self.assertEqual(self.broker.status_reads(), 1)
+
+    def test_an_ack_the_broker_cannot_settle_keeps_the_task_staged(self):
+        cases = (("gone", "queued"), ("gone", "served"), ("gone", None),
+                 ("busy", "acknowledged"), ("busy", "queued"))
+        for n, (answer, state) in enumerate(cases):
+            with self.subTest(answer=answer, state=state):
+                ask = f"{ASK_A}{n}"
+                self.broker.answers[ask] = [answer]
+                if state is not None:
+                    self.broker.states[ask] = state
+                self.assertFalse(self.take(voice_ask(ask)))
+                self.assertFalse((gw.TASKS_DIR / f"{ask}.txt").exists())
+                self.assertEqual(len(self.staged(ask)), 1)
+                self.assertIs(self.manifest()[ask]["accepted"], False)
+                self.assertIn(ask, self.marks())
+        # Only the ack says whose acknowledgement it is, so a 503 never publishes on the state.
+        self.assertEqual(self.fired, [])
 
     def test_an_unanswered_ack_keeps_the_task_staged_until_it_is_accepted(self):
         for n, answer in enumerate(("down", "busy", "auth")):
@@ -229,14 +300,21 @@ class AcknowledgingFirst(_Bridge):
         self.assertEqual([a["lease_id"] for a in self.broker.acks()], ["gen-1", "gen-2"])
         self.assertEqual((self.fired, self.manifest()), ([ASK_A], {}))
 
-    def test_a_mark_that_cannot_commit_stages_nothing_and_acks_nothing(self):
-        for content in ("{not json", "[]"):
+    def test_a_mark_that_cannot_commit_acks_nothing_until_it_can(self):
+        for n, content in enumerate(("{not json", "[]")):
             with self.subTest(content=content):
+                ask = f"{ASK_A}{n}"
                 gw.ACK_FIRST_FILE.write_text(content)
-                self.assertFalse(self.take(voice_ask(ASK_A)))
+                self.assertFalse(self.take(voice_ask(ask)))
                 self.assertEqual(self.broker.acks(), [])
-                self.assert_never_reached_the_core(ASK_A)
+                self.assertFalse((gw.TASKS_DIR / f"{ask}.txt").exists())
                 self.assertEqual(gw.ACK_FIRST_FILE.read_text(), content, "unreadable marks were overwritten")
+                self.assertNotIn(ask, self.on_disk_inflight())
+                self.assertIn(ask, self.manifest(), "the staged task lost its recovery record")
+                gw.ACK_FIRST_FILE.unlink()                 # readable again: marked, acked, published
+                self.assertTrue(gw._advance_held_tasks(self.inflight))
+                self.assertEqual((self.marks(), self.fired[-1]), ({ask: ask}, ask))
+                self.broker.calls.clear()
 
     def test_a_manifest_that_cannot_commit_stages_nothing_and_acks_nothing(self):
         gw.ACK_FIRST_MANIFEST_FILE.write_text("{not json")
@@ -245,6 +323,114 @@ class AcknowledgingFirst(_Bridge):
         self.assertFalse((gw.TASKS_DIR / f"{ASK_A}.txt").exists())
         self.assertEqual((self.staged(ASK_A), self.marks()), ([], {}))
         self.assertEqual(gw.ACK_FIRST_MANIFEST_FILE.read_text(), "{not json")
+
+    def test_the_staged_file_is_on_disk_in_its_directory_before_its_entry(self):
+        synced: "list[tuple]" = []
+        real = gw._fsync_in_place
+
+        def fsync(tid, *targets):
+            synced.append((targets, ASK_A in self.manifest()))
+            return real(tid, *targets)
+
+        self.broker.answers[ASK_A] = ["down"]
+        with patch.object(gw, "_fsync_in_place", side_effect=fsync):
+            self.take(voice_ask(ASK_A))
+        self.assertEqual(synced, [((gw._held_dir(), gw.TASKS_DIR), False)])
+        with patch.object(gw, "_fsync_in_place", return_value=False):
+            self.assertFalse(self.take(voice_ask(ASK_B)))
+        self.assertEqual((self.staged(ASK_B), list(self.manifest())), ([], [ASK_A]))
+
+    def test_the_rename_is_on_disk_in_both_directories_before_the_entry_goes(self):
+        events: "list" = []
+        fsync, publish, put = gw._fsync_in_place, gw._publish_staged, gw._put_held
+        fail_after_publish = {"left": 1}
+
+        def fsync_at(tid, *targets):
+            published = "publish" in events
+            events.append(("fsync", targets))
+            if published and fail_after_publish["left"]:
+                fail_after_publish["left"] -= 1
+                return False                         # the source directory did not commit
+            return fsync(tid, *targets)
+
+        def publish_at(tmp, path):
+            if Path(path).parent == gw.TASKS_DIR:        # not a state file's durable write
+                events.append("publish")
+            return publish(tmp, path)
+
+        def put_at(tid, entry):
+            events.append(("put", None if entry is None else "entry"))
+            return put(tid, entry)
+
+        with patch.multiple(gw, _fsync_in_place=fsync_at, _publish_staged=publish_at, _put_held=put_at):
+            self.assertTrue(self.take(voice_ask(ASK_A)))
+            after = events[events.index("publish") + 1:]
+            self.assertEqual(after, [("fsync", (gw._held_dir(), gw.TASKS_DIR))],
+                             "the entry went before both directories held the rename")
+            self.assertIs(self.manifest()[ASK_A]["accepted"], True)
+            self.assertFalse(gw._advance_held_tasks(self.inflight))   # the next pass: fsync, then clear
+        after = events[events.index("publish") + 2:]
+        self.assertEqual(after[-2:], [("fsync", (gw._held_dir(), gw.TASKS_DIR)), ("put", None)])
+        self.assertEqual((self.manifest(), self.fired, len(self.broker.acks())), ({}, [ASK_A], 1))
+
+    def test_a_staged_copy_beside_its_published_copy_is_dropped_not_published_again(self):
+        # A power loss can keep the publish's new name and bring back the staged one.
+        (gw.TASKS_DIR / "archive").mkdir()
+        where = {"queued": lambda t: t,
+                 "claimed": lambda t: t.rename(t.with_name(f"{t.stem}.claimed-core-1")),
+                 "archived": lambda t: t.rename(gw.TASKS_DIR / "archive" / t.name)}
+        for n, (name, move) in enumerate(where.items()):
+            with self.subTest(name):
+                ask = f"{ASK_C}{n}"
+                self.broker.answers[ask] = ["down"]
+                self.take(voice_ask(ask))
+                [staged] = self.staged(ask)
+                task = gw.TASKS_DIR / f"{ask}.txt"
+                task.write_text(staged.read_text())
+                gw.ACK_FIRST_MANIFEST_FILE.write_text(json.dumps(
+                    {ask: {**self.manifest()[ask], "accepted": True}}))
+                copy = move(task)
+                before = copy.stat()
+                self.assertFalse(gw._advance_held_tasks(self.inflight))
+                self.assertEqual((self.staged(ask), self.manifest(), self.fired), ([], {}, []))
+                self.assertEqual(copy.stat().st_ino, before.st_ino, "the task was published again")
+                self.assertEqual(task.exists(), name == "queued")
+                self.assertEqual(len(self.broker.acks()), n + 1, "an accepted task was acked again")
+
+    def test_a_staged_task_is_invisible_to_the_queue_and_to_its_lookups(self):
+        self.broker.answers[ASK_A] = ["down"]
+        self.take(voice_ask(ASK_A))
+        self.assertEqual(len(self.staged(ASK_A)), 1)
+        self.assertIsNone(gw.find_task_file(gw.TASKS_DIR, ASK_A))
+        self.assertEqual(sorted(p.name for p in gw.TASKS_DIR.iterdir() if p.is_file()), [])
+        self.assertFalse(gw._task_pending(ASK_A))
+
+    def test_at_start_staged_files_no_entry_names_are_removed(self):
+        self.broker.answers[ASK_A] = ["down"]
+        self.take(voice_ask(ASK_A))
+        [named] = self.staged(ASK_A)
+        orphans = [gw._held_dir() / f"{ASK_B}.txt.1.{'0' * 32}.tmp",
+                   gw._held_dir() / f"{ASK_A}.txt.2.{'1' * 32}.tmp"]
+        for orphan in orphans:
+            orphan.write_text("id: orphan\n")
+        kept = gw.ACK_FIRST_MANIFEST_FILE.read_text()
+        gw.ACK_FIRST_MANIFEST_FILE.write_text("{not json")
+        gw._sweep_held_dir()                             # the manifest cannot be read: nothing goes
+        self.assertTrue(all(f.exists() for f in orphans + [named]))
+        gw.ACK_FIRST_MANIFEST_FILE.write_text(kept)
+        gw._sweep_held_dir()
+        self.assertEqual((named.exists(), [o.exists() for o in orphans]), (True, [False, False]))
+
+    def test_a_discard_cut_short_is_finished_by_the_next_pass(self):
+        self.broker.answers[ASK_A] = ["stale"]
+        with patch.object(gw, "_forget_ack_first", return_value=False):
+            self.assertFalse(self.take(voice_ask(ASK_A)))
+        self.assertIs(self.manifest()[ASK_A]["refused"], True)
+        self.assertEqual((self.staged(ASK_A), self.marks()), ([], {ASK_A: ASK_A}))
+        self.assertFalse(gw._advance_held_tasks(self.inflight))
+        self.assertEqual(len(self.broker.acks()), 1, "a refused task was acked again")
+        self.assert_never_reached_the_core(ASK_A)
+        self.assertEqual((self.marks(), self.on_disk_inflight()), ({}, set()))
 
     def test_a_vanished_staged_file_without_a_published_copy_is_kept_and_reported(self):
         for name, other in (("no copy", None), ("a task file that does not match", "id: other\n")):
@@ -259,15 +445,23 @@ class AcknowledgingFirst(_Bridge):
                     (gw.TASKS_DIR / f"{ASK_A}.txt").write_text(other)
                 for _ in range(2):
                     self.assertFalse(gw._advance_held_tasks(self.inflight))
+                    gw._emit_gateway_status(True)
+                    self.assertEqual(self.reported(), [ASK_A])
                 self.assertEqual(self.manifest(), {ASK_A: entry}, "the entry was guessed away")
                 self.assertEqual(len(self.broker.acks()), 1, "a task that cannot be found was acked")
                 self.assertEqual(sum("staged file gone" in line for line in self.lines), 1)
                 self.assertEqual(self.fired, [])
-                gw.ACK_FIRST_MANIFEST_FILE.unlink()
+                gw.ACK_FIRST_MANIFEST_FILE.unlink()          # resolved by a person
                 (gw.TASKS_DIR / f"{ASK_A}.txt").unlink(missing_ok=True)
+                gw._advance_held_tasks(self.inflight)
+                gw._emit_gateway_status(True)
+                self.assertEqual(self.reported(), None)
                 self.broker.calls.clear()
 
-    def test_a_malformed_manifest_entry_is_left_alone(self):
+    def reported(self):
+        return json.loads(gw.GATEWAY_STATUS_FILE.read_text()).get("ack_first_unresolved")
+
+    def test_a_malformed_manifest_entry_is_left_alone_and_reported(self):
         victim = gw.INFLIGHT_FILE
         victim.write_text("[]")
         entry = {"broker_id": ASK_A, "lease_id": None, "staged": "../state/remote-task-inflight.json",
@@ -277,6 +471,41 @@ class AcknowledgingFirst(_Bridge):
         self.assertEqual((victim.read_text(), self.fired, self.broker.acks()), ("[]", [], []))
         self.assertFalse((gw.TASKS_DIR / f"{ASK_A}.txt").exists())
         self.assertTrue(any("malformed" in line for line in self.lines))
+        gw._emit_gateway_status(True)
+        self.assertEqual(self.reported(), [ASK_A])
+
+    def test_an_archived_task_or_its_result_proves_the_publish_after_a_crash(self):
+        # The publish happened and the entry's removal did not: what the core did since proves it.
+        moves = {"archived task": lambda t: t.rename(gw.TASKS_DIR / "archive" / t.name),
+                 "live result": lambda t: (t.unlink(), (gw.RESULTS_DIR / t.name).write_text("Clear.")),
+                 "archived result": lambda t: (t.unlink(), (gw.ARCHIVE_RESULTS_DIR
+                                                           / f"{t.stem}-1785976425.txt").write_text("Clear."))}
+        (gw.TASKS_DIR / "archive").mkdir()
+        gw.ARCHIVE_RESULTS_DIR.mkdir(parents=True)
+        for n, (name, move) in enumerate(moves.items()):
+            with self.subTest(name):
+                ask = f"{ASK_B}{n}"
+                self.assertTrue(self.take(voice_ask(ask)))
+                task = gw.TASKS_DIR / f"{ask}.txt"
+                entry = {"broker_id": ask, "lease_id": f"gen-{ask}", "staged": f"{ask}.txt.1.{'0' * 32}.tmp",
+                         "dest": task.name, "sha256": gw._held_digest(task.read_text()), "accepted": True}
+                gw.ACK_FIRST_MANIFEST_FILE.write_text(json.dumps({ask: entry}))
+                move(task)
+                acks, fired = len(self.broker.acks()), list(self.fired)
+                self.assertFalse(gw._advance_held_tasks(self.inflight))
+                self.assertEqual(self.manifest(), {})
+                self.assertFalse(task.exists(), "the task was published again")
+                self.assertEqual((len(self.broker.acks()), self.fired), (acks, fired))
+
+    def test_an_accepted_task_is_back_in_flight_before_its_publish(self):
+        # An older bridge, run in between, drops an id with no task file from its in-flight set.
+        self.broker.answers[ASK_A] = ["down"]
+        self.take(voice_ask(ASK_A))
+        gw.ACK_FIRST_MANIFEST_FILE.write_text(json.dumps(
+            {ASK_A: {**self.manifest()[ASK_A], "accepted": True}}))
+        gw._save_inflight(set())
+        self.assertTrue(gw._advance_held_tasks(set()))
+        self.assertEqual((self.on_disk_inflight(), len(self.broker.acks())), ({ASK_A}, 1))
 
     def test_a_staged_task_is_never_dropped_as_abandoned(self):
         self.broker.answers[ASK_A] = ["down"]
@@ -295,6 +524,7 @@ class AcknowledgingFirst(_Bridge):
                 self.assertTrue((gw.TASKS_DIR / f"{task['id']}.txt").exists())
         self.assertFalse(gw.ACK_FIRST_MANIFEST_FILE.exists())
         self.assertFalse(gw.ACK_FIRST_FILE.exists())
+        self.assertFalse(gw._held_dir().exists())
         self.assertEqual(self.broker.acks(), [], "written tasks are acked after the batch, as before")
 
 
@@ -330,6 +560,17 @@ class TheMark(_Bridge):
         gw._retire_delivered_marks()
         self.assertEqual(self.marks(), {ASK_A: ASK_A})
 
+    def test_at_start_an_unreadable_alias_ledger_keeps_every_mark(self):
+        # A re-ask's live result cannot be ruled out, so nothing is retired early.
+        self.assertTrue(self.take(voice_ask(ASK_A)))
+        self.deliver(ASK_A)
+        gw.DEDUP_ALIAS_FILE.write_text("{not json")
+        gw._retire_delivered_marks()
+        self.assertEqual(self.marks(), {ASK_A: ASK_A})
+        gw.DEDUP_ALIAS_FILE.unlink()
+        gw._retire_delivered_marks()
+        self.assertEqual(self.marks(), {})
+
 
 class Heartbeat(unittest.TestCase):
     def test_the_heartbeat_declares_the_contract_beside_task_ack(self):
@@ -362,7 +603,7 @@ class ThroughTheLoop(unittest.TestCase):
         return json.loads(path.read_text()) if path.exists() else {}
 
     def staged(self) -> "list[Path]":
-        return sorted((self.ws / "tasks").glob(f"{ASK_A}.txt.*.tmp"))
+        return sorted((self.ws / "tasks" / ".ack-first").glob(f"{ASK_A}.txt.*.tmp"))
 
     def entry(self) -> dict:
         return self.state("remote-task-ack-first-manifest").get(ASK_A) or {}
@@ -419,32 +660,114 @@ class ThroughTheLoop(unittest.TestCase):
         self.crash_between_the_ack_and_the_publish("before-publish", accepted=True)
         self.assertEqual(self.relay.acks, [ASK_A])
 
-    def crash_between_the_publish_and_the_entrys_removal(self, claimed: bool) -> None:
+    def test_a_crash_between_the_brokers_acceptance_and_its_record_runs_once_after_the_lease_ended(self):
+        self.relay.queue.append(voice_ask(ASK_A))
+        self.bridges.crashed(self.bridges.start(crash="after-ack"), "after the accepted ack")
+        self.assertIs(self.entry()["accepted"], False)
+        self.relay.lease_ended.add(ASK_A)                  # its re-ack now answers 404 not leased
+        bridge = self.bridges.start()
+        self.bridges.wait_for(lambda: self.bridges.fired(), bridge, "the publish after the restart")
+        self.bridges.polls_after(bridge)
+        self.bridges.stop(bridge)
+        self.assertEqual(self.bridges.fired(), [f"{ASK_A}.txt"], "the task did not run exactly once")
+        self.assertEqual((self.relay.acks, self.relay.status_reads), ([ASK_A, ASK_A], [ASK_A]))
+        self.assertEqual((self.staged(), self.entry()), ([], {}))
+
+    def test_a_crash_after_the_staged_file_and_before_its_entry_leaves_nothing_behind(self):
+        self.relay.queue.append(voice_ask(ASK_A))
+        self.bridges.crashed(self.bridges.start(crash="before-entry"), "the entry")
+        self.assertEqual((len(self.staged()), self.entry(), self.relay.acks), (1, {}, []))
+        self.relay.queue.append(voice_ask(ASK_A, lease="gen-2"))     # unacked, so served again
+        bridge = self.bridges.start()
+        self.bridges.wait_for(self.task.exists, bridge, "the new serve published")
+        self.bridges.polls_after(bridge)
+        self.bridges.stop(bridge)
+        self.assertIn("no ack_first manifest entry names it", self.bridges.log())
+        self.assertEqual((self.staged(), self.bridges.fired()), ([], [f"{ASK_A}.txt"]))
+        self.assertEqual([b.get("lease_id") for b in self.relay.ack_bodies], ["gen-2"])
+
+    def test_a_crash_after_the_entry_and_before_the_mark_runs_the_task_once(self):
+        self.relay.queue.append(voice_ask(ASK_A))
+        self.bridges.crashed(self.bridges.start(crash="before-mark"), "the mark")
+        self.assertEqual((len(self.staged()), self.state("remote-task-ack-first"), self.relay.acks),
+                         (1, {}, []))
+        bridge = self.bridges.start()
+        self.bridges.wait_for(lambda: self.bridges.fired(), bridge, "the publish after the restart")
+        self.bridges.polls_after(bridge)
+        self.bridges.stop(bridge)
+        self.assertEqual(self.bridges.fired(), [f"{ASK_A}.txt"])
+        self.assertEqual((self.state("remote-task-ack-first"), self.relay.acks), ({ASK_A: ASK_A}, [ASK_A]))
+
+    def test_a_crash_inside_a_discard_is_finished_after_the_restart(self):
+        self.relay.withdrawn.add(ASK_A)
+        self.relay.queue.append(voice_ask(ASK_A))
+        self.bridges.crashed(self.bridges.start(crash="after-refusal-recorded"), "the recorded refusal")
+        self.assertIs(self.entry().get("refused"), True)
+        self.assertEqual((len(self.staged()), self.state("remote-task-ack-first")), (1, {ASK_A: ASK_A}))
+        bridge = self.bridges.start()
+        self.bridges.wait_for(lambda: not self.entry(), bridge, "the discard finished")
+        self.bridges.polls_after(bridge)
+        self.bridges.stop(bridge)
+        self.assertEqual(self.relay.acks, [ASK_A], "a refused task was acked again")
+        self.assertFalse(self.task.exists())
+        self.assertEqual((self.staged(), self.bridges.fired()), ([], []))
+        self.assertNotIn(ASK_A, self.state("remote-task-ack-first"))
+        self.assertNotIn(ASK_A, self.state("remote-task-inflight") or [])
+
+    def crash_between_the_publish_and_the_entrys_removal(self, what_the_core_did,
+                                                         resurrect: bool = False) -> None:
+        """`what_the_core_did` moves the published task as the core would, and returns where
+        it is now (None once only its result is left). `resurrect` also brings the staged
+        name back, as a power loss before the source directory's fsync can."""
         self.relay.queue.append(voice_ask(ASK_A))
         self.bridges.crashed(self.bridges.start(crash="after-publish"), "after the publish")
         self.assertTrue(self.task.exists())
         self.assertEqual((self.staged(), self.entry().get("accepted")), ([], True))
-        copy = self.task.with_name(f"{ASK_A}.claimed-core-1") if claimed else self.task
-        if claimed:
-            self.task.rename(copy)
-        before = copy.stat()
+        if resurrect:
+            (self.ws / "tasks" / ".ack-first" / self.entry()["staged"]).write_text(self.task.read_text())
+        copy = what_the_core_did(self.task)
+        before = copy.stat() if copy else None
         bridge = self.bridges.start()
         self.bridges.wait_for(lambda: not self.entry(), bridge, "the entry cleared")
         self.bridges.polls_after(bridge)
         self.bridges.stop(bridge)
-        after = copy.stat()
-        self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns),
-                         "the task was published again")
-        self.assertEqual(self.task.exists(), not claimed, "a claimed task was queued again")
+        if copy is not None:
+            after = copy.stat()
+            self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns),
+                             "the task was published again")
+        self.assertEqual(self.task.exists(), copy == self.task, "a task the core took was queued again")
         self.assertEqual(self.relay.acks, [ASK_A])
         # The first process died before its wake, and a restart never re-fires one.
         self.assertEqual((self.staged(), self.bridges.fired()), ([], []))
 
     def test_a_crash_after_the_publish_and_before_the_entry_is_removed_runs_the_task_once(self):
-        self.crash_between_the_publish_and_the_entrys_removal(claimed=False)
+        self.crash_between_the_publish_and_the_entrys_removal(lambda task: task)
 
     def test_the_same_crash_with_the_task_claimed_by_the_core_runs_it_once(self):
-        self.crash_between_the_publish_and_the_entrys_removal(claimed=True)
+        self.crash_between_the_publish_and_the_entrys_removal(
+            lambda task: task.rename(task.with_name(f"{ASK_A}.claimed-core-1")))
+
+    def test_the_same_crash_with_the_task_archived_by_the_core_runs_it_once(self):
+        def archive(task):
+            (task.parent / "archive").mkdir()
+            return task.rename(task.parent / "archive" / task.name)
+        self.crash_between_the_publish_and_the_entrys_removal(archive)
+
+    def test_a_staged_copy_back_beside_the_published_one_after_a_power_loss_runs_once(self):
+        self.crash_between_the_publish_and_the_entrys_removal(lambda task: task, resurrect=True)
+
+    def test_the_same_with_the_task_archived_by_the_core_runs_once(self):
+        def archive(task):
+            (task.parent / "archive").mkdir()
+            return task.rename(task.parent / "archive" / task.name)
+        self.crash_between_the_publish_and_the_entrys_removal(archive, resurrect=True)
+
+    def test_the_same_crash_with_the_task_answered_by_the_core_runs_it_once(self):
+        def answer(task):
+            task.unlink()
+            (self.ws / "results" / task.name).write_text("Your calendar is clear.")
+        self.crash_between_the_publish_and_the_entrys_removal(answer)
+        self.assertEqual([r["id"] for r in self.relay.results], [ASK_A])
 
     def test_an_updated_bridges_poll_is_served_a_relay_ask_and_an_old_ones_is_not(self):
         self.relay.queue.extend([voice_ask(ASK_A), typed_task(TYPED_A)])
