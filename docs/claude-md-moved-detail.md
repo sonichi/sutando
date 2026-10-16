@@ -27,7 +27,7 @@ upload sink.
 
 Moved verbatim from CLAUDE.md "Vault — secure secret storage" (2026-10-16 context-budget diet):
 
-Python: import `get_vault_key`/`list_vault_keys` from `src/vault_intercept.py` (path-bootstrap snippet: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md)).
+Python: import `get_vault_key`/`list_vault_keys` from `src/vault_intercept.py` (path-bootstrap snippet: [Vault python usage](#vault-python-usage)).
 
 **CLI (for subprocesses):**
 ```bash
@@ -224,7 +224,7 @@ Moved verbatim from CLAUDE.md "Workspace contract" (2026-10-16 context-budget di
 
 **Resolution (every service reads the same):**
 
-**Default:** the workspace lives at `<repo>/workspace/` (in-repo). To override, edit `sutando.config.local.json` (per-clone, gitignored). `$SUTANDO_WORKSPACE` is no longer honored as of v0.8 / #1440 — see [`docs/workspace-config.md`](docs/workspace-config.md) for its deprecation behaviour and the repo-root fallback anti-pattern.
+**Default:** the workspace lives at `<repo>/workspace/` (in-repo). To override, edit `sutando.config.local.json` (per-clone, gitignored). `$SUTANDO_WORKSPACE` is no longer honored as of v0.8 / #1440 — see [`docs/workspace-config.md`](workspace-config.md) for its deprecation behaviour and the repo-root fallback anti-pattern.
 
 **Use the helper, don't reinvent the fallback:**
 - Python: `from workspace_default import resolve_workspace` → returns a `Path`.
@@ -240,7 +240,7 @@ Moved verbatim from CLAUDE.md "Task bridge" (2026-10-16 context-budget diet):
 
 **Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix.
 
-Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python). Why the scoped name slides past existing consumers, and how the phone drain claims it: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Per-channel pull namespace".
+Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python). Why the scoped name slides past existing consumers, and how the phone drain claims it: [Per-channel pull namespace — existing consumers](#per-channel-pull-namespace--existing-consumers) "Per-channel pull namespace".
 
 ## Per-channel pull namespace — existing consumers
 
