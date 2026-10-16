@@ -602,8 +602,7 @@ function matches(p: Person, said: string): boolean {
 
 /**
  * Who to @, from what the user said: "me" is the owner (whoami), a name is looked up among the room's
- * members and then across the space, and a full id must exist. 2026-10-16: the model guessed ids — the
- * tool description's example for "me", and a made-up "@xueqing:ag2.space" that notified no one.
+ * members and then across the space, and a full id must exist. The model never supplies an id it guessed.
  */
 export async function resolveMentions(client: McpClient, room: RoomRef, said: string[], deps: Pick<ReadRoomDeps, 'log'>): Promise<MentionResolution> {
 	const ids: string[] = [], names: string[] = [];
