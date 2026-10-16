@@ -91,7 +91,7 @@ step is left out. Every prompt says where to paste it (your DM or a room). When 
 done, a closing card offers one more prompt. UI labels match the AG2 Space client and its current
 screenshots; reword them in `tour_page.py` when the client changes.
 
-**Screenshots.** `assets/*.jpg` are real UI crops, adapted from Zerlinda's Sutando's "Getting
+**Screenshots.** `scripts/assets/*.jpg` are real UI crops, adapted from Zerlinda's Sutando's "Getting
 started with AG2 Space" page. Each is cropped so that no person's name, room or account shows,
 and each is at most 60 KB. They are inlined as `data:` URIs, so the page stays self-contained. A
 step names its images in `Section.images` as (file, alt).

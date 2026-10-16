@@ -95,7 +95,7 @@ IMPORT_SECTION = Section(
 )
 FINALE_PROMPT = "Help me plan my week."
 WHERE = {"dm": "your DM", "room": "a room"}
-ASSETS = Path(__file__).resolve().parent.parent / "assets"
+ASSETS = Path(__file__).resolve().parent / "assets"
 
 
 # (light, dark) per section; each passes WCAG AA (4.5:1) as text on that theme's card colour.
