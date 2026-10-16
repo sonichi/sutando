@@ -119,6 +119,13 @@ if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ "$TASKS_DIR_ABS" = "$CANONICAL_CORE_TA
   echo "watch-tasks-stream: SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID (and worker routing env) set while serving the core's own canonical inbox ($TASKS_DIR_ABS) -- clearing it to match the inbox, never the calling shell's inherited env" >&2
   unset SUTANDO_INSTANCE_ID SUTANDO_INBOX_KIND SUTANDO_INBOX_RESOLVER SUTANDO_INBOX_RESOLVER_TIMEOUT SUTANDO_POOL_DELIVERY_SCRIPT
 fi
+# A delivery inbox <ws>/deliveries/<id> is worker <id>'s seat: with no id passed, the
+# inbox names it, so the sentinel, handler, claims and beat are never the core's.
+if [ -z "${SUTANDO_INSTANCE_ID:-}" ] \
+   && [ "$(dirname "$TASKS_DIR_ABS")" = "$(canonical_tasks_dir "$WORKSPACE_DIR/deliveries")" ]; then
+  SUTANDO_INSTANCE_ID="$(basename "$TASKS_DIR_ABS")"; export SUTANDO_INSTANCE_ID
+  echo "watch-tasks-stream: no SUTANDO_INSTANCE_ID on delivery inbox $TASKS_DIR_ABS; serving it as worker $SUTANDO_INSTANCE_ID" >&2
+fi
 
 # shellcheck source=../scripts/python-binary.sh
 . "$__REPO_ROOT/scripts/python-binary.sh"

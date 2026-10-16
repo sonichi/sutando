@@ -1273,6 +1273,61 @@ class TestMacosNotifyAdapter(unittest.TestCase):
             self._assert_undelivered_and_retries()
 
 
+class TestMacosNotifyScript(unittest.TestCase):
+    MESSAGES = (
+        "⚠️ Agent needs you — 確認",
+        '"quoted" \\path\nsecond line',
+        'end run\nerror "must remain data"\non run argv',
+        '-e -- controls\r\t\b\f',
+    )
+
+    def _command(self, message):
+        with patch.object(_mod.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            self.assertTrue(_mod._macos_notify(message))
+        return run.call_args.args[0]
+
+    def test_text_is_passed_as_arguments_to_one_static_script(self):
+        scripts = set()
+        for message in self.MESSAGES:
+            with self.subTest(message=message):
+                command = self._command(message)
+                scripts.add(command[2])
+                self.assertEqual(command[:2], ["osascript", "-e"])
+                self.assertEqual(command[3:], ["--", message, "Sutando · Agent Shepherd"])
+        self.assertEqual(len(scripts), 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS AppleScript")
+    def test_production_script_compiles_without_sending_a_notification(self):
+        import subprocess
+        command = self._command(self.MESSAGES[0])
+        with tempfile.TemporaryDirectory() as td:
+            result = subprocess.run(
+                ["/usr/bin/osacompile", "-o", os.path.join(td, "notify.scpt")],
+                input=command[2], text=True, capture_output=True, timeout=8,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS AppleScript")
+    def test_actual_handler_round_trips_arguments_without_notifying(self):
+        import re
+        import subprocess
+        for message in self.MESSAGES:
+            with self.subTest(message=message):
+                command = self._command(message)
+                script, count = re.subn(
+                    r"(?m)^\s*display notification [^\n]+$",
+                    "return item 1 of argv", command[2],
+                )
+                self.assertEqual(count, 1)
+                result = subprocess.run(
+                    ["/usr/bin/osascript", *command[1:2], script, *command[3:]],
+                    capture_output=True, timeout=8,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, message.encode("utf-8") + b"\n")
+
+
 class TestUndeliveredLogThrottle(unittest.TestCase):
     """A cycle that reaches no one retries every tick but logs once per signal,
     then at most every UNDELIVERED_LOG_INTERVAL_S; the debounce state stays empty."""

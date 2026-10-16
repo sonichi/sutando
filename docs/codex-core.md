@@ -30,8 +30,16 @@ Save it as `sutando.config.local.json`, then run:
 
 ```bash
 codex login status
+bash skills/install.sh
 bash src/agent/start-cli.sh --restart
 ```
+
+With `core.runtime: codex`, `skills/install.sh` links every repo skill and every
+`<workspace>/skills/` skill into `$CODEX_HOME/skills/` (resolved by
+`scripts/sutando-config.sh codex-home-path skills`) as well as Claude's skills
+directory. Codex's bundled `.system/` skills and any entry already there with the
+same name are left alone. Codex reads skills at session start, so restart the core
+after installing.
 
 The tracked `type=codex` config entry sets `CODEX_HOME=~/.codex`, deliberately
 reusing the user's authenticated Codex installation rather than copying login
@@ -50,6 +58,8 @@ The Codex implementation:
   not copy Claude login state or run the Claude-only preflight for a Codex core;
 - exports the configured `CODEX_HOME` and requires `codex login status` to pass
   before any background service launches;
+- forwards `CODEX_HOME` and `CLAUDE_CONFIG_DIR` into the core session, so skills
+  that read the engine's channel state (such as `ag2space/access.json`) find it;
 - owns the same `sutando-core` tmux session used by the menu bar, health checks,
   and terminal attachment;
 - validates `codex` availability and authentication before changing the live
@@ -68,6 +78,32 @@ The Codex implementation:
   that follows the core's rollout file and writes its HealthStatus runtime
   observation record (`docs/health-snapshot.md`, "Runtime observation");
 - restarts the core and notifier together, preventing duplicate task consumers.
+
+## AG2 Space MCP without the desktop app
+
+The AG2 Space desktop app writes an `ag2-space` entry into `$CODEX_HOME/config.toml`.
+A Codex core set up without the app has no such entry, so it has no AG2 Space
+Actions (`room.commons.*` included) until you add the hosted server yourself. Find
+the Codex home with `bash scripts/sutando-config.sh core-config-dir-value codex`,
+then add this to its `config.toml`:
+
+```toml
+[mcp_servers.ag2-space]
+url = "https://mcp.ag2.space/mcp"
+```
+
+`codex mcp add ag2-space --url https://mcp.ag2.space/mcp` writes the same entry
+and starts the sign-in. The server uses OAuth, so no token goes in the file:
+
+```bash
+codex mcp login ag2-space   # sign in to AG2 Space in the browser
+codex mcp list              # ag2-space: enabled, Auth no longer "Not logged in"
+```
+
+That connection acts as you. To act as your agent, call the server's `agent_link`
+tool once from a Codex session with the one-time link code on the agent's
+settings page in AG2 Space. Restart the core afterwards
+(`bash src/agent/start-cli.sh --restart`, from outside the core session).
 
 ## Externally managed monitor and heartbeat
 

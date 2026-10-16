@@ -201,6 +201,46 @@ export function requestMarks(request: string): string[] {
 	return [...new Set([...numbers, ...quoted])];
 }
 
+/** The part of a table row that the supersede rule reads. */
+export type SupersedeRow = Pick<VoiceTaskRecord, 'text' | 'submittedAt' | 'delivery' | 'supersededBy'>;
+
+export interface SupersedeInput {
+	/** The request that corrects. */
+	taskId: string;
+	/** What it corrects, trimmed: a task id, or the misheard number or quoted name. */
+	replaces: string;
+	/** Oldest submission first, as `VoiceTaskStore.list()` returns them: the last match is the most recent. */
+	rows: ReadonlyArray<readonly [string, SupersedeRow]>;
+	now: number;
+	/** What a task id looks like in `rows`, anchored; the default is the voice task table's `task-<digits>`. */
+	idPattern?: RegExp;
+}
+
+export type SupersedePlan =
+	| { action: 'supersede'; id: string }
+	/** `names_nothing`: `replaces` is no id and carries no mark. `no_match`: no unheard request fits it. */
+	| { action: 'none'; why: 'names_nothing' | 'no_match' };
+
+const TASK_ID = /^task-\d+$/;
+
+/**
+ * The most recent unheard request from the last hour that `replaces` names, by id or by every mark
+ * it carries. Only a whole mark counts: a bare word like "pr" would match every unheard request.
+ */
+export function planSupersede(i: SupersedeInput): SupersedePlan {
+	const since = i.now - SUPERSEDE_WINDOW_MS;
+	// A copy without g/y: `.test` on the caller's own pattern would move its lastIndex.
+	const form = i.idPattern ?? TASK_ID;
+	const byId = new RegExp(form.source, form.flags.replace(/[gy]/g, '')).test(i.replaces);
+	const marks = byId ? [] : requestMarks(i.replaces);
+	if (!byId && marks.length === 0) return { action: 'none', why: 'names_nothing' };
+	const target = i.rows
+		.filter(([id, row]) => id !== i.taskId && row.delivery !== 'spoken' && !row.supersededBy && (row.submittedAt ?? 0) >= since)
+		.filter(([id, row]) => byId ? id === i.replaces : marks.every((m) => requestMarks(row.text ?? '').includes(m)))
+		.pop();
+	return target ? { action: 'supersede', id: target[0] } : { action: 'none', why: 'no_match' };
+}
+
 /** How long a handed-over result waits for the model's turn before the next one goes anyway. */
 export const HANDOFF_CONFIRM_MS = 60_000;
 
@@ -684,28 +724,19 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	}
 
 	/**
-	 * The model said this task corrects an earlier request (`replaces` names it: a task id, or the
-	 * misheard number or quoted name). Only a whole mark counts, never a word like "PR" (review of
-	 * #5348, B4: `replaces: 'pr'` superseded every unheard request), and only the most recent unheard
-	 * request that carries it is superseded: its result is not said, and its waiting call ends.
+	 * The model said this task corrects an earlier request (`replaces`). The one `planSupersede` picks
+	 * has its result left unsaid and its waiting call ended.
 	 */
 	private supersede(taskId: string, replaces: string): void {
-		const since = Date.now() - SUPERSEDE_WINDOW_MS;
-		const byId = /^task-\d+$/.test(replaces);
-		const marks = byId ? [] : requestMarks(replaces);
-		if (!byId && marks.length === 0) {
-			this.deps.log?.(`[RelayAgent] ${taskId}: "replaces" names no task or number (${replaces}); nothing corrected`);
+		const now = Date.now();
+		const plan = planSupersede({ taskId, replaces, rows: this.deps.store.list(), now });
+		if (plan.action === 'none') {
+			this.deps.log?.(plan.why === 'names_nothing'
+				? `[RelayAgent] ${taskId}: "replaces" names no task or number (${replaces}); nothing corrected`
+				: `[RelayAgent] ${taskId}: no unheard request carries "${replaces}"; nothing corrected`);
 			return;
 		}
-		const target = this.deps.store.list()
-			.filter(([id, row]) => id !== taskId && row.delivery !== 'spoken' && !row.supersededBy && (row.submittedAt ?? 0) >= since)
-			.filter(([id, row]) => byId ? id === replaces : marks.every((m) => requestMarks(row.text ?? '').includes(m)))
-			.pop();
-		if (!target) {
-			this.deps.log?.(`[RelayAgent] ${taskId}: no unheard request carries "${replaces}"; nothing corrected`);
-			return;
-		}
-		const [id] = target;
+		const { id } = plan;
 		this.deps.store.setSupersededBy(id, taskId);
 		this.endCall(id, 'delivered_separately');
 		this.deps.log?.(`[RelayAgent] ${id}: corrected by ${taskId}; its result will not be said`);

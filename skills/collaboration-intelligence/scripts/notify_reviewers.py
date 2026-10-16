@@ -272,6 +272,161 @@ def _is_github_user(login: str) -> bool:
     return p.returncode == 0 and p.stdout.strip().lower() == login.lower()
 
 
+# GitHub's own lookup order for CODEOWNERS on a branch; the first one found is used.
+CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
+
+
+class CodeownerCheckError(Exception):
+    """CODEOWNERS or the PR's files could not be read; the caller refuses."""
+
+
+def _gh(args: "list[str]") -> "subprocess.CompletedProcess":
+    try:
+        return subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60)
+    except Exception as exc:                     # noqa: BLE001 - re-raised as a refusal
+        raise CodeownerCheckError(f"gh {' '.join(args[:2])}: {type(exc).__name__}: {exc}")
+
+
+def _gh_out(args: "list[str]") -> str:
+    p = _gh(args)
+    if p.returncode != 0:
+        raise CodeownerCheckError(f"gh {' '.join(args)} rc={p.returncode}: "
+                                  f"{(p.stderr or '').strip()[:200]}")
+    return p.stdout
+
+
+def pr_facts(repo: str, num: str) -> dict:
+    """{base, author, files} for one PR; raises CodeownerCheckError on any doubt."""
+    head = _gh_out(["api", f"repos/{repo}/pulls/{num}",
+                    "--jq", "[.base.ref, .user.login, .changed_files] | @tsv"]).strip()
+    parts = head.split("\t")
+    if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2].isdigit():
+        raise CodeownerCheckError(f"unreadable PR facts for {repo}#{num}: {head[:120]!r}")
+    files = [f for f in _gh_out(["api", "--paginate", f"repos/{repo}/pulls/{num}/files",
+                                 "--jq", ".[].filename"]).splitlines() if f.strip()]
+    # The files endpoint stops at 3000; a short list would hide an unowned path.
+    if len(files) != int(parts[2]):
+        raise CodeownerCheckError(f"{repo}#{num}: read {len(files)} of {parts[2]} changed files")
+    return {"base": parts[0], "author": parts[1], "files": files}
+
+
+def fetch_codeowners(repo: str, base: str) -> "tuple[str, str] | None":
+    """(path, text) of the CODEOWNERS GitHub uses on `base`, or None if none exists.
+    Only a 404 means absent; any other failure raises, so the gate fails closed."""
+    from urllib.parse import quote
+    for path in CODEOWNERS_PATHS:
+        p = _gh(["api", f"repos/{repo}/contents/{path}?ref={quote(base, safe='')}",
+                 "-H", "Accept: application/vnd.github.raw"])
+        if p.returncode == 0:
+            return path, p.stdout
+        # 404 also means "repo unreadable"; it is read as "no CODEOWNERS" only
+        # because pr_facts reads the same repo first and would have failed.
+        if "HTTP 404" in (p.stderr or ""):
+            continue
+        raise CodeownerCheckError(f"reading {repo}:{path}@{base} rc={p.returncode}: "
+                                  f"{(p.stderr or '').strip()[:200]}")
+    return None
+
+
+def _codeowners_regex(pattern: str) -> "re.Pattern":
+    """GitHub's gitignore-style match. `*`/`?` stop at `/`; `**` crosses it; a slash
+    anywhere but the end anchors to the root; `docs/*` does not reach nested files,
+    but `room-*` owns a matching directory's contents, as in gitignore."""
+    anchored = "/" in pattern.rstrip("/")
+    dir_only = pattern.endswith("/")
+    body = pattern.strip("/")
+    out, i = "", 0
+    while i < len(body):
+        if body.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif body.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif body[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif body[i] == "?":
+            out, i = out + "[^/]", i + 1
+        else:
+            out, i = out + re.escape(body[i]), i + 1
+    last = body.rsplit("/", 1)[-1]
+    if dir_only:
+        tail = "/.*"
+    elif last == "*":
+        tail = ""
+    else:
+        tail = "(?:/.*)?"
+    return re.compile("^" + ("" if anchored else "(?:.*/)?") + out + tail + "$")
+
+
+def parse_codeowners(text: str) -> "list[tuple[re.Pattern, str, list[str]]]":
+    """[(regex, pattern, owners)] in file order; owners may be empty (= unowned)."""
+    rules = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        tokens = line.split()
+        pattern, owners = tokens[0], []
+        for tok in tokens[1:]:
+            if tok.startswith("#"):
+                break
+            owners.append(tok)
+        if pattern.startswith("\\#"):
+            pattern = pattern[1:]
+        rules.append((_codeowners_regex(pattern), pattern, owners))
+    return rules
+
+
+def owners_of(path: str, rules) -> "list[str]":
+    """Owners from the LAST matching rule, as GitHub resolves them."""
+    found = []
+    for rx, _pattern, owners in rules:
+        if rx.match(path):
+            found = owners
+    return found
+
+
+def codeowner_violations(files, author: str, logins, rules) -> "list[tuple[str, list[str]]]":
+    """(file, owners) per owned file with no asked non-author owner. Team and email
+    owners never count: membership is unread, so a reviewer in them is unproven."""
+    asked = {x.lower() for x in logins if x}
+    bad = []
+    for f in files:
+        owners = owners_of(f, rules)
+        if not owners:
+            continue
+        users = {o[1:].lower() for o in owners if o.startswith("@") and "/" not in o}
+        if not (users - {author.lower()}) & asked:
+            bad.append((f, owners))
+    return bad
+
+
+def codeowner_gate(message: str, targets, roster) -> "tuple[bool, list[str]]":
+    """(ok, lines) — every PR named in `message` must have, among `targets`, a
+    non-author code owner of each owned changed file. No CODEOWNERS = no rule."""
+    refs = sorted(set(_PR_URL.findall(message or "")))
+    logins = [_github_login(t["name"], roster)[0] for t in targets]
+    lines, ok = [], True
+    for repo, num in refs:
+        try:
+            facts = pr_facts(repo, num)
+            found = fetch_codeowners(repo, facts["base"])
+        except CodeownerCheckError as exc:
+            return False, [f"code-owner check FAILED for {repo}#{num}: {exc} — "
+                           "refusing rather than sending unchecked"]
+        if found is None:
+            continue
+        path, text = found
+        bad = codeowner_violations(facts["files"], facts["author"], logins,
+                                   parse_codeowners(text))
+        if bad:
+            ok = False
+            lines.append(f"{repo}#{num} ({path} on {facts['base']}, author "
+                         f"{facts['author']}): no asked reviewer ({', '.join(logins)}) "
+                         "is a non-author code owner of:")
+            lines += [f"  {f}  owners: {' '.join(o)}" for f, o in bad]
+    return ok, lines
+
+
 def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     """Is this stand actually a member of the room we are about to mention it in?
 
@@ -350,7 +505,7 @@ def ledger_path() -> Path:
     return Path(resolve_workspace()) / "state" / "review-asks.jsonl"
 
 
-def record_asks(message: str, reviewer: str) -> int:
+def record_asks(message: str, reviewer: str, no_codeowner: str = "") -> int:
     """Log a room ask so pr-unattended can see it. GitHub's timeline records only
     review_requested events, and the owner's rule is to ask in the room and never
     via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED."""
@@ -362,8 +517,11 @@ def record_asks(message: str, reviewer: str) -> int:
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a") as fh:
         for repo, num in sorted(refs):
-            fh.write(json.dumps({"repo": repo, "pr": num, "reviewer": reviewer,
-                                 "ts": ts, "channel": "room"}) + "\n")
+            row = {"repo": repo, "pr": num, "reviewer": reviewer,
+                   "ts": ts, "channel": "room"}
+            if no_codeowner:
+                row["no_codeowner"] = no_codeowner
+            fh.write(json.dumps(row) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
     return len(refs)
@@ -506,6 +664,8 @@ def main() -> int:
                     help="deliberately notify ONE reviewer; requires a reason")
     ap.add_argument("--widen-override", metavar="REASON", default="",
                     help="deliberately re-ask the SAME reviewers after 30min")
+    ap.add_argument("--no-codeowner", dest="no_codeowner", metavar="REASON", default="",
+                    help="deliberately ask without a non-author CODEOWNER; requires a reason")
     ap.add_argument("--kind", choices=("ask", "notice"), default="ask",
                     help="ask (default) requests review; notice tells reviewers "
                          "something about a PR without asking for anything")
@@ -554,17 +714,6 @@ def main() -> int:
                           file=sys.stderr)
                 kept.append(t)
             targets = kept
-    # The two-reviewer rule exists so one person being busy cannot stall a PR.
-    # A notice asks for nothing, so it cannot stall anything by going to one.
-    if a.send and a.kind == "ask" and len(targets) < 2 and not a.allow_single:
-        print(f"REFUSED: {len(targets)} reviewer(s) resolved from {names!r}; the rule is at "
-              "least TWO, so one being busy cannot stall the PR. Name another reviewer, "
-              "or pass --allow-single '<reason>'.", file=sys.stderr)
-        # A failed name is WHY the count is short and is the actionable half.
-        # `> 0` not `or`: refusal codes are positive, 0 means nothing refused.
-        return refusal_rc if refusal_rc > 0 else 5
-    if a.allow_single and len(targets) < 2:
-        print(f"single-reviewer ask allowed: {a.allow_single}", file=sys.stderr)
     if a.send and a.kind == "ask":
         loose = unrecordable_pr_refs(a.message)
         if loose:
@@ -573,12 +722,10 @@ def main() -> int:
                   "read the PR as never asked. Refused reference(s), and the form that works: "
                   + "; ".join(f"{tok} -> {fix}" for tok, fix in loose), file=sys.stderr)
             return 7
-    stale, why = _stale_repeat_ask(a.message, targets, load_roster()) if a.kind == "ask" else (False, "")
-    if stale and not a.widen_override:
-        print(f"REFUSED: {why} Re-asking the same people is not escalation — "
-              "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
-        return 6
+    # Gates judge only who a send would reach: a target dropped after them
+    # could be the one code owner, leaving the rest asked without one.
     failures = unlogged = 0
+    reachable = []
     for t in targets:
         if a.room and t["room"] != a.room:
             # Not an error: the pair is valid, but the Stand does not live in
@@ -622,6 +769,39 @@ def main() -> int:
                   "Resolve the room's own Stand for this person.", file=sys.stderr)
             failures += 1
             continue
+        reachable.append(t)
+    targets = reachable
+    # The two-reviewer rule exists so one person being busy cannot stall a PR.
+    # A notice asks for nothing, so it cannot stall anything by going to one.
+    if a.send and a.kind == "ask" and len(targets) < 2 and not a.allow_single:
+        print(f"REFUSED: {len(targets)} reviewer(s) resolved from {names!r}; the rule is at "
+              "least TWO, so one being busy cannot stall the PR. Name another reviewer, "
+              "or pass --allow-single '<reason>'.", file=sys.stderr)
+        # A failed name is WHY the count is short and is the actionable half.
+        # `> 0` not `or`: refusal codes are positive, 0 means nothing refused.
+        return refusal_rc if refusal_rc > 0 else 5
+    if a.allow_single and len(targets) < 2:
+        print(f"single-reviewer ask allowed: {a.allow_single}", file=sys.stderr)
+    stale, why = _stale_repeat_ask(a.message, targets, load_roster()) if a.kind == "ask" else (False, "")
+    if stale and not a.widen_override:
+        print(f"REFUSED: {why} Re-asking the same people is not escalation — "
+              "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
+        return 6
+    # Send-only like the two-reviewer rule: a plan cannot strand a PR, an ask can.
+    if a.send and a.kind == "ask" and targets:
+        if a.no_codeowner:
+            print(f"code-owner rule overridden: {a.no_codeowner}", file=sys.stderr)
+        else:
+            owned, lines = codeowner_gate(a.message, targets, load_roster())
+            if not owned:
+                print("REFUSED: code-owner rule — where the base branch has CODEOWNERS, "
+                      "an ask must include a non-author code owner.", file=sys.stderr)
+                for line in lines:
+                    print(line, file=sys.stderr)
+                print("Add a non-author code owner as a reviewer, or pass "
+                      "--no-codeowner '<reason>'.", file=sys.stderr)
+                return 8
+    for t in targets:
         argv = command_for(t, a.message)
         if not a.send:
             print("PLAN:", " ".join(argv))
@@ -661,7 +841,7 @@ def main() -> int:
             # The ask already happened; a lost ledger write makes pr-unattended
             # report NOBODY_EVER_ASKED for someone who was asked. Loud, not fatal.
             try:
-                n_logged = record_asks(a.message, t["name"]) if a.kind == "ask" else 0
+                n_logged = record_asks(a.message, t["name"], a.no_codeowner) if a.kind == "ask" else 0
             except OSError as e:
                 unlogged += 1
                 print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT recorded "

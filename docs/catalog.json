@@ -95,7 +95,7 @@
     "contributors"
    ],
    "status": "active",
-   "canonical_for": "verbatim parking for relocated CLAUDE.md detail: marker-migration history, vault python bootstrap, liveness payload schema",
+   "canonical_for": "verbatim parking for relocated CLAUDE.md detail: marker-migration history, vault python bootstrap, liveness payload schema, PR checklists, chat-path task/result recipes, workspace resolution, vault recipes, per-channel pull namespace, voice session context",
    "last_verified": "2026-10-10"
   },
   "docs/codex-core.md": {
@@ -106,7 +106,7 @@
    ],
    "status": "active",
    "canonical_for": "Codex core setup, earned-reset policy, and rollback",
-   "last_verified": "2026-09-30"
+   "last_verified": "2026-10-16"
   },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
@@ -343,14 +343,14 @@
    "last_verified": null
   },
   "docs/tutorial-delivery.md": {
-   "title": "Tutorial delivery (moved from CLAUDE.md)",
+   "title": "Tutorial delivery",
    "audience": [
     "agents",
     "contributors"
    ],
    "status": "active",
-   "canonical_for": "the section-by-section voice-friendly tutorial walkthrough procedure",
-   "last_verified": "2026-08-17"
+   "canonical_for": "the tutorial skill's two modes: the voice walkthrough and the AG2 Space Getting started page",
+   "last_verified": "2026-10-15"
   },
   "docs/voice-agent-test-framework.md": {
    "title": "Voice-agent test framework",
