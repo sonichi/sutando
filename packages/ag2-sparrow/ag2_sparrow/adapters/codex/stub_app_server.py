@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Test double for `codex app-server --listen stdio://`: the same JSON-RPC shapes, no model.
 
-Echoes the first line of each turn's input as the agentMessage. A turn whose input
-contains `[[approval]]` first sends an `item/commandExecution/requestApproval` request
-and waits for the client's decision, which is echoed in the reply.
+Echoes the first line of each turn's input as the agentMessage. Markers in the input
+drive failure modes: `[[approval]]` sends an `item/commandExecution/requestApproval`
+request first and echoes the decision; `[[stall]]` never completes until
+`turn/interrupt`; `[[stall-hard]]` ignores the interrupt too.
 """
 import json
 import sys
@@ -13,6 +14,7 @@ import uuid
 THREADS = {}
 REQ_ID = 1000
 PENDING = {}   # request id -> (thread id, turn id, item id, reply text)
+STALLED = {}   # turn id -> (thread id, hard)
 
 
 def send(obj):
@@ -54,7 +56,10 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": rid, "result": {"data": [{"id": "stub-model", "isDefault": True}], "nextCursor": None}})
     elif meth in ("thread/start", "thread/resume"):
         tid = p.get("threadId") or str(uuid.uuid4())
-        THREADS[tid] = {"cwd": p.get("cwd", "/")}
+        if meth == "thread/resume" and tid.startswith("stale-"):
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "no rollout found for thread id " + tid}})
+            continue
+        THREADS[tid] = {"cwd": p.get("cwd", "/"), "params": p}
         send({"jsonrpc": "2.0", "id": rid, "result": {"thread": thread_obj(tid), "model": p.get("model") or "stub-model",
                                                       "modelProvider": "stub", "cwd": THREADS[tid]["cwd"],
                                                       "approvalPolicy": "never", "sandbox": "read-only", "approvalsReviewer": None}})
@@ -71,12 +76,22 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": rid, "result": {"turn": {"id": turn_id, "status": "inProgress", "items": []}}})
         send({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": tid, "turn": {"id": turn_id, "status": "inProgress", "items": []}}})
         item_id = str(uuid.uuid4())
-        if "[[approval]]" in text:
+        if "[[stall" in text:
+            STALLED[turn_id] = (tid, "[[stall-hard]]" in text)
+        elif "[[approval]]" in text:
             REQ_ID += 1
             PENDING[REQ_ID] = (tid, turn_id, item_id, reply)
             send({"jsonrpc": "2.0", "id": REQ_ID, "method": "item/commandExecution/requestApproval",
                   "params": {"threadId": tid, "turnId": turn_id, "itemId": item_id, "command": ["rm", "-rf", "x"]}})
         else:
             finish_turn(tid, turn_id, item_id, reply)
+    elif meth == "turn/interrupt":
+        send({"jsonrpc": "2.0", "id": rid, "result": {}})
+        tid, hard = STALLED.get(p.get("turnId"), (None, True))
+        if tid is not None and not hard:
+            STALLED.pop(p["turnId"])
+            send({"jsonrpc": "2.0", "method": "turn/completed",
+                  "params": {"threadId": tid, "turn": {"id": p["turnId"], "status": "interrupted", "items": [],
+                                                       "error": {"message": "interrupted"}}}})
     elif rid is not None:
         send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "stub: unknown method %s" % meth}})
