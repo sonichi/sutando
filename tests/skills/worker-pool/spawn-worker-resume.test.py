@@ -16,6 +16,8 @@ Run: python3 tests/skills/worker-pool/spawn-worker-resume.test.py
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -85,6 +87,118 @@ class HermeticSpawnTest(unittest.TestCase):
         patcher = mock.patch.object(sw, "ensure_remedy_timer", side_effect=ensure_in_temp)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+
+class ResumeRuntimeSelection(HermeticSpawnTest):
+    def seed_claude(self, runner):
+        return sw.spawn(self.ws, self.repo, runtime="claude", cwd=str(self.repo),
+                        runner=runner, require_sentinel=False)
+
+    def snapshot(self):
+        return {str(p.relative_to(self.ws)): p.read_bytes()
+                for p in self.ws.rglob("*") if p.is_file()}
+
+    def test_resume_uses_recorded_runtime_and_preserves_identity_under_codex_core(self):
+        t = FakeTmux(runtime="codex")
+        first = self.seed_claude(t)
+        wid, sid = first["worker_id"], first["runtime_session_id"]
+        sw.pr.register_worker(self.ws, wid, "Mars-the-product-dev", runtime="claude")
+        inbox_entry = Path(first["delivery_dir"]) / "pending-delivery"
+        inbox_entry.write_text("pending")
+        lineage = wi.sessions(self.ws, wid)
+        t.existing.clear()
+
+        again = sw.spawn(self.ws, self.repo, resume=sid, cwd=str(self.repo),
+                         runner=t, require_sentinel=False)
+
+        self.assertEqual(again["runtime"], "claude")
+        self.assertEqual(again["worker_id"], wid)
+        self.assertEqual(again["runtime_session_id"], sid)
+        self.assertEqual(again["label"], "Mars-the-product-dev")
+        self.assertEqual(again["delivery_dir"], first["delivery_dir"])
+        self.assertEqual(inbox_entry.read_text(), "pending")
+        self.assertEqual(t.launches()[-1]["SUTANDO_WORKER_RUNTIME"], "claude")
+        self.assertEqual(t.launches()[-1]["SUTANDO_CLAUDE_RESUME"], sid)
+        self.assertFalse(t.launches()[-1].get("SUTANDO_CLAUDE_SESSION_ID"))
+        self.assertEqual(wi.sessions(self.ws, wid), lineage)
+        self.assertEqual(len(lineage), 1)
+        self.assertEqual(len(wi.incarnations(self.ws, wid)), 2)
+        self.assertEqual([p.name for p in (self.ws / "state/workers").iterdir()], [wid])
+
+    def test_runtime_comes_from_the_requested_session_not_the_latest_session(self):
+        t = FakeTmux(runtime="codex")
+        first = self.seed_claude(t)
+        wi.record_session(self.ws, first["worker_id"], "later-codex-session",
+                          runtime="codex", relation=wi.RELATION_NEW)
+        t.existing.clear()
+
+        again = sw.spawn(self.ws, self.repo, resume=first["runtime_session_id"],
+                         runner=t, require_sentinel=False)
+
+        self.assertEqual(again["runtime"], "claude")
+        self.assertEqual(t.launches()[-1]["SUTANDO_CLAUDE_RESUME"],
+                         first["runtime_session_id"])
+        before, launch_count = self.snapshot(), len(t.launches())
+        t.runtime = "claude"
+        t.existing.clear()
+        with self.assertRaisesRegex(sw.SpawnRefused, "Codex cannot resume"):
+            sw.spawn(self.ws, self.repo, resume="later-codex-session",
+                     runner=t, require_sentinel=False)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(len(t.launches()), launch_count)
+
+    def test_fresh_worker_keeps_core_runtime_and_drops_inherited_resume(self):
+        t = FakeTmux(runtime="codex")
+        first = self.seed_claude(t)
+        with mock.patch.dict(os.environ, {
+                "SUTANDO_CLAUDE_RESUME": first["runtime_session_id"],
+                "SUTANDO_CLAUDE_SESSION_ID": first["runtime_session_id"]}):
+            fresh = sw.spawn(self.ws, self.repo, runner=t, require_sentinel=False)
+
+        self.assertEqual(fresh["runtime"], "codex")
+        self.assertNotEqual(fresh["worker_id"], first["worker_id"])
+        self.assertIsNone(fresh["runtime_session_id"])
+        self.assertEqual(t.launches()[-1]["SUTANDO_WORKER_RUNTIME"], "codex")
+        self.assertFalse(t.launches()[-1].get("SUTANDO_CLAUDE_RESUME"))
+        self.assertFalse(t.launches()[-1].get("SUTANDO_CLAUDE_SESSION_ID"))
+
+    def test_explicit_codex_resume_refuses_without_launch_or_writes(self):
+        t = FakeTmux(runtime="codex")
+        first = self.seed_claude(t)
+        t.existing.clear()
+        before, launch_count = self.snapshot(), len(t.launches())
+
+        with self.assertRaisesRegex(sw.SpawnRefused, "Codex cannot resume"):
+            sw.spawn(self.ws, self.repo, runtime="codex",
+                     resume=first["runtime_session_id"], runner=t, require_sentinel=False)
+
+        self.assertEqual(len(t.launches()), launch_count)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_unknown_session_refuses_without_launch_or_writes(self):
+        t = FakeTmux(runtime="codex")
+        for populated in (False, True):
+            with self.subTest(populated=populated):
+                if populated:
+                    self.seed_claude(t)
+                    t.existing.clear()
+                before, launch_count = self.snapshot(), len(t.launches())
+                with self.assertRaisesRegex(sw.SpawnRefused, "no worker.*lineage"):
+                    sw.spawn(self.ws, self.repo, resume="unrecorded-session",
+                             runner=t, require_sentinel=False)
+                self.assertEqual(len(t.launches()), launch_count)
+                self.assertEqual(self.snapshot(), before)
+                if not populated:
+                    self.assertFalse((self.ws / "state/workers").exists())
+
+    def test_help_explains_fresh_and_resume_runtime_defaults(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            sw.main(["--help"])
+        self.assertEqual(cm.exception.code, 0)
+        help_text = " ".join(out.getvalue().split())
+        self.assertIn("the core's configured runtime for fresh workers", help_text)
+        self.assertIn("the recorded session's runtime for --resume", help_text)
 
 
 class ResumeKeepsIdentity(HermeticSpawnTest):

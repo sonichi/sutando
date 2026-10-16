@@ -240,7 +240,8 @@ describe('readRoom: every outcome is something the model can say', () => {
 		assert.equal(r.ok, true);
 		assert.equal(r.room, 'Sutando Triage');
 		assert.deepEqual(r.messages.map((m: { text: string }) => m.text), ['Approved #5453.']);
-		assert.deepEqual(f.calls, [{ name: 'room.action.read', args: { room_id: '!a:ag2.space', action: 'room.context.read', arguments: { limit: ROOM_READ_DEFAULT_LIMIT } } }]);
+		// Read past interleaved thread replies: 4× the limit plus 20, then cut to the limit in the main timeline.
+		assert.deepEqual(f.calls, [{ name: 'room.action.read', args: { room_id: '!a:ag2.space', action: 'room.context.read', arguments: { limit: ROOM_READ_DEFAULT_LIMIT * 4 + 20 } } }]);
 	});
 
 	it('a name not in the index refreshes it once: a newly joined room is read; a miss lists every room', async () => {
@@ -267,7 +268,7 @@ describe('readRoom: every outcome is something the model can say', () => {
 		const f = fake(() => read([]));
 		await readRoom({ room: '!cAAaogVSFcIYaNmohw:ag2.space', limit: 500 }, { client: () => f.client, currentRoom: () => null, index: idx([], f.client) });
 		assert.equal(f.calls.length, 1, 'no room.list for an id');
-		assert.equal((f.calls[0].args.arguments as { limit: number }).limit, 40);
+		assert.equal((f.calls[0].args.arguments as { limit: number }).limit, 40 * 4 + 20);
 	});
 
 	it('ambiguous comes back with the candidates; a miss on an empty index is not_found with no rooms', async () => {
@@ -300,7 +301,7 @@ describe('readRoom: every outcome is something the model can say', () => {
 		assert.equal(r.ok, true);
 		assert.deepEqual(f.calls[0].args.arguments, { limit: 10, around_event_id: '$hit' });
 		await readRoom({ room: 'Sutando Triage', around: '  ' }, { client: () => f.client, currentRoom: () => null, index });
-		assert.deepEqual(f.calls[1].args.arguments, { limit: ROOM_READ_DEFAULT_LIMIT }, 'a blank around is no around');
+		assert.deepEqual(f.calls[1].args.arguments, { limit: ROOM_READ_DEFAULT_LIMIT * 4 + 20 }, 'a blank around is no around');
 	});
 
 	it('the tool is inline and returns readRoom\'s answer', async () => {
@@ -336,7 +337,7 @@ describe('readRoom: every outcome is something the model can say', () => {
 	it('read_room is declared as a tool that fetches the answer, so the turn check does not also send the turn', () => {
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
 		assert.match(src, /answeringTools: roomRead\.tools\.map\(\(t\) => t\.name\)/);
-		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list\]/, 'list_rooms, search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room');
+		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list, \.\.\.open\]/, 'list_rooms, search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room');
 		assert.match(src, /roomIndexContextLines\(index\)/, 'the room names are in every prompt');
 		assert.match(src, /_rooms\.refresh\(\)\.then\(/, 'the index is the warm-up');
 	});
@@ -407,8 +408,8 @@ describe('searchRoom: what was said about something, however far back', () => {
 		assert.match(ROOM_TURN_CHECK_RULE, /^- none: a question about an AG2 Space room's messages/);
 		assert.match(ROOM_TURN_CHECK_RULE, /never work, even when it names a PR/);
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
-		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list\]/, 'search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room, all answering tools through the same map');
-		assert.match(src, /turnCheckRules: \[ROOM_TURN_CHECK_RULE\]/, 'the turn check is told');
+		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list, \.\.\.open\]/, 'search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room, all answering tools through the same map');
+		assert.match(src, /turnCheckRules: \[ROOM_TURN_CHECK_RULE, ROOM_ACTIONS_TURN_CHECK_RULE\]/, 'the turn check is told');
 	});
 });
 
@@ -543,7 +544,9 @@ describe('write_page: a spoken note into a room\'s Commons, after the user\'s ye
 		const failed = fake(() => ({ structuredContent: { status: 'failed' } }));
 		assert.deepEqual(await writePage({ room: '!a:x', title: 't', text: 'n' }, deps(failed.client, [])), { ok: false, error: 'failed' });
 		const slow = fake(() => new Error('tools/call timed out after 15000ms'));
-		assert.deepEqual(await writePage({ room: '!a:x', title: 't', text: 'n' }, deps(slow.client, [])), { ok: false, error: 'timeout' });
+		const unknown = await writePage({ room: '!a:x', title: 't', text: 'n' }, deps(slow.client, []));
+		assert.equal(unknown.ok, false);
+		assert.equal((unknown as { error: string }).error, 'outcome_unknown');
 		assert.equal(slow.calls.length, 1);
 	});
 
@@ -680,4 +683,113 @@ describe('send_message: a message in a room\'s chat, as the agent, after the use
 });
 
 });
+
+describe('read_room lines carry each message\'s event_id and its time, whatever type ts comes in', () => {
+	it('latest is the newest main-timeline line, and reactions show which are this agent\'s (live 2026-10-15: a thread reply was reacted to twice)', async () => {
+		const calls: string[] = [];
+		const client = {
+			async callTool(name: string) {
+				calls.push(name);
+				if (name === 'ag2.whoami') return { structuredContent: { actor: { id: '@me.agent:ag2.space' } } };
+				return { structuredContent: { result: { messages: [
+					{ sender: '@bot:ag2.space', body: 'in a thread', event_id: '$t', ts: 3, thread_root: '$root', reactions: [{ key: '👍', sender: '@me.agent:ag2.space' }, { key: '❤️', sender: '@x:ag2.space' }] },
+					{ sender: '@susan:ag2.space', body: 'main latest', event_id: '$m', ts: 2 },
+					{ sender: '@chi:ag2.space', body: 'older', event_id: '$o', ts: 1 },
+				] } } };
+			},
+			close() {},
+		};
+		const r = await readRoom({ room: '!a:ag2.space', limit: 1 }, { client: () => client as never, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never);
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.equal(r.latest?.event_id, '$m');
+			// The main timeline alone in messages; the thread reply apart, with its root.
+			assert.deepEqual(r.messages.map(m => m.event_id), ['$m']);
+			const thread = r.thread_replies!.find(m => m.event_id === '$t')!;
+			assert.equal(thread.in_thread_of, '$root');
+			assert.deepEqual(thread.reactions, ['👍 (you)', '❤️']);
+		}
+		assert.ok(calls.includes('ag2.whoami'));
+	});
+
+	it('"the second to last" counts in the main timeline: thread replies are not in messages (live 2026-10-15 22:57)', async () => {
+		const client = { async callTool() { return { structuredContent: { result: { messages: [
+			{ sender: '@bot:x', body: 'thread 1', event_id: '$t1', ts: 5, thread_root: '$m2' },
+			{ sender: '@dot:x', body: 'thread 2', event_id: '$t2', ts: 4, thread_root: '$m2' },
+			{ sender: '@susan:x', body: 'main latest', event_id: '$m2', ts: 3 },
+			{ sender: '@chi:x', body: 'main earlier', event_id: '$m1', ts: 2 },
+		] } } }; }, close() {} };
+		const r = await readRoom({ room: '!a:ag2.space', limit: 2 }, { client: () => client as never, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never);
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.deepEqual(r.messages.map(m => m.event_id), ['$m1', '$m2']);
+			assert.equal(r.messages[r.messages.length - 2].event_id, '$m1', 'the second to last is Chi\'s, not a thread reply');
+			// Numbered from the end, so the model never counts (live 23:06: it picked the 4th from last).
+			assert.deepEqual(r.messages.map(m => [m.event_id, m.from_last]), [['$m1', 2], ['$m2', 1]]);
+			assert.equal(r.latest?.from_last, 1);
+			assert.deepEqual(r.thread_replies!.map(m => m.event_id), ['$t2', '$t1']);
+		}
+	});
+
+	it('a system row ("Agent Native: …") gets no position: the third from last is the message before it (live 23:18)', async () => {
+		const client = { async callTool() { return { structuredContent: { result: { messages: [
+			{ sender: '@susan:x', body: '@dot hi', event_id: '$1', ts: 4 },
+			{ sender: '@chi:x', body: '@susan', event_id: '$2', ts: 3 },
+			{ sender: '@chi:x', body: 'Agent Native: @chi changed @dot access from Team to Guest.', event_id: '$sys', ts: 2 },
+			{ sender: '@chi:x', body: '> Point the ingestion at the new store.', event_id: '$3', ts: 1 },
+		] } } }; }, close() {} };
+		const r = await readRoom({ room: '!a:ag2.space', limit: 3 }, { client: () => client as never, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never);
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.deepEqual(r.messages.map(m => [m.event_id, m.from_last ?? null, m.system ?? false]), [['$3', 3, false], ['$sys', null, true], ['$2', 2, false], ['$1', 1, false]]);
+			assert.equal(r.latest?.event_id, '$1');
+		}
+	});
+
+	it('no reactions: no whoami call', async () => {
+		const calls: string[] = [];
+		const client = { async callTool(name: string) { calls.push(name); return { structuredContent: { result: { messages: [{ sender: '@a:x', body: 'hi', event_id: '$1', ts: 1 }] } } }; }, close() {} };
+		await readRoom({ room: '!a:ag2.space', limit: 1 }, { client: () => client as never, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never);
+		assert.deepEqual(calls, ['room.action.read']);
+	});
+
+	it('the ROOMS line: a name said exactly is that room, never a similar one', () => {
+		const lines = roomIndexContextLines({ rooms: () => [{ room_id: '!a', name: 'Sutando Triage' }, { room_id: '!b', name: 'triage system' }], refresh: async () => [], fetchedAt: () => 1 } as never);
+		assert.match(lines[0], /is one of these exactly \(ignoring case\) is that room — never swap it for a similar one/);
+	});
+
+	it('the latest read reaches the main timeline past newer thread replies', async () => {
+		const { latestInMainTimeline } = await import('../skills/ag2space-voice/room-read.ts');
+		const raw = [
+			{ body: 'thread reply', event_id: '$t1', thread_root: '$r' },
+			{ body: 'another', event_id: '$t2', thread_root: '$r' },
+			{ body: 'main latest', event_id: '$m1' },
+			{ body: 'main earlier', event_id: '$m2' },
+		];
+		assert.deepEqual((latestInMainTimeline(raw, 1) as Array<{ event_id: string }>).map(m => m.event_id), ['$t1', '$t2', '$m1']);
+		assert.deepEqual((latestInMainTimeline(raw, 5) as Array<{ event_id: string }>).map(m => m.event_id), ['$t1', '$t2', '$m1', '$m2']);
+	});
+
+	it('a thread reply is marked, and the description says the latest message is the latest outside threads', () => {
+		const [line] = toMessageLines([{ sender: '@b:ag2.space', body: 'in a thread', event_id: '$t', ts: 1, thread_root: '$root' }]);
+		assert.equal(line.thread, true);
+		const d = createReadRoomTool({ client: () => null, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 } } as never).description;
+		assert.match(d, /`messages` is the room\'s main timeline, oldest first, as the user sees it, each message with from_last/);
+		assert.match(d, /`thread_replies` are replies inside threads/);
+		assert.match(d, /"the last but one" \/ "the second to last" is from_last 2, "the third from last" from_last 3 — never count the list yourself/);
+		assert.match(d, /system:true is a system row the user does not see as a message: it has no from_last/);
+	});
+
+	it('event_id kept; ts as a numeric string still gives a time', () => {
+		const lines = toMessageLines([
+			{ sender: '@yixuan-desktop.agent:ag2.space', body: 'latest', event_id: '$new', ts: '1792047886394' },
+			{ sender: '@yixuan:ag2.space', body: 'earlier', event_id: '$old', ts: 1792047864226 },
+			{ sender: '@x:ag2.space', body: 'no id' },
+		]);
+		assert.deepEqual(lines.map(l => l.event_id), [undefined, '$old', '$new']);
+		assert.ok(lines[2].at && lines[1].at);
+		assert.equal(lines[0].at, '');
+	});
+});
+
 }

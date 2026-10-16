@@ -285,9 +285,11 @@ def compose_message(signal: dict, surface: str = "") -> str:
 def _macos_notify(message: str) -> bool:  # pragma: no cover - external I/O (osascript)
     """True only when osascript ran and exited 0."""
     try:
+        script = ("on run argv\n"
+                  "display notification (item 1 of argv) with title (item 2 of argv)\n"
+                  "end run")
         r = subprocess.run(
-            ["osascript", "-e",
-             f'display notification {json.dumps(message)} with title "Sutando · Agent Shepherd"'],
+            ["osascript", "-e", script, "--", message, "Sutando · Agent Shepherd"],
             capture_output=True, timeout=8)
         return r.returncode == 0
     except Exception:

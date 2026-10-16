@@ -277,22 +277,12 @@ and loads whichever repo it reviews.
     author's to run; if it needs an owner-scheduled service window, that is an ASK with
     its cost named (which service goes down, for how long, whether inbound is replayed) —
     never grounds to approve without it, and never a disclosure footnote on an approval.
-    A posted witness is public. It may not quote or closely paraphrase private
-    production content from any participant (owner, agent or third party); use
-    functional labels ("agent A, a status question"). Exact text is fine only when it
-    was written as publication-safe evidence, or cleared for publication. Redacting ids
-    is not enough. Editing a leaked comment is also not enough: anyone with read access
-    can view a comment's edit history ([GitHub docs](https://docs.github.com/en/communities/moderating-comments-and-conversations/tracking-changes-in-a-comment)).
-    So delete and repost it, or delete every sensitive revision from its history, and
-    check replies and reviews that quote or paraphrase it.
     *Grounded by:* #3174 (`fix(discord): suppress recreated task results after delivery`)
     — a Discord delivery-path change approved on its unit suite, then blocked back to
     CHANGES_REQUESTED on review because the delivery path had no post-restart witness. The
     approval read clean on every cheap signal (tests green, diff sensible); only exercising
     the restarted delivery loop end-to-end could have shown whether a recreated result is
-    actually suppressed after a real delivery. The publication rule: #5293's first
-    witness comments redacted room, agent and task IDs yet quoted the owner's
-    question and two agents' answers, and were deleted and reposted with functional labels.
+    actually suppressed after a real delivery.
 
 16. **An authorization or approval is a statement about the object as it stood at its
     timestamp — re-read the current state before acting on it.** Approvals, owner
