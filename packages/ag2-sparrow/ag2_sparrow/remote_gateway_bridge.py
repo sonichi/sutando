@@ -2921,6 +2921,13 @@ def _log_backoff(key: tuple, line: str) -> None:
         _log(line + (f" (seen {n} times)" if n > 1 else ""))
 
 
+def _log_backoff_forget(first: str) -> None:
+    """Drop every count keyed by `first` (a task or item id) once it is done, so the counts
+    stay bounded; the keys are copied first because another thread may be adding one."""
+    for key in [k for k in list(_LOG_COUNTS) if k[:1] == (first,)]:
+        _LOG_COUNTS.pop(key, None)
+
+
 def _post_ack_first(tid: str, lease_id: "str | None") -> str:
     """The durable ack of a staged `ack_first` task: "accepted" (a repeat answers
     `duplicate`); "stale", a newer serve holds the lease, so this one was never accepted;
@@ -4655,6 +4662,7 @@ def _discard_held(tid: str, entry: dict, staged: Path, inflight: "set[str]") -> 
     inflight.discard(tid)
     if not (_save_inflight(inflight) and _put_held(tid, None)):
         return
+    _log_backoff_forget(tid)
     _log(f"ack_first task {tid}: ack refused (withdrawn, expired or served again) "
          "— discarded, never published")
 
@@ -4665,6 +4673,7 @@ def _clear_held(tid: str, why: str = "") -> bool:
     if not (_fsync_in_place(tid, _held_dir(), TASKS_DIR) and _put_held(tid, None)):
         return False
     _HELD_TASKS.pop(tid, None)
+    _log_backoff_forget(tid)
     if why:
         _log(f"ack_first task {tid}: {why}")
     return True

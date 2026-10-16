@@ -656,6 +656,34 @@ class AcknowledgingFirst(_Bridge):
         self.assertEqual([line.rsplit("retrying", 1)[1] for line in retries],
                          ["", " (seen 2 times)", " (seen 4 times)", " (seen 8 times)"])
 
+    def counted(self, tid: str) -> "set[str]":
+        return {k[1] for k in gw._LOG_COUNTS if k[0] == tid}
+
+    def test_a_retired_task_leaves_no_backoff_counts_and_its_next_serve_starts_over(self):
+        gw._LOG_COUNTS[("item-of-another-task", "pending")] = 3
+        # Published after failing acks and an overdue report: every kind of its count goes.
+        self.broker.answers[ASK_A] = ["busy", "busy", "ok"]
+        self.take(voice_ask(ASK_A))
+        self.age(ASK_A, gw.ACK_FIRST_UNRESOLVED_AFTER_S + 1)
+        gw._advance_held_tasks(self.inflight)
+        self.assertEqual(self.counted(ASK_A), {"ack-retry", "ack-status", "overdue"})
+        self.assertTrue(gw._advance_held_tasks(self.inflight))
+        self.assertEqual(self.counted(ASK_A), set())
+        # Discarded after a failing ack: its count goes too.
+        self.broker.answers[ASK_B] = ["busy", "stale"]
+        self.take(voice_ask(ASK_B))
+        self.assertEqual(self.counted(ASK_B), {"ack-retry", "ack-status"})
+        gw._advance_held_tasks(self.inflight)
+        self.assertNotIn(ASK_B, self.manifest())
+        self.assertEqual(self.counted(ASK_B), set())
+        self.assertEqual(gw._LOG_COUNTS, {("item-of-another-task", "pending"): 3})
+        # Served again, the same task's first failing ack logs as a first one.
+        self.lines.clear()
+        self.broker.answers[ASK_B] = ["busy"]
+        self.take(voice_ask(ASK_B, lease="gen-2"))
+        [retry] = [line for line in self.lines if "kept staged, retrying" in line]
+        self.assertNotIn("(seen", retry)
+
     def test_a_staged_task_is_never_dropped_as_abandoned(self):
         self.broker.answers[ASK_A] = ["down"]
         self.take(voice_ask(ASK_A))
