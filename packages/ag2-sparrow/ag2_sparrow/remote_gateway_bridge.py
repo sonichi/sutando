@@ -4539,6 +4539,17 @@ def _discard_held(tid: str, entry: dict, staged: Path, inflight: "set[str]") -> 
          "— discarded, never published")
 
 
+def _clear_held(tid: str, why: str = "") -> bool:
+    """Remove a published task's entry, only once both directories hold its rename: a power
+    loss could otherwise bring the staged name back with no entry to say it was published."""
+    if not (_fsync_in_place(tid, _held_dir(), TASKS_DIR) and _put_held(tid, None)):
+        return False
+    _HELD_TASKS.pop(tid, None)
+    if why:
+        _log(f"ack_first task {tid}: {why}")
+    return True
+
+
 def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
     """Move a staged `ack_first` task on: published once its ack is accepted and recorded,
     discarded once it is refused, otherwise left staged for the next pass. True once published."""
@@ -4549,9 +4560,7 @@ def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
     if not staged.exists():
         # `_publish_staged` consumes the staged file, so only a publish removes it.
         if _held_published(tid, entry, dest):
-            _put_held(tid, None)
-            _HELD_TASKS.pop(tid, None)
-            _log(f"ack_first task {tid}: already published — manifest entry cleared")
+            _clear_held(tid, "already published — manifest entry cleared")
             return False
         _HELD_UNRESOLVED.add(tid)
         if tid not in _HELD_REPORTED:
@@ -4572,8 +4581,14 @@ def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
         # An acceptance that is not on disk keeps the task staged: the next pass acks again.
         if verdict != "accepted" or not _put_held(tid, {**entry, "accepted": True}):
             return False
-    elif tid not in inflight and not _track_durably(tid, inflight):
-        return False
+    else:
+        if tid not in inflight and not _track_durably(tid, inflight):
+            return False
+        if _held_published(tid, entry, dest):
+            # A power loss brought the staged name back after its publish: never publish twice.
+            _drop_staged(staged)
+            _clear_held(tid, "already published — the staged copy left beside it was dropped")
+            return False
     if not _publish_staged(staged, dest):
         return False
     served = _HELD_TASKS.pop(tid, None)
@@ -4582,7 +4597,7 @@ def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
     else:
         _log(f"queued {tid} (staged and acknowledged before a restart)")
         _fire_on_task(tid, dest)
-    _put_held(tid, None)
+    _clear_held(tid)
     return True
 
 

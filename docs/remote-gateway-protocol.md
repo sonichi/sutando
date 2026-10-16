@@ -124,8 +124,11 @@ own, and publishes it to the core only once its ack is accepted:
      and the ack is retried before every poll. Only the ack itself can say whose
      acknowledgement it is, so an ambiguous answer never publishes on the state.
 4. Accepted: the acceptance is recorded in the entry, then the staged file is
-   published to the core, then the entry is removed. An acceptance that cannot
-   be recorded keeps the task staged and unpublished; the next pass acks again.
+   published to the core (a rename into `tasks/`), then both directories are
+   fsync'd, and only then is the entry removed, so a power loss cannot bring the
+   staged name back without the entry that says it was published. An acceptance
+   that cannot be recorded keeps the task staged and unpublished; the next pass
+   acks again.
    Refused: the decision is recorded in the entry first, then the staged file,
    the mark and the in-flight entry go, and the entry goes last, so a crash in
    between finishes the discard on the next pass. The task never reaches the core.
@@ -138,7 +141,9 @@ at start: a staged file whose acceptance is not recorded is acked again and
 decided as above; one whose acceptance is recorded is published without a new ack.
 A staged file that is gone was consumed by its publish: a task file with the same
 digest, a claimed or archived copy, or a result for the task proves it, and the
-entry is cleared without publishing again. With neither, the entry is kept, the
+entry is cleared without publishing again. The same proof beside an accepted
+entry's staged file (a power loss kept the publish and brought the staged name
+back) drops the staged copy instead of publishing it a second time. With neither, the entry is kept, the
 bridge logs an error once, and it reports the entry under `ack_first_unresolved`
 in `state/gateway-status[.<instance>].json` (the bridge's status file for a local
 supervisor) for as long as it stays, together with any malformed entry. At start,
