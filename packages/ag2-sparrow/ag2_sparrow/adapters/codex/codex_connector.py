@@ -56,6 +56,8 @@ def child_env():
 
 def hatch_note(script_text):
     """The NON_OWNER_NOTE a Hatch script defines, with the shell's quote escapes undone."""
+    # Single-line only: a multi-line rewrite of the note does not match and the pin is
+    # used instead, which the byte-identity test then reports.
     m = re.search(r"^NON_OWNER_NOTE='(.*)'$", script_text, re.M)
     return m.group(1).replace("'\"'\"'", "'") if m else None
 
