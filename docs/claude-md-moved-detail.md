@@ -153,7 +153,7 @@ different machines coexist; mtime is the cross-host "is this core alive?"
 signal (younger than ~90s → alive). On SIGTERM/SIGINT the .alive file is
 unlinked so peers see a graceful shutdown immediately.
 
-Payload schema + locality/socket field semantics: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md).
+Payload schema + locality/socket field semantics: [Core liveness payload schema](#core-liveness-payload-schema).
 
 ## Session Continuity
 
