@@ -135,3 +135,6 @@ mtime delta.
   without a non-empty result file, one per tick in name order. One session per
   inbox — two armed sessions would double-submit.
 - Poll granularity 1 s; the model turn dominates latency.
+- The 30-tick stale rule also retires a task whose verifier run or submit
+  keeps rejecting (the file's mtime does not change), with only a debug-log
+  line to show for it; a restart re-scans it.

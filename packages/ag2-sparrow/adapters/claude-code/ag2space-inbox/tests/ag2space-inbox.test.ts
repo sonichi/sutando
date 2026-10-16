@@ -132,6 +132,20 @@ test('reply writes a dotted temp file, renames it, and refuses a second or empty
   expect(bad.isError).toBe(true)
 })
 
+test('an empty result file on disk is not an answer: the task is submitted and replied over', async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-z.txt'] = TASK('task-z')
+  h.files['/out/task-z.txt'] = ''
+  await arm($, h)
+  await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-z', text: 'zed' })
+  expect(String(r.text ?? r.result)).toContain('Wrote /out/task-z.txt')
+  expect(h.files['/out/task-z.txt']).toBe('zed\n')
+  const again = await $.tool.call({ tool: REPLY, task_id: 'task-z', text: 'no' })
+  expect(again.isError).toBe(true)
+})
+
 test('reply uses the armed results_dir when no env is set', async ($, on) => {
   const h = host(on, { env: {} })
   h.files['/in/task-e1.txt'] = TASK('task-e1')
