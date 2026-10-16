@@ -44,6 +44,16 @@ class ArchivedHeadTest(FakeTmuxHarness):
         super().tearDown()
         self.assertEqual(left, [], "a fixture watcher or fswatch outlived the test")
 
+    @staticmethod
+    def _wait_for_busy_attempt(errf_path, name, timeout=30):
+        line = f"composer not empty for {name};"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if line in errf_path.read_text(errors="replace"):
+                return True
+            time.sleep(0.2)
+        return False
+
     def test_an_archived_head_is_dropped_and_the_next_task_proceeds(self):
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
@@ -70,15 +80,18 @@ class ArchivedHeadTest(FakeTmuxHarness):
                 self.assertTrue(self._wait_for_fswatch_attach(),
                                 with_stderr("fswatch never attached to the watched tasks dir"))
                 self.write_task("task-gone.txt")
-                time.sleep(1.5)
+                # Wait on the notifier, not a clock: an announce slower than a fixed sleep
+                # leaves the head unqueued at the unlink, and then there is nothing to drop.
+                self.assertTrue(self._wait_for_busy_attempt(errf_path, "task-gone.txt"),
+                                with_stderr("task-gone.txt was never queued and attempted"))
                 self.assertNotIn("TYPE", self.sendkeys_log_text(),
                                  with_stderr("a busy composer must not have been typed over"))
                 # Archived out of tasks/ with no result anywhere has_result looks.
                 (self.tasks_dir / "task-gone.txt").unlink()
                 self.write_task("task-next.txt")
-                # Outlast CORE_READY_TIMEOUT (3s here) so a delivery attempt begun
-                # before the unlink has given up; the next pick sees the file gone.
-                time.sleep(4.5)
+                # The loop is serial, so an attempt on task-next.txt means the gone head was settled.
+                self.assertTrue(self._wait_for_busy_attempt(errf_path, "task-next.txt"),
+                                with_stderr("task-next.txt was never queued and attempted"))
                 self.assertNotIn("TYPE", self.sendkeys_log_text(),
                                  with_stderr("nothing may be typed while the composer is busy"))
                 self.pane_file.write_text(IDLE_FOOTER + "\n")
