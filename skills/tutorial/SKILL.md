@@ -50,8 +50,9 @@ not retry the page in the same turn.
    - The slot decides where the prompt is pasted (your DM or a room), not the wording.
 
    Pass the file as `--prompts <file>`, and pass the `I picked:` payload verbatim as
-   `--roles "Founder, Product Manager."`. Do not map it to slugs; the script takes labels or slugs
-   and adds a "Picked for: Founder, Product Manager" line under the heading. Otherwise leave both
+   `--roles "Founder, Product Manager."` (the whole line, `I picked:` included, works too). Do not
+   map it to slugs: the script takes labels or slugs and adds a "Picked for: Founder, Product
+   Manager" line under the heading. Otherwise leave both
    out. A missing, bad or partly bad file never fails the run: each slot without a usable prompt
    keeps the generic one.
 3. Create or refresh the page and summon the owner to it:

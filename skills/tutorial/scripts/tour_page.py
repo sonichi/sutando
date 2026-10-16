@@ -98,7 +98,8 @@ FINALE_PROMPT = "Help me plan my week."
 # Slots a --prompts file may fill; the slot, not the text, decides where the prompt is pasted.
 PROMPT_SLOTS = ("dm", "commons", "teamwork", "apps", "import", "finale")
 PROMPT_MAX = 200
-BAD_PROMPT = re.compile(r"[\r\n<>]|://|\bwww\.", re.I)
+BAD_PROMPT = re.compile(r"[\r\n<>]|://|\bwww\.|\b[a-z0-9-]+\.(?:com|net|org|io|ai|dev|app|co|space|edu|gov)\b", re.I)
+PICKED_PREFIX = re.compile(r"^\s*I\s+picked\s*:\s*", re.I)
 ROLE_SLUG = re.compile(r"[a-z0-9][a-z0-9_-]*")
 ROLE_TEXT = re.compile(r"[\w &'.-]{1,40}")
 ROLES_MAX = 6
@@ -239,7 +240,7 @@ def role_labels(roles: object) -> List[str]:
     string (or a list) of persona labels, or slugs when the client had no labels. A slug such as
     `product-manager` reads `Product Manager`; a label keeps its own words. Junk is dropped."""
     if isinstance(roles, str):
-        roles = roles.split(",")
+        roles = PICKED_PREFIX.sub("", roles, count=1).split(",")
     if not isinstance(roles, (list, tuple)):
         return []
     out: Dict[str, str] = {}

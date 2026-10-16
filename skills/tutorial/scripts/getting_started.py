@@ -63,6 +63,7 @@ SUMMON_CONTEXT = "A short tour of AG2 Space, with one thing to try in each part.
 PROFILE_TIMEOUT = 5
 CREATE_ACTION = "room.commons.pages.create"
 SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.I)
+SECRET_SHAPE = re.compile(r"(\bBearer\s+)\S+|\bhttps?://\S+\|\S+", re.I)
 # Each piece is one argv string: under Linux's 131,072-byte per-argument cap and Room Commons'
 # 196,608-byte write.
 CHUNK_BYTES = 120_000
@@ -198,15 +199,16 @@ def chunks(text: str, limit: int = 0) -> List[str]:
 
 
 def redact(text: str, env: Optional[Mapping[str, str]]) -> str:
-    """`text` with the value of every credential-like variable in `env` (and each half of a
-    `url|secret` token) replaced, so an error message never carries a secret."""
+    """`text` with every secret it may carry replaced: the value of each credential-like variable
+    in `env` (and each half of a `url|secret` token), and anything shaped like a bearer token or a
+    `url|secret` pair, so an error message never carries one."""
     secrets = set()
     for key, value in (env or {}).items():
         if SECRET_NAME.search(key) and value:
             secrets.update(v for v in (value, *value.split("|")) if len(v) >= 8)
     for value in sorted(secrets, key=len, reverse=True):
         text = text.replace(value, "[redacted]")
-    return text
+    return SECRET_SHAPE.sub(lambda m: (m.group(1) or "") + "[redacted]", text)
 
 
 def load_prompts(path: Optional[Path]) -> Dict[str, str]:
@@ -306,10 +308,12 @@ class Commons:
             got = self._door.execute(self.room, CREATE_ACTION, {"title": title, "kind": "html", "body": body},
                                      operation_id=operation_id)
         except Exception as exc:  # noqa: BLE001 - any failure leaves the create unresolved, not redone
-            raise PublishError(f"page create {operation_id} did not complete: {exc}") from None
+            raise PublishError(f"page create {operation_id} did not complete: "
+                               f"{redact(str(exc), self.env)}") from None
         kind = got.get("kind") if isinstance(got, dict) else None
         if not isinstance(kind, str) or not kind.startswith("html-"):
-            raise PublishError(f"page create {operation_id} returned no html page kind: {kind!r}")
+            raise PublishError(f"page create {operation_id} returned no html page kind: "
+                               f"{redact(repr(kind), self.env)}")
         return kind
 
     def run(self, *args: str, kind: Optional[str] = None, as_json: bool = False) -> str:
@@ -398,6 +402,13 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             found = commons.reconcile(pages, agent)
             step = ({"action": "adopt", "kind": found, "pending": True} if found
                     else {"action": "create", "kind": None, "pending": False})
+        elif step["action"] == "resume" and candidates(pages):
+            # The create may have landed and the server forgotten its operation id: a page this
+            # agent tagged is that page, so finish it rather than re-issue the create.
+            found = commons.reconcile(pages, agent)
+            if found:
+                _record(marker, rooms, commons.room, {"kind": found, "state": "pending"})
+                step = {"action": "update", "kind": found, "pending": True}
         kind = step["kind"]
         if step["action"] in ("create", "resume"):
             op = step.get("operation_id") or f"tutorial-{uuid.uuid4().hex}"
@@ -508,14 +519,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not script.is_file():
         print(json.dumps({"ok": False, "reason": "room-commons not installed", "path": str(script)}))
         return 3
+    env = commons_env(script)
     try:
-        result = publish(Commons(script, args.room, commons_env(script)), marker_path(_workspace()),
+        result = publish(Commons(script, args.room, env), marker_path(_workspace()),
                          name, args.owner, args.summon,
                          detect_core() if args.core == "auto" else args.core, args.audience,
                          args.agent_mxid or agent_mxid() or None, load_prompts(args.prompts),
                          args.roles)
     except (PublishError, ValueError) as exc:
-        print(json.dumps({"ok": False, "reason": str(exc)}))
+        print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
         return 4
     print(json.dumps({**result, "name": name}))
     return 0

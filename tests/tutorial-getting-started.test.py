@@ -833,6 +833,17 @@ class MainTest(unittest.TestCase):
         self.assertIn("Draft my weekly update.", page)
         self.assertIn("Picked for: Founder", page)
 
+    def test_publish_reason_never_carries_a_credential(self):
+        def leak(*a, **k):
+            raise RuntimeError("401 Authorization: Bearer srvtoken-123456 via https://relay.x.test/r|secretvalue1")
+        self.door.execute = leak
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                 "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
+        self.assertEqual(code, 4)
+        for secret in ("srvtoken-123456", "secretvalue1", "relay.x.test/r|"):
+            self.assertNotIn(secret, out)
+        self.assertIn("did not complete", json.loads(out)["reason"])
+
     def test_publish_without_room_commons_exits_3(self):
         with mock.patch.object(gs, "find_room_commons", return_value=self.tmp / "missing.py"):
             code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex")
@@ -868,7 +879,8 @@ class PersonalTest(unittest.TestCase):
                "unknown-slot": "ignored", "mobile": "not a prompt slot"}
         self.assertEqual(gs.tour_page.clean_prompts(bad), {})
         self.assertEqual(gs.render_page("Blue", "claude", prompts=bad), gs.render_page("Blue", "claude"))
-        self.assertEqual(gs.tour_page.clean_prompts({"dm": " ok ", "apps": "www.example.test"}), {"dm": "ok"})
+        self.assertEqual(gs.tour_page.clean_prompts({"dm": " ok ", "apps": "www.example.test",
+                                                     "commons": "Read example.com for me"}), {"dm": "ok"})
         self.assertEqual(gs.tour_page.clean_prompts(["dm", "x"]), {})
 
     def test_the_slot_decides_where_to_paste_not_the_text(self):
@@ -900,6 +912,8 @@ class PersonalTest(unittest.TestCase):
     def test_roles_take_the_first_contact_payload_as_given(self):
         labels = gs.tour_page.role_labels
         self.assertEqual(labels("Founder, Sales."), ["Founder", "Sales"])  # cinny-webclient#2231's line
+        self.assertEqual(labels("I picked: Founder, Sales."), ["Founder", "Sales"])  # the whole line
+        self.assertEqual(labels("  i PICKED :researcher, founder"), ["Researcher", "Founder"])
         self.assertEqual(labels("Product Manager, Designer."), ["Product Manager", "Designer"])
         self.assertEqual(labels("founder,sales"), ["Founder", "Sales"])  # slugs, when labels were missing
         self.assertEqual(labels("product-manager"), ["Product Manager"])
@@ -1111,8 +1125,9 @@ class PublishTest(unittest.TestCase):
         entry = gs.load_marker(self.marker)[self.ROOM]
         self.assertEqual(entry["state"], "creating")
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("created", "html-p1", True))
-        self.assertEqual(self.door.ops, [entry["operation_id"]] * 2)
+        # the landed page carries this agent's tag, so the rerun finishes it without a second create
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("updated", "html-p1", True))
+        self.assertEqual(self.door.ops, [entry["operation_id"]])
         self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
 
     def test_resumed_create_with_changed_content_rewrites_the_first_body(self):
@@ -1120,9 +1135,36 @@ class PublishTest(unittest.TestCase):
         with self.assertRaises(gs.PublishError):
             self.publish(name="Old")
         out = self.publish(name="New")
-        self.assertEqual((out["action"], out["kind"]), ("created", "html-p1"))
+        self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
         self.assertEqual(self.room()["pages"], {"html-p1": self.page("New")})
-        self.assertEqual(len(set(self.door.ops)), 1)
+        self.assertEqual(len(self.door.ops), 1)
+
+    def test_resume_without_a_listed_tagged_page_reissues_the_same_operation_id(self):
+        self.door.fail = "after"
+        with self.assertRaises(gs.PublishError):
+            self.publish()
+        op = gs.load_marker(self.marker)[self.ROOM]["operation_id"]
+        db = self.room()
+        db["titles"] = {"html-p1": "Untitled page"}  # not yet listed as "Getting started"
+        self.state.write_text(json.dumps(db))
+        out = self.publish(name="Other")  # content changed since the first attempt
+        self.assertEqual(self.door.ops, [op, op])  # the server answers the same operation id
+        self.assertEqual((out["action"], out["kind"]), ("created", "html-p1"))
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page("Other")})
+
+    def test_actions_client_errors_are_redacted(self):
+        commons = gs.Commons(self.stub, self.ROOM, env={"AG2_REMOTE_TOKEN": "https://relay.x.test/r|abcdefghijkl"},
+                             actions=lambda: self)
+        self.execute = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("401 Authorization: Bearer abcdefghijkl at https://relay.x.test/r|abcdefghijkl"))
+        with self.assertRaises(gs.PublishError) as caught:
+            commons.create_page("Getting started", "<p>x</p>", "op-1")
+        said = str(caught.exception)
+        self.assertNotIn("abcdefghijkl", said)
+        self.assertNotIn("relay.x.test/r|", said)
+        self.assertIn("Bearer [redacted]", said)
+        self.assertEqual(gs.redact("token Bearer srv-issued-123 from https://r.test/x|sec", {}),
+                         "token Bearer [redacted] from [redacted]")
 
     def test_create_refused_before_landing_is_retried_with_the_same_operation_id(self):
         self.door.fail = "before"
@@ -1147,10 +1189,10 @@ class PublishTest(unittest.TestCase):
                 self.publish()
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "creating")
         out = self.publish()
-        self.assertEqual((out["action"], out["kind"]), ("created", "html-p1"))
+        self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
         self.assertEqual(list(self.room()["pages"]), ["html-p1"])
         self.assertEqual(self.room()["pages"]["html-p1"], self.page())
-        self.assertEqual(len(set(self.door.ops)), 1)
+        self.assertEqual(len(self.door.ops), 1)
 
     def test_marker_write_failure_after_the_page_is_whole(self):
         real, n = gs.save_marker, {"i": 0}
