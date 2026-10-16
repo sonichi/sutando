@@ -55,9 +55,9 @@ from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these 
 
 SUMMON_CONTEXT = "A short tour of AG2 Space, with one thing to try in each part."
 PROFILE_TIMEOUT = 5
-# Room Commons refuses a page body over 196,608 bytes in one write; larger pages go in pieces.
-CHUNK_BYTES = 150_000
-ARGV_BYTES = 600_000
+# Each piece is one argv string: under Linux's 131,072-byte per-argument cap and Room Commons'
+# 196,608-byte write.
+CHUNK_BYTES = 120_000
 USER_AGENT = "sutando-tutorial/1"
 FALLBACK_NAME = "Sutando"
 MXID = re.compile(r"^@([^:\s]+):([A-Za-z0-9.\-]+(?::\d+)?)$")
@@ -170,18 +170,6 @@ def chunks(text: str, limit: int = 0) -> List[str]:
     return out
 
 
-def changed_bytes(old: str, new: str) -> int:
-    """UTF-8 bytes a replace of `old` by `new` writes once their common prefix and suffix are
-    dropped, as room-commons does before it edits."""
-    p, limit = 0, min(len(old), len(new))
-    while p < limit and old[p] == new[p]:
-        p += 1
-    q = 0
-    while q < limit - p and old[-1 - q] == new[-1 - q]:
-        q += 1
-    return len(old[p:len(old) - q].encode("utf-8")) + len(new[p:len(new) - q].encode("utf-8"))
-
-
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -268,12 +256,11 @@ class Commons:
             self.run("append", self.room, part, kind=kind)
 
     def rewrite(self, kind: str, old: str, new: str) -> None:
-        """Replace the page's text: one edit when the change is small enough to send at once, else
-        clear the page piece by piece and append the new text in pieces."""
+        """Replace the page's text: one edit when both texts fit one argument, else clear the page
+        piece by piece and append the new text in pieces."""
         if not old:
             self.append(kind, new)
-        elif (changed_bytes(old, new) <= CHUNK_BYTES
-              and len(old.encode("utf-8")) + len(new.encode("utf-8")) <= ARGV_BYTES):
+        elif len(old.encode("utf-8")) <= CHUNK_BYTES and len(new.encode("utf-8")) <= CHUNK_BYTES:
             self.run("replace", self.room, old, new, kind=kind)
         else:
             for part in chunks(old):

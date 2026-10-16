@@ -578,11 +578,7 @@ class ChunkTest(unittest.TestCase):
         self.assertEqual("".join(parts), text)
         self.assertTrue(all(len(p.encode("utf-8")) <= 7 for p in parts))
         self.assertEqual(gs.chunks(""), [])
-        self.assertLess(gs.CHUNK_BYTES, 196_608)
-
-    def test_changed_bytes_counts_only_the_middle(self):
-        self.assertEqual(gs.changed_bytes("abcXdef", "abcYYdef"), 3)
-        self.assertEqual(gs.changed_bytes("same", "same"), 0)
+        self.assertLess(gs.CHUNK_BYTES, 131_072)  # Linux MAX_ARG_STRLEN, below Commons' 196,608
 
 
 class AssetTest(unittest.TestCase):
@@ -698,7 +694,7 @@ class PublishTest(unittest.TestCase):
         before = len(self.room()["calls"])
         old = gs.render_page("Sutando", "codex")
         new = gs.render_page("Sutando", "claude")
-        self.assertGreater(gs.changed_bytes(old, new) + len(old) + len(new), gs.ARGV_BYTES)
+        self.assertGreater(len(old.encode()), gs.CHUNK_BYTES)
         out = self.publish(core="claude")
         self.assertEqual(out["action"], "updated")
         calls = self.room()["calls"][before:]
