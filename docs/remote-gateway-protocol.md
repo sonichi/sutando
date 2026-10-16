@@ -146,7 +146,10 @@ entry's staged file (a power loss kept the publish and brought the staged name
 back) drops the staged copy instead of publishing it a second time. With neither, the entry is kept, the
 bridge logs an error once, and it reports the entry under `ack_first_unresolved`
 in `state/gateway-status[.<instance>].json` (the bridge's status file for a local
-supervisor) for as long as it stays, together with any malformed entry. At start,
+supervisor) for as long as it stays, together with any malformed entry and any
+task still staged ten minutes after it was staged (an ack, mark, in-flight or
+publish step that keeps failing). Such a task keeps being retried; the report
+goes once it resolves. At start,
 before the first poll, it also removes each file in its staging directory that no
 entry names (a crash before the entry, inside a discard, or before a newer serve's
 entry replaced an older one). A task served again before its ack replaces its
