@@ -41,8 +41,7 @@ from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # no
 _GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 from _helpers.gateway_relay import Bridges, Relay  # noqa: E402
-from ag2_sparrow import outbox, remote_gateway_bridge as gw  # noqa: E402
-from ag2_sparrow.delivery_core import DeliveryOutcome  # noqa: E402
+from ag2_sparrow import delivery_core, outbox, remote_gateway_bridge as gw  # noqa: E402
 
 CONTRACT = ["voice-outcome-v1"]
 OWNER = "@owner:ag2.space"
@@ -535,7 +534,7 @@ class TheMark(_Bridge):
         """The outbox shows this result delivered, as a pass that crashed before its archive left it."""
         backend = gw._delivery_core().backend
         backend.publish(broker_id, json.dumps({"id": broker_id, "body": "Clear."}).encode())
-        backend.complete(backend.claim(broker_id, "a-crashed-process"), DeliveryOutcome.CONFIRMED)
+        backend.complete(backend.claim(broker_id, "a-crashed-process"), delivery_core.DeliveryOutcome.CONFIRMED)
 
     def test_the_mark_names_the_local_id_on_a_named_instance(self):
         with patch.multiple(gw, GATEWAY_INSTANCE="dev", _INST_SUFFIX=".dev"):
@@ -679,7 +678,7 @@ class ThroughTheLoop(unittest.TestCase):
         self.assertEqual((len(self.staged()), self.entry(), self.relay.acks), (1, {}, []))
         self.relay.queue.append(voice_ask(ASK_A, lease="gen-2"))     # unacked, so served again
         bridge = self.bridges.start()
-        self.bridges.wait_for(self.task.exists, bridge, "the new serve published")
+        self.bridges.wait_for(lambda: self.bridges.fired(), bridge, "the new serve published")
         self.bridges.polls_after(bridge)
         self.bridges.stop(bridge)
         self.assertIn("no ack_first manifest entry names it", self.bridges.log())
@@ -715,7 +714,8 @@ class ThroughTheLoop(unittest.TestCase):
         self.assertNotIn(ASK_A, self.state("remote-task-inflight") or [])
 
     def crash_between_the_publish_and_the_entrys_removal(self, what_the_core_did,
-                                                         resurrect: bool = False) -> None:
+                                                         resurrect: bool = False,
+                                                         settled=lambda: True) -> None:
         """`what_the_core_did` moves the published task as the core would, and returns where
         it is now (None once only its result is left). `resurrect` also brings the staged
         name back, as a power loss before the source directory's fsync can."""
@@ -728,7 +728,7 @@ class ThroughTheLoop(unittest.TestCase):
         copy = what_the_core_did(self.task)
         before = copy.stat() if copy else None
         bridge = self.bridges.start()
-        self.bridges.wait_for(lambda: not self.entry(), bridge, "the entry cleared")
+        self.bridges.wait_for(lambda: not self.entry() and settled(), bridge, "the entry cleared")
         self.bridges.polls_after(bridge)
         self.bridges.stop(bridge)
         if copy is not None:
@@ -766,7 +766,8 @@ class ThroughTheLoop(unittest.TestCase):
         def answer(task):
             task.unlink()
             (self.ws / "results" / task.name).write_text("Your calendar is clear.")
-        self.crash_between_the_publish_and_the_entrys_removal(answer)
+        # The outbound worker posts it on its own cadence, not the poll loop's.
+        self.crash_between_the_publish_and_the_entrys_removal(answer, settled=lambda: self.relay.results)
         self.assertEqual([r["id"] for r in self.relay.results], [ASK_A])
 
     def test_an_updated_bridges_poll_is_served_a_relay_ask_and_an_old_ones_is_not(self):
