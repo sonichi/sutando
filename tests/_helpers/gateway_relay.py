@@ -28,13 +28,18 @@ _TESTS = Path(__file__).resolve().parents[1]
 class Relay:
     """Serves each queued task once. As an AG2 Space broker does, it serves an `ack_first`
     task only to a poll that carries the contract, at most one per response, and serves a
-    poll without it the tasks behind that ask. It refuses the ack of a task in `withdrawn`
-    as a withdrawn lease, and answers results with 503 while `refusing`."""
+    poll without it the tasks behind that ask. It keeps each task's state for
+    `GET /v1/tasks/<id>/status`. The ack of a task in `withdrawn` is refused as not leased,
+    and so is any ack of a task in `lease_ended` (an acknowledged lease the broker ended),
+    whose state stays as it was. Results get a 503 while `refusing`."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.queue: "list[dict]" = []
         self.withdrawn: "set[str]" = set()
+        self.lease_ended: "set[str]" = set()
+        self.state: "dict[str, str]" = {}
+        self.status_reads: "list[str]" = []
         self.polls: "list[str]" = []
         self.served: "list[tuple[str, str]]" = []     # (task id, the poll's query)
         self.acks: "list[str]" = []                    # broker ids, in order
@@ -57,6 +62,14 @@ class Relay:
                 self.wfile.write(body)
 
             def do_GET(self):
+                if self.path.startswith("/v1/tasks/") and self.path.endswith("/status"):
+                    tid = urllib.parse.unquote(self.path.split("/")[-2])
+                    with relay.lock:
+                        relay.status_reads.append(tid)
+                        state = "withdrawn" if tid in relay.withdrawn else relay.state.get(tid)
+                    if state is None:
+                        return self._send(404, {"error": "unknown task"})
+                    return self._send(200, {"id": tid, "state": state})
                 if self.path.startswith("/v1/tasks?"):
                     query = urllib.parse.urlsplit(self.path).query
                     proof = f"capabilities={CONTRACT}" in query.split("&")
@@ -70,6 +83,7 @@ class Relay:
                             tasks.append(task)
                         relay.queue = [t for t in relay.queue if t not in tasks]
                         relay.served.extend((t["id"], query) for t in tasks)
+                        relay.state.update({t["id"]: "served" for t in tasks})
                     if not tasks:
                         time.sleep(0.2)              # a short hold, so an idle loop never spins
                     return self._send(200, {"tasks": tasks})
@@ -86,14 +100,18 @@ class Relay:
                             code, doc = 503, {"error": "unavailable"}
                         else:
                             relay.results.append(payload)
+                            relay.state[str((payload or {}).get("id"))] = "result_ready"
                     elif self.path.endswith("/ack"):
                         tid = urllib.parse.unquote(self.path.split("/")[-2])
                         relay.acks.append(tid)
                         relay.ack_bodies.append(payload)
-                        if tid in relay.withdrawn:
+                        if tid in relay.withdrawn or tid in relay.lease_ended:
                             code, doc = 404, {"error": "not leased to you"}
-                        elif relay.acks.count(tid) > 1:
+                        elif relay.state.get(tid) == "acknowledged":
                             doc = {"ok": True, "durable": True, "duplicate": True}
+                        else:
+                            relay.state[tid] = "acknowledged"
+                            doc = {"ok": True, "durable": True}
                 self._send(code, doc)
 
             do_PUT = do_POST
@@ -124,7 +142,7 @@ leaked = host_reads(reads)
 if leaked:
     sys.exit("the bridge import left its workspace: " + "; ".join(leaked))
 crash = sys.argv[4]
-ack, publish = gw._post_ack_first, gw._publish_staged
+ack, publish, put, mark = gw._post_ack_first, gw._publish_staged, gw._put_held, gw._record_ack_first
 
 def ack_at(tid, lease_id):
     if crash == "before-ack":
@@ -133,6 +151,20 @@ def ack_at(tid, lease_id):
     if crash == "after-ack" and out == "accepted":
         os._exit(17)
     return out
+
+def put_at(tid, entry):
+    staging = isinstance(entry, dict) and not entry.get("accepted") and not entry.get("refused")
+    if crash == "before-entry" and staging:
+        os._exit(17)
+    ok = put(tid, entry)
+    if crash == "after-refusal-recorded" and isinstance(entry, dict) and entry.get("refused"):
+        os._exit(17)
+    return ok
+
+def mark_at(tid):
+    if crash == "before-mark":
+        os._exit(17)
+    return mark(tid)
 
 def publish_at(tmp, path):
     queued = Path(path).parent == gw.TASKS_DIR
@@ -143,7 +175,8 @@ def publish_at(tmp, path):
         os._exit(17)
     return ok
 
-gw._post_ack_first, gw._publish_staged = ack_at, publish_at
+gw._post_ack_first, gw._publish_staged, gw._put_held, gw._record_ack_first = (
+    ack_at, publish_at, put_at, mark_at)
 gw.main()
 """
 

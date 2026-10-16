@@ -103,33 +103,49 @@ it serves with `"ack_first": true`, at most one per response. The bridge handles
 a task served with that exact boolean before the rest of the response, on its
 own, and publishes it to the core only once its ack is accepted:
 
-1. It writes the task file under a temporary name the core does not read, then
-   commits the task's `ack_first` mark and a manifest entry, both fsync'd, then
-   adds the task to the in-flight set. If the file, the mark or the entry does
-   not commit, nothing is staged and nothing is acked, so the broker serves the
-   task again; until the in-flight set commits, the task stays staged, unacked.
-2. It acks the task with `durable: true` and the served `lease_id`.
-3. An accepted ack (`200`, or `200` with `"duplicate": true` for a repeat)
-   publishes the task file to the core, and the manifest entry is removed after
-   the publish. A refused ack (`404 {"error": "not leased …"}`, with or without
-   `"reason": "stale lease generation"`: the ask was withdrawn, expired or served
-   again) discards the staged file, the manifest entry and the mark, and the
-   task never reaches the core. Any other answer, or a network error, keeps the
-   task staged; its ack is retried before every poll.
+1. It writes the task file into `tasks/.ack-first[.<instance>]/`, where neither
+   the core (which reads `tasks/*.txt`) nor a task-file lookup looks, fsyncs that
+   directory and `tasks/`, and commits a manifest entry. If any of these does not
+   commit, nothing is staged and nothing is acked, so the broker serves the task
+   again. Every later step resumes from the entry.
+2. Before the ack it commits the task's `ack_first` mark, then the in-flight set.
+   Until both commit, the task stays staged and unacked.
+3. It acks the task with `durable: true` and the served `lease_id`, and decides:
+   - `200` (also `"duplicate": true` for a repeat): accepted;
+   - `404` with `"reason": "stale lease generation"`: refused. A newer serve holds
+     the lease, and an acknowledged ask is never served again, so this serve was
+     never accepted;
+   - `404 {"error": "not leased …"}` without that reason, or any other answer:
+     the bridge asks `GET /v1/tasks/<id>/status`. `withdrawn`, `dead` or
+     `result_ready` (the ask ended, or was answered elsewhere) is refused;
+     `acknowledged` after the plain `404` is accepted (no lease is left, so no
+     other serve can hold that acknowledgement); anything else, an unreadable
+     status, or `acknowledged` after an ambiguous answer keeps the task staged,
+     and the ack is retried before every poll. Only the ack itself can say whose
+     acknowledgement it is, so an ambiguous answer never publishes on the state.
+4. Accepted: the acceptance is recorded in the entry, then the staged file is
+   published to the core, then the entry is removed. An acceptance that cannot
+   be recorded keeps the task staged and unpublished; the next pass acks again.
+   Refused: the decision is recorded in the entry first, then the staged file,
+   the mark and the in-flight entry go, and the entry goes last, so a crash in
+   between finishes the discard on the next pass. The task never reaches the core.
 
 The manifest is `state/remote-task-ack-first-manifest[.<instance>].json`, keyed by
 the local id; each entry names the broker id, the `lease_id`, the staged and
 destination file names, a SHA-256 digest of the task file, and whether the ack
-was accepted. At start, before the first poll, the bridge resumes each entry: a
-staged file whose ack is not yet recorded as accepted is acked again (the broker
-answers a repeat with `duplicate`) and then published or discarded as above; one
-whose ack was accepted is published without a new ack, so a lease the broker has
-since ended cannot discard a task it holds as acknowledged. A staged file that
-is gone was consumed by its publish: a task file with the same digest, a claimed
-or archived copy, or a result for the task proves it, and the entry is cleared
-without publishing again. With neither, the entry is kept and the bridge logs an
-error rather than guess. A task served again before its ack replaces its entry,
-so only the newest serve's lease is acked.
+was accepted or refused. The bridge resumes each entry before every poll, so also
+at start: a staged file whose acceptance is not recorded is acked again and
+decided as above; one whose acceptance is recorded is published without a new ack.
+A staged file that is gone was consumed by its publish: a task file with the same
+digest, a claimed or archived copy, or a result for the task proves it, and the
+entry is cleared without publishing again. With neither, the entry is kept, the
+bridge logs an error once, and it reports the entry under `ack_first_unresolved`
+in `state/gateway-status[.<instance>].json` (the bridge's status file for a local
+supervisor) for as long as it stays, together with any malformed entry. At start,
+before the first poll, it also removes each file in its staging directory that no
+entry names (a crash before the entry, inside a discard, or before a newer serve's
+entry replaced an older one). A task served again before its ack replaces its
+entry, so only the newest serve's lease is acked.
 
 **The `ack_first` mark.** `state/remote-task-ack-first[.<instance>].json` maps the
 broker id of each task served with `ack_first` to the local id it is published
@@ -137,10 +153,12 @@ under. It is a file of its own because an older bridge prunes the media sidecar
 when it settles a task, and the mark must survive a restart: it decides whether
 an honoured fold sends `consolidated_into` (see `POST /v1/results`). A mark is
 removed once the broker has accepted that task's result and the result is
-archived, at start when the outbox shows that result delivered and no result of
-the task is still live, or when its ack is refused, since such a task never
-reached the core. An older bridge never reads or writes the file. A task served
-without `ack_first` is unchanged.
+archived; at start when the outbox shows that result delivered and no result of
+the task, or of a re-ask answering it, is still live (while the dedup alias
+ledger cannot be read, no mark is retired at start); or when its ack is refused,
+since such a task never reached the core and can never produce a result. An
+older bridge never reads or writes the file. A task served without `ack_first`
+is unchanged.
 
 ### `POST /v1/tasks/<id>/ack`
 
@@ -155,11 +173,11 @@ delivery should treat ack as "stop redelivering"; the client is idempotent and
 will not re-queue a task it already claimed or archived.
 
 `durable: true` is sent only once the task file, its media sidecar and the
-in-flight set are all fsync'd (for an `ack_first` task, the staged file, its mark
-and its manifest entry too), so the task survives a crash of this host. When a
-fresh queue write, its media sidecar, the in-flight set or the pending-ack
-ledger does not commit, the client withholds the ack entirely rather than
-claiming a task it could still lose. The flag is merely absent — a plain ack the
+in-flight set are all fsync'd (for an `ack_first` task, the staged file and its
+directory, its manifest entry and its mark too), so the task survives a crash of
+this host. When a fresh queue write, its media sidecar, the in-flight set or the
+pending-ack ledger does not commit, the client withholds the ack entirely rather
+than claiming a task it could still lose. The flag is merely absent — a plain ack the
 server should treat as "stop redelivering" and nothing more — when a redelivered
 task is already queued and its durability could not be repaired. Acks that do
 not confirm are persisted and retried; a per-task `404 {"error": "not leased …"}`
@@ -170,7 +188,8 @@ on every serve), the ack echoes it — also on a retry after a restart, since th
 pending-ack ledger keeps it — and a `404 {"reason": "stale lease generation"}`
 retires that ack the same way; a task served without one is acked without the key.
 An `ack_first` task is not in the pending-ack ledger: its manifest entry is its
-retry record, because an accepted ack must also publish it (see `GET /v1/tasks`).
+retry record, because an accepted ack must also publish it, and its `404` is
+decided with the task's status rather than retired (see `GET /v1/tasks`).
 
 ### `POST /v1/results`
 
