@@ -23,6 +23,8 @@ row it lands or observes marks the store as used.
 from __future__ import annotations
 
 import hashlib
+import time
+from contextlib import contextmanager, nullcontext
 import json
 import re
 import subprocess
@@ -200,11 +202,27 @@ class ScriptDbClient:
 
     def __init__(self, argv: list, timeout: float = 90.0):
         self.argv, self.timeout = list(argv), timeout
+        self._deadline = None
+
+    @contextmanager
+    def operation(self):
+        previous = self._deadline
+        deadline = time.monotonic() + self.timeout
+        self._deadline = min(previous, deadline) if previous is not None else deadline
+        try:
+            yield
+        finally:
+            self._deadline = previous
 
     def _call(self, req: dict):
+        timeout = self.timeout
+        if self._deadline is not None:
+            timeout = min(timeout, self._deadline - time.monotonic())
+            if timeout <= 0:
+                raise StoreError("room database: operation deadline exceeded")
         try:
             r = subprocess.run(self.argv, input=json.dumps(req), capture_output=True,
-                               text=True, timeout=self.timeout)
+                               text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             raise StoreError(f"room database: no reply within {self.timeout:.0f}s") from None
         except OSError as e:
@@ -287,6 +305,9 @@ class RoomDbStore:
         self.last_link: Optional[str] = None
         self._keys: dict = {}
 
+    def operation(self):
+        return getattr(self.client, "operation", nullcontext)()
+
     def _rid(self, ask_id: str) -> str:
         """This host's row for `ask_id`: the existing one it owns, else a new key that carries
         the host, so two hosts' rows for one ask id are two rows, never one shared row."""
@@ -317,13 +338,17 @@ class RoomDbStore:
     def complete(self, ask_id: str) -> bool:
         """The row is present, carries this exact ask id (and this host), has a body and no
         incomplete mark: the confirmation an outbox entry is deleted on."""
-        r = self.client.row(DB_SCHEMA, self._rid(ask_id))
+        rid = self._rid(ask_id)
+        r = self.client.row(DB_SCHEMA, rid)
         if not r or not (r.get("body") or "").strip():
             return False
         cells = r.get("cells") or {}
         if cells.get("ask_id") != ask_id or not self.owns(cells):
             return False
-        return _mark(cells, "recovery") != INCOMPLETE
+        if _mark(cells, "recovery") == INCOMPLETE:
+            return False
+        self._keys[ask_id] = rid
+        return True
 
     def _locked(self, fn):
         if self.lock is None:
