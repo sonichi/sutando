@@ -4,13 +4,14 @@
 Every result carries `capabilities: ["voice-outcome-v1"]` with an explicit
 `dm_only`: an updated broker treats a relay ask's result without them as private,
 because an older bridge strips the core's `[dm-only]` line and posts the rest. An
-honoured fold of a task this process saw served with `ack_first` (a voice relay
-ask) names the task it was folded into, by the BROKER id the lane knows, in
-`consolidated_into`. Typed and Signal tasks keep today's bare close: the broker
-already acts on `consolidated_into` for any task. A re-ask and a report are
-unchanged, also when the holder itself closed by an honoured fold.
+honoured fold of a task served with `ack_first` (a voice relay ask), whose mark is
+kept on disk, names the task it was folded into, by the BROKER id the lane knows, in
+`consolidated_into`, also after a restart. Typed and Signal tasks keep today's bare
+close: the broker already acts on `consolidated_into` for any task. A re-ask and a
+report are unchanged, also when the holder itself closed by an honoured fold.
 
-Drives the real `_write_task`, `_post_ready_results`, the orphan sweep and the HITL
+Drives the real `_write_task` (a relay ask through `_take_ack_first`, acknowledged
+before it is published), `_post_ready_results`, the orphan sweep and the HITL
 control-result retry. A restart runs the real poll loop (`main()`) in fresh
 processes over one workspace, against a relay on a real socket.
 
@@ -21,13 +22,10 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,6 +39,7 @@ sys.path.insert(0, str(_TESTS))
 from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
 _GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
+from _helpers.gateway_relay import Bridges, Relay  # noqa: E402
 from ag2_sparrow import outbox, remote_gateway_bridge as gw  # noqa: E402
 
 CONTRACT = ["voice-outcome-v1"]
@@ -59,7 +58,8 @@ UNVERIFIED = ("⚠️ The holder's delivery destination or sender could not be v
 # Every per-instance ledger the drain reads, named as the bridge names it.
 _LEDGERS = {"INFLIGHT_FILE": "remote-task-inflight", "TASK_ROOMS_FILE": "remote-task-rooms",
             "TASK_MEDIA_FILE": "remote-task-media", "PENDING_ACK_FILE": "remote-task-acks",
-            "DEDUP_ALIAS_FILE": "remote-dedup-alias"}
+            "DEDUP_ALIAS_FILE": "remote-dedup-alias", "ACK_FIRST_FILE": "remote-task-ack-first",
+            "ACK_FIRST_MANIFEST_FILE": "remote-task-ack-first-manifest"}
 
 
 def voice_ask(broker_id: str, ack_first=True,
@@ -117,7 +117,7 @@ class _Bridge(unittest.TestCase):
             OWNER_ACTIVITY_FILE=state / "last-owner-activity.json",
             _DELIVERY_CORE=None, _req=self.broker.request, _log=self.lines.append,
             _WITHHELD_TASK_OUTPUT={}, _SETTLE_PENDING=set(), _SETTLE_SCANNED=set(),
-            _SETTLE_LOADED=False, _REDELIVERED=set(), _ACK_FIRST_SERVED=set(),
+            _SETTLE_LOADED=False, _REDELIVERED=set(), _HELD_TASKS={}, _HELD_REPORTED=set(),
             **{name: state / f"{stem}{suffix}.json" for name, stem in _LEDGERS.items()})
         stack = contextlib.ExitStack()
         for name, value in values.items():
@@ -128,7 +128,12 @@ class _Bridge(unittest.TestCase):
     # ── the poll loop's half, the core's half, the drain ─────────────────────
 
     def serve(self, task: dict) -> str:
-        """Queue a served task as the poll loop does: written, then durably in flight."""
+        """Queue a served task as the poll loop does: a relay ask staged, acknowledged and
+        published; any other task written, then durably in flight."""
+        if task.get("ack_first") is True:
+            published = gw._take_ack_first(dict(task), set(gw._load_inflight()))
+            self.assertTrue(published, "the relay ask was not published")
+            return gw._local_tid(task["id"])
         written = gw._write_task(dict(task))
         self.assertIsNotNone(written, "the served task was not queued")
         tid, durable = written
@@ -307,21 +312,79 @@ class HonouredFold(_Bridge):
             self.assertEqual(gw._fold_target(asker, ASK_B, "task-dev~ask-other"), "ask-other")
             self.assertEqual(gw._fold_target(asker, ASK_B, ASK_A), "")
 
-    def test_a_fold_for_an_already_accepted_ask_closes_like_a_suppression(self):
-        # The fold rides its own close record, as the bare marker's no_send does.
+    def accepted_then_folded(self, keep_mark: bool) -> "tuple[str, set]":
+        """The asker's answer is accepted, then the core folds it as a second reply."""
         holder = self.serve(voice_ask(ASK_A))
         asker = self.serve(voice_ask(ASK_B))
         self.answer(asker, "Your calendar is clear.")
         self.drain(asker)
+        self.assertNotIn(ASK_B, gw._load_ack_first(), "the accepted result kept its mark")
+        if keep_mark:
+            gw._record_ack_first(asker)              # a retirement that did not commit
         self.answer(holder, "[REPLIED]")
         self.answer(asker, f"[deduped: {holder}]")
-        inflight = self.drain(asker)
+        return asker, self.drain(asker)
+
+    def test_a_fold_for_an_already_accepted_ask_closes_like_a_suppression(self):
+        # Its mark went with the accepted answer; the close rides its own record.
+        asker, inflight = self.accepted_then_folded(keep_mark=False)
+        self.assertEqual(self.broker.results()[-1], {
+            "id": ASK_B, "body": f"[deduped: {ASK_A}]", "no_send": True,
+            "capabilities": CONTRACT, "dm_only": False})
+        self.assertTrue(self.accepted(f"{ASK_B}.lease-close"))
+        self.assertNotIn(asker, inflight)
+        self.assertEqual(list(gw.UNDELIVERABLE_RESULTS_DIR.glob("*")), [],
+                         "the close was quarantined as an unsent reply")
+
+    def test_a_fold_with_a_mark_left_after_acceptance_rides_its_own_close_record(self):
+        # The fold posts nothing either, so it closes an accepted id as no_send does.
+        asker, inflight = self.accepted_then_folded(keep_mark=True)
         self.assertEqual(self.broker.results()[-1]["consolidated_into"], ASK_A)
         self.assertEqual(len(self.broker.results()), 2)
         self.assertTrue(self.accepted(f"{ASK_B}.lease-close"))
         self.assertNotIn(asker, inflight)
         self.assertEqual(list(gw.UNDELIVERABLE_RESULTS_DIR.glob("*")), [],
                          "the close was quarantined as an unsent reply")
+
+    def test_a_fold_whose_archive_failed_is_sent_again_with_consolidated_into(self):
+        # The mark is retired after the archive, so the re-run keeps the fold's shape.
+        asker, _holder = self.fold(voice_ask(ASK_B), voice_ask(ASK_A))
+        real = gw._archive_result
+        with patch.object(gw, "_archive_result", side_effect=[False]):
+            inflight = self.drain(asker)
+        self.assertIn(asker, inflight)
+        self.assertIn(ASK_B, gw._load_ack_first())
+        with patch.object(gw, "_archive_result", side_effect=real):
+            inflight = self.drain(asker)
+        self.assertNotIn(asker, inflight)
+        self.assertEqual([p.get("consolidated_into") for p in self.broker.results()], [ASK_A, ASK_A])
+        self.assertNotIn(ASK_B, gw._load_ack_first(), "the archived fold kept its mark")
+
+    def test_unreadable_marks_defer_a_voice_asks_fold(self):
+        for content in ("{not json", "[]"):
+            with self.subTest(content=content):
+                self.broker.calls.clear()
+                asker, _holder = self.fold(voice_ask(f"{ASK_B}{len(content)}"),
+                                           voice_ask(f"{ASK_A}{len(content)}"))
+                gw.ACK_FIRST_FILE.write_text(content)
+                inflight = self.drain(asker)
+                self.assertEqual(self.broker.results(), [])
+                self.assertIn(asker, inflight)
+                gw.ACK_FIRST_FILE.unlink()
+
+    def test_unreadable_marks_never_stall_a_typed_fold(self):
+        # Only a voice ask can carry a mark, so a typed fold closes as before.
+        holder = self.serve(typed_task(TYPED_A))
+        self.answer(holder, "the full answer")
+        self.drain(holder)
+        asker = self.serve(typed_task(TYPED_B))
+        self.answer(asker, f"[deduped: {holder}]")
+        gw.ACK_FIRST_FILE.write_text("{not json")
+        inflight = self.drain(asker)
+        self.assertEqual(self.broker.results()[-1], {
+            "id": TYPED_B, "body": f"[deduped: {holder}]", "no_send": True,
+            "capabilities": CONTRACT, "dm_only": False})
+        self.assertNotIn(asker, inflight)
 
 
 class ReAskAndReport(_Bridge):
@@ -402,6 +465,7 @@ class ReAskAndReport(_Bridge):
         self.assertEqual(self.broker.results(), [
             {"id": ASK_B, "body": UNVERIFIED, "capabilities": CONTRACT, "dm_only": False}])
         self.assertNotIn(asker, inflight)
+        self.assertEqual(gw._load_ack_first(), {ASK_A: holder}, "the accepted report kept its mark")
 
 
 class NamedInstance(_Bridge):
@@ -447,149 +511,39 @@ class NamedInstance(_Bridge):
         self.assertEqual(self.broker.results(), [
             {"id": ASK_A, "body": gw._RECOVERED_LABEL + "Your 3pm is with Dana.",
              "capabilities": CONTRACT, "dm_only": True}])
-
-
-class _Relay:
-    """A relay on a real socket for a bridge process to poll: it serves each queued
-    task once, records every ack and accepted result, and refuses results while
-    `refusing` with a 503, which the bridge retries."""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.queue: "list[dict]" = []
-        self.acks: "list[str]" = []
-        self.results: "list[dict]" = []
-        self.refused = 0
-        self.refusing = False
-        relay = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *_a):
-                pass
-
-            def _send(self, code: int, doc: dict) -> None:
-                body = json.dumps(doc).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_GET(self):
-                if self.path.startswith("/v1/tasks?"):
-                    with relay.lock:
-                        tasks, relay.queue = relay.queue, []
-                    if not tasks:
-                        time.sleep(0.2)              # a short hold, so an idle loop never spins
-                    return self._send(200, {"tasks": tasks})
-                self._send(200, {"agents": []} if self.path == "/v1/agents" else {})
-
-            def do_POST(self):
-                size = int(self.headers.get("Content-Length") or 0)
-                payload = json.loads(self.rfile.read(size)) if size else None
-                with relay.lock:
-                    refuse = self.path == "/v1/results" and relay.refusing
-                    if refuse:
-                        relay.refused += 1
-                    elif self.path == "/v1/results":
-                        relay.results.append(payload)
-                    elif self.path.endswith("/ack"):
-                        relay.acks.append(self.path)
-                if refuse:
-                    return self._send(503, {"error": "unavailable"})
-                self._send(200, {"ok": True, "delivery_readable": True})
-
-            do_PUT = do_POST
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-
-    @property
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self.server.server_address[1]}"
-
-    def close(self) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-
-
-# One bridge process: the hermetic import over a shared workspace, then the real loop.
-_BRIDGE = r"""
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from _helpers.hermetic_gateway import host_reads, isolate_then_import
-gw, reads = isolate_then_import(root=Path(sys.argv[2]), env={
-    "REMOTE_TASK_URL": sys.argv[3], "REMOTE_TASK_POLL_WAIT": "1", "SUTANDO_BRIDGE_LOCK": "0"})
-leaked = host_reads(reads)
-if leaked:
-    sys.exit("the bridge import left its workspace: " + "; ".join(leaked))
-gw.main()
-"""
+        self.assertEqual(gw._load_ack_first(), {}, "the recovered result kept its mark")
 
 
 class AfterARestart(unittest.TestCase):
-    """A private result posted by a restarted bridge, through the real poll loop."""
+    """Results posted by a restarted bridge, through the real poll loop."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="voice-outcome-loop-")
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
-        self.relay = _Relay()
+        self.relay = Relay()
         self.addCleanup(self.relay.close)
-        self.runs = 0
+        self.bridges = Bridges(self, self.root, self.relay)
+        self.ws = self.bridges.ws
 
-    def start(self) -> "subprocess.Popen":
-        """A fresh bridge process; it shares only the workspace with any before it."""
-        self.runs += 1
-        log = open(self.root / f"bridge-{self.runs}.log", "w")
-        self.addCleanup(log.close)
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith("SUTANDO_") and k != "GATEWAY_INSTANCE"}
-        proc = subprocess.Popen(
-            [sys.executable, "-c", _BRIDGE, str(_TESTS), str(self.root / "ws"), self.relay.url],
-            env=env, stdout=log, stderr=subprocess.STDOUT)
-        self.addCleanup(self.stop, proc)
-        return proc
-
-    def stop(self, proc: "subprocess.Popen") -> None:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=15)
-
-    def wait_for(self, done, proc: "subprocess.Popen", what: str, timeout: float = 60.0) -> None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if done():
-                return
-            if proc.poll() is not None:
-                break
-            time.sleep(0.1)
-        log = (self.root / f"bridge-{self.runs}.log").read_text(errors="replace")[-3000:]
-        self.fail(f"{what}: not seen (bridge exit {proc.poll()}); its log ends:\n{log}")
-
-    def serve_once(self) -> "subprocess.Popen":
-        """A first bridge takes the relay ask and acknowledges it."""
-        self.relay.queue.append(voice_ask(ASK_A))
-        first = self.start()
-        self.wait_for(lambda: self.relay.acks, first, "the first bridge's ack")
-        self.assertTrue((self.root / "ws" / "tasks" / f"{ASK_A}.txt").exists())
-        return first
+    def serve_once(self, *broker_ids: str) -> None:
+        """A first bridge takes each relay ask, acknowledges and publishes it, and stops."""
+        self.relay.queue.extend(voice_ask(b) for b in broker_ids or (ASK_A,))
+        first = self.bridges.start()
+        for broker_id in broker_ids or (ASK_A,):
+            self.bridges.wait_for((self.ws / "tasks" / f"{broker_id}.txt").exists, first,
+                                  f"{broker_id} published")
+        self.bridges.stop(first)
 
     def write_private_answer(self) -> None:
-        (self.root / "ws" / "results" / f"{ASK_A}.txt").write_text("[dm-only]\nYour 3pm is with Dana.")
+        (self.ws / "results" / f"{ASK_A}.txt").write_text("[dm-only]\nYour 3pm is with Dana.")
 
     def test_a_private_answer_that_landed_while_the_bridge_was_down(self):
-        first = self.serve_once()
-        self.stop(first)
+        self.serve_once()
         self.write_private_answer()
-        second = self.start()
-        self.wait_for(lambda: self.relay.results, second, "the restarted bridge's result")
-        self.stop(second)
+        second = self.bridges.start()
+        self.bridges.wait_for(lambda: self.relay.results, second, "the restarted bridge's result")
+        self.bridges.stop(second)
         self.assertEqual(self.relay.results, [
             {"id": ASK_A, "body": "Your 3pm is with Dana.", "capabilities": CONTRACT,
              "dm_only": True}])
@@ -597,19 +551,40 @@ class AfterARestart(unittest.TestCase):
     def test_a_private_answer_refused_before_the_restart_is_resent_with_dm_only(self):
         # A retry resends the payload stored at the first attempt, so it must hold dm_only.
         self.relay.refusing = True
-        first = self.serve_once()
+        self.relay.queue.append(voice_ask(ASK_A))
+        first = self.bridges.start()
+        self.bridges.wait_for((self.ws / "tasks" / f"{ASK_A}.txt").exists, first, "the publish")
         self.write_private_answer()
-        self.wait_for(lambda: self.relay.refused, first, "the refused first send")
-        self.stop(first)
-        stored = json.loads(outbox.read_item(self.root / "ws" / "results" / ".outbox", ASK_A)["payload"])
+        self.bridges.refused_result_recorded(first, ASK_A)
+        self.bridges.stop(first)
+        stored = json.loads(outbox.read_item(self.ws / "results" / ".outbox", ASK_A)["payload"])
         self.relay.refusing = False
-        second = self.start()
-        self.wait_for(lambda: self.relay.results, second, "the restarted bridge's resend")
-        self.stop(second)
+        second = self.bridges.start()
+        self.bridges.wait_for(lambda: self.relay.results, second, "the restarted bridge's resend")
+        self.bridges.stop(second)
         self.assertEqual(self.relay.results, [
             {"id": ASK_A, "body": "Your 3pm is with Dana.", "capabilities": CONTRACT,
              "dm_only": True}])
         self.assertEqual(self.relay.results[0], stored, "the restart did not resend the stored payload")
+
+    def test_a_fold_after_a_restart_still_sends_consolidated_into(self):
+        self.serve_once(ASK_A, ASK_B)
+        (self.ws / "results" / f"{ASK_A}.txt").write_text("[REPLIED]")
+        (self.ws / "results" / f"{ASK_B}.txt").write_text(f"[deduped: {ASK_A}]")
+        # Only the asker in flight: a room-less holder whose own close is accepted first
+        # is no longer verifiable, and the planner reports instead.
+        (self.ws / "state" / "remote-task-inflight.json").write_text(json.dumps([ASK_B]))
+        second = self.bridges.start()
+        self.bridges.wait_for(lambda: self.relay.results, second, "the restarted bridge's fold")
+        marks = self.ws / "state" / "remote-task-ack-first.json"
+        self.bridges.wait_for(lambda: ASK_B not in json.loads(marks.read_text()), second,
+                              "the fold's mark retired after its archive")
+        self.bridges.stop(second)
+        self.assertEqual(self.relay.results, [
+            {"id": ASK_B, "body": "", "consolidated_into": ASK_A, "capabilities": CONTRACT,
+             "dm_only": False}])
+        self.assertEqual(json.loads(marks.read_text()), {ASK_A: ASK_A},
+                         "the holder's mark went although its result was never accepted")
 
 
 class BridgeImportIsHermetic(unittest.TestCase):
