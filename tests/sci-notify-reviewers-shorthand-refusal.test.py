@@ -129,8 +129,9 @@ class Shorthand(unittest.TestCase):
         self.assertGreater(len(self.calls), 0, 'the ask must actually be sent')
 
     def test_CONTROL_an_ask_with_no_pr_at_all_still_sends(self):
-        rc, _ = self._run("can you look at the roster when you get a moment?")
-        self.assertEqual(rc, 0, "an ask need not concern a PR; refusing it breaks the tool")
+        rc, _ = self._run("can you look at the roster when you get a moment?",
+                          extra=["--no-repo", "roster question, no code"])
+        self.assertEqual(rc, 0, "an ask need not concern a PR; --no-repo says so explicitly")
         self.assertGreater(len(self.calls), 0, 'the ask must actually be sent')
 
     def test_a_notice_is_not_refused(self):

@@ -513,6 +513,11 @@ def main() -> int:
                     help="room the conversation is actually in. When given, a reviewer whose "
                          "Stand is not a member THERE is REFUSED rather than silently notified "
                          "in their recorded room — correctly addressed, wrong venue.")
+    ap.add_argument("--repo", metavar="OWNER/NAME", default=None,
+                    help="repo whose access to check when the message names no PR URL "
+                         "(a patch reviewed before it is a PR)")
+    ap.add_argument("--no-repo", dest="no_repo", metavar="REASON", default="",
+                    help="deliberately send an ask that is about no repository")
     a = ap.parse_args()
     a.message = resolve_body(a.message, a.body_file)
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
@@ -523,15 +528,13 @@ def main() -> int:
     # ask the repo named in the message rather than trusting a cached tier.
     if a.kind == "ask" and targets:
         refs = _PR_URL.findall(a.message or "")
-        if not refs:
-            # Every other refusal path here prints; the one case that cannot be
-            # checked must not be the one case that is silent.
+        repo = refs[0][0] if refs else a.repo
+        if not repo:
             print("gate capability NOT CHECKED: the message names no "
                   "github.com/<owner>/<repo>/pull/<n> URL, so there is no repo to "
                   "ask about — an unchecked send is not a checked one",
                   file=sys.stderr)
-        if refs:
-            repo = refs[0][0]
+        if repo:
             roster_now = load_roster()
             kept = []
             for t in targets:
@@ -572,6 +575,12 @@ def main() -> int:
                   "only full github.com/<owner>/<repo>/pull/<n> URLs, so pr-unattended would "
                   "read the PR as never asked. Refused reference(s), and the form that works: "
                   + "; ".join(f"{tok} -> {fix}" for tok, fix in loose), file=sys.stderr)
+            return 7
+        # A patch shared before it is a PR still lives in a repo the reviewer may not see.
+        if not _PR_URL.findall(a.message or "") and not a.repo and not a.no_repo:
+            print("REFUSED: pass --repo OWNER/NAME so each reviewer's access is checked, "
+                  "or --no-repo '<reason>' if this ask concerns no repository.",
+                  file=sys.stderr)
             return 7
     stale, why = _stale_repeat_ask(a.message, targets, load_roster()) if a.kind == "ask" else (False, "")
     if stale and not a.widen_override:
