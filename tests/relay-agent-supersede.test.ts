@@ -39,10 +39,25 @@ describe('the supersede rule, over any table of requests', () => {
 		assert.deepEqual(plan('5302 "release notes"', rows), picks('task-a'), 'the newer request lacks the name');
 	});
 
-	it('a mark is the whole number: 5167 is not 51167', () => {
-		const rows: Rows = [['task-a', { text: 'Check PR #51167', submittedAt: ago(1_000) }]];
-		assert.deepEqual(plan('5167', rows), nothing('no_match'));
+	it('a mark is the whole number or the whole quoted name, never a part of one', () => {
+		const rows: Rows = [['task-a', { text: 'Check PR #51167 and "Release notes v2" and release notes', submittedAt: ago(1_000) }]];
+		assert.deepEqual(plan('1167', rows), nothing('no_match'));
+		assert.deepEqual(plan('5116', rows), nothing('no_match'));
+		assert.deepEqual(plan('"release notes"', rows), nothing('no_match'));
+		assert.deepEqual(plan('"release notes v2"', rows), picks('task-a'));
 		assert.deepEqual(plan('51167', rows), picks('task-a'));
+	});
+
+	it('a g or y idPattern is not advanced: repeated calls agree and the caller\'s pattern is untouched', () => {
+		const rows: Rows = [
+			['req-5302-a', { text: 'Summarize the budget', submittedAt: ago(3_000) }],
+			['req-6001-b', { text: 'Check PR 5302', submittedAt: ago(2_000) }],
+		];
+		for (const flags of ['g', 'y']) {
+			const idPattern = new RegExp('^req-\\d+-[a-z]$', flags);
+			for (let k = 0; k < 4; k++) assert.deepEqual(plan('req-5302-a', rows, { idPattern }), picks('req-5302-a'), `${flags} call ${k}`);
+			assert.equal(idPattern.lastIndex, 0);
+		}
 	});
 
 	it('what names nothing is told apart from what nothing matches', () => {
@@ -158,6 +173,16 @@ describe('RelayAgent applies the plan', () => {
 		await tick(5);
 		assert.equal(store.get('task-1')?.supersededBy, undefined);
 		assert.ok(logs.some((l) => l.includes('task-new1: no unheard request carries "9999"; nothing corrected')), logs.join('\n'));
+	});
+
+	it('it passes its own clock and task id: an old request is out of reach and a correction never supersedes itself', async () => {
+		const { relay, store, logs } = agent();
+		store.add('task-old', 'Check PR 7001', Date.now() - SUPERSEDE_WINDOW_MS - 60_000);
+		void relay.invoke('w', { task: 'Check PR 7001, not the old one', replaces: '7001' });
+		await tick(5);
+		assert.equal(store.get('task-old')?.supersededBy, undefined);
+		assert.equal(store.get('task-new1')?.supersededBy, undefined);
+		assert.ok(logs.some((l) => l.includes('task-new1: no unheard request carries "7001"; nothing corrected')), logs.join('\n'));
 	});
 
 	it('the request the plan picks is marked, its call ends, and the log says so', async () => {

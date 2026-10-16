@@ -229,7 +229,9 @@ const TASK_ID = /^task-\d+$/;
  */
 export function planSupersede(i: SupersedeInput): SupersedePlan {
 	const since = i.now - SUPERSEDE_WINDOW_MS;
-	const byId = (i.idPattern ?? TASK_ID).test(i.replaces);
+	// A copy without g/y: `.test` on the caller's own pattern would move its lastIndex.
+	const form = i.idPattern ?? TASK_ID;
+	const byId = new RegExp(form.source, form.flags.replace(/[gy]/g, '')).test(i.replaces);
 	const marks = byId ? [] : requestMarks(i.replaces);
 	if (!byId && marks.length === 0) return { action: 'none', why: 'names_nothing' };
 	const target = i.rows
@@ -726,7 +728,8 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	 * has its result left unsaid and its waiting call ended.
 	 */
 	private supersede(taskId: string, replaces: string): void {
-		const plan = planSupersede({ taskId, replaces, rows: this.deps.store.list(), now: Date.now() });
+		const now = Date.now();
+		const plan = planSupersede({ taskId, replaces, rows: this.deps.store.list(), now });
 		if (plan.action === 'none') {
 			this.deps.log?.(plan.why === 'names_nothing'
 				? `[RelayAgent] ${taskId}: "replaces" names no task or number (${replaces}); nothing corrected`
