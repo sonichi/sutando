@@ -214,7 +214,7 @@ class TheRule(_Bridge):
     def test_a_window_that_runs_out_during_a_send_is_reopened_too(self):
         self.older_window_runs_out(failures=4)       # parked by the failed send itself
 
-    def test_a_refused_failed_result_is_retried_never_parked(self):
+    def test_a_failed_refused_too_ends_the_result_and_nothing_revives_it(self):
         ask = self.serve(voice_ask())
         typed = self.serve(typed_task())
         self.answer(ask)
@@ -222,31 +222,65 @@ class TheRule(_Bridge):
         self.broker.result = "400"
         clock = [time.time()]
         gw._delivery_core("relay").backend.clock = lambda: clock[0]
-        for _pass in range(8):
-            self.drain()
+        for _pass in range(6):
+            inflight = self.drain()
+            gw._save_inflight(inflight)
             clock[0] += 60.0
         self.assertEqual(item(self.outbox_root, TYPED_A)["reason"], "permanent-refusal",
                          "a typed result no longer parks on a refusal")
-        self.assertEqual([n.split("-")[0] for n in self.quarantined()], ["task"])
+        # The answer refused, the `failed` in its place refused too: sent once each, then ended.
+        self.assertEqual([p for p in self.broker.results() if p["id"] == ASK_A], [ANSWER, FAILED])
         record = item(self.outbox_root, ASK_A)
-        self.assertNotEqual(record["status"], "PARKED")
-        self.assertEqual(json.loads(record["payload"]), FAILED)
-        self.assertEqual(json.loads(record["refused_payload"]), ANSWER)
-        self.assertGreaterEqual(record["retry"]["failures"], 8)
-        self.assertNotIn("requeue_reason", record, "it was parked on the way")
-        relay_posts = [p for p in self.broker.results() if p["id"] == ASK_A]
-        self.assertEqual(relay_posts, [ANSWER] + [FAILED] * 7, "the answer was sent more than once")
-        self.assertEqual(sum("is sent in its place" in line for line in self.lines), 1,
-                         "a refused `failed` was swapped again")
-        # Eight misses log on a backoff (the 1st, 2nd, 4th, 8th), not each one; a typed result as before.
-        unconfirmed = [line for line in self.lines if line.startswith("result POST not confirmed for ask-")]
+        self.assertEqual((record["status"], record["reason"]), ("PARKED", gw.REFUSED_FOR_GOOD))
+        self.assertEqual((json.loads(record["payload"]), json.loads(record["refused_payload"])),
+                         (FAILED, ANSWER))
+        self.assertEqual(record["resend_epoch"], 1, "the `failed` shares the refused answer's epoch")
+        self.assertEqual(sorted(n.split("-")[0] for n in self.quarantined()), ["ask", "task"])
+        self.assertFalse((gw.RESULTS_DIR / f"{ask}.txt").exists())
+        self.assertEqual(gw._load_ack_first(), {}, "the mark outlived the end")
+        self.assertNotIn(ask, gw._load_inflight(), "the in-flight id outlived the end")
+        self.assertEqual(sum(line.startswith(f"ERROR result {ask}: the broker refused") for line in self.lines), 1)
+        # A restart: the reclaim, the keep pass and the drain revive nothing, and post nothing.
+        inflight = set(gw._load_inflight())
+        gw._reclaim_parked_relay_results(inflight)
+        self.assertFalse(gw._keep_relay_results_in_flight(inflight))
+        gw._post_ready_results(inflight)
+        self.assertEqual([p for p in self.broker.results() if p["id"] == ASK_A], [ANSWER, FAILED])
+        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+
+    def test_misses_are_logged_on_a_backoff(self):
+        ask = self.serve(voice_ask())
+        self.answer(ask)
+        self.broker.result = "down"
+        clock = [time.time()]
+        gw._delivery_core("relay").backend.clock = lambda: clock[0]
+        for _pass in range(8):
+            self.drain()
+            clock[0] += 60.0
+        # Eight misses log the 1st, 2nd, 4th and 8th time, with the count; never parked.
+        unconfirmed = [line for line in self.lines if line.startswith(f"result POST not confirmed for {ask}")]
         self.assertEqual([line.rsplit("(seen ", 1)[-1] for line in unconfirmed[1:]],
                          ["2 times)", "4 times)", "8 times)"])
-        self.broker.result = "ok"
-        self.assertNotIn(ask, self.drain())
-        self.assertEqual(self.broker.results()[-1], FAILED)
-        self.assertEqual(self.quarantined()[0].split("-")[0], "task")
-        self.assertEqual(len(self.quarantined()), 1, "the relay ask's answer was quarantined")
+        self.assertEqual(len(unconfirmed), 4)
+        self.assertNotEqual(item(self.outbox_root, ASK_A)["status"], "PARKED")
+
+    def test_a_crash_after_the_end_never_lets_the_reclaim_revive_it(self):
+        ask = self.serve(voice_ask())
+        self.answer(ask)
+        self.broker.result = "400"
+        clock = [time.time()]
+        gw._delivery_core("relay").backend.clock = lambda: clock[0]
+        with patch.object(gw, "_forget_ack_first"):    # died before the mark went
+            for _pass in range(3):
+                self.drain()
+                clock[0] += 60.0
+        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+        self.assertEqual(gw._load_ack_first(), {ASK_A: ask})
+        [copy] = self.quarantined()
+        gw._reclaim_parked_relay_results(set())
+        self.assertEqual(item(self.outbox_root, ASK_A)["status"], "PARKED", "the reclaim requeued it")
+        self.assertEqual((self.quarantined(), gw._load_ack_first()), ([copy], {}))
+        self.assertFalse((gw.RESULTS_DIR / f"{ask}.txt").exists())
 
     def test_a_close_of_an_accepted_id_keeps_todays_policy(self):
         # The broker already took this task's result: no `failed` may follow it.
@@ -316,17 +350,17 @@ class TheRule(_Bridge):
         typed_waits = [line for line in self.lines if line.startswith(f"result {typed}: pending retry")]
         self.assertEqual(len(typed_waits), 8, "a typed result's wait is no longer logged as before")
 
-    def test_a_refused_payload_that_names_no_task_is_retried_as_it_is(self):
-        for stored in ("not json", json.dumps({"body": "no id"}), json.dumps({"id": ""})):
-            self.assertEqual(gw._failed_in_place_of(stored), stored)
+    def test_a_refused_payload_with_no_failed_to_swap_in_ends_at_once(self):
+        for stored in ("not json", json.dumps({"body": "no id"}), json.dumps({"id": ""}), json.dumps(FAILED)):
+            self.assertIsNone(gw._failed_in_place_of(stored))
         self.assertEqual(json.loads(gw._failed_in_place_of(json.dumps(ANSWER))), FAILED)
-        # Through the outbox: a malformed envelope is refused for good, and kept and retried as it is.
+        # Through the outbox: a malformed envelope is refused for good, and nothing names a task.
         core = gw._delivery_core("relay")
         core.backend.publish(ASK_A, b"not json")
         core.deliver_one(ASK_A, b"not json")
         record = item(self.outbox_root, ASK_A)
-        self.assertEqual((record["status"], record["payload"], record["retry"]["failures"]),
-                         ("READY", "not json", 1))
+        self.assertEqual((record["status"], record["reason"], record["payload"]),
+                         ("PARKED", gw.REFUSED_FOR_GOOD, "not json"))
         self.assertNotIn("refused_payload", record)
 
     def test_only_a_parked_result_is_reopened(self):
@@ -633,6 +667,23 @@ class NoCeiling(_Loop):
         self.assertEqual(self.archived(ASK_A), [PRIVATE], "the answer was not kept in the archive")
         self.assertEqual(item(self.outbox_root, TYPED_A)["reason"], "permanent-refusal")
         self.assertEqual([n.split("-")[0] for n in self.quarantined()], ["task"])
+
+    def test_a_failed_refused_too_ends_and_a_restart_does_not_revive_it(self):
+        self.relay.on_result = lambda p: (400, {"error": "unknown task"})
+        first = self.serve(voice_ask())
+        (self.results / f"{ASK_A}.txt").write_text(PRIVATE)
+        self.bridges.wait_for(lambda: self.quarantined() and not self.state("remote-task-ack-first")
+                              and ASK_A not in self.state("remote-task-inflight"), first, "the result ended")
+        self.bridges.stop(first)
+        self.assertEqual(self.posted(), [ANSWER, FAILED])
+        second = self.bridges.start()
+        self.bridges.polls_after(second, 5)
+        self.bridges.stop(second)
+        self.assertEqual(self.posted(), [ANSWER, FAILED], "the restart revived it")
+        record = item(self.outbox_root, ASK_A)
+        self.assertEqual((record["status"], record["reason"]), ("PARKED", gw.REFUSED_FOR_GOOD))
+        self.assertEqual(len(self.quarantined()), 1)
+        self.assertEqual(self.relay.results, [])
 
     def test_a_restart_between_the_refusal_and_the_acceptance_changes_nothing(self):
         def refuse_then_go_down(payload):

@@ -318,6 +318,7 @@ from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
                             RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
+from .delivery_core import REFUSED_FOR_GOOD
 from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_response_refused
 from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
                                               RESULT_THREAD_FIELD)
@@ -4453,6 +4454,9 @@ def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
         resumed = (record.get("status") in ("READY", "QUEUED")
                    and record.get("requeue_reason") == _RELAY_RECLAIMED)
         target = RESULTS_DIR / f"{local}.txt"
+        if parked and record.get("reason") == REFUSED_FOR_GOOD:
+            _forget_ack_first(broker_id)            # the rule's own end: its mark outlived a crash
+            continue
         if not (parked or resumed) or os.path.lexists(target):
             continue
         copy = _parked_copy(local)
@@ -5511,19 +5515,18 @@ _RELAY_REOPENED = "relay result: retried until the broker accepts it"
 _RELAY_RECLAIMED = "relay result an older bridge parked: reclaimed at start"
 
 
-def _failed_in_place_of(stored: str) -> str:
+def _failed_in_place_of(stored: str) -> "str | None":
     """The minimal `failed` result for the task whose stored payload the broker refused for
     good: the outbox stores it in place of that payload and retries it the same way, so the
-    broker ends the ask and posts "couldn't finish". A refused `failed` stays as it is."""
+    broker ends the ask and posts "couldn't finish". None, which ends the result, for a
+    payload that names no task or is itself a `failed`."""
     try:
         doc = json.loads(stored)
     except (TypeError, ValueError):
         doc = None
     rid = doc.get("id") if isinstance(doc, dict) else None
-    if not (isinstance(rid, str) and rid):
-        return stored                           # nothing names the task: retried as it is
-    if doc.get("status") == "failed":
-        return stored
+    if not (isinstance(rid, str) and rid) or doc.get("status") == "failed":
+        return None
     _log(f"result {rid}: the broker refused it for good — a `failed` result for the same task "
          "is sent in its place, retried until the broker accepts it")
     return json.dumps({"id": rid, "body": "", "status": "failed", **_result_contract(False)})
@@ -6036,7 +6039,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
                 return False
             return True
         if relay:
-            _reopen_relay_result(core, item_id, tid, record)
+            _reopen_relay_result(core, item_id, tid, record, result_file, generation)
             return False
         # The outbox has decided this item; no pass will ever claim it again,
         # so retrying logs forever and hides the failure behind "will retry".
@@ -6071,7 +6074,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     record = read_item(core.backend.root, item_id) or {}
     if record.get("status") == "PARKED":
         if relay:
-            _reopen_relay_result(core, item_id, tid, record)
+            _reopen_relay_result(core, item_id, tid, record, result_file, generation)
             return False
         # Parked by this very attempt: dispose now, or the next pass logs the
         # refusal a second time before the file leaves the drain's view.
@@ -6104,12 +6107,16 @@ def _relay_result(tid: str, broker_id: str) -> "bool | None":
     return broker_id in marks
 
 
-def _reopen_relay_result(core, item_id: str, tid: str, record: dict) -> None:
-    """A relay ask's result never ends on the Mac alone. A park the relay rule could not
-    prevent (the 10-minute window an older bridge started before the Mac updated, or a
-    refusal it recorded) is requeued under the rule; a refused payload, sent again, is
-    refused again and swapped for `failed` then."""
+def _reopen_relay_result(core, item_id: str, tid: str, record: dict, result_file=None,
+                         generation=None) -> None:
+    """A park the relay rule could not prevent (the 10-minute window an older bridge started
+    before the Mac updated, or a refusal it recorded) is requeued under the rule; a refused
+    payload, sent again, is refused again and swapped for `failed` then. The rule's own end,
+    the broker refusing the `failed` too, is never reopened: see `_end_relay_result`."""
     if record.get("status") != "PARKED":
+        return
+    if record.get("reason") == REFUSED_FOR_GOOD:
+        _end_relay_result(core, item_id, tid, record, result_file, generation)
         return
     outcome, _ = requeue_item_with_epoch(core.backend.root, item_id, reset_attempts=True,
                                          operator=core.worker, reason=_RELAY_REOPENED)
@@ -6117,13 +6124,26 @@ def _reopen_relay_result(core, item_id: str, tid: str, record: dict) -> None:
          f"it is retried until the broker accepts it ({outcome.value})")
 
 
+def _end_relay_result(core, item_id: str, tid: str, record: dict, result_file, generation) -> None:
+    """The broker refused the answer and the `failed` in its place for good: no retry can
+    change that. The result is quarantined as any park is, and the mark retired, so neither the
+    reclaim nor the keep pass revives it; the drain then settles the task and its in-flight id."""
+    _dispose_terminal(core, item_id, tid, record, result_file, generation)
+    _forget_ack_first(item_id)
+    _log(f"ERROR result {tid}: the broker refused the answer and the `failed` sent in its place "
+         f"for good ({REFUSED_FOR_GOOD}); it is not retried, and its relay mark is retired")
+
+
 def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None" = None) -> bool:
     """A delivered id whose remaining reply the owner kept for a person or
-    archived has nothing left to deliver: its task is settled."""
+    archived has nothing left to deliver: its task is settled. So is a relay
+    result the broker refused for good, whose result is quarantined."""
     root = getattr(_delivery_core().backend, "root", None)
     if root is None or os.path.lexists(rfile):
         return False                            # something is still live at the name: keep looking
-    if (read_item(root, item_id) or {}).get("status") != "DELIVERED":
+    record = read_item(root, item_id) or {}
+    if not (record.get("status") == "DELIVERED"
+            or (record.get("status") == "PARKED" and record.get("reason") == REFUSED_FOR_GOOD)):
         return False
     return _settle_task(tid, inflight)
 

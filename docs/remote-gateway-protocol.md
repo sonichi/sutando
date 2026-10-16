@@ -533,17 +533,26 @@ claim.
 A result posted under the id of a task whose `ack_first` mark is kept (see
 `GET /v1/tasks`), a re-ask's answer included, has no window and no attempt cap:
 it is retried, durably across restarts, under the same id and payload, until the
-broker accepts it, and it never ends on the Mac alone.
+broker accepts it, or refuses for good both the answer and the `failed` sent in
+its place (below).
 
 - A 401 or 403 is retried while the poll loop recovers the credential, as above,
   for as long as that takes.
 - A 408, 425, 429, a 5xx or a transport failure keeps the same result, retried
   under its id with the same backoff (2 s doubling to 30 s).
 - A definite refusal of the payload (any other 4xx, or a decline envelope) swaps
-  in a minimal `failed` result for the same task (the `failed` body above), stored
-  in place of the refused payload, which the record keeps as `refused_payload`.
-  It is retried the same way, so the broker ends the ask and posts "couldn't
+  in a minimal `failed` result for the same task (the `failed` body above), once.
+  It is stored in place of the refused payload, which the record keeps as
+  `refused_payload`, under a new resend epoch, so it has an idempotency key of its
+  own. It is retried the same way, so the broker ends the ask and posts "couldn't
   finish". Once it is accepted the live result is archived as usual.
+- If the broker refuses that `failed` for good too (it no longer knows the task,
+  say), no retry can change it, and the result ends. The item is parked as
+  `refused-for-good`, the result is quarantined to `results/undelivered/` with the
+  outbox's requeue command, as any park is, and the task's mark and in-flight id are
+  retired, logged once as an `ERROR`. Neither the drain, the pass that puts results
+  back in flight, nor the reclaim at start revives it. A refused payload that names
+  no task, so that no `failed` can be built, ends the same way at once.
 - A park the rule could not prevent, such as the 10-minute window an older bridge
   started before the Mac updated, is requeued with its retry state reset when the
   drain meets it, rather than quarantined.
