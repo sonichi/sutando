@@ -177,9 +177,8 @@ class Adapter:
         self.endpoint = "%s/v1/claude_code/routines/%s/fire" % (args.api_base.rstrip("/"), args.trigger_id)
         self.limiter = RateLimiter(os.path.join(args.state, "fires.json"), args.max_per_hour, clock)
         self.done_path = os.path.join(args.state, "done")
-        self.attempts = {}     # task id -> failed pre-send attempts
-        self.limited = {}      # task id -> 429s received
-        self.not_before = {}   # task id -> earliest next try
+        self.attempts, self.limited = {}, {}   # task id -> pre-send failures, 429s
+        self.not_before = {}
         self.hold_path = os.path.join(args.state, "hold.json")
         try:
             with open(self.hold_path, encoding="utf-8") as f:
