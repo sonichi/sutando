@@ -340,6 +340,63 @@ class AcknowledgingFirst(_Bridge):
             self.assertFalse(self.take(voice_ask(ASK_B)))
         self.assertEqual((self.staged(ASK_B), list(self.manifest())), ([], [ASK_A]))
 
+    def test_the_rename_is_on_disk_in_both_directories_before_the_entry_goes(self):
+        events: "list" = []
+        fsync, publish, put = gw._fsync_in_place, gw._publish_staged, gw._put_held
+        fail_after_publish = {"left": 1}
+
+        def fsync_at(tid, *targets):
+            published = "publish" in events
+            events.append(("fsync", targets))
+            if published and fail_after_publish["left"]:
+                fail_after_publish["left"] -= 1
+                return False                         # the source directory did not commit
+            return fsync(tid, *targets)
+
+        def publish_at(tmp, path):
+            if Path(path).parent == gw.TASKS_DIR:        # not a state file's durable write
+                events.append("publish")
+            return publish(tmp, path)
+
+        def put_at(tid, entry):
+            events.append(("put", None if entry is None else "entry"))
+            return put(tid, entry)
+
+        with patch.multiple(gw, _fsync_in_place=fsync_at, _publish_staged=publish_at, _put_held=put_at):
+            self.assertTrue(self.take(voice_ask(ASK_A)))
+            after = events[events.index("publish") + 1:]
+            self.assertEqual(after, [("fsync", (gw._held_dir(), gw.TASKS_DIR))],
+                             "the entry went before both directories held the rename")
+            self.assertIs(self.manifest()[ASK_A]["accepted"], True)
+            self.assertFalse(gw._advance_held_tasks(self.inflight))   # the next pass: fsync, then clear
+        after = events[events.index("publish") + 2:]
+        self.assertEqual(after[-2:], [("fsync", (gw._held_dir(), gw.TASKS_DIR)), ("put", None)])
+        self.assertEqual((self.manifest(), self.fired, len(self.broker.acks())), ({}, [ASK_A], 1))
+
+    def test_a_staged_copy_beside_its_published_copy_is_dropped_not_published_again(self):
+        # A power loss can keep the publish's new name and bring back the staged one.
+        (gw.TASKS_DIR / "archive").mkdir()
+        where = {"queued": lambda t: t,
+                 "claimed": lambda t: t.rename(t.with_name(f"{t.stem}.claimed-core-1")),
+                 "archived": lambda t: t.rename(gw.TASKS_DIR / "archive" / t.name)}
+        for n, (name, move) in enumerate(where.items()):
+            with self.subTest(name):
+                ask = f"{ASK_C}{n}"
+                self.broker.answers[ask] = ["down"]
+                self.take(voice_ask(ask))
+                [staged] = self.staged(ask)
+                task = gw.TASKS_DIR / f"{ask}.txt"
+                task.write_text(staged.read_text())
+                gw.ACK_FIRST_MANIFEST_FILE.write_text(json.dumps(
+                    {ask: {**self.manifest()[ask], "accepted": True}}))
+                copy = move(task)
+                before = copy.stat()
+                self.assertFalse(gw._advance_held_tasks(self.inflight))
+                self.assertEqual((self.staged(ask), self.manifest(), self.fired), ([], {}, []))
+                self.assertEqual(copy.stat().st_ino, before.st_ino, "the task was published again")
+                self.assertEqual(task.exists(), name == "queued")
+                self.assertEqual(len(self.broker.acks()), n + 1, "an accepted task was acked again")
+
     def test_a_staged_task_is_invisible_to_the_queue_and_to_its_lookups(self):
         self.broker.answers[ASK_A] = ["down"]
         self.take(voice_ask(ASK_A))
@@ -657,13 +714,17 @@ class ThroughTheLoop(unittest.TestCase):
         self.assertNotIn(ASK_A, self.state("remote-task-ack-first"))
         self.assertNotIn(ASK_A, self.state("remote-task-inflight") or [])
 
-    def crash_between_the_publish_and_the_entrys_removal(self, what_the_core_did) -> None:
+    def crash_between_the_publish_and_the_entrys_removal(self, what_the_core_did,
+                                                         resurrect: bool = False) -> None:
         """`what_the_core_did` moves the published task as the core would, and returns where
-        it is now (None once only its result is left)."""
+        it is now (None once only its result is left). `resurrect` also brings the staged
+        name back, as a power loss before the source directory's fsync can."""
         self.relay.queue.append(voice_ask(ASK_A))
         self.bridges.crashed(self.bridges.start(crash="after-publish"), "after the publish")
         self.assertTrue(self.task.exists())
         self.assertEqual((self.staged(), self.entry().get("accepted")), ([], True))
+        if resurrect:
+            (self.ws / "tasks" / ".ack-first" / self.entry()["staged"]).write_text(self.task.read_text())
         copy = what_the_core_did(self.task)
         before = copy.stat() if copy else None
         bridge = self.bridges.start()
@@ -691,6 +752,15 @@ class ThroughTheLoop(unittest.TestCase):
             (task.parent / "archive").mkdir()
             return task.rename(task.parent / "archive" / task.name)
         self.crash_between_the_publish_and_the_entrys_removal(archive)
+
+    def test_a_staged_copy_back_beside_the_published_one_after_a_power_loss_runs_once(self):
+        self.crash_between_the_publish_and_the_entrys_removal(lambda task: task, resurrect=True)
+
+    def test_the_same_with_the_task_archived_by_the_core_runs_once(self):
+        def archive(task):
+            (task.parent / "archive").mkdir()
+            return task.rename(task.parent / "archive" / task.name)
+        self.crash_between_the_publish_and_the_entrys_removal(archive, resurrect=True)
 
     def test_the_same_crash_with_the_task_answered_by_the_core_runs_it_once(self):
         def answer(task):
