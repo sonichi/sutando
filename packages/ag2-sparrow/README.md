@@ -224,7 +224,9 @@ tagging anyone by full Matrix ID (`@name:server`), never a short `@name`.
 `--answering` names the message the reply answers: 3 or more consecutive words
 of it, or 4 or more consecutive characters of text written without spaces such
 as Chinese, Japanese or Thai (the whole message when shorter; case, punctuation and @-mentions do not
-count, and neither do the sender prefix or a quoted reply fallback). A wake can
+count, and neither do the sender prefix or a quoted reply fallback). A message
+with no words, such as one that is only emoji, is named by quoting all of it
+exactly, punctuation included: `👍!` is not answered by `👍`. A wake can
 list several items, and the command refuses, writing nothing, a reply whose
 words are not the message of the item whose `result_file` it names, and points
 to the item they do belong to; so an answer run against another item's

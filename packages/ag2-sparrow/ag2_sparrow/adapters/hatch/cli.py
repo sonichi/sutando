@@ -691,7 +691,8 @@ def _weight(tokens: list) -> int:
 def answers(body: str, quoted: str) -> bool:
     """Whether `quoted` is ANSWERING_MIN_WORDS or more consecutive words of the message in
     `body` (ANSWERING_MIN_CHARS characters of text written without spaces, such as Chinese,
-    Japanese or Thai; all of it when shorter); case, punctuation and @-mentions do not count."""
+    Japanese or Thai; all of it when shorter); case, punctuation and @-mentions do not count.
+    A message with no words (e.g. only emoji) is named only by all of it, punctuation included."""
     message = message_text(body)
     have, want = _words(message), _words(quoted)
     if not have:  # no words at all, e.g. a lone emoji: only the whole message names it

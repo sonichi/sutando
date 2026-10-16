@@ -1700,6 +1700,20 @@ class ReplyBinding(Base):
         self.assertFalse(hatch_cli.answers(f"[AG2Space Chi] {both}", f"[AG2Space Chi] {up}"))
         self.assertFalse(hatch_cli.answers(f"[AG2Space Chi] {up}", f"[AG2Space Chi] {up}"))
 
+    def test_a_message_without_words_counts_its_punctuation(self):
+        up = "\U0001F44D"
+        self.assertFalse(hatch_cli.answers(f"[AG2Space Chi] {up}!", up))
+        self.assertTrue(hatch_cli.answers(f"[AG2Space Chi] {up}!", f"{up}!"))
+        self.assertFalse(hatch_cli.answers(f"[AG2Space Chi] {up}?", f"{up}!"))
+
+    def test_an_emoji_answer_without_its_punctuation_writes_nothing(self):
+        tid = "task-1784700000008"
+        self.add_task(tid, "$a", sender="@chi:ag2.space", mtime=1007, body="\U0001F44D!")
+        r = self.reply(str(self.results / f"{tid}.txt"), "--answering", "\U0001F44D",
+                       "--body", "@chi:ag2.space yes", "--wait", "0")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
+
     def test_the_message_replied_to_does_not_bind_the_reply(self):
         tid = "task-1784700000005"
         body = broker_reply_body("@ann:ag2.space", "please review the hatch pull request",
