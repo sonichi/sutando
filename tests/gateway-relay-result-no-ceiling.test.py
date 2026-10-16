@@ -181,6 +181,33 @@ class _Bridge(unittest.TestCase):
         d = gw.UNDELIVERABLE_RESULTS_DIR
         return sorted(p.name for p in d.iterdir() if not p.name.startswith(".")) if d.is_dir() else []
 
+    def backoff_counts(self, *ids: str) -> "list[tuple]":
+        return sorted(k for k in gw._LOG_COUNTS if k[0] in ids)
+
+    def delivered_after_waiting(self, body: str = PRIVATE) -> str:
+        """A relay result that waited in every way that counts (misses, waits inside the
+        backoff, the marks unreadable), then delivered; its counts are checked on the way."""
+        ask = self.serve(voice_ask())
+        self.answer(ask, body)
+        self.broker.result = "down"
+        clock = [time.time()]
+        gw._delivery_core("relay").backend.clock = lambda: clock[0]
+        for _pass in range(3):
+            self.drain()                                 # a miss, then two waits inside its backoff
+        clock[0] += 60.0
+        self.drain()                                     # a second miss
+        marks = gw.ACK_FIRST_FILE.read_text()
+        gw.ACK_FIRST_FILE.write_text("{not json")
+        self.drain()                                     # deferred while the marks cannot be read
+        gw.ACK_FIRST_FILE.write_text(marks)
+        gw._LOG_COUNTS[("another-task", "pending")] = 3
+        self.assertEqual(self.backoff_counts(ASK_A, ask),
+                         sorted({(ASK_A, "pending"), (ASK_A, "unconfirmed"), (ask, "deferred")}))
+        self.broker.result = "ok"
+        clock[0] += 60.0
+        self.assertNotIn(ask, self.drain())
+        return ask
+
 
 class TheRule(_Bridge):
     """Which results get the relay rule, and what it does where today's policy parks."""
@@ -240,6 +267,7 @@ class TheRule(_Bridge):
         self.assertEqual(gw._load_ack_first(), {}, "the mark outlived the end")
         self.assertNotIn(ask, gw._load_inflight(), "the in-flight id outlived the end")
         self.assertEqual(sum(line.startswith(f"ERROR result {ask}: the broker refused") for line in self.lines), 1)
+        self.assertEqual(self.backoff_counts(ASK_A, ask), [], "counts outlived the end")
         self.assertIn(f"result {ask}: its relay result's end is complete; its task is settled and its relay "
                       "mark retired", self.lines)
         # A restart: the reclaim, the keep pass and the drain revive nothing, and post nothing.
@@ -249,6 +277,18 @@ class TheRule(_Bridge):
         gw._post_ready_results(inflight)
         self.assertEqual([p for p in self.broker.results() if p["id"] == ASK_A], [ANSWER, FAILED])
         self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+
+    def test_a_delivered_relay_results_backoff_counts_go_and_its_cadence_restarts(self):
+        ask = self.delivered_after_waiting()
+        self.assertEqual(self.backoff_counts(ASK_A, ask), [], "counts outlived the delivery")
+        self.assertEqual(gw._LOG_COUNTS[("another-task", "pending")], 3, "another task's count went")
+        gw._log_backoff((ASK_A, "unconfirmed"), "the next miss")
+        self.assertEqual(self.lines[-1], "the next miss", "the cadence did not start over")
+
+    def test_a_closed_relay_asks_backoff_counts_go_too(self):
+        ask = self.delivered_after_waiting("[no-send]")  # a skip: the close is the delivery
+        self.assertEqual(self.broker.results()[-1]["no_send"], True)
+        self.assertEqual(self.backoff_counts(ASK_A, ask), [], "counts outlived the close")
 
     def test_misses_are_logged_on_a_backoff(self):
         ask = self.serve(voice_ask())
@@ -399,6 +439,24 @@ for _answer in ("408", "425", "429", "502", "down"):
 
 class TheRuleOnANamedInstance(_Bridge):
     INSTANCE = "dev"
+
+    def test_a_delivered_relay_results_backoff_counts_go_by_both_ids(self):
+        ask = self.delivered_after_waiting()
+        self.assertNotEqual(ask, ASK_A)
+        self.assertEqual(self.backoff_counts(ASK_A, ask), [], "counts outlived the delivery")
+
+    def test_an_ended_relay_results_backoff_counts_go_by_both_ids(self):
+        ask = self.serve(voice_ask())
+        self.answer(ask)
+        self.broker.result = "400"
+        clock = [time.time()]
+        gw._delivery_core("relay").backend.clock = lambda: clock[0]
+        for _pass in range(3):
+            gw._save_inflight(self.drain())
+            clock[0] += 60.0
+        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+        self.assertEqual(gw._load_ack_first(), {})
+        self.assertEqual(self.backoff_counts(ASK_A, ask), [], "counts outlived the end")
 
     def outside_the_in_flight_set(self, age: float) -> "tuple[str, str]":
         ask = self.serve(voice_ask())
@@ -609,6 +667,7 @@ class EndCutShort(_Bridge):
         with patch.multiple(gw, _SETTLE_PENDING=set(), _SETTLE_SCANNED=set(), _SETTLE_LOADED=False):
             gw._reclaim_parked_relay_results(set(gw._load_inflight()))
             self.assertEqual(gw._load_ack_first(), {})
+            self.assertEqual(self.backoff_counts(ASK_A, ask), [], "counts outlived the finished end")
             self.assertNotIn(ask, gw._load_inflight())
             self.assertIsNone(gw.find_task_file(gw.TASKS_DIR, ask), "the task was left in the queue")
             self.assertEqual(len(self.quarantined()), 1)

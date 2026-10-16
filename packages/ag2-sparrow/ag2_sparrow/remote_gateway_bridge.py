@@ -4456,7 +4456,7 @@ def _finish_relay_end(core, broker_id: str, local: str, record: dict, inflight: 
             return
     if not _save_inflight(inflight):
         return
-    _log_relay_end(local, _forget_ack_first(broker_id))
+    _log_relay_end(local, _forget_ack_first(broker_id), broker_id, *answers)
 
 
 def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
@@ -6183,13 +6183,21 @@ def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None"
     # A relay result's end: its task and in-flight id retired on disk, the mark last.
     settled = _settle_task(tid, inflight)
     if settled and (inflight is None or _save_inflight(inflight)):
-        _log_relay_end(tid, _forget_ack_first(item_id))
+        _log_relay_end(tid, _forget_ack_first(item_id), item_id)
     return settled
 
 
-def _log_relay_end(tid: str, mark_retired: bool) -> None:
-    """Say how the end of a relay result refused for good closed, once its steps ran."""
+def _forget_relay_counts(*ids: str) -> None:
+    """A relay result retired: its waiting lines' counts go, by broker and local id."""
+    for first in ids:
+        _log_backoff_forget(first)
+
+
+def _log_relay_end(tid: str, mark_retired: bool, *ids: str) -> None:
+    """Say how the end of a relay result refused for good closed, once its steps ran; a
+    complete end drops the backoff counts of `tid` and `ids`, as a delivery does."""
     if mark_retired:
+        _forget_relay_counts(tid, *ids)
         _log(f"result {tid}: its relay result's end is complete; its task is settled and its relay mark retired")
     else:
         _log(f"result {tid}: its task is settled, but its relay mark could not be retired; "
@@ -6361,6 +6369,7 @@ def _post_ready_results(inflight: set[str]) -> None:
                     _forget_task_media(tid)
                 if action == "report":
                     _forget_ack_first(_broker_tid(_delivery))
+                    _forget_relay_counts(_broker_tid(_delivery), tid)
                 _forget_dedup_alias(tid)
                 if action == "requeue":
                     inflight.add(payload)
@@ -6394,6 +6403,7 @@ def _post_ready_results(inflight: set[str]) -> None:
             _forget_task_media(tid)
             # After the archive, so a re-run of an accepted fold still names its holder.
             _forget_ack_first(_wire)
+            _forget_relay_counts(_wire, tid)
             changed = True
             _log(f"archived {tid} (marker {skip.value}, lease closed, not sent"
                  + (f", folded into {_folded})" if _folded else ")"))
@@ -6465,6 +6475,7 @@ def _post_ready_results(inflight: set[str]) -> None:
         _forget_task_room(tid)
         _forget_task_media(tid)
         _forget_ack_first(_wire)
+        _forget_relay_counts(_wire, tid)
         _forget_dedup_alias(tid)
         changed = True
         _log(f"archived gateway-accepted result for {tid}; Matrix delivery unconfirmed")
