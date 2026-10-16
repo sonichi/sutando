@@ -22,6 +22,8 @@ export type SkillSetupCtx = {
 	getVoiceSessionOrigin: () => VoiceSessionOrigin | null;
 	/** Recover the origin of a task written before a restart from its header lines. */
 	setVoiceTaskOriginResolver: (resolver: VoiceTaskOriginResolver | null) => void;
+	/** Each time the user's speech is transcribed: a skill holding a change for a spoken yes knows someone spoke. */
+	onUserSpoke?: (handler: () => void) => void;
 };
 export type SkillSetup = (ctx: SkillSetupCtx) => void;
 
