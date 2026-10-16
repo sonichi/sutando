@@ -27,6 +27,7 @@ reconciliation (and runs the same delivery read).
 """
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -64,6 +65,9 @@ class AG2SpaceResultProvider:
         self._request = request
         self._confirm_waits = tuple(confirm_waits)
         self._sleep = sleep
+        # rid -> reason for every readable send failure this process has seen: a later
+        # poll that cannot be read must not turn a known dead-letter into a delivery.
+        self._dead: dict = {}
 
     def _settled(self, rid: str) -> Optional[dict]:
         """The broker's terminal delivery state for `rid`, or None when it
@@ -74,8 +78,8 @@ class AG2SpaceResultProvider:
             try:
                 st = self._request(
                     "GET", DELIVERY_PATH.format(quote(rid, safe="")), None)
-            except (urllib.error.URLError, OSError, ValueError):
-                return None     # includes 404: an older broker, or untracked
+            except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+                return None     # includes 404 and a truncated read: nothing readable
             if not isinstance(st, dict) or not st.get("status"):
                 return None     # not a delivery answer: nothing to wait for
             if st.get("terminal"):
@@ -101,7 +105,7 @@ class AG2SpaceResultProvider:
                     f"gateway refused {item_id}: HTTP {e.code}") from e
             raise ProviderIndeterminate(
                 f"gateway retryable response for {item_id}: HTTP {e.code}") from e
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as e:
             # urllib can't separate connect-refused from response-lost-
             # after-send; the idempotent re-send resolves the ambiguity.
             raise ProviderIndeterminate(
@@ -116,16 +120,26 @@ class AG2SpaceResultProvider:
                 outcome=DeliveryOutcome.CONFIRMED, provider_ref=ref,
                 detail="no_send" if envelope.get("no_send")
                 else "delivery unconfirmed (broker exposes no delivery read)")
-        st = self._settled(str(envelope["id"]))
+        rid = str(envelope["id"])
+        st = self._settled(rid)
         status = str((st or {}).get("status") or "")
         reason = str((st or {}).get("reason") or "")
         if status == "dead" and reason.startswith("send-failed"):
             # Re-posting is deduped by rid, so the retries this earns end in a park.
+            self._dead[rid] = reason
             raise ProviderRefused(
                 f"broker dead-lettered {item_id} after accepting it: {reason}")
         if status == "delivered":
+            self._dead.pop(rid, None)
             return DeliveryReceipt(outcome=DeliveryOutcome.CONFIRMED,
                                    provider_ref="delivered")
+        if rid in self._dead:
+            # Known non-delivery stays known: an unreadable or non-terminal poll after a
+            # readable send failure is not evidence the broker sent it.
+            raise ProviderRefused(
+                f"broker dead-lettered {item_id} earlier and has not reported it delivered "
+                f"since: {self._dead[rid]} (latest read: "
+                f"{(status + ('/' + reason if reason else '')) or 'unreadable'})")
         return DeliveryReceipt(
             outcome=DeliveryOutcome.CONFIRMED, provider_ref=ref,
             detail=(f"delivery unconfirmed ({status or 'unsettled'})"

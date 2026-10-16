@@ -6,6 +6,7 @@ rid-deduped answer (duplicate:true) confirms the FIRST attempt landed.
 
 Run: python3 tests/ag2space-provider.test.py"""
 # ruff: noqa: E402 — imports follow the sys.path insert below
+import http.client
 import io
 import sys
 import tempfile
@@ -272,12 +273,53 @@ def main() -> int:
           r.outcome is DeliveryOutcome.CONFIRMED
           and [c[0] for c in gw.calls] == ["POST"])
 
+    # A known dead-letter stays known: the retry's status read fails, and the
+    # provider must not fall through to CONFIRMED on the rid-deduped accept.
+    DEAD = {"status": "dead", "terminal": True,
+            "reason": "send-failed:permanent-masquerade-failure"}
+    gw = ScriptedGateway(READABLE, dict(READABLE, duplicate=True),
+                         dict(READABLE, duplicate=True),
+                         delivery=[DEAD, urllib.error.URLError("boom"),
+                                   {"status": "dead", "terminal": True, "reason": "expired"}])
+    p = AG2SpaceResultProvider(gw, sleep=lambda _s: None)
+    outs = []
+    for _ in range(3):
+        try:
+            outs.append(p.deliver("task-X", ENVELOPE, "task-X#0"))
+        except (ProviderRefused, ProviderIndeterminate) as e:
+            outs.append(e)
+    check("dead-lettered, then an unreadable status on the retry -> still Refused",
+          isinstance(outs[0], ProviderRefused) and isinstance(outs[1], ProviderRefused)
+          and "unreadable" in str(outs[1]))
+    check("dead-lettered, then an unknown terminal status -> still Refused",
+          isinstance(outs[2], ProviderRefused) and "expired" in str(outs[2]))
+    gw = ScriptedGateway(READABLE, dict(READABLE, duplicate=True),
+                         delivery=[DEAD, {"status": "delivered", "terminal": True}])
+    p = AG2SpaceResultProvider(gw, sleep=lambda _s: None)
+    first = None
+    try:
+        p.deliver("task-X", ENVELOPE, "task-X#0")
+    except ProviderRefused as e:
+        first = e
+    r = p.deliver("task-X", ENVELOPE, "task-X#0")
+    check("...but a later readable `delivered` clears the memory and confirms",
+          isinstance(first, ProviderRefused) and r.outcome is DeliveryOutcome.CONFIRMED
+          and r.provider_ref == "delivered")
+    # A truncated status read is an unreadable read, not an escape that strands the claim.
+    r, gw, _ = settle(http.client.IncompleteRead(b""))
+    check("IncompleteRead on the delivery read -> unreadable -> CONFIRMED on the accept",
+          r.outcome is DeliveryOutcome.CONFIRMED and r.provider_ref == "accepted"
+          and "unconfirmed" in r.detail)
+    r, gw = outcome_of(http.client.IncompleteRead(b""))
+    check("IncompleteRead on the POST -> Indeterminate (re-send resolves it)",
+          isinstance(r, ProviderIndeterminate))
+
     # Through the core: the accept no longer completes the item DELIVERED, and
     # every rid-deduped re-POST reads the same `dead` until the ceiling parks it.
     with tempfile.TemporaryDirectory() as td:
         gw = ScriptedGateway(READABLE, dict(READABLE, duplicate=True),
                              dict(READABLE, duplicate=True),
-                             delivery=[DEAD, DEAD, DEAD])
+                             delivery=[DEAD, urllib.error.URLError("boom"), DEAD])
         core = DeliveryCore(DesignAClaimBackend(Path(td)),
                             AG2SpaceResultProvider(gw, sleep=lambda _s: None),
                             policy=RetryPolicy(max_attempts=3), worker="w")
