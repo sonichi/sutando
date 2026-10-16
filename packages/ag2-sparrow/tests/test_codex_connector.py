@@ -84,6 +84,12 @@ def result(work, task_id):
     return (Path(work) / "results" / (task_id + ".txt")).read_text()
 
 
+def run_owner_echo(work):
+    write_task(work, "task-chat-owner-echo", "owner asks")
+    run_connector(work, once=1)
+    return result(work, "task-chat-owner-echo")
+
+
 def saved_threads(work):
     return sorted(p.name for p in (Path(work) / "state" / "threads").iterdir())
 
@@ -201,10 +207,10 @@ class TierPolicyTest(unittest.TestCase):
             write_task(d, "task-chat-g", "guest asks", tier="guest", mtime=now - 20)
             write_task(d, "task-chat-o", "owner asks", tier="owner", mtime=now - 10)
             self.assertEqual(run_connector(d, once=2, extra=["--sandbox", "danger-full-access"]), 0)
-            self.assertIn("[sandbox=read-only ephemeral=True]", result(d, "task-chat-g"))
-            self.assertIn("[sandbox=danger-full-access ephemeral=False]", result(d, "task-chat-o"))
+            self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, "task-chat-g"))
+            self.assertIn("[sandbox=danger-full-access ephemeral=False cwd=", result(d, "task-chat-o"))
             self.assertEqual([m["tier"] for m in metrics(d)], ["guest", "owner"])
-            self.assertEqual(saved_threads(d), ["local-chat"], "only the owner thread is saved")
+            self.assertEqual(saved_threads(d), [cc.channel_key("local-chat")], "only the owner thread is saved")
 
     def test_owner_threads_are_keyed_per_channel(self):
         with tempfile.TemporaryDirectory() as d:
@@ -216,8 +222,9 @@ class TierPolicyTest(unittest.TestCase):
             ids = [m["thread"] for m in metrics(d)]
             self.assertNotEqual(ids[0], ids[1], "rooms do not share a thread")
             self.assertEqual(ids[0], ids[2], "a room keeps its thread")
-            self.assertEqual(saved_threads(d), ["_a_ag2.space", "_b_ag2.space"])
-            self.assertEqual((Path(d) / "state" / "threads" / "_a_ag2.space").read_text().strip(), ids[0])
+            self.assertEqual(saved_threads(d), sorted(cc.channel_key(c) for c in ("!a:ag2.space", "!b:ag2.space")))
+            saved = (Path(d) / "state" / "threads" / cc.channel_key("!a:ag2.space")).read_text().splitlines()
+            self.assertEqual(saved, [ids[0], "!a:ag2.space"], "the id, then the readable channel")
 
     def test_a_guest_never_reuses_any_thread(self):
         with tempfile.TemporaryDirectory() as d:
@@ -229,7 +236,7 @@ class TierPolicyTest(unittest.TestCase):
             self.assertEqual(run_connector(d, once=4), 0)
             ids = [m["thread"] for m in metrics(d)]
             self.assertEqual(len(set(ids)), 4, "no thread id is shared between the owner and non-owner tasks")
-            self.assertEqual(saved_threads(d), ["_a_ag2.space"])
+            self.assertEqual(saved_threads(d), [cc.channel_key("!a:ag2.space")])
             for tid in ("task-chat-g1", "task-chat-g2", "task-chat-t"):
                 self.assertIn("ephemeral=True", result(d, tid))
 
@@ -240,6 +247,50 @@ class TierPolicyTest(unittest.TestCase):
                 self.assertEqual(run_connector(d, once=1), 0)
             self.assertEqual(spy.call_args.args[1]["access_tier"], "guest")
             self.assertEqual(spy.call_args.args[4], cc.NON_OWNER_NOTE_FALLBACK)
+
+    def test_channel_key_is_a_digest_that_cannot_escape_or_collide(self):
+        keys = {c: cc.channel_key(c) for c in ("..", ".", "!a:b.org", "_a_b.org", "x" * 200, "x" * 200 + "y")}
+        for c, k in keys.items():
+            self.assertRegex(k, r"^[0-9a-f]{64}$", c)
+        self.assertEqual(len(set(keys.values())), len(keys), "distinct channels, distinct files")
+        self.assertEqual(cc.channel_key(None), "default")
+        self.assertEqual(cc.channel_key(""), "default")
+        with tempfile.TemporaryDirectory() as d:
+            write_task(d, "task-chat-1", "dotdot room", channel="..")
+            self.assertEqual(run_connector(d, once=1), 0)
+            self.assertEqual(saved_threads(d), [cc.channel_key("..")])
+            self.assertEqual(metrics(d)[0]["status"], "completed")
+
+    def test_thread_id_binds_to_exactly_one_channel(self):
+        self.assertEqual(cc.bound_thread_id("!a:x=T1", "!a:x"), "T1")
+        self.assertIsNone(cc.bound_thread_id("!a:x=T1", "!b:x"))
+        self.assertIsNone(cc.bound_thread_id("T1", "!a:x"), "an unbound id applies to nobody")
+        self.assertEqual(cc.bound_thread_id("=T1", None), "T1", "the empty channel is the default thread")
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-a", "room A", channel="!a:x", mtime=now - 20)
+            write_task(d, "task-chat-b", "room B", channel="!b:x", mtime=now - 10)
+            self.assertEqual(run_connector(d, once=2, extra=["--thread-id", "!a:x=bound-0001"]), 0)
+            ids = [m["thread"] for m in metrics(d)]
+            self.assertEqual(ids[0], "bound-0001", "room A resumed the bound thread")
+            self.assertNotEqual(ids[1], "bound-0001", "room B did not inherit it")
+
+    def test_non_owner_turn_runs_in_an_empty_temp_dir_removed_afterwards(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_task(d, "task-chat-g", "guest asks", tier="guest")
+            made, real_mkdtemp = [], tempfile.mkdtemp   # cc.tempfile is this module
+
+            def mkdtemp(**kw):
+                made.append(real_mkdtemp(**kw))
+                return made[-1]
+
+            with mock.patch.object(cc.tempfile, "mkdtemp", side_effect=mkdtemp):
+                self.assertEqual(run_connector(d, once=1), 0)
+            scratch = made[0]
+            self.assertNotEqual(os.path.dirname(scratch), os.path.abspath(d))
+            self.assertIn("cwd=%s]" % scratch, result(d, "task-chat-g"))
+            self.assertFalse(os.path.exists(scratch), "removed after the turn")
+            self.assertIn("cwd=%s]" % os.path.abspath(d), run_owner_echo(d))
 
     def test_mid_layout_team_task_runs_ephemeral(self):
         tid = "task-1792100000002"
@@ -267,7 +318,7 @@ class EndToEndStubTest(unittest.TestCase):
             self.assertEqual([m["task"] for m in recs], ["task-chat-c", "task-chat-b", "task-chat-a"])
             self.assertEqual({m["status"] for m in recs}, {"completed"})
             self.assertEqual(len({m["thread"] for m in recs}), 1, "one owner channel, one thread")
-            self.assertEqual((Path(d) / "state" / "threads" / "local-chat").read_text().strip(), recs[0]["thread"])
+            self.assertEqual((Path(d) / "state" / "threads" / cc.channel_key("local-chat")).read_text().split()[0], recs[0]["thread"])
             self.assertEqual((Path(d) / "state" / "done").read_text().split(),
                              ["task-chat-c", "task-chat-b", "task-chat-a"])
 
@@ -282,7 +333,7 @@ class EndToEndStubTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             write_task(d, "task-chat-1", "one")
             run_connector(d, once=1)
-            tid = (Path(d) / "state" / "threads" / "local-chat").read_text().strip()
+            tid = (Path(d) / "state" / "threads" / cc.channel_key("local-chat")).read_text().split()[0]
             # A drain claimed the result (renamed it away) but the task file is still there.
             os.remove(Path(d) / "results" / "task-chat-1.txt")
             write_task(d, "task-chat-2", "two")
@@ -295,7 +346,7 @@ class EndToEndStubTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             write_task(d, "task-chat-1", "one")
             with mock.patch.object(cc, "log", wraps=cc.log) as spy:
-                self.assertEqual(run_connector(d, once=1, extra=["--thread-id", "stale-0001"]), 0)
+                self.assertEqual(run_connector(d, once=1, extra=["--thread-id", "local-chat=stale-0001"]), 0)
             self.assertEqual(metrics(d)[0]["status"], "completed")
             self.assertNotEqual(metrics(d)[0]["thread"], "stale-0001")
             self.assertTrue(any("thread/resume failed" in " ".join(map(str, c.args)) for c in spy.call_args_list))
@@ -304,7 +355,7 @@ class EndToEndStubTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             write_task(d, "task-chat-1", "one")
             with mock.patch.object(cc, "log", wraps=cc.log) as spy:
-                rc = run_connector(d, once=1, extra=["--thread-id", "hang-0001", "--turn-timeout", "1"])
+                rc = run_connector(d, once=1, extra=["--thread-id", "local-chat=hang-0001", "--turn-timeout", "1"])
             self.assertEqual(rc, 0)
             self.assertEqual(metrics(d)[0]["status"], "completed")
             self.assertTrue(any("thread/resume failed" in " ".join(map(str, c.args)) for c in spy.call_args_list))
@@ -482,6 +533,9 @@ class EdgePathTest(unittest.TestCase):
             self.assertEqual(Path(state, "connector.pid").read_text().strip(), str(os.getpid()))
             Path(state, "connector.pid").write_text("garbage")
             self.assertIsNotNone(cc.acquire_lock(state))
+            Path(state, "connector.pid").write_text("garbage")
+            with mock.patch.object(cc.os, "unlink", side_effect=FileNotFoundError):
+                self.assertIsNone(cc.acquire_lock(state), "two failed creates in a row: give up")
         self.assertTrue(cc.pid_alive(os.getpid()))
         with mock.patch.object(cc.os, "kill", side_effect=PermissionError):
             self.assertTrue(cc.pid_alive(1))

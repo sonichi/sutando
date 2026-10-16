@@ -14,12 +14,15 @@ runs on its own ephemeral thread, read-only, with the Hatch adapter's NON_OWNER_
 in the prompt, and is refused by --push. The tier is never taken from message text.
 """
 import argparse
+import hashlib
 import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -71,7 +74,17 @@ def non_owner_note(path=HATCH_SCRIPT):
 
 
 def channel_key(channel_id):
-    return re.sub(r"[^A-Za-z0-9._-]", "_", channel_id or "")[:120] or "default"
+    """File name for a channel's thread: a digest, so no id can escape the directory or
+    collide with another; the readable id is kept inside the file."""
+    return hashlib.sha256(channel_id.encode("utf-8")).hexdigest() if channel_id else "default"
+
+
+def bound_thread_id(spec, channel_id):
+    """`--thread-id CHANNEL_ID=THREAD` names the one channel that may resume THREAD."""
+    if not spec or "=" not in spec:
+        return None
+    channel, thread = spec.split("=", 1)
+    return thread if channel == (channel_id or "") else None
 
 
 class Rpc:
@@ -232,17 +245,29 @@ def pid_alive(pid):
 
 
 def acquire_lock(state_dir):
-    """One connector per work dir: a pidfile whose owner must still be alive."""
+    """One connector per work dir: an O_EXCL pidfile. A stale one (dead owner) is
+    unlinked and the create retried once; a live owner means refusal."""
     path = os.path.join(state_dir, "connector.pid")
-    try:
-        with open(path, encoding="utf-8") as f:
-            other = int(f.read().strip() or 0)
-    except (OSError, ValueError):
-        other = 0
-    if other and other != os.getpid() and pid_alive(other):
-        return None
-    write_atomic(path, "%d\n" % os.getpid())
-    return path
+    for _ in (1, 2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    other = int(f.read().strip() or 0)
+            except (OSError, ValueError):
+                other = 0
+            if other and other != os.getpid() and pid_alive(other):
+                return None
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("%d\n" % os.getpid())
+        return path
+    return None
 
 
 class Connector:
@@ -254,6 +279,7 @@ class Connector:
         self.thread_id = None
         self.last_thread = None   # the thread the current task ran on, for its metrics row
         self.live = {}            # channel key -> owner thread id open on the current server
+        self.scratch_cwd = None   # the empty temp dir a non-owner turn runs in
         self.declined = []
 
     def handle_server_request(self, m):
@@ -271,7 +297,7 @@ class Connector:
             self.rpc.respond(rid, {})
 
     def thread_params(self, owner):
-        p = {"cwd": self.args.cwd, "approvalPolicy": "never",
+        p = {"cwd": self.args.cwd if owner else self.scratch_cwd, "approvalPolicy": "never",
              "sandbox": self.args.sandbox if owner else NON_OWNER_SANDBOX}
         if self.args.model:
             p["model"] = self.args.model
@@ -285,8 +311,9 @@ class Connector:
         self.thread_id = res["thread"]["id"]
         log("started thread", self.thread_id, "owner" if owner else "non-owner", "ephemeral" if ephemeral else "durable")
 
-    def open_owner_thread(self, key):
+    def open_owner_thread(self, channel_id):
         """The channel's durable thread: resume the saved id when it is still known, else start one."""
+        key = channel_key(channel_id)
         if key in self.live:
             self.thread_id = self.live[key]
             return
@@ -294,8 +321,8 @@ class Connector:
         wanted = None
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
-                wanted = f.read().strip() or None
-        wanted = wanted or self.args.thread_id
+                wanted = f.readline().strip() or None
+        wanted = wanted or bound_thread_id(self.args.thread_id, channel_id)
         if wanted and not self.args.ephemeral:
             try:
                 res = self.rpc.request("thread/resume", dict(self.thread_params(True), threadId=wanted),
@@ -308,14 +335,22 @@ class Connector:
         else:
             self.start_thread(True, self.args.ephemeral)
         self.live[key] = self.thread_id
-        write_atomic(path, self.thread_id + "\n")
+        write_atomic(path, "%s\n%s\n" % (self.thread_id, (channel_id or "")[:80]))
 
     def open_for(self, headers):
-        """Owner: the channel's durable thread. Anyone else: a fresh ephemeral, read-only thread."""
+        """Owner: the channel's durable thread. Anyone else: a fresh ephemeral, read-only
+        thread in an empty temp dir, so no room's tasks or results are in its cwd."""
         if is_owner(headers):
-            self.open_owner_thread(channel_key(headers.get("channel_id")))
+            self.open_owner_thread(headers.get("channel_id"))
         else:
+            self.drop_scratch()
+            self.scratch_cwd = tempfile.mkdtemp(prefix="codex-nonowner-")
             self.start_thread(False, True)
+
+    def drop_scratch(self):
+        if self.scratch_cwd:
+            shutil.rmtree(self.scratch_cwd, ignore_errors=True)
+            self.scratch_cwd = None
 
     def handshake(self):
         init = self.rpc.request("initialize", {"clientInfo": CLIENT,
@@ -491,6 +526,7 @@ class Connector:
             self.declined = []
             if not is_owner(headers):
                 self.thread_id = None         # the ephemeral thread is never reused
+                self.drop_scratch()
             with open(metrics_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             log("result <-", json.dumps(rec))
@@ -530,7 +566,8 @@ def build_parser():
     ap.add_argument("--model", default=None)
     ap.add_argument("--sandbox", default=NON_OWNER_SANDBOX, choices=["read-only", "workspace-write", "danger-full-access"],
                     help="sandbox for OWNER threads; every other tier is always read-only")
-    ap.add_argument("--thread-id", default=None, help="resume this id for an owner channel that has no saved thread yet")
+    ap.add_argument("--thread-id", default=None, metavar="CHANNEL_ID=THREAD",
+                    help="resume THREAD for exactly this owner channel when it has no saved thread yet")
     ap.add_argument("--ephemeral", action="store_true", help="owner threads too: do not persist to the Codex home")
     ap.add_argument("--developer-instructions", default=None)
     ap.add_argument("--once", type=int, default=0, help="exit after N tasks")
@@ -578,6 +615,7 @@ def main(argv=None):
             c.serve()
     finally:
         c.rpc.close()
+        c.drop_scratch()
         log("closed pid", c.rpc.p.pid, "rc", c.rpc.p.returncode)
         try:
             os.unlink(lock)

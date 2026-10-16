@@ -82,8 +82,8 @@ for line in sys.stdin:
         text = next((i.get("text", "") for i in p.get("input", []) if i.get("type") == "text"), "")
         tp = THREADS[tid]["params"]
         # The echo names the thread's settings, so a test can pin sandbox and lifetime.
-        reply = "STUB echo: " + (text.strip().split("\n")[0][:80]) + " [sandbox=%s ephemeral=%s]" % (
-            tp.get("sandbox"), tp.get("ephemeral"))
+        reply = "STUB echo: " + (text.strip().split("\n")[0][:80]) + " [sandbox=%s ephemeral=%s cwd=%s]" % (
+            tp.get("sandbox"), tp.get("ephemeral"), tp.get("cwd"))
         if "[[empty]]" in text:
             reply = "" if not THREADS[tid].get("emptied") else "STUB second try"
             THREADS[tid]["emptied"] = True
