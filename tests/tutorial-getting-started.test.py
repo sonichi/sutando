@@ -3,6 +3,7 @@
 and the room-commons calls publish makes, against a stub room_commons.py that keeps a fake room."""
 from __future__ import annotations
 
+import html
 import importlib.util
 import json
 import os
@@ -36,7 +37,9 @@ STUB = textwrap.dedent('''
     if argv[0] == "--kind":
         kind, argv = argv[1], argv[2:]
     cmd, room, rest = argv[0], argv[1], argv[2:]
-    db["calls"].append([cmd, kind] + rest[:1])
+    sized = cmd in ("append", "replace")
+    db["calls"].append([cmd, kind] + ([len(rest[0].encode()), len(rest[1].encode()) if cmd == "replace" else 0]
+                                      if sized else rest[:1]))
     def save():
         state.write_text(json.dumps(db))
     if cmd in os.environ.get("STUB_FAIL", "").split(","):
@@ -66,8 +69,9 @@ STUB = textwrap.dedent('''
 ''')
 
 
-TOUR = ["Rooms", "Commons", "Teamwork", "Calls & voice", "Connect other agents",
+TOUR = ["Your DM", "Rooms", "Commons", "Connect other agents", "Teamwork", "Calls & voice",
         "Connect your apps", "Activity & notices", "Mobile"]
+FINALE = "You\u2019re set \u2014 ask Blue anything"
 IMPORT = "Import your Claude Code history"
 
 
@@ -96,18 +100,26 @@ def parse(page):
     return p
 
 
+def steps(page):
+    """The step headings, without the closing card's (which comes first in the markup)."""
+    heads = parse(page).headings
+    assert heads[0] == FINALE, heads[0]
+    return heads[1:]
+
+
 class RenderTest(unittest.TestCase):
-    def test_tour_has_all_eight_sections_in_order(self):
+    def test_tour_has_all_nine_sections_in_order(self):
         for core in gs.CORES:
-            self.assertEqual(parse(gs.render_page("Blue", core)).headings[:8], TOUR)
+            self.assertEqual(steps(gs.render_page("Blue", core))[:9], TOUR)
+        self.assertLess(TOUR.index("Connect other agents"), TOUR.index("Teamwork"))
 
     def test_import_section_only_on_a_claude_core(self):
         claude = parse(gs.render_page("Blue", "claude"))
-        self.assertEqual(claude.headings, TOUR + [IMPORT])
+        self.assertEqual(steps(gs.render_page("Blue", "claude")), TOUR + [IMPORT])
         self.assertIn(gs.IMPORT_PROMPT, claude.buttons)
         for core in ("codex", "unknown"):
             page = parse(gs.render_page("Blue", core))
-            self.assertEqual(page.headings, TOUR)
+            self.assertEqual(steps(gs.render_page("Blue", core)), TOUR)
             self.assertNotIn(gs.IMPORT_PROMPT, page.buttons)
             self.assertNotIn("Claude Code", gs.render_page("Blue", core))
 
@@ -118,11 +130,53 @@ class RenderTest(unittest.TestCase):
     def test_copy_buttons_and_kept_connect_prompt(self):
         page = gs.render_page("Blue", "codex")
         self.assertEqual([b for b in parse(page).buttons if b],
-                         [s.prompt for s in gs.SECTIONS if s.prompt])
+                         [gs.tour_page.FINALE_PROMPT] + [s.prompt for s in gs.SECTIONS if s.prompt])
         self.assertIn(gs.CONNECT_PROMPT, parse(page).buttons)
         self.assertIn("Settings &rarr; Integrations", page)
         self.assertIn("navigator.clipboard", page)
         self.assertIn("prefers-color-scheme: dark", page)
+
+    def test_dm_step_comes_first_and_says_personal_answers_stay_in_the_dm(self):
+        dm = gs.SECTIONS[0]
+        self.assertEqual((dm.id, dm.title, dm.where), ("dm", "Your DM", "dm"))
+        self.assertIn("never in a room", dm.what)
+        self.assertEqual(dm.prompt, "What can you do for me today?")
+
+    def test_every_prompt_says_where_to_paste_it(self):
+        where = {s.id: s.where for s in gs.sections_for("claude") if s.prompt}
+        self.assertEqual(where, {"dm": "dm", "commons": "room", "teamwork": "room", "apps": "dm", "import": "dm"})
+        page = gs.render_page("Blue", "claude")
+        self.assertEqual(page.count('<p class="paste">Paste in: a room</p>'), 2)
+        self.assertEqual(page.count('<p class="paste">Paste in: your DM</p>'), 4)  # dm, apps, import, finale
+
+    def test_closing_card_is_hidden_until_everything_is_done(self):
+        page = gs.render_page("Blue", "claude")
+        self.assertIn('<section class="card finale" id="finale" aria-labelledby="h-finale" hidden', page)
+        self.assertIn("finale.hidden = n !== ids.length", gs.tour_page.SCRIPT)
+        self.assertIn(html.escape(gs.tour_page.FINALE_PROMPT), page)
+
+    def test_step_title_replaces_step_numbers(self):
+        page = gs.render_page("Blue", "codex")
+        self.assertNotRegex(page, r"Step \d+ of \d+")
+        self.assertIn('<p class="step-title" id="step-title" aria-live="polite">Your DM</p>', page)
+        self.assertIn("stepTitle.textContent = titles[cur]", gs.tour_page.SCRIPT)
+
+    def test_reviewed_wording(self):
+        by = {s.id: s for s in gs.sections_for("claude")}
+        self.assertIn("Dot (by OpenAI, in ChatGPT), Grok Bot (in Grok) or Muse (by Meta)", by["agents"].how)
+        self.assertIn("Mention &amp; Keywords", by["activity"].how)
+        self.assertIn("Activity tab", by["activity"].how)
+        self.assertTrue(by["import"].what.startswith("If you use Claude Code"))
+        self.assertIn("local Claude Code history", by["import"].what)
+        self.assertIn("headphone icon in the room header", by["calls"].how)
+        self.assertIn("Bring an agent?", by["calls"].how)
+        self.assertIn("+ at the top of the room list", by["rooms"].how)
+
+    def test_no_microphone_or_user_card_voice_button(self):
+        for core in gs.CORES:
+            text = re.sub(r"data:image/[^\"]+", "", gs.render_page("Blue", core)).lower()
+            self.assertNotRegex(text, r"micro|\bmic\b|push to talk")
+        self.assertNotIn("02-microphone", " ".join(f for s in gs.SECTIONS for f, _ in s.images))
 
     def test_codex_and_claude_code_are_not_offered_as_addable_agents(self):
         agents = [s for s in gs.SECTIONS if s.title == "Connect other agents"][0]
@@ -162,10 +216,10 @@ class InteractiveTest(unittest.TestCase):
 
     def test_tour_controls_and_progress(self):
         for marker in ('id="back"', 'id="next"', 'id="all"', 'id="dots"', 'aria-pressed="false"',
-                       'role="progressbar"', 'aria-valuemax="9"', "0 of 9 done", 'aria-label="Tour steps"'):
+                       'role="progressbar"', 'aria-valuemax="10"', "0 of 10 done", 'aria-label="Tour steps"'):
             self.assertIn(marker, self.page)
-        self.assertEqual(self.page.count('type="checkbox" data-done='), 9)
-        self.assertEqual(self.page.count("Mark done"), 9)
+        self.assertEqual(self.page.count('type="checkbox" data-done='), 10)
+        self.assertEqual(self.page.count("Mark done"), 10)
         self.assertIn("ArrowRight", self.page)
 
     def test_js_class_is_set_in_head_and_no_js_shows_every_section(self):
@@ -179,8 +233,8 @@ class InteractiveTest(unittest.TestCase):
         self.assertEqual(body.count('class="sec card cur"'), 1)
 
     def test_checkboxes_start_disabled_until_progress_loads(self):
-        self.assertEqual(self.page.count('data-done="'), 9)
-        self.assertEqual(len(re.findall(r'type="checkbox" data-done="[a-z]+" disabled>', self.page)), 9)
+        self.assertEqual(self.page.count('data-done="'), 10)
+        self.assertEqual(len(re.findall(r'type="checkbox" data-done="[a-z]+" disabled>', self.page)), 10)
         self.assertIn("b.disabled = false", gs.tour_page.SCRIPT)
 
     def test_show_all_toggle_keeps_one_label(self):
@@ -205,15 +259,17 @@ class InteractiveTest(unittest.TestCase):
         self.assertNotIn('role="img"', self.page)
 
     def test_an_svg_per_section_and_a_hero(self):
-        self.assertEqual(self.page.count('<div class="icon" aria-hidden="true"><svg'), 9)
+        self.assertEqual(self.page.count('<div class="icon" aria-hidden="true"><svg'), 10)
         self.assertIn('class="hero-art"', self.page)
         self.assertEqual(set(gs.tour_page.ICONS), {s.id for s in gs.sections_for("claude")})
 
     def test_no_external_urls(self):
         for core in gs.CORES:
             page = gs.render_page("Blue", core)
-            self.assertNotRegex(page, r"(?i)\b(?:https?:)?//[a-z0-9]")
-            self.assertNotRegex(page, r"(?i)<(?:img|link|iframe|object|embed)\b|\bsrc=|url\(")
+            bare = re.sub(r'src="data:image/jpeg;base64,[A-Za-z0-9+/=]+"', 'src=""', page)
+            self.assertNotRegex(bare, r"(?i)\b(?:https?:)?//[a-z0-9]")
+            self.assertNotRegex(bare, r"(?i)<(?:link|iframe|object|embed)\b|url\(")
+            self.assertEqual(re.findall(r'\bsrc="([^"]*)"', bare), [""] * bare.count("<img "))
 
     def test_dark_mode_and_reduced_motion(self):
         self.assertIn("prefers-color-scheme: dark", self.page)
@@ -272,6 +328,8 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
     if (scenario === 'me') w.artifact = runtime({ id: 'u42' }, () => Promise.resolve(['rooms']));
     if (scenario === 'nome') w.artifact = runtime(null, () => ['rooms']);
     if (scenario === 'slow') w.artifact = { ready: new Promise(() => {}), me: null, state: { get: () => undefined, set: () => {}, on: () => {} } };
+    if (scenario === 'advance') w.artifact = runtime({ id: 'u7' }, () => []);
+    if (scenario === 'finale') w.artifact = runtime({ id: 'u8' }, () => ['dm', 'rooms', 'commons', 'agents', 'teamwork', 'calls', 'apps', 'activity', 'mobile']);
     if (scenario === 'copy-ok') Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: () => Promise.resolve() } });
     if (scenario === 'copy-fail') {
       Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: () => Promise.reject(new Error('denied')) } });
@@ -290,6 +348,22 @@ const mark = (i) => { const b = d.querySelectorAll('input[data-done]')[i]; b.che
   if (scenario === 'me' || scenario === 'nome' || scenario === 'slow') {
     mark(2);
     out.local = w.localStorage.getItem('gs-done');
+  }
+  if (scenario === 'advance') {
+    out.before = d.querySelector('.sec.cur').id;
+    mark(0);
+    out.after = d.querySelector('.sec.cur').id;
+    out.focused = d.activeElement && d.activeElement.id;
+    out.title = d.getElementById('step-title').textContent;
+    d.getElementById('all').click();
+    mark(3);
+    out.afterAll = d.querySelector('.sec.cur').id;
+  }
+  if (scenario === 'finale') {
+    out.finaleHiddenBefore = d.getElementById('finale').hidden;
+    mark(9);
+    out.finaleHiddenAfter = d.getElementById('finale').hidden;
+    out.focused = d.activeElement && d.activeElement.id;
   }
   if (scenario === 'showall') {
     const all = d.getElementById('all');
@@ -358,27 +432,39 @@ class PageBehaviourTest(unittest.TestCase):
 
     def test_viewer_key_is_used_and_a_thenable_get_is_awaited(self):
         out = self.run_page("me")
-        self.assertEqual(out["progress"], "1 of 9 done")
-        self.assertEqual(out["sets"], [["gs-done-u42", ["rooms", "teamwork"]]])
+        self.assertEqual(out["progress"], "1 of 10 done")
+        self.assertEqual(out["sets"], [["gs-done-u42", ["rooms", "commons"]]])
         self.assertIsNone(out["local"])
 
     def test_without_a_viewer_id_the_shared_state_is_never_written(self):
         for scenario in ("nome", "slow"):
             out = self.run_page(scenario)
             self.assertEqual(out["sets"], [], scenario)
-            self.assertEqual(json.loads(out["local"]), ["teamwork"], scenario)
+            self.assertEqual(json.loads(out["local"]), ["commons"], scenario)
 
     def test_show_all_keeps_one_label_and_dots_scroll_and_focus(self):
         out = self.run_page("showall")
         self.assertEqual((out["labelBefore"], out["labelAfter"], out["pressed"]), ("Show all", "Show all", "true"))
         self.assertEqual(out["mode"], "all")
-        self.assertEqual(out["scrolled"], ["s-agents", "smooth"])
-        self.assertEqual(out["focused"], "h-agents")
+        self.assertEqual(out["scrolled"], ["s-teamwork", "smooth"])
+        self.assertEqual(out["focused"], "h-teamwork")
+
+    def test_mark_done_advances_in_step_mode_only(self):
+        out = self.run_page("advance")
+        self.assertEqual((out["before"], out["after"], out["focused"], out["title"]),
+                         ("s-dm", "s-rooms", "h-rooms", "Rooms"))
+        self.assertEqual(out["afterAll"], "s-rooms")
+
+    def test_closing_card_appears_when_all_are_done(self):
+        out = self.run_page("finale")
+        self.assertEqual((out["finaleHiddenBefore"], out["finaleHiddenAfter"], out["focused"]),
+                         (True, False, "h-finale"))
+        self.assertEqual(out["progressAfter"], "10 of 10 done")
 
     def test_copy_outcomes_are_announced(self):
         ok = self.run_page("copy-ok")
         self.assertEqual(ok["button"], "Copied")
-        self.assertEqual(ok["status"], "Copied: " + gs.SECTIONS[1].prompt)
+        self.assertEqual(ok["status"], "Copied: " + gs.tour_page.FINALE_PROMPT)
         fail = self.run_page("copy-fail")
         self.assertEqual(fail["button"], "Press Ctrl+C")
         self.assertIn("Press Ctrl+C", fail["status"])
@@ -485,6 +571,45 @@ class FinderTest(unittest.TestCase):
         self.assertEqual(found, beside if beside.is_file() else installed)
 
 
+class ChunkTest(unittest.TestCase):
+    def test_chunks_respect_the_byte_limit_and_characters(self):
+        text = "a" * 10 + "\u00e9" * 10 + "\U0001f600" * 5
+        parts = gs.chunks(text, 7)
+        self.assertEqual("".join(parts), text)
+        self.assertTrue(all(len(p.encode("utf-8")) <= 7 for p in parts))
+        self.assertEqual(gs.chunks(""), [])
+        self.assertLess(gs.CHUNK_BYTES, 196_608)
+
+    def test_changed_bytes_counts_only_the_middle(self):
+        self.assertEqual(gs.changed_bytes("abcXdef", "abcYYdef"), 3)
+        self.assertEqual(gs.changed_bytes("same", "same"), 0)
+
+
+class AssetTest(unittest.TestCase):
+    def test_every_step_image_exists_and_is_small(self):
+        tp = gs.tour_page
+        used = {f for s in tp.sections_for("claude") for f, _ in s.images}
+        files = {p.name: p.stat().st_size for p in tp.ASSETS.glob("*.jpg")}
+        self.assertEqual(used, set(files))
+        self.assertTrue(all(size <= 60_000 for size in files.values()), files)
+        self.assertLessEqual(sum(files.values()), 500_000)
+        for s in tp.sections_for("claude"):
+            for f, alt in s.images:
+                self.assertTrue(alt.strip(), f)
+
+    def test_each_step_with_an_image_renders_it_inline(self):
+        page = gs.render_page("Blue", "claude")
+        for s in gs.tour_page.sections_for("claude"):
+            block = page[page.index(f'id="s-{s.id}"'):]
+            block = block[:block.index("</section>")]
+            self.assertEqual(block.count('<img src="data:image/jpeg;base64,'), len(s.images), s.id)
+        for sid in ("rooms", "commons", "teamwork", "calls", "apps", "activity", "mobile"):
+            self.assertTrue([s for s in gs.SECTIONS if s.id == sid][0].images, sid)
+
+    def test_rendered_page_size_is_bounded(self):
+        self.assertLess(len(gs.render_page("Blue", "claude").encode()), 400_000)
+
+
 class MarkerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -545,7 +670,10 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(out, {"ok": True, "action": "created", "kind": "html-p1", "summoned": True})
         room = self.room()
         self.assertEqual(room["pages"], {"html-p1": gs.render_page("Sutando", "codex")})
-        self.assertEqual([c[0] for c in room["calls"]], ["page-add", "append", "summon"])
+        parts = gs.chunks(gs.render_page("Sutando", "codex"))
+        self.assertGreater(len(parts), 1)  # the page is over one write's limit
+        self.assertEqual([c[0] for c in room["calls"]], ["page-add"] + ["append"] * len(parts) + ["summon"])
+        self.assertTrue(all(c[2] <= gs.CHUNK_BYTES for c in room["calls"] if c[0] == "append"))
         self.assertEqual(room["calls"][-1], ["summon", "html-p1", "@chi:ag2.space"])
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["kind"], "html-p1")
 
@@ -556,13 +684,36 @@ class PublishTest(unittest.TestCase):
         self.assertFalse(out["summoned"])
         room = self.room()
         self.assertEqual(list(room["pages"]), ["html-p1"])
-        self.assertEqual([c[0] for c in room["calls"]][3:], ["pages", "read"])
+        first = 1 + len(gs.chunks(gs.render_page("Sutando", "codex"))) + 1
+        self.assertEqual([c[0] for c in room["calls"]][first:], ["pages", "read"])
 
     def test_changed_content_rewrites_the_same_page(self):
         self.publish()
         out = self.publish(name="Kai")
         self.assertEqual(out["action"], "updated")
         self.assertEqual(self.room()["pages"], {"html-p1": gs.render_page("Kai", "codex")})
+
+    def test_a_large_change_clears_in_pieces_then_appends_in_pieces(self):
+        self.publish()
+        before = len(self.room()["calls"])
+        old = gs.render_page("Sutando", "codex")
+        new = gs.render_page("Sutando", "claude")
+        self.assertGreater(gs.changed_bytes(old, new) + len(old) + len(new), gs.ARGV_BYTES)
+        out = self.publish(core="claude")
+        self.assertEqual(out["action"], "updated")
+        calls = self.room()["calls"][before:]
+        self.assertEqual([c[0] for c in calls if c[0] == "replace"], ["replace"] * len(gs.chunks(old)))
+        self.assertTrue(all(c[3] == 0 and c[2] <= gs.CHUNK_BYTES for c in calls if c[0] == "replace"))
+        self.assertEqual(len([c for c in calls if c[0] == "append"]), len(gs.chunks(new)))
+        self.assertEqual(self.room()["pages"], {"html-p1": new})
+
+    def test_a_small_change_is_one_replace(self):
+        commons = gs.Commons(self.stub, self.ROOM)
+        db = {"pages": {"html-p1": "<p>old</p>"}, "calls": [], "next": 2}
+        self.state.write_text(json.dumps(db))
+        commons.rewrite("html-p1", "<p>old</p>", "<p>new</p>")
+        self.assertEqual([c[0] for c in self.room()["calls"]], ["replace"])
+        self.assertEqual(self.room()["pages"]["html-p1"], "<p>new</p>")
 
     def test_core_change_rewrites_the_same_page(self):
         self.publish()

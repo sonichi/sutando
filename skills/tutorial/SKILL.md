@@ -73,24 +73,47 @@ room. A re-link or reinstall that reuses the DM rewrites that page in place; a p
 from the list is created again. `getting_started.py plan --room <room>` shows what `publish` would
 do; `render --name <name>` prints the HTML.
 
-**What the page says.** A short, interactive AG2 Space tour (`scripts/tour_page.py`). Each part is one line on what it is and one
-thing to try: Rooms, Commons, Teamwork, Calls & voice, Connect other agents (Dot, Grok Bot, Muse,
-Other; Claude Code and Codex are Sutando cores chosen at setup, not agents you add), Connect your
-apps (Settings → Integrations), Activity & notices, Mobile. On a Claude Code core it adds
-"Import your Claude Code history"; on Codex or an unknown core that part is left out. UI labels
-match the AG2 Space client; reword them in `tour_page.py` when the client renames one.
+**What the page says.** A short, interactive AG2 Space tour (`scripts/tour_page.py`). Each step is
+one line on what it is and one thing to try, in this order:
+1. Your DM: what the owner asks for themselves comes back in the DM, never in a room.
+2. Rooms.
+3. Commons.
+4. Connect other agents: Dot, Grok Bot, Muse. Claude Code and Codex are Sutando cores chosen at
+   setup, not agents you add.
+5. Teamwork.
+6. Calls & voice: the headphone icon in the room header only.
+7. Connect your apps: Settings → Integrations.
+8. Activity & notices.
+9. Mobile.
+
+On a Claude Code core it adds "Import your Claude Code history"; on Codex or an unknown core that
+step is left out. Every prompt says where to paste it (your DM or a room). When every step is
+done, a closing card offers one more prompt. UI labels match the AG2 Space client and its current
+screenshots; reword them in `tour_page.py` when the client changes.
+
+**Screenshots.** `assets/*.jpg` are real UI crops, adapted from Zerlinda's Sutando's "Getting
+started with AG2 Space" page. Each is cropped so that no person's name, room or account shows,
+and each is at most 60 KB. They are inlined as `data:` URIs, so the page stays self-contained. A
+step names its images in `Section.images` as (file, alt).
 
 **How the page behaves.**
-- It is one self-contained HTML document with no external URL. Each section has an inline SVG
-  icon in its own accent colour (AA contrast on the card in both themes), under a hero with your
-  name.
-- It opens as a step-by-step tour: Back and Next, numbered step dots, a "Show all" toggle, and
-  the arrow keys.
-- Each section has a "Mark done" checkbox and a progress bar ("3 of 9 done"). Progress is saved
-  in the page runtime's `window.artifact.state` under `gs-done-<viewer page id>`, so it survives
-  reloads and a refresh in place. Without that runtime it falls back to localStorage, then to
-  memory, and every storage access is guarded.
-- Animations stop under `prefers-reduced-motion`. Without scripts, every section shows.
+- It is one self-contained HTML document with no external URL.
+- An inline SVG icon and accent colour per step (AA contrast in both themes), under a hero with
+  your name.
+- The tour opens on one step, with the step's title, numbered dots, Back and Next, a "Show all"
+  toggle and the arrow keys. In Show all, a dot scrolls to its step.
+- "Mark done" moves to the next step that is not done (in step mode only) and fills the progress
+  bar.
+- Progress is saved in the page runtime's `window.artifact.state` under `gs-done-<viewer page id>`,
+  only once the runtime names the viewer. Otherwise it stays in this browser's localStorage, then
+  memory. The checkboxes stay disabled until progress has loaded.
+- Copy outcomes are announced in a live status region. Animations stop under
+  `prefers-reduced-motion`. Without scripts, every step shows.
+
+**Size.** With its screenshots the page is about 220 KB, over the 196,608 bytes Room Commons
+takes in one write. `publish` therefore appends it in pieces of at most 150,000 bytes. A refresh
+is one `replace` when the change is small; otherwise it clears the old text in pieces and appends
+the new.
 
 **The prompts.** Each card's Copy button puts its prompt on the clipboard; where the page's sandbox
 refuses the clipboard, the prompt is selected instead and the button says to press ⌘C. The page

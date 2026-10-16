@@ -7,8 +7,10 @@ viewer it uses this browser's localStorage, then memory, and every storage acces
 """
 from __future__ import annotations
 
+import base64
 import html
-from typing import List, NamedTuple, Optional
+from pathlib import Path
+from typing import List, NamedTuple, Optional, Tuple
 
 PAGE_TITLE = "Getting started"
 NAME_MAX = 64
@@ -22,60 +24,84 @@ class Section(NamedTuple):
     title: str
     what: str
     how: str
-    prompt: Optional[str]
+    prompt: Optional[str] = None
+    where: Optional[str] = None
+    images: Tuple[Tuple[str, str], ...] = ()
 
 
-# `what` and `how` are trusted markup with {name}, the agent's escaped name. UI labels match the
-# AG2 Space client.
+# `what` and `how` are trusted markup with {name}, the agent's escaped name; `images` are
+# (assets/ file, alt). UI labels match the AG2 Space client and its screenshots.
 SECTIONS = [
+    Section("dm", "Your DM",
+            "Your DM with {name} is where you ask for things for yourself. What you ask for "
+            "yourself (research, mail, calendar) comes back here in your DM, never in a room.",
+            "Ask {name} here:",
+            "What can you do for me today?", "dm"),
     Section("rooms", "Rooms",
             "Humans and agents talk in the same chat.",
-            "Create a room with the + next to Rooms, then invite {name}.",
-            None),
+            "Press + at the top of the room list and choose Room. Then open the room menu "
+            "(&#8942;), choose Invite, and add {name}.",
+            images=(("room-list-top.jpg", "The + button at the top of the room list"),
+                    ("new-room-dialog.jpg", "The New Chat Room dialog"),
+                    ("room-menu-invite.jpg", "The room menu, with Invite"))),
     Section("commons", "Commons",
-            "Each room's shared Doc, HTML pages, whiteboard, sheets and databases, under Commons "
-            "in the room header.",
+            "Each room's shared Doc, HTML pages, whiteboard, sheets and databases. Open them with "
+            "the Commons icon in the room header.",
             "Ask {name} in a room:",
-            "Make a plan for our team offsite in Commons."),
+            "Make a plan for our team offsite in Commons.", "room",
+            (("room-header-commons.jpg", "The room header; Commons is the second icon"),
+             ("commons-surfaces.jpg", "Commons: Doc, Whiteboard, HTML, PDF, Sheet and Database"))),
+    Section("agents", "Connect other agents",
+            "Bring agents from the apps you already use into your rooms.",
+            "Press + at the top of the room list, choose Agent, then Use an agent from another app, "
+            "and pick the app you already use: Dot (by OpenAI, in ChatGPT), Grok Bot (in Grok) or "
+            "Muse (by Meta)."),
     Section("teamwork", "Teamwork",
             "@-mention any agent in a room to hand it work; it replies in the thread.",
-            "In a room with another agent, ask {name}:",
+            "In a room with another agent, type @ and ask {name}:",
             "Research the three best note-taking apps for a small team, then ask another agent "
-            "in this room to review your answer."),
+            "in this room to review your answer.", "room",
+            (("composer-mention.jpg", "The @ button in the message composer"),)),
     Section("calls", "Calls &amp; voice",
-            "Talk live in any room or in your DM with {name}; agents join the call.",
-            "Press the call button in the room header (Start call).",
-            None),
-    Section("agents", "Connect other agents",
-            "Bring agents from other apps into your rooms.",
-            "Choose + then Agent to open Add an agent, pick Use an agent from another app, then "
-            "Dot (in ChatGPT), Grok Bot (in Grok), Muse or Other (any app with connectors).",
-            None),
+            "Talk live with {name} in your DM, or with people in any room.",
+            "Press the headphone icon in the room header (Start call). In your DM, {name} answers; "
+            "in a room, pick {name} under Bring an agent? to bring it into the call.",
+            images=(("room-header-call.jpg", "The headphone icon in the room header"),)),
     Section("apps", "Connect your apps",
             "Gmail, Calendar, Drive, Slack and more, so {name} can work with your real data.",
-            "Open Settings &rarr; Integrations, or ask {name} and a Connect button appears:",
-            CONNECT_PROMPT),
+            "Press the plug icon in your user card (bottom left) to open Settings &rarr; "
+            "Integrations, or ask {name} and a Connect button appears:",
+            CONNECT_PROMPT, "dm",
+            (("user-card-plug.jpg", "The plug icon in your user card"),
+             ("settings-integrations.jpg", "Settings, Apps: Integrations"))),
     Section("activity", "Activity &amp; notices",
-            "Each room's Activity tab shows what needs you and what your agents are working on.",
-            "The unread badge follows the room's notification setting (All Messages, Mention "
-            "&amp; Keywords or Mute), which you can change per room.",
-            None),
+            "The bell at the top of the room list and each room's Activity tab show what needs "
+            "you and what your agents are working on. The unread badge follows each room's "
+            "notification setting.",
+            "Try it: open a room's Activity tab while an agent works on something you asked for, "
+            "then set the room's notifications to Mention &amp; Keywords.",
+            images=(("room-list-top.jpg", "The bell at the top of the room list"),)),
     Section("mobile", "Mobile",
             "The same rooms and agents on your phone.",
             "Pair it in Settings &rarr; Mobile pairing.",
-            None),
+            images=(("mobile-pairing.jpg", "Settings: Mobile pairing"),)),
 ]
 IMPORT_SECTION = Section(
     "import", "Import your Claude Code history",
-    "Bring what you worked on in Claude Code into {name}'s memory. You see a digest first; "
-    "nothing is kept until you say so.",
+    "If you use Claude Code, {name} can read your local Claude Code history and bring what you "
+    "worked on into its memory. You see a digest first; nothing is kept until you say so.",
     "Ask {name}:",
-    IMPORT_PROMPT,
+    IMPORT_PROMPT, "dm",
 )
+FINALE_PROMPT = "Help me plan my week."
+WHERE = {"dm": "your DM", "room": "a room"}
+ASSETS = Path(__file__).resolve().parent.parent / "assets"
+
 
 # (light, dark) per section; each passes WCAG AA (4.5:1) as text on that theme's card colour.
 CARD = ("#ffffff", "#202225")
 ACCENTS = {
+    "dm": ("#4a5a70", "#b3c2d6"),
     "rooms": ("#1f5fcc", "#7aa7ff"),
     "commons": ("#0b7a5c", "#4fd1a5"),
     "teamwork": ("#7a3fc8", "#b98cff"),
@@ -89,6 +115,8 @@ ACCENTS = {
 
 _S = 'fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"'
 ICONS = {
+    "dm": f'<path {_S} d="M10 10h44a4 4 0 0 1 4 4v28a4 4 0 0 1-4 4H30l-12 10V46h-8a4 4 0 0 1-4-4V14a4 4 0 0 1 4-4z"/>'
+          f'<circle {_S} cx="32" cy="22" r="5"/><path {_S} d="M22 37c2-6 18-6 20 0"/>',
     "rooms": f'<path {_S} d="M8 12h30a4 4 0 0 1 4 4v14a4 4 0 0 1-4 4H20l-8 7v-7H8a4 4 0 0 1-4-4V16a4 4 0 0 1 4-4z"/>'
              f'<circle {_S} cx="23" cy="20" r="3"/><path {_S} d="M17 29c1.5-3 10.5-3 12 0"/>'
              f'<path {_S} d="M46 24h10a4 4 0 0 1 4 4v14a4 4 0 0 1-4 4h-2v7l-8-7h-8a4 4 0 0 1-4-4v-4"/>'
@@ -162,22 +190,47 @@ def contrast(a: str, b: str) -> float:
     return (hi + 0.05) / (lo + 0.05)
 
 
-def _section(sec: Section, n: int, total: int, who: str) -> str:
-    prompt = ""
-    if sec.prompt:
-        esc = html.escape(sec.prompt, quote=True)
-        prompt = (f'<div class="prompt"><code id="p-{sec.id}">{html.escape(sec.prompt)}</code>'
-                  f'<button type="button" class="copy" data-prompt="{esc}" '
-                  f'aria-describedby="p-{sec.id}">Copy</button></div>')
+def _data_uri(filename: str) -> str:
+    return "data:image/jpeg;base64," + base64.b64encode((ASSETS / filename).read_bytes()).decode("ascii")
+
+
+def _prompt(key: str, prompt: str, where: Optional[str]) -> str:
+    esc = html.escape(prompt, quote=True)
+    hint = f'<p class="paste">Paste in: {WHERE[where]}</p>' if where else ""
+    return (f'<div class="prompt"><code id="p-{key}">{html.escape(prompt)}</code>'
+            f'<button type="button" class="copy" data-prompt="{esc}" aria-describedby="p-{key}">Copy</button>'
+            f'</div>{hint}')
+
+
+def _shots(images) -> str:
+    if not images:
+        return ""
+    figs = "".join(f'<img src="{_data_uri(f)}" alt="{html.escape(alt, quote=True)}" loading="lazy">'
+                   for f, alt in images)
+    return f'<div class="shots">{figs}</div>'
+
+
+def _section(sec: Section, first: bool, who: str) -> str:
+    prompt = _prompt(sec.id, sec.prompt, sec.where) if sec.prompt else ""
     return (
-        f'<section class="sec card{" cur" if n == 1 else ""}" id="s-{sec.id}" data-id="{sec.id}" aria-labelledby="h-{sec.id}" '
-        f'style="--accent:var(--a-{sec.id})">'
+        f'<section class="sec card{" cur" if first else ""}" id="s-{sec.id}" data-id="{sec.id}" '
+        f'aria-labelledby="h-{sec.id}" style="--accent:var(--a-{sec.id})">'
         f'<div class="icon" aria-hidden="true"><svg viewBox="0 0 64 64" focusable="false">{ICONS[sec.id]}</svg></div>'
-        f'<div class="body"><p class="step">Step {n} of {total}</p>'
-        f'<h2 id="h-{sec.id}">{sec.title}</h2>'
+        f'<div class="body"><h2 id="h-{sec.id}">{sec.title}</h2>'
         f'<p>{sec.what.format(name=who)}</p><p class="how">{sec.how.format(name=who)}</p>{prompt}'
+        f'{_shots(sec.images)}'
         f'<label class="done"><input type="checkbox" data-done="{sec.id}" disabled> Mark done</label>'
         '</div></section>'
+    )
+
+
+def _finale(who: str) -> str:
+    return (
+        '<section class="card finale" id="finale" aria-labelledby="h-finale" hidden '
+        'style="--accent:var(--brand)"><div class="body">'
+        f'<h2 id="h-finale" tabindex="-1">You&rsquo;re set &mdash; ask {who} anything</h2>'
+        f'<p class="how">That was the whole tour. Start with something real:</p>'
+        f'{_prompt("finale", FINALE_PROMPT, "dm")}</div></section>'
     )
 
 
@@ -214,12 +267,19 @@ p { margin:0 0 6px; }
 .dot { width:28px; height:28px; padding:0; border-radius:50%%; font-size:12px; border:2px solid var(--line); color:var(--muted); background:var(--card); }
 .dot[aria-current="step"] { border-color:var(--brand); color:var(--fg); }
 .dot.is-done { background:var(--brand); border-color:var(--brand); color:var(--card); }
+.card[hidden] { display:none; }
 .card { background:var(--card); border:1px solid var(--line); border-top:4px solid var(--accent); border-radius:12px; padding:16px; margin:0 0 12px; display:flex; gap:16px; }
 .icon { flex:none; width:72px; height:72px; border-radius:16px; color:var(--accent); position:relative; display:grid; place-items:center; }
 .icon::before { content:""; position:absolute; inset:0; border-radius:inherit; background:currentColor; opacity:.12; }
 .icon svg { width:52px; height:52px; position:relative; }
 .body { min-width:0; flex:1; }
-.step { font-size:13px; font-weight:600; letter-spacing:.02em; color:var(--accent); margin-bottom:2px; }
+.step-title { flex-basis:100%%; margin:0; font-weight:600; }
+.js main[data-mode="all"] .step-title { display:none; }
+.paste { font-size:13px; color:var(--muted); margin:4px 0 0; }
+.shots { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; align-items:flex-start; }
+.shots img { max-width:100%%; height:auto; border:1px solid var(--line); border-radius:8px; }
+.finale { border-top-color:var(--brand); }
+.finale h2 { font-size:21px; }
 .prompt { display:flex; gap:8px; align-items:center; margin-top:8px; }
 code { flex:1; min-width:0; background:var(--code); border-radius:6px; padding:6px 8px; font-size:14px; overflow-wrap:anywhere; user-select:all; }
 button { flex:none; border:1px solid var(--brand); color:var(--brand); background:transparent; border-radius:8px; padding:6px 12px; font:inherit; font-size:14px; cursor:pointer; }
@@ -264,6 +324,8 @@ SCRIPT = """<script>
   const label = document.getElementById('progress-label');
   const fill = document.getElementById('progress-fill');
   const bar = document.getElementById('progress-bar');
+  const stepTitle = document.getElementById('step-title');
+  const finale = document.getElementById('finale');
   const done = new Set();
   let cur = 0;
   let store = { kind: 'memory', key: 'gs-done' };
@@ -324,6 +386,8 @@ SCRIPT = """<script>
       if (i === cur) d.setAttribute('aria-current', 'step'); else d.removeAttribute('aria-current');
     });
     const stepping = main.dataset.mode === 'step';
+    stepTitle.textContent = titles[cur];
+    finale.hidden = n !== ids.length;
     back.hidden = next.hidden = !stepping;
     back.disabled = cur === 0;
     next.disabled = cur === ids.length - 1;
@@ -344,6 +408,10 @@ SCRIPT = """<script>
     if (!id) return;
     if (ev.target.checked) done.add(id); else done.delete(id);
     save(); paint();
+    if (!ev.target.checked || main.dataset.mode !== 'step') return;
+    const after = ids.map((_, k) => (cur + 1 + k) % ids.length).find((k) => !done.has(ids[k]));
+    if (after === undefined) { finale.querySelector('h2').focus(); return; }
+    show(after, true);
   });
   document.addEventListener('keydown', (ev) => {
     if (main.dataset.mode !== 'step' || ev.altKey || ev.metaKey || ev.ctrlKey) return;
@@ -405,7 +473,7 @@ def render_page(name: str, core: str = "unknown") -> str:
     """The whole page as one HTML string; depends on nothing but the agent's name and core."""
     who = html.escape(clean_name(name))
     secs = sections_for(core)
-    body = "".join(_section(s, i, len(secs), who) for i, s in enumerate(secs, 1))
+    body = "".join(_section(s, i == 0, who) for i, s in enumerate(secs))
     light, dark = _palette()
     return (
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
@@ -421,9 +489,10 @@ def render_page(name: str, core: str = "unknown") -> str:
         f"aria-valuemin=\"0\" aria-valuemax=\"{len(secs)}\" aria-valuenow=\"0\"><span id=\"progress-fill\"></span></div></div>"
         "<nav class=\"controls\" id=\"controls\" aria-label=\"Tour steps\">"
         "<div class=\"dots\" id=\"dots\"></div>"
+        f"<p class=\"step-title\" id=\"step-title\" aria-live=\"polite\">{secs[0].title}</p>"
         "<button type=\"button\" id=\"back\" aria-label=\"Previous step\">Back</button>"
         "<button type=\"button\" id=\"next\" aria-label=\"Next step\">Next</button>"
         "<button type=\"button\" id=\"all\" aria-pressed=\"false\">Show all</button></nav>"
-        f"{body}<div id=\"status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\"></div>"
+        f"{_finale(who)}{body}<div id=\"status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\"></div>"
         f"</main>{SCRIPT}{COPY_SCRIPT}</body></html>\n"
     )

@@ -55,6 +55,9 @@ from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these 
 
 SUMMON_CONTEXT = "A short tour of AG2 Space, with one thing to try in each part."
 PROFILE_TIMEOUT = 5
+# Room Commons refuses a page body over 196,608 bytes in one write; larger pages go in pieces.
+CHUNK_BYTES = 150_000
+ARGV_BYTES = 600_000
 USER_AGENT = "sutando-tutorial/1"
 FALLBACK_NAME = "Sutando"
 MXID = re.compile(r"^@([^:\s]+):([A-Za-z0-9.\-]+(?::\d+)?)$")
@@ -151,6 +154,34 @@ def resolve_name(name: str, mxid: Optional[str] = None,
     return profile_name(mxid, fetch) or localpart_name(mxid) or FALLBACK_NAME
 
 
+def chunks(text: str, limit: int = 0) -> List[str]:
+    """`text` cut into pieces of at most `limit` UTF-8 bytes, never inside a character."""
+    limit = limit or CHUNK_BYTES
+    out, part, size = [], [], 0
+    for ch in text:
+        n = len(ch.encode("utf-8"))
+        if size + n > limit and part:
+            out.append("".join(part))
+            part, size = [], 0
+        part.append(ch)
+        size += n
+    if part:
+        out.append("".join(part))
+    return out
+
+
+def changed_bytes(old: str, new: str) -> int:
+    """UTF-8 bytes a replace of `old` by `new` writes once their common prefix and suffix are
+    dropped, as room-commons does before it edits."""
+    p, limit = 0, min(len(old), len(new))
+    while p < limit and old[p] == new[p]:
+        p += 1
+    q = 0
+    while q < limit - p and old[-1 - q] == new[-1 - q]:
+        q += 1
+    return len(old[p:len(old) - q].encode("utf-8")) + len(new[p:len(new) - q].encode("utf-8"))
+
+
 def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -232,6 +263,23 @@ class Commons:
     def read(self, kind: str) -> str:
         return json.loads(self.run("read", self.room, kind=kind, as_json=True)).get("text") or ""
 
+    def append(self, kind: str, text: str) -> None:
+        for part in chunks(text):
+            self.run("append", self.room, part, kind=kind)
+
+    def rewrite(self, kind: str, old: str, new: str) -> None:
+        """Replace the page's text: one edit when the change is small enough to send at once, else
+        clear the page piece by piece and append the new text in pieces."""
+        if not old:
+            self.append(kind, new)
+        elif (changed_bytes(old, new) <= CHUNK_BYTES
+              and len(old.encode("utf-8")) + len(new.encode("utf-8")) <= ARGV_BYTES):
+            self.run("replace", self.room, old, new, kind=kind)
+        else:
+            for part in chunks(old):
+                self.run("replace", self.room, part, "", kind=kind)
+            self.append(kind, new)
+
 
 def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = None,
             summon: bool = False, core: str = "unknown") -> dict:
@@ -245,15 +293,12 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             if current == page:
                 action = "unchanged"
             else:
-                if current:
-                    commons.run("replace", commons.room, current, page, kind=kind)
-                else:
-                    commons.run("append", commons.room, page, kind=kind)
+                commons.rewrite(kind, current, page)
                 action = "updated"
         else:
             kind = commons.add_page(PAGE_TITLE)
             try:
-                commons.run("append", commons.room, page, kind=kind)
+                commons.append(kind, page)
             except PublishError as exc:
                 with contextlib.suppress(PublishError):
                     commons.run("page-remove", commons.room, kind)
