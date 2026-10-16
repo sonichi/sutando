@@ -102,13 +102,15 @@ class VerifierMirrorsSparrow(unittest.TestCase):
         flipped = signed.replace("access_tier: owner", "access_tier: guest")
         crlf = stamp(base.replace("\n", "\r\n"), self.key)
         no_id = stamp("source: ag2space\naccess_tier: team\ntask: hi\n", self.key)
+        # Tier shapes, in order: post-task only, pre-task wins over post-task, pre-task
+        # conflict, the legacy `other` alias, an unknown tier, no tier at all, collaborator.
         tiers = [
-            "id: t\ntask: hi\naccess_tier: team\n",                       # post-task only: trusted
-            "id: t\naccess_tier: owner\ntask: hi\naccess_tier: guest\n",  # pre-task wins
-            "id: t\naccess_tier: owner\naccess_tier: guest\ntask: hi\n",  # conflict → guest
-            "id: t\naccess_tier: other\ntask: hi\n",                      # legacy alias → guest
-            "id: t\naccess_tier: admin\ntask: hi\n",                      # unknown → guest
-            "id: t\ntask: hi\n",                                          # none → owner
+            "id: t\ntask: hi\naccess_tier: team\n",
+            "id: t\naccess_tier: owner\ntask: hi\naccess_tier: guest\n",
+            "id: t\naccess_tier: owner\naccess_tier: guest\ntask: hi\n",
+            "id: t\naccess_tier: other\ntask: hi\n",
+            "id: t\naccess_tier: admin\ntask: hi\n",
+            "id: t\ntask: hi\n",
             "id: t\ncollaborator: true\naccess_tier: team\ntask: hi\n",
         ]
         return [signed, flipped, base, crlf, no_id] + [stamp(t, self.key) for t in tiers]
