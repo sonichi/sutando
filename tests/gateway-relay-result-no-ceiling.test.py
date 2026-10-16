@@ -55,10 +55,12 @@ Bridges, Relay = gateway_relay.Bridges, gateway_relay.Relay
 CONTRACT = ["voice-outcome-v1"]
 OWNER = "@owner:ag2.space"
 ROOM = "!room:ag2.space"
-ASK_A = "ask-5f3c9e0a1b2c"
+ASK_A, ASK_B = "ask-5f3c9e0a1b2c", "ask-7d4e2f1a9b8c"
 TYPED_A = "task-22d83e59601f3a1fef"
 SESSION_END = "voice-end-0123456789abcdef01234567"
 EMPTY_HOLDER = "task-0e5d1c2b3a4f5e6d7c"
+UNVERIFIED = ("⚠️ The holder's delivery destination or sender could not be verified. "
+              "This question needs a direct answer.")
 PRIVATE, TEXT = "[dm-only]\nYour 3pm is with Dana.", "Your 3pm is with Dana."
 ANSWER = {"id": ASK_A, "body": TEXT, "capabilities": CONTRACT, "dm_only": True}
 FAILED = {"id": ASK_A, "body": "", "status": "failed", "capabilities": CONTRACT, "dm_only": False}
@@ -183,6 +185,16 @@ class _Bridge(unittest.TestCase):
 
     def backoff_counts(self, *ids: str) -> "list[tuple]":
         return sorted(k for k in gw._LOG_COUNTS if k[0] in ids)
+
+    def drain_while_the_marks_cannot_be_read(self, *tids: str) -> None:
+        """One pass that waits under the local id (`deferred`); `tids` limits it to those."""
+        marks = gw.ACK_FIRST_FILE.read_text()
+        gw.ACK_FIRST_FILE.write_text("{not json")
+        if tids:
+            gw._post_ready_results(set(tids))
+        else:
+            self.drain()
+        gw.ACK_FIRST_FILE.write_text(marks)
 
     def delivered_after_waiting(self, body: str = PRIVATE) -> str:
         """A relay result that waited in every way that counts (misses, waits inside the
@@ -445,13 +457,33 @@ class TheRuleOnANamedInstance(_Bridge):
         self.assertNotEqual(ask, ASK_A)
         self.assertEqual(self.backoff_counts(ASK_A, ask), [], "counts outlived the delivery")
 
+    def test_a_reported_folds_backoff_counts_go_by_both_ids(self):
+        holder = self.serve(voice_ask(ASK_A))
+        asker = self.serve(voice_ask(ASK_B))
+        self.answer(holder, "Your calendar is clear.")   # answered, not yet accepted: a report
+        self.answer(asker, f"[deduped: {holder}]")
+        self.broker.result = "down"
+        gw._post_ready_results({asker})                  # the report missed: by broker id
+        self.drain_while_the_marks_cannot_be_read(asker)  # the report waited: by local id
+        self.assertEqual({k[0] for k in self.backoff_counts(ASK_B, asker)}, {ASK_B, asker})
+        self.broker.result = "ok"
+        gw._delivery_core("relay").backend.clock = lambda: time.time() + 60.0
+        gw._post_ready_results({asker})
+        self.assertEqual(self.broker.results()[-1]["body"], UNVERIFIED)
+        self.assertEqual(gw._load_ack_first(), {ASK_A: holder}, "the report kept its mark")
+        self.assertEqual(self.backoff_counts(ASK_B, asker), [], "counts outlived the report")
+
     def test_an_ended_relay_results_backoff_counts_go_by_both_ids(self):
         ask = self.serve(voice_ask())
         self.answer(ask)
         self.broker.result = "400"
         clock = [time.time()]
         gw._delivery_core("relay").backend.clock = lambda: clock[0]
-        for _pass in range(3):
+        self.drain()                                     # the answer refused: a miss, by broker id
+        clock[0] += 60.0
+        self.drain_while_the_marks_cannot_be_read()      # a wait, by local id
+        self.assertEqual({k[0] for k in self.backoff_counts(ASK_A, ask)}, {ASK_A, ask})
+        for _pass in range(2):
             gw._save_inflight(self.drain())
             clock[0] += 60.0
         self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
@@ -650,6 +682,9 @@ class EndCutShort(_Bridge):
         clock = [time.time()]
         gw._delivery_core("relay").backend.clock = lambda: clock[0]
         real = getattr(gw, step)
+        self.drain()                                     # the answer refused: a miss, by broker id
+        clock[0] += 60.0
+        self.drain_while_the_marks_cannot_be_read()      # a wait, by local id
 
         def dies(*a, **k):
             if not before:
@@ -664,6 +699,8 @@ class EndCutShort(_Bridge):
         return ask
 
     def assert_finished_by_a_start(self, ask: str) -> None:
+        self.assertEqual({k[0] for k in self.backoff_counts(ASK_A, ask)}, {ASK_A, ask},
+                         "no count under each id to check the finish against")
         with patch.multiple(gw, _SETTLE_PENDING=set(), _SETTLE_SCANNED=set(), _SETTLE_LOADED=False):
             gw._reclaim_parked_relay_results(set(gw._load_inflight()))
             self.assertEqual(gw._load_ack_first(), {})
