@@ -218,6 +218,7 @@ WRITERS = {
     "skills/deal-finder/scripts/scan.py": "from result_publish import publish_text",
     "skills/pending-questions/scripts/pending_questions_remind.py": "from result_publish import publish_text",
     "skills/import-claude-context/scripts/finalize.py": "from result_publish import publish_text",
+    "skills/schedule-crons/scripts/codex-scheduler.py": "from result_publish import publish_text",
     "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py": "from .result_publish import",
     "src/notify.sh": "result_publish.py",
     "src/launchd/gateway-bridge-wrapper.sh": "result_publish.py",
@@ -235,6 +236,7 @@ VIA_LOCAL_RECORD = {
 HAND_ROLLED = (
     "result_file.write_text(", "output_path.write_text(", "(RESULTS_DIR / name).write_text(",
     "tmp.write_text(part", 'f.write_text(clean_body', "path.write_text(\n        f\"You have",
+    'atomic_text(path, f"Schedule alert',
 )
 
 

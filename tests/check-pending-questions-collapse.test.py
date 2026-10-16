@@ -67,6 +67,8 @@ with tempfile.TemporaryDirectory() as td:
     ok("3 fires, same set -> 1 proactive-pending-q file", len(files) == 1)
     body = files[0].read_text() if files else ""
     ok("proactive content lists the question set", "Q1" in body and "Q2" in body)
+    mode = files[0].stat().st_mode & 0o777 if files else None
+    ok("reminder body is owner-only (0600), as the mkstemp it replaced", mode == 0o600)
 
 # T5: a changed set supersedes the earlier undelivered reminder rather than
 # queueing beside it — the old body states a count that is no longer true.

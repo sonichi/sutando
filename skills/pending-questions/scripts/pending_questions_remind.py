@@ -220,7 +220,8 @@ def notify_discord_dm(questions):
     # BEFORE writing: a file appearing after can be an overlapping run's, not ours.
     superseded = [p for p in RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}*.txt") if p != path]
     # Appear at the deliverable name in one step: a poll claims proactive-*.txt on sight.
-    publish_text(path, "\n".join(lines))
+    # Owner-only (0600): the body holds the owner's question titles and snippets.
+    publish_text(path, "\n".join(lines), mode=0o600)
     for old in superseded:
         old.unlink(missing_ok=True)
 
