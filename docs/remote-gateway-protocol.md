@@ -135,7 +135,10 @@ so only the newest serve's lease is acked.
 broker id of each task served with `ack_first` to the local id it is published
 under. It is a file of its own because an older bridge prunes the media sidecar
 when it settles a task, and the mark must survive a restart: it decides whether
-an honoured fold sends `consolidated_into` (see `POST /v1/results`). A mark is
+an honoured fold sends `consolidated_into` (see `POST /v1/results`), gives the
+task's result the relay rule's delivery with no ceiling, and lets an updated
+bridge reclaim at start a result an older bridge parked (see "A relay ask's
+result" under "Delivery + idempotency"). A mark is
 removed once the broker has accepted that task's result and the result is
 archived, at start when the outbox shows that result delivered and no result of
 the task is still live, or when its ack is refused, since such a task never
@@ -182,6 +185,8 @@ body: { "id": "task-123", "body": "<result text>",
 body: { ..., "thread": "ask" }                                  // optional
 body: { "id": "ask-…", "body": "", "consolidated_into": "ask-…",
         "capabilities": ["voice-outcome-v1"], "dm_only": false }  // an honoured fold
+body: { "id": "ask-…", "body": "", "status": "failed",
+        "capabilities": ["voice-outcome-v1"], "dm_only": false }  // a relay ask's refused result
 ```
 
 **The voice-outcome contract (`capabilities`, `dm_only`).** Every result carries
@@ -492,8 +497,59 @@ Without it, an expired window stays expired. The operator action increments the
 outbox resend epoch, but the gateway envelope retains the same broker result ID.
 Inspect whether a reply was already manually sent before recovering it.
 Existing parked records and historical quarantined replies are **not** migrated
-or replayed automatically. Live nonterminal records without a schedule acquire
-one on their next claim.
+or replayed automatically, except a relay ask's result an older bridge parked
+(below). Live nonterminal records without a schedule acquire one on their next
+claim.
+
+### A relay ask's result (no ceiling)
+
+A result posted under the id of a task whose `ack_first` mark is kept (see
+`GET /v1/tasks`), a re-ask's answer included, has no window and no attempt cap:
+it is retried, durably across restarts, under the same id and payload, until the
+broker accepts it, and it never ends on the Mac alone.
+
+- A 401 or 403 is retried while the poll loop recovers the credential, as above,
+  for as long as that takes.
+- A 408, 425, 429, a 5xx or a transport failure keeps the same result, retried
+  under its id with the same backoff (2 s doubling to 30 s).
+- A definite refusal of the payload (any other 4xx, or a decline envelope) swaps
+  in a minimal `failed` result for the same task (the `failed` body above), stored
+  in place of the refused payload, which the record keeps as `refused_payload`.
+  It is retried the same way, so the broker ends the ask and posts "couldn't
+  finish". Once it is accepted the live result is archived as usual.
+- A park the rule could not prevent, such as the 10-minute window an older bridge
+  started before the Mac updated, is requeued with its retry state reset when the
+  drain meets it, rather than quarantined.
+
+The outbox requires a finite window, so the relay rule's is a century. While the
+marks cannot be read, a voice ask's result waits; every other result goes on.
+Every result without a kept mark keeps the bounded policy above, unchanged. An
+orphan sweep that cannot deliver a relay ask's result keeps its id in flight, so
+the drain retries it and no later sweep quarantines it as too old.
+
+**Reclaimed at start after a downgrade.** An older bridge parks a relay ask's
+result after its 10-minute window and moves the body to `results/undelivered/`.
+On the primary lane, where the local id is the `ask-…` broker id, it never settles
+the task, because its quarantine lookup adds `task-` to an id without it; on a
+named instance, or for a re-ask on either lane, a restart settles it (the task is
+archived, its id leaves the in-flight set and its alias is forgotten). The older
+bridge never reads or writes the mark, so the mark survives. When an updated
+bridge starts, before its first drain, for each outbox item a mark names that is
+`PARKED`, with no live result at the local id's name:
+
+1. it requeues the item with its retry state reset, under the relay rule;
+2. it puts the local id the mark names back in the in-flight set, if it left;
+3. only then does it move the newest copy in `results/undelivered/` filed under
+   that local id, or under its re-ask's id, to `results/<local id>.txt`, never
+   over a file and never under the re-ask's id, whose alias may be gone.
+
+The drain then sends the item's stored payload under the same id. That payload is
+the older bridge's: it carries no contract, so the broker treats the answer as
+private. The orphan sweep never handles it, since its id is in flight. A reclaim
+cut short is finished at the next start (the item's requeue reason records it). A
+copy set aside on purpose for a person (an unattributed worker's reply, or a
+second reply after a delivery) has no parked item and stays for the operator, as
+does an answer whose Mac is never updated again.
 
 ### Duplicates waiting for a holder's answer
 

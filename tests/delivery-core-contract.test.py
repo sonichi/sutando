@@ -24,7 +24,8 @@ if str(_PKG) not in sys.path:
 from ag2_sparrow.delivery_core import (  # noqa: E402
     BackendCapabilities, ClaimToken, DeliveryCore, DeliveryOutcome, DeliveryReceipt,
     DesignAClaimBackend, DrainStatus, ProviderCapabilities,
-    ProviderIndeterminate, ProviderRefused, RetryPolicy, idempotency_key)
+    ProviderIndeterminate, ProviderPermanentRefused, ProviderRefused, RetryPolicy,
+    idempotency_key)
 from ag2_sparrow.delivery_core.core import _resend_epoch  # noqa: E402
 from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend  # noqa: E402
 from ag2_sparrow import outbox  # noqa: E402
@@ -457,6 +458,32 @@ class CorePolicy(unittest.TestCase):
         p = _Recorder([ProviderRefused("rejected before dispatch")])
         r = self._core(p).deliver_one(ITEM, b"x")
         self.assertIs(r.outcome, DeliveryOutcome.NOT_DELIVERED)
+
+    def test_a_refusal_for_good_parks_unless_a_replacement_is_configured(self):
+        """`replace_refused` is opt-in. Without it a refusal for good parks, as before. With
+        it the replacement is stored, the first refused payload and the source proof kept,
+        it is retried like any failure, and it is what every later attempt sends."""
+        self._core(_Recorder([ProviderPermanentRefused("HTTP 400")])).deliver_one(ITEM, b"x")
+        self.assertEqual(outbox._read_item(self.backend.root, ITEM)["reason"], "permanent-refusal")
+        with tempfile.TemporaryDirectory() as d:
+            backend = DesignAClaimBackend(Path(d), replace_refused=lambda stored: "y")
+            backend.publish(ITEM, b"x", source_ready_sha256="ab" * 32)
+            sent: list = []
+
+            class _Sends(_Recorder):
+                def deliver(self, item_id, payload, key):
+                    sent.append(payload)
+                    return super().deliver(item_id, payload, key)
+            core = DeliveryCore(backend, _Sends([ProviderPermanentRefused("HTTP 400"),
+                                                 ProviderPermanentRefused("HTTP 400"),
+                                                 DeliveryOutcome.CONFIRMED]))
+            for _ in range(3):
+                core.deliver_one(ITEM, b"x")
+            record = outbox._read_item(backend.root, ITEM)
+        self.assertEqual(sent, [b"x", b"y", b"y"])
+        self.assertEqual((record["status"], record["payload"], record["refused_payload"]),
+                         ("DELIVERED", "y", "x"))
+        self.assertEqual(outbox.source_proof(record), "ab" * 32)
 
     def test_programming_error_propagates(self):
         """Owner review finding 5, the other half: a bare Exception is a

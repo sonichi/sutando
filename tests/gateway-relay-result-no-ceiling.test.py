@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""A voice relay ask's result is delivered with no ceiling, and reclaimed after a downgrade.
+
+For a task served with `ack_first` (its mark is kept), the result's outbox item is retried
+with no window and no attempt cap, across restarts, under the same id and payload, until
+the broker accepts it: a 401 or 403 waits for the poll loop's credential recovery, a 408,
+425, 429, 5xx or network failure keeps the same result, and a definite refusal of the
+payload swaps in a minimal `failed` result for the same task, kept and retried the same
+way. Every other result keeps today's 10-minute window and is parked on the Mac after it.
+
+A bridge from before the contract parks a relay ask's result it cannot deliver for 10
+minutes; on a named instance, or for a re-ask, a restart then settles the task. When an
+updated bridge starts, it requeues each such item a mark names, puts the local id the mark
+names back in flight, and moves the newest quarantined copy back to that id's name, so the
+answer is posted once, under the relay ask's id, with the older bridge's stored payload.
+
+Drives the real drain, orphan sweep and reclaim in process; outages, refusals, restarts and
+downgrades run the real poll loop (`main()`) in fresh processes over one workspace, against
+a relay on a real socket. The older bridge is replayed by `_helpers/older_bridge.py`.
+
+Run: python3 tests/gateway-relay-result-no-ceiling.test.py
+"""
+from __future__ import annotations
+
+import contextlib
+import glob
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import urllib.error
+from pathlib import Path
+from unittest.mock import patch
+
+_REPO = Path(__file__).resolve().parent.parent
+_PKG = _REPO / "packages" / "ag2-sparrow"
+_TESTS = Path(__file__).resolve().parent
+if str(_PKG) not in sys.path:
+    sys.path.insert(0, str(_PKG))
+
+sys.path.insert(0, str(_TESTS))
+from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+
+from _helpers import older_bridge  # noqa: E402
+from _helpers.gateway_relay import Bridges, Relay  # noqa: E402
+from ag2_sparrow import gateway_instance, outbox, remote_gateway_bridge as gw  # noqa: E402
+
+CONTRACT = ["voice-outcome-v1"]
+OWNER = "@owner:ag2.space"
+ROOM = "!room:ag2.space"
+ASK_A = "ask-5f3c9e0a1b2c"
+TYPED_A = "task-22d83e59601f3a1fef"
+EMPTY_HOLDER = "task-0e5d1c2b3a4f5e6d7c"
+PRIVATE, TEXT = "[dm-only]\nYour 3pm is with Dana.", "Your 3pm is with Dana."
+ANSWER = {"id": ASK_A, "body": TEXT, "capabilities": CONTRACT, "dm_only": True}
+FAILED = {"id": ASK_A, "body": "", "status": "failed", "capabilities": CONTRACT, "dm_only": False}
+DAY = 86400.0
+
+_LEDGERS = {"INFLIGHT_FILE": "remote-task-inflight", "TASK_ROOMS_FILE": "remote-task-rooms",
+            "TASK_MEDIA_FILE": "remote-task-media", "PENDING_ACK_FILE": "remote-task-acks",
+            "DEDUP_ALIAS_FILE": "remote-dedup-alias", "ACK_FIRST_FILE": "remote-task-ack-first",
+            "ACK_FIRST_MANIFEST_FILE": "remote-task-ack-first-manifest"}
+
+
+def voice_ask(broker_id: str = ASK_A) -> dict:
+    """A relay ask as the broker serves one: no room, the owner as `user_id`."""
+    return {"id": broker_id, "task": "What's on my calendar today?", "source": "matrixrtc-voice",
+            "user_id": OWNER, "asked_by": OWNER, "access_tier": "owner",
+            "lease_id": f"gen-{broker_id}", "ack_first": True}
+
+
+def typed_task(broker_id: str = TYPED_A) -> dict:
+    return {"id": broker_id, "task": "What is AG2Space?", "source": "ag2space",
+            "channel_id": ROOM, "user_id": OWNER, "access_tier": "owner"}
+
+
+def item(root: Path, item_id: str) -> dict:
+    return outbox.read_item(root, item_id) or {}
+
+
+def age_retry(root: Path, item_id: str, seconds: float, failures: int = 20) -> None:
+    """As if every send of the item had failed for `seconds` more: the outage on disk."""
+    path = outbox._item_path(root, item_id)
+    record = json.loads(path.read_text())
+    for key in ("started_at", "deadline", "next_attempt_at"):
+        record["retry"][key] -= seconds
+    record["retry"]["failures"] = max(record["retry"]["failures"], failures)
+    path.write_text(json.dumps(record, sort_keys=True))
+
+
+def refused(code: int, body: "dict | None" = None) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("http://relay/v1/results", code, "refused", {},
+                                  io.BytesIO(json.dumps(body or {"error": "refused"}).encode()))
+
+
+class _Broker:
+    """The broker's side of the wire, in process. Acks are accepted; `result` answers each
+    result POST: "ok", "down" (no connection) or an HTTP status that refuses it."""
+
+    def __init__(self):
+        self.calls: "list[tuple]" = []
+        self.result = "ok"
+
+    def request(self, method, path, payload=None, **_kw):
+        payload = None if payload is None else json.loads(json.dumps(payload))
+        self.calls.append((method, path, payload))
+        if path == "/v1/results":
+            answer = self.result(payload) if callable(self.result) else self.result
+            if answer == "down":
+                raise urllib.error.URLError("connection refused")
+            if answer != "ok":
+                raise refused(int(answer))
+        if path == "/v1/agents":
+            return {"agents": []}
+        return {"ok": True, "delivery_readable": True, "durable": True}
+
+    def results(self) -> "list[dict]":
+        return [p for _m, path, p in self.calls if path == "/v1/results"]
+
+
+class _Bridge(unittest.TestCase):
+    """The real bridge over a scratch workspace; `INSTANCE` names its gateway."""
+
+    INSTANCE = ""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="relay-no-ceiling-")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.broker = _Broker()
+        self.lines: "list[str]" = []
+        for d in ("results", "tasks", "state"):
+            (self.root / d).mkdir()
+        suffix = f".{self.INSTANCE}" if self.INSTANCE else ""
+        state = self.root / "state"
+        values = dict(
+            RESULTS_DIR=self.root / "results", ARCHIVE_RESULTS_DIR=self.root / "results" / "archive",
+            UNDELIVERABLE_RESULTS_DIR=self.root / "results" / "undelivered",
+            TASKS_DIR=self.root / "tasks", _STATE=state,
+            GATEWAY_INSTANCE=self.INSTANCE, _INST_SUFFIX=suffix,
+            OWNER_ACTIVITY_FILE=state / "last-owner-activity.json",
+            _DELIVERY_CORE=None, _RELAY_CORE=None, _req=self.broker.request, _log=self.lines.append,
+            _fire_on_task=lambda *a, **k: None,
+            _WITHHELD_TASK_OUTPUT={}, _SETTLE_PENDING=set(), _SETTLE_SCANNED=set(),
+            _SETTLE_LOADED=False, _REDELIVERED=set(), _HELD_TASKS={}, _HELD_REPORTED=set(),
+            **{name: state / f"{stem}{suffix}.json" for name, stem in _LEDGERS.items()})
+        stack = contextlib.ExitStack()
+        for name, value in values.items():
+            stack.enter_context(patch.object(gw, name, value))
+        stack.enter_context(patch.object(outbox, "_activity_completed", lambda *a, **k: None))
+        self.addCleanup(stack.close)
+        self.outbox_root = gateway_instance.outbox_root(gw.RESULTS_DIR, self.INSTANCE)
+
+    def serve(self, task: dict) -> str:
+        """Queue a served task as the poll loop does: a relay ask acknowledged first."""
+        if task.get("ack_first") is True:
+            self.assertTrue(gw._take_ack_first(dict(task), set(gw._load_inflight())))
+            return gw._local_tid(task["id"])
+        tid, _durable = gw._write_task(dict(task))
+        gw._save_inflight(set(gw._load_inflight()) | {tid})
+        return tid
+
+    def answer(self, tid: str, body: str = PRIVATE) -> None:
+        (gw.RESULTS_DIR / f"{tid}.txt").write_text(body)
+
+    def drain(self) -> "set[str]":
+        inflight = set(gw._load_inflight())
+        gw._post_ready_results(inflight)
+        return inflight
+
+    def quarantined(self) -> "list[str]":
+        d = gw.UNDELIVERABLE_RESULTS_DIR
+        return sorted(p.name for p in d.iterdir() if not p.name.startswith(".")) if d.is_dir() else []
+
+
+class TheRule(_Bridge):
+    """Which results get the relay rule, and what it does where today's policy parks."""
+
+    def older_window_runs_out(self, failures: int) -> None:
+        # The Mac updated while an older bridge's 10-minute window was running: that window
+        # is on disk, and it runs out under the updated bridge.
+        ask = self.serve(voice_ask())
+        self.answer(ask)
+        self.broker.result = "down"
+        stored = json.dumps({"id": ASK_A, "body": TEXT}).encode()
+        old = gw._delivery_core()
+        old.backend.publish(ASK_A, stored, source_ready_sha256=outbox.source_digest(PRIVATE))
+        old.deliver_one(ASK_A, stored)
+        age_retry(self.outbox_root, ASK_A, 700, failures=failures)
+        self.drain()
+        self.assertEqual(self.quarantined(), [])
+        self.assertTrue((gw.RESULTS_DIR / f"{ask}.txt").exists())
+        record = item(self.outbox_root, ASK_A)
+        self.assertEqual((record["status"], record["requeue_reason"]), ("QUEUED", gw._RELAY_REOPENED))
+        self.assertNotIn("retry", record, "the older window was kept")
+        self.broker.result = "ok"
+        self.assertNotIn(ask, self.drain())
+        self.assertEqual(self.broker.results()[-1], {"id": ASK_A, "body": TEXT})
+        self.assertEqual(item(self.outbox_root, ASK_A)["status"], "DELIVERED")
+        self.assertEqual(gw._load_ack_first(), {})
+
+    def test_a_park_left_by_an_older_window_is_reopened_never_quarantined(self):
+        self.older_window_runs_out(failures=20)      # parked before the claim
+
+    def test_a_window_that_runs_out_during_a_send_is_reopened_too(self):
+        self.older_window_runs_out(failures=4)       # parked by the failed send itself
+
+    def test_a_refused_failed_result_is_retried_never_parked(self):
+        ask = self.serve(voice_ask())
+        typed = self.serve(typed_task())
+        self.answer(ask)
+        self.answer(typed, "A collaborative workspace.")
+        self.broker.result = "400"
+        clock = [time.time()]
+        gw._delivery_core("relay").backend.clock = lambda: clock[0]
+        for _pass in range(8):
+            self.drain()
+            clock[0] += 60.0
+        self.assertEqual(item(self.outbox_root, TYPED_A)["reason"], "permanent-refusal",
+                         "a typed result no longer parks on a refusal")
+        self.assertEqual([n.split("-")[0] for n in self.quarantined()], ["task"])
+        record = item(self.outbox_root, ASK_A)
+        self.assertNotEqual(record["status"], "PARKED")
+        self.assertEqual(json.loads(record["payload"]), FAILED)
+        self.assertEqual(json.loads(record["refused_payload"]), ANSWER)
+        self.assertGreaterEqual(record["retry"]["failures"], 8)
+        self.assertNotIn("requeue_reason", record, "it was parked on the way")
+        relay_posts = [p for p in self.broker.results() if p["id"] == ASK_A]
+        self.assertEqual(relay_posts, [ANSWER] + [FAILED] * 7, "the answer was sent more than once")
+        self.assertEqual(sum("is sent in its place" in line for line in self.lines), 1,
+                         "a refused `failed` was swapped again")
+        self.broker.result = "ok"
+        self.assertNotIn(ask, self.drain())
+        self.assertEqual(self.broker.results()[-1], FAILED)
+        self.assertEqual(self.quarantined()[0].split("-")[0], "task")
+        self.assertEqual(len(self.quarantined()), 1, "the relay ask's answer was quarantined")
+
+    def test_a_close_of_an_accepted_id_keeps_todays_policy(self):
+        # The broker already took this task's result: no `failed` may follow it.
+        ask = self.serve(voice_ask())
+        self.answer(ask, "Your calendar is clear.")
+        self.drain()
+        gw._record_ack_first(ask)                    # a retirement that did not commit
+        self.broker.result = lambda p: "400" if p.get("no_send") else "ok"
+        self.answer(ask, "[no-send]")                # a second reply, a suppression
+        gw._save_inflight({ask})
+        self.drain()
+        record = item(self.outbox_root, f"{ASK_A}.lease-close")
+        self.assertEqual((record["status"], record["reason"]), ("PARKED", "permanent-refusal"))
+        self.assertEqual([p.get("status") for p in self.broker.results()], [None, None])
+
+    def test_unreadable_marks_hold_a_voice_asks_result_and_never_a_typed_one(self):
+        ask = self.serve(voice_ask())
+        typed = self.serve(typed_task())
+        gw.ACK_FIRST_FILE.write_text("{not json")
+        self.answer(ask)
+        self.answer(typed, "A collaborative workspace.")
+        self.drain()
+        self.assertEqual([p["id"] for p in self.broker.results()], [TYPED_A])
+        self.assertIsNone(item(self.outbox_root, ASK_A).get("status"), "published without its rule")
+        self.assertIn(f"delivery deferred for {ask} — ack_first marks unreadable", self.lines)
+        gw.ACK_FIRST_FILE.write_text(json.dumps({ASK_A: ask}))
+        self.drain()
+        self.assertEqual(self.broker.results()[-1], ANSWER)
+
+
+class TheRuleOnANamedInstance(_Bridge):
+    INSTANCE = "dev"
+
+    def test_the_orphan_sweep_keeps_a_relay_result_in_flight(self):
+        ask = self.serve(voice_ask())
+        typed = self.serve(typed_task())
+        gw._save_inflight(set())                     # the ledger lost both; only the sweep looks
+        for tid in (ask, typed):
+            self.answer(tid)
+            landed = time.time() - 3600
+            os.utime(gw.RESULTS_DIR / f"{tid}.txt", (landed, landed))
+        self.broker.result = "503"
+        inflight: "set[str]" = set()
+        with patch.object(gw, "_last_orphan_sweep", 0.0):
+            gw._reconcile_orphan_results(inflight)
+        self.assertEqual(inflight, {ask}, "a typed result is kept or a relay result dropped")
+        self.assertEqual(gw._load_inflight(), {ask})
+        self.broker.result = "ok"
+        gw._delivery_core("relay").backend.clock = lambda: time.time() + 60.0   # past its backoff
+        gw._post_ready_results(inflight)
+        self.assertEqual([p["id"] for p in self.broker.results()].count(ASK_A), 2)
+        self.assertEqual(self.broker.results()[-1]["body"], gw._RECOVERED_LABEL + TEXT,
+                         "the drain did not resend the sweep's stored payload")
+        self.assertEqual(item(self.outbox_root, ASK_A)["status"], "DELIVERED")
+
+
+class TheReclaim(_Bridge):
+    """The reclaim at start, in process, over what an older bridge left."""
+
+    def parked_by_an_older_bridge(self) -> str:
+        ask = self.serve(voice_ask())
+        self.answer(ask)
+        older_bridge.park(gw, ask)
+        self.assertEqual(item(self.outbox_root, ASK_A)["status"], "PARKED")
+        return ask
+
+    def test_a_copy_set_aside_on_purpose_stays_for_the_operator(self):
+        ask = self.serve(voice_ask())
+        self.answer(ask)
+        # Withheld before any publish (an unattributed worker's reply): no parked item.
+        gw._quarantine_undelivered(gw.RESULTS_DIR / f"{ask}.txt", ask, "attribution refused")
+        kept = self.quarantined()
+        inflight: "set[str]" = set()
+        gw._reclaim_parked_relay_results(inflight)
+        self.assertEqual((self.quarantined(), inflight), (kept, set()))
+        self.assertFalse((gw.RESULTS_DIR / f"{ask}.txt").exists())
+
+    def test_a_live_result_at_its_name_is_never_replaced(self):
+        ask = self.parked_by_an_older_bridge()
+        kept = self.quarantined()
+        self.answer(ask, "A newer reply.")
+        gw._reclaim_parked_relay_results(set())
+        self.assertEqual((gw.RESULTS_DIR / f"{ask}.txt").read_text(), "A newer reply.")
+        self.assertEqual(self.quarantined(), kept)
+        self.assertEqual(item(self.outbox_root, ASK_A)["status"], "PARKED")
+
+    def test_the_newest_copy_is_restored_under_the_asks_id(self):
+        ask = self.parked_by_an_older_bridge()
+        [older] = self.quarantined()
+        reask = gw._reask_id(ask)
+        newer = gw.UNDELIVERABLE_RESULTS_DIR / f"{reask}-{time.time_ns() + 10**9}.txt"
+        newer.write_text("[dm-only]\nThe re-ask's answer.")
+        gw._reclaim_parked_relay_results(set())
+        self.assertEqual((gw.RESULTS_DIR / f"{ask}.txt").read_text(), "[dm-only]\nThe re-ask's answer.")
+        self.assertFalse((gw.RESULTS_DIR / f"{reask}.txt").exists())
+        self.assertEqual(self.quarantined(), [older])
+
+    def test_a_reclaim_cut_short_is_finished_by_the_next_start(self):
+        ask = self.parked_by_an_older_bridge()
+        gw._save_inflight(set())                     # it left the in-flight set
+        inflight: "set[str]" = set()
+        with patch.object(gw.undelivered_quarantine, "rename_noreplace",
+                          side_effect=OSError(5, "I/O error")):
+            gw._reclaim_parked_relay_results(inflight)
+        record = item(self.outbox_root, ASK_A)
+        self.assertEqual((record["status"], record["requeue_reason"]), ("QUEUED", gw._RELAY_RECLAIMED))
+        self.assertEqual(gw._load_inflight(), {ask})
+        self.assertFalse((gw.RESULTS_DIR / f"{ask}.txt").exists())
+        gw._reclaim_parked_relay_results(set(gw._load_inflight()))
+        self.assertEqual((gw.RESULTS_DIR / f"{ask}.txt").read_text(), PRIVATE)
+        self.assertEqual(self.quarantined(), [])
+        self.drain()
+        self.assertEqual(self.broker.results(), [{"id": ASK_A, "body": TEXT}])
+
+
+# ── through the real poll loop ───────────────────────────────────────────────
+
+class _Loop(unittest.TestCase):
+    INSTANCE = ""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="relay-no-ceiling-loop-")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.relay = Relay()
+        self.addCleanup(self.relay.close)
+        self.bridges = Bridges(self, self.root, self.relay)
+        if self.INSTANCE:
+            self.bridges.env["GATEWAY_INSTANCE"] = self.INSTANCE
+        self.ws = self.bridges.ws
+        self.results = self.ws / "results"
+        self.outbox_root = gateway_instance.outbox_root(self.results, self.INSTANCE)
+        self.local = f"task-{self.INSTANCE}~{ASK_A}" if self.INSTANCE else ASK_A
+
+    def state(self, stem: str):
+        suffix = f".{self.INSTANCE}" if self.INSTANCE else ""
+        path = self.ws / "state" / f"{stem}{suffix}.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def logged(self, text: str) -> int:
+        return (self.root / f"bridge-{self.bridges.runs}.log").read_text(errors="replace").count(text)
+
+    def quarantined(self) -> "list[str]":
+        d = self.results / "undelivered"
+        return sorted(p.name for p in d.iterdir() if not p.name.startswith(".")) if d.is_dir() else []
+
+    def archived(self, tid: str) -> "list[str]":
+        return [p.read_text() for p in (self.results / "archive").glob(f"{glob.escape(tid)}-*.txt")]
+
+    def posted(self, broker_id: str = ASK_A) -> "list[dict]":
+        return [p for p, _bearer in self.relay.posted if p.get("id") == broker_id]
+
+    def serve(self, *tasks: dict) -> "subprocess.Popen":
+        """A running bridge that has acknowledged and published every task."""
+        self.relay.queue.extend(tasks)
+        bridge = self.bridges.start()
+        for task in tasks:
+            tid = f"task-{self.INSTANCE}~{task['id']}" if self.INSTANCE else task["id"]
+            self.bridges.wait_for((self.ws / "tasks" / f"{tid}.txt").exists, bridge, f"{tid} published")
+        return bridge
+
+
+class NoCeiling(_Loop):
+    """The relay rule against a real loop: outages, refusals and credentials."""
+
+    def test_a_relay_result_outlives_a_broker_outage_past_10_minutes_and_a_restart(self):
+        self.relay.refusing = True
+        first = self.serve(voice_ask(), typed_task())
+        (self.results / f"{ASK_A}.txt").write_text(PRIVATE)
+        (self.results / f"{TYPED_A}.txt").write_text("A collaborative workspace.")
+        self.bridges.refused_result_recorded(first, ASK_A)
+        self.bridges.refused_result_recorded(first, TYPED_A)
+        self.bridges.stop(first)
+        for item_id in (ASK_A, TYPED_A):
+            age_retry(self.outbox_root, item_id, 700)
+        second = self.bridges.start()
+        self.bridges.wait_for(lambda: self.quarantined(), second, "the typed result parked")
+        self.bridges.wait_logged(second, f"result POST not confirmed for {ASK_A}")
+        self.assertEqual(item(self.outbox_root, TYPED_A)["reason"], "retry-window-exhausted")
+        self.assertNotEqual(item(self.outbox_root, ASK_A).get("status"), "PARKED")
+        self.relay.refusing = False
+        self.bridges.wait_for(lambda: self.relay.results, second, "the relay result accepted")
+        self.bridges.wait_for(lambda: not self.state("remote-task-ack-first"), second, "its mark retired")
+        self.bridges.polls_after(second)
+        self.bridges.stop(second)
+        self.assertEqual(self.relay.results, [ANSWER], "not posted exactly once")
+        self.assertNotIn("requeue_reason", item(self.outbox_root, ASK_A), "it was parked on the way")
+        self.assertTrue(all(p == ANSWER for p in self.posted()), "the payload changed")
+        self.assertEqual(self.archived(ASK_A), [PRIVATE])
+        self.assertEqual([n.split("-")[0] for n in self.quarantined()], ["task"])
+
+    def test_a_definite_refusal_swaps_in_a_failed_result_that_the_broker_accepts(self):
+        self.relay.on_result = lambda p: None if p.get("status") == "failed" else (400, {"error": "bad"})
+        bridge = self.serve(voice_ask(), typed_task())
+        (self.results / f"{ASK_A}.txt").write_text(PRIVATE)
+        (self.results / f"{TYPED_A}.txt").write_text("A collaborative workspace.")
+        self.bridges.wait_for(lambda: self.relay.results, bridge, "the failed result accepted")
+        self.bridges.wait_for(lambda: not self.state("remote-task-ack-first"), bridge, "its mark retired")
+        self.bridges.wait_for(lambda: self.quarantined(), bridge, "the typed result parked")
+        self.bridges.polls_after(bridge)
+        self.bridges.stop(bridge)
+        self.assertEqual(self.relay.results, [FAILED])
+        self.assertEqual(self.posted(), [ANSWER, FAILED])
+        self.assertNotIn("requeue_reason", item(self.outbox_root, ASK_A), "it was parked on the way")
+        self.assertEqual(self.archived(ASK_A), [PRIVATE], "the answer was not kept in the archive")
+        self.assertEqual(item(self.outbox_root, TYPED_A)["reason"], "permanent-refusal")
+        self.assertEqual([n.split("-")[0] for n in self.quarantined()], ["task"])
+
+    def test_a_restart_between_the_refusal_and_the_acceptance_changes_nothing(self):
+        def refuse_then_go_down(payload):
+            if payload.get("status") != "failed":
+                self.relay.refusing = True       # the broker goes down right after refusing
+                return 400, {"error": "bad"}
+            return None
+        self.relay.on_result = refuse_then_go_down
+        first = self.serve(voice_ask())
+        (self.results / f"{ASK_A}.txt").write_text(PRIVATE)
+        self.bridges.wait_for(lambda: self.posted()[-1:] == [FAILED]
+                              and self.logged(f"result POST not confirmed for {ASK_A}") >= 2,
+                              first, "the failed result refused while the broker is down")
+        self.bridges.stop(first)
+        self.assertEqual(json.loads(item(self.outbox_root, ASK_A)["payload"]), FAILED)
+        self.relay.on_result, self.relay.refusing = None, False
+        second = self.bridges.start()
+        self.bridges.wait_for(lambda: self.relay.results, second, "the failed result accepted")
+        # The mark goes after the archive, so a stop cannot cut the archive short.
+        self.bridges.wait_for(lambda: not self.state("remote-task-ack-first"), second, "its mark retired")
+        self.bridges.polls_after(second)
+        self.bridges.stop(second)
+        self.assertEqual(self.relay.results, [FAILED])
+        self.assertEqual(self.posted().count(ANSWER), 1, "the refused answer was sent again")
+        self.assertEqual(self.archived(ASK_A), [PRIVATE])
+
+    def credential_refused_past_the_window(self, code: int) -> None:
+        token_file = self.root / "remote-task.env"
+        self.bridges.env.update({"REMOTE_TASK_TOKEN_FILE": str(token_file), "REMOTE_REENROLL": "0",
+                                 "REMOTE_AUTH_RECHECK_INTERVAL": "1"})
+        self.relay.token = "hermetic-test-token"
+        first = self.serve(voice_ask())
+        self.relay.token, self.relay.auth_code = "rotated-secret", code   # revoked by the broker
+        (self.results / f"{ASK_A}.txt").write_text(PRIVATE)
+        self.bridges.refused_result_recorded(first, ASK_A)
+        self.bridges.stop(first)
+        age_retry(self.outbox_root, ASK_A, 700)
+        token_file.write_text("REMOTE_TASK_TOKEN=rotated-secret\n")       # the re-onboard lands
+        second = self.bridges.start()
+        self.bridges.wait_for(lambda: self.relay.results, second, "the result sent again")
+        self.bridges.wait_for(lambda: not self.state("remote-task-ack-first"), second, "its mark retired")
+        self.bridges.polls_after(second)
+        self.bridges.stop(second)
+        self.assertGreaterEqual(self.logged("waiting for token rotation")
+                                + self.logged("token file already rotated"), 1,
+                                "the poll loop never entered its credential recovery")
+        self.assertEqual(self.relay.results, [ANSWER])
+        accepted = [bearer for p, bearer in self.relay.posted if p == ANSWER]
+        self.assertEqual(accepted[-1], "Bearer rotated-secret")
+        self.assertIn("Bearer hermetic-test-token", accepted[:-1], "no send was ever refused")
+
+    def test_a_401_recovers_its_credential_and_sends_again(self):
+        self.credential_refused_past_the_window(401)
+
+    def test_a_403_recovers_its_credential_and_sends_again(self):
+        self.credential_refused_past_the_window(403)
+
+
+# The older bridge in a process of its own over the shared workspace, as `older_bridge` replays it.
+_OLDER = r"""
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from _helpers.hermetic_gateway import isolate_then_import
+gw, _reads = isolate_then_import(root=Path(sys.argv[2]), env=json.loads(sys.argv[5]))
+from _helpers import older_bridge
+out = older_bridge.park(gw, sys.argv[4]) if sys.argv[3] == "park" else older_bridge.restart(gw)
+Path(sys.argv[6]).write_text(json.dumps(out))
+"""
+
+
+class AfterADowngrade(_Loop):
+    """An ask acknowledged by an updated bridge, a downgrade before its result, the broker
+    unavailable past 10 minutes so the older bridge parks it, then the updated bridge back."""
+
+    def older(self, step: str, answered: str = ""):
+        out = self.root / f"older-{step}.json"
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_") and k != "GATEWAY_INSTANCE"}
+        done = subprocess.run(
+            [sys.executable, "-c", _OLDER, str(_TESTS), str(self.ws), step, answered,
+             json.dumps({"GATEWAY_INSTANCE": self.INSTANCE} if self.INSTANCE else {}), str(out)],
+            env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stdout[-2000:] + done.stderr[-2000:])
+        return json.loads(out.read_text())
+
+    def acknowledged_then_downgraded(self, reask: bool) -> str:
+        """The updated bridge takes the ask (and, with `reask`, publishes a re-ask of it), and
+        stops. Returns the local id whose answer the core then writes."""
+        if reask:
+            # A holder with no answer: the planner asks again rather than fold.
+            (self.results / "archive").mkdir(parents=True, exist_ok=True)
+            (self.results / "archive" / f"{EMPTY_HOLDER}-1785976425.txt").write_text("")
+        bridge = self.serve(voice_ask())
+        answered = self.local
+        if reask:
+            answered = gw._reask_id(self.local)
+            (self.results / f"{self.local}.txt").write_text(f"[deduped: {EMPTY_HOLDER}]")
+            self.bridges.wait_for(lambda: self.state("remote-task-inflight") == [answered], bridge,
+                                  "the re-ask in flight in place of the ask")
+        self.bridges.stop(bridge)
+        self.assertEqual(self.state("remote-task-ack-first"), {ASK_A: self.local})
+        return answered
+
+    def run_case(self, *, reask: bool = False, restart: bool = False, days_late: float = 0.0):
+        answered = self.acknowledged_then_downgraded(reask)
+        rfile = self.results / f"{answered}.txt"
+        rfile.write_text(PRIVATE)
+        if days_late:
+            landed = time.time() - days_late * DAY
+            os.utime(rfile, (landed, landed))
+        parked = self.older("park", answered)
+        self.assertEqual((parked["broker"], parked["reason"]), (ASK_A, "retry-window-exhausted"))
+        self.assertEqual(json.loads(parked["payload"]), {"id": ASK_A, "body": TEXT})
+        self.assertEqual(len(self.quarantined()), 1)
+        settled = self.older("restart") if restart else []
+        # The older bridge never reads or writes the mark, so it survives the settle.
+        self.assertEqual(self.state("remote-task-ack-first"), {ASK_A: self.local})
+        updated = self.bridges.start()
+        self.bridges.wait_for(lambda: self.relay.results, updated, "the reclaimed result accepted")
+        self.bridges.wait_for(lambda: not self.state("remote-task-ack-first"), updated, "its mark retired")
+        self.bridges.polls_after(updated, 3)
+        self.bridges.stop(updated)
+        # Posted once, under the relay ask's id, with the older bridge's stored payload: no
+        # contract, so the broker treats it as private. Never relabelled, never quarantined.
+        self.assertEqual(self.relay.results, [{"id": ASK_A, "body": TEXT}])
+        self.assertEqual([p for p, _b in self.relay.posted], [{"id": ASK_A, "body": TEXT}])
+        self.assertEqual(self.quarantined(), [], "a copy was left, or quarantined as too old")
+        self.assertIn(PRIVATE, self.archived(self.local), "not restored under the relay ask's local id")
+        self.assertEqual(self.archived(answered) if reask else [], [], "restored under the re-ask's id")
+        record = item(self.outbox_root, ASK_A)
+        self.assertEqual((record["status"], record["requeue_reason"]), ("DELIVERED", gw._RELAY_RECLAIMED))
+        self.assertNotIn(self.local, self.state("remote-task-inflight"))
+        self.assertEqual(self.logged("reclaimed the relay result an older bridge parked"), 1)
+        return settled
+
+    def test_parked_by_the_older_bridge_then_restored(self):
+        self.run_case()
+
+    def test_the_older_bridge_restarted_and_the_mac_updated_a_day_later(self):
+        # On the primary lane the older bridge never settles an `ask-…` id: its lookup adds `task-`.
+        self.assertEqual(self.run_case(restart=True, days_late=1.5), [])
+
+    def test_a_re_ask_with_that_restart_a_day_later(self):
+        self.assertEqual(self.run_case(reask=True, restart=True, days_late=1.5),
+                         [gw._reask_id(self.local)])
+
+
+class AfterADowngradeOnANamedInstance(AfterADowngrade):
+    INSTANCE = "dev"
+
+    def test_the_older_bridge_restarted_and_the_mac_updated_a_day_later(self):
+        # A named instance's local id starts with `task-`, so the older bridge settles it.
+        self.assertEqual(self.run_case(restart=True, days_late=1.5), [self.local])
+
+
+class BridgeImportIsHermetic(unittest.TestCase):
+    def test_the_bridge_import_reads_no_host_config_token_or_vault(self):
+        assert_hermetic(self, _IMPORT_READS)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

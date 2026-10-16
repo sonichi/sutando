@@ -29,7 +29,9 @@ class Relay:
     """Serves each queued task once. As an AG2 Space broker does, it serves an `ack_first`
     task only to a poll that carries the contract, at most one per response, and serves a
     poll without it the tasks behind that ask. It refuses the ack of a task in `withdrawn`
-    as a withdrawn lease, and answers results with 503 while `refusing`."""
+    as a withdrawn lease, and answers results with 503 while `refusing`. With `token` set,
+    a request with any other bearer is refused with `auth_code`; `on_result`, given the
+    payload, may answer a result itself (a status and a body), or return None."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -42,6 +44,10 @@ class Relay:
         self.results: "list[dict]" = []
         self.refused = 0
         self.refusing = False
+        self.token = ""
+        self.auth_code = 401
+        self.on_result = None
+        self.posted: "list[tuple[dict, str]]" = []     # every result POST and its bearer
         relay = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -56,7 +62,15 @@ class Relay:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _authorized(self) -> bool:
+                if relay.token and self.headers.get("Authorization") != f"Bearer {relay.token}":
+                    self._send(relay.auth_code, {"error": "unauthorized"})
+                    return False
+                return True
+
             def do_GET(self):
+                if not self._authorized():
+                    return
                 if self.path.startswith("/v1/tasks?"):
                     query = urllib.parse.urlsplit(self.path).query
                     proof = f"capabilities={CONTRACT}" in query.split("&")
@@ -78,9 +92,19 @@ class Relay:
             def do_POST(self):
                 size = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(size)) if size else None
+                if self.path == "/v1/results":
+                    with relay.lock:
+                        relay.posted.append((payload, self.headers.get("Authorization", "")))
+                if not self._authorized():
+                    return
                 code, doc = 200, {"ok": True, "delivery_readable": True}
                 with relay.lock:
-                    if self.path == "/v1/results":
+                    answer = None
+                    if self.path == "/v1/results" and relay.on_result:
+                        answer = relay.on_result(payload)
+                    if answer is not None:
+                        code, doc = answer
+                    elif self.path == "/v1/results":
                         if relay.refusing:
                             relay.refused += 1
                             code, doc = 503, {"error": "unavailable"}
