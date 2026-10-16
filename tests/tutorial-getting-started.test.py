@@ -3,7 +3,9 @@
 and the room-commons calls publish makes, against a stub room_commons.py that keeps a fake room."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import html
 import importlib.util
 import json
@@ -670,6 +672,150 @@ class AssetTest(unittest.TestCase):
 
     def test_rendered_page_size_is_bounded(self):
         self.assertLess(len(gs.render_page("Blue", "claude").encode()), 400_000)
+
+
+class EdgeTest(unittest.TestCase):
+    """Branches the end-to-end tests do not reach; no network, no live workspace."""
+
+    def test_https_get_sends_a_user_agent_and_caps_the_read(self):
+        seen = {}
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, n):
+                seen["n"] = n
+                return b'{"displayname": "X"}'
+
+        def urlopen(req, timeout):
+            seen["ua"], seen["timeout"] = req.get_header("User-agent"), timeout
+            return Resp()
+
+        with mock.patch.object(gs.urllib.request, "urlopen", urlopen):
+            self.assertEqual(gs._https_get("https://example.test/x"), b'{"displayname": "X"}')
+        self.assertEqual(seen, {"ua": gs.USER_AGENT, "timeout": gs.PROFILE_TIMEOUT, "n": 65536})
+
+    def test_marker_whose_rooms_is_not_a_map_reads_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "m.json"
+            path.write_text(json.dumps({"rooms": ["!r:x"]}))
+            self.assertEqual(gs.load_marker(path), {})
+
+    def test_detect_core(self):
+        with mock.patch.dict(os.environ, {"SUTANDO_CORE_RUNTIME": "codex"}):
+            self.assertEqual(gs.detect_core(), "codex")
+        import sutando_config
+        with mock.patch.object(sutando_config, "resolve_core_runtime", side_effect=ValueError("bad")):
+            self.assertEqual(gs.detect_core(), "unknown")
+        with mock.patch.object(sutando_config, "resolve_core_runtime", return_value="gemini"):
+            self.assertEqual(gs.detect_core(), "unknown")
+
+    def test_workspace_goes_through_the_resolver(self):
+        import workspace_default
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=Path("/ws.test")):
+            self.assertEqual(gs._workspace(), Path("/ws.test"))
+
+    def test_a_timeout_is_a_publish_error(self):
+        commons = gs.Commons(Path("/nonexistent/rc.py"), "!r:x")
+        with mock.patch.object(gs.subprocess, "run", side_effect=subprocess.TimeoutExpired("rc", 120)):
+            with self.assertRaisesRegex(gs.PublishError, "timed out"):
+                commons.run("pages", "!r:x")
+
+    def test_page_add_without_an_html_kind_is_refused(self):
+        commons = gs.Commons(Path("/nonexistent/rc.py"), "!r:x")
+        with mock.patch.object(gs.Commons, "run", return_value='{"ok": true, "kind": "markdown-x"}'):
+            with self.assertRaisesRegex(gs.PublishError, "no html page kind"):
+                commons.add_page("Getting started")
+
+    def test_rewrite_of_an_empty_page_appends(self):
+        commons = gs.Commons(Path("/nonexistent/rc.py"), "!r:x")
+        calls = []
+        with mock.patch.object(gs.Commons, "run", lambda self, *a, **k: calls.append((a, k)) or ""):
+            commons.rewrite("html-a", "", "<p>new</p>")
+        self.assertEqual(calls, [(("append", "!r:x", "<p>new</p>"), {"kind": "html-a"})])
+
+    def test_channel_value_prefers_the_environment(self):
+        import channel_credentials
+        self.assertEqual(channel_credentials.channel_value("AGENT_MXID", {"AGENT_MXID": "@env:x"}), "@env:x")
+
+
+class MainTest(unittest.TestCase):
+    """main() in-process: a temp workspace and channel dir, a stub room_commons.py, and no
+    identity or credential variable inherited from the host."""
+
+    ROOM = "!dm:example.test"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="tutorial-main-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.stub = self.tmp / "room_commons.py"
+        self.stub.write_text(STUB)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("SUTANDO_", "AG2", "REMOTE_TASK", "AGENT_", "ROOM_C", "MATRIX_"))
+               and k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME")}
+        env.update({"CLAUDE_CONFIG_DIR": str(self.tmp / "claude"), "STUB_STATE": str(self.tmp / "room.json"),
+                    "SUTANDO_WORKSPACE_DIR": str(self.tmp / "ws")})
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        ws = mock.patch.object(gs, "_workspace", return_value=self.tmp / "ws")
+        ws.start()
+        self.addCleanup(ws.stop)
+
+    def main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = gs.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_render_for_each_audience_and_core(self):
+        code, out, _ = self.main("render", "--name", "Blue", "--core", "claude", "--audience", "room")
+        self.assertEqual((code, out), (0, gs.render_page("Blue", "claude", "room")))
+        with mock.patch.object(gs, "detect_core", return_value="codex"):
+            code, out, _ = self.main("render", "--name", "Blue", "--core", "auto")
+        self.assertEqual((code, out), (0, gs.render_page("Blue", "codex")))
+
+    def test_render_name_auto_falls_back_without_the_network(self):
+        with mock.patch.object(gs, "_https_get", side_effect=OSError("offline")):
+            code, out, _ = self.main("render", "--name", "auto", "--agent-mxid", "@kai-blue.agent:example.test")
+        self.assertEqual(code, 0)
+        self.assertIn("<h1>Getting started with Kai Blue</h1>", out)
+
+    def test_bad_name_exits_2(self):
+        code, _, err = self.main("render", "--name", " ")
+        self.assertEqual(code, 2)
+        self.assertIn("1-64 characters", err)
+
+    def test_plan_reads_the_marker(self):
+        code, out, _ = self.main("plan", "--room", self.ROOM)
+        self.assertEqual((code, json.loads(out)), (0, {"action": "create", "kind": None}))
+
+    def test_publish_creates_then_reports_unchanged(self):
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                 "--owner", "@owner:example.test", "--room-commons", str(self.stub))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {"ok": True, "action": "created", "kind": "html-p1",
+                                           "summoned": True, "name": "Blue"})
+        with mock.patch.object(gs, "detect_core", return_value="codex"):
+            code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue",
+                                     "--room-commons", str(self.stub))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
+
+    def test_publish_without_room_commons_exits_3(self):
+        with mock.patch.object(gs, "find_room_commons", return_value=self.tmp / "missing.py"):
+            code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex")
+        self.assertEqual((code, json.loads(out)["reason"]), (3, "room-commons not installed"))
+
+    def test_publish_failure_exits_4(self):
+        os.environ["STUB_FAIL"] = "page-add"
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                 "--room-commons", str(self.stub))
+        self.assertEqual(code, 4)
+        self.assertIn("page-add failed", json.loads(out)["reason"])
 
 
 class MarkerTest(unittest.TestCase):
