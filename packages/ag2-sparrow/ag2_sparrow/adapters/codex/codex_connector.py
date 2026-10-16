@@ -279,7 +279,7 @@ class Connector:
         self.thread_id = None
         self.last_thread = None   # the thread the current task ran on, for its metrics row
         self.live = {}            # channel key -> owner thread id open on the current server
-        self.scratch_cwd = None   # the empty temp dir a non-owner turn runs in
+        self.scratch_cwd = None
         self.declined = []
 
     def handle_server_request(self, m):
