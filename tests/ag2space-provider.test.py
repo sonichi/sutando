@@ -305,6 +305,20 @@ def main() -> int:
     check("...but a later readable `delivered` clears the memory and confirms",
           isinstance(first, ProviderRefused) and r.outcome is DeliveryOutcome.CONFIRMED
           and r.provider_ref == "delivered")
+    # The memory is bounded: driven through deliver(), the oldest dead-lettered rids fall
+    # out once the limit is reached, and only remembered rids stay refused on an unreadable read.
+    from ag2_sparrow.delivery_core import provider_ag2space as _pm
+    n = _pm.DEAD_MEMORY_LIMIT + 5
+    gw = ScriptedGateway(*([READABLE] * n), delivery=[DEAD] * n)
+    p = AG2SpaceResultProvider(gw, sleep=lambda _s: None)
+    for i in range(n):
+        try:
+            p.deliver(f"task-{i}", json.dumps({"id": f"task-{i}", "body": "x"}).encode(), f"task-{i}#0")
+        except ProviderRefused:
+            pass
+    check("the dead-letter memory is bounded and drops the oldest rid first",
+          len(p._dead) == _pm.DEAD_MEMORY_LIMIT and "task-0" not in p._dead
+          and f"task-{n - 1}" in p._dead)
     # A truncated status read is an unreadable read, not an escape that strands the claim.
     r, gw, _ = settle(http.client.IncompleteRead(b""))
     check("IncompleteRead on the delivery read -> unreadable -> CONFIRMED on the accept",

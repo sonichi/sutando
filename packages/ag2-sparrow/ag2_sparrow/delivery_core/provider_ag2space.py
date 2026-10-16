@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import http.client
 import json
+from collections import OrderedDict
 import time
 import urllib.error
 from urllib.parse import quote
@@ -52,6 +53,10 @@ DELIVERY_PATH = "/v1/results/{}/delivery"
 CONFIRM_WAITS = (0.25, 0.5, 1.0, 2.0, 2.0)
 
 
+# Readable send failures remembered per process; older rids are parked by then.
+DEAD_MEMORY_LIMIT = 512
+
+
 class AG2SpaceResultProvider:
     """``request``: ``(method, path, payload_dict) -> parsed-json dict``,
     raising urllib errors on failure — the bridge's ``_req`` signature."""
@@ -65,9 +70,9 @@ class AG2SpaceResultProvider:
         self._request = request
         self._confirm_waits = tuple(confirm_waits)
         self._sleep = sleep
-        # rid -> reason for every readable send failure this process has seen: a later
-        # poll that cannot be read must not turn a known dead-letter into a delivery.
-        self._dead: dict = {}
+        # rid -> reason for each readable send failure seen here, newest last, capped:
+        # an unreadable later poll must not turn a known dead-letter into a delivery.
+        self._dead: OrderedDict = OrderedDict()
 
     def _settled(self, rid: str) -> Optional[dict]:
         """The broker's terminal delivery state for `rid`, or None when it
@@ -127,6 +132,9 @@ class AG2SpaceResultProvider:
         if status == "dead" and reason.startswith("send-failed"):
             # Re-posting is deduped by rid, so the retries this earns end in a park.
             self._dead[rid] = reason
+            self._dead.move_to_end(rid)
+            while len(self._dead) > DEAD_MEMORY_LIMIT:
+                self._dead.popitem(last=False)
             raise ProviderRefused(
                 f"broker dead-lettered {item_id} after accepting it: {reason}")
         if status == "delivered":
