@@ -6,7 +6,8 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   `notes/first-time-tutorial.md` and deliver it one brief, voice-friendly section at a time,
   waiting for the user to try each step.
 - **AG2 Space mode.** Right after the first-contact greeting in the owner's DM, the skill creates
-  one "Getting started" HTML page (Room Commons) in that DM, with copyable prompts that work on a
-  fresh install and a pointer to Settings → Integrations, and summons the owner to it. A marker
+  one "Getting started" HTML page (Room Commons) in that DM, a short AG2 Space tour with one thing
+  to try per part (a Claude Code history import part only on a Claude Code core), and summons
+  the owner to it. A marker
   under `<workspace>/state/tutorial/` keeps it to one page per room, so a re-link or reinstall
   refreshes the page instead of adding another.

@@ -63,35 +63,78 @@ STUB = textwrap.dedent('''
 ''')
 
 
-class Tag(HTMLParser):
+TOUR = ["Rooms", "Commons", "Teamwork", "Calls & voice", "Connect other agents",
+        "Connect your apps", "Activity & notices", "Mobile"]
+IMPORT = "Import your Claude Code history"
+
+
+class Page(HTMLParser):
     def __init__(self):
-        super().__init__()
-        self.buttons = []
+        super().__init__(convert_charrefs=True)
+        self.headings, self.buttons, self._in_h2 = [], [], False
 
     def handle_starttag(self, tag, attrs):
         if tag == "button":
             self.buttons.append(dict(attrs).get("data-prompt"))
+        self._in_h2 = tag == "h2"
+
+    def handle_endtag(self, tag):
+        if tag == "h2":
+            self._in_h2 = False
+
+    def handle_data(self, data):
+        if self._in_h2:
+            self.headings.append(data)
+
+
+def parse(page):
+    p = Page()
+    p.feed(page)
+    return p
 
 
 class RenderTest(unittest.TestCase):
-    def test_page_carries_the_name_and_a_copy_button_per_prompt(self):
-        page = gs.render_page("Sutando")
-        self.assertIn("Getting started with Sutando", page)
-        parsed = Tag()
-        parsed.feed(page)
-        self.assertEqual(parsed.buttons, [p for _, _, p in gs.TRY_NOW] + [gs.CONNECT_PROMPT])
-        self.assertEqual(len(gs.TRY_NOW), 5)
-        self.assertIn("Settings → Integrations", page)
-        self.assertIn("navigator.clipboard", page)
+    def test_tour_has_all_eight_sections_in_order(self):
+        for core in gs.CORES:
+            self.assertEqual(parse(gs.render_page("Blue", core)).headings[:8], TOUR)
 
-    def test_render_is_deterministic_and_depends_only_on_the_name(self):
+    def test_import_section_only_on_a_claude_core(self):
+        claude = parse(gs.render_page("Blue", "claude"))
+        self.assertEqual(claude.headings, TOUR + [IMPORT])
+        self.assertIn(gs.IMPORT_PROMPT, claude.buttons)
+        for core in ("codex", "unknown"):
+            page = parse(gs.render_page("Blue", core))
+            self.assertEqual(page.headings, TOUR)
+            self.assertNotIn(gs.IMPORT_PROMPT, page.buttons)
+            self.assertNotIn("Claude Code", gs.render_page("Blue", core))
+
+    def test_unknown_core_value_is_refused(self):
+        with self.assertRaises(ValueError):
+            gs.render_page("Blue", "gemini")
+
+    def test_copy_buttons_and_kept_connect_prompt(self):
+        page = gs.render_page("Blue", "codex")
+        self.assertEqual(parse(page).buttons,
+                         [p for _, _, _, p in gs.SECTIONS if p])
+        self.assertIn(gs.CONNECT_PROMPT, parse(page).buttons)
+        self.assertIn("Settings &rarr; Integrations", page)
+        self.assertIn("navigator.clipboard", page)
+        self.assertIn("prefers-color-scheme: dark", page)
+
+    def test_codex_and_claude_code_are_not_offered_as_addable_agents(self):
+        agents = [s for s in gs.SECTIONS if s[0] == "Connect other agents"][0]
+        self.assertNotIn("Codex", " ".join(agents[1:3]))
+        self.assertNotIn("Claude", " ".join(agents[1:3]))
+
+    def test_render_is_deterministic_and_depends_only_on_name_and_core(self):
         self.assertEqual(gs.render_page("Kai"), gs.render_page("  Kai "))
         self.assertNotEqual(gs.render_page("Kai"), gs.render_page("Mo"))
+        self.assertNotEqual(gs.render_page("Kai", "claude"), gs.render_page("Kai", "codex"))
 
-    def test_name_is_escaped(self):
-        page = gs.render_page('<img src=x onerror="alert(1)">')
+    def test_name_is_escaped_everywhere(self):
+        page = gs.render_page('<img src=x onerror="alert(1)">', "claude")
         self.assertNotIn("<img src=x", page)
-        self.assertIn("&lt;img", page)
+        self.assertGreaterEqual(page.count("&lt;img"), 5)
 
     def test_empty_or_long_name_is_refused(self):
         for bad in ("", "   ", "x" * (gs.NAME_MAX + 1)):
@@ -151,13 +194,14 @@ class PublishTest(unittest.TestCase):
         return json.loads(self.state.read_text())
 
     def publish(self, name="Sutando", **kw):
+        kw.setdefault("core", "codex")
         return gs.publish(gs.Commons(self.stub, self.ROOM), self.marker, name, **kw)
 
     def test_first_run_creates_writes_and_summons(self):
         out = self.publish(owner="@chi:ag2.space")
         self.assertEqual(out, {"ok": True, "action": "created", "kind": "html-p1", "summoned": True})
         room = self.room()
-        self.assertEqual(room["pages"], {"html-p1": gs.render_page("Sutando")})
+        self.assertEqual(room["pages"], {"html-p1": gs.render_page("Sutando", "codex")})
         self.assertEqual([c[0] for c in room["calls"]], ["page-add", "append", "summon"])
         self.assertEqual(room["calls"][-1], ["summon", "html-p1", "@chi:ag2.space"])
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["kind"], "html-p1")
@@ -175,7 +219,13 @@ class PublishTest(unittest.TestCase):
         self.publish()
         out = self.publish(name="Kai")
         self.assertEqual(out["action"], "updated")
-        self.assertEqual(self.room()["pages"], {"html-p1": gs.render_page("Kai")})
+        self.assertEqual(self.room()["pages"], {"html-p1": gs.render_page("Kai", "codex")})
+
+    def test_core_change_rewrites_the_same_page(self):
+        self.publish()
+        out = self.publish(core="claude")
+        self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
+        self.assertIn(gs.IMPORT_PROMPT, self.room()["pages"]["html-p1"])
 
     def test_removed_page_is_created_again(self):
         self.publish()
@@ -208,9 +258,18 @@ class CliTest(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True)
 
     def test_render(self):
-        done = self.run_cli("render", "--name", "Sutando")
-        self.assertEqual(done.returncode, 0)
-        self.assertEqual(done.stdout, gs.render_page("Sutando"))
+        for core in gs.CORES:
+            done = self.run_cli("render", "--name", "Sutando", "--core", core)
+            self.assertEqual(done.returncode, 0)
+            self.assertEqual(done.stdout, gs.render_page("Sutando", core))
+
+    def test_detect_core_reads_the_engine_resolver(self):
+        env = dict(os.environ, SUTANDO_CORE_RUNTIME="codex")
+        done = subprocess.run([sys.executable, "-c",
+                               "import importlib.util as u;s=u.spec_from_file_location('g',%r);"
+                               "m=u.module_from_spec(s);s.loader.exec_module(m);print(m.detect_core())"
+                               % str(SCRIPT)], capture_output=True, text=True, env=env)
+        self.assertEqual(done.stdout.strip(), "codex")
 
     def test_missing_room_commons_exits_3(self):
         done = self.run_cli("publish", "--room", "!r:x", "--name", "Sutando",

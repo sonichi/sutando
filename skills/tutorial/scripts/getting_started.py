@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """The owner's "Getting started" page in AG2 Space: render it, and create or refresh it in one room.
 
-  getting_started.py render --name NAME                 -> the page's HTML on stdout
+  getting_started.py render --name NAME [--core claude|codex|unknown|auto]   -> the page's HTML
   getting_started.py plan --room ROOM                   -> {"action": "create"|"update", "kind": ...}
-  getting_started.py publish --room ROOM --name NAME [--owner MXID] [--summon] [--room-commons PATH]
+  getting_started.py publish --room ROOM --name NAME [--owner MXID] [--core ...] [--summon]
+      [--room-commons PATH]
       -> {"ok": true, "action": "created"|"updated"|"unchanged", "kind": "html-<id>", "summoned": bool}
+
+The page is a short AG2 Space tour: eight sections, plus a Claude Code history import section when
+the core is Claude Code (`--core auto` asks the engine's config resolver; unknown omits it).
 
 One page per room. The marker at <workspace>/state/tutorial/getting-started.json records the page's
 kind per room, so a re-link or reinstall rewrites that page instead of adding a second one. The page
@@ -34,28 +38,60 @@ sys.path.insert(0, str(REPO / "src"))
 
 PAGE_TITLE = "Getting started"
 NAME_MAX = 64
-SUMMON_CONTEXT = "A few things to try with me. Tap one to copy it, then paste it into our chat."
+SUMMON_CONTEXT = "A short tour of AG2 Space, with one thing to try in each part."
 DEFAULT_ROOM_COMMONS = REPO / "skills" / "room-commons" / "scripts" / "room_commons.py"
 
-# Each works on a fresh install: no connected account is needed.
-TRY_NOW = [
-    ("Research something you have been curious about",
-     "I go read the web and come back with a short answer and my sources.",
-     "Research the best way to learn a new language in three months and give me a short answer with sources."),
-    ("Summarize a link or a file",
-     "Paste a link or drop a file into our chat and I boil it down.",
-     "Summarize this in five bullets: "),
-    ("Draft an email or a message",
-     "Tell me who it is for and what it should say; I write it in your voice.",
-     "Draft a short, friendly email to a colleague asking to move our meeting to next week."),
-    ("Teach me something about you",
-     "I remember what you tell me and use it from then on.",
-     "Remember that I prefer short answers with the key point first."),
-    ("Ask what I can do",
-     "I tell you what works right now and what needs an app connected first.",
-     "What can you do for me today?"),
-]
+CORES = ("claude", "codex", "unknown")
 CONNECT_PROMPT = "Connect my Google Calendar."
+IMPORT_PROMPT = "Import my Claude Code history."
+
+# (title, what it is, how to try it, prompt or None). {name} is the agent's escaped name;
+# UI labels match the AG2 Space client.
+SECTIONS = [
+    ("Rooms",
+     "Humans and agents talk in the same chat.",
+     "Create a room with the + next to Rooms, then invite {name}.",
+     None),
+    ("Commons",
+     "Each room's shared Doc, HTML pages, whiteboard, sheets and databases, under Commons in "
+     "the room header.",
+     "Ask {name} in a room:",
+     "Make a plan for our team offsite in Commons."),
+    ("Teamwork",
+     "@-mention any agent in a room to hand it work; it replies in the thread.",
+     "In a room with another agent, ask {name}:",
+     "Research the three best note-taking apps for a small team, then ask another agent in "
+     "this room to review your answer."),
+    ("Calls &amp; voice",
+     "Talk live in any room or in your DM with {name}; agents join the call.",
+     "Press the call button in the room header (Start call).",
+     None),
+    ("Connect other agents",
+     "Bring agents from other apps into your rooms.",
+     "Choose + then Agent to open Add an agent, pick Use an agent from another app, then Dot "
+     "(in ChatGPT), Grok Bot (in Grok), Muse or Other (any app with connectors).",
+     None),
+    ("Connect your apps",
+     "Gmail, Calendar, Drive, Slack and more, so {name} can work with your real data.",
+     "Open Settings &rarr; Integrations, or ask {name} and a Connect button appears:",
+     CONNECT_PROMPT),
+    ("Activity &amp; notices",
+     "Each room's Activity tab shows what needs you and what your agents are working on.",
+     "The unread badge follows the room's notification setting (All Messages, Mention &amp; "
+     "Keywords or Mute), which you can change per room.",
+     None),
+    ("Mobile",
+     "The same rooms and agents on your phone.",
+     "Pair it in Settings &rarr; Mobile pairing.",
+     None),
+]
+IMPORT_SECTION = (
+    "Import your Claude Code history",
+    "Bring what you worked on in Claude Code into {name}'s memory. You see a digest first; "
+    "nothing is kept until you say so.",
+    "Ask {name}:",
+    IMPORT_PROMPT,
+)
 
 
 class PublishError(RuntimeError):
@@ -70,15 +106,20 @@ def clean_name(name: str) -> str:
     return cleaned
 
 
-def _prompt_card(title: str, blurb: str, prompt: str) -> str:
-    e = html.escape
-    return (
-        '<li class="card">'
-        f"<h3>{e(title)}</h3><p>{e(blurb)}</p>"
-        f'<div class="prompt"><code>{e(prompt)}</code>'
-        f'<button type="button" data-prompt="{e(prompt, quote=True)}">Copy</button></div>'
-        "</li>"
-    )
+def _section(title: str, what: str, how: str, prompt: Optional[str], who: str) -> str:
+    """One section; the text is trusted markup, only the name and the prompt are escaped."""
+    body = f"<h2>{title}</h2><p>{what.format(name=who)}</p><p class=\"how\">{how.format(name=who)}</p>"
+    if prompt:
+        body += (f'<div class="prompt"><code>{html.escape(prompt)}</code>'
+                 f'<button type="button" data-prompt="{html.escape(prompt, quote=True)}">Copy</button></div>')
+    return f'<section class="card">{body}</section>'
+
+
+def sections_for(core: str) -> list:
+    """The page's sections; the import one only on a Claude Code core."""
+    if core not in CORES:
+        raise ValueError(f"core must be one of {', '.join(CORES)}, got {core!r}")
+    return SECTIONS + ([IMPORT_SECTION] if core == "claude" else [])
 
 
 # The frame is sandboxed to allow-scripts; the Clipboard API may be refused there, so the prompt
@@ -115,12 +156,11 @@ STYLE = """<style>
 body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 main { max-width:760px; margin:0 auto; padding:32px 16px 48px; }
 h1 { font-size:28px; margin:0 0 8px; }
-h2 { font-size:18px; margin:32px 0 12px; }
-h3 { font-size:16px; margin:0 0 4px; }
-p { margin:0 0 8px; }
-.lead, .card p { color:var(--muted); }
-ul { list-style:none; padding:0; margin:0; display:grid; gap:12px; }
-.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+h2 { font-size:17px; margin:0 0 4px; }
+p { margin:0 0 6px; }
+.lead, .how { color:var(--muted); }
+.lead { margin-bottom:20px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin:0 0 12px; }
 .prompt { display:flex; gap:8px; align-items:center; margin-top:8px; }
 code { flex:1; min-width:0; background:var(--code); border-radius:6px; padding:6px 8px; font-size:14px; overflow-wrap:anywhere; user-select:all; }
 button { flex:none; border:1px solid var(--accent); color:var(--accent); background:transparent; border-radius:6px; padding:6px 12px; font:inherit; font-size:14px; cursor:pointer; }
@@ -128,27 +168,18 @@ button:hover { background:var(--accent); color:var(--bg); }
 </style>"""
 
 
-def render_page(name: str) -> str:
-    """The whole page as one HTML string; depends on nothing but the agent's name."""
+def render_page(name: str, core: str = "unknown") -> str:
+    """The whole page as one HTML string; depends on nothing but the agent's name and core."""
     who = html.escape(clean_name(name))
-    cards = "".join(_prompt_card(*item) for item in TRY_NOW)
+    body = "".join(_section(*sec, who=who) for sec in sections_for(core))
     return (
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         f"<title>{PAGE_TITLE}</title>{STYLE}</head><body><main>"
         f"<h1>Getting started with {who}</h1>"
-        f"<p class=\"lead\">{who} is your agent. It lives on your Mac, does real work for you, "
-        "and remembers what it learns. Pick one below, copy it, and paste it into your chat with "
-        f"{who}. Edit it first if you like.</p>"
-        f"<h2>Try one now</h2><ul>{cards}</ul>"
-        "<h2>Connect an app to unlock more</h2><ul><li class=\"card\">"
-        "<p>Email, calendar, files and more work once you connect the app. Open "
-        "<strong>Settings → Integrations</strong> in AG2 Space, or ask in chat and a Connect "
-        "button appears.</p>"
-        f"<div class=\"prompt\"><code>{html.escape(CONNECT_PROMPT)}</code>"
-        f"<button type=\"button\" data-prompt=\"{html.escape(CONNECT_PROMPT, quote=True)}\">Copy</button>"
-        "</div></li></ul>"
-        f"</main>{COPY_SCRIPT}</body></html>\n"
+        f"<p class=\"lead\">A short tour of AG2 Space. Each part has one thing to try; Copy puts "
+        f"a prompt on your clipboard to paste into a chat with {who}.</p>"
+        f"{body}</main>{COPY_SCRIPT}</body></html>\n"
     )
 
 
@@ -235,8 +266,8 @@ class Commons:
 
 
 def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = None,
-            summon: bool = False) -> dict:
-    page = render_page(name)
+            summon: bool = False, core: str = "unknown") -> dict:
+    page = render_page(name, core)
     with _locked(marker):
         rooms = load_marker(marker)
         step = plan(rooms, commons.room, commons.listed_kinds() if commons.room in rooms else None)
@@ -274,6 +305,16 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
     return result
 
 
+def detect_core() -> str:
+    """The core runtime the engine resolves (launcher stamp, else config); unknown on failure."""
+    try:
+        from sutando_config import resolve_core_runtime
+        core = resolve_core_runtime()
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    return core if core in CORES else "unknown"
+
+
 def _workspace() -> Path:
     from workspace_default import resolve_workspace
     return resolve_workspace()
@@ -284,12 +325,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub = ap.add_subparsers(dest="command", required=True)
     r = sub.add_parser("render", help="print the page's HTML")
     r.add_argument("--name", required=True, help="the agent's own name, from its AG2 Space identity")
+    r.add_argument("--core", choices=CORES + ("auto",), default="unknown",
+                   help="the Sutando core; claude adds the Claude Code import section")
     p = sub.add_parser("plan", help="what publish would do in this room, from the marker alone")
     p.add_argument("--room", required=True)
     u = sub.add_parser("publish", help="create the page in this room, or refresh the one already there")
     u.add_argument("--room", required=True, help="the owner's DM room id")
     u.add_argument("--name", required=True, help="the agent's own name, from its AG2 Space identity")
     u.add_argument("--owner", help="the owner's mxid; summoned to the page when it is created")
+    u.add_argument("--core", choices=CORES + ("auto",), default="auto",
+                   help="the Sutando core (default auto: what the engine resolves); claude adds the "
+                        "Claude Code import section, unknown leaves it out")
     u.add_argument("--summon", action="store_true", help="summon the owner on a refresh too")
     u.add_argument("--room-commons", type=Path, default=DEFAULT_ROOM_COMMONS,
                    help="path to room_commons.py (default: the installed room-commons skill)")
@@ -297,7 +343,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         if args.command == "render":
-            sys.stdout.write(render_page(args.name))
+            core = detect_core() if args.core == "auto" else args.core
+            sys.stdout.write(render_page(args.name, core))
             return 0
         if args.command == "plan":
             print(json.dumps(plan(load_marker(marker_path(_workspace())), args.room)))
@@ -312,7 +359,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 3
     try:
         result = publish(Commons(args.room_commons, args.room), marker_path(_workspace()),
-                         args.name, args.owner, args.summon)
+                         args.name, args.owner, args.summon,
+                         detect_core() if args.core == "auto" else args.core)
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": str(exc)}))
         return 4

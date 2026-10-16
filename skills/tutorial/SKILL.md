@@ -1,6 +1,6 @@
 ---
 name: tutorial
-description: "Show a new owner what to try first. Voice: on \"tutorial\", \"walk me through\" or \"show me what you can do\", walk the workspace tutorial one short section at a time. AG2 Space: right after the first-contact greeting in the owner's DM, create (or refresh) one \"Getting started\" HTML page there with copyable prompts that work on a fresh install, and summon the owner to it."
+description: "Show a new owner what to try first. Voice: on \"tutorial\", \"walk me through\" or \"show me what you can do\", walk the workspace tutorial one short section at a time. AG2 Space: right after the first-contact greeting in the owner's DM, create (or refresh) one \"Getting started\" HTML page there, a short AG2 Space tour with one thing to try per part, and summon the owner to it."
 user-invocable: true
 ---
 
@@ -38,6 +38,10 @@ not retry the page in the same turn.
      --room '<owner DM room id>' --name '<your name>' --owner '<owner mxid>'
    ```
 
+   `--core` defaults to `auto`: the core runtime the engine resolves
+   (`bash scripts/sutando-config.sh core-runtime`: the launcher's `SUTANDO_CORE_RUNTIME` stamp,
+   else `core.runtime` in config). Pass `--core claude|codex|unknown` to override it.
+
    It prints one JSON line: `action` is `created`, `updated` or `unchanged`; `kind` is the page's
    `html-<id>`. On `created` it summons the owner, so the card in the DM is the one line that
    carries the page: post no other message about it. On `updated` / `unchanged` it summons no one
@@ -53,6 +57,13 @@ owner's accounts, and the question about their work stays in chat.
 room. A re-link or reinstall that reuses the DM rewrites that page in place; a page someone removed
 from the list is created again. `getting_started.py plan --room <room>` shows what `publish` would
 do; `render --name <name>` prints the HTML.
+
+**What the page says.** A short AG2 Space tour. Each part is one line on what it is and one
+thing to try: Rooms, Commons, Teamwork, Calls & voice, Connect other agents (Dot, Grok Bot, Muse,
+Other; Claude Code and Codex are Sutando cores chosen at setup, not agents you add), Connect your
+apps (Settings → Integrations), Activity & notices, Mobile. On a Claude Code core it adds
+"Import your Claude Code history"; on Codex or an unknown core that part is left out. UI labels
+match the AG2 Space client; reword them here when the client renames one.
 
 **The prompts.** Each card's Copy button puts its prompt on the clipboard; where the page's sandbox
 refuses the clipboard, the prompt is selected instead and the button says to press ⌘C. The page
