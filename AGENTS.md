@@ -48,17 +48,7 @@ Rationale + worked examples for every boundary rule below (quoted section names)
 - When refactoring, do NOT change prompts or tool behavior. Prompts are tuned through testing and must be preserved exactly.
 - **Code comments: at most 2 lines, and only what the code cannot state itself.** Give the constraint or the non-obvious reason. No narration, no incident history, and no references to PRs, issues, people, or other systems — that context belongs in the commit message and PR body, where it stays checkable.
 
-### Where does new code belong? (decision guide — issue #222)
-
-Walk this list top-to-bottom and stop at the first match:
-
-1. **Does it need an instant response from Gemini (< 1s round-trip)?** → inline tool in `src/inline-tools.ts` or `src/browser-tools.ts`. Keep it a thin wrapper around a system command. If it grows past ~50 lines or needs subprocess orchestration, push it back to a skill.
-2. **Is it a phone-call session concern (Twilio WS, audio routing, call lifecycle, hang_up/dtmf)?** → `skills/phone-conversation/scripts/conversation-server.ts`. Does NOT belong: recording, subtitling, observability dashboards, business logic.
-3. **Is it a voice-session concern (bodhi `VoiceSession` config, web client wiring, task-bridge plumbing)?** → `src/voice-agent.ts`. Does NOT belong: phone-specific logic, tool implementations.
-4. **Is it a self-contained feature (recording, image generation, skill discovery, etc.)?** → new skill under `skills/<name>/`. Each skill is optional — core must still boot if it's removed.
-5. **Is it core infrastructure shared by multiple skills (task bridge, health check, memory sync)?** → `src/`.
-
-If two layers seem to fit, prefer the more specific one (skill > core).
+**Where does new code belong?** Walk the placement checklist, and read the boundary rules for schema migrations, transport vs request domain, skill diagnostics and presentation vs storage: [`docs/architecture-boundaries.md`](docs/architecture-boundaries.md#placement-checklist-and-boundary-rules).
 
 **Fix a bug where the policy lives, not where the symptom surfaced.** "Don't smuggle a refactor into a fix commit" means don't bundle *unrelated* cleanup. It does not license copying the same patch into every adapter — when one defect exists in several places because the policy is duplicated, the duplication is the defect:
 
@@ -67,49 +57,13 @@ If two layers seem to fit, prefer the more specific one (skill > core).
 - Do not add a copy, and do not leave one behind because the extraction looked large. A large extraction measures how much drift has already accumulated, not a reason to add more.
 - Duplicated policy is a defect in its own right, whether or not it is currently misbehaving. Copies drift, and the copy nobody remembers is the one that ships the bug.
 
-**Destructive/legacy schema migrations live apart from the live writer** — in `conversation-store-migrations.ts` (idempotent, invoked before views/statements are prepared), never in a live record function. Enforced by `tests/conversation-store-migration-delegation.test.ts`. → "Schema migration vs live writer"
-
-**Transport does not own authorization or durable state.** `src/runtime-api/server.py` is transport + daemon composition only; dispatch, approval/authorization policy, idempotency and durable transitions live in `src/runtime-api/dispatcher.py`, with actor identity resolved daemon-side — never from a client parameter. → "Transport vs request domain"
-
-**Complex skill diagnostics separate analysis from IO and presentation.** Call-diagnostics detection/categorization/repair policy lives in `skills/call-diagnostics/scripts/analysis.py`; loaders and renderers consume it, and it stays inside the skill. Enforced by `tests/call-diagnostics-analysis.test.py`. → "Skill-internal boundaries"
-
-**Presentation modules don't own domain/storage policy.** Dashboard routes delegate schedule parsing, validation and atomic locked `crons.json` mutation to `src/dashboard_schedules.py` (the adapter resolves the path; the domain module receives it). Enforced by `tests/dashboard-schedule-delegation.test.py`. → "Presentation adapters vs domain/storage"
-
 ## Repo rules
 
 Before creating a PR, check `gh pr list --state open` for an existing PR on the same topic. If one exists, push to its branch instead of creating a new PR.
 
 Never commit directly to main. Always work on a feature branch.
 
-### Creating a PR or issue
-
-`CONTRIBUTING.md` is the canonical process and you MUST follow it. Before opening
-a PR, read and adhere to its "Before starting a PR", "The PR body should answer",
-and "After opening the PR" sections. The short checklist:
-
-- Search existing open + recently-closed PRs/issues for duplicates (`gh pr list --search "closes #N"`)
-- Confirm your git author email is GH-mapped — not `*.local` (macOS hostname auto-fill) or `noreply@anthropic.com`. CLA-Assistant silently leaves the check PENDING on unmappable emails.
-- Single concern per PR; no bundled refactors
-- Confirm the bug exists on `upstream/main` before adding a fix
-- **Paste before/after evidence** — the actual command output at the parent commit and at HEAD, not a description of it. This is the #1 change-request on this repo. Every claim in the body must be checkable from the diff or that output.
-- **Live path (bridge / network / delivery loop / startup)?** Include a real post-restart round trip, not just unit tests — reviewers reject harness-only proof for these.
-- **Stacked PR?** Name the parent and merge order; after the parent lands, rebase/update the child and rerun its full checks.
-- Scan added lines for hardcoded host paths and inline path fallbacks; production code must use the repo's path helpers.
-- `license/cla` missing after a push or `update-branch`? It is SHA-bound and the auto-recheck comment is unreliable — **close+reopen the PR** is the retry that works. Full ABSENT-vs-FAILING triage: `CONTRIBUTING.md` → "Check the CLA status"
-
-### Reviewing a PR
-
-When you review a PR (including another agent's), you MUST follow `CONTRIBUTING.md`'s
-"Reviewing PRs" section. In short:
-
-- Be evidence-first: cite the commit, file, line, repro, or failing test. If you did not verify a claim, say so explicitly.
-- Distinguish blockers from nits so the author knows what gates merge.
-- Add evidence, not noise — don't stack a bare "LGTM" under an existing approval.
-- APPROVE / REQUEST_CHANGES is a formal GitHub review action (`gh pr review`), not a Discord 👍 or a plain comment.
-- Review the current head and, for a stack, the child-only layer plus cumulative interaction. Re-check CI and approval freshness after every update/rebase.
-- Scan added lines for hardcoded host paths on every review; keep fixture exclusions token-specific so they cannot hide another real path on the same line.
-- Once a requested change is verified fixed, dismiss or replace the stale REQUEST_CHANGES state. If it remains, cite the exact unresolved behavior.
-- Merge only when the current head is mergeable, required CI + CLA are green, and it has the approvals the `main` ruleset requires. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
+**Creating or reviewing a PR or issue: you MUST follow `CONTRIBUTING.md` (and `REVIEW.md` when reviewing).** Checklists: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md#pr-checklists).
 
 **Review criteria live in `REVIEW.md` (single source of truth).** Don't duplicate the lessons here — read them from `REVIEW.md`. **Before reviewing, run `python3 skills/review-preflight/scripts/review-preflight.py <PR>`** — it reads `REVIEW.md` and prints the criteria inline; `scripts/review-checks.sh` runs the machine-readable `checks:` block (hardcoded-path scan) in CI; and Codex's managed GitHub-App reviewer reads `REVIEW.md` directly. Adding or editing a lesson is a PR to `REVIEW.md` only.
 
@@ -119,14 +73,7 @@ Sutando's file state lives in two top-level spaces (with the repo as the inferre
 
 All per-user mutable state — `tasks/`, `results/`, `state/`, `data/`, `logs/`, `notes/`, `build_log.md`, `pending-questions.md`, etc. — lives under a single **workspace** directory. Loose status/state `.json` files (`core-status.json`, `voice-state.json`, `contextual-chips.json`, `dynamic-content.json`, `quota-state.json`) live under `state/`; the workspace root holds only the top-level directories. Code, skills source, and repo configuration stay in the repo root (separate concern).
 
-**Resolution (every service reads the same):**
-
-**Default:** the workspace lives at `<repo>/workspace/` (in-repo). To override, edit `sutando.config.local.json` (per-clone, gitignored). `$SUTANDO_WORKSPACE` is no longer honored as of v0.8 / #1440 — see [`docs/workspace-config.md`](docs/workspace-config.md) for its deprecation behaviour and the repo-root fallback anti-pattern.
-
-**Use the helper, don't reinvent the fallback:**
-- Python: `from workspace_default import resolve_workspace` → returns a `Path`.
-- TypeScript: `import { resolveWorkspace } from './workspace_default.js'` → returns a `string` (added in #821).
-- Swift: `AppDelegate.workspace` property in `src/Sutando/main.swift` (added in #837 — split alongside `repoRoot` for code-adjacent paths).
+**Resolution and helpers** (default location, override, `resolve_workspace` / `resolveWorkspace` / `AppDelegate.workspace` — never reinvent the fallback): [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md#workspace-resolution).
 
 
 ## Personal overrides
@@ -161,40 +108,13 @@ When you accept a non-trivial commitment from the user via **chat** (direct text
 - The user asks you to do something concrete (close a PR, send an email, research a topic, fix a bug)
 - NOT for: quick questions, greetings, simple lookups, clarifications
 
-**How:**
-```bash
-WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
-local _ts="$(date +%s)"
-cat > "$WORKSPACE/tasks/task-chat-${_ts}.txt" << EOF
-id: task-chat-${_ts}
-timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-source: chat
-interaction_type: message
-channel_id: local-chat
-user_id: ${SUTANDO_DM_OWNER_ID:-chat-local}
-access_tier: owner
-priority: normal
-task: <concise description of what you're doing>
-EOF
-```
+**How:** write `$WORKSPACE/tasks/task-chat-<ts>.txt` with the recipe's headers: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md#chat-path-task-and-result-recipes).
 
 **`task:` must be the LAST header.** Its value is free-form and may span lines, so the strict `parse_task_headers` treats everything below it as body. Nothing is discarded, but `source`, `channel_id`, `access_tier` and `priority` all read as absent — so a task written with `task:` earlier routes nowhere and sorts as `normal` however it declares itself. The delimiter rule is deliberate (it stops a user-supplied body forging headers), so the writer is what must change.
 
 **Priority field**: `urgent` (voice/phone, sub-second latency target) | `normal` (chat/owner DM, default) | `low` (cron, health-check, non-owner DMs). When more than one task is pending, the consumer processes highest-priority first; tie-breaker is mtime FIFO. Defaults per source are encoded in `src/task_priority.py:default_priority_for_source`.
 
-**When done:**
-Write a result file using the same task ID (re-use the `WORKSPACE` from above).
-**Write it atomically** — a drain can claim `results/task-*.txt` the moment it appears, so a file
-built in place is published half-written:
-```bash
-_out="$WORKSPACE/results/task-chat-${_ts}.txt"
-_tmp="$(mktemp "$WORKSPACE/results/.task-chat-${_ts}.XXXXXX")"
-cat > "$_tmp" << EOF
-<result summary>
-EOF
-mv -f "$_tmp" "$_out"    # rename within one directory is atomic; no drain's glob
-                         # matches a name without `.txt` (pathlib `*` sees dotfiles)
-```
+**When done:** write `results/task-chat-<ts>.txt` atomically (temp file + `mv`), same recipe.
 
 This ensures the dashboard, result-watcher, and timeout logic work the same regardless of entry path.
 
@@ -350,12 +270,7 @@ room: 'I sent it to you in our DM.' Never move silently.
 
 **Marker parsing is centralised — do not re-implement it.** A Python result consumer MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`; attachments = actions with `kind == "attach"`). Attachment-path authorization is owned by `src/policy/egress/attachment.py` before the upload sink. One-way dependency: `parse_markers() -> send_allowlist.is_path_sendable() -> transport upload`, where `src/send_allowlist.py` is a transition alias. Private copies drift — guarded by `tests/bridge-marker-no-leak.test.py`; history in [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md).
 
-**Per-channel pull namespace** — `results/<channel-key>.task-{id}.txt`. The DEFAULT result filename remains `results/task-{id}.txt` for every task — keep using it unless you specifically need to push a result to a non-delegating consumer. Use the scoped form ONLY when a result needs to be claimed by a pull-side consumer that didn't delegate the work:
-- phone → key built via `phoneCallKey(callSid)` → `phone-<safe(call-sid)>`
-
-**Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix.
-
-Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python). Why the scoped name slides past existing consumers, and how the phone drain claims it: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Per-channel pull namespace".
+**Per-channel pull namespace** (`results/<channel-key>.task-{id}.txt`, only for a pull-side consumer that didn't delegate the work; default stays `results/task-{id}.txt`): [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md#per-channel-pull-namespace).
 
 **IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"` (`$SUTANDO_TASKS_DIR` as the inbox when set; the tag is what lets the external standby supervisor see this watcher and stand down) — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification, followed by `QUEUE: <n> pending after this` only when other tasks are waiting. When a notification arrives, Read the named file, process it, and write a result to `results/`. Pass `timeout_ms: 1800000` and re-arm on the expiry or early-exit notice (`Monitor` has no `persistent` option).
 
@@ -363,16 +278,7 @@ If the watcher stops, start it again the same way; a start on a watched inbox ex
 
 **Cancel handling.** When you read a task whose `task:` body starts with `CANCEL_INSTRUCTION:` — written by the `cancel_task` voice tool — stop any in-flight work on the referenced task ID, write a brief confirm result for the CANCEL_INSTRUCTION task itself (e.g. `"Cancelled task-X (was in progress)"` or `"task-X already completed, nothing to cancel"`), and do NOT process the original referenced task. The CANCEL_INSTRUCTION task uses the regular task pipeline as its signal channel — picking it up means you've reached the user's cancel intent.
 
-**Voice session context.** Voice-agent's Gemini context window rolls off after ~10 minutes of turns; voice forgets specifics like "the post" or "Mini Draft A" that landed earlier in your session. Whenever you make a durable decision the voice agent may need to reference later — picking a draft, writing text to clipboard for a pending paste, committing to an active task — update `state/voice-session-context.json`. Schema:
-```json
-{
-  "updated_at": "<ISO ts>",
-  "active_drafts": [{"name": "...", "summary": "...", "path": "..."}],
-  "pending_action": {"kind": "paste|review|other", "what": "...", "where": "..."} | null,
-  "last_results": [{"task_id": "...", "subject": "...", "ts": "..."}]
-}
-```
-Keep `active_drafts` and `last_results` to ~3 entries each (drop oldest). Voice can call the `recent_context` tool to read this file when it senses confusion ("what was the post?" / "what's pending?"). Per Chi 2026-05-13.
+**Voice session context.** On a durable decision the voice agent may reference later, update `state/voice-session-context.json` — schema and rules: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md#voice-session-context).
 
 ## Tutorial
 
@@ -384,14 +290,7 @@ Secrets passed via Slack/Discord (`vault set KEY VALUE`) are intercepted by the 
 
 **When writing any integration that needs an API key, token, or password — always use vault:**
 
-Python: import `get_vault_key`/`list_vault_keys` from `src/vault_intercept.py` (path-bootstrap snippet: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md)).
-
-**CLI (for subprocesses):**
-```bash
-python3 skills/secret-vault/secret-vault.py list                           # list stored key names
-python3 skills/secret-vault/secret-vault.py get KEY                        # print value
-python3 skills/secret-vault/secret-vault.py env KEY1 KEY2 -- python3 x.py  # inject as env vars
-```
+Python + CLI recipes: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md#vault-recipes).
 
 If an integration needs a key that isn't in the vault yet, ask the user to send `vault set KEY value` via Slack or Discord — the bridge intercepts it securely before it touches disk.
 
