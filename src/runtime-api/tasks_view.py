@@ -30,6 +30,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))  # src/
+from activity_bus import in_progress
 from delivery.readiness import read_ready_result
 from file_lock import locked_file
 from local_task_protocol import (KNOWN_HEADER_KEYS, find_archived_task,  # noqa: E402
@@ -241,8 +242,13 @@ class TasksView:
                 return {"taskId": task_id, "state": waiting["state"],
                         "waitingOn": waiting["requests"]}
             claimed = ".claimed-" in live.name
+            try:
+                active = claimed or in_progress(self.tasks_dir.parent, task_id)
+            except (UnicodeError, TypeError, OverflowError):
+                # Malformed activity must not block task reads or cancellation.
+                active = False
             return {"taskId": task_id,
-                    "state": "in_progress" if claimed else "pending"}
+                    "state": "in_progress" if active else "pending"}
         if find_archived_task(self.tasks_dir, task_id) is not None:
             # Archived task, result already delivered and rotated away.
             return {"taskId": task_id, "state": "done"}
