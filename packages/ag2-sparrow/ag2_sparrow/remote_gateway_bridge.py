@@ -4445,9 +4445,7 @@ def _finish_relay_end(core, broker_id: str, local: str, record: dict, inflight: 
             return
     if not _save_inflight(inflight):
         return
-    _forget_ack_first(broker_id)
-    _log(f"result {local}: finished the end of a relay result the broker refused for good "
-         f"({REFUSED_FOR_GOOD}); its task and relay mark are retired")
+    _log_relay_end(local, _forget_ack_first(broker_id))
 
 
 def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
@@ -6154,7 +6152,7 @@ def _end_relay_result(core, item_id: str, tid: str, record: dict, result_file, g
     steps leaves the mark for start-up to finish the end by (`_finish_relay_end`)."""
     _dispose_terminal(core, item_id, tid, record, result_file, generation)
     _log(f"ERROR result {tid}: the broker refused the answer and the `failed` sent in its place "
-         f"for good ({REFUSED_FOR_GOOD}); it is not retried, and its task and relay mark are retired")
+         f"for good ({REFUSED_FOR_GOOD}); it is quarantined and not retried")
 
 
 def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None" = None) -> bool:
@@ -6172,8 +6170,17 @@ def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None"
     # A relay result's end: its task and in-flight id retired on disk, the mark last.
     settled = _settle_task(tid, inflight)
     if settled and (inflight is None or _save_inflight(inflight)):
-        _forget_ack_first(item_id)
+        _log_relay_end(tid, _forget_ack_first(item_id))
     return settled
+
+
+def _log_relay_end(tid: str, mark_retired: bool) -> None:
+    """Say how the end of a relay result refused for good closed, once its steps ran."""
+    if mark_retired:
+        _log(f"result {tid}: its relay result's end is complete; its task is settled and its relay mark retired")
+    else:
+        _log(f"result {tid}: its task is settled, but its relay mark could not be retired; "
+             "the next start finishes the end")
 
 
 def _effective_item_id(core, broker_tid: str, no_send: bool) -> str:

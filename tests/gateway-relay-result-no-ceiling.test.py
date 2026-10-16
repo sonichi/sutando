@@ -240,6 +240,8 @@ class TheRule(_Bridge):
         self.assertEqual(gw._load_ack_first(), {}, "the mark outlived the end")
         self.assertNotIn(ask, gw._load_inflight(), "the in-flight id outlived the end")
         self.assertEqual(sum(line.startswith(f"ERROR result {ask}: the broker refused") for line in self.lines), 1)
+        self.assertIn(f"result {ask}: its relay result's end is complete; its task is settled and its relay "
+                      "mark retired", self.lines)
         # A restart: the reclaim, the keep pass and the drain revive nothing, and post nothing.
         inflight = set(gw._load_inflight())
         gw._reclaim_parked_relay_results(inflight)
@@ -643,11 +645,17 @@ class EndCutShort(_Bridge):
 
     def test_a_finish_that_cannot_complete_a_step_leaves_the_end_for_the_next_start(self):
         ask = self.refused_for_good_until("_dispose_terminal", before=True)
-        for step, stuck in (("_dispose_terminal", None), ("_settle_task", False), ("_save_inflight", False)):
+        for step, stuck in (("_dispose_terminal", None), ("_settle_task", False), ("_save_inflight", False),
+                            ("_forget_ack_first", False)):
             with patch.object(gw, step, return_value=stuck):
                 gw._reclaim_parked_relay_results(set(gw._load_inflight()))
             self.assertEqual(gw._load_ack_first(), {ASK_A: ask}, f"the mark went with {step} undone")
+        complete = f"result {ask}: its relay result's end is complete"
+        self.assertFalse(any(line.startswith(complete) for line in self.lines), "success logged before it was")
+        self.assertIn(f"result {ask}: its task is settled, but its relay mark could not be retired; "
+                      "the next start finishes the end", self.lines)
         self.assert_finished_by_a_start(ask)
+        self.assertEqual(sum(line.startswith(complete) for line in self.lines), 1)
 
 
 class EndCutShortOnANamedInstance(EndCutShort):
