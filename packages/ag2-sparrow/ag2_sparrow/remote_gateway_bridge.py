@@ -4686,6 +4686,9 @@ def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
     if entry.get("refused") is True:
         _discard_held(tid, entry, staged, inflight)
         return False
+    if entry.get("ending") is True:
+        _end_withdrawn_relay_ask(tid, entry, staged, inflight)
+        return False
     if not staged.exists():
         # `_publish_staged` consumes the staged file, so only a publish removes it.
         if _held_published(tid, entry, dest):
@@ -4721,6 +4724,7 @@ def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
     # After the ack, before the publish: the entry stays held and accepted, so
     # exactly-once is untouched and only the publication waits.
     if _staged_tier_withdrawn(tid, staged):
+        _end_withdrawn_relay_ask(tid, entry, staged, inflight)
         return False
     if not _publish_staged(staged, dest):
         return False
@@ -4818,6 +4822,72 @@ def _held_overdue(staged: Path) -> bool:
         return time.time() - staged.stat().st_mtime >= ACK_FIRST_UNRESOLVED_AFTER_S
     except OSError:
         return False
+
+
+# Why a held relay ask was ended unpublished: the tier it froze dropped and stayed dropped.
+_HELD_ENDED_REASON = "local access withdrawn"
+
+
+def _withdrawn_for_good(staged: Path) -> "tuple[str, str] | None":
+    """(the tier frozen, the tier now) for a held ask whose local access definitely dropped
+    and stayed dropped past the threshold. None while it may yet publish or be proven."""
+    frozen = _staged_policy_tier(staged)
+    if frozen is None or not _held_overdue(staged):
+        return None
+    now = _tier_for(frozen[1], frozen[0])
+    return (frozen[0], now) if _TIER_RANK[now] < _TIER_RANK[frozen[0]] else None
+
+
+def _end_withdrawn_relay_ask(tid: str, entry: dict, staged: Path, inflight: "set[str]") -> None:
+    """A held relay ask is already acknowledged, so withheld for good it would wait forever
+    and no outcome would ever be posted. Once its local access has stayed withdrawn past the
+    threshold, it is ended: the decision recorded in its entry, the relay `failed` result
+    sent with no ceiling, then the staged file, the in-flight id and the entry retired, the
+    mark last, each step resumed by the next pass after a crash. It is never published."""
+    if entry.get("ending") is not True:
+        dropped = _withdrawn_for_good(staged)
+        if dropped is None:
+            return
+        entry = {**entry, "accepted": True, "ending": True}   # reached only once the ack is accepted
+        if not _put_held(tid, entry):
+            return
+        _log(f"WARNING ack_first task {tid}: {_HELD_ENDED_REASON} (staged as {dropped[0]}, now "
+             f"{dropped[1]}) for {ACK_FIRST_UNRESOLVED_AFTER_S} s — ended with a `failed` result, "
+             "never published")
+    broker_id = entry["broker_id"]
+    if not _relay_failed_sent(broker_id):
+        return
+    _drop_staged(staged)
+    _HELD_TASKS.pop(tid, None)
+    _forget_task_media(tid)
+    inflight.discard(tid)
+    if not (_save_inflight(inflight) and _put_held(tid, None)):
+        return
+    if _forget_ack_first(broker_id):
+        _forget_relay_counts(tid, broker_id)
+        _log(f"ack_first task {tid}: ended unpublished ({_HELD_ENDED_REASON}); its relay mark is retired")
+    else:
+        _log(f"ack_first task {tid}: ended unpublished, but its relay mark could not be retired; "
+             "the next start retires it")
+
+
+def _relay_failed_sent(broker_id: str) -> bool:
+    """Send the relay `failed` result for an ask that never ran, retried as any relay result
+    is. True once the broker has it, or has refused it for good: nothing more can be sent."""
+    core = _delivery_core("relay")
+    payload = json.dumps({"id": broker_id, "body": "", "status": "failed",
+                          **_result_contract(False)}).encode("utf-8")
+    core.backend.publish(broker_id, payload)       # once: an existing record is never replaced
+    record = read_item(core.backend.root, broker_id) or {}
+    if record.get("status") not in ("DELIVERED", "PARKED"):
+        core.deliver_one(broker_id, payload)
+        record = read_item(core.backend.root, broker_id) or {}
+    if record.get("status") == "DELIVERED" or record.get("reason") == REFUSED_FOR_GOOD:
+        return True
+    if record.get("status") == "PARKED":           # a park the relay rule could not prevent
+        requeue_item_with_epoch(core.backend.root, broker_id, reset_attempts=True,
+                                operator=core.worker, reason=_RELAY_REOPENED)
+    return False
 
 
 def _take_ack_first(task: dict, inflight: "set[str]") -> bool:

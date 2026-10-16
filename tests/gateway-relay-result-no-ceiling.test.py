@@ -758,6 +758,122 @@ class EndCutShortOnANamedInstance(EndCutShort):
     INSTANCE = "dev"
 
 
+class WithdrawnAccess(_Bridge):
+    """A held relay ask whose local access is withdrawn after it was staged is withheld
+    (#5617). It is already acknowledged, so withheld for good it would wait forever: past
+    the threshold it is ended with a `failed` result instead, and never published."""
+
+    def withheld_on_a_drop(self, age: float = 0.0) -> Path:
+        """Staged under the owner cap, then acked under a guest cap: kept staged, unpublished."""
+        with patch.object(gw, "_post_ack_first", return_value="retry"):
+            self.assertFalse(gw._take_ack_first(voice_ask(), set(gw._load_inflight())))
+        [staged] = sorted(gw._held_dir().glob(f"{ASK_A}.txt.*.tmp"))
+        if age:
+            landed = time.time() - age
+            os.utime(staged, (landed, landed))
+        self.advance(cap="guest")
+        self.assertFalse((gw.TASKS_DIR / f"{ASK_A}.txt").exists(), "published under the lowered cap")
+        if age < gw.ACK_FIRST_UNRESOLVED_AFTER_S:
+            self.assertIs(gw._load_held()[ASK_A]["accepted"], True)
+        return staged
+
+    def advance(self, cap: "str | None" = "guest") -> bool:
+        with patch.object(gw, "LOCAL_TIER", cap or gw.LOCAL_TIER):
+            return gw._advance_held_tasks(set(gw._load_inflight()))
+
+    def assert_ended(self) -> None:
+        self.assertEqual([p for p in self.broker.results() if p["id"] == ASK_A][-1], FAILED)
+        self.assertEqual(item(self.outbox_root, ASK_A)["status"], "DELIVERED")
+        self.assertFalse((gw.TASKS_DIR / f"{ASK_A}.txt").exists(), "an ended ask was published")
+        self.assertEqual((sorted(gw._held_dir().glob("*.tmp")), gw._load_held()), ([], {}))
+        self.assertEqual(gw._load_ack_first(), {})
+        self.assertNotIn(ASK_A, gw._load_inflight())
+
+    def test_still_withdrawn_past_the_threshold_it_ends_with_one_failed_result(self):
+        self.withheld_on_a_drop(age=700.0)
+        self.assert_ended()
+        self.assertEqual(self.broker.results(), [FAILED], "not exactly one `failed`")
+        warnings = [line for line in self.lines if line.startswith(f"WARNING ack_first task {ASK_A}: local access withdrawn")]
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(self.backoff_counts(ASK_A), [])
+        # A restart revives nothing: the held tasks, the reclaim, the keep pass, the drain.
+        self.advance(cap="guest")
+        self.advance(cap=None)
+        gw._reclaim_parked_relay_results(set(gw._load_inflight()))
+        self.assertFalse(gw._keep_relay_results_in_flight(set(gw._load_inflight())))
+        self.drain()
+        self.assertEqual(self.broker.results(), [FAILED])
+        self.assertFalse((gw.TASKS_DIR / f"{ASK_A}.txt").exists())
+
+    def test_a_cap_restored_before_the_threshold_publishes_it_once(self):
+        staged = self.withheld_on_a_drop()
+        landed = time.time() - 300.0
+        os.utime(staged, (landed, landed))
+        self.advance(cap="guest")                        # still withdrawn, not yet overdue
+        self.assertIn(ASK_A, gw._load_held())
+        self.assertTrue(self.advance(cap="owner"))       # restored: published
+        self.assertTrue((gw.TASKS_DIR / f"{ASK_A}.txt").exists())
+        self.assertEqual((gw._load_held(), self.broker.results()), ({}, []), "a `failed` was sent")
+        self.assertEqual(gw._load_ack_first(), {ASK_A: ASK_A}, "the published ask lost its mark")
+
+    def test_an_unprovable_envelope_past_the_threshold_stays_withheld(self):
+        staged = self.withheld_on_a_drop()
+        cases = {"no access_tier line": lambda: staged.write_text(
+                     staged.read_text().replace("\naccess_tier: owner\n", "\n"))}
+        if os.geteuid() != 0:                            # root reads a mode-000 file
+            cases["unreadable"] = lambda: staged.chmod(0)
+        original = staged.read_text()
+        for name, damage in cases.items():
+            with self.subTest(name):
+                staged.write_text(original)
+                damage()
+                landed = time.time() - 700.0
+                os.utime(staged, (landed, landed))
+                self.advance(cap="guest")
+                staged.chmod(0o600)
+                self.assertIn(ASK_A, gw._load_held(), "an unprovable envelope was ended")
+                self.assertIn(ASK_A, gw._HELD_UNRESOLVED, "not reported")
+                self.assertEqual(self.broker.results(), [], "a `failed` was sent")
+                self.assertFalse((gw.TASKS_DIR / f"{ASK_A}.txt").exists())
+
+    def test_a_failed_the_broker_cannot_take_yet_is_retried_then_the_end_completes(self):
+        self.broker.result = "down"
+        self.withheld_on_a_drop(age=700.0)
+        held = gw._load_held()[ASK_A]
+        self.assertEqual((held["ending"], held["accepted"]), (True, True), "the decision was not recorded first")
+        self.assertEqual(gw._load_ack_first(), {ASK_A: ASK_A})
+        self.broker.result = "ok"
+        gw._delivery_core("relay").backend.clock = lambda: time.time() + 60.0
+        self.advance(cap="owner")                        # the decision stands though the cap came back
+        self.assert_ended()
+        self.assertFalse((gw.TASKS_DIR / f"{ASK_A}.txt").exists())
+
+    def test_a_failed_refused_for_good_still_ends_it(self):
+        self.broker.result = "400"
+        self.withheld_on_a_drop(age=700.0)
+        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+        self.assertEqual(self.broker.results(), [FAILED])
+        self.assertEqual((gw._load_held(), gw._load_ack_first()), ({}, {}))
+
+    def test_an_end_cut_short_is_finished_by_the_next_pass_or_start(self):
+        real_put = gw._put_held
+
+        def dies_removing(tid, entry):
+            if entry is None:
+                raise _Crash("before the entry goes")
+            return real_put(tid, entry)
+        with patch.object(gw, "_put_held", new=dies_removing), self.assertRaises(_Crash):
+            self.withheld_on_a_drop(age=700.0)
+        self.assertEqual((sorted(gw._held_dir().glob("*.tmp")), gw._load_ack_first()), ([], {ASK_A: ASK_A}))
+        self.advance(cap="guest")                        # the next pass: staged file gone, entry ending
+        self.assert_ended()
+        self.assertEqual(self.broker.results(), [FAILED])
+        # Cut before the mark: the next start retires it, the `failed` being delivered.
+        gw._record_ack_first(ASK_A)
+        gw._retire_delivered_marks()
+        self.assertEqual(gw._load_ack_first(), {})
+
+
 # ── through the real poll loop ───────────────────────────────────────────────
 
 class _Loop(unittest.TestCase):
@@ -1062,6 +1178,32 @@ class EndCutShortThroughTheLoop(_Loop):
 
 class EndCutShortThroughTheLoopOnANamedInstance(EndCutShortThroughTheLoop):
     INSTANCE = "dev"
+
+
+class WithdrawnAccessThroughTheLoop(_Loop):
+    """The same end through the real loop, across restarts."""
+
+    def test_withdrawn_past_the_threshold_after_a_restart_ends_once_and_stays_ended(self):
+        self.relay.queue.append(voice_ask())
+        self.bridges.crashed(self.bridges.start(crash="before-publish"), "the publish")
+        [staged] = sorted((self.ws / "tasks" / ".ack-first").glob(f"{ASK_A}.txt.*.tmp"))
+        landed = time.time() - 700.0                     # staged ten minutes and more ago
+        os.utime(staged, (landed, landed))
+        self.bridges.env["REMOTE_TASK_TIER"] = "guest"   # the operator withdrew local access
+        second = self.bridges.start()
+        self.bridges.wait_for(lambda: self.relay.results and not self.state("remote-task-ack-first")
+                              and ASK_A not in self.state("remote-task-inflight")
+                              and not self.state("remote-task-ack-first-manifest"), second, "the end")
+        self.bridges.polls_after(second)
+        self.bridges.stop(second)
+        third = self.bridges.start()
+        self.bridges.polls_after(third, 3)
+        self.bridges.stop(third)
+        self.assertEqual(self.posted(), [FAILED], "not exactly one `failed`")
+        self.assertEqual(self.relay.results, [FAILED])
+        self.assertEqual(self.bridges.fired(), [], "the ended ask reached the core")
+        self.assertFalse((self.ws / "tasks" / f"{ASK_A}.txt").exists())
+        self.assertEqual(sorted((self.ws / "tasks" / ".ack-first").glob("*.tmp")), [])
 
 
 class OutsideTheInFlightSet(_Loop):

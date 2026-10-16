@@ -132,7 +132,15 @@ own, and publishes it to the core only once its ack is accepted:
    resolved again under the local policy in force now; if access has dropped, or
    the file cannot be read or parsed or names no known tier, nothing is
    published: the task stays staged and accepted, is reported under
-   `ack_first_unresolved` (below), and is checked again on every pass.
+   `ack_first_unresolved` (below), and is checked again on every pass. The ask is
+   already acknowledged, so a definite drop that still holds ten minutes after the
+   task was staged ends it rather than leave it waiting with no outcome: the
+   decision is recorded in the entry, the relay `failed` result is sent for its
+   broker id with no ceiling (see "A relay ask's result"), then the staged file,
+   the in-flight id and the entry go, and the mark last, each step resumed after a
+   crash. It is never published; a cap restored before then publishes it as
+   usual. An envelope that cannot be proven is never ended this way: it stays
+   withheld and checked.
    Refused: the decision is recorded in the entry first, then the staged file,
    the mark and the in-flight entry go, and the entry goes last, so a crash in
    between finishes the discard on the next pass. The task never reaches the core.
