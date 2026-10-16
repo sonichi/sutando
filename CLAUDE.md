@@ -366,16 +366,7 @@ If the watcher stops, start it again the same way; a start on a watched inbox ex
 
 **Cancel handling.** When you read a task whose `task:` body starts with `CANCEL_INSTRUCTION:` — written by the `cancel_task` voice tool — stop any in-flight work on the referenced task ID, write a brief confirm result for the CANCEL_INSTRUCTION task itself (e.g. `"Cancelled task-X (was in progress)"` or `"task-X already completed, nothing to cancel"`), and do NOT process the original referenced task. The CANCEL_INSTRUCTION task uses the regular task pipeline as its signal channel — picking it up means you've reached the user's cancel intent.
 
-**Voice session context.** Voice-agent's Gemini context window rolls off after ~10 minutes of turns; voice forgets specifics like "the post" or "Mini Draft A" that landed earlier in your session. Whenever you make a durable decision the voice agent may need to reference later — picking a draft, writing text to clipboard for a pending paste, committing to an active task — update `state/voice-session-context.json`. Schema:
-```json
-{
-  "updated_at": "<ISO ts>",
-  "active_drafts": [{"name": "...", "summary": "...", "path": "..."}],
-  "pending_action": {"kind": "paste|review|other", "what": "...", "where": "..."} | null,
-  "last_results": [{"task_id": "...", "subject": "...", "ts": "..."}]
-}
-```
-Keep `active_drafts` and `last_results` to ~3 entries each (drop oldest). Voice can call the `recent_context` tool to read this file when it senses confusion ("what was the post?" / "what's pending?"). Per Chi 2026-05-13.
+**Voice session context.** Voice-agent's Gemini context window rolls off after ~10 minutes of turns; voice forgets specifics like "the post" or "Mini Draft A" that landed earlier in your session. Whenever you make a durable decision the voice agent may need to reference later — picking a draft, writing text to clipboard for a pending paste, committing to an active task — update `state/voice-session-context.json`. Schema, size limits and the `recent_context` reader: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md) "Voice session context schema".
 
 ## Tutorial
 
@@ -427,6 +418,8 @@ This also starts the screen capture server (needs terminal for Screen Recording 
 Use skills available to the active runtime and under this repo's `skills/` directory when available. Prefer existing skills over writing new code from scratch.
 
 **Coordinating with a person or agent — recruiting a reviewer, delegating, escalating, resolving an identity — starts by invoking [`skills/collaboration-intelligence/`](skills/collaboration-intelligence/SKILL.md).** It derives *whom to ask* from the map, not recall: a memory answering "who do I ask?" fires first and is one past situation's cached answer, so treat it as a candidate and invoke the skill anyway. Feed the map back from real use — record who actually answered, owned, or reviewed, and correct it when a routing guess turns out wrong; a map only used and never updated decays into the recall it replaced. The same applies **after every PR update that changes the diff**, not only at recruitment: a push re-notifies no one, so re-solicit each reviewer through their stand-in. A base-merge that only clears BEHIND is not such an update.
+
+**Durable work goes into Room Commons.** In an AG2 Space room, work people will come back to (a report, plan, spec, tracker, table, diagram or deck) becomes a Commons page via the `room-commons` skill or the `room.commons.*` Actions, linked in your reply — not chat, a local file or another tool's artifact.
 
 **Updating a skill mid-session.** Runtime behavior differs. For the Claude runtime, `skills/install.sh` places symlinks under its configured skills directory; after `git pull`, run `bash skills/refresh-skill.sh <name>` (or `--all`) to force its live watcher to re-read them. For the Codex runtime, `refresh-skill.sh` does not update Codex's cache; restart with `bash src/agent/start-cli.sh --restart` — **never from inside the core session**, which it kills (`docs/codex-core.md`). Manifest-loaded `config`/`tools` and `src/` agent code require a service restart via `src/restart.sh`.
 

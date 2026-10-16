@@ -143,3 +143,17 @@ Moved verbatim from CLAUDE.md "Task bridge" (2026-09-21 context-budget diet):
 > The per-consumer prefix is code-enforced (single helper, single source of truth) so cross-consumer namespace collisions are impossible regardless of what ID format a future consumer adopts.
 >
 > Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses.
+
+## Voice session context schema
+
+Moved verbatim from CLAUDE.md "Task bridge" (2026-10-16 context-budget diet). `state/voice-session-context.json` schema:
+
+```json
+{
+  "updated_at": "<ISO ts>",
+  "active_drafts": [{"name": "...", "summary": "...", "path": "..."}],
+  "pending_action": {"kind": "paste|review|other", "what": "...", "where": "..."} | null,
+  "last_results": [{"task_id": "...", "subject": "...", "ts": "..."}]
+}
+```
+Keep `active_drafts` and `last_results` to ~3 entries each (drop oldest). Voice can call the `recent_context` tool to read this file when it senses confusion ("what was the post?" / "what's pending?"). Per Chi 2026-05-13.

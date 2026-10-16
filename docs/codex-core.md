@@ -69,6 +69,32 @@ The Codex implementation:
   observation record (`docs/health-snapshot.md`, "Runtime observation");
 - restarts the core and notifier together, preventing duplicate task consumers.
 
+## AG2 Space MCP without the desktop app
+
+The AG2 Space desktop app writes an `ag2-space` entry into `$CODEX_HOME/config.toml`.
+A Codex core set up without the app has no such entry, so it has no AG2 Space
+Actions (`room.commons.*` included) until you add the hosted server yourself. Find
+the Codex home with `bash scripts/sutando-config.sh core-config-dir-value codex`,
+then add this to its `config.toml`:
+
+```toml
+[mcp_servers.ag2-space]
+url = "https://mcp.ag2.space/mcp"
+```
+
+`codex mcp add ag2-space --url https://mcp.ag2.space/mcp` writes the same entry
+and starts the sign-in. The server uses OAuth, so no token goes in the file:
+
+```bash
+codex mcp login ag2-space   # sign in to AG2 Space in the browser
+codex mcp list              # ag2-space: enabled, Auth no longer "Not logged in"
+```
+
+That connection acts as you. To act as your agent, call the server's `agent_link`
+tool once from a Codex session with the one-time link code on the agent's
+settings page in AG2 Space. Restart the core afterwards
+(`bash src/agent/start-cli.sh --restart`, from outside the core session).
+
 ## Externally managed monitor and heartbeat
 
 An embedder that owns both helpers can opt out of the launcher's helper lifecycle:
