@@ -30,20 +30,35 @@ whenever the owner asks for the tutorial in their AG2 Space DM.
 is extra: if any step below fails, the greeting stands. Do not edit, retract or repeat it, and do
 not retry the page in the same turn.
 
-1. Your name: `ag2.whoami` (the `ag2-space` tools). Use your own display name, not the owner's.
+1. Your name, never the owner's, and never a reason to stop. Use `ag2.whoami`'s `display_name`
+   when it has one. When it is null, pass `--name auto`, which falls back in this order:
+   - your Matrix profile displayname from your homeserver;
+   - a name made from your mxid's localpart (`@chi-air-blue.agent:…` gives `Chi Air Blue`);
+   - `Sutando`.
+
+   Your mxid is `$AGENT_MXID`, else the AG2 Space channel env file's, else `--agent-mxid`.
 2. Create or refresh the page and summon the owner to it:
 
    ```bash
    python3 skills/tutorial/scripts/getting_started.py publish \
-     --room '<owner DM room id>' --name '<your name>' --owner '<owner mxid>'
+     --room '<owner DM room id>' --name '<your name or auto>' --owner '<owner mxid>'
    ```
+
+   You need not source any env file. `room_commons.py` is found beside this skill, else in the
+   installed skills directory. When the environment names none of its credentials, they are read
+   from the AG2 Space channel env file through the shared resolver
+   (`src/channel_credentials.py`). They are passed to that process only and never printed.
 
    `--core` defaults to `auto`: the core runtime the engine resolves
    (`bash scripts/sutando-config.sh core-runtime`: the launcher's `SUTANDO_CORE_RUNTIME` stamp,
    else `core.runtime` in config). Pass `--core claude|codex|unknown` to override it.
 
-   It prints one JSON line: `action` is `created`, `updated` or `unchanged`; `kind` is the page's
-   `html-<id>`. On `created` it summons the owner, so the card in the DM is the one line that
+   It prints one JSON line:
+   - `action`: `created`, `updated` or `unchanged`;
+   - `kind`: the page's `html-<id>`;
+   - `name`: the name it used.
+
+   On `created` it summons the owner, so the card in the DM is the one line that
    carries the page: post no other message about it. On `updated` / `unchanged` it summons no one
    (`--summon` forces it, e.g. when the owner asks for the tutorial again).
 3. Exit 3 (room-commons not installed) or 4 (a room-commons call failed): leave the greeting as is
@@ -58,12 +73,24 @@ room. A re-link or reinstall that reuses the DM rewrites that page in place; a p
 from the list is created again. `getting_started.py plan --room <room>` shows what `publish` would
 do; `render --name <name>` prints the HTML.
 
-**What the page says.** A short AG2 Space tour. Each part is one line on what it is and one
+**What the page says.** A short, interactive AG2 Space tour (`scripts/tour_page.py`). Each part is one line on what it is and one
 thing to try: Rooms, Commons, Teamwork, Calls & voice, Connect other agents (Dot, Grok Bot, Muse,
 Other; Claude Code and Codex are Sutando cores chosen at setup, not agents you add), Connect your
 apps (Settings → Integrations), Activity & notices, Mobile. On a Claude Code core it adds
 "Import your Claude Code history"; on Codex or an unknown core that part is left out. UI labels
-match the AG2 Space client; reword them here when the client renames one.
+match the AG2 Space client; reword them in `tour_page.py` when the client renames one.
+
+**How the page behaves.**
+- It is one self-contained HTML document with no external URL. Each section has an inline SVG
+  icon in its own accent colour (AA contrast on the card in both themes), under a hero with your
+  name.
+- It opens as a step-by-step tour: Back and Next, numbered step dots, a "Show all" toggle, and
+  the arrow keys.
+- Each section has a "Mark done" checkbox and a progress bar ("3 of 9 done"). Progress is saved
+  in the page runtime's `window.artifact.state` under `gs-done-<viewer page id>`, so it survives
+  reloads and a refresh in place. Without that runtime it falls back to localStorage, then to
+  memory, and every storage access is guarded.
+- Animations stop under `prefers-reduced-motion`. Without scripts, every section shows.
 
 **The prompts.** Each card's Copy button puts its prompt on the clipboard; where the page's sandbox
 refuses the clipboard, the prompt is selected instead and the button says to press ⌘C. The page
