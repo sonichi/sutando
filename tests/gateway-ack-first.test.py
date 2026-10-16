@@ -432,7 +432,8 @@ class AcknowledgingFirst(_Bridge):
         self.assertEqual((self.marks(), self.on_disk_inflight()), ({}, set()))
 
     def test_a_vanished_staged_file_without_a_published_copy_is_kept_and_reported(self):
-        for name, other in (("no copy", None), ("a task file that does not match", "id: other\n")):
+        for name, other in (("no copy", None), ("a task file that does not match", b"id: other\n"),
+                            ("a task file that cannot be read", b"\xff\xfe not utf-8")):
             with self.subTest(name):
                 self.lines.clear()
                 gw._HELD_REPORTED.clear()
@@ -441,7 +442,7 @@ class AcknowledgingFirst(_Bridge):
                 entry = self.manifest()[ASK_A]
                 self.staged(ASK_A)[0].unlink()
                 if other is not None:
-                    (gw.TASKS_DIR / f"{ASK_A}.txt").write_text(other)
+                    (gw.TASKS_DIR / f"{ASK_A}.txt").write_bytes(other)
                 for _ in range(2):
                     self.assertFalse(gw._advance_held_tasks(self.inflight))
                     gw._emit_gateway_status(True)
@@ -503,8 +504,109 @@ class AcknowledgingFirst(_Bridge):
         gw.ACK_FIRST_MANIFEST_FILE.write_text(json.dumps(
             {ASK_A: {**self.manifest()[ASK_A], "accepted": True}}))
         gw._save_inflight(set())
+        with patch.object(gw, "_save_inflight", return_value=False):
+            self.assertFalse(gw._advance_held_tasks(set()))    # not in flight: not published
+        self.assertFalse((gw.TASKS_DIR / f"{ASK_A}.txt").exists())
         self.assertTrue(gw._advance_held_tasks(set()))
         self.assertEqual((self.on_disk_inflight(), len(self.broker.acks())), ({ASK_A}, 1))
+
+    def test_an_acceptance_the_unreadable_manifest_cannot_hold_keeps_the_task_staged(self):
+        self.broker.answers[ASK_A] = ["down"]
+        self.take(voice_ask(ASK_A))
+        entry, kept = self.manifest()[ASK_A], gw.ACK_FIRST_MANIFEST_FILE.read_text()
+        gw.ACK_FIRST_MANIFEST_FILE.write_text("{not json")
+        self.assertFalse(gw._advance_held(ASK_A, entry, self.inflight))   # acked, not recorded
+        self.assertEqual(self.broker.states[ASK_A], "acknowledged")
+        self.assertEqual((len(self.staged(ASK_A)), self.fired), (1, []))
+        self.assertEqual(gw.ACK_FIRST_MANIFEST_FILE.read_text(), "{not json")
+        gw.ACK_FIRST_MANIFEST_FILE.write_text(kept)              # readable again: acked, published
+        self.assertTrue(gw._advance_held_tasks(self.inflight))
+        self.assertEqual((self.fired, len(self.broker.acks())), ([ASK_A], 3))
+
+    def test_removing_an_entry_that_is_already_gone_rewrites_nothing(self):
+        # A pass after a partial failure removes the same entry again.
+        self.broker.answers[ASK_B] = ["down"]
+        self.take(voice_ask(ASK_B))
+        before = (gw.ACK_FIRST_MANIFEST_FILE.read_text(), gw.ACK_FIRST_MANIFEST_FILE.stat().st_mtime_ns)
+        self.assertTrue(gw._put_held(ASK_A, None))
+        self.assertEqual((gw.ACK_FIRST_MANIFEST_FILE.read_text(),
+                          gw.ACK_FIRST_MANIFEST_FILE.stat().st_mtime_ns), before)
+
+    def test_a_refusal_that_cannot_be_recorded_discards_nothing_yet(self):
+        self.broker.answers[ASK_A] = ["stale", "stale"]
+        real = gw._put_held
+        with patch.object(gw, "_put_held", side_effect=lambda tid, entry: False
+                          if isinstance(entry, dict) and entry.get("refused") else real(tid, entry)):
+            self.assertFalse(self.take(voice_ask(ASK_A)))
+        self.assertEqual((len(self.staged(ASK_A)), self.marks()), (1, {ASK_A: ASK_A}))
+        self.assertNotIn("refused", self.manifest()[ASK_A])
+        self.assertIn(ASK_A, self.on_disk_inflight())
+        self.assertFalse(gw._advance_held_tasks(self.inflight))      # acked again, refused again
+        self.assert_never_reached_the_core(ASK_A)
+        self.assertEqual((self.marks(), len(self.broker.acks())), ({}, 2))
+
+    def test_a_discard_whose_in_flight_save_fails_is_finished_by_the_next_pass(self):
+        self.broker.answers[ASK_A] = ["stale"]
+        real, failing = gw._save_inflight, {"left": 1}
+
+        def save(inflight):
+            if ASK_A not in inflight and failing["left"]:         # the discard's save
+                failing["left"] -= 1
+                return False
+            return real(inflight)
+
+        with patch.object(gw, "_save_inflight", side_effect=save):
+            self.assertFalse(self.take(voice_ask(ASK_A)))
+        self.assertIs(self.manifest()[ASK_A]["refused"], True)
+        self.assertEqual((self.staged(ASK_A), self.marks()), ([], {}))
+        self.assertIn(ASK_A, self.on_disk_inflight())
+        self.assertFalse(gw._advance_held_tasks(self.inflight))
+        self.assertEqual((self.manifest(), self.on_disk_inflight(), len(self.broker.acks())),
+                         ({}, set(), 1))
+
+    def test_an_in_flight_set_that_cannot_be_saved_holds_the_ack(self):
+        with patch.object(gw, "_save_inflight", return_value=False):
+            self.assertFalse(self.take(voice_ask(ASK_A)))
+        self.assertEqual((self.broker.acks(), len(self.staged(ASK_A))), ([], 1))
+        self.assertNotIn(ASK_A, self.inflight)
+        self.assertTrue(gw._advance_held_tasks(self.inflight))
+        self.assertEqual((self.fired, self.on_disk_inflight()), ([ASK_A], {ASK_A}))
+
+    def test_a_publish_that_fails_is_retried_without_a_new_ack(self):
+        real, failing = gw._publish_staged, {"left": 1}
+
+        def publish(tmp, path):
+            if Path(path).parent == gw.TASKS_DIR and failing["left"]:
+                failing["left"] -= 1
+                return False
+            return real(tmp, path)
+
+        with patch.object(gw, "_publish_staged", side_effect=publish):
+            self.assertFalse(self.take(voice_ask(ASK_A)))
+        self.assertIs(self.manifest()[ASK_A]["accepted"], True)
+        self.assertEqual((len(self.staged(ASK_A)), self.fired), (1, []))
+        self.assertTrue(gw._advance_held_tasks(self.inflight))
+        self.assertEqual((self.fired, len(self.broker.acks()), self.manifest()), ([ASK_A], 1, {}))
+
+    def test_a_task_staged_before_a_restart_gets_only_its_wake_on_the_publish(self):
+        self.broker.answers[ASK_A] = ["down"]
+        self.take(voice_ask(ASK_A))
+        gw._HELD_TASKS.clear()                          # the served task lived only in memory
+        self.assertTrue(gw._advance_held_tasks(self.inflight))
+        self.assertEqual(self.fired, [ASK_A])
+        self.assertIn(f"queued {ASK_A} (staged and acknowledged before a restart)", self.lines)
+        self.assertFalse(gw.OWNER_ACTIVITY_FILE.exists(), "a presence hint was replayed")
+
+    def test_a_relay_ask_served_again_once_queued_is_acked_not_staged_again(self):
+        self.assertTrue(self.take(voice_ask(ASK_A)))
+        self.assertFalse(self.take(voice_ask(ASK_A, lease="gen-2")))
+        self.assertEqual(self.broker.acks()[-1], {"id": ASK_A, "durable": True, "lease_id": "gen-2"})
+        self.assertEqual((self.fired, self.staged(ASK_A), self.manifest()), ([ASK_A], [], {}))
+        self.assertEqual(gw._load_pending_acks(), {}, "the confirmed ack was not retired")
+        # While the manifest cannot be read, not even that ack is sent.
+        gw.ACK_FIRST_MANIFEST_FILE.write_text("{not json")
+        self.assertFalse(self.take(voice_ask(ASK_A, lease="gen-3")))
+        self.assertEqual(len(self.broker.acks()), 2)
 
     def test_a_staged_task_is_never_dropped_as_abandoned(self):
         self.broker.answers[ASK_A] = ["down"]
@@ -558,6 +660,21 @@ class TheMark(_Bridge):
         (gw.RESULTS_DIR / f"{reask}.txt").write_text("Clear.")
         gw._retire_delivered_marks()
         self.assertEqual(self.marks(), {ASK_A: ASK_A})
+
+    def test_at_start_a_malformed_mark_is_left_as_it_is(self):
+        self.assertTrue(self.take(voice_ask(ASK_A)))
+        self.deliver(ASK_A)
+        gw.ACK_FIRST_FILE.write_text(json.dumps({ASK_A: ASK_A, "../escape": "x", ASK_B: 7}))
+        gw._retire_delivered_marks()
+        self.assertEqual(self.marks(), {"../escape": "x", ASK_B: 7})
+
+    def test_unreadable_marks_close_a_fold_as_before_when_its_task_file_cannot_be_read(self):
+        # Only a task file that reads `source: matrixrtc-voice` defers its fold.
+        gw.ACK_FIRST_FILE.write_text("{not json")
+        self.assertEqual(gw._fold_target(TYPED_A, TYPED_A, ASK_B), "")       # no task file at all
+        (gw.TASKS_DIR / f"{TYPED_A}.txt").mkdir()                           # one that cannot be read
+        self.assertEqual(gw._fold_target(TYPED_A, TYPED_A, ASK_B), "")
+        self.assertFalse(any("deferred" in line for line in self.lines))
 
     def test_at_start_an_unreadable_alias_ledger_keeps_every_mark(self):
         # A re-ask's live result cannot be ruled out, so nothing is retired early.
