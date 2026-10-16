@@ -73,6 +73,20 @@ class DropTask(unittest.TestCase):
             unstamped = "\n".join([lines[0]] + lines[2:]) + "\n"
             expect = hmac.new(bytes.fromhex(key.read_text()), unstamped.encode(), hashlib.sha256).hexdigest()
             self.assertEqual(mac, expect)
+            self._verify_with_task_envelope(text, Path(tmp))
+
+    def _verify_with_task_envelope(self, text: str, workspace: Path) -> None:
+        # The repo's own verifier when this test runs from a checkout; the package ships without src/.
+        src = Path(__file__).resolve().parents[3] / "src"
+        if not (src / "task_envelope.py").is_file():
+            self.skipTest("src/task_envelope.py not beside the package (standalone checkout)")
+        sys.path.insert(0, str(src))
+        import task_envelope
+        (workspace / "state" / "auth").mkdir(parents=True)
+        (workspace / "state" / "auth" / "task-hmac.key").write_text((workspace / "task-hmac.key").read_text())
+        self.assertEqual(task_envelope.verify_text(text, workspace)["verdict"], "verified")
+        flipped = text.replace("access_tier: owner", "access_tier: guest")
+        self.assertEqual(task_envelope.verify_text(flipped, workspace)["verdict"], "invalid")
 
 
 class Measure(unittest.TestCase):

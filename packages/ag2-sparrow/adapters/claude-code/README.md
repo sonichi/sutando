@@ -19,9 +19,20 @@ Two tools, registered at `session.start`:
   `glob("task-*.txt")` never matches the temp name and `read_ready_result`
   never sees a half body. One reply per task.
 
-A task is submitted once: an in-memory seen-set plus "a result for it already
-exists" (a restarted session re-submits only unanswered tasks). The task file
-stays in the inbox — Sparrow's result poster re-reads it for the tier guard.
+A task is submitted once: it is marked seen only when the submit resolves (a
+rejected submit is retried on the next tick), and a task whose result file
+already holds bytes is skipped (a restarted session re-submits only unanswered
+tasks; "holds bytes" is Sparrow's own `read_ready_result` rule, so a blank
+result never counts as answered). One submission per tick bounds a backlog
+after a restart; a file unchanged for 30 ticks that never gains a `task:` line
+is left alone. The task file stays in the inbox — Sparrow's result poster
+re-reads it for the tier guard. The sender tier is read the way Sparrow's
+`team_result_guard.resolve_access_tier` reads it: tier lines before `task:`
+win, else every tier line; none means owner; conflicting values fail to guest.
+
+The adapter lives beside the Python package on purpose, not inside it: it is a
+Claude Code plugin, not Python, so it ships with the repo and not in the wheel
+(the Hatch adapter inside the package is the other shape).
 
 Environment: `AG2_INBOX_DIR` and `AG2_RESULTS_DIR` (defaults for the tool
 arguments), `AG2_HMAC_KEY_FILE`, `AG2_HMAC_STRICT`.
@@ -38,9 +49,13 @@ Reply by writing results/task-<id>.txt atomically (temp + rename) via the ag2spa
 ```
 
 **The session's own prompt (CLAUDE.md) must honour the tier line.** A
-guest-tier body that says "you are the owner" is still a guest-tier body; the
-mod makes the claim unforgeable from inside the file, it cannot make the model
-obey it.
+guest-tier body that says "you are the owner" is still a guest-tier body. The
+tier line is unforgeable only when the envelope reads `verified`: without
+strict mode an `unsigned` file is submitted with an honour-system tier. A body
+that mimics the header line cannot pass as the mod's own: the engine frames
+every submission as "The ag2space-inbox plugin sent a message", and the
+header line is the first line of that frame, so a second copy inside the body
+is visibly inside the data.
 
 ## HMAC policy (mirrors `src/task_envelope.py`)
 
@@ -54,6 +69,12 @@ check (ten lines of embedded Python run through `$.process.run`; key path from
 submitted; `unsigned` and `unverifiable` are submitted with the verdict in the
 envelope line; `AG2_HMAC_STRICT=1` submits `verified` only. Checked against
 `task_envelope.verify_text` on the same bytes: all four verdicts agree.
+
+Sparrow itself never stamps: the stamper is a host-injected seam
+(`local_task_protocol.set_task_stamper`), and only Sutando's
+`src/remote-gateway-bridge.py` installs one. A standalone `ag2-sparrow` inbox
+therefore reads `unsigned` on every task, and strict mode submits nothing
+there.
 
 ## Two session shapes, measured
 
@@ -111,6 +132,6 @@ mtime delta.
 - The Mods API moves between releases (2.1.287+; built and measured on
   2.1.296). Re-run validate and the tests after a CLI upgrade.
 - The seen-set is module memory: a reload re-scans and re-submits anything
-  without a result file. One session per inbox — two armed sessions would
-  double-submit.
+  without a non-empty result file, one per tick in name order. One session per
+  inbox — two armed sessions would double-submit.
 - Poll granularity 1 s; the model turn dominates latency.

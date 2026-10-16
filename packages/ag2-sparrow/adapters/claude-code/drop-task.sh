@@ -14,7 +14,8 @@ body = "\n".join(lines) + "\n"
 # Same stamp as src/task_envelope.py: HMAC-SHA256 over the unstamped text, inserted after id:.
 mac = hmac.new(bytes.fromhex(open(key).read().strip()), body.encode(), hashlib.sha256).hexdigest()
 stamped = body.split("\n"); stamped.insert(1, "envelope_hmac: v1:" + mac)
-dest = os.path.join(inbox, tid + ".txt"); tmp = f"{dest}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+dest = os.path.join(inbox, tid + ".txt")
+tmp = os.path.join(inbox, f".{tid}.txt.{os.getpid()}.{uuid.uuid4().hex}.tmp")
 with open(tmp, "w") as f:
     f.write("\n".join(stamped)); f.flush(); os.fsync(f.fileno())
 os.replace(tmp, dest)
