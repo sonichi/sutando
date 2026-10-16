@@ -1164,13 +1164,13 @@ class BridgeDelegates(unittest.TestCase):
 
     # Every function of the bridge that still moves or removes a file, as of
     # this head; a new one is a private disposal path until proven otherwise.
-    # `_append_log_file` rotates the bridge's own log, never a result.
+    # `_append_log_file` and `_drop_staged` touch only its own log and staged tasks, never a result.
     MOVERS = {"_atomic_private_json", "_backup_tier_map_to_disk", "_emit_gateway_status",
               "_publish_staged", "_save_dedup_aliases", "_save_task_rooms",
               "_write_owner_activity", "refresh_routing", "_durable_write", "_write_task",
               "_append_log_file", "_archive_task_file", "_archive_resolved_review",
               "_retry_review_control_results", "_post_proactive", "_recover_orphan_proactive",
-              "_retire_proactive"}
+              "_retire_proactive", "_drop_staged"}
 
     def movers(self):
         out = {}

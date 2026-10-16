@@ -91,6 +91,57 @@ older brokers, bridges, and Sutando installations. An optional task handler may
 use the header with `source: ag2space` and `channel_id` to select a durable
 room-specific provider session.
 
+**`capabilities` (the poll's proof).** Every poll carries
+`&capabilities=voice-outcome-v1`, the voice-outcome contract the heartbeat also
+declares (below). One agent's credential may be used by more than one bridge, so
+an AG2 Space broker serves a voice relay ask only to a poll that names the
+contract itself, and serves a poll without it the tasks behind that ask; a relay
+that predates the parameter ignores it.
+
+**`ack_first` (acknowledging first).** An AG2 Space broker marks a voice relay ask
+it serves with `"ack_first": true`, at most one per response. The bridge handles
+a task served with that exact boolean before the rest of the response, on its
+own, and publishes it to the core only once its ack is accepted:
+
+1. It writes the task file under a temporary name the core does not read, then
+   commits the task's `ack_first` mark and a manifest entry, both fsync'd, then
+   adds the task to the in-flight set. If the file, the mark or the entry does
+   not commit, nothing is staged and nothing is acked, so the broker serves the
+   task again; until the in-flight set commits, the task stays staged, unacked.
+2. It acks the task with `durable: true` and the served `lease_id`.
+3. An accepted ack (`200`, or `200` with `"duplicate": true` for a repeat)
+   publishes the task file to the core, and the manifest entry is removed after
+   the publish. A refused ack (`404 {"error": "not leased …"}`, with or without
+   `"reason": "stale lease generation"`: the ask was withdrawn, expired or served
+   again) discards the staged file, the manifest entry and the mark, and the
+   task never reaches the core. Any other answer, or a network error, keeps the
+   task staged; its ack is retried before every poll.
+
+The manifest is `state/remote-task-ack-first-manifest[.<instance>].json`, keyed by
+the local id; each entry names the broker id, the `lease_id`, the staged and
+destination file names, a SHA-256 digest of the task file, and whether the ack
+was accepted. At start, before the first poll, the bridge resumes each entry: a
+staged file whose ack is not yet recorded as accepted is acked again (the broker
+answers a repeat with `duplicate`) and then published or discarded as above; one
+whose ack was accepted is published without a new ack, so a lease the broker has
+since ended cannot discard a task it holds as acknowledged. A staged file that
+is gone was consumed by its publish: a task file with the same digest, a claimed
+or archived copy, or a result for the task proves it, and the entry is cleared
+without publishing again. With neither, the entry is kept and the bridge logs an
+error rather than guess. A task served again before its ack replaces its entry,
+so only the newest serve's lease is acked.
+
+**The `ack_first` mark.** `state/remote-task-ack-first[.<instance>].json` maps the
+broker id of each task served with `ack_first` to the local id it is published
+under. It is a file of its own because an older bridge prunes the media sidecar
+when it settles a task, and the mark must survive a restart: it decides whether
+an honoured fold sends `consolidated_into` (see `POST /v1/results`). A mark is
+removed once the broker has accepted that task's result and the result is
+archived, at start when the outbox shows that result delivered and no result of
+the task is still live, or when its ack is refused, since such a task never
+reached the core. An older bridge never reads or writes the file. A task served
+without `ack_first` is unchanged.
+
 ### `POST /v1/tasks/<id>/ack`
 
 Claim/acknowledge a task so the server stops redelivering it.
@@ -104,7 +155,8 @@ delivery should treat ack as "stop redelivering"; the client is idempotent and
 will not re-queue a task it already claimed or archived.
 
 `durable: true` is sent only once the task file, its media sidecar and the
-in-flight set are all fsync'd, so the task survives a crash of this host. When a
+in-flight set are all fsync'd (for an `ack_first` task, the staged file, its mark
+and its manifest entry too), so the task survives a crash of this host. When a
 fresh queue write, its media sidecar, the in-flight set or the pending-ack
 ledger does not commit, the client withholds the ack entirely rather than
 claiming a task it could still lose. The flag is merely absent — a plain ack the
@@ -117,6 +169,8 @@ When the served task carries a `lease_id` (the broker's lease generation, fresh
 on every serve), the ack echoes it — also on a retry after a restart, since the
 pending-ack ledger keeps it — and a `404 {"reason": "stale lease generation"}`
 retires that ack the same way; a task served without one is acked without the key.
+An `ack_first` task is not in the pending-ack ledger: its manifest entry is its
+retry record, because an accepted ack must also publish it (see `GET /v1/tasks`).
 
 ### `POST /v1/results`
 
@@ -142,18 +196,18 @@ resends them; a payload an older bridge stored carries neither. Every existing k
 keeps its value, and a broker that predates the contract reads only the keys it
 names, so it ignores both.
 
-**`consolidated_into` (an honoured fold).** An AG2 Space broker marks a voice relay
-ask it serves with `"ack_first": true`. When the core folds such an ask, or a re-ask
-of it, into another task (`[deduped: <holder>]`) and the dedup planner honours the
-fold, its result closes with `consolidated_into`: the holder's **broker** id,
-resolved as a result's own id is (the dedup alias first, then the instance prefix
-stripped), so a named instance sends `ask-…`, never `task-<instance>~ask-…` or a
-re-ask's `task-<hash>`. It carries an empty `body` and no `no_send`: the broker
-records the ask as merged into the holder and posts nothing for it. While the alias
-ledger cannot be read, the result waits for a later pass; a holder that is not a task
-of this gateway is never named. The bridge knows an ask was served with `ack_first`
-only while the process that took it runs; after a restart, and for every other task
-(typed and Signal tasks included), an honoured fold closes with the bare
+**`consolidated_into` (an honoured fold).** When the core folds a task whose
+`ack_first` mark is kept (see `GET /v1/tasks`), or a re-ask answering one, into
+another task (`[deduped: <holder>]`) and the dedup planner honours the fold, its
+result closes with `consolidated_into`: the holder's **broker** id, resolved as a
+result's own id is (the dedup alias first, then the instance prefix stripped), so
+a named instance sends `ask-…`, never `task-<instance>~ask-…` or a re-ask's
+`task-<hash>`. It carries an empty `body` and no `no_send`: the broker records the
+ask as merged into the holder and posts nothing for it. The mark is on disk, so a
+fold answered after a restart sends it too. While the alias ledger cannot be read,
+or the marks cannot be read for a voice ask, the result waits for a later pass; a
+holder that is not a task of this gateway is never named. Every other task, typed
+and Signal tasks included, closes an honoured fold with the bare
 `[deduped: <holder>]` and `no_send` as before, because the broker already acts on
 `consolidated_into` for any task. A fold the planner re-asks or reports is
 unchanged: the re-ask's answer goes under the original id, and the report is a
@@ -194,9 +248,17 @@ body: {
   "provider": "<REMOTE_TASK_PROVIDER>",
   "tier": "<REMOTE_TASK_TIER>",
   "inflight": <int>,            // tasks currently claimed but not yet resulted
-  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status", "team-collaborator"]
+  "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status",
+                   "team-collaborator", "voice-outcome-v1"]
 }
 ```
+
+`voice-outcome-v1` declares the voice-outcome contract: the poll's proof and
+acknowledging an `ack_first` task before publishing it under `GET /v1/tasks`, and
+`dm_only` and `consolidated_into` under `POST /v1/results`. An AG2 Space broker
+keeps the declaration to decide whether a new call may use the voice relay; the
+poll and every result carry the contract again, because a Mac can be downgraded
+after the declaration was read.
 
 `status` and `step` come from the core's
 `state/core-status.json`, with the health-check overlay described under
