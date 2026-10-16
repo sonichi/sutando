@@ -76,7 +76,8 @@ broker also supplies its room-policy `access_tier` attestation.
 
 Owner replies to runtime action cards are interpreted before local task-file
 newline confinement. The action text excludes a well-formed broker reply-context
-envelope and the leading `> ` lines of a legacy Matrix rich-reply fallback.
+envelope and the leading quote lines of a legacy Matrix rich-reply fallback
+(`> `, `>\t`, and a bare `>` blank line).
 Only the remaining answer is matched; quoted-only or already-folded quotes do
 not become approvals. The same parser handles private-result review decisions.
 Owner identity, the target card and its current revision/guard remain required;

@@ -344,7 +344,7 @@ def reply_action_text(text: str) -> str:
     body = split_reply_context(text)[1].lstrip()
     lines = body.splitlines(keepends=True)
     for i, line in enumerate(lines):
-        if not line.startswith("> "):
+        if not (line.startswith(("> ", ">\t")) or line.rstrip("\r\n") == ">"):
             return "".join(lines[i:]).strip()
     return ""
 

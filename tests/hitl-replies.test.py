@@ -266,7 +266,7 @@ class ReplyHandlerTests(unittest.TestCase):
         req = self.mgr.create(tui_gate.requirement_for(
             "blocked-human", "selection", prompt, "test-core", "selection", "blocked"))
         self.mgr.record_projection(req.id, req.revision, "$tui-card")
-        text = "> <@agent:ag2.space> Allow harmless echo?\n\nYes"
+        text = "> <@agent:ag2.space> Allow harmless echo?\n>\n> Approve or Deny\n\nYes"
         self.assertEqual(self.h.offer_task(self._task(reply_to_event="$tui-card", task=text)), "applied")
         self.assertEqual(self.mgr.get(req.id).chosen_action, "allow")
         self.assertIsNone(self.mgr.get(self.req.id).chosen_action)

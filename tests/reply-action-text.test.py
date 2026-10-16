@@ -45,6 +45,20 @@ class ReplyActionTextTests(unittest.TestCase):
                 text = envelope("> <@agent:test.invalid> Original card\n> Another line\n\nDeny").replace("\n", nl)
                 self.assertEqual(protocol.reply_action_text(text), "Deny")
 
+    def test_blank_and_tab_prefixed_quote_lines_are_skipped(self):
+        for protocol in (CORE, VENDOR):
+            for nl in ("\n", "\r\n"):
+                for blank in (">", "> ", ">\t"):
+                    with self.subTest(protocol=protocol.__name__, newline=nl, blank=blank):
+                        text = envelope("> <@agent:test.invalid> Card\n" + blank
+                                        + "\n>\tApprove or Deny\n\nYes").replace("\n", nl)
+                        self.assertEqual(protocol.reply_action_text(text), "Yes")
+
+    def test_a_non_quote_greater_than_prefix_is_preserved(self):
+        for protocol in (CORE, VENDOR):
+            text = "> <@agent:test.invalid> Card\n>not a quote\n\nAllow"
+            self.assertEqual(protocol.reply_action_text(text), ">not a quote\n\nAllow")
+
     def test_quoted_and_folded_labels_are_not_answers(self):
         for protocol in (CORE, VENDOR):
             for text in ("> <@agent:test.invalid> Allow\n> Deny", "> <@agent:test.invalid> quote  Allow"):
