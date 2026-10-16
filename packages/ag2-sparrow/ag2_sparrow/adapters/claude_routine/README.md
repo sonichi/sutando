@@ -36,9 +36,14 @@ Payload:
 ```
 room=<channel_id> thread=<thread_root or none> tier=<owner|team|guest> collaborator=<true|false> task_id=<id>
 note: <NON_OWNER_NOTE>            (non-owner tiers only)
+<UNTRUSTED_TASK_<nonce>>
 <message body, untrusted>
+</UNTRUSTED_TASK_<nonce>>
 <bridge-written guardrail lines, when the task file has them>
 ```
+
+The nonce is fresh per fire, so a body cannot close the span early; the bridge-written lines sit after
+the closing marker and stay operator text. Only the body is cut to fit the length limit.
 
 Tier and collaborator come from the attested headers (`adapters/hatch/task_fields.attested_headers`, via
 the Codex adapter's `parse_task`), never from message text; unknown tiers become `guest`, and
@@ -50,7 +55,7 @@ carries the same text so the rules do not depend on the payload. A task with no 
 the owner's — and unlike the Codex adapter (which runs a non-owner turn on its own ephemeral, read-only
 sandbox), there is no narrower scope to fall back to here: the prompt's note is the only boundary once a
 task is fired. A team or guest task is therefore refused before it is ever sent, with a plain-text result
-saying so, unless `--allow-non-owner` is passed — which should only be true when this specific routine's
+("This agent only answers its owner here."), unless `--allow-non-owner` is passed — which should only be true when this specific routine's
 connector scope is meant to be reachable by non-owner senders.
 
 ## Results: why `[no-send]`
