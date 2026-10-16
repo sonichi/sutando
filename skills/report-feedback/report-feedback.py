@@ -28,6 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -78,6 +79,7 @@ ASK_ACTIONS = [
 AUTO_STATE_FILE = "feedback-auto-reports.json"
 AUTO_DEDUPE_WINDOW_S = 24 * 3600
 AUTO_DAILY_CAP = 5
+HISTORICAL_HOLD_S = 72 * 3600
 
 
 def _git(repo: Path, *args: str) -> Optional[str]:
@@ -162,6 +164,35 @@ def body_with_versions(body: str, versions: dict) -> str:
             line += f"; bundled build: {info['bundled_build']}"
         lines.append(line)
     return "\n".join(lines)
+
+
+def recovery_report_content(rec: dict) -> tuple[str, dict]:
+    """Describe the persisted hold interval without changing the draft or recovery state."""
+    recovery = dict(rec["payload"]["recovery"])
+    timestamps = {}
+    for key, value in (("observed_at", rec.get("created")), ("released", recovery.get("released"))):
+        try:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("unknown timestamp")
+            timestamps[key] = datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+        except (ValueError, OverflowError, OSError):
+            value = None
+            timestamps[key] = "unknown"
+        recovery[key] = value
+    observed, released = recovery["observed_at"], recovery["released"]
+    elapsed = (released - observed if observed is not None and released is not None
+               and released >= observed else None)
+    recovery["held_seconds"] = elapsed
+    recovery["historical"] = elapsed >= HISTORICAL_HOLD_S if elapsed is not None else None
+    duration = str(timedelta(seconds=elapsed)) if elapsed is not None else "unknown"
+    lines = [rec["payload"]["body"], "", "### Automatic report timing",
+             f"- Original observation (UTC): {timestamps['observed_at']}",
+             f"- Released (UTC): {timestamps['released']}",
+             f"- Elapsed hold duration: {duration}"]
+    if recovery["historical"]:
+        lines.extend(["", "**Historical report:** Held for at least 72 hours. This describes an earlier "
+                      "observation and may not reflect the current state."])
+    return "\n".join(lines), recovery
 
 
 def _redact(text: str) -> str:
@@ -736,8 +767,11 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
     ctx["versions"] = d.get("versions") or {
         name: {"version": "unknown", "commit": "unknown"} for name in ("sutando", "ag2space")
     }
+    body = d["body"]
     if d.get("recovery"):
         ctx["recovery"] = d["recovery"]
+        if d.get("auto"):
+            body, ctx["recovery"] = recovery_report_content(rec)
     with_logs = choice == "file" and prefs["sendLogs"] and not d.get("no_logs")
     if with_logs:
         excerpt, names = logs_excerpt(ws)
@@ -748,7 +782,7 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
             ctx["logs_omitted"] = why_no_logs(ws)
     else:
         ctx["logs_opted_out"] = True
-    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": body_with_versions(d["body"], ctx["versions"]), "context": ctx}
+    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": body_with_versions(body, ctx["versions"]), "context": ctx}
     mark_posting(ws, draft_id)
     receipt: dict = {}
     try:

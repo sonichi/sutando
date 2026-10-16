@@ -19,6 +19,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`activity_bus.py`** — ActivityCard is the UI projection of a durable TaskRun state machine; runtime instrumentation only enriches that state machine with observations.
 - **`activity_policy.py`** — Access tier → capabilities → audience policy → projection.
 - **`activity_rows.py`** — The agent-activity row writer: one JSON row per line at <workspace>/state/agent-activity.jsonl, the live window the desktop renders, its per-day archive, the per-task index that keeps a summary exact after rotation, and the summary left at done.
+- **`ag2space_links.py`** — Links a person clicks to open an AG2 Space room, message or room surface inside the app.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`agent_availability.py`** — Two room-visible projections of one private runtime: what this agent is doing on THIS task, and whether it can take more work.
 - **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
@@ -35,6 +36,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
 - **`cartesia-stt-provider.ts`** — Cartesia ink-whisper STT provider — drop-in replacement for GeminiBatchSTTProvider.
 - **`cartesia-tts.ts`** — Cartesia sonic-3 TTS — generates WAV audio files from text.
+- **`channel_credentials.py`** — Credential variables a room client reads, taken from the AG2 Space channel env file.
 - **`channel_env_containment.py`** — Shared containment policy for a channel's `.env` credential file.
 - **`channel_env_resolve.py`** — Pick the channel env file a caller should source for `channels/<source>`.
 - **`channel_token.py`** — Shared token-resolution policy for the channel bridges.
@@ -65,6 +67,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`credential_resolver.py`** — Credential resolver — capability, not key (G8, desktop-parity plan).
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`cron_entry_digest.py`** — Stable per-entry digests for `crons.json`, so config drift is DETECTABLE.
+- **`cron_loop_policy.py`** — Core loop identity and deliberate parking shared by schedule adapters.
 - **`cron_ownership.py`** — Which crons.json entries a given session may register.
 - **`cron_task_id.py`** — Canonical naming contract for a cron job's task id and result filename.
 - **`current_track.py`** — The one writer for a host's current-track.md: append and rotate share a lock.
@@ -116,6 +119,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
+- **`local_time.ts`** — The owner's wall clock for the `local_time:` task header; mirrors local_task_protocol.local_time_value (ISO-8601 with offset, then the IANA zone).
+- **`loop_completion.py`** — Host-specific proof that a proactive-loop pass completed.
 - **`meeting-dictation.ts`** — Meeting mode on bodhi's dictation (transcription) mode: while a meeting runs the voice model is quiesced, each final transcript line is appended to the day's meeting note, and an exit phrase returns the session to agent mode.
 - **`meeting-input-hold.ts`** — In meeting mode bodhi runs the session in transcription mode: the voice model must not speak.
 - **`meeting-tools.ts`** — Meeting tools — Google Meet, phone call, and meeting ID lookup.

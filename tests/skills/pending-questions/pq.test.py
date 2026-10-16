@@ -60,7 +60,7 @@ class TestAsk(_Ws):
                               "--urgency", "durable", "--workspace", str(self.ws))
         self.assertEqual(rc, 0, out)
         self.assertIn("recorded: Pending questions database", out)
-        self.assertIn(f"row: https://collab.test.invalid/#/room/{ROOM}?surface=db&page=pendingq", out)
+        self.assertIn("row: https://collab.test.invalid/home/!ownerdm%3Atest.invalid?surface=database&page=pendingq", out)
         [body] = json.loads(self.state.read_text())["bodies"].values()
         self.assertIn("**Approve** -> merge\n**Hold** -> wait", body)
         self.assertIn("**Sent:** queued owner-dm", body)
@@ -286,7 +286,7 @@ class TestSharedRoom(rdb._Ws):
         store, room = self.store_room({})
         self.assertEqual(room, self.SHARED)
         self.assertNotIn("DM", store.label)
-        self.assertIn(self.SHARED, store.link)
+        self.assertIn("/home/!shared%3Atest.invalid?", store.link)
 
     def test_env_wins_over_the_state_file(self):
         (self.ws / "state" / "pending-questions-room").write_text("!fromstate:test.invalid")

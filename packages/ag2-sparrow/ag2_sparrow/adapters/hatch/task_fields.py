@@ -14,6 +14,7 @@ from pathlib import Path
 from ... import gateway_instance, local_task_protocol
 
 SNIPPET_MAX = 500
+REPLY_CONTEXT_MAX = 2000
 # Matrix user id: @localpart:server_name (DNS name, IPv4 or [IPv6], optional :port).
 # fullmatch only: `$` would also match before a trailing newline.
 _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -48,20 +49,42 @@ def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":
     return strict
 
 
-def snippet(body: str) -> str:
-    """The message's first line without a Matrix reply fallback, which is the quoted
-    message replied to, not the reply."""
-    first = body.split("\n", 1)[0].strip()
-    prefix = _SENDER_PREFIX.match(first)
+def _split(text: str) -> "tuple[str, str]":
+    """(sender prefix, the message after it without a Matrix reply fallback, which is
+    the quoted message replied to, not the reply)."""
+    prefix = _SENDER_PREFIX.match(text)
     head = prefix.group(0) if prefix else ""
-    rest = first[len(head):]
+    rest = text[len(head):]
     fallback = _REPLY_FALLBACK.match(rest)
-    return (head + (rest[fallback.end():] if fallback else rest))[:SNIPPET_MAX]
+    return head, rest[fallback.end():] if fallback else rest
+
+
+def snippet(body: str) -> str:
+    """The message's first line, sender prefix kept, without a reply fallback."""
+    head, rest = _split(body.split("\n", 1)[0].strip())
+    return (head + rest)[:SNIPPET_MAX]
+
+
+def message_text(body: str) -> str:
+    """The whole message as its sender wrote it: no sender prefix, no reply fallback."""
+    return _split(body.strip())[1]
 
 
 def _field(headers: dict, key: str) -> "str | None":
     value = (headers.get(key) or "").strip()
     return value or None
+
+
+def _reply_and_message(parsed: "local_task_protocol.TaskHeaders") -> "tuple[dict | None, str]":
+    # Only an attested reply gets a reply_context; a block a sender typed stays their text.
+    if _field(parsed.headers, "reply_to_event"):
+        return local_task_protocol.split_reply_context(parsed.body)
+    return None, parsed.body
+
+
+def message_body(text: str) -> str:
+    """A task file's message: its body without a quoted reply-context block."""
+    return _reply_and_message(attested_headers(text))[1]
 
 
 def item_id(tid: str, instance: str = "") -> "str | None":
@@ -83,10 +106,11 @@ def task_fields(task_file: Path, result_dir: Path, instance: str = "") -> "dict 
         return None
     parsed = attested_headers(text)
     h = parsed.headers
+    reply, message = _reply_and_message(parsed)
     tier = local_task_protocol.canonical_access_tier(h.get("access_tier"))
     if tier not in local_task_protocol.BROKER_WIRE_TIERS:
         tier = "guest"  # absent or unknown: the most restricted tier
-    return {
+    item = {
         "task_id": tid,
         "room_id": _field(h, "channel_id") or _field(h, "source_room_id"),
         "event_id": _field(h, "source_message_id"),
@@ -95,10 +119,16 @@ def task_fields(task_file: Path, result_dir: Path, instance: str = "") -> "dict 
         "sender_name": _field(h, "sender_name"),
         "access_tier": tier,
         "collaborator": tier == "team" and (h.get("collaborator") or "").strip() == "true",
-        "snippet": snippet(parsed.body),
+        "snippet": snippet(message),
         "task_file": str(task_file),
         "result_file": str(result_dir / f"{tid}.txt"),
     }
+    if reply is not None:
+        label = reply["label"]
+        item["reply_context"] = {"sender": reply["sender"][:SNIPPET_MAX],
+                                 "body": reply["body"][:REPLY_CONTEXT_MAX],
+                                 "label": label[:REPLY_CONTEXT_MAX] if label else None}
+    return item
 
 
 def list_open_tasks(task_dir: Path, result_dir: Path, instance: str = "") -> list:

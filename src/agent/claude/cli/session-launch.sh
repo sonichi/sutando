@@ -73,6 +73,28 @@ claude_named_process_running() {
   [ -n "$(claude_named_pids)" ]
 }
 
+# A private socket (SUTANDO_TMUX_SOCKET set, e.g. a desktop install) is shared
+# with no other install, so a same-name claude outside its server is foreign.
+claude_private_socket_in_use() {
+  [ -n "${SUTANDO_TMUX_SOCKET:-}" ]
+}
+
+# claude_named_pids restricted to processes running inside a pane of the tmux
+# server on $TMUX_SOCKET (the pane pid itself or one of its descendants).
+claude_named_pids_on_socket() {
+  local panes pid p depth
+  panes="$(tmux -S "$TMUX_SOCKET" list-panes -a -F '#{pane_pid}' 2>/dev/null)" || return 0
+  [ -n "$panes" ] || return 0
+  for pid in $(claude_named_pids); do
+    p="$pid"; depth=0
+    while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$depth" -lt 16 ]; do
+      if printf '%s\n' "$panes" | grep -qx "$p"; then echo "$pid"; break; fi
+      p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+      depth=$((depth + 1))
+    done
+  done
+}
+
 claude_named_tmux_session_exists() {
   command -v tmux > /dev/null 2>&1 || return 1
   tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null
@@ -80,7 +102,11 @@ claude_named_tmux_session_exists() {
 
 claude_named_session_running() {
   claude_named_tmux_session_exists || return 1
-  claude_named_process_running
+  if claude_private_socket_in_use; then
+    [ -n "$(claude_named_pids_on_socket)" ]
+  else
+    claude_named_process_running
+  fi
 }
 
 # Optional working-directory override. Unset: no override, launches from cwd.

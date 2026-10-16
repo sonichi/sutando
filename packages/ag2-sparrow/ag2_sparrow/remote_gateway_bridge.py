@@ -910,12 +910,9 @@ def _archive_resolved_review(path: Path, record: dict) -> bool:
 
 def _decision_text(task: dict) -> str:
     text = str(task.get("task") or "").strip()
-    # Button replies can follow the broker's quoted context envelope; only text
-    # after its exact closing marker is the decision.
-    text = re.sub(
-        r"^\[AG2 Space reply context;[^\]]*\].*?"
-        r"\[End AG2 Space reply context\]\s*",
-        "", text, count=1, flags=re.DOTALL)
+    # Button replies can follow the broker's quoted context envelope; only the
+    # text after it is the decision.
+    text = local_task_protocol.split_reply_context(text)[1]
     text = re.sub(r"^\[AG2Space\s+[^\]]+\]\s*", "", text, count=1)
     return text.strip()
 
@@ -3969,6 +3966,10 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                 lines.append("session_scope: room")
         elif f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
+        elif f == "timestamp":
+            if task.get(f) not in (None, ""):
+                lines.append(f"timestamp: {_one_line(task[f])}")
+            lines.append(f"local_time: {local_task_protocol.local_time_value()}")
         elif f == "interaction_type":
             # Pass through when the gateway sends it; default to "message" —
             # all current gateway traffic is Matrix room messages. Whitelisted:

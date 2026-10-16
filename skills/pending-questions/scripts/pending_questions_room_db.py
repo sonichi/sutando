@@ -51,6 +51,7 @@ from pending_questions_outbox import (Outbox as HeldRecords, local_closes, mark_
 from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFailed, Outbox, Question,
                                      RoomDbStore, ScriptDbClient, StoreError, outbox_items, reconcile_pending,
                                      safe_body, waiting_item, write_question)
+from ag2space_links import database_link
 from workspace_default import status_path
 
 # The skill directories that provide the room capability, canonical name first.
@@ -60,8 +61,6 @@ CLI_MODULE = "room_collab.py"
 IDENTITY_VARS = ("AG2SPACE_USER_ID", "AG2_MATRIX_USER_ID")
 GAP = 1024
 SETTLE_SEC = 1.0
-# The documented room-surface link shape; `page` is the database id.
-LINK_TEMPLATE = "{origin}/#/room/{room}?surface=db&page={db}"
 ROOM_KEY = "PENDING_QUESTIONS_ROOM"
 # The collab service URL; set, it overrides the capability's own resolution (an outage rehearsal).
 URL_KEY = "PENDING_QUESTIONS_COLLAB_URL"
@@ -111,14 +110,21 @@ def configured_room(workspace: Path, environ) -> str:
     return room
 
 
+def db_link(origin: str, room: str, db: str) -> Optional[str]:
+    """The database's page in the room, as the app opens it; None when origin or room is unusable."""
+    try:
+        return database_link(origin, room, db)
+    except ValueError:
+        return None
+
+
 def _db_link(scripts: Path, room: str, url_override: str) -> Optional[str]:
     """The database's page in the room, from the capability's own URL resolution; None if unknown."""
     try:
         if str(scripts) not in sys.path:
             sys.path.insert(0, str(scripts))
         from room_collab import resolve_url  # noqa: PLC0415 — the injected capability
-        return LINK_TEMPLATE.format(origin=resolve_url(url_override or None).rstrip("/"), room=room,
-                                    db=DB_SCHEMA["id"])
+        return db_link(resolve_url(url_override or None), room, DB_SCHEMA["id"])
     except Exception:  # noqa: BLE001 — a link is a convenience, never a precondition
         return None
 
@@ -497,18 +503,9 @@ def _load_capability(scripts: str):
 def channel_credentials(cap, environ=None) -> dict:
     """The capability's credential variables from the AG2 Space channel env file the shared
     resolver picks; empty when a variable already names either, so the two never mix."""
-    from channel_env_resolve import resolve_channel_env
-    from channel_token import token_from_env_file
-    from util_paths import claude_home_path
-    env = os.environ if environ is None else environ
+    from channel_credentials import channel_credentials as shared
     names = (*getattr(cap, "URL_VARS", ()), *getattr(cap, "TOKEN_VARS", ()))
-    if not names or any(env.get(v) for v in names):
-        return {}
-    path = resolve_channel_env(claude_home_path("channels"), "ag2space")
-    if path is None:
-        return {}
-    found = {v: token_from_env_file(v, path) for v in names}
-    return {v: x for v, x in found.items() if x}
+    return shared(names, environ)
 
 
 def _credentials(cap, collab_url: Optional[str]) -> tuple:
@@ -530,7 +527,7 @@ async def _serve(args, req: dict) -> object:
     cap = _load_capability(args.skill_scripts)
     from room_collab_client import open_room_collab  # noqa: PLC0415
     url, token = _credentials(cap, args.collab_url or None)
-    link = LINK_TEMPLATE.format(origin=url.rstrip("/"), room=args.room, db=req["schema"]["id"])
+    link = db_link(url, args.room, req["schema"]["id"])
     async with open_room_collab(url, args.room, token, kind="db") as doc:
         result = await apply(doc, req, args.user_id, int(time.time() * 1000), link)
         await doc.settle(SETTLE_SEC)

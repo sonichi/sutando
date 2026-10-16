@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { resolveWorkspace } from '../src/workspace_default.js';
 import { buildVoiceTaskHeader, queuedAheadInstruction, setVoiceSessionOrigin, getVoiceSessionOrigin, workTool } from '../src/task-bridge.js';
 import { readQueueDepth } from '../src/inline-tools.js';
+import { localTimeValue } from '../src/local_time.js';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
@@ -148,6 +149,7 @@ describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
 		assert.equal(header, [
 			'id: task-1',
 			`timestamp: ${TS}`,
+			`local_time: ${localTimeValue(new Date(TS))}`,
 			'source: voice',
 			'interaction_type: realtime_audio',
 			'media_form: live_stream',
@@ -166,6 +168,7 @@ describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
 		assert.equal(header, [
 			'id: task-2',
 			`timestamp: ${TS}`,
+			`local_time: ${localTimeValue(new Date(TS))}`,
 			'source: voice',
 			'interaction_type: realtime_audio',
 			'media_form: live_stream',
@@ -206,7 +209,7 @@ describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
 		const roomFiles: string[] = [];
 		try {
 			const c1 = readFileSync(join(TASK_DIR, dmFile), 'utf-8');
-			assert.deepEqual(keysAbove(c1), ['id', 'timestamp', 'source', 'interaction_type', 'media_form', 'channel_id', 'user_id', 'access_tier', 'priority']);
+			assert.deepEqual(keysAbove(c1), ['id', 'timestamp', 'local_time', 'source', 'interaction_type', 'media_form', 'channel_id', 'user_id', 'access_tier', 'priority']);
 			assert.match(c1, /^priority: urgent$/m);
 
 			setVoiceSessionOrigin(ORIGIN);
@@ -214,7 +217,7 @@ describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
 			const room = await exec({ task: 'header shape probe room' }, null) as { taskId: string };
 			roomFiles.push(room.taskId + '.txt');
 			const c2 = readFileSync(join(TASK_DIR, room.taskId + '.txt'), 'utf-8');
-			assert.deepEqual(keysAbove(c2), ['id', 'timestamp', 'source', 'interaction_type', 'media_form', 'channel_id', 'channel_kind', 'source_room_id', 'user_id', 'access_tier', 'priority']);
+			assert.deepEqual(keysAbove(c2), ['id', 'timestamp', 'local_time', 'source', 'interaction_type', 'media_form', 'channel_id', 'channel_kind', 'source_room_id', 'user_id', 'access_tier', 'priority']);
 			assert.match(c2, /^channel_id: place-42$/m);
 			assert.match(c2, /^source_room_id: place-42$/m);
 			assert.match(c2, /^priority: urgent$/m);

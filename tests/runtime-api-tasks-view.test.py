@@ -13,6 +13,9 @@ Exit: 0 on pass, 1 on fail.
 import asyncio
 import concurrent.futures
 import contextlib
+import json
+import queue
+import subprocess
 import sys
 import tempfile
 import threading
@@ -30,6 +33,7 @@ from dispatcher import RuntimeDispatcher  # noqa: E402
 
 from protocol import ProtocolError  # noqa: E402
 from local_task_protocol import parse_task_headers_lenient  # noqa: E402
+from activity_bus import cancel_target  # noqa: E402
 
 
 class TasksViewTests(unittest.TestCase):
@@ -293,21 +297,120 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(by_id[b]["source"], "runtime-api")
         self.assertNotIn("truncated", out)
 
+    def test_list_tasks_disappearing_during_metadata_access(self):
+        real_stat = Path.stat
+        for mode in ("control", "claim", "archive"):
+            with self.subTest(mode=mode):
+                victim_id = self.view.submit("being processed")["taskId"]
+                queued_id = self.view.submit("still queued")["taskId"]
+                victim = self._task_file(victim_id)
+                mutated = False
+
+                def checked_stat(path, *args, **kwargs):
+                    nonlocal mutated
+                    if path == victim and not mutated:
+                        mutated = True
+                        if mode == "claim":
+                            path.rename(path.with_name(f"{victim_id}.claimed-worker-1.txt"))
+                        elif mode == "archive":
+                            path.unlink()
+                    return real_stat(path, *args, **kwargs)
+
+                with unittest.mock.patch.object(Path, "stat", checked_stat):
+                    rows = self.view.list_tasks()["tasks"]
+                ids = {row["taskId"] for row in rows}
+                self.assertTrue(mutated)
+                self.assertIn(queued_id, ids)
+                if mode == "control":
+                    self.assertIn(victim_id, ids)
+
+    def test_metadata_scans_propagate_operational_errors(self):
+        import errno
+        task_id = self.view.submit("queued")["taskId"]
+        result = self.results / f"{task_id}.txt"
+        self.results.mkdir(exist_ok=True)
+        result.write_text("ready")
+        real_stat = Path.stat
+        for victim, scan in ((self._task_file(task_id), self.view.list_tasks),
+                             (result, self.view.list_results)):
+            for fault in (PermissionError("denied"), OSError(errno.EIO, "I/O fault")):
+                with self.subTest(scan=scan.__name__, fault=type(fault).__name__):
+                    def checked_stat(path, *args, **kwargs):
+                        if path == victim:
+                            raise fault
+                        return real_stat(path, *args, **kwargs)
+
+                    with unittest.mock.patch.object(Path, "stat", checked_stat):
+                        with self.assertRaises(type(fault)) as raised:
+                            scan()
+                    self.assertIs(raised.exception, fault)
+
+    def test_result_disappearing_during_metadata_access(self):
+        task_id = self.view.submit("finished")["taskId"]
+        self.results.mkdir(exist_ok=True)
+        victim = self.results / f"{task_id}.txt"
+        victim.write_text("ready")
+        real_stat = Path.stat
+
+        def checked_stat(path, *args, **kwargs):
+            if path == victim:
+                path.unlink()
+            return real_stat(path, *args, **kwargs)
+
+        with unittest.mock.patch.object(Path, "stat", checked_stat):
+            self.assertEqual(self.view.list_results(), {"results": []})
+
+    def test_list_tasks_retains_mtime_and_limit_semantics(self):
+        import os
+        older = self.view.submit("older")["taskId"]
+        newer = self.view.submit("newer")["taskId"]
+        os.utime(self._task_file(older), (1000.1, 1000.1))
+        os.utime(self._task_file(newer), (1000.9, 1000.9))
+        (self.tasks / "task-other.txt").write_text("private")
+        (self.tasks / "task-rtapi-directory.txt").mkdir()
+        real_stat = Path.stat
+        seen = set()
+
+        def checked_stat(path, *args, **kwargs):
+            metadata = real_stat(path, *args, **kwargs)
+            if path in (self._task_file(older), self._task_file(newer)):
+                self.assertNotIn(path, seen, "enumeration must retain metadata")
+                seen.add(path)
+                if path == self._task_file(newer):
+                    path.unlink()
+            return metadata
+
+        with unittest.mock.patch.object(Path, "stat", checked_stat), \
+                unittest.mock.patch.object(self.view, "status", return_value={"state": "pending"}):
+            rows = self.view.list_tasks(limit=1)
+        self.assertEqual([row["taskId"] for row in rows["tasks"]], [newer])
+        self.assertTrue(rows["truncated"])
+        self.assertEqual(seen, {self._task_file(older), self._task_file(newer)})
+        rows = self.view.list_tasks()
+        self.assertEqual([row["taskId"] for row in rows["tasks"]], [older])
+        self.assertNotIn("truncated", rows)
+
     def test_list_tasks_empty_dir(self):
         view = TasksView(self.tasks / "nope", self.results, "@me:x")
         self.assertEqual(view.list_tasks(), {"tasks": []})
 
     def test_cancel_writes_cancel_instruction_signal(self):
         tid = self.view.submit("long job")["taskId"]
+        original = self._task_file(tid).read_bytes()
         out = self.view.cancel(tid)
         self.assertEqual(out["cancelled"], "requested")
         cancel_file = self._task_file(out["cancelTaskId"])
         th = parse_task_headers_lenient(cancel_file.read_text())
-        self.assertTrue(th.body.startswith(f"CANCEL_INSTRUCTION: {tid}"))
+        self.assertEqual(cancel_target(th.body), tid)
+        self.assertEqual(th.get("source"), "runtime-api")
+        self.assertEqual(th.get("channel_id"), "runtime-api")
+        self.assertEqual(th.get("user_id"), "@me:example.org")
+        self.assertEqual(th.get("access_tier"), "owner")
         self.assertEqual(th.get("priority"), "urgent")
         self.assertEqual(parse_priority_from_file(cancel_file), "urgent")
         # the original task file is untouched — the consumer decides
         self.assertTrue(self._task_file(tid).exists())
+        self.assertEqual(self._task_file(tid).read_bytes(), original)
 
     def test_cancel_done_task_is_noop_and_unknown_raises(self):
         self.results.mkdir(parents=True)
@@ -707,6 +810,99 @@ class DispatchTests(unittest.TestCase):
         return RuntimeDispatcher(
             self._No(), self._No(), "@me:x", executors={},
             tasks_view=TasksView(base / "tasks", base / "results", "@me:x"))
+
+    def _list_with_process_mutation(self, mode, boundary, acknowledgment="done"):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            d = self._dispatcher(base)
+            victim_id = asyncio.run(d.handle("task.submit", {"task": "victim"}))["taskId"]
+            queued_id = asyncio.run(d.handle("task.submit", {"task": "queued"}))["taskId"]
+            victim = base / "tasks" / f"{victim_id}.txt"
+            caller = r"""
+import asyncio, json, sys, time
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0, sys.argv[1])
+from tasks_view import TasksView
+from dispatcher import RuntimeDispatcher
+base, victim, boundary = Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
+real_stat = Path.stat
+seen = False
+def coordinated_stat(path, *args, **kwargs):
+    global seen
+    if path != victim or seen:
+        return real_stat(path, *args, **kwargs)
+    seen = True
+    metadata = real_stat(path, *args, **kwargs) if boundary == "after" else None
+    print(json.dumps({"boundary": boundary, "at": time.time_ns()}), flush=True)
+    if sys.stdin.readline().strip() != "done":
+        raise RuntimeError("mutation acknowledgment missing")
+    return metadata if boundary == "after" else real_stat(path, *args, **kwargs)
+d = RuntimeDispatcher(None, None, "@me:x", executors={},
+    tasks_view=TasksView(base / "tasks", base / "results", "@me:x"))
+with patch.object(Path, "stat", coordinated_stat):
+    rows = asyncio.run(d.handle("task.list", {}))
+print(json.dumps({"rows": rows, "at": time.time_ns()}), flush=True)
+"""
+            with subprocess.Popen(
+                    [sys.executable, "-B", "-c", caller,
+                     str(ROOT / "src" / "runtime-api"), str(base), str(victim), boundary],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True) as child:
+                try:
+                    lines = queue.Queue()
+                    reader = threading.Thread(
+                        target=lambda: lines.put(child.stdout.readline()), daemon=True)
+                    reader.start()
+                    try:
+                        line = lines.get(timeout=10)
+                    except queue.Empty:
+                        self.fail("caller did not reach metadata boundary")
+                    self.assertTrue(line, "caller exited before metadata boundary")
+                    event = json.loads(line)
+                    self.assertEqual(event["boundary"], boundary)
+                    mutation = subprocess.run(
+                        [sys.executable, "-B", "-c", r"""
+import json, sys, time
+from pathlib import Path
+p, mode = Path(sys.argv[1]), sys.argv[2]
+if mode == "claim":
+    p.rename(p.with_name(p.stem + ".claimed-worker-1.txt"))
+elif mode == "archive":
+    p.unlink()
+print(json.dumps({"mode": mode, "at": time.time_ns()}))
+""", str(victim), mode], capture_output=True, text=True, timeout=10)
+                    self.assertEqual(mutation.returncode, 0, mutation.stderr)
+                    changed = json.loads(mutation.stdout)
+                    output, error = child.communicate(acknowledgment + "\n", timeout=10)
+                    if acknowledgment != "done":
+                        self.assertNotEqual(child.returncode, 0)
+                        self.assertIn("mutation acknowledgment missing", error)
+                        return
+                    self.assertEqual(child.returncode, 0, error)
+                    result = json.loads(output)
+                    self.assertLessEqual(event["at"], changed["at"])
+                    self.assertLessEqual(changed["at"], result["at"])
+                    ids = {r["taskId"] for r in result["rows"]["tasks"]}
+                    self.assertIn(queued_id, ids)
+                    if mode == "control" or boundary == "after":
+                        self.assertEqual(ids, {victim_id, queued_id})
+                    later = asyncio.run(self._dispatcher(base).handle("task.list", {}))
+                    expected = {queued_id} if mode == "archive" else {victim_id, queued_id}
+                    self.assertEqual({r["taskId"] for r in later["tasks"]}, expected)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.communicate(timeout=10)
+
+    def test_list_separate_process_claim_archive_and_control(self):
+        for mode in ("control", "claim", "archive"):
+            for boundary in ("before", "after"):
+                with self.subTest(mode=mode, boundary=boundary):
+                    self._list_with_process_mutation(mode, boundary)
+
+    def test_list_process_missing_acknowledgment_fails(self):
+        self._list_with_process_mutation("control", "before", acknowledgment="")
 
     def test_submit_idempotency_retry_after_restart_and_completion(self):
         for lifecycle in ("completion", "archive"):
