@@ -34,8 +34,8 @@ class Section(NamedTuple):
 SECTIONS = [
     Section("dm", "Your DM",
             "Your DM with {name} is where you ask for things for yourself. What you ask for "
-            "yourself (research, mail, calendar) comes back here in your DM, never in a room.",
-            "Ask {name} here:",
+            "yourself (research, mail, calendar) comes back in your DM, never in a room.",
+            "Ask {name} in your DM:",
             "What can you do for me today?", "dm"),
     Section("rooms", "Rooms",
             "Humans and agents talk in the same chat.",
