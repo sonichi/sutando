@@ -108,7 +108,11 @@ def args_for(work, base, **kw):
     argv = ["--work", str(work), "--trigger-id", TRIGGER, "--api-base", base, "--poll", "0.01",
             "--timeout", "5", "--idle-exit", "0.5"]
     for k, v in kw.items():
-        argv += ["--" + k.replace("_", "-"), str(v)]
+        flag = "--" + k.replace("_", "-")
+        if v is True:
+            argv += [flag]
+        elif v is not False:
+            argv += [flag, str(v)]
     a = ra.build_parser().parse_args(argv)
     a.work = str(work)
     a.inbox, a.results, a.state = (os.path.join(a.work, d) for d in ("tasks", "results", "state"))
@@ -237,11 +241,18 @@ class FireLoopTest(unittest.TestCase):
 
     def test_other_4xx_writes_plain_failure(self):
         with tempfile.TemporaryDirectory() as d, fake_server([err(401, "authentication_error")]) as (srv, base):
-            write_task(d, "task-f", "x", tier="guest")
+            write_task(d, "task-f", "x")
             _, log = run_adapter(d, base, once=1)
             self.assertEqual(result(d, "task-f"), "The cloud agent could not take this message (HTTP 401, authentication_error).\n")
             self.assertEqual(len(srv.requests), 1)
             self.assertNotIn(TOKEN, log)
+
+    def test_a_non_owner_tier_never_learns_the_http_status_or_error_type(self):
+        with tempfile.TemporaryDirectory() as d, fake_server([err(401, "authentication_error")]) as (srv, base):
+            write_task(d, "task-f", "x", tier="guest")
+            run_adapter(d, base, once=1, allow_non_owner=True)
+            self.assertEqual(result(d, "task-f"), "This message could not be sent to the cloud agent right now.\n")
+            self.assertEqual(len(srv.requests), 1)
 
     def test_4xx_with_unparseable_body(self):
         with tempfile.TemporaryDirectory() as d, fake_server([(400, {}, b"oops")]) as (_, base):
@@ -320,8 +331,42 @@ class FireLoopTest(unittest.TestCase):
     def test_echo_mode_keeps_the_url_out_of_non_owner_rooms(self):
         with tempfile.TemporaryDirectory() as d, fake_server([ok(9)]) as (_, base):
             write_task(d, "task-g", "x", tier="team")
-            run_adapter(d, base, once=1, result_mode="echo")
+            run_adapter(d, base, once=1, result_mode="echo", allow_non_owner=True)
             self.assertTrue(result(d, "task-g").startswith("[no-send]\n"))
+
+    def test_a_non_owner_task_is_refused_by_default_and_never_fired(self):
+        with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (srv, base):
+            for tier in ("team", "guest", "superuser"):
+                tid = "task-" + tier
+                write_task(d, tid, "x", tier=tier)
+            run_adapter(d, base, once=3)
+            self.assertEqual(srv.requests, [], "a refused task must never reach the routine")
+            for tier in ("team", "guest", "superuser"):
+                self.assertEqual(result(d, "task-" + tier), ra.NON_OWNER_REFUSED)
+
+    def test_allow_non_owner_lets_a_non_owner_task_fire(self):
+        with tempfile.TemporaryDirectory() as d, fake_server([ok(3)]) as (srv, base):
+            write_task(d, "task-t", "x", tier="team")
+            run_adapter(d, base, once=1, allow_non_owner=True)
+            self.assertEqual(len(srv.requests), 1)
+            self.assertIn("session_3", result(d, "task-t"))
+
+    def test_a_task_file_that_vanishes_before_its_turn_is_skipped_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (srv, base):
+            gone = write_task(d, "task-gone", "x", mtime=1000)
+            write_task(d, "task-stay", "y", mtime=2000)
+            real_listdir = os.listdir
+
+            def listdir_then_remove(path):
+                names = real_listdir(path)
+                if os.path.exists(gone):
+                    os.remove(gone)
+                return names
+            with mock.patch.object(ra.os, "listdir", side_effect=listdir_then_remove):
+                run_adapter(d, base, once=1)
+            self.assertEqual(len(srv.requests), 1, "only the surviving task was fired")
+            self.assertIn("session_1", result(d, "task-stay"))
+            self.assertFalse(os.path.exists(Path(d) / "results" / "task-gone.txt"))
 
     def test_task_without_room_is_not_fired(self):
         with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (srv, base):

@@ -46,6 +46,13 @@ the Codex adapter's `parse_task`), never from message text; unknown tiers become
 The note is the Hatch adapter's `NON_OWNER_NOTE`, the same pin the Codex adapter uses; `routine-prompt.md`
 carries the same text so the rules do not depend on the payload. A task with no room is not fired.
 
+**Non-owner tiers are refused by default, not merely noted.** One routine holds one connector scope —
+the owner's — and unlike the Codex adapter (which runs a non-owner turn on its own ephemeral, read-only
+sandbox), there is no narrower scope to fall back to here: the prompt's note is the only boundary once a
+task is fired. A team or guest task is therefore refused before it is ever sent, with a plain-text result
+saying so, unless `--allow-non-owner` is passed — which should only be true when this specific routine's
+connector scope is meant to be reachable by non-owner senders.
+
 ## Results: why `[no-send]`
 
 The routine posts the reply, so the local bridge must not post a second one. A successful fire writes:
@@ -57,8 +64,10 @@ The routine posts the reply, so the local bridge must not post a second one. A s
 
 `--result-mode echo` writes `Sent to the cloud agent: <url>` instead, which the bridge does deliver; use
 it only to debug the wiring. Echo applies to owner tasks only: a non-owner room still gets `[no-send]`,
-so the session URL is never posted where others read it. A fire refused with a 4xx other than 429 writes a one-line plain-text failure
-(status and error type), which the bridge delivers to the room.
+so the session URL is never posted where others read it. A fire refused with a 4xx other than 429 writes
+a one-line plain-text failure for an owner task (status and error type); a non-owner task (only reachable
+at all with `--allow-non-owner`) gets a generic "could not be sent" line instead — the HTTP status and
+error type are the owner's connector's state, not something a non-owner sender learns.
 
 ## Errors and limits
 

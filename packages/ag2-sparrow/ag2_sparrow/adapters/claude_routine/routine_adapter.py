@@ -155,6 +155,10 @@ def result_body(outcome, mode, owner=True):
         if mode == "echo" and owner:
             return "Sent to the cloud agent: %s\n" % url
         return "[no-send]\n# claude routine session: %s\n" % url
+    # A non-owner tier never learns the HTTP status or error type: that is auth/config state
+    # about the owner's connector, and the sender is not the owner.
+    if not owner:
+        return "This message could not be sent to the cloud agent right now.\n"
     if outcome.kind == "rejected":
         return "The cloud agent could not take this message (HTTP %s, %s).\n" % (outcome.status, outcome.detail)
     if outcome.kind == "rate_limited":
@@ -167,6 +171,11 @@ def result_body(outcome, mode, owner=True):
 
 
 NO_ROOM = "This message has no room to reply in, so it was not sent to the cloud agent.\n"
+# The blocker this exists for: every tier fired at the one routine holding the owner's connector,
+# limited only by a prompt note. Non-owner tasks are refused here unless explicitly allowed.
+NON_OWNER_REFUSED = ("This routine only answers the owner by default (it holds the owner's AG2 "
+                     "Space connector); non-owner tasks are not sent to it. Pass --allow-non-owner "
+                     "to enable, only if this routine's scope is meant to be reachable by others.\n")
 
 
 class Adapter:
@@ -192,8 +201,16 @@ class Adapter:
         names = [n for n in os.listdir(self.args.inbox)
                  if n.startswith("task-") and n.endswith(".txt") and n[:-4] not in seen
                  and not os.path.exists(os.path.join(self.args.results, n))]
-        names.sort(key=lambda n: (os.stat(os.path.join(self.args.inbox, n)).st_mtime, n))
-        return names
+        # A file can vanish between listdir and stat (a cancel, a cleanup): drop it rather
+        # than crash the whole loop over one task that is no longer there to serve.
+        stamped = []
+        for n in names:
+            try:
+                stamped.append((os.stat(os.path.join(self.args.inbox, n)).st_mtime, n))
+            except FileNotFoundError:
+                continue
+        stamped.sort()
+        return [n for _, n in stamped]
 
     def finish(self, name, body, seen):
         write_atomic(os.path.join(self.args.results, name), body)
@@ -206,7 +223,17 @@ class Adapter:
     def step(self, name, seen):
         """Handle one task; returns True when it reached a final result."""
         task_id = name[:-4]
-        headers, message, operator_lines = parse_task(os.path.join(self.args.inbox, name))
+        try:
+            headers, message, operator_lines = parse_task(os.path.join(self.args.inbox, name))
+        except FileNotFoundError:
+            log("vanished before read ->", task_id)
+            seen.add(task_id)
+            return True
+        tier = headers.get("access_tier") or "guest"
+        if tier != "owner" and not self.args.allow_non_owner:
+            log("refused (non-owner, --allow-non-owner not set) ->", task_id, tier)
+            self.finish(name, NON_OWNER_REFUSED, seen)
+            return True
         room, text = build_payload(task_id, headers, message, operator_lines, self.note)
         if not room:
             log("no room ->", task_id)
@@ -281,6 +308,10 @@ def build_parser():
     ap.add_argument("--api-base", default=API_BASE)
     ap.add_argument("--allow-insecure-api-base", action="store_true", help="accept a non-https --api-base (tests only)")
     ap.add_argument("--result-mode", choices=["no-send", "echo"], default="no-send")
+    ap.add_argument("--allow-non-owner", action="store_true",
+                    help="fire non-owner tasks too, at the same routine and connector scope as the "
+                         "owner. Off by default: this routine holds the owner's AG2 Space connector, "
+                         "and a non-owner tier is bounded only by the prompt's note otherwise.")
     ap.add_argument("--max-per-hour", type=int, default=25,
                     help="local fire cap, 1-%d (the routine's own cap)" % ROUTINE_CAP_PER_HOUR)
     ap.add_argument("--max-retries", type=int, default=2,
