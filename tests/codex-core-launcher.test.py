@@ -506,6 +506,19 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertFalse(marker.exists())
         self.assertNotIn("kill-session", self._tmux_calls())
 
+    def test_core_session_receives_claude_config_dir(self):
+        ccd = str(Path(self.tmp.name) / "ccd")
+        result = self.run_launcher(env_extra={"CLAUDE_CONFIG_DIR": ccd})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        core = [l for l in self._tmux_calls().splitlines() if "new-session -d -s sutando-core " in l + " "]
+        self.assertTrue(core, self._tmux_calls())
+        self.assertIn(f"-e CLAUDE_CONFIG_DIR={ccd}", core[0])
+
+    def test_core_session_omits_an_unset_claude_config_dir(self):
+        result = self.run_launcher(env_extra={"CLAUDE_CONFIG_DIR": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("CLAUDE_CONFIG_DIR=", self._tmux_calls())
+
     def test_launches_codex_and_managed_task_notifier(self):
         result = self.run_launcher(env_extra={
             "SUTANDO_CORE_MODEL": "gpt-test",
