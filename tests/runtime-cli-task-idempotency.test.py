@@ -24,6 +24,10 @@ SERVER = ROOT / "src" / "runtime-api" / "server.py"
 CLI = ROOT / "src" / "runtime-cli" / "sutando-runtime.py"
 TEXT = "Summarize this week's synthetic meeting notes"
 
+PYBASE = [sys.executable]
+if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+    PYBASE += ["-m", "coverage", "run", f"--rcfile={ROOT / '.coveragerc'}"]
+
 
 def read_frame(sock):
     data = b""
@@ -82,7 +86,7 @@ class TaskIdempotencyTests(unittest.TestCase):
     def start_daemon(self):
         self.generation += 1
         self.log = self.base / f"daemon-{self.generation}.log"
-        command = [sys.executable, str(SERVER)]
+        command = [*PYBASE, str(SERVER)]
         with self.log.open("wb") as output:
             self.daemon = subprocess.Popen(
                 command, cwd=ROOT, env=self.env, stdin=subprocess.DEVNULL,
@@ -137,7 +141,7 @@ class TaskIdempotencyTests(unittest.TestCase):
         if socket_path is not None:
             env["SUTANDO_RUNTIME_SOCKET"] = str(socket_path)
         return subprocess.run(
-            [sys.executable, str(CLI), *args], cwd=ROOT, env=env,
+            [*PYBASE, str(CLI), *args], cwd=ROOT, env=env,
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
 
     def submit(self, key=None, *, text=TEXT, priority="normal", socket_path=None):
