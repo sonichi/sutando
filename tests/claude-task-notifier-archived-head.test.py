@@ -28,7 +28,6 @@ def _load(name: str, filename: str):
 
 
 _h = _load("claude_task_notifier_harness", "claude-task-notifier.test.py")
-_inflight = _load("claude_task_notifier_inflight", "claude-task-notifier-inflight.test.py")
 FakeTmuxHarness = _h.FakeTmuxHarness
 NOTIFIER = _h.NOTIFIER
 IDLE_FOOTER = _h.IDLE_FOOTER
@@ -36,23 +35,29 @@ DRAFT_FOOTER = _h.DRAFT_FOOTER
 
 
 class ArchivedHeadTest(FakeTmuxHarness):
-    # The main-loop helper, not the class: subclassing it would re-run its tests here.
-    _wait_for_fswatch_attach = _inflight.MainLoopWiringTest._wait_for_fswatch_attach
+    # Each wait polls and returns at once, so the bound only matters on a loaded host.
+    WAIT_S = 120
 
     def tearDown(self):
         left = self._kill_strays()
         super().tearDown()
         self.assertEqual(left, [], "a fixture watcher or fswatch outlived the test")
 
-    @staticmethod
-    def _wait_for_busy_attempt(errf_path, name, timeout=30):
-        line = f"composer not empty for {name};"
-        deadline = time.time() + timeout
+    def _wait_for(self, cond, rewrite=None):
+        deadline = time.time() + self.WAIT_S
+        next_write = 0.0
         while time.time() < deadline:
-            if line in errf_path.read_text(errors="replace"):
+            if cond():
                 return True
+            if rewrite and time.time() >= next_write:
+                rewrite()
+                next_write = time.time() + 2
             time.sleep(0.2)
         return False
+
+    @staticmethod
+    def _busy_attempt(errf_path, name):
+        return lambda: f"composer not empty for {name};" in errf_path.read_text(errors="replace")
 
     def test_an_archived_head_is_dropped_and_the_next_task_proceeds(self):
         if shutil.which("fswatch") is None:
@@ -61,6 +66,8 @@ class ArchivedHeadTest(FakeTmuxHarness):
         self.pane_file.write_text(DRAFT_FOOTER + "\n")
         errf_path = self.root / "notifier.stderr"
         errf = open(errf_path, "w")
+        # Present before the start, so the standby's startup sweep announces it with no fswatch event.
+        self.write_task("task-gone.txt")
         proc = subprocess.Popen(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env({"SUTANDO_NOTIFIER_RETRY_POLL_SEC": "1"}),
@@ -77,30 +84,22 @@ class ArchivedHeadTest(FakeTmuxHarness):
 
         try:
             try:
-                self.assertTrue(self._wait_for_fswatch_attach(),
-                                with_stderr("fswatch never attached to the watched tasks dir"))
-                self.write_task("task-gone.txt")
-                # Wait on the notifier, not a clock: an announce slower than a fixed sleep
-                # leaves the head unqueued at the unlink, and then there is nothing to drop.
-                self.assertTrue(self._wait_for_busy_attempt(errf_path, "task-gone.txt"),
+                self.assertTrue(self._wait_for(self._busy_attempt(errf_path, "task-gone.txt")),
                                 with_stderr("task-gone.txt was never queued and attempted"))
                 self.assertNotIn("TYPE", self.sendkeys_log_text(),
                                  with_stderr("a busy composer must not have been typed over"))
                 # Archived out of tasks/ with no result anywhere has_result looks.
                 (self.tasks_dir / "task-gone.txt").unlink()
-                self.write_task("task-next.txt")
+                # A standby has no subscribed signal, so rewrite until announced; a re-announce is a no-op.
                 # The loop is serial, so an attempt on task-next.txt means the gone head was settled.
-                self.assertTrue(self._wait_for_busy_attempt(errf_path, "task-next.txt"),
+                self.assertTrue(self._wait_for(self._busy_attempt(errf_path, "task-next.txt"),
+                                               rewrite=lambda: self.write_task("task-next.txt")),
                                 with_stderr("task-next.txt was never queued and attempted"))
                 self.assertNotIn("TYPE", self.sendkeys_log_text(),
                                  with_stderr("nothing may be typed while the composer is busy"))
                 self.pane_file.write_text(IDLE_FOOTER + "\n")
-                deadline = time.time() + 15
-                while time.time() < deadline:
-                    if "TYPE Sutando task ready: task-next.txt" in self.sendkeys_log_text():
-                        break
-                    time.sleep(0.2)
-                else:
+                if not self._wait_for(
+                        lambda: "TYPE Sutando task ready: task-next.txt" in self.sendkeys_log_text()):
                     self.fail(with_stderr("the task behind an archived head was never delivered"))
                 self.assertNotIn("TYPE Sutando task ready: task-gone.txt", self.sendkeys_log_text(),
                                  with_stderr("an archived task must not be typed into the core"))
