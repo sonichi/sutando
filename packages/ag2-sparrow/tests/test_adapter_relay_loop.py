@@ -1,4 +1,5 @@
-"""The shared relay-adapter library (`ag2_sparrow/adapters/relay_loop.py`) and both adapters' delegation to it.
+"""The shared relay library (`ag2_sparrow/relay_loop.py`), both Claude adapters' delegation to it,
+and the rule that no adapter imports another.
 
 Run:
     python3 packages/ag2-sparrow/tests/test_adapter_relay_loop.py
@@ -15,8 +16,10 @@ from pathlib import Path
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import task_priority  # noqa: E402
-from ag2_sparrow.adapters import relay_loop as rl  # noqa: E402
+from ag2_sparrow import relay_loop as rl, task_io, task_priority  # noqa: E402
+
+from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
+from ag2_sparrow.adapters.hatch import task_fields  # noqa: E402
 
 from ag2_sparrow.adapters.claude_cloud_session import session_adapter as sa  # noqa: E402
 from ag2_sparrow.adapters.claude_routine import routine_adapter as ra  # noqa: E402
@@ -70,6 +73,24 @@ class PriorityTest(unittest.TestCase):
             self.assertEqual(src.read_text(), (PKG_ROOT / "ag2_sparrow" / "task_priority.py").read_text())
 
 
+class LimiterTest(unittest.TestCase):
+    def test_keyed_entries_are_idempotent_persisted_and_forgettable(self):
+        now = [5000.0]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "sends.json")
+            lim = rl.RateLimiter(path, 2, lambda: now[0])
+            lim.record("task-a")
+            lim.record("task-a")
+            lim.record()
+            self.assertEqual(len(lim.times), 2)
+            again = rl.RateLimiter(path, 2, lambda: now[0])
+            self.assertEqual(again.entries, [(5000.0, "task-a"), (5000.0, None)])
+            again.forget("task-a")
+            self.assertEqual(rl.RateLimiter(path, 2, lambda: now[0]).entries, [(5000.0, None)])
+            Path(path).write_text("[[1]]")
+            self.assertEqual(rl.RateLimiter(path, 2, lambda: now[0]).entries, [])
+
+
 class LoopTest(unittest.TestCase):
     def test_read_task_admit_finish_and_retry(self):
         with tempfile.TemporaryDirectory() as d:
@@ -107,11 +128,42 @@ class LoopTest(unittest.TestCase):
         self.assertEqual(rl.result_body(out, "no-send", label="x"), "[no-send]\n# x: u\n")
 
 
-class DelegationTest(unittest.TestCase):
-    def imports(self, path):
-        tree = ast.parse(path.read_text())
-        return {("." * n.level) + (n.module or "") for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+def resolve(module, node):
+    """Absolute dotted name an ImportFrom refers to, from inside `module`."""
+    if node.level == 0:
+        return node.module or ""
+    base = module.split(".")[:-node.level]
+    return ".".join(base + ([node.module] if node.module else []))
 
+
+def adapter_imports():
+    """(importing module, imported name) for every import in every module under adapters/."""
+    for path in sorted(ADAPTERS.rglob("*.py")):
+        rel = path.relative_to(PKG_ROOT).with_suffix("")
+        parts = list(rel.parts)
+        if parts[-1] == "__init__":
+            parts = parts[:-1] + ["__init__"]
+        module = ".".join(parts)
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom):
+                target = resolve(module, node)
+                names = [target] + ["%s.%s" % (target, a.name) for a in node.names]
+            elif isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            else:
+                continue
+            for name in names:
+                yield module, name
+
+
+def adapter_of(dotted):
+    parts = dotted.split(".")
+    if parts[:2] == ["ag2_sparrow", "adapters"] and len(parts) > 2 and parts[2] != "__init__":
+        return parts[2]
+    return None
+
+
+class DelegationTest(unittest.TestCase):
     def test_both_adapters_delegate_to_the_shared_loop(self):
         shared = ("pending", "serve", "read_task", "admit", "schedule_retry")
         for mod, inherited in ((ra, shared + ("finish", "next_ready")), (sa, shared)):
@@ -120,15 +172,32 @@ class DelegationTest(unittest.TestCase):
                 self.assertIs(getattr(mod.Adapter, name), getattr(rl.RelayLoop, name), (mod, name))
             for name in ("build_payload", "result_body", "Outcome", "log"):
                 self.assertIs(getattr(mod, name), getattr(rl, name), (mod, name))
+            for name in ("acquire_lock", "non_owner_note", "write_atomic"):
+                self.assertIs(getattr(mod, name), getattr(task_io, name), (mod, name))
         self.assertIs(ra.RateLimiter, rl.RateLimiter)
+        for name in ("parse_task", "load_done", "record_done", "write_atomic", "non_owner_note"):
+            self.assertIs(getattr(rl, name), getattr(task_io, name), name)
+        for name in ("parse_task", "write_atomic", "load_done", "record_done", "acquire_lock", "pid_alive",
+                     "non_owner_note", "hatch_note", "attested_headers", "NON_OWNER_NOTE_FALLBACK"):
+            self.assertIs(getattr(cc, name), getattr(task_io, name), name)
+        self.assertIs(task_fields.attested_headers, task_io.attested_headers)
 
-    def test_no_adapter_imports_the_other(self):
-        routine = self.imports(ADAPTERS / "claude_routine" / "routine_adapter.py")
-        session = self.imports(ADAPTERS / "claude_cloud_session" / "session_adapter.py")
-        self.assertFalse([m for m in session if "claude_routine" in m], session)
-        self.assertFalse([m for m in routine if "claude_cloud_session" in m], routine)
-        self.assertIn("..relay_loop", routine)
-        self.assertIn("..relay_loop", session)
+    def test_no_adapter_imports_another_adapter(self):
+        crossings = sorted({(m, n) for m, n in adapter_imports()
+                            if adapter_of(m) and adapter_of(n) and adapter_of(m) != adapter_of(n)})
+        self.assertEqual(crossings, [])
+        names = {n for _, n in adapter_imports()}
+        self.assertIn("ag2_sparrow.relay_loop", names, "the scan resolves relative imports")
+        self.assertIn("ag2_sparrow.task_io", names)
+
+    def test_the_scan_catches_a_crossing(self):
+        node = ast.parse("from ..codex.codex_connector import parse_task").body[0]
+        target = resolve("ag2_sparrow.adapters.claude_routine.routine_adapter", node)
+        self.assertEqual(target, "ag2_sparrow.adapters.codex.codex_connector")
+        self.assertEqual((adapter_of("ag2_sparrow.adapters.claude_routine.routine_adapter"), adapter_of(target)),
+                         ("claude_routine", "codex"))
+        self.assertIsNone(adapter_of("ag2_sparrow.adapters"))
+        self.assertIsNone(adapter_of("ag2_sparrow.adapters.__init__"))
 
 
 if __name__ == "__main__":

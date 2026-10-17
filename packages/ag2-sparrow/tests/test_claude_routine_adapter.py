@@ -22,7 +22,7 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import team_guardrail  # noqa: E402
 
-from ag2_sparrow.adapters import relay_loop as rl  # noqa: E402
+from ag2_sparrow import relay_loop as rl  # noqa: E402
 
 from ag2_sparrow.adapters.claude_routine import routine_adapter as ra  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402

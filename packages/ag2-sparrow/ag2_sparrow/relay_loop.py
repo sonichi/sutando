@@ -1,4 +1,5 @@
-"""Shared library for adapters that relay inbox task files to a cloud agent that posts its own reply.
+"""Shared library for adapters that relay inbox task files to a cloud agent that posts its own
+reply. Package level, so adapters share it without importing one another.
 
 Owns the parts every such adapter must agree on: the payload layout (routing line, non-owner note,
 nonce-marked untrusted span, bridge-written lines after it), the result lines, the sliding-hour send
@@ -13,8 +14,8 @@ import time
 import uuid
 from pathlib import Path
 
-from .. import task_priority
-from .codex.codex_connector import load_done, non_owner_note, parse_task, record_done, write_atomic
+from . import task_priority
+from .task_io import load_done, non_owner_note, parse_task, record_done, write_atomic
 
 TEXT_MAX = 65536
 TRUNCATED = "\n[truncated]"
@@ -86,30 +87,45 @@ def result_body(outcome, mode, owner=True, label="claude routine session"):
 
 
 class RateLimiter:
-    """Sliding one-hour window of send times, kept in a file so a restart does not reset it."""
+    """Sliding one-hour window of send times, kept in a file so a restart does not reset it.
+    An entry may carry a task id; recording that id again inside the window is a no-op."""
 
     def __init__(self, path, per_hour, clock=time.time):
         self.path, self.per_hour, self.clock = path, per_hour, clock
         try:
             with open(path, encoding="utf-8") as f:
-                self.times = [float(t) for t in json.load(f)]
-        except (OSError, ValueError, TypeError):
-            self.times = []
+                self.entries = [(float(e[0]), str(e[1])) if isinstance(e, list) else (float(e), None)
+                                for e in json.load(f)]
+        except (OSError, ValueError, TypeError, IndexError):
+            self.entries = []
+
+    @property
+    def times(self):
+        return [t for t, _ in self.entries]
 
     def _prune(self):
         now = self.clock()
-        self.times = [t for t in self.times if 0 <= now - t < HOUR]
+        self.entries = [(t, k) for t, k in self.entries if 0 <= now - t < HOUR]
+
+    def _save(self):
+        write_atomic(self.path, json.dumps([t if k is None else [t, k] for t, k in self.entries]))
 
     def wait_seconds(self):
         self._prune()
-        if len(self.times) < self.per_hour:
+        if len(self.entries) < self.per_hour:
             return 0.0
         return max(min(self.times) + HOUR - self.clock(), 0.0)
 
-    def record(self):
+    def record(self, key=None):
         self._prune()
-        self.times.append(self.clock())
-        write_atomic(self.path, json.dumps(self.times))
+        if key is not None and any(k == key for _, k in self.entries):
+            return
+        self.entries.append((self.clock(), key))
+        self._save()
+
+    def forget(self, key):
+        self.entries = [(t, k) for t, k in self.entries if k != key]
+        self._save()
 
 
 class RelayLoop:

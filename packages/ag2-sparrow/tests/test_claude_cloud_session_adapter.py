@@ -235,7 +235,19 @@ class PayloadTest(unittest.TestCase):
         for tool in ("room_list", "room_inspect", "room_action_read", "relay_token_issue", "agent_link",
                      "agent_unlink"):
             self.assertIn("`%s`" % tool, forbidden)
-        self.assertIn("or any other tool", forbidden)
+        self.assertIn("or any other AG2 Space connector tool", forbidden)
+        self.assertIn("Claude Code's own tools (shell, files, web, subagents, skills)", prompt)
+
+    def test_session_prompt_pins_the_message_count(self):
+        prompt = PROMPT_MD.read_text(encoding="utf-8")
+        rule = prompt[prompt.index("Message count per task_id, exactly:"):prompt.index("End your turn")]
+        for clause in ("the answer is posted once, to exactly one place, either the\nitem's room or `owner_dm`",
+                       'the item\'s room gets exactly one more\nmessage, "I sent it to you in our DM.", and nothing else',
+                       "Never post two answers"):
+            self.assertIn(clause, rule)
+        self.assertNotIn("exactly once", prompt)
+        self.assertNotIn("post exactly once", sa.REMINDER)
+        self.assertIn("exactly one place", sa.REMINDER)
 
     def test_child_env_is_a_whitelist(self):
         self.assertEqual(sa.child_env(ENV), {k: ENV[k] for k in ("PATH", "HOME", "USER", "LANG")})
@@ -402,6 +414,23 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual(len(fake.calls()), 1, "a queued turn is never sent again")
             self.assertIn("turn=4", result(d, "task-k"))
 
+    def test_a_receipt_followed_by_other_json_and_an_error_is_never_retried(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = ok(4)["stdout"] + json.dumps({"error": "diagnostic"}) + "\n"
+            fake = Fake(d, [{"stdout": out, "rc": 1, "stderr": "getaddrinfo ENOTFOUND api.anthropic.com"}, ok(5)])
+            write_task(d, "task-k", "x")
+            run_adapter(d, fake, once=1, backoff=1)
+            self.assertEqual(len(fake.calls()), 1, "a queued turn is never sent again")
+            self.assertIn("turn=4", result(d, "task-k"))
+
+    def test_a_receipt_on_stderr_also_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [{"rc": 1, "stderr": "ECONNREFUSED\n" + ok(3)["stdout"]}])
+            write_task(d, "task-s", "x")
+            run_adapter(d, fake, once=1)
+            self.assertEqual(len(fake.calls()), 1)
+            self.assertIn("turn=3", result(d, "task-s"))
+
     def test_proven_unsent_attempts_do_not_consume_the_hourly_cap(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [{"rc": 1, "stderr": "getaddrinfo ENOTFOUND"}, ok(6)])
@@ -501,6 +530,19 @@ class QueueLoopTest(unittest.TestCase):
                                                   "(interrupted); it was not retried.\n")
             self.assertEqual(os.listdir(Path(d) / "state" / "sending"), [])
 
+    def test_a_crash_after_the_send_still_counts_against_the_hour_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok()])
+            self.assertEqual(self.crash_then_restart(d, fake), 1)
+            entries = json.loads((Path(d) / "state" / "sends.json").read_text())
+            self.assertEqual([e[1] for e in entries], ["task-c"], "counted once, across the crash and restart")
+            write_task(d, "task-next", "x")
+            clock = FakeClock()
+            start = clock.t
+            run_adapter(d, fake, clock=clock, once=1, max_per_hour=1)
+            self.assertEqual(len(fake.calls()), 2)
+            self.assertGreaterEqual(clock.t - start, 3600, "the next turn waited for the hour")
+
     def test_without_the_marker_the_crash_would_resend(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(sa, "mark_sending", lambda path: None):
             fake = Fake(d, [ok()])
@@ -516,7 +558,7 @@ class QueueLoopTest(unittest.TestCase):
             run_adapter(d, fake, clock=clock, once=3, min_gap_seconds=30)
             self.assertEqual(len(fake.calls()), 3)
             self.assertGreaterEqual(clock.t - start, 60)
-            times = json.loads((Path(d) / "state" / "sends.json").read_text())
+            times = [e[0] for e in json.loads((Path(d) / "state" / "sends.json").read_text())]
             self.assertTrue(all(b - a >= 30 for a, b in zip(times, times[1:])), times)
 
     def test_hourly_cap_holds_the_next_turn_and_survives_restart(self):

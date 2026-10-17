@@ -17,13 +17,14 @@ import subprocess
 import sys
 import time
 
-from ..codex.codex_connector import acquire_lock, non_owner_note, write_atomic
-from ..relay_loop import NO_ROOM, TEXT_MAX, Outcome, RelayLoop, build_payload, log, result_body
+from ...task_io import acquire_lock, non_owner_note, write_atomic
+from ...relay_loop import NO_ROOM, TEXT_MAX, Outcome, RelayLoop, build_payload, log, result_body
 
 SESSION_RE = re.compile(r"session_[A-Za-z0-9]+")
 ROOM_RE = re.compile(r"![^\s:]+:\S+")
-REMINDER = ("[sparrow task] Follow your standing AG2 Space instructions for this message: "
-            "post exactly once, to the audience they name, then end with posted/not posted <task_id>.")
+REMINDER = ("[sparrow task] Follow your standing AG2 Space instructions for this message: one answer, "
+            "to exactly one place they name (plus only the one DM pointer line when they say so), "
+            "then end with posted/not posted <task_id>.")
 # CLAUDE_CONFIG_DIR selects which login the CLI uses; without it the CLI falls back to the user default.
 ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "CLAUDE_CONFIG_DIR")
 LABEL = "claude cloud session"
@@ -52,17 +53,21 @@ def build_text(task_id, headers, message, operator_lines=(), note=None, owner_dm
     return room, REMINDER + "\n" + payload
 
 
-def _receipt(out):
-    if isinstance(out, bytes):
-        out = out.decode("utf-8", "replace")
-    out = (out or "").strip()
-    for chunk in [out] + out.splitlines()[::-1]:
-        try:
-            data = json.loads(chunk)
-        except ValueError:
-            continue
-        if isinstance(data, dict):
-            return data
+def _text(out):
+    return out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+
+
+def _receipt(*outputs):
+    """The first JSON record with "ok": true in any output, line by line or whole; else {}."""
+    for out in outputs:
+        out = _text(out).strip()
+        for chunk in [out] + out.splitlines():
+            try:
+                data = json.loads(chunk)
+            except ValueError:
+                continue
+            if isinstance(data, dict) and data.get("ok") is True:
+                return data
     return {}
 
 
@@ -75,15 +80,15 @@ def queue_turn(claude, session_id, text, env, timeout=60.0, run=subprocess.run):
     try:
         proc = run(argv, input=text, env=env, capture_output=True, text=True, timeout=timeout, shell=False)
     except subprocess.TimeoutExpired as e:
-        data = _receipt(e.stdout)
-        return _queued(data) if data.get("ok") is True else Outcome("ambiguous", detail="timeout")
+        data = _receipt(e.stdout, e.stderr)
+        return _queued(data) if data else Outcome("ambiguous", detail="timeout")
     except OSError as e:
         return Outcome("retry", detail=type(e).__name__)
-    data = _receipt(proc.stdout)
-    # Any receipt means the turn was queued, whatever the exit code or stderr says afterwards.
-    if data.get("ok") is True:
+    data = _receipt(proc.stdout, proc.stderr)
+    # Any receipt means the turn was queued, whatever else the exit code or output says.
+    if data:
         return _queued(data)
-    output = (proc.stderr or "") + (proc.stdout or "")
+    output = _text(proc.stderr) + _text(proc.stdout)
     log("claude:", output.strip()[-300:])
     if proc.returncode != 0 and UNSENT_RE.search(output):
         return Outcome("retry", detail="exit %d" % proc.returncode)
@@ -133,6 +138,7 @@ class Adapter(RelayLoop):
         if os.path.exists(self._marker(task_id)):
             # A send began before a crash; resending could post twice.
             log("interrupted send, not resent ->", task_id)
+            self.limiter.record(task_id)
             self.finish(name, result_body(INTERRUPTED, self.args.result_mode, owner, LABEL), seen)
             return True
         if not self.admit(name, headers, seen):
@@ -143,14 +149,15 @@ class Adapter(RelayLoop):
             self.finish(name, NO_ROOM, seen)
             return True
         log("queue ->", task_id, headers.get("access_tier"), "chars", len(text))
+        # Counted before the send, keyed by task, so a crash after it can neither drop nor double the count.
+        self.limiter.record(task_id)
         mark_sending(self._marker(task_id))
         out = queue_turn(self.args.claude, self.args.session_id, text, self.env, self.args.timeout, self.run)
         if out.kind == "retry":
+            self.limiter.forget(task_id)
             self._clear(task_id)
             if self.schedule_retry(task_id, out.detail):
                 return False
-        else:
-            self.limiter.record()
         log("result <-", task_id, out.kind, out.detail, out.session_id or "")
         self.finish(name, result_body(out, self.args.result_mode, owner, LABEL), seen)
         return True

@@ -13,7 +13,7 @@ python3 skills/secret-vault/secret-vault.py env CLAUDE_ROUTINE_TOKEN -- \
 One adapter per work dir (`state/connector.pid`, liveness-checked; exit 3 if another holds it), one fire in flight.
 Tasks are taken in the task protocol's priority order (`priority:` urgent, normal, low; oldest first
 within a priority). The loop, payload layout, result lines and hourly cap live in the shared
-[`relay_loop.py`](../relay_loop.py), which the cloud session adapter uses too.
+[`ag2_sparrow/relay_loop.py`](../../relay_loop.py), which the cloud session adapter uses too.
 
 ## Setup
 
@@ -48,8 +48,8 @@ note: <NON_OWNER_NOTE>            (non-owner tiers only)
 The nonce is fresh per fire, so a body cannot close the span early; the bridge-written lines sit after
 the closing marker and stay operator text. Only the body is cut to fit the length limit.
 
-Tier and collaborator come from the attested headers (`adapters/hatch/task_fields.attested_headers`, via
-the Codex adapter's `parse_task`), never from message text; unknown tiers become `guest`, and
+Tier and collaborator come from the attested headers (`task_io.attested_headers`, via
+the package-level `task_io.parse_task` every adapter shares), never from message text; unknown tiers become `guest`, and
 `collaborator=true` only at `team`. Header values have whitespace removed, so a value cannot add a line.
 The note is the Hatch adapter's `NON_OWNER_NOTE`, the same pin the Codex adapter uses; `routine-prompt.md`
 carries the same text so the rules do not depend on the payload. A task with no room is not fired.

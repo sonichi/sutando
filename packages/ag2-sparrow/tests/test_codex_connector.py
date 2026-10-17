@@ -20,7 +20,7 @@ from unittest import mock
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import local_task_protocol, team_guardrail  # noqa: E402
+from ag2_sparrow import local_task_protocol, task_io, team_guardrail  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 HATCH_SCRIPT = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch" / "ag2-sparrow-hatch.sh"
@@ -122,10 +122,11 @@ class ParseTaskTest(unittest.TestCase):
     def test_headers_come_from_the_package_parser(self):
         with tempfile.TemporaryDirectory() as d:
             p = write_task(d, "task-chat-2", "x")
-            with mock.patch.object(cc, "attested_headers", wraps=cc.attested_headers) as spy:
+            with mock.patch.object(task_io, "attested_headers", wraps=task_io.attested_headers) as spy:
                 cc.parse_task(str(p))
         self.assertEqual(spy.call_count, 1)
-        self.assertEqual(cc.attested_headers.__module__, "ag2_sparrow.adapters.hatch.task_fields")
+        self.assertEqual(cc.attested_headers.__module__, "ag2_sparrow.task_io")
+        self.assertIs(cc.parse_task, task_io.parse_task)
 
     def test_gateway_mid_layout_uses_the_attested_tier_and_keeps_the_guardrail_outside(self):
         tid = "task-1792100000001"
@@ -511,7 +512,7 @@ class EdgePathTest(unittest.TestCase):
     def test_done_list_is_bounded_and_deduplicated(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "done")
-            with mock.patch.object(cc, "DONE_KEEP", 3):
+            with mock.patch.object(task_io, "DONE_KEEP", 3):
                 for tid in ("a", "b", "a", "c", "d"):
                     cc.record_done(p, tid)
             self.assertEqual(cc.load_done(p), ["a", "c", "d"])

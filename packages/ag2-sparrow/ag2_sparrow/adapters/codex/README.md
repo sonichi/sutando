@@ -14,8 +14,8 @@ One connector per work dir: `state/connector.pid` is a liveness-checked lock (ex
 
 ## Tiers: what a non-owner sender gets
 
-The tier comes from the attested headers (`adapters/hatch/task_fields.attested_headers` over
-`local_task_protocol`), never from message text: a task-last file is parsed strictly, and a
+The tier comes from the attested headers (`task_io.attested_headers` over
+`local_task_protocol`, shared with the other adapters), never from message text: a task-last file is parsed strictly, and a
 gateway-written `task_layout: mid` file takes `access_tier` from the writer's trailer below the
 body. Absent or unknown → `guest`. `collaborator` rides along.
 

@@ -1,8 +1,10 @@
 # Claude cloud session adapter
 
 Feeds Sparrow/Sutando inbox tasks into **one persistent** Claude Code cloud session, as turns. The
-session runs in Anthropic's cloud with the AG2 Space connector, keeps its memory across messages, has
-the full Claude Code toolset, and posts each reply into the room itself. Unlike the
+session runs in Anthropic's cloud with the AG2 Space connector, keeps its memory across messages, keeps
+Claude Code's own toolset (shell, files, web, subagents, skills; these ran without permission prompts
+in the probes), and posts each reply itself. Only the AG2 Space connector is restricted, to the three
+tools that did not prompt (see Limits). Unlike the
 [routine adapter](../claude_routine/README.md), which starts a fresh one-shot session per message,
 every message here lands in the same session. This relay still has to run on a machine. Stdlib only;
 opt-in; the core never imports it.
@@ -17,7 +19,7 @@ python3 -m ag2_sparrow.adapters.claude_cloud_session.session_adapter \
 (`state/connector.pid`, liveness-checked; exit 3 if another holds it), one turn queued at a time,
 taken in the task protocol's priority order (`priority:` urgent, normal, low; oldest first within a
 priority). The loop, payload layout, result lines and hourly cap are the shared
-[`relay_loop.py`](../relay_loop.py), which the routine adapter uses too; this adapter keeps only the
+[`ag2_sparrow/relay_loop.py`](../../relay_loop.py), which the routine adapter uses too; this adapter keeps only the
 CLI call, the pre-send marker and the pacing gap.
 
 ## Setup (once)
@@ -78,7 +80,7 @@ answers its owner here."): the session holds the owner's connector and there is 
 
 | outcome | result file |
 |---|---|
-| a receipt with `"ok": true` on stdout, whatever the exit code or stderr | `[no-send]` + `# claude cloud session: <url>`; with `--result-mode echo`, `Sent to the cloud agent: <url>` (owner tasks only; non-owner rooms always get `[no-send]`) |
+| any JSON record with `"ok": true` anywhere in stdout or stderr, whatever else the output or exit code says | `[no-send]` + `# claude cloud session: <url>`; with `--result-mode echo`, `Sent to the cloud agent: <url>` (owner tasks only; non-owner rooms always get `[no-send]`) |
 | no receipt, and a non-zero exit whose output proves the CLI never reached the service (DNS failure, refused connection), or the executable failed to start | retried after `--backoff` × 2ⁿ (cap `--backoff-max`), up to `--max-retries` (default 2), then "could not be reached … after several tries" |
 | no receipt otherwise: any other non-zero exit, exit 0 without one, or a timeout (`--timeout`, default 60 s; a receipt printed before the timeout still counts as queued) | "may or may not have reached the cloud agent …; it was not retried" — never resubmitted |
 
@@ -88,16 +90,21 @@ restart with the "may or may not have reached" line instead of a second queued t
 
 Pacing: at least `--min-gap-seconds` (default 2) between queued turns and at most `--max-per-hour`
 (default 60) in a sliding hour, kept in `state/sends.json` so a restart does not reset either. The cap
-counts turns that were queued or may have been; an attempt proven unsent does not use it.
+counts turns that were queued or may have been; an attempt proven unsent does not use it. Each turn
+is counted before the CLI call, keyed by its task id, and dropped again only when the call proves it
+was never sent, so a crash right after a send cannot lose the count and a restart cannot count the
+same task twice.
 
 ## Limits
 
 - No reply readback: the CLI only queues; the session posts itself, and its `posted` / `not posted`
   line is visible only on the session page.
-- A permission prompt inside the session stalls the queue: every turn queued after it waits until
-  the owner answers it. In the probe, `room_list` raised one; `ag2_whoami`, `room_actions_describe`
-  and `room_action_execute` did not, so the standing instructions allow only those three. The adapter
-  cannot detect a stall, because the CLI only reports that a turn was queued (tracked in the liveness
+- Any tool that raises a permission prompt inside the session stalls the queue: every turn queued
+  after it waits until the owner answers it. In the probe, the connector's `room_list` raised one;
+  `ag2_whoami`, `room_actions_describe` and `room_action_execute` did not, so the standing
+  instructions allow only those three connector tools. Claude Code's own tools stay available; they
+  ran without prompts in the probes, and one that starts prompting would stall the queue the same
+  way. The adapter cannot detect a stall, because the CLI only reports that a turn was queued (tracked in the liveness
   issue), and nothing on the CLI side can answer the prompt. Fix it from the session's page: answer
   the prompt, and set the session's permission mode there if the page offers it.
 - A session the owner closes or archives makes every turn fail, so every task gets a failure result

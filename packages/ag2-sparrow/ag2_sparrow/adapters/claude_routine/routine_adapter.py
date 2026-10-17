@@ -20,8 +20,8 @@ import time
 import urllib.error
 import urllib.request
 
-from ..codex.codex_connector import acquire_lock, non_owner_note, write_atomic
-from ..relay_loop import (HOUR, NO_ROOM, NON_OWNER_REFUSED, TEXT_MAX, Outcome, RateLimiter,  # noqa: F401
+from ...task_io import acquire_lock, non_owner_note, write_atomic
+from ...relay_loop import (HOUR, NO_ROOM, NON_OWNER_REFUSED, TEXT_MAX, Outcome, RateLimiter,  # noqa: F401
                           RelayLoop, build_payload, log, result_body)
 
 API_BASE = "https://api.anthropic.com"
