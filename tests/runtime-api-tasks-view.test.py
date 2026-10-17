@@ -13,12 +13,15 @@ Exit: 0 on pass, 1 on fail.
 import asyncio
 import concurrent.futures
 import contextlib
+import itertools
 import json
+import os
 import queue
 import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -1144,6 +1147,109 @@ class ForeignTaskOwnershipTests(unittest.TestCase):
         self.assertIn(tid, [e["taskId"] for e in self.view.list_tasks()["tasks"]])
 
 
+class ResultOrderingTests(unittest.TestCase):
+    SECOND = 1_800_000_000
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.results = Path(tmp.name) / "results"
+        self.results.mkdir()
+        self.view = TasksView(Path(tmp.name) / "tasks", self.results, "@me:x")
+        self.ascending = []
+        for name, fraction in (("mu", 100_000_000), ("alpha", 500_000_000),
+                               ("zeta", 900_000_000)):
+            path = self.results / f"task-rtapi-{name}.txt"
+            path.write_text(f"{name} answer")
+            ns = self.SECOND * 1_000_000_000 + fraction
+            os.utime(path, ns=(ns, ns))
+            self.ascending.append(path)
+        observed = [p.stat().st_mtime_ns for p in self.ascending]
+        self.assertEqual(observed, sorted(set(observed)))
+        self.assertEqual({n // 1_000_000_000 for n in observed}, {self.SECOND})
+
+    def test_same_second_order_is_independent_of_enumeration_and_filename(self):
+        for name, body in (("task-rtapi-blank", " \n\t"),
+                           ("task-foreign", "foreign answer")):
+            path = self.results / f"{name}.txt"
+            path.write_text(body)
+            os.utime(path, (self.SECOND + 1, self.SECOND + 1))
+        real_glob = Path.glob
+        blank = self.results / "task-rtapi-blank.txt"
+        for order in itertools.permutations(self.ascending):
+            with self.subTest(order=[p.name for p in order]):
+                def ordered_glob(directory, pattern):
+                    matches = list(real_glob(directory, pattern))
+                    if directory == self.results:
+                        self.assertEqual(set(matches), {blank, *order})
+                        return iter([blank, *order])
+                    return iter(matches)
+
+                with unittest.mock.patch.object(Path, "glob", ordered_glob):
+                    self.assertEqual(self.view.get_result(), {
+                        "taskId": "task-rtapi-zeta", "result": "zeta answer",
+                        "latest": True})
+                    listed = self.view.list_results()["results"]
+                    self.assertEqual([r["taskId"] for r in listed],
+                                     [p.stem for p in reversed(self.ascending)])
+                    for result in listed:
+                        self.assertIs(type(result["ts"]), int)
+                        self.assertEqual(result["ts"], self.SECOND)
+                    self.assertEqual(self.view.list_results(limit=1), {
+                        "results": listed[:1], "truncated": True})
+                self.assertEqual(self.view.get_result("task-rtapi-mu"), {
+                    "taskId": "task-rtapi-mu", "result": "mu answer"})
+                self.assertIsNone(self.view.get_result("task-foreign"))
+
+    def test_equal_precise_mtimes_preserve_enumeration_order(self):
+        ns = self.SECOND * 1_000_000_000 + 500_000_000
+        for path in self.ascending:
+            os.utime(path, ns=(ns, ns))
+        for order in itertools.permutations(self.ascending):
+            with self.subTest(order=[p.name for p in order]), \
+                    unittest.mock.patch.object(Path, "glob", return_value=order):
+                self.assertEqual(self.view._result_files(),
+                                 [(p, self.SECOND) for p in order])
+
+    def test_full_stat_precision_and_single_cached_stat(self):
+        real_stat = Path.stat
+        metadata = {
+            path: types.SimpleNamespace(
+                st_mode=path.stat().st_mode, st_mtime=self.SECOND + 0.5,
+                st_mtime_ns=self.SECOND * 1_000_000_000 + 500_000_000 + i)
+            for i, path in enumerate(self.ascending)
+        }
+        directory = self.results / "task-rtapi-directory.txt"
+        directory.mkdir()
+        for read in (self.view._result_files, self.view.list_results,
+                     self.view.get_result):
+            with self.subTest(read=read.__name__):
+                calls = dict.fromkeys([*self.ascending, directory], 0)
+
+                def counted_stat(path, *args, **kwargs):
+                    if path in calls:
+                        calls[path] += 1
+                    if path in metadata:
+                        return metadata[path]
+                    return real_stat(path, *args, **kwargs)
+
+                with unittest.mock.patch.object(Path, "stat", counted_stat), \
+                        unittest.mock.patch.object(Path, "glob",
+                                                   return_value=[directory, *self.ascending]):
+                    got = read()
+                self.assertEqual(calls, dict.fromkeys(calls, 1))
+                if read == self.view._result_files:
+                    self.assertEqual(got, [(p, self.SECOND)
+                                          for p in reversed(self.ascending)])
+                elif read == self.view.list_results:
+                    self.assertEqual(got["results"], [
+                        {"taskId": p.stem, "ts": self.SECOND,
+                         "preview": p.read_text()}
+                        for p in reversed(self.ascending)])
+                else:
+                    self.assertEqual(got["taskId"], "task-rtapi-zeta")
+
+
 class ArchivalRaceTests(unittest.TestCase):
     """Archival unlinks a live result name. Enumeration and listing must
     absorb that; a raise here reached asyncio.gather and ended the daemon."""
@@ -1182,6 +1288,7 @@ class ArchivalRaceTests(unittest.TestCase):
     def test_archived_after_the_ready_read_still_returns_the_answer(self):
         import tasks_view as tv_mod
         real_read = tv_mod.read_ready_result
+        os.utime(self.f, ns=(1_800_000_000_900_000_000,) * 2)
 
         def read_then_archive(f):
             body = real_read(f)
@@ -1193,6 +1300,8 @@ class ArchivalRaceTests(unittest.TestCase):
             got = self.view.list_results()["results"]
         self.assertEqual([e["taskId"] for e in got], ["task-rtapi-race"])
         self.assertIsInstance(got[0]["ts"], int)
+        self.assertEqual(got[0]["ts"], 1_800_000_000)
+        self.assertEqual(got[0]["preview"], "READY BODY")
 
 
 class TasksViewAssignedIdTests(unittest.TestCase):

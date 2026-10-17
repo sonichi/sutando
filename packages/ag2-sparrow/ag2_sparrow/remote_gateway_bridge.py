@@ -944,7 +944,7 @@ def _decision_text(task: dict) -> str:
     text = str(task.get("task") or "").strip()
     # Button replies can follow the broker's quoted context envelope; only the
     # text after it is the decision.
-    text = local_task_protocol.split_reply_context(text)[1]
+    text = local_task_protocol.reply_action_text(text)
     text = re.sub(r"^\[AG2Space\s+[^\]]+\]\s*", "", text, count=1)
     return text.strip()
 

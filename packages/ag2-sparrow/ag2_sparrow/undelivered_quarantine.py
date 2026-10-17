@@ -23,7 +23,6 @@ supplies the results directory.
 from __future__ import annotations
 
 import ctypes
-import ctypes.util
 import errno
 import os
 import re
@@ -65,7 +64,7 @@ def report_once(key: str, log: Log, line: str) -> None:
 
 def _probe_rename() -> "tuple[str, Optional[Callable[[bytes, bytes], int]]]":
     try:
-        libc = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
+        libc = ctypes.CDLL(None, use_errno=True)  # find_library("c") spawns ldconfig on Linux
     except OSError:  # pragma: no cover - no libc to speak of
         return "none", None
     if sys.platform == "darwin" and hasattr(libc, "renamex_np"):  # pragma: no cover - Linux CI

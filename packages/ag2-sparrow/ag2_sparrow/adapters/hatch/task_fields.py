@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from ... import gateway_instance, local_task_protocol
+from ...task_io import attested_headers
 
 SNIPPET_MAX = 500
 REPLY_CONTEXT_MAX = 2000
@@ -38,16 +39,6 @@ def valid_mxid(value: str) -> bool:
         except ValueError:
             return False
     return m["port"] is None or 0 < int(m["port"]) <= 65535
-
-
-def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":
-    """Headers a tier or routing decision may read: the strict task-last parse, or the
-    trusted last-wins scan only when `task_layout: mid` sits above `task:`, where no
-    body text can claim it. The gateway writes access_tier last, below the body."""
-    strict = local_task_protocol.parse_task_headers(text)
-    if (strict.headers.get("task_layout") or "").strip() == "mid":
-        return local_task_protocol.parse_task_headers_trusted(text)
-    return strict
 
 
 def _split(text: str) -> "tuple[str, str]":

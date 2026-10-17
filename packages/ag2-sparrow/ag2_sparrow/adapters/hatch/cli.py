@@ -519,6 +519,12 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
             note(f"{unit} was not written by install, so it was kept; re-run with --force to "
                  "replace it with the unit above")
             return
+    stopped = False
+    if changed and _unit_props("ActiveState").get("ActiveState") in ("active", "reloading"):
+        r = _systemd_run(["systemctl", "--user", "stop", SERVICE_NAME])
+        stopped = _ok(r)
+        print(f"stopped: {SERVICE_NAME} before installing" if stopped else
+              f"NOTE service: stop failed ({_why(r)}); it is restarted after the install instead")
     if changed:
         _write(unit, text, 0o644)
         print(f"installed: {unit}")
@@ -536,7 +542,7 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
         main_pid = 0
     ran = props.get("ExecMainStartTimestampMonotonic", "0") not in ("", "0")
     # failed/activating/deactivating: the unit's own Sparrow crashed or is restarting.
-    outside = state == "inactive" and _outside_sparrow(state_dir, instance, main_pid, ran)
+    outside = not stopped and state == "inactive" and _outside_sparrow(state_dir, instance, main_pid, ran)
     has_token = device_env.is_file()
     start = has_token and not outside
     if start and state == "failed":

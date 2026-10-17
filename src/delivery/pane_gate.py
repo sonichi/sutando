@@ -166,6 +166,19 @@ def is_usage_limit(kind: Optional[str], text: Optional[str]) -> bool:
 AWAIT_HINT = re.compile(
     r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
     r"|Continuing automatically|❯\s*\d+\.", re.I)
+# A turn's spinner ("✳ Moonwalking… (15s · …)") or completion line: transcript above, live dialog
+# below. Not "esc to interrupt": the busy footer carries it, under any live dialog.
+_SPINNER_ROW = re.compile(r"^\s*[·✢✳✶✻✽*]\s+[A-Za-z][\w-]*(?:…|\.\.\.)\s*\(")
+_TURN_ROW = re.compile(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
+
+
+def live_tail(lines: List[str]) -> List[str]:
+    """`lines` below the last turn spinner / completion row, else all of them. Tool output
+    above that row may quote a dialog's caret or key hints; only a dialog below it is live."""
+    for i in range(len(lines) - 1, -1, -1):
+        if _TURN_ROW.search(_SGR.sub("", lines[i])):
+            return lines[i + 1:]
+    return lines
 
 
 @dataclass(frozen=True)
@@ -601,7 +614,7 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
     line = prompt_line(capture, adapter)
     # _gate's after_prompt() must see the same capture line was found in, or
     # it computes "below" from a view that never contained that line at all.
-    gate = _gate(capture, tail, line, adapter)
+    gate = _gate(capture, "\n".join(_SGR.sub("", ln) for ln in live_tail(lines)), line, adapter)
     if gate:
         return Verdict("busy", gate)
     if abn and not limit_is_stale(abn, workspace, socket, session, probe):

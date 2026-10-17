@@ -2,7 +2,7 @@
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
 Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
-canonical for those modules — currently 21 of them, including outbox.py and its
+canonical for those modules — currently 23 of them, including outbox.py and its
 transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
 and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
 dir-interface, no workspace-resolution).
@@ -61,6 +61,10 @@ MAP = {
     "src/undelivered_quarantine.py": "undelivered_quarantine.py",
     # the destined-proactive filename grammar every bridge and the voice drain read
     "src/proactive_routing.py": "proactive_routing.py",
+    # task ordering (urgent > normal > low, FIFO within a tier) for every inbox consumer
+    "src/task_priority.py": "task_priority.py",
+    # one adapter's task execution lifecycle: work-dir lock, classifier, claims, publication
+    "src/task_lifecycle.py": "task_lifecycle.py",
     # worker-pool completion-record contract: the pool skill writes through it
     # and the bridge reads through it, so neither keeps a private predicate.
     "skills/worker-pool/scripts/pool_record.py": "pool_record.py",
