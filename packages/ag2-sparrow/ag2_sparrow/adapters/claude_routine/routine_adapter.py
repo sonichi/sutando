@@ -42,7 +42,7 @@ def _field(value):
     return re.sub(r"\s+", "", value or "")
 
 
-def build_payload(task_id, headers, message, operator_lines=(), note=None):
+def build_payload(task_id, headers, message, operator_lines=(), note=None, text_max=TEXT_MAX):
     """First line: the attested routing fields. Then, for a non-owner tier, the note; then
     the untrusted body between nonce markers; then the bridge-written lines, outside them.
     Only the body is cut to fit the endpoint's limit, so the markers and lines survive."""
@@ -57,7 +57,7 @@ def build_payload(task_id, headers, message, operator_lines=(), note=None):
     tag = "UNTRUSTED_TASK_" + uuid.uuid4().hex[:8]
     opening, closing = "<%s>\n" % tag, "\n</%s>" % tag
     tail = closing + ("\n" + "\n".join(operator_lines) if operator_lines else "")
-    room_left = TEXT_MAX - len(head) - len(opening) - len(tail)
+    room_left = text_max - len(head) - len(opening) - len(tail)
     if len(message) > room_left:
         message = message[:max(room_left - len(TRUNCATED), 0)] + TRUNCATED
     return room, head + opening + message + tail
@@ -153,12 +153,12 @@ class RateLimiter:
         write_atomic(self.path, json.dumps(self.times))
 
 
-def result_body(outcome, mode, owner=True):
+def result_body(outcome, mode, owner=True, label="claude routine session"):
     url = outcome.url or "unknown"
     if outcome.kind == "ok":
         if mode == "echo" and owner:
             return "Sent to the cloud agent: %s\n" % url
-        return "[no-send]\n# claude routine session: %s\n" % url
+        return "[no-send]\n# %s: %s\n" % (label, url)
     # A non-owner tier never learns the HTTP status or error type: that is auth/config state
     # about the owner's connector, and the sender is not the owner.
     if not owner:
