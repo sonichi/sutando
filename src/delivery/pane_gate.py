@@ -47,7 +47,7 @@ from typing import Callable, List, Optional, Tuple
 _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC))
 from cli_wedge import (PROVIDER_LIMIT_PATTERNS, FrameAbnormal, capture_pane,  # noqa: E402
-                       core_target, frame_abnormal, frame_working, needs_login_line)
+                       core_target, frame_abnormal, frame_working, needs_login_line, state_id)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
@@ -463,6 +463,13 @@ def _below_composer(capture: str) -> List[str]:
     last = max((i for i, ln in enumerate(lines) if _SGR.sub("", ln).lstrip().startswith("❯")),
                default=len(lines) - 1)
     return lines[last + 1:]
+
+
+def progress_id(capture: str) -> str:
+    """Identity of the work on screen: the rows above the composer, clocks and spinners
+    normalised away. Status rows under it (footer counters, a limit banner) are not work."""
+    lines = (capture or "").splitlines()
+    return state_id("\n".join(lines[:len(lines) - len(_below_composer(capture))]))
 
 
 def _limit_row(ln: str) -> bool:

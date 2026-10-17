@@ -134,14 +134,14 @@ def _is_watcher_loss(obs: Observation) -> bool:
 
 
 def _wait_part(pane_id: str | None) -> str | None:
-    """The timer-normalised half of a "raw:normalised" frame id; None for a bare raw id."""
+    """The progress half of a "raw:progress" frame id; None for a bare raw id."""
     head, sep, tail = (pane_id or "").partition(":")
     return tail if sep and head and tail else None
 
 
 def _wait_moved(obs: Observation, ev: WorkerEvidence) -> bool:
-    """The last tick read the same gate or limit and the frame, clocks and spinners
-    normalised away, has changed since: the session progresses under a stale banner."""
+    """The last tick read the same gate or limit and the work on screen has changed since
+    (pane_gate.progress_id): the session progresses under a stale banner."""
     now, before = _wait_part(obs.pane_id), _wait_part(ev.last_pane_id)
     return bool(ev.wedge_kind == "human" and now and before and now != before)
 

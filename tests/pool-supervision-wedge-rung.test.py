@@ -243,8 +243,7 @@ def framed(body):
 
 def frame_obs(text):
     """What observe() hands the ladder for this capture: its kind and its frame id."""
-    return obs(classify(text, workspace=ws),
-               f"{sup.cw.raw_state_id(text)}:{sup.cw.state_id(text)}")
+    return obs(classify(text, workspace=ws), sup.frame_id(text))
 
 
 def turn_done(i):
@@ -279,6 +278,30 @@ got, _ = run([obs(LIMIT, "f1")] * 3)
 check("a bare raw id carries no progress evidence", got, [N, N, HUMAN])
 got, _ = run([obs(LIMIT, "r1:n1"), obs(LIMIT, "r1:n1"), obs(LIMIT, None)])
 check("an unread frame id is no evidence of progress", got, [N, N, HUMAN])
+
+# A worker genuinely held by the limit: idle prompt, the banner, no turn since, deliveries
+# piling up. Only the footer's counters change, and they are status, not work.
+
+
+def held(n_tasks, monitors):
+    return (f"● Picked up the next delivery.\n✻ Worked for 4m 12s · done 1:36 PM\n"
+            f"{RULE}❯ \n{RULE}{STALE}  ⏵⏵ bypass permissions on · {n_tasks} tasks"
+            f" · {monitors} monitor · ← for agents\n")
+
+
+HELD = [held(23, 1), held(24, 1), held(24, 2), held(25, 2)]
+check("a held worker under the banner reads as a wait", classify(HELD[0], workspace=ws), GATE)
+got, _ = run([frame_obs(f) for f in HELD])
+check("a held worker whose footer counters tick is still carded", got, [N, N, HUMAN, N])
+carded = ps.SupervisionState(last_sample_at=1000.0, workers={"w": ps.WorkerEvidence(
+    wedge_first_detected_at=400.0, wedge_consecutive=26, wedge_escalated=True,
+    wedge_kind="human", last_pane_id="064e072fcb5c")})
+st, out = carded, []
+for i, f in enumerate(HELD):
+    st, d = ps.evaluate(st, {"w": frame_obs(f)}, 1095.0 + 95 * i)
+    out.append(d["w"])
+check("an episode already carded under a bare id stays carded and asks no more",
+      (out, st.workers["w"].wedge_kind, st.workers["w"].wedge_escalated), ([N] * 4, "human", True))
 
 REFUSED = (f"\u276f check the inbox\n  \u23bf  You've hit your session limit \u00b7 resets 2am\n"
            f"\u273b Worked for 0s\n\u276f \n{FOOTER}\n")
