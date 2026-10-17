@@ -6,12 +6,15 @@ outside the work root, under the effective uid's home from pwd (never the enviro
 launch context of one user resolves one lock for one real work root. POSIX only. Stdlib only;
 vendored byte-identical into the ag2-sparrow package by packages/ag2-sparrow/tools/sync_from_src.py.
 
-One acquisition at a time per process: a module lock covers each whole attempt, and a fork waits for
-it, so no child is forked mid-acquire; a forked child drops the owner (closing the lock fd only while
-it is still the lock file). The root is held open from before its key is computed and must still be
-that directory after the flock and again just before Acquired is returned. publish's commit is the
-rename of the record into place: if fsyncing the directory fails after it, the record is published
-but its durability is uncertain, so publish returns Published(durable=False) and logs a warning.
+One acquisition at a time per process: a module lock covers each whole attempt. A fork takes that
+lock and the module guard first, so no child is forked mid-acquire or mid-release; the child gets
+fresh locks, drops the owner, and closes an inherited lock fd only while it is still the lock file.
+The root is held open (owner.root_fd) from before its key is computed for the owner's whole life:
+it must still be that directory after the flock and as the last step before Acquired is returned.
+After that the owner acts on the root only through that fd, so a path renamed away and replaced is
+simply a different root (with its own lock); release closes the fd last. publish's commit is the rename of the record into place: if fsyncing the directory fails
+after it, the record is published but its durability is uncertain, so publish returns
+Published(durable=False) and logs a warning.
 """
 
 from __future__ import annotations
@@ -92,6 +95,8 @@ class Owner:
     install_id: str
     acquired_at: float
     root_id: tuple = (0, 0)
+    root_fd: int = -1
+    path: str = ""
     published: bool = False
     released: bool = False
     mutex: Any = field(default_factory=threading.Lock, repr=False)
@@ -380,12 +385,15 @@ def _prior_refusal(prior: Prior) -> Optional[str]:
     return None
 
 
-def _legacy_finding(root: str):
-    """(LegacyRunning or None, stale) from the one read of a pre-holder_lock adapter's pidfile.
-    An empty or malformed file refuses only while fresh; older, it is a crash leftover (stale)."""
+def _legacy_finding(root: str, root_fd: Optional[int] = None):
+    """(LegacyRunning or None, stale) from the one read of a pre-holder_lock adapter's pidfile, read
+    through the held root when given. An empty or malformed file refuses only while fresh; older, it
+    is a crash leftover (stale)."""
     path = os.path.join(root, LEGACY_PIDFILE)
     try:
-        with open(path, "rb") as f:
+        fd = os.open(LEGACY_PIDFILE if root_fd is not None else path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+                     dir_fd=root_fd)
+        with os.fdopen(fd, "rb") as f:
             data = f.read()
             age = time.time() - os.fstat(f.fileno()).st_mtime
     except FileNotFoundError:
@@ -405,7 +413,6 @@ def _prepare(work_root):
     """Platform and owner checks, the normalized root created, and the lock dir ready. Returns
     (path, root, directory, root_fd): the caller closes root_fd. Runs under _ACQUIRING."""
     _platform()
-    _register_fork_hooks()
     with _GUARD:
         if _OWNER is not None and not _OWNER.released and _OWNER.pid == os.getpid():
             raise LockError("already owner")
@@ -414,8 +421,9 @@ def _prepare(work_root):
     root = os.path.realpath(path)
     root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
     try:
-        directory = _lock_dir_of(os.fstat(root_fd))
-        if directory == root or directory.startswith(root.rstrip(os.sep) + os.sep):
+        held = os.fstat(root_fd)
+        directory = _lock_dir_of(held)
+        if _within(directory, held):
             raise LockError("work root contains the lock directory")
         os.makedirs(directory, mode=0o700, exist_ok=True)
         if _is_network(_statfs_type(directory)):
@@ -424,6 +432,22 @@ def _prepare(work_root):
         os.close(root_fd)
         raise
     return path, root, directory, root_fd
+
+
+def _within(path: str, root_st) -> bool:
+    """Whether `path` is the root or lies under it, by (st_dev, st_ino) of each existing ancestor,
+    so case aliases and other spellings of the root are caught."""
+    while True:
+        try:
+            st = os.stat(path)
+            if (st.st_dev, st.st_ino) == (root_st.st_dev, root_st.st_ino):
+                return True
+        except OSError:
+            pass
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        path = parent
 
 
 def _root_unchanged(path: str, root: str, root_fd: int) -> bool:
@@ -441,26 +465,40 @@ _FORK_HOOK = []
 
 
 def _register_fork_hooks() -> None:
-    """Once per process: a fork waits for any acquisition in progress, and the child drops the owner."""
+    """At import, once: a fork waits for any acquisition or release in progress, and the child
+    starts with fresh locks and no owner."""
     if not _FORK_HOOK and hasattr(os, "register_at_fork"):
-        os.register_at_fork(before=_ACQUIRING.acquire, after_in_parent=_ACQUIRING.release,
+        os.register_at_fork(before=_before_fork, after_in_parent=_after_fork_in_parent,
                             after_in_child=_drop_in_child)
         _FORK_HOOK.append(True)
 
 
+def _before_fork() -> None:
+    _ACQUIRING.acquire()
+    _GUARD.acquire()
+
+
+def _after_fork_in_parent() -> None:
+    _GUARD.release()
+    _ACQUIRING.release()
+
+
 def _drop_in_child() -> None:
-    global _OWNER, _WAITING
+    global _OWNER, _WAITING, _GUARD, _ACQUIRING
+    _GUARD, _ACQUIRING = threading.Lock(), threading.Lock()
     owner, _OWNER, _WAITING = _OWNER, None, None
-    try:
-        if owner is not None and not owner.released:
-            try:
-                st = os.fstat(owner.fd)
-                if (st.st_dev, st.st_ino) == tuple(owner.lock_id):
-                    os.close(owner.fd)
-            except OSError:
-                pass
-    finally:
-        _ACQUIRING.release()
+    if owner is None:
+        return
+    for fd, want in ((owner.fd, tuple(owner.lock_id)), (owner.root_fd, tuple(owner.root_id))):
+        try:
+            st = os.fstat(fd)
+            if (st.st_dev, st.st_ino) == want:
+                os.close(fd)
+        except OSError:
+            pass
+
+
+_register_fork_hooks()
 
 
 def _attempt(path: str, root: str, directory: str, root_fd: int, install_id_: str):
@@ -486,21 +524,21 @@ def _attempt(path: str, root: str, directory: str, root_fd: int, install_id_: st
         reason = _prior_refusal(prior)
         if reason:
             return Held(prior, reason=reason)
-        legacy, _ = _legacy_finding(root)
+        legacy, _ = _legacy_finding(root, root_fd)
         if legacy:
             return legacy
         start = start_time(os.getpid())
         if start is None:
             raise LockError("cannot read this process's start time")
-        if not _root_unchanged(path, root, root_fd):
-            raise LockError("root changed")
         st, held = os.fstat(fd), os.fstat(root_fd)
         owner = Owner(fd=fd, lock_id=(st.st_dev, st.st_ino), pid=os.getpid(), start=start, root=root,
                       directory=directory, install_id=install_id_, acquired_at=time.time(),
-                      root_id=(held.st_dev, held.st_ino))
+                      root_id=(held.st_dev, held.st_ino), root_fd=root_fd, path=path)
         with _GUARD:
+            if not _root_unchanged(path, root, root_fd):
+                raise LockError("root changed")
             _OWNER = owner
-        kept = True
+            kept = True
         return Acquired(owner, prior)
     finally:
         if not kept:
@@ -514,10 +552,13 @@ def _attempt(path: str, root: str, directory: str, root_fd: int, install_id_: st
 def _one_attempt(work_root, install_id_: str):
     with _ACQUIRING:
         path, root, directory, root_fd = _prepare(work_root)
+        result = None
         try:
-            return _attempt(path, root, directory, root_fd, install_id_)
+            result = _attempt(path, root, directory, root_fd, install_id_)
+            return result
         finally:
-            os.close(root_fd)
+            if not isinstance(result, Acquired):
+                os.close(root_fd)
 
 
 def acquire(work_root, *, install_id: str, timeout: float = 0.0):
@@ -584,7 +625,11 @@ def _write_record(owner: Owner, rec: dict) -> bool:
     """Write the record; the rename is the commit. True when the directory fsync after it also
     succeeded; LockError (nothing written) when anything before the rename failed."""
     directory = owner.directory
-    for name in os.listdir(directory):
+    try:
+        names = os.listdir(directory)
+    except OSError as e:
+        raise LockError("cannot write the holder record: %s" % e)
+    for name in names:
         if name.startswith("." + HOLDER_NAME + ".") and name.endswith(".tmp"):
             try:
                 os.unlink(os.path.join(directory, name))
@@ -632,12 +677,6 @@ def publish(owner: Owner, adapter: str) -> Published:
             raise LockError("the lock descriptor is closed")
         if (st.st_dev, st.st_ino) != tuple(owner.lock_id) or not same_file(owner.fd, owner.lock_path):
             raise LockError("replaced")
-        try:
-            here = os.stat(owner.root)
-        except OSError:
-            here = None
-        if here is None or (here.st_dev, here.st_ino) != tuple(owner.root_id):
-            raise LockError("root changed")
         rec = {"schema": SCHEMA, "adapter": adapter, "pid": owner.pid, "start": owner.start, "host": _host(),
                "install_id": owner.install_id, "lock": {"dev": owner.lock_id[0], "ino": owner.lock_id[1]},
                "acquired_at": float(owner.acquired_at)}
@@ -650,7 +689,8 @@ def publish(owner: Owner, adapter: str) -> Published:
 
 
 def release(owner: Owner) -> Released:
-    """Remove the record only if it names this owner, then unlock and close. Single use, owner pid only."""
+    """Remove the record only if it names this owner, then, under the module guard, unlock and close
+    (the root fd last) and only then mark released. Owner pid only."""
     global _OWNER
     _check_owner(owner)
     with owner.mutex:
@@ -666,12 +706,14 @@ def release(owner: Owner) -> Released:
         except OSError:
             removed = False
         finally:
-            owner.released = True
-            try:
-                file_lock.unlock_fd(owner.fd)
-            finally:
-                os.close(owner.fd)
-                with _GUARD:
+            with _GUARD:
+                try:
+                    file_lock.unlock_fd(owner.fd)
+                finally:
+                    os.close(owner.fd)
+                    if owner.root_fd >= 0:
+                        os.close(owner.root_fd)
+                    owner.released = True
                     if _OWNER is owner:
                         _OWNER = None
         return Released(removed)
@@ -711,6 +753,9 @@ def status(work_root) -> dict:
     elif isinstance(prior, Valid):
         out["record"] = {"kind": "valid", "record": prior.record}
         out["holder_lineage"] = verify_lineage(prior.record["pid"], prior.record["start"], prior.record["host"])
+    owner = _OWNER
+    if owner is not None and not owner.released and owner.pid == os.getpid() and owner.directory == directory:
+        out["root_unchanged"] = _root_unchanged(owner.path or owner.root, owner.root, owner.root_fd)
     try:
         names = sorted(os.listdir(directory))
     except OSError:

@@ -723,12 +723,6 @@ class HolderLockTest(unittest.TestCase):
                 self.acquire()
         self.assertEqual(str(e.exception), "root changed")
         self.assertIsNone(self.hl._OWNER)
-        owner = self.owned()
-        os.rename(self.root, self.tmp / "moved-again")
-        self.root.mkdir()
-        with self.assertRaises(self.hl.LockError) as e:
-            self.hl.publish(owner, "routine")
-        self.assertEqual(str(e.exception), "root changed", "publish checks the root it was acquired on")
 
     def test_an_unencodable_string_is_invalid_on_read_and_refused_on_publish(self):
         pid, start = self.dead()
@@ -1156,11 +1150,6 @@ class HolderLockTest(unittest.TestCase):
             with self.assertRaises(self.hl.LockError) as e:
                 self.acquire()
         self.assertEqual(str(e.exception), "cannot read this process's start time")
-        owner = self.owned()
-        os.rmdir(self.root)
-        with self.assertRaises(self.hl.LockError) as e:
-            self.hl.publish(owner, "routine")
-        self.assertEqual(str(e.exception), "root changed")
 
     def test_acquire_with_a_timeout_waits_and_wait_returns_at_once_when_free(self):
         with self.flock_elsewhere():
@@ -1204,25 +1193,169 @@ class HolderLockTest(unittest.TestCase):
         owner = self.owned()
         other = os.open(os.devnull, os.O_RDONLY)
         self.addCleanup(lambda: contextlib.suppress(OSError) and os.close(other))
-        mismatched = dataclasses.replace(owner, fd=other)
+        mismatched = dataclasses.replace(owner, fd=other, root_fd=-1)
         self.hl._OWNER = mismatched
-        self.hl._ACQUIRING.acquire()
         self.hl._drop_in_child()
         os.fstat(other)
         self.assertIsNone(self.hl._OWNER, "the owner is dropped")
         self.assertFalse(self.hl._ACQUIRING.locked())
         closed = os.dup(owner.fd)
         os.close(closed)
-        gone = dataclasses.replace(owner, fd=closed)
+        gone = dataclasses.replace(owner, fd=closed, root_fd=-1)
         self.hl._OWNER = gone
-        self.hl._ACQUIRING.acquire()
         self.hl._drop_in_child()
         self.hl._OWNER = owner
-        self.hl._ACQUIRING.acquire()
         self.hl._drop_in_child()
         with self.assertRaises(OSError):
             os.fstat(owner.fd)
         owner.released = True
+        self.hl._drop_in_child()
+        self.assertIsNone(self.hl._OWNER, "a child of a child with no owner does nothing")
+
+    # ── second code review: the held root, fork during release, the inherited guard ──
+
+    def test_stable_root_identity_holds_through_the_consumers_first_act(self):
+        """Review schedule: "I replaced the root immediately after that second check returned true, before
+        `_attempt` constructed the owner ... first=Acquired stable_identity_matches_path=False
+        second=Acquired" -- keep a stable root capability through the returned lease and make consumers
+        use it, then pin replacement after the final check and after publish/at the first consumer act."""
+        self.root.mkdir()
+        real, calls = self.hl._root_unchanged, []
+
+        def check_then_swap(path, root, fd):
+            ok = real(path, root, fd)
+            calls.append(ok)
+            if len(calls) == 2:
+                os.rename(self.root, self.tmp / "moved")
+                self.root.mkdir()
+            return ok
+        with mock.patch.object(self.hl, "_root_unchanged", check_then_swap):
+            r = self.acquire()
+        self.assertEqual(len(calls), 2, "the final check is the last step before Acquired")
+        self.assertIsInstance(r, self.hl.Acquired, "the swap came after the last check")
+        held, moved = os.fstat(r.owner.root_fd), os.stat(self.tmp / "moved")
+        self.assertEqual((held.st_dev, held.st_ino), (moved.st_dev, moved.st_ino), "the owner holds its inode")
+        for name in ("tasks", "results", "state"):
+            os.mkdir(name, 0o700, dir_fd=r.owner.root_fd)
+        self.hl.publish(r.owner, "routine")
+        self.assertEqual(sorted(os.listdir(self.tmp / "moved")), ["results", "state", "tasks"],
+                         "the consumer's first act lands in the original inode")
+        self.assertEqual(os.listdir(self.root), [], "nothing on the new directory")
+        self.assertIs(self.hl.status(str(self.tmp / "moved"))["root_unchanged"], False,
+                      "status under the owner sees that its path now names another directory")
+        code = ("r = hl.acquire(%r, install_id='i')\nprint(type(r).__name__, hl.lock_dir(%r), flush=True)\n"
+                % (str(self.root), str(self.root)))
+        other = self.run_py(code)
+        self.addCleanup(lambda: (other.kill(), other.wait(WAIT)))
+        kind, other_dir = read_line(other.stdout).split()
+        self.assertEqual(kind, "Acquired", "the second acquirer at the path holds its own lock")
+        self.assertNotEqual(other_dir, r.owner.directory, "on the new inode")
+        other.wait(WAIT)
+        self.hl.release(r.owner)
+        with self.assertRaises(OSError):
+            os.fstat(r.owner.root_fd)
+
+    def test_a_fork_during_release_cannot_keep_the_flock(self):
+        """Review schedule: "`release` sets `owner.released = True` before it unlocks/closes ... I paused
+        exactly between those operations, forked a sleeping child, and terminated the owner before
+        unlock: release_paused=True while_child_alive=Contended after_child_exit=Acquired"."""
+        seams = {
+            "the review's seam, before the unlock": (
+                "real = hl.file_lock.unlock_fd\n"
+                "def seam(fd):\n    paused.set()\n    go.wait(10)\n    return real(fd)\n"
+                "hl.file_lock.unlock_fd = seam\n"),
+            "between unlock and close": (
+                "real = hl.file_lock.unlock_fd\n"
+                "def seam(fd):\n    out = real(fd)\n    paused.set()\n    go.wait(10)\n    return out\n"
+                "hl.file_lock.unlock_fd = seam\n"),
+            "between close and the released flag": (
+                "real = hl.os.close\n"
+                "def seam(fd):\n    real(fd)\n    if fd == r.owner.root_fd:\n        paused.set()\n        go.wait(10)\n"
+                "hl.os.close = seam\n"),
+        }
+        for name, patch in seams.items():
+            with self.subTest(seam=name):
+                root = self.tmp / name.replace(" ", "-")
+                code = ("import os, threading, time\nr = hl.acquire(%r, install_id='i')\n"
+                        "hl.publish(r.owner, 'routine')\npaused, go = threading.Event(), threading.Event()\n%s"
+                        "threading.Thread(target=hl.release, args=(r.owner,), daemon=True).start()\n"
+                        "paused.wait(10)\nprint('paused', os.getpid(), flush=True)\n"
+                        "child = os.fork()\n"
+                        "if child == 0:\n    print('child', os.getpid(), flush=True)\n    time.sleep(30)\n"
+                        "    os._exit(0)\n"
+                        "time.sleep(30)\n" % (str(root), patch))
+                owner = self.run_py(code)
+                self.addCleanup(lambda o=owner: (o.kill(), o.wait(WAIT)))
+                _, pid = read_line(owner.stdout).split()
+                children = []
+                if select.select([owner.stdout], [], [], 1.0)[0]:
+                    line = owner.stdout.readline().split()
+                    if line and line[0] == "child":
+                        children.append(int(line[1]))
+                for child in children:
+                    self.addCleanup(lambda c=child: self.hl._pid_alive(c) and os.kill(c, signal.SIGKILL))
+                os.kill(int(pid), signal.SIGKILL)
+                owner.wait(WAIT)
+                deadline = time.monotonic() + WAIT
+                while time.monotonic() < deadline and self.hl._pid_alive(int(pid)):
+                    time.sleep(0.02)
+                got = self.acquire(root)
+                self.assertIsInstance(got, self.hl.Acquired,
+                                      "a successor acquires at once; no forked child holds the lock (%s)" % children)
+                self.hl.release(got.owner)
+
+    def test_a_child_cannot_inherit_any_module_lock_in_an_unusable_state(self):
+        """Review schedule: "If another thread is in one of the `_GUARD` regions when the fork happens, the
+        vanished thread remains its owner and the child's next `acquire` blocks in `_prepare`:
+        guard_inherited_locked=True child_acquire=TIMEOUT"."""
+        for lock in ("_GUARD", "_ACQUIRING"):
+            with self.subTest(held=lock):
+                root = self.tmp / ("child-" + lock.strip("_").lower())
+                code = ("import os, threading, time, signal\nheld = threading.Event()\n"
+                        "def hold():\n    with hl.%s:\n        held.set()\n        time.sleep(0.5)\n"
+                        "threading.Thread(target=hold, daemon=True).start()\nheld.wait(10)\n"
+                        "child = os.fork()\n"
+                        "if child == 0:\n"
+                        "    signal.alarm(5)\n"
+                        "    r = hl.acquire(%r, install_id='i')\n"
+                        "    hl.publish(r.owner, 'routine')\n"
+                        "    hl.release(r.owner)\n"
+                        "    w = hl.wait(%r, install_id='i', deadline=time.monotonic() + 2)\n"
+                        "    hl.release(w.owner)\n"
+                        "    print('child', type(r).__name__, type(w).__name__, flush=True)\n    os._exit(0)\n"
+                        "os.waitpid(child, 0)\n" % (lock, str(root), str(root)))
+                proc = self.run_py(code)
+                self.addCleanup(lambda p=proc: (p.kill(), p.wait(WAIT)))
+                self.assertEqual(read_line(proc.stdout).split(), ["child", "Acquired", "Acquired"],
+                                 "acquire, publish, release and wait all proceed in the child")
+                proc.wait(WAIT)
+
+    def test_a_case_alias_of_the_home_as_the_root_is_refused_before_anything_is_created(self):
+        home = self.tmp / "Hx"
+        home.mkdir()
+        alias = self.tmp / "hx"
+        if not os.path.samefile(home, alias) if alias.exists() else True:
+            self.skipTest("this filesystem is case-sensitive")
+        with mock.patch.object(self.hl, "_home", lambda: str(home)):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.acquire(alias)
+        self.assertEqual(str(e.exception), "work root contains the lock directory")
+        self.assertEqual(os.listdir(home), [], "no .local/ under the root")
+
+    def test_a_failing_directory_scan_before_the_rename_is_a_lock_error(self):
+        owner = self.owned()
+        real = os.listdir
+
+        def failing(path="."):
+            if os.fspath(path) == owner.directory:
+                raise OSError(5, "I/O error")
+            return real(path)
+        with mock.patch.object(self.hl.os, "listdir", failing):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.hl.publish(owner, "routine")
+        self.assertIn("cannot write the holder record", str(e.exception))
+        self.assertFalse(owner.published)
+        self.assertFalse((self.ldir() / "holder").exists())
 
     def test_every_case_runs_against_the_source_and_the_vendored_copy(self):
         self.assertIsNot(SRC, VENDORED)
