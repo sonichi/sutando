@@ -279,6 +279,33 @@ lines[idx:end] = rows
 open(path, "w").write("\\n".join(lines) + "\\n")
 PYEOF
 }}
+# The composer's first visual row of text goes; the remainder is re-wrapped at WRAP_COLS.
+kill_first_visual_row() {{
+  python3 - "$PANE" {self.WRAP_COLS} "{self.WRAP_STYLE}" <<'PYEOF'
+import re, sys, textwrap
+path, wrap, style = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+lines = open(path).read().split("\\n")
+if lines and lines[-1] == "": lines.pop()
+idx = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].startswith("❯")), None)
+if idx is None:
+    sys.exit(0)
+end = idx + 1
+while wrap > 0 and end < len(lines) and lines[end].strip() and "⏵⏵" not in lines[end] \\
+        and not lines[end].startswith("❯") and not re.match(r"^[\\s─-╿]+$", lines[end]):
+    end += 1
+rest = lines[idx + 1:end]
+if not rest:
+    rows = ["❯ "]
+elif style == "word":
+    rows = textwrap.wrap("❯ " + " ".join(r.strip() for r in rest), width=wrap, subsequent_indent="  ",
+                         break_long_words=True, break_on_hyphens=False) or ["❯ "]
+else:
+    new = "❯ " + "".join(rest)
+    rows = [new[i:i + wrap] for i in range(0, len(new), wrap)]
+lines[idx:end] = rows
+open(path, "w").write("\\n".join(lines) + "\\n")
+PYEOF
+}}
 total_rows() {{ grep -c '' "$PANE" 2>/dev/null || echo 0; }}
 history_size() {{
   local t; t="$(total_rows)"; local h=$(( t - {self.PANE_HEIGHT} ))
@@ -389,6 +416,14 @@ case "$cmd" in
         if [ -f "{self.extra_owner_row_flag}" ]; then
           append_owner_row "$(cat "{self.extra_owner_row_flag}")"; rm -f "{self.extra_owner_row_flag}"
         fi
+      fi
+    elif [ "${{1:-}}" = C-a ]; then
+      # C-a C-k kills the composer's FIRST visual row only (measured live); the rest reflows up.
+      printf 'CLEAR %s\\n' "$*" >> "{self.sendkeys_log}"
+      [ -f "{self.root}/clear-ignored.flag" ] || kill_first_visual_row
+      # Consumed once: the owner types while the clear is under way.
+      if [ -f "{self.root}/owner-types-mid-clear.flag" ]; then
+        rm -f "{self.root}/owner-types-mid-clear.flag"; append_typed " OWNERTEXT"
       fi
     elif [ "${{1:-}}" = -N ] && [ "${{3:-}}" = BSpace ]; then
       printf 'BSPACE %s\\n' "$2" >> "{self.sendkeys_log}"
