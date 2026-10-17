@@ -48,8 +48,8 @@ def test_write_task_publishes_atomically_and_completely():
         assert durable, "a committed queue write must be ackable as durable"
         assert dest.exists(), "task file must be published"
         # No temp sidecar left behind — the tmp+rename must have completed.
-        assert not list(m.TASKS_DIR.glob(f"{tid}.txt.*.tmp"))
-        # The watcher globs task-*.txt; the staged name (.txt.<pid>.<uuid>.tmp) must not match.
+        assert not list(m.TASKS_DIR.glob(f".{tid}.txt.*.tmp"))
+        # The watcher globs task-*.txt; the staged name (.<name>.<pid>.<hex>.tmp) must not match.
         assert list(m.TASKS_DIR.glob("task-*.txt")) == [dest]
         body = dest.read_text()
         assert body.endswith("\n")

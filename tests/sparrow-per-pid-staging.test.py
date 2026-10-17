@@ -57,16 +57,16 @@ class TestSparrowPerPidStaging(unittest.TestCase):
             code, r'_durable_write\(INFLIGHT_FILE,',
             "INFLIGHT_FILE no longer publishes through the durable writer",
         )
+        # _stage_durable stages through the shared publisher, whose name is per call.
+        stage_body = code.split("def _stage_durable(", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("_stage_text(path, text)", stage_body,
+                      "_stage_durable no longer stages through the shared publisher")
+        publisher = (SPARROW_PY.parent / "result_publish.py").read_text()
         self.assertRegex(
-            code,
-            r'tmp = path\.with_name\(f["\']\{path\.name\}\.\{os\.getpid\(\)\}'
-            r'\.\{uuid\.uuid4\(\)\.hex\}\.tmp["\']\)',
-            "_stage_durable must stage per-invocation (PID + uuid), not PID-only",
-        )
-        self.assertNotRegex(
-            code,
-            r'tmp = path\.with_name\(f["\']\{path\.name\}\.\{os\.getpid\(\)\}\.tmp["\']\)',
-            "_stage_durable still uses the thread-unsafe PID-only staging",
+            publisher,
+            r'tmp = target\.with_name\(f["\']\.\{target\.name\}\.\{os\.getpid\(\)\}'
+            r'\.\{secrets\.token_hex\(8\)\}\{STAGED_SUFFIX\}["\']\)',
+            "the publisher must stage per-invocation (PID + random), not PID-only",
         )
         # The ledgers the durable writer serves are read-modify-written from both
         # threads, so each mutation runs under its own lock (like _INFLIGHT_MUTEX).
