@@ -392,13 +392,16 @@ install_claude_personal_hook() {
 # polls up to ~5s for it to actually come up (a `new-session` accepting the
 # command proves tmux liked it, not that the child process is alive). Reads
 # TMUX_SOCKET, SESSION, ENV_ARGS, CWD_ARGS, SURFACE_ARGS, SETTINGS_ARGS,
-# SESSION_ARGS, BOOT_PROMPT. Returns 0 if the session came up live, 1 otherwise
+# SESSION_ARGS, BOOT_PROMPT, and optional CLAUDE_LAUNCH_PREFIX (a wrapper that execs claude).
+# Returns 0 if the session came up live, 1 otherwise
 # (caller decides what that means — abort, retry, or a heal path).
+# With NEW_SESSION_REPORT_ARGS set, the creation's own report lands in LAUNCHED_SESSION_REPORT.
 launch_claude_session() {
-  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
-    claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+  LAUNCHED_SESSION_REPORT="$(tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" \
+    ${NEW_SESSION_REPORT_ARGS[@]+"${NEW_SESSION_REPORT_ARGS[@]}"} ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
+    ${CLAUDE_LAUNCH_PREFIX[@]+"${CLAUDE_LAUNCH_PREFIX[@]}"} claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
-    -- "$BOOT_PROMPT" || true
+    -- "$BOOT_PROMPT")" || true
   for _ in $(seq 1 25); do
     claude_named_session_running && return 0
     sleep 0.2

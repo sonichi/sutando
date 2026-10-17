@@ -300,6 +300,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 - **`task-event-handler-lookup.sh`** — Reads the task-event handler declared in a small JSON config file.
+- **`witness-flags.sh`** — Sourced by both start-cli.sh entry points before any launcher effect: any -witnes*/--witnes* argument, in any case, must be an exact supported flag, so a retired or misspelt one never reaches a production launch.
 
 ## `src/agent/agy/`
 
@@ -316,6 +317,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
 - **`task-notifier.sh`** — External task-file-injection notifier for the Claude Code core, matching Codex/agy's tmux-injection shape — a standby path alongside self-arm via Monitor.
+- **`witness-claude.sh`** — Witness core pane wrapper: execs "$@" with the vault's CLAUDE_CODE_OAUTH_TOKEN in its env (--check: only test for it).
+- **`witness-mode.sh`** — --witness <name>: a throwaway core from THIS checkout on its own socket, session and workspace.
 
 ## `src/agent/codex/cli/`
 

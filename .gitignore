@@ -128,6 +128,7 @@ voice-state.json
 # machine-specific overrides (different workspace location, different vault
 # remote per host) and must never be committed.
 sutando.config.local.json
+.sutando.config.local.json.witness-*
 
 # In-repo workspace (M0 default). Everything user-runtime — tasks/, results/,
 # state/, notes/, build_log.md, etc. — lives under workspace/ and must never

@@ -36,6 +36,7 @@ NEEDED = (
     "src/agent/claude/cli/session-launch.sh",
     "src/agent/codex/cli/start-cli.sh",
     "src/agent/restart-guard.sh",
+    "src/agent/witness-flags.sh",
     "src/agent/task-event-handler-lookup.sh",
     "src/claude_config_dir.sh",
     "src/shutdown.py",
