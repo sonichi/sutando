@@ -1133,7 +1133,7 @@ function initChromeStt() {
   };
 
   recognition.onend = () => {
-    if (connected) {
+    if (connected && !chromeSttSuspended) {
       try { recognition.start(); } catch {}
     }
   };
@@ -1151,12 +1151,29 @@ function showChromeSttInterim(text) {
 }
 
 function startChromeStt() {
-  if (!recognition) return;
+  if (!recognition || chromeSttSuspended) return;
   try { recognition.start(); } catch {}
 }
 
 function stopChromeStt() {
   if (recognition) { try { recognition.stop(); } catch {} }
+}
+
+// Meeting mode: the server streams the transcription model's text, and Chrome STT
+// (fixed to en-US) would show English guesses for other languages until it arrives.
+let chromeSttSuspended = false;
+function setChromeSttSuspended(on) {
+  if (on === chromeSttSuspended) return;
+  chromeSttSuspended = on;
+  if (on) {
+    stopChromeStt();
+    if (currentUserEl && currentUserEl.classList.contains('t-interim') && !serverUserTextReceived) {
+      currentUserEl.remove();
+      currentUserEl = null;
+    }
+  } else if (micAnnounced) {
+    startChromeStt();
+  }
 }
 
 // ─── Transcript ───────────────────────────────────────────
@@ -3812,6 +3829,7 @@ document.addEventListener('keydown', function(e) {
       .then(function(data) {
         var vm = (data && data.mode) || 'active';
         renderModeBadge(vm);
+        setChromeSttSuspended(vm === 'meeting');
       })
       .catch(function() { renderModeBadge('active'); });
   }, 2000);
