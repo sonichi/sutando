@@ -14,12 +14,16 @@ Capture (from a checkout of the reference commit, never from a branch under test
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+# The fixtures carry the codex command; which runner a host has installed is
+# tests/sandbox-runner.test.py's concern, so pin it here.
+os.environ["SUTANDO_SANDBOX_RUNNERS"] = "codex"
 _SRC = REPO / "src" / "remote-gateway-bridge.py"
 FIXTURES = REPO / "tests" / "fixtures" / "gateway-task-envelopes"
 PINNED_LOCAL_TIME = "2026-10-06T17:00:00-07:00 America/Los_Angeles"

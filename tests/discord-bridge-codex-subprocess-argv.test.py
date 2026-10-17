@@ -60,6 +60,8 @@ async def _fake_exec(*argv, **kwargs):
 
 async def _run():
     mod.asyncio.create_subprocess_exec = _fake_exec  # patch the spawn
+    # Pin the runner: which one is installed is the host's business, not this test's.
+    mod.sandbox_runner.select_runner = lambda *a, **k: (mod.sandbox_runner.RUNNERS["codex"], "codex")
     # model=None path
     await mod._run_codex_subprocess("hello prompt", None, 5)
     argv1 = captured["argv"]
