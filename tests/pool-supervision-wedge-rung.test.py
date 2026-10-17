@@ -229,6 +229,87 @@ for label, (text, want) in PANES.items():
     check(f"pane: {label}", classify(text, workspace=ws) if classify else "missing", want)
 
 
+# --- a stale limit banner over a session that is still progressing -----------------
+# After a re-login the CLI can leave its limit banner painted under a live session.
+
+STALE = ("  \u26a0 Usage limit reached \u00b7 continuing automatically at 2am \u00b7 esc to cancel\n"
+         "  \u26a0 /usage-credits to continue now\n")
+RULE = "\u2500" * 40 + "\n"
+
+
+def framed(body):
+    return f"{body}{RULE}\u276f \n{RULE}{STALE}{FOOTER}\n"
+
+
+def frame_obs(text):
+    """What observe() hands the ladder for this capture: its kind and its frame id."""
+    return obs(classify(text, workspace=ws), sup.frame_id(text))
+
+
+def turn_done(i):
+    return framed(f"\u25cf Sent a cross-session message ({i}).\n"
+                  f"\u273b Worked for {i + 2}s \u00b7 done 2:{10 + i:02d} PM\n")
+
+
+def thinking(i):
+    return framed(f"\u25cf Sent a cross-session message.\n"
+                  f"\u2733 Thinking\u2026 ({i}s \u00b7 esc to interrupt)\n")
+
+
+check("a live turn under a stale banner reads as working", classify(thinking(3), workspace=ws), WORK)
+check("an idle seat under a stale banner reads as a wait", classify(turn_done(0), workspace=ws), GATE)
+got, _ = run([frame_obs(thinking(i)) for i in range(6)])
+check("a live turn under a stale banner is no gate: no card", got, [N] * 6)
+got, _ = run([frame_obs(turn_done(i)) for i in range(6)])
+check("turns finishing under a stale banner are progress: no card", got, [N] * 6)
+got, _ = run([frame_obs(turn_done(0))] * 4)
+check("control: a banner on a frozen screen, work owed, is carded", got, [N, N, HUMAN, N])
+got, _ = run([obs(GATE, "r:n", work=False)] * 4)
+check("...and with no work owed it is not", got, [N] * 4)
+got, _ = run([frame_obs(framed(f"\u25cf Paused.\n\u273b Worked for {n}s \u00b7 done 2:10 PM\n"))
+              for n in range(2, 6)])
+check("a frozen screen whose only change is a clock is not progress", got, [N, N, HUMAN, N])
+got, _ = run([frame_obs(turn_done(0))] * 2 + [frame_obs(turn_done(1))] * 4)
+check("a move clears the sustain, which starts over once the frame settles",
+      got, [N, N, N, N, N, HUMAN])
+got, _ = run([obs(WORK, "turn:t")] + [obs(GATE, "dialog:d")] * 3)
+check("entering a gate changes the frame, which is not progress under it", got, [N, N, N, HUMAN])
+got, _ = run([obs(LIMIT, "f1")] * 3)
+check("a bare raw id carries no progress evidence", got, [N, N, HUMAN])
+got, _ = run([obs(LIMIT, "r1:n1"), obs(LIMIT, "r1:n1"), obs(LIMIT, None)])
+check("an unread frame id is no evidence of progress", got, [N, N, HUMAN])
+
+# A worker genuinely held by the limit: idle prompt, the banner, no turn since, deliveries
+# piling up. Only the footer's counters change, and they are status, not work.
+
+
+def held(n_tasks, monitors):
+    return (f"● Picked up the next delivery.\n✻ Worked for 4m 12s · done 1:36 PM\n"
+            f"{RULE}❯ \n{RULE}{STALE}  ⏵⏵ bypass permissions on · {n_tasks} tasks"
+            f" · {monitors} monitor · ← for agents\n")
+
+
+HELD = [held(23, 1), held(24, 1), held(24, 2), held(25, 2)]
+check("a held worker under the banner reads as a wait", classify(HELD[0], workspace=ws), GATE)
+got, _ = run([frame_obs(f) for f in HELD])
+check("a held worker whose footer counters tick is still carded", got, [N, N, HUMAN, N])
+carded = ps.SupervisionState(last_sample_at=1000.0, workers={"w": ps.WorkerEvidence(
+    wedge_first_detected_at=400.0, wedge_consecutive=26, wedge_escalated=True,
+    wedge_kind="human", last_pane_id="064e072fcb5c")})
+st, out = carded, []
+for i, f in enumerate(HELD):
+    st, d = ps.evaluate(st, {"w": frame_obs(f)}, 1095.0 + 95 * i)
+    out.append(d["w"])
+check("an episode already carded under a bare id stays carded and asks no more",
+      (out, st.workers["w"].wedge_kind, st.workers["w"].wedge_escalated), ([N] * 4, "human", True))
+
+REFUSED = (f"\u276f check the inbox\n  \u23bf  You've hit your session limit \u00b7 resets 2am\n"
+           f"\u273b Worked for 0s\n\u276f \n{FOOTER}\n")
+for label, text in (("a refused limit turn", REFUSED), ("the limit menu", PANES["limit menu"][0]),
+                    ("a permission dialog", PANES["permission"][0])):
+    got, _ = run([frame_obs(text)] * 4)
+    check(f"control: {label} on a frozen screen, work owed, is carded", got, [N, N, HUMAN, N])
+
 class Done:
     def __init__(self, rc=0, out="", err=""):
         self.returncode, self.stdout, self.stderr = rc, out, err

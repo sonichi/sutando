@@ -23,7 +23,7 @@ import activity_rows
 import task_queue
 from workspace_default import status_path
 
-_USAGE = frozenset({"turn-rejected", "session-limit", "fable-limit-unfocused"})
+_USAGE = frozenset({"turn-rejected", "session-limit", "usage-limit", "fable-limit-unfocused"})
 _SIGN_IN = frozenset({"login"})
 
 
