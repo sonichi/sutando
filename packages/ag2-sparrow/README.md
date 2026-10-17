@@ -590,7 +590,7 @@ replaces or removes it. `--cron-dir` names another scheduled-task directory and
 the tasks with `ag2-sparrow-hatch uninstall --keepalive` (tasks install did not
 write are refused, and the log is kept), or delete the file by hand.
 
-### Served wording
+### Served wording and self-upgrade
 
 The hook prompt is a short stub: a woken worker runs `ag2-sparrow-hatch
 wake-context` and follows what it prints, with the payload's `worker_note`.
@@ -609,6 +609,25 @@ The served tunables (`keepawake_interval_s`, `stuck_task_age_s`,
 `hook_silent_age_s`, `heartbeat_cadence_s`) are clamped to bounds the package
 sets. The fetch has no transport in this package yet, so the built-in text and
 defaults apply until one is added.
+
+When the served `target_version` is above the installed version, the keepawake
+run starts one detached upgrade per target and logs its decision on its line
+(`upgrade=off`, `current`, `no-hashes`, `0.6.0:started`, ...). The upgrade runs under
+`STATE_DIR/upgrade.lock`, which keepawake also holds while it checks and restarts
+Sparrow, and re-reads the installed version first. It copies the installed files
+to `STATE_DIR/rollback/<version>/`, stops Sparrow (SIGTERM, then waits), runs `pip
+install --no-deps --only-binary=:all: --require-hashes` pinned to every sha256 in
+`target_sha256`, requires `pip check` to run and report no new problem naming
+ag2-sparrow, re-runs `install --no-start` (which never starts the service), starts
+Sparrow, and checks it imports the target and reconnects. A reply posted while
+Sparrow is stopped waits in the results dir and is delivered once it starts. A
+failure restores the copied files, with no index and no network; the outcome is
+`rolled-back` only when the previous version runs connected again, else
+`restore-failed`, and the health row reports `upgrade-failed` either way. An
+attempt still marked started after 30 minutes counts as crashed and is restored
+first. Editable and URL installs are never upgraded. A changed hook definition is
+not applied: the hook wakes the agent once with install's `REQUIRED hook:` line.
+`AUTO_UPGRADE=0` in the install config turns self-upgrade off; install keeps it.
 
 ### Not from the single-file downloads
 
