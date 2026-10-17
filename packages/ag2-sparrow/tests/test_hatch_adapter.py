@@ -2311,14 +2311,15 @@ class StartSparrow(Base):
 
 
 HEARTBEAT = """
-import json
+import json, sys
 from unittest import mock
 from ag2_sparrow import remote_gateway_bridge as m
+inflight = set(sys.argv[1:])
 with mock.patch.object(m, "_req") as req:
-    m._post_heartbeat(set(), force=True)
+    m._post_heartbeat(inflight, force=True)
     if m._HEALTH_COMMAND._thread is not None:
         m._HEALTH_COMMAND._thread.join(30)
-    sent = m._post_heartbeat(set(), force=True)
+    sent = m._post_heartbeat(inflight, force=True)
 print(json.dumps(req.call_args.args[2] if sent else None))
 """
 
@@ -2433,7 +2434,18 @@ class HealthCommand(Base):
         self.assertFalse(hc.HealthCommand("", 60, logs.append))
         self.assertIsNone(hc.HealthCommand("  ", 60, logs.append).row())
 
-    def heartbeat(self, health_command):
+    def test_an_unknown_motion_is_read_from_whether_an_item_is_in_flight(self):
+        unknown = {**self.ROW, "motion": "unknown"}
+        self.assertEqual(hc.with_motion(unknown, True), {**unknown, "motion": "moving"})
+        self.assertEqual(hc.with_motion(unknown, False), {**unknown, "motion": "idle"})
+        self.assertEqual(unknown["motion"], "unknown", "the cached row is not changed")
+        for motion in ("idle", "moving"):
+            row = {**self.ROW, "motion": motion}
+            self.assertIs(hc.with_motion(row, True), row, "a reported motion stands")
+            self.assertIs(hc.with_motion(row, False), row)
+        self.assertIsNone(hc.with_motion(None, True), "no row stays no row")
+
+    def heartbeat(self, health_command, *inflight):
         env = py_env(self.home)
         env.update({"AGENT_CONNECT_TASK_DIR": str(self.tasks),
                     "AGENT_CONNECT_RESULT_DIR": str(self.results),
@@ -2441,7 +2453,7 @@ class HealthCommand(Base):
                     "REMOTE_TASK_URL": "https://gw.example/relay",
                     "REMOTE_TASK_TOKEN": "fake-relay-token-0123456789abcdef",
                     "REMOTE_HEALTH_COMMAND": health_command})
-        r = subprocess.run([sys.executable, "-c", HEARTBEAT], env=env, capture_output=True,
+        r = subprocess.run([sys.executable, "-c", HEARTBEAT, *inflight], env=env, capture_output=True,
                            text=True, cwd=str(self.home), timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1])
@@ -2459,6 +2471,23 @@ class HealthCommand(Base):
                          ("abnormal", "keepawake-not-running"))
         self.assertIn("worker_health.v1", body["capabilities"])
         self.assertNotIn("status", body, "the injected row does not drive presence")
+
+    def test_the_hatch_row_is_moving_while_an_item_is_in_flight_and_idle_after(self):
+        command = f"{sys.executable} -m ag2_sparrow.adapters.hatch.cli keepalive health"
+        crons = self.home / "workspace" / "cron.d" / "minutely"
+        crons.mkdir(parents=True)
+        (crons / keepalive.task_file()).write_text(keepalive.TASK_MARKER)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        (self.home / "keepalive-probe.log").write_text(
+            f"{stamp} keepawake listener=up restarted=0\n")
+        during = self.heartbeat(command, "task-1700000000-abc")["health"]
+        after = self.heartbeat(command)["health"]
+        self.assertEqual((during["motion"], during["condition"]), ("moving", "healthy"))
+        self.assertEqual((after["motion"], after["condition"]), ("idle", "healthy"))
+
+    def test_a_motion_the_command_prints_is_sent_as_printed(self):
+        row = {**self.ROW, "motion": "idle"}
+        self.assertEqual(self.heartbeat(self.stub(json.dumps(row)), "task-1")["health"], row)
 
     def test_the_command_never_sees_the_relay_token(self):
         row = {"alive": True, "motion": "idle", "condition": "healthy", "reason": None,

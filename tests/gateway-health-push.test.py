@@ -149,9 +149,9 @@ class WorkersPush(Base):
 
 
 class Heartbeat(Base):
-    def beat(self, s, force=False):
+    def beat(self, s, force=False, inflight=()):
         with mock.patch.object(rgb, "_health_snapshot", return_value=s), mock.patch.object(rgb, "_req") as req:
-            sent = rgb._post_heartbeat(set(), force=force)
+            sent = rgb._post_heartbeat(set(inflight), force=force)
         return req.call_args.args[2] if sent else None
 
     def test_the_core_row_and_capability_ride_the_heartbeat(self):
@@ -165,6 +165,10 @@ class Heartbeat(Base):
         self.assertIsNone(self.beat(snap(core=agent("core", "core"))))
         sick = snap(core=agent("core", "core", condition="abnormal", reason="needs-login"))
         self.assertEqual(self.beat(sick)["health"]["reason"], "needs-login")
+
+    def test_the_snapshot_row_keeps_its_own_motion_whatever_is_in_flight(self):
+        body = self.beat(snap(core=agent("core", "core", motion="unknown")), inflight={"task-1"})
+        self.assertEqual(body["health"]["motion"], "unknown")
 
     def test_without_health_the_heartbeat_is_unchanged(self):
         body = self.beat(None, force=True)
