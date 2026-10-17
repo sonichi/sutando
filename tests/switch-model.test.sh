@@ -148,4 +148,16 @@ rc=$(run 'fable[1m]'); [ "$rc" = 0 ] && ok "42 fable[1m] is matched against the 
 bad=""; for m in 'sonnet[2m]' 'default[1m]' 'opusx' 'sonnet[1m]; rm -rf /' 'gpt[1m]'; do rc=$(run "$m"); [ "$rc" = 2 ] && ! grep -q send-keys "$TMUX_LOG" || bad="$bad $m:$rc"; done
 [ -z "$bad" ] && ok "43 garbage around an alias (sonnet[2m], default[1m], opusx, injected suffix, gpt[1m]) is refused (rc=2), nothing sent" || fail "43" "$bad"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 43 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- --offline: the core is down, so its settings carry the model to the next launch
+printf '#!/bin/bash\n[ -n "${PGREP_CORE:-}" ] && exit 0; exit 1\n' > "$T/bin/pgrep"; chmod +x "$T/bin/pgrep"
+printf '{"permissions":{"allow":["Bash"]}}\n' > "$T/cfg/settings.json"; rm -f "$T/state/model-switch.json"
+rc=$(run sonnet --offline); R=$(python3 -c "import json;s=json.load(open('$T/cfg/settings.json'));r=json.load(open('$T/state/model-switch.json'));print(s['model'],s['permissions']['allow'][0],r['model'],r['accepted'])" 2>/dev/null)
+[ "$rc" = 0 ] && [ "$R" = "sonnet Bash sonnet False" ] && ! grep -q send-keys "$TMUX_LOG" && grep -q "next launch" "$T/out" \
+  && ok "44 --offline with no core writes the model into settings (other keys kept) and records it, nothing typed" || fail "44" "rc=$rc R=$R $(cat "$T/err")"
+printf '{"model":"opus"}\n' > "$T/cfg/settings.json"
+rc=$(PGREP_CORE=1 run haiku --offline); R=$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])")
+[ "$rc" = 9 ] && [ "$R" = "opus" ] && ok "45 --offline is refused while a core runs (rc=9), settings untouched" || fail "45" "rc=$rc R=$R"
+printf 'not json' > "$T/cfg/settings.json"; rc=$(run haiku --offline)
+[ "$rc" = 1 ] && [ "$(cat "$T/cfg/settings.json")" = "not json" ] && ok "46 --offline never overwrites settings it cannot read" || fail "46" "rc=$rc"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 46 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

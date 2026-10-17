@@ -329,6 +329,8 @@ _BASE_TO_STATE = {
     # "unknown" = runtime-health saw a live session but a stale/absent core-status
     # ("running" that never advanced) → wedged. That IS the supervisor's `hung`.
     "unknown": ("hung", "core alive but stalled (status stale, no recognized prompt)"),
+    # Held by the launcher for a provider limit: visible, resumes by itself, never a restart.
+    "paused": ("blocked-known", "core paused for a provider limit; it resumes by itself"),
 }
 
 
@@ -350,6 +352,8 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     """
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
+    if base_health == "paused":
+        return "blocked-known", _BASE_TO_STATE["paused"][1], None, None
     # An ACTIVE interactive gate in the pane is the finest signal — it distinguishes
     # "sitting at a prompt waiting for input" from the coarse health (e.g. the live
     # /login MENU, which runtime-health's needs_login markers don't match). Check it

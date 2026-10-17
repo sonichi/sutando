@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-09-18"
+   "last_verified": "2026-10-17"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census \u2014 Discord / AG2 Space / Slack",
@@ -145,7 +145,7 @@
    ],
    "status": "draft",
    "canonical_for": "the single authoritative severity-tagged core-health verdict and the report-vs-restart severity gate",
-   "last_verified": "2026-09-28"
+   "last_verified": "2026-10-17"
   },
   "docs/health-snapshot.md": {
    "title": "Health snapshot: GET /health",
