@@ -359,6 +359,90 @@ class TestGhostComposerComposeState(unittest.TestCase):
         self.assertNotEqual(st, "blocked-human")
 
 
+
+# The core reading a test file mid-turn: its tool output quotes a boxed selection
+# dialog, caret and key hints included, above the live spinner and empty composer.
+_TOOL_OUTPUT_DIALOG = (
+    "⏺ Read(tests/core-input-watch.test.py)\n"
+    "  ⎿  ╭───────────────────────────────────────────────────╮\n"
+    "     │ Overwrite the existing config file?               │\n"
+    "     │ ❯ 1. Yes                                          │\n"
+    "     │   2. No                                           │\n"
+    "     │ Enter to select · ↑/↓ to navigate · Esc to cancel │\n"
+    "     ╰───────────────────────────────────────────────────╯\n")
+_SPINNER = "✻ Perambulating… (1m 46s · ↓ 2.1k tokens · esc to interrupt)\n"
+_LIVE_SELECTION = ("  Overwrite the existing config file?\n"
+                   "  ❯ 1. Yes\n    2. No\n"
+                   "  Enter to select · ↑/↓ to navigate · Esc to cancel")
+
+
+class TestToolOutputIsNotAGate(unittest.TestCase):
+    """A dialog quoted in tool output is transcript; only rows below the turn's
+    spinner or completion line are the live input region."""
+
+    def test_working_pane_quoting_a_dialog_is_running_not_blocked_human(self):
+        pane = _TOOL_OUTPUT_DIALOG + _SPINNER + _IDLE_FOOTER
+        self.assertIsNone(classify(pane))
+        st, _d, prompt, kind = compose_state(pane, "working", True)
+        self.assertEqual((st, kind, prompt), ("running", None, None))
+
+    def test_finished_turn_quoting_a_dialog_is_idle_ready(self):
+        pane = _TOOL_OUTPUT_DIALOG + "✻ Worked for 2m 14s · done 12:55 PM\n" + _IDLE_FOOTER
+        self.assertIsNone(classify(pane))
+        self.assertEqual(compose_state(pane, "idle", True)[0], "idle-ready")
+
+    def test_a_real_selection_below_quoted_output_still_flags(self):
+        pane = _TOOL_OUTPUT_DIALOG + _SPINNER + _LIVE_SELECTION
+        kind, excerpt = classify(pane)
+        self.assertEqual(kind, "selection")
+        self.assertNotIn("Read(", excerpt)
+        self.assertEqual(compose_state(pane, "working", True)[0], "blocked-human")
+
+    def test_a_real_permission_prompt_mid_turn_still_flags(self):
+        pane = (_TOOL_OUTPUT_DIALOG + _SPINNER + "⏺ Bash(rm -rf build)\n"
+                "  Do you want to proceed?\n  Allow this action\n  Esc to cancel")
+        self.assertEqual(compose_state(pane, "working", True)[:4:3], ("blocked-human", "permission"))
+
+# Live Claude Code v2.1.296 shapes: the spinner row carries no "esc to interrupt";
+# the busy footer below it does.
+_LIVE_SPINNER = "✳ Moonwalking… (15s · ↓ 237 tokens)\n"
+_BUSY_FOOTER = "  ⏵⏵ bypass permissions on · 1 monitor · esc to interrupt · ← for agents\n"
+
+
+class TestTheBusyFooterIsNotTheTurnRow(unittest.TestCase):
+    """The live region is cut at the spinner, never at the footer: a dialog drawn
+    between them is live, and tool output above the spinner is transcript."""
+
+    LOGIN_PANE = (
+        "───────────────────────────────── sutando-core ─\n"
+        "Browser didn't open? Use the url below to sign in:\n"
+        "https://claude.ai/oauth/authorize?code=true&client_id=abc&scope=user%3Aprofile\n"
+        "Paste code here if prompted > \n"
+        "Esc to cancel\n"
+        "  ⏵⏵ bypass permissions on · 1 monitor · esc to interrupt · ← for agents\n"
+        "[sutando-c0:2.1.261* 2:monitor                       \"✳ sutando-core\" 00:55 06-Sep-26\n")
+    PERMISSION_UNDER_SPINNER = (
+        _TOOL_OUTPUT_DIALOG + _LIVE_SPINNER + "⏺ Bash(rm -rf build)\n"
+        "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n"
+        "  Esc to cancel · Tab to amend\n" + _BUSY_FOOTER)
+
+    def verdicts(self, pane):
+        v = _mod._pg_classify_pane(pane, _mod.CLAUDE)
+        return (classify(pane) or (None,))[0], compose_state(pane, "working", True)[0], f"{v.state}:{v.reason}"
+
+    def test_login_dialog_above_the_busy_footer_is_login(self):
+        self.assertEqual(self.verdicts(self.LOGIN_PANE), ("login", "blocked-human", "busy:login"))
+
+    def test_permission_dialog_between_spinner_and_busy_footer_is_blocked_human(self):
+        kind, state, verdict = self.verdicts(self.PERMISSION_UNDER_SPINNER)
+        self.assertIn(kind, ("selection", "permission"))
+        self.assertEqual((state, verdict), ("blocked-human", "busy:selection"))
+
+    def test_quoted_dialog_above_the_live_spinner_is_running(self):
+        pane = _TOOL_OUTPUT_DIALOG + _LIVE_SPINNER + _BUSY_FOOTER
+        self.assertEqual(self.verdicts(pane), (None, "running", "busy:working"))
+
+
 class TestUnobservedProbeIsNotHung(unittest.TestCase):
     """An unobserved process probe (tmux refused the client, binary missing) must
     hold, never become the RECOVER-facing `hung`; only a SEEN session with stale
