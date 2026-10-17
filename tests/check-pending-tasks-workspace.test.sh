@@ -173,7 +173,7 @@ mkdir -p "$REJ/scripts" "$REJ/src" "$REJ/workspace/tasks" "$REJ/workspace/result
 printf '#!/bin/bash\n[ "$1" = "workspace" ] && { echo "%s/workspace"; exit 0; }\nexit 1\n' "$REJ" \
   > "$REJ/scripts/sutando-config.sh"
 chmod +x "$REJ/scripts/sutando-config.sh"
-cp "$HOOK" "$REJ/src/"
+cp "$HOOK" "$REPO/src/session_identity.sh" "$REJ/src/"
 cp "$REPO/scripts/git-binary.sh" "$REJ/scripts/"
 printf 'id: probe\ntask: rejected-interpreter\n' > "$REJ/workspace/tasks/$PROBE"
 # A recording shim: if the hook falls back to PATH python this fires.
@@ -439,7 +439,7 @@ rm -rf "$GUEST_REPO"
 # 9. A PACKAGED BUNDLE has no .git at all; identity does not depend on one.
 BUNDLE="$(mktemp -d)"
 mkdir -p "$BUNDLE/src" "$BUNDLE/scripts" "$BUNDLE/workspace/tasks" "$BUNDLE/workspace/results"
-cp "$REPO/src/check-pending-tasks.sh" "$BUNDLE/src/"
+cp "$REPO/src/check-pending-tasks.sh" "$REPO/src/session_identity.sh" "$BUNDLE/src/"
 printf '#!/bin/bash\ncase "$1" in\n  workspace) echo "%s/workspace"; exit 0 ;;\n  python-bin) echo "%s"; exit 0 ;;\nesac\nexit 1\n' \
   "$BUNDLE" "$TEST_PY" > "$BUNDLE/scripts/sutando-config.sh"
 chmod +x "$BUNDLE/scripts/sutando-config.sh"

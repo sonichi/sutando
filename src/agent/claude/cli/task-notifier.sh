@@ -33,6 +33,9 @@ PARTIAL_DIR="$WORKSPACE_DIR/state/task-notifier-partial-paste"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 PANE_GATE_PY="$REPO/src/delivery/pane_gate.py"
+TURN_FAILURE_PY="$REPO/src/delivery/turn_failure.py"
+# How often the result wait asks whether an API-error turn lost the submitted prompt.
+RETRY_CHECK_SEC="${SUTANDO_NOTIFIER_RETRY_CHECK_SEC:-5}"
 # A long single-line prompt wraps past the pane's own height, scrolling its
 # leading marker into scrollback -- capture-pane -p alone never sees it.
 CAPTURE_SCROLLBACK_LINES="${SUTANDO_NOTIFIER_CAPTURE_SCROLLBACK_LINES:-2000}"
@@ -190,6 +193,24 @@ has_result() {
   local filename="$1"
   "$NOTIFIER_PY" "$DISPATCH_PY" has-result "$RESULTS_DIR" "$filename" || return 1
   "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" || true
+  "$NOTIFIER_PY" "$TURN_FAILURE_PY" retry-clear --state "$WORKSPACE_DIR/state" "$filename" 2>/dev/null || true
+  return 0
+}
+
+# Did an API-error turn consume this submitted prompt? Policy and guards: delivery/turn_failure.py.
+# On yes the marker is cleared, so the next pick of the still-queued task types it again.
+release_lost_submit() {
+  local filename="$1" reason rc=0 held=()
+  [ "${SUTANDO_INBOX_KIND:-}" = "deliveries" ] || held=(--deliveries-dir "$DELIVERIES_DIR")
+  reason="$("$NOTIFIER_PY" "$TURN_FAILURE_PY" retry-due --state "$WORKSPACE_DIR/state" \
+    --inflight-dir "$INFLIGHT_DIR" --results-dir "$RESULTS_DIR" --payload "$(task_payload "$filename")" \
+    ${held[@]+"${held[@]}"} "$filename" 2>/dev/null)" || rc=$?
+  # 3: the attempt cap was reached just now; say so once and keep waiting.
+  [ "$rc" -eq 3 ] && log_notifier "$reason"
+  [ "$rc" -eq 0 ] || return 1
+  "$NOTIFIER_PY" "$TURN_FAILURE_PY" retry-note --state "$WORKSPACE_DIR/state" "$filename" >/dev/null 2>&1 || return 1
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" || return 1
+  log_notifier "re-delivering $filename: $reason"
   return 0
 }
 
@@ -773,7 +794,7 @@ submit_task() {
 }
 
 submit_task_grown() {
-  local filename="$1" prompt started raw incarnation live_rc
+  local filename="$1" prompt started raw incarnation live_rc checked
   case "$filename" in
     ""|*/*|*..*) return 0 ;;
   esac
@@ -823,11 +844,16 @@ submit_task_grown() {
   fi
   restore_window
   started="$(date +%s)"
+  checked="$started"
   while ! has_result "$filename"; do
     tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null || return 0
     if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
       log_notifier "timed out waiting for result: $filename"
       return 0
+    fi
+    if [ $(( $(date +%s) - checked )) -ge "$RETRY_CHECK_SEC" ]; then
+      checked="$(date +%s)"
+      release_lost_submit "$filename" && return 0
     fi
     sleep "$POLL_INTERVAL"
   done
