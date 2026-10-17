@@ -158,9 +158,10 @@ def _host() -> str:
 
 
 def lock_dir(root) -> str:
-    """The lock directory of a work root: a function of its realpath and the effective uid only."""
-    real = os.path.realpath(os.fspath(root))
-    digest = hashlib.sha256(real.encode("utf-8")).hexdigest()[:16]
+    """The lock directory of an existing work root: keyed by the root directory's (st_dev, st_ino),
+    so every spelling of one directory shares it; the effective uid's home places it."""
+    st = os.stat(os.fspath(root))
+    digest = hashlib.sha256(("%d:%d" % (st.st_dev, st.st_ino)).encode("ascii")).hexdigest()[:16]
     return os.path.join(_home(), ".local", "state", "ag2-sparrow", "locks", digest)
 
 
@@ -316,9 +317,16 @@ def _read_prior(directory: str) -> Prior:
 
 
 def read_holder(work_root) -> Prior:
-    """Missing, Valid or Invalid. Never raises on a supported platform: an unreadable record is Invalid."""
+    """Missing, Valid or Invalid. Never raises on a supported platform: an unreadable record is Invalid;
+    a root that does not exist has no record."""
     try:
-        return _read_prior(lock_dir(work_root))
+        directory = lock_dir(work_root)
+    except FileNotFoundError:
+        return Missing()
+    except OSError as e:
+        return Invalid("unreadable: %s" % e, b"")
+    try:
+        return _read_prior(directory)
     except OSError as e:
         return Invalid("unreadable: %s" % e, b"")
 
@@ -375,6 +383,7 @@ def _prepare(work_root):
     os.makedirs(os.fspath(work_root), exist_ok=True)
     root = os.path.realpath(os.fspath(work_root))
     directory = lock_dir(root)
+    _register_fork_close()
     if directory == root or directory.startswith(root.rstrip(os.sep) + os.sep):
         raise LockError("work root contains the lock directory")
     os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -383,12 +392,32 @@ def _prepare(work_root):
     return root, directory
 
 
-def _root_unchanged(work_root, root: str) -> bool:
+def _root_unchanged(work_root, root: str, directory: str) -> bool:
     try:
         st = os.lstat(os.fspath(work_root))
+        same_key = lock_dir(root) == directory
     except OSError:
         return False
-    return stat.S_ISDIR(st.st_mode) and os.path.realpath(os.fspath(work_root)) == root
+    return stat.S_ISDIR(st.st_mode) and os.path.realpath(os.fspath(work_root)) == root and same_key
+
+
+_FORK_HOOK = []
+
+
+def _register_fork_close() -> None:
+    """Once per process: a forked child closes its copy of the lock fd before running any code."""
+    if not _FORK_HOOK and hasattr(os, "register_at_fork"):
+        os.register_at_fork(after_in_child=_close_in_child)
+        _FORK_HOOK.append(True)
+
+
+def _close_in_child() -> None:
+    owner = _OWNER
+    if owner is not None and not owner.released:
+        try:
+            os.close(owner.fd)
+        except OSError:
+            pass
 
 
 def _attempt(work_root, root: str, directory: str, install_id_: str):
@@ -403,7 +432,7 @@ def _attempt(work_root, root: str, directory: str, install_id_: str):
         locked = True
         if not same_file(fd, path):
             raise LockError("replaced")
-        if not _root_unchanged(work_root, root):
+        if not _root_unchanged(work_root, root, directory):
             raise LockError("root changed")
         try:
             prior = _read_prior(directory)
@@ -591,7 +620,11 @@ def status(work_root) -> dict:
     """The record, its holder's liveness, live and stale waiters, and any legacy pidfile. Read-only."""
     _platform()
     root = os.path.realpath(os.fspath(work_root))
-    directory = lock_dir(root)
+    try:
+        directory = lock_dir(root)
+    except FileNotFoundError:
+        return {"lock_dir": None, "record": {"kind": "missing"}, "holder_lineage": None, "waiters": [],
+                "stale_waiters": [], "legacy": None, "warnings": []}
     out = {"lock_dir": directory, "record": None, "holder_lineage": None, "waiters": [], "stale_waiters": [],
            "legacy": None, "warnings": []}
     try:

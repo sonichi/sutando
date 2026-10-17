@@ -52,7 +52,11 @@ class FirstActContract:
 
     def _fa_root(self, name="work"):
         root = os.path.join(self._fa_tmp, name)
-        self.addCleanup(shutil.rmtree, self.module.lock_dir(root), True)
+
+        def drop():
+            if os.path.isdir(root):
+                shutil.rmtree(self.module.lock_dir(root), True)
+        self.addCleanup(drop)
         return root
 
     def _fa_stop(self):

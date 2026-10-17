@@ -123,7 +123,17 @@ class HolderLockTest(unittest.TestCase):
         return rec
 
     def ldir(self, root=None):
-        return Path(self.hl.lock_dir(str(root or self.root)))
+        """The lock dir of `root`, which is created if absent (the key is the directory's inode)."""
+        root = Path(root or self.root)
+        root.mkdir(parents=True, exist_ok=True)
+        return Path(self.hl.lock_dir(str(root)))
+
+    def forget_lock_dir(self, root):
+        """At cleanup, remove the real-home lock dir of `root` if the root still exists."""
+        def drop():
+            if os.path.isdir(root):
+                shutil.rmtree(self.hl.lock_dir(root), True)
+        self.addCleanup(drop)
 
     def put(self, rec, root=None):
         d = self.ldir(root)
@@ -594,11 +604,59 @@ class HolderLockTest(unittest.TestCase):
         self.addCleanup(os.chdir, cwd)
         spellings = ["./w", "x/../w", "w/"]
         self.assertFalse(os.path.exists("w"))
-        self.assertEqual(len({self.hl.lock_dir(os.path.realpath(s)) for s in spellings}), 1)
-        self.hl.release(self.owned("./w"))
+        self.hl.release(self.owned("x/../w"))
+        self.assertEqual(len({self.hl.lock_dir(s) for s in spellings}), 1)
         with self.flock_elsewhere("./w"):
             for s in spellings[1:]:
                 self.assertIsInstance(self.acquire(s), self.hl.Contended, s)
+
+    def test_case_aliases_of_one_root_on_a_case_insensitive_filesystem_share_one_key(self):
+        upper = self.tmp / "Work"
+        upper.mkdir()
+        lower = self.tmp / "work"
+        if not lower.exists() or not os.path.samefile(upper, lower):
+            self.skipTest("this filesystem is case-sensitive")
+        self.assertEqual(self.hl.lock_dir(str(upper)), self.hl.lock_dir(str(lower)))
+        self.assertNotEqual(self.hl.lock_dir(str(upper)), self.hl.lock_dir(str(self.tmp)))
+        with self.flock_elsewhere(upper):
+            self.assertIsInstance(self.acquire(lower), self.hl.Contended)
+        owner = self.owned(upper)
+        self.hl.publish(owner, "routine")
+        self.assertIsInstance(self.hl.read_holder(str(lower)), self.hl.Valid)
+
+    def test_a_forked_child_holds_no_lock_fd_and_the_lock_is_free_once_the_owner_dies(self):
+        code = ("import os, sys, time\n"
+                "def lockfds(lock):\n"
+                "    n = 0\n"
+                "    for name in os.listdir('/dev/fd'):\n"
+                "        try:\n"
+                "            st = os.fstat(int(name))\n"
+                "        except (OSError, ValueError):\n"
+                "            continue\n"
+                "        n += (st.st_dev, st.st_ino) == (lock.st_dev, lock.st_ino)\n"
+                "    return n\n"
+                "r = hl.acquire(%r, install_id=hl.install_id())\nhl.publish(r.owner, 'routine')\n"
+                "lock = os.fstat(r.owner.fd)\nassert lockfds(lock) == 1\nchild = os.fork()\n"
+                "if child == 0:\n"
+                "    print('child', os.getpid(), 'lockfds', lockfds(lock), flush=True)\n"
+                "    time.sleep(30)\n    os._exit(0)\n"
+                "print('owner', os.getpid(), flush=True)\ntime.sleep(30)\n" % str(self.root))
+        owner = self.run_py(code)
+        self.addCleanup(lambda: (owner.kill(), owner.wait(WAIT)))
+        lines = sorted(read_line(owner.stdout).split() for _ in range(2))
+        child_line, owner_line = lines[0], lines[1]
+        child_pid, owner_pid = int(child_line[1]), int(owner_line[1])
+        self.addCleanup(lambda: self.hl._pid_alive(child_pid) and os.kill(child_pid, signal.SIGKILL))
+        self.assertEqual(child_line[3], "0", "the forked child holds no lock descriptor")
+        os.kill(owner_pid, signal.SIGKILL)
+        owner.wait(WAIT)
+        deadline = time.monotonic() + WAIT
+        while time.monotonic() < deadline and self.hl._pid_alive(owner_pid):
+            time.sleep(0.02)
+        self.assertTrue(self.hl._pid_alive(child_pid), "the child outlives the owner")
+        r = self.acquire()
+        self.assertIsInstance(r, self.hl.Acquired, "the lock is free once the owner dies")
+        self.assertEqual(r.prior.record["pid"], owner_pid)
 
     def test_a_root_swapped_for_a_symlink_between_mkdir_and_flock_is_refused(self):
         real = self.hl.file_lock.try_lock_fd
@@ -756,6 +814,7 @@ class HolderLockTest(unittest.TestCase):
     def test_lock_dir_is_a_function_of_realpath_and_uid_only_and_ignores_every_env_var(self):
         self.real_home()
         real_home = pwd.getpwuid(os.geteuid()).pw_dir
+        self.root.mkdir()
         base = self.hl.lock_dir(str(self.root))
         self.assertTrue(base.startswith(os.path.join(real_home, ".local", "state", "ag2-sparrow", "locks") + os.sep))
         env = {"HOME": "/nonexistent", "XDG_STATE_HOME": "/x", "XDG_RUNTIME_DIR": "/y", "SPARROW_LOCK_DIR": "/z",
@@ -765,12 +824,13 @@ class HolderLockTest(unittest.TestCase):
         os.symlink(self.tmp, self.tmp.parent / ("link-" + self.tmp.name))
         self.addCleanup(os.unlink, self.tmp.parent / ("link-" + self.tmp.name))
         self.assertEqual(self.hl.lock_dir(str(self.tmp.parent / ("link-" + self.tmp.name) / "work")), base)
+        (self.tmp / "other").mkdir()
         self.assertNotEqual(self.hl.lock_dir(str(self.tmp / "other")), base)
 
     def test_two_launch_contexts_with_different_environments_resolve_one_lock_dir(self):
         root = str(self.root)
         self.real_home()
-        self.addCleanup(shutil.rmtree, self.hl.lock_dir(root), True)
+        self.forget_lock_dir(root)
         code = ("import sys\nr = hl.acquire(%r, install_id=hl.install_id())\n"
                 "print(hl.lock_dir(%r), type(r).__name__, flush=True)\n"
                 "if isinstance(r, hl.Acquired):\n    hl.publish(r.owner, 'stub')\n    sys.stdin.read()\n"
@@ -806,6 +866,15 @@ class HolderLockTest(unittest.TestCase):
                     self.assertEqual(str(e.exception), "not a local filesystem")
                 else:
                     self.hl.release(self.owned())
+
+    def test_the_readmes_state_the_supported_upgrade_paths_and_the_manual_stop_for_everything_else(self):
+        for readme in PKG_READMES:
+            with self.subTest(readme=readme.relative_to(REPO)):
+                text = " ".join(readme.read_text().split())
+                self.assertIn("Supported upgrade paths: the Hatch installer and the keepawake self-upgrade", text)
+                for phrase in ("pip", "pipx", "rollback", "supervisor", "work root the upgrader does not know",
+                               "stop the adapters by hand"):
+                    self.assertIn(phrase, text)
 
     def test_the_readmes_document_the_network_home_refusal(self):
         for readme in PKG_READMES:

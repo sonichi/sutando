@@ -450,11 +450,12 @@ The transport modules (`remote_gateway_bridge`, `event_channel`, `event_inbox`, 
 
 ## One process per work root: `holder_lock`, POSIX only
 
-`ag2_sparrow.holder_lock` (bundled from `src/holder_lock.py`) is the package's one-process lock: an adapter holds a `flock` on a lock file for its whole life and publishes a small holder record naming itself. The lock directory is outside the work root, at `<home of the service user, from the password database>/.local/state/ag2-sparrow/locks/<hash of the work root's real path>/`, the same for every launch context of that user (systemd, cron, a Hatch hook, `nohup`); no environment variable moves it.
+`ag2_sparrow.holder_lock` (bundled from `src/holder_lock.py`) is the package's one-process lock: an adapter holds a `flock` on a lock file for its whole life and publishes a small holder record naming itself. The lock directory is outside the work root, at `<home of the service user, from the password database>/.local/state/ag2-sparrow/locks/<hash of the work root directory's device and inode>/`, the same for every launch context of that user (systemd, cron, a Hatch hook, `nohup`); no environment variable moves it.
 
 - **POSIX only.** `holder_lock`, and the adapters that use it, run on Linux and macOS. On Windows every entry point raises `LockError("unsupported platform: holder_lock is POSIX-only")`.
 - **Network-mounted home: refused.** When the service user's home directory is on a network or FUSE filesystem (NFS, SMB, sshfs, …), every adapter refuses to start with `LockError("not a local filesystem")`, because a `flock` there does not exclude across hosts. Remedy: run the adapters as a user with a local home directory.
 - **Upgrade order: stop → install → start.** Stop this package's adapters on the work roots you launched, install the new version, then start them again. A start while an older adapter still runs on the root is refused and explains what to stop; it does not take over.
+- **Supported upgrade paths: the Hatch installer and the keepawake self-upgrade**, both stop → install → start. Anything else (a direct `pip` or `pipx` install or upgrade, a rollback, a process supervisor restarting a unit, or a work root the upgrader does not know) must stop the adapters by hand before installing; `holder_lock.status(<work root>)` reports what is running there.
 
 ## What Sparrow is not
 
