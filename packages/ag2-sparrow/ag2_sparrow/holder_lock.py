@@ -704,32 +704,52 @@ def acquire(work_root, *, install_id: str, timeout: float = 0.0):
     return _one_attempt(work_root, install_id)
 
 
-def _write_waiting(directory: str, start: str) -> str:
-    path = os.path.join(directory, "%s%d" % (WAITING_PREFIX, os.getpid()))
-    tmp = os.path.join(directory, ".%s%d.%s.tmp" % (WAITING_PREFIX, os.getpid(), uuid.uuid4().hex[:8]))
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write("%s %.3f\n" % (start, time.time()))
-    os.replace(tmp, path)
-    return path
+def _write_waiting(dir_fd: int, start: str) -> str:
+    """This process's waiter file, written through the held lock-directory fd: a fresh temp
+    (O_EXCL, no link followed), fsynced, renamed into place. Returns its name."""
+    name = "%s%d" % (WAITING_PREFIX, os.getpid())
+    tmp = ".%s%d.%s.tmp" % (WAITING_PREFIX, os.getpid(), uuid.uuid4().hex[:8])
+    data = ("%s %.3f\n" % (start, time.time())).encode("ascii", "replace")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC, 0o600, dir_fd=dir_fd)
+    try:
+        try:
+            while data:
+                data = data[os.write(fd, data):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        with _suppress_os_error():
+            os.unlink(tmp, dir_fd=dir_fd)
+        raise
+    return name
 
 
 def wait(work_root, *, install_id: str, deadline: float, poll: float = 0.1,
          on_tick: Optional[Callable[[float, Prior], None]] = None):
-    """Acquired | TimedOut | Unreadable | LegacyRunning, polling until `deadline` (time.monotonic())."""
+    """Acquired | TimedOut | Unreadable | LegacyRunning, polling until `deadline` (time.monotonic()).
+    The verified lock directory stays open for the whole wait; the waiter file is written and removed
+    only through it, and each attempt first checks the directory's path still names it."""
     global _WAITING
     with _ACQUIRING:
         _, _, directory, root_fd, dir_fd = _prepare(work_root)
-        os.close(dir_fd)
         os.close(root_fd)
-    with _guarded:
-        if _WAITING == os.getpid():
-            raise LockError("already waiting")
-        _WAITING = os.getpid()
+    try:
+        with _guarded:
+            if _WAITING == os.getpid():
+                raise LockError("already waiting")
+            _WAITING = os.getpid()
+    except BaseException:
+        os.close(dir_fd)
+        raise
     mine = None
     try:
-        mine = _write_waiting(directory, start_time(os.getpid()) or "unknown")
+        mine = _write_waiting(dir_fd, start_time(os.getpid()) or "unknown")
         began = time.monotonic()
         while True:
+            if not _dir_unchanged(directory, dir_fd):
+                raise LockError("replaced")
             result = _one_attempt(work_root, install_id)
             if not isinstance(result, (Held, Contended)):
                 return result
@@ -739,13 +759,16 @@ def wait(work_root, *, install_id: str, deadline: float, poll: float = 0.1,
                 on_tick(time.monotonic() - began, result.holder)
             time.sleep(max(0.0, min(poll, deadline - time.monotonic())))
     finally:
-        if mine:
-            try:
-                os.unlink(mine)
-            except FileNotFoundError:
-                pass
-        with _guarded:
-            _WAITING = None
+        try:
+            if mine:
+                try:
+                    os.unlink(mine, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(dir_fd)
+            with _guarded:
+                _WAITING = None
 
 
 # ── publish, release ─────────────────────────────────────────────────────────

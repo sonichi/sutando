@@ -1951,6 +1951,160 @@ class HolderLockTest(unittest.TestCase):
         os.close(w2)
         self.assertEqual(read_line(new), "new-1")
 
+    # ── the code review at 53214f2 ──
+
+    def test_a_waiter_never_writes_or_removes_anything_under_the_work_root_even_when_the_lock_dir_is_redirected(self):
+        """Review schedule: "Pre-create work_root/waiting.<pid> with USER-DATA. Immediately after
+        wait() closes the fd returned by _prepare, rename the verified lock directory aside and replace
+        its old path with a symlink to work_root" -- it replaced, then deleted, the user's file."""
+        directory = self.ldir()
+        (self.root / ("waiting.%d" % os.getpid())).write_text("USER-DATA")
+        (self.root / "notes").mkdir()
+        (self.root / "notes" / "keep.txt").write_bytes(b"other user bytes")
+        before = snapshot(str(self.root))
+        moved = self.tmp / "moved-lock-dir"
+        real_prepare, real_check, seen = self.hl._prepare, self.hl._dir_unchanged, []
+
+        def prepare_then_redirect(*a, **k):
+            got = real_prepare(*a, **k)
+            if not seen:
+                seen.append("redirected")
+                os.rename(directory, moved)
+                os.symlink(self.root, directory)
+            return got
+
+        def check(*a, **k):
+            seen.append(sorted(n for n in os.listdir(moved) if n.startswith("waiting.")))
+            return real_check(*a, **k)
+        self.addCleanup(lambda: os.path.islink(directory) and os.unlink(directory))
+        with mock.patch.object(self.hl, "_prepare", prepare_then_redirect), \
+                mock.patch.object(self.hl, "_dir_unchanged", check):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.hl.wait(str(self.root), install_id="i", deadline=time.monotonic() + 2)
+        self.assertEqual(str(e.exception), "replaced", "refused before any attempt")
+        self.assertEqual(seen, ["redirected", ["waiting.%d" % os.getpid()]], "the waiter landed in the original")
+        self.assertEqual([n for n in os.listdir(moved) if "waiting" in n], [], "and was removed from it")
+        self.assertEqual(snapshot(str(self.root)), before, "the work root is byte-for-byte untouched")
+        self.assertIsNone(self.hl._WAITING)
+
+    def test_a_failed_waiter_write_leaves_no_temp_and_is_raised(self):
+        with mock.patch.object(self.hl.os, "replace", side_effect=OSError(28, "No space left")):
+            with self.assertRaises(OSError):
+                self.hl.wait(str(self.root), install_id="i", deadline=time.monotonic() + 1)
+        self.assertEqual([n for n in os.listdir(self.ldir()) if "waiting" in n], [], "the temp is removed")
+        self.assertIsNone(self.hl._WAITING)
+
+    def test_a_component_renamed_under_the_root_before_a_missing_part_is_opened_creates_nothing(self):
+        root = self.tmp / "r"
+        root.mkdir()
+        home = self.tmp / "h"
+        (home / ".local").mkdir(parents=True)
+        real_open, moved = os.open, []
+
+        def move_then_open(path, *a, **k):
+            if os.fspath(path) == "state" and k.get("dir_fd") is not None and not moved:
+                moved.append(True)
+                os.rename(home / ".local", root / "descendant")
+            return real_open(path, *a, **k)
+        with mock.patch.object(self.hl, "_home", lambda: str(home)), \
+                mock.patch.object(self.hl.os, "open", move_then_open):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.acquire(root)
+        self.assertEqual((moved, str(e.exception)), ([True], "work root contains the lock directory"))
+        self.assertEqual(os.listdir(root / "descendant"), [], "refused before mkdir")
+
+    def test_a_lock_file_created_by_a_racer_between_the_two_opens_is_used(self):
+        directory = self.ldir()
+        real_open = os.open
+
+        def racer_first(path, flags, *a, **k):
+            if os.fspath(path) == "lock" and flags & os.O_EXCL:
+                os.close(real_open(str(directory / "lock"), os.O_RDWR | os.O_CREAT, 0o600))
+            return real_open(path, flags, *a, **k)
+        with mock.patch.object(self.hl.os, "open", racer_first):
+            owner = self.owned()
+        self.assertEqual(os.stat(directory / "lock").st_ino, owner.lock_id[1])
+        self.hl.release(owner)
+
+    def test_the_identity_helpers_answer_false_on_unusable_descriptors(self):
+        self.assertFalse(self.hl._same_at(-1, -1, "lock"))
+        self.assertFalse(self.hl._dir_unchanged(str(self.tmp / "absent"), -1))
+
+    def test_the_lock_held_check_refuses_an_unopenable_or_swapped_lock_file(self):
+        owner = self.owned()
+        real_open = os.open
+
+        def fail_plain_lock_open(path, flags, *a, **k):
+            if os.fspath(path) == "lock" and not flags & os.O_CREAT:
+                raise OSError(13, "Permission denied")
+            return real_open(path, flags, *a, **k)
+        with mock.patch.object(self.hl.os, "open", fail_plain_lock_open):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.hl.publish(owner, "routine")
+        self.assertTrue(str(e.exception).startswith("lock lost: "), e.exception)
+
+        def swap_then_open(path, flags, *a, **k):
+            if os.fspath(path) == "lock" and not flags & os.O_CREAT:
+                fresh = Path(owner.directory) / "fresh"
+                fresh.write_bytes(b"")
+                os.replace(fresh, Path(owner.directory) / "lock")
+            return real_open(path, flags, *a, **k)
+        with mock.patch.object(self.hl, "_same_at", lambda *a: True), \
+                mock.patch.object(self.hl.os, "open", swap_then_open):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.hl.publish(owner, "routine")
+        self.assertEqual(str(e.exception), "replaced")
+        owner.released, self.hl._OWNER = True, None
+        for fd in (owner.fd, owner.dir_fd, owner.root_fd):
+            os.close(fd)
+
+    def test_every_waiter_file_operation_in_wait_goes_through_the_lock_dir_fd(self):
+        code = ("r = hl.acquire(%r, install_id='i')\nprint(type(r).__name__, flush=True)\nsys.stdin.read()\n"
+                "hl.release(r.owner)\n" % str(self.root))
+        child = self.run_py(code)
+        self.addCleanup(lambda: (child.stdin.close(), child.wait(WAIT), child.stdout.close(), child.stderr.close()))
+        self.assertEqual(read_line(child.stdout), "Acquired")
+        calls = []
+
+        def spy(name):
+            real = getattr(os, name)
+            return lambda *a, **k: (calls.append((name, a, k)), real(*a, **k))[1]
+        with contextlib.ExitStack() as stack:
+            for fn in ("open", "replace", "unlink", "rename", "remove"):
+                stack.enter_context(mock.patch.object(self.hl.os, fn, spy(fn)))
+            got = self.hl.wait(str(self.root), install_id="i", deadline=time.monotonic() + 0.3, poll=0.05)
+        self.assertIsInstance(got, self.hl.TimedOut)
+        waiter = [(n, a, k) for n, a, k in calls if a and "waiting." in str(a[0])]
+        self.assertEqual(sorted({n for n, _, _ in waiter}), ["open", "replace", "unlink"], waiter)
+        for n, a, k in waiter:
+            self.assertNotIn(os.sep, str(a[0]), "a bare name: %r" % ((n, a, k),))
+            keys = ("src_dir_fd", "dst_dir_fd") if n == "replace" else ("dir_fd",)
+            self.assertTrue(all(isinstance(k.get(key), int) for key in keys), (n, a, k))
+        self.assertEqual([x for x in os.listdir(self.ldir()) if "waiting." in x], [])
+
+    def test_no_function_acting_after_the_lock_dir_is_opened_does_path_based_io(self):
+        """Grep-pin: in every function that runs with the lock directory held, each os call that opens,
+        lists, renames or removes takes a descriptor (dir_fd=, src/dst_dir_fd=, or an fd argument),
+        and nothing calls the builtin open."""
+        tree = ast.parse(Path(self.hl.__file__).read_text())
+        held = {"_attempt", "_lock_still_held", "_write_record", "publish", "release", "_write_waiting", "wait"}
+        io_calls = {"open", "unlink", "remove", "replace", "rename", "mkdir", "rmdir", "listdir", "stat", "lstat"}
+        found = set()
+        for fn in (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in held):
+            found.add(fn.name)
+            for call in (c for c in ast.walk(fn) if isinstance(c, ast.Call)):
+                f = call.func
+                if isinstance(f, ast.Name):
+                    self.assertNotEqual(f.id, "open", "%s calls the builtin open" % fn.name)
+                if not (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "os"
+                        and f.attr in io_calls):
+                    continue
+                keywords = {k.arg for k in call.keywords}
+                first = ast.unparse(call.args[0]) if call.args else ""
+                self.assertTrue(keywords & {"dir_fd", "src_dir_fd"} or first.endswith("fd"),
+                                "%s: os.%s(%s) is path-based" % (fn.name, f.attr, first))
+        self.assertEqual(found, held)
+
     def test_every_case_runs_against_the_source_and_the_vendored_copy(self):
         self.assertIsNot(SRC, VENDORED)
         self.assertEqual(Path(SRC.__file__).read_bytes(), Path(VENDORED.__file__).read_bytes())
