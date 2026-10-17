@@ -579,10 +579,12 @@ that read.
 
 The outbox requires a finite window, so the relay rule's is a century. Its waiting
 is logged on a backoff (the 1st, 2nd, 4th, 8th ... time in a process, with the
-count), not on every 1-second drain pass. A relay result the broker has not
-accepted ten minutes after its first send is also reported under
+count), not on every 1-second drain pass. A relay result the broker has still not
+accepted ten minutes into its retry run is also reported under
 `relay_results_retrying` in `state/gateway-status[.<instance>].json`, as `count`
-and the oldest one's age in seconds, `oldest_age_s`; it keeps being retried, and
+and the oldest one's age in seconds, `oldest_age_s`. The age is measured from the
+outbox record's `retry.started_at`, so it starts again after a requeue or a
+reclaim at start, which drop the retry state. The result keeps being retried, and
 the field is absent while none is. While the marks cannot be read, only a
 result that may answer a relay ask waits: a voice task under an `ask-…` id (the
 lane's `ask_sutando` ids). The session-end task (`voice-end-…`) and every other

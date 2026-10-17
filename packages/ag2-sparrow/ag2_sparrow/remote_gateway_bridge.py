@@ -4853,9 +4853,10 @@ def _end_withdrawn_relay_ask(tid: str, entry: dict, staged: Path, inflight: "set
     threshold, it is ended: the decision recorded in its entry, the relay `failed` result
     sent with no ceiling, then the staged file, the in-flight id and the entry retired, the
     mark last, each step resumed by the next pass after a crash. It is never published.
-    A mark that cannot be retired here is retired by the next start because
-    `_put_held(tid, None)` has already removed the entry: `_retire_delivered_marks` keeps
-    a mark an entry names."""
+    A mark that cannot be retired here is retired by the next start: for a delivered `failed`
+    by `_retire_delivered_marks`, which keeps any mark an entry names and so relies on
+    `_put_held(tid, None)` above, and for one refused for good by
+    `_reclaim_parked_relay_results` through `_finish_relay_end`."""
     if entry.get("ending") is not True:
         dropped = _withdrawn_for_good(staged)
         if dropped is None:
@@ -5688,28 +5689,36 @@ _RELAY_RETRY = RetrySchedule(window_s=100 * 365 * 86400.0)
 # Why a relay ask's parked result was requeued: by the drain, or at start after a downgrade.
 _RELAY_REOPENED = "relay result: retried until the broker accepts it"
 _RELAY_RECLAIMED = "relay result an older bridge parked: reclaimed at start"
-# A relay result not accepted this long after its first send is reported in the gateway status,
-# and still retried: the window after which every other result parks.
+# A relay result this long into its retry run without an accept is reported in the gateway
+# status, and still retried: the window after which every other result parks.
 RELAY_RESULTS_RETRYING_AFTER_S = 600
 
 
 def _relay_results_retrying(now: float) -> "dict | None":
     """How many relay results the broker has not accepted `RELAY_RESULTS_RETRYING_AFTER_S` or
-    more after their first send, and the oldest one's age in seconds; None when none has.
-    Read from the kept marks and their outbox records; a record that cannot be read is skipped."""
-    root = _delivery_core("relay").backend.root
-    ages = []
-    for broker_id in filter(_valid_tid, _load_ack_first() or {}):
-        try:
-            record = read_item(root, broker_id) or {}
-        except (OSError, ValueError):
-            continue
-        retry = record.get("retry") if isinstance(record, dict) else None
-        started = retry.get("started_at") if isinstance(retry, dict) else None
-        if (isinstance(started, (int, float)) and record.get("status") not in ("DELIVERED", "PARKED")
-                and now - started >= RELAY_RESULTS_RETRYING_AFTER_S):
-            ages.append(now - started)
-    return {"count": len(ages), "oldest_age_s": int(max(ages))} if ages else None
+    more into their retry run, and the oldest one's age in seconds, both from the outbox
+    record's `retry.started_at`, which a requeue or a reclaim at start resets. None when none
+    has, and when it cannot be worked out (logged on a backoff), so the rest of the status is
+    still written. Read from the kept marks and their records; an unreadable one is skipped."""
+    try:
+        root = _delivery_core("relay").backend.root
+        ages = []
+        for broker_id in filter(_valid_tid, _load_ack_first() or {}):
+            try:
+                record = read_item(root, broker_id) or {}
+            except (OSError, ValueError):
+                continue
+            retry = record.get("retry") if isinstance(record, dict) else None
+            started = retry.get("started_at") if isinstance(retry, dict) else None
+            if (isinstance(started, (int, float))
+                    and record.get("status") not in ("DELIVERED", "PARKED")
+                    and now - started >= RELAY_RESULTS_RETRYING_AFTER_S):
+                ages.append(now - started)
+        return {"count": len(ages), "oldest_age_s": int(max(ages))} if ages else None
+    except Exception as e:  # noqa: BLE001 - this field never costs the rest of the status write
+        _log_backoff(("relay-results-retrying",), f"relay_results_retrying not reported "
+                     f"({type(e).__name__}: {e}); the rest of the gateway status is written")
+        return None
 
 
 def _failed_in_place_of(stored: str) -> "str | None":

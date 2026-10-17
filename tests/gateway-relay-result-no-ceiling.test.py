@@ -580,7 +580,7 @@ class TheRuleOnANamedInstance(_Bridge):
 
 
 class ReportedWhileRetrying(_Bridge):
-    """A relay result the broker has not accepted ten minutes after its first send is reported in
+    """A relay result the broker has not accepted ten minutes into its retry run is reported in
     the gateway status, as a count and the oldest one's age, and is still retried."""
 
     def setUp(self):
@@ -649,6 +649,19 @@ class ReportedWhileRetrying(_Bridge):
             status = self.status()
         self.assertIs(status["connected"], True)
         self.assertEqual(status["relay_results_retrying"]["count"], 1)
+
+    def test_a_field_that_cannot_be_worked_out_is_left_out_and_the_status_still_written(self):
+        self.retrying(ASK_A)
+        path = outbox._item_path(self.outbox_root, ASK_A)
+        record = json.loads(path.read_text())
+        record["retry"]["started_at"] = float("-inf")    # an infinite age has no int
+        path.write_text(json.dumps(record))
+        for _write in range(2):
+            status = self.status()
+            self.assertIs(status["connected"], True)
+            self.assertNotIn("relay_results_retrying", status)
+        self.assertEqual(sum("relay_results_retrying not reported (OverflowError" in line
+                             for line in self.lines), 2, "not logged on the backoff")
 
 
 class TheReclaim(_Bridge):
