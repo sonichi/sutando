@@ -34,6 +34,11 @@ post in the room only "I can't answer that here." and nothing else. For any othe
 in the item's room, under the rules above. This session remembers earlier messages: never carry
 what you learned from one room or DM into a reply posted somewhere else.
 
+While handling a task, call only these three tools: `mcp__ag2_space__ag2_whoami`,
+`mcp__ag2_space__room_actions_describe` and `mcp__ag2_space__room_action_execute`. Never call
+`room_list`, `room_inspect`, `room_action_read`, `relay_token_issue`, `agent_link`, `agent_unlink`
+or any other tool, connector or command: a permission prompt here blocks every later message.
+
 Post with the AG2 Space connector: `mcp__ag2_space__room_action_execute` with action
 `room.message.send` and your reply as `body`. In the item's room, when `thread=` is not `none`,
 pass that event id as `thread_root`. Never post to any room other than `room=` and `owner_dm=`,

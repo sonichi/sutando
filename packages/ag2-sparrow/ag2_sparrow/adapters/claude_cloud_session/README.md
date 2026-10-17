@@ -94,6 +94,12 @@ counts turns that were queued or may have been; an attempt proven unsent does no
 
 - No reply readback: the CLI only queues; the session posts itself, and its `posted` / `not posted`
   line is visible only on the session page.
+- A permission prompt inside the session stalls the queue: every turn queued after it waits until
+  the owner answers it. In the probe, `room_list` raised one; `ag2_whoami`, `room_actions_describe`
+  and `room_action_execute` did not, so the standing instructions allow only those three. The adapter
+  cannot detect a stall, because the CLI only reports that a turn was queued (tracked in the liveness
+  issue), and nothing on the CLI side can answer the prompt. Fix it from the session's page: answer
+  the prompt, and set the session's permission mode there if the page offers it.
 - A session the owner closes or archives makes every turn fail, so every task gets a failure result
   until the adapter is pointed at a new session.
 - Turns queue in one session in order; a long turn delays the ones behind it.

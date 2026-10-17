@@ -224,6 +224,19 @@ class PayloadTest(unittest.TestCase):
             _, text = sa.build_text("task-1", *cc.parse_task(str(p)), note=NOTE)
         self.assertIn(" channel_kind=room", text.split("\n")[1])
 
+    def test_session_prompt_allows_only_the_three_non_prompting_tools(self):
+        prompt = PROMPT_MD.read_text(encoding="utf-8")
+        allowed = re.search(r"call only these three tools: (.*?)\. Never call", prompt, re.S)
+        self.assertIsNotNone(allowed, prompt)
+        self.assertEqual(re.findall(r"`(mcp__ag2_space__\w+)`", allowed.group(1)),
+                         ["mcp__ag2_space__ag2_whoami", "mcp__ag2_space__room_actions_describe",
+                          "mcp__ag2_space__room_action_execute"])
+        forbidden = prompt[allowed.end():prompt.index("Post with the AG2 Space connector")]
+        for tool in ("room_list", "room_inspect", "room_action_read", "relay_token_issue", "agent_link",
+                     "agent_unlink"):
+            self.assertIn("`%s`" % tool, forbidden)
+        self.assertIn("or any other tool", forbidden)
+
     def test_child_env_is_a_whitelist(self):
         self.assertEqual(sa.child_env(ENV), {k: ENV[k] for k in ("PATH", "HOME", "USER", "LANG")})
         with_dir = dict(ENV, CLAUDE_CONFIG_DIR="/cfg/claude-owner")
