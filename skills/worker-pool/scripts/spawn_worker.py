@@ -322,9 +322,13 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
         raise SpawnRefused(
             f"no worker in this workspace has session {resume!r} in its lineage; "
             "refusing rather than resuming a conversation into a stranger's record")
-    if resumed_id and not runtime:
-        runtime = next((row.get("runtime") for row in wi.sessions(workspace, resumed_id)
-                        if row.get("session_id") == resume), None)
+    if resumed_id:
+        session = next((row for row in wi.sessions(workspace, resumed_id)
+                        if row.get("session_id") == resume), {})
+        if not runtime:
+            runtime = session.get("runtime")
+        if not cwd:
+            cwd = (session.get("transcript") or {}).get("cwd", "")
     runtime = resolve_runtime(repo, runtime, runner)
     if runtime == "codex" and resume:
         raise SpawnRefused("Codex cannot resume without a recorded CLI session id")
