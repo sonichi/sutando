@@ -1,11 +1,9 @@
-"""The shared relay library (`ag2_sparrow/relay_loop.py`), both Claude adapters' delegation to it,
-and the rule that no adapter imports another.
+"""The shared relay library (`ag2_sparrow/relay_loop.py`) and both Claude adapters' delegation to it.
+The import and path boundaries are in test_adapter_boundaries.py.
 
 Run:
     python3 packages/ag2-sparrow/tests/test_adapter_relay_loop.py
 """
-import ast
-import re
 import contextlib
 import io
 import os
@@ -24,15 +22,6 @@ from ag2_sparrow.adapters.hatch import task_fields  # noqa: E402
 
 from ag2_sparrow.adapters.claude_cloud_session import session_adapter as sa  # noqa: E402
 from ag2_sparrow.adapters.claude_routine import routine_adapter as ra  # noqa: E402
-
-ADAPTERS = PKG_ROOT / "ag2_sparrow" / "adapters"
-SHARED = PKG_ROOT / "ag2_sparrow"
-ADAPTER_DIRS = sorted([p for p in ADAPTERS.iterdir() if p.is_dir() and p.name != "__pycache__"]
-                      + [p for p in (PKG_ROOT / "adapters").iterdir() if p.is_dir()])
-CODE = (".py", ".sh", ".ts", ".json")
-SEGMENT = re.compile(r"(?:^|[/.\\])adapters(?:[/.\\]|$)")
-CROSS = re.compile(r"adapters[/.]([A-Za-z0-9_-]+)|\.\./([A-Za-z0-9_-]+)/")
-
 
 def write_task(inbox, tid, priority, mtime, tier="owner"):
     p = Path(inbox) / (tid + ".txt")
@@ -135,41 +124,6 @@ class LoopTest(unittest.TestCase):
         self.assertEqual(rl.result_body(out, "no-send", label="x"), "[no-send]\n# x: u\n")
 
 
-def resolve(module, node):
-    """Absolute dotted name an ImportFrom refers to, from inside `module`."""
-    if node.level == 0:
-        return node.module or ""
-    base = module.split(".")[:-node.level]
-    return ".".join(base + ([node.module] if node.module else []))
-
-
-def adapter_imports():
-    """(importing module, imported name) for every import in every module under adapters/."""
-    for path in sorted(ADAPTERS.rglob("*.py")):
-        rel = path.relative_to(PKG_ROOT).with_suffix("")
-        parts = list(rel.parts)
-        if parts[-1] == "__init__":
-            parts = parts[:-1] + ["__init__"]
-        module = ".".join(parts)
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.ImportFrom):
-                target = resolve(module, node)
-                names = [target] + ["%s.%s" % (target, a.name) for a in node.names]
-            elif isinstance(node, ast.Import):
-                names = [a.name for a in node.names]
-            else:
-                continue
-            for name in names:
-                yield module, name
-
-
-def adapter_of(dotted):
-    parts = dotted.split(".")
-    if parts[:2] == ["ag2_sparrow", "adapters"] and len(parts) > 2 and parts[2] != "__init__":
-        return parts[2]
-    return None
-
-
 class DelegationTest(unittest.TestCase):
     def test_both_adapters_delegate_to_the_shared_loop(self):
         shared = ("pending", "serve", "read_task", "admit", "schedule_retry")
@@ -188,60 +142,6 @@ class DelegationTest(unittest.TestCase):
                      "non_owner_note", "attested_headers", "NON_OWNER_NOTE"):
             self.assertIs(getattr(cc, name), getattr(task_io, name), name)
         self.assertIs(task_fields.attested_headers, task_io.attested_headers)
-
-    def test_no_adapter_imports_another_adapter(self):
-        crossings = sorted({(m, n) for m, n in adapter_imports()
-                            if adapter_of(m) and adapter_of(n) and adapter_of(m) != adapter_of(n)})
-        self.assertEqual(crossings, [])
-        names = {n for _, n in adapter_imports()}
-        self.assertIn("ag2_sparrow.relay_loop", names, "the scan resolves relative imports")
-        self.assertIn("ag2_sparrow.task_io", names)
-
-    def string_constants(self, path):
-        return [n.value for n in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
-                if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-
-    def test_no_shared_module_names_an_adapter_path(self):
-        names = {p.name for p in ADAPTER_DIRS}
-        found = []
-        for path in sorted(SHARED.glob("*.py")):
-            for value in self.string_constants(path):
-                if SEGMENT.search(value) or value in names:
-                    found.append((path.name, value[:80]))
-        self.assertEqual(found, [])
-
-    def test_no_adapter_names_another_adapters_path(self):
-        names = {p.name for p in ADAPTER_DIRS}
-        found = []
-        for adapter in ADAPTER_DIRS:
-            for path in sorted(p for p in adapter.rglob("*") if p.suffix in CODE and "__pycache__" not in p.parts):
-                for m in CROSS.finditer(path.read_text(encoding="utf-8", errors="replace")):
-                    other = m.group(1) or m.group(2)
-                    if other in names and other != adapter.name:
-                        found.append((str(path.relative_to(PKG_ROOT)), m.group(0)))
-                if path.suffix == ".py":
-                    found += [(str(path.relative_to(PKG_ROOT)), v) for v in self.string_constants(path)
-                              if v in names and v != adapter.name]
-        self.assertEqual(found, [])
-
-    def test_the_path_scans_catch_the_old_shapes(self):
-        self.assertTrue(SEGMENT.search("adapters"))
-        self.assertTrue(SEGMENT.search("../../../ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh"))
-        self.assertFalse(SEGMENT.search("so adapters share it"))
-        hits = [m.group(1) or m.group(2)
-                for m in CROSS.finditer("const HATCH_SCRIPT = '../../../ag2_sparrow/adapters/hatch/x.sh'")]
-        self.assertIn("hatch", hits)
-        self.assertIn("hatch", {p.name for p in ADAPTER_DIRS})
-        self.assertIn("claude-code", {p.name for p in ADAPTER_DIRS})
-
-    def test_the_scan_catches_a_crossing(self):
-        node = ast.parse("from ..codex.codex_connector import parse_task").body[0]
-        target = resolve("ag2_sparrow.adapters.claude_routine.routine_adapter", node)
-        self.assertEqual(target, "ag2_sparrow.adapters.codex.codex_connector")
-        self.assertEqual((adapter_of("ag2_sparrow.adapters.claude_routine.routine_adapter"), adapter_of(target)),
-                         ("claude_routine", "codex"))
-        self.assertIsNone(adapter_of("ag2_sparrow.adapters"))
-        self.assertIsNone(adapter_of("ag2_sparrow.adapters.__init__"))
 
 
 if __name__ == "__main__":

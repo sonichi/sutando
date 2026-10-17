@@ -85,8 +85,10 @@ answers its owner here."): the session holds the owner's connector and there is 
 | no receipt otherwise: any other non-zero exit, exit 0 without one, or a timeout (`--timeout`, default 60 s; a receipt printed before the timeout still counts as queued) | "may or may not have reached the cloud agent …; it was not retried" — never resubmitted |
 
 A non-owner task's failure line never carries the exit code. Before each call the adapter writes
-`state/sending/<task_id>` and removes it only with the result, so a crash mid-send is answered on
-restart with the "may or may not have reached" line instead of a second queued turn (at most once).
+`state/sending/<task_id>` (`sending`), rewrites it to `outcome` once the outcome is counted or to
+`unsent` before releasing the reservation of a proven-unsent call, and removes it only with the
+result. A crash mid-send is answered on restart with the "may or may not have reached" line instead
+of a second queued turn (at most once); a crash during a proven-unsent cleanup is retried once.
 
 Pacing: at least `--min-gap-seconds` (default 2) between queued turns and at most `--max-per-hour`
 (default 60) in a sliding hour, kept in `state/sends.json` so a restart does not reset either. The cap
@@ -95,9 +97,11 @@ is counted before the CLI call, keyed by its task id, and dropped again only whe
 was never sent, so a crash right after a send cannot lose the count and a restart cannot count the
 same task twice. Once the outcome is known (queued or ambiguous) the entry moves to that time, so the
 gap counts from when the turn was queued, not from when the call started. On restart, a task that
-already holds an entry or a pre-send marker is settled first and skips both gates: a marked task gets
-its "may or may not have reached" result at once, a reserved but unmarked one is sent at once, and
-neither gains a second entry or a newer time from the restart.
+already holds an entry or a pre-send marker is settled first and skips both gates. A marked task gets
+its "may or may not have reached" result at once; if the crash came before its outcome was recorded,
+its one entry moves to the restart time, the latest the turn can have been queued, so the next turn
+still waits the full gap and the hour. A reserved but unmarked task, or one whose marker says
+`unsent`, is sent at once. None of them gains a second entry.
 
 ## Limits
 

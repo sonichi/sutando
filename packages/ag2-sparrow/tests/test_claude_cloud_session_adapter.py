@@ -23,6 +23,7 @@ sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import team_guardrail  # noqa: E402
 
 from ag2_sparrow.adapters.claude_cloud_session import session_adapter as sa  # noqa: E402
+from ag2_sparrow import relay_loop as rl  # noqa: E402
 
 from ag2_sparrow.adapters.claude_routine import routine_adapter as ra  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
@@ -546,7 +547,7 @@ class QueueLoopTest(unittest.TestCase):
     def sends(self, d):
         return json.loads((Path(d) / "state" / "sends.json").read_text())
 
-    def test_full_cap_restart_settles_a_marked_task_at_once_without_a_new_entry(self):
+    def test_full_cap_restart_settles_a_marked_task_at_once_with_one_entry(self):
         class Crash(BaseException):
             pass
 
@@ -565,7 +566,8 @@ class QueueLoopTest(unittest.TestCase):
             run_adapter(d, fake, clock=clock, once=1, max_per_hour=1, min_gap_seconds=30)
             self.assertEqual(clock.t, start, "settling a marked task waits for no gate")
             self.assertIn("(interrupted)", result(d, "task-c"))
-            self.assertEqual(self.sends(d), [[first.t, "task-c"]], "the reservation keeps its original time")
+            self.assertEqual(self.sends(d), [[start, "task-c"]],
+                             "one entry, moved to the restart: the latest the unknown outcome can have been")
             self.assertEqual(len(fake.calls()), 1)
 
     def test_full_cap_restart_after_a_crash_before_the_marker_sends_once_without_waiting(self):
@@ -589,6 +591,99 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual(len(fake.calls()), 1)
             self.assertIn("turn=2", result(d, "task-b"))
             self.assertEqual(self.sends(d), [[start, "task-b"]], "one entry, at the outcome time")
+
+    def crash_between_outcome_and_finalize(self, d, fake, **kw):
+        class Crash(BaseException):
+            pass
+        first = FakeClock()
+
+        def slow(argv, **k):
+            first.t += 10
+            return subprocess.CompletedProcess(argv, 0, ok()["stdout"], "")
+        write_task(d, "task-c", "x", mtime=1000)
+        with mock.patch.object(rl.RateLimiter, "touch", side_effect=Crash), self.assertRaises(Crash):
+            run_adapter(d, fake, clock=first, run=slow, once=1, **kw)
+        self.assertEqual(self.sends(d), [[first.t - 10, "task-c"]], "only the pre-send reservation was written")
+        return first.t
+
+    def next_turn_after_restart(self, d, fake, crashed_at, **kw):
+        write_task(d, "task-next", "x", mtime=2000)
+        clock = FakeClock(crashed_at + 5)
+        restart = clock.t
+        starts = []
+
+        def record(argv, **k):
+            starts.append(clock.t)
+            return subprocess.CompletedProcess(argv, 0, ok()["stdout"], "")
+        run_adapter(d, fake, clock=clock, run=record, once=2, **kw)
+        self.assertIn("(interrupted)", result(d, "task-c"))
+        return restart, starts
+
+    def test_crash_before_finalize_keeps_the_min_gap_for_the_next_turn(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok()])
+            crashed = self.crash_between_outcome_and_finalize(d, fake, min_gap_seconds=2)
+            restart, starts = self.next_turn_after_restart(d, fake, crashed, min_gap_seconds=2)
+            self.assertEqual(len(starts), 1)
+            self.assertGreaterEqual(starts[0], restart + 2, "the gap runs from the settled turn")
+            self.assertEqual(self.sends(d), [[restart, "task-c"], [starts[0], "task-next"]],
+                             "the interrupted turn is counted once, at the restart")
+
+    def test_crash_before_finalize_keeps_the_hour_for_the_next_turn(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok()])
+            crashed = self.crash_between_outcome_and_finalize(d, fake, max_per_hour=1)
+            restart, starts = self.next_turn_after_restart(d, fake, crashed, max_per_hour=1)
+            self.assertEqual(len(starts), 1)
+            self.assertGreaterEqual(starts[0], restart + 3600, "the settled turn holds the hour")
+
+    def test_a_crash_after_the_unsent_mark_retries_exactly_once(self):
+        class Crash(BaseException):
+            pass
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [{"rc": 1, "stderr": "getaddrinfo ENOTFOUND"}, ok(7)])
+            write_task(d, "task-u", "x")
+            with mock.patch.object(rl.RateLimiter, "forget", side_effect=Crash), self.assertRaises(Crash):
+                run_adapter(d, fake, once=1, max_per_hour=1)
+            marker = Path(d) / "state" / "sending" / "task-u"
+            self.assertEqual(marker.read_text(), "unsent\n", "the marker moved before the reservation")
+            clock = FakeClock()
+            start = clock.t
+            run_adapter(d, fake, clock=clock, once=1, max_per_hour=1)
+            self.assertEqual(len(fake.calls()), 2, "retried exactly once")
+            self.assertIn("turn=7", result(d, "task-u"))
+            self.assertEqual(clock.t, start, "its own reservation does not hold the retry back")
+            self.assertFalse(marker.exists())
+
+    def test_retry_cleanup_marks_unsent_before_releasing_the_reservation(self):
+        order = []
+        real_mark, real_forget = sa.mark, rl.RateLimiter.forget
+
+        def spy_mark(path, phase):
+            order.append("mark " + phase)
+            real_mark(path, phase)
+
+        def spy_forget(lim, key):
+            order.append("forget")
+            real_forget(lim, key)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(sa, "mark", spy_mark), \
+                mock.patch.object(rl.RateLimiter, "forget", spy_forget):
+            fake = Fake(d, [{"rc": 1, "stderr": "getaddrinfo ENOTFOUND"}, ok()])
+            write_task(d, "task-u", "x")
+            run_adapter(d, fake, once=1, backoff=1)
+        self.assertEqual(order[:3], ["mark sending", "mark unsent", "forget"])
+
+    def test_marker_phases_on_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok(4)])
+            for tid, phase in (("task-o", "outcome"), ("task-s", "sending"), ("task-e", "")):
+                write_task(d, tid, "x")
+                (Path(d) / "state" / "sending").mkdir(parents=True, exist_ok=True)
+                (Path(d) / "state" / "sending" / tid).write_text(phase)
+            run_adapter(d, fake, once=3)
+            self.assertEqual(fake.calls(), [], "a possibly queued turn is never resent")
+            for tid in ("task-o", "task-s", "task-e"):
+                self.assertIn("(interrupted)", result(d, tid))
 
     def test_min_gap_counts_from_the_outcome_not_the_start(self):
         clock = FakeClock()

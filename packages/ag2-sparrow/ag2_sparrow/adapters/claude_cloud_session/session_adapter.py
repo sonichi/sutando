@@ -95,8 +95,12 @@ def queue_turn(claude, session_id, text, env, timeout=60.0, run=subprocess.run):
     return Outcome("ambiguous", detail="exit %d" % proc.returncode if proc.returncode else "no ok")
 
 
+def mark(path, phase):
+    write_atomic(path, phase + "\n")
+
+
 def mark_sending(path):
-    write_atomic(path, "%d\n" % os.getpid())
+    mark(path, "sending")
 
 
 class Adapter(RelayLoop):
@@ -110,6 +114,14 @@ class Adapter(RelayLoop):
     def _marker(self, task_id):
         return os.path.join(self.sending_dir, task_id)
 
+    def _phase(self, task_id):
+        """sending (the call may have queued it), outcome (known, counted), unsent (proven), or None."""
+        try:
+            with open(self._marker(task_id), encoding="utf-8") as f:
+                return (f.read().split() or ["sending"])[0]
+        except FileNotFoundError:
+            return None
+
     def _clear(self, task_id):
         try:
             os.unlink(self._marker(task_id))
@@ -121,7 +133,7 @@ class Adapter(RelayLoop):
         self._clear(name[:-4])
 
     def recovering(self, name):
-        return os.path.exists(self._marker(name[:-4])) or self.limiter.holds(name[:-4])
+        return self._phase(name[:-4]) in ("sending", "outcome") or self.limiter.holds(name[:-4])
 
     def next_ready(self, names):
         name, wait = super().next_ready(names)
@@ -138,9 +150,15 @@ class Adapter(RelayLoop):
             return True
         headers, message, operator_lines = task
         owner = headers.get("access_tier") == "owner"
-        if os.path.exists(self._marker(task_id)):
+        phase = self._phase(task_id)
+        if phase == "unsent":
+            self._clear(task_id)
+        elif phase is not None:
             # A send began before a crash; resending could post twice.
-            log("interrupted send, not resent ->", task_id)
+            log("interrupted send, not resent ->", task_id, phase)
+            if phase == "sending":
+                # Its outcome time is unknown: count it as queued now, the latest it can have been.
+                self.limiter.touch(task_id)
             self.finish(name, result_body(INTERRUPTED, self.args.result_mode, owner, LABEL), seen)
             return True
         if not self.admit(name, headers, seen):
@@ -156,12 +174,15 @@ class Adapter(RelayLoop):
         mark_sending(self._marker(task_id))
         out = queue_turn(self.args.claude, self.args.session_id, text, self.env, self.args.timeout, self.run)
         if out.kind == "retry":
+            # Marker first: a crash after it still reads as unsent, so a restart sends it again.
+            mark(self._marker(task_id), "unsent")
             self.limiter.forget(task_id)
             self._clear(task_id)
             if self.schedule_retry(task_id, out.detail):
                 return False
         else:
             self.limiter.touch(task_id)
+            mark(self._marker(task_id), "outcome")
         log("result <-", task_id, out.kind, out.detail, out.session_id or "")
         self.finish(name, result_body(out, self.args.result_mode, owner, LABEL), seen)
         return True
