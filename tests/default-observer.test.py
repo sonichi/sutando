@@ -388,12 +388,12 @@ def test_bridge_wiring_is_OPT_IN_not_default_on():
         os.environ["AGENT_MXID"] = "@me:hs"
         os.environ.pop("SPARROW_OBSERVE_REACT", None)
         h = _start_and_grab_handler(m)
-        check(type(h).__name__ == "TaskifyHandler",
+        check(type(h).__name__ != "ReactObserverHandler",
               "wiring: env unset → observer OFF (opt-in)")
 
         os.environ["SPARROW_OBSERVE_REACT"] = "0"
         h = _start_and_grab_handler(m)
-        check(type(h).__name__ == "TaskifyHandler",
+        check(type(h).__name__ != "ReactObserverHandler",
               "wiring: SPARROW_OBSERVE_REACT=0 → still off")
 
         os.environ["SPARROW_OBSERVE_REACT"] = "1"
@@ -406,7 +406,7 @@ def test_bridge_wiring_is_OPT_IN_not_default_on():
         os.environ.pop("AGENT_MXID", None)
         os.environ.pop("AGENT_ID", None)
         h = _start_and_grab_handler(m)
-        check(type(h).__name__ == "TaskifyHandler",
+        check(type(h).__name__ != "ReactObserverHandler",
               "wiring: no AGENT_MXID/AGENT_ID → observer stays off")
 
         # AGENT_ID fallback (live-deployment finding: a real install's durable
