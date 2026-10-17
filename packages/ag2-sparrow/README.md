@@ -212,8 +212,11 @@ agent's core. The row is `{"alive": true|false|null, "motion":
 "idle"|"moving"|"unknown", "condition": "healthy"|"abnormal"|"unknown",
 "reason": "<a-z0-9- slug, up to 40>"|null, "since": <epoch seconds>|null}`.
 Printing nothing sends no row. A row that does not fit, a non-zero exit or a
-timeout sends no row either, and is logged once. The row does not change the
-presence status Sparrow reports. The Hatch adapter's
+timeout sends no row either, and is logged once. A row whose `motion` is
+`unknown` is sent with Sparrow's own: `moving` while a message it pulled from
+the relay waits for its result to be posted, `idle` otherwise; a `motion` the
+command prints stands. The row does not change the presence status Sparrow
+reports. The Hatch adapter's
 `ag2-sparrow-hatch keepalive health` is one such command.
 
 ## Meta Hatch agents (`ag2-sparrow[hatch]`)
@@ -565,7 +568,10 @@ When more than one applies, `reason` names the first of
 is when that one went bad. A task a worker handed off to the main session
 stays open, so it also reads `task-not-picked-up` until it is answered.
 
-`motion` is always `unknown`. Sparrow drops a row that is not valid for the
+The command prints `motion` as `unknown`, so Sparrow sends its own: `moving`
+from when it pulls a message until that message's reply (or `--no-send`) is
+posted (a task handed off to the main session reads `moving` until it is
+answered), `idle` otherwise. Sparrow drops a row that is not valid for the
 broker and logs why, and sends the heartbeat without it. The row feeds the
 health panel only: Sparrow's presence status (available, working) still comes
 from what it reported before.
