@@ -114,6 +114,16 @@ jobs:
           python tests/eslint-workflow-scope-gate.test.py
           if ($LASTEXITCODE -ne 0) { throw 'eslint-workflow-scope-gate.test.py failed' }
 
+      - name: Verify durable Windows schedules
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/windows-cron-task.test.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'windows-cron-task.test.ps1 failed' }
+          python tests/cron-windows-consumer.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'cron-windows-consumer.test.py failed' }
+          python tests/durable-cron-reconcile.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'durable-cron-reconcile.test.py failed' }
+
       - name: Verify Windows app switching
         shell: pwsh
         env:
