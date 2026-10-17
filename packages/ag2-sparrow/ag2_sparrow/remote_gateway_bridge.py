@@ -778,15 +778,30 @@ def _gateway_owner() -> str:
     return owner if owner.startswith("@") and ":" in owner else ""
 
 
+def _owner_dm_is_private(room: str, owner: str) -> "bool | None":
+    """Whether only the agent and its owner are in `room`; None when the gateway cannot say."""
+    agent = _reenroll_identity()
+    if not (room and owner and agent):
+        return None
+    try:
+        answer = _req("POST", "/v1/room", {"op": "members", "room_id": room}, timeout=10)
+    except Exception:  # noqa: BLE001 - unreadable is undecided, never private
+        return None
+    if not isinstance(answer, dict) or answer.get("error") or not isinstance(answer.get("members"), list):
+        return None
+    members = {r.get("user_id") for r in answer["members"] if isinstance(r, dict)}
+    return bool(members) and members <= {agent, owner}
+
+
 def _owner_review_dm(owner: str) -> str:
-    if _GATEWAY_OWNER_DM_HINT:
+    if _GATEWAY_OWNER_DM_HINT and _owner_dm_is_private(_GATEWAY_OWNER_DM_HINT, owner) is True:
         _atomic_private_json(_WITHHELD_DM_CACHE,
-                             {"owner": owner, "room_id": _GATEWAY_OWNER_DM_HINT})
+                             {"owner": owner, "room_id": _GATEWAY_OWNER_DM_HINT, "private": True})
         return _GATEWAY_OWNER_DM_HINT
     cached = _read_private_json(_WITHHELD_DM_CACHE) or {}
     room = str(cached.get("room_id") or "")
-    if cached.get("owner") == owner and room.startswith("!"):
-        return room
+    if cached.get("owner") == owner and room.startswith("!") and cached.get("private") is True:
+        return room  # an unmarked cache predates the membership check and may name a shared room
     answer = _req("POST", "/v1/room", {
         "op": "create", "invite": [owner], "is_direct": True,
         "name": "Private result reviews",
@@ -795,7 +810,7 @@ def _owner_review_dm(owner: str) -> str:
     room = str((answer or {}).get("room_id") or "")
     if not room.startswith("!"):
         raise RuntimeError("gateway did not return a private review room")
-    _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room})
+    _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room, "private": True})
     return room
 
 
@@ -1799,13 +1814,15 @@ def _load_routing() -> None:
     except (OSError, ValueError):
         return
     # another agent's reading, or this agent's reading from another gateway, authorizes nothing
-    if isinstance(d, dict) and d.get("identity") == _reenroll_identity() and d.get("gateway") == URL:
+    if (isinstance(d, dict) and d.get("identity") == _reenroll_identity() and d.get("gateway") == URL
+            and d.get("private") is True):  # a reading saved before membership was checked authorizes nothing
         _ROUTING["owner_dm"] = _ROUTING["persisted"] = str(d.get("owner_dm") or "")
 
 
 def refresh_routing(force: bool = False) -> None:
     """Pull the agent's routing state from the gateway. A failed refresh books a short retry, not the
-    window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk."""
+    window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk.
+    A room is the owner DM only while its members are the agent and its owner; a shared room clears it."""
     _load_routing()
     if not _ROUTING["identity"] and not _ROUTING["gateway"]:
         _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # a reading set before any binding adopts this one
@@ -1817,18 +1834,28 @@ def refresh_routing(force: bool = False) -> None:
     if not force and now < _ROUTING["next"]:
         return
     try:
-        _gateway_owner()
+        owner = _gateway_owner()
     except Exception:  # noqa: BLE001 - offline: the last known owner DM stands
         _ROUTING["next"] = now + ROUTING_RETRY_S
         return
-    if _GATEWAY_OWNER_DM_HINT:
-        _ROUTING["owner_dm"] = _GATEWAY_OWNER_DM_HINT
-    if _ROUTING["owner_dm"] and _ROUTING["owner_dm"] != _ROUTING["persisted"]:  # until durably published
+    candidate = _GATEWAY_OWNER_DM_HINT or _ROUTING["owner_dm"]
+    private = _owner_dm_is_private(candidate, owner) if candidate else None
+    if private is False:
+        if now - _ROUTING.get("shared_logged", 0.0) >= ROUTING_REFRESH_S:
+            _ROUTING["shared_logged"] = now
+            _log(f"owner_dm_room {candidate} has members besides the agent and its owner: not an owner DM")
+        _ROUTING["owner_dm"] = ""
+    elif private is True:
+        _ROUTING["owner_dm"] = candidate
+    elif candidate != _ROUTING["owner_dm"]:  # undecided: a new room is not adopted, the checked one stands
+        _ROUTING["next"] = now + ROUTING_RETRY_S
+        return
+    if _ROUTING["owner_dm"] != _ROUTING["persisted"]:  # until durably published
         try:
             f = _routing_file(); f.parent.mkdir(parents=True, exist_ok=True)
             tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
             tmp.write_text(json.dumps({"identity": _reenroll_identity(), "gateway": URL,
-                                       "owner_dm": _ROUTING["owner_dm"]}), encoding="utf-8")
+                                       "owner_dm": _ROUTING["owner_dm"], "private": True}), encoding="utf-8")
             os.replace(tmp, f)
             _ROUTING["persisted"] = _ROUTING["owner_dm"]
         except OSError:
