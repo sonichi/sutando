@@ -11,6 +11,9 @@ python3 skills/secret-vault/secret-vault.py env CLAUDE_ROUTINE_TOKEN -- \
 
 `<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out, `<dir>/state/{done,fires.json,hold.json,connector.pid}`.
 One adapter per work dir (`state/connector.pid`, liveness-checked; exit 3 if another holds it), one fire in flight.
+Tasks are taken in the task protocol's priority order (`priority:` urgent, normal, low; oldest first
+within a priority). The loop, payload layout, result lines and hourly cap live in the shared
+[`relay_loop.py`](../relay_loop.py), which the cloud session adapter uses too.
 
 ## Setup
 

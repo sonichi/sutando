@@ -22,6 +22,8 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import team_guardrail  # noqa: E402
 
+from ag2_sparrow.adapters import relay_loop as rl  # noqa: E402
+
 from ag2_sparrow.adapters.claude_routine import routine_adapter as ra  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
@@ -504,11 +506,12 @@ class MainTest(unittest.TestCase):
     def test_result_write_is_atomic(self):
         with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (_, base):
             write_task(d, "task-at", "x")
-            with mock.patch.object(ra, "write_atomic", wraps=ra.write_atomic) as spy:
+            with mock.patch.object(rl, "write_atomic", wraps=rl.write_atomic) as spy:
                 run_adapter(d, base, once=1)
             self.assertIn(os.path.join(d, "results", "task-at.txt"), [c.args[0] for c in spy.call_args_list])
             self.assertEqual([n for n in os.listdir(os.path.join(d, "results")) if n.startswith(".")], [])
             self.assertIs(ra.write_atomic, cc.write_atomic)
+            self.assertIs(rl.write_atomic, cc.write_atomic)
 
 
 if __name__ == "__main__":

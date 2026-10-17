@@ -14,7 +14,11 @@ python3 -m ag2_sparrow.adapters.claude_cloud_session.session_adapter \
 
 `<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out,
 `<dir>/state/{done,sends.json,sending/,connector.pid}`. One adapter per work dir
-(`state/connector.pid`, liveness-checked; exit 3 if another holds it), one turn queued at a time.
+(`state/connector.pid`, liveness-checked; exit 3 if another holds it), one turn queued at a time,
+taken in the task protocol's priority order (`priority:` urgent, normal, low; oldest first within a
+priority). The loop, payload layout, result lines and hourly cap are the shared
+[`relay_loop.py`](../relay_loop.py), which the routine adapter uses too; this adapter keeps only the
+CLI call, the pre-send marker and the pacing gap.
 
 ## Setup (once)
 
@@ -27,14 +31,17 @@ python3 -m ag2_sparrow.adapters.claude_cloud_session.session_adapter \
    `room_list`).
 3. Paste [`session-prompt.md`](session-prompt.md) (the part between its two rules) as the session's
    first message. It should answer `ready`.
-4. Run the adapter with `--session-id session_…`. No token goes in the vault: the `claude` CLI's own
-   login on this machine is the credential.
+4. Run the adapter with `--session-id session_…` and, so owner-only answers asked in a shared room can
+   go to your DM, `--owner-dm <your DM room id>`. No token goes in the vault: the `claude` CLI's own
+   login on this machine is the credential (set `CLAUDE_CONFIG_DIR` for the adapter when that login
+   lives in a non-default config dir; it is passed through to the CLI).
 
 ## Wire
 
-Per task: `claude -p "<text>" --cloud <session_id> --output-format json`, run as an argv list (never a
-shell; the text is one argv element), with only `PATH`, `HOME`, `USER` (the macOS Keychain login needs
-it) and `LANG` in the child's environment. `--claude` picks the executable (default `claude` on PATH;
+Per task: `claude -p --cloud <session_id> --output-format json` with the text on **stdin**, run as an
+argv list (never a shell). The argv carries only that metadata, so the task text never appears in the
+process table. The child's environment has only `PATH`, `HOME`, `USER` (the macOS Keychain login needs
+it), `LANG`, and `CLAUDE_CONFIG_DIR` when the caller sets it. `--claude` picks the executable (default `claude` on PATH;
 the adapter refuses to start, exit 2, when it does not resolve). The CLI returns in about a second with
 `{"ok":true,"session_id":"…","url":"…"}` and exit 0 once the turn is **queued**; it does not return the
 reply.
@@ -43,7 +50,7 @@ Text:
 
 ```
 [sparrow task] Follow your standing AG2 Space instructions for this message: …
-room=<channel_id> thread=<thread_root or none> tier=<owner|team|guest> collaborator=<true|false> task_id=<id>
+room=<channel_id> thread=<thread_root or none> tier=<owner|team|guest> collaborator=<true|false> task_id=<id> channel_kind=<dm|room|unknown> [owner_dm=<room id>]
 note: <NON_OWNER_NOTE>            (non-owner tiers only)
 <UNTRUSTED_TASK_<nonce>>
 <message body, untrusted>
@@ -51,9 +58,16 @@ note: <NON_OWNER_NOTE>            (non-owner tiers only)
 <bridge-written guardrail lines, when the task file has them>
 ```
 
-Everything after the first line is the routine adapter's payload, built by the same function: fresh
-nonce per turn, attested tier and collaborator, header whitespace removed, the Hatch `NON_OWNER_NOTE`
-for non-owner tiers. The whole text is at most 65,536 characters; only the body is cut, ending in
+Everything after the first line is the routine adapter's payload, built by the same shared function:
+fresh nonce per turn, attested tier and collaborator, header whitespace removed, the Hatch
+`NON_OWNER_NOTE` for non-owner tiers. The routing line adds `channel_kind`, read from the attested
+`channel_kind` header the gateway stamps (`dm`, `room`, anything else `unknown`; a body line cannot
+claim it), and `owner_dm` from `--owner-dm`. With them the standing instructions apply the audience
+rule: in the owner's DM, answer there; in a room, post only what the room is meant to read, and send an
+answer meant for the owner alone (research, findings, anything about the owner, any data from the
+owner's connected accounts) to `owner_dm` with exactly one line in the room, "I sent it to you in our
+DM."; with no `owner_dm`, such an answer becomes "I can't answer that here." in the room and nothing
+else. The whole text is at most 65,536 characters; only the body is cut, ending in
 `[truncated]`. A task with no room is not queued.
 
 **Non-owner tiers are refused by default**, with the routine adapter's plain line ("This agent only
@@ -64,16 +78,17 @@ answers its owner here."): the session holds the owner's connector and there is 
 
 | outcome | result file |
 |---|---|
-| exit 0 and `"ok": true` | `[no-send]` + `# claude cloud session: <url>`; with `--result-mode echo`, `Sent to the cloud agent: <url>` (owner tasks only; non-owner rooms always get `[no-send]`) |
-| non-zero exit whose output proves the CLI never reached the service (DNS failure, refused connection), or the executable failed to start | retried after `--backoff` × 2ⁿ (cap `--backoff-max`), up to `--max-retries` (default 2), then "could not be reached … after several tries" |
-| any other non-zero exit, exit 0 without `"ok": true`, or a timeout (`--timeout`, default 60 s) | "may or may not have reached the cloud agent …; it was not retried" — never resubmitted |
+| a receipt with `"ok": true` on stdout, whatever the exit code or stderr | `[no-send]` + `# claude cloud session: <url>`; with `--result-mode echo`, `Sent to the cloud agent: <url>` (owner tasks only; non-owner rooms always get `[no-send]`) |
+| no receipt, and a non-zero exit whose output proves the CLI never reached the service (DNS failure, refused connection), or the executable failed to start | retried after `--backoff` × 2ⁿ (cap `--backoff-max`), up to `--max-retries` (default 2), then "could not be reached … after several tries" |
+| no receipt otherwise: any other non-zero exit, exit 0 without one, or a timeout (`--timeout`, default 60 s; a receipt printed before the timeout still counts as queued) | "may or may not have reached the cloud agent …; it was not retried" — never resubmitted |
 
 A non-owner task's failure line never carries the exit code. Before each call the adapter writes
 `state/sending/<task_id>` and removes it only with the result, so a crash mid-send is answered on
 restart with the "may or may not have reached" line instead of a second queued turn (at most once).
 
 Pacing: at least `--min-gap-seconds` (default 2) between queued turns and at most `--max-per-hour`
-(default 60) in a sliding hour, kept in `state/sends.json` so a restart does not reset either.
+(default 60) in a sliding hour, kept in `state/sends.json` so a restart does not reset either. The cap
+counts turns that were queued or may have been; an attempt proven unsent does not use it.
 
 ## Limits
 
@@ -86,7 +101,8 @@ Pacing: at least `--min-gap-seconds` (default 2) between queued turns and at mos
 
 ## Measured
 
-By hand on Claude Code 2.1.302, not by this adapter: queuing a turn returned in about 1 s; in the probe
+By hand on Claude Code 2.1.302, not by this adapter: queuing a turn returned in about 1 s, and a turn sent on stdin reached the session as the exact text; in the probe
 the session's `ag2_whoami` plus room post took 16 s. This adapter was tested only against a fake
-`claude` executable: `python3 packages/ag2-sparrow/tests/test_claude_cloud_session_adapter.py` (under the
-repository coverage gate through `tests/ag2-sparrow-claude-cloud-session.test.py`).
+`claude` executable: `python3 packages/ag2-sparrow/tests/test_claude_cloud_session_adapter.py` and the
+shared loop's `test_adapter_relay_loop.py` (under the repository coverage gate through
+`tests/ag2-sparrow-claude-cloud-session.test.py` and `tests/ag2-sparrow-relay-loop.test.py`).
