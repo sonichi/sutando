@@ -347,6 +347,8 @@ def main() -> int:
     spec = importlib.util.spec_from_file_location("rtc", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
     rtc = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rtc)
+    # The binding key lives under the passwd home: every load shares this module, never the real one.
+    rtc.gateway_instance._home = lambda: str(Path(tmp, "home"))
 
     # 1. pull a task and write it locally
     resp = rtc._req("GET", "/v1/tasks?wait=0")
@@ -1306,8 +1308,6 @@ def main() -> int:
     _real_identity, _real_state = rtc._reenroll_identity, rtc._STATE
     rtc._reenroll_identity = lambda: "@agent-t:example.org"  # the row match, not an env var the CI box lacks
     rtc._STATE = Path(tempfile.mkdtemp(prefix="rtc-routing-"))  # the persisted reading lands here, never live state
-    _real_xdg = os.environ.get("XDG_CONFIG_HOME")
-    os.environ["XDG_CONFIG_HOME"] = str(rtc._STATE / "config")  # the binding key too
     rtc._ROUTING.update(owner_dm="", next=0.0, loaded=True)
     STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
     (rtc.RESULTS_DIR / "proactive-t1b.txt").write_text("to the dm\n")
@@ -1423,10 +1423,6 @@ def main() -> int:
     STATE["agents"] = None  # teardown: the sections below run on the harness reading, no gateway lookups
     rtc._ROUTING.update(owner_dm="!owner:example.org", persisted="", identity="", gateway="", next=time.time() + 3600, loaded=True)
     rtc._reenroll_identity, rtc._STATE = _real_identity, _real_state
-    if _real_xdg is None:
-        os.environ.pop("XDG_CONFIG_HOME", None)
-    else:
-        os.environ["XDG_CONFIG_HOME"] = _real_xdg
     # 3.6 cross-bridge claim gate (proactive_routing wired by the loader).
     # Hermetic: the gate asks claude_home_path() whether the routed bridge is
     # configured, so an ambient ~/.claude would decide these cases from the

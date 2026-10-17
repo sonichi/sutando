@@ -44,6 +44,10 @@ VALUES = {"<AGENT_MXID>": AGENT, "<REPLY_COMMAND>": "/opt/bin/ag2-sparrow-hatch"
 
 
 GW = "https://gw.example/relay"
+PASSWD_HOME = gateway_instance._home
+# A child bridge keys under its test HOME: the passwd home is the real one.
+PRELUDE = ("import os\nfrom ag2_sparrow import gateway_instance as _gi\n"
+           "_gi._home = lambda: os.environ['HOME']\n")
 
 
 def bind(state, room, instance="", identity=AGENT, gateway=GW, status_agent=AGENT,
@@ -73,6 +77,9 @@ class Base(unittest.TestCase):
                                            "SPARROW_HATCH_CONFIG": str(self.home / "config")})
         env.start()
         self.addCleanup(env.stop)
+        home = mock.patch.object(gateway_instance, "_home", lambda: str(self.home))
+        home.start()
+        self.addCleanup(home.stop)
 
 
 class Heartbeat(Base):
@@ -111,7 +118,7 @@ print(json.dumps({"routing": json.loads(routing), "status": json.loads(status),
                    AGENT_CONNECT_STATE_DIR=str(self.state),
                    REMOTE_TASK_URL="https://gw.example/relay?tenant=a",
                    REMOTE_TASK_TOKEN="fake-relay-token-0123456789abcdef", **extra)
-        r = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True,
+        r = subprocess.run([sys.executable, "-c", PRELUDE + script], env=env, capture_output=True,
                            text=True, cwd=str(self.home), timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1])
@@ -128,6 +135,96 @@ print(json.dumps({"routing": json.loads(routing), "status": json.loads(status),
         self.assertEqual(out["reloaded"], "!dm:ag2.space !old:x -",
                          "its own record and a legacy one reload; a foreign binding does not")
         self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space")
+
+    COLD = """
+import json
+from unittest import mock
+from ag2_sparrow import gateway_instance, remote_gateway_bridge as m
+row = {"agents": [{"id": m._reenroll_identity(), "owner": "@owner:ag2.space",
+                   "owner_dm_room": "!dm:ag2.space"}]}
+key_before = gateway_instance.binding_key_path().exists()
+with mock.patch.object(m, "_req", return_value=row):
+    m.refresh_routing(force=True)
+m._emit_gateway_status(True)
+print(json.dumps({"key_before": key_before, "url": m.URL,
+                  "key_after": gateway_instance.binding_key_path().exists(),
+                  "status": json.loads(m.GATEWAY_STATUS_FILE.read_text())}))
+"""
+
+    def legacy(self, gateway="https://gw.example/relay?tenant=a"):
+        path = self.state / "owner-routing.json"
+        path.write_text(json.dumps({"identity": AGENT, "gateway": gateway, "owner_dm": "!dm:ag2.space"}))
+        return path
+
+    def test_a_cold_upgrade_rewrites_the_legacy_record_once_and_keeps_the_owner_dm(self):
+        path = self.legacy()
+        self.assertFalse(gateway_instance.binding_key_path().exists())
+        out = self.bridge(self.COLD, AGENT_MXID=AGENT)
+        self.assertFalse(out["key_before"], "truly cold: no key before the first load")
+        self.assertTrue(out["key_after"])
+        raw = path.read_text()
+        self.assertNotIn("tenant", raw, "the full URL is gone after one pass")
+        record = json.loads(raw)
+        digest = gateway_instance.binding_digest(AGENT, out["url"])
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(record, {"identity": AGENT, "gateway": GW, "binding": digest,
+                                  "owner_dm": "!dm:ag2.space"})
+        self.assertEqual(out["status"]["gateway_binding"], digest)
+        self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space")
+        before = path.stat()
+        self.bridge(self.COLD, AGENT_MXID=AGENT)
+        after = path.stat()
+        self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns),
+                         "a migrated record is not rewritten")
+
+    def test_a_legacy_record_from_another_gateway_loses_its_url_and_authorizes_nothing(self):
+        path = self.legacy("https://old.example/relay?tenant=old")
+        out = self.bridge(self.COLD.replace('"owner_dm_room": "!dm:ag2.space"', '"x": 1'),
+                          AGENT_MXID=AGENT)
+        self.assertTrue(out["key_after"])
+        record = json.loads(path.read_text())
+        self.assertNotIn("tenant", json.dumps(record))
+        self.assertEqual(record["gateway"], "https://old.example/relay")
+        self.assertEqual(record["binding"], gateway_instance.binding_digest(
+            AGENT, "https://old.example/relay?tenant=old"))
+        self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "")
+
+    def test_without_a_key_a_legacy_record_is_neither_rewritten_nor_marked_persisted(self):
+        path = self.legacy()
+        script = ("from ag2_sparrow import gateway_instance\n"
+                  "gateway_instance._binding_key = lambda create: None\n" + self.COLD)
+        self.bridge(script, AGENT_MXID=AGENT)
+        self.assertIn("tenant", path.read_text(), "no unbound record is written")
+        out = self.bridge(self.COLD, AGENT_MXID=AGENT)
+        self.assertNotIn("tenant", path.read_text(), "the next load with a key migrates it")
+        self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space", out)
+
+    STARTUP = """
+import json
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m
+lines = []
+class Stop(Exception):
+    pass
+def stop(*a, **k):
+    raise Stop()
+with mock.patch.object(m, "_log", lines.append), \\
+        mock.patch.object(m, "_acquire_singleton", return_value=True), \\
+        mock.patch.object(m, "_start_lock_heartbeat"), \\
+        mock.patch.object(m, "_emit_gateway_status", stop):
+    try:
+        m.main()
+    except Stop:
+        pass
+print(json.dumps({"lines": lines}))
+"""
+
+    def test_the_startup_log_names_only_the_redacted_gateway(self):
+        out = self.bridge(self.STARTUP)
+        start = [ln for ln in out["lines"] if ln.startswith("starting")]
+        self.assertEqual(len(start), 1, out["lines"])
+        self.assertIn(f"gateway={GW} ", start[0])
+        self.assertNotIn("tenant", "\n".join(out["lines"]))
 
     SCRIPT = """
 import json
@@ -150,7 +247,7 @@ print(json.dumps({"sent": req.call_args.args[2],
                    AGENT_CONNECT_STATE_DIR=str(self.state),
                    REMOTE_TASK_URL="https://gw.example/relay",
                    REMOTE_TASK_TOKEN="fake-relay-token-0123456789abcdef")
-        r = subprocess.run([sys.executable, "-c", self.SCRIPT], env=env, capture_output=True,
+        r = subprocess.run([sys.executable, "-c", PRELUDE + self.SCRIPT], env=env, capture_output=True,
                            text=True, cwd=str(self.home), timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(r.stdout.strip().splitlines()[-1])
@@ -267,13 +364,20 @@ class WakeContext(Base):
         path.write_text(json.dumps(record))
         self.assertEqual(runtime_text.owner_dm_room(self.state), "")
 
-    def test_the_binding_key_follows_the_config_home(self):
-        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.home / "xdg")}):
-            self.assertEqual(gateway_instance.binding_key_path(),
-                             self.home / "xdg" / "ag2-sparrow" / "binding.key")
-        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}):
-            self.assertEqual(gateway_instance.binding_key_path(),
-                             self.home / ".config" / "ag2-sparrow" / "binding.key")
+    def test_the_binding_key_follows_the_passwd_home_never_the_environment(self):
+        entry = mock.Mock(pw_dir=str(self.home / "pw"))
+        want = self.home / "pw" / ".config" / "ag2-sparrow" / "binding.key"
+        with mock.patch.object(gateway_instance, "_home", PASSWD_HOME), \
+                mock.patch.object(gateway_instance.pwd, "getpwuid", return_value=entry) as getpwuid:
+            for env in ({"XDG_CONFIG_HOME": str(self.home / "xdg"), "HOME": str(self.home / "a")},
+                        {"XDG_CONFIG_HOME": "", "HOME": str(self.home / "b")}):
+                with mock.patch.dict(os.environ, env):
+                    self.assertEqual(gateway_instance.binding_key_path(), want, env)
+            getpwuid.assert_called_with(os.geteuid())
+        with mock.patch.object(gateway_instance, "_home", PASSWD_HOME), \
+                mock.patch.object(gateway_instance.pwd, "getpwuid", side_effect=KeyError("uid")):
+            self.assertEqual(gateway_instance.binding_digest(AGENT, GW, create=True), "",
+                             "no passwd entry: no key, never an environment fallback")
 
     def test_the_binding_is_keyed_per_install_never_a_plain_hash_of_the_url(self):
         import hashlib
@@ -287,13 +391,66 @@ class WakeContext(Base):
         self.assertNotEqual(gateway_instance.binding_digest(AGENT, GW), digest)
         key.unlink()
         self.assertEqual(gateway_instance.binding_digest(AGENT, GW), "", "a reader never makes one")
-        key.write_text("not a key")
-        self.assertEqual(gateway_instance.binding_digest(AGENT, GW), "")
-        key.write_text("2" * 64)
-        with mock.patch.object(gateway_instance.Path, "exists", return_value=False), \
-                mock.patch.object(gateway_instance.os, "open", side_effect=FileExistsError):
-            self.assertTrue(gateway_instance.binding_digest(AGENT, GW, create=True),
-                            "a key another process created first is used")
+        self.assertFalse(key.exists())
+
+    def key(self, text, mode=0o600, age=0.0):
+        path = gateway_instance.binding_key_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        os.chmod(path, mode)
+        if age:
+            os.utime(path, (path.stat().st_mtime - age,) * 2)
+        return path
+
+    def assert_fresh_key(self, path):
+        self.assertRegex(path.read_text(), r"^[0-9a-f]{64}$")
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual([p.name for p in path.parent.iterdir()], [path.name], "no temp left")
+
+    def test_an_empty_short_or_loose_key_is_corrupt_and_replaced_only_once_stale(self):
+        for text, mode in (("", 0o600), ("abc", 0o600), ("not a key" * 8, 0o600),
+                           ("3" * 64, 0o644), ("3" * 64, 0o640)):
+            with self.subTest(text=text[:8], mode=oct(mode)):
+                path = self.key(text, mode)
+                self.assertEqual(gateway_instance.binding_digest(AGENT, GW), "", "a reader refuses it")
+                self.assertEqual(gateway_instance.binding_digest(AGENT, GW, create=True), "",
+                                 "a young bad key may be an older writer mid-write")
+                self.assertEqual(path.read_text(), text)
+                os.utime(path, (path.stat().st_mtime - 60,) * 2)
+                digest = gateway_instance.binding_digest(AGENT, GW, create=True)
+                self.assertEqual(len(digest), 64)
+                self.assert_fresh_key(path)
+                self.assertEqual(gateway_instance.binding_digest(AGENT, GW), digest)
+                path.unlink()
+
+    def test_a_crash_before_the_key_is_published_leaves_no_key(self):
+        path = gateway_instance.binding_key_path()
+        with mock.patch.object(gateway_instance.os, "fsync", side_effect=OSError("crash")):
+            self.assertEqual(gateway_instance.binding_digest(AGENT, GW, create=True), "")
+        self.assertFalse(path.exists(), "never an empty or partial key at the final path")
+        self.assertEqual(list(path.parent.iterdir()), [])
+        with mock.patch.object(gateway_instance.os, "link", side_effect=OSError("crash")):
+            self.assertEqual(gateway_instance.binding_digest(AGENT, GW, create=True), "")
+        self.assertFalse(path.exists())
+        self.assertEqual(len(gateway_instance.binding_digest(AGENT, GW, create=True)), 64)
+        self.assert_fresh_key(path)
+
+    def test_a_key_another_process_published_first_is_used(self):
+        path = gateway_instance.binding_key_path()
+        real_link = os.link
+
+        def race(src, dst):
+            self.key("4" * 64)
+            real_link(src, dst)
+
+        with mock.patch.object(gateway_instance.os, "link", race):
+            digest = gateway_instance.binding_digest(AGENT, GW, create=True)
+        self.assertEqual(path.read_text(), "4" * 64, "the winner's key is kept")
+        import hashlib
+        import hmac
+        self.assertEqual(digest, hmac.new(b"4" * 64, f"{AGENT}\n{GW}".encode(),
+                                          hashlib.sha256).hexdigest())
+        self.assert_fresh_key(path)
 
     def test_the_cli_prints_the_cached_text(self):
         (self.home / "config").write_text(f"AGENT_MXID={AGENT}\nSTATE_DIR={self.state}\n"
@@ -318,11 +475,15 @@ class WakeContext(Base):
 
 class RedactUrl(unittest.TestCase):
     def test_a_gateway_url_keeps_only_scheme_host_port_and_path(self):
+        closed = gateway_instance.REDACTED_URL
         cases = {"https://u:p@gw.example:8443/relay?token=x#f": "https://gw.example:8443/relay",
-                 "not a url": "not a url", "http://[::1": "http://[::1",
-                 "http://gw.example:99999/x": "http://gw.example:99999/x"}
+                 "https://[::1]:8443/relay?token=x": "https://[::1]:8443/relay",
+                 "not a url?token=SECRET": closed, "http://[::1?token=SECRET": closed,
+                 "http://gw.example:99999/x?token=SECRET": closed,
+                 "gw.example/relay?token=SECRET": closed, "//u:SECRET@/x": closed, "": closed}
         for raw, want in cases.items():
             self.assertEqual(gateway_instance.redact_url(raw), want, raw)
+            self.assertNotIn("SECRET", gateway_instance.redact_url(raw))
 
 
 class Fetch(Base):

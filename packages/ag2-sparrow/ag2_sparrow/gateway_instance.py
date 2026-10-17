@@ -12,8 +12,16 @@ import hashlib
 import hmac
 import os
 import re
+import stat
+import tempfile
+import time
 import urllib.parse
 from pathlib import Path
+
+try:
+    import pwd
+except ImportError:  # pragma: no cover - not POSIX
+    pwd = None  # type: ignore[assignment]
 
 INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 
@@ -43,44 +51,105 @@ def outbox_root(results_dir: Path, instance: str) -> Path:
     return Path(results_dir) / f".outbox{suffix(instance)}"
 
 
+REDACTED_URL = "<unparseable gateway URL>"
+
+
 def redact_url(value: str) -> str:
-    """Scheme, host, port and path of a gateway URL, as Sparrow persists it: userinfo,
-    query and fragment dropped. The bare string when it does not parse."""
+    """Scheme, host, port and path of a gateway URL, as Sparrow persists and logs it: userinfo,
+    query and fragment dropped. Fails closed: REDACTED_URL when it does not parse as one."""
     try:
         p = urllib.parse.urlsplit(str(value))
-        if not p.scheme and not p.netloc:
-            return str(value)
-        host = p.hostname or ""
+        if not p.scheme or not p.hostname:
+            return REDACTED_URL
+        host = f"[{p.hostname}]" if ":" in p.hostname else p.hostname
         if p.port:
             host = f"{host}:{p.port}"
         return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
     except Exception:  # noqa: BLE001 - redaction must never break status I/O
-        return str(value)
+        return REDACTED_URL
+
+
+KEY_GRACE_S = 5.0
+
+
+def _home() -> str:
+    """The effective uid's home from pwd, never the environment: every launch context of one
+    user (a service unit, a hook, a shell) resolves the same key."""
+    if pwd is None:
+        raise OSError("no passwd database")
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_dir
+    except KeyError:
+        raise OSError("no passwd entry for uid %d" % os.geteuid()) from None
 
 
 def binding_key_path() -> Path:
-    """The per-install key the binding is computed with: in the user's config dir
-    (XDG_CONFIG_HOME, else ~/.config), never the state dir, which may be synced."""
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return Path(base) / "ag2-sparrow" / "binding.key"
+    """The per-install key the binding is computed with: in the user's config dir under the
+    passwd home, never the state dir, which may be synced."""
+    return Path(_home()) / ".config" / "ag2-sparrow" / "binding.key"
 
 
-def _binding_key(create: bool) -> "bytes | None":
-    path = binding_key_path()
-    if create and not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            pass
-        else:
-            with os.fdopen(fd, "w", encoding="ascii") as fh:
-                fh.write(os.urandom(32).hex())
+def _read_key(path: Path) -> "bytes | None":
+    """The key, only from a regular file this uid owns with mode 0600 and 64 hex digits."""
     try:
-        key = path.read_text(encoding="ascii").strip()
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "r", encoding="ascii") as fh:
+            st = os.fstat(fh.fileno())
+            if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()
+                    or stat.S_IMODE(st.st_mode) != 0o600):
+                return None
+            key = fh.read(256).strip()
     except (OSError, UnicodeDecodeError):
         return None
     return key.encode("ascii") if re.fullmatch(r"[0-9a-f]{64}", key) else None
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _binding_key(create: bool) -> "bytes | None":
+    try:
+        path = binding_key_path()
+    except OSError:
+        return None
+    key = _read_key(path)
+    if key is not None or not create:
+        return key
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as fh:
+            os.fchmod(fh.fileno(), 0o600)
+            fh.write(os.urandom(32).hex())
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.link(tmp, str(path))  # the key appears whole or not at all
+        except FileExistsError:
+            key = _read_key(path)
+            if key is not None:
+                return key
+            # A bad key younger than the grace may be an older writer mid-write.
+            if time.time() - path.stat().st_mtime < KEY_GRACE_S:
+                return None
+            os.replace(tmp, str(path))
+        _fsync_dir(path.parent)
+        return _read_key(path)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def binding_digest(identity: str, gateway_url: str, create: bool = False) -> str:

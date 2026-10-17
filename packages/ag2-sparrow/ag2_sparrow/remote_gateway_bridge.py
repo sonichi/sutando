@@ -60,6 +60,7 @@ import glob
 import base64
 import contextlib
 import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -1793,6 +1794,29 @@ def _routing_file() -> Path:
     return _STATE / f"owner-routing{_INST_SUFFIX}.json"
 
 
+def _routing_record(identity: str, gateway_url: str, owner_dm: str) -> "dict | None":
+    """The owner-routing record as persisted: the redacted URL and the keyed binding of the full
+    one, never the full URL. None when no binding can be made, so nothing unbound is written."""
+    binding = gateway_instance.binding_digest(identity, gateway_url, create=True)
+    if not binding:
+        return None
+    return {"identity": identity, "gateway": _redact_url(gateway_url), "binding": binding,
+            "owner_dm": owner_dm}
+
+
+def _migrate_routing(d: dict) -> dict:
+    """A record from before the binding field holds the full URL: rewrite it once, atomically,
+    as the bound form. The record is returned as it now stands on disk."""
+    gateway = d.get("gateway")
+    if d.get("binding") or not isinstance(gateway, str) or not gateway:
+        return d
+    record = _routing_record(str(d.get("identity") or ""), gateway, str(d.get("owner_dm") or ""))
+    if record is None or not _durable_write(_routing_file(), json.dumps(record)):
+        _log("owner-routing: legacy record not migrated yet — retried at the next load")
+        return d
+    return record
+
+
 def _load_routing() -> None:
     if _ROUTING["loaded"]:
         return
@@ -1802,11 +1826,15 @@ def _load_routing() -> None:
         d = json.loads(_routing_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
+    if not isinstance(d, dict):
+        return
+    d = _migrate_routing(d)
     # another agent's reading, or this agent's reading from another gateway, authorizes nothing
-    if isinstance(d, dict) and d.get("identity") == _reenroll_identity() and (
-            d.get("binding") == gateway_instance.binding_digest(_reenroll_identity(), URL)
-            if d.get("binding") else d.get("gateway") == URL):
+    if d.get("identity") == _reenroll_identity() and d.get("binding") and hmac.compare_digest(
+            str(d["binding"]), gateway_instance.binding_digest(_reenroll_identity(), URL)):
         _ROUTING["owner_dm"] = _ROUTING["persisted"] = str(d.get("owner_dm") or "")
+    elif d.get("identity") == _reenroll_identity() and not d.get("binding") and d.get("gateway") == URL:
+        _ROUTING["owner_dm"] = str(d.get("owner_dm") or "")  # unmigrated: the writer rewrites it
 
 
 def refresh_routing(force: bool = False) -> None:
@@ -1830,18 +1858,11 @@ def refresh_routing(force: bool = False) -> None:
     if _GATEWAY_OWNER_DM_HINT:
         _ROUTING["owner_dm"] = _GATEWAY_OWNER_DM_HINT
     if _ROUTING["owner_dm"] and _ROUTING["owner_dm"] != _ROUTING["persisted"]:  # until durably published
-        try:
-            f = _routing_file(); f.parent.mkdir(parents=True, exist_ok=True)
-            tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({"identity": _reenroll_identity(), "gateway": _redact_url(URL),
-                                       "binding": gateway_instance.binding_digest(
-                                           _reenroll_identity(), URL, create=True),
-                                       "owner_dm": _ROUTING["owner_dm"]}), encoding="utf-8")
-            os.replace(tmp, f)
-            _ROUTING["persisted"] = _ROUTING["owner_dm"]
-        except OSError:
+        record = _routing_record(_reenroll_identity(), URL, _ROUTING["owner_dm"])
+        if record is None or not _durable_write(_routing_file(), json.dumps(record)):
             _ROUTING["next"] = now + ROUTING_RETRY_S  # in memory it holds; the write is retried soon
             return
+        _ROUTING["persisted"] = _ROUTING["owner_dm"]
     _ROUTING["next"] = now + (ROUTING_REFRESH_S if _ROUTING["owner_dm"] else ROUTING_RETRY_S)
 
 
@@ -2513,8 +2534,8 @@ def _redact_url(value: str) -> str:
     """Scheme+host+path only — drop userinfo, query, and fragment before a URL
     is persisted. `gateway-status.json` lives under `state/` (which vault-syncs),
     so a gateway configured with `user:pass@` userinfo or a `?token=` query param
-    must not land there in plaintext. Falls back to the bare string on any parse
-    failure (never raise from a best-effort status write)."""
+    must not land there in plaintext. Fails closed to a placeholder on any parse
+    failure (never the raw value, never raise from a best-effort status write)."""
     return gateway_instance.redact_url(value)
 
 
@@ -2699,8 +2720,8 @@ def _reload_rotated_token() -> bool:
     # (url_from_token) AND the split form (bare secret + a separate
     file_url = (url_from_token or _read_token_file_url(TOKEN_FILE)).rstrip("/")
     if file_url and file_url != URL:
-        _log(f"token file names a DIFFERENT gateway ({file_url}) "
-             f"than the running one ({URL}) — a URL change is not hot-swappable; "
+        _log(f"token file names a DIFFERENT gateway ({_redact_url(file_url)}) "
+             f"than the running one ({_redact_url(URL)}) — a URL change is not hot-swappable; "
              "restart the bridge to move gateways")
         return False
     if not secret or secret == TOKEN:
@@ -7249,7 +7270,7 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001 — a parked result left behind waits for the next start
         _log(f"relay result reclaim failed ({type(e).__name__}: {e}) — continuing")
     abandoned_suspects: set[str] = set()
-    _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
+    _log(f"starting — gateway={_redact_url(URL)} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
     # Always name where the diagnostics live: after an incident this line is the
     # trailhead (a bare-launched bridge under default dirs writes status to
