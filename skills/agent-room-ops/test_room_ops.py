@@ -1601,6 +1601,30 @@ class CitationCLITests(EnvCase):
                 room_ops._main(["mention", "peer", "ping", ROOM, "--reply-to", EV])
         self.assertEqual(cap["kw"], {"reply_to": EV})
 
+    def test_say_with_the_message_in_the_room_slot_is_refused_before_posting(self):
+        out = io.StringIO()
+        with mock.patch.object(room_ops._say, "say", side_effect=AssertionError("called")):
+            with contextlib.redirect_stdout(out):
+                rc = room_ops._main(["say", "Got it, on it now.", ROOM])
+        self.assertEqual(rc, 1)
+        res = json.loads(out.getvalue())
+        self.assertIs(res["ok"], False)
+        self.assertIn("argument order", res["reason"])
+
+    def test_mention_with_the_room_first_is_refused_before_posting(self):
+        out = io.StringIO()
+        with mock.patch.object(room_ops._mention, "mention", side_effect=AssertionError("called")):
+            with contextlib.redirect_stdout(out):
+                rc = room_ops._main(["mention", ROOM, "peer", "ping"])
+        self.assertEqual(rc, 1)
+        self.assertIs(json.loads(out.getvalue())["ok"], False)
+
+    def test_a_room_alias_is_accepted(self):
+        with mock.patch.object(room_ops._say, "say", return_value={"ok": True}) as said:
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["say", "#team:ag2.space", "hi"])
+        self.assertEqual(said.call_args.args[1], "#team:ag2.space")
+
     def test_help_says_a_citation_is_not_a_thread(self):
         # The surface a caller hits first must carry the limitation, not only
         # the module docstring and the skill doc.
