@@ -585,7 +585,9 @@ accepted ten minutes into its retry run is also reported under
 and the oldest one's age in seconds, `oldest_age_s`. The age is measured from the
 outbox record's `retry.started_at`, so it starts again after a requeue or a
 reclaim at start, which drop the retry state. The result keeps being retried, and
-the field is absent while none is. While the marks cannot be read, only a
+the field is absent while none is, and also while the marks file cannot be read
+(logged on its own backoff), so its absence does not prove nothing is retrying.
+While the marks cannot be read, only a
 result that may answer a relay ask waits: a voice task under an `ask-…` id (the
 lane's `ask_sutando` ids). The session-end task (`voice-end-…`) and every other
 result go on. Every result without a kept mark keeps the bounded policy above,

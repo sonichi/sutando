@@ -5699,7 +5699,9 @@ def _relay_results_retrying(now: float) -> "dict | None":
     more into their retry run, and the oldest one's age in seconds, both from the outbox
     record's `retry.started_at`, which a requeue or a reclaim at start resets. None when none
     has, and when it cannot be worked out (logged on a backoff), so the rest of the status is
-    still written. Read from the kept marks and their records; an unreadable one is skipped."""
+    still written. Read from the kept marks and their records; an unreadable one is skipped.
+    While the marks file cannot be read (`_load_ack_first` returns None and logs that on its
+    own backoff) the field is left out too, so its absence does not prove nothing is retrying."""
     try:
         root = _delivery_core("relay").backend.root
         ages = []
