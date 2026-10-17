@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 
 from . import local_task_protocol, result_disposal, task_priority
-from .task_io import (load_done, non_owner_note, parse_task, record_done, stop_requested, stoppable_sleep,
+from .task_io import (is_collaborator, load_done, non_owner_note, parse_task, record_done, stop_requested, stoppable_sleep,
                       write_atomic)
 
 TEXT_MAX = 65536
@@ -42,7 +42,7 @@ def build_payload(task_id, headers, message, operator_lines=(), note=None, text_
     non-owner tier, the note; then the untrusted body between nonce markers; then the bridge-written
     lines, outside them. Only the body is cut to fit `text_max`, so the markers and lines survive."""
     tier = headers.get("access_tier") or "guest"
-    collaborator = tier == "team" and headers.get("collaborator") == "true"
+    collaborator = is_collaborator(headers)
     room = _field(headers.get("channel_id")) or _field(headers.get("source_room_id"))
     thread = _field(headers.get("thread_root")) or "none"
     fields = "room=%s thread=%s tier=%s collaborator=%s task_id=%s" % (
@@ -226,10 +226,12 @@ class RelayLoop:
             return None
 
     def refusal(self, name, headers, seen):
-        """None when the task may be served. For a non-owner tier without --allow-non-owner the refusal
-        is finished and its step result returned: True when published, False when parked."""
+        """None when the task may be served: the owner, an attested collaborator (served read-only
+        with the non-owner note whatever --allow-non-owner says), or any tier under --allow-non-owner.
+        Otherwise the refusal is finished and its step result returned: True when published, False
+        when parked."""
         tier = headers.get("access_tier") or "guest"
-        if tier == "owner" or self.args.allow_non_owner:
+        if tier == "owner" or is_collaborator(headers) or self.args.allow_non_owner:
             return None
         log("refused (non-owner, --allow-non-owner not set) ->", name[:-4], tier)
         return self.finish(name, NON_OWNER_REFUSED, seen)

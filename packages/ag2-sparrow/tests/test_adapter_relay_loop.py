@@ -105,6 +105,20 @@ class LimiterTest(unittest.TestCase):
             self.assertIn((now[0] - 2, "task-a"), rl.RateLimiter(lim.path, 2, lambda: now[0]).entries)
 
 
+    def test_admission_serves_owner_and_attested_collaborator_and_refuses_the_rest(self):
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()):
+            loop = Loop(d)
+            seen = set()
+            collab = {"access_tier": "team", "collaborator": "true"}
+            self.assertIsNone(loop.refusal("task-c.txt", collab, seen))
+            for n, headers in enumerate(({"access_tier": "team", "collaborator": "false"}, {"access_tier": "team"},
+                                         {"access_tier": "guest", "collaborator": "true"}, {})):
+                name = "task-r%d.txt" % n
+                self.assertTrue(loop.refusal(name, headers, seen), headers)
+                self.assertEqual((Path(loop.args.results) / name).read_text(), rl.NON_OWNER_REFUSED)
+            loop.args.allow_non_owner = True
+            self.assertIsNone(loop.refusal("task-a.txt", {"access_tier": "guest"}, seen), "the flag still gates plain non-owners")
+
     def test_a_negative_once_is_refused_at_parsing(self):
         for build, need in ((sa.build_parser, ["--session-id", "session_x"]), (ra.build_parser, ["--trigger-id", "trig_x"]),
                             (cc.build_parser, ["--server", "stub"])):

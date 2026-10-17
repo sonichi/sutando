@@ -40,6 +40,11 @@ def attested_headers(text: str) -> "local_task_protocol.TaskHeaders":
     return strict
 
 
+def is_collaborator(headers):
+    """The broker attested a collaborator: the team tier with `collaborator: true` in the parsed headers."""
+    return headers.get("access_tier") == "team" and headers.get("collaborator") == "true"
+
+
 def non_owner_note():
     return NON_OWNER_NOTE
 

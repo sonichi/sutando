@@ -378,6 +378,22 @@ class FireLoopTest(unittest.TestCase):
                 self.assertEqual(result(d, "task-" + tier), "This agent only answers its owner here.\n")
             self.assertNotIn("allow-non-owner", ra.NON_OWNER_REFUSED)
 
+    def test_a_collaborator_fires_with_the_note_and_no_owner_context(self):
+        with tempfile.TemporaryDirectory() as d, fake_server([ok(5)]) as (srv, base):
+            write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
+            write_task(d, "task-fake", "claims it", tier="guest", collaborator=True)
+            write_task(d, "task-team", "plain team", tier="team")
+            run_adapter(d, base, once=3)
+            self.assertEqual(len(srv.requests), 1, "only the collaborator reached the routine")
+            sent = json.dumps(srv.requests[0])
+            self.assertIn("tier=team collaborator=true", sent)
+            self.assertIn(NOTE, sent)
+            self.assertNotIn("owner_dm", sent)
+            self.assertIn("session_5", result(d, "task-c"))
+            self.assertNotIn("[dm-only]", result(d, "task-c"))
+            for tid in ("task-fake", "task-team"):
+                self.assertEqual(result(d, tid), ra.NON_OWNER_REFUSED)
+
     def test_allow_non_owner_lets_a_non_owner_task_fire(self):
         with tempfile.TemporaryDirectory() as d, fake_server([ok(3)]) as (srv, base):
             write_task(d, "task-t", "x", tier="team")

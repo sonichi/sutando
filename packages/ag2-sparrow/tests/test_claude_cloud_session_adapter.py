@@ -382,6 +382,31 @@ class QueueLoopTest(unittest.TestCase):
             for tier in ("team", "guest", "superuser"):
                 self.assertEqual(result(d, "task-" + tier), ra.NON_OWNER_REFUSED)
 
+    def test_a_collaborator_is_served_with_the_note_and_no_owner_context(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok(7)])
+            write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
+            write_task(d, "task-fake", "claims it", tier="guest", collaborator=True)
+            write_task(d, "task-team", "plain team", tier="team")
+            run_adapter(d, fake, once=3, owner_dm="!dm:ag2.space")
+            self.assertEqual(len(fake.calls()), 1, "only the collaborator reached the provider")
+            sent = text_of(fake.calls()[0])
+            self.assertIn("tier=team collaborator=true", sent)
+            self.assertIn("\nnote: " + NOTE + "\n", sent)
+            for owner_only in ("owner_dm", "!dm:ag2.space"):
+                self.assertNotIn(owner_only, sent)
+            self.assertTrue(result(d, "task-c").startswith("[no-send]\n"), "the room's result, no DM marker")
+            self.assertNotIn("[dm-only]", result(d, "task-c"))
+            for tid in ("task-fake", "task-team"):
+                self.assertEqual(result(d, tid), ra.NON_OWNER_REFUSED, "a claim on another tier, or plain team")
+
+    def test_a_guest_stays_refused_with_the_same_message_beside_a_collaborator(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok()])
+            write_task(d, "task-g", "x", tier="guest")
+            run_adapter(d, fake, once=1)
+            self.assertEqual((fake.calls(), result(d, "task-g")), ([], ra.NON_OWNER_REFUSED))
+
     def test_allow_non_owner_queues_with_the_note(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [ok(3)])

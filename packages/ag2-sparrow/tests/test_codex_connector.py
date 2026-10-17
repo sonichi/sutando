@@ -302,6 +302,19 @@ class TierPolicyTest(unittest.TestCase):
             self.assertFalse(os.path.exists(scratch), "removed after the turn")
             self.assertIn("cwd=%s]" % os.path.abspath(d), run_owner_echo(d))
 
+    def test_a_collaborator_runs_read_only_ephemeral_with_the_note_and_no_owner_thread(self):
+        tid = "task-1792100000003"
+        with tempfile.TemporaryDirectory() as d:
+            write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
+            with mock.patch.object(cc, "wrap_untrusted", wraps=cc.wrap_untrusted) as spy:
+                self.assertEqual(run_connector(d, once=1, extra=["--sandbox", "danger-full-access"]), 0)
+            self.assertEqual((spy.call_args.args[1]["access_tier"], spy.call_args.args[1]["collaborator"]),
+                             ("team", "true"))
+            self.assertEqual(spy.call_args.args[4], cc.NON_OWNER_NOTE)
+            self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, tid))
+            self.assertEqual(saved_threads(d), [], "no owner thread is opened or saved")
+            self.assertNotIn("[dm-only]", result(d, tid))
+
     def test_mid_layout_team_task_runs_ephemeral(self):
         tid = "task-1792100000002"
         with tempfile.TemporaryDirectory() as d:

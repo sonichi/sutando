@@ -49,7 +49,7 @@ def channel_kind(headers):
 
 def build_text(task_id, headers, message, operator_lines=(), note=None, owner_dm=None):
     extra = [("channel_kind", channel_kind(headers))]
-    if owner_dm:
+    if owner_dm and headers.get("access_tier") == "owner":
         extra.append(("owner_dm", owner_dm))
     room, payload = build_payload(task_id, headers, message, operator_lines, note,
                                   text_max=TEXT_MAX - len(REMINDER) - 1, extra=extra)
