@@ -93,6 +93,15 @@ the recall in task 2 is what one owner channel now gets; a guest task has no suc
 Shape 2: `codex queue` returned in 0.13 s; the TUI rendered the reply 10.42 s later (model ~2 s,
 the rest is the TUI's drain cadence). Stub: file-to-file 0.08–0.13 s.
 
+## Lock, platform and upgrades
+
+The package's one-process lock, `ag2_sparrow.holder_lock` (see the package README), is what this adapter's single-instance check moves to. With it:
+
+- **POSIX only:** Linux and macOS; on Windows the adapter refuses to start with `LockError("unsupported platform: holder_lock is POSIX-only")`.
+- **Network-mounted home:** if the service user's home directory is on a network or FUSE filesystem, the adapter refuses to start with `LockError("not a local filesystem")`. Remedy: run it as a user with a local home directory.
+- **Upgrade order: stop → install → start.** Stop the adapter on its work root, install, then start it. A start while the old adapter still runs there is refused (exit 3) with the pid to stop.
+- **Supported upgrade paths: the Hatch installer and the keepawake self-upgrade**, both stop → install → start. Anything else (a direct `pip` or `pipx` install or upgrade, a rollback, a process supervisor restarting a unit, or a work root the upgrader does not know) must stop the adapters by hand before installing; `holder_lock.status(<work root>)` reports what is running there.
+
 ## Unproven
 
 `thread/resume` on a real durable thread (stub only); a hand-written client reaching the

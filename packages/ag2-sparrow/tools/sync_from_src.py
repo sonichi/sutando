@@ -40,6 +40,8 @@ MAP = {
     "src/delivery/disposal.py": "result_disposal.py",
     "src/dedup_recovery.py": "dedup_recovery.py",
     "src/file_lock.py": "file_lock.py",
+    # one-process exclusion per work root (flock + holder record); builds on file_lock
+    "src/holder_lock.py": "holder_lock.py",
     "src/workspace_lock.py": "workspace_lock.py",
     "src/chat_secret_filter.py": "chat_secret_filter.py",
     "src/policy/egress/result.py": "team_result_guard.py",
