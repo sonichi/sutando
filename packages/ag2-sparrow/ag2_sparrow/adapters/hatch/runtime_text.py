@@ -9,14 +9,13 @@ and fail-closed delivery are enforced by the code, which served text cannot reac
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
-import tempfile
 from importlib import resources
 from pathlib import Path
 
 from ... import gateway_instance, setup_fetch
+from . import cli as _cli
 
 TEXT_SCHEMA_VERSION = 1
 CACHE_NAME = "hatch-setup.json"
@@ -60,18 +59,6 @@ def load_cache(state_dir: Path) -> "dict | None":
     return _read_json(cache_path(state_dir))
 
 
-def _write_json(path: Path, value: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(value, fh, sort_keys=True)
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
-
-
 def refresh_cache(state_dir: Path, instance: str = "") -> "dict | None":
     """Fetch the served setup unless the cache already holds the revision Sparrow last
     heard of; a failed fetch keeps the cache. Returns the cache as it now stands."""
@@ -83,7 +70,7 @@ def refresh_cache(state_dir: Path, instance: str = "") -> "dict | None":
     fetched = setup_fetch.fetch_setup(kind="acp", vendor=VENDOR)
     if fetched is None:
         return cached
-    _write_json(cache_path(state_dir), fetched)
+    _cli._write(cache_path(state_dir), json.dumps(fetched, sort_keys=True), 0o600)
     return fetched
 
 
