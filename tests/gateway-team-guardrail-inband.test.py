@@ -75,7 +75,7 @@ class TeamGuardrailReachesTheBody(unittest.TestCase):
                                              "source_root": "$r:s", "source_room": "!r:s"})
             media_dir = str(Path(d) / "results" / tid)
             self.assertIn("Signal Room media:", body)
-            self.assertIn(f"[file: {media_dir}/<name>.png]", body,
+            self.assertIn(f"ONLY under {media_dir}/", body,
                           "the instruction must name THIS task's absolute media directory")
             self.assertIn("image-generation", body)
             self.assertEqual(body.count(FENCE), 1,
@@ -95,10 +95,25 @@ class TeamGuardrailReachesTheBody(unittest.TestCase):
             body, tid = _write(mod, signal={"v": 1, "cid": "c2", "route_attempt": 1,
                                              "source_root": "$r:s", "source_room": "!r:s"})
             media_dir = str(Path(d) / "results" / tid)
-            self.assertIn(f"--output '{media_dir}/<name>.png'", body,
+            self.assertIn(f"--output '{media_dir}/<name>'", body,
                           "the generate.py --output path must be shell-quoted")
-            self.assertIn(f"[file: {media_dir}/<name>.png]", body,
-                          "…while the marker form stays a plain path")
+            self.assertIn(f"ONLY under {media_dir}/", body,
+                          "…while the directory named for the marker stays a plain path")
+
+    def test_media_instruction_attaches_the_reported_path_not_a_fixed_extension(self):
+        # The generator saves under the extension its bytes have (often .jpg), so a
+        # fixed suffix in the instruction names a file that may not exist.
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load(Path(d))
+            mod.RESULTS_DIR = Path(d) / "results"
+            body, _tid = _write(mod, signal={"v": 1, "cid": "c3", "route_attempt": 1,
+                                              "source_root": "$r:s", "source_room": "!r:s"})
+            media = body.split("Signal Room media:", 1)[1]
+            self.assertIsNone(re.search(r"\.(png|jpe?g|webp|gif)\b", media, re.I),
+                              "the media instruction must not hardcode an image extension")
+            self.assertIn("[file: <path>]", media)
+            self.assertIn("the exact \"path\" from the generator's JSON output", media,
+                          "the agent must attach the path the generator reports")
 
     def test_ordinary_team_task_carries_no_media_instruction(self):
         with tempfile.TemporaryDirectory() as d:

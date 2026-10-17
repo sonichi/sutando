@@ -201,11 +201,11 @@ class TaskMediaRoute(unittest.TestCase):
         self.assertEqual(len(reask), 1, "the dedup was not re-asked")
         body = (mod.TASKS_DIR / f"{reask[0]}.txt").read_text()
         orig_dir = mod.RESULTS_DIR / "task-team-rq"
-        self.assertIn(f"[file: {orig_dir}/<name>.png]", body,
+        self.assertIn(f"ONLY under {orig_dir}/", body,
                       "the requeue carries the ORIGINAL media instruction verbatim")
         orig_dir.mkdir(parents=True, exist_ok=True)
-        (orig_dir / "chart.png").write_bytes(b"payload")
-        self._result(mod, reask[0], f"here [file: {orig_dir / 'chart.png'}]")
+        (orig_dir / "chart.jpg").write_bytes(b"payload")
+        self._result(mod, reask[0], f"here [file: {orig_dir / 'chart.jpg'}]")
         mod._post_ready_results(inflight)
         self.assertEqual([c[1] for c in self._media_posts()], ["/v1/tasks/task-team-rq/media"],
                          "a file under the ORIGINAL task's dir uploads on the original delivery's lease")
