@@ -6,11 +6,16 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .. import outbox
 from .contract import (BackendCapabilities, ClaimToken, CleanupReport,
                        DeliveryOutcome, RecoverReport)
+
+
+# The park reason under `replace_refused` once no replacement is left: the refused payload
+# was itself the replacement, or the hook had none for it.
+REFUSED_FOR_GOOD = "refused-for-good"
 
 
 class DesignAClaimBackend:
@@ -25,12 +30,16 @@ class DesignAClaimBackend:
 
     def __init__(self, root: Path, reclaim_ttl_s: float = 300.0,
                  retry_schedule: Optional[outbox.RetrySchedule] = None,
-                 clock=time.time, republish_delivered: bool = True):
+                 clock=time.time, republish_delivered: bool = True,
+                 replace_refused: Optional[Callable[[str], Optional[str]]] = None):
         self.root = Path(root)
         self.reclaim_ttl_s = reclaim_ttl_s
         self.retry_schedule = retry_schedule
         self.clock = clock
         self.republish_delivered = republish_delivered
+        # Opt-in: a payload refused for good is replaced once by `replace_refused(stored)` and
+        # retried as any failure is; with no replacement left it parks as REFUSED_FOR_GOOD.
+        self.replace_refused = replace_refused
 
     def publish(self, item_id: str, payload: bytes, *,
                 republish_delivered: Optional[bool] = None,
@@ -139,16 +148,38 @@ class DesignAClaimBackend:
                                         provider=provider, destination=destination)
             elif outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
                 outbox.park_item(self.root, item_id, "outcome-unknown")
-            elif terminal_reason:
+            elif terminal_reason and (self.replace_refused is None
+                                      or not self._replace_refused_locked(item_id)):
                 outbox.note_attempt(self.root, item_id)
-                outbox.park_item(self.root, item_id, terminal_reason)
-            elif self.retry_schedule is not None:
-                outbox.retry_failed_locked(self.root, item_id, self.clock())
+                outbox.park_item(self.root, item_id,
+                                 terminal_reason if self.replace_refused is None else REFUSED_FOR_GOOD)
             else:
-                attempts = outbox.note_attempt(self.root, item_id)
-                if park_at_attempts is not None and attempts >= park_at_attempts:
-                    outbox.park_item(self.root, item_id, "max-attempts")
+                if self.retry_schedule is not None:
+                    outbox.retry_failed_locked(self.root, item_id, self.clock())
+                else:
+                    attempts = outbox.note_attempt(self.root, item_id)
+                    if park_at_attempts is not None and attempts >= park_at_attempts:
+                        outbox.park_item(self.root, item_id, "max-attempts")
             return outbox._release_locked(self.root, item_id, token.worker)
+
+    def _replace_refused_locked(self, item_id: str) -> bool:
+        """Under the item lock and the claim: the replacement becomes the stored payload, once.
+        The refused one is kept, the source proof carries over (the replacement answers the
+        same source), and a new resend epoch gives it its own idempotency key. False when no
+        replacement is left: the refused payload was itself one, or the hook has none."""
+        d = outbox._read_item(self.root, item_id)
+        stored = d.get("payload") or ""
+        replacement = None if "refused_payload" in d else self.replace_refused(stored)
+        if replacement is None or replacement == stored:
+            return False
+        proof = outbox.source_proof(d)
+        for field in ("proof_version", "source_ready_sha256", "source_payload_sha256"):
+            d.pop(field, None)
+        d.update(payload=replacement, refused_payload=stored,
+                 resend_epoch=int(d.get("resend_epoch", 0) or 0) + 1,
+                 **outbox.source_proof_fields(proof, replacement, outbox.new_publication_id()))
+        outbox._write_item(self.root, item_id, d)
+        return True
 
     def resend_epoch(self, item_id: str) -> int:
         """Operator re-send generation; 0 until a requeue bumps it."""

@@ -272,6 +272,16 @@ def main() -> int:
     check("no_send closes the lease only: no delivery read",
           r.outcome is DeliveryOutcome.CONFIRMED
           and [c[0] for c in gw.calls] == ["POST"])
+    # A lane whose send belongs to the broker takes the accept as final: no read, no memory.
+    gw = ScriptedGateway(READABLE, dict(READABLE, duplicate=True), delivery=[DEAD, DEAD])
+    p = AG2SpaceResultProvider(gw, sleep=lambda _s: None, read_back=False)
+    r1 = p.deliver("task-X", ENVELOPE, "task-X#0")
+    r2 = p.deliver("task-X", ENVELOPE, "task-X#0")
+    check("read_back=False: the accept is final, a dead letter is never read",
+          r1.outcome is DeliveryOutcome.CONFIRMED and r1.provider_ref == "accepted"
+          and r2.provider_ref == "duplicate" and "accept as final" in r1.detail
+          and [c[0] for c in gw.calls] == ["POST", "POST"] and not p._dead)
+    check("read_back defaults on", AG2SpaceResultProvider(gw).read_back is True)
 
     # A known dead-letter stays known: the retry's status read fails, and the
     # provider must not fall through to CONFIRMED on the rid-deduped accept.
