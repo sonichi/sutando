@@ -92,6 +92,9 @@ export function parseWorkCheck(text: string, openTasks: OpenTask[] = []): WorkCh
 export type TurnVerdict =
 	| { action: 'work'; task: string }
 	| { action: 'none' }
+	/** The voice model answers it with one of its own tools, read fresh, never from memory (2026-10-16: "how many rooms
+	 *  have new messages" asked again was answered from the last count, and "the least active room" was guessed). */
+	| { action: 'fetch'; tool: string }
 	| { action: 'ask'; question: string }
 	| { action: 'duplicate'; of: string };
 
@@ -104,8 +107,9 @@ export interface TurnInput {
 
 export type TurnClassifier = (input: TurnInput, signal?: AbortSignal) => Promise<TurnVerdict>;
 
-/** @param extraRules rule lines from the voice surface: what the voice model answers itself (a skill's tools), so the core is not asked too. */
-export function turnClassifierPrompt(i: TurnInput, extraRules: readonly string[] = []): string {
+/** @param extraRules rule lines from the voice surface: what the voice model answers itself (a skill's tools), so the core is not asked too.
+ *  @param fetchTools the voice model's own tools a rule may name in a `fetch` verdict; none named, no `fetch`. */
+export function turnClassifierPrompt(i: TurnInput, extraRules: readonly string[] = [], fetchTools: readonly string[] = []): string {
 	return [
 		'You sit behind a voice assistant. It talks with the user; a back-end agent (the core) does the real work: anything about the user\'s own accounts, files, code repositories and PRs, email, calendar, messages, notes, and any action or lookup that needs them. The voice assistant itself can only talk, search the public web, and answer from general knowledge or from this conversation.',
 		'The user just finished saying something. Decide whether it asks the core to do something.',
@@ -120,9 +124,11 @@ export function turnClassifierPrompt(i: TurnInput, extraRules: readonly string[]
 		'- duplicate: the same request as one of the open tasks below (same thing, same ask, worded differently or misheard).',
 		'- ask: it is a request for the core but a specific thing is missing and the recent words do not supply it, or you cannot tell whether they want the core to act. One short question in the user\'s language.',
 		...extraRules,
+		...(fetchTools.length ? [`- fetch: a rule above says the question is answered with one of the assistant's own tools (${fetchTools.join(', ')}): name that tool. Every time it is asked, even right after the same question, and whatever the assistant already said.`] : []),
 		'Reply with JSON only, one of:',
 		'{"action":"work","task":"..."}',
 		'{"action":"none"}',
+		...(fetchTools.length ? ['{"action":"fetch","tool":"<tool name>"}'] : []),
 		'{"action":"duplicate","of":"<id of the open task>"}',
 		'{"action":"ask","question":"..."}',
 		'',
@@ -137,15 +143,16 @@ export function turnClassifierPrompt(i: TurnInput, extraRules: readonly string[]
 	].join('\n');
 }
 
-/** Anything unclear is `none`: the voice model's own `work` call still covers the turn. */
-export function parseTurnVerdict(text: string, openTasks: OpenTask[] = []): TurnVerdict {
+/** Anything unclear is `none`: the voice model's own `work` call still covers the turn. A `fetch` names one of `fetchTools`. */
+export function parseTurnVerdict(text: string, openTasks: OpenTask[] = [], fetchTools: readonly string[] = []): TurnVerdict {
 	const m = /\{[\s\S]*\}/.exec(text);
 	if (!m) return { action: 'none' };
 	try {
-		const d = JSON.parse(m[0]) as { action?: unknown; task?: unknown; question?: unknown; of?: unknown };
+		const d = JSON.parse(m[0]) as { action?: unknown; task?: unknown; question?: unknown; of?: unknown; tool?: unknown };
 		if (d.action === 'work' && typeof d.task === 'string' && d.task.trim()) return { action: 'work', task: d.task.trim() };
 		if (d.action === 'ask' && typeof d.question === 'string' && d.question.trim()) return { action: 'ask', question: d.question.trim() };
 		if (d.action === 'duplicate' && typeof d.of === 'string' && openTasks.some((t) => t.id === d.of)) return { action: 'duplicate', of: d.of };
+		if (d.action === 'fetch' && typeof d.tool === 'string' && fetchTools.includes(d.tool)) return { action: 'fetch', tool: d.tool };
 	} catch { /* not JSON */ }
 	return { action: 'none' };
 }
@@ -197,16 +204,16 @@ export function createGeminiWorkCheck(opts: { apiKey: () => string | undefined; 
 	};
 }
 
-export function createGeminiTurnClassifier(opts: { apiKey: () => string | undefined; model?: string; timeoutMs?: number; log?: (m: string) => void; extraRules?: readonly string[] }): TurnClassifier {
+export function createGeminiTurnClassifier(opts: { apiKey: () => string | undefined; model?: string; timeoutMs?: number; log?: (m: string) => void; extraRules?: readonly string[]; fetchTools?: readonly string[] }): TurnClassifier {
 	const model = opts.model ?? WORK_CHECK_MODEL;
 	return async (input, signal) => {
 		const apiKey = opts.apiKey();
 		if (!apiKey) return { action: 'none' };
 		const t0 = Date.now();
-		const text = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: turnClassifierPrompt(input, opts.extraRules), signal, log: opts.log, what: 'turn check' });
+		const text = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: turnClassifierPrompt(input, opts.extraRules, opts.fetchTools), signal, log: opts.log, what: 'turn check' });
 		if (text === null) return { action: 'none' };
-		const verdict = parseTurnVerdict(text, input.openTasks);
-		const detail = verdict.action === 'work' ? ` (${verdict.task})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';
+		const verdict = parseTurnVerdict(text, input.openTasks, opts.fetchTools);
+		const detail = verdict.action === 'work' ? ` (${verdict.task})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : verdict.action === 'fetch' ? ` ${verdict.tool}` : '';
 		opts.log?.(`[RelayAgent] turn check: ${verdict.action}${detail} in ${Date.now() - t0}ms`);
 		return verdict;
 	};

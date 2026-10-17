@@ -34,7 +34,7 @@ import { existsSync, readFileSync, unlinkSync, mkdirSync, copyFileSync, appendFi
 import { notify as platformNotify } from './platform.js';
 import { inlineTools, personalSkillSetups, personalVoiceSurface, describeVoiceTasks, voiceTaskCounts, voiceTaskStatusSnapshot } from './inline-tools.js';
 import { createClientFrameHub } from './client-frame-hub.js';
-import { runSkillSetups } from './skill-setup-runner.js';
+import { runSkillSetups, type CallEndedHandler } from './skill-setup-runner.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText, injectSilentContext } from './browser-tools.js';
@@ -600,6 +600,8 @@ let voiceSessionRef: VoiceSession | null = null;
 let beforeConversationClear: () => void = () => {};
 // Skills told each time the user's speech is transcribed (onUserSpoke).
 const userSpokeHandlers: Array<() => void> = [];
+// Skills' post-processing for a call that ended; registered through their setup() (onCallEnded).
+const callEndedHandlers: CallEndedHandler[] = [];
 // The compressed summary of the older conversation (bodhi keeps the slot, sutando fills it).
 const conversationSummary = createConversationSummarizer({
 	context: () => voiceSessionRef?.conversationContext ?? null,
@@ -649,6 +651,8 @@ function resolveCurrentMode(): ModeState {
 const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, ...inlineTools, ...personalVoiceSurface.tools];
 /** Skill tools that fetch the answer themselves: the relay agent's turn check leaves those turns alone. */
 const answeringTools = new Set(personalVoiceSurface.answeringTools);
+// The answering tools a skill's turn-check rule names as "fetch <tool>": the only ones a fetch verdict may ask for.
+const fetchTools = [...answeringTools].filter((t) => personalVoiceSurface.turnCheckRules.some((r) => r.includes(`fetch ${t}:`)));
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
@@ -1012,7 +1016,7 @@ async function main() {
 		recentConversation: () => recentConversationLines(sessionRef?.conversationContext.items ?? [], 8) || getRecentConversation(8),
 		// Every finished user turn too, whatever tool the voice model chose: is it a request for the core?
 		// A skill's tools answer some turns themselves (read_room): the check is told, so it does not send those to the core.
-		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), extraRules: personalVoiceSurface.turnCheckRules }) : undefined,
+		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), extraRules: personalVoiceSurface.turnCheckRules, fetchTools }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
 		// A question for the user is said as live input once the model stops speaking, not queued as a notification.
 		ask: (text) => relayAsk.ask(text),
@@ -1025,6 +1029,9 @@ async function main() {
 		sessionId: SESSION_ID,
 		items: () => sessionRef?.conversationContext.items ?? [],
 		onEnded: async (ended) => {
+			for (const h of callEndedHandlers) {
+				try { await h({ startedAt: ended.startedAt, endedAt: ended.endedAt, reason: ended.reason }); } catch (e) { console.error(`${ts()} [SessionEnd] a skill's call-ended step failed: ${(e as Error).message}`); }
+			}
 			const { summary, transcript } = sessionEndTask(ended);
 			await submitVoiceSessionEndTask(summary, transcript);
 		},
@@ -1560,6 +1567,7 @@ async function main() {
 		getVoiceSessionOrigin,
 		setVoiceTaskOriginResolver,
 		onUserSpoke: (handler) => { userSpokeHandlers.push(handler); },
+		onCallEnded: (handler) => { callEndedHandlers.push(handler); },
 	}, (msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
 	// Audio-duck relay: flag the slide server (localhost:7877) when Sutando is

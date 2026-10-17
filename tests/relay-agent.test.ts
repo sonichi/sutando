@@ -457,6 +457,42 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		assert.deepEqual(submitted, []);
 	});
 
+	it('a question its own tool answers, answered without calling it, is sent back to the voice model to call it now', async () => {
+		// 2026-10-16 23:42: "how many rooms have new messages today" asked again was answered from the last count, and
+		// "the least active room" was guessed; neither called query_messages.
+		const asked: string[] = [];
+		const submitted: string[] = [];
+		const logs: string[] = [];
+		const relay = new RelayAgent({
+			store: createVoiceTaskStore(),
+			classify: async () => ({ action: 'fetch', tool: 'query_messages' }),
+			ask: (t) => asked.push(t),
+			notice: () => assert.fail('the correction is said now, not queued'),
+			submit: async (a) => { submitted.push(String(a.task)); return {}; },
+			log: (l) => logs.push(l),
+		});
+		relay.onUserTurn('Which room is the least active today?');
+		await tick(10);
+		assert.equal(asked.length, 1);
+		assert.match(asked[0], /answered only by calling query_messages now/);
+		assert.match(asked[0], /if the result differs from what you said, say so/);
+		assert.deepEqual(submitted, [], 'never sent to the core');
+		assert.ok(logs.some((l) => l.includes('query_messages was not called for this turn')));
+	});
+
+	it('a fetch verdict for a turn the voice model did answer with its tool says nothing', async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((r) => { release = r; });
+		const asked: string[] = [];
+		const relay = new RelayAgent({ store: createVoiceTaskStore(), classify: async () => { await gate; return { action: 'fetch', tool: 'query_messages' }; }, ask: (t) => asked.push(t), submit: async () => ({}) });
+		relay.onUserTurn('How many rooms have new messages today?');
+		await tick(1);
+		relay.noteAnsweringTool('query_messages');
+		release();
+		await tick(10);
+		assert.deepEqual(asked, []);
+	});
+
 	it('the next turn, with no such tool, is checked as usual', async () => {
 		const { relay, submitted } = agent(async () => ({ action: 'work', task: '查一下 PR 5473 的 review' }));
 		relay.noteAnsweringTool('read_room');
@@ -513,6 +549,22 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		assert.deepEqual(parseTurnVerdict('{"action":"work"}'), { action: 'none' }, 'work with no task is not work');
 		assert.deepEqual(parseTurnVerdict('{"action":"ask","question":"哪个？"}'), { action: 'ask', question: '哪个？' });
 		assert.deepEqual(parseTurnVerdict('ok'), { action: 'none' });
+		// A fetch names one of the voice model's own tools, or it is none.
+		assert.deepEqual(parseTurnVerdict('{"action":"fetch","tool":"query_messages"}', [], ['query_messages', 'room_stats']), { action: 'fetch', tool: 'query_messages' });
+		assert.deepEqual(parseTurnVerdict('{"action":"fetch","tool":"rm_rf"}', [], ['query_messages']), { action: 'none' });
+		assert.deepEqual(parseTurnVerdict('{"action":"fetch","tool":"query_messages"}'), { action: 'none' }, 'no tools offered, no fetch');
+	});
+
+	it('fetch is offered to the turn check only with the tools it may name, and the voice agent passes its answering tools', async () => {
+		const { turnClassifierPrompt } = await import('../src/work-request-check.js');
+		const plain = turnClassifierPrompt({ utterance: 'A', recentConversation: '' }, ['- none: x']);
+		assert.doesNotMatch(plain, /"action":"fetch"/);
+		const withTools = turnClassifierPrompt({ utterance: 'A', recentConversation: '' }, ['- fetch query_messages: a count.'], ['query_messages', 'room_stats']);
+		assert.match(withTools, /- fetch: a rule above says .* \(query_messages, room_stats\): name that tool\. Every time it is asked, even right after the same question/);
+		assert.match(withTools, /\{"action":"fetch","tool":"<tool name>"\}/);
+		const agentSrc = readFileSync(join(import.meta.dirname ?? '.', '..', 'src', 'voice-agent.ts'), 'utf-8');
+		assert.match(agentSrc, /const fetchTools = \[\.\.\.answeringTools\]\.filter\(\(t\) => personalVoiceSurface\.turnCheckRules\.some\(\(r\) => r\.includes\(`fetch \$\{t\}:`\)\)\);/);
+		assert.match(agentSrc, /extraRules: personalVoiceSurface\.turnCheckRules, fetchTools \}\)/);
 	});
 
 	it('the prompts forbid filling in "that PR" from another request, defer to the assistant\'s own question, and drop fragments', async () => {
