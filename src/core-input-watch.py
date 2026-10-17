@@ -327,15 +327,24 @@ _BASE_TO_STATE = {
 }
 
 
-def limit_step(pane, baseline, workspace=None, socket=None, session=None):
+def owes_work(seat, workspace):
+    """Whether this seat has queued work: the core's own queue, else None. A worker's queue
+    is the pool's to read, so the pool's supervisor is what pages a banner holding it."""
+    return None if seat else core_gate_notice.queued_count(workspace) > 0
+
+
+def limit_step(pane, baseline, workspace=None, socket=None, session=None, owes_work=True):
     """(stale, baseline) for this poll's limit banner. The baseline is taken when a banner
-    first shows, and again when its text changes; the newest turn since then decides."""
+    first shows, and again when its text changes; the newest turn since then decides.
+    A banner holds nothing on a seat that owes no work (`owes_work` False or unknown)."""
     abn = limit_banner(pane or "")
     if abn is None:
         return False, None
     current = limit_baseline(pane)
     if baseline is None or baseline.banner != current.banner:
         baseline = current
+    if owes_work is not True:
+        return True, baseline
     return limit_is_stale(abn, workspace, socket, session, capture=pane, baseline=baseline), baseline
 
 
@@ -871,7 +880,8 @@ def main():
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         runtime = session_runtime(a.socket, a.session) or last_runtime
         last_runtime = runtime
-        limit_stale, limit_baseline = limit_step(pane, limit_baseline, workspace, a.socket, a.session)
+        limit_stale, limit_baseline = limit_step(pane, limit_baseline, workspace, a.socket, a.session,
+                                                 owes_work=owes_work(a.seat, workspace))
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
             gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),

@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import unittest
+from pathlib import Path as _Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_HERE, "..", "src", "core-input-watch.py")
@@ -1501,6 +1502,88 @@ class TestStaleLimitBanner(unittest.TestCase):
     def test_non_limit_abnormal_lines_are_never_stripped(self):
         pane = "Paste code here if prompted >\n" + _LIMIT_BANNER
         self.assertIn("Paste code here", _mod.strip_limit_banners(pane))
+
+
+# Three false pages on worker seats, owner-marked false: a stale limit banner under an idle or
+# working composer, with nothing on screen waiting for an answer.
+_STALE_BANNER = ("  ⚠ Usage limit reached · continuing automatically at 2am · esc to cancel\n"
+                 "  ⚠ /usage-credits to continue now\n")
+_RULE = "────────────────────────────────────────\n"
+_SEAT_FOOTER = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+_ALERT_WORKING = ("● Sent the reviewer a cross-session message.\n"
+                  "✻ Thinking… (12s · esc to interrupt)\n" + _RULE + "❯ \n" + _RULE
+                  + _STALE_BANNER + _SEAT_FOOTER)
+_ALERT_WAITING_PROSE = ("● Waiting on the reviewer's approval; nothing is needed from the owner.\n"
+                        "  the witness with the owner's relay-pause call waits on that approval;"
+                        " the inbox watcher is armed.\n" + _RULE + "❯ \n" + _RULE
+                        + _STALE_BANNER + _SEAT_FOOTER)
+_ALERT_DONE = ("● room-destination change that's already shipped.\n"
+               "✻ Worked for 2m 27s · done 2:23 PM · 1 monitor still running\n"
+               "  ✔ Update installed · Restart to update\n" + _RULE + "❯ \n" + _RULE
+               + _STALE_BANNER + _SEAT_FOOTER)
+_REFUSED_LIMIT_TURN = ("❯ check the inbox\n  ⎿  You've hit your session limit · resets 2am\n"
+                       "✻ Worked for 0s\n" + _RULE + "❯ \n" + _RULE + _SEAT_FOOTER)
+_LIMIT_MENU = ("  ⎿  You've hit your weekly limit · resets Sep 27 at 2am\n"
+               "  What do you want to do?\n  ❯ 1. Stop and wait for limit to reset\n"
+               "    2. Switch to extra usage\n  Enter to confirm · Esc to cancel\n")
+_PERMISSION = ("● I need to run a command.\n  Bash command\n    rm -rf build\n"
+               "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n  Esc to cancel\n")
+
+
+class TestStaleBannerOnASeatDoesNotPage(unittest.TestCase):
+    """A seat watcher pages a gate only on a prompt on screen; a limit banner holding a
+    worker's queued work is the pool supervisor's to page, since only it reads that queue."""
+
+    def _seat(self, panes, owes=None):
+        baseline, out = None, []
+        for pane in panes:
+            stale, baseline = _mod.limit_step(pane, baseline, "/nonexistent-ws", owes_work=owes)
+            st = compose_state(pane, "idle", True, limit_stale=stale, styled_pane=pane)
+            out.append(st[0])
+        return out
+
+    def test_the_three_false_pages_read_as_not_blocked_on_a_seat(self):
+        for name, pane in (("working", _ALERT_WORKING), ("waiting prose", _ALERT_WAITING_PROSE),
+                           ("finished turn", _ALERT_DONE)):
+            with self.subTest(alert=name):
+                self.assertNotIn("blocked-human", self._seat([pane] * 3))
+
+    def test_the_prose_alone_was_never_the_trigger(self):
+        pane = _ALERT_WAITING_PROSE.replace(_STALE_BANNER, "")
+        self.assertEqual(compose_state(pane, "idle", True)[0], "idle-ready")
+
+    def test_control_the_core_with_queued_work_still_pages_a_banner_nothing_outran(self):
+        self.assertEqual(self._seat([_ALERT_DONE] * 3, owes=True), ["blocked-human"] * 3)
+
+    def test_controls_a_real_prompt_pages_on_a_seat(self):
+        for name, pane, kind in (("refused limit turn", _REFUSED_LIMIT_TURN, "turn-rejected"),
+                                 ("limit menu", _LIMIT_MENU, "selection"),
+                                 ("permission dialog", _PERMISSION, "selection"),
+                                 ("permission under a stale banner",
+                                  _PERMISSION + _STALE_BANNER + _SEAT_FOOTER, "selection")):
+            with self.subTest(control=name):
+                stale, _ = _mod.limit_step(pane, None, "/nonexistent-ws", owes_work=None)
+                st = compose_state(pane, "idle", True, limit_stale=stale)
+                self.assertEqual((st[0], st[3]), ("blocked-human", kind))
+
+    def test_an_unforeseen_dialog_still_pages_under_a_stale_banner(self):
+        pane = ("  Overwrite the existing config file?\n  (Enter to confirm · Esc to cancel)\n"
+                + _STALE_BANNER + _SEAT_FOOTER)
+        stale, _ = _mod.limit_step(pane, None, "/nonexistent-ws", owes_work=None)
+        self.assertEqual(compose_state(pane, "idle", True, limit_stale=stale)[0], "blocked-human")
+        self.assertEqual(compose_state(pane.replace(_STALE_BANNER, ""), "idle", True)[:2],
+                         ("blocked-human", "awaiting user: unknown"))
+
+    def test_owes_work_is_the_cores_queue_and_unknown_on_a_worker_seat(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ws = _Path(td)
+            self.assertIsNone(_mod.owes_work("worker-seat", ws))
+            self.assertIs(_mod.owes_work("", ws), False)
+            (ws / "tasks").mkdir()
+            (ws / "tasks" / "task-1.txt").write_text("task: x\n")
+            self.assertIs(_mod.owes_work("", ws), True)
+            self.assertIsNone(_mod.owes_work("worker-seat", ws))
 
 
 if __name__ == "__main__":
