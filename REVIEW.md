@@ -334,7 +334,10 @@ and loads whichever repo it reviews.
     failing checks and no standing block — visibly reviewed, actually at 0-of-2. A peer
     validated the same predicate over 35 PRs with no exceptions and stated it unscoped; all
     35 were `base=main`, so their population could not have exposed the base dependency at
-    any sample size.
+    any sample size. This evidence predates the ruleset change from two approvals to one
+    plus code-owner review: at one, a single counting approval also reads `APPROVED` on
+    `main`, so the base branch no longer separates the cases by count. The write-access
+    half still holds, and the code-owner requirement still applies only on `main`.
 
 18. **A test that never ran cannot fail — verify the runner collected the expected new tests,
     by count and, where available, by name, before you interpret a discrimination result.** The standard proof that a new test earns its place is: revert the
