@@ -77,6 +77,10 @@ class StartCliPersonalClaudeHookWiringTest(unittest.TestCase):
             self.root / "src/agent/restart-guard.sh",
         )
         shutil.copy2(
+            REPO / "src/agent/runtime-compat-gate.sh",
+            self.root / "src/agent/runtime-compat-gate.sh",
+        )
+        shutil.copy2(
             REPO / "src/agent/task-event-handler-lookup.sh",
             self.root / "src/agent/task-event-handler-lookup.sh",
         )

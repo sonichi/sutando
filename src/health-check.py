@@ -972,6 +972,29 @@ def check_node_runtime() -> dict:
     }
 
 
+def check_core_runtime_compat(runtime: Optional[str] = None, discover=None) -> dict:
+    """The selected core CLI's version and capabilities, with the user's fix when unusable."""
+    import runtime_compat
+    name = "core-cli-compat"
+    try:
+        runtime = runtime or resolve_core_runtime(REPO_DIR)
+    except Exception as exc:  # noqa: BLE001 — the config check reports the cause
+        return {"name": name, "status": "warn", "detail": f"core runtime unresolved: {exc}"}
+    if runtime not in runtime_compat.RUNTIMES:
+        return {"name": name, "status": "warn", "detail": f"unknown core runtime {runtime!r}"}
+    env = dict(os.environ)
+    node = resolve_node_runtime(env)
+    if node.get("path"):
+        env["PATH"] = env.get("PATH", "") + os.pathsep + os.path.dirname(node["path"])
+    report = (discover or runtime_compat.discover)(runtime, env=env)
+    step = runtime_compat.plan(report, env=env)
+    status = {"ok": "ok", "newer-untested": "warn"}.get(report.status, "down")
+    detail = step.reason if status == "ok" else f"{step.reason} Fix: {step.command}"
+    if step.assisted:
+        detail += f" Or, with your consent: {step.assisted}"
+    return {"name": name, "status": status, "detail": detail}
+
+
 def check_port(port: int, name: str, probe: bool = False,
                pgrep_pattern: str = "") -> dict:
     """Check if a port is listening, optionally probing for a live response.
@@ -12894,6 +12917,8 @@ def run_all_checks() -> list[dict]:
     # G1.5: which Node would JS services resolve to (bundled/app-bundle/
     # system), red when none — the silent-dead-services failure class.
     checks.append(check_node_runtime())
+    # The core CLI itself: version, flags, and the repair when it cannot launch.
+    checks.append(check_core_runtime_compat())
     checks.append(check_secret_scanner_mode())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())

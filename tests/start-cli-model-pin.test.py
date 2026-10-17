@@ -43,6 +43,7 @@ def _launch_argv(model_env: "str | None") -> list[str]:
             # /usr/bin excluded intentionally: tmux lives there on Ubuntu CI
             # and the test targets the no-tmux fallback exec path.
             "PATH": f"{bind}:/bin",
+            "SUTANDO_SKIP_RUNTIME_COMPAT": "1",
             "HOME": str(td),
             "ARGS_FILE": str(args_file),
             # start-cli.sh stamps <workspace>/state/session-starts.log; without
@@ -198,6 +199,7 @@ def case_tmux_launch_clears_a_pinned_socket() -> list[str]:
 
             env = {
                 "PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin",
+                "SUTANDO_SKIP_RUNTIME_COMPAT": "1",
                 "HOME": str(td / "home"),
                 "SUTANDO_TMUX_SOCKET": str(sock),
                 "SUTANDO_TEST_MODE": "1",
@@ -257,6 +259,7 @@ def case_fresh_socket_server_is_born_unpinned() -> list[str]:
                 return ["fresh-socket) a server already exists — this is not the fresh case"]
             env = {
                 "PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin",
+                "SUTANDO_SKIP_RUNTIME_COMPAT": "1",
                 "HOME": str(td / "home"),
                 "SUTANDO_TMUX_SOCKET": str(sock),
                 "SUTANDO_TEST_MODE": "1",
@@ -333,6 +336,7 @@ def case_bare_invocation_still_warns_on_a_pinned_live_core() -> list[str]:
 
             env = {
                 "PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin",
+                "SUTANDO_SKIP_RUNTIME_COMPAT": "1",
                 "HOME": str(td / "home"),
                 "SUTANDO_TMUX_SOCKET": str(sock),
                 "SUTANDO_TEST_MODE": "1",

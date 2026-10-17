@@ -99,7 +99,7 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
                            ("lsof", "exit 1\n"), ("launchctl", "exit 1\n")):
             (bind / stub).write_text("#!/bin/bash\n" + body); (bind / stub).chmod(0o755)
         tm = lambda *a: subprocess.run([tmux, "-S", str(sock), *a], capture_output=True, text=True)
-        env = {"PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin", "HOME": str(td / "home"),
+        env = {"SUTANDO_SKIP_RUNTIME_COMPAT": "1", "PATH": f"{bind}:{Path(tmux).parent}:/usr/bin:/bin:/usr/sbin", "HOME": str(td / "home"),
                "SUTANDO_TMUX_SOCKET": str(sock), "SUTANDO_TEST_MODE": "1",
                **({"SUTANDO_POOL_DELIVERY_SCRIPT": str(delivery_script)}
                   if extra_env.get("SUTANDO_INSTANCE_ID") else {}),
@@ -252,7 +252,7 @@ def _core_env(extra_env: dict, td: Path) -> list[str]:
     stub = td / "bin"; stub.mkdir(exist_ok=True)
     for name, body in (("lsof", "exit 1\n"), ("launchctl", "exit 0\n"), ("sleep", "exit 0\n")):
         (stub / name).write_text("#!/bin/sh\n" + body); (stub / name).chmod(0o755)
-    env = {"HOME": str(td), "PATH": f"{stub}:/usr/bin:/bin:/usr/sbin:/sbin", **extra_env}
+    env = {"SUTANDO_SKIP_RUNTIME_COMPAT": "1", "HOME": str(td), "PATH": f"{stub}:/usr/bin:/bin:/usr/sbin:/sbin", **extra_env}
     out = subprocess.run(["bash", str(root / "src/agent/claude/cli/start-cli.sh"), "--print-core-env"],
                          cwd=str(root), env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
@@ -279,7 +279,7 @@ def _worker_env(extra_env: dict, td: Path) -> list[str]:
     for name, body in (("lsof", "exit 1\n"), ("launchctl", "exit 0\n"), ("sleep", "exit 0\n")):
         (stub / name).write_text("#!/bin/sh\n" + body); (stub / name).chmod(0o755)
     base = {"SUTANDO_TMUX_SESSION": "sutando-worker-" + "z" * 32, "SUTANDO_INSTANCE_ID": "z" * 32}
-    env = {"HOME": str(td), "PATH": f"{stub}:/usr/bin:/bin:/usr/sbin:/sbin", **base, **extra_env}
+    env = {"SUTANDO_SKIP_RUNTIME_COMPAT": "1", "HOME": str(td), "PATH": f"{stub}:/usr/bin:/bin:/usr/sbin:/sbin", **base, **extra_env}
     out = subprocess.run(
         ["bash", str(root / "skills/worker-pool/scripts/launch-worker-session.sh"), "--print-env"],
         cwd=str(root), env=env, capture_output=True, text=True, timeout=60)

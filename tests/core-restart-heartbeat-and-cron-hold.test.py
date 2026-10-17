@@ -79,7 +79,7 @@ class ClaudeLauncherEnsuresHeartbeat(unittest.TestCase):
             (bind / name).chmod(0o755)
         self.root = root
         self.sock = self.td / "t.sock"
-        self.env = {"PATH": f"{bind}:{Path(TMUX).parent}:/usr/bin:/bin:/usr/sbin",
+        self.env = {"SUTANDO_SKIP_RUNTIME_COMPAT": "1", "PATH": f"{bind}:{Path(TMUX).parent}:/usr/bin:/bin:/usr/sbin",
                     "HOME": str(self.td / "home"), "SUTANDO_TMUX_SOCKET": str(self.sock),
                     "SUTANDO_TEST_MODE": "1", "SUTANDO_RESTART_GRACE_S": "2"}
 
@@ -120,7 +120,7 @@ class EnsureRunningIsIdempotent(unittest.TestCase):
         self.root = self.td / "repo"
         shutil.copytree(REPO / "src", self.root / "src", symlinks=True)
         shutil.copytree(REPO / "scripts", self.root / "scripts", symlinks=True)
-        self.env = {"PATH": "/usr/bin:/bin:/usr/sbin", "HOME": str(self.td),
+        self.env = {"SUTANDO_SKIP_RUNTIME_COMPAT": "1", "PATH": "/usr/bin:/bin:/usr/sbin", "HOME": str(self.td),
                     # A socket no server listens on: the writer must find no core.
                     "SUTANDO_TMUX_SOCKET": str(self.td / "none.sock")}
         self.started: list[int] = []
