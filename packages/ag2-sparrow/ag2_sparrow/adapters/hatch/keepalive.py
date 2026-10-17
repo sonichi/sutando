@@ -458,6 +458,7 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
             else:
                 print(f"the replace failed: {how}", file=sys.stderr)
                 rc = 1
+    _refresh_setup(cfg)
     line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
         + (f" reason={reason}" if reason else "")
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -465,6 +466,15 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
         fh.write(line + "\n")
     print(line)
     return rc
+
+
+def _refresh_setup(cfg: dict) -> None:
+    """Refresh the served setup cache; never fails the run."""
+    from . import runtime_text
+    try:
+        runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
+    except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
+        print(f"NOTE served setup: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 def last_keepawake(log: Path) -> float | None:
@@ -522,24 +532,29 @@ def oldest_open_task(cfg: dict) -> "float | None":
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     """The core row for Sparrow's heartbeat; None while no keepawake task is installed.
     `alive` also counts the hook's activity marker."""
+    from . import runtime_text
     now = time.time() if now is None else now
     tasks = _found(cron_dir(cfg), TASK)
     if not tasks:
         return None
+    tune = runtime_text.tunables(runtime_text.current_cache(_state_dir(cfg), _instance(cfg)))
+    # The installed task runs every INTERVAL_MIN, so a shorter served interval cannot tighten it.
+    stale_s = 2 * max(tune["keepawake_interval_s"], INTERVAL_MIN * 60)
+    hook_stale_s = tune["hook_silent_age_s"]
     ran = last_keepawake(log)
     # Install leaves an unchanged task's mtime alone, so a task that never ran ages from it.
     last = ran if ran is not None else max(
         (m for m in map(_mtime, tasks) if m is not None), default=now)
-    fresh = _within(now, last)
+    fresh = _within(now, last, stale_s)
     alive = True if (fresh and ran is not None) or _within(now, _mtime(_activity_file(cfg))) \
         else None
-    problems = [] if fresh else [(NOT_RUNNING, last + STALE_S)]
+    problems = [] if fresh else [(NOT_RUNNING, last + stale_s)]
     hook = hook_last_run(cfg)
-    if hook is not None and not _within(now, hook, HOOK_STALE_S):
-        problems.append((HOOK_NOT_RUNNING, hook + HOOK_STALE_S))
+    if hook is not None and not _within(now, hook, hook_stale_s):
+        problems.append((HOOK_NOT_RUNNING, hook + hook_stale_s))
     oldest = oldest_open_task(cfg)
-    if oldest is not None and now - oldest > TASK_PICKUP_S:
-        problems.append((TASK_NOT_PICKED_UP, oldest + TASK_PICKUP_S))
+    if oldest is not None and now - oldest > tune["stuck_task_age_s"]:
+        problems.append((TASK_NOT_PICKED_UP, oldest + tune["stuck_task_age_s"]))
     # Fresh but never run: no evidence either way yet.
     condition = "abnormal" if problems else "healthy" if ran is not None else "unknown"
     reason, since = problems[0] if problems else (None, None)

@@ -21,6 +21,7 @@ SRC = PKG_ROOT / "ag2_sparrow"
 # Non-Python files the code reads at run time (package-data in pyproject.toml).
 DATA_FILES = ("ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh",
               "ag2_sparrow/adapters/hatch/hook-definition.json",
+              "ag2_sparrow/adapters/hatch/builtin-runtime-text.json",
               "ag2_sparrow/adapters/claude_routine/routine-prompt.md",
               "ag2_sparrow/adapters/claude_routine/README.md")
 
@@ -107,6 +108,10 @@ def main():
         r = subprocess.run([*named, "reply", "--help"],
                            capture_output=True, text=True, cwd=d, env=ienv, timeout=60)
         assert r.returncode == 0 and "result_file" in r.stdout, f"{r.stdout}\n{r.stderr}"
+        r = subprocess.run([*named, "wake-context"],
+                           capture_output=True, text=True, cwd=d, env=ienv, timeout=60)
+        assert r.returncode == 0 and "Follow the worker_note exactly" in r.stdout, \
+            f"{r.stdout}\n{r.stderr}"
         print(f"PASS installed hook prompt names the reply command by absolute path: {named.pop()}")
 
 if __name__ == "__main__":

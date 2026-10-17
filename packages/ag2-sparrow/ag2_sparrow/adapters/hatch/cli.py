@@ -1,4 +1,4 @@
-"""`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply|keepalive`: set up, check and answer through the Hatch hook.
+"""`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply|keepalive|wake-context`: set up, check and answer through the Hatch hook.
 
 install writes the hook script to ~/hooks/scripts/ (a registered hook's script is never
 rewritten: a changed one goes beside it), stages the hook definition for the agent's hooks
@@ -7,7 +7,8 @@ manager the ag2-sparrow user service that restarts Sparrow, and the keepalive's
 install record, then leaves Sparrow running and connected; verify checks that setup;
 sparrow checks only that Sparrow is running (the hook's heartbeat runs it); reply
 writes a worker's answer to its result_file and waits until Sparrow has sent it;
-keepalive runs the scheduled task, prints Sparrow's health row, and reports on its log."""
+keepalive runs the scheduled task, prints Sparrow's health row, and reports on its log;
+wake-context prints the text a woken worker follows (served by the backend, else built in)."""
 from __future__ import annotations
 
 import argparse
@@ -1013,6 +1014,25 @@ def reply(args) -> int:
         time.sleep(0.25)
 
 
+def wake_context(_args) -> int:
+    from . import runtime_text
+    cfg = _installed_config()
+    values = {"<AGENT_MXID>": cfg.get("AGENT_MXID") or "<AGENT_MXID>",
+              "<REPLY_COMMAND>": cfg.get("REPLY_COMMAND") or find_reply_command()
+              or REPLY_COMMAND,
+              "<ACTIVITY_FILE>": cfg.get("ACTIVITY_FILE")
+              or str(_home() / ".muse" / "last_active")}
+    state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
+    instance = (cfg["GATEWAY_INSTANCE"] if "GATEWAY_INSTANCE" in cfg
+                else os.environ.get("GATEWAY_INSTANCE") or "").strip()
+    text, source = runtime_text.wake_context(
+        runtime_text.current_cache(state, instance), values,
+        runtime_text.owner_dm_room(state, instance, cfg.get("AGENT_MXID") or ""))
+    print(text, end="")
+    print(f"wake-context: {source}", file=sys.stderr)
+    return 0
+
+
 def _keepalive(args) -> int:
     from . import keepalive
     return keepalive.main(args)
@@ -1080,6 +1100,9 @@ def main(argv=None) -> int:
     r.add_argument("--wait", type=float, default=REPLY_WAIT_S,
                    help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
     r.set_defaults(func=reply)
+    w = sub.add_parser("wake-context", help="print the prompt and worker note a woken worker "
+                       "follows (the backend's served copy when valid, else the built-in one)")
+    w.set_defaults(func=wake_context)
     args = ap.parse_args(argv)
     return args.func(args)
 

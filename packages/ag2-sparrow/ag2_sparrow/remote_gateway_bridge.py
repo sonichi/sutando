@@ -312,6 +312,7 @@ from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
+from . import __version__ as _PACKAGE_VERSION
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
@@ -460,6 +461,9 @@ _RELAY_ASK_PREFIX = "ask-"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
+# The heartbeat reply's pointers to the served setup; read by adapters, never by Sparrow.
+SETUP_HINT_FILE = _STATE / f"setup-hint{_INST_SUFFIX}.json"
+SETUP_HINT_FIELDS = ("setup_revision", "min_version", "target_version")
 
 # Launch provenance + in-bridge file log. A supervisor that persists stdout
 # (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
@@ -1799,7 +1803,9 @@ def _load_routing() -> None:
     except (OSError, ValueError):
         return
     # another agent's reading, or this agent's reading from another gateway, authorizes nothing
-    if isinstance(d, dict) and d.get("identity") == _reenroll_identity() and d.get("gateway") == URL:
+    if isinstance(d, dict) and d.get("identity") == _reenroll_identity() and (
+            d.get("binding") == gateway_instance.binding_digest(_reenroll_identity(), URL)
+            if d.get("binding") else d.get("gateway") == URL):
         _ROUTING["owner_dm"] = _ROUTING["persisted"] = str(d.get("owner_dm") or "")
 
 
@@ -1827,7 +1833,9 @@ def refresh_routing(force: bool = False) -> None:
         try:
             f = _routing_file(); f.parent.mkdir(parents=True, exist_ok=True)
             tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({"identity": _reenroll_identity(), "gateway": URL,
+            tmp.write_text(json.dumps({"identity": _reenroll_identity(), "gateway": _redact_url(URL),
+                                       "binding": gateway_instance.binding_digest(
+                                           _reenroll_identity(), URL, create=True),
                                        "owner_dm": _ROUTING["owner_dm"]}), encoding="utf-8")
             os.replace(tmp, f)
             _ROUTING["persisted"] = _ROUTING["owner_dm"]
@@ -2507,16 +2515,7 @@ def _redact_url(value: str) -> str:
     so a gateway configured with `user:pass@` userinfo or a `?token=` query param
     must not land there in plaintext. Falls back to the bare string on any parse
     failure (never raise from a best-effort status write)."""
-    try:
-        p = urllib.parse.urlsplit(str(value))
-        if not p.scheme and not p.netloc:
-            return str(value)
-        host = p.hostname or ""
-        if p.port:
-            host = f"{host}:{p.port}"
-        return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
-    except Exception:  # noqa: BLE001 — redaction must never break status I/O
-        return str(value)
+    return gateway_instance.redact_url(value)
 
 
 class _NeverFatalStream:
@@ -3524,6 +3523,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "provider": PROVIDER,
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
+            "package_version": _PACKAGE_VERSION,
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
                              "core-status", "team-collaborator", VOICE_OUTCOME_CONTRACT],
         }
@@ -3536,8 +3536,9 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         if health is not None:
             payload["health"] = health
             payload["capabilities"].append("worker_health.v1")
-        _req("POST", "/v1/heartbeat", payload, timeout=10)
+        reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
+        _record_setup_hint(reply)
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
@@ -3553,6 +3554,23 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     except _NETWORK_ERRORS as e:
         _log(f"heartbeat network error: {e} — continuing")
         return False
+
+
+def _record_setup_hint(reply) -> None:
+    """Keep the heartbeat reply's setup_revision and versions for an adapter to read;
+    best-effort, like the heartbeat itself."""
+    if not isinstance(reply, dict):
+        return
+    hint = {k: reply[k] for k in SETUP_HINT_FIELDS if k in reply}
+    if not hint:
+        return
+    try:
+        text = json.dumps(dict(hint, ts=int(time.time())), sort_keys=True)
+    except (TypeError, ValueError) as e:
+        _log(f"setup hint not recorded: {e}")
+        return
+    if not _durable_write(SETUP_HINT_FILE, text):
+        _log("setup hint not recorded")
 
 
 def _emit_gateway_status(connected: bool, *, error: str | None = None,
@@ -3584,6 +3602,9 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "gateway": _redact_url(URL),
             # Re-read on every write, so a lane switch or re-login shows at the next poll.
             "agent_id": (_reenroll_identity() or None) if connected else None,
+            # Keyed digest of identity + full URL: a reader matches a saved reading's binding.
+            "gateway_binding": (gateway_instance.binding_digest(_reenroll_identity(), URL)
+                                or None) if connected else None,
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
             "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
