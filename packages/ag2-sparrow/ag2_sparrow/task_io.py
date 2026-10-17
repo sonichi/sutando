@@ -253,9 +253,8 @@ def clear_attributed_pidfile(owner, root):
             "adapter and remove it, then start" % path)
 
 
-# Our own start is the wall clock at import: exact, no child process, and immune to the
-# second-level rounding of a ps/boot-time derived start on Linux. Kept as a float: a pidfile
-# written a millisecond before the start is still before it.
+# Our own start as the wall clock at import, kept as a float: exact, no child process, and
+# no second-level rounding on either side of the pidfile comparison.
 _PROCESS_STARTED_AT = time.time()
 
 
