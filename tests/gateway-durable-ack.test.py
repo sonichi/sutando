@@ -158,10 +158,13 @@ class DurableAck(unittest.TestCase):
              patch.object(mod.os, "replace", spy_replace):
             self.assertEqual(mod._write_task(self._task("task-seq")), ("task-seq", True))
         at = trace.index("rename:remote-task-media.json")
-        # Both files are staged and fsync'd first; the sidecar then commits, and
-        # only after that does the task become visible to the watcher.
+        # Both files staged+fsync'd first, then the media + room-map sidecars
+        # commit, and only then does the task become visible to the watcher.
         self.assertEqual(trace[:at].count("file"), 2)
-        expected = ["rename:remote-task-media.json", "rename:task-seq.txt"]
+        # Room sidecar commits BEFORE publish, so its rename sits between the
+        # media sidecar's dir-fsync and the task file's own rename.
+        expected = ["rename:remote-task-media.json", "rename:remote-task-rooms.json",
+                    "rename:task-seq.txt"]
         if os.name != "nt":
             expected[1:1] = ["dir"]
             expected.append("dir")

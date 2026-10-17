@@ -332,7 +332,7 @@ _BASE_TO_STATE = {
 }
 
 
-def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime=None,
+def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None, runtime="claude",
                    styled_pane: "str | None" = None):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
@@ -343,8 +343,22 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
 
     `process` is runtime-health's `signals.process` tri-state: True (session
     seen), False (server answered "no session"), None (the probe could not run).
+
+    `runtime` is the runtime stamped on the core session (see `session_runtime`),
+    defaulting to "claude" for callers that don't track it. It selects the pane
+    grammar: classify()'s signatures are Claude's TUI, so for a non-Claude core
+    (codex) they'd misfire and could even preempt the runtime-neutral verdicts
+    (a logged-out codex core, detected by runtime-health via `codex login
+    status`, must map to logged-out — not a mis-matched gate). So the Claude gate
+    classifier runs only for the Claude runtime; codex relies on the neutral
+    base_health (offline/needs_login/working/idle/unknown) plus its own
+    `_is_idle_ready` adapter. Codex gate semantics (e.g. its rate-limit screen)
+    are a tracked follow-up. `_is_idle_ready` itself already carries a per-runtime
+    adapter (falling back to Claude's grammar for anything unrecognized), so a
+    stale status that it does NOT rescue is real wedge evidence regardless of
+    runtime — there is no separate "no idle grammar, hold as unobserved" case.
+
     `prev_pane` is the previous poll's capture, the only evidence a turn is moving.
-    `runtime` is the runtime stamped on the core session (see `session_runtime`).
     `styled_pane` is the same capture taken WITH escapes, when the caller has one
     (see `classify()`); omitted it changes nothing else here.
     """
@@ -354,7 +368,9 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
     # "sitting at a prompt waiting for input" from the coarse health (e.g. the live
     # /login MENU, which runtime-health's needs_login markers don't match). Check it
     # first so we carry the prompt text + kind for ESCALATE / AUTO-ANSWER.
-    hit = classify(pane, styled_pane) if pane else None
+    # Allowlist, not a codex denylist: a future runtime (gemini, …) must not
+    # fall through to Claude's pane grammar either.
+    hit = classify(pane, styled_pane) if (pane and runtime == "claude") else None
     if hit:
         kind, excerpt = hit
         if kind in _HUMAN_GATES:
@@ -800,6 +816,22 @@ def _atomic_write(path, payload):
     os.replace(tmp, path)
 
 
+# Written EVERY tick (state file is write-on-change); best-effort. Must match
+# ag2_sparrow.core_state_notice.CORE_HEARTBEAT_FILE — the reader keys on it.
+_HEARTBEAT_FILENAME = "core-supervisor-heartbeat"
+
+
+def _write_heartbeat(out_path):
+    hb = os.path.join(os.path.dirname(out_path), _HEARTBEAT_FILENAME)
+    try:
+        tmp = hb + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(int(time.time())))
+        os.replace(tmp, hb)
+    except Exception:  # noqa: BLE001 — liveness ping is best-effort
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--socket", required=True)
@@ -899,6 +931,7 @@ def main():
         if last_answered and time.time() - last_answered["at"] > AUTO_ANSWER_CARRY_S:
             last_answered = None
 
+        _write_heartbeat(a.out)  # every tick — liveness, independent of state change
         sig = (state, prompt, last_answered and last_answered["at"])
         if sig != last_sig:
             payload = {"state": state, "detail": detail,

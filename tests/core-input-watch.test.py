@@ -1115,12 +1115,16 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
 
             def derive(self):
                 return {"health": "working"}
+
+            def core_runtime(self):
+                return "claude"
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
                 "--once", "--stable", "1"] + extra_args
         with patch.object(_mod, "capture_styled", lambda s, sess: pane), \
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod, "session_runtime", lambda s, sess: "claude"), \
                 patch.object(_mod, "send_keys", lambda s, sess, k: sent.append((s, sess, k)) or True), \
                 patch.object(sys, "argv", argv):
             main()
@@ -1342,7 +1346,9 @@ class TestMainOnce(unittest.TestCase):
                 return {"health": "working"}
 
         orig_cap, orig_load = _mod.capture_styled, _mod._load_runtime_health
+        orig_session_runtime = _mod.session_runtime
         _mod.capture_styled = lambda sock, sess: _BYPASS   # a recognized gate
+        _mod.session_runtime = lambda sock, sess: "claude"  # classify() is Claude-gated
         _mod._load_runtime_health = lambda: _FakeRH()
         try:
             with tempfile.TemporaryDirectory() as td:
@@ -1359,6 +1365,7 @@ class TestMainOnce(unittest.TestCase):
                     sig = json.load(f)
         finally:
             _mod.capture_styled, _mod._load_runtime_health = orig_cap, orig_load
+            _mod.session_runtime = orig_session_runtime
         # stable=2, first tick → prompt seen once (< 2) → debounced to running.
         self.assertEqual(sig["state"], "running")
 
