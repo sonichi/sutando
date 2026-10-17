@@ -3569,15 +3569,13 @@ def _record_setup_hint(reply) -> None:
     hint = {k: reply[k] for k in SETUP_HINT_FIELDS if k in reply}
     if not hint:
         return
-    tmp = SETUP_HINT_FILE.with_name(f".{SETUP_HINT_FILE.name}.{os.getpid()}")
     try:
-        SETUP_HINT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(dict(hint, ts=int(time.time())), sort_keys=True),
-                       encoding="utf-8")
-        os.replace(tmp, SETUP_HINT_FILE)
-    except (OSError, TypeError, ValueError) as e:
-        tmp.unlink(missing_ok=True)
+        text = json.dumps(dict(hint, ts=int(time.time())), sort_keys=True)
+    except (TypeError, ValueError) as e:
         _log(f"setup hint not recorded: {e}")
+        return
+    if not _durable_write(SETUP_HINT_FILE, text):
+        _log("setup hint not recorded")
 
 
 def _emit_gateway_status(connected: bool, *, error: str | None = None,
