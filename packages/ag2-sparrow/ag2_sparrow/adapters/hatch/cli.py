@@ -1,4 +1,4 @@
-"""`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply|keepalive`: set up, check and answer through the Hatch hook.
+"""`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply|keepalive|wake-context`: set up, check and answer through the Hatch hook.
 
 install writes the hook script to ~/hooks/scripts/ (a registered hook's script is never
 rewritten: a changed one goes beside it), stages the hook definition for the agent's hooks
@@ -7,7 +7,8 @@ manager the ag2-sparrow user service that restarts Sparrow, and the keepalive's
 install record, then leaves Sparrow running and connected; verify checks that setup;
 sparrow checks only that Sparrow is running (the hook's heartbeat runs it); reply
 writes a worker's answer to its result_file and waits until Sparrow has sent it;
-keepalive runs the scheduled task, prints Sparrow's health row, and reports on its log."""
+keepalive runs the scheduled task, prints Sparrow's health row, and reports on its log;
+wake-context prints the text a woken worker follows (served by the backend, else built in)."""
 from __future__ import annotations
 
 import argparse
@@ -271,12 +272,15 @@ def install_hook(mxid: str, reply_command: str, force: bool) -> bool:
 
 def render_config(mxid: str, task_dir: Path, result_dir: Path, activity_file: Path,
                   python: str, state_dir: Path, gateway_instance: str = "",
-                  reply_command: str = "", cron_dir: str = "", keepalive_log: str = "") -> str:
+                  reply_command: str = "", cron_dir: str = "", keepalive_log: str = "",
+                  auto_upgrade: str = "") -> str:
     rows = (("AGENT_MXID", mxid), ("TASK_DIR", str(task_dir)), ("RESULT_DIR", str(result_dir)),
             ("ACTIVITY_FILE", str(activity_file)), ("SPARROW_PYTHON", python),
             ("STATE_DIR", str(state_dir)), ("GATEWAY_INSTANCE", gateway_instance),
             ("REPLY_COMMAND", reply_command), ("CRON_DIR", cron_dir),
             ("KEEPALIVE_LOG", keepalive_log))
+    # Written only when set, so an owner's AUTO_UPGRADE=0 survives a re-install.
+    rows += (("AUTO_UPGRADE", auto_upgrade),) if auto_upgrade else ()
     return "".join(f"{k}={shlex.quote(v)}\n" for k, v in rows)
 
 
@@ -624,7 +628,8 @@ def install(args) -> int:
                      if args.keepalive_log else "")
     config = render_config(args.mxid, task_dir.resolve(), result_dir.resolve(),
                            activity, sys.executable, state_dir.resolve(), instance,
-                           reply_command, cron, keepalive_log)
+                           reply_command, cron, keepalive_log,
+                           _installed_config().get("AUTO_UPGRADE", ""))
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
     if args.no_service:
@@ -1013,6 +1018,21 @@ def reply(args) -> int:
         time.sleep(0.25)
 
 
+def wake_context(_args) -> int:
+    from . import runtime_text
+    cfg = _installed_config()
+    values = {"<AGENT_MXID>": cfg.get("AGENT_MXID") or "<AGENT_MXID>",
+              "<REPLY_COMMAND>": cfg.get("REPLY_COMMAND") or find_reply_command()
+              or REPLY_COMMAND,
+              "<ACTIVITY_FILE>": cfg.get("ACTIVITY_FILE")
+              or str(_home() / ".muse" / "last_active")}
+    cache = runtime_text.load_cache(Path(cfg.get("STATE_DIR") or _dirs.state_dir()))
+    text, source = runtime_text.wake_context(cache, values)
+    print(text, end="")
+    print(f"wake-context: {source}", file=sys.stderr)
+    return 0
+
+
 def _keepalive(args) -> int:
     from . import keepalive
     return keepalive.main(args)
@@ -1080,6 +1100,9 @@ def main(argv=None) -> int:
     r.add_argument("--wait", type=float, default=REPLY_WAIT_S,
                    help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
     r.set_defaults(func=reply)
+    w = sub.add_parser("wake-context", help="print the prompt and worker note a woken worker "
+                       "follows (the backend's served copy when valid, else the built-in one)")
+    w.set_defaults(func=wake_context)
     args = ap.parse_args(argv)
     return args.func(args)
 

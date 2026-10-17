@@ -590,6 +590,29 @@ replaces or removes it. `--cron-dir` names another scheduled-task directory and
 the tasks with `ag2-sparrow-hatch uninstall --keepalive` (tasks install did not
 write are refused, and the log is kept), or delete the file by hand.
 
+### Served wording and self-upgrade
+
+The hook prompt is a short stub: a woken worker runs `ag2-sparrow-hatch
+wake-context` and follows what it prints, with the payload's `worker_note`.
+`wake-context` prints the prompt and worker note from `state/hatch-setup.json`,
+the setup cache the keepawake run refreshes, else the copies shipped in the
+package (today's wording). A cache with a newer `text_schema_version`, a missing
+field, or text naming any command but the reply command is not used. The
+package's tier notes are always printed; served `tier_addenda` come after them.
+The served tunables (`keepawake_interval_s`, `stuck_task_age_s`,
+`hook_silent_age_s`, `heartbeat_cadence_s`) are clamped to bounds the package
+sets. The fetch has no transport in this package yet, so the built-in text and
+defaults apply until one is added.
+
+When the served `target_version` is above the installed version, the keepawake
+run starts one detached upgrade per target: `pip install --no-deps
+--require-hashes` pinned to every sha256 in `target_sha256`, `pip check`,
+`install` re-run, Sparrow restarted, then checked. A failure reinstalls the
+previous version (hash-pinned when an earlier upgrade recorded its hashes) and
+the health row reports `upgrade-failed`. A changed hook definition is not
+applied: the hook wakes the agent once with install's `REQUIRED hook:` line.
+`AUTO_UPGRADE=0` in the install config turns self-upgrade off; install keeps it.
+
 ### Not from the single-file downloads
 
 Install the adapter with pip: the zipapp and the Linux binary

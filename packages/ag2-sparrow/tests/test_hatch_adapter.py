@@ -27,7 +27,8 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import health_command as hc, outbox  # noqa: E402
-from ag2_sparrow.adapters.hatch import cli as hatch_cli, keepalive, task_fields  # noqa: E402
+from ag2_sparrow.adapters.hatch import (  # noqa: E402
+    cli as hatch_cli, keepalive, runtime_text, task_fields)
 
 KEEPAWAKE_NOTE = "the agent keeps Sparrow running with %s keepalive keepawake from its scheduler"
 
@@ -484,6 +485,29 @@ class HookScript(Base):
         (m,) = self.payload()["matches"]
         self.assertEqual((m["task_id"], m["event_id"]), ("task-blue~task-1784700000001", "$blue"))
         self.assertEqual(m["result_file"], str(self.results / "task-blue~task-1784700000001.txt"))
+
+    def test_an_upgrade_notice_wakes_the_agent_once(self):
+        notice = self.sparrow_state / "hatch-wake-notice"
+        notice.write_text("ag2-sparrow upgraded itself; REQUIRED hook: /h/def.json\n")
+        r = self.run_script(ACTIVITY_FILE=str(self.home / "marker"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        p = self.payload()
+        self.assertEqual(p["notice"], "ag2-sparrow upgraded itself; REQUIRED hook: /h/def.json")
+        self.assertIn("REQUIRED hook: /h/def.json Report this to your owner", p["worker_note"])
+        self.assertIn("change nothing yourself", p["worker_note"])
+        self.assertFalse(notice.exists())
+        self.reset()
+        self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 1}))
+        self.run_script(ACTIVITY_FILE=str(self.home / "absent"))
+        self.assertNotIn("notice", self.payload())
+
+    def test_a_task_wake_leaves_the_notice_for_a_quiet_poll(self):
+        notice = self.sparrow_state / "hatch-wake-notice"
+        notice.write_text("hook changed\n")
+        self.add_task("task-1784700000001", "$reply")
+        self.run_script()
+        self.assertNotIn("notice", self.payload())
+        self.assertTrue(notice.exists())
 
     def test_heartbeat_with_sparrow_running_carries_no_sparrow_field(self):
         self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 1}))
@@ -1128,6 +1152,14 @@ class Cli(Base):
         self.assertEqual(code, hatch_cli.SPARROW_DOWN)
         code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="blue")
         self.assertEqual(code, hatch_cli.SPARROW_OK, detail)
+
+    def test_install_keeps_auto_upgrade_off(self):
+        self.assertEqual(self.cli("install", "--mxid", AGENT).returncode, 0)
+        cfg = self.home / ".config" / "ag2-sparrow-hatch" / "config"
+        self.assertNotIn("AUTO_UPGRADE", cfg.read_text())
+        cfg.write_text(cfg.read_text() + "AUTO_UPGRADE=0\n")
+        self.assertEqual(self.cli("install", "--mxid", AGENT).returncode, 0)
+        self.assertEqual(hatch_cli.read_config(cfg)["AUTO_UPGRADE"], "0")
 
     def test_install_records_the_reply_command_by_absolute_path(self):
         r = self.cli("install", "--mxid", AGENT)
@@ -2483,7 +2515,10 @@ def project_scripts() -> set:
 
 class DocumentedCommands(unittest.TestCase):
     def test_every_command_the_worker_is_told_to_run_is_the_shipped_reply_command(self):
-        prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
+        shipped = runtime_text.builtin()
+        prompt = " ".join([json.loads((HATCH / "hook-definition.json").read_text())["prompt"],
+                           shipped["prompt"], shipped["worker_note"], shipped["restart_hint"],
+                           *shipped["tier_notes"]])
         named = {span.split()[0] for span in re.findall(r"`([^`]+)`", prompt)}
         self.assertEqual(named, {hatch_cli.REPLY_PLACEHOLDER})
         self.assertIn(hatch_cli.REPLY_COMMAND, project_scripts())
@@ -2492,12 +2527,29 @@ class DocumentedCommands(unittest.TestCase):
         self.assertEqual(spans, {"'\"$REPLY\"'"})
         self.assertIn(f'REPLY="${{REPLY_COMMAND:-{hatch_cli.REPLY_COMMAND}}}"', SCRIPT.read_text())
 
+    def test_built_in_notes_are_the_hook_scripts_notes(self):
+        script = SCRIPT.read_text()
+
+        def note(name):
+            raw = re.search(rf"^{name}='(.*)'$", script, re.M).group(1)
+            return (raw.replace("'\"$ACTIVITY_FILE\"'", "<ACTIVITY_FILE>")
+                    .replace("'\"$REPLY\"'", "<REPLY_COMMAND>").replace("'\"'\"'", "'"))
+        shipped = runtime_text.builtin()
+        self.assertEqual(shipped["worker_note"], note("REMAINING_WORK_NOTE"))
+        self.assertEqual(shipped["tier_notes"], [note("NON_OWNER_NOTE")])
+
+    def test_the_hook_prompt_sends_the_worker_to_wake_context(self):
+        prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
+        self.assertIn("`<REPLY_COMMAND> wake-context`", prompt)
+        self.assertIn("if that command fails, follow the worker_note alone", prompt)
+
     def test_no_instruction_names_the_unshipped_ag2_space_cli(self):
         prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
-        self.assertNotIn("ag2-space ", prompt + SCRIPT.read_text())
+        self.assertNotIn("ag2-space ", prompt + SCRIPT.read_text()
+                         + json.dumps(runtime_text.builtin()))
 
     def test_prompt_has_each_item_answered_from_its_own_task_file(self):
-        prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
+        prompt = runtime_text.builtin()["prompt"]
         for phrase in ("room_name, channel_kind", "Handle the items one at a time",
                        "read its task_file first", "its task: line is the whole message",
                        "Answer from that file; the snippet is only a preview",

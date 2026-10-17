@@ -315,11 +315,11 @@ def unmanaged_health_problem(cfg: dict) -> "tuple[int | None, str | None]":
     return pid, health_env_problem(cfg, pid)
 
 
-def replace_sparrow(cfg: dict, pid: int) -> "tuple[bool, str]":
-    """Stop Sparrow `pid`, which lacks this install's REMOTE_HEALTH_COMMAND, and start one
-    that has it."""
-    print(f"replacing: Sparrow (pid {pid}) runs without "
-          f"REMOTE_HEALTH_COMMAND={health_command(_command(cfg))}")
+def replace_sparrow(cfg: dict, pid: int, why: "str | None" = None) -> "tuple[bool, str]":
+    """Stop Sparrow `pid` and start one with this install's REMOTE_HEALTH_COMMAND; `why`
+    says what the replace is for (default: the running one lacks that command)."""
+    print(f"replacing: Sparrow (pid {pid}) " + (why or "runs without "
+          f"REMOTE_HEALTH_COMMAND={health_command(_command(cfg))}"))
     if not _stop(pid):
         return False, f"the old Sparrow (pid {pid}) did not stop"
     ok, how = restart_listener(cfg)
@@ -458,13 +458,25 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
             else:
                 print(f"the replace failed: {how}", file=sys.stderr)
                 rc = 1
+    upgrade = _served_setup(cfg)
     line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
-        + (f" reason={reason}" if reason else "")
+        + (f" reason={reason}" if reason else "") + (f" upgrade={upgrade}" if upgrade else "")
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
     print(line)
     return rc
+
+
+def _served_setup(cfg: dict) -> "str | None":
+    """Refresh the served setup and start an upgrade it calls for; never fails the run."""
+    from . import runtime_text, self_upgrade
+    try:
+        setup = runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
+        return self_upgrade.maybe_start(cfg, setup)
+    except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
+        print(f"NOTE served setup: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
 
 
 def last_keepawake(log: Path) -> float | None:
@@ -522,24 +534,30 @@ def oldest_open_task(cfg: dict) -> "float | None":
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     """The core row for Sparrow's heartbeat; None while no keepawake task is installed.
     `alive` also counts the hook's activity marker."""
+    from . import runtime_text, self_upgrade
     now = time.time() if now is None else now
     tasks = _found(cron_dir(cfg), TASK)
     if not tasks:
         return None
+    tune = runtime_text.tunables(runtime_text.load_cache(_state_dir(cfg)))
+    stale_s, hook_stale_s = 2 * tune["keepawake_interval_s"], tune["hook_silent_age_s"]
     ran = last_keepawake(log)
     # Install leaves an unchanged task's mtime alone, so a task that never ran ages from it.
     last = ran if ran is not None else max(
         (m for m in map(_mtime, tasks) if m is not None), default=now)
-    fresh = _within(now, last)
+    fresh = _within(now, last, stale_s)
     alive = True if (fresh and ran is not None) or _within(now, _mtime(_activity_file(cfg))) \
         else None
-    problems = [] if fresh else [(NOT_RUNNING, last + STALE_S)]
+    problems = [] if fresh else [(NOT_RUNNING, last + stale_s)]
     hook = hook_last_run(cfg)
-    if hook is not None and not _within(now, hook, HOOK_STALE_S):
-        problems.append((HOOK_NOT_RUNNING, hook + HOOK_STALE_S))
+    if hook is not None and not _within(now, hook, hook_stale_s):
+        problems.append((HOOK_NOT_RUNNING, hook + hook_stale_s))
     oldest = oldest_open_task(cfg)
-    if oldest is not None and now - oldest > TASK_PICKUP_S:
-        problems.append((TASK_NOT_PICKED_UP, oldest + TASK_PICKUP_S))
+    if oldest is not None and now - oldest > tune["stuck_task_age_s"]:
+        problems.append((TASK_NOT_PICKED_UP, oldest + tune["stuck_task_age_s"]))
+    failed = self_upgrade.failed_since(_state_dir(cfg))
+    if failed is not None:
+        problems.append((self_upgrade.UPGRADE_FAILED, failed))
     # Fresh but never run: no evidence either way yet.
     condition = "abnormal" if problems else "healthy" if ran is not None else "unknown"
     reason, since = problems[0] if problems else (None, None)

@@ -312,6 +312,7 @@ from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
+from . import __version__ as _PACKAGE_VERSION
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
@@ -460,6 +461,9 @@ _RELAY_ASK_PREFIX = "ask-"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
+# The heartbeat reply's pointers to the served setup; read by adapters, never by Sparrow.
+SETUP_HINT_FILE = _STATE / f"setup-hint{_INST_SUFFIX}.json"
+SETUP_HINT_FIELDS = ("setup_revision", "min_version", "target_version")
 
 # Launch provenance + in-bridge file log. A supervisor that persists stdout
 # (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
@@ -3524,6 +3528,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "provider": PROVIDER,
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
+            "package_version": _PACKAGE_VERSION,
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
                              "core-status", "team-collaborator", VOICE_OUTCOME_CONTRACT],
         }
@@ -3536,8 +3541,9 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         if health is not None:
             payload["health"] = health
             payload["capabilities"].append("worker_health.v1")
-        _req("POST", "/v1/heartbeat", payload, timeout=10)
+        reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
+        _record_setup_hint(reply)
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
@@ -3553,6 +3559,25 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     except _NETWORK_ERRORS as e:
         _log(f"heartbeat network error: {e} — continuing")
         return False
+
+
+def _record_setup_hint(reply) -> None:
+    """Keep the heartbeat reply's setup_revision and versions for an adapter to read;
+    best-effort, like the heartbeat itself."""
+    if not isinstance(reply, dict):
+        return
+    hint = {k: reply[k] for k in SETUP_HINT_FIELDS if k in reply}
+    if not hint:
+        return
+    tmp = SETUP_HINT_FILE.with_name(f".{SETUP_HINT_FILE.name}.{os.getpid()}")
+    try:
+        SETUP_HINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(dict(hint, ts=int(time.time())), sort_keys=True),
+                       encoding="utf-8")
+        os.replace(tmp, SETUP_HINT_FILE)
+    except (OSError, TypeError, ValueError) as e:
+        tmp.unlink(missing_ok=True)
+        _log(f"setup hint not recorded: {e}")
 
 
 def _emit_gateway_status(connected: bool, *, error: str | None = None,
