@@ -6,7 +6,7 @@ import type { SkillSetupCtx, VoiceSurfaceContribution } from '../../src/skill-se
 import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './session-context.js';
 import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateClient, navigateUiAvailable, navigateUiTool, resolveUiNavigated } from './navigate.js';
 import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
-import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createAddCommentTool, createSearchCommonsTool, createSearchRoomTool, createSendMessageTool, createWritePageTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
+import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createAddCommentTool, createSearchCommonsTool, createSearchRoomTool, createSendMessageTool, createWritePageTool, findAg2SpaceMcpEntry, mcpFailure, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
 import { ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, createDescribeActionTool, createFindActionsTool, createRunActionTool, armSpeechGate, noteUserSpoke } from './room-actions.js';
 
 export const tools: ToolDefinition[] = [];
@@ -81,7 +81,7 @@ function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; tu
 		_rooms = createRoomIndex({ client: () => _mcp, log });
 		_rooms.refresh().then(
 			() => console.log(`${ts()} [RoomRead] ag2-space MCP ready`),
-			(err) => console.warn(`${ts()} [RoomRead] ag2-space MCP warm-up failed: ${err instanceof Error ? err.message : err}`),
+			(err) => { const why = err instanceof Error ? err.message : String(err); console.warn(`${ts()} [RoomRead] ag2-space MCP warm-up failed (${mcpFailure(why)}): ${why}`); },
 		);
 	}
 	const index = _rooms!;
