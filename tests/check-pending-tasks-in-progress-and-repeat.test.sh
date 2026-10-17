@@ -156,5 +156,20 @@ record_delivery
 OUT="$(run_hook '{"stop_hook_active":true}')"
 [ "$OUT" = "{}" ] && [ ! -e "$COUNTER" ] && ok "an answered queue lets the turn end and clears the counter" || bad "an answered queue lets the turn end and clears the counter" "out=${OUT:0:80} counter=$(cat "$COUNTER" 2>/dev/null)"
 
+echo "a block hands a task to the core inline, so it records once that the core has it:"
+rm -f "$WS/state/agent-activity.jsonl"
+T3="task-handover-hooktest-$$"
+printf 'id: %s\nchannel_id: local-voice\ntask: draw a tree\n' "$T3" > "$WS/tasks/$T3.txt"
+handover_rows() { grep -c "\"$T3\"" "$WS/state/agent-activity.jsonl" 2>/dev/null | tr -d ' '; }
+OUT="$(run_hook '')"
+case "$OUT" in *'"decision":"block"'*"$T3"*) ok "the queued task blocks, its body in the reason" ;; *) bad "the queued task blocks" "got: ${OUT:0:160}" ;; esac
+ROW="$(grep "\"$T3\"" "$WS/state/agent-activity.jsonl" 2>/dev/null)"
+case "$ROW" in *'"kind": "processing"'*'"room": "local-voice"'*) ok "a processing row names it (what readers take as: the core has read it)" ;; *) bad "a processing row names it" "row: ${ROW:0:200}" ;; esac
+case "$ROW" in *TASK_STATUS*) bad "the row is the session's, not a bus projection" "row: ${ROW:0:200}" ;; *) ok "the row is the session's, not a bus projection" ;; esac
+OUT="$(run_hook '{"stop_hook_active":true}')"
+[ "$(handover_rows)" = "1" ] && ok "a repeat block writes no second row" || bad "a repeat block writes no second row" "rows: $(handover_rows)"
+case "$OUT" in *'"decision":"block"'*) ok "the row is not progress: the task still blocks" ;; *) bad "the row is not progress: the task still blocks" "got: ${OUT:0:160}" ;; esac
+rm -f "$WS/tasks/$T3.txt"
+
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 exit "$FAILED"

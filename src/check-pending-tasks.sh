@@ -171,6 +171,7 @@ task_in_progress() {
 
 UNPROCESSED=""
 UNPROCESSED_NAMES=""
+HANDED_FILES=()
 shopt -s nullglob 2>/dev/null
 
 if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
@@ -204,6 +205,7 @@ if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
       continue
     fi
     PAYLOAD="$TASKS_DIR/$TASK_ID.txt"
+    [ -f "$PAYLOAD" ] && HANDED_FILES+=("$PAYLOAD")
     UNPROCESSED+="--- $TASK_ID.txt ---
 $( [ -f "$PAYLOAD" ] && cat "$PAYLOAD" || echo "(payload not found at $PAYLOAD)" )
 
@@ -236,6 +238,7 @@ else
 "
       continue
     fi
+    HANDED_FILES+=("$f")
     UNPROCESSED+="--- $BASENAME ---
 $(cat "$f")
 
@@ -272,6 +275,9 @@ elif [ -n "$UNPROCESSED" ]; then
     echo '{}'
     exit 0
   fi
+  # The block hands these bodies to the core inline, with no Read for the activity hook to see:
+  # record that it has them (a processing row, never progress), so a cancel is answered truthfully.
+  [ "${#HANDED_FILES[@]}" -gt 0 ] && "$PYBIN" "$REPO_DIR/src/task_handover.py" "${HANDED_FILES[@]}" >/dev/null 2>&1
   # `reason` is what a blocking Stop delivers to the model, so the task names and
   # bodies ride it (a top-level additionalContext is not read on this event; it is
   # kept for the wire-shape pin). A real JSON encoder: hand-rolled escaping put a raw
