@@ -255,27 +255,286 @@ def parse_task_file(path) -> "dict | None":
     return parse(parsed.headers, parsed.body or "")
 
 
-def authorized_command(path, workspace=None) -> "dict | None":
-    """The picker command in one task file, or None unless the OWNER sent it.
+def sender_command(path, workspace=None) -> "tuple[str, dict, dict] | None":
+    """(sender, command, headers) for one picker task, or None when it is not one.
 
-    A task-last writer puts every header above `task:`; everything below is the
-    sender's text and may promote nothing. The gateway instead writes the picker
-    mark and the tier BELOW `task:`, so reading its tier needs the last-wins
-    parse -- which is only safe on a file whose writer declared the one-line
-    task-mid layout above `task:` AND whose envelope HMAC verifies; either
-    missing falls back to the strict parse (task_envelope.attested_task_headers).
+    `sender` is owner, collaborator, other (an explicit non-owner tier) or
+    unknown (no tier). A task-last writer puts every header above `task:`;
+    everything below is the sender's text and may promote nothing. The gateway
+    instead writes the picker mark, the tier and `collaborator` BELOW `task:`,
+    so reading them needs the last-wins parse -- which is only safe on a file
+    whose writer declared the one-line task-mid layout above `task:` AND whose
+    envelope HMAC verifies; either missing falls back to the strict parse
+    (task_envelope.attested_task_headers).
     """
     import task_envelope as te
     text = Path(path).read_text(encoding="utf-8", errors="replace")
-    strict = ltp.parse_task_headers(text)
-    above = strict.headers
+    above = ltp.parse_task_headers(text).headers
     if above.get("source") is not None and (above.get("source") or "").strip() != SOURCE:
         return None
     parsed = te.attested_task_headers(text, workspace)
-    if (parsed.headers.get("access_tier") or "").strip() != "owner":
-        return None
+    headers = parsed.headers
+    tier = (headers.get("access_tier") or "").strip()
     sentence = (parsed.body or "").split("\n", 1)[0]
-    return parse(parsed.headers, sentence)
+    cmd = parse(headers, sentence)
+    if cmd is None:
+        return None
+    if tier == "owner":
+        sender = "owner"
+    elif tier == "team" and (headers.get("collaborator") or "").strip() == "true":
+        sender = "collaborator"
+    else:
+        sender = "other" if tier else "unknown"
+    return sender, cmd, dict(headers)
+
+
+def authorized_command(path, workspace=None) -> "dict | None":
+    """The picker command in one task file, or None unless the OWNER sent it."""
+    got = sender_command(path, workspace)
+    return got[1] if got and got[0] == "owner" else None
+
+
+# A collaborator's add/pin waits for the owner: parked by the edge, answered by
+# `approve`/`decline`; the parked command is the only thing an approval applies.
+
+REFUSAL = ("Only this agent's owner can add or pin workers, so this request was "
+           "not applied.")
+
+
+def requests_path(workspace) -> Path:
+    return pr.roster_path(workspace).parent / "picker-requests.json"
+
+
+@contextlib.contextmanager
+def _requests_locked(workspace):
+    # Taken before the applied-ledger lock, never after it.
+    p = pr.roster_path(workspace).parent / ".picker-requests.lock"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _read_requests(workspace) -> dict:
+    try:
+        got = json.loads(requests_path(workspace).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def describe(cmd: dict) -> str:
+    action = cmd.get("action")
+    if action == "add":
+        label = cmd.get("label")
+        return "add a new worker to the pool" + (f" labelled '{label}'" if label else "")
+    if action == "unpin":
+        return "unpin this room from its worker (back to auto routing)"
+    workers = " ".join(cmd.get("workers") or [])
+    return (f"dedicate this room to worker {workers}" if cmd.get("dedicated")
+            else f"pin this room to worker {workers}")
+
+
+def _request_id(log: dict, task_id: str) -> str:
+    import hashlib
+    digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+    for n in range(8, len(digest) + 1):
+        rid = digest[:n]
+        held = (log.get("requests") or {}).get(rid)
+        if held is None or held.get("task_id") == task_id:
+            return rid
+    raise ValueError(f"no free request id for {task_id}")
+
+
+def _ask_owner(workspace, question: str, context: str) -> str:
+    """Ask through scripts/ask-owner.py, detached: the edge runs inside the
+    watcher's dispatch loop, and the owner store may be slow or remote."""
+    import subprocess
+    script = _SCRIPTS.parents[2] / "scripts" / "ask-owner.py"
+    log = pr.roster_path(workspace).parent / "picker-requests-ask.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "a", encoding="utf-8") as out:
+        subprocess.Popen([sys.executable, str(script), question, "--context", context,
+                          "--workspace", str(pr._root(workspace))],
+                         stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    return f"ask-owner.py started (output: {log})"
+
+
+def _post_notice(results_dir: Path, task_id: str, text: str) -> bool:
+    """The task's own result, which the bridge threads to the asking message.
+    Never over a result that already exists: that one is the answer."""
+    from local_record import write_text_whole
+    if ltp.find_result(results_dir, task_id) is not None:
+        return False
+    write_text_whole(results_dir / f"{task_id}.txt", text.rstrip("\n") + "\n")
+    return True
+
+
+def request_approval(workspace, path, *, results_dir=None, asker=None) -> "dict | None":
+    """Park a collaborator's add/pin/unpin and ask the owner; refuse any other
+    non-owner. None when this task is not the edge's to answer (owner, unknown)."""
+    got = sender_command(path, workspace)
+    if not got:
+        return None
+    sender, cmd, headers = got
+    if sender in ("owner", "unknown") or cmd.get("action") not in COMMANDS:
+        return None
+    task_id = Path(path).stem
+    rd = _results_dir(workspace, results_dir)
+    if sender != "collaborator":
+        _post_notice(rd, task_id, REFUSAL)
+        return {"action": "refused", "task_id": task_id}
+
+    with _requests_locked(workspace):
+        log = _read_requests(workspace)
+        rid = _request_id(log, task_id)
+        rec = (log.get("requests") or {}).get(rid)
+        new = rec is None
+        if new:
+            thread = (headers.get("thread_root") or headers.get("source_message_id") or "").strip()
+            lane = (headers.get("source") or "").strip()
+            seq = int(log.get("seq") or 0) + 1
+            log["seq"] = seq
+            room = (headers.get("channel_id") or "").strip() or None
+            rec = {"id": rid, "task_id": task_id, "command": cmd, "status": "pending",
+                   "seq": seq, "room_seq": _room_seq(workspace, room), "room": room,
+                   "room_name": (headers.get("room_name") or "").strip() or None,
+                   "thread_root": thread if thread.startswith("$") else None,
+                   "lane": lane if lane and lane != SOURCE else "ag2space",
+                   "requester": (headers.get("sender_name") or headers.get("user_id")
+                                 or "a collaborator").strip()}
+            log.setdefault("requests", {})[rid] = rec
+            pr._write_atomic(requests_path(workspace), log)
+    if new:
+        where = rec["room_name"] or rec["room"] or "a room"
+        question = (f"{rec['requester']} (a collaborator in {where}) asks to "
+                    f"{describe(cmd)}. Approve?")
+        context = (f"Request {rid}. Reply 'approve {rid}' or 'decline {rid}'; the core then runs "
+                   f"skills/worker-pool/scripts/worker_picker_commands.py approve|decline {rid} "
+                   "--task-file <your reply's task file>.")
+        try:
+            asked = (asker or _ask_owner)(workspace, question, context)
+        except Exception as e:  # noqa: BLE001 — the collaborator must hear either way
+            asked = None
+            print(f"worker-picker: owner not asked for {rid}: {e!r}", file=sys.stderr)
+        notice = (f"I've asked my owner for permission to {describe(cmd)}. "
+                  "I'll post here once they decide." if asked else
+                  f"Your request to {describe(cmd)} needs my owner's approval, and I "
+                  "could not reach them to ask. Please ask them directly.")
+        _post_notice(rd, task_id, notice)
+    return {"action": "awaiting-owner", "id": rid, "task_id": task_id, "new": new,
+            "status": rec.get("status")}
+
+
+def _notify_room(rec: dict, text: str) -> str:
+    """Post `text` in the requester's room through the task-progress skill when
+    it is installed; otherwise say it was not posted, never that it was."""
+    import subprocess
+    notify = _SCRIPTS.parents[1] / "task-progress" / "scripts" / "notify.py"
+    if not rec.get("room"):
+        return "NOT posted: the request carries no room"
+    if not notify.is_file():
+        return "NOT posted: the task-progress skill is not installed"
+    argv = [sys.executable, str(notify), "--source", rec.get("lane") or "ag2space",
+            "--channel-id", rec["room"], "--message", text]
+    if rec.get("thread_root"):
+        argv += ["--thread-root", rec["thread_root"]]
+    rc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=60).returncode
+    return "posted" if rc == 0 else f"NOT posted: notify.py exited {rc}"
+
+
+def _room_seq(workspace, room) -> "int | None":
+    return ((_read_applied(workspace).get("rooms") or {}).get(room) or {}).get("seq") if room else None
+
+
+def owner_authority_error(path, workspace, rid: str) -> "str | None":
+    """Why the task at `path` cannot decide request `rid`, or None when it can:
+    its ATTESTED tier is owner and its text names the request."""
+    import task_envelope as te
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"owner task unreadable: {e}"
+    parsed = te.attested_task_headers(text, workspace)
+    if (parsed.headers.get("access_tier") or "").strip() != "owner":
+        return "the deciding task is not the owner's"
+    if rid not in (parsed.body or ""):
+        return f"the owner's task does not name request {rid}"
+    return None
+
+
+def _superseded(workspace, log: dict, rec: dict) -> "str | None":
+    """Why approving this room-scoped request now would undo a later change."""
+    for other in (log.get("requests") or {}).values():
+        if (other is not rec and other.get("room") == rec.get("room")
+                and (other.get("command") or {}).get("action") in ("pin", "unpin")
+                and int(other.get("seq") or 0) > int(rec.get("seq") or 0)
+                and other.get("status") in ("pending", "approved")):
+            return f"a newer request for this room ({other['id']}) is {other['status']}"
+    if _room_seq(workspace, rec.get("room")) != rec.get("room_seq"):
+        return "this room's worker binding changed after the request was made"
+    return None
+
+
+def decide(workspace, rid: str, approve: bool, *, authority, notifier=None) -> dict:
+    """Apply (or drop) exactly the parked command, then tell the collaborator.
+    `authority` is the owner's own task answering it; a request decides once."""
+    refused = owner_authority_error(authority, workspace, rid)
+    if refused:
+        return {"id": rid, "error": refused}
+    with _requests_locked(workspace):
+        log = _read_requests(workspace)
+        rec = (log.get("requests") or {}).get(rid)
+        if rec is None:
+            return {"id": rid, "error": "no such request"}
+        if rec.get("status") != "pending":
+            return {"id": rid, "status": rec.get("status"), "error": "already decided"}
+        cmd = rec["command"]
+        out: dict = {"id": rid, "command": cmd}
+        why = _superseded(workspace, log, rec) if (
+            approve and cmd.get("action") in ("pin", "unpin")) else None
+        if why:
+            out["reason"] = why
+        elif approve and cmd.get("action") in ("pin", "unpin"):
+            try:
+                applied = apply(workspace, cmd, task_id=f"{rec['task_id']}.approved-{rid}")
+            except (pr.RosterError, OSError, ValueError) as e:
+                applied = {"action": "skipped", "reason": str(e)}
+            if applied.get("action") == "skipped":
+                return {**out, "status": "pending", "error": f"not applied: {applied.get('reason')}"}
+            out["applied"] = applied
+        elif approve:
+            out["next"] = ("run the owner's add: grow the installed core pool by one via "
+                           "scripts/install-core-pool.sh" +
+                           (f", label '{cmd['label']}'" if cmd.get("label") else ""))
+        rec["status"] = "superseded" if why else ("approved" if approve else "declined")
+        pr._write_atomic(requests_path(workspace), log)
+    out["status"] = rec["status"]
+    if why:
+        text = (f"Your request to {describe(cmd)} was not applied: {why}, so applying it "
+                "now would undo that. Nothing was changed.")
+    elif out.get("applied"):
+        text = f"My owner approved your request to {describe(cmd)}, and it is applied."
+    elif approve:
+        text = (f"My owner approved your request to {describe(cmd)}. The worker is added "
+                "when my owner's Sutando runs the add.")
+    else:
+        text = f"My owner declined your request to {describe(cmd)}."
+    out["notice"] = text
+    try:
+        out["posted"] = (notifier or _notify_room)(rec, text)
+    except Exception as e:  # noqa: BLE001 — the decision stands; say the post failed
+        out["posted"] = f"NOT posted: {e!r}"
+    return out
+
+
+def pending(workspace) -> list:
+    return [r for r in (_read_requests(workspace).get("requests") or {}).values()
+            if r.get("status") == "pending"]
 
 
 def applied_path(workspace) -> Path:
@@ -387,15 +646,40 @@ def apply(workspace, cmd: dict, *, task_id=None, results_dir=None) -> "dict | No
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="read a worker-picker task's intent")
-    ap.add_argument("--task-file", required=True)
+    ap = argparse.ArgumentParser(description="read a worker-picker task's intent, or "
+                                 "answer a collaborator's parked request")
+    ap.add_argument("verb", nargs="?", default="parse",
+                    choices=("parse", "request", "pending", "approve", "decline"))
+    ap.add_argument("request_id", nargs="?", help="for approve/decline")
+    ap.add_argument("--task-file", help="the picker task; for approve/decline, the "
+                    "owner's own task that answers the request")
+    ap.add_argument("--workspace", default=None)
+    ap.add_argument("--results-dir", default=None)
     a = ap.parse_args(argv)
-    intent = parse_task_file(a.task_file)
-    if intent is None:
-        print("worker-picker: not a picker command", file=sys.stderr)
-        return 3
-    print(json.dumps(intent, indent=2))
-    return 0
+    if not a.task_file and a.verb != "pending":
+        ap.error(f"{a.verb} needs --task-file")
+    if a.verb in ("approve", "decline") and not a.request_id:
+        ap.error(f"{a.verb} needs a request id")
+    if a.verb == "parse":
+        intent = parse_task_file(a.task_file)
+        if intent is None:
+            print("worker-picker: not a picker command", file=sys.stderr)
+            return 3
+        print(json.dumps(intent, indent=2))
+        return 0
+    ws = Path(a.workspace) if a.workspace else pr._root(None)
+    if a.verb == "request":
+        out = request_approval(ws, a.task_file, results_dir=a.results_dir)
+        if out is None:
+            print("worker-picker: not a collaborator's or non-owner's picker command",
+                  file=sys.stderr)
+            return 3
+    elif a.verb == "pending":
+        out = pending(ws)
+    else:
+        out = decide(ws, a.request_id, a.verb == "approve", authority=a.task_file)
+    print(json.dumps(out, indent=2))
+    return 1 if isinstance(out, dict) and out.get("error") else 0
 
 
 if __name__ == "__main__":

@@ -121,8 +121,14 @@ def apply_picker(workspace, task_file, results_dir=None) -> "dict | None":
     hands the task straight to the core, so the probe is the only call a
     picker task gets -- EXCEPT across a restart, where the startup sweep
     re-probes every retained task, so the replay gate is what makes that safe.
-    Idempotent; a failure is reported, never fatal."""
+    Idempotent; a failure is reported, never fatal. A collaborator's command is
+    parked for the owner and answered here, which is `handled`."""
     try:
+        asked = wpc.request_approval(workspace, task_file, results_dir=results_dir)
+        if asked is not None:
+            print(f"pool_route_handler: picker command {asked['action']} "
+                  f"({asked.get('id') or asked['task_id']})", file=sys.stderr)
+            return {**asked, "handled": True}
         cmd = wpc.authorized_command(task_file, workspace)
         out = wpc.apply(workspace, cmd, task_id=Path(task_file).stem,
                         results_dir=results_dir) if cmd else None
@@ -165,7 +171,10 @@ def main(argv=None) -> int:
         print(f"pool_route_handler: advertisement not ensured: {e!r}", file=sys.stderr)
     task = read_task(args.task_file)
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
-        apply_picker(ws, args.task_file, args.results_dir)
+        picked = apply_picker(ws, args.task_file, args.results_dir)
+        if picked and picked.get("handled"):
+            # Answered at the edge, its result written: the core must not take it too.
+            return 0
     code, targets, roster = classify(ws, task)
     stem = Path(args.task_file).stem
     if code == 0 and task["id"] != stem:
