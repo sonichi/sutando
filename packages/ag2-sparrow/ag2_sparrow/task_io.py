@@ -6,7 +6,6 @@ Package level so adapters share it without importing one another. Stdlib only.
 from __future__ import annotations
 
 import argparse
-import calendar
 import os
 import re
 import signal
@@ -254,11 +253,13 @@ def clear_attributed_pidfile(owner, root):
             "adapter and remove it, then start" % path)
 
 
+# Our own start is the wall clock at import: exact, no child process, and immune to the
+# second-level rounding of a ps/boot-time derived start on Linux.
+_PROCESS_STARTED_AT = int(time.time())
+
+
 def _started_at():
-    start = holder_lock.start_time(os.getpid())
-    if start is None:
-        return None
-    return calendar.timegm(time.strptime(start, "%Y-%m-%dT%H:%M:%SZ"))
+    return _PROCESS_STARTED_AT
 
 
 def main(argv=None):
