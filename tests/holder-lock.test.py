@@ -7,6 +7,7 @@ Run: python3 tests/holder-lock.test.py
 """
 import ast
 import contextlib
+import dataclasses
 import stat
 import io
 import json
@@ -1060,6 +1061,168 @@ class HolderLockTest(unittest.TestCase):
             self.assertEqual(self.acquire().prior, self.hl.Missing())
 
     # ── §7 both copies ──
+
+    # ── error paths, each driven for real ──
+
+    def denied(self, path):
+        os.chmod(path, 0)
+        self.addCleanup(os.chmod, path, 0o700)
+        if os.access(path, os.R_OK):
+            self.skipTest("permissions are not enforced for this user")
+
+    def test_identity_helpers_report_unobservable_instead_of_raising(self):
+        self.real_home()
+        with mock.patch.object(self.hl, "pwd", None):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.hl._home()
+        self.assertEqual(str(e.exception), self.hl.UNSUPPORTED)
+        with mock.patch.object(self.hl.subprocess, "run", side_effect=OSError(2, "no ps")):
+            self.assertIsNone(self.hl.start_time(os.getpid()))
+        with mock.patch.object(self.hl.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, "not a date at all\n", "")):
+            self.assertIsNone(self.hl.start_time(os.getpid()))
+        with mock.patch.object(self.hl.os, "kill", side_effect=PermissionError(1, "not permitted")):
+            self.assertIs(self.hl._pid_alive(12345), True, "another user's live process")
+        self.assertIsNone(self.hl._pid_alive(2 ** 70), "a pid that cannot exist is unobservable")
+
+    def test_the_filesystem_type_is_read_from_the_mount_table_or_statfs(self):
+        mounts = ("rootfs / ext4 rw 0 0\nserver:/zz-home /zz-home nfs4 rw 0 0\n"
+                  "fuse /zz-mnt/my\\040dir fuse.sshfs rw 0 0\n")
+        with mock.patch.object(self.hl.sys, "platform", "linux"), \
+                mock.patch("builtins.open", mock.mock_open(read_data=mounts)):
+            self.assertEqual(self.hl._statfs_type("/zz-home/u/.local/state"), "nfs4")
+            self.assertEqual(self.hl._statfs_type("/zz-mnt/my dir/x"), "fuse.sshfs")
+            self.assertEqual(self.hl._statfs_type("/zz-elsewhere/x"), "ext4")
+        with mock.patch.object(self.hl.sys, "platform", "linux"), \
+                mock.patch("builtins.open", side_effect=OSError(13, "denied")):
+            self.assertIsNone(self.hl._statfs_type("/home"))
+        self.assertIsNone(self.hl._darwin_statfs_type(str(self.tmp / "absent" / "x")), "statfs fails: unknown")
+        import ctypes
+        with mock.patch.object(ctypes, "CDLL", side_effect=OSError("no libc")):
+            self.assertIsNone(self.hl._darwin_statfs_type(str(self.tmp)))
+
+    def test_an_invalid_record_that_names_no_pid_or_cannot_be_validated_is_overwritten_typed(self):
+        self.put(b"[1, 2]")
+        self.assertEqual(self.hl._pids_in(b"[1, 2]"), [])
+        self.hl.release(self.owned())
+        with mock.patch.object(self.hl, "_record_problem", side_effect=ValueError("odd")):
+            got = self.hl._classify(b"{}")
+        self.assertIsInstance(got, self.hl.Invalid)
+        with mock.patch.object(self.hl, "_read_prior", side_effect=ValueError("odd")):
+            self.assertIsInstance(self.hl.read_holder(str(self.root)), self.hl.Invalid)
+            r = self.acquire()
+        self.assertIsInstance(r, self.hl.Acquired, "an undecodable prior is Invalid, never raised")
+        self.hl.release(r.owner)
+
+    def test_read_holder_and_status_report_an_unreadable_root_or_lock_dir(self):
+        self.root.mkdir()
+        outer = self.tmp / "outer"
+        (outer / "inner").mkdir(parents=True)
+        self.denied(outer)
+        self.assertIsInstance(self.hl.read_holder(str(outer / "inner")), self.hl.Invalid)
+        os.chmod(outer, 0o700)
+        st = self.hl.status(str(self.tmp / "never-created"))
+        self.assertEqual((st["lock_dir"], st["record"]), (None, {"kind": "missing"}))
+        d = self.ldir()
+        d.mkdir(parents=True)
+        (d / "holder").write_text("{}")
+        self.denied(d)
+        st = self.hl.status(str(self.root))
+        self.assertEqual(st["record"]["kind"], "unreadable")
+        self.assertEqual((st["waiters"], st["stale_waiters"]), ([], []))
+        os.chmod(d, 0o700)
+        (d / "waiting.99999999").mkdir()
+        self.assertEqual(self.hl.status(str(self.root))["stale_waiters"], [99999999], "an unreadable waiter")
+
+    def test_an_unreadable_legacy_pidfile_refuses(self):
+        p = self.root / "state" / "connector.pid"
+        p.parent.mkdir(parents=True)
+        p.write_text("123\n")
+        self.denied(p)
+        r = self.acquire()
+        self.assertEqual(r, self.hl.LegacyRunning(None, str(p)))
+
+    def test_a_root_removed_or_a_start_time_missing_after_the_flock_refuses(self):
+        real = self.hl.file_lock.try_lock_fd
+
+        def remove_root(fd):
+            os.rmdir(self.root)
+            return real(fd)
+        with mock.patch.object(self.hl.file_lock, "try_lock_fd", remove_root):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.acquire()
+        self.assertEqual(str(e.exception), "root changed")
+        with mock.patch.object(self.hl, "start_time", return_value=None):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.acquire()
+        self.assertEqual(str(e.exception), "cannot read this process's start time")
+        owner = self.owned()
+        os.rmdir(self.root)
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.publish(owner, "routine")
+        self.assertEqual(str(e.exception), "root changed")
+
+    def test_acquire_with_a_timeout_waits_and_wait_returns_at_once_when_free(self):
+        with self.flock_elsewhere():
+            began = time.monotonic()
+            self.assertIsInstance(self.acquire(timeout=0.2), self.hl.TimedOut)
+            self.assertLess(time.monotonic() - began, 2)
+        r = self.hl.wait(str(self.root), install_id="i", deadline=time.monotonic() + 5)
+        self.assertIsInstance(r, self.hl.Acquired)
+        self.hl.release(r.owner)
+
+    def test_a_waiting_file_removed_by_someone_else_is_not_an_error(self):
+        def remove_mine(elapsed, holder):
+            os.unlink(self.ldir() / ("waiting.%d" % os.getpid()))
+            raise KeyError("stop")
+        with self.flock_elsewhere(), self.assertRaises(KeyError):
+            self.hl.wait(str(self.root), install_id="i", deadline=time.monotonic() + 5, on_tick=remove_mine)
+        self.assertIsNone(self.hl._WAITING)
+
+    def test_publish_and_release_from_another_pid_or_after_a_write_failure(self):
+        owner = self.owned()
+        stranger = dataclasses.replace(owner, pid=owner.pid + 1)
+        for call in (self.hl.publish, self.hl.release):
+            with self.subTest(call=call.__name__), self.assertRaises(self.hl.LockError) as e:
+                call(*((stranger, "routine") if call is self.hl.publish else (stranger,)))
+            self.assertEqual(str(e.exception), "not the owner")
+        (self.ldir() / ".holder.1.deadbeef.tmp").mkdir()
+        (self.ldir() / ".holder.1.deadbeef.tmp" / "x").write_text("")
+        with mock.patch.object(self.hl.os, "replace", side_effect=OSError(28, "No space left")), \
+                mock.patch.object(self.hl.os, "unlink", side_effect=OSError(1, "not permitted")):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.hl.publish(owner, "routine")
+        self.assertIn("cannot write the holder record", str(e.exception))
+        self.assertFalse(owner.published, "the owner is still valid")
+        self.assertFalse((self.ldir() / "holder").exists())
+        self.hl.publish(owner, "routine")
+        with mock.patch.object(self.hl, "_read_prior", side_effect=OSError(5, "I/O error")):
+            self.assertEqual(self.hl.release(owner), self.hl.Released(False))
+        self.assertTrue(self.lock_free(), "unlocked even when the record could not be read")
+
+    def test_the_child_side_of_a_fork_closes_only_its_own_lock_descriptor(self):
+        owner = self.owned()
+        other = os.open(os.devnull, os.O_RDONLY)
+        self.addCleanup(lambda: contextlib.suppress(OSError) and os.close(other))
+        mismatched = dataclasses.replace(owner, fd=other)
+        self.hl._OWNER = mismatched
+        self.hl._ACQUIRING.acquire()
+        self.hl._drop_in_child()
+        os.fstat(other)
+        self.assertIsNone(self.hl._OWNER, "the owner is dropped")
+        self.assertFalse(self.hl._ACQUIRING.locked())
+        closed = os.dup(owner.fd)
+        os.close(closed)
+        gone = dataclasses.replace(owner, fd=closed)
+        self.hl._OWNER = gone
+        self.hl._ACQUIRING.acquire()
+        self.hl._drop_in_child()
+        self.hl._OWNER = owner
+        self.hl._ACQUIRING.acquire()
+        self.hl._drop_in_child()
+        with self.assertRaises(OSError):
+            os.fstat(owner.fd)
+        owner.released = True
 
     def test_every_case_runs_against_the_source_and_the_vendored_copy(self):
         self.assertIsNot(SRC, VENDORED)
