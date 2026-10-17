@@ -506,7 +506,11 @@ class TaskIoBranchTest(unittest.TestCase):
         owner = self.owner()
         found = task_io.root_path(owner, str(self.work.parent / "elsewhere"))
         self.assertTrue(os.path.samefile(found, self.work))
-        with mock.patch.object(task_io.sys, "platform", "linux"):
+        # On a real Linux /proc resolves the fd; the refusal is the branch where it cannot.
+        def readlink_fails(*a, **k):
+            raise FileNotFoundError("/proc/self/fd")
+        with mock.patch.object(task_io.sys, "platform", "linux"), \
+                mock.patch.object(task_io.os, "readlink", readlink_fails):
             with self.assertRaises(task_io.LockRefused) as cm:
                 task_io.root_path(owner, str(self.work.parent / "elsewhere"))
         self.assertIn("cannot resolve the held work root", cm.exception.line)
