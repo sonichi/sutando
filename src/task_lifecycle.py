@@ -124,19 +124,20 @@ def write_durable(path, data):
 
 
 def append_durable(path, line):
-    """Append all of `line` (a short write continues where it stopped), fsync, and fsync the
-    directory when this call created the file."""
+    """Append all of `line` (a short write continues where it stopped) and fsync. A file this call
+    creates is made durable first (created, fsynced, its directory fsynced), then written."""
     created = not os.path.exists(path)
     fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o644)
     try:
+        if created:
+            os.fsync(fd)
+            fsync_dir(os.path.dirname(str(path)) or ".")
         data = line.encode("utf-8")
         while data:
             data = data[os.write(fd, data):]
         os.fsync(fd)
     finally:
         os.close(fd)
-    if created:
-        fsync_dir(os.path.dirname(str(path)) or ".")
 
 
 def _lstat(path):
@@ -356,6 +357,7 @@ class RateJournal:
         try:
             with open(self.path, "rb") as f:
                 data = f.read()
+            fsync_dir(os.path.dirname(self.path) or ".")    # a crash may have left the entry undurable
         except FileNotFoundError:
             pass
         lines = data.split(b"\n")

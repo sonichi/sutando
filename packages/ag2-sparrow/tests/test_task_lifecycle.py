@@ -926,7 +926,7 @@ class PublicationTest(Base):
             life.record_outcome("task-a", "queued", "[no-send]\n")
             life.publish_and_settle("task-a")
         claim = ["fsync <temp>", "replace claim.json", "dir task-a"]
-        prepared_and_reserved = ["dir claims"] + claim + ["fsync rate.jsonl", "dir state"]
+        prepared_and_reserved = ["dir claims"] + claim + ["fsync rate.jsonl", "dir state", "fsync rate.jsonl"]
         stage = ["fsync <temp>", "replace body", "dir task-a"]
         confirmed_and_queued = claim + ["fsync rate.jsonl"]
         publication = ["fsync <temp>", "replace .task-a.txt.publish.1", "dir results", "final task-a.txt",
@@ -1259,12 +1259,42 @@ class JournalTest(Base):
         self.assertTrue(raw.endswith(b"\n"), "the record is complete")
         self.assertTrue(self.journal().charged("task-a", 1), "the charge survives a restart")
 
-    def test_the_first_journal_entry_syncs_the_directory_that_holds_it(self):
+    def test_the_first_journal_entry_syncs_the_directory_before_any_record_is_written(self):
         j = self.journal()
-        with mock.patch.object(self.lc, "fsync_dir") as sync:
+        events = []
+        with contextlib.ExitStack() as stack:
+            for patch in durable_events(self.lc, events):
+                stack.enter_context(patch)
             j.append("task-a", 1, "queued", self.clock.t)
             j.append("task-a", 2, "queued", self.clock.t)
-        sync.assert_called_once_with(str(self.work / "state"))
+        self.assertEqual(events, ["fsync rate.jsonl", "dir state", "fsync rate.jsonl", "fsync rate.jsonl"],
+                         "created and fsynced, its directory fsynced, then the record")
+
+    def test_a_crash_before_the_first_directory_barrier_is_repaired_by_the_restart(self):
+        j = self.journal()
+        with mock.patch.object(self.lc, "fsync_dir", side_effect=Crash()):
+            with self.assertRaises(Crash):
+                j.append("task-a", 1, "queued", self.clock.t)
+        self.assertEqual((self.work / "state" / "rate.jsonl").read_bytes(), b"", "no record before the barrier")
+        events = []
+        with contextlib.ExitStack() as stack:
+            for patch in durable_events(self.lc, events):
+                stack.enter_context(patch)
+            again = self.journal()
+        self.assertEqual(events, ["dir state"], "the restart fsyncs the directory that holds the journal")
+        again.append("task-a", 1, "queued", self.clock.t)
+        self.assertTrue(self.journal().charged("task-a", 1))
+
+    def test_a_journal_a_previous_start_left_without_a_barrier_is_synced_on_open(self):
+        j = self.journal()
+        j.append("task-a", 1, "queued", self.clock.t)
+        events = []
+        with contextlib.ExitStack() as stack:
+            for patch in durable_events(self.lc, events):
+                stack.enter_context(patch)
+            again = self.journal()
+        self.assertEqual(events, ["dir state"])
+        self.assertTrue(again.charged("task-a", 1), "the charge is read")
 
     def test_the_event_id_on_disk_is_task_attempt_kind(self):
         j = self.journal()
