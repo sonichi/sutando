@@ -75,6 +75,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Health snapshot: `GET /health`](health-snapshot.md)
 - [Pointer Teacher design](pointer-teacher-design.md)
 - [Credential resolution by capability (G8)](design-credential-capability-resolver.md)
+- [holder_lock: the one flock-and-holder primitive](design-holder-lock.md)
 - [ADR 0001: Pointer Teacher brain](adr/0001-pointer-teacher-brain.md)
 
 ## Documentation contract
