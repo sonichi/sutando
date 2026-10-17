@@ -8,6 +8,7 @@ injective and the first `~` splits it. The empty instance is the primary: identi
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import urllib.parse
 from pathlib import Path
@@ -53,3 +54,11 @@ def redact_url(value: str) -> str:
         return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
     except Exception:  # noqa: BLE001 - redaction must never break status I/O
         return str(value)
+
+
+def binding_digest(identity: str, gateway_url: str) -> str:
+    """sha256 of an agent identity and the FULL gateway URL: what binds a saved reading to
+    one enrollment without persisting the URL; '' when either is missing."""
+    if not identity or not gateway_url:
+        return ""
+    return hashlib.sha256(f"{identity}\n{gateway_url}".encode("utf-8")).hexdigest()

@@ -53,15 +53,18 @@ def hint_path(state_dir: Path, instance: str = "") -> Path:
 
 def owner_dm_room(state_dir: Path, instance: str = "", agent_mxid: str = "") -> str:
     """The owner's DM room Sparrow last read from AG2 Space (its owner-routing file), only
-    while that reading is bound to the identity and gateway the running Sparrow reports;
-    '' otherwise, as the bridge itself refuses another enrollment's reading."""
+    while that reading's binding (identity + full gateway URL digest) is the one the running
+    Sparrow reports; '' otherwise, as the bridge refuses another enrollment's reading."""
     sfx = gateway_instance.suffix(instance)
     routing = _read_json(Path(state_dir) / f"owner-routing{sfx}.json") or {}
     status = _read_json(Path(state_dir) / f"gateway-status{sfx}.json") or {}
-    identity, gateway = str(routing.get("identity") or ""), status.get("gateway")
+    identity, binding = str(routing.get("identity") or ""), status.get("gateway_binding")
+    # The redacted URL is for display; the binding is the digest of the full URL.
     bound = (identity and identity == status.get("agent_id")
-             and (not agent_mxid or identity == agent_mxid) and isinstance(gateway, str)
-             and gateway and gateway_instance.redact_url(str(routing.get("gateway") or "")) == gateway)
+             and (not agent_mxid or identity == agent_mxid) and isinstance(binding, str)
+             and binding and routing.get("binding") in (None, binding)
+             and gateway_instance.binding_digest(identity, str(routing.get("gateway") or ""))
+             == binding)
     room = str(routing.get("owner_dm") or "")
     return room if bound and ROOM_ID_RE.fullmatch(room) else ""
 

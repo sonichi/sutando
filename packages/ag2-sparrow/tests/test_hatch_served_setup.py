@@ -43,14 +43,23 @@ VALUES = {"<AGENT_MXID>": AGENT, "<REPLY_COMMAND>": "/opt/bin/ag2-sparrow-hatch"
           "<ACTIVITY_FILE>": "/tmp/marker"}
 
 
-def bind(state, room, instance="", identity=AGENT, gateway="https://gw.example/relay",
-         status_agent=AGENT, status_gateway="https://gw.example/relay"):
-    """The owner-routing file the bridge writes, and the status file of the Sparrow running."""
+GW = "https://gw.example/relay"
+
+
+def bind(state, room, instance="", identity=AGENT, gateway=GW, status_agent=AGENT,
+         status_url=GW, binding=True):
+    """The owner-routing file the bridge writes, and the status file of the Sparrow running
+    against `status_url`; binding=False writes a record from before the binding field."""
     sfx = f".{instance}" if instance else ""
-    (state / f"owner-routing{sfx}.json").write_text(json.dumps(
-        {"identity": identity, "gateway": gateway, "owner_dm": room}))
+    record = {"identity": identity, "gateway": gateway, "owner_dm": room}
+    if binding:
+        record["binding"] = gateway_instance.binding_digest(identity, gateway)
+    (state / f"owner-routing{sfx}.json").write_text(json.dumps(record))
     (state / f"gateway-status{sfx}.json").write_text(json.dumps(
-        {"connected": True, "agent_id": status_agent, "gateway": status_gateway}))
+        {"connected": True, "agent_id": status_agent,
+         "gateway": gateway_instance.redact_url(status_url),
+         "gateway_binding": gateway_instance.binding_digest(status_agent or "", status_url)
+         or None}))
 
 
 class Base(unittest.TestCase):
@@ -66,6 +75,44 @@ class Base(unittest.TestCase):
 
 
 class Heartbeat(Base):
+    ROUTING = """
+import json
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m
+row = {"agents": [{"id": m._reenroll_identity(), "owner": "@owner:ag2.space",
+                   "owner_dm_room": "!dm:ag2.space"}]}
+with mock.patch.object(m, "_req", return_value=row):
+    m.refresh_routing(force=True)
+m._emit_gateway_status(True)
+print(json.dumps({"routing": json.loads(m._routing_file().read_text()),
+                  "status": json.loads(m.GATEWAY_STATUS_FILE.read_text()),
+                  "url": m.URL, "identity": m._reenroll_identity()}))
+"""
+
+    def bridge(self, script, **extra):
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("REMOTE_", "AG2_", "AGENT_CONNECT_", "SPARROW_"))
+               and k not in ("CLAUDE_CONFIG_DIR", "AGENT_MXID", "AGENT_ID")}
+        env.update(HOME=str(self.home), PYTHONPATH=str(PKG_ROOT),
+                   AGENT_CONNECT_TASK_DIR=str(self.home / "t"),
+                   AGENT_CONNECT_RESULT_DIR=str(self.home / "r"),
+                   AGENT_CONNECT_STATE_DIR=str(self.state),
+                   REMOTE_TASK_URL="https://gw.example/relay?tenant=a",
+                   REMOTE_TASK_TOKEN="fake-relay-token-0123456789abcdef", **extra)
+        r = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True,
+                           text=True, cwd=str(self.home), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_the_bridge_binds_the_routing_record_and_its_status_to_the_full_url(self):
+        out = self.bridge(self.ROUTING, AGENT_MXID=AGENT)
+        digest = gateway_instance.binding_digest(AGENT, out["url"])
+        self.assertTrue(out["url"].endswith("?tenant=a"), out["url"])
+        self.assertEqual(out["routing"]["binding"], digest)
+        self.assertEqual(out["status"]["gateway_binding"], digest)
+        self.assertNotIn("tenant", out["status"]["gateway"])
+        self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space")
+
     SCRIPT = """
 import json
 from unittest import mock
@@ -178,13 +225,31 @@ class WakeContext(Base):
     def test_an_owner_dm_bound_to_another_enrollment_is_not_shown(self):
         for over in ({"identity": "@previous-agent:ag2.space"},
                      {"gateway": "https://previous-gateway.example/relay"},
-                     {"status_agent": None}, {"status_gateway": None}):
+                     {"status_agent": None}):
             bind(self.state, "!old-owner:ag2.space", **over)
             self.assertEqual(runtime_text.owner_dm_room(self.state), "", over)
         bind(self.state, "!dm:ag2.space")
         self.assertEqual(runtime_text.owner_dm_room(self.state, "", "@other:ag2.space"), "")
-        bind(self.state, "!dm:ag2.space", gateway="https://user:pw@gw.example/relay?t=1")
+        bind(self.state, "!dm:ag2.space", binding=False)
         self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space")
+
+    def test_the_same_redacted_gateway_with_another_full_url_is_refused(self):
+        old, new = "https://gw.example/relay?tenant=old", "https://gw.example/relay?tenant=new"
+        self.assertEqual(gateway_instance.redact_url(old), gateway_instance.redact_url(new))
+        bind(self.state, "!old-owner:ag2.space", gateway=old, status_url=new)
+        self.assertEqual(runtime_text.owner_dm_room(self.state), "")
+        bind(self.state, "!old-owner:ag2.space", gateway=old, status_url=new, binding=False)
+        self.assertEqual(runtime_text.owner_dm_room(self.state), "")
+        bind(self.state, "!dm:ag2.space", gateway=new, status_url=new)
+        self.assertEqual(runtime_text.owner_dm_room(self.state), "!dm:ag2.space")
+
+    def test_a_record_whose_binding_disagrees_with_its_url_is_refused(self):
+        bind(self.state, "!dm:ag2.space")
+        path = self.state / "owner-routing.json"
+        record = json.loads(path.read_text())
+        record["binding"] = "0" * 64
+        path.write_text(json.dumps(record))
+        self.assertEqual(runtime_text.owner_dm_room(self.state), "")
 
     def test_the_cli_prints_the_cached_text(self):
         (self.home / "config").write_text(f"AGENT_MXID={AGENT}\nSTATE_DIR={self.state}\n"
