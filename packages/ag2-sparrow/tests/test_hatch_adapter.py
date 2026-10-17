@@ -486,29 +486,6 @@ class HookScript(Base):
         self.assertEqual((m["task_id"], m["event_id"]), ("task-blue~task-1784700000001", "$blue"))
         self.assertEqual(m["result_file"], str(self.results / "task-blue~task-1784700000001.txt"))
 
-    def test_an_upgrade_notice_wakes_the_agent_once(self):
-        notice = self.sparrow_state / "hatch-wake-notice"
-        notice.write_text("ag2-sparrow upgraded itself; REQUIRED hook: /h/def.json\n")
-        r = self.run_script(ACTIVITY_FILE=str(self.home / "marker"))
-        self.assertEqual(r.returncode, 0, r.stderr)
-        p = self.payload()
-        self.assertEqual(p["notice"], "ag2-sparrow upgraded itself; REQUIRED hook: /h/def.json")
-        self.assertIn("REQUIRED hook: /h/def.json Report this to your owner", p["worker_note"])
-        self.assertIn("change nothing yourself", p["worker_note"])
-        self.assertFalse(notice.exists())
-        self.reset()
-        self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 1}))
-        self.run_script(ACTIVITY_FILE=str(self.home / "absent"))
-        self.assertNotIn("notice", self.payload())
-
-    def test_a_task_wake_leaves_the_notice_for_a_quiet_poll(self):
-        notice = self.sparrow_state / "hatch-wake-notice"
-        notice.write_text("hook changed\n")
-        self.add_task("task-1784700000001", "$reply")
-        self.run_script()
-        self.assertNotIn("notice", self.payload())
-        self.assertTrue(notice.exists())
-
     def test_heartbeat_with_sparrow_running_carries_no_sparrow_field(self):
         self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 1}))
         self.run_script(ACTIVITY_FILE=str(self.home / "absent"))
@@ -1152,14 +1129,6 @@ class Cli(Base):
         self.assertEqual(code, hatch_cli.SPARROW_DOWN)
         code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="blue")
         self.assertEqual(code, hatch_cli.SPARROW_OK, detail)
-
-    def test_install_keeps_auto_upgrade_off(self):
-        self.assertEqual(self.cli("install", "--mxid", AGENT).returncode, 0)
-        cfg = self.home / ".config" / "ag2-sparrow-hatch" / "config"
-        self.assertNotIn("AUTO_UPGRADE", cfg.read_text())
-        cfg.write_text(cfg.read_text() + "AUTO_UPGRADE=0\n")
-        self.assertEqual(self.cli("install", "--mxid", AGENT).returncode, 0)
-        self.assertEqual(hatch_cli.read_config(cfg)["AUTO_UPGRADE"], "0")
 
     def test_install_records_the_reply_command_by_absolute_path(self):
         r = self.cli("install", "--mxid", AGENT)

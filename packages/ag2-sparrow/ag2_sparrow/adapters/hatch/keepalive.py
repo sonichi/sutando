@@ -438,14 +438,9 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
 
 
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
-    from . import self_upgrade
     now = time.time() if now is None else now
     up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
-    # An upgrade stops Sparrow on purpose and starts it again itself.
-    upgrading = self_upgrade.upgrade_running(_state_dir(cfg))
-    if upgrading:
-        print("an upgrade is running; Sparrow is left as it is")
-    elif not up:
+    if not up:
         ok, how = restart_listener(cfg)
         if ok:
             restarted = 1
@@ -463,9 +458,9 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
             else:
                 print(f"the replace failed: {how}", file=sys.stderr)
                 rc = 1
-    upgrade = "running" if upgrading else _served_setup(cfg)
+    _refresh_setup(cfg)
     line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
-        + (f" reason={reason}" if reason else "") + (f" upgrade={upgrade}" if upgrade else "")
+        + (f" reason={reason}" if reason else "")
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
@@ -473,15 +468,13 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
     return rc
 
 
-def _served_setup(cfg: dict) -> "str | None":
-    """Refresh the served setup and start an upgrade it calls for; never fails the run."""
-    from . import runtime_text, self_upgrade
+def _refresh_setup(cfg: dict) -> None:
+    """Refresh the served setup cache; never fails the run."""
+    from . import runtime_text
     try:
-        setup = runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
-        return self_upgrade.maybe_start(cfg, setup)
+        runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
     except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
         print(f"NOTE served setup: {type(e).__name__}: {e}", file=sys.stderr)
-        return None
 
 
 def last_keepawake(log: Path) -> float | None:
@@ -539,13 +532,15 @@ def oldest_open_task(cfg: dict) -> "float | None":
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     """The core row for Sparrow's heartbeat; None while no keepawake task is installed.
     `alive` also counts the hook's activity marker."""
-    from . import runtime_text, self_upgrade
+    from . import runtime_text
     now = time.time() if now is None else now
     tasks = _found(cron_dir(cfg), TASK)
     if not tasks:
         return None
-    tune = runtime_text.tunables(runtime_text.load_cache(_state_dir(cfg)))
-    stale_s, hook_stale_s = 2 * tune["keepawake_interval_s"], tune["hook_silent_age_s"]
+    tune = runtime_text.tunables(runtime_text.current_cache(_state_dir(cfg), _instance(cfg)))
+    # The installed task runs every INTERVAL_MIN, so a shorter served interval cannot tighten it.
+    stale_s = 2 * max(tune["keepawake_interval_s"], INTERVAL_MIN * 60)
+    hook_stale_s = tune["hook_silent_age_s"]
     ran = last_keepawake(log)
     # Install leaves an unchanged task's mtime alone, so a task that never ran ages from it.
     last = ran if ran is not None else max(
@@ -560,9 +555,6 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     oldest = oldest_open_task(cfg)
     if oldest is not None and now - oldest > tune["stuck_task_age_s"]:
         problems.append((TASK_NOT_PICKED_UP, oldest + tune["stuck_task_age_s"]))
-    failed = self_upgrade.failed_since(_state_dir(cfg))
-    if failed is not None:
-        problems.append((self_upgrade.UPGRADE_FAILED, failed))
     # Fresh but never run: no evidence either way yet.
     condition = "abnormal" if problems else "healthy" if ran is not None else "unknown"
     reason, since = problems[0] if problems else (None, None)

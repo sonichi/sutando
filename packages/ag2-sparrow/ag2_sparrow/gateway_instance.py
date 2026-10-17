@@ -9,6 +9,7 @@ injective and the first `~` splits it. The empty instance is the primary: identi
 from __future__ import annotations
 
 import re
+import urllib.parse
 from pathlib import Path
 
 INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
@@ -37,3 +38,18 @@ def owns(local_tid: str, instance: str) -> bool:
 def outbox_root(results_dir: Path, instance: str) -> Path:
     """The outbox the bridge for `instance` delivers results from."""
     return Path(results_dir) / f".outbox{suffix(instance)}"
+
+
+def redact_url(value: str) -> str:
+    """Scheme, host, port and path of a gateway URL, as Sparrow persists it: userinfo,
+    query and fragment dropped. The bare string when it does not parse."""
+    try:
+        p = urllib.parse.urlsplit(str(value))
+        if not p.scheme and not p.netloc:
+            return str(value)
+        host = p.hostname or ""
+        if p.port:
+            host = f"{host}:{p.port}"
+        return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
+    except Exception:  # noqa: BLE001 - redaction must never break status I/O
+        return str(value)

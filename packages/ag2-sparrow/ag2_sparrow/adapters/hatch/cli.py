@@ -272,15 +272,12 @@ def install_hook(mxid: str, reply_command: str, force: bool) -> bool:
 
 def render_config(mxid: str, task_dir: Path, result_dir: Path, activity_file: Path,
                   python: str, state_dir: Path, gateway_instance: str = "",
-                  reply_command: str = "", cron_dir: str = "", keepalive_log: str = "",
-                  auto_upgrade: str = "") -> str:
+                  reply_command: str = "", cron_dir: str = "", keepalive_log: str = "") -> str:
     rows = (("AGENT_MXID", mxid), ("TASK_DIR", str(task_dir)), ("RESULT_DIR", str(result_dir)),
             ("ACTIVITY_FILE", str(activity_file)), ("SPARROW_PYTHON", python),
             ("STATE_DIR", str(state_dir)), ("GATEWAY_INSTANCE", gateway_instance),
             ("REPLY_COMMAND", reply_command), ("CRON_DIR", cron_dir),
             ("KEEPALIVE_LOG", keepalive_log))
-    # Written only when set, so an owner's AUTO_UPGRADE=0 survives a re-install.
-    rows += (("AUTO_UPGRADE", auto_upgrade),) if auto_upgrade else ()
     return "".join(f"{k}={shlex.quote(v)}\n" for k, v in rows)
 
 
@@ -628,8 +625,7 @@ def install(args) -> int:
                      if args.keepalive_log else "")
     config = render_config(args.mxid, task_dir.resolve(), result_dir.resolve(),
                            activity, sys.executable, state_dir.resolve(), instance,
-                           reply_command, cron, keepalive_log,
-                           _installed_config().get("AUTO_UPGRADE", ""))
+                           reply_command, cron, keepalive_log)
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
     if args.no_service:
@@ -1029,8 +1025,9 @@ def wake_context(_args) -> int:
     state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
     instance = (cfg["GATEWAY_INSTANCE"] if "GATEWAY_INSTANCE" in cfg
                 else os.environ.get("GATEWAY_INSTANCE") or "").strip()
-    text, source = runtime_text.wake_context(runtime_text.load_cache(state), values,
-                                             runtime_text.owner_dm_room(state, instance))
+    text, source = runtime_text.wake_context(
+        runtime_text.current_cache(state, instance), values,
+        runtime_text.owner_dm_room(state, instance, cfg.get("AGENT_MXID") or ""))
     print(text, end="")
     print(f"wake-context: {source}", file=sys.stderr)
     return 0

@@ -2511,16 +2511,7 @@ def _redact_url(value: str) -> str:
     so a gateway configured with `user:pass@` userinfo or a `?token=` query param
     must not land there in plaintext. Falls back to the bare string on any parse
     failure (never raise from a best-effort status write)."""
-    try:
-        p = urllib.parse.urlsplit(str(value))
-        if not p.scheme and not p.netloc:
-            return str(value)
-        host = p.hostname or ""
-        if p.port:
-            host = f"{host}:{p.port}"
-        return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
-    except Exception:  # noqa: BLE001 — redaction must never break status I/O
-        return str(value)
+    return gateway_instance.redact_url(value)
 
 
 class _NeverFatalStream:

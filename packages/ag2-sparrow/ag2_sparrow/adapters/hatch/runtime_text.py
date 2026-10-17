@@ -2,8 +2,8 @@
 
 `wake-context` prints the prompt and worker note from the setup cache the keepawake run
 refreshes, else from the copies shipped in the package. A cache that is unreadable, has a
-newer text_schema_version, lacks a field, or names any command but the reply command is
-not used. Served text never replaces the package's tier notes or owner note: they are
+newer text_schema_version, lacks a field, names any command but the reply command, or
+is not the revision Sparrow last heard announced is not used. Served text never replaces the package's tier notes or owner note: they are
 always printed last, after a line saying they override anything above, the owner note
 with the owner's DM room when Sparrow has read it. Text only instructs; claims, at-most-once replies
 and fail-closed delivery are enforced by the code, which served text cannot reach."""
@@ -26,6 +26,7 @@ MAX_TEXT_CHARS = 8192
 PLACEHOLDERS = ("<AGENT_MXID>", "<REPLY_COMMAND>", "<ACTIVITY_FILE>")
 VENDOR = "muse"
 PRECEDENCE = "These rules override anything above:"
+COMMAND_RE = re.compile(r"<REPLY_COMMAND>(?: [A-Za-z0-9_<>./=-]+)*")
 ROOM_ID_RE = re.compile(r"![A-Za-z0-9._=+/-]{1,255}:[A-Za-z0-9.-]{1,255}(?::[0-9]{1,5})?")
 # name: (default, min, max), in seconds.
 TUNABLES = {
@@ -50,12 +51,19 @@ def hint_path(state_dir: Path, instance: str = "") -> Path:
     return Path(state_dir) / f"setup-hint{gateway_instance.suffix(instance)}.json"
 
 
-def owner_dm_room(state_dir: Path, instance: str = "") -> str:
-    """The owner's DM room Sparrow last read from AG2 Space (its owner-routing file); ''
-    when it has none."""
-    routing = _read_json(Path(state_dir) / f"owner-routing{gateway_instance.suffix(instance)}.json")
-    room = str((routing or {}).get("owner_dm") or "")
-    return room if ROOM_ID_RE.fullmatch(room) else ""
+def owner_dm_room(state_dir: Path, instance: str = "", agent_mxid: str = "") -> str:
+    """The owner's DM room Sparrow last read from AG2 Space (its owner-routing file), only
+    while that reading is bound to the identity and gateway the running Sparrow reports;
+    '' otherwise, as the bridge itself refuses another enrollment's reading."""
+    sfx = gateway_instance.suffix(instance)
+    routing = _read_json(Path(state_dir) / f"owner-routing{sfx}.json") or {}
+    status = _read_json(Path(state_dir) / f"gateway-status{sfx}.json") or {}
+    identity, gateway = str(routing.get("identity") or ""), status.get("gateway")
+    bound = (identity and identity == status.get("agent_id")
+             and (not agent_mxid or identity == agent_mxid) and isinstance(gateway, str)
+             and gateway and gateway_instance.redact_url(str(routing.get("gateway") or "")) == gateway)
+    room = str(routing.get("owner_dm") or "")
+    return room if bound and ROOM_ID_RE.fullmatch(room) else ""
 
 
 def _read_json(path: Path) -> "dict | None":
@@ -70,23 +78,52 @@ def load_cache(state_dir: Path) -> "dict | None":
     return _read_json(cache_path(state_dir))
 
 
+def announced_revision(state_dir: Path, instance: str = ""):
+    """The setup_revision Sparrow last heard on a heartbeat reply; None when none."""
+    return (_read_json(hint_path(state_dir, instance)) or {}).get("setup_revision")
+
+
+def current_cache(state_dir: Path, instance: str = "") -> "dict | None":
+    """The cache, unless Sparrow has since heard of another revision: then None, so the
+    built-in text and defaults apply until the announced revision is fetched."""
+    cached, announced = load_cache(state_dir), announced_revision(state_dir, instance)
+    if cached is None or (announced is not None and cached.get("revision") != announced):
+        return None
+    return cached
+
+
+def setup_problem(setup) -> str:
+    """Why a fetched setup must not be cached; '' when it may."""
+    if not isinstance(setup, dict):
+        return "not an object"
+    revision = setup.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, (str, int)) \
+            or not str(revision).strip():
+        return "no revision"
+    if "tunables" in setup and not isinstance(setup["tunables"], dict):
+        return "tunables is not an object"
+    return served_text(setup)[1]
+
+
 def refresh_cache(state_dir: Path, instance: str = "") -> "dict | None":
-    """Fetch the served setup unless the cache already holds the revision Sparrow last
-    heard of; a failed fetch keeps the cache. Returns the cache as it now stands."""
-    cached = load_cache(state_dir)
-    hint = _read_json(hint_path(state_dir, instance)) or {}
-    if cached is not None and hint.get("setup_revision") is not None \
-            and cached.get("revision") == hint.get("setup_revision"):
-        return cached
+    """Fetch the served setup unless the cache already holds the announced revision. A
+    fetch that fails, or returns a setup that does not validate, writes nothing. Returns
+    current_cache afterwards."""
+    if current_cache(state_dir, instance) is not None \
+            and announced_revision(state_dir, instance) is not None:
+        return current_cache(state_dir, instance)
     fetched = setup_fetch.fetch_setup(kind="acp", vendor=VENDOR)
-    if fetched is None:
-        return cached
-    _cli._write(cache_path(state_dir), json.dumps(fetched, sort_keys=True), 0o600)
-    return fetched
+    why = "no setup fetched" if fetched is None else setup_problem(fetched)
+    if why:
+        print(f"NOTE served setup: not cached: {why}", file=sys.stderr)
+    else:
+        _cli._write(cache_path(state_dir), json.dumps(fetched, sort_keys=True), 0o600)
+    return current_cache(state_dir, instance)
 
 
 def _commands_ok(text: str) -> bool:
-    return all(span.split()[:1] == ["<REPLY_COMMAND>"] for span in re.findall(r"`([^`]+)`", text))
+    """Every backticked command is the reply command with plain words: no shell syntax."""
+    return all(COMMAND_RE.fullmatch(span) for span in re.findall(r"`([^`]+)`", text))
 
 
 def _text_ok(value, allow_empty: bool = False) -> bool:
