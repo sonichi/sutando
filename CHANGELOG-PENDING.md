@@ -11,6 +11,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Added
 
 <!-- feat() PRs go here -->
+- ag2-sparrow: a `REMOTE_HEALTH_COMMAND` row whose `motion` is `unknown` (the Hatch keepalive row) is sent as `moving` while a message Sparrow pulled waits for its result to be posted, `idle` otherwise, so the health dot shows a Hatch agent at work. ([#5682])
 - tutorial: `getting_started.py publish` reads the setup app's saved inputs (`<workspace>/state/onboarding/tutorial-inputs.json`: owner DM room, owner, agent id, picked roles) for any flag left out, so `publish` alone works; `--name` defaults to `auto`. The skill now answers an owner DM line `/tutorial` (the setup app ends the first-contact message with it) and runs by its script path, which a core that cannot find skills by name can still follow.
 - ag2space-voice: `find_room_actions` / `describe_room_action` / `run_room_action` — the voice model reaches any other action in the AG2 Space catalog (resolve a comment, list members, react, invites…). What voice may run comes from the effect and risk the server declares for the action, fetched before running: reads run, changes run after a read-back and a yes, high risk or an outside effect is refused.
 - marketplace: Sutando can install marketplace skills, activate cloud tools, check for outdated skills, update, and uninstall on request or from a use-case doc's `Requires:` list, then tells the owner once if a core restart is needed.
