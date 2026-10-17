@@ -50,6 +50,11 @@ def on_create(req: HumanRequirement, now: float) -> Dict:
     return {"notified_at": now, "reminders": 0}
 
 
+def reminds(req: HumanRequirement) -> bool:
+    """A card whose subject says `remind: False` is announced once: its card is the only alert."""
+    return (req.subject or {}).get("remind") is not False
+
+
 def interval(reminders: int) -> float:
     return REMIND_INTERVALS_S[min(max(reminders, 0), len(REMIND_INTERVALS_S) - 1)]
 
@@ -64,7 +69,7 @@ def due(req: HumanRequirement, projection: Dict, now: float) -> Optional[str]:
         # Only a card this module scheduled owes a recovery; a pre-upgrade ledger has no notified_at.
         owed = projection.get("notified_at") and not projection.get("recovered")
         return RECOVERY if owed else None
-    if req.status in TERMINAL_STATUSES:
+    if req.status in TERMINAL_STATUSES or not reminds(req):
         return None
     # A card projected before this ledger key existed counts from its creation.
     last = projection.get("notified_at") or req.created_at
@@ -120,7 +125,7 @@ def plan(entries: Iterable[Tuple[HumanRequirement, Dict]], now: float) -> List[N
     for members in seats.values():
         open_ = [(r, pj) for r, pj in members if r.status not in TERMINAL_STATUSES]
         if open_:
-            live = [(r, pj) for r, pj in open_ if _current(r, pj)]
+            live = [(r, pj) for r, pj in open_ if _current(r, pj) and reminds(r)]
             if not live:
                 continue
             last = max(pj.get("notified_at") or r.created_at for r, pj in live)

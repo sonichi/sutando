@@ -93,10 +93,12 @@ TURN_DONE = re.compile(
 TURN_SHORT = re.compile(r"[01]s")
 # A turn the CLI refuses outright is a FINISHED turn: the reason is its `⎿` result and the
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
+LIMIT_REFUSAL = re.compile(
+    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit", re.I)
 REFUSAL = re.compile(
-    r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
+    LIMIT_REFUSAL.pattern
     # A bare "not logged in" is a refusal only as the CLI's own line-start `⎿` row.
-    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b", re.I)
+    + r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b", re.I)
 
 
 def refusal_line(line: str) -> bool:
@@ -115,6 +117,51 @@ CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
     ("selection", re.compile(r"(❯\s*\d+\.|\bSelect\b).*", re.S)),
     ("permission", re.compile(r"Do you want to (proceed|allow)|Allow this action|permission to", re.I)),
 ]
+# The gate kinds above that are a usage limit (the wait banner, the limit menu).
+LIMIT_GATES = frozenset({"session-limit", "usage-limit"})
+
+
+def limit_line(line: str) -> bool:
+    """One line of the limit's own words: the wait banner, the menu title or a refusal."""
+    return bool(LIMIT_WAIT.search(line) or LIMIT_REFUSAL.search(line))
+
+
+_NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
+_CARET_ROW = re.compile(r"^\s*❯\s*\d+\.\s")
+
+
+def _dialog_names_limit(text: str) -> bool:
+    """The live numbered dialog's own text, back to the turn above it, names a limit."""
+    lines = (text or "").splitlines()
+    rows = [i for i, ln in enumerate(lines) if _CARET_ROW.match(ln)] or \
+        [i for i, ln in enumerate(lines) if _NUMBERED_ROW.match(ln)]
+    if not rows:
+        return False
+    start = rows[-1]
+    while start > 0 and _NUMBERED_ROW.match(lines[start - 1]):
+        start -= 1
+    for line in reversed(lines[:start]):
+        core = line.strip()
+        if not core:
+            continue
+        if core[0] in "✻⎿●⏺" or (core.startswith("❯") and core.lstrip("❯").strip()):
+            return False  # the turn above the dialog: its words are not the dialog's
+        if limit_line(core):
+            return True
+    return False
+
+
+def is_usage_limit(kind: Optional[str], text: Optional[str]) -> bool:
+    """`kind` (a gate signature, or turn-rejected) on `text` waits on a usage limit: the
+    wait banner, the limit menu (classified `selection`, its caret row being lowest) or a
+    turn refused for a limit."""
+    if kind in LIMIT_GATES:
+        return True
+    if kind == "turn-rejected":
+        return bool(LIMIT_REFUSAL.search(text or ""))
+    return kind in ("selection", "unknown") and _dialog_names_limit(text or "")
+
+
 # A dialog that holds the input shows how to answer it: a caret on a numbered row or a key hint.
 AWAIT_HINT = re.compile(
     r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"

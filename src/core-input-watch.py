@@ -67,7 +67,8 @@ import os.path as _osp
 import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
-from worker_auth_state import authenticated_turn, login_expired, refusal_answered  # noqa: E402
+from worker_auth_state import (  # noqa: E402
+    authenticated_turn, login_expired, refusal_answered, signed_in_since)
 import cli_wedge  # noqa: E402
 import core_gate_notice  # noqa: E402
 import self_opened_gate  # noqa: E402
@@ -123,7 +124,7 @@ from delivery.pane_gate import (  # noqa: E402
     COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, TURN_DONE, TURN_SHORT,
     classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, gate_evidence,
     limit_banner, limit_baseline, limit_is_stale, prompt_line as _pg_prompt_line, refusal_line,
-    strip_limit_banners,
+    is_usage_limit, limit_line, strip_limit_banners,
 )
 
 _FABLE_TEXT = FABLE_TEXT
@@ -614,7 +615,17 @@ DRIVE_SETTLE_S = 15.0
 from prompt_excerpt import prompt_excerpt  # noqa: E402  (shared with core-supervisor-relay)
 
 
-def escalation_message(state, detail, kind, prompt):
+def limit_standing(pane, runtime=None):
+    """A limit line is on the pane and no turn did work after it. A delivery the limit
+    refuses repaints the pane without ending the episode; only work or no limit text does."""
+    if not (pane and pane.strip()):
+        return True  # no evidence either way: the episode stands
+    lines = pane.splitlines()
+    last = max((i for i, ln in enumerate(lines) if limit_line(ln)), default=None)
+    return last is not None and not signed_in_since("\n".join(lines[last + 1:]), runtime)
+
+
+def escalation_message(state, detail, kind, prompt, session=None):
     """The card body. The core is blocked, so this is the only thing that will
     reach the owner until they act."""
     head = ("I am blocked and cannot continue without you."
@@ -628,8 +639,12 @@ def escalation_message(state, detail, kind, prompt):
         # Plain lines, not a code fence: the card renders text, and the prompt is what the owner
         # needs to read, not the pane's chrome around it.
         lines += ["", "What the terminal is showing:"] + [f"  {ln}" for ln in excerpt]
-    lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
-                  "Nothing else I do can clear this one."]
+    if is_usage_limit(kind, prompt):
+        from hitl.tui_gate import limit_unblock
+        lines += ["", limit_unblock(session)]
+    else:
+        lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
+                      "Nothing else I do can clear this one."]
     return "\n".join(lines)
 
 
@@ -666,7 +681,8 @@ def _name_seat(req, session, seat):
 def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None):
     """Raise ONE requirement per episode. The Manager dedups on
     (runtime, kind, device) + guard, so the prompt IS the episode key: the same
-    prompt returns the same record, a different one mints a new card.
+    prompt returns the same record, a different one mints a new card. A usage
+    limit is keyed on the session instead, whatever its screen shows.
 
     Returns the requirement, or None when nothing could be raised.
     """
@@ -674,9 +690,11 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
         return None
     try:
         from hitl import tui_gate
+        limit = is_usage_limit(kind, prompt)
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
-                                       escalation_message(state, detail, kind, prompt),
-                                       runtime=runtime)
+                                       escalation_message(state, detail, kind, prompt, session),
+                                       runtime=runtime,
+                                       episode=tui_gate.LIMIT_EPISODE if limit else None)
         if queued:
             req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
         if seat:
@@ -717,19 +735,24 @@ def resolve_escalations(manager, session, pane=None, runtime=None):
     A signed-out card clears only on positive proof in `pane` that the CLI is signed in:
     a turn that ran, or output after the refusal (worker_auth_state). A newer prompt, a
     spinner, an empty capture or a health verdict read off another session's status
-    file is not "Sutando has continued its work".
+    file is not "Sutando has continued its work". A usage-limit card clears only once
+    `limit_standing` says the limit no longer holds the pane.
     """
     if manager is None:
         return []
     try:
         from hitl.manager import AUTH_KIND
+        from hitl.tui_gate import LIMIT_EPISODE
         signed_in = authenticated_turn(pane, runtime) or refusal_answered(pane, runtime)
+        limited = limit_standing(pane, runtime)
         done = []
         for r in manager.active():
             subj = r.subject or {}
             if subj.get("source") != _TUI_SOURCE or subj.get("session") != session:
                 continue
             if r.kind == AUTH_KIND and not signed_in:
+                continue
+            if subj.get("episode") == LIMIT_EPISODE and limited:
                 continue
             manager.resolve(r.id)   # returns blocked task ids, not a verdict
             done.append(r.id)
@@ -896,8 +919,10 @@ def main():
         login_settling, login_since = login_confirm_step(login_since, state, kind, time.time(),
                                                          a.login_confirm_s)
         if state in ("blocked-human", "blocked-known"):
-            stable_prompt = stable_prompt + 1 if prompt == last_prompt else 1
-            last_prompt = prompt
+            # A limit's screen repaints (a clock, a refused delivery); the episode is what settles.
+            seen = "usage-limit" if is_usage_limit(kind, prompt) else prompt
+            stable_prompt = stable_prompt + 1 if seen == last_prompt else 1
+            last_prompt = seen
             if stable_prompt < a.stable:
                 settling = True
                 state, detail, prompt, kind = "running", "processing (prompt settling)", None, None
@@ -947,7 +972,9 @@ def main():
                 if not a.seat:
                     notice_queued(hitl, req, workspace, state, kind)
             elif verdict == "resolve":
-                resolve_escalations(hitl, a.session, pane, runtime)
+                # A banner judged outrun is not standing evidence, for the card as for the state.
+                resolve_escalations(hitl, a.session,
+                                    strip_limit_banners(pane) if limit_stale and pane else pane, runtime)
                 if not a.seat:
                     core_gate_notice.end_outage(workspace)
         if a.once:

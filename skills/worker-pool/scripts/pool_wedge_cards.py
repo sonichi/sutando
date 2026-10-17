@@ -98,6 +98,15 @@ def proxy_routed(socket, session) -> bool | None:
     return qa.points_at_credential_proxy(env.base_url) if env.observed else None
 
 
+def at_limit(text, pane, runtime, *, workspace=None, socket=None, session=None) -> bool:
+    """The pane waits on a usage limit (banner, limit menu), not on some other gate."""
+    if pane == ps.PANE_LIMIT:
+        return True
+    adapter = sup.pane_gate.ADAPTERS.get(runtime, sup.pane_gate.CLAUDE)
+    verdict = sup.pane_gate.classify_pane(text, adapter, workspace, socket, session)
+    return verdict.state == "busy" and sup.pane_gate.is_usage_limit(verdict.reason, text)
+
+
 def _jump(session):
     from hitl.schema import Action
     return Action(id="open_terminal", kind="open_terminal", label=f"Open terminal ({session})")
@@ -127,6 +136,18 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
     if which == ps.CARD_HUMAN:
         if pane not in (ps.PANE_GATE, ps.PANE_LIMIT):
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
+    if which == ps.CARD_HUMAN and at_limit(text, pane, runtime, workspace=workspace,
+                                           socket=socket, session=session):
+        from hitl import tui_gate
+        # The seat monitor's card for this limit shares the guard, so one card serves both.
+        subject.update(episode=tui_gate.LIMIT_EPISODE, remind=False)
+        req = HumanRequirement(
+            kind="core-blocked", runtime=runtime, device=device, subject=subject,
+            title=f"{seat} · usage limit",
+            message=(f"{seat} (tmux session {session}) owes work and has hit its usage limit. "
+                     + tui_gate.limit_unblock(session)),
+            guard=tui_gate.limit_guard(session), actions=[_jump(session)])
+    elif which == ps.CARD_HUMAN:
         req = HumanRequirement(
             kind="core-blocked", runtime=runtime, device=device, subject=subject,
             title=f"{seat} · needs your decision",
