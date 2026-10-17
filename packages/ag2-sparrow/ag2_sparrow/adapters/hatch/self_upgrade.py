@@ -1,54 +1,70 @@
 """Self-upgrade for a Hatch install: move ag2-sparrow up to the backend's target_version.
 
-The keepawake run starts it (`maybe_start`) at most once per target version, and only up:
-never to a lower or equal version, never when min_version is above the target, never
-without the target's sha256 map (wheel filename -> sha256), never with AUTO_UPGRADE=0.
-The upgrade runs detached (`run_upgrade`), since the scheduler's timeout would cut it
-short: `pip install --no-deps --require-hashes` of the pinned version into this
-interpreter, `pip check`, install re-run non-interactively, Sparrow restarted, then
-verified (the new version imports and Sparrow reconnects). Any failure reinstalls the
-previous version, hash-pinned when an earlier upgrade recorded its hashes, restarts
-Sparrow, and leaves the health reason upgrade-failed. A changed hook definition
-(install's REQUIRED hook: line) is never applied: the hook wakes the agent once with it."""
+The keepawake run decides (`maybe_start`) and logs the decision on its line: at most one
+attempt per target version, and only up; never when min_version is above the target,
+without the target's sha256 map (wheel filename -> sha256), with AUTO_UPGRADE=0, or for
+an editable or URL install. The upgrade runs detached (`run_upgrade`), since the
+scheduler's timeout would cut it short, under STATE_DIR/upgrade.lock so two never
+overlap. Its order is snapshot, stop, install, start, verify: the installed files are
+copied to STATE_DIR/rollback/<version>/, Sparrow is stopped gracefully, `pip install
+--no-deps --only-binary=:all: --require-hashes` puts the pinned wheel into this
+interpreter, `pip check` must report no new problem naming ag2-sparrow, install is re-run
+non-interactively, and Sparrow is started and must import the target and reconnect. A
+reply posted while Sparrow is stopped waits in the results dir and its outbox, which the
+upgrade never touches, and is delivered once Sparrow starts. Any failure restores the
+snapshot (no index, no network), re-runs install, starts Sparrow, and leaves the health
+reason upgrade-failed. A changed hook definition (install's REQUIRED hook: line) is never
+applied: the hook wakes the agent once with it."""
 from __future__ import annotations
 
 import argparse
+import contextlib
+import importlib.metadata
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
-from ... import __version__, _dirs
+from ... import __version__, _dirs, file_lock
 from . import cli as _cli, keepalive as _keepalive
 
 PACKAGE = "ag2-sparrow"
 STATE_NAME = "hatch-upgrade.json"
 NOTICE_NAME = "hatch-wake-notice"
 LOG_NAME = "hatch-upgrade.log"
+LOCK_NAME = "upgrade.lock"
+ROLLBACK_DIR = "rollback"
 UPGRADE_FAILED = "upgrade-failed"
+# A "started" attempt this old, with no upgrade holding the lock, crashed.
+STALE_START_S = 30 * 60
 PIP_TIMEOUT_S = 600
 INSTALL_TIMEOUT_S = 300
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
-_VERSION_RE = re.compile(r"(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?(?:\.post(\d+))?(?:\.dev(\d+))?")
+_VERSION_RE = re.compile(
+    r"([0-9]{1,9}(?:\.[0-9]{1,9}){0,9})(?:(a|b|rc)([0-9]{1,9}))?"
+    r"(?:\.post([0-9]{1,9}))?(?:\.dev([0-9]{1,9}))?")
 _PRE = {"a": 0, "b": 1, "rc": 2}
+_OWN_RE = re.compile(r"ag2[-_.]sparrow", re.I)
 
 
 def parse_version(text) -> "tuple | None":
     """A sortable key for a plain PEP 440 version; None for anything else, which is never
     passed to pip."""
-    m = _VERSION_RE.fullmatch(text) if isinstance(text, str) else None
+    m = _VERSION_RE.fullmatch(text) if isinstance(text, str) and len(text) <= 64 else None
     if m is None:
         return None
-    release = tuple(int(p) for p in m.group(1).split("."))
-    release = release + (0,) * (6 - len(release)) if len(release) <= 6 else release
+    release = [int(p) for p in m.group(1).split(".")]
+    while len(release) > 1 and release[-1] == 0:
+        release.pop()
     pre, post, dev = m.group(2), m.group(4), m.group(5)
     # A bare .devN sorts before every pre-release of its release.
     stage = (_PRE[pre], int(m.group(3))) if pre else ((-1, 0) if dev and post is None else (3, 0))
-    return (release, stage, int(post) if post else -1,
+    return (tuple(release), stage, int(post) if post else -1,
             int(dev) if dev else float("inf"))
 
 
@@ -85,6 +101,31 @@ def failed_since(state_dir: Path, installed: str = __version__) -> "float | None
     return None
 
 
+@contextlib.contextmanager
+def upgrade_lock(state_dir: Path):
+    """Yields True while this process holds the upgrade lock, False when another does."""
+    path = Path(state_dir) / LOCK_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            file_lock.lock_fd(fd, blocking=False)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            file_lock.unlock_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def upgrade_running(state_dir: Path) -> bool:
+    with upgrade_lock(state_dir) as held:
+        return not held
+
+
 def _run(argv: list, timeout: float) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
@@ -110,6 +151,88 @@ def _why(r: subprocess.CompletedProcess) -> str:
     return lines[-1] if lines else f"exit {r.returncode}"
 
 
+def _distribution():
+    """The installed ag2-sparrow, read from disk each call; None when pip did not install it."""
+    try:
+        return importlib.metadata.distribution(PACKAGE)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def unsupported_install(dist) -> str:
+    """Why this install cannot be upgraded and restored file by file; '' when it can."""
+    if dist is None:
+        return "ag2-sparrow is not installed as a package here"
+    if dist.read_text("direct_url.json") is not None:
+        return "ag2-sparrow is an editable or URL install (direct_url.json)"
+    if not dist.files:
+        return "ag2-sparrow's install record (RECORD) is missing"
+    return ""
+
+
+def _installed_paths(dist) -> "list[Path]":
+    return [Path(os.path.normpath(dist.locate_file(f))) for f in dist.files or []]
+
+
+def snapshot(state_dir: Path, version: str, dist) -> Path:
+    """Copy every file the install recorded into STATE_DIR/rollback/<version>/."""
+    dest = Path(state_dir) / ROLLBACK_DIR / version
+    tmp = dest.with_name(f".{version}.{os.getpid()}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    (tmp / "files").mkdir(parents=True)
+    entries = []
+    for i, path in enumerate(_installed_paths(dist)):
+        if "__pycache__" in path.parts or not path.is_file():
+            continue
+        name = f"{i:05d}"
+        shutil.copy2(path, tmp / "files" / name)
+        entries.append({"path": str(path), "copy": name})
+    if not entries:
+        raise ValueError("the install recorded no files")
+    (tmp / "manifest.json").write_text(json.dumps({"version": version, "files": entries}),
+                                       encoding="utf-8")
+    shutil.rmtree(dest, ignore_errors=True)
+    os.replace(tmp, dest)
+    return dest
+
+
+def restore(state_dir: Path, version: str) -> None:
+    """Put the snapshot of `version` back in place of whatever is installed now."""
+    snap = Path(state_dir) / ROLLBACK_DIR / version
+    manifest = json.loads((snap / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("version") != version or not manifest.get("files"):
+        raise ValueError(f"the snapshot in {snap} is not one of {version}")
+    current = _distribution()
+    emptied = set()
+    for path in _installed_paths(current) if current is not None else []:
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+            emptied.add(path.parent)
+    for entry in manifest["files"]:
+        target = Path(entry["path"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(snap / "files" / entry["copy"], target)
+    for directory in sorted(emptied, key=lambda d: len(d.parts), reverse=True):
+        with contextlib.suppress(OSError):
+            directory.rmdir()  # only a directory the failed version left empty
+
+
+def pip_install(state_dir: Path, version: str, hashes: dict) -> subprocess.CompletedProcess:
+    """Install exactly `version` as a wheel with no dependency changes, pinned to every
+    sha256 in `hashes`. pip accepts --hash only in a requirements file, so it goes there."""
+    Path(state_dir).mkdir(parents=True, exist_ok=True)
+    fd, req = tempfile.mkstemp(dir=str(state_dir), prefix=".upgrade-", suffix=".txt")
+    pins = " ".join(f"--hash=sha256:{h}" for h in sorted(set(hashes.values())))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"{PACKAGE}=={version} {pins}\n")
+        return _run([sys.executable, "-m", "pip", "install", "--no-deps", "--only-binary=:all:",
+                     "--disable-pip-version-check", "--require-hashes", "-r", req],
+                    PIP_TIMEOUT_S)
+    finally:
+        Path(req).unlink(missing_ok=True)
+
+
 def valid_hashes(value) -> "dict | None":
     """A non-empty {wheel filename: sha256} map, else None."""
     if not isinstance(value, dict) or not value:
@@ -119,26 +242,13 @@ def valid_hashes(value) -> "dict | None":
     return dict(value) if ok else None
 
 
-def pip_install(state_dir: Path, version: str,
-                hashes: "dict | None") -> subprocess.CompletedProcess:
-    """Install exactly `version` with no dependency changes, pinned to every sha256 in
-    `hashes` when given. pip accepts --hash only in a requirements file, so it goes there."""
-    pip = [sys.executable, "-m", "pip", "install", "--no-deps", "--disable-pip-version-check"]
-    if hashes is None:
-        return _run([*pip, f"{PACKAGE}=={version}"], PIP_TIMEOUT_S)
-    Path(state_dir).mkdir(parents=True, exist_ok=True)
-    fd, req = tempfile.mkstemp(dir=str(state_dir), prefix=".upgrade-", suffix=".txt")
-    pins = " ".join(f"--hash=sha256:{h}" for h in sorted(set(hashes.values())))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(f"{PACKAGE}=={version} {pins}\n")
-        return _run([*pip, "--require-hashes", "-r", req], PIP_TIMEOUT_S)
-    finally:
-        Path(req).unlink(missing_ok=True)
-
-
-def pip_check() -> subprocess.CompletedProcess:
-    return _run([sys.executable, "-m", "pip", "check"], PIP_TIMEOUT_S)
+def own_check_problems() -> "set[str]":
+    """`pip check` lines that name ag2-sparrow (it has no requirements of its own)."""
+    r = _run([sys.executable, "-m", "pip", "check"], PIP_TIMEOUT_S)
+    if r.returncode == 0:
+        return set()
+    return {line.strip() for line in f"{r.stdout}\n{r.stderr}".splitlines()
+            if _OWN_RE.search(line)}
 
 
 def install_argv(cfg: dict) -> list:
@@ -167,45 +277,74 @@ def installed_version() -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def maybe_start(cfg: dict, setup: "dict | None", installed: str = __version__,
-                now: "float | None" = None) -> "str | None":
-    """Start an upgrade to the served target when one is due; what was done, or None."""
+def _decide(cfg: dict, setup: "dict | None", installed: str) -> "tuple[str, str, dict | None]":
+    """(decision, detail, hashes); decision is '' when an upgrade to the target is due."""
     if (cfg.get("AUTO_UPGRADE") or "").strip() == "0":
-        return None
+        return "off", "AUTO_UPGRADE=0 in the install config", None
     package = (setup or {}).get("package")
     package = package if isinstance(package, dict) else {}
     target, hashes = package.get("target_version"), valid_hashes(package.get("target_sha256"))
+    if target is None:
+        return "no-target", "the served setup names no target_version", None
     want, have = parse_version(target), parse_version(installed)
     if want is None or have is None:
-        return None
+        return "bad-version", f"cannot compare {target!r} with {installed!r}", None
     if want < have:
-        print(f"NOTE upgrade: target_version {target} is below the installed {installed}; "
-              "nothing done", file=sys.stderr)
-        return None
+        return "below-installed", f"target_version {target} is below the installed {installed}", None
     if want == have:
-        return None
+        return "current", f"{installed} is the target_version", None
     floor = package.get("min_version")
     if floor is not None and (parse_version(floor) is None or parse_version(floor) > want):
-        print(f"NOTE upgrade: min_version {floor!r} is above target_version {target}; "
-              "nothing done", file=sys.stderr)
-        return None
+        return "min-above-target", f"min_version {floor!r} is above target_version {target}", None
     if hashes is None:
-        print(f"NOTE upgrade: {target} has no valid target_sha256 map, so it was not installed",
-              file=sys.stderr)
+        return "no-hashes", f"{target} has no valid target_sha256 map", None
+    why = unsupported_install(_distribution())
+    if why:
+        return "unsupported-install", why, None
+    return "", "", hashes
+
+
+def maybe_start(cfg: dict, setup: "dict | None", installed: str = __version__,
+                now: "float | None" = None) -> "str | None":
+    """Decide on the served target and start an upgrade when one is due. Returns the
+    decision for the keepawake line; None only when there is no served setup."""
+    if setup is None:
         return None
+    decision, detail, hashes = _decide(cfg, setup, installed)
+    if decision:
+        print(f"upgrade: {decision}: {detail}", file=sys.stderr)
+        return decision
+    target = setup["package"]["target_version"]
+    now = time.time() if now is None else now
     state_dir = _keepalive._state_dir(cfg)
-    state = load_state(state_dir)
-    if target in state["attempted"]:
-        return None
-    # Recorded before the start, so a crash mid-upgrade is never retried for this target.
-    state["attempted"][target] = {"at": time.time() if now is None else now,
-                                  "from": installed, "outcome": "started"}
-    save_state(state_dir, state)
+    with upgrade_lock(state_dir) as held:
+        if not held:
+            print("upgrade: running: an upgrade already holds the lock", file=sys.stderr)
+            return "running"
+        state = load_state(state_dir)
+        tried = state["attempted"].get(target)
+        if isinstance(tried, dict):
+            at = tried.get("at") if isinstance(tried.get("at"), (int, float)) else 0
+            if tried.get("outcome") == "started" and now - at > STALE_START_S:
+                tried["outcome"] = "crashed"
+                state["failed"] = {"target": target, "from": tried.get("from", installed),
+                                   "why": "the upgrade did not finish", "at": now}
+                save_state(state_dir, state)
+                print(f"upgrade: {target} started {int(now - at)}s ago and never finished; "
+                      "counted as failed", file=sys.stderr)
+                return f"{target}:crashed"
+            print(f"upgrade: {target} was already attempted ({tried.get('outcome')})",
+                  file=sys.stderr)
+            return f"{target}:attempted"
+        # Recorded before the start, so a crash mid-upgrade is never retried for this target.
+        state["attempted"][target] = {"at": now, "from": installed, "outcome": "started"}
+        save_state(state_dir, state)
     argv = [sys.executable, "-m", "ag2_sparrow.adapters.hatch.self_upgrade", target,
             json.dumps(hashes, sort_keys=True)]
     if not _spawn(argv, state_dir / LOG_NAME):
         _finish(state_dir, target, "not-started")
         return f"{target}:not-started"
+    print(f"upgrade: started {installed} -> {target}", file=sys.stderr)
     return f"{target}:started"
 
 
@@ -216,52 +355,86 @@ def _finish(state_dir: Path, target: str, outcome: str, **extra) -> None:
     save_state(state_dir, state)
 
 
-def _restart(cfg: dict) -> "tuple[bool, str]":
+def stop_sparrow(cfg: dict) -> "tuple[bool, str]":
+    """Stop Sparrow gracefully (SIGTERM, then wait); a stopped unit is not restarted."""
+    if _keepalive._service_managed():
+        r = _cli._systemd_run(["systemctl", "--user", "stop", _cli.SERVICE_NAME])
+        return _cli._ok(r), f"systemctl --user stop {_cli.SERVICE_NAME} ({_cli._why(r)})"
     holder = _cli.live_lock_holder(_cli._lock_record(_keepalive._state_dir(cfg),
                                                      _keepalive._instance(cfg)))
     if holder is None:
-        return _keepalive.restart_listener(cfg)
-    return _keepalive.replace_sparrow(cfg, holder, why="to run the upgraded ag2-sparrow")
+        return True, "Sparrow was not running"
+    return _keepalive._stop(holder), f"stopped Sparrow (pid {holder})"
+
+
+def start_sparrow(cfg: dict) -> "tuple[bool, str]":
+    return _keepalive.restart_listener(cfg)
 
 
 def _rollback(cfg: dict, state_dir: Path, previous: str, target: str, why: str) -> str:
-    print(f"upgrade to {target} failed ({why}); reinstalling {previous}", file=sys.stderr)
-    record = load_state(state_dir).get("installed") or {}
-    hashes = valid_hashes(record.get("sha256")) if record.get("version") == previous else None
-    if hashes is None:
-        print(f"NOTE upgrade: no sha256 is recorded for {previous}, so it is reinstalled "
-              "without a hash pin", file=sys.stderr)
-    r = pip_install(state_dir, previous, hashes)
-    if r.returncode != 0:
-        print(f"error: reinstalling {previous} failed: {_why(r)}", file=sys.stderr)
+    print(f"upgrade to {target} failed ({why}); restoring {previous}", file=sys.stderr)
+    stop_sparrow(cfg)
+    try:
+        restore(state_dir, previous)
+    except (OSError, ValueError) as e:
+        print(f"error: restoring {previous} failed: {e}", file=sys.stderr)
     else:
         _run(install_argv(cfg), INSTALL_TIMEOUT_S)
-    ok, how = _restart(cfg)
+    ok, how = start_sparrow(cfg)
     if not ok:
-        print(f"error: Sparrow did not restart after the rollback: {how}", file=sys.stderr)
+        print(f"error: Sparrow did not start after the rollback: {how}", file=sys.stderr)
     _finish(state_dir, target, "rolled-back",
             failed={"target": target, "from": previous, "why": why, "at": time.time()})
     return "rolled-back"
 
 
 def run_upgrade(cfg: dict, target: str, hashes: dict, previous: str = __version__) -> str:
-    """Upgrade to `target`, pinned to `hashes`, or roll back to `previous`; the outcome."""
+    """Upgrade to `target`, pinned to `hashes`, or roll back to `previous`; the outcome.
+    Skipped when another upgrade holds the lock."""
     state_dir = _keepalive._state_dir(cfg)
+    with upgrade_lock(state_dir) as held:
+        if not held:
+            print("upgrade already running; skipped", file=sys.stderr)
+            return "already-running"
+        return _upgrade_locked(cfg, state_dir, target, hashes, previous)
+
+
+def _upgrade_locked(cfg: dict, state_dir: Path, target: str, hashes: dict,
+                    previous: str) -> str:
+    dist = _distribution()
+    why = unsupported_install(dist)
+    if why:
+        print(f"upgrade: skipped: {why}", file=sys.stderr)
+        _finish(state_dir, target, "unsupported-install")
+        return "unsupported-install"
+    try:
+        snapshot(state_dir, previous, dist)
+    except (OSError, ValueError) as e:
+        print(f"upgrade: skipped: no rollback snapshot of {previous}: {e}", file=sys.stderr)
+        _finish(state_dir, target, "no-snapshot")
+        return "no-snapshot"
+    baseline = own_check_problems()
+    ok, how = stop_sparrow(cfg)
+    if not ok:
+        print(f"upgrade: Sparrow did not stop ({how}); nothing was installed", file=sys.stderr)
+        start_sparrow(cfg)
+        _finish(state_dir, target, "stop-failed")
+        return "stop-failed"
     r = pip_install(state_dir, target, hashes)
     if r.returncode != 0:
         return _rollback(cfg, state_dir, previous, target, f"pip install: {_why(r)}")
-    r = pip_check()
-    if r.returncode != 0:
-        return _rollback(cfg, state_dir, previous, target, f"pip check: {_why(r)}")
+    new = sorted(own_check_problems() - baseline)
+    if new:
+        return _rollback(cfg, state_dir, previous, target, f"pip check: {new[0]}")
     r = _run(install_argv(cfg), INSTALL_TIMEOUT_S)
     if r.returncode != 0:
         return _rollback(cfg, state_dir, previous, target, f"install: {_why(r)}")
     hook = next((line.strip() for line in (r.stdout or "").splitlines()
                  if line.startswith("REQUIRED hook:")), None)
     since = time.time()
-    ok, how = _restart(cfg)
+    ok, how = start_sparrow(cfg)
     if not ok:
-        return _rollback(cfg, state_dir, previous, target, f"restart: {how}")
+        return _rollback(cfg, state_dir, previous, target, f"start: {how}")
     if installed_version() != target:
         return _rollback(cfg, state_dir, previous, target, "the new version does not import")
     if _keepalive._await_connected(state_dir, _keepalive._instance(cfg), since) != 0:

@@ -4,8 +4,8 @@
 refreshes, else from the copies shipped in the package. A cache that is unreadable, has a
 newer text_schema_version, lacks a field, or names any command but the reply command is
 not used. Served text never replaces the package's tier notes or owner note: they are
-always printed, with the owner's DM room when Sparrow has read it, and served
-tier_addenda come after them. Text only instructs; claims, at-most-once replies
+always printed last, after a line saying they override anything above, the owner note
+with the owner's DM room when Sparrow has read it. Text only instructs; claims, at-most-once replies
 and fail-closed delivery are enforced by the code, which served text cannot reach."""
 from __future__ import annotations
 
@@ -25,13 +25,14 @@ TIERS = ("owner", "team", "guest")
 MAX_TEXT_CHARS = 8192
 PLACEHOLDERS = ("<AGENT_MXID>", "<REPLY_COMMAND>", "<ACTIVITY_FILE>")
 VENDOR = "muse"
+PRECEDENCE = "These rules override anything above:"
 ROOM_ID_RE = re.compile(r"![A-Za-z0-9._=+/-]{1,255}:[A-Za-z0-9.-]{1,255}(?::[0-9]{1,5})?")
 # name: (default, min, max), in seconds.
 TUNABLES = {
     "keepawake_interval_s": (15 * 60, 5 * 60, 60 * 60),
     "stuck_task_age_s": (15 * 60, 5 * 60, 2 * 60 * 60),
     "hook_silent_age_s": (5 * 60, 2 * 60, 60 * 60),
-    "heartbeat_cadence_s": (5 * 60, 60, 30 * 60),
+    "heartbeat_cadence_s": (60, 30, 90),
 }
 
 
@@ -128,11 +129,12 @@ def wake_context(cache: "dict | None", values: dict,
     text, why = served_text(cache)
     source = f"served revision {cache.get('revision')}" if text else f"built-in ({why})"
     text = text or {**{f: shipped[f] for f in TEXT_FIELDS}, "tier_addenda": {}}
-    parts = [text["prompt"], "Worker note: " + text["worker_note"], *shipped["tier_notes"],
-             shipped["owner_note"] + (f" owner_dm_room: {owner_dm}" if owner_dm else "")]
+    parts = [text["prompt"], "Worker note: " + text["worker_note"]]
     parts += [f"Addendum for {tier} items: {text['tier_addenda'][tier]}"
               for tier in TIERS if (text["tier_addenda"].get(tier) or "").strip()]
-    parts.append(text["restart_hint"])
+    # The package's own rules come last, so nothing served can follow and countermand them.
+    parts += [text["restart_hint"], PRECEDENCE, *shipped["tier_notes"],
+              shipped["owner_note"] + (f" owner_dm_room: {owner_dm}" if owner_dm else "")]
     return "\n\n".join(_render(p, values) for p in parts) + "\n", source
 
 

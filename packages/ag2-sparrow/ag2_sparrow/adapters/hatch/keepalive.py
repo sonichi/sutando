@@ -315,11 +315,11 @@ def unmanaged_health_problem(cfg: dict) -> "tuple[int | None, str | None]":
     return pid, health_env_problem(cfg, pid)
 
 
-def replace_sparrow(cfg: dict, pid: int, why: "str | None" = None) -> "tuple[bool, str]":
-    """Stop Sparrow `pid` and start one with this install's REMOTE_HEALTH_COMMAND; `why`
-    says what the replace is for (default: the running one lacks that command)."""
-    print(f"replacing: Sparrow (pid {pid}) " + (why or "runs without "
-          f"REMOTE_HEALTH_COMMAND={health_command(_command(cfg))}"))
+def replace_sparrow(cfg: dict, pid: int) -> "tuple[bool, str]":
+    """Stop Sparrow `pid`, which lacks this install's REMOTE_HEALTH_COMMAND, and start one
+    that has it."""
+    print(f"replacing: Sparrow (pid {pid}) runs without "
+          f"REMOTE_HEALTH_COMMAND={health_command(_command(cfg))}")
     if not _stop(pid):
         return False, f"the old Sparrow (pid {pid}) did not stop"
     ok, how = restart_listener(cfg)
@@ -438,9 +438,14 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
 
 
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
+    from . import self_upgrade
     now = time.time() if now is None else now
     up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
-    if not up:
+    # An upgrade stops Sparrow on purpose and starts it again itself.
+    upgrading = self_upgrade.upgrade_running(_state_dir(cfg))
+    if upgrading:
+        print("an upgrade is running; Sparrow is left as it is")
+    elif not up:
         ok, how = restart_listener(cfg)
         if ok:
             restarted = 1
@@ -458,7 +463,7 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
             else:
                 print(f"the replace failed: {how}", file=sys.stderr)
                 rc = 1
-    upgrade = _served_setup(cfg)
+    upgrade = "running" if upgrading else _served_setup(cfg)
     line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
         + (f" reason={reason}" if reason else "") + (f" upgrade={upgrade}" if upgrade else "")
     log.parent.mkdir(parents=True, exist_ok=True)
