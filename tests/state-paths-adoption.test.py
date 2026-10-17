@@ -136,6 +136,10 @@ TS_CANONICAL = re.compile(
 # non-workspace purposes (e.g. walking the checkout for git operations).
 # Each entry is justified, not silently allowed.
 ALLOWLIST = {
+    # holder_lock never resolves the workspace — its only "state/" token is the
+    # legacy connector.pid relative to a caller-supplied work root, and the
+    # module is vendored into ag2-sparrow where src/ is not importable.
+    "src/holder_lock.py",
     # cloud_auth never resolves the workspace — read_cloud_auth(ws) takes the
     # dir from its caller (report-feedback / marketplace resolve it).
     "src/cloud_auth.py",
