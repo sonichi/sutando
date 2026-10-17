@@ -59,9 +59,10 @@ def redact_url(value: str) -> str:
 
 
 def binding_key_path() -> Path:
-    """The per-install key the binding is computed with: outside the state dir, which may
-    be synced, beside the relay token's default home."""
-    return Path(os.path.expanduser("~")) / ".config" / "ag2-sparrow" / "binding.key"
+    """The per-install key the binding is computed with: in the user's config dir
+    (XDG_CONFIG_HOME, else ~/.config), never the state dir, which may be synced."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return Path(base) / "ag2-sparrow" / "binding.key"
 
 
 def _binding_key(create: bool) -> "bytes | None":
@@ -85,7 +86,8 @@ def _binding_key(create: bool) -> "bytes | None":
 def binding_digest(identity: str, gateway_url: str, create: bool = False) -> str:
     """HMAC-SHA256, under the per-install key, of an agent identity and the FULL gateway
     URL: binds a saved reading to one enrollment without persisting anything the URL could
-    be recovered from. '' when either is missing or there is no key (the writer creates it)."""
+    be recovered from. '' when either is missing or there is no key; only the owner-routing
+    writer creates one (create=True)."""
     key = _binding_key(create) if identity and gateway_url else None
     if key is None:
         return ""

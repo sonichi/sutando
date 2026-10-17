@@ -69,7 +69,7 @@ class Base(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.home)
         self.state = self.home / "state"
         self.state.mkdir()
-        env = mock.patch.dict(os.environ, {"HOME": str(self.home),
+        env = mock.patch.dict(os.environ, {"HOME": str(self.home), "XDG_CONFIG_HOME": "",
                                            "SPARROW_HATCH_CONFIG": str(self.home / "config")})
         env.start()
         self.addCleanup(env.stop)
@@ -266,6 +266,14 @@ class WakeContext(Base):
         record["binding"] = "0" * 64
         path.write_text(json.dumps(record))
         self.assertEqual(runtime_text.owner_dm_room(self.state), "")
+
+    def test_the_binding_key_follows_the_config_home(self):
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.home / "xdg")}):
+            self.assertEqual(gateway_instance.binding_key_path(),
+                             self.home / "xdg" / "ag2-sparrow" / "binding.key")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}):
+            self.assertEqual(gateway_instance.binding_key_path(),
+                             self.home / ".config" / "ag2-sparrow" / "binding.key")
 
     def test_the_binding_is_keyed_per_install_never_a_plain_hash_of_the_url(self):
         import hashlib

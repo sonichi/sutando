@@ -1306,13 +1306,18 @@ def main() -> int:
     _real_identity, _real_state = rtc._reenroll_identity, rtc._STATE
     rtc._reenroll_identity = lambda: "@agent-t:example.org"  # the row match, not an env var the CI box lacks
     rtc._STATE = Path(tempfile.mkdtemp(prefix="rtc-routing-"))  # the persisted reading lands here, never live state
+    _real_xdg = os.environ.get("XDG_CONFIG_HOME")
+    os.environ["XDG_CONFIG_HOME"] = str(rtc._STATE / "config")  # the binding key too
     rtc._ROUTING.update(owner_dm="", next=0.0, loaded=True)
     STATE["agents"] = [{"id": "@agent-t:example.org", "owner": "@owner:example.org", "owner_dm_room": "!dm:example.org"}]
     (rtc.RESULTS_DIR / "proactive-t1b.txt").write_text("to the dm\n")
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["room_id"] == "!dm:example.org",
           "proactive delivery goes to the gateway's owner_dm_room, not the pinned room")
-    check(json.loads(rtc._routing_file().read_text()) == {"identity": "@agent-t:example.org", "gateway": rtc.URL, "owner_dm": "!dm:example.org"},
+    _rec = json.loads(rtc._routing_file().read_text())
+    check(_rec == {"identity": "@agent-t:example.org", "gateway": rtc._redact_url(rtc.URL),
+                   "binding": rtc.gateway_instance.binding_digest("@agent-t:example.org", rtc.URL),
+                   "owner_dm": "!dm:example.org"} and len(_rec["binding"]) == 64,
           "the reading is persisted under the state dir, bound to this identity and this gateway")
     _real_replace = rtc.os.replace; _faults = []
     def _fail_routing_once(src, dst):
@@ -1418,6 +1423,10 @@ def main() -> int:
     STATE["agents"] = None  # teardown: the sections below run on the harness reading, no gateway lookups
     rtc._ROUTING.update(owner_dm="!owner:example.org", persisted="", identity="", gateway="", next=time.time() + 3600, loaded=True)
     rtc._reenroll_identity, rtc._STATE = _real_identity, _real_state
+    if _real_xdg is None:
+        os.environ.pop("XDG_CONFIG_HOME", None)
+    else:
+        os.environ["XDG_CONFIG_HOME"] = _real_xdg
     # 3.6 cross-bridge claim gate (proactive_routing wired by the loader).
     # Hermetic: the gate asks claude_home_path() whether the routed bridge is
     # configured, so an ambient ~/.claude would decide these cases from the
