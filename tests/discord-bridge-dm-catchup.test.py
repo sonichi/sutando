@@ -15,10 +15,10 @@ record of it; the message was only recoverable via manual REST fetch.
 ## The fix
 
 Track the last DM message ID we successfully observed per channel in
-`state/discord-dm-checkpoint.json`. On every `on_ready` (full
-reconnect after gateway IDENTIFY), call `_catchup_missed_dms()`
-which REST-fetches messages with `after=<last_seen_id>` from each
-checkpointed channel and replays them through `_handle_discord_message`.
+`state/discord-dm-checkpoint.json`. Reconcile immediately on every
+`on_ready` and periodically while the gateway remains ready, REST-fetching
+messages with `after=<last_seen_id>` and replaying them through
+`_dispatch_discord_message`.
 Discord message IDs are Snowflake-monotonic so `after=<id>` is
 reliable.
 
@@ -30,6 +30,7 @@ mocking which is more involved — we exercise the pure parts directly
 and source-grep-assert the wiring.
 """
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -192,6 +193,307 @@ def test_source_wires_catchup_into_on_ready():
     )
 
 
+def test_source_wires_periodic_reconciliation_once():
+    """Start reconciliation inside the once-only long-lived-loop guard."""
+    src = (REPO / "src" / "discord-bridge.py").read_text()
+    import re
+    on_ready_block = re.search(
+        r"async def on_ready\(\):(.*?)(?=^(?:async )?def )",
+        src, re.MULTILINE | re.DOTALL,
+    )
+    assert on_ready_block, "could not locate on_ready in discord-bridge.py"
+    body = on_ready_block.group(1)
+    guard_pos = body.index("if not _poll_loops_started:")
+    # main wrapped every long-lived loop in _supervise_loop; this one is not an
+    # exception, so pin BOTH the guard placement and the supervision.
+    loop_pos = body.index('_supervise_loop(_dm_reconciliation_loop, "_dm_reconciliation_loop")')
+    assert loop_pos > guard_pos, (
+        "periodic DM reconciliation must start inside the once-only poll-loop "
+        "guard, or reconnects will accumulate duplicate loops"
+    )
+    assert "create_task(_dm_reconciliation_loop())" not in body, (
+        "unsupervised: an exception escaping the loop would end reconciliation "
+        "permanently while the bridge stays up"
+    )
+
+
+def test_ready_bridge_runs_reconciliation_without_reconnect():
+    """A protocol-ready bridge performs catch-up on the periodic path."""
+    calls = []
+    real_client = bridge.client
+    real_catchup = bridge._catchup_missed_dms
+    bridge.client = type("_ReadyClient", (), {"is_ready": lambda self: True})()
+
+    async def fake_catchup():
+        calls.append("catchup")
+
+    bridge._catchup_missed_dms = fake_catchup
+    try:
+        result = asyncio.run(bridge._reconcile_missed_dms_if_ready())
+    finally:
+        bridge.client = real_client
+        bridge._catchup_missed_dms = real_catchup
+    assert result is True
+    assert calls == ["catchup"]
+
+    bridge.client = type("_NotReadyClient", (), {"is_ready": lambda self: False})()
+    try:
+        result = asyncio.run(bridge._reconcile_missed_dms_if_ready())
+    finally:
+        bridge.client = real_client
+    assert result is False
+    assert calls == ["catchup"]
+
+
+def test_catchup_passes_are_serialized():
+    """Reconnect and periodic reconciliation must share one async lock, created
+    lazily inside the running loop (not at module scope — #2655)."""
+    src = (REPO / "src" / "discord-bridge.py").read_text()
+    assert "def _get_dm_catchup_lock()" in src
+    assert "async with _get_dm_catchup_lock():" in src
+    # The MODULE-SCOPE construction (column 0) is the bug — it must be gone; the
+    # lazy assignment INSIDE the getter (indented) is the fix and is fine.
+    assert "\n_dm_catchup_lock = asyncio.Lock()" not in src
+    assert "\n_dm_catchup_lock = None" in src
+
+
+def test_gateway_and_rest_race_is_claimed_exactly_once():
+    """Concurrent gateway/REST discovery dispatches one handler body only."""
+    bridge.seen_message_ids.clear()
+    bridge._inflight_discord_message_ids.clear()
+    calls = []
+    real_handler = bridge._handle_discord_message
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_handler(message, force=False):
+            calls.append(message.id)
+            started.set()
+            await release.wait()
+
+        bridge._handle_discord_message = fake_handler
+        msg = types.SimpleNamespace(id=987654, author="owner")
+        first = asyncio.create_task(bridge._dispatch_discord_message(msg))
+        await started.wait()
+        second = asyncio.create_task(bridge._dispatch_discord_message(msg))
+        await second
+        release.set()
+        await first
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        bridge._handle_discord_message = real_handler
+        bridge.seen_message_ids.clear()
+        bridge._inflight_discord_message_ids.clear()
+    assert calls == [987654], (
+        f"gateway + REST must dispatch one handler body, got {calls!r}"
+    )
+
+
+def test_failed_claim_is_released_for_retry():
+    """A handler exception must not poison in-memory dedup for this process."""
+    bridge.seen_message_ids.clear()
+    bridge._inflight_discord_message_ids.clear()
+    calls = []
+    real_handler = bridge._handle_discord_message
+
+    async def flaky_handler(message, force=False):
+        calls.append(message.id)
+        if len(calls) == 1:
+            raise RuntimeError("transient")
+
+    bridge._handle_discord_message = flaky_handler
+    msg = types.SimpleNamespace(id=24680, author="owner")
+    try:
+        try:
+            asyncio.run(bridge._dispatch_discord_message(msg))
+        except RuntimeError:
+            pass
+        asyncio.run(bridge._dispatch_discord_message(msg))
+    finally:
+        bridge._handle_discord_message = real_handler
+        bridge.seen_message_ids.clear()
+        bridge._inflight_discord_message_ids.clear()
+    assert calls == [24680, 24680], (
+        f"a failed claim must be retriable, got calls {calls!r}"
+    )
+
+
+def test_force_dispatch_bypasses_dedup_and_reaches_handler():
+    """Intentional edit reprocessing must bypass both dedup sets."""
+    bridge.seen_message_ids.clear()
+    bridge._inflight_discord_message_ids.clear()
+    bridge.seen_message_ids.add(13579)
+    calls = []
+    real_handler = bridge._handle_discord_message
+
+    async def fake_handler(message, force=False):
+        calls.append((message.id, force))
+
+    bridge._handle_discord_message = fake_handler
+    try:
+        asyncio.run(bridge._dispatch_discord_message(
+            types.SimpleNamespace(id=13579, author="owner"), force=True
+        ))
+    finally:
+        bridge._handle_discord_message = real_handler
+        bridge.seen_message_ids.clear()
+        bridge._inflight_discord_message_ids.clear()
+    assert calls == [(13579, True)]
+
+
+def test_seen_message_cache_is_bounded_after_success():
+    """A successful dispatch clears the old 10k cache before adding its ID."""
+    bridge.seen_message_ids.clear()
+    bridge._inflight_discord_message_ids.clear()
+    bridge.seen_message_ids.update(range(10000))
+    real_handler = bridge._handle_discord_message
+
+    async def fake_handler(message, force=False):
+        return None
+
+    bridge._handle_discord_message = fake_handler
+    try:
+        asyncio.run(bridge._dispatch_discord_message(
+            types.SimpleNamespace(id=20000, author="owner")
+        ))
+    finally:
+        bridge._handle_discord_message = real_handler
+    assert bridge.seen_message_ids == {20000}
+    bridge.seen_message_ids.clear()
+    bridge._inflight_discord_message_ids.clear()
+
+
+def test_event_wrappers_dispatch_normal_and_edited_messages():
+    """Gateway and both intentional edit paths reach the shared dispatcher."""
+    calls = []
+    real_dispatch = bridge._dispatch_discord_message
+    real_mentions = bridge._message_mentions_bot
+    real_client = bridge.client
+    real_allowed = bridge.load_allowed
+    me = object()
+
+    async def fake_dispatch(message, force=False):
+        calls.append((message.id, force))
+
+    bridge._dispatch_discord_message = fake_dispatch
+    bridge.client = type("_Client", (), {"user": me})()
+    bridge.load_allowed = lambda: {"owner-id"}
+    try:
+        asyncio.run(bridge.on_message(types.SimpleNamespace(id=1)))
+
+        before = types.SimpleNamespace(mentioned=False)
+        after_mention = types.SimpleNamespace(
+            id=2,
+            author=types.SimpleNamespace(bot=False),
+            mentions=[],
+            mentioned=True,
+        )
+        bridge._message_mentions_bot = lambda message: message.mentioned
+        asyncio.run(bridge.on_message_edit(before, after_mention))
+
+        before_dm = types.SimpleNamespace(content="old")
+        after_dm = types.SimpleNamespace(
+            id=3,
+            author=types.SimpleNamespace(bot=False, id="owner-id"),
+            mentions=[],
+            channel=_FakeDM(77),
+            content="new",
+            created_at=types.SimpleNamespace(timestamp=lambda: bridge.time.time()),
+        )
+        bridge._message_mentions_bot = lambda message: False
+        asyncio.run(bridge.on_message_edit(before_dm, after_dm))
+    finally:
+        bridge._dispatch_discord_message = real_dispatch
+        bridge._message_mentions_bot = real_mentions
+        bridge.client = real_client
+        bridge.load_allowed = real_allowed
+    assert calls == [(1, False), (2, True), (3, True)]
+
+
+def test_catchup_history_replays_through_shared_dispatcher():
+    """REST history must use the same dispatcher as gateway delivery."""
+    calls = []
+    real_load = bridge._load_dm_checkpoint
+    real_dispatch = bridge._dispatch_discord_message
+    real_client = bridge.client
+
+    class _HistoryDM(_FakeDM):
+        async def history(self, **kwargs):
+            yield types.SimpleNamespace(id=11, author="owner")
+            yield types.SimpleNamespace(id=12, author="owner")
+
+    channel = _HistoryDM(77)
+    bridge._load_dm_checkpoint = lambda: {"77": "10"}
+    bridge.client = type("_Client", (), {
+        "get_channel": lambda self, channel_id: channel,
+    })()
+
+    async def fake_dispatch(message, force=False):
+        calls.append((message.id, force))
+
+    bridge._dispatch_discord_message = fake_dispatch
+    try:
+        asyncio.run(bridge._catchup_missed_dms_unlocked())
+    finally:
+        bridge._load_dm_checkpoint = real_load
+        bridge._dispatch_discord_message = real_dispatch
+        bridge.client = real_client
+    assert calls == [(11, False), (12, False)]
+
+
+def test_catchup_wrapper_executes_unlocked_pass():
+    """The serialized wrapper must actually invoke the pass it protects."""
+    calls = []
+    real_unlocked = bridge._catchup_missed_dms_unlocked
+
+    async def fake_unlocked():
+        calls.append("pass")
+
+    bridge._catchup_missed_dms_unlocked = fake_unlocked
+    try:
+        asyncio.run(bridge._catchup_missed_dms())
+    finally:
+        bridge._catchup_missed_dms_unlocked = real_unlocked
+    assert calls == ["pass"]
+
+
+def test_periodic_loop_survives_one_failed_pass():
+    """One REST failure is logged and the long-lived loop keeps polling."""
+    calls = []
+    real_sleep = bridge.asyncio.sleep
+    real_reconcile = bridge._reconcile_missed_dms_if_ready
+
+    async def fake_sleep(seconds):
+        calls.append(("sleep", seconds))
+
+    async def fake_reconcile():
+        calls.append(("reconcile", None))
+        if sum(1 for kind, _ in calls if kind == "reconcile") == 1:
+            raise RuntimeError("transient")
+        raise asyncio.CancelledError()
+
+    bridge.asyncio.sleep = fake_sleep
+    bridge._reconcile_missed_dms_if_ready = fake_reconcile
+    try:
+        try:
+            asyncio.run(bridge._dm_reconciliation_loop())
+        except asyncio.CancelledError:
+            pass
+    finally:
+        bridge.asyncio.sleep = real_sleep
+        bridge._reconcile_missed_dms_if_ready = real_reconcile
+    assert calls == [
+        ("sleep", bridge.DM_RECONCILE_INTERVAL_SECONDS),
+        ("reconcile", None),
+        ("sleep", bridge.DM_RECONCILE_INTERVAL_SECONDS),
+        ("reconcile", None),
+    ]
+
+
 def test_source_wires_checkpoint_update_into_handler():
     """Architectural: `_handle_discord_message` must call
     `_update_dm_checkpoint` for DMs. Without this, the checkpoint
@@ -293,6 +595,8 @@ def _drive_self_authored(channel, msg_id=99999):
     me = object()
     fake_client = type("_C", (), {"user": me})()
     msg = types.SimpleNamespace(author=me, channel=channel, id=msg_id)
+    bridge.seen_message_ids.discard(msg_id)
+    bridge._inflight_discord_message_ids.discard(msg_id)
     real_client = getattr(bridge, "client", None)
     bridge.client = fake_client
     try:
@@ -356,9 +660,38 @@ def test_checkpoint_write_failure_does_not_break_the_handler():
         bridge._update_dm_checkpoint = orig
 
 
+def test_dm_catchup_lock_is_lazy_and_survives_contention_on_a_fresh_loop():
+    # asyncio.Lock() binds the event loop at construction, so a module-scope lock
+    # binds the pre-run loop and a contended acquire under asyncio.run() cross-loops.
+    bridge._dm_catchup_lock = None
+    assert bridge._dm_catchup_lock is None  # not constructed at import time
+
+    async def _contend():
+        async def _waiter(started):
+            started.set()
+            async with bridge._get_dm_catchup_lock():  # blocks while held below
+                return True
+        async with bridge._get_dm_catchup_lock():       # first use -> created in THIS loop
+            started = asyncio.Event()
+            waiter = asyncio.ensure_future(_waiter(started))
+            await started.wait()
+            await asyncio.sleep(0)                       # let the waiter reach the contended acquire
+            assert not waiter.done(), "waiter should be blocked on the contended lock"
+            return waiter
+        # (lock released here)
+
+    async def _run():
+        waiter = await _contend()
+        return await waiter  # the previously-contended acquire must NOT raise
+
+    assert asyncio.run(_run()) is True   # fresh asyncio.run() loop, exactly the prod path
+    bridge._dm_catchup_lock = None       # reset for test isolation
+
+
 def main():
     failures = []
     for fn in (
+        test_dm_catchup_lock_is_lazy_and_survives_contention_on_a_fresh_loop,
         test_load_returns_empty_when_file_missing,
         test_load_returns_empty_on_malformed_json,
         test_load_returns_empty_on_non_dict_root,
@@ -368,6 +701,17 @@ def main():
         test_update_handles_string_message_id,
         test_load_filters_malformed_entries,
         test_source_wires_catchup_into_on_ready,
+        test_source_wires_periodic_reconciliation_once,
+        test_ready_bridge_runs_reconciliation_without_reconnect,
+        test_catchup_passes_are_serialized,
+        test_gateway_and_rest_race_is_claimed_exactly_once,
+        test_failed_claim_is_released_for_retry,
+        test_force_dispatch_bypasses_dedup_and_reaches_handler,
+        test_seen_message_cache_is_bounded_after_success,
+        test_event_wrappers_dispatch_normal_and_edited_messages,
+        test_catchup_history_replays_through_shared_dispatcher,
+        test_catchup_wrapper_executes_unlocked_pass,
+        test_periodic_loop_survives_one_failed_pass,
         test_source_wires_checkpoint_update_into_handler,
         test_self_authored_dms_advance_the_checkpoint,
         test_self_authored_dm_actually_advances_the_checkpoint,

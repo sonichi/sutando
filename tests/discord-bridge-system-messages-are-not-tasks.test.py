@@ -107,6 +107,9 @@ def _run(msg, checkpoint_raises=False):
     `observed` is the moderation hook the guard used to sit BEHIND."""
     observed, reached = [], []
     checkpoints.clear()
+    # Every case reuses one message id, so the claim state must reset too.
+    bridge.seen_message_ids.clear()
+    bridge._inflight_discord_message_ids.clear()
 
     async def _spy_observe(m):
         observed.append(getattr(m, "id", None))
