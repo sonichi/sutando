@@ -374,6 +374,7 @@ class TasksView:
                          "state": self.status(task_id)["state"]}
                 try:
                     th = parse_task_headers_lenient(f.read_text())
+                    entry["preview"] = " ".join(th.body.split())[:160]
                     for k in ("source", "priority", "timestamp", "instance_id"):
                         v = th.get(k)
                         if v:
