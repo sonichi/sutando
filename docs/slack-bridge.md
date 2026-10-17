@@ -22,7 +22,10 @@ pipeline as voice / Discord / Telegram.
 4. **Event Subscriptions**: turn the **Enable Events** toggle ON at the
    top of the page. Leave the Request URL field blank — Socket Mode
    delivers events over the WebSocket, no public webhook needed. Under
-   **Subscribe to bot events**, add `message.im` and `app_mention`.
+   **Subscribe to bot events**, add `message.im`, `app_mention`,
+   `message.channels` and `message.groups`. The last two let a plain
+   (no @mention) reply in a channel thread the bot started or posted in
+   reach the bot; without them only @mentions work in channels.
    Click **Save Changes**.
 
 5. **App Home → Messages Tab**: in the left sidebar pick **App Home**,

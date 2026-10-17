@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to
+Slack bridge for Sutando — receives DMs, @mentions and replies in threads the
+bot started or posted in via Socket Mode, writes to
 tasks/, sends replies from results/. Works alongside the voice / discord /
 telegram bridges. Runs as a background daemon.
 
@@ -117,6 +118,7 @@ from slack_owner import resolve_proactive_owner_id  # noqa: E402
 from slack_proactive_receipts import mark_delivered as mark_proactive_delivered  # noqa: E402
 from slack_proactive_receipts import was_delivered as proactive_was_delivered  # noqa: E402
 import slack_result_delivery as _srd  # noqa: E402  (reply leg binds the shared outbox; needs _PKG_ROOT above)
+from slack_bot_threads import BotThreadRecord, is_addressed_thread_reply  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -501,6 +503,8 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
 # restarted bridge still needs the original channel + thread timestamp to route
 # a late result. Discord already persists the equivalent map for this reason.
 PENDING_REPLIES_FILE = STATE_DIR / "slack-pending-replies.json"
+# Channel threads the bot has posted into; a plain reply there is addressed to it.
+BOT_THREADS = BotThreadRecord(STATE_DIR / "slack-bot-threads.json")
 
 
 def _atomic_write_pending_replies(data: dict) -> None:
@@ -984,7 +988,8 @@ def _slack_context_note(event: dict) -> tuple[str, set[str]]:
         return _slack_context_unavailable_note(), set()
 
 
-def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
+def _write_task(event: dict, prefix: str, text: str, username: str | None,
+                ack_not_allowed: bool = True) -> str | None:
     """Write a task file from a Slack event. Returns task_id or None if skipped."""
     user_id = event.get("user")
     if not user_id:
@@ -1035,12 +1040,12 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         # Keep _TOFU_ENROLLMENT_CODE valid for the process lifetime (do NOT clear
         # it) so the gate stays armed if access.json is deleted externally later
         # (#899), instead of falling through to an unguarded tofu_onboard().
-    # Every _write_task call is a DM (handle_message) or an @mention
-    # (handle_mention), so a non-allowlisted sender here DID address the bot —
-    # ack them (rate-limited) before the fail-closed drop so it isn't silent.
+    # A DM or @mention DID address the bot, so ack (rate-limited) before the
+    # drop; a plain thread reply may be meant for the other humans there.
     if user_id not in allowed:
         print(f"  Dropped message from non-allowed user {user_id}", flush=True)
-        _ack_not_allowlisted(event, user_id)
+        if ack_not_allowed:
+            _ack_not_allowlisted(event, user_id)
         return None
 
     # Download any attached files BEFORE writing the task, so the task body
@@ -1412,16 +1417,60 @@ def handle_mention(event, say):
     _write_task(event, prefix, text, username)
 
 
+_bot_user_id_cache: list[str] = []
+
+
+def _bot_user_id() -> str | None:
+    """This bot's Slack user id (auth.test), cached once known; None on failure."""
+    if _bot_user_id_cache:
+        return _bot_user_id_cache[0]
+    try:
+        uid = app.client.auth_test().get("user_id")
+    except Exception as e:
+        print(f"  [thread-reply] auth.test failed: {e}", flush=True)
+        return None
+    if uid:
+        _bot_user_id_cache.append(uid)
+    return uid or None
+
+
+def _note_bot_thread(channel: str, thread_ts: str | None, resp) -> None:
+    """Record the channel thread a successful post landed in; never raises."""
+    try:
+        if not channel or channel.startswith("D"):
+            return
+        root = thread_ts or (resp.get("ts") if resp is not None else None)
+        if root:
+            BOT_THREADS.record(channel, str(root))
+    except Exception as e:
+        print(f"  [bot-threads] record failed: {e}", flush=True)
+
+
+def _handle_channel_thread_reply(event: dict) -> str | None:
+    """A plain reply in a thread the bot started or posted in → task, gated like a mention."""
+    thread_ts = event.get("thread_ts")
+    if not thread_ts or thread_ts == event.get("ts"):
+        return None
+    if not is_addressed_thread_reply(
+        event, _bot_user_id(),
+        BOT_THREADS.contains(event.get("channel", ""), str(thread_ts)),
+    ):
+        return None
+    user_id = event.get("user")
+    username = _resolve_username(user_id) if user_id else None
+    text = (event.get("text") or "").strip()
+    return _write_task(event, "Slack thread reply", text, username, ack_not_allowed=False)
+
+
 @app.event("message")
 def handle_message(event, say):
-    """DM → task file. Channel messages are handled via app_mention only."""
+    """DM → task file; a channel reply in a bot thread → task (mentions use app_mention)."""
     # Ignore bot messages, edited messages, and channel-history backfills.
     if event.get("subtype") in ("bot_message", "message_changed", "message_deleted"):
         return
-    # Only handle direct messages (channel_type=im). Channel @mentions arrive
-    # via the separate app_mention event above, so handling them here would
-    # double-fire.
+    # Channel @mentions arrive via app_mention; handling them here would double-fire.
     if event.get("channel_type") != "im":
+        _handle_channel_thread_reply(event)
         return
     user_id = event.get("user")
     if not user_id:
@@ -1529,6 +1578,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             try:
                 _last_resp = app.client.chat_postMessage(**kwargs)
                 _parts_visible += 1
+                _note_bot_thread(channel, thread_ts, _last_resp)
             except Exception as e:
                 print(f"[Slack] chat_postMessage failed: {e}", flush=True)
                 _chunk_exc = e
@@ -1873,7 +1923,8 @@ def _no_events_hint_thread():
             "  Most common cause: Event Subscriptions is disabled in your app config.\n"
             "  Fix: https://api.slack.com/apps → your app → Event Subscriptions →\n"
             "    1. Toggle 'Enable Events' to ON\n"
-            "    2. Under 'Subscribe to bot events' add: message.im, app_mention\n"
+            "    2. Under 'Subscribe to bot events' add: message.im, app_mention,\n"
+            "       message.channels, message.groups (thread replies)\n"
             "    3. Save Changes (if greyed, see docs/slack-bridge.md install gotchas)\n"
             "    4. Reinstall app if Slack prompts a yellow banner\n"
             "  Then send a DM to your bot — TOFU will auto-onboard you as owner.",
