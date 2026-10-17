@@ -49,8 +49,8 @@ def _load():
 def _stdin_payload(kw: dict) -> str:
     """The paths a stubbed `subprocess.run` was handed on stdin.
 
-    The probe feeds `check-ignore --stdin` from a file, not `input=` (a pipe
-    write past 64 KiB can block past the timeout); peek without consuming it.
+    The probe feeds `check-ignore --stdin` from a file, not `input=` (see
+    health-check-git-stdin-no-pipe.test.py); peek without consuming it.
     """
     f = kw.get("stdin")
     if f is None:

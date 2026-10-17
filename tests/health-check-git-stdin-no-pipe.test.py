@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Large git stdin must come from a file, never from `subprocess.run(input=)`.
+"""Git stdin in health-check must come from a file, never from `subprocess.run(input=)`.
 
-`_carrier_target_verdict` feeds `git check-ignore --stdin` the whole carrier
-tree (~11k paths on a real workspace) and `_index_growth_note` feeds
-`git cat-file --batch` a spec per revision. With `input=`, Python writes the
-payload into a 64 KiB pipe while git writes its answer into another; once both
-are full the two block on each other inside write(2). The 60 s timeout lives in
-the selector loop, which the thread never reaches, so the probe hung 8-15 min
-and took every proactive-loop health step with it.
+`_carrier_target_verdict` feeds `git check-ignore -v -z --stdin` the whole carrier
+tree (~11k paths on a real workspace); git flushes one record per path. When
+macOS's system-wide pipe-buffer pool is spent, a new pipe holds 512 bytes yet
+poll() still reports it writable, so `communicate()` sleeps in a blocking
+os.write() on git's stdin while git sleeps writing its stdout. `timeout=` is
+only checked around select(), so it never fires: the probe hung 8-15 min and
+took every proactive-loop health step with it. `_index_growth_note` feeds
+`git cat-file --batch` at most 12 short specs, which cannot deadlock; it is
+held to the same shape defensively.
 
-The hang itself does not reproduce on every host, so this pins the shape of the
-call: (1) an AST walk asserting neither git call site passes `input=`, and
-(2) >64 KiB of real input through each call site, with git's answer checked.
+The spent-pool reproduction is tests/health-check-git-stdin-pipe-pool.test.py
+(macOS, opt-in). This suite pins the shape on every host: (1) an AST walk
+asserting neither git call site passes `input=`, and (2) >64 KiB of real input
+through each call site, with git's answer checked.
 
 Run: python3 tests/health-check-git-stdin-no-pipe.test.py
 """

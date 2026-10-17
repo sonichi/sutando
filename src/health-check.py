@@ -1986,8 +1986,8 @@ def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
     # `-z` makes git read NUL-separated input, which is the only delimiter a
     # POSIX filename cannot contain.
     rels = "\0".join(str(t.relative_to(workspace)) for t in targets)
-    # stdin is a file, not `input=`: a pipe write past 64 KiB blocks the thread
-    # outside the selector while git blocks on its full stdout, so no timeout fires.
+    # stdin is a file, not `input=`: with macOS's pipe pool spent, poll() calls a full pipe writable,
+    # communicate() blocks in os.write while git blocks on stdout, and timeout= never fires.
     try:
         with tempfile.TemporaryFile() as stdin:
             stdin.write(rels.encode("utf-8"))
@@ -2379,8 +2379,8 @@ def _index_growth_note(index: Path, effective_bytes: int,
             stamps.append((sha, int(at)))
         if not stamps:
             return _TREND_UNAVAILABLE
-        # stdin is a file, not `input=`: see `_carrier_target_verdict` for why a
-        # pipe write can block the thread past the timeout.
+        # Defensive: this stdin (<= 12 short specs) is too small to deadlock, but it stays
+        # off `input=` like `_carrier_target_verdict`, whose larger stdin can.
         with tempfile.TemporaryFile() as stdin:
             stdin.write("".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode())
             stdin.seek(0)
