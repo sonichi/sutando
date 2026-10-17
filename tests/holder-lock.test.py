@@ -7,6 +7,7 @@ Run: python3 tests/holder-lock.test.py
 """
 import ast
 import contextlib
+import stat
 import io
 import json
 import os
@@ -16,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -254,6 +256,43 @@ class HolderLockTest(unittest.TestCase):
                 self.acquire()
         self.assertEqual(str(e.exception), "root changed")
         self.assertIsNone(self.hl._OWNER)
+
+    def test_two_concurrent_acquires_in_one_process_let_exactly_one_proceed(self):
+        inside, go = threading.Event(), threading.Event()
+        real_statfs, real_open = self.hl._statfs_type, os.open
+        other = self.tmp / "other"
+        other.mkdir()
+        other_lock = str(self.ldir(other) / "lock")
+        opened = []
+
+        def statfs(path):
+            if not inside.is_set():
+                inside.set()
+                go.wait(10)
+            return real_statfs(path)
+
+        def spy_open(path, *a, **k):
+            opened.append(os.fspath(path))
+            return real_open(path, *a, **k)
+        results = {}
+
+        def run(name, root):
+            try:
+                results[name] = type(self.acquire(root)).__name__
+            except self.hl.LockError as e:
+                results[name] = "LockError: %s" % e
+        with mock.patch.object(self.hl, "_statfs_type", statfs), mock.patch.object(self.hl.os, "open", spy_open):
+            first = threading.Thread(target=run, args=("first", self.root))
+            first.start()
+            self.assertTrue(inside.wait(10), "the first acquire is past its owner check")
+            second = threading.Thread(target=run, args=("second", other))
+            second.start()
+            second.join(0.5)
+            go.set()
+            first.join(10)
+            second.join(10)
+        self.assertEqual(results, {"first": "Acquired", "second": "LockError: already owner"})
+        self.assertNotIn(other_lock, opened, "the second never touched its lock")
 
     def test_one_owner_per_process(self):
         owner = self.owned()
@@ -604,7 +643,10 @@ class HolderLockTest(unittest.TestCase):
         self.addCleanup(os.chdir, cwd)
         spellings = ["./w", "x/../w", "w/"]
         self.assertFalse(os.path.exists("w"))
+        before = set(os.listdir("."))
         self.hl.release(self.owned("x/../w"))
+        self.assertEqual(set(os.listdir(".")) - before, {"w"}, "only the root itself: no x/, no sibling")
+        self.assertEqual(os.listdir("w"), [], "and nothing under it")
         self.assertEqual(len({self.hl.lock_dir(s) for s in spellings}), 1)
         with self.flock_elsewhere("./w"):
             for s in spellings[1:]:
@@ -623,6 +665,99 @@ class HolderLockTest(unittest.TestCase):
         owner = self.owned(upper)
         self.hl.publish(owner, "routine")
         self.assertIsInstance(self.hl.read_holder(str(lower)), self.hl.Valid)
+
+    def test_a_fork_during_an_acquisition_waits_and_the_child_does_not_keep_the_lock(self):
+        code = ("import os, threading, time\n"
+                "paused, go = threading.Event(), threading.Event()\nreal = hl.start_time\n"
+                "def slow(pid):\n    paused.set()\n    go.wait(10)\n    return real(pid)\n"
+                "hl.start_time = slow\nresult = {}\n"
+                "t = threading.Thread(target=lambda: result.update(r=hl.acquire(%r, install_id='i')))\nt.start()\n"
+                "paused.wait(10)\n"
+                "threading.Timer(0.3, go.set).start()\n"
+                "child = os.fork()\n"
+                "if child == 0:\n    print('child', os.getpid(), flush=True)\n    time.sleep(30)\n    os._exit(0)\n"
+                "t.join(10)\nhl.start_time = real\nhl.publish(result['r'].owner, 'routine')\n"
+                "print('owner', os.getpid(), flush=True)\ntime.sleep(30)\n" % str(self.root))
+        owner = self.run_py(code)
+        self.addCleanup(lambda: (owner.kill(), owner.wait(WAIT)))
+        lines = dict(read_line(owner.stdout).split() for _ in range(2))
+        child_pid, owner_pid = int(lines["child"]), int(lines["owner"])
+        self.addCleanup(lambda: self.hl._pid_alive(child_pid) and os.kill(child_pid, signal.SIGKILL))
+        os.kill(owner_pid, signal.SIGKILL)
+        owner.wait(WAIT)
+        deadline = time.monotonic() + WAIT
+        while time.monotonic() < deadline and self.hl._pid_alive(owner_pid):
+            time.sleep(0.02)
+        self.assertTrue(self.hl._pid_alive(child_pid), "the child forked mid-acquire outlives the owner")
+        self.assertIsInstance(self.acquire(), self.hl.Acquired, "and does not keep the lock")
+
+    def test_a_forked_child_that_reuses_the_fd_number_never_has_it_closed_by_a_grandchild(self):
+        code = ("import os, sys\nr = hl.acquire(%r, install_id='i')\nhl.publish(r.owner, 'routine')\n"
+                "lock_fd = r.owner.fd\nchild = os.fork()\n"
+                "if child == 0:\n"
+                "    spare = os.open(os.devnull, os.O_RDONLY)\n    os.dup2(spare, lock_fd)\n    fd = lock_fd\n"
+                "    grand = os.fork()\n"
+                "    if grand == 0:\n"
+                "        try:\n            os.fstat(fd)\n            state = 'open'\n"
+                "        except OSError:\n            state = 'closed'\n"
+                "        print('reused', fd == lock_fd, state, flush=True)\n        os._exit(0)\n"
+                "    os.waitpid(grand, 0)\n    os._exit(0)\n"
+                "os.waitpid(child, 0)\nhl.release(r.owner)\n" % str(self.root))
+        proc = self.run_py(code)
+        self.addCleanup(lambda: (proc.kill(), proc.wait(WAIT)))
+        line = read_line(proc.stdout).split()
+        self.assertEqual(line, ["reused", "True", "open"], "the child's own fd, on the old number, survives")
+        proc.wait(WAIT)
+
+    def test_a_root_replaced_after_the_flock_check_is_refused_before_acquired(self):
+        self.root.mkdir()
+        real = self.hl._read_prior
+
+        def replace_root(d):
+            os.rename(self.root, self.tmp / "moved")
+            self.root.mkdir()
+            return real(d)
+        with mock.patch.object(self.hl, "_read_prior", replace_root):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.acquire()
+        self.assertEqual(str(e.exception), "root changed")
+        self.assertIsNone(self.hl._OWNER)
+        owner = self.owned()
+        os.rename(self.root, self.tmp / "moved-again")
+        self.root.mkdir()
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.publish(owner, "routine")
+        self.assertEqual(str(e.exception), "root changed", "publish checks the root it was acquired on")
+
+    def test_an_unencodable_string_is_invalid_on_read_and_refused_on_publish(self):
+        pid, start = self.dead()
+        raw = json.dumps(self.record(pid, start)).replace('"routine"', '"\\ud800"').encode()
+        self.assertIn(b"\\ud800", raw)
+        self.put(raw)
+        self.assertIsInstance(self.hl.read_holder(str(self.root)), self.hl.Invalid)
+        r = self.acquire()
+        self.assertIsInstance(r, self.hl.Acquired, "a dead pid in an invalid record: typed, never raised")
+        with self.assertRaises(self.hl.LockError):
+            self.hl.publish(r.owner, "\ud800")
+        self.assertEqual((self.ldir() / "holder").read_bytes(), raw, "nothing written")
+
+    def test_a_directory_fsync_failure_after_the_rename_is_published_with_durability_uncertain(self):
+        owner = self.owned()
+        real = os.fsync
+
+        def fail_on_a_directory(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(5, "I/O error")
+            return real(fd)
+        with mock.patch.object(self.hl.os, "fsync", fail_on_a_directory), \
+                self.assertLogs(self.hl._LOG, level="WARNING") as logs:
+            got = self.hl.publish(owner, "routine")
+        self.assertEqual((type(got).__name__, got.durable), ("Published", False))
+        self.assertTrue(owner.published)
+        self.assertEqual(self.hl.read_holder(str(self.root)), self.hl.Valid(got.record))
+        self.assertIn("durability is uncertain", logs.output[0])
+        with self.assertRaises(self.hl.LockError):
+            self.hl.publish(owner, "routine")
 
     def test_a_forked_child_holds_no_lock_fd_and_the_lock_is_free_once_the_owner_dies(self):
         code = ("import os, sys, time\n"
