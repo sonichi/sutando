@@ -462,6 +462,11 @@ def _pending_gather() -> dict:
     return pending_questions_reader.gather(WORKSPACE_DIR, _pending_store())
 
 
+def _pending_gather_polled() -> dict:
+    """`_pending_gather` for a route clients poll every few seconds: the reader's reused gather."""
+    return pending_questions_reader.gather_recent(WORKSPACE_DIR, _pending_store())
+
+
 def _questions_unavailable(g: dict) -> Optional[str]:
     return (g["reason"] or "room unreachable") if g["unavailable"] else None
 
@@ -556,7 +561,7 @@ def dismiss_question(qid: str) -> tuple:
 
 def _active_tasks_payload(watcher_ok: Optional[bool], core_ok: bool) -> dict:
     """Build the stable response payload for GET /tasks/active."""
-    g = _pending_gather()
+    g = _pending_gather_polled()
     return {
         "tasks": _active_task_rows(),
         "watcher": watcher_ok,

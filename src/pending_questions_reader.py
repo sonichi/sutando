@@ -13,6 +13,11 @@ what the adapter holds locally, lists or counts is the adapter's to say. `waitin
 `resolve` are the thin views every core reader uses; a read never reconciles (`reconcile_pass`
 does, on demand; the two are the adapter's separate entry points). Never read any file for this.
 
+`gather_recent` / `count_recent` are for pollers (the web client's 3 s task poll, the dashboard's
+15 s reload): each fresh gather opens a socket to the room, so a poller reuses one no older than
+POLL_REUSE_SEC, concurrent callers share one in-flight read, and a `resolve` or `reconcile_pass`
+through this module drops what it held. One-shot readers keep calling `gather`.
+
 `resolve` closes through the adapter; with no adapter, or an adapter that raises, it returns
 (False, why) and records nothing — the caller keeps the answer it holds (agent-api files the
 answer task before it asks for the close).
@@ -25,6 +30,7 @@ injects an adapter file in place of the declared one.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import sys
@@ -146,6 +152,49 @@ def gather(workspace, adapter=None) -> dict:
     return g
 
 
+# How long a poller reuses a gather; a question filed by another process shows up within it.
+POLL_REUSE_SEC = 60.0
+_RECENT: dict = {}
+_RECENT_LOCKS: dict = {}
+_FORGOTTEN: dict = {}
+_RECENT_GUARD = threading.Lock()
+_now = time.monotonic
+
+
+def _recent_key(workspace, resolved: Resolved) -> tuple:
+    return str(Path(workspace).resolve()), str(resolved.reason)
+
+
+def gather_recent(workspace, adapter=None, max_age: float = POLL_REUSE_SEC) -> dict:
+    """`gather`, reused while no older than `max_age` seconds; callers that arrive during a read
+    wait for it instead of starting their own."""
+    r = resolve_adapter(adapter)
+    key = _recent_key(workspace, r)
+    with _RECENT_GUARD:
+        lock = _RECENT_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        with _RECENT_GUARD:
+            generation = _FORGOTTEN.get(key[0], 0)
+            hit = _RECENT.get(key)
+        if hit is not None and 0 <= _now() - hit[0] < max_age:
+            return copy.deepcopy(hit[1])
+        started = _now()
+        g = gather(workspace, r)
+        with _RECENT_GUARD:
+            if _FORGOTTEN.get(key[0], 0) == generation:  # a write during the read makes it stale
+                _RECENT[key] = (started, g)
+        return copy.deepcopy(g)
+
+
+def forget_recent(workspace) -> None:
+    """Drop every reused gather of `workspace`: a write through this module has changed the rows."""
+    ws = str(Path(workspace).resolve())
+    with _RECENT_GUARD:
+        _FORGOTTEN[ws] = _FORGOTTEN.get(ws, 0) + 1
+        for key in [k for k in _RECENT if k[0] == ws]:
+            del _RECENT[key]
+
+
 def waiting(workspace, adapter=None) -> list:
     return gather(workspace, adapter)["waiting"]
 
@@ -153,7 +202,15 @@ def waiting(workspace, adapter=None) -> list:
 def count(workspace, adapter=None) -> dict:
     """{"open": n | None, "done": n | None, "pending_close": n, "unavailable", "reason"}; None is
     unknown, never 0."""
-    g = gather(workspace, adapter)
+    return _count_of(gather(workspace, adapter))
+
+
+def count_recent(workspace, adapter=None, max_age: float = POLL_REUSE_SEC) -> dict:
+    """`count` over `gather_recent`, for pollers."""
+    return _count_of(gather_recent(workspace, adapter, max_age))
+
+
+def _count_of(g: dict) -> dict:
     return {"open": None if g["unavailable"] else len(g["waiting"]), "done": g["done"],
             "pending_close": len(g["pending_close"]), "unavailable": g["unavailable"], "reason": g["reason"]}
 
@@ -167,6 +224,8 @@ def reconcile_pass(workspace, adapter=None) -> dict:
         return mod.reconcile_pass(Path(workspace))
     except Exception as e:  # noqa: BLE001
         return {"flushed": [], "moved": [], "closed": [], "errors": [f"adapter failed: {type(e).__name__}: {e}"]}
+    finally:
+        forget_recent(workspace)
 
 
 def reconcile_then_gather(workspace, adapter=None) -> dict:
@@ -189,6 +248,8 @@ def resolve(workspace, ask_id: str, status: str, adapter=None) -> tuple:
         return mod.resolve(Path(workspace), ask_id, status)
     except Exception as e:  # noqa: BLE001
         return False, f"not closed: adapter failed ({type(e).__name__}: {e}); nothing records the close"
+    finally:
+        forget_recent(workspace)
 
 
 def _norm_title(text: str) -> str:
