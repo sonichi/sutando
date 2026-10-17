@@ -546,7 +546,10 @@ A result posted under the id of a task whose `ack_first` mark is kept (see
 `GET /v1/tasks`), a re-ask's answer included, has no window and no attempt cap:
 it is retried, durably across restarts, under the same id and payload, until the
 broker accepts it, or refuses for good both the answer and the `failed` sent in
-its place (below).
+its place (below). The accept is final for it: the broker posts a relay ask's
+outcome to the room itself, with its own dead letter, so the bridge never reads
+`GET /v1/results/<id>/delivery` for a relay result. Every other result keeps
+that read.
 
 - A 401 or 403 is retried while the poll loop recovers the credential, as above,
   for as long as that takes.

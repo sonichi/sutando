@@ -5711,9 +5711,11 @@ def _delivery_core(lane: str = "result") -> DeliveryCore:
     current = _WITHHELD_OUTBOX if withheld else _RELAY_CORE if relay else _DELIVERY_CORE
     if current is None or current.backend.root != root:
         # Late-bound senders, so token rotation and a test's _req double reach them mid-process.
+        # A relay result's room send is the broker's, with its own dead letter: its accept is
+        # final here, or a send the broker dead-letters would be retried with no ceiling.
         provider = (AG2SpaceRoomMessageProvider(lambda *a: _post_room_message(*a),
                                                 lambda *a: _record_release_receipt(*a)) if withheld
-                    else AG2SpaceResultProvider(lambda *a, **k: _req(*a, **k)))
+                    else AG2SpaceResultProvider(lambda *a, **k: _req(*a, **k), read_back=not relay))
         current = DeliveryCore(
             DesignAClaimBackend(root, retry_schedule=_RELAY_RETRY if relay else RetrySchedule(),
                                 republish_delivered=False,

@@ -13,7 +13,10 @@ is a refusal (the message never reached the room), and anything else — still
 sending, no delivery state, an unreadable answer — stays CONFIRMED on the
 accept with provider_ref ``accepted``/``duplicate``: recorded, delivery
 unconfirmed. An accept without the flag (an older broker) is exactly that,
-with no read at all.
+with no read at all. A provider built with ``read_back=False`` reads nothing
+either: the lane that builds it owns the send downstream (a relay ask's
+result, posted to the room by the broker with its own dead letter), so the
+accept is final for it.
 
 idempotent_send is licensed by the gateway's rid-keyed done-window dedup,
 live-verified on prod 2026-08-18: re-POSTing an already-recorded result id
@@ -66,8 +69,10 @@ class AG2SpaceResultProvider:
 
     def __init__(self, request: Callable[..., dict], *,
                  confirm_waits=CONFIRM_WAITS,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 read_back: bool = True):
         self._request = request
+        self.read_back = read_back
         self._confirm_waits = tuple(confirm_waits)
         self._sleep = sleep
         # rid -> reason for each readable send failure seen here, newest last, capped:
@@ -120,10 +125,12 @@ class AG2SpaceResultProvider:
         if resp.get("ok") is False or resp.get("error") or resp.get("errcode"):
             raise ProviderPermanentRefused(f"gateway declined {item_id}: {str(resp)[:200]}")
         ref = "duplicate" if resp.get("duplicate") else "accepted"
-        if envelope.get("no_send") or not resp.get("delivery_readable"):
+        if envelope.get("no_send") or not self.read_back or not resp.get("delivery_readable"):
             return DeliveryReceipt(
                 outcome=DeliveryOutcome.CONFIRMED, provider_ref=ref,
                 detail="no_send" if envelope.get("no_send")
+                else "delivery unconfirmed (this lane takes the accept as final)"
+                if not self.read_back
                 else "delivery unconfirmed (broker exposes no delivery read)")
         rid = str(envelope["id"])
         st = self._settled(rid)

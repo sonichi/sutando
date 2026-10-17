@@ -64,6 +64,7 @@ UNVERIFIED = ("⚠️ The holder's delivery destination or sender could not be v
 PRIVATE, TEXT = "[dm-only]\nYour 3pm is with Dana.", "Your 3pm is with Dana."
 ANSWER = {"id": ASK_A, "body": TEXT, "capabilities": CONTRACT, "dm_only": True}
 FAILED = {"id": ASK_A, "body": "", "status": "failed", "capabilities": CONTRACT, "dm_only": False}
+DEAD = {"status": "dead", "reason": "send-failed:M_FORBIDDEN", "terminal": True}
 DAY = 86400.0
 
 _LEDGERS = {"INFLIGHT_FILE": "remote-task-inflight", "TASK_ROOMS_FILE": "remote-task-rooms",
@@ -110,6 +111,8 @@ class _Broker:
     def __init__(self):
         self.calls: "list[tuple]" = []
         self.result = "ok"
+        self.delivery: "dict | None" = None        # every result's delivery state, when readable
+        self.delivery_reads = 0
 
     def request(self, method, path, payload=None, **_kw):
         payload = None if payload is None else json.loads(json.dumps(payload))
@@ -122,6 +125,10 @@ class _Broker:
                 raise refused(int(answer))
         if path == "/v1/agents":
             return {"agents": []}
+        if path.startswith("/v1/results/") and path.endswith("/delivery"):
+            self.delivery_reads += 1
+            if self.delivery is not None:
+                return dict(self.delivery)
         return {"ok": True, "delivery_readable": True, "durable": True}
 
     def results(self) -> "list[dict]":
@@ -442,6 +449,25 @@ class TheRule(_Bridge):
         gw._delivery_core("relay").backend.clock = lambda: time.time() + 60.0
         self.drain()
         self.assertEqual(self.broker.results(), [ANSWER] * 3)
+
+    def test_the_brokers_accept_is_final_its_room_send_is_the_brokers(self):
+        # The broker posts a relay ask's outcome itself, dead letter included; read back
+        # here, a send it dead-letters would be a refusal retried with no ceiling.
+        self.broker.delivery = DEAD
+        ask = self.serve(voice_ask())
+        self.answer(ask)
+        self.assertNotIn(ask, self.drain())
+        self.assertEqual(item(self.outbox_root, ASK_A)["status"], "DELIVERED")
+        self.assertEqual(self.broker.delivery_reads, 0, "the relay lane read the delivery")
+        self.assertEqual(gw._load_ack_first(), {})
+        self.assertIs(gw._delivery_core("relay").provider.read_back, False)
+        self.assertIs(gw._delivery_core().provider.read_back, True, "today's lane lost its read")
+        # The same answer under today's policy is the refusal it is meant to be.
+        typed = self.serve(typed_task())
+        self.answer(typed, TEXT)
+        self.assertIn(typed, self.drain())
+        self.assertEqual(self.broker.delivery_reads, 1)
+        self.assertNotEqual(item(self.outbox_root, TYPED_A)["status"], "DELIVERED")
 
 
 for _answer in ("408", "425", "429", "502", "down"):
@@ -854,6 +880,12 @@ class WithdrawnAccess(_Bridge):
         self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
         self.assertEqual(self.broker.results(), [FAILED])
         self.assertEqual((gw._load_held(), gw._load_ack_first()), ({}, {}))
+
+    def test_a_failed_the_broker_dead_letters_still_ends_it(self):
+        self.broker.delivery = DEAD
+        self.withheld_on_a_drop(age=700.0)
+        self.assert_ended()
+        self.assertEqual((self.broker.results(), self.broker.delivery_reads), ([FAILED], 0))
 
     def test_an_end_whose_steps_cannot_complete_waits_for_the_next_pass(self):
         staged = self.withheld_on_a_drop()
