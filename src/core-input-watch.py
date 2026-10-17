@@ -122,8 +122,8 @@ from delivery.pane_gate import (  # noqa: E402
     ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
     COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, TURN_DONE, TURN_SHORT,
     classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, gate_evidence,
-    limit_banner, limit_baseline, limit_is_stale, prompt_line as _pg_prompt_line, refusal_line,
-    strip_limit_banners,
+    limit_banner, limit_baseline, limit_is_stale, live_tail, prompt_line as _pg_prompt_line,
+    refusal_line, strip_limit_banners,
 )
 
 _FABLE_TEXT = FABLE_TEXT
@@ -199,9 +199,11 @@ def classify(pane: str, styled_pane: "str | None" = None):
 
     `styled_pane` supplies placeholder evidence to the shared filter. It must be
     the SAME capture as `pane` (e.g. `pane = _ANSI_SGR.sub("", styled_pane)`),
-    so stripping never shifts a line out of the window the two share."""
+    so stripping never shifts a line out of the window the two share.
+    Only rows below the last turn spinner / completion line are read (pane_gate.live_tail)."""
     plain_lines = pane.splitlines()
     kept = [i for i, ln in enumerate(plain_lines) if ln.strip()][-14:]
+    kept = kept[len(kept) - len(live_tail([plain_lines[i] for i in kept])):]
     tail = "\n".join(plain_lines[i] for i in kept)
     styled_lines = styled_pane.splitlines() if styled_pane is not None else None
     styled_tail = ("\n".join(styled_lines[i] for i in kept)

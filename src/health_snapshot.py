@@ -341,7 +341,8 @@ def _workers(ws: Path):
         row = row if isinstance(row, dict) else {}
         if row.get("state") == "retired":
             continue
-        label = row.get("label")
+        # The name people see: the display label the pool applies, else the base label.
+        label = row.get("display_label") or row.get("label")
         out.append((wid, label if isinstance(label, str) and label != wid else None, row.get("state")))
     return out
 

@@ -90,8 +90,8 @@ class HermeticSpawnTest(unittest.TestCase):
 
 
 class ResumeRuntimeSelection(HermeticSpawnTest):
-    def seed_claude(self, runner):
-        return sw.spawn(self.ws, self.repo, runtime="claude", cwd=str(self.repo),
+    def seed_claude(self, runner, cwd=None):
+        return sw.spawn(self.ws, self.repo, runtime="claude", cwd=str(cwd or self.repo),
                         runner=runner, require_sentinel=False)
 
     def snapshot(self):
@@ -100,30 +100,77 @@ class ResumeRuntimeSelection(HermeticSpawnTest):
 
     def test_resume_uses_recorded_runtime_and_preserves_identity_under_codex_core(self):
         t = FakeTmux(runtime="codex")
-        first = self.seed_claude(t)
+        project, later = self.ws / "project", self.ws / "later-project"
+        project.mkdir()
+        later.mkdir()
+        first = self.seed_claude(t, cwd=project)
         wid, sid = first["worker_id"], first["runtime_session_id"]
         sw.pr.register_worker(self.ws, wid, "Mars-the-product-dev", runtime="claude")
         inbox_entry = Path(first["delivery_dir"]) / "pending-delivery"
         inbox_entry.write_text("pending")
+        wi.record_session(self.ws, wid, "later-session", runtime="claude",
+                          relation=wi.RELATION_NEW, cwd=str(later))
         lineage = wi.sessions(self.ws, wid)
         t.existing.clear()
 
-        again = sw.spawn(self.ws, self.repo, resume=sid, cwd=str(self.repo),
+        again = sw.spawn(self.ws, self.repo, resume=sid,
                          runner=t, require_sentinel=False)
 
         self.assertEqual(again["runtime"], "claude")
+        self.assertEqual(again["cwd"], str(project))
         self.assertEqual(again["worker_id"], wid)
         self.assertEqual(again["runtime_session_id"], sid)
         self.assertEqual(again["label"], "Mars-the-product-dev")
         self.assertEqual(again["delivery_dir"], first["delivery_dir"])
         self.assertEqual(inbox_entry.read_text(), "pending")
         self.assertEqual(t.launches()[-1]["SUTANDO_WORKER_RUNTIME"], "claude")
+        self.assertEqual(t.launches()[-1]["SUTANDO_CLAUDE_WORKING_DIR"], str(project))
+        self.assertEqual(t.launches()[-1]["SUTANDO_TASKS_DIR"], first["delivery_dir"])
         self.assertEqual(t.launches()[-1]["SUTANDO_CLAUDE_RESUME"], sid)
         self.assertFalse(t.launches()[-1].get("SUTANDO_CLAUDE_SESSION_ID"))
         self.assertEqual(wi.sessions(self.ws, wid), lineage)
-        self.assertEqual(len(lineage), 1)
+        self.assertEqual(len(lineage), 2)
         self.assertEqual(len(wi.incarnations(self.ws, wid)), 2)
         self.assertEqual([p.name for p in (self.ws / "state/workers").iterdir()], [wid])
+
+    def test_explicit_runtime_still_uses_the_recorded_folder(self):
+        t = FakeTmux(runtime="codex")
+        project = self.ws / "project"
+        project.mkdir()
+        first = self.seed_claude(t, cwd=project)
+        t.existing.clear()
+
+        again = sw.spawn(self.ws, self.repo, runtime="claude",
+                         resume=first["runtime_session_id"], runner=t,
+                         require_sentinel=False)
+
+        self.assertEqual(again["cwd"], str(project))
+        self.assertEqual(t.launches()[-1]["SUTANDO_CLAUDE_WORKING_DIR"], str(project))
+
+    def test_explicit_folder_overrides_the_recorded_folder(self):
+        t = FakeTmux(runtime="codex")
+        project, override = self.ws / "project", self.ws / "override"
+        project.mkdir()
+        override.mkdir()
+        first = self.seed_claude(t, cwd=project)
+        t.existing.clear()
+
+        again = sw.spawn(self.ws, self.repo, resume=first["runtime_session_id"],
+                         cwd=str(override), runner=t, require_sentinel=False)
+
+        self.assertEqual(again["cwd"], str(override))
+        self.assertEqual(t.launches()[-1]["SUTANDO_CLAUDE_WORKING_DIR"], str(override))
+
+    def test_empty_legacy_folder_falls_back_to_the_repository(self):
+        t = FakeTmux(runtime="codex")
+        legacy = wi.create_worker(self.ws, runtime="claude", cwd="",
+                                  session_id="legacy-session")
+
+        again = sw.spawn(self.ws, self.repo, resume=legacy["runtime_session_id"],
+                         runner=t, require_sentinel=False)
+
+        self.assertEqual(again["cwd"], str(self.repo))
+        self.assertEqual(t.launches()[-1]["SUTANDO_CLAUDE_WORKING_DIR"], str(self.repo))
 
     def test_runtime_comes_from_the_requested_session_not_the_latest_session(self):
         t = FakeTmux(runtime="codex")
@@ -156,9 +203,11 @@ class ResumeRuntimeSelection(HermeticSpawnTest):
             fresh = sw.spawn(self.ws, self.repo, runner=t, require_sentinel=False)
 
         self.assertEqual(fresh["runtime"], "codex")
+        self.assertEqual(fresh["cwd"], str(self.repo))
         self.assertNotEqual(fresh["worker_id"], first["worker_id"])
         self.assertIsNone(fresh["runtime_session_id"])
         self.assertEqual(t.launches()[-1]["SUTANDO_WORKER_RUNTIME"], "codex")
+        self.assertEqual(t.launches()[-1]["SUTANDO_CODEX_WORKING_DIR"], str(self.repo))
         self.assertFalse(t.launches()[-1].get("SUTANDO_CLAUDE_RESUME"))
         self.assertFalse(t.launches()[-1].get("SUTANDO_CLAUDE_SESSION_ID"))
 

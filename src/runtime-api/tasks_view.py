@@ -276,8 +276,8 @@ class TasksView:
         return None
 
     def _result_files(self) -> "list[tuple[Path, int]]":
-        """(path, mtime) newest first, for `task-rtapi-` results only — source
-        isolation: other sources' results must not leak into this channel.
+        """(path, integer seconds), newest first by full filesystem precision.
+        Only `task-rtapi-` results: other sources must not leak into this channel.
 
         Returns the mtime it already read rather than letting callers stat
         again: archival unlinks a live name, so a second stat can raise on a
@@ -293,9 +293,9 @@ class TasksView:
             except FileNotFoundError:
                 continue  # archived mid-scan — absent, not an error
             if stat_module.S_ISREG(st.st_mode):
-                found.append((f, int(st.st_mtime)))
-        found.sort(key=lambda pair: pair[1], reverse=True)
-        return found
+                found.append((f, int(st.st_mtime), st.st_mtime_ns))
+        found.sort(key=lambda entry: entry[2], reverse=True)
+        return [(path, ts) for path, ts, _ns in found]
 
     # ── task.list_results ────────────────────────────────────────────────────
     def list_results(self, limit: int = 50) -> dict:
