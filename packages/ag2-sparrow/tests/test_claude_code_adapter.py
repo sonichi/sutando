@@ -24,10 +24,11 @@ sys.path.insert(0, str(PKG))
 from ag2_sparrow.local_task_protocol import parse_task_headers  # noqa: E402
 from ag2_sparrow.team_result_guard import resolve_access_tier  # noqa: E402
 
+from ag2_sparrow import task_io  # noqa: E402
+
 ADAPTER = PKG / "adapters" / "claude-code"
 MOD = ADAPTER / "ag2space-inbox"
 REGISTER = MOD / "hooks" / "register.ts"
-HATCH = PKG / "ag2_sparrow" / "adapters" / "hatch" / "ag2-sparrow-hatch.sh"
 SRC = PKG.parents[1] / "src"
 HOST_PATH_RE = re.compile(r"/Users/|/home/[a-z]|/private/tmp|~/\.claude|~/\.sutando")
 STAMP = "envelope_hmac: v1:"
@@ -72,11 +73,10 @@ class PluginShape(unittest.TestCase):
     def test_mod_tests_exist_for_the_claude_harness(self):
         self.assertTrue(list((MOD / "tests").glob("*.test.ts")))
 
-    def test_pinned_non_owner_note_is_the_hatch_adapters(self):
-        hatch = re.search(r"^NON_OWNER_NOTE='(.*)'$", HATCH.read_text(), re.M).group(1).replace("'\"'\"'", "'")
-        mod = re.search(r"^const NON_OWNER_NOTE_FALLBACK = `(.*)`$", REGISTER.read_text(), re.M).group(1)
-        self.assertEqual(mod, hatch)
-        self.assertIn("ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh", REGISTER.read_text())
+    def test_pinned_non_owner_note_is_the_shared_owners(self):
+        mod = re.search(r"^const NON_OWNER_NOTE = `(.*)`$", REGISTER.read_text(), re.M).group(1)
+        self.assertEqual(mod, task_io.NON_OWNER_NOTE)
+        self.assertNotIn("adapters/hatch", REGISTER.read_text())
 
 
 class VerifierMirrorsSparrow(unittest.TestCase):
