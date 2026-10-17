@@ -10,6 +10,7 @@ fails quickly. Run:
 """
 import atexit
 import contextlib
+import importlib.util
 import io
 import os
 import select
@@ -267,6 +268,15 @@ class InterlockTest(unittest.TestCase):
         self.assertIn("refusing to start: %s is held by %s pid %d on " % (self.work, held_by[0], held_by[1]), err)
         self.assertEqual(holder(self.work), held_by, "nobody took it over")
 
+    def serving(self, kind):
+        """Start an adapter and wait until its serve loop runs its first stop check: every startup
+        step (directories, probes, first init) is over by then."""
+        log = self.base / ("%s.ready" % kind)
+        started = self.start(kind, SPY % str(log))
+        wait_for(lambda: log.exists() and "check 0" in [w for w, _ in spied(log)],
+                 "the %s serve loop to start" % kind)
+        return started
+
     def test_cloud_first_then_routine_then_codex_refuse(self):
         _, held_by = self.start("cloud")
         self.assertEqual(held_by[0], "claude-cloud-session")
@@ -275,18 +285,14 @@ class InterlockTest(unittest.TestCase):
         self.assert_refused_at_the_flock(self.cloud_main(), held_by)
 
     def test_routine_first_then_cloud_refuses_at_the_flock(self):
-        _, held_by = self.start("routine")
-        wait_for(lambda: all((self.work / d).is_dir() for d in ("tasks", "results", "state")), "the work dirs")
+        _, held_by = self.serving("routine")
         before = sorted(os.listdir(self.work))
         self.assert_refused_at_the_flock(self.cloud_main(), held_by)
         self.assertEqual(sorted(os.listdir(self.work)), before, "the refused adapter created nothing")
 
     def test_the_cloud_holds_the_flock_and_a_routine_refuses_at_it(self):
-        _, held_by = self.start("cloud")
-        state = self.work / "state"
-        wait_for(lambda: (state / "format").exists() and not any(n.startswith(".format.") for n in os.listdir(state)),
-                 "the first init to finish")
-        before = sorted(os.listdir(state))
+        _, held_by = self.serving("cloud")
+        before = sorted(os.listdir(self.work / "state"))
         self.assert_refused_at_the_flock(self.routine_main(), held_by)
         self.assertEqual(sorted(os.listdir(self.work / "state")), before, "the refused routine wrote nothing")
 
@@ -563,11 +569,16 @@ class TaskIoBranchTest(unittest.TestCase):
             write(text)
             self.assertIn("not a dead adapter's pidfile", task_io.clear_attributed_pidfile(owner, str(self.work)))
             self.assertTrue(pidfile.exists())
+        # The module's own start line runs under a frozen clock, so what it stores is what is compared.
+        spec = importlib.util.spec_from_file_location("ag2_sparrow._task_io_frozen", task_io.__file__)
+        fresh = importlib.util.module_from_spec(spec)
+        with mock.patch.object(time, "time", return_value=1000.9):
+            spec.loader.exec_module(fresh)
+        self.assertEqual(fresh._started_at(), 1000.9)
         for mtime, removed in ((1000.899, True), (1000.901, False)):
             write("%d\n" % dead.pid)
             os.utime(pidfile, (mtime, mtime))
-            with mock.patch.object(task_io, "_PROCESS_STARTED_AT", 1000.9):
-                got = task_io.clear_attributed_pidfile(owner, str(self.work))
+            got = fresh.clear_attributed_pidfile(owner, str(self.work))
             self.assertEqual((got is None, pidfile.exists()), (removed, not removed),
                              "mtime %.3f, start 1000.900 (same whole second)" % mtime)
         write("%d\n" % dead.pid)
