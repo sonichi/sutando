@@ -2,12 +2,14 @@
 """A stub holder_lock caller for the first-act contract: acquire, publish, then act on the root.
 
     holder_lock_stub.py --module src|vendored --work ROOT [--spawn-before-publish] [--by-path]
+                        [--release-in-handler]
 
 Prints one line: `acquired`, or the refusal's class and reason; exits 0, 3 on a refusal, 2 on a
 LockError. While holding it waits for stdin to close, then releases.
 """
 import argparse
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +33,8 @@ def main(argv=None):
     ap.add_argument("--work", required=True)
     ap.add_argument("--spawn-before-publish", action="store_true")
     ap.add_argument("--by-path", action="store_true", help="a faulty first act by pathname")
+    ap.add_argument("--release-in-handler", action="store_true",
+                    help="a faulty SIGTERM handler that calls release instead of setting a flag")
     args = ap.parse_args(argv)
     hl = load(args.module)
     try:
@@ -47,12 +51,26 @@ def main(argv=None):
     if args.by_path:
         os.makedirs(os.path.join(args.work, "state"), exist_ok=True)
     else:
-        os.mkdir("state", 0o755, dir_fd=result.owner.root_fd)
+        try:
+            os.mkdir("state", 0o755, dir_fd=result.owner.root_fd)
+        except FileExistsError:
+            pass
     subprocess.run(["true"], check=True)
+    if args.release_in_handler:
+        signal.signal(signal.SIGTERM, lambda *_: hl.release(result.owner))
+    else:
+        signal.signal(signal.SIGTERM, _stop)
     print("acquired", flush=True)
-    sys.stdin.read()
-    hl.release(result.owner)
+    try:
+        sys.stdin.read()
+    finally:
+        hl.release(result.owner)
     return 0
+
+
+def _stop(signum, frame):
+    """Sets the flag only (here: unwinds to main's finally, which releases)."""
+    raise SystemExit(128 + signum)
 
 
 if __name__ == "__main__":

@@ -7,11 +7,13 @@ Run: python3 tests/holder-lock.test.py
 """
 import ast
 import contextlib
+import copy
 import dataclasses
 import stat
 import io
 import json
 import os
+import pickle
 import select
 import shutil
 import signal
@@ -59,10 +61,30 @@ PKG_READMES = [REPO / "packages" / "ag2-sparrow" / "README.md",
                REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "adapters" / "codex" / "README.md"]
 
 
-def read_line(stream, timeout=WAIT):
-    if not select.select([stream], [], [], timeout)[0]:
-        raise AssertionError("no line within %.0fs" % timeout)
-    return stream.readline().strip()
+_PENDING = {}
+
+
+def read_line(stream, timeout=WAIT, default=AssertionError):
+    """One line from a child's pipe, read with os.read on the raw fd into a per-fd buffer, so two
+    lines arriving in one read are both kept. After `timeout`: raise, or return `default`."""
+    fd = stream.fileno()
+    buf = _PENDING.get(fd, b"")
+    deadline = time.monotonic() + timeout
+    while b"\n" not in buf:
+        left = deadline - time.monotonic()
+        if left <= 0 or not select.select([fd], [], [], left)[0]:
+            _PENDING[fd] = buf
+            if default is AssertionError:
+                raise AssertionError("no line within %.0fs" % timeout)
+            return default
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            _PENDING[fd] = b""
+            return buf.decode().strip()
+        buf += chunk
+    line, _, rest = buf.partition(b"\n")
+    _PENDING[fd] = rest
+    return line.decode().strip()
 
 
 @unittest.skipUnless(POSIX, "holder_lock is POSIX-only; the Windows job runs only the platform case")
@@ -588,6 +610,12 @@ class HolderLockTest(unittest.TestCase):
                     with self.assertRaises(self.hl.LockError) as e:
                         call()
                     self.assertEqual(str(e.exception), "unsupported platform: holder_lock is POSIX-only")
+        self.real_home()
+        with mock.patch.object(self.hl, "pwd", None):
+            for name, call in {"read_holder": lambda: self.hl.read_holder(str(self.tmp)),
+                               "lock_dir": lambda: self.hl.lock_dir(str(self.tmp))}.items():
+                with self.subTest(helper=name), self.assertRaises(self.hl.LockError):
+                    call()
         self.assertFalse(self.root.exists(), "nothing created")
 
     # ── §2 the record ──
@@ -845,7 +873,7 @@ class HolderLockTest(unittest.TestCase):
         result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(
             unittest.defaultTestLoader.loadTestsFromTestCase(self.stub_contract()))
         self.assertTrue(result.wasSuccessful(), [str(e[1])[-400:] for e in result.failures + result.errors])
-        self.assertEqual(result.testsRun, 6)
+        self.assertEqual(result.testsRun, 7)
 
     def test_the_first_act_contract_pins_publish_before_any_child_is_spawned(self):
         self.real_home()
@@ -863,6 +891,15 @@ class HolderLockTest(unittest.TestCase):
         result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(case)
         self.assertEqual(len(result.failures), 1, "a first act by pathname fails the contract")
         self.assertIn("nothing on the new directory at the path", result.failures[0][1])
+
+    def test_the_first_act_contract_pins_no_holder_lock_call_in_a_signal_handler(self):
+        """A caller whose SIGTERM handler calls release (instead of setting a flag for its main loop)
+        never ends on SIGTERM, and the contract fails it."""
+        self.real_home()
+        case = self.stub_contract("--release-in-handler")("test_first_act_sigterm_ends_the_caller_and_frees_the_lock")
+        result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(case)
+        self.assertEqual(len(result.failures), 1, "a handler that calls holder_lock fails the contract")
+        self.assertIn("did not end on SIGTERM", result.failures[0][1])
 
     def stub_contract(self, *extra):
         kind, mod = self.kind, self.hl
@@ -1298,10 +1335,9 @@ class HolderLockTest(unittest.TestCase):
                 self.addCleanup(lambda o=owner: (o.kill(), o.wait(WAIT)))
                 _, pid = read_line(owner.stdout).split()
                 children = []
-                if select.select([owner.stdout], [], [], 1.0)[0]:
-                    line = owner.stdout.readline().split()
-                    if line and line[0] == "child":
-                        children.append(int(line[1]))
+                line = (read_line(owner.stdout, 1.0, default="") or "").split()
+                if line and line[0] == "child":
+                    children.append(int(line[1]))
                 for child in children:
                     self.addCleanup(lambda c=child: self.hl._pid_alive(c) and os.kill(c, signal.SIGKILL))
                 os.kill(int(pid), signal.SIGKILL)
@@ -1419,6 +1455,9 @@ class HolderLockTest(unittest.TestCase):
         self.assertEqual(results, ["LockError: released"])
         os.fstat(lock_n)
         os.fstat(root_n)
+        again = self.owned()
+        self.hl.publish(again, "routine")
+        self.race_two_releases_inside_the_critical_section(again)
 
     def test_a_released_handle_cannot_publish_over_its_replacements_record(self):
         """Review schedule: "release completed, a replacement owner naturally reused the fd numbers
@@ -1486,12 +1525,11 @@ class HolderLockTest(unittest.TestCase):
         self.assertEqual(r, self.hl.Contended(self.hl.Valid(json.loads(data))))
 
     def test_containment_edges_and_a_handle_whose_fd_is_no_longer_the_lock(self):
-        self.assertTrue(self.hl._within(str(self.tmp / "anything"), os.stat(os.sep)), "the root is /")
-        (self.tmp / "real").mkdir()
-        os.symlink(self.tmp / "real", self.tmp / "link")
-        with mock.patch.object(self.hl.os.path, "realpath", lambda p: p):
-            self.assertTrue(self.hl._within(str(self.tmp / "link" / "x"), os.stat(self.tmp / "real")),
-                            "a component that is a link when walked counts as inside")
+        top = os.stat(os.sep)
+        fd = os.open(str(self.tmp), os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        self.assertTrue(self.hl._fd_within(fd, (top.st_dev, top.st_ino)), "everything lies under /")
+        self.assertFalse(self.hl._fd_within(fd, (0, 0)), "and under no other directory that is not an ancestor")
         owner = self.owned()
         null = os.open(os.devnull, os.O_RDONLY)
         os.dup2(null, owner.fd)
@@ -1512,8 +1550,220 @@ class HolderLockTest(unittest.TestCase):
         self.assertFalse((self.ldir() / "holder").exists(), "nothing published")
         self.assertEqual(len([n for n in os.listdir(self.ldir()) if n.startswith(".holder.")]), 1,
                          "the stated residual: one temp")
+        real_unlink = os.unlink
+
+        def unlink_all_but_the_temp(p, *a, **k):
+            if os.path.basename(os.fspath(p)).startswith(".holder."):
+                raise OSError(1, "not permitted")
+            return real_unlink(p, *a, **k)
+        with mock.patch.object(self.hl.os, "unlink", unlink_all_but_the_temp), \
+                self.assertLogs(self.hl._LOG, level="WARNING") as logs:
+            self.assertTrue(self.hl.publish(owner, "routine").durable, "a stuck temp does not fail publish")
+        self.assertIn("could not be removed", logs.output[0])
+        self.assertEqual(len([n for n in os.listdir(self.ldir()) if n.startswith(".holder.")]), 1,
+                         "while removing it keeps failing, it stays")
+        self.hl.release(owner)
+        self.hl.publish(self.owned(), "routine")
+        self.assertEqual([n for n in os.listdir(self.ldir()) if n.startswith(".holder.")], [],
+                         "the first publish that can remove it does")
+
+    # ── the code review at ceb81d5 ──
+
+    def test_a_signal_handler_calling_release_mid_publish_gets_lock_error_not_a_hang(self):
+        """Review schedule: "A SIGTERM handler that calls release while main is inside release or
+        publish blocks forever, with the lock fd still open"."""
+        owner = self.owned()
+        seen = []
+
+        def handler(signum, frame):
+            try:
+                seen.append(self.hl.release(owner))
+            except self.hl.LockError as e:
+                seen.append("LockError: %s" % e)
+        previous = signal.signal(signal.SIGUSR1, handler)
+        self.addCleanup(signal.signal, signal.SIGUSR1, previous)
+        real = self.hl._write_record
+
+        def signalled(o, rec):
+            os.kill(os.getpid(), signal.SIGUSR1)
+            for _ in range(3):
+                time.sleep(0.01)
+            return real(o, rec)
+        signal.alarm(10)
+        self.addCleanup(signal.alarm, 0)
+        with mock.patch.object(self.hl, "_write_record", signalled):
+            got = self.hl.publish(owner, "routine")
+        self.assertEqual(seen, ["LockError: re-entrant"], "refused at once, never blocked")
+        self.assertTrue(got.durable and owner.published and not owner.released, "the lock stays consistent")
+        self.assertEqual(self.hl.release(owner), self.hl.Released(True), "and releases normally afterwards")
+
+    def test_release_after_the_lock_file_was_replaced_leaves_the_record(self):
+        owner = self.owned()
         self.hl.publish(owner, "routine")
-        self.assertEqual([n for n in os.listdir(self.ldir()) if n.startswith(".holder.")], [])
+        record = (self.ldir() / "holder").read_bytes()
+        (self.ldir() / "fresh").write_text("")
+        os.replace(self.ldir() / "fresh", self.ldir() / "lock")
+        self.assertEqual(self.hl.release(owner), self.hl.Released(False))
+        self.assertEqual((self.ldir() / "holder").read_bytes(), record, "removed only through the lock it holds")
+
+    def test_release_leaves_a_record_naming_this_pid_but_another_lock(self):
+        owner = self.owned()
+        self.hl.publish(owner, "routine")
+        rec = self.hl.read_holder(str(self.root)).record
+        other = json.dumps(dict(rec, lock={"dev": rec["lock"]["dev"], "ino": rec["lock"]["ino"] + 1})).encode()
+        (self.ldir() / "holder").write_bytes(other)
+        self.assertEqual(self.hl.release(owner), self.hl.Released(False))
+        self.assertEqual((self.ldir() / "holder").read_bytes(), other)
+
+    def test_the_legacy_read_is_through_the_held_root_not_the_path(self):
+        self.root.mkdir()
+        pid, _ = self.proc()
+        (self.root / "state").mkdir()
+        (self.root / "state" / "connector.pid").write_text("%d\n" % pid)
+        real = self.hl._read_prior
+
+        def replace_then_read(d):
+            os.rename(self.root, self.tmp / "moved")
+            self.root.mkdir()
+            return real(d)
+        with mock.patch.object(self.hl, "_read_prior", replace_then_read):
+            r = self.acquire()
+        self.assertIsInstance(r, self.hl.LegacyRunning, "the held root's pidfile, not the new path's empty dir")
+        self.assertEqual(r.pid, pid)
+
+    def race_two_releases_inside_the_critical_section(self, owner):
+        """One release paused inside the critical section, a second release started meanwhile: the
+        second must wait for the first and then refuse, never run alongside it."""
+        entered, go, first = threading.Event(), threading.Event(), []
+        real = self.hl._read_prior
+
+        def slow(d):
+            if threading.current_thread() is first[0]:
+                entered.set()
+                go.wait(10)
+            return real(d)
+        results = []
+
+        def call():
+            try:
+                results.append(repr(self.hl.release(owner)))
+            except BaseException as e:
+                results.append("%s: %s" % (type(e).__name__, e))
+        with mock.patch.object(self.hl, "_read_prior", slow):
+            a = threading.Thread(target=call)
+            first.append(a)
+            a.start()
+            self.assertTrue(entered.wait(10))
+            b = threading.Thread(target=call)
+            b.start()
+            b.join(0.5)
+            go.set()
+            a.join(10)
+            b.join(10)
+        self.assertEqual(sorted(results), ["LockError: released", "Released(record_removed=True)"])
+
+    def test_racing_releases_inside_the_critical_section_never_both_proceed(self):
+        owner = self.owned()
+        self.hl.publish(owner, "routine")
+        self.race_two_releases_inside_the_critical_section(owner)
+
+    def test_a_reused_pid_in_a_leftover_legacy_file_is_ignored(self):
+        pid, _ = self.proc()
+        p = self.root / "state" / "connector.pid"
+        p.parent.mkdir(parents=True)
+        p.write_text("%d\n" % pid)
+        os.utime(p, (time.time() - 100, time.time() - 100))
+        self.hl.release(self.owned())
+        os.utime(p, (time.time() + 100, time.time() + 100))
+        self.assertIsInstance(self.acquire(), self.hl.LegacyRunning, "a pid started before the file: refused")
+        os.utime(p, (time.time() - 100, time.time() - 100))
+        with mock.patch.object(self.hl, "start_time", return_value=None):
+            self.assertIsInstance(self.acquire(), self.hl.LegacyRunning, "an unreadable start time: refused")
+
+    def test_a_uid_with_no_passwd_entry_is_a_lock_error(self):
+        self.real_home()
+        with mock.patch.object(self.hl.pwd, "getpwuid", side_effect=KeyError("getpwuid(): uid not found")):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.hl.lock_dir(str(self.tmp))
+        self.assertIn("no passwd entry", str(e.exception))
+
+    # ── the re-review at ceb81d5 ──
+
+    def test_a_copied_or_rebuilt_owner_can_neither_release_nor_publish(self):
+        """Review schedule: "alias = dataclasses.replace(old); release(old); new = acquire(...);
+        publish(new, 'new'); release(alias)" removed the new holder and closed new's fds."""
+        owner = self.owned()
+        self.hl.publish(owner, "routine")
+        for make in (copy.copy, copy.deepcopy, pickle.dumps):
+            with self.subTest(make=make.__name__), self.assertRaises(self.hl.LockError):
+                make(owner)
+        alias = dataclasses.replace(owner)
+        record = (self.ldir() / "holder").read_bytes()
+        for call in (lambda: self.hl.release(alias), lambda: self.hl.publish(alias, "alias")):
+            with self.assertRaises(self.hl.LockError) as e:
+                call()
+            self.assertEqual(str(e.exception), "released")
+        self.assertEqual((self.ldir() / "holder").read_bytes(), record, "touches nothing")
+        os.fstat(owner.fd)
+        os.fstat(owner.root_fd)
+        self.assertFalse(self.lock_free(), "the lock stays held")
+
+    def test_a_stale_owner_cannot_release_its_successor_even_on_reused_fd_numbers(self):
+        old = self.owned()
+        alias = dataclasses.replace(old)
+        self.hl.release(old)
+        new = self.owned()
+        for theirs, mine in ((new.fd, old.fd), (new.root_fd, old.root_fd)):
+            if theirs != mine and mine not in (new.fd, new.root_fd):
+                os.dup2(theirs, mine)
+                self.addCleanup(self.close_quietly, mine)
+        self.hl.publish(new, "new")
+        record = (self.ldir() / "holder").read_bytes()
+        for stale in (old, alias):
+            with self.assertRaises(self.hl.LockError):
+                self.hl.release(stale)
+        self.assertEqual((self.ldir() / "holder").read_bytes(), record, "the successor's record is intact")
+        os.fstat(new.fd)
+        os.fstat(new.root_fd)
+        self.assertIs(self.hl._OWNER, new)
+        self.assertFalse(new.released)
+
+    def test_a_component_created_concurrently_is_opened_not_refused(self):
+        real = os.mkdir
+
+        def someone_else_first(path, *a, **k):
+            real(path, *a, **k)
+            raise FileExistsError(17, "File exists", os.fspath(path))
+        with mock.patch.object(self.hl.os, "mkdir", someone_else_first):
+            self.hl.release(self.owned())
+
+    def close_quietly(self, fd):
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+    def test_a_component_swapped_for_a_symlink_into_the_root_while_the_tree_is_built_is_refused(self):
+        """Review schedule: "Switching the home .local symlink from an outside directory to a
+        descendant of the work root after _within returns but before makedirs" made both copies
+        create the lock tree under the root."""
+        root = self.tmp / "r"
+        (root / "descendant").mkdir(parents=True)
+        home = self.tmp / "h"
+        (home / ".local").mkdir(parents=True)
+        real_open, swapped = os.open, []
+
+        def swap_then_open(path, *a, **k):
+            if os.fspath(path) == ".local" and k.get("dir_fd") is not None and not swapped:
+                swapped.append(True)
+                os.rename(home / ".local", home / "outside")
+                os.symlink(root / "descendant", home / ".local")
+            return real_open(path, *a, **k)
+        with mock.patch.object(self.hl, "_home", lambda: str(home)), \
+                mock.patch.object(self.hl.os, "open", swap_then_open):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.acquire(root)
+        self.assertEqual(swapped, [True])
+        self.assertEqual(str(e.exception), "work root contains the lock directory")
+        self.assertEqual(os.listdir(root / "descendant"), [], "nothing created under the root")
 
     def test_every_case_runs_against_the_source_and_the_vendored_copy(self):
         self.assertIsNot(SRC, VENDORED)
@@ -1535,9 +1785,12 @@ class WindowsPlatformTest(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "real only on Windows")
     def test_on_windows_every_entry_point_raises_lock_error(self):
         for hl in (SRC, VENDORED):
+            dummy = hl.Owner(fd=-1, lock_id=(0, 0), pid=os.getpid(), start="s", root="r", directory="d",
+                             install_id="i", acquired_at=1.0)
             for call in (lambda: hl.acquire("w", install_id="i"),
                          lambda: hl.wait("w", install_id="i", deadline=time.monotonic() + 1),
-                         lambda: hl.status("w")):
+                         lambda: hl.publish(dummy, "routine"), lambda: hl.release(dummy),
+                         lambda: hl.status("w"), lambda: hl.read_holder("."), lambda: hl.lock_dir(".")):
                 with self.assertRaises(hl.LockError):
                     call()
 

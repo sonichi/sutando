@@ -19,6 +19,7 @@ Published(durable=False) and logs a warning.
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import logging
@@ -105,6 +106,15 @@ class Owner:
     def lock_path(self) -> str:
         return os.path.join(self.directory, LOCK_NAME)
 
+    def __copy__(self):
+        raise LockError("an owner cannot be copied")
+
+    def __deepcopy__(self, memo):
+        raise LockError("an owner cannot be copied")
+
+    def __reduce_ex__(self, protocol):
+        raise LockError("an owner cannot be pickled")
+
 
 @dataclass(frozen=True)
 class Acquired:
@@ -153,6 +163,7 @@ class Released:
 _OWNER: Optional[Owner] = None
 _WAITING: Optional[int] = None
 _GUARD = threading.Lock()
+_GUARD_THREAD: Optional[int] = None
 _ACQUIRING = threading.Lock()
 _LOG = logging.getLogger(__name__)
 
@@ -167,7 +178,10 @@ def _platform() -> None:
 def _home() -> str:
     if pwd is None:
         raise LockError(UNSUPPORTED)
-    return pwd.getpwuid(os.geteuid()).pw_dir
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_dir
+    except KeyError:
+        raise LockError("no passwd entry for uid %d" % os.geteuid())
 
 
 def _host() -> str:
@@ -400,7 +414,8 @@ def _legacy_finding(root: str, root_fd: Optional[int] = None):
                      dir_fd=root_fd)
         with os.fdopen(fd, "rb") as f:
             data = f.read()
-            age = time.time() - os.fstat(f.fileno()).st_mtime
+            mtime = os.fstat(f.fileno()).st_mtime
+            age = time.time() - mtime
     except FileNotFoundError:
         return None, False
     except OSError:
@@ -409,61 +424,97 @@ def _legacy_finding(root: str, root_fd: Optional[int] = None):
     if not m:
         return (LegacyRunning(None, path), False) if age < LEGACY_FRESH_S else (None, True)
     pid = int(m.group(1))
-    return (LegacyRunning(pid, path) if verify_lineage(pid, None) is not False else None), False
+    if verify_lineage(pid, None) is False or _started_after(pid, mtime):
+        return None, False
+    return LegacyRunning(pid, path), False
+
+
+def _started_after(pid: int, mtime: float) -> bool:
+    """The pid's current process started after the file was written: a reused pid, not its writer."""
+    start = start_time(pid)
+    if start is None:
+        return False
+    return calendar.timegm(time.strptime(start, "%Y-%m-%dT%H:%M:%SZ")) > mtime
 
 
 # ── acquire, wait ────────────────────────────────────────────────────────────
 
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+
+
 def _prepare(work_root):
-    """Platform and owner checks, the normalized root created, and the lock dir ready. Returns
-    (path, root, directory, root_fd): the caller closes root_fd. Runs under _ACQUIRING."""
+    """Platform and owner checks, the normalized root and the lock dir created descriptor-relative.
+    Returns (path, root, directory, root_fd, dir_fd); the caller closes both fds. Runs under
+    _ACQUIRING."""
     _platform()
-    with _GUARD:
+    with _guarded:
         if _OWNER is not None and not _OWNER.released and _OWNER.pid == os.getpid():
             raise LockError("already owner")
     path = os.path.abspath(os.path.normpath(os.fspath(work_root)))
-    os.makedirs(path, exist_ok=True)
+    root_fd = _open_dirs(os.sep, [p for p in path.split(os.sep) if p], 0o777)
     root = os.path.realpath(path)
-    root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
     try:
         held = os.fstat(root_fd)
         directory = _lock_dir_of(held)
-        if _within(directory, held):
-            raise LockError("work root contains the lock directory")
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        if _is_network(_statfs_type(directory)):
-            raise LockError("not a local filesystem")
+        home = _home()
+        parts = os.path.relpath(directory, home).split(os.sep)
+        dir_fd = _open_dirs(home, parts, 0o700, inside=(held.st_dev, held.st_ino))
     except BaseException:
         os.close(root_fd)
         raise
-    return path, root, directory, root_fd
-
-
-def _within(path: str, root_st) -> bool:
-    """Whether `path` is the root or lies under it. Symlinks are resolved first (realpath), then each
-    existing component of the real path is opened from the one above with O_NOFOLLOW and compared
-    with the root by (st_dev, st_ino); a component that turns into a link meanwhile counts as inside."""
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    want = (root_st.st_dev, root_st.st_ino)
-    fd = os.open(os.sep, flags)
     try:
-        if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) == want:
-            return True
-        for part in [p for p in os.path.realpath(path).split(os.sep) if p]:
+        if _is_network(_statfs_type(directory)):
+            raise LockError("not a local filesystem")
+    except BaseException:
+        os.close(dir_fd)
+        os.close(root_fd)
+        raise
+    return path, root, directory, root_fd, dir_fd
+
+
+def _open_dirs(start: str, parts, mode: int, inside=None) -> int:
+    """Open `start`, then each of `parts` from the one above (creating it with `mode` if absent), and
+    return the last fd. With `inside` (a root's (st_dev, st_ino)), every opened directory is checked
+    by its physical ancestry first, so nothing is ever created under that root."""
+    fd = os.open(start, _DIR_FLAGS)
+    try:
+        if inside is not None and _fd_within(fd, inside):
+            raise LockError("work root contains the lock directory")
+        for part in parts:
             try:
-                nxt = os.open(part, flags, dir_fd=fd)
+                nxt = os.open(part, _DIR_FLAGS, dir_fd=fd)
             except FileNotFoundError:
-                return False
-            except OSError:
-                return True
+                try:
+                    os.mkdir(part, mode, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                nxt = os.open(part, _DIR_FLAGS, dir_fd=fd)
             os.close(fd)
             fd = nxt
-            st = os.fstat(fd)
-            if (st.st_dev, st.st_ino) == want:
-                return True
-        return False
-    finally:
+            if inside is not None and _fd_within(fd, inside):
+                raise LockError("work root contains the lock directory")
+        return fd
+    except BaseException:
         os.close(fd)
+        raise
+
+
+def _fd_within(fd: int, root_id) -> bool:
+    """Whether the directory open at `fd` is the root or lies under it, by walking ".." from it."""
+    cur = os.dup(fd)
+    try:
+        while True:
+            st = os.fstat(cur)
+            if (st.st_dev, st.st_ino) == tuple(root_id):
+                return True
+            parent = os.open("..", _DIR_FLAGS, dir_fd=cur)
+            os.close(cur)
+            cur = parent
+            up = os.fstat(cur)
+            if (up.st_dev, up.st_ino) == (st.st_dev, st.st_ino):
+                return False
+    finally:
+        os.close(cur)
 
 
 def _root_unchanged(path: str, root: str, root_fd: int) -> bool:
@@ -500,8 +551,8 @@ def _after_fork_in_parent() -> None:
 
 
 def _drop_in_child() -> None:
-    global _OWNER, _WAITING, _GUARD, _ACQUIRING
-    _GUARD, _ACQUIRING = threading.Lock(), threading.Lock()
+    global _OWNER, _WAITING, _GUARD, _ACQUIRING, _GUARD_THREAD
+    _GUARD, _ACQUIRING, _GUARD_THREAD = threading.Lock(), threading.Lock(), None
     owner, _OWNER, _WAITING = _OWNER, None, None
     if owner is None:
         return
@@ -517,11 +568,11 @@ def _drop_in_child() -> None:
 _register_fork_hooks()
 
 
-def _attempt(path: str, root: str, directory: str, root_fd: int, install_id_: str):
+def _attempt(path: str, root: str, directory: str, root_fd: int, dir_fd: int, install_id_: str):
     global _OWNER
     lock_path = os.path.join(directory, LOCK_NAME)
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(lock_path, flags, 0o600)
+    fd = os.open(LOCK_NAME, flags, 0o600, dir_fd=dir_fd)
     locked = kept = False
     try:
         if not file_lock.try_lock_fd(fd):
@@ -550,7 +601,7 @@ def _attempt(path: str, root: str, directory: str, root_fd: int, install_id_: st
         owner = Owner(fd=fd, lock_id=(st.st_dev, st.st_ino), pid=os.getpid(), start=start, root=root,
                       directory=directory, install_id=install_id_, acquired_at=time.time(),
                       root_id=(held.st_dev, held.st_ino), root_fd=root_fd, path=path)
-        with _GUARD:
+        with _guarded:
             if not _root_unchanged(path, root, root_fd):
                 raise LockError("root changed")
             _OWNER = owner
@@ -567,12 +618,13 @@ def _attempt(path: str, root: str, directory: str, root_fd: int, install_id_: st
 
 def _one_attempt(work_root, install_id_: str):
     with _ACQUIRING:
-        path, root, directory, root_fd = _prepare(work_root)
+        path, root, directory, root_fd, dir_fd = _prepare(work_root)
         result = None
         try:
-            result = _attempt(path, root, directory, root_fd, install_id_)
+            result = _attempt(path, root, directory, root_fd, dir_fd, install_id_)
             return result
         finally:
+            os.close(dir_fd)
             if not isinstance(result, Acquired):
                 os.close(root_fd)
 
@@ -598,9 +650,10 @@ def wait(work_root, *, install_id: str, deadline: float, poll: float = 0.1,
     """Acquired | TimedOut | Unreadable | LegacyRunning, polling until `deadline` (time.monotonic())."""
     global _WAITING
     with _ACQUIRING:
-        _, _, directory, root_fd = _prepare(work_root)
+        _, _, directory, root_fd, dir_fd = _prepare(work_root)
+        os.close(dir_fd)
         os.close(root_fd)
-    with _GUARD:
+    with _guarded:
         if _WAITING == os.getpid():
             raise LockError("already waiting")
         _WAITING = os.getpid()
@@ -623,11 +676,33 @@ def wait(work_root, *, install_id: str, deadline: float, poll: float = 0.1,
                 os.unlink(mine)
             except FileNotFoundError:
                 pass
-        with _GUARD:
+        with _guarded:
             _WAITING = None
 
 
 # ── publish, release ─────────────────────────────────────────────────────────
+
+class _Guarded:
+    """_GUARD for a section of this module: a same-thread re-entry (a signal handler calling in while
+    its thread is inside) raises LockError("re-entrant") instead of blocking forever."""
+
+    def __enter__(self):
+        global _GUARD_THREAD
+        if _GUARD_THREAD == threading.get_ident():
+            raise LockError("re-entrant")
+        _GUARD.acquire()
+        _GUARD_THREAD = threading.get_ident()
+        return self
+
+    def __exit__(self, *exc):
+        global _GUARD_THREAD
+        _GUARD_THREAD = None
+        _GUARD.release()
+        return False
+
+
+_guarded = _Guarded()
+
 
 def _check_owner(owner: Owner) -> None:
     """Outside any lock: the platform, and the owner pid (a forked child stops here)."""
@@ -637,14 +712,12 @@ def _check_owner(owner: Owner) -> None:
 
 
 def _held_fds(owner: Owner) -> None:
-    """Under _GUARD: the owner is unreleased and its fds are still the lock file and the held root,
-    else LockError before any fd is touched."""
-    if owner.released:
+    """Under _GUARD: the owner is this process's current owner object (never a copy or a stale handle),
+    unreleased, and its fds are still the lock file and the held root; else LockError before any fd
+    is touched."""
+    if owner.released or owner is not _OWNER or owner.root_fd < 0:
         raise LockError("released")
-    held = [(owner.fd, tuple(owner.lock_id))]
-    if owner.root_fd >= 0:
-        held.append((owner.root_fd, tuple(owner.root_id)))
-    for fd, want in held:
+    for fd, want in ((owner.fd, tuple(owner.lock_id)), (owner.root_fd, tuple(owner.root_id))):
         try:
             st = os.fstat(fd)
         except OSError:
@@ -656,7 +729,7 @@ def _held_fds(owner: Owner) -> None:
 def _write_record(owner: Owner, rec: dict) -> bool:
     """Write the record; the rename is the commit. True when the directory fsync after it also
     succeeded; LockError when anything before the rename failed: no record is published, though a
-    temp whose cleanup also failed may remain until the next publish removes it."""
+    temp whose cleanup also failed may remain; each later publish tries to remove it (logged if not)."""
     directory = owner.directory
     try:
         names = os.listdir(directory)
@@ -666,8 +739,8 @@ def _write_record(owner: Owner, rec: dict) -> bool:
         if name.startswith("." + HOLDER_NAME + ".") and name.endswith(".tmp"):
             try:
                 os.unlink(os.path.join(directory, name))
-            except OSError:
-                pass
+            except OSError as e:
+                _LOG.warning("a leftover holder temp %s could not be removed (%s); it stays", name, e)
     tmp = os.path.join(directory, ".%s.%d.%s.tmp" % (HOLDER_NAME, os.getpid(), uuid.uuid4().hex[:8]))
     data = json.dumps(rec, sort_keys=True, ensure_ascii=True).encode("ascii")
     try:
@@ -702,7 +775,7 @@ def publish(owner: Owner, adapter: str) -> Published:
     """Write the holder record, once per owner; every field but `adapter` is generated. Validated
     and written under the module guard, so a released handle never writes."""
     _check_owner(owner)
-    with _GUARD:
+    with _guarded:
         _held_fds(owner)
         if owner.published:
             raise LockError("published")
@@ -724,7 +797,7 @@ def release(owner: Owner) -> Released:
     unlock and close (the root fd last), and only then mark released. Owner pid only."""
     global _OWNER
     _check_owner(owner)
-    with _GUARD:
+    with _guarded:
         _held_fds(owner)
         removed = False
         try:

@@ -5,8 +5,10 @@ A consumer subclasses it with unittest.TestCase and supplies `caller(root, *extr
 until its stdin closes, printing `acquired` once it holds. `module` is the holder_lock module the
 caller uses. The mixin drives contention, no-trace, a missing root, a replaced lock file, a live
 legacy pidfile, publish-before-spawn (no child process before the record exists; `ps` is exempt),
-and a root replaced right after Acquired (the caller's first act must land in the original inode,
-through owner.root_fd, never on the new directory at the path). Every wait is bounded.
+a root replaced right after Acquired (the caller's first act must land in the original inode,
+through owner.root_fd, never on the new directory at the path), and SIGTERM (the caller ends within
+the bound, its record removed and the lock free: its handler sets a flag and the main loop releases;
+holder_lock is never called from a signal handler). Every wait is bounded.
 
 Run as a script, this file is the spawn guard: `holder_lock_contract.py guard <report> <root>
 <module kind> <script> [args...]` runs the script with every child spawn checked; `... replace
@@ -17,6 +19,7 @@ import os
 import runpy
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -79,9 +82,20 @@ class FirstActContract:
         return child
 
     def _fa_line(self, child):
-        if not select.select([child.stdout], [], [], WAIT)[0]:
-            self.fail("no line from the caller within %.0fs" % WAIT)
-        return child.stdout.readline().strip()
+        """One line, read with os.read on the raw fd (a buffered readline after select can block
+        when two lines arrive in one read)."""
+        fd, buf = child.stdout.fileno(), getattr(child, "_fa_buf", b"")
+        deadline = time.monotonic() + WAIT
+        while b"\n" not in buf:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                self.fail("no line from the caller within %.0fs" % WAIT)
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            buf += chunk
+        line, _, child._fa_buf = buf.partition(b"\n")
+        return line.decode().strip()
 
     def _fa_run(self, argv):
         r = subprocess.run([sys.executable] + list(argv), capture_output=True, text=True, timeout=WAIT * 3,
@@ -154,6 +168,20 @@ class FirstActContract:
         self.assertEqual(self._fa_line(holder), "acquired")
         self.assertEqual(os.listdir(root), [], "nothing on the new directory at the path")
         self.assertTrue(os.listdir(moved), "the first act landed in the original inode")
+
+
+    def test_first_act_sigterm_ends_the_caller_and_frees_the_lock(self):
+        root = self._fa_root()
+        holder = self._fa_hold(root)
+        pid = self.module.read_holder(root).record["pid"]
+        os.kill(pid, signal.SIGTERM)
+        try:
+            holder.wait(WAIT)
+        except subprocess.TimeoutExpired:
+            self.fail("the caller did not end on SIGTERM within %.0fs" % WAIT)
+        self.assertIsInstance(self.module.read_holder(root), self.module.Missing, "its record is removed")
+        rc, out = self._fa_run(self.caller(root))
+        self.assertEqual(rc, 0, "the lock is free again: %s" % out)
 
 
 def _load(kind):
