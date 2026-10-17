@@ -291,6 +291,23 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual(len(json.loads((Path(d) / "state" / "sends.json").read_text())), 1)
             self.assertEqual(os.listdir(Path(d) / "state" / "sending"), [], "the marker goes with the result")
 
+    def test_each_provider_call_carries_exactly_one_task_and_never_the_session_prompt(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok(1), ok(2), ok(3)])
+            tids = ["task-a", "task-b", "task-c"]
+            for i, tid in enumerate(tids):
+                write_task(d, tid, "witness %s" % tid, mtime=1000 + i)
+            run_adapter(d, fake, once=3)
+            texts = [text_of(call) for call in fake.calls()]
+        prompt = PROMPT_MD.read_text(encoding="utf-8")
+        self.assertEqual(len(texts), 3, "one provider call per task")
+        for tid, text in zip(tids, texts):
+            self.assertTrue(text.startswith("[sparrow task]"), text[:80])
+            self.assertEqual(text.count("[sparrow task]"), 1, "exactly one task header per call")
+            self.assertEqual(re.findall(r"task_id=(\S+)", text), [tid])
+            self.assertNotIn(NOTE, text, "the standing session prompt is never part of a task turn")
+            self.assertLess(len(text), len(prompt))
+
     def test_the_task_text_never_shows_in_the_process_table(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [dict(ok(), sleep=3)])
