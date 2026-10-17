@@ -1026,8 +1026,11 @@ def wake_context(_args) -> int:
               or REPLY_COMMAND,
               "<ACTIVITY_FILE>": cfg.get("ACTIVITY_FILE")
               or str(_home() / ".muse" / "last_active")}
-    cache = runtime_text.load_cache(Path(cfg.get("STATE_DIR") or _dirs.state_dir()))
-    text, source = runtime_text.wake_context(cache, values)
+    state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
+    instance = (cfg["GATEWAY_INSTANCE"] if "GATEWAY_INSTANCE" in cfg
+                else os.environ.get("GATEWAY_INSTANCE") or "").strip()
+    text, source = runtime_text.wake_context(runtime_text.load_cache(state), values,
+                                             runtime_text.owner_dm_room(state, instance))
     print(text, end="")
     print(f"wake-context: {source}", file=sys.stderr)
     return 0

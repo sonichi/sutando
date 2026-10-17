@@ -3,8 +3,9 @@
 `wake-context` prints the prompt and worker note from the setup cache the keepawake run
 refreshes, else from the copies shipped in the package. A cache that is unreadable, has a
 newer text_schema_version, lacks a field, or names any command but the reply command is
-not used. Served text never replaces the package's tier notes: they are always printed,
-and served tier_addenda come after them. Text only instructs; claims, at-most-once replies
+not used. Served text never replaces the package's tier notes or owner note: they are
+always printed, with the owner's DM room when Sparrow has read it, and served
+tier_addenda come after them. Text only instructs; claims, at-most-once replies
 and fail-closed delivery are enforced by the code, which served text cannot reach."""
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ TIERS = ("owner", "team", "guest")
 MAX_TEXT_CHARS = 8192
 PLACEHOLDERS = ("<AGENT_MXID>", "<REPLY_COMMAND>", "<ACTIVITY_FILE>")
 VENDOR = "muse"
+ROOM_ID_RE = re.compile(r"![A-Za-z0-9._=+/-]{1,255}:[A-Za-z0-9.-]{1,255}(?::[0-9]{1,5})?")
 # name: (default, min, max), in seconds.
 TUNABLES = {
     "keepawake_interval_s": (15 * 60, 5 * 60, 60 * 60),
@@ -45,6 +47,14 @@ def cache_path(state_dir: Path) -> Path:
 def hint_path(state_dir: Path, instance: str = "") -> Path:
     """What Sparrow recorded from its last heartbeat reply (setup_revision, versions)."""
     return Path(state_dir) / f"setup-hint{gateway_instance.suffix(instance)}.json"
+
+
+def owner_dm_room(state_dir: Path, instance: str = "") -> str:
+    """The owner's DM room Sparrow last read from AG2 Space (its owner-routing file); ''
+    when it has none."""
+    routing = _read_json(Path(state_dir) / f"owner-routing{gateway_instance.suffix(instance)}.json")
+    room = str((routing or {}).get("owner_dm") or "")
+    return room if ROOM_ID_RE.fullmatch(room) else ""
 
 
 def _read_json(path: Path) -> "dict | None":
@@ -111,13 +121,15 @@ def _render(text: str, values: dict) -> str:
     return text
 
 
-def wake_context(cache: "dict | None", values: dict) -> "tuple[str, str]":
+def wake_context(cache: "dict | None", values: dict,
+                 owner_dm: str = "") -> "tuple[str, str]":
     """(the text a woken worker follows, where it came from)."""
     shipped = builtin()
     text, why = served_text(cache)
     source = f"served revision {cache.get('revision')}" if text else f"built-in ({why})"
     text = text or {**{f: shipped[f] for f in TEXT_FIELDS}, "tier_addenda": {}}
-    parts = [text["prompt"], "Worker note: " + text["worker_note"], *shipped["tier_notes"]]
+    parts = [text["prompt"], "Worker note: " + text["worker_note"], *shipped["tier_notes"],
+             shipped["owner_note"] + (f" owner_dm_room: {owner_dm}" if owner_dm else "")]
     parts += [f"Addendum for {tier} items: {text['tier_addenda'][tier]}"
               for tier in TIERS if (text["tier_addenda"].get(tier) or "").strip()]
     parts.append(text["restart_hint"])

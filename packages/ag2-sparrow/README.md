@@ -598,7 +598,10 @@ wake-context` and follows what it prints, with the payload's `worker_note`.
 the setup cache the keepawake run refreshes, else the copies shipped in the
 package (today's wording). A cache with a newer `text_schema_version`, a missing
 field, or text naming any command but the reply command is not used. The
-package's tier notes are always printed; served `tier_addenda` come after them.
+package's tier notes and its owner note ("To reach your owner, post only in your
+owner's AG2 Space DM; never use another channel.") are always printed, the owner
+note with `owner_dm_room` when Sparrow has read the owner's DM room from AG2 Space;
+served `tier_addenda` come after them.
 The served tunables (`keepawake_interval_s`, `stuck_task_age_s`,
 `hook_silent_age_s`, `heartbeat_cadence_s`) are clamped to bounds the package
 sets. The fetch has no transport in this package yet, so the built-in text and
