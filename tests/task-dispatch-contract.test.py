@@ -623,6 +623,34 @@ class PendingCandidatesBatchTest(unittest.TestCase):
                 self.assertEqual(has_ready_result(self.results_dir, name), ready)
                 self.assertEqual(name not in got, ready)
 
+    def test_one_archived_file_satisfies_an_exact_id_and_its_epoch_base_id(self):
+        names = ["task-a.txt", "task-a-1700000000.txt"]
+        for layout in ("archive", "archive/2026-09", "archive-2026-09-20"):
+            with self.subTest(layout=layout):
+                for p in self.results_dir.rglob("*.txt"):
+                    p.unlink()
+                for name in names:
+                    (self.tasks_dir / name).write_text("priority: normal\ntask: fixture\n")
+                _write(self.results_dir / layout / names[1])
+                self.assertEqual([has_ready_result(self.results_dir, n) for n in names], [True, True])
+                self.assertEqual(list(pending_candidates(self.tasks_dir, self.results_dir)), [])
+
+    def test_overlapping_ids_match_has_ready_result_in_every_layout(self):
+        ids = ["task-o", "task-o-1700000000", "task-o-1700000000-1800000000", "task-o-x"]
+        layouts = ["", "archive/", "archive/2026-09/", "archive-2026-09-20/"]
+        bodies = {"ready": "done\n", "blank": WS}
+        for layout in layouts:
+            for archived in ids:
+                for kind, body in bodies.items():
+                    with self.subTest(layout=layout, archived=archived, body=kind):
+                        for p in [*self.tasks_dir.iterdir(), *self.results_dir.rglob("*.txt")]:
+                            p.unlink()
+                        for tid in ids:
+                            (self.tasks_dir / f"{tid}.txt").write_text("priority: normal\ntask: x\n")
+                        _write(self.results_dir / f"{layout}{archived}.txt", body)
+                        want = [f"{t}.txt" for t in ids if not has_ready_result(self.results_dir, f"{t}.txt")]
+                        self.assertEqual(sorted(pending_candidates(self.tasks_dir, self.results_dir)), sorted(want))
+
     def _archive_listings(self, n_tasks):
         for i in range(n_tasks):
             (self.tasks_dir / f"task-q{i:03d}.txt").write_text("priority: normal\ntask: x\n")
