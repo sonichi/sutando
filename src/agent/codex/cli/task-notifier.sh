@@ -14,9 +14,11 @@ if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
 else
   TASKS_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/tasks"
 fi
-# The workspace is named, not inferred, when the inbox is not <workspace>/tasks
-# (a worker's <workspace>/deliveries/<id>); its parent is right only for the core.
-WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
+# Derived by the watcher's own rule, so a worker's <workspace>/deliveries/<id> keeps its
+# named workspace and an inbox outside it never adopts an inherited one.
+# shellcheck source=../../../tasks-dir-resolve.sh
+source "$REPO/src/tasks-dir-resolve.sh"
+WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # The pool router's hand-off sentinels (task_dispatch.worker_holds); a routed task stays in tasks/.
 DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"

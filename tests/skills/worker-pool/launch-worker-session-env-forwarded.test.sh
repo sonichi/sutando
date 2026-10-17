@@ -85,12 +85,12 @@ check $? "the core's launcher names no pool path (it arrives in env)"
 # Behaviour, not spelling: run the watcher's own resolution under the forwarded
 # env and assert results/ lands in the shared workspace, not under deliveries/.
 # shellcheck disable=SC2046
-resolved="$(env -i HOME="$HOME" PATH="/usr/bin:/bin" \
+resolved="$(env -i HOME="$HOME" PATH="/usr/bin:/bin" RESOLVER="$REPO/src/tasks-dir-resolve.sh" \
   $(grep -E '^SUTANDO_(TASKS|WORKSPACE|RESULTS)_DIR=' "$TMP/fwd") \
   bash -c '
+    . "$RESOLVER"
     TASKS_DIR="$SUTANDO_TASKS_DIR"; mkdir -p "$TASKS_DIR"
-    TASKS_DIR_ABS="$(cd "$TASKS_DIR" && pwd -P)"
-    WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR_ABS")}"
+    WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
     echo "${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"')"
 [ "$(cd "$(dirname "$resolved")" && pwd -P)" = "$(cd "$WS" && pwd -P)" ]
 check $? "the worker resolves RESULTS_DIR to the shared workspace (got $resolved)"
