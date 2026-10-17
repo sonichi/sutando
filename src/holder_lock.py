@@ -12,9 +12,17 @@ fresh locks, drops the owner, and closes an inherited lock fd only while it is s
 The root is held open (owner.root_fd) from before its key is computed for the owner's whole life:
 it must still be that directory after the flock and as the last step before Acquired is returned.
 After that the owner acts on the root only through that fd, so a path renamed away and replaced is
-simply a different root (with its own lock); release closes the fd last. publish's commit is the rename of the record into place: if fsyncing the directory fails
-after it, the record is published but its durability is uncertain, so publish returns
-Published(durable=False) and logs a warning.
+simply a different root (with its own lock); release closes the fd last. The lock directory is held
+open too (owner.dir_fd): after acquire every record read, write, rename and unlink goes through it.
+publish's commit is the rename of the record into place: if fsyncing the directory fails after it,
+the record is published but its durability is uncertain, so publish returns Published(durable=False)
+and logs a warning. Every entry point checks the platform before touching the filesystem.
+
+Threat model: this module defends against other processes, other owners, and stale or copied Owner
+objects. It does not defend against code in the owning process that closes, dup2s or reopens this
+module's descriptors. One cheap check covers the lock itself: publish and release first try a
+non-blocking flock on a fresh open of the lock file, which fails while we hold it; if it succeeds,
+the lock is gone and they refuse with LockError("lock lost").
 """
 
 from __future__ import annotations
@@ -97,6 +105,8 @@ class Owner:
     acquired_at: float
     root_id: tuple = (0, 0)
     root_fd: int = -1
+    dir_fd: int = -1
+    dir_id: tuple = (0, 0)
     path: str = ""
     published: bool = False
     released: bool = False
@@ -192,6 +202,7 @@ def lock_dir(root) -> str:
     """The lock directory of an existing work root: keyed by the root directory's (st_dev, st_ino),
     so every spelling of one directory shares it; the effective uid's home places it. The path is
     normalized lexically first, as acquire does."""
+    _platform()
     return _lock_dir_of(os.stat(os.path.abspath(os.path.normpath(os.fspath(root)))))
 
 
@@ -349,17 +360,23 @@ def _classify(raw: bytes) -> Prior:
     return Invalid(problem, raw) if problem else Valid(rec)
 
 
-def _read_prior(directory: str) -> Prior:
-    """The record in `directory`; OSError when it exists but cannot be read."""
+def _read_prior(where) -> Prior:
+    """The record in the lock directory `where` (an open dir fd, or a path for readers that hold
+    nothing); OSError when it exists but cannot be read. Through a fd, a link is not followed."""
     try:
-        with open(os.path.join(directory, HOLDER_NAME), "rb") as f:
-            raw = f.read()
+        if isinstance(where, int):
+            fd = os.open(HOLDER_NAME, os.O_RDONLY | _NOFOLLOW | _CLOEXEC, dir_fd=where)
+            with os.fdopen(fd, "rb") as f:
+                raw = f.read()
+        else:
+            with open(os.path.join(where, HOLDER_NAME), "rb") as f:
+                raw = f.read()
     except FileNotFoundError:
         return Missing()
     return _classify(raw)
 
 
-def _holder_of(directory: str) -> Prior:
+def _holder_of(directory) -> Prior:
     """The record in a known lock directory, typed: an unreadable one is Invalid."""
     try:
         return _read_prior(directory)
@@ -439,7 +456,9 @@ def _started_after(pid: int, mtime: float) -> bool:
 
 # ── acquire, wait ────────────────────────────────────────────────────────────
 
-_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _CLOEXEC
 
 
 def _prepare(work_root):
@@ -481,22 +500,56 @@ def _open_dirs(start: str, parts, mode: int, inside=None) -> int:
         if inside is not None and _fd_within(fd, inside):
             raise LockError("work root contains the lock directory")
         for part in parts:
+            made = False
             try:
                 nxt = os.open(part, _DIR_FLAGS, dir_fd=fd)
             except FileNotFoundError:
+                if inside is not None and _fd_within(fd, inside):
+                    raise LockError("work root contains the lock directory")
                 try:
                     os.mkdir(part, mode, dir_fd=fd)
+                    made = True
                 except FileExistsError:
                     pass
                 nxt = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            if inside is not None and _fd_within(nxt, inside):
+                os.close(nxt)
+                if made:
+                    with _suppress_os_error():
+                        os.rmdir(part, dir_fd=fd)
+                raise LockError("work root contains the lock directory")
             os.close(fd)
             fd = nxt
-            if inside is not None and _fd_within(fd, inside):
-                raise LockError("work root contains the lock directory")
         return fd
     except BaseException:
         os.close(fd)
         raise
+
+
+class _suppress_os_error:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, exc, tb):
+        return kind is not None and issubclass(kind, OSError)
+
+
+def _same_at(fd: int, dir_fd: int, name: str) -> bool:
+    """True when `name` in the directory open at `dir_fd` (a link is not followed) is the open file `fd`."""
+    try:
+        held, here = os.fstat(fd), os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except (OSError, TypeError, ValueError):
+        return False
+    return (held.st_dev, held.st_ino) == (here.st_dev, here.st_ino)
+
+
+def _dir_unchanged(directory: str, dir_fd: int) -> bool:
+    """The lock directory's path (a link is not followed) still names the directory held at `dir_fd`."""
+    try:
+        here, held = os.lstat(directory), os.fstat(dir_fd)
+    except OSError:
+        return False
+    return stat.S_ISDIR(here.st_mode) and (here.st_dev, here.st_ino) == (held.st_dev, held.st_ino)
 
 
 def _fd_within(fd: int, root_id) -> bool:
@@ -556,7 +609,8 @@ def _drop_in_child() -> None:
     owner, _OWNER, _WAITING = _OWNER, None, None
     if owner is None:
         return
-    for fd, want in ((owner.fd, tuple(owner.lock_id)), (owner.root_fd, tuple(owner.root_id))):
+    for fd, want in ((owner.fd, tuple(owner.lock_id)), (owner.dir_fd, tuple(owner.dir_id)),
+                     (owner.root_fd, tuple(owner.root_id))):
         try:
             st = os.fstat(fd)
             if (st.st_dev, st.st_ino) == want:
@@ -570,20 +624,33 @@ _register_fork_hooks()
 
 def _attempt(path: str, root: str, directory: str, root_fd: int, dir_fd: int, install_id_: str):
     global _OWNER
-    lock_path = os.path.join(directory, LOCK_NAME)
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(LOCK_NAME, flags, 0o600, dir_fd=dir_fd)
+    made = False
+    try:
+        fd = os.open(LOCK_NAME, os.O_RDWR | _NOFOLLOW | _CLOEXEC, dir_fd=dir_fd)
+    except FileNotFoundError:
+        try:
+            fd = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC, 0o600, dir_fd=dir_fd)
+            made = True
+        except FileExistsError:
+            fd = os.open(LOCK_NAME, os.O_RDWR | _NOFOLLOW | _CLOEXEC, dir_fd=dir_fd)
+    held = os.fstat(root_fd)
+    if _fd_within(dir_fd, (held.st_dev, held.st_ino)):
+        os.close(fd)
+        if made:
+            with _suppress_os_error():
+                os.unlink(LOCK_NAME, dir_fd=dir_fd)
+        raise LockError("work root contains the lock directory")
     locked = kept = False
     try:
         if not file_lock.try_lock_fd(fd):
-            return Contended(_holder_of(directory))
+            return Contended(_holder_of(dir_fd))
         locked = True
-        if not same_file(fd, lock_path):
+        if not (_same_at(fd, dir_fd, LOCK_NAME) and _dir_unchanged(directory, dir_fd)):
             raise LockError("replaced")
         if not _root_unchanged(path, root, root_fd):
             raise LockError("root changed")
         try:
-            prior = _read_prior(directory)
+            prior = _read_prior(dir_fd)
         except OSError as e:
             return Unreadable(str(e))
         except (UnicodeError, ValueError) as e:
@@ -597,10 +664,11 @@ def _attempt(path: str, root: str, directory: str, root_fd: int, dir_fd: int, in
         start = start_time(os.getpid())
         if start is None:
             raise LockError("cannot read this process's start time")
-        st, held = os.fstat(fd), os.fstat(root_fd)
+        st, held, dst = os.fstat(fd), os.fstat(root_fd), os.fstat(dir_fd)
         owner = Owner(fd=fd, lock_id=(st.st_dev, st.st_ino), pid=os.getpid(), start=start, root=root,
                       directory=directory, install_id=install_id_, acquired_at=time.time(),
-                      root_id=(held.st_dev, held.st_ino), root_fd=root_fd, path=path)
+                      root_id=(held.st_dev, held.st_ino), root_fd=root_fd, dir_fd=dir_fd,
+                      dir_id=(dst.st_dev, dst.st_ino), path=path)
         with _guarded:
             if not _root_unchanged(path, root, root_fd):
                 raise LockError("root changed")
@@ -624,8 +692,8 @@ def _one_attempt(work_root, install_id_: str):
             result = _attempt(path, root, directory, root_fd, dir_fd, install_id_)
             return result
         finally:
-            os.close(dir_fd)
             if not isinstance(result, Acquired):
+                os.close(dir_fd)
                 os.close(root_fd)
 
 
@@ -715,9 +783,10 @@ def _held_fds(owner: Owner) -> None:
     """Under _GUARD: the owner is this process's current owner object (never a copy or a stale handle),
     unreleased, and its fds are still the lock file and the held root; else LockError before any fd
     is touched."""
-    if owner.released or owner is not _OWNER or owner.root_fd < 0:
+    if owner.released or owner is not _OWNER or owner.root_fd < 0 or owner.dir_fd < 0:
         raise LockError("released")
-    for fd, want in ((owner.fd, tuple(owner.lock_id)), (owner.root_fd, tuple(owner.root_id))):
+    for fd, want in ((owner.fd, tuple(owner.lock_id)), (owner.dir_fd, tuple(owner.dir_id)),
+                     (owner.root_fd, tuple(owner.root_id))):
         try:
             st = os.fstat(fd)
         except OSError:
@@ -726,47 +795,63 @@ def _held_fds(owner: Owner) -> None:
             raise LockError("released")
 
 
+def _lock_still_held(owner: Owner) -> None:
+    """Our open file description still holds the flock. A fresh open of the lock file must fail a
+    non-blocking flock (somebody holds it), and re-asserting it on owner.fd must succeed (that is us)."""
+    try:
+        fd = os.open(LOCK_NAME, os.O_RDWR | _NOFOLLOW | _CLOEXEC, dir_fd=owner.dir_fd)
+    except OSError as e:
+        raise LockError("lock lost: %s" % e)
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != tuple(owner.lock_id):
+            raise LockError("replaced")
+        if file_lock.try_lock_fd(fd):
+            file_lock.unlock_fd(fd)
+            raise LockError("lock lost")
+    finally:
+        os.close(fd)
+    if not file_lock.try_lock_fd(owner.fd):
+        raise LockError("lock lost")
+
+
 def _write_record(owner: Owner, rec: dict) -> bool:
     """Write the record; the rename is the commit. True when the directory fsync after it also
     succeeded; LockError when anything before the rename failed: no record is published, though a
     temp whose cleanup also failed may remain; each later publish tries to remove it (logged if not)."""
-    directory = owner.directory
+    dfd = owner.dir_fd
     try:
-        names = os.listdir(directory)
+        names = os.listdir(dfd)
     except OSError as e:
         raise LockError("cannot write the holder record: %s" % e)
     for name in names:
         if name.startswith("." + HOLDER_NAME + ".") and name.endswith(".tmp"):
             try:
-                os.unlink(os.path.join(directory, name))
+                os.unlink(name, dir_fd=dfd)
             except OSError as e:
                 _LOG.warning("a leftover holder temp %s could not be removed (%s); it stays", name, e)
-    tmp = os.path.join(directory, ".%s.%d.%s.tmp" % (HOLDER_NAME, os.getpid(), uuid.uuid4().hex[:8]))
+    tmp = ".%s.%d-%d.tmp" % (HOLDER_NAME, owner.lock_id[0], owner.lock_id[1])
     data = json.dumps(rec, sort_keys=True, ensure_ascii=True).encode("ascii")
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW | _CLOEXEC, 0o600, dir_fd=dfd)
         try:
             while data:
                 data = data[os.write(fd, data):]
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.replace(tmp, os.path.join(directory, HOLDER_NAME))
+        os.replace(tmp, HOLDER_NAME, src_dir_fd=dfd, dst_dir_fd=dfd)
     except OSError as e:
         try:
-            os.unlink(tmp)
+            os.unlink(tmp, dir_fd=dfd)
         except OSError:
             pass
         raise LockError("cannot write the holder record: %s" % e)
     try:
-        dfd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        os.fsync(dfd)
     except OSError as e:
         _LOG.warning("holder record published in %s, but its directory fsync failed (%s): durability "
-                     "is uncertain", directory, e)
+                     "is uncertain", owner.directory, e)
         return False
     return True
 
@@ -779,8 +864,9 @@ def publish(owner: Owner, adapter: str) -> Published:
         _held_fds(owner)
         if owner.published:
             raise LockError("published")
-        if not same_file(owner.fd, owner.lock_path):
+        if not (_same_at(owner.fd, owner.dir_fd, LOCK_NAME) and _dir_unchanged(owner.directory, owner.dir_fd)):
             raise LockError("replaced")
+        _lock_still_held(owner)
         rec = {"schema": SCHEMA, "adapter": adapter, "pid": owner.pid, "start": owner.start, "host": _host(),
                "install_id": owner.install_id, "lock": {"dev": owner.lock_id[0], "ino": owner.lock_id[1]},
                "acquired_at": float(owner.acquired_at)}
@@ -799,14 +885,16 @@ def release(owner: Owner) -> Released:
     _check_owner(owner)
     with _guarded:
         _held_fds(owner)
+        if _same_at(owner.fd, owner.dir_fd, LOCK_NAME):
+            _lock_still_held(owner)
         removed = False
         try:
-            if same_file(owner.fd, owner.lock_path):
-                prior = _read_prior(owner.directory)
+            if _same_at(owner.fd, owner.dir_fd, LOCK_NAME):
+                prior = _read_prior(owner.dir_fd)
                 if isinstance(prior, Valid) and prior.record["pid"] == owner.pid \
                         and prior.record["start"] == owner.start \
                         and (prior.record["lock"]["dev"], prior.record["lock"]["ino"]) == tuple(owner.lock_id):
-                    os.unlink(os.path.join(owner.directory, HOLDER_NAME))
+                    os.unlink(HOLDER_NAME, dir_fd=owner.dir_fd)
                     removed = True
         except OSError:
             removed = False
@@ -815,6 +903,7 @@ def release(owner: Owner) -> Released:
                 file_lock.unlock_fd(owner.fd)
             finally:
                 os.close(owner.fd)
+                os.close(owner.dir_fd)
                 if owner.root_fd >= 0:
                     os.close(owner.root_fd)
                 owner.released = True

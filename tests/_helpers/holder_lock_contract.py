@@ -45,6 +45,7 @@ def snapshot(path):
 
 class FirstActContract:
     module = None
+    fa_quiet = False  # a negative control, expected to fail, prints no FAIL-DIAG line
 
     def caller(self, root, *extra):
         raise NotImplementedError
@@ -54,6 +55,7 @@ class FirstActContract:
         self._fa_tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self._fa_tmp, True)
         self._fa_children = []
+        self._fa_ran = getattr(self, "_fa_ran", [])
         self.addCleanup(self._fa_stop)
 
     def _fa_root(self, name="work"):
@@ -74,6 +76,19 @@ class FirstActContract:
                 except (OSError, subprocess.TimeoutExpired):
                     child.kill()
                     child.wait(WAIT)
+            text = (getattr(child, "_fa_seen", b"") + getattr(child, "_fa_buf", b"")).decode("utf-8", "replace")
+            for stream in (child.stdout, child.stderr):
+                try:
+                    text += os.read(stream.fileno(), 65536).decode("utf-8", "replace") if select.select(
+                        [stream], [], [], 0)[0] else ""
+                except (OSError, ValueError):
+                    pass
+            self._fa_ran.append((child.returncode, text))
+            for stream in (child.stdin, child.stdout, child.stderr):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
     def _fa_start(self, argv):
         child = subprocess.Popen([sys.executable] + list(argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -95,12 +110,32 @@ class FirstActContract:
                 break
             buf += chunk
         line, _, child._fa_buf = buf.partition(b"\n")
+        child._fa_seen = getattr(child, "_fa_seen", b"") + line + b"\n"
         return line.decode().strip()
 
     def _fa_run(self, argv):
         r = subprocess.run([sys.executable] + list(argv), capture_output=True, text=True, timeout=WAIT * 3,
                            stdin=subprocess.DEVNULL)
+        self._fa_ran.append((r.returncode, r.stdout + r.stderr))
         return r.returncode, r.stdout.strip()
+
+    def run(self, result=None):
+        """A failing case also prints one `FAIL-DIAG:` stdout line per caller it ran (exit code and
+        the head of its output), and appends the same lines to the failure's message."""
+        self._fa_ran = []
+        before = len(result.failures) + len(result.errors) if result is not None else 0
+        out = super().run(result)
+        result = result if result is not None else out
+        diag = ["FAIL-DIAG: %s rc=%s %s" % (self.id(), rc, " ".join(text.split())[:300] or "(no output)")
+                for rc, text in self._fa_ran]
+        if result is None or len(result.failures) + len(result.errors) == before:
+            return out
+        if not self.fa_quiet:
+            print("\n".join(diag or ["FAIL-DIAG: %s (no caller ran)" % self.id()]), flush=True)
+        for bucket in (result.failures, result.errors):
+            if bucket and bucket[-1][0] is self:
+                bucket[-1] = (self, bucket[-1][1] + "\n" + "\n".join(diag))
+        return out
 
     def _fa_hold(self, root):
         holder = self._fa_start(self.caller(root))

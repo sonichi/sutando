@@ -61,29 +61,26 @@ PKG_READMES = [REPO / "packages" / "ag2-sparrow" / "README.md",
                REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "adapters" / "codex" / "README.md"]
 
 
-_PENDING = {}
-
-
 def read_line(stream, timeout=WAIT, default=AssertionError):
-    """One line from a child's pipe, read with os.read on the raw fd into a per-fd buffer, so two
-    lines arriving in one read are both kept. After `timeout`: raise, or return `default`."""
+    """One line from a child's pipe, read with os.read on the raw fd into a buffer kept on the stream
+    object (never keyed by fd number, which a later pipe may reuse), so two lines arriving in one read
+    are both kept. After `timeout`: raise, or return `default`."""
     fd = stream.fileno()
-    buf = _PENDING.get(fd, b"")
+    buf = getattr(stream, "_hl_pending", b"")
     deadline = time.monotonic() + timeout
     while b"\n" not in buf:
         left = deadline - time.monotonic()
         if left <= 0 or not select.select([fd], [], [], left)[0]:
-            _PENDING[fd] = buf
+            stream._hl_pending = buf
             if default is AssertionError:
                 raise AssertionError("no line within %.0fs" % timeout)
             return default
         chunk = os.read(fd, 4096)
         if not chunk:
-            _PENDING[fd] = b""
+            stream._hl_pending = b""
             return buf.decode().strip()
         buf += chunk
-    line, _, rest = buf.partition(b"\n")
-    _PENDING[fd] = rest
+    line, _, stream._hl_pending = buf.partition(b"\n")
     return line.decode().strip()
 
 
@@ -872,8 +869,30 @@ class HolderLockTest(unittest.TestCase):
         self.real_home()
         result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(
             unittest.defaultTestLoader.loadTestsFromTestCase(self.stub_contract()))
-        self.assertTrue(result.wasSuccessful(), [str(e[1])[-400:] for e in result.failures + result.errors])
+        self.assertTrue(result.wasSuccessful(), [str(e[1])[-1500:] for e in result.failures + result.errors])
         self.assertEqual(result.testsRun, 7)
+
+    def test_the_first_act_contract_sigterm_case_holds_for_a_signal_right_after_acquired(self):
+        """CI (Linux): SIGTERM landed between the stub's `acquired` line and its try block, so its
+        handler's exit skipped release and the record stayed; the stub lingers there to pin it."""
+        self.real_home()
+        case = self.stub_contract("--linger", "0.5")("test_first_act_sigterm_ends_the_caller_and_frees_the_lock")
+        result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(case)
+        self.assertTrue(result.wasSuccessful(), [str(e[1])[-1500:] for e in result.failures + result.errors])
+
+    def test_a_failing_contract_case_prints_fail_diag_with_the_callers_exit_and_output(self):
+        """CI shows only lines matching FAIL: a failing case names each caller's exit code and output."""
+        self.real_home()
+        case = self.stub_contract("--by-path")("test_first_act_lands_on_the_held_root_when_the_path_is_replaced")
+        case.fa_quiet = False
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(case)
+        lines = out.getvalue().splitlines()
+        self.assertTrue(lines and all(line.startswith("FAIL-DIAG: ") for line in lines), lines)
+        self.assertIn("test_first_act_lands_on_the_held_root_when_the_path_is_replaced rc=", lines[0])
+        self.assertIn("acquired", lines[0], "the head of the caller's output")
+        self.assertIn(lines[0], result.failures[0][1], "and the same line in the failure message")
 
     def test_the_first_act_contract_pins_publish_before_any_child_is_spawned(self):
         self.real_home()
@@ -906,6 +925,7 @@ class HolderLockTest(unittest.TestCase):
 
         class Stub(FirstActContract, unittest.TestCase):
             module, module_kind = mod, kind
+            fa_quiet = bool(extra) and "--linger" not in extra
 
             def caller(self, root, *more):
                 return [str(REPO / "tests" / "_helpers" / "holder_lock_stub.py"), "--module", kind, "--work", root] + list(extra)
@@ -1393,7 +1413,7 @@ class HolderLockTest(unittest.TestCase):
         real = os.listdir
 
         def failing(path="."):
-            if os.fspath(path) == owner.directory:
+            if path == owner.dir_fd or (not isinstance(path, int) and os.fspath(path) == owner.directory):
                 raise OSError(5, "I/O error")
             return real(path)
         with mock.patch.object(self.hl.os, "listdir", failing):
@@ -1541,15 +1561,26 @@ class HolderLockTest(unittest.TestCase):
         os.close(owner.fd)
         os.close(owner.root_fd)
 
-    def test_a_failed_cleanup_leaves_a_temp_that_the_next_publish_removes(self):
+    def test_failed_publishes_leave_at_most_one_temp_and_the_next_publish_removes_it(self):
+        """Review schedule: "Three retryable failures left counts [1, 2, 3]"; the temp name is fixed
+        per owner and opened with O_TRUNC, so a retry reuses it."""
         owner = self.owned()
-        with mock.patch.object(self.hl.os, "replace", side_effect=OSError(5, "I/O error")), \
-                mock.patch.object(self.hl.os, "unlink", side_effect=OSError(1, "not permitted")):
-            with self.assertRaises(self.hl.LockError):
-                self.hl.publish(owner, "routine")
+        counts = []
+        for _ in range(3):
+            with mock.patch.object(self.hl.os, "replace", side_effect=OSError(5, "I/O error")), \
+                    mock.patch.object(self.hl.os, "unlink", side_effect=OSError(1, "not permitted")):
+                with self.assertRaises(self.hl.LockError):
+                    self.hl.publish(owner, "routine")
+            counts.append(len([n for n in os.listdir(self.ldir()) if n.startswith(".holder.")]))
+        self.assertEqual(counts, [1, 1, 1])
         self.assertFalse((self.ldir() / "holder").exists(), "nothing published")
-        self.assertEqual(len([n for n in os.listdir(self.ldir()) if n.startswith(".holder.")]), 1,
-                         "the stated residual: one temp")
+        self.assertTrue(self.hl.publish(owner, "routine").durable)
+        self.assertEqual([n for n in os.listdir(self.ldir()) if n.startswith(".holder.")], [],
+                         "the next publish that succeeds consumes it")
+
+    def test_an_earlier_owners_stuck_temp_stays_while_removal_fails_and_goes_once_it_can(self):
+        owner = self.owned()
+        (self.ldir() / ".holder.1-2.tmp").write_bytes(b"x")
         real_unlink = os.unlink
 
         def unlink_all_but_the_temp(p, *a, **k):
@@ -1560,8 +1591,7 @@ class HolderLockTest(unittest.TestCase):
                 self.assertLogs(self.hl._LOG, level="WARNING") as logs:
             self.assertTrue(self.hl.publish(owner, "routine").durable, "a stuck temp does not fail publish")
         self.assertIn("could not be removed", logs.output[0])
-        self.assertEqual(len([n for n in os.listdir(self.ldir()) if n.startswith(".holder.")]), 1,
-                         "while removing it keeps failing, it stays")
+        self.assertEqual([n for n in os.listdir(self.ldir()) if n.startswith(".holder.")], [".holder.1-2.tmp"])
         self.hl.release(owner)
         self.hl.publish(self.owned(), "routine")
         self.assertEqual([n for n in os.listdir(self.ldir()) if n.startswith(".holder.")], [],
@@ -1764,6 +1794,162 @@ class HolderLockTest(unittest.TestCase):
         self.assertEqual(swapped, [True])
         self.assertEqual(str(e.exception), "work root contains the lock directory")
         self.assertEqual(os.listdir(root / "descendant"), [], "nothing created under the root")
+
+    # ── the code review at a132917 ──
+
+    def test_a_same_inode_reopen_dup2d_onto_the_lock_fd_makes_publish_and_release_refuse(self):
+        """Review schedule: "Reopening owner.lock_path and dup2-ing it onto owner.fd preserves that
+        inode but closes the locked description. A subprocess then acquires and publishes successor;
+        the old canonical publish(owner, "stale") still returns Published and overwrites that record."
+        Out of the threat model to prevent; the fresh-open check makes the stale owner refuse."""
+        owner = self.owned()
+        fresh = os.open(owner.lock_path, os.O_RDWR)
+        os.dup2(fresh, owner.fd)
+        os.close(fresh)
+        self.assertEqual(os.fstat(owner.fd).st_ino, owner.lock_id[1], "same inode: _held_fds still passes")
+        code = ("r = hl.acquire(%r, install_id='i')\nprint(type(r).__name__, flush=True)\n"
+                "hl.publish(r.owner, 'successor')\nprint('published', flush=True)\nsys.stdin.read()\n"
+                "hl.release(r.owner)\n" % str(self.root))
+        child = self.run_py(code)
+        self.addCleanup(lambda: (child.stdin.close(), child.wait(WAIT), child.stdout.close(), child.stderr.close()))
+        self.assertEqual((read_line(child.stdout), read_line(child.stdout)), ("Acquired", "published"))
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.publish(owner, "stale")
+        self.assertEqual(str(e.exception), "lock lost")
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.release(owner)
+        self.assertEqual(str(e.exception), "lock lost")
+        self.assertEqual(self.hl.read_holder(str(self.root)).record["adapter"], "successor", "not overwritten")
+        child.stdin.close()
+        child.wait(WAIT)
+        owner.released, self.hl._OWNER = True, None
+        for fd in (owner.fd, owner.dir_fd, owner.root_fd):
+            os.close(fd)
+
+    def test_a_lock_lost_with_nobody_else_holding_is_refused_too(self):
+        owner = self.owned()
+        fresh = os.open(owner.lock_path, os.O_RDWR)
+        os.dup2(fresh, owner.fd)
+        os.close(fresh)
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.publish(owner, "stale")
+        self.assertEqual(str(e.exception), "lock lost")
+        self.assertTrue(self.lock_free(), "the check took nothing")
+        owner.released, self.hl._OWNER = True, None
+        for fd in (owner.fd, owner.dir_fd, owner.root_fd):
+            os.close(fd)
+
+    def test_a_checked_directory_renamed_under_the_root_before_mkdir_leaves_nothing_there(self):
+        """Review schedule: "ancestry is checked before the following mkdir; renaming that
+        already-checked directory under the work root at the seam made acquire refuse only after
+        creating root/descendant/state"."""
+        root = self.tmp / "r"
+        root.mkdir()
+        home = self.tmp / "h"
+        (home / ".local").mkdir(parents=True)
+        real_mkdir, moved = os.mkdir, []
+
+        def move_then_mkdir(path, *a, **k):
+            if os.fspath(path) == "state" and k.get("dir_fd") is not None and not moved:
+                moved.append(True)
+                os.rename(home / ".local", root / "descendant")
+            return real_mkdir(path, *a, **k)
+        with mock.patch.object(self.hl, "_home", lambda: str(home)), \
+                mock.patch.object(self.hl.os, "mkdir", move_then_mkdir):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.acquire(root)
+        self.assertEqual(moved, [True])
+        self.assertEqual(str(e.exception), "work root contains the lock directory")
+        self.assertEqual(os.listdir(root / "descendant"), [], "the component it made is removed")
+
+    def test_the_lock_dir_moved_under_the_root_before_the_lock_open_leaves_no_lock_there(self):
+        """Review schedule: "Moving the final checked directory before the lock open likewise left
+        root/descendant/lock before LockError"."""
+        root = self.tmp / "r"
+        root.mkdir()
+        directory = self.ldir(root)
+        real_open, moved = os.open, []
+
+        def move_then_open(path, *a, **k):
+            if os.fspath(path) == "lock" and k.get("dir_fd") is not None and not moved:
+                moved.append(True)
+                os.rename(directory, root / "descendant")
+            return real_open(path, *a, **k)
+        with mock.patch.object(self.hl.os, "open", move_then_open):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.acquire(root)
+        self.assertEqual(moved, [True])
+        self.assertEqual(str(e.exception), "work root contains the lock directory")
+        self.assertEqual(os.listdir(root / "descendant"), [], "no lock file left under the root")
+
+    def test_a_lock_dir_moved_aside_and_symlinked_to_the_root_gets_no_write_through_the_path(self):
+        """Review schedule: "Renaming the lock directory aside and symlinking its old path to the work
+        root made both copies return Published(durable=True), write work_root/holder ... It also
+        deleted a pre-existing work_root/.holder.user-data.tmp during cleanup"."""
+        owner = self.owned()
+        victim = self.root / ".holder.user-data.tmp"
+        victim.write_bytes(b"user data")
+        moved = self.tmp / "moved-lock-dir"
+        os.rename(owner.directory, moved)
+        os.symlink(self.root, owner.directory)
+        self.addCleanup(lambda: os.path.islink(owner.directory) and os.unlink(owner.directory))
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.publish(owner, "routine")
+        self.assertEqual(str(e.exception), "replaced")
+        self.assertEqual(sorted(os.listdir(self.root)), [".holder.user-data.tmp"], "no holder in the root")
+        self.assertEqual(victim.read_bytes(), b"user data")
+        self.assertEqual(os.listdir(moved), ["lock"])
+        self.assertEqual(self.hl.release(owner), self.hl.Released(False))
+        self.assertEqual(sorted(os.listdir(self.root)), [".holder.user-data.tmp"])
+
+    def test_every_entry_point_checks_the_platform_before_touching_the_filesystem(self):
+        """Review: "with pwd=None, a missing root yields FileNotFoundError / Missing, not LockError"."""
+        owner = self.owned()
+        missing = str(self.tmp / "absent" / "root")
+        touched = []
+
+        def spy(name):
+            real = getattr(os, name)
+            return lambda *a, **k: (touched.append(name), real(*a, **k))[1]
+        calls = [("lock_dir", lambda: self.hl.lock_dir(missing)),
+                 ("read_holder", lambda: self.hl.read_holder(missing)),
+                 ("status", lambda: self.hl.status(missing)),
+                 ("acquire", lambda: self.hl.acquire(missing, install_id="i")),
+                 ("acquire with a timeout", lambda: self.hl.acquire(missing, install_id="i", timeout=1)),
+                 ("wait", lambda: self.hl.wait(missing, install_id="i", deadline=time.monotonic() + 1)),
+                 ("publish", lambda: self.hl.publish(owner, "routine")),
+                 ("release", lambda: self.hl.release(owner))]
+        for name, call in calls:
+            with self.subTest(entry=name):
+                touched.clear()
+                with mock.patch.object(self.hl, "pwd", None), \
+                        contextlib.ExitStack() as stack:
+                    for fn in ("stat", "lstat", "open", "mkdir", "listdir", "scandir"):
+                        stack.enter_context(mock.patch.object(self.hl.os, fn, spy(fn)))
+                    with self.assertRaises(self.hl.LockError) as e:
+                        call()
+                self.assertEqual(str(e.exception), self.hl.UNSUPPORTED)
+                self.assertEqual(touched, [], "nothing touched before the platform check")
+        self.assertFalse((self.tmp / "absent").exists())
+        self.hl.release(owner)
+
+    def test_read_line_keeps_no_bytes_for_a_later_pipe_that_reuses_the_fd_number(self):
+        """Review schedule: "After reading old-1 and closing that pipe with old-2 buffered, a new child
+        reusing the fd returned old-2 instead of new-1"."""
+        r, w = os.pipe()
+        old = os.fdopen(r, "rb", buffering=0)
+        os.write(w, b"old-1\nold-2\n")
+        os.close(w)
+        self.assertEqual(read_line(old), "old-1")
+        number = old.fileno()
+        old.close()
+        r2, w2 = os.pipe()
+        self.assertEqual(r2, number, "the fd number is reused")
+        new = os.fdopen(r2, "rb", buffering=0)
+        self.addCleanup(new.close)
+        os.write(w2, b"new-1\n")
+        os.close(w2)
+        self.assertEqual(read_line(new), "new-1")
 
     def test_every_case_runs_against_the_source_and_the_vendored_copy(self):
         self.assertIsNot(SRC, VENDORED)
