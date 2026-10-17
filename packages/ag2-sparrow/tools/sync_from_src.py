@@ -2,7 +2,7 @@
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
 Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
-canonical for those modules — currently 22 of them, including outbox.py and its
+canonical for those modules — currently 23 of them, including outbox.py and its
 transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
 and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
 dir-interface, no workspace-resolution).

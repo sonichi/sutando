@@ -27,8 +27,8 @@ REMIND_INTERVALS_S = (30 * 60, 2 * 60 * 60, 6 * 60 * 60)
 
 REMINDER = "reminder"
 RECOVERY = "recovery"
-# Kinds whose recovery is a reconnection; any other kind says what cleared.
-RECONNECT_KINDS = frozenset({"auth"})
+# Kinds whose recovery is a sign-in, announced without the card's headline; others say what cleared.
+SIGN_IN_KINDS = frozenset({"auth"})
 
 
 class Notice(NamedTuple):
@@ -161,10 +161,12 @@ def body(notice: str, req: HumanRequirement, now: float,
          since: Optional[float] = None, queued: Optional[int] = None) -> str:
     n = _queued(req) if queued is None else queued
     if notice == RECOVERY:
-        lead = "Reconnected" if req.kind in RECONNECT_KINDS else "Cleared"
         tail = (f"resuming {n} queued task{'s' if n != 1 else ''}" if n
                 else "Sutando has continued its work")
-        return f"✓ {lead} — {_headline(req)}; {tail}."
+        if req.kind in SIGN_IN_KINDS:
+            seat = str((req.device or {}).get("name") or "")
+            return f"✓ Signed in{f' ({seat})' if seat else ''} — {tail}."
+        return f"✓ Cleared — {_headline(req)}; {tail}."
     waiting = f" {n} task{'s are' if n != 1 else ' is'} waiting." if n else ""
     started = req.created_at if since is None else since
     return (f"⚠ Still blocked after {_duration(now - started)} — "

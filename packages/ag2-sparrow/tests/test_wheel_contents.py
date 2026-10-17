@@ -96,10 +96,12 @@ def main():
         home.mkdir()
         ienv = dict(env, HOME=str(home), PATH="/usr/bin:/bin",
                     AGENT_CONNECT_TASK_DIR=str(d / "tasks"), AGENT_CONNECT_RESULT_DIR=str(d / "results"))
-        r = subprocess.run([str(bindir / "ag2-sparrow-hatch"), "install", "--mxid", "@w:ag2.space"],
+        # No relay here, so no Sparrow could connect: install's start-and-check step is skipped.
+        r = subprocess.run([str(bindir / "ag2-sparrow-hatch"), "install", "--mxid", "@w:ag2.space",
+                            "--no-start"],
                            capture_output=True, text=True, cwd=d, env=ienv, timeout=60)
         assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
-        prompt = json.loads((home / "hooks" / "definitions" / "ag2-sparrow-hatch.json")
+        prompt = json.loads((home / ".config" / "ag2-sparrow-hatch" / "hook-definition.json")
                             .read_text())["prompt"]
         named = {span.split()[0] for span in re.findall(r"`([^`]+)`", prompt)}
         assert {str(pathlib.Path(n).resolve()) for n in named} == \

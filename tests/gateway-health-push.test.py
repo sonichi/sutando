@@ -172,6 +172,22 @@ class Heartbeat(Base):
         self.assertNotIn("worker_health.v1", body["capabilities"])
 
 
+class OneContract(Base):
+    """health_command owns the broker's row contract; the snapshot path uses it too."""
+
+    def test_the_bridge_takes_fields_and_reason_grammar_from_health_command(self):
+        from ag2_sparrow import health_command as hc
+        self.assertIs(rgb.HEALTH_FIELDS, hc.FIELDS)
+        with mock.patch.object(hc, "slug", return_value="from-the-owner") as slug:
+            self.assertEqual(rgb._health_row({"reason": "Needs Login"})["reason"], "from-the-owner")
+        slug.assert_called_once_with("Needs Login")
+
+    def test_a_snapshot_row_passes_the_command_paths_validator(self):
+        from ag2_sparrow import health_command as hc
+        row = rgb._health_row(agent("core", "core", condition="abnormal", reason="Needs Login!" * 9))
+        self.assertEqual(hc.validate(row), (row, None))
+
+
 class SignedInIdentity(Base):
     def emit(self, connected):
         path = self.ws / "state" / "gateway-status.json"

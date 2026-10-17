@@ -109,7 +109,7 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
     if _NEVER_ONE_CLICK.search(prompt or "") or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out"):
         pass  # keeps the blocked card: never a one-click answer on a trust/spend gate
     elif gate == "login" or state == "logged-out":
-        kind, title = "auth", "Claude needs to be reconnected"
+        kind, title = "auth", "Claude needs you to sign in again"
         message = "Your Claude session has expired. Sign in again to continue."
         actions = [Action(id="authenticate", kind="authenticate", label="Sign in to Claude")]
     elif gate == "press-enter":

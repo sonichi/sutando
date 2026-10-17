@@ -46,6 +46,8 @@ Config (env / .env):
   REMOTE_TASK_ON_TASK   optional wake command, run once per newly queued task
                         file (argv split with shlex, no shell; file path appended;
                         the task's bytes on stdin, routing headers as SPARROW_* env)
+  REMOTE_HEALTH_COMMAND optional command printing the core's health row (JSON) for
+                        the heartbeat; see health_command.py
   REMOTE_OUTBOUND_SCAN_S outbound worker scan period seconds (default 1.0)
 
 Stdlib only (urllib) — no new dependencies.
@@ -309,6 +311,7 @@ from . import undelivered_quarantine
 from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
+from . import health_command
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
@@ -318,7 +321,7 @@ from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
                             RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
-from .delivery_core import REFUSED_FOR_GOOD
+from .delivery_core import is_refused_for_good
 from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_response_refused
 from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
                                               RESULT_THREAD_FIELD)
@@ -3195,9 +3198,13 @@ def _workers_body(ad: dict) -> dict:
     return ad["workers"]
 
 
-HEALTH_FIELDS = ("alive", "motion", "condition", "reason", "since")
+HEALTH_FIELDS = health_command.FIELDS
 HEALTH_TTL_S = 15.0
 _health_cache: dict = {"at": None, "value": None, "error": None}
+# An adapter's own core row, when it injects one; it outranks the monorepo snapshot's.
+_HEALTH_COMMAND = health_command.HealthCommand(
+    os.environ.get("REMOTE_HEALTH_COMMAND") or "", HEARTBEAT_INTERVAL, lambda m: _log(m),
+    env=lambda: _on_task_env())
 
 
 def _health_snapshot() -> "dict | None":
@@ -3223,10 +3230,9 @@ def _health_snapshot() -> "dict | None":
 
 
 def _health_row(agent: dict) -> dict:
-    """The wire row; the broker takes `reason` as a slug of [a-z0-9-]{1,40}."""
+    """The wire row, its `reason` made a slug the broker accepts."""
     row = {k: agent.get(k) for k in HEALTH_FIELDS}
-    if row["reason"] is not None:
-        row["reason"] = re.sub(r"[^a-z0-9-]+", "-", str(row["reason"]).lower()).strip("-")[:40].strip("-") or None
+    row["reason"] = health_command.slug(row["reason"])
     return row
 
 
@@ -3503,13 +3509,14 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     now = time.time()
     if _heartbeat_retry_at and now < _heartbeat_retry_at:
         return False
-    health = _core_health(_health_snapshot())
+    health = _HEALTH_COMMAND.row() if _HEALTH_COMMAND else _core_health(_health_snapshot())
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
-    _status, _step = _reported_core_status(health)
+    # An injected row is not the core's beat: presence status stays the core-status file's.
+    _status, _step = _reported_core_status(None if _HEALTH_COMMAND else health)
     try:
         payload = {
             "client": "sutando-gateway-client",
@@ -3585,6 +3592,9 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
         if _HELD_UNRESOLVED:
             # Staged relay asks the bridge can neither publish nor clear without a person.
             payload["ack_first_unresolved"] = sorted(_one_line(t)[:128] for t in _HELD_UNRESOLVED)[:20]
+        retrying = _relay_results_retrying(time.time())
+        if retrying:
+            payload["relay_results_retrying"] = retrying
         # Recovery surface: recovered ONLY via the probe-success terminal; a
         # missing block means "no episode known", never success.
         if _reenroll_state.get("code"):
@@ -4491,7 +4501,7 @@ def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
         resumed = (record.get("status") in ("READY", "QUEUED")
                    and record.get("requeue_reason") == _RELAY_RECLAIMED)
         target = RESULTS_DIR / f"{local}.txt"
-        if parked and record.get("reason") == REFUSED_FOR_GOOD:
+        if parked and is_refused_for_good(record.get("reason")):
             _finish_relay_end(core, broker_id, local, record, inflight)
             continue
         if not (parked or resumed) or os.path.lexists(target):
@@ -4528,7 +4538,8 @@ def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
 
 # The served task behind each staged `ack_first` task, for the publish that follows its ack.
 _HELD_TASKS: "dict[str, tuple[dict, str, str]]" = {}
-# Entries this process already logged as unresolved, so a stuck entry logs once.
+# Entries this process logged as malformed or with their staged file gone: each is reported once
+# per process, by intent. Never cleared: it grows with those error cases only, not with traffic.
 _HELD_REPORTED: "set[str]" = set()
 # Entries the last pass could neither publish nor clear, reported in the gateway status.
 _HELD_UNRESOLVED: "set[str]" = set()
@@ -4780,7 +4791,7 @@ def _staged_policy_tier(staged: Path) -> "tuple[str, str] | None":
     try:
         text = staged.read_text(encoding="utf-8", errors="replace")
         headers = local_task_protocol.parse_task_headers_trusted(text).headers
-    except Exception:  # noqa: BLE001 — unprovable, so withheld by the caller, never published
+    except Exception:  # noqa: BLE001 - unprovable, so withheld by the caller, never published
         return None
     frozen = local_task_protocol.canonical_access_tier(headers.get("access_tier"))
     if frozen not in _TIER_RANK:
@@ -4848,7 +4859,11 @@ def _end_withdrawn_relay_ask(tid: str, entry: dict, staged: Path, inflight: "set
     and no outcome would ever be posted. Once its local access has stayed withdrawn past the
     threshold, it is ended: the decision recorded in its entry, the relay `failed` result
     sent with no ceiling, then the staged file, the in-flight id and the entry retired, the
-    mark last, each step resumed by the next pass after a crash. It is never published."""
+    mark last, each step resumed by the next pass after a crash. It is never published.
+    A mark that cannot be retired here is retired by the next start: for a delivered `failed`
+    by `_retire_delivered_marks`, which keeps any mark an entry names and so relies on
+    `_put_held(tid, None)` above, and for one refused for good by
+    `_reclaim_parked_relay_results` through `_finish_relay_end`."""
     if entry.get("ending") is not True:
         dropped = _withdrawn_for_good(staged)
         if dropped is None:
@@ -4887,7 +4902,7 @@ def _relay_failed_sent(broker_id: str) -> bool:
     if record.get("status") not in ("DELIVERED", "PARKED"):
         core.deliver_one(broker_id, payload)
         record = read_item(core.backend.root, broker_id) or {}
-    if record.get("status") == "DELIVERED" or record.get("reason") == REFUSED_FOR_GOOD:
+    if record.get("status") == "DELIVERED" or is_refused_for_good(record.get("reason")):
         return True
     if record.get("status") == "PARKED":           # a park the relay rule could not prevent
         requeue_item_with_epoch(core.backend.root, broker_id, reset_attempts=True,
@@ -5681,6 +5696,38 @@ _RELAY_RETRY = RetrySchedule(window_s=100 * 365 * 86400.0)
 # Why a relay ask's parked result was requeued: by the drain, or at start after a downgrade.
 _RELAY_REOPENED = "relay result: retried until the broker accepts it"
 _RELAY_RECLAIMED = "relay result an older bridge parked: reclaimed at start"
+# A relay result this long into its retry run without an accept is reported in the gateway
+# status, and still retried: the window after which every other result parks.
+RELAY_RESULTS_RETRYING_AFTER_S = 600
+
+
+def _relay_results_retrying(now: float) -> "dict | None":
+    """How many relay results the broker has not accepted `RELAY_RESULTS_RETRYING_AFTER_S` or
+    more into their retry run, and the oldest one's age in seconds, both from the outbox
+    record's `retry.started_at`, which a requeue or a reclaim at start resets. None when none
+    has, and when it cannot be worked out (logged on a backoff), so the rest of the status is
+    still written. Read from the kept marks and their records; an unreadable one is skipped.
+    While the marks file cannot be read (`_load_ack_first` returns None and logs that on its
+    own backoff) the field is left out too, so its absence does not prove nothing is retrying."""
+    try:
+        root = _delivery_core("relay").backend.root
+        ages = []
+        for broker_id in filter(_valid_tid, _load_ack_first() or {}):
+            try:
+                record = read_item(root, broker_id) or {}
+            except (OSError, ValueError):
+                continue
+            retry = record.get("retry") if isinstance(record, dict) else None
+            started = retry.get("started_at") if isinstance(retry, dict) else None
+            if (isinstance(started, (int, float))
+                    and record.get("status") not in ("DELIVERED", "PARKED")
+                    and now - started >= RELAY_RESULTS_RETRYING_AFTER_S):
+                ages.append(now - started)
+        return {"count": len(ages), "oldest_age_s": int(max(ages))} if ages else None
+    except Exception as e:  # noqa: BLE001 - this field never costs the rest of the status write
+        _log_backoff(("relay-results-retrying",), f"relay_results_retrying not reported "
+                     f"({type(e).__name__}: {e}); the rest of the gateway status is written")
+        return None
 
 
 def _failed_in_place_of(stored: str) -> "str | None":
@@ -6289,7 +6336,7 @@ def _reopen_relay_result(core, item_id: str, tid: str, record: dict, result_file
     the broker refusing the `failed` too, is never reopened: see `_end_relay_result`."""
     if record.get("status") != "PARKED":
         return
-    if record.get("reason") == REFUSED_FOR_GOOD:
+    if is_refused_for_good(record.get("reason")):
         _end_relay_result(core, item_id, tid, record, result_file, generation)
         return
     outcome, _ = requeue_item_with_epoch(core.backend.root, item_id, reset_attempts=True,
@@ -6305,7 +6352,7 @@ def _end_relay_result(core, item_id: str, tid: str, record: dict, result_file, g
     steps leaves the mark for start-up to finish the end by (`_finish_relay_end`)."""
     _dispose_terminal(core, item_id, tid, record, result_file, generation)
     _log(f"ERROR result {tid}: the broker refused the answer and the `failed` sent in its place "
-         f"for good ({REFUSED_FOR_GOOD}); it is quarantined and not retried")
+         f"for good ({record.get('reason')}); it is quarantined and not retried")
 
 
 def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None" = None) -> bool:
@@ -6318,7 +6365,7 @@ def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None"
     record = read_item(root, item_id) or {}
     if record.get("status") == "DELIVERED":
         return _settle_task(tid, inflight)
-    if record.get("status") != "PARKED" or record.get("reason") != REFUSED_FOR_GOOD:
+    if record.get("status") != "PARKED" or not is_refused_for_good(record.get("reason")):
         return False
     # A relay result's end: its task and in-flight id retired on disk, the mark last.
     settled = _settle_task(tid, inflight)

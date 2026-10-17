@@ -65,6 +65,8 @@ PRIVATE, TEXT = "[dm-only]\nYour 3pm is with Dana.", "Your 3pm is with Dana."
 ANSWER = {"id": ASK_A, "body": TEXT, "capabilities": CONTRACT, "dm_only": True}
 FAILED = {"id": ASK_A, "body": "", "status": "failed", "capabilities": CONTRACT, "dm_only": False}
 DEAD = {"status": "dead", "reason": "send-failed:M_FORBIDDEN", "terminal": True}
+# A relay result refused for good parks under the prefix with the refusal's own reason kept.
+FOR_GOOD = "refused-for-good:permanent-refusal"
 DAY = 86400.0
 
 _LEDGERS = {"INFLIGHT_FILE": "remote-task-inflight", "TASK_ROOMS_FILE": "remote-task-rooms",
@@ -277,7 +279,7 @@ class TheRule(_Bridge):
         # The answer refused, the `failed` in its place refused too: sent once each, then ended.
         self.assertEqual([p for p in self.broker.results() if p["id"] == ASK_A], [ANSWER, FAILED])
         record = item(self.outbox_root, ASK_A)
-        self.assertEqual((record["status"], record["reason"]), ("PARKED", gw.REFUSED_FOR_GOOD))
+        self.assertEqual((record["status"], record["reason"]), ("PARKED", FOR_GOOD))
         self.assertEqual((json.loads(record["payload"]), json.loads(record["refused_payload"])),
                          (FAILED, ANSWER))
         self.assertEqual(record["resend_epoch"], 1, "the `failed` did not get an epoch of its own")
@@ -286,6 +288,7 @@ class TheRule(_Bridge):
         self.assertEqual(gw._load_ack_first(), {}, "the mark outlived the end")
         self.assertNotIn(ask, gw._load_inflight(), "the in-flight id outlived the end")
         self.assertEqual(sum(line.startswith(f"ERROR result {ask}: the broker refused") for line in self.lines), 1)
+        self.assertIn(f"for good ({FOR_GOOD}); it is quarantined", "".join(self.lines), "the reason was not logged")
         self.assertEqual(self.backoff_counts(ASK_A, ask), [], "counts outlived the end")
         self.assertIn(f"result {ask}: its relay result's end is complete; its task is settled and its relay "
                       "mark retired", self.lines)
@@ -295,7 +298,7 @@ class TheRule(_Bridge):
         self.assertFalse(gw._keep_relay_results_in_flight(inflight))
         gw._post_ready_results(inflight)
         self.assertEqual([p for p in self.broker.results() if p["id"] == ASK_A], [ANSWER, FAILED])
-        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], FOR_GOOD)
 
     def test_a_delivered_relay_results_backoff_counts_go_and_its_cadence_restarts(self):
         ask = self.delivered_after_waiting()
@@ -325,7 +328,7 @@ class TheRule(_Bridge):
         self.assertEqual(len(unconfirmed), 4)
         self.assertNotEqual(item(self.outbox_root, ASK_A)["status"], "PARKED")
 
-    def test_a_crash_after_the_end_never_lets_the_reclaim_revive_it(self):
+    def crash_after_the_end_then_a_start(self, reason: "str | None" = None) -> None:
         ask = self.serve(voice_ask())
         self.answer(ask)
         self.broker.result = "400"
@@ -335,13 +338,22 @@ class TheRule(_Bridge):
             for _pass in range(3):
                 self.drain()
                 clock[0] += 60.0
-        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], FOR_GOOD)
+        if reason is not None:
+            path = outbox._item_path(self.outbox_root, ASK_A)
+            path.write_text(json.dumps(dict(json.loads(path.read_text()), reason=reason)))
         self.assertEqual(gw._load_ack_first(), {ASK_A: ask})
         [copy] = self.quarantined()
         gw._reclaim_parked_relay_results(set())
         self.assertEqual(item(self.outbox_root, ASK_A)["status"], "PARKED", "the reclaim requeued it")
         self.assertEqual((self.quarantined(), gw._load_ack_first()), ([copy], {}))
         self.assertFalse((gw.RESULTS_DIR / f"{ask}.txt").exists())
+
+    def test_a_crash_after_the_end_never_lets_the_reclaim_revive_it(self):
+        self.crash_after_the_end_then_a_start()
+
+    def test_the_bare_reason_an_earlier_build_parked_with_is_the_end_too(self):
+        self.crash_after_the_end_then_a_start(reason="refused-for-good")
 
     def test_a_close_of_an_accepted_id_keeps_todays_policy(self):
         # The broker already took this task's result: no `failed` may follow it.
@@ -421,7 +433,7 @@ class TheRule(_Bridge):
         core.deliver_one(ASK_A, b"not json")
         record = item(self.outbox_root, ASK_A)
         self.assertEqual((record["status"], record["reason"], record["payload"]),
-                         ("PARKED", gw.REFUSED_FOR_GOOD, "not json"))
+                         ("PARKED", FOR_GOOD, "not json"))
         self.assertNotIn("refused_payload", record)
 
     def test_only_a_parked_result_is_reopened(self):
@@ -512,7 +524,7 @@ class TheRuleOnANamedInstance(_Bridge):
         for _pass in range(2):
             gw._save_inflight(self.drain())
             clock[0] += 60.0
-        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], FOR_GOOD)
         self.assertEqual(gw._load_ack_first(), {})
         self.assertEqual(self.backoff_counts(ASK_A, ask), [], "counts outlived the end")
 
@@ -565,6 +577,91 @@ class TheRuleOnANamedInstance(_Bridge):
 
     def test_while_the_alias_ledger_cannot_be_read_the_sweep_leaves_a_voice_asks_result(self):
         self.unreadable_then_swept(gw.DEDUP_ALIAS_FILE)
+
+
+class ReportedWhileRetrying(_Bridge):
+    """A relay result the broker has not accepted ten minutes into its retry run is reported in
+    the gateway status, as a count and the oldest one's age, and is still retried."""
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (("GATEWAY_STATUS_FILE", self.root / "state" / "gateway-status.json"),
+                            ("_HELD_UNRESOLVED", set())):
+            patcher = patch.object(gw, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def status(self) -> dict:
+        gw._emit_gateway_status(True)
+        return json.loads(gw.GATEWAY_STATUS_FILE.read_text())
+
+    def retrying(self, *asks: str) -> "list[str]":
+        tids = [self.serve(voice_ask(ask)) for ask in asks]
+        for tid in tids:
+            self.answer(tid)
+        self.broker.result = "down"
+        self.drain()
+        return tids
+
+    def test_only_a_relay_result_retrying_past_the_threshold_is_reported(self):
+        self.retrying(ASK_A, ASK_B)
+        typed = self.serve(typed_task())
+        self.answer(typed, "A collaborative workspace.")
+        self.drain()
+        self.assertNotIn("relay_results_retrying", self.status(), "reported under the threshold")
+        age_retry(self.outbox_root, ASK_A, 900)
+        age_retry(self.outbox_root, ASK_B, gw.RELAY_RESULTS_RETRYING_AFTER_S - 60)
+        age_retry(self.outbox_root, TYPED_A, 900)        # not a relay result: it parks instead
+        reported = self.status()["relay_results_retrying"]
+        self.assertEqual(reported["count"], 1)
+        self.assertTrue(900 <= reported["oldest_age_s"] < 960, reported)
+        age_retry(self.outbox_root, ASK_B, 120)
+        reported = self.status()["relay_results_retrying"]
+        self.assertEqual(reported["count"], 2)
+        self.assertTrue(900 <= reported["oldest_age_s"] < 960, "not the oldest one's age")
+        self.assertNotEqual(item(self.outbox_root, ASK_A)["status"], "PARKED", "reporting gave up on it")
+        self.broker.result = "ok"
+        self.drain()
+        self.assertEqual(gw._load_ack_first(), {})
+        self.assertNotIn("relay_results_retrying", self.status(), "the report outlived the delivery")
+
+    def test_a_delivered_result_whose_mark_a_crash_kept_is_not_reported(self):
+        ask, = self.retrying(ASK_A)
+        age_retry(self.outbox_root, ASK_A, 900)
+        self.broker.result = "ok"
+        with patch.object(gw, "_forget_ack_first"):    # died before the mark went
+            self.drain()
+        self.assertEqual((item(self.outbox_root, ASK_A)["status"], gw._load_ack_first()),
+                         ("DELIVERED", {ASK_A: ask}))
+        self.assertNotIn("relay_results_retrying", self.status())
+
+    def test_a_record_that_cannot_be_read_is_skipped_and_the_status_still_written(self):
+        self.retrying(ASK_A, ASK_B)
+        for ask in (ASK_A, ASK_B):
+            age_retry(self.outbox_root, ask, 900)
+        real = gw.read_item
+
+        def read_item(root, item_id):
+            if item_id == ASK_A:
+                raise PermissionError(13, "Permission denied")
+            return real(root, item_id)
+        with patch.object(gw, "read_item", read_item):
+            status = self.status()
+        self.assertIs(status["connected"], True)
+        self.assertEqual(status["relay_results_retrying"]["count"], 1)
+
+    def test_a_field_that_cannot_be_worked_out_is_left_out_and_the_status_still_written(self):
+        self.retrying(ASK_A)
+        path = outbox._item_path(self.outbox_root, ASK_A)
+        record = json.loads(path.read_text())
+        record["retry"]["started_at"] = float("-inf")    # an infinite age has no int
+        path.write_text(json.dumps(record))
+        for _write in range(2):
+            status = self.status()
+            self.assertIs(status["connected"], True)
+            self.assertNotIn("relay_results_retrying", status)
+        self.assertEqual(sum("relay_results_retrying not reported (OverflowError" in line
+                             for line in self.lines), 2, "not logged on the backoff")
 
 
 class TheReclaim(_Bridge):
@@ -720,7 +817,7 @@ class EndCutShort(_Bridge):
             for _pass in range(4):
                 self.drain()
                 clock[0] += 60.0
-        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], FOR_GOOD)
         self.assertEqual(gw._load_ack_first(), {ASK_A: ask}, "the mark went before the rest")
         return ask
 
@@ -738,7 +835,7 @@ class EndCutShort(_Bridge):
             for _pass in range(3):
                 self.drain()
         self.assertEqual(self.broker.results(), [ANSWER, FAILED], "posted again")
-        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], FOR_GOOD)
 
     def test_cut_short_before_the_quarantine(self):
         self.assert_finished_by_a_start(self.refused_for_good_until("_dispose_terminal", before=True))
@@ -877,7 +974,7 @@ class WithdrawnAccess(_Bridge):
     def test_a_failed_refused_for_good_still_ends_it(self):
         self.broker.result = "400"
         self.withheld_on_a_drop(age=700.0)
-        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], gw.REFUSED_FOR_GOOD)
+        self.assertEqual(item(self.outbox_root, ASK_A)["reason"], FOR_GOOD)
         self.assertEqual(self.broker.results(), [FAILED])
         self.assertEqual((gw._load_held(), gw._load_ack_first()), ({}, {}))
 
@@ -1014,9 +1111,14 @@ class NoCeiling(_Loop):
         self.bridges.wait_logged(second, f"result POST not confirmed for {ASK_A}")
         self.assertEqual(item(self.outbox_root, TYPED_A)["reason"], "retry-window-exhausted")
         self.assertNotEqual(item(self.outbox_root, ASK_A).get("status"), "PARKED")
+        self.bridges.wait_for(lambda: self.state("gateway-status").get("relay_results_retrying"),
+                              second, "the relay result reported as retrying")
+        self.assertEqual(self.state("gateway-status")["relay_results_retrying"]["count"], 1)
         self.relay.refusing = False
         self.bridges.wait_for(lambda: self.relay.results, second, "the relay result accepted")
         self.bridges.wait_for(lambda: not self.state("remote-task-ack-first"), second, "its mark retired")
+        self.bridges.wait_for(lambda: "relay_results_retrying" not in self.state("gateway-status"),
+                              second, "the report gone once accepted")
         self.bridges.polls_after(second)
         self.bridges.stop(second)
         self.assertEqual(self.relay.results, [ANSWER], "not posted exactly once")
@@ -1055,7 +1157,7 @@ class NoCeiling(_Loop):
         self.bridges.stop(second)
         self.assertEqual(self.posted(), [ANSWER, FAILED], "the restart revived it")
         record = item(self.outbox_root, ASK_A)
-        self.assertEqual((record["status"], record["reason"]), ("PARKED", gw.REFUSED_FOR_GOOD))
+        self.assertEqual((record["status"], record["reason"]), ("PARKED", FOR_GOOD))
         self.assertEqual(len(self.quarantined()), 1)
         self.assertEqual(self.relay.results, [])
 
@@ -1234,7 +1336,7 @@ class EndCutShortThroughTheLoop(_Loop):
         self.bridges.stop(second)
         self.assertEqual(self.posted(), [ANSWER, FAILED], "posted again after the restart")
         record = item(self.outbox_root, ASK_A)
-        self.assertEqual((record["status"], record["reason"]), ("PARKED", gw.REFUSED_FOR_GOOD))
+        self.assertEqual((record["status"], record["reason"]), ("PARKED", FOR_GOOD))
         self.assertEqual(len(self.quarantined()), 1)
         self.assertFalse((self.ws / "tasks" / f"{self.local}.txt").exists(), "the task was left in the queue")
 
