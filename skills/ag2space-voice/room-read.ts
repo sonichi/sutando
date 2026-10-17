@@ -161,7 +161,7 @@ export function mcpPayload(r: McpToolResult): Record<string, unknown> | null {
 const MATRIX_ROOM_ID = /^![A-Za-z0-9._=\-/+]+:[A-Za-z0-9.\-]+(:\d+)?$/;
 /** A Matrix event id, as read_room, search_room and add_comment return them. */
 const EVENT_ID = /^\$[^\s]{1,255}$/;
-/** A full Matrix user id — what room.message.send's mentions take. */
+/** A full Matrix user id — what room.message.send's and the comment actions' mentions take, once resolved. */
 const MATRIX_USER_ID = /^@[^\s:]+:[A-Za-z0-9.\-]+(:\d+)?$/;
 
 export interface RoomRef { room_id: string; name: string }
@@ -583,32 +583,104 @@ export async function writePage(args: { room?: string; title?: string; kind?: st
 	return { ok: true, room: target.room.name, did: kind ? 'appended' : 'created', title, kind: newKind, ms: Date.now() - t0 };
 }
 
+/** "me" in a mention: the user this agent acts for. */
+const MENTION_ME = /^(me|myself|i|owner|我|我自己)$/i;
+const nameKey = (s: string) => s.normalize('NFKC').toLowerCase().replace(/[\s._\-’'"]+/g, '');
+
+export type MentionResolution =
+	| { ok: true; ids: string[]; names: string[] }
+	| { ok: false; error: 'no_user' | 'ambiguous_user' | 'no_owner' | 'unavailable'; name: string; candidates?: string[] };
+
+type Person = { id: string; name: string };
+/** A person matches a spoken name on the whole display name, one word of it, or the id's local part. */
+function matches(p: Person, said: string): boolean {
+	const key = nameKey(said);
+	if (!key) return false;
+	const local = p.id.slice(1, p.id.indexOf(':'));
+	return nameKey(p.name) === key || nameKey(local) === key || p.name.split(/[\s\-_]+/).some(w => nameKey(w) === key);
+}
+
+/**
+ * Who to @, from what the user said: "me" is the owner (whoami), a name is looked up among the room's
+ * members and then across the space, and a full id must exist. The model never supplies an id it guessed.
+ */
+export async function resolveMentions(client: McpClient, room: RoomRef, said: string[], deps: Pick<ReadRoomDeps, 'log'>): Promise<MentionResolution> {
+	const ids: string[] = [], names: string[] = [];
+	let members: Person[] | null = null;
+	const roomMembers = async (): Promise<Person[]> => {
+		if (members) return members;
+		const r = await roomRead(client, room, 'room.members.list', {}, deps, ROOM_READ_CALL_TIMEOUT_MS);
+		const list = r.ok && Array.isArray(r.result.members) ? r.result.members as Array<{ user_id?: unknown; display_name?: unknown }> : [];
+		members = list.filter(m => typeof m.user_id === 'string').map(m => ({ id: m.user_id as string, name: typeof m.display_name === 'string' ? m.display_name : '' }));
+		return members;
+	};
+	const add = (p: Person) => { if (!ids.includes(p.id)) { ids.push(p.id); names.push(p.name || p.id); } };
+	for (const raw of said) {
+		const name = String(raw).trim().replace(/^@(?![^\s:]+:)/, '');
+		if (!name) continue;
+		if (MENTION_ME.test(name)) {
+			const owner = await ownerId(client);
+			if (!owner) return { ok: false, error: 'no_owner', name };
+			add({ id: owner, name: (await roomMembers()).find(m => m.id === owner)?.name || 'you' });
+			continue;
+		}
+		if (MATRIX_USER_ID.test(name)) {
+			const member = (await roomMembers()).find(m => m.id === name);
+			if (member) { add(member); continue; }
+			const r = await roomRead(client, null, 'space.user.profile.read', { user_id: name }, deps, ROOM_READ_CALL_TIMEOUT_MS);
+			if (!r.ok) return { ok: false, error: r.error === 'NOT_FOUND' ? 'no_user' : 'unavailable', name };
+			add({ id: name, name: typeof r.result.display_name === 'string' ? r.result.display_name : name });
+			continue;
+		}
+		let found = (await roomMembers()).filter(m => matches(m, name));
+		if (!found.length) {
+			const r = await roomRead(client, null, 'space.users.search', { query: name }, deps, ROOM_READ_CALL_TIMEOUT_MS);
+			if (!r.ok) return { ok: false, error: 'unavailable', name };
+			const users = Array.isArray(r.result.users) ? r.result.users as Array<{ user_id?: unknown; display_name?: unknown }> : [];
+			found = users.filter(u => typeof u.user_id === 'string').map(u => ({ id: u.user_id as string, name: typeof u.display_name === 'string' ? u.display_name : '' })).filter(p => matches(p, name));
+		}
+		if (!found.length) return { ok: false, error: 'no_user', name };
+		if (found.length > 1) return { ok: false, error: 'ambiguous_user', name, candidates: found.slice(0, 5).map(p => `${p.name || p.id} (${p.id})`) };
+		add(found[0]);
+	}
+	return { ok: true, ids, names };
+}
+
+/** The resolved ids are shown first by the server; the same "@id" typed into the text would show twice. */
+const withoutMentionIds = (text: string, ids: string[]) => ids.reduce((t, id) => t.split(id).join(''), text).replace(/[ \t]{2,}/g, ' ').trim();
+
 export type AddCommentResult =
-	| { ok: true; room: string; kind: string; quote: string | null; event_id: string | null; ms: number }
-	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
+	| { ok: true; room: string; kind: string; quote: string | null; event_id: string | null; mentions: number; mentioned: string[]; ms: number }
+	| { ok: false; error: string; candidates?: string[]; rooms?: string[]; name?: string };
 
 /**
  * A comment on a Commons page (room.commons.comments.add), as the web client leaves one: on the whole
  * page, or anchored to a passage of a Doc page with `quote`. 2026-10-13 21:16: "make a comment" was
- * appended to the page's text instead, and the user found no comment.
+ * appended to the page's text instead, and the user found no comment. `mentions` are named first and
+ * notified, as on room.message.send.
  */
-export async function addComment(args: { room?: string; kind?: string; text: string; quote?: string; reply_to?: string }, deps: ReadRoomDeps): Promise<AddCommentResult> {
+export async function addComment(args: { room?: string; kind?: string; text: string; quote?: string; reply_to?: string; mentions?: string[] }, deps: ReadRoomDeps): Promise<AddCommentResult> {
 	const t0 = Date.now();
 	const client = deps.client();
 	if (!client) return { ok: false, error: 'not_connected' };
-	const text = (args.text ?? '').trim();
+	let text = (args.text ?? '').trim();
 	if (!text) return { ok: false, error: 'no_text' };
 	if (text.length > ROOM_WRITE_TEXT_MAX) return { ok: false, error: 'too_long' };
+	const said = (args.mentions ?? []).map(m => String(m).trim()).filter(Boolean);
 	const replyTo = (args.reply_to ?? '').trim();
 	if (replyTo) {
 		// A reply in a comment thread: the thread's root, from a comment's event_id.
 		if (!EVENT_ID.test(replyTo)) return { ok: false, error: 'no_thread' };
 		const target = await targetRoom(args.room, deps);
 		if (!target.ok) return target;
-		const done = await roomExecute(client, target.room, 'room.commons.comments.reply', { root_event_id: replyTo, text }, deps);
+		const who = await resolveMentions(client, target.room, said, deps);
+		if (!who.ok) return who;
+		const mentions = who.ids;
+		text = withoutMentionIds(text, mentions) || text;
+		const done = await roomExecute(client, target.room, 'room.commons.comments.reply', { root_event_id: replyTo, text, ...(mentions.length ? { mentions } : {}) }, deps);
 		if (!done.ok) return done;
-		deps.log?.(`[RoomRead] room.commons.comments.reply in ${target.room.name}: ${text.length} chars`);
-		return { ok: true, room: target.room.name, kind: '', quote: null, event_id: typeof done.result.event_id === 'string' ? done.result.event_id : null, ms: Date.now() - t0 };
+		deps.log?.(`[RoomRead] room.commons.comments.reply in ${target.room.name}: ${text.length} chars${mentions.length ? ` @${mentions.length}` : ''}`);
+		return { ok: true, room: target.room.name, kind: '', quote: null, event_id: typeof done.result.event_id === 'string' ? done.result.event_id : null, mentions: mentions.length, mentioned: who.names, ms: Date.now() - t0 };
 	}
 	const kind = (args.kind ?? '').trim();
 	if (!/^((markdown|html|board|sheet)(-[a-z0-9]{8})?|readme)$/.test(kind)) return { ok: false, error: 'no_page' };
@@ -616,16 +688,20 @@ export async function addComment(args: { room?: string; kind?: string; text: str
 	if (quote && !/^markdown/.test(kind)) return { ok: false, error: 'no_quote' };
 	const target = await targetRoom(args.room, deps);
 	if (!target.ok) return target;
-	const done = await roomExecute(client, target.room, 'room.commons.comments.add', { kind, text, ...(quote ? { quote } : {}) }, deps);
+	const who = await resolveMentions(client, target.room, said, deps);
+	if (!who.ok) return who;
+	const mentions = who.ids;
+	text = withoutMentionIds(text, mentions) || text;
+	const done = await roomExecute(client, target.room, 'room.commons.comments.add', { kind, text, ...(quote ? { quote } : {}), ...(mentions.length ? { mentions } : {}) }, deps);
 	if (!done.ok) return done;
 	const event_id = typeof done.result.event_id === 'string' ? done.result.event_id : null;
-	deps.log?.(`[RoomRead] room.commons.comments.add on ${kind} in ${target.room.name}: ${text.length} chars${quote ? ' (on a passage)' : ''}`);
-	return { ok: true, room: target.room.name, kind, quote, event_id, ms: Date.now() - t0 };
+	deps.log?.(`[RoomRead] room.commons.comments.add on ${kind} in ${target.room.name}: ${text.length} chars${quote ? ' (on a passage)' : ''}${mentions.length ? ` @${mentions.length}` : ''}`);
+	return { ok: true, room: target.room.name, kind, quote, event_id, mentions: mentions.length, mentioned: who.names, ms: Date.now() - t0 };
 }
 
 export type SendMessageResult =
-	| { ok: true; room: string; event_id: string | null; reply: boolean; mentions: number; ms: number }
-	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
+	| { ok: true; room: string; event_id: string | null; reply: boolean; mentions: number; mentioned: string[]; ms: number }
+	| { ok: false; error: string; candidates?: string[]; rooms?: string[]; name?: string };
 
 /**
  * A message in a room's chat, as the agent, through room.message.send: optionally a reply to a message
@@ -635,16 +711,18 @@ export async function sendMessage(args: { room?: string; text: string; reply_to?
 	const t0 = Date.now();
 	const client = deps.client();
 	if (!client) return { ok: false, error: 'not_connected' };
-	const body = (args.text ?? '').trim();
+	let body = (args.text ?? '').trim();
 	if (!body) return { ok: false, error: 'no_text' };
 	if (body.length > ROOM_WRITE_TEXT_MAX) return { ok: false, error: 'too_long' };
 	const replyTo = (args.reply_to ?? '').trim();
 	const thread = (args.thread ?? '').trim();
 	if ((replyTo && !EVENT_ID.test(replyTo)) || (thread && !EVENT_ID.test(thread))) return { ok: false, error: 'no_message' };
-	const mentions = (args.mentions ?? []).map(m => String(m).trim()).filter(Boolean);
-	if (mentions.some(m => !MATRIX_USER_ID.test(m))) return { ok: false, error: 'no_user' };
 	const target = await targetRoom(args.room, deps);
 	if (!target.ok) return target;
+	const who = await resolveMentions(client, target.room, (args.mentions ?? []).map(m => String(m).trim()).filter(Boolean), deps);
+	if (!who.ok) return who;
+	const mentions = who.ids;
+	body = withoutMentionIds(body, mentions) || body;
 	const done = await roomExecute(client, target.room, 'room.message.send', {
 		body,
 		...(replyTo ? { reply_to: replyTo } : {}),
@@ -653,7 +731,7 @@ export async function sendMessage(args: { room?: string; text: string; reply_to?
 	}, deps);
 	if (!done.ok) return done;
 	deps.log?.(`[RoomRead] room.message.send in ${target.room.name}: ${body.length} chars${replyTo ? ' (reply)' : ''}${thread ? ' (thread)' : ''}${mentions.length ? ` @${mentions.length}` : ''}`);
-	return { ok: true, room: target.room.name, event_id: typeof done.result.event_id === 'string' ? done.result.event_id : null, reply: !!replyTo, mentions: mentions.length, ms: Date.now() - t0 };
+	return { ok: true, room: target.room.name, event_id: typeof done.result.event_id === 'string' ? done.result.event_id : null, reply: !!replyTo, mentions: mentions.length, mentioned: who.names, ms: Date.now() - t0 };
 }
 
 export function createReadRoomTool(deps: ReadRoomDeps): ToolDefinition {
@@ -812,22 +890,24 @@ export function createAddCommentTool(deps: ReadRoomDeps): ToolDefinition {
 			'Call it when the user wants to comment, remark or 留言 on a document or page ("comment on the design doc: Susan has reviewed"). To change the page\'s own text, use write_page instead. ' +
 			'Pass `kind` from a search_commons hit (e.g. "markdown-4m8ay3mg"), "markdown" for the main Doc, "html" for the main HTML page, or "readme"; `quote` = the exact passage to anchor to (Doc pages only), left out for a comment on the whole page. ' +
 			'To answer in an existing comment thread instead, pass `reply_to` = that comment\'s event_id and no kind. ' +
-			WRITE_CONFIRMATION +
+			'`mentions` = whom the user asked to @, as they said it: "me" for the user, a name ("Chi"), or a full user id; the tool looks each one up, so never make up an id. Only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own. Do not write the @ or their names into `text`: the mentioned are shown first. ' +
+			WRITE_CONFIRMATION.replace('on which page and in which room', 'on which page and in which room, and whom it mentions') +
 			'Leave `room` out for the room this session is in. ' +
-			'Returns {ok:true, room, kind, quote, event_id} — then tell the user in one sentence that the comment is on that page. ' +
-			'Errors: "no_text" — nothing to write; "too_long" — keep it under 4000 characters; "no_page" — the kind is not a page kind; "no_quote" — a quote anchors only on a Doc page; "no_thread" — reply_to is not a comment\'s event_id; "NOT_FOUND" — no such page, passage or thread; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
+			'Returns {ok:true, room, kind, quote, event_id, mentions, mentioned} — then tell the user in one sentence that the comment is on that page, naming whom it @-mentioned from `mentioned`. ' +
+			'Errors: "no_text" — nothing to write; "too_long" — keep it under 4000 characters; "no_page" — the kind is not a page kind; "no_quote" — a quote anchors only on a Doc page; "no_thread" — reply_to is not a comment\'s event_id; "no_user" — nobody by that name (`name`); say so and ask who they meant; "ambiguous_user" — several people match `name`: read out `candidates` and ask which; "no_owner" — you could not tell who the user is: ask for their name; "NOT_FOUND" — no such page, passage or thread; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not comment in that room; "not_connected" or "unavailable" — say the comment could not be left right now and nothing was written; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({
 			text: z.string().min(1).max(ROOM_WRITE_TEXT_MAX).describe('The exact comment, as the user confirmed it.'),
 			kind: z.string().optional().describe('The page\'s kind from a search_commons hit (e.g. "markdown-4m8ay3mg"), or "markdown" for the main Doc. Omit when replying in a thread.'),
 			quote: z.string().max(2000).optional().describe('A passage of the page to anchor the comment to, exactly as it reads there. Omit for the whole page.'),
 			reply_to: z.string().optional().describe('To reply in a comment thread: the comment\'s event_id.'),
+			mentions: z.array(z.string()).max(10).optional().describe('Whom to @ in the comment, as the user said it: "me", a name, or a full user id. Only when the user asked to @ them.'),
 			room: z.string().optional().describe('The room name, e.g. "Sutando Triage". Omit for the current room.'),
 		}),
 		execution: 'inline',
 		timeout: ROOM_INDEX_COLD_TIMEOUT_MS + ROOM_COMMONS_TIMEOUT_MS + 1000,
 		async execute(args) {
-			const a = (args ?? {}) as { room?: string; kind?: string; text: string; quote?: string; reply_to?: string };
+			const a = (args ?? {}) as { room?: string; kind?: string; text: string; quote?: string; reply_to?: string; mentions?: string[] };
 			const r = await addComment(a, deps);
 			deps.log?.(`[RoomRead] add_comment ${a.reply_to ? 'reply in a thread' : `on ${a.kind ?? ''}`} in ${a.room ? `"${a.room}"` : '(current room)'} → ${r.ok ? `left in ${r.ms}ms` : r.error}`);
 			return r;
@@ -842,18 +922,18 @@ export function createSendMessageTool(deps: ReadRoomDeps): ToolDefinition {
 			'Send a message in an AG2 Space room\'s chat, as this agent, where every member reads it. ' +
 			'Call it when the user wants something said or posted in a room ("tell Sutando Triage that …", "reply to Chi\'s message: …"). ' +
 			'Pass `text` = the message; `reply_to` = the event_id of the message it answers (from read_room or search_room), left out otherwise; `thread` = a thread root\'s event_id to post inside that thread. ' +
-			'`mentions` = full user ids (e.g. "@sutando-sonichi:ag2.space", from a message\'s sender) only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own. ' +
+			'`mentions` = whom the user asked to @, as they said it: "me" for the user, a name ("Chi"), or a full user id; the tool looks each one up, so never make up an id. Only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own. Do not write the @ or their names into `text`: the mentioned are shown first. ' +
 			WRITE_CONFIRMATION.replace('on which page and in which room', 'in which room, and whom it replies to or mentions') +
 			'Leave `room` out for the room this session is in. ' +
-			'Returns {ok:true, room, event_id, reply, mentions} — then tell the user in one sentence that it is posted. ' +
-			'Errors: "no_text" — nothing to send; "too_long" — keep it under 4000 characters; "no_message" — reply_to or thread is not a message\'s event_id; "no_user" — a mention is not a full user id; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
+			'Returns {ok:true, room, event_id, reply, mentions, mentioned} — then tell the user in one sentence that it is posted, naming whom it @-mentioned from `mentioned`. ' +
+			'Errors: "no_text" — nothing to send; "too_long" — keep it under 4000 characters; "no_message" — reply_to or thread is not a message\'s event_id; "no_user" — nobody by that name (`name`); say so and ask who they meant; "ambiguous_user" — several people match `name`: read out `candidates` and ask which; "no_owner" — you could not tell who the user is: ask for their name; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not post in that room; "not_connected" or "unavailable" — say it could not be sent right now and nothing was sent; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({
 			text: z.string().min(1).max(ROOM_WRITE_TEXT_MAX).describe('The exact message, as the user confirmed it.'),
 			room: z.string().optional().describe('The room name, e.g. "Sutando Triage". Omit for the current room.'),
 			reply_to: z.string().optional().describe('The event_id of the message this replies to. Omit for a plain message.'),
 			thread: z.string().optional().describe('The thread root\'s event_id, to post inside that thread.'),
-			mentions: z.array(z.string()).max(10).optional().describe('Full user ids to @, only when the user asked to @ them.'),
+			mentions: z.array(z.string()).max(10).optional().describe('Whom to @, as the user said it: "me", a name, or a full user id. Only when the user asked to @ them.'),
 		}),
 		execution: 'inline',
 		timeout: ROOM_INDEX_COLD_TIMEOUT_MS + ROOM_COMMONS_TIMEOUT_MS + 1000,
