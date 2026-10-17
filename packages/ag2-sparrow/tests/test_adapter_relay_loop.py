@@ -221,7 +221,7 @@ class DelegationTest(unittest.TestCase):
                 self.assertIs(getattr(mod.Adapter, name), getattr(rl.RelayLoop, name), (mod, name))
             for name in ("build_payload", "result_body", "Outcome", "log"):
                 self.assertIs(getattr(mod, name), getattr(rl, name), (mod, name))
-            for name in ("acquire_lock", "non_owner_note", "write_atomic"):
+            for name in ("acquire_lock", "non_owner_note", "write_atomic") if mod is ra else ("non_owner_note",):
                 self.assertIs(getattr(mod, name), getattr(task_io, name), (mod, name))
         self.assertIs(ra.RateLimiter, rl.RateLimiter)
         for name in ("parse_task", "load_done", "record_done", "write_atomic", "non_owner_note"):

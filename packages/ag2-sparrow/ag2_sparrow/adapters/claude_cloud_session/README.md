@@ -14,13 +14,54 @@ python3 -m ag2_sparrow.adapters.claude_cloud_session.session_adapter \
   --work <dir> --session-id session_... [--claude <path>] [options]
 ```
 
-`<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out,
-`<dir>/state/{done,sends.json,sending/,connector.pid}`. One adapter per work dir
-(`state/connector.pid`, liveness-checked; exit 3 if another holds it), one turn queued at a time,
-taken in the task protocol's priority order (`priority:` urgent, normal, low; oldest first within a
-priority). The loop, payload layout, result lines and hourly cap are the shared
-[`ag2_sparrow/relay_loop.py`](../../relay_loop.py), which the routine adapter uses too; this adapter keeps only the
-CLI call, the pre-send marker and the pacing gap.
+`<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out. One turn is queued at a time, taken
+in the task protocol's priority order (`priority:` urgent, normal, low; oldest first within a
+priority). The inbox loop and the payload builder are the shared
+[`ag2_sparrow/relay_loop.py`](../../relay_loop.py); every durable step is the owner module
+[`ag2_sparrow/task_lifecycle.py`](../../task_lifecycle.py) (canonical in `src/task_lifecycle.py`),
+which only this adapter uses. This adapter renders texts and calls the CLI; it writes nothing under
+`results/` or `state/` itself.
+
+## Deployment: one topology
+
+This adapter supports exactly one deployment: a new, dedicated, standalone relay (its own gateway
+bridge with the `AGENT_CONNECT_*` environment, as the support-cc relay runs). There is no cutover from
+an existing work dir and no Sutando-loader mode.
+
+```
+adapter:  --work=$CLOUD_WORK --gateway-state=$GATEWAY_STATE
+bridge:   AGENT_CONNECT_TASK_DIR=$CLOUD_WORK/tasks
+          AGENT_CONNECT_RESULT_DIR=$CLOUD_WORK/results
+          AGENT_CONNECT_STATE_DIR=$GATEWAY_STATE        (a dedicated directory outside $CLOUD_WORK)
+```
+
+`tasks/` and `results/` are the bridge's; `$CLOUD_WORK/state/` is the adapter's alone, and nothing
+lock-related lives under `$CLOUD_WORK`. `$CLOUD_WORK` is this adapter's own: never share it with any other adapter (the
+routine adapter, the Codex adapter, or a second cloud-session adapter). That is an operator rule; the
+adapter checks nothing about it beyond the single-process lock. The binary enforces the rest:
+
+- **Lock.** Its first act is the package's one-process lock, `holder_lock` (shared with the routine
+  and Codex adapters, so any second adapter of any kind on this dir refuses): a `flock` held for the
+  process's life in a lock directory outside `$CLOUD_WORK`, under the service user's local home, and
+  a holder record published at once. Then it creates `tasks/`, `results/` and `state/`. A held dir
+  is exit 3 naming the holder; a live pre-`holder_lock` adapter (a live pid in `state/connector.pid`)
+  is exit 3 naming the pid to stop; any other lock failure is exit 2. The lock is released on exit
+  and on SIGTERM. POSIX only; a network-mounted home refuses with `LockError("not a local
+  filesystem")` (remedy: a local home for the service user).
+- **Upgrade order: stop → install → start.** A `state/connector.pid` left by a pre-`holder_lock`
+  version is removed once when it is exactly one dead pid written before this start; anything else
+  there refuses naming it.
+- **Topology.** `--gateway-state` names the bridge's state dir so the adapter can check the layout:
+  a relative path, or one inside `$CLOUD_WORK`, refuses (exit 2, naming it).
+- **Fresh-dir rule.** Without `state/format`, `$CLOUD_WORK` may hold only the bridge's `tasks/` and
+  `results/` and an interrupted first init's own `state/` (an empty `settled-ids`, an empty `claims/`,
+  one marker temp `.format.<pid>.<6 hex>.tmp`); anything else refuses naming it. First init is one durable
+  transaction: create and fsync the empty ledger, create and fsync `claims/`, write `state/format`
+  (`cloud-session/1`) last by temp + fsync + rename, then fsync `state/`, `$CLOUD_WORK` and its
+  parent; an interrupted init completes on the next start. With the marker, `state/` may hold only
+  `format`, `claims/`, `settled-ids`, `rate.jsonl` and `done`, and the ledger and `claims/` must
+  exist; anything else refuses naming it.
+- **Probe.** Rename and hard link must work in `results/` and `state/`, else exit 2.
 
 ## Setup (once)
 
@@ -84,36 +125,57 @@ answers its owner here."): the session holds the owner's connector and there is 
 | no receipt, and a non-zero exit whose output proves the CLI never reached the service (DNS failure, refused connection), or the executable failed to start | retried after `--backoff` × 2ⁿ (cap `--backoff-max`), up to `--max-retries` (default 2), then "could not be reached … after several tries" |
 | no receipt otherwise: any other non-zero exit, exit 0 without one, or a timeout (`--timeout`, default 60 s; a receipt printed before the timeout still counts as queued) | "may or may not have reached the cloud agent …; it was not retried" — never resubmitted |
 
-A non-owner task's failure line never carries the exit code. Before each call the adapter writes
-`state/sending/<task_id>` (`sending`), rewrites it to `outcome` once the outcome is counted or to
-`unsent` before releasing the reservation of a proven-unsent call, and removes it only with the
-result. A crash mid-send is answered on restart with the "may or may not have reached" line instead
-of a second queued turn (at most once); a crash during a proven-unsent cleanup is retried once.
-Writer contract: a result is written once and never replaces another. It is staged as
-`results/.task-<id>.txt.staged`, the task is recorded in `state/done`, and the stage is then hard-linked
-to `results/task-<id>.txt` (no-replace: if a result is already there it stays, and the stage is
-discarded). Whether a result exists in any generation (live, mid-disposal, archived) is asked of the
-package's `local_task_protocol.find_result` and `result_disposal.find_claims`, never worked out here;
-delivery and claims belong to the bridge's outbox. On start, a staged body is published only when no
-generation exists, and an interrupted task gets its "interrupted" line only then too. Also on start,
-leftovers of tasks no longer in the inbox (cancelled or archived) are settled: an `unsent` marker and
-its reservation are dropped; any other marker (`sending`, `outcome`, or an older release's pid) is
-taken as possibly queued, counted with exactly one keyed entry (moved to, or created at, the start
-time unless its outcome was recorded) and recorded done; a reservation with neither a task nor a
-marker, which was never sent, is released.
+A non-owner task's failure line never carries the exit code.
 
-Pacing: at least `--min-gap-seconds` (default 2) between queued turns and at most `--max-per-hour`
-(default 60) in a sliding hour, kept in `state/sends.json` so a restart does not reset either. The cap
-counts turns that were queued or may have been; an attempt proven unsent does not use it. Each turn
-is counted before the CLI call, keyed by its task id, and dropped again only when the call proves it
-was never sent, so a crash right after a send cannot lose the count and a restart cannot count the
-same task twice. Once the outcome is known (queued or ambiguous) the entry moves to that time, so the
-gap counts from when the turn was queued, not from when the call started. On restart, a task that
-already holds an entry or a pre-send marker is settled first and skips both gates. A marked task gets
-its "may or may not have reached" result at once; if the crash came before its outcome was recorded,
-its one entry moves to the restart time, the latest the turn can have been queued, so the next turn
-still waits the full gap and the hour. A reserved but unmarked task, or one whose marker says
-`unsent`, is sent at once. None of them gains a second entry.
+### The task lifecycle (task_lifecycle.py)
+
+Each task has one claim, `state/claims/<task_id>/claim.json` (temp + fsync + rename), one attempt at a
+time: `PREPARED → CALLING → {NOT_DELIVERED | CONFIRMED | OUTCOME_UNKNOWN} → RESULT_STAGED → PUBLISHED →
+SETTLED`. `CALLING` is durable before the CLI runs. The exact rendered result body is staged at
+`state/claims/<task_id>/body` before it is published, and removed at `SETTLED`.
+
+- **Which result exists.** A strict classifier answers exactly one of `LIVE_READY`, `LIVE_UNREADY`,
+  `CLAIMED` (a result-disposal claim `.task-<id>.disposing-*`), `ARCHIVED`, `QUARANTINED` (any copy
+  under `results/undelivered/`, hash-free), `ABSENT`, or `UNKNOWN` when any lookup fails. Precedence:
+  `UNKNOWN` > `LIVE_READY` > `ARCHIVED` > `QUARANTINED` > `CLAIMED` > `LIVE_UNREADY` > `ABSENT`. The
+  decision is taken under `results/.disposal.lock`: `ABSENT` may call; a terminal state
+  (`LIVE_READY`, `ARCHIVED`, `QUARANTINED`) settles with no call and no new result; `CLAIMED`,
+  `LIVE_UNREADY` and `UNKNOWN` park the task and re-check it later.
+- **Publication (writer contract).** A result is written once and never replaces another. Under the
+  disposal lock the stage is copied to a unique dot-prefixed temp in `results/`, fsynced, read back,
+  renamed to a private sibling, and renamed no-replace to `results/task-<id>.txt`, with `results/`
+  fsynced after each step; the final file is read back under the same lock. A successful rename is
+  the win; if the final file is gone afterwards (a drain took it), the task still reads as won and is
+  never retried. If the name is taken, a ready result there settles the task (lost); an unfinished one
+  parks it. Delivery and claims of published results belong to the bridge's outbox; nothing here
+  re-implements them.
+- **Cancellation.** The task file is checked once more right before `CALLING` is written: a task
+  observed absent there is never called and its claim is dropped; a task observed present may be
+  called, even if it is removed before `CALLING` lands (it then follows its outcome).
+- **Recovery** (on start, after the lock): `PREPARED`/`NOT_DELIVERED` are retried only when the task
+  file exists and the classifier says `ABSENT`, settled when the task was removed or a terminal result
+  exists, parked otherwise; `CALLING` becomes `OUTCOME_UNKNOWN`, is counted at the restart time and
+  answered "may or may not have reached (interrupted)" unless a result exists, never resent; later
+  phases finish publishing.
+- **Settled ids.** `state/settled-ids` is append-only, one validated id per newline-terminated record.
+  Order, under the lock: the claim is written `SETTLED` (its directory fsynced), then the id is
+  appended in full and the ledger fsynced, and only then does the in-memory set change. A settled id
+  is never called again, whatever its file looks like later. On start, every `SETTLED` claim missing
+  from the ledger is re-appended, then the validated ledger is fsynced, before any claim is compacted
+  (24 h after `SETTLED`). Only an unterminated suffix left by a crash is truncated; any terminated
+  malformed record refuses naming its byte offset.
+- **Errors.** Any claim or ledger I/O error (read, write, fsync, rename, listing) keeps the claim as
+  it was, admits no work, compacts nothing, and exits 2 naming the path.
+- **Rate journal.** `state/rate.jsonl`: one fsynced line per attempt event (`reserved`, `queued`,
+  `unknown`, `unsent`) with the stable id `<task>:<attempt>:<kind>`. A reducer keeps one charge per
+  attempt: `unsent` cancels it, `queued`/`unknown` count once at the later time, `reserved` alone
+  counts nothing; replayed lines collapse. A torn last line is dropped on open, and lines older than
+  two hours are compacted away by temp + rename.
+
+Pacing: at least `--min-gap-seconds` (default 2) after the latest counted turn and at most
+`--max-per-hour` (default 60) counted turns in a sliding hour, both read from the journal, so a restart
+resets neither. A proven-unsent attempt counts nothing; an interrupted call counts at the restart time,
+the latest it can have been queued.
 
 ## Limits
 
@@ -137,5 +199,5 @@ still waits the full gap and the hour. A reserved but unmarked task, or one whos
 By hand on Claude Code 2.1.302, not by this adapter: queuing a turn returned in about 1 s, and a turn sent on stdin reached the session as the exact text; in the probe
 the session's `ag2_whoami` plus room post took 16 s. This adapter was tested only against a fake
 `claude` executable: `python3 packages/ag2-sparrow/tests/test_claude_cloud_session_adapter.py` and the
-shared loop's `test_adapter_relay_loop.py` (under the repository coverage gate through
-`tests/ag2-sparrow-claude-cloud-session.test.py` and `tests/ag2-sparrow-relay-loop.test.py`).
+owner's `test_task_lifecycle.py` (under the repository coverage gate through
+`tests/ag2-sparrow-claude-cloud-session.test.py` and `tests/ag2-sparrow-task-lifecycle.test.py`).

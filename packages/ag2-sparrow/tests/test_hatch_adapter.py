@@ -1073,6 +1073,8 @@ class FakeSystemd:
             rc = 0 if self.enabled else 1
         elif cmd[2] == "reset-failed":
             self.state = "inactive" if self.state == "failed" else self.state
+        elif cmd[2] == "stop":
+            self.state = "inactive"
         elif cmd[2] == "enable":
             self.enabled = True
             if "--now" in cmd:
@@ -1197,7 +1199,38 @@ class Service(Base):
         self.assertIn(f"installed: {self.unit}", r.stdout)
         self.assertIn("RestartSec=10\n", self.unit.read_text())
         self.assertEqual(len(fake.ran("daemon-reload")), 1)
-        self.assertEqual(fake.ran("restart"), [["--user", "restart", "ag2-sparrow.service"]])
+        self.assertEqual(fake.ran("stop"), [["--user", "stop", "ag2-sparrow.service"]])
+        self.assertEqual(fake.ran("restart"), [], "stopped before the install, started after it")
+        self.assertEqual(fake.state, "active")
+
+
+class InstallOrderTest(Service):
+    def test_the_upgrader_stops_then_installs_then_starts(self):
+        fake = FakeSystemd()
+        self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+        self.unit.write_text(self.unit.read_text().replace("RestartSec=10", "RestartSec=5"))
+        fake.calls.clear()
+        order = []
+        real_write = hatch_cli._write
+
+        def write(path, text, mode):
+            order.append("install " + Path(path).name)
+            return real_write(path, text, mode)
+
+        def systemd(cmd):
+            out = fake(cmd)
+            if cmd[0] == "systemctl" and cmd[2] in ("stop", "enable", "restart", "start"):
+                order.append(" ".join(cmd[2:]))
+            return out
+        with mock.patch.object(hatch_cli, "_write", write):
+            r = self.with_systemd(systemd, "install", "--mxid", AGENT, env={"USER": "hatch"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        stop = order.index("stop ag2-sparrow.service")
+        unit = order.index("install ag2-sparrow.service")
+        start = order.index("enable --now ag2-sparrow.service")
+        self.assertLess(stop, unit)
+        self.assertLess(unit, start)
+        self.assertNotIn("restart ag2-sparrow.service", order)
 
     def test_a_unit_install_did_not_write_is_kept_unless_forced(self):
         self.unit.parent.mkdir(parents=True)

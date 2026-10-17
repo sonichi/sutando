@@ -9,8 +9,8 @@ python3 skills/secret-vault/secret-vault.py env CLAUDE_ROUTINE_TOKEN -- \
   python3 -m ag2_sparrow.adapters.claude_routine.routine_adapter --work <dir> --trigger-id trig_... [options]
 ```
 
-`<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out, `<dir>/state/{done,fires.json,hold.json,connector.pid}`.
-One adapter per work dir (`state/connector.pid`, liveness-checked; exit 3 if another holds it), one fire in flight.
+`<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out, `<dir>/state/{done,fires.json,hold.json}`.
+One process per work dir, through the package's `holder_lock` (its first act; exit 3 naming the holder if another adapter of any kind holds the dir, exit 2 for any other lock failure; released on exit and on SIGTERM), one fire in flight.
 Tasks are taken in the task protocol's priority order (`priority:` urgent, normal, low; oldest first
 within a priority). The loop, payload layout, result lines and hourly cap live in the shared
 [`ag2_sparrow/relay_loop.py`](../../relay_loop.py), which the cloud session adapter uses too.
@@ -98,7 +98,7 @@ so a restart does not reset it; entries dated in the future (a clock stepped bac
 
 ## Lock, platform and upgrades
 
-The package's one-process lock, `ag2_sparrow.holder_lock` (see the package README), is what this adapter's single-instance check moves to. With it:
+This adapter's single-instance check is the package's one-process lock, `ag2_sparrow.holder_lock` (see the package README). So:
 
 - **POSIX only:** Linux and macOS; on Windows the adapter refuses to start with `LockError("unsupported platform: holder_lock is POSIX-only")`.
 - **Network-mounted home:** if the service user's home directory is on a network or FUSE filesystem, the adapter refuses to start with `LockError("not a local filesystem")`. Remedy: run it as a user with a local home directory.

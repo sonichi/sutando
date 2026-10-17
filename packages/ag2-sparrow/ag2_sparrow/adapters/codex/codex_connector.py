@@ -26,8 +26,9 @@ import threading
 import time
 import uuid
 
-from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, acquire_lock, attested_headers,  # noqa: F401
-                        load_done, non_owner_note, parse_task, pid_alive, record_done, write_atomic)
+from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, LockRefused, acquire_lock, attested_headers,  # noqa: F401
+                        exit_on_sigterm, load_done, make_dirs, non_owner_note, parse_task, pid_alive,
+                        exit_code, record_done, release_lock, root_path, stop_requested, write_atomic)
 
 CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
 APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
@@ -373,7 +374,7 @@ class Connector:
         done = 0
         idle_since = time.time()
         metrics_path = os.path.join(self.args.state, "metrics.jsonl")
-        while True:
+        while not stop_requested():
             names = self.pending_tasks(seen)
             if not names:
                 if self.args.once and done >= self.args.once:
@@ -473,18 +474,30 @@ def main(argv=None):
         return push(*args.push)
     if not args.work:
         build_parser().error("--work is required unless --push is given")
+    cwd_given = args.cwd
     args.work = os.path.abspath(args.work)
-    args.inbox = os.path.join(args.work, "tasks")
-    args.results = os.path.join(args.work, "results")
-    args.state = os.path.join(args.work, "state")
-    args.cwd = os.path.abspath(args.cwd or args.work)
-    for d in (args.inbox, args.results, args.state, os.path.join(args.state, "threads")):
-        os.makedirs(d, exist_ok=True)
-    lock = acquire_lock(args.state)
-    if lock is None:
-        sys.stderr.write("another connector holds %s (state/connector.pid is alive)\n" % args.work)
-        return 3
+    try:
+        owner = acquire_lock(args.work, "codex")
+    except LockRefused as e:
+        sys.stderr.write(e.line + "\n")
+        return e.code
+    exit_on_sigterm()
+    try:
+        make_dirs(owner, ("tasks", "results", "state", os.path.join("state", "threads")))
+        args.work = root_path(owner, args.work)
+        args.inbox = os.path.join(args.work, "tasks")
+        args.results = os.path.join(args.work, "results")
+        args.state = os.path.join(args.work, "state")
+        args.cwd = os.path.abspath(cwd_given or args.work)
+        return exit_code(serve_locked(args))
+    except LockRefused as e:
+        sys.stderr.write(e.line + "\n")
+        return e.code
+    finally:
+        release_lock(owner)
 
+
+def serve_locked(args):
     argv_srv = server_argv(args.server)
     stderr_path = os.path.join(args.state, "app-server-%s.stderr" % args.server)
 
@@ -501,10 +514,6 @@ def main(argv=None):
         c.rpc.close()
         c.drop_scratch()
         log("closed pid", c.rpc.p.pid, "rc", c.rpc.p.returncode)
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
     return 0
 
 

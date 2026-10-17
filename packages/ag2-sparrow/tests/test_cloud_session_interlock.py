@@ -6,7 +6,7 @@ directory outside the work dir, held for the process's life, and a holder record
 So whichever starts first holds the dir and every later one, of any kind, refuses at that flock with
 exit 3 naming the holder. Gated like test_task_lifecycle.py. Every wait is bounded, so a red run
 fails quickly. Run:
-    TASK_LIFECYCLE_CONTRACT=1 python3 packages/ag2-sparrow/tests/test_cloud_session_interlock.py
+    python3 packages/ag2-sparrow/tests/test_cloud_session_interlock.py
 """
 import atexit
 import contextlib
@@ -39,15 +39,70 @@ try:
 except ImportError:  # the package outside its repository has no contract mixin
     FirstActContract = None
 
-# Off until the owner module lands; TASK_LIFECYCLE_CONTRACT=1 turns the contract on.
-CONTRACT = os.environ.get("TASK_LIFECYCLE_CONTRACT", "0") == "1"
-GATE = unittest.skipUnless(CONTRACT, "the task-lifecycle contract is off (TASK_LIFECYCLE_CONTRACT=1 turns it on)")
+# On now that the owner module has landed; TASK_LIFECYCLE_CONTRACT=0 turns the contract off.
+CONTRACT = os.environ.get("TASK_LIFECYCLE_CONTRACT", "1") == "1"
+GATE = unittest.skipUnless(CONTRACT, "the task-lifecycle contract is off (TASK_LIFECYCLE_CONTRACT=0)")
 WAIT = 10.0
 # holder_lock keeps its lock dirs under the uid's home; these tests and their children use a temp home.
 LOCK_HOME = tempfile.mkdtemp(prefix="sparrow-lock-home-")
 holder_lock._home = lambda: LOCK_HOME
 atexit.register(shutil.rmtree, LOCK_HOME, True)
 SET_HOME = "from ag2_sparrow import holder_lock\nholder_lock._home = lambda: %r\n" % LOCK_HOME
+# Logs every holder_lock call (and whether a SIGTERM handler is on its stack), the signal, and each
+# stop check the serve loops make, one line each, to the given file.
+SPY = """
+import sys, time
+from ag2_sparrow import holder_lock as _hl, relay_loop as _rl, task_io as _tio
+from ag2_sparrow.adapters.codex import codex_connector as _cc
+_log, _handler = open(%r, "a", buffering=1), _tio._terminated
+
+
+def _note(*words):
+    _log.write(" ".join(map(str, words)) + " %%.4f\\n" %% time.monotonic())
+
+
+def _in_handler():
+    f = sys._getframe(1)
+    while f is not None and f.f_code not in (_handler.__code__, _spy_handler.__code__):
+        f = f.f_back
+    return f is not None
+
+
+def _spy(name, fn):
+    return lambda *a, **k: (_note("handler" if _in_handler() else "main", name), fn(*a, **k))[1]
+
+
+def _spy_handler(signum, frame):
+    _note("signal", signum)
+    _handler(signum, frame)
+
+
+def _check(fn):
+    return lambda: (lambda got: (_note("check", got), got)[1])(fn())
+
+
+for _name in [n for n in dir(_hl) if not n.startswith("_")]:
+    _fn = getattr(_hl, _name)
+    if callable(_fn) and not isinstance(_fn, type):
+        setattr(_hl, _name, _spy(_name, _fn))
+_tio._terminated = _spy_handler
+_rl.stop_requested = _check(_rl.stop_requested)
+_cc.stop_requested = _check(_cc.stop_requested)
+"""
+# After SPY: the relay loop always has one task whose retry is 30 s away, at a 1 s poll (cap 50 s).
+LONG_BACKOFF = """
+_serve = _rl.RelayLoop.serve
+
+
+def _backoff_serve(self):
+    self.args.poll = 1.0
+    self.pending = lambda seen: ["task-later.txt"]
+    self.next_ready = lambda names: (_note("backoff", 30), (None, 30))[1]
+    return _serve(self)
+
+
+_rl.RelayLoop.serve = _backoff_serve
+"""
 FAKE_CLAUDE = "#!%s\nimport sys\nsys.stdin.read()\nprint('{\"ok\": true, \"url\": \"u\"}')\n"
 CLOUD = """
 import sys
@@ -128,6 +183,11 @@ def wait_for(predicate, what, timeout=WAIT):
     raise AssertionError("timed out after %.0fs waiting for %s" % (timeout, what))
 
 
+def spied(log):
+    """The SPY log as (words, monotonic time) pairs."""
+    return [(w, float(t)) for w, t in (line.rsplit(" ", 1) for line in log.read_text().splitlines())]
+
+
 def holder(work):
     """(adapter, pid) of the published holder record of `work`, or None."""
     rec = holder_lock.read_holder(str(work))
@@ -163,11 +223,12 @@ class InterlockTest(unittest.TestCase):
         self.children.append(child)
         return child
 
-    def start(self, kind):
+    def start(self, kind, spy=""):
         """An adapter of `kind` holding the dir; returns (adapter name, pid) from its published record."""
-        code = {"cloud": CLOUD % (str(PKG_ROOT), SET_HOME, str(self.work), str(self.claude), str(self.base)),
-                "routine": ROUTINE % (str(PKG_ROOT), SET_HOME, str(self.work)),
-                "codex": CODEX % (str(PKG_ROOT), SET_HOME, str(self.work))}[kind]
+        setup = SET_HOME + spy
+        code = {"cloud": CLOUD % (str(PKG_ROOT), setup, str(self.work), str(self.claude), str(self.base)),
+                "routine": ROUTINE % (str(PKG_ROOT), setup, str(self.work)),
+                "codex": CODEX % (str(PKG_ROOT), setup, str(self.work))}[kind]
         child = self.spawn(code)
         legacy = self.work / "state" / "connector.pid"
         wait_for(lambda: holder(self.work) or child.poll() is not None or legacy.exists(),
@@ -278,18 +339,52 @@ class InterlockTest(unittest.TestCase):
         self.run_with_the_root_replaced_after_acquired(self.cloud_main)
         self.assertTrue((self.base / "moved" / "state" / "format").exists(), "first init on the original too")
 
-    def test_sigterm_runs_release_and_leaves_no_record(self):
+    def test_sigterm_only_flags_and_the_loop_releases_within_one_step(self):
+        """The handler calls nothing on holder_lock; the serve loop's next stop check sees the flag,
+        and release follows it with no further loop step."""
         for kind in ("cloud", "routine", "codex"):
             with self.subTest(adapter=kind):
                 self.work = self.base / kind
-                child, held_by = self.start(kind)
+                log = self.base / ("%s.spy" % kind)
+                child, held_by = self.start(kind, SPY % str(log))
+                wait_for(lambda: log.exists() and "check 0" in [w for w, _ in spied(log)],
+                         "the %s serve loop to run" % kind)
                 os.kill(held_by[1], signal.SIGTERM)
                 child.wait(WAIT)
                 self.assertEqual(child.returncode, 128 + signal.SIGTERM, child.stderr.read())
+                lines = spied(log)
+                self.assertEqual([w for w, _ in lines if w.startswith("handler ")], [],
+                                 "the signal handler called holder_lock")
+                at = [w for w, _ in lines].index("signal %d" % signal.SIGTERM)
+                after = [(w, t) for w, t in lines[at + 1:] if w != "main read_holder"]
+                self.assertEqual([w for w, _ in after[:2]], ["check %d" % signal.SIGTERM, "main release"],
+                                 "the next loop step stops, and release comes from the loop's caller")
+                self.assertLess(after[1][1] - lines[at][1], 1.0, "release within one 0.05s step")
                 self.assertIsInstance(holder_lock.read_holder(str(self.work)), holder_lock.Missing,
                                       "release ran: the record is gone")
                 self.assertFalse((self.work / "state" / "connector.pid").exists())
                 task_io.release_lock(task_io.acquire_lock(str(self.work), "check"))
+
+    def test_sigterm_during_a_long_retry_backoff_releases_within_two_seconds(self):
+        """The backoff sleep wakes on the stop flag; a running provider turn is bounded by its own
+        timeout instead (not driven here)."""
+        for kind in ("cloud", "routine"):
+            with self.subTest(adapter=kind):
+                self.work = self.base / kind
+                log = self.base / ("%s.backoff" % kind)
+                child, held_by = self.start(kind, SPY % str(log) + LONG_BACKOFF)
+                wait_for(lambda: log.exists() and "backoff 30" in [w for w, _ in spied(log)],
+                         "the %s loop to enter its 30 s backoff" % kind)
+                time.sleep(0.3)
+                os.kill(held_by[1], signal.SIGTERM)
+                child.wait(WAIT)
+                self.assertEqual(child.returncode, 128 + signal.SIGTERM, child.stderr.read())
+                lines = spied(log)
+                at = [w for w, _ in lines].index("signal %d" % signal.SIGTERM)
+                released = [t for w, t in lines[at + 1:] if w == "main release"]
+                self.assertTrue(released, "release ran after the signal")
+                self.assertLess(released[0] - lines[at][1], 2.0, "release within 2 s, not after the backoff")
+                self.assertIsInstance(holder_lock.read_holder(str(self.work)), holder_lock.Missing)
 
 
 @GATE

@@ -20,7 +20,8 @@ import time
 import urllib.error
 import urllib.request
 
-from ...task_io import acquire_lock, non_owner_note, write_atomic
+from ...task_io import (LockRefused, acquire_lock, exit_code, exit_on_sigterm, make_dirs, non_owner_note, release_lock,
+                        root_path, stoppable_sleep, write_atomic)
 from ...relay_loop import (HOUR, NO_ROOM, NON_OWNER_REFUSED, TEXT_MAX, Outcome, RateLimiter,  # noqa: F401
                           RelayLoop, build_payload, log, result_body)
 
@@ -86,7 +87,7 @@ def fire(endpoint, token, text, timeout=30.0, opener=urllib.request.urlopen):
 
 
 class Adapter(RelayLoop):
-    def __init__(self, args, token, opener=urllib.request.urlopen, clock=time.time, sleep=time.sleep, note=None):
+    def __init__(self, args, token, opener=urllib.request.urlopen, clock=time.time, sleep=stoppable_sleep, note=None):
         self.init_loop(args, "fires.json", clock, sleep)
         self.token, self.opener = token, opener
         self.note = note if note is not None else non_owner_note()
@@ -173,23 +174,25 @@ def main(argv=None, environ=None, opener=urllib.request.urlopen):
         sys.stderr.write("refusing to start: env var %s is empty or unset\n" % args.token_env)
         return 2
     args.work = os.path.abspath(args.work)
-    args.inbox = os.path.join(args.work, "tasks")
-    args.results = os.path.join(args.work, "results")
-    args.state = os.path.join(args.work, "state")
-    for d in (args.inbox, args.results, args.state):
-        os.makedirs(d, exist_ok=True)
-    lock = acquire_lock(args.state)
-    if lock is None:
-        sys.stderr.write("another adapter holds %s (state/connector.pid is alive)\n" % args.work)
-        return 3
     try:
+        owner = acquire_lock(args.work, "claude-routine")
+    except LockRefused as e:
+        sys.stderr.write(e.line + "\n")
+        return e.code
+    exit_on_sigterm()
+    try:
+        make_dirs(owner, ("tasks", "results", "state"))
+        args.work = root_path(owner, args.work)
+        args.inbox = os.path.join(args.work, "tasks")
+        args.results = os.path.join(args.work, "results")
+        args.state = os.path.join(args.work, "state")
         Adapter(args, token, opener).serve()
+    except LockRefused as e:
+        sys.stderr.write(e.line + "\n")
+        return e.code
     finally:
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
-    return 0
+        release_lock(owner)
+    return exit_code(0)
 
 
 if __name__ == "__main__":

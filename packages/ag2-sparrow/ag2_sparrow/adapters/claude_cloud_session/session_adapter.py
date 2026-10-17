@@ -5,7 +5,8 @@ Each `tasks/task-*.txt` becomes one `claude -p --cloud <session_id> --output-for
 turn text on stdin, never in argv. The CLI returns once the turn is queued; the session (set up once
 with session-prompt.md and the AG2 Space connector) posts the reply itself, so the result file written
 here is `[no-send]` plus the session URL as a comment; `--result-mode echo` writes a visible
-"Sent to the cloud agent: <url>" instead. One turn queued at a time, one adapter per work dir.
+"Sent to the cloud agent: <url>" instead. Every durable step (work-dir lock, claims, publication,
+rate journal, settled ids) is task_lifecycle's; this module renders texts and calls the CLI.
 The CLI's own login is the credential. Stdlib only.
 """
 import argparse
@@ -17,8 +18,10 @@ import subprocess
 import sys
 import time
 
-from ...task_io import acquire_lock, load_done, non_owner_note, record_done, write_atomic
+from ... import task_lifecycle
 from ...relay_loop import NO_ROOM, TEXT_MAX, Outcome, RelayLoop, build_payload, log, result_body
+from ...task_io import (LockRefused, acquire_lock, clear_attributed_pidfile, exit_code, exit_on_sigterm,
+                        make_dirs, non_owner_note, release_lock, root_path, stoppable_sleep)
 
 SESSION_RE = re.compile(r"session_[A-Za-z0-9]+")
 ROOM_RE = re.compile(r"![^\s:]+:\S+")
@@ -95,77 +98,52 @@ def queue_turn(claude, session_id, text, env, timeout=60.0, run=subprocess.run):
     return Outcome("ambiguous", detail="exit %d" % proc.returncode if proc.returncode else "no ok")
 
 
-def mark(path, phase):
-    write_atomic(path, phase + "\n")
+PARK_SECONDS = 30.0
 
 
-def mark_sending(path):
-    mark(path, "sending")
+class JournalGate:
+    """The send gates read from the lifecycle's rate journal: queued and possibly queued turns."""
+
+    def __init__(self, journal, per_hour):
+        self.journal, self.per_hour = journal, per_hour
+
+    @property
+    def times(self):
+        return self.journal.times()
+
+    def wait_seconds(self):
+        return self.journal.wait_seconds(self.per_hour)
 
 
 class Adapter(RelayLoop):
-    def __init__(self, args, clock=time.time, sleep=time.sleep, note=None, environ=None, run=subprocess.run):
-        self.init_loop(args, "sends.json", clock, sleep)
-        self.run = run
+    """Every durable step goes through task_lifecycle; this class only renders texts and calls the CLI."""
+
+    def __init__(self, args, clock=time.time, sleep=stoppable_sleep, note=None, environ=None, run=subprocess.run):
+        self.args, self.clock, self.sleep, self.run = args, clock, sleep, run
         self.note = note if note is not None else non_owner_note()
         self.env = child_env(environ)
-        self.sending_dir = os.path.join(args.state, "sending")
-
-    def _marker(self, task_id):
-        return os.path.join(self.sending_dir, task_id)
-
-    def _phase(self, task_id):
-        """sending (the call may have queued it), outcome (known, counted), unsent (proven), or None.
-        Any other content (an older format's pid) is read like sending: possibly queued."""
-        try:
-            with open(self._marker(task_id), encoding="utf-8") as f:
-                return (f.read().split() or ["sending"])[0]
-        except FileNotFoundError:
-            return None
-
-    def _clear(self, task_id):
-        try:
-            os.unlink(self._marker(task_id))
-        except FileNotFoundError:
-            pass
-
-    def _settled(self, name, seen):
-        super()._settled(name, seen)
-        self._clear(name[:-4])
-
-    def _count_possibly_sent(self, task_id, phase):
-        """One keyed entry for a turn that may have been queued, at the latest time it can have been."""
-        if phase == "outcome":
-            return
-        if self.limiter.holds(task_id):
-            self.limiter.touch(task_id)
-        else:
-            self.limiter.record(task_id)
+        self.lc = task_lifecycle.Lifecycle(args.work, clock=clock, log=log)
+        self.limiter = JournalGate(self.lc.journal, args.max_per_hour)
+        # The loop's done ledger is the settled-ids ledger: same one-id-per-line format, repaired on open.
+        self.done_path = self.lc.settled.path
+        self.attempts, self.limited, self.not_before = {}, {}, {}
+        self.blocked_until = 0.0
 
     def recover(self):
-        """Settle what a crash left behind for tasks no longer in the inbox (cancelled, archived)."""
-        super().recover()
-        done = set(load_done(self.done_path))
-        live = {n[:-4] for n in os.listdir(self.args.inbox) if n.startswith("task-") and n.endswith(".txt")}
-        markers = set(os.listdir(self.sending_dir)) if os.path.isdir(self.sending_dir) else set()
-        for task_id in sorted(markers):
-            if task_id in live and task_id not in done:
-                continue
-            phase = self._phase(task_id)
-            if task_id not in done:
-                if phase == "unsent":
-                    self.limiter.forget(task_id)
-                else:
-                    self._count_possibly_sent(task_id, phase)
-                    record_done(self.done_path, task_id)
-            log("settled a leftover marker ->", task_id, phase)
-            self._clear(task_id)
-        for task_id in {k for _, k in self.limiter.entries if k} - live - done - markers:
-            log("released the reservation of a task no longer queued, never sent ->", task_id)
-            self.limiter.forget(task_id)
+        self.lc.recover()
+
+    def _phase(self, task_id):
+        try:
+            rec = self.lc.claims.load(task_id)
+        except task_lifecycle.ClaimUnreadable:
+            return None
+        return rec["phase"] if rec else None
 
     def recovering(self, name):
-        return self._phase(name[:-4]) not in (None, "unsent") or self.limiter.holds(name[:-4])
+        """A task past its call only needs publishing: it skips the send gates, not its park delay."""
+        phase = self._phase(name[:-4])
+        return (phase is not None and phase not in task_lifecycle.CALLABLE
+                and self.not_before.get(name[:-4], 0) <= self.clock())
 
     def next_ready(self, names):
         name, wait = super().next_ready(names)
@@ -174,55 +152,88 @@ class Adapter(RelayLoop):
         gap = max(self.limiter.times) + self.args.min_gap_seconds - self.clock()
         return (None, gap) if gap > 0 else (name, 0.0)
 
+    def park(self, task_id, why):
+        log("parked ->", task_id, why)
+        self.not_before[task_id] = self.clock() + PARK_SECONDS
+        return False
+
+    def finish(self, name, body, seen):
+        """A result with no provider call (a refusal, no room): published through the lifecycle."""
+        if self.lc.complete_without_call(name[:-4], body, body.strip()) == "parked":
+            return self.park(name[:-4], "publication")
+        self._settled(name, seen)
+        return True
+
+    def _settled(self, name, seen):
+        seen.add(name[:-4])
+        for d in (self.attempts, self.limited, self.not_before):
+            d.pop(name[:-4], None)
+
+    def _publish(self, name, seen):
+        if self.lc.publish_and_settle(name[:-4]) == "parked":
+            return self.park(name[:-4], "publication")
+        self._settled(name, seen)
+        return True
+
     def step(self, name, seen):
         """Handle one task; returns True when it reached a final result."""
         task_id = name[:-4]
+        if task_id in self.lc.settled:
+            log("already settled, never called again ->", task_id)
+            seen.add(task_id)
+            return True
+        try:
+            rec = self.lc.claims.load(task_id)
+        except task_lifecycle.ClaimUnreadable as e:
+            return self.park(task_id, e)
+        if rec and rec["phase"] not in task_lifecycle.CALLABLE:
+            return self._publish(name, seen)
         task = self.read_task(name, seen)
         if task is None:
             return True
         headers, message, operator_lines = task
         owner = headers.get("access_tier") == "owner"
-        phase = self._phase(task_id)
-        if phase == "unsent":
-            self._clear(task_id)
-        elif phase is not None:
-            # A send began before a crash; resending could post twice.
-            log("interrupted send, not resent ->", task_id, phase)
-            self._count_possibly_sent(task_id, phase)
-            self.settle(name, result_body(INTERRUPTED, self.args.result_mode, owner, LABEL), seen)
-            return True
         if not self.admit(name, headers, seen):
             return True
         room, text = build_text(task_id, headers, message, operator_lines, self.note, self.args.owner_dm)
         if not room:
             log("no room ->", task_id)
-            self.finish(name, NO_ROOM, seen)
+            return self.finish(name, NO_ROOM, seen)
+        decision, state = self.lc.decide(task_id)
+        if decision == "settle":
+            self.lc.settle_without_result(task_id, "a result already exists (%s)" % state)
+            self._settled(name, seen)
             return True
-        log("queue ->", task_id, headers.get("access_tier"), "chars", len(text))
-        # Reserved before the send, keyed by task, so a crash after it can neither drop nor double the count.
-        self.limiter.record(task_id)
-        mark_sending(self._marker(task_id))
+        if decision == "park":
+            return self.park(task_id, state)
+        attempt = self.lc.prepare(task_id, result_body(INTERRUPTED, self.args.result_mode, owner, LABEL))
+        if not self.lc.begin_call(task_id, attempt, os.path.join(self.args.inbox, name)):
+            self._settled(name, seen)
+            return True
+        log("queue ->", task_id, headers.get("access_tier"), "attempt", attempt, "chars", len(text))
         out = queue_turn(self.args.claude, self.args.session_id, text, self.env, self.args.timeout, self.run)
         if out.kind == "retry":
-            # Marker first: a crash after it still reads as unsent, so a restart sends it again.
-            mark(self._marker(task_id), "unsent")
-            self.limiter.forget(task_id)
-            self._clear(task_id)
+            self.lc.not_delivered(task_id, attempt, out.detail)
             if self.schedule_retry(task_id, out.detail):
                 return False
+            kind = "final"
         else:
-            self.limiter.touch(task_id)
-            mark(self._marker(task_id), "outcome")
+            kind = "queued" if out.kind == "ok" else "unknown"
         log("result <-", task_id, out.kind, out.detail, out.session_id or "")
-        self.finish(name, result_body(out, self.args.result_mode, owner, LABEL), seen)
-        return True
+        self.lc.record_outcome(task_id, kind, result_body(out, self.args.result_mode, owner, LABEL),
+                               out.detail, out.url)
+        return self._publish(name, seen)
 
 
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--work", required=True, help="dir holding tasks/ results/ state/")
+    ap.add_argument("--work", required=True,
+                    help="$CLOUD_WORK: this adapter's own dir; the bridge's tasks/ and results/ live in it "
+                         "(README: deployment)")
     ap.add_argument("--session-id", required=True, help="the session_... id printed by `claude --cloud`")
     ap.add_argument("--claude", default="claude", help="the claude executable (default: claude on PATH)")
+    ap.add_argument("--gateway-state", default=None,
+                    help="the gateway bridge's AGENT_CONNECT_STATE_DIR; refused when inside --work")
     ap.add_argument("--owner-dm", default=None,
                     help="the owner's DM room id; answers meant for the owner alone go there "
                          "instead of a shared room")
@@ -261,22 +272,63 @@ def main(argv=None, environ=None):
         return 2
     args.claude = os.path.abspath(resolved)
     args.work = os.path.abspath(args.work)
+    try:
+        owner = acquire_lock(args.work, "claude-cloud-session")
+    except LockRefused as e:
+        sys.stderr.write(e.line + "\n")
+        return e.code
+    exit_on_sigterm()
+    try:
+        return exit_code(serve_locked(args, environ, owner))
+    finally:
+        release_lock(owner)
+
+
+def gateway_state_conflict(work, gateway_state):
+    """--gateway-state, the bridge's own state dir, must be absolute and outside the work dir."""
+    if gateway_state is None:
+        return None
+    if not os.path.isabs(gateway_state):
+        return "refusing to start: --gateway-state must be an absolute path (it is %r)" % gateway_state
+    root, mine = os.path.realpath(work), os.path.realpath(gateway_state)
+    if mine == root or mine.startswith(root + os.sep):
+        return ("refusing to start: --gateway-state %s is inside the work dir %s; the bridge's state "
+                "belongs outside it" % (gateway_state, work))
+    return None
+
+
+def startup_refusal(work, environ=None, gateway_state=None, owner=None):
+    """Checks that run after the lock is published and the directories exist; the first refusal, or None."""
+    return (gateway_state_conflict(work, gateway_state)
+            or (clear_attributed_pidfile(owner, work) if owner is not None else None)
+            or task_lifecycle.prepare_work_dir(work)
+            or task_lifecycle.probe_moves(os.path.join(work, "results"))
+            or task_lifecycle.probe_moves(os.path.join(work, "state")))
+
+
+def serve_locked(args, environ=None, owner=None):
+    """Under the published lock: the directories through the held root, then the startup checks
+    against that root's current path, then serving."""
+    try:
+        make_dirs(owner, ("tasks", "results", "state"))
+        args.work = root_path(owner, args.work)
+    except OSError as e:
+        sys.stderr.write("refusing to start: cannot create the work dirs (%s)\n" % e)
+        return 2
+    except LockRefused as e:
+        sys.stderr.write(e.line + "\n")
+        return e.code
     args.inbox = os.path.join(args.work, "tasks")
     args.results = os.path.join(args.work, "results")
     args.state = os.path.join(args.work, "state")
-    for d in (args.inbox, args.results, args.state, os.path.join(args.state, "sending")):
-        os.makedirs(d, exist_ok=True)
-    lock = acquire_lock(args.state)
-    if lock is None:
-        sys.stderr.write("another adapter holds %s (state/connector.pid is alive)\n" % args.work)
-        return 3
     try:
+        refusal = startup_refusal(args.work, environ, args.gateway_state, owner)
+        if refusal:
+            raise task_lifecycle.StartupRefused(2, refusal)
         Adapter(args, environ=environ).serve()
-    finally:
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
+    except task_lifecycle.StartupRefused as e:
+        sys.stderr.write(e.message + "\n")
+        return e.code
     return 0
 
 

@@ -9,8 +9,8 @@ python3 -m ag2_sparrow.adapters.codex.codex_connector --work <dir> [--server std
 python3 -m ag2_sparrow.adapters.codex.codex_connector --push <thread-id> <owner-task-file>
 ```
 
-`<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out, `<dir>/state/{threads/,done,metrics.jsonl,connector.pid}`.
-One connector per work dir: `state/connector.pid` is a liveness-checked lock (exit 3 if another holds it).
+`<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out, `<dir>/state/{threads/,done,metrics.jsonl}`.
+One process per work dir, through the package's `holder_lock` (its first act; exit 3 naming the holder if another adapter of any kind holds the dir, exit 2 for any other lock failure; released on exit and on SIGTERM).
 
 ## Tiers: what a non-owner sender gets
 
@@ -95,7 +95,7 @@ the rest is the TUI's drain cadence). Stub: file-to-file 0.08–0.13 s.
 
 ## Lock, platform and upgrades
 
-The package's one-process lock, `ag2_sparrow.holder_lock` (see the package README), is what this adapter's single-instance check moves to. With it:
+This adapter's single-instance check is the package's one-process lock, `ag2_sparrow.holder_lock` (see the package README). So:
 
 - **POSIX only:** Linux and macOS; on Windows the adapter refuses to start with `LockError("unsupported platform: holder_lock is POSIX-only")`.
 - **Network-mounted home:** if the service user's home directory is on a network or FUSE filesystem, the adapter refuses to start with `LockError("not a local filesystem")`. Remedy: run it as a user with a local home directory.

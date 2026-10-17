@@ -15,7 +15,8 @@ import uuid
 from pathlib import Path
 
 from . import local_task_protocol, result_disposal, task_priority
-from .task_io import load_done, non_owner_note, parse_task, record_done, write_atomic
+from .task_io import (load_done, non_owner_note, parse_task, record_done, stop_requested, stoppable_sleep,
+                      write_atomic)
 
 TEXT_MAX = 65536
 TRUNCATED = "\n[truncated]"
@@ -164,7 +165,7 @@ def result_exists(results, task_id):
 class RelayLoop:
     """The inbox loop. Subclasses set `limiter` (or call `init_loop`) and implement `step()`."""
 
-    def init_loop(self, args, limiter_file, clock=time.time, sleep=time.sleep):
+    def init_loop(self, args, limiter_file, clock=time.time, sleep=stoppable_sleep):
         self.args, self.clock, self.sleep = args, clock, sleep
         self.limiter = RateLimiter(os.path.join(args.state, limiter_file), args.max_per_hour, clock)
         self.done_path = os.path.join(args.state, "done")
@@ -276,7 +277,7 @@ class RelayLoop:
         seen = set(load_done(self.done_path))
         done = 0
         idle_since = self.clock()
-        while True:
+        while not stop_requested():
             names = self.pending(seen)
             if not names:
                 if self.args.once and done >= self.args.once:

@@ -2,7 +2,7 @@
 
 Every case runs against the vendored copy, and again against the canonical src/ copy when this
 package sits in its repository. Run:
-    TASK_LIFECYCLE_CONTRACT=1 python3 packages/ag2-sparrow/tests/test_task_lifecycle.py
+    python3 packages/ag2-sparrow/tests/test_task_lifecycle.py
 """
 import ast
 import atexit
@@ -46,9 +46,9 @@ LOCK_HOME = tempfile.mkdtemp(prefix="sparrow-lock-home-")
 holder_lock._home = lambda: LOCK_HOME
 atexit.register(shutil.rmtree, LOCK_HOME, True)
 SET_HOME = "from ag2_sparrow import holder_lock\nholder_lock._home = lambda: %r\n" % LOCK_HOME
-# Off until the owner module lands; TASK_LIFECYCLE_CONTRACT=1 turns the contract on.
-CONTRACT = os.environ.get("TASK_LIFECYCLE_CONTRACT", "0") == "1"
-GATE = unittest.skipUnless(CONTRACT, "the task-lifecycle contract is off (TASK_LIFECYCLE_CONTRACT=1 turns it on)")
+# On now that the owner module has landed; TASK_LIFECYCLE_CONTRACT=0 turns the contract off.
+CONTRACT = os.environ.get("TASK_LIFECYCLE_CONTRACT", "1") == "1"
+GATE = unittest.skipUnless(CONTRACT, "the task-lifecycle contract is off (TASK_LIFECYCLE_CONTRACT=0)")
 LEGACY = ("state/connector.pid", "state/sends.json", "state/fires.json", "state/sending")
 
 

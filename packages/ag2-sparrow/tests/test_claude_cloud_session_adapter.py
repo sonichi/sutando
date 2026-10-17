@@ -23,7 +23,7 @@ sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import team_guardrail  # noqa: E402
 
 from ag2_sparrow.adapters.claude_cloud_session import session_adapter as sa  # noqa: E402
-from ag2_sparrow import relay_loop as rl  # noqa: E402
+from ag2_sparrow import relay_loop as rl, result_disposal, result_ready, task_lifecycle as lc  # noqa: E402
 
 from ag2_sparrow.adapters.claude_routine import routine_adapter as ra  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
@@ -137,6 +137,14 @@ def run_adapter(work, fake, clock=None, run=subprocess.run, **kw):
     with contextlib.redirect_stderr(err_buf):
         ad.serve()
     return ad, err_buf.getvalue()
+
+
+def charges(work):
+    return lc.RateJournal(Path(work) / "state" / "rate.jsonl").charges()
+
+
+def claim(work, tid):
+    return lc.ClaimStore(Path(work) / "state" / "claims").load(tid)
 
 
 def text_of(call):
@@ -287,9 +295,10 @@ class QueueLoopTest(unittest.TestCase):
                 self.assertEqual(env[k], ENV[k])
             self.assertFalse([k for k in env if k.startswith("SUTANDO") or k in ("ANTHROPIC_API_KEY", "TERM")], env)
             self.assertNotIn("CLAUDE_CONFIG_DIR", env)
-            self.assertEqual((Path(d) / "state" / "done").read_text(), "task-a\n")
-            self.assertEqual(len(json.loads((Path(d) / "state" / "sends.json").read_text())), 1)
-            self.assertEqual(os.listdir(Path(d) / "state" / "sending"), [], "the marker goes with the result")
+            self.assertEqual((Path(d) / "state" / "settled-ids").read_text(), "task-a\n")
+            self.assertEqual(len(charges(d)), 1)
+            self.assertEqual(claim(d, "task-a")["phase"], "SETTLED")
+            self.assertEqual(sorted(os.listdir(Path(d) / "state")), ["claims", "rate.jsonl", "settled-ids"])
 
     def test_each_provider_call_carries_exactly_one_task_and_never_the_session_prompt(self):
         with tempfile.TemporaryDirectory() as d:
@@ -459,7 +468,7 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual(len(fake.calls()), 2)
             self.assertIn("turn=6", result(d, "task-u"))
             self.assertLess(clock.t - start, 60)
-            self.assertEqual(len(json.loads((Path(d) / "state" / "sends.json").read_text())), 1)
+            self.assertEqual(list(charges(d)), [("task-u", 2)], "only the attempt that queued counts")
 
     def test_pending_order_follows_task_priority(self):
         with tempfile.TemporaryDirectory() as d:
@@ -526,358 +535,6 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual((out.kind, out.detail), ("ambiguous", "timeout"))
             self.assertLess(time.time() - started, 30)
 
-    def crash_then_restart(self, d, fake):
-        class Crash(BaseException):
-            pass
-
-        def send_then_crash(argv, **kw):
-            subprocess.run(argv, **kw)
-            raise Crash()
-        write_task(d, "task-c", "x")
-        with self.assertRaises(Crash):
-            run_adapter(d, fake, run=send_then_crash, once=1)
-        self.assertFalse((Path(d) / "results" / "task-c.txt").exists())
-        run_adapter(d, fake, once=1)
-        return len(fake.calls())
-
-    def test_a_crash_after_the_send_marker_is_never_resent(self):
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [ok()])
-            self.assertEqual(self.crash_then_restart(d, fake), 1, "at most once across a crash")
-            self.assertEqual(result(d, "task-c"), "This message may or may not have reached the cloud agent "
-                                                  "(interrupted); it was not retried.\n")
-            self.assertEqual(os.listdir(Path(d) / "state" / "sending"), [])
-
-    def test_a_crash_after_the_send_still_counts_against_the_hour_once(self):
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [ok()])
-            self.assertEqual(self.crash_then_restart(d, fake), 1)
-            entries = json.loads((Path(d) / "state" / "sends.json").read_text())
-            self.assertEqual([e[1] for e in entries], ["task-c"], "counted once, across the crash and restart")
-            write_task(d, "task-next", "x")
-            clock = FakeClock()
-            start = clock.t
-            run_adapter(d, fake, clock=clock, once=1, max_per_hour=1)
-            self.assertEqual(len(fake.calls()), 2)
-            self.assertGreaterEqual(clock.t - start, 3600, "the next turn waited for the hour")
-
-    def sends(self, d):
-        return json.loads((Path(d) / "state" / "sends.json").read_text())
-
-    def test_full_cap_restart_settles_a_marked_task_at_once_with_one_entry(self):
-        class Crash(BaseException):
-            pass
-
-        def send_then_crash(argv, **kw):
-            subprocess.run(argv, **kw)
-            raise Crash()
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [ok()])
-            write_task(d, "task-c", "x")
-            first = FakeClock()
-            with self.assertRaises(Crash):
-                run_adapter(d, fake, clock=first, run=send_then_crash, once=1, max_per_hour=1)
-            self.assertEqual(self.sends(d), [[first.t, "task-c"]])
-            clock = FakeClock(first.t + 100)
-            start = clock.t
-            run_adapter(d, fake, clock=clock, once=1, max_per_hour=1, min_gap_seconds=30)
-            self.assertEqual(clock.t, start, "settling a marked task waits for no gate")
-            self.assertIn("(interrupted)", result(d, "task-c"))
-            self.assertEqual(self.sends(d), [[start, "task-c"]],
-                             "one entry, moved to the restart: the latest the unknown outcome can have been")
-            self.assertEqual(len(fake.calls()), 1)
-
-    def test_full_cap_restart_after_a_crash_before_the_marker_sends_once_without_waiting(self):
-        class Crash(BaseException):
-            pass
-
-        def crash(path):
-            raise Crash()
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [ok(2)])
-            write_task(d, "task-b", "x")
-            first = FakeClock()
-            with mock.patch.object(sa, "mark_sending", crash), self.assertRaises(Crash):
-                run_adapter(d, fake, clock=first, once=1, max_per_hour=1)
-            self.assertEqual(fake.calls(), [], "the crash came before the send")
-            self.assertEqual(self.sends(d), [[first.t, "task-b"]])
-            clock = FakeClock(first.t + 100)
-            start = clock.t
-            run_adapter(d, fake, clock=clock, once=1, max_per_hour=1, min_gap_seconds=30)
-            self.assertEqual(clock.t, start, "its own reservation does not hold it back")
-            self.assertEqual(len(fake.calls()), 1)
-            self.assertIn("turn=2", result(d, "task-b"))
-            self.assertEqual(self.sends(d), [[start, "task-b"]], "one entry, at the outcome time")
-
-    def crash_between_outcome_and_finalize(self, d, fake, **kw):
-        class Crash(BaseException):
-            pass
-        first = FakeClock()
-
-        def slow(argv, **k):
-            first.t += 10
-            return subprocess.CompletedProcess(argv, 0, ok()["stdout"], "")
-        write_task(d, "task-c", "x", mtime=1000)
-        with mock.patch.object(rl.RateLimiter, "touch", side_effect=Crash), self.assertRaises(Crash):
-            run_adapter(d, fake, clock=first, run=slow, once=1, **kw)
-        self.assertEqual(self.sends(d), [[first.t - 10, "task-c"]], "only the pre-send reservation was written")
-        return first.t
-
-    def next_turn_after_restart(self, d, fake, crashed_at, **kw):
-        write_task(d, "task-next", "x", mtime=2000)
-        clock = FakeClock(crashed_at + 5)
-        restart = clock.t
-        starts = []
-
-        def record(argv, **k):
-            starts.append(clock.t)
-            return subprocess.CompletedProcess(argv, 0, ok()["stdout"], "")
-        run_adapter(d, fake, clock=clock, run=record, once=2, **kw)
-        self.assertIn("(interrupted)", result(d, "task-c"))
-        return restart, starts
-
-    def test_crash_before_finalize_keeps_the_min_gap_for_the_next_turn(self):
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [ok()])
-            crashed = self.crash_between_outcome_and_finalize(d, fake, min_gap_seconds=2)
-            restart, starts = self.next_turn_after_restart(d, fake, crashed, min_gap_seconds=2)
-            self.assertEqual(len(starts), 1)
-            self.assertGreaterEqual(starts[0], restart + 2, "the gap runs from the settled turn")
-            self.assertEqual(self.sends(d), [[restart, "task-c"], [starts[0], "task-next"]],
-                             "the interrupted turn is counted once, at the restart")
-
-    def test_crash_before_finalize_keeps_the_hour_for_the_next_turn(self):
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [ok()])
-            crashed = self.crash_between_outcome_and_finalize(d, fake, max_per_hour=1)
-            restart, starts = self.next_turn_after_restart(d, fake, crashed, max_per_hour=1)
-            self.assertEqual(len(starts), 1)
-            self.assertGreaterEqual(starts[0], restart + 3600, "the settled turn holds the hour")
-
-    def test_a_cancelled_task_after_the_unsent_mark_frees_its_reservation(self):
-        class Crash(BaseException):
-            pass
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [{"rc": 1, "stderr": "getaddrinfo ENOTFOUND"}, ok(8)])
-            task = write_task(d, "task-cancelled", "x")
-            with mock.patch.object(rl.RateLimiter, "forget", side_effect=Crash), self.assertRaises(Crash):
-                run_adapter(d, fake, once=1, max_per_hour=1)
-            task.unlink()
-            write_task(d, "task-next", "x")
-            clock = FakeClock()
-            start = clock.t
-            run_adapter(d, fake, clock=clock, once=1, max_per_hour=1)
-            self.assertEqual(clock.t, start, "the proven-unsent attempt holds nothing")
-            self.assertEqual(len(fake.calls()), 2)
-            self.assertIn("turn=8", result(d, "task-next"))
-            self.assertEqual([e[1] for e in self.sends(d)], ["task-next"])
-            self.assertEqual(os.listdir(Path(d) / "state" / "sending"), [])
-
-    def test_leftovers_of_tasks_no_longer_queued_are_settled_on_start(self):
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [ok()])
-            state = Path(d) / "state"
-            (state / "sending").mkdir(parents=True)
-            for tid, phase in (("task-s", "sending"), ("task-o", "outcome"), ("task-done", "outcome")):
-                (state / "sending" / tid).write_text(phase + "\n")
-            (state / "done").write_text("task-done\n")
-            clock = FakeClock()
-            t0 = clock.t
-            lim = rl.RateLimiter(str(state / "sends.json"), 60, lambda: t0 - 50)
-            for key in ("task-s", "task-o", "task-gone", "task-done"):
-                lim.record(key)
-            run_adapter(d, fake, clock=clock)
-            self.assertEqual(fake.calls(), [])
-            self.assertEqual(os.listdir(state / "sending"), [])
-            self.assertEqual(sorted(self.sends(d), key=lambda e: e[1]),
-                             [[t0 - 50, "task-done"], [t0 - 50, "task-o"], [t0, "task-s"]],
-                             "an unknown outcome counts at the restart; a never-sent reservation is dropped")
-            self.assertEqual(set((state / "done").read_text().split()), {"task-done", "task-o", "task-s"})
-
-    def test_a_result_claimed_at_once_then_a_crash_is_never_answered_twice(self):
-        class Crash(BaseException):
-            pass
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [ok(1), ok(2)])
-            write_task(d, "task-q", "x")
-            results = Path(d) / "results"
-            live = results / "task-q.txt"
-            stop = threading.Event()
-
-            def drain():
-                n = 0
-                while not stop.is_set():
-                    try:
-                        live.rename(results / ("task-q.sending.%d.%d" % (os.getpid(), n)))
-                        n += 1
-                    except FileNotFoundError:
-                        pass
-                    time.sleep(0.001)
-            t = threading.Thread(target=drain, daemon=True)
-            t.start()
-
-            def claimed():
-                return [n for n in os.listdir(results) if n.startswith("task-q.sending.")]
-
-            def crash_once_claimed(*a, **k):
-                if live.exists() or claimed():
-                    deadline = time.time() + 5
-                    while not claimed() and time.time() < deadline:
-                        time.sleep(0.001)
-                    raise Crash()
-                return real_done(*a, **k)
-            real_done = rl.record_done
-            try:
-                with mock.patch.object(rl, "record_done", crash_once_claimed), \
-                        mock.patch.object(sa.Adapter, "_clear", side_effect=Crash), self.assertRaises(Crash):
-                    run_adapter(d, fake, once=1)
-                deadline = time.time() + 5
-                while not claimed() and time.time() < deadline:
-                    time.sleep(0.001)
-                self.assertEqual(len(claimed()), 1, "the drain took the result as it appeared")
-                run_adapter(d, fake, once=0)
-                time.sleep(0.05)
-            finally:
-                stop.set()
-                t.join()
-            self.assertEqual(len(fake.calls()), 1)
-            self.assertEqual(len(claimed()), 1, "no second result")
-            self.assertFalse(live.exists())
-            self.assertEqual((Path(d) / "state" / "done").read_text().split(), ["task-q"])
-            self.assertEqual([n for n in os.listdir(results) if n.startswith(".")], [])
-
-    def test_a_crash_after_the_unsent_mark_retries_exactly_once(self):
-        class Crash(BaseException):
-            pass
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [{"rc": 1, "stderr": "getaddrinfo ENOTFOUND"}, ok(7)])
-            write_task(d, "task-u", "x")
-            with mock.patch.object(rl.RateLimiter, "forget", side_effect=Crash), self.assertRaises(Crash):
-                run_adapter(d, fake, once=1, max_per_hour=1)
-            marker = Path(d) / "state" / "sending" / "task-u"
-            self.assertEqual(marker.read_text(), "unsent\n", "the marker moved before the reservation")
-            clock = FakeClock()
-            start = clock.t
-            run_adapter(d, fake, clock=clock, once=1, max_per_hour=1)
-            self.assertEqual(len(fake.calls()), 2, "retried exactly once")
-            self.assertIn("turn=7", result(d, "task-u"))
-            self.assertEqual(clock.t, start, "its own reservation does not hold the retry back")
-            self.assertFalse(marker.exists())
-
-    def test_retry_cleanup_marks_unsent_before_releasing_the_reservation(self):
-        order = []
-        real_mark, real_forget = sa.mark, rl.RateLimiter.forget
-
-        def spy_mark(path, phase):
-            order.append("mark " + phase)
-            real_mark(path, phase)
-
-        def spy_forget(lim, key):
-            order.append("forget")
-            real_forget(lim, key)
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(sa, "mark", spy_mark), \
-                mock.patch.object(rl.RateLimiter, "forget", spy_forget):
-            fake = Fake(d, [{"rc": 1, "stderr": "getaddrinfo ENOTFOUND"}, ok()])
-            write_task(d, "task-u", "x")
-            run_adapter(d, fake, once=1, backoff=1)
-        self.assertEqual(order[:3], ["mark sending", "mark unsent", "forget"])
-
-    def test_marker_phases_on_restart(self):
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [ok(4)])
-            for tid, phase in (("task-o", "outcome"), ("task-s", "sending"), ("task-e", "")):
-                write_task(d, tid, "x")
-                (Path(d) / "state" / "sending").mkdir(parents=True, exist_ok=True)
-                (Path(d) / "state" / "sending" / tid).write_text(phase)
-            run_adapter(d, fake, once=3)
-            self.assertEqual(fake.calls(), [], "a possibly queued turn is never resent")
-            for tid in ("task-o", "task-s", "task-e"):
-                self.assertIn("(interrupted)", result(d, tid))
-
-    def legacy_restart(self, d, reserved, **gates):
-        """A pid marker from the first release, with or without a keyed reservation, then a restart."""
-        fake = Fake(d, [ok()])
-        state = Path(d) / "state"
-        (state / "sending").mkdir(parents=True)
-        (state / "sending" / "task-old").write_text("75369\n")
-        write_task(d, "task-old", "x", mtime=1000)
-        write_task(d, "task-next", "x", mtime=2000)
-        clock = FakeClock()
-        restart = clock.t
-        if reserved:
-            rl.RateLimiter(str(state / "sends.json"), 60, lambda: restart - 50).record("task-old")
-        starts = []
-
-        def record(argv, **k):
-            starts.append(clock.t)
-            return subprocess.CompletedProcess(argv, 0, ok()["stdout"], "")
-        run_adapter(d, fake, clock=clock, run=record, once=2, **gates)
-        self.assertIn("(interrupted)", result(d, "task-old"), "settled, never resent")
-        self.assertEqual(len(starts), 1)
-        return restart, starts[0]
-
-    def test_a_legacy_pid_marker_counts_once_at_the_restart_for_both_gates(self):
-        for reserved in (True, False):
-            with self.subTest(reserved=reserved), tempfile.TemporaryDirectory() as d:
-                restart, start = self.legacy_restart(d, reserved, min_gap_seconds=2)
-                self.assertGreaterEqual(start, restart + 2)
-                self.assertEqual(self.sends(d), [[restart, "task-old"], [start, "task-next"]],
-                                 "exactly one keyed entry, at the restart")
-            with self.subTest(reserved=reserved, gate="hour"), tempfile.TemporaryDirectory() as d:
-                restart, start = self.legacy_restart(d, reserved, max_per_hour=1)
-                self.assertGreaterEqual(start, restart + 3600)
-
-    def test_a_dequeued_legacy_marker_without_a_reservation_still_counts(self):
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [ok()])
-            state = Path(d) / "state"
-            (state / "sending").mkdir(parents=True)
-            (state / "sending" / "task-gone").write_text("75369\n")
-            clock = FakeClock()
-            t0 = clock.t
-            run_adapter(d, fake, clock=clock)
-            self.assertEqual(self.sends(d), [[t0, "task-gone"]])
-            self.assertEqual((state / "done").read_text(), "task-gone\n")
-            self.assertEqual(os.listdir(state / "sending"), [])
-
-    def test_an_interrupted_task_with_an_archived_result_gets_no_second_one(self):
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [ok()])
-            state, results = Path(d) / "state", Path(d) / "results"
-            (state / "sending").mkdir(parents=True)
-            (state / "sending" / "task-a").write_text("outcome\n")
-            (results / "archive").mkdir(parents=True)
-            (results / "archive" / "task-a.txt").write_text("[no-send]\n")
-            write_task(d, "task-a", "x")
-            run_adapter(d, fake, once=1)
-            self.assertFalse((results / "task-a.txt").exists())
-            self.assertEqual((state / "done").read_text(), "task-a\n")
-            self.assertEqual(fake.calls(), [])
-            self.assertEqual(os.listdir(state / "sending"), [])
-
-    def test_min_gap_counts_from_the_outcome_not_the_start(self):
-        clock = FakeClock()
-        starts = []
-
-        def slow(argv, **kw):
-            starts.append(clock.t)
-            clock.t += 10
-            return subprocess.CompletedProcess(argv, 0, ok(len(starts))["stdout"], "")
-        with tempfile.TemporaryDirectory() as d:
-            fake = Fake(d, [ok()])
-            write_task(d, "task-1", "x", mtime=1000)
-            write_task(d, "task-2", "x", mtime=2000)
-            run_adapter(d, fake, clock=clock, run=slow, once=2, min_gap_seconds=2)
-            self.assertEqual(len(starts), 2)
-            self.assertGreaterEqual(starts[1], starts[0] + 10 + 2)
-            times = [e[0] for e in self.sends(d)]
-            self.assertEqual(times, [starts[0] + 10, starts[1] + 10], "each entry is the outcome time")
-
-    def test_without_the_marker_the_crash_would_resend(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(sa, "mark_sending", lambda path: None):
-            fake = Fake(d, [ok()])
-            self.assertEqual(self.crash_then_restart(d, fake), 2, "the marker is what prevents the second send")
-
     def test_min_gap_spaces_turns(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [ok()])
@@ -888,7 +545,7 @@ class QueueLoopTest(unittest.TestCase):
             run_adapter(d, fake, clock=clock, once=3, min_gap_seconds=30)
             self.assertEqual(len(fake.calls()), 3)
             self.assertGreaterEqual(clock.t - start, 60)
-            times = [e[0] for e in json.loads((Path(d) / "state" / "sends.json").read_text())]
+            times = sorted(charges(d).values())
             self.assertTrue(all(b - a >= 30 for a, b in zip(times, times[1:])), times)
 
     def test_hourly_cap_holds_the_next_turn_and_survives_restart(self):
@@ -902,7 +559,7 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual(len(fake.calls()), 3)
             self.assertGreaterEqual(clock.t - start, 3600)
             ad = sa.Adapter(args_for(d, fake.path, max_per_hour=1), clock=clock, sleep=clock.sleep, environ=ENV)
-            self.assertGreater(ad.limiter.wait_seconds(), 0, "sends.json is reloaded on restart")
+            self.assertGreater(ad.limiter.wait_seconds(), 0, "the rate journal is reloaded on restart")
 
     def test_skips_done_answered_vanished_and_roomless_tasks(self):
         with tempfile.TemporaryDirectory() as d:
@@ -911,7 +568,7 @@ class QueueLoopTest(unittest.TestCase):
             write_task(d, "task-has", "x")
             write_task(d, "task-x", "x", channel=None)
             (Path(d) / "state").mkdir(exist_ok=True)
-            (Path(d) / "state" / "done").write_text("task-old\n")
+            (Path(d) / "state" / "settled-ids").write_text("task-old\n")
             (Path(d) / "results").mkdir(exist_ok=True)
             (Path(d) / "results" / "task-has.txt").write_text("done")
             run_adapter(d, fake)
@@ -946,21 +603,25 @@ class MainTest(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("not an executable", out)
 
-    def test_runs_from_path_releases_the_pidfile_and_refuses_a_live_holder(self):
+    def test_runs_from_path_and_releases_the_work_lock(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [ok(4)])
-            write_task(d, "task-m", "x")
+            work = Path(d) / "cloud-session"
             env = dict(ENV, PATH=str(fake.dir) + os.pathsep + ENV["PATH"])
-            argv = ["--work", d, "--session-id", SID, "--once", "1", "--poll", "0.01"]
-            rc, _ = self.run_main(argv, env)
-            self.assertEqual(rc, 0)
-            self.assertIn("turn=4", result(d, "task-m"))
+            argv = ["--work", str(work), "--session-id", SID, "--poll", "0.01", "--idle-exit", "0.05"]
+            self.assertEqual(self.run_main(argv, env)[0], 0, "a first start on an absent dir initialises it")
+            write_task(work, "task-m", "x")
+            rc, err = self.run_main(argv + ["--once", "1"], env)
+            self.assertEqual(rc, 0, err)
+            self.assertIn("turn=4", result(work, "task-m"))
             self.assertEqual(fake.calls()[0]["argv"][0], str(fake.path), "claude resolved on the child's PATH")
-            self.assertFalse((Path(d) / "state" / "connector.pid").exists())
-            (Path(d) / "state" / "connector.pid").write_text("%d\n" % os.getppid())
-            rc, out = self.run_main(argv, env)
-            self.assertEqual(rc, 3)
-            self.assertIn("another adapter", out)
+            self.assertFalse((work / "state" / "connector.pid").exists())
+            self.assertEqual(self.run_main(argv, env)[0], 0, "a work dir this binary created restarts")
+            (Path(d) / "old" / "state").mkdir(parents=True)
+            (Path(d) / "old" / "state" / "sends.json").write_text("[]")
+            rc, err = self.run_main(["--work", str(Path(d) / "old"), "--session-id", SID, "--idle-exit", "0.05"], env)
+            self.assertEqual(rc, 2)
+            self.assertIn("state/sends.json", err)
 
 
 if __name__ == "__main__":

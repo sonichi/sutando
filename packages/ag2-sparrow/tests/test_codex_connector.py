@@ -527,25 +527,22 @@ class EdgePathTest(unittest.TestCase):
             self.assertEqual(cc.load_done(p), ["a", "c", "d"])
             self.assertEqual(cc.load_done(os.path.join(d, "missing")), [])
 
-    def test_single_instance_lock(self):
+    def test_the_connector_refuses_at_the_shared_flock_and_names_the_holder(self):
         with tempfile.TemporaryDirectory() as d:
-            state = os.path.join(d, "state")
-            os.makedirs(state)
-            sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            code = ("import sys, time\nsys.path.insert(0, %r)\nfrom ag2_sparrow import task_io\n"
+                    "owner = task_io.acquire_lock(%r, 'holder-test')\nprint('held', flush=True)\ntime.sleep(30)\n"
+                    % (str(Path(__file__).resolve().parents[1]), d))
+            holder = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
             try:
-                Path(state, "connector.pid").write_text("%d\n" % sleeper.pid)
-                self.assertEqual(cc.main(["--server", "stub", "--work", d, "--once", "1"]), 3)
+                self.assertEqual(holder.stdout.readline().strip(), "held")
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(cc.main(["--server", "stub", "--work", d, "--once", "1"]), 3)
+                self.assertIn("refusing to start: %s is held by holder-test pid " % d, err.getvalue())
+                self.assertFalse(os.path.exists(os.path.join(d, "state")), "refused before creating anything")
             finally:
-                sleeper.kill()
-                sleeper.wait()
-            Path(state, "connector.pid").write_text("%d\n" % sleeper.pid)   # now a dead pid
-            self.assertIsNotNone(cc.acquire_lock(state))
-            self.assertEqual(Path(state, "connector.pid").read_text().strip(), str(os.getpid()))
-            Path(state, "connector.pid").write_text("garbage")
-            self.assertIsNotNone(cc.acquire_lock(state))
-            Path(state, "connector.pid").write_text("garbage")
-            with mock.patch.object(cc.os, "unlink", side_effect=FileNotFoundError):
-                self.assertIsNone(cc.acquire_lock(state), "two failed creates in a row: give up")
+                holder.kill()
+                holder.wait()
         self.assertTrue(cc.pid_alive(os.getpid()))
         with mock.patch.object(cc.os, "kill", side_effect=PermissionError):
             self.assertTrue(cc.pid_alive(1))

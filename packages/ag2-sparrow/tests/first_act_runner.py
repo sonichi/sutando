@@ -6,7 +6,8 @@
 Prints `acquired` once the adapter is serving (after publishing its record and running one short
 child, the caller's own after-publish child), or the refusing result's class name when main
 returns non-zero.
-Closing stdin stops the adapter with SIGTERM, so its own handler releases the lock.
+Once serving, closing stdin stops the adapter with SIGTERM: its handler sets the flag, its loop
+returns and its main releases the lock; that stop exits 0 here.
 """
 import os
 import signal
@@ -38,14 +39,17 @@ def main():
     def publish(owner, name):
         out = real_publish(owner, name)
         subprocess.run(["true"], check=True)
-        threading.Thread(target=lambda: (sys.stdin.read(), os.kill(me, signal.SIGTERM)), daemon=True).start()
         return out
     holder_lock.acquire, holder_lock.publish = acquire, publish
     from ag2_sparrow import relay_loop
     from ag2_sparrow.adapters.codex import codex_connector
 
     def serving(real):
-        return lambda self, *a, **k: (print("acquired", flush=True), real(self, *a, **k))[1]
+        def serve(self, *a, **k):
+            print("acquired", flush=True)
+            threading.Thread(target=lambda: (sys.stdin.read(), os.kill(me, signal.SIGTERM)), daemon=True).start()
+            return real(self, *a, **k)
+        return serve
     relay_loop.RelayLoop.serve = serving(relay_loop.RelayLoop.serve)
     codex_connector.Connector.serve = serving(codex_connector.Connector.serve)
     me = os.getpid()
@@ -62,7 +66,7 @@ def main():
                      {"PATH": "/usr/bin:/bin", "HOME": tempfile.gettempdir()})
     if rc and seen.get("result") not in (None, "Acquired"):
         print(seen["result"], flush=True)
-    return rc
+    return 0 if rc == 128 + signal.SIGTERM else rc
 
 
 if __name__ == "__main__":

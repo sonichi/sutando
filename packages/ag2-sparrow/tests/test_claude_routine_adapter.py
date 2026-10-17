@@ -501,7 +501,7 @@ class MainTest(unittest.TestCase):
             (Path(d) / "state" / "connector.pid").write_text("%d\n" % os.getppid())
             rc, out = self.run_main(argv, env)
             self.assertEqual(rc, 3)
-            self.assertIn("another adapter", out)
+            self.assertIn("stop the old adapter (pid %d), then start" % os.getppid(), out)
 
     def test_result_write_is_atomic(self):
         with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (_, base):

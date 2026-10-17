@@ -1,7 +1,7 @@
 """The cloud-session adapter's side of the task-lifecycle contract, end to end through the adapter.
 
-Gated like test_task_lifecycle.py: TASK_LIFECYCLE_CONTRACT=1 turns these on. Run:
-    TASK_LIFECYCLE_CONTRACT=1 python3 packages/ag2-sparrow/tests/test_cloud_session_contract.py
+Gated like test_task_lifecycle.py (on by default; TASK_LIFECYCLE_CONTRACT=0 turns them off). Run:
+    python3 packages/ag2-sparrow/tests/test_cloud_session_contract.py
 """
 import atexit
 import json
@@ -23,8 +23,8 @@ from test_claude_cloud_session_adapter import (FakeClock, Fake, ok, result, run_
 
 from ag2_sparrow import holder_lock, result_disposal, result_ready, task_lifecycle as lc  # noqa: E402
 
-# Off until the owner module lands; TASK_LIFECYCLE_CONTRACT=1 turns the contract on.
-CONTRACT = os.environ.get("TASK_LIFECYCLE_CONTRACT", "0") == "1"
+# On now that the owner module has landed; TASK_LIFECYCLE_CONTRACT=0 turns the contract off.
+CONTRACT = os.environ.get("TASK_LIFECYCLE_CONTRACT", "1") == "1"
 
 
 # holder_lock keeps its lock dirs under the uid's home; these tests and their children use a temp home.
@@ -48,7 +48,7 @@ def claim(work, tid):
     return lc.ClaimStore(Path(work) / "state" / "claims").load(tid)
 
 
-@unittest.skipUnless(CONTRACT, "the task-lifecycle contract is off (TASK_LIFECYCLE_CONTRACT=1 turns it on)")
+@unittest.skipUnless(CONTRACT, "the task-lifecycle contract is off (TASK_LIFECYCLE_CONTRACT=0)")
 class AdapterLifecycleTest(unittest.TestCase):
     def crash_during_the_call(self, d, fake, clock):
         class Crash(BaseException):
