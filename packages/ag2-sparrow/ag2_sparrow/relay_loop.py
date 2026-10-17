@@ -137,6 +137,18 @@ class RateLimiter:
         self._save()
 
 
+STAGED_RE = re.compile(r"\.(task-.+\.txt)\.staged")
+
+
+def staged_path(results, name):
+    # Dot-prefixed in the same directory: drains never list it, and publishing is one rename.
+    return os.path.join(results, ".%s.staged" % name)
+
+
+def publish(staged, path):
+    os.replace(staged, path)
+
+
 class RelayLoop:
     """The inbox loop. Subclasses set `limiter` (or call `init_loop`) and implement `step()`."""
 
@@ -158,8 +170,12 @@ class RelayLoop:
         return [p.name for p in task_priority.sort_tasks_by_priority(paths)]
 
     def finish(self, name, body, seen):
-        write_atomic(os.path.join(self.args.results, name), body)
+        """Stage the body, record the task done, then publish: a drain may claim the result the
+        moment it appears, so the done record must already say the task is settled."""
+        staged = staged_path(self.args.results, name)
+        write_atomic(staged, body)
         record_done(self.done_path, name[:-4])
+        publish(staged, os.path.join(self.args.results, name))
         seen.add(name[:-4])
         self.attempts.pop(name[:-4], None)
         self.limited.pop(name[:-4], None)
@@ -215,7 +231,17 @@ class RelayLoop:
             return None, wait
         return ready[0], 0.0
 
+    def recover(self):
+        """Publish what a crash left staged: those tasks are settled, so the body is their result."""
+        for entry in sorted(os.listdir(self.args.results)):
+            m = STAGED_RE.fullmatch(entry)
+            if m:
+                log("publishing a staged result ->", m.group(1))
+                record_done(self.done_path, m.group(1)[:-4])
+                publish(os.path.join(self.args.results, entry), os.path.join(self.args.results, m.group(1)))
+
     def serve(self):
+        self.recover()
         seen = set(load_done(self.done_path))
         done = 0
         idle_since = self.clock()

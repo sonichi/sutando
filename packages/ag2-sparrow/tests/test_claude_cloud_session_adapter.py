@@ -637,6 +637,98 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual(len(starts), 1)
             self.assertGreaterEqual(starts[0], restart + 3600, "the settled turn holds the hour")
 
+    def test_a_cancelled_task_after_the_unsent_mark_frees_its_reservation(self):
+        class Crash(BaseException):
+            pass
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [{"rc": 1, "stderr": "getaddrinfo ENOTFOUND"}, ok(8)])
+            task = write_task(d, "task-cancelled", "x")
+            with mock.patch.object(rl.RateLimiter, "forget", side_effect=Crash), self.assertRaises(Crash):
+                run_adapter(d, fake, once=1, max_per_hour=1)
+            task.unlink()
+            write_task(d, "task-next", "x")
+            clock = FakeClock()
+            start = clock.t
+            run_adapter(d, fake, clock=clock, once=1, max_per_hour=1)
+            self.assertEqual(clock.t, start, "the proven-unsent attempt holds nothing")
+            self.assertEqual(len(fake.calls()), 2)
+            self.assertIn("turn=8", result(d, "task-next"))
+            self.assertEqual([e[1] for e in self.sends(d)], ["task-next"])
+            self.assertEqual(os.listdir(Path(d) / "state" / "sending"), [])
+
+    def test_leftovers_of_tasks_no_longer_queued_are_settled_on_start(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok()])
+            state = Path(d) / "state"
+            (state / "sending").mkdir(parents=True)
+            for tid, phase in (("task-s", "sending"), ("task-o", "outcome"), ("task-done", "outcome")):
+                (state / "sending" / tid).write_text(phase + "\n")
+            (state / "done").write_text("task-done\n")
+            clock = FakeClock()
+            t0 = clock.t
+            lim = rl.RateLimiter(str(state / "sends.json"), 60, lambda: t0 - 50)
+            for key in ("task-s", "task-o", "task-gone", "task-done"):
+                lim.record(key)
+            run_adapter(d, fake, clock=clock)
+            self.assertEqual(fake.calls(), [])
+            self.assertEqual(os.listdir(state / "sending"), [])
+            self.assertEqual(sorted(self.sends(d), key=lambda e: e[1]),
+                             [[t0 - 50, "task-done"], [t0 - 50, "task-o"], [t0, "task-s"]],
+                             "an unknown outcome counts at the restart; a never-sent reservation is dropped")
+            self.assertEqual(set((state / "done").read_text().split()), {"task-done", "task-o", "task-s"})
+
+    def test_a_result_claimed_at_once_then_a_crash_is_never_answered_twice(self):
+        class Crash(BaseException):
+            pass
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok(1), ok(2)])
+            write_task(d, "task-q", "x")
+            results = Path(d) / "results"
+            live = results / "task-q.txt"
+            stop = threading.Event()
+
+            def drain():
+                n = 0
+                while not stop.is_set():
+                    try:
+                        live.rename(results / ("task-q.sending.%d.%d" % (os.getpid(), n)))
+                        n += 1
+                    except FileNotFoundError:
+                        pass
+                    time.sleep(0.001)
+            t = threading.Thread(target=drain, daemon=True)
+            t.start()
+
+            def claimed():
+                return [n for n in os.listdir(results) if n.startswith("task-q.sending.")]
+
+            def crash_once_claimed(*a, **k):
+                if live.exists() or claimed():
+                    deadline = time.time() + 5
+                    while not claimed() and time.time() < deadline:
+                        time.sleep(0.001)
+                    raise Crash()
+                return real_done(*a, **k)
+            real_done = rl.record_done
+            try:
+                with mock.patch.object(rl, "record_done", crash_once_claimed), \
+                        mock.patch.object(sa.Adapter, "_clear", side_effect=Crash), self.assertRaises(Crash):
+                    run_adapter(d, fake, once=1)
+                deadline = time.time() + 5
+                while not claimed() and time.time() < deadline:
+                    time.sleep(0.001)
+                self.assertEqual(len(claimed()), 1, "the drain took the result as it appeared")
+                run_adapter(d, fake, once=0)
+                time.sleep(0.05)
+            finally:
+                stop.set()
+                t.join()
+            self.assertEqual(len(fake.calls()), 1)
+            self.assertEqual(len(claimed()), 1, "no second result")
+            self.assertFalse(live.exists())
+            self.assertEqual((Path(d) / "state" / "done").read_text().split(), ["task-q"])
+            self.assertEqual([n for n in os.listdir(results) if n.startswith(".")], [])
+
     def test_a_crash_after_the_unsent_mark_retries_exactly_once(self):
         class Crash(BaseException):
             pass

@@ -89,6 +89,13 @@ A non-owner task's failure line never carries the exit code. Before each call th
 `unsent` before releasing the reservation of a proven-unsent call, and removes it only with the
 result. A crash mid-send is answered on restart with the "may or may not have reached" line instead
 of a second queued turn (at most once); a crash during a proven-unsent cleanup is retried once.
+A result is staged as `results/.task-<id>.txt.staged`, the task is recorded in `state/done`, and only
+then is the result renamed into place, so a drain that claims it the instant it appears and a crash
+right after cannot lead to a second, different result; a staged body left by a crash is published on
+start. Also on start, leftovers of tasks no longer in the inbox (cancelled or archived) are settled:
+an `unsent` marker and its reservation are dropped, a `sending`/`outcome` marker counts (moved to the
+start time when its outcome was never recorded) and is recorded done, and a reservation with neither
+a task nor a marker, which was never sent, is released.
 
 Pacing: at least `--min-gap-seconds` (default 2) between queued turns and at most `--max-per-hour`
 (default 60) in a sliding hour, kept in `state/sends.json` so a restart does not reset either. The cap

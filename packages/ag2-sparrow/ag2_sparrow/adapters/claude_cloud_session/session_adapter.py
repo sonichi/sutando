@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-from ...task_io import acquire_lock, non_owner_note, write_atomic
+from ...task_io import acquire_lock, load_done, non_owner_note, record_done, write_atomic
 from ...relay_loop import NO_ROOM, TEXT_MAX, Outcome, RelayLoop, build_payload, log, result_body
 
 SESSION_RE = re.compile(r"session_[A-Za-z0-9]+")
@@ -131,6 +131,29 @@ class Adapter(RelayLoop):
     def finish(self, name, body, seen):
         super().finish(name, body, seen)
         self._clear(name[:-4])
+
+    def recover(self):
+        """Settle what a crash left behind for tasks no longer in the inbox (cancelled, archived)."""
+        super().recover()
+        done = set(load_done(self.done_path))
+        live = {n[:-4] for n in os.listdir(self.args.inbox) if n.startswith("task-") and n.endswith(".txt")}
+        markers = set(os.listdir(self.sending_dir)) if os.path.isdir(self.sending_dir) else set()
+        for task_id in sorted(markers):
+            if task_id in live and task_id not in done:
+                continue
+            phase = self._phase(task_id)
+            if task_id not in done:
+                if phase == "unsent":
+                    self.limiter.forget(task_id)
+                else:
+                    if phase == "sending":
+                        self.limiter.touch(task_id)
+                    record_done(self.done_path, task_id)
+            log("settled a leftover marker ->", task_id, phase)
+            self._clear(task_id)
+        for task_id in {k for _, k in self.limiter.entries if k} - live - done - markers:
+            log("released the reservation of a task no longer queued, never sent ->", task_id)
+            self.limiter.forget(task_id)
 
     def recovering(self, name):
         return self._phase(name[:-4]) in ("sending", "outcome") or self.limiter.holds(name[:-4])

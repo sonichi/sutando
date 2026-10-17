@@ -508,7 +508,9 @@ class MainTest(unittest.TestCase):
             write_task(d, "task-at", "x")
             with mock.patch.object(rl, "write_atomic", wraps=rl.write_atomic) as spy:
                 run_adapter(d, base, once=1)
-            self.assertIn(os.path.join(d, "results", "task-at.txt"), [c.args[0] for c in spy.call_args_list])
+            self.assertIn(rl.staged_path(os.path.join(d, "results"), "task-at.txt"),
+                          [c.args[0] for c in spy.call_args_list])
+            self.assertTrue(os.path.exists(os.path.join(d, "results", "task-at.txt")))
             self.assertEqual([n for n in os.listdir(os.path.join(d, "results")) if n.startswith(".")], [])
             self.assertIs(ra.write_atomic, cc.write_atomic)
             self.assertIs(rl.write_atomic, cc.write_atomic)
