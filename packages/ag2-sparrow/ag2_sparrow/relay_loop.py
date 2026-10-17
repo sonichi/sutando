@@ -280,7 +280,7 @@ class RelayLoop:
         while not stop_requested():
             names = self.pending(seen)
             if not names:
-                if self.args.once and done >= self.args.once:
+                if self.args.once and done >= self.args.once:  # pragma: no cover - a step's own check returns first
                     return
                 if self.args.idle_exit and self.clock() - idle_since > self.args.idle_exit:
                     log("idle-exit")

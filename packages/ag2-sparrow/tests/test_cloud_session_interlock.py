@@ -452,5 +452,129 @@ CodexFirstActTest = first_act_case("codex", "CodexFirstActTest")
 CloudFirstActTest = first_act_case("cloud", "CloudFirstActTest")
 
 
+class TaskIoBranchTest(unittest.TestCase):
+    """task_io's refusal, path-resolution, stop-flag and legacy-pidfile branches, in this process."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = Path(tmp.name) / "work"
+        (self.work / "state").mkdir(parents=True)
+
+    def owner(self):
+        got = holder_lock.acquire(str(self.work), install_id=holder_lock.install_id(), timeout=0)
+        self.assertIsInstance(got, holder_lock.Acquired)
+        self.addCleanup(task_io.release_lock, got.owner)
+        return got.owner
+
+    def refused(self, outcome=None, error=None, **kw):
+        with mock.patch.object(holder_lock, "acquire", return_value=outcome, side_effect=error):
+            with self.assertRaises(task_io.LockRefused) as cm:
+                task_io.acquire_lock("/w", "x")
+        return cm.exception
+
+    def test_every_non_acquired_outcome_is_a_refusal_with_its_code(self):
+        valid = holder_lock.Valid({"adapter": "codex", "pid": 7, "host": "h"})
+        e = self.refused(holder_lock.Held(valid, "it is running"))
+        self.assertEqual((e.code, "codex pid 7 on h (it is running)" in e.line), (3, True))
+        e = self.refused(holder_lock.Contended(holder_lock.Invalid("torn", b"")))
+        self.assertEqual((e.code, "record is unreadable" in e.line), (3, True))
+        e = self.refused(holder_lock.LegacyRunning(42, "/w/state/connector.pid"))
+        self.assertEqual((e.code, "old adapter (pid 42)" in e.line), (3, True))
+        e = self.refused(holder_lock.LegacyRunning(None, "/w/state/connector.pid"))
+        self.assertEqual((e.code, "is not a pid record" in e.line), (3, True))
+        e = self.refused(holder_lock.Unreadable("EIO"))
+        self.assertEqual((e.code, e.line.endswith("EIO")), (2, True))
+        e = self.refused(error=holder_lock.LockError("replaced"))
+        self.assertEqual((e.code, e.line.endswith("replaced")), (2, True))
+
+    def test_a_publish_failure_releases_the_lock_and_refuses(self):
+        owner = object()
+        with mock.patch.object(holder_lock, "acquire", return_value=holder_lock.Acquired(owner, holder_lock.Missing())), \
+                mock.patch.object(holder_lock, "publish", side_effect=holder_lock.LockError("full")), \
+                mock.patch.object(holder_lock, "release") as release:
+            with self.assertRaises(task_io.LockRefused) as cm:
+                task_io.acquire_lock("/w", "x")
+        self.assertEqual(cm.exception.code, 2)
+        release.assert_called_once_with(owner)
+
+    def test_a_release_that_fails_is_swallowed(self):
+        with mock.patch.object(holder_lock, "release", side_effect=holder_lock.LockError("gone")):
+            task_io.release_lock(object())
+
+    def test_root_path_follows_a_replaced_path_or_refuses(self):
+        owner = self.owner()
+        found = task_io.root_path(owner, str(self.work.parent / "elsewhere"))
+        self.assertTrue(os.path.samefile(found, self.work))
+        with mock.patch.object(task_io.sys, "platform", "linux"):
+            with self.assertRaises(task_io.LockRefused) as cm:
+                task_io.root_path(owner, str(self.work.parent / "elsewhere"))
+        self.assertIn("cannot resolve the held work root", cm.exception.line)
+        real = os.stat
+        calls = []
+
+        def stat(path, *a, **k):
+            calls.append(path)
+            if len(calls) == 1:
+                raise FileNotFoundError(path)
+            st = real(path, *a, **k)
+            return os.stat_result((st.st_mode, st.st_ino + 1, st.st_dev) + tuple(st)[3:])
+        with mock.patch.object(task_io.os, "stat", stat):
+            with self.assertRaises(task_io.LockRefused) as cm:
+                task_io.root_path(owner, "/nonexistent")
+        self.assertIn("no reachable path", cm.exception.line)
+
+    def test_the_stop_flag_is_set_by_the_handler_and_names_the_exit_code(self):
+        before = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, before)
+        self.addCleanup(task_io._STOP.__setitem__, 0, 0)
+        task_io.exit_on_sigterm()
+        self.assertIs(signal.getsignal(signal.SIGTERM), task_io._terminated)
+        self.assertEqual((task_io.stop_requested(), task_io.exit_code(0)), (0, 0))
+        signal.raise_signal(signal.SIGTERM)
+        self.assertEqual((task_io.stop_requested(), task_io.exit_code(0)), (signal.SIGTERM, 128 + signal.SIGTERM))
+        start = time.monotonic()
+        task_io.stoppable_sleep(5)
+        self.assertLess(time.monotonic() - start, 1, "a requested stop ends the sleep")
+
+    def test_the_legacy_pidfile_is_removed_only_when_a_dead_adapter_wrote_it_before_this_start(self):
+        owner = self.owner()
+        pidfile = self.work / "state" / "connector.pid"
+        self.assertIsNone(task_io.clear_attributed_pidfile(owner, str(self.work)))
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        old = time.time() - 1000
+
+        def write(text):
+            pidfile.write_text(text)
+            os.utime(pidfile, (old, old))
+        write("%d\n" % dead.pid)
+        self.assertIsNone(task_io.clear_attributed_pidfile(owner, str(self.work)))
+        self.assertFalse(pidfile.exists(), "removed once")
+        for text in ("%d\n" % os.getpid(), "not a pid", "12 extra\n"):
+            write(text)
+            self.assertIn("not a dead adapter's pidfile", task_io.clear_attributed_pidfile(owner, str(self.work)))
+            self.assertTrue(pidfile.exists())
+        write("%d\n" % dead.pid)
+        os.utime(pidfile, None)
+        self.assertIn("not a dead adapter's pidfile", task_io.clear_attributed_pidfile(owner, str(self.work)),
+                      "written after this process started")
+        write("%d\n" % dead.pid)
+        with mock.patch.object(task_io.os, "unlink", side_effect=PermissionError(1, "no")):
+            self.assertIn("cannot remove", task_io.clear_attributed_pidfile(owner, str(self.work)))
+        pidfile.unlink()
+        pidfile.mkdir()
+        self.assertIn("cannot read", task_io.clear_attributed_pidfile(owner, str(self.work)))
+
+    def test_the_module_prints_the_note_and_asks_for_a_flag(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(task_io.main(["--non-owner-note"]), 0)
+        self.assertEqual(out.getvalue().rstrip("\n"), task_io.NON_OWNER_NOTE.rstrip("\n"))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            task_io.main([])
+        self.assertEqual(cm.exception.code, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -89,6 +89,31 @@ class LimiterTest(unittest.TestCase):
             self.assertEqual(rl.RateLimiter(path, 2, lambda: now[0]).entries, [])
 
 
+    def test_a_reservation_is_held_until_it_ages_out_and_touch_renews_it(self):
+        now = [5000.0]
+        with tempfile.TemporaryDirectory() as d:
+            lim = rl.RateLimiter(os.path.join(d, "sends.json"), 2, lambda: now[0])
+            lim.record("task-a")
+            lim.record("task-b")
+            self.assertTrue(lim.holds("task-a"))
+            self.assertFalse(lim.holds("task-z"))
+            now[0] += rl.HOUR - 1
+            lim.touch("task-a")
+            now[0] += 2
+            self.assertTrue(lim.holds("task-a"), "touched, so still inside the window")
+            self.assertFalse(lim.holds("task-b"), "aged out of the window")
+            self.assertIn((now[0] - 2, "task-a"), rl.RateLimiter(lim.path, 2, lambda: now[0]).entries)
+
+
+    def test_a_recovering_task_skips_the_send_gates(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = Loop(d)
+            loop.blocked_until = 2000.0
+            self.assertEqual(loop.next_ready(["task-a.txt"]), (None, 1000.0))
+            loop.recovering = lambda name: name == "task-b.txt"
+            self.assertEqual(loop.next_ready(["task-a.txt", "task-b.txt"]), ("task-b.txt", 0.0))
+
+
 class WriterContractTest(unittest.TestCase):
     """Results are written once and never replace one; existence is local_task_protocol's answer."""
 

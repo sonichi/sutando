@@ -516,5 +516,20 @@ class MainTest(unittest.TestCase):
             self.assertIs(rl.write_atomic, cc.write_atomic)
 
 
+class HeldRootRefusalTest(unittest.TestCase):
+    def test_a_held_root_that_has_no_path_exits_with_the_refusal_code(self):
+        with tempfile.TemporaryDirectory() as d:
+            err = io.StringIO()
+            with mock.patch.object(ra, "acquire_lock", return_value=object()), \
+                    mock.patch.object(ra, "release_lock") as release, \
+                    mock.patch.object(ra, "exit_on_sigterm"), \
+                    mock.patch.object(ra, "make_dirs"), \
+                    mock.patch.object(ra, "root_path", side_effect=ra.LockRefused(2, "refusing to start: gone")), \
+                    contextlib.redirect_stderr(err):
+                rc = ra.main(["--work", d, "--trigger-id", TRIGGER], {"CLAUDE_ROUTINE_TOKEN": "t"})
+        self.assertEqual((rc, err.getvalue().strip()), (2, "refusing to start: gone"))
+        release.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

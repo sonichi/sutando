@@ -601,5 +601,20 @@ class PushTest(unittest.TestCase):
         self.assertEqual(rc, 3)
 
 
+class HeldRootRefusalTest(unittest.TestCase):
+    def test_a_held_root_that_has_no_path_exits_with_the_refusal_code(self):
+        with tempfile.TemporaryDirectory() as d:
+            err = io.StringIO()
+            with mock.patch.object(cc, "acquire_lock", return_value=object()), \
+                    mock.patch.object(cc, "release_lock") as release, \
+                    mock.patch.object(cc, "exit_on_sigterm"), \
+                    mock.patch.object(cc, "make_dirs"), \
+                    mock.patch.object(cc, "root_path", side_effect=cc.LockRefused(2, "refusing to start: gone")), \
+                    contextlib.redirect_stderr(err):
+                rc = cc.main(["--server", "stub", "--work", d])
+        self.assertEqual((rc, err.getvalue().strip()), (2, "refusing to start: gone"))
+        release.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import contextlib
+import errno
 import importlib.util
 import io
 import json
@@ -1889,6 +1890,125 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                              (PKG_ROOT / "ag2_sparrow" / "task_lifecycle.py").read_text())
 
 
+class ErrorBranchTest(Base):
+    """The error and edge branches of the owner's helpers, driven with real files."""
+
+    def test_helpers_report_missing_paths_and_log_to_stderr(self):
+        lc = self.lc
+        self.assertIsNone(lc._lstat(self.work / "nope"))
+        self.assertIsNotNone(lc._lstat(self.work))
+        self.assertFalse(lc._is_type(self.work / "nope", "dir"))
+        (self.work / "d").mkdir()
+        (self.work / "d" / "f").write_text("x")
+        self.assertEqual(lc._first_entry(str(self.work / "d")), "f")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            lc._log("hello", 1)
+        self.assertIn("hello 1", err.getvalue())
+
+    def test_a_flat_load_finds_its_siblings_through_the_path(self):
+        spec = importlib.util.spec_from_file_location("task_lifecycle_flat", self.lc.__file__)
+        flat = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, "path", list(sys.path)):
+            spec.loader.exec_module(flat)
+        self.assertTrue(callable(flat.Lifecycle))
+
+    def test_a_failed_replace_leaves_no_temp_behind(self):
+        target = self.work / "out"
+        with mock.patch.object(self.lc.os, "replace", side_effect=OSError(errno.EIO, "boom")):
+            with self.assertRaises(OSError):
+                self.lc.write_durable(target, b"x")
+        self.assertEqual(os.listdir(self.work), [])
+
+    def test_a_marked_state_that_is_a_link_is_refused(self):
+        real = self.work / "real"
+        (real / "claims").mkdir(parents=True)
+        (real / "settled-ids").write_text("")
+        (real / "format").write_text(self.lc.FORMAT + "\n")
+        os.symlink(real, self.work / "state")
+        self.assertIn("is not a directory", self.lc.prepare_work_dir(str(self.work)))
+
+    def test_the_journal_skips_a_bad_line_and_reports_a_charge(self):
+        life = self.life()
+        life.journal.append("task-a", 1, "unsent")
+        life.journal.append("task-a", 2, "queued")
+        with open(life.journal.path, "ab") as f:
+            f.write(b"not json\n")
+        again = self.lc.RateJournal(life.journal.path, self.clock)
+        self.assertEqual(len(again.events), 2)
+        self.assertTrue(again.charged("task-a", 2))
+        self.assertFalse(again.charged("task-a", 1))
+
+    def test_the_ledger_fails_closed_and_adds_once(self):
+        path = self.work / "ids"
+        path.write_bytes(b"\xff\xfe\n")
+        with self.assertRaises(self.lc.LedgerError):
+            self.lc.SettledIds(path)
+        path.write_bytes(b"task-a\ntask-b")
+        with mock.patch.object(self.lc.os, "truncate", side_effect=OSError(errno.EPERM, "no")):
+            with self.assertRaises(self.lc.LedgerError):
+                self.lc.SettledIds(path)
+        path.write_bytes(b"task-a\n")
+        ids = self.lc.SettledIds(path)
+        ids.add("task-a")
+        self.assertEqual(path.read_bytes(), b"task-a\n", "a recorded id is not appended twice")
+
+    def test_a_claim_that_names_another_task_is_unreadable(self):
+        store = self.lc.ClaimStore(self.work / "claims")
+        (self.work / "claims" / "task-a").mkdir(parents=True)
+        (self.work / "claims" / "task-a" / "claim.json").write_text("[]")
+        with self.assertRaises(self.lc.ClaimUnreadable):
+            store.load("task-a")
+
+    def test_the_stage_reports_io_errors_and_tolerates_absence(self):
+        store = self.lc.ClaimStore(self.work / "claims")
+        with mock.patch.object(self.lc, "write_durable", side_effect=OSError(errno.EIO, "x")):
+            with self.assertRaises(self.lc.StateError):
+                store.stage("task-a", b"b")
+        with self.assertRaises(self.lc.StateError):
+            store.staged("task-a")
+        store.unstage("task-a")
+        store.remove("task-a")
+        store.stage("task-a", b"b")
+        with mock.patch.object(self.lc.os, "unlink", side_effect=PermissionError(errno.EACCES, "x")):
+            with self.assertRaises(self.lc.StateError):
+                store.unstage("task-a")
+        with mock.patch.object(self.lc.shutil, "rmtree", side_effect=PermissionError(errno.EACCES, "x")):
+            with self.assertRaises(self.lc.StateError):
+                store.remove("task-a")
+
+    def test_a_body_hold_check_that_cannot_read_is_false(self):
+        life = self.life()
+        with mock.patch.object(self.lc.local_task_protocol, "iter_result_candidates",
+                               side_effect=OSError(errno.EIO, "x")):
+            self.assertFalse(life._holds_body("task-a", b"b"))
+
+    def test_a_foreign_exists_error_is_not_a_taken_name(self):
+        life = self.life()
+        life.claims.stage("task-a", b"b\n")
+        life._save({"schema": 1, "task_id": "task-a", "attempt": 0, "created_at": 0}, phase=self.lc.RESULT_STAGED)
+        with mock.patch.object(self.lc.undelivered_quarantine, "move_private",
+                               side_effect=FileExistsError(errno.ENOTSUP, "x")):
+            with self.assertRaises(FileExistsError):
+                with self.lc.result_disposal.locked(life.results):
+                    life._publish(life.claims.load("task-a"))
+
+    def test_a_published_file_that_differs_from_the_stage_is_logged(self):
+        lines = []
+        life = self.lc.Lifecycle(self.work, clock=self.clock, log=lambda *a: lines.append(" ".join(map(str, a))))
+        life.claims.stage("task-a", b"b\n")
+        life._save({"schema": 1, "task_id": "task-a", "attempt": 0, "created_at": 0}, phase=self.lc.RESULT_STAGED)
+        with mock.patch.object(self.lc.Lifecycle, "read_final", return_value=b"other"):
+            self.assertEqual(life.publish_and_settle("task-a"), "settled")
+        self.assertTrue(any("differs from the stage" in l for l in lines))
+
+    def test_recover_ignores_a_claim_dir_with_no_record(self):
+        life = self.life()
+        (life.claims.root / "task-a").mkdir(parents=True)
+        life.recover()
+        self.assertTrue((life.claims.root / "task-a").is_dir())
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     copies = [("vendored", vendored)]
@@ -1897,7 +2017,7 @@ def load_tests(loader, tests, pattern):
         copies.append(("src", src))
     for label, mod in copies:
         for case in (LockTest, FreshDirTest, ProbeTest, ProbeBothDirsTest, ClassifyTest, PublicationTest,
-                     JournalTest, SettledIdsTest, DecisionTest):
+                     JournalTest, SettledIdsTest, DecisionTest, ErrorBranchTest):
             if label == "src" and case in (LockTest, FreshDirTest, ProbeBothDirsTest):
                 continue
             bound = GATE(type("%s_%s" % (case.__name__, label), (case,), {"lc": mod}))

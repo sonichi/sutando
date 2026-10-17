@@ -624,5 +624,102 @@ class MainTest(unittest.TestCase):
             self.assertIn("state/sends.json", err)
 
 
+class StepBranchTest(unittest.TestCase):
+    """The step's parking, settling and publishing branches, each driven through a real Adapter."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = Path(tmp.name) / "work"
+        self.fake = Fake(tmp.name, [ok()])
+        clock = FakeClock()
+        self.ad = sa.Adapter(args_for(self.work, self.fake.path), clock=clock, sleep=clock.sleep, note=NOTE,
+                             environ=ENV)
+        self.seen = set()
+
+    def test_an_unreadable_claim_parks_the_task_and_has_no_phase(self):
+        write_task(self.work, "task-a", "hi")
+        claim_dir = self.work / "state" / "claims" / "task-a"
+        claim_dir.mkdir(parents=True)
+        (claim_dir / "claim.json").write_text("{torn")
+        self.assertIsNone(self.ad._phase("task-a"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(self.ad.step("task-a.txt", self.seen))
+        self.assertGreater(self.ad.not_before["task-a"], self.ad.clock())
+
+    def test_a_settled_id_is_never_called_again(self):
+        write_task(self.work, "task-a", "hi")
+        self.ad.lc.settled.add("task-a")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(self.ad.step("task-a.txt", self.seen))
+        self.assertEqual(self.seen, {"task-a"})
+        self.assertEqual(self.fake.calls(), [])
+
+    def test_a_claim_past_its_call_is_published_and_a_parked_publication_waits(self):
+        write_task(self.work, "task-a", "hi")
+        past = {"phase": "published", "task_id": "task-a"}
+        with mock.patch.object(self.ad.lc.claims, "load", return_value=past), \
+                mock.patch.object(self.ad.lc, "publish_and_settle", return_value="settled"):
+            self.assertTrue(self.ad.step("task-a.txt", self.seen))
+        with mock.patch.object(self.ad.lc.claims, "load", return_value=past), \
+                mock.patch.object(self.ad.lc, "publish_and_settle", return_value="parked"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(self.ad.step("task-a.txt", self.seen))
+        self.assertIn("task-a", self.ad.not_before)
+
+    def test_a_roomless_task_whose_publication_parks_waits(self):
+        write_task(self.work, "task-a", "hi", channel=None)
+        with mock.patch.object(self.ad.lc, "complete_without_call", return_value="parked"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(self.ad.step("task-a.txt", self.seen))
+
+    def test_an_existing_result_settles_and_an_undecided_one_parks(self):
+        write_task(self.work, "task-a", "hi")
+        with mock.patch.object(self.ad.lc, "decide", return_value=("settle", "live-ready")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(self.ad.step("task-a.txt", self.seen))
+        self.assertIn("task-a", self.ad.lc.settled)
+        write_task(self.work, "task-b", "hi")
+        with mock.patch.object(self.ad.lc, "decide", return_value=("park", "claimed")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(self.ad.step("task-b.txt", self.seen))
+        self.assertEqual(self.fake.calls(), [])
+
+    def test_a_refused_call_begin_settles_without_calling(self):
+        write_task(self.work, "task-a", "hi")
+        with mock.patch.object(self.ad.lc, "begin_call", return_value=False), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(self.ad.step("task-a.txt", self.seen))
+        self.assertEqual((self.seen, self.fake.calls()), ({"task-a"}, []))
+
+    def test_a_publication_that_parks_is_retried_after_the_park_delay(self):
+        with mock.patch.object(self.ad.lc, "publish_and_settle", return_value="parked"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(self.ad._publish("task-a.txt", self.seen))
+
+
+class ServeLockedRefusalTest(unittest.TestCase):
+    def serve(self, **patches):
+        with tempfile.TemporaryDirectory() as d:
+            args = args_for(Path(d) / "work", Path(d) / "claude")
+            err = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                for name, kw in patches.items():
+                    stack.enter_context(mock.patch.object(sa, name, **kw))
+                stack.enter_context(contextlib.redirect_stderr(err))
+                rc = sa.serve_locked(args, ENV, owner=object())
+        return rc, err.getvalue()
+
+    def test_a_work_dir_that_cannot_be_made_exits_2(self):
+        rc, err = self.serve(make_dirs={"side_effect": OSError(13, "denied")})
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot create the work dirs", err)
+
+    def test_a_held_root_without_a_path_exits_with_the_refusal_code(self):
+        rc, err = self.serve(make_dirs={"return_value": None},
+                             root_path={"side_effect": sa.LockRefused(2, "refusing to start: gone")})
+        self.assertEqual((rc, err.strip()), (2, "refusing to start: gone"))
+
+
 if __name__ == "__main__":
     unittest.main()
