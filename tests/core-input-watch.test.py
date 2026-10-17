@@ -1635,19 +1635,19 @@ class TestMainOnce(unittest.TestCase):
         self.assertEqual(sig["state"], "running")
 
 
-# A worker pane captured live 2026-10-11 (worker 17c6c322): a stale usage-limit banner under
+# A worker pane captured live 2026-10-11 (worker-a): a stale usage-limit banner under
 # the composer while turns kept finishing, with the CLI's optional feedback survey above it.
 _SURVEY = ("● How is Claude doing this session? (optional)\n"
            "  1: Bad    2: Fine   3: Good   0: Dismiss\n"
            "                                        ✔ Update installed · Restart to update\n")
-_WORKER_FOOTER = ("──────── sutando-worker-17c6c322 ─\n❯ \n────────\n")
+_WORKER_FOOTER = ("──────── seat-1 ─\n❯ \n────────\n")
 _LIMIT_BANNER = ("  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
                  "    Continuing automatically at Oct 13 at 11pm · esc to cancel\n")
 _BYPASS_FOOTER = "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents · ↓ to manage"
 _EARLIER_TURN = ("⏺ The task watcher on my inbox hit its 30-minute limit, so I restarted it.\n"
                  "✻ Churned for 27s · done 1:55 PM · 1 monitor still running\n")
-_LATER_TURN = ("⏺ Monitor(Streaming task watcher (worker 17c6c322 inbox))\n"
-               "  ⎿  Monitor started · task bz8oy6aip · timeout 1800s\n"
+_LATER_TURN = ("⏺ Monitor(Streaming task watcher (worker-a inbox))\n"
+               "  ⎿  Monitor started · task task-a · timeout 1800s\n"
                "✻ Brewed for 22s · done 1:58 PM · 1 monitor still running\n")
 _LIVE_BEFORE = _EARLIER_TURN + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
 _LIVE_PANE = _EARLIER_TURN + _LATER_TURN + _SURVEY + _WORKER_FOOTER + _LIMIT_BANNER + _BYPASS_FOOTER
