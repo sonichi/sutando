@@ -53,13 +53,14 @@ def bind(state, room, instance="", identity=AGENT, gateway=GW, status_agent=AGEN
     sfx = f".{instance}" if instance else ""
     record = {"identity": identity, "gateway": gateway, "owner_dm": room}
     if binding:
-        record["binding"] = gateway_instance.binding_digest(identity, gateway)
+        record.update(gateway=gateway_instance.redact_url(gateway),
+                      binding=gateway_instance.binding_digest(identity, gateway, create=True))
     (state / f"owner-routing{sfx}.json").write_text(json.dumps(record))
     (state / f"gateway-status{sfx}.json").write_text(json.dumps(
         {"connected": True, "agent_id": status_agent,
          "gateway": gateway_instance.redact_url(status_url),
-         "gateway_binding": gateway_instance.binding_digest(status_agent or "", status_url)
-         or None}))
+         "gateway_binding": gateway_instance.binding_digest(status_agent or "", status_url,
+                                                            create=True) or None}))
 
 
 class Base(unittest.TestCase):
@@ -84,9 +85,20 @@ row = {"agents": [{"id": m._reenroll_identity(), "owner": "@owner:ag2.space",
 with mock.patch.object(m, "_req", return_value=row):
     m.refresh_routing(force=True)
 m._emit_gateway_status(True)
-print(json.dumps({"routing": json.loads(m._routing_file().read_text()),
-                  "status": json.loads(m.GATEWAY_STATUS_FILE.read_text()),
-                  "url": m.URL, "identity": m._reenroll_identity()}))
+routing, status = m._routing_file().read_text(), m.GATEWAY_STATUS_FILE.read_text()
+m._ROUTING.update(owner_dm="", persisted="", loaded=False)
+m._load_routing()
+reloaded = m._ROUTING["owner_dm"]
+record = json.loads(routing)
+for legacy in ({"identity": record["identity"], "gateway": m.URL, "owner_dm": "!old:x"},
+               dict(record, binding="0" * 64, owner_dm="!forged:x")):
+    m._routing_file().write_text(json.dumps(legacy))
+    m._ROUTING.update(owner_dm="", persisted="", loaded=False)
+    m._load_routing()
+    reloaded += " " + (m._ROUTING["owner_dm"] or "-")
+m._routing_file().write_text(routing)
+print(json.dumps({"routing": json.loads(routing), "status": json.loads(status),
+                  "raw": routing + status, "reloaded": reloaded, "url": m.URL}))
 """
 
     def bridge(self, script, **extra):
@@ -108,9 +120,13 @@ print(json.dumps({"routing": json.loads(m._routing_file().read_text()),
         out = self.bridge(self.ROUTING, AGENT_MXID=AGENT)
         digest = gateway_instance.binding_digest(AGENT, out["url"])
         self.assertTrue(out["url"].endswith("?tenant=a"), out["url"])
+        self.assertTrue(digest)
         self.assertEqual(out["routing"]["binding"], digest)
         self.assertEqual(out["status"]["gateway_binding"], digest)
-        self.assertNotIn("tenant", out["status"]["gateway"])
+        self.assertNotIn("tenant", out["raw"], "nothing from the URL's query is persisted")
+        self.assertNotIn("fake-relay-token", out["raw"])
+        self.assertEqual(out["reloaded"], "!dm:ag2.space !old:x -",
+                         "its own record and a legacy one reload; a foreign binding does not")
         self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space")
 
     SCRIPT = """
@@ -243,13 +259,33 @@ class WakeContext(Base):
         bind(self.state, "!dm:ag2.space", gateway=new, status_url=new)
         self.assertEqual(runtime_text.owner_dm_room(self.state), "!dm:ag2.space")
 
-    def test_a_record_whose_binding_disagrees_with_its_url_is_refused(self):
+    def test_a_record_whose_binding_disagrees_with_the_running_one_is_refused(self):
         bind(self.state, "!dm:ag2.space")
         path = self.state / "owner-routing.json"
         record = json.loads(path.read_text())
         record["binding"] = "0" * 64
         path.write_text(json.dumps(record))
         self.assertEqual(runtime_text.owner_dm_room(self.state), "")
+
+    def test_the_binding_is_keyed_per_install_never_a_plain_hash_of_the_url(self):
+        import hashlib
+        digest = gateway_instance.binding_digest(AGENT, GW, create=True)
+        key = gateway_instance.binding_key_path()
+        self.assertEqual(oct(key.stat().st_mode & 0o777), "0o600")
+        self.assertNotIn(str(self.state), str(key))
+        self.assertNotEqual(digest, hashlib.sha256(f"{AGENT}\n{GW}".encode()).hexdigest())
+        self.assertEqual(gateway_instance.binding_digest(AGENT, GW), digest, "stable per key")
+        key.write_text("1" * 64)
+        self.assertNotEqual(gateway_instance.binding_digest(AGENT, GW), digest)
+        key.unlink()
+        self.assertEqual(gateway_instance.binding_digest(AGENT, GW), "", "a reader never makes one")
+        key.write_text("not a key")
+        self.assertEqual(gateway_instance.binding_digest(AGENT, GW), "")
+        key.write_text("2" * 64)
+        with mock.patch.object(gateway_instance.Path, "exists", return_value=False), \
+                mock.patch.object(gateway_instance.os, "open", side_effect=FileExistsError):
+            self.assertTrue(gateway_instance.binding_digest(AGENT, GW, create=True),
+                            "a key another process created first is used")
 
     def test_the_cli_prints_the_cached_text(self):
         (self.home / "config").write_text(f"AGENT_MXID={AGENT}\nSTATE_DIR={self.state}\n"

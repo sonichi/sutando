@@ -9,6 +9,8 @@ injective and the first `~` splits it. The empty instance is the primary: identi
 from __future__ import annotations
 
 import hashlib
+import hmac
+import os
 import re
 import urllib.parse
 from pathlib import Path
@@ -56,9 +58,35 @@ def redact_url(value: str) -> str:
         return str(value)
 
 
-def binding_digest(identity: str, gateway_url: str) -> str:
-    """sha256 of an agent identity and the FULL gateway URL: what binds a saved reading to
-    one enrollment without persisting the URL; '' when either is missing."""
-    if not identity or not gateway_url:
+def binding_key_path() -> Path:
+    """The per-install key the binding is computed with: outside the state dir, which may
+    be synced, beside the relay token's default home."""
+    return Path(os.path.expanduser("~")) / ".config" / "ag2-sparrow" / "binding.key"
+
+
+def _binding_key(create: bool) -> "bytes | None":
+    path = binding_key_path()
+    if create and not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "w", encoding="ascii") as fh:
+                fh.write(os.urandom(32).hex())
+    try:
+        key = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return key.encode("ascii") if re.fullmatch(r"[0-9a-f]{64}", key) else None
+
+
+def binding_digest(identity: str, gateway_url: str, create: bool = False) -> str:
+    """HMAC-SHA256, under the per-install key, of an agent identity and the FULL gateway
+    URL: binds a saved reading to one enrollment without persisting anything the URL could
+    be recovered from. '' when either is missing or there is no key (the writer creates it)."""
+    key = _binding_key(create) if identity and gateway_url else None
+    if key is None:
         return ""
-    return hashlib.sha256(f"{identity}\n{gateway_url}".encode("utf-8")).hexdigest()
+    return hmac.new(key, f"{identity}\n{gateway_url}".encode("utf-8"), hashlib.sha256).hexdigest()

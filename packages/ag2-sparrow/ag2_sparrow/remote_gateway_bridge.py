@@ -1803,7 +1803,9 @@ def _load_routing() -> None:
     except (OSError, ValueError):
         return
     # another agent's reading, or this agent's reading from another gateway, authorizes nothing
-    if isinstance(d, dict) and d.get("identity") == _reenroll_identity() and d.get("gateway") == URL:
+    if isinstance(d, dict) and d.get("identity") == _reenroll_identity() and (
+            d.get("binding") == gateway_instance.binding_digest(_reenroll_identity(), URL, True)
+            if d.get("binding") else d.get("gateway") == URL):
         _ROUTING["owner_dm"] = _ROUTING["persisted"] = str(d.get("owner_dm") or "")
 
 
@@ -1831,9 +1833,9 @@ def refresh_routing(force: bool = False) -> None:
         try:
             f = _routing_file(); f.parent.mkdir(parents=True, exist_ok=True)
             tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({"identity": _reenroll_identity(), "gateway": URL,
+            tmp.write_text(json.dumps({"identity": _reenroll_identity(), "gateway": _redact_url(URL),
                                        "binding": gateway_instance.binding_digest(
-                                           _reenroll_identity(), URL),
+                                           _reenroll_identity(), URL, create=True),
                                        "owner_dm": _ROUTING["owner_dm"]}), encoding="utf-8")
             os.replace(tmp, f)
             _ROUTING["persisted"] = _ROUTING["owner_dm"]
@@ -3600,9 +3602,9 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "gateway": _redact_url(URL),
             # Re-read on every write, so a lane switch or re-login shows at the next poll.
             "agent_id": (_reenroll_identity() or None) if connected else None,
-            # Digest of identity + full URL, so a reader can match a saved reading's binding.
-            "gateway_binding": (gateway_instance.binding_digest(_reenroll_identity(), URL)
-                                or None) if connected else None,
+            # Keyed digest of identity + full URL: a reader matches a saved reading's binding.
+            "gateway_binding": (gateway_instance.binding_digest(
+                _reenroll_identity(), URL, create=True) or None) if connected else None,
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
             "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
