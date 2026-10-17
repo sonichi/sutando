@@ -448,12 +448,156 @@ def test_header_stop_pattern_escapes_key_metacharacters() -> None:
     assert not ordinary.match("  user_id: x")
     assert not ordinary.match("see user_id: x")
 
+def test_apply_refuses_to_save_over_an_unreadable_store() -> None:
+    """A store that cannot be read must not be replaced by an empty one.
+
+    The loader answers the same empty store for "no sidecar yet" and "sidecar
+    I could not parse". The first must stay writable or a new install can
+    never record anything; the second must not, or one unparseable byte costs
+    the whole file. Both directions are asserted here because a guard that
+    refuses everything would pass a one-sided test.
+    """
+    # direction 1: a populated store that got truncated is preserved.
+    workspace = fixture_workspace()
+    store_path = workspace / "data" / "task-workstreams.json"
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    populated = {
+        "schema_version": workstreams.SCHEMA_VERSION,
+        "workstreams": {"ws-1": {"title": "Kept"}},
+        "assignments": {f"task-{i:03d}": {"workstream_id": "ws-1"} for i in range(50)},
+        "reviews": {},
+        "context_history": {},
+    }
+    store_path.write_text(json.dumps(populated))
+    damaged = store_path.read_text()[: len(store_path.read_text()) // 2]
+    store_path.write_text(damaged)
+
+    snapshot = workstreams.build_classifier_snapshot(workspace)
+    proposal = {
+        "snapshot_hash": snapshot["snapshot_hash"],
+        "workstreams": [{"name": "New", "confidence": 0.95, "task_ids": ["task-a1"]}],
+    }
+    try:
+        workstreams.apply_inference(workspace, proposal)
+        raise AssertionError("apply must refuse an unreadable store")
+    except workstreams.WorkstreamStoreUnreadable as exc:
+        assert "could not be read" in str(exc)
+    assert store_path.read_text() == damaged, "the damaged file must be left for recovery"
+
+    # inherit declines rather than raising: its caller is unguarded.
+    assert workstreams.inherit_assignment(workspace, "task-child", "task-000") is False
+    assert store_path.read_text() == damaged
+
+    # direction 2 (the control): an ABSENT store is still writable, or this
+    # guard would break every first run.
+    fresh = fixture_workspace()
+    fresh_store = fresh / "data" / "task-workstreams.json"
+    assert not fresh_store.exists()
+    fresh_snapshot = workstreams.build_classifier_snapshot(fresh)
+    result = workstreams.apply_inference(fresh, {
+        "snapshot_hash": fresh_snapshot["snapshot_hash"],
+        "workstreams": [{"name": "First", "confidence": 0.95, "task_ids": ["task-a1"]}],
+    })
+    assert result.assigned == 1
+    assert fresh_store.exists()
+    assert workstreams.load_workstream_store(fresh)["assignments"]["task-a1"]
+
+    # direction 3: a store the loader cannot accept for any OTHER reason is
+    # also content, not absence. A stale schema_version parses fine.
+    for label, seed in (
+        ("stale schema", {"schema_version": "v0-unsupported"}),
+        ("no schema", {}),
+    ):
+        stale = fixture_workspace()
+        stale_store = stale / "data" / "task-workstreams.json"
+        stale_store.parent.mkdir(parents=True, exist_ok=True)
+        body = dict(seed)
+        body.update({
+            "workstreams": {"ws-1": {"title": "Kept"}},
+            "assignments": {f"task-{i:03d}": {"workstream_id": "ws-1"} for i in range(50)},
+            "reviews": {}, "context_history": {},
+        })
+        stale_store.write_text(json.dumps(body))
+        intact = stale_store.read_text()
+        stale_snapshot = workstreams.build_classifier_snapshot(stale)
+        try:
+            workstreams.apply_inference(stale, {
+                "snapshot_hash": stale_snapshot["snapshot_hash"],
+                "workstreams": [{"name": "New", "confidence": 0.95, "task_ids": ["task-a1"]}],
+            })
+            raise AssertionError(f"apply must refuse a store with a {label}")
+        except workstreams.WorkstreamStoreUnreadable:
+            pass
+        assert stale_store.read_text() == intact, f"{label}: the store must survive"
+
+    # …and the control that keeps this from refusing everything: a store the
+    # loader DOES accept, which happens to be empty, must still be writable.
+    legit = fixture_workspace()
+    legit_store = legit / "data" / "task-workstreams.json"
+    legit_store.parent.mkdir(parents=True, exist_ok=True)
+    legit_store.write_text(json.dumps({
+        "schema_version": workstreams.SCHEMA_VERSION,
+        "workstreams": {}, "assignments": {}, "reviews": {}, "context_history": {},
+    }))
+    legit_snapshot = workstreams.build_classifier_snapshot(legit)
+    assert workstreams.apply_inference(legit, {
+        "snapshot_hash": legit_snapshot["snapshot_hash"],
+        "workstreams": [{"name": "First", "confidence": 0.95, "task_ids": ["task-a1"]}],
+    }).assigned == 1
+
+    # a store path that cannot be READ at all (not just parsed). A directory
+    # standing where the file belongs raises OSError, like a permission loss.
+    blocked = fixture_workspace()
+    blocked_store = blocked / "data" / "task-workstreams.json"
+    blocked_store.mkdir(parents=True, exist_ok=True)
+    blocked_snapshot = workstreams.build_classifier_snapshot(blocked)
+    try:
+        workstreams.apply_inference(blocked, {
+            "snapshot_hash": blocked_snapshot["snapshot_hash"],
+            "workstreams": [{"name": "New", "confidence": 0.95, "task_ids": ["task-a1"]}],
+        })
+        raise AssertionError("apply must refuse a store path it cannot read")
+    except workstreams.WorkstreamStoreUnreadable as exc:
+        assert "unreadable" in str(exc)
+
+    # a top level that is valid JSON but not an object at all.
+    listy = fixture_workspace()
+    listy_store = listy / "data" / "task-workstreams.json"
+    listy_store.parent.mkdir(parents=True, exist_ok=True)
+    listy_store.write_text(json.dumps([{"workstream_id": "ws-1"}] * 50))
+    listy_intact = listy_store.read_text()
+    listy_snapshot = workstreams.build_classifier_snapshot(listy)
+    try:
+        workstreams.apply_inference(listy, {
+            "snapshot_hash": listy_snapshot["snapshot_hash"],
+            "workstreams": [{"name": "New", "confidence": 0.95, "task_ids": ["task-a1"]}],
+        })
+        raise AssertionError("apply must refuse a non-object store")
+    except workstreams.WorkstreamStoreUnreadable as exc:
+        assert "not an object" in str(exc)
+    assert listy_store.read_text() == listy_intact
+
+    # direction 4: an empty FILE is not a store worth protecting either.
+    blank = fixture_workspace()
+    blank_store = blank / "data" / "task-workstreams.json"
+    blank_store.parent.mkdir(parents=True, exist_ok=True)
+    blank_store.write_text("   \n")
+    blank_snapshot = workstreams.build_classifier_snapshot(blank)
+    assert workstreams.apply_inference(blank, {
+        "snapshot_hash": blank_snapshot["snapshot_hash"],
+        "workstreams": [{"name": "First", "confidence": 0.95, "task_ids": ["task-a1"]}],
+    }).assigned == 1
+
+
 def test_apply_is_validated_stable_sticky_and_fail_open() -> None:
     workspace = fixture_workspace()
     store_path = workspace / "data" / "task-workstreams.json"
     store_path.parent.mkdir(parents=True, exist_ok=True)
     store_path.write_text("not json")
     assert workstreams.load_workstream_store(workspace)["workstreams"] == {}
+    # The reader still fails open; applying OVER that file is refused now and
+    # has its own test. This one starts from a genuinely absent store.
+    store_path.unlink()
 
     snapshot = workstreams.build_classifier_snapshot(workspace)
     try:
@@ -1468,6 +1612,7 @@ def main() -> None:
         test_task_text_keeps_the_whole_body_not_just_its_first_line,
         test_task_text_stops_at_headers_that_follow_the_task_line,
         test_header_stop_pattern_escapes_key_metacharacters,
+        test_apply_refuses_to_save_over_an_unreadable_store,
         test_apply_is_validated_stable_sticky_and_fail_open,
         test_legacy_project_sidecar_migrates_on_the_next_write,
         test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating,
