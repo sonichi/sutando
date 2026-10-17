@@ -83,19 +83,18 @@ bootout_if_loaded() {
     fi
 }
 
-resolve_python() {
-    # Prefer Homebrew python3 — NOT for the version (cron-runner.py runs on 3.9)
-    # but because /usr/bin/python3 is the Xcode-CLT stub, REVIEW.md lesson 7.
-    if [ -x /opt/homebrew/bin/python3 ]; then
-        echo /opt/homebrew/bin/python3
-    elif [ -x /usr/local/bin/python3 ]; then
-        echo /usr/local/bin/python3
-    elif command -v python3 >/dev/null 2>&1; then
-        command -v python3
-    else
-        echo "ERROR: no python3 found" >&2
+resolve_runner_python() {
+    # The shared resolver: $SUTANDO_PY (the launcher passes the interpreter it resolved), then the
+    # bundled one, then a PATH python3 that is not the Xcode-CLT stub (REVIEW.md lesson 7).
+    # shellcheck source=../scripts/python-binary.sh
+    . "$REPO/scripts/python-binary.sh"
+    local py
+    py="$(resolve_python "$REPO")"
+    if [ -z "$py" ]; then
+        echo "ERROR: no runnable python3 found" >&2
         exit 1
     fi
+    printf '%s\n' "$py"
 }
 
 resolve_homebrew_bin() {
@@ -115,11 +114,18 @@ case "$cmd" in
             echo "ERROR: template not found: $TEMPLATE" >&2
             exit 1
         fi
-        PYTHON_BIN="$(resolve_python)"
+        PYTHON_BIN="$(resolve_runner_python)"
+        # The canonical label ($SUTANDO_HOST_LABEL first), the one cron-runner.py reads.
+        H="$(bash "$REPO/scripts/sutando-config.sh" host-label)"
+        if [ -z "$H" ]; then
+            echo "ERROR: host label did not resolve" >&2
+            exit 1
+        fi
         BREW_BIN="$(resolve_homebrew_bin)"
         echo "Installing $LABEL"
         echo "  repo:    $REPO"
         echo "  python:  $PYTHON_BIN"
+        echo "  host:    $H"
         echo "  brew:    $BREW_BIN"
         mkdir -p "$HOME/Library/LaunchAgents"
         mkdir -p "$WORKSPACE/logs"
@@ -142,7 +148,6 @@ case "$cmd" in
         # exists to prevent. cron-runner.py persists its state file on every
         # tick whenever crons.json has entries, so a forced tick + fresh state
         # write is an end-to-end proof.
-        H="$(hostname | sed 's/\..*//')"
         CRONS_FILE="$WORKSPACE/hosts/$H/crons.json"
         STATE_FILE="$WORKSPACE/state/cron-runner-state.json"
         if ! "$PYTHON_BIN" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])) else 1)' "$CRONS_FILE" 2>/dev/null; then
