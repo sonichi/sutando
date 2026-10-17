@@ -587,7 +587,7 @@ describe('add_comment: a comment on a page, as the web client leaves one', () =>
 		// 2026-10-13 21:16: "make a comment: Susan has reviewed" was appended to the page's text; the comments list stayed empty.
 		const f = fake(() => done({ event_id: '$root', comment: {} }));
 		const r = await addComment({ room: 'open.space launch video', kind: 'markdown-4m8ay3mg', text: ' Susan has reviewed. ' }, deps(f.client));
-		assert.deepEqual(r, { ok: true, room: 'open.space launch video', kind: 'markdown-4m8ay3mg', quote: null, event_id: '$root', ms: r.ok ? r.ms : -1 });
+		assert.deepEqual(r, { ok: true, room: 'open.space launch video', kind: 'markdown-4m8ay3mg', quote: null, event_id: '$root', mentions: 0, mentioned: [], ms: r.ok ? r.ms : -1 });
 		const { operation_id, ...rest } = f.calls[0].args as { operation_id: string };
 		assert.match(operation_id, /^[0-9a-f-]{36}$/);
 		assert.deepEqual(rest, { room_id: '!tdhHBCseqxerbZwbfm:ag2.space', action: 'room.commons.comments.add', arguments: { kind: 'markdown-4m8ay3mg', text: 'Susan has reviewed.' } });
@@ -600,6 +600,70 @@ describe('add_comment: a comment on a page, as the web client leaves one', () =>
 		assert.deepEqual((f.calls[2].args as { action: string; arguments: unknown }).action, 'room.commons.comments.reply');
 		assert.deepEqual((f.calls[2].args as { arguments: unknown }).arguments, { root_event_id: '$root', text: 'Thanks.' });
 		assert.deepEqual(await addComment({ room: 'open.space launch video', reply_to: 'root', text: 'x' }, deps(f.client)), { ok: false, error: 'no_thread' });
+	});
+
+	// The people the live test (2026-10-16) named: "me", "Xueqing" spelled out, "Chi", and a made-up id.
+	const people = (name: string, args: Record<string, unknown>) => {
+		if (name === 'ag2.whoami') return { structuredContent: { actor: { id: '@liususan091219-maddy.agent:ag2.space' }, runtime: { owner_id: '@liususan091219:ag2.space' } } };
+		const a = args as { action?: string; arguments?: { query?: string; user_id?: string } };
+		if (a.action === 'room.members.list') return done({ members: [
+			{ user_id: '@liususan091219:ag2.space', display_name: 'Xueqing Liu' },
+			{ user_id: '@chi:ag2.space', display_name: 'Chi Wang' },
+			{ user_id: '@sutando-sonichi:ag2.space', display_name: 'Echo-Act-IV-Pro' },
+			{ user_id: '@chi-chi-air-blue.agent:ag2.space', display_name: 'Echo-Act-IV-Blue' },
+			{ user_id: '@yixuan:ag2.space', display_name: 'Yixuan Zhai' },
+			{ user_id: '@yixuan-desktop.agent:ag2.space', display_name: 'Yixuan’s Desktop' },
+		] });
+		if (a.action === 'space.users.search') return done({ users: a.arguments?.query === 'qingyun'
+			? [{ user_id: '@qingyun:ag2.space', display_name: 'qingyun', kind: 'human' }]
+			: a.arguments?.query === 'Bo' ? [{ user_id: '@bo1:ag2.space', display_name: 'Bo Liu' }, { user_id: '@bo2:ag2.space', display_name: 'Bo Chen' }] : [] });
+		if (a.action === 'space.user.profile.read') return a.arguments?.user_id === '@qingyun:ag2.space'
+			? done({ user_id: '@qingyun:ag2.space', display_name: 'qingyun' })
+			: { isError: true, content: [{ type: 'text', text: '{"code":"NOT_FOUND"}' }] };
+		return done({ event_id: '$root' });
+	};
+	const sent = (f: { calls: Call[] }) => f.calls.filter(c => c.name === 'room.action.execute').map(c => (c.args as { arguments: Record<string, unknown> }).arguments);
+
+	it('"me" is the owner and a name is looked up among the room\'s members; the ids reach .add and .reply, and the names come back', async () => {
+		const f = fake(people);
+		const r = await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'Please review.', quote: 'the record', mentions: ['me', 'Chi'] }, deps(f.client));
+		assert.deepEqual(r.ok && [r.mentions, r.mentioned], [2, ['Xueqing Liu', 'Chi Wang']]);
+		const rep = await addComment({ room: 'open.space launch video', reply_to: '$root', text: 'Done?', mentions: ['XUEQING', '@chi:ag2.space'] }, deps(f.client));
+		assert.deepEqual(rep.ok && rep.mentioned, ['Xueqing Liu', 'Chi Wang']);
+		assert.deepEqual(sent(f), [
+			{ kind: 'markdown', text: 'Please review.', quote: 'the record', mentions: ['@liususan091219:ag2.space', '@chi:ag2.space'] },
+			{ root_event_id: '$root', text: 'Done?', mentions: ['@liususan091219:ag2.space', '@chi:ag2.space'] },
+		]);
+	});
+
+	it('someone not in the room is found across the space; an id typed into the text is not shown twice', async () => {
+		const f = fake(people);
+		const r = await addComment({ room: 'open.space launch video', kind: 'markdown', text: '@qingyun:ag2.space Please review it. @qingyun:ag2.space', mentions: ['qingyun'] }, deps(f.client));
+		assert.deepEqual(r.ok && r.mentioned, ['qingyun']);
+		assert.deepEqual(sent(f), [{ kind: 'markdown', text: 'Please review it.', mentions: ['@qingyun:ag2.space'] }]);
+	});
+
+	it('a made-up id, a name nobody has, or a name several people share sends nothing and says so; the example id is gone from the description', async () => {
+		const f = fake(people);
+		assert.deepEqual(await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'x', mentions: ['@xueqing:ag2.space'] }, deps(f.client)), { ok: false, error: 'no_user', name: '@xueqing:ag2.space' });
+		assert.deepEqual(await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'x', mentions: ['薛行流'] }, deps(f.client)), { ok: false, error: 'no_user', name: '薛行流' });
+		assert.deepEqual(await addComment({ room: 'open.space launch video', reply_to: '$root', text: 'x', mentions: ['Echo'] }, deps(f.client)), { ok: false, error: 'ambiguous_user', name: 'Echo', candidates: ['Echo-Act-IV-Pro (@sutando-sonichi:ag2.space)', 'Echo-Act-IV-Blue (@chi-chi-air-blue.agent:ag2.space)'] });
+		assert.deepEqual(await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'x', mentions: ['Bo'] }, deps(f.client)), { ok: false, error: 'ambiguous_user', name: 'Bo', candidates: ['Bo Liu (@bo1:ag2.space)', 'Bo Chen (@bo2:ag2.space)'] });
+		assert.deepEqual(sent(f), []);
+		// "Yixuan" is the person, not the agent named "Yixuan’s Desktop".
+		const y = await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'x', mentions: ['Yixuan'] }, deps(f.client));
+		assert.deepEqual(y.ok && y.mentioned, ['Yixuan Zhai']);
+		const tool = createAddCommentTool({ client: () => f.client, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 1 } });
+		assert.doesNotMatch(tool.description, /@sutando-sonichi/);
+		assert.match(tool.description, /"me" for the user, a name \("Chi"\), or a full user id; the tool looks each one up, so never make up an id/);
+		assert.match(tool.description, /Do not write the @ or their names into `text`/);
+		assert.match(tool.description, /"ambiguous_user" — several people match `name`: read out `candidates` and ask which/);
+	});
+
+	it('"me" with no owner to name sends nothing', async () => {
+		const f = fake((name, args) => name === 'ag2.whoami' ? { structuredContent: { actor: { id: '@a.agent:ag2.space' } } } : people(name, args));
+		assert.deepEqual(await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'x', mentions: ['me'] }, deps(f.client)), { ok: false, error: 'no_owner', name: 'me' });
+		assert.deepEqual(sent(f), []);
 	});
 
 	it('nothing is sent without text, with a kind that is not a page, with a quote on a non-Doc page, or to a misheard room; refusals and a missing passage are said', async () => {
@@ -624,6 +688,8 @@ describe('add_comment: a comment on a page, as the web client leaves one', () =>
 		assert.match(tool.description, /To change the page's own text, use write_page instead/);
 		assert.match(tool.description, /call only after the user has clearly said yes/);
 		assert.match(tool.description, /Once they have said yes, call this tool in that same turn/);
+		assert.match(tool.description, /say back the exact text you will write, on which page and in which room, and whom it mentions, and call only after/);
+		assert.match(tool.description, /Only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own/);
 		const out = await tool.execute({ kind: 'markdown', text: 'c' }, {} as never);
 		assert.equal(out.ok && out.room, 'C');
 		assert.match(ROOM_READ_PROMPT_RULE, /a comment or 留言 on a page → add_comment the same way, never an appended line/);
@@ -647,23 +713,27 @@ describe('send_message: a message in a room\'s chat, as the agent, after the use
 	it('a plain message, a reply, a thread post and mentions go through room.message.send with a fresh operation_id', async () => {
 		const f = fake(() => done({ event_id: '$sent' }));
 		const r = await sendMessage({ room: 'Sutando Triage', text: ' Looking at 5473 now. ' }, deps(f.client));
-		assert.deepEqual(r, { ok: true, room: 'Sutando Triage', event_id: '$sent', reply: false, mentions: 0, ms: r.ok ? r.ms : -1 });
+		assert.deepEqual(r, { ok: true, room: 'Sutando Triage', event_id: '$sent', reply: false, mentions: 0, mentioned: [], ms: r.ok ? r.ms : -1 });
 		const { operation_id, ...rest } = f.calls[0].args as { operation_id: string };
 		assert.match(operation_id, /^[0-9a-f-]{36}$/);
 		assert.deepEqual(rest, { room_id: '!cAAaogVSFcIYaNmohw:ag2.space', action: 'room.message.send', arguments: { body: 'Looking at 5473 now.' } });
 		assert.equal(f.calls[0].timeoutMs, ROOM_COMMONS_TIMEOUT_MS);
-		const r2 = await sendMessage({ room: 'Sutando Triage', text: 'Yes.', reply_to: '$q', thread: '$t', mentions: ['@sutando-sonichi:ag2.space'] }, deps(f.client));
-		assert.deepEqual(r2.ok && [r2.reply, r2.mentions], [true, 1]);
-		assert.deepEqual((f.calls[1].args as { arguments: unknown }).arguments, { body: 'Yes.', reply_to: '$q', thread_root: '$t', mentions: ['@sutando-sonichi:ag2.space'] });
+		const m = fake((name, args) => (args as { action?: string }).action === 'room.members.list'
+			? done({ members: [{ user_id: '@sutando-sonichi:ag2.space', display_name: 'Echo-Act-IV-Pro' }] }) : done({ event_id: '$sent' }));
+		const r2 = await sendMessage({ room: 'Sutando Triage', text: 'Yes.', reply_to: '$q', thread: '$t', mentions: ['Echo-Act-IV-Pro'] }, deps(m.client));
+		assert.deepEqual(r2.ok && [r2.reply, r2.mentions, r2.mentioned], [true, 1, ['Echo-Act-IV-Pro']]);
+		assert.deepEqual((m.calls[1].args as { arguments: unknown }).arguments, { body: 'Yes.', reply_to: '$q', thread_root: '$t', mentions: ['@sutando-sonichi:ag2.space'] });
 	});
 
 	it('nothing is sent without text, with a reply or thread that is not an event id, with a mention that is not a user id, or to a misheard room; refusals are said', async () => {
 		const f = fake(() => done({ event_id: '$x' }));
 		assert.deepEqual(await sendMessage({ room: 'Sutando Triage', text: ' ' }, deps(f.client)), { ok: false, error: 'no_text' });
 		assert.deepEqual(await sendMessage({ room: 'Sutando Triage', text: 'x', reply_to: 'chi' }, deps(f.client)), { ok: false, error: 'no_message' });
-		assert.deepEqual(await sendMessage({ room: 'Sutando Triage', text: 'x', mentions: ['Chi'] }, deps(f.client)), { ok: false, error: 'no_user' });
 		assert.deepEqual(await sendMessage({ room: 'Sutando Triaging', text: 'x' }, deps(f.client)), { ok: false, error: 'not_found', rooms: ['Sutando Triage'] });
 		assert.equal(f.calls.length, 0);
+		// Nobody in the room or the space by that name: looked up, nothing sent.
+		assert.deepEqual(await sendMessage({ room: 'Sutando Triage', text: 'x', mentions: ['Chi'] }, deps(f.client)), { ok: false, error: 'no_user', name: 'Chi' });
+		assert.deepEqual(f.calls.map(c => (c.args as { action?: string }).action), ['room.members.list', 'space.users.search']);
 		const refused = fake(() => ({ isError: true, content: [{ type: 'text', text: '{"code":"FORBIDDEN"}' }] }));
 		assert.deepEqual(await sendMessage({ room: '!a:x', text: 'x' }, deps(refused.client, [])), { ok: false, error: 'FORBIDDEN' });
 	});
@@ -673,7 +743,8 @@ describe('send_message: a message in a room\'s chat, as the agent, after the use
 		const tool = createSendMessageTool({ client: () => f.client, currentRoom: () => ({ id: '!c:x', name: 'C' }), index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 1 } });
 		assert.equal(tool.name, 'send_message');
 		assert.equal(tool.execution, 'inline');
-		assert.match(tool.description, /only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own/);
+		assert.match(tool.description, /Only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own/);
+		assert.doesNotMatch(tool.description, /@sutando-sonichi/);
 		assert.match(tool.description, /say back the exact text you will write, in which room, and whom it replies to or mentions, and call only after the user has clearly said yes/);
 		assert.match(tool.description, /Once they have said yes, call this tool in that same turn/);
 		const out = await tool.execute({ text: 'hi' }, {} as never);

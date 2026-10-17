@@ -16,7 +16,8 @@ its held entry; a held entry with no row waits (not yet in the room), or is done
 locally; a local close naming neither is `pending_close`. `unavailable: True` and `done: None`
 when the room cannot be read — never a zero. `reconcile_pass(workspace)` is the explicit pass
 (outbox replay, local closes, stale marks, the transitional legacy ingest, the history
-backfill); `ask_owner` runs it first, then the queue, then the row, and writes no row when
+backfill); `ask_owner` queues and holds its new question before room work, then reconciles after
+its row is confirmed, and writes no row when
 the outbox could not hold the question; a confirmed row commits the history marker BEFORE
 its outbox entry is deleted, and keeps the entry when that commit fails. `resolve` closes
 the row (committing the history marker first when the row is in view and the marker is not;
@@ -32,6 +33,7 @@ shapes through the client's own put_database / put_row_body.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import asyncio
 import json
 import os
@@ -278,14 +280,15 @@ def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
     if store is None:
         return _close_locally(ws, ask_id, status, f"room database: not used ({where})")
     try:
-        reconcile_pending(store, ws, host_label())
-        if not store_history(ws) and store.status_of(ask_id) is not None:
-            try:
-                Outbox(ws).commit_history(ask_id)
-            except StoreError as e:
-                return _close_locally(ws, ask_id, status, f"room database: left open — {e}", "its row is in view")
-        store.close(ask_id, status)
-        return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
+        with getattr(store, "operation", nullcontext)():
+            reconcile_pending(store, ws, host_label())
+            if not store_history(ws) and store.status_of(ask_id) is not None:
+                try:
+                    Outbox(ws).commit_history(ask_id)
+                except StoreError as e:
+                    return _close_locally(ws, ask_id, status, f"room database: left open — {e}", "its row is in view")
+            store.close(ask_id, status)
+            return True, f"room database: {ask_id} -> {status} in {store.where(ask_id)}"
     except GuardFailed as g:
         if not g.current and any(e["ask_id"] == ask_id for e in Outbox(ws).entries()):
             return _close_locally(ws, ask_id, status, "its held entry has no row yet")
@@ -301,7 +304,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
               host: Optional[str] = None, now: Optional[float] = None, store=None,
               default_action: Optional[str] = None, reason: Optional[str] = None,
               options=(), priority: str = "Medium") -> dict:
-    """Reconcile, queue (core), hold, row, notify — each step reported, none raising past here.
+    """Queue (core), hold, row, bounded reconcile, notify — each step reported, none raising past here.
     `store` is this adapter's store; None leaves the question in the outbox. No outbox record,
     no row: the question is still queued to the owner, and the report says it was not held. A
     confirmed row commits the store-history marker, then releases its outbox entry; a marker
@@ -312,11 +315,6 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
     ws = Path(workspace) if workspace else resolve_workspace(migrate=False)
     host = host or host_label()
     rec = None
-    if store is not None:
-        try:
-            rec = reconcile_pending(store, ws, host)
-        except Exception as e:  # noqa: BLE001 — this ask still goes out
-            rec = {"flushed": [], "closed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
     intro = None
     if store is not None and not room_introduced(ws):
         intro = (f"All my questions for you are kept in the Pending questions database in {store.label}; "
@@ -331,22 +329,29 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
             mark_room_introduced(ws, out["ask_id"])
         except OSError as e:
             out["send_error"] = f"{type(e).__name__}: {e}"
-    if out["outbox"] is None:
-        out["db_error"] = f"{out['outbox_error']}; the room was NOT written (no durable record to replay)"
-    else:
-        q = Question.from_dict(out["question"])
-        w = write_question(q, store, out["sent_line"])
-        out["link"], out["db_error"] = w.link or link, w.db_error
-        if w.complete:
-            out["record"] = store.where(q.ask_id)
-            try:
-                mark_store_used(ws, q.ask_id)
-                Outbox(ws).delete(q.ask_id)
-                out["outbox"] = None
-            except OSError as e:  # the entry stays: local evidence a later outage can be read from
-                out["history_error"] = f"{type(e).__name__}: {e}"
+    with getattr(store, "operation", nullcontext)():
+        if out["outbox"] is None:
+            out["db_error"] = f"{out['outbox_error']}; the room was NOT written (no durable record to replay)"
         else:
-            out["record"] = f"outbox {out['outbox']}"
+            q = Question.from_dict(out["question"])
+            w = write_question(q, store, out["sent_line"])
+            out["link"], out["db_error"] = w.link or link, w.db_error
+            if w.complete:
+                out["record"] = store.where(q.ask_id)
+                try:
+                    mark_store_used(ws, q.ask_id)
+                    Outbox(ws).delete(q.ask_id)
+                    out["outbox"] = None
+                except OSError as e:  # the entry stays: local evidence a later outage can be read from
+                    out["history_error"] = f"{type(e).__name__}: {e}"
+            else:
+                out["record"] = f"outbox {out['outbox']}"
+        if out["record"] is not None and out["outbox"] is None:
+            try:
+                rec = reconcile_pending(store, ws, host)
+            except Exception as e:  # noqa: BLE001
+                rec = {"flushed": [], "closed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
+    out["reconcile"] = rec
     if urgency == "live":
         out["macos"], out["macos_fix"] = core_ask.notify_macos(f"Question: {question}")
     return out

@@ -35,12 +35,17 @@ This skill's `hooks/compact-carry.py` keeps owner questions out of compaction su
 one, has the core file any never-asked question it carried; `session-state.md` shows only the
 count (`python3 src/pending_questions_reader.py summary`).
 
-- `ask` reconciles, queues the question to the owner (the task's conversation only for an
+- `ask` queues the question to the owner (the task's conversation only for an
   owner-tier task in his DM; otherwise his DM), saves it to the outbox, writes the row born
   with its `**Sent:**` record, and once that exact row is confirmed complete commits the
   store-history marker and THEN deletes the outbox file — a marker that cannot be written
   keeps the file (`history: FAILED` in the report) so the local evidence outlives the
-  failure. If the outbox cannot hold the question, NO row is written: the owner is still
+  failure. Only after that confirmation does it reconcile the older backlog. Room subprocess
+  calls share one operation budget (90 seconds by default), so failures cannot renew the
+  timeout for each older question; the held entries remain for a later explicit reconcile.
+  The shared reconcile pass applies that budget to every caller, including `pq reconcile`
+  and reminders. Resolving an answer shares it across reconciliation and the row close.
+  If the outbox cannot hold the question, NO row is written: the owner is still
   asked, and the report says nothing holds it. Read the output: a `FAILED` line is not an
   ask. Then continue; never block.
 - `list` is READ-ONLY — it writes no file, not even the history marker — and lists each ask

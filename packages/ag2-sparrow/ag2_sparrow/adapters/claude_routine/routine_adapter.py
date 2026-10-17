@@ -19,6 +19,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 from ..codex.codex_connector import (acquire_lock, load_done, non_owner_note, parse_task,
                                      record_done, write_atomic)
@@ -43,7 +44,8 @@ def _field(value):
 
 def build_payload(task_id, headers, message, operator_lines=(), note=None):
     """First line: the attested routing fields. Then, for a non-owner tier, the note; then
-    the untrusted body. Truncated to the endpoint's limit."""
+    the untrusted body between nonce markers; then the bridge-written lines, outside them.
+    Only the body is cut to fit the endpoint's limit, so the markers and lines survive."""
     tier = headers.get("access_tier") or "guest"
     collaborator = tier == "team" and headers.get("collaborator") == "true"
     room = _field(headers.get("channel_id")) or _field(headers.get("source_room_id"))
@@ -52,11 +54,13 @@ def build_payload(task_id, headers, message, operator_lines=(), note=None):
         room, thread, tier, "true" if collaborator else "false", _field(task_id))
     if tier != "owner":
         head += "note: %s\n" % (note if note is not None else non_owner_note())
-    body = message + ("\n" + "\n".join(operator_lines) if operator_lines else "")
-    text = head + body
-    if len(text) > TEXT_MAX:
-        text = text[:TEXT_MAX - len(TRUNCATED)] + TRUNCATED
-    return room, text
+    tag = "UNTRUSTED_TASK_" + uuid.uuid4().hex[:8]
+    opening, closing = "<%s>\n" % tag, "\n</%s>" % tag
+    tail = closing + ("\n" + "\n".join(operator_lines) if operator_lines else "")
+    room_left = TEXT_MAX - len(head) - len(opening) - len(tail)
+    if len(message) > room_left:
+        message = message[:max(room_left - len(TRUNCATED), 0)] + TRUNCATED
+    return room, head + opening + message + tail
 
 
 def retry_after_seconds(value, now=None, default=60.0):
@@ -171,11 +175,9 @@ def result_body(outcome, mode, owner=True):
 
 
 NO_ROOM = "This message has no room to reply in, so it was not sent to the cloud agent.\n"
-# The blocker this exists for: every tier fired at the one routine holding the owner's connector,
-# limited only by a prompt note. Non-owner tasks are refused here unless explicitly allowed.
-NON_OWNER_REFUSED = ("This routine only answers the owner by default (it holds the owner's AG2 "
-                     "Space connector); non-owner tasks are not sent to it. Pass --allow-non-owner "
-                     "to enable, only if this routine's scope is meant to be reachable by others.\n")
+# The routine acts with the owner's AG2 Space connector, so non-owner tiers are refused
+# unless --allow-non-owner is set; the sender sees only this plain line.
+NON_OWNER_REFUSED = "This agent only answers its owner here.\n"
 
 
 class Adapter:
