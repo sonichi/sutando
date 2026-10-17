@@ -885,6 +885,18 @@ class WithdrawnAccess(_Bridge):
         self.assertEqual([p["id"] for p in self.broker.results()].count(ASK_A), 2, "sent more than retried")
 
     def test_an_end_cut_short_is_finished_by_the_next_pass_or_start(self):
+        # Cut after the `failed` is accepted, before anything is retired: the start's mark
+        # sweep keeps the mark the entry still names, and the end retires it last.
+        with patch.object(gw, "_drop_staged", side_effect=_Crash("after the accepted `failed`")), \
+                self.assertRaises(_Crash):
+            self.withheld_on_a_drop(age=700.0)
+        self.assertEqual(item(self.outbox_root, ASK_A)["status"], "DELIVERED")
+        gw._retire_delivered_marks()
+        self.assertEqual(gw._load_ack_first(), {ASK_A: ASK_A}, "the start retired the mark first")
+        with patch.object(gw, "_load_held", return_value=None):
+            gw._retire_delivered_marks()                 # nor while the manifest cannot be read
+        self.assertEqual(gw._load_ack_first(), {ASK_A: ASK_A})
+        # Cut before the entry goes: the next pass finishes, the staged file already gone.
         real_put = gw._put_held
 
         def dies_removing(tid, entry):
@@ -892,12 +904,14 @@ class WithdrawnAccess(_Bridge):
                 raise _Crash("before the entry goes")
             return real_put(tid, entry)
         with patch.object(gw, "_put_held", new=dies_removing), self.assertRaises(_Crash):
-            self.withheld_on_a_drop(age=700.0)
+            self.advance(cap="guest")
         self.assertEqual((sorted(gw._held_dir().glob("*.tmp")), gw._load_ack_first()), ([], {ASK_A: ASK_A}))
-        self.advance(cap="guest")                        # the next pass: staged file gone, entry ending
+        gw._retire_delivered_marks()
+        self.assertEqual(gw._load_ack_first(), {ASK_A: ASK_A})
+        self.advance(cap="guest")
         self.assert_ended()
         self.assertEqual(self.broker.results(), [FAILED])
-        # Cut before the mark: the next start retires it, the `failed` being delivered.
+        # Cut before the mark, the entry gone: now the start's sweep retires it.
         gw._record_ack_first(ASK_A)
         gw._retire_delivered_marks()
         self.assertEqual(gw._load_ack_first(), {})
@@ -1233,6 +1247,37 @@ class WithdrawnAccessThroughTheLoop(_Loop):
         self.assertEqual(self.bridges.fired(), [], "the ended ask reached the core")
         self.assertFalse((self.ws / "tasks" / f"{ASK_A}.txt").exists())
         self.assertEqual(sorted((self.ws / "tasks" / ".ack-first").glob("*.tmp")), [])
+
+    def test_a_crash_after_the_failed_is_accepted_leaves_the_mark_for_the_end_to_retire_last(self):
+        self.relay.queue.append(voice_ask())
+        self.bridges.crashed(self.bridges.start(crash="before-publish"), "the publish")
+        [staged] = sorted((self.ws / "tasks" / ".ack-first").glob(f"{ASK_A}.txt.*.tmp"))
+        landed = time.time() - 700.0
+        os.utime(staged, (landed, landed))
+        self.bridges.env["REMOTE_TASK_TIER"] = "guest"
+        self.bridges.crashed(self.bridges.start(crash="withdrawn:after-failed"), "the accepted `failed`")
+        self.assertEqual(self.relay.results, [FAILED])
+        held = self.state("remote-task-ack-first-manifest")
+        self.assertIs(held[ASK_A]["ending"], True)
+        self.assertEqual((self.state("remote-task-ack-first"), staged.exists()), ({ASK_A: ASK_A}, True))
+        self.assertIn(ASK_A, self.state("remote-task-inflight"))
+        # The next start's mark sweep sees a delivered result and no live file: it must keep the mark.
+        self.bridges.crashed(self.bridges.start(crash="start:after-mark-sweep"), "the start's mark sweep")
+        self.assertEqual(self.state("remote-task-ack-first"), {ASK_A: ASK_A},
+                         "the start retired the mark before the end retired the rest")
+        self.assertIs(self.state("remote-task-ack-first-manifest")[ASK_A]["ending"], True)
+        last = self.bridges.start()
+        self.bridges.wait_for(lambda: not self.state("remote-task-ack-first")
+                              and not self.state("remote-task-ack-first-manifest"), last, "the end finished")
+        self.bridges.polls_after(last)
+        self.bridges.stop(last)
+        self.assertEqual(self.posted(), [FAILED], "the `failed` was sent again")
+        self.assertEqual(self.bridges.fired(), [], "the ended ask reached the core")
+        self.assertFalse((self.ws / "tasks" / f"{ASK_A}.txt").exists())
+        self.assertFalse(staged.exists())
+        self.assertNotIn(ASK_A, self.state("remote-task-inflight"))
+        self.assertEqual(self.logged(f"ack_first task {ASK_A}: ended unpublished (local access withdrawn); "
+                                     "its relay mark is retired"), 1)
 
 
 class OutsideTheInFlightSet(_Loop):

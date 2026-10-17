@@ -4409,11 +4409,16 @@ def _retire_delivered_marks() -> None:
     aliases = _load_dedup_aliases()
     if aliases is None:
         return              # a re-ask's live result cannot be ruled out: the marks wait
+    held = _load_held()
+    if held is None:
+        return              # a held task's mark cannot be ruled out: the marks wait
+    # A held task's end (a withdrawn ask's `failed`) retires its own mark, last.
+    staged = {e.get("broker_id") for e in held.values() if isinstance(e, dict)}
     root = _delivery_core().backend.root
     for broker_id, local in sorted(marks.items()):
         if not (_valid_tid(broker_id) and isinstance(local, str) and _valid_local_tid(local)):
             continue
-        if (read_item(root, broker_id) or {}).get("status") != "DELIVERED":
+        if broker_id in staged or (read_item(root, broker_id) or {}).get("status") != "DELIVERED":
             continue
         # A re-ask answers under its original's id, so its live result keeps the mark too.
         answers = {local} | {k for k, v in aliases.items() if v == local and _valid_local_tid(k)}

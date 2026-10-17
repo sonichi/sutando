@@ -202,17 +202,21 @@ def publish_at(tmp, path):
 gw._post_ack_first, gw._publish_staged, gw._put_held, gw._record_ack_first = (
     ack_at, publish_at, put_at, mark_at)
 
-# The end of a relay result refused for good, cut short before a step or after it.
-END_STEPS = {"end:before-quarantine": ("_dispose_terminal", True), "end:before-settle": ("_settle_task", True),
-             "end:after-settle": ("_settle_task", False), "end:before-mark": ("_forget_ack_first", True)}
+# A relay result's end cut short at a step: before it, after it, or after it succeeded.
+END_STEPS = {"end:before-quarantine": ("_dispose_terminal", "before"),
+             "end:before-settle": ("_settle_task", "before"), "end:after-settle": ("_settle_task", "after"),
+             "end:before-mark": ("_forget_ack_first", "before"),
+             "withdrawn:after-failed": ("_relay_failed_sent", "after-true"),
+             "start:after-mark-sweep": ("_retire_delivered_marks", "after")}
 if crash in END_STEPS:
-    step, before = END_STEPS[crash]
+    step, when = END_STEPS[crash]
     real_step = getattr(gw, step)
 
     def step_at(*a, **k):
-        if not before:
-            real_step(*a, **k)
-        os._exit(17)
+        out = None if when == "before" else real_step(*a, **k)
+        if when != "after-true" or out:
+            os._exit(17)
+        return out
     setattr(gw, step, step_at)
 gw.main()
 """
