@@ -260,18 +260,19 @@ def prepare_work_dir(work):
 
 
 def probe_moves(directory):
-    """Refusal line unless rename and hard link both work in `directory`."""
+    """Refusal line unless rename, hard link and the no-replace move publication uses all work in `directory`."""
     base = os.path.join(directory, ".probe-%d-%s" % (os.getpid(), uuid.uuid4().hex[:8]))
     try:
         with open(base, "wb") as f:
             f.write(b"probe")
         os.link(base, base + ".link")
         os.rename(base + ".link", base + ".moved")
+        undelivered_quarantine.move_private(Path(base + ".moved"), Path(base + ".final"))
         return None
     except OSError as e:
-        return "refusing to start: rename and hard link must work in %s (%s)" % (directory, e)
+        return "refusing to start: rename, hard link and no-replace rename must work in %s (%s)" % (directory, e)
     finally:
-        for p in (base, base + ".link", base + ".moved"):
+        for p in (base, base + ".link", base + ".moved", base + ".final"):
             if os.path.lexists(p):
                 os.unlink(p)
 

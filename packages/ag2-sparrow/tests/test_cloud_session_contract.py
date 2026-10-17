@@ -271,7 +271,7 @@ def bounded_wait(predicate, what, timeout=30.0):
     raise AssertionError("timed out after %.0fs waiting for %s" % (timeout, what))
 
 
-@unittest.skipUnless(CONTRACT, "the task-lifecycle contract is off (TASK_LIFECYCLE_CONTRACT=1 turns it on)")
+@unittest.skipUnless(CONTRACT, "the task-lifecycle contract is off (TASK_LIFECYCLE_CONTRACT=0 turns it off)")
 @unittest.skipUnless(BRIDGE_FIXTURE.exists(), "the bridge's own broker fixture lives in the repository's src/")
 class ProductionBridgeWitnessTest(unittest.TestCase):
     """The packaged bridge, as a subprocess, against the bridge's own in-process broker fixture."""

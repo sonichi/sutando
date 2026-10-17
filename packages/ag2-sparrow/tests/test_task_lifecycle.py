@@ -767,6 +767,12 @@ class ProbeTest(Base):
             self.assertIn("hard link", self.lc.probe_moves(str(self.work)))
         self.assertEqual(os.listdir(self.work), [])
 
+    def test_a_filesystem_without_the_no_replace_move_fails_the_probe(self):
+        failing = FileExistsError(errno.ENOTSUP, "no no-replace rename")
+        with mock.patch.object(self.lc.undelivered_quarantine, "move_private", side_effect=failing):
+            self.assertIn("no-replace rename", self.lc.probe_moves(str(self.work)))
+        self.assertEqual(os.listdir(self.work), [], "the probe files are removed")
+
 
 # ── the classifier ───────────────────────────────────────────────────────────
 

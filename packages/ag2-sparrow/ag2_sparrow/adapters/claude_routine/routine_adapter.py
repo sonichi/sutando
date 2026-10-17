@@ -23,7 +23,7 @@ import urllib.request
 from ...task_io import (LockRefused, acquire_lock, exit_code, exit_on_sigterm, make_dirs, non_owner_note, release_lock,
                         root_path, stoppable_sleep, write_atomic)
 from ...relay_loop import (HOUR, NO_ROOM, NON_OWNER_REFUSED, TEXT_MAX, Outcome, RateLimiter,  # noqa: F401
-                          RelayLoop, build_payload, log, result_body)
+                          RelayLoop, build_payload, count_arg, log, result_body)
 
 API_BASE = "https://api.anthropic.com"
 API_VERSION = "2023-06-01"
@@ -154,7 +154,7 @@ def build_parser():
     ap.add_argument("--backoff", type=float, default=2.0, help="first retry delay, doubled per retry")
     ap.add_argument("--backoff-max", type=float, default=60.0)
     ap.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout per fire")
-    ap.add_argument("--once", type=int, default=0, help="exit after N tasks")
+    ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=1.0)
     return ap
@@ -174,12 +174,12 @@ def main(argv=None, environ=None, opener=urllib.request.urlopen):
         sys.stderr.write("refusing to start: env var %s is empty or unset\n" % args.token_env)
         return 2
     args.work = os.path.abspath(args.work)
+    exit_on_sigterm()
     try:
         owner = acquire_lock(args.work, "claude-routine")
     except LockRefused as e:
         sys.stderr.write(e.line + "\n")
         return e.code
-    exit_on_sigterm()
     try:
         make_dirs(owner, ("tasks", "results", "state"))
         args.work = root_path(owner, args.work)

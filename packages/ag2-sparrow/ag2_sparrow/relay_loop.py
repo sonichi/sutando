@@ -6,6 +6,7 @@ nonce-marked untrusted span, bridge-written lines after it), the result lines, t
 cap kept on disk, and the task/result loop (priority order, done ledger, retry timing). An adapter
 subclasses `RelayLoop`, implements `step()`, and keeps only its own transport. Stdlib only.
 """
+import argparse
 import json
 import os
 import re
@@ -56,6 +57,14 @@ def build_payload(task_id, headers, message, operator_lines=(), note=None, text_
     if len(message) > room_left:
         message = message[:max(room_left - len(TRUNCATED), 0)] + TRUNCATED
     return room, head + opening + message + tail
+
+
+def count_arg(text):
+    """argparse type for --once: an integer of zero or more (zero means no limit)."""
+    n = int(text)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return n
 
 
 class Outcome:
@@ -280,7 +289,7 @@ class RelayLoop:
         while not stop_requested():
             names = self.pending(seen)
             if not names:
-                if self.args.once and done >= self.args.once:  # pragma: no cover - a step's own check returns first
+                if self.args.once and done >= self.args.once:  # pragma: no cover - a step returns first; --once is never negative
                     return
                 if self.args.idle_exit and self.clock() - idle_since > self.args.idle_exit:
                     log("idle-exit")

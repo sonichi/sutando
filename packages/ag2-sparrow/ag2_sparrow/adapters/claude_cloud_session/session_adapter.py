@@ -19,7 +19,7 @@ import sys
 import time
 
 from ... import task_lifecycle
-from ...relay_loop import NO_ROOM, TEXT_MAX, Outcome, RelayLoop, build_payload, log, result_body
+from ...relay_loop import NO_ROOM, TEXT_MAX, Outcome, RelayLoop, build_payload, count_arg, log, result_body
 from ...task_io import (LockRefused, acquire_lock, clear_attributed_pidfile, exit_code, exit_on_sigterm,
                         make_dirs, non_owner_note, release_lock, root_path, stoppable_sleep)
 
@@ -250,7 +250,7 @@ def build_parser():
     ap.add_argument("--backoff", type=float, default=2.0, help="first retry delay, doubled per retry")
     ap.add_argument("--backoff-max", type=float, default=60.0)
     ap.add_argument("--timeout", type=float, default=60.0, help="seconds per claude call")
-    ap.add_argument("--once", type=int, default=0, help="exit after N tasks")
+    ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=1.0)
     return ap
@@ -272,12 +272,12 @@ def main(argv=None, environ=None):
         return 2
     args.claude = os.path.abspath(resolved)
     args.work = os.path.abspath(args.work)
+    exit_on_sigterm()
     try:
         owner = acquire_lock(args.work, "claude-cloud-session")
     except LockRefused as e:
         sys.stderr.write(e.line + "\n")
         return e.code
-    exit_on_sigterm()
     try:
         return exit_code(serve_locked(args, environ, owner))
     finally:

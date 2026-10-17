@@ -26,7 +26,7 @@ RECORDED = json.loads((Path(__file__).resolve().parent / "adapter_differential_r
 class DifferentialTest(unittest.TestCase):
     def run_driver(self, adapter):
         with tempfile.TemporaryDirectory() as base:
-            env = dict(os.environ, PYTHONPATH=str(PKG_ROOT))
+            env = dict(os.environ, PYTHONPATH=str(PKG_ROOT), TMPDIR="/tmp")  # a stable gettempdir() on every host
             out = subprocess.run([sys.executable, str(DRIVER), adapter, base], env=env, capture_output=True,
                                  text=True, timeout=180)
             self.assertEqual(out.returncode, 0, out.stderr)

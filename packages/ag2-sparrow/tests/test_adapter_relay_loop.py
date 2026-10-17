@@ -105,6 +105,14 @@ class LimiterTest(unittest.TestCase):
             self.assertIn((now[0] - 2, "task-a"), rl.RateLimiter(lim.path, 2, lambda: now[0]).entries)
 
 
+    def test_a_negative_once_is_refused_at_parsing(self):
+        for build in (sa.build_parser, ra.build_parser):
+            parser = build()
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parser.parse_args(["--work", "w", "--once", "-1"] + (["--session-id", "session_x"] if build is sa.build_parser else ["--trigger-id", "trig_x"]))
+        self.assertEqual(rl.count_arg("0"), 0)
+        self.assertEqual(rl.count_arg("3"), 3)
+
     def test_a_recovering_task_skips_the_send_gates(self):
         with tempfile.TemporaryDirectory() as d:
             loop = Loop(d)

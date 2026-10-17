@@ -476,12 +476,12 @@ def main(argv=None):
         build_parser().error("--work is required unless --push is given")
     cwd_given = args.cwd
     args.work = os.path.abspath(args.work)
+    exit_on_sigterm()
     try:
         owner = acquire_lock(args.work, "codex")
     except LockRefused as e:
         sys.stderr.write(e.line + "\n")
         return e.code
-    exit_on_sigterm()
     try:
         make_dirs(owner, ("tasks", "results", "state", os.path.join("state", "threads")))
         args.work = root_path(owner, args.work)

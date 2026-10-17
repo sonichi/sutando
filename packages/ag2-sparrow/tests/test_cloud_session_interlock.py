@@ -276,13 +276,17 @@ class InterlockTest(unittest.TestCase):
 
     def test_routine_first_then_cloud_refuses_at_the_flock(self):
         _, held_by = self.start("routine")
+        wait_for(lambda: all((self.work / d).is_dir() for d in ("tasks", "results", "state")), "the work dirs")
         before = sorted(os.listdir(self.work))
         self.assert_refused_at_the_flock(self.cloud_main(), held_by)
         self.assertEqual(sorted(os.listdir(self.work)), before, "the refused adapter created nothing")
 
     def test_the_cloud_holds_the_flock_and_a_routine_refuses_at_it(self):
         _, held_by = self.start("cloud")
-        before = sorted(os.listdir(self.work / "state"))
+        state = self.work / "state"
+        wait_for(lambda: (state / "format").exists() and not any(n.startswith(".format.") for n in os.listdir(state)),
+                 "the first init to finish")
+        before = sorted(os.listdir(state))
         self.assert_refused_at_the_flock(self.routine_main(), held_by)
         self.assertEqual(sorted(os.listdir(self.work / "state")), before, "the refused routine wrote nothing")
 
@@ -569,6 +573,24 @@ class TaskIoBranchTest(unittest.TestCase):
         pidfile.unlink()
         pidfile.mkdir()
         self.assertIn("cannot read", task_io.clear_attributed_pidfile(owner, str(self.work)))
+
+    def test_every_adapter_installs_the_stop_handler_before_it_takes_the_lock(self):
+        before = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, before)
+        for mod, argv, env in ((sa, ["--session-id", "session_x", "--claude", sys.executable], {"PATH": "/usr/bin:/bin"}),
+                               (ra, ["--trigger-id", "trig_x"], {"CLAUDE_ROUTINE_TOKEN": "t"}),
+                               (cc, ["--server", "stub"], None)):
+            with self.subTest(adapter=mod.__name__):
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                seen = []
+
+                def acquire(*a, **k):
+                    seen.append(signal.getsignal(signal.SIGTERM))
+                    raise task_io.LockRefused(3, "refusing to start: held")
+                args = ["--work", str(self.work)] + argv
+                with mock.patch.object(mod, "acquire_lock", acquire), contextlib.redirect_stderr(io.StringIO()):
+                    rc = mod.main(args, env) if env is not None else mod.main(args)
+                self.assertEqual((rc, seen), (3, [task_io._terminated]))
 
     def test_the_module_prints_the_note_and_asks_for_a_flag(self):
         out = io.StringIO()
