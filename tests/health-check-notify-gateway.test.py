@@ -28,6 +28,13 @@ from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent / "_helpers"))
+import relay_isolation  # noqa: E402
+from relay_isolation import assert_secret_equal, assert_secret_none  # noqa: E402
+
+
+def setUpModule():
+    unittest.addModuleCleanup(relay_isolation.isolate())
 
 
 def _load():
@@ -88,31 +95,31 @@ class TestGatewayNotify(unittest.TestCase):
     def test_env_parsing_skips_comments_blanks_and_missing_file(self):
         # Comments + blank lines are ignored; a missing .env yields no creds.
         self._write_env("# gateway creds\n\nREMOTE_TASK_URL=https://gw\nREMOTE_TASK_TOKEN=s\n")
-        self.assertEqual(self.hc._gateway_creds(), ("https://gw", "s"))
+        assert_secret_equal(self, self.hc._gateway_creds(), ("https://gw", "s"))
         (self.cfg / "channels" / "ag2space" / ".env").unlink()
-        self.assertIsNone(self.hc._gateway_creds())
+        assert_secret_none(self, self.hc._gateway_creds())
 
     # --- creds ------------------------------------------------------------
 
     def test_creds_split_form(self):
         self._write_env("REMOTE_TASK_URL=https://gw/\nREMOTE_TASK_TOKEN=secret\n")
-        self.assertEqual(self.hc._gateway_creds(), ("https://gw", "secret"))
+        assert_secret_equal(self, self.hc._gateway_creds(), ("https://gw", "secret"))
 
     def test_creds_one_token_form(self):
         self._write_env("REMOTE_TASK_TOKEN=https://gw|secret\n")
-        self.assertEqual(self.hc._gateway_creds(), ("https://gw", "secret"))
+        assert_secret_equal(self, self.hc._gateway_creds(), ("https://gw", "secret"))
 
     def test_creds_legacy_split_form(self):
         self._write_env("AG2_REMOTE_URL=https://legacy-gw/\nAG2_REMOTE_TOKEN=legacy-secret\n")
-        self.assertEqual(self.hc._gateway_creds(), ("https://legacy-gw", "legacy-secret"))
+        assert_secret_equal(self, self.hc._gateway_creds(), ("https://legacy-gw", "legacy-secret"))
 
     def test_creds_legacy_one_token_form(self):
         self._write_env("AG2_REMOTE_TOKEN=https://legacy-gw|legacy-secret\n")
-        self.assertEqual(self.hc._gateway_creds(), ("https://legacy-gw", "legacy-secret"))
+        assert_secret_equal(self, self.hc._gateway_creds(), ("https://legacy-gw", "legacy-secret"))
 
     def test_creds_none_when_missing(self):
         self._write_env("AGENT_ID=x\n")
-        self.assertIsNone(self.hc._gateway_creds())
+        assert_secret_none(self, self.hc._gateway_creds())
 
     # --- delivery ---------------------------------------------------------
 

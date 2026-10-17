@@ -103,6 +103,11 @@ def _clean_for(var: str, value: object) -> str:
     return clean_relay_token(value) if var in RELAY_TOKEN_VARS else _clean(value)
 
 
+def clean_for(var: str, value: object) -> str:
+    """Public face of `_clean_for`, for resolvers that hold already-parsed values."""
+    return _clean_for(var, value)
+
+
 def token_from_env_file(var: str, env_file: Path) -> str:
     """Read `var` from a `KEY=VALUE` file. '' when absent, empty, or unreadable."""
     try:

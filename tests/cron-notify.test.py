@@ -11,6 +11,10 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "tests" / "_helpers"))
+import relay_isolation  # noqa: E402
+
+relay_isolation.isolate()
 spec = importlib.util.spec_from_file_location(
     "cron_notify", REPO / "skills" / "schedule-crons" / "cron-notify.py")
 cn = importlib.util.module_from_spec(spec)
@@ -84,21 +88,14 @@ def main() -> int:
     check("record_ping tolerates non-dict", cn.record_ping(None, "c", 5) == {"c": 5})
 
     # ── gateway config + delivery (urllib mocked — no network) ──────────
-    # _load_gateway now delegates to the canonical resolver (ensure-cron-room.py:
-    # resolve_token): it reads process env AND <repo>/.env across all gateway
-    # alias keys, honoring combined "url|secret" and split URL+token. It takes a
-    # REPO DIR (reads <repo>/.env), repo-anchored regardless of cwd — not a .env
-    # file path. Tests clear the process-env gateway keys so the running core's
-    # real creds can't leak in and make a negative meaningless.
+    # _load_gateway(repo) resolves through src/relay_credentials.py with <repo>/.env
+    # as the last tier; relay_isolation blanked the host tiers, so negatives hold.
     import unittest.mock as um
     import os as _os
-    _GW_KEYS = ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN",
-                "GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL", "AG2_REMOTE_URL")
+    _r = relay_isolation.redact
 
     def _clean_env(**over):
-        e = {k: v for k, v in _os.environ.items() if k not in _GW_KEYS}
-        e.update(over)
-        return um.patch.dict(_os.environ, e, clear=True)
+        return um.patch.dict(_os.environ, over)
 
     with tempfile.TemporaryDirectory() as d:
         env = Path(d) / ".env"
@@ -106,12 +103,12 @@ def main() -> int:
         with _clean_env():
             base, secret = cn._load_gateway(d)
             check("_load_gateway parses combined url|secret from <repo>/.env",
-                  base == "https://x.example/relay" and secret == "sekret", (base, secret))
+                  base == "https://x.example/relay" and secret == "sekret", (base, _r(secret)))
         # split token via process env WINS over .env (the exact #2346 gap: the old
         # reader saw only AG2_REMOTE_TOKEN in .env and returned (None, None) here)
         with _clean_env(GATEWAY_URL="https://env.example", GATEWAY_TOKEN="s2"):
             check("_load_gateway split process-env wins over .env",
-                  cn._load_gateway(d) == ("https://env.example", "s2"), cn._load_gateway(d))
+                  cn._load_gateway(d) == ("https://env.example", "s2"), _r(cn._load_gateway(d)))
         # repo-anchored: resolves the same from a non-repo cwd
         with _clean_env():
             _cwd0 = _os.getcwd()
@@ -119,14 +116,14 @@ def main() -> int:
                 _os.chdir(tempfile.gettempdir())
                 check("_load_gateway resolves <repo>/.env from a non-repo cwd",
                       cn._load_gateway(d) == ("https://x.example/relay", "sekret"),
-                      cn._load_gateway(d))
+                      _r(cn._load_gateway(d)))
             finally:
                 _os.chdir(_cwd0)
         # bare token, no URL anywhere → no base, so nothing can be sent
         env.write_text("AG2_REMOTE_TOKEN=nopipe\n")
         with _clean_env():
             b2, _s2 = cn._load_gateway(d)
-            check("_load_gateway bare token → no base (won't send)", b2 is None, (b2, _s2))
+            check("_load_gateway bare token → no base (won't send)", b2 is None, (b2, _r(_s2)))
         # nothing configured anywhere → (None, None)
         with tempfile.TemporaryDirectory() as _empty, _clean_env():
             check("_load_gateway unconfigured → (None, None)",

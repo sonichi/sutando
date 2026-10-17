@@ -9,7 +9,7 @@ Every room-ops module is a thin **gateway-only** client: it speaks the stable
 authoritative membership enforcement. This module centralises the pieces every
 capability shares so they aren't copy-pasted per module:
 
-  - gateway coordinates (GATEWAY_URL / token from env/vault; RELAY_* honored as aliases)
+  - gateway coordinates (resolved by src/relay_credentials.py: env, channel env, vault, repo .env)
   - the optional per-agent default-deny client gate (defense-in-depth; the gateway
     is the real membership boundary)
   - HTTP helpers (json / bytes) + a uniform degrade-reason mapping
@@ -83,89 +83,50 @@ def _core_src_on_path():
         cur = parent
 
 
-def _channel_env_file():
-    """Path to the ag2space channel `.env`, or None when it cannot be located.
-
-    room-ops IS the ag2space transport, so its credential lives beside the other
-    providers' — `channel_token.py` states the rule: each bridge reads its own
-    `channels/<name>/.env`. Returned rather than inlined so tests can shadow this
-    boundary the way they already shadow the vault.
-
-    The dir is REMOTE_TASK_CHANNEL_DIR, the same expression the gateway bridge
-    uses; hardcoding "ag2space" made every lane read PROD's credential.
-    """
+def _relay_credentials():
+    """The core relay resolver (src/relay_credentials.py), or None when unreachable."""
     try:
         if not _core_src_on_path():
             return None
-        from util_paths import claude_home_path
-        channel_dir = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
-        p = claude_home_path("channels", channel_dir, ".env")
-        return p if os.path.isfile(p) else None
+        import relay_credentials
+        return relay_credentials
     except Exception:
         return None
 
 
-def _from_channel_env(names, env_file=None):
-    """First non-empty value among `names` in the channel `.env`; '' if none.
+def _lane():
+    # REMOTE_TASK_CHANNEL_DIR is the gateway bridge's own lane key; a fixed
+    # "ag2space" would serve every lane PROD's credential.
+    return os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
 
-    Sits between the process env and the vault, so an exported value still wins
-    and a stored one still loses. Alias set matches the VAULT tier (which
-    includes the legacy AG2_REMOTE_TOKEN), not the narrower env chain.
+
+def _channel_env_file():
+    """This lane's channel env file, picked as scripts/channel-env.sh picks it; None if none.
+
+    room-ops IS the ag2space transport, so its credential lives beside the other
+    providers'. Kept as a seam so tests can shadow the file the way they shadow the vault.
     """
     try:
-        env_file = _channel_env_file() if env_file is None else env_file
-        if env_file is None:
-            return ""
-        if not _core_src_on_path():
-            return ""
-        from channel_token import token_from_env_file
-        from pathlib import Path
+        rc = _relay_credentials()
+        return None if rc is None else rc.channel_env_file(_lane())
     except Exception:
-        return ""
-    for var in names:
-        # token_from_env_file is already total on OSError; UnicodeDecodeError is
-        # not an OSError, so decode failures would otherwise read as "no token".
-        try:
-            got = token_from_env_file(var, Path(env_file))
-        except (OSError, UnicodeDecodeError):
-            return ""
-        if got:
-            return got
-    return ""
+        return None
 
 
 def _token_from_vault(vault_get=None):
-    """Vault fallback for the gateway bearer — parity with the channel bridges
-    (sonichi#2638) and the sparrow bridge.
+    """First gateway alias stored in the vault; '' on any failure. Never logged.
 
-    gateway() resolves the token from GATEWAY_TOKEN / RELAY_TOKEN /
-    REMOTE_TASK_TOKEN in the process env; when the launcher didn't export any of
-    them (the desktop-spawned core is the case that bites — its supervisor uses a
-    fixed env whitelist), `vault set REMOTE_TASK_TOKEN <url|secret>` should still
-    arm room ops. Nothing here read the vault, so it was a silent no-op — even
-    though this module's own docstring already promised "token from env/vault".
-    This closes that gap and makes the code match the doc.
-
-    Reuses the shared core policy `channel_token.token_from_vault` (never copies
-    it); total-failure-safe; the value is never logged. Tries the names gateway()
-    honors, then the legacy `AG2_REMOTE_TOKEN` alias. Prefer the **combined**
-    onboarding value (`https://<gateway>|<secret>`) so the URL travels with the
-    token: a vault-set BARE secret with no REMOTE_TASK_URL env resolves a bearer
-    but no base, which degrades to "no gateway configured" exactly as an env-only
-    bare secret does today (caller-consistent — the vault tier adds no new URL
-    obligation).
+    Covers the desktop-spawned core, whose supervisor passes a fixed env
+    whitelist: `vault set REMOTE_TASK_TOKEN <url|secret>` still arms room ops.
     """
     try:
-        if not _core_src_on_path():
+        rc = _relay_credentials()
+        if rc is None:
             return ""
         from channel_token import token_from_vault
+        return rc.vault_token(lambda var: token_from_vault(var, vault_get=vault_get))
     except Exception:
         return ""
-    for var in ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
-        tok = token_from_vault(var, vault_get=vault_get)
-        if tok:
-            return tok
-    return ""
 
 
 def _credential_contract():
@@ -187,34 +148,23 @@ def _credential_contract():
 def gateway():
     """Return (base_url, headers). base is '' when no gateway is configured.
 
-    PR2 of the credential-contract migration (#2668): parsing/precedence now
-    delegates to the vendored shared contract; this facade keeps only the
-    room-ops runtime pieces (the vault tier and header shape). Named
-    behavior change vs the legacy resolver (enabling-only, ratified in
-    #2668): combined onboarding tokens now also split on `%7C`/`%7c` and
-    with a case-insensitive scheme — tokens that previously failed auth on
-    room-ops (sent whole as the bearer) now work, matching sparrow.
-
-    Env chain is DELIBERATELY unchanged: GATEWAY_TOKEN > RELAY_TOKEN >
-    REMOTE_TASK_TOKEN (room-ops has never read AG2_REMOTE_TOKEN from env —
-    the vault tier still tries it), URL: GATEWAY_URL > RELAY_URL >
-    REMOTE_TASK_URL > url-from-token. Vault stays last so a stored value
-    never shadows a fresher env token.
+    Tier order and parsing belong to src/relay_credentials.py (env, channel env,
+    vault, repo .env). The env chain stays GATEWAY_TOKEN > RELAY_TOKEN >
+    REMOTE_TASK_TOKEN: room-ops has never read AG2_REMOTE_TOKEN from env.
     """
-    gc = _credential_contract()
-    raw, _name = gc.resolve_alias_precedence(
-        os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
-    if not raw:
-        raw = _from_channel_env(
-            ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"))
-    if not raw:
-        raw = _token_from_vault()
-    explicit_url, _ = gc.resolve_alias_precedence(
-        os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
-    if not explicit_url:
-        explicit_url = _from_channel_env(("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
-    creds = gc.normalize_credentials(raw, explicit_url=explicit_url,
-                                     source="resolved" if raw else "none")
+    rc = _relay_credentials()
+    if rc is not None:
+        creds = rc.resolve_relay_credentials(
+            _lane(), env_token_names=("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"),
+            channel=_channel_env_file(), vault=_token_from_vault)
+    else:
+        # No core src/ next to this skill: the env tier is all there is.
+        gc = _credential_contract()
+        raw, _ = gc.resolve_alias_precedence(
+            os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
+        url, _ = gc.resolve_alias_precedence(
+            os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
+        creds = gc.normalize_credentials(raw, explicit_url=url)
     headers = {"User-Agent": "sutando-room-ops/1"}
     if creds.token:
         headers["Authorization"] = f"Bearer {creds.token}"

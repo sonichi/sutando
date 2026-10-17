@@ -29,6 +29,15 @@ WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
 LOGS_DIR="$WORKSPACE/logs"
 mkdir -p "$LOGS_DIR"
 
+# The primary lane's token can live only in the repo .env, and the core session
+# that runs this script does not export it, so load it here as startup.sh does.
+if [ -f "$REPO/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$REPO/.env"
+  set +a
+fi
+
 # shellcheck source=../src/startup-runtime.sh
 source "$REPO/src/startup-runtime.sh"
 

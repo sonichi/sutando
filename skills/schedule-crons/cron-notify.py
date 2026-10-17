@@ -194,23 +194,12 @@ def _canonical_resolver():
     return _RESOLVE_TOKEN
 
 
-def _repo_root():
-    from pathlib import Path
-    return str(Path(__file__).resolve().parents[2])
-
-
 def _load_gateway(repo=None):
     """Return (base_url, secret) for the gateway, or (None, None) if unconfigured.
 
-    Delegates to the canonical resolver (ensure-cron-room.py:resolve_token) so
-    cron-notify honors the SAME cred contract as every other client: process env
-    AND <repo>/.env (process env wins), all alias keys
-    (GATEWAY_*/RELAY_*/REMOTE_TASK_*/AG2_REMOTE_*), and both a combined
-    "url|secret" token and a split URL+token. Repo-root anchored, so a cron
-    invoked from any cwd still resolves — the prior cwd-relative, `.env`-only,
-    `AG2_REMOTE_TOKEN`-only reader returned (None, None) for a supported
-    split-token install and from a non-repo cwd (#2346 review)."""
-    return _canonical_resolver()(repo if repo is not None else _repo_root())
+    Delegates to ensure-cron-room.py:resolve_token, which reads src/relay_credentials.py;
+    `repo` overrides which repo `.env` is the last tier."""
+    return _canonical_resolver()(repo)
 
 
 def _post_to_room(room_id, body, repo=None):

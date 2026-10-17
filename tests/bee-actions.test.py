@@ -17,6 +17,13 @@ from unittest.mock import patch
 
 _SCRIPT = (Path(__file__).resolve().parent.parent
            / "skills" / "bee-actions" / "scripts" / "bee_actions.py")
+sys.path.insert(0, str(Path(__file__).resolve().parent / "_helpers"))
+import relay_isolation  # noqa: E402
+from relay_isolation import assert_secret_equal, assert_secret_none  # noqa: E402
+
+
+def setUpModule():
+    unittest.addModuleCleanup(relay_isolation.isolate())
 
 
 def _load():
@@ -143,7 +150,7 @@ class TestBeeActions(unittest.TestCase):
                                      "BEE_API_BASE": self.base,
                                      "BEE_API_TOKEN": "tok-cloud"}):
             self.assertEqual(self.mod.main(), 0)
-        self.assertEqual(_Server.calls[-1]["auth"], "Bearer tok-cloud")
+        assert_secret_equal(self, _Server.calls[-1]["auth"], "Bearer tok-cloud", "bearer")
 
     def test_vault_fallback_for_bearer(self):
         import types
@@ -155,7 +162,7 @@ class TestBeeActions(unittest.TestCase):
                                      "BEE_API_BASE": self.base,
                                      "BEE_API_TOKEN": ""}):
             self.assertEqual(self.mod.main(), 0)
-        self.assertEqual(_Server.calls[-1]["auth"], "Bearer tok-vault")
+        assert_secret_equal(self, _Server.calls[-1]["auth"], "Bearer tok-vault", "bearer")
 
     def test_complete_todo_how_appends_done_note(self):
         # --how: complete first, then read the text, then rewrite it with the
@@ -189,7 +196,7 @@ class TestBeeActions(unittest.TestCase):
         self.assertEqual(rc, 0)
         c = _Server.calls[-1]
         self.assertEqual((c["method"], c["path"]), ("POST", "/v1/room"))
-        self.assertEqual(c["auth"], "Bearer tok-gw")
+        assert_secret_equal(self, c["auth"], "Bearer tok-gw", "bearer")
         self.assertEqual(c["body"], {"op": "message", "room_id": "!bee:ag2.space",
                                      "body": "hello from sutando"})
 
@@ -248,7 +255,7 @@ class TestBeeActions(unittest.TestCase):
                                      "BEE_API_BASE": "https://cloud.example",
                                      "BEE_API_TOKEN": ""}):
             self.assertEqual(self.mod.main(), 0)
-        self.assertIsNone(_Server.calls[-1]["auth"])   # proxy path, no bearer
+        assert_secret_none(self, _Server.calls[-1]["auth"], "bearer")   # proxy path, no bearer
 
     def test_room_verbs_without_gateway_creds_exit_2(self):
         rc, _ = self._run_room("post-room", "msg",
