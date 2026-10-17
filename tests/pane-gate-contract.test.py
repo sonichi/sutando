@@ -1403,7 +1403,7 @@ class AUsageLimitBannerTheSeatHasOutrun(unittest.TestCase):
     gate kind, and a turn that finishes after it was first seen makes it stale."""
 
     PANE = ("✻ Churned for 27s · done 1:55 PM\n"
-            "──────── sutando-worker ─\n❯ \n────────\n"
+            "──────── seat-1 ─\n❯ \n────────\n"
             "  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
             "    Continuing automatically at Oct 13 at 11pm · esc to cancel\n"
             "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents\n")
@@ -1415,7 +1415,7 @@ class AUsageLimitBannerTheSeatHasOutrun(unittest.TestCase):
 
     def test_a_banner_only_pane_reads_as_main_did(self):
         # Not a cli_wedge banner: an idle pane under it is not held for the notifier.
-        pane = ("──────── sutando-worker ─\n❯ \n────────\n"
+        pane = ("──────── seat-1 ─\n❯ \n────────\n"
                 "  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
                 "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents\n")
         v = pg.classify_pane(pane, pg.CLAUDE, "/nonexistent-ws")
