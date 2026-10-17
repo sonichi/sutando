@@ -319,6 +319,8 @@ agent-room-ops/
   media.py         fetch_media() / send_media()
   react.py         react() / unreact()
   room_ops.py      unified CLI dispatcher
+  post_command.py  prints the curl command a remote agent (no skill installed) runs to post a reply;
+                   ids validated, token named by env var, never read
   test_room_ops.py 39 tests, no network
 ```
 

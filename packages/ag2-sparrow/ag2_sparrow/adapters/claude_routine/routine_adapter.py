@@ -19,17 +19,15 @@ import sys
 import time
 import urllib.error
 import urllib.request
-import uuid
 
-from ..codex.codex_connector import (acquire_lock, load_done, non_owner_note, parse_task,
-                                     record_done, write_atomic)
+from ..codex.codex_connector import (NON_OWNER_REFUSED, list_pending, load_done, non_owner_note, parse_task,
+                                     prepare_work, record_done, release_lock, span_tag, wrap_span, write_atomic)
 
 API_BASE = "https://api.anthropic.com"
 API_VERSION = "2023-06-01"
 TEXT_MAX = 65536
 ROUTINE_CAP_PER_HOUR = 30
 TRIGGER_RE = re.compile(r"trig_[A-Za-z0-9]+")
-TRUNCATED = "\n[truncated]"
 HOUR = 3600.0
 
 
@@ -54,13 +52,8 @@ def build_payload(task_id, headers, message, operator_lines=(), note=None):
         room, thread, tier, "true" if collaborator else "false", _field(task_id))
     if tier != "owner":
         head += "note: %s\n" % (note if note is not None else non_owner_note())
-    tag = "UNTRUSTED_TASK_" + uuid.uuid4().hex[:8]
-    opening, closing = "<%s>\n" % tag, "\n</%s>" % tag
-    tail = closing + ("\n" + "\n".join(operator_lines) if operator_lines else "")
-    room_left = TEXT_MAX - len(head) - len(opening) - len(tail)
-    if len(message) > room_left:
-        message = message[:max(room_left - len(TRUNCATED), 0)] + TRUNCATED
-    return room, head + opening + message + tail
+    after = "\n" + "\n".join(operator_lines) if operator_lines else ""
+    return room, wrap_span(span_tag(), message, head, after, TEXT_MAX)
 
 
 def retry_after_seconds(value, now=None, default=60.0):
@@ -175,9 +168,6 @@ def result_body(outcome, mode, owner=True):
 
 
 NO_ROOM = "This message has no room to reply in, so it was not sent to the cloud agent.\n"
-# The routine acts with the owner's AG2 Space connector, so non-owner tiers are refused
-# unless --allow-non-owner is set; the sender sees only this plain line.
-NON_OWNER_REFUSED = "This agent only answers its owner here.\n"
 
 
 class Adapter:
@@ -200,19 +190,7 @@ class Adapter:
             self.blocked_until = 0.0
 
     def pending(self, seen):
-        names = [n for n in os.listdir(self.args.inbox)
-                 if n.startswith("task-") and n.endswith(".txt") and n[:-4] not in seen
-                 and not os.path.exists(os.path.join(self.args.results, n))]
-        # A file can vanish between listdir and stat (a cancel, a cleanup): drop it rather
-        # than crash the whole loop over one task that is no longer there to serve.
-        stamped = []
-        for n in names:
-            try:
-                stamped.append((os.stat(os.path.join(self.args.inbox, n)).st_mtime, n))
-            except FileNotFoundError:
-                continue
-        stamped.sort()
-        return [n for _, n in stamped]
+        return list_pending(self.args.inbox, self.args.results, seen)
 
     def finish(self, name, body, seen):
         write_atomic(os.path.join(self.args.results, name), body)
@@ -341,23 +319,14 @@ def main(argv=None, environ=None, opener=urllib.request.urlopen):
     if not token:
         sys.stderr.write("refusing to start: env var %s is empty or unset\n" % args.token_env)
         return 2
-    args.work = os.path.abspath(args.work)
-    args.inbox = os.path.join(args.work, "tasks")
-    args.results = os.path.join(args.work, "results")
-    args.state = os.path.join(args.work, "state")
-    for d in (args.inbox, args.results, args.state):
-        os.makedirs(d, exist_ok=True)
-    lock = acquire_lock(args.state)
+    lock = prepare_work(args)
     if lock is None:
         sys.stderr.write("another adapter holds %s (state/connector.pid is alive)\n" % args.work)
         return 3
     try:
         Adapter(args, token, opener).serve()
     finally:
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
+        release_lock(lock)
     return 0
 
 

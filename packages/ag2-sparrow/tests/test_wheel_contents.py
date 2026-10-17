@@ -22,7 +22,8 @@ SRC = PKG_ROOT / "ag2_sparrow"
 DATA_FILES = ("ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh",
               "ag2_sparrow/adapters/hatch/hook-definition.json",
               "ag2_sparrow/adapters/claude_routine/routine-prompt.md",
-              "ag2_sparrow/adapters/claude_routine/README.md")
+              "ag2_sparrow/adapters/claude_routine/README.md",
+              "ag2_sparrow/adapters/codex_cloud/README.md")
 
 
 def _expected_packages():

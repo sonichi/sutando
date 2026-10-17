@@ -48,6 +48,7 @@ include = ["ag2_sparrow*"]
 [tool.setuptools.package-data]
 "ag2_sparrow.adapters.hatch" = ["*.sh", "*.json"]
 "ag2_sparrow.adapters.claude_routine" = ["*.md"]
+"ag2_sparrow.adapters.codex_cloud" = ["*.md"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ag2_sparrow.__version__" }

@@ -534,11 +534,46 @@ class EdgePathTest(unittest.TestCase):
             Path(state, "connector.pid").write_text("garbage")
             self.assertIsNotNone(cc.acquire_lock(state))
             Path(state, "connector.pid").write_text("garbage")
-            with mock.patch.object(cc.os, "unlink", side_effect=FileNotFoundError):
-                self.assertIsNone(cc.acquire_lock(state), "two failed creates in a row: give up")
+            real_stat = os.stat
+            with mock.patch.object(cc.os, "stat", side_effect=lambda p, *a, **k: os.stat_result(
+                    (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)) if str(p).endswith("connector.pid") else real_stat(p, *a, **k)):
+                self.assertIsNone(cc.acquire_lock(state), "the path keeps being replaced: give up")
+            cc.release_lock(os.path.join(state, "connector.pid"))
         self.assertTrue(cc.pid_alive(os.getpid()))
         with mock.patch.object(cc.os, "kill", side_effect=PermissionError):
             self.assertTrue(cc.pid_alive(1))
+
+    LOCK_PROBE = ("import sys; sys.path.insert(0, %r); "
+                  "from ag2_sparrow.adapters.codex import codex_connector as cc; "
+                  "print(cc.acquire_lock(sys.argv[1]) is not None, flush=True); sys.stdin.read()")
+
+    def probe(self, state):
+        return subprocess.Popen([sys.executable, "-c", self.LOCK_PROBE % str(PKG_ROOT), state],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+    def test_a_holder_that_has_not_written_its_pid_yet_still_excludes_others(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = cc.acquire_lock(d)
+            try:
+                # The window between creating the file and writing the pid.
+                Path(path).write_text("")
+                other = self.probe(d)
+                out, _ = other.communicate("", timeout=30)
+                self.assertEqual(out.strip(), "False", "a second process took the lock")
+                self.assertTrue(os.path.exists(path))
+            finally:
+                cc.release_lock(path)
+
+    def test_concurrent_acquirers_get_exactly_one_owner(self):
+        with tempfile.TemporaryDirectory() as d:
+            procs = [self.probe(d) for _ in range(8)]
+            answers = [p.stdout.readline().strip() for p in procs]
+            for p in procs:
+                p.communicate("", timeout=30)
+            self.assertEqual(sorted(answers), ["False"] * 7 + ["True"])
+            self.assertIsNotNone(cc.acquire_lock(d), "the lock frees when its owner exits")
+            cc.release_lock(os.path.join(d, "connector.pid"))
+            self.assertFalse(os.path.exists(os.path.join(d, "connector.pid")))
 
     def test_rpc_close_kills_a_child_that_ignores_eof(self):
         with tempfile.TemporaryDirectory() as d:
