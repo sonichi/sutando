@@ -178,7 +178,8 @@ case "$1" in
     has_result() { [ -s "$RESULTS_DIR/$1" ]; }
     tmux() { return 0; }
     clear_workstream_context() { :; }
-    deliver_prompt() { printf 'done\n' > "$RESULTS_DIR/$1"; }
+    clear_delivery_claim() { :; }
+    deliver_task() { printf 'done\n' > "$RESULTS_DIR/$1"; }
     log_notifier() { :; }
     # This is a BARE managed-loop call, not inside `if`, `||` or `$()`.
     submit_task task-x.txt 1

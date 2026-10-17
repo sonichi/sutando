@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
-  Observer, TAIL_BYTES, apply, buildRecord, descendants, fileDeps, isEntrypoint, lineChange, lsofRollouts, newState, parseArgs,
+  Observer, TAIL_BYTES, apply, buildRecord, coreThread, descendants, fileDeps, isEntrypoint, lineChange, lsofRollouts, newState, parseArgs,
   pickRollout, rolloutPaths, runLoop,
 } from '../src/agent/codex/cli/codex-observer.mjs';
 
@@ -82,6 +82,30 @@ test('only the one top-level rollout is the core', () => {
   assert.equal(pickRollout([{path: 'a'}, {path: 'b'}]), null);
   assert.equal(pickRollout([{path: 'b', parent_thread_id: 'x'}]), null);
   assert.equal(pickRollout([]), null);
+});
+
+test('the core thread for codex queue: its id once a turn is persisted, else a reason code', async () => {
+  const deps = (metas, turn = true, pid = 42) => ({panePid: async () => pid, openRollouts: async () => Object.keys(metas),
+    readMeta: async (p) => metas[p], hasTurn: () => turn});
+  const uuid = '01a143a9-b73a-7b41-9ad1-fbd10bfb3c74';
+  assert.deepEqual(await coreThread(deps({'/r/a': {id: 'main-id'}, '/r/b': {parent_thread_id: 'main-id'}})), {code: 0, id: 'main-id'});
+  assert.deepEqual(await coreThread(deps({[`/r/rollout-2026-10-16T00-00-00-${uuid}.jsonl`]: {}})), {code: 0, id: uuid});
+  assert.equal((await coreThread(deps({'/r/a': {id: 'x'}}, false))).code, 4);
+  assert.equal((await coreThread(deps({'/r/a': {id: 'x'}, '/r/b': {id: 'y'}}))).code, 3);
+  assert.equal((await coreThread(deps({'/r/a': null}))).code, 3);
+  assert.equal((await coreThread(deps({}, true, 0))).code, 3);
+});
+
+test('hasTurn finds a persisted turn across a chunk boundary and nothing in a meta-only rollout', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'core-thread-'));
+  const f = path.join(dir, 'rollout.jsonl');
+  const turn = JSON.stringify({type: 'event_msg', payload: {type: 'task_started'}});
+  fs.writeFileSync(f, 'x'.repeat(1024 * 1024 - 10) + '\n' + turn + '\n');
+  const deps = fileDeps({engine: REPO, tmuxSocket: '/s', session: 's'});
+  assert.equal(deps.hasTurn(f), true);
+  fs.writeFileSync(f, JSON.stringify({type: 'session_meta', payload: {id: 'm'}}) + '\n');
+  assert.equal(deps.hasTurn(f), false);
+  fs.rmSync(dir, {recursive: true});
 });
 
 test('process tree and lsof parsing', () => {

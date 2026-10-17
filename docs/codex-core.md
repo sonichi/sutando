@@ -79,6 +79,109 @@ The Codex implementation:
   observation record (`docs/health-snapshot.md`, "Runtime observation");
 - restarts the core and notifier together, preventing duplicate task consumers.
 
+## Task delivery: send-keys or queue
+
+By default the notifier types each task into the core's pane with `tmux send-keys`.
+With Codex 0.157 or later you can opt in to `codex queue`, which hands the task to
+the TUI's shared app-server daemon; the TUI runs it at its next idle point, so no
+keystroke can be lost or merged with a draft:
+
+```json
+{
+  "core": { "runtime": "codex", "codex": { "delivery": "queue" } }
+}
+```
+
+Restart the core (`bash src/agent/start-cli.sh --restart`, from outside the core)
+for a change to take effect. Queue mode applies to the core's notifier only; a pool
+worker's notifier always uses send-keys.
+
+Only one core notifier runs per workspace. The notifier re-executes itself under
+`src/delivery/notifier_lock.py`, which holds an exclusive `flock` on the workspace's
+`state/codex-notifier.lock` on fd 9. The notifier and every child it starts inherit that fd, so
+the lock is held until the last of them exits, `kill -9` included, and the kernel then drops it;
+no lock is ever left behind. `codex_queue.py` passes fd 9 on to the `codex queue` it starts. A
+child that outlives a killed notifier (a `tmux` call, a Python helper, a `codex queue` send) could
+still deliver, so the next notifier waits for it on purpose:
+the lock is the fence, with no pid records and nothing killed. Those children are short-lived and
+bounded by their own timeouts. A wait is logged, and `health-check.py` reports one that lasts.
+At startup the notifier confirms that the inherited fd really holds this workspace's lock before
+acting as its owner; a stale or copied `SUTANDO_NOTIFIER_LOCK_FD` makes it wait for the lock instead.
+Never delete or replace `state/codex-notifier.lock`: a holder keeps the old file, so a new file at the
+same path would admit a second notifier. Nothing in the repo removes it, and a waiter that finds the
+path replaced while it waited reopens the new file rather than trusting the old one.
+
+The trade-off is deliberate: a child that hangs while holding fd 9 stalls delivery until it exits,
+because a hung child cannot be told from a slow one that is about to type. The waiting notifier
+logs every 30 s, health-check warns at 180 s, and a managed notifier exits 75 at 600 s and is retried
+by its supervisor while the warning stays up. This rests on two invariants: the watcher is started
+with `9>&-`, and no long-lived background job the notifier starts may inherit fd 9.
+The lock is kept out of the long-lived watcher the notifier starts. That watcher leads its
+own session, so it outlives a `kill -9` of its notifier and would keep the inbox to itself.
+The notifier records the watcher's pid, start time and inbox in
+`state/codex-notifier.watcher`, and the next notifier, holding the lock, stops that exact
+watcher before starting its own. Pool workers have their own inboxes and are unchanged.
+
+A second notifier (for example, start-cli replacing a stale one) waits for the first to
+exit. While it waits, it logs to stderr and `logs/task-notifier.log`, and records itself
+in `state/codex-notifier.lock.waiting`; `health-check.py`'s `codex-task-notifier` check
+warns once a live notifier has waited 180 s or more, so a stuck holder cannot stall
+delivery unseen. A managed notifier gives up after 600 s
+(`SUTANDO_NOTIFIER_LOCK_TIMEOUT`) and its supervisor starts it again. A one-shot
+`task-notifier.sh --event <task>` waits only 5 s, so while the managed notifier runs it
+always gives up and drops its event; nothing in production calls it.
+
+In both modes the core's notifier delivers each task at most once through one gate: it
+takes an atomic per-task claim (`state/codex-delivery-claims/<task-id>`, created on
+demand) and then re-checks for a ready result, live or archived, before either
+transport. A task that already has a result is skipped; one already claimed by another
+notifier, a crash, or an earlier run in the other mode is not delivered again; and a
+claim that cannot be taken defers the task to the next cycle, never typing it. The
+claim is released only when nothing was delivered, and removed once the task has a
+result. Each claim records the core it was handed to (the pane's pid and start time,
+stamped just before the hand-off). Because one notifier owns every claim, a claim only
+has to survive restarts in sequence: after a core restart, a task that was only typed
+into the old core is retyped, as before; one that may have been queued is never retyped
+(the daemon may still hold it) but is abandoned at once, with the owner alert below. On start the notifier prunes the
+claim of every task that has a ready result, live or archived, whether or not its task
+file is still in `tasks/`, and of an abandoned task whose owner alert was written once
+its task file has left `tasks/`.
+
+In queue mode the notifier also:
+
+- resolves the core's thread for every task (so `/new` or `/resume` in the TUI is
+  followed), from the rollout file the core pane's process tree holds open
+  (`codex-observer.mjs --core-thread`). `core.codex.thread` is used only when that
+  lookup cannot find the core's thread at all (never when it found a thread with no
+  turn yet): if Codex's shared daemon, not the pane's process tree, holds the file,
+  the lookup finds nothing (unverified on 0.157+), and without `core.codex.thread`
+  every task falls back to send-keys;
+- delivers the **first task after every core restart by send-keys**: a fresh thread
+  has no rollout file until its first turn, so the lookup finds none open and reports
+  no thread (`rc 3`, "0 open"). Queue mode takes over from the second task. This was
+  seen on a live scratch Codex core;
+- marks the claim "queue" before calling `codex queue`, and sends exactly the prompt
+  the send-keys path would type, as one argument;
+- does not wait for the pane to go idle and never clears or types into it while
+  queueing; pane state is logged as health only;
+- falls back to send-keys, with a line in `logs/task-notifier.log`, only when the task
+  certainly was not handed off: no thread found, the thread has no persisted turn yet,
+  `codex` could not start, or it exited non-zero without acknowledging the queue. That
+  fallback types through the usual composer check but skips the wait for an idle core;
+- treats a `codex queue` that times out, or acknowledges and then exits non-zero, as
+  an unknown outcome: it logs it and waits for the result, and never types the task.
+
+When a claimed task has no result after `SUTANDO_NOTIFIER_COMPLETION_TIMEOUT` (3600 s):
+
+- if it may have been queued (its claim is marked "queue"), the claim is marked
+  abandoned, so the task is never typed or queued again; `results/` is left untouched;
+  the owner is told out of band, retried every cycle until it is on disk, by a proactive message (`results/proactive-<ts>-<id>.txt`:
+  "task <id> was handed to Codex but no reply came back in <N> min; not retried, to
+  avoid running it twice"); and the queue moves on;
+- if it was only typed, the claim is released and the task is retried as before.
+
+An active `/goal` keeps the TUI from draining its queue (openai/codex#52705).
+
 ## AG2 Space MCP without the desktop app
 
 The AG2 Space desktop app writes an `ag2-space` entry into `$CODEX_HOME/config.toml`.

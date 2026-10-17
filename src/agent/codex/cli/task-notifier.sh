@@ -22,9 +22,26 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
+# Per-task delivery claims, one per task across transports; they outlive a notifier or core restart.
+DELIVERY_CLAIM_DIR="$WORKSPACE_DIR/state/codex-delivery-claims"
+# The running notifier's watcher: pid, start time, inbox. Written and read only under the lock.
+WATCHER_RECORD="$WORKSPACE_DIR/state/codex-notifier.watcher"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve pane state")" || exit 1
+# One core notifier per workspace: re-exec under a kernel lock held by this process and its children,
+# so claims only ever have one live owner. A busy lock makes a one-shot --event give up quickly.
+LOCK_OWNER=""
+if [ -z "$WORKER_INSTANCE" ] && [ "${SUTANDO_NOTIFIER_LOCK_FD:-}" = 9 ] && { : >&9; } 2>/dev/null \
+  && "$NOTIFIER_PY" "$REPO/src/delivery/notifier_lock.py" --lock "$WORKSPACE_DIR/state/codex-notifier.lock" --check-held 9; then
+  LOCK_OWNER=1
+fi
+if [ -z "$WORKER_INSTANCE" ] && [ -z "$LOCK_OWNER" ]; then
+  _lock_timeout="${SUTANDO_NOTIFIER_LOCK_TIMEOUT:-600}"
+  [ "${1:-}" = "--event" ] && _lock_timeout=5
+  exec "$NOTIFIER_PY" "$REPO/src/delivery/notifier_lock.py" --lock "$WORKSPACE_DIR/state/codex-notifier.lock" \
+    --timeout "$_lock_timeout" --log-file "$WORKSPACE_DIR/logs/task-notifier.log" -- /bin/bash "${BASH_SOURCE[0]}" "$@"
+fi
 # shellcheck source=../../../delivery/worker-stage.sh
 source "$REPO/src/delivery/worker-stage.sh"
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
@@ -43,6 +60,10 @@ COMPOSER_POLL="${SUTANDO_NOTIFIER_COMPOSER_POLL:-$POLL_INTERVAL}"
 WORKSTREAM_CONTEXT_SCRIPT="$REPO/skills/task-workstream-grouping/scripts/workstreams.py"
 PANE_GATE_PY="$REPO/src/delivery/pane_gate.py"
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
+CODEX_QUEUE_PY="$REPO/src/delivery/codex_queue.py"
+# Read once per run; core only, since a configured core.codex.thread names the core's thread.
+DELIVERY_MODE="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" mode 2>/dev/null)" || DELIVERY_MODE=send-keys
+[ -z "$WORKER_INSTANCE" ] || DELIVERY_MODE=send-keys
 watcher_pid=""
 event_dir=""
 workstream_context_file=""
@@ -60,7 +81,11 @@ stop_watcher() {
 }
 
 cleanup_notifier() {
+  local mine="$watcher_pid"
   stop_watcher
+  if [ -n "$LOCK_OWNER" ] && [ -n "$mine" ] && [ "$(sed -n 1p "$WATCHER_RECORD" 2>/dev/null)" = "$mine" ]; then
+    rm -f "$WATCHER_RECORD"
+  fi
   clear_workstream_context
   if [ -n "$event_dir" ]; then
     rm -f "$event_dir/events"
@@ -176,6 +201,8 @@ clear_automation_leftover() {
 
 wait_for_core_idle() {
   local started cleared=0
+  # Queue mode never types into the pane, so a busy core or a draft does not hold the task back.
+  [ "${DELIVERY_MODE:-}" = queue ] && return 0
   started="$(date +%s)"
   while ! core_is_idle; do
     if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
@@ -313,6 +340,220 @@ deliver_prompt() {
   done
 }
 
+# One atomic claim per task (mkdir): the only ownership point for every transport. It is kept
+# until the task has a result; a failed claim never authorizes typing, the task is deferred.
+claim_delivery() {  # 0 claimed; 1 already claimed; 2 could not claim (defer)
+  if mkdir -p "$DELIVERY_CLAIM_DIR" 2>/dev/null && mkdir "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null; then
+    stamp_claim "$1"
+    return 0
+  fi
+  [ -d "$DELIVERY_CLAIM_DIR/${1%.txt}" ] && return 1
+  return 2
+}
+
+# The live core process as "<pane pid> <start time>": a restarted core is a different one.
+core_identity() {
+  local target pid start
+  target="$(core_target)" || return 1
+  pid="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$target" '#{pane_pid}' 2>/dev/null)" || return 1
+  [ -n "$pid" ] || return 1
+  start="$(process_start "$pid")" || return 1
+  printf '%s %s' "$pid" "$start"
+}
+
+# C locale and UTC: lstart is rendered per TZ and locale, and two notifiers may differ in both.
+process_start() {
+  local start
+  start="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null)" || return 1
+  [ -n "$start" ] || return 1
+  printf '%s' "$start" | tr -s ' '
+}
+
+# True only when the claim names a core and a different core is running now; unknown is not gone.
+claim_core_gone() {
+  local recorded current
+  recorded="$(cat "$DELIVERY_CLAIM_DIR/${1%.txt}/core" 2>/dev/null)" || return 1
+  current="$(core_identity)" || return 1
+  [ -n "$recorded" ] && [ -n "$current" ] && [ "$recorded" != "$current" ]
+}
+
+# The core a claim was taken for, re-stamped just before each hand-off.
+stamp_claim() {
+  core_identity > "$DELIVERY_CLAIM_DIR/${1%.txt}/core" 2>/dev/null || true
+}
+
+# The watcher a notifier killed by -9 left running (it leads its own session) holds the inbox, so
+# the next watcher refuses to start. Holding the lock, that notifier is gone: stop its watcher.
+reap_orphaned_watcher() {
+  local pid start inbox waited=0
+  [ -f "$WATCHER_RECORD" ] || return 0
+  pid="$(sed -n 1p "$WATCHER_RECORD" 2>/dev/null)" || pid=""
+  start="$(sed -n 2p "$WATCHER_RECORD" 2>/dev/null)" || start=""
+  inbox="$(sed -n 3p "$WATCHER_RECORD" 2>/dev/null)" || inbox=""
+  rm -f "$WATCHER_RECORD"
+  [ -n "$pid" ] && [ -n "$start" ] && [ "$inbox" = "$TASKS_DIR" ] || return 0
+  [ "$(process_start "$pid" || true)" = "$start" ] || return 0
+  case "$(ps -o command= -p "$pid" 2>/dev/null || true)" in *watch-tasks-stream.sh*) ;; *) return 0 ;; esac
+  log_notifier "stopping watcher pid $pid, left running by a notifier that died"
+  kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 50 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+}
+
+# A typed-only claim from a restarted core is replaced by a fresh one. The lock above makes this
+# notifier the claims' only live owner, so no other notifier can be deciding at the same time.
+replace_stale_claim() {  # 0 the claim is now ours; 1 left alone
+  local claim="$DELIVERY_CLAIM_DIR/${1%.txt}"
+  [ -d "$claim" ] && [ ! -e "$claim/queue" ] && ! claim_abandoned "$1" && claim_core_gone "$1" || return 1
+  rm -rf "$claim" 2>/dev/null || true
+  mkdir "$claim" 2>/dev/null || return 1
+  stamp_claim "$1"
+}
+
+release_delivery() {
+  rm -rf "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null || true
+}
+
+clear_delivery_claim() {
+  [ -e "$DELIVERY_CLAIM_DIR/${1%.txt}/abandoned" ] && return 0
+  rm -rf "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null || true
+}
+
+claim_abandoned() {
+  [ -e "$DELIVERY_CLAIM_DIR/${1%.txt}/abandoned" ]
+}
+
+# Drop claims whose task is finished: a ready result (live or archived), or, for an abandoned
+# claim, an owner alert written and no task file left in tasks/.
+prune_delivery_claims() {
+  local claim id
+  [ -d "$DELIVERY_CLAIM_DIR" ] || return 0
+  for claim in "$DELIVERY_CLAIM_DIR"/*/; do
+    [ -d "$claim" ] || continue
+    id="$(basename "$claim")"
+    if ! has_result "$id.txt"; then
+      [ ! -e "$TASKS_DIR/$id.txt" ] && [ -e "$claim/abandoned" ] && [ -e "$claim/alerted" ] || continue
+    fi
+    rm -rf "$claim" 2>/dev/null || true
+  done
+}
+
+# Never retried again; results/ untouched. "abandoned" (holding the reason) is written first, so
+# the task stays fail-closed; "alerted" only once the owner alert is on disk. $2 says why.
+abandon_claimed_task() {
+  local filename="$1" id="${1%.txt}" claim why tmp
+  claim="$DELIVERY_CLAIM_DIR/$id"
+  [ -e "$claim/alerted" ] && return 0
+  if [ ! -e "$claim/abandoned" ]; then
+    printf '%s' "$2" > "$claim/abandoned" 2>/dev/null \
+      || log_notifier "could not mark $filename abandoned; its claim still keeps it from being retried"
+  fi
+  why="$(cat "$claim/abandoned" 2>/dev/null)" || why=""
+  [ -n "$why" ] || why="${2:-no reply came back}"
+  if tmp="$(mktemp "$RESULTS_DIR/.proactive-$id.XXXXXX" 2>/dev/null)" \
+    && printf '%s\n' "task $id was handed to Codex but $why; not retried, to avoid running it twice" > "$tmp" \
+    && mv -f "$tmp" "$RESULTS_DIR/proactive-$(date +%s)-$id.txt"; then
+    : > "$claim/alerted" 2>/dev/null || log_notifier "alerted the owner about $filename but could not record it"
+    log_notifier "abandoned $filename ($why); alerted the owner, not retrying"
+  else
+    rm -f "${tmp:-}" 2>/dev/null || true
+    log_notifier "abandoned $filename ($why); could NOT write the owner alert, will retry next cycle"
+  fi
+}
+
+# Every cycle: write the owner alert for any abandoned claim whose alert did not get out.
+retry_owner_alerts() {
+  local claim
+  [ -d "$DELIVERY_CLAIM_DIR" ] || return 0
+  for claim in "$DELIVERY_CLAIM_DIR"/*/; do
+    [ -e "${claim}abandoned" ] && [ ! -e "${claim}alerted" ] || continue
+    abandon_claimed_task "$(basename "$claim").txt" ""
+  done
+}
+
+# No result by COMPLETION_TIMEOUT. A typed-only claim is released, so the task is retried as before;
+# one that may have been queued is abandoned.
+time_out_claimed_task() {
+  if [ ! -e "$DELIVERY_CLAIM_DIR/${1%.txt}/queue" ]; then
+    release_delivery "$1"
+    return 0
+  fi
+  abandon_claimed_task "$1" "no reply came back in $(( (COMPLETION_TIMEOUT + 59) / 60 )) min"
+}
+
+# Hand the prompt to `codex queue`; non-zero means it certainly was not handed off.
+# The thread is resolved per task: /new or /resume in the TUI changes it.
+queue_prompt() {
+  local filename="$1" prompt="$2" out thread rc=0 thread_err
+  # Stderr captured separately: 2>&1 would let a config warning corrupt $thread.
+  thread_err="$(mktemp "${TMPDIR:-/tmp}/sutando-codex-thread-err.XXXXXX")" || { log_notifier "queue mode: could not create temp file for $filename; falling back to send-keys"; return 1; }
+  thread="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" thread --engine "$REPO" --socket "$TMUX_SOCKET" --session "$SESSION" 2>"$thread_err")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log_notifier "queue mode: no usable core thread for $filename (rc $rc: $(cat "$thread_err" 2>/dev/null)); falling back to send-keys"
+    rm -f "$thread_err"
+    return 1
+  fi
+  rm -f "$thread_err"
+  out="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" send --thread "$thread" --message "$prompt" 2>&1)" || rc=$?
+  # Only codex_queue.py's QUEUE_FAILED (5) proves nothing reached `codex queue`; any other
+  # non-zero (unknown, a signal, a crash) counts as handed off and is never typed.
+  if [ "$rc" -eq 5 ]; then
+    log_notifier "queue mode: codex queue failed for $filename on thread $thread (rc $rc: $out); falling back to send-keys"
+    return 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    log_notifier "queue mode: outcome UNKNOWN for $filename on thread $thread (rc $rc: $out); not typing it, waiting on its result"
+    return 0
+  fi
+  log_notifier "queued $filename into thread $thread (pane: $(pane_state || echo unreadable))"
+}
+
+# Deliver once: 0 delivered, already claimed, or already answered (wait on the result); 1 nothing
+# delivered (defer). The claim, then a fresh result check, come before either transport.
+deliver_task() {
+  local filename="$1" prompt="$2" rc=0 claim="$DELIVERY_CLAIM_DIR/${1%.txt}"
+  if [ -n "${WORKER_INSTANCE:-}" ]; then
+    deliver_prompt "$filename" "$prompt"
+    return
+  fi
+  claim_delivery "$filename" || rc=$?
+  # A claim from a core that has since restarted: a typed task died with it and is retyped, as on
+  # main; one that may have been queued is never retyped (the daemon may hold it) but abandoned now.
+  if [ "$rc" -eq 1 ] && ! claim_abandoned "$filename" && claim_core_gone "$filename"; then
+    if [ -e "$claim/queue" ]; then
+      abandon_claimed_task "$filename" "the core restarted before it replied"
+      return 0
+    fi
+    if replace_stale_claim "$filename"; then
+      log_notifier "$filename was typed into a core that has since restarted; typing it again"
+      rc=0
+    fi
+  fi
+  case "$rc" in
+    1) log_notifier "$filename is already claimed; not delivering it again, waiting on its result"; return 0 ;;
+    2) log_notifier "deferring $filename: could not take its delivery claim in $DELIVERY_CLAIM_DIR"; return 1 ;;
+  esac
+  if has_result "$filename"; then
+    release_delivery "$filename"
+    return 0
+  fi
+  stamp_claim "$filename"
+  if [ "${DELIVERY_MODE:-}" = queue ]; then
+    # The marker goes down first, so a crash mid-queue still reads as "possibly queued".
+    if : > "$claim/queue" 2>/dev/null; then
+      queue_prompt "$filename" "$prompt" && return 0
+      rm -f "$claim/queue"
+    else
+      log_notifier "queue mode: could not mark $filename as queueing; typing it instead"
+    fi
+  fi
+  deliver_prompt "$filename" "$prompt" && return 0
+  release_delivery "$filename"
+  return 1
+}
+
 # What the prompt tells the session to read: the payload a resolver-backed
 # announcement named, else the inbox entry itself (the core's tasks/ case).
 task_payload() {
@@ -335,6 +576,7 @@ submit_task() {
   # replay any task whose bridge result already exists.
   if has_result "$filename"; then
     mark_worker_stage "$filename" done
+    clear_delivery_claim "$filename"
     return 0
   fi
   prompt="Sutando task ready: $filename. Read $(task_payload "$filename"), follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
@@ -367,7 +609,7 @@ submit_task() {
     log_notifier "refusing --event $filename: could not record worker ownership"
     return 1
   fi
-  if ! deliver_prompt "$filename" "$prompt"; then
+  if ! deliver_task "$filename" "$prompt"; then
     clear_workstream_context
     if [ "$wait_for_result" = "1" ]; then
       log_notifier "deferring $filename: composer was not idle-ready, will retry on the next idle cycle"
@@ -385,6 +627,10 @@ submit_task() {
   if [ "$wait_for_result" = "1" ]; then
     started="$(date +%s)"
     while ! has_result "$filename"; do
+      if [ -n "${DELIVERY_CLAIM_DIR:-}" ] && claim_abandoned "$filename"; then
+        clear_workstream_context
+        return 0
+      fi
       session_exists=0
       tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null && session_exists=1
       if [ "$session_exists" != "1" ]; then
@@ -393,12 +639,16 @@ submit_task() {
       fi
       if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
         echo "task-notifier: timed out waiting for result: $filename" >&2
+        if [ -n "${DELIVERY_CLAIM_DIR:-}" ] && [ -d "$DELIVERY_CLAIM_DIR/${filename%.txt}" ]; then
+          time_out_claimed_task "$filename"
+        fi
         clear_workstream_context
         return 0
       fi
       sleep "$POLL_INTERVAL"
     done
     mark_worker_stage "$filename" done
+    clear_delivery_claim "$filename"
     clear_workstream_context
   fi
 }
@@ -414,10 +664,15 @@ mkfifo "$event_dir/events"
 queue_dir="$event_dir/queue"
 PAYLOAD_DIR="$event_dir/payload"
 mkdir -p "$queue_dir" "$PAYLOAD_DIR"
+prune_delivery_claims
+[ -n "$LOCK_OWNER" ] && reap_orphaned_watcher
 "$NOTIFIER_PY" -c \
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
-  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" &
+  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" 9>&- &
 watcher_pid=$!
+if [ -n "$LOCK_OWNER" ]; then
+  printf '%s\n%s\n%s\n' "$watcher_pid" "$(process_start "$watcher_pid" || true)" "$TASKS_DIR" > "$WATCHER_RECORD" 2>/dev/null || true
+fi
 
 # A narrower net than the watcher's own routing, for a worker claim that
 # outlives its handler declaration (the pool de-registers mid-flight).
@@ -459,9 +714,11 @@ enqueue_announced_task() {
   filename="${entry%%$'\t'*}"; payload="${entry#*$'\t'}"
   if has_result "$filename"; then
     mark_worker_stage "$filename" done
+    clear_delivery_claim "$filename"
     return 0
   fi
   [ -e "$queue_dir/$filename" ] && return 0
+  claim_abandoned "$filename" && return 0
   if [ "${SUTANDO_INBOX_KIND:-}" != "deliveries" ] && filename_is_worker_held "$filename"; then
     log_notifier "$filename is worker-held per deliveries/; not queuing, not typing into the core"
     return 0
@@ -510,18 +767,26 @@ queue_head() {
 # it queued rather than typing into Codex's non-durable input.
 process_announced_queue() {
   local filename
+  retry_owner_alerts
   while :; do
     filename="$(queue_head)"
     [ -n "$filename" ] || return 0
     if has_result "$filename"; then
       mark_worker_stage "$filename" done
+      clear_delivery_claim "$filename"
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
-    wait_for_core_idle || exit 1
-    submit_task "$filename" 1
-    if has_result "$filename"; then
-      mark_worker_stage "$filename" done
+    if ! claim_abandoned "$filename"; then
+      wait_for_core_idle || exit 1
+      submit_task "$filename" 1
+    fi
+    # An abandoned task leaves the queue unanswered; its claim keeps it from ever being retried.
+    if has_result "$filename" || claim_abandoned "$filename"; then
+      if has_result "$filename"; then
+        mark_worker_stage "$filename" done
+        clear_delivery_claim "$filename"
+      fi
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi

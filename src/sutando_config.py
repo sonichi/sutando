@@ -648,6 +648,23 @@ def resolve_core_runtime(repo_root: Optional[Path] = None) -> str:
     return runtime
 
 
+_CODEX_DELIVERY_MODES = {"send-keys", "queue"}
+
+
+def resolve_codex_delivery(repo_root: Optional[Path] = None) -> dict:
+    """How tasks reach a Codex core: ``core.codex.delivery`` and an optional ``core.codex.thread``.
+
+    Default and any unrecognized mode is ``send-keys``, so only an explicit opt-in changes delivery.
+    """
+    core = load_config(repo_root).get("core") or {}
+    codex = core.get("codex") if isinstance(core.get("codex"), dict) else {}
+    mode = str(codex.get("delivery") or "send-keys").strip()
+    if mode not in _CODEX_DELIVERY_MODES:
+        print(f"sutando config: unsupported core.codex.delivery={mode!r}; using send-keys", file=sys.stderr)
+        mode = "send-keys"
+    return {"delivery": mode, "thread": str(codex.get("thread") or "").strip()}
+
+
 _DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"
 
 

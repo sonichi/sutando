@@ -245,6 +245,36 @@ class CodexTaskNotifierHealthTests(unittest.TestCase):
             any("=kewei-core-watcher" in args for _, args in tmux.calls)
         )
 
+    def _lock_wait_result(self, waiting_text):
+        self.write_local_core()
+        if waiting_text is not None:
+            (self.state / "codex-notifier.lock.waiting").write_text(waiting_text)
+        with tempfile.TemporaryDirectory() as repo_td:
+            repo = Path(repo_td)
+            direct = repo / "src/agent/codex/cli/task-notifier.sh"
+            direct.parent.mkdir(parents=True)
+            direct.write_text("#!/bin/bash\n")
+            tmux = FakeTmux(panes=[("0", f"bash {direct}")])
+            with (
+                mock.patch.object(hc, "REPO_DIR", repo),
+                mock.patch.object(hc, "_run_tmux", side_effect=tmux),
+            ):
+                return hc.check_codex_task_notifier()
+
+    def test_a_long_wait_for_the_notifier_lock_warns(self):
+        result = self._lock_wait_result(f"{os.getpid()} {int(time.time()) - 600}\n")
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("waited", result["detail"])
+        self.assertIn("codex-notifier.lock", result["detail"])
+
+    def test_a_short_wait_a_dead_waiter_or_a_bad_record_does_not_warn(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        for text in (f"{os.getpid()} {int(time.time()) - 10}\n", f"{dead.pid} {int(time.time()) - 600}\n",
+                     "garbage\n", None):
+            (self.state / "codex-notifier.lock.waiting").unlink(missing_ok=True)
+            self.assertEqual(self._lock_wait_result(text)["status"], "ok", text)
+
     def test_current_direct_notifier_is_accepted(self):
         self.write_local_core()
         with tempfile.TemporaryDirectory() as repo_td:

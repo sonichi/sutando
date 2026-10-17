@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Read-only observer of the Codex core: publishes its runtime observation record from the rollout
-// file the core's process holds open. Args: --engine --tmux-socket --session [--workspace].
+// file the core's process holds open. Args: [--core-thread] --engine --tmux-socket --session [--workspace].
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -101,6 +101,25 @@ export function pickRollout(metas) {
   if (metas.some((m) => !m)) return null;
   const top = metas.filter((m) => !m.parent_thread_id && !m.agent_path);
   return top.length === 1 ? top[0].path : null;
+}
+
+// The core's thread for `codex queue`: {code: 0, id}, 3 when no single core rollout is open,
+// 4 when it has no turn yet (Codex refuses to queue into a thread with no persisted turn).
+export async function coreThread(deps) {
+  const panePid = await deps.panePid();
+  if (!panePid) return {code: 3, reason: 'no core pane'};
+  const paths = await deps.openRollouts(panePid);
+  const metas = await Promise.all(paths.map(async (p) => {
+    const m = await deps.readMeta(p);
+    return m ? {...m, path: p} : null;
+  }));
+  const file = pickRollout(metas);
+  if (!file) return {code: 3, reason: `no single top-level rollout among ${paths.length} open`};
+  const meta = metas.find((m) => m && m.path === file);
+  const id = meta.id || (path.basename(file).match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/) || [])[1];
+  if (!id) return {code: 3, reason: `no thread id in ${path.basename(file)}`};
+  if (!deps.hasTurn(file)) return {code: 4, reason: 'thread has no persisted turn', id};
+  return {code: 0, id};
 }
 
 export function descendants(rootPid, psText) {
@@ -296,6 +315,23 @@ function firstLine(file, limit = 4 * 1024 * 1024) {
   }
 }
 
+function fileContains(file, needle) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const want = Buffer.from(needle);
+    const chunk = Buffer.alloc(1024 * 1024);
+    let carry = Buffer.alloc(0);
+    for (let n; (n = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0;) {
+      const hay = Buffer.concat([carry, chunk.subarray(0, n)]);
+      if (hay.includes(want)) return true;
+      carry = hay.subarray(Math.max(0, hay.length - want.length + 1));
+    }
+    return false;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 export function fileDeps(opts, io = fs) {
   return {
     now: () => Date.now() / 1000,
@@ -311,6 +347,7 @@ export function fileDeps(opts, io = fs) {
         return first.type === 'session_meta' ? first.payload : null;
       } catch { return null; }
     },
+    hasTurn: (file) => fileContains(file, '"type":"task_started"'),
     readTail: (file, bytes) => {
       const {buf, end} = readRange(io, file, (size) => Math.max(0, size - bytes));
       return {text: buf.toString('utf8'), size: end};
@@ -339,7 +376,15 @@ export async function runLoop(observer, sleep) {
 }
 
 async function main() {
-  const opts = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  if (argv[0] === '--core-thread') {
+    const opts = parseArgs(argv.slice(1));
+    const r = await coreThread(fileDeps(opts));
+    if (r.code === 0) process.stdout.write(r.id);
+    else process.stderr.write(`${r.reason}\n`);
+    process.exit(r.code);
+  }
+  const opts = parseArgs(argv);
   const observer = new Observer(opts, fileDeps(opts));
   setInterval(() => observer.heartbeat(), HEARTBEAT_MS);
   await runLoop(observer, (ms) => new Promise((r) => setTimeout(r, ms)));

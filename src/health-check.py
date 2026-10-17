@@ -10390,7 +10390,33 @@ def check_codex_task_notifier() -> dict:
                 "session could not be verified"
             ),
         }
+    waited = _codex_notifier_lock_wait()
+    if waited is not None and waited >= CODEX_NOTIFIER_LOCK_WAIT_WARN_S:
+        return {
+            "name": "codex-task-notifier",
+            "status": "warn",
+            "detail": (
+                f"a Codex notifier has waited {waited}s for state/codex-notifier.lock; "
+                "another notifier still holds it, so no new tasks are being delivered"
+            ),
+        }
     return _probe_codex_task_notifier(target)
+
+
+CODEX_NOTIFIER_LOCK_WAIT_WARN_S = 180
+
+
+def _codex_notifier_lock_wait() -> "int | None":
+    """Seconds a live notifier has waited for the single-notifier lock, from notifier_lock.py's
+    `.waiting` record; None when nobody waits or the waiter has exited."""
+    try:
+        pid_text, since_text = (WORKSPACE_DIR / "state" / "codex-notifier.lock.waiting").read_text().split()[:2]
+        pid, since = int(pid_text), int(since_text)
+    except (OSError, ValueError):
+        return None
+    if not _process_alive(pid):
+        return None
+    return max(0, int(time.time()) - since)
 
 
 def _claude_runtime_selected() -> bool:

@@ -2,12 +2,14 @@
 """Hermetic integration tests for the persistent Codex core launcher."""
 import json
 import os
+import re
 import shutil
 import signal
 import select
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 import pty
@@ -16,6 +18,19 @@ from pathlib import Path
 REAL_REPO = Path(os.environ.get(
     "SUTANDO_TEST_REPO", Path(__file__).resolve().parents[1]
 )).resolve()
+
+
+def _extract_shell_fn(text, name):
+    return re.search(r"^%s\(\) \{.*?^\}" % re.escape(name), text, re.S | re.M).group(0)
+
+
+def _delivery_source(root):
+    # The production delivery functions, extracted together so a harness runs the shipped code.
+    text = (root / "src/agent/codex/cli/task-notifier.sh").read_text()
+    return "\n".join(_extract_shell_fn(text, n) for n in
+                     ("has_result", "claim_delivery", "stamp_claim", "replace_stale_claim",
+                      "claim_core_gone", "release_delivery", "clear_delivery_claim", "claim_abandoned",
+                      "abandon_claimed_task", "retry_owner_alerts", "queue_prompt", "deliver_task"))
 
 
 def _read_count(path):
@@ -112,6 +127,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/quota_availability.py",
             "src/delivery/readiness.py",
             "src/delivery/task_dispatch.py",
+            "src/delivery/codex_queue.py",
+            "src/delivery/notifier_lock.py",
             "src/local_task_protocol.py",
             "src/result_markers.py",
             "src/task_priority.py",
@@ -1051,6 +1068,741 @@ exit 0
         self.assertNotIn("Related prior workstream context", calls)
         self.assertIn("/tasks/task-123.txt", calls)
         self.assertIn("send-keys -t =sutando-core:0 C-m", calls)
+
+    # A live core pane: idle composer, session present. Records every tmux call.
+    _LIVE_PANE_TMUX = '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+for _a in "$@"; do [ "$_a" = capture-pane ] && { printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }; done
+exit 0
+'''
+
+    def _run_event(self, delivery=None, codex_rc=0, node_rc=None, thread="core-thread-1", ack=False, extra_env=None):
+        """Run `--event task-123.txt` with a logging fake codex (and node); returns (result, codex argv log)."""
+        codex_log = Path(self.tmp.name) / "codex.log"
+        codex_cfg = {"thread": thread} if thread else {}
+        if delivery is not None:
+            codex_cfg["delivery"] = delivery
+        (self.root / "sutando.config.local.json").write_text(json.dumps({"core": {"codex": codex_cfg}}))
+        self._write_exe("tmux", self._LIVE_PANE_TMUX)
+        self._write_exe("codex", f'''#!/bin/bash
+for a in "$@"; do printf '%s\\0' "$a"; done >> "{codex_log}"
+printf '\\n' >> "{codex_log}"
+[ "$1" = queue ] || exit 0
+[ {codex_rc} = 0 ] && {{ echo "Queued message m1 for thread $3."; exit 0; }}
+{"echo Queued message m1 for thread $3." if ack else ":"}
+echo "Error: failed to queue session message" >&2; exit {codex_rc}
+''')
+        if node_rc is not None:
+            self._write_exe("node", f'#!/bin/bash\necho "thread has no persisted turn" >&2\nexit {node_rc}\n')
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_")}
+        env.update(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1", SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT="1",
+                   SUTANDO_NOTIFIER_SUBMIT_RETRIES="1", SUTANDO_NOTIFIER_POLL_INTERVAL="0.05", **(extra_env or {}))
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-123.txt"],
+                                env=env, capture_output=True, text=True, timeout=120)
+        calls = [line.split("\0")[:-1] for line in codex_log.read_text().splitlines()] if codex_log.exists() else []
+        return result, calls
+
+    def test_default_delivery_types_and_never_queues(self):
+        # A usable thread is configured, so only the default mode keeps this from queueing.
+        result, codex_calls = self._run_event()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in codex_calls if c[:1] == ["queue"]], [])
+        self.assertIn("send-keys -t =sutando-core:0 -l -- Sutando task ready: task-123.txt", self._tmux_calls())
+
+    def test_queue_delivery_queues_the_exact_prompt_without_typing(self):
+        result, codex_calls = self._run_event(delivery="queue")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        queued = [c for c in codex_calls if c[:1] == ["queue"]]
+        self.assertEqual(len(queued), 1, codex_calls)
+        workspace = (self.root / "workspace").resolve()
+        prompt = (f"Sutando task ready: task-123.txt. Read {workspace}/tasks/task-123.txt, follow AGENTS.md, "
+                  f"complete the task, and write the result to {workspace}/results/task-123.txt.")
+        self.assertEqual(queued[0], ["queue", "--thread", "core-thread-1", "--message", prompt])
+        self.assertNotIn("send-keys", self._tmux_calls())
+        self.assertIn("queued task-123.txt into thread core-thread-1", result.stderr)
+
+    def test_queue_failure_falls_back_to_send_keys_with_a_reason(self):
+        result, codex_calls = self._run_event(delivery="queue", codex_rc=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len([c for c in codex_calls if c[:1] == ["queue"]]), 1)
+        self.assertIn("codex queue failed for task-123.txt", result.stderr)
+        self.assertIn("falling back to send-keys", result.stderr)
+        self.assertIn("send-keys -t =sutando-core:0 -l -- Sutando task ready: task-123.txt", self._tmux_calls())
+
+    def test_an_unknown_queue_outcome_is_never_typed(self):
+        result, codex_calls = self._run_event(delivery="queue", codex_rc=1, ack=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len([c for c in codex_calls if c[:1] == ["queue"]]), 1)
+        self.assertIn("outcome UNKNOWN for task-123.txt", result.stderr)
+        self.assertNotIn("send-keys", self._tmux_calls())
+
+    def test_a_worker_notifier_ignores_queue_mode(self):
+        stage_writer = Path(self.tmp.name) / "pool-delivery.py"
+        stage_writer.write_text("import sys\nsys.exit(0)\n")
+        result, codex_calls = self._run_event(delivery="queue", extra_env={
+            "SUTANDO_INSTANCE_ID": "worker-1", "SUTANDO_POOL_DELIVERY_SCRIPT": str(stage_writer)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in codex_calls if c[:1] == ["queue"]], [])
+        self.assertIn("send-keys -t =sutando-core:0 -l -- Sutando task ready: task-123.txt. Worker worker-1",
+                      self._tmux_calls())
+
+    # A fake helper (`thread` / `send`) for the extracted delivery functions. THREAD is a bash
+    # snippet for the thread step; SEND for the send step. Every send and typing is logged.
+    def _delivery_harness(self, body, *, thread='printf t1', send="printf 'Queued message'",
+                          claims=None, mode="queue"):
+        tmp = Path(self.tmp.name)
+        fake_py = tmp / "fake-py"
+        fake_py.write_text("#!/bin/bash\n"
+                           f'[ "$1" = "$DISPATCH_PY" ] && exec "{sys.executable}" "$@"\nshift\n'
+                           f'if [ "$1" = thread ]; then {thread}; exit $?; fi\n'
+                           f"printf '%s\\n' \"$3\" >> \"{tmp}/sent\"\n{send}\n")
+        fake_py.chmod(0o755)
+        stubs = ("log_notifier() { printf '%s\\n' \"$*\" >> \"$LOG\"; }\n"
+                 "pane_state() { echo idle-ready; }\n"
+                 "core_identity() { [ -s \"$CORE_ID\" ] && cat \"$CORE_ID\"; }\n"
+                 "deliver_prompt() { [ -z \"${HOLD:-}\" ] || while [ ! -e \"$HOLD\" ]; do sleep 0.02; done\n"
+                 "  printf 'SEND_KEYS:%s\\n' \"$1\" >> \"$TYPED\"; return ${DELIVER_RC:-0}; }\n")
+        harness = stubs + _delivery_source(self.root) + "\n" + body
+        env = dict(os.environ, NOTIFIER_PY=str(fake_py), CODEX_QUEUE_PY="x", REPO="r",
+                   TMUX_SOCKET="s", SESSION="sutando-core", DELIVERY_MODE=mode,
+                   DELIVERY_CLAIM_DIR=str(claims if claims is not None else tmp / "claims"),
+                   LOG=str(tmp / "log"), TYPED=str(tmp / "typed"), RESULTS_DIR=str(tmp / "results"),
+                   DISPATCH_PY=str(self.root / "src/delivery/task_dispatch.py"), WORKER_INSTANCE="",
+                   CORE_ID=str(tmp / "core-id"))
+        (tmp / "results").mkdir(exist_ok=True)
+        return harness, env
+
+    def _lines(self, name):
+        path = Path(self.tmp.name) / name
+        return path.read_text().split() if path.exists() else []
+
+    def _run_harness(self, body, **kw):
+        harness, env = self._delivery_harness(body, **kw)
+        return subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
+
+    def test_queue_prompt_resolves_the_thread_for_every_task(self):
+        # After /new or /resume the core's thread changes; a cached id would queue into the old one.
+        n = Path(self.tmp.name) / "n"
+        r = self._run_harness('deliver_task a.txt p1 && deliver_task b.txt p2\n',
+                              thread=f'c=$(($(cat "{n}" 2>/dev/null || echo 0) + 1)); echo $c > "{n}"; printf "t%s" $c')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._lines("sent"), ["t1", "t2"])
+
+    def test_queue_prompt_thread_lookup_ignores_a_stderr_warning_on_success(self):
+        r = self._run_harness('deliver_task a.txt p1\n',
+                              thread="echo \"sutando config: unsupported core.codex.delivery='x'\" >&2; printf clean-thread")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._lines("sent"), ["clean-thread"])
+
+    def test_a_task_is_never_resubmitted_once_handed_off(self):
+        r = self._run_harness('deliver_task a.txt p1; deliver_task a.txt p1; echo "rc=$?"\n')
+        self.assertEqual(r.stdout.strip(), "rc=0", r.stderr)
+        self.assertEqual(self._lines("sent"), ["t1"])
+        self.assertEqual(self._lines("typed"), [])
+
+    def test_a_signaled_helper_is_unknown_keeps_the_claim_and_never_types(self):
+        r = self._run_harness('deliver_task a.txt p1; echo "rc=$?"; deliver_task a.txt p1\n', send="exit 143")
+        self.assertEqual(r.stdout.strip(), "rc=0", r.stderr)
+        self.assertEqual(self._lines("sent"), ["t1"])
+        self.assertEqual(self._lines("typed"), [])
+        self.assertTrue((Path(self.tmp.name) / "claims" / "a").is_dir())
+
+    def test_an_unknown_outcome_keeps_the_claim_and_is_never_requeued(self):
+        r = self._run_harness('deliver_task a.txt p; echo "rc1=$?"; deliver_task a.txt p; echo "rc2=$?"\n',
+                              send="echo 'may have queued' >&2; exit 6")
+        self.assertEqual(r.stdout.split(), ["rc1=0", "rc2=0"], r.stderr)
+        self.assertTrue((Path(self.tmp.name) / "claims" / "a").is_dir(), "an unknown outcome keeps the claim")
+        self.assertEqual(self._lines("sent"), ["t1"])
+        self.assertEqual(self._lines("typed"), [])
+
+    def test_a_certain_queue_failure_types_once_and_keeps_the_claim(self):
+        r = self._run_harness('deliver_task a.txt p1; echo "rc=$?"; deliver_task a.txt p1\n',
+                              send="printf 'codex queue did not start' >&2; exit 5")
+        self.assertEqual(r.stdout.strip(), "rc=0", r.stderr)
+        self.assertEqual(self._lines("typed"), ["SEND_KEYS:a.txt"])
+        self.assertTrue((Path(self.tmp.name) / "claims" / "a").is_dir(), "typed, so the claim stays")
+
+    def test_a_refused_fallback_releases_the_claim_and_defers(self):
+        r = self._run_harness('DELIVER_RC=1 deliver_task a.txt p1; echo "rc=$?"\n', thread="exit 3")
+        self.assertEqual(r.stdout.strip(), "rc=1", r.stderr)
+        self.assertFalse((Path(self.tmp.name) / "claims" / "a").exists(), "nothing was typed, so it is released")
+
+    def _race(self, rounds, **kw):
+        tmp = Path(self.tmp.name)
+        harness, env = self._delivery_harness(
+            f'while [ ! -e "{tmp}/go" ]; do sleep 0.01; done\ndeliver_task "$1" p; echo "rc=$?"\n', **kw)
+        for n in range(rounds):
+            procs = [subprocess.Popen(["bash", "-c", harness, "h", f"task-{n}.txt"], env=env,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+            time.sleep(0.2)
+            (tmp / "go").touch()
+            outs = [p.communicate(timeout=30) for p in procs]
+            (tmp / "go").unlink()
+            yield n, outs
+
+    def test_two_concurrent_notifiers_queue_a_task_exactly_once(self):
+        for n, outs in self._race(5):
+            self.assertEqual(sorted(o[0].strip() for o in outs), ["rc=0", "rc=0"], outs)
+            self.assertEqual(len(self._lines("sent")), n + 1, f"round {n}")
+        self.assertEqual(self._lines("typed"), [])
+
+    def test_two_concurrent_notifiers_on_a_safe_fallback_type_a_task_exactly_once(self):
+        for label, kw in (("no thread", {"thread": "sleep 0.2; exit 3"}),
+                          ("helper rc 5", {"send": "sleep 0.2; exit 5"})):
+            for f in ("typed", "sent"):
+                (Path(self.tmp.name) / f).unlink(missing_ok=True)
+            shutil.rmtree(Path(self.tmp.name) / "claims", ignore_errors=True)
+            for n, outs in self._race(3, **kw):
+                self.assertEqual(len(self._lines("typed")), n + 1, f"{label}, round {n}: {outs}")
+
+    def test_a_failed_claim_whose_owner_released_never_types(self):
+        # The loser's mkdir hits EEXIST, then the owner releases before the loser looks again.
+        claim = Path(self.tmp.name) / "claims" / "a"
+        r = self._run_harness(f'mkdir() {{ [ "${{!#}}" = "{claim}" ] && return 1; command mkdir "$@"; }}\n'
+                              'deliver_task a.txt p; echo "rc=$?"\n')
+        self.assertEqual(r.stdout.strip(), "rc=1", r.stderr)
+        self.assertEqual(self._lines("sent"), [])
+        self.assertEqual(self._lines("typed"), [])
+
+    def test_an_unclaimable_task_is_never_handed_off(self):
+        blocker = Path(self.tmp.name) / "not-a-dir"
+        blocker.write_text("")
+        r = self._run_harness('deliver_task a.txt p; echo "rc=$?"\n', claims=blocker / "claims")
+        self.assertEqual(r.stdout.strip(), "rc=1", r.stderr)
+        self.assertEqual(self._lines("sent"), [])
+        self.assertEqual(self._lines("typed"), [])
+
+    def test_a_claim_left_by_a_crash_is_never_typed_or_requeued(self):
+        (Path(self.tmp.name) / "claims" / "a").mkdir(parents=True)
+        r = self._run_harness('deliver_task a.txt p; echo "rc=$?"\n')
+        self.assertEqual(r.stdout.strip(), "rc=0", r.stderr)
+        self.assertEqual(self._lines("sent"), [])
+        self.assertEqual(self._lines("typed"), [])
+
+    def test_send_keys_creates_its_claim_on_demand_and_types_once(self):
+        claims = Path(self.tmp.name) / "claims"
+        self.assertFalse(claims.exists())
+        r = self._run_harness('deliver_task a.txt p; echo "rc1=$?"; deliver_task a.txt p; echo "rc2=$?"\n',
+                              mode="send-keys")
+        self.assertEqual(r.stdout.split(), ["rc1=0", "rc2=0"], r.stderr)
+        self.assertEqual(self._lines("typed"), ["SEND_KEYS:a.txt"])
+        self.assertTrue((claims / "a").is_dir())
+        self.assertFalse((claims / "a" / "queue").exists(), "a typed-only claim")
+
+    def test_a_queue_notifier_never_delivers_a_task_a_send_keys_notifier_is_typing(self):
+        # Kewei's first interleaving: send-keys owns the task while a queue notifier runs.
+        tmp = Path(self.tmp.name)
+        hold = tmp / "hold"
+        harness, env = self._delivery_harness('deliver_task a.txt p; echo "rc=$?"\n', mode="send-keys")
+        typist = subprocess.Popen(["bash", "-c", harness], env=dict(env, HOLD=str(hold)),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + 10
+        while not (tmp / "claims" / "a").is_dir() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        r = self._run_harness('deliver_task a.txt p; echo "rc=$?"\n')
+        hold.touch()
+        out, err = typist.communicate(timeout=30)
+        self.assertEqual((r.stdout.strip(), out.strip()), ("rc=0", "rc=0"), r.stderr + err)
+        self.assertEqual(self._lines("sent"), [])
+        self.assertEqual(self._lines("typed"), ["SEND_KEYS:a.txt"])
+
+    def _old_claim(self, core="111 Mon Oct 12 09:00:00 2026", queued=False):
+        tmp = Path(self.tmp.name)
+        claim = tmp / "claims" / "a"
+        claim.mkdir(parents=True)
+        (claim / "core").write_text(core)
+        if queued:
+            (claim / "queue").touch()
+        (tmp / "core-id").write_text("222 Fri Oct 16 10:00:00 2026")
+        return claim
+
+    def test_a_typed_task_is_retyped_once_after_a_core_restart(self):
+        claim = self._old_claim()
+        r = self._run_harness('deliver_task a.txt p; echo "rc1=$?"; deliver_task a.txt p; echo "rc2=$?"\n',
+                              mode="send-keys")
+        self.assertEqual(r.stdout.split(), ["rc1=0", "rc2=0"], r.stderr)
+        self.assertEqual(self._lines("typed"), ["SEND_KEYS:a.txt"])
+        self.assertEqual((claim / "core").read_text(), "222 Fri Oct 16 10:00:00 2026", "re-claimed by the new core")
+
+    def test_a_queued_task_is_abandoned_not_retyped_after_a_core_restart(self):
+        claim = self._old_claim(queued=True)
+        r = self._run_harness('deliver_task a.txt p; echo "rc=$?"\n')
+        self.assertEqual(r.stdout.strip(), "rc=0", r.stderr)
+        self.assertEqual(self._lines("typed") + self._lines("sent"), [])
+        self.assertTrue((claim / "abandoned").exists() and (claim / "alerted").exists())
+        alerts = list((Path(self.tmp.name) / "results").glob("proactive-*-a.txt"))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].read_text(), "task a was handed to Codex but the core restarted before it "
+                                                "replied; not retried, to avoid running it twice\n")
+
+    def test_an_alert_that_could_not_be_written_is_retried_once_results_is_back(self):
+        tmp = Path(self.tmp.name)
+        claim = self._old_claim(queued=True)
+        results = tmp / "results"
+        results.mkdir(exist_ok=True)
+        results.chmod(0o500)
+        try:
+            r = self._run_harness('deliver_task a.txt p; echo "rc=$?"\n')
+        finally:
+            results.chmod(0o700)
+        self.assertEqual(r.stdout.strip(), "rc=0", r.stderr)
+        self.assertTrue((claim / "abandoned").exists())
+        self.assertFalse((claim / "alerted").exists())
+        self.assertEqual(list(results.glob("proactive-*")), [])
+        self.assertEqual(self._lines("typed") + self._lines("sent"), [], "fail-closed: never retyped")
+        r = self._run_harness('retry_owner_alerts; retry_owner_alerts; deliver_task a.txt p\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        alerts = list(results.glob("proactive-*-a.txt"))
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("the core restarted before it replied", alerts[0].read_text())
+        self.assertTrue((claim / "alerted").exists())
+        self.assertEqual(self._lines("typed") + self._lines("sent"), [])
+
+    # Kewei's round-6 cases, each against the production functions under the real notifier lock.
+    def _locked(self, body, *, mode="queue", group=True):
+        tmp = Path(self.tmp.name)
+        harness, env = self._delivery_harness(body, mode=mode)
+        cmd = [sys.executable, str(self.root / "src/delivery/notifier_lock.py"), "--lock", str(tmp / "notifier.lock"),
+               "--timeout", "30", "--", "bash", "-c", harness]
+        return subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=group)
+
+    def _wait_for(self, path, timeout=10):
+        deadline = time.monotonic() + timeout
+        while not path.exists():
+            self.assertLess(time.monotonic(), deadline, f"{path.name} never appeared")
+            time.sleep(0.02)
+
+    # Pauses a notifier right after deliver_task's result check, as in Kewei's schedules.
+    _PAUSE_AFTER_RESULT_CHECK = ('eval "orig_$(declare -f has_result)"\n'
+                                 'has_result() { local rc=0; orig_has_result "$@" || rc=$?; touch "$PAUSED"; '
+                                 'while [ ! -e "$GO" ]; do sleep 0.02; done; return $rc; }\n')
+
+    def _paused_owner_and_waiter(self, owner_mode, waiter_mode):
+        tmp = Path(self.tmp.name)
+        (tmp / "core-id").write_text("111 old")
+        os.environ["PAUSED"], os.environ["GO"] = str(tmp / "paused"), str(tmp / "go")
+        try:
+            a = self._locked(self._PAUSE_AFTER_RESULT_CHECK + "deliver_task a.txt p\n", mode=owner_mode)
+            self._wait_for(tmp / "paused")
+            (tmp / "core-id").write_text("222 new")
+            b = self._locked(f'touch "{tmp}/b-started"\ndeliver_task a.txt p\n', mode=waiter_mode)
+            time.sleep(1.0)
+            self.assertFalse((tmp / "b-started").exists(), "a second notifier ran while the first held the lock")
+            (tmp / "go").touch()
+            a.communicate(timeout=30)
+            b.communicate(timeout=30)
+        finally:
+            os.environ.pop("PAUSED", None)
+            os.environ.pop("GO", None)
+        self.assertTrue((tmp / "b-started").exists())
+
+    def test_round6_old_owner_double_handoff_cannot_happen(self):
+        self._paused_owner_and_waiter("send-keys", "queue")
+        self.assertEqual(self._lines("typed"), ["SEND_KEYS:a.txt"])
+        self.assertEqual(self._lines("sent"), [], "typed and queued cannot both happen")
+
+    def test_round6_stale_waiter_cannot_falsely_abandon_a_fresh_claim(self):
+        self._paused_owner_and_waiter("queue", "queue")
+        claim = Path(self.tmp.name) / "claims" / "a"
+        self.assertEqual(self._lines("sent"), ["t1"])
+        self.assertFalse((claim / "abandoned").exists())
+        self.assertEqual(list((Path(self.tmp.name) / "results").glob("proactive-*")), [])
+
+    def test_round6_crash_left_takeover_state_is_taken_over_at_once_and_delivered_once(self):
+        tmp = Path(self.tmp.name)
+        (tmp / "core-id").write_text("111 old")
+        a = self._locked(f'deliver_task a.txt p\ntouch "{tmp}/a-typed"\nsleep 60\n', mode="send-keys")
+        self._wait_for(tmp / "a-typed")
+        os.killpg(a.pid, signal.SIGKILL)
+        a.communicate(timeout=30)
+        started = time.monotonic()
+        b = self._locked('deliver_task a.txt p\n', mode="send-keys")
+        b.communicate(timeout=30)
+        self.assertLess(time.monotonic() - started, 5, "the next notifier took the lock at once")
+        self.assertEqual(sorted(p.name for p in (tmp / "claims").iterdir()), ["a"], "no stranded lock state")
+        self.assertEqual(self._lines("typed"), ["SEND_KEYS:a.txt"], "same core: delivered once")
+        (tmp / "core-id").write_text("222 new")
+        for _ in range(2):
+            self._locked('deliver_task a.txt p\n', mode="send-keys").communicate(timeout=30)
+        self.assertEqual(self._lines("typed"), ["SEND_KEYS:a.txt", "SEND_KEYS:a.txt"], "retyped exactly once")
+
+    def test_round6_crash_left_alerting_state_sends_exactly_one_alert(self):
+        tmp = Path(self.tmp.name)
+        claim = self._old_claim(queued=True)
+        hang_before_alert = f'mktemp() {{ touch "{tmp}/at-alert"; sleep 60; }}\n'
+        a = self._locked(hang_before_alert + 'deliver_task a.txt p\n')
+        self._wait_for(tmp / "at-alert")
+        os.killpg(a.pid, signal.SIGKILL)
+        a.communicate(timeout=30)
+        self.assertTrue((claim / "abandoned").exists())
+        self.assertFalse((claim / "alerted").exists())
+        started = time.monotonic()
+        b = self._locked('retry_owner_alerts; retry_owner_alerts; deliver_task a.txt p\n')
+        b.communicate(timeout=30)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(len(list((tmp / "results").glob("proactive-*-a.txt"))), 1)
+        self.assertTrue((claim / "alerted").exists())
+        self.assertEqual(self._lines("typed") + self._lines("sent"), [])
+
+    def test_round8_a_killed_owners_delivery_child_holds_off_its_successor(self):
+        # A's delivery runs in a child that outlives a SIGKILL of A alone; B may act only after it.
+        tmp = Path(self.tmp.name)
+        (tmp / "core-id").write_text("111 same")
+        hold, child = tmp / "release", tmp / "child"
+        a = self._locked(f'( HOLD="{hold}" deliver_task a.txt p ) & echo $! > "{child}"; wait\n',
+                         mode="send-keys", group=False)
+        self._wait_for(tmp / "claims" / "a")
+        self._wait_for(child)
+        os.kill(a.pid, signal.SIGKILL)
+        a.wait(timeout=30)
+        b = self._locked(f'touch "{tmp}/b-started"\ndeliver_task a.txt p\n', mode="queue")
+        time.sleep(1.0)
+        self.assertFalse((tmp / "b-started").exists(), "B ran while A's delivery child still held the lock")
+        hold.touch()
+        b.communicate(timeout=30)
+        for f in (a.stdout, a.stderr):
+            f.close()
+        self.assertTrue((tmp / "b-started").exists())
+        self.assertEqual(self._lines("typed") + self._lines("sent"), ["SEND_KEYS:a.txt"])
+
+    def test_a_stale_or_copied_lock_fd_marker_does_not_bypass_a_held_lock(self):
+        sys.path.insert(0, str(self.root / "src/delivery"))
+        import notifier_lock
+        state = self.root / "workspace" / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        held = notifier_lock.acquire(str(state / "codex-notifier.lock"), 1, 1)
+        self.addCleanup(os.close, held)
+        self._write_exe("tmux", self._LIVE_PANE_TMUX)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_")}
+        env.update(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log), SUTANDO_NOTIFIER_LOCK_FD="9",
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_POLL_INTERVAL="0.05", SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        other = os.open(str(state / "codex-notifier.lock"), os.O_RDWR)
+        self.addCleanup(os.close, other)
+        for fd9 in (None, other):  # no fd 9 at all; fd 9 on the lock file but not the holder
+            kw = {"pass_fds": (9,)} if fd9 is not None else {}
+            if fd9 is not None:
+                os.dup2(fd9, 9)
+            try:
+                r = subprocess.run(["/bin/bash", str(script), "--event", "task-1.txt"], env=env,
+                                   capture_output=True, text=True, timeout=30, **kw)
+            finally:
+                if fd9 is not None:
+                    os.close(9)
+            self.assertEqual(r.returncode, 75, r.stderr)
+        self.assertNotIn("task-1.txt", self.log.read_text() if self.log.exists() else "")
+
+    def test_two_real_notifiers_on_one_workspace_never_overlap(self):
+        # The shipped task-notifier.sh, run twice: the second waits on the first's lock.
+        tmp = Path(self.tmp.name)
+        go = tmp / "go"
+        self._write_exe("tmux", f'''#!/bin/bash
+printf '%s LOCKFD=%s\\n' "$*" "${{SUTANDO_NOTIFIER_LOCK_FD:-}}" >> "$TMUX_LOG"
+for _a in "$@"; do [ "$_a" = capture-pane ] && {{ printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }}; done
+case "$*" in *"-l -- Sutando task ready: task-1.txt"*)
+  for _ in $(seq 200); do [ -e "{go}" ] && break; sleep 0.05; done ;; esac
+exit 0
+''')
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_")}
+        env.update(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1", SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT="1",
+                   SUTANDO_NOTIFIER_SUBMIT_RETRIES="1", SUTANDO_NOTIFIER_POLL_INTERVAL="0.05")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        run = lambda task: subprocess.Popen(["/bin/bash", str(script), "--event", task], env=env,  # noqa: E731
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        first = run("task-1.txt")
+        deadline = time.monotonic() + 15
+        while "task-1.txt" not in (self.log.read_text() if self.log.exists() else ""):
+            self.assertLess(time.monotonic(), deadline, "the first notifier never typed")
+            time.sleep(0.05)
+        second = run("task-2.txt")
+        time.sleep(1.5)
+        self.assertNotIn("task-2.txt", self.log.read_text(), "the second notifier ran while the first held the lock")
+        go.touch()
+        out1, err1 = first.communicate(timeout=30)
+        out2, err2 = second.communicate(timeout=30)
+        self.assertEqual((first.returncode, second.returncode), (0, 0), err1 + err2)
+        calls = self.log.read_text().splitlines()
+        self.assertTrue(any("-l -- Sutando task ready: task-2.txt" in c for c in calls), err2)
+        self.assertTrue(calls and all(c.endswith("LOCKFD=9") for c in calls), calls)
+
+    def test_after_a_notifier_is_killed_the_next_one_serves_the_inbox_at_once(self):
+        # Its watcher leads its own session, so it outlives a kill -9 and keeps holding the inbox.
+        tmp = Path(self.tmp.name)
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        tasks.mkdir(exist_ok=True)
+        (workspace / "results").mkdir(exist_ok=True)
+        (workspace / "logs").mkdir(exist_ok=True)
+        holder = tmp / "watcher-holder"
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text(f'''#!/bin/bash
+h="$(cat "{holder}" 2>/dev/null)"
+if [ -n "$h" ] && kill -0 "$h" 2>/dev/null; then echo "already watched by pid $h; exiting 0" >&2; exit 0; fi
+echo $$ > "{holder}"
+for f in "$1"/*.txt; do [ -e "$f" ] && echo "TASK_FILE: $(basename "$f")"; done
+while :; do sleep 1; done
+''')
+        watcher.chmod(0o755)
+        self._write_exe("tmux", self._LIVE_PANE_TMUX)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_")}
+        env.update(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_POLL_INTERVAL="0.05", SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1",
+                   SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="30")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        run = lambda: subprocess.Popen(["/bin/bash", str(script)], env=env, stdout=subprocess.DEVNULL,  # noqa: E731
+                                       stderr=subprocess.DEVNULL, start_new_session=True)
+        record = workspace / "state" / "codex-notifier.watcher"
+        first = run()
+        self._wait_for(record)
+        self._wait_for(holder)
+        orphan = int(holder.read_text())
+        second = None
+        try:
+            first.kill()
+            first.wait(timeout=30)
+            os.kill(orphan, 0)  # the watcher outlived its notifier
+            (tasks / "task-777.txt").write_text("task: x\n")
+            second = run()
+            deadline = time.monotonic() + 10
+            while "task-777.txt" not in (self.log.read_text() if self.log.exists() else ""):
+                self.assertLess(time.monotonic(), deadline, "the restarted notifier never served the inbox")
+                time.sleep(0.05)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(orphan, 0)
+            self.assertIn("left running by a notifier that died",
+                          (workspace / "logs" / "task-notifier.log").read_text())
+        finally:
+            for proc in (second, first):
+                if proc is not None and proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=30)
+            # Each watcher leads its own session; a killed notifier never stops it.
+            for pid in {orphan, int(holder.read_text() or 0)} - {0}:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    def test_a_watcher_record_that_no_longer_names_the_watcher_kills_nothing(self):
+        tmp = Path(self.tmp.name)
+        fake = tmp / "watch-tasks-stream.sh"
+        fake.write_text("#!/bin/bash\nwhile :; do sleep 1; done\n")
+        fake.chmod(0o755)
+        other = tmp / "other.sh"
+        other.write_text("#!/bin/bash\nwhile :; do sleep 1; done\n")
+        other.chmod(0o755)
+        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
+        fns = "\n".join(_extract_shell_fn(text, n) for n in ("process_start", "reap_orphaned_watcher"))
+        procs = {name: subprocess.Popen(["bash", str(path)], start_new_session=True)
+                 for name, path in (("watcher", fake), ("other", other))}
+        try:
+            time.sleep(0.3)
+            start = lambda pid: subprocess.run(  # noqa: E731
+                ["bash", "-c", fns + f"\nprocess_start {pid}"], capture_output=True, text=True).stdout
+            cases = (  # (pid, start, inbox) -> must survive
+                (procs["watcher"].pid, "Mon Jan  1 00:00:00 2001", "/inbox"),
+                (procs["watcher"].pid, start(procs["watcher"].pid), "/another-inbox"),
+                (procs["other"].pid, start(procs["other"].pid), "/inbox"),
+            )
+            record = tmp / "record"
+            for pid, st, inbox in cases:
+                record.write_text(f"{pid}\n{st}\n{inbox}\n")
+                r = subprocess.run(["bash", "-c", "set -euo pipefail\nlog_notifier() { :; }\n" + fns +
+                                    "\nreap_orphaned_watcher\necho FINISHED\n"],
+                                   env=dict(os.environ, WATCHER_RECORD=str(record), TASKS_DIR="/inbox"),
+                                   capture_output=True, text=True, timeout=30)
+                self.assertIn("FINISHED", r.stdout, r.stderr)
+                self.assertIsNone(procs["watcher"].poll())
+                self.assertIsNone(procs["other"].poll())
+            r = subprocess.run(["bash", "-c", "set -euo pipefail\nlog_notifier() { :; }\n" + fns +
+                                "\nreap_orphaned_watcher\necho FINISHED\n"],
+                               env=dict(os.environ, WATCHER_RECORD=str(tmp / "missing"), TASKS_DIR="/inbox"),
+                               capture_output=True, text=True, timeout=30)
+            self.assertIn("FINISHED", r.stdout, r.stderr)
+        finally:
+            for proc in procs.values():
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+
+    def test_the_notifier_runs_under_the_inbox_lock_and_keeps_it_from_its_watcher(self):
+        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
+        self.assertIn('exec "$NOTIFIER_PY" "$REPO/src/delivery/notifier_lock.py" --lock '
+                      '"$WORKSPACE_DIR/state/codex-notifier.lock"', text)
+        self.assertRegex(text, r'watch-tasks-stream\.sh"[^\n]*9>&- &')
+
+    def test_a_claim_from_the_same_or_an_unknown_core_is_waited_on(self):
+        for recorded, current in (("222 Fri Oct 16 10:00:00 2026", "222 Fri Oct 16 10:00:00 2026"),
+                                  ("", "222 Fri Oct 16 10:00:00 2026"), ("111 x", "")):
+            shutil.rmtree(Path(self.tmp.name) / "claims", ignore_errors=True)
+            self._old_claim(core=recorded)
+            (Path(self.tmp.name) / "core-id").write_text(current)
+            r = self._run_harness('deliver_task a.txt p; echo "rc=$?"\n', mode="send-keys")
+            self.assertEqual(r.stdout.strip(), "rc=0", r.stderr)
+            self.assertEqual(self._lines("typed"), [], (recorded, current))
+
+    def test_core_identity_ignores_the_callers_time_zone_and_locale(self):
+        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
+        harness = (f'core_target() {{ printf "=sutando-core:0"; }}\ntmux() {{ echo {os.getpid()}; }}\n'
+                   + _extract_shell_fn(text, "process_start") + "\n"
+                   + _extract_shell_fn(text, "core_identity") + "\ncore_identity\n")
+        ids = set()
+        for tz, lc in (("UTC", "C"), ("Asia/Tokyo", "de_DE.UTF-8"), ("America/Los_Angeles", "ja_JP.UTF-8")):
+            r = subprocess.run(["bash", "-c", harness], env=dict(os.environ, TMUX_SOCKET="s", TZ=tz, LC_ALL=lc),
+                               capture_output=True, text=True, timeout=30)
+            self.assertTrue(r.stdout.startswith(f"{os.getpid()} "), r.stderr)
+            ids.add(r.stdout)
+        self.assertEqual(len(ids), 1, ids)
+
+    def test_core_identity_is_the_pane_pid_and_its_start_time(self):
+        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
+        harness = ('core_target() { printf "=sutando-core:0"; }\n'
+                   'tmux() { [ "$3" = display-message ] && echo 4242; }\n'
+                   'ps() { [ "$4" = 4242 ] && echo "Fri Oct 16  10:00:00 2026"; }\n'
+                   + _extract_shell_fn(text, "process_start") + "\n"
+                   + _extract_shell_fn(text, "core_identity") + "\ncore_identity\n")
+        r = subprocess.run(["bash", "-c", harness], env=dict(os.environ, TMUX_SOCKET="s"),
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.stdout, "4242 Fri Oct 16 10:00:00 2026")
+
+    def test_a_task_whose_reply_landed_before_the_claim_is_never_delivered(self):
+        # Kewei's second interleaving: the reply lands and its claim is cleared before this notifier claims.
+        (Path(self.tmp.name) / "results").mkdir(exist_ok=True)
+        (Path(self.tmp.name) / "results" / "a.txt").write_text("real reply\n")
+        for mode in ("queue", "send-keys"):
+            r = self._run_harness('deliver_task a.txt p; echo "rc=$?"\n', mode=mode)
+            self.assertEqual(r.stdout.strip(), "rc=0", r.stderr)
+            self.assertEqual(self._lines("sent") + self._lines("typed"), [], mode)
+            self.assertFalse((Path(self.tmp.name) / "claims" / "a").exists(), "the claim is released")
+
+    def _claimed_event(self, **kw):
+        (self.root / "workspace" / "state" / "codex-delivery-claims" / "task-123").mkdir(parents=True)
+        return self._run_event(**kw)
+
+    def test_a_claim_survives_a_switch_back_to_send_keys(self):
+        result, codex_calls = self._claimed_event(delivery="send-keys")
+        self.assertEqual(codex_calls, [])
+        self.assertNotIn("send-keys -t =sutando-core:0 -l", self._tmux_calls())
+        self.assertIn("is already claimed; not delivering it again", result.stderr)
+
+    def test_a_claim_survives_a_mode_resolution_failure(self):
+        (self.root / "src" / "delivery" / "codex_queue.py").unlink()
+        result, codex_calls = self._claimed_event(delivery="queue")
+        self.assertEqual(codex_calls, [])
+        self.assertNotIn("send-keys -t =sutando-core:0 -l", self._tmux_calls())
+        self.assertIn("is already claimed; not delivering it again", result.stderr)
+
+    def _timeout_run(self, queued=True, task_a_live=None):
+        tmp = Path(self.tmp.name)
+        ws = tmp / "ws"
+        for d in ("results", "queue", "claims/task-a"):
+            (ws / d).mkdir(parents=True)
+        if queued:
+            (ws / "claims" / "task-a" / "queue").touch()
+        if task_a_live is not None:
+            (ws / "results" / "task-a.txt").write_text(task_a_live)
+        for name in ("task-a.txt", "task-b.txt"):
+            (ws / "queue" / name).write_text("normal")
+            time.sleep(0.02)
+        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
+        fns = "\n".join(_extract_shell_fn(text, n) for n in (
+            "has_result", "release_delivery", "clear_delivery_claim", "claim_abandoned",
+            "abandon_claimed_task", "retry_owner_alerts", "time_out_claimed_task",
+            "wait_for_core_idle", "submit_task", "queue_head", "process_announced_queue"))
+        # task-a holds a claim and never answers; task-b is answered as soon as it is delivered.
+        stubs = textwrap.dedent('''\
+            set -euo pipefail
+            workstream_context_file=""
+            log_notifier() { printf '%s\\n' "$*" >> "$LOG"; }
+            mark_worker_stage() { :; }
+            clear_workstream_context() { :; }
+            prepare_workstream_context() { :; }
+            task_payload() { printf '%s' "$1"; }
+            tmux() { return 0; }
+            deliver_task() {
+              if [ -d "$DELIVERY_CLAIM_DIR/${1%.txt}" ]; then return 0; fi
+              echo done > "$RESULTS_DIR/$1"
+            }
+        ''')
+        harness = stubs + fns + "\nprocess_announced_queue\necho FINISHED\n"
+        env = dict(os.environ, DELIVERY_MODE="queue", DELIVERY_CLAIM_DIR=str(ws / "claims"),
+                   RESULTS_DIR=str(ws / "results"), queue_dir=str(ws / "queue"), PAYLOAD_DIR=str(ws / "queue"),
+                   LOG=str(tmp / "log"), COMPLETION_TIMEOUT="1", POLL_INTERVAL="0.05",
+                   NOTIFIER_PY=sys.executable, DISPATCH_PY=str(self.root / "src/delivery/task_dispatch.py"),
+                   TMUX_SOCKET="s", SESSION="sutando-core", WORKER_INSTANCE="")
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=60)
+        self.assertIn("FINISHED", r.stdout, r.stderr)
+        return ws, (tmp / "log").read_text() if (tmp / "log").exists() else ""
+
+    def test_a_queued_task_with_no_reply_is_abandoned_the_owner_alerted_and_the_queue_moves_on(self):
+        ws, log = self._timeout_run(task_a_live="")
+        self.assertEqual((ws / "results" / "task-a.txt").read_text(), "", "results/ is left untouched")
+        alerts = sorted((ws / "results").glob("proactive-*-task-a.txt"))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].read_text(), "task task-a was handed to Codex but no reply came back in 1 min; "
+                                                "not retried, to avoid running it twice\n")
+        self.assertEqual([p.name for p in (ws / "results").iterdir() if p.name.startswith(".")], [])
+        self.assertEqual((ws / "results" / "task-b.txt").read_text().strip(), "done")
+        self.assertTrue((ws / "claims" / "task-a" / "abandoned").exists(), "the claim is kept")
+        self.assertIn("abandoned task-a.txt", log)
+        self.assertEqual(list((ws / "queue").iterdir()), [])
+
+    def test_a_typed_only_claim_is_released_at_timeout_so_the_task_is_retried_as_before(self):
+        ws, log = self._timeout_run(queued=False)
+        self.assertFalse((ws / "claims" / "task-a").exists())
+        self.assertEqual(list((ws / "results").glob("proactive-*")), [])
+        self.assertEqual(sorted(p.name for p in (ws / "queue").iterdir()), ["task-a.txt", "task-b.txt"])
+
+    def test_only_claims_of_finished_tasks_are_pruned(self):
+        tmp = Path(self.tmp.name)
+        ws = tmp / "ws"
+        for d in ("tasks", "results/archive", "claims"):
+            (ws / d).mkdir(parents=True)
+        cases = {  # id -> (task file still in tasks/, result, abandoned)
+            "done-archived": (False, "archive", False),
+            "done-live": (False, "live", False),
+            "still-in-tasks": (True, "archive", False),
+            "no-result": (False, None, False),
+            "abandoned-unpublished": (False, None, True),
+            "abandoned-published": (False, "live", True),
+            "abandoned-alerted": (False, None, "alerted"),
+            "abandoned-alerted-in-tasks": (True, None, "alerted"),
+        }
+        for tid, (in_tasks, result, abandoned) in cases.items():
+            (ws / "claims" / tid).mkdir()
+            if abandoned:
+                (ws / "claims" / tid / "abandoned").touch()
+            if abandoned == "alerted":
+                (ws / "claims" / tid / "alerted").touch()
+            if in_tasks:
+                (ws / "tasks" / f"{tid}.txt").write_text("task: x\n")
+            if result:
+                (ws / "results" / ("archive" if result == "archive" else "") / f"{tid}.txt").write_text("reply\n")
+        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
+        self.assertRegex(text, r"\nprune_delivery_claims\n", "the notifier prunes on start")
+        fns = "\n".join(_extract_shell_fn(text, n) for n in ("has_result", "prune_delivery_claims"))
+        env = dict(os.environ, DELIVERY_CLAIM_DIR=str(ws / "claims"), TASKS_DIR=str(ws / "tasks"),
+                   RESULTS_DIR=str(ws / "results"), NOTIFIER_PY=sys.executable,
+                   DISPATCH_PY=str(self.root / "src/delivery/task_dispatch.py"))
+        r = subprocess.run(["bash", "-c", "set -euo pipefail\n" + fns + "\nprune_delivery_claims\necho FINISHED\n"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        self.assertIn("FINISHED", r.stdout, r.stderr)
+        self.assertEqual(sorted(p.name for p in (ws / "claims").iterdir()),
+                         ["abandoned-alerted-in-tasks", "abandoned-unpublished", "no-result"])
+
+    def test_thread_without_a_persisted_turn_falls_back_without_queueing(self):
+        result, codex_calls = self._run_event(delivery="queue", thread=None, node_rc=4)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in codex_calls if c[:1] == ["queue"]], [])
+        self.assertIn("no usable core thread for task-123.txt (rc 4: thread has no persisted turn)", result.stderr)
+        self.assertIn("send-keys -t =sutando-core:0 -l -- Sutando task ready: task-123.txt", self._tmux_calls())
 
     def test_notifier_does_not_replay_completed_task(self):
         workspace = self.root / "workspace"

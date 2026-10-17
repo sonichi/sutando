@@ -30,6 +30,24 @@
           "minimum": 1,
           "default": 10,
           "description": "Commits behind origin/<expected_branch> before health-check's live-checkout-branch probe warns that the checkout is stale. Being ON the right branch is only half of being current \u2014 a checkout can sit on main and still run weeks-old code. Deliberately not 1: main moves several times a day, so warning on any delta trains the reader to ignore the probe. Invalid values (non-integer, zero, negative) fall back to 10 rather than crashing the health check or warning on a current checkout. No env-var override."
+        },
+        "codex": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Codex-core settings, read only when core.runtime is codex. A change takes effect on a core restart.",
+          "properties": {
+            "delivery": {
+              "type": "string",
+              "enum": ["send-keys", "queue"],
+              "default": "send-keys",
+              "description": "How the task notifier hands a task to the Codex TUI: type it into the tmux pane (send-keys), or `codex queue --thread` it (queue, Codex >= 0.157), falling back to send-keys whenever queueing fails."
+            },
+            "thread": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Queue mode only: the core's Codex thread id or exact name. Unset, the notifier reads it from the rollout the core's process holds open."
+            }
+          }
         }
       }
     },
