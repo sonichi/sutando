@@ -51,7 +51,7 @@ the closing marker and stay operator text. Only the body is cut to fit the lengt
 Tier and collaborator come from the attested headers (`task_io.attested_headers`, via
 the package-level `task_io.parse_task` every adapter shares), never from message text; unknown tiers become `guest`, and
 `collaborator=true` only at `team`. Header values have whitespace removed, so a value cannot add a line.
-The note is the Hatch adapter's `NON_OWNER_NOTE`, the same pin the Codex adapter uses; `routine-prompt.md`
+The note is the shared `ag2_sparrow.task_io.NON_OWNER_NOTE`, the same text every adapter renders; `routine-prompt.md`
 carries the same text so the rules do not depend on the payload. A task with no room is not fired.
 
 **Non-owner tiers are refused by default, not merely noted.** One routine holds one connector scope —

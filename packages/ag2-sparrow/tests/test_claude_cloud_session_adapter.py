@@ -30,7 +30,7 @@ from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 SID = "session_01TESTSESSION"
 PROMPT_MD = PKG_ROOT / "ag2_sparrow" / "adapters" / "claude_cloud_session" / "session-prompt.md"
 ROUTINE_MD = PKG_ROOT / "ag2_sparrow" / "adapters" / "claude_routine" / "routine-prompt.md"
-NOTE = cc.NON_OWNER_NOTE_FALLBACK
+NOTE = cc.NON_OWNER_NOTE
 SPAN_RE = re.compile(r"<(UNTRUSTED_TASK_[0-9a-f]{8})>\n(.*)\n</\1>", re.S)
 ENV = {"PATH": "/usr/bin:/bin", "HOME": "/home/owner", "USER": "owner", "LANG": "en_US.UTF-8",
        "SUTANDO_WORKSPACE": "/secret/ws", "ANTHROPIC_API_KEY": "sk-should-not-pass", "TERM": "xterm"}
@@ -542,6 +542,71 @@ class QueueLoopTest(unittest.TestCase):
             run_adapter(d, fake, clock=clock, once=1, max_per_hour=1)
             self.assertEqual(len(fake.calls()), 2)
             self.assertGreaterEqual(clock.t - start, 3600, "the next turn waited for the hour")
+
+    def sends(self, d):
+        return json.loads((Path(d) / "state" / "sends.json").read_text())
+
+    def test_full_cap_restart_settles_a_marked_task_at_once_without_a_new_entry(self):
+        class Crash(BaseException):
+            pass
+
+        def send_then_crash(argv, **kw):
+            subprocess.run(argv, **kw)
+            raise Crash()
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok()])
+            write_task(d, "task-c", "x")
+            first = FakeClock()
+            with self.assertRaises(Crash):
+                run_adapter(d, fake, clock=first, run=send_then_crash, once=1, max_per_hour=1)
+            self.assertEqual(self.sends(d), [[first.t, "task-c"]])
+            clock = FakeClock(first.t + 100)
+            start = clock.t
+            run_adapter(d, fake, clock=clock, once=1, max_per_hour=1, min_gap_seconds=30)
+            self.assertEqual(clock.t, start, "settling a marked task waits for no gate")
+            self.assertIn("(interrupted)", result(d, "task-c"))
+            self.assertEqual(self.sends(d), [[first.t, "task-c"]], "the reservation keeps its original time")
+            self.assertEqual(len(fake.calls()), 1)
+
+    def test_full_cap_restart_after_a_crash_before_the_marker_sends_once_without_waiting(self):
+        class Crash(BaseException):
+            pass
+
+        def crash(path):
+            raise Crash()
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok(2)])
+            write_task(d, "task-b", "x")
+            first = FakeClock()
+            with mock.patch.object(sa, "mark_sending", crash), self.assertRaises(Crash):
+                run_adapter(d, fake, clock=first, once=1, max_per_hour=1)
+            self.assertEqual(fake.calls(), [], "the crash came before the send")
+            self.assertEqual(self.sends(d), [[first.t, "task-b"]])
+            clock = FakeClock(first.t + 100)
+            start = clock.t
+            run_adapter(d, fake, clock=clock, once=1, max_per_hour=1, min_gap_seconds=30)
+            self.assertEqual(clock.t, start, "its own reservation does not hold it back")
+            self.assertEqual(len(fake.calls()), 1)
+            self.assertIn("turn=2", result(d, "task-b"))
+            self.assertEqual(self.sends(d), [[start, "task-b"]], "one entry, at the outcome time")
+
+    def test_min_gap_counts_from_the_outcome_not_the_start(self):
+        clock = FakeClock()
+        starts = []
+
+        def slow(argv, **kw):
+            starts.append(clock.t)
+            clock.t += 10
+            return subprocess.CompletedProcess(argv, 0, ok(len(starts))["stdout"], "")
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok()])
+            write_task(d, "task-1", "x", mtime=1000)
+            write_task(d, "task-2", "x", mtime=2000)
+            run_adapter(d, fake, clock=clock, run=slow, once=2, min_gap_seconds=2)
+            self.assertEqual(len(starts), 2)
+            self.assertGreaterEqual(starts[1], starts[0] + 10 + 2)
+            times = [e[0] for e in self.sends(d)]
+            self.assertEqual(times, [starts[0] + 10, starts[1] + 10], "each entry is the outcome time")
 
     def test_without_the_marker_the_crash_would_resend(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(sa, "mark_sending", lambda path: None):

@@ -120,9 +120,12 @@ class Adapter(RelayLoop):
         super().finish(name, body, seen)
         self._clear(name[:-4])
 
+    def recovering(self, name):
+        return os.path.exists(self._marker(name[:-4])) or self.limiter.holds(name[:-4])
+
     def next_ready(self, names):
         name, wait = super().next_ready(names)
-        if name is None or not self.limiter.times:
+        if name is None or self.recovering(name) or not self.limiter.times:
             return name, wait
         gap = max(self.limiter.times) + self.args.min_gap_seconds - self.clock()
         return (None, gap) if gap > 0 else (name, 0.0)
@@ -138,7 +141,6 @@ class Adapter(RelayLoop):
         if os.path.exists(self._marker(task_id)):
             # A send began before a crash; resending could post twice.
             log("interrupted send, not resent ->", task_id)
-            self.limiter.record(task_id)
             self.finish(name, result_body(INTERRUPTED, self.args.result_mode, owner, LABEL), seen)
             return True
         if not self.admit(name, headers, seen):
@@ -149,7 +151,7 @@ class Adapter(RelayLoop):
             self.finish(name, NO_ROOM, seen)
             return True
         log("queue ->", task_id, headers.get("access_tier"), "chars", len(text))
-        # Counted before the send, keyed by task, so a crash after it can neither drop nor double the count.
+        # Reserved before the send, keyed by task, so a crash after it can neither drop nor double the count.
         self.limiter.record(task_id)
         mark_sending(self._marker(task_id))
         out = queue_turn(self.args.claude, self.args.session_id, text, self.env, self.args.timeout, self.run)
@@ -158,6 +160,8 @@ class Adapter(RelayLoop):
             self._clear(task_id)
             if self.schedule_retry(task_id, out.detail):
                 return False
+        else:
+            self.limiter.touch(task_id)
         log("result <-", task_id, out.kind, out.detail, out.session_id or "")
         self.finish(name, result_body(out, self.args.result_mode, owner, LABEL), seen)
         return True

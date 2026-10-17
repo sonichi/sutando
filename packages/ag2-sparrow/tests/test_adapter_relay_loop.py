@@ -5,6 +5,7 @@ Run:
     python3 packages/ag2-sparrow/tests/test_adapter_relay_loop.py
 """
 import ast
+import re
 import contextlib
 import io
 import os
@@ -25,6 +26,12 @@ from ag2_sparrow.adapters.claude_cloud_session import session_adapter as sa  # n
 from ag2_sparrow.adapters.claude_routine import routine_adapter as ra  # noqa: E402
 
 ADAPTERS = PKG_ROOT / "ag2_sparrow" / "adapters"
+SHARED = PKG_ROOT / "ag2_sparrow"
+ADAPTER_DIRS = sorted([p for p in ADAPTERS.iterdir() if p.is_dir() and p.name != "__pycache__"]
+                      + [p for p in (PKG_ROOT / "adapters").iterdir() if p.is_dir()])
+CODE = (".py", ".sh", ".ts", ".json")
+SEGMENT = re.compile(r"(?:^|[/.\\])adapters(?:[/.\\]|$)")
+CROSS = re.compile(r"adapters[/.]([A-Za-z0-9_-]+)|\.\./([A-Za-z0-9_-]+)/")
 
 
 def write_task(inbox, tid, priority, mtime, tier="owner"):
@@ -178,7 +185,7 @@ class DelegationTest(unittest.TestCase):
         for name in ("parse_task", "load_done", "record_done", "write_atomic", "non_owner_note"):
             self.assertIs(getattr(rl, name), getattr(task_io, name), name)
         for name in ("parse_task", "write_atomic", "load_done", "record_done", "acquire_lock", "pid_alive",
-                     "non_owner_note", "hatch_note", "attested_headers", "NON_OWNER_NOTE_FALLBACK"):
+                     "non_owner_note", "attested_headers", "NON_OWNER_NOTE"):
             self.assertIs(getattr(cc, name), getattr(task_io, name), name)
         self.assertIs(task_fields.attested_headers, task_io.attested_headers)
 
@@ -189,6 +196,43 @@ class DelegationTest(unittest.TestCase):
         names = {n for _, n in adapter_imports()}
         self.assertIn("ag2_sparrow.relay_loop", names, "the scan resolves relative imports")
         self.assertIn("ag2_sparrow.task_io", names)
+
+    def string_constants(self, path):
+        return [n.value for n in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+
+    def test_no_shared_module_names_an_adapter_path(self):
+        names = {p.name for p in ADAPTER_DIRS}
+        found = []
+        for path in sorted(SHARED.glob("*.py")):
+            for value in self.string_constants(path):
+                if SEGMENT.search(value) or value in names:
+                    found.append((path.name, value[:80]))
+        self.assertEqual(found, [])
+
+    def test_no_adapter_names_another_adapters_path(self):
+        names = {p.name for p in ADAPTER_DIRS}
+        found = []
+        for adapter in ADAPTER_DIRS:
+            for path in sorted(p for p in adapter.rglob("*") if p.suffix in CODE and "__pycache__" not in p.parts):
+                for m in CROSS.finditer(path.read_text(encoding="utf-8", errors="replace")):
+                    other = m.group(1) or m.group(2)
+                    if other in names and other != adapter.name:
+                        found.append((str(path.relative_to(PKG_ROOT)), m.group(0)))
+                if path.suffix == ".py":
+                    found += [(str(path.relative_to(PKG_ROOT)), v) for v in self.string_constants(path)
+                              if v in names and v != adapter.name]
+        self.assertEqual(found, [])
+
+    def test_the_path_scans_catch_the_old_shapes(self):
+        self.assertTrue(SEGMENT.search("adapters"))
+        self.assertTrue(SEGMENT.search("../../../ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh"))
+        self.assertFalse(SEGMENT.search("so adapters share it"))
+        hits = [m.group(1) or m.group(2)
+                for m in CROSS.finditer("const HATCH_SCRIPT = '../../../ag2_sparrow/adapters/hatch/x.sh'")]
+        self.assertIn("hatch", hits)
+        self.assertIn("hatch", {p.name for p in ADAPTER_DIRS})
+        self.assertIn("claude-code", {p.name for p in ADAPTER_DIRS})
 
     def test_the_scan_catches_a_crossing(self):
         node = ast.parse("from ..codex.codex_connector import parse_task").body[0]

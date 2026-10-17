@@ -30,7 +30,7 @@ from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 TOKEN = "sk-ant-oat01-FAKE-TEST-TOKEN-do-not-log"
 TRIGGER = "trig_01TESTTRIGGER"
 PROMPT_MD = PKG_ROOT / "ag2_sparrow" / "adapters" / "claude_routine" / "routine-prompt.md"
-NOTE = cc.NON_OWNER_NOTE_FALLBACK
+NOTE = cc.NON_OWNER_NOTE
 SPAN_RE = re.compile(r"<(UNTRUSTED_TASK_[0-9a-f]{8})>\n(.*)\n</\1>", re.S)
 
 

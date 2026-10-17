@@ -61,8 +61,8 @@ note: <NON_OWNER_NOTE>            (non-owner tiers only)
 ```
 
 Everything after the first line is the routine adapter's payload, built by the same shared function:
-fresh nonce per turn, attested tier and collaborator, header whitespace removed, the Hatch
-`NON_OWNER_NOTE` for non-owner tiers. The routing line adds `channel_kind`, read from the attested
+fresh nonce per turn, attested tier and collaborator, header whitespace removed, the shared
+`task_io.NON_OWNER_NOTE` for non-owner tiers. The routing line adds `channel_kind`, read from the attested
 `channel_kind` header the gateway stamps (`dm`, `room`, anything else `unknown`; a body line cannot
 claim it), and `owner_dm` from `--owner-dm`. With them the standing instructions apply the audience
 rule: in the owner's DM, answer there; in a room, post only what the room is meant to read, and send an
@@ -93,7 +93,11 @@ Pacing: at least `--min-gap-seconds` (default 2) between queued turns and at mos
 counts turns that were queued or may have been; an attempt proven unsent does not use it. Each turn
 is counted before the CLI call, keyed by its task id, and dropped again only when the call proves it
 was never sent, so a crash right after a send cannot lose the count and a restart cannot count the
-same task twice.
+same task twice. Once the outcome is known (queued or ambiguous) the entry moves to that time, so the
+gap counts from when the turn was queued, not from when the call started. On restart, a task that
+already holds an entry or a pre-send marker is settled first and skips both gates: a marked task gets
+its "may or may not have reached" result at once, a reserved but unmarked one is sent at once, and
+neither gains a second entry or a newer time from the restart.
 
 ## Limits
 

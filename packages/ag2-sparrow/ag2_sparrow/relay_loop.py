@@ -123,6 +123,15 @@ class RateLimiter:
         self.entries.append((self.clock(), key))
         self._save()
 
+    def holds(self, key):
+        self._prune()
+        return any(k == key for _, k in self.entries)
+
+    def touch(self, key):
+        """Move a reservation to now, keeping it the one entry for that key."""
+        self.entries = [(self.clock() if k == key else t, k) for t, k in self.entries]
+        self._save()
+
     def forget(self, key):
         self.entries = [(t, k) for t, k in self.entries if k != key]
         self._save()
@@ -187,8 +196,15 @@ class RelayLoop:
     def step(self, name, seen):
         raise NotImplementedError
 
+    def recovering(self, name):
+        """True for a task whose earlier attempt is already counted; it skips the send gates."""
+        return False
+
     def next_ready(self, names):
         now = self.clock()
+        for n in names:
+            if self.recovering(n):
+                return n, 0.0
         if now < self.blocked_until:
             return None, self.blocked_until - now
         ready = [n for n in names if self.not_before.get(n[:-4], 0) <= now]

@@ -26,9 +26,8 @@ import threading
 import time
 import uuid
 
-from ...task_io import (DONE_KEEP, HATCH_SCRIPT, NON_OWNER_NOTE_FALLBACK, acquire_lock,  # noqa: F401
-                        attested_headers, hatch_note, load_done, non_owner_note, parse_task, pid_alive,
-                        record_done, write_atomic)
+from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, acquire_lock, attested_headers,  # noqa: F401
+                        load_done, non_owner_note, parse_task, pid_alive, record_done, write_atomic)
 
 CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
 APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
@@ -135,7 +134,7 @@ def is_owner(headers):
     return headers.get("access_tier") == "owner"
 
 
-def wrap_untrusted(task_id, headers, message, operator_lines=(), note=NON_OWNER_NOTE_FALLBACK):
+def wrap_untrusted(task_id, headers, message, operator_lines=(), note=NON_OWNER_NOTE):
     tag = "UNTRUSTED_TASK_" + uuid.uuid4().hex[:8]
     meta = ", ".join("%s=%s" % (k, headers.get(k) or "?")
                      for k in ("source", "channel_id", "access_tier", "collaborator", "priority"))
