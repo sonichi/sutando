@@ -129,7 +129,16 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.work = Path(self.tmp.name)
+        self.addCleanup(self.drop_lock_dir)
         self.clock = Clock()
+
+    def drop_lock_dir(self):
+        """The lock directory is keyed by the root's inode, which a Linux tmpfs/ext4 reuses: a record
+        or junk left by one test must not be inherited by the next fresh temp dir."""
+        try:
+            shutil.rmtree(holder_lock.lock_dir(str(self.work)), True)
+        except OSError:
+            pass
 
     def life(self):
         return self.lc.Lifecycle(self.work, clock=self.clock, log=quiet)
