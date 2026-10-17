@@ -143,8 +143,7 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
 
 def observe_pane(workspace, worker_id, runtime: str = "claude", *,
                  runner=subprocess.run) -> tuple[str | None, str | None]:
-    """(pane kind, frame id) of this worker's pane; (None, None) when unread. The id is
-    "raw:normalised": the raw half proves a frozen turn, the normalised half a waiting one."""
+    """(pane kind, frame id) of this worker's pane; (None, None) when unread."""
     socket, name = _open_tmux(workspace, worker_id)
     if not socket:
         return None, None
@@ -157,7 +156,12 @@ def observe_pane(workspace, worker_id, runtime: str = "claude", *,
     if not text or not text.strip():
         return None, None
     return (classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name),
-            f"{cw.raw_state_id(text)}:{cw.state_id(text)}")
+            frame_id(text))
+
+
+def frame_id(text: str) -> str:
+    """"raw:progress": the raw frame proves a frozen turn, the progress half a waiting one."""
+    return f"{cw.raw_state_id(text)}:{pane_gate.progress_id(text)}"
 
 
 def supervised_workers(workspace) -> dict:
