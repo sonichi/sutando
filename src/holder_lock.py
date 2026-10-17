@@ -345,6 +345,16 @@ def _read_prior(directory: str) -> Prior:
     return _classify(raw)
 
 
+def _holder_of(directory: str) -> Prior:
+    """The record in a known lock directory, typed: an unreadable one is Invalid."""
+    try:
+        return _read_prior(directory)
+    except OSError as e:
+        return Invalid("unreadable: %s" % e, b"")
+    except (UnicodeError, ValueError) as e:
+        return Invalid("not a valid record (%s)" % e.__class__.__name__, b"")
+
+
 def read_holder(work_root) -> Prior:
     """Missing, Valid or Invalid. Never raises on a supported platform: an unreadable record is Invalid;
     a root that does not exist has no record."""
@@ -354,12 +364,7 @@ def read_holder(work_root) -> Prior:
         return Missing()
     except OSError as e:
         return Invalid("unreadable: %s" % e, b"")
-    try:
-        return _read_prior(directory)
-    except OSError as e:
-        return Invalid("unreadable: %s" % e, b"")
-    except (UnicodeError, ValueError) as e:
-        return Invalid("not a valid record (%s)" % e.__class__.__name__, b"")
+    return _holder_of(directory)
 
 
 def _pids_in(raw: bytes):
@@ -435,19 +440,30 @@ def _prepare(work_root):
 
 
 def _within(path: str, root_st) -> bool:
-    """Whether `path` is the root or lies under it, by (st_dev, st_ino) of each existing ancestor,
-    so case aliases and other spellings of the root are caught."""
-    while True:
-        try:
-            st = os.stat(path)
-            if (st.st_dev, st.st_ino) == (root_st.st_dev, root_st.st_ino):
+    """Whether `path` is the root or lies under it. Symlinks are resolved first (realpath), then each
+    existing component of the real path is opened from the one above with O_NOFOLLOW and compared
+    with the root by (st_dev, st_ino); a component that turns into a link meanwhile counts as inside."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    want = (root_st.st_dev, root_st.st_ino)
+    fd = os.open(os.sep, flags)
+    try:
+        if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) == want:
+            return True
+        for part in [p for p in os.path.realpath(path).split(os.sep) if p]:
+            try:
+                nxt = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                return False
+            except OSError:
                 return True
-        except OSError:
-            pass
-        parent = os.path.dirname(path)
-        if parent == path:
-            return False
-        path = parent
+            os.close(fd)
+            fd = nxt
+            st = os.fstat(fd)
+            if (st.st_dev, st.st_ino) == want:
+                return True
+        return False
+    finally:
+        os.close(fd)
 
 
 def _root_unchanged(path: str, root: str, root_fd: int) -> bool:
@@ -509,7 +525,7 @@ def _attempt(path: str, root: str, directory: str, root_fd: int, install_id_: st
     locked = kept = False
     try:
         if not file_lock.try_lock_fd(fd):
-            return Contended(read_holder(root))
+            return Contended(_holder_of(directory))
         locked = True
         if not same_file(fd, lock_path):
             raise LockError("replaced")
@@ -614,16 +630,33 @@ def wait(work_root, *, install_id: str, deadline: float, poll: float = 0.1,
 # ── publish, release ─────────────────────────────────────────────────────────
 
 def _check_owner(owner: Owner) -> None:
+    """Outside any lock: the platform, and the owner pid (a forked child stops here)."""
     _platform()
     if owner.pid != os.getpid():
         raise LockError("not the owner")
+
+
+def _held_fds(owner: Owner) -> None:
+    """Under _GUARD: the owner is unreleased and its fds are still the lock file and the held root,
+    else LockError before any fd is touched."""
     if owner.released:
         raise LockError("released")
+    held = [(owner.fd, tuple(owner.lock_id))]
+    if owner.root_fd >= 0:
+        held.append((owner.root_fd, tuple(owner.root_id)))
+    for fd, want in held:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            raise LockError("released")
+        if (st.st_dev, st.st_ino) != want:
+            raise LockError("released")
 
 
 def _write_record(owner: Owner, rec: dict) -> bool:
     """Write the record; the rename is the commit. True when the directory fsync after it also
-    succeeded; LockError (nothing written) when anything before the rename failed."""
+    succeeded; LockError when anything before the rename failed: no record is published, though a
+    temp whose cleanup also failed may remain until the next publish removes it."""
     directory = owner.directory
     try:
         names = os.listdir(directory)
@@ -666,16 +699,14 @@ def _write_record(owner: Owner, rec: dict) -> bool:
 
 
 def publish(owner: Owner, adapter: str) -> Published:
-    """Write the holder record, once per owner; every field but `adapter` is generated."""
+    """Write the holder record, once per owner; every field but `adapter` is generated. Validated
+    and written under the module guard, so a released handle never writes."""
     _check_owner(owner)
-    with owner.mutex:
+    with _GUARD:
+        _held_fds(owner)
         if owner.published:
             raise LockError("published")
-        try:
-            st = os.fstat(owner.fd)
-        except OSError:
-            raise LockError("the lock descriptor is closed")
-        if (st.st_dev, st.st_ino) != tuple(owner.lock_id) or not same_file(owner.fd, owner.lock_path):
+        if not same_file(owner.fd, owner.lock_path):
             raise LockError("replaced")
         rec = {"schema": SCHEMA, "adapter": adapter, "pid": owner.pid, "start": owner.start, "host": _host(),
                "install_id": owner.install_id, "lock": {"dev": owner.lock_id[0], "ino": owner.lock_id[1]},
@@ -689,11 +720,12 @@ def publish(owner: Owner, adapter: str) -> Published:
 
 
 def release(owner: Owner) -> Released:
-    """Remove the record only if it names this owner, then, under the module guard, unlock and close
-    (the root fd last) and only then mark released. Owner pid only."""
+    """Under the module guard: validate the handle, remove the record only if it names this owner,
+    unlock and close (the root fd last), and only then mark released. Owner pid only."""
     global _OWNER
     _check_owner(owner)
-    with owner.mutex:
+    with _GUARD:
+        _held_fds(owner)
         removed = False
         try:
             if same_file(owner.fd, owner.lock_path):
@@ -706,16 +738,15 @@ def release(owner: Owner) -> Released:
         except OSError:
             removed = False
         finally:
-            with _GUARD:
-                try:
-                    file_lock.unlock_fd(owner.fd)
-                finally:
-                    os.close(owner.fd)
-                    if owner.root_fd >= 0:
-                        os.close(owner.root_fd)
-                    owner.released = True
-                    if _OWNER is owner:
-                        _OWNER = None
+            try:
+                file_lock.unlock_fd(owner.fd)
+            finally:
+                os.close(owner.fd)
+                if owner.root_fd >= 0:
+                    os.close(owner.root_fd)
+                owner.released = True
+                if _OWNER is owner:
+                    _OWNER = None
         return Released(removed)
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A stub holder_lock caller for the first-act contract: acquire, publish, then act on the root.
 
-    holder_lock_stub.py --module src|vendored --work ROOT [--spawn-before-publish]
+    holder_lock_stub.py --module src|vendored --work ROOT [--spawn-before-publish] [--by-path]
 
 Prints one line: `acquired`, or the refusal's class and reason; exits 0, 3 on a refusal, 2 on a
 LockError. While holding it waits for stdin to close, then releases.
@@ -30,6 +30,7 @@ def main(argv=None):
     ap.add_argument("--module", choices=("src", "vendored"), required=True)
     ap.add_argument("--work", required=True)
     ap.add_argument("--spawn-before-publish", action="store_true")
+    ap.add_argument("--by-path", action="store_true", help="a faulty first act by pathname")
     args = ap.parse_args(argv)
     hl = load(args.module)
     try:
@@ -43,7 +44,10 @@ def main(argv=None):
     if args.spawn_before_publish:
         subprocess.run(["true"], check=True)
     hl.publish(result.owner, "stub")
-    os.makedirs(os.path.join(args.work, "state"), exist_ok=True)
+    if args.by_path:
+        os.makedirs(os.path.join(args.work, "state"), exist_ok=True)
+    else:
+        os.mkdir("state", 0o755, dir_fd=result.owner.root_fd)
     subprocess.run(["true"], check=True)
     print("acquired", flush=True)
     sys.stdin.read()

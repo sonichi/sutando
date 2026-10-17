@@ -845,7 +845,7 @@ class HolderLockTest(unittest.TestCase):
         result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(
             unittest.defaultTestLoader.loadTestsFromTestCase(self.stub_contract()))
         self.assertTrue(result.wasSuccessful(), [str(e[1])[-400:] for e in result.failures + result.errors])
-        self.assertEqual(result.testsRun, 5)
+        self.assertEqual(result.testsRun, 6)
 
     def test_the_first_act_contract_pins_publish_before_any_child_is_spawned(self):
         self.real_home()
@@ -853,6 +853,16 @@ class HolderLockTest(unittest.TestCase):
         result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(case)
         self.assertEqual(len(result.failures), 1, "a spawn before publish fails the contract")
         self.assertIn("before the record existed", result.failures[0][1])
+
+    def test_the_first_act_contract_pins_the_first_act_on_the_held_root(self):
+        """Review schedule: "Replacing the root after the final successful root check while driving that
+        committed stub produced: acquired | old_state False new_state True checks 2" -- add the
+        replacement schedule to the reusable contract, so a pathname first act fails it."""
+        self.real_home()
+        case = self.stub_contract("--by-path")("test_first_act_lands_on_the_held_root_when_the_path_is_replaced")
+        result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(case)
+        self.assertEqual(len(result.failures), 1, "a first act by pathname fails the contract")
+        self.assertIn("nothing on the new directory at the path", result.failures[0][1])
 
     def stub_contract(self, *extra):
         kind, mod = self.kind, self.hl
@@ -1356,6 +1366,154 @@ class HolderLockTest(unittest.TestCase):
         self.assertIn("cannot write the holder record", str(e.exception))
         self.assertFalse(owner.published)
         self.assertFalse((self.ldir() / "holder").exists())
+
+    # ── third code review ──
+
+    def pause_after_the_owner_check(self):
+        """The real owner check, then a pause in any thread but this one until `go` is set."""
+        checked, go, main = threading.Event(), threading.Event(), threading.current_thread()
+        real = self.hl._check_owner
+
+        def paused(owner):
+            real(owner)
+            if threading.current_thread() is not main:
+                checked.set()
+                go.wait(10)
+        patcher = mock.patch.object(self.hl, "_check_owner", paused)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return checked, go
+
+    def test_a_second_release_racing_the_first_never_touches_reused_descriptors(self):
+        """Review schedule: "I used a barrier immediately after the real check so two threads observed
+        released=False, then let one finish first ... I reopened /dev/null on the released owner's
+        numeric lock/root fds; the second release closed both unrelated descriptors"."""
+        owner = self.owned()
+        self.hl.publish(owner, "routine")
+        checked, go = self.pause_after_the_owner_check()
+        results = []
+
+        def second():
+            try:
+                results.append(self.hl.release(owner))
+            except self.hl.LockError as e:
+                results.append("LockError: %s" % e)
+        t = threading.Thread(target=second)
+        t.start()
+        self.assertTrue(checked.wait(10))
+        self.assertEqual(self.hl.release(owner), self.hl.Released(True))
+        lock_n, root_n = owner.fd, owner.root_fd
+        null = os.open(os.devnull, os.O_RDONLY)
+        for n in (lock_n, root_n):
+            if n != null:
+                os.dup2(null, n)
+        if null not in (lock_n, root_n):
+            os.close(null)
+        def close_quietly():
+            for n in (lock_n, root_n):
+                with contextlib.suppress(OSError):
+                    os.close(n)
+        self.addCleanup(close_quietly)
+        go.set()
+        t.join(10)
+        self.assertEqual(results, ["LockError: released"])
+        os.fstat(lock_n)
+        os.fstat(root_n)
+
+    def test_a_released_handle_cannot_publish_over_its_replacements_record(self):
+        """Review schedule: "release completed, a replacement owner naturally reused the fd numbers
+        and published adapter=new, then the old released handle successfully overwrote that committed
+        record with adapter=stale"."""
+        old = self.owned()
+        checked, go = self.pause_after_the_owner_check()
+        results = []
+
+        def stale():
+            try:
+                results.append(self.hl.publish(old, "stale"))
+            except self.hl.LockError as e:
+                results.append("LockError: %s" % e)
+        t = threading.Thread(target=stale)
+        t.start()
+        self.assertTrue(checked.wait(10))
+        self.hl.release(old)
+        new = self.owned()
+        if old.fd not in (new.fd, new.root_fd):
+            os.dup2(new.fd, old.fd)
+
+            def close_alias():
+                with contextlib.suppress(OSError):
+                    os.close(old.fd)
+            self.addCleanup(close_alias)
+        self.hl.publish(new, "new")
+        go.set()
+        t.join(10)
+        self.assertEqual(results, ["LockError: released"])
+        self.assertEqual(self.hl.read_holder(str(self.root)).record["adapter"], "new")
+
+    def test_a_symlinked_ancestor_pointing_inside_the_root_is_refused(self):
+        """Review schedule: "With the service home's .local symlinked to <root>/descendant, both modules
+        returned Acquired and created the lock tree physically under the work root"."""
+        root = self.tmp / "r"
+        (root / "descendant").mkdir(parents=True)
+        home = self.tmp / "h"
+        home.mkdir()
+        os.symlink(root / "descendant", home / ".local")
+        with mock.patch.object(self.hl, "_home", lambda: str(home)):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.acquire(root)
+        self.assertEqual(str(e.exception), "work root contains the lock directory")
+        self.assertEqual(os.listdir(root / "descendant"), [], "nothing created under the root")
+        os.unlink(home / ".local")
+        os.symlink(root, home / ".local")
+        with mock.patch.object(self.hl, "_home", lambda: str(home)), self.assertRaises(self.hl.LockError):
+            self.acquire(root)
+
+    def test_a_contended_result_reports_the_record_of_the_lock_it_contended_on(self):
+        """Review schedule: "Replacing the root at that seam produced, for both modules:
+        result=Contended holder=Missing old_record=Valid"."""
+        self.root.mkdir()
+        pid, start = self.proc()
+        data = self.put(self.record(pid, start))
+        real = self.hl.file_lock.try_lock_fd
+
+        def replace_then_lock(fd):
+            os.rename(self.root, self.tmp / "moved")
+            self.root.mkdir()
+            return real(fd)
+        with self.flock_elsewhere(), mock.patch.object(self.hl.file_lock, "try_lock_fd", replace_then_lock):
+            r = self.acquire()
+        self.assertEqual(r, self.hl.Contended(self.hl.Valid(json.loads(data))))
+
+    def test_containment_edges_and_a_handle_whose_fd_is_no_longer_the_lock(self):
+        self.assertTrue(self.hl._within(str(self.tmp / "anything"), os.stat(os.sep)), "the root is /")
+        (self.tmp / "real").mkdir()
+        os.symlink(self.tmp / "real", self.tmp / "link")
+        with mock.patch.object(self.hl.os.path, "realpath", lambda p: p):
+            self.assertTrue(self.hl._within(str(self.tmp / "link" / "x"), os.stat(self.tmp / "real")),
+                            "a component that is a link when walked counts as inside")
+        owner = self.owned()
+        null = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(null, owner.fd)
+        os.close(null)
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.publish(owner, "routine")
+        self.assertEqual(str(e.exception), "released", "a handle whose fd is not the lock never writes")
+        owner.released, self.hl._OWNER = True, None
+        os.close(owner.fd)
+        os.close(owner.root_fd)
+
+    def test_a_failed_cleanup_leaves_a_temp_that_the_next_publish_removes(self):
+        owner = self.owned()
+        with mock.patch.object(self.hl.os, "replace", side_effect=OSError(5, "I/O error")), \
+                mock.patch.object(self.hl.os, "unlink", side_effect=OSError(1, "not permitted")):
+            with self.assertRaises(self.hl.LockError):
+                self.hl.publish(owner, "routine")
+        self.assertFalse((self.ldir() / "holder").exists(), "nothing published")
+        self.assertEqual(len([n for n in os.listdir(self.ldir()) if n.startswith(".holder.")]), 1,
+                         "the stated residual: one temp")
+        self.hl.publish(owner, "routine")
+        self.assertEqual([n for n in os.listdir(self.ldir()) if n.startswith(".holder.")], [])
 
     def test_every_case_runs_against_the_source_and_the_vendored_copy(self):
         self.assertIsNot(SRC, VENDORED)

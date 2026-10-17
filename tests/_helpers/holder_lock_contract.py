@@ -4,11 +4,14 @@ A consumer subclasses it with unittest.TestCase and supplies `caller(root, *extr
 (a Python script and its arguments) that starts the caller on a work root and keeps it holding
 until its stdin closes, printing `acquired` once it holds. `module` is the holder_lock module the
 caller uses. The mixin drives contention, no-trace, a missing root, a replaced lock file, a live
-legacy pidfile, and publish-before-spawn (no child process before the record exists; `ps` is
-exempt). Every wait is bounded.
+legacy pidfile, publish-before-spawn (no child process before the record exists; `ps` is exempt),
+and a root replaced right after Acquired (the caller's first act must land in the original inode,
+through owner.root_fd, never on the new directory at the path). Every wait is bounded.
 
 Run as a script, this file is the spawn guard: `holder_lock_contract.py guard <report> <root>
-<module kind> <script> [args...]` runs the script with every child spawn checked.
+<module kind> <script> [args...]` runs the script with every child spawn checked; `... replace
+<moved> <root> <module kind> <script> [args...]` runs it with the root renamed to <moved> and a new
+directory put at <root> right after Acquired.
 """
 import os
 import runpy
@@ -138,8 +141,22 @@ class FirstActContract:
                          "a child was spawned before the record existed")
 
 
-def _guard(report, root, kind, script, args):
-    """Run `script` with every child spawn recorded as before- or after-publish."""
+    def test_first_act_lands_on_the_held_root_when_the_path_is_replaced(self):
+        root = self._fa_root()
+        moved = os.path.join(self._fa_tmp, "moved")
+
+        def drop_moved():
+            if os.path.isdir(moved):
+                shutil.rmtree(self.module.lock_dir(moved), True)
+        self.addCleanup(drop_moved)
+        script, *args = self.caller(root)
+        holder = self._fa_start([str(HERE), "replace", moved, root, self.module_kind, script] + args)
+        self.assertEqual(self._fa_line(holder), "acquired")
+        self.assertEqual(os.listdir(root), [], "nothing on the new directory at the path")
+        self.assertTrue(os.listdir(moved), "the first act landed in the original inode")
+
+
+def _load(kind):
     repo = HERE.parents[2]
     if kind == "src":
         sys.path.insert(0, str(repo / "src"))
@@ -147,6 +164,28 @@ def _guard(report, root, kind, script, args):
     else:
         sys.path.insert(0, str(repo / "packages" / "ag2-sparrow"))
         from ag2_sparrow import holder_lock as hl
+    return hl
+
+
+def _replace(moved, root, kind, script, args):
+    """Run `script` with its root renamed away and a new directory put at the path after Acquired."""
+    hl = _load(kind)
+    real = hl.acquire
+
+    def acquire_then_replace(*a, **k):
+        got = real(*a, **k)
+        if isinstance(got, hl.Acquired):
+            os.rename(root, moved)
+            os.mkdir(root)
+        return got
+    hl.acquire = acquire_then_replace
+    sys.argv = [script] + list(args)
+    runpy.run_path(script, run_name="__main__")
+
+
+def _guard(report, root, kind, script, args):
+    """Run `script` with every child spawn recorded as before- or after-publish."""
+    hl = _load(kind)
 
     def note(argv):
         name = os.path.basename(str(argv[0] if isinstance(argv, (list, tuple)) else argv).split()[0])
@@ -170,8 +209,9 @@ def _guard(report, root, kind, script, args):
     runpy.run_path(script, run_name="__main__")
 
 
-if __name__ == "__main__" and len(sys.argv) > 5 and sys.argv[1] == "guard":
+if __name__ == "__main__" and len(sys.argv) > 5 and sys.argv[1] in ("guard", "replace"):
     try:
-        _guard(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:])
+        (_guard if sys.argv[1] == "guard" else _replace)(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
+                                                          sys.argv[6:])
     except SystemExit as e:
         sys.exit(e.code)
