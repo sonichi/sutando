@@ -318,7 +318,7 @@ from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
                             RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
-from .delivery_core import REFUSED_FOR_GOOD
+from .delivery_core import is_refused_for_good
 from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_response_refused
 from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
                                               RESULT_THREAD_FIELD)
@@ -3585,6 +3585,9 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
         if _HELD_UNRESOLVED:
             # Staged relay asks the bridge can neither publish nor clear without a person.
             payload["ack_first_unresolved"] = sorted(_one_line(t)[:128] for t in _HELD_UNRESOLVED)[:20]
+        retrying = _relay_results_retrying(time.time())
+        if retrying:
+            payload["relay_results_retrying"] = retrying
         # Recovery surface: recovered ONLY via the probe-success terminal; a
         # missing block means "no episode known", never success.
         if _reenroll_state.get("code"):
@@ -4491,7 +4494,7 @@ def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
         resumed = (record.get("status") in ("READY", "QUEUED")
                    and record.get("requeue_reason") == _RELAY_RECLAIMED)
         target = RESULTS_DIR / f"{local}.txt"
-        if parked and record.get("reason") == REFUSED_FOR_GOOD:
+        if parked and is_refused_for_good(record.get("reason")):
             _finish_relay_end(core, broker_id, local, record, inflight)
             continue
         if not (parked or resumed) or os.path.lexists(target):
@@ -4528,7 +4531,8 @@ def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
 
 # The served task behind each staged `ack_first` task, for the publish that follows its ack.
 _HELD_TASKS: "dict[str, tuple[dict, str, str]]" = {}
-# Entries this process already logged as unresolved, so a stuck entry logs once.
+# Entries this process logged as malformed or with their staged file gone: each is reported once
+# per process, by intent. Never cleared: it grows with those error cases only, not with traffic.
 _HELD_REPORTED: "set[str]" = set()
 # Entries the last pass could neither publish nor clear, reported in the gateway status.
 _HELD_UNRESOLVED: "set[str]" = set()
@@ -4780,7 +4784,7 @@ def _staged_policy_tier(staged: Path) -> "tuple[str, str] | None":
     try:
         text = staged.read_text(encoding="utf-8", errors="replace")
         headers = local_task_protocol.parse_task_headers_trusted(text).headers
-    except Exception:  # noqa: BLE001 — unprovable, so withheld by the caller, never published
+    except Exception:  # noqa: BLE001 - unprovable, so withheld by the caller, never published
         return None
     frozen = local_task_protocol.canonical_access_tier(headers.get("access_tier"))
     if frozen not in _TIER_RANK:
@@ -4848,7 +4852,10 @@ def _end_withdrawn_relay_ask(tid: str, entry: dict, staged: Path, inflight: "set
     and no outcome would ever be posted. Once its local access has stayed withdrawn past the
     threshold, it is ended: the decision recorded in its entry, the relay `failed` result
     sent with no ceiling, then the staged file, the in-flight id and the entry retired, the
-    mark last, each step resumed by the next pass after a crash. It is never published."""
+    mark last, each step resumed by the next pass after a crash. It is never published.
+    A mark that cannot be retired here is retired by the next start because
+    `_put_held(tid, None)` has already removed the entry: `_retire_delivered_marks` keeps
+    a mark an entry names."""
     if entry.get("ending") is not True:
         dropped = _withdrawn_for_good(staged)
         if dropped is None:
@@ -4887,7 +4894,7 @@ def _relay_failed_sent(broker_id: str) -> bool:
     if record.get("status") not in ("DELIVERED", "PARKED"):
         core.deliver_one(broker_id, payload)
         record = read_item(core.backend.root, broker_id) or {}
-    if record.get("status") == "DELIVERED" or record.get("reason") == REFUSED_FOR_GOOD:
+    if record.get("status") == "DELIVERED" or is_refused_for_good(record.get("reason")):
         return True
     if record.get("status") == "PARKED":           # a park the relay rule could not prevent
         requeue_item_with_epoch(core.backend.root, broker_id, reset_attempts=True,
@@ -5681,6 +5688,28 @@ _RELAY_RETRY = RetrySchedule(window_s=100 * 365 * 86400.0)
 # Why a relay ask's parked result was requeued: by the drain, or at start after a downgrade.
 _RELAY_REOPENED = "relay result: retried until the broker accepts it"
 _RELAY_RECLAIMED = "relay result an older bridge parked: reclaimed at start"
+# A relay result not accepted this long after its first send is reported in the gateway status,
+# and still retried: the window after which every other result parks.
+RELAY_RESULTS_RETRYING_AFTER_S = 600
+
+
+def _relay_results_retrying(now: float) -> "dict | None":
+    """How many relay results the broker has not accepted `RELAY_RESULTS_RETRYING_AFTER_S` or
+    more after their first send, and the oldest one's age in seconds; None when none has.
+    Read from the kept marks and their outbox records; a record that cannot be read is skipped."""
+    root = _delivery_core("relay").backend.root
+    ages = []
+    for broker_id in filter(_valid_tid, _load_ack_first() or {}):
+        try:
+            record = read_item(root, broker_id) or {}
+        except (OSError, ValueError):
+            continue
+        retry = record.get("retry") if isinstance(record, dict) else None
+        started = retry.get("started_at") if isinstance(retry, dict) else None
+        if (isinstance(started, (int, float)) and record.get("status") not in ("DELIVERED", "PARKED")
+                and now - started >= RELAY_RESULTS_RETRYING_AFTER_S):
+            ages.append(now - started)
+    return {"count": len(ages), "oldest_age_s": int(max(ages))} if ages else None
 
 
 def _failed_in_place_of(stored: str) -> "str | None":
@@ -6289,7 +6318,7 @@ def _reopen_relay_result(core, item_id: str, tid: str, record: dict, result_file
     the broker refusing the `failed` too, is never reopened: see `_end_relay_result`."""
     if record.get("status") != "PARKED":
         return
-    if record.get("reason") == REFUSED_FOR_GOOD:
+    if is_refused_for_good(record.get("reason")):
         _end_relay_result(core, item_id, tid, record, result_file, generation)
         return
     outcome, _ = requeue_item_with_epoch(core.backend.root, item_id, reset_attempts=True,
@@ -6305,7 +6334,7 @@ def _end_relay_result(core, item_id: str, tid: str, record: dict, result_file, g
     steps leaves the mark for start-up to finish the end by (`_finish_relay_end`)."""
     _dispose_terminal(core, item_id, tid, record, result_file, generation)
     _log(f"ERROR result {tid}: the broker refused the answer and the `failed` sent in its place "
-         f"for good ({REFUSED_FOR_GOOD}); it is quarantined and not retried")
+         f"for good ({record.get('reason')}); it is quarantined and not retried")
 
 
 def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None" = None) -> bool:
@@ -6318,7 +6347,7 @@ def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None"
     record = read_item(root, item_id) or {}
     if record.get("status") == "DELIVERED":
         return _settle_task(tid, inflight)
-    if record.get("status") != "PARKED" or record.get("reason") != REFUSED_FOR_GOOD:
+    if record.get("status") != "PARKED" or not is_refused_for_good(record.get("reason")):
         return False
     # A relay result's end: its task and in-flight id retired on disk, the mark last.
     settled = _settle_task(tid, inflight)

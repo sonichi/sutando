@@ -493,18 +493,28 @@ class CorePolicy(unittest.TestCase):
                          "the replacement did not get an idempotency key of its own")
 
     def test_a_refused_replacement_or_none_to_offer_parks_as_refused_for_good(self):
-        from ag2_sparrow.delivery_core import REFUSED_FOR_GOOD
         refusal = ProviderPermanentRefused("HTTP 400")
         # A hook that always has another replacement: still only one is ever tried.
         sent, record, _keys = self.replaced(lambda stored: stored + "'", [refusal, refusal, refusal])
         self.assertEqual(sent, [b"x", b"x'"], "a refused replacement was replaced again")
+        # The refusal's own reason is kept after the prefix.
         self.assertEqual((record["status"], record["reason"], record["payload"]),
-                         ("PARKED", REFUSED_FOR_GOOD, "x'"))
+                         ("PARKED", "refused-for-good:permanent-refusal", "x'"))
         sent, record, _keys = self.replaced(lambda stored: None, [refusal])
         self.assertEqual(sent, [b"x"])
         self.assertEqual((record["status"], record["reason"], record["payload"]),
-                         ("PARKED", REFUSED_FOR_GOOD, "x"))
+                         ("PARKED", "refused-for-good:permanent-refusal", "x"))
         self.assertNotIn("refused_payload", record)
+
+    def test_a_refused_for_good_reason_is_matched_with_or_without_the_refusals_reason(self):
+        from ag2_sparrow.delivery_core import REFUSED_FOR_GOOD, is_refused_for_good, refused_for_good
+        self.assertEqual(refused_for_good("HTTP 400"), "refused-for-good:HTTP 400")
+        self.assertEqual((refused_for_good(None), refused_for_good("")), (REFUSED_FOR_GOOD,) * 2)
+        # The bare prefix is what an earlier build parked with.
+        for reason in (REFUSED_FOR_GOOD, "refused-for-good:permanent-refusal"):
+            self.assertTrue(is_refused_for_good(reason), reason)
+        for reason in (None, "", 7, "permanent-refusal", "refused-for-goodness", "x:refused-for-good"):
+            self.assertFalse(is_refused_for_good(reason), reason)
 
     def test_programming_error_propagates(self):
         """Owner review finding 5, the other half: a bare Exception is a

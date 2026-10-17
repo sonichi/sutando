@@ -13,9 +13,20 @@ from .contract import (BackendCapabilities, ClaimToken, CleanupReport,
                        DeliveryOutcome, RecoverReport)
 
 
-# The park reason under `replace_refused` once no replacement is left: the refused payload
-# was itself the replacement, or the hook had none for it.
+# The park reason's prefix under `replace_refused` once no replacement is left (the refused
+# payload was itself one, or the hook had none for it); match it with is_refused_for_good().
 REFUSED_FOR_GOOD = "refused-for-good"
+
+
+def refused_for_good(terminal_reason: Optional[str]) -> str:
+    """The park reason for a refusal for good, the refusal's own reason kept after a colon."""
+    return f"{REFUSED_FOR_GOOD}:{terminal_reason}" if terminal_reason else REFUSED_FOR_GOOD
+
+
+def is_refused_for_good(reason: object) -> bool:
+    """Whether a park reason is a refusal for good, with or without the refusal's reason."""
+    return isinstance(reason, str) and (reason == REFUSED_FOR_GOOD
+                                        or reason.startswith(f"{REFUSED_FOR_GOOD}:"))
 
 
 class DesignAClaimBackend:
@@ -38,7 +49,7 @@ class DesignAClaimBackend:
         self.clock = clock
         self.republish_delivered = republish_delivered
         # Opt-in: a payload refused for good is replaced once by `replace_refused(stored)` and
-        # retried as any failure is; with no replacement left it parks as REFUSED_FOR_GOOD.
+        # retried as any failure is; with no replacement left it parks as `refused_for_good()`.
         self.replace_refused = replace_refused
 
     def publish(self, item_id: str, payload: bytes, *,
@@ -151,8 +162,8 @@ class DesignAClaimBackend:
             elif terminal_reason and (self.replace_refused is None
                                       or not self._replace_refused_locked(item_id)):
                 outbox.note_attempt(self.root, item_id)
-                outbox.park_item(self.root, item_id,
-                                 terminal_reason if self.replace_refused is None else REFUSED_FOR_GOOD)
+                outbox.park_item(self.root, item_id, terminal_reason if self.replace_refused is None
+                                 else refused_for_good(terminal_reason))
             else:
                 if self.retry_schedule is not None:
                     outbox.retry_failed_locked(self.root, item_id, self.clock())
