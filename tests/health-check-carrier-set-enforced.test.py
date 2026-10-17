@@ -126,6 +126,33 @@ class CarrierSetProbe(unittest.TestCase):
         self.assertIsNotNone(r)
         self.assertEqual(r["status"], "ok", f"carve-out read as data loss: {r['detail']}")
 
+    def test_the_reserved_snapshot_temp_is_a_deliberate_deny_not_data_loss(self):
+        # The generator hard-denies `hosts/*/build_log.md.snap.??????`; the probe
+        # mirrors that set, so a rule missing here reads a crash temp as loss.
+        ws = _mkworkspace(self.tmp, ["hosts/", "hosts/**"],
+                          ["hosts/h/pending-questions.md",
+                           "hosts/h/build_log.md.snap.AB12cd"],
+                          extra_lines=["hosts/*/build_log.md.snap.??????"])
+        self._patch_resolved(["hosts/"], exclude=[])
+        self._patch_shipped(["hosts/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "ok",
+                         f"reserved snapshot temp read as data loss: {r['detail']}")
+
+    def test_control_a_genuinely_dropped_host_file_still_fails(self):
+        # Without this the test above passes just as well on a probe that can no
+        # longer condemn anything; the deny must be narrow, not blanket.
+        ws = _mkworkspace(self.tmp, ["hosts/", "hosts/**"],
+                          ["hosts/h/pending-questions.md", "hosts/h/notes.md"],
+                          extra_lines=["hosts/h/notes.md"])
+        self._patch_resolved(["hosts/"], exclude=[])
+        self._patch_shipped(["hosts/"])
+        r = self.hc.check_carrier_set_enforced(workspace_dir=ws)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["status"], "fail",
+                         f"probe can no longer see a real drop: {r['detail']}")
+
     def test_a_carve_out_DIRECTORY_does_not_condemn_the_entry(self):
         # `data/` emits `data/` AND `data/**` — the shape that condemned
         # `hosts/` on the reporting host via `hosts/<h>/data/*.jsonl`.
