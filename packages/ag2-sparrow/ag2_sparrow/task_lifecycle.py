@@ -124,12 +124,19 @@ def write_durable(path, data):
 
 
 def append_durable(path, line):
+    """Append all of `line` (a short write continues where it stopped), fsync, and fsync the
+    directory when this call created the file."""
+    created = not os.path.exists(path)
     fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o644)
     try:
-        os.write(fd, line.encode("utf-8"))
+        data = line.encode("utf-8")
+        while data:
+            data = data[os.write(fd, data):]
         os.fsync(fd)
     finally:
         os.close(fd)
+    if created:
+        fsync_dir(os.path.dirname(str(path)) or ".")
 
 
 def _lstat(path):

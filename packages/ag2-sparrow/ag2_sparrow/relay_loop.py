@@ -199,6 +199,7 @@ class RelayLoop:
         record_done(self.done_path, name[:-4])
         publish(staged, os.path.join(self.args.results, name))
         self._settled(name, seen)
+        return True
 
     def settle(self, name, body, seen):
         """finish() unless some generation of this task's result already exists; then only done."""
@@ -224,14 +225,14 @@ class RelayLoop:
             seen.add(name[:-4])
             return None
 
-    def admit(self, name, headers, seen):
-        """False, with the refusal written, for a non-owner tier unless --allow-non-owner is set."""
+    def refusal(self, name, headers, seen):
+        """None when the task may be served. For a non-owner tier without --allow-non-owner the refusal
+        is finished and its step result returned: True when published, False when parked."""
         tier = headers.get("access_tier") or "guest"
         if tier == "owner" or self.args.allow_non_owner:
-            return True
+            return None
         log("refused (non-owner, --allow-non-owner not set) ->", name[:-4], tier)
-        self.finish(name, NON_OWNER_REFUSED, seen)
-        return False
+        return self.finish(name, NON_OWNER_REFUSED, seen)
 
     def schedule_retry(self, task_id, detail, at_least=0.0):
         """True when the task gets another try (after backoff); False once retries are spent."""

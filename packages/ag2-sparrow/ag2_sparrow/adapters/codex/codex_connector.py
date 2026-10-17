@@ -26,6 +26,7 @@ import threading
 import time
 import uuid
 
+from ...relay_loop import count_arg
 from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, LockRefused, acquire_lock, attested_headers,  # noqa: F401
                         exit_on_sigterm, load_done, make_dirs, non_owner_note, parse_task, pid_alive,
                         exit_code, record_done, release_lock, root_path, stop_requested, write_atomic)
@@ -455,7 +456,7 @@ def build_parser():
                     help="resume THREAD for exactly this owner channel when it has no saved thread yet")
     ap.add_argument("--ephemeral", action="store_true", help="owner threads too: do not persist to the Codex home")
     ap.add_argument("--developer-instructions", default=None)
-    ap.add_argument("--once", type=int, default=0, help="exit after N tasks")
+    ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)
     ap.add_argument("--turn-timeout", type=float, default=600)

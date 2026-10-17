@@ -193,8 +193,9 @@ class Adapter(RelayLoop):
             return True
         headers, message, operator_lines = task
         owner = headers.get("access_tier") == "owner"
-        if not self.admit(name, headers, seen):
-            return True
+        refused = self.refusal(name, headers, seen)
+        if refused is not None:
+            return refused
         room, text = build_text(task_id, headers, message, operator_lines, self.note, self.args.owner_dm)
         if not room:
             log("no room ->", task_id)

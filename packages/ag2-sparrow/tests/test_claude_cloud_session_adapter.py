@@ -672,6 +672,31 @@ class StepBranchTest(unittest.TestCase):
         with mock.patch.object(self.ad.lc, "complete_without_call", return_value="parked"), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertFalse(self.ad.step("task-a.txt", self.seen))
+        self.assertEqual(self.ad.not_before["task-a"], self.ad.clock() + sa.PARK_SECONDS)
+        self.assertNotIn("task-a", self.seen)
+
+    def test_a_parked_non_owner_refusal_is_not_done_and_the_task_stays_pending(self):
+        from ag2_sparrow import task_io
+        write_task(self.work, "task-g", "hi", tier="guest")
+        self.ad.args.once = 1
+        sleeps = []
+
+        def sleep(s):
+            sleeps.append(s)
+            task_io._STOP[0] = signal_number
+        signal_number = 15
+        self.addCleanup(task_io._STOP.__setitem__, 0, 0)
+        self.ad.sleep = sleep
+        err = io.StringIO()
+        with mock.patch.object(sa.task_lifecycle.Lifecycle, "complete_without_call", return_value="parked"), \
+                contextlib.redirect_stderr(err):
+            self.ad.serve()
+        self.assertTrue(sleeps, "once=1 did not end the loop: the parked refusal was not counted done")
+        self.assertEqual(self.ad.pending(set()), ["task-g.txt"])
+        self.assertFalse((self.work / "results" / "task-g.txt").exists())
+        self.assertIn("task-g", self.ad.not_before)
+        self.assertIn("parked -> task-g publication", err.getvalue())
+        self.assertEqual(self.fake.calls(), [])
 
     def test_an_existing_result_settles_and_an_undecided_one_parks(self):
         write_task(self.work, "task-a", "hi")

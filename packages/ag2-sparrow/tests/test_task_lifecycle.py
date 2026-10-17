@@ -926,7 +926,7 @@ class PublicationTest(Base):
             life.record_outcome("task-a", "queued", "[no-send]\n")
             life.publish_and_settle("task-a")
         claim = ["fsync <temp>", "replace claim.json", "dir task-a"]
-        prepared_and_reserved = ["dir claims"] + claim + ["fsync rate.jsonl"]
+        prepared_and_reserved = ["dir claims"] + claim + ["fsync rate.jsonl", "dir state"]
         stage = ["fsync <temp>", "replace body", "dir task-a"]
         confirmed_and_queued = claim + ["fsync rate.jsonl"]
         publication = ["fsync <temp>", "replace .task-a.txt.publish.1", "dir results", "final task-a.txt",
@@ -1242,6 +1242,29 @@ class JournalTest(Base):
         self.assertEqual(j.times(), [now - 10])
         self.assertEqual(j.wait_seconds(1), 3590)
         self.assertEqual(j.wait_seconds(2), 0)
+
+    def test_a_short_write_still_leaves_a_whole_record_that_survives_restart(self):
+        j = self.journal()
+        real, shorts = os.write, []
+
+        def short(fd, data):
+            if not shorts:
+                shorts.append(len(data))
+                return real(fd, data[:len(data) - 1])
+            return real(fd, data)
+        with mock.patch.object(self.lc.os, "write", short):
+            j.append("task-a", 1, "queued", self.clock.t)
+        self.assertEqual(len(shorts), 1, "the first write was cut short")
+        raw = (self.work / "state" / "rate.jsonl").read_bytes()
+        self.assertTrue(raw.endswith(b"\n"), "the record is complete")
+        self.assertTrue(self.journal().charged("task-a", 1), "the charge survives a restart")
+
+    def test_the_first_journal_entry_syncs_the_directory_that_holds_it(self):
+        j = self.journal()
+        with mock.patch.object(self.lc, "fsync_dir") as sync:
+            j.append("task-a", 1, "queued", self.clock.t)
+            j.append("task-a", 2, "queued", self.clock.t)
+        sync.assert_called_once_with(str(self.work / "state"))
 
     def test_the_event_id_on_disk_is_task_attempt_kind(self):
         j = self.journal()
@@ -1962,9 +1985,15 @@ class ErrorBranchTest(Base):
     def test_a_claim_that_names_another_task_is_unreadable(self):
         store = self.lc.ClaimStore(self.work / "claims")
         (self.work / "claims" / "task-a").mkdir(parents=True)
-        (self.work / "claims" / "task-a" / "claim.json").write_text("[]")
+        claim = self.work / "claims" / "task-a" / "claim.json"
+        claim.write_text("[]")
         with self.assertRaises(self.lc.ClaimUnreadable):
             store.load("task-a")
+        claim.write_text('{"task_id": "task-b", "phase": "prepared"}')
+        with self.assertRaises(self.lc.ClaimUnreadable):
+            store.load("task-a")
+        claim.write_text('{"task_id": "task-a", "phase": "prepared"}')
+        self.assertEqual(store.load("task-a")["phase"], "prepared")
 
     def test_the_stage_reports_io_errors_and_tolerates_absence(self):
         store = self.lc.ClaimStore(self.work / "claims")

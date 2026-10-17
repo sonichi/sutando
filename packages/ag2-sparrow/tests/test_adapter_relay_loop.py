@@ -106,10 +106,10 @@ class LimiterTest(unittest.TestCase):
 
 
     def test_a_negative_once_is_refused_at_parsing(self):
-        for build in (sa.build_parser, ra.build_parser):
-            parser = build()
+        for build, need in ((sa.build_parser, ["--session-id", "session_x"]), (ra.build_parser, ["--trigger-id", "trig_x"]),
+                            (cc.build_parser, ["--server", "stub"])):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                parser.parse_args(["--work", "w", "--once", "-1"] + (["--session-id", "session_x"] if build is sa.build_parser else ["--trigger-id", "trig_x"]))
+                build().parse_args(["--work", "w", "--once", "-1"] + need)
         self.assertEqual(rl.count_arg("0"), 0)
         self.assertEqual(rl.count_arg("3"), 3)
 
@@ -219,14 +219,14 @@ class LoopTest(unittest.TestCase):
                 write_task(loop.args.inbox, "task-g", "normal", 100, tier="guest")
                 headers, message, _ = loop.read_task("task-g.txt", seen)
                 self.assertEqual((headers["access_tier"], message), ("guest", "hi"))
-                self.assertFalse(loop.admit("task-g.txt", headers, seen))
+                self.assertTrue(loop.refusal("task-g.txt", headers, seen))
                 self.assertEqual((Path(loop.args.results) / "task-g.txt").read_text(), rl.NON_OWNER_REFUSED)
-                self.assertTrue(loop.admit("task-o.txt", {"access_tier": "owner"}, seen))
+                self.assertIsNone(loop.refusal("task-o.txt", {"access_tier": "owner"}, seen))
                 self.assertTrue(loop.schedule_retry("task-r", "x"))
                 self.assertEqual(loop.not_before["task-r"], 1002.0)
                 self.assertFalse(loop.schedule_retry("task-r", "x"), "max_retries is 1")
             loop.args.allow_non_owner = True
-            self.assertTrue(loop.admit("task-t.txt", {"access_tier": "team"}, seen))
+            self.assertIsNone(loop.refusal("task-t.txt", {"access_tier": "team"}, seen))
             self.assertEqual(Path(loop.done_path).read_text(), "task-g\n")
             with self.assertRaises(NotImplementedError):
                 loop.step("task-x.txt", seen)
@@ -247,7 +247,7 @@ class LoopTest(unittest.TestCase):
 
 class DelegationTest(unittest.TestCase):
     def test_both_adapters_delegate_to_the_shared_loop(self):
-        shared = ("pending", "serve", "read_task", "admit", "schedule_retry")
+        shared = ("pending", "serve", "read_task", "refusal", "schedule_retry")
         for mod, inherited in ((ra, shared + ("finish", "next_ready")), (sa, shared)):
             self.assertTrue(issubclass(mod.Adapter, rl.RelayLoop), mod)
             for name in inherited:

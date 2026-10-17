@@ -243,7 +243,7 @@ def clear_attributed_pidfile(owner, root):
     m = re.fullmatch(rb"([1-9][0-9]{0,9})\n?", data)
     started = _started_at()
     if m and stat.S_ISREG(st.st_mode) and not pid_alive(int(m.group(1))) \
-            and started is not None and int(st.st_mtime) < started:
+            and started is not None and st.st_mtime < started:
         try:
             os.unlink(rel, dir_fd=owner.root_fd)
         except OSError as e:
@@ -254,8 +254,9 @@ def clear_attributed_pidfile(owner, root):
 
 
 # Our own start is the wall clock at import: exact, no child process, and immune to the
-# second-level rounding of a ps/boot-time derived start on Linux.
-_PROCESS_STARTED_AT = int(time.time())
+# second-level rounding of a ps/boot-time derived start on Linux. Kept as a float: a pidfile
+# written a millisecond before the start is still before it.
+_PROCESS_STARTED_AT = time.time()
 
 
 def _started_at():

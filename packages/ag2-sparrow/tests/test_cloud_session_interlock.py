@@ -563,6 +563,12 @@ class TaskIoBranchTest(unittest.TestCase):
             write(text)
             self.assertIn("not a dead adapter's pidfile", task_io.clear_attributed_pidfile(owner, str(self.work)))
             self.assertTrue(pidfile.exists())
+        for delta, removed in ((-0.001, True), (0.001, False)):
+            write("%d\n" % dead.pid)
+            at = task_io._started_at() + delta
+            os.utime(pidfile, (at, at))
+            got = task_io.clear_attributed_pidfile(owner, str(self.work))
+            self.assertEqual((got is None, pidfile.exists()), (removed, not removed), "mtime start%+.3f" % delta)
         write("%d\n" % dead.pid)
         os.utime(pidfile, None)
         self.assertIn("not a dead adapter's pidfile", task_io.clear_attributed_pidfile(owner, str(self.work)),

@@ -108,8 +108,9 @@ class Adapter(RelayLoop):
         if task is None:
             return True
         headers, message, operator_lines = task
-        if not self.admit(name, headers, seen):
-            return True
+        refused = self.refusal(name, headers, seen)
+        if refused is not None:
+            return refused
         room, text = build_payload(task_id, headers, message, operator_lines, self.note)
         if not room:
             log("no room ->", task_id)
