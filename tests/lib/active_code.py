@@ -73,10 +73,13 @@ def active_text(text: str) -> str:
 import re
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# An optional fd digit plus `<`/`>` -- matches a redirect operator's own
+# leading text, glued to its target (`2>/dev/null`) or not (`2>`, `>`).
+_REDIR_TOKEN_RE = re.compile(r"^[0-9]*[<>]")
 
 
 def _command_tokens(seg: str) -> list[str]:
-    """`seg`'s tokens with a leading env/VAR=/`!` prefix peeled off.
+    """`seg`'s tokens with a leading env/VAR=/`!`/`{` prefix peeled off.
 
     `FOO=1 cmd` runs `cmd`; `BAD-NAME=1 cmd` is not a valid assignment (a
     hyphen can't start a shell identifier), so bash tries to RUN it and
@@ -88,9 +91,21 @@ def _command_tokens(seg: str) -> list[str]:
     `'!' cmd`, `\\! cmd`, `env ! cmd` and `X=1 ! cmd` all try to RUN a
     program literally named `!` and fail with 127 on both Bash 3.2 and 5.2
     (keweichen round 15) -- shlex already erased the quoting/escaping by the
-    time tokens exist, so this checks the untokenized text first."""
+    time tokens exist, so this checks the untokenized text first. Same rule
+    for a leading bare `{` (a command-GROUP opener, e.g. `;{ helper; }`) --
+    round 34 follow-up: `{ bash helper` tokenized as calling "{", never
+    "bash" -- but round 35, kewei-red-ag2space: a QUOTED/ESCAPED `'{'`/`\\{`
+    is a real Bash attempt to run a program literally named `{` (rc 127),
+    since shlex resolves both to the identical bare token `{` the first
+    fix could not tell apart from the reserved word."""
     stripped = seg.lstrip()
     leading_bang = stripped == "!" or stripped[:2] in ("! ", "!\t")
+    # `!` is peeled first (below); the opener check looks PAST it too,
+    # or `! { helper; }` -- which really runs helper -- goes unrecognized.
+    after_bang = stripped[1:].lstrip() if leading_bang else stripped
+    # A redirect glued straight onto `{` (`{>/dev/null cmd; }`) still opens
+    # a command group in Bash -- `<`/`>` are metacharacters, not word chars.
+    leading_brace = after_bang[:1] == "{" and (len(after_bang) == 1 or after_bang[1] in " \t<>")
     import shlex
     try:
         toks = shlex.split(seg)
@@ -105,6 +120,20 @@ def _command_tokens(seg: str) -> list[str]:
             toks = toks[1:]; changed = True
         elif toks[0] == "env" and len(toks) > 1:
             toks = toks[1:]; changed = True
+        elif toks[0] == "{" and leading_brace and len(toks) > 1:
+            toks = toks[1:]; changed = True
+        elif (leading_brace and toks[0][:1] == "{" and len(toks[0]) > 1
+              and _REDIR_TOKEN_RE.match(toks[0][1:])):
+            # shlex has no redirect grammar, so `{>/dev/null` (or `{2>`)
+            # glues into one token; split the reserved-word `{` back off.
+            toks = [toks[0][1:]] + toks[1:]; changed = True
+        elif _REDIR_TOKEN_RE.match(toks[0]) and len(toks) > 1:
+            # A leading redirect (`>/dev/null false`, `2> /dev/null false`)
+            # and its target -- glued or the next word -- are never the command.
+            m = _REDIR_TOKEN_RE.match(toks[0])
+            rest = toks[1:]
+            toks = rest if m.end() < len(toks[0]) else rest[1:]
+            changed = True
         elif toks[0] == "timeout" and len(toks) > 1:
             toks = toks[1:]; changed = True
             while toks and (toks[0].startswith("-") or toks[0].isdigit()):
@@ -320,7 +349,62 @@ _FUNC_START_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w.-]*)\s*\(\s*\)\s
 # The `{` on its OWN line -- a valid spelling `_FUNC_START_RE` alone can't
 # see, since it anchors the `{` to the same line as `name()`.
 _FUNC_START_SPLIT_RE = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w.-]*)\s*\(\s*\)\s*$")
-_BRACE_ONLY_RE = re.compile(r"^\s*\{\s*$")
+# The `function` keyword with NO parens at all -- also valid Bash, and
+# distinct from the two forms above (which both require `()`).
+_FUNC_START_KEYWORD_RE = re.compile(r"^\s*function\s+([A-Za-z_][\w.-]*)\s*\{\s*(.*)$")
+_FUNC_START_KEYWORD_SPLIT_RE = re.compile(r"^\s*function\s+([A-Za-z_][\w.-]*)\s*$")
+# A split opener's `{` line, which may ALSO carry body content after it
+# (`name()\n{ :; helper`) -- group(1) is that content, empty when bare.
+_BRACE_LINE_RE = re.compile(r"^\s*\{\s*(.*)$")
+_CLOSE_ONLY_RE = re.compile(r"^\s*\}\s*$")
+_CMD_SEP = frozenset(";&|")
+# `{`/`}` glued onto a redirect (`{>/dev/null`) is still a token boundary;
+# kept apart from _CMD_SEP since a redirect never re-arms command-start.
+_TOKEN_BOUNDARY_EXTRA = frozenset("<>")
+
+
+def _line_continues(line: str) -> bool:
+    """True when `line` ends in a live (unquoted) backslash-newline
+    continuation -- an ODD trailing run of backslashes, since each PAIR
+    is one literal backslash and only a leftover single one escapes the
+    newline (round 35 follow-up, kewei-red-ag2space: the continued half
+    of `printf x \\\\n  } more` is one logical command, so its `}` is a
+    plain argument, never a fresh line's command-start)."""
+    masked = unquoted(line)
+    i = len(masked)
+    while i > 0 and masked[i - 1] == "\\":
+        i -= 1
+    return (len(masked) - i) % 2 == 1
+
+
+def _logical_line(lines: list, i: int) -> "tuple[str, int]":
+    """(joined text, last physical index) of the continuation-joined
+    logical line starting at physical line `i`. A backslash-newline joins
+    physical lines into ONE command, so brace-depth scanning must see
+    them as one unit -- round 36 follow-up, kewei-red-ag2space: forcing
+    every continued line to a fresh non-command-start state discarded a
+    `;` that had already re-armed it before the backslash."""
+    parts = [lines[i]]
+    j = i
+    while _line_continues(parts[-1]) and j + 1 < len(lines):
+        parts[-1] = parts[-1][:-1]
+        j += 1
+        parts.append(lines[j])
+    return "".join(parts), j
+
+
+def _closer_trailing_content(line: str, needed_delta: int) -> "str | None":
+    """The text STRICTLY AFTER the closer that brings `line`'s running
+    delta to `needed_delta`, or None if no prefix of `line` reaches it.
+    Content there belongs to whatever ENCLOSES the thing this line
+    closes, never to the closing definition itself -- round 36 follow-up,
+    kewei-red-ag2space: a nested function's `}; H` put a real command
+    from the OUTER scope on the same line as the nested close, and
+    "does this line have content" alone can't see which side it is on."""
+    for i in range(1, len(line) + 1):
+        if _brace_delta(line[:i]) == needed_delta:
+            return line[i:]
+    return None
 
 
 def _brace_delta(line: str) -> int:
@@ -328,58 +412,165 @@ def _brace_delta(line: str) -> int:
     expansion's OWN braces (opener, any nested ones, and its closer) never
     open or close a function block, so the whole span is skipped as a unit,
     not just its opener (round 30b, keweichen: `echo ${x}` left the closer
-    uncounted, so its `}` alone closed an unrelated function block early)."""
+    uncounted, so its `}` alone closed an unrelated function block early).
+    Any backslash-escaped character (not just `\\{`/`\\}`) is two literal
+    chars everywhere -- kewei-red-ag2space round 34: an escaped `\\;`
+    inside a command was still read as an UNESCAPED separator, so the
+    literal `}` argument right after it landed at a manufactured
+    command-start and counted as structural (round 33's narrower
+    `\\{`/`\\}`-only check missed this; any escaped separator has the
+    same failure shape). `{`/`}` is a reserved word ONLY in COMMAND-START
+    position as its own TOKEN -- bounded by whitespace, string edges, OR
+    another operator (`;`/`&`/`|`), never by an ordinary word character on
+    either side (round 33: `echo hi } more`'s `}` is a plain argument;
+    round 34: a compact `};` or `;{` glued to its neighbor with no space
+    -- both valid Bash, confirmed by direct execution -- was missing its
+    boundary check and read as non-structural). A same-line NESTED function
+    header (`inner() {`) opens unconditionally, never by command-start
+    position -- `NAME ()` is reserved function-definition syntax in Bash,
+    not an ordinary command whose surrounding text can disarm it (round 35
+    follow-up, kewei-red-ag2space: scanning for an OUTER function's own
+    close, the text "inner() " before the nested opener left command-start
+    state disabled with nothing to re-arm it, so the nested `{` went
+    uncounted and the nested function's OWN close was mistaken for the
+    outer's). Callers join a backslash-continued run into ONE logical
+    line first (`_logical_line`) rather than passing a per-line override
+    here -- round 36 follow-up, kewei-red-ag2space: a fixed "continuation
+    means not command-start" flag discarded a `;` that had already
+    re-armed command position before the backslash."""
     masked = unquoted(line)
+    m = _FUNC_START_RE.match(masked) or _FUNC_START_KEYWORD_RE.match(masked)
+    if m:
+        return 1 + _brace_delta(m.group(2))
     delta, i, n = 0, 0, len(masked)
+    at_cmd_start = True  # the start of a physical (or joined logical) line is itself command-start
+
+    def boundary(pos: int) -> bool:
+        return (pos < 0 or pos >= n or masked[pos].isspace()
+                or masked[pos] in _CMD_SEP or masked[pos] in _TOKEN_BOUNDARY_EXTRA)
+
     while i < n:
         ch = masked[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            at_cmd_start = False
+            continue
         if ch == "$" and i + 1 < n and masked[i + 1] == "{":
             depth, i = 1, i + 2
             while i < n and depth > 0:
+                if masked[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
                 if masked[i] == "{":
                     depth += 1
                 elif masked[i] == "}":
                     depth -= 1
                 i += 1
+            at_cmd_start = False
             continue
-        if ch == "{":
-            delta += 1
-        elif ch == "}":
-            delta -= 1
+        if ch in "{}":
+            is_token = boundary(i - 1) and boundary(i + 1)
+            if at_cmd_start and is_token:
+                delta += 1 if ch == "{" else -1
+            at_cmd_start = False
+            i += 1
+            continue
+        if ch in _CMD_SEP:
+            at_cmd_start = True
+            i += 1
+            continue
+        if ch.isspace():
+            i += 1
+            continue
+        at_cmd_start = False
         i += 1
     return delta
 
 
-def _function_bodies(text: str) -> list[tuple[str, int, int]]:
-    """(name, first_body_line, last_body_line) for every multi-line
-    `name() { ... }` definition, `{` on the same line OR its own next
-    line — 0-based inclusive indices into `text.split("\\n")`, excluding
-    the opening/closing brace lines themselves. A one-liner
-    (`name() { cmd; }`) has no line to hide."""
+def _function_bodies(text: str) -> list[tuple[str, int, tuple[int, ...], int, int]]:
+    """(name, anchor, sig_lines, first_body_line, last_body_line) for every
+    `name() { ... }` or `function name { ... }` definition (either
+    spelling, `{` on the same line or its own next line) — 0-based
+    indices into `text.split("\\n")`. `anchor` is the definition's own
+    first line, for ordering redefinitions against call sites. `sig_lines`
+    are the pure declaration line(s) (`name() {` or `name()` + `{`) that
+    must never be scanned as call text -- round 33, keweichen: `discover ()
+    {` (a space before the parens) tokenizes its OWN line as a bare call to
+    "discover", which the no-space spelling only avoided by tokenization
+    luck (`discover()` glues into one token that can't equal the name).
+
+    Multi-line spans exclude a clean closing-brace-only line, but INCLUDE
+    it when real content shares that line (round 33, keweichen: `bash
+    helper.sh; }` put the last command on the same line as the closer,
+    outside every recorded span, so an uncalled function's last command
+    read as top-level). A one-liner (`name() { cmd; }`, closed on its own
+    opening line) has no separate line to exclude, so its span is that
+    single line and `sig_lines` is empty (round 33, keweichen: treating it
+    as having "no line to hide" left its own line out of every function's
+    tracked span entirely, crediting an uncalled one-liner as top-level).
+
+    The split spelling's own opener line (`{` on its own next line) can
+    ALSO carry body content, same as the single-line form (round 34
+    follow-up, kewei-red-ag2space: `name()\\n{ :; helper` closed by a bare
+    `}` with no line between vanished entirely -- only a bare `{`-only
+    line was recognized as that form's opener at all).
+
+    A NESTED definition inside a function's own body gets its own entry
+    too, offset back into this call's coordinates (round 35 follow-up,
+    kewei-red-ag2space: `outer` merely DEFINING `inner` without calling it
+    still credited inner's body, since nothing distinguished it from
+    outer's own unconditionally-kept text) -- reachability then gates it
+    by whether the NESTED name is itself called, exactly like a top-level
+    sibling. The recursive scan skips the enclosing opener's own
+    declaration line when that line also carries body content, or
+    re-feeding it would re-match the SAME definition and recurse forever."""
     lines = text.split("\n")
     out, i, n = [], 0, len(lines)
     while i < n:
-        m = _FUNC_START_RE.match(lines[i])
+        m = _FUNC_START_RE.match(lines[i]) or _FUNC_START_KEYWORD_RE.match(lines[i])
         if m:
-            rest, brace_line = m.group(2), i
+            rest, brace_line, anchor, name_line = m.group(2), i, i, None
         else:
-            m = _FUNC_START_SPLIT_RE.match(lines[i])
-            if m and i + 1 < n and _BRACE_ONLY_RE.match(lines[i + 1]):
-                rest, brace_line = "", i + 1
+            m = _FUNC_START_SPLIT_RE.match(lines[i]) or _FUNC_START_KEYWORD_SPLIT_RE.match(lines[i])
+            m2 = _BRACE_LINE_RE.match(lines[i + 1]) if m and i + 1 < n else None
+            if m2:
+                rest, brace_line, anchor, name_line = m2.group(1), i + 1, i, i
             else:
                 i += 1
                 continue
+        has_rest = bool(rest.strip())
+        # The name-only line (split form) is always pure declaration; the
+        # opener line joins it only when the opener itself carries no body.
+        sig_lines = ((name_line,) if name_line is not None else ()) + (() if has_rest else (brace_line,))
         depth = 1 + _brace_delta(rest)
         if depth <= 0:
+            out.append((m.group(1), anchor, sig_lines, brace_line, brace_line))
             i = brace_line + 1
             continue
-        start = brace_line + 1
-        j = start
+        j = brace_line + 1
+        close_line, last_logical, depth_before_last = j, "", depth
         while j < n and depth > 0:
-            depth += _brace_delta(lines[j])
-            j += 1
-        if j - 2 >= start:
-            out.append((m.group(1), start, j - 2))
+            logical, close_line = _logical_line(lines, j)
+            depth_before_last = depth
+            depth += _brace_delta(logical)
+            last_logical, j = logical, close_line + 1
+        trailing = (_closer_trailing_content(last_logical, -depth_before_last)
+                    if last_logical else None)
+        excluded_close = bool(_CLOSE_ONLY_RE.match(lines[close_line])
+                              or (trailing is not None and trailing.strip()))
+        end = close_line - 1 if excluded_close else close_line
+        # `rest` on the opener is body content too -- a function with no
+        # line past it before a bare `}` needs the opener IN its own span.
+        start = brace_line if has_rest else brace_line + 1
+        if end >= start:
+            out.append((m.group(1), anchor, () if has_rest else sig_lines, start, end))
+            # Nested definitions get their own entry too (see docstring);
+            # skip a same-line opener's own text or it re-matches itself.
+            nested_from = start + 1 if has_rest else start
+            if nested_from <= end:
+                for nname, nanchor, nsig, nstart, nend in _function_bodies("\n".join(lines[nested_from:end + 1])):
+                    out.append((nname, nanchor + nested_from, tuple(s + nested_from for s in nsig),
+                                 nstart + nested_from, nend + nested_from))
         i = j
     return out
 
@@ -395,35 +586,237 @@ def _strip_unreachable_function_bodies(text: str) -> str:
     anywhere never runs discover.sh (round 30, keweichen — the delegation
     guard credited exactly this shape). Reachability is transitive: a body
     called from an already-reachable function counts too, not just the
-    top-level flow outside every function."""
+    top-level flow outside every function.
+
+    A call resolves to whichever definition of that NAME was already
+    ANCHORED (its own first line) before the CALLING CONTEXT's own point of
+    execution -- Bash redefinition is last-wins only AT THAT POINT, never
+    globally (round 33, keweichen: a decoy defined AFTER a real call still
+    "won" under a single global last-definition rule, and the inverse --
+    a helper defined and called BEFORE a later decoy -- wrongly lost credit
+    for a call that had already run). A call before every definition of
+    that name resolves to nothing, matching a real `command not found`.
+
+    A call INSIDE a function's own body resolves against whichever line
+    reached that function's OWN invocation, not the nested call's fixed
+    textual position in the caller's body -- running a body never advances
+    the script's sequential position, so a name used inside `outer` binds
+    exactly as if written at `outer`'s own call site (round 33 follow-up,
+    kewei-red-ag2space: resolving against the nested call's own line instead
+    credited whichever definition preceded it in SOURCE order, which is
+    always the STALEST one, regardless of what a later redefinition --
+    reached before `outer` was ever invoked -- would really run).
+
+    A same-line function-open ("name() { CMD" or "name() { CMD; }") glues
+    its body to the declaration syntax on one physical line; that line is
+    unmasked to just CMD before any call-scan sees it (round 33 follow-up:
+    `discover() { helper; }` then `discover` still read as calling nothing,
+    since "discover() { helper" tokenizes its own first word as
+    "discover()", never "helper"). A candidate line's own call is credited
+    only when it also survives the SAME multi-line AND-OR/if dead-branch
+    state the whole candidate region would see, not just its own isolated
+    text -- a per-line check alone can't tell `false &&\n  discover` or
+    `if false; then\n  discover\nfi` from an unconditional call.
+
+    A function body reachable from two DIFFERENT call sites can resolve
+    its OWN internal calls differently at each one, if a name it uses was
+    redefined in between (round 34 follow-up, kewei-red-ag2space: deduping
+    a queued span by span alone, ignoring which call site reached it,
+    skipped re-exploring a second call after such a redefinition -- the
+    invocation environment that call actually ran under was never
+    visited). Traversal state is keyed on (span, at_line) for that reason;
+    the final kept set still keys on span alone, since a span reachable
+    under ANY context is real regardless of how many others also reach
+    it."""
     lines = text.split("\n")
     funcs = _function_bodies(text)
     if not funcs:
         return text
-    in_body = [False] * len(lines)
-    for _, start, end in funcs:
+
+    # A same-line opener's body is glued to its declaration syntax; unmask
+    # it to just the body text before any call-scan sees the line.
+    for _, anchor, _, start, _ in funcs:
+        if start == anchor:
+            m = _FUNC_START_RE.match(lines[start]) or _FUNC_START_KEYWORD_RE.match(lines[start])
+            if m:
+                lines[start] = m.group(2)
+
+    # Every signature/body line is off-limits for call-scanning regardless
+    # of reachability -- a declaration is never a call (see `discover ()`).
+    excluded = [False] * len(lines)
+    for _, _, sig_lines, start, end in funcs:
+        for k in sig_lines:
+            excluded[k] = True
         for k in range(start, end + 1):
-            in_body[k] = True
-    top_level = "\n".join(ln for idx, ln in enumerate(lines) if not in_body[idx])
+            excluded[k] = True
+    top_level_idx = [idx for idx in range(len(lines)) if not excluded[idx]]
+    # Every line but a pure signature can call -- `installed_before` needs
+    # a call to an enclosing function wherever it actually happens.
+    sig_only: set = set()
+    for _, _, sig_lines, _, _ in funcs:
+        sig_only.update(sig_lines)
+    callable_idx = [idx for idx in range(len(lines)) if idx not in sig_only]
 
-    def called_in(name: str, hay: str) -> bool:
-        return any(_segment_calls(seg, name) for seg in _segments(hay))
+    by_name: dict[str, list[tuple[int, int, int]]] = {}
+    for name, anchor, _, start, end in funcs:
+        by_name.setdefault(name, []).append((anchor, start, end))
+    for spans in by_name.values():
+        spans.sort()
 
-    reachable = {name for name, _, _ in funcs if called_in(name, top_level)}
-    changed = True
-    while changed:
-        changed = False
-        for caller, cstart, cend in funcs:
-            if caller not in reachable:
+    def called_on(name: str, idxs: list[int]) -> list[int]:
+        """Line indices among `idxs` whose own line calls `name`, subject
+        to the SAME multi-line AND-OR/if dead-branch state the whole
+        candidate region would see -- a per-line check alone can't tell
+        `false &&\\n  discover` or `if false; then\\n  discover\\nfi` from
+        an unconditional call (kewei-red-ag2space round 33 follow-up).
+        Lines outside `idxs` are blanked, not omitted, so a gap (an
+        excluded function body sitting between two candidates) can't
+        shift adjacency; a blank line is a no-op to the AND-OR/if scanner,
+        exactly like a line that was never there.
+
+        Liveness is checked by INCREMENTAL truncation, one candidate line
+        at a time, never by matching filtered segment TEXT back to a line
+        (kewei-red-ag2space round 34 follow-up: an identically-worded dead
+        occurrence earlier in the scan consumed the one live segment a
+        LATER, genuinely-live occurrence produced, crediting the wrong
+        line's call). `_raw_segments`/`_filter_dead_branches` scan strictly
+        left to right with no lookahead, so truncating the region right
+        after `idx` can only ever APPEND segments to what an identical
+        truncation ending one line earlier already produced -- the new
+        ones, if any, are unambiguously `idx`'s own."""
+        if not idxs:
+            return []
+        idx_set = set(idxs)
+        out, prev_len = [], 0
+        for idx in sorted(idxs):
+            region = [lines[k] if k in idx_set and k <= idx else "" for k in range(idx + 1)]
+            live = _segments("\n".join(region))
+            new = live[prev_len:]
+            prev_len = len(live)
+            if any(_segment_calls(seg, name) for seg in new):
+                out.append(idx)
+        return out
+
+    def enclosing_span(span: "tuple[int, int, int]") -> "tuple[str, int, int, int] | None":
+        """(name, anchor, start, end) of the tightest OTHER function whose
+        body contains `span`'s anchor, or None when `span` is top-level."""
+        best = None
+        for name2, anchor2, _, start2, end2 in funcs:
+            cand = (anchor2, start2, end2)
+            if cand == span or not (start2 <= span[0] <= end2):
                 continue
-            body = "\n".join(lines[cstart:cend + 1])
-            for callee, _, _ in funcs:
-                if callee not in reachable and called_in(callee, body):
-                    reachable.add(callee)
-                    changed = True
+            if best is None or (end2 - start2) < (best[3] - best[2]):
+                best = (name2, anchor2, start2, end2)
+        return best
 
-    for name, start, end in funcs:
-        if name in reachable:
+    _calls_cache: dict[str, list[int]] = {}
+
+    def calls_to(name: str) -> list[int]:
+        """Every line (any depth -- top-level or inside a body) that calls
+        `name`, memoized: `installed_before` re-asks this for the same
+        enclosing name at multiple candidate `ref`s."""
+        if name not in _calls_cache:
+            _calls_cache[name] = called_on(name, callable_idx)
+        return _calls_cache[name]
+
+    def installed_before(span: "tuple[int, int, int]", ref: int,
+                          seen: frozenset = frozenset()) -> "int | None":
+        """The line at which `span`'s definition is INSTALLED as seen from
+        `ref`, or None if it never is by then -- round 36 follow-up,
+        qingyun-wu: a nested definition takes effect only once its
+        ENCLOSING function actually runs, not at its own textual anchor
+        (kewei-red-ag2space: calling a nested-only name before the
+        enclosing call ever executes must resolve to nothing, and a
+        top-level redefinition that is merely TEXTUALLY later than the
+        nested one must still lose to a nested one installed by a LATER
+        runtime call). Top-level: its own anchor. Nested: the LATEST call
+        to its direct enclosing function that lands before `ref`, with
+        that enclosing definition itself required to be installed by the
+        call's own line (recursive, depth-general)."""
+        if span in seen:
+            return None
+        encl = enclosing_span(span)
+        if encl is None:
+            anchor = span[0]
+            return anchor if anchor < ref else None
+        encl_name, encl_anchor, encl_start, encl_end = encl
+        encl_span = (encl_anchor, encl_start, encl_end)
+        best_call = None
+        for call_line in calls_to(encl_name):
+            if call_line < ref and installed_before(encl_span, call_line, seen | {span}) is not None:
+                if best_call is None or call_line > best_call:
+                    best_call = call_line
+        return best_call
+
+    def resolve(name: str, at_line: int, own_line: int = None,
+                body_bounds: "tuple[int, int] | None" = None
+                ) -> "tuple[int, int, int] | None":
+        """The (anchor, start, end) of `name`'s definition active at the
+        call, kept in the result (not just start/end) since two DIFFERENT
+        definitions -- typically an outer one-liner and a nested one
+        inside it -- can share an identical (start, end) span (round 36
+        follow-up, kewei-red-ag2space: a reachability key of span alone
+        aliased them, so outer being reachable made a never-called
+        sibling read as reachable too).
+
+        A candidate ANCHORED inside `body_bounds` uses `own_line` (the
+        call's OWN textual position) as its reference instead of
+        `at_line` -- a name defined and called within the SAME body
+        executes in that body's own sequential order regardless of when
+        the ENCLOSING function itself was invoked; only a candidate
+        OUTSIDE that body can shift with the enclosing call (round 36
+        follow-up, qingyun-sutando/kewei-red-ag2space: calling a name
+        before its own later definition, both inside the same body, must
+        resolve to nothing -- a real `command not found` -- not to
+        whatever the propagated at_line happened to make current).
+
+        A candidate reached from OUTSIDE its own body (the `at_line`
+        branch) that is itself nested is resolved by INSTALLATION time
+        (`installed_before`), never by its bare anchor -- see that
+        function's docstring."""
+        best, best_eff = None, None
+        for anchor, start, end in by_name.get(name, ()):
+            span = (anchor, start, end)
+            same_body = body_bounds and body_bounds[0] <= anchor <= body_bounds[1]
+            if same_body:
+                eff = anchor if anchor < own_line else None
+            elif enclosing_span(span) is None:
+                eff = anchor if anchor < at_line else None
+            else:
+                eff = installed_before(span, at_line)
+            if eff is not None and (best_eff is None or eff > best_eff):
+                best, best_eff = span, eff
+        return best
+
+    # `at_line` is the call site that reached each queued function; `span`
+    # is the full (anchor, start, end) `resolve()` returns (see docstring).
+    reachable: set[tuple[int, int, int]] = set()
+    visited: set[tuple[int, int, int, int]] = set()
+    queue: list[tuple[int, int, int, int]] = []
+
+    def enqueue(span, at_line):
+        reachable.add(span)
+        key = span + (at_line,)
+        if key not in visited:
+            visited.add(key)
+            queue.append(key)
+
+    for name in by_name:
+        for idx in called_on(name, top_level_idx):
+            span = resolve(name, idx)
+            if span:
+                enqueue(span, idx)
+    while queue:
+        _, cstart, cend, at_line = queue.pop()
+        body_idx = list(range(cstart, cend + 1))
+        for name in by_name:
+            for idx in called_on(name, body_idx):
+                span = resolve(name, at_line, own_line=idx, body_bounds=(cstart, cend))
+                if span:
+                    enqueue(span, at_line)
+
+    for _, anchor, _, start, end in funcs:
+        if (anchor, start, end) in reachable:
             continue
         for k in range(start, end + 1):
             lines[k] = ""
