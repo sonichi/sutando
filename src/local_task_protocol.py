@@ -339,6 +339,16 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
     return (reply, rest) if reply is not None else (None, text)
 
 
+def reply_action_text(text: str) -> str:
+    """The answer after broker context and the leading Matrix reply quote."""
+    body = split_reply_context(text)[1].lstrip()
+    lines = body.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if not (line.startswith(("> ", ">\t")) or line.rstrip("\r\n") == ">"):
+            return "".join(lines[i:]).strip()
+    return ""
+
+
 def parse_task_headers(text: str) -> TaskHeaders:
     """Parse a **task-last** file: collect `key: value` lines strictly BEFORE
     the first `task:` line; everything from `task:` onward is untrusted body.

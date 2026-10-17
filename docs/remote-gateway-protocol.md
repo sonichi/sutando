@@ -74,6 +74,15 @@ A task object **must** carry a unique `"id"`. Recognized string fields
 and written into the local task file the core consumes. For AG2 Space, the
 broker also supplies its room-policy `access_tier` attestation.
 
+Owner replies to runtime action cards are interpreted before local task-file
+newline confinement. The action text excludes a well-formed broker reply-context
+envelope and the leading quote lines of a legacy Matrix rich-reply fallback
+(`> `, `>\t`, and a bare `>` blank line).
+Only the remaining answer is matched; quoted-only or already-folded quotes do
+not become approvals. The same parser handles private-result review decisions.
+Owner identity, the target card and its current revision/guard remain required;
+an unthreaded Yes does not approve an arbitrary pending prompt.
+
 A worker-picker button may be sent as `"picker_command"` (`add` | `pin` |
 `unpin`) plus optional `"picker_args"` — a JSON object, either inline or
 already serialized as a string; the bridge writes it as JSON either way. Both
