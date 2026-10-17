@@ -39,6 +39,8 @@ _ENV_REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-}"; _ENV_AG2_REMOTE_TOKEN="${AG2_RE
 _ENV_REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-}"; _ENV_AG2_REMOTE_TIER="${AG2_REMOTE_TIER:-}"
 if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)"; then
     [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
+    # The bridge re-reads this file on an auth rejection to pick up a rotated token.
+    [ -f "$_RELAY_ENV" ] && export REMOTE_TASK_TOKEN_FILE="$_RELAY_ENV"
 fi
 
 # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads).
