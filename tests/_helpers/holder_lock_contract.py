@@ -1,0 +1,173 @@
+"""FirstActContract: the first-act rules every holder_lock caller must keep, driven through its CLI.
+
+A consumer subclasses it with unittest.TestCase and supplies `caller(root, *extra)`: the argv
+(a Python script and its arguments) that starts the caller on a work root and keeps it holding
+until its stdin closes, printing `acquired` once it holds. `module` is the holder_lock module the
+caller uses. The mixin drives contention, no-trace, a missing root, a replaced lock file, a live
+legacy pidfile, and publish-before-spawn (no child process before the record exists; `ps` is
+exempt). Every wait is bounded.
+
+Run as a script, this file is the spawn guard: `holder_lock_contract.py guard <report> <root>
+<module kind> <script> [args...]` runs the script with every child spawn checked.
+"""
+import os
+import runpy
+import select
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+WAIT = 10.0
+HERE = Path(__file__).resolve()
+
+
+def snapshot(path):
+    """Every file and directory under `path` with its bytes; a refusal must leave it equal."""
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames:
+            out[os.path.relpath(os.path.join(dirpath, name), path) + "/"] = None
+        for name in filenames:
+            p = os.path.join(dirpath, name)
+            with open(p, "rb") as f:
+                out[os.path.relpath(p, path)] = f.read()
+    return out
+
+
+class FirstActContract:
+    module = None
+
+    def caller(self, root, *extra):
+        raise NotImplementedError
+
+    def setUp(self):
+        super().setUp()
+        self._fa_tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._fa_tmp, True)
+        self._fa_children = []
+        self.addCleanup(self._fa_stop)
+
+    def _fa_root(self, name="work"):
+        root = os.path.join(self._fa_tmp, name)
+        self.addCleanup(shutil.rmtree, self.module.lock_dir(root), True)
+        return root
+
+    def _fa_stop(self):
+        for child in self._fa_children:
+            if child.poll() is None:
+                try:
+                    child.stdin.close()
+                    child.wait(WAIT)
+                except (OSError, subprocess.TimeoutExpired):
+                    child.kill()
+                    child.wait(WAIT)
+
+    def _fa_start(self, argv):
+        child = subprocess.Popen([sys.executable] + list(argv), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+        self._fa_children.append(child)
+        return child
+
+    def _fa_line(self, child):
+        if not select.select([child.stdout], [], [], WAIT)[0]:
+            self.fail("no line from the caller within %.0fs" % WAIT)
+        return child.stdout.readline().strip()
+
+    def _fa_run(self, argv):
+        r = subprocess.run([sys.executable] + list(argv), capture_output=True, text=True, timeout=WAIT * 3,
+                           stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout.strip()
+
+    def _fa_hold(self, root):
+        holder = self._fa_start(self.caller(root))
+        self.assertEqual(self._fa_line(holder), "acquired")
+        return holder
+
+    def test_first_act_contention_refuses_with_exit_3_and_leaves_no_trace(self):
+        root = self._fa_root()
+        self._fa_hold(root)
+        before, record = snapshot(root), self.module.read_holder(root)
+        rc, out = self._fa_run(self.caller(root))
+        self.assertEqual(rc, 3, out)
+        self.assertEqual(snapshot(root), before, "the loser leaves the root as it was")
+        self.assertEqual(self.module.read_holder(root), record, "and the record")
+
+    def test_first_act_a_missing_root_is_created_and_acquired(self):
+        root = self._fa_root("absent/work")
+        self.assertFalse(os.path.exists(root))
+        self._fa_hold(root)
+        self.assertTrue(os.path.isdir(root))
+
+    def test_first_act_a_replaced_lock_file_still_refuses(self):
+        root = self._fa_root()
+        self._fa_hold(root)
+        lock = os.path.join(self.module.lock_dir(root), "lock")
+        fresh = lock + ".fresh"
+        open(fresh, "w").close()
+        os.replace(fresh, lock)
+        rc, out = self._fa_run(self.caller(root))
+        self.assertEqual(rc, 3, "the record names the live holder: %s" % out)
+
+    def test_first_act_a_live_legacy_pidfile_refuses(self):
+        root = self._fa_root()
+        live = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(lambda: (live.kill(), live.wait(WAIT)))
+        os.makedirs(os.path.join(root, "state"))
+        with open(os.path.join(root, "state", "connector.pid"), "w") as f:
+            f.write("%d\n" % live.pid)
+        rc, out = self._fa_run(self.caller(root))
+        self.assertEqual((rc, out.split()[0]), (3, "LegacyRunning"), out)
+
+    def test_first_act_publish_comes_before_any_child_is_spawned(self):
+        root = self._fa_root()
+        report = os.path.join(self._fa_tmp, "spawns.txt")
+        script, *args = self.caller(root)
+        holder = self._fa_start([str(HERE), "guard", report, root, self.module_kind, script] + args)
+        self.assertEqual(self._fa_line(holder), "acquired")
+        with open(report, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertTrue(lines, "the guard saw the caller's own child after publish")
+        self.assertEqual([line for line in lines if not line.startswith("after-publish ")], [],
+                         "a child was spawned before the record existed")
+
+
+def _guard(report, root, kind, script, args):
+    """Run `script` with every child spawn recorded as before- or after-publish."""
+    repo = HERE.parents[2]
+    if kind == "src":
+        sys.path.insert(0, str(repo / "src"))
+        import holder_lock as hl
+    else:
+        sys.path.insert(0, str(repo / "packages" / "ag2-sparrow"))
+        from ag2_sparrow import holder_lock as hl
+
+    def note(argv):
+        name = os.path.basename(str(argv[0] if isinstance(argv, (list, tuple)) else argv).split()[0])
+        if name == "ps":
+            return
+        prior = hl.read_holder(root)
+        ours = isinstance(prior, hl.Valid) and prior.record["pid"] == os.getpid()
+        with open(report, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % ("after-publish" if ours else "BEFORE-PUBLISH", name))
+    real_init = subprocess.Popen.__init__
+
+    def init(self, args, *a, **k):
+        note(args)
+        real_init(self, args, *a, **k)
+    subprocess.Popen.__init__ = init
+    for name in ("posix_spawn", "posix_spawnp", "execv", "execve"):
+        real = getattr(os, name, None)
+        if real is not None:
+            setattr(os, name, (lambda r: lambda path, *a, **k: (note([path]), r(path, *a, **k))[1])(real))
+    sys.argv = [script] + list(args)
+    runpy.run_path(script, run_name="__main__")
+
+
+if __name__ == "__main__" and len(sys.argv) > 5 and sys.argv[1] == "guard":
+    try:
+        _guard(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:])
+    except SystemExit as e:
+        sys.exit(e.code)
