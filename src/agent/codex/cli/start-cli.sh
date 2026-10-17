@@ -237,6 +237,8 @@ WORKING_DIR="$(cd "$WORKING_DIR" && pwd -P)"
 
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex)
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
+# An embedder's resolved workspace (skills read it before any resolver); same tmux reason.
+[ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
 [ -n "${CODEX_HOME:-}" ] && CORE_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
 # Skills read channel state (ag2space access.json) under it; tmux's server env can predate it.
 [ -n "${CLAUDE_CONFIG_DIR:-}" ] && CORE_ENV_ARGS+=(-e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR")
