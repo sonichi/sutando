@@ -64,6 +64,14 @@ class ReplyActionTextTests(unittest.TestCase):
             for text in ("> <@agent:test.invalid> Allow\n> Deny", "> <@agent:test.invalid> quote  Allow"):
                 self.assertEqual(protocol.reply_action_text(text), "")
 
+    def test_a_line_separator_inside_a_quote_line_is_not_an_answer(self):
+        for protocol in (CORE, VENDOR):
+            for sep in ("\u2028", "\u2029", "\v", "\f", "\x85", "\x1c", "\x1d", "\x1e"):
+                with self.subTest(protocol=protocol.__name__, sep=repr(sep)):
+                    text = envelope("> <@agent:test.invalid> Quoted card" + sep + "Allow")
+                    self.assertEqual(protocol.reply_action_text(text), "")
+                    self.assertEqual(protocol.reply_action_text(text + "\n\nDeny"), "Deny")
+
     def test_ordinary_answer_and_qualification_survive(self):
         for text in ("Allow", "Deny — wrong folder", "", "Why does this need approval?"):
             self.assertEqual(CORE.reply_action_text(text), text)
