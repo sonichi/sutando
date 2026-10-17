@@ -48,6 +48,13 @@ def _resend_epoch(backend, item_id: str) -> int:
     return int(fn(item_id)) if callable(fn) else 0
 
 
+def _read_receipt(receipt):
+    """(outcome, destination, provider_ref, detail) of one receipt."""
+    return (receipt.outcome, getattr(receipt, "destination", None),
+            getattr(receipt, "provider_ref", None),
+            str(getattr(receipt, "detail", "") or ""))
+
+
 class DeliveryCore:
     def __init__(self, backend: ClaimBackend, provider: DeliveryProvider,
                  policy: RetryPolicy | None = None,
@@ -65,11 +72,12 @@ class DeliveryCore:
         violation) propagates rather than masquerading as ambiguity."""
         try:
             receipt = self.provider.deliver(item_id, payload, key)
-            return receipt.outcome, getattr(receipt, "destination", None), False, receipt.detail
+            outcome, destination, ref, detail = _read_receipt(receipt)
+            return outcome, destination, ref, False, detail
         except ProviderIndeterminate as exc:
-            return DeliveryOutcome.OUTCOME_UNKNOWN, None, False, str(exc)
+            return DeliveryOutcome.OUTCOME_UNKNOWN, None, None, False, str(exc)
         except ProviderRefused as exc:
-            return (DeliveryOutcome.NOT_DELIVERED, None,
+            return (DeliveryOutcome.NOT_DELIVERED, None, None,
                     isinstance(exc, ProviderPermanentRefused), str(exc))
 
     def _reconcile(self, item_id: str, payload: bytes, key: str):
@@ -90,7 +98,7 @@ class DeliveryCore:
             return None
         if resolved is None:
             return None
-        return resolved.outcome, getattr(resolved, "destination", None)
+        return _read_receipt(resolved)
 
     def deliver_one(self, item_id: str, payload: bytes) -> DrainResult:
         """Claim -> deliver -> classify -> complete, with retry accounting."""
@@ -107,7 +115,7 @@ class DeliveryCore:
         if callable(stored_payload):
             payload = stored_payload(token)
         key = idempotency_key(item_id, _resend_epoch(self.backend, item_id))
-        outcome, destination, permanent, detail = self._attempt(item_id, payload, key)
+        outcome, destination, ref, permanent, detail = self._attempt(item_id, payload, key)
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
             caps = self.provider.capabilities
             if caps.reconcile_capable:
@@ -115,10 +123,11 @@ class DeliveryCore:
                 if resolved is not None:
                     # The reconciliation receipt is the statement about THIS
                     # item; its destination replaces the ambiguous attempt's.
-                    outcome, destination = resolved
+                    outcome, destination, ref, detail = resolved
             elif caps.idempotent_send:
                 if not self.policy.defer_idempotent_resend:
-                    outcome, destination, permanent, detail = self._attempt(item_id, payload, key)
+                    outcome, destination, ref, permanent, detail = self._attempt(
+                        item_id, payload, key)
                 if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
                     # Retryable by license: parking would strand an item a
                     # later safe re-send could still deliver.
@@ -130,7 +139,8 @@ class DeliveryCore:
                               park_at_attempts=self.policy.max_attempts,
                               provider=type(self.provider).__name__,
                               destination=destination, **terminal)
-        return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome, detail=detail)
+        return DrainResult(status=DrainStatus.ATTEMPTED, outcome=outcome,
+                           provider_ref=ref, detail=detail)
 
     def recover(self) -> RecoverReport:
         return self.backend.recover()

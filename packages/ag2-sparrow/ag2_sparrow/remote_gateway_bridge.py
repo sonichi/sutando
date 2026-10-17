@@ -6233,9 +6233,13 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
             _quarantine_unsent(result_file, tid, item_id, generation)
             return False
         _ENGINE_COUNTS["core_confirmed"] += 1
-        # A confirmed send was otherwise silent, so nothing on the happy path
-        # told a live round trip apart from the legacy one it replaces.
-        _log(f"result {tid} accepted by gateway; Matrix delivery unconfirmed "
+        # Only the broker's own `delivered` read-back may be logged as delivered;
+        # an accept alone is recorded, not posted.
+        ref = getattr(res, "provider_ref", None)
+        what = ("delivered" if ref == "delivered" else
+                f"accepted by the broker, room delivery unconfirmed "
+                f"({ref or 'accepted'}),")
+        _log(f"result {tid} {what} via DeliveryCore "
              f"(provider={type(core.provider).__name__}, "
              f"backend={type(core.backend).__name__}, worker={core.worker})")
         return True
@@ -6612,7 +6616,7 @@ def _post_ready_results(inflight: set[str]) -> None:
         _forget_relay_counts(_wire, tid)
         _forget_dedup_alias(tid)
         changed = True
-        _log(f"archived gateway-accepted result for {tid}; Matrix delivery unconfirmed")
+        _log(f"archived result for {tid}")
     if changed:
         _save_inflight(inflight)
 
