@@ -77,3 +77,16 @@
 
 # Mark: co-owner where he's clear 2nd place (added 2026-09-28, owner-assigned: 'add Mark for areas he's 2nd').
 /skills/call-diagnostics/  @liususan091219 @marklysze     # Susan 4, Mark 3, Qingyun 2
+
+# Windows runtime: PowerShell entry points, OS abstractions, Windows tests and CI.
+# Keep existing maintainers as co-owners so an author's PR can receive owner review.
+/src/*.ps1                @sonichi @qingyun-wu @thinkall
+/scripts/*.ps1            @sonichi @qingyun-wu @thinkall
+/skills/install.ps1       @sonichi @qingyun-wu @thinkall
+/src/platform.ts          @sonichi @qingyun-wu @thinkall
+/src/sutando_platform.py   @sonichi @qingyun-wu @thinkall
+/tests/*.ps1              @sonichi @qingyun-wu @liususan091219 @thinkall
+/tests/windows-*          @sonichi @qingyun-wu @liususan091219 @thinkall
+/tests/*-windows*         @sonichi @qingyun-wu @liususan091219 @thinkall
+/tests/notify-ps1-*.test.py @sonichi @qingyun-wu @liususan091219 @thinkall
+/.github/workflows/windows-runtime.yml @sonichi @qingyun-wu @thinkall
