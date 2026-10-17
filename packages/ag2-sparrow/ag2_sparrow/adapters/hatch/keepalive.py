@@ -37,12 +37,16 @@ STALE_S = 2 * INTERVAL_MIN * 60
 NOT_RUNNING = "keepawake-not-running"
 HOOK_NOT_RUNNING, HOOK_STALE_S = "hook-not-running", 5 * 60
 TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
+UPGRADE_FAILED = "upgrade-failed"
 NO_HEALTH_COMMAND, UNKNOWN_ENV = "no-health-command", "unknown-env"
 REASON_HINTS = {
     HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
                       "the hook run line above",
     TASK_NOT_PICKED_UP: f"an AG2 Space task has been open over {TASK_PICKUP_S // 60} minutes: "
                         "the hook is not waking a worker for it, or a worker handed it off",
+    UPGRADE_FAILED: "an automatic ag2-sparrow upgrade failed; its outcome and the version "
+                    "installed now are in hatch-upgrade.json and hatch-upgrade.log in the "
+                    "state dir",
 }
 RUN_TIMEOUT_S = 120
 GAP_MINUTES = 16
@@ -473,7 +477,27 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
 
 
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
+    from . import self_upgrade
     now = time.time() if now is None else now
+    # Held across the probe and the restart, so an upgrade cannot start in between.
+    with self_upgrade.upgrade_lock(_state_dir(cfg)) as free:
+        up, restarted, rc, reason = _keep_listener(cfg, now) if free else (
+            listener_up(cfg, now), 0, 0, None)
+    if not free:
+        print("an upgrade is running; Sparrow is left as it is")
+    upgrade = _served_setup(cfg) if free else "running"
+    line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
+        + (f" reason={reason}" if reason else "") + (f" upgrade={upgrade}" if upgrade else "")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    print(line)
+    return rc
+
+
+def _keep_listener(cfg: dict, now: float) -> "tuple[bool, int, int, str | None]":
+    """Restart Sparrow if it is down, or replace one without the health command:
+    (up, restarted, rc, reason)."""
     up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
     if not up:
         ok, how = restart_listener(cfg)
@@ -493,23 +517,18 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
             else:
                 print(f"the replace failed: {how}", file=sys.stderr)
                 rc = 1
-    _refresh_setup(cfg)
-    line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
-        + (f" reason={reason}" if reason else "")
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-    print(line)
-    return rc
+    return up, restarted, rc, reason
 
 
-def _refresh_setup(cfg: dict) -> None:
-    """Refresh the served setup cache; never fails the run."""
-    from . import runtime_text
+def _served_setup(cfg: dict) -> "str | None":
+    """Refresh the served setup and decide on the upgrade it calls for; never fails the run."""
+    from . import runtime_text, self_upgrade
     try:
-        runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
+        setup = runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
+        return self_upgrade.maybe_start(cfg, setup)
     except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
         print(f"NOTE served setup: {diagnostics.describe(e)}", file=sys.stderr)
+        return None
 
 
 def last_keepawake(log: Path) -> float | None:
@@ -567,7 +586,7 @@ def oldest_open_task(cfg: dict) -> "float | None":
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     """The core row for Sparrow's heartbeat; None while no keepawake task is installed.
     `alive` also counts the hook's activity marker."""
-    from . import runtime_text
+    from . import runtime_text, self_upgrade
     now = time.time() if now is None else now
     tasks = _found(cron_dir(cfg), TASK)
     if not tasks:
@@ -590,6 +609,9 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     oldest = oldest_open_task(cfg)
     if oldest is not None and now - oldest > tune["stuck_task_age_s"]:
         problems.append((TASK_NOT_PICKED_UP, oldest + tune["stuck_task_age_s"]))
+    failed = self_upgrade.failed_since(_state_dir(cfg))
+    if failed is not None:
+        problems.append((UPGRADE_FAILED, failed))
     # Fresh but never run: no evidence either way yet.
     condition = "abnormal" if problems else "healthy" if ran is not None else "unknown"
     reason, since = problems[0] if problems else (None, None)
