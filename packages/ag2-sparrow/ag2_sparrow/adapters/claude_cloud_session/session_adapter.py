@@ -115,7 +115,8 @@ class Adapter(RelayLoop):
         return os.path.join(self.sending_dir, task_id)
 
     def _phase(self, task_id):
-        """sending (the call may have queued it), outcome (known, counted), unsent (proven), or None."""
+        """sending (the call may have queued it), outcome (known, counted), unsent (proven), or None.
+        Any other content (an older format's pid) is read like sending: possibly queued."""
         try:
             with open(self._marker(task_id), encoding="utf-8") as f:
                 return (f.read().split() or ["sending"])[0]
@@ -128,9 +129,18 @@ class Adapter(RelayLoop):
         except FileNotFoundError:
             pass
 
-    def finish(self, name, body, seen):
-        super().finish(name, body, seen)
+    def _settled(self, name, seen):
+        super()._settled(name, seen)
         self._clear(name[:-4])
+
+    def _count_possibly_sent(self, task_id, phase):
+        """One keyed entry for a turn that may have been queued, at the latest time it can have been."""
+        if phase == "outcome":
+            return
+        if self.limiter.holds(task_id):
+            self.limiter.touch(task_id)
+        else:
+            self.limiter.record(task_id)
 
     def recover(self):
         """Settle what a crash left behind for tasks no longer in the inbox (cancelled, archived)."""
@@ -146,8 +156,7 @@ class Adapter(RelayLoop):
                 if phase == "unsent":
                     self.limiter.forget(task_id)
                 else:
-                    if phase == "sending":
-                        self.limiter.touch(task_id)
+                    self._count_possibly_sent(task_id, phase)
                     record_done(self.done_path, task_id)
             log("settled a leftover marker ->", task_id, phase)
             self._clear(task_id)
@@ -156,7 +165,7 @@ class Adapter(RelayLoop):
             self.limiter.forget(task_id)
 
     def recovering(self, name):
-        return self._phase(name[:-4]) in ("sending", "outcome") or self.limiter.holds(name[:-4])
+        return self._phase(name[:-4]) not in (None, "unsent") or self.limiter.holds(name[:-4])
 
     def next_ready(self, names):
         name, wait = super().next_ready(names)
@@ -179,10 +188,8 @@ class Adapter(RelayLoop):
         elif phase is not None:
             # A send began before a crash; resending could post twice.
             log("interrupted send, not resent ->", task_id, phase)
-            if phase == "sending":
-                # Its outcome time is unknown: count it as queued now, the latest it can have been.
-                self.limiter.touch(task_id)
-            self.finish(name, result_body(INTERRUPTED, self.args.result_mode, owner, LABEL), seen)
+            self._count_possibly_sent(task_id, phase)
+            self.settle(name, result_body(INTERRUPTED, self.args.result_mode, owner, LABEL), seen)
             return True
         if not self.admit(name, headers, seen):
             return True

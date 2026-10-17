@@ -9,13 +9,15 @@ import io
 import os
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import relay_loop as rl, task_io, task_priority  # noqa: E402
+from ag2_sparrow import relay_loop as rl, result_disposal, result_ready, task_io, task_priority  # noqa: E402
 
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 from ag2_sparrow.adapters.hatch import task_fields  # noqa: E402
@@ -85,6 +87,92 @@ class LimiterTest(unittest.TestCase):
             self.assertEqual(rl.RateLimiter(path, 2, lambda: now[0]).entries, [(5000.0, None)])
             Path(path).write_text("[[1]]")
             self.assertEqual(rl.RateLimiter(path, 2, lambda: now[0]).entries, [])
+
+
+class WriterContractTest(unittest.TestCase):
+    """Results are written once and never replace one; existence is local_task_protocol's answer."""
+
+    def stage(self, loop, name, body):
+        staged = rl.staged_path(loop.args.results, name)
+        Path(staged).write_text(body)
+        return staged
+
+    def recover(self, loop):
+        with contextlib.redirect_stderr(io.StringIO()):
+            loop.recover()
+
+    def test_recovery_never_overwrites_a_live_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = Loop(d)
+            live = Path(loop.args.results) / "task-a.txt"
+            live.write_text("new-visible\n")
+            staged = self.stage(loop, "task-a.txt", "old-staged\n")
+            self.recover(loop)
+            self.assertEqual(live.read_text(), "new-visible\n")
+            self.assertFalse(os.path.exists(staged))
+            self.assertEqual(Path(loop.done_path).read_text(), "task-a\n")
+
+    def test_recovery_after_a_real_disposal_claimed_the_result_adds_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = Loop(d)
+            results = Path(loop.args.results)
+            live, archive = results / "task-b.txt", results / "archive"
+            archive.mkdir()
+            retired = []
+            stop = threading.Event()
+
+            def drain():
+                while not stop.is_set() and not retired:
+                    if live.exists():
+                        _, generation = result_ready.identity_of(live)
+                        retired.append(result_disposal.retire_generation(
+                            results, live, generation, lambda m: None, archive, ["task-b-1.txt"]))
+                    time.sleep(0.001)
+            t = threading.Thread(target=drain, daemon=True)
+            t.start()
+            staged = self.stage(loop, "task-b.txt", "first\n")
+            os.link(staged, live)           # a crash between the publish link and the stage's unlink
+            deadline = time.time() + 5
+            while not retired and time.time() < deadline:
+                time.sleep(0.001)
+            stop.set()
+            t.join()
+            self.assertTrue(retired and retired[0].retired, retired)
+            claim = archive / "task-b-1.txt"
+            self.assertEqual(claim.read_text(), "first\n")
+            self.recover(loop)
+            self.assertFalse(live.exists(), "no new result appears")
+            self.assertFalse(os.path.exists(staged))
+            self.assertEqual(claim.read_text(), "first\n")
+            self.assertEqual(sorted(p.name for p in archive.iterdir()), ["task-b-1.txt"])
+
+    def test_a_staged_body_with_no_result_anywhere_is_published_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = Loop(d)
+            staged = self.stage(loop, "task-c.txt", "body\n")
+            self.recover(loop)
+            self.recover(loop)
+            self.assertEqual((Path(loop.args.results) / "task-c.txt").read_text(), "body\n")
+            self.assertFalse(os.path.exists(staged))
+            self.assertEqual(Path(loop.done_path).read_text(), "task-c\n")
+
+    def test_finish_never_replaces_and_settle_defers_to_any_generation(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = Loop(d)
+            results = Path(loop.args.results)
+            (results / "task-d.txt").write_text("theirs\n")
+            (results / "archive").mkdir()
+            (results / "archive" / "task-e.txt").write_text("archived\n")
+            seen = set()
+            with contextlib.redirect_stderr(io.StringIO()):
+                loop.finish("task-d.txt", "ours\n", seen)
+                loop.settle("task-e.txt", "ours\n", seen)
+                loop.settle("task-f.txt", "ours\n", seen)
+            self.assertEqual((results / "task-d.txt").read_text(), "theirs\n")
+            self.assertFalse((results / "task-e.txt").exists())
+            self.assertEqual((results / "task-f.txt").read_text(), "ours\n")
+            self.assertEqual(Path(loop.done_path).read_text().split(), ["task-d", "task-e", "task-f"])
+            self.assertEqual([n for n in os.listdir(results) if n.startswith(".")], [])
 
 
 class LoopTest(unittest.TestCase):

@@ -89,13 +89,18 @@ A non-owner task's failure line never carries the exit code. Before each call th
 `unsent` before releasing the reservation of a proven-unsent call, and removes it only with the
 result. A crash mid-send is answered on restart with the "may or may not have reached" line instead
 of a second queued turn (at most once); a crash during a proven-unsent cleanup is retried once.
-A result is staged as `results/.task-<id>.txt.staged`, the task is recorded in `state/done`, and only
-then is the result renamed into place, so a drain that claims it the instant it appears and a crash
-right after cannot lead to a second, different result; a staged body left by a crash is published on
-start. Also on start, leftovers of tasks no longer in the inbox (cancelled or archived) are settled:
-an `unsent` marker and its reservation are dropped, a `sending`/`outcome` marker counts (moved to the
-start time when its outcome was never recorded) and is recorded done, and a reservation with neither
-a task nor a marker, which was never sent, is released.
+Writer contract: a result is written once and never replaces another. It is staged as
+`results/.task-<id>.txt.staged`, the task is recorded in `state/done`, and the stage is then hard-linked
+to `results/task-<id>.txt` (no-replace: if a result is already there it stays, and the stage is
+discarded). Whether a result exists in any generation (live, mid-disposal, archived) is asked of the
+package's `local_task_protocol.find_result` and `result_disposal.find_claims`, never worked out here;
+delivery and claims belong to the bridge's outbox. On start, a staged body is published only when no
+generation exists, and an interrupted task gets its "interrupted" line only then too. Also on start,
+leftovers of tasks no longer in the inbox (cancelled or archived) are settled: an `unsent` marker and
+its reservation are dropped; any other marker (`sending`, `outcome`, or an older release's pid) is
+taken as possibly queued, counted with exactly one keyed entry (moved to, or created at, the start
+time unless its outcome was recorded) and recorded done; a reservation with neither a task nor a
+marker, which was never sent, is released.
 
 Pacing: at least `--min-gap-seconds` (default 2) between queued turns and at most `--max-per-hour`
 (default 60) in a sliding hour, kept in `state/sends.json` so a restart does not reset either. The cap

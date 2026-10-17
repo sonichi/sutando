@@ -777,6 +777,67 @@ class QueueLoopTest(unittest.TestCase):
             for tid in ("task-o", "task-s", "task-e"):
                 self.assertIn("(interrupted)", result(d, tid))
 
+    def legacy_restart(self, d, reserved, **gates):
+        """A pid marker from the first release, with or without a keyed reservation, then a restart."""
+        fake = Fake(d, [ok()])
+        state = Path(d) / "state"
+        (state / "sending").mkdir(parents=True)
+        (state / "sending" / "task-old").write_text("75369\n")
+        write_task(d, "task-old", "x", mtime=1000)
+        write_task(d, "task-next", "x", mtime=2000)
+        clock = FakeClock()
+        restart = clock.t
+        if reserved:
+            rl.RateLimiter(str(state / "sends.json"), 60, lambda: restart - 50).record("task-old")
+        starts = []
+
+        def record(argv, **k):
+            starts.append(clock.t)
+            return subprocess.CompletedProcess(argv, 0, ok()["stdout"], "")
+        run_adapter(d, fake, clock=clock, run=record, once=2, **gates)
+        self.assertIn("(interrupted)", result(d, "task-old"), "settled, never resent")
+        self.assertEqual(len(starts), 1)
+        return restart, starts[0]
+
+    def test_a_legacy_pid_marker_counts_once_at_the_restart_for_both_gates(self):
+        for reserved in (True, False):
+            with self.subTest(reserved=reserved), tempfile.TemporaryDirectory() as d:
+                restart, start = self.legacy_restart(d, reserved, min_gap_seconds=2)
+                self.assertGreaterEqual(start, restart + 2)
+                self.assertEqual(self.sends(d), [[restart, "task-old"], [start, "task-next"]],
+                                 "exactly one keyed entry, at the restart")
+            with self.subTest(reserved=reserved, gate="hour"), tempfile.TemporaryDirectory() as d:
+                restart, start = self.legacy_restart(d, reserved, max_per_hour=1)
+                self.assertGreaterEqual(start, restart + 3600)
+
+    def test_a_dequeued_legacy_marker_without_a_reservation_still_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok()])
+            state = Path(d) / "state"
+            (state / "sending").mkdir(parents=True)
+            (state / "sending" / "task-gone").write_text("75369\n")
+            clock = FakeClock()
+            t0 = clock.t
+            run_adapter(d, fake, clock=clock)
+            self.assertEqual(self.sends(d), [[t0, "task-gone"]])
+            self.assertEqual((state / "done").read_text(), "task-gone\n")
+            self.assertEqual(os.listdir(state / "sending"), [])
+
+    def test_an_interrupted_task_with_an_archived_result_gets_no_second_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok()])
+            state, results = Path(d) / "state", Path(d) / "results"
+            (state / "sending").mkdir(parents=True)
+            (state / "sending" / "task-a").write_text("outcome\n")
+            (results / "archive").mkdir(parents=True)
+            (results / "archive" / "task-a.txt").write_text("[no-send]\n")
+            write_task(d, "task-a", "x")
+            run_adapter(d, fake, once=1)
+            self.assertFalse((results / "task-a.txt").exists())
+            self.assertEqual((state / "done").read_text(), "task-a\n")
+            self.assertEqual(fake.calls(), [])
+            self.assertEqual(os.listdir(state / "sending"), [])
+
     def test_min_gap_counts_from_the_outcome_not_the_start(self):
         clock = FakeClock()
         starts = []

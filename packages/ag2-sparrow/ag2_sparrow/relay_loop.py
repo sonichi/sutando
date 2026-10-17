@@ -14,7 +14,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import task_priority
+from . import local_task_protocol, result_disposal, task_priority
 from .task_io import load_done, non_owner_note, parse_task, record_done, write_atomic
 
 TEXT_MAX = 65536
@@ -146,7 +146,19 @@ def staged_path(results, name):
 
 
 def publish(staged, path):
-    os.replace(staged, path)
+    """Put a staged body at `path` unless a result already sits there; the stage goes either way.
+    No replace: a result another writer published, or a drain is reading, is never overwritten."""
+    try:
+        os.link(staged, path)
+    except FileExistsError:
+        log("a result is already at", os.path.basename(path), "- the staged copy is discarded")
+    os.unlink(staged)
+
+
+def result_exists(results, task_id):
+    """Any generation of the task's result: live, archived, or mid-disposal."""
+    return (local_task_protocol.find_result(Path(results), task_id) is not None
+            or bool(result_disposal.find_claims(Path(results), task_id)))
 
 
 class RelayLoop:
@@ -176,6 +188,18 @@ class RelayLoop:
         write_atomic(staged, body)
         record_done(self.done_path, name[:-4])
         publish(staged, os.path.join(self.args.results, name))
+        self._settled(name, seen)
+
+    def settle(self, name, body, seen):
+        """finish() unless some generation of this task's result already exists; then only done."""
+        if result_exists(self.args.results, name[:-4]):
+            log("a result already exists, none added ->", name[:-4])
+            record_done(self.done_path, name[:-4])
+            self._settled(name, seen)
+        else:
+            self.finish(name, body, seen)
+
+    def _settled(self, name, seen):
         seen.add(name[:-4])
         self.attempts.pop(name[:-4], None)
         self.limited.pop(name[:-4], None)
@@ -232,13 +256,20 @@ class RelayLoop:
         return ready[0], 0.0
 
     def recover(self):
-        """Publish what a crash left staged: those tasks are settled, so the body is their result."""
+        """A staged body a crash left is that task's result, unless any generation of a result
+        already exists (published, claimed, archived); then the stage is discarded."""
         for entry in sorted(os.listdir(self.args.results)):
             m = STAGED_RE.fullmatch(entry)
-            if m:
-                log("publishing a staged result ->", m.group(1))
-                record_done(self.done_path, m.group(1)[:-4])
-                publish(os.path.join(self.args.results, entry), os.path.join(self.args.results, m.group(1)))
+            if not m:
+                continue
+            staged, task_id = os.path.join(self.args.results, entry), m.group(1)[:-4]
+            record_done(self.done_path, task_id)
+            if result_exists(self.args.results, task_id):
+                log("a result already exists, staged copy discarded ->", task_id)
+                os.unlink(staged)
+            else:
+                log("publishing a staged result ->", task_id)
+                publish(staged, os.path.join(self.args.results, m.group(1)))
 
     def serve(self):
         self.recover()
