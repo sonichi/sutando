@@ -378,9 +378,15 @@ class PositiveArgTest(unittest.TestCase):
                 self.assertIn("--max-collaborator-per-hour: must be 1 or more", err.getvalue())
             self.assertEqual(build().parse_args(["--work", "w", "--max-collaborator-per-hour", "1"] + need)
                              .max_collaborator_per_hour, 1)
-            for flag, bad, msg in (("--collaborator-timeout", "0", "must be more than 0"),
-                                   ("--collaborator-timeout", "-1", "must be more than 0"),
-                                   ("--collaborator-max-age", "-1", "must be 0 or more")):
+            for flag, bad, msg in (("--collaborator-timeout", "0", "must be a finite number more than 0"),
+                                   ("--collaborator-timeout", "-1", "must be a finite number more than 0"),
+                                   ("--collaborator-timeout", "inf", "must be a finite number more than 0"),
+                                   ("--collaborator-timeout", "1e309", "must be a finite number more than 0"),
+                                   ("--collaborator-timeout", "nan", "must be a finite number more than 0"),
+                                   ("--collaborator-max-age", "-1", "must be a finite number, 0 or more"),
+                                   ("--collaborator-max-age", "inf", "must be a finite number, 0 or more"),
+                                   ("--collaborator-max-age", "1e309", "must be a finite number, 0 or more"),
+                                   ("--collaborator-max-age", "nan", "must be a finite number, 0 or more")):
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
                     build().parse_args(["--work", "w", flag, bad] + need)

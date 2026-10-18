@@ -7,6 +7,7 @@ cap kept on disk, and the task/result loop (priority order, done ledger, retry t
 subclasses `RelayLoop`, implements `step()`, and keeps only its own transport. Stdlib only.
 """
 import argparse
+import math
 import json
 import os
 import re
@@ -76,18 +77,18 @@ def positive_arg(text):
 
 
 def positive_float(text):
-    """argparse type for a timeout: seconds, more than 0."""
+    """argparse type for a timeout: finite seconds, more than 0."""
     x = float(text)
-    if not x > 0:
-        raise argparse.ArgumentTypeError("must be more than 0")
+    if not (math.isfinite(x) and x > 0):
+        raise argparse.ArgumentTypeError("must be a finite number more than 0")
     return x
 
 
 def nonnegative_float(text):
-    """argparse type for an age bound: seconds, 0 or more (0 means off)."""
+    """argparse type for an age bound: finite seconds, 0 or more (0 means off)."""
     x = float(text)
-    if not x >= 0:
-        raise argparse.ArgumentTypeError("must be 0 or more")
+    if not (math.isfinite(x) and x >= 0):
+        raise argparse.ArgumentTypeError("must be a finite number, 0 or more")
     return x
 
 
