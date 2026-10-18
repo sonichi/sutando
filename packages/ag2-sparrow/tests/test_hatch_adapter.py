@@ -2403,12 +2403,98 @@ class StartSparrow(Base):
         self.assertIsNone(old.poll())
         self.assertFalse(self.seen.exists())
 
+    def test_no_service_never_replaces_a_service_sparrow_while_the_manager_does_not_answer(self):
+        old = self.old_sparrow()
+        unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
+        unit.parent.mkdir(parents=True)
+        unit.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\nExecStart=/x\n")
+        fake = FakeSystemd(state="active", enabled=True, main_pid=old.pid, ran=True)
+        answers, refused = iter([False, False, False]), []  # the manager answers from the fourth probe
+
+        def systemd(cmd):
+            if cmd[1:] == ["--user", "show-environment"] and not next(answers, True):
+                refused.append(cmd)
+                return subprocess.CompletedProcess(cmd, 1, "", "Failed to connect to bus")
+            return fake(cmd)
+        real_which, stopped, spawned = shutil.which, [], []
+        with mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda name, *a, **k:
+                               "/usr/bin/systemctl" if name == "systemctl" else real_which(name, *a, **k)), \
+                mock.patch.object(hatch_cli, "_systemd_run", side_effect=systemd), \
+                mock.patch.object(keepalive, "sparrow_env", return_value={"HOME": "x"}), \
+                mock.patch.object(keepalive, "_stop", side_effect=lambda pid: stopped.append(pid) or True), \
+                mock.patch.object(keepalive, "_spawn_sparrow",
+                                  side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")):
+            r = self.install()
+        self.assertEqual((stopped, spawned), ([], []), r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIsNone(old.poll())
+        self.assertGreaterEqual(len(refused), 2, "both ownership checks met the unanswering manager")
+        self.assertIn(f"skipped: the ag2-sparrow user service (--no-service); {unit} is installed but "
+                      "systemctl --user did not answer, so whether that service runs Sparrow is unknown; "
+                      "no Sparrow is stopped and no detached one is started beside it\n", r.stdout)
+        self.assertIn(f"NOTE sparrow: {unit} is installed but systemctl --user did not answer", r.stdout)
+        self.assertNotIn("replacing:", r.stdout)
+        self.assertNotIn("started:", r.stdout)
+
+    def test_an_unanswering_manager_gets_no_detached_sparrow_beside_its_unit(self):
+        unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
+        unit.parent.mkdir(parents=True)
+        unit.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\nExecStart=/x\n")
+        spawned = []
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
+                mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
+                mock.patch.object(keepalive, "_spawn_sparrow",
+                                  side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")):
+            ok, how = keepalive.restart_listener({})
+        self.assertEqual((ok, spawned), (False, []))
+        self.assertIn("did not answer; no detached Sparrow is started beside that service", how)
+
     def test_no_service_with_no_unit_runs_one_detached_sparrow(self):
         r = self.install()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertNotIn("is already installed", r.stdout)
         self.assertIn("started: started ", r.stdout)
         self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
+
+
+class ReachabilityProbe(Base):
+    """systemd_user_available answers a bool and keeps nothing show-environment prints."""
+
+    def test_the_probe_discards_what_show_environment_prints(self):
+        synthetic = "REMOTE_TASK_TOKEN=synth-probe-output-5698"
+        ran = subprocess.CompletedProcess([], 0, synthetic + "\n", synthetic + "\n")
+        out = io.StringIO()
+        with mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
+                mock.patch.object(hatch_cli, "_systemd_run", return_value=ran), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            got = hatch_cli.systemd_user_available()
+        self.assertIs(got, True)
+        self.assertEqual(out.getvalue(), "")
+        kept = {k: v for k, v in vars(hatch_cli).items() if not k.startswith("__")}
+        self.assertNotIn("synth-probe-output-5698", repr(kept))
+
+
+class InstallMasking(Base):
+    """An install reads each credential source for its diffs' masking once, however many it shows."""
+    cli, state, script = Cli.cli, Cli.state, Cli.script
+
+    def test_the_vault_is_consulted_at_most_once_per_install(self):
+        r = self.cli("install", "--mxid", AGENT, "--no-service", "--no-start")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        cfg = self.home / ".config" / "ag2-sparrow-hatch" / "config"
+        cfg.write_text(cfg.read_text() + "LOCAL=edit\n")
+        self.script.write_text(self.script.read_text() + "# local edit\n")
+        resolved, lookups = [], []
+
+        def vault():
+            resolved.append(1)
+            return lambda key: lookups.append(key) or ""
+        with mock.patch.object(gateway_credential_io, "_vault", side_effect=vault):
+            r = self.cli("install", "--mxid", AGENT, "--no-service", "--no-start", "--force")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertGreaterEqual(r.stdout.count("DIFF:"), 2, r.stdout)
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(sorted(lookups), ["AG2_REMOTE_TOKEN", "REMOTE_TASK_TOKEN"], "each key once")
 
 
 HEARTBEAT = """

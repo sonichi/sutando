@@ -216,6 +216,43 @@ class PureContractCases:
             self.assertNotIn(secret, shown, secret)
         self.assertIn("ExecStart=/x\n", shown, "a line holding no registered value is shown")
 
+    def test_a_systemd_value_is_registered_whole_whatever_its_quotes_or_escapes(self):
+        exact = "Environment=REMOTE_TASK_TOKEN='abcdefgh'\nExecStart=/bin/echo --token='abcdefgh' --x\n"
+        registry = self.c.SecretRegistry()
+        self.c.register_assignments(registry, exact)
+        self.assertEqual(self.c.mask_env_assignments(exact, registry), "Environment=<withheld>\nExecStart=<withheld>\n")
+        for env_line, secret in (("Environment=REMOTE_TASK_TOKEN='abcdefgh'", "abcdefgh"),
+                                 ('Environment="REMOTE_TASK_\\x54OKEN=abc"', "abc"),
+                                 ('Environment="REMOTE_TASK_TOKEN=alpha\\somega"', "alpha omega")):
+            with self.subTest(env_line=env_line):
+                neutral = (f"NOTE={secret}\nExecStart=/bin/echo '{secret}' --x\nDescription=Sparrow \"{secret}\"\n"
+                           f"ExecStartPre=/bin/echo {secret.replace(' ', chr(92) + 's')}\n")
+                registry = self.c.SecretRegistry()
+                self.c.register_assignments(registry, env_line + "\n", neutral)
+                shown = self.c.mask_env_assignments(neutral, registry)
+                self.assertNotIn(secret, shown)
+                self.assertEqual(len(shown.splitlines()), 4)
+
+    def test_a_credential_shape_is_withheld_whatever_the_registry_holds(self):
+        tok = "synth-shape-5698"
+        for line in (f"ExecStart=/opt/bin/sparrow --token {tok}", f"ExecStart=/opt/bin/sparrow --token={tok}",
+                     f"execstart=/opt/bin/sparrow --token {tok}", f"ExecStart=/usr/bin/env -i REMOTE_TASK_TOKEN={tok} /x",
+                     f"ExecStartPre=/bin/sh -c 'export REMOTE_TASK_TOKEN={tok}'",
+                     f'curl -H "Authorization: Bearer {tok}" https://gw.example/', f"ExecStart=/x --secret {tok}",
+                     f"ExecStart=/x --password={tok}", f"ExecStart=/x --api-key {tok}", f"ExecStart=/x --bearer {tok}",
+                     f"ExecStart=/x -H Bearer\\s{tok}", f'{{"api_key": "{tok}"}}', f"run --auth-token {tok}"):
+            for registry in (None, self.c.SecretRegistry()):
+                with self.subTest(line=line, registry=registry is not None):
+                    self.assertNotIn(tok, self.c.mask_env_assignments(line + "\n", registry))
+        old = f"ExecStart=/usr/bin/env -i REMOTE_TASK_TOKEN={tok} /x\n"
+        new = f'ExecStart=/usr/bin/env X={tok} /x\nDescription=Sparrow {tok}\nNOTE={tok}\n{{"note": "{tok}"}}\n'
+        registry = self.c.SecretRegistry()
+        self.c.register_assignments(registry, old, new)
+        self.assertNotIn(tok, self.c.mask_env_assignments(old, registry) + self.c.mask_env_assignments(new, registry),
+                         "a value found by its shape is withheld wherever it recurs")
+        self.assertEqual(self.c.mask_env_assignments(f"Description=Sparrow {tok}\n", self.c.SecretRegistry()),
+                         f"Description=Sparrow {tok}\n", "the stated limit: a bare token nothing names")
+
     def test_edge_paths_never_raise(self):
         registry = self.c.SecretRegistry()
         registry.register("\ud800lone")  # not even surrogateescape encodes a lone high surrogate
@@ -553,11 +590,12 @@ class RealSinks(unittest.TestCase):
         host = owner.CREDENTIAL_KEYS + (owner.TOKEN_FILE_KEY, owner.CHANNEL_DIR_KEY, "AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR")
         env = {k: v for k, v in os.environ.items() if k not in host}
         env.update(fx.env, HOME=str(fx.root))
-        vault = getattr(fx, "vault", "")
+        vault, lookups = getattr(fx, "vault", ""), getattr(fx, "lookups", None)
+        lookups = lookups if isinstance(lookups, list) else []
         with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(io.StringIO()), \
                 mock.patch.object(gateway_credential_io, "_vault", return_value=lambda key: (
-                    vault if key == "REMOTE_TASK_TOKEN" else "")):
+                    lookups.append(key) or (vault if key == "REMOTE_TASK_TOKEN" else ""))):
             hatch_cli._install_file(unit, ours, 0o644, refuse_drift=True, force=False)
         self.assertIn("DIFF:", out.getvalue())
         return out.getvalue()
@@ -642,6 +680,67 @@ class RealSinks(unittest.TestCase):
             self.assertNotIn(secret, shown)
             self.assertNotIn("x54", shown)
             self.assertEqual(shown.count("-Environment=<withheld>\n"), 8)
+
+    @staticmethod
+    def body(shown: str) -> str:
+        """The diff's own lines, without the headers that name the temp paths."""
+        return "".join(line for line in shown.splitlines(True)
+                       if line[:1] in "+- " and not line.startswith(("---", "+++")))
+
+    def bare(self, root: Path, lookups: "list | None" = None):
+        """A host with no credential anywhere: an empty environment, no files, a vault that holds
+        nothing and records each key it is asked for."""
+        return mock.Mock(root=root, env={}, vault="", lookups=lookups if lookups is not None else [])
+
+    def test_the_hatch_install_diff_registers_a_systemd_value_whole(self):
+        with tempfile.TemporaryDirectory() as td:
+            exact = self.hatch_diff(self.bare(Path(td)), "[Service]\nEnvironment=REMOTE_TASK_TOKEN='abcdefgh'\n"
+                                                         "ExecStart=/bin/echo --token='abcdefgh' --x\n")
+            self.assertEqual(self.body(exact), " [Service]\n-Environment=<withheld>\n-ExecStart=<withheld>\n"
+                                               "+ExecStart=/y\n")
+        for env_line, secret in (("Environment=REMOTE_TASK_TOKEN='abcdefgh'", "abcdefgh"),
+                                 ('Environment="REMOTE_TASK_\\x54OKEN=abc"', "abc"),
+                                 ('Environment="REMOTE_TASK_TOKEN=alpha\\somega"', "alpha omega")):
+            with self.subTest(env_line=env_line), tempfile.TemporaryDirectory() as td:
+                shown = self.body(self.hatch_diff(self.bare(Path(td)), f"[Service]\n{env_line}\nNOTE={secret}\n"
+                                                                       f"ExecStart=/bin/echo '{secret}' --x\n"))
+                self.assertNotIn(secret, shown)
+                self.assertIn("-NOTE=<withheld>\n-ExecStart=<withheld>\n", shown)
+
+    def test_the_hatch_install_diff_withholds_every_credential_shape(self):
+        tok = "synth-shape-sink-5698"
+        lines = (f"ExecStart=/opt/bin/sparrow --token {tok}", f"ExecStart=/opt/bin/sparrow --token={tok}",
+                 f"execstart=/opt/bin/sparrow --token {tok}", f"ExecStart=/usr/bin/env -i REMOTE_TASK_TOKEN={tok} /x",
+                 f"ExecStartPre=/bin/sh -c 'export REMOTE_TASK_TOKEN={tok}'",
+                 f'ExecStartPost=/usr/bin/curl -H "Authorization: Bearer {tok}" https://gw.example/')
+        for line in lines:
+            with self.subTest(line=line), tempfile.TemporaryDirectory() as td:
+                lookups = []
+                shown = self.body(self.hatch_diff(self.bare(Path(td), lookups), f"[Service]\n{line}\nExecStart=/x\n"))
+                self.assertNotIn(tok, shown)
+                self.assertIn("-ExecStart=/x\n", shown, "a line with no shape is shown")
+        with tempfile.TemporaryDirectory() as td:
+            recur = (f"ExecStart=/usr/bin/env X={tok} /x\nDescription=Sparrow {tok}\nNOTE={tok}\n"
+                     f'Note={{"note": "{tok}"}}\n')
+            shown = self.body(self.hatch_diff(self.bare(Path(td)), f"[Service]\n{lines[3]}\n{recur}"))
+            self.assertNotIn(tok, shown, "a value found by its shape is withheld wherever it recurs")
+        with tempfile.TemporaryDirectory() as td:
+            limit = self.body(self.hatch_diff(self.bare(Path(td)), f"[Service]\nDescription=Sparrow {tok}\n"))
+            self.assertIn(f"-Description=Sparrow {tok}\n", limit, "the stated limit: a bare token nothing names")
+
+    def test_the_hatch_install_diff_seeds_from_the_default_device_file(self):
+        live = "synth-default-device-5698"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            device = root / ".config" / "ag2-sparrow" / "relay.env"
+            device.parent.mkdir(parents=True)
+            device.write_text(f"REMOTE_TASK_TOKEN={live}\n")
+            lookups = []
+            shown = self.body(self.hatch_diff(self.bare(root, lookups), f"[Service]\nExecStart=/x --flag {live}\n"
+                                                                        f"NOTE={live}\n"))
+            self.assertNotIn(live, shown)
+            self.assertIn("-ExecStart=<withheld>\n-NOTE=<withheld>\n", shown)
+            self.assertEqual(lookups, [], "the default device file holds the token: the vault is not reached")
 
     def install_service(self, fx, installed: str, drop_in: str = "") -> str:
         """install_service over `installed` (and a drop-in beside it), with a reachable fake systemd."""
@@ -847,7 +946,7 @@ OWNER_READERS = {"env_files": (1, ("read_text",)), "discover": (None, ("read_tok
 IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_bridge.py", "_read_text"),
               ("remote_gateway_bridge.py", "_vault_lookup"), ("adapters/hatch/cli.py", "systemd_user_available"),
               ("gateway_credential_io.py", "read_file"), ("gateway_credential_io.py", "vault_lookup"),
-              ("gateway_credential_io.py", "_vault")}
+              ("gateway_credential_io.py", "_vault"), ("gateway_credential_io.py", "_vault_once")}
 # A command whose output is a credential store: the Keychain, or the systemd user manager's environment.
 STORE_READS = ("security", "find-generic-password", "show-environment")
 
@@ -883,6 +982,35 @@ def _free_refs(node, bound=frozenset()):
         yield node.attr
     for child in ast.iter_child_nodes(node):
         yield from _free_refs(child, bound)
+
+
+# What would keep the manager's environment: reading its text, printing, storing or yielding it.
+PROBE_KEEPS = (ast.Global, ast.Nonlocal, ast.Assign, ast.AugAssign, ast.AnnAssign, ast.NamedExpr, ast.Yield,
+               ast.YieldFrom, ast.Lambda)
+
+
+def _probe_keeps(inner, parents) -> "list[str]":
+    """Why a scope that runs show-environment keeps its output: the run's result must be passed
+    straight to _ok, a bool, and the scope may not read stdout/stderr, print, write or store."""
+    if not any(isinstance(n, ast.Constant) and n.value == "show-environment" for n in inner):
+        return []
+    why = []
+    for n in inner:
+        if isinstance(n, ast.Constant) and n.value == "show-environment":
+            run = parents.get(n)
+            while run is not None and not isinstance(run, ast.Call):
+                run = parents.get(run)
+            outer = parents.get(run)
+            if not (isinstance(outer, ast.Call) and getattr(outer.func, "id", None) == "_ok" and run in outer.args):
+                why.append("its result is not only tested by _ok")
+        elif isinstance(n, ast.Attribute) and n.attr in ("stdout", "stderr", "output"):
+            why.append(f"reads .{n.attr}")
+        elif isinstance(n, ast.Call) and (getattr(n.func, "id", None) or getattr(n.func, "attr", None)) in (
+                "print", "write", "append", "extend", "add", "update", "setattr", "setdefault"):
+            why.append("prints or stores")
+        elif isinstance(n, PROBE_KEEPS):
+            why.append(type(n).__name__)
+    return why
 
 
 def credential_access(source: str, rel: str) -> "list[str]":
@@ -935,6 +1063,7 @@ def credential_access(source: str, rel: str) -> "list[str]":
             any(isinstance(n, (ast.Import, ast.ImportFrom)) and "channel_token" in ast.unparse(n) for n in inner)
         if (reads or store) and (rel, name) not in IO_ALLOWED:
             out.append(f"{rel}:{name} credential I/O outside the adapters' edge")
+        out += [f"{rel}:{name} the show-environment probe keeps its output ({why})" for why in _probe_keeps(inner, parents)]
     for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
         callee = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
         if callee not in OWNER_READERS:
@@ -996,6 +1125,23 @@ class Guard(unittest.TestCase):
         self.assertEqual(credential_access(allowed, "remote_gateway_bridge.py"), [])
         self.assertEqual(credential_access('"""Put REMOTE_TASK_TOKEN in the .env file."""\nx = 1\n', "probe.py"), [],
                          "a docstring naming a key is prose, not a read")
+
+    def test_the_reachability_probe_discards_what_show_environment_prints(self):
+        rel, run = "adapters/hatch/cli.py", '_systemd_run(["systemctl", "--user", "show-environment"])'
+        shipped = (f'def systemd_user_available():\n    return shutil.which("systemctl") is not None and \\\n'
+                   f"        _ok({run})\n")
+        self.assertEqual(credential_access(shipped, rel), [])
+        keeps = [f"    return {run}",
+                 f"    return {run}.stdout",
+                 f"    r = {run}\n    print(r.stdout)\n    return _ok(r)",
+                 f"    global LAST\n    LAST = {run}\n    return _ok(LAST)",
+                 f"    _ok({run})\n    CACHE.append({run})\n    return True",
+                 f"    return _ok(r := {run}) and bool(r.stdout)",
+                 f"    sys.stderr.write(str({run}))\n    return True",
+                 f"    yield {run}"]
+        for body in keeps:
+            with self.subTest(body=body):
+                self.assertTrue(credential_access(f"def systemd_user_available():\n{body}\n", rel), body)
 
     def test_the_vendored_and_generated_copies_match_their_sources(self):
         for cmd in ([sys.executable, str(PKG / "tools" / "sync_from_src.py"), "--check"],

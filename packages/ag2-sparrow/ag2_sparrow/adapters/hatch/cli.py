@@ -131,12 +131,28 @@ def _record_script(sha: str) -> None:
                                             [r for r in recorded if r != sha] + [sha]), 0o644)
 
 
+# One install's masking registry, seeded on its first diff so each credential source is read once.
+_INSTALL_MASK: dict = {}
+
+
+def _masking_registry() -> "gateway_credentials.SecretRegistry":
+    """A registry holding every credential candidate the environment Sparrow gets leads to: this
+    one with AG2_DEVICE_ENV as the unit and a detached Sparrow receive it (masking only)."""
+    registry = _INSTALL_MASK.get("registry")
+    if registry is None:
+        registry = gateway_credentials.SecretRegistry()
+        gateway_credential_io.register_candidates(
+            dict(os.environ, AG2_DEVICE_ENV=str(device_env_path())), registry)
+        if _INSTALL_MASK.get("open"):
+            _INSTALL_MASK["registry"] = registry
+    return registry
+
+
 def _diff(old: str, new: str, path: Path) -> str:
     """The diff of an installed file against ours, as gateway_credentials.mask_env_assignments
-    shows it: no environment line's content, and no value registered from either text or from
-    any credential candidate this environment leads to (masking only; the bridge decides)."""
-    registry = gateway_credentials.SecretRegistry()
-    gateway_credential_io.register_candidates(os.environ, registry)
+    shows it: no environment line's content, no credential shape, and no value registered from
+    either text or from any credential candidate (masking only; the bridge decides)."""
+    registry = _masking_registry()
     gateway_credentials.register_assignments(registry, old, new)
     old, new = (gateway_credentials.mask_env_assignments(t, registry) for t in (old, new))
     return "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
@@ -608,6 +624,15 @@ def service_status(reply_command: str = "") -> "tuple[bool | None, str]":
 
 
 def install(args) -> int:
+    _INSTALL_MASK.clear()
+    _INSTALL_MASK["open"] = True
+    try:
+        return _install(args)
+    finally:
+        _INSTALL_MASK.clear()
+
+
+def _install(args) -> int:
     from . import keepalive
     reply_command = find_reply_command()
     problem = reply_command_problem(reply_command)
@@ -639,7 +664,12 @@ def install(args) -> int:
                            reply_command, cron, keepalive_log)
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
-    if args.no_service and keepalive._unit_owner() is not None:
+    owner = keepalive._unit_owner() if args.no_service else None
+    if owner == keepalive.UNIT_UNREACHABLE:
+        print(f"skipped: the ag2-sparrow user service (--no-service); {service_path()} is "
+              "installed but systemctl --user did not answer, so whether that service runs Sparrow "
+              "is unknown; no Sparrow is stopped and no detached one is started beside it")
+    elif owner is not None:
         print(f"skipped: the ag2-sparrow user service (--no-service); {service_path()} "
               "is already installed, so that service runs Sparrow and its environment is the live "
               "identity; no detached Sparrow is started beside it")

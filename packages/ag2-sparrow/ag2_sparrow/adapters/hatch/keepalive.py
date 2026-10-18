@@ -236,7 +236,11 @@ def _spawn_sparrow(cfg: dict) -> "tuple[bool, str]":
 
 def restart_listener(cfg: dict) -> "tuple[bool, str]":
     """Through the user service install wrote when there is one, else a detached Sparrow."""
-    if _service_managed():
+    owner = _unit_owner()
+    if owner == UNIT_UNREACHABLE:
+        return False, (f"{_cli.service_path()} is installed but systemctl --user did not answer; "
+                       "no detached Sparrow is started beside that service")
+    if owner == "ours":
         # A unit left failed by its start limit stays down until reset.
         _cli._systemd_run(["systemctl", "--user", "reset-failed", _cli.SERVICE_NAME])
         r = _cli._systemd_run(["systemctl", "--user", "restart", _cli.SERVICE_NAME])
@@ -327,18 +331,19 @@ def replace_sparrow(cfg: dict, pid: int) -> "tuple[bool, str]":
                 f"{how}; the old Sparrow (pid {pid}) was stopped, so none is running now")
 
 
+UNIT_UNREACHABLE = "unreachable"
+
+
 def _unit_owner() -> "str | None":
-    """"ours" for the unit install wrote, "other" for a hand-made one, None for no unit
-    (or no systemd to run it)."""
+    """"ours" for the unit install wrote, "other" for a hand-made one, None for no unit (or no
+    systemctl), UNIT_UNREACHABLE for a unit whose user manager did not answer: not "no unit"."""
     unit = _cli.service_path()
-    if not unit.is_file() or not _cli.systemd_user_available():
+    if not unit.is_file() or _cli.shutil.which("systemctl") is None:
         return None
+    if not _cli.systemd_user_available():
+        return UNIT_UNREACHABLE
     text = unit.read_text(encoding="utf-8", errors="replace")
     return "ours" if text.startswith(_cli.SERVICE_MARKER) else "other"
-
-
-def _service_managed() -> bool:
-    return _unit_owner() == "ours"
 
 
 def _wall_from_monotonic_us(value: "str | None") -> "float | None":
@@ -362,6 +367,11 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
     started = time.time()
     holder = _cli.live_lock_holder(_cli._lock_record(state, instance))
     owner = _unit_owner()
+    if owner == UNIT_UNREACHABLE:
+        print(f"NOTE sparrow: {_cli.service_path()} is installed but systemctl --user did not "
+              "answer, so whether that service runs Sparrow is unknown; install neither stops nor "
+              "starts a Sparrow. Run ag2-sparrow-hatch verify once the user manager answers")
+        return 0
     if owner == "other":
         print(f"NOTE sparrow: {_cli.service_path()} was not written by install, so install "
               "neither starts nor replaces the Sparrow it runs; run ag2-sparrow-hatch verify")

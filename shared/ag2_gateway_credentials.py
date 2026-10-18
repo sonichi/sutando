@@ -162,7 +162,67 @@ def forms(secret: str) -> "set[str]":
 
 
 def _views(text: str) -> "set[str]":
-    return {fold(v) for v in (text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text))}
+    """`text` as matched: raw, percent-decoded, systemd-unescaped and with its quotes off, so no
+    quoting or escaping in the rendered line decides whether a secret in it is seen."""
+    texts = {text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text)}
+    texts |= {systemd_unescape(t) for t in tuple(texts)}
+    return {fold(v) for t in texts for v in (t, _unquoted(t))}
+
+
+_SYSTEMD_ESCAPE_RE = re.compile(r"\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|[0-7]{3}|.)", re.S)
+_SYSTEMD_SIMPLE = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v", "s": " "}
+
+
+def _unescape_one(m: "re.Match[str]") -> str:
+    e = m.group(1)
+    try:
+        if len(e) > 1 and e[0] in "xuU":
+            return chr(int(e[1:], 16))
+        if len(e) == 3:
+            return chr(int(e, 8))
+    except (ValueError, OverflowError):
+        return m.group(0)
+    return _SYSTEMD_SIMPLE.get(e, e)
+
+
+def systemd_unescape(text: str) -> str:
+    """`text` with the C-style escapes systemd decodes in a unit value (\\xNN, \\NNN, \\uNNNN,
+    \\UNNNNNNNN, \\s and the single-letter ones) decoded. Total over any str."""
+    return _SYSTEMD_ESCAPE_RE.sub(_unescape_one, str(text))
+
+
+def _unquoted(text: str) -> str:
+    return text.replace('"', "").replace("'", "")
+
+
+def systemd_words(text: str) -> "list[str]":
+    """`text` split into words as systemd splits an Environment= value: whitespace outside quotes,
+    quotes anywhere in a word removed, escapes decoded. An unclosed quote runs to the end."""
+    words, cur, quote, started, i = [], [], "", False, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            cur.append(text[i:i + 2])
+            started, i = True, i + 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = ""
+            else:
+                cur.append(ch)
+        elif ch in "\"'":
+            quote, started = ch, True
+        elif ch.isspace():
+            if started:
+                words.append("".join(cur))
+            cur, started = [], False
+        else:
+            cur.append(ch)
+            started = True
+        i += 1
+    if started:
+        words.append("".join(cur))
+    return [systemd_unescape(w) for w in words]
 
 
 class SecretRegistry:
@@ -406,38 +466,84 @@ def _join(group: "list[str]") -> str:
     return " ".join(p[:-1] if p.endswith("\\") and i < len(kept) - 1 else p for i, p in enumerate(kept))
 
 
+_SHAPE_NAME = r"[\w-]*(?:token|secret|passw(?:or)?d|api[-_]?key|bearer|auth)[\w-]*"
+_SHAPE_VALUE = r"(\"[^\"]*\"?|'[^']*'?|[^\s\"';&|]+)"
+# Any `KEY=value` in the line (env -i, sh -c 'export ...', an argument), and a quoted JSON key.
+_ANY_ASSIGNMENT_RE = re.compile(r"(?<![\w-])([A-Za-z_][A-Za-z0-9_]*)\s*=\s*" + _SHAPE_VALUE + "?")
+_JSON_KEY_RE = re.compile(r"[\"']([\w-]+)[\"']\s*:\s*" + _SHAPE_VALUE + "?")
+# A credential flag in `--flag value` or `--flag=value` form.
+_FLAG_RE = re.compile(r"(?i)(?:^|(?<=[\s\"'=(]))--?" + _SHAPE_NAME + r"(?:(?:=|\s+)" + _SHAPE_VALUE + ")?")
+_HEADER_RE = re.compile(r"(?i)\bauthorization\s*:\s*(?:[A-Za-z]+\s+)?" + _SHAPE_VALUE
+                        + r"?|\bbearer\s+" + _SHAPE_VALUE)
+
+
+def _shape_views(text: str) -> "set[str]":
+    return {v for t in (text, systemd_unescape(text)) for v in (t, _unquoted(t))}
+
+
+def credential_shapes(text: str) -> "list[str]":
+    """The value of every credential shape in `text` ('' for one with no value): a credential-named
+    KEY= or quoted JSON key anywhere, a credential flag, an Authorization: header or a Bearer value."""
+    found = []
+    for view in _shape_views(str(text)):
+        for regex in (_ANY_ASSIGNMENT_RE, _JSON_KEY_RE):
+            found += [m.group(2) or "" for m in regex.finditer(view) if _CREDENTIAL_NAME_RE.search(m.group(1))]
+        found += [m.group(1) or "" for m in _FLAG_RE.finditer(view)]
+        found += [m.group(1) or m.group(2) or "" for m in _HEADER_RE.finditer(view)]
+    return found
+
+
+def credential_shaped(text: str) -> bool:
+    """Whether `text` carries a credential by its shape, whatever the registry holds."""
+    return bool(credential_shapes(text))
+
+
+def _register_value(registry: "SecretRegistry", value: str, min_len: int) -> None:
+    """`value` as written, systemd-unescaped and with its quotes off, each registered."""
+    forms_ = {value, systemd_unescape(value), value.strip("'\""), _unquoted(systemd_unescape(value))}
+    try:
+        forms_.add(value.encode("latin-1", "backslashreplace").decode("unicode_escape"))
+    except (UnicodeError, ValueError):
+        pass
+    for form in forms_:
+        registry.register(form, min_len=min_len)
+
+
 def register_assignments(registry: "SecretRegistry", *texts: str) -> None:
     """Every value the texts assign, registered before any of them is shown: a credential-named
-    key's at any length, and each value on an environment line at BARE_SECRET_MIN, so the same
+    key's at any length, each value on an environment line (split as systemd splits it, and as
+    written) at BARE_SECRET_MIN, and every credential shape's value at any length, so the same
     value under a neutral key or on another line is withheld too."""
     for text in texts:
         for group in _groups(text):
             joined = _join(group)
             if any(sets_environment(line) for line in group):
-                words = re.split(r"[\s\"']+", joined.partition("=")[2])
+                rest = joined.partition("=")[2]
+                words = systemd_words(rest) + re.split(r"[\s\"']+", rest)
             else:
                 m = _ASSIGNMENT_LINE_RE.match(joined)
                 credential = m and _CREDENTIAL_NAME_RE.search(m.group(3))
                 words = [f"{m.group(3)}={parse_env_value(m.group(5))}"] if credential else []
             for word in words:
                 key, eq, value = word.partition("=")
-                if not eq:
-                    continue
-                min_len = 1 if _CREDENTIAL_NAME_RE.search(key) else BARE_SECRET_MIN
-                registry.register(value, min_len=min_len)
-                try:
-                    registry.register(value.encode("latin-1", "backslashreplace").decode("unicode_escape"),
-                                      min_len=min_len)
-                except (UnicodeError, ValueError):
-                    pass
+                if eq:
+                    named = _CREDENTIAL_NAME_RE.search(systemd_unescape(key))
+                    _register_value(registry, value, 1 if named else BARE_SECRET_MIN)
+            for value in credential_shapes(joined):
+                if value:
+                    _register_value(registry, value, 1)
 
 
 def _mask_line(body: str, registry: "SecretRegistry | None") -> str:
+    """One rendered line: an assignment shows only its key when its value holds a credential shape
+    or a registered secret; any other line holding either is withheld whole."""
+    held = registry is not None and registry.contains(body)
     m = _ASSIGNMENT_LINE_RE.match(body)
-    if m:
+    if m and not (registry is not None and registry.contains(m.group(3))):
         indent, export, key, sep, raw = m.groups()
-        return f"{indent}{export or ''}{key}{sep}{mask_assignment(key, parse_env_value(raw), registry)}"
-    return WITHHELD_TEXT if registry is not None and registry.contains(body) else body
+        value = WITHHELD if credential_shaped(raw) or held else mask_assignment(key, parse_env_value(raw), registry)
+        return f"{indent}{export or ''}{key}{sep}{value}"
+    return WITHHELD_TEXT if held or credential_shaped(body) else body
 
 
 def mask_env_assignments(text: str, registry: "SecretRegistry | None" = None) -> str:

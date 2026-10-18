@@ -54,7 +54,14 @@ def _vault() -> "Optional[Callable[[str], str]]":
 
 def register_candidates(env: Mapping[str, str], registry: "gateway_credentials.SecretRegistry") -> None:
     """Register every gateway credential candidate `env` leads to (the environment, the channel
-    .env files, the token file, the vault when no earlier tier holds a token), for masking only."""
+    .env files, the token file, the vault when no earlier tier holds a token), for masking only.
+    The vault reader is resolved once, and only when that tier is reached."""
+    resolved: list = []
+
+    def _vault_once(key: str) -> str:
+        if not resolved:
+            resolved.append(_vault() or (lambda _k: ""))
+        return resolved[0](key)
     gateway_credential_sources.discover(
         env, gateway_credential_sources.env_files(env, read_file), read_token_file=read_file,
-        vault_lookup=lambda key: (_vault() or (lambda _k: ""))(key), registry=registry)
+        vault_lookup=_vault_once, registry=registry)
