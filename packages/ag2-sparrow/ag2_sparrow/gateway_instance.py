@@ -18,7 +18,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from . import file_lock, holder_lock
+from . import file_lock, task_io
 
 INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 
@@ -94,9 +94,12 @@ KEY_GRACE_S = 5.0
 
 def binding_key_path() -> Path:
     """The per-install key the binding is computed with: in the config dir under the effective
-    uid's passwd home (holder_lock's), so every launch context resolves one key; never the
-    state dir, which may be synced."""
-    return Path(holder_lock._home()) / ".config" / "ag2-sparrow" / "binding.key"
+    uid's passwd home (task_io.user_home), so every launch context resolves one key; never the
+    state dir, which may be synced. OSError when the uid has no passwd entry."""
+    home = task_io.user_home()
+    if not home:
+        raise OSError("no passwd home for this uid")
+    return Path(home) / ".config" / "ag2-sparrow" / "binding.key"
 
 
 def _read_key(path: Path) -> "bytes | None":
@@ -125,7 +128,7 @@ def _fsync_dir(path: Path) -> None:
 def _binding_key(create: bool) -> "bytes | None":
     try:
         path = binding_key_path()
-    except holder_lock.LockError:
+    except OSError:
         return None
     key = _read_key(path)
     if key is not None or not create:
