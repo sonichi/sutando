@@ -2717,8 +2717,8 @@ def _http_error_body(e) -> str:
 
 
 def _read_token_file(path: str) -> str:
-    """The onboarding string from a token file, or "" (missing / unreadable / empty: no rotation);
-    gateway_credential_sources.token_file_token decides the shape."""
+    """The onboarding string from a token file, or "" (missing, unreadable, not UTF-8 or empty: no
+    rotation); gateway_credential_sources.token_file_token decides the shape."""
     return gateway_credential_sources.token_file_token(_read_text(path))
 
 

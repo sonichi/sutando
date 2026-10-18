@@ -296,8 +296,22 @@ class DiscoveryCases:
         self.assertEqual(self.o.first_env({"REMOTE_TASK_TOKEN": "''", "AG2_REMOTE_TOKEN": "x"}, self.o.TOKEN_KEYS),
                          ("", "REMOTE_TASK_TOKEN"), "a set but quoted-empty env value still wins, as it always has")
 
+    def test_a_file_value_is_unquoted_once(self):
+        padded = 'REMOTE_TASK_TOKEN="  pad-tok-1  "\nREMOTE_TASK_URL="  https://p.example/r  "\n'
+        vals = self.o.parse_env_text(padded)
+        self.assertEqual(self.o.token_from_files([("/a", vals)])[:2], ("  pad-tok-1  ", "  https://p.example/r  "),
+                         "the file tier uses the value parse_env_text gave, as main does")
+        self.assertEqual(self.o.token_file_token(padded), "  pad-tok-1  ")
+        self.assertEqual(self.o.token_file_url(padded), "  https://p.example/r  ")
+        blank = [("/a", self.o.parse_env_text('REMOTE_TASK_TOKEN=" \'\'"\n')), ("/b", {"REMOTE_TASK_TOKEN": "later"})]
+        self.assertEqual(self.o.token_from_files(blank)[0], " ", "a quoted space is not re-stripped into absence")
+        registry = self.o.contract.SecretRegistry()
+        found = self.o.discover({}, [("/a", vals)], registry=registry)
+        self.assertEqual(found.raw, "  pad-tok-1  ")
+        self.assertTrue(registry.contains(f"Bearer {found.raw}."), "the value used is the value registered")
+
     def test_the_owner_opens_nothing_itself(self):
-        tree = ast.parse((REPO / "src" / "gateway_credential_sources.py").read_text())
+        tree = ast.parse(Path(self.o.__file__).read_text())
         calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
         for io_call in ("open", "os.environ.get", "os.getenv", "Path", "print"):
             self.assertNotIn(io_call, calls, io_call)
@@ -374,6 +388,17 @@ class RealSinks(unittest.TestCase):
                                                       'import os\nprint(json.dumps({"marker": os.environ.get("REMOTE_MEDIA_MARKER"), '))
             self.assertEqual((out["token"], out["source"], out["marker"]), (CHANNEL_TOKEN, "file", "media-tag"))
             self.assertIn(f"loaded from {fx.channel}", err)
+
+    def test_a_non_utf8_token_file_is_no_rotation(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), ROWS[0])
+            bad = fx.root / "bad-token"
+            bad.write_bytes(b"REMOTE_TASK_TOKEN=\xff\xfe-not-utf8\n")
+            fx.env["REMOTE_TASK_TOKEN_FILE"] = str(bad)
+            out, _err = self.bridge(fx, BRIDGE.replace("print(json.dumps({",
+                                                      'print(json.dumps({"rotated": m._read_token_file(m.TOKEN_FILE), '))
+            self.assertEqual((out["rotated"], out["token"], out["token_file"]), ("", ENV_TOKEN, str(bad)),
+                             "the import survives it and a rotation read is no rotation, never an exception")
 
     def test_the_hatch_install_diff_withholds_every_candidate_of_every_row(self):
         for row in ROWS:

@@ -87,9 +87,10 @@ def channel_env_paths(env: Mapping[str, str], channel_dir: str = DEFAULT_CHANNEL
 
 
 def first(values: Mapping[str, str], keys) -> "tuple[str, str]":
-    """(value, key) of the first key with a non-empty value; ('', '') when none."""
+    """(value, key) of the first key with a non-empty value; ('', '') when none. The values are
+    already parsed (parse_env_text, _assignments): unquoting them again would change a padded token."""
     for key in keys:
-        value = unquote(values.get(key) or "")
+        value = values.get(key) or ""
         if value:
             return value, key
     return "", ""
@@ -208,8 +209,8 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
     token_file_env = env.get(TOKEN_FILE_KEY) or ""
     token_file_text = read_token_file(token_file_env) if (token_file_env and read_token_file) else ""
     if registry is not None:
-        register(registry, [unquote(values.get(key) or "") for values in [env] + [v for _p, v in files]
-                            for key in CREDENTIAL_KEYS])
+        register(registry, [unquote(env.get(key) or "") for key in CREDENTIAL_KEYS])
+        register(registry, [values.get(key) or "" for _p, values in files for key in CREDENTIAL_KEYS])
         register(registry, [token_file_token(token_file_text), token_file_url(token_file_text)])
 
     found = {"raw": "", "token_key": "", "source": "none", "source_file": "", "source_vals": {},
