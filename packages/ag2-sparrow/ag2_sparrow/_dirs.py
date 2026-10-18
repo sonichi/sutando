@@ -39,3 +39,10 @@ def result_dir():
 
 def state_dir():
     return _resolve("state", "AGENT_CONNECT_STATE_DIR", _DEFAULT_BASE / "state")
+
+
+def device_env_path():
+    """The 0600 .env file holding REMOTE_TASK_TOKEN that Sparrow reads at startup; every installer
+    points its service at this path and never copies the token anywhere else."""
+    env = os.environ.get("AG2_DEVICE_ENV")
+    return Path(env).expanduser() if env else Path.home() / ".config" / "ag2-sparrow" / "relay.env"

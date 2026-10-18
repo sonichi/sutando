@@ -119,23 +119,58 @@ headless stream showed two separate `init`/`result` pairs, the arming turn and
 the task's own. Plain `claude -p "<prompt>" < /dev/null` exits when its first
 turn ends, so a headless agent needs stdin held open.
 
-## Launch
+## Launch: `ag2-sparrow-connect claude-local`
+
+The package's `ag2-sparrow-connect` console script hosts the session, so the
+hand launch below is only for a one-off look:
 
 ```bash
-env -i PATH="$PATH" HOME="$HOME" USER="$USER" \
-  CLAUDE_CONFIG_DIR=<workspace>/.claude-sutando \
-  AG2_INBOX_DIR=<sparrow task dir> AG2_RESULTS_DIR=<sparrow result dir> \
-  AG2_HMAC_KEY_FILE=<workspace>/state/auth/task-hmac.key \
-  claude --plugin-dir packages/ag2-sparrow/adapters/claude-code/ag2space-inbox --permission-mode bypassPermissions
+ag2-sparrow-connect claude-local install \
+  --plugin-dir packages/ag2-sparrow/adapters/claude-code/ag2space-inbox \
+  --claude-config-dir <workspace>/.claude-sutando \
+  --hmac-key-file <workspace>/state/auth/task-hmac.key
+  # --inbox / --results default to Sparrow's own dirs; --permission-mode default bypassPermissions
+ag2-sparrow-connect claude-local verify
+ag2-sparrow-connect claude-local uninstall
 ```
 
-then: "Arm ag2space_inbox_watch and keep working on nothing; when a task
-arrives, answer it with ag2space_reply." `env -i` keeps the host's
-`SUTANDO_*` out of the session. **`USER` is required on macOS**: the config
-dir's `claude.ai` login lives in the Keychain under the account name, and
-without `USER` the CLI falls back to `.credentials.json` and reports
-`loggedIn: false` (`claude auth status` is the cheap check). Add the host's
-`ANTHROPIC_BASE_URL` when its API path goes through a local proxy.
+`install` checks `claude --version` against the pin (2.1.287; an older CLI is
+one clear line and exit 2, nothing written), records the paths in
+`~/.config/ag2-sparrow/claude-local.conf` (0600, marker first line), and
+writes a supervisor whose first line is a marker: a systemd user unit
+(`~/.config/systemd/user/ag2-sparrow-claude-local.service`, `Restart=always`,
+`RestartSec=10`, `RestartPreventExitStatus=75`, linger requested) on Linux, a
+launchd agent (`~/Library/LaunchAgents/ai.ag2.sparrow.claude-local.plist`,
+`KeepAlive`, `RunAtLoad`, `ThrottleInterval` 10) on macOS. Both run
+`ag2-sparrow-connect claude-local run`, carry paths only, and never the relay
+token: that stays in Sparrow's 0600 `relay.env`, and the Claude login stays in
+its config dir (`verify` runs `claude auth status` there; nothing is copied).
+
+`run` checks the pin again, takes the one-session-per-inbox `holder_lock` on
+the resolved inbox dir for the whole child (a second launcher exits 75, which
+the systemd unit does not relaunch), and starts
+
+```
+claude --plugin-dir <plugin> --permission-mode bypassPermissions \
+  -p --input-format stream-json --output-format stream-json --verbose
+```
+
+with an environment of only `PATH`, `HOME`, `USER`, `ANTHROPIC_BASE_URL`
+(when set), `CLAUDE_CONFIG_DIR`, `AG2_INBOX_DIR`, `AG2_RESULTS_DIR`,
+`AG2_HMAC_KEY_FILE`, `AG2_HMAC_STRICT` and the marker `AG2_AUTOARM=1`, so the
+host's `SUTANDO_*` never reaches the session. With that marker the Mod arms
+the inbox watch itself at `session.start` from `AG2_INBOX_DIR` /
+`AG2_RESULTS_DIR`, with no model turn and nothing written to stdin, on
+**every** start (a restart re-arms the same way); stdin is held open so the
+session lives until the supervisor stops it. A session launched by hand
+without the marker is armed by the explicit prompt: "Arm ag2space_inbox_watch
+and keep working on nothing; when a task arrives, answer it with
+ag2space_reply."
+`--permission-mode` on `install` narrows the unattended default; a mode that
+prompts stalls the queue at the first prompting tool. **`USER` is required on
+macOS**: the config dir's `claude.ai` login lives in the Keychain under the
+account name, and without `USER` the CLI falls back to `.credentials.json` and
+reports `loggedIn: false` (`claude auth status` is the cheap check).
 
 Helpers: `drop-task.sh <inbox> <keyfile> <suffix> "<message>"` writes a
 Sparrow-shaped, stamped, task-last file by temp + fsync + rename;
@@ -155,10 +190,19 @@ mtime delta.
 ## Limits
 
 - The Mods API moves between releases (2.1.287+; built and measured on
-  2.1.296). Re-run validate and the tests after a CLI upgrade.
+  2.1.296). `install`, `run` and `verify` compare `claude --version` to the
+  pin and refuse an older CLI with one line and exit 2 before any session
+  starts; a newer CLI passes, so re-run validate and the tests after an
+  upgrade.
 - The seen-set is module memory: a reload re-scans and re-submits anything
   without a non-empty result file, one per tick in name order. One session per
-  inbox — two armed sessions would double-submit.
+  inbox: the launcher holds the inbox's `holder_lock` for the whole child and a
+  second launcher exits 75. launchd has no `RestartPreventExitStatus`, so on
+  macOS a second agent pointed at the same inbox keeps exiting 75 every
+  `ThrottleInterval` without ever starting a session.
+- On macOS the launchd user agent stops at logout and starts again at the next
+  login; there is no linger equivalent. On Linux `install` asks for linger so
+  the unit survives logout.
 - Poll granularity 1 s; the model turn dominates latency.
 - The 30-tick stale rule retires a task whose verifier keeps failing to run
   (the file's mtime does not change), with only a debug-log line to show for

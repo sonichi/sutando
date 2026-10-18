@@ -189,3 +189,26 @@ test('reply uses the armed results_dir when no env is set', async ($, on) => {
   expect(String(r.text ?? r.result)).toContain('Wrote /out/task-e1.txt')
   expect(h.files['/out/task-e1.txt']).toBe('ok\n')
 })
+
+test('with AG2_AUTOARM=1 the launcher\'s env arms the watch at session.start, no tool call', async ($, on) => {
+  const h = host(on, { env: { AG2_AUTOARM: '1', AG2_INBOX_DIR: '/in', AG2_RESULTS_DIR: '/out' } })
+  h.files['/in/task-z1.txt'] = TASK('task-z1')
+  await $.session.start({ surface: 'terminal', isInteractive: false, cwd: '/w' })
+  await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.submitted[0]).toContain('task task-z1;')
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-z1', text: 'four' })
+  expect(r.isError).toBeFalsy()
+  expect(h.files['/out/task-z1.txt']).toBe('four\n')
+})
+
+test('without the marker nothing is armed at session.start', async ($, on) => {
+  const h = host(on, { env: { AG2_INBOX_DIR: '/in', AG2_RESULTS_DIR: '/out' } })
+  h.files['/in/task-z2.txt'] = TASK('task-z2')
+  await $.session.start({ surface: 'terminal', isInteractive: false, cwd: '/w' })
+  await h.clock.advance(3000)
+  expect(h.submitted.length).toBe(0)
+  await $.tool.call({ tool: WATCH })
+  await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+})

@@ -342,9 +342,8 @@ def service_path() -> Path:
 
 
 def device_env_path() -> Path:
-    """The .env file holding REMOTE_TASK_TOKEN that Sparrow reads at startup."""
-    env = os.environ.get("AG2_DEVICE_ENV")
-    return Path(env).expanduser() if env else _home() / ".config" / "ag2-sparrow" / "relay.env"
+    """The .env file holding REMOTE_TASK_TOKEN that Sparrow reads at startup (the shared owner's)."""
+    return _dirs.device_env_path()
 
 
 def _systemd_run(cmd: list) -> "subprocess.CompletedProcess | None":
