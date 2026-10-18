@@ -148,9 +148,73 @@ def lock_holder_pid(work):
     return record.get("pid") if state.get("holder_lineage") else None
 
 
-def lock_fd(owner):
-    """The owner's lock descriptor, for a child that must keep the lock held after the owner is gone."""
-    return owner.fd
+def lock_holder(work):
+    """The holder record's attribution: {"adapter", "pid", "start", "live"} (live: the pid's lineage
+    checks out, so it names the launcher; a dead pid under a held lock means only its child remains),
+    else {}. Never liveness of the lock itself: that is lock_held's."""
+    try:
+        state = holder_lock.status(work)
+    except (OSError, holder_lock.LockError):
+        return {}
+    record = (state.get("record") or {}).get("record") or {}
+    if not record:
+        return {}
+    return {"adapter": record.get("adapter"), "pid": record.get("pid"), "start": record.get("start"),
+            "live": bool(state.get("holder_lineage"))}
+
+
+def lock_path(work):
+    """The flock file of `work`'s one-process lock (what `lsof` names its holders by), or None."""
+    try:
+        return os.path.join(holder_lock.lock_dir(work), holder_lock.LOCK_NAME)
+    except (OSError, holder_lock.LockError):
+        return None
+
+
+def lock_held(work):
+    """held | free | unknown: a non-blocking flock probe of `work`'s one-process lock, released at
+    once. A root or lock file that does not exist is free; a probe that cannot run is unknown."""
+    import fcntl
+    try:
+        directory = holder_lock.lock_dir(work)
+    except FileNotFoundError:
+        return "free"
+    except (OSError, holder_lock.LockError):
+        return "unknown"
+    try:
+        fd = os.open(os.path.join(directory, holder_lock.LOCK_NAME), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return "free"
+    except OSError:
+        return "unknown"
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "held"
+        except OSError:
+            return "unknown"
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return "free"
+    finally:
+        os.close(fd)
+
+
+def lease_fd(owner):
+    """The lock descriptor for the one child's pass_fds (holder_lock §1.9): the child keeps the root
+    held after the launcher is gone, and the launcher may release only after the confirmed reap."""
+    return holder_lock.child_lease(owner)
+
+
+def release_after_reap(owner, child_pid):
+    """End the lease and release: True when the child is confirmed gone and the lock is released;
+    False (nothing unlocked, the child left fenced under the flock) when it is not."""
+    try:
+        holder_lock.end_lease(owner, child_pid)
+        holder_lock.release(owner)
+    except holder_lock.LockError:
+        return False
+    return True
 
 
 def acquire_lock(work, adapter):

@@ -123,44 +123,74 @@ turn ends, so a headless agent needs stdin held open.
 
 The package's `ag2-sparrow-claude-local` console script hosts the session (one
 script per adapter, as `ag2-sparrow-hatch`: the adapter-boundary rule forbids a
-shared dispatcher that imports adapters), so the
+shared dispatcher that imports adapters; the lifecycle itself is
+`ag2_sparrow/connect_common.py`, which the Codex launcher shares), so the
 hand launch below is only for a one-off look:
 
 ```bash
 ag2-sparrow-claude-local install \
   --plugin-dir packages/ag2-sparrow/adapters/claude-code/ag2space-inbox \
+  --work <work> \
   --claude-config-dir <workspace>/.claude-sutando \
   --hmac-key-file <workspace>/state/auth/task-hmac.key
-  # --inbox / --results default to Sparrow's own dirs; --permission-mode default bypassPermissions
+  # or --inbox <work>/tasks [--results <dir>]; --permission-mode default bypassPermissions
 ag2-sparrow-claude-local verify
+ag2-sparrow-claude-local debug-run    # one session in the foreground; refused while the job is registered
 ag2-sparrow-claude-local uninstall
 ```
 
-`install` checks `claude --version` against the pin (2.1.287; an older CLI is
-one clear line and exit 2, nothing written), records the paths in
-`~/.config/ag2-sparrow/claude-local.conf` (0600, marker first line), and
-writes a supervisor whose first line is a marker: a systemd user unit
+The service manager (`systemd --user` on Linux, launchd on macOS) is the only
+supervisor; the work root's `holder_lock` flock is occupancy and its record
+attribution, never readiness (the §15 task is the readiness proof). `install`
+checks `claude --version` against the pin (2.1.287; an older CLI is one clear
+line and exit 2, nothing written), then runs as a **quiescent replacement**
+under one per-shape operation lock (`~/.config/ag2-sparrow/claude-local.oplock`,
+a stable file that is never unlinked; a second `install`, `uninstall` or
+`debug-run` waits briefly, then refuses with one line): both files must be
+absent or carry install's marker (an unmarked file is a final refusal that
+names what to remove by hand; there is no `--force`); the work root must be
+the one already persisted (a change is "run uninstall, then install"); a root
+held with no registered job is an orphan and refuses **before any file is
+written**, naming the pid; then the job is stopped through the manager (a
+bounded `launchctl bootout --wait`, or `systemctl stop`) and proven absent
+from the manager's own output, the root proven free, and only then are the
+config (`~/.config/ag2-sparrow/claude-local.conf`, 0600, marker first line,
+the canonical `ROOT` persisted from `--work` or the lexical parent of an
+`--inbox` whose basename is `tasks`) and the unit written by temp + replace
+and the job registered and started: a systemd user unit
 (`~/.config/systemd/user/ag2-sparrow-claude-local.service`, `Restart=always`,
-`RestartSec=10`, `RestartPreventExitStatus=75`, linger requested) on Linux, a
+`RestartSec=10`, `RestartPreventExitStatus=75`, linger requested) or a
 launchd agent (`~/Library/LaunchAgents/ai.ag2.sparrow.claude-local.plist`,
-`KeepAlive`, `RunAtLoad`, `ThrottleInterval` 10) on macOS. Both run
+`KeepAlive`, `RunAtLoad`, `ThrottleInterval` 10). Success is "the managed
+launcher acquired the expected root": within a bound, the root's flock is held
+by a live `claude-local` holder whose pid and start differ from the record
+before the apply. Anything less fails closed with "the managed launcher did
+not acquire <root> ...; run uninstall, then install", rolls nothing back, and
+the identical `install` is the retry (it performs the whole stop/replace/start
+again; there is no "unchanged" shortcut). Both units run
 `ag2-sparrow-claude-local run`, carry paths only, and never the relay
 token: that stays in Sparrow's 0600 `relay.env`, and the Claude login stays in
 its config dir (`verify` runs `claude auth status` there; nothing is copied).
 
-`run` checks the pin again, takes the one-session-per-inbox `holder_lock` for
-the whole child, and starts the session. The lock is keyed on the inbox's
-**parent** (the work root whose inbox is `<work>/tasks`), the same key the
-Codex, routine and cloud-session adapters use, so one session per inbox holds
-across adapter kinds too. The child inherits the lock descriptor, so the flock
-stays held until both the launcher and the session are gone; a second launcher
-exits 75, which the systemd unit does not relaunch (a session's own exit 75 is
-reported as 1). A `SIGTERM` to the launcher (`systemctl stop`, `bootout`)
-terminates the child, waits up to 15 s, kills it, then releases the lock, so a
-stop leaves neither a running session nor a stale record. The env allowlist
-below does not isolate files: a `bypassPermissions` session can still read
-`relay.env` or anything else on disk if a non-owner task steers it; that is
-the owner's decision when choosing the mode. `run` starts
+`run` checks the pin again, takes the one-session-per-root `holder_lock` on
+the persisted `ROOT` (the same key the Codex, routine and cloud-session
+adapters use, so a symlinked `tasks` still contends with its siblings),
+publishes its record before the child exists, leases the lock descriptor to
+the child (`holder_lock.child_lease`, design §1.9), and starts the session
+through a one-line trampoline that `fchdir`s into `tasks` under the **held
+root inode** (a path replaced after the lock check is a different root the
+child never sees). The flock therefore stays held until both the launcher and
+the session are gone; a second launcher exits 75, which the systemd unit does
+not relaunch (a session's own exit 75 is reported as 1). Every launcher exit
+reaps the child first: `SIGTERM` (`systemctl stop`, `bootout`) and `SIGINT`
+terminate it, wait up to 15 s, kill, reap, then release (143 / 130); a
+post-spawn exception reaps, then re-raises; a reap that cannot be confirmed
+exits **without** releasing, so the surviving child keeps the root fenced and
+`verify` reads "held, launcher gone (child alive)"; `SIGKILL` of the launcher
+leaves the same state. The env allowlist below does not isolate files: a
+`bypassPermissions` session can still read `relay.env` or anything else on
+disk if a non-owner task steers it; that is the owner's decision when
+choosing the mode. `run` starts
 
 ```
 claude --plugin-dir <plugin> --permission-mode bypassPermissions \
@@ -168,21 +198,41 @@ claude --plugin-dir <plugin> --permission-mode bypassPermissions \
 ```
 
 with an environment of only `PATH`, `HOME`, `USER`, `ANTHROPIC_BASE_URL`
-(when set), `CLAUDE_CONFIG_DIR`, `AG2_INBOX_DIR`, `AG2_RESULTS_DIR`,
-`AG2_HMAC_KEY_FILE`, `AG2_HMAC_STRICT` and the marker `AG2_AUTOARM=1`, so the
-host's `SUTANDO_*` never reaches the session. With that marker the Mod arms
-the inbox watch itself at `session.start` from `AG2_INBOX_DIR` /
-`AG2_RESULTS_DIR`, with no model turn and nothing written to stdin, on
-**every** start (a restart re-arms the same way); stdin is held open so the
-session lives until the supervisor stops it. A session launched by hand
-without the marker is armed by the explicit prompt: "Arm ag2space_inbox_watch
-and keep working on nothing; when a task arrives, answer it with
-ag2space_reply."
-`--permission-mode` on `install` narrows the unattended default; a mode that
-prompts stalls the queue at the first prompting tool. **`USER` is required on
-macOS**: the config dir's `claude.ai` login lives in the Keychain under the
-account name, and without `USER` the CLI falls back to `.credentials.json` and
-reports `loggedIn: false` (`claude auth status` is the cheap check).
+(when set), `CLAUDE_CONFIG_DIR`, `AG2_INBOX_DIR` (the held root's `tasks`),
+`AG2_RESULTS_DIR`, `AG2_HMAC_KEY_FILE`, `AG2_HMAC_STRICT` and the marker
+`AG2_AUTOARM=1`, so the host's `SUTANDO_*` never reaches the session. With
+that marker the Mod arms the inbox watch itself at `session.start` from
+`AG2_INBOX_DIR` / `AG2_RESULTS_DIR`, with no model turn and nothing written to
+stdin, on **every** start (a restart re-arms the same way); stdin is held
+open so the session lives until the manager stops it. A session launched by
+hand without the marker is armed by the explicit prompt: "Arm
+ag2space_inbox_watch and keep working on nothing; when a task arrives, answer
+it with ag2space_reply." `--permission-mode` on `install` narrows the
+unattended default; a mode that prompts stalls the queue at the first
+prompting tool. **`USER` is required on macOS**: the config dir's `claude.ai`
+login lives in the Keychain under the account name, and without `USER` the
+CLI falls back to `.credentials.json` and reports `loggedIn: false`
+(`claude auth status` is the cheap check).
+
+`verify` prints `INFO job: <name> active|absent|unknown` from the manager's
+own words and `INFO session: <root> held by launcher pid N | held, launcher
+gone (child alive) | free | unknown (...)` from `task_io.lock_held` (the
+physical flock probe; errors read `unknown`, never `free`) and the holder
+record. `debug-run` holds the operation lock from the registered/absent check
+through the root lock's acquisition, refuses a registered job, an unknown
+probe or a held root, and otherwise runs the same session in the foreground.
+
+`uninstall` tears down with the config **last**, every step re-runnable:
+stop through the manager and prove it absent (systemd: `stop`, `disable`,
+then `is-active` inactive/failed and `is-enabled` disabled), prove the root's
+flock free, remove the marked unit, `daemon-reload` and require
+`LoadState=not-found`, then remove the marked config. A live holder, an
+unknown probe, a lock error or any failure in between keeps the config (so a
+rerun still knows the root) and prints the manual recovery verbatim: the exact
+`launchctl bootout --wait` / `systemctl --user stop` command, how to find and
+stop what holds the root (the launcher pid from the record, or `lsof` on the
+lock file), then "re-run uninstall". Sparrow's `relay.env` and the Claude
+login are never touched.
 
 Helpers: `drop-task.sh <inbox> <keyfile> <suffix> "<message>"` writes a
 Sparrow-shaped, stamped, task-last file by temp + fsync + rename;
@@ -208,10 +258,14 @@ mtime delta.
   upgrade.
 - The seen-set is module memory: a reload re-scans and re-submits anything
   without a non-empty result file, one per tick in name order. One session per
-  inbox: the launcher holds the inbox's `holder_lock` for the whole child and a
-  second launcher exits 75. launchd has no `RestartPreventExitStatus`, so on
-  macOS a second agent pointed at the same inbox keeps exiting 75 every
-  `ThrottleInterval` without ever starting a session.
+  work root: the launcher holds the root's `holder_lock` for the whole child
+  (leased to it) and a second launcher exits 75. launchd has no
+  `RestartPreventExitStatus`, so on macOS a second agent pointed at the same
+  root keeps exiting 75 every `ThrottleInterval` without ever starting a
+  session. A hand-invoked `run` between the manager's stop and `uninstall`'s
+  lock check is the stated, unsupported operator race: uninstall then refuses
+  on the held root. No automatic rollback on a failed reconfigure: the operator
+  runs uninstall, then install.
 - On macOS the launchd user agent stops at logout and starts again at the next
   login; there is no linger equivalent. On Linux `install` asks for linger so
   the unit survives logout.
