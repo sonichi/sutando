@@ -80,6 +80,14 @@ class PublisherContract(unittest.TestCase):
             finally:
                 tmp.unlink()
 
+    def test_is_staged_for_recognises_only_its_own_stagings(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = result_publish.stage_text(Path(td) / "task-1.txt", BODY)
+            self.assertTrue(result_publish.is_staged_for(tmp.name, "task-1.txt"))
+            for other in ("task-12.txt", "task-1"):
+                self.assertFalse(result_publish.is_staged_for(tmp.name, other), other)
+            self.assertFalse(result_publish.is_staged_for("task-1.txt", "task-1.txt"))
+
     def test_two_stagings_of_one_name_never_share_a_file(self):
         with tempfile.TemporaryDirectory() as td:
             target = Path(td) / "task-1.txt"

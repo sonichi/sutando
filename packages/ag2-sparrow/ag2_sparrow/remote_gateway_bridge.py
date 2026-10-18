@@ -328,7 +328,8 @@ from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THR
 from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
                            ready_body_of, ResultIdentity)
 from . import result_disposal as disposal
-from .result_publish import publish_staged as _publish_staged_whole, stage_text as _stage_text
+from .result_publish import (is_staged_for as _is_staged_for, publish_staged as _publish_staged_whole,
+                             stage_text as _stage_text)
 from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
 from .send_allowlist import is_path_sendable
@@ -4569,9 +4570,12 @@ def _held_entry_ok(tid: str, entry) -> bool:
     if not (_valid_local_tid(tid) and isinstance(entry, dict)):
         return False
     staged = entry.get("staged")
-    return (entry.get("broker_id") == _broker_tid(tid) and entry.get("dest") == f"{tid}.txt"
+    dest = f"{tid}.txt"
+    # The unprefixed form is what a bridge before the shared publisher staged; its entries stay valid.
+    legacy = isinstance(staged, str) and staged.startswith(f"{dest}.") and staged.endswith(".tmp")
+    return (entry.get("broker_id") == _broker_tid(tid) and entry.get("dest") == dest
             and isinstance(staged, str) and Path(staged).name == staged
-            and staged.startswith(f"{tid}.txt.") and staged.endswith(".tmp"))
+            and (_is_staged_for(staged, dest) or legacy))
 
 
 def _held_digest(text: str) -> str:

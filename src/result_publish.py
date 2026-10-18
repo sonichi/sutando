@@ -19,7 +19,8 @@ import secrets
 import sys
 from pathlib import Path
 
-__all__ = ["STAGED_SUFFIX", "stage_text", "publish_staged", "publish_text", "main"]
+__all__ = ["STAGED_SUFFIX", "stage_text", "is_staged_for", "publish_staged", "publish_text",
+           "main"]
 
 STAGED_SUFFIX = ".tmp"
 
@@ -46,6 +47,16 @@ def stage_text(path: str | Path, text: str, mode: int = 0o666) -> Path:
         tmp.unlink(missing_ok=True)
         raise
     return tmp
+
+
+def is_staged_for(name: str, target_name: str) -> bool:
+    """True when `name` has the shape `stage_text` gives a staging of `target_name`."""
+    prefix = f".{target_name}."
+    if not (name.startswith(prefix) and name.endswith(STAGED_SUFFIX)):
+        return False
+    pid, _, token = name[len(prefix):-len(STAGED_SUFFIX)].partition(".")
+    return (pid.isascii() and pid.isdigit() and len(token) == 16
+            and all(c in "0123456789abcdef" for c in token))
 
 
 def publish_staged(tmp: str | Path, path: str | Path) -> Path:

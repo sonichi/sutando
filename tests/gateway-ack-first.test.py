@@ -151,7 +151,7 @@ class _Bridge(unittest.TestCase):
         return gw._take_ack_first(dict(task), self.inflight)
 
     def staged(self, tid: str) -> "list[Path]":
-        return sorted(gw._held_dir().glob(f"{tid}.txt.*.tmp"))
+        return sorted(gw._held_dir().glob(f".{tid}.txt.*.tmp"))
 
     def manifest(self) -> dict:
         return json.loads(gw.ACK_FIRST_MANIFEST_FILE.read_text()) if gw.ACK_FIRST_MANIFEST_FILE.exists() else {}
@@ -863,7 +863,7 @@ class ThroughTheLoop(unittest.TestCase):
         return json.loads(path.read_text()) if path.exists() else {}
 
     def staged(self) -> "list[Path]":
-        return sorted((self.ws / "tasks" / ".ack-first").glob(f"{ASK_A}.txt.*.tmp"))
+        return sorted((self.ws / "tasks" / ".ack-first").glob(f".{ASK_A}.txt.*.tmp"))
 
     def entry(self) -> dict:
         return self.state("remote-task-ack-first-manifest").get(ASK_A) or {}

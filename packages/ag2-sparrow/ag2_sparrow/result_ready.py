@@ -97,16 +97,16 @@ def read_ready_result_with_identity(path: str | Path) -> "ReadyResult | None":
     """`read_ready_result` plus the identity of the bytes it returned."""
     p = Path(path)
     try:
-        before = p.stat()
+        before = os.stat(p)
         if before.st_size == 0:
             return None
         data, identity = identity_of(p)
-        after = p.stat()
+        after = os.stat(p)
         if _shape(after) != _shape(before) or (len(data), identity.mtime_ns) != _shape(after):
             return None  # changed under the read: a prefix, not the body
         if time.time() - after.st_mtime < SETTLE_SEC:
             _sleep(_HOLD_SEC)
-            if _shape(p.stat()) != _shape(after):
+            if _shape(os.stat(p)) != _shape(after):
                 return None  # young and still growing
     except OSError:
         return None                     # missing or unreadable: readable again on a later pass
