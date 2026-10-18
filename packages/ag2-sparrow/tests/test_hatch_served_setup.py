@@ -183,15 +183,22 @@ def sink_violations(source):
                            for m in ast.walk(arg)):
                         mark(fn, param, -1, True)
 
+    def is_sink_ref(node):
+        return (isinstance(node, ast.Name) and node.id in SINK_CALLS) or (
+            isinstance(node, ast.Attribute) and node.attr in SINK_CALLS)
+
     out = []
     for call in ast.walk(tree):
         if not isinstance(call, ast.Call):
             continue
         f = call.func
         name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
-        if name not in SINK_CALLS and ast.unparse(f) not in STREAM_WRITES:
+        args = list(call.args) + [k.value for k in call.keywords]
+        # A call handed a sink function (report_once(key, _log, line)) is a sink for its other arguments.
+        handed = any(is_sink_ref(a) for a in args)
+        if name not in SINK_CALLS and ast.unparse(f) not in STREAM_WRITES and not handed:
             continue
-        for arg in list(call.args) + [k.value for k in call.keywords]:
+        for arg in (a for a in args if not is_sink_ref(a)):
             out += [(n.lineno, n.id) for n in ast.walk(arg)
                     if isinstance(n, ast.Name) and is_tainted(n) and not allowed(n, arg)]
     return sorted(set(out))
@@ -581,6 +588,12 @@ print(json.dumps({"raw": raw, "url": m.URL, "files": files}))
         for text in ("'/relay?flag&x=1'", "'/relay?flag'", "a&flag", "a;flag", "%3Fflag"):
             self.assertEqual(gateway_instance.redact_text(text, flag), closed, text)
         self.assertEqual(gateway_instance.redact_text("a flag is set", flag), "a flag is set")
+        # A URL ignores the case of its scheme and host, never of its path or credential bytes.
+        plain = "https://gw.example/relay"
+        self.assertEqual(gateway_instance.redact_text("poll HTTPS://GW.Example/relay failed", plain),
+                         "poll https://gw.example/relay failed")
+        self.assertEqual(gateway_instance.redact_text("poll https://gw.example/RELAY failed", plain),
+                         "poll https://gw.example/RELAY failed")
         ctl = "https://gw.example/relay?k=v\x01w"
         self.assertEqual(gateway_instance.redact_text(repr("/relay?k=v\x01w"), ctl), closed)
         for mixed_url, text in (("https://gw/relay?id=a%2fb", "diag id%3Da%252Fb"),
@@ -825,22 +838,45 @@ raise RuntimeError("fatal enrollment=SECRET%0aBAD")
             "try:\n    x()\nexcept Exception as e:\n    held('n', e)\n": [(2, "err")],
             "def f():\n    try:\n        x()\n    except Exception as exc:\n"
             "        note = f'failed ({diagnostics.describe(exc)})'\n    _log(note)\n": [],
+            "try:\n    x()\nexcept Exception as e:\n    report_once('k', _log, f'failed ({e})')\n": [(4, "e")],
+            "try:\n    x()\nexcept Exception as e:\n    anything('k', self._log, line=f'{e}')\n": [(4, "e")],
             "try:\n    x()\nexcept Exception as e:\n    _log(f'{diagnostics.describe(e)} {type(e).__name__} {e.code}')\n": [],
         }
         for source, want in cases.items():
             self.assertEqual(sink_violations(source), want, source)
 
     def test_the_sink_guard_catches_the_two_sites_that_slipped_past_the_direct_check(self):
-        # Both escaped a check of sink arguments alone: one through an assigned note, one through a
-        # helper's parameter. Reverting either to its old form must fail the guard.
+        # Each escaped the guard of its day: an assigned note, a helper's parameter, and two lines handed
+        # with _log to report_once. Reverting any to its old form must fail the guard.
         src = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text(encoding="utf-8")
         for new, old, name in (
                 ('note = f"archive reconcile failed ({diagnostics.describe(exc)}); left for the owner"',
                  'note = f"archive reconcile failed ({exc}); left for the owner"', "note"),
-                ('room gate failed ({diagnostics.describe(exc)})', 'room gate failed ({exc})', "exc")):
+                ('room gate failed ({diagnostics.describe(exc)})', 'room gate failed ({exc})', "exc"),
+                ('ledger could not be read ({diagnostics.describe(e)})', 'ledger could not be read ({e})', "e"),
+                ('recovery failed ({diagnostics.describe(e)})', 'recovery failed ({e})', "e")):
             self.assertEqual(src.count(new), 1, new)
             bad = sink_violations(src.replace(new, old))
             self.assertEqual([n for _, n in bad], [name], old)
+
+    def test_the_log_and_the_status_writer_run_the_secret_registry(self):
+        from ag2_sparrow import diagnostics
+        token = "fake-relay-token-0123456789abcdef"
+        out = self.bridge("""
+import json
+from ag2_sparrow import remote_gateway_bridge as m
+m._log("plain words, then the bearer TOKEN")
+m._emit_gateway_status(False, error="reconnecting with TOKEN")
+print(json.dumps({"status": json.load(open(m.GATEWAY_STATUS_FILE))}))
+""".replace("TOKEN", token))
+        logs = (self.home / "logs" / "gateway-bridge.log").read_text()
+        self.assertIn(diagnostics.WITHHELD_TEXT, logs)
+        self.assertNotIn(token, logs)
+        self.assertEqual(out["status"]["error"], diagnostics.WITHHELD_TEXT)
+        with mock.patch.object(diagnostics, "_SECRETS", {}):
+            diagnostics.register_secret(token)
+            self.assertEqual(diagnostics.safe_status({"e": [f"x {token}"]}, lambda t: t),
+                             {"e": [diagnostics.WITHHELD_TEXT]}, "safe_status runs the registry after the net")
 
     def test_the_status_file_is_written_only_through_safe_status(self):
         import ast
@@ -902,8 +938,8 @@ print(json.dumps({"files": files, "status": json.load(open(m.GATEWAY_STATUS_FILE
 
     def test_an_echoed_bearer_token_reaches_no_sink_in_either_reenroll_branch(self):
         token = "fake-relay-token-0123456789abcdef"
-        forms = [token, token.upper(), "fake%2Drelay%2Dtoken%2D0123456789abcdef", "0123456789abcdef",
-                 "relay-token-01234"]
+        forms = [token, "fake%2Drelay%2Dtoken%2D0123456789abcdef", "fake%2drelay%2dtoken%2d0123456789abcdef",
+                 "0123456789abcdef", "relay-token-01234"]
         r = subprocess.run([sys.executable, "-c", PRELUDE + self.REENROLL], capture_output=True, text=True,
                            cwd=str(self.home), timeout=60,
                            env=self.bridge_env(AGENT_MXID=AGENT, FORMS=json.dumps(forms)))
@@ -914,7 +950,7 @@ print(json.dumps({"files": files, "status": json.load(open(m.GATEWAY_STATUS_FILE
         self.assertIsNone(block.get("refused_error"), "nor a kept error name")
         self.assertNotIn("RELINK CODE", r.stdout)
         everything = "\n".join([r.stdout.rsplit("\n", 2)[0], r.stderr, *out["files"].values()])
-        for secret in ("relay-token", "0123456789abcdef", "RELAY-TOKEN", "relay%2Dtoken"):
+        for secret in ("relay-token", "0123456789abcdef", "relay%2Dtoken", "relay%2dtoken"):
             self.assertNotIn(secret, everything, secret)
 
     def test_a_safe_error_name_and_approval_code_still_reach_the_status(self):

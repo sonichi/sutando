@@ -184,6 +184,18 @@ def _secret_parts(url: str) -> "list[str]":
     return [p for p in dict.fromkeys(parts) if p not in ("=", "?", "&", ";", "#", "@", ":@")]
 
 
+def _url_form_re(form: str) -> "re.Pattern[str]":
+    """`form` with its scheme and host matched in any case, which a URL ignores there, and the
+    rest (userinfo, path, query: the bytes a credential is made of) exactly."""
+    scheme, sep, rest = form.partition("://")
+    if not sep:
+        return re.compile(re.escape(form))
+    authority, slash, tail = rest.partition("/")
+    userinfo, at, host = authority.rpartition("@")
+    return re.compile(f"(?i:{re.escape(scheme + sep)})" + re.escape(userinfo + at)
+                      + f"(?i:{re.escape(host)})" + re.escape(slash + tail))
+
+
 def register_gateway_secrets(url: str) -> None:
     """Add every credential part of the gateway URL to the process's secret registry: each
     delimited part, and the bare userinfo, password and query values long enough to match alone."""
@@ -203,7 +215,7 @@ def redact_text(text: str, gateway_url: str) -> str:
     if not url:
         return text
     for form in sorted(diagnostics.forms(url), key=len, reverse=True):
-        text = text.replace(form, redact_url(url))
+        text = _url_form_re(form).sub(lambda _m: redact_url(url), text)
     views = {diagnostics.hex_upper(v) for v in (text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text))}
     for part in _secret_parts(url):
         if any(diagnostics.hex_upper(form) in view for form in diagnostics.forms(part) for view in views):

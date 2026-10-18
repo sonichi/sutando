@@ -5167,7 +5167,7 @@ def _load_settle_pending() -> bool:
                 raise ValueError("ids is not a list")
         except (OSError, ValueError, KeyError, TypeError) as e:
             disposal.report_once("settle-ledger", _log,
-                                 f"the settle-intent ledger could not be read ({e}); it is left as it is "
+                                 f"the settle-intent ledger could not be read ({diagnostics.describe(e)}); it is left as it is "
                                  "and nothing is written over it until it can be")
             return False
         _SETTLE_PENDING.update(t for t in ids if isinstance(t, str) and _valid_local_tid(t))
@@ -5849,7 +5849,7 @@ def _recover_disposing_claims() -> None:
         disposal.recover_abandoned_claims(RESULTS_DIR, _log)
     except Exception as e:  # noqa: BLE001 - the adapter boundary fails open
         disposal.report_once(f"recovery:{RESULTS_DIR}", _log,
-                             f"result disposal: recovery failed ({e}); delivery continues")
+                             f"result disposal: recovery failed ({diagnostics.describe(e)}); delivery continues")
 
 
 def _disposed_copy_exists(tid: str, generation) -> bool:

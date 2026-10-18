@@ -79,11 +79,12 @@ def code_field(value: Any, gateway_url: str = "") -> "str | None":
         return None
     url = str(gateway_url or "")
     url_forms = {url, urllib.parse.unquote(url), urllib.parse.unquote(urllib.parse.unquote(url))}
-    if any(value.lower() in form.lower() for form in url_forms if form):
+    token = hex_upper(value)  # percent-hex is case-free; the bytes of a secret are not
+    if any(token in hex_upper(form) for form in url_forms if form):
         return None
     with _SECRETS_LOCK:
         secrets = [f for fs in _SECRETS.values() for f in fs]
-    if contains_secret(value) or any(hex_upper(value).lower() in f.lower() for f in secrets):
+    if contains_secret(value) or any(token in f for f in secrets):
         return None  # a secret, or an echoed piece of one
     return value
 
