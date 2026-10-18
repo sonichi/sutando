@@ -2,7 +2,7 @@
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
 Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
-canonical for those modules — currently 30 of them, including outbox.py and its
+canonical for those modules — currently 34 of them, including outbox.py and its
 transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
 and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
 dir-interface, no workspace-resolution).
@@ -68,6 +68,11 @@ MAP = {
     # worker-pool completion-record contract: the pool skill writes through it
     # and the bridge reads through it, so neither keeps a private predicate.
     "skills/worker-pool/scripts/pool_record.py": "pool_record.py",
+    # the tmux tri-state probe and the guarded pane-key send with its two shell scripts
+    "src/tmux_probe.py": "tmux_probe.py",
+    "src/tmux_pane_keys.py": "tmux_pane_keys.py",
+    "src/tmux-pane-keys.sh": "tmux-pane-keys.sh",
+    "src/bounded-wait.sh": "bounded-wait.sh",
     # the HITL decision domain and store (the claude-local card's CAS), imports relative-first
     "src/hitl/__init__.py": "hitl/__init__.py",
     "src/hitl/schema.py": "hitl/schema.py",
