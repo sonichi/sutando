@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -631,20 +632,59 @@ class RealSinks(unittest.TestCase):
 
     def bridge(self, fx, script=BRIDGE, timeout=60):
         state = fx.root / "state"
-        env = {"PATH": "/usr/bin:/bin", "HOME": str(fx.root), "PYTHONPATH": str(PKG),
-               "AGENT_CONNECT_TASK_DIR": str(fx.root / "t"), "AGENT_CONNECT_RESULT_DIR": str(fx.root / "r"),
-               "AGENT_CONNECT_STATE_DIR": str(state), **fx.env}
+        # The helper owns the coverage bootstrap: only the coverage package reaches the child's path.
+        env = hermetic_env(fx.root, **{"PATH": "/usr/bin:/bin", "PYTHONPATH": str(PKG),
+                                       "AGENT_CONNECT_TASK_DIR": str(fx.root / "t"),
+                                       "AGENT_CONNECT_RESULT_DIR": str(fx.root / "r"),
+                                       "AGENT_CONNECT_STATE_DIR": str(state), **fx.env})
         child = fx.root / "child.py"
         child.write_text(script.replace("VAULT", json.dumps(fx.vault)).replace("CANDIDATES", json.dumps(fx.candidates)))
         cmd, cwd = [sys.executable, str(child)], fx.root
         if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":  # the gate measures the child too
-            import coverage
-            env["PYTHONPATH"] += os.pathsep + str(Path(coverage.__file__).parent.parent)
             cmd = [sys.executable, "-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}", str(child)]
             cwd = REPO
         r = subprocess.run(cmd, env=env, capture_output=True, text=True, cwd=str(cwd), timeout=timeout)
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1]), r.stderr
+
+    def plant_coverage(self, root: Path) -> "tuple[Path, Path]":
+        """A synthetic coverage install that runs its target, with a sitecustomize.py beside it."""
+        site = root / "site-packages"
+        (site / "coverage").mkdir(parents=True)
+        (site / "coverage" / "__init__.py").write_text("")
+        (site / "coverage" / "__main__.py").write_text(
+            "import runpy, sys\nsys.argv = sys.argv[3:]\nrunpy.run_path(sys.argv[0], run_name='__main__')\n")
+        witness = root / "sitecustomize-witness"
+        (site / "sitecustomize.py").write_text(
+            f"import os\nopen({str(witness)!r}, 'a').write(os.environ.get('REMOTE_TASK_TOKEN_FILE', '-') + '\\n')\n")
+        return site, witness
+
+    def under_synthetic_coverage(self, site: Path):
+        fake = types.ModuleType("coverage")
+        fake.__file__ = str(site / "coverage" / "__init__.py")
+        return mock.patch.dict(sys.modules, {"coverage": fake}), mock.patch.dict(
+            os.environ, {"SUTANDO_TEST_SUBPROCESS_COVERAGE": "1"})
+
+    def test_a_sitecustomize_beside_coverage_never_runs_in_the_bridge_child(self):
+        with tempfile.TemporaryDirectory() as td:
+            site, witness = self.plant_coverage(Path(td))
+            fx = Fixture(Path(td) / "row", ROWS[0])
+            mods, env_patch = self.under_synthetic_coverage(site)
+            with mods, env_patch:
+                out, _err = self.bridge(fx)
+            self.assertEqual(out["token"], fx.expected()["token"], "the child ran under the synthetic coverage")
+            self.assertFalse(witness.exists(), "a sitecustomize beside coverage ran in the bridge child")
+
+    def test_the_planted_sitecustomize_runs_when_its_directory_is_on_the_path(self):
+        # Control: the containing directory, as the removed private bootstrap added it, runs the plant.
+        with tempfile.TemporaryDirectory() as td:
+            site, witness = self.plant_coverage(Path(td))
+            fx = Fixture(Path(td) / "row", ROWS[0])
+            fx.env["PYTHONPATH"] = os.pathsep.join([str(PKG), str(site)])
+            mods, env_patch = self.under_synthetic_coverage(site)
+            with mods, env_patch:
+                self.bridge(fx)
+            self.assertTrue(witness.exists(), "the planted sitecustomize never ran: the control proves nothing")
 
     def test_the_bridge_uses_the_tabled_winner_and_registers_every_candidate(self):
         for row in ROWS:
