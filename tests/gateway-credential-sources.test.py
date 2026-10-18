@@ -282,8 +282,8 @@ class PureContractCases:
             self.assertTrue(self.c.credential_name(name), name)
         for name in ("AUTHOR", "author", "tokenizer", "oauth-client-id", "X-AUTHOR", "keyboard", "patch"):
             self.assertFalse(self.c.credential_name(name), name)
-        for line in ("ExecStart=/x --author qingyun", "ExecStart=/x --tokenizer wordpiece", "X-AUTHOR=qingyun",
-                     "ExecStart=/x --oauth-client-id abc", "Description=Bearer of tasks", "Author: qingyun"):
+        for line in ("ExecStart=/x --author someone", "ExecStart=/x --tokenizer wordpiece", "X-AUTHOR=someone",
+                     "ExecStart=/x --oauth-client-id abc", "Description=Bearer of tasks", "Author: someone"):
             self.assertEqual(self.c.mask_env_assignments(line + "\n", self.c.SecretRegistry()), line + "\n")
 
     def test_a_short_or_path_shaped_value_hides_no_other_line(self):
@@ -787,10 +787,10 @@ class RealSinks(unittest.TestCase):
         tok = "synth-n1-sink-5698"
         with tempfile.TemporaryDirectory() as td:
             shown = self.body(self.hatch_diff(self.bare(Path(td)), "[Service]\nExecStart=/x --auth=1\nRestartSec=10\n"
-                                                                   "ExecStartPre=/x --author qingyun\n"
+                                                                   "ExecStartPre=/x --author someone\n"
                                                                    f"ExecStartPost=/x -H 'X-Api-Key: {tok}'\n"))
             self.assertEqual(shown, " [Service]\n-ExecStart=<withheld>\n-RestartSec=10\n"
-                                    "-ExecStartPre=/x --author qingyun\n-ExecStartPost=<withheld>\n+ExecStart=/y\n")
+                                    "-ExecStartPre=/x --author someone\n-ExecStartPost=<withheld>\n+ExecStart=/y\n")
 
     def test_the_hatch_install_diff_seeds_from_the_default_device_file(self):
         live = "synth-default-device-5698"
