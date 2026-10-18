@@ -1244,10 +1244,95 @@ class RoutingMigration(unittest.TestCase):
         self.assertEqual((again.state, again.removed), (self.rm.DONE, 1))
         self.assertFalse(bad.exists())
 
+    def test_a_failed_read_back_is_failed_and_the_next_run_sees_a_bound_record(self):
+        self.legacy()
+        real, reads = self.rm._read, []
+
+        def read(path):
+            reads.append(1)
+            if len(reads) == 2:
+                raise PermissionError("transient")
+            return real(path)
+        with mock.patch.object(self.rm, "_read", read):
+            self.assertEqual(self.run_migration().state, self.rm.FAILED)
+        self.assertNotIn("tenant", self.path.read_text())
+        self.assertEqual(self.run_migration().state, self.rm.NOT_NEEDED)
+
+    def test_a_missing_dir_and_a_foreign_entry_are_handled(self):
+        missing = self.rm.migrate_owner_routing(self.dir / "gone" / "owner-routing.json",
+                                                record_for=self.record, write=lambda p, t: True)
+        self.assertEqual(missing.state, self.rm.NOT_NEEDED)
+        (self.dir / ".owner-routing.json.40.tmp").mkdir()
+        self.assertEqual(self.run_migration().state, self.rm.NOT_NEEDED, "a directory is not swept")
+        self.temp(".owner-routing.json.41.tmp", 2 * 3600)
+        with mock.patch.object(self.rm.os, "stat", side_effect=PermissionError("no")):
+            self.assertEqual(self.run_migration().state, self.rm.FAILED)
+
     def test_a_temp_vanishing_mid_sweep_is_not_an_error(self):
         self.temp(".owner-routing.json.31.tmp", 2 * 3600)
         with mock.patch.object(self.rm.os, "unlink", side_effect=FileNotFoundError()):
             self.assertEqual(self.run_migration().state, self.rm.NOT_NEEDED)
+
+
+class InProcessSinks(unittest.TestCase):
+    """The same contracts as the subprocess tests, in this process."""
+    URL = "https://gw.example/relay?enrollment=SECRET%0aBAD"
+
+    def test_the_excepthooks_report_type_innermost_line_and_redacted_text(self):
+        import threading
+        saved = sys.excepthook, threading.excepthook
+        self.addCleanup(lambda: (setattr(sys, "excepthook", saved[0]), setattr(threading, "excepthook", saved[1])))
+        gateway_instance.install_scrubbing_excepthooks(lambda: self.URL)
+        err = io.StringIO()
+        try:
+            raise ValueError("bad " + self.URL)
+        except ValueError as e:
+            exc, tb = e, e.__traceback__
+        with contextlib.redirect_stderr(err):
+            sys.excepthook(ValueError, exc, tb)
+            args = mock.Mock(exc_type=RuntimeError, exc_value=RuntimeError("enrollment=SECRET%0aBAD"),
+                             exc_traceback=None, thread=mock.Mock())
+            args.thread.name = "worker"
+            threading.excepthook(args)
+            threading.excepthook(mock.Mock(exc_type=SystemExit))
+            broken = mock.Mock(exc_type=KeyError, exc_value=mock.Mock(__str__=mock.Mock(side_effect=OSError)),
+                               exc_traceback=None, thread=mock.Mock())
+            threading.excepthook(broken)
+        text = err.getvalue()
+        self.assertIn(f"Uncaught ValueError at {__file__}:", text)
+        self.assertIn("ValueError at", text)
+        self.assertIn("Exception in thread worker: RuntimeError: " + gateway_instance.REDACTED_TEXT, text)
+        self.assertIn("KeyError: " + gateway_instance.REDACTED_TEXT, text, "unprintable text is withheld")
+        self.assertNotIn("SECRET", text)
+        with mock.patch.object(sys, "stderr", mock.Mock(write=mock.Mock(side_effect=OSError))):
+            sys.excepthook(ValueError, exc, None)  # nowhere to report: still never raises
+
+    def test_the_event_channel_open_and_stream_keep_only_the_type(self):
+        from ag2_sparrow import event_channel
+        inbox = mock.Mock(durable_cursor=mock.Mock(return_value=None))
+        lines = []
+        for ch in ("\n", "\t", "\x7f"):
+            channel = event_channel.EventChannel(inbox, f"https://gw.example/relay?k=SECRET{ch}BAD", {},
+                                                 log=lines.append)
+            self.assertTrue(channel._consume_once())
+            self.assertEqual(channel.health["error"], "connect: InvalidURL")
+
+        class Stream:
+            def __init__(self, exc):
+                self.exc = exc
+
+            def __iter__(self):
+                raise self.exc
+
+            def close(self):
+                pass
+        channel = event_channel.EventChannel(inbox, GW, {}, log=lines.append)
+        for exc, want in ((OSError("SECRET"), "stream dropped: OSError"),
+                          (RuntimeError("SECRET"), "channel error: RuntimeError")):
+            with mock.patch.object(channel, "_open", return_value=Stream(exc)):
+                self.assertTrue(channel._consume_once())
+            self.assertEqual(channel.health["error"], want)
+        self.assertNotIn("SECRET", json.dumps(lines))
 
 
 class Diagnostics(unittest.TestCase):
