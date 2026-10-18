@@ -367,8 +367,8 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
     msg = compose_message(signal, surface=source)
     if dry_run:
         return msg
-    # The app pops its own notification for a landed channel message, so macOS is the
-    # fallback only. Debounce on a confirmed channel send; macOS alone must not suppress it.
+    # The app pops its own notification for a channel message the gateway accepted (2xx), so
+    # macOS is the fallback only. Debounce on that send; macOS alone must not suppress it.
     if source and channel:
         delivered = _channel_notify(msg, source, channel, extra=alert_content(signal))
         if not delivered and macos:

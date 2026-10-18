@@ -67,8 +67,7 @@ import os.path as _osp
 import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
-from worker_auth_state import (  # noqa: E402
-    authenticated_turn, login_expired, refusal_answered, signed_in_since)
+from worker_auth_state import authenticated_turn, login_expired, refusal_answered  # noqa: E402
 import cli_wedge  # noqa: E402
 import core_gate_notice  # noqa: E402
 import self_opened_gate  # noqa: E402
@@ -123,7 +122,7 @@ from delivery.pane_gate import (  # noqa: E402
     ADAPTERS, AWAIT_HINT, BORDER_LINE, CLAUDE, CLAUDE_GATE_SIGNATURES, CLAUDE_IDLE,
     COMPOSER_PLACEHOLDER, FABLE_TEXT, SGR_STRIP as _ANSI_SGR, TURN_DONE, TURN_SHORT,
     classify_pane as _pg_classify_pane, composer_text as _pg_composer_text, gate_evidence,
-    is_usage_limit, limit_banner, limit_baseline, limit_is_stale, limit_line, live_tail,
+    is_usage_limit, limit_banner, limit_baseline, limit_is_stale, live_tail,
     prompt_line as _pg_prompt_line, refusal_line, strip_limit_banners,
 )
 
@@ -617,16 +616,6 @@ DRIVE_SETTLE_S = 15.0
 from prompt_excerpt import prompt_excerpt  # noqa: E402  (shared with core-supervisor-relay)
 
 
-def limit_standing(pane, runtime=None):
-    """A limit line is on the pane and no turn did work after it. A delivery the limit
-    refuses repaints the pane without ending the episode; only work or no limit text does."""
-    if not (pane and pane.strip()):
-        return True  # no evidence either way: the episode stands
-    lines = pane.splitlines()
-    last = max((i for i, ln in enumerate(lines) if limit_line(ln)), default=None)
-    return last is not None and not signed_in_since("\n".join(lines[last + 1:]), runtime)
-
-
 def escalation_message(state, detail, kind, prompt, session=None):
     """The card body. The core is blocked, so this is the only thing that will
     reach the owner until they act."""
@@ -738,15 +727,14 @@ def resolve_escalations(manager, session, pane=None, runtime=None):
     a turn that ran, or output after the refusal (worker_auth_state). A newer prompt, a
     spinner, an empty capture or a health verdict read off another session's status
     file is not "Sutando has continued its work". A usage-limit card clears only once
-    `limit_standing` says the limit no longer holds the pane.
+    `tui_gate.limit_card_holds` says the limit no longer holds the pane.
     """
     if manager is None:
         return []
     try:
         from hitl.manager import AUTH_KIND
-        from hitl.tui_gate import LIMIT_EPISODE
+        from hitl.tui_gate import limit_card_holds
         signed_in = authenticated_turn(pane, runtime) or refusal_answered(pane, runtime)
-        limited = limit_standing(pane, runtime)
         done = []
         for r in manager.active():
             subj = r.subject or {}
@@ -754,7 +742,7 @@ def resolve_escalations(manager, session, pane=None, runtime=None):
                 continue
             if r.kind == AUTH_KIND and not signed_in:
                 continue
-            if subj.get("episode") == LIMIT_EPISODE and limited:
+            if limit_card_holds(r, pane, runtime):
                 continue
             manager.resolve(r.id)   # returns blocked task ids, not a verdict
             done.append(r.id)

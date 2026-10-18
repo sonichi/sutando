@@ -50,6 +50,7 @@ from cli_wedge import (PROVIDER_LIMIT_PATTERNS, FrameAbnormal, capture_pane,  # 
                        core_target, frame_abnormal, frame_working, needs_login_line, state_id)
 from quota_availability import provider_allows_now  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
+from worker_auth_state import signed_in_since  # noqa: E402
 
 REPO = _SRC.parent
 SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
@@ -124,6 +125,17 @@ LIMIT_GATES = frozenset({"session-limit", "usage-limit"})
 def limit_line(line: str) -> bool:
     """One line of the limit's own words: the wait banner, the menu title or a refusal."""
     return bool(LIMIT_WAIT.search(line) or LIMIT_REFUSAL.search(line))
+
+
+def limit_standing(pane: Optional[str], runtime: Optional[str] = None, outrun: bool = False) -> bool:
+    """A limit line is on the pane and no turn did work after it. A delivery the limit
+    refuses repaints the pane without ending the episode; only work or no limit text does.
+    `outrun`: the caller judged the banner under the composer stale, so it is not evidence."""
+    if not (pane and pane.strip()):
+        return True  # no evidence either way: the episode stands
+    lines = (strip_limit_banners(pane) if outrun else pane).splitlines()
+    last = max((i for i, ln in enumerate(lines) if limit_line(ln)), default=None)
+    return last is not None and not signed_in_since("\n".join(lines[last + 1:]), runtime)
 
 
 _NUMBERED_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")

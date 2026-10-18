@@ -41,6 +41,19 @@ def limit_guard(session: str) -> str:
     return f"{LIMIT_EPISODE}:{session}"
 
 
+def limit_card(req: HumanRequirement) -> bool:
+    return (req.subject or {}).get("episode") == LIMIT_EPISODE
+
+
+def limit_card_holds(req: HumanRequirement, pane: Optional[str], runtime: Optional[str] = None,
+                     outrun: bool = False) -> bool:
+    """A usage-limit card stays open while its limit stands on `pane`; every resolver asks this."""
+    if not limit_card(req):
+        return False
+    from delivery.pane_gate import limit_standing
+    return limit_standing(pane, runtime, outrun)
+
+
 def limit_unblock(session: Optional[str] = None) -> str:
     """How the owner lifts a usage limit, for the card body."""
     where = f"open its terminal (tmux session {session})" if session else "open its terminal"
@@ -124,8 +137,9 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
     kind, title, message, actions = FALLBACK_KIND, f"{session} · {state}", fallback_message, []
     option_for_action: Dict[str, int] = {}
 
-    if _NEVER_ONE_CLICK.search(prompt or "") or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out"):
-        pass  # keeps the blocked card: never a one-click answer on a trust/spend gate
+    if (episode == LIMIT_EPISODE or _NEVER_ONE_CLICK.search(prompt or "")
+            or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out")):
+        pass  # keeps the blocked card: never a one-click answer on a trust/spend gate or a limit
     elif gate == "login" or state == "logged-out":
         kind, title = "auth", "Claude needs you to sign in again"
         message = "Your Claude session has expired. Sign in again to continue."

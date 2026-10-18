@@ -101,7 +101,7 @@ class OneCardPerEpisode(unittest.TestCase):
         self.assertIs(card.subject["remind"], False)
 
         frames = [
-            # A delivery typed into the limited seat: the old code read this as recovery.
+            # A delivery typed into the limited seat.
             _refused("task-1") + "❯ task-2\n✻ Pondering… (2s · esc to interrupt)\n" + _FOOTER,
             # Its refusal, with a reset time the CLI repainted.
             _refused("task-1") + _refused("task-2", resets="3:59pm") + _FOOTER,
@@ -221,42 +221,117 @@ class UnblockGuidance(unittest.TestCase):
         self.assertIn("Open the Runtime panel", body)
 
 
-class PoolAndMonitorShareOneCard(unittest.TestCase):
+def _pool():
+    spec_ = u.spec_from_file_location("pool_remedy", SCRIPTS / "pool_remedy.py")
+    rem = sys.modules.get("pool_remedy") or u.module_from_spec(spec_)
+    if "pool_remedy" not in sys.modules:
+        sys.modules["pool_remedy"] = rem
+        spec_.loader.exec_module(rem)
+    return rem
+
+
+def _shows(pane):
+    class _Done:
+        returncode, stderr, stdout = 0, "", pane
+    return lambda *a, **k: _Done()
+
+
+WID = "7c54b230a8d94ea9b86f52d70134ac68"
+POOL_SESSION = f"sutando-worker-{WID}"
+_MENU = ("  You've hit your session limit · resets 4pm\n"
+         "  ❯ 1. Stop and wait for limit to reset\n  Enter to confirm · Esc to cancel\n")
+# "limit reached" escapes the one-click deny list, so this menu parses as a two-option choice.
+_WEEKLY_MENU = ("  Weekly limit reached · resets Oct 20, 9am\n\n"
+                "  ❯ 1. Stop and wait for limit to reset\n"
+                "    2. Switch to extra usage\n  Enter to confirm · Esc to cancel\n")
+
+
+class _PoolSeat(unittest.TestCase):
+    def setUp(self):
+        rem = _pool()
+        self.wc, wi, self.ps = rem.wc, rem.wi, rem.ps
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = pathlib.Path(self.td.name)
+        (self.ws / "state").mkdir()
+        (self.ws / "state" / "roster.json").write_text(json.dumps(
+            {"workers": {WID: {"state": "live", "label": "comm"}}}))
+        wi.record_session(self.ws, WID, "s1", runtime="claude", relation=wi.RELATION_NEW)
+        wi.start_incarnation(self.ws, WID, "s1", tmux_socket="/tmp/p.sock", tmux_session=POOL_SESSION)
+        self.m = HitlManager(HitlStore(self.ws / "state" / "hitl" / "requirements"))
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _pool_card(self, pane=_MENU):
+        out = self.wc.raise_card(self.ws, WID, self.ps.CARD_HUMAN, runner=_shows(pane),
+                                 routed=lambda *a: False, manager=self.m)
+        return self.m.get(out["hitl_id"])
+
+    def _sweep(self, pane):
+        return self.wc.resolve_cleared(self.ws, {WID}, manager=self.m, runner=_shows(pane))
+
+
+class PoolAndMonitorShareOneCard(_PoolSeat):
     def test_the_pool_limit_card_is_the_monitors_card(self):
-        spec_ = u.spec_from_file_location("pool_remedy", SCRIPTS / "pool_remedy.py")
-        rem = sys.modules.get("pool_remedy") or u.module_from_spec(spec_)
-        if "pool_remedy" not in sys.modules:
-            sys.modules["pool_remedy"] = rem
-            spec_.loader.exec_module(rem)
-        wc, wi, ps = rem.wc, rem.wi, rem.ps
-        wid = "7c54b230a8d94ea9b86f52d70134ac68"
-        name = f"sutando-worker-{wid}"
-        with tempfile.TemporaryDirectory() as td:
-            ws = pathlib.Path(td)
-            (ws / "state").mkdir()
-            (ws / "state" / "roster.json").write_text(json.dumps(
-                {"workers": {wid: {"state": "live", "label": "comm"}}}))
-            wi.record_session(ws, wid, "s1", runtime="claude", relation=wi.RELATION_NEW)
-            wi.start_incarnation(ws, wid, "s1", tmux_socket="/tmp/p.sock", tmux_session=name)
-            m = HitlManager(HitlStore(ws / "state" / "hitl" / "requirements"))
-            pane = ("  You've hit your session limit · resets 4pm\n"
-                    "  ❯ 1. Stop and wait for limit to reset\n  Enter to confirm · Esc to cancel\n")
+        m, name = self.m, POOL_SESSION
+        pool_card = self._pool_card()
+        self.assertEqual(pool_card.guard, tui_gate.limit_guard(name))
+        self.assertIn("/usage-credits to use extra credits, or /login to switch to another account",
+                      pool_card.message)
+        self.assertIn(f"tmux session {name}", pool_card.message)
+        watched = M.escalate(m, "blocked-human", "d", "session-limit", _MENU, name,
+                             seat="worker comm", runtime="claude")
+        self.assertEqual(watched.id, pool_card.id)
+        self.assertEqual(len(m.active()), 1)
 
-            class _Done:
-                returncode, stderr = 0, ""
-                stdout = pane
+    def test_a_limit_menu_with_choices_is_still_the_one_card(self):
+        for pool_first in (True, False):
+            with self.subTest(pool_first=pool_first):
+                for r in self.m.active():
+                    self.m.resolve(r.id)
+                first = self._pool_card(_WEEKLY_MENU) if pool_first else None
+                watched = M.escalate(self.m, "blocked-human", "d", "selection", _WEEKLY_MENU,
+                                     POOL_SESSION, seat="worker comm", runtime="claude")
+                self.assertEqual(watched.kind, tui_gate.FALLBACK_KIND)
+                self.assertEqual([a.kind for a in watched.actions], ["open_terminal"])
+                pooled = first or self._pool_card(_WEEKLY_MENU)
+                self.assertEqual(watched.id, pooled.id)
+                self.assertEqual(len(self.m.active()), 1)
 
-            out = wc.raise_card(ws, wid, ps.CARD_HUMAN, runner=lambda *a, **k: _Done(),
-                                routed=lambda *a: False, manager=m)
-            pool_card = m.get(out["hitl_id"])
-            self.assertEqual(pool_card.guard, tui_gate.limit_guard(name))
-            self.assertIn("/usage-credits to use extra credits, or /login to switch to another account",
-                          pool_card.message)
-            self.assertIn(f"tmux session {name}", pool_card.message)
-            watched = M.escalate(m, "blocked-human", "d", "session-limit", pane, name,
-                                 seat="worker comm", runtime="claude")
-            self.assertEqual(watched.id, pool_card.id)
-            self.assertEqual(len(m.active()), 1)
+
+class PoolSweepKeepsTheEpisode(_PoolSeat):
+    """The pool's sweep closes a seat's card once the seat is not wedged; a limit card
+    closes by the seat monitor's rule instead, so an unwedged but limited seat keeps it."""
+
+    def test_the_sweep_keeps_a_limit_card_while_the_limit_stands(self):
+        card = self._pool_card()
+        watched = M.escalate(self.m, "blocked-human", "d", "turn-rejected", _refused("task-1"),
+                             POOL_SESSION, runtime="claude")
+        self.assertEqual(watched.id, card.id)
+        for pane in (_refused("task-1") + "❯ task-2\n✻ Pondering… (2s · esc to interrupt)\n" + _FOOTER,
+                     _refused("task-1") + _refused("task-2", resets="3:59pm") + _FOOTER,
+                     _MENU):
+            self.assertEqual(self._sweep(pane), [], pane)
+            self.assertEqual([r.id for r in self.m.active()], [card.id])
+        again = self._pool_card(_refused("task-2") + _MENU)
+        self.assertEqual(again.id, card.id)
+
+    def test_the_sweep_closes_it_once_work_ran_and_a_new_limit_is_a_new_card(self):
+        card = self._pool_card()
+        self.assertEqual(self._sweep(_refused("task-2") + _REAL_TURN + _FOOTER), [card.id])
+        self.assertEqual(self.m.get(card.id).status, STATUS_RESOLVED)
+        self.assertNotEqual(self._pool_card().id, card.id)
+
+    def test_an_unread_pane_keeps_it(self):
+        card = self._pool_card()
+        self.assertEqual(self._sweep(""), [])
+        self.assertEqual([r.id for r in self.m.active()], [card.id])
+
+    def test_other_pool_cards_still_close_on_the_sweep(self):
+        card = self._pool_card("  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n"
+                               "  Enter to confirm · Esc to cancel\n")
+        self.assertNotIn("episode", card.subject)
+        self.assertEqual(self._sweep(_refused("task-1") + _FOOTER), [card.id])
 
 
 if __name__ == "__main__":

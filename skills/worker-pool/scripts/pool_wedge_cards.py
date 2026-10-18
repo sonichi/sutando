@@ -107,6 +107,22 @@ def at_limit(text, pane, runtime, *, workspace=None, socket=None, session=None) 
     return verdict.state == "busy" and sup.pane_gate.is_usage_limit(verdict.reason, text)
 
 
+def limit_holds(workspace, req, worker_id, runner=subprocess.run) -> bool:
+    """The seat monitor's episode-end rule, read off this worker's pane now."""
+    from hitl import tui_gate
+    if not tui_gate.limit_card(req):
+        return False  # skip the pane read; the rule itself is limit_card_holds
+    socket, session = sup._open_tmux(workspace, worker_id)
+    text = capture(socket, session, runner) if socket else None
+    runtime = worker_runtime(workspace, worker_id)
+    outrun = False
+    if text is not None:
+        pane = sup.classify_pane_text(text, runtime or "claude", workspace=workspace,
+                                      socket=socket, session=session)
+        outrun = not at_limit(text, pane, runtime, workspace=workspace, socket=socket, session=session)
+    return tui_gate.limit_card_holds(req, text, runtime, outrun)
+
+
 def _jump(session):
     from hitl.schema import Action
     return Action(id="open_terminal", kind="open_terminal", label=f"Open terminal ({session})")
@@ -244,11 +260,13 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
     return out
 
 
-def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, observations=None, recovered=None) -> list:
+def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, observations=None, recovered=None,
+                    runner=subprocess.run) -> list:
     """Close the pending cards of seats that are no longer wedged, and of seats still
     wedged whose card is not the one their pane asks for now (`wedges`: worker ->
     that card). Pressed proxy cause cards require positive recovery evidence
-    (`recovered`, defaulting to `worker_ids`); Escape stays with `drive_escapes`."""
+    (`recovered`, defaulting to `worker_ids`); Escape stays with `drive_escapes`.
+    A usage-limit card stays while `limit_holds`: an unwedged seat may still be limited."""
     from hitl.schema import STATUS_IN_PROGRESS
     manager = manager or manager_for(workspace)
     wedges = wedges or {}
@@ -273,7 +291,8 @@ def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, observa
                          and subj.get("wedge") == ps.CARD_CAUSE
                          and r.chosen_action == PROXY_ACTION)
         if (subj.get("source") == SOURCE and stale
-                and (r.status != STATUS_IN_PROGRESS or cleared_proxy)):
+                and (r.status != STATUS_IN_PROGRESS or cleared_proxy)
+                and not limit_holds(workspace, r, w, runner)):
             manager.resolve(r.id)
             closed.append(r.id)
     return closed
