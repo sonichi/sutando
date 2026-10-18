@@ -1780,8 +1780,8 @@ PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
 PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
-_ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
-                  "migrated": False, "held_logged": 0.0}
+_ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0,
+                  "held_logged": 0.0}
 ROUTING_REFRESH_S = 300.0
 ROUTING_RETRY_S = 30.0
 OWNER_PRIVATE = "owner_private"
@@ -1804,48 +1804,44 @@ def _routing_record(identity: str, gateway_url: str, owner_dm: str) -> "dict | N
             "owner_dm": owner_dm}
 
 
-def _migrate_routing() -> bool:
-    """Run the routing state's one-time migrations until one finishes; retried at each load. A
-    rewrite makes the held reading stale, so the next load reads the record from disk again."""
-    if not _ROUTING["migrated"]:
-        result = routing_migrations.migrate_owner_routing(
-            _routing_file(), record_for=_routing_record, write=_durable_write,
-            log=lambda line: _log_backoff(("owner-routing migration", line), line))
-        if result.rewritten:
-            _ROUTING["loaded"] = False
-        _ROUTING["migrated"] = result.finished
-    return _ROUTING["migrated"]
+def _migrate_routing() -> "routing_migrations.Result":
+    """The routing state's migrations, on every load: no latch, so what disk still holds (a legacy
+    record, a legacy temp still inside its age bound) is handled when it is there."""
+    return routing_migrations.migrate_owner_routing(
+        _routing_file(), record_for=_routing_record, write=_durable_write,
+        log=lambda line: _log_backoff(("owner-routing migration", line), line))
 
 
 def _load_routing() -> None:
-    _migrate_routing()  # before the reading is prepared
-    if _ROUTING["loaded"]:
-        return
-    _ROUTING["loaded"] = True
-    _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # what the in-memory reading is bound to
+    """Migrate, then rebuild the reading from the disk record, on every load. A gateway reading
+    the writer has not committed yet (owner_dm != persisted) is kept until its write commits."""
+    _migrate_routing()
+    current = (_reenroll_identity(), URL)
+    if not _ROUTING["identity"] and not _ROUTING["gateway"]:
+        _ROUTING["identity"], _ROUTING["gateway"] = current  # a reading set before any binding adopts this one
+    elif (_ROUTING["identity"], _ROUTING["gateway"]) != current:  # re-enrolled: the old reading is not ours
+        _ROUTING.update(owner_dm="", persisted="", identity=current[0], gateway=current[1])
     try:
         d = json.loads(_routing_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
-    if not isinstance(d, dict):
-        return
     # another agent's reading, or this agent's reading from another gateway, authorizes nothing
-    if d.get("identity") == _reenroll_identity() and d.get("binding") and hmac.compare_digest(
+    if isinstance(d, dict) and d.get("identity") == current[0] and d.get("binding") and hmac.compare_digest(
             str(d["binding"]).encode("utf-8"),
-            gateway_instance.binding_digest(_reenroll_identity(), URL).encode("utf-8")):
-        _ROUTING["owner_dm"] = _ROUTING["persisted"] = str(d.get("owner_dm") or "")
+            gateway_instance.binding_digest(current[0], URL).encode("utf-8")):
+        disk = str(d.get("owner_dm") or "")
+        if not _ROUTING["owner_dm"] or _ROUTING["owner_dm"] == _ROUTING["persisted"]:
+            _ROUTING["owner_dm"] = disk
+        _ROUTING["persisted"] = disk
 
 
 def refresh_routing(force: bool = False) -> None:
     """Pull the agent's routing state from the gateway. A failed refresh books a short retry, not the
     window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk."""
+    reenrolled = bool(_ROUTING["identity"] or _ROUTING["gateway"]) and (
+        (_reenroll_identity(), URL) != (_ROUTING["identity"], _ROUTING["gateway"]))
     _load_routing()
-    if not _ROUTING["identity"] and not _ROUTING["gateway"]:
-        _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # a reading set before any binding adopts this one
-    elif (_reenroll_identity(), URL) != (_ROUTING["identity"], _ROUTING["gateway"]):  # re-enrolled while running
-        _ROUTING.update(owner_dm="", persisted="", loaded=False)
-        _load_routing()
-        force = True
+    force = force or reenrolled
     now = time.time()
     if not force and now < _ROUTING["next"]:
         return

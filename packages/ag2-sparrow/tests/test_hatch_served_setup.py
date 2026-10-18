@@ -211,14 +211,14 @@ with mock.patch.object(m, "_req", return_value=row):
     m.refresh_routing(force=True)
 m._emit_gateway_status(True)
 routing, status = m._routing_file().read_text(), m.GATEWAY_STATUS_FILE.read_text()
-m._ROUTING.update(owner_dm="", persisted="", loaded=False)
+m._ROUTING.update(owner_dm="", persisted="")
 m._load_routing()
 reloaded = m._ROUTING["owner_dm"]
 record = json.loads(routing)
 for legacy in ({"identity": record["identity"], "gateway": m.URL, "owner_dm": "!old:x"},
                dict(record, binding="0" * 64, owner_dm="!forged:x")):
     m._routing_file().write_text(json.dumps(legacy))
-    m._ROUTING.update(owner_dm="", persisted="", loaded=False, migrated=False)  # a restart
+    m._ROUTING.update(owner_dm="", persisted="")  # a restart
     m._load_routing()
     reloaded += " " + (m._ROUTING["owner_dm"] or "-")
 m._routing_file().write_text(routing)
@@ -368,16 +368,52 @@ rm._read = read
 seen = []
 for _ in range(2):
     m._load_routing()
-    seen.append({"migrated": m._ROUTING["migrated"], "dm": m._ROUTING["owner_dm"],
-                 "disk": open(m._routing_file()).read()})
+    seen.append({"dm": m._ROUTING["owner_dm"], "disk": open(m._routing_file()).read()})
 print(json.dumps(seen))
 """, AGENT_MXID=AGENT)
-        self.assertFalse(out[0]["migrated"], "a read error is unknown, never migrated")
-        self.assertIn("tenant", out[0]["disk"])
+        self.assertIn("tenant", out[0]["disk"], "a read error is unknown, never migrated")
         self.assertEqual(out[0]["dm"], "")
-        self.assertTrue(out[1]["migrated"])
         self.assertNotIn("tenant", out[1]["disk"])
         self.assertEqual(out[1]["dm"], "!dm:ag2.space", "the rewritten record is read again from disk")
+
+    def test_a_failed_read_back_after_a_committed_rewrite_still_yields_the_owner_dm(self):
+        (self.state / "owner-routing.json").write_text(json.dumps(
+            {"identity": AGENT, "gateway": "https://gw.example/relay?tenant=a", "owner_dm": "!dm:ag2.space"}))
+        out = self.bridge("""
+import json
+from ag2_sparrow import remote_gateway_bridge as m, routing_migrations as rm
+real, reads = rm._read, []
+def read(path):
+    reads.append(1)
+    if len(reads) == 2:  # the read-back right after the rewrite committed
+        raise PermissionError("transient")
+    return real(path)
+rm._read = read
+seen = []
+for _ in range(3):
+    m._load_routing()
+    seen.append({"dm": m._ROUTING["owner_dm"], "state": m._migrate_routing().state})
+print(json.dumps(seen))
+""", AGENT_MXID=AGENT)
+        self.assertNotIn("tenant", (self.state / "owner-routing.json").read_text())
+        self.assertEqual([row["dm"] for row in out], ["!dm:ag2.space"] * 3,
+                         "the reading comes from the disk record whatever the migration reported")
+
+    def test_a_young_legacy_temp_is_swept_once_it_ages_past_the_bound(self):
+        temp = self.state / ".owner-routing.json.7.tmp"
+        temp.write_text(json.dumps({"gateway": "https://gw.example/relay?tenant=a"}))
+        out = self.bridge("""
+import json, os, time
+from ag2_sparrow import remote_gateway_bridge as m
+path = m._STATE / ".owner-routing.json.7.tmp"
+m._load_routing()
+first = [path.exists(), m._migrate_routing().state]
+os.utime(path, (time.time() - 2 * 3600,) * 2)
+m._load_routing()
+print(json.dumps({"first": first, "after": [path.exists(), m._migrate_routing().state]}))
+""", AGENT_MXID=AGENT)
+        self.assertEqual(out["first"], [True, "pending"], "a young temp is not done: it is pending")
+        self.assertEqual(out["after"], [False, "not_needed"], "the same process sweeps it once it is stale")
 
     LEAK = """
 import glob, json, os, socket
@@ -485,7 +521,8 @@ print(json.dumps({"raw": raw, "url": m.URL, "files": files}))
         src = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
         tree = ast.parse(src)
         fns = {f.name: f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)}
-        first = fns["_load_routing"].body[0]
+        first = next(n for n in fns["_load_routing"].body
+                     if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)))
         self.assertEqual(ast.unparse(first).split("#")[0].strip(), "_migrate_routing()",
                          "migration runs before the reading is prepared")
         self.assertIn("routing_migrations.migrate_owner_routing", ast.unparse(fns["_migrate_routing"]))
@@ -500,11 +537,12 @@ def migrate(path, **kw):
     return rm.Result(state=rm.NOT_NEEDED if len(calls) > 1 else rm.FAILED)
 rm.migrate_owner_routing = migrate
 m._load_routing(); m._load_routing(); m._load_routing()
-print(json.dumps({"calls": calls, "loaded": m._ROUTING["loaded"]}))
+print(json.dumps({"calls": calls}))
 """)
-        self.assertEqual(out["calls"], [["log", "record_for", "write"]] * 2,
-                         "an unfinished migration is retried at the next load, then not again")
-        self.assertTrue(out["loaded"])
+        self.assertEqual(out["calls"], [["log", "record_for", "write"]] * 3,
+                         "it runs on every load: there is no latch to go stale")
+        for latch in ('_ROUTING["migrated"]', '_ROUTING["loaded"]'):
+            self.assertNotIn(latch, src)
 
     SCRUB = """
 import io, json, os, traceback, urllib.error, urllib.request, http.client
@@ -1133,11 +1171,11 @@ class RoutingMigration(unittest.TestCase):
         self.legacy()
         seen = []
         result = self.run_migration(record_for=lambda i, u, d: seen.append(u) or self.record(i, u, d))
-        self.assertEqual((result.state, result.rewritten, result.finished), (self.rm.DONE, True, True))
+        self.assertEqual((result.state, result.finished), (self.rm.DONE, True))
         self.assertEqual(seen, [GW + "?tenant=a"], "bound from the full URL it held")
         self.assertNotIn("tenant", self.path.read_text())
         again = self.run_migration()
-        self.assertEqual((again.state, again.rewritten, len(self.writes)), (self.rm.NOT_NEEDED, False, 1))
+        self.assertEqual((again.state, len(self.writes)), (self.rm.NOT_NEEDED, 1))
 
     def test_no_record_or_a_current_one_is_not_needed(self):
         self.assertEqual(self.run_migration().state, self.rm.NOT_NEEDED)
@@ -1150,7 +1188,7 @@ class RoutingMigration(unittest.TestCase):
         for exc in (PermissionError("transient"), ValueError("torn")):
             with mock.patch.object(self.rm, "_read", side_effect=exc):
                 result = self.run_migration()
-            self.assertEqual((result.state, result.rewritten), (self.rm.FAILED, False), exc)
+            self.assertEqual(result.state, self.rm.FAILED, exc)
         self.assertIn("tenant", self.path.read_text())
         self.assertEqual(self.run_migration().state, self.rm.DONE, "then it succeeds")
 
@@ -1161,7 +1199,7 @@ class RoutingMigration(unittest.TestCase):
             self.legacy()
             before = self.path.read_text()
             result = self.run_migration(record_for=record_for, write=write)
-            self.assertEqual((result.state, result.rewritten), (self.rm.FAILED, False))
+            self.assertEqual(result.state, self.rm.FAILED)
             self.assertEqual(self.path.read_text(), before)
         self.assertIn("not migrated yet", self.logs[-1])
 
@@ -1180,9 +1218,12 @@ class RoutingMigration(unittest.TestCase):
         other_old = self.temp(".owner-routing.json.12.tmp", 2 * 3600)
         own_young = self.temp(".owner-routing.json.13.tmp", 600)
         result = self.run_migration()
-        self.assertEqual((result.state, result.removed), (self.rm.DONE, 2))
+        self.assertEqual((result.state, result.removed, result.pending), (self.rm.PENDING, 2, 1),
+                         "a young temp left is not done")
         self.assertFalse(own_old.exists() or other_old.exists(), "the pid never protects a temp")
         self.assertTrue(own_young.exists())
+        os.utime(own_young, (time.time() - 2 * 3600,) * 2)
+        self.assertEqual(self.run_migration().state, self.rm.DONE)
 
     def test_a_sweep_error_does_not_block_the_rewrite_and_the_sweep_is_retried(self):
         self.legacy()
@@ -1196,11 +1237,11 @@ class RoutingMigration(unittest.TestCase):
             return real_unlink(name, *a, **k)
         with mock.patch.object(self.rm.os, "unlink", unlink):
             result = self.run_migration()
-        self.assertEqual((result.state, result.rewritten, result.removed), (self.rm.FAILED, True, 1))
+        self.assertEqual((result.state, result.removed), (self.rm.FAILED, 1))
         self.assertNotIn("tenant", self.path.read_text(), "the rewrite ran despite the sweep error")
         self.assertTrue(bad.exists() and not stale.exists())
         again = self.run_migration()
-        self.assertEqual((again.state, again.rewritten, again.removed), (self.rm.DONE, False, 1))
+        self.assertEqual((again.state, again.removed), (self.rm.DONE, 1))
         self.assertFalse(bad.exists())
 
     def test_a_temp_vanishing_mid_sweep_is_not_an_error(self):
