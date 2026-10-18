@@ -16,9 +16,11 @@ next refusal opened another; and the reminder backoff re-alerted on top. Now:
 - the card names /usage-credits and /login in that seat's terminal.
 """
 import importlib.util as u
+import io
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -66,8 +68,8 @@ class _RH:
         return {"health": self.health}
 
 
-def _tick(out, pane, health="idle"):
-    argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--session", SESSION,
+def _tick(out, pane, health="idle", session=SESSION):
+    argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--session", session,
             "--out", out, "--once", "--stable", "1", "--seat", SEAT]
     with patch.object(M, "capture_styled", lambda s, sess: pane), \
             patch.object(M, "_load_runtime_health", lambda: _RH(health)), \
@@ -333,6 +335,148 @@ class PoolSweepKeepsTheEpisode(_PoolSeat):
         self.assertNotIn("episode", card.subject)
         self.assertEqual(self._sweep(_refused("task-1") + _FOOTER), [card.id])
 
+
+_POOL_FOOTER = "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n"
+# A worker pane captured live: the CLI keeps this banner drawn under the composer after turns finish.
+_BANNER = ("──────── seat-1 ─\n❯ \n────────\n"
+           "  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+           "    Continuing automatically at Oct 13 at 11pm · esc to cancel\n"
+           "  ⏵⏵ bypass permissions on · 1 monitor · ← for agents · ↓ to manage")
+_EARLIER = ("⏺ The task watcher on my inbox hit its 30-minute limit, so I restarted it.\n"
+            "✻ Churned for 27s · done 1:55 PM · 1 monitor still running\n")
+
+
+class PersistedSweepKeepsTheEpisode(unittest.TestCase):
+    """The real `pool_remedy --sweep` (supervision writer, card raise, resolve_cleared) and the
+    real seat monitor tick on one on-disk store, projected; either producer raises first."""
+
+    def setUp(self):
+        rem = self.rem = _pool()
+        self.sup, self.wc, wi = rem.sup, rem.wc, rem.wi
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.ws = pathlib.Path(self.td.name)
+        (self.ws / "state").mkdir()
+        (self.ws / "state" / "roster.json").write_text(json.dumps(
+            {"workers": {WID: {"state": "live", "runtime": "claude", "label": "comm"}}}))
+        wi.record_session(self.ws, WID, "s1", runtime="claude", relation=wi.RELATION_NEW)
+        wi.start_incarnation(self.ws, WID, "s1", tmux_socket=str(self.ws / "tmux.sock"),
+                             tmux_session=wi.tmux_session_name(WID))
+        self.inbox = rem.pd.deliveries_dir(self.ws, WID)
+        self.inbox.mkdir(parents=True)
+        self.out = str(self.ws / "state" / f"core-supervisor.{POOL_SESSION}.json")
+        self.now, self.pane, self.sent, self.watching = 1000.0, _POOL_FOOTER, [], False
+
+    def runner(self, argv, **kwargs):
+        if "capture-pane" in argv:
+            return subprocess.CompletedProcess(argv, 0, self.pane, "")
+        if "has-session" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if "inbox-holders" in argv:
+            return subprocess.CompletedProcess(argv, 0, "4242 session\n", "")
+        raise AssertionError(f"unexpected process operation: {argv}")
+
+    def owe(self, task):
+        for f in self.inbox.glob("task-*.txt"):
+            f.unlink()
+        if task:
+            (self.inbox / f"{task}.txt").write_text("pending")
+
+    def manager(self):
+        return self.wc.manager_for(self.ws)  # fresh from disk, as a restarted producer loads it
+
+    def watch(self):
+        self.watching = True
+        _tick(self.out, self.pane, session=POOL_SESSION)
+
+    def sweep(self):
+        rem, sup, wc = self.rem, self.sup, self.wc
+        self.now += 300.0
+        real_tick, real_raise = sup.tick, wc.raise_card
+        with patch.object(sup, "tick", side_effect=lambda ws, now, **kw:
+                          real_tick(ws, now, runner=self.runner, **kw)), \
+                patch.object(wc, "raise_card", side_effect=lambda ws, wid, which, **kw:
+                             real_raise(ws, wid, which, runner=self.runner, routed=lambda *_: False)), \
+                patch.object(rem, "ensure_supervisors", return_value={}), \
+                patch.object(rem, "ensure_input_watches", return_value={}), \
+                patch.object(wc, "drive_escapes", return_value={}), \
+                patch.object(rem.time, "time", return_value=self.now), \
+                patch.object(rem.subprocess, "run", side_effect=AssertionError("unexpected subprocess")), \
+                patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(rem.main(["--workspace", str(self.ws), "--repo", str(REPO), "--sweep"],
+                                      runner=self.runner), 0)
+        if self.watching:
+            _tick(self.out, self.pane, session=POOL_SESSION)
+        project(self.manager(), lambda p: (self.sent.append(p), {"ok": True, "event_id": "$e"})[1],
+                "!room", clock=lambda: self.now)
+
+    def card_ids(self):
+        return [r.id for r in self.manager().active()]
+
+    def alerts(self):
+        return sum(p.get("op") == "message" and "needs your attention" in p["body"] for p in self.sent)
+
+    def limit_begins(self, pane, task, seat_first):
+        self.pane = pane
+        self.owe(task)
+        if seat_first:
+            self.watch()
+        for _ in range(6):
+            self.sweep()
+        self.watch()
+        [card] = self.manager().active()
+        self.assertTrue(tui_gate.limit_card(card))
+        self.assertEqual(card.subject["source"], "tui" if seat_first else self.wc.SOURCE)
+        self.assertEqual(self.alerts(), 1)
+        return card.id
+
+    def test_refused_deliveries_keep_the_card_until_work_runs_then_a_new_limit_is_new(self):
+        for seat_first in (False, True):
+            with self.subTest(seat_first=seat_first):
+                self.setUp()
+                card = self.limit_begins(_refused("task-1") + _POOL_FOOTER, "task-1", seat_first)
+                for pane in (_refused("task-1") + "❯ task-2\n✻ Pondering… (2s · esc to interrupt)\n",
+                             _refused("task-1") + _refused("task-2", resets="3:59pm") + _POOL_FOOTER,
+                             _refused("task-2") + _MENU):
+                    self.pane = pane
+                    self.owe("task-2")
+                    for _ in range(2):
+                        self.sweep()
+                        self.assertEqual(self.card_ids(), [card], pane)
+                        self.assertEqual(self.alerts(), 1)
+                self.pane = _refused("task-2") + _REAL_TURN + _POOL_FOOTER
+                self.owe(None)
+                self.sweep()
+                self.assertEqual(self.card_ids(), [], "real work did not clear")
+                self.assertEqual(self.manager().get(card).status, STATUS_RESOLVED)
+                self.pane = _REAL_TURN + _refused("task-10") + _POOL_FOOTER
+                self.owe("task-10")
+                for _ in range(6):
+                    self.sweep()
+                [again] = self.card_ids()
+                self.assertNotEqual(again, card, "a limit after recovery is a new episode")
+                self.assertEqual(self.alerts(), 2)
+
+    def test_a_banner_left_drawn_after_a_finished_turn_ends_the_episode(self):
+        # A worker's monitor leaves banners to the pool, so only the pool raises this card.
+        later = "⏺ Done: the summary is in the room.\n✻ Brewed for 3m 2s · done 1:58 PM\n"
+        card = self.limit_begins(_EARLIER + _BANNER, "task-1", seat_first=False)
+        for pane in (_EARLIER + _BANNER, _EARLIER + "❯ task-2\n✻ Pondering… (2s · esc to interrupt)\n" + _BANNER):
+            self.pane = pane
+            self.owe("task-2")
+            self.sweep()
+            self.assertEqual(self.card_ids(), [card], "a standing banner closed the card")
+        self.pane = _EARLIER + later + _BANNER
+        self.owe(None)
+        self.sweep()
+        self.assertEqual(self.card_ids(), [], "a recovered seat kept its limit card")
+        self.pane = _EARLIER + later + _BANNER + "\n" + _refused("task-3") + _POOL_FOOTER
+        self.owe("task-3")
+        for _ in range(6):
+            self.sweep()
+        [again] = self.card_ids()
+        self.assertNotEqual(again, card, "the next limit folded into the old card")
+        self.assertEqual(self.alerts(), 2)
 
 if __name__ == "__main__":
     unittest.main()

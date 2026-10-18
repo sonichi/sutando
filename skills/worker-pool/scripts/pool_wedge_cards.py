@@ -107,20 +107,18 @@ def at_limit(text, pane, runtime, *, workspace=None, socket=None, session=None) 
     return verdict.state == "busy" and sup.pane_gate.is_usage_limit(verdict.reason, text)
 
 
-def limit_holds(workspace, req, worker_id, runner=subprocess.run) -> bool:
-    """The seat monitor's episode-end rule, read off this worker's pane now."""
+def limit_holds(workspace, req, worker_id, runner=None, owes_work=None) -> bool:
+    """The seat monitor's episode-end rule, read off this worker's pane now. `owes_work`:
+    the observed queue; the pool keeps no banner baseline, so each read is a first sight."""
     from hitl import tui_gate
     if not tui_gate.limit_card(req):
         return False  # skip the pane read; the rule itself is limit_card_holds
     socket, session = sup._open_tmux(workspace, worker_id)
-    text = capture(socket, session, runner) if socket else None
-    runtime = worker_runtime(workspace, worker_id)
+    text = capture(socket, session, runner or subprocess.run) if socket else None
     outrun = False
     if text is not None:
-        pane = sup.classify_pane_text(text, runtime or "claude", workspace=workspace,
-                                      socket=socket, session=session)
-        outrun = not at_limit(text, pane, runtime, workspace=workspace, socket=socket, session=session)
-    return tui_gate.limit_card_holds(req, text, runtime, outrun)
+        outrun, _ = sup.pane_gate.limit_step(text, None, workspace, socket, session, owes_work=owes_work)
+    return tui_gate.limit_card_holds(req, text, worker_runtime(workspace, worker_id), outrun)
 
 
 def _jump(session):
@@ -261,7 +259,7 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
 
 
 def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, observations=None, recovered=None,
-                    runner=subprocess.run) -> list:
+                    runner=None) -> list:
     """Close the pending cards of seats that are no longer wedged, and of seats still
     wedged whose card is not the one their pane asks for now (`wedges`: worker ->
     that card). Pressed proxy cause cards require positive recovery evidence
@@ -292,7 +290,8 @@ def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, observa
                          and r.chosen_action == PROXY_ACTION)
         if (subj.get("source") == SOURCE and stale
                 and (r.status != STATUS_IN_PROGRESS or cleared_proxy)
-                and not limit_holds(workspace, r, w, runner)):
+                and not limit_holds(workspace, r, w, runner,
+                                    ((observations or {}).get(w) or {}).get("work_outstanding"))):
             manager.resolve(r.id)
             closed.append(r.id)
     return closed

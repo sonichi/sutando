@@ -605,6 +605,22 @@ def limit_is_stale(abn, workspace, socket, session, probe=False, capture=None, b
         return False
 
 
+def limit_step(pane, baseline, workspace=None, socket=None, session=None, owes_work=True):
+    """(stale, baseline) for this poll's limit banner. The baseline is taken when a banner
+    first shows, and again when its text changes; the newest turn since then decides.
+    A banner holds nothing on a seat that owes no work (`owes_work` False or unknown).
+    The seat monitor and the pool sweep both judge staleness here."""
+    abn = limit_banner(pane or "")
+    if abn is None:
+        return False, None
+    current = limit_baseline(pane)
+    if baseline is None or baseline.banner != current.banner:
+        baseline = current
+    if owes_work is not True:
+        return True, baseline
+    return limit_is_stale(abn, workspace, socket, session, capture=pane, baseline=baseline), baseline
+
+
 def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=None,
                   socket=None, session=None, probe=False) -> Verdict:
     """One verdict for a captured pane. A failed or empty capture is UNKNOWN, never idle.
