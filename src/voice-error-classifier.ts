@@ -61,11 +61,8 @@ const PATTERNS: Array<{
 		userActionUrl: 'https://aistudio.google.com/apikey',
 	},
 	{
-		// An ephemeral token that can no longer open a session. Gemini closes the dial with 1011 and
-		// one of these reasons (measured 2026-10-17 on gemini-3.8-live): "Token has expired" past
-		// expireTime, "Token has been used too many times" once `uses` are spent, and
-		// "new_session_expire_time deadline exceeded" past the session-start window. Every redial
-		// presents the same token, so retrying can never succeed: only a newly issued token can.
+		// Dead ephemeral-token close reasons (1011): expired, uses spent, past the start window.
+		// Every redial presents the same token, so only a newly issued token helps.
 		rx: /\btoken has expired\b|\btoken has been used too many times\b|\bnew_session_expire_time deadline exceeded\b/i,
 		category: 'token_expired',
 		retryable: false,
