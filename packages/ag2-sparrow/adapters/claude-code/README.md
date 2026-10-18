@@ -133,7 +133,7 @@ ag2-sparrow-claude-local install \
   --work <work> \
   --claude-config-dir <workspace>/.claude-sutando \
   --hmac-key-file <workspace>/state/auth/task-hmac.key
-  # or --inbox <work>/tasks [--results <dir>]; --permission-mode default bypassPermissions
+  # or --inbox <work>/tasks (the result dir is <work>/results); --permission-mode default bypassPermissions
 ag2-sparrow-claude-local verify
 ag2-sparrow-claude-local debug-run    # one session in the foreground; refused while the job is registered
 ag2-sparrow-claude-local uninstall
@@ -148,23 +148,29 @@ under one per-shape operation lock (`~/.config/ag2-sparrow/claude-local.oplock`,
 a stable file that is never unlinked; a second `install`, `uninstall` or
 `debug-run` waits briefly, then refuses with one line): both files must be
 absent or carry install's marker (an unmarked file is a final refusal that
-names what to remove by hand; there is no `--force`); the work root must be
-the one already persisted (a change is "run uninstall, then install"); a root
-held with no registered job is an orphan and refuses **before any file is
-written**, naming the pid; then the job is stopped through the manager (a
-bounded `launchctl bootout --wait`, or `systemctl stop`) and proven absent
-from the manager's own output, the root proven free, and only then are the
-config (`~/.config/ag2-sparrow/claude-local.conf`, 0600, marker first line,
-the canonical `ROOT` persisted from `--work` or the lexical parent of an
-`--inbox` whose basename is `tasks`) and the unit written by temp + replace
-and the job registered and started: a systemd user unit
+names what to remove by hand; there is no `--force`), and a marked config must
+fully parse and name an absolute `ROOT`, else install and uninstall stop before
+any mutation and keep it (fix or remove it by hand); the work root must be the
+one already persisted (a change is "run uninstall, then install"); a root held
+with no running job (the manager probed directly: `launchctl print
+gui/<uid>/<label>`, `systemctl show -p LoadState,ActiveState,UnitFileState`;
+a loaded or enabled but inactive unit is *registered*, not running) is an
+orphan and refuses **before any file or directory is written**, naming the
+pid; then the job is stopped through the manager (`launchctl bootout --wait
+gui/<uid>/<label>`, the single service target `--wait` applies to, bounded by
+the command timeout; or `systemctl stop` + `disable`, proven inactive and
+disabled) and the root proven free within a bound; only then are `tasks/` and
+`results/` made, the config (`~/.config/ag2-sparrow/claude-local.conf`, 0600,
+marker first line, the canonical `ROOT` persisted from `--work` or the lexical
+parent of an `--inbox` whose basename is `tasks`) and the unit written by
+temp + replace and the job registered and started: a systemd user unit
 (`~/.config/systemd/user/ag2-sparrow-claude-local.service`, `Restart=always`,
 `RestartSec=10`, `RestartPreventExitStatus=75`, linger requested) or a
 launchd agent (`~/Library/LaunchAgents/ai.ag2.sparrow.claude-local.plist`,
 `KeepAlive`, `RunAtLoad`, `ThrottleInterval` 10). Success is "the managed
 launcher acquired the expected root": within a bound, the root's flock is held
-by a live `claude-local` holder whose pid and start differ from the record
-before the apply. Anything less fails closed with "the managed launcher did
+by a live `claude-local` holder from this very install (`holder_lock.install_id`)
+whose pid and start differ from the record before the apply. Anything less fails closed with "the managed launcher did
 not acquire <root> ...; run uninstall, then install", rolls nothing back, and
 the identical `install` is the retry (it performs the whole stop/replace/start
 again; there is no "unchanged" shortcut). Both units run
@@ -174,18 +180,25 @@ its config dir (`verify` runs `claude auth status` there; nothing is copied).
 
 `run` checks the pin again, takes the one-session-per-root `holder_lock` on
 the persisted `ROOT` (the same key the Codex, routine and cloud-session
-adapters use, so a symlinked `tasks` still contends with its siblings),
-publishes its record before the child exists, leases the lock descriptor to
-the child (`holder_lock.child_lease`, design §1.9), and starts the session
-through a one-line trampoline that `fchdir`s into `tasks` under the **held
-root inode** (a path replaced after the lock check is a different root the
-child never sees). The flock therefore stays held until both the launcher and
-the session are gone; a second launcher exits 75, which the systemd unit does
-not relaunch (a session's own exit 75 is reported as 1). Every launcher exit
-reaps the child first: `SIGTERM` (`systemctl stop`, `bootout`) and `SIGINT`
-terminate it, wait up to 15 s, kill, reap, then release (143 / 130); a
-post-spawn exception reaps, then re-raises; a reap that cannot be confirmed
-exits **without** releasing, so the surviving child keeps the root fenced and
+adapters use, so a symlinked `tasks` still contends with its siblings; a
+`Contended` with no record or no live holder is retried for 1 s first, so a
+`verify` or install probe's momentary flock never forges a 75), publishes its
+record before the child exists, leases the lock descriptor to exactly one
+child (`holder_lock.child_lease`, design §1.9; terminal, never a second), and
+starts the session through a small trampoline **parent**: it keeps the lease
+for itself (not inheritable), `fchdir`s into `tasks` under the **held root
+inode**, sets `AG2_INBOX_DIR=.` and `AG2_RESULTS_DIR=../results`, runs
+`claude` with `close_fds`, forwards `SIGTERM`/`SIGINT` to it and reaps it
+before exiting with its code. So the session's task I/O is bound to the
+inherited inode (a path replaced after the lock check is a different root it
+never lists), and no grandchild can keep the flock. The flock therefore stays
+held until both the launcher and the trampoline are gone; a second launcher
+exits 75, which the systemd unit does not relaunch (a session's own exit 75
+is reported as 1). Every launcher exit reaps the child first: `SIGTERM`
+(`systemctl stop`, `bootout`) and `SIGINT` terminate it, wait up to 15 s,
+kill, wait up to 10 s more, then release (143 / 130); a post-spawn exception
+reaps, then re-raises; a reap not confirmed within that bound exits
+**without** releasing, so the surviving child keeps the root fenced and
 `verify` reads "held, launcher gone (child alive)"; `SIGKILL` of the launcher
 leaves the same state. The env allowlist below does not isolate files: a
 `bypassPermissions` session can still read `relay.env` or anything else on
@@ -198,8 +211,8 @@ claude --plugin-dir <plugin> --permission-mode bypassPermissions \
 ```
 
 with an environment of only `PATH`, `HOME`, `USER`, `ANTHROPIC_BASE_URL`
-(when set), `CLAUDE_CONFIG_DIR`, `AG2_INBOX_DIR` (the held root's `tasks`),
-`AG2_RESULTS_DIR`, `AG2_HMAC_KEY_FILE`, `AG2_HMAC_STRICT` and the marker
+(when set), `CLAUDE_CONFIG_DIR`, `AG2_INBOX_DIR=.`, `AG2_RESULTS_DIR=../results`
+(both relative to the held `tasks` cwd), `AG2_HMAC_KEY_FILE`, `AG2_HMAC_STRICT` and the marker
 `AG2_AUTOARM=1`, so the host's `SUTANDO_*` never reaches the session. With
 that marker the Mod arms the inbox watch itself at `session.start` from
 `AG2_INBOX_DIR` / `AG2_RESULTS_DIR`, with no model turn and nothing written to
@@ -214,19 +227,22 @@ login lives in the Keychain under the account name, and without `USER` the
 CLI falls back to `.credentials.json` and reports `loggedIn: false`
 (`claude auth status` is the cheap check).
 
-`verify` prints `INFO job: <name> active|absent|unknown` from the manager's
-own words and `INFO session: <root> held by launcher pid N | held, launcher
+`verify` prints `INFO job: <name> active|registered|absent|unknown` from the
+manager's own words and `INFO session: <root> held by launcher pid N | held, launcher
 gone (child alive) | free | unknown (...)` from `task_io.lock_held` (the
 physical flock probe; errors read `unknown`, never `free`) and the holder
 record. `debug-run` holds the operation lock from the registered/absent check
 through the root lock's acquisition, refuses a registered job, an unknown
-probe or a held root, and otherwise runs the same session in the foreground.
+probe or a held root (a registered-but-inactive unit refuses too), and
+otherwise runs the same session in the foreground.
 
-`uninstall` tears down with the config **last**, every step re-runnable:
-stop through the manager and prove it absent (systemd: `stop`, `disable`,
-then `is-active` inactive/failed and `is-enabled` disabled), prove the root's
-flock free, remove the marked unit, `daemon-reload` and require
-`LoadState=not-found`, then remove the marked config. A live holder, an
+`uninstall` tears down with the config **last**, every step re-runnable: the
+manager is probed first (a job registered without files is still torn down),
+stopped and proven stopped (launchd: `bootout --wait gui/<uid>/<label>`, then
+`print` says not found; systemd: `stop`, `disable`, then `show` says inactive
+and disabled), the root's flock proven free within the same bound install
+uses, the marked unit removed, `daemon-reload` run with `LoadState=not-found`
+required, then the marked config removed. A live holder, an
 unknown probe, a lock error or any failure in between keeps the config (so a
 rerun still knows the root) and prints the manual recovery verbatim: the exact
 `launchctl bootout --wait` / `systemctl --user stop` command, how to find and

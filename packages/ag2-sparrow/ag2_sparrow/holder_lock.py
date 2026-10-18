@@ -111,6 +111,7 @@ class Owner:
     published: bool = False
     released: bool = False
     leased: bool = False
+    lease_used: bool = False
     mutex: Any = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -903,16 +904,16 @@ def publish(owner: Owner, adapter: str) -> Published:
 
 
 def child_lease(owner: Owner) -> int:
-    """The lock descriptor for one child's pass_fds (§1.9): the flock lives on the shared open file
-    description, so the child keeps the root held after this process is gone, and `release` is refused
-    until `end_lease` confirms the reap. Once per owner."""
+    """The lock descriptor for exactly one child's pass_fds (§1.9): the flock lives on the shared open
+    file description, so the child keeps the root held after this process is gone, and `release` is
+    refused until `end_lease` confirms the reap. Terminal: a second call is LockError("lease used")."""
     _check_owner(owner)
     with _guarded:
         _held_fds(owner)
-        if owner.leased:
-            raise LockError("leased")
+        if owner.lease_used:
+            raise LockError("lease used")
         _lock_still_held(owner)
-        owner.leased = True
+        owner.leased = owner.lease_used = True
         return owner.fd
 
 

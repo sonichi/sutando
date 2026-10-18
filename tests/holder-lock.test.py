@@ -478,7 +478,7 @@ class HolderLockTest(unittest.TestCase):
         self.assertEqual(fd, owner.fd, "the lease is the owner's own descriptor, for pass_fds")
         with self.assertRaises(self.hl.LockError) as e:
             self.hl.child_lease(owner)
-        self.assertEqual(str(e.exception), "leased", "once per owner")
+        self.assertEqual(str(e.exception), "lease used", "once per owner")
         child = subprocess.Popen(["sleep", "30"], pass_fds=(fd,))
         self.addCleanup(lambda: (child.poll() is None and child.kill(), child.wait(WAIT)))
         with self.assertRaises(self.hl.LockError) as e:
@@ -535,6 +535,23 @@ class HolderLockTest(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertIsInstance(r, self.hl.Acquired, "the root is free once the child is gone")
+
+    def test_a_lease_is_terminal_even_after_end_lease(self):
+        owner = self.owned()
+        fd = self.hl.child_lease(owner)
+        child = subprocess.Popen(["true"], pass_fds=(fd,))
+        child.wait(WAIT)
+        self.hl.end_lease(owner, child.pid)
+        self.assertFalse(owner.leased)
+        self.assertTrue(owner.lease_used)
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.child_lease(owner)
+        self.assertEqual(str(e.exception), "lease used", "a reaped child does not re-open the lease")
+        with self.assertRaises(self.hl.LockError) as e:
+            self.hl.end_lease(owner, child.pid)
+        self.assertEqual(str(e.exception), "not leased")
+        self.hl.release(owner)
+        self.assertTrue(self.lock_free())
 
     def test_a_copied_owner_cannot_lease_and_a_lease_survives_no_lost_lock(self):
         owner = self.owned()

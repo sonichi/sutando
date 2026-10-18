@@ -160,7 +160,12 @@ def lock_holder(work):
     if not record:
         return {}
     return {"adapter": record.get("adapter"), "pid": record.get("pid"), "start": record.get("start"),
-            "live": bool(state.get("holder_lineage"))}
+            "install_id": record.get("install_id"), "live": bool(state.get("holder_lineage"))}
+
+
+def install_id():
+    """This running package's install identity, as holder_lock records it in every holder record."""
+    return holder_lock.install_id()
 
 
 def lock_path(work):
@@ -217,11 +222,22 @@ def release_after_reap(owner, child_pid):
     return True
 
 
-def acquire_lock(work, adapter):
+def acquire_lock(work, adapter, retry_s=0.0):
     """The adapter's first act: one process per work root through holder_lock, its record
-    published at once. Returns the owner, or raises LockRefused with the exit code and line."""
+    published at once. Returns the owner, or raises LockRefused with the exit code and line. A
+    Contended with no record or no live holder is retried for `retry_s` first: a probe's momentary
+    flock is not another session."""
+    deadline = time.monotonic() + retry_s
     try:
-        got = holder_lock.acquire(work, install_id=holder_lock.install_id(), timeout=0)
+        while True:
+            got = holder_lock.acquire(work, install_id=holder_lock.install_id(), timeout=0)
+            if isinstance(got, holder_lock.Contended) and time.monotonic() < deadline and not (
+                    isinstance(got.holder, holder_lock.Valid)
+                    and holder_lock.verify_lineage(got.holder.record["pid"], got.holder.record["start"],
+                                                   got.holder.record["host"])):
+                time.sleep(0.05)
+                continue
+            break
         if isinstance(got, holder_lock.Acquired):
             try:
                 holder_lock.publish(got.owner, adapter)

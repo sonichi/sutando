@@ -32,8 +32,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import _dirs
-from .task_io import (LockRefused, acquire_lock, lease_fd, lock_held, lock_holder, lock_path, release_after_reap,
-                      release_lock, root_path)
+from .task_io import (LockRefused, acquire_lock, install_id, lease_fd, lock_held, lock_holder, lock_path,
+                      release_after_reap, release_lock)
 
 EXIT_HELD = 75          # another session holds this work root: a supervisor must not relaunch over it
 EXIT_UNUSABLE = 2
@@ -42,8 +42,25 @@ TERM_GRACE_S = 15.0
 RUN_TIMEOUT_S = 30
 CONFIRM_TIMEOUT_S = 30.0
 OP_WAIT_S = 30.0
+ACQUIRE_RETRY_S = 1.0
+REAP_BOUND_S = 10.0
 POLL_S = 0.2
-TRAMPOLINE = "import os, sys; os.fchdir(int(sys.argv[1])); os.execv(sys.argv[2], sys.argv[2:])"
+# The small parent between the launcher and the session: it keeps the lease fd for itself (never
+# inherited further), runs the session with cwd = the held tasks inode, and reaps it on any signal.
+TRAMPOLINE = """
+import os, signal, subprocess, sys
+lease, tasks = int(sys.argv[1]), int(sys.argv[2])
+os.fchdir(tasks); os.close(tasks); os.set_inheritable(lease, False)
+env = dict(os.environ, AG2_INBOX_DIR=".", AG2_RESULTS_DIR=os.path.join("..", "results"))
+child = subprocess.Popen(sys.argv[3:], env=env, close_fds=True)
+for sig in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(sig, lambda signum, frame: child.send_signal(signum))
+while True:
+    try:
+        sys.exit(child.wait())
+    except KeyboardInterrupt:
+        child.terminate()
+"""
 
 
 @dataclass(frozen=True)
@@ -247,6 +264,24 @@ def supervisor_text(path: Path) -> "tuple[str | None, str]":
     return file_text(path, "supervisor file")
 
 
+def owned_config(shape: Shape) -> "tuple[dict | None, str]":
+    """(config, '') for a fully parsable marked config with a trustworthy ROOT, (None, '') for none, else
+    (None, why): a malformed owned config stops install and uninstall before any mutation."""
+    conf = config_path(shape)
+    text, problem = owned_text(conf, shape.marker, "config")
+    if problem:
+        return None, problem
+    if text is None:
+        return None, ""
+    cfg, problem = load_config(shape)
+    if problem:
+        return None, f"{problem.split('; run ')[0]}; fix or remove it by hand (rm {shlex.quote(str(conf))}), then run " \
+                     f"{shape.command} install"
+    if not os.path.isabs(cfg["ROOT"]):
+        return None, f"{conf} names a relative ROOT {cfg['ROOT']!r}; fix or remove it by hand, then run {shape.command} install"
+    return cfg, ""
+
+
 def owned_text(path: Path, marker: str, what: str) -> "tuple[str | None, str]":
     """(text, '') for a marked file or nothing, else (None, why): ownership refusals are final and name
     what to remove by hand."""
@@ -337,31 +372,43 @@ def _systemctl(*args) -> "subprocess.CompletedProcess | None":
     return _run(["systemctl", "--user", "--no-ask-password", *args])
 
 
+def unit_state(shape: Shape) -> dict:
+    """{load, active, enabled} from one `systemctl show --value` (its own words only); every field
+    'unknown' when it cannot be read."""
+    r = _systemctl("show", "-p", "LoadState,ActiveState,UnitFileState", "--value", shape.service_name)
+    words = (r.stdout or "").split("\n") if r is not None and r.returncode == 0 else []
+    words = [w.strip() for w in words] + ["", "", ""]
+    load, active, enabled = words[0], words[1], words[2]
+    return {"load": load if load in ("loaded", "not-found", "masked", "bad-setting", "error") else "unknown",
+            "active": "active" if active in ("active", "activating", "reloading", "deactivating") else
+                      "inactive" if active in ("inactive", "failed") else "unknown",
+            "enabled": "enabled" if enabled in ("enabled", "enabled-runtime", "static", "linked", "indirect") else
+                       "disabled" if enabled in ("disabled", "not-found", "") and load != "unknown" else "unknown"}
+
+
 def unit_active(shape: Shape) -> str:
-    """active | absent | unknown, from `systemctl is-active`'s own words only."""
-    r = _systemctl("is-active", shape.service_name)
-    if r is None:
+    """active | registered | absent | unknown: a loaded or enabled unit counts as registered."""
+    st = unit_state(shape)
+    if "unknown" in st.values():
         return "unknown"
-    word = _word(r)
-    if r.returncode == 0 or word in ("active", "activating", "reloading"):
+    if st["active"] == "active":
         return "active"
-    return "absent" if word in ("inactive", "failed") else "unknown"
-
-
-def unit_enabled(shape: Shape) -> str:
-    """enabled | disabled | unknown, from `systemctl is-enabled`'s own words only."""
-    word = _word(_systemctl("is-enabled", shape.service_name))
-    return "enabled" if word in ("enabled", "enabled-runtime", "static", "linked") else \
-        "disabled" if word in ("disabled", "not-found") else "unknown"
+    return "absent" if st["load"] == "not-found" and st["enabled"] == "disabled" else "registered"
 
 
 def unit_load_state(shape: Shape) -> str:
-    return _word(_systemctl("show", "-p", "LoadState", "--value", shape.service_name)) or "unknown"
+    return unit_state(shape)["load"]
+
+
+def launchd_service(shape: Shape) -> str:
+    """The single service target `gui/<uid>/<label>`: what `bootout --wait` and `print` take."""
+    return f"{_launchd_target()}/{shape.agent_label}"
 
 
 def agent_loaded(shape: Shape) -> str:
-    """active | absent | unknown, from `launchctl print`'s exit and its documented not-found error only."""
-    r = _run(["launchctl", "print", f"{_launchd_target()}/{shape.agent_label}"])
+    """active | absent | unknown, from `launchctl print`'s exit and its documented not-found error only;
+    a registered launchd job is a running one (KeepAlive)."""
+    r = _run(["launchctl", "print", launchd_service(shape)])
     if r is None:
         return "unknown"
     if r.returncode == 0:
@@ -370,13 +417,14 @@ def agent_loaded(shape: Shape) -> str:
 
 
 def manager_state(shape: Shape) -> str:
+    """active | registered | absent | unknown, probed from the manager, never from the files."""
     return agent_loaded(shape) if is_macos() else unit_active(shape)
 
 
 def stop_command(shape: Shape) -> str:
     """What stops the job by hand, verbatim for a refusal."""
     if is_macos():
-        return f"launchctl bootout --wait {_launchd_target()} {shlex.quote(str(plist_path(shape)))}"
+        return f"launchctl bootout --wait {launchd_service(shape)}"
     return f"systemctl --user stop {shape.service_name}"
 
 
@@ -397,19 +445,28 @@ def start_supervisor(shape: Shape) -> str:
 
 
 def stop_supervisor(shape: Shape) -> str:
-    """Stop the job through the manager (launchd: a bounded `bootout --wait`; systemd: stop) and
-    require its explicit absent: '' on absent, else why not."""
+    """Stop the job through the manager (launchd: a bounded `bootout --wait` on the service target;
+    systemd: stop + disable) and require its own word for it: '' once launchd reports it absent or
+    systemd reports it inactive and disabled, else why not."""
     if is_macos():
-        r = _run(["launchctl", "bootout", "--wait", _launchd_target(), str(supervisor_path(shape))])
-    else:
-        r = _systemctl("stop", shape.service_name)
+        r = _run(["launchctl", "bootout", "--wait", launchd_service(shape)])
+        if r is None:
+            return f"the stop command for {job_name(shape)} could not run"
+        state = manager_state(shape)
+        if state == "absent":
+            return ""
+        return (f"{job_name(shape)} is still active after the stop ({_why(r)})" if state == "active" else
+                f"{job_name(shape)}'s state after the stop is unknown ({_why(r)})")
+    r = _systemctl("stop", shape.service_name)
     if r is None:
         return f"the stop command for {job_name(shape)} could not run"
-    state = manager_state(shape)
-    if state == "absent":
+    _systemctl("disable", shape.service_name)
+    st = unit_state(shape)
+    if st["active"] == "inactive" and st["enabled"] == "disabled":
         return ""
-    return (f"{job_name(shape)} is still active after the stop ({_why(r)})" if state == "active" else
-            f"{job_name(shape)}'s state after the stop is unknown ({_why(r)})")
+    if "unknown" in (st["active"], st["enabled"]):
+        return f"{job_name(shape)}'s state after the stop is unknown ({_why(r)})"
+    return f"{job_name(shape)} is still {st['active']} and {st['enabled']} after the stop ({_why(r)})"
 
 
 def linger(shape: Shape) -> None:
@@ -502,12 +559,14 @@ def _await_free(root: str) -> str:
 
 
 def _fresh_holder(shape: Shape, root: str, before: dict) -> "dict | None":
-    """The record once the root is held by a live launcher of this shape other than `before`'s, within
-    the bound. The flock is occupancy, the record attribution: never the session's readiness."""
+    """The record once the root is held by a live launcher of this shape from this very install, other
+    than `before`'s (pid and start), within the bound. The flock is occupancy, the record attribution:
+    never the session's readiness."""
     deadline = time.monotonic() + CONFIRM_TIMEOUT_S
+    mine = install_id()
     while True:
         rec = lock_holder(root) if lock_held(root) == "held" else {}
-        if rec.get("live") and rec.get("adapter") == shape.name \
+        if rec.get("live") and rec.get("adapter") == shape.name and rec.get("install_id") == mine \
                 and (rec["pid"], rec["start"]) != (before.get("pid"), before.get("start")):
             return rec
         if time.monotonic() >= deadline:
@@ -529,16 +588,13 @@ def _install_locked(shape: Shape, values: dict, root: str) -> int:
     """A quiescent replacement: both files owned, the same root as before, no orphan on it, the job
     stopped and absent, the root free; only then the files, the start, and the fresh holder."""
     conf, sup, marker = config_path(shape), supervisor_path(shape), supervisor_marker(shape)
-    old_text, problem = owned_text(conf, shape.marker, "config")
+    old, problem = owned_config(shape)
     if problem:
         return _refuse(problem)
+    old = old or {}
     unit_text, problem = owned_text(sup, marker, "supervisor file")
     if problem:
         return _refuse(problem)
-    try:
-        old = read_config(conf) if old_text else {}
-    except ValueError:
-        old = {}
     if old.get("ROOT") and old["ROOT"] != root:
         return _refuse(f"the work root is {old['ROOT']}, not {root}; run {shape.command} uninstall, then "
                        f"{shape.command} install")
@@ -548,13 +604,13 @@ def _install_locked(shape: Shape, values: dict, root: str) -> int:
     state, manager = lock_held(root), manager_state(shape)
     if state == "unknown" or manager == "unknown":
         return _refuse(f"{root} is {holder_line(root)} and {job_name(shape)} is {manager}; nothing was applied")
-    if state == "held" and manager == "absent":
+    if state == "held" and manager != "active":
         rec = lock_holder(root)
         who = f"launcher pid {rec['pid']}" if rec.get("live") else f"launcher pid {rec.get('pid')} gone, the child alive"
         return _refuse(f"{root} is held by a session no job of {job_name(shape)} manages ({who}); stop it, then run "
                        "install again; nothing was applied")
     before = lock_holder(root)
-    if unit_text is not None or manager == "active":
+    if unit_text is not None or manager != "absent":
         problem = stop_supervisor(shape)
         if problem:
             return _refuse(f"{problem}; nothing was applied")
@@ -562,6 +618,8 @@ def _install_locked(shape: Shape, values: dict, root: str) -> int:
     problem = _await_free(root)
     if problem:
         return _refuse(f"{problem} after the stop; nothing was applied")
+    for key in ("INBOX_DIR", "RESULTS_DIR"):
+        Path(values[key]).mkdir(parents=True, exist_ok=True)
     _write(conf, render_config(shape, dict(values, ROOT=root)), 0o600)
     _write(sup, unit, 0o644)
     print(f"{'installed' if not old else 'changed' if old != dict(values, ROOT=root) else 'rewritten'}: {conf}")
@@ -581,16 +639,27 @@ def _install_locked(shape: Shape, values: dict, root: str) -> int:
 
 # ── run and debug-run ────────────────────────────────────────────────────────
 
-def _reap(child, grace: float) -> None:
-    """terminate, wait `grace`, kill, wait: the child never outlives a launcher that can still act."""
+def _reap(child, grace: float) -> bool:
+    """terminate, wait `grace`, kill, wait REAP_BOUND_S: True once the child is reaped; False when that
+    cannot be confirmed within the bound, so the caller exits without releasing."""
     if child.poll() is not None:
-        return
+        return True
     child.terminate()
     try:
         child.wait(timeout=grace)
+        return True
     except subprocess.TimeoutExpired:
-        child.kill()
-        child.wait()
+        pass
+    return _kill_bounded(child)
+
+
+def _kill_bounded(child) -> bool:
+    child.kill()
+    try:
+        child.wait(timeout=REAP_BOUND_S)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
 
 
 def supervise(shape: Shape, argv: list, env: dict, popen=subprocess.Popen, pass_fds=(), map_exit=None) -> int:
@@ -618,7 +687,11 @@ def supervise(shape: Shape, argv: list, env: dict, popen=subprocess.Popen, pass_
                 rc = child.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
                 if state["stop_at"] is not None and time.monotonic() > state["stop_at"]:
-                    child.kill()
+                    if not _kill_bounded(child):
+                        print(f"{shape.name}: the child did not die within {REAP_BOUND_S:.0f} s of the kill",
+                              file=sys.stderr)
+                        return 128 + signal.SIGTERM
+                    rc = child.returncode
         print(f"{shape.name}: child exited {rc}", file=sys.stderr)
         if state["stop_at"] is not None:
             return 128 + signal.SIGTERM
@@ -650,9 +723,9 @@ def serve(shape: Shape, root: str, argv: list, env: dict, popen=subprocess.Popen
     by a trampoline, and the lock released only after a confirmed reap; else the launcher exits and the
     child stays fenced under the flock."""
     try:
-        owner = acquire_lock(root, shape.name)
+        owner = acquire_lock(root, shape.name, retry_s=ACQUIRE_RETRY_S)
     except LockRefused as e:
-        print(e.line, file=sys.stderr)
+        print(f"refusing to start: {root} is {holder_line(root)}" if e.code == 3 else e.line, file=sys.stderr)
         return EXIT_HELD if e.code == 3 else EXIT_UNUSABLE
     if op_lock is not None:
         op_lock.release()
@@ -660,13 +733,6 @@ def serve(shape: Shape, root: str, argv: list, env: dict, popen=subprocess.Popen
         inbox_fd = os.open("tasks", os.O_RDONLY | os.O_DIRECTORY, dir_fd=owner.root_fd)
     except OSError as e:
         print(f"refusing to start: no tasks/ under the held root {root} ({e.strerror or e})", file=sys.stderr)
-        release_lock(owner)
-        return EXIT_UNUSABLE
-    try:
-        env = dict(env, AG2_INBOX_DIR=os.path.join(root_path(owner, root), "tasks"))
-    except LockRefused as e:
-        print(e.line, file=sys.stderr)
-        os.close(inbox_fd)
         release_lock(owner)
         return EXIT_UNUSABLE
     try:
@@ -679,7 +745,7 @@ def serve(shape: Shape, root: str, argv: list, env: dict, popen=subprocess.Popen
     # Nothing is written to stdin: a plugin arms itself from the env. The pipe stays open, since a
     # stream-json session ends when its input ends.
     try:
-        rc = supervise(shape, [sys.executable, "-c", TRAMPOLINE, str(inbox_fd), *argv], env, popen,
+        rc = supervise(shape, [sys.executable, "-c", TRAMPOLINE, str(lease), str(inbox_fd), *argv], env, popen,
                        pass_fds=(lease, inbox_fd), map_exit=map_exit)
     finally:
         os.close(inbox_fd)
@@ -694,7 +760,7 @@ def debug_run_problem(shape: Shape, root: str) -> str:
     """'' when a foreground session may start: no registered job and the root free; else why not."""
     manager = manager_state(shape)
     if manager != "absent":
-        return (f"{job_name(shape)} is {'registered' if manager == 'active' else 'in an unknown state'}; "
+        return (f"{job_name(shape)} is {'registered' if manager in ('active', 'registered') else 'in an unknown state'}; "
                 f"run {shape.command} uninstall first, or watch its log instead")
     state = lock_held(root)
     if state != "free":
@@ -742,43 +808,40 @@ def _uninstall_locked(shape: Shape) -> int:
     unit, problem = owned_text(sup, marker, "supervisor file")
     if problem:
         return _refuse(problem)
-    cfg_text, problem = owned_text(conf, shape.marker, "config")
+    cfg, problem = owned_config(shape)
     if problem:
         return _refuse(problem)
-    if unit is None and cfg_text is None:
+    root = cfg["ROOT"] if cfg else ""
+    manager = manager_state(shape)
+    if manager == "unknown":
+        return _refuse(f"{job_name(shape)}'s state is unknown; nothing was removed", recovery_lines(shape, root) if root else ())
+    if unit is None and cfg is None and manager == "absent":
         print(f"nothing to remove: {shape.name} is not installed")
         print(f"kept: {_dirs.device_env_path()} (Sparrow's token) and {shape.kept}")
         return 0
-    try:
-        root = read_config(conf).get("ROOT", "") if cfg_text else ""
-    except ValueError:
-        root = ""
-    kept = (f"{sup} and {conf} were" if unit is not None else f"{conf} was") + " kept so a rerun knows the work root"
+    kept = (f"{sup} and {conf} were" if unit is not None and cfg else f"{conf} was" if cfg else
+            f"{sup} was" if unit is not None else "nothing was") + " kept so a rerun knows the work root"
     recovery = recovery_lines(shape, root) if root else ()
-    if unit is not None:
+    if unit is not None or manager != "absent":
         problem = stop_supervisor(shape)
-        if not problem and not is_macos():
-            _systemctl("disable", shape.service_name)
-            if unit_enabled(shape) != "disabled":
-                problem = f"{shape.service_name} is not confirmed disabled ({unit_enabled(shape)})"
         if problem:
             return _refuse(f"{problem}; {kept}", recovery)
         print(f"stopped: {job_name(shape)}")
     if root:
-        state = lock_held(root)
-        if state != "free":
-            return _refuse(f"{root} is {holder_line(root)}; {kept}", recovery)
+        problem = _await_free(root)
+        if problem:
+            return _refuse(f"{problem}; {kept}", recovery)
     if unit is not None:
         sup.unlink()
         print(f"removed: {sup}")
     if not is_macos():
         r = _systemctl("daemon-reload")
         if not _ok(r):
-            return _refuse(f"systemctl --user daemon-reload failed ({_why(r)}); {kept}; run uninstall again")
+            return _refuse(f"systemctl --user daemon-reload failed ({_why(r)}); {kept}; run uninstall again", recovery)
         if unit_load_state(shape) != "not-found":
             return _refuse(f"{shape.service_name} is still known to systemd (LoadState {unit_load_state(shape)}); {kept}; "
-                           "run uninstall again")
-    if cfg_text is not None:
+                           "run uninstall again", recovery)
+    if cfg is not None:
         conf.unlink()
         print(f"removed: {conf}")
     print(f"kept: {_dirs.device_env_path()} (Sparrow's token) and {shape.kept}")

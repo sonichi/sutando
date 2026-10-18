@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -231,29 +232,43 @@ if sys.argv[1:] == ["--version"]:
     sys.exit(int(read("claude-version-rc", "0")))
 if sys.argv[1:3] == ["auth", "status"]:
     print(read("claude-auth", '{"loggedIn": true}')); sys.exit(0)
-json.dump({"argv": sys.argv, "env": dict(os.environ), "cwd": os.getcwd(), "pid": os.getpid()},
+try:
+    listing = sorted(os.listdir(os.environ.get("AG2_INBOX_DIR", ".")))
+except OSError as e:
+    listing = ["ERROR %%s" %% e]
+json.dump({"argv": sys.argv, "env": dict(os.environ), "cwd": os.getcwd(), "pid": os.getpid(), "ppid": os.getppid(),
+           "listing": listing},
           open(os.path.join(home, "claude-session.json"), "w"))
-import time
+import subprocess, time
+if read("claude-detach", ""):
+    p = subprocess.Popen(["sleep", "30"], start_new_session=True, close_fds=False)   # as a Rust Command would
+    open(os.path.join(home, "claude-detached.pid"), "w").write(str(p.pid))
 time.sleep(float(read("claude-linger", "0")))
 sys.exit(int(read("claude-exit", "0")))
 '''
 TOKEN = "tok-FAKE-RELAY-TOKEN-never-copied"
 L = cli.LOCAL
-STAND_IN = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import task_io\n"
+STAND_IN = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import holder_lock, task_io\n"
+            "install = %r\n"
+            "if install: holder_lock.install_id = lambda: install\n"
             "o = task_io.acquire_lock(%r, %r); print('held', flush=True); sys.stdin.read(); task_io.release_lock(o)")
 OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.claude_code.cli import LOCAL\n"
              "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
-INACTIVE = (3, "inactive\n", "")
-ACTIVE = (0, "active\n", "")
 NOT_LOADED = (113, "", 'Could not find service "ai.ag2.sparrow.claude-local" in domain for uid: 501\n')
+SERVICE_TARGET = f"gui/{os.getuid()}/ai.ag2.sparrow.claude-local"
+
+
+def SHOW(load, active, enabled):
+    """`systemctl show -p LoadState,ActiveState,UnitFileState --value`'s three lines."""
+    return (0, f"{load}\n{active}\n{enabled}\n", "")
 START_VERBS = ("restart", "bootstrap", "kickstart")
 STOP_VERBS = ("stop", "bootout")
 
 
-def hold(root, name="first-launcher", script=STAND_IN):
+def hold(root, name="first-launcher", script=STAND_IN, install=""):
     """A lock holder in another process (holder_lock allows one acquisition per process)."""
-    p = subprocess.Popen([sys.executable, "-c", script % ((str(PKG), str(root), name) if script is STAND_IN
+    p = subprocess.Popen([sys.executable, "-c", script % ((str(PKG), install, str(root), name) if script is STAND_IN
                                                              else (str(PKG),))],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     assert p.stdout.readline().strip() == "held"
@@ -299,34 +314,46 @@ def oplock_free():
 
 class Runner:
     """A manager command table for connect_common._run: (program, verb) -> rc or (rc, out, err); None =
-    could not run. With a root, a start verb runs a stand-in launcher (adapter `adapter`) holding the
-    root's lock, a stop verb ends it, and the probes answer from that stand-in and the unit on disk unless
-    the table says otherwise: is-active / print from whether it is alive, is-enabled from enable/disable,
-    show LoadState from whether the unit file exists."""
+    could not run. With a root, a start verb runs a stand-in launcher (adapter `adapter`, install identity
+    `install`) holding the root's lock, a stop verb ends it (after `stop_delay`), and the probes answer
+    from the manager's own state unless the table says otherwise: `show` LoadState from the unit file or
+    a `registered` job, ActiveState from the stand-in, UnitFileState from enable/disable; `print` likewise."""
 
-    def __init__(self, table=None, default=0, root=None, adapter="claude-local"):
+    def __init__(self, table=None, default=0, root=None, adapter="claude-local", install="", registered=False,
+                 stop_delay=0.0):
         self.table, self.default, self.calls, self.root = dict(table or {}), default, [], root
-        self.session, self.adapter, self.enabled = None, adapter, False
+        self.session, self.adapter, self.install = None, adapter, install
+        self.enabled, self.registered, self.stop_delay, self.timers = False, registered, stop_delay, []
 
     def start_session(self):
         self.stop_session()
-        self.session = hold(self.root, self.adapter)
+        self.session = hold(self.root, self.adapter, install=self.install)
 
     def stop_session(self):
+        for t in self.timers:
+            t.join()
+        self.timers.clear()
         if self.session is not None:
             unhold(self.session)
             self.session = None
+
+    def end_session_later(self):
+        session, self.session = self.session, None
+        if session is not None:
+            t = threading.Timer(self.stop_delay, unhold, (session,))
+            t.start()
+            self.timers.append(t)
 
     def verb(self, cmd):
         return cmd[1] if cmd[0] == "launchctl" else next(a for a in cmd[1:] if not a.startswith("--"))
 
     def answer(self, verb):
-        if verb in ("is-active", "print"):
-            return (ACTIVE if verb == "is-active" else 0) if self.session else (INACTIVE if verb == "is-active" else NOT_LOADED)
-        if verb == "is-enabled":
-            return (0, "enabled\n", "") if self.enabled else (1, "disabled\n", "")
+        if verb == "print":
+            return 0 if self.session or self.registered else NOT_LOADED
         if verb == "show":
-            return (0, ("loaded" if cm.service_path(L).exists() else "not-found") + "\n", "")
+            loaded = cm.service_path(L).exists() or self.registered
+            return SHOW("loaded" if loaded else "not-found", "active" if self.session else "inactive",
+                        "enabled" if self.enabled else "disabled")
         return self.default
 
     def __call__(self, cmd):
@@ -338,11 +365,14 @@ class Runner:
         rc, out, err = got if isinstance(got, tuple) else (got, "", "exit %s" % got)
         if rc == 0 and verb in ("enable", "disable"):
             self.enabled = verb == "enable"
+            self.registered = self.registered and verb == "enable"
+        if rc == 0 and verb == "bootout":
+            self.registered = False
         if self.root and rc == 0:
             if verb in START_VERBS:
                 self.start_session()
             elif verb in STOP_VERBS:
-                self.stop_session()
+                self.end_session_later() if self.stop_delay else self.stop_session()
         return subprocess.CompletedProcess(cmd, rc, out, err)
 
     def verbs(self, program):
@@ -396,8 +426,8 @@ class ConnectBase(unittest.TestCase):
         self.runners = []
         self.addCleanup(lambda: [r.stop_session() for r in self.runners])
 
-    def runner(self, table=None, default=0, root=True, adapter="claude-local"):
-        r = Runner(table, default, str(self.work) if root else None, adapter)
+    def runner(self, table=None, default=0, root=True, adapter="claude-local", **kw):
+        r = Runner(table, default, str(self.work) if root else None, adapter, **kw)
         self.runners.append(r)
         return r
 
@@ -409,7 +439,7 @@ class ConnectBase(unittest.TestCase):
 
     def install(self, *extra):
         return self.main("install", "--plugin-dir", str(self.plugin), "--inbox", str(self.inbox),
-                         "--results", str(self.results), "--claude-config-dir", str(self.home / ".claude-sutando"),
+                         "--claude-config-dir", str(self.home / ".claude-sutando"),
                          "--hmac-key-file", str(self.home / "task-hmac.key"), *extra)
 
     def install_with(self, runner, mac=False, *extra):
@@ -434,6 +464,11 @@ class ConnectBase(unittest.TestCase):
     def session(self):
         p = self.home / "claude-session.json"
         return json.loads(p.read_text()) if p.exists() else None
+
+
+def task_io_lock_holder(root):
+    from ag2_sparrow import task_io
+    return task_io.lock_holder(root)
 
 
 class ConnectRender(ConnectBase):
@@ -480,7 +515,7 @@ class ConnectInstall(ConnectBase):
         unit = cli.service_path().read_text()
         self.assertTrue(unit.startswith(cli.MARKER))
         self.assertNotIn(TOKEN, unit + cfg_path.read_text())
-        self.assertEqual(runner.verbs("systemctl"), ["is-active", "show-environment", "daemon-reload", "enable", "restart"],
+        self.assertEqual(runner.verbs("systemctl"), ["show", "show-environment", "daemon-reload", "enable", "restart"],
                          "absent and free: no stop, then register and start")
         self.assertIn(f"{self.ACQUIRED}: {self.work} (launcher pid {runner.pid()})", out)
         self.assertIn("linger: enabled for owner", out)
@@ -494,7 +529,8 @@ class ConnectInstall(ConnectBase):
         rc, out, _ = self.install_with(runner, False, "--permission-mode", "default")
         self.assertEqual(rc, 0)
         verbs = runner.verbs("systemctl")
-        self.assertEqual(verbs[:2], ["is-active", "stop"], "the job is stopped before anything is written")
+        self.assertEqual(verbs[:4], ["show", "stop", "disable", "show"], "the job is stopped and proven inactive+disabled "
+                         "before anything is written")
         self.assertEqual(verbs[-3:], ["daemon-reload", "enable", "restart"])
         self.assertIn("changed: ", out)
         self.assertEqual(cli.read_config(cli.config_path())["PERMISSION_MODE"], "default")
@@ -531,7 +567,9 @@ class ConnectInstall(ConnectBase):
         rc, out, _ = self.install_with(runner, True, "--permission-mode", "plan")
         self.assertEqual(rc, 0)
         self.assertEqual(runner.verbs("launchctl"), ["print", "bootout", "print", "bootstrap"])
-        self.assertIn("--wait", next(c for c in runner.calls if c[1] == "bootout"))
+        self.assertEqual(next(c for c in runner.calls if c[1] == "bootout"), ["launchctl", "bootout", "--wait", SERVICE_TARGET],
+                         "the single service target, the only form --wait applies to")
+        self.assertEqual(runner.calls[0], ["launchctl", "print", SERVICE_TARGET])
         self.assertNotEqual(runner.pid(), first)
         self.assertIn(f"launcher pid {runner.pid()}", out)
 
@@ -560,6 +598,29 @@ class ConnectInstall(ConnectBase):
         for word in ("alive", "session is running", "came up", "ready"):
             self.assertNotIn(word, line, "the lock is occupancy, the record attribution; readiness is the task's")
 
+    def test_confirmation_requires_this_installs_identity_too(self):
+        other = self.runner(install="/elsewhere/site-packages/ag2_sparrow")
+        rc, _, err = self.install_with(other)
+        self.assertEqual(rc, 1, "same adapter, another install: not this manager's launcher")
+        self.assertIn(f"did not acquire {self.work}", err)
+        self.assertIn(f"held by launcher pid {other.pid()}", err, "held all along, by the wrong install")
+
+    def test_fresh_holder_refuses_the_snapshotted_holder_and_takes_a_different_one(self):
+        self.configure()
+        first = hold(str(self.work), "claude-local")
+        try:
+            mine = task_io_lock_holder(str(self.work))
+            with mock.patch.object(cm, "CONFIRM_TIMEOUT_S", 0.5):
+                self.assertIsNone(cm._fresh_holder(L, str(self.work), mine), "the pre-apply holder itself is not fresh")
+                self.assertEqual(cm._fresh_holder(L, str(self.work), {})["pid"], first.pid, "with no snapshot it is")
+        finally:
+            unhold(first)
+        second = hold(str(self.work), "claude-local")
+        try:
+            self.assertEqual(cm._fresh_holder(L, str(self.work), mine)["pid"], second.pid, "a different live holder is")
+        finally:
+            unhold(second)
+
     def test_a_failed_start_fails_closed_with_the_same_line(self):
         for table in ({("systemctl", "restart"): 1}, {("systemctl", "daemon-reload"): 1}, {("systemctl", "enable"): 1},
                       {("systemctl", "show-environment"): None}):
@@ -574,13 +635,16 @@ class ConnectInstall(ConnectBase):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
         before = cli.config_path().read_text()
-        for table in ({("systemctl", "stop"): 0, ("systemctl", "is-active"): ACTIVE},
-                      {("systemctl", "is-active"): (4, "", "Failed to connect to bus\n")},
+        for table in ({("systemctl", "stop"): 0, ("systemctl", "show"): SHOW("loaded", "active", "enabled")},
+                      {("systemctl", "show"): (1, "", "Failed to connect to bus\n")},
                       {("systemctl", "stop"): None}):
             rc, _, err = self.install_with(self.runner(table), False, "--permission-mode", "plan")
             self.assertEqual(rc, 1, table)
             self.assertIn("nothing was applied", err)
             self.assertEqual(cli.config_path().read_text(), before, "the old config stands")
+        for table in ({("systemctl", "show"): (1, "", "Failed to connect to bus\n")}, {("systemctl", "show"): None}):
+            rc, _, err = self.install_with(self.runner(table), False, "--permission-mode", "plan")
+            self.assertEqual((rc, "is unknown; nothing was applied" in err), (1, True), table)
 
     def test_install_refuses_an_old_cli_before_writing_anything(self):
         (self.home / "claude-version").write_text("2.1.200")
@@ -674,7 +738,6 @@ class ConnectRoot(ConnectBase):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
         other = self.home / "other"
-        (other / "tasks").mkdir(parents=True)
         before = cli.config_path().read_text()
         runner.calls.clear()
         rc, _, err = self.install_with(runner, False, "--work", str(other))
@@ -682,6 +745,7 @@ class ConnectRoot(ConnectBase):
         self.assertIn(f"the work root is {self.work}, not {other}; run {cli.COMMAND} uninstall, then {cli.COMMAND} install", err)
         self.assertEqual(cli.config_path().read_text(), before)
         self.assertEqual(runner.calls, [], "refused before the manager is touched")
+        self.assertFalse(other.exists(), "the proposed root is untouched: no tasks/ or results/ made")
 
     def test_the_child_runs_against_tasks_under_the_held_root_inode_not_the_path(self):
         self.configure()
@@ -689,8 +753,8 @@ class ConnectRoot(ConnectBase):
         held_tasks = os.stat(self.inbox)
         seen, moved, real_acquire = {}, self.home / "moved-away", cm.acquire_lock
 
-        def acquire_then_replace_the_path(root, adapter):
-            owner = real_acquire(root, adapter)
+        def acquire_then_replace_the_path(root, adapter, **kw):
+            owner = real_acquire(root, adapter, **kw)
             os.rename(self.work, moved)                       # the path is replaced right after the lock check
             self.work.mkdir()
             (self.work / "tasks").mkdir()
@@ -699,9 +763,10 @@ class ConnectRoot(ConnectBase):
         class Child:
             def __init__(self, argv, **kw):
                 self.stdin = io.StringIO()
-                fd = int(argv[3])
+                fd = int(argv[4])
                 st = os.fstat(fd)
                 seen["cwd_is_held"] = (st.st_dev, st.st_ino) == (held_tasks.st_dev, held_tasks.st_ino)
+                seen["lease_is_lock"] = int(argv[3]) == kw["pass_fds"][0]
                 seen["argv"], seen["env"], seen["pass_fds"] = argv, kw["env"], kw["pass_fds"]
                 seen["sibling"] = task_io.lock_held(str(moved))
                 p = subprocess.Popen(["true"])
@@ -722,11 +787,62 @@ class ConnectRoot(ConnectBase):
         self.assertEqual(rc, 0)
         self.assertTrue(seen["cwd_is_held"], "the trampoline's fd is tasks/ under the held root inode, not the new path")
         self.assertEqual(seen["argv"][:3], [sys.executable, "-c", cm.TRAMPOLINE])
-        self.assertEqual(seen["argv"][4], str(self.claude))
-        self.assertEqual(seen["env"]["AG2_INBOX_DIR"], str(moved / "tasks"), "the held inode's path at spawn")
+        self.assertEqual(seen["argv"][5], str(self.claude))
+        self.assertTrue(seen["lease_is_lock"], "the trampoline keeps the lease fd for itself")
         self.assertEqual(len(seen["pass_fds"]), 2, "the lease and the tasks fd")
         self.assertEqual(seen["sibling"], "held", "the moved-away root (the held inode) is what a sibling contends on")
         self.assertEqual(task_io.lock_held(str(moved)), "free", "released after the confirmed reap")
+
+    def test_replacing_the_root_at_the_popen_seam_does_not_change_what_the_session_lists(self):
+        """The session's cwd is the held tasks inode and AG2_INBOX_DIR is '.', so a root replaced between
+        the env's construction and the spawn changes nothing it lists."""
+        self.configure()
+        (self.inbox / "task-held.txt").write_text("task: in the held inbox\n")
+        moved = self.home / "moved-away"
+
+        def replace_then_spawn(argv, **kw):
+            os.rename(self.work, moved)
+            self.work.mkdir()
+            (self.work / "tasks").mkdir()
+            (self.work / "tasks" / "task-replacement.txt").write_text("task: in the replacement\n")
+            return subprocess.Popen(argv, **kw)
+        rc = cli.run(type("A", (), {})(), popen=replace_then_spawn)
+        self.assertEqual(rc, 0)
+        rec = self.session()
+        self.assertEqual(rec["listing"], ["task-held.txt"], "the session lists the held inode, never the replacement")
+        self.assertEqual((rec["env"]["AG2_INBOX_DIR"], rec["env"]["AG2_RESULTS_DIR"]), (".", "../results"))
+        self.assertEqual(Path(rec["cwd"]).resolve(), (moved / "tasks").resolve())
+
+    def test_a_session_that_spawns_a_detached_sleep_does_not_keep_the_root_held(self):
+        """Only the trampoline holds the lease: with the launcher gone and the trampoline and session
+        killed, a grandchild that inherited every fd (as a Rust Command's would) does not keep the flock."""
+        from ag2_sparrow import task_io
+        self.configure()
+        (self.home / "claude-detach").write_text("1")
+        launcher, session = ConnectLauncherProcess.launcher(self)
+        for _ in range(100):
+            if (self.home / "claude-detached.pid").exists():
+                break
+            time.sleep(0.05)
+        sleeper, trampoline = int((self.home / "claude-detached.pid").read_text()), self.session()["ppid"]
+        self.addCleanup(lambda: alive(sleeper) and os.kill(sleeper, signal.SIGKILL))
+        os.kill(launcher.pid, signal.SIGKILL)
+        launcher.wait(timeout=30)
+        try:
+            self.assertEqual(task_io.lock_held(str(self.work)), "held", "the trampoline keeps the lease after the launcher")
+            for pid in (trampoline, session):
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+                wait_gone(pid)
+            self.assertTrue(alive(sleeper), "the grandchild outlives them all")
+            self.assertEqual(task_io.lock_held(str(self.work)), "free", "and holds no lease: it never reached the session")
+        finally:
+            os.kill(sleeper, signal.SIGKILL)
+            wait_gone(sleeper)
+            launcher.stdout.close()
+            launcher.stderr.close()
+        owner = task_io.acquire_lock(str(self.work), "cleanup")
+        task_io.release_lock(owner)
 
     def test_a_config_without_a_root_is_one_line(self):
         self.configure()
@@ -749,14 +865,16 @@ class ConnectOrphan(ConnectBase):
         try:
             self.assertEqual(task_io.lock_held(str(self.work)), "held", "the leased child keeps the fd")
             self.assertFalse(task_io.lock_holder(str(self.work))["live"])
-            runner = self.runner({("systemctl", "is-active"): INACTIVE})
+            shutil.rmtree(self.results)
+            runner = self.runner({})
             rc, out, err = self.install_with(runner, False, "--permission-mode", "default")
             self.assertEqual(rc, 1)
+            self.assertFalse(self.results.exists(), "the refusal made no directory under the root")
             self.assertIn(f"{self.work} is held by a session no job of {cli.SERVICE_NAME} manages", err)
             self.assertIn(f"launcher pid {launcher.pid} gone, the child alive", err)
             self.assertIn("nothing was applied", err)
             self.assertNotIn(ConnectInstall.ACQUIRED, out)
-            self.assertEqual(runner.verbs("systemctl"), ["is-active"], "probed, not applied")
+            self.assertEqual(runner.verbs("systemctl"), ["show"], "probed, not applied")
             self.assertEqual(cli.config_path().read_text(), before, "config untouched")
             self.assertFalse(cli.service_path().exists(), "no unit written")
         finally:
@@ -772,6 +890,9 @@ class ConnectOrphan(ConnectBase):
             self.assertIn(f"no job of {cli.AGENT_LABEL} manages (launcher pid {holder.pid})", err)
             rc, _, err = self.install_with(self.runner({("launchctl", "print"): (1, "", "launchctl: hm\n")}), True)
             self.assertEqual((rc, "is unknown; nothing was applied" in err), (1, True), "an unknown probe applies nothing")
+            rc, _, err = self.install_with(self.runner({("systemctl", "show"): SHOW("loaded", "inactive", "enabled")}))
+            self.assertEqual(rc, 1, "a registered but inactive job runs no holder either: an orphan")
+            self.assertIn(f"no job of {cli.SERVICE_NAME} manages (launcher pid {holder.pid})", err)
         finally:
             unhold(holder)
 
@@ -819,11 +940,11 @@ class ConnectSerialize(ConnectBase):
         self.runners[-1].stop_session()
         other = hold(None, script=OP_HOLDER)
         try:
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "is-active"): INACTIVE})):
+            with mock.patch.object(cm, "_run", side_effect=Runner({})):
                 rc, _, err = self.main("uninstall")
             self.assertEqual((rc, "operation is in progress" in err), (1, True))
             self.assertTrue(cli.config_path().exists())
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "is-active"): INACTIVE})):
+            with mock.patch.object(cm, "_run", side_effect=Runner({})):
                 rc, _, err = self.main("debug-run")
             self.assertEqual((rc, "operation is in progress" in err), (2, True))
             self.assertIsNone(self.session())
@@ -845,12 +966,15 @@ class ConnectSerialize(ConnectBase):
             def wait(self, timeout=None):
                 self.rc = 0
                 return 0
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "is-active"): INACTIVE})):
+        with mock.patch.object(cm, "_run", side_effect=self.runner()):
+            self.assertEqual(self.main("uninstall")[0], 0, "the job is gone, so debug-run may run")
+        self.configure()
+        with mock.patch.object(cm, "_run", side_effect=Runner({})):
             rc = cli.debug_run(type("A", (), {})(), popen=lambda argv, **kw: Child(argv, **kw))
         self.assertEqual(rc, 0)
         self.assertTrue(seen["oplock_free_at_spawn"], "debug-run releases the operation lock once the root lock is held")
         self.assertTrue(cm.oplock_path(L).exists(), "the mutex file is never unlinked")
-        with mock.patch.object(cm, "_run", side_effect=self.runner({("systemctl", "is-active"): INACTIVE})):
+        with mock.patch.object(cm, "_run", side_effect=self.runner({})):
             self.assertEqual(self.main("uninstall")[0], 0)
         self.assertTrue(cm.oplock_path(L).exists())
 
@@ -870,7 +994,7 @@ class ConnectRun(ConnectBase):
         self.assertEqual(env["AG2_AUTOARM"], "1", "the plugin arms itself from this marker at session.start")
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.home / ".claude-sutando"))
         self.assertEqual((env["AG2_INBOX_DIR"], env["AG2_RESULTS_DIR"], env["AG2_HMAC_KEY_FILE"]),
-                         (str(self.inbox), str(self.results), str(self.home / "task-hmac.key")))
+                         (".", "../results", str(self.home / "task-hmac.key")), "task I/O bound to the held inode, by cwd")
         self.assertEqual(env["USER"], "owner", "macOS needs USER for the Keychain login")
         self.assertTrue(set(env) <= {"PATH", "HOME", "USER", "CLAUDE_CONFIG_DIR", "AG2_INBOX_DIR", "AG2_RESULTS_DIR",
                                      "AG2_HMAC_KEY_FILE", "AG2_AUTOARM"}, sorted(env))
@@ -878,6 +1002,7 @@ class ConnectRun(ConnectBase):
                        "SUTANDO_WORKSPACE_DIR", "AG2_DEVICE_ENV"):
             self.assertNotIn(secret, env)
         self.assertEqual(rec["cwd"], str(self.inbox))
+        self.assertEqual(rec["listing"], [], "the inbox it lists is its cwd")
         self.assertIsNone(getattr(holder_lock.read_holder(str(self.work)), "record", None), "released after the child")
 
     def test_run_refuses_an_old_cli_and_starts_no_session(self):
@@ -923,14 +1048,33 @@ class ConnectRun(ConnectBase):
                 return 0
         rc = cli.run(type("A", (), {})(), popen=lambda argv, **kw: Child(argv, **kw))
         self.assertEqual(rc, 0)
-        self.assertEqual((seen["at_spawn"]["pid"], seen["at_spawn"]["live"], seen["at_spawn"]["adapter"]),
-                         (os.getpid(), True, "claude-local"))
+        self.assertEqual((seen["at_spawn"]["pid"], seen["at_spawn"]["live"], seen["at_spawn"]["adapter"],
+                          seen["at_spawn"]["install_id"]), (os.getpid(), True, "claude-local", holder_lock.install_id()))
         self.assertEqual(seen["during_wait"], os.getpid(), "held by this launcher while the child runs")
         self.assertEqual(seen["pass_fds"][0], holder_lock._OWNER.fd if holder_lock._OWNER else seen["pass_fds"][0])
         self.assertEqual(len(seen["pass_fds"]), 2, "the leased lock descriptor and the tasks fd go to the child")
         self.assertEqual(seen["stdin"], "", "nothing is written to stdin: the plugin arms itself")
         self.assertEqual(seen["env"]["AG2_AUTOARM"], "1")
         self.assertIsNone(task_io.lock_holder_pid(work), "released after the confirmed reap")
+
+    def test_a_probe_loop_beside_repeated_launcher_starts_never_forges_a_75(self):
+        from ag2_sparrow import task_io
+        self.configure()
+        stop, probes = threading.Event(), [0]
+
+        def probe():
+            while not stop.is_set():
+                task_io.lock_held(str(self.work))
+                probes[0] += 1
+        t = threading.Thread(target=probe, daemon=True)
+        t.start()
+        try:
+            codes = [self.main("run")[0] for _ in range(25)]
+        finally:
+            stop.set()
+            t.join()
+        self.assertEqual(codes, [0] * 25, "a probe's momentary flock is retried through, never reported as another holder")
+        self.assertGreater(probes[0], 25)
 
     def test_a_missing_tasks_dir_under_the_held_root_refuses(self):
         self.configure()
@@ -955,23 +1099,25 @@ class ConnectDebugRun(ConnectBase):
 
     def test_debug_run_refuses_a_registered_job_an_unknown_one_or_a_held_root_else_runs(self):
         self.configure()
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "is-active"): ACTIVE})):
-            rc, _, err = self.main("debug-run")
-        self.assertEqual((rc, f"{cli.SERVICE_NAME} is registered" in err), (2, True))
-        self.assertIsNone(self.session())
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "is-active"): None})):
+        for show in (SHOW("loaded", "active", "enabled"), SHOW("loaded", "inactive", "enabled"), SHOW("loaded", "inactive", "disabled"),
+                     SHOW("not-found", "inactive", "enabled")):
+            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): show})):
+                rc, _, err = self.main("debug-run")
+            self.assertEqual((rc, f"{cli.SERVICE_NAME} is registered" in err), (2, True), show)
+            self.assertIsNone(self.session())
+        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): None})):
             rc, _, err = self.main("debug-run")
         self.assertEqual((rc, "unknown state" in err), (2, True))
         holder = hold(str(self.work))
         try:
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "is-active"): INACTIVE})):
+            with mock.patch.object(cm, "_run", side_effect=Runner({})):
                 rc, _, err = self.main("debug-run")
         finally:
             unhold(holder)
         self.assertEqual(rc, 2)
         self.assertIn(f"held by launcher pid {holder.pid}; stop that session first", err)
         self.assertIsNone(self.session())
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "is-active"): INACTIVE})):
+        with mock.patch.object(cm, "_run", side_effect=Runner({})):
             rc, _, err = self.main("debug-run")
         self.assertEqual(rc, 0, err)
         self.assertIsNotNone(self.session(), "absent and free: the session runs in the foreground")
@@ -1001,19 +1147,20 @@ class ConnectUninstall(ConnectBase):
         with mock.patch.object(cm, "_run", side_effect=runner):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
-        self.assertEqual(runner.verbs("systemctl"), ["stop", "is-active", "disable", "is-enabled", "daemon-reload", "show"])
+        self.assertEqual(runner.verbs("systemctl"), ["show", "stop", "disable", "show", "daemon-reload", "show"])
         self.assertFalse(cli.service_path().exists() or cli.config_path().exists())
         self.assertIn(f"stopped: {cli.SERVICE_NAME}", out)
         self.assertLess(out.index(f"removed: {cli.service_path()}"), out.index(f"removed: {cli.config_path()}"), "config last")
         self.assertEqual(self.relay.read_text(), f"REMOTE_TASK_TOKEN={TOKEN}\n", "Sparrow's token file is untouched")
         self.assertTrue((self.plugin / ".claude-plugin" / "plugin.json").exists())
-        self.assertIn("nothing to remove", self.main("uninstall")[1])
+        with mock.patch.object(cm, "_run", side_effect=Runner()):
+            self.assertIn("nothing to remove", self.main("uninstall")[1])
 
     def test_a_partial_systemd_teardown_keeps_the_config_and_completes_on_retry(self):
         self.assertEqual(self.install_with(self.runner())[0], 0)
         self.runners[-1].stop_session()
         for table, why in (({("systemctl", "daemon-reload"): 1}, "daemon-reload failed"),
-                           ({("systemctl", "show"): (0, "loaded\n", "")}, "still known to systemd (LoadState loaded)")):
+                           ({("systemctl", "show"): SHOW("loaded", "inactive", "disabled")}, "still known to systemd (LoadState loaded)")):
             self.configure()
             cm._write(cli.service_path(), cm.render_service(L, "/x"), 0o644)
             with mock.patch.object(cm, "_run", side_effect=self.runner(table)):
@@ -1027,17 +1174,47 @@ class ConnectUninstall(ConnectBase):
             with mock.patch.object(cm, "_run", side_effect=runner):
                 rc, out, err = self.main("uninstall")
             self.assertEqual(rc, 0, err)
-            self.assertEqual(runner.verbs("systemctl"), ["daemon-reload", "show"], "the retry finishes from where it stopped")
+            self.assertEqual(runner.verbs("systemctl"), ["show", "daemon-reload", "show"], "the retry finishes from where it stopped")
             self.assertFalse(cli.config_path().exists())
-        for table in ({("systemctl", "is-enabled"): (0, "enabled\n", "")}, {("systemctl", "is-enabled"): None}):
-            self.assertEqual(self.install_with(self.runner())[0], 0)
-            self.runners[-1].stop_session()
-            with mock.patch.object(cm, "_run", side_effect=self.runner(table)):
-                rc, _, err = self.main("uninstall")
-            self.assertEqual((rc, "not confirmed disabled" in err), (1, True), table)
-            self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
-            with mock.patch.object(cm, "_run", side_effect=self.runner()):
-                self.assertEqual(self.main("uninstall")[0], 0)
+        self.assertEqual(self.install_with(self.runner())[0], 0)
+        self.runners[-1].stop_session()
+        with mock.patch.object(cm, "_run", side_effect=self.runner({("systemctl", "show"): SHOW("loaded", "inactive", "enabled")})):
+            rc, _, err = self.main("uninstall")
+        self.assertEqual((rc, "is still inactive and enabled after the stop" in err), (1, True))
+        self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
+        with mock.patch.object(cm, "_run", side_effect=self.runner()):
+            self.assertEqual(self.main("uninstall")[0], 0)
+
+    def test_a_registered_job_without_files_is_still_torn_down(self):
+        self.configure()
+        runner = self.runner(registered=True)
+        with mock.patch.object(cm, "_run", side_effect=runner):
+            rc, out, err = self.main("uninstall")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(runner.verbs("systemctl"), ["show", "stop", "disable", "show", "daemon-reload", "show"],
+                         "the manager is probed and the job stopped, disabled, reloaded away")
+        self.assertFalse(cli.config_path().exists())
+        with mock.patch.object(cm, "_run", side_effect=Runner()):
+            self.assertIn("nothing to remove", self.main("uninstall")[1])
+        runner = self.runner(registered=True)
+        with mock.patch.object(cm, "_run", side_effect=runner):
+            rc, out, err = self.main("uninstall")
+        self.assertEqual((rc, runner.verbs("systemctl")), (0, ["show", "stop", "disable", "show", "daemon-reload", "show"]),
+                         "no files at all, a registered job: still torn down")
+        self.assertNotIn("nothing to remove", out)
+        mac = self.runner(registered=True)
+        with mock.patch.object(cm, "is_macos", return_value=True), mock.patch.object(cm, "_run", side_effect=mac):
+            rc, out, _ = self.main("uninstall")
+        self.assertEqual((rc, mac.calls), (0, [["launchctl", "print", SERVICE_TARGET], ["launchctl", "bootout", "--wait", SERVICE_TARGET],
+                                               ["launchctl", "print", SERVICE_TARGET]]))
+
+    def test_uninstall_waits_a_bounded_time_for_the_root_to_free_after_the_stop(self):
+        runner = self.runner(stop_delay=0.6)
+        self.assertEqual(self.install_with(runner)[0], 0)
+        with mock.patch.object(cm, "_run", side_effect=runner):
+            rc, _, err = self.main("uninstall")
+        self.assertEqual(rc, 0, "the launcher reaps within the bound: " + err)
+        self.assertFalse(cli.config_path().exists())
 
     def test_launchd_boots_out_with_wait_and_requires_the_documented_not_found(self):
         runner = self.runner()
@@ -1046,8 +1223,8 @@ class ConnectUninstall(ConnectBase):
         with mock.patch.object(cm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=True):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
-        self.assertEqual(runner.verbs("launchctl"), ["bootout", "print"])
-        self.assertIn("--wait", runner.calls[0])
+        self.assertEqual(runner.verbs("launchctl"), ["print", "bootout", "print"])
+        self.assertEqual(runner.calls[1], ["launchctl", "bootout", "--wait", SERVICE_TARGET])
         self.assertFalse(cli.plist_path().exists() or cli.config_path().exists())
         self.assertLess(out.index(f"removed: {cli.plist_path()}"), out.index(f"removed: {cli.config_path()}"), "config last")
         plist = cli.plist_path()
@@ -1060,7 +1237,7 @@ class ConnectUninstall(ConnectBase):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1, table)
             self.assertTrue(plist.exists() and cli.config_path().exists(), "kept after an unconfirmed stop")
-            self.assertIn("Manual recovery: 1. stop the job by hand: launchctl bootout --wait gui/", err)
+            self.assertIn(f"Manual recovery: 1. stop the job by hand: launchctl bootout --wait {SERVICE_TARGET}", err)
             self.assertIn(f"3. re-run {cli.COMMAND} uninstall", err)
             with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "bootout"): 3, ("launchctl", "print"): NOT_LOADED})), \
                     mock.patch.object(cm, "is_macos", return_value=True):
@@ -1072,7 +1249,7 @@ class ConnectUninstall(ConnectBase):
         keeper = runner.session
         runner.session = None                                  # the stop verb reaches nobody: the holder stays
         try:
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "is-active"): INACTIVE})):
+            with mock.patch.object(cm, "_run", side_effect=Runner({})):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1)
             self.assertIn(f"{self.work} is held by launcher pid {keeper.pid}; ", err)
@@ -1083,7 +1260,7 @@ class ConnectUninstall(ConnectBase):
             self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
         finally:
             unhold(keeper)
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "is-active"): INACTIVE})):
+        with mock.patch.object(cm, "_run", side_effect=Runner({})):
             self.assertEqual(self.main("uninstall")[0], 0, "re-run once the root is free")
         self.assertFalse(cli.config_path().exists())
 
@@ -1095,7 +1272,7 @@ class ConnectUninstall(ConnectBase):
         os.kill(launcher.pid, signal.SIGKILL)
         launcher.wait(timeout=30)
         try:
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "is-active"): INACTIVE})):
+            with mock.patch.object(cm, "_run", side_effect=Runner({})):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1)
             self.assertIn("held, launcher gone (child alive)", err)
@@ -1108,13 +1285,18 @@ class ConnectUninstall(ConnectBase):
     def test_an_unknown_stop_probe_or_a_lock_error_refuses(self):
         self.assertEqual(self.install_with(self.runner())[0], 0)
         self.runners[-1].stop_session()
-        for table in ({("systemctl", "stop"): 0, ("systemctl", "is-active"): ACTIVE},
-                      {("systemctl", "stop"): 1, ("systemctl", "is-active"): (4, "", "Failed to connect to bus\n")},
-                      {("systemctl", "stop"): None, ("systemctl", "is-active"): None}):
+        for table in ({("systemctl", "stop"): 0, ("systemctl", "show"): SHOW("loaded", "active", "enabled")},
+                      {("systemctl", "stop"): None}):
             with mock.patch.object(cm, "_run", side_effect=Runner(table)):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1, table)
             self.assertIn("Manual recovery", err)
+            self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
+        for table in ({("systemctl", "stop"): 1, ("systemctl", "show"): (1, "", "Failed to connect to bus\n")},
+                      {("systemctl", "show"): None}):
+            with mock.patch.object(cm, "_run", side_effect=Runner(table)):
+                rc, _, err = self.main("uninstall")
+            self.assertEqual((rc, "state is unknown; nothing was removed" in err), (1, True), table)
             self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
         with mock.patch.object(cm, "_run", side_effect=self.runner()), mock.patch.object(cm, "lock_held", return_value="unknown"):
             rc, _, err = self.main("uninstall")
@@ -1122,7 +1304,7 @@ class ConnectUninstall(ConnectBase):
         self.assertIn("unknown (the lock of", err)
         self.assertTrue(cli.config_path().exists(), "a lock error keeps everything")
         with mock.patch.object(cm, "_run", side_effect=self.runner({("systemctl", "stop"): 1})):
-            self.assertEqual(self.main("uninstall")[0], 0, "stop failed but the unit is confirmed inactive: absent")
+            self.assertEqual(self.main("uninstall")[0], 0, "stop failed but the unit is confirmed inactive and disabled")
 
     def test_files_install_did_not_write_are_kept_and_named(self):
         self.configure()
@@ -1185,7 +1367,7 @@ class ConnectOwnership(ConnectBase):
         self.assertEqual(cfg.read_text(), "CLAUDE=/theirs\n")
         self.assertFalse(cli.service_path().exists(), "nothing written before the refusal")
 
-    def test_a_dangling_a_directory_or_an_unparsable_config_is_one_line(self):
+    def test_a_dangling_a_directory_or_an_unparsable_config_is_one_line_and_kept(self):
         cfg = cli.config_path()
         cfg.symlink_to(self.home / "gone")
         rc, _, err = self.main("run")
@@ -1202,14 +1384,45 @@ class ConnectOwnership(ConnectBase):
         self.assertTrue(cfg.is_dir())
         cfg.rmdir()
         good = self.configure().read_text()
-        cfg.write_text(good + "PERMISSION_MODE='unclosed\n")
-        rc, _, err = self.main("run")
-        self.assertEqual((rc, "is not parsable" in err), (2, True))
-        rc, out, err = self.main("verify")
-        self.assertEqual((rc, "is not parsable" in out), (1, True))
-        rc, _, err = self.install_with(self.runner())
-        self.assertEqual(rc, 0, "a marked but unparsable config is replaced by install: " + err)
+        for bad in (good + "PERMISSION_MODE='unclosed\n", good.replace("INBOX_DIR=", "INBOX_WAS="),
+                    good.replace(f"ROOT={self.work}", "ROOT=relative/work")):
+            cfg.write_text(bad)
+            rc, _, err = self.main("run")
+            self.assertEqual(rc, 2, bad)
+            rc, _, err = self.install_with(self.runner())
+            self.assertEqual(rc, 1, "a marked but malformed config is never replaced: " + err)
+            self.assertIn("remove it by hand", err)
+            self.assertEqual(cfg.read_text(), bad, "preserved")
+            self.assertFalse(cli.service_path().exists())
+            rc, _, err = self.main("uninstall")
+            self.assertEqual((rc, cfg.read_text()), (1, bad), "uninstall keeps it too: " + err)
 
+    def test_a_malformed_owned_config_fails_closed_with_an_old_root_orphan(self):
+        """The persisted root is the only anchor; a config that cannot name it stops install and uninstall
+        before any mutation, while a holder on the old root stays untouched."""
+        from ag2_sparrow import task_io
+        cfg = self.configure()
+        cm._write(cli.service_path(), cm.render_service(L, "/x"), 0o644)
+        good = cfg.read_text()
+        bad = good.replace(f"ROOT={self.work}", "ROOT='unmatched")
+        cfg.write_text(bad)
+        holder = hold(str(self.work), "claude-local")
+        try:
+            other = self.home / "other"
+            rc, _, err = self.install_with(self.runner(), False, "--work", str(other))
+            self.assertEqual(rc, 1)
+            self.assertIn("is not parsable", err)
+            self.assertFalse(other.exists())
+            self.assertEqual(cfg.read_text(), bad, "preserved")
+            with mock.patch.object(cm, "_run", side_effect=self.runner()) as r:
+                rc, _, err = self.main("uninstall")
+            self.assertEqual(rc, 1)
+            self.assertIn("is not parsable", err)
+            self.assertTrue(cli.service_path().exists() and cfg.exists(), "nothing removed")
+            self.assertEqual(r.side_effect.calls, [], "the manager is not touched")
+            self.assertEqual(task_io.lock_held(str(self.work)), "held", "the old root's holder is untouched")
+        finally:
+            unhold(holder)
     def test_verify_stops_cleanly_on_a_config_missing_a_required_key(self):
         self.configure(PLUGIN_DIR="")
         rc, out, _ = self.main("verify")
@@ -1246,7 +1459,7 @@ class ConnectBranches(ConnectBase):
         self.assertEqual(cli.SHAPE, "claude-local")
         with mock.patch.object(cm, "is_macos", return_value=True):
             self.assertEqual(cm.job_name(L), cli.AGENT_LABEL)
-            self.assertIn("launchctl bootout --wait gui/", cm.stop_command(L))
+            self.assertEqual(cm.stop_command(L), f"launchctl bootout --wait {SERVICE_TARGET}")
         with mock.patch.object(cm, "is_macos", return_value=False):
             self.assertEqual(cm.stop_command(L), f"systemctl --user stop {cli.SERVICE_NAME}")
 
@@ -1256,17 +1469,19 @@ class ConnectBranches(ConnectBase):
         return p
 
     def test_probes_read_explicit_outputs_only(self):
-        for got, want in ((ACTIVE, "active"), ((0, "", ""), "active"), ((3, "activating\n", ""), "active"), (INACTIVE, "absent"),
-                          ((3, "failed\n", ""), "absent"), ((4, "", "Failed to connect to bus\n"), "unknown"), (None, "unknown")):
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "is-active"): got})):
+        for got, want in ((SHOW("loaded", "active", "enabled"), "active"), (SHOW("loaded", "activating", "enabled"), "active"),
+                          (SHOW("not-found", "inactive", "disabled"), "absent"), (SHOW("not-found", "failed", ""), "absent"),
+                          (SHOW("loaded", "inactive", "disabled"), "registered"), (SHOW("not-found", "inactive", "enabled"), "registered"),
+                          (SHOW("loaded", "inactive", "enabled"), "registered"), ((1, "", "Failed to connect to bus\n"), "unknown"),
+                          (SHOW("odd", "inactive", "disabled"), "unknown"), (None, "unknown")):
+            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): got})) as r:
                 self.assertEqual(cm.unit_active(L), want, got)
+            self.assertEqual(r.side_effect.calls[0], ["systemctl", "--user", "--no-ask-password", "show", "-p",
+                                                      "LoadState,ActiveState,UnitFileState", "--value", cli.SERVICE_NAME])
         for got, want in ((0, "active"), (NOT_LOADED, "absent"), ((113, "", "Bad request\n"), "unknown"), (None, "unknown")):
-            with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): got})):
+            with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): got})) as r:
                 self.assertEqual(cm.agent_loaded(L), want, got)
-        for got, want in (((0, "enabled\n", ""), "enabled"), ((1, "disabled\n", ""), "disabled"), ((1, "not-found\n", ""), "disabled"),
-                          ((0, "", ""), "unknown"), (None, "unknown")):
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "is-enabled"): got})):
-                self.assertEqual(cm.unit_enabled(L), want, got)
+            self.assertEqual(r.side_effect.calls[0], ["launchctl", "print", SERVICE_TARGET])
         with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): None})):
             self.assertEqual(cm.unit_load_state(L), "unknown")
         with mock.patch.object(cm, "is_macos", return_value=True), \
@@ -1276,7 +1491,6 @@ class ConnectBranches(ConnectBase):
                 contextlib.redirect_stdout(io.StringIO()) as out:
             cm.linger(L)
         self.assertIn("enable-linger owner failed", out.getvalue())
-
     def test_a_non_plugin_dir_a_missing_console_script_and_a_failed_write(self):
         rc, _, err = self.main("install", "--plugin-dir", str(self.home))
         self.assertEqual((rc, "is not a Claude Code plugin" in err), (2, True))
@@ -1329,7 +1543,8 @@ class LockHelpers(unittest.TestCase):
             try:
                 self.assertEqual(task_io.lock_held(str(root)), "held")
                 rec = task_io.lock_holder(str(root))
-                self.assertEqual((rec["pid"], rec["live"], rec["adapter"]), (holder.pid, True, "claude-local"))
+                self.assertEqual((rec["pid"], rec["live"], rec["adapter"], rec["install_id"]),
+                                 (holder.pid, True, "claude-local", holder_lock.install_id()))
                 self.assertTrue(rec["start"])
                 self.assertEqual(task_io.lock_holder_pid(str(root)), holder.pid)
                 self.assertTrue(task_io.lock_path(str(root)).endswith("/lock"))
@@ -1459,31 +1674,40 @@ class ConnectLauncherProcess(ConnectBase):
         owner = task_io.acquire_lock(work, "cleanup")
         task_io.release_lock(owner)
 
-    def test_an_unconfirmed_reap_exits_without_releasing(self):
-        """A kill that does not take: the launcher exits, the lock is not unlocked, the child stays fenced."""
-        driver = ("class Immortal(subprocess.Popen):\n"
-                  "    def terminate(self): pass\n"
-                  "    def kill(self): pass\n"
+    def test_an_unconfirmed_reap_exits_without_releasing_within_the_bound(self):
+        """A kill that does not take: every timed wait expires and the final wait would block; the launcher
+        kills once, waits the bound, then exits without unlocking, the child left fenced."""
+        driver = ("import time\n"
+                  "class Immortal(subprocess.Popen):\n"
+                  "    def terminate(self): print('terminate called', file=sys.stderr, flush=True)\n"
+                  "    def kill(self): print('kill called', file=sys.stderr, flush=True)\n"
                   "    def wait(self, timeout=None):\n"
                   "        if timeout is not None: raise subprocess.TimeoutExpired(self.args, timeout)\n"
-                  "        return None\n"
-                  "import ag2_sparrow.connect_common as cm; cm.TERM_GRACE_S = 0.2\n"
+                  "        time.sleep(600)\n"
+                  "import ag2_sparrow.connect_common as cm; cm.TERM_GRACE_S = 0.2; cm.REAP_BOUND_S = 0.5\n"
                   "sys.exit(cli.run(type('A', (), {})(), popen=Immortal))")
         from ag2_sparrow import task_io
         self.configure()
-        launcher, child = self.launcher(driver=driver)
-        os.kill(launcher.pid, signal.SIGINT)
-        launcher.wait(timeout=30)                  # the child keeps the pipes, so no communicate() yet
-        try:
-            self.assertEqual(launcher.returncode, 130)
-            self.assertTrue(self.alive(child), "the child is still there")
-            self.assertEqual(task_io.lock_held(str(self.work)), "held", "and keeps the root fenced")
-        finally:
-            os.kill(child, signal.SIGKILL)
-            self.wait_gone(child)
-        _, err = launcher.communicate(timeout=30)
-        self.assertIn("not confirmed reaped; exiting without releasing", err)
-
+        for sig, want in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+            launcher, child = self.launcher(driver=driver)
+            started = time.monotonic()
+            os.kill(launcher.pid, sig)
+            launcher.wait(timeout=30)                  # the child keeps the pipes, so no communicate() yet
+            elapsed = time.monotonic() - started
+            try:
+                self.assertEqual(launcher.returncode, want, sig)
+                self.assertLess(elapsed, 5.0, "grace + bound, not forever")
+                self.assertTrue(self.alive(child), "the child is still there")
+                self.assertEqual(task_io.lock_held(str(self.work)), "held", "and keeps the root fenced")
+            finally:
+                os.kill(child, signal.SIGKILL)
+                self.wait_gone(child)
+            _, err = launcher.communicate(timeout=30)
+            self.assertEqual(err.count("kill called"), 1, err)
+            self.assertIn("not confirmed reaped; exiting without releasing", err)
+            (self.home / "claude-session.json").unlink()
+            owner = task_io.acquire_lock(str(self.work), "cleanup")
+            task_io.release_lock(owner)
     def session_after(self, first_pid):
         rec = self.session()
         return None if rec is None or rec["pid"] == first_pid else rec

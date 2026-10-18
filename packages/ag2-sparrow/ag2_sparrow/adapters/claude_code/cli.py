@@ -117,15 +117,10 @@ def install(args) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
-    if args.work:
-        inbox, results = Path(root) / "tasks", Path(root) / "results"
-    else:
-        inbox = Path(args.inbox or _dirs.task_dir()).expanduser()
-        results = Path(args.results or _dirs.result_dir()).expanduser()
-    for d in (inbox, results):
-        d.mkdir(parents=True, exist_ok=True)
+    # The session reads tasks/ and results/ under the held root inode; the paths here are for verify.
+    inbox = Path(root) / "tasks" if args.work else Path(os.path.normpath(os.path.expanduser(args.inbox or _dirs.task_dir())))
     values = {"CLAUDE": os.path.abspath(claude), "PLUGIN_DIR": str(plugin), "INBOX_DIR": str(inbox),
-              "RESULTS_DIR": str(results),
+              "RESULTS_DIR": str(Path(root) / "results"),
               "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser().resolve()) if args.claude_config_dir else "",
               "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if args.hmac_strict else "",
               "PERMISSION_MODE": args.permission_mode}
@@ -231,8 +226,8 @@ def main(argv=None) -> int:
                        "(a reinstall stops the old one first)")
     p.add_argument("--plugin-dir", required=True, help="the ag2space-inbox plugin directory from the repo")
     p.add_argument("--work", help="the work root: its tasks/ is the inbox, its results/ the result dir")
-    p.add_argument("--inbox", help="Sparrow's task dir, <work>/tasks (default: as ag2-sparrow resolves it)")
-    p.add_argument("--results", help="Sparrow's result dir (default: as ag2-sparrow resolves it)")
+    p.add_argument("--inbox", help="Sparrow's task dir, <work>/tasks (default: as ag2-sparrow resolves it); the "
+                   "result dir is <work>/results")
     p.add_argument("--claude-config-dir", help="CLAUDE_CONFIG_DIR holding the login the session uses (default: "
                    "the CLI's own)")
     p.add_argument("--hmac-key-file", help="the task-envelope key Sutando stamps with (AG2_HMAC_KEY_FILE)")
