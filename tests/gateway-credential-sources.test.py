@@ -467,8 +467,10 @@ def credential_access(source: str, rel: str) -> "list[str]":
                   and n.body and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
     out = []
     for node in ast.walk(tree):
-        if id(node) in docstrings or isinstance(parents.get(node), (ast.BinOp, ast.JoinedStr, ast.FormattedValue)):
-            continue
+        parent = parents.get(node)
+        if id(node) in docstrings or (isinstance(parent, (ast.BinOp, ast.JoinedStr, ast.FormattedValue))
+                                      and _constant(parent) is not None):
+            continue  # the folded parent is checked whole
         text = _constant(node)
         if text is not None and any(text == k or (len(text) >= 8 and text in k) for k in SOURCE_KEYS):
             out.append(f"{rel}:{node.lineno} key {text!r}")
@@ -511,9 +513,13 @@ def credential_access(source: str, rel: str) -> "list[str]":
         handed = [k.value for k in call.keywords if k.arg in ("read_token_file", "vault_lookup")]
         handed += call.args[1:2] if OWNER_READERS[callee] == 1 else []
         for value in handed:
-            for ref in (n for n in ast.walk(value) if isinstance(n, ast.Name) and n.id.startswith("_read")):
-                if (rel, ref.id) not in IO_ALLOWED:
-                    out.append(f"{rel}:{call.lineno} reader {ref.id} handed to the owner")
+            params = {a.arg for lam in ast.walk(value) if isinstance(lam, ast.Lambda) for a in ast.walk(lam.args)
+                      if isinstance(a, ast.arg)}
+            # A reader handed in, a lambda's body included, may only call or name allowlisted readers.
+            for ref in ast.walk(value):
+                word = ref.id if isinstance(ref, ast.Name) else ref.attr if isinstance(ref, ast.Attribute) else None
+                if word and word not in params and (rel, word) not in IO_ALLOWED:
+                    out.append(f"{rel}:{call.lineno} reader {word} handed to the owner")
     return out
 
 
@@ -543,10 +549,16 @@ class Guard(unittest.TestCase):
             'def f():\n    subprocess.run(["security", "find-generic-password", "-s", "x"])',
             'from channel_token import token_from_vault\ntoken_from_vault(name)',
             'def g():\n    return discover(env, files, read_token_file=_read_anything)',
+            'n = "TOKEN"\nos.environ.get(f"REMOTE_TASK_{n}")',
+            'n = "TOKEN"\nos.environ.get("REMOTE_TASK_" + n)',
+            'discover(env, files, read_token_file=lambda p: open(p).read())',
+            'discover(env, files, vault_lookup=lambda k: Path(k).read_text())',
+            'env_files(env, lambda p: open(p).read())',
         ]
         for source in bypasses:
             self.assertTrue(credential_access(source, "probe.py"), source)
-        allowed = 'def _read_text(path):\n    return open(path).read()\nfiles = env_files(env, _read_text)\n'
+        allowed = ('def _read_text(path):\n    return open(path).read()\nfiles = env_files(env, _read_text)\n'
+                   'discover(env, files, read_token_file=lambda p: _read_text(p) or "")\n')
         self.assertEqual(credential_access(allowed, "adapters/hatch/cli.py"), [])
         self.assertEqual(credential_access('"""Put REMOTE_TASK_TOKEN in the .env file."""\nx = 1\n', "probe.py"), [],
                          "a docstring naming a key is prose, not a read")
