@@ -315,11 +315,30 @@ print(json.dumps({"raw": raw, "url": m.URL, "files": files}))
                            ("'/relay?enrollment=SECRET%20BAD&tenant=a'", closed),
                            ("enrollment=SECRET BAD", closed), ("tenant=a", closed), ("x=a", closed),
                            ("'tenant%3Da'", closed), ("u:pw-1234@host", closed), (":pw-1234@", closed),
-                           ("#frag-xyz", closed)):
+                           ("#frag-xyz", closed), ("login failed u:pw-1234@gw", closed),
+                           ("login failed for u:pw-1234", "login failed for u:pw-1234")):
             self.assertEqual(gateway_instance.redact_text(text, url), want, text)
+        for userinfo_url, texts in (
+                ("https://u:SECRETPW@gw.example/relay",
+                 ("login failed u:SECRETPW@gw", "bad :SECRETPW@", "u%3ASECRETPW%40gw")),
+                ("https://SECRETTOK@gw.example/relay", ("auth SECRETTOK@gw", "SECRETTOK%40gw"))):
+            for text in texts:
+                self.assertEqual(gateway_instance.redact_text(text, userinfo_url), closed, text)
+        flag = "https://gw.example/relay?flag&x=1"
+        for text in ("'/relay?flag&x=1'", "'/relay?flag'", "a&flag", "a;flag", "%3Fflag"):
+            self.assertEqual(gateway_instance.redact_text(text, flag), closed, text)
+        self.assertEqual(gateway_instance.redact_text("a flag is set", flag), "a flag is set")
         ctl = "https://gw.example/relay?k=v\x01w"
         self.assertEqual(gateway_instance.redact_text(repr("/relay?k=v\x01w"), ctl), closed)
         self.assertEqual(gateway_instance.redact_text("x", ""), "x")
+
+    def test_the_bridge_refuses_a_non_ascii_binding_without_raising(self):
+        (self.state / "owner-routing.json").write_text(json.dumps(
+            {"identity": AGENT, "gateway": GW, "binding": "é" * 64, "owner_dm": "!dm:ag2.space"}))
+        out = self.bridge("import json\nfrom ag2_sparrow import remote_gateway_bridge as m\n"
+                          "m._load_routing()\nprint(json.dumps({'dm': m._ROUTING['owner_dm']}))\n",
+                          AGENT_MXID=AGENT)
+        self.assertEqual(out, {"dm": ""})
 
     def test_the_bridge_delegates_routing_migration_and_retries_it(self):
         import ast
@@ -503,6 +522,18 @@ class WakeContext(Base):
         self.assertEqual(runtime_text.owner_dm_room(self.state), "")
         bind(self.state, "!dm:ag2.space", gateway=new, status_url=new)
         self.assertEqual(runtime_text.owner_dm_room(self.state), "!dm:ag2.space")
+
+    def test_a_non_ascii_binding_is_refused_without_raising(self):
+        bind(self.state, "!dm:ag2.space")
+        for side in ("owner-routing.json", "gateway-status.json"):
+            path = self.state / side
+            original = path.read_text()
+            record = json.loads(original)
+            record["binding" if side.startswith("owner") else "gateway_binding"] = "é" * 64
+            path.write_text(json.dumps(record))
+            self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "", side)
+            path.write_text(original)
+        self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space")
 
     def test_a_record_whose_binding_disagrees_with_the_running_one_is_refused(self):
         bind(self.state, "!dm:ag2.space")
@@ -723,6 +754,34 @@ class RoutingMigration(unittest.TestCase):
         self.assertIn("RuntimeError", self.logs[-1])
         with mock.patch.object(self.rm.os, "listdir", side_effect=PermissionError("no")):
             self.assertFalse(self.run_migration().done)
+
+    def test_a_sweep_error_does_not_block_the_rewrite_and_the_sweep_is_retried(self):
+        self.legacy()
+        bad, stale = (self.dir / f".owner-routing.json.{n}.tmp" for n in (21, 22))
+        for path in (bad, stale):
+            path.write_text("x")
+            os.utime(path, (time.time() - 60,) * 2)
+        real_unlink = os.unlink
+
+        def unlink(name, *a, **k):
+            if name == bad.name:
+                raise PermissionError("busy")
+            return real_unlink(name, *a, **k)
+        with mock.patch.object(self.rm.os, "unlink", unlink):
+            result = self.run_migration()
+        self.assertEqual((result.done, result.rewritten, result.removed), (False, True, 1))
+        self.assertNotIn("tenant", self.path.read_text(), "the rewrite ran despite the sweep error")
+        self.assertTrue(bad.exists() and not stale.exists())
+        again = self.run_migration()
+        self.assertEqual((again.done, again.rewritten, again.removed), (True, False, 1))
+        self.assertFalse(bad.exists())
+
+    def test_a_temp_vanishing_mid_sweep_is_not_an_error(self):
+        path = self.dir / ".owner-routing.json.31.tmp"
+        path.write_text("x")
+        os.utime(path, (time.time() - 60,) * 2)
+        with mock.patch.object(self.rm.os, "unlink", side_effect=FileNotFoundError()):
+            self.assertTrue(self.run_migration().done)
 
     def test_the_sweep_bounds_pid_reuse_and_respects_the_grace(self):
         now = time.time()

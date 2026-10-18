@@ -36,18 +36,22 @@ def migrate_owner_routing(record_path: Path, *,
     """Sweep the legacy temps, then rewrite a legacy record. `record_for(identity, full URL,
     owner_dm)` builds the current record or None when it cannot be bound; `write` publishes it
     atomically and says whether it committed."""
+    removed, swept = 0, False
     try:
-        removed = sweep_legacy_temps(Path(record_path), pid_alive)
+        removed, swept = sweep_legacy_temps(Path(record_path), pid_alive)
+    except Exception as e:  # noqa: BLE001 - the sweep is retried; the rewrite still runs
+        log(f"owner-routing temp sweep failed ({type(e).__name__}) — retried at the next load")
+    if removed:
+        log(f"owner-routing: removed {removed} stale temp file(s)")
+    try:
         rewritten = _rewrite_legacy_record(Path(record_path), record_for, write)
     except Exception as e:  # noqa: BLE001 - a failed migration is retried, never fatal
         log(f"owner-routing migration failed ({type(e).__name__}) — retried at the next load")
-        return Result(done=False)
+        return Result(done=False, removed=removed)
     if rewritten is None:
         log("owner-routing: legacy record not migrated yet — retried at the next load")
         return Result(done=False, removed=removed)
-    if removed:
-        log(f"owner-routing: removed {removed} stale temp file(s)")
-    return Result(done=True, rewritten=rewritten, removed=removed)
+    return Result(done=swept, rewritten=rewritten, removed=removed)
 
 
 def _rewrite_legacy_record(path: Path, record_for, write) -> "bool | None":
@@ -67,27 +71,33 @@ def _rewrite_legacy_record(path: Path, record_for, write) -> "bool | None":
     return True
 
 
-def sweep_legacy_temps(record_path: Path, pid_alive: Callable[[int], bool]) -> int:
+def sweep_legacy_temps(record_path: Path, pid_alive: Callable[[int], bool]) -> "tuple[int, bool]":
     """Unlink `.<record name>.<pid>.tmp` in the record's dir: regular files only (no symlink is
-    followed), this uid's, older than the grace, and whose pid is dead or older than the bound."""
+    followed), this uid's, older than the grace, and whose pid is dead or older than the bound.
+    (removed, finished): an entry that errors is skipped, and the sweep is unfinished."""
     pattern = re.compile(re.escape(f".{record_path.name}.") + r"([0-9]{1,10})\.tmp")
     try:
         dfd = os.open(str(record_path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     except FileNotFoundError:
-        return 0
-    removed = 0
+        return 0, True
+    removed, finished = 0, True
     try:
         for name in os.listdir(dfd):
             m = pattern.fullmatch(name)
             if not m or int(m.group(1)) == os.getpid():
                 continue
-            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
-            age = time.time() - st.st_mtime
-            if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or age < TEMP_GRACE_S
-                    or (age < TEMP_MAX_AGE_S and pid_alive(int(m.group(1))))):
-                continue
-            os.unlink(name, dir_fd=dfd)
-            removed += 1
+            try:
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                age = time.time() - st.st_mtime
+                if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or age < TEMP_GRACE_S
+                        or (age < TEMP_MAX_AGE_S and pid_alive(int(m.group(1))))):
+                    continue
+                os.unlink(name, dir_fd=dfd)
+                removed += 1
+            except FileNotFoundError:
+                continue  # gone already: nothing left to sweep
+            except OSError:
+                finished = False
     finally:
         os.close(dfd)
-    return removed
+    return removed, finished
