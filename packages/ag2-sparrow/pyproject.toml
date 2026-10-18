@@ -16,7 +16,9 @@ keywords = ["ag2", "agent", "relay", "gateway", "matrix", "delivery", "outbox", 
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
-  "Operating System :: OS Independent",
+  "Operating System :: POSIX",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
   "Intended Audience :: Developers",
 ]
 # Zero third-party runtime deps — the client is stdlib-only (urllib/json/...).
@@ -48,6 +50,7 @@ include = ["ag2_sparrow*"]
 [tool.setuptools.package-data]
 "ag2_sparrow.adapters.hatch" = ["*.sh", "*.json"]
 "ag2_sparrow.adapters.claude_routine" = ["*.md"]
+"ag2_sparrow.adapters.claude_cloud_session" = ["*.md"]
 
 [tool.setuptools.dynamic]
 version = { attr = "ag2_sparrow.__version__" }

@@ -2,7 +2,8 @@
 # tmux-send-line.sh <session> <line> [--socket PATH] [--runtime claude|codex] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
 # The ONE sender for a line typed into a Sutando core pane: has-session, read
 # the current prompt line, apply the queued-input policy, then send-keys -l + Enter.
-# Exit: 0 sent · 3 no session · 4 no tmux · 5 pending text · 6 WORD already queued · 7 inspection failed (refused).
+# Exit: 0 sent · 3 no session · 4 no tmux · 5 pending text · 6 WORD already queued · 7 inspection failed (refused)
+# · 75 another sender busy · 124 send timed out and revoked · 125 send may have applied (fenced).
 set -u -o pipefail
 SESSION="${1:?session}"; LINE="${2:?line}"; shift 2; RUNTIME=claude
 SOCK="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"; REFUSE=""; SKIPWORD=""; DRY=""
@@ -55,7 +56,10 @@ AFTER_BASELINE="$(printf '%s\n' "$CAP" | "$PY" "$REPO/src/delivery/pane_gate.py"
 if [ -n "$SKIPWORD" ] && [ "$PENDING" = "$SKIPWORD" ]; then echo "tmux-send-line: '$SKIPWORD' already queued at the prompt — not sent" >&2; exit 6; fi
 if [ -n "$REFUSE" ] && [ -n "$PENDING" ]; then echo "tmux-send-line: prompt carries pending text (${PENDING:0:60}) — not sent" >&2; exit 5; fi
 [ -n "$DRY" ] && { echo "dry-run: would send '$LINE' + Enter to $SESSION on $SOCK (pending: '${PENDING}')"; exit 0; }
-"$TMUX" -S "$SOCK" send-keys -t "$SESSION" -l "$LINE" || { echo "tmux-send-line: send-keys failed" >&2; exit 1; }
+keys() { bash "$REPO/src/tmux-pane-keys.sh" --tmux "$TMUX" -S "$SOCK" -t "$SESSION" -- "$@"; local rc=$?
+  [ "$rc" = 0 ] && return 0; echo "tmux-send-line: send-keys failed" >&2
+  case "$rc" in 75|124|125) exit "$rc" ;; *) exit 1 ;; esac; }
+keys -l "$LINE"
 # Codex reads an Enter within 120ms of a typed burst as a pasted newline (PASTE_ENTER_SUPPRESS_WINDOW), not a submit.
 [ "$RUNTIME" = codex ] && sleep 0.25
 # The lock excludes cooperating senders, not operator keystrokes: a picker or dialog
@@ -70,5 +74,5 @@ if [ "$RUNTIME" = codex ]; then
   AFTER_NOW="$(printf '%s\n' "$RECAP" | "$PY" "$REPO/src/delivery/pane_gate.py" after --runtime "$RUNTIME" --width "${WIDTH:-0}")" || { echo "tmux-send-line: prompt unknown or unparseable — Enter withheld" >&2; exit 7; }
   if [ "$AFTER_NOW" != "$AFTER_BASELINE" ]; then echo "tmux-send-line: pane state changed below the prompt during the delay (was '${AFTER_BASELINE:0:60}', now '${AFTER_NOW:0:60}') — Enter withheld" >&2; exit 5; fi
 fi
-"$TMUX" -S "$SOCK" send-keys -t "$SESSION" Enter || { echo "tmux-send-line: send-keys failed" >&2; exit 1; }
+keys Enter
 echo "sent '$LINE' to $SESSION"

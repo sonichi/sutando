@@ -22,13 +22,15 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import team_guardrail  # noqa: E402
 
+from ag2_sparrow import relay_loop as rl  # noqa: E402
+
 from ag2_sparrow.adapters.claude_routine import routine_adapter as ra  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 TOKEN = "sk-ant-oat01-FAKE-TEST-TOKEN-do-not-log"
 TRIGGER = "trig_01TESTTRIGGER"
 PROMPT_MD = PKG_ROOT / "ag2_sparrow" / "adapters" / "claude_routine" / "routine-prompt.md"
-NOTE = cc.NON_OWNER_NOTE_FALLBACK
+NOTE = cc.NON_OWNER_NOTE
 SPAN_RE = re.compile(r"<(UNTRUSTED_TASK_[0-9a-f]{8})>\n(.*)\n</\1>", re.S)
 
 
@@ -499,16 +501,34 @@ class MainTest(unittest.TestCase):
             (Path(d) / "state" / "connector.pid").write_text("%d\n" % os.getppid())
             rc, out = self.run_main(argv, env)
             self.assertEqual(rc, 3)
-            self.assertIn("another adapter", out)
+            self.assertIn("stop the old adapter (pid %d), then start" % os.getppid(), out)
 
     def test_result_write_is_atomic(self):
         with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (_, base):
             write_task(d, "task-at", "x")
-            with mock.patch.object(ra, "write_atomic", wraps=ra.write_atomic) as spy:
+            with mock.patch.object(rl, "write_atomic", wraps=rl.write_atomic) as spy:
                 run_adapter(d, base, once=1)
-            self.assertIn(os.path.join(d, "results", "task-at.txt"), [c.args[0] for c in spy.call_args_list])
+            self.assertIn(rl.staged_path(os.path.join(d, "results"), "task-at.txt"),
+                          [c.args[0] for c in spy.call_args_list])
+            self.assertTrue(os.path.exists(os.path.join(d, "results", "task-at.txt")))
             self.assertEqual([n for n in os.listdir(os.path.join(d, "results")) if n.startswith(".")], [])
             self.assertIs(ra.write_atomic, cc.write_atomic)
+            self.assertIs(rl.write_atomic, cc.write_atomic)
+
+
+class HeldRootRefusalTest(unittest.TestCase):
+    def test_a_held_root_that_has_no_path_exits_with_the_refusal_code(self):
+        with tempfile.TemporaryDirectory() as d:
+            err = io.StringIO()
+            with mock.patch.object(ra, "acquire_lock", return_value=object()), \
+                    mock.patch.object(ra, "release_lock") as release, \
+                    mock.patch.object(ra, "exit_on_sigterm"), \
+                    mock.patch.object(ra, "make_dirs"), \
+                    mock.patch.object(ra, "root_path", side_effect=ra.LockRefused(2, "refusing to start: gone")), \
+                    contextlib.redirect_stderr(err):
+                rc = ra.main(["--work", d, "--trigger-id", TRIGGER], {"CLAUDE_ROUTINE_TOKEN": "t"})
+        self.assertEqual((rc, err.getvalue().strip()), (2, "refusing to start: gone"))
+        release.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -225,6 +225,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $failures += 'single-instance.test.py failed' }
           python tests/file-lock.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'file-lock.test.py failed' }
+          python tests/holder-lock.test.py
+          if ($LASTEXITCODE -ne 0) { $failures += 'holder-lock.test.py failed' }
           python tests/outbox-windows.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'outbox-windows.test.py failed' }
           python tests/proactive-recovery-process-probe.test.py

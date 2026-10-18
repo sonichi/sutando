@@ -23,7 +23,9 @@ DATA_FILES = ("ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh",
               "ag2_sparrow/adapters/hatch/hook-definition.json",
               "ag2_sparrow/adapters/hatch/builtin-runtime-text.json",
               "ag2_sparrow/adapters/claude_routine/routine-prompt.md",
-              "ag2_sparrow/adapters/claude_routine/README.md")
+              "ag2_sparrow/adapters/claude_routine/README.md",
+              "ag2_sparrow/adapters/claude_cloud_session/session-prompt.md",
+              "ag2_sparrow/adapters/claude_cloud_session/README.md")
 
 
 def _expected_packages():
@@ -78,7 +80,7 @@ def main():
         env["AGENT_CONNECT_STATE_DIR"] = str(d / "state")
         env["PYTHONPATH"] = ""
         # Run from the temp dir so the source tree cannot shadow the installed copy.
-        _run([py, "-c", "import ag2_sparrow.remote_gateway_bridge, ag2_sparrow.outbox_cli"],
+        _run([py, "-c", "import ag2_sparrow.remote_gateway_bridge, ag2_sparrow.outbox_cli, ag2_sparrow.holder_lock"],
              cwd=d, env=env)
         r = subprocess.run([str(bindir / "ag2-sparrow")], capture_output=True, text=True,
                            cwd=d, env=env, timeout=60)

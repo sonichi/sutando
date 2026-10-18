@@ -19,48 +19,16 @@ import sys
 import time
 import urllib.error
 import urllib.request
-import uuid
 
-from ..codex.codex_connector import (acquire_lock, load_done, non_owner_note, parse_task,
-                                     record_done, write_atomic)
+from ...task_io import (LockRefused, acquire_lock, exit_code, exit_on_sigterm, make_dirs, non_owner_note, release_lock,
+                        root_path, stoppable_sleep, write_atomic)
+from ...relay_loop import (HOUR, NO_ROOM, NON_OWNER_REFUSED, TEXT_MAX, Outcome, RateLimiter,  # noqa: F401
+                          RelayLoop, build_payload, count_arg, log, result_body)
 
 API_BASE = "https://api.anthropic.com"
 API_VERSION = "2023-06-01"
-TEXT_MAX = 65536
 ROUTINE_CAP_PER_HOUR = 30
 TRIGGER_RE = re.compile(r"trig_[A-Za-z0-9]+")
-TRUNCATED = "\n[truncated]"
-HOUR = 3600.0
-
-
-def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
-
-
-def _field(value):
-    # Header values go on the payload's first line, so no whitespace may split or end it.
-    return re.sub(r"\s+", "", value or "")
-
-
-def build_payload(task_id, headers, message, operator_lines=(), note=None):
-    """First line: the attested routing fields. Then, for a non-owner tier, the note; then
-    the untrusted body between nonce markers; then the bridge-written lines, outside them.
-    Only the body is cut to fit the endpoint's limit, so the markers and lines survive."""
-    tier = headers.get("access_tier") or "guest"
-    collaborator = tier == "team" and headers.get("collaborator") == "true"
-    room = _field(headers.get("channel_id")) or _field(headers.get("source_room_id"))
-    thread = _field(headers.get("thread_root")) or "none"
-    head = "room=%s thread=%s tier=%s collaborator=%s task_id=%s\n" % (
-        room, thread, tier, "true" if collaborator else "false", _field(task_id))
-    if tier != "owner":
-        head += "note: %s\n" % (note if note is not None else non_owner_note())
-    tag = "UNTRUSTED_TASK_" + uuid.uuid4().hex[:8]
-    opening, closing = "<%s>\n" % tag, "\n</%s>" % tag
-    tail = closing + ("\n" + "\n".join(operator_lines) if operator_lines else "")
-    room_left = TEXT_MAX - len(head) - len(opening) - len(tail)
-    if len(message) > room_left:
-        message = message[:max(room_left - len(TRUNCATED), 0)] + TRUNCATED
-    return room, head + opening + message + tail
 
 
 def retry_after_seconds(value, now=None, default=60.0):
@@ -75,14 +43,6 @@ def retry_after_seconds(value, now=None, default=60.0):
             except (TypeError, ValueError):
                 secs = default
     return min(max(secs, 1.0), HOUR)
-
-
-class Outcome:
-    """kind: ok | rate_limited | rejected | retry (provably not accepted) | ambiguous (may have been)."""
-
-    def __init__(self, kind, status=None, url=None, session_id=None, retry_after=None, detail=""):
-        self.kind, self.status, self.url = kind, status, url
-        self.session_id, self.retry_after, self.detail = session_id, retry_after, detail
 
 
 def _error_type(raw):
@@ -126,70 +86,12 @@ def fire(endpoint, token, text, timeout=30.0, opener=urllib.request.urlopen):
     return Outcome("ok", 200, url=data.get("claude_code_session_url"), session_id=data.get("claude_code_session_id"))
 
 
-class RateLimiter:
-    """Sliding one-hour window of fire times, kept in a file so a restart does not reset it."""
-
-    def __init__(self, path, per_hour, clock=time.time):
-        self.path, self.per_hour, self.clock = path, per_hour, clock
-        try:
-            with open(path, encoding="utf-8") as f:
-                self.times = [float(t) for t in json.load(f)]
-        except (OSError, ValueError, TypeError):
-            self.times = []
-
-    def _prune(self):
-        now = self.clock()
-        self.times = [t for t in self.times if 0 <= now - t < HOUR]
-
-    def wait_seconds(self):
-        self._prune()
-        if len(self.times) < self.per_hour:
-            return 0.0
-        return max(min(self.times) + HOUR - self.clock(), 0.0)
-
-    def record(self):
-        self._prune()
-        self.times.append(self.clock())
-        write_atomic(self.path, json.dumps(self.times))
-
-
-def result_body(outcome, mode, owner=True):
-    url = outcome.url or "unknown"
-    if outcome.kind == "ok":
-        if mode == "echo" and owner:
-            return "Sent to the cloud agent: %s\n" % url
-        return "[no-send]\n# claude routine session: %s\n" % url
-    # A non-owner tier never learns the HTTP status or error type: that is auth/config state
-    # about the owner's connector, and the sender is not the owner.
-    if not owner:
-        return "This message could not be sent to the cloud agent right now.\n"
-    if outcome.kind == "rejected":
-        return "The cloud agent could not take this message (HTTP %s, %s).\n" % (outcome.status, outcome.detail)
-    if outcome.kind == "rate_limited":
-        return "The cloud agent is over its hourly limit, so this message was not sent to it.\n"
-    if outcome.kind == "ambiguous":
-        return ("This message may or may not have reached the cloud agent (%s); it was not retried.\n"
-                % (outcome.status or outcome.detail))
-    return ("The cloud agent could not be reached for this message after several tries (%s).\n"
-            % (outcome.status or outcome.detail))
-
-
-NO_ROOM = "This message has no room to reply in, so it was not sent to the cloud agent.\n"
-# The routine acts with the owner's AG2 Space connector, so non-owner tiers are refused
-# unless --allow-non-owner is set; the sender sees only this plain line.
-NON_OWNER_REFUSED = "This agent only answers its owner here.\n"
-
-
-class Adapter:
-    def __init__(self, args, token, opener=urllib.request.urlopen, clock=time.time, sleep=time.sleep, note=None):
-        self.args, self.token, self.opener = args, token, opener
-        self.clock, self.sleep = clock, sleep
+class Adapter(RelayLoop):
+    def __init__(self, args, token, opener=urllib.request.urlopen, clock=time.time, sleep=stoppable_sleep, note=None):
+        self.init_loop(args, "fires.json", clock, sleep)
+        self.token, self.opener = token, opener
         self.note = note if note is not None else non_owner_note()
         self.endpoint = "%s/v1/claude_code/routines/%s/fire" % (args.api_base.rstrip("/"), args.trigger_id)
-        self.limiter = RateLimiter(os.path.join(args.state, "fires.json"), args.max_per_hour, clock)
-        self.done_path = os.path.join(args.state, "done")
-        self.attempts, self.limited = {}, {}   # task id -> pre-send failures, 429s
-        self.not_before = {}
         self.hold_path = os.path.join(args.state, "hold.json")
         try:
             with open(self.hold_path, encoding="utf-8") as f:
@@ -199,43 +101,16 @@ class Adapter:
         if self.blocked_until > self.clock() + HOUR:
             self.blocked_until = 0.0
 
-    def pending(self, seen):
-        names = [n for n in os.listdir(self.args.inbox)
-                 if n.startswith("task-") and n.endswith(".txt") and n[:-4] not in seen
-                 and not os.path.exists(os.path.join(self.args.results, n))]
-        # A file can vanish between listdir and stat (a cancel, a cleanup): drop it rather
-        # than crash the whole loop over one task that is no longer there to serve.
-        stamped = []
-        for n in names:
-            try:
-                stamped.append((os.stat(os.path.join(self.args.inbox, n)).st_mtime, n))
-            except FileNotFoundError:
-                continue
-        stamped.sort()
-        return [n for _, n in stamped]
-
-    def finish(self, name, body, seen):
-        write_atomic(os.path.join(self.args.results, name), body)
-        record_done(self.done_path, name[:-4])
-        seen.add(name[:-4])
-        self.attempts.pop(name[:-4], None)
-        self.limited.pop(name[:-4], None)
-        self.not_before.pop(name[:-4], None)
-
     def step(self, name, seen):
         """Handle one task; returns True when it reached a final result."""
         task_id = name[:-4]
-        try:
-            headers, message, operator_lines = parse_task(os.path.join(self.args.inbox, name))
-        except FileNotFoundError:
-            log("vanished before read ->", task_id)
-            seen.add(task_id)
+        task = self.read_task(name, seen)
+        if task is None:
             return True
-        tier = headers.get("access_tier") or "guest"
-        if tier != "owner" and not self.args.allow_non_owner:
-            log("refused (non-owner, --allow-non-owner not set) ->", task_id, tier)
-            self.finish(name, NON_OWNER_REFUSED, seen)
-            return True
+        headers, message, operator_lines = task
+        refused = self.refusal(name, headers, seen)
+        if refused is not None:
+            return refused
         room, text = build_payload(task_id, headers, message, operator_lines, self.note)
         if not room:
             log("no room ->", task_id)
@@ -252,53 +127,11 @@ class Adapter:
                 return False
         else:
             self.limiter.record()
-        if out.kind == "retry":
-            n = self.attempts[task_id] = self.attempts.get(task_id, 0) + 1
-            if n <= self.args.max_retries:
-                delay = max(min(self.args.backoff * (2 ** (n - 1)), self.args.backoff_max), out.retry_after or 0)
-                self.not_before[task_id] = self.clock() + delay
-                log("retry %d/%d for %s in %.1fs (%s)" % (n, self.args.max_retries, task_id, delay,
-                                                         out.status or out.detail))
-                return False
+        if out.kind == "retry" and self.schedule_retry(task_id, out.status or out.detail, out.retry_after):
+            return False
         log("result <-", task_id, out.kind, out.status, out.session_id or "")
         self.finish(name, result_body(out, self.args.result_mode, headers.get("access_tier") == "owner"), seen)
         return True
-
-    def next_ready(self, names):
-        now = self.clock()
-        if now < self.blocked_until:
-            return None, self.blocked_until - now
-        ready = [n for n in names if self.not_before.get(n[:-4], 0) <= now]
-        if not ready:
-            return None, min(self.not_before[n[:-4]] for n in names) - now
-        wait = self.limiter.wait_seconds()
-        if wait > 0:
-            return None, wait
-        return ready[0], 0.0
-
-    def serve(self):
-        seen = set(load_done(self.done_path))
-        done = 0
-        idle_since = self.clock()
-        while True:
-            names = self.pending(seen)
-            if not names:
-                if self.args.once and done >= self.args.once:
-                    return
-                if self.args.idle_exit and self.clock() - idle_since > self.args.idle_exit:
-                    log("idle-exit")
-                    return
-                self.sleep(self.args.poll)
-                continue
-            name, wait = self.next_ready(names)
-            if name is None:
-                self.sleep(min(max(wait, 0.01), self.args.poll * 50))
-                continue
-            if self.step(name, seen):
-                done += 1
-                if self.args.once and done >= self.args.once:
-                    return
-            idle_since = self.clock()
 
 
 def build_parser():
@@ -322,7 +155,7 @@ def build_parser():
     ap.add_argument("--backoff", type=float, default=2.0, help="first retry delay, doubled per retry")
     ap.add_argument("--backoff-max", type=float, default=60.0)
     ap.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout per fire")
-    ap.add_argument("--once", type=int, default=0, help="exit after N tasks")
+    ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=1.0)
     return ap
@@ -342,23 +175,25 @@ def main(argv=None, environ=None, opener=urllib.request.urlopen):
         sys.stderr.write("refusing to start: env var %s is empty or unset\n" % args.token_env)
         return 2
     args.work = os.path.abspath(args.work)
-    args.inbox = os.path.join(args.work, "tasks")
-    args.results = os.path.join(args.work, "results")
-    args.state = os.path.join(args.work, "state")
-    for d in (args.inbox, args.results, args.state):
-        os.makedirs(d, exist_ok=True)
-    lock = acquire_lock(args.state)
-    if lock is None:
-        sys.stderr.write("another adapter holds %s (state/connector.pid is alive)\n" % args.work)
-        return 3
+    exit_on_sigterm()
     try:
+        owner = acquire_lock(args.work, "claude-routine")
+    except LockRefused as e:
+        sys.stderr.write(e.line + "\n")
+        return e.code
+    try:
+        make_dirs(owner, ("tasks", "results", "state"))
+        args.work = root_path(owner, args.work)
+        args.inbox = os.path.join(args.work, "tasks")
+        args.results = os.path.join(args.work, "results")
+        args.state = os.path.join(args.work, "state")
         Adapter(args, token, opener).serve()
+    except LockRefused as e:
+        sys.stderr.write(e.line + "\n")
+        return e.code
     finally:
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
-    return 0
+        release_lock(owner)
+    return exit_code(0)
 
 
 if __name__ == "__main__":

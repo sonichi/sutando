@@ -168,6 +168,16 @@
    "canonical_for": "the capability-not-key credential-resolver contract: tier order, managed-file schema, source observability, and the reader-sweep migration plan",
    "last_verified": "2026-08-05"
   },
+  "docs/design-holder-lock.md": {
+   "title": "holder_lock: the one flock-and-holder primitive",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the shared flock-and-holder lock contract: acquire/wait results, the holder record, the work-root first-act rule and the install boundary that the adapter and notifier locks build on",
+   "last_verified": "2026-10-17"
+  },
   "docs/design-mediated-capability-layer.md": {
    "title": "Mediated capability layer",
    "audience": [
@@ -247,7 +257,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-10-12"
+   "last_verified": "2026-10-16"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",

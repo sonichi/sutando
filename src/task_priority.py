@@ -20,10 +20,13 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Tuple
 
-# Self-sufficient import: consumers load this module standalone via importlib
-# (tests, tools) where src/ isn't on sys.path — same pattern as the bridges.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import local_task_protocol as _ltp  # noqa: E402
+# Relative inside the ag2-sparrow package copy; a flat load (importlib in tests, tools,
+# bridges) has no parent package, so src/ goes on sys.path instead.
+try:
+    from . import local_task_protocol as _ltp
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import local_task_protocol as _ltp  # noqa: E402
 
 _ORDER = {"urgent": 0, "normal": 1, "low": 2}
 _VALID = frozenset(_ORDER.keys())
@@ -44,11 +47,8 @@ def default_priority_for_source(source: str, access_tier: str | None = None) -> 
     if s in ("chat", "context-drop"):
         return "normal"
     if s in ("discord", "telegram", "slack"):
-        # Owner-tier traffic stays at normal; team/guest gets demoted so a
-        # public-channel ping never preempts an owner-DM follow-up. Slack was
-        # omitted originally (Air's finding 2026-07-24) — it carries the exact
-        # same owner/team/other tier model as discord, so its non-owner tasks
-        # must demote identically or a team-tier Slack ping outranks owner work.
+        # Owner-tier traffic stays normal; team/guest is demoted so a channel ping
+        # from a non-owner never preempts owner work.
         return "normal" if (access_tier or "owner").lower() == "owner" else "low"
     if s in ("health-check", "sync-memory", "sync-workspace", "cron"):
         return "low"
