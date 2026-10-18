@@ -6,6 +6,7 @@ Run:
 """
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -40,7 +41,8 @@ class Loop(rl.RelayLoop):
                                      state=os.path.join(work, "state"), max_per_hour=kw.get("max_per_hour", 5),
                                      max_retries=1, backoff=2.0, backoff_max=60.0, once=0, idle_exit=0, poll=0.01,
                                      allow_non_owner=kw.get("allow_non_owner", False),
-                                     allow_collaborator=kw.get("allow_collaborator", False))
+                                     allow_collaborator=kw.get("allow_collaborator", False),
+                                     max_collaborator_per_hour=kw.get("max_collaborator_per_hour", 10))
         for d in (args.inbox, args.results, args.state):
             os.makedirs(d, exist_ok=True)
         self.init_loop(args, "sends.json", clock=lambda: 1000.0, sleep=lambda s: None)
@@ -230,8 +232,8 @@ FORBIDDEN_FLAGS = ("--cloud", "--resume", "-r", "--dangerously-skip-permissions"
 
 def assert_isolated_call(case, argv, env, claude="claude"):
     """The one shape every collaborator turn must have, whichever adapter spawned it."""
-    case.assertEqual(argv, [claude, "-p", "--safe-mode", "--restricted", "--strict-mcp-config", "--tools",
-                            "Read,Grep,Glob", "--output-format", "json"])
+    case.assertEqual(argv, [claude, "-p", "--safe-mode", "--restricted", "--strict-mcp-config",
+                            "--no-session-persistence", "--tools", "Read,Grep,Glob", "--output-format", "json"])
     for flag in FORBIDDEN_FLAGS:
         case.assertNotIn(flag, argv, flag)
     case.assertTrue(set(env) <= set(ct.ENV_KEEP), env)
@@ -281,6 +283,127 @@ class CollaboratorTurnTest(unittest.TestCase):
         self.assertEqual(ct.child_env({"PATH": "/bin", "USER": "", "TERM": "x"}), {"PATH": "/bin"})
         with mock.patch.dict(os.environ, {"SUTANDO_X": "1"}):
             self.assertNotIn("SUTANDO_X", ct.child_env())
+
+    def test_a_temp_dir_that_cannot_be_made_is_a_failed_turn_with_no_call(self):
+        run = FakeRun()
+
+        def mkdtemp(**kw):
+            raise OSError(28, "no space")
+        turn = ct.run_collaborator_turn("claude", "t", {}, run=run, mkdtemp=mkdtemp)
+        self.assertEqual((turn.kind, turn.text, turn.detail), ("failed", "", "OSError"))
+        self.assertEqual(run.calls, [])
+
+    def test_the_timeout_is_the_callers(self):
+        run = FakeRun()
+        ct.run_collaborator_turn("claude", "t", {}, 7.5, run=run)
+        self.assertEqual(run.calls[0]["timeout"], 7.5)
+
+
+MARKER_BODIES = ("[no-send]\nHI", "[REPLIED]\nHI", "[deduped: task-9]\nHI", "[channel: !other:x]\nHI",
+                 "[thread: $root]\nHI", "[thread]\nHI", "[reply: 12345678901234567]\nHI", "[dm-only]\nHI",
+                 "[file: /etc/passwd]\nHI", "[send: /etc/passwd]\nHI", "[attach: /etc/passwd]\nHI",
+                 "HI\n[no-send]", "HI\n[dm-only]\nmore", "HI [dm-only] inline", "HI\n[file: /etc/passwd]",
+                 "[channel: !other:x]\n[no-send]\nHI", "[dm-only]\n[channel: !other:x]\nHI", "  [no-send]\nHI",
+                 "[NO-SEND]\nHI", "[Dm-Only]\nHI")
+
+
+class InertTextTest(unittest.TestCase):
+    """A collaborator's text never executes delivery protocol: the production parser must see no action."""
+
+    def test_every_marker_form_is_quoted_and_the_parser_then_sees_nothing(self):
+        from ag2_sparrow.result_markers import parse_markers
+        for raw in MARKER_BODIES:
+            if raw.lstrip().startswith("[") or "dm-only" in raw.lower():
+                self.assertTrue(parse_markers(raw).actions or parse_markers(raw, skip_after_channel=True).actions,
+                                "a live marker to begin with: " + repr(raw))
+            body = ct.inert_text(raw)
+            self.assertIsNotNone(body, raw)
+            self.assertEqual(parse_markers(body).actions, [], raw)
+            self.assertEqual(parse_markers(body, skip_after_channel=True).actions, [], raw)
+            self.assertEqual(parse_markers(body).body, body, "nothing is stripped either: " + raw)
+            self.assertIn("HI", body)
+            self.assertFalse(body.split("\n")[0].startswith("[no-send]"), "the first line is never a marker")
+        self.assertEqual(ct.inert_text("[no-send]\nHI"), "[ no-send]\nHI", "the parser's own quoted form")
+        self.assertEqual(ct.inert_text("plain text\n\nwith [brackets] kept"), "plain text\n\nwith [brackets] kept")
+
+    def test_the_turn_text_is_inert_before_it_leaves_the_helper(self):
+        from ag2_sparrow.result_markers import parse_markers
+        for raw in MARKER_BODIES:
+            run = FakeRun(stdout=json.dumps({"result": raw}))
+            turn = ct.run_collaborator_turn("claude", "t", {}, run=run)
+            self.assertEqual(turn.kind, "ok", raw)
+            self.assertEqual(parse_markers(turn.text).actions, [], raw)
+            self.assertIn("HI", turn.text)
+
+    def test_text_that_still_acts_after_quoting_is_a_failed_turn(self):
+        with mock.patch.object(ct, "_executes", return_value=True):
+            self.assertIsNone(ct.inert_text("[no-send]\nHI"))
+            run = FakeRun(stdout=json.dumps({"result": "[no-send]\nHI"}))
+            turn = ct.run_collaborator_turn("claude", "t", {}, run=run)
+            self.assertEqual((turn.kind, turn.detail), ("failed", "markers"))
+
+
+class PositiveArgTest(unittest.TestCase):
+    def test_the_collaborator_cap_must_be_one_or_more(self):
+        self.assertEqual(rl.positive_arg("1"), 1)
+        with self.assertRaises(rl.argparse.ArgumentTypeError):
+            rl.positive_arg("0")
+        for build, need in ((sa.build_parser, ["--session-id", "session_x"]), (ra.build_parser, ["--trigger-id", "trig_x"])):
+            for bad in ("0", "-3"):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                    build().parse_args(["--work", "w", "--max-collaborator-per-hour", bad] + need)
+                self.assertIn("--max-collaborator-per-hour: must be 1 or more", err.getvalue())
+            self.assertEqual(build().parse_args(["--work", "w", "--max-collaborator-per-hour", "1"] + need)
+                             .max_collaborator_per_hour, 1)
+
+
+class LaneSchedulingTest(unittest.TestCase):
+    """Each task waits only on its own lane's gate: the collaborator cap, or the provider's hold and cap."""
+
+    def loop(self, d, **kw):
+        loop = Loop(d, max_per_hour=1, max_collaborator_per_hour=1, **kw)
+        write_task(loop.args.inbox, "task-c", "normal", 100, tier="team")
+        p = Path(loop.args.inbox) / "task-c.txt"
+        p.write_text(p.read_text().replace("access_tier: team", "collaborator: true\naccess_tier: team"))
+        write_task(loop.args.inbox, "task-o", "normal", 200)
+        return loop
+
+    def test_a_sole_collaborator_is_not_held_by_the_provider_hold_or_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = self.loop(d)
+            self.assertEqual((loop.lane("task-c.txt"), loop.lane("task-o.txt")), ("collaborator", "provider"))
+            loop.blocked_until = loop.clock() + 300
+            self.assertEqual(loop.next_ready(["task-o.txt", "task-c.txt"]), ("task-c.txt", 0.0))
+            self.assertEqual(loop.next_ready(["task-o.txt"]), (None, 300.0))
+            loop.blocked_until = 0.0
+            loop.limiter.record()
+            self.assertEqual(loop.next_ready(["task-o.txt", "task-c.txt"]), ("task-c.txt", 0.0))
+            self.assertEqual(loop.next_ready(["task-o.txt"]), (None, rl.HOUR))
+
+    def test_an_owner_task_is_not_held_by_a_full_collaborator_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = self.loop(d)
+            loop.collab_limiter.record()
+            self.assertEqual(loop.next_ready(["task-c.txt", "task-o.txt"]), ("task-o.txt", 0.0))
+            self.assertEqual(loop.next_ready(["task-c.txt"]), (None, rl.HOUR))
+            loop.limiter.record()
+            loop.blocked_until = loop.clock() + 120
+            self.assertEqual(loop.next_ready(["task-c.txt", "task-o.txt"]), (None, 120.0), "the least wait of both")
+
+    def test_a_lane_is_read_once_and_a_vanished_task_is_the_providers_to_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = self.loop(d)
+            with mock.patch.object(rl, "parse_task", wraps=task_io.parse_task) as spy:
+                for _ in range(3):
+                    loop.next_ready(["task-c.txt", "task-o.txt"])
+            self.assertEqual(spy.call_count, 1, "the first ready task is served; its lane is cached")
+            self.assertEqual(loop.lane("task-gone.txt"), "provider")
+            self.assertNotIn("task-gone.txt", loop.lanes)
+            loop._settled("task-c.txt", set())
+            self.assertNotIn("task-c.txt", loop.lanes)
+            loop.not_before["task-o"] = loop.clock() + 5
+            self.assertEqual(loop.next_ready(["task-o.txt"]), (None, 5.0), "a parked task waits its own delay")
 
 
 class WriterContractTest(unittest.TestCase):
@@ -408,8 +531,8 @@ class LoopTest(unittest.TestCase):
 
 class DelegationTest(unittest.TestCase):
     def test_both_adapters_delegate_to_the_shared_loop(self):
-        shared = ("pending", "serve", "read_task", "refusal", "schedule_retry")
-        for mod, inherited in ((ra, shared + ("finish", "next_ready")), (sa, shared)):
+        shared = ("pending", "serve", "read_task", "refusal", "schedule_retry", "next_ready", "lane")
+        for mod, inherited in ((ra, shared + ("finish", "provider_wait")), (sa, shared)):
             self.assertTrue(issubclass(mod.Adapter, rl.RelayLoop), mod)
             for name in inherited:
                 self.assertIs(getattr(mod.Adapter, name), getattr(rl.RelayLoop, name), (mod, name))

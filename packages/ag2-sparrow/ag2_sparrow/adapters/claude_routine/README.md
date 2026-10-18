@@ -65,16 +65,23 @@ reaches the routine at all: with `--allow-collaborator` it is served on the isol
 without it, it gets the same refusal line. `--allow-non-owner` does not imply `--allow-collaborator`. The
 owner path is unchanged.
 
-**The isolated collaborator turn.** `<--claude> -p --safe-mode --restricted --strict-mcp-config --tools
-Read,Grep,Glob --output-format json`, the same payload on stdin (the note, `collaborator=true`, never
-`owner_dm`), in a fresh empty temp directory removed afterwards, with an environment of only `PATH`, `HOME`,
-`USER`, `LANG` and `CLAUDE_CONFIG_DIR`. What it can reach: the CLI's login and the three read tools over an
-empty directory. What it cannot: the routine and its connector, any session or history (no `--cloud`, no
-`--resume`), Bash or code-running tools, the web, MCP servers, CLAUDE.md, hooks, skills, settings, or the
-work dir. The JSON `result` string is the task's result, verbatim, which the bridge posts once in the
-originating room; any failure (non-zero exit, no `result`, timeout, missing CLI) gets the generic "could not
-be sent" line — one try, no retry. These turns have their own cap, `--max-collaborator-per-hour` (default
-10, `state/collaborator-turns.json`), and never count against `--max-per-hour`.
+**The isolated collaborator turn.** `<--claude> -p --safe-mode --restricted --strict-mcp-config
+--no-session-persistence --tools Read,Grep,Glob --output-format json`, the same payload on stdin (one lead
+line naming the situation, then the note, `collaborator=true`, never `owner_dm`), in a fresh empty temp
+directory removed afterwards, with an environment of only `PATH`, `HOME`, `USER`, `LANG` and
+`CLAUDE_CONFIG_DIR`, and the adapter's `--timeout`. What it can reach: the CLI's login and the three read
+tools over an empty directory. What it cannot: the routine and its connector, any session or history (no
+`--cloud`, no `--resume`, and the turn itself is never saved, so nothing can resume it), Bash or
+code-running tools, the web, MCP servers, CLAUDE.md, hooks, skills, settings, or the work dir. The JSON
+`result` string becomes the task's result as **inert text**: every result-delivery marker the shared
+parser knows (`[no-send]`, `[REPLIED]`, `[deduped:]`, `[channel:]`, `[thread:]`, `[thread]`, `[reply:]`,
+`[dm-only]`, `[file:]`/`[send:]`/`[attach:]`) is quoted in the parser's own form (`[ no-send]`) before
+publication and checked by the parser again, so the bridge executes nothing from it and posts it once in
+the originating room. Any failure (non-zero exit, no `result`, timeout, no temp dir, missing CLI) gets the
+generic "could not be sent" line — one try, no retry. These turns have their own cap,
+`--max-collaborator-per-hour` (1 or more, default 10, `state/collaborator-turns.json`), and their own gate:
+a collaborator waits only on that cap, never on `--max-per-hour` or a 429 hold, and an owner task waits
+only on its own gates, never on the collaborator cap.
 
 ## Results: why `[no-send]`
 

@@ -5,20 +5,24 @@ Package level so both Claude adapters share it without importing one another. St
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 
+from .result_markers import neutralize_markers, parse_markers
+
 # CLAUDE_CONFIG_DIR selects which login the CLI uses; without it the CLI falls back to the user default.
 ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "CLAUDE_CONFIG_DIR")
 # --safe-mode: no CLAUDE.md, hooks, skills, plugins or MCP from the cwd or config dir (login kept);
-# --restricted, --strict-mcp-config and the three read tools: nothing runs, no owner connector loads.
-TURN_ARGV = ("-p", "--safe-mode", "--restricted", "--strict-mcp-config", "--tools", "Read,Grep,Glob",
-             "--output-format", "json")
+# --no-session-persistence: the turn is never saved, so nothing can resume it; the rest: only reads.
+TURN_ARGV = ("-p", "--safe-mode", "--restricted", "--strict-mcp-config", "--no-session-persistence",
+             "--tools", "Read,Grep,Glob", "--output-format", "json")
 # The turn has no standing instructions: this line is all it knows about where its text goes.
 REMINDER = ("[sparrow collaborator task] One message from a collaborator of your owner follows; answer it "
             "on your owner's behalf. This turn is isolated: no connectors, no files, no memory of earlier "
             "messages. Write only the reply text; the bridge delivers it to the sender's room for you.")
+_BRACKET_RE = re.compile(r"\[(?=\S)")
 
 
 def child_env(environ=None):
@@ -33,14 +37,32 @@ class Turn:
         self.kind, self.text, self.detail = kind, text, detail
 
 
+def _executes(body):
+    return bool(parse_markers(body).actions or parse_markers(body, skip_after_channel=True).actions)
+
+
+def inert_text(text):
+    """`text` as a body the delivery parser executes nothing from: the parser's own quoted form first,
+    then every bracket opened, each pass checked by the parser itself; None when something still acts."""
+    body = text.strip()
+    for quote in (neutralize_markers, lambda s: _BRACKET_RE.sub("[ ", s)):
+        if not _executes(body):
+            return body
+        body = quote(body)
+    return None if _executes(body) else body
+
+
 def _stdout(proc):
     out = proc.stdout
     return out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
 
 
 def run_collaborator_turn(claude, text, env, timeout=120.0, run=subprocess.run, mkdtemp=tempfile.mkdtemp):
-    """The text on stdin, in a fresh empty directory removed afterwards; the JSON `result` is the reply."""
-    cwd = mkdtemp(prefix="collaborator-turn-")
+    """The text on stdin, in a fresh empty directory removed afterwards; the JSON `result`, made inert, is the reply."""
+    try:
+        cwd = mkdtemp(prefix="collaborator-turn-")
+    except OSError as e:
+        return Turn("failed", detail=type(e).__name__)
     try:
         proc = run([claude] + list(TURN_ARGV), input=REMINDER + "\n" + text, env=env, cwd=cwd,
                    capture_output=True, text=True, timeout=timeout, shell=False)
@@ -57,4 +79,7 @@ def run_collaborator_turn(claude, text, env, timeout=120.0, run=subprocess.run, 
     reply = data.get("result") if isinstance(data, dict) and not data.get("is_error") else None
     if not isinstance(reply, str) or not reply.strip():
         return Turn("failed", detail="no result")
-    return Turn("ok", text=reply)
+    body = inert_text(reply)
+    if body is None:
+        return Turn("failed", detail="markers")
+    return Turn("ok", text=body)

@@ -123,18 +123,25 @@ headers, never the message text) never enters this session: with `--allow-collab
 an isolated local turn; without it, it gets the same refusal line. `--allow-non-owner` does not imply
 `--allow-collaborator`. The owner path is unchanged.
 
-**The isolated collaborator turn** is `<--claude> -p --safe-mode --restricted --strict-mcp-config --tools
-Read,Grep,Glob --output-format json` with the routine adapter's payload on stdin (the note,
-`collaborator=true`; no reminder, no `channel_kind`, no `owner_dm`), in a fresh empty temp directory removed
-afterwards, with the same five-variable environment as above. What it can reach: the CLI's login and the
-three read tools over an empty directory. What it cannot: this session (no `--cloud`, no session id, no
-`--resume`), its history and connector, Bash or code-running tools, the web, MCP servers, CLAUDE.md, hooks,
-skills, settings, or the work dir. The JSON `result` string is the task's result, verbatim, which the
-bridge posts once in the originating room; any failure gets "This message could not be sent to the cloud
-agent right now." — one try, no retry. The turn runs inside the same claim/journal/ledger lifecycle as a
-queued turn, recorded as a `final` outcome, so it is never charged to `--max-per-hour` or
-`--min-gap-seconds`; its own cap is `--max-collaborator-per-hour` (default 10,
-`state/collaborator-turns.json`). The adapter log shows `collaborator turn ->` instead of `queue ->`.
+**The isolated collaborator turn** is `<--claude> -p --safe-mode --restricted --strict-mcp-config
+--no-session-persistence --tools Read,Grep,Glob --output-format json` with the routine adapter's payload on
+stdin (one lead line naming the situation, then the note, `collaborator=true`; not this session's reminder,
+no `channel_kind`, no `owner_dm`), in a fresh empty temp directory removed afterwards, with the same
+five-variable environment as above and this adapter's `--timeout`. What it can reach: the CLI's login and
+the three read tools over an empty directory. What it cannot: this session (no `--cloud`, no session id, no
+`--resume`, and the turn itself is never saved, so nothing can resume it), its history and connector, Bash
+or code-running tools, the web, MCP servers, CLAUDE.md, hooks, skills, settings, or the work dir. The JSON
+`result` string becomes the task's result as **inert text**: every result-delivery marker the shared parser
+knows (`[no-send]`, `[REPLIED]`, `[deduped:]`, `[channel:]`, `[thread:]`, `[thread]`, `[reply:]`,
+`[dm-only]`, `[file:]`/`[send:]`/`[attach:]`) is quoted in the parser's own form (`[ no-send]`) before
+publication and checked by the parser again, so the gateway executes nothing from it and posts it once in
+the originating room. Any failure (non-zero exit, no `result`, timeout, no temp dir, missing CLI) gets "This
+message could not be sent to the cloud agent right now." — one try, no retry. The turn runs inside the same
+claim/journal/ledger lifecycle as a queued turn, recorded as a `final` outcome, so it is never charged to
+`--max-per-hour` or `--min-gap-seconds`; its own cap is `--max-collaborator-per-hour` (1 or more, default
+10, `state/collaborator-turns.json`, part of this adapter's state contract), and its own gate: a
+collaborator waits only on that cap, never on the session's cap, hold or gap, and an owner task never waits
+on the collaborator cap. The adapter log shows `collaborator turn ->` instead of `queue ->`.
 
 ## Results
 

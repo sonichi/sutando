@@ -25,7 +25,7 @@ from ...collaborator_turn import child_env, run_collaborator_turn
 from ...task_io import (LockRefused, acquire_lock, exit_code, exit_on_sigterm, is_collaborator, make_dirs,
                         non_owner_note, release_lock, root_path, stoppable_sleep, write_atomic)
 from ...relay_loop import (HOUR, NO_ROOM, NON_OWNER_FAILED, NON_OWNER_REFUSED, TEXT_MAX, Outcome,  # noqa: F401
-                          RateLimiter, RelayLoop, build_payload, count_arg, log, result_body)
+                          RateLimiter, RelayLoop, build_payload, count_arg, log, positive_arg, result_body)
 
 API_BASE = "https://api.anthropic.com"
 API_VERSION = "2023-06-01"
@@ -95,9 +95,6 @@ class Adapter(RelayLoop):
         self.token, self.opener, self.run = token, opener, run
         self.env = child_env(environ)
         self.note = note if note is not None else non_owner_note()
-        # Collaborator turns never touch the routine, so they have their own cap, not the fire cap.
-        self.collab_limiter = RateLimiter(os.path.join(args.state, "collaborator-turns.json"),
-                                          args.max_collaborator_per_hour, clock)
         self.endpoint = "%s/v1/claude_code/routines/%s/fire" % (args.api_base.rstrip("/"), args.trigger_id)
         self.hold_path = os.path.join(args.state, "hold.json")
         try:
@@ -143,14 +140,12 @@ class Adapter(RelayLoop):
         return True
 
     def collaborator_turn(self, name, text, seen):
-        """An isolated local turn, never the routine: its reply is the result, else the plain failure line."""
+        """An isolated local turn, never the routine: its reply is the result, else the plain failure line.
+        Its cap is next_ready's gate, so a turn that reaches here only has to be counted."""
         task_id = name[:-4]
-        if self.collab_limiter.wait_seconds() > 0:
-            log("collaborator cap reached ->", task_id)
-            return self.finish(name, NON_OWNER_FAILED, seen)
         self.collab_limiter.record()
         log("collaborator turn ->", task_id)
-        turn = run_collaborator_turn(self.args.claude, text, self.env, run=self.run)
+        turn = run_collaborator_turn(self.args.claude, text, self.env, self.args.timeout, run=self.run)
         log("result <-", task_id, turn.kind, turn.detail)
         return self.finish(name, turn.text if turn.kind == "ok" else NON_OWNER_FAILED, seen)
 
@@ -173,19 +168,21 @@ def build_parser():
     ap.add_argument("--allow-collaborator", action="store_true",
                     help="serve attested collaborators (Team) on an isolated local turn: a fresh `claude -p` "
                          "with the three read tools in an empty directory, no session, no connector, no "
-                         "history; off by default, so they are refused with the same plain line")
+                         "history, and never saved (--no-session-persistence); off by default, so they are "
+                         "refused with the same plain line")
     ap.add_argument("--claude", default="claude",
                     help="the claude executable for collaborator turns (default: claude on PATH)")
     ap.add_argument("--max-per-hour", type=int, default=25,
                     help="local fire cap, 1-%d (the routine's own cap)" % ROUTINE_CAP_PER_HOUR)
-    ap.add_argument("--max-collaborator-per-hour", type=int, default=10,
-                    help="isolated collaborator turns in a sliding hour; they never count against --max-per-hour")
+    ap.add_argument("--max-collaborator-per-hour", type=positive_arg, default=10,
+                    help="isolated collaborator turns in a sliding hour, 1 or more; their own gate, so they never "
+                         "count against --max-per-hour and a fire hold never delays them")
     ap.add_argument("--max-retries", type=int, default=2,
                     help="retries per task for failures that prove the fire was not sent; anything ambiguous is never retried")
     ap.add_argument("--max-rate-limited", type=int, default=5, help="429s per task before it gets a failure result")
     ap.add_argument("--backoff", type=float, default=2.0, help="first retry delay, doubled per retry")
     ap.add_argument("--backoff-max", type=float, default=60.0)
-    ap.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout per fire")
+    ap.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout per fire, and seconds per collaborator turn")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=1.0)

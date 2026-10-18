@@ -25,6 +25,7 @@ HOUR = 3600.0
 NO_ROOM = "This message has no room to reply in, so it was not sent to the cloud agent.\n"
 # A non-owner tier never learns a status or error detail: that is the owner's connector state.
 NON_OWNER_FAILED = "This message could not be sent to the cloud agent right now.\n"
+COLLAB_LIMITER_FILE = "collaborator-turns.json"
 
 
 def log(*a):
@@ -63,6 +64,14 @@ def count_arg(text):
     n = int(text)
     if n < 0:
         raise argparse.ArgumentTypeError("must be 0 or more")
+    return n
+
+
+def positive_arg(text):
+    """argparse type for a cap: an integer of one or more."""
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
     return n
 
 
@@ -174,8 +183,12 @@ class RelayLoop:
     def init_loop(self, args, limiter_file, clock=time.time, sleep=stoppable_sleep):
         self.args, self.clock, self.sleep = args, clock, sleep
         self.limiter = RateLimiter(os.path.join(args.state, limiter_file), args.max_per_hour, clock)
+        # Collaborator turns never touch the provider, so they have their own cap, not the provider's.
+        self.collab_limiter = RateLimiter(os.path.join(args.state, COLLAB_LIMITER_FILE),
+                                          args.max_collaborator_per_hour, clock)
         self.done_path = os.path.join(args.state, "done")
         self.attempts, self.limited, self.not_before = {}, {}, {}   # task id -> pre-send failures, 429s, earliest retry
+        self.lanes = {}                                            # task name -> which gates apply
         self.blocked_until = 0.0
 
     def pending(self, seen):
@@ -212,6 +225,7 @@ class RelayLoop:
         self.attempts.pop(name[:-4], None)
         self.limited.pop(name[:-4], None)
         self.not_before.pop(name[:-4], None)
+        self.lanes.pop(name, None)
 
     def read_task(self, name, seen):
         """(headers, message, operator_lines), or None when the file is gone (marked seen)."""
@@ -252,20 +266,39 @@ class RelayLoop:
         """True for a task whose earlier attempt is already counted; it skips the send gates."""
         return False
 
+    def lane(self, name):
+        """Which gates apply: `collaborator` (its own cap) or `provider` (the hold and the cap).
+        Read once per task from the attested headers; a file that is gone is the step's to report."""
+        if name not in self.lanes:
+            try:
+                headers, _, _ = parse_task(os.path.join(self.args.inbox, name))
+            except OSError:
+                return "provider"
+            self.lanes[name] = "collaborator" if is_collaborator(headers) else "provider"
+        return self.lanes[name]
+
+    def provider_wait(self):
+        """Seconds until the provider may be called: its hold first, then its sliding-hour cap."""
+        hold = self.blocked_until - self.clock()
+        return hold if hold > 0 else self.limiter.wait_seconds()
+
     def next_ready(self, names):
+        """The first ready task whose own lane's gate is open, else how long until some gate opens."""
         now = self.clock()
         for n in names:
             if self.recovering(n):
                 return n, 0.0
-        if now < self.blocked_until:
-            return None, self.blocked_until - now
         ready = [n for n in names if self.not_before.get(n[:-4], 0) <= now]
         if not ready:
             return None, min(self.not_before[n[:-4]] for n in names) - now
-        wait = self.limiter.wait_seconds()
-        if wait > 0:
-            return None, wait
-        return ready[0], 0.0
+        waits = {}
+        for n in ready:
+            lane = self.lane(n)
+            if lane not in waits:
+                waits[lane] = self.collab_limiter.wait_seconds() if lane == "collaborator" else self.provider_wait()
+            if waits[lane] <= 0:
+                return n, 0.0
+        return None, min(waits.values())
 
     def recover(self):
         """A staged body a crash left is that task's result, unless any generation of a result

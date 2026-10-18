@@ -62,7 +62,7 @@ PUBLISHED, SETTLED = "PUBLISHED", "SETTLED"
 CALLABLE = frozenset((PREPARED, NOT_DELIVERED))
 
 FORMAT = "cloud-session/1"
-STATE_ALLOWED = frozenset(("format", "claims", "settled-ids", "rate.jsonl", "done"))
+STATE_ALLOWED = frozenset(("format", "claims", "settled-ids", "rate.jsonl", "done", "collaborator-turns.json"))
 FORMAT_TEMP = re.compile(r"\.format\.\d+\.[0-9a-f]{6}\.tmp")
 
 
