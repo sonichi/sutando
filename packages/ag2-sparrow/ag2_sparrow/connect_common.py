@@ -643,10 +643,12 @@ def _reap(child, grace: float) -> bool:
     """terminate, wait `grace`, kill, wait REAP_BOUND_S: True once the child is reaped; False when that
     cannot be confirmed within the bound, so the caller exits without releasing."""
     if child.poll() is not None:
+        _sweep(child)
         return True
     child.terminate()
     try:
         child.wait(timeout=grace)
+        _sweep(child)
         return True
     except subprocess.TimeoutExpired:
         pass
@@ -654,12 +656,30 @@ def _reap(child, grace: float) -> bool:
 
 
 def _kill_bounded(child) -> bool:
-    child.kill()
+    _kill_group(child)
     try:
         child.wait(timeout=REAP_BOUND_S)
     except subprocess.TimeoutExpired:
         return False
+    _sweep(child)
     return True
+
+
+def _kill_group(child) -> None:
+    """SIGKILL the trampoline's whole process group, the session in it: a forced stop never reaches the
+    lease holder alone. A group gone or not ours falls back to the one process."""
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        child.kill()
+
+
+def _sweep(child) -> None:
+    """Once the trampoline is reaped, nothing it ran outlives the lease it held."""
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def supervise(shape: Shape, argv: list, env: dict, popen=subprocess.Popen, pass_fds=(), map_exit=None) -> int:
@@ -678,7 +698,7 @@ def supervise(shape: Shape, argv: list, env: dict, popen=subprocess.Popen, pass_
     child = None
     try:
         child = state["child"] = supervise.child = popen(argv, stdin=subprocess.PIPE, env=env, text=True,
-                                                         pass_fds=pass_fds)
+                                                         pass_fds=pass_fds, start_new_session=True)
         if state["stop_at"] is not None:
             child.terminate()
         rc = None
@@ -692,6 +712,7 @@ def supervise(shape: Shape, argv: list, env: dict, popen=subprocess.Popen, pass_
                               file=sys.stderr)
                         return 128 + signal.SIGTERM
                     rc = child.returncode
+        _sweep(child)
         print(f"{shape.name}: child exited {rc}", file=sys.stderr)
         if state["stop_at"] is not None:
             return 128 + signal.SIGTERM

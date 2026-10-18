@@ -239,7 +239,9 @@ except OSError as e:
 json.dump({"argv": sys.argv, "env": dict(os.environ), "cwd": os.getcwd(), "pid": os.getpid(), "ppid": os.getppid(),
            "listing": listing},
           open(os.path.join(home, "claude-session.json"), "w"))
-import subprocess, time
+import signal, subprocess, time
+if read("claude-ignore-term", ""):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 if read("claude-detach", ""):
     p = subprocess.Popen(["sleep", "30"], start_new_session=True, close_fds=False)   # as a Rust Command would
     open(os.path.join(home, "claude-detached.pid"), "w").write(str(p.pid))
@@ -1685,6 +1687,7 @@ class ConnectLauncherProcess(ConnectBase):
                   "        if timeout is not None: raise subprocess.TimeoutExpired(self.args, timeout)\n"
                   "        time.sleep(600)\n"
                   "import ag2_sparrow.connect_common as cm; cm.TERM_GRACE_S = 0.2; cm.REAP_BOUND_S = 0.5\n"
+                  "cm._kill_group = lambda child: child.kill(); cm._sweep = lambda child: None\n"
                   "sys.exit(cli.run(type('A', (), {})(), popen=Immortal))")
         from ag2_sparrow import task_io
         self.configure()
@@ -1711,6 +1714,49 @@ class ConnectLauncherProcess(ConnectBase):
     def session_after(self, first_pid):
         rec = self.session()
         return None if rec is None or rec["pid"] == first_pid else rec
+
+    def test_a_forced_stop_reaches_a_session_that_ignores_sigterm(self):
+        """The trampoline keeps the lease, the session runs under it: the kill after the grace must take the
+        session too, or the release would free a root the session is still armed on."""
+        from ag2_sparrow import task_io
+        driver = ("import ag2_sparrow.connect_common as cm; cm.TERM_GRACE_S = 0.5\n"
+                  "sys.exit(cli.main(['run']))")
+        self.configure()
+        (self.home / "claude-ignore-term").write_text("1")
+        launcher, child = self.launcher(driver=driver)
+        trampoline = self.session()["ppid"]
+        self.assertEqual(os.getpgid(trampoline), trampoline, "the trampoline leads its own process group")
+        self.assertEqual(os.getpgid(child), trampoline, "and the session is in it")
+        os.kill(launcher.pid, signal.SIGTERM)
+        launcher.wait(timeout=30)                      # not communicate(): a surviving session keeps the pipes
+        try:
+            self.assertEqual(launcher.returncode, 143)
+            self.assertTrue(self.wait_gone(child, 2), "the session that ignored SIGTERM was killed with the group")
+            self.assertTrue(self.wait_gone(trampoline, 2))
+            self.assertEqual(task_io.lock_held(str(self.work)), "free")
+        finally:
+            if self.alive(child):
+                os.kill(child, signal.SIGKILL)
+        launcher.communicate(timeout=30)
+
+    def test_a_trampoline_killed_from_outside_takes_its_session_with_it_before_the_release(self):
+        """A dead trampoline has dropped the lease; the launcher sweeps its group before it releases, so no
+        session outlives the fence it was started under."""
+        from ag2_sparrow import task_io
+        self.configure()
+        launcher, child = self.launcher()
+        trampoline = self.session()["ppid"]
+        os.kill(trampoline, signal.SIGKILL)
+        launcher.wait(timeout=30)                      # not communicate(): a surviving session keeps the pipes
+        try:
+            self.assertTrue(self.wait_gone(child, 2), "the session did not outlive its trampoline")
+            self.assertEqual(task_io.lock_held(str(self.work)), "free")
+            self.assertIsInstance(holder_lock.read_holder(str(self.work)), holder_lock.Missing)
+        finally:
+            if self.alive(child):
+                os.kill(child, signal.SIGKILL)
+        _, err = launcher.communicate(timeout=30)
+        self.assertIn("child exited -9", err)
 
 
 class ConnectEnvAndPaths(ConnectBase):

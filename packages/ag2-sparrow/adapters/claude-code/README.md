@@ -189,9 +189,13 @@ starts the session through a small trampoline **parent**: it keeps the lease
 for itself (not inheritable), `fchdir`s into `tasks` under the **held root
 inode**, sets `AG2_INBOX_DIR=.` and `AG2_RESULTS_DIR=../results`, runs
 `claude` with `close_fds`, forwards `SIGTERM`/`SIGINT` to it and reaps it
-before exiting with its code. So the session's task I/O is bound to the
-inherited inode (a path replaced after the lock check is a different root it
-never lists), and no grandchild can keep the flock. The flock therefore stays
+before exiting with its code. The trampoline leads its own process group and
+the session runs in it: the launcher's kill after the grace is a group kill,
+and once the trampoline is reaped for any reason the launcher sweeps the group
+before it releases, so no session outlives the lease it was fenced under. So
+the session's task I/O is bound to the inherited inode (a path replaced after
+the lock check is a different root it never lists), and no grandchild can keep
+the flock. The flock therefore stays
 held until both the launcher and the trampoline are gone; a second launcher
 exits 75, which the systemd unit does not relaunch (a session's own exit 75
 is reported as 1). Every launcher exit reaps the child first: `SIGTERM`
