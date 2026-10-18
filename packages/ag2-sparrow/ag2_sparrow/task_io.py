@@ -169,6 +169,15 @@ def install_id():
     return holder_lock.install_id()
 
 
+# The one liveness policy, re-exported for the lifecycle's injection seam (it imports no holder_lock).
+verify_lineage = holder_lock.verify_lineage
+
+
+def process_identity():
+    """This process as a claim writer: {pid, start}, start None when unreadable (then unobserved)."""
+    return {"pid": os.getpid(), "start": holder_lock.start_time(os.getpid())}
+
+
 def lock_path(work):
     """The flock file of `work`'s one-process lock (what `lsof` names its holders by), or None."""
     try:

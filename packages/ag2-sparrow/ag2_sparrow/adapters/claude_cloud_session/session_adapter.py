@@ -23,7 +23,8 @@ from ...collaborator_turn import ENV_KEEP, child_env, run_collaborator_turn  # n
 from ...relay_loop import (COLLAB_LIMITER_FILE, NO_ROOM, NON_OWNER_FAILED, TEXT_MAX, Outcome, RateLimiter, RelayLoop,
                            build_payload, count_arg, log, nonnegative_float, positive_arg, positive_float, result_body)
 from ...task_io import (LockRefused, acquire_lock, clear_attributed_pidfile, exit_code, exit_on_sigterm,
-                        is_collaborator, make_dirs, non_owner_note, release_lock, root_path, stoppable_sleep)
+                        is_collaborator, make_dirs, non_owner_note, process_identity, release_lock, root_path,
+                        stoppable_sleep, verify_lineage)
 
 SESSION_RE = re.compile(r"session_[A-Za-z0-9]+")
 ROOM_RE = re.compile(r"![^\s:]+:\S+")
@@ -117,7 +118,8 @@ class Adapter(RelayLoop):
         self.args, self.clock, self.sleep, self.run = args, clock, sleep, run
         self.note = note if note is not None else non_owner_note()
         self.env = child_env(environ)
-        self.lc = task_lifecycle.Lifecycle(args.work, clock=clock, log=log)
+        self.lc = task_lifecycle.Lifecycle(args.work, clock=clock, log=log, identity=process_identity(),
+                                           lineage=verify_lineage)
         self.limiter = JournalGate(self.lc.journal, args.max_per_hour)
         # Collaborator turns never touch the session, so they have their own cap, outside the rate journal.
         self.collab_limiter = RateLimiter(os.path.join(args.state, COLLAB_LIMITER_FILE),
@@ -186,6 +188,9 @@ class Adapter(RelayLoop):
             rec = self.lc.claims.load(task_id)
         except task_lifecycle.ClaimUnreadable as e:
             return self.park(task_id, e)
+        if rec and rec.get("claim_mode") == task_lifecycle.LOCAL:
+            log("foreign claim (local), left alone ->", task_id)
+            return self.park(task_id, "a local claim")
         if rec and rec["phase"] not in task_lifecycle.CALLABLE:
             return self._publish(name, seen)
         task = self.read_task(name, seen)
