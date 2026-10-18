@@ -33,6 +33,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 PKG = REPO / "packages" / "ag2-sparrow"
 sys.path.insert(0, str(PKG))
@@ -88,18 +93,6 @@ ROWS = [
     ("a URL-shaped opaque bearer is a secret whole", {"REMOTE_TASK_TOKEN": URL_SHAPED_BEARER, "REMOTE_TASK_URL": GW},
      {"REMOTE_TASK_TOKEN": DEVICE_TOKEN}, {}, "", None, (URL_SHAPED_BEARER, "env", GW, "")),
 ]
-
-
-# The host variables a harness passes on; no other is copied, so no host credential selector leaks in.
-HOST_ALLOWLIST = ("PATH", "LANG", "TMPDIR")
-
-
-def hermetic_env(home: Path, extra=()) -> dict:
-    """An environment built from nothing: the allowlisted host variables, `extra`, and a temp HOME."""
-    env = {k: os.environ[k] for k in HOST_ALLOWLIST if k in os.environ}
-    env.update(extra)
-    env.update(HOME=str(home), USER="hatch")
-    return env
 
 
 def _write_env(path: Path, values: dict) -> None:
@@ -730,7 +723,7 @@ class RealSinks(unittest.TestCase):
         unit = fx.root / name
         unit.write_text(installed)
         out = io.StringIO()
-        env = hermetic_env(fx.root, fx.env)
+        env = hermetic_env(fx.root, **fx.env)
         vault, lookups = getattr(fx, "vault", ""), getattr(fx, "lookups", None)
         lookups = lookups if isinstance(lookups, list) else []
         with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
@@ -940,7 +933,7 @@ class RealSinks(unittest.TestCase):
         if drop_in:
             (unit.parent / f"{hatch_cli.SERVICE_NAME}.d").mkdir()
             (unit.parent / f"{hatch_cli.SERVICE_NAME}.d" / "override.conf").write_text(drop_in)
-        env = hermetic_env(fx.root, fx.env)
+        env = hermetic_env(fx.root, **fx.env)
         ok = subprocess.CompletedProcess([], 0, "", "")
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
@@ -987,7 +980,7 @@ class RealSinks(unittest.TestCase):
                 fx = Fixture(Path(td), ROWS[0])  # an env token, and a named token file that is refused
                 self.refuse(fx.token_file, "non-utf8")
                 fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
-                env = hermetic_env(fx.root, fx.env)
+                env = hermetic_env(fx.root, **fx.env)
                 spawned = []
 
                 def popen(cmd, env=None, **_kw):

@@ -23,6 +23,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
@@ -127,15 +133,8 @@ def run_main(main, args, env):
     return types.SimpleNamespace(returncode=rc, stdout=out.getvalue(), stderr=err.getvalue())
 
 
-# The host variables a harness passes on; no other is copied, so no host credential selector leaks in.
-HOST_ALLOWLIST = ("PATH", "LANG", "TMPDIR", "USER")
-
-
 def py_env(home):
-    env = {k: os.environ[k] for k in HOST_ALLOWLIST if k in os.environ}
-    env["HOME"] = str(home)
-    env["PYTHONPATH"] = str(PKG_ROOT)
-    return env
+    return hermetic_env(home, PYTHONPATH=str(PKG_ROOT))
 
 
 class Base(unittest.TestCase):
