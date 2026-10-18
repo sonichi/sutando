@@ -6,6 +6,7 @@ No network beyond 127.0.0.1 and no real token. Run:
 import contextlib
 import http.server
 import io
+import itertools
 import json
 import os
 import re
@@ -78,8 +79,12 @@ def fake_server(script):
         srv.server_close()
 
 
+T0 = 1_800_000_000.0
+_WRITES = itertools.count()
+
+
 class FakeClock:
-    def __init__(self, t=1_800_000_000.0):
+    def __init__(self, t=T0):
         self.t = t
         self.sleeps = []
 
@@ -104,8 +109,9 @@ def write_task(work, tid, body, tier="owner", channel="!room:ag2.space", thread=
     p = Path(work) / "tasks" / (tid + ".txt")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    if mtime is not None:
-        os.utime(p, (mtime, mtime))
+    # An explicit mtime is an ordering key; every fixture sits seconds before the fake clock's start.
+    t = T0 - 6 + (mtime / 1000.0 if mtime is not None else 1 + next(_WRITES) * 1e-3)
+    os.utime(p, (t, t))
     return p
 
 
@@ -408,7 +414,7 @@ class FireLoopTest(unittest.TestCase):
             write_task(d, "task-o", "owner asks", mtime=1400)
             run = FakeRun()
             ad, err = run_adapter(d, base, once=5, run=run, environ=LEAKY_ENV, claude="/opt/cli/claude",
-                                  allow_collaborator=True)
+                                  allow_collaborator=True, collaborator_timeout=9)
             self.assertEqual(len(srv.requests), 1, "only the owner reached the routine")
             self.assertIn("tier=owner", srv.requests[0]["body"]["text"])
             self.assertNotIn("SECRET-MARKER", json.dumps(srv.requests))
@@ -416,7 +422,10 @@ class FireLoopTest(unittest.TestCase):
             self.assertEqual(call["argv"], ["/opt/cli/claude", "-p", "--safe-mode", "--restricted", "--strict-mcp-config",
                                             "--no-session-persistence", "--tools", "Read,Grep,Glob", "--output-format",
                                             "json"])
-            self.assertEqual(call["timeout"], 5.0, "the adapter's own --timeout")
+            self.assertEqual(call["timeout"], 9.0, "--collaborator-timeout, not the HTTP --timeout (5 here)")
+            self.assertEqual(ra.build_parser().get_default("collaborator_timeout"), 30.0,
+                             "the fire's own default: the turn blocks the loop, so no longer than before")
+            self.assertEqual(ra.build_parser().get_default("collaborator_max_age"), 1800.0)
             for flag in ("--cloud", "--resume", "-r", "--dangerously-skip-permissions", "--permission-mode", "--bare"):
                 self.assertNotIn(flag, call["argv"], flag)
             self.assertNotIn("SECRET-MARKER", " ".join(call["argv"]), "the text goes on stdin")
@@ -525,6 +534,52 @@ class FireLoopTest(unittest.TestCase):
             self.assertEqual(run.calls, [])
             self.assertFalse((Path(d) / "results" / "task-c.txt").exists())
             self.assertLess(clock.t - start, rl.HOUR)
+
+    def test_a_collaborator_task_that_waited_past_the_max_age_gets_the_line_and_no_turn(self):
+        with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (srv, base):
+            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
+            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            run, clock = FakeRun(), FakeClock()
+            start = clock.t
+            # Cap 1: c2 is seen at once but waits for the window, which is longer than the max age.
+            ad, err = run_adapter(d, base, clock=clock, once=1, run=run, max_collaborator_per_hour=1,
+                                  allow_collaborator=True, collaborator_max_age=600)
+            self.assertEqual(result(d, "task-c1"), "Hello from the turn", "fresh: it ran")
+            self.assertIsNone(ad.next_ready(["task-c2.txt"])[0], "the next poll sees c2 waiting on the cap")
+            self.assertLessEqual(ad.seen_at["task-c2.txt"], clock.t)
+            clock.t += 1000                  # past the max age, still inside the full cap's window
+            self.assertEqual(ad.next_ready(["task-c2.txt"]), ("task-c2.txt", 0.0),
+                             "stale: the ungated lane, ahead of the full cap")
+            ad.args.once = 2
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                ad.serve()
+            self.assertEqual(result(d, "task-c2"), rl.NON_OWNER_FAILED, "stale: the line, no turn")
+            self.assertEqual(len(run.calls), 1)
+            self.assertIn("collaborator task waited too long -> task-c2", err_buf.getvalue())
+            self.assertEqual(srv.requests, [])
+            self.assertEqual(json.loads(Path(ad.args.state, rl.COLLAB_LIMITER_FILE).read_text()), [start],
+                             "the stale rejection consumed no cap entry: the file still holds only the first turn")
+
+    def test_a_backlog_task_aged_past_the_cutoff_by_the_turn_before_it_gets_the_line(self):
+        with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (srv, base):
+            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
+            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            clock, inner = FakeClock(), FakeRun()
+
+            def slow_run(argv, **kw):
+                clock.t += 20            # the first turn itself takes longer than the max age
+                return inner(argv, **kw)
+            start = clock.t
+            ad, err = run_adapter(d, base, clock=clock, once=2, run=slow_run, allow_collaborator=True,
+                                  collaborator_max_age=10)
+            self.assertEqual(result(d, "task-c1"), "Hello from the turn")
+            self.assertEqual(result(d, "task-c2"), rl.NON_OWNER_FAILED, "seen at the first scan, aged by the turn before it")
+            self.assertEqual(len(inner.calls), 1, "exactly one turn")
+            self.assertIn("collaborator task waited too long -> task-c2", err)
+            self.assertEqual(srv.requests, [])
+            self.assertEqual(ad.collab_limiter.times, [start], "the stale rejection consumed no cap entry")
+            self.assertEqual(json.loads(Path(ad.args.state, rl.COLLAB_LIMITER_FILE).read_text()), [start])
 
     def test_refused_tasks_are_never_held_behind_a_saturated_cap(self):
         with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (srv, base):

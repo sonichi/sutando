@@ -6,6 +6,12 @@ unreachable, is replayed idempotently by the next pass (an incomplete row resume
 is listed once as "not yet in the room"; a host reads only its own rows; code never
 writes the owner's Status and never reopens a closed row; the reminder sends nothing
 unless asked. No real room is touched: the room-collab capability is a fake."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import contextlib
 import importlib.util

@@ -23,6 +23,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
@@ -128,13 +134,7 @@ def run_main(main, args, env):
 
 
 def py_env(home):
-    # CLAUDE_CONFIG_DIR names a channel .env the bridge would read a live token from.
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("REMOTE_", "AG2_", "AGENT_CONNECT_", "SPARROW_"))
-           and k != "CLAUDE_CONFIG_DIR"}
-    env["HOME"] = str(home)
-    env["PYTHONPATH"] = str(PKG_ROOT)
-    return env
+    return hermetic_env(home, PYTHONPATH=str(PKG_ROOT))
 
 
 class Base(unittest.TestCase):
@@ -1147,7 +1147,8 @@ class Cli(Base):
         self.state.mkdir()
         (self.state / "gateway-status.blue.json").write_text(
             json.dumps({"connected": True, "ts": 1000}))
-        with mock.patch.dict(os.environ, {"GATEWAY_INSTANCE": "blue"}):
+        with mock.patch.dict(os.environ, py_env(self.home), clear=True), \
+                mock.patch.dict(os.environ, {"GATEWAY_INSTANCE": "blue"}):
             code, detail = hatch_cli.check_sparrow(self.state, now=1010)
             self.assertEqual(code, hatch_cli.SPARROW_OK, detail)
             code, _ = hatch_cli.check_sparrow(self.state, now=1010, instance="")

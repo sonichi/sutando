@@ -1090,8 +1090,8 @@ class BridgeImportIsHermetic(unittest.TestCase):
         assert_hermetic(self, _IMPORT_READS)
 
     def test_the_checker_flags_a_host_read_and_a_vault_lookup(self):
-        from _helpers.hermetic_gateway import host_reads
-        flagged = host_reads([('file', str(Path.home() / '.claude' / 'channels' / 'x.env')),
+        from _helpers.hermetic_gateway import HOST_HOME, host_reads
+        flagged = host_reads([('file', str(HOST_HOME / '.claude' / 'channels' / 'x.env')),
                               ('proc', 'security find-generic-password -s REMOTE_TASK_TOKEN -w')])
         self.assertEqual(len(flagged), 2, flagged)
 

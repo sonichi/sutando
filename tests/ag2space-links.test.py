@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """src/ag2space_links.py: the shapes of the links that open AG2 Space inside the app, each
 caller's delegation to it, and no other link builder in the tree."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import re
 import subprocess

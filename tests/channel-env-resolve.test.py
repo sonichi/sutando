@@ -21,6 +21,11 @@ Run: python3 tests/channel-env-resolve.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import io
 import os
@@ -270,7 +275,7 @@ class TestShellWrapper(_Base):
     """The wrapper is what callers actually invoke; pin its stdout + exit codes."""
 
     def _run(self, config_dir: Path, source: str = "ag2space", **env):
-        environ = dict(os.environ)
+        environ = isolated_child_env()
         environ["CLAUDE_CONFIG_DIR"] = str(config_dir)
         for k in _AMBIENT:
             environ.pop(k, None)

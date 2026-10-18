@@ -19,6 +19,12 @@ import sys
 import tempfile
 import time
 
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC_DIR = PKG_ROOT.parents[1] / "src"
 STALE_S = 3
@@ -72,15 +78,14 @@ def _spawn(base, pass_max, warmup=0):
     for sub in ("tasks", "results", "state"):
         (base / sub).mkdir()
     started, gate = base / "started", base / "gate"
-    env = {**os.environ,
-           "AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
+    env = hermetic_env(**{"AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
            "AGENT_CONNECT_RESULT_DIR": str(base / "results"),
            "AGENT_CONNECT_STATE_DIR": str(base / "state"),
            "REMOTE_TASK_URL": "https://gw.example/relay",
            "REMOTE_TASK_TOKEN": "dummy-secret",
            "SUTANDO_SUPERVISED": "1",
            "PROBE_STARTED": str(started), "PROBE_GATE": str(gate),
-           "PROBE_PASS_MAX": str(pass_max), "PROBE_WARMUP": str(warmup)}
+           "PROBE_PASS_MAX": str(pass_max), "PROBE_WARMUP": str(warmup)})
     env.pop("SUTANDO_BRIDGE_LOCK", None)
     child = subprocess.Popen([sys.executable, "-c", _CHILD % (str(PKG_ROOT), str(SRC_DIR), STALE_S)],
                              env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

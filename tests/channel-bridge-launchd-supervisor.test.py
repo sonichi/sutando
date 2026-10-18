@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import os
 import plistlib
 import shutil
@@ -80,7 +85,7 @@ def test_wrapper_restart_signal() -> None:
         shims = root / "shims"; shims.mkdir(exist_ok=True)
         (shims / "osascript").write_text("#!/bin/bash\nexit 0\n")
         (shims / "osascript").chmod(0o755)
-        env = os.environ.copy()
+        env = isolated_child_env()
         env.update({
             "PATH": f"{shims}:{env.get('PATH','')}",
             "SUTANDO_CHANNEL_BRIDGE_PYTHON": str(fake_python),
@@ -134,7 +139,7 @@ def _stage_clean_exit(root, rc=75):
     shims = root / "shims"; shims.mkdir(exist_ok=True)
     (shims / "osascript").write_text("#!/bin/bash\nexit 0\n")
     (shims / "osascript").chmod(0o755)
-    env = os.environ.copy()
+    env = isolated_child_env()
     env.update({
         "PATH": f"{shims}:{env.get('PATH','')}",
         "SUTANDO_CHANNEL_BRIDGE_PYTHON": str(fake_python),

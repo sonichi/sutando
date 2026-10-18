@@ -12,6 +12,12 @@ request on stdin. Two desktop-install failures are pinned here:
 
 No real room is touched: the capability is a fake that records what it was handed.
 """
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib
 import io
@@ -99,7 +105,7 @@ class ServeProcess(unittest.TestCase):
         (self.scripts / "room_collab_client.py").write_text(FAKE_CLIENT)
         self.seen = self.tmp / "seen.json"
         self.config = self.tmp / "claude-config"
-        self.env = {k: v for k, v in os.environ.items()
+        self.env = {k: v for k, v in isolated_child_env().items()
                     if k not in CRED_VARS and k not in ("AG2_DEVICE_ENV", "CLAUDE_HOME")}
         self.env.update({"FAKE_SEEN": str(self.seen), "CLAUDE_CONFIG_DIR": str(self.config)})
 
@@ -187,7 +193,7 @@ class InProcess(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="pq-inproc-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.config = self.tmp / "claude-config"
-        base = {k: v for k, v in os.environ.items()
+        base = {k: v for k, v in isolated_child_env().items()
                 if k not in CRED_VARS and k not in ("AG2_DEVICE_ENV", "CLAUDE_HOME")}
         base["CLAUDE_CONFIG_DIR"] = str(self.config)
         patcher = mock.patch.dict(os.environ, base, clear=True)

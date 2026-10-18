@@ -7,6 +7,7 @@ cap kept on disk, and the task/result loop (priority order, done ledger, retry t
 subclasses `RelayLoop`, implements `step()`, and keeps only its own transport. Stdlib only.
 """
 import argparse
+import math
 import json
 import os
 import re
@@ -73,6 +74,22 @@ def positive_arg(text):
     if n < 1:
         raise argparse.ArgumentTypeError("must be 1 or more")
     return n
+
+
+def positive_float(text):
+    """argparse type for a timeout: finite seconds, more than 0."""
+    x = float(text)
+    if not (math.isfinite(x) and x > 0):
+        raise argparse.ArgumentTypeError("must be a finite number more than 0")
+    return x
+
+
+def nonnegative_float(text):
+    """argparse type for an age bound: finite seconds, 0 or more (0 means off)."""
+    x = float(text)
+    if not (math.isfinite(x) and x >= 0):
+        raise argparse.ArgumentTypeError("must be a finite number, 0 or more")
+    return x
 
 
 class Outcome:
@@ -188,7 +205,7 @@ class RelayLoop:
                                           args.max_collaborator_per_hour, clock)
         self.done_path = os.path.join(args.state, "done")
         self.attempts, self.limited, self.not_before = {}, {}, {}   # task id -> pre-send failures, 429s, earliest retry
-        self.lanes = {}                                            # task name -> which gates apply
+        self.lanes, self.seen_at = {}, {}                         # task name -> which gates apply, first seen
         self.blocked_until = 0.0
 
     def pending(self, seen):
@@ -226,6 +243,7 @@ class RelayLoop:
         self.limited.pop(name[:-4], None)
         self.not_before.pop(name[:-4], None)
         self.lanes.pop(name, None)
+        self.seen_at.pop(name, None)
 
     def read_task(self, name, seen):
         """(headers, message, operator_lines), or None when the file is gone (marked seen)."""
@@ -286,6 +304,18 @@ class RelayLoop:
                                 "collaborator" if kind == "collaborator" else "provider")
         return self.lanes[name]
 
+    def first_seen(self, name, now):
+        """When the task began waiting: its file time when that is earlier than this scan, so time in the
+        inbox before a restart or a hand-over counts too; a gone file is the step's to report."""
+        try:
+            return min(now, os.stat(os.path.join(self.args.inbox, name)).st_mtime)
+        except OSError:
+            return now
+
+    def too_old(self, name):
+        """True once a task has waited past --collaborator-max-age (0: never) since it was first seen."""
+        return 0 < self.args.collaborator_max_age < self.clock() - self.seen_at.get(name, self.clock())
+
     def lane_wait(self, lane):
         if lane == "refuse":
             return 0.0
@@ -297,8 +327,12 @@ class RelayLoop:
         return hold if hold > 0 else self.limiter.wait_seconds()
 
     def next_ready(self, names):
-        """The first ready task whose own lane's gate is open, else how long until some gate opens."""
+        """The first ready task whose own lane's gate is open, else how long until some gate opens.
+        Every task in the scan is stamped as seen, selected or not: its age runs from its first scan."""
         now = self.clock()
+        for n in names:
+            if n not in self.seen_at:
+                self.seen_at[n] = self.first_seen(n, now)
         for n in names:
             if self.recovering(n):
                 return n, 0.0
@@ -308,6 +342,8 @@ class RelayLoop:
         waits = {}
         for n in ready:
             lane = self.lane(n)
+            if lane == "collaborator" and self.too_old(n):
+                lane = "refuse"      # the step answers it with the line, no turn: it waits on no cap
             if lane not in waits:
                 waits[lane] = self.lane_wait(lane)
             if waits[lane] <= 0:

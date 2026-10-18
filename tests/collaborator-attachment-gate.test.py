@@ -7,6 +7,12 @@ withheld attach-only result is quarantined so an owner word can release it.
 Path authorization is deliberately absent here — it stays with the transport
 allowlist (one owner: src/policy/egress/attachment.py).
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os

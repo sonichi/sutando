@@ -6,6 +6,7 @@ script of canned outputs. No network, no real CLI. Run:
 """
 import contextlib
 import io
+import itertools
 import json
 import os
 import re
@@ -85,8 +86,12 @@ class Fake:
         return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
 
 
+T0 = 1_800_000_000.0
+_WRITES = itertools.count()
+
+
 class FakeClock:
-    def __init__(self, t=1_800_000_000.0):
+    def __init__(self, t=T0):
         self.t = t
         self.sleeps = []
 
@@ -113,8 +118,9 @@ def write_task(work, tid, body, tier="owner", channel="!room:ag2.space", thread=
     p = Path(work) / "tasks" / (tid + ".txt")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    if mtime is not None:
-        os.utime(p, (mtime, mtime))
+    # An explicit mtime is an ordering key; every fixture sits seconds before the fake clock's start.
+    t = T0 - 6 + (mtime / 1000.0 if mtime is not None else 1 + next(_WRITES) * 1e-3)
+    os.utime(p, (t, t))
     return p
 
 
@@ -555,13 +561,89 @@ class QueueLoopTest(unittest.TestCase):
             self.assertAlmostEqual(wait, rl.HOUR, delta=11.0)
             self.assertEqual(ad.next_ready(["task-c2.txt", "task-g2.txt"]), ("task-g2.txt", 0.0), "the refusal goes first")
 
-    def test_a_collaborator_turn_uses_the_adapters_timeout(self):
+    def test_a_collaborator_turn_uses_collaborator_timeout(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [turn_ok()])
             write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
             with mock.patch.object(sa.subprocess, "run", wraps=subprocess.run) as spy:
-                run_adapter(d, fake, run=sa.subprocess.run, once=1, allow_collaborator=True, timeout=7)
-            self.assertEqual(spy.call_args.kwargs["timeout"], 7.0)
+                run_adapter(d, fake, run=sa.subprocess.run, once=1, allow_collaborator=True, collaborator_timeout=7)
+            self.assertEqual(spy.call_args.kwargs["timeout"], 7.0, "--collaborator-timeout, not --timeout (10 here)")
+            self.assertEqual(sa.build_parser().get_default("collaborator_timeout"), 60.0)
+            self.assertEqual(sa.build_parser().get_default("collaborator_max_age"), 1800.0)
+
+    def test_a_non_owner_turn_under_allow_non_owner_never_carries_owner_dm(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok(1), ok(2)])
+            write_task(d, "task-g", "guest asks", tier="guest", mtime=1000)
+            write_task(d, "task-o", "owner asks", mtime=2000)
+            run_adapter(d, fake, once=2, allow_non_owner=True, owner_dm="!dm:ag2.space")
+            guest, owner = fake.calls()
+            self.assertIn("tier=guest", text_of(guest))
+            for owner_only in ("owner_dm", "!dm:ag2.space"):
+                self.assertNotIn(owner_only, text_of(guest))
+            self.assertIn("owner_dm=!dm:ag2.space", text_of(owner))
+            self.assertNotIn("owner_dm", sa.build_text("t", {"access_tier": "team", "channel_id": "!r:x"}, "m",
+                                                       owner_dm="!dm:x")[1])
+
+    def test_settling_drops_the_lane_and_first_seen_records(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok("one")])
+            write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
+            ad, _ = run_adapter(d, fake, once=1, allow_collaborator=True)
+            self.assertEqual((ad.lanes, ad.seen_at), ({}, {}))
+            ad.lanes["task-x.txt"], ad.seen_at["task-x.txt"] = "provider", 1.0
+            ad._settled("task-x.txt", set())
+            self.assertEqual((ad.lanes, ad.seen_at), ({}, {}))
+
+    def test_a_collaborator_task_that_waited_past_the_max_age_gets_the_line_and_no_turn(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok("one")])
+            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
+            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            clock = FakeClock()
+            start = clock.t
+            ad, _ = run_adapter(d, fake, clock=clock, once=1, max_collaborator_per_hour=1, allow_collaborator=True,
+                                collaborator_max_age=600)
+            self.assertEqual(result(d, "task-c1"), "one", "fresh: it ran")
+            self.assertIsNone(ad.next_ready(["task-c2.txt"])[0], "the next poll sees c2 waiting on the cap")
+            self.assertLessEqual(ad.seen_at["task-c2.txt"], clock.t)
+            clock.t += 1000                  # past the max age, still inside the full cap's window
+            self.assertEqual(ad.next_ready(["task-c2.txt"]), ("task-c2.txt", 0.0),
+                             "stale: the ungated lane, ahead of the full cap")
+            ad.args.once = 2
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf), mock.patch.object(ad.lc, "prepare", wraps=ad.lc.prepare) as prepare:
+                ad.serve()
+            self.assertEqual(result(d, "task-c2"), rl.NON_OWNER_FAILED, "stale: the line, no turn")
+            self.assertEqual(len(fake.calls()), 1)
+            self.assertEqual(prepare.call_count, 0, "no claim was prepared for the stale task")
+            self.assertEqual(claim(d, "task-c2")["attempt"], 0)
+            self.assertIn("collaborator task waited too long -> task-c2", err_buf.getvalue())
+            self.assertEqual(json.loads(Path(ad.args.state, rl.COLLAB_LIMITER_FILE).read_text()), [start],
+                             "the stale rejection consumed no cap entry: the file still holds only the first turn")
+
+    def test_a_backlog_task_aged_past_the_cutoff_by_the_turn_before_it_gets_the_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok("one"), turn_ok("two")])
+            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
+            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            clock = FakeClock()
+
+            def slow_run(argv, **kw):
+                clock.t += 20            # the first turn itself takes longer than the max age
+                return subprocess.run(argv, **kw)
+            start = clock.t
+            with mock.patch.object(lc.Lifecycle, "prepare", autospec=True, side_effect=lc.Lifecycle.prepare) as prepare:
+                ad, err = run_adapter(d, fake, clock=clock, run=slow_run, once=2, allow_collaborator=True,
+                                      collaborator_max_age=10)
+            self.assertEqual([c.args[1] for c in prepare.call_args_list], ["task-c1"], "one claim, for the turn that ran")
+            self.assertEqual(result(d, "task-c1"), "one")
+            self.assertEqual(result(d, "task-c2"), rl.NON_OWNER_FAILED, "seen at the first scan, aged by the turn before it")
+            self.assertEqual(len(fake.calls()), 1, "exactly one turn")
+            self.assertEqual(claim(d, "task-c2")["attempt"], 0, "no call was prepared")
+            self.assertIn("collaborator task waited too long -> task-c2", err)
+            self.assertEqual(ad.collab_limiter.times, [start], "the stale rejection consumed no cap entry")
+            self.assertEqual(json.loads(Path(ad.args.state, rl.COLLAB_LIMITER_FILE).read_text()), [start])
 
     def test_a_collaborator_reply_never_executes_delivery_protocol(self):
         from ag2_sparrow.result_markers import parse_markers

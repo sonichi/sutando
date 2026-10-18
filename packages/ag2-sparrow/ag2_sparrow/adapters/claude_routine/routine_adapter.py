@@ -25,7 +25,8 @@ from ...collaborator_turn import child_env, run_collaborator_turn
 from ...task_io import (LockRefused, acquire_lock, exit_code, exit_on_sigterm, is_collaborator, make_dirs,
                         non_owner_note, release_lock, root_path, stoppable_sleep, write_atomic)
 from ...relay_loop import (HOUR, NO_ROOM, NON_OWNER_FAILED, NON_OWNER_REFUSED, TEXT_MAX, Outcome,  # noqa: F401
-                          RateLimiter, RelayLoop, build_payload, count_arg, log, positive_arg, result_body)
+                          RateLimiter, RelayLoop, build_payload, count_arg, log, nonnegative_float, positive_arg,
+                          positive_float, result_body)
 
 API_BASE = "https://api.anthropic.com"
 API_VERSION = "2023-06-01"
@@ -143,9 +144,12 @@ class Adapter(RelayLoop):
         """An isolated local turn, never the routine: its reply is the result, else the plain failure line.
         Its cap is next_ready's gate, so a turn that reaches here only has to be counted."""
         task_id = name[:-4]
+        if self.too_old(name):
+            log("collaborator task waited too long ->", task_id)
+            return self.finish(name, NON_OWNER_FAILED, seen)
         self.collab_limiter.record()
         log("collaborator turn ->", task_id)
-        turn = run_collaborator_turn(self.args.claude, text, self.env, self.args.timeout, run=self.run)
+        turn = run_collaborator_turn(self.args.claude, text, self.env, self.args.collaborator_timeout, run=self.run)
         log("result <-", task_id, turn.kind, turn.detail)
         return self.finish(name, turn.text if turn.kind == "ok" else NON_OWNER_FAILED, seen)
 
@@ -182,7 +186,14 @@ def build_parser():
     ap.add_argument("--max-rate-limited", type=int, default=5, help="429s per task before it gets a failure result")
     ap.add_argument("--backoff", type=float, default=2.0, help="first retry delay, doubled per retry")
     ap.add_argument("--backoff-max", type=float, default=60.0)
-    ap.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout per fire, and seconds per collaborator turn")
+    ap.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout per fire")
+    ap.add_argument("--collaborator-timeout", type=positive_float, default=30.0,
+                    help="seconds per collaborator turn, more than 0. The turn runs inside the one serve loop, so "
+                         "raising this delays any owner fire that arrives meanwhile by up to that much")
+    ap.add_argument("--collaborator-max-age", type=nonnegative_float, default=1800.0,
+                    help="a collaborator task that waited longer than this many seconds gets the plain failure line "
+                         "at once instead of a turn, counted since the task was first seen in a pending scan, or "
+                         "its file time if earlier; a restart does not reset it. 0 turns the cut-off off")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=1.0)

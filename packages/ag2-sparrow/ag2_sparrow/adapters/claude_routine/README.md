@@ -69,7 +69,9 @@ owner path is unchanged.
 --no-session-persistence --tools Read,Grep,Glob --output-format json`, the same payload on stdin (one lead
 line naming the situation, then the note, `collaborator=true`, never `owner_dm`), in a fresh empty temp
 directory removed afterwards, with an environment of only `PATH`, `HOME`, `USER`, `LANG` and
-`CLAUDE_CONFIG_DIR`, and the adapter's `--timeout`. What it can reach: the CLI's login and the three read
+`CLAUDE_CONFIG_DIR`, bounded by `--collaborator-timeout` (default 30 s; the HTTP `--timeout` is the fire's
+alone). The turn runs synchronously inside the one serve loop: an owner task that arrives while it runs
+waits for it, so raising this delays owner fires by up to that much. What it can reach: the CLI's login and the three read
 tools over an empty directory. What it cannot: the routine and its connector, any session or history (no
 `--cloud`, no `--resume`, and the turn itself is never saved, so nothing can resume it), Bash or
 code-running tools, the web, MCP servers, CLAUDE.md, hooks, skills, settings, or the work dir. The JSON
@@ -81,7 +83,13 @@ the originating room. Any failure (non-zero exit, no `result`, timeout, no temp 
 generic "could not be sent" line — one try, no retry. These turns have their own cap,
 `--max-collaborator-per-hour` (1 or more, default 10, `state/collaborator-turns.json`), and their own gate:
 a collaborator waits only on that cap, never on `--max-per-hour` or a 429 hold, and an owner task waits
-only on its own gates, never on the collaborator cap.
+only on its own gates, never on the collaborator cap. A turn is never counted against the owner provider's
+limiter; it still costs the owner's Claude plan. A task that has waited longer than `--collaborator-max-age`
+(default 1800 s; 0 turns the cut-off off) gets the generic line instead of a turn, so a burst is not answered
+hours late. The wait counts since the task was first seen in a pending scan, or its file time if earlier; a
+restart does not reset it. The line goes out at once: a stale task takes the ungated lane and never waits on
+the collaborator cap. This adapter keeps no call journal: a crash mid-turn re-runs the turn
+on restart, counted twice against the collaborator cap, with one result.
 
 ## Results: why `[no-send]`
 

@@ -25,6 +25,12 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parents[1] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -566,7 +572,7 @@ def main() -> int:
             for name, body in files.items():
                 with open(_os.path.join(ch, name), "w", encoding="utf-8", newline="\n") as fh:
                     fh.write(body)
-            env = dict(_os.environ, CLAUDE_CONFIG_DIR=d, SUTANDO_PY=sys.executable)
+            env = isolated_child_env(CLAUDE_CONFIG_DIR=d, SUTANDO_PY=sys.executable)
             r = _sp.run([_bash, _helper, "ag2space"], capture_output=True,
                         text=True, env=env, timeout=30)
             return r.returncode, r.stdout.strip()

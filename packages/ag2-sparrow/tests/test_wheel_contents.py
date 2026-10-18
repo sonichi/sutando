@@ -16,6 +16,12 @@ import tempfile
 import venv
 import zipfile
 
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = PKG_ROOT / "ag2_sparrow"
 # Non-Python files the code reads at run time (package-data in pyproject.toml).
@@ -73,11 +79,8 @@ def main():
         print(f"PASS wheel+sdist ship all {len(expected)} packages: {', '.join(expected)}")
 
         _run([py, "-m", "pip", "install", "--quiet", "--no-deps", "--no-index", str(whl)])
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("REMOTE_TASK_", "AG2_", "SUTANDO_"))
-               and k != "CLAUDE_CONFIG_DIR"}  # names a channel .env holding a live token
-        env["AGENT_CONNECT_STATE_DIR"] = str(d / "state")
-        env["PYTHONPATH"] = ""
+        (d / "import-home").mkdir()
+        env = hermetic_env(d / "import-home", AGENT_CONNECT_STATE_DIR=str(d / "state"), PYTHONPATH="")
         # Run from the temp dir so the source tree cannot shadow the installed copy.
         _run([py, "-c", "import ag2_sparrow.remote_gateway_bridge, ag2_sparrow.outbox_cli, ag2_sparrow.holder_lock"],
              cwd=d, env=env)
