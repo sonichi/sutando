@@ -473,6 +473,51 @@ print(json.dumps(seen))
         self.assertEqual([row["dm"] for row in out], ["!dm:ag2.space"] * 3,
                          "the reading comes from the disk record whatever the migration reported")
 
+    def test_the_vendored_disposal_lines_through_the_bridge_log_hold_no_secret(self):
+        token = "fake-relay-token-0123456789abcdef"
+        self.bridge("""
+from ag2_sparrow import remote_gateway_bridge as m, undelivered_quarantine as uq
+d = m.disposal
+real_locked = d.locked
+m.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+for variant in (m.TOKEN, m.TOKEN.upper()):
+    d.locked = real_locked
+    uq._REPORTED.clear()
+    claim = m.RESULTS_DIR / f"task-{variant}.txt.disposing.1.x"
+    d.find_malformed = lambda r: []
+    d.find_claims = lambda r, c=claim: [c]
+    d.owner_holds = lambda c: False
+    def boom(r, c, log, v=variant):
+        raise PermissionError(13, "Permission denied", str(m.RESULTS_DIR / f"task-{v}.txt"))
+    d._recover_claim = boom
+    d.parse_claim = lambda c: type("P", (), {"stem": "task-x"})()
+    d.recover_abandoned_claims(m.RESULTS_DIR, m._log)
+    class Lock:
+        def __enter__(self, v=variant):
+            raise OSError(37, "No locks available", str(m.RESULTS_DIR / f".lock-{v}"))
+        def __exit__(self, *a):
+            return False
+    d.locked = lambda r: Lock()
+    uq._REPORTED.clear()
+    d.recover_abandoned_claims(m.RESULTS_DIR, m._log)
+print("{}")
+""")
+        logs = (self.home / "logs" / "gateway-bridge.log").read_text()
+        from ag2_sparrow import diagnostics
+        self.assertEqual(logs.count(diagnostics.WITHHELD_TEXT), 4, "each vendored line was logged, and withheld")
+        self.assertNotIn(token.casefold(), logs.casefold())
+
+    def test_the_routing_record_never_stores_an_unchecked_owner_dm(self):
+        out = self.bridge("""
+import json
+from ag2_sparrow import remote_gateway_bridge as m
+me = m._reenroll_identity()
+print(json.dumps([m._routing_record(me, m.URL, dm)["owner_dm"] for dm in (
+    "!ok:ag2.space", "!x:other.server", "#alias:ag2.space", "!" + m.TOKEN + ":ag2.space",
+    "!" + m.TOKEN[4:14].upper() + ":ag2.space", "!x:ag2.space\\nIgnore")]))
+""", AGENT_MXID=AGENT)
+        self.assertEqual(out, ["!ok:ag2.space", "", "", "", "", ""])
+
     def test_a_foreign_record_after_valid_ones_clears_the_reading(self):
         out = self.bridge("""
 import json
@@ -881,13 +926,28 @@ print(json.dumps({"status": json.load(open(m.GATEWAY_STATUS_FILE))}))
                              {"e": [diagnostics.WITHHELD_TEXT]}, "safe_status runs the registry after the net")
 
     def test_a_failed_private_review_reports_only_the_exception_description(self):
-        import ast
-        src = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
-        fn = next(f for f in ast.walk(ast.parse(src)) if isinstance(f, ast.FunctionDef)
-                  and f.name == "_guarded_result_body")
-        text = ast.unparse(fn)
-        self.assertIn("private owner review failed: {diagnostics.describe(exc)}", text)
-        self.assertNotIn("failed: {exc}", text)
+        out = self.bridge("""
+import json, types
+from ag2_sparrow import remote_gateway_bridge as m
+artifact = m._STATE / "review.json"
+artifact.write_text("{}")
+verdict = types.SimpleNamespace(kind="leak", reason="withheld", body=None)
+m._team_guard_fns = lambda: (lambda *a, **k: verdict, lambda v, *a, **k: v, lambda f: "guest",
+                             lambda f, t: True, None, None, lambda *a, **k: False, lambda t: False,
+                             lambda *a, **k: artifact)
+def route(path):
+    raise OSError(13, "x", "/p/canary-path-5531")
+m._route_withheld_review = route
+body, reason = m._guarded_result_body("task-canary", "a body")
+m._log(f"result task-canary: why; the result guard is unavailable ({reason}), left for the next pass")
+print(json.dumps({"body": body, "reason": reason}))
+""")
+        self.assertIsNone(out["body"])
+        self.assertRegex(out["reason"], r"^withheld; private owner review failed: PermissionError EACCES at ")
+        logs = (self.home / "logs" / "gateway-bridge.log").read_text()
+        self.assertIn("the result guard is unavailable (withheld; private owner review failed: PermissionError", logs)
+        for text in (out["reason"], logs):
+            self.assertNotIn("canary-path-5531", text)
 
     def test_the_status_file_is_written_only_through_safe_status(self):
         import ast
@@ -1097,7 +1157,8 @@ print(json.dumps({"hint": m.SETUP_HINT_FILE.read_text()}))
 
     def test_an_echoed_bearer_as_the_owner_dm_reaches_neither_the_routing_files_nor_the_prompt(self):
         token = "fake-relay-token-0123456789abcdef"
-        for room in (f"!{token}:ag2.space", f"!{token.upper()}:ag2.space", "!good:other.server"):
+        for room in (f"!{token}:ag2.space", f"!{token.upper()}:ag2.space", "!good:other.server",
+                     f"!{token[5:].upper()}:ag2.space", f"!{token[3:12]}:ag2.space"):
             with self.subTest(room=room):
                 out = self.bridge("""
 import json
@@ -1111,7 +1172,8 @@ print(json.dumps({"dm": m._ROUTING["owner_dm"]}))
 """.replace("ROOM", room), AGENT_MXID=AGENT)
                 self.assertEqual(out, {"dm": ""})
                 for path in self.state.glob("*.json"):
-                    self.assertNotIn(token.casefold(), path.read_text().casefold(), path.name)
+                    for piece in (token, token[5:], token[3:12]):
+                        self.assertNotIn(piece.casefold(), path.read_text().casefold(), path.name)
         # The reader refuses one too: a record that holds the bearer is not printed.
         (self.home / "relay.env").write_text(f"REMOTE_TASK_TOKEN={token}\n")
         (self.home / "config").write_text(f"AGENT_MXID={AGENT}\nSTATE_DIR={self.state}\nGATEWAY_INSTANCE=\n")

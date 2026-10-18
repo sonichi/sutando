@@ -203,12 +203,14 @@ def _url_form_re(form: str) -> "re.Pattern[str]":
                       + f"(?i:{re.escape(host)})" + re.escape(slash + tail))
 
 
+ROOM_PIECE_MIN = 6  # a shorter localpart is a "piece" of nearly any secret and reveals none
 MATRIX_ROOM_RE = re.compile(r"!([A-Za-z0-9._~=-]{1,255}):([A-Za-z0-9.-]{1,255}(?::[0-9]{1,5})?)")
 
 
 def owner_room(room: Any, identity: str) -> str:
     """`room` when it is a Matrix room id on the agent's own homeserver (the server part of its
-    `@local:server` identity) and holds no registered secret in any case; '' otherwise. The one
+    `@local:server` identity), holds no registered secret and whose localpart, if ROOM_PIECE_MIN
+    characters or longer, is no piece of one, in any case; '' otherwise. Room ids without a server part (room version 12) are refused. The one
     check every writer and reader of the owner DM applies, so an echoed credential never
     becomes a room."""
     if not isinstance(room, str) or not isinstance(identity, str):
@@ -217,7 +219,9 @@ def owner_room(room: Any, identity: str) -> str:
     server = identity.partition(":")[2] if identity.startswith("@") else ""
     if m is None or not server or m.group(2).casefold() != server.casefold():
         return ""
-    return "" if diagnostics.contains_secret(room) else room
+    local = m.group(1)
+    piece = len(local) >= ROOM_PIECE_MIN and diagnostics.holds_or_is_piece(local)
+    return "" if diagnostics.contains_secret(room) or piece else room
 
 
 def register_gateway_secrets(url: str) -> None:

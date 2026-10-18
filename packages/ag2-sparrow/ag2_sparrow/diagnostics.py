@@ -67,6 +67,15 @@ def contains_secret(text: str) -> bool:
     return any(f in v for fs in rendered for f in fs for v in views)
 
 
+def holds_or_is_piece(value: str) -> bool:
+    """Whether `value` holds a registered secret, or is itself a piece of one, in any rendering and
+    letter case: the rule for a short gateway-supplied token that will be kept or shown."""
+    token = fold(value)
+    with _SECRETS_LOCK:
+        rendered = [f for fs in _SECRETS.values() for f in fs]
+    return contains_secret(value) or any(token in f for f in rendered)
+
+
 def scrub(text: str) -> str:
     """`text`, or WITHHELD_TEXT when a registered secret survives in it."""
     return WITHHELD_TEXT if contains_secret(text) else str(text)
@@ -84,11 +93,7 @@ def code_field(value: Any, gateway_url: str = "") -> "str | None":
     token = fold(value)
     if any(token in fold(form) for form in url_forms if form):
         return None
-    with _SECRETS_LOCK:
-        secrets = [f for fs in _SECRETS.values() for f in fs]
-    if contains_secret(value) or any(token in f for f in secrets):
-        return None  # a secret, or an echoed piece of one
-    return value
+    return None if holds_or_is_piece(value) else value
 
 
 _EAI = {v: k for k, v in vars(socket).items() if k.startswith("EAI_") and isinstance(v, int)}
