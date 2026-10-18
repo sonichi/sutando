@@ -528,6 +528,33 @@ class QueueLoopTest(unittest.TestCase):
             self.assertFalse((Path(d) / "results" / "task-c2.txt").exists(), "still waiting on its own cap")
             self.assertLess(clock.t - start, rl.HOUR)
 
+    def test_refused_tasks_are_never_held_behind_a_saturated_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok(1)])
+            (Path(d) / "state").mkdir()
+            clock = FakeClock()
+            (Path(d) / "state" / rl.COLLAB_LIMITER_FILE).write_text(json.dumps([clock.t - 10]))
+            write_task(d, "task-o", "owner first", mtime=1000)
+            write_task(d, "task-g", "guest asks", tier="guest", mtime=2000)
+            write_task(d, "task-c", "collab asks", tier="team", collaborator=True, mtime=3000)
+            start = clock.t
+            ad, err = run_adapter(d, fake, clock=clock, once=3, max_per_hour=1, min_gap_seconds=1000,
+                                  max_collaborator_per_hour=1)
+            self.assertEqual(len(fake.calls()), 1, "only the owner's turn")
+            self.assertIn("--cloud", fake.calls()[0]["argv"])
+            for tid in ("task-g", "task-c"):
+                self.assertEqual(result(d, tid), ra.NON_OWNER_REFUSED, tid)
+                self.assertEqual(claim(d, tid)["attempt"], 0, "no call was prepared")
+            self.assertLess(clock.t - start, 1000, "refused at once, behind neither the full cap nor the gap")
+            self.assertGreater(ad.provider_wait(), 0, "the session's gate is shut")
+            write_task(d, "task-c2", "collab again", tier="team", collaborator=True, mtime=4000)
+            write_task(d, "task-g2", "guest again", tier="guest", mtime=5000)
+            ad.args.allow_collaborator = True
+            name, wait = ad.next_ready(["task-c2.txt"])
+            self.assertIsNone(name, "admitted, so it waits on its own full cap")
+            self.assertAlmostEqual(wait, rl.HOUR, delta=11.0)
+            self.assertEqual(ad.next_ready(["task-c2.txt", "task-g2.txt"]), ("task-g2.txt", 0.0), "the refusal goes first")
+
     def test_a_collaborator_turn_uses_the_adapters_timeout(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [turn_ok()])

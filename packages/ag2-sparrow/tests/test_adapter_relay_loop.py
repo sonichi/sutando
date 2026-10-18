@@ -361,8 +361,8 @@ class PositiveArgTest(unittest.TestCase):
 class LaneSchedulingTest(unittest.TestCase):
     """Each task waits only on its own lane's gate: the collaborator cap, or the provider's hold and cap."""
 
-    def loop(self, d, **kw):
-        loop = Loop(d, max_per_hour=1, max_collaborator_per_hour=1, **kw)
+    def loop(self, d, allow_collaborator=True, **kw):
+        loop = Loop(d, max_per_hour=1, max_collaborator_per_hour=1, allow_collaborator=allow_collaborator, **kw)
         write_task(loop.args.inbox, "task-c", "normal", 100, tier="team")
         p = Path(loop.args.inbox) / "task-c.txt"
         p.write_text(p.read_text().replace("access_tier: team", "collaborator: true\naccess_tier: team"))
@@ -390,6 +390,37 @@ class LaneSchedulingTest(unittest.TestCase):
             loop.limiter.record()
             loop.blocked_until = loop.clock() + 120
             self.assertEqual(loop.next_ready(["task-c.txt", "task-o.txt"]), (None, 120.0), "the least wait of both")
+
+    def test_a_refused_task_has_no_gate_and_classify_is_what_refusal_decides(self):
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()):
+            loop = self.loop(d, allow_collaborator=False)
+            write_task(loop.args.inbox, "task-g", "normal", 300, tier="guest")
+            loop.limiter.record()
+            loop.collab_limiter.record()
+            loop.blocked_until = loop.clock() + 300
+            # Both flags off: the guest and the collaborator are refused, so neither waits on anything.
+            self.assertEqual((loop.lane("task-g.txt"), loop.lane("task-c.txt")), ("refuse", "refuse"))
+            self.assertEqual(loop.next_ready(["task-o.txt", "task-c.txt", "task-g.txt"]), ("task-c.txt", 0.0))
+            self.assertEqual(loop.next_ready(["task-o.txt", "task-g.txt"]), ("task-g.txt", 0.0))
+            for name in ("task-c.txt", "task-g.txt"):
+                self.assertTrue(loop.refusal(name, task_io.parse_task(os.path.join(loop.args.inbox, name))[0], set()))
+            # Flags on: the same tasks are admitted and wait on their own gate.
+            loop.args.allow_collaborator = loop.args.allow_non_owner = True
+            loop.lanes.clear()
+            self.assertEqual((loop.lane("task-g.txt"), loop.lane("task-c.txt")), ("provider", "collaborator"))
+            name, wait = loop.next_ready(["task-o.txt", "task-c.txt", "task-g.txt"])
+            self.assertEqual((name, wait), (None, 300.0), "an admitted guest waits on the provider gate")
+            for headers, flags, want in (({"access_tier": "owner"}, (False, False), "owner"),
+                                         ({"access_tier": "guest"}, (False, False), "refused"),
+                                         ({"access_tier": "guest"}, (True, False), "non_owner"),
+                                         ({"access_tier": "team", "collaborator": "true"}, (False, False), "refused-collaborator"),
+                                         ({"access_tier": "team", "collaborator": "true"}, (True, False), "refused-collaborator"),
+                                         ({"access_tier": "team", "collaborator": "true"}, (False, True), "collaborator"),
+                                         ({"access_tier": "guest", "collaborator": "true"}, (False, True), "refused")):
+                loop.args.allow_non_owner, loop.args.allow_collaborator = flags
+                self.assertEqual(loop.classify(headers), want, (headers, flags))
+                refused = loop.refusal("task-x%d.txt" % len(loop.lanes), headers, set())
+                self.assertEqual(refused is None, not want.startswith("refused"), (headers, flags))
 
     def test_a_lane_is_read_once_and_a_vanished_task_is_the_providers_to_report(self):
         with tempfile.TemporaryDirectory() as d:

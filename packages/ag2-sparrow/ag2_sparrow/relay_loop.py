@@ -236,17 +236,24 @@ class RelayLoop:
             seen.add(name[:-4])
             return None
 
-    def refusal(self, name, headers, seen):
-        """None when task_io.admission admits the task (a collaborator only under --allow-collaborator);
-        otherwise the refusal is finished and its step result returned: True when published, False
-        when parked."""
+    def classify(self, headers):
+        """The one admission decision, from task_io.admission and both allow flags: owner | non_owner |
+        collaborator (served), or refused-collaborator | refused. refusal() and lane() both read it."""
         kind = admission(headers, self.args.allow_non_owner)
         if kind == "collaborator" and not self.args.allow_collaborator:
+            return "refused-collaborator"
+        return kind or "refused"
+
+    def refusal(self, name, headers, seen):
+        """None when classify() serves the task; otherwise the refusal is finished and its step result
+        returned: True when published, False when parked."""
+        kind = self.classify(headers)
+        if kind == "refused-collaborator":
             log("refused (collaborator, --allow-collaborator not set) ->", name[:-4])
-            return self.finish(name, NON_OWNER_REFUSED, seen)
-        if kind is not None:
+        elif kind == "refused":
+            log("refused (non-owner, --allow-non-owner not set) ->", name[:-4], headers.get("access_tier") or "guest")
+        else:
             return None
-        log("refused (non-owner, --allow-non-owner not set) ->", name[:-4], headers.get("access_tier") or "guest")
         return self.finish(name, NON_OWNER_REFUSED, seen)
 
     def schedule_retry(self, task_id, detail, at_least=0.0):
@@ -267,15 +274,22 @@ class RelayLoop:
         return False
 
     def lane(self, name):
-        """Which gates apply: `collaborator` (its own cap) or `provider` (the hold and the cap).
-        Read once per task from the attested headers; a file that is gone is the step's to report."""
+        """Which gate applies, from classify(): `refuse` (none: the step refuses it at once), `collaborator`
+        (its own cap) or `provider` (the hold and the cap). Read once per task; a gone file is the step's."""
         if name not in self.lanes:
             try:
                 headers, _, _ = parse_task(os.path.join(self.args.inbox, name))
             except OSError:
                 return "provider"
-            self.lanes[name] = "collaborator" if is_collaborator(headers) else "provider"
+            kind = self.classify(headers)
+            self.lanes[name] = ("refuse" if kind.startswith("refused") else
+                                "collaborator" if kind == "collaborator" else "provider")
         return self.lanes[name]
+
+    def lane_wait(self, lane):
+        if lane == "refuse":
+            return 0.0
+        return self.collab_limiter.wait_seconds() if lane == "collaborator" else self.provider_wait()
 
     def provider_wait(self):
         """Seconds until the provider may be called: its hold first, then its sliding-hour cap."""
@@ -295,7 +309,7 @@ class RelayLoop:
         for n in ready:
             lane = self.lane(n)
             if lane not in waits:
-                waits[lane] = self.collab_limiter.wait_seconds() if lane == "collaborator" else self.provider_wait()
+                waits[lane] = self.lane_wait(lane)
             if waits[lane] <= 0:
                 return n, 0.0
         return None, min(waits.values())

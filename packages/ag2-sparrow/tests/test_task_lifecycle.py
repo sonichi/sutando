@@ -621,6 +621,23 @@ class FreshDirTest(Base):
                 self.assertIn("%s is missing" % name, self.lc.prepare_work_dir(str(self.work)))
                 os.rename(moved, p)
 
+    def test_an_optional_limiter_record_must_be_a_plain_file(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)), "absent: accepted")
+        p = self.work / "state" / "collaborator-turns.json"
+        p.write_text("[]")
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)), "a plain file: accepted")
+        p.unlink()
+        p.mkdir()
+        line = self.lc.prepare_work_dir(str(self.work))
+        self.assertIn("state/collaborator-turns.json in", line)
+        self.assertIn("is not a plain file", line)
+        p.rmdir()
+        os.symlink(self.work / "state" / "settled-ids", p)
+        self.assertIn("is not a plain file", self.lc.prepare_work_dir(str(self.work)), "a link is not a plain file")
+        os.unlink(p)
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        self.assertIn("collaborator-turns.json", self.lc.STATE_OPTIONAL_FILES)
+
     def test_the_bridge_may_create_tasks_and_results_first(self):
         (self.work / "tasks").mkdir()
         (self.work / "tasks" / "task-early.txt").write_text("id: task-early\n")

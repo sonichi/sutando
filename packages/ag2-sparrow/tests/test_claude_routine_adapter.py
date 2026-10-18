@@ -526,6 +526,30 @@ class FireLoopTest(unittest.TestCase):
             self.assertFalse((Path(d) / "results" / "task-c.txt").exists())
             self.assertLess(clock.t - start, rl.HOUR)
 
+    def test_refused_tasks_are_never_held_behind_a_saturated_cap(self):
+        with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (srv, base):
+            clock = FakeClock()
+            state = Path(d) / "state"
+            state.mkdir()
+            (state / "fires.json").write_text(json.dumps([clock.t - 10]))
+            (state / rl.COLLAB_LIMITER_FILE).write_text(json.dumps([clock.t - 10]))
+            write_task(d, "task-g", "guest asks", tier="guest", mtime=1000)
+            write_task(d, "task-c", "collab asks", tier="team", collaborator=True, mtime=2000)
+            run, start = FakeRun(), clock.t
+            ad, err = run_adapter(d, base, clock=clock, once=2, run=run, max_per_hour=1, max_collaborator_per_hour=1)
+            for tid in ("task-g", "task-c"):
+                self.assertEqual(result(d, tid), ra.NON_OWNER_REFUSED, tid)
+            self.assertEqual((run.calls, srv.requests), ([], []), "no local turn, no fire")
+            self.assertLess(clock.t - start, 1.0, "refused at once, behind no gate")
+            self.assertIn("refused (collaborator, --allow-collaborator not set) -> task-c", err)
+            write_task(d, "task-c2", "collab again", tier="team", collaborator=True, mtime=3000)
+            write_task(d, "task-g2", "guest again", tier="guest", mtime=4000)
+            ad.args.allow_collaborator = True
+            name, wait = ad.next_ready(["task-c2.txt"])
+            self.assertIsNone(name, "admitted, so it waits on its own full cap")
+            self.assertAlmostEqual(wait, rl.HOUR, delta=11.0)
+            self.assertEqual(ad.next_ready(["task-c2.txt", "task-g2.txt"]), ("task-g2.txt", 0.0), "the refusal goes first")
+
     def test_a_collaborator_reply_never_executes_delivery_protocol(self):
         from ag2_sparrow.result_markers import parse_markers
         from ag2_sparrow.team_result_guard import guard_result_for_tier

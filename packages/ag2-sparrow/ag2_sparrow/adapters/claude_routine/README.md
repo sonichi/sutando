@@ -9,7 +9,7 @@ python3 skills/secret-vault/secret-vault.py env CLAUDE_ROUTINE_TOKEN -- \
   python3 -m ag2_sparrow.adapters.claude_routine.routine_adapter --work <dir> --trigger-id trig_... [options]
 ```
 
-`<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out, `<dir>/state/{done,fires.json,hold.json}`.
+`<dir>/tasks/task-*.txt` in, `<dir>/results/task-<id>.txt` out, `<dir>/state/{done,fires.json,hold.json,collaborator-turns.json}`.
 One process per work dir, through the package's `holder_lock` (its first act; exit 3 naming the holder if another adapter of any kind holds the dir, exit 2 for any other lock failure; released on exit and on SIGTERM), one fire in flight.
 Tasks are taken in the task protocol's priority order (`priority:` urgent, normal, low; oldest first
 within a priority). The loop, payload layout, result lines and hourly cap live in the shared

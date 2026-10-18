@@ -59,8 +59,8 @@ adapter checks nothing about it beyond the single-process lock. The binary enfor
   transaction: create and fsync the empty ledger, create and fsync `claims/`, write `state/format`
   (`cloud-session/1`) last by temp + fsync + rename, then fsync `state/`, `$CLOUD_WORK` and its
   parent; an interrupted init completes on the next start. With the marker, `state/` may hold only
-  `format`, `claims/`, `settled-ids`, `rate.jsonl` and `done`, and the ledger and `claims/` must
-  exist; anything else refuses naming it.
+  `format`, `claims/`, `settled-ids`, `rate.jsonl`, `done` and `collaborator-turns.json` (a plain
+  file when present), and the ledger and `claims/` must exist; anything else refuses naming it.
 - **Probe.** Rename and hard link must work in `results/` and `state/`, else exit 2.
 
 ## Setup (once)
