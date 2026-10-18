@@ -184,8 +184,9 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
         "discord": ("`resolve_channel_token(\"DISCORD_BOT_TOKEN\")` over "
                     "channels/discord/.env",
                     [(DISCORD, r'resolve_channel_token\("DISCORD_BOT_TOKEN"')]),
-        "ag2space": ("REMOTE_TASK_TOKEN via the ag2space channel env",
-                     [(AG2, r'vals.get\("REMOTE_TASK_TOKEN"\)')]),
+        "ag2space": ("`gateway_credential_sources.discover`: REMOTE_TASK_TOKEN env -> channel .env -> "
+                     "vault",
+                     [(AG2, r'gateway_credential_sources\.discover\(')]),
         "slack": ("SLACK_BOT_TOKEN / SLACK_APP_TOKEN: env -> channel .env -> "
                   "vault",
                   [(SLACK, r'token_from_vault\("SLACK_BOT_TOKEN"\)')]),
