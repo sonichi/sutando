@@ -97,6 +97,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`file_lock.py`** — Cross-platform advisory file-lock primitives for shared runtime state.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
+- **`gateway_credential_sources.py`** — Which AG2 Space gateway credential wins when sources disagree: the one owner of that precedence.
 - **`gateway_serving.py`** — Shared owner for the `gateway-status.json` sidecar verdict.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
