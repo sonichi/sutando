@@ -17,9 +17,9 @@ around this block, not inside it.
 """
 
 try:  # vendored into ag2_sparrow as a package module; `policy` package in src/
-    from .sandbox_runner import RUNNERS, selected_or_codex, shell_command
+    from .sandbox_runner import selected_or_fallback, shell_command
 except ImportError:  # pragma: no cover - loaded as a top-level file
-    from sandbox_runner import RUNNERS, selected_or_codex, shell_command
+    from sandbox_runner import selected_or_fallback, shell_command
 
 
 # Verbatim: changing this text changes an enforcement surface, not a comment.
@@ -95,13 +95,11 @@ _RUNNER_LABELS = {"codex": "Codex", "claude": "Claude Code"}
 def sandboxed_delegation_text(runner=None) -> str:
     """The delegation instruction for `runner` (default: the one `sandbox_runner` selects)."""
     if runner is None:
-        runner = selected_or_codex()
+        runner = selected_or_fallback()
     return SANDBOXED_DELEGATION_TEMPLATE.format(
         label=_RUNNER_LABELS.get(runner.name, runner.name), name=runner.name,
         command=shell_command(runner, '"$(cat <prompt-file>)"'))
 
-
-SANDBOXED_DELEGATION_CODEX = sandboxed_delegation_text(RUNNERS["codex"])
 
 
 def sandboxed_delegation_lines(

@@ -35,7 +35,7 @@ If you don't see `/codex:*` slash-commands available, install the plugin in this
 /codex:setup
 ```
 
-This skill stays as the **non-interactive bash-wrapper** path — invoked by `discord-bridge.py`'s team-tier `===SUTANDO SYSTEM INSTRUCTIONS===` block (codex exec --sandbox read-only on Discord tasks from non-owner senders), cron-fired jobs that need a one-shot codex call, and similar file-bridge workflows where a plugin slash-command can't reach.
+This skill stays as the **non-interactive bash-wrapper** path — invoked by `discord-bridge.py`'s team-tier `===SUTANDO SYSTEM INSTRUCTIONS===` block (it bounds the non-owner sandbox runner from `src/policy/sandbox_runner.py` on Discord tasks from non-owner senders, and runs `review-pr.sh` for their PR-review requests), cron-fired jobs that need a one-shot codex call, and similar file-bridge workflows where a plugin slash-command can't reach.
 
 ## Guardrails
 

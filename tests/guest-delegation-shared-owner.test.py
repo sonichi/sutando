@@ -19,8 +19,11 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from policy.guardrail import (  # noqa: E402
-    SANDBOXED_DELEGATION_CODEX, sandboxed_delegation_lines,
+    sandboxed_delegation_lines, sandboxed_delegation_text,
 )
+from policy.sandbox_runner import FALLBACK, RUNNERS  # noqa: E402
+
+SANDBOXED_DELEGATION = sandboxed_delegation_text(RUNNERS[FALLBACK])
 
 ADAPTERS = {
     "ag2space": REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py",
@@ -30,13 +33,13 @@ ADAPTERS = {
 
 class TestOwnerContract(unittest.TestCase):
     def test_invocation_is_stdin_safe(self):
-        self.assertIn("< /dev/null", SANDBOXED_DELEGATION_CODEX)
-        self.assertIn("--sandbox read-only", SANDBOXED_DELEGATION_CODEX)
+        self.assertIn("< /dev/null", SANDBOXED_DELEGATION)
+        self.assertIn("--tools ''", SANDBOXED_DELEGATION)
 
     def test_exit_code_is_not_evidence(self):
         """The quieter half: a hang announces itself, an exit-0 refusal does not."""
-        self.assertIn("exits 0", SANDBOXED_DELEGATION_CODEX)
-        self.assertIn("non-empty", SANDBOXED_DELEGATION_CODEX)
+        self.assertIn("exits 0", SANDBOXED_DELEGATION)
+        self.assertIn("non-empty", SANDBOXED_DELEGATION)
 
     def test_block_is_fenced_and_carries_its_parameters(self):
         lines = sandboxed_delegation_lines(
@@ -53,8 +56,8 @@ class TestOwnerContract(unittest.TestCase):
         """A delegate that cannot fetch the artifact writes a plausible summary
         anyway — the same shape as exit-0-on-refusal, which this block already
         covers. Raised on #3512 by two reviewers independently."""
-        self.assertIn("NO NETWORK", SANDBOXED_DELEGATION_CODEX)
-        self.assertIn("decline", SANDBOXED_DELEGATION_CODEX)
+        self.assertIn("NO NETWORK", SANDBOXED_DELEGATION)
+        self.assertIn("decline", SANDBOXED_DELEGATION)
         lines = sandboxed_delegation_lines(
             "AG2 Space", "GUEST tier", "results/task-X.txt", "SCOPE-SENTINEL")
         self.assertIn("NO NETWORK", "\n".join(lines))
@@ -63,10 +66,10 @@ class TestOwnerContract(unittest.TestCase):
         """`assert the OUTPUT is non-empty` had no next step, so the branch where
         codex cannot answer was unstated everywhere but Discord — whose bridge
         carries a two-sentinel Stage-2 contract the shared owner never learned."""
-        self.assertIn("NO permitted fallback", SANDBOXED_DELEGATION_CODEX)
-        self.assertIn("unrestricted core", SANDBOXED_DELEGATION_CODEX)
+        self.assertIn("NO permitted fallback", SANDBOXED_DELEGATION)
+        self.assertIn("unrestricted core", SANDBOXED_DELEGATION)
         for symptom in ("absent", "exiting non-zero", "exiting 0 having written nothing"):
-            self.assertIn(symptom, SANDBOXED_DELEGATION_CODEX)
+            self.assertIn(symptom, SANDBOXED_DELEGATION)
         lines = sandboxed_delegation_lines(
             "AG2 Space", "GUEST tier", "results/task-X.txt", "SCOPE-SENTINEL")
         self.assertIn("NO permitted fallback", "\n".join(lines))
@@ -74,16 +77,16 @@ class TestOwnerContract(unittest.TestCase):
     def test_silence_is_not_an_outcome(self):
         """A guest cannot distinguish a refusal from a dropped task, so the
         unavailable branch must produce a reply rather than nothing."""
-        self.assertIn("do not silently skip", SANDBOXED_DELEGATION_CODEX)
-        self.assertIn("no inspection was performed", SANDBOXED_DELEGATION_CODEX)
+        self.assertIn("do not silently skip", SANDBOXED_DELEGATION)
+        self.assertIn("no inspection was performed", SANDBOXED_DELEGATION)
         lines = sandboxed_delegation_lines(
             "AG2 Space", "GUEST tier", "results/task-X.txt", "SCOPE-SENTINEL")
         self.assertIn("no inspection was performed", "\n".join(lines))
 
     def test_scope_is_a_parameter_not_baked_in(self):
         """Slack's per-tier limits must not leak into the shared text."""
-        self.assertNotIn("information-only", SANDBOXED_DELEGATION_CODEX)
-        self.assertNotIn("Research, inspect", SANDBOXED_DELEGATION_CODEX)
+        self.assertNotIn("information-only", SANDBOXED_DELEGATION)
+        self.assertNotIn("Research, inspect", SANDBOXED_DELEGATION)
 
 
 class TestAdaptersDelegate(unittest.TestCase):

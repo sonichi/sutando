@@ -487,8 +487,9 @@ def main() -> int:
     rtc._write_task({**TASK, "id": "task-GUEST", "access_tier": "guest"})
     guest_body = (rtc.TASKS_DIR / "task-GUEST.txt").read_text()
     check("access_tier: guest" in guest_body
-          and "codex exec --sandbox read-only" in guest_body,
-          "guest task retains the established read-only Codex delegation")
+          and "claude -p --restricted --strict-mcp-config --tools ''" in guest_body
+          and "codex exec" not in guest_body,
+          "guest task delegates to the no-tools sandbox, never codex")
     # context enrichment: room_name / sender_name / reply_to_* serialize when
     # present, and a newline in a name can't forge an extra field line.
     rtc._write_task({**TASK, "id": "task-CTX", "room_name": "#design",
