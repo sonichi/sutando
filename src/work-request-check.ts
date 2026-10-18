@@ -10,7 +10,8 @@
  * Any failure or delay lets the request through: the check never blocks work.
  */
 
-export type WorkCheck = { action: 'submit' } | { action: 'ask'; question: string } | { action: 'duplicate'; of: string };
+/** `own`: the voice model does this itself with its own tools, so it is not sent to the core. */
+export type WorkCheck = { action: 'submit' } | { action: 'ask'; question: string } | { action: 'duplicate'; of: string } | { action: 'own' };
 
 /** A task the user asked for that has not been answered yet: the check compares a new request with these. */
 export interface OpenTask {
@@ -33,7 +34,8 @@ export type WorkRequestCheck = (input: WorkCheckInput, signal?: AbortSignal) => 
 export const WORK_CHECK_MODEL = 'gemini-3-flash-preview';
 export const WORK_CHECK_TIMEOUT_MS = 4_000;
 
-export function workCheckPrompt(i: WorkCheckInput): string {
+/** @param ownRules rule lines from the voice surface: what the voice model does itself with its own tools. None given, no `own`. */
+export function workCheckPrompt(i: WorkCheckInput, ownRules: readonly string[] = []): string {
 	return [
 		'A voice assistant wrote a request for its back-end agent (the core), which does lookups, actions and file work. Before it is sent, decide one thing: does the request identify WHICH thing it is about?',
 		'Rules:',
@@ -42,9 +44,14 @@ export function workCheckPrompt(i: WorkCheckInput): string {
 		'- "the PR", "that file", "the meeting", "那个 PR" with no number, name or title = not identified. Do NOT fill it in from a PR, file or meeting that came up earlier, not even in the request just before: ask. The only exception is the user answering the assistant\'s own "which one?".',
 		'- A bare number is identified when the recent words show what kind of thing the numbers are (e.g. the user has been asking about PRs).',
 		'- The same request as one of the open tasks (same thing, same ask, maybe worded differently or misheard) = duplicate.',
+		...(ownRules.length ? [
+			'- own: one of these rules says the voice assistant does it itself with its own tools (the rule calls it the assistant\'s own, never work), and that covers the whole request; a request that also needs the core (an email, code, a lookup elsewhere) is submit. It is not sent, however the request is worded:',
+			...ownRules.map((r) => `  ${r}`),
+		] : []),
 		'Reply with JSON only:',
 		'{"action":"duplicate","of":"<id of the open task>"} when it is the same request as an open task.',
 		'{"action":"ask","question":"..."} when a specific thing is not identified. One short question in the user\'s language asking only for the missing piece.',
+		...(ownRules.length ? ['{"action":"own"} when a rule above says the assistant does it itself.'] : []),
 		'{"action":"submit"} otherwise, including requests about no specific thing (a general summary, a search, a how-to).',
 		'Examples:',
 		'Request "Check the status of the PR"; recent words "帮我查一下那个 PR 的状态" -> {"action":"ask","question":"你说的是哪个 PR？"}',
@@ -70,8 +77,8 @@ function openTasksBlock(tasks: OpenTask[] | undefined): string {
 	return tasks?.length ? tasks.map((t) => `${t.id}: ${t.text.replace(/\s+/g, ' ').slice(0, 160)}`).join('\n') : '(none)';
 }
 
-/** The model's reply as a decision. Anything that is not a clear ask or a known duplicate means submit. */
-export function parseWorkCheck(text: string, openTasks: OpenTask[] = []): WorkCheck {
+/** The model's reply as a decision. Anything that is not a clear ask, a known duplicate or (with own rules) own means submit. */
+export function parseWorkCheck(text: string, openTasks: OpenTask[] = [], own = false): WorkCheck {
 	const m = /\{[\s\S]*\}/.exec(text);
 	if (!m) return { action: 'submit' };
 	try {
@@ -79,6 +86,7 @@ export function parseWorkCheck(text: string, openTasks: OpenTask[] = []): WorkCh
 		if (d.action === 'ask' && typeof d.question === 'string' && d.question.trim()) return { action: 'ask', question: d.question.trim() };
 		// Only an id that is really open: a made-up one must not swallow a request.
 		if (d.action === 'duplicate' && typeof d.of === 'string' && openTasks.some((t) => t.id === d.of)) return { action: 'duplicate', of: d.of };
+		if (d.action === 'own' && own) return { action: 'own' };
 	} catch { /* not JSON: submit */ }
 	return { action: 'submit' };
 }
@@ -183,15 +191,15 @@ async function geminiJson(opts: { apiKey: string; model: string; timeoutMs: numb
 	}
 }
 
-export function createGeminiWorkCheck(opts: { apiKey: () => string | undefined; model?: string; timeoutMs?: number; log?: (m: string) => void }): WorkRequestCheck {
+export function createGeminiWorkCheck(opts: { apiKey: () => string | undefined; model?: string; timeoutMs?: number; log?: (m: string) => void; ownRules?: readonly string[] }): WorkRequestCheck {
 	const model = opts.model ?? WORK_CHECK_MODEL;
 	return async (input, signal) => {
 		const apiKey = opts.apiKey();
 		if (!apiKey) return { action: 'submit' };
 		const t0 = Date.now();
-		const text = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: workCheckPrompt(input), signal, log: opts.log, what: 'work check' });
+		const text = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: workCheckPrompt(input, opts.ownRules), signal, log: opts.log, what: 'work check' });
 		if (text === null) return { action: 'submit' };
-		const verdict = parseWorkCheck(text, input.openTasks);
+		const verdict = parseWorkCheck(text, input.openTasks, !!opts.ownRules?.length);
 		opts.log?.(`[RelayAgent] work check: ${verdict.action}${verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : ''} in ${Date.now() - t0}ms`);
 		return verdict;
 	};

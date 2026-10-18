@@ -543,6 +543,8 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	private lastTakenAt = 0;
 	/** When the work check last had the user asked: the next call's answer is sent as it is. */
 	private askedAt = 0;
+	/** When the work check last sent a request back as the voice model's own: the next call is sent as it is. */
+	private ownAt = 0;
 	/** User turns waiting for the turn check (several when the user went on speaking). */
 	private turns: Array<{ text: string; at: number; origin: O | undefined }> = [];
 	private turnsRunning = false;
@@ -672,6 +674,14 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 				this.deps.log?.(`[RelayAgent] not submitted, asking the user: ${verdict.question}`);
 				return framedSystem(`Nothing was submitted: the request does not say what it is about. Ask the user now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}" Then, with their answer, call work again.`);
 			}
+			// Once per request: called again right after, the voice model's own tools did not do it, and it is sent.
+			if (verdict.action === 'own' && Date.now() - this.ownAt < ONE_ASK_WINDOW_MS) {
+				this.deps.log?.('[RelayAgent] sent back once already; sending it as it is');
+			} else if (verdict.action === 'own') {
+				this.ownAt = Date.now();
+				this.deps.log?.('[RelayAgent] not submitted: the voice model does this with its own tools');
+				return framedSystem('Nothing was submitted: this is done with your own tools, not by the core. Do it now yourself with them, and tell the user from the result. Do not say it is being worked on.');
+			}
 			if (verdict.action === 'duplicate') {
 				// The same request is already with the core (2026-10-12: PR 5333 was sent twice). This call
 				// waits for that task's result instead, unless another call already does.
@@ -684,6 +694,7 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 			}
 		}
 		this.askedAt = 0; // this request goes; the next vague one may be asked about again
+		this.ownAt = 0;
 		const submitted = await this.deps.submit(args, origin);
 		const taskId = submitted.taskId;
 		if (submitted.status !== 'pending' || typeof taskId !== 'string') return JSON.stringify(submitted);

@@ -129,7 +129,7 @@ describe('relay agent subagent: the work call returns its task\'s result', () =>
 });
 
 describe('relay agent: a text model checks a request before it is submitted', () => {
-	function agent(check: (input: { task: string; recentConversation: string }) => Promise<{ action: 'submit' } | { action: 'ask'; question: string } | { action: 'duplicate'; of: string }>) {
+	function agent(check: (input: { task: string; recentConversation: string }) => Promise<{ action: 'submit' } | { action: 'ask'; question: string } | { action: 'duplicate'; of: string } | { action: 'own' }>) {
 		const store = createVoiceTaskStore();
 		const submitted: string[] = [];
 		const logs: string[] = [];
@@ -177,6 +177,35 @@ describe('relay agent: a text model checks a request before it is submitted', ()
 		assert.deepEqual(parseWorkCheck('{"action":"submit"}'), { action: 'submit' });
 		assert.deepEqual(parseWorkCheck('{"action":"ask"}'), { action: 'submit' }, 'an ask with no question is not an ask');
 		assert.deepEqual(parseWorkCheck('sure, go ahead'), { action: 'submit' });
+		assert.deepEqual(parseWorkCheck('{"action":"own"}'), { action: 'submit' }, 'no own rules given, no own');
+		assert.deepEqual(parseWorkCheck('{"action":"own"}', [], true), { action: 'own' });
+	});
+
+	it('a request the voice model does with its own tools is not submitted: it is told to do it now', async () => {
+		// Writing a LaTeX project's paper is the voice model's own, not the core's.
+		const { relay, submitted, logs } = agent(async () => ({ action: 'own' }));
+		const out = await Promise.race([relay.invoke('w', { task: "Write the content for 'The Best Paper' in susan's agents" }), tick(3_000).then(() => 'timed out')]);
+		assert.deepEqual(submitted, [], 'nothing submitted');
+		assert.match(out, /Nothing was submitted: this is done with your own tools/);
+		assert.doesNotMatch(out, /find_room_actions|AG2 Space/, 'core names no skill: the surface\'s own tools do it');
+		assert.ok(logs.some((l) => l.includes('the voice model does this with its own tools')));
+	});
+
+	it('sent back once, the same request called again is submitted: the user is never stuck', async () => {
+		const { relay, submitted } = agent(async () => ({ action: 'own' }));
+		await relay.invoke('w', { task: 'write it' });
+		void relay.invoke('w', { task: 'write it' });
+		await tick(10);
+		assert.deepEqual(submitted, ['write it']);
+	});
+
+	it('the own rule is in the prompt only when the voice surface gives rules', async () => {
+		const { workCheckPrompt } = await import('../src/work-request-check.js');
+		const input = { task: 'fill in the LaTeX project', recentConversation: '' };
+		assert.doesNotMatch(workCheckPrompt(input), /"own"/);
+		const p = workCheckPrompt(input, ['- none: a LaTeX project is the assistant\'s own, never work.']);
+		assert.match(p, /\{"action":"own"\}/);
+		assert.match(p, / {2}- none: a LaTeX project is the assistant's own, never work\./);
 	});
 });
 

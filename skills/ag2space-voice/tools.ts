@@ -7,7 +7,8 @@ import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextC
 import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateClient, navigateUiAvailable, navigateUiTool, resolveUiNavigated } from './navigate.js';
 import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
 import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createAddCommentTool, createSearchCommonsTool, createSearchRoomTool, createSendMessageTool, createWritePageTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
-import { ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, createDescribeActionTool, createFindActionsTool, createRunActionTool, armSpeechGate, noteUserSpoke } from './room-actions.js';
+import { EDIT_FILE_PROMPT_RULE, createEditFileTool } from './edit-file.js';
+import { ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, createDescribeActionTool, createFindActionsTool, createRunActionTool } from './room-actions.js';
 
 export const tools: ToolDefinition[] = [];
 
@@ -32,11 +33,6 @@ export async function handleSessionContextFrame(ctx: Pick<SkillSetupCtx, 'sendCl
 }
 
 export function setup(ctx: SkillSetupCtx): void {
-	// A change held for a spoken yes needs the user to have spoken since it was held.
-	if (typeof ctx?.onUserSpoke === 'function') {
-		ctx.onUserSpoke(noteUserSpoke);
-		armSpeechGate();
-	}
 	// A host that predates the client-frame seam gets no room binding rather than a throw.
 	if (typeof ctx?.onClientFrame !== 'function' || typeof ctx.clientAttached !== 'function' || typeof ctx.setVoiceSessionOrigin !== 'function') {
 		console.warn('[ag2space-voice] host has no client-frame seam — room binding disabled');
@@ -94,11 +90,13 @@ function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; tu
 	const comment = createAddCommentTool(deps);
 	const message = createSendMessageTool(deps);
 	const list = createListRoomsTool({ index, log });
+	// A project file is changed from a short instruction; the voice model never writes the file out.
+	const edit = createEditFileTool(deps);
 	// Any other catalog action: found, described and run by name, gated by the server's own effect and risk.
 	const open = [createFindActionsTool(deps), createDescribeActionTool(deps), createRunActionTool(deps)];
 	return {
-		tools: [read, search, commons, page, write, comment, message, list, ...open],
-		promptRules: [ROOM_READ_PROMPT_RULE, ROOM_ACTIONS_PROMPT_RULE],
+		tools: [read, search, commons, page, write, comment, message, list, edit, ...open],
+		promptRules: [ROOM_READ_PROMPT_RULE, EDIT_FILE_PROMPT_RULE, ROOM_ACTIONS_PROMPT_RULE],
 		turnCheckRules: [ROOM_TURN_CHECK_RULE, ROOM_ACTIONS_TURN_CHECK_RULE],
 		contextLines: () => roomIndexContextLines(index),
 	};
