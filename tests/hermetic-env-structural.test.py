@@ -2,18 +2,21 @@
 """No test that reaches gateway credentials inherits the outer environment.
 
 A test file (under tests/ or packages/*/tests, or a src/*.test.py or skills/*/test_*.py) that names the remote gateway bridge, Hatch,
-room_ops' gateway client, the credential modules, or any module whose code reads a GATEWAY_*, RELAY_*,
-REMOTE_TASK_* or AG2_REMOTE_* name (tests/_helpers/credential_scope.py finds those by scanning the tree)
+room_ops' gateway client, the credential modules, or any module tests/_helpers/credential_scope.py
+finds reading a credential name (or importing one that does) in its code, not a comment or docstring,
 must build every environment with tests/_helpers/hermetic_env.py. Refused anywhere else in such a file:
 
-  copy        os.environ.copy(), dict(os.environ, ...), {**os.environ, ...}, f(**os.environ), or a
-              dict comprehension over os.environ (a denylist still carries every other selector)
-  spawn-env   a subprocess handed env=None or env=os.environ
+  copy        os.environ.copy(), dict(os.environ, ...), {**os.environ, ...}, f(**os.environ), a
+              dict comprehension over os.environ, os.environ | {...}, x.update(os.environ) or
+              copy.copy/deepcopy(os.environ) (a denylist still carries every other selector);
+              aliases (`import os as o`, `from os import environ`) resolve through the imports
+  spawn-env   a subprocess handed env=None or env=os.environ, or an os.exec*e/spawn*e handed os.environ
   env-param   a subprocess handed an `env` parameter that defaults to None and is never rebuilt
-  unisolated  code run (a subprocess, a module loader, an import of those modules) in a test
-              file that never calls isolate_os_environ() or isolate_then_import() at module level
-              (a tests/_helpers library may instead isolate in the function, or spawn with the
-              helper's env)
+  unisolated  code run (a subprocess or os/asyncio spawn, a module loader, an import of those
+              modules) in a test file that never calls isolate_os_environ() or isolate_then_import()
+              as a module-level statement (a tests/_helpers library may instead isolate in the
+              function, or spawn with the helper's env); a call under `if`, or a clearing patch
+              never entered or started, does not isolate
   before-isolation  such code at module level above that call
 """
 from __future__ import annotations
@@ -47,29 +50,54 @@ SPAWNS = {"run", "Popen", "check_output", "check_call", "call"}
 LOADERS = {"import_module", "spec_from_file_location", "exec_module", "run_path", "run_module", "__import__"}
 
 
-def _is_environ(n) -> bool:
-    return (isinstance(n, ast.Attribute) and n.attr == "environ"
-            and isinstance(n.value, ast.Name) and n.value.id == "os")
+MODULES = ("os", "copy", "asyncio", "subprocess")
+OS_SPAWNS = ("system", "popen", "exec", "spawn", "posix_spawn")
+ASYNC_SPAWNS = {"create_subprocess_exec", "create_subprocess_shell"}
+
+
+class Imports:
+    """The names a file binds to os, copy, asyncio, subprocess and their members, `as` names included."""
+
+    def __init__(self, tree):
+        self.mods = {m: {m} for m in MODULES}
+        self.members = {"Popen": "subprocess.Popen"}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                for a in n.names:
+                    if a.name in MODULES and a.asname:
+                        self.mods[a.name].add(a.asname)
+            elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module in MODULES:
+                for a in n.names:
+                    self.members[a.asname or a.name] = f"{n.module}.{a.name}"
+
+    def qual(self, n) -> "str | None":
+        if isinstance(n, ast.Name):
+            return self.members.get(n.id) or next((m for m, ns in self.mods.items() if n.id in ns), None)
+        if isinstance(n, ast.Attribute) and self.qual(n.value) in MODULES:
+            return f"{self.qual(n.value)}.{n.attr}"
+        return None
+
+    def environ(self, n) -> bool:
+        return self.qual(n) == "os.environ"
+
+    def spawn(self, call: ast.Call) -> bool:
+        q = self.qual(call.func) or ""
+        mod, _, attr = q.partition(".")
+        return ((mod == "subprocess" and attr in SPAWNS) or (mod == "os" and attr.startswith(OS_SPAWNS))
+                or (mod == "asyncio" and attr in ASYNC_SPAWNS))
 
 
 def _name(f) -> str:
     return getattr(f, "attr", None) or getattr(f, "id", "") or ""
 
 
-def _over_environ(it) -> bool:
-    return _is_environ(it) or (isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute)
-                               and it.func.attr in ("items", "keys") and _is_environ(it.func.value))
+def _over_environ(it, imp: Imports) -> bool:
+    return imp.environ(it) or (isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute)
+                               and it.func.attr in ("items", "keys") and imp.environ(it.func.value))
 
 
-def _is_spawn(call: ast.Call) -> bool:
-    f = call.func
-    if isinstance(f, ast.Attribute) and f.attr in SPAWNS:
-        return isinstance(f.value, ast.Name) and f.value.id == "subprocess"
-    return isinstance(f, ast.Name) and f.id == "Popen"
-
-
-def _clearing_patch(call: ast.Call) -> bool:
-    return (_name(call.func) == "dict" and call.args and _is_environ(call.args[0])
+def _clearing_patch(call: ast.Call, imp: Imports) -> bool:
+    return (_name(call.func) == "dict" and call.args and imp.environ(call.args[0])
             and any(k.arg == "clear" and isinstance(k.value, ast.Constant) and k.value.value is True
                     for k in call.keywords))
 
@@ -86,6 +114,36 @@ def _imports_target(node) -> bool:
     return False
 
 
+def code_text(tree) -> str:
+    """The file's code without comments or docstrings, so only names in code put it in scope."""
+    for n in ast.walk(tree):
+        if (isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body
+                and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)
+                and isinstance(n.body[0].value.value, str)):
+            n.body[0] = ast.Pass()
+    return ast.unparse(tree)
+
+
+def _copy_rule(n, imp: Imports) -> bool:
+    """A node that copies os.environ into a new mapping."""
+    if isinstance(n, ast.Call):
+        f, q = n.func, imp.qual(n.func)
+        return ((isinstance(f, ast.Attribute) and f.attr == "copy" and imp.environ(f.value))
+                or (isinstance(f, ast.Name) and f.id == "dict" and bool(n.args) and imp.environ(n.args[0]))
+                or any(k.arg is None and imp.environ(k.value) for k in n.keywords)
+                or (isinstance(f, ast.Attribute) and f.attr == "update" and any(imp.environ(a) for a in n.args))
+                or (q in ("copy.copy", "copy.deepcopy") and any(imp.environ(a) for a in n.args)))
+    if isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitOr):
+        return imp.environ(n.left) or imp.environ(n.right)
+    if isinstance(n, ast.AugAssign) and isinstance(n.op, ast.BitOr):
+        return imp.environ(n.value)
+    if isinstance(n, ast.Dict):
+        return any(k is None and imp.environ(v) for k, v in zip(n.keys, n.values))
+    if isinstance(n, ast.DictComp):
+        return any(_over_environ(g.iter, imp) for g in n.generators)
+    return False
+
+
 def violations(source: str, name: str = "<sample>") -> "list[str]":
     """Each inheritance site in one file's source, as 'name:line: rule'."""
     if not REFERENCE.search(source):
@@ -94,6 +152,9 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
         tree = ast.parse(source)
     except SyntaxError:
         return [f"{name}:0: unparseable"]
+    if not REFERENCE.search(code_text(ast.parse(source))):
+        return []
+    imp = Imports(tree)
     parents = {}
     for p in ast.walk(tree):
         for c in ast.iter_child_nodes(p):
@@ -106,11 +167,31 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
                 return n
         return None
 
+    def statement(n) -> bool:
+        """`n` is a whole statement's value directly in a module or function body: it runs."""
+        s = parents.get(n)
+        holder = parents.get(s)
+        return (isinstance(s, (ast.Expr, ast.Assign, ast.AnnAssign)) and s.value is n
+                and isinstance(holder, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)) and s in holder.body)
+
+    def entered(n) -> bool:
+        """A patcher entered by `with`, applied as a decorator, or started as a statement."""
+        p = parents.get(n)
+        if isinstance(p, ast.withitem) or (isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                                           and n in p.decorator_list):
+            return True
+        return (isinstance(p, ast.Attribute) and p.attr == "start" and isinstance(parents.get(p), ast.Call)
+                and statement(parents[p]))
+
     def isolates(n) -> bool:
-        return isinstance(n, ast.Call) and (_name(n.func) in ISOLATORS or _clearing_patch(n))
+        if not isinstance(n, ast.Call):
+            return False
+        if _name(n.func) in ISOLATORS:
+            return statement(n)
+        return _clearing_patch(n, imp) and entered(n)
 
     def runs_code(n) -> bool:
-        return (isinstance(n, ast.Call) and (_is_spawn(n) or _name(n.func) in LOADERS)) or _imports_target(n)
+        return (isinstance(n, ast.Call) and (imp.spawn(n) or _name(n.func) in LOADERS)) or _imports_target(n)
 
     library = "/_helpers/" in name
 
@@ -121,7 +202,7 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
         fn = enclosing_def(n)
         if fn is not None and any(isolates(c) and c.lineno < n.lineno for c in ast.walk(fn)):
             return True
-        env = {k.arg: k.value for k in n.keywords}.get("env") if isinstance(n, ast.Call) and _is_spawn(n) else None
+        env = {k.arg: k.value for k in n.keywords}.get("env") if isinstance(n, ast.Call) and imp.spawn(n) else None
         if env is None:
             return False
         if any(b in ast.unparse(env) for b in BUILDERS):
@@ -141,30 +222,22 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
                 if enclosing_def(n) is None and n.lineno < module_iso[0]]
     for n in nodes:
         rule = None
-        if isinstance(n, ast.Call):
-            f = n.func
-            if isinstance(f, ast.Attribute) and f.attr == "copy" and _is_environ(f.value):
-                rule = "copy"
-            elif isinstance(f, ast.Name) and f.id == "dict" and n.args and _is_environ(n.args[0]):
-                rule = "copy"
-            elif any(k.arg is None and _is_environ(k.value) for k in n.keywords):
-                rule = "copy"
-            elif _is_spawn(n):
-                rule = _spawn_env_rule(n, enclosing_def(n))
-        elif isinstance(n, ast.Dict) and any(k is None and _is_environ(v) for k, v in zip(n.keys, n.values)):
+        if _copy_rule(n, imp):
             rule = "copy"
-        elif isinstance(n, ast.DictComp) and any(_over_environ(g.iter) for g in n.generators):
-            rule = "copy"
+        elif isinstance(n, ast.Call) and imp.spawn(n):
+            rule = _spawn_env_rule(n, enclosing_def(n), imp)
         if rule:
             out.append((n.lineno, rule))
     return [f"{name}:{line}: {rule}" for line, rule in sorted(set(out))]
 
 
-def _spawn_env_rule(n: ast.Call, fn) -> "str | None":
+def _spawn_env_rule(n: ast.Call, fn, imp: Imports) -> "str | None":
+    if (imp.qual(n.func) or "").startswith("os.") and any(imp.environ(a) for a in n.args):
+        return "spawn-env"
     env = {k.arg: k.value for k in n.keywords}.get("env")
     if env is None:
         return None
-    if (isinstance(env, ast.Constant) and env.value is None) or _is_environ(env):
+    if (isinstance(env, ast.Constant) and env.value is None) or imp.environ(env):
         return "spawn-env"
     if not isinstance(env, ast.Name) or fn is None or isinstance(fn, ast.Lambda):
         return None
@@ -218,6 +291,11 @@ def spawn(args, env=None):
 '''
 
 
+IN_SCOPE = 'BRIDGE = "src/remote-gateway-bridge.py"\n'
+ISOLATED = "from _helpers.hermetic_env import isolate_os_environ\nisolate_os_environ()\n" + IN_SCOPE
+GATEWAY_IMPORT = "from ag2_sparrow import remote_gateway_bridge\n"
+
+
 class SelfTest(unittest.TestCase):
     def test_every_rule_fires_on_the_flagged_sample(self):
         got = violations(SAMPLE_FLAGGED)
@@ -238,7 +316,7 @@ class SelfTest(unittest.TestCase):
         by_path = ('import importlib.util\nBRIDGE = "src/remote-gateway-bridge.py"\n'
                    'spec = importlib.util.spec_from_file_location("b", BRIDGE)\n')
         self.assertIn("unisolated", " ".join(violations(by_path)))
-        hc = '# drives the remote_gateway_bridge restart\nimport subprocess\nsubprocess.run(["bash", "x.sh"], env=E)\n'
+        hc = 'NOTE = "drives the remote_gateway_bridge restart"\nimport subprocess\nsubprocess.run(["bash", "x.sh"], env=E)\n'
         self.assertIn("unisolated", " ".join(violations(hc)))
         by_name = 'import sys\nsys.path.insert(0, "skills/agent-room-ops")\nimport read as rd\n'
         self.assertIn("unisolated", " ".join(violations(by_name)))
@@ -260,6 +338,59 @@ class SelfTest(unittest.TestCase):
                'spec = importlib.util.spec_from_file_location("bee", S)\n')
         self.assertIn("unisolated", " ".join(violations(bee)))
         self.assertIn("unisolated", " ".join(violations('import sys\nsys.path.insert(0, "src")\nimport channel_token\n')))
+
+    def test_aliased_merged_updated_and_copied_environments_are_copies(self):
+        for body in ("import os as _os\nenv = _os.environ.copy()\n",
+                     "from os import environ\nenv = environ.copy()\n",
+                     "from os import environ\nenv = dict(environ)\n",
+                     "from os import environ as E\nenv = {**E}\n",
+                     'import os\nenv = os.environ | {"X": "1"}\n',
+                     'import os\nenv = {"X": "1"} | os.environ\n',
+                     "import os\nenv = {}\nenv.update(os.environ)\n",
+                     "import copy, os\nenv = copy.copy(os.environ)\n",
+                     "import copy as c, os\nenv = c.deepcopy(os.environ)\n",
+                     "from copy import deepcopy\nimport os\nenv = deepcopy(os.environ)\n"):
+            with self.subTest(body=body):
+                self.assertIn("copy", " ".join(violations(ISOLATED + body)))
+
+    def test_os_and_asyncio_spawns_need_isolation(self):
+        for body in ('import os\nos.system("python3 x.py")\n', 'import os as o\no.popen("x")\n',
+                     'import os\nos.execv("/bin/sh", ["sh"])\n', 'from os import spawnlp\nspawnlp(0, "sh", "sh")\n',
+                     'import os\nos.posix_spawn("/bin/sh", ["sh"], {})\n',
+                     'import asyncio\nasyncio.create_subprocess_exec("sh")\n',
+                     'import asyncio as aio\naio.create_subprocess_shell("sh")\n',
+                     'from asyncio import create_subprocess_exec\ncreate_subprocess_exec("sh")\n',
+                     'from subprocess import run\nrun(["sh"])\n', 'import subprocess as sp\nsp.check_call(["sh"])\n'):
+            with self.subTest(body=body):
+                self.assertIn("unisolated", " ".join(violations(IN_SCOPE + body)))
+
+    def test_spawns_handed_the_outer_environment(self):
+        for body in ('import os\nos.execve("/bin/sh", ["sh"], os.environ)\n',
+                     'import asyncio, os\nasyncio.create_subprocess_exec("sh", env=os.environ)\n',
+                     'import os\nfrom subprocess import run\nrun(["python3", "remote_gateway_bridge.py"], env=os.environ)\n'):
+            with self.subTest(body=body):
+                self.assertIn("spawn-env", " ".join(violations(ISOLATED + body)))
+
+    def test_isolation_that_never_runs_does_not_count(self):
+        for iso in ("if False:\n    isolate_os_environ()\n",
+                    "try:\n    pass\nexcept Exception:\n    isolate_os_environ()\n",
+                    "import os\nfrom unittest import mock\nmock.patch.dict(os.environ, {}, clear=True)\n",
+                    "import os\nfrom unittest import mock\nP = mock.patch.dict(os.environ, {}, clear=True)\n"):
+            with self.subTest(iso=iso):
+                self.assertIn("unisolated", " ".join(violations(iso + GATEWAY_IMPORT)))
+        for iso in ("isolate_os_environ()\n", "ENV = isolate_os_environ()\n",
+                    "import os\nfrom unittest import mock\nmock.patch.dict(os.environ, {}, clear=True).start()\n"):
+            with self.subTest(iso=iso):
+                self.assertEqual(violations(iso + GATEWAY_IMPORT), [])
+
+    def test_a_mention_only_in_a_comment_or_docstring_is_out_of_scope(self):
+        body = "import os, subprocess\nenv = os.environ.copy()\nsubprocess.run(['x'])\n"
+        for head in ('"""Exercises the remote_gateway_bridge and Hatch (adapters/hatch)."""\n',
+                     "# drives the remote_gateway_bridge; see gateway_credential\n",
+                     'def f():\n    """Imports room_ops: import room_ops."""\n'):
+            with self.subTest(head=head):
+                self.assertEqual(violations(head + body), [])
+        self.assertIn("copy", " ".join(violations('B = "remote_gateway_bridge"\n' + body)))
 
     def test_a_file_naming_no_gateway_module_is_out_of_scope(self):
         self.assertEqual(violations("import os\nenv = os.environ.copy()\n"), [])

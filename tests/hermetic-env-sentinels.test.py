@@ -17,6 +17,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -100,6 +101,16 @@ class Sentinels(unittest.TestCase):
             with self.subTest(values=values):
                 self.check(["-c", GATEWAY_IMPORT], values=values)
 
+    def test_test_control_gates_pass_and_no_credential_does(self):
+        root = Path(tempfile.mkdtemp(prefix="hermetic-gates-")).resolve()
+        names = sentinels(root / MARK)
+        gates = {"CI": "1", "GITHUB_ACTIONS": "true", "SUTANDO_TEST_PIPE_POOL": "1"}
+        disguised = {"SUTANDO_TEST_REMOTE_TASK_TOKEN": f"{MARK}-t", "SUTANDO_TEST_AG2_DEVICE_ENV": f"{MARK}-d"}
+        with mock.patch.dict(os.environ, {**names, **gates, **disguised}):
+            env = hermetic_env(root / "home")
+        self.assertEqual({k: env.get(k) for k in gates}, gates)
+        self.assertEqual([k for k in env if k in names or k in disguised or MARK in env[k]], [])
+
     def test_values_cover_every_selector_the_credential_modules_read(self):
         self.assertTrue(selector_names(), "the credential scan found nothing: its roots moved")
         self.assertLessEqual(set(selector_names()), set(VALUES))
@@ -118,6 +129,9 @@ class Sentinels(unittest.TestCase):
 
     def test_the_hatch_adapter_suite_reads_no_outer_selector(self):
         self.check(["packages/ag2-sparrow/tests/test_hatch_adapter.py"])
+
+    def test_channel_env_resolve_and_its_shell_children_read_no_outer_selector(self):
+        self.check(["tests/channel-env-resolve.test.py"])
 
 
 def _user_site(base: Path) -> Path:
@@ -176,6 +190,48 @@ class UserSite(unittest.TestCase):
         env.pop("PYTHONNOUSERSITE", None)
         subprocess.run([sys.executable, "-c", "pass"], env=env, check=True, timeout=60)
         self.assertTrue(witness.exists(), "the planted .pth never ran: the control proves nothing")
+
+
+class CoverageBootstrap(unittest.TestCase):
+    """Under the coverage runner children import coverage from PYTHONPATH; a sitecustomize.py next
+    to that install would run at startup, before the audit hook, if its directory were exposed."""
+
+    def plant(self) -> "tuple[Path, Path, Path]":
+        root = Path(tempfile.mkdtemp(prefix="hermetic-covsite-")).resolve()
+        site = root / "site-packages"
+        (site / "coverage").mkdir(parents=True)
+        (site / "coverage" / "__init__.py").write_text("")
+        witness = root / "sitecustomize-witness"
+        (site / "sitecustomize.py").write_text(PTH % str(witness))
+        return root, site, witness
+
+    def runner(self, site: Path):
+        fake = types.ModuleType("coverage")
+        fake.__file__ = str(site / "coverage" / "__init__.py")
+        return mock.patch.dict(sys.modules, {"coverage": fake}), mock.patch.dict(
+            os.environ, {"SUTANDO_TEST_SUBPROCESS_COVERAGE": "1"})
+
+    def test_a_sitecustomize_beside_coverage_never_runs_in_a_child(self):
+        root, site, witness = self.plant()
+        mods, env_patch = self.runner(site)
+        with mods, env_patch:
+            record, _, proc = audit(["-c", GATEWAY_IMPORT])
+            env = hermetic_env(root / "home")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1500:])
+        self.assertFalse(witness.exists(), "a sitecustomize beside coverage ran before the audit hook")
+        self.assertFalse(leaks(record))
+        self.assertNotIn(str(site), env["PYTHONPATH"].split(os.pathsep))
+        probe = subprocess.run([sys.executable, "-c", "import coverage; print(coverage.__file__)"],
+                               env=env, capture_output=True, text=True, check=True, timeout=60)
+        self.assertEqual(Path(probe.stdout.strip()).resolve(), site / "coverage" / "__init__.py",
+                         "the child no longer reaches coverage: the runner would lose its measurement")
+
+    def test_the_planted_sitecustomize_is_live_when_its_directory_is_on_the_path(self):
+        # Control: the directory the helper used to add runs the plant and reads the sentinel.
+        root, site, witness = self.plant()
+        env = hermetic_env(root / "home", PYTHONPATH=str(site), **sentinels(root / MARK))
+        subprocess.run([sys.executable, "-c", "pass"], env=env, check=True, timeout=60)
+        self.assertTrue(witness.exists(), "the planted sitecustomize never ran: the control proves nothing")
 
 
 if __name__ == "__main__":

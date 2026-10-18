@@ -6,6 +6,17 @@ Run: python3 tests/telegram-ingress-identity.test.py
 """
 from __future__ import annotations
 
+import json
+import sys
+from pathlib import Path
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# A --bridge child keeps the hermetic environment its harness built; isolation would discard it.
+_BRIDGE_ENV = json.loads(Path(sys.argv[4]).read_text()) if sys.argv[1:2] == ["--bridge"] else {}
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ(**_BRIDGE_ENV)
+
 import importlib.util
 import io
 import json
@@ -84,7 +95,7 @@ class Harness:
     def __init__(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="telegram-ingress-")
         self.root = Path(self.tmp.name)
-        self.env = os.environ.copy()
+        self.env = isolated_child_env()
         supplied = self.env.get("SUTANDO_WORKSPACE") if self.env.get("SUTANDO_TEST_MODE") == "1" else None
         self.ws = Path(supplied) if supplied else self.root / "workspace"
         self.tasks, self.results = self.ws / "tasks", self.ws / "results"
@@ -133,7 +144,10 @@ class Harness:
         argv = [sys.executable]
         if self.env.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
             argv += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
-        proc = self.start(name, argv + [str(Path(__file__).resolve()), "--bridge", str(events), str(int(hold))])
+        env_file = self.root / f"{name}.env.json"
+        env_file.write_text(json.dumps(self.env))
+        proc = self.start(name, argv + [str(Path(__file__).resolve()), "--bridge", str(events), str(int(hold)),
+                                        str(env_file)])
         self.wait(lambda: len(self.calls(events, "getUpdates")) == 1, proc)
         return proc, events
 

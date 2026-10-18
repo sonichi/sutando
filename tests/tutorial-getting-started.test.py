@@ -3,6 +3,11 @@
 and the room-commons calls publish makes, against a stub room_commons.py that keeps a fake room."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import hashlib
 import io
@@ -442,7 +447,7 @@ def _jsdom_node():
     if not node:
         return None
     probe = subprocess.run([node, "-e", "require('jsdom')"], capture_output=True, text=True)
-    return (node, dict(os.environ)) if probe.returncode == 0 else None
+    return (node, isolated_child_env()) if probe.returncode == 0 else None
 
 
 class PageBehaviourTest(unittest.TestCase):
@@ -766,7 +771,7 @@ class MainTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.stub = self.tmp / "room_commons.py"
         self.stub.write_text(STUB)
-        env = {k: v for k, v in os.environ.items()
+        env = {k: v for k, v in isolated_child_env().items()
                if not k.startswith(("SUTANDO_", "AG2", "REMOTE_TASK", "AGENT_", "ROOM_C", "MATRIX_"))
                and k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME")}
         env.update({"CLAUDE_CONFIG_DIR": str(self.tmp / "claude"), "STUB_STATE": str(self.tmp / "room.json"),
@@ -1368,7 +1373,7 @@ class CliTest(unittest.TestCase):
             self.assertEqual(done.stdout, gs.render_page("Sutando", core))
 
     def test_detect_core_reads_the_engine_resolver(self):
-        env = dict(os.environ, SUTANDO_CORE_RUNTIME="codex")
+        env = isolated_child_env(SUTANDO_CORE_RUNTIME="codex")
         done = subprocess.run([sys.executable, "-c",
                                "import importlib.util as u;s=u.spec_from_file_location('g',%r);"
                                "m=u.module_from_spec(s);s.loader.exec_module(m);print(m.detect_core())"

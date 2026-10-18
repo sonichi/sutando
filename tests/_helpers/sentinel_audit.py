@@ -1,6 +1,6 @@
 """Run a test file, or `-c` code, under an audit hook that records opens, child environments,
 and this process's environment whenever a gateway, Hatch, room_ops, bee-actions or credential module
-is imported.
+is imported (the channel token reader and channel_env_resolve included).
 
     python3 sentinel_audit.py <out.json> <file.py | -c CODE> [args...]
 
@@ -16,7 +16,8 @@ opens: "list[str]" = []
 child_envs: "list[dict]" = []
 import_envs: "list[dict]" = []
 GATEWAY_MODULE = re.compile(
-    r"remote_gateway_bridge|gateway_credential|adapters\.hatch|bee_actions|(^|\.)_gateway$|(^|\.)room_ops$")
+    r"remote_gateway_bridge|gateway_credential|adapters\.hatch|bee_actions|(^|\.)_gateway$|(^|\.)room_ops$"
+    r"|(^|\.)channel_token$|(^|\.)channel_env_resolve$")
 
 
 def _hook(event, args):
