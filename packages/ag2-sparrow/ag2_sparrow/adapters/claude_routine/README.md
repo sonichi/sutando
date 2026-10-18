@@ -54,12 +54,27 @@ the package-level `task_io.parse_task` every adapter shares), never from message
 The note is the shared `ag2_sparrow.task_io.NON_OWNER_NOTE`, the same text every adapter renders; `routine-prompt.md`
 carries the same text so the rules do not depend on the payload. A task with no room is not fired.
 
-**Non-owner tiers are refused by default, not merely noted.** One routine holds one connector scope —
-the owner's — and unlike the Codex adapter (which runs a non-owner turn on its own ephemeral, read-only
-sandbox), there is no narrower scope to fall back to here: the prompt's note is the only boundary once a
-task is fired. A team or guest task is therefore refused before it is ever sent, with a plain-text result
-("This agent only answers its owner here."), unless `--allow-non-owner` is passed — which should only be true when this specific routine's
-connector scope is meant to be reachable by non-owner senders.
+**Who is served.** Admission is the shared `task_io.admission` gate over the attested headers: the owner,
+an attested collaborator (Team), nobody else. A non-owner without collaborator access (Guest, and any
+collaborator claim the broker did not attest) is refused before anything is sent, with a plain-text result
+("This agent only answers its owner here."), unless `--allow-non-owner` is passed — which fires such tasks
+at the same routine and connector scope as the owner, bounded only by the prompt's note, and should only be
+true when this specific routine's connector scope is meant to be reachable by them. An attested collaborator
+(the broker's `collaborator: true` on the team tier, from the parsed headers, never the message text) never
+reaches the routine at all: with `--allow-collaborator` it is served on the isolated local turn below;
+without it, it gets the same refusal line. `--allow-non-owner` does not imply `--allow-collaborator`. The
+owner path is unchanged.
+
+**The isolated collaborator turn.** `<--claude> -p --safe-mode --restricted --strict-mcp-config --tools
+Read,Grep,Glob --output-format json`, the same payload on stdin (the note, `collaborator=true`, never
+`owner_dm`), in a fresh empty temp directory removed afterwards, with an environment of only `PATH`, `HOME`,
+`USER`, `LANG` and `CLAUDE_CONFIG_DIR`. What it can reach: the CLI's login and the three read tools over an
+empty directory. What it cannot: the routine and its connector, any session or history (no `--cloud`, no
+`--resume`), Bash or code-running tools, the web, MCP servers, CLAUDE.md, hooks, skills, settings, or the
+work dir. The JSON `result` string is the task's result, verbatim, which the bridge posts once in the
+originating room; any failure (non-zero exit, no `result`, timeout, missing CLI) gets the generic "could not
+be sent" line — one try, no retry. These turns have their own cap, `--max-collaborator-per-hour` (default
+10, `state/collaborator-turns.json`), and never count against `--max-per-hour`.
 
 ## Results: why `[no-send]`
 

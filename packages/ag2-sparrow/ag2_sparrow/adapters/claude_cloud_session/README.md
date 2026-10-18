@@ -113,9 +113,28 @@ DM."; with no `owner_dm`, such an answer becomes "I can't answer that here." in 
 else. The whole text is at most 65,536 characters; only the body is cut, ending in
 `[truncated]`. A task with no room is not queued.
 
-**Non-owner tiers are refused by default**, with the routine adapter's plain line ("This agent only
-answers its owner here."): the session holds the owner's connector and there is no narrower scope.
-`--allow-non-owner` queues them anyway, bounded only by the note and the standing instructions.
+**Who is served.** Admission is the shared `task_io.admission` gate over the attested headers: the owner,
+an attested collaborator (Team), nobody else. A non-owner without collaborator access (Guest, and any
+collaborator claim the broker did not attest) is refused with the routine adapter's plain line ("This agent
+only answers its owner here.") unless `--allow-non-owner` is passed, which queues such tasks into this
+session anyway — the owner's history and connector, bounded only by the note and the standing
+instructions. An attested collaborator (the broker's `collaborator: true` on the team tier, from the parsed
+headers, never the message text) never enters this session: with `--allow-collaborator` it is served on
+an isolated local turn; without it, it gets the same refusal line. `--allow-non-owner` does not imply
+`--allow-collaborator`. The owner path is unchanged.
+
+**The isolated collaborator turn** is `<--claude> -p --safe-mode --restricted --strict-mcp-config --tools
+Read,Grep,Glob --output-format json` with the routine adapter's payload on stdin (the note,
+`collaborator=true`; no reminder, no `channel_kind`, no `owner_dm`), in a fresh empty temp directory removed
+afterwards, with the same five-variable environment as above. What it can reach: the CLI's login and the
+three read tools over an empty directory. What it cannot: this session (no `--cloud`, no session id, no
+`--resume`), its history and connector, Bash or code-running tools, the web, MCP servers, CLAUDE.md, hooks,
+skills, settings, or the work dir. The JSON `result` string is the task's result, verbatim, which the
+bridge posts once in the originating room; any failure gets "This message could not be sent to the cloud
+agent right now." — one try, no retry. The turn runs inside the same claim/journal/ledger lifecycle as a
+queued turn, recorded as a `final` outcome, so it is never charged to `--max-per-hour` or
+`--min-gap-seconds`; its own cap is `--max-collaborator-per-hour` (default 10,
+`state/collaborator-turns.json`). The adapter log shows `collaborator turn ->` instead of `queue ->`.
 
 ## Results
 

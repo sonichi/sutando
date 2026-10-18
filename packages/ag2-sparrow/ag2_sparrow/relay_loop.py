@@ -16,16 +16,15 @@ import uuid
 from pathlib import Path
 
 from . import local_task_protocol, result_disposal, task_priority
-from .task_io import (is_collaborator, load_done, non_owner_note, parse_task, record_done, stop_requested, stoppable_sleep,
-                      write_atomic)
+from .task_io import (NON_OWNER_REFUSED, admission, is_collaborator, load_done, non_owner_note,  # noqa: F401
+                      parse_task, record_done, stop_requested, stoppable_sleep, write_atomic)
 
 TEXT_MAX = 65536
 TRUNCATED = "\n[truncated]"
 HOUR = 3600.0
 NO_ROOM = "This message has no room to reply in, so it was not sent to the cloud agent.\n"
-# The cloud agent acts with the owner's AG2 Space connector, so non-owner tiers are refused
-# unless the adapter opts in; the sender sees only this plain line.
-NON_OWNER_REFUSED = "This agent only answers its owner here.\n"
+# A non-owner tier never learns a status or error detail: that is the owner's connector state.
+NON_OWNER_FAILED = "This message could not be sent to the cloud agent right now.\n"
 
 
 def log(*a):
@@ -81,10 +80,8 @@ def result_body(outcome, mode, owner=True, label="claude routine session"):
         if mode == "echo" and owner:
             return "Sent to the cloud agent: %s\n" % url
         return "[no-send]\n# %s: %s\n" % (label, url)
-    # A non-owner tier never learns a status or error detail: that is the owner's
-    # connector state, and the sender is not the owner.
     if not owner:
-        return "This message could not be sent to the cloud agent right now.\n"
+        return NON_OWNER_FAILED
     if outcome.kind == "rejected":
         return "The cloud agent could not take this message (HTTP %s, %s).\n" % (outcome.status, outcome.detail)
     if outcome.kind == "rate_limited":
@@ -226,14 +223,16 @@ class RelayLoop:
             return None
 
     def refusal(self, name, headers, seen):
-        """None when the task may be served: the owner, an attested collaborator (served read-only
-        with the non-owner note whatever --allow-non-owner says), or any tier under --allow-non-owner.
-        Otherwise the refusal is finished and its step result returned: True when published, False
+        """None when task_io.admission admits the task (a collaborator only under --allow-collaborator);
+        otherwise the refusal is finished and its step result returned: True when published, False
         when parked."""
-        tier = headers.get("access_tier") or "guest"
-        if tier == "owner" or is_collaborator(headers) or self.args.allow_non_owner:
+        kind = admission(headers, self.args.allow_non_owner)
+        if kind == "collaborator" and not self.args.allow_collaborator:
+            log("refused (collaborator, --allow-collaborator not set) ->", name[:-4])
+            return self.finish(name, NON_OWNER_REFUSED, seen)
+        if kind is not None:
             return None
-        log("refused (non-owner, --allow-non-owner not set) ->", name[:-4], tier)
+        log("refused (non-owner, --allow-non-owner not set) ->", name[:-4], headers.get("access_tier") or "guest")
         return self.finish(name, NON_OWNER_REFUSED, seen)
 
     def schedule_retry(self, task_id, detail, at_least=0.0):

@@ -19,7 +19,15 @@ The tier comes from the attested headers (`task_io.attested_headers` over
 gateway-written `task_layout: mid` file takes `access_tier` from the writer's trailer below the
 body. Absent or unknown → `guest`. `collaborator` rides along.
 
-| | owner | team / guest / other / ambient |
+Admission is the shared `task_io.admission` gate: the owner and an attested collaborator (Team — the
+broker's `collaborator: true` on the team tier, from the parsed headers, never the message text) are
+served. A non-owner without collaborator access (Guest, and any collaborator claim the broker did not
+attest) gets "This agent only answers its owner here." as its result — no thread started, no turn, the
+log says `refused (non-owner, --allow-non-owner not set)` — unless `--allow-non-owner` is passed, which
+serves them exactly like a collaborator, on the ephemeral read-only thread in the right-hand column. The
+owner path is unchanged.
+
+| | owner | attested collaborator, or any non-owner under `--allow-non-owner` |
 |---|---|---|
 | thread | durable, one per `channel_id` (`state/threads/<sha256 of the id>`, the readable id inside the file), resumed across restarts; owner tasks with no `channel_id` share the one `default` thread; `--thread-id CHANNEL_ID=THREAD` seeds exactly that channel | a fresh **ephemeral** thread per task, never reused, never saved |
 | cwd | `--cwd` (default `--work`) | an empty temp dir, removed after the turn, so no room's `tasks/` or `results/` is in reach |
@@ -34,7 +42,8 @@ cannot see another room's or the owner's thread, cannot write, and cannot be que
 owner's TUI. What it can still do is *read* within Codex's `read-only` sandbox and answer in its
 own room; how far that sandbox lets reads reach outside `cwd` is not measured here. Sparrow
 never stamps envelopes, so there is no signature to check: an `invalid`/`unsigned` task is
-submitted like any other, and the tier is the only gate — hence the hard isolation above.
+submitted like any other, and the attested tier is the only gate — hence the refusal by default and the
+hard isolation above for whoever is admitted.
 
 ## Three shapes
 

@@ -19,27 +19,22 @@ import sys
 import time
 
 from ... import task_lifecycle
-from ...relay_loop import NO_ROOM, TEXT_MAX, Outcome, RelayLoop, build_payload, count_arg, log, result_body
+from ...collaborator_turn import ENV_KEEP, child_env, run_collaborator_turn  # noqa: F401
+from ...relay_loop import (NO_ROOM, NON_OWNER_FAILED, TEXT_MAX, Outcome, RateLimiter, RelayLoop, build_payload,
+                           count_arg, log, result_body)
 from ...task_io import (LockRefused, acquire_lock, clear_attributed_pidfile, exit_code, exit_on_sigterm,
-                        make_dirs, non_owner_note, release_lock, root_path, stoppable_sleep)
+                        is_collaborator, make_dirs, non_owner_note, release_lock, root_path, stoppable_sleep)
 
 SESSION_RE = re.compile(r"session_[A-Za-z0-9]+")
 ROOM_RE = re.compile(r"![^\s:]+:\S+")
 REMINDER = ("[sparrow task] Follow your standing AG2 Space instructions for this message: one answer, "
             "to exactly one place they name (plus only the one DM pointer line when they say so), "
             "then end with posted/not posted <task_id>.")
-# CLAUDE_CONFIG_DIR selects which login the CLI uses; without it the CLI falls back to the user default.
-ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "CLAUDE_CONFIG_DIR")
 LABEL = "claude cloud session"
 # Output that proves the CLI never reached the service, so the turn was not queued.
 UNSENT_RE = re.compile(r"ENOTFOUND|EAI_AGAIN|ECONNREFUSED|getaddrinfo|Could not resolve host|"
                        r"nodename nor servname|Name or service not known", re.I)
 INTERRUPTED = Outcome("ambiguous", detail="interrupted")
-
-
-def child_env(environ=None):
-    env = os.environ if environ is None else environ
-    return {k: env[k] for k in ENV_KEEP if env.get(k)}
 
 
 def channel_kind(headers):
@@ -124,6 +119,9 @@ class Adapter(RelayLoop):
         self.env = child_env(environ)
         self.lc = task_lifecycle.Lifecycle(args.work, clock=clock, log=log)
         self.limiter = JournalGate(self.lc.journal, args.max_per_hour)
+        # Collaborator turns never touch the session, so they have their own cap, outside the rate journal.
+        self.collab_limiter = RateLimiter(os.path.join(args.state, "collaborator-turns.json"),
+                                          args.max_collaborator_per_hour, clock)
         # The loop's done ledger is the settled-ids ledger: same one-id-per-line format, repaired on open.
         self.done_path = self.lc.settled.path
         self.attempts, self.limited, self.not_before = {}, {}, {}
@@ -196,7 +194,12 @@ class Adapter(RelayLoop):
         refused = self.refusal(name, headers, seen)
         if refused is not None:
             return refused
-        room, text = build_text(task_id, headers, message, operator_lines, self.note, self.args.owner_dm)
+        collaborator = is_collaborator(headers)
+        if collaborator:
+            # The isolated turn has no standing instructions, so no reminder and no owner_dm.
+            room, text = build_payload(task_id, headers, message, operator_lines, self.note)
+        else:
+            room, text = build_text(task_id, headers, message, operator_lines, self.note, self.args.owner_dm)
         if not room:
             log("no room ->", task_id)
             return self.finish(name, NO_ROOM, seen)
@@ -207,10 +210,20 @@ class Adapter(RelayLoop):
             return True
         if decision == "park":
             return self.park(task_id, state)
+        if collaborator and self.collab_limiter.wait_seconds() > 0:
+            log("collaborator cap reached ->", task_id)
+            return self.finish(name, NON_OWNER_FAILED, seen)
         attempt = self.lc.prepare(task_id, result_body(INTERRUPTED, self.args.result_mode, owner, LABEL))
         if not self.lc.begin_call(task_id, attempt, os.path.join(self.args.inbox, name)):
             self._settled(name, seen)
             return True
+        if collaborator:
+            self.collab_limiter.record()
+            log("collaborator turn ->", task_id, "attempt", attempt, "chars", len(text))
+            turn = run_collaborator_turn(self.args.claude, text, self.env, run=self.run)
+            log("result <-", task_id, turn.kind, turn.detail)
+            self.lc.record_outcome(task_id, "final", turn.text if turn.kind == "ok" else NON_OWNER_FAILED, turn.detail)
+            return self._publish(name, seen)
         log("queue ->", task_id, headers.get("access_tier"), "attempt", attempt, "chars", len(text))
         out = queue_turn(self.args.claude, self.args.session_id, text, self.env, self.args.timeout, self.run)
         if out.kind == "retry":
@@ -240,12 +253,21 @@ def build_parser():
                          "instead of a shared room")
     ap.add_argument("--result-mode", choices=["no-send", "echo"], default="no-send")
     ap.add_argument("--allow-non-owner", action="store_true",
-                    help="queue non-owner tasks too, into the same session and connector scope as the "
-                         "owner. Off by default: the session holds the owner's AG2 Space connector, "
-                         "and a non-owner tier is bounded only by the prompt's note otherwise.")
+                    help="queue tasks from non-owner senders without collaborator access too (guests, and any "
+                         "collaborator claim the broker did not attest), into the same session and connector "
+                         "scope as the owner. Off by default: the session holds the owner's history and AG2 "
+                         "Space connector, and such a sender is bounded only by the prompt's note otherwise. An "
+                         "attested collaborator is not covered by it: see --allow-collaborator.")
+    ap.add_argument("--allow-collaborator", action="store_true",
+                    help="serve attested collaborators (Team) on an isolated local turn: a fresh `claude -p` "
+                         "with the three read tools in an empty directory, never this session, no connector, "
+                         "no history; off by default, so they are refused with the same plain line")
     ap.add_argument("--min-gap-seconds", type=float, default=2.0, help="least time between two queued turns")
     ap.add_argument("--max-per-hour", type=int, default=60,
                     help="turns queued (or possibly queued) in a sliding hour; proven-unsent attempts do not count")
+    ap.add_argument("--max-collaborator-per-hour", type=int, default=10,
+                    help="isolated collaborator turns in a sliding hour; they never count against --max-per-hour "
+                         "or --min-gap-seconds")
     ap.add_argument("--max-retries", type=int, default=2,
                     help="retries per task for failures that prove the turn was not queued; anything ambiguous is never retried")
     ap.add_argument("--backoff", type=float, default=2.0, help="first retry delay, doubled per retry")

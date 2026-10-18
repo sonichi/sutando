@@ -8,10 +8,12 @@ daemon, or the stub in this directory. Each `tasks/task-*.txt` becomes one
 `results/task-<id>.txt`. `--push` instead hands the wrapped text to `codex queue`,
 which delivers into a thread owned by a running interactive TUI. Stdlib only.
 
-Tier policy, from the attested headers: an owner task runs on a durable thread kept
-per channel_id (state/threads/<key>) with the configured sandbox; any other tier
-runs on its own ephemeral thread, read-only, with the Hatch adapter's NON_OWNER_NOTE
-in the prompt, and is refused by --push. The tier is never taken from message text.
+Tier policy, from the attested headers (task_io.admission): an owner task runs on a
+durable thread kept per channel_id (state/threads/<key>) with the configured sandbox;
+an attested collaborator, or any non-owner under --allow-non-owner, runs on its own
+ephemeral thread, read-only, with the shared NON_OWNER_NOTE in the prompt, and is
+refused by --push; every other non-owner gets NON_OWNER_REFUSED as its result. The
+tier is never taken from message text.
 """
 import argparse
 import hashlib
@@ -27,9 +29,10 @@ import time
 import uuid
 
 from ...relay_loop import count_arg
-from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, LockRefused, acquire_lock, attested_headers,  # noqa: F401
-                        exit_on_sigterm, load_done, make_dirs, non_owner_note, parse_task, pid_alive,
-                        exit_code, record_done, release_lock, root_path, stop_requested, write_atomic)
+from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock,  # noqa: F401
+                        admission, attested_headers, exit_on_sigterm, load_done, make_dirs, non_owner_note,
+                        parse_task, pid_alive, exit_code, record_done, release_lock, root_path, stop_requested,
+                        write_atomic)
 
 CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
 APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
@@ -397,6 +400,13 @@ class Connector:
             t_mtime = os.stat(path).st_mtime
             t_seen = time.time()
             headers, message, operator_lines = parse_task(path)
+            if admission(headers, self.args.allow_non_owner) is None:
+                log("refused (non-owner, --allow-non-owner not set) ->", task_id, headers["access_tier"])
+                write_atomic(os.path.join(self.args.results, name), NON_OWNER_REFUSED)
+                record_done(done_path, task_id)
+                done += 1
+                idle_since = time.time()
+                continue
             prompt = wrap_untrusted(task_id, headers, message, operator_lines, self.note)
             log("turn ->", task_id, headers["access_tier"], repr(message[:60]))
             t_sent = time.time()
@@ -452,6 +462,11 @@ def build_parser():
     ap.add_argument("--model", default=None)
     ap.add_argument("--sandbox", default=NON_OWNER_SANDBOX, choices=["read-only", "workspace-write", "danger-full-access"],
                     help="sandbox for OWNER threads; every other tier is always read-only")
+    ap.add_argument("--allow-non-owner", action="store_true",
+                    help="serve tasks from non-owner senders without collaborator access too (guests, and any "
+                         "collaborator claim the broker did not attest), each on its own ephemeral read-only "
+                         "thread. Off by default: they are refused with a plain line. An attested collaborator "
+                         "never needs it: it always gets that ephemeral read-only thread.")
     ap.add_argument("--thread-id", default=None, metavar="CHANNEL_ID=THREAD",
                     help="resume THREAD for exactly this owner channel when it has no saved thread yet")
     ap.add_argument("--ephemeral", action="store_true", help="owner threads too: do not persist to the Codex home")
