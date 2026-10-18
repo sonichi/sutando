@@ -178,32 +178,13 @@ def lock_path(work):
 
 
 def lock_held(work):
-    """held | free | unknown: a non-blocking flock probe of `work`'s one-process lock, released at
-    once. A root or lock file that does not exist is free; a probe that cannot run is unknown."""
-    import fcntl
+    """held | free | unknown: holder_lock.occupancy's tri-state (unobserved reads as unknown). A free
+    flock whose record names a live or unverifiable holder or consumer is held or unknown, never free."""
     try:
-        directory = holder_lock.lock_dir(work)
-    except FileNotFoundError:
-        return "free"
+        state = holder_lock.occupancy(work)
     except (OSError, holder_lock.LockError):
         return "unknown"
-    try:
-        fd = os.open(os.path.join(directory, holder_lock.LOCK_NAME), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
-    except FileNotFoundError:
-        return "free"
-    except OSError:
-        return "unknown"
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return "held"
-        except OSError:
-            return "unknown"
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return "free"
-    finally:
-        os.close(fd)
+    return "unknown" if state == "unobserved" else state
 
 
 def acquire_lock(work, adapter, retry_s=0.0):

@@ -362,6 +362,28 @@ class LockTest(Base):
         self.assertEqual(rc, 2)
         self.assertIn("root changed", err)
 
+    def test_lock_held_is_holder_locks_occupancy(self):
+        """task_io.lock_held delegates to the one tri-state reader; unobserved reads as unknown."""
+        self.assertEqual(task_io.lock_held(str(self.work)), "free")
+        with mock.patch.object(holder_lock, "occupancy", return_value="unobserved") as occ:
+            self.assertEqual(task_io.lock_held(str(self.work)), "unknown")
+        occ.assert_called_once_with(str(self.work))
+        with mock.patch.object(holder_lock, "occupancy", side_effect=holder_lock.LockError("x")):
+            self.assertEqual(task_io.lock_held(str(self.work)), "unknown")
+        child = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(lambda: (child.kill(), child.wait(10)))
+        start = holder_lock.start_time(child.pid)
+        self.work.mkdir(exist_ok=True)
+        lock_dir = Path(holder_lock.lock_dir(str(self.work)))
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        (lock_dir / "lock").touch()
+        (lock_dir / "holder").write_bytes(json.dumps({
+            "schema": 2, "adapter": "claude-local", "pid": child.pid, "start": start, "host": holder_lock._host(),
+            "install_id": "i", "lock": {"dev": 1, "ino": 2}, "acquired_at": 1.0, "owner_pid": 2 ** 22 - 1,
+            "owner_start": "2000-01-01T00:00:00Z", "consumer": {"pid": child.pid, "start": start},
+            "tombstone": None}).encode())
+        self.assertEqual(task_io.lock_held(str(self.work)), "held", "a free flock, a live consumer: the sticky rule")
+
     def test_the_lock_is_the_first_act(self):
         self.holder()
         before = sorted(os.listdir(self.work))
