@@ -220,9 +220,16 @@ class Measure(unittest.TestCase):
 from ag2_sparrow import _dirs, connect_common as cm, holder_lock  # noqa: E402
 from ag2_sparrow.adapters.claude_code import cli  # noqa: E402
 
-FAKE_CLAUDE = r'''#!%(py)s
-import json, os, sys
+# Susan's nit: the fake is a #!/bin/sh wrapper that execs the quoted interpreter on the body beside
+# it, so an interpreter path containing a space works where a shebang could not carry it.
+FAKE_CLAUDE_SH = '''#!/bin/sh
+exec "%(py)s" "$0.py" "$@"
+'''
+FAKE_CLAUDE = r'''import json, os, sys
 home = os.environ["HOME"]
+# The wrapper is what the launcher ran; record it as argv[0], as a real claude would see itself.
+if sys.argv[0].endswith(".py"):
+    sys.argv[0] = sys.argv[0][:-3]
 def read(name, default):
     try:
         return open(os.path.join(home, name)).read().strip()
@@ -236,8 +243,10 @@ if sys.argv[1:3] == ["auth", "status"]:
 try:
     listing = sorted(os.listdir(os.environ.get("AG2_INBOX_DIR", ".")))
 except OSError as e:
-    listing = ["ERROR %%s" %% e]
-json.dump({"argv": sys.argv, "env": dict(os.environ), "cwd": os.getcwd(), "pid": os.getpid(), "ppid": os.getppid(),
+    listing = ["ERROR %s" % e]
+# PWD, SHLVL, OLDPWD and _ are the sh wrapper's own, never the launcher's.
+env = {k: v for k, v in os.environ.items() if k not in ("PWD", "SHLVL", "OLDPWD", "_")}
+json.dump({"argv": sys.argv, "env": env, "cwd": os.getcwd(), "pid": os.getpid(), "ppid": os.getppid(),
            "listing": listing},
           open(os.path.join(home, "claude-session.json"), "w"))
 import signal, time
@@ -248,6 +257,17 @@ if read("claude-signal-parent", ""):
 time.sleep(float(read("claude-linger", "0")))
 sys.exit(int(read("claude-exit", "0")))
 '''
+
+
+def write_fake_claude(path, py=sys.executable):
+    """The wrapper at `path` (what --claude names) and its Python body at `path`.py."""
+    path = Path(path)
+    path.write_text(FAKE_CLAUDE_SH % {"py": py})
+    path.chmod(0o755)
+    path.with_name(path.name + ".py").write_text(FAKE_CLAUDE)
+    return path
+
+
 TOKEN = "tok-FAKE-RELAY-TOKEN-never-copied"
 L = cli.LOCAL
 STAND_IN = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import holder_lock, task_io\n"
@@ -429,15 +449,36 @@ class Runner:
         return self.session.pid if self.session else None
 
 
+class FakeClaudeWrapper(unittest.TestCase):
+    """The harness's fake claude works through an interpreter path containing a space."""
+
+    def test_the_wrapper_execs_the_quoted_interpreter_from_a_path_with_a_space(self):
+        with tempfile.TemporaryDirectory() as d:
+            spaced = Path(d) / "py dir" / "python3"
+            spaced.parent.mkdir()
+            spaced.symlink_to(sys.executable)
+            home = Path(d) / "home"
+            home.mkdir()
+            claude = write_fake_claude(Path(d) / "claude", py=str(spaced))
+            self.assertEqual(claude.read_text().splitlines()[0], "#!/bin/sh")
+            self.assertIn('exec "%s" "$0.py" "$@"' % spaced, claude.read_text())
+            r = subprocess.run([str(claude), "--version"], capture_output=True, text=True,
+                               env={"PATH": "/usr/bin:/bin", "HOME": str(home)}, cwd=d)
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, "2.1.296 (Claude Code)"), r.stderr)
+            r = subprocess.run([str(claude), "--plugin-dir", "x"], capture_output=True, text=True,
+                               env={"PATH": "/usr/bin:/bin", "HOME": str(home), "AG2_INBOX_DIR": d}, cwd=d)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            rec = json.loads((home / "claude-session.json").read_text())
+            self.assertEqual(rec["argv"], [str(claude), "--plugin-dir", "x"], "argv[0] is the wrapper the launcher ran")
+
+
 class ConnectBase(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp()).resolve()   # macOS: /var is /private/var once resolved
         self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
         self.bin = self.home / "bin"
         self.bin.mkdir()
-        self.claude = self.bin / "claude"
-        self.claude.write_text(FAKE_CLAUDE % {"py": sys.executable})
-        self.claude.chmod(0o755)
+        self.claude = write_fake_claude(self.bin / "claude")
         self.work = self.home / "work"
         self.inbox, self.results = self.work / "tasks", self.work / "results"
         self.plugin = self.home / "plugin"
