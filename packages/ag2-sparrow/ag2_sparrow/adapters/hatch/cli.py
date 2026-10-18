@@ -29,6 +29,7 @@ from importlib import resources
 from pathlib import Path
 
 from ... import _dirs, gateway_credential_sources, gateway_credentials, gateway_instance, outbox, workspace_lock
+from ...bounded_file_read import read_regular_text
 from ...result_markers import parse_markers
 from .task_fields import item_id, valid_mxid
 
@@ -132,11 +133,8 @@ def _record_script(sha: str) -> None:
 
 
 def _read_text(path):
-    """A credential file's text, or None when it cannot be read."""
-    try:
-        return Path(path).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return None
+    """A credential file's text, or None when it cannot be read (bounded_file_read)."""
+    return read_regular_text(path)
 
 
 def _credential_discovery():

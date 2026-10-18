@@ -114,16 +114,21 @@ def config_from_files(files: "Sequence[EnvFile]", key: str) -> str:
     return ""
 
 
-def _assignments(text: str, keys) -> "dict[str, str]":
-    found = {}
+def _assignment_pairs(text: str, keys) -> "list[tuple[str, str]]":
+    """Every (key, value) assignment of `keys` in `text`, in order, duplicates included."""
+    found = []
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("export "):
             line = line[len("export "):].lstrip()
         for key in keys:
             if line.startswith(key + "="):
-                found[key] = unquote(line[len(key) + 1:])
+                found.append((key, unquote(line[len(key) + 1:])))
     return found
+
+
+def _assignments(text: str, keys) -> "dict[str, str]":
+    return dict(_assignment_pairs(text, keys))
 
 
 def token_file_token(text: str) -> str:
@@ -211,6 +216,8 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
     if registry is not None:
         register(registry, [unquote(env.get(key) or "") for key in CREDENTIAL_KEYS])
         register(registry, [values.get(key) or "" for _p, values in files for key in CREDENTIAL_KEYS])
+        # Every assignment read, not only the winners: a losing alias or overwritten duplicate was read too.
+        register(registry, [v for _k, v in _assignment_pairs(token_file_text, TOKEN_KEYS + URL_KEYS)])
         register(registry, [token_file_token(token_file_text), token_file_url(token_file_text)])
 
     found = {"raw": "", "token_key": "", "source": "none", "source_file": "", "source_vals": {},

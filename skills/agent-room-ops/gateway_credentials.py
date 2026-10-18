@@ -374,17 +374,32 @@ def mask_assignment(key: str, value: str, registry: "SecretRegistry | None" = No
     return value
 
 
-def _logical_lines(text: str) -> "list[list[str]]":
-    """Physical lines grouped as systemd reads them: a line ending in a backslash continues."""
-    groups, current = [], []
+def _is_comment(line: str) -> bool:
+    return line.lstrip().startswith(("#", ";"))
+
+
+def _logical_lines(text: str) -> "list[tuple[list[str], str, list[str]]]":
+    """Physical lines grouped as systemd reads them, as (lines, joined text, skipped comments): a
+    line ending in a backslash continues, and a comment line inside a continuation is skipped
+    without ending it."""
+    groups, current, kept, skipped = [], [], [], []
     for line in text.splitlines(True):
+        body = line.rstrip("\r\n")
         current.append(line)
-        if not line.rstrip("\r\n").endswith("\\"):
-            groups.append(current)
-            current = []
+        if kept and _is_comment(body):
+            skipped.append(body)
+            continue
+        kept.append(body)
+        if not body.endswith("\\"):
+            groups.append((current, _join(kept), skipped))
+            current, kept, skipped = [], [], []
     if current:
-        groups.append(current)
+        groups.append((current, _join(kept), skipped))
     return groups
+
+
+def _join(pieces: "list[str]") -> str:
+    return " ".join(p[:-1] if i < len(pieces) - 1 else p for i, p in enumerate(pieces))
 
 
 def _mask_logical(body: str, registry: "SecretRegistry | None") -> str:
@@ -410,17 +425,15 @@ def _mask_logical(body: str, registry: "SecretRegistry | None") -> str:
 
 def mask_env_assignments(text: str, registry: "SecretRegistry | None" = None) -> str:
     """A unit file, .env or config as it may be shown (an install diff). Continued lines are joined
-    first, as systemd joins them. Every assignment on an `Environment=` line (one or several,
+    first, as systemd joins them, past any comment line inside the continuation. Every assignment on an `Environment=` line (one or several,
     quoted or not) and every `KEY=value` line is masked by mask_assignment; any other line is
     withheld whole when it holds a registered secret. A logical line that changed is shown as one
     line, so no physical piece of it prints raw."""
     out = []
-    for group in _logical_lines(text):
+    for group, joined, skipped in _logical_lines(text):
         end = "\n" if group[-1].endswith("\n") else ""
-        pieces = [line.rstrip("\r\n") for line in group]
-        joined = " ".join(p[:-1] if i < len(pieces) - 1 else p for i, p in enumerate(pieces))
         masked = _mask_logical(joined, registry)
-        if masked == joined:
+        if masked == joined and all(_mask_logical(c, registry) == c for c in skipped):
             out.append("".join(group))
         else:
             out.append(masked + end)

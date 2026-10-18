@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -188,6 +189,20 @@ class PureContractCases:
             for piece in ("en-Q7zZ-live", "Synth9Tok", "retired-cont-9988", "spaced-retired-7766", "spaced-retired-5544"):
                 self.assertNotIn(piece, shown, continued)
 
+    def test_a_comment_inside_a_continuation_does_not_end_it(self):
+        registry = self.c.SecretRegistry()
+        registry.register("comment-held-4410")
+        for unit in ('Environment="REMOTE_TASK_TOKEN=retired-first-9382\\\n# comment\nretired-last-8372"\n',
+                     'Environment="REMOTE_TASK_TOKEN=retired-first-9382\\\n  ; one\n# two \\\nretired-last-8372"\n',
+                     'Environment=SAFE=keep-me \\\n# comment-held-4410\n  OTHER=x\n'):
+            shown = self.c.mask_env_assignments(unit, registry)
+            for piece in ("retired-first-9382", "retired-last-8372", "comment-held-4410"):
+                self.assertNotIn(piece, shown, unit)
+        self.assertEqual(self.c.mask_env_assignments('Environment="REMOTE_TASK_TOKEN=a-1\\\n# c\nb-2"\nExecStart=/x\n'),
+                         "Environment=REMOTE_TASK_TOKEN=<withheld>\nExecStart=/x\n")
+        self.assertEqual(self.c.mask_env_assignments("# top\nA=b\n"), "# top\nA=b\n",
+                         "a comment outside a continuation is its own line")
+
     def test_edge_paths_never_raise(self):
         registry = self.c.SecretRegistry()
         registry.register("\ud800lone")  # not even surrogateescape encodes a lone high surrogate
@@ -264,6 +279,17 @@ class DiscoveryCases:
                     if candidate == fx.vault and found.token_source != "vault":
                         continue  # the vault is read only when no earlier source holds a token
                     self.assertTrue(registry.contains(f"x {candidate} y"), candidate)
+
+    def test_every_token_file_assignment_is_registered(self):
+        text = ("REMOTE_TASK_TOKEN=current-file-9821\nAG2_REMOTE_TOKEN=legacy-file-7364\n"
+                "REMOTE_TASK_TOKEN=overwritten-file-5530\nAG2_REMOTE_URL=https://legacy-u:legacy-p-6612@gw.example/r\n")
+        registry = self.o.contract.SecretRegistry()
+        found = self.o.discover({"REMOTE_TASK_TOKEN": ENV_TOKEN, "REMOTE_TASK_URL": GW, "REMOTE_TASK_TOKEN_FILE": "/t"},
+                                read_token_file=lambda p: text, registry=registry)
+        self.assertEqual((found.token, found.token_source), (ENV_TOKEN, "env"))
+        for secret in ("current-file-9821", "legacy-file-7364", "overwritten-file-5530", "legacy-p-6612"):
+            self.assertTrue(registry.contains(secret), secret)
+            self.assertNotIn(secret, self.o.contract.mask_env_assignments(f"Environment=NOTE={secret}\n", registry))
 
     def test_a_url_shaped_bearer_is_registered_whole(self):
         registry = self.o.contract.SecretRegistry()
@@ -343,7 +369,7 @@ print(json.dumps({"token": m.TOKEN, "source": m._FOUND.token_source, "url": m.UR
 class RealSinks(unittest.TestCase):
     """The same rows through the real bridge and the real Hatch install diff."""
 
-    def bridge(self, fx, script=BRIDGE):
+    def bridge(self, fx, script=BRIDGE, timeout=60):
         state = fx.root / "state"
         env = {"PATH": "/usr/bin:/bin", "HOME": str(fx.root), "PYTHONPATH": str(PKG),
                "AGENT_CONNECT_TASK_DIR": str(fx.root / "t"), "AGENT_CONNECT_RESULT_DIR": str(fx.root / "r"),
@@ -356,7 +382,7 @@ class RealSinks(unittest.TestCase):
             env["PYTHONPATH"] += os.pathsep + str(Path(coverage.__file__).parent.parent)
             cmd = [sys.executable, "-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}", str(child)]
             cwd = REPO
-        r = subprocess.run(cmd, env=env, capture_output=True, text=True, cwd=str(cwd), timeout=60)
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, cwd=str(cwd), timeout=timeout)
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1]), r.stderr
 
@@ -429,13 +455,85 @@ class RealSinks(unittest.TestCase):
                     self.assertNotIn(secret.casefold(), shown.casefold(), secret)
 
 
+    def hatch_diff(self, fx, installed: str) -> str:
+        unit = fx.root / "ag2-sparrow.service"
+        unit.write_text(installed)
+        out = io.StringIO()
+        env = {k: v for k, v in os.environ.items() if k not in owner.CREDENTIAL_KEYS}
+        env.update(fx.env, HOME=str(fx.root))
+        with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            hatch_cli._install_file(unit, "[Service]\nExecStart=/y\n", 0o644, refuse_drift=True, force=False)
+        self.assertIn("DIFF:", out.getvalue())
+        return out.getvalue()
+
+    def test_the_hatch_install_diff_masks_past_a_comment_in_a_continuation(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), ROWS[0])
+            shown = self.hatch_diff(fx, '[Service]\nEnvironment="REMOTE_TASK_TOKEN=retired-first-9382\\\n'
+                                        '# comment\nretired-last-8372"\nExecStart=/x\n')
+            self.assertNotIn("retired-first-9382", shown)
+            self.assertNotIn("retired-last-8372", shown)
+            self.assertIn("Environment=REMOTE_TASK_TOKEN=<withheld>", shown)
+
+    def test_the_hatch_install_diff_withholds_a_losing_token_file_alias(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), ROWS[0])
+            fx.token_file.write_text("REMOTE_TASK_TOKEN=current-file-9821\nAG2_REMOTE_TOKEN=legacy-file-7364\n")
+            fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
+            shown = self.hatch_diff(fx, "[Service]\nEnvironment=NOTE=legacy-file-7364\n"
+                                        "Environment=OTHER=current-file-9821\nExecStart=/x\n")
+            self.assertNotIn("legacy-file-7364", shown)
+            self.assertNotIn("current-file-9821", shown)
+
+    def test_a_fifo_credential_path_never_hangs_the_bridge_import(self):
+        for where in ("REMOTE_TASK_TOKEN_FILE", "AG2_DEVICE_ENV"):
+            with self.subTest(where=where), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), ROWS[0])
+                fifo = fx.root / "fifo"
+                os.mkfifo(fifo)  # no writer: a blocking open or read never returns
+                fx.env[where] = str(fifo)
+                out, _err = self.bridge(fx, timeout=20)
+                self.assertEqual((out["token"], out["source"]), (ENV_TOKEN, "env"))
+
+
+class BoundedRead(unittest.TestCase):
+    COPIES = {"package": _load("bounded_file_read_pkg", PKG / "ag2_sparrow" / "bounded_file_read.py"),
+              "src": _load("bounded_file_read_src", REPO / "src" / "bounded_file_read.py")}
+
+    def read(self, m, path, **kw):
+        box = []
+        t = threading.Thread(target=lambda: box.append(m.read_regular_text(str(path), **kw)), daemon=True)
+        t.start()
+        t.join(10)
+        self.assertFalse(t.is_alive(), f"{path} blocked the read")
+        return box[0]
+
+    def test_only_a_bounded_regular_file_is_read(self):
+        for name, m in self.COPIES.items():
+            with self.subTest(copy=name), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                os.mkfifo(root / "fifo")
+                (root / "ok").write_bytes(b"A=b\r\nC=d\n")
+                (root / "big").write_bytes(b"x" * 33)
+                (root / "bad").write_bytes(b"\xff\xfe")
+                self.assertEqual(self.read(m, root / "ok"), "A=b\nC=d\n")
+                self.assertIsNone(self.read(m, root / "fifo"))
+                self.assertIsNone(self.read(m, root))
+                self.assertIsNone(self.read(m, root / "missing"))
+                self.assertIsNone(self.read(m, root / "bad"))
+                self.assertIsNone(self.read(m, root / "big", limit=32))
+                self.assertEqual(self.read(m, root / "big", limit=33), "x" * 33)
+
+
 SOURCE_KEYS = set(owner.CREDENTIAL_KEYS) | {owner.TOKEN_FILE_KEY}
 KEY_TUPLES = {"TOKEN_KEYS", "URL_KEYS", "CREDENTIAL_KEYS", "TOKEN_FILE_KEY", "MEDIA_TOKEN_KEY"}
 # What names a credential file or store: a scope holding one of these and a read is credential I/O.
 CREDENTIAL_MARKERS = {"AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR", "TOKEN_FILE", "device_env_path",
                       "channel_env_paths", "env_files", "channel_token", "token_from_vault"}
 READS = {"open", "read_text", "read_bytes", "readlines"}
-OWNER_READERS = {"env_files": 1, "discover": None}  # owner calls whose callable arguments read credentials
+# Owner calls whose callable arguments read credentials: (positional index, keyword names).
+OWNER_READERS = {"env_files": (1, ("read_text",)), "discover": (None, ("read_token_file", "vault_lookup"))}
 # Where credential I/O may happen: the adapters' edge, as (module, function).
 IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_bridge.py", "_read_text"),
               ("remote_gateway_bridge.py", "_vault_lookup"), ("adapters/hatch/cli.py", "_read_text")}
@@ -454,6 +552,24 @@ def _constant(node):
     if isinstance(node, ast.FormattedValue) and node.conversion == -1 and node.format_spec is None:
         return _constant(node.value)
     return None
+
+
+def _free_refs(node, bound=frozenset()):
+    """Names and attributes `node` reads, minus names bound as a parameter of a lambda enclosing
+    the use; a default is evaluated outside its lambda, so the names it reads stay free."""
+    if isinstance(node, ast.Lambda):
+        a = node.args
+        for default in a.defaults + [d for d in a.kw_defaults if d is not None]:
+            yield from _free_refs(default, bound)
+        params = {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg] if x}
+        yield from _free_refs(node.body, bound | params)
+        return
+    if isinstance(node, ast.Name) and node.id not in bound:
+        yield node.id
+    elif isinstance(node, ast.Attribute):
+        yield node.attr
+    for child in ast.iter_child_nodes(node):
+        yield from _free_refs(child, bound)
 
 
 def credential_access(source: str, rel: str) -> "list[str]":
@@ -510,15 +626,13 @@ def credential_access(source: str, rel: str) -> "list[str]":
         callee = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
         if callee not in OWNER_READERS:
             continue
-        handed = [k.value for k in call.keywords if k.arg in ("read_token_file", "vault_lookup")]
-        handed += call.args[1:2] if OWNER_READERS[callee] == 1 else []
+        index, keywords = OWNER_READERS[callee]
+        handed = [k.value for k in call.keywords if k.arg in keywords]
+        handed += call.args[index:index + 1] if index is not None else []
         for value in handed:
-            params = {a.arg for lam in ast.walk(value) if isinstance(lam, ast.Lambda) for a in ast.walk(lam.args)
-                      if isinstance(a, ast.arg)}
-            # A reader handed in, a lambda's body included, may only call or name allowlisted readers.
-            for ref in ast.walk(value):
-                word = ref.id if isinstance(ref, ast.Name) else ref.attr if isinstance(ref, ast.Attribute) else None
-                if word and word not in params and (rel, word) not in IO_ALLOWED:
+            # A reader handed in, a lambda's body and defaults included, may only name allowlisted readers.
+            for word in _free_refs(value):
+                if (rel, word) not in IO_ALLOWED:
                     out.append(f"{rel}:{call.lineno} reader {word} handed to the owner")
     return out
 
@@ -554,11 +668,16 @@ class Guard(unittest.TestCase):
             'discover(env, files, read_token_file=lambda p: open(p).read())',
             'discover(env, files, vault_lookup=lambda k: Path(k).read_text())',
             'env_files(env, lambda p: open(p).read())',
+            'env_files(env, read_text=lambda p: open(p).read())',
+            'discover(env, files, read_token_file=lambda p, open=open, read=None: open(p).read())',
+            'discover(env, files, read_token_file=lambda p, r=_read_anything: r(p))',
         ]
         for source in bypasses:
             self.assertTrue(credential_access(source, "probe.py"), source)
         allowed = ('def _read_text(path):\n    return open(path).read()\nfiles = env_files(env, _read_text)\n'
-                   'discover(env, files, read_token_file=lambda p: _read_text(p) or "")\n')
+                   'files = env_files(env, read_text=_read_text)\n'
+                   'discover(env, files, read_token_file=lambda p: _read_text(p) or "")\n'
+                   'discover(env, files, vault_lookup=lambda k: (_read_text() or (lambda _k: ""))(k))\n')
         self.assertEqual(credential_access(allowed, "adapters/hatch/cli.py"), [])
         self.assertEqual(credential_access('"""Put REMOTE_TASK_TOKEN in the .env file."""\nx = 1\n', "probe.py"), [],
                          "a docstring naming a key is prose, not a read")

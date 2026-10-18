@@ -305,6 +305,7 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import agent_identity, gateway_credential_sources, gateway_credentials, gateway_instance, local_task_protocol
+from .bounded_file_read import read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
@@ -505,13 +506,9 @@ CHANNEL_DIR = gateway_credential_sources.channel_dir(os.environ)
 
 
 def _read_env_file(path: str):
-    """A channel .env file's text, or None when it cannot be read; an undecodable file is not
-    an OSError, so it is caught too."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return fh.read()
-    except (OSError, UnicodeDecodeError):
-        return None
+    """A channel .env file's text, or None when it cannot be read (missing, not a regular file,
+    oversized or not UTF-8)."""
+    return read_regular_text(path)
 
 
 def _channel_env_candidates():
@@ -1829,10 +1826,7 @@ def _local_redact_vault_set(text: str) -> str:
 
 
 def _read_text(path: str) -> str:
-    try:
-        return Path(path).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return ""
+    return read_regular_text(path) or ""
 
 
 # The process's credentials: every candidate registered, the winners chosen by the one owner's table.
