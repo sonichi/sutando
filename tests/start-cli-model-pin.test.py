@@ -2,6 +2,12 @@
 """start-cli.sh must ignore $SUTANDO_CORE_MODEL and clear it from every
 tmux session scope, not just tmux's default target."""
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import os
 import subprocess
 import sys

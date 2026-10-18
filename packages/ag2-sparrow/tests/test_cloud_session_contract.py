@@ -17,6 +17,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_claude_cloud_session_adapter import (FakeClock, Fake, ok, result, run_adapter,  # noqa: E402
                                                write_task)

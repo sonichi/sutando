@@ -15,6 +15,11 @@ import unittest.mock as um
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "packages" / "ag2-sparrow"))
@@ -762,7 +767,7 @@ class EntryPointImportsInThePackage(unittest.TestCase):
 
     def _run(self, code: str, pkg_parent: str):
         import subprocess
-        env = dict(os.environ, PYTHONPATH=pkg_parent, PYTHONDONTWRITEBYTECODE="1")
+        env = hermetic_env(PYTHONPATH=pkg_parent, PYTHONDONTWRITEBYTECODE="1")
         return subprocess.run([sys.executable, "-c", code], env=env,
                               capture_output=True, text=True, cwd=tempfile.gettempdir())
 

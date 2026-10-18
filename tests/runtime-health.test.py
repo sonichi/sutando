@@ -8,6 +8,12 @@ working-state e2e would need a live core, which CI doesn't have.
 
     python3 tests/runtime-health.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -191,7 +197,7 @@ if _env_before is not None:
 shutil.rmtree(_sock_tmp, ignore_errors=True)
 
 # 3) offline end-to-end: a socket with no session → health=offline, authed=null.
-env = dict(os.environ)
+env = isolated_child_env()
 env["SUTANDO_TMUX_SOCKET"] = "/tmp/rh-test-nonexistent-%d.sock" % os.getpid()
 p = subprocess.run(
     [sys.executable, os.path.join(REPO, "src", "runtime-health.py")],

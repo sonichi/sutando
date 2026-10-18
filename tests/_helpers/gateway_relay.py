@@ -23,6 +23,8 @@ from pathlib import Path
 
 CONTRACT = "voice-outcome-v1"
 _TESTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_TESTS))
+from _helpers.hermetic_env import hermetic_env  # noqa: E402
 
 
 class Relay:
@@ -240,8 +242,7 @@ class Bridges:
         self.runs += 1
         log = open(self.root / f"bridge-{self.runs}.log", "w")
         self.test.addCleanup(log.close)
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith("SUTANDO_") and k != "GATEWAY_INSTANCE"}
+        env = hermetic_env(self.root / "home")
         proc = subprocess.Popen(
             [sys.executable, "-c", _BRIDGE, str(_TESTS), str(self.ws), self.relay.url, crash,
              json.dumps(self.env)],

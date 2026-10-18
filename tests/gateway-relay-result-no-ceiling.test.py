@@ -45,6 +45,7 @@ if str(_PKG) not in sys.path:
 
 sys.path.insert(0, str(_TESTS))
 from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+from _helpers.hermetic_env import hermetic_env  # noqa: E402
 _GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
 
 from _helpers import gateway_relay, older_bridge  # noqa: E402
@@ -1237,7 +1238,7 @@ class AfterADowngrade(_Loop):
 
     def older(self, step: str, answered: str = ""):
         out = self.root / f"older-{step}.json"
-        env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_") and k != "GATEWAY_INSTANCE"}
+        env = hermetic_env(self.root / "home")
         done = subprocess.run(
             [sys.executable, "-c", _OLDER, str(_TESTS), str(self.ws), step, answered,
              json.dumps({"GATEWAY_INSTANCE": self.INSTANCE} if self.INSTANCE else {}), str(out)],

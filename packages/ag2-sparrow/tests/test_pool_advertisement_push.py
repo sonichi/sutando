@@ -21,6 +21,12 @@ import tempfile
 import time
 import urllib.error
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 MXID = "@sutando-test:ag2.space"
 W1 = "a3f91c2d4e5b6a7c8d9e0f1a2b3c4d5e"
 
@@ -604,10 +610,10 @@ def test_a_fifo_with_no_writer_is_unavailable_not_a_wedged_loop():
         (base / "state").mkdir()
         fifo = base / "state" / "pool-advertisement.json"
         os.mkfifo(fifo)
-        env = {**os.environ, "AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
+        env = hermetic_env(**{"AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
                "AGENT_CONNECT_RESULT_DIR": str(base / "results"),
                "AGENT_CONNECT_STATE_DIR": str(base / "state"), "AGENT_MXID": MXID,
-               "REMOTE_TASK_URL": "https://gw.example/relay", "REMOTE_TASK_TOKEN": "dummy-secret"}
+               "REMOTE_TASK_URL": "https://gw.example/relay", "REMOTE_TASK_TOKEN": "dummy-secret"})
         code = ("import sys; sys.path.insert(0, %r); "
                 "from ag2_sparrow import remote_gateway_bridge as m; "
                 "print(repr(m._read_pool_advertisement()))"
@@ -791,14 +797,13 @@ def test_shutdown_holds_the_lock_until_no_publication_can_complete():
         (base / "state").mkdir()
         (base / "state" / "pool-advertisement.json").write_text(json.dumps(_record(1)))
         started, gate, done = (base / "started"), (base / "gate"), (base / "done")
-        env = {**os.environ,
-               "AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
+        env = hermetic_env(**{"AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
                "AGENT_CONNECT_RESULT_DIR": str(base / "results"),
                "AGENT_CONNECT_STATE_DIR": str(base / "state"), "AGENT_MXID": MXID,
                "REMOTE_TASK_URL": "https://gw.example/relay",
                "REMOTE_TASK_TOKEN": "dummy-secret",
                "PROBE_STARTED": str(started), "PROBE_GATE": str(gate),
-               "PROBE_DONE": str(done)}
+               "PROBE_DONE": str(done)})
         code = _CHILD_GENERATION % str(pathlib.Path(__file__).resolve().parents[1])
         child = subprocess.Popen([sys.executable, "-c", code], env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

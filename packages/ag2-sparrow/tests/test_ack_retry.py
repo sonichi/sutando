@@ -14,6 +14,12 @@ import tempfile
 import urllib.error
 
 
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 def _load(base, cooldown="300"):
     os.environ["AGENT_CONNECT_TASK_DIR"] = str(base / "tasks")
     os.environ["AGENT_CONNECT_RESULT_DIR"] = str(base / "results")

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Regression checks for the generated Codex instruction file."""
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import subprocess
 import sys
 import tempfile

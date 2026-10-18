@@ -14,6 +14,11 @@ import urllib.error
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 # Shadow the vault boundary before any gateway() call can reach it. gateway() now
 # resolves the token from the Keychain when the env has none — and this file's

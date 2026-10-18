@@ -14,6 +14,12 @@ import pathlib
 import tempfile
 
 
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 def _load(base):
     """Reload the bridge with task/result/state dirs pointed under `base`."""
     os.environ["AGENT_CONNECT_TASK_DIR"] = str(base / "tasks")

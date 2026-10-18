@@ -21,6 +21,11 @@ import tempfile
 import threading
 import urllib.error
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 REAL_HOME = pathlib.Path(os.path.expanduser("~")).resolve()
 root = pathlib.Path(tempfile.mkdtemp()).resolve()

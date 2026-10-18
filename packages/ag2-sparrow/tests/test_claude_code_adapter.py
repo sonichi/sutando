@@ -19,6 +19,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 PKG = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG))
 from ag2_sparrow.local_task_protocol import parse_task_headers  # noqa: E402
@@ -42,7 +48,7 @@ def verify_py(source: str = "") -> str:
 
 def run_verifier(script: str, text: str, key_file: str) -> tuple[str, str, str]:
     out = subprocess.run([sys.executable, "-c", script], input=text, capture_output=True, text=True,
-                         env={**os.environ, "AG2_HMAC_KEY_FILE": key_file}, check=True).stdout.split()
+                         env=hermetic_env(**{"AG2_HMAC_KEY_FILE": key_file}), check=True).stdout.split()
     return (out[0], out[1], out[2])
 
 

@@ -18,6 +18,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parents[1]
 SYNC = REPO / "packages" / "ag2-sparrow" / "tools" / "sync_from_src.py"
 
