@@ -277,7 +277,7 @@ class CardPoster:
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     reply = json.loads(resp.read().decode() or "{}")
             except Exception as e:  # noqa: BLE001 — best-effort, retry next sweep
-                self._log(f"human-action: card post failed (will retry): {e}")
+                self._log(f"human-action: card post failed (will retry): {type(e).__name__}")  # its text names the URL
                 continue
             event_id = reply.get("event_id") or (reply.get("result") or {}).get("event_id")
             # Record the card on the CURRENT record under the shared transition

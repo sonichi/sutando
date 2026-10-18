@@ -113,7 +113,7 @@ class EventChannel:
             self._set(status="reconnecting", error=f"HTTP {e.code}")
             return True
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            self._set(status="reconnecting", error=f"connect: {e}")
+            self._set(status="reconnecting", error=f"connect: {type(e).__name__}")  # never its text: it names the URL
             return True
         self._set(status="connected", error=None)
         try:
@@ -139,10 +139,10 @@ class EventChannel:
                 self._set(last_cursor=self._inbox.durable_cursor(),
                           last_event_at=time.time())
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            self._set(status="reconnecting", error=f"stream dropped: {e}")
+            self._set(status="reconnecting", error=f"stream dropped: {type(e).__name__}")
         except Exception as e:  # noqa: BLE001 — isolation: never escape the channel
-            self._set(status="reconnecting", error=f"channel error: {e}")
-            self._log(f"event-channel: swallowed {e}")
+            self._set(status="reconnecting", error=f"channel error: {type(e).__name__}")
+            self._log(f"event-channel: swallowed {type(e).__name__}")
         finally:
             try:
                 resp.close()

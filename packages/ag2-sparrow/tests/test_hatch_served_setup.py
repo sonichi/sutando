@@ -206,42 +206,62 @@ print(json.dumps({"key_before": key_before, "url": m.URL,
         self.assertNotIn("tenant", path.read_text(), "the next load with a key migrates it")
         self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space", out)
 
-    def test_stale_pre_binding_temps_are_swept_on_load_and_nothing_else(self):
-        child = subprocess.Popen([sys.executable, "-c", ""])
-        child.wait()
-        dead, live, old = child.pid, os.getpid(), time.time() - 60
+    def test_stale_pre_binding_temps_are_swept_on_load_by_age_alone(self):
+        live, old, young = os.getpid(), time.time() - 2 * 3600, time.time() - 1800
         outside = self.home / "outside.txt"
         outside.write_text("keep")
         secret = json.dumps({"identity": AGENT, "gateway": "https://gw.example/relay?tenant=a"})
 
-        def temp(name, age=True):
+        def temp(name, mtime=old):
             path = self.state / name
             path.write_text(secret)
-            if age:
-                os.utime(path, (old, old))
+            os.utime(path, (mtime, mtime))
             return path
 
-        stale = temp(f".owner-routing.json.{dead}.tmp")
-        abandoned = temp(f".owner-routing.json.{live}.tmp")
-        os.utime(abandoned, (time.time() - 2 * 3600,) * 2)
-        kept = [temp(f".owner-routing.json.{live + 1 if live + 1 != dead else live + 2}.tmp", age=False),
-                temp(f".owner-routing.json.{dead + 1}.tmp", age=False),
-                temp(f".owner-routing.json.{dead}.tmp.bak"),
-                temp(f".owner-routing.blue.json.{dead}.tmp")]
-        link = self.state / f".owner-routing.json.{dead + 2}.tmp"
+        stale = [temp(".owner-routing.json.1.tmp"), temp(f".owner-routing.json.{live}.tmp")]
+        kept = [temp(".owner-routing.json.2.tmp", young), temp(".owner-routing.json.3.tmp.bak"),
+                temp(".owner-routing.blue.json.4.tmp")]
+        link = self.state / ".owner-routing.json.5.tmp"
         link.symlink_to(outside)
         os.utime(link, (old, old), follow_symlinks=False)
-        folder = self.state / f".owner-routing.json.{dead + 3}.tmp"
+        folder = self.state / ".owner-routing.json.6.tmp"
         folder.mkdir()
         os.utime(folder, (old, old))
         self.bridge("from ag2_sparrow import remote_gateway_bridge as m\n"
                     "m._load_routing()\nprint('{}')\n")
-        self.assertFalse(stale.exists(), "a dead writer's old temp is removed")
-        self.assertFalse(abandoned.exists(), "past the bound a temp is stale whatever its pid says")
+        for path in stale:
+            self.assertFalse(path.exists(), f"{path.name}: past the bound, stale whatever its pid")
         for path in kept:
             self.assertTrue(path.exists(), path.name)
         self.assertTrue(link.is_symlink() and outside.read_text() == "keep", "a symlink is never followed")
         self.assertTrue(folder.is_dir())
+
+    def test_a_transient_read_error_then_success_migrates_and_reloads_the_owner_dm(self):
+        record = self.state / "owner-routing.json"
+        record.write_text(json.dumps({"identity": AGENT, "gateway": "https://gw.example/relay?tenant=a",
+                                      "owner_dm": "!dm:ag2.space"}))
+        out = self.bridge("""
+import json
+from ag2_sparrow import remote_gateway_bridge as m, routing_migrations as rm
+real, fails = rm._read, [PermissionError("transient")]
+def read(path):
+    if fails:
+        raise fails.pop()
+    return real(path)
+rm._read = read
+seen = []
+for _ in range(2):
+    m._load_routing()
+    seen.append({"migrated": m._ROUTING["migrated"], "dm": m._ROUTING["owner_dm"],
+                 "disk": open(m._routing_file()).read()})
+print(json.dumps(seen))
+""", AGENT_MXID=AGENT)
+        self.assertFalse(out[0]["migrated"], "a read error is unknown, never migrated")
+        self.assertIn("tenant", out[0]["disk"])
+        self.assertEqual(out[0]["dm"], "")
+        self.assertTrue(out[1]["migrated"])
+        self.assertNotIn("tenant", out[1]["disk"])
+        self.assertEqual(out[1]["dm"], "!dm:ag2.space", "the rewritten record is read again from disk")
 
     LEAK = """
 import glob, json, os, socket
@@ -288,11 +308,11 @@ print(json.dumps({"raw": raw, "url": m.URL, "files": files}))
                 url = f"https://gw.example/relay?enrollment=SECRET{ch}BAD"
                 out, printed = self.leak(url, secrets=("SECRET", repr(ch)[1:-1] + "BAD"))
                 self.assertEqual(out["url"], url)
-                self.assertIn("InvalidURL", out["raw"])
-                self.assertIn("SECRET", out["raw"], "the exception itself carries the query")
-                self.assertIn(gateway_instance.REDACTED_TEXT, printed)
+                scrubbed = "InvalidURL contacting https://gw.example/relay"
+                self.assertEqual(out["raw"], "InvalidURL: " + scrubbed, "only its type leaves _req")
+                self.assertIn(scrubbed, printed)
                 status = json.loads((self.state / "gateway-status.json").read_text())
-                self.assertIn(gateway_instance.REDACTED_TEXT, status["error"])
+                self.assertEqual(status["error"], "unexpected: " + scrubbed)
 
     def test_short_percent_encoded_and_escaped_query_text_never_reaches_a_sink(self):
         url = "https://gw.example/relay?token=zq9&id=a%2Fb"
@@ -349,7 +369,7 @@ print(json.dumps({"raw": raw, "url": m.URL, "files": files}))
         self.assertEqual(ast.unparse(first).split("#")[0].strip(), "_migrate_routing()",
                          "migration runs before the reading is prepared")
         self.assertIn("routing_migrations.migrate_owner_routing", ast.unparse(fns["_migrate_routing"]))
-        for legacy in ("sweep_legacy_temps", "TEMP_GRACE", "TEMP_MAX_AGE", r"\.tmp"):
+        for legacy in ("sweep_legacy_temps", "TEMP_MAX_AGE", r"\.tmp"):
             self.assertNotIn(legacy, src, "the live writer's module owns no legacy migration")
         out = self.bridge("""
 import json
@@ -357,14 +377,76 @@ from ag2_sparrow import remote_gateway_bridge as m, routing_migrations as rm
 calls = []
 def migrate(path, **kw):
     calls.append(sorted(kw))
-    return rm.Result(done=len(calls) > 1)
+    return rm.Result(state=rm.NOT_NEEDED if len(calls) > 1 else rm.FAILED)
 rm.migrate_owner_routing = migrate
 m._load_routing(); m._load_routing(); m._load_routing()
 print(json.dumps({"calls": calls, "loaded": m._ROUTING["loaded"]}))
 """)
-        self.assertEqual(out["calls"], [["log", "pid_alive", "record_for", "write"]] * 2,
+        self.assertEqual(out["calls"], [["log", "record_for", "write"]] * 2,
                          "an unfinished migration is retried at the next load, then not again")
         self.assertTrue(out["loaded"])
+
+    SCRUB = """
+import io, json, os, traceback, urllib.error, urllib.request, http.client
+from ag2_sparrow import remote_gateway_bridge as m
+secret = "enrollment=Se%2fcR%2FeT"
+forms = [secret, secret.upper(), secret.lower(), "Se%2fcR%2FeT", "Se/cR/eT", "Se%252fcR%252FeT",
+         repr("Se\\ncR"), "Se\\x7fcR", "U2UvY1IvZVQ"]
+text = " | ".join(forms)
+raised = [urllib.error.HTTPError(m.URL + "/v1/tasks", 503, text, {}, io.BytesIO(b"{}")),
+          urllib.error.URLError(text), TimeoutError(text), ConnectionResetError(104, text),
+          http.client.InvalidURL(text), http.client.IncompleteRead(text.encode()), ValueError(text),
+          OSError(2, text, text)]
+out = []
+for exc in raised:
+    def boom(*a, **k):
+        raise exc
+    urllib.request.urlopen = boom
+    try:
+        m._req("GET", "/v1/tasks?wait=0")
+    except Exception as e:  # the poll loop's handlers, as written
+        code = getattr(e, "code", None)
+        m._log(f"unexpected: {e} — backing off 1s")
+        m._log(f"poll network error: {type(e).__name__}: {e!r}")
+        m._log("".join(traceback.format_exception(e)))
+        m._emit_gateway_status(False, error=f"network: {e}", backoff_s=1)
+        out.append({"type": type(e).__name__, "isinstance": isinstance(e, type(exc)), "code": code,
+                    "str": str(e), "status": json.load(open(m.GATEWAY_STATUS_FILE))["error"]})
+files = {p: open(p, errors="replace").read() for p in __import__("glob").glob(os.environ["HOME"] + "/**", recursive=True)
+         if os.path.isfile(p)}
+print(json.dumps({"out": out, "forms": forms, "files": files}))
+"""
+
+    def test_an_exception_from_a_gateway_call_is_logged_and_persisted_only_as_its_type(self):
+        url = "https://gw.example/relay?enrollment=Se%2fcR%2FeT"
+        r = subprocess.run([sys.executable, "-c", PRELUDE + self.SCRUB], capture_output=True, text=True,
+                           cwd=str(self.home), timeout=60, env=self.bridge_env(REMOTE_TASK_URL=url))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        result = json.loads(r.stdout.strip().splitlines()[-1])
+        printed = "\n".join(r.stdout.strip().splitlines()[:-1]) + r.stderr
+        self.assertEqual(len(result["out"]), 8)
+        for row in result["out"]:
+            self.assertTrue(row["isinstance"], row)
+            want = f"{row['type']} contacting https://gw.example/relay"
+            self.assertEqual(row["str"], want + (" (HTTP 503)" if row["type"] == "HTTPError" else ""))
+            self.assertIn(row["str"], row["status"])
+        self.assertEqual(result["out"][0]["code"], 503, "the status code survives")
+        for form in result["forms"] + ["cR", "eT", "Se%"]:
+            self.assertNotIn(form, printed, form)
+            for path, text in result["files"].items():
+                self.assertNotIn(form, text, (form, path))
+
+    def test_the_event_channel_keeps_only_an_exception_type_in_its_status(self):
+        from ag2_sparrow import event_channel
+        inbox = mock.Mock(durable_cursor=mock.Mock(return_value=None))
+        lines = []
+        ch = event_channel.EventChannel(inbox, GW + "?enrollment=SECRET", {}, log=lines.append)
+        for exc in (OSError("GET https://gw.example/relay?enrollment=SECRET failed"),
+                    TimeoutError("SECRET")):
+            with mock.patch.object(ch, "_open", side_effect=exc):
+                ch._consume_once()
+            self.assertEqual(ch.health["error"], f"connect: {type(exc).__name__}")
+        self.assertNotIn("SECRET", json.dumps(lines))
 
     STARTUP = """
 import json
@@ -695,7 +777,7 @@ class WakeContext(Base):
 
 
 class RoutingMigration(unittest.TestCase):
-    """routing_migrations in-process: idempotent, never raises, and unfinished until it commits."""
+    """routing_migrations in-process: tri-state, verified on disk, never raises, age-only sweep."""
 
     def setUp(self):
         from ag2_sparrow import routing_migrations
@@ -705,43 +787,60 @@ class RoutingMigration(unittest.TestCase):
         self.path = self.dir / "owner-routing.json"
         self.writes, self.logs = [], []
 
-    def run_migration(self, record_for=None, write=None, alive=lambda pid: False):
+    def record(self, i, u, d):
+        return {"identity": i, "binding": "b" * 64, "gateway": "redacted", "owner_dm": d}
+
+    def run_migration(self, record_for=None, write=None):
         def default_write(path, text):
             self.writes.append(text)
             path.write_text(text)
             return True
-        return self.rm.migrate_owner_routing(
-            self.path, record_for=record_for or (lambda i, u, d: {"identity": i, "binding": "b" * 64,
-                                                                    "gateway": "redacted", "owner_dm": d}),
-            write=write or default_write, pid_alive=alive, log=self.logs.append)
+        return self.rm.migrate_owner_routing(self.path, record_for=record_for or self.record,
+                                             write=write or default_write, log=self.logs.append)
 
     def legacy(self):
         self.path.write_text(json.dumps({"identity": AGENT, "gateway": GW + "?tenant=a",
                                          "owner_dm": "!dm:ag2.space"}))
 
-    def test_a_legacy_record_is_rewritten_once(self):
+    def temp(self, name, age):
+        path = self.dir / name
+        path.write_text("x")
+        os.utime(path, (time.time() - age,) * 2)
+        return path
+
+    def test_a_legacy_record_is_rewritten_once_and_verified(self):
         self.legacy()
         seen = []
-        result = self.run_migration(record_for=lambda i, u, d: seen.append(u) or {
-            "identity": i, "binding": "b" * 64, "gateway": "redacted", "owner_dm": d})
-        self.assertEqual((result.done, result.rewritten), (True, True))
+        result = self.run_migration(record_for=lambda i, u, d: seen.append(u) or self.record(i, u, d))
+        self.assertEqual((result.state, result.rewritten, result.finished), (self.rm.DONE, True, True))
         self.assertEqual(seen, [GW + "?tenant=a"], "bound from the full URL it held")
         self.assertNotIn("tenant", self.path.read_text())
         again = self.run_migration()
-        self.assertEqual((again.done, again.rewritten, len(self.writes)), (True, False, 1))
+        self.assertEqual((again.state, again.rewritten, len(self.writes)), (self.rm.NOT_NEEDED, False, 1))
 
-    def test_no_record_or_a_current_one_is_done_with_nothing_written(self):
-        self.assertTrue(self.run_migration().done)
+    def test_no_record_or_a_current_one_is_not_needed(self):
+        self.assertEqual(self.run_migration().state, self.rm.NOT_NEEDED)
         self.path.write_text(json.dumps({"identity": AGENT, "gateway": GW, "binding": "c" * 64}))
-        self.assertTrue(self.run_migration().done)
+        self.assertEqual(self.run_migration().state, self.rm.NOT_NEEDED)
         self.assertEqual(self.writes, [])
 
-    def test_an_unbindable_or_unwritten_record_is_left_and_not_done(self):
-        for record_for, write in ((lambda i, u, d: None, None), (None, lambda p, t: False)):
+    def test_a_read_error_is_unknown_never_migrated(self):
+        self.legacy()
+        for exc in (PermissionError("transient"), ValueError("torn")):
+            with mock.patch.object(self.rm, "_read", side_effect=exc):
+                result = self.run_migration()
+            self.assertEqual((result.state, result.rewritten), (self.rm.FAILED, False), exc)
+        self.assertIn("tenant", self.path.read_text())
+        self.assertEqual(self.run_migration().state, self.rm.DONE, "then it succeeds")
+
+    def test_an_unbindable_unwritten_or_unverified_record_is_left_and_failed(self):
+        def lying_write(path, text):
+            return True  # claims a commit that never reached the disk
+        for record_for, write in ((lambda i, u, d: None, None), (None, lambda p, t: False), (None, lying_write)):
             self.legacy()
             before = self.path.read_text()
             result = self.run_migration(record_for=record_for, write=write)
-            self.assertFalse(result.done)
+            self.assertEqual((result.state, result.rewritten), (self.rm.FAILED, False))
             self.assertEqual(self.path.read_text(), before)
         self.assertIn("not migrated yet", self.logs[-1])
 
@@ -750,17 +849,24 @@ class RoutingMigration(unittest.TestCase):
 
         def boom(path, text):
             raise RuntimeError("disk")
-        self.assertFalse(self.run_migration(write=boom).done)
-        self.assertIn("RuntimeError", self.logs[-1])
+        self.assertEqual(self.run_migration(write=boom).state, self.rm.FAILED)
+        self.assertIn("RuntimeError", " ".join(self.logs))
         with mock.patch.object(self.rm.os, "listdir", side_effect=PermissionError("no")):
-            self.assertFalse(self.run_migration().done)
+            self.assertEqual(self.run_migration().state, self.rm.FAILED)
+
+    def test_the_sweep_is_by_age_alone_including_this_process_pid(self):
+        own_old = self.temp(f".owner-routing.json.{os.getpid()}.tmp", 2 * 3600)
+        other_old = self.temp(".owner-routing.json.12.tmp", 2 * 3600)
+        own_young = self.temp(".owner-routing.json.13.tmp", 600)
+        result = self.run_migration()
+        self.assertEqual((result.state, result.removed), (self.rm.DONE, 2))
+        self.assertFalse(own_old.exists() or other_old.exists(), "the pid never protects a temp")
+        self.assertTrue(own_young.exists())
 
     def test_a_sweep_error_does_not_block_the_rewrite_and_the_sweep_is_retried(self):
         self.legacy()
-        bad, stale = (self.dir / f".owner-routing.json.{n}.tmp" for n in (21, 22))
-        for path in (bad, stale):
-            path.write_text("x")
-            os.utime(path, (time.time() - 60,) * 2)
+        bad = self.temp(".owner-routing.json.21.tmp", 2 * 3600)
+        stale = self.temp(".owner-routing.json.22.tmp", 2 * 3600)
         real_unlink = os.unlink
 
         def unlink(name, *a, **k):
@@ -769,29 +875,17 @@ class RoutingMigration(unittest.TestCase):
             return real_unlink(name, *a, **k)
         with mock.patch.object(self.rm.os, "unlink", unlink):
             result = self.run_migration()
-        self.assertEqual((result.done, result.rewritten, result.removed), (False, True, 1))
+        self.assertEqual((result.state, result.rewritten, result.removed), (self.rm.FAILED, True, 1))
         self.assertNotIn("tenant", self.path.read_text(), "the rewrite ran despite the sweep error")
         self.assertTrue(bad.exists() and not stale.exists())
         again = self.run_migration()
-        self.assertEqual((again.done, again.rewritten, again.removed), (True, False, 1))
+        self.assertEqual((again.state, again.rewritten, again.removed), (self.rm.DONE, False, 1))
         self.assertFalse(bad.exists())
 
     def test_a_temp_vanishing_mid_sweep_is_not_an_error(self):
-        path = self.dir / ".owner-routing.json.31.tmp"
-        path.write_text("x")
-        os.utime(path, (time.time() - 60,) * 2)
+        self.temp(".owner-routing.json.31.tmp", 2 * 3600)
         with mock.patch.object(self.rm.os, "unlink", side_effect=FileNotFoundError()):
-            self.assertTrue(self.run_migration().done)
-
-    def test_the_sweep_bounds_pid_reuse_and_respects_the_grace(self):
-        now = time.time()
-        young, live_old, live_recent = (self.dir / f".owner-routing.json.{n}.tmp" for n in (11, 12, 13))
-        for path, age in ((young, 1), (live_old, 2 * 3600), (live_recent, 600)):
-            path.write_text("x")
-            os.utime(path, (now - age,) * 2)
-        result = self.run_migration(alive=lambda pid: True)
-        self.assertEqual(result.removed, 1)
-        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), [young.name, live_recent.name])
+            self.assertEqual(self.run_migration().state, self.rm.NOT_NEEDED)
 
 
 class RedactUrl(unittest.TestCase):

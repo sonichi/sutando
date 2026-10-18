@@ -1805,11 +1805,15 @@ def _routing_record(identity: str, gateway_url: str, owner_dm: str) -> "dict | N
 
 
 def _migrate_routing() -> bool:
-    """Run the routing state's one-time migrations until one finishes; retried at each load."""
+    """Run the routing state's one-time migrations until one finishes; retried at each load. A
+    rewrite makes the held reading stale, so the next load reads the record from disk again."""
     if not _ROUTING["migrated"]:
-        _ROUTING["migrated"] = routing_migrations.migrate_owner_routing(
+        result = routing_migrations.migrate_owner_routing(
             _routing_file(), record_for=_routing_record, write=_durable_write,
-            pid_alive=_pid_alive, log=_log).done
+            log=lambda line: _log_backoff(("owner-routing migration", line), line))
+        if result.rewritten:
+            _ROUTING["loaded"] = False
+        _ROUTING["migrated"] = result.finished
     return _ROUTING["migrated"]
 
 
@@ -2122,14 +2126,15 @@ def _reenroll_claim() -> None:
         return
     _reenroll_state["last_attempt_at"] = time.monotonic()
     try:
-        req = urllib.request.Request(
-            _provision_base() + "/connect/reenroll",
-            data=json.dumps({"agent_id": agent_id, "bearer": TOKEN}).encode(),
-            # The prod edge 403s urllib's default UA — same contract as _req().
-            headers={"Content-Type": "application/json",
-                     "User-Agent": "sutando-gateway-client/1.0"}, method="POST")
-        with urllib.request.urlopen(req, timeout=20) as r:
-            body = json.loads(r.read() or b"{}")
+        with _gateway_call():
+            req = urllib.request.Request(
+                _provision_base() + "/connect/reenroll",
+                data=json.dumps({"agent_id": agent_id, "bearer": TOKEN}).encode(),
+                # The prod edge 403s urllib's default UA — same contract as _req().
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "sutando-gateway-client/1.0"}, method="POST")
+            with urllib.request.urlopen(req, timeout=20) as r:
+                body = json.loads(r.read() or b"{}")
         code = str(body.get("approval_code") or "")
         if body.get("pending") and code:
             _reenroll_state["code"] = code
@@ -2608,20 +2613,31 @@ _NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
                    http.client.IncompleteRead)
 
 
+@contextlib.contextmanager
+def _gateway_call():
+    """Every call that receives the gateway URL runs inside this: what it raises carries only
+    its type, the redacted gateway and an HTTP status, so no caller can log or persist the URL."""
+    try:
+        yield
+    except Exception as e:  # noqa: BLE001 - re-raised as the same type, scrubbed
+        raise gateway_instance.scrub_exception(e, URL) from None
+
+
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty)."""
-    data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
-    req.add_header("Authorization", f"Bearer {TOKEN}")
-    req.add_header("Accept", "application/json")
-    # CloudFlare bot-fight (error 1010) rejects python-urllib's default
-    # User-Agent with a 403; send an explicit client UA so the gateway's edge
-    req.add_header("User-Agent", "sutando-gateway-client/1.0")
-    if data is not None:
-        req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode().strip()
-        return json.loads(raw) if raw else {}
+    with _gateway_call():
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
+        req.add_header("Authorization", f"Bearer {TOKEN}")
+        req.add_header("Accept", "application/json")
+        # CloudFlare bot-fight (error 1010) rejects python-urllib's default
+        # User-Agent with a 403; send an explicit client UA so the gateway's edge
+        req.add_header("User-Agent", "sutando-gateway-client/1.0")
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode().strip()
+            return json.loads(raw) if raw else {}
 
 
 def _http_error_body(e) -> str:

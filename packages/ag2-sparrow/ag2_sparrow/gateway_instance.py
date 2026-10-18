@@ -66,6 +66,37 @@ def redact_url(value: str) -> str:
         return REDACTED_URL
 
 
+_SCRUBBED_TYPES: "dict[type, type]" = {}
+
+
+def scrub_exception(exc: BaseException, gateway_url: str) -> BaseException:
+    """`exc`, raised by a call that received the gateway URL, as an exception of a subclass of
+    its own type (so every `except` and attribute read still works) whose text is only
+    `<type> contacting <redacted gateway>`, plus the HTTP status when it has one. Nothing the
+    original text held, in any encoding, can reach a log or a status file through it."""
+    base = type(exc)
+    safe = _SCRUBBED_TYPES.get(base)
+    if safe is None:
+        safe = _SCRUBBED_TYPES[base] = type(base.__name__, (base,), {
+            "__str__": lambda self: self.__dict__.get("_scrubbed", base.__name__),
+            "__repr__": lambda self: f"{base.__name__}({self.__dict__.get('_scrubbed', '')!r})",
+            "__module__": base.__module__, "__qualname__": base.__qualname__})
+    code = exc.__dict__.get("code")
+    text = f"{base.__name__} contacting {redact_url(gateway_url)}"
+    if isinstance(code, int):
+        text += f" (HTTP {code})"
+    out = safe.__new__(safe)
+    # Objects (an HTTPError's body and headers) and numbers stay; text and bytes never do.
+    out.__dict__.update({k: (text if isinstance(v, str) else b"" if isinstance(v, (bytes, bytearray)) else v)
+                         for k, v in exc.__dict__.items()})
+    if isinstance(exc, OSError):
+        out.errno = exc.errno
+    out.__dict__["_scrubbed"] = text
+    out.args = (text,)
+    out.__traceback__ = exc.__traceback__
+    return out
+
+
 REDACTED_TEXT = "<text withheld: it may contain the gateway URL>"
 
 
