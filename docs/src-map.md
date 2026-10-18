@@ -48,6 +48,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently and prune dead copies of the same hook.
 - **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
+- **`cli_wedge_patterns.py`** — The abnormal-banner table of the CLI progress detector: text on a pane that says the CLI is parked (a login prompt, a provider limit, a compaction, an error it sits on), as data.
 - **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.
 - **`cloud_auth.py`** — Sutando Cloud session: find the owner's sutk_ bearer and call the cloud API.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
@@ -236,7 +237,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmp-paths.ts`** — Shared cross-platform temp-file paths used by both writers and readers.
-- **`tmux-pane-keys.sh`** — tmux-pane-keys.sh [--tmux BIN] -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...> Leaves pane mode and sends in one tmux step, bounded.
+- **`tmux-pane-keys.sh`** — tmux-pane-keys.sh [--tmux BIN] --python PY -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...> tmux-pane-keys.sh [--tmux BIN] --python PY -S SOCKET -t PANE [--timeout SECS] --fence PREDICATE ACTION Leaves pane mode and sends in one tmux step, bounded; or runs ACTION only while the format PREDICATE holds for PANE, else orphans the ticket (exit 1, nothing sent).
 - **`tmux-probe-cli.py`** — Tiny CLI over tmux_probe.has_session(), for callers (start-cli.sh's relay loop) that cannot import Python but must not duplicate its ABSENT_SIGNATURES.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`tmux_pane_keys.py`** — Shared tmux pane-key argv and crash-safe send guard.
