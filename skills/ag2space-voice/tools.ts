@@ -7,6 +7,7 @@ import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextC
 import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateClient, navigateUiAvailable, navigateUiTool, resolveUiNavigated } from './navigate.js';
 import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
 import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createAddCommentTool, createSearchCommonsTool, createSearchRoomTool, createSendMessageTool, createWritePageTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
+import { QUERY_PROMPT_RULE, QUERY_TURN_CHECK_RULE, createQueryMessagesTool, createRoomStatsTool, recordCallEnded } from './query.js';
 import { ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, createDescribeActionTool, createFindActionsTool, createRunActionTool, armSpeechGate, noteUserSpoke } from './room-actions.js';
 
 export const tools: ToolDefinition[] = [];
@@ -32,6 +33,10 @@ export async function handleSessionContextFrame(ctx: Pick<SkillSetupCtx, 'sendCl
 }
 
 export function setup(ctx: SkillSetupCtx): void {
+	// When a call ends, what was checked for "new" during it is kept for the next call.
+	ctx?.onCallEnded?.(() => {
+		try { recordCallEnded(); } catch (err) { console.warn(`${ts()} [RoomQuery] could not keep the call's "new" point: ${err instanceof Error ? err.message : err}`); }
+	});
 	// A change held for a spoken yes needs the user to have spoken since it was held.
 	if (typeof ctx?.onUserSpoke === 'function') {
 		ctx.onUserSpoke(noteUserSpoke);
@@ -95,11 +100,13 @@ function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; tu
 	const message = createSendMessageTool(deps);
 	const list = createListRoomsTool({ index, log });
 	// Any other catalog action: found, described and run by name, gated by the server's own effect and risk.
+	const query = createQueryMessagesTool(deps);
+	const roomStats = createRoomStatsTool(deps);
 	const open = [createFindActionsTool(deps), createDescribeActionTool(deps), createRunActionTool(deps)];
 	return {
-		tools: [read, search, commons, page, write, comment, message, list, ...open],
-		promptRules: [ROOM_READ_PROMPT_RULE, ROOM_ACTIONS_PROMPT_RULE],
-		turnCheckRules: [ROOM_TURN_CHECK_RULE, ROOM_ACTIONS_TURN_CHECK_RULE],
+		tools: [read, search, commons, page, write, comment, message, list, query, roomStats, ...open],
+		promptRules: [ROOM_READ_PROMPT_RULE, QUERY_PROMPT_RULE, ROOM_ACTIONS_PROMPT_RULE],
+		turnCheckRules: [ROOM_TURN_CHECK_RULE, QUERY_TURN_CHECK_RULE, ROOM_ACTIONS_TURN_CHECK_RULE],
 		contextLines: () => roomIndexContextLines(index),
 	};
 }

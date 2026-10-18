@@ -598,6 +598,13 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 
 	private async actOnTurn(verdict: Awaited<ReturnType<TurnClassifier>>, origin: O | undefined): Promise<void> {
 		if (verdict.action === 'none') return;
+		if (verdict.action === 'fetch') {
+			// Reached only when the voice model called none of its answering tools for this turn: it answered from
+			// memory or guessed. Said now, like a question for the user, so the correction is not queued behind the next turn.
+			this.deps.log?.(`[RelayAgent] ${verdict.tool} was not called for this turn; telling the voice model to call it`);
+			(this.deps.ask ?? this.deps.notice)?.(framedSystem(`The user's last question is answered only by calling ${verdict.tool} now, with what that question asks for, and answering from its result. Nothing said about it before this call was checked: if the result differs from what you said, say so and give the result.`));
+			return;
+		}
 		if (verdict.action === 'duplicate') {
 			this.deps.log?.(`[RelayAgent] the user asked again for ${verdict.of}; not sent twice`);
 			return;

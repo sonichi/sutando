@@ -24,7 +24,11 @@ export type SkillSetupCtx = {
 	setVoiceTaskOriginResolver: (resolver: VoiceTaskOriginResolver | null) => void;
 	/** Each time the user's speech is transcribed: a skill holding a change for a spoken yes knows someone spoke. */
 	onUserSpoke?: (handler: () => void) => void;
+	/** After a call ends (hang-up, or shutdown mid-call), with the session-end task: a skill's post-processing. */
+	onCallEnded?: (handler: CallEndedHandler) => void;
 };
+/** The call that ended, as the session-end task reports it. */
+export type CallEndedHandler = (call: { startedAt: number; endedAt: number; reason: string }) => void | Promise<void>;
 export type SkillSetup = (ctx: SkillSetupCtx) => void;
 
 /** What a skill's optional `voiceSurface()` export adds to the web voice session only. */

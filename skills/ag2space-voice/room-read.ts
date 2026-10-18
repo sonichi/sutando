@@ -186,7 +186,7 @@ export function pickRoom(query: string, rooms: RoomRef[]): RoomResolution {
 }
 
 /** Every room the agent is a member of (room.list, scope self), named rooms only; pages followed. */
-export async function listRooms(client: McpClient, timeoutMs = ROOM_READ_CALL_TIMEOUT_MS): Promise<RoomRef[]> {
+export async function listRooms(client: McpClient, timeoutMs = ROOM_READ_CALL_TIMEOUT_MS, opts: { unnamed?: boolean } = {}): Promise<RoomRef[]> {
 	const out: RoomRef[] = [];
 	let cursor: string | undefined;
 	for (let page = 0; page < ROOM_INDEX_MAX_PAGES; page++) {
@@ -195,7 +195,10 @@ export async function listRooms(client: McpClient, timeoutMs = ROOM_READ_CALL_TI
 		if (res.isError || !payload) throw new Error(`room.list: ${String((payload as { code?: string } | null)?.code ?? 'failed')}`);
 		for (const r of Array.isArray(payload.rooms) ? payload.rooms : []) {
 			const room = r as { room_id?: unknown; name?: unknown };
-			if (typeof room.room_id === 'string' && typeof room.name === 'string' && room.name.trim()) out.push({ room_id: room.room_id, name: room.name.trim() });
+			if (typeof room.room_id !== 'string') continue;
+			const name = typeof room.name === 'string' ? room.name.trim() : '';
+			if (name) out.push({ room_id: room.room_id, name });
+			else if (opts.unnamed) out.push({ room_id: room.room_id, name: 'an unnamed room' });
 		}
 		cursor = typeof payload.next_cursor === 'string' && payload.next_cursor ? payload.next_cursor : undefined;
 		if (!cursor) break;
@@ -770,6 +773,7 @@ export function createSearchRoomTool(deps: ReadRoomDeps): ToolDefinition {
 		name: 'search_room',
 		description:
 			'Search an AG2 Space room\'s messages for words, however far back, right now (a second or two). ' +
+			'It finds a topic in one room; it is not how to find who mentioned, tagged or messaged the user — that is query_messages. ' +
 			'Call it when the user asks what was said in a room about a particular PR, issue, topic or person ("what was the review of 5473 in Sutando Triage", "what did Chi say about the guest line"), or about something from earlier than the latest messages — never answer such a question from memory or from an earlier answer; search every time. ' +
 			'Pass `query` = the words to find (a PR number, a name, a phrase), `room` = the room name as spoken or as listed in ROOMS; leave `room` out for the room this session is in. ' +
 			'Returns {ok:true, room, hits:[{at, from, text, event_id}]} newest first, each a snippet around the match — answer from them in a sentence or two; to read the whole discussion around a hit, call read_room with `around` = its event_id. ' +

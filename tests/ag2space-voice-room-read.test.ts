@@ -337,7 +337,7 @@ describe('readRoom: every outcome is something the model can say', () => {
 	it('read_room is declared as a tool that fetches the answer, so the turn check does not also send the turn', () => {
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
 		assert.match(src, /answeringTools: roomRead\.tools\.map\(\(t\) => t\.name\)/);
-		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list, \.\.\.open\]/, 'list_rooms, search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room');
+		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list, query, roomStats, \.\.\.open\]/, 'list_rooms, search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room');
 		assert.match(src, /roomIndexContextLines\(index\)/, 'the room names are in every prompt');
 		assert.match(src, /_rooms\.refresh\(\)\.then\(/, 'the index is the warm-up');
 	});
@@ -408,8 +408,8 @@ describe('searchRoom: what was said about something, however far back', () => {
 		assert.match(ROOM_TURN_CHECK_RULE, /^- none: a question about an AG2 Space room's messages/);
 		assert.match(ROOM_TURN_CHECK_RULE, /never work, even when it names a PR/);
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
-		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list, \.\.\.open\]/, 'search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room, all answering tools through the same map');
-		assert.match(src, /turnCheckRules: \[ROOM_TURN_CHECK_RULE, ROOM_ACTIONS_TURN_CHECK_RULE\]/, 'the turn check is told');
+		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, list, query, roomStats, \.\.\.open\]/, 'search_room, search_commons, read_page, write_page, add_comment and send_message are declared with read_room, all answering tools through the same map');
+		assert.match(src, /turnCheckRules: \[ROOM_TURN_CHECK_RULE, QUERY_TURN_CHECK_RULE, ROOM_ACTIONS_TURN_CHECK_RULE\]/, 'the turn check is told');
 	});
 });
 
