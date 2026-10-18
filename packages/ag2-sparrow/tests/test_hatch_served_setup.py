@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -108,7 +109,7 @@ print(json.dumps({"routing": json.loads(routing), "status": json.loads(status),
                   "raw": routing + status, "reloaded": reloaded, "url": m.URL}))
 """
 
-    def bridge(self, script, **extra):
+    def bridge_env(self, **extra):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("REMOTE_", "AG2_", "AGENT_CONNECT_", "SPARROW_"))
                and k not in ("CLAUDE_CONFIG_DIR", "AGENT_MXID", "AGENT_ID")}
@@ -117,7 +118,12 @@ print(json.dumps({"routing": json.loads(routing), "status": json.loads(status),
                    AGENT_CONNECT_RESULT_DIR=str(self.home / "r"),
                    AGENT_CONNECT_STATE_DIR=str(self.state),
                    REMOTE_TASK_URL="https://gw.example/relay?tenant=a",
-                   REMOTE_TASK_TOKEN="fake-relay-token-0123456789abcdef", **extra)
+                   REMOTE_TASK_TOKEN="fake-relay-token-0123456789abcdef")
+        env.update(extra)
+        return env
+
+    def bridge(self, script, **extra):
+        env = self.bridge_env(**extra)
         r = subprocess.run([sys.executable, "-c", PRELUDE + script], env=env, capture_output=True,
                            text=True, cwd=str(self.home), timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -198,6 +204,83 @@ print(json.dumps({"key_before": key_before, "url": m.URL,
         out = self.bridge(self.COLD, AGENT_MXID=AGENT)
         self.assertNotIn("tenant", path.read_text(), "the next load with a key migrates it")
         self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space", out)
+
+    def test_stale_pre_binding_temps_are_swept_on_load_and_nothing_else(self):
+        child = subprocess.Popen([sys.executable, "-c", ""])
+        child.wait()
+        dead, live, old = child.pid, os.getpid(), time.time() - 60
+        outside = self.home / "outside.txt"
+        outside.write_text("keep")
+        secret = json.dumps({"identity": AGENT, "gateway": "https://gw.example/relay?tenant=a"})
+
+        def temp(name, age=True):
+            path = self.state / name
+            path.write_text(secret)
+            if age:
+                os.utime(path, (old, old))
+            return path
+
+        stale = temp(f".owner-routing.json.{dead}.tmp")
+        kept = [temp(f".owner-routing.json.{live}.tmp"),
+                temp(f".owner-routing.json.{dead + 1}.tmp", age=False),
+                temp(f".owner-routing.json.{dead}.tmp.bak"),
+                temp(f".owner-routing.blue.json.{dead}.tmp")]
+        link = self.state / f".owner-routing.json.{dead + 2}.tmp"
+        link.symlink_to(outside)
+        os.utime(link, (old, old), follow_symlinks=False)
+        folder = self.state / f".owner-routing.json.{dead + 3}.tmp"
+        folder.mkdir()
+        os.utime(folder, (old, old))
+        self.bridge("from ag2_sparrow import remote_gateway_bridge as m\n"
+                    "m._load_routing()\nprint('{}')\n")
+        self.assertFalse(stale.exists(), "a dead writer's old temp is removed")
+        for path in kept:
+            self.assertTrue(path.exists(), path.name)
+        self.assertTrue(link.is_symlink() and outside.read_text() == "keep", "a symlink is never followed")
+        self.assertTrue(folder.is_dir())
+
+    LEAK = """
+import glob, json, os
+from ag2_sparrow import remote_gateway_bridge as m
+try:
+    m._req("GET", "/v1/tasks?wait=0")
+    raw = ""
+except Exception as e:  # what the poll loop's last catch receives
+    raw = f"{type(e).__name__}: {e}"
+    m._log(f"unexpected: {e} — backing off 1s")
+    m._emit_gateway_status(False, error=f"unexpected: {e}", backoff_s=1)
+files = {p: open(p, errors="replace").read() for p in glob.glob(os.environ["HOME"] + "/**", recursive=True)
+         if os.path.isfile(p)}
+print(json.dumps({"raw": raw, "url": m.URL, "files": files}))
+"""
+
+    def test_an_error_carrying_the_gateway_url_is_redacted_before_it_is_logged_or_persisted(self):
+        url = "https://gw.example/relay?enrollment=SECRET BAD"
+        r = subprocess.run([sys.executable, "-c", PRELUDE + self.LEAK], capture_output=True, text=True,
+                           cwd=str(self.home), timeout=60, env=self.bridge_env(REMOTE_TASK_URL=url))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual(out["url"], url)
+        self.assertIn("InvalidURL", out["raw"])
+        self.assertIn("SECRET", out["raw"], "the exception itself carries the query")
+        printed = r.stdout.strip().splitlines()[:-1]
+        self.assertTrue(any(gateway_instance.REDACTED_TEXT in ln for ln in printed), printed)
+        self.assertNotIn("SECRET", "\n".join(printed) + r.stderr)
+        status = json.loads((self.state / "gateway-status.json").read_text())
+        self.assertIn(gateway_instance.REDACTED_TEXT, status["error"])
+        for path, text in out["files"].items():
+            self.assertNotIn("SECRET", text, path)
+
+    def test_redacted_text_keeps_diagnostics_and_fails_closed_on_any_secret_piece(self):
+        url = "https://u:pw-1234@gw.example/relay?enrollment=SECRET%20BAD&tenant=acme#frag-xyz"
+        closed = gateway_instance.REDACTED_TEXT
+        for text, want in ((f"poll failed for {url}", "poll failed for https://gw.example/relay"),
+                           ("poll HTTP 500 — enrollment file", "poll HTTP 500 — enrollment file"),
+                           ("'/relay?enrollment=SECRET%20BAD&tenant=acme'", closed),
+                           ("found SECRET BAD in path", closed), ("acme", closed),
+                           ("pw-1234", closed), ("frag-xyz", closed)):
+            self.assertEqual(gateway_instance.redact_text(text, url), want, text)
+        self.assertEqual(gateway_instance.redact_text("x", ""), "x")
 
     STARTUP = """
 import json
@@ -406,7 +489,8 @@ class WakeContext(Base):
     def assert_fresh_key(self, path):
         self.assertRegex(path.read_text(), r"^[0-9a-f]{64}$")
         self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
-        self.assertEqual([p.name for p in path.parent.iterdir()], [path.name], "no temp left")
+        self.assertEqual(sorted(p.name for p in path.parent.iterdir()),
+                         [path.name, f"{path.name}.lock"], "no temp left")
 
     def test_an_empty_short_or_loose_key_is_corrupt_and_replaced_only_once_stale(self):
         for text, mode in (("", 0o600), ("abc", 0o600), ("not a key" * 8, 0o600),
@@ -429,12 +513,51 @@ class WakeContext(Base):
         with mock.patch.object(gateway_instance.os, "fsync", side_effect=OSError("crash")):
             self.assertEqual(gateway_instance.binding_digest(AGENT, GW, create=True), "")
         self.assertFalse(path.exists(), "never an empty or partial key at the final path")
-        self.assertEqual(list(path.parent.iterdir()), [])
+        self.assertEqual([p.name for p in path.parent.iterdir()], [f"{path.name}.lock"])
         with mock.patch.object(gateway_instance.os, "link", side_effect=OSError("crash")):
             self.assertEqual(gateway_instance.binding_digest(AGENT, GW, create=True), "")
         self.assertFalse(path.exists())
         self.assertEqual(len(gateway_instance.binding_digest(AGENT, GW, create=True)), 64)
         self.assert_fresh_key(path)
+
+    def test_two_writers_recovering_a_stale_key_bind_with_the_one_key(self):
+        import threading
+        path = self.key("", age=60)
+        a_replacing, release_a, b_at_lock = threading.Event(), threading.Event(), threading.Event()
+        real_replace, real_lock, replaced, digests = os.replace, gateway_instance.file_lock.lock_fd, [], {}
+
+        def replace(src, dst):
+            if threading.current_thread().name == "A":
+                a_replacing.set()
+                self.assertTrue(release_a.wait(10))
+            replaced.append(threading.current_thread().name)
+            return real_replace(src, dst)
+
+        def lock(fd, **kw):
+            if threading.current_thread().name == "B":
+                b_at_lock.set()  # B has already read the bad key outside the lock
+            return real_lock(fd, **kw)
+
+        def writer():
+            digests[threading.current_thread().name] = gateway_instance.binding_digest(
+                AGENT, GW, create=True)
+
+        with mock.patch.object(gateway_instance.os, "replace", replace), \
+                mock.patch.object(gateway_instance.file_lock, "lock_fd", lock):
+            a = threading.Thread(target=writer, name="A")
+            a.start()
+            self.assertTrue(a_replacing.wait(10), "A is mid-recovery, holding the lock")
+            b = threading.Thread(target=writer, name="B")
+            b.start()
+            self.assertTrue(b_at_lock.wait(10))
+            release_a.set()
+            a.join(10)
+            b.join(10)
+        self.assertEqual(replaced, ["A"], "one writer recovers; the other re-reads")
+        self.assertEqual(len(digests["A"]), 64)
+        self.assertEqual(digests["A"], digests["B"])
+        self.assertEqual(gateway_instance.binding_digest(AGENT, GW), digests["A"])
+        self.assertEqual(sorted(p.name for p in path.parent.iterdir()), [path.name, f"{path.name}.lock"])
 
     def test_a_key_another_process_published_first_is_used(self):
         path = gateway_instance.binding_key_path()

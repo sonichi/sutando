@@ -18,7 +18,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from . import holder_lock
+from . import file_lock, holder_lock
 
 INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 
@@ -66,6 +66,29 @@ def redact_url(value: str) -> str:
         return REDACTED_URL
 
 
+REDACTED_TEXT = "<text withheld: it may contain the gateway URL>"
+
+
+def redact_text(text: str, gateway_url: str) -> str:
+    """Diagnostic text safe to log or persist: the full gateway URL replaced by its redacted
+    form. Fails closed: REDACTED_TEXT when any secret part of the URL (userinfo, query,
+    fragment, or a query value or a word of one) still appears, or the URL does not parse."""
+    text, url = str(text), str(gateway_url or "")
+    if not url:
+        return text
+    try:
+        p = urllib.parse.urlsplit(url)
+        userinfo = p.netloc.rpartition("@")[0]
+    except Exception:  # noqa: BLE001 - an unparseable URL may sit in the text in any form
+        return REDACTED_TEXT if url in text else text
+    text = text.replace(url, redact_url(url))
+    values = [part.partition("=")[2] for part in re.split(r"[&;]", p.query)]
+    values += [userinfo, *userinfo.split(":"), p.query, p.fragment]
+    values += [urllib.parse.unquote_plus(v) for v in values]
+    pieces = {piece for v in values for piece in (v, *v.split())}
+    return REDACTED_TEXT if any(len(x) >= 4 and x in text for x in pieces) else text
+
+
 KEY_GRACE_S = 5.0
 
 
@@ -109,34 +132,45 @@ def _binding_key(create: bool) -> "bytes | None":
         return key
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        with file_lock.locked_file(path.parent / f"{path.name}.lock", create_mode=0o600):
+            return _publish_key(path)
     except OSError:
         return None
+
+
+def _publish_key(path: Path) -> "bytes | None":
+    """Under the key dir's lock, so one writer publishes or recovers and every other re-reads
+    the key it published before binding with it."""
+    key = _read_key(path)
+    if key is not None:
+        return key
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        st = None
+    # A bad key younger than the grace may be an older, unlocked writer mid-write.
+    if st is not None and time.time() - st.st_mtime < KEY_GRACE_S:
+        return None
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="ascii") as fh:
             os.fchmod(fh.fileno(), 0o600)
             fh.write(os.urandom(32).hex())
             fh.flush()
             os.fsync(fh.fileno())
-        try:
+        if st is None:
             os.link(tmp, str(path))  # the key appears whole or not at all
-        except FileExistsError:
-            key = _read_key(path)
-            if key is not None:
-                return key
-            # A bad key younger than the grace may be an older writer mid-write.
-            if time.time() - path.stat().st_mtime < KEY_GRACE_S:
-                return None
+        else:
             os.replace(tmp, str(path))
         _fsync_dir(path.parent)
-        return _read_key(path)
-    except OSError:
-        return None
+    except FileExistsError:
+        pass  # an unlocked writer published first: its key, re-read below, is the key
     finally:
         try:
             os.unlink(tmp)
         except OSError:
             pass
+    return _read_key(path)
 
 
 def binding_digest(identity: str, gateway_url: str, create: bool = False) -> str:

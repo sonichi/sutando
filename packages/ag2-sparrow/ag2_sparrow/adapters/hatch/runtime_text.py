@@ -9,6 +9,7 @@ with the owner's DM room when Sparrow has read it. Text only instructs; claims, 
 and fail-closed delivery are enforced by the code, which served text cannot reach."""
 from __future__ import annotations
 
+import hmac
 import json
 import re
 import sys
@@ -65,7 +66,7 @@ def owner_dm_room(state_dir: Path, instance: str = "", agent_mxid: str = "") -> 
         identity, str(routing.get("gateway") or ""))
     bound = (identity and identity == status.get("agent_id")
              and (not agent_mxid or identity == agent_mxid) and isinstance(binding, str)
-             and binding and saved == binding)
+             and binding and isinstance(saved, str) and hmac.compare_digest(saved, binding))
     room = str(routing.get("owner_dm") or "")
     return room if bound and ROOM_ID_RE.fullmatch(room) else ""
 

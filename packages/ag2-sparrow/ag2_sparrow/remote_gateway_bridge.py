@@ -1817,10 +1817,45 @@ def _migrate_routing(d: dict) -> dict:
     return record
 
 
+ROUTING_TEMP_GRACE_S = 5.0
+
+
+def _sweep_routing_temps() -> int:
+    """Unlink the pre-binding writer's crash leftovers (`.owner-routing<sfx>.json.<pid>.tmp`, which
+    may hold the full URL): only regular files in the state dir, this uid's, past the grace, whose pid is dead."""
+    pattern = re.compile(re.escape(f".{_routing_file().name}.") + r"([0-9]{1,10})\.tmp")
+    removed = 0
+    try:
+        dfd = os.open(_STATE, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return 0
+    try:
+        for name in os.listdir(dfd):
+            m = pattern.fullmatch(name)
+            if not m or int(m.group(1)) == os.getpid():
+                continue
+            try:
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()
+                        or time.time() - st.st_mtime < ROUTING_TEMP_GRACE_S
+                        or _pid_alive(int(m.group(1)))):
+                    continue
+                os.unlink(name, dir_fd=dfd)
+                removed += 1
+            except OSError:
+                continue
+    finally:
+        os.close(dfd)
+    if removed:
+        _log(f"owner-routing: removed {removed} stale temp file(s)")
+    return removed
+
+
 def _load_routing() -> None:
     if _ROUTING["loaded"]:
         return
     _ROUTING["loaded"] = True
+    _sweep_routing_temps()
     _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # what the in-memory reading is bound to
     try:
         d = json.loads(_routing_file().read_text(encoding="utf-8"))
@@ -2582,7 +2617,8 @@ sys.stderr = _NeverFatalStream(sys.stderr)
 
 
 def _log(msg: str) -> None:
-    line = f"[remote-gateway-bridge] {msg}"
+    safe = gateway_instance.redact_text(msg, globals().get("URL") or "")
+    line = f"[remote-gateway-bridge] {safe}"
     print(line, flush=True)
     _append_log_file(line)
 
@@ -3619,7 +3655,7 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "ts": now,
             "last_ok_ts": last_ok,
             "backoff_s": int(backoff_s),
-            "error": _one_line(error) if error else None,
+            "error": _one_line(gateway_instance.redact_text(error, URL)) if error else None,
             "gateway": _redact_url(URL),
             # Re-read on every write, so a lane switch or re-login shows at the next poll.
             "agent_id": (_reenroll_identity() or None) if connected else None,
