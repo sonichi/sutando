@@ -32,7 +32,7 @@ isolate_os_environ()
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import health_command as hc, outbox  # noqa: E402
+from ag2_sparrow import gateway_credential_io, health_command as hc, outbox  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli, keepalive, task_fields  # noqa: E402
 
 KEEPAWAKE_NOTE = "the agent keeps Sparrow running with %s keepalive keepawake from its scheduler"
@@ -159,6 +159,10 @@ class Base(unittest.TestCase):
         systemd = mock.patch.object(hatch_cli, "_systemd_run", return_value=None)
         systemd.start()
         self.addCleanup(systemd.stop)
+        # Nor the host's vault, which an install diff's masking reaches when nothing else holds a token.
+        vault = mock.patch.object(gateway_credential_io, "_vault", return_value=None)
+        vault.start()
+        self.addCleanup(vault.stop)
         # Nor does install start a Sparrow, unless a test asks for the real step.
         ensure = mock.patch.object(keepalive, "ensure_sparrow", return_value=0)
         ensure.start()

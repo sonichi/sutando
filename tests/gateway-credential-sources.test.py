@@ -35,7 +35,7 @@ REPO = Path(__file__).resolve().parent.parent
 PKG = REPO / "packages" / "ag2-sparrow"
 sys.path.insert(0, str(PKG))
 sys.path.insert(0, str(REPO / "shared"))
-from ag2_sparrow import gateway_credential_sources as owner, gateway_credentials as contract  # noqa: E402
+from ag2_sparrow import gateway_credential_io, gateway_credential_sources as owner, gateway_credentials as contract  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli, keepalive as hatch_keepalive  # noqa: E402
 
 
@@ -451,6 +451,10 @@ class RealSinks(unittest.TestCase):
         patcher = mock.patch.object(hatch_cli, "_systemd_run", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Nor the host's vault: a Hatch diff that reaches the vault tier reads a fake one.
+        vault = mock.patch.object(gateway_credential_io, "_vault", return_value=None)
+        vault.start()
+        self.addCleanup(vault.stop)
 
     def bridge(self, fx, script=BRIDGE, timeout=60):
         state = fx.root / "state"
@@ -541,15 +545,20 @@ class RealSinks(unittest.TestCase):
             self.assertIn(f"credential file {fx.token_file} was refused (not UTF-8)", reload_err)
             self.assertNotIn(FILE_TOKEN, reload_err, "path and reason, never content")
 
-    def hatch_diff(self, fx, installed: str) -> str:
-        unit = fx.root / "ag2-sparrow.service"
+    def hatch_diff(self, fx, installed: str, name: str = "ag2-sparrow.service",
+                   ours: str = "[Service]\nExecStart=/y\n") -> str:
+        unit = fx.root / name
         unit.write_text(installed)
         out = io.StringIO()
-        env = {k: v for k, v in os.environ.items() if k not in owner.CREDENTIAL_KEYS}
+        host = owner.CREDENTIAL_KEYS + (owner.TOKEN_FILE_KEY, owner.CHANNEL_DIR_KEY, "AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR")
+        env = {k: v for k, v in os.environ.items() if k not in host}
         env.update(fx.env, HOME=str(fx.root))
+        vault = getattr(fx, "vault", "")
         with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
-                contextlib.redirect_stderr(io.StringIO()):
-            hatch_cli._install_file(unit, "[Service]\nExecStart=/y\n", 0o644, refuse_drift=True, force=False)
+                contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(gateway_credential_io, "_vault", return_value=lambda key: (
+                    vault if key == "REMOTE_TASK_TOKEN" else "")):
+            hatch_cli._install_file(unit, ours, 0o644, refuse_drift=True, force=False)
         self.assertIn("DIFF:", out.getvalue())
         return out.getvalue()
 
@@ -557,13 +566,49 @@ class RealSinks(unittest.TestCase):
         for row in ROWS:
             with self.subTest(row=row[0]), tempfile.TemporaryDirectory() as td:
                 fx = Fixture(Path(td), row)
-                body = "".join(f"Environment=X{i}={c}\n" for i, c in enumerate(fx.candidates))
+                # Each candidate only outside an assignment: discovery alone registers it.
+                body = "".join(f"ExecStartPre=/x --token {c}\n" for c in fx.candidates)
                 shown = self.hatch_diff(fx, f'[Service]\nEnvironment="SAFE=keep-me" "REMOTE_TASK_TOKEN={RETIRED}"\n'
                                             f"Environment=REMOTE_TASK_URL={URL_SECRET_URL}\n{body}"
                                             f"ExecStart=/x --a {fx.candidates[0]}\n")
-                for secret in fx.candidates + [RETIRED, "pass-word-2", "query-secret-3", "keep-me"]:
+                # The vault is read only when no earlier tier holds a token, as in the bridge.
+                reached = [c for c in fx.candidates if c != fx.vault or fx.expected()["source"] == "vault"]
+                for secret in reached + [RETIRED, "pass-word-2", "query-secret-3", "keep-me"]:
                     self.assertNotIn(secret.casefold(), shown.casefold(), secret)
                 self.assertIn("-Environment=<withheld>\n", shown)
+                self.assertNotIn("Environment=X", shown)
+
+    def outside_assignments(self, live: str, env: dict, vault: str = ""):
+        """The real Hatch diff of a unit and a hook script that hold `live` only outside any
+        assignment, with `env` (paths under the temp root filled in) and a fake vault."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "relay.env").write_text(f"REMOTE_TASK_TOKEN={live}\n")
+            (root / "token").write_text(f"REMOTE_TASK_TOKEN={live}\n")
+            fx = mock.Mock(root=root, vault=vault, env={k: str(root / v) if v in ("relay.env", "token") else v
+                                                        for k, v in env.items()})
+            unit = self.hatch_diff(fx, f"[Service]\nExecStart=/x --token {live}\n")
+            hook = self.hatch_diff(fx, f'#!/bin/sh\ncurl -H "Authorization: Bearer {live}" https://gw.example/\n',
+                                   name=hatch_cli.SCRIPT_NAME, ours="#!/bin/sh\nexit 0\n")
+        return unit, hook
+
+    def test_a_token_only_outside_an_assignment_is_masked_from_the_env_or_the_device_file(self):
+        live = "synth-live-outside-5698"
+        for where, env in (("env", {"REMOTE_TASK_TOKEN": live}), ("device file", {"AG2_DEVICE_ENV": "relay.env"})):
+            with self.subTest(where=where):
+                unit, hook = self.outside_assignments(live, env)
+                self.assertNotIn(live, unit + hook)
+                self.assertIn("-ExecStart=<withheld>\n", unit)
+                self.assertIn(f"-{contract.WITHHELD_TEXT}\n", hook)
+
+    def test_a_token_only_outside_an_assignment_is_masked_from_the_token_file_or_the_vault(self):
+        live = "synth-live-rotated-5698"
+        for where, env, vault in (("token file", {"REMOTE_TASK_TOKEN_FILE": "token"}, ""), ("vault", {}, live)):
+            with self.subTest(where=where):
+                unit, hook = self.outside_assignments(live, env, vault)
+                self.assertNotIn(live, unit + hook)
+                self.assertIn("-ExecStart=<withheld>\n", unit)
+                self.assertIn(f"-{contract.WITHHELD_TEXT}\n", hook)
 
     def test_the_hatch_install_diff_masks_past_a_comment_in_a_continuation(self):
         with tempfile.TemporaryDirectory() as td:
@@ -800,7 +845,9 @@ OWNER_READERS = {"env_files": (1, ("read_text",)), "discover": (None, ("read_tok
 # Where credential I/O may happen: the adapters' edge, as (module, function).
 # Hatch's systemd reachability probe discards what show-environment prints.
 IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_bridge.py", "_read_text"),
-              ("remote_gateway_bridge.py", "_vault_lookup"), ("adapters/hatch/cli.py", "systemd_user_available")}
+              ("remote_gateway_bridge.py", "_vault_lookup"), ("adapters/hatch/cli.py", "systemd_user_available"),
+              ("gateway_credential_io.py", "read_file"), ("gateway_credential_io.py", "vault_lookup"),
+              ("gateway_credential_io.py", "_vault")}
 # A command whose output is a credential store: the Keychain, or the systemd user manager's environment.
 STORE_READS = ("security", "find-generic-password", "show-environment")
 

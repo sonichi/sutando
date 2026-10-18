@@ -28,7 +28,7 @@ import time
 from importlib import resources
 from pathlib import Path
 
-from ... import _dirs, gateway_credentials, gateway_instance, outbox, workspace_lock
+from ... import _dirs, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
 from ...result_markers import parse_markers
 from .task_fields import item_id, valid_mxid
 
@@ -133,8 +133,10 @@ def _record_script(sha: str) -> None:
 
 def _diff(old: str, new: str, path: Path) -> str:
     """The diff of an installed file against ours, as gateway_credentials.mask_env_assignments
-    shows it: no environment line's content, and no value registered from either text."""
+    shows it: no environment line's content, and no value registered from either text or from
+    any credential candidate this environment leads to (masking only; the bridge decides)."""
     registry = gateway_credentials.SecretRegistry()
+    gateway_credential_io.register_candidates(os.environ, registry)
     gateway_credentials.register_assignments(registry, old, new)
     old, new = (gateway_credentials.mask_env_assignments(t, registry) for t in (old, new))
     return "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),

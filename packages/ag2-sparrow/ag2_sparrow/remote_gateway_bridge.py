@@ -304,7 +304,7 @@ from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir a
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
-from . import agent_identity, gateway_credential_sources, gateway_credentials, gateway_instance, local_task_protocol
+from . import agent_identity, gateway_credential_io, gateway_credential_sources, gateway_credentials, gateway_instance, local_task_protocol
 from .bounded_file_read import read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
@@ -546,16 +546,7 @@ def _vault_lookup(vault_get=None):
     core `channel_token.token_from_vault`, total-failure-safe and never surfacing the value. The
     package ships standalone, so the monorepo `src/` may be absent: then there is no vault tier
     (None) rather than a crash at startup. `vault_get` is injectable for hermetic tests."""
-    try:
-        src = _monorepo_src("channel_token.py")
-        if not src:
-            return None
-        if src not in sys.path:
-            sys.path.insert(0, src)
-        from channel_token import token_from_vault
-    except Exception:
-        return None
-    return lambda key: token_from_vault(key, vault_get=vault_get)
+    return gateway_credential_io.vault_lookup(_monorepo_src("channel_token.py"), vault_get)
 
 
 def _announce_vault_token() -> None:
@@ -1521,14 +1512,7 @@ _VAULT_INTERCEPT_FNS: "tuple | None" = None
 def _monorepo_src(marker: str) -> str:
     """The monorepo `src/` that holds `marker`, walking up from this file;
     '' when sparrow runs standalone (pyproject install, no monorepo around it)."""
-    cur = os.path.dirname(os.path.abspath(__file__))
-    while True:
-        if os.path.isfile(os.path.join(cur, "src", marker)):
-            return os.path.join(cur, "src")
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            return ""
-        cur = parent
+    return gateway_credential_io.monorepo_src(marker, __file__)
 
 
 # `project()` assigns retry cadence to its caller and the worker drives this
