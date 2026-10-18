@@ -289,7 +289,7 @@ m._ROUTING.update(owner_dm="", persisted="")
 m._load_routing()
 reloaded = m._ROUTING["owner_dm"]
 record = json.loads(routing)
-for legacy in ({"identity": record["identity"], "gateway": m.URL, "owner_dm": "!old:x"},
+for legacy in ({"identity": record["identity"], "gateway": m.URL, "owner_dm": "!old:ag2.space"},
                dict(record, binding="0" * 64, owner_dm="!forged:x")):
     m._routing_file().write_text(json.dumps(legacy))
     m._ROUTING.update(owner_dm="", persisted="")  # a restart
@@ -329,7 +329,7 @@ print(json.dumps({"routing": json.loads(routing), "status": json.loads(status),
         self.assertEqual(out["status"]["gateway_binding"], digest)
         self.assertNotIn("tenant", out["raw"], "nothing from the URL's query is persisted")
         self.assertNotIn("fake-relay-token", out["raw"])
-        self.assertEqual(out["reloaded"], "!dm:ag2.space !old:x -",
+        self.assertEqual(out["reloaded"], "!dm:ag2.space !old:ag2.space -",
                          "its own record and a legacy one reload; a foreign binding does not")
         self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space")
 
@@ -880,6 +880,15 @@ print(json.dumps({"status": json.load(open(m.GATEWAY_STATUS_FILE))}))
             self.assertEqual(diagnostics.safe_status({"e": [f"x {token}"]}, lambda t: t),
                              {"e": [diagnostics.WITHHELD_TEXT]}, "safe_status runs the registry after the net")
 
+    def test_a_failed_private_review_reports_only_the_exception_description(self):
+        import ast
+        src = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
+        fn = next(f for f in ast.walk(ast.parse(src)) if isinstance(f, ast.FunctionDef)
+                  and f.name == "_guarded_result_body")
+        text = ast.unparse(fn)
+        self.assertIn("private owner review failed: {diagnostics.describe(exc)}", text)
+        self.assertNotIn("failed: {exc}", text)
+
     def test_the_status_file_is_written_only_through_safe_status(self):
         import ast
         src = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
@@ -993,6 +1002,43 @@ print("{}")
             self.assertNotIn(secret, logs, secret)
             self.assertNotIn(secret, status, secret)
 
+    def test_the_unraisable_and_atexit_paths_are_scrubbed(self):
+        script = """
+import atexit, gc
+from ag2_sparrow import diagnostics, gateway_instance
+url = "https://user-name-1:pass-word-9@gw.example/relay?k=query-secret-1#frag-secret-1"
+gateway_instance.register_gateway_secrets(url)
+diagnostics.register_secret("bearer-secret-77")
+gateway_instance.install_scrubbing_excepthooks(lambda: url)
+class D:
+    def __del__(self):
+        raise ValueError("del " + url + " bearer-secret-77")
+D(); gc.collect()
+atexit.register(lambda: (_ for _ in ()).throw(RuntimeError("atexit " + url + " BEARER-SECRET-77")))
+"""
+        r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                           cwd=str(self.home), timeout=60, env=self.bridge_env())
+        self.assertIn("Exception ignored: ValueError", r.stderr)
+        self.assertIn("RuntimeError", r.stderr)
+        for secret in ("user-name-1", "pass-word-9", "query-secret-1", "frag-secret-1", "bearer-secret-77"):
+            self.assertNotIn(secret, r.stderr.casefold(), secret)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_a_secret_spread_across_the_hook_record_withholds_it_whole(self):
+        script = """
+import threading
+from ag2_sparrow import diagnostics, gateway_instance
+diagnostics.register_secret("w-abc: XyzErr")
+gateway_instance.install_scrubbing_excepthooks(lambda: "")
+XyzErr = type("XyzErr", (Exception,), {})
+def boom():
+    raise XyzErr("x")
+t = threading.Thread(target=boom, name="w-abc"); t.start(); t.join()
+"""
+        r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                           cwd=str(self.home), timeout=60, env=self.bridge_env())
+        self.assertEqual(r.stderr.strip(), "Exception in thread w-abc: " + gateway_instance.REDACTED_TEXT)
+
     def test_the_excepthook_scrubs_its_file_name_and_thread_name_too(self):
         script = """
 import threading
@@ -1013,6 +1059,83 @@ ns["boom"]()
         from ag2_sparrow import diagnostics
         self.assertIn("Uncaught ValueError at " + diagnostics.WITHHELD_TEXT + ":2: x", r.stderr)
         self.assertIn("Exception in thread " + diagnostics.WITHHELD_TEXT + ": ValueError", r.stderr)
+
+    def test_the_setup_hint_keeps_only_a_safe_revision_and_pep440_versions(self):
+        out = self.bridge("""
+import json
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m
+for reply in ({"setup_revision": "rev " + m.TOKEN, "target_version": "9.9 tenant=a", "min_version": float("nan")},
+              {"setup_revision": m.TOKEN.upper(), "target_version": "a", "min_version": "inf"},
+              {"setup_revision": "r8", "target_version": "1.2.3rc1", "min_version": "0.5.0"}):
+    with mock.patch.object(m, "_req", return_value=reply):
+        m._post_heartbeat(set(), force=True)
+    hints.append(m.SETUP_HINT_FILE.read_text() if m.SETUP_HINT_FILE.exists() else "")
+print(json.dumps(hints))
+""".replace("for reply in", "hints = []\nfor reply in", 1))
+        for written in out:
+            for secret in ("fake-relay-token", "FAKE-RELAY-TOKEN", "tenant=a", "NaN", "Infinity", '"a"', '"inf"'):
+                self.assertNotIn(secret, written, secret)
+
+        hint = json.loads((self.state / "setup-hint.json").read_text())
+        self.assertEqual({k: hint[k] for k in ("setup_revision", "target_version", "min_version")},
+                         {"setup_revision": "r8", "target_version": "1.2.3rc1", "min_version": "0.5.0"})
+        everything = "\n".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
+        for secret in ("fake-relay-token", "FAKE-RELAY-TOKEN", "tenant=a", "NaN", "Infinity"):
+            self.assertNotIn(secret, everything, secret)
+        # The payload also runs through safe_status: with the field checks bypassed, the token is still withheld.
+        bypass = self.bridge("""
+import json
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m
+with mock.patch.object(m.diagnostics, "code_field", lambda v, u="": v), \\
+        mock.patch.object(m, "_req", return_value={"setup_revision": "r " + m.TOKEN.upper()}):
+    m._post_heartbeat(set(), force=True)
+print(json.dumps({"hint": m.SETUP_HINT_FILE.read_text()}))
+""")
+        self.assertNotIn("FAKE-RELAY-TOKEN", bypass["hint"])
+
+    def test_an_echoed_bearer_as_the_owner_dm_reaches_neither_the_routing_files_nor_the_prompt(self):
+        token = "fake-relay-token-0123456789abcdef"
+        for room in (f"!{token}:ag2.space", f"!{token.upper()}:ag2.space", "!good:other.server"):
+            with self.subTest(room=room):
+                out = self.bridge("""
+import json
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m
+row = {"agents": [{"id": m._reenroll_identity(), "owner": "@o:ag2.space", "owner_dm_room": "ROOM"}]}
+with mock.patch.object(m, "_req", return_value=row):
+    m.refresh_routing(force=True)
+m._emit_gateway_status(True)
+print(json.dumps({"dm": m._ROUTING["owner_dm"]}))
+""".replace("ROOM", room), AGENT_MXID=AGENT)
+                self.assertEqual(out, {"dm": ""})
+                for path in self.state.glob("*.json"):
+                    self.assertNotIn(token.casefold(), path.read_text().casefold(), path.name)
+        # The reader refuses one too: a record that holds the bearer is not printed.
+        (self.home / "relay.env").write_text(f"REMOTE_TASK_TOKEN={token}\n")
+        (self.home / "config").write_text(f"AGENT_MXID={AGENT}\nSTATE_DIR={self.state}\nGATEWAY_INSTANCE=\n")
+        bind(self.state, f"!{token}:ag2.space")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": str(self.home / "relay.env")}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(hatch_cli.main(["wake-context"]), 0)
+        self.assertNotIn(token, out.getvalue())
+        self.assertNotIn("owner_dm_room:", out.getvalue())
+
+    def test_a_case_folded_echo_reaches_no_sink(self):
+        token = "fake-relay-token-0123456789abcdef"
+        forms = [token.upper(), token.lower(), token.swapcase()]
+        r = subprocess.run([sys.executable, "-c", PRELUDE + self.REENROLL], capture_output=True, text=True,
+                           cwd=str(self.home), timeout=60,
+                           env=self.bridge_env(AGENT_MXID=AGENT, FORMS=json.dumps(forms)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        block = out["status"].get("reenroll") or {}
+        self.assertIsNone(block.get("approval_code"))
+        self.assertNotIn("RELINK CODE", r.stdout)
+        everything = "\n".join([r.stdout.rsplit("\n", 2)[0], r.stderr, *out["files"].values()])
+        self.assertNotIn(token.casefold(), everything.casefold())
 
     def test_a_safe_error_name_and_approval_code_still_reach_the_status(self):
         r = subprocess.run([sys.executable, "-c", PRELUDE + self.REENROLL], capture_output=True, text=True,
@@ -1563,6 +1686,17 @@ class InProcessSinks(unittest.TestCase):
         self.assertNotIn("SECRET", json.dumps(lines))
 
 
+class InstallDiff(unittest.TestCase):
+    def test_the_install_diff_withholds_credentials_on_disk(self):
+        old = ("[Service]\nEnvironment=REMOTE_TASK_TOKEN=https://gw.example/relay|diff-bearer-42\n"
+               "Environment=OTHER=diff-bearer-42-echo\nExecStart=/x\n")
+        with mock.patch.dict(os.environ, {"REMOTE_TASK_TOKEN": "diff-bearer-42", "AG2_DEVICE_ENV": "/nonexistent"}):
+            text = hatch_cli._diff(old, "[Service]\nExecStart=/y\n", Path("/unit"))
+        self.assertNotIn("diff-bearer-42", text.casefold())
+        self.assertIn("Environment=REMOTE_TASK_TOKEN=<withheld>", text)
+        self.assertIn("ExecStart=/x", text)
+
+
 class Diagnostics(unittest.TestCase):
     def setUp(self):
         from ag2_sparrow import diagnostics
@@ -1636,6 +1770,27 @@ class Diagnostics(unittest.TestCase):
         for echoed in (token, "t0ken", "SeCrEt"):
             self.assertIsNone(self.d.code_field(echoed), echoed)
         self.assertEqual(self.d.code_field("reenroll_disabled"), "reenroll_disabled")
+
+    def test_every_url_credential_piece_is_registered(self):
+        with mock.patch.object(self.d, "_SECRETS", {}):
+            gateway_instance.register_gateway_secrets(
+                "https://long-username-1:long-password-2@gw.example/relay?k=ab&t=long-query-3#long-fragment-4")
+            for text in ("x long-password-2 y", "x long-fragment-4 y", "x long-username-1 y",
+                         "x long-query-3 y", "x k=ab y", "LONG-PASSWORD-2", "Long-Fragment-4"):
+                self.assertEqual(self.d.scrub(text), self.d.WITHHELD_TEXT, text)
+            self.assertEqual(self.d.scrub("x ab y"), "x ab y", "a short bare query value alone is not matched")
+
+    def test_secret_matching_ignores_letter_case_everywhere(self):
+        with mock.patch.object(self.d, "_SECRETS", {}):
+            self.d.register_secret("MixedToken9")
+            for text in ("mixedtoken9", "MIXEDTOKEN9", "mIXEDtOKEN9", "mixedtoken9".encode().hex() and "MixedToken9"):
+                self.assertEqual(self.d.scrub(text), self.d.WITHHELD_TEXT, text)
+            for value in ("MIXEDTOKEN9", "mixedtoken9", "XEDTOK"):
+                self.assertIsNone(self.d.code_field(value), value)
+            self.assertEqual(self.d.safe_status({"e": "x MIXEDTOKEN9"}, lambda t: t), {"e": self.d.WITHHELD_TEXT})
+            self.assertEqual(self.d.version_field("1.0+mixedtoken9"), None)
+            self.assertEqual(self.d.version_field("1.0.post1"), "1.0.post1")
+            self.assertEqual(self.d.version_field("not a version"), None)
 
     def test_describe_trusts_a_gateway_only_on_a_scrubbed_exception(self):
         forged = ValueError("x")

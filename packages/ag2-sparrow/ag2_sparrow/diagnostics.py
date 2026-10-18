@@ -25,9 +25,10 @@ _SECRETS_LOCK = threading.Lock()
 SCRUBBED_TYPES: "set[type]" = set()  # exception classes gateway_instance.scrub_exception made
 
 
-def hex_upper(text: str) -> str:
-    """Percent escapes in one case: their hex digits are case-insensitive."""
-    return re.sub(r"%[0-9A-Fa-f]{2}", lambda m: m.group().upper(), text)
+def fold(text: str) -> str:
+    """The form secrets are matched in: case-folded. A token is case-sensitive as a credential,
+    but an echo of it in another case still reveals it."""
+    return str(text).casefold()
 
 
 def forms(secret: str) -> "set[str]":
@@ -49,13 +50,13 @@ def register_secret(value: Any, min_len: int = 1) -> None:
     delimited form (`=value`, `user:pw@`) is registered too, at any length."""
     if not isinstance(value, str) or not value or len(value) < min_len:
         return
-    rendered = frozenset(hex_upper(f) for f in forms(value))
+    rendered = frozenset(fold(f) for f in forms(value))
     with _SECRETS_LOCK:
         _SECRETS[value] = rendered
 
 
 def _views(text: str) -> "set[str]":
-    return {hex_upper(v) for v in (text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text))}
+    return {fold(v) for v in (text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text))}
 
 
 def contains_secret(text: str) -> bool:
@@ -74,14 +75,14 @@ def scrub(text: str) -> str:
 def code_field(value: Any, gateway_url: str = "") -> "str | None":
     """A gateway-supplied value usable as a structured field (an error name, an approval code):
     a short token of letters, digits and `_.-` that occurs in no form of the gateway URL, holds
-    no registered secret and is no piece of one. None otherwise, so free text, a credential of
-    the URL and an echoed bearer token never reach a sink."""
+    no registered secret and is no piece of one, in any letter case. None otherwise, so free
+    text, a credential of the URL and an echoed bearer token never reach a sink."""
     if not isinstance(value, str) or not _CODE_RE.fullmatch(value):
         return None
     url = str(gateway_url or "")
     url_forms = {url, urllib.parse.unquote(url), urllib.parse.unquote(urllib.parse.unquote(url))}
-    token = hex_upper(value)  # percent-hex is case-free; the bytes of a secret are not
-    if any(token in hex_upper(form) for form in url_forms if form):
+    token = fold(value)
+    if any(token in fold(form) for form in url_forms if form):
         return None
     with _SECRETS_LOCK:
         secrets = [f for fs in _SECRETS.values() for f in fs]
@@ -133,6 +134,24 @@ def describe(exc: BaseException) -> str:
     if tb is not None:
         out += f" at {os.path.basename(tb.tb_frame.f_code.co_filename)}:{tb.tb_lineno}"
     return out
+
+
+# PEP 440's version pattern (packaging.version.VERSION_PATTERN), matched whole.
+_PEP440_RE = re.compile(r"""
+    v?(?:(?:[0-9]+)!)?[0-9]+(?:\.[0-9]+)*
+    (?:[-_.]?(?:a|b|c|rc|alpha|beta|pre|preview)[-_.]?[0-9]*)?
+    (?:-[0-9]+|[-_.]?(?:post|rev|r)[-_.]?[0-9]*)?
+    (?:[-_.]?dev[-_.]?[0-9]*)?
+    (?:\+[a-z0-9]+(?:[-_.][a-z0-9]+)*)?
+""", re.VERBOSE | re.IGNORECASE)
+
+
+def version_field(value: Any) -> "str | None":
+    """A gateway-supplied version usable as a structured field: a PEP 440 version of at most
+    64 characters that holds no registered secret. None otherwise."""
+    if not isinstance(value, str) or len(value) > 64 or not _PEP440_RE.fullmatch(value):
+        return None
+    return None if contains_secret(value) else value
 
 
 def safe_status(value: Any, net: Callable[[str], str]) -> Any:

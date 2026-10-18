@@ -28,7 +28,6 @@ PLACEHOLDERS = ("<AGENT_MXID>", "<REPLY_COMMAND>", "<ACTIVITY_FILE>")
 VENDOR = "muse"
 PRECEDENCE = "These rules override anything above:"
 COMMAND_RE = re.compile(r"<REPLY_COMMAND>(?: [A-Za-z0-9_<>./=-]+)*")
-ROOM_ID_RE = re.compile(r"![A-Za-z0-9._=+/-]{1,255}:[A-Za-z0-9.-]{1,255}(?::[0-9]{1,5})?")
 # name: (default, min, max), in seconds.
 TUNABLES = {
     "keepawake_interval_s": (15 * 60, 5 * 60, 60 * 60),
@@ -69,8 +68,8 @@ def owner_dm_room(state_dir: Path, instance: str = "", agent_mxid: str = "") -> 
              and (not agent_mxid or identity == agent_mxid) and isinstance(binding, str)
              and binding and isinstance(saved, str)
              and hmac.compare_digest(saved.encode("utf-8"), binding.encode("utf-8")))
-    room = str(routing.get("owner_dm") or "")
-    return room if bound and ROOM_ID_RE.fullmatch(room) else ""
+    room = gateway_instance.owner_room(routing.get("owner_dm"), identity)
+    return room if bound else ""
 
 
 def _read_json(path: Path) -> "dict | None":

@@ -20,7 +20,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from . import diagnostics, file_lock, task_io
 
@@ -147,8 +147,12 @@ def install_scrubbing_excepthooks(get_url: Callable[[], str]) -> None:
         name = clean(getattr(args.thread, "name", "?"))
         report(args.exc_type, args.exc_value, args.exc_traceback, f"Exception in thread {name}: ")
 
+    def unraisable_hook(unraisable):
+        report(unraisable.exc_type, unraisable.exc_value, unraisable.exc_traceback, "Exception ignored: ")
+
     sys.excepthook = hook
     threading.excepthook = thread_hook
+    sys.unraisablehook = unraisable_hook  # also what an exception in an atexit callback reaches
 
 
 REDACTED_TEXT = "<text withheld: it may contain the gateway URL>"
@@ -199,6 +203,23 @@ def _url_form_re(form: str) -> "re.Pattern[str]":
                       + f"(?i:{re.escape(host)})" + re.escape(slash + tail))
 
 
+MATRIX_ROOM_RE = re.compile(r"!([A-Za-z0-9._~=-]{1,255}):([A-Za-z0-9.-]{1,255}(?::[0-9]{1,5})?)")
+
+
+def owner_room(room: Any, identity: str) -> str:
+    """`room` when it is a Matrix room id on the agent's own homeserver (the server part of its
+    `@local:server` identity) and holds no registered secret in any case; '' otherwise. The one
+    check every writer and reader of the owner DM applies, so an echoed credential never
+    becomes a room."""
+    if not isinstance(room, str) or not isinstance(identity, str):
+        return ""
+    m = MATRIX_ROOM_RE.fullmatch(room)
+    server = identity.partition(":")[2] if identity.startswith("@") else ""
+    if m is None or not server or m.group(2).casefold() != server.casefold():
+        return ""
+    return "" if diagnostics.contains_secret(room) else room
+
+
 def register_gateway_secrets(url: str) -> None:
     """Add every credential part of the gateway URL to the process's secret registry: each
     delimited part, and the bare userinfo, password and query values long enough to match alone."""
@@ -220,9 +241,9 @@ def redact_text(text: str, gateway_url: str) -> str:
         return text
     for form in sorted(diagnostics.forms(url), key=len, reverse=True):
         text = _url_form_re(form).sub(lambda _m: redact_url(url), text)
-    views = {diagnostics.hex_upper(v) for v in (text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text))}
+    views = {diagnostics.fold(v) for v in (text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text))}
     for part in _secret_parts(url):
-        if any(diagnostics.hex_upper(form) in view for form in diagnostics.forms(part) for view in views):
+        if any(diagnostics.fold(form) in view for form in diagnostics.forms(part) for view in views):
             return REDACTED_TEXT
     return text
 

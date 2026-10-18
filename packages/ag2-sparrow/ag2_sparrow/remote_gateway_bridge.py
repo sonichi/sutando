@@ -779,7 +779,7 @@ def _gateway_owner() -> str:
                 if isinstance(row, dict) and row.get("id") == identity), None)
     owner = str((row or {}).get("owner") or "")
     hint = str((row or {}).get("owner_dm_room") or "")
-    _GATEWAY_OWNER_DM_HINT = hint if hint.startswith("!") else ""
+    _GATEWAY_OWNER_DM_HINT = gateway_instance.owner_room(hint, identity)
     return owner if owner.startswith("@") and ":" in owner else ""
 
 
@@ -789,16 +789,16 @@ def _owner_review_dm(owner: str) -> str:
                              {"owner": owner, "room_id": _GATEWAY_OWNER_DM_HINT})
         return _GATEWAY_OWNER_DM_HINT
     cached = _read_private_json(_WITHHELD_DM_CACHE) or {}
-    room = str(cached.get("room_id") or "")
-    if cached.get("owner") == owner and room.startswith("!"):
+    room = gateway_instance.owner_room(cached.get("room_id"), _reenroll_identity())
+    if cached.get("owner") == owner and room:
         return room
     answer = _req("POST", "/v1/room", {
         "op": "create", "invite": [owner], "is_direct": True,
         "name": "Private result reviews",
         "topic": "Owner-only review of results withheld from shared rooms.",
     }, timeout=20)
-    room = str((answer or {}).get("room_id") or "")
-    if not room.startswith("!"):
+    room = gateway_instance.owner_room((answer or {}).get("room_id"), _reenroll_identity())
+    if not room:
         raise RuntimeError("gateway did not return a private review room")
     _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room})
     return room
@@ -1609,7 +1609,7 @@ def _guarded_result_body(tid: str, body: str):
             if not _route_withheld_review(artifact):
                 return None, f"{verdict.reason}; private owner review unavailable"
         except Exception as exc:  # noqa: BLE001 — retain result file for retry
-            return None, f"{verdict.reason}; private owner review failed: {exc}"
+            return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
     result = (verdict.body, verdict.reason)
     if verdict.reason is not None:
         _WITHHELD_TASK_OUTPUT[cached] = result
@@ -1804,7 +1804,7 @@ def _routing_record(identity: str, gateway_url: str, owner_dm: str) -> "dict | N
     if not binding:
         return None
     return {"identity": identity, "gateway": _redact_url(gateway_url), "binding": binding,
-            "owner_dm": owner_dm}
+            "owner_dm": gateway_instance.owner_room(owner_dm, identity)}
 
 
 def _migrate_routing() -> "routing_migrations.Result":
@@ -1832,7 +1832,7 @@ def _load_routing() -> None:
     bound = isinstance(d, dict) and d.get("identity") == current[0] and bool(d.get("binding")) \
         and hmac.compare_digest(str(d["binding"]).encode("utf-8"),
                                 gateway_instance.binding_digest(current[0], URL).encode("utf-8"))
-    disk = str(d.get("owner_dm") or "") if bound else ""
+    disk = gateway_instance.owner_room(d.get("owner_dm"), current[0]) if bound else ""
     # A reading that came from disk follows the disk; one the writer has not committed yet stays.
     if not _ROUTING["owner_dm"] or _ROUTING["owner_dm"] == _ROUTING["persisted"]:
         _ROUTING["owner_dm"] = disk
@@ -3594,11 +3594,16 @@ def _record_setup_hint(reply) -> None:
     best-effort, like the heartbeat itself."""
     if not isinstance(reply, dict):
         return
-    hint = {k: reply[k] for k in SETUP_HINT_FIELDS if k in reply}
+    # Gateway values: the revision only as a code_field token, the versions only as PEP 440.
+    hint = {k: (diagnostics.code_field(reply.get(k), URL) if k == "setup_revision"
+                else diagnostics.version_field(reply.get(k))) for k in SETUP_HINT_FIELDS if k in reply}
+    hint = {k: v for k, v in hint.items() if v is not None}
     if not hint:
         return
+    payload = diagnostics.safe_status(dict(hint, ts=int(time.time())),
+                                      lambda text: gateway_instance.redact_text(text, URL))
     try:
-        text = json.dumps(dict(hint, ts=int(time.time())), sort_keys=True)
+        text = json.dumps(payload, sort_keys=True, allow_nan=False)
     except (TypeError, ValueError) as e:
         _log(f"setup hint not recorded: {diagnostics.describe(e)}")
         return
