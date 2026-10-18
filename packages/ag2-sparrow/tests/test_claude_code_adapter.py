@@ -815,9 +815,10 @@ class ConnectRoot(ConnectBase):
         self.assertEqual((rec["env"]["AG2_INBOX_DIR"], rec["env"]["AG2_RESULTS_DIR"]), (".", "../results"))
         self.assertEqual(Path(rec["cwd"]).resolve(), (moved / "tasks").resolve())
 
-    def test_a_session_that_spawns_a_detached_sleep_does_not_keep_the_root_held(self):
-        """Only the trampoline holds the lease: with the launcher gone and the trampoline and session
-        killed, a grandchild that inherited every fd (as a Rust Command's would) does not keep the flock."""
+    def test_the_session_shares_the_lease_so_the_root_stays_held_while_anything_that_got_it_lives(self):
+        """Fail closed: with the launcher SIGKILLed and the trampoline killed, the session still holds the
+        root; a detached grandchild that inherited every fd (as a Rust Command's would) holds it after the
+        session too, until it exits. Nothing runs a second session over a live one."""
         from ag2_sparrow import task_io
         self.configure()
         (self.home / "claude-detach").write_text("1")
@@ -832,17 +833,20 @@ class ConnectRoot(ConnectBase):
         launcher.wait(timeout=30)
         try:
             self.assertEqual(task_io.lock_held(str(self.work)), "held", "the trampoline keeps the lease after the launcher")
-            for pid in (trampoline, session):
-                with contextlib.suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGKILL)
-                wait_gone(pid)
+            os.kill(trampoline, signal.SIGKILL)
+            wait_gone(trampoline)
+            self.assertTrue(alive(session), "the session outlives its trampoline")
+            self.assertEqual(task_io.lock_held(str(self.work)), "held", "and keeps the root fenced: it shares the lease")
+            os.kill(session, signal.SIGKILL)
+            wait_gone(session)
             self.assertTrue(alive(sleeper), "the grandchild outlives them all")
-            self.assertEqual(task_io.lock_held(str(self.work)), "free", "and holds no lease: it never reached the session")
+            self.assertEqual(task_io.lock_held(str(self.work)), "held", "a descriptor it inherited keeps the root held")
         finally:
             os.kill(sleeper, signal.SIGKILL)
             wait_gone(sleeper)
             launcher.stdout.close()
             launcher.stderr.close()
+        self.assertEqual(task_io.lock_held(str(self.work)), "free", "and free once the last holder is gone")
         owner = task_io.acquire_lock(str(self.work), "cleanup")
         task_io.release_lock(owner)
 
@@ -1707,7 +1711,7 @@ class ConnectLauncherProcess(ConnectBase):
                 self.wait_gone(child)
             _, err = launcher.communicate(timeout=30)
             self.assertEqual(err.count("kill called"), 1, err)
-            self.assertIn("not confirmed reaped; exiting without releasing", err)
+            self.assertIn("was not confirmed gone; exiting without releasing", err)
             (self.home / "claude-session.json").unlink()
             owner = task_io.acquire_lock(str(self.work), "cleanup")
             task_io.release_lock(owner)
@@ -1757,6 +1761,29 @@ class ConnectLauncherProcess(ConnectBase):
                 os.kill(child, signal.SIGKILL)
         _, err = launcher.communicate(timeout=30)
         self.assertIn("child exited -9", err)
+
+    def test_a_session_outliving_its_trampoline_keeps_the_root_held_and_the_launcher_does_not_release(self):
+        """The launcher unlocks only once the trampoline's whole group is gone: with the sweep disabled, a
+        session that survives its trampoline is left fenced and the launcher exits without releasing."""
+        from ag2_sparrow import task_io
+        driver = ("import ag2_sparrow.connect_common as cm; cm._sweep = lambda child: None; cm.REAP_BOUND_S = 0.5\n"
+                  "sys.exit(cli.main(['run']))")
+        self.configure()
+        launcher, child = self.launcher(driver=driver)
+        trampoline = self.session()["ppid"]
+        os.kill(trampoline, signal.SIGKILL)
+        launcher.wait(timeout=30)
+        try:
+            self.assertTrue(self.alive(child), "the session outlived its trampoline")
+            self.assertEqual(task_io.lock_held(str(self.work)), "held", "and the launcher did not unlock over it")
+            self.assertEqual(self.main("run")[0], 75, "a second launcher is refused meanwhile")
+        finally:
+            os.kill(child, signal.SIGKILL)
+            self.wait_gone(child)
+        _, err = launcher.communicate(timeout=30)
+        self.assertIn("was not confirmed gone; exiting without releasing", err)
+        owner = task_io.acquire_lock(str(self.work), "cleanup")
+        task_io.release_lock(owner)
 
 
 class ConnectEnvAndPaths(ConnectBase):

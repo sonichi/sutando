@@ -45,14 +45,14 @@ OP_WAIT_S = 30.0
 ACQUIRE_RETRY_S = 1.0
 REAP_BOUND_S = 10.0
 POLL_S = 0.2
-# The small parent between the launcher and the session: it keeps the lease fd for itself (never
-# inherited further), runs the session with cwd = the held tasks inode, and reaps it on any signal.
+# The small parent between the launcher and the session: it runs the session with cwd = the held
+# tasks inode and the lease fd shared (the root stays held while either of them lives), reaps it on any signal.
 TRAMPOLINE = """
 import os, signal, subprocess, sys
 lease, tasks = int(sys.argv[1]), int(sys.argv[2])
-os.fchdir(tasks); os.close(tasks); os.set_inheritable(lease, False)
+os.fchdir(tasks); os.close(tasks)
 env = dict(os.environ, AG2_INBOX_DIR=".", AG2_RESULTS_DIR=os.path.join("..", "results"))
-child = subprocess.Popen(sys.argv[3:], env=env, close_fds=True)
+child = subprocess.Popen(sys.argv[3:], env=env, close_fds=True, pass_fds=(lease,))
 for sig in (signal.SIGTERM, signal.SIGINT):
     signal.signal(sig, lambda signum, frame: child.send_signal(signum))
 while True:
@@ -682,6 +682,22 @@ def _sweep(child) -> None:
         pass
 
 
+def _group_gone(child) -> bool:
+    """True once no process of the trampoline's group is left within the bound: the session shares the
+    lease, so the launcher may unlock only when it is gone too."""
+    deadline = time.monotonic() + REAP_BOUND_S
+    while True:
+        try:
+            os.killpg(child.pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:       # a member mid-teardown reads EPERM for a moment: still there
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(POLL_S)
+
+
 def supervise(shape: Shape, argv: list, env: dict, popen=subprocess.Popen, pass_fds=(), map_exit=None) -> int:
     """Run the child until it ends; every launcher exit path reaps it first: SIGTERM -> 143, SIGINT ->
     130, a post-spawn exception re-raised after the reap. `map_exit` renames a child's exit codes, and a
@@ -771,9 +787,10 @@ def serve(shape: Shape, root: str, argv: list, env: dict, popen=subprocess.Popen
     finally:
         os.close(inbox_fd)
         child = supervise.child
-        if not (child is not None and child.poll() is not None and release_after_reap(owner, child.pid)):
-            print(f"{shape.name}: the child was not confirmed reaped; exiting without releasing {root}, so a "
-                  "surviving child keeps it fenced", file=sys.stderr)
+        if not (child is not None and child.poll() is not None and _group_gone(child)
+                and release_after_reap(owner, child.pid)):
+            print(f"{shape.name}: the child or its session was not confirmed gone; exiting without releasing "
+                  f"{root}, so a survivor keeps it fenced", file=sys.stderr)
     return rc
 
 

@@ -185,26 +185,31 @@ adapters use, so a symlinked `tasks` still contends with its siblings; a
 `verify` or install probe's momentary flock never forges a 75), publishes its
 record before the child exists, leases the lock descriptor to exactly one
 child (`holder_lock.child_lease`, design §1.9; terminal, never a second), and
-starts the session through a small trampoline **parent**: it keeps the lease
-for itself (not inheritable), `fchdir`s into `tasks` under the **held root
-inode**, sets `AG2_INBOX_DIR=.` and `AG2_RESULTS_DIR=../results`, runs
-`claude` with `close_fds`, forwards `SIGTERM`/`SIGINT` to it and reaps it
-before exiting with its code. The trampoline leads its own process group and
-the session runs in it: the launcher's kill after the grace is a group kill,
-and once the trampoline is reaped for any reason the launcher sweeps the group
-before it releases, so no session outlives the lease it was fenced under. So
-the session's task I/O is bound to the inherited inode (a path replaced after
-the lock check is a different root it never lists), and no grandchild can keep
-the flock. The flock therefore stays
-held until both the launcher and the trampoline are gone; a second launcher
-exits 75, which the systemd unit does not relaunch (a session's own exit 75
-is reported as 1). Every launcher exit reaps the child first: `SIGTERM`
-(`systemctl stop`, `bootout`) and `SIGINT` terminate it, wait up to 15 s,
-kill, wait up to 10 s more, then release (143 / 130); a post-spawn exception
-reaps, then re-raises; a reap not confirmed within that bound exits
-**without** releasing, so the surviving child keeps the root fenced and
-`verify` reads "held, launcher gone (child alive)"; `SIGKILL` of the launcher
-leaves the same state. The env allowlist below does not isolate files: a
+starts the session through a small trampoline **parent**: it `fchdir`s into
+`tasks` under the **held root inode**, sets `AG2_INBOX_DIR=.` and
+`AG2_RESULTS_DIR=../results`, runs `claude` with `close_fds` and the lease as
+its one extra descriptor, forwards `SIGTERM`/`SIGINT` to it and reaps it
+before exiting with its code. So the session's task I/O is bound to the
+inherited inode (a path replaced after the lock check is a different root it
+never lists), and the flock is held by the launcher, the trampoline and the
+session alike: the root stays held while any of them lives, so a dead
+trampoline never leaves a live session on a free root (fail closed). The
+trampoline leads its own process group and the session runs in it: the
+launcher's kill after the grace is a group kill, once the trampoline is
+reaped for any reason the launcher sweeps the group, and it releases only
+once the group is empty, so no session outlives the lease it was fenced
+under and nothing unlocks over a live one. A second launcher exits 75, which
+the systemd unit does not relaunch (a session's own exit 75 is reported as
+1). Every launcher exit reaps the child first: `SIGTERM` (`systemctl stop`,
+`bootout`) and `SIGINT` terminate it, wait up to 15 s, kill, wait up to 10 s
+more, then release (143 / 130); a post-spawn exception reaps, then re-raises;
+a reap, or a group, not confirmed gone within that bound exits **without**
+releasing, so the survivor keeps the root fenced and `verify` reads "held,
+launcher gone (child alive)"; `SIGKILL` of the launcher leaves the same state.
+A child the session starts in its own process group that inherited the
+descriptor (a Rust `Command` passes every one) escapes the sweep and keeps the
+root held after a SIGKILLed launcher until it exits; the same reading names
+it, and stopping it frees the root. The env allowlist below does not isolate files: a
 `bypassPermissions` session can still read `relay.env` or anything else on
 disk if a non-owner task steers it; that is the owner's decision when
 choosing the mode. `run` starts
