@@ -305,7 +305,7 @@ from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir a
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
-from . import gateway_instance, local_task_protocol
+from . import gateway_instance, local_task_protocol, routing_migrations
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
@@ -1781,7 +1781,7 @@ PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
-                  "held_logged": 0.0}
+                  "migrated": False, "held_logged": 0.0}
 ROUTING_REFRESH_S = 300.0
 ROUTING_RETRY_S = 30.0
 OWNER_PRIVATE = "owner_private"
@@ -1804,58 +1804,20 @@ def _routing_record(identity: str, gateway_url: str, owner_dm: str) -> "dict | N
             "owner_dm": owner_dm}
 
 
-def _migrate_routing(d: dict) -> dict:
-    """A record from before the binding field holds the full URL: rewrite it once, atomically,
-    as the bound form. The record is returned as it now stands on disk."""
-    gateway = d.get("gateway")
-    if d.get("binding") or not isinstance(gateway, str) or not gateway:
-        return d
-    record = _routing_record(str(d.get("identity") or ""), gateway, str(d.get("owner_dm") or ""))
-    if record is None or not _durable_write(_routing_file(), json.dumps(record)):
-        _log("owner-routing: legacy record not migrated yet — retried at the next load")
-        return d
-    return record
-
-
-ROUTING_TEMP_GRACE_S = 5.0
-
-
-def _sweep_routing_temps() -> int:
-    """Unlink the pre-binding writer's crash leftovers (`.owner-routing<sfx>.json.<pid>.tmp`, which
-    may hold the full URL): only regular files in the state dir, this uid's, past the grace, whose pid is dead."""
-    pattern = re.compile(re.escape(f".{_routing_file().name}.") + r"([0-9]{1,10})\.tmp")
-    removed = 0
-    try:
-        dfd = os.open(_STATE, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except OSError:
-        return 0
-    try:
-        for name in os.listdir(dfd):
-            m = pattern.fullmatch(name)
-            if not m or int(m.group(1)) == os.getpid():
-                continue
-            try:
-                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
-                if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()
-                        or time.time() - st.st_mtime < ROUTING_TEMP_GRACE_S
-                        or _pid_alive(int(m.group(1)))):
-                    continue
-                os.unlink(name, dir_fd=dfd)
-                removed += 1
-            except OSError:
-                continue
-    finally:
-        os.close(dfd)
-    if removed:
-        _log(f"owner-routing: removed {removed} stale temp file(s)")
-    return removed
+def _migrate_routing() -> bool:
+    """Run the routing state's one-time migrations until one finishes; retried at each load."""
+    if not _ROUTING["migrated"]:
+        _ROUTING["migrated"] = routing_migrations.migrate_owner_routing(
+            _routing_file(), record_for=_routing_record, write=_durable_write,
+            pid_alive=_pid_alive, log=_log).done
+    return _ROUTING["migrated"]
 
 
 def _load_routing() -> None:
+    _migrate_routing()  # before the reading is prepared
     if _ROUTING["loaded"]:
         return
     _ROUTING["loaded"] = True
-    _sweep_routing_temps()
     _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # what the in-memory reading is bound to
     try:
         d = json.loads(_routing_file().read_text(encoding="utf-8"))
@@ -1863,13 +1825,11 @@ def _load_routing() -> None:
         return
     if not isinstance(d, dict):
         return
-    d = _migrate_routing(d)
     # another agent's reading, or this agent's reading from another gateway, authorizes nothing
     if d.get("identity") == _reenroll_identity() and d.get("binding") and hmac.compare_digest(
-            str(d["binding"]), gateway_instance.binding_digest(_reenroll_identity(), URL)):
+            str(d["binding"]).encode("utf-8"),
+            gateway_instance.binding_digest(_reenroll_identity(), URL).encode("utf-8")):
         _ROUTING["owner_dm"] = _ROUTING["persisted"] = str(d.get("owner_dm") or "")
-    elif d.get("identity") == _reenroll_identity() and not d.get("binding") and d.get("gateway") == URL:
-        _ROUTING["owner_dm"] = str(d.get("owner_dm") or "")  # unmigrated: the writer rewrites it
 
 
 def refresh_routing(force: bool = False) -> None:

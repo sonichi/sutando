@@ -69,24 +69,65 @@ def redact_url(value: str) -> str:
 REDACTED_TEXT = "<text withheld: it may contain the gateway URL>"
 
 
+def _forms(secret: str) -> "set[str]":
+    """The ways a URL part can be rendered in diagnostic text: raw, escaped as repr and
+    unicode_escape render it, and percent-encoded or -decoded."""
+    out = set()
+    for s in {secret, urllib.parse.unquote(secret), urllib.parse.unquote_plus(secret)}:
+        out |= {s, repr(s)[1:-1], s.encode("unicode_escape").decode("ascii"),
+                ascii(s)[1:-1], s.encode("ascii", "backslashreplace").decode("ascii"),
+                urllib.parse.quote(s, safe=""), urllib.parse.quote(s, safe="/=&?#:@"),
+                urllib.parse.quote_plus(s, safe=""), urllib.parse.quote_plus(s, safe="/=&?#:@")}
+    return {f for f in out if f}
+
+
+def _split_by_hand(url: str) -> "tuple[str, str, str]":
+    before, _, fragment = url.partition("#")
+    _, _, query = before.partition("?")
+    userinfo = before.partition("://")[2].partition("/")[0].rpartition("@")[0]
+    return userinfo, query, fragment
+
+
+def _secret_parts(url: str) -> "list[str]":
+    """Each part of the URL that may carry a credential, with the delimiter the URL itself puts
+    before it, so a part of any length is matched where URL text renders it. Split by hand as
+    well as by urlsplit, which drops tab, CR and LF from the parts it returns."""
+    splits = [_split_by_hand(url)]
+    try:
+        p = urllib.parse.urlsplit(url)
+        splits.append((p.netloc.rpartition("@")[0], p.query, p.fragment))
+    except Exception:  # noqa: BLE001 - the hand split stands alone
+        pass
+    parts = []
+    for userinfo, query, fragment in splits:
+        if userinfo:
+            parts.append(userinfo + "@")
+            if ":" in userinfo:
+                parts.append(":" + userinfo.partition(":")[2] + "@")
+        if query:
+            parts.append("?" + query)
+            for pair in re.split(r"[&;]", query):
+                key, eq, value = pair.partition("=")
+                parts += [pair, "=" + value] if eq else ["?" + pair, "&" + pair, ";" + pair]
+        if fragment:
+            parts.append("#" + fragment)
+    return [p for p in dict.fromkeys(parts) if p not in ("=", "?", "&", ";", "#", "@", ":@")]
+
+
 def redact_text(text: str, gateway_url: str) -> str:
     """Diagnostic text safe to log or persist: the full gateway URL replaced by its redacted
-    form. Fails closed: REDACTED_TEXT when any secret part of the URL (userinfo, query,
-    fragment, or a query value or a word of one) still appears, or the URL does not parse."""
+    form. Fails closed: REDACTED_TEXT when any credential-bearing part of the URL (userinfo,
+    query or one of its pairs or values, fragment) survives in any rendering of it."""
     text, url = str(text), str(gateway_url or "")
     if not url:
         return text
-    try:
-        p = urllib.parse.urlsplit(url)
-        userinfo = p.netloc.rpartition("@")[0]
-    except Exception:  # noqa: BLE001 - an unparseable URL may sit in the text in any form
-        return REDACTED_TEXT if url in text else text
-    text = text.replace(url, redact_url(url))
-    values = [part.partition("=")[2] for part in re.split(r"[&;]", p.query)]
-    values += [userinfo, *userinfo.split(":"), p.query, p.fragment]
-    values += [urllib.parse.unquote_plus(v) for v in values]
-    pieces = {piece for v in values for piece in (v, *v.split())}
-    return REDACTED_TEXT if any(len(x) >= 4 and x in text for x in pieces) else text
+    for form in sorted(_forms(url), key=len, reverse=True):
+        text = text.replace(form, redact_url(url))
+    views = {text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text)}
+    for part in _secret_parts(url):
+        if any(form in view for form in _forms(part) for view in views):
+            return REDACTED_TEXT
+    return text
 
 
 KEY_GRACE_S = 5.0
@@ -103,7 +144,8 @@ def binding_key_path() -> Path:
 
 
 def _read_key(path: Path) -> "bytes | None":
-    """The key, only from a regular file this uid owns with mode 0600 and 64 hex digits."""
+    """The key, only from a regular file this uid owns with mode 0600 holding exactly 64 hex
+    digits (no newline)."""
     try:
         fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         with os.fdopen(fd, "r", encoding="ascii") as fh:
@@ -111,7 +153,7 @@ def _read_key(path: Path) -> "bytes | None":
             if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()
                     or stat.S_IMODE(st.st_mode) != 0o600):
                 return None
-            key = fh.read(256).strip()
+            key = fh.read(65)
     except (OSError, UnicodeDecodeError):
         return None
     return key.encode("ascii") if re.fullmatch(r"[0-9a-f]{64}", key) else None

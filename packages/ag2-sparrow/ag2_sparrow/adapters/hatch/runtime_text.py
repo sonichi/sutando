@@ -66,7 +66,8 @@ def owner_dm_room(state_dir: Path, instance: str = "", agent_mxid: str = "") -> 
         identity, str(routing.get("gateway") or ""))
     bound = (identity and identity == status.get("agent_id")
              and (not agent_mxid or identity == agent_mxid) and isinstance(binding, str)
-             and binding and isinstance(saved, str) and hmac.compare_digest(saved, binding))
+             and binding and isinstance(saved, str)
+             and hmac.compare_digest(saved.encode("utf-8"), binding.encode("utf-8")))
     room = str(routing.get("owner_dm") or "")
     return room if bound and ROOM_ID_RE.fullmatch(room) else ""
 

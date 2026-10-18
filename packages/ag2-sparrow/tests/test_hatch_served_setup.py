@@ -102,7 +102,7 @@ record = json.loads(routing)
 for legacy in ({"identity": record["identity"], "gateway": m.URL, "owner_dm": "!old:x"},
                dict(record, binding="0" * 64, owner_dm="!forged:x")):
     m._routing_file().write_text(json.dumps(legacy))
-    m._ROUTING.update(owner_dm="", persisted="", loaded=False)
+    m._ROUTING.update(owner_dm="", persisted="", loaded=False, migrated=False)  # a restart
     m._load_routing()
     reloaded += " " + (m._ROUTING["owner_dm"] or "-")
 m._routing_file().write_text(routing)
@@ -222,7 +222,9 @@ print(json.dumps({"key_before": key_before, "url": m.URL,
             return path
 
         stale = temp(f".owner-routing.json.{dead}.tmp")
-        kept = [temp(f".owner-routing.json.{live}.tmp"),
+        abandoned = temp(f".owner-routing.json.{live}.tmp")
+        os.utime(abandoned, (time.time() - 2 * 3600,) * 2)
+        kept = [temp(f".owner-routing.json.{live + 1 if live + 1 != dead else live + 2}.tmp", age=False),
                 temp(f".owner-routing.json.{dead + 1}.tmp", age=False),
                 temp(f".owner-routing.json.{dead}.tmp.bak"),
                 temp(f".owner-routing.blue.json.{dead}.tmp")]
@@ -235,53 +237,115 @@ print(json.dumps({"key_before": key_before, "url": m.URL,
         self.bridge("from ag2_sparrow import remote_gateway_bridge as m\n"
                     "m._load_routing()\nprint('{}')\n")
         self.assertFalse(stale.exists(), "a dead writer's old temp is removed")
+        self.assertFalse(abandoned.exists(), "past the bound a temp is stale whatever its pid says")
         for path in kept:
             self.assertTrue(path.exists(), path.name)
         self.assertTrue(link.is_symlink() and outside.read_text() == "keep", "a symlink is never followed")
         self.assertTrue(folder.is_dir())
 
     LEAK = """
-import glob, json, os
+import glob, json, os, socket
 from ag2_sparrow import remote_gateway_bridge as m
+def offline(*a, **k):
+    raise OSError("no network in this test")
+socket.create_connection = offline
+socket.socket.connect = offline
+raw = ""
 try:
     m._req("GET", "/v1/tasks?wait=0")
-    raw = ""
 except Exception as e:  # what the poll loop's last catch receives
     raw = f"{type(e).__name__}: {e}"
     m._log(f"unexpected: {e} — backing off 1s")
     m._emit_gateway_status(False, error=f"unexpected: {e}", backoff_s=1)
+for text in json.loads(os.environ["LEAK_FORMS"]):
+    m._log(f"diagnostic: {text}")
+    m._emit_gateway_status(False, error=f"diagnostic: {text}", backoff_s=1)
+    status = json.loads(m.GATEWAY_STATUS_FILE.read_text())["error"]
+    print("STATUS " + json.dumps(status))
 files = {p: open(p, errors="replace").read() for p in glob.glob(os.environ["HOME"] + "/**", recursive=True)
          if os.path.isfile(p)}
 print(json.dumps({"raw": raw, "url": m.URL, "files": files}))
 """
 
-    def test_an_error_carrying_the_gateway_url_is_redacted_before_it_is_logged_or_persisted(self):
-        url = "https://gw.example/relay?enrollment=SECRET BAD"
+    def leak(self, url, forms=(), secrets=()):
+        """Run the real _req and the two sinks (the log line, the status error) for `url`;
+        assert no secret survives in stdout, stderr or any file under the test home."""
         r = subprocess.run([sys.executable, "-c", PRELUDE + self.LEAK], capture_output=True, text=True,
-                           cwd=str(self.home), timeout=60, env=self.bridge_env(REMOTE_TASK_URL=url))
+                           cwd=str(self.home), timeout=60,
+                           env=self.bridge_env(REMOTE_TASK_URL=url, LEAK_FORMS=json.dumps(list(forms))))
         self.assertEqual(r.returncode, 0, r.stderr)
         out = json.loads(r.stdout.strip().splitlines()[-1])
-        self.assertEqual(out["url"], url)
-        self.assertIn("InvalidURL", out["raw"])
-        self.assertIn("SECRET", out["raw"], "the exception itself carries the query")
-        printed = r.stdout.strip().splitlines()[:-1]
-        self.assertTrue(any(gateway_instance.REDACTED_TEXT in ln for ln in printed), printed)
-        self.assertNotIn("SECRET", "\n".join(printed) + r.stderr)
-        status = json.loads((self.state / "gateway-status.json").read_text())
-        self.assertIn(gateway_instance.REDACTED_TEXT, status["error"])
-        for path, text in out["files"].items():
-            self.assertNotIn("SECRET", text, path)
+        printed = "\n".join(r.stdout.strip().splitlines()[:-1]) + r.stderr
+        for secret in secrets:
+            self.assertNotIn(secret, printed, (url, secret))
+            for path, text in out["files"].items():
+                self.assertNotIn(secret, text, (url, secret, path))
+        return out, printed
+
+    def test_an_invalid_url_error_never_reaches_the_log_or_the_status_file(self):
+        for ch in ("\n", "\t", "\x7f", " "):
+            with self.subTest(ch=repr(ch)):
+                url = f"https://gw.example/relay?enrollment=SECRET{ch}BAD"
+                out, printed = self.leak(url, secrets=("SECRET", repr(ch)[1:-1] + "BAD"))
+                self.assertEqual(out["url"], url)
+                self.assertIn("InvalidURL", out["raw"])
+                self.assertIn("SECRET", out["raw"], "the exception itself carries the query")
+                self.assertIn(gateway_instance.REDACTED_TEXT, printed)
+                status = json.loads((self.state / "gateway-status.json").read_text())
+                self.assertIn(gateway_instance.REDACTED_TEXT, status["error"])
+
+    def test_short_percent_encoded_and_escaped_query_text_never_reaches_a_sink(self):
+        url = "https://gw.example/relay?token=zq9&id=a%2Fb"
+        forms = ("GET /relay?token=zq9&id=a%2Fb", "token=zq9", "'token=zq9'", "token%3Dzq9",
+                 "id=a/b", "id%3Da%252Fb", "=zq9 rejected", "token%3dzq%39")
+        out, printed = self.leak(url, forms, secrets=("zq9", "a/b", "a%2Fb", "a%252Fb"))
+        self.assertEqual(printed.count(gateway_instance.REDACTED_TEXT), 2 * len(forms), printed)
+
+    def test_an_unparseable_gateway_url_fails_closed_in_both_sinks(self):
+        url = "http://[::1?token=zq9"
+        forms = (f"bad url {url}", "'/?token=zq9'", "token=zq9", "token%3Dzq9")
+        self.leak(url, forms, secrets=("zq9",))
 
     def test_redacted_text_keeps_diagnostics_and_fails_closed_on_any_secret_piece(self):
-        url = "https://u:pw-1234@gw.example/relay?enrollment=SECRET%20BAD&tenant=acme#frag-xyz"
+        url = "https://u:pw-1234@gw.example/relay?enrollment=SECRET%20BAD&tenant=a#frag-xyz"
         closed = gateway_instance.REDACTED_TEXT
         for text, want in ((f"poll failed for {url}", "poll failed for https://gw.example/relay"),
                            ("poll HTTP 500 — enrollment file", "poll HTTP 500 — enrollment file"),
-                           ("'/relay?enrollment=SECRET%20BAD&tenant=acme'", closed),
-                           ("found SECRET BAD in path", closed), ("acme", closed),
-                           ("pw-1234", closed), ("frag-xyz", closed)):
+                           ("a tenant field, a word", "a tenant field, a word"),
+                           ("'/relay?enrollment=SECRET%20BAD&tenant=a'", closed),
+                           ("enrollment=SECRET BAD", closed), ("tenant=a", closed), ("x=a", closed),
+                           ("'tenant%3Da'", closed), ("u:pw-1234@host", closed), (":pw-1234@", closed),
+                           ("#frag-xyz", closed)):
             self.assertEqual(gateway_instance.redact_text(text, url), want, text)
+        ctl = "https://gw.example/relay?k=v\x01w"
+        self.assertEqual(gateway_instance.redact_text(repr("/relay?k=v\x01w"), ctl), closed)
         self.assertEqual(gateway_instance.redact_text("x", ""), "x")
+
+    def test_the_bridge_delegates_routing_migration_and_retries_it(self):
+        import ast
+        src = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
+        tree = ast.parse(src)
+        fns = {f.name: f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)}
+        first = fns["_load_routing"].body[0]
+        self.assertEqual(ast.unparse(first).split("#")[0].strip(), "_migrate_routing()",
+                         "migration runs before the reading is prepared")
+        self.assertIn("routing_migrations.migrate_owner_routing", ast.unparse(fns["_migrate_routing"]))
+        for legacy in ("sweep_legacy_temps", "TEMP_GRACE", "TEMP_MAX_AGE", r"\.tmp"):
+            self.assertNotIn(legacy, src, "the live writer's module owns no legacy migration")
+        out = self.bridge("""
+import json
+from ag2_sparrow import remote_gateway_bridge as m, routing_migrations as rm
+calls = []
+def migrate(path, **kw):
+    calls.append(sorted(kw))
+    return rm.Result(done=len(calls) > 1)
+rm.migrate_owner_routing = migrate
+m._load_routing(); m._load_routing(); m._load_routing()
+print(json.dumps({"calls": calls, "loaded": m._ROUTING["loaded"]}))
+""")
+        self.assertEqual(out["calls"], [["log", "pid_alive", "record_for", "write"]] * 2,
+                         "an unfinished migration is retried at the next load, then not again")
+        self.assertTrue(out["loaded"])
 
     STARTUP = """
 import json
@@ -496,7 +560,7 @@ class WakeContext(Base):
 
     def test_an_empty_short_or_loose_key_is_corrupt_and_replaced_only_once_stale(self):
         for text, mode in (("", 0o600), ("abc", 0o600), ("not a key" * 8, 0o600),
-                           ("3" * 64, 0o644), ("3" * 64, 0o640)):
+                           ("3" * 64, 0o644), ("3" * 64, 0o640), ("3" * 64 + "\n", 0o600)):
             with self.subTest(text=text[:8], mode=oct(mode)):
                 path = self.key(text, mode)
                 self.assertEqual(gateway_instance.binding_digest(AGENT, GW), "", "a reader refuses it")
@@ -597,6 +661,78 @@ class WakeContext(Base):
             self.assertEqual(hatch_cli.main(["wake-context"]), 0)
         self.assertNotIn("Served prompt", out.getvalue())
         self.assertIn("built-in (no setup cache)", err.getvalue())
+
+
+class RoutingMigration(unittest.TestCase):
+    """routing_migrations in-process: idempotent, never raises, and unfinished until it commits."""
+
+    def setUp(self):
+        from ag2_sparrow import routing_migrations
+        self.rm = routing_migrations
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.path = self.dir / "owner-routing.json"
+        self.writes, self.logs = [], []
+
+    def run_migration(self, record_for=None, write=None, alive=lambda pid: False):
+        def default_write(path, text):
+            self.writes.append(text)
+            path.write_text(text)
+            return True
+        return self.rm.migrate_owner_routing(
+            self.path, record_for=record_for or (lambda i, u, d: {"identity": i, "binding": "b" * 64,
+                                                                    "gateway": "redacted", "owner_dm": d}),
+            write=write or default_write, pid_alive=alive, log=self.logs.append)
+
+    def legacy(self):
+        self.path.write_text(json.dumps({"identity": AGENT, "gateway": GW + "?tenant=a",
+                                         "owner_dm": "!dm:ag2.space"}))
+
+    def test_a_legacy_record_is_rewritten_once(self):
+        self.legacy()
+        seen = []
+        result = self.run_migration(record_for=lambda i, u, d: seen.append(u) or {
+            "identity": i, "binding": "b" * 64, "gateway": "redacted", "owner_dm": d})
+        self.assertEqual((result.done, result.rewritten), (True, True))
+        self.assertEqual(seen, [GW + "?tenant=a"], "bound from the full URL it held")
+        self.assertNotIn("tenant", self.path.read_text())
+        again = self.run_migration()
+        self.assertEqual((again.done, again.rewritten, len(self.writes)), (True, False, 1))
+
+    def test_no_record_or_a_current_one_is_done_with_nothing_written(self):
+        self.assertTrue(self.run_migration().done)
+        self.path.write_text(json.dumps({"identity": AGENT, "gateway": GW, "binding": "c" * 64}))
+        self.assertTrue(self.run_migration().done)
+        self.assertEqual(self.writes, [])
+
+    def test_an_unbindable_or_unwritten_record_is_left_and_not_done(self):
+        for record_for, write in ((lambda i, u, d: None, None), (None, lambda p, t: False)):
+            self.legacy()
+            before = self.path.read_text()
+            result = self.run_migration(record_for=record_for, write=write)
+            self.assertFalse(result.done)
+            self.assertEqual(self.path.read_text(), before)
+        self.assertIn("not migrated yet", self.logs[-1])
+
+    def test_a_failing_migration_never_raises(self):
+        self.legacy()
+
+        def boom(path, text):
+            raise RuntimeError("disk")
+        self.assertFalse(self.run_migration(write=boom).done)
+        self.assertIn("RuntimeError", self.logs[-1])
+        with mock.patch.object(self.rm.os, "listdir", side_effect=PermissionError("no")):
+            self.assertFalse(self.run_migration().done)
+
+    def test_the_sweep_bounds_pid_reuse_and_respects_the_grace(self):
+        now = time.time()
+        young, live_old, live_recent = (self.dir / f".owner-routing.json.{n}.tmp" for n in (11, 12, 13))
+        for path, age in ((young, 1), (live_old, 2 * 3600), (live_recent, 600)):
+            path.write_text("x")
+            os.utime(path, (now - age,) * 2)
+        result = self.run_migration(alive=lambda pid: True)
+        self.assertEqual(result.removed, 1)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), [young.name, live_recent.name])
 
 
 class RedactUrl(unittest.TestCase):
