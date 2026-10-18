@@ -40,7 +40,9 @@ owner path is unchanged.
 This is enforcement by thread isolation and sandbox, not by the prompt alone: a non-owner turn
 cannot see another room's or the owner's thread, cannot write, and cannot be queued into the
 owner's TUI. What it can still do is *read* within Codex's `read-only` sandbox and answer in its
-own room; how far that sandbox lets reads reach outside `cwd` is not measured here. Sparrow
+own room; how far that sandbox lets reads reach outside `cwd` is not measured here, and parity of that
+reach with the Claude adapters' isolated turn (`--safe-mode --restricted`, read tools only, empty cwd)
+is a follow-up, not a claim made here. Sparrow
 never stamps envelopes, so there is no signature to check: an `invalid`/`unsigned` task is
 submitted like any other, and the attested tier is the only gate — hence the refusal by default and the
 hard isolation above for whoever is admitted.

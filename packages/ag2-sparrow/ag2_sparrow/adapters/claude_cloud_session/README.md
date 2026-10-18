@@ -127,7 +127,8 @@ an isolated local turn; without it, it gets the same refusal line. `--allow-non-
 --no-session-persistence --tools Read,Grep,Glob --output-format json` with the routine adapter's payload on
 stdin (one lead line naming the situation, then the note, `collaborator=true`; not this session's reminder,
 no `channel_kind`, no `owner_dm`), in a fresh empty temp directory removed afterwards, with the same
-five-variable environment as above and this adapter's `--timeout`. What it can reach: the CLI's login and
+five-variable environment as above, bounded by `--collaborator-timeout` (default 60 s; `--timeout` is the
+`--cloud` call's alone). What it can reach: the CLI's login and
 the three read tools over an empty directory. What it cannot: this session (no `--cloud`, no session id, no
 `--resume`, and the turn itself is never saved, so nothing can resume it), its history and connector, Bash
 or code-running tools, the web, MCP servers, CLAUDE.md, hooks, skills, settings, or the work dir. The JSON
@@ -137,11 +138,17 @@ knows (`[no-send]`, `[REPLIED]`, `[deduped:]`, `[channel:]`, `[thread:]`, `[thre
 publication and checked by the parser again, so the gateway executes nothing from it and posts it once in
 the originating room. Any failure (non-zero exit, no `result`, timeout, no temp dir, missing CLI) gets "This
 message could not be sent to the cloud agent right now." — one try, no retry. The turn runs inside the same
-claim/journal/ledger lifecycle as a queued turn, recorded as a `final` outcome, so it is never charged to
-`--max-per-hour` or `--min-gap-seconds`; its own cap is `--max-collaborator-per-hour` (1 or more, default
-10, `state/collaborator-turns.json`, part of this adapter's state contract), and its own gate: a
-collaborator waits only on that cap, never on the session's cap, hold or gap, and an owner task never waits
-on the collaborator cap. The adapter log shows `collaborator turn ->` instead of `queue ->`.
+claim/journal/ledger lifecycle as a queued turn, recorded as a `final` outcome, so it is never counted
+against the owner provider's limiter or `--min-gap-seconds`; the turn still costs the owner's Claude plan.
+One exception, which fails safe: a crash mid-turn leaves a `CALLING` claim, and the restart records it as
+`unknown` in the journal like any interrupted call, so that one attempt does count toward the owner lane's
+cap and gap, and its staged `NON_OWNER_FAILED` body is published without a second turn. Its own cap is
+`--max-collaborator-per-hour` (1 or more, default 10, `state/collaborator-turns.json`, part of this
+adapter's state contract), and its own gate: a collaborator waits only on that cap, never on the session's
+cap, hold or gap, and an owner task never waits on the collaborator cap. A task that has waited longer than
+`--collaborator-max-age` (default 1800 s, measured from when this adapter first saw it) gets the generic
+line instead of a turn, so a burst is not answered hours late. The adapter log shows `collaborator turn ->`
+instead of `queue ->`.
 
 ## Results
 

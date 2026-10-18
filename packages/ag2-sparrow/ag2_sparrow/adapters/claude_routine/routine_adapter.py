@@ -143,9 +143,12 @@ class Adapter(RelayLoop):
         """An isolated local turn, never the routine: its reply is the result, else the plain failure line.
         Its cap is next_ready's gate, so a turn that reaches here only has to be counted."""
         task_id = name[:-4]
+        if self.too_old(name):
+            log("collaborator task waited too long ->", task_id)
+            return self.finish(name, NON_OWNER_FAILED, seen)
         self.collab_limiter.record()
         log("collaborator turn ->", task_id)
-        turn = run_collaborator_turn(self.args.claude, text, self.env, self.args.timeout, run=self.run)
+        turn = run_collaborator_turn(self.args.claude, text, self.env, self.args.collaborator_timeout, run=self.run)
         log("result <-", task_id, turn.kind, turn.detail)
         return self.finish(name, turn.text if turn.kind == "ok" else NON_OWNER_FAILED, seen)
 
@@ -182,7 +185,11 @@ def build_parser():
     ap.add_argument("--max-rate-limited", type=int, default=5, help="429s per task before it gets a failure result")
     ap.add_argument("--backoff", type=float, default=2.0, help="first retry delay, doubled per retry")
     ap.add_argument("--backoff-max", type=float, default=60.0)
-    ap.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout per fire, and seconds per collaborator turn")
+    ap.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout per fire")
+    ap.add_argument("--collaborator-timeout", type=float, default=120.0, help="seconds per collaborator turn")
+    ap.add_argument("--collaborator-max-age", type=float, default=1800.0,
+                    help="a collaborator task that waited longer than this (seconds, since the adapter first saw "
+                         "it) gets the plain failure line instead of a turn")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=1.0)

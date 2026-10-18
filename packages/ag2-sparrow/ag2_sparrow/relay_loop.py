@@ -188,7 +188,7 @@ class RelayLoop:
                                           args.max_collaborator_per_hour, clock)
         self.done_path = os.path.join(args.state, "done")
         self.attempts, self.limited, self.not_before = {}, {}, {}   # task id -> pre-send failures, 429s, earliest retry
-        self.lanes = {}                                            # task name -> which gates apply
+        self.lanes, self.seen_at = {}, {}                         # task name -> which gates apply, first seen
         self.blocked_until = 0.0
 
     def pending(self, seen):
@@ -226,6 +226,7 @@ class RelayLoop:
         self.limited.pop(name[:-4], None)
         self.not_before.pop(name[:-4], None)
         self.lanes.pop(name, None)
+        self.seen_at.pop(name, None)
 
     def read_task(self, name, seen):
         """(headers, message, operator_lines), or None when the file is gone (marked seen)."""
@@ -284,7 +285,12 @@ class RelayLoop:
             kind = self.classify(headers)
             self.lanes[name] = ("refuse" if kind.startswith("refused") else
                                 "collaborator" if kind == "collaborator" else "provider")
+            self.seen_at[name] = self.clock()
         return self.lanes[name]
+
+    def too_old(self, name):
+        """True once a task has waited past --collaborator-max-age since this loop first classified it."""
+        return self.clock() - self.seen_at.get(name, self.clock()) > self.args.collaborator_max_age
 
     def lane_wait(self, lane):
         if lane == "refuse":

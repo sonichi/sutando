@@ -42,7 +42,8 @@ class Loop(rl.RelayLoop):
                                      max_retries=1, backoff=2.0, backoff_max=60.0, once=0, idle_exit=0, poll=0.01,
                                      allow_non_owner=kw.get("allow_non_owner", False),
                                      allow_collaborator=kw.get("allow_collaborator", False),
-                                     max_collaborator_per_hour=kw.get("max_collaborator_per_hour", 10))
+                                     max_collaborator_per_hour=kw.get("max_collaborator_per_hour", 10),
+                                     collaborator_max_age=kw.get("collaborator_max_age", 1800.0))
         for d in (args.inbox, args.results, args.state):
             os.makedirs(d, exist_ok=True)
         self.init_loop(args, "sends.json", clock=lambda: 1000.0, sleep=lambda s: None)
@@ -335,6 +336,27 @@ class InertTextTest(unittest.TestCase):
             self.assertEqual(parse_markers(turn.text).actions, [], raw)
             self.assertIn("HI", turn.text)
 
+    def test_the_bracket_fallback_is_reached_when_the_quoted_form_is_not_enough(self):
+        from ag2_sparrow.result_markers import parse_markers
+        with mock.patch.object(ct, "neutralize_markers", side_effect=lambda s: s):
+            body = ct.inert_text("[no-send]\nHI [dm-only]\n[file: /x]")
+            self.assertEqual(body, "[ no-send]\nHI [ dm-only]\n[ file: /x]", "every bracket opened")
+            self.assertEqual(parse_markers(body).actions, [])
+            turn = ct.run_collaborator_turn("claude", "t", {}, run=FakeRun(stdout=json.dumps({"result": "[no-send]\nHI"})))
+            self.assertEqual((turn.kind, turn.text), ("ok", "[ no-send]\nHI"))
+
+    def test_both_parser_modes_are_consulted(self):
+        from ag2_sparrow.result_markers import Action, ParseResult
+        calls = []
+
+        def only_after_channel(text, skip_after_channel=False):
+            calls.append(skip_after_channel)
+            return ParseResult(text, [Action("skip", "no-send")] if skip_after_channel else [])
+        with mock.patch.object(ct, "parse_markers", side_effect=only_after_channel):
+            self.assertTrue(ct._executes("x"))
+            self.assertIsNone(ct.inert_text("x"), "a body only the delivery verdict's mode acts on is still refused")
+        self.assertEqual(calls[:2], [False, True])
+
     def test_text_that_still_acts_after_quoting_is_a_failed_turn(self):
         with mock.patch.object(ct, "_executes", return_value=True):
             self.assertIsNone(ct.inert_text("[no-send]\nHI"))
@@ -421,6 +443,23 @@ class LaneSchedulingTest(unittest.TestCase):
                 self.assertEqual(loop.classify(headers), want, (headers, flags))
                 refused = loop.refusal("task-x%d.txt" % len(loop.lanes), headers, set())
                 self.assertEqual(refused is None, not want.startswith("refused"), (headers, flags))
+
+    def test_a_task_is_too_old_once_it_waited_past_the_max_age_since_first_seen(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = self.loop(d, collaborator_max_age=100.0)
+            now = [loop.clock()]
+            loop.clock = lambda: now[0]
+            self.assertFalse(loop.too_old("task-never-seen.txt"))
+            loop.lane("task-c.txt")
+            self.assertEqual(loop.seen_at["task-c.txt"], now[0])
+            now[0] += 100
+            self.assertFalse(loop.too_old("task-c.txt"), "exactly the limit is still fresh")
+            now[0] += 1
+            self.assertTrue(loop.too_old("task-c.txt"))
+            loop.lane("task-c.txt")
+            self.assertTrue(loop.too_old("task-c.txt"), "a second look does not restart the clock")
+            loop._settled("task-c.txt", set())
+            self.assertNotIn("task-c.txt", loop.seen_at)
 
     def test_a_lane_is_read_once_and_a_vanished_task_is_the_providers_to_report(self):
         with tempfile.TemporaryDirectory() as d:

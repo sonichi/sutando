@@ -560,8 +560,55 @@ class QueueLoopTest(unittest.TestCase):
             fake = Fake(d, [turn_ok()])
             write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
             with mock.patch.object(sa.subprocess, "run", wraps=subprocess.run) as spy:
-                run_adapter(d, fake, run=sa.subprocess.run, once=1, allow_collaborator=True, timeout=7)
-            self.assertEqual(spy.call_args.kwargs["timeout"], 7.0)
+                run_adapter(d, fake, run=sa.subprocess.run, once=1, allow_collaborator=True, collaborator_timeout=7)
+            self.assertEqual(spy.call_args.kwargs["timeout"], 7.0, "--collaborator-timeout, not --timeout (10 here)")
+            self.assertEqual(sa.build_parser().get_default("collaborator_timeout"), 60.0)
+            self.assertEqual(sa.build_parser().get_default("collaborator_max_age"), 1800.0)
+
+    def test_a_non_owner_turn_under_allow_non_owner_never_carries_owner_dm(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [ok(1), ok(2)])
+            write_task(d, "task-g", "guest asks", tier="guest", mtime=1000)
+            write_task(d, "task-o", "owner asks", mtime=2000)
+            run_adapter(d, fake, once=2, allow_non_owner=True, owner_dm="!dm:ag2.space")
+            guest, owner = fake.calls()
+            self.assertIn("tier=guest", text_of(guest))
+            for owner_only in ("owner_dm", "!dm:ag2.space"):
+                self.assertNotIn(owner_only, text_of(guest))
+            self.assertIn("owner_dm=!dm:ag2.space", text_of(owner))
+            self.assertNotIn("owner_dm", sa.build_text("t", {"access_tier": "team", "channel_id": "!r:x"}, "m",
+                                                       owner_dm="!dm:x")[1])
+
+    def test_settling_drops_the_lane_and_first_seen_records(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok("one")])
+            write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
+            ad, _ = run_adapter(d, fake, once=1, allow_collaborator=True)
+            self.assertEqual((ad.lanes, ad.seen_at), ({}, {}))
+            ad.lanes["task-x.txt"], ad.seen_at["task-x.txt"] = "provider", 1.0
+            ad._settled("task-x.txt", set())
+            self.assertEqual((ad.lanes, ad.seen_at), ({}, {}))
+
+    def test_a_collaborator_task_that_waited_past_the_max_age_gets_the_line_and_no_turn(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Fake(d, [turn_ok("one")])
+            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
+            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            clock = FakeClock()
+            ad, _ = run_adapter(d, fake, clock=clock, once=1, max_collaborator_per_hour=1, allow_collaborator=True,
+                                collaborator_max_age=600)
+            self.assertEqual(result(d, "task-c1"), "one", "fresh: it ran")
+            self.assertIsNone(ad.next_ready(["task-c2.txt"])[0], "the next poll sees c2 waiting on the cap")
+            self.assertEqual(ad.seen_at["task-c2.txt"], clock.t)
+            clock.t += rl.HOUR
+            ad.args.once = 2
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                ad.serve()
+            self.assertEqual(result(d, "task-c2"), rl.NON_OWNER_FAILED, "stale: the line, no turn")
+            self.assertEqual(len(fake.calls()), 1)
+            self.assertEqual(claim(d, "task-c2")["attempt"], 0, "no call was prepared")
+            self.assertIn("collaborator task waited too long -> task-c2", err_buf.getvalue())
 
     def test_a_collaborator_reply_never_executes_delivery_protocol(self):
         from ag2_sparrow.result_markers import parse_markers

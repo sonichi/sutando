@@ -408,7 +408,7 @@ class FireLoopTest(unittest.TestCase):
             write_task(d, "task-o", "owner asks", mtime=1400)
             run = FakeRun()
             ad, err = run_adapter(d, base, once=5, run=run, environ=LEAKY_ENV, claude="/opt/cli/claude",
-                                  allow_collaborator=True)
+                                  allow_collaborator=True, collaborator_timeout=9)
             self.assertEqual(len(srv.requests), 1, "only the owner reached the routine")
             self.assertIn("tier=owner", srv.requests[0]["body"]["text"])
             self.assertNotIn("SECRET-MARKER", json.dumps(srv.requests))
@@ -416,7 +416,9 @@ class FireLoopTest(unittest.TestCase):
             self.assertEqual(call["argv"], ["/opt/cli/claude", "-p", "--safe-mode", "--restricted", "--strict-mcp-config",
                                             "--no-session-persistence", "--tools", "Read,Grep,Glob", "--output-format",
                                             "json"])
-            self.assertEqual(call["timeout"], 5.0, "the adapter's own --timeout")
+            self.assertEqual(call["timeout"], 9.0, "--collaborator-timeout, not the HTTP --timeout (5 here)")
+            self.assertEqual(ra.build_parser().get_default("collaborator_timeout"), 120.0)
+            self.assertEqual(ra.build_parser().get_default("collaborator_max_age"), 1800.0)
             for flag in ("--cloud", "--resume", "-r", "--dangerously-skip-permissions", "--permission-mode", "--bare"):
                 self.assertNotIn(flag, call["argv"], flag)
             self.assertNotIn("SECRET-MARKER", " ".join(call["argv"]), "the text goes on stdin")
@@ -525,6 +527,27 @@ class FireLoopTest(unittest.TestCase):
             self.assertEqual(run.calls, [])
             self.assertFalse((Path(d) / "results" / "task-c.txt").exists())
             self.assertLess(clock.t - start, rl.HOUR)
+
+    def test_a_collaborator_task_that_waited_past_the_max_age_gets_the_line_and_no_turn(self):
+        with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (srv, base):
+            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
+            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            run, clock = FakeRun(), FakeClock()
+            # Cap 1: c2 is seen at once but waits for the window, which is longer than the max age.
+            ad, err = run_adapter(d, base, clock=clock, once=1, run=run, max_collaborator_per_hour=1,
+                                  allow_collaborator=True, collaborator_max_age=600)
+            self.assertEqual(result(d, "task-c1"), "Hello from the turn", "fresh: it ran")
+            self.assertIsNone(ad.next_ready(["task-c2.txt"])[0], "the next poll sees c2 waiting on the cap")
+            self.assertEqual(ad.seen_at["task-c2.txt"], clock.t)
+            clock.t += rl.HOUR
+            ad.args.once = 2
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                ad.serve()
+            self.assertEqual(result(d, "task-c2"), rl.NON_OWNER_FAILED, "stale: the line, no turn")
+            self.assertEqual(len(run.calls), 1)
+            self.assertIn("collaborator task waited too long -> task-c2", err_buf.getvalue())
+            self.assertEqual(srv.requests, [])
 
     def test_refused_tasks_are_never_held_behind_a_saturated_cap(self):
         with tempfile.TemporaryDirectory() as d, fake_server([ok()]) as (srv, base):
