@@ -305,7 +305,7 @@ from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir a
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
-from . import gateway_instance, local_task_protocol, routing_migrations
+from . import diagnostics, gateway_instance, local_task_protocol, routing_migrations
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
@@ -718,7 +718,7 @@ def _stage_durable(path: Path, text: str) -> "Path | None":
             os.fsync(handle.fileno())
         return tmp
     except Exception as exc:  # noqa: BLE001
-        _log(f"durable stage failed for {path.name} ({exc})")
+        _log(f"durable stage failed for {path.name} ({diagnostics.describe(exc)})")
         return None
 
 
@@ -734,7 +734,7 @@ def _publish_staged(tmp: Path, path: Path) -> bool:
                 os.close(dfd)
         return True
     except Exception as exc:  # noqa: BLE001
-        _log(f"durable publish failed for {path.name} ({exc})")
+        _log(f"durable publish failed for {path.name} ({diagnostics.describe(exc)})")
         return False
 
 
@@ -1171,7 +1171,7 @@ def _settle_landed_releases() -> None:
                 _log(f"withheld review {review_id}: published; its outbox item is still claimed "
                      "and is settled once that claim can be taken")
         except Exception as exc:  # noqa: BLE001 — next beat retries
-            _log(f"withheld review {review_id}: outbox settlement deferred ({exc})")
+            _log(f"withheld review {review_id}: outbox settlement deferred ({diagnostics.describe(exc)})")
 
 
 def _settlement_record(directory: Path, review_id: str) -> "dict | None":
@@ -1323,7 +1323,7 @@ def _handle_hitl_action(task: dict):
     try:
         out = handler.offer_task(task)
     except Exception as e:  # noqa: BLE001 — a broken click must not stall the poll loop
-        _log(f"hitl: task-relay click {task_id} not applied: {e}")
+        _log(f"hitl: task-relay click {task_id} not applied: {diagnostics.describe(e)}")
         return False
     if out == "rejected":
         return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
@@ -1348,7 +1348,7 @@ def _claim_review_decision(task: dict, path: Path, updates: dict) -> "dict | Non
         if claimed is None:
             _explain_unclaimed(task, path)
     except Exception as exc:  # noqa: BLE001 — a failed claim is answered, never escapes the beat
-        _log(f"withheld review {path.stem}: reply {task.get('id')} could not be processed ({exc})")
+        _log(f"withheld review {path.stem}: reply {task.get('id')} could not be processed ({diagnostics.describe(exc)})")
         _queue_review_control_result(task, body=(
             f"Your decision on review `{path.stem}` could not be processed right now. Nothing "
             "changed; please reply again."))
@@ -1405,7 +1405,7 @@ def _handle_review_decision(task: dict) -> bool:
         matched = _match_review_decision(task)
         archived_reply = matched is not None and _archived_reply(matched[0])
     except (_ReviewsUnreadable, OSError) as exc:
-        _log(f"withheld reviews: reply {task.get('id')} could not be checked ({exc})")
+        _log(f"withheld reviews: reply {task.get('id')} could not be checked ({diagnostics.describe(exc)})")
         record = getattr(exc, "record", "")
         _queue_review_control_result(task, body=(
             f"Your reply could not be checked: the review record `{record}` is not a readable "
@@ -1440,7 +1440,7 @@ def _handle_review_decision(task: dict) -> bool:
         try:
             _resolve_review_card(path, record)
         except Exception as exc:  # noqa: BLE001 — durable pending state retries
-            _log(f"withheld review {record.get('review_id')} card edit deferred: {exc}")
+            _log(f"withheld review {record.get('review_id')} card edit deferred: {diagnostics.describe(exc)}")
         return True
     # Persist release before the network call; pending retries use a stable
     # dedupe key so they cannot duplicate the disclosure.
@@ -1454,7 +1454,7 @@ def _handle_review_decision(task: dict) -> bool:
         if _publish_review(path, record):
             _resolve_review_card(path, record)
     except Exception as exc:  # noqa: BLE001 — durable pending state retries
-        _log(f"withheld review {record.get('review_id')} publish deferred: {exc}")
+        _log(f"withheld review {record.get('review_id')} publish deferred: {diagnostics.describe(exc)}")
     return True
 
 
@@ -1473,11 +1473,11 @@ def _retry_pending_publications() -> None:
             if not _publish_review(path, record):
                 _log(f"withheld review {record.get('review_id')} publish still pending")
         except Exception as exc:  # noqa: BLE001 — next poll retries
-            _log(f"withheld review {record.get('review_id')} publish retry failed: {exc}")
+            _log(f"withheld review {record.get('review_id')} publish retry failed: {diagnostics.describe(exc)}")
     try:
         _settle_landed_releases()
     except Exception as exc:  # noqa: BLE001 — next poll retries
-        _log(f"withheld release settlement deferred: {exc}")
+        _log(f"withheld release settlement deferred: {diagnostics.describe(exc)}")
 
 
 def _retry_review_card_resolutions() -> None:
@@ -1491,7 +1491,7 @@ def _retry_review_card_resolutions() -> None:
             if not _resolve_review_card(path, record):
                 _log(f"withheld review {record.get('review_id')} card edit still pending")
         except Exception as exc:  # noqa: BLE001 — next poll retries
-            _log(f"withheld review {record.get('review_id')} card edit retry failed: {exc}")
+            _log(f"withheld review {record.get('review_id')} card edit retry failed: {diagnostics.describe(exc)}")
 
 
 def _control_result_path(task_id: str) -> Path:
@@ -1508,7 +1508,7 @@ def _queue_review_control_result(task: dict, body: str = "[no-send]") -> None:
         if not path.is_file():
             _atomic_private_json(path, {"id": task_id, "body": body})
     except Exception as exc:  # noqa: BLE001 — the reply is redelivered and answered then
-        _log(f"review control result {task_id} not saved: {exc}")
+        _log(f"review control result {task_id} not saved: {diagnostics.describe(exc)}")
 
 
 def _retry_review_control_results() -> None:
@@ -1526,7 +1526,7 @@ def _retry_review_control_results() -> None:
                 **_result_contract(False)})
             path.unlink(missing_ok=True)
         except Exception as exc:  # noqa: BLE001 — next poll retries
-            _log(f"review control result {record.get('id')} retry deferred: {exc}")
+            _log(f"review control result {record.get('id')} retry deferred: {diagnostics.describe(exc)}")
 
 
 def _is_redelivery_control(body: str) -> bool:
@@ -1678,7 +1678,7 @@ def _project_hitl(log=print) -> int:
         from hitl.manager import HitlManager, HitlStore, default_store
         from hitl.projector import pending_ids, project
     except Exception as e:  # noqa: BLE001 — an optional tier never breaks the pulse
-        log(f"hitl: projector unavailable ({e}); cards will not be delivered")
+        log(f"hitl: projector unavailable ({diagnostics.describe(e)}); cards will not be delivered")
         return 0
     workspace = _STATE.parent
     manager = HitlManager(HitlStore(default_store(workspace)))
@@ -1715,7 +1715,7 @@ def _hitl_reply_handler(owner_mxid: str, log=print):
         return HitlReplyHandler(HitlManager(HitlStore(default_store(workspace))), owner_mxid,
                                 workspace=workspace, log=log)
     except Exception as e:  # noqa: BLE001 — an optional handler must never break the chain
-        log(f"hitl: reply handler unavailable ({e}); card clicks will not be applied")
+        log(f"hitl: reply handler unavailable ({diagnostics.describe(e)}); card clicks will not be applied")
         return None
 
 
@@ -1957,19 +1957,19 @@ def _outbound_worker(inflight: "set[str]") -> None:
         try:
             _post_ready_results(inflight)
         except Exception as e:  # noqa: BLE001 — failure isolation per cycle
-            _log(f"outbound worker: results drain error (isolated): {e}")
+            _log(f"outbound worker: results drain error (isolated): {diagnostics.describe(e)}")
         try:
             _post_proactive()
         except Exception as e:  # noqa: BLE001
-            _log(f"outbound worker: proactive drain error (isolated): {e}")
+            _log(f"outbound worker: proactive drain error (isolated): {diagnostics.describe(e)}")
         try:
             _project_hitl(log=_log)
         except Exception as e:  # noqa: BLE001
-            _log(f"outbound worker: hitl projection error (isolated): {e}")
+            _log(f"outbound worker: hitl projection error (isolated): {diagnostics.describe(e)}")
         try:
             _retry_pending_acks(inflight)
         except Exception as e:  # noqa: BLE001
-            _log(f"outbound worker: pending-ack retry error (isolated): {e}")
+            _log(f"outbound worker: pending-ack retry error (isolated): {diagnostics.describe(e)}")
         for tid in [t for t in first_seen if t not in inflight]:
             ms = (time.monotonic() - first_seen.pop(tid)) * 1000.0
             _log(f"outbound worker: {tid} seen->retired {ms:.0f}ms (monotonic)")
@@ -2029,7 +2029,7 @@ def _start_results_watcher() -> "threading.Thread | None":
                         backoff = min(backoff * 2, 30.0)
                         break            # dir vnode gone: rebuild registration
             except Exception as e:  # noqa: BLE001 — degraded, never fatal
-                _log(f"results watcher degraded (scan remains the floor): {e}")
+                _log(f"results watcher degraded (scan remains the floor): {diagnostics.describe(e)}")
                 _OUTBOUND_STOP.wait(min(backoff, 30.0))
                 backoff = min(backoff * 2, 30.0)
             finally:
@@ -2135,7 +2135,7 @@ def _reenroll_claim() -> None:
                          "User-Agent": "sutando-gateway-client/1.0"}, method="POST")
             with urllib.request.urlopen(req, timeout=20) as r:
                 body = json.loads(r.read() or b"{}")
-        code = str(body.get("approval_code") or "")
+        code = diagnostics.code_field(body.get("approval_code"), URL) or ""
         if body.get("pending") and code:
             _reenroll_state["code"] = code
             _reenroll_state["claimed_at"] = int(time.time())
@@ -2144,19 +2144,19 @@ def _reenroll_claim() -> None:
                  f"lost. RELINK CODE: {code} — the owner approves by DMing the "
                  f"concierge: relink approve {code}")
         else:
-            _log(f"reenroll: claim not parked ({str(body)[:200]})")
+            _log("reenroll: claim not parked (the answer carries no usable approval code)")
     except urllib.error.HTTPError as e:
         raw = _http_error_body(e)
         try:
             err = json.loads(raw).get("error")
         except Exception:  # noqa: BLE001 — a non-JSON body still records the status
             err = None
-        _reenroll_state["refused"] = {"status": e.code,
-                                      "error": err if isinstance(err, str) else None,
-                                      "at": int(time.time())}
-        _log(f"reenroll: claim refused HTTP {e.code} ({raw[:200]})")
+        # The body is the gateway's free text: only an error name that is a safe token leaves here.
+        err = diagnostics.code_field(err, URL)
+        _reenroll_state["refused"] = {"status": e.code, "error": err, "at": int(time.time())}
+        _log(f"reenroll: claim refused HTTP {e.code}" + (f" ({err})" if err else ""))
     except Exception as e:  # noqa: BLE001 — recovery must never crash the loop
-        _log(f"reenroll: claim failed: {e}")
+        _log(f"reenroll: claim failed: {diagnostics.describe(e)}")
 
 
 def _reenroll_clear(recovered: bool = False) -> None:
@@ -2817,7 +2817,7 @@ def _read_ack_json(path: Path) -> dict:
     except FileNotFoundError:
         return {}
     except Exception as e:  # noqa: BLE001
-        _log(f"pending-ack file {path.name} unreadable ({e}) — starting empty")
+        _log(f"pending-ack file {path.name} unreadable ({diagnostics.describe(e)}) — starting empty")
         return {}
     return {str(k): v for k, v in data.items()} if isinstance(data, dict) else {}
 
@@ -2938,7 +2938,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
         _log(f"task ack failed for {tid}: HTTP {e.code} — gateway may redeliver")
         return False
     except _NETWORK_ERRORS as e:
-        _log(f"task ack network error for {tid}: {e} — gateway may redeliver")
+        _log(f"task ack network error for {tid}: {diagnostics.describe(e)} — gateway may redeliver")
         return False
 
 
@@ -2983,7 +2983,7 @@ def _post_ack_first(tid: str, lease_id: "str | None") -> str:
     except (OSError, ValueError, http.client.HTTPException) as e:
         # A re-ack of an accepted task answers `duplicate`, so retrying is always safe.
         _log_backoff((tid, "ack-retry"), f"ack_first task {tid}: ack failed "
-                     f"({type(e).__name__}: {e}) — kept staged, retrying")
+                     f"({diagnostics.describe(e)}) — kept staged, retrying")
         return "retry"
 
 
@@ -2995,7 +2995,7 @@ def _ack_first_state(tid: str) -> "str | None":
         doc = _req("GET", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/status", timeout=10)
     except (OSError, ValueError, http.client.HTTPException) as e:
         _log_backoff((tid, "ack-status"), f"ack_first task {tid}: status unreadable "
-                     f"({type(e).__name__}: {e}) — kept staged")
+                     f"({diagnostics.describe(e)}) — kept staged")
         return None
     state = doc.get("state") if isinstance(doc, dict) else None
     return state if isinstance(state, str) else None
@@ -3216,7 +3216,7 @@ def _push_pool_advertisement_now() -> None:
         _maybe_push_agent_profile(record)
         _maybe_pull_worker_labels(record)
     except Exception as e:  # noqa: BLE001 — a background push fails loudly, never silently
-        _log(f"pool advertisement push failed: {e}")
+        _log(f"pool advertisement push failed: {diagnostics.describe(e)}")
 
 
 def _workers_body(ad: dict) -> dict:
@@ -3340,7 +3340,7 @@ def _maybe_push_workers_snapshot(record) -> bool:
         return False
     except Exception as e:  # noqa: BLE001 — relay must never kill the loop
         _workers_push_retry_at = now + 300
-        _log(f"workers-snapshot push failed, retrying in 5m: {e}")
+        _log(f"workers-snapshot push failed, retrying in 5m: {diagnostics.describe(e)}")
         return False
     _workers_pushed_identity = identity
     _workers_pushed_at = _now()
@@ -3405,7 +3405,7 @@ def _maybe_push_agent_profile(record) -> bool:
         return False
     except Exception as e:  # noqa: BLE001 — relay must never kill the loop
         _profile_push_retry_at = now + 300
-        _log(f"agent-profile push failed, retrying in 5m: {e}")
+        _log(f"agent-profile push failed, retrying in 5m: {diagnostics.describe(e)}")
         return False
     _profile_pushed_identity = key
     _log(f"agent-profile pushed for {mxid}")
@@ -3433,7 +3433,7 @@ def _maybe_pull_worker_labels(record) -> bool:
         return False
     except Exception as e:  # noqa: BLE001 — optional read cannot stop task intake
         _profile_labels_retry_at = now + 300
-        _log(f"worker-label read failed, retrying in 5m: {e}")
+        _log(f"worker-label read failed, retrying in 5m: {diagnostics.describe(e)}")
         return False
 
     _profile_labels_checked_at = now
@@ -3461,7 +3461,7 @@ def _maybe_pull_worker_labels(record) -> bool:
         result = _WORKER_LABEL_APPLIER(labels, version, mxid)
     except Exception as e:  # noqa: BLE001 — local pool may be absent or upgrading
         _profile_labels_retry_at = now + 300
-        _log(f"worker-label apply failed, retrying in 5m: {e}")
+        _log(f"worker-label apply failed, retrying in 5m: {diagnostics.describe(e)}")
         return False
     if isinstance(result, dict) and result.get("changed"):
         _log(f"worker labels applied from owner profile config v{version}")
@@ -3583,7 +3583,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         _log(f"heartbeat failed: HTTP {e.code} — continuing")
         return False
     except _NETWORK_ERRORS as e:
-        _log(f"heartbeat network error: {e} — continuing")
+        _log(f"heartbeat network error: {diagnostics.describe(e)} — continuing")
         return False
 
 
@@ -3598,7 +3598,7 @@ def _record_setup_hint(reply) -> None:
     try:
         text = json.dumps(dict(hint, ts=int(time.time())), sort_keys=True)
     except (TypeError, ValueError) as e:
-        _log(f"setup hint not recorded: {e}")
+        _log(f"setup hint not recorded: {diagnostics.describe(e)}")
         return
     if not _durable_write(SETUP_HINT_FILE, text):
         _log("setup hint not recorded")
@@ -3685,6 +3685,7 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
         # Per-PID staging (sonichi/sutando#2222 follow-up): single-writer today,
         # but a shared temp name collides if a second sparrow instance ever runs;
         tmp = GATEWAY_STATUS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+        payload = diagnostics.safe_status(payload, lambda text: gateway_instance.redact_text(text, URL))
         with open(tmp, "w") as f:
             json.dump(payload, f)
         os.replace(tmp, GATEWAY_STATUS_FILE)
@@ -3812,7 +3813,7 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     try:
         data = _download_bytes(url, headers, MAX_MEDIA_BYTES)
     except Exception as e:  # noqa: BLE001 — drop-in safe
-        _log(f"media fetch failed ({e}) — leaving marker as-is")
+        _log(f"media fetch failed ({diagnostics.describe(e)}) — leaving marker as-is")
         return body
     try:
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -3829,7 +3830,7 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
             f.write(data)
         path = Path(path_str)
     except Exception as e:  # noqa: BLE001
-        _log(f"media save failed ({e}) — leaving marker as-is")
+        _log(f"media save failed ({diagnostics.describe(e)}) — leaving marker as-is")
         return body
     _log(f"fetched media → {path} ({len(data)} bytes)")
     if _refs_out is not None:
@@ -3904,7 +3905,7 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:  # noqa: BLE001
-        _log(f"owner-activity write failed: {e}")
+        _log(f"owner-activity write failed: {diagnostics.describe(e)}")
 
 
 def _fsync_in_place(tid: str, *targets: Path) -> bool:
@@ -3920,7 +3921,7 @@ def _fsync_in_place(tid: str, *targets: Path) -> bool:
             finally:
                 os.close(fd)
     except OSError as exc:
-        _log(f"durability repair failed for {tid} ({exc})")
+        _log(f"durability repair failed for {tid} ({diagnostics.describe(exc)})")
         return False
     return True
 
@@ -4022,7 +4023,7 @@ def _feed_on_task_stdin(proc: "subprocess.Popen", data: bytes, tid: str) -> None
     except (BrokenPipeError, ConnectionResetError):
         pass  # the command exited or closed stdin without reading: it ignores the payload
     except (OSError, ValueError) as exc:
-        _log(f"on-task stdin write failed for {tid}: {type(exc).__name__}: {exc}")
+        _log(f"on-task stdin write failed for {tid}: {diagnostics.describe(exc)}")
     finally:
         with contextlib.suppress(OSError):
             pipe.close()
@@ -4052,7 +4053,7 @@ def _fire_on_task(tid: str, path: Path, text: "str | None" = None) -> None:
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 start_new_session=True)
     except Exception as exc:  # noqa: BLE001 — a bad wake command never stops the pull loop
-        _log(f"on-task command failed to start for {tid}: {type(exc).__name__}: {exc}")
+        _log(f"on-task command failed to start for {tid}: {diagnostics.describe(exc)}")
         return
 
     threading.Thread(target=_feed_and_reap, args=(proc, data, tid),
@@ -4165,7 +4166,7 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
                 except Exception as _vault_exc:
                     _fetched = _redact_fallback(_fetched)
                     _log(f"[vault] intercept errored "
-                         f"({type(_vault_exc).__name__}: {_vault_exc}) — "
+                         f"({diagnostics.describe(_vault_exc)}) — "
                          f"redacted, NOT stored")
             else:
                 _fetched = _redact_fallback(_fetched)
@@ -4298,7 +4299,7 @@ def _load_dedup_aliases() -> "dict[str, str] | None":
     try:
         loaded = json.loads(DEDUP_ALIAS_FILE.read_text())
     except (OSError, ValueError) as exc:
-        _log(f"dedup alias ledger unreadable ({exc}) — deferring")
+        _log(f"dedup alias ledger unreadable ({diagnostics.describe(exc)}) — deferring")
         return None
     return loaded if isinstance(loaded, dict) else None
 
@@ -4316,7 +4317,7 @@ def _save_dedup_aliases(aliases: dict[str, str]) -> bool:
         os.replace(tmp, DEDUP_ALIAS_FILE)
         return True
     except Exception as exc:  # noqa: BLE001
-        _log(f"dedup alias persist FAILED ({exc}) — keeping original delivery")
+        _log(f"dedup alias persist FAILED ({diagnostics.describe(exc)}) — keeping original delivery")
         return False
 
 
@@ -4347,7 +4348,7 @@ def _load_task_rooms() -> dict[str, str]:
     except FileNotFoundError:
         return {}
     except Exception as e:  # noqa: BLE001
-        _log(f"task-rooms file unreadable ({e}) — starting empty")
+        _log(f"task-rooms file unreadable ({diagnostics.describe(e)}) — starting empty")
         return {}
 
 
@@ -4361,7 +4362,7 @@ def _save_task_rooms(rooms: dict[str, str]) -> None:
         tmp.write_text(json.dumps(rooms, sort_keys=True))
         os.replace(tmp, TASK_ROOMS_FILE)
     except Exception as e:  # noqa: BLE001
-        _log(f"task-rooms persist failed ({e}) — continuing")
+        _log(f"task-rooms persist failed ({diagnostics.describe(e)}) — continuing")
 
 
 def _record_task_room(tid: str, room: str) -> None:
@@ -4391,7 +4392,7 @@ def _load_task_media() -> "dict | None":
     try:
         loaded = json.loads(TASK_MEDIA_FILE.read_text())
     except (OSError, ValueError) as exc:
-        _log(f"task-media sidecar unreadable ({exc}) — deferring")
+        _log(f"task-media sidecar unreadable ({diagnostics.describe(exc)}) — deferring")
         return None
     return loaded if isinstance(loaded, dict) else None
 
@@ -4436,7 +4437,7 @@ def _load_ack_first() -> "dict | None":
     try:
         loaded = json.loads(ACK_FIRST_FILE.read_text())
     except (OSError, ValueError) as exc:
-        _log_backoff(("ack-first-marks",), f"ack_first marks unreadable ({exc}) — deferring")
+        _log_backoff(("ack-first-marks",), f"ack_first marks unreadable ({diagnostics.describe(exc)}) — deferring")
         return None
     return loaded if isinstance(loaded, dict) else None
 
@@ -4582,7 +4583,7 @@ def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
                     else f"a live result already holds {target.name}"))
             continue
         except OSError as e:
-            _log(f"result {local}: its parked relay result could not be moved back ({e}); "
+            _log(f"result {local}: its parked relay result could not be moved back ({diagnostics.describe(e)}); "
                  "the next start reclaims it")
             continue
         _log(f"result {local}: reclaimed the relay result an older bridge parked ({copy.name}); "
@@ -4612,7 +4613,7 @@ def _load_held() -> "dict | None":
     try:
         loaded = json.loads(ACK_FIRST_MANIFEST_FILE.read_text())
     except (OSError, ValueError) as exc:
-        _log(f"ack_first manifest unreadable ({exc}) — nothing staged is acked or published")
+        _log(f"ack_first manifest unreadable ({diagnostics.describe(exc)}) — nothing staged is acked or published")
         return None
     return loaded if isinstance(loaded, dict) else None
 
@@ -5360,7 +5361,7 @@ def _record_proactive_receipt(item_id: str, room: str) -> None:
         record_delivered(RESULTS_DIR / ".outbox-ag2space-proactive", item_id,
                          provider="ag2space-proactive", destination=room)
     except Exception as e:  # noqa: BLE001 — receipt is best-effort by design
-        _log(f"proactive receipt write failed for {item_id}: {e} "
+        _log(f"proactive receipt write failed for {item_id}: {diagnostics.describe(e)} "
              "(delivery unaffected)")
 
 
@@ -5414,7 +5415,7 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
         dest_dir.mkdir(parents=True, exist_ok=True)
         claim.rename(dest_dir / f"{original.stem}-{int(time.time())}.txt")
     except OSError as e:
-        _log(f"could not retire proactive {original.name} ({e}) — re-queueing")
+        _log(f"could not retire proactive {original.name} ({diagnostics.describe(e)}) — re-queueing")
         try:
             claim.rename(original)
         except OSError:
@@ -5502,7 +5503,7 @@ def _post_proactive() -> None:
                 claim.rename(f)
             except OSError as restore_exc:
                 _log(f"CRITICAL: proactive {claim.name} post-claim read failed "
-                     f"({exc}) AND restore to {f.name} failed ({restore_exc}) — "
+                     f"({diagnostics.describe(exc)}) AND restore to {f.name} failed ({diagnostics.describe(restore_exc)}) — "
                      f"owner nudge stranded under live pid until restart")
             continue
         if route == "foreign" or (
@@ -5597,7 +5598,7 @@ def _post_proactive() -> None:
             continue
         except (urllib.error.URLError, TimeoutError) as e:
             outcome = _resolve_send_failure(claim, f, e)
-            _log(f"proactive send network error for {f.name}: {e} — {outcome}")
+            _log(f"proactive send network error for {f.name}: {diagnostics.describe(e)} — {outcome}")
             continue
         _record_proactive_receipt(f.stem, dest_room)
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -5626,7 +5627,7 @@ def _load_inflight() -> set[str]:
         return set()
     except Exception as e:  # noqa: BLE001
         _INFLIGHT_DEGRADED = True
-        _log(f"inflight file unreadable ({e}) — starting empty")
+        _log(f"inflight file unreadable ({diagnostics.describe(e)}) — starting empty")
         return set()
 
 
@@ -5716,7 +5717,7 @@ def _dedup_plan(tid: str, holder_id: str | None, inflight: "set[str] | None" = N
                 _reask_id(tid), commit_identity=_commit,
                 channel_dir=CHANNEL_DIR, holder_delivery_state=_holder_delivery_state)
     except OSError as e:
-        _log(f"dedup decision for {tid} deferred: {e}")
+        _log(f"dedup decision for {tid} deferred: {diagnostics.describe(e)}")
         return "defer", None, room
     return action, payload, room
 
@@ -5779,7 +5780,7 @@ def _relay_results_retrying(now: float) -> "dict | None":
         return {"count": len(ages), "oldest_age_s": int(max(ages))} if ages else None
     except Exception as e:  # noqa: BLE001 - this field never costs the rest of the status write
         _log_backoff(("relay-results-retrying",), f"relay_results_retrying not reported "
-                     f"({type(e).__name__}: {e}); the rest of the gateway status is written")
+                     f"({diagnostics.describe(e)}); the rest of the gateway status is written")
         return None
 
 
@@ -5855,7 +5856,7 @@ def _disposed_copy_exists(tid: str, generation) -> bool:
     try:
         return disposal.disposed_copy_exists(RESULTS_DIR, tid, generation, _log)
     except OSError as e:
-        _log(f"result {tid}: could not check for a disposed copy ({e})")
+        _log(f"result {tid}: could not check for a disposed copy ({diagnostics.describe(e)})")
         return False
 
 
@@ -5901,7 +5902,7 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
         _log(f"result {tid}: {why} but the result file vanished before "
              "quarantine and no quarantined copy of the body this pass read was found")
     except OSError as e:
-        _log(f"result {tid}: {why} but quarantine failed ({e}) — "
+        _log(f"result {tid}: {why} but quarantine failed ({diagnostics.describe(e)}) — "
              "leaving it in place")
 
 
@@ -6826,7 +6827,7 @@ def _retire_orphan(rfile, directory, base: str, generation) -> bool:
     try:
         done = disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))
     except OSError as e:
-        _log(f"orphan sweep: {stem} could not be moved ({e}); left in place")
+        _log(f"orphan sweep: {stem} could not be moved ({diagnostics.describe(e)}); left in place")
         return False
     if done.outcome is disposal.Retirement.FALLBACK:
         _log(f"orphan sweep: {stem} was not moved to {Path(directory).name}/: {done.cause}")
@@ -7061,7 +7062,7 @@ def _release_singleton() -> None:
         try:
             _ws_retain(_LOCK_ROLE, _LOCK_WS)  # else our dead pid gets it reaped at once
         except Exception as e:
-            _log(f"singleton: retain failed ({e}) — the held lock can be reaped once this pid exits")
+            _log(f"singleton: retain failed ({diagnostics.describe(e)}) — the held lock can be reaped once this pid exits")
         return
     try:
         _ws_release(_LOCK_ROLE, _LOCK_WS)
@@ -7142,7 +7143,7 @@ def _acquire_singleton() -> bool:
     try:
         r = _ws_acquire(_LOCK_ROLE, _LOCK_WS, stale_seconds=_LOCK_STALE_S)
     except Exception as e:  # fail-open — never wedge task delivery on a lock bug
-        _log(f"singleton: acquire error ({e}) — proceeding without lock")
+        _log(f"singleton: acquire error ({diagnostics.describe(e)}) — proceeding without lock")
         return True
     if r.status == "deferred":
         h = r.holder or {}
@@ -7232,13 +7233,13 @@ def _maybe_start_event_channel() -> None:
                     if poster is not None:
                         poster.sweep()
                 except Exception as e:  # noqa: BLE001 — drain must never break anything
-                    _log(f"event drain error (isolated): {e}")
+                    _log(f"event drain error (isolated): {diagnostics.describe(e)}")
                 time.sleep(2.0)
         threading.Thread(target=_drain_loop, name="sparrow-event-drain", daemon=True).start()
         _log("event channel + consumer started (SPARROW_EVENTS enabled) — isolated "
              "daemon threads, task delivery unaffected")
     except Exception as e:  # noqa: BLE001 — event startup must NEVER break tasks
-        _log(f"event channel start failed (task delivery unaffected): {e}")
+        _log(f"event channel start failed (task delivery unaffected): {diagnostics.describe(e)}")
 
 
 def _poll_timeout_is_empty(last_ok: float, now: float,
@@ -7275,13 +7276,13 @@ def main() -> None:
         try:
             sweep()
         except Exception as e:  # noqa: BLE001 — what a sweep leaves waits for the next start
-            _log(f"{sweep.__name__} failed ({type(e).__name__}: {e}) — continuing")
+            _log(f"{sweep.__name__} failed ({diagnostics.describe(e)}) — continuing")
     try:
         # Before the drain and the orphan sweep, so the body is back in flight under its id.
         _reclaim_parked_relay_results(inflight)
         _keep_relay_results_in_flight(inflight)
     except Exception as e:  # noqa: BLE001 — a parked result left behind waits for the next start
-        _log(f"relay result reclaim failed ({type(e).__name__}: {e}) — continuing")
+        _log(f"relay result reclaim failed ({diagnostics.describe(e)}) — continuing")
     abandoned_suspects: set[str] = set()
     _log(f"starting — gateway={_redact_url(URL)} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
@@ -7395,14 +7396,14 @@ def main() -> None:
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _NETWORK_ERRORS as e:
             poll_failures += 1
-            _log(f"poll network error: {type(e).__name__}: {e} — {poll_failures} consecutive, "
+            _log(f"poll network error: {diagnostics.describe(e)} — {poll_failures} consecutive, "
                  f"{int(time.time() - last_poll_ok)}s since last successful poll — "
                  f"backing off {backoff}s")
-            _emit_gateway_status(False, error=f"network: {e}", backoff_s=backoff)
+            _emit_gateway_status(False, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
-            _log(f"unexpected: {e} — backing off {backoff}s")
-            _emit_gateway_status(False, error=f"unexpected: {e}", backoff_s=backoff)
+            _log(f"unexpected: {diagnostics.describe(e)} — backing off {backoff}s")
+            _emit_gateway_status(False, error=f"unexpected: {diagnostics.describe(e)}", backoff_s=backoff)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
 
 

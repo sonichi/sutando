@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from ... import _dirs
+from ... import _dirs, diagnostics
 from . import cli as _cli, task_fields
 
 TASK, INTERVAL_MIN = "sparrow-keepawake", 15
@@ -284,7 +284,7 @@ def _stop(pid: int) -> bool:
     except ProcessLookupError:
         return True
     except OSError as e:
-        print(f"error: cannot stop Sparrow (pid {pid}): {e}", file=sys.stderr)
+        print(f"error: cannot stop Sparrow (pid {pid}): {diagnostics.describe(e)}", file=sys.stderr)
         return False
     deadline = time.monotonic() + STOP_WAIT_S
     while time.monotonic() < deadline:
@@ -474,7 +474,7 @@ def _refresh_setup(cfg: dict) -> None:
     try:
         runtime_text.refresh_cache(_state_dir(cfg), _instance(cfg))
     except Exception as e:  # noqa: BLE001 - keepawake's own job must still be logged
-        print(f"NOTE served setup: {type(e).__name__}: {e}", file=sys.stderr)
+        print(f"NOTE served setup: {diagnostics.describe(e)}", file=sys.stderr)
 
 
 def last_keepawake(log: Path) -> float | None:
@@ -582,7 +582,7 @@ def report(log: Path, gap_minutes: float = GAP_MINUTES) -> int:
     try:
         lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as e:
-        print(f"error: cannot read {log}: {e}", file=sys.stderr)
+        print(f"error: cannot read {log}: {diagnostics.describe(e)}", file=sys.stderr)
         return 1
     rows, unreadable = [], 0
     for line in lines:

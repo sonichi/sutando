@@ -116,25 +116,31 @@ def gateway_call(gateway_url: str):
 
 def install_scrubbing_excepthooks(get_url: Callable[[], str]) -> None:
     """Backstop for a process that holds the gateway URL: an uncaught exception, in any thread,
-    is reported as its type and its text through redact_text, never a raw traceback."""
-    def report(exc_type, exc, where: str) -> None:
+    is reported as the file:line of its innermost frame, its type and its text through
+    redact_text, never a raw traceback (a path and a line number cannot carry the URL)."""
+    def report(exc_type, exc, tb, where: str) -> None:
         try:
             text = redact_text(str(exc), get_url() or "")
         except Exception:  # noqa: BLE001 - a hook must report something, never the raw text
             text = REDACTED_TEXT
+        at = ""
+        while tb is not None and tb.tb_next is not None:
+            tb = tb.tb_next
+        if tb is not None:
+            at = f" at {tb.tb_frame.f_code.co_filename}:{tb.tb_lineno}"
         try:
-            sys.stderr.write(f"{where}{getattr(exc_type, '__name__', 'Exception')}: {text}\n")
+            sys.stderr.write(f"{where}{getattr(exc_type, '__name__', 'Exception')}{at}: {text}\n")
         except Exception:  # noqa: BLE001 - nowhere left to report to
             pass
 
-    def hook(exc_type, exc, _tb):
-        report(exc_type, exc, "Uncaught ")
+    def hook(exc_type, exc, tb):
+        report(exc_type, exc, tb, "Uncaught ")
 
     def thread_hook(args):
         if args.exc_type is SystemExit:
             return
         name = getattr(args.thread, "name", "?")
-        report(args.exc_type, args.exc_value, f"Exception in thread {name}: ")
+        report(args.exc_type, args.exc_value, args.exc_traceback, f"Exception in thread {name}: ")
 
     sys.excepthook = hook
     threading.excepthook = thread_hook

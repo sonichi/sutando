@@ -69,6 +69,122 @@ def bind(state, room, instance="", identity=AGENT, gateway=GW, status_agent=AGEN
                                                             create=True) or None}))
 
 
+# Modules holding the gateway URL or gateway data; the vendored core modules touch only local
+# files and are canonical in src/, so they are outside this contract.
+SINK_CONTRACT_MODULES = ("remote_gateway_bridge.py", "event_channel.py", "human_action.py",
+                         "event_consumer.py", "default_observer.py", "routing_migrations.py",
+                         "gateway_instance.py", "setup_fetch.py", "diagnostics.py",
+                         "adapters/hatch/keepalive.py", "adapters/hatch/runtime_text.py",
+                         "adapters/hatch/cli.py")
+SINK_CALLS = {"_log", "log", "_log_backoff", "_held", "print", "_emit_gateway_status",
+              "_set", "warning", "error", "info", "debug", "exception"}
+STREAM_WRITES = {"sys.stderr.write", "sys.stdout.write"}
+SAFE_ATTRS = {"code", "errno", "status", "__name__"}
+# Calls whose result is structured (a type, a length, a predicate), never the value's text.
+SAFE_CALLS = {"diagnostics.describe", "type", "len", "isinstance", "undelivered_quarantine.no_primitive"}
+
+
+def sink_violations(source):
+    """(line, name) for every exception object or response body that reaches a sink call other
+    than through diagnostics.describe(), type(...), or a structured attribute (.code, .errno)."""
+    import ast
+    tree = ast.parse(source)
+    parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+    bodies = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call):
+            u = ast.unparse(n.value)
+            if "_http_error_body(" in u or ".read(" in u:
+                bodies |= {t.id for t in n.targets if isinstance(t, ast.Name)}
+
+    def handler_names(node):
+        names = set()
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, ast.ExceptHandler) and node.name:
+                names.add(node.name)
+        return names
+
+    def allowed(name_node, stop):
+        node = name_node
+        while node is not stop:
+            up = parents[node]
+            if isinstance(up, ast.Attribute) and up.attr in SAFE_ATTRS:
+                return True
+            if isinstance(up, ast.Call) and ast.unparse(up.func) in SAFE_CALLS:
+                return True
+            node = up
+        return False
+
+    out = []
+    for call in ast.walk(tree):
+        if not isinstance(call, ast.Call):
+            continue
+        f = call.func
+        name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+        if name not in SINK_CALLS and ast.unparse(f) not in STREAM_WRITES:
+            continue
+        watched = handler_names(call) | bodies
+        for arg in list(call.args) + [k.value for k in call.keywords]:
+            for n in ast.walk(arg):
+                if isinstance(n, ast.Name) and n.id in watched and not allowed(n, arg):
+                    out.append((n.lineno, n.id))
+    return out
+
+
+URL_PRIMITIVES = {("urllib.request", "urlopen"), ("urllib.request", "Request"),
+                  ("urllib.request", "build_opener"), ("urllib.request", "OpenerDirector"),
+                  ("http.client", "HTTPConnection"), ("http.client", "HTTPSConnection")}
+OPENER_MAKERS = {"build_opener", "OpenerDirector"}
+GATEWAY_CALL_NAMES = {"gateway_instance.gateway_call", "_gateway_call"}
+
+
+def url_primitive_uses(source):
+    """(line, what, inside gateway_call) for every reference to a URL-taking primitive: a call,
+    a bare reference (an alias made at run time), a from-import alias, and `.open` on an opener
+    built by build_opener/OpenerDirector. Not seen: names computed at run time (getattr, importlib)."""
+    import ast
+    tree = ast.parse(source)
+    parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+    names = {name for _, name in URL_PRIMITIVES}
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in {m for m, _ in URL_PRIMITIVES}:
+            for a in node.names:
+                if (node.module, a.name) in URL_PRIMITIVES:
+                    aliases[a.asname or a.name] = a.name
+
+    def primitive(node):
+        if isinstance(node, ast.Attribute) and node.attr in names:
+            return node.attr
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in aliases:
+            return aliases[node.id]
+        return None
+
+    def wrapped(node):
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, ast.With) and any(
+                    isinstance(item.context_expr, ast.Call)
+                    and ast.unparse(item.context_expr.func) in GATEWAY_CALL_NAMES for item in node.items):
+                return True
+        return False
+
+    openers = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+               and primitive(n.value.func) in OPENER_MAKERS for t in n.targets if isinstance(t, ast.Name)}
+    out = []
+    for node in ast.walk(tree):
+        what = primitive(node)
+        if what:
+            out.append((node.lineno, what, wrapped(node)))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "open":
+            recv = node.func.value
+            if ((isinstance(recv, ast.Name) and recv.id in openers)
+                    or (isinstance(recv, ast.Call) and primitive(recv.func) in OPENER_MAKERS)):
+                out.append((node.lineno, "opener.open", wrapped(node)))
+    return out
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp())
@@ -400,7 +516,7 @@ text = " | ".join(forms)
 raised = [urllib.error.HTTPError(m.URL + "/v1/tasks", 503, text, {}, io.BytesIO(b"{}")),
           urllib.error.URLError(text), TimeoutError(text), ConnectionResetError(104, text),
           http.client.InvalidURL(text), http.client.IncompleteRead(text.encode()), ValueError(text),
-          OSError(2, text, text)]
+          OSError(2, text, text), urllib.error.URLError(OSError(61, text))]
 out = []
 for exc in raised:
     def boom(*a, **k):
@@ -429,15 +545,19 @@ print(json.dumps({"out": out, "forms": forms, "files": files}))
         self.assertEqual(r.returncode, 0, r.stderr)
         result = json.loads(r.stdout.strip().splitlines()[-1])
         printed = "\n".join(r.stdout.strip().splitlines()[:-1]) + r.stderr
-        self.assertEqual(len(result["out"]), 8)
+        self.assertEqual(len(result["out"]), 9)
         for row in result["out"]:
             self.assertTrue(row["isinstance"], row)
             self.assertEqual(row["context"], "None", "the original is not reachable from it")
+            want = f"{row['type']} contacting https://gw.example/relay"
+            self.assertEqual(row["str"], want + (" (HTTP 503)" if row["type"] == "HTTPError" else ""), row)
+            self.assertIn(row["str"], row["status"])
+        nested = result["out"][-1]
+        self.assertEqual((nested["type"], nested["reason"]),
+                         ("URLError", "ConnectionRefusedError contacting https://gw.example/relay"),
+                         "a nested exception in an attribute is scrubbed too")
         for form in result["forms"]:
             self.assertNotIn(form, json.dumps(result["out"]), "nor from its attributes")
-            want = f"{row['type']} contacting https://gw.example/relay"
-            self.assertEqual(row["str"], want + (" (HTTP 503)" if row["type"] == "HTTPError" else ""))
-            self.assertIn(row["str"], row["status"])
         self.assertEqual(result["out"][0]["code"], 503, "the status code survives")
         for form in result["forms"] + ["cR", "eT", "Se%"]:
             self.assertNotIn(form, printed, form)
@@ -520,36 +640,132 @@ raise RuntimeError("fatal enrollment=SECRET%0aBAD")
         r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
                            cwd=str(self.home), timeout=60, env=self.bridge_env())
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("Exception in thread worker: ValueError: bad https://gw.example/relay", r.stderr)
-        self.assertIn("Uncaught RuntimeError: " + gateway_instance.REDACTED_TEXT, r.stderr)
+        self.assertIn("Exception in thread worker: ValueError at <string>:7: bad https://gw.example/relay",
+                      r.stderr)
+        self.assertIn("Uncaught RuntimeError at <string>:9: " + gateway_instance.REDACTED_TEXT, r.stderr)
         self.assertNotIn("SECRET", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
 
     def test_every_url_taking_call_in_the_package_runs_inside_gateway_call(self):
-        import ast
-        allowed = {("adapters/claude_routine/routine_adapter.py", "Request"),  # the routine endpoint,
-                   ("adapters/claude_routine/routine_adapter.py", "urlopen")}  # not the gateway
+        allowed = {"adapters/claude_routine/routine_adapter.py"}  # the routine endpoint, not the gateway
         found, unwrapped = [], []
         for path in sorted((PKG_ROOT / "ag2_sparrow").rglob("*.py")):
             rel = str(path.relative_to(PKG_ROOT / "ag2_sparrow"))
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
-                if name not in ("Request", "urlopen", "build_opener", "HTTPConnection", "HTTPSConnection"):
-                    continue
-                found.append((rel, name))
-                up, wrapped = node, False
-                while up in parents and not wrapped:
-                    up = parents[up]
-                    wrapped = isinstance(up, ast.With) and any(
-                        "gateway_call" in ast.unparse(item.context_expr) for item in up.items)
-                if not wrapped and (rel, name) not in allowed:
-                    unwrapped.append(f"{rel}:{node.lineno} {name}")
+            for line, what, wrapped in url_primitive_uses(path.read_text(encoding="utf-8")):
+                found.append((rel, what))
+                if not wrapped and rel not in allowed:
+                    unwrapped.append(f"{rel}:{line} {what}")
         self.assertGreaterEqual(len(found), 10, found)
-        self.assertEqual(unwrapped, [], "a call that receives the gateway URL is not wrapped")
+        self.assertEqual(unwrapped, [], "a use of a URL-taking primitive is not inside gateway_call")
+
+    def test_the_guard_sees_aliases_openers_and_bare_references(self):
+        cases = {
+            "from urllib.request import urlopen as fetch\nfetch(u)\n": [(2, "urlopen", False)],
+            "import urllib.request as ur\nur.urlopen(u)\n": [(2, "urlopen", False)],
+            "import urllib.request\nget = urllib.request.urlopen\n": [(2, "urlopen", False)],
+            "import urllib.request\nop = urllib.request.build_opener()\nop.open(u)\n":
+                [(2, "build_opener", False), (3, "opener.open", False)],
+            "from urllib.request import OpenerDirector\nOpenerDirector().open(u)\n":
+                [(2, "OpenerDirector", False), (2, "opener.open", False)],
+            "from http.client import HTTPSConnection as C\nC(h)\n": [(2, "HTTPSConnection", False)],
+            "import urllib.request\nwith gateway_instance.gateway_call(u):\n    urllib.request.urlopen(u)\n":
+                [(3, "urlopen", True)],
+            "f = open(p)\nos.open(p, 0)\n": [],
+            "import urllib.request\nwith fake_gateway_call(u):\n    urllib.request.urlopen(u)\n":
+                [(3, "urlopen", False)],
+        }
+        for source, want in cases.items():
+            self.assertEqual(sorted(url_primitive_uses(source)), sorted(want), source)
+        # Not visible statically, so the guard does not claim it: a name looked up at run time.
+        self.assertEqual(url_primitive_uses('getattr(urllib.request, "url" + "open")(u)\n'), [])
+
+    def test_no_exception_text_or_response_body_reaches_a_sink(self):
+        found = {}
+        for rel in SINK_CONTRACT_MODULES:
+            bad = sink_violations((PKG_ROOT / "ag2_sparrow" / rel).read_text(encoding="utf-8"))
+            if bad:
+                found[rel] = bad
+        self.assertEqual(found, {}, "an exception or a response body is handed to a sink")
+
+    def test_the_sink_guard_sees_each_shape(self):
+        cases = {
+            "try:\n    x()\nexcept Exception as e:\n    _log(f'failed {e}')\n": [(4, "e")],
+            "try:\n    x()\nexcept Exception as e:\n    _log('failed ' + str(e))\n": [(4, "e")],
+            "try:\n    x()\nexcept OSError as e:\n    print(f'{e.args}', file=sys.stderr)\n": [(4, "e")],
+            "raw = _http_error_body(e)\n_log(f'refused ({raw[:200]})')\n": [(2, "raw")],
+            "try:\n    x()\nexcept Exception as e:\n    _set(error=f'x {e!r}')\n": [(4, "e")],
+            "try:\n    x()\nexcept Exception as e:\n    sys.stderr.write(str(e))\n": [(4, "e")],
+            "data = r.read()\nf.write(data)\n_log(f'{len(data)} bytes')\n": [],
+            "try:\n    x()\nexcept Exception as e:\n    _log(f'{diagnostics.describe(e)} {type(e).__name__} {e.code}')\n": [],
+        }
+        for source, want in cases.items():
+            self.assertEqual(sink_violations(source), want, source)
+
+    def test_the_status_file_is_written_only_through_safe_status(self):
+        import ast
+        src = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
+        tree = ast.parse(src)
+        writers = sorted({f.name for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
+                          for n in ast.walk(f) if isinstance(n, ast.Name) and n.id == "GATEWAY_STATUS_FILE"
+                          and any(isinstance(c, ast.Call) and getattr(c.func, "attr", "") in ("replace", "write_text", "dump")
+                                  for c in ast.walk(f))})
+        self.assertEqual(writers, ["_emit_gateway_status"])
+        fn = next(f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name == "_emit_gateway_status")
+        body = ast.unparse(fn)
+        self.assertLess(body.index("diagnostics.safe_status(payload"), body.index("json.dump(payload"))
+
+    REENROLL = """
+import io, json, os, glob, urllib.error, urllib.request
+from ag2_sparrow import remote_gateway_bridge as m
+forms = json.loads(os.environ["FORMS"])
+answers = []
+for form in forms:
+    answers.append(urllib.error.HTTPError(m.URL, 403, form, {}, io.BytesIO(json.dumps({"error": form, "detail": form}).encode())))
+    answers.append(urllib.error.HTTPError(m.URL, 503, form, {}, io.BytesIO(("<html>" + form).encode())))
+    answers.append(urllib.error.URLError(form))
+    answers.append({"pending": True, "approval_code": form})
+    answers.append({"pending": False, "note": form})
+for answer in answers:
+    def reply(req, timeout=0, answer=answer):
+        if isinstance(answer, Exception):
+            raise answer
+        body = io.BytesIO(json.dumps(answer).encode())
+        body.__enter__ = lambda *a: body
+        body.__exit__ = lambda *a: False
+        return body
+    urllib.request.urlopen = reply
+    m._reenroll_state.update(last_attempt_at=None, code=None, claimed_at=None)
+    m._reenroll_claim()
+    m._emit_gateway_status(False, error="auth rejected HTTP 401")
+files = {p: open(p, errors="replace").read() for p in glob.glob(os.environ["HOME"] + "/**", recursive=True)
+         if os.path.isfile(p)}
+print(json.dumps({"files": files, "status": json.load(open(m.GATEWAY_STATUS_FILE))}))
+"""
+
+    def test_credential_forms_through_the_production_reenroll_claim_reach_no_sink(self):
+        url = "https://gw.example/relay?token=Se%2fCR%2FeT"
+        forms = ["Se%2fCR%2FeT", "Se%252FCR%252feT", "se%2fcr%2fet", "Se/CR/eT", "Se\\x2fCR",
+                 "token=Se%2fCR%2FeT", "c" + "R%2FeT"]
+        r = subprocess.run([sys.executable, "-c", PRELUDE + self.REENROLL], capture_output=True, text=True,
+                           cwd=str(self.home), timeout=60,
+                           env=self.bridge_env(REMOTE_TASK_URL=url, AGENT_MXID=AGENT, FORMS=json.dumps(forms)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertTrue(any(p.endswith("gateway-bridge.log") for p in out["files"]), "the log file is scanned")
+        self.assertEqual(out["status"]["reenroll"]["refused_error"], None)
+        everything = "\n".join([r.stdout.rsplit("\n", 2)[0], r.stderr, *out["files"].values()])
+        for secret in ("Se%2f", "Se%2F", "Se%252", "se%2f", "Se/CR", "CR%2F", "cR%2F", "Se\\x2f"):
+            self.assertNotIn(secret, everything, secret)
+            self.assertNotIn(secret.lower(), everything.lower(), secret)
+        self.assertIn("reenroll: claim refused HTTP 403", everything)
+
+    def test_a_safe_error_name_and_approval_code_still_reach_the_status(self):
+        r = subprocess.run([sys.executable, "-c", PRELUDE + self.REENROLL], capture_output=True, text=True,
+                           cwd=str(self.home), timeout=60,
+                           env=self.bridge_env(AGENT_MXID=AGENT, FORMS=json.dumps(["reenroll_disabled"])))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("reenroll: claim refused HTTP 403 (reenroll_disabled)", r.stdout)
+        self.assertIn("RELINK CODE: reenroll_disabled", r.stdout)
 
     STARTUP = """
 import json
@@ -991,6 +1207,39 @@ class RoutingMigration(unittest.TestCase):
         self.temp(".owner-routing.json.31.tmp", 2 * 3600)
         with mock.patch.object(self.rm.os, "unlink", side_effect=FileNotFoundError()):
             self.assertEqual(self.run_migration().state, self.rm.NOT_NEEDED)
+
+
+class Diagnostics(unittest.TestCase):
+    def setUp(self):
+        from ag2_sparrow import diagnostics
+        self.d = diagnostics
+
+    def test_describe_is_the_type_errno_and_status_only(self):
+        import io
+        import urllib.error
+        self.assertEqual(self.d.describe(ValueError("SECRET")), "ValueError")
+        self.assertEqual(self.d.describe(FileNotFoundError(2, "SECRET", "/x")), "FileNotFoundError ENOENT")
+        self.assertEqual(self.d.describe(urllib.error.HTTPError("u", 403, "SECRET", {}, io.BytesIO())),
+                         "HTTPError (HTTP 403)")
+        scrubbed = gateway_instance.scrub_exception(TimeoutError("SECRET"), GW + "?k=SECRET")
+        self.assertEqual(self.d.describe(scrubbed), "TimeoutError contacting " + GW)
+
+    def test_safe_status_nets_every_nested_string_and_withholds_objects(self):
+        url = GW + "?token=Se%2fCR"
+        net = lambda text: gateway_instance.redact_text(text, url)  # noqa: E731
+        payload = {"error": "x token=Se%2fCR", "events": {"error": ["ok", "=Se%2FCR"], "n": 3},
+                   "token=Se%2fCR": True, "obj": object(), "t": ("a",), "none": None}
+        out = self.d.safe_status(payload, net)
+        closed = gateway_instance.REDACTED_TEXT
+        self.assertEqual(out, {"error": closed, "events": {"error": ["ok", closed], "n": 3},
+                               closed: True, "obj": self.d.WITHHELD, "t": ["a"], "none": None})
+
+    def test_code_field_admits_only_a_token_absent_from_the_url(self):
+        url = GW + "?token=Se%2fCR%2FeT"
+        for value, want in (("reenroll_disabled", "reenroll_disabled"), ("c0de", "c0de"),
+                            ("Se", None), ("se%2fcr", None), ("Se/CR", None), ("has space", None),
+                            ("x" * 65, None), ({"nested": 1}, None), (None, None), ("token", None)):
+            self.assertEqual(self.d.code_field(value, url), want, value)
 
 
 class RedactUrl(unittest.TestCase):

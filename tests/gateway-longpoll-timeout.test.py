@@ -234,7 +234,7 @@ class AckFirstInTheLoopTest(unittest.TestCase):
                 patch.object(self.gw, "_retire_delivered_marks", new=_retire_delivered_marks), \
                 patch.object(self.gw, "_sweep_held_dir", new=lambda: self.calls.append("swept")):
             loop.run()
-        self.assertIn("_retire_delivered_marks failed (RuntimeError: marks) — continuing", loop.logs)
+        self.assertIn("_retire_delivered_marks failed (RuntimeError) — continuing", loop.logs)
         self.assertEqual(self.calls, ["swept"], "one sweep's failure skipped the next")
         self.assertEqual(len(loop.polls), 1)
 
@@ -260,7 +260,7 @@ class RelayResultsInTheLoopTest(unittest.TestCase):
         with _Loop(self.gw) as loop, \
                 patch.object(self.gw, "_reclaim_parked_relay_results", new=_reclaim_parked_relay_results):
             loop.run()
-        self.assertIn("relay result reclaim failed (RuntimeError: outbox) — continuing", loop.logs)
+        self.assertIn("relay result reclaim failed (RuntimeError) — continuing", loop.logs)
         self.assertEqual(len(loop.polls), 1)
 
     def test_a_relay_result_landing_outside_the_in_flight_set_wakes_the_outbound_worker(self):
@@ -302,7 +302,7 @@ class DroppedConnectionTest(unittest.TestCase):
     def _assert_network_path(self, loop, cls):
         logs = " ".join(loop.logs)
         self.assertEqual(loop.clock.slept, [1], "backs off like any outage")
-        self.assertIn(f"poll network error: {cls}:", logs, "names the exception class")
+        self.assertIn(f"poll network error: {cls}", logs, "names the exception class, never its text")
         self.assertIn("1 consecutive, 1s since last successful poll", logs)
         self.assertNotIn("unexpected", logs, "a dropped connection is not a crash")
         self.assertTrue(any(c is False and "network" in str(k.get("error", ""))
