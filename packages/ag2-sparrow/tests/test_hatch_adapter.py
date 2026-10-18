@@ -23,12 +23,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
-from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
-
-# Before anything below reads the environment: no outer credential selector survives.
-isolate_os_environ()
-
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
@@ -133,8 +127,15 @@ def run_main(main, args, env):
     return types.SimpleNamespace(returncode=rc, stdout=out.getvalue(), stderr=err.getvalue())
 
 
+# The host variables a harness passes on; no other is copied, so no host credential selector leaks in.
+HOST_ALLOWLIST = ("PATH", "LANG", "TMPDIR", "USER")
+
+
 def py_env(home):
-    return hermetic_env(home, PYTHONPATH=str(PKG_ROOT))
+    env = {k: os.environ[k] for k in HOST_ALLOWLIST if k in os.environ}
+    env["HOME"] = str(home)
+    env["PYTHONPATH"] = str(PKG_ROOT)
+    return env
 
 
 class Base(unittest.TestCase):
@@ -2579,7 +2580,7 @@ class StartSparrow(Base):
         unit.parent.mkdir(parents=True)
         unit.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\nExecStart=/x\n")
         spawned = []
-        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
+        with mock.patch.dict(os.environ, py_env(self.home), clear=True), \
                 mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
                 mock.patch.object(keepalive, "_spawn_sparrow",
                                   side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")):
@@ -2675,7 +2676,7 @@ class StartSparrow(Base):
 
             def systemd(cmd, out=out):
                 return subprocess.CompletedProcess(cmd, 0, out, "") if cmd[1:3] == ["--user", "show"] else fake(cmd)
-            with self.subTest(answer=name), mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
+            with self.subTest(answer=name), mock.patch.dict(os.environ, py_env(self.home), clear=True), \
                     mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
                     mock.patch.object(hatch_cli, "_systemd_run", side_effect=systemd):
                 ok, how = keepalive.restart_listener({})

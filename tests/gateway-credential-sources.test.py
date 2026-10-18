@@ -90,6 +90,18 @@ ROWS = [
 ]
 
 
+# The host variables a harness passes on; no other is copied, so no host credential selector leaks in.
+HOST_ALLOWLIST = ("PATH", "LANG", "TMPDIR")
+
+
+def hermetic_env(home: Path, extra=()) -> dict:
+    """An environment built from nothing: the allowlisted host variables, `extra`, and a temp HOME."""
+    env = {k: os.environ[k] for k in HOST_ALLOWLIST if k in os.environ}
+    env.update(extra)
+    env.update(HOME=str(home), USER="hatch")
+    return env
+
+
 def _write_env(path: Path, values: dict) -> None:
     path.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
 
@@ -718,9 +730,7 @@ class RealSinks(unittest.TestCase):
         unit = fx.root / name
         unit.write_text(installed)
         out = io.StringIO()
-        host = owner.CREDENTIAL_KEYS + (owner.TOKEN_FILE_KEY, owner.CHANNEL_DIR_KEY, "AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR")
-        env = {k: v for k, v in os.environ.items() if k not in host}
-        env.update(fx.env, HOME=str(fx.root))
+        env = hermetic_env(fx.root, fx.env)
         vault, lookups = getattr(fx, "vault", ""), getattr(fx, "lookups", None)
         lookups = lookups if isinstance(lookups, list) else []
         with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
@@ -930,8 +940,7 @@ class RealSinks(unittest.TestCase):
         if drop_in:
             (unit.parent / f"{hatch_cli.SERVICE_NAME}.d").mkdir()
             (unit.parent / f"{hatch_cli.SERVICE_NAME}.d" / "override.conf").write_text(drop_in)
-        env = {k: v for k, v in os.environ.items() if k not in owner.CREDENTIAL_KEYS}
-        env.update(fx.env, HOME=str(fx.root), USER="hatch")
+        env = hermetic_env(fx.root, fx.env)
         ok = subprocess.CompletedProcess([], 0, "", "")
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
@@ -978,8 +987,7 @@ class RealSinks(unittest.TestCase):
                 fx = Fixture(Path(td), ROWS[0])  # an env token, and a named token file that is refused
                 self.refuse(fx.token_file, "non-utf8")
                 fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
-                env = {k: v for k, v in os.environ.items() if k not in owner.CREDENTIAL_KEYS}
-                env.update(fx.env, HOME=str(fx.root), USER="hatch")
+                env = hermetic_env(fx.root, fx.env)
                 spawned = []
 
                 def popen(cmd, env=None, **_kw):
@@ -1013,6 +1021,32 @@ class RealSinks(unittest.TestCase):
                 result, stderr = self.bridge(fx, BRIDGE_MAIN, timeout=20)
                 self.assertIn(f"REMOTE_TASK_TOKEN_FILE names {fx.token_file}", result["exited"] or "")
                 self.assertNotIn(ENV_TOKEN, stderr + result["exited"])
+
+    def test_no_harness_reads_a_credential_path_the_outer_environment_names(self):
+        with tempfile.TemporaryDirectory() as outer_td, tempfile.TemporaryDirectory() as td:
+            outer = Path(outer_td)
+            sentinels = (outer / "token", outer / "relay.env", outer / "claude" / "channels" / "sentinel-dir" / ".env")
+            for path in sentinels:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("REMOTE_TASK_TOKEN=synth-outer-sentinel-5698\n")
+            outer_env = {"REMOTE_TASK_TOKEN_FILE": str(sentinels[0]), "AG2_DEVICE_ENV": str(sentinels[1]),
+                         "CLAUDE_CONFIG_DIR": str(outer / "claude"), "REMOTE_TASK_CHANNEL_DIR": "sentinel-dir"}
+            opened, real_read, runs = [], gateway_credential_io.read_file, []
+            real_run = subprocess.run
+            with mock.patch.dict(os.environ, outer_env), \
+                    mock.patch.object(gateway_credential_io, "read_file",
+                                      side_effect=lambda path: opened.append(str(path)) or real_read(path)), \
+                    mock.patch.object(subprocess, "run",
+                                      side_effect=lambda cmd, **kw: runs.append(kw.get("env")) or real_run(cmd, **kw)):
+                root = Path(td)
+                self.hatch_diff(self.bare(root), "[Service]\nExecStart=/x\n")
+                self.install_service(self.bare(root), "[Service]\nExecStart=/x\n")
+                self.bridge(Fixture(root, ROWS[3]))
+            self.assertTrue(opened, "the harnesses reached the readers")
+            for path in sentinels:
+                self.assertNotIn(str(path), opened)
+            for env in runs:
+                self.assertFalse(set(outer_env.values()) & set((env or {}).values()), "the bridge child's env")
 
     def refuse(self, path: Path, how: str) -> None:
         if path.exists():
