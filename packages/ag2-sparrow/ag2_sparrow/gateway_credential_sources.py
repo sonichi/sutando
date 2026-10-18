@@ -101,7 +101,7 @@ def env_files(env: Mapping[str, str], read_text: "Callable[[str], object]") -> E
     """The channel .env files a Sparrow given `env` reads, in order, through the caller's
     `read_text` (see _read_result). An absent file is skipped; a refused one is recorded and
     skipped, a refused AG2_DEVICE_ENV also setting `blocked`, which discover() applies to the
-    credential tiers only: later files still supply config. The bridge and Hatch both call this."""
+    credential tiers only: later files still supply config. The bridge calls this."""
     out, values, refused = EnvFiles(), [], []
     device = env.get("AG2_DEVICE_ENV") or ""
     for path in channel_env_paths(env, channel_dir(env)):
@@ -248,12 +248,6 @@ class Discovery:
     deprecated: "tuple[tuple[str, str], ...]" = ()
     notes: "tuple[str, ...]" = ()
     fatal: str = ""
-
-    @property
-    def withheld(self) -> str:
-        """Why a sink must print no credential-bearing file content, or "": a fatal discovery, or
-        any refused file, whose secrets the registry could not hold."""
-        return "; ".join(x for x in (self.fatal, *self.notes) if x)
 
 
 def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,

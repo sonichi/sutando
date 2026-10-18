@@ -33,7 +33,6 @@ import errno as _errno
 import math
 import os.path
 import re
-import shlex
 import socket
 import threading
 import urllib.parse
@@ -357,7 +356,10 @@ _CREDENTIAL_NAME_RE = re.compile(
     re.IGNORECASE)
 # `KEY=value`, `KEY = value` and `export KEY=value`, as parse_env_text reads them.
 _ASSIGNMENT_LINE_RE = re.compile(r"^(\s*)(export\s+)?([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*)$")
-_ENVIRONMENT_RE = re.compile(r"^(\s*)Environment(\s*=\s*)(.*)$")
+ENVIRONMENT_WITHHELD = "Environment=<withheld>"
+# A directive naming the environment in any letter case, or one holding a backslash (an escape
+# systemd might decode) or a character outside printable ASCII, is in doubt and withheld.
+_ENVIRONMENT_DOUBT_RE = re.compile(r"environment|\\|[^\x20-\x7e]", re.IGNORECASE)
 
 
 def mask_assignment(key: str, value: str, registry: "SecretRegistry | None" = None) -> str:
@@ -375,53 +377,62 @@ def _is_comment(line: str) -> bool:
     return line.lstrip().startswith(("#", ";"))
 
 
-def _continues(line: str) -> bool:
-    """systemd's escape parity: only an odd run of trailing backslashes continues the line."""
-    return (len(line) - len(line.rstrip("\\"))) % 2 == 1
+def sets_environment(line: str) -> bool:
+    """Whether a unit line could set, load, unset or pass the environment (Environment=,
+    EnvironmentFile=, UnsetEnvironment=, PassEnvironment=, in any spelling): its directive, the
+    text before the first `=` with comment markers off, is judged undecoded and in doubt counts."""
+    directive = line.rstrip("\r\n").lstrip().lstrip("#;").partition("=")[0]
+    return bool(_ENVIRONMENT_DOUBT_RE.search(directive))
 
 
-def _logical_lines(text: str) -> "list[tuple[list[str], str, list[str]]]":
-    """Physical lines grouped as systemd reads them, as (lines, joined text, skipped comments): a
-    comment line is skipped before continuation (it neither starts nor ends one), and a line
-    ending in an odd run of backslashes continues."""
-    groups, current, kept, skipped = [], [], [], []
+def _groups(text: str) -> "list[list[str]]":
+    """Physical lines grouped by continuation, never fewer than systemd joins: any trailing
+    backslash continues (comment lines too), and a comment inside a continuation does not end it."""
+    groups, current = [], []
     for line in text.splitlines(True):
         body = line.rstrip("\r\n")
-        if _is_comment(body):
-            if kept:
-                current.append(line)
-                skipped.append(body)
-            else:
-                groups.append(([line], body, []))
-            continue
         current.append(line)
-        kept.append(body)
-        if not _continues(body):
-            groups.append((current, _join(kept), skipped))
-            current, kept, skipped = [], [], []
+        if body.endswith("\\") or (_is_comment(body) and len(current) > 1):
+            continue
+        groups.append(current)
+        current = []
     if current:
-        groups.append((current, _join(kept), skipped))
+        groups.append(current)
     return groups
 
 
-def _join(pieces: "list[str]") -> str:
-    return " ".join(p[:-1] if i < len(pieces) - 1 else p for i, p in enumerate(pieces))
+def _join(group: "list[str]") -> str:
+    kept = [line.rstrip("\r\n") for i, line in enumerate(group) if i == 0 or not _is_comment(line)]
+    return " ".join(p[:-1] if p.endswith("\\") and i < len(kept) - 1 else p for i, p in enumerate(kept))
 
 
-def _mask_logical(body: str, registry: "SecretRegistry | None") -> str:
-    env = _ENVIRONMENT_RE.match(body)
-    if env:
-        indent, sep, rest = env.groups()
-        try:
-            words = shlex.split(rest)
-        except ValueError:
-            return f"{indent}Environment{sep}{WITHHELD}"
-        shown = []
-        for word in words:
-            key, eq, value = word.partition("=")
-            item = f"{key}={mask_assignment(key, value, registry)}" if eq else WITHHELD
-            shown.append(shlex.quote(item) if any(c.isspace() for c in item) else item)
-        return f"{indent}Environment{sep}{' '.join(shown)}"
+def register_assignments(registry: "SecretRegistry", *texts: str) -> None:
+    """Every value the texts assign, registered before any of them is shown: a credential-named
+    key's at any length, and each value on an environment line at BARE_SECRET_MIN, so the same
+    value under a neutral key or on another line is withheld too."""
+    for text in texts:
+        for group in _groups(text):
+            joined = _join(group)
+            if any(sets_environment(line) for line in group):
+                words = re.split(r"[\s\"']+", joined.partition("=")[2])
+            else:
+                m = _ASSIGNMENT_LINE_RE.match(joined)
+                credential = m and _CREDENTIAL_NAME_RE.search(m.group(3))
+                words = [f"{m.group(3)}={parse_env_value(m.group(5))}"] if credential else []
+            for word in words:
+                key, eq, value = word.partition("=")
+                if not eq:
+                    continue
+                min_len = 1 if _CREDENTIAL_NAME_RE.search(key) else BARE_SECRET_MIN
+                registry.register(value, min_len=min_len)
+                try:
+                    registry.register(value.encode("latin-1", "backslashreplace").decode("unicode_escape"),
+                                      min_len=min_len)
+                except (UnicodeError, ValueError):
+                    pass
+
+
+def _mask_line(body: str, registry: "SecretRegistry | None") -> str:
     m = _ASSIGNMENT_LINE_RE.match(body)
     if m:
         indent, export, key, sep, raw = m.groups()
@@ -430,16 +441,20 @@ def _mask_logical(body: str, registry: "SecretRegistry | None") -> str:
 
 
 def mask_env_assignments(text: str, registry: "SecretRegistry | None" = None) -> str:
-    """A unit file, .env or config as it may be shown (an install diff). Continued lines are joined
-    first, as systemd joins them, past any comment line inside the continuation. Every assignment on an `Environment=` line (one or several,
-    quoted or not) and every `KEY=value` line is masked by mask_assignment; any other line is
-    withheld whole when it holds a registered secret. A logical line that changed is shown as one
-    line, so no physical piece of it prints raw."""
+    """A unit file, drop-in, .env or script as it may be shown (an install diff). A continued group
+    with any line that sets_environment prints as ENVIRONMENT_WITHHELD alone: no key, value or
+    path. Any other `KEY=value` is masked by mask_assignment, and any other line holding a
+    registered secret is withheld whole; a changed group prints as one line."""
     out = []
-    for group, joined, skipped in _logical_lines(text):
+    for group in _groups(text):
         end = "\n" if group[-1].endswith("\n") else ""
-        masked = _mask_logical(joined, registry)
-        if masked == joined and all(_mask_logical(c, registry) == c for c in skipped):
+        if any(sets_environment(line) for line in group):
+            out.append(ENVIRONMENT_WITHHELD + end)
+            continue
+        joined = _join(group)
+        masked = _mask_line(joined, registry)
+        comments = [line.rstrip("\r\n") for line in group[1:] if _is_comment(line)]
+        if masked == joined and all(_mask_line(c, registry) == c for c in comments):
             out.append("".join(group))
         else:
             out.append(masked + end)

@@ -2372,6 +2372,41 @@ class StartSparrow(Base):
                          "x y")
 
 
+    # install --no-service: an installed user service stays the one Sparrow; with no unit, install
+    # runs one detached, which checks its own credentials when it starts.
+    def test_no_service_defers_to_an_installed_running_service(self):
+        old = self.old_sparrow()
+        unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
+        unit.parent.mkdir(parents=True)
+        unit.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\nExecStart=/x\n")
+        fake = FakeSystemd(state="active", enabled=True, main_pid=old.pid, ran=True)
+        real_which, stopped, spawned = shutil.which, [], []
+        with mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda name, *a, **k:
+                               "/usr/bin/systemctl" if name == "systemctl" else real_which(name, *a, **k)), \
+                mock.patch.object(hatch_cli, "_systemd_run", side_effect=fake), \
+                mock.patch.object(keepalive, "sparrow_env", return_value={"HOME": "x"}), \
+                mock.patch.object(keepalive, "_stop", side_effect=lambda pid: stopped.append(pid) or True), \
+                mock.patch.object(keepalive, "_spawn_sparrow",
+                                  side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")):
+            r = self.install()
+        self.assertEqual((stopped, spawned), ([], []), r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"skipped: the ag2-sparrow user service (--no-service); {unit} is already "
+                      "installed, so that service runs Sparrow and its environment is the live "
+                      "identity; no detached Sparrow is started beside it\n", r.stdout)
+        self.assertEqual([c for c in fake.calls if c[0] == "--user" and c[1] in
+                          ("start", "restart", "stop", "enable", "daemon-reload")], [])
+        self.assertIsNone(old.poll())
+        self.assertFalse(self.seen.exists())
+
+    def test_no_service_with_no_unit_runs_one_detached_sparrow(self):
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("is already installed", r.stdout)
+        self.assertIn("started: started ", r.stdout)
+        self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
+
+
 HEARTBEAT = """
 import json, sys
 from unittest import mock

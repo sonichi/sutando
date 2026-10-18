@@ -7,8 +7,10 @@ Pins, through the real sinks:
     module-global registry;
   - the discovery owner (src/gateway_credential_sources.py, vendored into ag2-sparrow): SOURCES,
     mixed and conflicting sources, every candidate registered before a winner is chosen;
-  - the real bridge (imported in a child) and the real Hatch install diff, driven by the same
-    table of rows, so both sinks follow one precedence;
+  - the real bridge (imported in a child), driven by the table of rows, and its own startup
+    check, which is what decides for a detached Sparrow Hatch falls back to;
+  - the real Hatch install diff, which withholds every environment line whole and decides nothing
+    about credentials;
   - a structural guard: no other package module reads a credential source, and the vendored and
     generated copies match their canonical sources.
 Hermetic: temp HOME and files, a faked vault, no network, no real credential.
@@ -34,7 +36,7 @@ PKG = REPO / "packages" / "ag2-sparrow"
 sys.path.insert(0, str(PKG))
 sys.path.insert(0, str(REPO / "shared"))
 from ag2_sparrow import gateway_credential_sources as owner, gateway_credentials as contract  # noqa: E402
-from ag2_sparrow.adapters.hatch import cli as hatch_cli  # noqa: E402
+from ag2_sparrow.adapters.hatch import cli as hatch_cli, keepalive as hatch_keepalive  # noqa: E402
 
 
 def _load(name: str, path: Path):
@@ -165,55 +167,54 @@ class PureContractCases:
             self.assertRegex(self.c.describe(e), r"^KeyError\['owner_dm'\] at ")
         self.assertEqual(self.c.describe(FileNotFoundError(2, "SECRET", "/x")), "FileNotFoundError ENOENT")
 
-    def test_install_diff_masking_covers_multi_assignment_and_url_lines(self):
-        registry = self.c.SecretRegistry()
-        registry.register(ENV_TOKEN)
+    def test_every_environment_line_is_withheld_whole(self):
         unit = ("[Service]\n"
                 f'Environment="SAFE=keep-me" "REMOTE_TASK_TOKEN={RETIRED}"\n'
                 f"Environment=REMOTE_TASK_URL={URL_SECRET_URL}\n"
-                f"Environment=OTHER={GW}|{RETIRED}\n"
-                "Environment=AG2_DEVICE_ENV=/home/x/relay.env\n"
-                f"ExecStart=/opt/bin/x --flag {ENV_TOKEN.upper()}\n")
-        shown = self.c.mask_env_assignments(unit, registry)
-        for secret in (RETIRED, ENV_TOKEN, "user-name-1", "pass-word-2", "query-secret-3", "frag-secret-4"):
-            self.assertNotIn(secret.casefold(), shown.casefold(), secret)
-        self.assertIn("SAFE=keep-me", shown)
-        self.assertIn("Environment=REMOTE_TASK_URL=https://gw.example/relay\n", shown)
-        self.assertIn("AG2_DEVICE_ENV=/home/x/relay.env", shown)
-        registry.register("Synth9Tok-en-Q7zZ-live")
-        for continued in ("Environment=REMOTE_TASK_TOKEN=Synth9Tok-\\\nen-Q7zZ-live\n",
-                          "Environment=SAFE=keep-me \\\n  \"REMOTE_TASK_TOKEN=retired-cont-9988\"\n",
-                          "REMOTE_TASK_TOKEN = \"spaced-retired-7766\"\n",
-                          "Environment = \"REMOTE_TASK_TOKEN=spaced-retired-5544\"\n"):
-            shown = self.c.mask_env_assignments(continued, registry)
-            for piece in ("en-Q7zZ-live", "Synth9Tok", "retired-cont-9988", "spaced-retired-7766", "spaced-retired-5544"):
-                self.assertNotIn(piece, shown, continued)
+                "EnvironmentFile=-/home/x/secret-dir-5698/relay.env\n"
+                "UnsetEnvironment=REMOTE_TASK_TOKEN\nPassEnvironment=AG2_REMOTE_TOKEN\n"
+                'Environment = "NOTE=spaced-5544"\n\tenvironment=NOTE=lower-6655\n'
+                "# Environment=NOTE=commented-7766\n"
+                'ExecStart=/opt/bin/x --flag\nREMOTE_TASK_TOKEN = "spaced-retired-7766"\nPLAIN=keep-too\n')
+        shown = self.c.mask_env_assignments(unit)
+        self.assertEqual(shown.splitlines(), ["[Service]"] + [self.c.ENVIRONMENT_WITHHELD] * 8 + [
+            "ExecStart=/opt/bin/x --flag", "REMOTE_TASK_TOKEN = <withheld>", "PLAIN=keep-too"])
+        self.assertEqual(self.c.ENVIRONMENT_WITHHELD, "Environment=<withheld>", "no key, value or path")
 
-    def test_a_comment_inside_a_continuation_does_not_end_it(self):
-        registry = self.c.SecretRegistry()
-        registry.register("comment-held-4410")
-        for unit in ('Environment="REMOTE_TASK_TOKEN=retired-first-9382\\\n# comment\nretired-last-8372"\n',
-                     'Environment="REMOTE_TASK_TOKEN=retired-first-9382\\\n  ; one\n# two \\\nretired-last-8372"\n',
-                     'Environment=SAFE=keep-me \\\n# comment-held-4410\n  OTHER=x\n'):
-            shown = self.c.mask_env_assignments(unit, registry)
-            for piece in ("retired-first-9382", "retired-last-8372", "comment-held-4410"):
-                self.assertNotIn(piece, shown, unit)
-        self.assertEqual(self.c.mask_env_assignments('Environment="REMOTE_TASK_TOKEN=a-1\\\n# c\nb-2"\nExecStart=/x\n'),
-                         "Environment=REMOTE_TASK_TOKEN=<withheld>\nExecStart=/x\n")
+    def test_an_escaped_or_doubtful_directive_is_withheld(self):
+        secret = "synth-hex-key-5698"
+        for line in (f"Environment=REMOTE_TASK_\\x54OKEN={secret}", f"Environment=REMOTE_TASK_\\u0054OKEN={secret}",
+                     f"Environment=REMOTE_TASK_\\124OKEN={secret}", f"\\x45nvironment=NOTE={secret}",
+                     f"\\105nvironment=NOTE={secret}", f"Environ\\u006dent=NOTE={secret}",
+                     f"\\U00000045nvironmentFile=/p/{secret}", f"Unset\\x45nvironment={secret}",
+                     f"REMOTE_TASK_\\x54OKEN={secret}", f"REMOTE_TASK_\\124OKEN={secret}",
+                     f"REMOTE_TASK_\\u0054OKEN={secret}", f"\uff25nvironment=NOTE={secret}"):
+            with self.subTest(line=line):
+                self.assertEqual(self.c.mask_env_assignments(f"[Service]\n{line}\nExecStart=/x\n"),
+                                 f"[Service]\n{self.c.ENVIRONMENT_WITHHELD}\nExecStart=/x\n")
+
+    def test_a_continued_environment_line_is_withheld_with_every_line_it_joins(self):
+        for unit in ('Environment="REMOTE_TASK_TOKEN=first-9382\\\n# comment\ntail-8372"\n',
+                     'Environment="REMOTE_TASK_TOKEN=first-9382\\\n  ; one\n# two \\\ntail-8372"\n',
+                     "Environment=SAFE=first-9382\\\\\ntail-8372\n",
+                     "ExecStart=/x first-9382 \\\nEnvironment=NOTE=tail-8372\n",
+                     "# harmless first-9382 \\\nEnvironment=NOTE=tail-8372\n"):
+            with self.subTest(unit=unit):
+                shown = self.c.mask_env_assignments(unit + "After=y\n")
+                self.assertEqual(shown, f"{self.c.ENVIRONMENT_WITHHELD}\nAfter=y\n")
         self.assertEqual(self.c.mask_env_assignments("# top\nA=b\n"), "# top\nA=b\n",
                          "a comment outside a continuation is its own line")
 
-    def test_continuation_follows_systemd_comment_and_backslash_parity(self):
-        after_comment = "# harmless comment \\\nEnvironment=REMOTE_TASK_TOKEN=synth-after-comment-5698\n"
-        after_even = "Environment=SAFE=C:\\\\\nEnvironment=REMOTE_TASK_TOKEN=synth-after-even-slashes-5698\n"
-        self.assertEqual(self.c.mask_env_assignments(after_comment),
-                         "# harmless comment \\\nEnvironment=REMOTE_TASK_TOKEN=<withheld>\n",
-                         "a top-level comment's backslash starts no continuation")
-        shown = self.c.mask_env_assignments(after_even).splitlines()
-        self.assertEqual((len(shown), shown[1]), (2, "Environment=REMOTE_TASK_TOKEN=<withheld>"),
-                         "an even run of backslashes does not continue")
-        odd = "Environment=SAFE=C:\\\\\\\nREMOTE_TASK_TOKEN=synth-after-odd-slashes-5698\n"
-        self.assertNotIn("synth-after-odd-slashes-5698", self.c.mask_env_assignments(odd), "an odd run continues")
+    def test_a_value_on_an_environment_line_is_withheld_wherever_it_recurs(self):
+        old = ("[Service]\nEnvironment=REMOTE_TASK_TOKEN=tok-dup-5698\nEnvironment=NOTE=neutral-dup-4411\n"
+               "Environment=OTHER=esc\\x2ddup-7722\nExecStart=/x --a tok-dup-5698\n")
+        new = "[Service]\nNOTE2=neutral-dup-4411\nExecStartPre=/bin/echo esc-dup-7722\nExecStart=/x\n"
+        registry = self.c.SecretRegistry()
+        self.c.register_assignments(registry, old, new)
+        shown = self.c.mask_env_assignments(old, registry) + self.c.mask_env_assignments(new, registry)
+        for secret in ("tok-dup-5698", "neutral-dup-4411", "esc-dup-7722", "esc\\x2ddup-7722"):
+            self.assertNotIn(secret, shown, secret)
+        self.assertIn("ExecStart=/x\n", shown, "a line holding no registered value is shown")
 
     def test_edge_paths_never_raise(self):
         registry = self.c.SecretRegistry()
@@ -228,6 +229,7 @@ class PureContractCases:
         self.assertEqual(self.c.mask_env_assignments('Environment="unclosed\n'), "Environment=<withheld>\n")
         self.assertEqual(self.c.mask_env_assignments("Environment=NOEQUALS\n"), "Environment=<withheld>\n")
         self.assertEqual(self.c.mask_env_assignments("free text line\n"), "free text line\n")
+        self.c.register_assignments(self.c.SecretRegistry(), "Environment=NOTE=bad-escape\\x\n", "X_TOKEN=\\u12\n")
         import urllib.error
         import io as _io
         err = urllib.error.URLError(ConnectionRefusedError(61, "x"))
@@ -301,7 +303,7 @@ class DiscoveryCases:
         self.assertEqual((found.token, found.token_source), (ENV_TOKEN, "env"))
         for secret in ("current-file-9821", "legacy-file-7364", "overwritten-file-5530", "legacy-p-6612"):
             self.assertTrue(registry.contains(secret), secret)
-            self.assertNotIn(secret, self.o.contract.mask_env_assignments(f"Environment=NOTE={secret}\n", registry))
+            self.assertNotIn(secret, self.o.contract.mask_env_assignments(f"NOTE={secret}\n", registry))
 
     def test_every_assignment_of_a_repeated_key_in_a_channel_file_is_registered(self):
         text = {"/dev": "REMOTE_TASK_TOKEN=early-dup-1111\nREMOTE_TASK_URL=https://gw.example/r\n"
@@ -435,11 +437,17 @@ print(json.dumps({"token": m.TOKEN, "source": m._FOUND.token_source, "url": m.UR
 """
 
 
+# The bridge's own startup check: main() exits FATAL before it polls or publishes anything.
+BRIDGE_MAIN = BRIDGE.replace("print(json.dumps({", "try:\n    m.main()\n    exited = None\n"
+                             "except SystemExit as e:\n    exited = str(e.code)\n"
+                             'print(json.dumps({"exited": exited, ')
+
+
 class RealSinks(unittest.TestCase):
     """The same rows through the real bridge and the real Hatch install diff."""
 
     def setUp(self):
-        # No reachable user manager unless a case supplies one: Hatch then reads the installer's env.
+        # No case reaches the host's systemctl unless it supplies a fake.
         patcher = mock.patch.object(hatch_cli, "_systemd_run", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -501,9 +509,7 @@ class RealSinks(unittest.TestCase):
                              "the import survives it and a rotation read is no rotation, never an exception")
 
     def test_a_refused_named_token_file_is_fatal_at_startup(self):
-        script = BRIDGE.replace("print(json.dumps({", "try:\n    m.main()\n    exited = None\n"
-                                "except SystemExit as e:\n    exited = str(e.code)\n"
-                                'print(json.dumps({"exited": exited, ')
+        script = BRIDGE_MAIN
         for how, reason in (("oversize", "over 1048576 bytes"), ("non-utf8", "not UTF-8"),
                             ("fifo", "not a regular file")):
             with self.subTest(how=how), tempfile.TemporaryDirectory() as td:
@@ -535,35 +541,6 @@ class RealSinks(unittest.TestCase):
             self.assertIn(f"credential file {fx.token_file} was refused (not UTF-8)", reload_err)
             self.assertNotIn(FILE_TOKEN, reload_err, "path and reason, never content")
 
-    def test_the_hatch_install_diff_withholds_every_candidate_of_every_row(self):
-        for row in ROWS:
-            with self.subTest(row=row[0]), tempfile.TemporaryDirectory() as td:
-                fx = Fixture(Path(td), row)
-                unit = fx.root / "ag2-sparrow.service"
-                body = "".join(f"Environment=X{i}={c}\n" for i, c in enumerate(fx.candidates))
-                unit.write_text(f'[Service]\nEnvironment="SAFE=keep-me" "REMOTE_TASK_TOKEN={RETIRED}"\n'
-                                f"Environment=REMOTE_TASK_URL={URL_SECRET_URL}\n{body}ExecStart=/x\n")
-                out = io.StringIO()
-                env = {k: v for k, v in os.environ.items() if k not in owner.CREDENTIAL_KEYS}
-                env.update(fx.env, HOME=str(fx.root))
-                with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
-                        contextlib.redirect_stderr(io.StringIO()):
-                    hatch_cli._install_file(unit, "[Service]\nExecStart=/y\n", 0o644, refuse_drift=True, force=False)
-                with mock.patch.dict(os.environ, env, clear=True):
-                    found, _registry = hatch_cli._credential_discovery()
-                want = fx.expected()
-                if want["source"] == "vault":
-                    want = {"token": "", "source": "none", "url": GW, "token_file": ""}  # Hatch reads no vault
-                self.assertEqual({"token": found.token, "source": found.token_source, "url": found.url,
-                                  "token_file": found.token_file}, want, "Hatch resolves the bridge's row")
-                shown = out.getvalue()
-                self.assertIn("DIFF:", shown)
-                self.assertIn("SAFE=keep-me", shown)
-                # The vault is not a Hatch source; every other candidate, winner or not, is withheld.
-                for secret in [c for c in fx.candidates if c != fx.vault] + [RETIRED, "pass-word-2", "query-secret-3"]:
-                    self.assertNotIn(secret.casefold(), shown.casefold(), secret)
-
-
     def hatch_diff(self, fx, installed: str) -> str:
         unit = fx.root / "ag2-sparrow.service"
         unit.write_text(installed)
@@ -576,6 +553,18 @@ class RealSinks(unittest.TestCase):
         self.assertIn("DIFF:", out.getvalue())
         return out.getvalue()
 
+    def test_the_hatch_install_diff_withholds_every_candidate_of_every_row(self):
+        for row in ROWS:
+            with self.subTest(row=row[0]), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), row)
+                body = "".join(f"Environment=X{i}={c}\n" for i, c in enumerate(fx.candidates))
+                shown = self.hatch_diff(fx, f'[Service]\nEnvironment="SAFE=keep-me" "REMOTE_TASK_TOKEN={RETIRED}"\n'
+                                            f"Environment=REMOTE_TASK_URL={URL_SECRET_URL}\n{body}"
+                                            f"ExecStart=/x --a {fx.candidates[0]}\n")
+                for secret in fx.candidates + [RETIRED, "pass-word-2", "query-secret-3", "keep-me"]:
+                    self.assertNotIn(secret.casefold(), shown.casefold(), secret)
+                self.assertIn("-Environment=<withheld>\n", shown)
+
     def test_the_hatch_install_diff_masks_past_a_comment_in_a_continuation(self):
         with tempfile.TemporaryDirectory() as td:
             fx = Fixture(Path(td), ROWS[0])
@@ -583,17 +572,7 @@ class RealSinks(unittest.TestCase):
                                         '# comment\nretired-last-8372"\nExecStart=/x\n')
             self.assertNotIn("retired-first-9382", shown)
             self.assertNotIn("retired-last-8372", shown)
-            self.assertIn("Environment=REMOTE_TASK_TOKEN=<withheld>", shown)
-
-    def test_the_hatch_install_diff_withholds_a_losing_token_file_alias(self):
-        with tempfile.TemporaryDirectory() as td:
-            fx = Fixture(Path(td), ROWS[0])
-            fx.token_file.write_text("REMOTE_TASK_TOKEN=current-file-9821\nAG2_REMOTE_TOKEN=legacy-file-7364\n")
-            fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
-            shown = self.hatch_diff(fx, "[Service]\nEnvironment=NOTE=legacy-file-7364\n"
-                                        "Environment=OTHER=current-file-9821\nExecStart=/x\n")
-            self.assertNotIn("legacy-file-7364", shown)
-            self.assertNotIn("current-file-9821", shown)
+            self.assertIn("-Environment=<withheld>\n", shown)
 
     def test_the_hatch_install_diff_follows_systemd_continuations(self):
         with tempfile.TemporaryDirectory() as td:
@@ -605,61 +584,111 @@ class RealSinks(unittest.TestCase):
             self.assertNotIn("synth-after-comment-5698", shown)
             self.assertNotIn("synth-after-even-slashes-5698", shown)
 
-    def test_the_hatch_install_diff_is_withheld_when_a_credential_file_was_refused(self):
-        for which in ("channel", "token file"):
-            with self.subTest(file=which), tempfile.TemporaryDirectory() as td:
-                fx = Fixture(Path(td), ROWS[1])
-                fx.device.unlink()
-                path = fx.channel if which == "channel" else fx.token_file
-                if which == "token file":
-                    fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
-                self.refuse(path, "oversize")  # holds DEVICE_TOKEN, never read
-                shown = self.hatch_diff(fx, f"[Service]\nEnvironment=NOTE={DEVICE_TOKEN}\nExecStart=/x\n")
-                self.assertNotIn(DEVICE_TOKEN, shown)
-                self.assertIn("diff withheld: ", shown)
-                self.assertIn(f"credential file {path} was refused (over 1048576 bytes)", shown)
-
-    @contextlib.contextmanager
-    def manager(self, manager_env):
-        """A reachable systemd user manager whose show-environment prints `manager_env`."""
-        shown = "".join(f"{k}={v}\n" for k, v in manager_env.items())
-        done = subprocess.CompletedProcess([], 0, stdout=shown, stderr="")
-        with mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
-                mock.patch.object(hatch_cli, "_systemd_run", return_value=done):
-            yield
-
-    def test_hatch_reads_the_service_managers_environment_not_the_installers(self):
+    def test_the_hatch_install_diff_withholds_escaped_directive_spellings(self):
+        secret = "synth-hex-key-5698"
         with tempfile.TemporaryDirectory() as td:
-            fx = Fixture(Path(td), ROWS[1])
-            fx.device.unlink()  # only the channel .env under CLAUDE_CONFIG_DIR carries a token
-            config = fx.env.pop("CLAUDE_CONFIG_DIR")
-            env = {k: v for k, v in os.environ.items() if k not in owner.CREDENTIAL_KEYS + ("CLAUDE_CONFIG_DIR",)}
-            env.update(fx.env, HOME=str(fx.root))
-            for name, installer, manager, source in (
-                    ("manager only", {}, {"CLAUDE_CONFIG_DIR": config}, "file"),
-                    ("installer only", {"CLAUDE_CONFIG_DIR": config}, {"PATH": "/usr/bin"}, "none")):
-                with self.subTest(name), mock.patch.dict(os.environ, dict(env, **installer), clear=True), \
-                        self.manager(manager):
-                    found, registry = hatch_cli._credential_discovery()
-                    self.assertEqual(found.token_source, source, "the unit runs with the manager's environment")
-                    self.assertTrue(registry.contains(f"x {CHANNEL_TOKEN} y"), "either side's candidate is masked")
-                    unit = fx.root / "ag2-sparrow.service"
-                    unit.write_text(f"[Service]\nEnvironment=NOTE={CHANNEL_TOKEN}\nExecStart=/x\n")
-                    out = io.StringIO()
-                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-                        hatch_cli._install_file(unit, "[Service]\nExecStart=/y\n", 0o644, refuse_drift=True, force=False)
-                    self.assertIn("DIFF:", out.getvalue())
-                    self.assertNotIn(CHANNEL_TOKEN, out.getvalue())
+            fx = Fixture(Path(td), ROWS[0])
+            shown = self.hatch_diff(fx, "[Service]\n" + "".join(f"{line}\n" for line in (
+                f"Environment=REMOTE_TASK_\\x54OKEN={secret}", f"Environment=REMOTE_TASK_\\u0054OKEN={secret}",
+                f"Environment=REMOTE_TASK_\\124OKEN={secret}", f"\\x45nvironment=NOTE={secret}",
+                f"\\105nvironmentFile=/p/{secret}", f"Environ\\u006dent=NOTE={secret}",
+                f"REMOTE_TASK_\\x54OKEN={secret}", f"REMOTE_TASK_\\124OKEN={secret}"))
+                + "ExecStart=/x\n")
+            self.assertNotIn(secret, shown)
+            self.assertNotIn("x54", shown)
+            self.assertEqual(shown.count("-Environment=<withheld>\n"), 8)
 
-    def test_a_manager_environment_value_is_unescaped(self):
-        with self.manager({"CLAUDE_CONFIG_DIR": "$'/tmp/a\\tb'", "PLAIN": "x=y"}), \
-                mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": "/dev-env"}, clear=True):
-            self.assertEqual(hatch_cli._service_env(),
-                             {"CLAUDE_CONFIG_DIR": "/tmp/a\tb", "PLAIN": "x=y", "AG2_DEVICE_ENV": "/dev-env"})
-        with mock.patch.object(hatch_cli.shutil, "which", return_value=None), \
-                mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": "/dev-env", "K": "v"}, clear=True):
-            self.assertEqual(hatch_cli._service_env(), {"AG2_DEVICE_ENV": "/dev-env", "K": "v"},
-                             "no reachable manager: the installer's own environment")
+    def install_service(self, fx, installed: str, drop_in: str = "") -> str:
+        """install_service over `installed` (and a drop-in beside it), with a reachable fake systemd."""
+        unit = fx.root / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text(installed)
+        if drop_in:
+            (unit.parent / f"{hatch_cli.SERVICE_NAME}.d").mkdir()
+            (unit.parent / f"{hatch_cli.SERVICE_NAME}.d" / "override.conf").write_text(drop_in)
+        env = {k: v for k, v in os.environ.items() if k not in owner.CREDENTIAL_KEYS}
+        env.update(fx.env, HOME=str(fx.root), USER="hatch")
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err), \
+                mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
+                mock.patch.object(hatch_cli, "_systemd_run", return_value=ok), \
+                mock.patch.object(hatch_cli, "_find_console_script", return_value="/opt/bin/ag2-sparrow"):
+            hatch_cli.install_service(fx.root / "t", fx.root / "r", fx.root / "s", "", False)
+        return out.getvalue() + err.getvalue()
+
+    def test_an_owned_or_retained_unit_prints_no_environment_content(self):
+        lines = ("Environment=REMOTE_TASK_TOKEN=synth-per-unit-duplicate-5698\n"
+                 "Environment=NOTE=synth-per-unit-duplicate-5698\n"
+                 "EnvironmentFile=/home/x/secret-dir-5698/relay.env\n"
+                 "UnsetEnvironment=AG2_REMOTE_TOKEN\nPassEnvironment=REMOTE_TASK_URL\n"
+                 "ExecStartPre=/bin/true synth-per-unit-duplicate-5698\nExecStart=/x\n")
+        for kind, head in (("owned", hatch_cli.SERVICE_MARKER + "\n"), ("retained", "")):
+            with self.subTest(kind), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), ROWS[0])
+                shown = self.install_service(fx, f"{head}[Service]\n{lines}")
+                self.assertEqual("DIFF:" in shown, kind == "retained", shown)
+                for secret in ("synth-per-unit-duplicate-5698", "secret-dir-5698", "AG2_REMOTE_TOKEN",
+                               "REMOTE_TASK_URL", str(fx.root / "t")):
+                    self.assertNotIn(secret, shown, secret)
+                if kind == "retained":
+                    self.assertEqual(shown.count("Environment=<withheld>\n"), 5, "a line per old one, in context")
+                    self.assertIn("+Description=ag2-sparrow (AG2 Space listener)\n", shown, "the rest is shown")
+
+    def test_a_drop_in_is_never_read_and_its_lines_would_be_withheld(self):
+        drop_in = ("[Service]\nEnvironment=REMOTE_TASK_TOKEN=synth-drop-in-5698\n"
+                   "EnvironmentFile=/home/x/drop-in-dir-5698/relay.env\n")
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), ROWS[0])
+            shown = self.install_service(fx, "[Service]\nEnvironment=NOTE=synth-drop-in-5698\nExecStart=/x\n",
+                                         drop_in)
+            self.assertIn("DIFF:", shown)
+            for secret in ("synth-drop-in-5698", "drop-in-dir-5698"):
+                self.assertNotIn(secret, shown, secret)
+            self.assertNotIn("drop-in", hatch_cli._diff(drop_in, "", fx.root / "override.conf").split("\n", 2)[2])
+
+    def test_after_a_failed_service_install_the_detached_bridge_checks_its_own_environment(self):
+        for route in ("service install failed", "--no-service, no unit"):
+            with self.subTest(route=route), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), ROWS[0])  # an env token, and a named token file that is refused
+                self.refuse(fx.token_file, "non-utf8")
+                fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
+                env = {k: v for k, v in os.environ.items() if k not in owner.CREDENTIAL_KEYS}
+                env.update(fx.env, HOME=str(fx.root), USER="hatch")
+                spawned = []
+
+                def popen(cmd, env=None, **_kw):
+                    spawned.append(env)
+                    return mock.Mock(pid=4242, wait=mock.Mock(return_value=1))
+                args = mock.Mock(mxid="@a:ag2.space", gateway_instance="", no_service=route.startswith("--"),
+                                 no_keepalive=True, no_start=False, force=False,
+                                 task_dir=str(fx.root / "task dir"), result_dir=str(fx.root / "r"),
+                                 state_dir=str(fx.root / "s"), activity_file=str(fx.root / "act"),
+                                 cron_dir=None, keepalive_log=None)
+                ok = subprocess.CompletedProcess([], 0, "", "")
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(err), \
+                        mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
+                        mock.patch.object(hatch_cli, "_systemd_run", return_value=ok), \
+                        mock.patch.object(hatch_cli, "find_reply_command", return_value="/r"), \
+                        mock.patch.object(hatch_cli, "reply_command_problem", return_value=""), \
+                        mock.patch.object(hatch_cli, "install_hook", return_value=True), \
+                        mock.patch.object(hatch_cli, "_find_console_script", return_value="/opt/bin/ag2-sparrow"), \
+                        mock.patch.object(hatch_keepalive.subprocess, "Popen", side_effect=popen):
+                    hatch_cli.install(args)
+                said = out.getvalue() + err.getvalue()
+                self.assertEqual(len(spawned), 1, said)
+                if not args.no_service:
+                    self.assertIn("no service was set up", said)
+                self.assertNotIn("REFUSED", said, "Hatch decides nothing about a process it does not run")
+                self.assertNotIn(str(fx.token_file), said)
+                keys = owner.CREDENTIAL_KEYS + (owner.TOKEN_FILE_KEY, "AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR")
+                fx.env = {k: v for k, v in spawned[0].items() if k in keys}
+                result, stderr = self.bridge(fx, BRIDGE_MAIN, timeout=20)
+                self.assertIn(f"REMOTE_TASK_TOKEN_FILE names {fx.token_file}", result["exited"] or "")
+                self.assertNotIn(ENV_TOKEN, stderr + result["exited"])
 
     def refuse(self, path: Path, how: str) -> None:
         if path.exists():
@@ -676,9 +705,7 @@ class RealSinks(unittest.TestCase):
     def test_a_refused_named_device_file_fails_closed(self):
         reasons = {"fifo": "not a regular file", "oversize": "over 1048576 bytes",
                    "non-utf8": "not UTF-8", "directory": "not a regular file"}
-        script = BRIDGE.replace("print(json.dumps({", "try:\n    m.main()\n    exited = None\n"
-                                "except SystemExit as e:\n    exited = str(e.code)\n"
-                                'print(json.dumps({"exited": exited, ')
+        script = BRIDGE_MAIN
         for how, reason in reasons.items():
             with self.subTest(how=how), tempfile.TemporaryDirectory() as td:
                 fx = Fixture(Path(td), ROWS[1])  # the device file would win over the channel file
@@ -702,7 +729,7 @@ class RealSinks(unittest.TestCase):
             self.assertIn(f"credential file {fx.channel} was refused (over 1048576 bytes)", err)
             self.assertNotIn(DEVICE_TOKEN, err)
 
-    def test_the_hatch_install_diff_withholds_a_repeated_key_in_a_channel_file(self):
+    def test_every_assignment_of_a_repeated_key_is_registered_by_the_bridge(self):
         for which in ("device", "channel"):
             with self.subTest(file=which), tempfile.TemporaryDirectory() as td:
                 fx = Fixture(Path(td), ROWS[1])
@@ -711,38 +738,10 @@ class RealSinks(unittest.TestCase):
                     fx.device.unlink()
                 path.write_text(f"REMOTE_TASK_TOKEN=early-dup-token-1111\nREMOTE_TASK_URL={GW}\n"
                                 "REMOTE_TASK_TOKEN=late-dup-token-2222\n")
-                shown = self.hatch_diff(fx, "[Service]\nEnvironment=NOTE=early-dup-token-1111\n"
-                                            "Environment=NOTE2=late-dup-token-2222\nExecStart=/x\n")
-                self.assertNotIn("early-dup-token-1111", shown)
-                self.assertNotIn("late-dup-token-2222", shown)
                 fx.candidates = ["early-dup-token-1111", "late-dup-token-2222"]
                 out, _err = self.bridge(fx)
                 self.assertEqual(out["token"], "late-dup-token-2222", "the last assignment still wins")
                 self.assertEqual(out["registered"], {c: True for c in fx.candidates})
-
-    def test_the_hatch_install_refuses_a_refused_device_file(self):
-        for how in ("oversize", "fifo"):
-            with self.subTest(how=how), tempfile.TemporaryDirectory() as td:
-                fx = Fixture(Path(td), ROWS[1])
-                self.refuse(fx.device, how)
-                env = {k: v for k, v in os.environ.items() if k not in owner.CREDENTIAL_KEYS}
-                env.update(fx.env, HOME=str(fx.root))
-                unit = fx.root / "ag2-sparrow.service"
-                unit.write_text(f"[Service]\nEnvironment=NOTE={DEVICE_TOKEN}\nExecStart=/x\n")
-                args = mock.Mock(mxid="@a:ag2.space", gateway_instance="")
-                out, err = io.StringIO(), io.StringIO()
-                with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
-                        contextlib.redirect_stderr(err), \
-                        mock.patch.object(hatch_cli, "find_reply_command", return_value="/r"), \
-                        mock.patch.object(hatch_cli, "reply_command_problem", return_value=""), \
-                        mock.patch.object(hatch_cli, "install_hook", side_effect=AssertionError("installed")):
-                    rc = hatch_cli.install(args)
-                    hatch_cli._install_file(unit, "[Service]\nExecStart=/y\n", 0o644, refuse_drift=True, force=False)
-                self.assertEqual(rc, 1)
-                self.assertIn(f"NOTE credentials: credential file {fx.device} was refused", out.getvalue())
-                self.assertIn(f"REFUSED: AG2_DEVICE_ENV names {fx.device}", err.getvalue())
-                self.assertIn("diff withheld", out.getvalue())
-                self.assertNotIn(DEVICE_TOKEN, out.getvalue() + err.getvalue())
 
     def test_a_fifo_credential_path_never_hangs_the_bridge_import(self):
         for where in ("REMOTE_TASK_TOKEN_FILE", "AG2_DEVICE_ENV"):
@@ -799,8 +798,11 @@ READS = {"open", "read_text", "read_bytes", "readlines"}
 # Owner calls whose callable arguments read credentials: (positional index, keyword names).
 OWNER_READERS = {"env_files": (1, ("read_text",)), "discover": (None, ("read_token_file", "vault_lookup"))}
 # Where credential I/O may happen: the adapters' edge, as (module, function).
+# Hatch's systemd reachability probe discards what show-environment prints.
 IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_bridge.py", "_read_text"),
-              ("remote_gateway_bridge.py", "_vault_lookup"), ("adapters/hatch/cli.py", "_read_text")}
+              ("remote_gateway_bridge.py", "_vault_lookup"), ("adapters/hatch/cli.py", "systemd_user_available")}
+# A command whose output is a credential store: the Keychain, or the systemd user manager's environment.
+STORE_READS = ("security", "find-generic-password", "show-environment")
 
 
 def _constant(node):
@@ -882,7 +884,7 @@ def credential_access(source: str, rel: str) -> "list[str]":
                     tainted |= {t.id for t in ast.walk(n.optional_vars) if isinstance(t, ast.Name)}
         reads = any(isinstance(n, ast.Call) and (getattr(n.func, "id", None) in READS or getattr(n.func, "attr", None) in READS)
                     and marked(n, tainted) for n in inner)
-        store = any(isinstance(n, ast.Constant) and n.value in ("security", "find-generic-password") for n in inner) or \
+        store = any(isinstance(n, ast.Constant) and n.value in STORE_READS for n in inner) or \
             any(isinstance(n, (ast.Import, ast.ImportFrom)) and "channel_token" in ast.unparse(n) for n in inner)
         if (reads or store) and (rel, name) not in IO_ALLOWED:
             out.append(f"{rel}:{name} credential I/O outside the adapters' edge")
@@ -935,6 +937,8 @@ class Guard(unittest.TestCase):
             'env_files(env, read_text=lambda p: open(p).read())',
             'discover(env, files, read_token_file=lambda p, open=open, read=None: open(p).read())',
             'discover(env, files, read_token_file=lambda p, r=_read_anything: r(p))',
+            'def f():\n    subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True)',
+            'def _manager_env():\n    return _systemd_run(["systemctl", "--user", "show-environment"]).stdout',
         ]
         for source in bypasses:
             self.assertTrue(credential_access(source, "probe.py"), source)
@@ -942,7 +946,7 @@ class Guard(unittest.TestCase):
                    'files = env_files(env, read_text=_read_text)\n'
                    'discover(env, files, read_token_file=lambda p: _read_text(p) or "")\n'
                    'discover(env, files, vault_lookup=lambda k: (_read_text() or (lambda _k: ""))(k))\n')
-        self.assertEqual(credential_access(allowed, "adapters/hatch/cli.py"), [])
+        self.assertEqual(credential_access(allowed, "remote_gateway_bridge.py"), [])
         self.assertEqual(credential_access('"""Put REMOTE_TASK_TOKEN in the .env file."""\nx = 1\n', "probe.py"), [],
                          "a docstring naming a key is prose, not a read")
 
