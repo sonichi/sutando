@@ -29,7 +29,7 @@ from importlib import resources
 from pathlib import Path
 
 from ... import _dirs, gateway_credential_sources, gateway_credentials, gateway_instance, outbox, workspace_lock
-from ...bounded_file_read import read_regular_text
+from ...bounded_file_read import read_regular
 from ...result_markers import parse_markers
 from .task_fields import item_id, valid_mxid
 
@@ -133,8 +133,8 @@ def _record_script(sha: str) -> None:
 
 
 def _read_text(path):
-    """A credential file's text, or None when it cannot be read (bounded_file_read)."""
-    return read_regular_text(path)
+    """A credential file's (text, refusal reason): bounded_file_read.read_regular."""
+    return read_regular(path)
 
 
 def _credential_discovery():
@@ -145,14 +145,27 @@ def _credential_discovery():
     env = dict(os.environ, AG2_DEVICE_ENV=str(device_env_path()))
     found = gateway_credential_sources.discover(
         env, gateway_credential_sources.env_files(env, _read_text),
-        read_token_file=lambda p: _read_text(p) or "", registry=registry)
+        read_token_file=_read_text, registry=registry)
     return found, registry
+
+
+def credentials_usable() -> bool:
+    """Print a NOTE per refused credential file; False when the discovery is fatal, so the
+    install stops rather than set up a Sparrow that would fall back to another token."""
+    found, _registry = _credential_discovery()
+    for note in found.notes:
+        print(f"NOTE credentials: {note}")
+    if found.fatal:
+        print(f"REFUSED: {found.fatal}", file=sys.stderr)
+    return not found.fatal
 
 
 def _diff(old: str, new: str, path: Path) -> str:
     """The diff of an installed file against ours, with every credential withheld: a unit or .env
     on disk may hold a live, rotated or retired token (gateway_credentials.mask_env_assignments)."""
-    _found, registry = _credential_discovery()
+    found, registry = _credential_discovery()
+    if found.fatal:  # an unread device file's tokens cannot be withheld, so show no lines at all
+        return f"(diff withheld: {found.fatal})\n"
     old, new = (gateway_credentials.mask_env_assignments(t, registry) for t in (old, new))
     return "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
                                         f"{path} (installed)", f"{path} (ag2-sparrow)"))
@@ -639,6 +652,8 @@ def install(args) -> int:
         print(f"error: GATEWAY_INSTANCE {instance!r} must match {INSTANCE_RE.pattern}",
               file=sys.stderr)
         return 2
+    if not credentials_usable():
+        return 1
     task_dir = Path(args.task_dir) if args.task_dir else _dirs.task_dir()
     result_dir = Path(args.result_dir) if args.result_dir else _dirs.result_dir()
     state_dir = Path(args.state_dir) if args.state_dir else _dirs.state_dir()

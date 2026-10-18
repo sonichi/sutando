@@ -305,7 +305,7 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import agent_identity, gateway_credential_sources, gateway_credentials, gateway_instance, local_task_protocol
-from .bounded_file_read import read_regular_text
+from .bounded_file_read import read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
@@ -506,9 +506,8 @@ CHANNEL_DIR = gateway_credential_sources.channel_dir(os.environ)
 
 
 def _read_env_file(path: str):
-    """A channel .env file's text, or None when it cannot be read (missing, not a regular file,
-    oversized or not UTF-8)."""
-    return read_regular_text(path)
+    """A credential file's (text, refusal reason): bounded_file_read.read_regular."""
+    return read_regular(path)
 
 
 def _channel_env_candidates():
@@ -1833,8 +1832,10 @@ def _read_text(path: str) -> str:
 _SECRETS = gateway_credentials.SecretRegistry()
 # The vault is located only if no earlier source holds a token.
 _FOUND = gateway_credential_sources.discover(
-    os.environ, _channel_env_candidates(), read_token_file=_read_text,
+    os.environ, _channel_env_candidates(), read_token_file=_read_env_file,
     vault_lookup=lambda key: (_vault_lookup() or (lambda _k: ""))(key), registry=_SECRETS)
+for _note in _FOUND.notes + ((_FOUND.fatal,) if _FOUND.fatal else ()):
+    print(f"[remote-gateway-bridge] {_note}", file=sys.stderr, flush=True)
 for _old, _new in _FOUND.deprecated:
     if _old not in _warned_legacy:
         _warned_legacy.add(_old)
@@ -7518,6 +7519,8 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
 
 
 def main() -> None:
+    if _FOUND.fatal:
+        sys.exit(f"FATAL: {_FOUND.fatal}")
     if not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
     if not URL:

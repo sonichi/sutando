@@ -291,6 +291,50 @@ class DiscoveryCases:
             self.assertTrue(registry.contains(secret), secret)
             self.assertNotIn(secret, self.o.contract.mask_env_assignments(f"Environment=NOTE={secret}\n", registry))
 
+    def test_every_assignment_of_a_repeated_key_in_a_channel_file_is_registered(self):
+        text = {"/dev": "REMOTE_TASK_TOKEN=early-dup-1111\nREMOTE_TASK_URL=https://gw.example/r\n"
+                        "REMOTE_TASK_TOKEN=late-dup-2222\n",
+                "/chan": "export AG2_REMOTE_TOKEN=exported-dup-3333\nREMOTE_TASK_TOKEN=chan-early-4444\n"
+                         "REMOTE_TASK_TOKEN=chan-late-5555\n"}
+        env = {"AG2_DEVICE_ENV": "/dev", "CLAUDE_CONFIG_DIR": "/c"}
+        files = self.o.env_files(env, lambda p: text.get(p) or text["/chan"])
+        registry = self.o.contract.SecretRegistry()
+        found = self.o.discover(env, files, registry=registry)
+        self.assertEqual((found.token, found.token_source), ("late-dup-2222", "file"), "the last assignment still wins")
+        for secret in ("early-dup-1111", "late-dup-2222", "exported-dup-3333", "chan-early-4444", "chan-late-5555"):
+            self.assertTrue(registry.contains(secret), secret)
+
+    def test_a_refused_named_device_file_stops_the_file_and_vault_tiers(self):
+        env = {"AG2_DEVICE_ENV": "/dev", "CLAUDE_CONFIG_DIR": "/c"}
+        reads = {"/dev": (None, "over 1048576 bytes")}
+        files = self.o.env_files(env, lambda p: reads.get(p, (f"REMOTE_TASK_TOKEN={CHANNEL_TOKEN}\n", "")))
+        self.assertEqual((list(files), files.refused), ([], (("/dev", "over 1048576 bytes"),)),
+                         "the channel file after a refused device file is not read")
+        found = self.o.discover(dict(env, REMOTE_TASK_URL=GW), files, vault_lookup=lambda k: VAULT_TOKEN)
+        self.assertEqual((found.token, found.token_source), ("", "none"))
+        self.assertIn("/dev", found.fatal)
+        self.assertIn("over 1048576 bytes", found.fatal)
+        self.assertEqual(found.notes, (self.o.refusal_note("/dev", "over 1048576 bytes"),))
+        with_env = self.o.discover(dict(env, REMOTE_TASK_TOKEN=ENV_TOKEN), files)
+        self.assertEqual((with_env.token_source, bool(with_env.fatal)), ("env", True),
+                         "the env tier is still read, and the adapter still refuses")
+
+    def test_a_refused_default_channel_file_is_named_and_skipped(self):
+        env = {"CLAUDE_CONFIG_DIR": "/c"}
+        files = self.o.env_files(env, lambda p: (None, "not a regular file"))
+        found = self.o.discover(env, files, vault_lookup=lambda k: VAULT_TOKEN if k == "REMOTE_TASK_TOKEN" else "")
+        self.assertEqual((found.token_source, found.fatal), ("vault", ""), "documented: the next tier, with a note")
+        self.assertEqual(len(found.notes), 1)
+        self.assertIn("not a regular file", found.notes[0])
+        absent = self.o.discover(env, self.o.env_files(env, lambda p: None))
+        self.assertEqual((absent.notes, absent.fatal), ((), ""), "an absent file is not a refusal")
+
+    def test_a_refused_token_file_is_named(self):
+        found = self.o.discover({"REMOTE_TASK_TOKEN": ENV_TOKEN, "REMOTE_TASK_TOKEN_FILE": "/t"},
+                                read_token_file=lambda p: (None, "not UTF-8"))
+        self.assertEqual((found.token_source, found.fatal), ("env", ""))
+        self.assertEqual(found.notes, (self.o.refusal_note("/t", "not UTF-8"),))
+
     def test_a_url_shaped_bearer_is_registered_whole(self):
         registry = self.o.contract.SecretRegistry()
         self.o.register(registry, [URL_SHAPED_BEARER])
@@ -403,11 +447,10 @@ class RealSinks(unittest.TestCase):
                 if row[1].get("AG2_REMOTE_TOKEN"):
                     self.assertIn("AG2_REMOTE_TOKEN is deprecated", err)
 
-    def test_an_unreadable_file_is_skipped_and_the_media_marker_is_carried(self):
+    def test_a_missing_device_file_is_skipped_and_the_media_marker_is_carried(self):
         with tempfile.TemporaryDirectory() as td:
             fx = Fixture(Path(td), ROWS[2])
-            fx.device.unlink()
-            fx.device.mkdir()  # unreadable as a file: the next candidate supplies the token
+            fx.device.unlink()  # absent, not refused: the next candidate supplies the token
             _write_env(fx.channel, {"REMOTE_TASK_TOKEN": CHANNEL_TOKEN, "REMOTE_TASK_URL": GW,
                                     "REMOTE_MEDIA_MARKER": "media-tag"})
             out, err = self.bridge(fx, BRIDGE.replace("print(json.dumps({",
@@ -486,6 +529,89 @@ class RealSinks(unittest.TestCase):
             self.assertNotIn("legacy-file-7364", shown)
             self.assertNotIn("current-file-9821", shown)
 
+    def refuse(self, path: Path, how: str) -> None:
+        if path.exists():
+            path.unlink()
+        if how == "fifo":
+            os.mkfifo(path)
+        elif how == "oversize":
+            path.write_text(f"REMOTE_TASK_TOKEN={DEVICE_TOKEN}\n" + "#" * (1 << 20))
+        elif how == "non-utf8":
+            path.write_bytes(f"REMOTE_TASK_TOKEN={DEVICE_TOKEN}\n".encode() + b"\xff\xfe\n")
+        else:
+            path.mkdir()
+
+    def test_a_refused_named_device_file_fails_closed(self):
+        reasons = {"fifo": "not a regular file", "oversize": "over 1048576 bytes",
+                   "non-utf8": "not UTF-8", "directory": "not a regular file"}
+        script = BRIDGE.replace("print(json.dumps({", "try:\n    m.main()\n    exited = None\n"
+                                "except SystemExit as e:\n    exited = str(e.code)\n"
+                                'print(json.dumps({"exited": exited, ')
+        for how, reason in reasons.items():
+            with self.subTest(how=how), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), ROWS[1])  # the device file would win over the channel file
+                self.refuse(fx.device, how)
+                out, err = self.bridge(fx, script, timeout=20)
+                self.assertEqual((out["token"], out["source"]), ("", "none"), "no other file or the vault stands in")
+                self.assertIn(f"AG2_DEVICE_ENV names {fx.device}", out["exited"])
+                self.assertIn(reason, out["exited"])
+                self.assertIn(f"credential file {fx.device} was refused ({reason})", err)
+                self.assertNotIn("loaded from", err)
+                for secret in (DEVICE_TOKEN, CHANNEL_TOKEN, VAULT_TOKEN):
+                    self.assertNotIn(secret, err + out["exited"])
+
+    def test_a_refused_default_channel_file_warns_and_is_skipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), ROWS[1])
+            del fx.env["AG2_DEVICE_ENV"]  # the channel .env under CLAUDE_CONFIG_DIR is the unnamed default
+            self.refuse(fx.channel, "oversize")
+            out, err = self.bridge(fx)
+            self.assertEqual((out["token"], out["source"]), (VAULT_TOKEN, "vault"), "documented: the next tier")
+            self.assertIn(f"credential file {fx.channel} was refused (over 1048576 bytes)", err)
+            self.assertNotIn(DEVICE_TOKEN, err)
+
+    def test_the_hatch_install_diff_withholds_a_repeated_key_in_a_channel_file(self):
+        for which in ("device", "channel"):
+            with self.subTest(file=which), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), ROWS[1])
+                path = fx.device if which == "device" else fx.channel
+                if which == "channel":
+                    fx.device.unlink()
+                path.write_text(f"REMOTE_TASK_TOKEN=early-dup-token-1111\nREMOTE_TASK_URL={GW}\n"
+                                "REMOTE_TASK_TOKEN=late-dup-token-2222\n")
+                shown = self.hatch_diff(fx, "[Service]\nEnvironment=NOTE=early-dup-token-1111\n"
+                                            "Environment=NOTE2=late-dup-token-2222\nExecStart=/x\n")
+                self.assertNotIn("early-dup-token-1111", shown)
+                self.assertNotIn("late-dup-token-2222", shown)
+                fx.candidates = ["early-dup-token-1111", "late-dup-token-2222"]
+                out, _err = self.bridge(fx)
+                self.assertEqual(out["token"], "late-dup-token-2222", "the last assignment still wins")
+                self.assertEqual(out["registered"], {c: True for c in fx.candidates})
+
+    def test_the_hatch_install_refuses_a_refused_device_file(self):
+        for how in ("oversize", "fifo"):
+            with self.subTest(how=how), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), ROWS[1])
+                self.refuse(fx.device, how)
+                env = {k: v for k, v in os.environ.items() if k not in owner.CREDENTIAL_KEYS}
+                env.update(fx.env, HOME=str(fx.root))
+                unit = fx.root / "ag2-sparrow.service"
+                unit.write_text(f"[Service]\nEnvironment=NOTE={DEVICE_TOKEN}\nExecStart=/x\n")
+                args = mock.Mock(mxid="@a:ag2.space", gateway_instance="")
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(err), \
+                        mock.patch.object(hatch_cli, "find_reply_command", return_value="/r"), \
+                        mock.patch.object(hatch_cli, "reply_command_problem", return_value=""), \
+                        mock.patch.object(hatch_cli, "install_hook", side_effect=AssertionError("installed")):
+                    rc = hatch_cli.install(args)
+                    hatch_cli._install_file(unit, "[Service]\nExecStart=/y\n", 0o644, refuse_drift=True, force=False)
+                self.assertEqual(rc, 1)
+                self.assertIn(f"NOTE credentials: credential file {fx.device} was refused", out.getvalue())
+                self.assertIn(f"REFUSED: AG2_DEVICE_ENV names {fx.device}", err.getvalue())
+                self.assertIn("diff withheld", out.getvalue())
+                self.assertNotIn(DEVICE_TOKEN, out.getvalue() + err.getvalue())
+
     def test_a_fifo_credential_path_never_hangs_the_bridge_import(self):
         for where in ("REMOTE_TASK_TOKEN_FILE", "AG2_DEVICE_ENV"):
             with self.subTest(where=where), tempfile.TemporaryDirectory() as td:
@@ -524,6 +650,12 @@ class BoundedRead(unittest.TestCase):
                 self.assertIsNone(self.read(m, root / "bad"))
                 self.assertIsNone(self.read(m, root / "big", limit=32))
                 self.assertEqual(self.read(m, root / "big", limit=33), "x" * 33)
+                self.assertEqual(m.read_regular(str(root / "ok")), ("A=b\nC=d\n", ""))
+                self.assertEqual(m.read_regular(str(root / "missing")), (None, ""), "absent is not a refusal")
+                self.assertEqual(m.read_regular(str(root / "fifo")), (None, "not a regular file"))
+                self.assertEqual(m.read_regular(str(root)), (None, "not a regular file"))
+                self.assertEqual(m.read_regular(str(root / "bad")), (None, "not UTF-8"))
+                self.assertEqual(m.read_regular(str(root / "big"), limit=32), (None, "over 32 bytes"))
 
 
 SOURCE_KEYS = set(owner.CREDENTIAL_KEYS) | {owner.TOKEN_FILE_KEY}

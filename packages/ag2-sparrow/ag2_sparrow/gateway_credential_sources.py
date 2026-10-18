@@ -3,7 +3,10 @@
 Every source is read by the caller, at its own I/O edge (the environment, the channel .env files it
 knows, a token file, a vault read), and handed in as plain values or a callable; this module opens
 nothing itself. SOURCES states the precedence once and discover() walks it. discover() registers
-every materialized candidate before it picks the winners, so a sink can withhold a discarded one.
+every materialized candidate before it picks the winners, so a sink can withhold a discarded one,
+every assignment of a credential key included. A credential file that exists but is refused is
+named, never treated as absent in silence; a refused AG2_DEVICE_ENV stops the file and vault
+tiers (Discovery.fatal), so a broken explicit file never hands the choice to another file's token.
 Parsing and masking are the pure contract in gateway_credentials (generated from
 shared/ag2_gateway_credentials.py). Stdlib only; vendored byte-identical into the ag2-sparrow
 package by tools/sync_from_src.py.
@@ -41,16 +44,22 @@ EnvFile = "tuple[str, Mapping[str, str]]"
 unquote = contract.parse_env_value
 
 
-def parse_env_text(text: str) -> "dict[str, str]":
-    """A .env file's KEY=VALUE lines, unquoted (comments and blank lines skipped)."""
-    vals = {}
+def parse_env_pairs(text: str) -> "list[tuple[str, str]]":
+    """A .env file's KEY=VALUE lines, unquoted, in order, a repeated key every time it appears."""
+    pairs = []
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        vals[key.strip()] = unquote(val)
-    return vals
+        pairs.append((key.strip(), unquote(val)))
+    return pairs
+
+
+def parse_env_text(text: str) -> "dict[str, str]":
+    """A .env file's KEY=VALUE lines, unquoted (comments and blank lines skipped); the last
+    assignment of a repeated key wins."""
+    return dict(parse_env_pairs(text))
 
 
 DEFAULT_CHANNEL_DIR = "ag2space"
@@ -64,15 +73,47 @@ def channel_dir(env: Mapping[str, str]) -> str:
     return env.get(CHANNEL_DIR_KEY) or DEFAULT_CHANNEL_DIR
 
 
-def env_files(env: Mapping[str, str], read_text: "Callable[[str], Optional[str]]") -> "list[EnvFile]":
-    """The channel .env files a Sparrow given `env` reads, in order, as (path, values), through the
-    caller's `read_text` (None when unreadable, which skips that file). One candidate set for every
-    adapter: the bridge and the Hatch adapter both call this."""
-    out = []
+def _read_result(got) -> "tuple[Optional[str], str]":
+    """A caller's reader returns text, None (absent), or bounded_file_read.read_regular's
+    (text, reason), whose non-empty reason means the file exists but was refused."""
+    if isinstance(got, tuple):
+        return got[0], got[1] or ""
+    return got, ""
+
+
+def refusal_note(path: str, reason: str) -> str:
+    """The one line an adapter prints for a refused credential file: path and reason, no content."""
+    return f"credential file {path} was refused ({reason}); nothing in it was read"
+
+
+class EnvFiles(list):
+    """env_files' result: the readable files as (path, values), plus every credential-key value
+    each one assigns (a repeated key every time), the refused (path, reason) pairs, and `blocked`,
+    the message that stops the file tier when the explicitly named AG2_DEVICE_ENV was refused."""
+    credential_values: "tuple[str, ...]" = ()
+    refused: "tuple[tuple[str, str], ...]" = ()
+    blocked: str = ""
+
+
+def env_files(env: Mapping[str, str], read_text: "Callable[[str], object]") -> EnvFiles:
+    """The channel .env files a Sparrow given `env` reads, in order, through the caller's
+    `read_text` (see _read_result). An absent file is skipped; a refused one is recorded, and a
+    refused AG2_DEVICE_ENV ends the walk. The bridge and the Hatch adapter both call this."""
+    out, values, refused = EnvFiles(), [], []
+    device = env.get("AG2_DEVICE_ENV") or ""
     for path in channel_env_paths(env, channel_dir(env)):
-        text = read_text(path)
+        text, reason = _read_result(read_text(path))
         if text is not None:
             out.append((path, parse_env_text(text)))
+            values += [v for k, v in parse_env_pairs(text) if k in CREDENTIAL_KEYS]
+            values += [v for _k, v in _assignment_pairs(text, CREDENTIAL_KEYS)]  # `export KEY=` too
+        elif reason:
+            refused.append((path, reason))
+            if path == device:
+                out.blocked = (f"AG2_DEVICE_ENV names {path}, which was refused ({reason}); not falling "
+                               "back to another credential source. Fix that file or unset AG2_DEVICE_ENV")
+                break
+    out.credential_values, out.refused = tuple(values), tuple(refused)
     return out
 
 
@@ -190,7 +231,8 @@ class Discovery:
     or "none"; `token_key` the key the token was read under; `url_key` the env key of an
     env-supplied URL; `source_file` (and its values) the file that supplied the token, if one did;
     `media_token` the homeserver media token, from the environment only; `deprecated` the
-    (legacy key, current name) pairs set in the environment without their current name."""
+    (legacy key, current name) pairs set in the environment without their current name; `notes`
+    one line per refused credential file; `fatal` why the adapter must not start or install."""
     raw: str = ""
     token: str = ""
     url: str = ""
@@ -202,6 +244,8 @@ class Discovery:
     source_file_values: Mapping[str, str] = field(default_factory=dict)
     media_token: str = ""
     deprecated: "tuple[tuple[str, str], ...]" = ()
+    notes: "tuple[str, ...]" = ()
+    fatal: str = ""
 
 
 def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
@@ -210,12 +254,20 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
              registry: "Optional[contract.SecretRegistry]" = None) -> Discovery:
     """Register every materialized candidate, then pick the winners by walking SOURCES in order.
     `files` are the channel .env files the caller reads, in its order, as (path, values); `read_token_file(path)` returns a
-    token file's text ('' when unreadable); `vault_lookup(key)` is the caller's vault read."""
+    token file's text, or a read_regular result (see _read_result); `vault_lookup(key)` is the
+    caller's vault read. `files` from env_files carry every assignment and any refusal."""
     token_file_env = env.get(TOKEN_FILE_KEY) or ""
-    token_file_text = read_token_file(token_file_env) if (token_file_env and read_token_file) else ""
+    token_file_text, token_file_reason = (_read_result(read_token_file(token_file_env))
+                                          if (token_file_env and read_token_file) else ("", ""))
+    token_file_text = token_file_text or ""
+    notes = [refusal_note(p, r) for p, r in getattr(files, "refused", ())]
+    if token_file_reason:
+        notes.append(refusal_note(token_file_env, token_file_reason))
+    blocked = getattr(files, "blocked", "")
     if registry is not None:
         register(registry, [unquote(env.get(key) or "") for key in CREDENTIAL_KEYS])
         register(registry, [values.get(key) or "" for _p, values in files for key in CREDENTIAL_KEYS])
+        register(registry, getattr(files, "credential_values", ()))
         # Every assignment read, not only the winners: a losing alias or overwritten duplicate was read too.
         register(registry, [v for _k, v in _assignment_pairs(token_file_text, TOKEN_KEYS + URL_KEYS)])
         register(registry, [token_file_token(token_file_text), token_file_url(token_file_text)])
@@ -240,6 +292,8 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
 
     tiers = dict(SOURCES)
     for name in tiers["token"]:
+        if blocked and name != "env":
+            continue  # a refused explicit device file: no later tier may stand in for it
         got = {"env": token_env, "file": token_file, "vault": token_vault}[name]()
         if got:
             found.update(got, source=name)
@@ -258,4 +312,5 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
                      token_source=source, token_key=token_key, url_key=url_key if url == env_url and url else "",
                      source_file=source_file, source_file_values=dict(source_vals), media_token=media,
                      deprecated=tuple((old, new) for old, new in LEGACY_ALIASES.items()
-                                      if env.get(old) and not env.get(new)))
+                                      if env.get(old) and not env.get(new)),
+                     notes=tuple(notes), fatal=blocked)
