@@ -2,7 +2,7 @@
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
 Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
-canonical for those modules — currently 23 of them, including outbox.py and its
+canonical for those modules — currently 30 of them, including outbox.py and its
 transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
 and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
 dir-interface, no workspace-resolution).
@@ -68,6 +68,14 @@ MAP = {
     # worker-pool completion-record contract: the pool skill writes through it
     # and the bridge reads through it, so neither keeps a private predicate.
     "skills/worker-pool/scripts/pool_record.py": "pool_record.py",
+    # the HITL decision domain and store (the claude-local card's CAS), imports relative-first
+    "src/hitl/__init__.py": "hitl/__init__.py",
+    "src/hitl/schema.py": "hitl/schema.py",
+    "src/hitl/host.py": "hitl/host.py",
+    "src/hitl/manager.py": "hitl/manager.py",
+    "src/hitl/projector.py": "hitl/projector.py",
+    "src/hitl/renotify.py": "hitl/renotify.py",
+    "src/hitl/replies.py": "hitl/replies.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -88,6 +96,7 @@ def main() -> int:
             if have != want:
                 drift.append(pkg_name)
         else:
+            pkg.parent.mkdir(parents=True, exist_ok=True)
             pkg.write_text(want, encoding="utf-8")
     if check:
         if drift:
