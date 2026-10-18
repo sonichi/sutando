@@ -348,7 +348,7 @@ def main() -> int:
     rtc = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rtc)
     # The binding key lives under the passwd home: every load shares this module, never the real one.
-    rtc.gateway_instance._home = lambda: str(Path(tmp, "home"))
+    rtc.gateway_instance.binding_key_path = lambda: Path(tmp, "config", "binding.key")
 
     # 1. pull a task and write it locally
     resp = rtc._req("GET", "/v1/tasks?wait=0")

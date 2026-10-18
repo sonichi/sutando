@@ -44,10 +44,10 @@ VALUES = {"<AGENT_MXID>": AGENT, "<REPLY_COMMAND>": "/opt/bin/ag2-sparrow-hatch"
 
 
 GW = "https://gw.example/relay"
-PASSWD_HOME = gateway_instance._home
+PASSWD_HOME = gateway_instance.holder_lock._home
 # A child bridge keys under its test HOME: the passwd home is the real one.
-PRELUDE = ("import os\nfrom ag2_sparrow import gateway_instance as _gi\n"
-           "_gi._home = lambda: os.environ['HOME']\n")
+PRELUDE = ("import os\nfrom ag2_sparrow import holder_lock as _hl\n"
+           "_hl._home = lambda: os.environ['HOME']\n")
 
 
 def bind(state, room, instance="", identity=AGENT, gateway=GW, status_agent=AGENT,
@@ -77,7 +77,7 @@ class Base(unittest.TestCase):
                                            "SPARROW_HATCH_CONFIG": str(self.home / "config")})
         env.start()
         self.addCleanup(env.stop)
-        home = mock.patch.object(gateway_instance, "_home", lambda: str(self.home))
+        home = mock.patch.object(gateway_instance.holder_lock, "_home", lambda: str(self.home))
         home.start()
         self.addCleanup(home.stop)
 
@@ -367,15 +367,16 @@ class WakeContext(Base):
     def test_the_binding_key_follows_the_passwd_home_never_the_environment(self):
         entry = mock.Mock(pw_dir=str(self.home / "pw"))
         want = self.home / "pw" / ".config" / "ag2-sparrow" / "binding.key"
-        with mock.patch.object(gateway_instance, "_home", PASSWD_HOME), \
-                mock.patch.object(gateway_instance.pwd, "getpwuid", return_value=entry) as getpwuid:
+        with mock.patch.object(gateway_instance.holder_lock, "_home", PASSWD_HOME), \
+                mock.patch.object(gateway_instance.holder_lock.pwd, "getpwuid", return_value=entry) as getpwuid:
             for env in ({"XDG_CONFIG_HOME": str(self.home / "xdg"), "HOME": str(self.home / "a")},
                         {"XDG_CONFIG_HOME": "", "HOME": str(self.home / "b")}):
                 with mock.patch.dict(os.environ, env):
                     self.assertEqual(gateway_instance.binding_key_path(), want, env)
             getpwuid.assert_called_with(os.geteuid())
-        with mock.patch.object(gateway_instance, "_home", PASSWD_HOME), \
-                mock.patch.object(gateway_instance.pwd, "getpwuid", side_effect=KeyError("uid")):
+        self.assertFalse(hasattr(gateway_instance, "_home"), "holder_lock owns the home policy")
+        with mock.patch.object(gateway_instance.holder_lock, "_home", PASSWD_HOME), \
+                mock.patch.object(gateway_instance.holder_lock.pwd, "getpwuid", side_effect=KeyError("uid")):
             self.assertEqual(gateway_instance.binding_digest(AGENT, GW, create=True), "",
                              "no passwd entry: no key, never an environment fallback")
 

@@ -18,10 +18,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-try:
-    import pwd
-except ImportError:  # pragma: no cover - not POSIX
-    pwd = None  # type: ignore[assignment]
+from . import holder_lock
 
 INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 
@@ -72,21 +69,11 @@ def redact_url(value: str) -> str:
 KEY_GRACE_S = 5.0
 
 
-def _home() -> str:
-    """The effective uid's home from pwd, never the environment: every launch context of one
-    user (a service unit, a hook, a shell) resolves the same key."""
-    if pwd is None:
-        raise OSError("no passwd database")
-    try:
-        return pwd.getpwuid(os.geteuid()).pw_dir
-    except KeyError:
-        raise OSError("no passwd entry for uid %d" % os.geteuid()) from None
-
-
 def binding_key_path() -> Path:
-    """The per-install key the binding is computed with: in the user's config dir under the
-    passwd home, never the state dir, which may be synced."""
-    return Path(_home()) / ".config" / "ag2-sparrow" / "binding.key"
+    """The per-install key the binding is computed with: in the config dir under the effective
+    uid's passwd home (holder_lock's), so every launch context resolves one key; never the
+    state dir, which may be synced."""
+    return Path(holder_lock._home()) / ".config" / "ag2-sparrow" / "binding.key"
 
 
 def _read_key(path: Path) -> "bytes | None":
@@ -115,7 +102,7 @@ def _fsync_dir(path: Path) -> None:
 def _binding_key(create: bool) -> "bytes | None":
     try:
         path = binding_key_path()
-    except OSError:
+    except holder_lock.LockError:
         return None
     key = _read_key(path)
     if key is not None or not create:

@@ -26,7 +26,7 @@ from unittest import mock
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import health_command as hc, outbox  # noqa: E402
+from ag2_sparrow import health_command as hc, outbox, task_io  # noqa: E402
 from ag2_sparrow.adapters.hatch import (  # noqa: E402
     cli as hatch_cli, keepalive, runtime_text, task_fields)
 
@@ -2566,7 +2566,12 @@ class DocumentedCommands(unittest.TestCase):
                     .replace("'\"$REPLY\"'", "<REPLY_COMMAND>").replace("'\"'\"'", "'"))
         shipped = runtime_text.builtin()
         self.assertEqual(shipped["worker_note"], note("REMAINING_WORK_NOTE"))
-        self.assertEqual(shipped["tier_notes"], [note("NON_OWNER_NOTE")])
+        # task_io owns the non-owner policy: the hook reads it and the built-in text is it.
+        self.assertIn('NON_OWNER_NOTE="$(timeout 10 "$PY" -m ag2_sparrow.task_io --non-owner-note',
+                      script)
+        self.assertEqual(shipped["tier_notes"], [task_io.non_owner_note()])
+        raw = json.loads((HATCH / "builtin-runtime-text.json").read_text())
+        self.assertNotIn("tier_notes", raw, "no second copy of the policy text")
 
     def test_the_hook_prompt_sends_the_worker_to_wake_context(self):
         prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]

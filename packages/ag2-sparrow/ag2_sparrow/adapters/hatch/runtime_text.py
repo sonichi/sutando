@@ -15,7 +15,7 @@ import sys
 from importlib import resources
 from pathlib import Path
 
-from ... import gateway_instance, setup_fetch
+from ... import gateway_instance, setup_fetch, task_io
 from . import cli as _cli
 
 TEXT_SCHEMA_VERSION = 1
@@ -38,8 +38,9 @@ TUNABLES = {
 
 
 def builtin() -> dict:
+    """The shipped text; its tier note is task_io's non-owner policy, which owns that text."""
     text = resources.files(__package__).joinpath("builtin-runtime-text.json")
-    return json.loads(text.read_text(encoding="utf-8"))
+    return {**json.loads(text.read_text(encoding="utf-8")), "tier_notes": [task_io.non_owner_note()]}
 
 
 def cache_path(state_dir: Path) -> Path:

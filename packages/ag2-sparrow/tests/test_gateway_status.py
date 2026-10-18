@@ -15,7 +15,7 @@ def _load(tmp):
     os.environ.setdefault("REMOTE_TASK_TOKEN", "dummy-secret")
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     mod = importlib.reload(importlib.import_module("ag2_sparrow.remote_gateway_bridge"))
-    mod.gateway_instance._home = lambda: str(tmp)  # the binding key, never the real home
+    mod.gateway_instance.binding_key_path = lambda: pathlib.Path(tmp, "binding.key")  # never the real one
     return mod
 
 def test_connected_then_reconnecting_preserves_last_ok():
