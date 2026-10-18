@@ -2,8 +2,8 @@
 
 Every source is read by the caller, at its own I/O edge (the environment, the channel .env files it
 knows, a token file, a vault read), and handed in as plain values or a callable; this module opens
-nothing itself. SOURCES states the precedence once. discover() registers every candidate any source
-holds before it picks the winners, so a sink can withhold a credential precedence discarded.
+nothing itself. SOURCES states the precedence once and discover() walks it. discover() registers
+every materialized candidate before it picks the winners, so a sink can withhold a discarded one.
 Parsing and masking are the pure contract in gateway_credentials (generated from
 shared/ag2_gateway_credentials.py). Stdlib only; vendored byte-identical into the ag2-sparrow
 package by tools/sync_from_src.py.
@@ -24,6 +24,7 @@ URL_KEYS = ("REMOTE_TASK_URL", "AG2_REMOTE_URL")
 TOKEN_FILE_KEY = "REMOTE_TASK_TOKEN_FILE"
 MEDIA_TOKEN_KEY = "REMOTE_MEDIA_HS_TOKEN"
 CREDENTIAL_KEYS = TOKEN_KEYS + URL_KEYS + (MEDIA_TOKEN_KEY,)
+LEGACY_ALIASES = {"AG2_REMOTE_TOKEN": "REMOTE_TASK_TOKEN", "AG2_REMOTE_URL": "REMOTE_TASK_URL"}
 
 # The precedence, stated once; the first source carrying a value wins (see discover() for each name:
 # "file" is the first listed .env file carrying a token, "token" the URL inside the winning one).
@@ -53,6 +54,26 @@ def parse_env_text(text: str) -> "dict[str, str]":
 
 
 DEFAULT_CHANNEL_DIR = "ag2space"
+
+
+CHANNEL_DIR_KEY = "REMOTE_TASK_CHANNEL_DIR"
+
+
+def channel_dir(env: Mapping[str, str]) -> str:
+    """Which channels/<dir>/ a Sparrow reads: REMOTE_TASK_CHANNEL_DIR, else the default."""
+    return env.get(CHANNEL_DIR_KEY) or DEFAULT_CHANNEL_DIR
+
+
+def env_files(env: Mapping[str, str], read_text: "Callable[[str], Optional[str]]") -> "list[EnvFile]":
+    """The channel .env files a Sparrow given `env` reads, in order, as (path, values), through the
+    caller's `read_text` (None when unreadable, which skips that file). One candidate set for every
+    adapter: the bridge and the Hatch adapter both call this."""
+    out = []
+    for path in channel_env_paths(env, channel_dir(env)):
+        text = read_text(path)
+        if text is not None:
+            out.append((path, parse_env_text(text)))
+    return out
 
 
 def channel_env_paths(env: Mapping[str, str], channel_dir: str = DEFAULT_CHANNEL_DIR) -> "list[str]":
@@ -143,19 +164,18 @@ def token_from_vault(vault_lookup: "Callable[[str], str]") -> "tuple[str, str]":
 
 
 def register(registry: "contract.SecretRegistry", values) -> None:
-    """Register credential values as secrets: an onboarding string whole and split, a URL by its
-    credential parts, a bare token as it is."""
+    """Register credential values as secrets: each value whole, and also an onboarding string's
+    secret and a URL's credential parts."""
     for value in values:
         if not value:
             continue
+        registry.register(value)  # whole, whatever its shape: a bearer may look like a URL
         url, secret = contract.parse_onboarding_token(value)
         if url:
             registry.register_gateway_url(url)
             registry.register(secret)
         elif value.lower().startswith(("http://", "https://")):
             registry.register_gateway_url(value)
-        else:
-            registry.register(value)
 
 
 @dataclass(frozen=True)
@@ -163,7 +183,8 @@ class Discovery:
     """The winners by SOURCES, and what they came from: `token_source` is "env", "file", "vault"
     or "none"; `token_key` the key the token was read under; `url_key` the env key of an
     env-supplied URL; `source_file` (and its values) the file that supplied the token, if one did;
-    `media_token` the homeserver media token, from the environment only."""
+    `media_token` the homeserver media token, from the environment only; `deprecated` the
+    (legacy key, current name) pairs set in the environment without their current name."""
     raw: str = ""
     token: str = ""
     url: str = ""
@@ -174,14 +195,15 @@ class Discovery:
     source_file: str = ""
     source_file_values: Mapping[str, str] = field(default_factory=dict)
     media_token: str = ""
+    deprecated: "tuple[tuple[str, str], ...]" = ()
 
 
 def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
              read_token_file: "Optional[Callable[[str], str]]" = None,
              vault_lookup: "Optional[Callable[[str], str]]" = None,
              registry: "Optional[contract.SecretRegistry]" = None) -> Discovery:
-    """Register every candidate, then pick the winners by SOURCES. `files` are the channel .env
-    files the caller reads, in its order, as (path, values); `read_token_file(path)` returns a
+    """Register every materialized candidate, then pick the winners by walking SOURCES in order.
+    `files` are the channel .env files the caller reads, in its order, as (path, values); `read_token_file(path)` returns a
     token file's text ('' when unreadable); `vault_lookup(key)` is the caller's vault read."""
     token_file_env = env.get(TOKEN_FILE_KEY) or ""
     token_file_text = read_token_file(token_file_env) if (token_file_env and read_token_file) else ""
@@ -190,22 +212,42 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
                             for key in CREDENTIAL_KEYS])
         register(registry, [token_file_token(token_file_text), token_file_url(token_file_text)])
 
-    raw, token_key = first_env(env, TOKEN_KEYS)
-    source, source_file, source_vals, file_url = ("env" if raw else "none"), "", {}, ""
-    if not raw:
-        raw, file_url, source_file, source_vals = token_from_files(files)
-        if raw:
-            source, token_key = "file", first(source_vals, TOKEN_KEYS)[1]
-    if not raw and vault_lookup is not None:
-        raw, token_key = token_from_vault(vault_lookup)
-        if raw:
-            source = "vault"
-            if registry is not None:
-                register(registry, [raw])
+    found = {"raw": "", "token_key": "", "source": "none", "source_file": "", "source_vals": {},
+             "file_url": ""}
+
+    def token_env():
+        raw, key = first_env(env, TOKEN_KEYS)
+        return raw and dict(raw=raw, token_key=key)
+
+    def token_file():
+        raw, url, path, vals = token_from_files(files)
+        return raw and dict(raw=raw, token_key=first(vals, TOKEN_KEYS)[1], source_file=path,
+                            source_vals=vals, file_url=url)
+
+    def token_vault():
+        raw, key = token_from_vault(vault_lookup) if vault_lookup is not None else ("", "")
+        if raw and registry is not None:
+            register(registry, [raw])
+        return raw and dict(raw=raw, token_key=key)
+
+    tiers = dict(SOURCES)
+    for name in tiers["token"]:
+        got = {"env": token_env, "file": token_file, "vault": token_vault}[name]()
+        if got:
+            found.update(got, source=name)
+            break
+    raw = found["raw"]
     url_from_token, token = contract.parse_onboarding_token(raw)
     env_url, url_key = first_env(env, URL_KEYS)
-    url = env_url or url_from_token or file_url
-    return Discovery(raw=raw, token=token, url=url.rstrip("/"), token_file=token_file_env or source_file,
-                     token_source=source, token_key=token_key, url_key=url_key,
-                     source_file=source_file, source_file_values=dict(source_vals),
-                     media_token=env.get(MEDIA_TOKEN_KEY) or "")
+    url = next((v for v in ({"env": env_url, "token": url_from_token, "file": found["file_url"]}[n]
+                            for n in tiers["url"]) if v), "")
+    token_file_path = next((v for v in ({"env": token_file_env, "file": found["source_file"]}[n]
+                                        for n in tiers["token_file"]) if v), "")
+    media = next((v for v in ({"env": env.get(MEDIA_TOKEN_KEY) or ""}[n] for n in tiers["media_token"]) if v), "")
+    source, token_key, source_file, source_vals = (found["source"], found["token_key"], found["source_file"],
+                                                   found["source_vals"])
+    return Discovery(raw=raw, token=token, url=url.rstrip("/"), token_file=token_file_path,
+                     token_source=source, token_key=token_key, url_key=url_key if url == env_url and url else "",
+                     source_file=source_file, source_file_values=dict(source_vals), media_token=media,
+                     deprecated=tuple((old, new) for old, new in LEGACY_ALIASES.items()
+                                      if env.get(old) and not env.get(new)))

@@ -355,8 +355,12 @@ def describe(exc: BaseException) -> str:
     return out
 
 
-_CREDENTIAL_NAME_RE = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|AUTH", re.IGNORECASE)
-_ASSIGNMENT_LINE_RE = re.compile(r"^(\s*)(export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_CREDENTIAL_NAME_RE = re.compile(
+    r"TOKEN|SECRET|PASSWORD|PASSWD|PASS\b|_PASS|CREDENTIAL|API_?KEY|PRIVATE_?KEY|AUTH|BEARER|COOKIE|SESSION",
+    re.IGNORECASE)
+# `KEY=value`, `KEY = value` and `export KEY=value`, as parse_env_text reads them.
+_ASSIGNMENT_LINE_RE = re.compile(r"^(\s*)(export\s+)?([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*)$")
+_ENVIRONMENT_RE = re.compile(r"^(\s*)Environment(\s*=\s*)(.*)$")
 
 
 def mask_assignment(key: str, value: str, registry: "SecretRegistry | None" = None) -> str:
@@ -370,35 +374,56 @@ def mask_assignment(key: str, value: str, registry: "SecretRegistry | None" = No
     return value
 
 
-def mask_env_assignments(text: str, registry: "SecretRegistry | None" = None) -> str:
-    """A unit file, .env or config as it may be shown (an install diff): every assignment on a
-    systemd `Environment=` line (one or several, quoted or not) and every `KEY=value` line masked
-    by mask_assignment; any other line withheld whole when it holds a registered secret."""
-    out = []
+def _logical_lines(text: str) -> "list[list[str]]":
+    """Physical lines grouped as systemd reads them: a line ending in a backslash continues."""
+    groups, current = [], []
     for line in text.splitlines(True):
-        end = "\n" if line.endswith("\n") else ""
-        body = line[:len(line) - len(end)]
-        stripped = body.lstrip()
-        indent = body[:len(body) - len(stripped)]
-        if stripped.startswith("Environment="):
-            try:
-                words = shlex.split(stripped[len("Environment="):])
-            except ValueError:
-                out.append(f"{indent}Environment={WITHHELD}{end}")
-                continue
-            shown = []
-            for word in words:
-                key, eq, value = word.partition("=")
-                item = f"{key}={mask_assignment(key, value, registry)}" if eq else WITHHELD
-                shown.append(shlex.quote(item) if any(c.isspace() for c in item) else item)
-            out.append(f"{indent}Environment={' '.join(shown)}{end}")
-            continue
-        m = _ASSIGNMENT_LINE_RE.match(body)
-        if m:
-            value = mask_assignment(m.group(3), parse_env_value(m.group(4)), registry)
-            out.append(f"{m.group(1)}{m.group(2) or ''}{m.group(3)}={value}{end}")
-            continue
-        out.append((WITHHELD_TEXT if registry is not None and registry.contains(body) else body) + end)
+        current.append(line)
+        if not line.rstrip("\r\n").endswith("\\"):
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _mask_logical(body: str, registry: "SecretRegistry | None") -> str:
+    env = _ENVIRONMENT_RE.match(body)
+    if env:
+        indent, sep, rest = env.groups()
+        try:
+            words = shlex.split(rest)
+        except ValueError:
+            return f"{indent}Environment{sep}{WITHHELD}"
+        shown = []
+        for word in words:
+            key, eq, value = word.partition("=")
+            item = f"{key}={mask_assignment(key, value, registry)}" if eq else WITHHELD
+            shown.append(shlex.quote(item) if any(c.isspace() for c in item) else item)
+        return f"{indent}Environment{sep}{' '.join(shown)}"
+    m = _ASSIGNMENT_LINE_RE.match(body)
+    if m:
+        indent, export, key, sep, raw = m.groups()
+        return f"{indent}{export or ''}{key}{sep}{mask_assignment(key, parse_env_value(raw), registry)}"
+    return WITHHELD_TEXT if registry is not None and registry.contains(body) else body
+
+
+def mask_env_assignments(text: str, registry: "SecretRegistry | None" = None) -> str:
+    """A unit file, .env or config as it may be shown (an install diff). Continued lines are joined
+    first, as systemd joins them. Every assignment on an `Environment=` line (one or several,
+    quoted or not) and every `KEY=value` line is masked by mask_assignment; any other line is
+    withheld whole when it holds a registered secret. A logical line that changed is shown as one
+    line, so no physical piece of it prints raw."""
+    out = []
+    for group in _logical_lines(text):
+        end = "\n" if group[-1].endswith("\n") else ""
+        pieces = [line.rstrip("\r\n") for line in group]
+        joined = " ".join(p[:-1] if i < len(pieces) - 1 else p for i, p in enumerate(pieces))
+        masked = _mask_logical(joined, registry)
+        if masked == joined:
+            out.append("".join(group))
+        else:
+            out.append(masked + end)
     return "".join(out)
 
 

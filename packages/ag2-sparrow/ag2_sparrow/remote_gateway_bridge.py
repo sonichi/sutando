@@ -501,22 +501,23 @@ _parse_onboarding_token = gateway_credentials.parse_onboarding_token
 
 # Which channels/<dir>/ this instance reads (.env fallback + access.json).
 # Env-only — the .env file can't name its own directory. Default preserves the
-CHANNEL_DIR = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
+CHANNEL_DIR = gateway_credential_sources.channel_dir(os.environ)
+
+
+def _read_env_file(path: str):
+    """A channel .env file's text, or None when it cannot be read; an undecodable file is not
+    an OSError, so it is caught too."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def _channel_env_candidates():
-    """The readable channel .env files in precedence order, as [(path, vals)]: AG2_DEVICE_ENV, then
-    $CLAUDE_CONFIG_DIR/channels/<dir>/.env. Never a bare-home guess (an unrelated install's token)."""
-    out = []
-    for path in gateway_credential_sources.channel_env_paths(os.environ, CHANNEL_DIR):
-        try:
-            with open(path, encoding="utf-8") as fh:
-                text = fh.read()
-        # Every candidate is read eagerly, so one may be undecodable — and that is not an OSError.
-        except (OSError, UnicodeDecodeError):
-            continue
-        out.append((path, gateway_credential_sources.parse_env_text(text)))
-    return out
+    """The readable channel .env files in precedence order, as [(path, vals)]
+    (gateway_credential_sources.env_files decides which and in what order)."""
+    return gateway_credential_sources.env_files(os.environ, _read_env_file)
 
 
 def _config_from_channel_env(key: str) -> str:
@@ -545,7 +546,7 @@ def _token_from_ag2space_env():
 
 
 def _vault_lookup(vault_get=None):
-    """The vault read for the ag2space token, parity with the channel bridges (#2638): the shared
+    """The vault read for the ag2space token, parity with the channel bridges: the shared
     core `channel_token.token_from_vault`, total-failure-safe and never surfacing the value. The
     package ships standalone, so the monorepo `src/` may be absent: then there is no vault tier
     (None) rather than a crash at startup. `vault_get` is injectable for hermetic tests."""
@@ -1840,10 +1841,8 @@ _SECRETS = gateway_credentials.SecretRegistry()
 _FOUND = gateway_credential_sources.discover(
     os.environ, _channel_env_candidates(), read_token_file=_read_text,
     vault_lookup=lambda key: (_vault_lookup() or (lambda _k: ""))(key), registry=_SECRETS)
-for _old, _new, _used in (("AG2_REMOTE_TOKEN", "REMOTE_TASK_TOKEN",
-                           _FOUND.token_source == "env" and _FOUND.token_key == "AG2_REMOTE_TOKEN"),
-                          ("AG2_REMOTE_URL", "REMOTE_TASK_URL", _FOUND.url_key == "AG2_REMOTE_URL")):
-    if _used and _old not in _warned_legacy:
+for _old, _new in _FOUND.deprecated:
+    if _old not in _warned_legacy:
         _warned_legacy.add(_old)
         print(f"[remote-gateway-bridge] {_old} is deprecated — rename to {_new} in your .env",
               file=sys.stderr, flush=True)

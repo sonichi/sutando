@@ -56,6 +56,7 @@ ENV_TOKEN, DEVICE_TOKEN, CHANNEL_TOKEN = "env-token-AAAA1111", "device-token-BBB
 VAULT_TOKEN, FILE_TOKEN, RETIRED = "vault-token-DDDD4444", "rotated-token-EEEE5555", "retired-token-FFFF6666"
 GW = "https://gw.example/relay"
 URL_SECRET_URL = "https://user-name-1:pass-word-2@gw.example/relay?k=query-secret-3#frag-secret-4"
+URL_SHAPED_BEARER = "https://opaque.example/bearer-GGGG7777"
 
 # (name, env, device file, channel file, vault, token file) -> (winner, source, url, token_file)
 ROWS = [
@@ -76,6 +77,11 @@ ROWS = [
      (DEVICE_TOKEN, "file", GW, "TOKENFILE")),
     ("the legacy alias is honoured after the current name", {"AG2_REMOTE_TOKEN": ENV_TOKEN, "AG2_REMOTE_URL": GW},
      {"REMOTE_TASK_TOKEN": DEVICE_TOKEN}, {}, "", None, (ENV_TOKEN, "env", GW, "")),
+    ("the channel dir is the one REMOTE_TASK_CHANNEL_DIR names", {"REMOTE_TASK_CHANNEL_DIR": "dev-ag2space"},
+     {}, {"REMOTE_TASK_TOKEN": CHANNEL_TOKEN, "REMOTE_TASK_URL": GW}, "", None,
+     (CHANNEL_TOKEN, "file", GW, "CHANNEL")),
+    ("a URL-shaped opaque bearer is a secret whole", {"REMOTE_TASK_TOKEN": URL_SHAPED_BEARER, "REMOTE_TASK_URL": GW},
+     {"REMOTE_TASK_TOKEN": DEVICE_TOKEN}, {}, "", None, (URL_SHAPED_BEARER, "env", GW, "")),
 ]
 
 
@@ -91,7 +97,7 @@ class Fixture:
         self.root = root
         self.device = root / "relay.env"
         self.config = root / "claude"
-        self.channel = self.config / "channels" / "ag2space" / ".env"
+        self.channel = self.config / "channels" / env.get("REMOTE_TASK_CHANNEL_DIR", "ag2space") / ".env"
         self.channel.parent.mkdir(parents=True, exist_ok=True)
         self.token_file = root / "token"
         _write_env(self.device, device)
@@ -100,11 +106,12 @@ class Fixture:
             self.token_file.write_text(f"REMOTE_TASK_TOKEN={token_file}\n")
         self.env = {k: (str(self.token_file) if v == "TOKENFILE" else v) for k, v in env.items()}
         self.env.update(AG2_DEVICE_ENV=str(self.device), CLAUDE_CONFIG_DIR=str(self.config))
-        values = [v for d in (env, device, channel) for v in d.values() if v and v != "TOKENFILE"]
+        values = [v for d in (env, device, channel) for k, v in d.items()
+                  if v and v != "TOKENFILE" and k != "REMOTE_TASK_CHANNEL_DIR"]
         values += ([self.vault] if self.vault else []) + ([token_file] if token_file else [])
         # The secrets: a bare token, or the secret of an onboarding string; a plain URL is none.
         self.candidates = [contract.parse_onboarding_token(v)[1] for v in values
-                           if not (v.startswith("http") and "|" not in v)]
+                           if not (v.startswith("http") and "|" not in v) or v == URL_SHAPED_BEARER]
 
     def expected(self):
         token, source, url, token_file = self.expect
@@ -172,6 +179,14 @@ class PureContractCases:
         self.assertIn("SAFE=keep-me", shown)
         self.assertIn("Environment=REMOTE_TASK_URL=https://gw.example/relay\n", shown)
         self.assertIn("AG2_DEVICE_ENV=/home/x/relay.env", shown)
+        registry.register("Synth9Tok-en-Q7zZ-live")
+        for continued in ("Environment=REMOTE_TASK_TOKEN=Synth9Tok-\\\nen-Q7zZ-live\n",
+                          "Environment=SAFE=keep-me \\\n  \"REMOTE_TASK_TOKEN=retired-cont-9988\"\n",
+                          "REMOTE_TASK_TOKEN = \"spaced-retired-7766\"\n",
+                          "Environment = \"REMOTE_TASK_TOKEN=spaced-retired-5544\"\n"):
+            shown = self.c.mask_env_assignments(continued, registry)
+            for piece in ("en-Q7zZ-live", "Synth9Tok", "retired-cont-9988", "spaced-retired-7766", "spaced-retired-5544"):
+                self.assertNotIn(piece, shown, continued)
 
     def test_edge_paths_never_raise(self):
         registry = self.c.SecretRegistry()
@@ -201,7 +216,7 @@ class PureContractCases:
             self.assertEqual(int(self.c.describe(e).rsplit(":", 1)[1]), deeper.__code__.co_firstlineno + 1)
 
     def test_the_contract_is_pure(self):
-        tree = ast.parse((REPO / "shared" / "ag2_gateway_credentials.py").read_text())
+        tree = ast.parse(Path(self.c.__file__).read_text())
         calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
         for io_call in ("open", "os.environ.get", "os.getenv", "subprocess.run", "print"):
             self.assertNotIn(io_call, calls, io_call)
@@ -249,6 +264,20 @@ class DiscoveryCases:
                     if candidate == fx.vault and found.token_source != "vault":
                         continue  # the vault is read only when no earlier source holds a token
                     self.assertTrue(registry.contains(f"x {candidate} y"), candidate)
+
+    def test_a_url_shaped_bearer_is_registered_whole(self):
+        registry = self.o.contract.SecretRegistry()
+        self.o.register(registry, [URL_SHAPED_BEARER])
+        self.assertTrue(registry.contains(f"x {URL_SHAPED_BEARER} y"))
+
+    def test_the_table_drives_the_choice(self):
+        row = ROWS[0]  # env wins over every file, as tabled
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(self.o, "SOURCES", (("token", ("file", "env", "vault")),) + self.o.SOURCES[1:]):
+            fx = Fixture(Path(td), row)
+            found = self.o.discover(fx.env, fx.owner_files(self.o))
+            self.assertEqual((found.token, found.token_source), (DEVICE_TOKEN, "file"),
+                             "reordering SOURCES reorders the choice: the table is the precedence")
 
     def test_the_parsers_and_tiers(self):
         self.assertEqual(self.o.parse_env_text("# c\n\nA = ' x '\nnoequals\n"), {"A": " x "}, "whitespace, then the quotes")
@@ -360,6 +389,13 @@ class RealSinks(unittest.TestCase):
                 with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out), \
                         contextlib.redirect_stderr(io.StringIO()):
                     hatch_cli._install_file(unit, "[Service]\nExecStart=/y\n", 0o644, refuse_drift=True, force=False)
+                with mock.patch.dict(os.environ, env, clear=True):
+                    found, _registry = hatch_cli._credential_discovery()
+                want = fx.expected()
+                if want["source"] == "vault":
+                    want = {"token": "", "source": "none", "url": GW, "token_file": ""}  # Hatch reads no vault
+                self.assertEqual({"token": found.token, "source": found.token_source, "url": found.url,
+                                  "token_file": found.token_file}, want, "Hatch resolves the bridge's row")
                 shown = out.getvalue()
                 self.assertIn("DIFF:", shown)
                 self.assertIn("SAFE=keep-me", shown)
@@ -368,36 +404,127 @@ class RealSinks(unittest.TestCase):
                     self.assertNotIn(secret.casefold(), shown.casefold(), secret)
 
 
+SOURCE_KEYS = set(owner.CREDENTIAL_KEYS) | {owner.TOKEN_FILE_KEY}
+KEY_TUPLES = {"TOKEN_KEYS", "URL_KEYS", "CREDENTIAL_KEYS", "TOKEN_FILE_KEY", "MEDIA_TOKEN_KEY"}
+# What names a credential file or store: a scope holding one of these and a read is credential I/O.
+CREDENTIAL_MARKERS = {"AG2_DEVICE_ENV", "CLAUDE_CONFIG_DIR", "TOKEN_FILE", "device_env_path",
+                      "channel_env_paths", "env_files", "channel_token", "token_from_vault"}
+READS = {"open", "read_text", "read_bytes", "readlines"}
+OWNER_READERS = {"env_files": 1, "discover": None}  # owner calls whose callable arguments read credentials
+# Where credential I/O may happen: the adapters' edge, as (module, function).
+IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_bridge.py", "_read_text"),
+              ("remote_gateway_bridge.py", "_vault_lookup"), ("adapters/hatch/cli.py", "_read_text")}
+
+
+def _constant(node):
+    """A string the expression always evaluates to, when it is built from constants only."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _constant(node.left), _constant(node.right)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        parts = [_constant(v) for v in node.values]
+        return None if None in parts else "".join(parts)
+    if isinstance(node, ast.FormattedValue) and node.conversion == -1 and node.format_spec is None:
+        return _constant(node.value)
+    return None
+
+
+def credential_access(source: str, rel: str) -> "list[str]":
+    """Every way `source` (module `rel`) touches a credential source on its own: a credential key
+    or a piece of one as a string, the owner's key tuples, credential I/O outside IO_ALLOWED, and
+    a function handed to the owner as a reader that is not in IO_ALLOWED."""
+    tree = ast.parse(source)
+    parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+    docstrings = {id(n.body[0].value) for n in ast.walk(tree)
+                  if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                  and n.body and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
+    out = []
+    for node in ast.walk(tree):
+        if id(node) in docstrings or isinstance(parents.get(node), (ast.BinOp, ast.JoinedStr, ast.FormattedValue)):
+            continue
+        text = _constant(node)
+        if text is not None and any(text == k or (len(text) >= 8 and text in k) for k in SOURCE_KEYS):
+            out.append(f"{rel}:{node.lineno} key {text!r}")
+        name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
+        if name in KEY_TUPLES:
+            out.append(f"{rel}:{node.lineno} owner key tuple {name}")
+    scopes = [("<module>", [n for n in tree.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))])]
+    scopes += [(f.name, [f]) for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for name, nodes in scopes:
+        inner = [n for root in nodes for n in ast.walk(root)
+                 if not (root is not n and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))]
+        def marked(expr, tainted=frozenset()):
+            for n in ast.walk(expr):
+                word = getattr(n, "id", None) or getattr(n, "attr", None)
+                if word in CREDENTIAL_MARKERS or word in tainted:
+                    return True
+                if isinstance(n, ast.Constant) and isinstance(n.value, str) and (
+                        ".env" in n.value or n.value in CREDENTIAL_MARKERS):
+                    return True
+            return False
+        tainted = set()
+        for _ in range(3):  # names bound from a credential path, to a fixpoint
+            for n in inner:
+                if isinstance(n, ast.Assign) and marked(n.value, tainted):
+                    tainted |= {t.id for t in n.targets if isinstance(t, ast.Name)}
+                elif isinstance(n, ast.For) and marked(n.iter, tainted) and isinstance(n.target, ast.Name):
+                    tainted.add(n.target.id)
+                elif isinstance(n, ast.withitem) and n.optional_vars is not None and marked(n.context_expr, tainted):
+                    tainted |= {t.id for t in ast.walk(n.optional_vars) if isinstance(t, ast.Name)}
+        reads = any(isinstance(n, ast.Call) and (getattr(n.func, "id", None) in READS or getattr(n.func, "attr", None) in READS)
+                    and marked(n, tainted) for n in inner)
+        store = any(isinstance(n, ast.Constant) and n.value in ("security", "find-generic-password") for n in inner) or \
+            any(isinstance(n, (ast.Import, ast.ImportFrom)) and "channel_token" in ast.unparse(n) for n in inner)
+        if (reads or store) and (rel, name) not in IO_ALLOWED:
+            out.append(f"{rel}:{name} credential I/O outside the adapters' edge")
+    for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
+        callee = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
+        if callee not in OWNER_READERS:
+            continue
+        handed = [k.value for k in call.keywords if k.arg in ("read_token_file", "vault_lookup")]
+        handed += call.args[1:2] if OWNER_READERS[callee] == 1 else []
+        for value in handed:
+            for ref in (n for n in ast.walk(value) if isinstance(n, ast.Name) and n.id.startswith("_read")):
+                if (rel, ref.id) not in IO_ALLOWED:
+                    out.append(f"{rel}:{call.lineno} reader {ref.id} handed to the owner")
+    return out
+
+
 class Guard(unittest.TestCase):
-    SOURCE_KEYS = set(owner.CREDENTIAL_KEYS) | {owner.TOKEN_FILE_KEY}
     OWNERS = {"gateway_credential_sources.py", "gateway_credentials.py"}
 
-    def test_no_other_package_module_reads_a_credential_source(self):
+    def test_no_other_package_module_touches_a_credential_source(self):
         found = []
         for path in sorted((PKG / "ag2_sparrow").rglob("*.py")):
-            if path.name in self.OWNERS:
-                continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                # A read is a lookup of a credential key: env.get / mapping.get / getenv / [key].
-                if isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) \
-                        in ("get", "getenv", "pop", "setdefault"):
-                    keys = [a.value for a in node.args[:1] if isinstance(a, ast.Constant)]
-                elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
-                    keys = [node.slice.value]
-                else:
-                    continue
-                if any(k in self.SOURCE_KEYS for k in keys):
-                    found.append(f"{path.relative_to(PKG)}:{node.lineno}")
-        self.assertEqual(found, [], "a credential source is read outside the owner")
+            if path.name not in self.OWNERS:
+                rel = str(path.relative_to(PKG / "ag2_sparrow"))
+                found += credential_access(path.read_text(encoding="utf-8"), rel)
+        self.assertEqual(found, [], "a credential source is touched outside the owner and the adapters' edge")
 
-    def test_the_guard_sees_each_read_shape(self):
-        for source in ('os.environ.get("REMOTE_TASK_TOKEN")', 'vals["AG2_REMOTE_URL"]',
-                       'os.getenv("REMOTE_MEDIA_HS_TOKEN")', 'env.pop("REMOTE_TASK_TOKEN_FILE")'):
-            tree = ast.parse(source)
-            node = tree.body[0].value
-            key = node.args[0].value if isinstance(node, ast.Call) else node.slice.value
-            self.assertIn(key, self.SOURCE_KEYS, source)
+    def test_the_detector_catches_every_bypass(self):
+        bypasses = [
+            'os.environ.get("REMOTE_TASK_TOKEN")',
+            'e = os.environ\ne.get("REMOTE_TASK_TOKEN")',
+            'K = "REMOTE_TASK_TOKEN"\nos.environ.get(K)',
+            'os.environ.get("REMOTE_TASK_" + "TOKEN")',
+            'os.environ.get(f"REMOTE_TASK_{\'TOKEN\'}")',
+            'os.environ.get(g.TOKEN_KEYS[0])',
+            '[v for k, v in os.environ.items() if k.endswith("TASK_TOKEN")]',
+            'os.environ.__getitem__("REMOTE_TASK_TOKEN")',
+            'Path("~/.config/ag2-sparrow/relay.env").expanduser().read_text()',
+            'open(os.environ.get("AG2_DEVICE_ENV")).read()',
+            'def f():\n    subprocess.run(["security", "find-generic-password", "-s", "x"])',
+            'from channel_token import token_from_vault\ntoken_from_vault(name)',
+            'def g():\n    return discover(env, files, read_token_file=_read_anything)',
+        ]
+        for source in bypasses:
+            self.assertTrue(credential_access(source, "probe.py"), source)
+        allowed = 'def _read_text(path):\n    return open(path).read()\nfiles = env_files(env, _read_text)\n'
+        self.assertEqual(credential_access(allowed, "adapters/hatch/cli.py"), [])
+        self.assertEqual(credential_access('"""Put REMOTE_TASK_TOKEN in the .env file."""\nx = 1\n', "probe.py"), [],
+                         "a docstring naming a key is prose, not a read")
 
     def test_the_vendored_and_generated_copies_match_their_sources(self):
         for cmd in ([sys.executable, str(PKG / "tools" / "sync_from_src.py"), "--check"],

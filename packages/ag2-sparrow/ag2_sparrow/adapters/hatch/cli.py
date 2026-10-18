@@ -131,28 +131,30 @@ def _record_script(sha: str) -> None:
                                             [r for r in recorded if r != sha] + [sha]), 0o644)
 
 
-def _read_text(path) -> str:
+def _read_text(path):
+    """A credential file's text, or None when it cannot be read."""
     try:
         return Path(path).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        return ""
+        return None
 
 
-def _credential_registry() -> "gateway_credentials.SecretRegistry":
-    """Every credential this host could hand Sparrow, registered before any precedence choice:
-    the environment, the device .env file and a token file it names (one owner decides)."""
+def _credential_discovery():
+    """(discovery, registry) for the Sparrow this host runs: the environment it is given (the
+    device .env file named) and the files and token file the owner lists; every materialized
+    candidate registered before any precedence choice. No vault: it is the macOS keychain."""
     registry = gateway_credentials.SecretRegistry()
-    env = dict(os.environ, AG2_DEVICE_ENV=str(device_env_path()))  # what the Sparrow service is given
-    files = [(p, gateway_credential_sources.parse_env_text(_read_text(p)))
-             for p in gateway_credential_sources.channel_env_paths(env)]
-    gateway_credential_sources.discover(env, files, read_token_file=_read_text, registry=registry)
-    return registry
+    env = dict(os.environ, AG2_DEVICE_ENV=str(device_env_path()))
+    found = gateway_credential_sources.discover(
+        env, gateway_credential_sources.env_files(env, _read_text),
+        read_token_file=lambda p: _read_text(p) or "", registry=registry)
+    return found, registry
 
 
 def _diff(old: str, new: str, path: Path) -> str:
     """The diff of an installed file against ours, with every credential withheld: a unit or .env
     on disk may hold a live, rotated or retired token (gateway_credentials.mask_env_assignments)."""
-    registry = _credential_registry()
+    _found, registry = _credential_discovery()
     old, new = (gateway_credentials.mask_env_assignments(t, registry) for t in (old, new))
     return "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
                                         f"{path} (installed)", f"{path} (ag2-sparrow)"))
