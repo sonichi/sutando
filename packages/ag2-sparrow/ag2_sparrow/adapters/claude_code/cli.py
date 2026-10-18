@@ -395,7 +395,7 @@ def install(args) -> int:
         if problem:
             print(f"error: the running session still has the old config: {problem}", file=sys.stderr)
             return 1
-        print(f"restarted: the session, with the new config")
+        print("restarted: the session, with the new config")
     elif changed and status == "none" and lock_holder_pid(work_root(values)):
         print(f"error: a session (pid {lock_holder_pid(work_root(values))}) still runs with the old config and no supervisor "
               "of install's manages it; stop it, then start it again", file=sys.stderr)
