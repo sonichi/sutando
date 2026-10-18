@@ -119,19 +119,21 @@ headless stream showed two separate `init`/`result` pairs, the arming turn and
 the task's own. Plain `claude -p "<prompt>" < /dev/null` exits when its first
 turn ends, so a headless agent needs stdin held open.
 
-## Launch: `ag2-sparrow-connect claude-local`
+## Launch: `ag2-sparrow-claude-local`
 
-The package's `ag2-sparrow-connect` console script hosts the session, so the
+The package's `ag2-sparrow-claude-local` console script hosts the session (one
+script per adapter, as `ag2-sparrow-hatch`: the adapter-boundary rule forbids a
+shared dispatcher that imports adapters), so the
 hand launch below is only for a one-off look:
 
 ```bash
-ag2-sparrow-connect claude-local install \
+ag2-sparrow-claude-local install \
   --plugin-dir packages/ag2-sparrow/adapters/claude-code/ag2space-inbox \
   --claude-config-dir <workspace>/.claude-sutando \
   --hmac-key-file <workspace>/state/auth/task-hmac.key
   # --inbox / --results default to Sparrow's own dirs; --permission-mode default bypassPermissions
-ag2-sparrow-connect claude-local verify
-ag2-sparrow-connect claude-local uninstall
+ag2-sparrow-claude-local verify
+ag2-sparrow-claude-local uninstall
 ```
 
 `install` checks `claude --version` against the pin (2.1.287; an older CLI is
@@ -142,13 +144,23 @@ writes a supervisor whose first line is a marker: a systemd user unit
 `RestartSec=10`, `RestartPreventExitStatus=75`, linger requested) on Linux, a
 launchd agent (`~/Library/LaunchAgents/ai.ag2.sparrow.claude-local.plist`,
 `KeepAlive`, `RunAtLoad`, `ThrottleInterval` 10) on macOS. Both run
-`ag2-sparrow-connect claude-local run`, carry paths only, and never the relay
+`ag2-sparrow-claude-local run`, carry paths only, and never the relay
 token: that stays in Sparrow's 0600 `relay.env`, and the Claude login stays in
 its config dir (`verify` runs `claude auth status` there; nothing is copied).
 
-`run` checks the pin again, takes the one-session-per-inbox `holder_lock` on
-the resolved inbox dir for the whole child (a second launcher exits 75, which
-the systemd unit does not relaunch), and starts
+`run` checks the pin again, takes the one-session-per-inbox `holder_lock` for
+the whole child, and starts the session. The lock is keyed on the inbox's
+**parent** (the work root whose inbox is `<work>/tasks`), the same key the
+Codex, routine and cloud-session adapters use, so one session per inbox holds
+across adapter kinds too. The child inherits the lock descriptor, so the flock
+stays held until both the launcher and the session are gone; a second launcher
+exits 75, which the systemd unit does not relaunch (a session's own exit 75 is
+reported as 1). A `SIGTERM` to the launcher (`systemctl stop`, `bootout`)
+terminates the child, waits up to 15 s, kills it, then releases the lock, so a
+stop leaves neither a running session nor a stale record. The env allowlist
+below does not isolate files: a `bypassPermissions` session can still read
+`relay.env` or anything else on disk if a non-owner task steers it; that is
+the owner's decision when choosing the mode. `run` starts
 
 ```
 claude --plugin-dir <plugin> --permission-mode bypassPermissions \

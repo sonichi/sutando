@@ -163,8 +163,14 @@ export const register: Register = (on) => {
     // The connect launcher sets AG2_AUTOARM=1 beside the dirs: arm now, no model turn needed. A hand
     // launch without the marker keeps the explicit arming prompt.
     if ((await $.env.get('AG2_AUTOARM')) === '1') {
-      const r = await arm($, s, String((await $.env.get('AG2_INBOX_DIR')) || ''), String((await $.env.get('AG2_RESULTS_DIR')) || ''))
-      await $.ui.log(`${PLUGIN}: auto-arm: ${r.result}`, { to: 'debug' })
+      let r: { result: string; isError?: boolean }
+      try {
+        r = await arm($, s, String((await $.env.get('AG2_INBOX_DIR')) || ''), String((await $.env.get('AG2_RESULTS_DIR')) || ''))
+      } catch (err: any) {
+        r = { result: `Error: ${err?.message ?? err}`, isError: true }
+      }
+      // A supervised session that failed to arm would otherwise sit silent: say so where it is seen.
+      await $.ui.log(`${PLUGIN}: auto-arm ${r.isError ? 'FAILED' : 'ok'}: ${r.result}`, r.isError ? {} : { to: 'debug' })
     }
     return next(e)
   })

@@ -138,14 +138,19 @@ def _held_line(work, holder, reason):
 
 
 def lock_holder_pid(work):
-    """The pid of the live holder of `work`'s one-process lock, or None when none holds it or the
-    root does not exist: the only holder read an adapter may make."""
+    """The pid of the LIVE holder of `work`'s one-process lock (a record whose process lineage
+    checks out), else None: a dead holder's record, no record, or no root all read as nobody."""
     try:
-        holder = holder_lock.read_holder(work)
-    except OSError:
+        state = holder_lock.status(work)
+    except (OSError, holder_lock.LockError):
         return None
-    rec = getattr(holder, "record", None) or {}
-    return rec.get("pid") if isinstance(holder, holder_lock.Valid) else None
+    record = (state.get("record") or {}).get("record") or {}
+    return record.get("pid") if state.get("holder_lineage") else None
+
+
+def lock_fd(owner):
+    """The owner's lock descriptor, for a child that must keep the lock held after the owner is gone."""
+    return owner.fd
 
 
 def acquire_lock(work, adapter):
