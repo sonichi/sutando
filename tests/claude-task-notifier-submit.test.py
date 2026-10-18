@@ -289,7 +289,8 @@ class EventDispatchTests(FakeTmuxHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("ENTER", self.sendkeys_log_text(),
                           "Enter must never fire when staging never succeeded")
-        self.assertLess(elapsed, 4,
+        # Below the 8s COMPLETION_TIMEOUT with room for the bounded, locked key sends.
+        self.assertLess(elapsed, 6,
                          f"took {elapsed:.1f}s -- a never-submitted prompt must not wait out "
                          "the completion timeout")
 

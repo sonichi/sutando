@@ -74,6 +74,15 @@ A task object **must** carry a unique `"id"`. Recognized string fields
 and written into the local task file the core consumes. For AG2 Space, the
 broker also supplies its room-policy `access_tier` attestation.
 
+Owner replies to runtime action cards are interpreted before local task-file
+newline confinement. The action text excludes a well-formed broker reply-context
+envelope and the leading quote lines of a legacy Matrix rich-reply fallback
+(`> `, `>\t`, and a bare `>` blank line).
+Only the remaining answer is matched; quoted-only or already-folded quotes do
+not become approvals. The same parser handles private-result review decisions.
+Owner identity, the target card and its current revision/guard remain required;
+an unthreaded Yes does not approve an arbitrary pending prompt.
+
 A worker-picker button may be sent as `"picker_command"` (`add` | `pin` |
 `unpin`) plus optional `"picker_args"` — a JSON object, either inline or
 already serialized as a string; the bridge writes it as JSON either way. Both
@@ -563,20 +572,31 @@ that read.
   finish". Once it is accepted the live result is archived as usual.
 - If the broker refuses that `failed` for good too (it no longer knows the task,
   say), no retry can change it, and the result ends. The item is parked as
-  `refused-for-good`, the result is quarantined to `results/undelivered/` with the
-  outbox's requeue command, as any park is, and the task is settled: archived, its
-  id out of the in-flight set on disk, and its mark retired last, logged once as an
-  `ERROR`. A crash between those steps leaves the mark, so the next start finishes
-  the end in the same order. Neither the drain, the pass that puts results back in
-  flight, nor the reclaim at start revives it. A refused payload that names no
-  task, so that no `failed` can be built, ends the same way at once.
+  `refused-for-good:<reason>`, the refusal's terminal reason kept after the prefix
+  (the delivery core's is `permanent-refusal`; a bare `refused-for-good` an
+  earlier build wrote reads the same). The result is quarantined to
+  `results/undelivered/` with the outbox's requeue command, as any park is, and
+  the task is settled: archived, its id out of the in-flight set on disk, and its
+  mark retired last, logged once as an `ERROR`. A crash between those steps leaves
+  the mark, so the next start finishes the end in the same order. Neither the
+  drain, the pass that puts results back in flight, nor the reclaim at start
+  revives it. A refused payload that names no task, so that no `failed` can be
+  built, ends the same way at once.
 - A park the rule could not prevent, such as the 10-minute window an older bridge
   started before the Mac updated, is requeued with its retry state reset when the
   drain meets it, rather than quarantined.
 
 The outbox requires a finite window, so the relay rule's is a century. Its waiting
 is logged on a backoff (the 1st, 2nd, 4th, 8th ... time in a process, with the
-count), not on every 1-second drain pass. While the marks cannot be read, only a
+count), not on every 1-second drain pass. A relay result the broker has still not
+accepted ten minutes into its retry run is also reported under
+`relay_results_retrying` in `state/gateway-status[.<instance>].json`, as `count`
+and the oldest one's age in seconds, `oldest_age_s`. The age is measured from the
+outbox record's `retry.started_at`, so it starts again after a requeue or a
+reclaim at start, which drop the retry state. The result keeps being retried, and
+the field is absent while none is, and also while the marks file cannot be read
+(logged on its own backoff), so its absence does not prove nothing is retrying.
+While the marks cannot be read, only a
 result that may answer a relay ask waits: a voice task under an `ask-…` id (the
 lane's `ask_sutando` ids). The session-end task (`voice-end-…`) and every other
 result go on. Every result without a kept mark keeps the bounded policy above,

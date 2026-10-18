@@ -297,6 +297,25 @@ class CodexClassification(unittest.TestCase):
         self.assertEqual((v.state, v.reason), ("busy", "press-enter"))
 
 
+class QuotedDialogAboveTheTurnIsTranscript(unittest.TestCase):
+    """Tool output quoting a dialog sits above the turn's spinner; only rows below it are live."""
+    QUOTED = ("  ⎿  │ ❯ 1. Yes                                          │\n"
+              "     │ Enter to select · ↑/↓ to navigate · Esc to cancel │\n"
+              "✻ Perambulating… (1m 46s · esc to interrupt)\n")
+
+    def test_a_working_turn_with_a_draft_is_not_held_by_quoted_output(self):
+        v = pg.classify_pane(f"{self.QUOTED}❯ half typed\n{FOOTER}\n", pg.CLAUDE)
+        self.assertEqual((v.state, v.reason), ("busy", "working"))
+
+    def test_a_live_dialog_below_the_spinner_still_holds_the_pane(self):
+        live = "Select an option:\n❯ 1. main.py\n  2. util.py\n  Enter to select · Esc to cancel\n"
+        v = pg.classify_pane(self.QUOTED + live, pg.CLAUDE)
+        self.assertEqual((v.state, v.reason), ("busy", "selection"))
+
+    def test_live_tail_keeps_everything_without_a_turn_row(self):
+        self.assertEqual(pg.live_tail(["a", "b"]), ["a", "b"])
+
+
 class GateSignaturesNeedACurrentAffordance(unittest.TestCase):
     """A finished turn's prose above the runtime's empty composer is history; only a dialog that
     shows how to answer it (caret on a numbered row, an Enter/Esc hint) holds the pane."""
@@ -927,6 +946,7 @@ class EndToEndThroughTheRealScript(unittest.TestCase):
         shim = self.bin / "tmux"
         shim.write_text(
             "#!/usr/bin/env bash\n"
+            f'. "{REPO}/tests/lib/tmux-fake-unwrap.sh"\n'
             "printf '%s\\n' \"$*\" >> \"$TMUX_LOG\"\n"
             "case \" $* \" in\n"
             "  *' capture-pane '*)\n"

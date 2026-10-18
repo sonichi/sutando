@@ -46,6 +46,8 @@ _STATUS_LINES = {
     STATUS_EXPIRED: "— Expired, no longer applicable.",
     STATUS_CANCELLED: "— Cancelled.",
 }
+# A cleared Claude login is a sign-in; "reconnect" names restoring an AG2 Space agent token.
+_KIND_STATUS_LINES = {("auth", STATUS_RESOLVED): "✓ Signed in — Sutando has continued its work."}
 
 
 def fallback_body(req: HumanRequirement) -> str:
@@ -56,7 +58,7 @@ def fallback_body(req: HumanRequirement) -> str:
     lead = _CATEGORY_HEADS.get(category_of(req.kind),
                                _CATEGORY_HEADS[CATEGORY_BLOCKED])
     head = f"{lead} — {req.message}{where}"
-    closer = _STATUS_LINES.get(req.status)
+    closer = _KIND_STATUS_LINES.get((req.kind, req.status)) or _STATUS_LINES.get(req.status)
     if closer:
         return f"{head}\n\n{closer}"
     return head

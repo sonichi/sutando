@@ -247,13 +247,14 @@ def pending_candidates(
     step handed back.
     """
     claims = Path(claims_dir) if claims_dir else None
-    for task in sort_tasks_by_priority(Path(tasks_dir).glob("*.txt")):
-        if not task.is_file():
-            continue
+    tasks = [t for t in sort_tasks_by_priority(Path(tasks_dir).glob("*.txt"))
+             if t.is_file() and t.name and "/" not in t.name and ".." not in t.name]
+    # One listing per result layout for the whole queue; a per-task glob of the flat archive
+    # costs (tasks x archive size) and dominated every polling caller's CPU.
+    ready = ready_result_filenames(results_dir, [t.name for t in tasks])
+    for task in tasks:
         name = task.name
-        if not name or "/" in name or ".." in name:
-            continue
-        if has_ready_result(results_dir, name):
+        if name in ready:
             continue
         if claims is not None and (claims / name).is_file():
             continue

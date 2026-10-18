@@ -86,7 +86,8 @@ class ProjectorTests(unittest.TestCase):
         self.assertEqual(edit["event_id"], "$ev1")  # EDIT targets the CREATE
         self.assertEqual(edit["dedupe_key"], f"hitl:{req.id}:2")
         self.assertEqual(edit["extra_content"][WIRE_FIELD]["status"], "resolved")
-        self.assertIn("Resolved", edit["body"])
+        self.assertIn("✓ Signed in — Sutando has continued its work.", edit["body"])
+        self.assertNotIn("econnect", edit["body"])
 
     def test_idempotent_between_changes(self):
         req = self.mgr.create(make_req())
@@ -122,6 +123,13 @@ class ProjectorTests(unittest.TestCase):
         req = make_req()
         req.transition("cancelled")
         self.assertIn("Cancelled", fallback_body(req))
+
+    def test_only_a_cleared_login_reads_signed_in(self):
+        for kind, line in (("auth", "✓ Signed in — Sutando has continued its work."),
+                           ("core-blocked", "✓ Resolved — Sutando has continued its work.")):
+            req = make_req(kind=kind)
+            req.transition("resolved")
+            self.assertIn(line, fallback_body(req))
 
     def test_a_decision_does_not_wear_the_blocking_header(self):
         """The card colours choice/confirmation apart from a real block; a client
