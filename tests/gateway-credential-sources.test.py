@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -30,8 +31,26 @@ from unittest import mock
 REPO = Path(__file__).resolve().parent.parent
 PKG = REPO / "packages" / "ag2-sparrow"
 sys.path.insert(0, str(PKG))
+sys.path.insert(0, str(REPO / "shared"))
 from ag2_sparrow import gateway_credential_sources as owner, gateway_credentials as contract  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli  # noqa: E402
+
+
+def _load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module  # a dataclass looks its module up while it is being defined
+    spec.loader.exec_module(module)
+    return module
+
+
+# Every copy is tested, not only the one the package imports: the canonical sources and the
+# generated skill copy are the same code, and drift between them is checked by the guard below.
+CONTRACTS = {"package": contract,
+             "shared": _load("ag2_gateway_credentials", REPO / "shared" / "ag2_gateway_credentials.py"),
+             "skill": _load("room_ops_gateway_credentials", REPO / "skills" / "agent-room-ops" / "gateway_credentials.py")}
+OWNERS = {"package": owner,
+          "src": _load("gateway_credential_sources_src", REPO / "src" / "gateway_credential_sources.py")}
 
 ENV_TOKEN, DEVICE_TOKEN, CHANNEL_TOKEN = "env-token-AAAA1111", "device-token-BBBB2222", "channel-token-CCCC3333"
 VAULT_TOKEN, FILE_TOKEN, RETIRED = "vault-token-DDDD4444", "rotated-token-EEEE5555", "retired-token-FFFF6666"
@@ -93,51 +112,53 @@ class Fixture:
                       "TOKENFILE": str(self.token_file)}.get(token_file, token_file)
         return {"token": token, "source": source, "url": url, "token_file": token_file}
 
-    def owner_files(self):
-        return [(str(p), owner.parse_env_text(p.read_text())) for p in (self.device, self.channel)]
+    def owner_files(self, o=owner):
+        return [(str(p), o.parse_env_text(p.read_text())) for p in (self.device, self.channel)]
 
 
-class PureContract(unittest.TestCase):
+class PureContractCases:
+    c = contract
+
     def test_every_rendering_and_case_of_a_registered_secret_is_withheld(self):
-        registry = contract.SecretRegistry()
+        registry = self.c.SecretRegistry()
         registry.register("MixedToken/9+x")
         for text in ("MixedToken/9+x", "mixedtoken/9+x", "MIXEDTOKEN%2F9%2BX", "mixedtoken%2f9%2bx",
                      "MixedToken%252F9%252Bx", repr("MixedToken/9+x")):
-            self.assertEqual(registry.scrub(f"a {text} b"), contract.WITHHELD_TEXT, text)
+            self.assertEqual(registry.scrub(f"a {text} b"), self.c.WITHHELD_TEXT, text)
         self.assertEqual(registry.scrub("plain words"), "plain words")
         registry.register("\udcff")  # a non-UTF-8 environment byte: total, never raises
         self.assertTrue(registry.contains("x \udcff y"))
 
     def test_pieces_and_code_fields(self):
-        registry = contract.SecretRegistry()
+        registry = self.c.SecretRegistry()
         registry.register("bearer-secret-value-77")
         for value in ("bearer-secret-value-77", "SECRET-VALUE", "secret-value-77"):
-            self.assertIsNone(contract.code_field(value, registry), value)
-        self.assertEqual(contract.code_field("reenroll_disabled", registry), "reenroll_disabled")
-        self.assertIsNone(contract.code_field("has space", registry))
-        self.assertIsNone(contract.code_field("query-secret-3", None, URL_SECRET_URL))
+            self.assertIsNone(self.c.code_field(value, registry), value)
+        self.assertEqual(self.c.code_field("reenroll_disabled", registry), "reenroll_disabled")
+        self.assertIsNone(self.c.code_field("has space", registry))
+        self.assertIsNone(self.c.code_field("query-secret-3", None, URL_SECRET_URL))
 
     def test_url_parts_are_registered_and_redacted(self):
-        registry = contract.SecretRegistry()
+        registry = self.c.SecretRegistry()
         registry.register_gateway_url(URL_SECRET_URL)
         for piece in ("user-name-1", "pass-word-2", "query-secret-3", "frag-secret-4", "k=ab"[:0] + "=query-secret-3"):
             self.assertTrue(registry.contains(f"x {piece} y"), piece)
-        self.assertEqual(contract.redact_text(f"poll {URL_SECRET_URL} failed", URL_SECRET_URL),
+        self.assertEqual(self.c.redact_text(f"poll {URL_SECRET_URL} failed", URL_SECRET_URL),
                          "poll https://gw.example/relay failed")
-        self.assertEqual(contract.redact_text("leaked k=query-secret-3", URL_SECRET_URL), contract.REDACTED_TEXT)
-        self.assertEqual(contract.redact_url("not a url"), contract.REDACTED_URL)
+        self.assertEqual(self.c.redact_text("leaked k=query-secret-3", URL_SECRET_URL), self.c.REDACTED_TEXT)
+        self.assertEqual(self.c.redact_url("not a url"), self.c.REDACTED_URL)
 
     def test_safe_status_and_describe(self):
-        out = contract.safe_status({"a": float("nan"), "b": [1.5, "x"], "c": object()}, lambda t: t.upper())
-        self.assertEqual(out, {"A": contract.WITHHELD, "B": [1.5, "X"], "C": contract.WITHHELD})
+        out = self.c.safe_status({"a": float("nan"), "b": [1.5, "x"], "c": object()}, lambda t: t.upper())
+        self.assertEqual(out, {"A": self.c.WITHHELD, "B": [1.5, "X"], "C": self.c.WITHHELD})
         try:
             {}["owner_dm"]
         except KeyError as e:
-            self.assertRegex(contract.describe(e), r"^KeyError\['owner_dm'\] at ")
-        self.assertEqual(contract.describe(FileNotFoundError(2, "SECRET", "/x")), "FileNotFoundError ENOENT")
+            self.assertRegex(self.c.describe(e), r"^KeyError\['owner_dm'\] at ")
+        self.assertEqual(self.c.describe(FileNotFoundError(2, "SECRET", "/x")), "FileNotFoundError ENOENT")
 
     def test_install_diff_masking_covers_multi_assignment_and_url_lines(self):
-        registry = contract.SecretRegistry()
+        registry = self.c.SecretRegistry()
         registry.register(ENV_TOKEN)
         unit = ("[Service]\n"
                 f'Environment="SAFE=keep-me" "REMOTE_TASK_TOKEN={RETIRED}"\n'
@@ -145,12 +166,39 @@ class PureContract(unittest.TestCase):
                 f"Environment=OTHER={GW}|{RETIRED}\n"
                 "Environment=AG2_DEVICE_ENV=/home/x/relay.env\n"
                 f"ExecStart=/opt/bin/x --flag {ENV_TOKEN.upper()}\n")
-        shown = contract.mask_env_assignments(unit, registry)
+        shown = self.c.mask_env_assignments(unit, registry)
         for secret in (RETIRED, ENV_TOKEN, "user-name-1", "pass-word-2", "query-secret-3", "frag-secret-4"):
             self.assertNotIn(secret.casefold(), shown.casefold(), secret)
         self.assertIn("SAFE=keep-me", shown)
         self.assertIn("Environment=REMOTE_TASK_URL=https://gw.example/relay\n", shown)
         self.assertIn("AG2_DEVICE_ENV=/home/x/relay.env", shown)
+
+    def test_edge_paths_never_raise(self):
+        registry = self.c.SecretRegistry()
+        registry.register("\ud800lone")  # not even surrogateescape encodes a lone high surrogate
+        self.assertTrue(registry.contains("x \ud800lone y"))
+        self.assertEqual(self.c.redact_url("https://u:p@gw.example:8443/relay?k=v#f"), "https://gw.example:8443/relay")
+        self.assertEqual(self.c.redact_url("http://[::1"), self.c.REDACTED_URL)
+        self.assertIn("?k=secret-v", self.c.secret_parts("http://[::1?k=secret-v"))
+        self.assertEqual(self.c.redact_text("plain", ""), "plain")
+        self.assertEqual(self.c.redact_text("x bare-host y", "bare-host"), "x <unparseable gateway URL> y")
+        self.assertEqual(self.c.safe_status(True, str.upper), True)
+        self.assertEqual(self.c.mask_env_assignments('Environment="unclosed\n'), "Environment=<withheld>\n")
+        self.assertEqual(self.c.mask_env_assignments("Environment=NOEQUALS\n"), "Environment=<withheld>\n")
+        self.assertEqual(self.c.mask_env_assignments("free text line\n"), "free text line\n")
+        import urllib.error
+        import io as _io
+        err = urllib.error.URLError(ConnectionRefusedError(61, "x"))
+        self.assertTrue(self.c.describe(err).startswith("URLError(ConnectionRefusedError/"))
+        http = urllib.error.HTTPError("u", 503, "SECRET", {}, _io.BytesIO())
+        self.assertEqual(self.c.describe(http), "HTTPError (HTTP 503)")
+        def deeper():
+            raise ValueError("SECRET")
+        try:
+            deeper()
+        except ValueError as e:
+            self.assertRegex(self.c.describe(e), r"^ValueError at [\w.-]+:\d+$")
+            self.assertEqual(int(self.c.describe(e).rsplit(":", 1)[1]), deeper.__code__.co_firstlineno + 1)
 
     def test_the_contract_is_pure(self):
         tree = ast.parse((REPO / "shared" / "ag2_gateway_credentials.py").read_text())
@@ -162,9 +210,25 @@ class PureContract(unittest.TestCase):
         self.assertFalse([v for v in module_level if "SecretRegistry(" in v], "no module-global registry")
 
 
-class Discovery(unittest.TestCase):
+
+
+class PackageContract(PureContractCases, unittest.TestCase):
+    c = CONTRACTS["package"]
+
+
+class SharedContract(PureContractCases, unittest.TestCase):
+    c = CONTRACTS["shared"]
+
+
+class SkillContract(PureContractCases, unittest.TestCase):
+    c = CONTRACTS["skill"]
+
+
+class DiscoveryCases:
+    o = owner
+
     def test_the_table_is_stated_once(self):
-        self.assertEqual(owner.SOURCES, (("token", ("env", "file", "vault")),
+        self.assertEqual(self.o.SOURCES, (("token", ("env", "file", "vault")),
                                          ("url", ("env", "token", "file")),
                                          ("token_file", ("env", "file")),
                                          ("media_token", ("env",))))
@@ -173,8 +237,8 @@ class Discovery(unittest.TestCase):
         for row in ROWS:
             with self.subTest(row=row[0]), tempfile.TemporaryDirectory() as td:
                 fx = Fixture(Path(td), row)
-                registry = contract.SecretRegistry()
-                found = owner.discover(fx.env, fx.owner_files(),
+                registry = self.o.contract.SecretRegistry()
+                found = self.o.discover(fx.env, fx.owner_files(self.o),
                                        read_token_file=lambda p: Path(p).read_text() if Path(p).exists() else "",
                                        vault_lookup=lambda key, v=fx.vault: v if key == "REMOTE_TASK_TOKEN" else "",
                                        registry=registry)
@@ -186,12 +250,39 @@ class Discovery(unittest.TestCase):
                         continue  # the vault is read only when no earlier source holds a token
                     self.assertTrue(registry.contains(f"x {candidate} y"), candidate)
 
+    def test_the_parsers_and_tiers(self):
+        self.assertEqual(self.o.parse_env_text("# c\n\nA = ' x '\nnoequals\n"), {"A": " x "}, "whitespace, then the quotes")
+        self.assertEqual(self.o.channel_env_paths({"AG2_DEVICE_ENV": "/d", "CLAUDE_CONFIG_DIR": "/c"}, "chan"),
+                         ["/d", os.path.join("/c", "channels", "chan", ".env")])
+        self.assertEqual(self.o.channel_env_paths({}), [])
+        files = [("/a", {"X": ""}), ("/b", {"X": "later", "Y": "y"})]
+        self.assertEqual(self.o.config_from_files(files, "X"), "", "an explicit blank is a decision")
+        self.assertEqual(self.o.config_from_files(files, "Y"), "y")
+        self.assertEqual(self.o.config_from_files(files, "Z"), "")
+        text = "export REMOTE_TASK_TOKEN='tok-1'\nAG2_REMOTE_TOKEN=legacy\nAG2_REMOTE_URL=https://u.example/relay\n"
+        self.assertEqual((self.o.token_file_token(text), self.o.token_file_url(text)), ("tok-1", "https://u.example/relay"))
+        self.assertEqual(self.o.token_file_token("# comment\nhttps://g.example/r|raw\n"), "https://g.example/r|raw")
+        self.assertEqual(self.o.token_file_token("A=b\n"), "")
+        self.assertEqual(self.o.token_from_vault(lambda key: ""), ("", ""))
+        self.assertEqual(self.o.first_env({"REMOTE_TASK_TOKEN": "''", "AG2_REMOTE_TOKEN": "x"}, self.o.TOKEN_KEYS),
+                         ("", "REMOTE_TASK_TOKEN"), "a set but quoted-empty env value still wins, as it always has")
+
     def test_the_owner_opens_nothing_itself(self):
         tree = ast.parse((REPO / "src" / "gateway_credential_sources.py").read_text())
         calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
         for io_call in ("open", "os.environ.get", "os.getenv", "Path", "print"):
             self.assertNotIn(io_call, calls, io_call)
         self.assertNotIn("os.environ", ast.unparse(tree))
+
+
+
+
+class PackageDiscovery(DiscoveryCases, unittest.TestCase):
+    o = OWNERS["package"]
+
+
+class SrcDiscovery(DiscoveryCases, unittest.TestCase):
+    o = OWNERS["src"]
 
 
 BRIDGE = """
@@ -209,14 +300,20 @@ print(json.dumps({"token": m.TOKEN, "source": m._FOUND.token_source, "url": m.UR
 class RealSinks(unittest.TestCase):
     """The same rows through the real bridge and the real Hatch install diff."""
 
-    def bridge(self, fx):
+    def bridge(self, fx, script=BRIDGE):
         state = fx.root / "state"
         env = {"PATH": "/usr/bin:/bin", "HOME": str(fx.root), "PYTHONPATH": str(PKG),
                "AGENT_CONNECT_TASK_DIR": str(fx.root / "t"), "AGENT_CONNECT_RESULT_DIR": str(fx.root / "r"),
                "AGENT_CONNECT_STATE_DIR": str(state), **fx.env}
-        script = BRIDGE.replace("VAULT", json.dumps(fx.vault)).replace("CANDIDATES", json.dumps(fx.candidates))
-        r = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True,
-                           cwd=str(fx.root), timeout=60)
+        child = fx.root / "child.py"
+        child.write_text(script.replace("VAULT", json.dumps(fx.vault)).replace("CANDIDATES", json.dumps(fx.candidates)))
+        cmd, cwd = [sys.executable, str(child)], fx.root
+        if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":  # the gate measures the child too
+            import coverage
+            env["PYTHONPATH"] += os.pathsep + str(Path(coverage.__file__).parent.parent)
+            cmd = [sys.executable, "-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}", str(child)]
+            cwd = REPO
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, cwd=str(cwd), timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1]), r.stderr
 
@@ -236,6 +333,18 @@ class RealSinks(unittest.TestCase):
                     self.assertIn("token not in env; loaded from", err)
                 if row[1].get("AG2_REMOTE_TOKEN"):
                     self.assertIn("AG2_REMOTE_TOKEN is deprecated", err)
+
+    def test_an_unreadable_file_is_skipped_and_the_media_marker_is_carried(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), ROWS[2])
+            fx.device.unlink()
+            fx.device.mkdir()  # unreadable as a file: the next candidate supplies the token
+            _write_env(fx.channel, {"REMOTE_TASK_TOKEN": CHANNEL_TOKEN, "REMOTE_TASK_URL": GW,
+                                    "REMOTE_MEDIA_MARKER": "media-tag"})
+            out, err = self.bridge(fx, BRIDGE.replace("print(json.dumps({",
+                                                      'import os\nprint(json.dumps({"marker": os.environ.get("REMOTE_MEDIA_MARKER"), '))
+            self.assertEqual((out["token"], out["source"], out["marker"]), (CHANNEL_TOKEN, "file", "media-tag"))
+            self.assertIn(f"loaded from {fx.channel}", err)
 
     def test_the_hatch_install_diff_withholds_every_candidate_of_every_row(self):
         for row in ROWS:
