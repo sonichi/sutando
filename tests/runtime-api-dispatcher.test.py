@@ -9,6 +9,12 @@ are security contracts (governed-capability gating, fingerprint binding, one-tim
 approval consumption, idempotency, crash recovery), and a response object alone
 does not prove the row transitioned correctly.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import json
 import os
