@@ -421,7 +421,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`__init__.py`** — _(no header comment)_
 - **`guardrail.py`** — The Team-tier guardrail prose, shared by every surface that admits Team work.
-- **`sandbox_runner.py`** — Which CLI runs a non-owner request in the read-only, no-network sandbox, and how.
+- **`sandbox_runner.py`** — Which CLI runs a non-owner request in the sandbox (agy fenced; claude opt-in), and how.
 - **`seatbelt.py`** — A per-run macOS Seatbelt (`sandbox-exec`) profile that fences one CLI run.
 
 ## `src/policy/context/`

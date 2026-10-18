@@ -220,7 +220,7 @@ class InProcess(unittest.TestCase):
 
 
 class Script(unittest.TestCase):
-    def run_script(self, *args, command=None):
+    def run_script(self, *args, command=None, opt_in=True):
         tmp = Path(tempfile.mkdtemp(prefix="review-pr-test-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         bindir = tmp / "bin"
@@ -233,8 +233,11 @@ class Script(unittest.TestCase):
         env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
         # Default order, but no fenced runner ready: the stub codex has no native
         # binary, and agy (possibly installed in ~/.local/bin) has no API key.
-        for k in ("SUTANDO_SANDBOX_RUNNERS", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        for k in ("SUTANDO_SANDBOX_RUNNERS", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+                  sr.CLAUDE_OPT_IN_KEY):
             env.pop(k, None)
+        if opt_in:
+            env[sr.CLAUDE_OPT_IN_KEY] = "1"
         argv = ["bash", "-c", command] if command else ["bash", str(SCRIPT), "7", *args]
         return subprocess.run(argv, cwd=REPO, env=env,
                               capture_output=True, text=True, stdin=subprocess.DEVNULL,
@@ -253,6 +256,14 @@ class Script(unittest.TestCase):
         self.assertEqual(rec["argv"][rec["argv"].index("--tools") + 1], "Read,Grep,Glob")
         self.assertIn("--restricted", rec["argv"])
         self.assertFalse(cwd.exists(), "the review dir was not removed")
+
+    def test_non_owner_without_opt_in_runs_nothing(self):
+        """No fenced agy and claude not opted in: exit 3, no runner spawned."""
+        p = self.run_script("--non-owner", opt_in=False)
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertIn("sandboxed path unavailable", p.stderr)
+        self.assertFalse(self.claude_log.exists(), "claude ran without the owner's opt-in")
+        self.assertFalse(self.codex_log.exists(), "codex was invoked")
 
     def test_owner_path_still_runs_codex(self):
         self.run_script()

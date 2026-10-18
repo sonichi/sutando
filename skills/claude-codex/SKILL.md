@@ -99,13 +99,15 @@ do NOT drop it near 120 or you'll kill legitimate reviews.
 file the user can, so a review asked for by anyone but the owner must not use it. With
 `--non-owner`, `scripts/review_pr_sandbox.py` copies the PR's diff and its changed files at
 the head commit into a fresh temp dir outside the repo and workspace, and runs the first
-usable runner from `src/policy/sandbox_runner.py` there, in the configured order
-(`agy,codex,claude`). On macOS, agy runs inside a per-run Seatbelt profile
+usable runner from `src/policy/sandbox_runner.py` there. agy is the default; on macOS it
+runs inside a per-run Seatbelt profile
 (`src/policy/seatbelt.py`): every process may read and write only that dir and a scratch
 dir, the tool binary alone reads its own install, nothing reaches loopback, and outbound is
-TCP 443 plus DNS. Codex is always skipped: fenced, its in-process `apply_patch` could still
-read or move the `auth.json` login it must hold. Elsewhere, or when agy has no API key in its
-env, claude runs with Read/Grep/Glob confined to that dir (no command, network or MCP). Exit `3` = no safe runner installed. The team-tier
+TCP 443 plus DNS. Codex is never used: fenced, its in-process `apply_patch` could still
+read or move the `auth.json` login it must hold. claude runs (with Read/Grep/Glob confined to
+that dir, no command, network or MCP) only when the owner sets `SUTANDO_SANDBOX_ALLOW_CLAUDE`
+on (declared off in this skill's `manifest.json`). Neither usable: exit `3`, sandboxed path
+unavailable, no fallback. The team-tier
 `===SUTANDO SYSTEM INSTRUCTIONS===` block runs `review-pr.sh <N> --non-owner` to auto-review
 a non-owner PR-review request (owner-ping only on failure).
 

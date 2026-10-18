@@ -19,7 +19,8 @@
 # printed after the marker, so the verdict names what it actually reviewed.
 #
 # --non-owner: anyone but the owner. review_pr_sandbox.py reviews in a temp dir holding
-# only the PR's files, never with codex (fenced agy on macOS, else confined claude).
+# only the PR's files: fenced agy on macOS by default, confined claude only if the owner
+# opted in (SUTANDO_SANDBOX_ALLOW_CLAUDE), never codex; neither usable exits 3.
 #
 # stdout is NOT the verdict: take only what follows the LAST `VERDICT-MARKER:` line.
 # The stream, or its tail, picks up codex trace or truncates the checks. See SKILL.md.
@@ -108,6 +109,6 @@ printf '%s\n' "$VERDICT_MARKER"
 if [[ $rc -eq 0 && -s "$OUT" ]]; then
     cat "$OUT"
 else
-    echo "review-pr: no verdict for #$PR (exit $rc — 125=stalled, 124=hit --max, 3=no safe runner, other=error)" >&2
+    echo "review-pr: no verdict for #$PR (exit $rc — 125=stalled, 124=hit --max, 3=sandboxed path unavailable, other=error)" >&2
 fi
 exit "$rc"

@@ -3,15 +3,15 @@
 
 `review-pr.sh --non-owner` calls this. It copies the PR's diff and its changed
 files at the head commit into a fresh temp dir outside the repo and workspace,
-then runs the first usable runner from src/policy/sandbox_runner.py there, in the
-configured order: agy only inside the macOS Seatbelt fence (which lets it read
-that dir and nothing of the owner's), else claude with read-only file tools
-confined to that dir. Codex is never used: its own read-only sandbox reads every
-file the user can, and fenced, its in-process apply_patch can move its login.
+then runs the first usable runner from src/policy/sandbox_runner.py there: agy,
+the default, only inside the macOS Seatbelt fence (which lets it read that dir and
+nothing of the owner's); claude, with read-only file tools confined to that dir,
+only when the owner opted in. Codex is never used: its own read-only sandbox reads
+every file the user can, and fenced, its in-process apply_patch can move its login.
 
     review_pr_sandbox.py --pr N [--repo owner/repo] --diff-file F --out F [--max S]
 
-Exit: the runner's code; 124 when it hits --max; 3 when no safe runner is installed.
+Exit: the runner's code; 124 when it hits --max; 3 when no runner is usable (sandboxed path unavailable).
 """
 from __future__ import annotations
 
@@ -130,7 +130,7 @@ def review_dir(workspace: Optional[Path] = None) -> Path:
 
 
 def build(root: Path, diff: str, which: Callable = shutil.which) -> Optional[sr.Invocation]:
-    """The confined invocation for a review in `root`; None when no safe runner."""
+    """The confined invocation for a review in `root`; None when no runner is usable."""
     picked = sr.select_runner(which=which, fenced=True)
     if picked is None:
         return None
@@ -145,8 +145,9 @@ def run(pr: str, repo: str, diff: str, out: Path, max_s: int, gh: Gh = _gh) -> i
         populate(root, pr, repo, diff, gh)
         inv = build(root, diff)
         if inv is None:
-            print("review-pr: no safe sandbox runner installed (needs claude, or agy "
-                  "on macOS)", file=sys.stderr)
+            print("review-pr: sandboxed path unavailable: no usable runner (agy fenced on "
+                  f"macOS with an API key, or claude with {sr.CLAUDE_OPT_IN_KEY} on)",
+                  file=sys.stderr)
             return NO_RUNNER
         try:
             p = subprocess.run(inv.argv, cwd=inv.cwd, env=inv.env, stdin=subprocess.DEVNULL,

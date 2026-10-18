@@ -69,7 +69,10 @@ class _ReviewCanary(unittest.TestCase):
     def setUpClass(cls):
         self = cls
         self.binary = sr.find_binary(cls.RUNNER)
-        if self.binary is None or not sr.usable(sr.RUNNERS[cls.RUNNER], self.binary, fenced=True):
+        # claude is opted in: what is judged here is the runner's confinement.
+        opted = dict(os.environ, **{sr.CLAUDE_OPT_IN_KEY: "1"})
+        if self.binary is None or not sr.usable(sr.RUNNERS[cls.RUNNER], self.binary, opted,
+                                                fenced=True):
             raise unittest.SkipTest(f"{cls.RUNNER} not usable as a sandbox runner on this host")
         self.runner = sr.RUNNERS[cls.RUNNER]
         self.owner = fence_canary.OwnerFiles()
@@ -82,7 +85,7 @@ class _ReviewCanary(unittest.TestCase):
         self.secret_path.write_text(self.secret + "\n")
         review_pr_fixture.install(self.tmp / "bin",
                                   pr_spec(self.secret_path, self.public))
-        env = dict(os.environ, PATH=f"{self.tmp / 'bin'}{os.pathsep}{os.environ['PATH']}",
+        env = dict(opted, PATH=f"{self.tmp / 'bin'}{os.pathsep}{os.environ['PATH']}",
                    **{sr.CONFIG_KEY: cls.RUNNER, fence_canary.ENV_VAR: self.owner.env_token})
         self.proc = subprocess.run(["bash", str(SCRIPT), "42", "--non-owner"], cwd=REPO,
                                    env=env, capture_output=True, text=True,

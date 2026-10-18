@@ -474,9 +474,9 @@ def main() -> int:
     rtc._write_task({**TASK, "id": "task-GUEST", "access_tier": "guest"})
     guest_body = (rtc.TASKS_DIR / "task-GUEST.txt").read_text()
     check("access_tier: guest" in guest_body
-          and "claude -p --restricted --strict-mcp-config --tools ''" in guest_body
+          and "python3 -E -s src/policy/sandbox_runner.py run --" in guest_body
           and "codex exec" not in guest_body,
-          "guest task delegates to the no-tools sandbox, never codex")
+          "guest task delegates to the sandbox_runner in-band command, never codex")
     # context enrichment: room_name / sender_name / reply_to_* serialize when
     # present, and a newline in a name can't forge an extra field line.
     rtc._write_task({**TASK, "id": "task-CTX", "room_name": "#design",
