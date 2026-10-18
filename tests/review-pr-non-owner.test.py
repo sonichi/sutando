@@ -26,7 +26,7 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "tests" / "_helpers"))
 sys.path.insert(0, str(REPO / "skills" / "claude-codex" / "scripts"))
 
-from policy import sandbox_runner as sr  # noqa: E402
+from policy import sandbox_runner as sr, seatbelt  # noqa: E402
 import discord_env, review_pr_fixture, review_pr_sandbox as rps  # noqa: E401,E402
 
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="review-pr-ccd-")
@@ -139,9 +139,10 @@ class ConfinedInvocation(unittest.TestCase):
         self.assertNotIn("--add-dir", a)
         self.assertEqual(a[-2:], ["--", "p"])
 
-    def test_refuses_unsafe_runners_and_bad_dirs(self):
+    def test_refuses_unfenced_unsafe_runners_and_bad_dirs(self):
         for name in ("codex", "agy"):
-            with self.assertRaises(ValueError):
+            with mock.patch.object(seatbelt, "available", return_value=False), \
+                    self.assertRaises(ValueError):
                 sr.confined_invocation(sr.RUNNERS[name], f"/b/{name}", "p", cwd=str(self.root))
         with self.assertRaises(ValueError):
             sr.confined_invocation(sr.RUNNERS["claude"], "/b/claude", "p",
@@ -308,8 +309,9 @@ class Script(unittest.TestCase):
         for n in ("claude", "codex"):
             (bindir / n).chmod(0o755)
         env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
-        env.pop("SUTANDO_SANDBOX_RUNNERS", None)
-        for k in HOSTILE_ENV:
+        # Default order, but no fenced runner ready: the stub codex has no native
+        # binary, and agy (possibly installed in ~/.local/bin) has no API key.
+        for k in ("SUTANDO_SANDBOX_RUNNERS", "GEMINI_API_KEY", "GOOGLE_API_KEY", *HOSTILE_ENV):
             env.pop(k, None)
         env.update(extra_env or {})
         argv = ["bash", "-c", command] if command else ["bash", str(SCRIPT), "7", *args]
@@ -317,7 +319,7 @@ class Script(unittest.TestCase):
                               capture_output=True, text=True, stdin=subprocess.DEVNULL,
                               timeout=60)
 
-    def test_non_owner_runs_claude_confined_and_never_codex(self):
+    def test_non_owner_runs_claude_confined_and_never_codex_unfenced(self):
         p = self.run_script("--non-owner")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("STUB REVIEW", p.stdout)

@@ -3,9 +3,11 @@
 
 `review-pr.sh --non-owner` calls this. It copies the PR's diff and its changed
 files at the head commit into a fresh temp dir outside the repo and workspace,
-then runs the safe runner from src/policy/sandbox_runner.py there with read-only
-file tools confined to that dir. Codex is never used: its read-only sandbox still
-reads every file the user can.
+then runs the first usable runner from src/policy/sandbox_runner.py there, in the
+configured order: agy only inside the macOS Seatbelt fence (which lets it read
+that dir and nothing of the owner's), else claude with read-only file tools
+confined to that dir. Codex is never used: its own read-only sandbox reads every
+file the user can, and fenced, its in-process apply_patch can move its login.
 
     review_pr_sandbox.py --pr N [--repo owner/repo] --diff-file F --out F [--max S]
     review_pr_sandbox.py --task-mode TASK_FILE   # prints owner | non-owner
@@ -150,7 +152,7 @@ def review_dir(workspace: Optional[Path] = None) -> Path:
 
 def build(root: Path, diff: str, which: Callable = shutil.which) -> Optional[sr.Invocation]:
     """The confined invocation for a review in `root`; None when no safe runner."""
-    picked = sr.select_runner(which=which)
+    picked = sr.select_runner(which=which, fenced=True)
     if picked is None:
         return None
     runner, binary = picked
@@ -164,14 +166,17 @@ def run(pr: str, repo: str, diff: str, out: Path, max_s: int, gh: Gh = _gh) -> i
         populate(root, pr, repo, diff, gh)
         inv = build(root, diff)
         if inv is None:
-            print("review-pr: no safe sandbox runner installed (needs claude)", file=sys.stderr)
+            print("review-pr: no safe sandbox runner installed (needs claude, or agy "
+                  "on macOS)", file=sys.stderr)
             return NO_RUNNER
         try:
-            p = subprocess.run(inv.argv, cwd=inv.cwd, stdin=subprocess.DEVNULL,
+            p = subprocess.run(inv.argv, cwd=inv.cwd, env=inv.env, stdin=subprocess.DEVNULL,
                                capture_output=True, text=True,
                                timeout=max_s if max_s > 0 else None)
         except subprocess.TimeoutExpired:
             return 124
+        finally:
+            sr.release(inv)
         out.write_text(p.stdout)
         if p.returncode != 0:
             sys.stderr.write(p.stderr[-2000:])

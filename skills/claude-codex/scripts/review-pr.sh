@@ -18,9 +18,8 @@
 # request did not come from this checkout. Either way the resolved repo and title are
 # printed after the marker, so the verdict names what it actually reviewed.
 #
-# --non-owner: for a request from anyone but the owner. Codex is not used (its
-# read-only sandbox still reads every file the user can); review_pr_sandbox.py runs
-# the safe runner in a temp dir holding only the PR's diff and changed files.
+# --non-owner: anyone but the owner. review_pr_sandbox.py reviews in a temp dir holding
+# only the PR's files, never with codex (fenced agy on macOS, else confined claude).
 #
 # --task-file F: only an explicit `access_tier: owner` header gets owner mode; any
 # other tier, a missing one or an unreadable file means --non-owner.

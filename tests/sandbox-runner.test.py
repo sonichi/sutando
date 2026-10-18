@@ -2,9 +2,10 @@
 """The non-owner sandbox runner has ONE owner: src/policy/sandbox_runner.py.
 
 Pins: the first safe, installed runner in the configured order is chosen; agy and
-codex are never chosen (neither can be confined so it reads no file); claude runs
-with no tools in a fresh empty temp dir; the guardrail text and the Discord bridge
-both take the runner from the module, so neither can drift.
+codex are never chosen unfenced (neither can be confined by its own flags so it
+reads no file; their Seatbelt-fenced runs are pinned in tests/seatbelt-fence.test.py);
+claude runs with no tools in a fresh empty temp dir; the guardrail text and the
+Discord bridge both take the runner from the module, so neither can drift.
 
 Run: python3 tests/sandbox-runner.test.py
 """
@@ -25,8 +26,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from policy import sandbox_runner as sr  # noqa: E402
-from policy import guardrail  # noqa: E402
+from policy import guardrail, sandbox_runner as sr, seatbelt  # noqa: E402
 sys.path.insert(0, str(REPO / "tests" / "_helpers"))
 import discord_env  # noqa: E402
 
@@ -58,7 +58,8 @@ class OrderSelection(unittest.TestCase):
         self.assertFalse(sr.RUNNERS["agy"].safe)
         self.assertIn("no flag-only read-only, no-network mode", sr.RUNNERS["agy"].unsafe_reason)
         self.assertIsNone(sr.select_runner(("agy",), fake_which({"agy"})))
-        with sr.empty_dir() as d, self.assertRaises(ValueError):
+        with mock.patch.object(seatbelt, "available", return_value=False), \
+                sr.empty_dir() as d, self.assertRaises(ValueError):
             sr.invocation(sr.RUNNERS["agy"], "/fake/bin/agy", "p", cwd=d)
 
     def test_codex_is_never_selected(self):
@@ -67,8 +68,13 @@ class OrderSelection(unittest.TestCase):
         self.assertIn("denies reads outside", sr.RUNNERS["codex"].unsafe_reason)
         self.assertIsNone(sr.select_runner(("codex",), fake_which({"codex"})))
         self.assertIsNone(sr.select_runner(None, fake_which({"codex"}), {sr.CONFIG_KEY: "codex"}))
-        with sr.empty_dir() as d, self.assertRaises(ValueError):
-            sr.invocation(sr.RUNNERS["codex"], "/fake/bin/codex", "p", cwd=d)
+        for fence in (False, True):  # with or without the macOS fence, codex never runs
+            with self.subTest(fence=fence), \
+                    mock.patch.object(seatbelt, "available", return_value=fence):
+                self.assertIsNone(sr.select_runner(("codex",), fake_which({"codex"}), fenced=True))
+                for build in (sr.invocation, sr.confined_invocation):
+                    with sr.empty_dir() as d, self.assertRaises(ValueError):
+                        build(sr.RUNNERS["codex"], "/fake/bin/codex", "p", cwd=d)
         with self.assertRaises(ValueError):
             sr.shell_command(sr.RUNNERS["codex"], "P")
 
@@ -134,8 +140,9 @@ class OrderConfig(unittest.TestCase):
 
 
 class Invocations(unittest.TestCase):
-    def test_a_runner_with_no_safe_flags_has_no_invocation(self):
-        with sr.empty_dir() as d, self.assertRaises(ValueError):
+    def test_a_runner_with_no_safe_flags_and_no_fence_has_no_invocation(self):
+        with mock.patch.object(seatbelt, "available", return_value=False), \
+                sr.empty_dir() as d, self.assertRaises(ValueError):
             sr.invocation(sr.RUNNERS["agy"], "/b/agy", "PROMPT", cwd=d)
 
     def test_claude_argv_has_no_tools_and_no_mcp(self):
@@ -321,17 +328,24 @@ class DiscordBridgeDelegates(unittest.TestCase):
         self.assertNotIn("Do NOT redirect stdout", claude["team"])
         self.assertNotIn("-C /tmp", claude["guest"])
 
-    def _spawn_with(self, picked, stdout=b"", write_file=None):
+    def _spawn_with(self, picked, stdout=b"", write_file=None, rc=0, hang=False, fail=False):
         captured = {}
 
         class Proc:
-            returncode = 0
+            returncode = rc
 
             async def communicate(self):
+                if hang:
+                    await asyncio.sleep(60)
                 return stdout, b""
+
+            def kill(self):
+                captured["killed"] = True
 
         async def fake_exec(*argv, **kw):
             captured.update(argv=list(argv), kw=kw)
+            if fail:
+                raise OSError("spawn failed")
             if write_file is not None and "-o" in argv:
                 Path(argv[argv.index("-o") + 1]).write_text(write_file)
             return Proc()
@@ -340,7 +354,7 @@ class DiscordBridgeDelegates(unittest.TestCase):
         sr.select_runner = lambda *a, **k: picked
         self.bridge.asyncio.create_subprocess_exec = fake_exec
         try:
-            raw = asyncio.run(self.bridge._run_codex_subprocess("judge me", None, 5))
+            raw = asyncio.run(self.bridge._run_codex_subprocess("judge me", None, 0.2 if hang else 5))
         finally:
             sr.select_runner, self.bridge.asyncio.create_subprocess_exec = orig_sel, orig_exec
         return raw, captured
@@ -351,6 +365,14 @@ class DiscordBridgeDelegates(unittest.TestCase):
         self.assertEqual(cap["argv"][:2], ["/fake/claude", "-p"])
         self.assertIs(cap["kw"]["stdin"], asyncio.subprocess.DEVNULL)
         self.assertTrue(os.path.basename(cap["kw"]["cwd"]).startswith("sutando-sandbox-"))
+
+    def test_judge_failures_return_nothing(self):
+        claude = (sr.RUNNERS["claude"], "/fake/claude")
+        self.assertEqual(self._spawn_with(claude, stdout=b"x", fail=True)[0], "")
+        self.assertEqual(self._spawn_with(claude, stdout=b"x", rc=2)[0], "")
+        raw, cap = self._spawn_with(claude, stdout=b"x", hang=True)
+        self.assertEqual(raw, "")
+        self.assertTrue(cap.get("killed"))
 
     def test_judge_with_no_runner_spawns_nothing(self):
         raw, cap = self._spawn_with(None)

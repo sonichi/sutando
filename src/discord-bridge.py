@@ -1352,32 +1352,36 @@ async def _run_codex_subprocess(prompt, model, timeout_s):
     timeout, non-zero exit). `model` is accepted for the caller's signature;
     the sandboxed runner uses its own default.
     """
-    picked = sandbox_runner.select_runner()
+    picked = sandbox_runner.select_runner(fenced=True)
     if picked is None:
         return ""
     with sandbox_runner.empty_dir() as cwd:
         inv = sandbox_runner.invocation(*picked, prompt, cwd=cwd)
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *inv.argv,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=inv.cwd,
-            )
-        except Exception:
-            return ""
-        try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-        except asyncio.TimeoutError:
             try:
-                proc.kill()
+                proc = await asyncio.create_subprocess_exec(
+                    *inv.argv,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=inv.cwd,
+                    env=inv.env,
+                )
             except Exception:
-                pass
-            return ""
-        if proc.returncode != 0:
-            return ""
-        return (stdout or b"").decode("utf-8", errors="replace")
+                return ""
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return ""
+            if proc.returncode != 0:
+                return ""
+            return (stdout or b"").decode("utf-8", errors="replace")
+        finally:
+            sandbox_runner.release(inv)
 
 
 # ---------------------------------------------------------------------------
