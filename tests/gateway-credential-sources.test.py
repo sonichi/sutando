@@ -23,6 +23,8 @@ import importlib.util
 import io
 import json
 import os
+import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -132,6 +134,14 @@ ORACLE_STEMS = ("pass", "pwd", "secret", "token", "key", "auth", "cred", "bearer
                 "priv", "sig", "otp", "apikey", "pw", "pat")
 ORACLE_SEPARATORS = ("/", ".", "-", " ", "+", ":", "_", "\\\"", "\u2022", "\u00b7", "\u2192", "\u3000")
 ORACLE_CONTROLS = ("name", "note", "colour", "ExecStart", "mode")
+
+
+def unquoted_name_lines(name: str, sep: str) -> "tuple[str, ...]":
+    """`name` as a plain assignment, colon key and flag; a flag word split at an ASCII blank is two
+    shell words, so there the flag is only the quoted one."""
+    lines = (f"{name}=synth-only-value", f"{name}: synth-only-value", f"run --{name}=synth-only-value",
+             f'run --"{name}" synth-only-value', f"run '--{name}' synth-only-value")
+    return lines + (() if sep == " " else (f"run --{name} synth-only-value",))
 
 
 def name_sweep():
@@ -302,12 +312,22 @@ class PureContractCases:
                     self.assertEqual(self.c.credential_shaped(line), shaped, line)
                     shown = self.c.mask_env_assignments(line + "\n", self.c.SecretRegistry())
                     self.assertEqual("synth-only-value" not in shown, shaped, shown)
-            if not sep.isspace():
-                for line in (f"{name}=synth-only-value", f"{name}: synth-only-value", f"run --{name} synth-only-value",
-                             f"run --{name}=synth-only-value"):
-                    with self.subTest(line=line):
-                        self.assertEqual("synth-only-value" not in self.c.mask_env_assignments(
-                            line + "\n", self.c.SecretRegistry()), shaped, line)
+            for line in unquoted_name_lines(name, sep):
+                with self.subTest(line=line):
+                    self.assertEqual(self.c.credential_shaped(line), shaped, line)
+                    self.assertEqual("synth-only-value" not in self.c.mask_env_assignments(
+                        line + "\n", self.c.SecretRegistry()), shaped, line)
+
+    def test_a_name_position_judges_every_suffix_of_its_line(self):
+        rng, alphabet = random.Random(5698), "pPaAtTwWsSkKeEyYxX01 _-./\"'\u3000\uff50"
+        for _ in range(4000):
+            view = "".join(rng.choice(alphabet + ":=") for _ in range(rng.randint(1, 24)))
+            seps = [m.start() for m in self.c._SEPARATOR_RE.finditer(view)]
+            judged = self.c._name_positions(view)[:len(seps)]
+            for j, (named, _value) in zip(seps, judged):
+                start = max(view.rfind("\n", 0, j), view.rfind("\r", 0, j)) + 1
+                if any(self.c.credential_name(view[i:j]) for i in range(start, j)):
+                    self.assertTrue(named, (view, j))
 
     def test_a_credential_name_holds_a_stem_after_folding(self):
         for name in ("REMOTE_TASK_TOKEN", "MYTOKEN", "DBPASSWORD", "apiKey", "accessToken", "X-Api-Key", "pat",
@@ -826,9 +846,18 @@ class RealSinks(unittest.TestCase):
                 shown = hatch_cli._diff(old, "RestartSec=10\n", Path("unit"))
                 self.assertEqual("synth-only-value" not in shown, shaped, shown)
                 self.assertIn(" RestartSec=10\n", shown)
-        with mock.patch.object(hatch_cli, "_masking_registry", side_effect=lambda: contract.SecretRegistry()):
-            shown = hatch_cli._diff('{"pa/ss":"synth-only-value"}\n', "", Path("unit"))
-        self.assertEqual(shown.splitlines()[2:], ["@@ -1 +0,0 @@", f"-{contract.WITHHELD_TEXT}"])
+        for name, sep, shaped in name_sweep():
+            for line in unquoted_name_lines(name, sep):
+                with self.subTest(line=line), mock.patch.object(hatch_cli, "_masking_registry",
+                                                                side_effect=lambda: contract.SecretRegistry()):
+                    shown = hatch_cli._diff(f"{line}\nRestartSec=10\n", "RestartSec=10\n", Path("unit"))
+                    self.assertEqual("synth-only-value" not in shown, shaped, shown)
+        for line in ('{"pa/ss":"synth-only-value"}', "pa ss: synth-only-value", 'run --"pa ss" synth-only-value',
+                     'run "--pa ss" synth-only-value', 'run --pa" "ss synth-only-value'):
+            with self.subTest(line=line), mock.patch.object(hatch_cli, "_masking_registry",
+                                                            side_effect=lambda: contract.SecretRegistry()):
+                shown = hatch_cli._diff(line + "\n", "", Path("unit"))
+            self.assertEqual(shown.splitlines()[2:], ["@@ -1 +0,0 @@", f"-{contract.WITHHELD_TEXT}"])
 
     def test_the_hatch_install_diff_withholds_every_credential_shape(self):
         tok = "synth-shape-sink-5698"
@@ -1105,6 +1134,7 @@ SHOW_ENV = "show-environment"
 SYSTEMD_PROBE = ("adapters/hatch/cli.py", "systemd_user_available")
 # The one place systemctl is named and run; every other use calls it with a literal tuple.
 SYSTEMCTL_HELPER = ("adapters/hatch/cli.py", "_systemctl")
+SYSTEMD_RUNNERS = frozenset({SYSTEMCTL_HELPER[1], "_systemd_run"})
 
 
 def _constant(node):
@@ -1185,25 +1215,41 @@ def _literal_args(call) -> bool:
 
 def _systemd_findings(tree, parents, rel: str) -> "list[str]":
     """Closed world, no constant evaluated and no dataflow: "systemctl" as a string literal anywhere
-    but inside SYSTEMCTL_HELPER; every use of the helper a direct call with a literal tuple; every
-    _systemd_run use outside it a direct call on a literal list naming another program; and
-    show-environment in any string literal (template parts included) outside SYSTEMD_PROBE."""
-    helper = {id(n) for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
-              and (rel, f.name) == SYSTEMCTL_HELPER for n in ast.walk(f)}
+    but inside SYSTEMCTL_HELPER, the one top-level def of that name in its module; every use of a
+    SYSTEMD_RUNNERS name a direct call by that name (the helper's with a literal tuple, _systemd_run's
+    on a literal program), never imported under another name, rebound, redefined, or named in a
+    string; and show-environment in any string literal (template parts included) outside SYSTEMD_PROBE."""
+    tops = [f for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == SYSTEMCTL_HELPER[1]]
+    canonical = {id(tops[0])} if rel == SYSTEMCTL_HELPER[0] and len(tops) == 1 else set()
+    canonical |= {id(f) for f in tree.body if isinstance(f, ast.FunctionDef) and f.name == "_systemd_run"
+                  and rel == SYSTEMCTL_HELPER[0]}
+    helper = {id(n) for f in tree.body if id(f) in canonical and f.name == SYSTEMCTL_HELPER[1] for n in ast.walk(f)}
     out = []
     for n in ast.walk(tree):
         scope = parents.get(n)
         while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
             scope = parents.get(scope)
-        where = f"{rel}:{getattr(n, 'lineno', '?')}"
+        where = f"{rel}:{getattr(n, 'lineno', getattr(parents.get(n), 'lineno', '?'))}"
         if _str(n) and SHOW_ENV in n.value and (rel, getattr(scope, "name", None)) != SYSTEMD_PROBE:
             out.append(f"{where} {SHOW_ENV} outside the reachability probe")
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in SYSTEMD_RUNNERS \
+                and id(n) not in canonical:
+            out.append(f"{where} a second definition of {n.name}")
+        named = getattr(n, "name", None) if isinstance(n, ast.alias) else getattr(n, "arg", None) \
+            if isinstance(n, (ast.arg, ast.keyword)) else None
+        if isinstance(n, ast.alias) and (n.asname or n.name) != n.name and SYSTEMD_RUNNERS & {n.name, n.asname}:
+            out.append(f"{where} {n.name} imported as {n.asname}")
+        elif isinstance(n, (ast.arg, ast.keyword)) and named in SYSTEMD_RUNNERS:
+            out.append(f"{where} {named} rebound as a parameter or keyword")
+        text = _constant(n)
+        if text is not None and any(w in text for w in SYSTEMD_RUNNERS):
+            out.append(f"{where} {sorted(w for w in SYSTEMD_RUNNERS if w in text)[0]} named in a string")
         if id(n) in helper:
             continue
         if _systemctl_literal(n):
             out.append(f"{where} a systemctl literal outside {SYSTEMCTL_HELPER[1]}")
         word = getattr(n, "id", None) if isinstance(n, ast.Name) else getattr(n, "attr", None)
-        if word not in (SYSTEMCTL_HELPER[1], "_systemd_run") or not isinstance(n, (ast.Name, ast.Attribute)):
+        if word not in SYSTEMD_RUNNERS or not isinstance(n, (ast.Name, ast.Attribute)):
             continue
         call = parents.get(n)
         if not (isinstance(call, ast.Call) and call.func is n):
@@ -1215,6 +1261,27 @@ def _systemd_findings(tree, parents, rel: str) -> "list[str]":
             if not (isinstance(arg, (ast.List, ast.Tuple)) and arg.elts and _str(arg.elts[0])):
                 out.append(f"{where} a _systemd_run call not on a literal program")
     return out
+
+
+def systemd_findings(source: str, rel: str) -> "list[str]":
+    tree = ast.parse(source)
+    return _systemd_findings(tree, {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}, rel)
+
+
+def package_systemd_findings(root: Path) -> "list[str]":
+    """The systemd rule over every module under `root`, the credential owners included, and each
+    runner's identity: exactly one def of that name in the package, top-level in the helper's module."""
+    found, defs = [], {name: [] for name in sorted(SYSTEMD_RUNNERS)}
+    for path in sorted(root.rglob("*.py")):
+        rel, text = path.relative_to(root).as_posix(), path.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        found += systemd_findings(text, rel)
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in defs:
+                defs[n.name].append((rel, n in tree.body))
+    found += [f"{name} is defined at {where}, not once at the top level of {SYSTEMCTL_HELPER[0]}"
+              for name, where in defs.items() if where != [(SYSTEMCTL_HELPER[0], True)]]
+    return found
 
 
 def _probe_keeps(inner, parents) -> "list[str]":
@@ -1401,7 +1468,7 @@ class Guard(unittest.TestCase):
                                f"def f():\n    c = ['systemctl']\n    c += ['--user', {cmd}]\n    return subprocess.run(c).stdout\n",
                                f"def f():\n    return subprocess.run([*['systemctl'], '--user', {cmd}]).stdout\n",
                                f"def f():\n    c = ['systemctl']\n    c.append({cmd})\n    return _systemd_run(c).stdout\n"):
-                    self.assertTrue(credential_access(self.HELPER + source, rel), source)
+                    self.assertTrue(self.appended(source, rel), source)
         for source in (
                 # A literal "systemctl" staged into a non-literal argv, in each form.
                 'def manager_env(rest):\n    return subprocess.run(\n        ["systemctl"] + rest, capture_output=True, text=True\n    ).stdout\n',
@@ -1422,17 +1489,63 @@ class Guard(unittest.TestCase):
                 'def f(**kw):\n    return _systemctl(("--user",), **kw)\n',
                 'def f():\n    _systemd_run(CMD)\n', 'def f(rest):\n    run = _systemd_run\n    run(rest)\n',
                 'def f():\n    subprocess.run("systemctl --user show-environment", shell=True)\n',
-                'X = "show-environment"\n', 'def f():\n    print(f"run systemctl --user show-environment")\n'):
+                'X = "show-environment"\n', 'def f():\n    print(f"run systemctl --user show-environment")\n',
+                # Another name for a runner, a redefinition of one, or one named in a string.
+                'from .cli import _systemctl as run\ndef f(rest):\n    return run(rest).stdout\n',
+                'from .cli import _systemd_run as run\ndef f(rest):\n    return run(rest).stdout\n',
+                'from . import cli\nrun = cli._systemctl\n', 'run = _systemctl\n',
+                'def f():\n    return getattr(_cli, "_systemctl")(("--user",)).stdout\n',
+                'def f():\n    return getattr(_cli, "_system" + "ctl")(("--user",)).stdout\n',
+                'def f(_systemctl=print):\n    return _systemctl(("--user",))\n',
+                'class Unit:\n    def _systemctl(self, args):\n        return subprocess.run(["systemctl", *args])\n',
+                'def f():\n    def _systemctl(args):\n        return args\n    return _systemctl(("--user",))\n',
+                'def _systemctl(args):\n    return _systemd_run(["systemctl", *args])\n',
+                'def f():\n    def _systemd_run(cmd):\n        return subprocess.run(cmd)\n    return _systemd_run(["x"])\n'):
             with self.subTest(source=source):
-                self.assertTrue(credential_access(self.HELPER + source, rel), source)
+                self.assertTrue(self.appended(source, rel), source)
         self.assertTrue(credential_access(self.HELPER, "adapters/hatch/keepalive.py"),
                         "only the one helper, in its own module, may name systemctl")
+        self.assertEqual(credential_access(self.HELPER, rel), [], "the helper alone, in its module")
         for source in ('def f():\n    _systemctl(("--user", "stop", "ag2-sparrow.service"))\n',
                        'def f():\n    _cli._systemctl(("--user", "restart", "ag2-sparrow.service"))\n',
                        'def f():\n    _systemd_run(["loginctl", "enable-linger", user])\n',
                        'def f():\n    return _systemctl((), locate=True)\n',
                        'def f():\n    note(f"run systemctl --user restart {SERVICE_NAME}")\n'):
             self.assertEqual(credential_access(self.HELPER + source, rel), [], source)
+
+    def appended(self, source: str, rel: str) -> "list[str]":
+        """The findings credential_access reports in `source` itself, after HELPER is prepended."""
+        offset, out = self.HELPER.count("\n"), []
+        for found in credential_access(self.HELPER + source, rel):
+            where = found.split(" ", 1)[0].split(":", 1)[1]
+            if (int(where) > offset) if where.isdigit() else where != SYSTEMCTL_HELPER[1]:
+                out.append(found)
+        return out
+
+    def test_the_systemd_rule_covers_every_package_module(self):
+        root = PKG / "ag2_sparrow"
+        self.assertEqual(package_systemd_findings(root), [])
+        probe = '\ndef manager(rest):\n    return subprocess.run(["systemctl", *rest]).stdout\n'
+        for module in ("gateway_credentials.py", "gateway_credential_sources.py", "remote_gateway_bridge.py",
+                       "adapters/hatch/keepalive.py"):
+            with self.subTest(module=module), tempfile.TemporaryDirectory() as td:
+                copy = Path(td) / "ag2_sparrow"
+                shutil.copytree(root, copy, ignore=shutil.ignore_patterns("__pycache__"))
+                with open(copy / module, "a", encoding="utf-8") as f:
+                    f.write(probe)
+                found = package_systemd_findings(copy)
+                self.assertTrue(found and all(x.startswith(f"{module}:") for x in found), found)
+        for module, extra in (("adapters/hatch/keepalive.py", "\ndef _systemctl(args):\n    return args\n"),
+                              ("adapters/hatch/cli.py", "\nclass Unit:\n    def _systemctl(self, args):\n"
+                                                        "        return args\n")):
+            with self.subTest(module=module), tempfile.TemporaryDirectory() as td:
+                copy = Path(td) / "ag2_sparrow"
+                shutil.copytree(root, copy, ignore=shutil.ignore_patterns("__pycache__"))
+                with open(copy / module, "a", encoding="utf-8") as f:
+                    f.write(extra)
+                found = package_systemd_findings(copy)
+                self.assertTrue(any(x.startswith(f"{SYSTEMCTL_HELPER[1]} is defined at") for x in found), found)
+                self.assertTrue(any(x.startswith(f"{module}:") and "a second definition" in x for x in found), found)
 
     def test_every_shipped_service_name_literal_is_the_service_name(self):
         tree = ast.parse((PKG / "ag2_sparrow" / "adapters" / "hatch" / "cli.py").read_text(encoding="utf-8"))

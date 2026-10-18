@@ -419,6 +419,8 @@ CREDENTIAL_STEMS = ("pass", "pwd", "secret", "token", "key", "auth", "cred", "be
                     "cookie", "priv", "sig", "otp", "apikey")
 SEGMENT_STEMS = ("pw", "pat")
 _NAME_WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
+_SEGMENT_HEADS = frozenset(s[0] for s in SEGMENT_STEMS)
+_WORD_RUN_RE = re.compile(r"\w*")
 
 
 def credential_name(name: str) -> bool:
@@ -519,27 +521,58 @@ def _quoted_name(view: str, close: int) -> str:
     return view[k + 1:close]
 
 
-def _names_and_values(view: str) -> "list[tuple[tuple[str, ...], str]]":
-    """Every name position in `view` with the value that follows it: the complete key before each
-    separator (inside its quotes with any characters, and as the unquoted run back to a blank or
-    quote), and each flag's name up to a blank or `=` (and up to `,` or a quote)."""
-    out = []
+def _shell_word(view: str, i: int) -> "tuple[str, int]":
+    """The word a shell reads from `i`, quotes removed, up to an ASCII blank or `=`, and where it
+    ends."""
+    word = []
+    while i < len(view) and view[i] not in " \t\n=":
+        q = view[i]
+        if q in "\"'":
+            i += 1
+            while i < len(view) and view[i] != q:
+                if q == '"' and view[i] == "\\" and i + 1 < len(view):
+                    i += 1
+                word.append(view[i])
+                i += 1
+            i += 1
+        else:
+            word.append(view[i])
+            i += 1
+    return "".join(word), min(i, len(view))
+
+
+def _name_positions(view: str) -> "list[tuple[bool, str]]":
+    """Every name position in `view`: whether credential_name accepts any candidate name, and the
+    value that follows. Before each separator the candidates are every suffix of the line back to
+    its start (and the quoted key); for each flag, the run to a blank or `=` and the shell word."""
+    out, line, heads = [], -1, False
     for m in _SEPARATOR_RE.finditer(view):
         j = m.start()
-        while j > 0 and view[j - 1].isspace():
-            j -= 1
-        names = [_quoted_name(view, j - 1)] if j > 0 and view[j - 1] in "\"'" else []
+        start = max(view.rfind("\n", 0, j), view.rfind("\r", 0, j)) + 1
+        if start != line:
+            line, scanned, heads = start, start + 1, False
+        # A suffix judges differently from the whole span only by a SEGMENT_STEMS word at its start.
+        for i in range(scanned, j):
+            if not heads and unicodedata.normalize("NFKC", view[i]).lower()[:1] in _SEGMENT_HEADS:
+                heads = credential_name(view[i:_WORD_RUN_RE.match(view, i).end()])
+        scanned = max(scanned, j)
         k = j
-        while k > 0 and not view[k - 1].isspace() and view[k - 1] not in "\"'":
+        while k > start and view[k - 1].isspace():
             k -= 1
-        names.append(view[k:j])
+        quoted = k > start and view[k - 1] in "\"'" and credential_name(_quoted_name(view, k - 1))
         v = _VALUE_RE.match(view, m.end())
-        out.append((tuple(names), v.group(1) if v else ""))
+        out.append((heads or quoted or credential_name(view[start:j]), v.group(1) if v else ""))
     for m in _FLAG_RE.finditer(view):
         wide = _FLAG_WIDE_RE.match(view, m.end()).group(0)
         name = _FLAG_NAME_RE.match(wide).group(0)
         v = _FLAG_VALUE_RE.match(view, m.end() + len(name))
-        out.append(((wide, name), v.group(1) if v else ""))
+        out.append((credential_name(wide) or credential_name(name), v.group(1) if v else ""))
+        opened = m.start() > 0 and view[m.start() - 1] in "\"'"
+        word, end = _shell_word(view, m.start() - opened)
+        word = word.lstrip("-")
+        if word != name:
+            v = _FLAG_VALUE_RE.match(view, end)
+            out.append((credential_name(word), v.group(1) if v else ""))
     return out
 
 
@@ -549,11 +582,11 @@ def _shape_views(text: str) -> "set[str]":
 
 def credential_shapes(text: str) -> "list[str]":
     """The value of every credential shape in `text` ('' for one with no value): a name position
-    whose complete name credential_name accepts (the one verdict), an Authorization: header, or a
-    Bearer value."""
+    with a candidate name credential_name accepts (the only name verdict), and, only adding to
+    that, an Authorization: header or a Bearer value."""
     found = []
     for view in _shape_views(str(text)):
-        found += [value for names, value in _names_and_values(view) if any(map(credential_name, names))]
+        found += [value for named, value in _name_positions(view) if named]
         found += [m.group(1) or m.group(2) or "" for m in _HEADER_RE.finditer(view)]
     return found
 

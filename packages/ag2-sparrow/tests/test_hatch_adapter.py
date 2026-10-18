@@ -2530,6 +2530,30 @@ class StartSparrow(Base):
                       "enabled", r.stdout)
         self.assertNotIn("replacing:", r.stdout)
 
+    def test_install_that_stopped_the_service_and_then_lost_its_state_fails_with_the_start_command(self):
+        answers = []
+
+        def show(cmd):
+            answers.append(cmd)
+            if len(answers) == 1:
+                return subprocess.CompletedProcess(cmd, 0, "ActiveState=active\nMainPID=4242\n"
+                                                   "ExecMainStartTimestampMonotonic=123456\n", "")
+            return self.UNKNOWN_SHOW["garbled MainPID"](cmd)
+        _, spawned, old, r, fake = self.unit_state_unknown(show)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(spawned, [], r.stdout + r.stderr)
+        self.assertEqual([c[1] for c in fake.calls if c[0] == "--user" and c[1] in
+                          ("start", "restart", "stop", "enable", "daemon-reload", "reset-failed")],
+                         ["stop", "daemon-reload"])
+        self.assertIn(f"error: service: this install stopped {hatch_cli.SERVICE_NAME} and did not start it "
+                      "again", r.stderr)
+        self.assertIn(f"it stays stopped until you run: systemctl --user start {hatch_cli.SERVICE_NAME}\n",
+                      r.stderr)
+        self.assertIn("skipped: starting and checking Sparrow (the service was left stopped above)", r.stdout)
+        self.assertNotIn("enabled:", r.stdout)
+        old.kill()
+        old.wait(5)
+
     def test_a_leftover_unit_with_no_user_manager_exits_non_zero_and_starts_nothing(self):
         unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
         unit.parent.mkdir(parents=True)

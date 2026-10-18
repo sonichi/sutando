@@ -531,21 +531,22 @@ def keepawake_note(reply_command: str, keepalive_on: bool = True) -> str:
 
 
 def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance: str,
-                    force: bool, health_command: str = "", reply_command: str = "") -> None:
-    """Write, enable and start the ag2-sparrow user service. Never fails the install:
-    each problem prints a NOTE saying what was not done and how to finish by hand."""
+                    force: bool, health_command: str = "", reply_command: str = "") -> bool:
+    """Write, enable and start the ag2-sparrow user service. Each problem prints a NOTE saying
+    what was not done and how to finish by hand; True only when this install stopped the service
+    and left it stopped, which fails the install."""
     def note(text: str) -> None:
         print(f"NOTE service: {text}")
 
     if not systemd_user_available():
         note("systemctl --user is not available here, so no service was set up; "
              + keepawake_note(reply_command, bool(health_command)))
-        return
+        return False
     exec_start = _find_console_script(SPARROW_COMMAND)
     if not exec_start:
         note(f"{SPARROW_COMMAND} was not found beside {sys.executable} or on PATH; no service "
              "was set up. Reinstall ag2-sparrow for this Python and run install again")
-        return
+        return False
     device_env = device_env_path()
     try:
         st = device_env.stat()
@@ -568,7 +569,7 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
             env["REMOTE_HEALTH_COMMAND"] = " ".join(map(_unit_value, shlex.split(health_command)))
     except ValueError as e:
         note(f"{e}; no service was set up")
-        return
+        return False
     unit, text = service_path(), render_service(exec_start, env)
     changed = True
     if unit.exists():
@@ -581,14 +582,14 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
             print(_diff(old, text, unit), end="")
             note(f"{unit} was not written by install, so it was kept; re-run with --force to "
                  "replace it with the unit above")
-            return
+            return False
     stopped = False
     before = _unit_props() if changed else {}
     if before is None:
         note(f"systemctl --user show {SERVICE_NAME} did not give a well-formed state, so nothing was "
              "stopped, written, reloaded or enabled; run ag2-sparrow-hatch install again once the "
              "user manager answers")
-        return
+        return False
     if before.get("ActiveState") in ("active", "reloading"):
         r = _systemctl(("--user", "stop", "ag2-sparrow.service"))
         stopped = _ok(r)
@@ -601,13 +602,18 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
         if not _ok(r):
             note(f"systemctl --user daemon-reload failed ({_why(r)}); run it, then "
                  f"systemctl --user enable --now {SERVICE_NAME}")
-            return
+            return False
     props = _unit_props()
+    if props is None and stopped:
+        print(f"error: service: this install stopped {SERVICE_NAME} and did not start it again, because "
+              f"systemctl --user show {SERVICE_NAME} then did not give a well-formed state; it stays "
+              f"stopped until you run: systemctl --user start {SERVICE_NAME}", file=sys.stderr)
+        return True
     if props is None:
         note(f"systemctl --user show {SERVICE_NAME} did not give a well-formed state, so whether it runs "
              "is unknown; it was neither enabled, started nor restarted; run ag2-sparrow-hatch install "
              "again once the user manager answers")
-        return
+        return False
     state = props["ActiveState"]
     active = state in ("active", "reloading")
     main_pid = props["MainPID"]
@@ -623,7 +629,7 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
     if not _ok(r):
         note(f"systemctl --user enable {SERVICE_NAME} failed ({_why(r)}); fix that and run "
              f"systemctl --user enable --now {SERVICE_NAME}")
-        return
+        return False
     if active and changed:
         r = _systemctl(("--user", "restart", "ag2-sparrow.service"))
         print(f"restarted: {SERVICE_NAME} with the new unit" if _ok(r) else
@@ -640,12 +646,12 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         print("linger: skipped (running as root)")
-        return
+        return False
     r = _systemd_run(["loginctl", "show-user", user, "--property=Linger", "--value"]) \
         if user else None
     if _ok(r) and r.stdout.strip() == "yes":
         print(f"linger: already on for {user}")
-        return
+        return False
     r = _systemd_run(["loginctl", "enable-linger", user]) if user else None
     if _ok(r):
         print(f"linger: enabled for {user}, so Sparrow runs while you are logged out")
@@ -653,6 +659,7 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
         note(f"loginctl enable-linger {user or '$USER'} failed ({_why(r)}), so Sparrow stops "
              "when you log out and starts again at your next login. Ask an administrator to "
              f"run: loginctl enable-linger {user or '$USER'}")
+    return False
 
 
 def service_status(reply_command: str = "") -> "tuple[bool | None, str]":
@@ -714,6 +721,7 @@ def _install(args) -> int:
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
     owner = keepalive._unit_owner() if args.no_service else None
+    left_stopped = False
     if owner == keepalive.UNIT_UNREACHABLE:
         print(f"skipped: the ag2-sparrow user service (--no-service); {service_path()} is "
               "installed but systemctl --user did not answer, so whether that service runs Sparrow "
@@ -726,15 +734,18 @@ def _install(args) -> int:
         print("skipped: the ag2-sparrow user service (--no-service); "
               + keepawake_note(reply_command, not args.no_keepalive))
     else:
-        install_service(task_dir.resolve(), result_dir.resolve(), state_dir.resolve(), instance,
-                        args.force,
-                        "" if args.no_keepalive else keepalive.health_command(reply_command),
-                        reply_command)
+        left_stopped = install_service(task_dir.resolve(), result_dir.resolve(), state_dir.resolve(), instance,
+                                       args.force,
+                                       "" if args.no_keepalive else keepalive.health_command(reply_command),
+                                       reply_command)
     if args.no_keepalive:
         print("skipped: the keepalive task (--no-keepalive)")
     else:
         keepalive.install_tasks(read_config(config_path()), args.force)
-    if args.no_start:
+    if left_stopped:
+        rc = 1
+        print("skipped: starting and checking Sparrow (the service was left stopped above)")
+    elif args.no_start:
         rc = 0
         print("skipped: starting and checking Sparrow (--no-start)")
     else:
