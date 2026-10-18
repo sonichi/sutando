@@ -21,7 +21,7 @@ import time
 from ... import task_lifecycle
 from ...collaborator_turn import ENV_KEEP, child_env, run_collaborator_turn  # noqa: F401
 from ...relay_loop import (COLLAB_LIMITER_FILE, NO_ROOM, NON_OWNER_FAILED, TEXT_MAX, Outcome, RateLimiter, RelayLoop,
-                           build_payload, count_arg, log, positive_arg, result_body)
+                           build_payload, count_arg, log, nonnegative_float, positive_arg, positive_float, result_body)
 from ...task_io import (LockRefused, acquire_lock, clear_attributed_pidfile, exit_code, exit_on_sigterm,
                         is_collaborator, make_dirs, non_owner_note, release_lock, root_path, stoppable_sleep)
 
@@ -276,10 +276,12 @@ def build_parser():
     ap.add_argument("--backoff", type=float, default=2.0, help="first retry delay, doubled per retry")
     ap.add_argument("--backoff-max", type=float, default=60.0)
     ap.add_argument("--timeout", type=float, default=60.0, help="seconds per claude --cloud call")
-    ap.add_argument("--collaborator-timeout", type=float, default=60.0, help="seconds per collaborator turn")
-    ap.add_argument("--collaborator-max-age", type=float, default=1800.0,
-                    help="a collaborator task that waited longer than this (seconds, since the adapter first saw "
-                         "it) gets the plain failure line instead of a turn")
+    ap.add_argument("--collaborator-timeout", type=positive_float, default=60.0,
+                    help="seconds per collaborator turn, more than 0")
+    ap.add_argument("--collaborator-max-age", type=nonnegative_float, default=1800.0,
+                    help="a collaborator task that waited longer than this many seconds gets the plain failure line "
+                         "at once instead of a turn, counted since the task was first seen in a pending scan, or "
+                         "its file time if earlier; a restart does not reset it. 0 turns the cut-off off")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=1.0)

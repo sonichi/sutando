@@ -75,6 +75,22 @@ def positive_arg(text):
     return n
 
 
+def positive_float(text):
+    """argparse type for a timeout: seconds, more than 0."""
+    x = float(text)
+    if not x > 0:
+        raise argparse.ArgumentTypeError("must be more than 0")
+    return x
+
+
+def nonnegative_float(text):
+    """argparse type for an age bound: seconds, 0 or more (0 means off)."""
+    x = float(text)
+    if not x >= 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return x
+
+
 class Outcome:
     """kind: ok | rate_limited | rejected | retry (provably not accepted) | ambiguous (may have been)."""
 
@@ -285,12 +301,19 @@ class RelayLoop:
             kind = self.classify(headers)
             self.lanes[name] = ("refuse" if kind.startswith("refused") else
                                 "collaborator" if kind == "collaborator" else "provider")
-            self.seen_at[name] = self.clock()
         return self.lanes[name]
 
+    def first_seen(self, name, now):
+        """When the task began waiting: its file time when that is earlier than this scan, so time in the
+        inbox before a restart or a hand-over counts too; a gone file is the step's to report."""
+        try:
+            return min(now, os.stat(os.path.join(self.args.inbox, name)).st_mtime)
+        except OSError:
+            return now
+
     def too_old(self, name):
-        """True once a task has waited past --collaborator-max-age since this loop first classified it."""
-        return self.clock() - self.seen_at.get(name, self.clock()) > self.args.collaborator_max_age
+        """True once a task has waited past --collaborator-max-age (0: never) since it was first seen."""
+        return 0 < self.args.collaborator_max_age < self.clock() - self.seen_at.get(name, self.clock())
 
     def lane_wait(self, lane):
         if lane == "refuse":
@@ -303,8 +326,12 @@ class RelayLoop:
         return hold if hold > 0 else self.limiter.wait_seconds()
 
     def next_ready(self, names):
-        """The first ready task whose own lane's gate is open, else how long until some gate opens."""
+        """The first ready task whose own lane's gate is open, else how long until some gate opens.
+        Every task in the scan is stamped as seen, selected or not: its age runs from its first scan."""
         now = self.clock()
+        for n in names:
+            if n not in self.seen_at:
+                self.seen_at[n] = self.first_seen(n, now)
         for n in names:
             if self.recovering(n):
                 return n, 0.0
@@ -314,6 +341,8 @@ class RelayLoop:
         waits = {}
         for n in ready:
             lane = self.lane(n)
+            if lane == "collaborator" and self.too_old(n):
+                lane = "refuse"      # the step answers it with the line, no turn: it waits on no cap
             if lane not in waits:
                 waits[lane] = self.lane_wait(lane)
             if waits[lane] <= 0:

@@ -378,6 +378,15 @@ class PositiveArgTest(unittest.TestCase):
                 self.assertIn("--max-collaborator-per-hour: must be 1 or more", err.getvalue())
             self.assertEqual(build().parse_args(["--work", "w", "--max-collaborator-per-hour", "1"] + need)
                              .max_collaborator_per_hour, 1)
+            for flag, bad, msg in (("--collaborator-timeout", "0", "must be more than 0"),
+                                   ("--collaborator-timeout", "-1", "must be more than 0"),
+                                   ("--collaborator-max-age", "-1", "must be 0 or more")):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                    build().parse_args(["--work", "w", flag, bad] + need)
+                self.assertIn("%s: %s" % (flag, msg), err.getvalue())
+            args = build().parse_args(["--work", "w", "--collaborator-max-age", "0", "--collaborator-timeout", "0.5"] + need)
+            self.assertEqual((args.collaborator_max_age, args.collaborator_timeout), (0.0, 0.5), "0 is off; any positive timeout")
 
 
 class LaneSchedulingTest(unittest.TestCase):
@@ -388,6 +397,7 @@ class LaneSchedulingTest(unittest.TestCase):
         write_task(loop.args.inbox, "task-c", "normal", 100, tier="team")
         p = Path(loop.args.inbox) / "task-c.txt"
         p.write_text(p.read_text().replace("access_tier: team", "collaborator: true\naccess_tier: team"))
+        os.utime(p, (100, 100))            # the rewrite must keep the ordering mtime
         write_task(loop.args.inbox, "task-o", "normal", 200)
         return loop
 
@@ -446,20 +456,47 @@ class LaneSchedulingTest(unittest.TestCase):
 
     def test_a_task_is_too_old_once_it_waited_past_the_max_age_since_first_seen(self):
         with tempfile.TemporaryDirectory() as d:
-            loop = self.loop(d, collaborator_max_age=100.0)
+            loop = self.loop(d, collaborator_max_age=1000.0)   # task-c mtime 100, task-o mtime 200, clock 1000
             now = [loop.clock()]
             loop.clock = lambda: now[0]
             self.assertFalse(loop.too_old("task-never-seen.txt"))
-            loop.lane("task-c.txt")
-            self.assertEqual(loop.seen_at["task-c.txt"], now[0])
-            now[0] += 100
+            self.assertEqual(loop.next_ready(["task-c.txt", "task-o.txt"]), ("task-c.txt", 0.0))
+            self.assertEqual(loop.seen_at, {"task-c.txt": 100.0, "task-o.txt": 200.0},
+                             "every task in the scan is stamped from its file time, selected or not")
+            self.assertEqual(list(loop.lanes), ["task-c.txt"], "stamping does not depend on classifying")
+            now[0] = 1100
             self.assertFalse(loop.too_old("task-c.txt"), "exactly the limit is still fresh")
-            now[0] += 1
+            now[0] = 1101
             self.assertTrue(loop.too_old("task-c.txt"))
+            self.assertFalse(loop.too_old("task-o.txt"))
+            loop.next_ready(["task-c.txt", "task-o.txt"])
             loop.lane("task-c.txt")
-            self.assertTrue(loop.too_old("task-c.txt"), "a second look does not restart the clock")
+            self.assertTrue(loop.too_old("task-c.txt"), "a later scan or look does not restart the clock")
+            again = self.loop(d, collaborator_max_age=1000.0)
+            again.clock = lambda: now[0]
+            again.next_ready(["task-c.txt"])
+            self.assertTrue(again.too_old("task-c.txt"), "a restart does not reset it: the file time seeds it")
+            loop.args.collaborator_max_age = 0
+            self.assertFalse(loop.too_old("task-c.txt"), "0 turns the cut-off off")
             loop._settled("task-c.txt", set())
             self.assertNotIn("task-c.txt", loop.seen_at)
+
+    def test_first_seen_is_the_scan_when_the_file_is_newer_or_gone(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = self.loop(d)
+            p = Path(loop.args.inbox) / "task-c.txt"
+            os.utime(p, (5000, 5000))
+            loop.next_ready(["task-c.txt", "task-gone.txt"])
+            self.assertEqual(loop.seen_at, {"task-c.txt": 1000.0, "task-gone.txt": 1000.0},
+                             "a future file time never makes a task younger than its first scan")
+
+    def test_a_stale_collaborator_takes_the_ungated_lane_past_a_full_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            loop = self.loop(d, collaborator_max_age=500.0)     # task-c mtime 100: 900 s old at clock 1000
+            loop.collab_limiter.record()
+            self.assertEqual(loop.next_ready(["task-c.txt"]), ("task-c.txt", 0.0), "stale: the line, at once")
+            loop.args.collaborator_max_age = 5000.0
+            self.assertEqual(loop.next_ready(["task-c.txt"])[0], None, "fresh: it waits on its cap")
 
     def test_a_lane_is_read_once_and_a_vanished_task_is_the_providers_to_report(self):
         with tempfile.TemporaryDirectory() as d:
