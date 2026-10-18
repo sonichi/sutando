@@ -545,7 +545,7 @@ print(json.dumps({"calls": calls}))
             self.assertNotIn(latch, src)
 
     SCRUB = """
-import io, json, os, traceback, urllib.error, urllib.request, http.client
+import errno, io, json, os, traceback, urllib.error, urllib.request, http.client
 from ag2_sparrow import remote_gateway_bridge as m
 secret = "enrollment=Se%2fcR%2FeT"
 forms = [secret, secret.upper(), secret.lower(), "Se%2fcR%2FeT", "Se/cR/eT", "Se%252fcR%252FeT",
@@ -554,7 +554,7 @@ text = " | ".join(forms)
 raised = [urllib.error.HTTPError(m.URL + "/v1/tasks", 503, text, {}, io.BytesIO(b"{}")),
           urllib.error.URLError(text), TimeoutError(text), ConnectionResetError(104, text),
           http.client.InvalidURL(text), http.client.IncompleteRead(text.encode()), ValueError(text),
-          OSError(2, text, text), urllib.error.URLError(OSError(61, text))]
+          OSError(2, text, text), urllib.error.URLError(OSError(errno.ECONNREFUSED, text))]
 out = []
 for exc in raised:
     def boom(*a, **k):
