@@ -2038,6 +2038,16 @@ class StartSparrow(Base):
             {"connected": True, "ts": int(time.time()) - 5, "error": None}))
         return proc
 
+    def sparrow_cmdline(self, proc):
+        """keepalive._proc, reading `proc`'s argv from the fixture on hosts without /proc (macOS)."""
+        real_proc = keepalive._proc
+
+        def read(pid, name):
+            if name == "cmdline" and not Path("/proc").is_dir() and pid == proc.pid:
+                return b"\0".join(a.encode() for a in self.old_argv) + b"\0"
+            return real_proc(pid, name)
+        return mock.patch.object(keepalive, "_proc", side_effect=read)
+
     def wait_for(self, path):
         deadline = time.monotonic() + 5
         while not path.exists() and time.monotonic() < deadline:
@@ -2423,7 +2433,8 @@ class StartSparrow(Base):
                 mock.patch.object(keepalive, "sparrow_env", return_value={"HOME": "x"}), \
                 mock.patch.object(keepalive, "_stop", side_effect=lambda pid: stopped.append(pid) or True), \
                 mock.patch.object(keepalive, "_spawn_sparrow",
-                                  side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")):
+                                  side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")), \
+                self.sparrow_cmdline(old):
             r = self.install()
         self.assertEqual((stopped, spawned), ([], []), r.stdout + r.stderr)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -2436,14 +2447,18 @@ class StartSparrow(Base):
         self.assertNotIn("replacing:", r.stdout)
         self.assertNotIn("started:", r.stdout)
 
-    def unit_state_unknown(self, show, *args):
+    def unit_state_unknown(self, show, *args, state="active"):
         """install over a running service whose manager answers show-environment but not `show`:
-        `show` returns what `show(cmd)` gives. (stopped pids, spawns, old Sparrow, result, fake)."""
+        `show` returns what `show(cmd)` gives. (stopped pids, spawns, old Sparrow, result, fake).
+        The relay token file exists, so a parser that accepted the answer would act on it."""
         old = self.old_sparrow()
         unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
         unit.parent.mkdir(parents=True, exist_ok=True)
         unit.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\nExecStart=/x\n")
-        fake = FakeSystemd(state="active", enabled=True, main_pid=old.pid, ran=True)
+        relay = self.home / ".config" / "ag2-sparrow" / "relay.env"
+        relay.parent.mkdir(parents=True, exist_ok=True)
+        relay.write_text("REMOTE_TASK_TOKEN=x\n")
+        fake = FakeSystemd(state=state, enabled=True, main_pid=old.pid, ran=True)
 
         def systemd(cmd):
             return show(cmd) if cmd[1:3] == ["--user", "show"] else fake(cmd)
@@ -2454,7 +2469,7 @@ class StartSparrow(Base):
                 mock.patch.object(keepalive, "sparrow_env", return_value={"HOME": "x"}), \
                 mock.patch.object(keepalive, "_spawn_sparrow",
                                   side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")), \
-                mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW):
+                mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW), self.sparrow_cmdline(old):
             r = self.cli("install", "--mxid", AGENT, *args)
         return stopped, spawned, old, r, fake
 
@@ -2473,8 +2488,8 @@ class StartSparrow(Base):
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
                 self.assertNotIn("replacing:", r.stdout)
                 self.assertNotIn("started:", r.stdout)
-                self.assertIn(f"systemctl --user show {hatch_cli.SERVICE_NAME} did not give its state, so "
-                              "whether that service runs Sparrow is unknown; install neither stops nor "
+                self.assertIn(f"systemctl --user show {hatch_cli.SERVICE_NAME} did not give a well-formed state, "
+                              "so whether that service runs Sparrow is unknown; install neither stops nor "
                               f"starts a Sparrow. Sparrow (pid {old.pid}) was left as it is", r.stdout)
                 self.assertEqual([c for c in fake.calls if c[0] == "--user" and c[1] in
                                   ("start", "restart", "stop", "enable", "reset-failed")], [])
@@ -2489,7 +2504,7 @@ class StartSparrow(Base):
         self.assertEqual([c for c in fake.calls if c[0] == "--user" and c[1] in ("start", "restart", "stop")], [])
         self.assertEqual(fake.ran("enable"), [["--user", "enable", hatch_cli.SERVICE_NAME]],
                          "enabled, never --now")
-        self.assertIn("did not give its state, so it was not stopped first", r.stdout)
+        self.assertIn("did not give a well-formed state, so it was not stopped first", r.stdout)
         self.assertIn("it was enabled but neither started nor restarted", r.stdout)
         self.assertNotIn("replacing:", r.stdout)
 
@@ -2525,6 +2540,113 @@ class StartSparrow(Base):
             ok, how = keepalive.restart_listener({})
         self.assertEqual((ok, spawned), (False, []))
         self.assertIn("did not answer; no detached Sparrow is started beside that service", how)
+
+    # Each answer is malformed in one way; the rest is a valid stopped unit, so a parser that
+    # accepted it would SIGTERM the lock holder (not the MainPID) and start the service.
+    VALID = {"ActiveState": "inactive", "MainPID": "0", "ExecMainStartTimestampMonotonic": "0"}
+    MALFORMED = {
+        "unknown state": {"ActiveState": "not-a-systemd-state"}, "bogus state": {"ActiveState": "bogus"},
+        "trailing space": {"ActiveState": "inactive "}, "leading space": {"ActiveState": " inactive"},
+        "capitalised": {"ActiveState": "Inactive"}, "empty state": {"ActiveState": ""},
+        "CR": {"ActiveState": "inactive\r"}, "superscript pid": {"MainPID": "\u00b2"},
+        "arabic-indic pid": {"MainPID": "\u0660"}, "fullwidth pid": {"MainPID": "\uff10"},
+        "negative pid": {"MainPID": "-1"}, "signed pid": {"MainPID": "+5"}, "spaced pid": {"MainPID": " 5"},
+        "hex pid": {"MainPID": "0x10"}, "empty pid": {"MainPID": ""}, "timestamp n/a": {"ExecMainStartTimestampMonotonic": "n/a"},
+        "missing timestamp": {"ExecMainStartTimestampMonotonic": None}, "missing state": {"ActiveState": None},
+        "missing pid": {"MainPID": None}}
+    MALFORMED_RAW = {"duplicate state": "ActiveState=active\nActiveState=inactive\nMainPID=0\nExecMainStartTimestampMonotonic=0\n",
+                     "unknown property": "ActiveState=inactive\nMainPID=0\nExecMainStartTimestampMonotonic=0\nFoo=bar\n",
+                     "line without =": "ActiveState=inactive\ngarbage\nMainPID=0\nExecMainStartTimestampMonotonic=0\n",
+                     "empty answer": "", "no stdout": None}
+
+    def malformed_answers(self):
+        for name, change in self.MALFORMED.items():
+            props = {k: v for k, v in {**self.VALID, **change}.items() if v is not None}
+            yield name, "".join(f"{k}={v}\n" for k, v in props.items())
+        yield from self.MALFORMED_RAW.items()
+
+    def test_unit_props_accepts_only_a_positively_verified_state(self):
+        def props(out):
+            ran = subprocess.CompletedProcess([], 0, out, "")
+            with mock.patch.object(hatch_cli, "_systemd_run", return_value=ran):
+                return hatch_cli._unit_props()
+        for name, out in self.malformed_answers():
+            with self.subTest(answer=name):
+                self.assertIsNone(props(out))
+        for state in sorted(hatch_cli.UNIT_STATES):
+            got = props(f"ActiveState={state}\nMainPID=4242\nExecMainStartTimestampMonotonic=123\n")
+            self.assertEqual(got, {"ActiveState": state, "MainPID": "4242",
+                                   "ExecMainStartTimestampMonotonic": "123"}, state)
+
+    def test_a_malformed_unit_answer_stops_signals_and_starts_nothing(self):
+        for name, out in self.malformed_answers():
+            for args in (("--no-service",), ()):
+                with self.subTest(answer=name, args=args):
+                    show = lambda cmd, out=out: subprocess.CompletedProcess(cmd, 0, out, "")
+                    _, spawned, old, r, fake = self.unit_state_unknown(show, *args, state="inactive")
+                    self.assertNotIn("Traceback", r.stderr)
+                    self.assertIsNone(old.poll(), "the lock holder got no SIGTERM")
+                    self.assertEqual((spawned, r.returncode), ([], 0), r.stdout + r.stderr)
+                    self.assertEqual([c for c in fake.calls if c[0] == "--user" and c[1] in
+                                      ("start", "restart", "stop", "reset-failed")], [])
+                    self.assertNotIn("--now", [a for c in fake.ran("enable") for a in c])
+                    self.assertNotIn("replacing:", r.stdout)
+                    self.assertIn(f"Sparrow (pid {old.pid}) was left as it is", r.stdout)
+                    old.kill()
+                    old.wait(5)
+                    shutil.rmtree(self.home / ".config" / "systemd")
+
+    def test_a_well_formed_stopped_unit_still_replaces_the_outside_sparrow(self):
+        # The revert control for the table above: the same fixture with a valid answer acts.
+        out = "".join(f"{k}={v}\n" for k, v in self.VALID.items())
+        stopped, spawned, old, r, fake = self.unit_state_unknown(
+            lambda cmd: subprocess.CompletedProcess(cmd, 0, out, ""), state="inactive")
+        self.assertEqual(old.wait(5), -signal.SIGTERM, r.stdout + r.stderr)
+        self.assertEqual(fake.ran("restart"), [["--user", "restart", "ag2-sparrow.service"]])
+
+    def test_keepawake_restarts_nothing_on_a_malformed_unit_answer(self):
+        unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
+        unit.parent.mkdir(parents=True)
+        unit.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\nExecStart=/x\n")
+        for name, out in self.malformed_answers():
+            fake = FakeSystemd(state="failed")
+
+            def systemd(cmd, out=out):
+                return subprocess.CompletedProcess(cmd, 0, out, "") if cmd[1:3] == ["--user", "show"] else fake(cmd)
+            with self.subTest(answer=name), mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
+                    mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
+                    mock.patch.object(hatch_cli, "_systemd_run", side_effect=systemd):
+                ok, how = keepalive.restart_listener({})
+            self.assertFalse(ok)
+            self.assertIn("did not give a well-formed state; it was neither reset nor restarted", how)
+            self.assertEqual([c for c in fake.calls if c[1] in ("restart", "reset-failed", "start")], [])
+
+    def test_an_unproven_fresh_lock_holder_is_no_success_while_the_manager_is_silent(self):
+        unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
+        unit.parent.mkdir(parents=True)
+        unit.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\nExecStart=/x\n")
+        real_which = shutil.which
+        for sparrow, want in ((False, 1), (True, 0)):
+            old = self.old_sparrow(sparrow=sparrow)
+            checked, spawned = [], []
+            real_is = keepalive.is_sparrow_pid
+            with self.subTest(sparrow=sparrow), \
+                    mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda name, *a, **k:
+                                      "/usr/bin/systemctl" if name == "systemctl" else real_which(name, *a, **k)), \
+                    mock.patch.object(hatch_cli, "_systemd_run", side_effect=FakeSystemd(available=False)), \
+                    mock.patch.object(keepalive, "is_sparrow_pid", side_effect=lambda pid: checked.append(pid) or real_is(pid)), \
+                    mock.patch.object(keepalive, "_spawn_sparrow",
+                                      side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")), \
+                    mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW), self.sparrow_cmdline(old):
+                r = self.cli("install", "--mxid", AGENT, "--no-service")
+                self.assertEqual((spawned, r.returncode), ([], want), r.stdout + r.stderr)
+                self.assertIn(old.pid, checked, "the holder is proven Sparrow before it counts")
+                self.assertIsNone(old.poll())
+                if not sparrow:
+                    self.assertIn(f"pid {old.pid} holds Sparrow's lock but is not proven to be Sparrow", r.stderr)
+                    self.assertNotIn("was left as it is; run", r.stdout)
+            old.kill()
+            old.wait(5)
 
     def test_no_service_with_no_unit_runs_one_detached_sparrow(self):
         r = self.install()

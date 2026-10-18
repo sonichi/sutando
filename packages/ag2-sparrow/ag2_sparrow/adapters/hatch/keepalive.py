@@ -242,8 +242,11 @@ def restart_listener(cfg: dict) -> "tuple[bool, str]":
                        "no detached Sparrow is started beside that service")
     if owner == "ours":
         # A unit left failed by its start limit stays down until reset.
-        _cli._systemd_run(["systemctl", "--user", "reset-failed", _cli.SERVICE_NAME])
-        r = _cli._systemd_run(["systemctl", "--user", "restart", _cli.SERVICE_NAME])
+        if _cli._unit_props() is None:
+            return False, (f"systemctl --user show {_cli.SERVICE_NAME} did not give a well-formed state; "
+                           "it was neither reset nor restarted")
+        _cli._systemd_run(["systemctl", "--user", "reset-failed", "ag2-sparrow.service"])
+        r = _cli._systemd_run(["systemctl", "--user", "restart", "ag2-sparrow.service"])
         if _cli._ok(r):
             return True, f"systemctl --user restart {_cli.SERVICE_NAME}"
         return False, f"systemctl --user restart {_cli.SERVICE_NAME} failed ({_cli._why(r)})"
@@ -361,14 +364,19 @@ def _left_running(pid: int) -> None:
 
 
 def _unit_state_unknown(cfg: dict, holder: "int | None", why: str) -> int:
-    """Install stops and starts nothing while the unit's state is unknown; 1 when no Sparrow runs."""
+    """Install stops and starts nothing while the unit's state is unknown; 0 only when the lock
+    holder is proven to run Sparrow's command line, else 1 saying why."""
     head = (f"{_cli.service_path()} is installed but {why}, so whether that service runs Sparrow is "
             "unknown; install neither stops nor starts a Sparrow")
-    if holder is not None or listener_up(cfg, time.time()):
-        who = f"Sparrow (pid {holder})" if holder is not None else "The running Sparrow"
-        print(f"NOTE sparrow: {head}. {who} was left as it is; run "
+    if holder is not None and is_sparrow_pid(holder):
+        print(f"NOTE sparrow: {head}. Sparrow (pid {holder}) was left as it is; run "
               "ag2-sparrow-hatch verify once the user manager answers")
         return 0
+    if holder is not None:
+        _left_running(holder)
+        print(f"error: Sparrow is not proven running: {head}, and pid {holder} holds Sparrow's lock but "
+              "is not proven to be Sparrow", file=sys.stderr)
+        return 1
     print(f"error: Sparrow is not running: {head}. Start your user manager (systemctl --user) and "
           f"run install again, or remove {_cli.service_path()} if it is left over", file=sys.stderr)
     return 1
@@ -389,10 +397,10 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
         return 0
     start, stopped, since = False, None, None
     if owner == "ours":
-        props = _cli._unit_props("ActiveState", "MainPID", "ExecMainStartTimestampMonotonic")
+        props = _cli._unit_props()
         if props is None:
-            return _unit_state_unknown(cfg, holder,
-                                       f"systemctl --user show {_cli.SERVICE_NAME} did not give its state")
+            return _unit_state_unknown(cfg, holder, f"systemctl --user show {_cli.SERVICE_NAME} did not "
+                                       "give a well-formed state")
         active = props["ActiveState"] in ("active", "reloading")
         if active:
             # install_service may have just restarted the unit: only its new process counts.

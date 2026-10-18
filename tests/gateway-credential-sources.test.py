@@ -276,15 +276,47 @@ class PureContractCases:
             with self.subTest(line=line):
                 self.assertNotIn(tok, self.c.mask_env_assignments(line + "\n", self.c.SecretRegistry()))
 
-    def test_a_credential_name_is_a_whole_word(self):
+    def test_a_credential_name_holds_a_stem_after_folding(self):
         for name in ("REMOTE_TASK_TOKEN", "MYTOKEN", "DBPASSWORD", "apiKey", "accessToken", "X-Api-Key", "pat",
-                     "auth-mode", "SESSION_ID", "github_pat"):
+                     "auth-mode", "SESSION_ID", "github_pat", "DB_PASSCODE", "AUTHKEY", "PRIVKEY", "SESSIONID", "JWT",
+                     "pw", "pwd", "DB_PW", "dbpw", "auth.token", "access.token", "OAuthClientId", "oauth-client-id",
+                     "AUTH_MODE", "author", "COMPASS", "bypass-proxy", "KillSignal", "\uff34\uff2f\uff2b\uff25\uff2e"):
             self.assertTrue(self.c.credential_name(name), name)
-        for name in ("AUTHOR", "author", "tokenizer", "oauth-client-id", "X-AUTHOR", "keyboard", "patch"):
+        for name in ("ExecStart", "Description", "WorkingDirectory", "RestartSec", "WantedBy", "StandardOutput",
+                     "Environment", "tokn", "PWNAGE", "path", "patch", "PATH", "x"):
             self.assertFalse(self.c.credential_name(name), name)
-        for line in ("ExecStart=/x --author someone", "ExecStart=/x --tokenizer wordpiece", "X-AUTHOR=someone",
-                     "ExecStart=/x --oauth-client-id abc", "Description=Bearer of tasks", "Author: someone"):
+        for line in ("ExecStart=/x --author someone", "X-AUTHOR=someone", "AUTH_MODE=basic", "Author: someone",
+                     "ExecStart=/x --oauth-client-id abc", "Description=Bearer of tasks"):
+            self.assertNotEqual(self.c.mask_env_assignments(line + "\n", self.c.SecretRegistry()), line + "\n",
+                                "over-withholding is the accepted price of the closed-world rule")
+        for line in ("ExecStart=/x --tokn v", "Description=A plain relay", "free text line", "see https://a.example/b:c"):
             self.assertEqual(self.c.mask_env_assignments(line + "\n", self.c.SecretRegistry()), line + "\n")
+
+    def test_every_stem_separator_casing_and_shape_is_withheld(self):
+        tok = "synth-sweep-5698"
+        stems = self.c.CREDENTIAL_STEMS + self.c.SEGMENT_STEMS
+        casings = (str.lower, str.upper, str.title, lambda n: n[:1] + n[1:].upper())
+        shapes = ("{n}={v}", "export {n}={v}", "ExecStart=/x --{n} {v}", "ExecStart=/x --{n}={v}", "ExecStart=/x -{n} {v}",
+                  "args: [--{n},{v}]", "args: [--{n}={v}]", '{{"{n}": "{v}"}}', "{{'{n}':'{v}'}}", "{n}: {v}",
+                  "  - {n}: {v}", "ExecStart=/x -H '{n}: {v}'", "ExecStart=/usr/bin/env -i {n}={v} /x")
+        for stem in stems:
+            for sep in ("", "_", "-", ".", "__"):
+                for case in casings:
+                    name = case(f"db{sep}{stem}" if stem in self.c.SEGMENT_STEMS else f"db{sep}{stem}{sep}v2")
+                    for shape in shapes:
+                        line = shape.format(n=name, v=tok)
+                        with self.subTest(line=line):
+                            self.assertNotIn(tok, self.c.mask_env_assignments(line + "\n", self.c.SecretRegistry()))
+
+    def test_adjacent_shapes_from_review_are_withheld(self):
+        tok = "synth-adjacent-5698"
+        for line in (f"DB_PASSCODE={tok}", f"args: [--token,{tok}]", f"args: [--access-key={tok}]",
+                     f'{{"auth.token":"{tok}"}}', f"access.token: {tok}", f"ExecStart=/x --pw {tok}",
+                     f"ExecStart=/x --pwd={tok}", f"AUTHKEY={tok}", f"PRIVKEY={tok}", f"SESSIONID={tok}",
+                     f"JWT={tok}", f"ExecStart=/x -H Bearer\\s{tok[:6]}", f"Authorization: Bearer {tok[:5]}"):
+            for registry in (None, self.c.SecretRegistry()):
+                with self.subTest(line=line, registry=registry is not None):
+                    self.assertNotIn(tok[:5], self.c.mask_env_assignments(line + "\n", registry))
 
     def test_a_short_or_path_shaped_value_hides_no_other_line(self):
         for shaped, harmless in (("ExecStart=/x --auth=1", "RestartSec=10\nDescription=Sparrow 1.0\n"),
@@ -790,7 +822,17 @@ class RealSinks(unittest.TestCase):
                                                                    "ExecStartPre=/x --author someone\n"
                                                                    f"ExecStartPost=/x -H 'X-Api-Key: {tok}'\n"))
             self.assertEqual(shown, " [Service]\n-ExecStart=<withheld>\n-RestartSec=10\n"
-                                    "-ExecStartPre=/x --author someone\n-ExecStartPost=<withheld>\n+ExecStart=/y\n")
+                                    "-ExecStartPre=<withheld>\n-ExecStartPost=<withheld>\n+ExecStart=/y\n",
+                             "--author is withheld: the closed-world name rule over-withholds")
+
+    def test_the_hatch_install_diff_withholds_the_adjacent_review_shapes(self):
+        tok = "synth-adjacent-sink-5698"
+        for line in (f"DB_PASSCODE={tok}", f"Note=args: [--token,{tok}]", f"Note=args: [--access-key={tok}]",
+                     f'Note={{"auth.token":"{tok}"}}', f"Note=access.token: {tok}", f"ExecStartPre=/x --pw {tok}"):
+            with self.subTest(line=line), tempfile.TemporaryDirectory() as td:
+                shown = self.body(self.hatch_diff(self.bare(Path(td)), f"[Service]\n{line}\nExecStart=/x\n"))
+                self.assertNotIn(tok, shown)
+                self.assertIn("-ExecStart=/x\n", shown, "a line with no shape is shown")
 
     def test_the_hatch_install_diff_seeds_from_the_default_device_file(self):
         live = "synth-default-device-5698"
@@ -1011,8 +1053,11 @@ IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_b
               ("remote_gateway_bridge.py", "_vault_lookup"), ("adapters/hatch/cli.py", "systemd_user_available"),
               ("gateway_credential_io.py", "read_file"), ("gateway_credential_io.py", "vault_lookup"),
               ("gateway_credential_io.py", "_vault"), ("gateway_credential_io.py", "_vault_once")}
-# A command whose output is a credential store: the Keychain, or the systemd user manager's environment.
-STORE_READS = ("security", "find-generic-password", "show-environment")
+# A command whose output is a credential store: the Keychain. The systemd user manager's environment
+# is SYSTEMD_PROBE's closed-world rule below, which evaluates no constant.
+STORE_READS = ("security", "find-generic-password")
+SHOW_ENV = "show-environment"
+SYSTEMD_PROBE = ("adapters/hatch/cli.py", "systemd_user_available")
 
 
 def _constant(node):
@@ -1068,10 +1113,49 @@ PROBE_KEEPS = (ast.Global, ast.Nonlocal, ast.Assign, ast.AugAssign, ast.AnnAssig
                ast.YieldFrom, ast.Lambda)
 
 
+def _str(node) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def _literal_list(node) -> bool:
+    return isinstance(node, (ast.List, ast.Tuple)) and bool(node.elts) and all(_str(e) for e in node.elts)
+
+
+def _callee(call) -> "str | None":
+    return getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+
+
+def _systemd_findings(tree, parents, rel: str) -> "list[str]":
+    """Closed world, no constant evaluated: a string literal (an f-string, % or format template part
+    included) holding show-environment outside SYSTEMD_PROBE, and a systemctl invocation (a list
+    holding the literal "systemctl", any _systemd_run call, or "systemctl" anywhere else but
+    shutil.which) whose arguments are not a plain literal list of literal strings."""
+    out = []
+    for n in ast.walk(tree):
+        scope = parents.get(n)
+        while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope = parents.get(scope)
+        where = f"{rel}:{getattr(n, 'lineno', '?')}"
+        if _str(n) and SHOW_ENV in n.value and (rel, getattr(scope, "name", None)) != SYSTEMD_PROBE:
+            out.append(f"{where} {SHOW_ENV} outside the reachability probe")
+        if _str(n) and n.value == "systemctl":
+            parent = parents.get(n)
+            ok = _literal_list(parent) or (isinstance(parent, ast.Call) and _callee(parent) == "which")
+            if not ok:
+                out.append(f"{where} a systemctl invocation whose arguments are not a literal list")
+        if isinstance(n, ast.Call) and _callee(n) == "_systemd_run":
+            arg = n.args[0] if len(n.args) == 1 and not n.keywords else None
+            first = arg.elts[0] if isinstance(arg, (ast.List, ast.Tuple)) and arg.elts else None
+            other = _str(first) and first.value != "systemctl"
+            if not other and not _literal_list(arg):
+                out.append(f"{where} a _systemd_run call whose arguments are not a literal list")
+    return out
+
+
 def _probe_keeps(inner, parents) -> "list[str]":
     """Why a scope that runs show-environment keeps its output: the run's result must be passed
     straight to _ok, a bool, and the scope may not read stdout/stderr, print, write or store."""
-    probe = [n for n in inner if _constant(n) == "show-environment" and _constant(parents.get(n)) != "show-environment"]
+    probe = [n for n in inner if _str(n) and SHOW_ENV in n.value]
     if not probe:
         return []
     why = []
@@ -1144,6 +1228,7 @@ def credential_access(source: str, rel: str) -> "list[str]":
         if (reads or store) and (rel, name) not in IO_ALLOWED:
             out.append(f"{rel}:{name} credential I/O outside the adapters' edge")
         out += [f"{rel}:{name} the show-environment probe keeps its output ({why})" for why in _probe_keeps(inner, parents)]
+    out += _systemd_findings(tree, parents, rel)
     for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
         callee = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
         if callee not in OWNER_READERS:
@@ -1211,6 +1296,8 @@ class Guard(unittest.TestCase):
         shipped = (f'def systemd_user_available():\n    return shutil.which("systemctl") is not None and \\\n'
                    f"        _ok({run})\n")
         self.assertEqual(credential_access(shipped, rel), [])
+        self.assertTrue(credential_access(shipped, "adapters/hatch/keepalive.py"), "only the one allowlisted probe")
+        self.assertTrue(credential_access(shipped.replace("systemd_user_available", "probe"), rel))
         keeps = [f"    return {run}",
                  f"    return {run}.stdout",
                  f"    r = {run}\n    print(r.stdout)\n    return _ok(r)",
@@ -1219,18 +1306,52 @@ class Guard(unittest.TestCase):
                  f"    return _ok(r := {run}) and bool(r.stdout)",
                  f"    sys.stderr.write(str({run}))\n    return True",
                  f"    yield {run}"]
-        built = ('"show-" + "environment"', '"".join(("show-", "environment"))', 'f"show-{\'environment\'}"',
-                 '"show-{}".format("environment")', '"show-%s" % "environment"', '"show-%s%s" % ("environ", "ment")',
-                 '"-".join(["show", "environment"])', '("show-" "env") + "ironment"')
-        for cmd in built:
-            folded = f'_systemd_run(["systemctl", "--user", {cmd}])'
-            keeps += [f"    return {folded}.stdout", f"    c = {cmd}\n    return _systemd_run(['systemctl', c]).stdout"]
-            self.assertEqual(credential_access(shipped.replace(run, folded), rel), [], f"discarded: {cmd}")
-            self.assertTrue(credential_access(f"def f():\n    subprocess.run(['systemctl', '--user', {cmd}])\n",
-                                              "probe.py"), f"a store read outside the edge: {cmd}")
         for body in keeps:
             with self.subTest(body=body):
                 self.assertTrue(credential_access(f"def systemd_user_available():\n{body}\n", rel), body)
+
+    # Every runtime-equivalent spelling of the verb: none is a plain literal, so each is flagged
+    # without evaluating it, even inside the probe and even when its output is discarded.
+    BUILT = ('"show-" + "environment"', '"".join(("show-", "environment"))', 'f"show-{\'environment\'}"',
+             '"show-{}".format("environment")', '"show-%s" % "environment"', '"show-%s%s" % ("environ", "ment")',
+             '"-".join(["show", "environment"])', '("show-" "env") + "ironment"', 'f"show-{\'environment\'!s}"',
+             '"show-{noun}".format(noun="environment")', '"%(verb)s-%(noun)s" % {"verb": "show", "noun": "environment"}',
+             '"".join(("show-",) + ("environment",))', 'VERB', 'self.verb', 'verb()', '"show-environment"[0:16]',
+             '"tnemnorivne-wohs"[::-1]', 'bytes.decode(b"show-environment")', 'str("show-environment")')
+
+    def test_every_non_literal_systemctl_argument_is_flagged(self):
+        rel, run = "adapters/hatch/cli.py", '_systemd_run(["systemctl", "--user", "show-environment"])'
+        shipped = f"def systemd_user_available():\n    return _ok({run})\n"
+        for cmd in self.BUILT:
+            with self.subTest(cmd=cmd):
+                folded = f'_systemd_run(["systemctl", "--user", {cmd}])'
+                for source in (shipped.replace(run, folded),
+                               f"def systemd_user_available():\n    return {folded}.stdout\n",
+                               f"def f():\n    c = {cmd}\n    return _systemd_run(['systemctl', c]).stdout\n",
+                               f"def f():\n    subprocess.run(['systemctl', '--user', {cmd}])\n",
+                               f"def f():\n    subprocess.run(('systemctl', '--user', {cmd}), capture_output=True)\n"):
+                    self.assertTrue(credential_access(source, rel), source)
+        for source in ('def f():\n    _systemd_run(CMD)\n', 'def f():\n    _systemd_run(["systemctl", *ARGS])\n',
+                       'SYSTEMCTL = "systemctl"\ndef f():\n    subprocess.run([SYSTEMCTL, "--user", v])\n',
+                       'def f():\n    _systemd_run(["systemctl", "--user", "show", NAME])\n',
+                       'def f():\n    _systemd_run(["systemctl"] + rest)\n',
+                       'def f():\n    _systemd_run(["systemctl", "--user", "enable", *(["--now"] if s else [])])\n',
+                       'def f():\n    subprocess.run("systemctl --user show-environment", shell=True)\n',
+                       'X = "show-environment"\n', 'def f():\n    print(f"run systemctl --user show-environment")\n'):
+            with self.subTest(source=source):
+                self.assertTrue(credential_access(source, "adapters/hatch/cli.py"), source)
+        for source in ('def f():\n    _systemd_run(["systemctl", "--user", "stop", "ag2-sparrow.service"])\n',
+                       'def f():\n    _systemd_run(["loginctl", "enable-linger", user])\n',
+                       'def f():\n    return shutil.which("systemctl")\n'):
+            self.assertEqual(credential_access(source, "adapters/hatch/cli.py"), [], source)
+
+    def test_every_shipped_service_name_literal_is_the_service_name(self):
+        tree = ast.parse((PKG / "ag2_sparrow" / "adapters" / "hatch" / "cli.py").read_text(encoding="utf-8"))
+        tree2 = ast.parse((PKG / "ag2_sparrow" / "adapters" / "hatch" / "keepalive.py").read_text(encoding="utf-8"))
+        names = {e.value for t in (tree, tree2) for n in ast.walk(t) if _literal_list(n) and n.elts[0].value == "systemctl"
+                 for e in n.elts if e.value.endswith(".service")}
+        self.assertEqual(names, {"ag2-sparrow.service"})
+        self.assertIn("SERVICE_NAME = 'ag2-sparrow.service'", ast.unparse(tree))
 
     def test_the_vendored_and_generated_copies_match_their_sources(self):
         for cmd in ([sys.executable, str(PKG / "tools" / "sync_from_src.py"), "--check"],

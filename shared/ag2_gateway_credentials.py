@@ -35,6 +35,7 @@ import os.path
 import re
 import socket
 import threading
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
@@ -412,20 +413,22 @@ def describe(exc: BaseException) -> str:
     return out
 
 
-_CREDENTIAL_WORDS = frozenset(
-    "token tokens secret secrets password passwords passwd pass passphrase credential credentials creds key "
-    "apikey auth authorization bearer cookie session pat".split())
-# A word that ends in one of these is a credential name glued together (MYTOKEN, DBPASSWORD).
-_CREDENTIAL_SUFFIXES = ("token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "pass",
-                        "apikey", "privatekey", "accesskey", "secretkey", "credential", "credentials")
+# A name holding any stem names a credential (over-withholding AUTHOR, KEYBOARD and SIGNAL is the
+# accepted price); "pw" and "pat" are too common inside words (path), so count as a segment or suffix.
+CREDENTIAL_STEMS = ("pass", "pwd", "secret", "token", "key", "auth", "cred", "bearer", "jwt", "session",
+                    "cookie", "priv", "sig", "otp", "apikey")
+SEGMENT_STEMS = ("pw", "pat")
 _NAME_WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
 
 
 def credential_name(name: str) -> bool:
-    """Whether `name` (a key, flag or header) names a credential as a whole word: split on
-    separators, case changes and digits, so AUTHOR, --tokenizer and --oauth-id do not."""
-    words = [w.lower() for w in _NAME_WORD_RE.findall(str(name))]
-    return any(w in _CREDENTIAL_WORDS or w.endswith(_CREDENTIAL_SUFFIXES) for w in words)
+    """Whether `name` (a key, flag or header) names a credential: lowercased, with everything but
+    letters and digits removed, it contains a CREDENTIAL_STEMS stem, or ends in or has a SEGMENT_STEMS segment."""
+    text = unicodedata.normalize("NFKC", str(name))
+    folded = re.sub(r"[^a-z0-9]", "", text.lower())
+    segments = {w.lower() for w in _NAME_WORD_RE.findall(text)}
+    return any(stem in folded for stem in CREDENTIAL_STEMS) or folded.endswith(SEGMENT_STEMS) \
+        or bool(segments.intersection(SEGMENT_STEMS))
 
 
 # `KEY=value`, `KEY = value` and `export KEY=value`, as parse_env_text reads them.
@@ -490,15 +493,18 @@ def _join(group: "list[str]") -> str:
     return " ".join(p[:-1] if p.endswith("\\") and i < len(kept) - 1 else p for i, p in enumerate(kept))
 
 
-_SHAPE_VALUE = r"(\"[^\"]*\"?|'[^']*'?|[^\s\"';&|]+)"
-# Any `KEY=value` in the line (env -i, sh -c 'export ...', an argument), and a quoted JSON key.
-_ANY_ASSIGNMENT_RE = re.compile(r"(?<![\w-])([A-Za-z_][A-Za-z0-9_]*)\s*=\s*" + _SHAPE_VALUE + "?")
-_JSON_KEY_RE = re.compile(r"[\"']([\w-]+)[\"']\s*:\s*" + _SHAPE_VALUE + "?")
-# A flag in `--flag value` or `--flag=value` form, and a `Name: value` header or YAML key.
-_FLAG_RE = re.compile(r"(?:^|(?<=[\s\"'=(]))--?([A-Za-z][\w-]*)(?:(?:=|\s+)" + _SHAPE_VALUE + ")?")
-_COLON_KEY_RE = re.compile(r"(?:^|(?<=[\s\"'{,;]))([A-Za-z_][\w-]*)\s*:(?!//)\s*" + _SHAPE_VALUE + "?")
+_SHAPE_VALUE = r"(\"[^\"]*\"?|'[^']*'?|[^\s\"';&|,\]\)}]+)"
+# Values to register, by shape: `KEY=value` anywhere (env -i, sh -c 'export ...', an argument), a
+# quoted JSON key, a `Name: value` header or YAML key, and a flag as `--f value`, `--f=value` or `--f,value`.
+_ANY_ASSIGNMENT_RE = re.compile(r"(?<![\w.-])([A-Za-z_][\w.-]*)\s*=\s*" + _SHAPE_VALUE + "?")
+_JSON_KEY_RE = re.compile(r"[\"']([\w.-]+)[\"']\s*:\s*" + _SHAPE_VALUE + "?")
+_FLAG_RE = re.compile(r"(?<![\w.-])--?([A-Za-z][\w.-]*)(?:(?:=|,\s*|\s+)" + _SHAPE_VALUE + ")?")
+_COLON_KEY_RE = re.compile(r"(?<![\w.-])([A-Za-z_][\w.-]*)\s*:(?!//)\s*" + _SHAPE_VALUE + "?")
 _HEADER_RE = re.compile(r"(?i)\bauthorization\s*:\s*(?:[A-Za-z]+\s+)?" + _SHAPE_VALUE
-                        + r"?|\bbearer\s+(?=[\"']?[^\s\"';&|]{8})" + _SHAPE_VALUE)
+                        + r"?|\bbearer\s+" + _SHAPE_VALUE)
+# Withholding, closed-world: a credential_name in any name position (a flag, or a name a quote or
+# blanks away from `=` or a `:` that does not start `://`) shapes the line, whatever its value.
+_NAME_POSITION_RE = re.compile(r"(?<![\w.-])(-{1,2})?([\w.-]*[A-Za-z0-9_])(?=([\"']?\s*(?:=|:(?!//)))?)")
 
 
 def _shape_views(text: str) -> "set[str]":
@@ -506,14 +512,16 @@ def _shape_views(text: str) -> "set[str]":
 
 
 def credential_shapes(text: str) -> "list[str]":
-    """The value of every credential shape in `text` ('' for one with no value): a credential_name
-    KEY=, quoted JSON key, `Name: value` header or YAML key, or --flag anywhere, an Authorization:
-    header, or a Bearer value of 8 or more characters."""
+    """The value of every credential shape in `text` ('' for one with no value or found by its name
+    position alone): a credential_name in a name position (a flag, KEY=, a quoted or bare `name:`
+    key or header), an Authorization: header, or a Bearer value."""
     found = []
     for view in _shape_views(str(text)):
         for regex in (_ANY_ASSIGNMENT_RE, _JSON_KEY_RE, _COLON_KEY_RE, _FLAG_RE):
             found += [m.group(2) or "" for m in regex.finditer(view) if credential_name(m.group(1))]
         found += [m.group(1) or m.group(2) or "" for m in _HEADER_RE.finditer(view)]
+        found += ["" for m in _NAME_POSITION_RE.finditer(view)
+                  if (m.group(1) or m.group(3) is not None) and credential_name(m.group(2))]
     return found
 
 
