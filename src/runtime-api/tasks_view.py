@@ -30,6 +30,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))  # src/
+from activity_bus import in_progress
 from delivery.readiness import read_ready_result
 from file_lock import locked_file
 from local_task_protocol import (KNOWN_HEADER_KEYS, find_archived_task,  # noqa: E402
@@ -241,8 +242,13 @@ class TasksView:
                 return {"taskId": task_id, "state": waiting["state"],
                         "waitingOn": waiting["requests"]}
             claimed = ".claimed-" in live.name
+            try:
+                active = claimed or in_progress(self.tasks_dir.parent, task_id)
+            except (UnicodeError, TypeError, OverflowError):
+                # Malformed activity must not block task reads or cancellation.
+                active = False
             return {"taskId": task_id,
-                    "state": "in_progress" if claimed else "pending"}
+                    "state": "in_progress" if active else "pending"}
         if find_archived_task(self.tasks_dir, task_id) is not None:
             # Archived task, result already delivered and rotated away.
             return {"taskId": task_id, "state": "done"}
@@ -270,8 +276,8 @@ class TasksView:
         return None
 
     def _result_files(self) -> "list[tuple[Path, int]]":
-        """(path, mtime) newest first, for `task-rtapi-` results only — source
-        isolation: other sources' results must not leak into this channel.
+        """(path, integer seconds), newest first by full filesystem precision.
+        Only `task-rtapi-` results: other sources must not leak into this channel.
 
         Returns the mtime it already read rather than letting callers stat
         again: archival unlinks a live name, so a second stat can raise on a
@@ -287,9 +293,9 @@ class TasksView:
             except FileNotFoundError:
                 continue  # archived mid-scan — absent, not an error
             if stat_module.S_ISREG(st.st_mode):
-                found.append((f, int(st.st_mtime)))
-        found.sort(key=lambda pair: pair[1], reverse=True)
-        return found
+                found.append((f, int(st.st_mtime), st.st_mtime_ns))
+        found.sort(key=lambda entry: entry[2], reverse=True)
+        return [(path, ts) for path, ts, _ns in found]
 
     # ── task.list_results ────────────────────────────────────────────────────
     def list_results(self, limit: int = 50) -> dict:
@@ -368,6 +374,7 @@ class TasksView:
                          "state": self.status(task_id)["state"]}
                 try:
                     th = parse_task_headers_lenient(f.read_text())
+                    entry["preview"] = " ".join(th.body.split())[:160]
                     for k in ("source", "priority", "timestamp", "instance_id"):
                         v = th.get(k)
                         if v:

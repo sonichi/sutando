@@ -39,7 +39,7 @@ for _p in (REPO / "src", HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 import pending_questions_ledger as ledger
-from pending_questions_md import DIVIDER_RE, active_region, mask_markup
+from pending_questions_md import DIVIDER_RE, active_region, archive_boundary_damage, mask_markup
 from pending_questions_outbox import mark_store_used
 from pending_questions_store import Question, StoreError, question_body, row_body, row_id, safe_body
 
@@ -186,6 +186,10 @@ def ingest_legacy_file_entries(workspace, host: Optional[str], store) -> tuple:
         return moved, errors
     except OSError as e:
         return moved, [f"legacy file: {e}"]
+    damaged = archive_boundary_damage(text)
+    if damaged:
+        lines = ", ".join(str(line) for line, _ in damaged)
+        return moved, [f"legacy ingest: ambiguous archive boundary at line(s) {lines}; no entries imported"]
     todo = [e for e in legacy_entries(text) if e["open"] and not e["moved"]]
     if not todo:
         return moved, errors

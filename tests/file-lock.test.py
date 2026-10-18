@@ -109,6 +109,24 @@ class LockContract(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     file_lock.lock_fd(fh.fileno())
 
+    @unittest.skipUnless(os.name == "posix", "flock contention between two open file descriptions")
+    def test_try_lock_fd_returns_busy_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "lock")
+            first = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            second = os.open(path, os.O_RDWR)
+            try:
+                self.assertIs(file_lock.try_lock_fd(first), True)
+                self.assertIs(file_lock.try_lock_fd(second), False, "busy, not an exception")
+                file_lock.unlock_fd(first)
+                self.assertIs(file_lock.try_lock_fd(second), True)
+            finally:
+                os.close(first)
+                os.close(second)
+        with patch.object(file_lock, "lock_fd", side_effect=OSError(errno.EBADF, "bad descriptor")):
+            with self.assertRaises(OSError):
+                file_lock.try_lock_fd(42)
+
     def test_posix_delegation(self):
         fake = Mock(LOCK_EX=2, LOCK_NB=4, LOCK_UN=8)
         with patch.object(file_lock, "fcntl", fake):

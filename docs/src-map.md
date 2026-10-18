@@ -30,7 +30,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`auth-preflight-gate.sh`** — auth-preflight-gate.sh — boot gate for the logged-out-CLI class (#2396).
 - **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
 - **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
-- **`bounded-wait.sh`** — The watcher's one bounded child run.
+- **`bounded-wait.sh`** — Shared bounded child run.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
@@ -101,6 +101,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
 - **`health_snapshot.py`** — Health snapshot — one read-only answer per agent (core and workers) from existing state files.
+- **`holder_lock.py`** — One-process exclusion per work root: a flock held for the owner's life, and a record of who holds it.
 - **`hook_transcript_path.sh`** — Shared resolver for a Claude Code hook's transcript path.
 - **`http-body-limit.ts`** — Shared request-body cap for the two HTTP surfaces that accept a vision frame: the web-client's /vision/frame proxy and the voice-agent's vision control server.
 - **`inbox-resolve.sh`** — Inbox-entry resolver — sourceable so a test can invoke it in isolation.
@@ -226,6 +227,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`task_envelope.py`** — Task-envelope authentication: an HMAC stamp that makes access_tier a verified claim instead of an honor-system header.
 - **`task_envelope.ts`** — task_envelope.ts — TypeScript mirror of src/task_envelope.py's stamping half, for the TS task writers (voice delegation seam, context-drop, wearable).
 - **`task_envelope_census.py`** — Soak census for HMAC task envelopes: the read-only measurement behind the "writer census reaches zero" gate.
+- **`task_lifecycle.py`** — Task execution lifecycle for an adapter that serves one work dir and calls a provider per task.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_queue.py`** — The pending task queue, in one place: which task files are waiting, in the order the core will take them, and where a given task stands in that order.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
@@ -235,8 +237,10 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmp-paths.ts`** — Shared cross-platform temp-file paths used by both writers and readers.
+- **`tmux-pane-keys.sh`** — tmux-pane-keys.sh [--tmux BIN] -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...> Leaves pane mode and sends in one tmux step, bounded.
 - **`tmux-probe-cli.py`** — Tiny CLI over tmux_probe.has_session(), for callers (start-cli.sh's relay loop) that cannot import Python but must not duplicate its ABSENT_SIGNATURES.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
+- **`tmux_pane_keys.py`** — Shared tmux pane-key argv and crash-safe send guard.
 - **`tmux_probe.py`** — Tri-state tmux session probe shared by every core-liveness reader.
 - **`turn-start.sh`** — UserPromptSubmit hook: a new turn is starting, so re-arm the Stop reminder.
 - **`turn_ledger.py`** — The turn ledger — a record that the agent's turn produced an outbound message.

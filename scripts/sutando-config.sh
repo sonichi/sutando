@@ -266,6 +266,25 @@ print(entry['value'], end='')
 "
     ;;
 
+  codex-home-path)
+    # The core_config_dirs codex value the Codex launcher exports, else $CODEX_HOME, else
+    # Codex's own default. Extra args join as sub-path components, as in claude-home-path.
+    _cxh_base="$(py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import find_core_config_dir
+entry = find_core_config_dir(type_='codex')
+print(entry['value'] if entry else '', end='')
+")"
+    [ -n "$_cxh_base" ] || _cxh_base="${CODEX_HOME:-$HOME/.codex}"
+    _cxh_base="${_cxh_base/#\~/$HOME}"
+    shift
+    for _p in "$@"; do
+      _cxh_base="$_cxh_base/$_p"
+    done
+    printf '%s' "$_cxh_base"
+    ;;
+
   core-config-dirs)
     # v0.9 — print all resolved core_config_dirs entries as JSON (one object
     # per line — JSON Lines). For tooling that wants to enumerate without

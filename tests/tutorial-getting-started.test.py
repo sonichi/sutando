@@ -857,6 +857,74 @@ class MainTest(unittest.TestCase):
         self.assertIn("pages failed", json.loads(out)["reason"])
 
 
+    # The setup app's saved inputs: <workspace>/state/onboarding/tutorial-inputs.json.
+    def save_inputs(self, data):
+        path = gs.inputs_path(self.tmp / "ws")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data if isinstance(data, str) else json.dumps(data))
+
+    def room_state(self):
+        return json.loads((self.tmp / "room.json").read_text())
+
+    def test_publish_alone_takes_room_owner_and_roles_from_the_inputs_file(self):
+        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test",
+                          "agent_mxid": "@kai.agent:example.test", "roles": "I picked: Founder, Sales."})
+        with mock.patch.object(gs, "detect_core", return_value="codex"), \
+                mock.patch.object(gs, "_https_get", side_effect=OSError("offline")):
+            code, out, _ = self.main("publish", "--room-commons", str(self.stub))
+        self.assertEqual(code, 0)
+        result = json.loads(out)
+        self.assertEqual((result["action"], result["summoned"], result["name"]), ("created", True, "Kai"))
+        self.assertIn(["summon", result["kind"], "@owner:example.test"], self.room_state()["calls"])
+        self.assertIn("Picked for: Founder, Sales", self.room_state()["pages"][result["kind"]])
+
+    def test_command_line_overrides_the_inputs_file(self):
+        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder"})
+        code, out, _ = self.main("publish", "--name", "Blue", "--core", "codex", "--owner", "@other:example.test",
+                                 "--roles", "Sales", "--room-commons", str(self.stub),
+                                 "--agent-mxid", "@kai.agent:example.test")
+        self.assertEqual(code, 0)
+        page = self.room_state()["pages"][json.loads(out)["kind"]]
+        self.assertIn("Picked for: Sales", page)
+        self.assertNotIn("Founder", page.split("Picked for:", 1)[1][:80])
+
+    def test_owner_and_roles_stay_in_the_inputs_room(self):
+        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder"})
+        code, out, _ = self.main("publish", "--room", "!elsewhere:example.test", "--name", "Blue",
+                                 "--core", "codex", "--room-commons", str(self.stub),
+                                 "--agent-mxid", "@kai.agent:example.test")
+        self.assertEqual(code, 0)
+        result = json.loads(out)
+        self.assertFalse(result["summoned"])
+        self.assertNotIn("Picked for:", self.room_state()["pages"][result["kind"]])
+
+    def test_no_room_anywhere_exits_2(self):
+        for data in (None, "{not json", "[]", {"room": "dm"}, {"room": "!x:example.test\n"}):
+            if data is not None:
+                self.save_inputs(data)
+            code, out, err = self.main("publish", "--room-commons", str(self.stub))
+            self.assertEqual((code, out), (2, ""), data)
+            self.assertIn("no --room", err)
+
+    def test_garbled_inputs_keep_the_flag_only_behaviour(self):
+        self.save_inputs("{garbled")
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                 "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
+        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["summoned"]), (0, "created", False))
+
+    def test_load_inputs_keeps_only_well_formed_fields(self):
+        path = self.tmp / "inputs.json"
+        path.write_text(json.dumps({"room": self.ROOM, "owner": "owner@example.test",
+                                    "agent_mxid": "@kai.agent:example.test", "roles": ["Founder", " Sales "],
+                                    "extra": "ignored"}))
+        self.assertEqual(gs.load_inputs(path), {"room": self.ROOM, "agent_mxid": "@kai.agent:example.test",
+                                                "roles": "Founder, Sales"})
+        path.write_text(json.dumps({"room": 7, "owner": "@o:example.test\n", "roles": "a\nb",
+                                    "agent_mxid": "@" + "a" * 300 + ":example.test"}))
+        self.assertEqual(gs.load_inputs(path), {})
+        self.assertEqual(gs.load_inputs(self.tmp / "absent.json"), {})
+
+
 class PersonalTest(unittest.TestCase):
     """Prompts the agent writes for the owner's work (--prompts) and the roles line (--roles)."""
 

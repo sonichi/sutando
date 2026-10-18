@@ -259,6 +259,16 @@ jobs:
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_env_token_quotes.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_signal_exit_log.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_hatch_adapter.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_code_adapter.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_codex_connector.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_routine_adapter.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_cloud_session_adapter.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_adapter_relay_loop.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_adapter_boundaries.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_task_lifecycle.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_cloud_session_contract.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_cloud_session_interlock.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_adapter_differential.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tools/test_no_drift.py
           timeout -k 5 300 python3 packages/ag2-sparrow/tests/test_wheel_contents.py
           timeout -k 5 120 python3 skills/agent-room-ops/test_room_ops.py

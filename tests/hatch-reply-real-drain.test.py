@@ -88,7 +88,7 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
                    GATEWAY_INSTANCE=self.instance)
         proc = subprocess.Popen(
             [sys.executable, '-m', 'ag2_sparrow.adapters.hatch.cli', 'reply',
-             '--answering', 'what is 2+2', str(self.results / f'{self.tid}.txt'), '--wait', '20'],
+             str(self.results / f'{self.tid}.txt'), '--wait', '20'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=env, cwd=str(self.home))
         done = {}

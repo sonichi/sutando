@@ -181,8 +181,10 @@ with tempfile.TemporaryDirectory() as td:
     bridge._retry_review_control_results()
     bridge._req = fake_req
     control_posts = [p for _m, u, p in calls if u == "/v1/results"]
+    # Every result carries the voice-outcome contract (docs/remote-gateway-protocol.md).
     check(not control_path.exists() and control_posts[-1] == {
-        "id": "decision-no", "body": "[no-send]"},
+        "id": "decision-no", "body": "[no-send]",
+        "capabilities": ["voice-outcome-v1"], "dm_only": False},
         "the owner decision is consumed without becoming an ordinary agent task")
 
     guard.materialize_withheld_verdict(

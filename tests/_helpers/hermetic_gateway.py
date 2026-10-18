@@ -22,14 +22,19 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 ROOT = Path(tempfile.mkdtemp(prefix="hermetic-gateway-"))
 
-_ENV = {
-    "CLAUDE_CONFIG_DIR": str(ROOT / "claude-config"),
-    "AGENT_CONNECT_TASK_DIR": str(ROOT / "tasks"),
-    "AGENT_CONNECT_RESULT_DIR": str(ROOT / "results"),
-    "AGENT_CONNECT_STATE_DIR": str(ROOT / "state"),
-    "REMOTE_TASK_TOKEN": "hermetic-test-token",
-    "REMOTE_TASK_URL": "http://127.0.0.1:9",
-}
+
+def _isolated_env(root: Path) -> "dict[str, str]":
+    return {
+        "CLAUDE_CONFIG_DIR": str(root / "claude-config"),
+        "AGENT_CONNECT_TASK_DIR": str(root / "tasks"),
+        "AGENT_CONNECT_RESULT_DIR": str(root / "results"),
+        "AGENT_CONNECT_STATE_DIR": str(root / "state"),
+        "REMOTE_TASK_TOKEN": "hermetic-test-token",
+        "REMOTE_TASK_URL": "http://127.0.0.1:9",
+    }
+
+
+_ENV = _isolated_env(ROOT)
 _UNSET = ("AG2_DEVICE_ENV", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
 
 
@@ -61,11 +66,17 @@ def host_reads(reads: "list[tuple[str, str]]") -> "list[str]":
     return bad
 
 
-def isolate_then_import():
-    """Isolate the environment, then import the bridge while recording reads."""
+def isolate_then_import(root: "Path | None" = None, env: "dict[str, str] | None" = None):
+    """Isolate the environment, then import the bridge while recording reads.
+
+    `root` reuses a workspace, so a second process (a restarted bridge) finds what
+    the first left there; `env` overrides variables, such as the relay URL."""
+    global ROOT
+    if root is not None:
+        ROOT = Path(root)
     for d in ("claude-config", "tasks", "results", "state"):
         (ROOT / d).mkdir(parents=True, exist_ok=True)
-    os.environ.update(_ENV)
+    os.environ.update({**_isolated_env(ROOT), **(env or {})})
     for name in _UNSET:
         os.environ.pop(name, None)
     sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))

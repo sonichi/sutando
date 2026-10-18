@@ -20,7 +20,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from local_task_protocol import split_reply_context
+from local_task_protocol import reply_action_text
 from workspace_default import resolve_workspace
 
 from .manager import HitlManager
@@ -271,6 +271,5 @@ def match_action(req: HumanRequirement, text: str):
 
 
 def _reply_text(task_text: str) -> str:
-    """The message text after the relay's quoted reply context. A wrong cut can
-    only fail to match a label (the task then stays a message), never pick one."""
-    return split_reply_context(task_text)[1]
+    """The unquoted answer; owner, card identity and stale guards are checked separately."""
+    return reply_action_text(task_text)
