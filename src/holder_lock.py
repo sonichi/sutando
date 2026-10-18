@@ -110,8 +110,6 @@ class Owner:
     path: str = ""
     published: bool = False
     released: bool = False
-    leased: bool = False
-    lease_used: bool = False
     mutex: Any = field(default_factory=threading.Lock, repr=False)
 
     @property
@@ -903,43 +901,13 @@ def publish(owner: Owner, adapter: str) -> Published:
         return Published(dict(rec, lock=dict(rec["lock"])), durable=durable)
 
 
-def child_lease(owner: Owner) -> int:
-    """The lock descriptor for exactly one child's pass_fds (§1.9): the flock lives on the shared open
-    file description, so the child keeps the root held after this process is gone, and `release` is
-    refused until `end_lease` confirms the reap. Terminal: a second call is LockError("lease used")."""
-    _check_owner(owner)
-    with _guarded:
-        _held_fds(owner)
-        if owner.lease_used:
-            raise LockError("lease used")
-        _lock_still_held(owner)
-        owner.leased = owner.lease_used = True
-        return owner.fd
-
-
-def end_lease(owner: Owner, child_pid: int) -> None:
-    """The leased child is reaped: its pid is gone, so `release` may follow. A pid still present (a
-    zombie included) is LockError("child alive"); the owner then exits without release (§1.9)."""
-    _check_owner(owner)
-    with _guarded:
-        _held_fds(owner)
-        if not owner.leased:
-            raise LockError("not leased")
-        if _pid_alive(int(child_pid)) is not False:
-            raise LockError("child alive")
-        owner.leased = False
-
-
 def release(owner: Owner) -> Released:
     """Under the module guard: validate the handle, remove the record only if it names this owner,
-    unlock and close (the root fd last), and only then mark released. Owner pid only; never while a
-    child lease is out."""
+    unlock and close (the root fd last), and only then mark released. Owner pid only."""
     global _OWNER
     _check_owner(owner)
     with _guarded:
         _held_fds(owner)
-        if owner.leased:
-            raise LockError("leased")
         if _same_at(owner.fd, owner.dir_fd, LOCK_NAME):
             _lock_still_held(owner)
         removed = False

@@ -165,9 +165,12 @@ marker first line, the canonical `ROOT` persisted from `--work` or the lexical
 parent of an `--inbox` whose basename is `tasks`) and the unit written by
 temp + replace and the job registered and started: a systemd user unit
 (`~/.config/systemd/user/ag2-sparrow-claude-local.service`, `Restart=always`,
-`RestartSec=10`, `RestartPreventExitStatus=75`, linger requested) or a
-launchd agent (`~/Library/LaunchAgents/ai.ag2.sparrow.claude-local.plist`,
-`KeepAlive`, `RunAtLoad`, `ThrottleInterval` 10). Success is "the managed
+`RestartSec=10`, `RestartPreventExitStatus=75`, `KillMode=control-group`,
+`TimeoutStopSec=30`, `Environment=AG2_SPARROW_MANAGED=1`, linger requested) or
+a launchd agent (`~/Library/LaunchAgents/ai.ag2.sparrow.claude-local.plist`,
+`KeepAlive`, `RunAtLoad`, `ThrottleInterval` 30, `AbandonProcessGroup` false,
+`ExitTimeOut` 30, `AG2_SPARROW_MANAGED=1` in `EnvironmentVariables`). The
+manager owns the process tree (below). Success is "the managed
 launcher acquired the expected root": within a bound, the root's flock is held
 by a live `claude-local` holder from this very install (`holder_lock.install_id`)
 whose pid and start differ from the record before the apply. Anything less fails closed with "the managed launcher did
@@ -178,43 +181,55 @@ again; there is no "unchanged" shortcut). Both units run
 token: that stays in Sparrow's 0600 `relay.env`, and the Claude login stays in
 its config dir (`verify` runs `claude auth status` there; nothing is copied).
 
-`run` checks the pin again, takes the one-session-per-root `holder_lock` on
-the persisted `ROOT` (the same key the Codex, routine and cloud-session
-adapters use, so a symlinked work root still contends with its siblings; a
-`tasks` that is itself a symlink is refused at install and by `run`, which
-opens it `O_NOFOLLOW` under the held root, since the lock would sit on this
-root while the session listed the link's target; a
+`run` is the manager's entrypoint, not a human one: it refuses with one line
+naming `debug-run` unless `AG2_SPARROW_MANAGED=1` is in its environment, which
+the unit and the plist set (a guard against an accidental hand start inside
+the manager's teardown window, not a security boundary; the marker is not
+passed on to the session). It checks the pin again, takes the
+one-session-per-root `holder_lock` on the persisted `ROOT` (the same key the
+Codex, routine and cloud-session adapters use, so a symlinked work root still
+contends with its siblings; a `tasks` that is itself a symlink is refused at
+install and by `run`, which opens it `O_NOFOLLOW` under the held root, since
+the lock would sit on this root while the session listed the link's target; a
 `Contended` with no record or no live holder is retried for 1 s first, so a
 `verify` or install probe's momentary flock never forges a 75), publishes its
-record before the child exists, leases the lock descriptor to exactly one
-child (`holder_lock.child_lease`, design §1.9; terminal, never a second), and
-starts the session through a small trampoline **parent**: it `fchdir`s into
-`tasks` under the **held root inode**, sets `AG2_INBOX_DIR=.` and
-`AG2_RESULTS_DIR=../results`, runs `claude` with `close_fds` and the lease as
-its one extra descriptor, forwards `SIGTERM`/`SIGINT` to it and reaps it
-before exiting with its code. So the session's task I/O is bound to the
-inherited inode (a path replaced after the lock check is a different root it
-never lists), and the flock is held by the launcher, the trampoline and the
-session alike: the root stays held while any of them lives, so a dead
-trampoline never leaves a live session on a free root (fail closed). The
-trampoline leads its own process group and the session runs in it: the
-launcher's kill after the grace is a group kill, once the trampoline is
-reaped for any reason the launcher sweeps the group, and it releases only
-once the group is empty, so no session outlives the lease it was fenced
-under and nothing unlocks over a live one. A second launcher exits 75, which
-the systemd unit does not relaunch (a session's own exit 75 is reported as
-1). Every launcher exit reaps the child first: `SIGTERM` (`systemctl stop`,
-`bootout`) and `SIGINT` are one explicit stop path, its handlers installed
-before the lock is taken (no `KeyboardInterrupt` can skip a reap): they
-terminate it, wait up to 15 s, kill, wait up to 10 s more, then release
-(143 / 130); a post-spawn exception reaps, then re-raises;
-a reap, or a group, not confirmed gone within that bound exits **without**
-releasing, so the survivor keeps the root fenced and `verify` reads "held,
-launcher gone (child alive)"; `SIGKILL` of the launcher leaves the same state.
-A child the session starts in its own process group that inherited the
-descriptor (a Rust `Command` passes every one) escapes the sweep and keeps the
-root held after a SIGKILLed launcher until it exits; the same reading names
-it, and stopping it frees the root. The env allowlist below does not isolate files: a
+record before the child exists, and starts the session as its **direct
+child**: the launcher `fchdir`s to `tasks` under the **held root inode**
+around the spawn and restores its cwd in `finally` (the cwd is process-wide,
+so the launcher is single-threaded by invariant and refuses to spawn with
+any other thread alive), sets `AG2_INBOX_DIR=.` and `AG2_RESULTS_DIR=../results`,
+and runs `claude` with `close_fds` — no lock, root or tasks descriptor reaches
+it, no new session or process group, no trampoline. So the session's task I/O
+is bound to the inherited inode (a path replaced after the lock check is a
+different root it never lists), and the flock is held by the launcher alone,
+for its own life: nothing a descendant does can hold it, because nothing ever
+inherits it. A second launcher exits 75, which the systemd unit does not
+relaunch (a session's own exit 75 is reported as 1).
+
+**The manager owns the process tree; the adapter signals only its unreaped
+direct child.** `SIGTERM` (`systemctl stop`, `bootout`) and `SIGINT` are one
+stop path whose handlers go directly over the inherited dispositions before
+the lock is taken (an inherited `SIG_IGN` is replaced, there is no `SIG_DFL`
+step, and an inherited `SIGCHLD=SIG_IGN` is reset so the child is reapable);
+the handler only records the first signal, and the main loop terminates the
+child, waits up to 15 s, kills, waits up to 10 s more, and exits 143 / 130
+with "child reaped" printed only after a confirmed `wait()`. The child handle
+is published to the loop only after `Popen` returned and the pidfd decision
+was made, and the loop re-checks a stop recorded meanwhile, so a signal
+landing inside `Popen` is neither raised nor lost; a stop before the spawn is
+"stopped before the session started". The adapter issues no `killpg` at all:
+on Linux the child is held by a pidfd opened right after the spawn and every
+signal goes through `pidfd_send_signal` (a `pidfd_open` failure stops the
+child, bounded, and refuses with exit 2); on macOS, which has no pidfd, the
+unreaped direct child's `Popen` handle is the explicitly allowed fallback.
+After `wait()` returns nothing is signalled, and the rest of the tree is the
+manager's: systemd tears the control group down on stop and after the
+launcher's death before any restart (`KillMode=control-group`, SIGTERM then
+SIGKILL at `TimeoutStopSec`); launchd SIGTERMs the remaining process group
+once when the job's process dies (`AbandonProcessGroup=false`) and respawns
+after `ThrottleInterval`. A kill the launcher cannot confirm within its bound
+exits with the signal's code and the lock goes with the launcher; the
+survivor is the manager's. The env allowlist below does not isolate files: a
 `bypassPermissions` session can still read `relay.env` or anything else on
 disk if a non-owner task steers it; that is the owner's decision when
 choosing the mode. `run` starts
@@ -242,13 +257,21 @@ CLI falls back to `.credentials.json` and reports `loggedIn: false`
 (`claude auth status` is the cheap check).
 
 `verify` prints `INFO job: <name> active|registered|absent|unknown` from the
-manager's own words and `INFO session: <root> held by launcher pid N | held, launcher
-gone (child alive) | free | unknown (...)` from `task_io.lock_held` (the
-physical flock probe; errors read `unknown`, never `free`) and the holder
-record. `debug-run` holds the operation lock from the registered/absent check
-through the root lock's acquisition, refuses a registered job, an unknown
-probe or a held root (a registered-but-inactive unit refuses too), and
-otherwise runs the same session in the foreground.
+manager's own words and `INFO session: <root> …` as the lock beside the
+manager's own state (systemd `ActiveState/SubState`; launchd the job's
+`pid = N` / `state = …` from `launchctl print`): `held by launcher pid N
+(manager active/running)`, `restarting (manager activating/auto-restart, lock
+free)` for a free lock under a live or respawning job (never a bare `free`),
+`free (no job)` when the job is absent, or `unknown (...)` when the flock
+cannot be probed (`task_io.lock_held`, the physical probe; errors read
+`unknown`, never `free`). On Linux it adds `INFO systemd ordering is asserted
+from KillMode=control-group and not witnessed`. `debug-run` is the only human
+path: it holds the operation lock from the registered/absent check through
+the root lock's acquisition, refuses a registered job, an unknown probe or a
+held root (a registered-but-inactive unit refuses too), and otherwise runs
+the same session in the foreground. No manager owns its tree: a SIGKILLed
+`debug-run` leaves its session alive with the root free, yours to stop
+(`debug-run --help` says so).
 
 `uninstall` tears down with the config **last**, every step re-runnable: the
 manager is probed first (a job registered without files is still torn down),
@@ -288,14 +311,40 @@ mtime delta.
   upgrade.
 - The seen-set is module memory: a reload re-scans and re-submits anything
   without a non-empty result file, one per tick in name order. One session per
-  work root: the launcher holds the root's `holder_lock` for the whole child
-  (leased to it) and a second launcher exits 75. launchd has no
-  `RestartPreventExitStatus`, so on macOS a second agent pointed at the same
-  root keeps exiting 75 every `ThrottleInterval` without ever starting a
-  session. A hand-invoked `run` between the manager's stop and `uninstall`'s
-  lock check is the stated, unsupported operator race: uninstall then refuses
-  on the held root. No automatic rollback on a failed reconfigure: the operator
-  runs uninstall, then install.
+  work root: the launcher holds the root's `holder_lock` for its own life and
+  a second launcher exits 75. launchd has no `RestartPreventExitStatus`, so on
+  macOS a second agent pointed at the same root keeps exiting 75 every
+  `ThrottleInterval` without ever starting a session. A hand-invoked
+  `debug-run` between the manager's stop and `uninstall`'s lock check is the
+  stated, unsupported operator race: uninstall then refuses on the held root.
+  No automatic rollback on a failed reconfigure: the operator runs uninstall,
+  then install.
+- Overlap after a launcher crash, on macOS (the owner's option A, stated and
+  witnessed): when the launcher dies (`kill -9`), the lock reads free at once
+  — there is no fence that survives the launcher — and launchd SIGTERMs the
+  remaining process group once, then respawns the job after `ThrottleInterval`
+  (30 s); it never SIGKILLs. Measured: the old session got SIGTERM 8 ms after
+  the kill and the new launcher started 7 s later (with the then 10 s
+  throttle). The real Claude Code CLI exits on SIGTERM, so it is gone well
+  before the respawn (the §15 witness measures exactly that: session exit time
+  against the respawn, no overlap). A session that ignores SIGTERM overlaps the
+  new one for as long as it lives, and `bootout` does not reach it either:
+  `verify` shows the manager's state beside the lock, and the recovery is
+  `launchctl bootout --wait gui/<uid>/ai.ag2.sparrow.claude-local`, then stop
+  the named stray by hand. A second launcher started by hand in that window is
+  refused only by the manager's ordering and the `run` gate, not by a lock.
+- A descendant that calls `setsid()` leaves the process group: it cannot hold
+  the flock (nothing inherits it), so it cannot fence or double-submit, but it
+  can still act on the workspace until it exits and neither the launcher nor
+  launchd reaps it. The same applies to a tool subprocess of the session that
+  ignored launchd's single SIGTERM.
+- systemd's ordering — the control group SIGTERMed, then SIGKILLed at
+  `TimeoutStopSec`, and the unit not restarted until it is empty — is asserted
+  from `KillMode=control-group` and not witnessed here; `verify` says so on
+  Linux.
+- macOS has no `pidfd_open`: the unreaped direct child's `Popen` handle is the
+  fallback the launcher signals through (Linux uses a pidfd). Either way the
+  launcher never signals a bare pid or a group, and nothing after `wait()`.
 - On macOS the launchd user agent stops at logout and starts again at the next
   login; there is no linger equivalent. On Linux `install` asks for linger so
   the unit survives logout.

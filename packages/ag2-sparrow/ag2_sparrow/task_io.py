@@ -150,8 +150,9 @@ def lock_holder_pid(work):
 
 def lock_holder(work):
     """The holder record's attribution: {"adapter", "pid", "start", "live"} (live: the pid's lineage
-    checks out, so it names the launcher; a dead pid under a held lock means only its child remains),
-    else {}. Never liveness of the lock itself: that is lock_held's."""
+    checks out, so it names the launcher; a dead pid under a held lock is a holder between its flock
+    and its record, since no child ever holds the lock), else {}. Never liveness of the lock itself:
+    that is lock_held's."""
     try:
         state = holder_lock.status(work)
     except (OSError, holder_lock.LockError):
@@ -203,23 +204,6 @@ def lock_held(work):
         return "free"
     finally:
         os.close(fd)
-
-
-def lease_fd(owner):
-    """The lock descriptor for the one child's pass_fds (holder_lock §1.9): the child keeps the root
-    held after the launcher is gone, and the launcher may release only after the confirmed reap."""
-    return holder_lock.child_lease(owner)
-
-
-def release_after_reap(owner, child_pid):
-    """End the lease and release: True when the child is confirmed gone and the lock is released;
-    False (nothing unlocked, the child left fenced under the flock) when it is not."""
-    try:
-        holder_lock.end_lease(owner, child_pid)
-        holder_lock.release(owner)
-    except holder_lock.LockError:
-        return False
-    return True
 
 
 def acquire_lock(work, adapter, retry_s=0.0):

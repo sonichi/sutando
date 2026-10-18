@@ -6,8 +6,10 @@ per-shape operation lock: stop the job and prove it absent, prove the old root f
 and the unit (tmp + replace), register and start, then require the root held by a fresh holder of this
 shape; anything less is one line and the files as written, so an identical install is the retry.
 `uninstall` stops, proves absent, proves the root free, removes the unit, reloads, and the config last.
-An unknown probe authorises nothing. The launcher takes the lock, leases its descriptor to the child,
-runs the child against `tasks` under the held root inode, and releases only after a confirmed reap.
+An unknown probe authorises nothing. The launcher holds the lock for its own life only, spawns the
+session as its direct child against `tasks` under the held root inode, signals only that child while
+it is unreaped, and leaves the rest of the process tree to the manager (systemd's control group,
+launchd's process group): nothing a descendant does can hold the root.
 
 Package level, parametrised by a Shape the adapter passes in: this module names no adapter and imports
 none, so each adapter owns its console script and the boundary rule holds. Stdlib only.
@@ -27,13 +29,13 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import _dirs
-from .task_io import (LockRefused, acquire_lock, install_id, lease_fd, lock_held, lock_holder, lock_path,
-                      release_after_reap, release_lock)
+from .task_io import LockRefused, acquire_lock, install_id, lock_held, lock_holder, lock_path, release_lock
 
 EXIT_HELD = 75          # another session holds this work root: a supervisor must not relaunch over it
 EXIT_UNUSABLE = 2
@@ -45,22 +47,12 @@ OP_WAIT_S = 30.0
 ACQUIRE_RETRY_S = 1.0
 REAP_BOUND_S = 10.0
 POLL_S = 0.2
-# The small parent between the launcher and the session: it runs the session with cwd = the held
-# tasks inode and the lease fd shared (the root stays held while either of them lives), reaps it on any signal.
-TRAMPOLINE = """
-import os, signal, subprocess, sys
-lease, tasks = int(sys.argv[1]), int(sys.argv[2])
-os.fchdir(tasks); os.close(tasks)
-env = dict(os.environ, AG2_INBOX_DIR=".", AG2_RESULTS_DIR=os.path.join("..", "results"))
-child = subprocess.Popen(sys.argv[3:], env=env, close_fds=True, pass_fds=(lease,))
-for sig in (signal.SIGTERM, signal.SIGINT):
-    signal.signal(sig, lambda signum, frame: child.send_signal(signum))
-while True:
-    try:
-        sys.exit(child.wait())
-    except KeyboardInterrupt:
-        child.terminate()
-"""
+STOP_TIMEOUT_S = 30     # the manager's own SIGTERM-to-SIGKILL bound: past the launcher's grace + reap bound
+THROTTLE_S = 30         # launchd's respawn delay: behind a normal SIGTERM shutdown of the old session
+
+# Set by the unit and the plist in the launcher's environment; `run` refuses without it, so a hand
+# start never takes the root inside the manager's teardown window. A guard, not a security boundary.
+MANAGED_VAR = "AG2_SPARROW_MANAGED"
 
 
 @dataclass(frozen=True)
@@ -322,17 +314,23 @@ def console_script(shape: Shape) -> str:
 
 
 def render_service(shape: Shape, exec_start: str) -> str:
+    """The manager owns the tree: KillMode=control-group tears the whole cgroup down on stop and after
+    the launcher's death before any restart (SIGTERM, then SIGKILL at TimeoutStopSec)."""
     return (f"{shape.marker}\n[Unit]\nDescription=ag2-sparrow {shape.name} ({shape.description})\n"
             "# A session that dies 5 times in 5 minutes (e.g. a bad login) is left failed.\n"
             "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
-            f"[Service]\nExecStart={exec_start} run\nRestart=always\nRestartSec=10\n"
+            f"[Service]\nExecStart={exec_start} run\nEnvironment={MANAGED_VAR}=1\nRestart=always\nRestartSec=10\n"
+            f"KillMode=control-group\nTimeoutStopSec={STOP_TIMEOUT_S}\n"
             f"# {EXIT_HELD}: another session already serves this work root; do not relaunch over it.\n"
             f"RestartPreventExitStatus={EXIT_HELD}\n\n[Install]\nWantedBy=default.target\n")
 
 
 def render_plist(shape: Shape, exec_start: str, path_env: str, log: str) -> str:
+    """AbandonProcessGroup=false: when the launcher dies launchd SIGTERMs the rest of its process group
+    once (never SIGKILL), then respawns after ThrottleInterval; ExitTimeOut bounds a bootout."""
     body = {"Label": shape.agent_label, "ProgramArguments": [exec_start, "run"], "RunAtLoad": True,
-            "KeepAlive": True, "ThrottleInterval": 10, "EnvironmentVariables": {"PATH": path_env},
+            "KeepAlive": True, "ThrottleInterval": THROTTLE_S, "AbandonProcessGroup": False,
+            "ExitTimeOut": STOP_TIMEOUT_S, "EnvironmentVariables": {"PATH": path_env, MANAGED_VAR: "1"},
             "StandardOutPath": log, "StandardErrorPath": log}
     text = plistlib.dumps(body, sort_keys=True).decode("utf-8")
     head, rest = text.split("\n", 1)
@@ -430,6 +428,28 @@ def agent_loaded(shape: Shape) -> str:
 def manager_state(shape: Shape) -> str:
     """active | registered | absent | unknown, probed from the manager, never from the files."""
     return agent_loaded(shape) if is_macos() else unit_active(shape)
+
+
+def manager_detail(shape: Shape) -> str:
+    """The manager's own words for the job's life, beside the lock in `verify`: systemd's
+    `ActiveState/SubState` (`active/running`, `activating/auto-restart`); launchd's `pid = N` and
+    `state = …` lines from `launchctl print`; 'absent' or 'unknown' from the same probes."""
+    if is_macos():
+        r = _run(["launchctl", "print", launchd_service(shape)])
+        if r is None:
+            return "unknown"
+        if r.returncode != 0:
+            return "absent" if "could not find service" in ((r.stderr or "") + (r.stdout or "")).lower() else "unknown"
+        found = dict(re.findall(r"^\s*(pid|state) = (\S+)", r.stdout or "", re.M))
+        words = [f"{k} {found[k]}" for k in ("pid", "state") if k in found]
+        return ", ".join(words) if words else "loaded"
+    r = _systemctl("show", "-p", "ActiveState,SubState", "--value", shape.service_name)
+    if r is None or r.returncode != 0:
+        return "unknown"
+    active, sub = ((r.stdout or "").split("\n") + ["", ""])[:2]
+    if not active.strip():
+        return "unknown"
+    return "absent" if unit_active(shape) == "absent" else f"{active.strip()}/{sub.strip() or '-'}"
 
 
 def stop_command(shape: Shape) -> str:
@@ -531,20 +551,36 @@ class operation_lock:
 
 
 def holder_line(root: str) -> str:
-    """held by launcher pid N | held, launcher gone (child alive) | free | unknown (why)."""
+    """held by launcher pid N | held by an unrecorded holder | free | unknown (why). The flock is held
+    by a launcher for its own life only, so a held lock names a live launcher or a holder between its
+    flock and its record; a dead pid in the record under a held lock is the latter, never a child."""
     state = lock_held(root)
     if state == "free":
         return "free"
     if state == "unknown":
         return f"unknown (the lock of {root} could not be probed)"
     rec = lock_holder(root)
-    return f"held by launcher pid {rec['pid']}" if rec.get("live") else "held, launcher gone (child alive)"
+    return f"held by launcher pid {rec['pid']}" if rec.get("live") else "held by an unrecorded holder"
+
+
+def occupancy_line(shape: Shape, root: str) -> str:
+    """The lock beside the manager's state: a free lock under a live or respawning job is 'restarting
+    (manager …, lock free)', never 'free'; held is 'held by launcher pid N (manager …)'; absent and free
+    is 'free (no job)'; a stopped or unprobeable job with a free lock says so as 'free (manager …)'."""
+    lock, manager = holder_line(root), manager_detail(shape)
+    if lock != "free":
+        return f"{lock} (manager {manager})"
+    if manager == "absent":
+        return "free (no job)"
+    if manager == "unknown" or manager.split("/")[0] in ("inactive", "failed"):
+        return f"free (manager {manager})"
+    return f"restarting (manager {manager}, lock free)"
 
 
 def recovery_lines(shape: Shape, root: str) -> list:
     rec, lock = lock_holder(root), lock_path(root)
     who = (f"kill {rec['pid']} (the launcher pid in the lock record)" if rec.get("live") else
-           f"the launcher is gone; find the child with: lsof {shlex.quote(lock or '<lock file>')}")
+           f"no live launcher is recorded; find the holder with: lsof {shlex.quote(lock or '<lock file>')}")
     return [f"Manual recovery: 1. stop the job by hand: {stop_command(shape)}",
             f"2. stop what holds the work root {root}: {who}",
             f"3. re-run {shape.command} uninstall"]
@@ -617,7 +653,7 @@ def _install_locked(shape: Shape, values: dict, root: str) -> int:
         return _refuse(f"{root} is {holder_line(root)} and {job_name(shape)} is {manager}; nothing was applied")
     if state == "held" and manager != "active":
         rec = lock_holder(root)
-        who = f"launcher pid {rec['pid']}" if rec.get("live") else f"launcher pid {rec.get('pid')} gone, the child alive"
+        who = f"launcher pid {rec['pid']}" if rec.get("live") else "an unrecorded holder; lsof the lock file"
         return _refuse(f"{root} is held by a session no job of {job_name(shape)} manages ({who}); stop it, then run "
                        "install again; nothing was applied")
     before = lock_holder(root)
@@ -650,49 +686,6 @@ def _install_locked(shape: Shape, values: dict, root: str) -> int:
 
 # ── run and debug-run ────────────────────────────────────────────────────────
 
-def _reap(child, grace: float) -> bool:
-    """terminate, wait `grace`, kill, wait REAP_BOUND_S: True once the child is reaped; False when that
-    cannot be confirmed within the bound, so the caller exits without releasing."""
-    if child.poll() is not None:
-        _sweep(child)
-        return True
-    child.terminate()
-    try:
-        child.wait(timeout=grace)
-        _sweep(child)
-        return True
-    except subprocess.TimeoutExpired:
-        pass
-    return _kill_bounded(child)
-
-
-def _kill_bounded(child) -> bool:
-    _kill_group(child)
-    try:
-        child.wait(timeout=REAP_BOUND_S)
-    except subprocess.TimeoutExpired:
-        return False
-    _sweep(child)
-    return True
-
-
-def _kill_group(child) -> None:
-    """SIGKILL the trampoline's whole process group, the session in it: a forced stop never reaches the
-    lease holder alone. A group gone or not ours falls back to the one process."""
-    try:
-        os.killpg(child.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        child.kill()
-
-
-def _sweep(child) -> None:
-    """Once the trampoline is reaped, nothing it ran outlives the lease it held."""
-    try:
-        os.killpg(child.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
 def _is_link(name: str, dir_fd: int) -> bool:
     """O_NOFOLLOW on a link reads ELOOP on Linux and ENOTDIR with O_DIRECTORY on macOS: ask lstat instead."""
     try:
@@ -701,36 +694,31 @@ def _is_link(name: str, dir_fd: int) -> bool:
         return False
 
 
-def _group_gone(child) -> bool:
-    """True once no process of the trampoline's group is left within the bound: the session shares the
-    lease, so the launcher may unlock only when it is gone too."""
-    deadline = time.monotonic() + REAP_BOUND_S
-    while True:
-        try:
-            os.killpg(child.pid, 0)
-        except ProcessLookupError:
-            return True
-        except PermissionError:       # a member mid-teardown reads EPERM for a moment: still there
-            pass
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(POLL_S)
+def managed_problem(shape: Shape, environ=None) -> str:
+    """'' when the manager's marker is in the environment, else the one line `run` refuses with. The
+    gate guards against an accidental hand start inside the manager's teardown window; it is not a
+    security boundary."""
+    base = os.environ if environ is None else environ
+    if base.get(MANAGED_VAR) == "1":
+        return ""
+    return (f"{shape.command} run is the manager's entrypoint ({MANAGED_VAR}=1 in the unit's environment); "
+            f"for a session by hand run {shape.command} debug-run")
 
 
 def stop_state() -> dict:
-    return {"child": None, "stop_at": None, "sig": None, "installed": None}
+    return {"child": None, "pidfd": None, "sig": None, "installed": None}
 
 
 def stop_handlers(state: dict) -> dict:
-    """SIGTERM and SIGINT as one explicit stop path (no KeyboardInterrupt anywhere after this): the first
-    one terminates the child, if any, and starts the grace; the exit code is 128 + that signal."""
+    """SIGTERM and SIGINT as one stop path, installed directly over the inherited dispositions (an
+    inherited SIG_IGN is replaced; no SIG_DFL step, so no window with a default action). The handler
+    only records the first signal: terminate, kill, wait and release are the main loop's. An inherited
+    SIGCHLD=SIG_IGN would let the kernel reap the child before wait() could: reset to SIG_DFL."""
     def on_stop(signum, frame):
         state["sig"] = state["sig"] or signum
-        child = state["child"]
-        if child is not None and child.poll() is None and state["stop_at"] is None:
-            child.terminate()
-        state["stop_at"] = state["stop_at"] or time.monotonic() + TERM_GRACE_S
     before = {sig: signal.signal(sig, on_stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+    if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
+        before[signal.SIGCHLD] = signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     state["installed"] = True
     return before
 
@@ -741,40 +729,127 @@ def restore_handlers(state: dict, before: dict) -> None:
     state["installed"] = None
 
 
-def supervise(shape: Shape, argv: list, env: dict, popen=subprocess.Popen, pass_fds=(), map_exit=None,
-              state=None) -> int:
-    """Run the child until it ends; every launcher exit path reaps it first: SIGTERM -> 143, SIGINT ->
-    130 (both through `stop_handlers`, installed here unless the caller already did), a post-spawn
-    exception re-raised after the reap. `map_exit` renames a child's exit codes, and a child's own 75
-    becomes 1. The spawned child is left in `supervise.child` for the lease."""
-    state = state if state is not None else stop_state()
-    before = stop_handlers(state) if state.get("installed") is None else None
-    supervise.child = None
-    child = None
+def _spawn(argv: list, env: dict, popen, inbox_fd: int):
+    """The session as the direct child, cwd = the held tasks descriptor: fchdir around the spawn, the
+    launcher's cwd restored in finally. close_fds: no lock, root or tasks descriptor reaches it; no
+    descriptor is passed, no new session or process group: the manager's topology is inherited as is."""
+    saved = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
     try:
-        if state["stop_at"] is not None:
-            print(f"{shape.name}: stopped before the session started", file=sys.stderr)
-            return 128 + state["sig"]
-        child = state["child"] = supervise.child = popen(argv, stdin=subprocess.PIPE, env=env, text=True,
-                                                         pass_fds=pass_fds, start_new_session=True)
-        if state["stop_at"] is not None:
-            child.terminate()
-        rc = None
-        while rc is None:
+        os.fchdir(inbox_fd)
+        try:
+            return popen(argv, stdin=subprocess.PIPE, env=env, close_fds=True)
+        finally:
+            os.fchdir(saved)
+    finally:
+        os.close(saved)
+
+
+def _pidfd(child) -> "int | None":
+    """Linux: a pidfd on the direct child, opened right after the spawn and before the handle is
+    published, so the final kill names a descriptor and never a number a reap could free for reuse;
+    an OSError (ENOSYS, EMFILE, anything) is the caller's refusal. macOS has no pidfd_open: the
+    unreaped direct child's Popen handle is the explicitly allowed fallback."""
+    opener = getattr(os, "pidfd_open", None)
+    return None if opener is None else opener(child.pid)
+
+
+def _signal(child, pidfd, sig) -> None:
+    """Only the unreaped direct child: through the pidfd when one is open, else the Popen handle (which
+    guards a reaped child itself). Never a bare number, never a group, nothing once wait() returned."""
+    if child.returncode is not None:
+        return
+    if pidfd is None:
+        child.send_signal(sig)
+        return
+    try:
+        signal.pidfd_send_signal(pidfd, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _stop(child, pidfd, grace: float = TERM_GRACE_S) -> bool:
+    """terminate, wait `grace`, kill, wait REAP_BOUND_S: True once the child is reaped; False when that
+    cannot be confirmed within the bound (the survivor is the manager's to clean)."""
+    if child.poll() is not None:
+        return True
+    _signal(child, pidfd, signal.SIGTERM)
+    try:
+        child.wait(timeout=grace)
+        return True
+    except subprocess.TimeoutExpired:
+        pass
+    _signal(child, pidfd, signal.SIGKILL)
+    try:
+        child.wait(timeout=REAP_BOUND_S)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+def _run_until_end(child, pidfd, state: dict) -> "int | None":
+    """Poll until the child ends; the first recorded stop terminates it, the grace expiring kills it;
+    None when the kill is not confirmed within the bound."""
+    stop_at = None
+    while True:
+        if state["sig"] is not None and stop_at is None:
+            _signal(child, pidfd, signal.SIGTERM)
+            stop_at = time.monotonic() + TERM_GRACE_S
+        try:
+            return child.wait(timeout=POLL_S)
+        except subprocess.TimeoutExpired:
+            if stop_at is not None and time.monotonic() > stop_at:
+                _signal(child, pidfd, signal.SIGKILL)
+                try:
+                    return child.wait(timeout=REAP_BOUND_S)
+                except subprocess.TimeoutExpired:
+                    return None
+
+
+def supervise(shape: Shape, argv: list, env: dict, popen, state: dict, inbox_fd: int, map_exit=None) -> int:
+    """Run the session as the direct child until it ends. A stop already recorded is 'stopped before
+    the session started'; the launcher must be single-threaded (the cwd switch is process-wide), else
+    refuse; the spawn, then the pidfd decision, then the handle published to `state`, then the loop
+    re-checks a stop recorded meanwhile, so a signal landing inside Popen is neither raised nor lost.
+    Exit 128 + the first stop signal, 'child reaped' only after a confirmed wait(); a post-spawn
+    exception stops the child the same bounded way, then re-raises. `map_exit` renames a child's exit
+    codes, and a child's own 75 becomes 1. `inbox_fd` is closed once the spawn is over."""
+    before = stop_handlers(state) if state.get("installed") is None else None
+    child = pidfd = None
+    try:
+        try:
+            if state["sig"] is not None:
+                print(f"{shape.name}: stopped before the session started", file=sys.stderr)
+                return 128 + state["sig"]
+            threads = threading.active_count()
+            if threads != 1:
+                print(f"{shape.name}: refusing to start: the launcher runs {threads} threads and the cwd switch around "
+                      "the spawn needs exactly one", file=sys.stderr)
+                return EXIT_UNUSABLE
             try:
-                rc = child.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                if state["stop_at"] is not None and time.monotonic() > state["stop_at"]:
-                    if not _kill_bounded(child):
-                        print(f"{shape.name}: the child did not die within {REAP_BOUND_S:.0f} s of the kill",
-                              file=sys.stderr)
-                        return 128 + state["sig"]
-                    rc = child.returncode
-        _sweep(child)
+                child = _spawn(argv, env, popen, inbox_fd)
+            except OSError as e:
+                print(f"{shape.name}: refusing to start: the session could not be spawned ({e.strerror or e})",
+                      file=sys.stderr)
+                return EXIT_UNUSABLE
+        finally:
+            os.close(inbox_fd)
+        try:
+            pidfd = _pidfd(child)
+        except OSError as e:
+            reaped = _stop(child, None)
+            print(f"{shape.name}: refusing to start: pidfd_open failed ({e.strerror or e}); the session was "
+                  f"{'stopped and reaped' if reaped else 'signalled but not confirmed gone'}", file=sys.stderr)
+            return EXIT_UNUSABLE
+        state["child"], state["pidfd"] = child, pidfd
+        rc = _run_until_end(child, pidfd, state)
+        if rc is None:
+            print(f"{shape.name}: the child did not die within {REAP_BOUND_S:.0f} s of the kill; what is left is the "
+                  "manager's to clean", file=sys.stderr)
+            return 128 + state["sig"]
         print(f"{shape.name}: child exited {rc}", file=sys.stderr)
-        if state["stop_at"] is not None:
-            if state["sig"] == signal.SIGINT:
-                print(f"{shape.name}: interrupted; child reaped", file=sys.stderr)
+        if state["sig"] is not None:
+            word = "interrupted" if state["sig"] == signal.SIGINT else "stopped"
+            print(f"{shape.name}: {word}; child reaped", file=sys.stderr)
             return 128 + state["sig"]
         if map_exit and rc in map_exit:
             print(f"{shape.name}: reported as {map_exit[rc]}", file=sys.stderr)
@@ -785,20 +860,22 @@ def supervise(shape: Shape, argv: list, env: dict, popen=subprocess.Popen, pass_
             return EXIT_CHILD_HELD
         return rc
     except BaseException:
-        if child is not None:
-            _reap(child, TERM_GRACE_S)
+        if child is not None and child.returncode is None:
+            _stop(child, pidfd)
         raise
     finally:
+        if pidfd is not None:
+            os.close(pidfd)
         if before is not None:
             restore_handlers(state, before)
 
 
 def serve(shape: Shape, root: str, argv: list, env: dict, popen=subprocess.Popen, map_exit=None,
           op_lock=None) -> int:
-    """The launcher: the root's lock taken and recorded before the child (an `op_lock` released right
-    after), its descriptor leased to the child, the child run against `tasks` under the held root inode
-    by a trampoline, and the lock released only after a confirmed reap; else the launcher exits and the
-    child stays fenced under the flock."""
+    """The launcher: the stop handlers first, then the root's lock taken and recorded for this process's
+    life (an `op_lock` released right after), the session spawned as the direct child against `tasks`
+    under the held root inode, and the lock released when the launcher exits, whatever the child did.
+    Nothing a descendant does can hold the root; what outlives the launcher is the manager's."""
     state = stop_state()
     before = stop_handlers(state)
     try:
@@ -823,26 +900,13 @@ def _serve(shape, root, argv, env, popen, map_exit, op_lock, state) -> int:
         print(f"refusing to start: {what}", file=sys.stderr)
         release_lock(owner)
         return EXIT_UNUSABLE
+    # The session's task I/O is relative to its cwd, the held tasks inode: a path replaced after the
+    # lock check is a different root it never lists. Nothing is written to stdin; the pipe stays open.
+    env = dict(env, AG2_INBOX_DIR=".", AG2_RESULTS_DIR=os.path.join("..", "results"))
     try:
-        lease = lease_fd(owner)
-    except Exception as e:  # noqa: BLE001 - any failure to lease is a refusal, never a child without the fence
-        print(f"refusing to start: {root}: {e}", file=sys.stderr)
-        os.close(inbox_fd)
-        release_lock(owner)
-        return EXIT_UNUSABLE
-    # Nothing is written to stdin: a plugin arms itself from the env. The pipe stays open, since a
-    # stream-json session ends when its input ends.
-    try:
-        rc = supervise(shape, [sys.executable, "-c", TRAMPOLINE, str(lease), str(inbox_fd), *argv], env, popen,
-                       pass_fds=(lease, inbox_fd), map_exit=map_exit, state=state)
+        return supervise(shape, argv, env, popen, state, inbox_fd, map_exit=map_exit)
     finally:
-        os.close(inbox_fd)
-        child = supervise.child
-        if not (child is not None and child.poll() is not None and _group_gone(child)
-                and release_after_reap(owner, child.pid)):
-            print(f"{shape.name}: the child or its session was not confirmed gone; exiting without releasing "
-                  f"{root}, so a survivor keeps it fenced", file=sys.stderr)
-    return rc
+        release_lock(owner)
 
 
 def debug_run_problem(shape: Shape, root: str) -> str:
@@ -878,7 +942,12 @@ def verify_tail(shape: Shape, cfg: dict, results: list) -> None:
     check(results, text is not None and marked(text, supervisor_marker(shape)), "supervisor",
           problem or (f"{sup} missing; run {shape.command} install" if text is None else str(sup)))
     print(f"INFO job: {job_name(shape)} {manager_state(shape)}")
-    print(f"INFO session: {work_root(cfg)} {holder_line(work_root(cfg))}")
+    print(f"INFO session: {work_root(cfg)} {occupancy_line(shape, work_root(cfg))}")
+    if not is_macos():
+        print("INFO systemd ordering is asserted from KillMode=control-group and not witnessed")
+    else:
+        print("INFO launchd SIGTERMs the group once after a launcher death and respawns after "
+              f"{THROTTLE_S} s; a session that ignores SIGTERM overlaps the new one (bootout, then stop the stray)")
 
 
 def uninstall(shape: Shape) -> int:

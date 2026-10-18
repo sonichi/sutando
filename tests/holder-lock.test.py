@@ -469,105 +469,6 @@ class HolderLockTest(unittest.TestCase):
         self.assertEqual((self.ldir() / "holder").read_bytes(), record)
         self.hl.release(owner)
 
-    # ── §1.9 child lease ──
-
-    def test_child_lease_hands_the_lock_fd_to_one_child_and_release_waits_for_the_confirmed_reap(self):
-        owner = self.owned()
-        self.hl.publish(owner, "routine")
-        fd = self.hl.child_lease(owner)
-        self.assertEqual(fd, owner.fd, "the lease is the owner's own descriptor, for pass_fds")
-        with self.assertRaises(self.hl.LockError) as e:
-            self.hl.child_lease(owner)
-        self.assertEqual(str(e.exception), "lease used", "once per owner")
-        child = subprocess.Popen(["sleep", "30"], pass_fds=(fd,))
-        self.addCleanup(lambda: (child.poll() is None and child.kill(), child.wait(WAIT)))
-        with self.assertRaises(self.hl.LockError) as e:
-            self.hl.release(owner)
-        self.assertEqual(str(e.exception), "leased", "release is refused while the lease is out")
-        self.assertFalse(owner.released)
-        self.assertFalse(self.lock_free(), "and the flock is still held")
-        with self.assertRaises(self.hl.LockError) as e:
-            self.hl.end_lease(owner, child.pid)
-        self.assertEqual(str(e.exception), "child alive", "a live child is no confirmed reap")
-        child.kill()
-        time.sleep(0.2)
-        with self.assertRaises(self.hl.LockError) as e:
-            self.hl.end_lease(owner, child.pid)
-        self.assertEqual(str(e.exception), "child alive", "a zombie is not reaped yet either")
-        child.wait(WAIT)
-        self.hl.end_lease(owner, child.pid)
-        with self.assertRaises(self.hl.LockError) as e:
-            self.hl.end_lease(owner, child.pid)
-        self.assertEqual(str(e.exception), "not leased")
-        self.assertTrue(self.hl.release(owner).record_removed)
-        self.assertTrue(self.lock_free())
-        with self.assertRaises(self.hl.LockError):
-            self.hl.child_lease(owner)      # released
-
-    def test_a_leased_child_keeps_the_root_fenced_when_the_owner_exits_without_release(self):
-        """§1.9: a launcher that cannot confirm the reap exits without LOCK_UN; the surviving child's
-        copy of the open file description keeps the flock, so a successor is refused until it is gone."""
-        self.real_home()
-        self.root.mkdir()
-        self.forget_lock_dir(str(self.root))
-        code = ("import os, subprocess, sys, time\n"
-                "r = hl.acquire(%r, install_id=hl.install_id())\nhl.publish(r.owner, 'routine')\n"
-                "fd = hl.child_lease(r.owner)\n"
-                "child = subprocess.Popen(['sleep', '30'], pass_fds=(fd,))\n"
-                "print('child', child.pid, flush=True)\n"
-                "os._exit(0)\n" % str(self.root))
-        owner = self.run_py(code, home="-")
-        child_pid = int(read_line(owner.stdout).split()[1])
-        self.addCleanup(lambda: self.hl._pid_alive(child_pid) and os.kill(child_pid, signal.SIGKILL))
-        owner.wait(WAIT)
-        self.assertEqual(owner.returncode, 0)
-        r = self.acquire()
-        self.assertIsInstance(r, self.hl.Contended, "the child's descriptor still holds the flock")
-        self.assertEqual(r.holder.record["pid"], owner.pid, "the dead launcher's record stays as attribution")
-        self.assertIsNone(self.hl.status(str(self.root))["holder_lineage"] or None, "and names no live holder")
-        os.kill(child_pid, signal.SIGKILL)
-        deadline = time.monotonic() + WAIT
-        while time.monotonic() < deadline and self.hl._pid_alive(child_pid):
-            time.sleep(0.02)
-        for _ in range(100):
-            r = self.acquire()
-            if isinstance(r, self.hl.Acquired):
-                break
-            time.sleep(0.05)
-        self.assertIsInstance(r, self.hl.Acquired, "the root is free once the child is gone")
-
-    def test_a_lease_is_terminal_even_after_end_lease(self):
-        owner = self.owned()
-        fd = self.hl.child_lease(owner)
-        child = subprocess.Popen(["true"], pass_fds=(fd,))
-        child.wait(WAIT)
-        self.hl.end_lease(owner, child.pid)
-        self.assertFalse(owner.leased)
-        self.assertTrue(owner.lease_used)
-        with self.assertRaises(self.hl.LockError) as e:
-            self.hl.child_lease(owner)
-        self.assertEqual(str(e.exception), "lease used", "a reaped child does not re-open the lease")
-        with self.assertRaises(self.hl.LockError) as e:
-            self.hl.end_lease(owner, child.pid)
-        self.assertEqual(str(e.exception), "not leased")
-        self.hl.release(owner)
-        self.assertTrue(self.lock_free())
-
-    def test_a_copied_owner_cannot_lease_and_a_lease_survives_no_lost_lock(self):
-        owner = self.owned()
-        rebuilt = dataclasses.replace(owner) if False else self.hl.Owner(**{f.name: getattr(owner, f.name)
-                                                                           for f in dataclasses.fields(owner)
-                                                                           if f.name != "mutex"})
-        with self.assertRaises(self.hl.LockError):
-            self.hl.child_lease(rebuilt)
-        self.assertFalse(owner.leased)
-        with mock.patch.object(self.hl.file_lock, "try_lock_fd", return_value=False):
-            with self.assertRaises(self.hl.LockError) as e:
-                self.hl.child_lease(owner)
-        self.assertIn("lock lost", str(e.exception), "a lease is never handed out on a lost flock")
-        self.assertFalse(owner.leased)
-        self.hl.release(owner)
-
     def test_nothing_in_the_module_unlinks_or_replaces_the_lock_file(self):
         source = Path(self.hl.__file__).read_text()
         self.assertNotRegex(source, r"\bftruncate\b|\btruncate\(")
@@ -2017,8 +1918,6 @@ class HolderLockTest(unittest.TestCase):
                  ("acquire with a timeout", lambda: self.hl.acquire(missing, install_id="i", timeout=1)),
                  ("wait", lambda: self.hl.wait(missing, install_id="i", deadline=time.monotonic() + 1)),
                  ("publish", lambda: self.hl.publish(owner, "routine")),
-                 ("child_lease", lambda: self.hl.child_lease(owner)),
-                 ("end_lease", lambda: self.hl.end_lease(owner, 1)),
                  ("release", lambda: self.hl.release(owner))]
         for name, call in calls:
             with self.subTest(entry=name):
@@ -2231,7 +2130,6 @@ class WindowsPlatformTest(unittest.TestCase):
             for call in (lambda: hl.acquire("w", install_id="i"),
                          lambda: hl.wait("w", install_id="i", deadline=time.monotonic() + 1),
                          lambda: hl.publish(dummy, "routine"), lambda: hl.release(dummy),
-                         lambda: hl.child_lease(dummy), lambda: hl.end_lease(dummy, 1),
                          lambda: hl.status("w"), lambda: hl.read_holder("."), lambda: hl.lock_dir(".")):
                 with self.assertRaises(hl.LockError):
                     call()

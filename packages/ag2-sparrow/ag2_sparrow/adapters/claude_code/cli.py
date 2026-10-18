@@ -7,11 +7,12 @@ shared dispatcher that imports adapters; the lifecycle itself (install, run, ver
 
 `install` records the session's paths and the canonical work root in a 0600 config, writes a service
 manager unit (a systemd user unit on Linux, a launchd agent on macOS) whose first line is a marker, has
-the manager start it, and confirms a fresh launcher holds the root. `run` is what the manager runs: it
-checks the CLI version, takes the one-session-per-root lock for the whole child, starts `claude -p` in
-stream-json mode with the AG2 Space inbox plugin, which arms its inbox watch itself from the launcher's
-env on every start, and holds stdin open so the session lives. The relay token stays in Sparrow's own
-env file, the Claude login stays in its config dir: neither is copied. Stdlib only.
+the manager start it, and confirms a fresh launcher holds the root. `run` is what the manager runs
+(gated on the marker the unit sets in its environment; by hand it names `debug-run`): it checks the
+CLI version, takes the one-session-per-root lock for its own life, starts `claude -p` in stream-json
+mode with the AG2 Space inbox plugin as its direct child, which arms its inbox watch itself from the
+launcher's env on every start, and holds stdin open so the session lives. The relay token stays in
+Sparrow's own env file, the Claude login stays in its config dir: neither is copied. Stdlib only.
 """
 from __future__ import annotations
 
@@ -144,13 +145,23 @@ def session_argv(cfg: dict) -> list:
 
 
 def run(args, popen=subprocess.Popen, op_lock=None) -> int:
-    """What the manager runs: the canonical root's lock is taken and recorded before the child starts,
-    the child holds its lease so the flock outlives a dead launcher, and every launcher exit reaps the
-    child before the lock goes (cm.serve)."""
+    """What the manager runs, and only it: refused without the marker the unit sets in its environment
+    (naming debug-run), else the session (`_run_session`)."""
+    problem = cm.managed_problem(LOCAL)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
     cfg, problem = load_config()
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
+    return _run_session(cfg, popen, op_lock)
+
+
+def _run_session(cfg: dict, popen=subprocess.Popen, op_lock=None) -> int:
+    """The ungated session: the pin checked, then the canonical root's lock taken and recorded for this
+    process's life and the child run as its direct child under the held root (cm.serve). The marker is
+    not in the child's env: `child_env` is an allowlist."""
     problem = version_problem(cfg["CLAUDE"])
     if problem:
         print(f"error: {problem}", file=sys.stderr)
@@ -159,8 +170,9 @@ def run(args, popen=subprocess.Popen, op_lock=None) -> int:
 
 
 def debug_run(args, popen=subprocess.Popen) -> int:
-    """A foreground session for a look: under the operation lock from the registered/absent check
-    through the root lock's acquisition, and only with no registered job and the root free."""
+    """The one human path: under the operation lock from the registered/absent check through the root
+    lock's acquisition, only with no registered job and the root free. No manager owns its tree: a
+    SIGKILLed debug-run leaves its session alive with the root free, yours to stop."""
     cfg, problem = load_config()
     if problem:
         print(f"error: {problem}", file=sys.stderr)
@@ -171,7 +183,7 @@ def debug_run(args, popen=subprocess.Popen) -> int:
             if problem:
                 print(f"error: {problem}", file=sys.stderr)
                 return EXIT_UNUSABLE
-            return run(args, popen, op_lock=op)
+            return _run_session(cfg, popen, op_lock=op)
     except cm.Busy as e:
         print(f"error: {e}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -237,9 +249,14 @@ def main(argv=None) -> int:
                         "session, a narrower mode makes a prompting tool stall the queue")
     p.add_argument("--claude", default="claude", help="the claude executable (default: claude on PATH)")
     p.set_defaults(func=install)
-    sub.add_parser("run", help="what the manager runs: one session, armed on every start").set_defaults(func=run)
-    sub.add_parser("debug-run", help="one session in the foreground; refused while the job is registered or the "
-                   "work root is held").set_defaults(func=debug_run)
+    run_help = (f"what the manager runs: one session, armed on every start; refused unless {cm.MANAGED_VAR}=1 is in "
+                "the environment, as the unit sets it (a guard against an accidental hand start, not a security "
+                "boundary; use debug-run by hand)")
+    sub.add_parser("run", help=run_help, description=run_help).set_defaults(func=run)
+    debug_help = ("one session in the foreground; refused while the job is registered or the work root is held. "
+                  "No manager owns its tree: a SIGKILLed debug-run leaves its session alive with the root free, "
+                  "yours to stop")
+    sub.add_parser("debug-run", help=debug_help, description=debug_help).set_defaults(func=debug_run)
     sub.add_parser("verify", help="check every part").set_defaults(func=verify)
     sub.add_parser("uninstall", help="stop the job and remove what install wrote").set_defaults(func=uninstall)
     args = ap.parse_args(argv)
