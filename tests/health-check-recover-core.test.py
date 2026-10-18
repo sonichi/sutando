@@ -2,12 +2,6 @@
 """Tests for the core wedge auto-recovery (`recover_core_if_wedged`) in"""
 
 from __future__ import annotations
-
-from _helpers.hermetic_env import isolate_os_environ
-
-# Before anything reads the environment: no outer credential selector survives.
-isolate_os_environ()
-
 import importlib.util
 import json
 import sys

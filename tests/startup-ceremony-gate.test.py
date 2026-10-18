@@ -12,11 +12,6 @@ as local, which is what lets the session boundary resolve from `state/session-st
 """
 from __future__ import annotations
 
-from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
-
-# Before anything reads the environment: no outer credential selector survives.
-isolate_os_environ()
-
 import contextlib
 import importlib.util
 import io
@@ -58,7 +53,7 @@ def _workspace(root: Path, *, started_at: float, stamp_ts: float | None) -> Path
 
 
 def _run(ws: Path) -> subprocess.CompletedProcess:
-    env = isolated_child_env(SUTANDO_HOST_LABEL=HOST)
+    env = dict(os.environ, SUTANDO_HOST_LABEL=HOST)
     return subprocess.run(
         PYBASE + [str(GATE), "--workspace", str(ws), "--host-label", HOST],
         capture_output=True, text=True, env=env, timeout=60, cwd=REPO,
@@ -113,7 +108,7 @@ class VerifyCeremonyGate(unittest.TestCase):
             dst.write_text(GATE.read_text())
             (tree / "src").mkdir()  # src/ present, health-check.py absent — the reviewer's second case
             ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=1_000_300.0)
-            env = isolated_child_env(SUTANDO_HOST_LABEL=HOST)
+            env = dict(os.environ, SUTANDO_HOST_LABEL=HOST)
             r = subprocess.run([sys.executable, str(dst), "--workspace", str(ws), "--host-label", HOST],
                                capture_output=True, text=True, env=env, timeout=60)
             self.assertEqual(r.returncode, 2, f"rc={r.returncode}\n{r.stderr}")
@@ -131,7 +126,7 @@ class VerifyCeremonyGate(unittest.TestCase):
             (tree / "src").mkdir()
             (tree / "src" / "health-check.py").write_text('raise RuntimeError("boom at import")\n')
             ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=1_000_300.0)
-            env = isolated_child_env(SUTANDO_HOST_LABEL=HOST)
+            env = dict(os.environ, SUTANDO_HOST_LABEL=HOST)
             r = subprocess.run([sys.executable, str(dst), "--workspace", str(ws), "--host-label", HOST],
                                capture_output=True, text=True, env=env, timeout=60)
             self.assertEqual(r.returncode, 2, f"rc={r.returncode}\n{r.stderr}")

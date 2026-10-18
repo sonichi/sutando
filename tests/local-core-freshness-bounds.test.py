@@ -16,12 +16,6 @@ reads like coverage these functions never had.
 Run: python3 tests/local-core-freshness-bounds.test.py
 """
 from __future__ import annotations
-
-from _helpers.hermetic_env import isolate_os_environ
-
-# Before anything reads the environment: no outer credential selector survives.
-isolate_os_environ()
-
 import importlib.util
 import json
 import os

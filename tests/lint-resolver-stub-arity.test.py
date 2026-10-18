@@ -4,11 +4,6 @@ Behind a broad `except` it is swallowed, so the write path is DISABLED, not redi
 """
 from __future__ import annotations
 
-from _helpers.hermetic_env import isolate_os_environ
-
-# Before anything reads the environment: no outer credential selector survives.
-isolate_os_environ()
-
 import ast
 import contextlib
 import importlib.util
