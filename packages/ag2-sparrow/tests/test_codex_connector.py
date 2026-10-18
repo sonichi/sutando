@@ -650,6 +650,9 @@ class EdgePathTest(unittest.TestCase):
     def test_child_env_falls_back_without_path(self):
         with mock.patch.dict(cc.os.environ, {}, clear=True):
             self.assertEqual(cc.child_env(), {"PATH": "/usr/bin:/bin", "HOME": ""})
+        with mock.patch.dict(cc.os.environ, {"CODEX_HOME": "/h/.codex-agent", "OPENAI_API_KEY": "no"}, clear=True):
+            self.assertEqual(cc.child_env(), {"PATH": "/usr/bin:/bin", "HOME": "", "CODEX_HOME": "/h/.codex-agent"},
+                             "the login's home passes through when the launcher names one; nothing else does")
 
     def test_work_is_required_without_push(self):
         with self.assertRaises(SystemExit):

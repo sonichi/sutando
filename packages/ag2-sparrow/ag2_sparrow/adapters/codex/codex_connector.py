@@ -30,15 +30,18 @@ import uuid
 
 from ...relay_loop import count_arg
 from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock,  # noqa: F401
-                        admission, attested_headers, exit_on_sigterm, load_done, make_dirs, non_owner_note,
-                        parse_task, pid_alive, exit_code, record_done, release_lock, root_path, stop_requested,
-                        write_atomic)
+                        admission, attested_headers, exit_on_sigterm, holder_consumer, load_done, make_dirs,
+                        non_owner_note, parse_task, pid_alive, exit_code, record_done, release_lock, root_path,
+                        stop_requested, write_atomic)
 
 CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
 APPROVAL_REQUESTS = ("item/commandExecution/requestApproval", "item/fileChange/requestApproval",
                      "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval")
 NON_OWNER_SANDBOX = "read-only"
 NO_REPLY = "[no reply] Codex completed the turn without a message."
+# --held: the launcher that spawned this process holds the work root and attaches it as the consumer
+# whose liveness fences the root; the connector waits this long for that record, then refuses.
+HELD_WAIT_S = 30.0
 
 
 def log(*a):
@@ -46,7 +49,10 @@ def log(*a):
 
 
 def child_env():
-    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "")}
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "")}
+    if os.environ.get("CODEX_HOME"):
+        env["CODEX_HOME"] = os.environ["CODEX_HOME"]      # the login's home, when the launcher names one
+    return env
 
 
 def channel_key(channel_id):
@@ -458,6 +464,9 @@ def build_parser():
     ap.add_argument("--server", choices=["stdio", "proxy", "stub"], default="stdio",
                     help="stdio: own codex app-server; proxy: shared daemon via `codex app-server proxy`; stub: local fake")
     ap.add_argument("--work", help="dir holding tasks/ results/ state/ (required unless --push)")
+    ap.add_argument("--held", action="store_true",
+                    help="the work root's lock is held by the launcher that spawned this process and attaches it as "
+                         "the consumer; take no lock, refuse unless that record names this process")
     ap.add_argument("--cwd", default=None, help="thread cwd (default: --work)")
     ap.add_argument("--model", default=None)
     ap.add_argument("--sandbox", default=NON_OWNER_SANDBOX, choices=["read-only", "workspace-write", "danger-full-access"],
@@ -493,6 +502,8 @@ def main(argv=None):
     cwd_given = args.cwd
     args.work = os.path.abspath(args.work)
     exit_on_sigterm()
+    if args.held:
+        return serve_held(args, cwd_given)
     try:
         owner = acquire_lock(args.work, "codex")
     except LockRefused as e:
@@ -511,6 +522,25 @@ def main(argv=None):
         return e.code
     finally:
         release_lock(owner)
+
+
+def serve_held(args, cwd_given):
+    """Under a launcher: no lock of our own, the dirs the holder made, and a start only once the
+    holder's record names this process as the consumer (a hand start with --held is refused)."""
+    deadline = time.monotonic() + HELD_WAIT_S
+    while True:
+        consumer = holder_consumer(args.work)
+        if consumer and consumer.get("pid") == os.getpid():
+            break
+        if stop_requested() or time.monotonic() >= deadline:
+            sys.stderr.write("refusing to start: --held, but no holder of %s attached this process\n" % args.work)
+            return 2
+        time.sleep(0.05)
+    args.inbox = os.path.join(args.work, "tasks")
+    args.results = os.path.join(args.work, "results")
+    args.state = os.path.join(args.work, "state")
+    args.cwd = os.path.abspath(cwd_given or args.work)
+    return exit_code(serve_locked(args))
 
 
 def serve_locked(args):

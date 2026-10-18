@@ -262,6 +262,7 @@ jobs:
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_hatch_adapter.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_code_adapter.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_codex_connector.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_codex_local_connect.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_routine_adapter.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_claude_cloud_session_adapter.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_adapter_relay_loop.py
