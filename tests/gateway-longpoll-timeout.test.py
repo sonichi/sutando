@@ -9,6 +9,7 @@ timeout as a network error backed a healthy bridge off and wrote
 """
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import threading
@@ -234,7 +235,8 @@ class AckFirstInTheLoopTest(unittest.TestCase):
                 patch.object(self.gw, "_retire_delivered_marks", new=_retire_delivered_marks), \
                 patch.object(self.gw, "_sweep_held_dir", new=lambda: self.calls.append("swept")):
             loop.run()
-        self.assertIn("_retire_delivered_marks failed (RuntimeError) — continuing", loop.logs)
+        self.assertTrue(any(re.fullmatch(r"_retire_delivered_marks failed \(RuntimeError at [\w.-]+:\d+\) — continuing", ln)
+                            for ln in loop.logs), loop.logs)
         self.assertEqual(self.calls, ["swept"], "one sweep's failure skipped the next")
         self.assertEqual(len(loop.polls), 1)
 
@@ -260,7 +262,8 @@ class RelayResultsInTheLoopTest(unittest.TestCase):
         with _Loop(self.gw) as loop, \
                 patch.object(self.gw, "_reclaim_parked_relay_results", new=_reclaim_parked_relay_results):
             loop.run()
-        self.assertIn("relay result reclaim failed (RuntimeError) — continuing", loop.logs)
+        self.assertTrue(any(re.fullmatch(r"relay result reclaim failed \(RuntimeError at [\w.-]+:\d+\) — continuing", ln)
+                            for ln in loop.logs), loop.logs)
         self.assertEqual(len(loop.polls), 1)
 
     def test_a_relay_result_landing_outside_the_in_flight_set_wakes_the_outbound_worker(self):

@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -656,10 +657,12 @@ print(json.dumps({"lines": lines, "channel": channel}))
                 self.assertEqual(out["channel"]["health"]["error"], "connect: InvalidURL",
                                  "the real InvalidURL, driven through run()")
                 logged = "\n".join(out["lines"])
-                self.assertIn("media fetch failed (URLError contacting https://gw.example/relay/media/abc)", logged)
-                self.assertIn("reenroll: claim failed: URLError contacting https://gw.example/relay", logged)
-                self.assertIn("human-action: card post failed (will retry): URLError", out["lines"],
-                              "the card poster logs the type alone")
+                self.assertRegex(logged, r"media fetch failed \(URLError contacting "
+                                         r"https://gw\.example/relay/media/abc at <string>:\d+\)")
+                self.assertRegex(logged, r"reenroll: claim failed: URLError contacting https://gw\.example/relay at <string>:\d+")
+                self.assertRegex(logged, r"human-action: card post failed \(will retry\): URLError "
+                                         r"contacting https://gw\.example/relay at <string>:\d+",
+                                 "the card poster logs the description alone")
                 everything = r.stdout + r.stderr
                 for secret in ("SECRET", "secret", "MEDIASECRET", "BAD", "bad"):
                     self.assertNotIn(secret, everything, secret)
@@ -1349,6 +1352,43 @@ class Diagnostics(unittest.TestCase):
                          "HTTPError (HTTP 403)")
         scrubbed = gateway_instance.scrub_exception(TimeoutError("SECRET"), GW + "?k=SECRET")
         self.assertEqual(self.d.describe(scrubbed), "TimeoutError contacting " + GW)
+
+    def raised(self, exc):
+        try:
+            raise exc
+        except BaseException as e:  # noqa: BLE001
+            return e, e.__traceback__.tb_lineno
+
+    def test_describe_tells_refused_resolver_and_timeout_apart_and_names_the_line(self):
+        import errno
+        import socket
+        import urllib.error
+        here = os.path.basename(__file__)
+        for reason, want in ((ConnectionRefusedError(errno.ECONNREFUSED, "SECRET"),
+                              "URLError(ConnectionRefusedError/ECONNREFUSED)"),
+                             (socket.gaierror(socket.EAI_NONAME, "SECRET"), "URLError(gaierror/EAI_NONAME)"),
+                             (TimeoutError("SECRET"), "URLError(TimeoutError)")):
+            exc, line = self.raised(urllib.error.URLError(reason))
+            self.assertEqual(self.d.describe(exc), f"{want} at {here}:{line}")
+            scrubbed = gateway_instance.scrub_exception(exc, GW + "?k=SECRET")
+            self.assertEqual(self.d.describe(scrubbed), f"{want} contacting {GW} at {here}:{line}")
+            self.assertNotIn("SECRET", self.d.describe(scrubbed))
+
+    def test_a_keyerror_names_its_key_only_when_the_code_wrote_it(self):
+        here = os.path.basename(__file__)
+
+        def literal():
+            return {}["owner_dm"]
+
+        def computed(key):
+            return {}[key]
+        for fn, want in ((literal, "KeyError['owner_dm']"), (lambda: computed("SECRET" + "x"), "KeyError")):
+            try:
+                fn()
+            except KeyError as e:
+                text = self.d.describe(e)
+            self.assertRegex(text, "^" + re.escape(want) + f" at {re.escape(here)}:\\d+$")
+            self.assertNotIn("SECRET", text)
 
     def test_safe_status_nets_every_nested_string_and_withholds_objects(self):
         url = GW + "?token=Se%2fCR"

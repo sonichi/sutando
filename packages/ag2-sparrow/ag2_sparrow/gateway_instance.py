@@ -99,6 +99,7 @@ def scrub_exception(exc: BaseException, gateway_url: str) -> BaseException:
     if isinstance(exc, OSError):
         out.errno = exc.errno
     out.__dict__["_scrubbed"] = text
+    out.__dict__["_gateway"] = redact_url(gateway_url)
     out.args = (text,)
     out.__traceback__ = exc.__traceback__
     return out

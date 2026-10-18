@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-from . import gateway_instance
+from . import diagnostics, gateway_instance
 
 # If not even a keepalive arrives for this long the TCP path is dead — reconnect.
 STREAM_READ_TIMEOUT = 120
@@ -145,7 +145,7 @@ class EventChannel:
             self._set(status="reconnecting", error=f"stream dropped: {type(e).__name__}")
         except Exception as e:  # noqa: BLE001 — isolation: never escape the channel
             self._set(status="reconnecting", error=f"channel error: {type(e).__name__}")
-            self._log(f"event-channel: swallowed {type(e).__name__}")
+            self._log(f"event-channel: swallowed {diagnostics.describe(e)}")
         finally:
             try:
                 resp.close()
