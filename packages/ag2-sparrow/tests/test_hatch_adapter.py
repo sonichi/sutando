@@ -2436,6 +2436,83 @@ class StartSparrow(Base):
         self.assertNotIn("replacing:", r.stdout)
         self.assertNotIn("started:", r.stdout)
 
+    def unit_state_unknown(self, show, *args):
+        """install over a running service whose manager answers show-environment but not `show`:
+        `show` returns what `show(cmd)` gives. (stopped pids, spawns, old Sparrow, result, fake)."""
+        old = self.old_sparrow()
+        unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\nExecStart=/x\n")
+        fake = FakeSystemd(state="active", enabled=True, main_pid=old.pid, ran=True)
+
+        def systemd(cmd):
+            return show(cmd) if cmd[1:3] == ["--user", "show"] else fake(cmd)
+        real_which, stopped, spawned = shutil.which, [], []
+        with mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda name, *a, **k:
+                               "/usr/bin/systemctl" if name == "systemctl" else real_which(name, *a, **k)), \
+                mock.patch.object(hatch_cli, "_systemd_run", side_effect=systemd), \
+                mock.patch.object(keepalive, "sparrow_env", return_value={"HOME": "x"}), \
+                mock.patch.object(keepalive, "_spawn_sparrow",
+                                  side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")), \
+                mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW):
+            r = self.cli("install", "--mxid", AGENT, *args)
+        return stopped, spawned, old, r, fake
+
+    UNKNOWN_SHOW = {"fails": lambda cmd: subprocess.CompletedProcess(cmd, 1, "", "Failed to connect to bus"),
+                    "could not run": lambda cmd: None,
+                    "answers no state": lambda cmd: subprocess.CompletedProcess(cmd, 0, "MainPID=0\n", ""),
+                    "garbled MainPID": lambda cmd: subprocess.CompletedProcess(
+                        cmd, 0, "ActiveState=inactive\nMainPID=\nExecMainStartTimestampMonotonic=0\n", "")}
+
+    def test_no_service_never_stops_a_service_sparrow_when_the_unit_state_query_fails(self):
+        for name, show in self.UNKNOWN_SHOW.items():
+            with self.subTest(show=name):
+                _, spawned, old, r, fake = self.unit_state_unknown(show, "--no-service")
+                self.assertIsNone(old.poll(), "the service-owned Sparrow got no SIGTERM")
+                self.assertEqual(spawned, [], r.stdout + r.stderr)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertNotIn("replacing:", r.stdout)
+                self.assertNotIn("started:", r.stdout)
+                self.assertIn(f"systemctl --user show {hatch_cli.SERVICE_NAME} did not give its state, so "
+                              "whether that service runs Sparrow is unknown; install neither stops nor "
+                              f"starts a Sparrow. Sparrow (pid {old.pid}) was left as it is", r.stdout)
+                self.assertEqual([c for c in fake.calls if c[0] == "--user" and c[1] in
+                                  ("start", "restart", "stop", "enable", "reset-failed")], [])
+                old.kill()
+                old.wait(5)
+                shutil.rmtree(self.home / ".config" / "systemd")
+
+    def test_install_neither_stops_nor_starts_the_service_when_the_unit_state_query_fails(self):
+        _, spawned, old, r, fake = self.unit_state_unknown(self.UNKNOWN_SHOW["fails"])
+        self.assertIsNone(old.poll(), "the service-owned Sparrow got no SIGTERM")
+        self.assertEqual((spawned, r.returncode), ([], 0), r.stdout + r.stderr)
+        self.assertEqual([c for c in fake.calls if c[0] == "--user" and c[1] in ("start", "restart", "stop")], [])
+        self.assertEqual(fake.ran("enable"), [["--user", "enable", hatch_cli.SERVICE_NAME]],
+                         "enabled, never --now")
+        self.assertIn("did not give its state, so it was not stopped first", r.stdout)
+        self.assertIn("it was enabled but neither started nor restarted", r.stdout)
+        self.assertNotIn("replacing:", r.stdout)
+
+    def test_a_leftover_unit_with_no_user_manager_exits_non_zero_and_starts_nothing(self):
+        unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
+        unit.parent.mkdir(parents=True)
+        unit.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\nExecStart=/x\n")
+        real_which, spawned = shutil.which, []
+        for args in (("--no-service",), ()):
+            with self.subTest(args=args), \
+                    mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda name, *a, **k:
+                                      "/usr/bin/systemctl" if name == "systemctl" else real_which(name, *a, **k)), \
+                    mock.patch.object(hatch_cli, "_systemd_run", side_effect=FakeSystemd(available=False)), \
+                    mock.patch.object(keepalive, "_spawn_sparrow",
+                                      side_effect=lambda cfg: spawned.append(cfg) or (True, "spawned")), \
+                    mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW):
+                r = self.cli("install", "--mxid", AGENT, *args)
+            self.assertEqual((spawned, r.returncode), ([], 1), r.stdout + r.stderr)
+            self.assertIn(f"error: Sparrow is not running: {unit} is installed but systemctl --user did not "
+                          "answer, so whether that service runs Sparrow is unknown; install neither stops nor "
+                          "starts a Sparrow. Start your user manager", r.stderr)
+            self.assertFalse(self.seen.exists())
+
     def test_an_unanswering_manager_gets_no_detached_sparrow_beside_its_unit(self):
         unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
         unit.parent.mkdir(parents=True)

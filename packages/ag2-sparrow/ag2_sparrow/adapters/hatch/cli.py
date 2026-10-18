@@ -155,8 +155,8 @@ def _diff(old: str, new: str, path: Path) -> str:
     registry = _masking_registry()
     gateway_credentials.register_assignments(registry, old, new)
     old, new = (gateway_credentials.mask_env_assignments(t, registry) for t in (old, new))
-    return "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
-                                        f"{path} (installed)", f"{path} (ag2-sparrow)"))
+    lines = gateway_credentials.physical_lines
+    return "".join(difflib.unified_diff(lines(old), lines(new), f"{path} (installed)", f"{path} (ag2-sparrow)"))
 
 
 def _write(path: Path, text: str, mode: int) -> None:
@@ -421,12 +421,19 @@ def _unit_value(value: str) -> str:
     return value.replace("%", "%%")
 
 
-def _unit_props(*names: str) -> dict:
+def _unit_props(*names: str) -> "dict | None":
+    """The unit's properties; None when the query failed or its answer is unusable (no
+    ActiveState, a MainPID that is not a number): an unknown state, never "inactive"."""
     r = _systemd_run(["systemctl", "--user", "show", SERVICE_NAME,
                       *(f"--property={n}" for n in names)])
     if not _ok(r):
-        return {}
-    return dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+        return None
+    props = dict(line.split("=", 1) for line in (r.stdout or "").split("\n") if "=" in line)
+    if "ActiveState" in names and not props.get("ActiveState"):
+        return None
+    if "MainPID" in names and not props.get("MainPID", "").isdigit():
+        return None
+    return props
 
 
 def _lock_record(state_dir: Path, instance: str) -> "dict | None":
@@ -542,7 +549,10 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
                  "replace it with the unit above")
             return
     stopped = False
-    if changed and _unit_props("ActiveState").get("ActiveState") in ("active", "reloading"):
+    before = _unit_props("ActiveState") if changed else {}
+    if before is None:
+        note(f"systemctl --user show {SERVICE_NAME} did not give its state, so it was not stopped first")
+    elif before.get("ActiveState") in ("active", "reloading"):
         r = _systemd_run(["systemctl", "--user", "stop", SERVICE_NAME])
         stopped = _ok(r)
         print(f"stopped: {SERVICE_NAME} before installing" if stopped else
@@ -556,12 +566,16 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
                  f"systemctl --user enable --now {SERVICE_NAME}")
             return
     props = _unit_props("ActiveState", "MainPID", "ExecMainStartTimestampMonotonic")
-    state = props.get("ActiveState", "inactive")
+    if props is None:
+        r = _systemd_run(["systemctl", "--user", "enable", SERVICE_NAME])
+        note(f"systemctl --user show {SERVICE_NAME} did not give its state, so whether it runs is unknown; "
+             + ("it was enabled but neither started nor restarted" if _ok(r) else
+                f"systemctl --user enable failed too ({_why(r)})")
+             + "; run ag2-sparrow-hatch install again once the user manager answers")
+        return
+    state = props["ActiveState"]
     active = state in ("active", "reloading")
-    try:
-        main_pid = int(props.get("MainPID") or 0)
-    except ValueError:
-        main_pid = 0
+    main_pid = int(props["MainPID"])
     ran = props.get("ExecMainStartTimestampMonotonic", "0") not in ("", "0")
     # failed/activating/deactivating: the unit's own Sparrow crashed or is restarting.
     outside = not stopped and state == "inactive" and _outside_sparrow(state_dir, instance, main_pid, ran)

@@ -199,8 +199,9 @@ def _unquoted(text: str) -> str:
 
 
 def systemd_words(text: str) -> "list[str]":
-    """`text` split into words as systemd splits an Environment= value: whitespace outside quotes,
-    quotes anywhere in a word removed, escapes decoded. An unclosed quote runs to the end."""
+    """`text` split into words as systemd splits an Environment= value: space, tab, CR or LF
+    outside quotes, quotes anywhere in a word removed, escapes decoded. An unclosed quote runs to
+    the end."""
     words, cur, quote, started, i = [], [], "", False, 0
     while i < len(text):
         ch = text[i]
@@ -215,7 +216,7 @@ def systemd_words(text: str) -> "list[str]":
                 cur.append(ch)
         elif ch in "\"'":
             quote, started = ch, True
-        elif ch.isspace():
+        elif ch in " \t\r\n":
             if started:
                 words.append("".join(cur))
             cur, started = [], False
@@ -414,9 +415,22 @@ def describe(exc: BaseException) -> str:
     return out
 
 
-_CREDENTIAL_NAME_RE = re.compile(
-    r"TOKEN|SECRET|PASSWORD|PASSWD|PASS\b|_PASS|CREDENTIAL|API_?KEY|PRIVATE_?KEY|AUTH|BEARER|COOKIE|SESSION",
-    re.IGNORECASE)
+_CREDENTIAL_WORDS = frozenset(
+    "token tokens secret secrets password passwords passwd pass passphrase credential credentials creds key "
+    "apikey auth authorization bearer cookie session pat".split())
+# A word that ends in one of these is a credential name glued together (MYTOKEN, DBPASSWORD).
+_CREDENTIAL_SUFFIXES = ("token", "tokens", "secret", "secrets", "password", "passwords", "passwd", "pass",
+                        "apikey", "privatekey", "accesskey", "secretkey", "credential", "credentials")
+_NAME_WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
+
+
+def credential_name(name: str) -> bool:
+    """Whether `name` (a key, flag or header) names a credential as a whole word: split on
+    separators, case changes and digits, so AUTHOR, --tokenizer and --oauth-id do not."""
+    words = [w.lower() for w in _NAME_WORD_RE.findall(str(name))]
+    return any(w in _CREDENTIAL_WORDS or w.endswith(_CREDENTIAL_SUFFIXES) for w in words)
+
+
 # `KEY=value`, `KEY = value` and `export KEY=value`, as parse_env_text reads them.
 _ASSIGNMENT_LINE_RE = re.compile(r"^(\s*)(export\s+)?([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*)$")
 ENVIRONMENT_WITHHELD = "Environment=<withheld>"
@@ -429,7 +443,7 @@ def mask_assignment(key: str, value: str, registry: "SecretRegistry | None" = No
     """The value of `key=value` as it may be shown: withheld for a credential-named key, an
     onboarding string or one holding a registered secret; a URL by its redacted form."""
     url, _secret = parse_onboarding_token(value)
-    if _CREDENTIAL_NAME_RE.search(key) or url or (registry is not None and registry.contains(value)):
+    if credential_name(key) or url or (registry is not None and registry.contains(value)):
         return WITHHELD
     if "://" in value:
         return redact_url(value)
@@ -440,19 +454,29 @@ def _is_comment(line: str) -> bool:
     return line.lstrip().startswith(("#", ";"))
 
 
+# A line break other than the LF that ends a physical line: CR, NUL and every one str.splitlines knows.
+_INLINE_BREAK_RE = re.compile(r"[\r\x00\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
+
+
+def physical_lines(text: str) -> "list[str]":
+    """`text` split after each LF only (a CRLF stays whole), as systemd reads a unit; unlike
+    str.splitlines, no other line break ends a line, so none splits a value from its key."""
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
+
+
 def sets_environment(line: str) -> bool:
     """Whether a unit line could set, load, unset or pass the environment (Environment=,
-    EnvironmentFile=, UnsetEnvironment=, PassEnvironment=, in any spelling): its directive, the
-    text before the first `=` with comment markers off, is judged undecoded and in doubt counts."""
-    directive = line.rstrip("\r\n").lstrip().lstrip("#;").partition("=")[0]
-    return bool(_ENVIRONMENT_DOUBT_RE.search(directive))
+    EnvironmentFile=, UnsetEnvironment=, PassEnvironment=, in any spelling): the directive of each
+    piece any line break starts, comment markers off, is judged undecoded and in doubt counts."""
+    return any(_ENVIRONMENT_DOUBT_RE.search(piece.lstrip().lstrip("#;").partition("=")[0])
+               for piece in _INLINE_BREAK_RE.split(line.rstrip("\r\n")))
 
 
 def _groups(text: str) -> "list[list[str]]":
     """Physical lines grouped by continuation, never fewer than systemd joins: any trailing
     backslash continues (comment lines too), and a comment inside a continuation does not end it."""
     groups, current = [], []
-    for line in text.splitlines(True):
+    for line in physical_lines(text):
         body = line.rstrip("\r\n")
         current.append(line)
         if body.endswith("\\") or (_is_comment(body) and len(current) > 1):
@@ -469,15 +493,15 @@ def _join(group: "list[str]") -> str:
     return " ".join(p[:-1] if p.endswith("\\") and i < len(kept) - 1 else p for i, p in enumerate(kept))
 
 
-_SHAPE_NAME = r"[\w-]*(?:token|secret|passw(?:or)?d|api[-_]?key|bearer|auth)[\w-]*"
 _SHAPE_VALUE = r"(\"[^\"]*\"?|'[^']*'?|[^\s\"';&|]+)"
 # Any `KEY=value` in the line (env -i, sh -c 'export ...', an argument), and a quoted JSON key.
 _ANY_ASSIGNMENT_RE = re.compile(r"(?<![\w-])([A-Za-z_][A-Za-z0-9_]*)\s*=\s*" + _SHAPE_VALUE + "?")
 _JSON_KEY_RE = re.compile(r"[\"']([\w-]+)[\"']\s*:\s*" + _SHAPE_VALUE + "?")
-# A credential flag in `--flag value` or `--flag=value` form.
-_FLAG_RE = re.compile(r"(?i)(?:^|(?<=[\s\"'=(]))--?" + _SHAPE_NAME + r"(?:(?:=|\s+)" + _SHAPE_VALUE + ")?")
+# A flag in `--flag value` or `--flag=value` form, and a `Name: value` header or YAML key.
+_FLAG_RE = re.compile(r"(?:^|(?<=[\s\"'=(]))--?([A-Za-z][\w-]*)(?:(?:=|\s+)" + _SHAPE_VALUE + ")?")
+_COLON_KEY_RE = re.compile(r"(?:^|(?<=[\s\"'{,;]))([A-Za-z_][\w-]*)\s*:(?!//)\s*" + _SHAPE_VALUE + "?")
 _HEADER_RE = re.compile(r"(?i)\bauthorization\s*:\s*(?:[A-Za-z]+\s+)?" + _SHAPE_VALUE
-                        + r"?|\bbearer\s+" + _SHAPE_VALUE)
+                        + r"?|\bbearer\s+(?=[\"']?[^\s\"';&|]{8})" + _SHAPE_VALUE)
 
 
 def _shape_views(text: str) -> "set[str]":
@@ -485,13 +509,13 @@ def _shape_views(text: str) -> "set[str]":
 
 
 def credential_shapes(text: str) -> "list[str]":
-    """The value of every credential shape in `text` ('' for one with no value): a credential-named
-    KEY= or quoted JSON key anywhere, a credential flag, an Authorization: header or a Bearer value."""
+    """The value of every credential shape in `text` ('' for one with no value): a credential_name
+    KEY=, quoted JSON key, `Name: value` header or YAML key, or --flag anywhere, an Authorization:
+    header, or a Bearer value of 8 or more characters."""
     found = []
     for view in _shape_views(str(text)):
-        for regex in (_ANY_ASSIGNMENT_RE, _JSON_KEY_RE):
-            found += [m.group(2) or "" for m in regex.finditer(view) if _CREDENTIAL_NAME_RE.search(m.group(1))]
-        found += [m.group(1) or "" for m in _FLAG_RE.finditer(view)]
+        for regex in (_ANY_ASSIGNMENT_RE, _JSON_KEY_RE, _COLON_KEY_RE, _FLAG_RE):
+            found += [m.group(2) or "" for m in regex.finditer(view) if credential_name(m.group(1))]
         found += [m.group(1) or m.group(2) or "" for m in _HEADER_RE.finditer(view)]
     return found
 
@@ -515,8 +539,8 @@ def _register_value(registry: "SecretRegistry", value: str, min_len: int) -> Non
 def register_assignments(registry: "SecretRegistry", *texts: str) -> None:
     """Every value the texts assign, registered before any of them is shown: a credential-named
     key's at any length, each value on an environment line (split as systemd splits it, and as
-    written) at BARE_SECRET_MIN, and every credential shape's value at any length, so the same
-    value under a neutral key or on another line is withheld too."""
+    written) at BARE_SECRET_MIN, and every credential shape's value at BARE_SECRET_MIN unless it is
+    a plain path, so the same value under a neutral key or on another line is withheld too."""
     for text in texts:
         for group in _groups(text):
             joined = _join(group)
@@ -525,21 +549,24 @@ def register_assignments(registry: "SecretRegistry", *texts: str) -> None:
                 words = systemd_words(rest) + re.split(r"[\s\"']+", rest)
             else:
                 m = _ASSIGNMENT_LINE_RE.match(joined)
-                credential = m and _CREDENTIAL_NAME_RE.search(m.group(3))
+                credential = m and credential_name(m.group(3))
                 words = [f"{m.group(3)}={parse_env_value(m.group(5))}"] if credential else []
             for word in words:
                 key, eq, value = word.partition("=")
                 if eq:
-                    named = _CREDENTIAL_NAME_RE.search(systemd_unescape(key))
+                    named = credential_name(systemd_unescape(key))
                     _register_value(registry, value, 1 if named else BARE_SECRET_MIN)
             for value in credential_shapes(joined):
-                if value:
-                    _register_value(registry, value, 1)
+                if not value.strip("'\"").startswith("/"):
+                    _register_value(registry, value, BARE_SECRET_MIN)
 
 
 def _mask_line(body: str, registry: "SecretRegistry | None") -> str:
     """One rendered line: an assignment shows only its key when its value holds a credential shape
-    or a registered secret; any other line holding either is withheld whole."""
+    or a registered secret; any other line holding either, or a line break inside it, is withheld
+    whole, so no renderer that breaks the line there shows an unmasked piece."""
+    if _INLINE_BREAK_RE.search(body):
+        return WITHHELD_TEXT
     held = registry is not None and registry.contains(body)
     m = _ASSIGNMENT_LINE_RE.match(body)
     if m and not (registry is not None and registry.contains(m.group(3))):

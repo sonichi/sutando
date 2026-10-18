@@ -360,6 +360,20 @@ def _left_running(pid: int) -> None:
           "cannot be read as Sparrow's, so it was left running as it is")
 
 
+def _unit_state_unknown(cfg: dict, holder: "int | None", why: str) -> int:
+    """Install stops and starts nothing while the unit's state is unknown; 1 when no Sparrow runs."""
+    head = (f"{_cli.service_path()} is installed but {why}, so whether that service runs Sparrow is "
+            "unknown; install neither stops nor starts a Sparrow")
+    if holder is not None or listener_up(cfg, time.time()):
+        who = f"Sparrow (pid {holder})" if holder is not None else "The running Sparrow"
+        print(f"NOTE sparrow: {head}. {who} was left as it is; run "
+              "ag2-sparrow-hatch verify once the user manager answers")
+        return 0
+    print(f"error: Sparrow is not running: {head}. Start your user manager (systemctl --user) and "
+          f"run install again, or remove {_cli.service_path()} if it is left over", file=sys.stderr)
+    return 1
+
+
 def ensure_sparrow(cfg: dict, health: bool) -> int:
     """Leave a Sparrow running and connected: start one if none runs, replace one outside
     the installed service, or (with `health`) one that lacks REMOTE_HEALTH_COMMAND."""
@@ -368,10 +382,7 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
     holder = _cli.live_lock_holder(_cli._lock_record(state, instance))
     owner = _unit_owner()
     if owner == UNIT_UNREACHABLE:
-        print(f"NOTE sparrow: {_cli.service_path()} is installed but systemctl --user did not "
-              "answer, so whether that service runs Sparrow is unknown; install neither stops nor "
-              "starts a Sparrow. Run ag2-sparrow-hatch verify once the user manager answers")
-        return 0
+        return _unit_state_unknown(cfg, holder, "systemctl --user did not answer")
     if owner == "other":
         print(f"NOTE sparrow: {_cli.service_path()} was not written by install, so install "
               "neither starts nor replaces the Sparrow it runs; run ag2-sparrow-hatch verify")
@@ -379,7 +390,10 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
     start, stopped, since = False, None, None
     if owner == "ours":
         props = _cli._unit_props("ActiveState", "MainPID", "ExecMainStartTimestampMonotonic")
-        active = props.get("ActiveState") in ("active", "reloading")
+        if props is None:
+            return _unit_state_unknown(cfg, holder,
+                                       f"systemctl --user show {_cli.SERVICE_NAME} did not give its state")
+        active = props["ActiveState"] in ("active", "reloading")
         if active:
             # install_service may have just restarted the unit: only its new process counts.
             since = _wall_from_monotonic_us(props.get("ExecMainStartTimestampMonotonic")) \

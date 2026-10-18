@@ -253,6 +253,52 @@ class PureContractCases:
         self.assertEqual(self.c.mask_env_assignments(f"Description=Sparrow {tok}\n", self.c.SecretRegistry()),
                          f"Description=Sparrow {tok}\n", "the stated limit: a bare token nothing names")
 
+    BREAKS = ("\u2028", "\u2029", "\x85", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\r", "\x00")
+
+    def test_only_an_lf_ends_a_line_and_no_other_break_carries_a_tail(self):
+        for ch in self.BREAKS:
+            with self.subTest(ch=repr(ch)):
+                self.assertEqual(self.c.physical_lines(f"a{ch}b\nc\r\nd"), [f"a{ch}b\n", "c\r\n", "d"])
+                for text, shown in ((f'Environment="REMOTE_TASK_TOKEN=qa-first{ch}qa-tail-9988"\n',
+                                     "Environment=<withheld>\n"),
+                                    (f"Description=x{ch}Environment=NOTE=qa-tail-9988\n", "Environment=<withheld>\n"),
+                                    (f"ExecStart=/x --flag qa-first{ch}qa-tail-9988\n", self.c.WITHHELD_TEXT + "\n"),
+                                    (f"NOTE=qa-first{ch}qa-tail-9988\n", self.c.WITHHELD_TEXT + "\n")):
+                    registry = self.c.SecretRegistry()
+                    self.c.register_assignments(registry, text)
+                    self.assertEqual(self.c.mask_env_assignments(text, registry), shown)
+
+    def test_flag_header_and_yaml_credential_shapes(self):
+        tok = "synth-n1-shape-5698"
+        for line in (f"ExecStart=/x --key {tok}", f"ExecStart=/x --access-key={tok}", f"ExecStart=/x --credentials {tok}",
+                     f"ExecStart=/x --pat {tok}", f"ExecStart=/x -H 'X-Api-Key: {tok}'", f"X-Auth-Token: {tok}",
+                     f"token: {tok}", f"  api_key: {tok}", f"password: '{tok}'", f"ExecStart=/x -H X-Api-Key:{tok}"):
+            with self.subTest(line=line):
+                self.assertNotIn(tok, self.c.mask_env_assignments(line + "\n", self.c.SecretRegistry()))
+
+    def test_a_credential_name_is_a_whole_word(self):
+        for name in ("REMOTE_TASK_TOKEN", "MYTOKEN", "DBPASSWORD", "apiKey", "accessToken", "X-Api-Key", "pat",
+                     "auth-mode", "SESSION_ID", "github_pat"):
+            self.assertTrue(self.c.credential_name(name), name)
+        for name in ("AUTHOR", "author", "tokenizer", "oauth-client-id", "X-AUTHOR", "keyboard", "patch"):
+            self.assertFalse(self.c.credential_name(name), name)
+        for line in ("ExecStart=/x --author qingyun", "ExecStart=/x --tokenizer wordpiece", "X-AUTHOR=qingyun",
+                     "ExecStart=/x --oauth-client-id abc", "Description=Bearer of tasks", "Author: qingyun"):
+            self.assertEqual(self.c.mask_env_assignments(line + "\n", self.c.SecretRegistry()), line + "\n")
+
+    def test_a_short_or_path_shaped_value_hides_no_other_line(self):
+        for shaped, harmless in (("ExecStart=/x --auth=1", "RestartSec=10\nDescription=Sparrow 1.0\n"),
+                                 ("ExecStart=/x --auth-mode=basic", "Description=A basic relay\n"),
+                                 ("ExecStart=/x --token-file /home/u/cfg/token", "ExecStartPre=/bin/ls /home/u/cfg/token\n")):
+            with self.subTest(shaped=shaped):
+                text = f"{shaped}\n{harmless}"
+                registry = self.c.SecretRegistry()
+                self.c.register_assignments(registry, text)
+                self.assertEqual(self.c.mask_env_assignments(text, registry), f"ExecStart=<withheld>\n{harmless}")
+        registry = self.c.SecretRegistry()
+        self.c.register_assignments(registry, "ExecStart=/x --auth=long-enough-5698\n")
+        self.assertTrue(registry.contains("NOTE=long-enough-5698"), "a shaped value of 8 or more is reused")
+
     def test_edge_paths_never_raise(self):
         registry = self.c.SecretRegistry()
         registry.register("\ud800lone")  # not even surrogateescape encodes a lone high surrogate
@@ -728,6 +774,24 @@ class RealSinks(unittest.TestCase):
             limit = self.body(self.hatch_diff(self.bare(Path(td)), f"[Service]\nDescription=Sparrow {tok}\n"))
             self.assertIn(f"-Description=Sparrow {tok}\n", limit, "the stated limit: a bare token nothing names")
 
+    def test_the_hatch_install_diff_shows_no_tail_past_a_unicode_line_break(self):
+        for ch in ("\u2028", "\u2029", "\x85"):
+            with self.subTest(ch=repr(ch)), tempfile.TemporaryDirectory() as td:
+                shown = self.body(self.hatch_diff(self.bare(Path(td)), f'[Service]\nEnvironment="REMOTE_TASK_TOKEN='
+                                                                       f'qa-first{ch}qa-tail-9988"\nExecStart=/x\n'))
+                self.assertNotIn("qa-tail-9988", shown)
+                self.assertNotIn("qa-first", shown)
+                self.assertEqual(shown, " [Service]\n-Environment=<withheld>\n-ExecStart=/x\n+ExecStart=/y\n")
+
+    def test_the_hatch_install_diff_keeps_harmless_lines_and_names(self):
+        tok = "synth-n1-sink-5698"
+        with tempfile.TemporaryDirectory() as td:
+            shown = self.body(self.hatch_diff(self.bare(Path(td)), "[Service]\nExecStart=/x --auth=1\nRestartSec=10\n"
+                                                                   "ExecStartPre=/x --author qingyun\n"
+                                                                   f"ExecStartPost=/x -H 'X-Api-Key: {tok}'\n"))
+            self.assertEqual(shown, " [Service]\n-ExecStart=<withheld>\n-RestartSec=10\n"
+                                    "-ExecStartPre=/x --author qingyun\n-ExecStartPost=<withheld>\n+ExecStart=/y\n")
+
     def test_the_hatch_install_diff_seeds_from_the_default_device_file(self):
         live = "synth-default-device-5698"
         with tempfile.TemporaryDirectory() as td:
@@ -963,6 +1027,21 @@ def _constant(node):
         return None if None in parts else "".join(parts)
     if isinstance(node, ast.FormattedValue) and node.conversion == -1 and node.format_spec is None:
         return _constant(node.value)
+    try:
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod) and _constant(node.left) is not None:
+            elts = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+            args = [_constant(e) for e in elts]
+            return None if None in args else _constant(node.left) % tuple(args)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and not node.keywords \
+                and _constant(node.func.value) is not None:
+            args = [_constant(a) for a in node.args]
+            if node.func.attr == "format" and None not in args:
+                return _constant(node.func.value).format(*args)
+            if node.func.attr == "join" and len(node.args) == 1 and isinstance(node.args[0], (ast.Tuple, ast.List)):
+                parts = [_constant(e) for e in node.args[0].elts]
+                return None if None in parts else _constant(node.func.value).join(parts)
+    except (TypeError, ValueError, IndexError, KeyError):
+        pass
     return None
 
 
@@ -992,11 +1071,12 @@ PROBE_KEEPS = (ast.Global, ast.Nonlocal, ast.Assign, ast.AugAssign, ast.AnnAssig
 def _probe_keeps(inner, parents) -> "list[str]":
     """Why a scope that runs show-environment keeps its output: the run's result must be passed
     straight to _ok, a bool, and the scope may not read stdout/stderr, print, write or store."""
-    if not any(isinstance(n, ast.Constant) and n.value == "show-environment" for n in inner):
+    probe = [n for n in inner if _constant(n) == "show-environment" and _constant(parents.get(n)) != "show-environment"]
+    if not probe:
         return []
     why = []
     for n in inner:
-        if isinstance(n, ast.Constant) and n.value == "show-environment":
+        if n in probe:
             run = parents.get(n)
             while run is not None and not isinstance(run, ast.Call):
                 run = parents.get(run)
@@ -1059,7 +1139,7 @@ def credential_access(source: str, rel: str) -> "list[str]":
                     tainted |= {t.id for t in ast.walk(n.optional_vars) if isinstance(t, ast.Name)}
         reads = any(isinstance(n, ast.Call) and (getattr(n.func, "id", None) in READS or getattr(n.func, "attr", None) in READS)
                     and marked(n, tainted) for n in inner)
-        store = any(isinstance(n, ast.Constant) and n.value in STORE_READS for n in inner) or \
+        store = any(_constant(n) in STORE_READS for n in inner) or \
             any(isinstance(n, (ast.Import, ast.ImportFrom)) and "channel_token" in ast.unparse(n) for n in inner)
         if (reads or store) and (rel, name) not in IO_ALLOWED:
             out.append(f"{rel}:{name} credential I/O outside the adapters' edge")
@@ -1139,6 +1219,15 @@ class Guard(unittest.TestCase):
                  f"    return _ok(r := {run}) and bool(r.stdout)",
                  f"    sys.stderr.write(str({run}))\n    return True",
                  f"    yield {run}"]
+        built = ('"show-" + "environment"', '"".join(("show-", "environment"))', 'f"show-{\'environment\'}"',
+                 '"show-{}".format("environment")', '"show-%s" % "environment"', '"show-%s%s" % ("environ", "ment")',
+                 '"-".join(["show", "environment"])', '("show-" "env") + "ironment"')
+        for cmd in built:
+            folded = f'_systemd_run(["systemctl", "--user", {cmd}])'
+            keeps += [f"    return {folded}.stdout", f"    c = {cmd}\n    return _systemd_run(['systemctl', c]).stdout"]
+            self.assertEqual(credential_access(shipped.replace(run, folded), rel), [], f"discarded: {cmd}")
+            self.assertTrue(credential_access(f"def f():\n    subprocess.run(['systemctl', '--user', {cmd}])\n",
+                                              "probe.py"), f"a store read outside the edge: {cmd}")
         for body in keeps:
             with self.subTest(body=body):
                 self.assertTrue(credential_access(f"def systemd_user_available():\n{body}\n", rel), body)
