@@ -23,6 +23,8 @@ import time
 import urllib.error
 import urllib.request
 
+from . import gateway_instance
+
 # If not even a keepalive arrives for this long the TCP path is dead — reconnect.
 STREAM_READ_TIMEOUT = 120
 _FATAL_HTTP = frozenset({401, 403, 404})
@@ -92,8 +94,9 @@ class EventChannel:
             # Header wins server-side over ?cursor= (#184) — resume from the last
             # DURABLY-written event, so nothing between durable and received is lost.
             h["Last-Event-ID"] = str(int(resume))
-        req = urllib.request.Request(f"{self._base}/v1/events/stream", headers=h, method="GET")
-        return urllib.request.urlopen(req, timeout=STREAM_READ_TIMEOUT)
+        with gateway_instance.gateway_call(self._base):
+            req = urllib.request.Request(f"{self._base}/v1/events/stream", headers=h, method="GET")
+            return urllib.request.urlopen(req, timeout=STREAM_READ_TIMEOUT)
 
     def _consume_once(self) -> bool:
         """One SSE connection. Returns True if it ended retryably (reconnect),
@@ -112,8 +115,8 @@ class EventChannel:
                 return False
             self._set(status="reconnecting", error=f"HTTP {e.code}")
             return True
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            self._set(status="reconnecting", error=f"connect: {type(e).__name__}")  # never its text: it names the URL
+        except Exception as e:  # noqa: BLE001 - never its text: it names the URL
+            self._set(status="reconnecting", error=f"connect: {type(e).__name__}")
             return True
         self._set(status="connected", error=None)
         try:

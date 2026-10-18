@@ -8,15 +8,19 @@ injective and the first `~` splits it. The empty instance is the primary: identi
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import os
 import re
 import stat
+import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 from pathlib import Path
+from typing import Callable
 
 from . import file_lock, task_io
 
@@ -77,9 +81,11 @@ def scrub_exception(exc: BaseException, gateway_url: str) -> BaseException:
     base = type(exc)
     safe = _SCRUBBED_TYPES.get(base)
     if safe is None:
+        # The original is never reachable from it: no __context__ (set when raised in a handler).
         safe = _SCRUBBED_TYPES[base] = type(base.__name__, (base,), {
             "__str__": lambda self: self.__dict__.get("_scrubbed", base.__name__),
             "__repr__": lambda self: f"{base.__name__}({self.__dict__.get('_scrubbed', '')!r})",
+            "__context__": property(lambda self: None, lambda self, value: None),
             "__module__": base.__module__, "__qualname__": base.__qualname__})
     code = exc.__dict__.get("code")
     text = f"{base.__name__} contacting {redact_url(gateway_url)}"
@@ -87,7 +93,8 @@ def scrub_exception(exc: BaseException, gateway_url: str) -> BaseException:
         text += f" (HTTP {code})"
     out = safe.__new__(safe)
     # Objects (an HTTPError's body and headers) and numbers stay; text and bytes never do.
-    out.__dict__.update({k: (text if isinstance(v, str) else b"" if isinstance(v, (bytes, bytearray)) else v)
+    out.__dict__.update({k: (text if isinstance(v, str) else b"" if isinstance(v, (bytes, bytearray))
+                             else scrub_exception(v, gateway_url) if isinstance(v, BaseException) else v)
                          for k, v in exc.__dict__.items()})
     if isinstance(exc, OSError):
         out.errno = exc.errno
@@ -95,6 +102,42 @@ def scrub_exception(exc: BaseException, gateway_url: str) -> BaseException:
     out.args = (text,)
     out.__traceback__ = exc.__traceback__
     return out
+
+
+@contextlib.contextmanager
+def gateway_call(gateway_url: str):
+    """Wrap every call that receives the gateway URL, or a URL derived from it: what it raises
+    is re-raised by scrub_exception, so no caller can log or persist text from it."""
+    try:
+        yield
+    except Exception as e:  # noqa: BLE001 - re-raised as the same type, scrubbed
+        raise scrub_exception(e, gateway_url) from None
+
+
+def install_scrubbing_excepthooks(get_url: Callable[[], str]) -> None:
+    """Backstop for a process that holds the gateway URL: an uncaught exception, in any thread,
+    is reported as its type and its text through redact_text, never a raw traceback."""
+    def report(exc_type, exc, where: str) -> None:
+        try:
+            text = redact_text(str(exc), get_url() or "")
+        except Exception:  # noqa: BLE001 - a hook must report something, never the raw text
+            text = REDACTED_TEXT
+        try:
+            sys.stderr.write(f"{where}{getattr(exc_type, '__name__', 'Exception')}: {text}\n")
+        except Exception:  # noqa: BLE001 - nowhere left to report to
+            pass
+
+    def hook(exc_type, exc, _tb):
+        report(exc_type, exc, "Uncaught ")
+
+    def thread_hook(args):
+        if args.exc_type is SystemExit:
+            return
+        name = getattr(args.thread, "name", "?")
+        report(args.exc_type, args.exc_value, f"Exception in thread {name}: ")
+
+    sys.excepthook = hook
+    threading.excepthook = thread_hook
 
 
 REDACTED_TEXT = "<text withheld: it may contain the gateway URL>"
@@ -154,11 +197,16 @@ def redact_text(text: str, gateway_url: str) -> str:
         return text
     for form in sorted(_forms(url), key=len, reverse=True):
         text = text.replace(form, redact_url(url))
-    views = {text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text)}
+    views = {_hex_upper(v) for v in (text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text))}
     for part in _secret_parts(url):
-        if any(form in view for form in _forms(part) for view in views):
+        if any(_hex_upper(form) in view for form in _forms(part) for view in views):
             return REDACTED_TEXT
     return text
+
+
+def _hex_upper(text: str) -> str:
+    """Percent escapes in one case: their hex digits are case-insensitive."""
+    return re.sub(r"%[0-9A-Fa-f]{2}", lambda m: m.group().upper(), text)
 
 
 KEY_GRACE_S = 5.0

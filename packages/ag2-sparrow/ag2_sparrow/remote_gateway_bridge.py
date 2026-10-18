@@ -2617,10 +2617,8 @@ _NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
 def _gateway_call():
     """Every call that receives the gateway URL runs inside this: what it raises carries only
     its type, the redacted gateway and an HTTP status, so no caller can log or persist the URL."""
-    try:
+    with gateway_instance.gateway_call(URL):
         yield
-    except Exception as e:  # noqa: BLE001 - re-raised as the same type, scrubbed
-        raise gateway_instance.scrub_exception(e, URL) from None
 
 
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S):
@@ -3747,22 +3745,23 @@ def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
     gateway-controlled URL must not bounce our bearer to another host — and a
     3xx is treated as a FAILURE (raise) so the redirect page's body is never
     saved as if it were the media."""
-    req = urllib.request.Request(url, method="GET")
-    for k, v in headers.items():
-        req.add_header(k, v)
-    if "Authorization" in headers:
-        class _NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *a, **kw):  # noqa: D401
-                return None
-        opener = urllib.request.build_opener(_NoRedirect)
-        resp_ctx = opener.open(req, timeout=30)
-    else:
-        resp_ctx = urllib.request.urlopen(req, timeout=30)
-    with resp_ctx as resp:
-        status = getattr(resp, "status", 200)
-        if 300 <= status < 400:
-            raise ValueError(f"authenticated media fetch got a redirect ({status})")
-        data = resp.read(cap + 1)
+    with gateway_instance.gateway_call(url):  # a gateway-supplied URL, maybe under the gateway's
+        req = urllib.request.Request(url, method="GET")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        if "Authorization" in headers:
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *a, **kw):  # noqa: D401
+                    return None
+            opener = urllib.request.build_opener(_NoRedirect)
+            resp_ctx = opener.open(req, timeout=30)
+        else:
+            resp_ctx = urllib.request.urlopen(req, timeout=30)
+        with resp_ctx as resp:
+            status = getattr(resp, "status", 200)
+            if 300 <= status < 400:
+                raise ValueError(f"authenticated media fetch got a redirect ({status})")
+            data = resp.read(cap + 1)
     if len(data) > cap:
         raise ValueError(f"media exceeds {cap}-byte cap")
     return data
@@ -7253,6 +7252,8 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
 
 
 def main() -> None:
+    # This process holds the gateway URL: nothing uncaught, in any thread, prints it raw.
+    gateway_instance.install_scrubbing_excepthooks(lambda: URL)
     if not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
     if not URL:

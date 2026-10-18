@@ -350,6 +350,10 @@ print(json.dumps({"raw": raw, "url": m.URL, "files": files}))
         self.assertEqual(gateway_instance.redact_text("a flag is set", flag), "a flag is set")
         ctl = "https://gw.example/relay?k=v\x01w"
         self.assertEqual(gateway_instance.redact_text(repr("/relay?k=v\x01w"), ctl), closed)
+        for mixed_url, text in (("https://gw/relay?id=a%2fb", "diag id%3Da%252Fb"),
+                                ("https://gw/relay?id=a%2Fb", "diag id%3da%252fb"),
+                                ("https://gw/relay?id=a%2Fb", "diag id=a%2fb")):
+            self.assertEqual(gateway_instance.redact_text(text, mixed_url), closed, (mixed_url, text))
         self.assertEqual(gateway_instance.redact_text("x", ""), "x")
 
     def test_the_bridge_refuses_a_non_ascii_binding_without_raising(self):
@@ -411,6 +415,7 @@ for exc in raised:
         m._log("".join(traceback.format_exception(e)))
         m._emit_gateway_status(False, error=f"network: {e}", backoff_s=1)
         out.append({"type": type(e).__name__, "isinstance": isinstance(e, type(exc)), "code": code,
+                    "context": repr(e.__context__), "reason": str(getattr(e, "reason", "")),
                     "str": str(e), "status": json.load(open(m.GATEWAY_STATUS_FILE))["error"]})
 files = {p: open(p, errors="replace").read() for p in __import__("glob").glob(os.environ["HOME"] + "/**", recursive=True)
          if os.path.isfile(p)}
@@ -427,6 +432,9 @@ print(json.dumps({"out": out, "forms": forms, "files": files}))
         self.assertEqual(len(result["out"]), 8)
         for row in result["out"]:
             self.assertTrue(row["isinstance"], row)
+            self.assertEqual(row["context"], "None", "the original is not reachable from it")
+        for form in result["forms"]:
+            self.assertNotIn(form, json.dumps(result["out"]), "nor from its attributes")
             want = f"{row['type']} contacting https://gw.example/relay"
             self.assertEqual(row["str"], want + (" (HTTP 503)" if row["type"] == "HTTPError" else ""))
             self.assertIn(row["str"], row["status"])
@@ -448,6 +456,101 @@ print(json.dumps({"out": out, "forms": forms, "files": files}))
             self.assertEqual(ch.health["error"], f"connect: {type(exc).__name__}")
         self.assertNotIn("SECRET", json.dumps(lines))
 
+    PATHS = """
+import json, os, threading, time, urllib.error, urllib.request
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m, event_channel, human_action
+lines = []
+m._log = lines.append  # the bridge's own sink, as written by its callers
+inbox = mock.Mock(durable_cursor=mock.Mock(return_value=None))
+ch = event_channel.EventChannel(inbox, m.URL, {}, log=lines.append)
+t = threading.Thread(target=ch.run, kwargs={"stop": lambda: ch.health["retry_count"] >= 1},
+                     name="sparrow-event-channel")
+t.start(); t.join(10)
+channel = {"alive_until_stopped": not t.is_alive(), "health": ch.health}
+media = os.environ["MEDIA_URL"]
+def boom(*a, **k):
+    raise urllib.error.URLError("failed " + os.environ["SECRET_TEXT"])
+with mock.patch.object(urllib.request, "urlopen", boom), \\
+        mock.patch.object(urllib.request.OpenerDirector, "open", boom):
+    m._maybe_fetch_media(f"[{m.MEDIA_MARKER_TAG}: {media} mime=image/png name=a.png]")
+    m._reenroll_claim()
+    store = mock.Mock(pending=mock.Mock(return_value=[{"action_id": "a1"}]))
+    poster = human_action.CardPoster(store, m.URL, {}, "!room:x", log=lines.append)
+    with mock.patch.object(poster, "_render", return_value="card"):
+        poster.sweep()
+print(json.dumps({"lines": lines, "channel": channel}))
+"""
+
+    def test_every_gateway_call_path_keeps_only_the_exception_type(self):
+        for ch in ("\n", "\t", "\x7f"):
+            with self.subTest(ch=repr(ch)):
+                url = f"https://gw.example/relay?enrollment=SECRET{ch}BAD"
+                media = "https://gw.example/relay/media/abc?sig=MEDIASECRET"
+                secret_text = " ".join((url, media, "SECRET%0aBAD", "secret%0Abad", repr("SECRET\nBAD")))
+                r = subprocess.run([sys.executable, "-c", PRELUDE + self.PATHS], capture_output=True,
+                                   text=True, cwd=str(self.home), timeout=60,
+                                   env=self.bridge_env(REMOTE_TASK_URL=url, MEDIA_URL=media,
+                                                       SECRET_TEXT=secret_text, AGENT_MXID=AGENT))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                out = json.loads(r.stdout.strip().splitlines()[-1])
+                self.assertTrue(out["channel"]["alive_until_stopped"], "the channel thread never dies")
+                self.assertEqual(out["channel"]["health"]["error"], "connect: InvalidURL",
+                                 "the real InvalidURL, driven through run()")
+                logged = "\n".join(out["lines"])
+                self.assertIn("media fetch failed (URLError contacting https://gw.example/relay/media/abc)", logged)
+                self.assertIn("reenroll: claim failed: URLError contacting https://gw.example/relay", logged)
+                self.assertIn("human-action: card post failed (will retry): URLError", out["lines"],
+                              "the card poster logs the type alone")
+                everything = r.stdout + r.stderr
+                for secret in ("SECRET", "secret", "MEDIASECRET", "BAD", "bad"):
+                    self.assertNotIn(secret, everything, secret)
+
+    def test_the_excepthooks_report_only_the_type_and_redacted_text(self):
+        script = """
+import threading
+from ag2_sparrow import gateway_instance
+url = "https://gw.example/relay?enrollment=SECRET%0aBAD"
+gateway_instance.install_scrubbing_excepthooks(lambda: url)
+def die():
+    raise ValueError("bad " + url)
+t = threading.Thread(target=die, name="worker"); t.start(); t.join()
+raise RuntimeError("fatal enrollment=SECRET%0aBAD")
+"""
+        r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                           cwd=str(self.home), timeout=60, env=self.bridge_env())
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Exception in thread worker: ValueError: bad https://gw.example/relay", r.stderr)
+        self.assertIn("Uncaught RuntimeError: " + gateway_instance.REDACTED_TEXT, r.stderr)
+        self.assertNotIn("SECRET", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_every_url_taking_call_in_the_package_runs_inside_gateway_call(self):
+        import ast
+        allowed = {("adapters/claude_routine/routine_adapter.py", "Request"),  # the routine endpoint,
+                   ("adapters/claude_routine/routine_adapter.py", "urlopen")}  # not the gateway
+        found, unwrapped = [], []
+        for path in sorted((PKG_ROOT / "ag2_sparrow").rglob("*.py")):
+            rel = str(path.relative_to(PKG_ROOT / "ag2_sparrow"))
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+                if name not in ("Request", "urlopen", "build_opener", "HTTPConnection", "HTTPSConnection"):
+                    continue
+                found.append((rel, name))
+                up, wrapped = node, False
+                while up in parents and not wrapped:
+                    up = parents[up]
+                    wrapped = isinstance(up, ast.With) and any(
+                        "gateway_call" in ast.unparse(item.context_expr) for item in up.items)
+                if not wrapped and (rel, name) not in allowed:
+                    unwrapped.append(f"{rel}:{node.lineno} {name}")
+        self.assertGreaterEqual(len(found), 10, found)
+        self.assertEqual(unwrapped, [], "a call that receives the gateway URL is not wrapped")
+
     STARTUP = """
 import json
 from unittest import mock
@@ -465,11 +568,13 @@ with mock.patch.object(m, "_log", lines.append), \\
         m.main()
     except Stop:
         pass
-print(json.dumps({"lines": lines}))
+import sys, threading
+print(json.dumps({"lines": lines, "hooks": [sys.excepthook.__qualname__, threading.excepthook.__qualname__]}))
 """
 
     def test_the_startup_log_names_only_the_redacted_gateway(self):
         out = self.bridge(self.STARTUP)
+        self.assertTrue(all("install_scrubbing_excepthooks" in h for h in out["hooks"]), out["hooks"])
         start = [ln for ln in out["lines"] if ln.startswith("starting")]
         self.assertEqual(len(start), 1, out["lines"])
         self.assertIn(f"gateway={GW} ", start[0])
