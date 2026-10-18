@@ -378,19 +378,28 @@ def _is_comment(line: str) -> bool:
     return line.lstrip().startswith(("#", ";"))
 
 
+def _continues(line: str) -> bool:
+    """systemd's escape parity: only an odd run of trailing backslashes continues the line."""
+    return (len(line) - len(line.rstrip("\\"))) % 2 == 1
+
+
 def _logical_lines(text: str) -> "list[tuple[list[str], str, list[str]]]":
     """Physical lines grouped as systemd reads them, as (lines, joined text, skipped comments): a
-    line ending in a backslash continues, and a comment line inside a continuation is skipped
-    without ending it."""
+    comment line is skipped before continuation (it neither starts nor ends one), and a line
+    ending in an odd run of backslashes continues."""
     groups, current, kept, skipped = [], [], [], []
     for line in text.splitlines(True):
         body = line.rstrip("\r\n")
-        current.append(line)
-        if kept and _is_comment(body):
-            skipped.append(body)
+        if _is_comment(body):
+            if kept:
+                current.append(line)
+                skipped.append(body)
+            else:
+                groups.append(([line], body, []))
             continue
+        current.append(line)
         kept.append(body)
-        if not body.endswith("\\"):
+        if not _continues(body):
             groups.append((current, _join(kept), skipped))
             current, kept, skipped = [], [], []
     if current:

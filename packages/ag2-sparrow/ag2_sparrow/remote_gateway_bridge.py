@@ -2712,9 +2712,13 @@ def _http_error_body(e) -> str:
 
 
 def _read_token_file(path: str) -> str:
-    """The onboarding string from a token file, or "" (missing, unreadable, not UTF-8 or empty: no
-    rotation); gateway_credential_sources.token_file_token decides the shape."""
-    return gateway_credential_sources.token_file_token(_read_text(path))
+    """The onboarding string from a token file, or "" (missing, refused or empty: no rotation); a
+    refused file is named on stderr, path and reason only. token_file_token decides the shape."""
+    text, reason = read_regular(path)
+    if reason:
+        print(f"[remote-gateway-bridge] {gateway_credential_sources.refusal_note(path, reason)}; "
+              "no rotation", file=sys.stderr, flush=True)
+    return gateway_credential_sources.token_file_token(text or "")
 
 
 def _read_token_file_url(path: str) -> str:

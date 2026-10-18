@@ -203,6 +203,18 @@ class PureContractCases:
         self.assertEqual(self.c.mask_env_assignments("# top\nA=b\n"), "# top\nA=b\n",
                          "a comment outside a continuation is its own line")
 
+    def test_continuation_follows_systemd_comment_and_backslash_parity(self):
+        after_comment = "# harmless comment \\\nEnvironment=REMOTE_TASK_TOKEN=synth-after-comment-5698\n"
+        after_even = "Environment=SAFE=C:\\\\\nEnvironment=REMOTE_TASK_TOKEN=synth-after-even-slashes-5698\n"
+        self.assertEqual(self.c.mask_env_assignments(after_comment),
+                         "# harmless comment \\\nEnvironment=REMOTE_TASK_TOKEN=<withheld>\n",
+                         "a top-level comment's backslash starts no continuation")
+        shown = self.c.mask_env_assignments(after_even).splitlines()
+        self.assertEqual((len(shown), shown[1]), (2, "Environment=REMOTE_TASK_TOKEN=<withheld>"),
+                         "an even run of backslashes does not continue")
+        odd = "Environment=SAFE=C:\\\\\\\nREMOTE_TASK_TOKEN=synth-after-odd-slashes-5698\n"
+        self.assertNotIn("synth-after-odd-slashes-5698", self.c.mask_env_assignments(odd), "an odd run continues")
+
     def test_edge_paths_never_raise(self):
         registry = self.c.SecretRegistry()
         registry.register("\ud800lone")  # not even surrogateescape encodes a lone high surrogate
@@ -304,14 +316,22 @@ class DiscoveryCases:
         for secret in ("early-dup-1111", "late-dup-2222", "exported-dup-3333", "chan-early-4444", "chan-late-5555"):
             self.assertTrue(registry.contains(secret), secret)
 
+    def test_general_config_still_reaches_a_later_file_after_a_refused_one(self):
+        env = {"AG2_DEVICE_ENV": "/dev", "CLAUDE_CONFIG_DIR": "/c"}
+        files = self.o.env_files(env, lambda p: (None, "not UTF-8") if p == "/dev"
+                                 else ("REMOTE_PROACTIVE_ROOM=!r:example.org\n", ""))
+        self.assertTrue(files.blocked)
+        self.assertEqual(self.o.config_from_files(files, "REMOTE_PROACTIVE_ROOM"), "!r:example.org")
+
     def test_a_refused_named_device_file_stops_the_file_and_vault_tiers(self):
         env = {"AG2_DEVICE_ENV": "/dev", "CLAUDE_CONFIG_DIR": "/c"}
         reads = {"/dev": (None, "over 1048576 bytes")}
-        files = self.o.env_files(env, lambda p: reads.get(p, (f"REMOTE_TASK_TOKEN={CHANNEL_TOKEN}\n", "")))
-        self.assertEqual((list(files), files.refused), ([], (("/dev", "over 1048576 bytes"),)),
-                         "the channel file after a refused device file is not read")
-        found = self.o.discover(dict(env, REMOTE_TASK_URL=GW), files, vault_lookup=lambda k: VAULT_TOKEN)
-        self.assertEqual((found.token, found.token_source), ("", "none"))
+        files = self.o.env_files(env, lambda p: reads.get(
+            p, (f"REMOTE_TASK_TOKEN={GW}|{CHANNEL_TOKEN}\nREMOTE_TASK_URL={GW}\n", "")))
+        self.assertEqual(files.refused, (("/dev", "over 1048576 bytes"),))
+        found = self.o.discover(env, files, vault_lookup=lambda k: VAULT_TOKEN)
+        self.assertEqual((found.token, found.token_source, found.url, found.token_file), ("", "none", "", ""),
+                         "neither the later file nor the vault stands in, nor becomes the rotation source")
         self.assertIn("/dev", found.fatal)
         self.assertIn("over 1048576 bytes", found.fatal)
         self.assertEqual(found.notes, (self.o.refusal_note("/dev", "over 1048576 bytes"),))
@@ -329,11 +349,16 @@ class DiscoveryCases:
         absent = self.o.discover(env, self.o.env_files(env, lambda p: None))
         self.assertEqual((absent.notes, absent.fatal), ((), ""), "an absent file is not a refusal")
 
-    def test_a_refused_token_file_is_named(self):
+    def test_a_refused_named_token_file_is_named_and_fatal(self):
         found = self.o.discover({"REMOTE_TASK_TOKEN": ENV_TOKEN, "REMOTE_TASK_TOKEN_FILE": "/t"},
                                 read_token_file=lambda p: (None, "not UTF-8"))
-        self.assertEqual((found.token_source, found.fatal), ("env", ""))
+        self.assertEqual(found.token_source, "env")
         self.assertEqual(found.notes, (self.o.refusal_note("/t", "not UTF-8"),))
+        self.assertIn("REMOTE_TASK_TOKEN_FILE names /t", found.fatal)
+        self.assertIn("not UTF-8", found.fatal)
+        absent = self.o.discover({"REMOTE_TASK_TOKEN": ENV_TOKEN, "REMOTE_TASK_TOKEN_FILE": "/t"},
+                                 read_token_file=lambda p: (None, ""))
+        self.assertEqual(absent.fatal, "", "an absent token file is not a refusal")
 
     def test_a_url_shaped_bearer_is_registered_whole(self):
         registry = self.o.contract.SecretRegistry()
@@ -413,6 +438,12 @@ print(json.dumps({"token": m.TOKEN, "source": m._FOUND.token_source, "url": m.UR
 class RealSinks(unittest.TestCase):
     """The same rows through the real bridge and the real Hatch install diff."""
 
+    def setUp(self):
+        # No reachable user manager unless a case supplies one: Hatch then reads the installer's env.
+        patcher = mock.patch.object(hatch_cli, "_systemd_run", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def bridge(self, fx, script=BRIDGE, timeout=60):
         state = fx.root / "state"
         env = {"PATH": "/usr/bin:/bin", "HOME": str(fx.root), "PYTHONPATH": str(PKG),
@@ -468,6 +499,41 @@ class RealSinks(unittest.TestCase):
                                                       'print(json.dumps({"rotated": m._read_token_file(m.TOKEN_FILE), '))
             self.assertEqual((out["rotated"], out["token"], out["token_file"]), ("", ENV_TOKEN, str(bad)),
                              "the import survives it and a rotation read is no rotation, never an exception")
+
+    def test_a_refused_named_token_file_is_fatal_at_startup(self):
+        script = BRIDGE.replace("print(json.dumps({", "try:\n    m.main()\n    exited = None\n"
+                                "except SystemExit as e:\n    exited = str(e.code)\n"
+                                'print(json.dumps({"exited": exited, ')
+        for how, reason in (("oversize", "over 1048576 bytes"), ("non-utf8", "not UTF-8"),
+                            ("fifo", "not a regular file")):
+            with self.subTest(how=how), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), ROWS[0])
+                self.refuse(fx.token_file, how)
+                fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
+                out, err = self.bridge(fx, script, timeout=20)
+                self.assertEqual(out["token"], ENV_TOKEN)
+                self.assertIn(f"REMOTE_TASK_TOKEN_FILE names {fx.token_file}", out["exited"] or "")
+                self.assertIn(reason, out["exited"])
+                self.assertIn(f"credential file {fx.token_file} was refused ({reason})", err)
+                self.assertNotIn(DEVICE_TOKEN, err + out["exited"], "path and reason, never content")
+
+    def test_a_token_file_refused_at_reload_is_named(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), ROWS[0])
+            fx.token_file.write_text(f"REMOTE_TASK_TOKEN={ENV_TOKEN}\n")
+            fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
+            path = json.dumps(str(fx.token_file))
+            script = BRIDGE.replace("print(json.dumps({", (
+                "import os, pathlib\n"
+                f"p = pathlib.Path({path})\n"
+                f"p.write_bytes(b'REMOTE_TASK_TOKEN=' + {json.dumps(FILE_TOKEN)}.encode() + b'\\xff\\n')\n"
+                "print('--reload--', file=sys.stderr, flush=True)\n"
+                'print(json.dumps({"reloaded": m._reload_rotated_token(), '))
+            out, err = self.bridge(fx, script)
+            self.assertFalse(out["reloaded"])
+            reload_err = err.split("--reload--", 1)[1]
+            self.assertIn(f"credential file {fx.token_file} was refused (not UTF-8)", reload_err)
+            self.assertNotIn(FILE_TOKEN, reload_err, "path and reason, never content")
 
     def test_the_hatch_install_diff_withholds_every_candidate_of_every_row(self):
         for row in ROWS:
@@ -528,6 +594,72 @@ class RealSinks(unittest.TestCase):
                                         "Environment=OTHER=current-file-9821\nExecStart=/x\n")
             self.assertNotIn("legacy-file-7364", shown)
             self.assertNotIn("current-file-9821", shown)
+
+    def test_the_hatch_install_diff_follows_systemd_continuations(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), ROWS[0])
+            shown = self.hatch_diff(fx, "[Service]\n# harmless comment \\\n"
+                                        "Environment=REMOTE_TASK_TOKEN=synth-after-comment-5698\n"
+                                        "Environment=SAFE=C:\\\\\n"
+                                        "Environment=REMOTE_TASK_TOKEN=synth-after-even-slashes-5698\nExecStart=/x\n")
+            self.assertNotIn("synth-after-comment-5698", shown)
+            self.assertNotIn("synth-after-even-slashes-5698", shown)
+
+    def test_the_hatch_install_diff_is_withheld_when_a_credential_file_was_refused(self):
+        for which in ("channel", "token file"):
+            with self.subTest(file=which), tempfile.TemporaryDirectory() as td:
+                fx = Fixture(Path(td), ROWS[1])
+                fx.device.unlink()
+                path = fx.channel if which == "channel" else fx.token_file
+                if which == "token file":
+                    fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
+                self.refuse(path, "oversize")  # holds DEVICE_TOKEN, never read
+                shown = self.hatch_diff(fx, f"[Service]\nEnvironment=NOTE={DEVICE_TOKEN}\nExecStart=/x\n")
+                self.assertNotIn(DEVICE_TOKEN, shown)
+                self.assertIn("diff withheld: ", shown)
+                self.assertIn(f"credential file {path} was refused (over 1048576 bytes)", shown)
+
+    @contextlib.contextmanager
+    def manager(self, manager_env):
+        """A reachable systemd user manager whose show-environment prints `manager_env`."""
+        shown = "".join(f"{k}={v}\n" for k, v in manager_env.items())
+        done = subprocess.CompletedProcess([], 0, stdout=shown, stderr="")
+        with mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"), \
+                mock.patch.object(hatch_cli, "_systemd_run", return_value=done):
+            yield
+
+    def test_hatch_reads_the_service_managers_environment_not_the_installers(self):
+        with tempfile.TemporaryDirectory() as td:
+            fx = Fixture(Path(td), ROWS[1])
+            fx.device.unlink()  # only the channel .env under CLAUDE_CONFIG_DIR carries a token
+            config = fx.env.pop("CLAUDE_CONFIG_DIR")
+            env = {k: v for k, v in os.environ.items() if k not in owner.CREDENTIAL_KEYS + ("CLAUDE_CONFIG_DIR",)}
+            env.update(fx.env, HOME=str(fx.root))
+            for name, installer, manager, source in (
+                    ("manager only", {}, {"CLAUDE_CONFIG_DIR": config}, "file"),
+                    ("installer only", {"CLAUDE_CONFIG_DIR": config}, {"PATH": "/usr/bin"}, "none")):
+                with self.subTest(name), mock.patch.dict(os.environ, dict(env, **installer), clear=True), \
+                        self.manager(manager):
+                    found, registry = hatch_cli._credential_discovery()
+                    self.assertEqual(found.token_source, source, "the unit runs with the manager's environment")
+                    self.assertTrue(registry.contains(f"x {CHANNEL_TOKEN} y"), "either side's candidate is masked")
+                    unit = fx.root / "ag2-sparrow.service"
+                    unit.write_text(f"[Service]\nEnvironment=NOTE={CHANNEL_TOKEN}\nExecStart=/x\n")
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                        hatch_cli._install_file(unit, "[Service]\nExecStart=/y\n", 0o644, refuse_drift=True, force=False)
+                    self.assertIn("DIFF:", out.getvalue())
+                    self.assertNotIn(CHANNEL_TOKEN, out.getvalue())
+
+    def test_a_manager_environment_value_is_unescaped(self):
+        with self.manager({"CLAUDE_CONFIG_DIR": "$'/tmp/a\\tb'", "PLAIN": "x=y"}), \
+                mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": "/dev-env"}, clear=True):
+            self.assertEqual(hatch_cli._service_env(),
+                             {"CLAUDE_CONFIG_DIR": "/tmp/a\tb", "PLAIN": "x=y", "AG2_DEVICE_ENV": "/dev-env"})
+        with mock.patch.object(hatch_cli.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": "/dev-env", "K": "v"}, clear=True):
+            self.assertEqual(hatch_cli._service_env(), {"AG2_DEVICE_ENV": "/dev-env", "K": "v"},
+                             "no reachable manager: the installer's own environment")
 
     def refuse(self, path: Path, how: str) -> None:
         if path.exists():

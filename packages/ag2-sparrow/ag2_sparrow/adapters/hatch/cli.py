@@ -11,6 +11,7 @@ keepalive runs the scheduled task, prints Sparrow's health row, and reports on i
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import difflib
 import hashlib
 import json
@@ -137,16 +138,54 @@ def _read_text(path):
     return read_regular(path)
 
 
+# One install run asks the user manager once: its answer decides both the service and the analysis.
+_MANAGER_PROBE: dict = {}
+
+
+def _manager_env() -> "dict | None":
+    """The systemd user manager's environment, which the installed unit inherits; None when
+    `systemctl --user` cannot answer (then Sparrow runs from the installer's shell, if at all)."""
+    if "env" in _MANAGER_PROBE:
+        return _MANAGER_PROBE["env"]
+    if shutil.which("systemctl") is None:
+        return None
+    r = _systemd_run(["systemctl", "--user", "show-environment"])
+    if not _ok(r):
+        return None
+    env = {}
+    for line in (r.stdout or "").splitlines():
+        key, eq, value = line.partition("=")
+        if not eq:
+            continue
+        if value.startswith("$'") and value.endswith("'") and len(value) >= 3:
+            value = value[2:-1].encode("latin-1", "backslashreplace").decode("unicode_escape")
+        env[key] = value
+    return env
+
+
+def _service_env() -> dict:
+    """The environment the installed Sparrow runs with: the manager's (else the installer's), with
+    the unit's own AG2_DEVICE_ENV over it."""
+    manager = _manager_env()
+    return dict(os.environ if manager is None else manager, AG2_DEVICE_ENV=str(device_env_path()))
+
+
 def _credential_discovery():
-    """(discovery, registry) for the Sparrow this host runs: the environment it is given (the
-    device .env file named) and the files and token file the owner lists; every materialized
-    candidate registered before any precedence choice. No vault: it is the macOS keychain."""
+    """(discovery, registry) for the Sparrow this host runs: the service's environment (the
+    device .env file named) and the files and token file it lists; the installer's environment is
+    read too, into the same registry, so a diff masks what either can see. No vault: it is the
+    macOS keychain. The discovery's `withheld` covers both reads."""
     registry = gateway_credentials.SecretRegistry()
-    env = dict(os.environ, AG2_DEVICE_ENV=str(device_env_path()))
-    found = gateway_credential_sources.discover(
-        env, gateway_credential_sources.env_files(env, _read_text),
-        read_token_file=_read_text, registry=registry)
-    return found, registry
+    found = []
+    for env in (_service_env(), dict(os.environ, AG2_DEVICE_ENV=str(device_env_path()))):
+        found.append(gateway_credential_sources.discover(
+            env, gateway_credential_sources.env_files(env, _read_text),
+            read_token_file=_read_text, registry=registry))
+    service, installer = found
+    if installer.withheld and not service.withheld:
+        service = dataclasses.replace(service, notes=service.notes + installer.notes + (
+            (installer.fatal,) if installer.fatal else ()))
+    return service, registry
 
 
 def credentials_usable() -> bool:
@@ -164,8 +203,8 @@ def _diff(old: str, new: str, path: Path) -> str:
     """The diff of an installed file against ours, with every credential withheld: a unit or .env
     on disk may hold a live, rotated or retired token (gateway_credentials.mask_env_assignments)."""
     found, registry = _credential_discovery()
-    if found.fatal:  # an unread device file's tokens cannot be withheld, so show no lines at all
-        return f"(diff withheld: {found.fatal})\n"
+    if found.withheld:  # an unread file's tokens cannot be masked, so show no lines at all
+        return f"(diff withheld: {found.withheld})\n"
     old, new = (gateway_credentials.mask_env_assignments(t, registry) for t in (old, new))
     return "".join(difflib.unified_diff(old.splitlines(True), new.splitlines(True),
                                         f"{path} (installed)", f"{path} (ag2-sparrow)"))
@@ -404,8 +443,7 @@ def _why(r) -> str:
 
 def systemd_user_available() -> bool:
     """Whether `systemctl --user` reaches a running user manager."""
-    return shutil.which("systemctl") is not None and \
-        _ok(_systemd_run(["systemctl", "--user", "show-environment"]))
+    return _manager_env() is not None
 
 
 def render_service(exec_start: str, env: dict) -> str:
@@ -636,6 +674,17 @@ def service_status(reply_command: str = "") -> "tuple[bool | None, str]":
 
 
 def install(args) -> int:
+    """_install, with the user manager asked at most once; --no-service asks it nothing, since
+    Sparrow then runs from this shell's environment."""
+    _MANAGER_PROBE.clear()
+    try:
+        _MANAGER_PROBE["env"] = None if args.no_service else _manager_env()
+        return _install(args)
+    finally:
+        _MANAGER_PROBE.clear()
+
+
+def _install(args) -> int:
     from . import keepalive
     reply_command = find_reply_command()
     problem = reply_command_problem(reply_command)

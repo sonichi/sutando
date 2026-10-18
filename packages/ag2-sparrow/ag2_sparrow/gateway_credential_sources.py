@@ -5,8 +5,10 @@ knows, a token file, a vault read), and handed in as plain values or a callable;
 nothing itself. SOURCES states the precedence once and discover() walks it. discover() registers
 every materialized candidate before it picks the winners, so a sink can withhold a discarded one,
 every assignment of a credential key included. A credential file that exists but is refused is
-named, never treated as absent in silence; a refused AG2_DEVICE_ENV stops the file and vault
-tiers (Discovery.fatal), so a broken explicit file never hands the choice to another file's token.
+named, never treated as absent in silence. Fail-closed covers the credential tiers only: a refused
+AG2_DEVICE_ENV stops the file and vault token tiers and a refused REMOTE_TASK_TOKEN_FILE stops
+rotation (Discovery.fatal either way), while general config such as REMOTE_PROACTIVE_ROOM still
+falls through to the later files.
 Parsing and masking are the pure contract in gateway_credentials (generated from
 shared/ag2_gateway_credentials.py). Stdlib only; vendored byte-identical into the ag2-sparrow
 package by tools/sync_from_src.py.
@@ -89,7 +91,7 @@ def refusal_note(path: str, reason: str) -> str:
 class EnvFiles(list):
     """env_files' result: the readable files as (path, values), plus every credential-key value
     each one assigns (a repeated key every time), the refused (path, reason) pairs, and `blocked`,
-    the message that stops the file tier when the explicitly named AG2_DEVICE_ENV was refused."""
+    the message that stops the token tiers when the explicitly named AG2_DEVICE_ENV was refused."""
     credential_values: "tuple[str, ...]" = ()
     refused: "tuple[tuple[str, str], ...]" = ()
     blocked: str = ""
@@ -97,8 +99,9 @@ class EnvFiles(list):
 
 def env_files(env: Mapping[str, str], read_text: "Callable[[str], object]") -> EnvFiles:
     """The channel .env files a Sparrow given `env` reads, in order, through the caller's
-    `read_text` (see _read_result). An absent file is skipped; a refused one is recorded, and a
-    refused AG2_DEVICE_ENV ends the walk. The bridge and the Hatch adapter both call this."""
+    `read_text` (see _read_result). An absent file is skipped; a refused one is recorded and
+    skipped, a refused AG2_DEVICE_ENV also setting `blocked`, which discover() applies to the
+    credential tiers only: later files still supply config. The bridge and Hatch both call this."""
     out, values, refused = EnvFiles(), [], []
     device = env.get("AG2_DEVICE_ENV") or ""
     for path in channel_env_paths(env, channel_dir(env)):
@@ -112,7 +115,6 @@ def env_files(env: Mapping[str, str], read_text: "Callable[[str], object]") -> E
             if path == device:
                 out.blocked = (f"AG2_DEVICE_ENV names {path}, which was refused ({reason}); not falling "
                                "back to another credential source. Fix that file or unset AG2_DEVICE_ENV")
-                break
     out.credential_values, out.refused = tuple(values), tuple(refused)
     return out
 
@@ -247,6 +249,12 @@ class Discovery:
     notes: "tuple[str, ...]" = ()
     fatal: str = ""
 
+    @property
+    def withheld(self) -> str:
+        """Why a sink must print no credential-bearing file content, or "": a fatal discovery, or
+        any refused file, whose secrets the registry could not hold."""
+        return "; ".join(x for x in (self.fatal, *self.notes) if x)
+
 
 def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
              read_token_file: "Optional[Callable[[str], str]]" = None,
@@ -261,9 +269,14 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
                                           if (token_file_env and read_token_file) else ("", ""))
     token_file_text = token_file_text or ""
     notes = [refusal_note(p, r) for p, r in getattr(files, "refused", ())]
+    blocked = getattr(files, "blocked", "")
+    fatal = [blocked] if blocked else []
     if token_file_reason:
         notes.append(refusal_note(token_file_env, token_file_reason))
-    blocked = getattr(files, "blocked", "")
+        # A refused named token file would silently disable rotation: after a 401 nothing could recover.
+        fatal.append(f"REMOTE_TASK_TOKEN_FILE names {token_file_env}, which was refused "
+                     f"({token_file_reason}); token rotation cannot read it. Fix that file or unset "
+                     "REMOTE_TASK_TOKEN_FILE")
     if registry is not None:
         register(registry, [unquote(env.get(key) or "") for key in CREDENTIAL_KEYS])
         register(registry, [values.get(key) or "" for _p, values in files for key in CREDENTIAL_KEYS])
@@ -313,4 +326,4 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
                      source_file=source_file, source_file_values=dict(source_vals), media_token=media,
                      deprecated=tuple((old, new) for old, new in LEGACY_ALIASES.items()
                                       if env.get(old) and not env.get(new)),
-                     notes=tuple(notes), fatal=blocked)
+                     notes=tuple(notes), fatal="; ".join(fatal))
