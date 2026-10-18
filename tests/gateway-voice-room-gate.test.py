@@ -345,7 +345,8 @@ class DrainRoomGateTests(_LoaderFixture):
         self.assertEqual(self._names(), [tagged.name], "not claimed: no .sending, nothing archived")
         failed = [line for line in self.logs if f"proactive {tagged.name} held: room gate failed" in line]
         self.assertEqual(len(failed), 1, self.logs)
-        self.assertIn("verifier down", failed[0])
+        self.assertIn("room gate failed (RuntimeError at ", failed[0])
+        self.assertNotIn("verifier down", failed[0], "the exception's text never reaches the log")
 
     def test_gate_raising_after_the_claim_hands_the_result_back(self):
         tagged = self._result("proactive-result-task-24-24.to-ag2space.txt", f"[channel: {OK_ROOM}]\nroom body")

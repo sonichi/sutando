@@ -22,7 +22,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Callable
 
-from . import file_lock, task_io
+from . import diagnostics, file_lock, task_io
 
 INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 
@@ -87,6 +87,7 @@ def scrub_exception(exc: BaseException, gateway_url: str) -> BaseException:
             "__repr__": lambda self: f"{base.__name__}({self.__dict__.get('_scrubbed', '')!r})",
             "__context__": property(lambda self: None, lambda self, value: None),
             "__module__": base.__module__, "__qualname__": base.__qualname__})
+        diagnostics.SCRUBBED_TYPES.add(safe)
     code = exc.__dict__.get("code")
     text = f"{base.__name__} contacting {redact_url(gateway_url)}"
     if isinstance(code, int):
@@ -121,7 +122,7 @@ def install_scrubbing_excepthooks(get_url: Callable[[], str]) -> None:
     redact_text, never a raw traceback (a path and a line number cannot carry the URL)."""
     def report(exc_type, exc, tb, where: str) -> None:
         try:
-            text = redact_text(str(exc), get_url() or "")
+            text = diagnostics.scrub(redact_text(str(exc), get_url() or ""))
         except Exception:  # noqa: BLE001 - a hook must report something, never the raw text
             text = REDACTED_TEXT
         at = ""
@@ -148,18 +149,6 @@ def install_scrubbing_excepthooks(get_url: Callable[[], str]) -> None:
 
 
 REDACTED_TEXT = "<text withheld: it may contain the gateway URL>"
-
-
-def _forms(secret: str) -> "set[str]":
-    """The ways a URL part can be rendered in diagnostic text: raw, escaped as repr and
-    unicode_escape render it, and percent-encoded or -decoded."""
-    out = set()
-    for s in {secret, urllib.parse.unquote(secret), urllib.parse.unquote_plus(secret)}:
-        out |= {s, repr(s)[1:-1], s.encode("unicode_escape").decode("ascii"),
-                ascii(s)[1:-1], s.encode("ascii", "backslashreplace").decode("ascii"),
-                urllib.parse.quote(s, safe=""), urllib.parse.quote(s, safe="/=&?#:@"),
-                urllib.parse.quote_plus(s, safe=""), urllib.parse.quote_plus(s, safe="/=&?#:@")}
-    return {f for f in out if f}
 
 
 def _split_by_hand(url: str) -> "tuple[str, str, str]":
@@ -195,6 +184,17 @@ def _secret_parts(url: str) -> "list[str]":
     return [p for p in dict.fromkeys(parts) if p not in ("=", "?", "&", ";", "#", "@", ":@")]
 
 
+def register_gateway_secrets(url: str) -> None:
+    """Add every credential part of the gateway URL to the process's secret registry: each
+    delimited part, and the bare userinfo, password and query values long enough to match alone."""
+    for part in _secret_parts(str(url or "")):
+        diagnostics.register_secret(part, delimited=True)
+    userinfo, query, fragment = _split_by_hand(str(url or ""))
+    for value in (userinfo, userinfo.partition(":")[2], fragment,
+                  *(pair.partition("=")[2] for pair in re.split(r"[&;]", query))):
+        diagnostics.register_secret(value)
+
+
 def redact_text(text: str, gateway_url: str) -> str:
     """Diagnostic text safe to log or persist: the full gateway URL replaced by its redacted
     form. Fails closed: REDACTED_TEXT when any credential-bearing part of the URL (userinfo,
@@ -202,18 +202,13 @@ def redact_text(text: str, gateway_url: str) -> str:
     text, url = str(text), str(gateway_url or "")
     if not url:
         return text
-    for form in sorted(_forms(url), key=len, reverse=True):
+    for form in sorted(diagnostics.forms(url), key=len, reverse=True):
         text = text.replace(form, redact_url(url))
-    views = {_hex_upper(v) for v in (text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text))}
+    views = {diagnostics.hex_upper(v) for v in (text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text))}
     for part in _secret_parts(url):
-        if any(_hex_upper(form) in view for form in _forms(part) for view in views):
+        if any(diagnostics.hex_upper(form) in view for form in diagnostics.forms(part) for view in views):
             return REDACTED_TEXT
     return text
-
-
-def _hex_upper(text: str) -> str:
-    """Percent escapes in one case: their hex digits are case-insensitive."""
-    return re.sub(r"%[0-9A-Fa-f]{2}", lambda m: m.group().upper(), text)
 
 
 KEY_GRACE_S = 5.0

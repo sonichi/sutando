@@ -1276,7 +1276,7 @@ def _defers_to_archive(path: Path) -> bool:
         note = ("its archived decision stands" if outcome is not None else
                 "its archived decision is not a recognised outcome; left for the owner")
     except Exception as exc:  # noqa: BLE001 — one record's fault must never stop the beat
-        note = f"archive reconcile failed ({exc}); left for the owner"
+        note = f"archive reconcile failed ({diagnostics.describe(exc)}); left for the owner"
         failures = _RECONCILE_FAILURES[str(path)] = _RECONCILE_FAILURES.get(str(path), 0) + 1
         if failures == _RECONCILE_GIVE_UP_AFTER:
             _log(f"withheld review {path.stem}: archive reconcile failed {failures} times; "
@@ -1758,6 +1758,9 @@ if not _RAW:
 _URL_FROM_TOKEN, TOKEN = _parse_onboarding_token(_RAW)
 URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
+# Every credential this process holds is withheld from logs and status in any rendering.
+gateway_instance.register_gateway_secrets(URL)
+diagnostics.register_secret(TOKEN)
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 ON_TASK_CMD = os.environ.get("REMOTE_TASK_ON_TASK") or ""
@@ -1826,13 +1829,14 @@ def _load_routing() -> None:
     except (OSError, ValueError):
         return
     # another agent's reading, or this agent's reading from another gateway, authorizes nothing
-    if isinstance(d, dict) and d.get("identity") == current[0] and d.get("binding") and hmac.compare_digest(
-            str(d["binding"]).encode("utf-8"),
-            gateway_instance.binding_digest(current[0], URL).encode("utf-8")):
-        disk = str(d.get("owner_dm") or "")
-        if not _ROUTING["owner_dm"] or _ROUTING["owner_dm"] == _ROUTING["persisted"]:
-            _ROUTING["owner_dm"] = disk
-        _ROUTING["persisted"] = disk
+    bound = isinstance(d, dict) and d.get("identity") == current[0] and bool(d.get("binding")) \
+        and hmac.compare_digest(str(d["binding"]).encode("utf-8"),
+                                gateway_instance.binding_digest(current[0], URL).encode("utf-8"))
+    disk = str(d.get("owner_dm") or "") if bound else ""
+    # A reading that came from disk follows the disk; one the writer has not committed yet stays.
+    if not _ROUTING["owner_dm"] or _ROUTING["owner_dm"] == _ROUTING["persisted"]:
+        _ROUTING["owner_dm"] = disk
+    _ROUTING["persisted"] = disk
 
 
 def refresh_routing(force: bool = False) -> None:
@@ -2486,6 +2490,7 @@ def _strip_room_ops_meta(body: str) -> "tuple[str, bool]":
     # pure injection with no legitimate task text, so it must degrade to an empty
     return (cleaned.strip(), stripped)
 HS_MEDIA_TOKEN = os.environ.get("REMOTE_MEDIA_HS_TOKEN") or ""
+diagnostics.register_secret(HS_MEDIA_TOKEN)
 # The homeserver token is attached ONLY to media URLs on this exact origin
 # (scheme+host+port). Without it configured, Matrix media URLs are never
 HS_MEDIA_ORIGIN = (os.environ.get("REMOTE_MEDIA_HS_ORIGIN") or "").rstrip("/")
@@ -2578,7 +2583,7 @@ sys.stderr = _NeverFatalStream(sys.stderr)
 
 
 def _log(msg: str) -> None:
-    safe = gateway_instance.redact_text(msg, globals().get("URL") or "")
+    safe = diagnostics.scrub(gateway_instance.redact_text(msg, globals().get("URL") or ""))
     line = f"[remote-gateway-bridge] {safe}"
     print(line, flush=True)
     _append_log_file(line)
@@ -2722,6 +2727,7 @@ def _reload_rotated_token() -> bool:
     # Route through the SAME parse used at import time (_parse_onboarding_token)
     # so a rotation written in the URL-encoded form (https://gw/relay%7C<secret>,
     url_from_token, secret = _parse_onboarding_token(raw)
+    diagnostics.register_secret(secret)  # read from a file: a credential whatever happens next
     # The URL guard must cover BOTH layouts: the combined url|secret form
     # (url_from_token) AND the split form (bare secret + a separate
     file_url = (url_from_token or _read_token_file_url(TOKEN_FILE)).rstrip("/")
@@ -3248,7 +3254,7 @@ def _health_snapshot() -> "dict | None":
             import health_snapshot
             value = health_snapshot.snapshot(_STATE.parent)
     except Exception as e:  # noqa: BLE001 — health is optional; it never breaks a push
-        error = f"{type(e).__name__}: {e}"
+        error = diagnostics.describe(e)
     if error and error != _health_cache["error"]:
         _log(f"health snapshot unavailable: {error}")
     _health_cache.update(at=time.monotonic(), value=value, error=error)
@@ -3460,7 +3466,7 @@ def _maybe_pull_worker_labels(record) -> bool:
         _log(f"worker-label apply failed, retrying in 5m: {diagnostics.describe(e)}")
         return False
     if isinstance(result, dict) and result.get("changed"):
-        _log(f"worker labels applied from owner profile config v{version}")
+        _log(f"worker labels applied from owner profile config v{int(version)}")
     return True
 
 
@@ -5265,7 +5271,7 @@ def _room_bound_result(name: str, room: "str | None") -> bool:
 def _gate_failed(name: str, exc: Exception) -> None:
     if name not in _GATE_FAILED_LOGGED:
         _GATE_FAILED_LOGGED.add(name)
-        _log(f"proactive {name} held: room gate failed ({exc}) — a room-bound "
+        _log(f"proactive {name} held: room gate failed ({diagnostics.describe(exc)}) — a room-bound "
              "result is never delivered unchecked")
 
 # Bodies above this never fit a Matrix event, so they are undeliverable no
@@ -5579,7 +5585,7 @@ def _post_proactive() -> None:
                 outcome = _resolve_send_failure(
                     claim, f, _UnconfirmedDelivery("no event_id in response"))
                 _log(f"proactive send for {f.name} got no delivery signal "
-                     f"(response {str(resp)[:120]!r}) — {outcome}; check "
+                     f"(a {type(resp).__name__} answer with no event_id) — {outcome}; check "
                      "REMOTE_PROACTIVE_ROOM and the agent's room membership")
                 continue
         except urllib.error.HTTPError as e:

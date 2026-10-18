@@ -8,27 +8,83 @@ flow; it never hands them to a sink. Stdlib only.
 from __future__ import annotations
 
 import errno as _errno
+import math
 import os
 import re
 import socket
+import threading
 import urllib.parse
 from typing import Any, Callable
 
 WITHHELD = "<withheld>"
+WITHHELD_TEXT = "<text withheld: it may contain a credential>"
 _CODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+BARE_SECRET_MIN = 8  # a bare secret shorter than this would withhold ordinary words
+_SECRETS: "dict[str, frozenset[str]]" = {}  # the process's secrets -> every rendering of each
+_SECRETS_LOCK = threading.Lock()
+SCRUBBED_TYPES: "set[type]" = set()  # exception classes gateway_instance.scrub_exception made
+
+
+def hex_upper(text: str) -> str:
+    """Percent escapes in one case: their hex digits are case-insensitive."""
+    return re.sub(r"%[0-9A-Fa-f]{2}", lambda m: m.group().upper(), text)
+
+
+def forms(secret: str) -> "set[str]":
+    """The ways a secret can be rendered in diagnostic text: raw, escaped as repr and
+    unicode_escape render it, and percent-encoded or -decoded."""
+    out = set()
+    for s in {secret, urllib.parse.unquote(secret), urllib.parse.unquote_plus(secret)}:
+        out |= {s, repr(s)[1:-1], s.encode("unicode_escape").decode("ascii"),
+                ascii(s)[1:-1], s.encode("ascii", "backslashreplace").decode("ascii"),
+                urllib.parse.quote(s, safe=""), urllib.parse.quote(s, safe="/=&?#:@"),
+                urllib.parse.quote_plus(s, safe=""), urllib.parse.quote_plus(s, safe="/=&?#:@")}
+    return {f for f in out if f}
+
+
+def register_secret(value: Any, delimited: bool = False) -> None:
+    """Add a secret of this process (the bearer token, a token read from a file, a credential part
+    of the gateway URL). A bare one shorter than BARE_SECRET_MIN is not matched on its own; a
+    delimited URL part (`=value`, `user:pw@`) is, whatever its length."""
+    if not isinstance(value, str) or not value or (not delimited and len(value) < BARE_SECRET_MIN):
+        return
+    rendered = frozenset(hex_upper(f) for f in forms(value))
+    with _SECRETS_LOCK:
+        _SECRETS[value] = rendered
+
+
+def _views(text: str) -> "set[str]":
+    return {hex_upper(v) for v in (text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text))}
+
+
+def contains_secret(text: str) -> bool:
+    """Whether any registered secret survives in `text`, in any rendering."""
+    with _SECRETS_LOCK:
+        rendered = list(_SECRETS.values())
+    views = _views(str(text))
+    return any(f in v for fs in rendered for f in fs for v in views)
+
+
+def scrub(text: str) -> str:
+    """`text`, or WITHHELD_TEXT when a registered secret survives in it."""
+    return WITHHELD_TEXT if contains_secret(text) else str(text)
 
 
 def code_field(value: Any, gateway_url: str = "") -> "str | None":
     """A gateway-supplied value usable as a structured field (an error name, an approval code):
-    a short token of letters, digits and `_.-` that occurs in no form of the gateway URL. None
-    otherwise, so free text, and anything that may be a piece of the URL's credentials, never
-    reaches a sink."""
+    a short token of letters, digits and `_.-` that occurs in no form of the gateway URL, holds
+    no registered secret and is no piece of one. None otherwise, so free text, a credential of
+    the URL and an echoed bearer token never reach a sink."""
     if not isinstance(value, str) or not _CODE_RE.fullmatch(value):
         return None
     url = str(gateway_url or "")
-    forms = {url, urllib.parse.unquote(url), urllib.parse.unquote(urllib.parse.unquote(url))}
-    if any(value.lower() in form.lower() for form in forms if form):
+    url_forms = {url, urllib.parse.unquote(url), urllib.parse.unquote(urllib.parse.unquote(url))}
+    if any(value.lower() in form.lower() for form in url_forms if form):
         return None
+    with _SECRETS_LOCK:
+        secrets = [f for fs in _SECRETS.values() for f in fs]
+    if contains_secret(value) or any(hex_upper(value).lower() in f.lower() for f in secrets):
+        return None  # a secret, or an echoed piece of one
     return value
 
 
@@ -66,9 +122,9 @@ def describe(exc: BaseException) -> str:
     if isinstance(exc, KeyError) and len(exc.args) == 1 and isinstance(exc.args[0], str) and tb is not None \
             and exc.args[0] in tb.tb_frame.f_code.co_consts:
         out += f"[{exc.args[0]!r}]"
-    gateway = fields.get("_gateway")
+    gateway = fields.get("_gateway") if type(exc) in SCRUBBED_TYPES else None
     if isinstance(gateway, str):
-        out += f" contacting {gateway}"
+        out += f" contacting {scrub(gateway)}"
     status = fields.get("code")
     if isinstance(status, int) and not isinstance(status, bool):
         out += f" (HTTP {status})"
@@ -78,12 +134,15 @@ def describe(exc: BaseException) -> str:
 
 
 def safe_status(value: Any, net: Callable[[str], str]) -> Any:
-    """`value` with every string, at any depth, passed through `net` (the URL redactor); keys
-    too. Numbers, booleans and None pass. Anything else is withheld, never str()-ed."""
-    if value is None or isinstance(value, (bool, int, float)):
+    """`value` with every string, at any depth, passed through `net` (the URL redactor) and then
+    the secret registry; keys too. Finite numbers, booleans and None pass. Anything else is
+    withheld, never str()-ed."""
+    if value is None or isinstance(value, (bool, int)):
         return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else WITHHELD
     if isinstance(value, str):
-        return net(value)
+        return scrub(net(value))
     if isinstance(value, dict):
         return {safe_status(k, net) if isinstance(k, str) else WITHHELD: safe_status(v, net)
                 for k, v in value.items()}

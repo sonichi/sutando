@@ -70,33 +70,34 @@ def bind(state, room, instance="", identity=AGENT, gateway=GW, status_agent=AGEN
                                                             create=True) or None}))
 
 
-# Modules holding the gateway URL or gateway data; the vendored core modules touch only local
-# files and are canonical in src/, so they are outside this contract.
+# Modules holding the gateway URL or gateway data. The vendored core modules and the Hatch install
+# CLI handle only local files and config, so they are outside this contract.
 SINK_CONTRACT_MODULES = ("remote_gateway_bridge.py", "event_channel.py", "human_action.py",
                          "event_consumer.py", "default_observer.py", "routing_migrations.py",
                          "gateway_instance.py", "setup_fetch.py", "diagnostics.py",
-                         "adapters/hatch/keepalive.py", "adapters/hatch/runtime_text.py",
-                         "adapters/hatch/cli.py")
+                         "adapters/hatch/keepalive.py", "adapters/hatch/runtime_text.py")
 SINK_CALLS = {"_log", "log", "_log_backoff", "_held", "print", "_emit_gateway_status",
               "_set", "warning", "error", "info", "debug", "exception"}
 STREAM_WRITES = {"sys.stderr.write", "sys.stdout.write"}
 SAFE_ATTRS = {"code", "errno", "status", "__name__"}
 # Calls whose result is structured (a type, a length, a predicate), never the value's text.
-SAFE_CALLS = {"diagnostics.describe", "type", "len", "isinstance", "undelivered_quarantine.no_primitive"}
+SAFE_CALLS = {"diagnostics.describe", "diagnostics.code_field", "type", "len", "isinstance", "int",
+              "undelivered_quarantine.no_primitive"}
+
+
+TEXT_CALLS = {"str", "repr", "format", "join", "ascii", "strip", "lower", "upper", "replace", "decode",
+              "splitlines", "rstrip", "lstrip"}
 
 
 def sink_violations(source):
     """(line, name) for every exception object or response body that reaches a sink call other
-    than through diagnostics.describe(), type(...), or a structured attribute (.code, .errno)."""
+    than through diagnostics.describe(), type(...), or a structured attribute (.code, .errno).
+    Follows it through local text assignments (`msg = f"{e}"`, an aliased body) and one hop into
+    a same-module helper's parameter. Flow by line order: a later clean assignment ends it."""
     import ast
     tree = ast.parse(source)
     parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
-    bodies = set()
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call):
-            u = ast.unparse(n.value)
-            if "_http_error_body(" in u or ".read(" in u:
-                bodies |= {t.id for t in n.targets if isinstance(t, ast.Name)}
+    funcs = {f.name: f for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
     def handler_names(node):
         names = set()
@@ -105,6 +106,13 @@ def sink_violations(source):
             if isinstance(node, ast.ExceptHandler) and node.name:
                 names.add(node.name)
         return names
+
+    def enclosing(node):
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return node
+        return None
 
     def allowed(name_node, stop):
         node = name_node
@@ -117,6 +125,64 @@ def sink_violations(source):
             node = up
         return False
 
+    def carries_text(name_node, stop):
+        """The name's text flows into the expression: no call on the way but a text one."""
+        node = name_node
+        while node is not stop:
+            up = parents[node]
+            if isinstance(up, ast.Call) and node is not up.func:
+                callee = up.func.attr if isinstance(up.func, ast.Attribute) else getattr(up.func, "id", "")
+                if callee not in TEXT_CALLS:
+                    return False
+            if isinstance(up, ast.Attribute) and up.attr in SAFE_ATTRS:
+                return False
+            node = up
+        return True
+
+    events = {}  # function -> name -> [(line, tainted)], a later entry overriding an earlier one
+
+    def is_tainted(name_node):
+        if name_node.id in handler_names(name_node):
+            return True
+        marks = [t for line, t in events.get(enclosing(name_node), {}).get(name_node.id, ())
+                 if line < name_node.lineno or line == -1]
+        return bool(marks) and marks[-1]
+
+    def mark(fn, name, line, tainted):
+        seq = events.setdefault(fn, {}).setdefault(name, [])
+        if (line, tainted) not in seq:
+            seq.append((line, tainted))
+            seq.sort(key=lambda m: m[0])
+
+    for fn in funcs.values():  # a parameter declared as an exception
+        for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs:
+            if a.annotation is not None and ast.unparse(a.annotation) in ("Exception", "BaseException", "OSError"):
+                mark(fn, a.arg, -1, True)
+    for _ in range(4):  # to a fixpoint
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Assign):
+                body = any(isinstance(c, ast.Call) and (getattr(c.func, "attr", "") == "read"
+                                                        or getattr(c.func, "id", "") in ("_http_error_body", "_req"))
+                           for c in ast.walk(n.value))
+                text = any(isinstance(m, ast.Name) and is_tainted(m) and carries_text(m, n.value)
+                           for m in ast.walk(n.value))
+                for t in n.targets:
+                    if isinstance(t, ast.Name):
+                        mark(enclosing(n), t.id, n.lineno, body or text)
+            elif isinstance(n, ast.Call):
+                callee = n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", "")
+                fn = funcs.get(callee)
+                if fn is None or callee in SINK_CALLS:  # a sink's own body is checked at its call sites
+                    continue
+                params = [a.arg for a in fn.args.posonlyargs + fn.args.args]
+                if params[:1] == ["self"] and isinstance(n.func, ast.Attribute):
+                    params = params[1:]
+                passed = list(zip(params, n.args)) + [(k.arg, k.value) for k in n.keywords if k.arg]
+                for param, arg in passed:
+                    if any(isinstance(m, ast.Name) and is_tainted(m) and carries_text(m, arg)
+                           for m in ast.walk(arg)):
+                        mark(fn, param, -1, True)
+
     out = []
     for call in ast.walk(tree):
         if not isinstance(call, ast.Call):
@@ -125,12 +191,10 @@ def sink_violations(source):
         name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
         if name not in SINK_CALLS and ast.unparse(f) not in STREAM_WRITES:
             continue
-        watched = handler_names(call) | bodies
         for arg in list(call.args) + [k.value for k in call.keywords]:
-            for n in ast.walk(arg):
-                if isinstance(n, ast.Name) and n.id in watched and not allowed(n, arg):
-                    out.append((n.lineno, n.id))
-    return out
+            out += [(n.lineno, n.id) for n in ast.walk(arg)
+                    if isinstance(n, ast.Name) and is_tainted(n) and not allowed(n, arg)]
+    return sorted(set(out))
 
 
 URL_PRIMITIVES = {("urllib.request", "urlopen"), ("urllib.request", "Request"),
@@ -399,6 +463,22 @@ print(json.dumps(seen))
         self.assertNotIn("tenant", (self.state / "owner-routing.json").read_text())
         self.assertEqual([row["dm"] for row in out], ["!dm:ag2.space"] * 3,
                          "the reading comes from the disk record whatever the migration reported")
+
+    def test_a_foreign_record_after_valid_ones_clears_the_reading(self):
+        out = self.bridge("""
+import json
+from ag2_sparrow import remote_gateway_bridge as m
+seen = []
+for dm, identity in (("!a:ag2.space", m._reenroll_identity()), ("!b:ag2.space", m._reenroll_identity()),
+                     ("!c:ag2.space", "@someone-else:ag2.space")):
+    record = m._routing_record(identity, m.URL, dm)
+    m._routing_file().write_text(json.dumps(record))
+    m._load_routing()
+    seen.append([m._ROUTING["owner_dm"], m._ROUTING["persisted"]])
+print(json.dumps(seen))
+""", AGENT_MXID=AGENT)
+        self.assertEqual(out, [["!a:ag2.space"] * 2, ["!b:ag2.space"] * 2, ["", ""]],
+                         "valid A, then valid B, then a foreign record clears the reading")
 
     def test_a_young_legacy_temp_is_swept_once_it_ages_past_the_bound(self):
         temp = self.state / ".owner-routing.json.7.tmp"
@@ -737,10 +817,30 @@ raise RuntimeError("fatal enrollment=SECRET%0aBAD")
             "try:\n    x()\nexcept Exception as e:\n    _set(error=f'x {e!r}')\n": [(4, "e")],
             "try:\n    x()\nexcept Exception as e:\n    sys.stderr.write(str(e))\n": [(4, "e")],
             "data = r.read()\nf.write(data)\n_log(f'{len(data)} bytes')\n": [],
+            # The two shapes that slipped past the direct check: an assigned note, a helper's parameter.
+            "def f():\n    try:\n        x()\n    except Exception as exc:\n        note = f'failed ({exc})'\n"
+            "    _log(f'left: {note}')\n": [(6, "note")],
+            "def gate_failed(name, exc: Exception):\n    _log(f'held: gate failed ({exc})')\n": [(2, "exc")],
+            "def held(name, err):\n    _log(f'held: {err}')\n"
+            "try:\n    x()\nexcept Exception as e:\n    held('n', e)\n": [(2, "err")],
+            "def f():\n    try:\n        x()\n    except Exception as exc:\n"
+            "        note = f'failed ({diagnostics.describe(exc)})'\n    _log(note)\n": [],
             "try:\n    x()\nexcept Exception as e:\n    _log(f'{diagnostics.describe(e)} {type(e).__name__} {e.code}')\n": [],
         }
         for source, want in cases.items():
             self.assertEqual(sink_violations(source), want, source)
+
+    def test_the_sink_guard_catches_the_two_sites_that_slipped_past_the_direct_check(self):
+        # Both escaped a check of sink arguments alone: one through an assigned note, one through a
+        # helper's parameter. Reverting either to its old form must fail the guard.
+        src = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text(encoding="utf-8")
+        for new, old, name in (
+                ('note = f"archive reconcile failed ({diagnostics.describe(exc)}); left for the owner"',
+                 'note = f"archive reconcile failed ({exc}); left for the owner"', "note"),
+                ('room gate failed ({diagnostics.describe(exc)})', 'room gate failed ({exc})', "exc")):
+            self.assertEqual(src.count(new), 1, new)
+            bad = sink_violations(src.replace(new, old))
+            self.assertEqual([n for _, n in bad], [name], old)
 
     def test_the_status_file_is_written_only_through_safe_status(self):
         import ast
@@ -799,6 +899,23 @@ print(json.dumps({"files": files, "status": json.load(open(m.GATEWAY_STATUS_FILE
             self.assertNotIn(secret, everything, secret)
             self.assertNotIn(secret.lower(), everything.lower(), secret)
         self.assertIn("reenroll: claim refused HTTP 403", everything)
+
+    def test_an_echoed_bearer_token_reaches_no_sink_in_either_reenroll_branch(self):
+        token = "fake-relay-token-0123456789abcdef"
+        forms = [token, token.upper(), "fake%2Drelay%2Dtoken%2D0123456789abcdef", "0123456789abcdef",
+                 "relay-token-01234"]
+        r = subprocess.run([sys.executable, "-c", PRELUDE + self.REENROLL], capture_output=True, text=True,
+                           cwd=str(self.home), timeout=60,
+                           env=self.bridge_env(AGENT_MXID=AGENT, FORMS=json.dumps(forms)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        block = out["status"].get("reenroll") or {}
+        self.assertIsNone(block.get("approval_code"), "an echoed bearer is never an approval code")
+        self.assertIsNone(block.get("refused_error"), "nor a kept error name")
+        self.assertNotIn("RELINK CODE", r.stdout)
+        everything = "\n".join([r.stdout.rsplit("\n", 2)[0], r.stderr, *out["files"].values()])
+        for secret in ("relay-token", "0123456789abcdef", "RELAY-TOKEN", "relay%2Dtoken"):
+            self.assertNotIn(secret, everything, secret)
 
     def test_a_safe_error_name_and_approval_code_still_reach_the_status(self):
         r = subprocess.run([sys.executable, "-c", PRELUDE + self.REENROLL], capture_output=True, text=True,
@@ -1399,6 +1516,27 @@ class Diagnostics(unittest.TestCase):
         closed = gateway_instance.REDACTED_TEXT
         self.assertEqual(out, {"error": closed, "events": {"error": ["ok", closed], "n": 3},
                                closed: True, "obj": self.d.WITHHELD, "t": ["a"], "none": None})
+
+    def test_the_secret_registry_withholds_every_rendering_and_echoed_pieces(self):
+        token = "Bearer-SeCrEt/t0ken+value"
+        self.d.register_secret(token)
+        self.d.register_secret("short")  # a bare secret this short is not matched on its own
+        for text in (token, f"x {token} y", "Bearer-SeCrEt%2Ft0ken%2Bvalue", "Bearer-SeCrEt%2ft0ken%2bvalue",
+                     repr(token), "Bearer-SeCrEt%252Ft0ken%252Bvalue"):
+            self.assertEqual(self.d.scrub(text), self.d.WITHHELD_TEXT, text)
+        self.assertEqual(self.d.scrub("a short word"), "a short word")
+        for echoed in (token, "t0ken", "SeCrEt"):
+            self.assertIsNone(self.d.code_field(echoed), echoed)
+        self.assertEqual(self.d.code_field("reenroll_disabled"), "reenroll_disabled")
+
+    def test_describe_trusts_a_gateway_only_on_a_scrubbed_exception(self):
+        forged = ValueError("x")
+        forged._gateway = "https://user:SECRET@gw.example/relay"
+        self.assertEqual(self.d.describe(forged), "ValueError")
+
+    def test_safe_status_withholds_non_finite_numbers(self):
+        out = self.d.safe_status({"a": float("nan"), "b": float("inf"), "c": 1.5}, lambda t: t)
+        self.assertEqual(out, {"a": self.d.WITHHELD, "b": self.d.WITHHELD, "c": 1.5})
 
     def test_code_field_admits_only_a_token_absent_from_the_url(self):
         url = GW + "?token=Se%2fCR%2FeT"
