@@ -208,6 +208,8 @@ def load_config(shape: Shape) -> "tuple[dict, str]":
     missing = [k for k in shape.required_keys + ("ROOT",) if not cfg.get(k)]
     if missing:
         return {}, f"{path} lacks {', '.join(missing)}; run {shape.command} install"
+    if not os.path.isabs(cfg["ROOT"]):
+        return {}, f"{path} names a relative ROOT {cfg['ROOT']!r}; run {shape.command} install"
     return cfg, ""
 
 
@@ -218,14 +220,25 @@ def work_root(cfg: dict) -> str:
 
 def canonical_root(work: str, inbox: str) -> "tuple[str, str]":
     """(root, '') from --work, else from the inbox whose LEXICAL basename must be `tasks`: its lexical
-    parent, canonicalized once here and persisted, is what the session locks even when `tasks` is a
-    symlink; else ('', why)."""
+    parent, canonicalized once here and persisted, is what the session locks; a `tasks` that is itself
+    a symlink is refused; else ('', why)."""
     if work:
-        return str(Path(work).expanduser().resolve()), ""
+        root = str(Path(work).expanduser().resolve())
+        return root, tasks_link_problem(root)
     path = Path(os.path.normpath(os.path.expanduser(inbox)))
     if path.name != "tasks":
         return "", f"the inbox must be <work>/tasks, not {path}; pass --work <dir>"
-    return str(path.parent.resolve()), ""
+    if path.is_symlink():
+        return "", f"{path} is a symlink; tasks must be a real directory under the work root (point --work at it)"
+    root = str(path.parent.resolve())
+    return root, tasks_link_problem(root)
+
+
+def tasks_link_problem(root: str) -> str:
+    """'' unless `tasks` under the root is a symlink: the session would list the link's target while
+    the lock sits on this root, two locks for one inbox."""
+    tasks = os.path.join(root, "tasks")
+    return f"{tasks} is a symlink; tasks must be a real directory under the work root" if os.path.islink(tasks) else ""
 
 
 def _write(path: Path, text: str, mode: int) -> None:
@@ -277,8 +290,6 @@ def owned_config(shape: Shape) -> "tuple[dict | None, str]":
     if problem:
         return None, f"{problem.split('; run ')[0]}; fix or remove it by hand (rm {shlex.quote(str(conf))}), then run " \
                      f"{shape.command} install"
-    if not os.path.isabs(cfg["ROOT"]):
-        return None, f"{conf} names a relative ROOT {cfg['ROOT']!r}; fix or remove it by hand, then run {shape.command} install"
     return cfg, ""
 
 
@@ -682,6 +693,14 @@ def _sweep(child) -> None:
         pass
 
 
+def _is_link(name: str, dir_fd: int) -> bool:
+    """O_NOFOLLOW on a link reads ELOOP on Linux and ENOTDIR with O_DIRECTORY on macOS: ask lstat instead."""
+    try:
+        return stat.S_ISLNK(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
 def _group_gone(child) -> bool:
     """True once no process of the trampoline's group is left within the bound: the session shares the
     lease, so the launcher may unlock only when it is gone too."""
@@ -698,21 +717,44 @@ def _group_gone(child) -> bool:
         time.sleep(POLL_S)
 
 
-def supervise(shape: Shape, argv: list, env: dict, popen=subprocess.Popen, pass_fds=(), map_exit=None) -> int:
-    """Run the child until it ends; every launcher exit path reaps it first: SIGTERM -> 143, SIGINT ->
-    130, a post-spawn exception re-raised after the reap. `map_exit` renames a child's exit codes, and a
-    child's own 75 becomes 1. The spawned child is left in `supervise.child` for the lease."""
-    state = {"child": None, "stop_at": None}
-    supervise.child = None
+def stop_state() -> dict:
+    return {"child": None, "stop_at": None, "sig": None, "installed": None}
 
-    def on_term(signum, frame):
+
+def stop_handlers(state: dict) -> dict:
+    """SIGTERM and SIGINT as one explicit stop path (no KeyboardInterrupt anywhere after this): the first
+    one terminates the child, if any, and starts the grace; the exit code is 128 + that signal."""
+    def on_stop(signum, frame):
+        state["sig"] = state["sig"] or signum
         child = state["child"]
         if child is not None and child.poll() is None and state["stop_at"] is None:
             child.terminate()
         state["stop_at"] = state["stop_at"] or time.monotonic() + TERM_GRACE_S
-    before = signal.signal(signal.SIGTERM, on_term)
+    before = {sig: signal.signal(sig, on_stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+    state["installed"] = True
+    return before
+
+
+def restore_handlers(state: dict, before: dict) -> None:
+    for sig, handler in before.items():
+        signal.signal(sig, handler)
+    state["installed"] = None
+
+
+def supervise(shape: Shape, argv: list, env: dict, popen=subprocess.Popen, pass_fds=(), map_exit=None,
+              state=None) -> int:
+    """Run the child until it ends; every launcher exit path reaps it first: SIGTERM -> 143, SIGINT ->
+    130 (both through `stop_handlers`, installed here unless the caller already did), a post-spawn
+    exception re-raised after the reap. `map_exit` renames a child's exit codes, and a child's own 75
+    becomes 1. The spawned child is left in `supervise.child` for the lease."""
+    state = state if state is not None else stop_state()
+    before = stop_handlers(state) if state.get("installed") is None else None
+    supervise.child = None
     child = None
     try:
+        if state["stop_at"] is not None:
+            print(f"{shape.name}: stopped before the session started", file=sys.stderr)
+            return 128 + state["sig"]
         child = state["child"] = supervise.child = popen(argv, stdin=subprocess.PIPE, env=env, text=True,
                                                          pass_fds=pass_fds, start_new_session=True)
         if state["stop_at"] is not None:
@@ -726,12 +768,14 @@ def supervise(shape: Shape, argv: list, env: dict, popen=subprocess.Popen, pass_
                     if not _kill_bounded(child):
                         print(f"{shape.name}: the child did not die within {REAP_BOUND_S:.0f} s of the kill",
                               file=sys.stderr)
-                        return 128 + signal.SIGTERM
+                        return 128 + state["sig"]
                     rc = child.returncode
         _sweep(child)
         print(f"{shape.name}: child exited {rc}", file=sys.stderr)
         if state["stop_at"] is not None:
-            return 128 + signal.SIGTERM
+            if state["sig"] == signal.SIGINT:
+                print(f"{shape.name}: interrupted; child reaped", file=sys.stderr)
+            return 128 + state["sig"]
         if map_exit and rc in map_exit:
             print(f"{shape.name}: reported as {map_exit[rc]}", file=sys.stderr)
             return map_exit[rc]
@@ -740,17 +784,13 @@ def supervise(shape: Shape, argv: list, env: dict, popen=subprocess.Popen, pass_
                   "work root", file=sys.stderr)
             return EXIT_CHILD_HELD
         return rc
-    except KeyboardInterrupt:
-        if child is not None:
-            _reap(child, TERM_GRACE_S)
-        print(f"{shape.name}: interrupted; child reaped", file=sys.stderr)
-        return 128 + signal.SIGINT
     except BaseException:
         if child is not None:
             _reap(child, TERM_GRACE_S)
         raise
     finally:
-        signal.signal(signal.SIGTERM, before)
+        if before is not None:
+            restore_handlers(state, before)
 
 
 def serve(shape: Shape, root: str, argv: list, env: dict, popen=subprocess.Popen, map_exit=None,
@@ -759,6 +799,15 @@ def serve(shape: Shape, root: str, argv: list, env: dict, popen=subprocess.Popen
     after), its descriptor leased to the child, the child run against `tasks` under the held root inode
     by a trampoline, and the lock released only after a confirmed reap; else the launcher exits and the
     child stays fenced under the flock."""
+    state = stop_state()
+    before = stop_handlers(state)
+    try:
+        return _serve(shape, root, argv, env, popen, map_exit, op_lock, state)
+    finally:
+        restore_handlers(state, before)
+
+
+def _serve(shape, root, argv, env, popen, map_exit, op_lock, state) -> int:
     try:
         owner = acquire_lock(root, shape.name, retry_s=ACQUIRE_RETRY_S)
     except LockRefused as e:
@@ -767,9 +816,11 @@ def serve(shape: Shape, root: str, argv: list, env: dict, popen=subprocess.Popen
     if op_lock is not None:
         op_lock.release()
     try:
-        inbox_fd = os.open("tasks", os.O_RDONLY | os.O_DIRECTORY, dir_fd=owner.root_fd)
+        inbox_fd = os.open("tasks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=owner.root_fd)
     except OSError as e:
-        print(f"refusing to start: no tasks/ under the held root {root} ({e.strerror or e})", file=sys.stderr)
+        what = "tasks/ under the held root is a symlink, not a directory" if _is_link("tasks", owner.root_fd) \
+            else f"no tasks/ under the held root {root} ({e.strerror or e})"
+        print(f"refusing to start: {what}", file=sys.stderr)
         release_lock(owner)
         return EXIT_UNUSABLE
     try:
@@ -783,7 +834,7 @@ def serve(shape: Shape, root: str, argv: list, env: dict, popen=subprocess.Popen
     # stream-json session ends when its input ends.
     try:
         rc = supervise(shape, [sys.executable, "-c", TRAMPOLINE, str(lease), str(inbox_fd), *argv], env, popen,
-                       pass_fds=(lease, inbox_fd), map_exit=map_exit)
+                       pass_fds=(lease, inbox_fd), map_exit=map_exit, state=state)
     finally:
         os.close(inbox_fd)
         child = supervise.child

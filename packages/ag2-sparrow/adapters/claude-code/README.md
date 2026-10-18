@@ -180,7 +180,10 @@ its config dir (`verify` runs `claude auth status` there; nothing is copied).
 
 `run` checks the pin again, takes the one-session-per-root `holder_lock` on
 the persisted `ROOT` (the same key the Codex, routine and cloud-session
-adapters use, so a symlinked `tasks` still contends with its siblings; a
+adapters use, so a symlinked work root still contends with its siblings; a
+`tasks` that is itself a symlink is refused at install and by `run`, which
+opens it `O_NOFOLLOW` under the held root, since the lock would sit on this
+root while the session listed the link's target; a
 `Contended` with no record or no live holder is retried for 1 s first, so a
 `verify` or install probe's momentary flock never forges a 75), publishes its
 record before the child exists, leases the lock descriptor to exactly one
@@ -201,8 +204,10 @@ once the group is empty, so no session outlives the lease it was fenced
 under and nothing unlocks over a live one. A second launcher exits 75, which
 the systemd unit does not relaunch (a session's own exit 75 is reported as
 1). Every launcher exit reaps the child first: `SIGTERM` (`systemctl stop`,
-`bootout`) and `SIGINT` terminate it, wait up to 15 s, kill, wait up to 10 s
-more, then release (143 / 130); a post-spawn exception reaps, then re-raises;
+`bootout`) and `SIGINT` are one explicit stop path, its handlers installed
+before the lock is taken (no `KeyboardInterrupt` can skip a reap): they
+terminate it, wait up to 15 s, kill, wait up to 10 s more, then release
+(143 / 130); a post-spawn exception reaps, then re-raises;
 a reap, or a group, not confirmed gone within that bound exits **without**
 releasing, so the survivor keeps the root fenced and `verify` reads "held,
 launcher gone (child alive)"; `SIGKILL` of the launcher leaves the same state.

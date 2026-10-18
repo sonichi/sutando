@@ -736,6 +736,28 @@ class ConnectRoot(ConnectBase):
         rc, _, err = self.main("run")
         self.assertEqual((rc, "refusing to start" in err), (2, True), "ROOT is read, never re-derived from the inbox")
 
+    def test_a_tasks_symlink_is_refused_at_install_and_at_run(self):
+        """A `tasks` that is itself a link would put the lock on this root and the session on the link's
+        target: two locks for one inbox. Refused before any write, and by run through O_NOFOLLOW."""
+        real = self.home / "elsewhere" / "tasks"
+        real.mkdir(parents=True)
+        self.work.mkdir(parents=True, exist_ok=True)
+        link = self.work / "tasks"
+        link.symlink_to(real)
+        for extra in (("--inbox", str(link)), ("--work", str(self.work))):
+            runner = self.runner()
+            rc, _, err = self.install_with(runner, False, *extra)
+            self.assertEqual(rc, 2, err)
+            self.assertIn("is a symlink; tasks must be a real directory", err)
+            self.assertFalse(cli.config_path().exists(), "nothing written")
+            self.assertEqual(runner.calls, [], "the manager is never touched")
+        from ag2_sparrow import task_io
+        self.configure(INBOX_DIR=str(link))
+        rc, _, err = self.main("run")
+        self.assertEqual((rc, "tasks/ under the held root is a symlink" in err), (2, True), "ERR=" + err)
+        self.assertIsNone(self.session(), "no session started against the link's target")
+        self.assertEqual(task_io.lock_held(str(self.work)), "free", "and the lock was released")
+
     def test_a_work_root_change_is_refused_with_uninstall_then_install(self):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
@@ -1393,8 +1415,17 @@ class ConnectOwnership(ConnectBase):
         for bad in (good + "PERMISSION_MODE='unclosed\n", good.replace("INBOX_DIR=", "INBOX_WAS="),
                     good.replace(f"ROOT={self.work}", "ROOT=relative/work")):
             cfg.write_text(bad)
-            rc, _, err = self.main("run")
+            scratch = self.home / "cwd"
+            scratch.mkdir(exist_ok=True)
+            was = os.getcwd()
+            os.chdir(scratch)                                   # a relative ROOT would be made under the cwd
+            try:
+                rc, _, err = self.main("run")
+            finally:
+                os.chdir(was)
             self.assertEqual(rc, 2, bad)
+            self.assertEqual(os.listdir(scratch), [], "refused by the loader, before anything under the cwd is made")
+            self.assertIsNone(self.session())
             rc, _, err = self.install_with(self.runner())
             self.assertEqual(rc, 1, "a marked but malformed config is never replaced: " + err)
             self.assertIn("remove it by hand", err)
@@ -1761,6 +1792,38 @@ class ConnectLauncherProcess(ConnectBase):
                 os.kill(child, signal.SIGKILL)
         _, err = launcher.communicate(timeout=30)
         self.assertIn("child exited -9", err)
+
+    def test_external_trampoline_kills_never_free_the_root_over_a_live_session(self):
+        """Repeated: after each kill of the trampoline the launcher sweeps and waits for the group, so the
+        root reads free only once the session is gone. AG2_SPARROW_STRESS_N runs (default 5)."""
+        from ag2_sparrow import task_io
+        self.configure()
+        for i in range(int(os.environ.get("AG2_SPARROW_STRESS_N", "5"))):
+            launcher, child = self.launcher()
+            os.kill(self.session()["ppid"], signal.SIGKILL)
+            launcher.wait(timeout=30)
+            try:
+                free = task_io.lock_held(str(self.work)) == "free"
+                self.assertFalse(free and self.alive(child), f"run {i}: the root read free with the session alive")
+                self.assertTrue(self.wait_gone(child, 2), f"run {i}: the session was swept")
+                self.assertEqual(task_io.lock_held(str(self.work)), "free", f"run {i}")
+            finally:
+                if self.alive(child):
+                    os.kill(child, signal.SIGKILL)
+            launcher.communicate(timeout=30)
+            (self.home / "claude-session.json").unlink()
+
+    def test_sigint_is_an_explicit_stop_path_every_time(self):
+        """Repeated SIGINT: 130 and a reaped, released root each run, never a KeyboardInterrupt escaping
+        as -2. AG2_SPARROW_STRESS_N runs (default 5)."""
+        self.configure()
+        for i in range(int(os.environ.get("AG2_SPARROW_STRESS_N", "5"))):
+            launcher, child = self.launcher()
+            os.kill(launcher.pid, signal.SIGINT)
+            _, err = launcher.communicate(timeout=30)
+            self.assertEqual(launcher.returncode, 130, f"run {i}: {err}")
+            self.assert_reaped_and_released(child, str(self.work))
+            (self.home / "claude-session.json").unlink()
 
     def test_a_session_outliving_its_trampoline_keeps_the_root_held_and_the_launcher_does_not_release(self):
         """The launcher unlocks only once the trampoline's whole group is gone: with the sweep disabled, a
