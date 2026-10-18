@@ -494,17 +494,53 @@ def _join(group: "list[str]") -> str:
 
 
 _SHAPE_VALUE = r"(\"[^\"]*\"?|'[^']*'?|[^\s\"';&|,\]\)}]+)"
-# Values to register, by shape: `KEY=value` anywhere (env -i, sh -c 'export ...', an argument), a
-# quoted JSON key, a `Name: value` header or YAML key, and a flag as `--f value`, `--f=value` or `--f,value`.
-_ANY_ASSIGNMENT_RE = re.compile(r"(?<![\w.-])([A-Za-z_][\w.-]*)\s*=\s*" + _SHAPE_VALUE + "?")
-_JSON_KEY_RE = re.compile(r"[\"']([\w.-]+)[\"']\s*:\s*" + _SHAPE_VALUE + "?")
-_FLAG_RE = re.compile(r"(?<![\w.-])--?([A-Za-z][\w.-]*)(?:(?:=|,\s*|\s+)" + _SHAPE_VALUE + ")?")
-_COLON_KEY_RE = re.compile(r"(?<![\w.-])([A-Za-z_][\w.-]*)\s*:(?!//)\s*" + _SHAPE_VALUE + "?")
+_VALUE_RE = re.compile(r"\s*" + _SHAPE_VALUE)
+_FLAG_VALUE_RE = re.compile(r"(?:=|,\s*|\s+)" + _SHAPE_VALUE)
+# Locators only, never a verdict: every `=` or `:` not starting `://`, and every flag's dashes.
+_SEPARATOR_RE = re.compile(r"=|:(?!//)")
+_FLAG_RE = re.compile(r"(?<![\w.-])-{1,2}(?=[^\s=-])")
+_FLAG_WIDE_RE = re.compile(r"[^\s=]+")
+_FLAG_NAME_RE = re.compile(r"[^\s=,\"']*")
 _HEADER_RE = re.compile(r"(?i)\bauthorization\s*:\s*(?:[A-Za-z]+\s+)?" + _SHAPE_VALUE
                         + r"?|\bbearer\s+" + _SHAPE_VALUE)
-# Withholding, closed-world: a credential_name in any name position (a flag, or a name a quote or
-# blanks away from `=` or a `:` that does not start `://`) shapes the line, whatever its value.
-_NAME_POSITION_RE = re.compile(r"(?<![\w.-])(-{1,2})?([\w.-]*[A-Za-z0-9_])(?=([\"']?\s*(?:=|:(?!//)))?)")
+
+
+def _quoted_name(view: str, close: int) -> str:
+    """The text inside the quote that closes at `close`, back to its unescaped opening quote."""
+    q, k = view[close], close - 1
+    while k >= 0:
+        if view[k] == q:
+            b = k
+            while b > 0 and view[b - 1] == "\\":
+                b -= 1
+            if (k - b) % 2 == 0:
+                break
+        k -= 1
+    return view[k + 1:close]
+
+
+def _names_and_values(view: str) -> "list[tuple[tuple[str, ...], str]]":
+    """Every name position in `view` with the value that follows it: the complete key before each
+    separator (inside its quotes with any characters, and as the unquoted run back to a blank or
+    quote), and each flag's name up to a blank or `=` (and up to `,` or a quote)."""
+    out = []
+    for m in _SEPARATOR_RE.finditer(view):
+        j = m.start()
+        while j > 0 and view[j - 1].isspace():
+            j -= 1
+        names = [_quoted_name(view, j - 1)] if j > 0 and view[j - 1] in "\"'" else []
+        k = j
+        while k > 0 and not view[k - 1].isspace() and view[k - 1] not in "\"'":
+            k -= 1
+        names.append(view[k:j])
+        v = _VALUE_RE.match(view, m.end())
+        out.append((tuple(names), v.group(1) if v else ""))
+    for m in _FLAG_RE.finditer(view):
+        wide = _FLAG_WIDE_RE.match(view, m.end()).group(0)
+        name = _FLAG_NAME_RE.match(wide).group(0)
+        v = _FLAG_VALUE_RE.match(view, m.end() + len(name))
+        out.append(((wide, name), v.group(1) if v else ""))
+    return out
 
 
 def _shape_views(text: str) -> "set[str]":
@@ -512,16 +548,13 @@ def _shape_views(text: str) -> "set[str]":
 
 
 def credential_shapes(text: str) -> "list[str]":
-    """The value of every credential shape in `text` ('' for one with no value or found by its name
-    position alone): a credential_name in a name position (a flag, KEY=, a quoted or bare `name:`
-    key or header), an Authorization: header, or a Bearer value."""
+    """The value of every credential shape in `text` ('' for one with no value): a name position
+    whose complete name credential_name accepts (the one verdict), an Authorization: header, or a
+    Bearer value."""
     found = []
     for view in _shape_views(str(text)):
-        for regex in (_ANY_ASSIGNMENT_RE, _JSON_KEY_RE, _COLON_KEY_RE, _FLAG_RE):
-            found += [m.group(2) or "" for m in regex.finditer(view) if credential_name(m.group(1))]
+        found += [value for names, value in _names_and_values(view) if any(map(credential_name, names))]
         found += [m.group(1) or m.group(2) or "" for m in _HEADER_RE.finditer(view)]
-        found += ["" for m in _NAME_POSITION_RE.finditer(view)
-                  if (m.group(1) or m.group(3) is not None) and credential_name(m.group(2))]
     return found
 
 

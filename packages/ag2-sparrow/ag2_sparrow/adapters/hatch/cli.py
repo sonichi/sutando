@@ -390,10 +390,18 @@ def _why(r) -> str:
     return lines[-1] if lines else f"exit {r.returncode}"
 
 
+def _systemctl(args: "tuple[str, ...]", *, locate: bool = False):
+    """The one place systemctl is named: run with `args`, a literal tuple at every call site,
+    or with locate=True only its path on PATH (None when absent)."""
+    if locate:
+        return shutil.which("systemctl")
+    return _systemd_run(["systemctl", *args])
+
+
 def systemd_user_available() -> bool:
     """Whether `systemctl --user` reaches a running user manager."""
-    return shutil.which("systemctl") is not None and \
-        _ok(_systemd_run(["systemctl", "--user", "show-environment"]))
+    return _systemctl((), locate=True) is not None and \
+        _ok(_systemctl(("--user", "show-environment")))
 
 
 def render_service(exec_start: str, env: dict) -> str:
@@ -426,17 +434,26 @@ UNIT_STATES = frozenset(("active", "reloading", "inactive", "failed", "activatin
                          "maintenance", "refreshing"))
 _UNIT_PROPS = ("ActiveState", "MainPID", "ExecMainStartTimestampMonotonic")
 _ASCII_DIGITS = re.compile(r"[0-9]+")
+# (most digits, largest value): no pid exceeds Linux PID_MAX_LIMIT, a timestamp is a u64 of microseconds.
+_UNIT_NUMBERS = {"MainPID": (10, 4194304), "ExecMainStartTimestampMonotonic": (20, 2 ** 64 - 1)}
 
 
 def _unit_props() -> "dict | None":
-    """ActiveState, MainPID and ExecMainStartTimestampMonotonic, only when positively verified:
-    each exactly once, a documented state and ASCII decimal numbers. Anything else is None."""
-    r = _systemd_run(["systemctl", "--user", "show", "ag2-sparrow.service", "--property=ActiveState",
-                      "--property=MainPID", "--property=ExecMainStartTimestampMonotonic"])
-    if not _ok(r) or not isinstance(r.stdout, str):
+    """ActiveState (a documented state), MainPID and ExecMainStartTimestampMonotonic (ints in
+    _UNIT_NUMBERS bounds), each exactly once and fully parsed here. Anything else is None."""
+    r = _systemctl(("--user", "show", "ag2-sparrow.service", "--property=ActiveState",
+                    "--property=MainPID", "--property=ExecMainStartTimestampMonotonic"))
+    try:
+        return _parse_unit_props(r.stdout) if _ok(r) else None
+    except Exception:  # noqa: BLE001 - any surprise in the answer is an unknown state
+        return None
+
+
+def _parse_unit_props(stdout: str) -> "dict | None":
+    if not isinstance(stdout, str):
         return None
     props = {}
-    for line in r.stdout.split("\n"):
+    for line in stdout.split("\n"):
         if not line:
             continue
         key, eq, value = line.partition("=")
@@ -445,8 +462,11 @@ def _unit_props() -> "dict | None":
         props[key] = value
     if set(props) != set(_UNIT_PROPS) or props["ActiveState"] not in UNIT_STATES:
         return None
-    if not all(_ASCII_DIGITS.fullmatch(props[n]) for n in _UNIT_PROPS[1:]):
-        return None
+    for name, (digits, largest) in _UNIT_NUMBERS.items():
+        text = props[name]
+        if len(text) > digits or not _ASCII_DIGITS.fullmatch(text) or int(text) > largest:
+            return None
+        props[name] = int(text)
     return props
 
 
@@ -565,48 +585,47 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
     stopped = False
     before = _unit_props() if changed else {}
     if before is None:
-        note(f"systemctl --user show {SERVICE_NAME} did not give a well-formed state, so it was not "
-             "stopped first")
-    elif before.get("ActiveState") in ("active", "reloading"):
-        r = _systemd_run(["systemctl", "--user", "stop", "ag2-sparrow.service"])
+        note(f"systemctl --user show {SERVICE_NAME} did not give a well-formed state, so nothing was "
+             "stopped, written, reloaded or enabled; run ag2-sparrow-hatch install again once the "
+             "user manager answers")
+        return
+    if before.get("ActiveState") in ("active", "reloading"):
+        r = _systemctl(("--user", "stop", "ag2-sparrow.service"))
         stopped = _ok(r)
         print(f"stopped: {SERVICE_NAME} before installing" if stopped else
               f"NOTE service: stop failed ({_why(r)}); it is restarted after the install instead")
     if changed:
         _write(unit, text, 0o644)
         print(f"installed: {unit}")
-        r = _systemd_run(["systemctl", "--user", "daemon-reload"])
+        r = _systemctl(("--user", "daemon-reload"))
         if not _ok(r):
             note(f"systemctl --user daemon-reload failed ({_why(r)}); run it, then "
                  f"systemctl --user enable --now {SERVICE_NAME}")
             return
     props = _unit_props()
     if props is None:
-        r = _systemd_run(["systemctl", "--user", "enable", "ag2-sparrow.service"])
         note(f"systemctl --user show {SERVICE_NAME} did not give a well-formed state, so whether it runs "
-             "is unknown; "
-             + ("it was enabled but neither started nor restarted" if _ok(r) else
-                f"systemctl --user enable failed too ({_why(r)})")
-             + "; run ag2-sparrow-hatch install again once the user manager answers")
+             "is unknown; it was neither enabled, started nor restarted; run ag2-sparrow-hatch install "
+             "again once the user manager answers")
         return
     state = props["ActiveState"]
     active = state in ("active", "reloading")
-    main_pid = int(props["MainPID"])
-    ran = props["ExecMainStartTimestampMonotonic"] != "0"
+    main_pid = props["MainPID"]
+    ran = props["ExecMainStartTimestampMonotonic"] != 0
     # failed/activating/deactivating: the unit's own Sparrow crashed or is restarting.
     outside = not stopped and state == "inactive" and _outside_sparrow(state_dir, instance, main_pid, ran)
     has_token = device_env.is_file()
     start = has_token and not outside
     if start and state == "failed":
-        _systemd_run(["systemctl", "--user", "reset-failed", "ag2-sparrow.service"])
-    r = _systemd_run(["systemctl", "--user", "enable", "--now", "ag2-sparrow.service"]) if start else \
-        _systemd_run(["systemctl", "--user", "enable", "ag2-sparrow.service"])
+        _systemctl(("--user", "reset-failed", "ag2-sparrow.service"))
+    r = _systemctl(("--user", "enable", "--now", "ag2-sparrow.service")) if start else \
+        _systemctl(("--user", "enable", "ag2-sparrow.service"))
     if not _ok(r):
         note(f"systemctl --user enable {SERVICE_NAME} failed ({_why(r)}); fix that and run "
              f"systemctl --user enable --now {SERVICE_NAME}")
         return
     if active and changed:
-        r = _systemd_run(["systemctl", "--user", "restart", "ag2-sparrow.service"])
+        r = _systemctl(("--user", "restart", "ag2-sparrow.service"))
         print(f"restarted: {SERVICE_NAME} with the new unit" if _ok(r) else
               f"NOTE service: restart failed ({_why(r)}); run systemctl --user restart "
               f"{SERVICE_NAME}")
@@ -645,11 +664,11 @@ def service_status(reply_command: str = "") -> "tuple[bool | None, str]":
     if not unit.is_file():
         return None, (f"{unit} not installed; {keepawake_note(reply_command)}. Run "
                       "ag2-sparrow-hatch install to set the service up")
-    enabled = _systemd_run(["systemctl", "--user", "is-enabled", "ag2-sparrow.service"])
+    enabled = _systemctl(("--user", "is-enabled", "ag2-sparrow.service"))
     if not _ok(enabled):
         return False, (f"{unit} installed but not enabled; run systemctl --user enable --now "
                        f"{SERVICE_NAME}")
-    active = _ok(_systemd_run(["systemctl", "--user", "is-active", "--quiet", "ag2-sparrow.service"]))
+    active = _ok(_systemctl(("--user", "is-active", "--quiet", "ag2-sparrow.service")))
     return True, f"{unit} installed and enabled ({'active' if active else 'not active'})"
 
 
@@ -947,7 +966,7 @@ def uninstall_service(keepalive_on: bool = True) -> int:
         print(f"error: {unit} was not written by install; remove it yourself", file=sys.stderr)
         return 1
     if systemd_user_available():
-        r = _systemd_run(["systemctl", "--user", "disable", "--now", "ag2-sparrow.service"])
+        r = _systemctl(("--user", "disable", "--now", "ag2-sparrow.service"))
         if not _ok(r):
             print(f"error: systemctl --user disable --now {SERVICE_NAME} failed ({_why(r)}); "
                   f"{unit} was kept", file=sys.stderr)
@@ -956,7 +975,7 @@ def uninstall_service(keepalive_on: bool = True) -> int:
     unit.unlink()
     print(f"removed: {unit}")
     if systemd_user_available():
-        _systemd_run(["systemctl", "--user", "daemon-reload"])
+        _systemctl(("--user", "daemon-reload"))
     print("Linger was left as it is (other user services may need it); "
           + keepawake_note(_installed_config().get("REPLY_COMMAND", ""), keepalive_on) + ".")
     return 0

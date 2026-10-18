@@ -1299,6 +1299,29 @@ class Service(Base):
                         AGENT_CONNECT_STATE_DIR=str(self.state), **env)
             return run_main(hatch_cli.main, args, base)
 
+    def test_a_number_its_consumer_cannot_take_stops_reloads_and_starts_nothing(self):
+        # The exact answer: an active unit, a 5,000-digit MainPID and a start timestamp.
+        for name, change in [("5000-digit pid", {"MainPID": "7" * 5000})] + list(StartSparrow.OVERSIZED.items()):
+            with self.subTest(answer=name):
+                answer = "".join(f"{k}={v}\n" for k, v in
+                                 {**StartSparrow.VALID, "ActiveState": "active", "ExecMainStartTimestampMonotonic": "1",
+                                  **change}.items())
+                fake = FakeSystemd(state="active", enabled=True)
+
+                def systemd(cmd, answer=answer):
+                    if cmd[1:3] == ["--user", "show"]:
+                        fake.calls.append(cmd[1:])
+                        return subprocess.CompletedProcess(cmd, 0, answer, "")
+                    return fake(cmd)
+                with mock.patch.object(keepalive, "_spawn_sparrow", side_effect=AssertionError("spawned")):
+                    r = self.with_systemd(systemd, "install", "--mxid", AGENT, "--no-start", env={"USER": "hatch"})
+                self.assertNotIn("Traceback", r.stdout + r.stderr)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual([c[1] for c in fake.calls if c[0] == "--user"], ["show-environment", "show"],
+                                 "nothing but the reachability probe and one show")
+                self.assertIn("so nothing was stopped, written, reloaded or enabled", r.stdout)
+                self.assertFalse(self.unit.exists())
+
     @property
     def unit(self):
         return self.home / ".config" / "systemd" / "user" / "ag2-sparrow.service"
@@ -2501,11 +2524,10 @@ class StartSparrow(Base):
         _, spawned, old, r, fake = self.unit_state_unknown(self.UNKNOWN_SHOW["fails"])
         self.assertIsNone(old.poll(), "the service-owned Sparrow got no SIGTERM")
         self.assertEqual((spawned, r.returncode), ([], 0), r.stdout + r.stderr)
-        self.assertEqual([c for c in fake.calls if c[0] == "--user" and c[1] in ("start", "restart", "stop")], [])
-        self.assertEqual(fake.ran("enable"), [["--user", "enable", hatch_cli.SERVICE_NAME]],
-                         "enabled, never --now")
-        self.assertIn("did not give a well-formed state, so it was not stopped first", r.stdout)
-        self.assertIn("it was enabled but neither started nor restarted", r.stdout)
+        self.assertEqual([c for c in fake.calls if c[0] == "--user" and c[1] in
+                          ("start", "restart", "stop", "enable", "daemon-reload", "reset-failed")], [])
+        self.assertIn("did not give a well-formed state, so nothing was stopped, written, reloaded or "
+                      "enabled", r.stdout)
         self.assertNotIn("replacing:", r.stdout)
 
     def test_a_leftover_unit_with_no_user_manager_exits_non_zero_and_starts_nothing(self):
@@ -2575,8 +2597,24 @@ class StartSparrow(Base):
                 self.assertIsNone(props(out))
         for state in sorted(hatch_cli.UNIT_STATES):
             got = props(f"ActiveState={state}\nMainPID=4242\nExecMainStartTimestampMonotonic=123\n")
-            self.assertEqual(got, {"ActiveState": state, "MainPID": "4242",
-                                   "ExecMainStartTimestampMonotonic": "123"}, state)
+            self.assertEqual(got, {"ActiveState": state, "MainPID": 4242,
+                                   "ExecMainStartTimestampMonotonic": 123}, state)
+        for name, change in self.EDGE.items():
+            with self.subTest(edge=name):
+                out = "".join(f"{k}={v}\n" for k, v in {**self.VALID, **change}.items())
+                want = None if name in self.OVERSIZED else {k: int(v) if k != "ActiveState" else v
+                                                            for k, v in {**self.VALID, **change}.items()}
+                self.assertEqual(props(out), want, name)
+
+    # Bounds: MainPID at most 10 digits and PID_MAX_LIMIT; the timestamp at most 20 digits and a u64.
+    OVERSIZED = {"11-digit pid": {"MainPID": "1" * 11}, "pid past PID_MAX_LIMIT": {"MainPID": "4194305"},
+                 "10-digit pid past the limit": {"MainPID": "9999999999"}, "zero-padded 11 digits": {"MainPID": "0" * 10 + "1"},
+                 "21-digit timestamp": {"ExecMainStartTimestampMonotonic": "1" * 21},
+                 "timestamp 2**64": {"ExecMainStartTimestampMonotonic": str(2 ** 64)},
+                 "4301-digit timestamp": {"ExecMainStartTimestampMonotonic": "9" * 4301}}
+    EDGE = {**OVERSIZED, "pid at PID_MAX_LIMIT": {"MainPID": "4194304"}, "zero-padded 10 digits": {"MainPID": "0" * 9 + "1"},
+            "largest timestamp": {"ExecMainStartTimestampMonotonic": str(2 ** 64 - 1)},
+            "20-digit zero timestamp": {"ExecMainStartTimestampMonotonic": "0" * 20}, "pid 1": {"MainPID": "1"}}
 
     def test_a_malformed_unit_answer_stops_signals_and_starts_nothing(self):
         for name, out in self.malformed_answers():

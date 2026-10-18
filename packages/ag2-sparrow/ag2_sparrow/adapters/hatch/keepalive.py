@@ -245,8 +245,8 @@ def restart_listener(cfg: dict) -> "tuple[bool, str]":
         if _cli._unit_props() is None:
             return False, (f"systemctl --user show {_cli.SERVICE_NAME} did not give a well-formed state; "
                            "it was neither reset nor restarted")
-        _cli._systemd_run(["systemctl", "--user", "reset-failed", "ag2-sparrow.service"])
-        r = _cli._systemd_run(["systemctl", "--user", "restart", "ag2-sparrow.service"])
+        _cli._systemctl(("--user", "reset-failed", "ag2-sparrow.service"))
+        r = _cli._systemctl(("--user", "restart", "ag2-sparrow.service"))
         if _cli._ok(r):
             return True, f"systemctl --user restart {_cli.SERVICE_NAME}"
         return False, f"systemctl --user restart {_cli.SERVICE_NAME} failed ({_cli._why(r)})"
@@ -341,7 +341,7 @@ def _unit_owner() -> "str | None":
     """"ours" for the unit install wrote, "other" for a hand-made one, None for no unit (or no
     systemctl), UNIT_UNREACHABLE for a unit whose user manager did not answer: not "no unit"."""
     unit = _cli.service_path()
-    if not unit.is_file() or _cli.shutil.which("systemctl") is None:
+    if not unit.is_file() or _cli._systemctl((), locate=True) is None:
         return None
     if not _cli.systemd_user_available():
         return UNIT_UNREACHABLE
@@ -349,7 +349,7 @@ def _unit_owner() -> "str | None":
     return "ours" if text.startswith(_cli.SERVICE_MARKER) else "other"
 
 
-def _wall_from_monotonic_us(value: "str | None") -> "float | None":
+def _wall_from_monotonic_us(value: "int | str | None") -> "float | None":
     """A systemd *TimestampMonotonic property as wall-clock seconds; None when unset."""
     try:
         us = int(value or 0)
@@ -414,7 +414,7 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
                       "line REMOTE_TASK_TOKEN=<token>, chmod 600 it, then run: systemctl --user "
                       f"start {_cli.SERVICE_NAME}", file=sys.stderr)
                 return 1
-            if holder is not None and str(holder) != props.get("MainPID"):
+            if holder is not None and holder != props["MainPID"]:
                 if not is_sparrow_pid(holder):
                     _left_running(holder)
                     print(f"error: {_cli.SERVICE_NAME} was not started while pid {holder} holds "
