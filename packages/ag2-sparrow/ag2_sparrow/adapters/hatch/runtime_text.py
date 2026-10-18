@@ -55,8 +55,9 @@ def hint_path(state_dir: Path, instance: str = "") -> Path:
 
 def owner_dm_room(state_dir: Path, instance: str = "", agent_mxid: str = "") -> str:
     """The owner's DM room Sparrow last read from AG2 Space (its owner-routing file), only
-    while that reading's binding (gateway_instance.binding_digest) is the one the running
-    Sparrow reports; '' otherwise, as the bridge refuses another enrollment's reading."""
+    while Sparrow reports itself connected and that reading's binding
+    (gateway_instance.binding_digest) is the one it reports; '' otherwise, as the bridge refuses
+    another enrollment's reading."""
     sfx = gateway_instance.suffix(instance)
     routing = _read_json(Path(state_dir) / f"owner-routing{sfx}.json") or {}
     status = _read_json(Path(state_dir) / f"gateway-status{sfx}.json") or {}
@@ -64,7 +65,7 @@ def owner_dm_room(state_dir: Path, instance: str = "", agent_mxid: str = "") -> 
     # A record from before the binding field holds the full URL, so its binding is computed.
     saved = routing.get("binding") or gateway_instance.binding_digest(
         identity, str(routing.get("gateway") or ""))
-    bound = (identity and identity == status.get("agent_id")
+    bound = (status.get("connected") is True and identity and identity == status.get("agent_id")
              and (not agent_mxid or identity == agent_mxid) and isinstance(binding, str)
              and binding and isinstance(saved, str)
              and hmac.compare_digest(saved.encode("utf-8"), binding.encode("utf-8")))

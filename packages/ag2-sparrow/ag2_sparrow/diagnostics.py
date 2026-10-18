@@ -19,7 +19,7 @@ from typing import Any, Callable
 WITHHELD = "<withheld>"
 WITHHELD_TEXT = "<text withheld: it may contain a credential>"
 _CODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
-BARE_SECRET_MIN = 8  # a bare secret shorter than this would withhold ordinary words
+BARE_SECRET_MIN = 8  # a bare URL query value shorter than this would withhold ordinary words
 _SECRETS: "dict[str, frozenset[str]]" = {}  # the process's secrets -> every rendering of each
 _SECRETS_LOCK = threading.Lock()
 SCRUBBED_TYPES: "set[type]" = set()  # exception classes gateway_instance.scrub_exception made
@@ -42,11 +42,12 @@ def forms(secret: str) -> "set[str]":
     return {f for f in out if f}
 
 
-def register_secret(value: Any, delimited: bool = False) -> None:
-    """Add a secret of this process (the bearer token, a token read from a file, a credential part
-    of the gateway URL). A bare one shorter than BARE_SECRET_MIN is not matched on its own; a
-    delimited URL part (`=value`, `user:pw@`) is, whatever its length."""
-    if not isinstance(value, str) or not value or (not delimited and len(value) < BARE_SECRET_MIN):
+def register_secret(value: Any, min_len: int = 1) -> None:
+    """Add a secret of this process. A token (the bearer, the media token, a token read from a
+    file) is opaque and matched at any length. A bare piece of the gateway URL passes
+    min_len=BARE_SECRET_MIN, so a short query value does not withhold ordinary words; its
+    delimited form (`=value`, `user:pw@`) is registered too, at any length."""
+    if not isinstance(value, str) or not value or len(value) < min_len:
         return
     rendered = frozenset(hex_upper(f) for f in forms(value))
     with _SECRETS_LOCK:
@@ -136,7 +137,7 @@ def describe(exc: BaseException) -> str:
 
 def safe_status(value: Any, net: Callable[[str], str]) -> Any:
     """`value` with every string, at any depth, passed through `net` (the URL redactor) and then
-    the secret registry; keys too. Finite numbers, booleans and None pass. Anything else is
+    the secret registry; keys through `net` only. Finite numbers, booleans and None pass. Anything else is
     withheld, never str()-ed."""
     if value is None or isinstance(value, (bool, int)):
         return value
@@ -145,8 +146,9 @@ def safe_status(value: Any, net: Callable[[str], str]) -> Any:
     if isinstance(value, str):
         return scrub(net(value))
     if isinstance(value, dict):
-        return {safe_status(k, net) if isinstance(k, str) else WITHHELD: safe_status(v, net)
-                for k, v in value.items()}
+        # Keys are field names: the URL net runs on them, the registry on values only, so a short
+        # token cannot turn the payload's own structure into withheld keys.
+        return {net(k) if isinstance(k, str) else WITHHELD: safe_status(v, net) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [safe_status(v, net) for v in value]
     return WITHHELD

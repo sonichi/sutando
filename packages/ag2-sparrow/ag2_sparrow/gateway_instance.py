@@ -120,18 +120,21 @@ def install_scrubbing_excepthooks(get_url: Callable[[], str]) -> None:
     """Backstop for a process that holds the gateway URL: an uncaught exception, in any thread,
     is reported as the file:line of its innermost frame, its type and its text through
     redact_text, never a raw traceback (a path and a line number cannot carry the URL)."""
-    def report(exc_type, exc, tb, where: str) -> None:
+    def clean(value) -> str:
         try:
-            text = diagnostics.scrub(redact_text(str(exc), get_url() or ""))
+            return diagnostics.scrub(redact_text(str(value), get_url() or ""))
         except Exception:  # noqa: BLE001 - a hook must report something, never the raw text
-            text = REDACTED_TEXT
-        at = ""
+            return REDACTED_TEXT
+
+    def report(exc_type, exc, tb, where: str) -> None:
         while tb is not None and tb.tb_next is not None:
             tb = tb.tb_next
-        if tb is not None:
-            at = f" at {tb.tb_frame.f_code.co_filename}:{tb.tb_lineno}"
+        at = f" at {clean(tb.tb_frame.f_code.co_filename)}:{tb.tb_lineno}" if tb is not None else ""
+        record = f"{where}{clean(getattr(exc_type, '__name__', 'Exception'))}{at}: {clean(exc)}"
+        if clean(record) != record:  # a secret spanning the pieces
+            record = f"{where.split(':')[0]}: {REDACTED_TEXT}"
         try:
-            sys.stderr.write(f"{where}{getattr(exc_type, '__name__', 'Exception')}{at}: {text}\n")
+            sys.stderr.write(record + "\n")
         except Exception:  # noqa: BLE001 - nowhere left to report to
             pass
 
@@ -141,7 +144,7 @@ def install_scrubbing_excepthooks(get_url: Callable[[], str]) -> None:
     def thread_hook(args):
         if args.exc_type is SystemExit:
             return
-        name = getattr(args.thread, "name", "?")
+        name = clean(getattr(args.thread, "name", "?"))
         report(args.exc_type, args.exc_value, args.exc_traceback, f"Exception in thread {name}: ")
 
     sys.excepthook = hook
@@ -200,11 +203,12 @@ def register_gateway_secrets(url: str) -> None:
     """Add every credential part of the gateway URL to the process's secret registry: each
     delimited part, and the bare userinfo, password and query values long enough to match alone."""
     for part in _secret_parts(str(url or "")):
-        diagnostics.register_secret(part, delimited=True)
+        diagnostics.register_secret(part)
     userinfo, query, fragment = _split_by_hand(str(url or ""))
-    for value in (userinfo, userinfo.partition(":")[2], fragment,
+    username, _, password = userinfo.partition(":")
+    for value in (userinfo, username, password, fragment,
                   *(pair.partition("=")[2] for pair in re.split(r"[&;]", query))):
-        diagnostics.register_secret(value)
+        diagnostics.register_secret(value, min_len=diagnostics.BARE_SECRET_MIN)
 
 
 def redact_text(text: str, gateway_url: str) -> str:

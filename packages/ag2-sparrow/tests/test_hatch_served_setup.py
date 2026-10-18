@@ -79,6 +79,8 @@ SINK_CONTRACT_MODULES = ("remote_gateway_bridge.py", "event_channel.py", "human_
 SINK_CALLS = {"_log", "log", "_log_backoff", "_held", "print", "_emit_gateway_status",
               "_set", "warning", "error", "info", "debug", "exception"}
 STREAM_WRITES = {"sys.stderr.write", "sys.stdout.write"}
+# Names that, handed as an argument, are a sink function (not a variable that happens to be "log").
+SINK_FUNCTIONS = {"_log", "_log_backoff", "_held", "print", "_emit_gateway_status"}
 SAFE_ATTRS = {"code", "errno", "status", "__name__"}
 # Calls whose result is structured (a type, a length, a predicate), never the value's text.
 SAFE_CALLS = {"diagnostics.describe", "diagnostics.code_field", "type", "len", "isinstance", "int",
@@ -184,8 +186,8 @@ def sink_violations(source):
                         mark(fn, param, -1, True)
 
     def is_sink_ref(node):
-        return (isinstance(node, ast.Name) and node.id in SINK_CALLS) or (
-            isinstance(node, ast.Attribute) and node.attr in SINK_CALLS)
+        return (isinstance(node, ast.Name) and node.id in SINK_FUNCTIONS) or (
+            isinstance(node, ast.Attribute) and node.attr in SINK_FUNCTIONS)
 
     out = []
     for call in ast.walk(tree):
@@ -953,6 +955,65 @@ print(json.dumps({"files": files, "status": json.load(open(m.GATEWAY_STATUS_FILE
         for secret in ("relay-token", "0123456789abcdef", "relay%2Dtoken", "relay%2dtoken"):
             self.assertNotIn(secret, everything, secret)
 
+    def test_a_short_bearer_is_matched_at_any_length_in_both_reenroll_branches(self):
+        for token in ("sek1", "abc1234"):
+            with self.subTest(token=token):
+                r = subprocess.run([sys.executable, "-c", PRELUDE + self.REENROLL], capture_output=True,
+                                   text=True, cwd=str(self.home), timeout=60,
+                                   env=self.bridge_env(AGENT_MXID=AGENT, REMOTE_TASK_TOKEN=token,
+                                                       FORMS=json.dumps([token])))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                out = json.loads(r.stdout.strip().splitlines()[-1])
+                block = out["status"].get("reenroll") or {}
+                self.assertIsNone(block.get("approval_code"))
+                self.assertIsNone(block.get("refused_error"))
+                everything = "\n".join([r.stdout.rsplit("\n", 2)[0], r.stderr, *out["files"].values()])
+                self.assertNotIn(token, everything)
+
+    def test_the_media_token_a_rotated_token_and_a_url_username_are_registered(self):
+        media, rotated = "media-tok-77", "rotated-secret-99"
+        token_file = self.home / "token"
+        token_file.write_text(f"REMOTE_TASK_TOKEN={rotated}\n")
+        url = "https://longusername1:pw-123456@gw.example/relay"
+        out = self.bridge("""
+import json
+from ag2_sparrow import remote_gateway_bridge as m
+assert m._reload_rotated_token(), "the rotation is read"
+for word in ("MEDIA", "ROTATED", "longusername1"):
+    m._log("a line naming " + word)
+    m._emit_gateway_status(False, error="x " + word)
+    print(json.dumps({"status": json.load(open(m.GATEWAY_STATUS_FILE))["error"]}))
+print("{}")
+""".replace("MEDIA", media).replace("ROTATED", rotated), REMOTE_TASK_URL=url,
+                          REMOTE_MEDIA_HS_TOKEN=media, REMOTE_TASK_TOKEN_FILE=str(token_file))
+        self.assertEqual(out, {})
+        logs = (self.home / "logs" / "gateway-bridge.log").read_text()
+        status = (self.state / "gateway-status.json").read_text()
+        for secret in (media, rotated, "longusername1"):
+            self.assertNotIn(secret, logs, secret)
+            self.assertNotIn(secret, status, secret)
+
+    def test_the_excepthook_scrubs_its_file_name_and_thread_name_too(self):
+        script = """
+import threading
+from ag2_sparrow import diagnostics, gateway_instance
+diagnostics.register_secret("path-secret-012345")
+gateway_instance.install_scrubbing_excepthooks(lambda: "")
+code = compile("def boom():\\n    raise ValueError('x')\\n", "/tmp/path-secret-012345/worker.py", "exec")
+ns = {}
+exec(code, ns)
+t = threading.Thread(target=ns["boom"], name="worker-path-secret-012345")
+t.start(); t.join()
+ns["boom"]()
+"""
+        r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                           cwd=str(self.home), timeout=60, env=self.bridge_env())
+        self.assertNotIn("path-secret-012345", r.stderr)
+        self.assertIn("ValueError", r.stderr)
+        from ag2_sparrow import diagnostics
+        self.assertIn("Uncaught ValueError at " + diagnostics.WITHHELD_TEXT + ":2: x", r.stderr)
+        self.assertIn("Exception in thread " + diagnostics.WITHHELD_TEXT + ": ValueError", r.stderr)
+
     def test_a_safe_error_name_and_approval_code_still_reach_the_status(self):
         r = subprocess.run([sys.executable, "-c", PRELUDE + self.REENROLL], capture_output=True, text=True,
                            cwd=str(self.home), timeout=60,
@@ -1130,6 +1191,17 @@ class WakeContext(Base):
             path.write_text(json.dumps(record))
             self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "", side)
             path.write_text(original)
+        self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space")
+
+    def test_a_disconnected_sparrow_does_not_hand_out_the_owner_dm(self):
+        bind(self.state, "!dm:ag2.space")
+        self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space")
+        path = self.state / "gateway-status.json"
+        status = json.loads(path.read_text())
+        for connected in (False, None, "true", 1):
+            path.write_text(json.dumps(dict(status, connected=connected)))
+            self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "", connected)
+        path.write_text(json.dumps(status))
         self.assertEqual(runtime_text.owner_dm_room(self.state, "", AGENT), "!dm:ag2.space")
 
     def test_a_record_whose_binding_disagrees_with_the_running_one_is_refused(self):
@@ -1556,7 +1628,7 @@ class Diagnostics(unittest.TestCase):
     def test_the_secret_registry_withholds_every_rendering_and_echoed_pieces(self):
         token = "Bearer-SeCrEt/t0ken+value"
         self.d.register_secret(token)
-        self.d.register_secret("short")  # a bare secret this short is not matched on its own
+        self.d.register_secret("short", min_len=self.d.BARE_SECRET_MIN)  # a short URL piece is not matched alone
         for text in (token, f"x {token} y", "Bearer-SeCrEt%2Ft0ken%2Bvalue", "Bearer-SeCrEt%2ft0ken%2bvalue",
                      repr(token), "Bearer-SeCrEt%252Ft0ken%252Bvalue"):
             self.assertEqual(self.d.scrub(text), self.d.WITHHELD_TEXT, text)
