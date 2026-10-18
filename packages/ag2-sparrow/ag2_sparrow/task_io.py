@@ -137,6 +137,17 @@ def _held_line(work, holder, reason):
     return "refusing to start: %s is held by a process whose record is unreadable" % work
 
 
+def lock_holder_pid(work):
+    """The pid of the live holder of `work`'s one-process lock, or None when none holds it or the
+    root does not exist: the only holder read an adapter may make."""
+    try:
+        holder = holder_lock.read_holder(work)
+    except OSError:
+        return None
+    rec = getattr(holder, "record", None) or {}
+    return rec.get("pid") if isinstance(holder, holder_lock.Valid) else None
+
+
 def acquire_lock(work, adapter):
     """The adapter's first act: one process per work root through holder_lock, its record
     published at once. Returns the owner, or raises LockRefused with the exit code and line."""

@@ -25,8 +25,8 @@ import sysconfig
 import tempfile
 from pathlib import Path
 
-from ... import _dirs, holder_lock
-from ...task_io import LockRefused, acquire_lock, release_lock
+from ... import _dirs
+from ...task_io import LockRefused, acquire_lock, lock_holder_pid, release_lock
 
 SHAPE = "claude-local"
 COMMAND = "ag2-sparrow-connect"
@@ -378,9 +378,8 @@ def verify(_args) -> int:
         _check(results, marked(sup.read_text(encoding="utf-8", errors="replace"), marker), "supervisor", str(sup))
     except OSError:
         _check(results, False, "supervisor", f"{sup} missing; run {COMMAND} {SHAPE} install")
-    holder = holder_lock.read_holder(cfg["INBOX_DIR"]) if Path(cfg["INBOX_DIR"]).is_dir() else None
-    rec = getattr(holder, "record", None) or {}
-    print(f"INFO session: {'held by pid %s' % rec.get('pid') if rec.get('pid') else 'no session holds the inbox now'}")
+    pid = lock_holder_pid(cfg["INBOX_DIR"]) if Path(cfg["INBOX_DIR"]).is_dir() else None
+    print(f"INFO session: {'held by pid %s' % pid if pid else 'no session holds the inbox now'}")
     return 0 if all(results) else 1
 
 
