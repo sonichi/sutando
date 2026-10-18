@@ -10346,8 +10346,8 @@ def _codex_delegation_consumer(tasks_dir=None, channels_dir=None, scan_cap: int 
 
 def check_codex_presence(which=shutil.which, consumer=None) -> dict:
     """Report a missing `codex` binary WHERE IT WOULD BE USED. Non-owner sandbox
-    answers do not use it (src/policy/sandbox_runner.py never selects codex); the Team
-    PR-review helper does. Keying only on PATH turned an absent capability into a fault."""
+    answers and PR reviews do not use it (src/policy/sandbox_runner.py never selects
+    codex); keying only on PATH turned an absent optional capability into a fault."""
     name = "codex-presence"
     resolved = which("codex")
     if resolved:
@@ -10368,9 +10368,9 @@ def check_codex_presence(which=shutil.which, consumer=None) -> dict:
     config = Path.home() / ".codex"
     wiped = config.is_dir()
     detail = (
-        "codex is NOT on PATH — delegation to it (the Team PR-review helper) is "
-        "unavailable. Non-owner sandbox answers do not need it (they use the runner "
-        "in src/policy/sandbox_runner.py). "
+        "codex is NOT on PATH — delegation to it is unavailable. Non-owner sandbox "
+        "answers and Team PR reviews do not need it (they use the runner in "
+        "src/policy/sandbox_runner.py). "
     )
     detail += (
         f"{config} still exists, so this is a wiped binary rather than a lost login; "

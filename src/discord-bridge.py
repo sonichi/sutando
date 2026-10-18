@@ -582,6 +582,9 @@ def archive_path(kind: str, task_id: str) -> "Path":
     return month_dir / f"{task_id}.txt"
 
 
+# The Team rulebook's PR-review command; `--non-owner` keeps the review off codex.
+TEAM_PR_REVIEW_COMMAND = "bash skills/claude-codex/scripts/review-pr.sh <N> --non-owner"
+
 # How the Stage-1 answer reaches the staging file, keyed by `answer_on_stdout`.
 _SANDBOX_OUTPUT_NOTE = {
     False: "   - The `-o` flag writes ONLY the agent's final message to the file (no exec sub-command dumps, no setup banner). Do NOT redirect stdout — codex's stdout includes verbose exec output from internal tool calls (e.g. github plugin reading PR diffs), which floods Discord. Do NOT add commentary.\n",
@@ -4082,7 +4085,7 @@ async def _handle_discord_message(message, force=False):
             + _SANDBOX_OUTPUT_NOTE[_sandbox.answer_on_stdout] +
             "\n"
             "2. PR-REVIEW REQUEST (the task asks you to review / look at a specific GitHub PR #N) — AUTO-REVIEW, read-only:\n"
-            "   - Run: bash skills/claude-codex/scripts/review-pr.sh <N>   (fetches the diff via `gh pr diff` — READ-ONLY: no checkout, never mutates git state or fails on a dirty tree — inlines it into `codex exec --sandbox read-only` `< /dev/null`, bounded by codex-bounded.sh --stall/--max so it can't grind. The verdict is comment-only; it never merges/approves. Diff is fetched OUTSIDE the sandbox so the sandboxed agent needs no network. Note: codex is agentic — a review can take 100s+; --max defaults to 240, don't shorten it.)\n"
+            f"   - Run: {TEAM_PR_REVIEW_COMMAND}   (keep `--non-owner`: it fetches the PR's diff and changed files via `gh` — READ-ONLY, no checkout — into a fresh temp dir outside the repo and workspace, and runs the sandbox runner there with read-only file tools confined to that dir, so the reviewer can read the PR's code and no other file. Never codex. The verdict is comment-only; it never merges/approves. A review can take 100s+; --max defaults to 240, don't shorten it.)\n"
             "   - On SUCCESS (exit 0): stdout line 1 is `VERDICT-MARKER: <token>`; the verdict is ONLY the text after the LAST occurrence of that exact <token>. The token is a per-run nonce, so a diff or verdict that quotes a marker literal cannot truncate the extract. Everything before it is codex's exec trace (kept there deliberately so codex-bounded.sh --stall can watch it) and contains repository source the agent inlined while working — copying the whole stream, or its tail, quotes that source as the PR's own content. Extract after the last marker and write ONLY that to results/task-{id}.txt. This is information-only (the team-tier bound) — safe because the review ran sandboxed read-only and the output is just analysis.\n"
             "   - On FAILURE (non-zero — stalled=125 / hit cap=124 / gh-or-codex error): FALL BACK to owner-ping — write results/proactive-{ts}.txt (who asked, which PR link, that the auto-review failed), then write exactly `[no-send]` to results/task-{id}.txt so the task archives — the bridge delivers nothing for that marker, so this is still no sender reply. Owner-ping is the FALLBACK here, not the default.\n"
             "2b. MESSAGE OWNER — when the task needs owner decision for any OTHER reason (authorization, scope question, merge direction, repeated echo):\n"
