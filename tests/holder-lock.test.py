@@ -2268,6 +2268,44 @@ class HolderLockTest(unittest.TestCase):
                          "a record whose owner fields are this process is removed whatever the fencing pid")
         self.assertFalse((self.ldir() / "holder").exists())
 
+    def test_tombstone_consumer_refuses_a_lock_file_or_directory_replaced_before_the_write(self):
+        hpid, hstart = self.dead()
+        dpid, dstart = self.dead()
+        dead = self.put(self.record2(hpid, hstart, attached=(dpid, dstart)))
+        (self.ldir() / "lock").touch()
+        directory = self.ldir()
+        for name, swap in (("the lock file", lambda: (os.rename(directory / "lock", directory / "lock.old"),
+                                                       (directory / "lock").touch())),
+                           ("the directory", lambda: (os.rename(directory, str(directory) + ".aside"),
+                                                      os.mkdir(directory)))):
+            def swap_after_the_proof(rec, swap=swap):
+                swap()
+                return True
+            with mock.patch.object(self.hl, "_proven_dead", swap_after_the_proof), \
+                    self.assertRaises(self.hl.LockError) as e:
+                self.hl.tombstone_consumer(str(self.root), dead, by="launcher", reason="proved gone")
+            self.assertEqual(str(e.exception), "replaced", name)
+            held = Path(str(directory) + ".aside") if name == "the directory" else directory
+            self.assertEqual((held / "holder").read_bytes(), dead, "%s: nothing written" % name)
+            if name == "the lock file":
+                os.rename(directory / "lock.old", directory / "lock")
+
+    def test_attach_consumer_names_only_the_holders_own_live_child(self):
+        owner = self.owned()
+        self.hl.publish(owner, "claude-local")
+        published = (self.ldir() / "holder").read_bytes()
+        stranger = os.getppid()
+        dpid, dstart = self.dead()
+        for pid, start, why in ((stranger, self.hl.start_time(stranger), "another process's child"),
+                                (dpid, dstart, "a dead child")):
+            with self.assertRaises(self.hl.LockError) as e:
+                self.hl.attach_consumer(owner, published, pid=pid, start=start)
+            self.assertEqual(str(e.exception), "not the holder's live child", why)
+            self.assertEqual((self.ldir() / "holder").read_bytes(), published, "%s: nothing written" % why)
+        cpid, cstart = self.proc()
+        self.hl.attach_consumer(owner, published, pid=cpid, start=cstart)
+        self.end(cpid)
+
     def test_tombstone_consumer_needs_the_pair_dead_twice_and_never_removes_the_record(self):
         hpid, hstart = self.dead()
         cpid, cstart = self.proc()

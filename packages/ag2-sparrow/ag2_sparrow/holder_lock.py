@@ -255,6 +255,16 @@ def start_time(pid: int) -> Optional[str]:
         return None
 
 
+def parent_pid(pid: int) -> Optional[int]:
+    """The parent pid of a running process, read with ps; None if unseen."""
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(int(pid))], capture_output=True, text=True,
+                             env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"}, timeout=10).stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return int(out) if out.isdigit() else None
+
+
 def _pid_alive(pid: int) -> Optional[bool]:
     try:
         os.kill(pid, 0)
@@ -1004,8 +1014,9 @@ def _own_record(owner: Owner, raw: Optional[bytes]) -> dict:
 
 
 def attach_consumer(owner: Owner, expected: bytes, *, pid: int, start: str) -> Published:
-    """Compare-and-swap by the holder: while the record's bytes still equal `expected`, write the
-    consumer and move the top-level pid/start to it, so its liveness fences the root from here on.
+    """Compare-and-swap by the holder: while the record's bytes still equal `expected` and `pid` is
+    this owner's live child (ps ppid, and the start given), write the consumer and move the top-level
+    pid/start to it, so its liveness fences the root from here on.
     Under the module guard and the §1.8 lock check; a record that changed is LockError("record
     changed"), nothing written."""
     _check_owner(owner)
@@ -1022,6 +1033,8 @@ def attach_consumer(owner: Owner, expected: bytes, *, pid: int, start: str) -> P
         rec = _own_record(owner, raw)
         if rec["consumer"] is not None:
             raise LockError("consumer attached")
+        if parent_pid(pid) != owner.pid or verify_lineage(pid, start) is not True:
+            raise LockError("not the holder's live child")
         rec = dict(rec, pid=pid, start=start, consumer={"pid": pid, "start": start})
         problem = _record_problem(rec)
         if problem:
@@ -1072,6 +1085,8 @@ def tombstone_consumer(work_root, expected: bytes, *, by: str, reason: str) -> P
                     raise LockError("no consumer")
                 if not _proven_dead(rec):
                     raise LockError("not proven dead")
+                if not (_same_at(fd, dfd, LOCK_NAME) and _dir_unchanged(directory, dfd)):
+                    raise LockError("replaced")
                 if _raw_record(dfd) != expected:
                     raise LockError("record changed")
                 st = os.fstat(fd)

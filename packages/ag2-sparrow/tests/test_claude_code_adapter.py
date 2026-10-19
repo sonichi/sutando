@@ -1528,6 +1528,25 @@ class ConnectBranches(ConnectBase):
 class LockHelpers(unittest.TestCase):
     """task_io: lock_held is held | free | unknown (the flock, occupancy); lock_holder is attribution."""
 
+    def test_the_contended_retry_reads_liveness_through_holder_locks_one_reader(self):
+        """A schema-2 record whose consumer is dead but whose holder lives is held: no retry. Nobody
+        live (no record) is a probe's momentary flock: retried until the bound."""
+        p = subprocess.Popen(["sleep", "30"])
+        dead_start = task_io.start_time(p.pid)
+        p.kill()
+        p.wait()
+        me = (os.getpid(), task_io.start_time(os.getpid()))
+        rec = {"schema": 2, "adapter": "x", "pid": p.pid, "start": dead_start, "host": holder_lock._host(),
+               "install_id": "i", "lock": {"dev": 1, "ino": 2}, "acquired_at": 1.0, "owner_pid": me[0],
+               "owner_start": me[1], "consumer": {"pid": p.pid, "start": dead_start}, "tombstone": None}
+        for prior, retried in ((holder_lock.Valid(rec), False), (holder_lock.Missing(), True)):
+            calls = []
+            with mock.patch.object(holder_lock, "acquire",
+                                   lambda *a, **k: calls.append(1) or holder_lock.Contended(prior)), \
+                    self.assertRaises(task_io.LockRefused):
+                task_io.acquire_lock("/nonexistent-root", "x", retry_s=0.3)
+            self.assertEqual(len(calls) > 1, retried, (prior, len(calls)))
+
     def test_lock_held_lock_holder_lock_path_and_lock_holder_pid(self):
         from ag2_sparrow import task_io
         with tempfile.TemporaryDirectory() as d:

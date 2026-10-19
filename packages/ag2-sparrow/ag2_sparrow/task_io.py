@@ -205,10 +205,8 @@ def acquire_lock(work, adapter, retry_s=0.0):
     try:
         while True:
             got = holder_lock.acquire(work, install_id=holder_lock.install_id(), timeout=0)
-            if isinstance(got, holder_lock.Contended) and time.monotonic() < deadline and not (
-                    isinstance(got.holder, holder_lock.Valid)
-                    and holder_lock.verify_lineage(got.holder.record["pid"], got.holder.record["start"],
-                                                   got.holder.record["host"])):
+            if isinstance(got, holder_lock.Contended) and time.monotonic() < deadline \
+                    and holder_lock._occupant(got.holder)[0] != "held":
                 time.sleep(0.05)
                 continue
             break
