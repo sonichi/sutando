@@ -3,6 +3,8 @@
 two store pins): the vendored hitl is imported first; the claude-local root is projected into the
 owner DM and accepted only through the adapter's one accepter; a click, the owner's bare `/exit` and
 an event-channel click are consumed and never become a chat task; the default store is untouched."""
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -17,6 +19,9 @@ PKG = REPO / "packages" / "ag2-sparrow"
 TMP = Path(tempfile.mkdtemp(prefix="cl-bridge-"))
 os.environ["HOME"] = str(TMP / "home")
 (TMP / "home").mkdir()
+# Before the import reads them: never a developer host's channel .env or access map.
+os.environ["AG2_DEVICE_ENV"] = str(TMP / "device" / ".env")
+os.environ["CLAUDE_CONFIG_DIR"] = str(TMP / "claude-config")
 sys.path.insert(0, str(PKG))
 from ag2_sparrow._dirs import set_dirs  # noqa: E402
 
@@ -86,6 +91,18 @@ class Base(unittest.TestCase):
         return t
 
 
+class Hermetic(unittest.TestCase):
+    def test_the_channel_env_and_the_access_map_are_this_tests_own(self):
+        self.assertTrue(rgb._ag2space_access_path().startswith(str(TMP)), rgb._ag2space_access_path())
+        (TMP / "device").mkdir(exist_ok=True)
+        (TMP / "device" / ".env").write_text("REMOTE_TASK_TOKEN=tok-test\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rgb._token_from_ag2space_env()
+        lines = [ln for ln in err.getvalue().splitlines() if "loaded from" in ln]
+        self.assertTrue(lines and all(str(TMP) in ln for ln in lines), err.getvalue())
+
+
 class Projection(Base):
     def test_the_primary_projects_the_claude_local_root_into_the_owner_dm_and_fills_the_room(self):
         default_before = tree(self.default.root)
@@ -101,6 +118,38 @@ class Projection(Base):
         self.assertEqual({k: v for k, v in tree(self.default.root).items() if self.req.id in k}, {},
                          "(a) the claude-local card never lands in the default store")
         self.assertTrue(set(default_before) <= set(tree(self.default.root)))
+
+    def test_a_stuck_default_card_never_holds_back_a_claude_local_card_and_the_reverse(self):
+        sent = []
+
+        def refuse_default(method, path, payload, timeout=20):
+            sent.append(payload)
+            return {"ok": False} if self.default_req.id in json.dumps(payload) else {"event_id": "$cl"}
+        with mock.patch.object(rgb, "_req", refuse_default):
+            self.assertEqual(rgb._project_hitl(log=lambda *a: None), 1)
+        self.assertTrue(any(self.req.id in json.dumps(p) for p in sent), "projected despite the stuck default card")
+        self.assertEqual(self.store().load(self.req.id).room, DM)
+        rgb._hitl_backoff_reset()
+        sent.clear()
+        with mock.patch.object(rgb, "_req", lambda m, p, payload, timeout=20: sent.append(payload) or {"event_id": "$d"}), \
+                mock.patch.object(rgb, "_project_claude_local", side_effect=RuntimeError("claude-local store broke")):
+            with self.assertRaises(RuntimeError):
+                rgb._project_hitl(log=lambda *a: None)
+        self.assertTrue(any(self.default_req.id in json.dumps(p) for p in sent), "the default card went out first")
+        rgb._hitl_backoff_reset()
+
+    def test_a_raising_default_sender_still_gives_the_claude_local_card_its_pass(self):
+        sent = []
+
+        def raise_default(method, path, payload, timeout=20):
+            if self.default_req.id in json.dumps(payload):
+                raise OSError("relay down for that card")
+            sent.append(payload)
+            return {"event_id": "$cl"}
+        with mock.patch.object(rgb, "_req", raise_default), self.assertRaises(OSError):
+            rgb._project_hitl(log=lambda *a: None)
+        self.assertTrue(any(self.req.id in json.dumps(p) for p in sent), "projected before the error is re-raised")
+        rgb._hitl_backoff_reset()
 
     def test_a_secondary_gateway_projects_nothing(self):
         with mock.patch.object(rgb, "GATEWAY_INSTANCE", "second"):
@@ -136,6 +185,18 @@ class Clicks(Base):
             self.assertTrue(str(out).startswith("rejected:"), out)
             self.assertIn("did not apply", rgb._hitl_control_body(out))
         self.assertEqual(tree(self.store_root), before)
+
+    def test_a_keep_waiting_whose_rearm_fails_after_the_commit_tells_the_owner_it_is_recorded(self):
+        click = self.click()
+        click["hitl_action"]["action_id"] = card.ACTION_KEEP
+        with mock.patch.object(card, "reconcile_rearm", side_effect=ValueError("store busy")):
+            out = rgb._handle_hitl_action(click)
+        self.assertEqual(out, "applied:rearm-pending:store busy")
+        body = rgb._hitl_control_body(out)
+        self.assertIn("Recorded: keep waiting", body)
+        self.assertNotIn("already moved", body)
+        got = self.store().load(self.req.id)
+        self.assertEqual((got.status, card.local(got)["effect_phase"]), ("in_progress", card.PHASE_REARMING))
 
     def test_commit_unknown_is_consumed_never_a_chat_task_and_sends_nothing(self):
         from ag2_sparrow.hitl import manager as hm
@@ -217,6 +278,13 @@ class Clicks(Base):
         self.assertFalse(claimant.claims(dict(event, content={"space.ag2.hitl.action": {"hitl_id": self.default_req.id}})))
         self.assertEqual(claimant.offer(dict(event, actor_id="@guest:ag2.space"))[0], "$e1")
         self.assertTrue(claimant.last_outcome.startswith("rejected:"))
+        before = tree(self.store_root)
+        for name, over, tiers in (("an attested guest tier", {"access_tier": "guest"}, {}),
+                                  ("a local cap below owner", {}, {OWNER: "team"})):
+            with mock.patch.object(rgb, "_load_tier_map", return_value=tiers):
+                claimant.offer(dict(event, **over))
+            self.assertTrue(claimant.last_outcome.startswith("rejected:"), (name, claimant.last_outcome))
+        self.assertEqual(tree(self.store_root), before, "the owner's id alone is not enough")
         self.assertEqual(claimant.offer(event), ["$e1"])
         self.assertEqual(claimant.last_outcome, "applied")
 

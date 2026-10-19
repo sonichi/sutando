@@ -910,6 +910,18 @@ class ConnectRoot(ConnectBase):
         self.assertEqual(cm.work_root(cfg), str(self.work))
         self.assertEqual(cm.canonical_root("", str(self.home / "w" / "sub" / ".." / "tasks")), (str(self.home / "w"), ""))
 
+    def test_a_root_with_a_line_break_is_refused_at_install_before_any_write(self):
+        for name in ("w\nx", "w\rx"):
+            odd = self.home / name
+            (odd / "tasks").mkdir(parents=True)
+            for flags in (("--work", str(odd)), ("--inbox", str(odd / "tasks"))):
+                with mock.patch.object(cm, "_run", side_effect=self.runner()) as run:
+                    rc, _, err = self.main("install", "--plugin-dir", str(self.plugin), *flags)
+                self.assertEqual((rc, "line break" in err), (2, True), (flags, err))
+                self.assertFalse(cli.config_path().exists(), "nothing written")
+                self.assertFalse(cm.service_path(L).exists())
+                self.assertEqual(run.call_count, 0, "no manager call")
+
     def test_a_symlinked_inbox_locks_the_persisted_root_which_a_sibling_shares(self):
         real = self.home / "elsewhere"
         (real / "tasks").mkdir(parents=True)
@@ -2696,10 +2708,66 @@ class CardAccepter(CardBase):
             accepter._apply(mgr, store, self.reply(req), None)
         other, _ = card.manager(self.store_root)
         with accepter.locks(self.root, self.lc.supervisor_lock, store):
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(accepter.Refused):
                 accepter._apply(mgr, other, self.reply(req), None)
             accepter._apply(mgr, store, self.reply(req), card.patch_for(card.ACTION_STOP, req.revision, "i"))
         self.assertEqual(self.load(req.id).status, "in_progress", "entered with the outer two held: committed")
+
+    def test_the_same_store_check_survives_python_O(self):
+        store, mgr = card.manager(self.store_root)
+        other, _ = card.manager(self.store_root)
+        with self.assertRaises(accepter.Refused):
+            accepter.same_store(mgr, other)
+        accepter.same_store(mgr, store)
+        r = subprocess.run([sys.executable, "-O", "-c", "import sys; sys.path.insert(0, %r)\n"
+                            "from ag2_sparrow import claude_local_accepter as a, claude_local_card as c\n"
+                            "s, m = c.manager(%r); o, _ = c.manager(%r)\n"
+                            "try:\n    a.same_store(m, o)\nexcept a.Refused:\n    print('refused')\n"
+                            % (str(PKG), str(self.store_root), str(self.store_root))], capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "refused", r.stderr)
+
+    def test_the_resolved_coordinates_are_the_gate_opened_and_the_record_read_under_the_lock_order(self):
+        req = self.raise_card()
+        sub = card.local(req)
+        opened, real = [], records.flocked
+        store_cls_locked = card.HitlStore.locked
+
+        def probe_free(path):
+            fd = os.open(str(path), os.O_RDWR)
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return True
+            except BlockingIOError:
+                return False
+            finally:
+                os.close(fd)
+
+        @contextlib.contextmanager
+        def spy_flocked(path, blocking=True):
+            opened.append(Path(path))
+            with real(path, blocking) as fd:
+                yield fd
+
+        @contextlib.contextmanager
+        def spy_locked(store):
+            opened.append(("store", probe_free(self.lc.supervisor_lock), probe_free(records.progress_lock_path(self.root))))
+            with store_cls_locked(store):
+                yield
+        with mock.patch.object(records, "flocked", spy_flocked), mock.patch.object(card.HitlStore, "locked", spy_locked):
+            self.assertEqual(self.accept(self.reply(req)), "applied")
+        self.assertEqual(opened[0], card.resolve_under(self.root, sub["progress_lock"]), "the gate is the resolved coordinate")
+        self.assertEqual(opened[1], self.lc.supervisor_lock)
+        self.assertEqual(opened[2], ("store", False, False), "the store lock is taken with the gate and supervisor lock held")
+        for odd in ("state/other.lock", "results/progress.lock"):
+            req = self.raise_card(stall=dict(STALL, frame_hash=os.urandom(8).hex()))
+            req.subject = {card.SUBJECT: dict(card.local(req), progress_lock=odd)}
+            store, _ = card.manager(self.store_root)
+            store.save(req, store.projection(req.id))
+            out = self.accept(self.reply(req))
+            self.assertTrue(out.startswith("rejected:") and "do not name" in out, (odd, out))
+            self.lc.clear_card(None)
 
     def test_a_coordinate_escaping_the_root_is_refused(self):
         for bad in ("../outside.lock", "/etc/passwd", "state/../../x"):

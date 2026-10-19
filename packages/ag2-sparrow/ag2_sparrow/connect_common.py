@@ -220,16 +220,22 @@ def work_root(cfg: dict) -> str:
 def canonical_root(work: str, inbox: str) -> "tuple[str, str]":
     """(root, '') from --work, else from the inbox whose LEXICAL basename must be `tasks`: its lexical
     parent, canonicalized once here and persisted, is what the session locks; a `tasks` that is itself
-    a symlink is refused; else ('', why)."""
+    a symlink is refused; a root with a newline in it is refused before anything is written; else ('', why)."""
     if work:
         root = str(Path(work).expanduser().resolve())
-        return root, tasks_link_problem(root)
+        return _root_checked(root)
     path = Path(os.path.normpath(os.path.expanduser(inbox)))
     if path.name != "tasks":
         return "", f"the inbox must be <work>/tasks, not {path}; pass --work <dir>"
     if path.is_symlink():
         return "", f"{path} is a symlink; tasks must be a real directory under the work root (point --work at it)"
-    root = str(path.parent.resolve())
+    return _root_checked(str(path.parent.resolve()))
+
+
+def _root_checked(root: str) -> "tuple[str, str]":
+    # The config, unit and plist are line-oriented: a newline in the root cannot be stored or run.
+    if "\n" in root or "\r" in root:
+        return "", f"the work root {root!r} contains a line break; use a directory whose path has none"
     return root, tasks_link_problem(root)
 
 

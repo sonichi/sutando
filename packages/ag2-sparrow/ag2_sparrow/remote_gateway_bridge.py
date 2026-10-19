@@ -1724,23 +1724,26 @@ def _project_hitl(log=print) -> int:
         return 0
     workspace = _STATE.parent
     manager = HitlManager(HitlStore(default_store(workspace)))
-    done = []
+    done, failed, raised = [], False, None
+    # Each store gets its pass: a stuck card in one never holds back the other's.
     try:
         if pending_ids(manager):
-            done = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20), room)
-            if not done:
-                _hitl_backoff_bump(log)
-                return 0
+            got = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20), room)
+            done, failed = list(got or []), not got
+    except Exception as e:  # noqa: BLE001 — re-raised below, after the claude-local pass
+        failed, raised = True, e
+    try:
         done += _project_claude_local(mods, room, log)
-    except Exception:
-        _hitl_backoff_bump(log)  # a raising sender is a refusal too
-        raise
-    if not done:
-        _hitl_backoff_reset()  # idle is not failure; a new card must not wait out a backoff
-        return 0
-    _hitl_backoff_reset()
+    except Exception as e:  # noqa: BLE001 — re-raised below
+        failed, raised = True, raised or e
     for req_id, event_id in done:
         log(f"hitl: projected {req_id} -> {event_id or 'no event id'}")
+    if failed:
+        _hitl_backoff_bump(log)  # a refusing or raising sender
+        if raised is not None:
+            raise raised
+        return len(done)
+    _hitl_backoff_reset()  # idle is not failure; a new card must not wait out a backoff
     return len(done)
 
 
@@ -1761,6 +1764,7 @@ def _hitl_reply_handler(owner_mxid: str, log=print):
 
 
 CLAUDE_LOCAL_ID_PREFIX = "hitl_cl_"
+REARM_PENDING = "applied:rearm-pending:"
 _EXIT_TEXT = "/exit"
 
 
@@ -1831,6 +1835,9 @@ def _hitl_control_body(hitl_out) -> str:
     """The control result closing a consumed click: a refusal or cancellation is the owner's to hear;
     applied and commit-unknown (consumed, reconciled by the launcher) send nothing."""
     out = str(hitl_out)
+    if out.startswith(REARM_PENDING):
+        return (f"Recorded: keep waiting. The new card could not be raised yet ({out[len(REARM_PENDING):]}); "
+                "the launcher completes it at its next reconcile.")
     if out.startswith("rejected:"):
         return f"That click did not apply: the card had already moved ({out[9:]}). Please use the current card."
     if out.startswith("cancelled:"):
@@ -1867,8 +1874,11 @@ class _ClaudeLocalClicks:
             try:
                 reply = ActionReply.from_wire(dict(self._payload(event), room=str(event.get("room_id") or ""),
                                                    sender=actor))
-                self.last_outcome = accepter.accept(reply, state_dir=_STATE,
-                                                    owner_ok=bool(self.owner) and actor == self.owner, log=self.log)
+                # The relay's predicate: the owner by id and by tier (an attested tier when the event has
+                # one; the actor itself is broker-attested), always under the local cap.
+                tier = _tier_for(actor, _normalized_tier(event.get("access_tier") or "owner"))
+                self.last_outcome = accepter.accept(reply, state_dir=_STATE, log=self.log,
+                                                    owner_ok=bool(self.owner) and actor == self.owner and tier == "owner")
             except MalformedActionError as e:
                 self.last_outcome = f"rejected:{e}"
             except Exception as e:  # noqa: BLE001 — a broken click must not stall the drain

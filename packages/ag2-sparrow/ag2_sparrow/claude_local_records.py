@@ -125,8 +125,8 @@ def empty_supervisor() -> dict:
             "effect": None, "observed_session_id": None, "title_changed": None, "updated_at": 0.0}
 
 
-def load_supervisor(root) -> dict:
-    rec = read_json(supervisor_path(root))
+def load_supervisor(root, path=None) -> dict:
+    rec = read_json(supervisor_path(root) if path is None else path)
     if not rec:
         return empty_supervisor()
     out = empty_supervisor()

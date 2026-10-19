@@ -1,11 +1,12 @@
-"""The one accepter for a claude-local card (#5695 K5): bridge clicks, the owner-DM `/exit` and the
-local `stop --confirm` all land here. The bridge owns it (v3.10), so it lives outside the adapter.
+"""The one accepter for a claude-local card: bridge clicks, the owner-DM `/exit` and the local
+`stop --confirm` all land here. The bridge owns it, so it lives outside the adapter.
 
 Lock order, always: the progress gate (`<root>/state/progress.lock`) -> the supervisor lock (the
 install's `claude-local.supervisor.lock`) -> one fresh HitlStore's `locked()`, the manager
 constructed over that same object. The work root and the supervisor lock come from the opaque install
 id on the requirement, resolved through what the adapter registered beside the store; the
-root-relative coordinates are confined to that root. Under all three locks the requirement is
+root-relative coordinates must resolve under that root to its own progress gate and supervisor
+record, and those resolved paths are the gate opened and the record read. Under all three locks the requirement is
 reloaded, the coordinates and the live stall token revalidated, and `apply_action(reply, patch)`
 writes the chosen action, the revision and status, the saga key and the effect phase in its one save.
 A directory fsync that fails after the replace is `commit-unknown`: nothing else is recorded, no
@@ -47,10 +48,22 @@ def _locate(reply_id: str, state_dir) -> "tuple[card.HitlStore, card.HitlManager
     return store, mgr, found
 
 
+def coordinates(root, sub: dict) -> "tuple":
+    """(progress gate, supervisor record): the card's coordinates resolved under the root, which must
+    name this root's own gate and record (the files the Mod and the launcher lock); else ValueError."""
+    if not card.coordinates_ok(sub):
+        raise ValueError("lock coordinates are not root-relative and confined")
+    gate, record = card.resolve_under(root, sub["progress_lock"]), card.resolve_under(root, sub["supervisor_record"])
+    if (gate, record) != (records.progress_lock_path(root).resolve(), records.supervisor_path(root).resolve()):
+        raise ValueError("lock coordinates do not name this root's progress gate and supervisor record")
+    return gate, record
+
+
 @contextmanager
-def locks(root, supervisor_lock, store):
+def locks(root, supervisor_lock, store, gate=None):
     """progress gate -> supervisor lock -> the store's own lock, in that order and no other."""
-    with records.flocked(records.progress_lock_path(root)), records.flocked(supervisor_lock), store.locked():
+    gate = records.progress_lock_path(root) if gate is None else gate
+    with records.flocked(gate), records.flocked(supervisor_lock), store.locked():
         _OUTER.held = getattr(_OUTER, "held", 0) + 1
         try:
             yield
@@ -62,29 +75,37 @@ def _apply(mgr, store, reply, patch):
     """apply_action only from inside `locks`, and only on the manager over the outer store."""
     if not getattr(_OUTER, "held", 0):
         raise Refused("apply_action entered without the progress gate and the supervisor lock; refused")
-    assert mgr.store is store, "the manager must be constructed over the outer store object"
+    same_store(mgr, store)
     return mgr.apply_action(reply, patch)
 
 
-def live_token(root) -> str:
-    return records.stall_token(records.load_supervisor(root).get("stall"))
+def same_store(mgr, store) -> None:
+    """The manager must be constructed over the outer store object: a check `python -O` keeps."""
+    if mgr.store is not store:
+        raise Refused("apply_action on a manager over another store object; refused")
 
 
-def _revalidate(req: HumanRequirement, reply: ActionReply, root, owner_ok: bool, local: bool) -> dict:
+def live_token(root, record=None) -> str:
+    return records.stall_token(records.load_supervisor(root, record).get("stall"))
+
+
+def _revalidate(req: HumanRequirement, reply: ActionReply, root, owner_ok: bool, local: bool, opened) -> dict:
+    """`opened`: the (gate, record) taken from the card before the locks; the reloaded card must name them."""
     sub = card.local(req)
     if not owner_ok:
         raise Refused("%s: only the owner may act on this card" % req.id)
-    if not card.coordinates_ok(sub):
-        raise Refused("%s: lock coordinates are not root-relative and confined" % req.id)
+    try:
+        if coordinates(root, sub) != opened:
+            raise ValueError("lock coordinates changed under the locks")
+    except ValueError as e:
+        raise Refused("%s: %s" % (req.id, e))
     room = sub.get("room") or req.room
     if not local and (not room or reply.room != room):
         raise Refused("%s: reply from another room (or the card has no projected room yet)" % req.id)
-    supervisor = records.load_supervisor(root)
+    supervisor = records.load_supervisor(root, opened[1])
     if sub.get("install_id") != supervisor.get("install_id"):
         raise Refused("%s: the card names another install" % req.id)
-    for key in ("progress_lock", "supervisor_record"):
-        card.resolve_under(root, sub[key])
-    if sub.get("stall_token", "") != live_token(root):
+    if sub.get("stall_token", "") != live_token(root, opened[1]):
         raise Refused("%s: the session made progress since the card; action cancelled" % req.id, "cancelled")
     return sub
 
@@ -102,21 +123,23 @@ def reconcile_unconfirmed(store, mgr, req: HumanRequirement) -> bool:
 
 
 def accept(reply: ActionReply, *, state_dir, owner_ok: bool, local: bool = False, log=print) -> str:
-    """applied | applied:reconciled | rejected:<why> | cancelled:<why> | commit-unknown:<why>. `local`
+    """applied | applied:reconciled | applied:rearm-pending:<why> | rejected:<why> | cancelled:<why> |
+    commit-unknown:<why>. `local`
     is the machine's own `stop --confirm` (no room); every other reply must come from the card's room."""
     try:
         store, mgr, found = _locate(reply.hitl_id, state_dir)
         root, supervisor_lock = card.resolve_install(store.root, card.local(found).get("install_id"))
+        opened = coordinates(root, card.local(found))
     except Refused as e:
         return "%s:%s" % (e.outcome, e.why)
     except ValueError as e:
         return "rejected:%s" % e
     try:
-        with locks(root, supervisor_lock, store):
+        with locks(root, supervisor_lock, store, gate=opened[0]):
             req = store.load(reply.hitl_id)
             if req is None:
                 return "rejected:%s vanished" % reply.hitl_id
-            sub = _revalidate(req, reply, root, owner_ok, local)
+            sub = _revalidate(req, reply, root, owner_ok, local, opened)
             if req.status == STATUS_IN_PROGRESS and reconcile_unconfirmed(store, mgr, req):
                 return "applied:reconciled"
             if req.status != STATUS_PENDING:
@@ -129,7 +152,11 @@ def accept(reply: ActionReply, *, state_dir, owner_ok: bool, local: bool = False
             except OSError as e:
                 return "commit-unknown:%s" % (e.strerror or e)
             if action.id == card.ACTION_KEEP:
-                card.reconcile_rearm(store, mgr, store.load(req.id))
+                try:
+                    card.reconcile_rearm(store, mgr, store.load(req.id))
+                except ValueError as e:     # the decision is committed; the launcher's reconcile finishes it
+                    log("claude-local: %s -> keep waiting recorded; rearm pending: %s" % (req.id, e))
+                    return "applied:rearm-pending:%s" % e
             log("claude-local: %s -> %s accepted (revision %d)" % (req.id, action.id, reply.expected_revision))
             return "applied"
     except Refused as e:
