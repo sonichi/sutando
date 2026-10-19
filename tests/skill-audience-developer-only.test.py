@@ -10,7 +10,9 @@ Hermetic: temp dirs only, a minimal environment, no live workspace or Claude hom
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -115,6 +117,74 @@ class OptInKey(unittest.TestCase):
     def test_skills_is_a_known_object_key(self):
         self.assertIn("skills", sutando_config._KNOWN_TOP_LEVEL_KEYS)
         self.assertIn("skills", sutando_config._OBJECT_TOP_LEVEL_KEYS)
+
+
+class HelperInProcess(unittest.TestCase):
+    """main() and developer_opt_in() run in-process, against a temp repo's config."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = Path(self.tmp.name)
+        self.repo = t / "repo"
+        self.repo.mkdir()
+        self.dev = make_skill(t / "skills", "dev-tool", {"audience": "developer"})
+        self.typo = make_skill(t / "skills", "typo-tool", {"audience": "devloper"})
+        self.plain = make_skill(t / "skills", "plain")
+        self.saved = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("SUTANDO_")}
+        os.environ["SUTANDO_TEST_MODE"] = "1"
+        os.environ["SUTANDO_WORKSPACE"] = str(t / "ws")
+
+    def tearDown(self):
+        for k in [k for k in os.environ if k.startswith("SUTANDO_")]:
+            del os.environ[k]
+        os.environ.update(self.saved)
+        sutando_config._reset_cache_for_tests()
+        self.tmp.cleanup()
+
+    def configure(self, developer):
+        sutando_config._reset_cache_for_tests()
+        (self.repo / "sutando.config.json").write_text(json.dumps({"skills": {"developer": developer}}))
+
+    def run_main(self, argv) -> tuple:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = sa.main(argv, repo_root=self.repo)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_excluded_without_opt_in(self):
+        self.configure(False)
+        rc, out, _ = self.run_main(["excluded", str(self.dev), str(self.typo), str(self.plain)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.splitlines(), [
+            "dev-tool\tdeveloper-only",
+            "typo-tool\tunknown audience 'devloper'; treated as developer-only"])
+
+    def test_excluded_with_opt_in(self):
+        self.configure(True)
+        self.assertEqual(self.run_main(["excluded", str(self.dev), str(self.plain)]), (0, "", ""))
+
+    def test_usage(self):
+        for argv in ([], ["other"]):
+            rc, out, err = self.run_main(argv)
+            self.assertEqual((rc, out), (2, ""), argv)
+            self.assertIn("usage: skill_audience.py excluded", err)
+
+    def test_developer_opt_in_reads_the_given_repo(self):
+        self.configure(True)
+        self.assertTrue(sa.developer_opt_in(self.repo))
+        self.configure(False)
+        self.assertFalse(sa.developer_opt_in(self.repo))
+
+    def test_developer_opt_in_puts_src_on_the_path(self):
+        src = str(REPO / "src")
+        saved = list(sys.path)
+        sys.path[:] = [p for p in sys.path if p != src]
+        try:
+            self.configure(True)
+            self.assertTrue(sa.developer_opt_in(self.repo))
+            self.assertIn(src, sys.path)
+        finally:
+            sys.path[:] = saved
 
 
 class InstallShEndToEnd(unittest.TestCase):

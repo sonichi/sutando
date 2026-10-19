@@ -78,11 +78,11 @@ def excluded(skill_dirs: Iterable, developer: bool) -> list:
     return out
 
 
-def main(argv: list) -> int:
+def main(argv: list, repo_root: Optional[Path] = None) -> int:
     if not argv or argv[0] != "excluded":
         print("usage: skill_audience.py excluded <skill_dir>...", file=sys.stderr)
         return 2
-    for name, reason in excluded(argv[1:], developer_opt_in()):
+    for name, reason in excluded(argv[1:], developer_opt_in(repo_root)):
         print(f"{name}\t{reason}")
     return 0
 
