@@ -173,6 +173,7 @@ class RuntimeDispatcher:
                                      "needs a new approval)"},
                     resolved_by="daemon-recovery")
                 n += 1
+        self._reconcile_expired()
         if relinked or n:
             _log(f"recovered {relinked} pending request(s)"
                  + (f", failed {n} interrupted capability execution(s)" if n else ""))
@@ -590,6 +591,10 @@ class RuntimeDispatcher:
     # ── resolution mapping (ha decision → runtime terminal state) ──────────
     def _settle(self, request_id: str) -> None:
         rec = self.store.get(request_id)
+        if (rec and rec["status"] == "expired"
+                and rec["requestType"] in ("approval", "elicitation", "human_action")):
+            self.ha.expire(request_id)
+            return
         if not rec or rec["status"] != "pending":
             return
         aid = self._ha_of.get(request_id)
@@ -631,9 +636,17 @@ class RuntimeDispatcher:
                                   result={"answer": answer},
                                   resolved_by=resolved_by)
 
+    def _reconcile_expired(self) -> None:
+        for rec in self.store.expired_human_requests():
+            try:
+                self._settle(rec["requestId"])
+            except Exception as e:  # A failed mirror remains eligible on the next pass.
+                _log(f"requirement expiry error for {rec['requestId']} (isolated): {e}")
+
     async def resolver_loop(self) -> None:
         while True:
             try:
+                self._reconcile_expired()
                 for rec in self.store.pending():
                     self._settle(rec["requestId"])
             except Exception as e:  # noqa: BLE001 — resolver must never die

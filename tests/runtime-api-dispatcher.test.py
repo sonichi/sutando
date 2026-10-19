@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
@@ -294,6 +295,55 @@ d.recover()
 check("recovery relinks a pending approval to its card", a_rid in d._ha_of, str(d._ha_of))
 check("recovery relinks a pending elicitation to its card", e_rid in d._ha_of, str(d._ha_of))
 check("recovered approval is still pending", store.get(a_rid)["status"] == "pending")
+
+print("── expired mirror reconciliation and retry ──")
+d, store, ha, tmp = fresh()
+expired_ids = []
+for kind, params in (("approval", {"action": "local"}),
+                     ("elicitation", {"question": "q", "type": "confirmation"}),
+                     ("human_action", {"action": "local"})):
+    rid = run(d.handle(kind + ".request", {**params, "expiresInS": 0.05}))["requestId"]
+    expired_ids.append(rid)
+    ha.manager.record_projection(d._ha_of[rid], 1, "$" + rid)
+time.sleep(0.1)
+d._settle(expired_ids[0])
+check("settle expires the mirror when its read expires the runtime row",
+      ha.manager.get(ha_action_id(expired_ids[0])).status == "expired")
+for rid in expired_ids:
+    store.get(rid)
+runtime_before = [store.get(rid) for rid in expired_ids]
+retry_id = ha_action_id(expired_ids[1])
+real_save = ha.manager.store.save
+failures = []
+
+
+def fail_once(req, *args, **kwargs):
+    if req.id == retry_id and req.status == "expired" and not failures:
+        failures.append(req.id)
+        raise OSError("synthetic transient mirror write failure")
+    return real_save(req, *args, **kwargs)
+
+
+d._ha_of.clear()
+with patch.object(ha.manager.store, "save", side_effect=fail_once):
+    d.recover()
+    check("recovery isolates a transient mirror-write failure",
+          failures == [retry_id] and ha.manager.get(retry_id).status == "pending")
+    check("one failed expiry does not block another mirror",
+          ha.manager.get(ha_action_id(expired_ids[2])).status == "expired")
+    run(one_and_a_bit())
+check("periodic reconciliation retries an already-expired runtime row",
+      ha.manager.get(retry_id).status == "expired")
+snapshots = [ha.manager.get(ha_action_id(rid)) for rid in expired_ids]
+d.recover()
+run(one_and_a_bit())
+check("repeated success adds no revisions or runtime transitions",
+      snapshots == [ha.manager.get(ha_action_id(rid)) for rid in expired_ids]
+      and runtime_before == [store.get(rid) for rid in expired_ids])
+check("expiry preserves original projection receipts",
+      all(ha.manager.store.projection(ha_action_id(rid)) ==
+          {"revision": 1, "event_id": "$" + rid} for rid in expired_ids))
+check("expired mirrors leave active()", not ha.manager.active())
 
 print("── approval.respond (device-plane; needs a daemon-resolved grant) ──")
 d0, store0, ha0, _ = fresh(actor="ungranted")

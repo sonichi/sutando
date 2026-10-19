@@ -143,6 +143,17 @@ class HumanActionAdapter:
             self.manager.store.save(req)
         self.manager.resolve(action_id)
 
+    def expire(self, request_id: str) -> None:
+        """Expire only the existing requirement belonging to this request."""
+        aid = ha_action_id(request_id)
+        with self.manager.store.locked():
+            req = self.manager.get(aid)
+            if (req is None or req.terminal or req.runtime != RUNTIME
+                    or req.subject.get("runtime_request_id") != request_id
+                    or req.guard != f"runtime:{request_id}"):
+                return
+            self.manager.expire(aid)
+
     # ── inbound: resolved requirement → runtime terminal state ─────────────
     def poll_resolution(self, action_id: str):
         """Return (status, answers, resolved_by) once the requirement reaches a

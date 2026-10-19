@@ -14,6 +14,7 @@ import asyncio
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -147,6 +148,55 @@ class AdapterEdgeTests(unittest.TestCase):
         self.assertEqual(self.ha.poll_resolution(aid), ("expired", None, None))
         status, answers, _by = self.ha.poll_resolution(aid)
         self.assertEqual((status, answers), ("expired", None))
+
+    def test_expire_delegates_and_preserves_identity_answer_and_receipt(self):
+        from hitl.schema import ActionReply
+        for status in ("pending", "in_progress"):
+            with self.subTest(status=status):
+                rid = "r-expire-" + status
+                aid = self.ha.open_elicitation(self._req(rid, options=["A", "B"]))
+                req = self.ha.manager.get(aid)
+                if status == "in_progress":
+                    self.ha.manager.apply_action(ActionReply(
+                        aid, req.revision, "opt1", req.guard, answer="saved payload"))
+                self.ha.manager.record_projection(aid, 1, "$original", {"receipt": "keep"})
+                before = self.ha.manager.get(aid)
+                ledger = self.ha.manager.store.projection(aid)
+                with patch.object(self.ha.manager, "expire", wraps=self.ha.manager.expire) as expire:
+                    self.ha.expire(rid)
+                    expire.assert_called_once_with(aid)
+                after = self.ha.manager.get(aid)
+                self.assertEqual(after.status, "expired")
+                self.assertEqual(after.revision, before.revision + 1)
+                for field in ("id", "guard", "expires_at", "subject", "chosen_action", "answer"):
+                    self.assertEqual(getattr(after, field), getattr(before, field))
+                self.assertEqual(self.ha.manager.store.projection(aid), ledger)
+                self.ha.expire(rid)
+                self.assertEqual(self.ha.manager.get(aid), after)
+
+    def test_expire_never_creates_or_changes_foreign_or_terminal_requirements(self):
+        self.ha.expire("r-missing")
+        self.assertEqual(self.ha.manager.store.all(), [])
+        for field, value in (("runtime", "other"), ("subject", {}), ("guard", "other")):
+            rid = "r-mismatch-" + field
+            aid = self.ha.open_approval(self._req(rid, action="x"))
+            req = self.ha.manager.get(aid)
+            setattr(req, field, value)
+            self.ha.manager.store.save(req)
+            self.ha.expire(rid)
+            self.assertEqual(self.ha.manager.get(aid), req)
+        for terminal in ("resolved", "cancelled", "expired"):
+            rid = "r-terminal-" + terminal
+            aid = self.ha.open_approval(self._req(rid, action="x"))
+            if terminal == "resolved":
+                self.ha.resolve(aid, {"1": [2]}, "synthetic-owner")
+            elif terminal == "cancelled":
+                self.ha.manager.cancel(aid)
+            else:
+                self.ha.manager.expire(aid)
+            req = self.ha.manager.get(aid)
+            self.ha.expire(rid)
+            self.assertEqual(self.ha.manager.get(aid), req)
 
     def test_resolve_refuses_an_unknown_requirement_and_a_bad_index(self):
         from hitl.schema import MalformedActionError

@@ -142,6 +142,29 @@ def main() -> int:
 
     store.close()
 
+    filtered_db = str(tmp / "filtered.sqlite")
+    filtered = rs.RequestStore(filtered_db)
+    expected = set()
+    for kind in ("approval", "elicitation", "human_action", "capability", "other"):
+        for status in ("pending", *sorted(rs.TERMINAL)):
+            row = filtered.create(kind, kind + ".request", "synthetic", {})
+            if status != "pending":
+                filtered.transition(row["requestId"], status)
+            if status == "expired" and kind in ("approval", "elicitation", "human_action"):
+                expected.add(row["requestId"])
+    before = filtered._db.execute("SELECT * FROM runtime_requests").fetchall()
+    check({r["requestId"] for r in filtered.expired_human_requests()} == expected,
+          "expiry retry query includes only expired human requests")
+    check(all(r["status"] == "pending" for r in filtered.pending()),
+          "pending() stays restricted to pending rows")
+    check(filtered._db.execute("SELECT * FROM runtime_requests").fetchall() == before,
+          "expiry retry query preserves all stored fields")
+    filtered.close()
+    filtered = rs.RequestStore(filtered_db)
+    check({r["requestId"] for r in filtered.expired_human_requests()} == expected,
+          "expiry retry candidates survive reopen")
+    filtered.close()
+
     # migration: pre-idempotency schema gains the new columns on boot
     old_db = str(tmp / "old.sqlite")
     con = sqlite3.connect(old_db)
