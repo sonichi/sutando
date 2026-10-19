@@ -756,6 +756,10 @@ run_handler_now() {
         if [ "$timed_out" -eq 1 ]; then
           echo "watch-tasks-stream: handler timed out for $filename after ${SUTANDO_HANDLER_RUN_TIMEOUT}s (still running, not a decline); publishing safe terminal failure rather than assuming core may inherit it" >&2
           publish_terminal_failure "$filename" "timed out" "$task_path" || claim_settled=0
+        elif [ ! -e "$task_path" ]; then
+          # Moved out from under the handler (e.g. task-orphan-check archived it): its new owner answers, not us.
+          echo "watch-tasks-stream: handler failed for $filename after its payload left $task_path; another owner took it, publishing nothing" >&2
+          record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true
         else
           echo "watch-tasks-stream: required Team handler failed for $filename (exit $handler_rc); publishing safe terminal failure" >&2
           # An unsettled publish leaves the claim held rather than clobbering a
