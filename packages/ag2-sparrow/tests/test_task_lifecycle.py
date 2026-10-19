@@ -2137,15 +2137,9 @@ OTHER = {"pid": 2 ** 22 - 2, "start": "2026-01-01T00:00:01Z"}
 
 
 def main_lifecycle():
-    """origin/main's src/task_lifecycle.py as its own module, or None when git cannot show it."""
-    r = subprocess.run(["git", "-C", str(PKG_ROOT.parents[1]), "show", "origin/main:src/task_lifecycle.py"],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        return None
-    d = tempfile.mkdtemp(prefix="tl-main-")
-    atexit.register(shutil.rmtree, d, True)
-    path = Path(d) / "task_lifecycle_main.py"
-    path.write_text(r.stdout)
+    """The pre-claude-local task_lifecycle checked in as a fixture, as its own module; a missing
+    fixture is an error, never a skip."""
+    path = PKG_ROOT.parents[1] / "tests" / "fixtures" / "old_main" / "task_lifecycle_pre_local.py"
     spec = importlib.util.spec_from_file_location("task_lifecycle_main", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
@@ -2613,8 +2607,6 @@ class LocalClaimTest(Base):
 
     def test_unmodified_main_refuses_the_fenced_work_dir_at_startup_with_everything_unchanged(self):
         old = main_lifecycle()
-        if old is None:
-            self.skipTest("origin/main is not available")
         self.assertEqual(old.FORMAT, "cloud-session/1")
         self.assertFalse(hasattr(old, "FORMAT_LOCAL"))
         self.local_dir()

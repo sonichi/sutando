@@ -154,14 +154,10 @@ class HolderLockTest(unittest.TestCase):
         return rec
 
     def main_module(self):
-        """origin/main's src/holder_lock.py, loaded as its own module with this test's home."""
+        """The schema-1 holder_lock checked in as a fixture, loaded as its own module with this test's
+        home. A missing fixture is an error, never a skip."""
         import importlib.util
-        r = subprocess.run(["git", "-C", str(REPO), "show", "origin/main:src/holder_lock.py"],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            self.skipTest("origin/main is not available: %s" % r.stderr.strip())
-        path = self.tmp / "holder_lock_main.py"
-        path.write_text(r.stdout)
+        path = REPO / "tests" / "fixtures" / "old_main" / "holder_lock_schema1.py"
         spec = importlib.util.spec_from_file_location("holder_lock_main_%s" % self.kind, path)
         mod = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = mod                      # dataclasses resolve the module by name

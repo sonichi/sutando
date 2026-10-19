@@ -3085,26 +3085,15 @@ class LauncherUnit(ConnectBase):
 
 
 class OldMainHitl(CardBase):
-    """v3.10/v3.14 K5 rolling pins against origin/main's src/hitl, loaded from git into a scratch dir."""
+    """Rolling pins against the pre-claude-local src/hitl, checked in as a fixture."""
 
     def old_main(self, code):
-        """Run `code` with origin/main's hitl package first on sys.path; its stdout."""
+        """Run `code` with the fixture's hitl package first on sys.path; its stdout. A missing fixture
+        is an error, never a skip."""
         repo = PKG.parents[1]
-        scratch = Path(tempfile.mkdtemp(prefix="oldmain"))
-        self.addCleanup(shutil.rmtree, scratch, True)
-        names = subprocess.run(["git", "-C", str(repo), "ls-tree", "--name-only", "origin/main", "src/hitl/"],
-                               capture_output=True, text=True)
-        if names.returncode != 0 or not names.stdout.strip():
-            self.skipTest("origin/main is not available")
-        (scratch / "hitl").mkdir()
-        for name in names.stdout.split():
-            body = subprocess.run(["git", "-C", str(repo), "show", "origin/main:%s" % name], capture_output=True).stdout
-            (scratch / "hitl" / Path(name).name).write_bytes(body)
-        for dep in ("file_lock.py", "workspace_default.py", "local_task_protocol.py"):
-            body = subprocess.run(["git", "-C", str(repo), "show", "origin/main:src/%s" % dep], capture_output=True)
-            if body.returncode == 0:
-                (scratch / dep).write_bytes(body.stdout)
-        r = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r)\n%s" % (str(scratch), code)],
+        fixture = repo / "tests" / "fixtures" / "old_main" / "hitl_pre_local"
+        self.assertTrue((fixture / "hitl" / "manager.py").is_file(), "the checked-in fixture")
+        r = subprocess.run([sys.executable, "-c", "import sys; sys.path[:0] = [%r, %r]\n%s" % (str(fixture), str(repo / "src"), code)],
                            capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=""))
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
