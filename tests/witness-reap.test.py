@@ -63,6 +63,19 @@ class Tree:
         cfg.write_text(f'#!/bin/bash\n[ "$1" = workspace ] && printf %s "{ws}"\n')
         return ws
 
+    def stub_resolver(self, interpreter):
+        """A scripts/python-binary.sh whose resolve_python prints `interpreter` (may be empty)."""
+        (self.repo / "scripts" / "python-binary.sh").write_text(
+            f"resolve_python() {{ printf %s \"{interpreter}\"; }}\n")
+
+    def wrapped_python(self):
+        """An interpreter that records each use, then runs the real one."""
+        wrapper = self.root / "resolved-python"
+        log = self.root / "resolved-python.log"
+        wrapper.write_text(f'#!/bin/bash\necho used >> "{log}"\nexec "{sys.executable}" "$@"\n')
+        wrapper.chmod(0o755)
+        return wrapper, log
+
     def run(self, script, *args):
         return subprocess.run(["bash", str(self.repo / "scripts" / script), *args],
                               env=_env(self.home), capture_output=True, text=True, timeout=60)
@@ -101,6 +114,23 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(out.stderr.strip().splitlines(),
                          ["witness-reap: process-hygiene skill not installed; skipping"])
+
+    def test_reaper_runs_under_the_resolved_interpreter(self):
+        log = self.t.stub_skill(self.t.repo / "skills", rc=0)
+        wrapper, used = self.t.wrapped_python()
+        self.t.stub_resolver(wrapper)
+        out = self.t.run("witness-reap.sh")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(used.read_text().splitlines(), ["used"])
+        self.assertEqual(_calls(log), [["--reap", "--spotlight"]])
+
+    def test_resolver_finding_no_python_skips_rather_than_run_bare_python3(self):
+        log = self.t.stub_skill(self.t.repo / "skills", rc=0)
+        self.t.stub_resolver("")
+        out = self.t.run("witness-reap.sh")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(_calls(log), [])
+        self.assertIn("no runnable python3", out.stderr)
 
     def test_workspace_skill_is_found(self):
         ws = self.t.stub_workspace()

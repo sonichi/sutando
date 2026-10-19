@@ -22,7 +22,17 @@ if [ -z "$reaper" ]; then
   exit 0
 fi
 
-out="$(python3 "$reaper" --reap --spotlight 2>&1)"; rc=$?
+PY="python3"
+if [ -f "$REPO/scripts/python-binary.sh" ]; then
+  . "$REPO/scripts/python-binary.sh"
+  PY="$(resolve_python "$REPO")"
+  if [ -z "$PY" ]; then
+    echo "witness-reap: no runnable python3 (resolve_python printed nothing); skipping" >&2
+    exit 0
+  fi
+fi
+
+out="$("$PY" "$reaper" --reap --spotlight 2>&1)"; rc=$?
 [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/witness-reap: /' >&2
 if [ "$rc" -ne 0 ]; then
   echo "witness-reap: reaper exited rc=$rc; ignored, the witness result stands" >&2
