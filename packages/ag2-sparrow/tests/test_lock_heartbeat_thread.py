@@ -51,11 +51,11 @@ def fake_req(method, path, *a, **k):
         first_poll = first_poll or time.monotonic()
         if time.monotonic() - first_poll < warmup:
             time.sleep(0.2)
-            return {}
+            return {"tasks": []}   # the broker's empty poll; an empty body backs off
         started.write_text(str(os.getpid()))
         while not gate.exists():
             time.sleep(0.02)
-    return {}
+    return {"tasks": []} if path.startswith("/v1/tasks?") else {}
 
 
 m._req = fake_req
