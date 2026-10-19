@@ -160,10 +160,13 @@ python3 skills/process-hygiene/scripts/reap_orphans.py --reap --spotlight   # st
 ```
 
 Witness scripts run it once at their end: `scripts/witness-reap.sh`, called from
-a witness's EXIT trap, runs `--reap --spotlight` with the normal thresholds when
-this skill is installed, skips with one line when it is not, and never changes the
-witness's exit code. A health-check load warning that runs it once when the cause
-matches comes in a follow-up.
+a witness's EXIT trap. It runs only when this skill is installed, meaning linked
+into the host's skills dir (`bash scripts/sutando-config.sh claude-home-path
+skills`, where `skills/install.sh` links); a skill that is only shipped in the repo
+is skipped with one line. By default it is report-only (`--spotlight`); with
+`PROCESS_HYGIENE_WITNESS_REAP=1` it runs `--reap --spotlight` with the normal
+thresholds. It never changes the witness's exit code. A health-check load warning
+that runs it once when the cause matches comes in a follow-up.
 
 `--reap` refuses a minimum age under 600 s (exit 2), so a typo cannot reap young
 work. A run holds an exclusive `flock` on `process-hygiene.lock` beside its log;
@@ -177,6 +180,7 @@ Declared in `manifest.json`; read CLI > environment > manifest:
 |---|---|---|
 | `PROCESS_HYGIENE_MIN_AGE_S` | `7200` | `--min-age` |
 | `PROCESS_HYGIENE_GRACE_S` | `5` | `--grace` |
+| `PROCESS_HYGIENE_WITNESS_REAP` | `0` (report-only) | `scripts/witness-reap.sh --reap` / `--report-only` |
 
 `--claude-config-dir DIR` (repeatable) replaces the config dirs searched for
 session markers and transcripts. `--tmp-base DIR` (repeatable) replaces the default `/tmp` search base (on macOS

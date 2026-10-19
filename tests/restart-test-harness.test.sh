@@ -12,7 +12,7 @@ bad() { echo "FAIL $1"; fail=$((fail+1)); }
 TMPD="$(mktemp -d -t restart-harness.XXXXXX)"
 trap 'rm -rf "$TMPD"' EXIT
 
-# Run a copy beside its reap helper but without the skill, so its exit trap never runs the real reaper.
+# A copy beside its reap helper but no sutando-config.sh: no installed skills dir, so no real reaper.
 mkdir -p "$TMPD/repo/scripts"
 cp "$REPO/scripts/restart-test-harness.sh" "$REPO/scripts/witness-reap.sh" "$TMPD/repo/scripts/"
 H="$TMPD/repo/scripts/restart-test-harness.sh"

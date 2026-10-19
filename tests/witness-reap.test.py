@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """scripts/witness-reap.sh runs the process-hygiene reaper once at the end of a witness.
 
-Every case runs copies of the scripts in a temp tree with a stub reaper that records
-its argv, under `env -i`, so no real reaper, workspace or ~/.claude is reached.
+Every case runs copies of the scripts in a temp tree: a stub sutando-config.sh points
+the installed skills dir at a temp claude-home, and a stub reaper records its argv.
+Under `env -i`, so no real reaper, workspace or ~/.claude is reached.
 """
 import json
 import os
@@ -16,7 +17,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 HELPER = REPO / "scripts" / "witness-reap.sh"
 HARNESS = REPO / "scripts" / "restart-test-harness.sh"
-REL = Path("process-hygiene") / "scripts" / "reap_orphans.py"
+MANIFEST = REPO / "skills" / "process-hygiene" / "manifest.json"
+KEY = "PROCESS_HYGIENE_WITNESS_REAP"
+REPORT = ["--spotlight"]
+REAP = ["--reap", "--spotlight"]
 
 # Scripts that spawn a service, core, agent or browser to collect evidence; each must
 # run the helper on exit.
@@ -28,18 +32,14 @@ STUB_REAPER = """import json, sys
 from pathlib import Path
 with open(Path(__file__).with_name("calls.jsonl"), "a") as fh:
     fh.write(json.dumps(sys.argv[1:]) + "\\n")
-print("process-hygiene: mode=reap roots=0 candidates=0 stub")
+print("process-hygiene: mode=stub roots=0 candidates=0")
 sys.exit({rc})
 """
 
 
-def _env(home):
-    path = os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"])
-    return {"PATH": path, "HOME": str(home), "LANG": "C"}
-
-
 class Tree:
-    """A copied repo layout: scripts/ with the helper and harness, optional stub skills."""
+    """A copied repo layout with the helper and harness, a shipped stub skill, and a
+    claude-home whose skills/ dir is what the stub sutando-config.sh reports."""
 
     def __init__(self, tmp):
         self.root = Path(tmp)
@@ -49,19 +49,26 @@ class Tree:
             shutil.copy2(src, self.repo / "scripts" / src.name)
         self.home = self.root / "home"
         self.home.mkdir()
+        self.claude_home = self.root / "claude-home"
+        (self.claude_home / "skills").mkdir(parents=True)
+        (self.repo / "scripts" / "sutando-config.sh").write_text(
+            '#!/bin/bash\n[ "$1" = claude-home-path ] || exit 1\nshift\n'
+            f'p="{self.claude_home}"; for s in "$@"; do p="$p/$s"; done; printf %s "$p"\n')
+        self.skill = self.repo / "skills" / "process-hygiene"
 
-    def stub_skill(self, skills_root, rc=0):
-        reaper = Path(skills_root) / REL
-        reaper.parent.mkdir(parents=True, exist_ok=True)
-        reaper.write_text(STUB_REAPER.format(rc=rc))
-        return reaper.with_name("calls.jsonl")
+    def ship_skill(self, rc=0, opt_in=None):
+        """The repo's copy of the skill: real manifest, stub reaper."""
+        (self.skill / "scripts").mkdir(parents=True, exist_ok=True)
+        (self.skill / "scripts" / "reap_orphans.py").write_text(STUB_REAPER.format(rc=rc))
+        manifest = json.loads(MANIFEST.read_text())
+        if opt_in is not None:
+            manifest["config"][KEY] = opt_in
+        (self.skill / "manifest.json").write_text(json.dumps(manifest))
+        return self.skill / "scripts" / "calls.jsonl"
 
-    def stub_workspace(self):
-        ws = self.root / "ws"
-        ws.mkdir()
-        cfg = self.repo / "scripts" / "sutando-config.sh"
-        cfg.write_text(f'#!/bin/bash\n[ "$1" = workspace ] && printf %s "{ws}"\n')
-        return ws
+    def link_skill(self, target=None):
+        """What skills/install.sh does: a symlink in the installed skills dir."""
+        (self.claude_home / "skills" / "process-hygiene").symlink_to(target or self.skill)
 
     def stub_resolver(self, interpreter):
         """A scripts/python-binary.sh whose resolve_python prints `interpreter` (may be empty)."""
@@ -76,9 +83,11 @@ class Tree:
         wrapper.chmod(0o755)
         return wrapper, log
 
-    def run(self, script, *args):
+    def run(self, script, *args, env=None):
+        path = os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"])
+        full = {"PATH": path, "HOME": str(self.home), "LANG": "C", **(env or {})}
         return subprocess.run(["bash", str(self.repo / "scripts" / script), *args],
-                              env=_env(self.home), capture_output=True, text=True, timeout=60)
+                              env=full, capture_output=True, text=True, timeout=60)
 
 
 def _calls(log):
@@ -95,57 +104,93 @@ class HelperTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_runs_reaper_once_with_reap_and_spotlight(self):
-        log = self.t.stub_skill(self.t.repo / "skills", rc=0)
-        out = self.t.run("witness-reap.sh")
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(_calls(log), [["--reap", "--spotlight"]])
-        self.assertIn("witness-reap: process-hygiene: mode=reap", out.stderr)
+    def test_shipped_manifest_declares_report_only_default(self):
+        self.assertEqual(json.loads(MANIFEST.read_text())["config"][KEY], "0")
 
-    def test_reaper_error_is_printed_and_exit_is_zero(self):
-        log = self.t.stub_skill(self.t.repo / "skills", rc=2)
+    def test_linked_skill_runs_report_only_by_default(self):
+        log = self.t.ship_skill()
+        self.t.link_skill()
         out = self.t.run("witness-reap.sh")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(_calls(log), [["--reap", "--spotlight"]])
-        self.assertIn("reaper exited rc=2", out.stderr)
+        self.assertEqual(_calls(log), [REPORT])
+        self.assertIn("witness-reap: process-hygiene: mode=stub", out.stderr)
 
-    def test_absent_skill_is_skipped_with_one_line(self):
-        out = self.t.run("witness-reap.sh")
+    def test_env_opt_in_reaps(self):
+        log = self.t.ship_skill()
+        self.t.link_skill()
+        self.assertEqual(self.t.run("witness-reap.sh", env={KEY: "1"}).returncode, 0)
+        self.assertEqual(_calls(log), [REAP])
+
+    def test_manifest_opt_in_reaps(self):
+        log = self.t.ship_skill(opt_in="1")
+        self.t.link_skill()
+        self.assertEqual(self.t.run("witness-reap.sh").returncode, 0)
+        self.assertEqual(_calls(log), [REAP])
+
+    def test_env_overrides_manifest(self):
+        log = self.t.ship_skill(opt_in="1")
+        self.t.link_skill()
+        self.t.run("witness-reap.sh", env={KEY: "0"})
+        self.assertEqual(_calls(log), [REPORT])
+
+    def test_cli_overrides_env(self):
+        log = self.t.ship_skill()
+        self.t.link_skill()
+        self.t.run("witness-reap.sh", "--reap", env={KEY: "0"})
+        self.t.run("witness-reap.sh", "--report-only", env={KEY: "1"})
+        self.assertEqual(_calls(log), [REAP, REPORT])
+
+    def test_shipped_but_not_linked_is_skipped(self):
+        log = self.t.ship_skill()
+        out = self.t.run("witness-reap.sh", env={KEY: "1"})
         self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(_calls(log), [])
         self.assertEqual(out.stderr.strip().splitlines(),
                          ["witness-reap: process-hygiene skill not installed; skipping"])
 
+    def test_link_to_a_dir_without_the_reaper_is_skipped(self):
+        empty = self.t.root / "empty-skill"
+        empty.mkdir()
+        self.t.link_skill(empty)
+        out = self.t.run("witness-reap.sh")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("process-hygiene skill not installed; skipping", out.stderr)
+
+    def test_no_config_resolver_is_skipped(self):
+        log = self.t.ship_skill()
+        self.t.link_skill()
+        (self.t.repo / "scripts" / "sutando-config.sh").unlink()
+        out = self.t.run("witness-reap.sh")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(_calls(log), [])
+        self.assertIn("no installed skills dir resolved; skipping", out.stderr)
+
+    def test_reaper_error_is_printed_and_exit_is_zero(self):
+        log = self.t.ship_skill(rc=2)
+        self.t.link_skill()
+        out = self.t.run("witness-reap.sh")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(_calls(log), [REPORT])
+        self.assertIn("reaper exited rc=2", out.stderr)
+
     def test_reaper_runs_under_the_resolved_interpreter(self):
-        log = self.t.stub_skill(self.t.repo / "skills", rc=0)
+        log = self.t.ship_skill()
+        self.t.link_skill()
         wrapper, used = self.t.wrapped_python()
         self.t.stub_resolver(wrapper)
         out = self.t.run("witness-reap.sh")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(used.read_text().splitlines(), ["used"])
-        self.assertEqual(_calls(log), [["--reap", "--spotlight"]])
+        self.assertEqual(_calls(log), [REPORT])
+        self.assertIn("used", used.read_text().splitlines())
 
     def test_resolver_finding_no_python_skips_rather_than_run_bare_python3(self):
-        log = self.t.stub_skill(self.t.repo / "skills", rc=0)
+        log = self.t.ship_skill()
+        self.t.link_skill()
         self.t.stub_resolver("")
         out = self.t.run("witness-reap.sh")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(_calls(log), [])
         self.assertIn("no runnable python3", out.stderr)
-
-    def test_workspace_skill_is_found(self):
-        ws = self.t.stub_workspace()
-        log = self.t.stub_skill(ws / "skills", rc=0)
-        out = self.t.run("witness-reap.sh")
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(_calls(log), [["--reap", "--spotlight"]])
-
-    def test_shipped_skill_shadows_the_workspace_copy(self):
-        ws = self.t.stub_workspace()
-        ws_log = self.t.stub_skill(ws / "skills", rc=0)
-        repo_log = self.t.stub_skill(self.t.repo / "skills", rc=0)
-        self.assertEqual(self.t.run("witness-reap.sh").returncode, 0)
-        self.assertEqual(_calls(repo_log), [["--reap", "--spotlight"]])
-        self.assertEqual(_calls(ws_log), [])
 
 
 class HarnessTest(unittest.TestCase):
@@ -154,7 +199,8 @@ class HarnessTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.t = Tree(self._tmp.name)
-        self.log = self.t.stub_skill(self.t.repo / "skills", rc=2)
+        self.log = self.t.ship_skill(rc=2)
+        self.t.link_skill()
         counter = self.t.root / "counter"
         self.changing = f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "{counter}"; echo pid-$n'
 
@@ -168,14 +214,14 @@ class HarnessTest(unittest.TestCase):
     def test_pass_keeps_rc_0_after_a_failing_reaper(self):
         out = self._harness(self.changing)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertEqual(_calls(self.log), [["--reap", "--spotlight"]])
+        self.assertEqual(_calls(self.log), [REPORT])
 
-    def test_fail_keeps_rc_1_and_still_reaps(self):
+    def test_fail_keeps_rc_1_and_still_runs_the_reaper(self):
         out = self._harness("echo same")
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
-        self.assertEqual(_calls(self.log), [["--reap", "--spotlight"]])
+        self.assertEqual(_calls(self.log), [REPORT])
 
-    def test_usage_error_spawns_nothing_and_does_not_reap(self):
+    def test_usage_error_spawns_nothing_and_does_not_run_the_reaper(self):
         out = self.t.run("restart-test-harness.sh", "--bogus", "x")
         self.assertEqual(out.returncode, 2)
         self.assertEqual(_calls(self.log), [])
