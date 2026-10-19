@@ -194,10 +194,15 @@ token is read from (`vault set AG2_RELAY_TOKEN_BRIDGE_… <token>`). sparrowd
 reads every marked `<workspace>/agents/*.bridge/worker.json` at its start
 (`src/sparrowd.py`) and runs each as a worker through `src/sparrow_agent_bridge.py`:
 the token from the vault into `REMOTE_TASK_TOKEN` (never on disk; no token, no
-bridge), the agent's own dirs and the workspace's task stamper injected, the
-host's token file and proactive room cleared, and the package bridge run in
-that process. A declaration that is unmarked, malformed, names an absent vault
-key or points outside `<workspace>/agents` is skipped with one reason line.
+bridge), the agent's own dirs and the workspace's task stamper injected, and
+the package bridge run in that process under sparrowd's environment minus the
+host's token, identity and owner-DM variables. The declaration is data the
+agent's own session could write, so it chooses nothing: the worker name, the
+vault key, the token variable and the exact env (the three dirs and
+`AGENT_MXID`) are derived from its directory's segment, and a declaration
+that differs in any of them, adds any key, sits anywhere but directly under
+`<workspace>/agents`, is unmarked or malformed, or whose key the vault lacks
+is skipped with one reason line.
 Restart sparrowd (`src/sparrowd.py`) after install: it reads its workers only
 at start, and until then `verify` fails the bridge row and says so. Nothing in
 this repo starts sparrowd (`startup.sh` and `restart.sh` run the core bridge
@@ -252,7 +257,10 @@ records Claude Code's own trust for exactly `<work>/tasks` (never a parent):
 config (`.claude.json` in `CLAUDE_CONFIG_DIR`, or in `HOME`; a non-empty legacy
 `.config.json` wins), under the CLI's own lock directory (`<file>.lock`, waited
 for, never broken), the rest of the file unchanged and nothing written when it
-is already there. When it cannot, nothing is created and the line says why. A
+is already there. When it cannot, nothing is created and the line says why. The
+write is a read-modify-replace of the owner's global `.claude.json`, once per
+inbox; whether the CLI itself honours that lock directory is not verified, so a
+CLI write landing in the same instant could be lost. A
 pane still showing a startup dialog (the folder-trust or the bypass-permissions
 one) is logged by the launcher, raises the needs-attention card after 60 s,
 and fails `verify`'s `session` row; `attach` and answer it.

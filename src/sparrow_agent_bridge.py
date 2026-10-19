@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """One agent's gateway bridge under sparrowd, from the declaration its claude-local install wrote.
 
-`declarations(workspace, vault_keys)` reads every `<workspace>/agents/*.bridge/worker.json` and keeps
-only a marked, well-formed one whose dirs sit under `<workspace>/agents` and whose vault key exists,
-with one reason line for each one skipped. Run as a script with a declaration path, it re-checks that
-declaration, puts the token from the vault into the bridge's env (never on disk), injects the agent's
-own dirs and the workspace's task stamper, and runs the package bridge in this process.
+A declaration is data the agent's own session could write, so it chooses nothing: everything the
+bridge runs with is derived from the declaration's path segment (`<agents>/<segment>.bridge/`) by the
+adapter's own functions, and the file is only checked to agree with it. The worker name, the vault
+key, the token variable and the exact env (three dirs plus `AGENT_MXID`, whose id must map to the same
+segment) are each compared; any difference skips the declaration with one reason line.
+
+`declarations(workspace, vault_keys)` lists the valid ones whose vault key exists. Run as a script with
+a declaration path, it re-checks it, builds the bridge's environment (sparrowd's own, minus the host's
+token, identity and owner-DM variables, plus the derived env and the vault token, never on disk),
+injects the agent's dirs and the workspace's task stamper, and runs the package bridge in this process.
 """
 from __future__ import annotations
 
 import json
 import os
-import re
 import runpy
 import sys
 from pathlib import Path
@@ -22,35 +26,71 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-WRITTEN_BY = "ag2-sparrow-claude-local install"
+from ag2_sparrow import agent_identity  # noqa: E402
+from ag2_sparrow.adapters.claude_code import cli as adapter  # noqa: E402
+
+WRITTEN_BY = f"{adapter.COMMAND} install"
 BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
-DIR_KEYS = ("AGENT_CONNECT_TASK_DIR", "AGENT_CONNECT_RESULT_DIR", "AGENT_CONNECT_STATE_DIR")
-_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+TOKEN_ENV = "REMOTE_TASK_TOKEN"
+SUFFIX = ".bridge"
+# Never inherited from sparrowd: the host's token files, its agent identity and its owner DM.
+HOST_ONLY = ("AG2_DEVICE_ENV", "REMOTE_TASK_TOKEN_FILE", TOKEN_ENV, "AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID",
+             "GATEWAY_INSTANCE", "REMOTE_PROACTIVE_ROOM", "AGENT_CONNECT_TASK_DIR", "AGENT_CONNECT_RESULT_DIR",
+             "AGENT_CONNECT_STATE_DIR")
+
+
+def _resolved(env: dict) -> dict:
+    return {k: str(Path(v).resolve()) if k.startswith("AGENT_CONNECT_") else v for k, v in env.items()}
 
 
 def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
-    """(declaration, '') or (None, why it is not run)."""
+    """(the derived declaration, '') or (None, why it is not run). The returned name, vault key and env
+    come from the path's segment, never from the file."""
+    path = Path(path)
+    home = path.parent
+    if path.name != adapter.DECLARATION or not home.name.endswith(SUFFIX) or \
+            home.resolve().parent != Path(agents).resolve():
+        return None, f"{path}: not a declaration directly under {agents}"
+    segment = home.name[:-len(SUFFIX)]
     try:
-        decl = json.loads(Path(path).read_text(encoding="utf-8"))
+        decl = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         return None, f"{path}: unreadable or malformed ({type(e).__name__})"
     if not isinstance(decl, dict) or decl.get("written_by") != WRITTEN_BY:
         return None, f"{path}: not written by {WRITTEN_BY}"
-    name, env = decl.get("name"), decl.get("env")
-    if not isinstance(name, str) or not _NAME.match(name):
-        return None, f"{path}: the worker name is missing or not a name"
-    if decl.get("module") != BRIDGE_MODULE:
-        return None, f"{path}: names a module other than the bridge"
-    if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
-        return None, f"{path}: env is not a string map"
-    root = Path(agents).resolve()
-    for key in DIR_KEYS:
-        if not env.get(key) or not Path(env[key]).resolve().is_relative_to(root):
-            return None, f"{path}: {key} points outside {root}"
-    if not all(isinstance(decl.get(k), str) and _ENV_NAME.match(decl[k]) for k in ("token_vault_key", "token_env")):
-        return None, f"{path}: the vault key or the token variable is not a name"
-    return decl, ""
+    env = decl.get("env")
+    mxid = env.get("AGENT_MXID") if isinstance(env, dict) else None
+    try:
+        own = isinstance(mxid, str) and agent_identity.root_segment(mxid) == segment
+    except ValueError:
+        own = False
+    if not own:
+        return None, f"{path}: AGENT_MXID {mxid!r} is not the agent the segment {segment} names"
+    root = str(Path(agents).resolve() / segment)
+    want = {"name": adapter.worker_name(segment), "token_vault_key": adapter.vault_key(segment),
+            "token_env": TOKEN_ENV, "module": BRIDGE_MODULE, "env": adapter.bridge_env(root, mxid)}
+    for key in ("name", "token_vault_key", "token_env", "module"):
+        if decl.get(key) != want[key]:
+            return None, f"{path}: {key} {decl.get(key)!r} is not the derived {want[key]!r}"
+    if sorted(env) != sorted(want["env"]):
+        extra = sorted(set(env) ^ set(want["env"]))
+        return None, f"{path}: env keys differ from the bridge's own ({', '.join(map(str, extra))})"
+    try:
+        same = _resolved(env) == _resolved(want["env"])
+    except (TypeError, OSError, ValueError):
+        same = False
+    if not same:
+        return None, f"{path}: env is not the canonical one for {segment}"
+    return want, ""
+
+
+def bridge_environ(decl: dict, token: str, base=None) -> dict:
+    """What the bridge runs under: sparrowd's environment minus the host-only variables, plus the derived
+    env, an empty owner DM and the agent's token."""
+    env = {k: v for k, v in (os.environ if base is None else base).items() if k not in HOST_ONLY}
+    env.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
+    env[TOKEN_ENV] = token
+    return env
 
 
 def declarations(workspace: Path, vault_keys) -> "tuple[list, list]":
@@ -87,11 +127,9 @@ def main(argv=None, workspace=None, get_key=None, run=runpy.run_module) -> int:
     except KeyError:
         print(f"sparrow-agent-bridge: not starting: the vault has no {decl['token_vault_key']}", file=sys.stderr)
         return 1
-    # The agent's own token and id only: no host token file may shadow them, and nudges stay the core's.
-    for key in ("AG2_DEVICE_ENV", "REMOTE_TASK_TOKEN_FILE"):
-        os.environ.pop(key, None)
-    os.environ.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
-    os.environ[decl["token_env"]] = token
+    environ = bridge_environ(decl, token)
+    os.environ.clear()
+    os.environ.update(environ)
     from ag2_sparrow._dirs import set_dirs
     from ag2_sparrow.local_task_protocol import set_task_stamper
     from task_envelope import stamp_text

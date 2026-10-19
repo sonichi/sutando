@@ -101,12 +101,8 @@ def _agent_bridge_specs(workspace=None, vault_keys=None) -> "tuple[list, list[st
             vault_keys = []
             print(f"sparrowd: vault manifest unreadable ({type(exc).__name__})", file=sys.stderr)
     found, skipped = agent_bridge.declarations(workspace or resolve_workspace(), vault_keys)
-    specs, seen = [], set()
-    for path, decl in found:
-        if decl["name"] in seen:
-            skipped.append(f"{path}: the worker name {decl['name']} is already supervised")
-            continue
-        seen.add(decl["name"])
+    specs = []
+    for path, decl in found:     # names derive from distinct segments: never two alike
         specs.append(WorkerSpec(name=decl["name"], argv=[sys.executable, str(AGENT_BRIDGE), str(path)], cwd=str(REPO)))
     return specs, skipped
 
