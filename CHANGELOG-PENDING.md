@@ -11,6 +11,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Added
 
 <!-- feat() PRs go here -->
+- skills: a manifest may set `"audience": "developer"`; `skills/install.sh`, `skills/install.ps1` and `health-check --fix` then skip that skill unless sutando config sets `skills.developer` to `true`. An unknown audience value counts as developer-only. A developer skill already linked on a host is left in place with a note. ([#5725])
 - ag2-sparrow: a `REMOTE_HEALTH_COMMAND` row whose `motion` is `unknown` (the Hatch keepalive row) is sent as `moving` while a message Sparrow pulled waits for its result to be posted, `idle` otherwise, so the health dot shows a Hatch agent at work. ([#5682])
 - tutorial: `getting_started.py publish` reads the setup app's saved inputs (`<workspace>/state/onboarding/tutorial-inputs.json`: owner DM room, owner, agent id, picked roles) for any flag left out, so `publish` alone works; `--name` defaults to `auto`. The skill now answers an owner DM line `/tutorial` (the setup app ends the first-contact message with it) and runs by its script path, which a core that cannot find skills by name can still follow.
 - ag2space-voice: `find_room_actions` / `describe_room_action` / `run_room_action` — the voice model reaches any other action in the AG2 Space catalog (resolve a comment, list members, react, invites…). What voice may run comes from the effect and risk the server declares for the action, fetched before running: reads run, changes run after a read-back and a yes, high risk or an outside effect is refused.
