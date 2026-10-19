@@ -196,6 +196,17 @@ FOLLOW_UP_WINDOW_S = 120.0
 #: A typed answer re-arms only after this long: a switch that did not take would otherwise
 #: be refused again, re-detected and re-typed on every tick.
 TYPED_ANSWER_COOLDOWN_S = 600.0
+#: A re-type within this long of the last one continues its episode: a switch that did not
+#: take is re-typed each cooldown, and the owner hears about the episode once.
+TYPED_EPISODE_GAP_S = 2 * TYPED_ANSWER_COOLDOWN_S
+
+
+def typed_episode(prev_at, prev_episode, now):
+    """The episode a typed answer at `now` belongs to: the previous one's when it was typed
+    within TYPED_EPISODE_GAP_S, else a new episode named by `now`."""
+    if prev_at is not None and prev_episode is not None and now - prev_at <= TYPED_EPISODE_GAP_S:
+        return prev_episode
+    return now
 
 
 def auto_answer(kind):
@@ -921,6 +932,7 @@ def main():
     answered_prompt = None
     last_answered = None
     typed_at = {}
+    typed_episodes = {}
     follow_up = None
     idle_ticks = 0
     login_since = None
@@ -973,7 +985,10 @@ def main():
             answered_prompt = prompt
             last_answered = {"kind": kind, "key": key, "at": time.time()}
             if isinstance(key, tuple):
+                typed_episodes[kind] = typed_episode(typed_at.get(kind), typed_episodes.get(kind),
+                                                     last_answered["at"])
                 typed_at[kind] = last_answered["at"]
+                last_answered["episode"] = typed_episodes[kind]
             if kind in _FOLLOW_UP:
                 follow_up = {"key": _FOLLOW_UP[kind], "at": last_answered["at"]}
         elif follow_up:

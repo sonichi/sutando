@@ -73,10 +73,10 @@ def _soft_notice(signal: dict):
 
 def _sig_hash(signal: dict) -> str:
     """Stable hash of the escalation-relevant fields (state + prompt); a soft
-    notice hashes its own record, so it fires once however the state moves on."""
+    notice hashes its record's episode (else its time), so a re-typed switch is one notice."""
     aa = _soft_notice(signal)
     if aa and signal.get("state") not in HARD_ESCALATE:
-        key = f"auto\x00{aa.get('kind')}\x00{aa.get('at')}"
+        key = f"auto\x00{aa.get('kind')}\x00{aa.get('episode', aa.get('at'))}"
     else:
         key = f"{signal.get('state')}\x00{signal.get('prompt') or ''}"
     return hashlib.sha1(key.encode()).hexdigest()
@@ -210,9 +210,9 @@ def compose_message(signal: dict, surface: str = "") -> str:
     if aa and signal.get("state") not in HARD_ESCALATE and aa.get("kind") == "fable-limit-refused":
         who = f"worker {signal['seat']}" if signal.get("seat") else "the core"
         return (f"ℹ️ Fable weekly limit reached — {who} had a turn refused, so its monitor typed"
-                " `/model opus`, then `continue` once the switch settled: it runs on Opus for the rest"
-                " of this session."
-                " /model in its terminal switches back; /usage-credits keeps Fable on credits.")
+                " `/model opus`, and types `continue` once the pane is idle with an empty composer."
+                " Whether the switch took is not checked: if its terminal still shows the Fable"
+                " refusal, it did not. /model there picks a model; /usage-credits keeps Fable on credits.")
     if aa and signal.get("state") not in HARD_ESCALATE:
         return ("ℹ️ Fable weekly limit reached — the core pressed Enter on the focused"
                 " \"Switch to <fallback> and continue\" of Claude Code's limit dialog, which"

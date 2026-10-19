@@ -299,6 +299,13 @@ class TestClassify(unittest.TestCase):
                          (None, None))
         self.assertEqual(_mod.follow_up_step(None, "idle-ready", 102.0, _IDLE), (None, None))
 
+    def test_a_retyped_switch_stays_in_its_episode_until_a_long_gap(self):
+        gap = _mod.TYPED_EPISODE_GAP_S
+        self.assertEqual(_mod.typed_episode(None, None, 100.0), 100.0)
+        self.assertEqual(_mod.typed_episode(100.0, 100.0, 100.0 + _mod.TYPED_ANSWER_COOLDOWN_S + 5), 100.0)
+        self.assertEqual(_mod.typed_episode(700.0, 100.0, 700.0 + gap), 100.0)
+        self.assertEqual(_mod.typed_episode(700.0, 100.0, 700.0 + gap + 1), 700.0 + gap + 1)
+
     def test_a_draft_at_idle_ready_keeps_continue_unsent(self):
         pending = {"key": ("continue", "Enter"), "at": 100.0}
         draft = _IDLE.replace("❯ ", "❯ half-typed reply")
@@ -1340,6 +1347,7 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
         sent, payload = self._tick([], pane=_FABLE_REFUSED_MONITOR)
         self.assertEqual(sent, [("/tmp/x.sock", "sutando-core", ("/model opus", "Enter"))])
         self.assertEqual(payload["auto_answered"]["kind"], "fable-limit-refused")
+        self.assertEqual(payload["auto_answered"]["episode"], payload["auto_answered"]["at"])
 
     def test_no_auto_answer_flag_reports_only(self):
         sent, payload = self._tick(["--no-auto-answer"])

@@ -180,6 +180,11 @@ class TestComposeMessage(unittest.TestCase):
         self.assertNotIn("Agent needs you", msg)
         self.assertIn("the core", compose_message({k: v for k, v in _FABLE_REFUSED_AUTO.items() if k != "seat"}))
 
+    def test_a_refused_turn_switch_says_what_was_typed_not_that_it_took(self):
+        msg = compose_message(_FABLE_REFUSED_AUTO)
+        self.assertIn("not checked", msg)
+        self.assertNotIn("runs on Opus", msg)
+
     def test_fable_auto_answer_says_what_was_pressed_not_needs_you(self):
         msg = compose_message(_FABLE_AUTO)
         self.assertIn("Fable weekly limit", msg)
@@ -1097,6 +1102,23 @@ class TestSeatNotices(unittest.TestCase):
         self.assertIn("worker Pro-fast", first)
         self.assertNotIn("worker Pro-fast", second)
         self.assertTrue(os.path.exists(self.state + ".sutando-worker-ab"))
+
+    def test_a_failed_switch_retyped_each_cooldown_is_one_notice_per_episode(self):
+        aa = _FABLE_REFUSED_AUTO["auto_answered"]
+        t0 = aa["at"]
+        sent = []
+        orig = _mod._macos_notify
+        _mod._macos_notify = lambda m: sent.append(m) or True
+        try:
+            for at, episode in ((t0, t0), (t0 + 605, t0), (t0 + 1210, t0), (t0 + 90000, t0 + 90000)):
+                self._seat("sutando-worker-ab", dict(_FABLE_REFUSED_AUTO,
+                                                     auto_answered=dict(aa, at=at, episode=episode)))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main(["--signal", self.core, "--state-file", self.state])
+        finally:
+            _mod._macos_notify = orig
+        # Three re-types of one failed switch are one notice; a later episode is a new one.
+        self.assertEqual(len(sent), 2)
 
     def test_a_seat_hard_gate_is_left_to_its_own_card(self):
         self._seat("sutando-worker-ab", _LOGIN)
