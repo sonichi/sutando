@@ -1368,7 +1368,9 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
                 return {"health": "unknown"}
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
                 "--stable", "1", *extra_args]
+        # session_runtime's real tmux call polls time.sleep, which would spend fake_sleep's ticks.
         with patch.object(_mod, "capture_styled", fake_capture), \
+                patch.object(_mod, "session_runtime", lambda *a: None), \
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
