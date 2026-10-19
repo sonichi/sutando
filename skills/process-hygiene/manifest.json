@@ -1,0 +1,20 @@
+{
+  "name": "process-hygiene",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Developer-only, not scheduled. Report, and with --reap stop, orphaned processes (PPID 1, owned by this user, older than a threshold) whose cwd is inside the scratchpad of an ended agent session; --spotlight keeps Spotlight out of scratchpads. Contributes no tools; manifest present to DECLARE config per skills/MANIFEST.md: PROCESS_HYGIENE_MIN_AGE_S is the minimum age in seconds before an orphan is a candidate; PROCESS_HYGIENE_GRACE_S is the wait between SIGTERM and SIGKILL.",
+  "permissions": {
+    "network": false,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "PROCESS_HYGIENE_MIN_AGE_S": "7200",
+    "PROCESS_HYGIENE_GRACE_S": "5"
+  }
+}
