@@ -39,6 +39,12 @@
       "enum": ["stable", "experimental", "deprecated"],
       "description": "Trust/maturity signal. stable = guaranteed contract; experimental = unstable API/behavior; deprecated = use another skill."
     },
+    "audience": {
+      "type": "string",
+      "enum": ["user", "developer"],
+      "default": "user",
+      "description": "Who the skill is for. Absent or `user`: every install. `developer`: installers (skills/install.sh, skills/install.ps1, health-check --fix) link it only where sutando config sets `skills.developer` to true. Installers treat any other value as `developer` (fail-closed); the decision lives in src/skill_audience.py."
+    },
     "agent_compatibility": {
       "type": "string",
       "description": "SemVer range of the Sutando agent runtime this skill supports, e.g. '>=0.9 <2.0'. Absent = no declared constraint (assumed compatible)."
@@ -139,6 +145,11 @@
       "type": "string",
       "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$))[^\\s]+\\.py$",
       "description": "The script that IS the store of owner pending questions (room_store, gather, waiting, count, reconcile_pass, resolve, ask_owner, remind), relative to the skill directory and resolving inside it. Core reaches it only through src/pending_questions_reader.py, by this field alone; at most one installed skill may declare it (skills/MANIFEST.md)."
+    },
+    "orphan_reaper": {
+      "type": "string",
+      "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$))[^\\s]+\\.py$",
+      "description": "A script that reports (no arguments) or stops (--reap) orphaned test processes, relative to the skill directory and resolving inside it. health-check runs it, from the installed (linked) skills dir only, to classify sustained load; at most one installed skill may declare it (skills/MANIFEST.md)."
     }
   },
   "allOf": [

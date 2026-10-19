@@ -159,8 +159,32 @@ python3 skills/process-hygiene/scripts/reap_orphans.py --spotlight          # re
 python3 skills/process-hygiene/scripts/reap_orphans.py --reap --spotlight   # stop candidates
 ```
 
-Its triggers come in a follow-up: a health-check load warning that runs it once
-when the cause matches, and the end of witness scripts.
+Witness scripts run it once at their end: `scripts/witness-reap.sh`, called from
+a witness's EXIT trap. It runs only when this skill is installed, meaning linked
+into the host's skills dir (`bash scripts/sutando-config.sh claude-home-path
+skills`, where `skills/install.sh` links); a skill that is only shipped in the repo
+is skipped with one line. By default it is report-only (`--spotlight`); with
+`PROCESS_HYGIENE_WITNESS_REAP=1` it runs `--reap --spotlight` with the normal
+thresholds. It never changes the witness's exit code.
+
+The manifest declares this script as `orphan_reaper` (skills/MANIFEST.md). Once the
+skill is installed (linked into the Claude skills dir), health-check's `system-load`
+item runs the script in report mode when load stays high, and calls the cause
+leftover test processes (`cause=leftover-test-processes action=reap-once`) when the
+candidates it would stop hold at least half of the top five CPU users' share.
+A pass without `--fix` only warns. Any `health-check.py --fix` run reaps:
+with `SUTANDO_HEALTH_LOAD_REAP=1` it runs `reap_orphans.py --reap --spotlight` in
+the same run that warns, at most once per high-load episode (until load drops to
+normal and rises again), and the warning then says when it ran and what it
+stopped. So the opt-in means **reap automatically**: the desktop app runs
+`health-check.py --fix --emit-task` every 30 minutes and once at startup, so on a
+desktop host it reaps on that timer without the core deciding; the core's own
+`--fix` runs, and any manual one, do the same. The launchd fallback runs without
+`--fix` and never reaps. Both switches that let something other than a person reap,
+`SUTANDO_HEALTH_LOAD_REAP` in health-check's config and `PROCESS_HYGIENE_WITNESS_REAP`
+for witness scripts, are off unless set to exactly `1`. While the health-check one is
+off, the warning says so with `action=none` and keeps
+`cause=leftover-test-processes`, so the core can still run this script by hand.
 
 `--reap` refuses a minimum age under 600 s (exit 2), so a typo cannot reap young
 work. A run holds an exclusive `flock` on `process-hygiene.lock` beside its log;
@@ -174,6 +198,7 @@ Declared in `manifest.json`; read CLI > environment > manifest:
 |---|---|---|
 | `PROCESS_HYGIENE_MIN_AGE_S` | `7200` | `--min-age` |
 | `PROCESS_HYGIENE_GRACE_S` | `5` | `--grace` |
+| `PROCESS_HYGIENE_WITNESS_REAP` | `0` (report-only) | `scripts/witness-reap.sh --reap` / `--report-only` |
 
 `--claude-config-dir DIR` (repeatable) replaces the config dirs searched for
 session markers and transcripts. `--tmp-base DIR` (repeatable) replaces the default `/tmp` search base (on macOS

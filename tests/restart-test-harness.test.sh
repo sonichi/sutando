@@ -4,7 +4,6 @@
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-H="$REPO/scripts/restart-test-harness.sh"
 
 pass=0; fail=0
 ok()  { echo "ok   $1"; pass=$((pass+1)); }
@@ -12,6 +11,11 @@ bad() { echo "FAIL $1"; fail=$((fail+1)); }
 
 TMPD="$(mktemp -d -t restart-harness.XXXXXX)"
 trap 'rm -rf "$TMPD"' EXIT
+
+# A copy beside its reap helper but no sutando-config.sh: no installed skills dir, so no real reaper.
+mkdir -p "$TMPD/repo/scripts"
+cp "$REPO/scripts/restart-test-harness.sh" "$REPO/scripts/witness-reap.sh" "$TMPD/repo/scripts/"
+H="$TMPD/repo/scripts/restart-test-harness.sh"
 
 # An identity that changes on every call — a real restart's pid/start-time.
 CHANGING="$TMPD/changing.sh"
