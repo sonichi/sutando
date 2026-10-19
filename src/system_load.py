@@ -58,9 +58,10 @@ ACTION_NONE = "none"
 
 Runner = Callable[[Sequence[str], float], Tuple[int, str]]
 
-_SECRET_FLAG = re.compile(r"^--?(?:[\w-]*(?:token|secret|password|passwd|api[-_]?key|auth|credential)[\w-]*)$", re.I)
-_SECRET_ASSIGN = re.compile(r"^([\w.-]*(?:token|secret|password|passwd|key|auth|credential)[\w.-]*)=.+$", re.I)
-_OPAQUE = re.compile(r"^[A-Za-z0-9_\-+/=.:]{32,}$")
+_NAME_CHARS = re.compile(r"[^A-Za-z0-9._+-]")
+_FLAG_NAME = re.compile(r"^--[A-Za-z][A-Za-z0-9-]{0,23}$")
+_SHORT_FLAG = re.compile(r"^-[A-Za-z0-9]$")
+PLACEHOLDER = "…"
 _WOULD_STOP = re.compile(r"^(?:would stop|stopping) \S+=\S+ pids=([\d,]+)")
 _SUMMARY = re.compile(r"\bmode=(report|reap)\b.*\bcandidates=(\d+)")
 
@@ -145,27 +146,23 @@ def run_command(argv: Sequence[str], timeout: float) -> Tuple[int, str]:
 
 
 def render_command(command: str) -> str:
-    """The command with paths cut to their basename and anything credential-shaped masked, truncated."""
-    out: List[str] = []
-    mask_next = False
-    for tok in command.split():
-        if mask_next:
-            out.append("***")
-            mask_next = False
-            continue
-        if _SECRET_FLAG.match(tok):
-            out.append(tok)
-            mask_next = True
-            continue
-        m = _SECRET_ASSIGN.match(tok)
-        if m:
-            out.append(m.group(1) + "=***")
-            continue
-        if "/" in tok:
-            tok = tok.rstrip("/").rsplit("/", 1)[-1] or tok
-        out.append("***" if _OPAQUE.match(tok) else tok)
+    """Only the executable's basename and flag names; every value and free word becomes a placeholder,
+    so no argument text (a secret, or words addressed to the core reading this) leaves the host."""
+    toks = command.split()
+    if not toks:
+        return ""
+    exe = _NAME_CHARS.sub("", toks[0].rstrip("/").rsplit("/", 1)[-1])[:32] or PLACEHOLDER
+    out = [exe]
+    for tok in toks[1:]:
+        name, sep, _ = tok.partition("=")
+        if _FLAG_NAME.match(name) or _SHORT_FLAG.match(name):
+            out.append(name if not sep else f"{name} {PLACEHOLDER}")
+        elif tok.startswith("-") and len(tok) > 2 and _SHORT_FLAG.match(tok[:2]) and tok[1] != "-":
+            out.append(f"{tok[:2]} {PLACEHOLDER}")
+        else:
+            out.append(PLACEHOLDER)
     text = " ".join(out)
-    return text if len(text) <= CMD_WIDTH else text[:CMD_WIDTH - 1] + "…"
+    return text if len(text) <= CMD_WIDTH else text[:CMD_WIDTH - 1] + PLACEHOLDER
 
 
 def top_cpu(ps_output: str, exclude: Sequence[int] = (), limit: int = TOP_N) -> List[dict]:
