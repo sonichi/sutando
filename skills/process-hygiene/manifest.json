@@ -13,6 +13,7 @@
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   },
+  "orphan_reaper": "scripts/reap_orphans.py",
   "config": {
     "PROCESS_HYGIENE_MIN_AGE_S": "7200",
     "PROCESS_HYGIENE_GRACE_S": "5"

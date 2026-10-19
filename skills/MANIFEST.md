@@ -159,6 +159,21 @@ the owner's DM through the proactive path and keeps one generic record under
 `<workspace>/state/ask-owner/` (`src/local_record.py`), saying that nothing lists or closes it.
 The outbox, the ask-id grammar and every question schema are the declaring skill's.
 
+## Orphan reaper (`orphan_reaper`)
+
+`"orphan_reaper": "scripts/<reaper>.py"` declares the script that finds, and stops, orphaned test
+processes. Core reaches it only through `src/system_load.py`, which takes the path its caller
+injects and names no skill; `src/health-check.py` resolves it with `skill_roots.declared("orphan_reaper",
+workspace)` (same roots, containment and one-declarer rule as `pending_questions_store`). The contract
+health-check relies on:
+
+- no arguments: report only, exit 0, one `would stop <kind>=<id> pids=<pid,...> ...` line per target,
+  then a summary line carrying `mode=report ... candidates=<n>`;
+- no summary line means it did nothing (another run holds its lock, or it failed);
+- exit status 2 is a usage error and is never retried.
+
+With none declared, the `system-load` warning says its cause is unclassified.
+
 ## Claude plugin (`claude_plugin`)
 
 `"claude_plugin": "./plugin"` names a Claude Code plugin directory inside the skill. The Claude

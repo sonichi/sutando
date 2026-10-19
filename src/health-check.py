@@ -18,6 +18,8 @@ Checks:
   - Critical files (CLAUDE.md, build_log.md, ACTIVITY.md)
   - Memory system (MEMORY.md index, key memory files)
   - Notes directory
+  - Sustained system load against the core count, with its top CPU users
+    (src/system_load.py)
   - Extra per-host probes declared in
     <workspace>/hosts/<host-label>/health-checks-extra.json (opt-in; see
     check_user_defined). Each entry is {"name", "command"[, "timeout"]};
@@ -92,6 +94,8 @@ from gateway_serving import (  # noqa: E402
 )
 from task_archive import find_task_file  # noqa: E402
 from sutando_config import config_get  # noqa: E402
+import skill_roots  # noqa: E402
+import system_load  # noqa: E402
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
 # resolver existed, every consumer hardcoded REPO_DIR / "tasks" — so when the
@@ -7828,6 +7832,18 @@ def check_disk_space() -> dict:
     return {"name": name, "status": "ok", "detail": where}
 
 
+def check_system_load(workspace: Optional[Path] = None, **probes) -> dict:
+    """Sustained load against the core count (src/system_load.py). The cause classifier is the
+    script an installed skill declares for system_load.DECLARATION, resolved here and injected."""
+    ws = WORKSPACE_DIR if workspace is None else Path(workspace)
+    found = skill_roots.declared(system_load.DECLARATION, ws)
+    return system_load.check(
+        ws / "state" / system_load.STATE_NAME,
+        ratio=system_load.setting(config_get(system_load.RATIO_KEY), system_load.DEFAULT_RATIO, float),
+        passes=system_load.setting(config_get(system_load.PASSES_KEY), system_load.DEFAULT_PASSES, int),
+        classifier=found.script, unavailable=found.reason, **probes)
+
+
 @functools.lru_cache(maxsize=1)
 def _ephemeral_roots() -> tuple:
     """Temp roots whose contents do not survive a sweep or reboot, asked of the
@@ -13409,6 +13425,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_runtime_identity())
     checks.append(check_live_tree_drift())
     checks.append(check_disk_space())
+    checks.append(check_system_load())
 
     # Last, and only when this host declares any: a user probe must never
     # delay or displace a built-in one.

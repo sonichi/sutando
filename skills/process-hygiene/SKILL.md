@@ -159,8 +159,10 @@ python3 skills/process-hygiene/scripts/reap_orphans.py --spotlight          # re
 python3 skills/process-hygiene/scripts/reap_orphans.py --reap --spotlight   # stop candidates
 ```
 
-Its triggers come in a follow-up: a health-check load warning that runs it once
-when the cause matches, and the end of witness scripts.
+The manifest declares this script as `orphan_reaper` (skills/MANIFEST.md). When
+health-check's `system-load` item sees load stay high, it runs the script in report
+mode and calls the cause leftover test processes when the candidates it would stop
+hold at least half of the top five CPU users' share.
 
 `--reap` refuses a minimum age under 600 s (exit 2), so a typo cannot reap young
 work. A run holds an exclusive `flock` on `process-hygiene.lock` beside its log;
