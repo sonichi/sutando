@@ -39,6 +39,12 @@
       "enum": ["stable", "experimental", "deprecated"],
       "description": "Trust/maturity signal. stable = guaranteed contract; experimental = unstable API/behavior; deprecated = use another skill."
     },
+    "audience": {
+      "type": "string",
+      "enum": ["user", "developer"],
+      "default": "user",
+      "description": "Who the skill is for. Absent or `user`: every install. `developer`: installers (skills/install.sh, skills/install.ps1, health-check --fix) link it only where sutando config sets `skills.developer` to true. Installers treat any other value as `developer` (fail-closed); the decision lives in src/skill_audience.py."
+    },
     "agent_compatibility": {
       "type": "string",
       "description": "SemVer range of the Sutando agent runtime this skill supports, e.g. '>=0.9 <2.0'. Absent = no declared constraint (assumed compatible)."

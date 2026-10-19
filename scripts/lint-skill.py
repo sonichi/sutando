@@ -70,8 +70,13 @@ KNOWN_TOP = {
     "agent_compatibility", "dependencies", "permissions", "contract",
     "provenance", "enabled", "access_tier", "tools", "server", "startup", "config",
     "hooks", "documented_for_core", "core_description", "supervised_worker",
-    "pending_questions_store", "claude_plugin",
+    "pending_questions_store", "claude_plugin", "audience",
 }
+AUDIENCES = {"user", "developer"}
+# Fields a runtime scan activates straight from <repo>/skills, past the installers'
+# audience check, so a developer-only skill may not declare them.
+RUNTIME_ACTIVATED = ("tools", "hooks", "claude_plugin", "supervised_worker",
+                     "pending_questions_store", "documented_for_core")
 # Signals a skill actually touches the network (used for the permission cross-check).
 # No trailing \b: signals ending in a space/paren (`curl `, `fetch(`) are followed
 # by a non-word char, and a trailing \b there kills the match — so `curl -s …` and
@@ -206,6 +211,15 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
         ui = prov.get("upstream_intent")
         if ui is not None and ui not in INTENTS:
             err(f"provenance.upstream_intent '{ui}' not in {sorted(INTENTS)}")
+
+    aud = m.get("audience")
+    if "audience" in m and aud not in AUDIENCES:
+        err(f"audience {aud!r} not in {sorted(AUDIENCES)} (installers treat it as developer-only)")
+    if "audience" in m and aud != "user":
+        for field in RUNTIME_ACTIVATED:
+            if m.get(field) not in (None, False):
+                err(f"developer-only skill declares '{field}', which runtime scans activate on "
+                    f"every install regardless of audience")
 
     # tools imply manifest-loaded
     if "tools" in m:

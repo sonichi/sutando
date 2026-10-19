@@ -7918,8 +7918,13 @@ def check_skill_symlinks() -> dict:
     # -- harmless that time, which is exactly why it survived unnoticed.
     shadowed: list[str] = []   # real dir where a symlink belongs -> NOT auto-fixed
     misdirected: list[tuple[str, str]] = []  # resolves, but into a temp dir
+    from skill_audience import developer_opt_in, installable  # noqa: PLC0415
+    developer = developer_opt_in()
     for skill_dir in sorted(skills_src.iterdir()):
         if not skill_dir.is_dir():
+            continue
+        # skills/install.sh does not link these here, so --fix must not either.
+        if installable(skill_dir, developer).reason is not None:
             continue
         # Mirror skills/install.sh's filter: only dirs WITH a SKILL.md are
         # slash-invocable skills the installer links. Manifest-loaded and
