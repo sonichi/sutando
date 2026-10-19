@@ -2706,6 +2706,10 @@ _NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
                    http.client.IncompleteRead)
 
 
+# The last response's status and edge headers, per thread, for the poll's anomaly line.
+_RESP_META = threading.local()
+
+
 def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty)."""
     data = json.dumps(payload).encode() if payload is not None else None
@@ -2718,6 +2722,10 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
     if data is not None:
         req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
+        headers = getattr(resp, "headers", None) or {}
+        _RESP_META.last = {"status": getattr(resp, "status", None),
+                           "content_length": headers.get("Content-Length"),
+                           "cf_ray": headers.get("CF-Ray")}
         raw = resp.read().decode().strip()
         return json.loads(raw) if raw else {}
 
@@ -5042,7 +5050,54 @@ def _relay_failed_sent(broker_id: str) -> bool:
     return False
 
 
-def _isolated(task: dict, take, *args) -> bool:
+_POLL_ANOMALIES = 0
+
+
+def _served_key(task: dict) -> str:
+    return _one_line(task.get("id"))[:128]
+
+
+def _poll_task_list(resp) -> list:
+    """The poll's served tasks. A 200 with no `tasks` list (an empty body, or other JSON) is
+    logged and counted: it can stand for a batch the broker served and the client never saw."""
+    global _POLL_ANOMALIES
+    tasks = resp.get("tasks") if isinstance(resp, dict) else None
+    if isinstance(tasks, list):
+        return tasks
+    _POLL_ANOMALIES += 1
+    meta = getattr(_RESP_META, "last", None) or {}
+    shape = "an empty body" if resp == {} else f"{type(resp).__name__} without a tasks list"
+    _log(f"poll anomaly #{_POLL_ANOMALIES}: answered {shape} (status={meta.get('status')}, "
+         f"content-length={meta.get('content_length')}, cf-ray={meta.get('cf_ray')}) "
+         "— any task served in it is lost to this client until its lease expires")
+    return []
+
+
+def _receive_round(tasks: list) -> "tuple[list, dict]":
+    """Log each served task at receipt, before any branching; returns the tasks to take and
+    their fates (None until the round settles one)."""
+    taken, fates = [], {}
+    for task in tasks:
+        if not isinstance(task, dict):
+            _log(f"served entry is a {type(task).__name__}, not a task — dropped")
+            continue
+        key = _served_key(task)
+        _log(f"served {key} lease={_one_line(_lease_id_of(task) or 'none')}"
+             + (" ack_first" if task.get("ack_first") is True else ""))
+        taken.append(task)
+        fates[key] = None
+    return taken, fates
+
+
+def _settle_round(fates: dict) -> None:
+    """Every served task ends the round acked, staged, consumed or dropped with a reason."""
+    for key, fate in fates.items():
+        if fate is None:
+            _log(f"served {key} was not acked, staged, consumed or dropped this round "
+                 "— the broker re-serves it when its lease expires")
+
+
+def _isolated(task: dict, take, *args, fates: "dict | None" = None) -> bool:
     """`take(*args)`, where a raise costs only this task: it is logged and left unacked for
     the broker to re-serve, and the rest of its batch is still taken and acked."""
     try:
@@ -5050,16 +5105,17 @@ def _isolated(task: dict, take, *args) -> bool:
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             raise                     # the loop's auth recovery owns a rejected bearer
-        _log(f"task {_one_line(task.get('id'))[:128]} not taken (HTTPError: {e}) "
-             "— not acked; the broker re-serves it")
-        return False
+        why = f"HTTPError: {e}"
     except Exception as e:  # noqa: BLE001 — one task must not withhold its batch's acks
-        _log(f"task {_one_line(task.get('id'))[:128]} not taken ({type(e).__name__}: {e}) "
-             "— not acked; the broker re-serves it")
-        return False
+        why = f"{type(e).__name__}: {e}"
+    if fates is not None:
+        fates[_served_key(task)] = "dropped"
+    _log(f"task {_served_key(task)} not taken ({why}) — not acked; the broker re-serves it")
+    return False
 
 
-def _take_served_task(task: dict, inflight: "set[str]", pending_ack: list) -> bool:
+def _take_served_task(task: dict, inflight: "set[str]", pending_ack: list,
+                      fates: "dict | None" = None) -> bool:
     """One served task that is not `ack_first`: consumed as a control, or queued and its
     ack added to `pending_ack`. True when it newly entered the in-flight set."""
     hitl_out = _handle_hitl_action(task)
@@ -5068,20 +5124,28 @@ def _take_served_task(task: dict, inflight: "set[str]", pending_ack: list) -> bo
         _queue_review_control_result(task, body=body)
         _retry_review_control_results()
         _log(f"hitl: consumed card click {task.get('id')} from the task relay ({hitl_out})")
+        _set_fate(fates, task, "consumed")
         return False
     if _handle_review_decision(task):
         _queue_review_control_result(task)
         _retry_review_control_results()
         _log(f"consumed private review decision {task.get('id')}")
+        _set_fate(fates, task, "consumed")
         return False
     written = _write_task(task)
     if not written:
+        _set_fate(fates, task, "dropped")       # _write_task logged why
         return False
     tid, durable = written
     pending_ack.append((tid, durable, _lease_id_of(task)))
     fresh = tid not in inflight
     inflight.add(tid)
     return fresh
+
+
+def _set_fate(fates: "dict | None", task: dict, fate: str) -> None:
+    if fates is not None:
+        fates[_served_key(task)] = fate
 
 
 def _take_ack_first(task: dict, inflight: "set[str]") -> bool:
@@ -7552,6 +7616,7 @@ def main() -> None:
                 wake_outbound()
             prev_ok = poll_grace_since
             try:
+                _RESP_META.last = None
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_POLL_PROOF}", timeout=POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
                 # A completed poll remains evidence even if accepting its tasks fails.
@@ -7561,27 +7626,36 @@ def main() -> None:
                 # socket.timeout only aliases TimeoutError on 3.10+, not 3.9.
                 if not _poll_timeout_is_empty(poll_grace_since, time.time()):
                     raise
+                _log(f"poll read timed out after {POLL_WAIT + 10}s inside the "
+                     f"{POLL_TIMEOUT_GRACE_S:g}s grace — treated as an empty poll")
                 resp = {"tasks": []}
             if poll_failures and poll_grace_since != prev_ok:  # a real answer, not the grace path
                 _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s")
                 poll_failures = 0
             added = False
             pending_ack = []
-            tasks = resp.get("tasks", [])
+            tasks, fates = _receive_round(_poll_task_list(resp))
             # First and on its own, so a slow task ahead cannot hold it past its delivery lease.
             for task in tasks:
                 if task.get("ack_first") is True:
-                    added |= _isolated(task, _take_ack_first, task, inflight)
+                    added |= _isolated(task, _take_ack_first, task, inflight, fates=fates)
+                    fates[_served_key(task)] = fates[_served_key(task)] or "staged"
             for task in tasks:
                 if task.get("ack_first") is not True:
-                    added |= _isolated(task, _take_served_task, task, inflight, pending_ack)
+                    added |= _isolated(task, _take_served_task, task, inflight, pending_ack,
+                                       fates, fates=fates)
             # Ack only after task file, in-flight set and ack ledger are durable;
             # any failure withholds every ack this round, redeliveries included.
             committed = _save_inflight(inflight) if pending_ack else True
             if pending_ack and committed:
                 committed = _record_pending_acks(pending_ack)
+            if pending_ack and not committed:
+                _log(f"acks withheld for {len(pending_ack)} task(s): the in-flight set or "
+                     "ack ledger did not commit")
             for tid, durable, lease in pending_ack if committed else ():
-                _post_task_ack(tid, durable, lease)
+                if _post_task_ack(tid, durable, lease):
+                    fates[_broker_tid(tid)] = "acked"
+            _settle_round(fates)
             if added:
                 wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)

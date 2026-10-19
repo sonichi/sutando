@@ -459,7 +459,7 @@ class OneTaskFailsInABatchTest(unittest.TestCase):
             loop.served = [served]
             self.gw._write_task = write
             self.gw._post_task_ack = lambda tid, durable=False, lease=None: \
-                self.acked.append((tid, lease))
+                self.acked.append((tid, lease)) or True
             loop.run()
         return loop
 
@@ -560,6 +560,129 @@ class OneTaskFailsInABatchTest(unittest.TestCase):
             loop = self._run([relay, typed], lambda task, *a, **k: (task["id"], True))
         self.assertEqual(self.acked, [("task-d4", "lease-d4")])
         self.assertTrue(any(relay["id"] in m and "RuntimeError" in m for m in loop.logs))
+
+
+class RoundAccountingTest(unittest.TestCase):
+    """Every served task is named at receipt and settled by the end of its round, and a poll
+    answer with no task list is a logged anomaly, never a silent empty poll."""
+
+    ROOM = "!secretroom:ag2.space"
+
+    def setUp(self):
+        try:
+            from ag2_sparrow import remote_gateway_bridge as gw
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            self.skipTest(f"gateway not importable: {str(e)[:60]}")
+        self.gw = gw
+
+    def _task(self, n):
+        return {"id": f"task-r{n}", "task": "hi", "lease_id": f"lease-r{n}", "channel_id": self.ROOM}
+
+    def _run(self, served, ack=lambda tid: True, commit=True, poll=None):
+        with _Loop(self.gw) as loop, \
+                patch.object(self.gw, "_record_pending_acks", return_value=commit), \
+                patch.object(self.gw, "wake_outbound", new=lambda: None):
+            loop.served = [served]
+            if poll is not None:
+                self.gw._req = lambda method, path, *a, **k: (
+                    loop.polls.append(path) or poll() if path.startswith("/v1/tasks?") else {})
+            self.gw._write_task = lambda task, *a, **k: (task["id"], True)
+            self.gw._post_task_ack = lambda tid, durable=False, lease=None: ack(tid)
+            loop.run()
+        return loop
+
+    def test_each_served_task_is_logged_at_receipt_with_its_lease_and_no_room(self):
+        loop = self._run([self._task(1), self._task(2)])
+        self.assertIn("served task-r1 lease=lease-r1", loop.logs)
+        self.assertIn("served task-r2 lease=lease-r2", loop.logs)
+        self.assertFalse(any(self.ROOM in m for m in loop.logs), "no room id in any line")
+
+    def test_a_fully_acked_round_flags_nothing(self):
+        loop = self._run([self._task(1), self._task(2)])
+        self.assertFalse(any("was not acked" in m for m in loop.logs))
+
+    def test_a_task_whose_ack_did_not_land_is_named_at_the_end_of_the_round(self):
+        loop = self._run([self._task(1), self._task(2)], ack=lambda tid: tid != "task-r2")
+        flagged = [m for m in loop.logs if "was not acked, staged, consumed or dropped" in m]
+        self.assertEqual(len(flagged), 1)
+        self.assertTrue(flagged[0].startswith("served task-r2 "))
+
+    def test_a_round_whose_ledger_did_not_commit_names_every_task(self):
+        loop = self._run([self._task(1), self._task(2)], commit=False)
+        self.assertIn("acks withheld for 2 task(s): the in-flight set or ack ledger did not commit",
+                      loop.logs)
+        flagged = [m.split()[1] for m in loop.logs if "was not acked" in m]
+        self.assertEqual(flagged, ["task-r1", "task-r2"])
+
+    def test_dropped_and_staged_tasks_are_settled(self):
+        relay = {"id": "ask-5f3c9e0a1b2c", "task": "calendar?", "ack_first": True}
+        with patch.object(self.gw, "_take_ack_first", return_value=False), \
+                patch.object(self.gw, "_handle_hitl_action", return_value=False), \
+                patch.object(self.gw, "_handle_review_decision", return_value=False):
+            with _Loop(self.gw) as loop, \
+                    patch.object(self.gw, "_record_pending_acks", return_value=True):
+                loop.served = [[relay, self._task(3)]]
+                self.gw._write_task = lambda task, *a, **k: None      # logged its own reason
+                loop.run()
+        self.assertFalse(any("was not acked" in m for m in loop.logs))
+        self.assertIn("served ask-5f3c9e0a1b2c lease=none ack_first", loop.logs)
+
+    def test_an_empty_poll_body_is_a_logged_counted_anomaly(self):
+        before = self.gw._POLL_ANOMALIES
+        loop = self._run([], poll=lambda: {})
+        lines = [m for m in loop.logs if m.startswith("poll anomaly #")]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("answered an empty body", lines[0])
+        self.assertEqual(self.gw._POLL_ANOMALIES, before + 1)
+        self.assertEqual(loop.clock.slept, [], "still no back-off")
+        self.assertIn((True, {}), loop.status)
+
+    def test_json_without_a_task_list_is_a_logged_anomaly(self):
+        for answer, shape in (({"error": "busy"}, "dict without a tasks list"),
+                              ({"tasks": None}, "dict without a tasks list"),
+                              ([], "list without a tasks list")):
+            loop = self._run([], poll=lambda a=answer: a)
+            self.assertTrue(any(shape in m for m in loop.logs if m.startswith("poll anomaly")),
+                            answer)
+            self.assertEqual(loop.clock.slept, [], answer)
+
+    def test_the_anomaly_names_status_length_and_edge_ray_from_the_real_request(self):
+        import urllib.request
+
+        class _Resp:
+            status = 200
+            headers = {"Content-Length": "0", "CF-Ray": "8f00aa11bb22cc33-SJC"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b""
+
+        with _Loop(self.gw) as loop:
+            real_req = loop._saved["_req"]
+            self.gw._req = lambda method, path, *a, **k: (
+                real_req(method, path, *a, **k) if path.startswith("/v1/tasks?") else {})
+            saved_open = urllib.request.urlopen
+            urllib.request.urlopen = lambda *a, **k: _Resp()
+            try:
+                loop.run()
+            finally:
+                urllib.request.urlopen = saved_open
+        lines = [m for m in loop.logs if m.startswith("poll anomaly #")]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("status=200, content-length=0, cf-ray=8f00aa11bb22cc33-SJC", lines[0])
+        self.assertFalse(any("secret" in m for m in loop.logs), "the bearer never reaches a line")
+
+    def test_the_read_timeout_grace_path_is_logged(self):
+        with _Loop(self.gw, poll_raises=TimeoutError("The read operation timed out"),
+                   advance=1.0) as loop:
+            loop.run()
+        self.assertTrue(any(m.startswith("poll read timed out after 35s inside the")
+                            for m in loop.logs))
 
 
 class RelayResultsInTheLoopTest(unittest.TestCase):
