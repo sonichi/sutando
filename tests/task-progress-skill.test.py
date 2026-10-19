@@ -20,6 +20,13 @@ from unittest.mock import MagicMock, patch
 REPO = Path(__file__).parent.parent
 SCRIPT = REPO / "skills" / "task-progress" / "scripts" / "notify.py"
 sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "tests" / "_helpers"))
+import relay_isolation  # noqa: E402
+from relay_isolation import assert_secret_equal, assert_secret_none  # noqa: E402
+
+
+def setUpModule():
+    unittest.addModuleCleanup(relay_isolation.isolate())
 
 import channel_env_containment  # noqa: E402 — the shared module notify.py delegates to
 
@@ -628,7 +635,7 @@ class TestSendRemoteGateway(unittest.TestCase):
             result = self.mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
         self.assertTrue(result)
         self.assertEqual(captured["url"], "https://gw.example/relay/v1/room")
-        self.assertEqual(captured["auth"], "Bearer symlinked-token")
+        assert_secret_equal(self, captured["auth"], "Bearer symlinked-token", "bearer")
 
     def test_symlinked_env_refused_when_app_support_unset(self):
         """Fail-closed: the SAME layout without SUTANDO_APP_SUPPORT is just a
@@ -717,7 +724,7 @@ class TestSendRemoteGateway(unittest.TestCase):
         self.assertEqual(captured["url"], "https://gw.example/relay/v1/room")
         self.assertEqual(captured["payload"],
                          {"op": "message", "room_id": "!room:ag2.space", "body": "hi"})
-        self.assertEqual(captured["auth"], "Bearer sekret")
+        assert_secret_equal(self, captured["auth"], "Bearer sekret", "bearer")
 
     def test_containment_delegates_to_shared_module_not_a_copy(self):
         """Delegation, not re-implementation: stub the shared
@@ -784,7 +791,7 @@ class TestSendRemoteGateway(unittest.TestCase):
             result = self.mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
         self.assertTrue(result)
         self.assertEqual(captured["url"], "https://gw.example/relay/v1/room")
-        self.assertEqual(captured["auth"], "Bearer sekret")
+        assert_secret_equal(self, captured["auth"], "Bearer sekret", "bearer")
 
 
 class TestGatewaySourceTraversal(unittest.TestCase):

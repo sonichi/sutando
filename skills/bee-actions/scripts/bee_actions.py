@@ -47,8 +47,8 @@ if none is registered and an owner is known (--invite / BEE_ROOM_OWNER), the
 room is auto-registered first: a private room with just the owner invited —
 effectively a DM thread — created via gateway op:create and persisted, so the
 user never has to register by hand. `register-room --room` records a room the
-user picked instead. Gateway creds via the shared contract (GATEWAY_TOKEN >
-RELAY_TOKEN > REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN; combined url|secret ok).
+user picked instead. Gateway creds via src/relay_credentials.py (env, then the
+ag2space channel env, the vault, the repo .env; combined url|secret ok).
 
 Output is JSON on stdout (machine-readable for the calling agent); errors exit
 non-zero with a one-line reason on stderr.
@@ -94,14 +94,8 @@ def _cfg(args, attr: str, key: str) -> str:
 
 def _gateway_creds() -> "tuple[str, dict] | None":
     """(base_url, headers) for the ag2space gateway, or None if unconfigured."""
-    from ag2_gateway_credentials import normalize_credentials, resolve_alias_precedence
-    raw, _ = resolve_alias_precedence(
-        os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN",
-                     "AG2_REMOTE_TOKEN"))
-    url, _ = resolve_alias_precedence(
-        os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
-    creds = normalize_credentials(raw, explicit_url=url,
-                                  source="resolved" if raw else "none")
+    from relay_credentials import resolve_relay_credentials
+    creds = resolve_relay_credentials()
     if not (creds.base_url and creds.token):
         return None
     return creds.base_url, {"Authorization": f"Bearer {creds.token}",

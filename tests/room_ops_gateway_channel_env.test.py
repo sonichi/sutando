@@ -10,7 +10,7 @@ suite lives under `skills/agent-room-ops/`. Those tests DO run in CI
 in-process so the gate measures them.
 
 Hermeticity: `_channel_env_file()` resolves a REAL path under $CLAUDE_CONFIG_DIR,
-so every test here either injects `env_file=` explicitly or points
+so every test here either shadows `_channel_env_file` or points
 CLAUDE_CONFIG_DIR at a temp dir. Nothing reads the operator's channel .env.
 
 Run: python3 tests/room_ops_gateway_channel_env.test.py
@@ -143,52 +143,6 @@ class ChannelEnvLocator(_Base):
         with mock.patch.object(_gateway, "_core_src_on_path",
                                lambda: (_ for _ in ()).throw(RuntimeError("boom"))):
             self.assertIsNone(_gateway._channel_env_file())
-
-
-class FromChannelEnv(_Base):
-    def test_first_non_empty_alias_wins(self):
-        f = self._envfile("RELAY_TOKEN=\nREMOTE_TASK_TOKEN=second\n")
-        got = _gateway._from_channel_env(
-            ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"), env_file=f)
-        self.assertEqual(got, "second")
-
-    def test_empty_when_no_alias_present(self):
-        f = self._envfile("SOMETHING_ELSE=1\n")
-        self.assertEqual(_gateway._from_channel_env(("GATEWAY_TOKEN",), env_file=f), "")
-
-    def test_empty_when_locator_returns_none(self):
-        with mock.patch.object(_gateway, "_channel_env_file", lambda: None):
-            self.assertEqual(_gateway._from_channel_env(("GATEWAY_TOKEN",)), "")
-
-    def test_empty_when_core_src_missing(self):
-        f = self._envfile("REMOTE_TASK_TOKEN=x\n")
-        # Control as above: the file HAS the token, so "" must come from the
-        # off-path branch actually running, not from a swallowed TypeError.
-        calls = []
-
-        def not_on_path():
-            calls.append(1)
-            return False
-
-        with mock.patch.object(_gateway, "_core_src_on_path", not_on_path):
-            self.assertEqual(_gateway._from_channel_env(("REMOTE_TASK_TOKEN",), env_file=f), "")
-        self.assertEqual(calls, [1], "stub never ran - '' came from elsewhere")
-
-    def test_resolution_failure_is_absence_not_a_crash(self):
-        # The guard around the locator+imports: anything raising there must read
-        # as "no credential here", never propagate into the caller's gateway().
-        def boom():
-            raise RuntimeError("locator exploded")
-        with mock.patch.object(_gateway, "_channel_env_file", boom):
-            self.assertEqual(_gateway._from_channel_env(("REMOTE_TASK_TOKEN",)), "")
-
-    def test_undecodable_file_is_absence_not_a_crash(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        f = os.path.join(d, ".env")
-        with open(f, "wb") as fh:
-            fh.write(b"REMOTE_TASK_TOKEN=\xff\xfe\x00binary\n")
-        self.assertEqual(_gateway._from_channel_env(("REMOTE_TASK_TOKEN",), env_file=f), "")
 
 
 class GatewayPrecedence(_Base):

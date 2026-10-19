@@ -277,6 +277,20 @@ def _load_channel_env_containment():
 _channel_env_is_contained = _load_channel_env_containment()
 
 
+def _load_relay():
+    """src/relay_credentials (the shared relay resolver), or None when src/ is absent."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+        import relay_credentials  # type: ignore
+        return relay_credentials
+    except Exception:
+        return None
+
+
+_relay = _load_relay()
+_resolve_relay = _relay.resolve_relay_credentials if _relay is not None else None
+
+
 def _gateway_config(source: str) -> "tuple[str, str] | None":
     """(url, token) for a gateway-bridged source, or None (reason already
     printed). Shared by the text and media senders so the two cannot drift."""
@@ -290,46 +304,24 @@ def _gateway_config(source: str) -> "tuple[str, str] | None":
     _claude_config = Path(_base) if _base else Path.home() / ".claude"
     channels_dir = _claude_config / "channels"
     env_path = channels_dir / source / ".env"
-    # Belt and suspenders: even a slug-valid name must RESOLVE inside an
-    # approved root (_channel_env_is_contained) — anything else is refused.
-    # Derive the EFFECTIVE gateway config from os.environ ALONE first — including
-    # the alias and the combined "url|secret" one-token form. Only if that is still
-    # missing a value do we resolve/guard/read the channel file. Checking just the
-    # split REMOTE_TASK_URL+REMOTE_TASK_TOKEN pair was not enough: the documented
-    # one-token onboarding (REMOTE_TASK_TOKEN=https://gw|secret, or the legacy
-    # AG2_REMOTE_TOKEN) is a fully env-configured send, and it was still being
-    # refused by the containment guard over a file it never needed.
-    #
-    # One-token onboarding: the URL travels inside the token — the same contract
-    # ag2-sparrow's remote_gateway_bridge accepts (docs/remote-gateway-protocol.md).
-    def _derive(get):
-        u = (get("REMOTE_TASK_URL") or "").strip().rstrip("/")
-        tok = (get("REMOTE_TASK_TOKEN") or "").strip()
-        if not tok:
-            tok = (get("AG2_REMOTE_TOKEN") or "").strip()
-        if "|" in tok:
-            _u, tok = tok.split("|", 1)
-            if not u:
-                u = _u.rstrip("/")
-        if not u:
-            u = (get("AG2_REMOTE_URL") or "").strip().rstrip("/")
-        return u, tok
-
-    url, token = _derive(lambda k: os.environ.get(k, ""))
-    if not (url and token):
-        # The file IS needed, so the containment check applies — two approved
-        # roots, fail-closed outside both (see _channel_env_is_contained).
-        if not _channel_env_is_contained(env_path, channels_dir, source):
-            print(f"[task-progress] refusing env path outside channels dir: {env_path}",
-                  file=sys.stderr)
-            return None
-        env = _env_file(os.path.realpath(env_path))
-        url, token = _derive(lambda k: os.environ.get(k, "") or env.get(k, ""))
-    if not url or not token:
-        print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN (or AG2_REMOTE_TOKEN) "
-              f"for source '{source}' (looked in {env_path})", file=sys.stderr)
+    if _resolve_relay is None:
+        print("[task-progress] relay resolver unavailable (src/relay_credentials.py)",
+              file=sys.stderr)
         return None
-    return url, token
+    contained = _channel_env_is_contained(env_path, channels_dir, source)
+    # The channel-env.sh pick when one qualifies, else the contained `.env`; read through _env_file.
+    picked = _relay.channel_env_file(source, channels_dir=channels_dir) if _relay else None
+    target = picked or (os.path.realpath(env_path) if contained else None)
+    creds = _resolve_relay(source, channel=_env_file(str(target)) if target else None)
+    if creds.base_url and creds.token:
+        return creds.base_url, creds.token
+    if not contained:
+        print(f"[task-progress] refusing env path outside channels dir: {env_path}",
+              file=sys.stderr)
+        return None
+    print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN (or AG2_REMOTE_TOKEN) "
+          f"for source '{source}' (looked in {env_path})", file=sys.stderr)
+    return None
 
 
 def _gateway_headers(token: str) -> dict:
