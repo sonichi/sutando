@@ -916,6 +916,21 @@ cp "$CODEX_GOOD" "$PREFIX/bin/codex"
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual(len(sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt"))), 1)
 
+    def test_app_surface_broken_codex_stops_at_once_without_a_dm(self):
+        self._write_exe("codex", "#!/bin/bash\nexit 1\n")
+        ran = Path(self.tmp.name) / "npm-ran"
+        self._write_exe("npm", f'#!/bin/bash\ntouch "{ran}"\nexit 1\n')
+        start = time.monotonic()
+        r = self.run_launcher(env_extra={"SUTANDO_RUNTIME_CONSENT_SURFACE": "app",
+                                         "SUTANDO_RUNTIME_WAIT_S": "600"})
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertLess(time.monotonic() - start, 60)
+        self.assertNotIn("waiting up to", r.stderr)
+        self.assertNotIn("new-session -d -s sutando-core ", self._tmux_calls())
+        ws = self.root / "workspace"
+        self.assertEqual(sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt")), [])
+        self.assertFalse(ran.exists())
+
     def _owner_reply_installs(self, installed_stub):
         """Broken codex, one launch to open the incident, then the owner's install reply."""
         self._write_exe("codex", "#!/bin/bash\nexit 1\n")

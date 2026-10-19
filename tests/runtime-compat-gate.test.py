@@ -158,6 +158,35 @@ class ClaudeRestartKeepsRunningCore(unittest.TestCase):
 
 
 
+
+class AppLaunchedCoreNeverWaitsOrDms(unittest.TestCase):
+    """The real Claude launcher under the app's consent surface: no 600 s wait, no owner DM."""
+
+    def test_app_surface_launch_stops_at_once_without_a_dm(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        bin_dir = tmp / "bin"
+        log = tmp / "tmux.log"
+        write_exe(bin_dir / "tmux", f'echo "$*" >> "{log}"\nexit 0\n')
+        write_exe(bin_dir / "claude", "exit 1\n")
+        write_exe(bin_dir / "pgrep", "exit 1\n")
+        env = {"HOME": str(tmp / "home"), "PATH": f"{bin_dir}:/usr/bin:/bin",
+               "SUTANDO_RUNTIMES_DIR": str(tmp / "runtimes"), "SUTANDO_RUNTIME_SYSTEM_DIRS": "",
+               "SUTANDO_TMUX_SOCKET": str(tmp / "sock"), "SUTANDO_SKIP_AUTH_PREFLIGHT": "1",
+               "CLAUDE_CONFIG_DIR": str(tmp / "cfg"), "SUTANDO_RUNTIME_CONSENT_SURFACE": "app"}
+        repo = launcher_copy(tmp)
+        try:
+            r = subprocess.run(["bash", str(repo / "src/agent/claude/cli/start-cli.sh")], env=env,
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail("the launch was still waiting for a fix after 60s")
+        self.assertEqual(r.returncode, 3, r.stderr[-2000:])
+        self.assertNotIn("waiting up to", r.stderr)
+        self.assertNotIn("new-session", log.read_text() if log.exists() else "")
+        dms = list((repo / "workspace" / "results").glob("proactive-runtime-compat-claude-*.txt"))
+        self.assertEqual(dms, [], "the app shows the card; the gate sends no DM")
+
+
 class ClaudeConsentRepairLaunchesTheRepairedBinary(unittest.TestCase):
     """The real Claude launcher: consent repairs a broken claude and launches the new one."""
 

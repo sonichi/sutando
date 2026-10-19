@@ -29,15 +29,22 @@ is reported only after the new binary has actually been launched.
 CLI:
   python3 src/runtime_compat.py doctor [--runtime claude|codex|all] [--json]
   python3 src/runtime_compat.py ensure --runtime R [--wait S] [--repair] [--yes]
-  python3 src/runtime_compat.py repair --runtime R --yes
+  python3 src/runtime_compat.py repair --runtime R --yes [--json] [--consent-source app
+                                      --consent-by MXID] [--plan-hash H]
   python3 src/runtime_compat.py which --runtime R [--enforce-auth]
+  python3 src/runtime_compat.py notify-owner --runtime R [--json]
 Exit codes for ensure and which: 0 usable (prints the binary path), 3 binary unusable,
 4 login required, 2 usage error. The repair matrix:
 docs/runtime-compat-repair-matrix.md.
+
+With SUTANDO_RUNTIME_CONSENT_SURFACE=app the desktop app is where the owner answers:
+a launch never waits and never DMs, probes and download retries are time-bounded, and
+the app runs `repair --consent-source app` and, if its card goes unanswered, `notify-owner`.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -57,7 +64,9 @@ KNOWN_BAD = "known-bad"
 INCOMPATIBLE = "incompatible"
 BROKEN = "broken"
 MISSING = "missing"
+UNPROBED = "unknown"
 USABLE = (OK, NEWER_UNTESTED)
+AUTH_LOGIN_VALUES = ("ok", "logged-out", "unknown")
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -68,6 +77,11 @@ PROBE_TIMEOUT_S = 30
 INSTALL_TIMEOUT_S = 900
 MIN_FREE_BYTES = 512 * 1024 * 1024
 WAIT_POLL_S = 5.0
+DOCTOR_SCHEMA = 1
+APP_PROBE_TIMEOUT_S = 10
+APP_DISCOVERY_CAP_S = 60
+APP_RETRY_BUDGET_S = 30
+REPAIR_PHASES = ("checking-disk", "downloading", "verifying", "switching", "done")
 
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 _DISK_FULL_RE = re.compile(r"ENOSPC|no space left on device", re.I)
@@ -79,6 +93,12 @@ _NODE_MISSING_RE = re.compile(r"node: No such file|env: node|node: not found", r
 
 Version = Tuple[int, int, int]
 Runner = Callable[..., "subprocess.CompletedProcess"]
+
+
+def app_surface(env: Optional[dict] = None) -> bool:
+    """The desktop app shows the repair card, so the engine must answer fast and never DM."""
+    env = os.environ if env is None else env
+    return env.get("SUTANDO_RUNTIME_CONSENT_SURFACE") == "app"
 
 
 @dataclass(frozen=True)
@@ -146,9 +166,26 @@ class Report:
             return None
         return self.candidates[0]
 
+    @property
+    def selected_reason(self) -> str:
+        """One line: the binary a launch uses and why, or why there is none."""
+        binary = RUNTIMES[self.runtime].binary if self.runtime in RUNTIMES else self.runtime
+        sel = self.selected
+        skipped = self.candidates[:self.candidates.index(sel)] if sel else self.candidates
+        why = "; ".join(f"{c.path} ({c.source}) is {c.status}: {c.detail}" for c in skipped)
+        if sel is None:
+            return f"no usable {binary}: {why or 'nothing is installed'}"
+        chose = f"chose {sel.path} ({sel.source}) {sel.version}"
+        if why:
+            return f"{chose} because {why}"
+        if sel.source != "PATH":
+            return f"{chose} because no {binary} is on PATH"
+        return f"{chose}; it passes doctor"
+
     def to_dict(self) -> dict:
         return {"runtime": self.runtime, "status": self.status,
                 "selected": asdict(self.selected) if self.selected else None,
+                "selected_reason": self.selected_reason,
                 "candidates": [asdict(c) for c in self.candidates],
                 "interrupted_updates": list(self.interrupted)}
 
@@ -173,6 +210,7 @@ class RepairResult:
     user_action: str = ""
     attempts: int = 0
     path: Optional[str] = None
+    version: Optional[str] = None
 
 
 def parse_version(text: str) -> Optional[Version]:
@@ -249,9 +287,14 @@ def candidate_paths(spec: RuntimeSpec, env: dict, root: Path) -> List[Tuple[str,
 
 
 def probe(path: str, spec: RuntimeSpec, *, source: str = "PATH", env: Optional[dict] = None,
-          run: Runner = _run) -> Candidate:
-    """Launch one binary and classify it. Never raises."""
+          run: Runner = _run, timeout: float = PROBE_TIMEOUT_S, deadline: Optional[float] = None,
+          now: Callable[[], float] = time.monotonic) -> Candidate:
+    """Launch one binary and classify it. Never raises. With `deadline`, both calls
+    together end by it (a `now()` value)."""
     c = Candidate(path=path, source=source)
+
+    def limit() -> float:
+        return timeout if deadline is None else max(0.001, min(timeout, deadline - now()))
     if not os.path.exists(path):
         c.status, c.detail = BROKEN, "points to a missing file (an update may have been interrupted)"
         return c
@@ -259,9 +302,10 @@ def probe(path: str, spec: RuntimeSpec, *, source: str = "PATH", env: Optional[d
         c.status, c.detail = BROKEN, "is not executable"
         return c
     try:
-        r = run([path, "--version"], env=env)
+        t = limit()
+        r = run([path, "--version"], env=env, timeout=t)
     except subprocess.TimeoutExpired:
-        c.status, c.detail = BROKEN, f"--version did not answer within {PROBE_TIMEOUT_S}s"
+        c.status, c.detail = BROKEN, f"--version did not answer within {t:g}s"
         return c
     except OSError as exc:
         c.status, c.detail = BROKEN, f"could not be launched ({exc.strerror or exc})"
@@ -283,7 +327,7 @@ def probe(path: str, spec: RuntimeSpec, *, source: str = "PATH", env: Optional[d
         c.detail = f"{c.version} is older than the minimum {_fmt(spec.min_version)}"
         return c
     try:
-        h = run([path, "--help"], env=env)
+        h = run([path, "--help"], env=env, timeout=limit())
     except (subprocess.TimeoutExpired, OSError) as exc:
         c.status, c.detail = BROKEN, f"--help could not run ({exc})"
         return c
@@ -330,16 +374,25 @@ def _pid_alive(pid: int) -> bool:
 
 def discover(runtime: str, *, env: Optional[dict] = None, run: Runner = _run,
              root: Optional[Path] = None, spec: Optional[RuntimeSpec] = None,
-             pid_alive: Callable[[int], bool] = _pid_alive) -> Report:
+             pid_alive: Callable[[int], bool] = _pid_alive,
+             now: Callable[[], float] = time.monotonic) -> Report:
     env = dict(os.environ if env is None else env)
     spec = spec or RUNTIMES[runtime]
     root = root or managed_root(env)
+    cap = now() + APP_DISCOVERY_CAP_S if app_surface(env) else None
     cands: List[Candidate] = []
     for path, source in candidate_paths(spec, env, root):
         # Known locations stand in only when no PATH or managed install works.
         if source == "known" and any(c.usable for c in cands):
             break
-        cands.append(probe(path, spec, source=source, env=env, run=run))
+        if cap is None:
+            cands.append(probe(path, spec, source=source, env=env, run=run))
+        elif now() >= cap:
+            cands.append(Candidate(path, source, UNPROBED, detail="not probed in time"))
+        else:
+            cands.append(probe(path, spec, source=source, env=env, run=run, now=now,
+                               timeout=APP_PROBE_TIMEOUT_S,
+                               deadline=min(now() + APP_PROBE_TIMEOUT_S, cap)))
     selected = next((c for c in cands if c.usable), None)
     return Report(runtime, cands, selected, interrupted_updates(root, runtime, pid_alive))
 
@@ -351,6 +404,11 @@ def _npm_prefix_of(path: str, spec: RuntimeSpec) -> Optional[str]:
             os.path.join(prefix, "lib", "node_modules", spec.package)):
         return prefix
     return None
+
+
+def plan_hash(step: RepairStep) -> str:
+    """What the app's consent click refers to; a different plan needs a new click."""
+    return hashlib.sha256(json.dumps(asdict(step), sort_keys=True).encode()).hexdigest()
 
 
 def _assisted_cmd(runtime: str) -> str:
@@ -480,9 +538,12 @@ def assisted_install(runtime: str, *, env: Optional[dict] = None, run: Runner = 
                      disk_usage: Callable[[str], "shutil._ntuple_diskusage"] = shutil.disk_usage,
                      pid_alive: Callable[[int], bool] = _pid_alive,
                      min_free: int = MIN_FREE_BYTES, now: Callable[[], float] = time.time,
-                     log: Callable[[str], None] = lambda _m: None) -> RepairResult:
+                     log: Callable[[str], None] = lambda _m: None,
+                     progress: Callable[..., None] = lambda _phase, **_kw: None,
+                     monotonic: Callable[[], float] = time.monotonic) -> RepairResult:
     """Install a compatible CLI. Callers hold the user's consent. Concurrent repairs of one
-    runtime run one at a time; a waiter that finds a working result reuses it."""
+    runtime run one at a time; a waiter that finds a working result reuses it.
+    `progress(phase, **detail)` is told each phase as it starts."""
     env = dict(os.environ if env is None else env)
     spec = spec or RUNTIMES[runtime]
     root = root or managed_root(env)
@@ -491,6 +552,7 @@ def assisted_install(runtime: str, *, env: Optional[dict] = None, run: Runner = 
     if installer is None:
         return RepairResult(False, "no-installer", "neither npm nor the vendor installer can run here",
                             _manual_without_installer(spec))
+    progress("checking-disk")
     free = disk_usage(str(_existing_ancestor(root))).free
     if free < min_free:
         need = (min_free - free) // (1024 * 1024) + 1
@@ -512,8 +574,10 @@ def assisted_install(runtime: str, *, env: Optional[dict] = None, run: Runner = 
             if ready.usable:
                 log(f"another repair already installed {spec.binary} {ready.version}; using it")
                 return RepairResult(True, "installed", f"{spec.binary} {ready.version} at {link}",
-                                    "", 0, str(link))
-        ctx = _Ctx(spec, base, root, env, run, attempts, backoff_s, sleep, now, log, retry, installer)
+                                    "", 0, str(link), ready.version)
+        budget = APP_RETRY_BUDGET_S if app_surface(env) else None
+        ctx = _Ctx(spec, base, root, env, run, attempts, backoff_s, sleep, now, log, retry, installer,
+                   progress, monotonic, budget)
         if installer.kind == "npm":
             return _install_npm(ctx)
         return _install_external(ctx)
@@ -533,11 +597,20 @@ class _Ctx:
     log: Callable[[str], None]
     retry: str
     installer: Installer
+    progress: Callable[..., None] = lambda _phase, **_kw: None
+    monotonic: Callable[[], float] = time.monotonic
+    budget_s: Optional[float] = None
 
 
 def _run_with_retry(ctx: _Ctx, argv: Sequence[str], env: dict, before=None):
-    """(None, attempts) on success, else (failed RepairResult, attempts)."""
+    """(None, attempts) on success, else (failed RepairResult, attempts). With a budget,
+    no attempt starts after it and no backoff outlasts it."""
+    end = ctx.monotonic() + ctx.budget_s if ctx.budget_s is not None else None
+    last: Optional[Tuple[str, str]] = None
     for n in range(1, ctx.attempts + 1):
+        if last is not None and end is not None and ctx.monotonic() >= end:
+            return _failed(*last, n - 1, ctx.root, ctx.retry, ctx.installer), n - 1
+        ctx.progress("downloading", attempt=n, attempts=ctx.attempts)
         if before:
             before()
         try:
@@ -550,10 +623,13 @@ def _run_with_retry(ctx: _Ctx, argv: Sequence[str], env: dict, before=None):
         if rc == 0:
             return None, n
         reason, detail = _classify_failure(text), _tail(text)
+        last = (reason, detail)
         ctx.log(f"attempt {n}/{ctx.attempts} failed ({reason}): {detail}")
-        if reason == "disk-full" or n == ctx.attempts:
+        left = end - ctx.monotonic() if end is not None else None
+        if reason == "disk-full" or n == ctx.attempts or (left is not None and left <= 0):
             return _failed(reason, detail, n, ctx.root, ctx.retry, ctx.installer), n
-        ctx.sleep(ctx.backoff_s * (2 ** (n - 1)))
+        wait = ctx.backoff_s * (2 ** (n - 1))
+        ctx.sleep(wait if left is None else min(wait, left))
     raise AssertionError("unreachable")  # pragma: no cover
 
 
@@ -562,6 +638,8 @@ def _install_npm(ctx: _Ctx) -> RepairResult:
     staging = base / f".staging-{os.getpid()}-{int(ctx.now())}"
     npm_env = dict(env, npm_config_update_notifier="false", npm_config_fund="false",
                    npm_config_audit="false")
+    if ctx.budget_s is not None:
+        npm_env["npm_config_fetch_retries"] = "0"  # the attempt counter is the only retry loop
     argv = [ctx.installer.argv[0], "install", "-g", "--prefix", str(staging),
             f"{spec.package}@{spec.tested_major}"]
     try:
@@ -569,6 +647,7 @@ def _install_npm(ctx: _Ctx) -> RepairResult:
                                     before=lambda: shutil.rmtree(staging, ignore_errors=True))
         if failed:
             return failed
+        ctx.progress("verifying")
         staged = probe(str(staging / "bin" / spec.binary), spec, source="staged", env=env, run=ctx.run)
         if not staged.usable:
             return RepairResult(False, "verify-failed", f"the new {spec.binary} {staged.detail}",
@@ -590,6 +669,7 @@ def _install_external(ctx: _Ctx) -> RepairResult:
     if failed:
         return failed
     target = Path(ctx.installer.where)
+    ctx.progress("verifying")
     got = probe(str(target), ctx.spec, source="installed", env=ctx.env, run=ctx.run)
     if not got.usable:
         return RepairResult(False, "verify-failed", f"the installed {ctx.spec.binary} {got.detail}",
@@ -637,6 +717,7 @@ def _publish(ctx: _Ctx, target: Path, n: int, staging: Optional[Path] = None,
     """Move a staged version into place and switch the link, as one transaction.
     A journal written first lets a later run undo it if this process dies midway."""
     spec = ctx.spec
+    ctx.progress("switching")
     link = ctx.root / "bin" / spec.binary
     tag = f"{os.getpid()}-{int(ctx.now())}"
     j = {"phase": "started", "previous": os.readlink(str(link)) if os.path.islink(str(link)) else None,
@@ -670,7 +751,7 @@ def _publish(ctx: _Ctx, target: Path, n: int, staging: Optional[Path] = None,
     _write_journal(journal, j)
     _commit(j, journal)
     return RepairResult(True, "installed", f"{spec.binary} {live.version} at {link}", "", n,
-                        str(link))
+                        str(link), live.version)
 
 
 def _commit(j: dict, journal: Path) -> None:
@@ -758,7 +839,8 @@ def auth_status(runtime: str, binary: str, *, env: Optional[dict] = None, run: R
     home = env.get("CODEX_HOME")
     login = (f"CODEX_HOME={shlex.quote(home)} " if home else "") + f"{shlex.quote(binary)} login"
     try:
-        r = run([binary, "login", "status"], env=env)
+        r = run([binary, "login", "status"], env=env,
+                timeout=APP_PROBE_TIMEOUT_S if app_surface(env) else PROBE_TIMEOUT_S)
     except (subprocess.TimeoutExpired, OSError) as exc:
         return {"login": "unknown", "remedy": login, "detail": f"login status failed: {exc}"}
     if r.returncode == 0:
@@ -821,15 +903,18 @@ class Incident:
         from owner_reply import STEPS
         return [e for e in self.entries if not all(e.get(s) for s in STEPS)]
 
-    def notify(self, body: str) -> bool:
-        """Queue the incident's DM if it is not queued yet. True when this call queued it."""
-        from owner_reply import queue_notice
+    def _open(self) -> None:
         if not self.open:
             t = int(self.clock())
             self.rec = {"status": "open", "opened_at": t, "actions": self._unfinished(),
                         "notice_queued": False,
                         "notice": f"proactive-runtime-compat-{self.runtime}-{t}.txt"}
             self._save()
+
+    def notify(self, body: str) -> bool:
+        """Queue the incident's DM if it is not queued yet. True when this call queued it."""
+        from owner_reply import queue_notice
+        self._open()
         if self.rec.get("notice_queued") or not queue_notice(self.workspace, self.rec["notice"], body):
             return False
         self.rec["notice_queued"] = True
@@ -837,17 +922,41 @@ class Incident:
         return True
 
     def take_replies(self) -> None:
-        """Record the owner's new replies to this incident before anything acts on them."""
+        """Record the owner's new replies to this incident before anything acts on them.
+        After an app fix, a late reply to its DM is recorded as already answered."""
         from owner_reply import matching_replies
-        if not self.open:
+        late = (not self.open and self.rec.get("resolved_by") == "app"
+                and self.rec.get("notice_queued") and self.rec.get("fixed_reply"))
+        if not self.open and not late:
             return
         known = {e["task"] for e in self.entries}
         got = list(matching_replies(self.workspace, (install_phrase(self.runtime), RETRY_PHRASE),
                                     skip=known))
+        done = {"applied": True, "reply": self.rec["fixed_reply"]} if late else {}
         if got:
             self.rec["actions"] = self.entries + [
-                {"task": p.stem, "phrase": phrase, "at": int(self.clock())} for p, phrase in got]
+                dict({"task": p.stem, "phrase": phrase, "at": int(self.clock())}, **done)
+                for p, phrase in got]
             self._save()
+
+    def record_consent(self, consent: dict) -> None:
+        """Persist the app's consent before the repair it allows runs."""
+        self._open()
+        self.rec["consent"] = consent
+        self._save()
+
+    def resolve_from_app(self, detail: str) -> None:
+        """The app fixed it: answer the owner's replies, tell the DM thread, close."""
+        from owner_reply import queue_notice
+        reply = f"Already fixed from the app: {detail}. Nothing more to do."
+        self.apply(None, reply)
+        self.finish()
+        if self.rec.get("notice_queued"):
+            queue_notice(self.workspace, self.rec["notice"].replace(".txt", "-fixed.txt"),
+                         f"Fixed from the app: {detail}. No reply needed.\n")
+        self.rec.update(status="resolved", resolved_at=int(self.clock()), resolved_by="app",
+                        fixed_reply=reply)
+        self._save()
 
     def pending(self) -> set:
         """Phrases of recorded replies whose action has not been applied yet."""
@@ -1012,6 +1121,7 @@ def _ensure(runtime, env, wait_s, repair, consent, enforce_auth, claude_config_d
     sel = report.selected
     if sel.status == NEWER_UNTESTED:
         say(plan(report, env=env).reason)
+    say(report.selected_reason)
     say(f"using {sel.path} ({sel.version})")
     auth = auth_fn(runtime, sel.path, env=env, claude_config_dir=claude_config_dir)
     if auth["login"] == "logged-out":
@@ -1076,6 +1186,85 @@ def _workspace() -> Optional[Path]:
         return None
 
 
+def _doctor_doc(report: Report, env: dict) -> dict:
+    """One `doctor --json` entry; the desktop app parses this shape (schema 1)."""
+    step = plan(report, env=env)
+    if report.selected is None:
+        auth = {"login": "unknown", "remedy": "", "detail": "no usable binary"}
+    else:
+        auth = auth_status(report.runtime, report.selected.path, env=env,
+                           claude_config_dir=env.get("CLAUDE_CONFIG_DIR") or None)
+    return dict(report.to_dict(), schema=DOCTOR_SCHEMA, plan=asdict(step),
+                plan_hash=plan_hash(step), auth=auth)
+
+
+def _repair_cmd(a: argparse.Namespace, env: dict) -> int:
+    def emit(kind: str, **fields) -> None:
+        if kind == "progress" and fields["phase"] not in REPAIR_PHASES:
+            raise ValueError(f"undeclared repair phase {fields['phase']!r}")
+        if a.json:
+            print(json.dumps(dict(type=kind, **fields)), flush=True)
+
+    def done(result: RepairResult, code: int) -> int:
+        emit("result", **asdict(result))
+        return code
+    if not a.yes:
+        _say("the assisted repair changes files; pass --yes to consent.")
+        return done(RepairResult(False, "no-consent", "--yes was not given"), EXIT_USAGE)
+    if a.consent_source == "app" and not a.plan_hash:
+        _say("an app consent needs --plan-hash; refusing without one.")
+        return done(RepairResult(False, "plan-hash-required", "app consent requires --plan-hash",
+                                 "Resend the repair with the current plan's hash."), EXIT_USAGE)
+    inc, consent_hash = None, a.plan_hash
+    if a.plan_hash or a.consent_source:
+        current = plan_hash(plan(discover(a.runtime, env=env), env=env))
+        if a.plan_hash and a.plan_hash != current:
+            _say("the situation changed since the plan was shown; review it again.")
+            return done(RepairResult(False, "plan-changed", "the repair plan is no longer the one "
+                                     "consented to", "Check again, then review the new plan."),
+                        EXIT_USAGE)
+        consent_hash = current
+    ws = _workspace() if a.consent_source else None
+    if a.consent_source and ws is None:
+        _say("the workspace isn't available to record consent; refusing without it.")
+        return done(RepairResult(False, "workspace-unavailable", "could not resolve the workspace "
+                                 "to record consent", "Retry once the workspace is reachable."),
+                    EXIT_USAGE)
+    if ws is not None:
+        inc = Incident(ws, a.runtime)
+        inc.take_replies()
+        inc.record_consent({"source": a.consent_source, "by": a.consent_by, "at": int(time.time()),
+                            "plan_hash": consent_hash, "runtime": a.runtime})
+    result = assisted_install(a.runtime, env=env, log=_say,
+                              progress=lambda phase, **kw: emit("progress", phase=phase, **kw))
+    emit("progress", phase="done")
+    _say(f"{result.reason}: {result.detail}")
+    if not result.ok:
+        _say(f"next: {result.user_action}")
+    elif inc is not None and a.consent_source == "app":
+        inc.resolve_from_app(result.detail)
+    return done(result, 0 if result.ok else EXIT_UNUSABLE)
+
+
+def _notify_owner_cmd(a: argparse.Namespace, env: dict) -> int:
+    def out(queued: bool, reason: str) -> int:
+        if a.json:
+            print(json.dumps({"queued": queued, "reason": reason}))
+        else:
+            _say(f"owner DM {'queued' if queued else 'not queued'}: {reason}")
+        return 0
+    report = discover(a.runtime, env=env)
+    if report.selected is not None:
+        return out(False, "usable")
+    ws = _workspace()
+    if ws is None:
+        return out(False, "no-workspace")
+    inc = Incident(ws, a.runtime)
+    if inc.notify(notice_body(a.runtime, plan(report, env=env))):
+        return out(True, "queued")
+    return out(False, "already-sent" if inc.rec.get("notice_queued") else "not-queued")
+
+
 def main(argv: Optional[Sequence[str]] = None, *, env: Optional[dict] = None,
          consent: Callable[[str], bool] = _ask_consent) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -1100,13 +1289,23 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[dict] = None,
     r = sub.add_parser("repair")
     r.add_argument("--runtime", choices=tuple(RUNTIMES), required=True)
     r.add_argument("--yes", action="store_true")
+    r.add_argument("--json", action="store_true",
+                   help="one JSON line per phase on stdout, then one result line")
+    r.add_argument("--consent-source", default="",
+                   help="who consented, e.g. app; recorded on the incident before acting")
+    r.add_argument("--consent-by", default="", help="the account that consented")
+    r.add_argument("--plan-hash", default="", help="refuse when the plan is no longer this one; "
+                   "required with --consent-source app")
+    n = sub.add_parser("notify-owner", help="queue the incident's one owner DM, if still unusable")
+    n.add_argument("--runtime", choices=tuple(RUNTIMES), required=True)
+    n.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     env = dict(os.environ if env is None else env)
     if a.cmd == "doctor":
         names = list(RUNTIMES) if a.runtime == "all" else [a.runtime]
         reports = [discover(n, env=env) for n in names]
         if a.json:
-            print(json.dumps([dict(r.to_dict(), plan=asdict(plan(r, env=env))) for r in reports], indent=2))
+            print(json.dumps([_doctor_doc(r, env) for r in reports], indent=2))
         else:
             for rep in reports:
                 auth = (auth_status(rep.runtime, rep.selected.path, env=env,
@@ -1119,6 +1318,7 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[dict] = None,
         if rep.selected is None:
             _say(f"no usable {RUNTIMES[a.runtime].binary}: {plan(rep, env=env).reason}")
             return EXIT_UNUSABLE
+        _say(rep.selected_reason)
         print(rep.selected.path)
         if a.enforce_auth:
             auth = auth_status(a.runtime, rep.selected.path, env=env,
@@ -1128,19 +1328,16 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[dict] = None,
                 return EXIT_LOGIN
         return 0
     if a.cmd == "repair":
-        if not a.yes:
-            _say("the assisted repair changes files; pass --yes to consent.")
-            return EXIT_USAGE
-        result = assisted_install(a.runtime, env=env, log=_say)
-        _say(f"{result.reason}: {result.detail}")
-        if not result.ok:
-            _say(f"next: {result.user_action}")
-        return 0 if result.ok else EXIT_UNUSABLE
+        return _repair_cmd(a, env)
+    if a.cmd == "notify-owner":
+        return _notify_owner_cmd(a, env)
     give = (lambda _q: True) if a.yes or env.get("SUTANDO_RUNTIME_REPAIR_CONSENT") == "1" else consent
-    rc, path = ensure(a.runtime, env=env, wait_s=a.wait, repair=a.repair, consent=give,
-                      enforce_auth=a.enforce_auth, claude_config_dir=a.claude_config_dir or None,
+    app = app_surface(env)
+    rc, path = ensure(a.runtime, env=env, wait_s=0.0 if app else a.wait, repair=a.repair,
+                      consent=give, enforce_auth=a.enforce_auth,
+                      claude_config_dir=a.claude_config_dir or None,
                       resume_hint=a.resume_hint, workspace=_workspace(),
-                      notify_owner=a.notify_owner)
+                      notify_owner=a.notify_owner and not app)
     if path:
         print(path)
     return rc
