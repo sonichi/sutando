@@ -43,7 +43,9 @@ resubmit; the `id:` header must equal the file stem. Whether a task's result is
 ready is never the Mod's call (it reads no result file): the claim and
 `interrupt` answer from the shared lifecycle, a terminal answer retires the
 task, and a result not ready yet (`LIVE_UNREADY`, e.g. whitespace-only or
-undecodable) keeps it, backed off, until that changes.
+undecodable) keeps it, backed off, until that changes; one kept past 300 s is
+marked stuck exactly as an unpublished interrupted answer is (below), and the
+claim's write clears the mark when it finally claims or refuses for good.
 
 Intake stops, loudly, when the CLI answers a hard failure (exit 3: the
 progress record could not be written durably at the temp, fsync, replace or
@@ -63,7 +65,7 @@ retires a task only on a `resolved` reply (any other reply, exit code or a CLI
 that did not run keeps it; the next call publishes a staged answer), backing off 1, 2, 4 ... ticks
 up to 60, with a log line on the first failure, each new delay and the
 success. One still failing after 300 s is marked `stuck` in the plugin record:
-`verify` fails its `interrupts` row naming it and the launcher raises the
+`verify` fails its `unanswered` row naming it and the launcher raises the
 needs-attention card. The mark never outlives the answer: the CLI drops it in
 the write that resolves the task, the Mod clears it on every retirement (a
 no-op without one, never from memory), and the record's writer, `verify` and

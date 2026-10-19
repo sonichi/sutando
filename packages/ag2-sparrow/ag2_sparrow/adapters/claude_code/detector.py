@@ -4,8 +4,8 @@ pane's capture and the Mod's progress record, never from the process.
 Two cases: (a) the raw pane static for STALL_MIN_S while the plugin record shows an offer in flight
 (CALLING or TURN_CONFIRMED with no result), which is this adapter's rule, not cli_wedge's; (b)
 abnormal text on the pane, read line-anchored through the shared banner grammar
-(cli_wedge_patterns), or a Claude Code startup dialog the pane waits at (trust.dialog); (c) an
-interrupted answer the Mod could not publish for its stuck threshold (`stuck` in the record). The verdict is data the launcher writes into the supervisor record; nothing
+(cli_wedge_patterns), or a Claude Code startup dialog the pane waits at (trust.dialog); (c) a
+task the Mod has kept without an answer past its stuck threshold (`stuck` in the record). The verdict is data the launcher writes into the supervisor record; nothing
 here acts.
 """
 from __future__ import annotations
@@ -62,8 +62,8 @@ def derive(previous: dict, text: str, plugin: dict, now: float, stall_min_s: flo
         ids, since = sorted(stuck), min(v["since"] for v in stuck.values())
         return {"frame_hash": h, "static_since": now, "task": None, "abnormal": [], "abnormal_since": None,
                 "dialog": trust.dialog(text),
-                "stall": {"reason": "abnormal:interrupt-unpublished", "since": since, "frame_hash": "", "task": ids[0],
-                          "checks": "interrupted answers not published: %s" % ", ".join(
+                "stall": {"reason": "abnormal:task-unanswered", "since": since, "frame_hash": "", "task": ids[0],
+                          "checks": "tasks without an answer: %s" % ", ".join(
                               "%s (%s)" % (i, stuck[i].get("detail") or "no detail") for i in ids), "lines": []}}
     task = inflight_task(plugin)
     names = abnormal_names(text)

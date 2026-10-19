@@ -181,6 +181,22 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
   let busy = false
   const log = (line: string) => $.ui.log(`${PLUGIN}: ${line}`, { to: 'debug' })
 
+  // A task kept without an answer: never aged out, retried after 1, 2, 4 ... ticks up to the cap, logged
+  // per state change, and marked stuck in the record once it has waited STUCK_TICKS.
+  const retain = async (name: string, rid: string, what: string, why: string) => {
+    const prev = s.retry.get(name)
+    s.stale.delete(name)
+    const fails = (prev?.fails ?? 0) + 1
+    const delay = Math.min(BACKOFF_MAX_TICKS, 2 ** (fails - 1))
+    const next = { fails, delay, next: s.tick + delay, first: prev?.first ?? s.tick, stuck: prev?.stuck ?? false }
+    if (!prev || delay !== prev.delay) await $.ui.log(`${PLUGIN}: ${rid} ${what} (${why}); next try in ${delay} s`, {})
+    if (!next.stuck && s.tick - next.first >= STUCK_TICKS) {
+      const p = await cli($, s, ['progress', '--stuck', rid, '--stuck-detail', `${what}: ${why}`])
+      if (p.ok) { next.stuck = true; await $.ui.log(`${PLUGIN}: ${rid} ${what}: STUCK for ${STUCK_TICKS} s; recorded for verify and the card`, {}) }
+    }
+    s.retry.set(name, next)
+  }
+
   const scan = async () => {
     if (busy) return
     busy = true
@@ -206,14 +222,6 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
         if (rid !== stem) { log(`${entry.name}: header id ${rid} does not match the file stem; not submitted`); s.seen.add(entry.name); continue }
         if (s.offers.has(rid)) { s.seen.add(entry.name); continue }
         // Whether a result is ready is the lifecycle's call (claim, interrupt), never a size read here.
-        if (s.answered.has(rid)) {
-          // A retirement clears the record's stuck mark (a no-op without one); kept, and never aged out,
-          // until that write lands.
-          if (!(await cli($, s, ['progress', '--unstuck', rid])).ok) { s.stale.delete(entry.name); continue }
-          s.retry.delete(entry.name)
-          s.seen.add(entry.name)
-          continue
-        }
         let out = ''
         try {
           const v = await $.process.run(['python3', '-c', VERIFY_PY], { stdin: text, env: { AG2_HMAC_KEY_FILE: keyFile } })
@@ -232,17 +240,7 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
           // Retired only on a reply that says resolved (exit 3 too: the step stood, only the mirror failed);
           // every other reply, exit code or failure to run keeps it, never aged out, backed off.
           if (!((r.ok || r.hard) && r.data?.resolved === true)) {
-            s.stale.delete(entry.name)
-            const fails = (backoff?.fails ?? 0) + 1
-            const delay = Math.min(BACKOFF_MAX_TICKS, 2 ** (fails - 1))
-            const next = { fails, delay, next: s.tick + delay, first: backoff?.first ?? s.tick, stuck: backoff?.stuck ?? false }
-            const why = String(r.data?.refused ?? r.data?.error ?? 'no resolved reply')
-            if (!backoff || delay !== backoff.delay) await $.ui.log(`${PLUGIN}: ${rid} interrupted answer not published (${why}); next try in ${delay} s`, {})
-            if (!next.stuck && s.tick - next.first >= STUCK_TICKS) {
-              const p = await cli($, s, ['progress', '--stuck', rid, '--stuck-detail', why])
-              if (p.ok) { next.stuck = true; await $.ui.log(`${PLUGIN}: ${rid} interrupted answer STUCK for ${STUCK_TICKS} s; recorded for verify and the card`, {}) }
-            }
-            s.retry.set(entry.name, next)
+            await retain(entry.name, rid, 'interrupted answer not published', String(r.data?.refused ?? r.data?.error ?? 'no resolved reply'))
             continue
           }
           // The CLI cleared the mark in its resolving write; the Mod clears it too, so both converge.
@@ -257,17 +255,12 @@ async function arm($: any, s: State, inbox: string, results: string): Promise<{ 
           await $.ui.log(`${PLUGIN}: ${rid} ${r.data?.answered ? 'answered as interrupted' : 'already resolved'} (intake stopped)`, {})
           continue
         }
-        // The claim: only a task the classifier reads ABSENT and the shared admission policy admits may be
-        // submitted; a terminal refusal retires it here (a refused non-owner task is answered by the CLI), a
-        // nonterminal one (a result not ready yet) keeps it, backed off.
+        // Only an ABSENT, admitted task is submitted; a final refusal retires it (a refused non-owner is answered
+        // by the CLI), a retry (a result not ready, a mark not yet cleared) keeps it, backed off.
         const claimed = await cli($, s, ['claim', rid])
         if (claimed.hard) return
         if (!claimed.ok && claimed.data?.retry) {
-          s.stale.delete(entry.name)
-          const fails = (backoff?.fails ?? 0) + 1
-          const delay = Math.min(BACKOFF_MAX_TICKS, 2 ** (fails - 1))
-          if (!backoff || delay !== backoff.delay) log(`${rid} not claimable yet (${claimed.data?.refused ?? ''}); next try in ${delay} s`)
-          s.retry.set(entry.name, { fails, delay, next: s.tick + delay, first: backoff?.first ?? s.tick, stuck: false })
+          await retain(entry.name, rid, 'not claimable yet', String(claimed.data?.refused ?? ''))
           continue
         }
         s.retry.delete(entry.name)

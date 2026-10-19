@@ -22,7 +22,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
                                claimAs?: Record<string, unknown>; interruptParks?: number; interruptThrows?: number;
                                interruptSoft?: Record<string, string | number>; stuckAtStart?: Record<string, unknown>;
-                               unstuckFails?: number } = {}) {
+                               unstuckFails?: number; clearFails?: Record<string, string> } = {}) {
   const files: Record<string, string> = {}
   const submitted: string[] = []
   const runs: string[][] = []
@@ -42,6 +42,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   // The plugin record's stuck marks: durable across Mod starts, returned by every progress reply.
   const stuck: Record<string, unknown> = { ...(opts.stuckAtStart ?? {}) }
   let unstuckFailsLeft = opts.unstuckFails ?? 0
+  const clearFailsLeft: Record<string, string> = { ...(opts.clearFails ?? {}) }
   let sidReads = 0
   const interruptAt: number[] = []
   const logs: string[] = []
@@ -109,7 +110,15 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       return fail ? out(3, { ...data, hard: true, error: 'progress write failed: disk' }) : out(0, data)
     }
     if (verb === 'claim') {
-      if (result(task) === 'LIVE_READY') { delete stuck[task]; return out(1, { refused: `${task} is LIVE_READY` }) }
+      if (result(task) === 'LIVE_READY') {
+        // As the CLI: the mark is cleared before the final refusal; a failed clear is a retry, the task kept.
+        if (task in stuck && clearFailsLeft[task]) {
+          const why = clearFailsLeft[task]; delete clearFailsLeft[task]
+          return out(1, { refused: `${task} is LIVE_READY, but its stuck mark could not be cleared (${why}): cleanup pending; retried`, retry: true })
+        }
+        delete stuck[task]
+        return out(1, { refused: `${task} is LIVE_READY` })
+      }
       if (result(task) === 'LIVE_UNREADY') return out(1, { refused: `${task} is LIVE_UNREADY, not claimable yet; retried`, retry: true })
       const c = claims[task]
       if (c && c.phase !== 'PREPARED') return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
@@ -123,6 +132,7 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
         return out(1, { refused: `${task} not admitted` })
       }
       if (!c) claims[task] = { attempt: 1, phase: 'PREPARED' }
+      delete stuck[task]                                // the claim's write clears the task's mark
       return answer({ task_id: task, attempt: claims[task].attempt, ...(opts.claimAs ?? { admission, access_tier: tier, collaborator: collab }) })
     }
     const c = claims[task]
@@ -586,8 +596,9 @@ test('a failing interrupt backs off 1, 2, 4 ... ticks capped at 60, logs per sta
   const gaps = h.interruptAt.slice(1).map((t: number, i: number) => t - h.interruptAt[i])
   expect(gaps.slice(0, 9)).toEqual([1, 2, 4, 8, 16, 32, 60, 60, 60])
   // A log line on the first failure and each new delay, never per attempt.
-  expect(h.logs.filter((l: string) => l.includes('task-stuck interrupted answer not published')).length).toBe(7)
-  expect(h.progress.find((p: string[]) => p[0] === '--stuck')).toEqual(['--stuck', 'task-stuck', '--stuck-detail', 'task-stuck: not answered yet (disposition ABSENT); retried'])
+  expect(h.logs.filter((l: string) => l.includes('task-stuck interrupted answer not published (')).length).toBe(7)
+  expect(h.logs.filter((l: string) => l.includes('task-stuck interrupted answer not published: STUCK')).length).toBe(1)
+  expect(h.progress.find((p: string[]) => p[0] === '--stuck')).toEqual(['--stuck', 'task-stuck', '--stuck-detail', 'interrupted answer not published: task-stuck: not answered yet (disposition ABSENT); retried'])
   expect(h.files['/out/task-stuck.txt']).toContain('interrupted')   // the 12th attempt, at tick 363, publishes
   expect(h.stuck).toEqual({})                         // cleared by the CLI's resolving write, not by Mod memory
   expect(h.logs.filter((l: string) => l.includes('task-stuck answered as interrupted')).length).toBe(1)
@@ -655,6 +666,43 @@ test('a whitespace-only or undecodable result is not an answer: the durable mark
   await h.clock.advance(70000)                          // the backed-off tries still come
   expect(h.stuck).toEqual({})
   expect(h.files['/out/task-bad.txt']).toContain('interrupted')
+})
+
+test('an unready result held past 300 ticks is marked stuck for verify and the card; a real body clears it', async ($, on) => {
+  const h = host(on)
+  h.files['/out/task-held.txt'] = ' \n'
+  h.files['/in/task-held.txt'] = TASK('task-held')
+  h.files['/out/task-held2.txt'] = '\t'
+  h.files['/in/task-held2.txt'] = TASK('task-held2')
+  await arm($, h)
+  for (let i = 0; i < 320; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(0)
+  expect(h.progress.find((p: string[]) => p[0] === '--stuck')?.slice(0, 3)).toEqual(['--stuck', 'task-held', '--stuck-detail'])
+  expect(Object.keys(h.stuck).sort()).toEqual(['task-held', 'task-held2'])
+  h.files['/out/task-held2.txt'] = 'a real answer\n'     // a real body: the claim's terminal refusal clears it
+  for (let i = 0; i < 70; i++) await h.clock.advance(1000)
+  expect(Object.keys(h.stuck)).toEqual(['task-held'])
+  expect(h.logs.filter((l: string) => l.includes('task-held not claimable yet: STUCK')).length).toBe(1)
+  delete h.files['/out/task-held.txt']                 // the stray file goes: the next try claims and submits
+  for (let i = 0; i < 70; i++) await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.stuck).toEqual({})
+})
+
+test('a mark that could not be cleared at the final claim keeps the task until the next claim clears it', async ($, on) => {
+  const h = host(on, { stuckAtStart: { 'task-clear-fail': { since: 1 }, 'task-lock-fail': { since: 1 } },
+                       clearFails: { 'task-clear-fail': 'RecordError: disk', 'task-lock-fail': 'OSError: progress lock' } })
+  await arm($, h)
+  for (const t of ['task-clear-fail', 'task-lock-fail']) {
+    h.files[`/out/${t}.txt`] = 'answered out of band\n'
+    h.files[`/in/${t}.txt`] = TASK(t)
+  }
+  await h.clock.advance(10000)
+  expect(h.stuck).toEqual({})
+  expect(h.logs.filter((l: string) => l.includes('cleanup pending')).length).toBe(2)   // each kept once, then cleared
+  for (const t of ['task-clear-fail', 'task-lock-fail'])
+    expect(h.runs.filter((a: string[]) => a[2] === 'claim' && a[3] === t).length).toBe(2)
+  expect(h.submitted.length).toBe(0)
 })
 
 test('thirty failed unstuck writes never age a retained task out: the next one lands (stopped-intake path)', async ($, on) => {

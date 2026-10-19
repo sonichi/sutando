@@ -551,7 +551,7 @@ def verify(_args) -> int:
     except records.RecordError:
         stuck = {}
     if stuck:
-        cm.check(results, False, "interrupts", "interrupted answers not published, retried with backoff: " + ", ".join(
+        cm.check(results, False, "unanswered", "tasks without an answer, retried with backoff: " + ", ".join(
             "%s since %s (%s)" % (t, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(v["since"])), v.get("detail") or "")
             for t, v in sorted(stuck.items())))
     rec = records.load_supervisor(root)

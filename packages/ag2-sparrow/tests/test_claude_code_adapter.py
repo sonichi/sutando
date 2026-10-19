@@ -2610,16 +2610,16 @@ class InboxCli(ConnectBase):
         t = self.task("task-marked")
         self.assertEqual(self.verb("progress", "--stuck", t, "--stuck-detail", "parked before a restart")[0], 0)
         with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
-            self.assertIn("FAIL interrupts", self.main("verify")[1])
+            self.assertIn("FAIL unanswered", self.main("verify")[1])
             rc, out = self.verb("interrupt", t)
             self.assertEqual((rc, out["resolved"], out["answered"]), (0, True, True))
             self.assertEqual(records.load_plugin(self.root)["stuck"], {}, "cleared in the resolving write")
-            self.assertNotIn("interrupts", self.main("verify")[1])
+            self.assertNotIn("unanswered", self.main("verify")[1])
             self.assertEqual(self.verb("progress", "--stuck", t)[0], 0)      # a mark left on an already-answered task
             rc, out = self.verb("interrupt", t)
             self.assertEqual((rc, out["resolved"], out["answered"]), (0, True, False))
             self.assertEqual(records.load_plugin(self.root)["stuck"], {}, "a resolved reply always clears it")
-            self.assertNotIn("interrupts", self.main("verify")[1])
+            self.assertNotIn("unanswered", self.main("verify")[1])
         self.assertEqual(self.verb("progress", "--intake", "open")[1]["stuck"], {}, "every progress reply carries the marks")
 
     def test_a_mark_never_outlives_its_answer_even_when_the_task_file_is_gone(self):
@@ -2629,7 +2629,7 @@ class InboxCli(ConnectBase):
         self.assertIn("task-gone", records.load_plugin(self.root)["stuck"])
         (self.results / "task-gone.txt").write_text("published by another route\n")
         with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
-            self.assertNotIn("interrupts", self.main("verify")[1])
+            self.assertNotIn("unanswered", self.main("verify")[1])
         lc = launcher.Launcher(dict(cli.read_config(cli.config_path()), ROOT=self.root), cli.config_dir())
         with mock.patch.object(lc.tm, "capture", return_value="pane"):
             self.assertIsNone(lc.observe({"generation": {"pane_id": "%0"}, "stall": None}).get("stall"))
@@ -2658,11 +2658,25 @@ class InboxCli(ConnectBase):
         rc, out = self.verb("interrupt", "task-bad")
         self.assertEqual((rc, out["resolved"]), (0, True))
         self.assertEqual(records.load_plugin(self.root)["stuck"], {})
-        t = self.task("task-lockfail")
-        (self.results / (t + ".txt")).write_text("answered\n")
-        with mock.patch.object(records, "write_progress", side_effect=records.RecordError("disk")):
+        t = self.task("task-claimable")
+        self.assertEqual(self.verb("progress", "--stuck", t, "--stuck-detail", "not claimable yet")[0], 0)
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out["admission"]), (0, "owner"))
+        self.assertNotIn(t, records.load_plugin(self.root)["stuck"], "a successful claim clears the mark in its write")
+        for t, error in (("task-clearfail", records.RecordError("disk")), ("task-lockfail", OSError(errno.EIO, "lock"))):
+            self.task(t)
+            self.assertEqual(self.verb("progress", "--stuck", t)[0], 0)
+            (self.results / (t + ".txt")).write_text("answered out of band\n")
+            with mock.patch.object(records, "write_progress", side_effect=error):
+                rc, out = self.verb("claim", t)
+            self.assertEqual((rc, out.get("retry"), "cleanup pending" in out["refused"]), (1, True, True),
+                             "a terminal task whose mark could not be cleared is kept: " + t)
+            self.assertIn(t, records.load_plugin(self.root)["stuck"])
             rc, out = self.verb("claim", t)
-        self.assertEqual((rc, "retry" in out), (1, False), "a failed clear never turns a terminal refusal into a retry")
+            self.assertEqual((rc, "retry" in out, "only ABSENT" in out["refused"]), (1, False, True), "then final: " + t)
+            self.assertNotIn(t, records.load_plugin(self.root)["stuck"])
+        with mock.patch.object(records, "load_plugin", side_effect=records.RecordError("torn")):
+            self.assertFalse(inbox._clear_stuck(self.root, "task-x"), "an unreadable record is never read as cleared")
 
     def test_a_stuck_interrupt_is_named_by_verify_and_raises_the_card_and_clears(self):
         self.assertEqual(self.verb("progress", "--stuck", "task-s", "--stuck-detail", "parked")[0], 0)
@@ -2671,19 +2685,19 @@ class InboxCli(ConnectBase):
         self.assertEqual(list(marks), ["task-s"])
         self.assertEqual(marks["task-s"]["detail"], "still parked", "the first time is kept, the detail refreshed")
         obs = detector.derive({}, "pane", records.load_plugin(self.root), 1000.0)
-        self.assertEqual((obs["stall"]["reason"], obs["stall"]["task"]), ("abnormal:interrupt-unpublished", "task-s"))
+        self.assertEqual((obs["stall"]["reason"], obs["stall"]["task"]), ("abnormal:task-unanswered", "task-s"))
         self.assertEqual(detector.derive(obs, "other pane", records.load_plugin(self.root), 2000.0)["stall"], obs["stall"],
                          "the same stall across ticks, so one card")
         with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
             out = self.main("verify")[1]
-        self.assertIn("FAIL interrupts: interrupted answers not published, retried with backoff: task-s since", out)
+        self.assertIn("FAIL unanswered: tasks without an answer, retried with backoff: task-s since", out)
         self.assertIn("(still parked)", out)
         self.assertEqual(self.verb("progress", "--unstuck", "task-s")[0], 0)
         self.assertEqual(records.load_plugin(self.root)["stuck"], {})
         self.assertIsNone(detector.derive({}, "pane", records.load_plugin(self.root), 1000.0)["stall"])
-        self.assertNotIn("interrupts", self.main("verify")[1])
+        self.assertNotIn("unanswered", self.main("verify")[1])
         records.plugin_path(self.root).write_text("[")
-        self.assertNotIn("interrupts", self.main("verify")[1], "an unreadable record names no stuck answer, never crashes")
+        self.assertNotIn("unanswered", self.main("verify")[1], "an unreadable record names no stuck answer, never crashes")
         self.assertEqual(detector.stuck_answers({"stuck": {"a": {"since": "x"}, "b": 3}}), {})
         self.assertEqual(detector.stuck_answers({"stuck": ["a"]}), {})
 

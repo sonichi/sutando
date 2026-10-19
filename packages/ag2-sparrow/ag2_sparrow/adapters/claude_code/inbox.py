@@ -125,13 +125,17 @@ def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":
     return kind, headers, why
 
 
-def _clear_stuck(root, task_id) -> None:
-    """Best effort: a resolved task's stuck mark dropped; the next record write prunes it otherwise."""
+def _clear_stuck(root, task_id) -> bool:
+    """A resolved task's stuck mark dropped: True once no mark is left (none to clear writes nothing),
+    False when the record could not be read or written, so the caller keeps the task and retries."""
     try:
+        if task_id not in (records.load_plugin(root).get("stuck") or {}):
+            return True
         records.write_progress(root, lambda rec: dict(rec, stuck={k: v for k, v in rec["stuck"].items() if k != task_id})
                                if isinstance(rec.get("stuck"), dict) and task_id in rec["stuck"] else rec)
-    except records.RecordError:
-        pass
+        return True
+    except (records.RecordError, OSError, TypeError):
+        return False
 
 
 def _mirror(root, task_id, phase, out: dict, extra=None, unstuck=False) -> dict:
@@ -175,12 +179,14 @@ def claim(root, task_id) -> dict:
     if verdict != "call":
         if not terminal:
             raise Parked("%s is %s, not claimable yet; retried" % (task_id, state))
-        _clear_stuck(root, task_id)      # after claims.lock: the progress lock is never taken under it
+        # After claims.lock (the progress lock is never taken under it); a mark not yet cleared keeps it.
+        if not _clear_stuck(root, task_id):
+            raise Parked("%s is %s, but its stuck mark could not be cleared: cleanup pending; retried" % (task_id, state))
         raise Refused("%s is %s; only ABSENT may be submitted" % (task_id, state))
     return _mirror(root, task_id, lifecycle.PREPARED,
                    {"task_id": task_id, "attempt": attempt, "generation": generation, "admission": kind,
                     "access_tier": headers["access_tier"], "collaborator": headers["collaborator"] == "true"},
-                   {"attempt": attempt})
+                   {"attempt": attempt}, unstuck=True)
 
 
 def resolved(lc, task_id) -> "tuple[bool, str]":
