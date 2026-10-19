@@ -165,6 +165,18 @@
         }
       }
     },
+    "skills": {
+      "type": "object",
+      "description": "How skills are installed on this host. See skills/MANIFEST.md, `audience`.",
+      "additionalProperties": false,
+      "properties": {
+        "developer": {
+          "type": "boolean",
+          "default": false,
+          "description": "Link developer-only skills (manifest `audience`: `developer`, or an unknown value) into the core's skills dirs. Only JSON true opts in; any other value is false. Read by resolve_skills_developer() in src/sutando_config.py, through src/skill_audience.py, the decision every installer calls."
+        }
+      }
+    },
     "bridges": {
       "type": "object",
       "description": "Bridge-wide toggles shared by the Discord/Telegram/Slack bridges.",
