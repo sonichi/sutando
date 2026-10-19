@@ -70,6 +70,7 @@ Known keys (`docs/sutando-config.schema.json` → `env.properties` is the refere
 | `SUTANDO_HEALTH_QUEUE_COUNT` | `3` | health-check `task-queue` | pending-task count that, with the age above, warns |
 | `SUTANDO_HEALTH_LOAD_RATIO` | `1.5` | health-check `system-load` | a pass is high when the 1-min load exceeds this times the core count |
 | `SUTANDO_HEALTH_LOAD_PASSES` | `3` | health-check `system-load` | consecutive high passes before it warns |
+| `SUTANDO_HEALTH_LOAD_REAP` | `0` (unset is off) | health-check `system-load` | only exactly `1` lets every `--fix` run (the desktop app runs one every 30 min) reap leftover test processes automatically, at most once per episode; anything else is off |
 
 ## Three common overrides
 

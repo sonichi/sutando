@@ -7841,12 +7841,49 @@ def check_system_load(workspace: Optional[Path] = None, **probes) -> dict:
     """Sustained load against the core count (src/system_load.py). The cause classifier is the
     script an installed (linked) skill declares for system_load.DECLARATION, resolved here and injected."""
     ws = WORKSPACE_DIR if workspace is None else Path(workspace)
-    found = skill_roots.declared(system_load.DECLARATION, roots=[installed_skills_dir()])
+    found, name = _installed_reaper()
     return system_load.check(
         ws / "state" / system_load.STATE_NAME,
         ratio=system_load.setting(config_get(system_load.RATIO_KEY), system_load.DEFAULT_RATIO, float),
         passes=system_load.setting(config_get(system_load.PASSES_KEY), system_load.DEFAULT_PASSES, int),
-        classifier=found.script, unavailable=found.reason, **probes)
+        classifier=found.script, unavailable=found.reason, reaper_name=name,
+        reap_on=system_load.reap_enabled(config_get(system_load.REAP_KEY)), **probes)
+
+
+def _installed_reaper():
+    """(Declaration, declaring skill's name) for system_load.DECLARATION in the installed skills dir."""
+    roots = [installed_skills_dir()]
+    found = skill_roots.declared(system_load.DECLARATION, roots=roots)
+    name = next((n for n, p in skill_roots.declared_scripts(system_load.DECLARATION, roots) if p == found.script), None)
+    return found, name
+
+
+def apply_system_load_reap(checks: list, workspace: Optional[Path] = None, stream=None, **probes) -> Optional[dict]:
+    """--fix for `system-load`: when it warns with action reap-once, run the installed orphan reaper
+    once for this episode (system_load.reap_once) and rewrite the row to say what happened."""
+    row = next((c for c in checks if c.get("name") == system_load.NAME), None)
+    if not row or row.get("status") != "warn" or row.get("action") != system_load.ACTION_REAP:
+        return None
+    out = stream or sys.stdout
+
+    def log(line: str) -> None:
+        print(line, file=out, flush=True)
+
+    if not system_load.reap_enabled(config_get(system_load.REAP_KEY)):
+        log(f"system-load: not reaped: reaping is off ({system_load.REAP_KEY}=1 enables it)")
+        return {"action": "disabled"}
+    found, _ = _installed_reaper()
+    if found.script is None:
+        reason = found.reason or "no installed skill declares an orphan reaper"
+        log(f"system-load: not reaped: {reason}")
+        system_load.annotate(row, None, unreaped=reason)
+        return {"action": "no-reaper", "reason": reason}
+    ws = WORKSPACE_DIR if workspace is None else Path(workspace)
+    state_path = ws / "state" / system_load.STATE_NAME
+    result = system_load.reap_once(state_path, found.script, log=log, **probes)
+    if result["action"] != "busy":
+        system_load.annotate(row, system_load.read_state(state_path).get("episode"))
+    return result
 
 
 @functools.lru_cache(maxsize=1)
@@ -15005,6 +15042,7 @@ def main():
         apply_skill_symlink_fixes(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_task_watcher_sentinel_fix(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_claude_hooks_fix(checks, stream=sys.stderr if as_json else sys.stdout)
+        apply_system_load_reap(checks, stream=sys.stderr if as_json else sys.stdout)
 
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set

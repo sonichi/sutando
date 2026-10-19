@@ -254,6 +254,11 @@
           "default": "1.5",
           "description": "health-check system-load: a pass is high when the 1-min load average exceeds this times the core count. A malformed or non-positive value falls back to the default."
         },
+        "SUTANDO_HEALTH_LOAD_REAP": {
+          "type": "string",
+          "default": "0",
+          "description": "health-check system-load: only exactly `1` lets every `health-check.py --fix` run (the desktop app's 30-minute pass included, so reaping is automatic there) run the installed orphan reaper, at most once per high-load episode. Anything else, unset included, is off: --fix does not reap and the warning says `reaping is off (SUTANDO_HEALTH_LOAD_REAP=1 enables it)` with action=none, keeping cause=leftover-test-processes so the core can still run the reaper by hand. A normal pass never reaps."
+        },
         "SUTANDO_HEALTH_LOAD_PASSES": {
           "type": "string",
           "default": "3",

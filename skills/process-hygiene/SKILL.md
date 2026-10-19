@@ -164,6 +164,19 @@ skill is installed (linked into the Claude skills dir), health-check's `system-l
 item runs the script in report mode when load stays high, and calls the cause
 leftover test processes (`cause=leftover-test-processes action=reap-once`) when the
 candidates it would stop hold at least half of the top five CPU users' share.
+A pass without `--fix` only warns. Any `health-check.py --fix` run reaps:
+with `SUTANDO_HEALTH_LOAD_REAP=1` it runs `reap_orphans.py --reap --spotlight` in
+the same run that warns, at most once per high-load episode (until load drops to
+normal and rises again), and the warning then says when it ran and what it
+stopped. So the opt-in means **reap automatically**: the desktop app runs
+`health-check.py --fix --emit-task` every 30 minutes and once at startup, so on a
+desktop host it reaps on that timer without the core deciding; the core's own
+`--fix` runs, and any manual one, do the same. The launchd fallback runs without
+`--fix` and never reaps. Both switches that let something other than a person reap,
+`SUTANDO_HEALTH_LOAD_REAP` in health-check's config and `PROCESS_HYGIENE_WITNESS_REAP`
+for witness scripts, are off unless set to exactly `1`. While the health-check one is
+off, the warning says so with `action=none` and keeps
+`cause=leftover-test-processes`, so the core can still run this script by hand.
 
 `--reap` refuses a minimum age under 600 s (exit 2), so a typo cannot reap young
 work. A run holds an exclusive `flock` on `process-hygiene.lock` beside its log;

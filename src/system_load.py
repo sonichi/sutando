@@ -8,11 +8,20 @@ never names, locates or imports a skill. The script contract it relies on:
 - run with no arguments it only reports, exits 0, and prints one line per process group or pid it
   would stop, `would stop <kind>=<id> pids=<pid,pid,...> ...`, then a summary line carrying
   `mode=report ... candidates=<n>`; no summary line means it did nothing (busy or failed);
-- exit status 2 is a usage error, never retried.
+- exit status 2 is a usage error, never retried;
+- `--reap --spotlight` stops the candidates and prints the same summary with `mode=reap ...
+  terminated=<n> killed=<n> aborted=<n>`.
+
+An episode is a run of consecutive high passes; it ends with the first pass at or below the
+threshold, or after MAX_GAP_S without a pass. A pass without `--fix` never reaps. Any health-check
+`--fix` run (the core's, a manual one, or the desktop app's 30-minute pass) calls `reap_once` when the
+warning's action is reap-once: the reaper runs at most once per episode, recorded in the state file,
+so a repeated `--fix` in the same episode stops nothing.
 
 Config (health-check's `config_get` keys, read by the edge):
   SUTANDO_HEALTH_LOAD_RATIO   1-min load / cores above which a pass counts as high (default 1.5)
   SUTANDO_HEALTH_LOAD_PASSES  consecutive high passes before the warning (default 3)
+  SUTANDO_HEALTH_LOAD_REAP    exactly 1 lets --fix reap; anything else, unset included, is off
 """
 from __future__ import annotations
 
@@ -26,6 +35,8 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
+from result_publish import publish_text
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover — non-POSIX: the lock degrades to a no-op
@@ -38,6 +49,9 @@ RATIO_KEY = "SUTANDO_HEALTH_LOAD_RATIO"
 PASSES_KEY = "SUTANDO_HEALTH_LOAD_PASSES"
 DEFAULT_RATIO = 1.5
 DEFAULT_PASSES = 3
+REAP_KEY = "SUTANDO_HEALTH_LOAD_REAP"
+REAP_TIMEOUT_S = 600
+REAP_MAX_ATTEMPTS = 3
 
 HISTORY_LEN = 12
 # A pass within this of the previous one replaces it: a burst of manual or dashboard runs is one pass.
@@ -64,6 +78,7 @@ _SHORT_FLAG = re.compile(r"^-[A-Za-z0-9]$")
 PLACEHOLDER = "…"
 _WOULD_STOP = re.compile(r"^(?:would stop|stopping) \S+=\S+ pids=([\d,]+)")
 _SUMMARY = re.compile(r"\bmode=(report|reap)\b.*\bcandidates=(\d+)")
+_COUNT = re.compile(r"\b(candidates|terminated|killed|aborted)=(\d+)")
 
 
 def setting(raw: Optional[str], default, cast):
@@ -84,11 +99,8 @@ def read_state(path: Path) -> dict:
 
 
 def write_state(path: Path, state: dict) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(state))
-    os.replace(tmp, path)
+    """Whole in one rename, file and directory fsynced (result_publish's staged write)."""
+    publish_text(path, json.dumps(state))
 
 
 @contextlib.contextmanager
@@ -130,6 +142,17 @@ def record(state: dict, load1: float, cores: int, now: float) -> List[dict]:
         readings.append(reading)
     state["readings"] = readings[-HISTORY_LEN:]
     return state["readings"]
+
+
+def track_episode(state: dict, previous: Optional[dict], current: dict, ratio: float) -> Optional[dict]:
+    """Open an episode on the first high pass, keep it while passes stay high, end it on a normal one."""
+    episode = state.get("episode") if isinstance(state.get("episode"), dict) else None
+    if not is_high(current, ratio):
+        episode = None
+    elif episode is None or previous is None or not is_high(previous, ratio):
+        episode = {"start": current["ts"], "reaped": None, "attempts": 0}
+    state["episode"] = episode
+    return episode
 
 
 def sustained(readings: Sequence[dict], ratio: float, passes: int) -> bool:
@@ -252,7 +275,8 @@ def _cached_cause(state: dict, now: float) -> Optional[Tuple[str, str]]:
 def check(state_path: Path, ratio: float = DEFAULT_RATIO, passes: int = DEFAULT_PASSES,
           classifier: Optional[Path] = None, unavailable: Optional[str] = None,
           now: Optional[float] = None, load_fn: Optional[Callable[[], Sequence[float]]] = None,
-          cores_fn: Optional[Callable[[], Optional[int]]] = None, runner: Optional[Runner] = None) -> Dict:
+          cores_fn: Optional[Callable[[], Optional[int]]] = None, runner: Optional[Runner] = None,
+          reaper_name: Optional[str] = None, reap_on: bool = False) -> Dict:
     """The `system-load` row. A warning carries `cause` and `action` (also as `cause=... action=...`
     at the end of its detail) so the core can decide; `reap-once` means the cause is leftover tests."""
     now = time.time() if now is None else now
@@ -268,7 +292,10 @@ def check(state_path: Path, ratio: float = DEFAULT_RATIO, passes: int = DEFAULT_
                 "detail": "core count unreadable on this host; load not measured"}
     with locked(state_path):
         state = read_state(state_path)
+        last = (state.get("readings") or [None])[-1]
+        fresh = isinstance(last, dict) and isinstance(last.get("ts"), (int, float)) and now - last["ts"] <= MAX_GAP_S
         readings = record(state, load1, cores, now)
+        episode = track_episode(state, last if fresh else None, readings[-1], ratio)
         write_state(state_path, state)
     reading = f"load {load1:.2f} on {cores} cores ({load1 / cores:.2f}x; threshold {ratio:g}x)"
     if not sustained(readings, ratio, passes):
@@ -291,9 +318,112 @@ def check(state_path: Path, ratio: float = DEFAULT_RATIO, passes: int = DEFAULT_
             fresh = read_state(state_path)
             fresh["classification"] = {"at": now, "cause": cause, "note": note}
             write_state(state_path, fresh)
-    action = ACTION_REAP if cause == CAUSE_LEFTOVER else ACTION_NONE
     detail = f"{reading} for {passes} consecutive passes; cause: {_cause_text(cause, note)}"
     if top:
         detail += f"; top CPU: {describe_top(top)}"
-    return {"name": NAME, "status": "warn", "detail": f"{detail}; cause={cause} action={action}",
-            "cause": cause, "action": action}
+    row = {"name": NAME, "status": "warn", "cause": cause, "_base": detail,
+           "_reaper": reaper_name or "orphan", "_reap_on": reap_on}
+    return annotate(row, episode)
+
+
+def counts_text(counts: Dict[str, int]) -> str:
+    stopped = counts.get("terminated", 0) + counts.get("killed", 0)
+    return (f"stopped {stopped} of {counts.get('candidates', 0)} ({counts.get('terminated', 0)} terminated, "
+            f"{counts.get('killed', 0)} killed, {counts.get('aborted', 0)} changed before stopping)")
+
+
+def _stamp(at) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(at)) if isinstance(at, (int, float)) else "an unknown time"
+
+
+def annotate(row: Dict, episode: Optional[dict], unreaped: Optional[str] = None) -> Dict:
+    """Set a warning row's `action` and say in its detail what `--fix` will do, or did, this episode."""
+    cause, name = row["cause"], row.get("_reaper") or "orphan"
+    reaped = episode.get("reaped") if isinstance(episode, dict) else None
+    action, tail = ACTION_NONE, ""
+    if cause != CAUSE_LEFTOVER:
+        pass
+    elif isinstance(reaped, dict) and reaped.get("outcome") == "reaped":
+        tail = f"; the {name} reaper already ran this episode at {_stamp(reaped.get('at'))}: {counts_text(reaped)}"
+    elif isinstance(reaped, dict):
+        tail = (f"; the {name} reaper failed this episode at {_stamp(reaped.get('at'))} ({reaped.get('outcome')}); "
+                "not retried until load returns to normal")
+    elif unreaped:
+        tail = f"; --fix could not reap: {unreaped}"
+    elif not row.get("_reap_on", False):
+        tail = f"; reaping is off ({REAP_KEY}=1 enables it)"
+    else:
+        action = ACTION_REAP
+        tail = f"; --fix runs the {name} reaper once for this episode"
+        attempts = int((episode or {}).get("attempts") or 0)
+        if attempts:
+            tail += f" (it did nothing on {attempts} of {REAP_MAX_ATTEMPTS} tries)"
+    row["action"] = action
+    row["detail"] = f"{row['_base']}{tail}; cause={cause} action={action}"
+    return row
+
+
+def reap_enabled(raw: Optional[str]) -> bool:
+    """Fail closed: only exactly `1` turns reaping on."""
+    return raw == "1"
+
+
+def parse_counts(output: str) -> Optional[Dict[str, int]]:
+    """The reap summary's counts, or None when the reaper printed no `mode=reap` summary."""
+    for line in reversed(output.splitlines()):
+        m = _SUMMARY.search(line)
+        if m and m.group(1) == "reap":
+            return {k: int(v) for k, v in _COUNT.findall(line)}
+    return None
+
+
+def _save_episode(state_path: Path, episode: dict) -> None:
+    with locked(state_path):
+        state = read_state(state_path)
+        current = state.get("episode")
+        if isinstance(current, dict) and current.get("start") == episode["start"]:
+            state["episode"] = episode
+            write_state(state_path, state)
+
+
+def reap_once(state_path: Path, reaper: Path, runner: Optional[Runner] = None,
+              log: Callable[[str], None] = print, now: Optional[float] = None) -> Dict:
+    """Run `reaper --reap --spotlight` at most once in the current episode (health-check --fix);
+    the caller has established that the warning stands with cause leftover test processes."""
+    now = time.time() if now is None else now
+    runner = runner or run_command
+    with locked(Path(str(state_path) + ".reap"), blocking=False) as held:
+        if not held:
+            log("system-load: another --fix is reaping; skipped")
+            return {"action": "busy"}
+        episode = read_state(state_path).get("episode")
+        if not isinstance(episode, dict) or "start" not in episode:
+            return {"action": "no-episode"}
+        if episode.get("reaped"):
+            log("system-load: the reaper already ran this episode; nothing to do")
+            return {"action": "already", "reaped": episode["reaped"]}
+        episode["attempts"] = int(episode.get("attempts") or 0) + 1
+        try:
+            rc, out = runner([sys.executable, str(reaper), "--reap", "--spotlight"], REAP_TIMEOUT_S)
+        except (OSError, subprocess.SubprocessError) as e:
+            episode["reaped"] = {"at": now, "outcome": f"could not run: {type(e).__name__}"}
+            _save_episode(state_path, episode)
+            log(f"system-load: reaper failed ({type(e).__name__}); not retried this episode")
+            return {"action": "failed"}
+        if rc == 2:
+            episode["reaped"] = {"at": now, "outcome": "usage error, exit 2"}
+            _save_episode(state_path, episode)
+            log("system-load: WARN reaper refused its arguments (exit 2); not retried this episode")
+            return {"action": "usage-error"}
+        counts = parse_counts(out) if rc == 0 else None
+        if counts is None:
+            if episode["attempts"] >= REAP_MAX_ATTEMPTS:
+                episode["reaped"] = {"at": now, "outcome": f"did nothing in {REAP_MAX_ATTEMPTS} tries"}
+            _save_episode(state_path, episode)
+            log(f"system-load: reaper did nothing (exit {rc}, busy or failed); try {episode['attempts']} "
+                f"of {REAP_MAX_ATTEMPTS} this episode")
+            return {"action": "nothing", "rc": rc}
+        episode["reaped"] = dict(counts, at=now, outcome="reaped")
+        _save_episode(state_path, episode)
+        log(f"system-load: --fix ran the reaper once this episode: {counts_text(counts)}")
+        return {"action": "reaped", "counts": counts}

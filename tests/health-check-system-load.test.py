@@ -362,9 +362,11 @@ class Edge(unittest.TestCase):
 
     def test_a_linked_declaring_skill_is_found(self):
         self.link("any-name")
-        row = self.run_passes()
+        row = self.run_passes({sl.REAP_KEY: "1"})
         self.assertEqual((row["cause"], row["action"]), (sl.CAUSE_LEFTOVER, sl.ACTION_REAP))
         self.assertTrue(row["detail"].endswith("; cause=leftover-test-processes action=reap-once"))
+        row = self.run_passes()
+        self.assertEqual((row["cause"], row["action"]), (sl.CAUSE_LEFTOVER, sl.ACTION_NONE))
 
     def test_the_default_installed_dir_is_claude_homes_skills(self):
         with mock.patch.object(self.hc, "claude_home_path", lambda *p: self.tmp.joinpath("chp", *p)):

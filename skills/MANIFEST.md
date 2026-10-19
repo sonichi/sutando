@@ -171,11 +171,21 @@ counts, never the shipped copy in `<repo>/skills`; containment and the one-decla
 - no arguments: report only, exit 0, one `would stop <kind>=<id> pids=<pid,...> ...` line per target,
   then a summary line carrying `mode=report ... candidates=<n>`;
 - no summary line means it did nothing (another run holds its lock, or it failed);
-- exit status 2 is a usage error and is never retried.
+- exit status 2 is a usage error and is never retried;
+- `--reap --spotlight`: stop the candidates, then the same summary with `mode=reap ... terminated=<n>
+  killed=<n> aborted=<n>`. A health-check pass without `--fix` never runs this. Every `health-check.py
+  --fix` run does, in the same run that warns, at most once per high-load episode (recorded in
+  health-check's state), when the warning's action is `reap-once`; a repeated `--fix` in the episode
+  stops nothing. The desktop app runs `--fix` every 30 minutes and at startup, so with the opt-in a
+  desktop host reaps automatically on that timer; the launchd fallback runs without `--fix`.
 
 With none installed, the `system-load` warning says its cause is unclassified. A warning ends its
 detail with `cause=<leftover-test-processes|other|unclassified> action=<reap-once|none>` and carries
-the same two keys in `--json`, for the core to decide on.
+the same two keys in `--json`. `action=reap-once` means `--fix` **will** reap:
+the cause is leftover test processes, the reaper has not run this episode, and
+`SUTANDO_HEALTH_LOAD_REAP` is exactly `1`. `action=none` means `--fix` will not reap for any reason
+(another cause, already ran or failed this episode, or reaping off, which is the default); with
+`cause=leftover-test-processes` the core can still run the reaper by hand.
 
 ## Claude plugin (`claude_plugin`)
 
