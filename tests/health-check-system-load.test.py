@@ -8,9 +8,11 @@ Run: python3 tests/health-check-system-load.test.py
 """
 from __future__ import annotations
 
+import tempfile
+
 from _helpers.hermetic_env import isolate_os_environ
 
-isolate_os_environ()
+isolate_os_environ(CLAUDE_CONFIG_DIR=tempfile.mkdtemp(prefix="sysload-ccd-"))
 
 import ast
 import importlib.util
@@ -18,7 +20,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import textwrap
 import unittest
 from pathlib import Path
