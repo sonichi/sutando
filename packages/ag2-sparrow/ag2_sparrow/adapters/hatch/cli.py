@@ -132,17 +132,41 @@ def _record_script(sha: str) -> None:
                                             [r for r in recorded if r != sha] + [sha]), 0o644)
 
 
-_CREDENTIAL_LINE_RE = re.compile(r"^(\s*(?:Environment=)?[\"']?[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD)[A-Z0-9_]*=).*$")
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_ASSIGNMENT_RE = re.compile(r"^(\s*(?:export\s+)?[\"']?)([A-Za-z_][A-Za-z0-9_]*)=")
+_CREDENTIAL_NAME_RE = re.compile(r"TOKEN|SECRET|PASSW|URL|KEY|AUTH|CRED", re.IGNORECASE)
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"']+")
+
+
+def _masked_line(line: str) -> str:
+    """Every value on an `Environment=` line (one may hold several assignments), and a
+    credential-named value elsewhere, withheld; any other URL keeps only scheme, host and path."""
+    body = line.lstrip()
+    if body.startswith("Environment="):
+        prefix = line[:len(line) - len(body)] + "Environment="
+        try:
+            words = shlex.split(body[len("Environment="):])
+        except ValueError:
+            return prefix + diagnostics.WITHHELD
+        names = [w.partition("=")[0] for w in words]
+        if not names or not all("=" in w and _ENV_NAME_RE.fullmatch(n) for w, n in zip(words, names)):
+            return prefix + diagnostics.WITHHELD
+        return prefix + " ".join(f"{n}={diagnostics.WITHHELD}" for n in names)
+    m = _ASSIGNMENT_RE.match(line)
+    if m and _CREDENTIAL_NAME_RE.search(m.group(2)):
+        return m.group(0) + diagnostics.WITHHELD
+    return _URL_RE.sub(lambda u: gateway_instance.redact_url(u.group(0)), line)
 
 
 def _masked(text: str) -> str:
-    """A unit or config with each credential-named value, and any line holding a registered secret
-    in any case, withheld: install shows a diff of what is on disk, which may hold a token."""
+    """A unit or config with every `Environment=` value, each credential-named value, and any line
+    holding a registered secret in any case, withheld: install diffs what is on disk, which may hold
+    a retired token no registry knows."""
     _register_device_secrets()
     lines = []
     for line in text.splitlines(True):
         end = "\n" if line.endswith("\n") else ""
-        line = _CREDENTIAL_LINE_RE.sub(lambda m: m.group(1) + diagnostics.WITHHELD, line.rstrip("\n"))
+        line = _masked_line(line.rstrip("\n"))
         lines.append(diagnostics.scrub(line) + end)
     return "".join(lines)
 
@@ -1035,23 +1059,49 @@ def reply(args) -> int:
         time.sleep(0.25)
 
 
-_DEVICE_SECRET_KEYS = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL")
+_TOKEN_KEYS = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+_URL_KEYS = ("REMOTE_TASK_URL", "AG2_REMOTE_URL")
+_TOKEN_FILE_MAX = 64 * 1024
+
+
+def _register_onboarding(raw: str) -> None:
+    url, secret = gateway_credentials.parse_onboarding_token(raw.strip().strip("'\""))
+    diagnostics.register_secret(secret)
+    gateway_instance.register_gateway_secrets(url)
+
+
+def _register_token_file(path: str) -> None:
+    """Every token-shaped line of a rotated token file, whichever one the bridge would pick."""
+    try:
+        with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+            text = fh.read(_TOKEN_FILE_MAX)
+    except (OSError, ValueError):
+        return
+    for line in text.splitlines():
+        line = line.strip().removeprefix("export ").strip()
+        key, eq, value = line.partition("=")
+        if eq and key in _TOKEN_KEYS:
+            _register_onboarding(value)
+        elif not eq and line and not line.startswith("#"):
+            _register_onboarding(line)
 
 
 def _register_device_secrets() -> None:
-    """Give this process the bearer and the gateway URL Sparrow reads, so the owner DM it prints is
-    refused when it holds either (diagnostics' registry). Best-effort: no file, nothing registered."""
+    """Register every credential this host could hand Sparrow, from the process env and the device
+    file each on its own: whichever one precedence picks, the others must still be withheld."""
     try:
-        env = {k.strip().removeprefix("export ").strip(): v for k, v in read_config(device_env_path()).items()}
+        file_env = {k.strip().removeprefix("export ").strip(): v for k, v in read_config(device_env_path()).items()}
     except (OSError, UnicodeDecodeError):
-        env = {}
-    env = {**{k: v for k, v in os.environ.items() if k in _DEVICE_SECRET_KEYS}, **env}
-    for key in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"):
-        url, secret = gateway_credentials.parse_onboarding_token(env.get(key) or "")
-        diagnostics.register_secret(secret)
-        gateway_instance.register_gateway_secrets(url)
-    for key in ("REMOTE_TASK_URL", "AG2_REMOTE_URL"):
-        gateway_instance.register_gateway_secrets(env.get(key) or "")
+        file_env = {}
+    for source in (os.environ, file_env):
+        for key in _TOKEN_KEYS:
+            _register_onboarding(str(source.get(key) or ""))
+        for key in _URL_KEYS:
+            gateway_instance.register_gateway_secrets(str(source.get(key) or "").strip().strip("'\""))
+        diagnostics.register_secret(str(source.get("REMOTE_MEDIA_HS_TOKEN") or "").strip().strip("'\""))
+        token_file = str(source.get("REMOTE_TASK_TOKEN_FILE") or "").strip().strip("'\"")
+        if token_file:
+            _register_token_file(token_file)
 
 
 def wake_context(_args) -> int:

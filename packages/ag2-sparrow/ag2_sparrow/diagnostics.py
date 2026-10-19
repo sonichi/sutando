@@ -38,9 +38,17 @@ def forms(secret: str) -> "set[str]":
     for s in {secret, urllib.parse.unquote(secret), urllib.parse.unquote_plus(secret)}:
         out |= {s, repr(s)[1:-1], s.encode("unicode_escape").decode("ascii"),
                 ascii(s)[1:-1], s.encode("ascii", "backslashreplace").decode("ascii"),
-                urllib.parse.quote(s, safe=""), urllib.parse.quote(s, safe="/=&?#:@"),
-                urllib.parse.quote_plus(s, safe=""), urllib.parse.quote_plus(s, safe="/=&?#:@")}
+                *(_quoted(quote, s, safe) for quote in (urllib.parse.quote, urllib.parse.quote_plus)
+                  for safe in ("", "/=&?#:@"))}
     return {f for f in out if f}
+
+
+def _quoted(quote: Callable[..., str], s: str, safe: str) -> str:
+    # An env value read from non-UTF-8 bytes holds lone surrogates, which strict UTF-8 refuses.
+    try:
+        return quote(s, safe=safe, errors="surrogateescape")
+    except UnicodeEncodeError:
+        return quote(s, safe=safe, errors="surrogatepass")
 
 
 def register_secret(value: Any, min_len: int = 1) -> None:

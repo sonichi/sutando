@@ -1177,13 +1177,19 @@ print(json.dumps({"dm": m._ROUTING["owner_dm"]}))
         # The reader refuses one too: a record that holds the bearer is not printed.
         (self.home / "relay.env").write_text(f"REMOTE_TASK_TOKEN={token}\n")
         (self.home / "config").write_text(f"AGENT_MXID={AGENT}\nSTATE_DIR={self.state}\nGATEWAY_INSTANCE=\n")
-        bind(self.state, f"!{token}:ag2.space")
-        out = io.StringIO()
-        with mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": str(self.home / "relay.env")}), \
-                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(hatch_cli.main(["wake-context"]), 0)
-        self.assertNotIn(token, out.getvalue())
-        self.assertNotIn("owner_dm_room:", out.getvalue())
+        # A piece above ROOM_PIECE_MIN is refused in any case; the shortest piece is the boundary.
+        size = gateway_instance.ROOM_PIECE_MIN
+        for room, refused in ((token, True), (token[5:].upper(), True), (token[3:3 + size], True),
+                              (token[3:3 + size - 1], False)):
+            with self.subTest(room=room):
+                bind(self.state, f"!{room}:ag2.space")
+                out = io.StringIO()
+                with mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": str(self.home / "relay.env")}), \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(hatch_cli.main(["wake-context"]), 0)
+                self.assertEqual("owner_dm_room:" not in out.getvalue(), refused)
+                if refused:
+                    self.assertNotIn(room.casefold(), out.getvalue().casefold())
 
     def test_a_case_folded_echo_reaches_no_sink(self):
         token = "fake-relay-token-0123456789abcdef"
@@ -1265,6 +1271,120 @@ print(json.dumps({"sent": req.call_args.args[2],
         self.assertEqual({k: out["hint"][k] for k in ("setup_revision", "target_version")},
                          {"setup_revision": "r7", "target_version": "9.9"})
         self.assertNotIn("ok", out["hint"])
+
+    def wake(self, env):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(hatch_cli.main(["wake-context"]), 0)
+        return out.getvalue()
+
+    def test_every_credential_candidate_is_withheld_whichever_one_precedence_picks(self):
+        live, stale, rotated, raw, media = ("SYNTH-ENV-LIVE-TOKEN-4815", "synth-file-stale-token-1623",
+                                            "synth-rotated-file-token-4204", "synth-raw-line-token-2718",
+                                            "synth-media-token-3141")
+        (self.home / "rotated").write_text(f"# rotated\nREMOTE_TASK_TOKEN={rotated}\n{raw}\n")
+        (self.home / "relay.env").write_text(
+            f"REMOTE_TASK_TOKEN={stale}\nREMOTE_TASK_TOKEN_FILE={self.home / 'rotated'}\n")
+        (self.home / "config").write_text(f"AGENT_MXID={AGENT}\nSTATE_DIR={self.state}\nGATEWAY_INSTANCE=\n")
+        env = {"AG2_DEVICE_ENV": str(self.home / "relay.env"), "REMOTE_TASK_TOKEN": live,
+               "REMOTE_MEDIA_HS_TOKEN": media, "REMOTE_TASK_TOKEN_FILE": str(self.home / "absent")}
+        for token in (live, live.lower(), stale, rotated, raw, media):
+            with self.subTest(token=token):
+                bind(self.state, f"!{token}:ag2.space")
+                printed = self.wake(env)
+                self.assertNotIn(token.casefold(), printed.casefold())
+                self.assertNotIn("owner_dm_room:", printed)
+        # The same conflict through the install diff, on a line no credential name marks.
+        with mock.patch.dict(os.environ, env):
+            text = hatch_cli._diff(f"Description=agent {live} {stale}\nExecStart=/x\n", "ExecStart=/y\n",
+                                   Path("/unit"))
+        self.assertNotIn(live.casefold(), text.casefold())
+        self.assertNotIn(stale, text)
+        self.assertIn("ExecStart=/x", text)
+
+    def test_a_refused_setup_revision_retires_the_cache_it_would_replace(self):
+        self.bridge("""
+import json
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m
+for reply in ({"setup_revision": "new-r8"}, {"setup_revision": "rev " + m.TOKEN, "target_version": "9.9"}):
+    with mock.patch.object(m, "_req", return_value=reply):
+        m._post_heartbeat(set(), force=True)
+print("{}")
+""")
+        runtime_text.cache_path(self.state).write_text(json.dumps(served(revision="old-r7")))
+        hint = json.loads(runtime_text.hint_path(self.state).read_text())
+        self.assertNotIn("setup_revision", hint)
+        self.assertNotIn("fake-relay-token", json.dumps(hint))
+        self.assertIsNone(runtime_text.current_cache(self.state))
+        # A revision it keeps lifts the refusal; the cache then applies only at that revision.
+        self.bridge("""
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m
+with mock.patch.object(m, "_req", return_value={"setup_revision": "old-r7"}):
+    m._post_heartbeat(set(), force=True)
+print("{}")
+""")
+        self.assertEqual(runtime_text.current_cache(self.state)["revision"], "old-r7")
+
+    def test_a_gateway_owner_is_kept_and_invited_only_as_a_strict_mxid_holding_no_secret(self):
+        token = "fake-relay-token-0123456789abcdef"
+        for owner, kept in ((f"@{token}:ag2.space", False), (f"@{token[5:].upper()}:ag2.space", False),
+                            ("@o x:ag2.space", False), ("@o:ag2.space\nX", False), ("o:ag2.space", False),
+                            ("@owner-1:ag2.space", True)):
+            with self.subTest(owner=owner):
+                out = self.bridge("""
+import json, os
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m
+sent = []
+def req(method, path, payload=None, **k):
+    if path == "/v1/agents":
+        return {"agents": [{"id": m._reenroll_identity(), "owner": os.environ["OWNER"]}]}
+    sent.append(payload)
+    return {"room_id": "!dmroom123:ag2.space"}
+with mock.patch.object(m, "_req", req):
+    owner = m._gateway_owner()
+    if owner:
+        m._owner_review_dm(owner)
+print(json.dumps({"owner": owner, "sent": sent}))
+""", AGENT_MXID=AGENT, OWNER=owner)
+                self.assertEqual(out["owner"], owner if kept else "")
+                self.assertEqual(bool(out["sent"]), kept)
+                cache = "\n".join(p.read_text() for p in self.state.rglob("*.json"))
+                for piece in (token, token[5:]):
+                    self.assertNotIn(piece.casefold(), (cache + json.dumps(out)).casefold())
+
+    def test_an_unloadable_result_guard_reaches_the_caller_log_only_as_its_type(self):
+        out = self.bridge("""
+import json
+from ag2_sparrow import remote_gateway_bridge as m
+def broken():
+    raise RuntimeError("unregistered-synthetic-credential-99")
+m._team_guard_fns = broken
+m._owner_mention_disposition = lambda tid, raw: False
+(m.RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+f = m.RESULTS_DIR / "task-canary.txt"
+f.write_text("a reply")
+m._quarantine_unsent(f, "task-canary", "item-1")
+print(json.dumps({"reason": m._guarded_result_body("task-canary", "a reply")[1]}))
+""")
+        self.assertRegex(out["reason"], r"^team_result_guard unavailable: RuntimeError at \S+:\d+$")
+        logs = (self.home / "logs" / "gateway-bridge.log").read_text()
+        self.assertIn("the result guard is unavailable (team_result_guard unavailable: RuntimeError at ", logs)
+        everything = "\n".join(p.read_text(errors="replace") for p in self.home.rglob("*") if p.is_file())
+        self.assertNotIn("unregistered-synthetic-credential-99", everything)
+
+    def test_a_non_utf8_token_in_a_bytes_environment_still_imports_and_is_withheld(self):
+        env = {k.encode(): v.encode() for k, v in self.bridge_env().items()}
+        env[b"REMOTE_TASK_TOKEN"] = b"\xff"
+        r = subprocess.run([sys.executable, "-c", PRELUDE + (
+            "from ag2_sparrow import remote_gateway_bridge as m\n"
+            "print(m.diagnostics.contains_secret('x%FFy'), m.diagnostics.contains_secret('plain'))\n")],
+            env=env, capture_output=True, text=True, cwd=str(self.home), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.split()[-2:], ["True", "False"])
 
 
 class WakeContext(Base):
@@ -1758,6 +1878,32 @@ class InstallDiff(unittest.TestCase):
         self.assertIn("Environment=REMOTE_TASK_TOKEN=<withheld>", text)
         self.assertIn("ExecStart=/x", text)
 
+    def test_install_withholds_every_environment_assignment_and_url_credential_on_disk(self):
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home)
+        unit = home / "ag2-sparrow.service"
+        unit.write_text('[Service]\nEnvironment="SAFE=x" "REMOTE_TASK_TOKEN=RETIRED-SYNTHETIC-TOKEN-314159"\n'
+                        "Environment=REMOTE_TASK_URL=https://user:pass@gw.example/relay?token=SYNTHETIC-URL-SECRET#frag\n"
+                        "Environment='BROKEN=\n"
+                        "REMOTE_TASK_URL=https://cfg-user:cfg-pass@gw.example/relay?k=CFG-QUERY-SECRET\n"
+                        "ExecStart=/x --gateway https://exec-user:exec-pass@gw.example/relay?k=EXEC-SECRET\n"
+                        "Description=a safe neighbour\n")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": str(home / "absent")}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(hatch_cli._install_file(unit, "[Service]\nExecStart=/y\n", 0o600,
+                                                    refuse_drift=False, force=True))
+        text = out.getvalue()
+        for secret in ("RETIRED-SYNTHETIC-TOKEN-314159", "SYNTHETIC-URL-SECRET", "user:pass", "frag",
+                       "cfg-user", "cfg-pass", "CFG-QUERY-SECRET", "exec-user", "exec-pass", "EXEC-SECRET"):
+            self.assertNotIn(secret.casefold(), text.casefold(), secret)
+        self.assertIn("-Environment=SAFE=<withheld> REMOTE_TASK_TOKEN=<withheld>", text)
+        self.assertIn("-Environment=REMOTE_TASK_URL=<withheld>", text)
+        self.assertIn("-Environment=<withheld>", text)
+        self.assertIn("-REMOTE_TASK_URL=<withheld>", text)
+        self.assertIn("-ExecStart=/x --gateway https://gw.example/relay", text)
+        self.assertIn("-Description=a safe neighbour", text)
+
 
 class Diagnostics(unittest.TestCase):
     def setUp(self):
@@ -1869,6 +2015,22 @@ class Diagnostics(unittest.TestCase):
                             ("Se", None), ("se%2fcr", None), ("Se/CR", None), ("has space", None),
                             ("x" * 65, None), ({"nested": 1}, None), (None, None), ("token", None)):
             self.assertEqual(self.d.code_field(value, url), want, value)
+
+
+class OwnerAndForms(unittest.TestCase):
+    def test_owner_mxid_admits_only_a_matrix_user_id_holding_no_secret(self):
+        from ag2_sparrow import diagnostics
+        diagnostics.register_secret("owner-unit-secret-5150")
+        for owner, kept in (("@owner-1:ag2.space", True), ("@o:ag2.space:8448", True), ("owner:ag2.space", False),
+                            ("@o x:ag2.space", False), (None, False), ("@OWNER-UNIT-SECRET-5150:ag2.space", False),
+                            ("@unit-secret:ag2.space", False), ("@x:owner-unit-secret-5150", False)):
+            with self.subTest(owner=owner):
+                self.assertEqual(gateway_instance.owner_mxid(owner), owner if kept else "")
+
+    def test_forms_are_total_over_lone_surrogates(self):
+        from ag2_sparrow import diagnostics
+        self.assertIn("%FF", diagnostics.forms("\udcff"))
+        self.assertIn("%ED%A0%80", diagnostics.forms("\ud800"))
 
 
 class RedactUrl(unittest.TestCase):

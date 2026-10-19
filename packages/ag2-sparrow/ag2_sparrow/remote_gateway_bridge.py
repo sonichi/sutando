@@ -467,6 +467,7 @@ GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
 # The heartbeat reply's pointers to the served setup; read by adapters, never by Sparrow.
 SETUP_HINT_FILE = _STATE / f"setup-hint{_INST_SUFFIX}.json"
 SETUP_HINT_FIELDS = ("setup_revision", "min_version", "target_version")
+SETUP_REVISION_WITHHELD = "setup_revision_withheld"  # read by adapters/hatch/runtime_text.py
 
 # Launch provenance + in-bridge file log. A supervisor that persists stdout
 # (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
@@ -768,7 +769,7 @@ def _gateway_owner() -> str:
     owner = str((row or {}).get("owner") or "")
     hint = str((row or {}).get("owner_dm_room") or "")
     _GATEWAY_OWNER_DM_HINT = gateway_instance.owner_room(hint, identity)
-    return owner if owner.startswith("@") and ":" in owner else ""
+    return gateway_instance.owner_mxid(owner)
 
 
 def _owner_review_dm(owner: str) -> str:
@@ -1548,7 +1549,7 @@ def _guarded_result_body(tid: str, body: str):
          journal_suppression, suppression_only, guarded_tier, review_artifact) = _team_guard_fns()
         from .chat_secret_filter import filter_chat_secrets
     except Exception as exc:
-        return None, f"team_result_guard unavailable: {exc}"
+        return None, f"team_result_guard unavailable: {diagnostics.describe(exc)}"
     tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
     # Absence is not owner provenance: a month-archived Team task is exactly the
     # case that would otherwise fall open.
@@ -3586,6 +3587,9 @@ def _record_setup_hint(reply) -> None:
     # Gateway values: the revision only as a code_field token, the versions only as PEP 440.
     hint = {k: (diagnostics.code_field(reply.get(k), URL) if k == "setup_revision"
                 else diagnostics.version_field(reply.get(k))) for k in SETUP_HINT_FIELDS if k in reply}
+    if "setup_revision" in hint and hint["setup_revision"] is None:
+        # A refused announcement still retires the cache it replaces: no revision is never "any".
+        hint[SETUP_REVISION_WITHHELD] = True
     hint = {k: v for k, v in hint.items() if v is not None}
     if not hint:
         return

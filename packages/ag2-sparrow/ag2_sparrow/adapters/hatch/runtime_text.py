@@ -89,11 +89,17 @@ def announced_revision(state_dir: Path, instance: str = ""):
     return (_read_json(hint_path(state_dir, instance)) or {}).get("setup_revision")
 
 
+def _announcement_refused(state_dir: Path, instance: str = "") -> bool:
+    """Sparrow heard a revision it would not keep (the bridge's SETUP_REVISION_WITHHELD)."""
+    return (_read_json(hint_path(state_dir, instance)) or {}).get("setup_revision_withheld") is True
+
+
 def current_cache(state_dir: Path, instance: str = "") -> "dict | None":
-    """The cache, unless Sparrow has since heard of another revision: then None, so the
-    built-in text and defaults apply until the announced revision is fetched."""
+    """The cache, unless Sparrow has since heard of another revision, or of one it refused: then
+    None, so the built-in text and defaults apply until a revision it keeps is fetched."""
     cached, announced = load_cache(state_dir), announced_revision(state_dir, instance)
-    if cached is None or (announced is not None and cached.get("revision") != announced):
+    if cached is None or _announcement_refused(state_dir, instance) \
+            or (announced is not None and cached.get("revision") != announced):
         return None
     return cached
 

@@ -224,6 +224,20 @@ def owner_room(room: Any, identity: str) -> str:
     return "" if diagnostics.contains_secret(room) or piece else room
 
 
+MATRIX_USER_RE = re.compile(r"@([A-Za-z0-9._=/+-]{1,255}):([A-Za-z0-9.-]{1,255}(?::[0-9]{1,5})?)")
+
+
+def owner_mxid(owner: Any) -> str:
+    """`owner` when it is a Matrix user id that holds no registered secret and whose localpart, if
+    ROOM_PIECE_MIN characters or longer, is no piece of one; '' otherwise (owner_room's rule)."""
+    m = MATRIX_USER_RE.fullmatch(owner) if isinstance(owner, str) else None
+    if m is None:
+        return ""
+    local = m.group(1)
+    piece = len(local) >= ROOM_PIECE_MIN and diagnostics.holds_or_is_piece(local)
+    return "" if diagnostics.contains_secret(owner) or piece else owner
+
+
 def register_gateway_secrets(url: str) -> None:
     """Add every credential part of the gateway URL to the process's secret registry: each
     delimited part, and the bare userinfo, password and query values long enough to match alone."""
