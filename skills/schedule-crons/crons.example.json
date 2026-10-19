@@ -23,7 +23,7 @@
     "name": "process-hygiene",
     "cron": "23 * * * *",
     "launchd": true,
-    "shell_command": "PY=\"$(bash scripts/sutando-config.sh python-bin)\" && \"$PY\" skills/process-hygiene/scripts/reap_orphans.py --reap --spotlight"
+    "shell_command": "PY=\"$(bash scripts/sutando-config.sh python-bin)\" && \"$PY\" skills/process-hygiene/scripts/reap_orphans.py --spotlight"
   },
   {
     "name": "example-digest",

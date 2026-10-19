@@ -1,6 +1,6 @@
 ---
 name: process-hygiene
-description: "Report, and with --reap stop, orphaned processes that interrupted agent test runs left behind in per-session scratchpads (PPID 1, this user, older than 2 h by default, cwd inside <tmp>/claude-<uid>/<project>/<session>/scratchpad). --spotlight keeps Spotlight from indexing scratchpad churn. Use when the Mac is noisy or loaded with leftover test processes, or schedule it hourly."
+description: "Report, and with --reap stop, orphaned processes that interrupted agent test runs left behind in per-session scratchpads (PPID 1, this user, older than 2 h by default, cwd inside <tmp>/claude-<uid>/<project>/<session>/scratchpad, and that session has ended). --spotlight keeps Spotlight from indexing scratchpad churn. Use when the Mac is noisy or loaded with leftover test processes, or schedule it hourly."
 user-invocable: true
 ---
 
@@ -36,6 +36,29 @@ ALL of:
 4. its working directory (`lsof -a -p PID -d cwd -Fn` on macOS, `/proc/PID/cwd`
    on Linux), as a realpath, is inside a scratchpad root matching
    `/private/tmp/claude-<uid>/*/*/scratchpad` or `/tmp/claude-<uid>/*/*/scratchpad`.
+5. the Claude Code session that owns that scratchpad has **ended** (below).
+
+**The owning session.** A scratchpad is
+`<tmp>/claude-<uid>/<project-slug>/<session-id>/scratchpad`. A live session may
+have started a server there on purpose, so its orphans are never candidates. For
+each Claude config dir (`CLAUDE_CONFIG_DIR`, the home `.claude`, and every
+`claude` entry of `core_config_dirs`; `--claude-config-dir` replaces the list):
+
+- **alive** — a session marker `<config>/sessions/<pid>.json` names the session
+  (`sessionId`) and its `pid` is running with the marker's `procStart` (compared
+  with `ps -o lstart=` under `TZ=UTC` and the C locale, so a reused pid is not
+  mistaken for the session), or the session transcript
+  `<config>/projects/<slug>/<session-id>.jsonl` changed within the minimum age;
+- **gone** — that transcript exists, a `sessions/` directory exists to have held
+  a marker, and neither alive condition holds;
+- **unknown** — anything else: no transcript in any known config dir, a marker or
+  `sessions/` directory that cannot be read, a marker without `pid`/`procStart`.
+  Unknown is treated as alive: never reaped.
+
+Claude Code writes the marker while a session runs and it is the only per-session
+liveness record on disk; a session's main process does not hold its transcript
+open, and its task-output files are open only while a background command runs,
+so neither of those can tell an idle live session from an ended one.
 
 Never touched, whatever else holds: tmux servers, `claude` sessions (and the
 Claude Code node CLI), anything whose command names a Sutando core, worker, tmux
@@ -84,22 +107,29 @@ Spotlight → Privacy instead.
 ## Scheduling
 
 Hourly, off the top of the hour, as an OS-level shell job (it needs no model
-session). Add to `<workspace>/hosts/<host-label>/crons.json` (see
-`skills/schedule-crons/crons.example.json`):
+session). `skills/schedule-crons/crons.example.json` ships it **report-only**
+(plus the Spotlight markers): it logs what it would stop and stops nothing.
 
 ```json
 {
   "name": "process-hygiene",
   "cron": "23 * * * *",
   "launchd": true,
-  "shell_command": "PY=\"$(bash scripts/sutando-config.sh python-bin)\" && \"$PY\" skills/process-hygiene/scripts/reap_orphans.py --reap --spotlight"
+  "shell_command": "PY=\"$(bash scripts/sutando-config.sh python-bin)\" && \"$PY\" skills/process-hygiene/scripts/reap_orphans.py --spotlight"
 }
+```
+
+**Stopping is an explicit opt-in.** After reading a few runs of
+`<workspace>/logs/process-hygiene.log` and the cron log, enable it by changing
+that entry's `shell_command` in `<workspace>/hosts/<host-label>/crons.json` to:
+
+```json
+  "shell_command": "PY=\"$(bash scripts/sutando-config.sh python-bin)\" && \"$PY\" skills/process-hygiene/scripts/reap_orphans.py --reap --spotlight"
 ```
 
 `python-bin` resolves a verified interpreter; a bare `python3` under launchd's
 `PATH` can be the Xcode Command Line Tools stub. It needs the OS-level runner
-(`bash src/install-cron-runner-launchd.sh`). Run the script once in report mode
-first and read what it would stop.
+(`bash src/install-cron-runner-launchd.sh`).
 
 ## Config
 
@@ -110,5 +140,6 @@ Declared in `manifest.json`; read CLI > environment > manifest:
 | `PROCESS_HYGIENE_MIN_AGE_S` | `7200` | `--min-age` |
 | `PROCESS_HYGIENE_GRACE_S` | `5` | `--grace` |
 
-`--tmp-base DIR` (repeatable) replaces the default `/tmp` search base (on macOS
+`--claude-config-dir DIR` (repeatable) replaces the config dirs searched for
+session markers and transcripts. `--tmp-base DIR` (repeatable) replaces the default `/tmp` search base (on macOS
 a symlink, so its realpath is covered too); `--log PATH` replaces the workspace log.

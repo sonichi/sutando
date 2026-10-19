@@ -75,6 +75,9 @@ PS_ARGV = ["ps", "-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", 
 C_LOCALE = {"LC_ALL": "C", "LANG": "C"}
 
 
+ALIVE, GONE, UNKNOWN = "alive", "gone", "unknown"
+
+
 @dataclass(frozen=True)
 class Proc:
     pid: int
@@ -123,6 +126,7 @@ class Context:
     killpg: Callable[[int, int], None] = os.killpg
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
+    owner_state: Callable[[str], str] = lambda root: UNKNOWN
 
 
 def manifest_config(key: str, manifest: Path = MANIFEST) -> Optional[str]:
@@ -236,7 +240,7 @@ def scratchpad_roots(uid: int, tmp_bases: Sequence[str]) -> List[str]:
 
 
 def inside(path: str, roots: Sequence[str]) -> bool:
-    return any(path == r or path.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+    return owning_root(path, roots) is not None
 
 
 def protected_reason(command: str) -> Optional[str]:
@@ -260,6 +264,87 @@ def ancestors(pid: int, procs: Dict[int, Proc]) -> Set[int]:
     return seen
 
 
+def utc_start(pid: int, run=subprocess.run) -> Optional[str]:
+    """`ps -o lstart=` in UTC and the C locale: the format of a session marker's procStart."""
+    try:
+        out = run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=15,
+                  env={**os.environ, **C_LOCALE, "TZ": "UTC"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return " ".join(out.stdout.split()) or None
+
+
+def default_config_dirs() -> List[str]:
+    """Claude config dirs whose sessions/ and projects/ may own a scratchpad."""
+    dirs = [os.environ.get("CLAUDE_CONFIG_DIR", ""), os.path.join(os.path.expanduser("~"), ".claude")]
+    try:
+        sys.path.insert(0, str(REPO))
+        from src.sutando_config import resolve_core_config_dirs  # noqa: E402
+        dirs += [e.get("value", "") for e in resolve_core_config_dirs() if e.get("type") == "claude"]
+    except Exception:  # a missing or invalid config adds nothing; the env and home dirs remain
+        pass
+    seen: List[str] = []
+    for d in dirs:
+        if d and os.path.isdir(d) and os.path.realpath(d) not in seen:
+            seen.append(os.path.realpath(d))
+    return seen
+
+
+def owner_state(root: str, config_dirs: Sequence[str], min_age_s: float,
+                start_of=utc_start, now=time.time) -> str:
+    """Whether the session owning <tmp>/claude-<uid>/<slug>/<session>/scratchpad is ALIVE, GONE or UNKNOWN.
+
+    Alive: a Claude Code session marker (<config>/sessions/<pid>.json) names the
+    session and its pid is running with the marker's procStart, or the session
+    transcript (<config>/projects/<slug>/<session>.jsonl) changed within the
+    minimum age. Gone: the transcript exists and neither holds. Anything that
+    cannot be read, including a transcript found nowhere, is UNKNOWN."""
+    parts = Path(root).parts
+    if len(parts) < 3 or parts[-1] != "scratchpad":
+        return UNKNOWN
+    slug, session = parts[-3], parts[-2]
+    transcript_found = False
+    sessions_seen = False
+    for cfg in config_dirs:
+        sessions = Path(cfg) / "sessions"
+        if sessions.is_dir():
+            sessions_seen = True
+            try:
+                markers = [sessions / n for n in sorted(os.listdir(sessions)) if n.endswith(".json")]
+            except OSError:
+                return UNKNOWN
+            for marker in markers:
+                try:
+                    data = json.loads(marker.read_text())
+                except (OSError, ValueError):
+                    return UNKNOWN
+                if not isinstance(data, dict) or data.get("sessionId") != session:
+                    continue
+                pid, proc_start = data.get("pid"), data.get("procStart")
+                if not isinstance(pid, int) or not isinstance(proc_start, str):
+                    return UNKNOWN
+                if start_of(pid) == " ".join(proc_start.split()):
+                    return ALIVE
+        transcript = Path(cfg) / "projects" / slug / f"{session}.jsonl"
+        try:
+            mtime = transcript.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return UNKNOWN
+        transcript_found = True
+        if now() - mtime < min_age_s:
+            return ALIVE
+    return GONE if transcript_found and sessions_seen else UNKNOWN
+
+
+def owning_root(cwd: str, roots: Sequence[str]) -> Optional[str]:
+    for r in roots:
+        if cwd == r or cwd.startswith(r.rstrip(os.sep) + os.sep):
+            return r
+    return None
+
+
 def classify(proc: Proc, ctx: Context) -> Tuple[Optional[str], Optional[str]]:
     """(reason it is skipped or None, its cwd when read). Cheap rules run before lsof."""
     if proc.uid != ctx.uid:
@@ -278,8 +363,12 @@ def classify(proc: Proc, ctx: Context) -> Tuple[Optional[str], Optional[str]]:
     cwd = ctx.read_cwd(proc.pid)
     if cwd is None:
         return "cwd unreadable", None
-    if not inside(cwd, ctx.roots):
+    root = owning_root(cwd, ctx.roots)
+    if root is None:
         return "cwd outside every scratchpad", cwd
+    state = ctx.owner_state(root)
+    if state != GONE:
+        return f"owning session {state}", cwd
     return None, cwd
 
 
@@ -452,6 +541,9 @@ def parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     p.add_argument("--grace", type=float, help=f"seconds between SIGTERM and SIGKILL; overrides {GRACE_KEY}")
     p.add_argument("--tmp-base", action="append", help="directory holding claude-<uid>/ (repeatable; "
                    "default /tmp, which covers its realpath)")
+    p.add_argument("--claude-config-dir", action="append", help="Claude config dir holding sessions/ and "
+                   "projects/ (repeatable; default CLAUDE_CONFIG_DIR, the home .claude, and the claude "
+                   "core_config_dirs)")
     p.add_argument("--log", type=Path, help="log file (default <workspace>/logs/process-hygiene.log)")
     return p.parse_args(argv)
 
@@ -485,9 +577,20 @@ def run(args: argparse.Namespace, ctx: Context) -> Dict[str, int]:
 def build_context(args: argparse.Namespace, log: Callable[[str], None], orphan_ppid: int = 1) -> Context:
     uid = os.getuid()
     bases = args.tmp_base or list(DEFAULT_TMP_BASES)
-    return Context(uid=uid, min_age_s=setting(args.min_age, MIN_AGE_KEY), grace_s=setting(args.grace, GRACE_KEY),
+    min_age = setting(args.min_age, MIN_AGE_KEY)
+    configs = [os.path.realpath(d) for d in args.claude_config_dir] if args.claude_config_dir \
+        else default_config_dirs()
+    cache: Dict[str, str] = {}
+
+    def owner(root: str) -> str:
+        if root not in cache:
+            cache[root] = owner_state(root, configs, min_age)
+        return cache[root]
+
+    return Context(uid=uid, min_age_s=min_age, grace_s=setting(args.grace, GRACE_KEY),
                    roots=scratchpad_roots(uid, bases), snapshot=snapshot, read_cwd=read_cwd, log=log,
-                   protected_pids=launchd_pids(), own_pgid=os.getpgrp(), orphan_ppid=orphan_ppid)
+                   protected_pids=launchd_pids(), own_pgid=os.getpgrp(), orphan_ppid=orphan_ppid,
+                   owner_state=owner)
 
 
 def main(argv: Optional[Sequence[str]] = None, orphan_ppid: int = 1) -> int:

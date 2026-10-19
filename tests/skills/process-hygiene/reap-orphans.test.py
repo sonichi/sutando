@@ -73,7 +73,8 @@ class Recorder:
     def ctx(self, **kw):
         base = dict(uid=UID, min_age_s=7200, grace_s=1.0, roots=[ROOT], snapshot=self.snapshot,
                     read_cwd=lambda pid: self.cwds.get(pid), log=self.lines.append, kill=self.kill,
-                    killpg=self.killpg, sleep=self.sleep, clock=lambda: self.now)
+                    killpg=self.killpg, sleep=self.sleep, clock=lambda: self.now,
+                    owner_state=lambda root: ro.GONE)
         base.update(kw)
         return ro.Context(**base)
 
@@ -200,6 +201,14 @@ class Rules(unittest.TestCase):
     def test_orphan_parent_is_injectable_for_subreaper_hosts(self):
         self.assertIsNone(self.reason(P(10, ppid=77), orphan_ppid=77))
 
+    def test_a_live_or_unknown_owning_session_spares_the_orphan(self):
+        roots = []
+        for state, want in ((ro.ALIVE, "owning session alive"), (ro.UNKNOWN, "owning session unknown"),
+                            (ro.GONE, None)):
+            ctx = self.ctx({10: ROOT + "/sub"}, owner_state=lambda root, st=state: roots.append(root) or st)
+            self.assertEqual(ro.classify(P(10), ctx)[0], want)
+        self.assertEqual(roots, [ROOT] * 3, "the owner is judged by the scratchpad root, not the cwd")
+
     def test_never_touch_list(self):
         for command in ("tmux -S /tmp/x.sock new-session -d", "/opt/homebrew/bin/tmux attach", "claude --resume",
                         "-claude", "node /x/node_modules/@anthropic-ai/claude-code/cli.js",
@@ -232,6 +241,95 @@ class Rules(unittest.TestCase):
         procs = {5: P(5, ppid=4), 4: P(4, ppid=1), 1: P(1, ppid=0), 8: P(8, ppid=9), 9: P(9, ppid=8)}
         self.assertEqual(ro.ancestors(5, procs), {5, 4})
         self.assertEqual(ro.ancestors(8, procs), {8, 9})
+
+
+class OwnerState(unittest.TestCase):
+    """owner_state over a fabricated Claude config dir; ps is stubbed by start_of."""
+    START = "Fri Oct 2 02:46:19 2026"
+
+    def setUp(self):
+        self.cfg = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.cfg, True)
+        (self.cfg / "sessions").mkdir()
+        self.transcript = self.cfg / "projects" / "proj" / "sess.jsonl"
+        self.transcript.parent.mkdir(parents=True)
+        self.transcript.write_text("{}\n")
+        os.utime(self.transcript, (1000, 1000))
+        self.root = "/t/claude-1/proj/sess/scratchpad"
+
+    def state(self, start_of=lambda pid: None, now=lambda: 1000 + 10_000, configs=None):
+        return ro.owner_state(self.root, configs or [str(self.cfg)], 7200, start_of=start_of, now=now)
+
+    def marker(self, pid=4321, session="sess", start="Fri Oct  2 02:46:19 2026", **extra):
+        body = dict(pid=pid, sessionId=session, procStart=start, **extra)
+        (self.cfg / "sessions" / f"{pid}.json").write_text(json.dumps(body))
+
+    def test_a_running_marker_pid_with_its_start_time_is_alive(self):
+        self.marker()
+        self.assertEqual(self.state(start_of=lambda pid: self.START if pid == 4321 else None), ro.ALIVE)
+
+    def test_a_marker_whose_pid_is_gone_or_reused_is_not_alive(self):
+        self.marker()
+        self.assertEqual(self.state(start_of=lambda pid: None), ro.GONE)
+        self.assertEqual(self.state(start_of=lambda pid: "Sat Oct 3 00:00:00 2026"), ro.GONE)
+
+    def test_another_sessions_marker_does_not_count(self):
+        self.marker(session="other")
+        self.assertEqual(self.state(start_of=lambda pid: self.START), ro.GONE)
+
+    def test_a_recent_transcript_is_alive(self):
+        self.assertEqual(self.state(now=lambda: 1000 + 60), ro.ALIVE)
+
+    def test_no_transcript_anywhere_is_unknown(self):
+        self.transcript.unlink()
+        self.assertEqual(self.state(), ro.UNKNOWN)
+
+    def test_no_sessions_dir_is_unknown(self):
+        (self.cfg / "sessions").rmdir()
+        self.assertEqual(self.state(), ro.UNKNOWN)
+
+    def test_unreadable_records_are_unknown(self):
+        (self.cfg / "sessions" / "9.json").write_text("{not json")
+        self.assertEqual(self.state(), ro.UNKNOWN)
+        (self.cfg / "sessions" / "9.json").write_text(json.dumps({"sessionId": "sess"}))
+        self.assertEqual(self.state(), ro.UNKNOWN)
+        (self.cfg / "sessions" / "9.json").unlink()
+        os.chmod(self.cfg / "sessions", 0)
+        self.addCleanup(os.chmod, self.cfg / "sessions", 0o700)
+        if os.access(self.cfg / "sessions", os.R_OK):
+            self.skipTest("running as a user that can read a mode-000 directory")
+        self.assertEqual(self.state(), ro.UNKNOWN)
+
+    def test_unstattable_transcript_is_unknown(self):
+        with mock.patch.object(Path, "stat", side_effect=PermissionError("EACCES")):
+            self.assertEqual(self.state(), ro.UNKNOWN)
+
+    def test_a_path_that_is_not_a_scratchpad_is_unknown(self):
+        self.assertEqual(ro.owner_state("/t/x", [str(self.cfg)], 7200), ro.UNKNOWN)
+
+    def test_the_marker_found_in_any_config_dir_counts(self):
+        other = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, other, True)
+        (other / "sessions").mkdir()
+        (other / "sessions" / "77.json").write_text(json.dumps({"pid": 77, "sessionId": "sess",
+                                                                "procStart": self.START}))
+        self.assertEqual(self.state(start_of=lambda pid: self.START, configs=[str(self.cfg), str(other)]),
+                         ro.ALIVE)
+
+    def test_utc_start_reads_ps_in_utc(self):
+        run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "Fri Oct  2 02:46:19 2026\n", ""))
+        self.assertEqual(ro.utc_start(5, run=run), self.START)
+        self.assertEqual(run.call_args.kwargs["env"]["TZ"], "UTC")
+        self.assertIsNone(ro.utc_start(5, run=mock.Mock(side_effect=OSError)))
+        self.assertIsNone(ro.utc_start(5, run=mock.Mock(return_value=subprocess.CompletedProcess([], 1, "", ""))))
+        self.assertEqual(ro.utc_start(os.getpid()), ro.utc_start(os.getpid()))
+
+    def test_default_config_dirs_are_existing_realpaths(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            dirs = ro.default_config_dirs()
+        self.assertIn(os.path.realpath(self.cfg), dirs)
+        self.assertTrue(all(os.path.isdir(d) for d in dirs))
+        self.assertEqual(len(dirs), len(set(dirs)))
 
 
 class Planning(unittest.TestCase):
@@ -398,6 +496,13 @@ class RealOrphans(unittest.TestCase):
         self.addCleanup(self.kill_mine)
         self.log = self.base / "hygiene.log"
         self.orphan_ppid = None
+        self.cfg = self.base / "cfg"
+        (self.cfg / "sessions").mkdir(parents=True)
+        self.transcript = self.cfg / "projects" / "proj" / "sess.jsonl"
+        self.transcript.parent.mkdir(parents=True)
+        self.transcript.write_text("{}\n")
+        old = time.time() - 10 * 86400
+        os.utime(self.transcript, (old, old))   # an ended session, unless a test says otherwise
 
     def kill_mine(self):
         """Only this test's pids, verified by start time, and the children they started."""
@@ -438,7 +543,7 @@ class RealOrphans(unittest.TestCase):
 
     def args(self, *extra):
         return ro.parse_args(["--tmp-base", str(self.base), "--min-age", str(self.MIN_AGE), "--grace", "1",
-                              "--log", str(self.log), *extra])
+                              "--log", str(self.log), "--claude-config-dir", str(self.cfg), *extra])
 
     def guarded(self, args):
         ctx = ro.build_context(args, ro.file_logger(args.log), orphan_ppid=self.orphan_ppid or 1)
@@ -543,15 +648,59 @@ class RealOrphans(unittest.TestCase):
                 time.sleep(0.3)
                 self.assertTrue(alive(pid), f"a process whose {change} changed was signalled")
 
+    def test_a_live_owning_session_keeps_its_orphan_until_it_ends(self):
+        owner = subprocess.Popen(["sleep", "650"])          # stands in for the session's claude process
+        self.mine[owner.pid] = start_time(owner.pid)
+        self.addCleanup(lambda: (owner.kill(), owner.wait()))
+        (self.cfg / "sessions" / f"{owner.pid}.json").write_text(json.dumps(
+            {"pid": owner.pid, "sessionId": "sess", "procStart": ro.utc_start(owner.pid)}))
+        orphan = self.orphan(self.root, "sleep", "651")
+        time.sleep(self.MIN_AGE + 1.5)
+
+        counts, out = self.run_reaper("--reap")
+        self.assertEqual(counts["candidates"], 0, out)
+        time.sleep(0.3)
+        self.assertTrue(alive(orphan), "a live session's orphaned child was stopped")
+
+        owner.kill()
+        owner.wait()                                        # the marker stays behind, as after a crash
+        counts, out = self.run_reaper("--reap")
+        self.assertEqual(counts["terminated"], 1, out)
+        self.assertTrue(self.wait_gone(orphan), "an ended session's orphan survived")
+
+    def test_an_unreadable_owner_spares_the_orphan(self):
+        self.transcript.unlink()                            # no record of the session anywhere
+        orphan = self.orphan(self.root, "sleep", "652")
+        time.sleep(self.MIN_AGE + 1.5)
+        counts, out = self.run_reaper("--reap")
+        self.assertEqual(counts["candidates"], 0, out)
+        time.sleep(0.3)
+        self.assertTrue(alive(orphan), "an orphan whose owner could not be read was stopped")
+
     def test_main_reports_and_exits_zero(self):
         self.orphan(self.root, "sleep", "640")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = ro.main(["--tmp-base", str(self.base), "--min-age", "0", "--grace", "1", "--log", str(self.log),
-                          "--spotlight"], orphan_ppid=self.orphan_ppid or 1)
+                          "--claude-config-dir", str(self.cfg), "--spotlight"], orphan_ppid=self.orphan_ppid or 1)
         self.assertEqual(rc, 0)
         self.assertIn("mode=report", out.getvalue())
         self.assertTrue((self.root / ro.NEVER_INDEX).exists())
+
+
+class ShippedSchedule(unittest.TestCase):
+    """A data pin, not a behaviour test: the shipped example only reports; stopping is the owner's opt-in."""
+
+    def test_example_cron_is_report_only_and_the_opt_in_is_documented(self):
+        crons = json.loads((REPO / "skills" / "schedule-crons" / "crons.example.json").read_text())
+        entry = [e for e in crons if e.get("name") == "process-hygiene"]
+        self.assertEqual(len(entry), 1)
+        self.assertTrue(entry[0].get("launchd"))
+        argv = entry[0]["shell_command"].split()
+        self.assertIn("skills/process-hygiene/scripts/reap_orphans.py", argv)
+        self.assertNotIn("--reap", argv)
+        doc = (REPO / "skills" / "process-hygiene" / "SKILL.md").read_text()
+        self.assertIn("reap_orphans.py --reap --spotlight", doc)
 
 
 class Main(unittest.TestCase):
