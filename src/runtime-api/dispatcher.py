@@ -569,7 +569,13 @@ class RuntimeDispatcher:
         rec = self._require(params)
         self.store.transition(rec["requestId"], "cancelled",
                               resolved_by=self.actor_id)
-        return self._public(self.store.get(rec["requestId"]))
+        rec = self.store.get(rec["requestId"])
+        if rec["status"] == "cancelled" and rec["requestType"] in (
+                "approval", "elicitation", "human_action"):
+            # A previous mirror write may have failed, even before a restart.
+            self.ha.cancel(self._ha_of.get(rec["requestId"])
+                           or ha_action_id(rec["requestId"]))
+        return self._public(rec)
 
     def _require(self, params: dict) -> dict:
         rid = params.get("requestId")

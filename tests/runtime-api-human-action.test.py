@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
@@ -24,6 +25,7 @@ from request_store import RequestStore  # noqa: E402
 
 from ha_adapter import HumanActionAdapter  # noqa: E402
 from protocol import ProtocolError  # noqa: E402
+from hitl.schema import ActionReply, StaleRequirementError  # noqa: E402
 
 SETTLE_METHODS = ("human_action.complete", "human_action.decline")
 
@@ -132,6 +134,72 @@ class AdapterEdgeTests(unittest.TestCase):
 
     def _req(self, rid, **params):
         return {"requestId": rid, "params": params}
+
+    def test_cancel_delegates_to_manager_and_rejects_old_actions(self):
+        for kind in ("approval", "elicitation", "human_action"):
+            for in_progress in (False, True):
+                with self.subTest(kind=kind, in_progress=in_progress):
+                    aid = getattr(self.ha, f"open_{kind}")(self._req(
+                        f"r-{kind}_{in_progress}", action="Synthetic action",
+                        question="Choose?", options=["A", "B"]))
+                    req = self.ha.manager.get(aid)
+                    reply = ActionReply(hitl_id=aid, expected_revision=req.revision,
+                                        guard=req.guard, action_id=req.actions[0].id)
+                    if in_progress:
+                        self.ha.manager.apply_action(reply)
+                    with mock.patch.object(self.ha.manager, "cancel",
+                                           wraps=self.ha.manager.cancel) as cancel:
+                        self.ha.cancel(aid)
+                    cancel.assert_called_once_with(aid)
+                    cancelled = self.ha.manager.get(aid)
+                    self.assertEqual(cancelled.status, "cancelled")
+                    self.assertNotIn(aid, [r.id for r in self.ha.manager.active()])
+                    with self.assertRaises(StaleRequirementError):
+                        self.ha.manager.apply_action(reply)
+                    self.ha.cancel(aid)
+                    self.assertEqual(self.ha.manager.get(aid), cancelled)
+
+    def test_cancel_preserves_terminal_answers_and_missing_records(self):
+        for idx in (1, 2):
+            aid = self.ha.open_approval(self._req(f"r-terminal{idx}", action="x"))
+            self.ha.resolve(aid, {"1": [idx]}, "synthetic-owner")
+            before = self.ha.manager.get(aid)
+            self.ha.cancel(aid)
+            self.assertEqual(self.ha.manager.get(aid), before)
+            self.assertEqual(self.ha.poll_resolution(aid),
+                             ("resolved", {"1": [idx]}, "synthetic-owner"))
+        aid = self.ha.open_approval(self._req("r-expired", action="x"))
+        self.ha.manager.expire(aid)
+        before = self.ha.manager.get(aid)
+        self.ha.cancel(aid)
+        self.assertEqual(self.ha.manager.get(aid), before)
+        records = self.ha.manager.store.all()
+        self.ha.cancel("hitl_missing")
+        self.assertEqual(self.ha.manager.store.all(), records)
+
+    def test_cancel_write_failure_propagates_and_retry_uses_production_writer(self):
+        for resolve_before_retry in (False, True):
+            with self.subTest(resolve_before_retry=resolve_before_retry):
+                aid = self.ha.open_elicitation(self._req(
+                    f"r-retry{resolve_before_retry}", question="Choose?",
+                    options=["A", "B"]))
+                before = self.ha.manager.get(aid)
+                with mock.patch("hitl.manager.os.replace",
+                                side_effect=PermissionError("synthetic write failure")):
+                    with self.assertRaisesRegex(PermissionError, "synthetic write failure"):
+                        self.ha.cancel(aid)
+                self.assertEqual(self.ha.manager.get(aid), before)
+                self.assertEqual(list(self.ha.manager.store.root.glob(".tmp-*")), [])
+                if resolve_before_retry:
+                    self.ha.resolve(aid, {"1": "B"}, "synthetic-owner")
+                    before = self.ha.manager.get(aid)
+                self.ha.cancel(aid)
+                if resolve_before_retry:
+                    self.assertEqual(self.ha.manager.get(aid), before)
+                    self.assertEqual(self.ha.poll_resolution(aid),
+                                     ("resolved", {"1": "B"}, "synthetic-owner"))
+                else:
+                    self.assertEqual(self.ha.manager.get(aid).status, "cancelled")
 
     def test_free_text_decision_round_trips_the_typed_answer(self):
         aid = self.ha.open_elicitation(self._req("r-ft", type="text", question="Your name?"))
