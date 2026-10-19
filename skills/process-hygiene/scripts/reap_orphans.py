@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""Report, and with --reap stop, orphaned processes left in agent scratchpads.
+
+A process is a candidate only when ALL of these hold:
+  - it is owned by the user running this script;
+  - its parent is init (PPID 1), i.e. whatever started it is gone;
+  - it has run longer than the minimum age (manifest config, default 2 h);
+  - its working directory is inside an agent scratchpad,
+    <tmp>/claude-<uid>/<project>/<session>/scratchpad (realpaths compared);
+  - it is not on the never-touch list (tmux, claude sessions, Sutando core and
+    worker processes, relay bridges, launchd jobs, Chrome/Chromium, apps under
+    /Applications), and it is not this script or one of its ancestors.
+
+Launchd jobs also have PPID 1 on macOS. They are excluded twice: every pid
+`launchctl list` reports is skipped, and a job's working directory is `/` or the
+plist's WorkingDirectory, never a per-session scratchpad, so the cwd rule alone
+already keeps them out when launchctl cannot be read.
+
+Stopping is per target, never by pattern. Immediately before each signal the
+target is re-read (pid, start time, cwd, command); any change aborts it, which
+is what makes PID reuse safe. A whole process group is signalled only when
+every member of the group is itself a candidate; otherwise the single pid is.
+SIGTERM first, a bounded grace, then SIGKILL for survivors after a second
+identical re-check.
+
+--spotlight drops an empty `.metadata_never_index` into each scratchpad root and
+into each `claude-<uid>` directory above them, so Spotlight skips test churn.
+
+Exit status is 0 for every run that parsed its arguments (it runs from cron);
+2 on a usage error.
+
+Run: python3 skills/process-hygiene/scripts/reap_orphans.py [--reap] [--spotlight]
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import glob
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+
+SKILL_DIR = Path(__file__).resolve().parents[1]
+REPO = SKILL_DIR.parents[1]
+MANIFEST = SKILL_DIR / "manifest.json"
+
+MIN_AGE_KEY = "PROCESS_HYGIENE_MIN_AGE_S"
+GRACE_KEY = "PROCESS_HYGIENE_GRACE_S"
+DEFAULT_TMP_BASES = ("/tmp",)  # on macOS a symlink; roots are compared as realpaths
+NEVER_INDEX = ".metadata_never_index"
+LOG_NAME = "process-hygiene.log"
+
+PROTECTED_SUBSTRINGS = (
+    "sutando-core", "sutando-worker", "sutando-tmux", "sutando-relay",
+    "run-bridge.sh", "remote_gateway_bridge", "remote-gateway-bridge",
+    "claude-code", "Google Chrome", "Chromium", "chrome-headless-shell",
+)
+# An installed app's own binary. A toolchain under an app bundle (Xcode's
+# swift-frontend) or a framework's Python.app is not the user's app.
+APP_ROOTS = ("/Applications/", os.path.join(os.path.expanduser("~"), "Applications") + "/")
+APP_BINARY = re.compile(r"^[^\n]*?\.app/Contents/MacOS/[^/]*$")
+PROTECTED_EXECUTABLES = frozenset({
+    "tmux", "claude", "launchd", "chrome", "chromium", "chromium-browser", "google-chrome",
+})
+
+PS_ARGV = ["ps", "-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "uid=", "-o", "stat=",
+           "-o", "etime=", "-o", "lstart=", "-o", "command="]
+C_LOCALE = {"LC_ALL": "C", "LANG": "C"}
+
+
+@dataclass(frozen=True)
+class Proc:
+    pid: int
+    ppid: int
+    pgid: int
+    uid: int
+    stat: str
+    age_s: Optional[int]
+    lstart: str
+    command: str
+
+    @property
+    def zombie(self) -> bool:
+        return self.stat.startswith("Z")
+
+
+@dataclass
+class Candidate:
+    proc: Proc
+    cwd: str
+
+    def identity(self) -> Tuple[int, str, str, str]:
+        return (self.proc.pid, self.proc.lstart, self.cwd, self.proc.command)
+
+
+@dataclass
+class Target:
+    kind: str  # "group" or "pid"
+    ident: int  # pgid for a group, pid otherwise
+    members: Dict[int, Candidate] = field(default_factory=dict)
+
+
+@dataclass
+class Context:
+    uid: int
+    min_age_s: float
+    grace_s: float
+    roots: List[str]
+    snapshot: Callable[[], Optional[Dict[int, Proc]]]
+    read_cwd: Callable[[int], Optional[str]]
+    log: Callable[[str], None]
+    protected_pids: Set[int] = field(default_factory=set)
+    own_pgid: int = -1
+    orphan_ppid: int = 1
+    kill: Callable[[int, int], None] = os.kill
+    killpg: Callable[[int, int], None] = os.killpg
+    sleep: Callable[[float], None] = time.sleep
+    clock: Callable[[], float] = time.monotonic
+
+
+def manifest_config(key: str, manifest: Path = MANIFEST) -> Optional[str]:
+    try:
+        value = json.loads(manifest.read_text()).get("config", {}).get(key)
+    except (OSError, ValueError, AttributeError):
+        return None
+    return None if value is None else str(value)
+
+
+def setting(cli_value: Optional[float], key: str, env=None, manifest: Path = MANIFEST) -> float:
+    """CLI > env > manifest config, per skills/MANIFEST.md. Raises ValueError when unusable."""
+    if cli_value is not None:
+        value: object = cli_value
+    else:
+        env = os.environ if env is None else env
+        value = env.get(key) or manifest_config(key, manifest)
+    if value is None:
+        raise ValueError(f"{key} is not set in the CLI, the environment or {manifest.name}")
+    number = float(value)
+    if number < 0:
+        raise ValueError(f"{key} must be >= 0, got {value}")
+    return number
+
+
+def parse_etime(text: str) -> Optional[int]:
+    try:
+        days = 0
+        if "-" in text:
+            head, text = text.split("-", 1)
+            days = int(head)
+        fields = [int(x) for x in text.split(":")]
+    except ValueError:
+        return None
+    if not 1 <= len(fields) <= 3:
+        return None
+    fields = [0] * (3 - len(fields)) + fields
+    return days * 86400 + fields[0] * 3600 + fields[1] * 60 + fields[2]
+
+
+def parse_ps(text: str) -> Dict[int, Proc]:
+    procs: Dict[int, Proc] = {}
+    for line in text.splitlines():
+        parts = line.split(None, 11)
+        if len(parts) < 11:
+            continue
+        try:
+            pid, ppid, pgid, uid = (int(x) for x in parts[:4])
+        except ValueError:
+            continue
+        procs[pid] = Proc(pid=pid, ppid=ppid, pgid=pgid, uid=uid, stat=parts[4], age_s=parse_etime(parts[5]),
+                          lstart=" ".join(parts[6:11]), command=parts[11] if len(parts) > 11 else "")
+    return procs
+
+
+def snapshot(run=subprocess.run) -> Optional[Dict[int, Proc]]:
+    """Every process, or None when ps could not be read (never an empty table)."""
+    try:
+        out = run(PS_ARGV, capture_output=True, text=True, timeout=30, env={**os.environ, **C_LOCALE})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    procs = parse_ps(out.stdout)
+    return procs or None
+
+
+def read_cwd(pid: int, system: Optional[str] = None, run=subprocess.run, readlink=os.readlink) -> Optional[str]:
+    system = system or sys.platform
+    if system.startswith("linux"):
+        try:
+            path = readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            return None
+        if path.endswith(" (deleted)"):
+            return None
+        return os.path.realpath(path)
+    try:
+        out = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True,
+                  timeout=15, env={**os.environ, **C_LOCALE})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.stdout.splitlines():
+        if line.startswith("n") and len(line) > 1:
+            return os.path.realpath(line[1:])
+    return None
+
+
+def launchd_pids(system: Optional[str] = None, run=subprocess.run) -> Set[int]:
+    if not (system or sys.platform).startswith("darwin"):
+        return set()
+    try:
+        out = run(["launchctl", "list"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    pids = set()
+    for line in out.stdout.splitlines():
+        head = line.split(None, 1)[0] if line.strip() else ""
+        if head.isdigit():
+            pids.add(int(head))
+    return pids
+
+
+def scratchpad_roots(uid: int, tmp_bases: Sequence[str]) -> List[str]:
+    roots = set()
+    for base in tmp_bases:
+        for hit in glob.glob(os.path.join(glob.escape(base), f"claude-{uid}", "*", "*", "scratchpad")):
+            if os.path.isdir(hit):
+                roots.add(os.path.realpath(hit))
+    return sorted(roots)
+
+
+def inside(path: str, roots: Sequence[str]) -> bool:
+    return any(path == r or path.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
+def protected_reason(command: str) -> Optional[str]:
+    for needle in PROTECTED_SUBSTRINGS:
+        if needle in command:
+            return f"never-touch ({needle})"
+    for app_root in APP_ROOTS:
+        if command.startswith(app_root) and APP_BINARY.match(command.split(" -", 1)[0].rstrip()):
+            return "never-touch (an app under Applications)"
+    argv0 = command.split(None, 1)[0] if command.strip() else ""
+    if os.path.basename(argv0).lstrip("-") in PROTECTED_EXECUTABLES:
+        return f"never-touch ({os.path.basename(argv0)})"
+    return None
+
+
+def ancestors(pid: int, procs: Dict[int, Proc]) -> Set[int]:
+    seen: Set[int] = set()
+    while pid in procs and pid not in seen and pid > 1:
+        seen.add(pid)
+        pid = procs[pid].ppid
+    return seen
+
+
+def classify(proc: Proc, ctx: Context) -> Tuple[Optional[str], Optional[str]]:
+    """(reason it is skipped or None, its cwd when read). Cheap rules run before lsof."""
+    if proc.uid != ctx.uid:
+        return "another user", None
+    if proc.pid in ctx.protected_pids:
+        return "this run, an ancestor, or a launchd job", None
+    if proc.zombie:
+        return "zombie", None
+    if proc.ppid != ctx.orphan_ppid:
+        return "has a live parent", None
+    if proc.age_s is None or proc.age_s < ctx.min_age_s:
+        return "younger than the minimum age", None
+    reason = protected_reason(proc.command)
+    if reason:
+        return reason, None
+    cwd = ctx.read_cwd(proc.pid)
+    if cwd is None:
+        return "cwd unreadable", None
+    if not inside(cwd, ctx.roots):
+        return "cwd outside every scratchpad", cwd
+    return None, cwd
+
+
+def find_candidates(procs: Dict[int, Proc], ctx: Context) -> Dict[int, Candidate]:
+    found: Dict[int, Candidate] = {}
+    for proc in procs.values():
+        reason, cwd = classify(proc, ctx)
+        if reason is None and cwd is not None:
+            found[proc.pid] = Candidate(proc, cwd)
+    return found
+
+
+def group_members(procs: Dict[int, Proc], pgid: int) -> Set[int]:
+    return {p.pid for p in procs.values() if p.pgid == pgid and not p.zombie}
+
+
+def plan(cands: Dict[int, Candidate], procs: Dict[int, Proc], ctx: Context) -> List[Target]:
+    targets: List[Target] = []
+    for pgid in sorted({c.proc.pgid for c in cands.values()}):
+        mine = {pid: c for pid, c in cands.items() if c.proc.pgid == pgid}
+        if pgid > 1 and pgid != ctx.own_pgid and group_members(procs, pgid) == set(mine):
+            targets.append(Target("group", pgid, mine))
+        else:
+            targets.extend(Target("pid", pid, {pid: c}) for pid, c in sorted(mine.items()))
+    return targets
+
+
+def unchanged(cand: Candidate, procs: Dict[int, Proc], ctx: Context) -> bool:
+    now = procs.get(cand.proc.pid)
+    if now is None or now.zombie or (now.lstart, now.command) != (cand.proc.lstart, cand.proc.command):
+        return False
+    return ctx.read_cwd(cand.proc.pid) == cand.cwd
+
+
+def alive_members(target: Target, procs: Dict[int, Proc]) -> Set[int]:
+    if target.kind == "group":
+        return group_members(procs, target.ident)
+    now = procs.get(target.ident)
+    return {target.ident} if now is not None and not now.zombie else set()
+
+
+def recheck(target: Target, ctx: Context, after_term: bool = False) -> Tuple[bool, Optional[Set[int]]]:
+    """(still safe to signal, planned members alive now or None when ps failed).
+
+    Before SIGTERM nothing may have left or joined; after it, members may only have left."""
+    procs = ctx.snapshot()
+    if procs is None:
+        return False, None
+    alive = alive_members(target, procs)
+    expected = set(target.members)
+    if not (alive <= expected if after_term else alive == expected):
+        return False, alive & expected
+    return all(unchanged(target.members[pid], procs, ctx) for pid in alive), alive
+
+
+def still_running(target: Target, ctx: Context) -> bool:
+    """Cheap poll during the grace: a planned member with its original start time is alive."""
+    procs = ctx.snapshot()
+    if procs is None:
+        return True
+    return any(procs[pid].lstart == target.members[pid].proc.lstart
+               for pid in alive_members(target, procs) & set(target.members))
+
+
+def describe(target: Target) -> str:
+    first = next(iter(target.members.values()))
+    cmd = first.proc.command.replace("\n", "\\n")
+    cmd = cmd if len(cmd) <= 160 else cmd[:157] + "..."
+    pids = ",".join(str(p) for p in sorted(target.members))
+    return f"{target.kind}={target.ident} pids={pids} age={first.proc.age_s}s cwd={first.cwd} cmd={cmd!r}"
+
+
+def send(target: Target, sig: int, ctx: Context, alive: Optional[Set[int]] = None) -> bool:
+    """Signal a re-checked target. A group whose leader is a zombie can refuse
+    killpg with EPERM; its members, just re-checked, are then signalled one by one."""
+    try:
+        if target.kind == "group":
+            ctx.killpg(target.ident, sig)
+        else:
+            ctx.kill(target.ident, sig)
+        return True
+    except ProcessLookupError:
+        return True
+    except PermissionError as e:
+        if target.kind != "group":
+            ctx.log(f"signal-refused sig={sig} {describe(target)} err={e}")
+            return False
+    refused = False
+    for pid in sorted(target.members if alive is None else alive):
+        try:
+            ctx.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError as e:
+            refused = True
+            ctx.log(f"signal-refused sig={sig} pid={pid} err={e}")
+    return not refused
+
+
+def stop(target: Target, ctx: Context) -> str:
+    ok, alive = recheck(target, ctx)
+    if not ok:
+        if target.kind == "group" and alive:
+            ctx.log(f"group-changed {describe(target)}; signalling unchanged members one by one")
+            singles = [Target("pid", pid, {pid: target.members[pid]}) for pid in sorted(alive)]
+            outcomes = [stop(t, ctx) for t in singles]
+            return "killed" if "killed" in outcomes else ("terminated" if "terminated" in outcomes else "aborted")
+        ctx.log(f"abort-changed {describe(target)}")
+        return "aborted"
+    if not send(target, signal.SIGTERM, ctx, alive):
+        return "aborted"
+    ctx.log(f"sigterm {describe(target)}")
+    deadline = ctx.clock() + ctx.grace_s
+    while ctx.clock() < deadline and still_running(target, ctx):
+        ctx.sleep(0.1)
+    ok, alive = recheck(target, ctx, after_term=True)
+    if alive is not None and not alive:
+        ctx.log(f"terminated {target.kind}={target.ident}")
+        return "terminated"
+    if not ok:
+        ctx.log(f"abort-kill-changed {describe(target)}")
+        return "aborted"
+    if not send(target, signal.SIGKILL, ctx, alive):
+        return "aborted"
+    ctx.log(f"sigkill {describe(target)} survivors={','.join(str(p) for p in sorted(alive or ()))}")
+    return "killed"
+
+
+def ensure_never_index(roots: Sequence[str], log: Callable[[str], None]) -> List[str]:
+    dirs = sorted(set(roots) | {os.path.dirname(os.path.dirname(os.path.dirname(r))) for r in roots})
+    created = []
+    for d in dirs:
+        marker = os.path.join(d, NEVER_INDEX)
+        if os.path.exists(marker):
+            continue
+        try:
+            with open(marker, "a"):
+                pass
+        except OSError as e:
+            log(f"spotlight-marker-failed dir={d} err={e}")
+            continue
+        created.append(marker)
+        log(f"spotlight-marker dir={d}")
+    return created
+
+
+def default_log_path() -> Path:
+    sys.path.insert(0, str(REPO / "src"))
+    from workspace_default import resolve_workspace  # noqa: E402
+    return resolve_workspace(migrate=False) / "logs" / LOG_NAME
+
+
+def file_logger(path: Path) -> Callable[[str], None]:
+    def log(line: str) -> None:
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as fh:
+                fh.write(f"{stamp} {line}\n")
+        except OSError as e:
+            print(f"process-hygiene: cannot write {path}: {e}", file=sys.stderr)
+    return log
+
+
+def parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Report (default) or stop orphaned processes in agent scratchpads.")
+    p.add_argument("--reap", action="store_true", help="stop candidates (default: report only)")
+    p.add_argument("--spotlight", action="store_true", help="drop .metadata_never_index into scratchpad roots")
+    p.add_argument("--min-age", type=float, help=f"seconds; overrides {MIN_AGE_KEY}")
+    p.add_argument("--grace", type=float, help=f"seconds between SIGTERM and SIGKILL; overrides {GRACE_KEY}")
+    p.add_argument("--tmp-base", action="append", help="directory holding claude-<uid>/ (repeatable; "
+                   "default /tmp, which covers its realpath)")
+    p.add_argument("--log", type=Path, help="log file (default <workspace>/logs/process-hygiene.log)")
+    return p.parse_args(argv)
+
+
+def run(args: argparse.Namespace, ctx: Context) -> Dict[str, int]:
+    counts = {"candidates": 0, "terminated": 0, "killed": 0, "aborted": 0, "markers": 0}
+    if args.spotlight:
+        counts["markers"] = len(ensure_never_index(ctx.roots, ctx.log))
+    procs = ctx.snapshot()
+    if procs is None:
+        print("process-hygiene: ps could not be read; nothing was examined or stopped")
+        ctx.log("ps-unavailable; nothing examined")
+        return counts
+    me = os.getpid()
+    ctx.protected_pids |= ancestors(me, procs) | {me}
+    cands = find_candidates(procs, ctx)
+    counts["candidates"] = len(cands)
+    for target in plan(cands, procs, ctx):
+        print(("stopping " if args.reap else "would stop ") + describe(target))
+        if args.reap:
+            counts[stop(target, ctx)] += 1
+    mode = "reap" if args.reap else "report"
+    summary = (f"mode={mode} roots={len(ctx.roots)} candidates={counts['candidates']} "
+               f"terminated={counts['terminated']} killed={counts['killed']} aborted={counts['aborted']} "
+               f"spotlight_markers={counts['markers']}")
+    print(f"process-hygiene: {summary}")
+    ctx.log(f"summary {summary}")
+    return counts
+
+
+def build_context(args: argparse.Namespace, log: Callable[[str], None], orphan_ppid: int = 1) -> Context:
+    uid = os.getuid()
+    bases = args.tmp_base or list(DEFAULT_TMP_BASES)
+    return Context(uid=uid, min_age_s=setting(args.min_age, MIN_AGE_KEY), grace_s=setting(args.grace, GRACE_KEY),
+                   roots=scratchpad_roots(uid, bases), snapshot=snapshot, read_cwd=read_cwd, log=log,
+                   protected_pids=launchd_pids(), own_pgid=os.getpgrp(), orphan_ppid=orphan_ppid)
+
+
+def main(argv: Optional[Sequence[str]] = None, orphan_ppid: int = 1) -> int:
+    args = parse_args(argv)
+    try:
+        log = file_logger(args.log or default_log_path())
+        ctx = build_context(args, log, orphan_ppid)
+    except ValueError as e:
+        print(f"process-hygiene: {e}", file=sys.stderr)
+        return 2
+    try:
+        run(args, ctx)
+    except Exception as e:  # a cron job reports and exits 0; it never retries in a loop
+        print(f"process-hygiene: run failed: {e!r}")
+        log(f"run-failed err={e!r}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
