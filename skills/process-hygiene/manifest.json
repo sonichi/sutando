@@ -1,6 +1,7 @@
 {
   "name": "process-hygiene",
   "version": "0.1.0",
+  "audience": "developer",
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
