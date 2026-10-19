@@ -1,6 +1,6 @@
 ---
 name: process-hygiene
-description: "Report, and with --reap stop, orphaned processes that interrupted agent test runs left behind in per-session scratchpads (PPID 1, this user, older than 2 h by default, cwd inside <tmp>/claude-<uid>/<project>/<session>/scratchpad, and that session has ended). --spotlight keeps Spotlight from indexing scratchpad churn. Use when the Mac is noisy or loaded with leftover test processes, or schedule it hourly."
+description: "Report, and with --reap stop, orphaned processes that interrupted agent test runs left behind in per-session scratchpads (PPID 1, this user, older than 2 h by default, cwd inside <tmp>/claude-<uid>/<project>/<session>/scratchpad, and that session has ended). --spotlight keeps Spotlight from indexing scratchpad churn. For Sutando developers only; not scheduled. Use when the Mac is noisy or loaded with leftover test processes."
 user-invocable: true
 ---
 
@@ -23,7 +23,7 @@ python3 skills/process-hygiene/scripts/reap_orphans.py --spotlight   # Spotlight
 
 Every run appends one line per action and a summary to
 `<workspace>/logs/process-hygiene.log` and prints the summary. The exit status is
-0 for every run that parsed its arguments, so a cron never retries in a loop; 2
+0 for every run that parsed its arguments, so a scheduled caller never retries in a loop; 2
 on a usage error.
 
 ## What is a candidate
@@ -142,42 +142,29 @@ Per target, never by pattern:
 `--spotlight` creates an empty `.metadata_never_index` in each existing
 scratchpad root and in each `claude-<uid>` directory above them, skipping any
 that already has one. Scratchpads are created by Claude Code itself, so there is
-no Sutando session-start hook to add the marker at creation; the hourly run
-covers new ones within the hour. Whether Spotlight honours the marker below a
+no Sutando session-start hook to add the marker at creation; each run covers
+the ones created since the last. Whether Spotlight honours the marker below a
 volume root depends on the macOS release (unverified on every release); if
 `mdworker` keeps indexing the temp tree, add `/private/tmp` to System Settings →
 Spotlight → Privacy instead.
 
-## Scheduling
+## Developer-only, not scheduled
 
-Hourly, off the top of the hour, as an OS-level shell job (it needs no model
-session). `skills/schedule-crons/crons.example.json` ships it **report-only**
-(plus the Spotlight markers): it logs what it would stop and stops nothing.
+This skill is for Sutando developers, whose agent sessions run test suites. It
+is not added to `skills/schedule-crons/crons.example.json`: new installs copy
+that file, and an hourly job there would reach every user. Run it by hand:
 
-```json
-{
-  "name": "process-hygiene",
-  "cron": "23 * * * *",
-  "launchd": true,
-  "shell_command": "PY=\"$(bash scripts/sutando-config.sh python-bin)\" && \"$PY\" skills/process-hygiene/scripts/reap_orphans.py --spotlight"
-}
+```bash
+python3 skills/process-hygiene/scripts/reap_orphans.py --spotlight          # report only
+python3 skills/process-hygiene/scripts/reap_orphans.py --reap --spotlight   # stop candidates
 ```
 
-**Stopping is an explicit opt-in.** After reading a few runs of
-`<workspace>/logs/process-hygiene.log` and the cron log, enable it by changing
-that entry's `shell_command` in `<workspace>/hosts/<host-label>/crons.json` to:
-
-```json
-  "shell_command": "PY=\"$(bash scripts/sutando-config.sh python-bin)\" && \"$PY\" skills/process-hygiene/scripts/reap_orphans.py --reap --spotlight"
-```
+Its triggers come in a follow-up: a health-check load warning that runs it once
+when the cause matches, and the end of witness scripts.
 
 `--reap` refuses a minimum age under 600 s (exit 2), so a typo cannot reap young
 work. A run holds an exclusive `flock` on `process-hygiene.lock` beside its log;
-a second run (a manual one during the cron's) prints that and does nothing.
-
-`python-bin` resolves a verified interpreter; a bare `python3` under launchd's
-`PATH` can be the Xcode Command Line Tools stub. It needs the OS-level runner
-(`bash src/install-cron-runner-launchd.sh`).
+a second, concurrent run prints that and does nothing.
 
 ## Config
 

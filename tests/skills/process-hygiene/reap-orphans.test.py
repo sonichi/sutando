@@ -886,19 +886,17 @@ class RealOrphans(unittest.TestCase):
         self.assertTrue((self.root / ro.NEVER_INDEX).exists())
 
 
-class ShippedSchedule(unittest.TestCase):
-    """A data pin, not a behaviour test: the shipped example only reports; stopping is the owner's opt-in."""
+class DeveloperOnly(unittest.TestCase):
+    """A data pin: the skill ships no schedule, because new installs copy the example crons."""
 
-    def test_example_cron_is_report_only_and_the_opt_in_is_documented(self):
+    def test_no_example_cron_and_the_doc_says_developer_only(self):
         crons = json.loads((REPO / "skills" / "schedule-crons" / "crons.example.json").read_text())
-        entry = [e for e in crons if e.get("name") == "process-hygiene"]
-        self.assertEqual(len(entry), 1)
-        self.assertTrue(entry[0].get("launchd"))
-        argv = entry[0]["shell_command"].split()
-        self.assertIn("skills/process-hygiene/scripts/reap_orphans.py", argv)
-        self.assertNotIn("--reap", argv)
+        self.assertFalse([e for e in crons if "process-hygiene" in json.dumps(e)])
         doc = (REPO / "skills" / "process-hygiene" / "SKILL.md").read_text()
+        self.assertIn("Developer-only, not scheduled", doc)
         self.assertIn("reap_orphans.py --reap --spotlight", doc)
+        manifest = json.loads((REPO / "skills" / "process-hygiene" / "manifest.json").read_text())
+        self.assertTrue(manifest["description"].startswith("Developer-only, not scheduled."))
 
 
 class Main(unittest.TestCase):
