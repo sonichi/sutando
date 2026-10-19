@@ -35,6 +35,7 @@ SERVER_EXIT_S = 20.0
 CONSUMER_WAIT_S = 30.0
 INNER_STOP_S = 120.0
 TITLE_CHANGED = "title changed"
+FIELD_SEP = "|:ag2:|"
 START_COMMAND_RE = re.compile(r'^"?ag2-sparrow-claude-local hold --generation=[0-9a-f]{32} --"?$')
 TMUX_VERSION_RE = re.compile(r"(\d+)\.(\d+)")
 SESSION_ENV_KEYS = ("CLAUDE_CONFIG_DIR", "HMAC_KEY_FILE", "HMAC_STRICT")
@@ -87,17 +88,19 @@ class Tmux:
         return tmux_probe.has_session(self.sock, name, timeout=PROBE_TIMEOUT_S, tmux=self.tmux)
 
     def pane_fields(self, pane_id) -> "dict | None":
-        r = self.run("display-message", "-p", "-t", pane_id,
-                     "#{pane_id}\t#{pane_pid}\t#{session_id}\t#{session_created}\t#{pid}\t#{pane_title}\t#{pane_start_command}")
+        # A printable separator no locale escapes; the title, the one free-text field, comes last.
+        r = self.run("display-message", "-p", "-t", pane_id, FIELD_SEP.join(
+            ("#{pane_id}", "#{pane_pid}", "#{session_id}", "#{session_created}", "#{pid}", "#{pane_start_command}",
+             "#{pane_title}")))
         if r is None or r.returncode != 0:
             return None
-        parts = (r.stdout or "").rstrip("\n").split("\t", 6)
+        parts = (r.stdout or "").rstrip("\n").split(FIELD_SEP, 6)
         if len(parts) != 7:
             return None
         try:
             return {"pane_id": parts[0], "pane_pid": int(parts[1]), "session_id": parts[2],
-                    "session_created": int(parts[3]), "server_pid": int(parts[4]), "title": parts[5],
-                    "start_command": parts[6]}
+                    "session_created": int(parts[3]), "server_pid": int(parts[4]), "start_command": parts[5],
+                    "title": parts[6]}
         except ValueError:
             return None
 

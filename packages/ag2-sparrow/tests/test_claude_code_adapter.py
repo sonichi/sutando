@@ -2382,6 +2382,29 @@ class LauncherTmux(ConnectBase):
         self.assertEqual(wait_for(self.session, 10)["env"].get("LC_CTYPE"), "en_US.UTF-8",
                          "the clean server gives the pane a UTF-8 locale")
 
+    def test_the_pane_reads_back_without_a_locale_even_from_a_client_without_u(self):
+        """The separator alone suffices: no LANG/LC_*, and a client that does not pass -u."""
+        real = launcher.Tmux.run
+
+        def without_u(tm, *args, **kw):
+            seen.append(args)
+            return tm._run([tm.tmux, "-S", tm.sock, *args], capture_output=True, text=True,
+                           timeout=kw.get("timeout", launcher.PROBE_TIMEOUT_S), env=kw.get("env"), stdin=subprocess.DEVNULL)
+        seen = []
+        with mock.patch.dict(os.environ):
+            for name in [k for k in os.environ if k == "LANG" or k.startswith("LC_")]:
+                del os.environ[name]
+            with mock.patch.object(launcher.Tmux, "run", without_u):
+                lc, rec = self.created()
+                fields = lc.tm.pane_fields(rec["generation"]["pane_id"])
+        self.assertTrue(seen, "the -u-less client ran")
+        self.assertEqual((fields["pane_pid"], fields["title"]), (rec["generation"]["pane_pid"], rec["title_token"]))
+        self.assertIs(launcher.Tmux.run, real)
+        self.tmux("select-pane", "-t", rec["generation"]["pane_id"], "-T", "a %s title" % launcher.FIELD_SEP)
+        got = lc.tm.pane_fields(rec["generation"]["pane_id"])
+        self.assertEqual(got["title"], "a %s title" % launcher.FIELD_SEP)
+        self.assertEqual(got["start_command"], rec["generation"]["start_command"], "a free-text title never shifts a field")
+
     def test_adoption_needs_the_pane_tuple_the_consumer_and_this_generations_witness(self):
         lc, rec = self.created()
         root = str(self.work)
