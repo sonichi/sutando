@@ -61,7 +61,8 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
     env = decl.get("env")
     mxid = env.get("AGENT_MXID") if isinstance(env, dict) else None
     try:
-        own = isinstance(mxid, str) and agent_identity.root_segment(mxid) == segment
+        # The bridge reports the id verbatim, so it must be exact: no surrounding whitespace to strip.
+        own = isinstance(mxid, str) and mxid == mxid.strip() and agent_identity.root_segment(mxid) == segment
     except ValueError:
         own = False
     if not own:

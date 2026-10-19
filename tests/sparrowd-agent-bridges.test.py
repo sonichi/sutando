@@ -95,6 +95,8 @@ class Specs(Base):
             (lambda: self.edit(decl, env=dict(json.loads(good)["env"], AGENT_MXID="@other:x")),
              "AGENT_MXID '@other:x' is not the agent the segment"),
             (lambda: self.edit(decl, env=dict(json.loads(good)["env"], AGENT_MXID="")), "is not the agent"),
+            (lambda: self.edit(decl, env=dict(json.loads(good)["env"], AGENT_MXID=AGENT + " ")),
+             f"AGENT_MXID '{AGENT} ' is not the agent"),
             (lambda: self.edit(decl, env=dict(json.loads(good)["env"], AGENT_CONNECT_TASK_DIR="/elsewhere/tasks")),
              "env is not the canonical one"),
             (lambda: self.edit(decl, env=dict(json.loads(good)["env"], AGENT_CONNECT_STATE_DIR=str(self.ws / "agents" / "x"))),
