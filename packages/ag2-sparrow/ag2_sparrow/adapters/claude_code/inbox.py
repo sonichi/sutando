@@ -49,6 +49,15 @@ def prepare_root(root) -> str:
     return ""
 
 
+def root_problem(root) -> str:
+    """prepare_root's layout verdict without writing anything: what install checks before it starts."""
+    return lifecycle.prepare_work_dir(root, check_only=True) or ""
+
+
+def retryable(problem: str) -> bool:
+    """Whether a prepare_root refusal may clear by itself (the dir was unreadable), not a layout one."""
+    return problem.startswith(lifecycle.UNCHECKED) or not problem.startswith("refusing to start:")
+
 def _lifecycle(root):
     return lifecycle.Lifecycle(root, identity=task_io.process_identity(), lineage=task_io.verify_lineage,
                                log=lambda *a: print("inbox:", *a, file=sys.stderr))

@@ -226,7 +226,7 @@ class Measure(unittest.TestCase):
 from ag2_sparrow import _dirs, connect_common as cm, holder_lock, tmux_pane_keys, tmux_probe  # noqa: E402
 from ag2_sparrow import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records  # noqa: E402
 
-from ag2_sparrow.adapters.claude_code import cli, detector, hold as hold_mod, inbox, launcher  # noqa: E402
+from ag2_sparrow.adapters.claude_code import cli, detector, hold as hold_mod, inbox, launcher, trust  # noqa: E402
 from ag2_sparrow.hitl.schema import ActionReply, STATUS_IN_PROGRESS, STATUS_PENDING, STATUS_RESOLVED  # noqa: E402
 
 # The fake is a #!/bin/sh wrapper that execs the quoted interpreter on the body beside
@@ -677,6 +677,7 @@ class ConnectInstall(ConnectBase):
         self.assertEqual(cli.read_config(cli.config_path())["SESSION_ID"], first, "kept without --new-session")
         live = {"server_pid": os.getpid(), "server_start": holder_lock.start_time(os.getpid()), "session_id": "$1",
                 "session_created": 1, "pane_id": "%0", "pane_pid": 1, "start_command": "x", "nonce": "0" * 32}
+        self.assertEqual(inbox.prepare_root(str(self.work)), "", "a launcher prepares the root before its record")
         records.save_supervisor(str(self.work), dict(records.empty_supervisor(), generation=live))
         rc, out, _ = self.install_with(runner, False, "--new-session")
         self.assertEqual(rc, 0)
@@ -1661,8 +1662,9 @@ class ConnectVerify(ConnectBase):
         self.assertEqual(set(self.checks(out)), {"config", "claude", "login", "tmux", "socket", "plugin", "inbox", "results",
                                                  "hmac", "hitl", "relay", "supervisor"})
         self.assertIn(f"INFO job: {cli.SERVICE_NAME} active", out)
-        self.assertIn(f"INFO session: {self.work} held by launcher pid {runner.pid()}", out)
-        self.assertIn(f"INFO occupancy: {self.work} held by hold pid {runner.pid()} (manager", out, "the shared tri-state")
+        self.assertIn(f"INFO session: {self.work} held by hold pid {runner.pid()}, no live claude attached (manager", out,
+                      "the shared tri-state, naming the lock's holder")
+        self.assertNotIn("launcher pid", out)
         self.assertIn("INFO session id: %s" % cli.read_config(cli.config_path())["SESSION_ID"], out)
         self.assertIn(f"INFO attach: {cli.COMMAND} attach", out)
         self.assertIn("PASS hitl store: %s (the bridge's, beside its default store)" % cli.hitl_store_root(), out)
@@ -1724,9 +1726,9 @@ class ConnectOccupancy(ConnectBase):
             running = SHOWING(LoadState="loaded", ActiveState="active", SubState="running", UnitFileState="enabled")
             with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): running})):
                 out = self.main("verify")[1]
-            self.assertIn(f"INFO session: {work} held by launcher pid {holder.pid} (manager active/running)", out)
+            self.assertIn(f"INFO session: {work} held by hold pid {holder.pid}, no live claude attached (manager active/running)", out)
             with mock.patch.object(cm, "_run", side_effect=Runner({})):
-                self.assertIn(f"INFO session: {work} held by launcher pid {holder.pid} (manager absent)", self.main("verify")[1])
+                self.assertIn(f"INFO session: {work} held by hold pid {holder.pid}, no live claude attached (manager absent)", self.main("verify")[1])
         finally:
             unhold(holder)
         with mock.patch.object(cm, "_run", side_effect=Runner({})):
@@ -1751,7 +1753,7 @@ class ConnectOccupancy(ConnectBase):
             holder = hold(work, "claude-local")
             try:
                 with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): live})):
-                    self.assertIn(f"INFO session: {work} held by launcher pid {holder.pid} (manager pid 4242, state running)",
+                    self.assertIn(f"INFO session: {work} held by hold pid {holder.pid}, no live claude attached (manager pid 4242, state running)",
                                   self.main("verify")[1])
             finally:
                 unhold(holder)
@@ -2398,6 +2400,8 @@ class LauncherTmux(ConnectBase):
         self.assertRegex(rec["title_token"], r"^t[0-9a-f]{32}$")
         session = wait_for(self.session, 10)
         self.assertEqual(rec["consumer"]["pid"], session["pid"], "the consumer is the pane's claude")
+        self.assertTrue(trust.trusted(trust.config_file(self.cfg["CLAUDE_CONFIG_DIR"]), trust.project_key(str(self.inbox))),
+                        "the inbox is trusted before the session starts")
         self.assertEqual(task_io.lock_holder(str(self.work))["pid"], session["pid"])
         env = session["env"]
         for leaked in (CANARY[0], "SUTANDO_WORKSPACE_DIR", "REMOTE_TASK_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
@@ -3734,6 +3738,280 @@ class OldMainHitl(CardBase):
                          (ROOM, card.KIND_STALL, "STOPPING"), "the new reader derives them from the subject")
         self.lc.apply_effects(self.lc.record())
         self.assertEqual(len(self.stops), 1, "reconciles to the same requirement")
+
+
+# The pane of a fresh install, as the live witness captured it from Claude Code 2.1.303.
+TRUST_PANE = """────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+ /w/root/tasks
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this
+ folder first.
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel
+"""
+BYPASS_PANE = """  WARNING: Claude Code running in Bypass Permissions mode
+  ❯ No, exit
+    Yes, I accept
+  Enter to confirm · Esc to cancel
+"""
+READY_PANE = """ ▐▛███▛█   Claude Code
+❯ Try "how does <filepath> work?"
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+"""
+
+
+class FolderTrust(unittest.TestCase):
+    """The CLI's own trust record for exactly the held inbox, under the CLI's own lock, nothing else changed."""
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp(prefix="trust")).resolve()
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.ccd = self.home / "ccd"
+        self.inbox = self.home / "work" / "tasks"
+        self.inbox.mkdir(parents=True)
+
+    def data(self, path=None):
+        return json.loads((path or self.ccd / ".claude.json").read_text())
+
+    def test_records_exactly_the_inbox_idempotently_and_keeps_everything_else(self):
+        self.ccd.mkdir()
+        conf = self.ccd / ".claude.json"
+        other = {"hasCompletedOnboarding": True, "oauthAccount": {"x": 1}, "numStartups": 7,
+                 "projects": {str(self.home / "work"): {"allowedTools": ["Read"]},
+                              str(self.inbox): {"allowedTools": ["Bash"], "hasTrustDialogAccepted": False}}}
+        conf.write_text(json.dumps(other))
+        conf.chmod(0o600)
+        self.assertEqual(trust.record(str(self.ccd), str(self.inbox)), "")
+        got = self.data()
+        self.assertEqual({k: v for k, v in got.items() if k != "projects"}, {k: v for k, v in other.items() if k != "projects"})
+        self.assertEqual(got["projects"][str(self.home / "work")], {"allowedTools": ["Read"]}, "never the parent")
+        self.assertEqual(got["projects"][str(self.inbox)], {"allowedTools": ["Bash"], "hasTrustDialogAccepted": True})
+        self.assertEqual(stat.S_IMODE(conf.stat().st_mode), 0o600)
+        self.assertFalse((self.ccd / ".claude.json.lock").exists(), "the CLI's lock is released")
+        before = (conf.stat().st_ino, conf.stat().st_mtime_ns)
+        self.assertEqual(trust.record(str(self.ccd), str(self.inbox)), "")
+        self.assertEqual((conf.stat().st_ino, conf.stat().st_mtime_ns), before, "already trusted: nothing is written")
+        self.assertEqual(sorted(p.name for p in self.ccd.iterdir()), [".claude.json"], "no temp left behind")
+
+    def test_the_key_is_the_resolved_path_and_a_missing_file_or_dir_is_created(self):
+        link = self.home / "link"
+        os.symlink(self.home / "work", link)
+        self.assertEqual(trust.record(str(self.ccd), str(link / "tasks")), "")
+        self.assertEqual(list(self.data()["projects"]), [str(self.inbox)], "the cwd hold fchdirs to, resolved")
+        self.assertEqual(stat.S_IMODE((self.ccd / ".claude.json").stat().st_mode), 0o600)
+        self.assertTrue(trust.trusted(str(self.ccd / ".claude.json"), trust.project_key(str(self.inbox))))
+
+    def test_the_cli_config_file_is_resolved_as_the_cli_does(self):
+        self.assertEqual(trust.config_file("", str(self.home)), str(self.home / ".claude.json"), "no config dir: HOME")
+        self.assertEqual(trust.config_file(str(self.ccd), str(self.home)), str(self.ccd / ".claude.json"))
+        self.ccd.mkdir()
+        (self.ccd / ".config.json").write_text("{}")
+        self.assertEqual(trust.config_file(str(self.ccd)), str(self.ccd / ".config.json"), "a non-empty legacy file wins")
+        (self.ccd / ".config.json").write_text("")
+        (self.ccd / ".claude.json").write_text("{}")
+        self.assertEqual(trust.config_file(str(self.ccd)), str(self.ccd / ".claude.json"))
+        (self.home / ".claude").mkdir()
+        (self.home / ".claude" / ".config.json").write_text('{"a": 1}')
+        self.assertEqual(trust.config_file("", str(self.home)), str(self.home / ".claude" / ".config.json"))
+
+    def test_a_symlinked_config_is_written_through_and_stays_a_link(self):
+        self.ccd.mkdir()
+        real = self.home / "dotfiles.json"
+        real.write_text("{}")
+        os.symlink(real, self.ccd / ".claude.json")
+        self.assertEqual(trust.record(str(self.ccd), str(self.inbox)), "")
+        self.assertTrue(os.path.islink(self.ccd / ".claude.json"))
+        self.assertIn(str(self.inbox), self.data(real)["projects"])
+
+    def test_it_fails_closed_with_one_line_and_leaves_the_file_as_it_was(self):
+        self.ccd.mkdir()
+        conf = self.ccd / ".claude.json"
+        for text, why in (("{not json", "Expecting property name"), ("[1]", "not a JSON object"),
+                          ('{"projects": []}', "projects entry is not an object")):
+            with self.subTest(text=text):
+                conf.write_text(text)
+                line = trust.record(str(self.ccd), str(self.inbox))
+                self.assertTrue(line.startswith("cannot record Claude Code's folder trust for %s in %s (" % (self.inbox, conf)), line)
+                self.assertIn(why, line)
+                self.assertTrue(line.endswith("the session would stop at the trust dialog"))
+                self.assertEqual(conf.read_text(), text)
+        conf.write_text("{}")
+        (self.ccd / ".claude.json.lock").mkdir()
+        line = trust.record(str(self.ccd), str(self.inbox), wait_s=0.1)
+        self.assertIn("the CLI's config lock %s stayed held" % (self.ccd / ".claude.json.lock"), line)
+        self.assertTrue((self.ccd / ".claude.json.lock").is_dir(), "another holder's lock is never broken")
+        self.assertEqual(conf.read_text(), "{}")
+        os.rmdir(self.ccd / ".claude.json.lock")
+        with mock.patch.object(trust.os, "replace", side_effect=OSError(28, "No space left on device")):
+            self.assertIn("No space left on device", trust.record(str(self.ccd), str(self.inbox)))
+        self.assertEqual(sorted(p.name for p in self.ccd.iterdir()), [".claude.json"], "the temp is removed, the lock released")
+        with mock.patch.object(trust, "trusted", side_effect=[False, False]):
+            self.assertIn("did not read back", trust.record(str(self.ccd), str(self.inbox)))
+
+    def test_a_held_lock_released_in_time_is_waited_for(self):
+        self.ccd.mkdir()
+        lock = self.ccd / ".claude.json.lock"
+        lock.mkdir()
+        t = threading.Timer(0.2, lambda: os.rmdir(lock))
+        t.start()
+        self.addCleanup(t.cancel)
+        self.assertEqual(trust.record(str(self.ccd), str(self.inbox), wait_s=5.0), "")
+
+    def test_the_startup_dialogs_read_from_a_capture(self):
+        self.assertEqual(trust.dialog(TRUST_PANE), "folder-trust")
+        self.assertEqual(trust.dialog(BYPASS_PANE), "bypass-permissions")
+        self.assertEqual(trust.dialog(TRUST_PANE.replace("❯ No, exit", "  No, exit").replace("   Yes, I", " ❯ Yes, I")),
+                         "folder-trust", "the cursor on either line")
+        for text in (READY_PANE, None, "", "we said Yes, I trust this folder in a chat line\n",
+                     "  Yes, I trust this folder\n", "  ❯ No, exit\n"):
+            self.assertIsNone(trust.dialog(text), text)
+        self.assertEqual(detector.abnormal_names(TRUST_PANE), ["dialog:folder-trust"])
+        obs = detector.derive({}, TRUST_PANE, {"inflight": {}}, 0.0, abnormal_min_s=5)
+        self.assertEqual(obs["dialog"], "folder-trust")
+        obs = detector.derive(obs, TRUST_PANE, {"inflight": {}}, 5.0, abnormal_min_s=5)
+        self.assertEqual(obs["stall"]["reason"], "abnormal:dialog:folder-trust", "an unanswered dialog raises the card")
+
+
+class StartupDialogAndRefusals(ConnectBase):
+    """The launcher records trust before the session, names a pane at a startup dialog, and stops for good
+    on a root it may never serve; verify fails on that pane; install refuses that root up front."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        self.cfg = cli.load_config()[0]
+        self.lines = []
+
+    def launcher(self):
+        return launcher.Launcher(self.cfg, cli.config_dir(), log=self.lines.append, sleep=lambda s: None)
+
+    def trusted(self):
+        return trust.trusted(trust.config_file(self.cfg["CLAUDE_CONFIG_DIR"]), trust.project_key(str(self.inbox)))
+
+    def test_creation_records_the_inbox_trust_first_and_refuses_when_it_cannot(self):
+        lc = self.launcher()
+        clear = mock.patch.object(tmux_pane_keys, "fence_status", return_value="clear")
+        with clear, mock.patch.object(task_io, "holder_consumer", return_value=None), \
+                mock.patch.object(trust, "record", return_value="cannot record x"), \
+                mock.patch.object(launcher, "create_session") as made:
+            self.assertEqual(lc.create({}), (False, "cannot record x"))
+        made.assert_not_called()
+        with clear, mock.patch.object(task_io, "holder_consumer", return_value=None), \
+                mock.patch.object(launcher, "create_session", return_value=(None, "tmux new-session failed: x")):
+            self.assertEqual(lc.create({}), (False, "tmux new-session failed: x"))
+        self.assertTrue(self.trusted(), "recorded before the session was made")
+        self.assertEqual(lc.refused, "")
+
+    def test_a_layout_refusal_is_terminal_and_an_unreadable_root_is_retried(self):
+        (self.work / "stray").write_text("x")
+        lc = self.launcher()
+        with mock.patch.object(tmux_pane_keys, "fence_status", return_value="clear"), \
+                mock.patch.object(launcher, "classify", return_value=("create", "")):
+            rc, _ = lc.tick(lc.record())
+            self.assertEqual(rc, cm.EXIT_HELD, "the manager stops: launchd's 0, systemd's RestartPreventExitStatus")
+            self.assertEqual(launcher.launchd_exit(rc), 0)
+            self.assertIn("is not a fresh work dir for this adapter (it holds stray)", self.lines[0])
+            self.assertEqual(self.lines[1], f"stopping: the work root needs attention, then run {cli.COMMAND} install again")
+            lc = self.launcher()
+            with mock.patch.object(inbox, "prepare_root", return_value="refusing to start: cannot check /w: EIO"):
+                self.assertEqual(lc.tick(lc.record())[0], launcher.EXIT_RETRY)
+            with mock.patch.object(inbox, "prepare_root", return_value="/w is not a prepared work dir (x)"):
+                self.assertEqual(lc.tick(lc.record())[0], launcher.EXIT_RETRY)
+        self.assertFalse(self.trusted(), "nothing recorded for a root it refused")
+
+    def test_a_root_the_bridge_wrote_into_still_gets_a_new_session(self):
+        from ag2_sparrow import workspace_lock
+        from ag2_sparrow.hitl.manager import HitlStore, default_store
+        self.assertEqual(inbox.prepare_root(str(self.work)), "", "the first session's launcher prepared it")
+        workspace_lock.acquire("gateway-bridge", self.work)
+        HitlStore(default_store(self.work))
+        (self.work / "logs").mkdir()
+        (self.work / "logs" / "gateway-bridge.log").write_text("x\n")
+        lc = self.launcher()
+        with mock.patch.object(tmux_pane_keys, "fence_status", return_value="clear"), \
+                mock.patch.object(launcher, "create_session", return_value=(None, "reached the session step")):
+            self.assertEqual(lc.create({}), (False, "reached the session step"))
+        self.assertEqual(lc.refused, "")
+
+    def test_a_pane_at_a_startup_dialog_is_logged_once_and_its_answer_too(self):
+        lc = self.launcher()
+        lc.store_root, lc.tm = None, StubTm()
+        rec = lc._with_record(lambda r: dict(r, generation=GEN))
+        frames = iter([TRUST_PANE, TRUST_PANE, READY_PANE])
+        lc.tm.capture = lambda pane_id: next(frames)
+        for _ in range(3):
+            rec = lc.observe(rec)
+        self.assertEqual(self.lines, [f"the session waits at Claude Code's folder-trust dialog; answer it in the pane "
+                                      f"({cli.COMMAND} attach)", "the session is past its startup dialog"])
+
+    def test_verify_fails_on_a_pane_waiting_at_a_dialog_and_reports_the_trust_record(self):
+        runner = self.runner()
+        with mock.patch.object(cm, "_run", side_effect=runner):
+            rc, out, _ = self.main("verify")
+        self.assertIn(f"INFO folder trust: {self.inbox} not recorded (the launcher records it before it creates the session)", out)
+        self.assertNotIn("FAIL session", out)
+        self.assertEqual(trust.record(self.cfg["CLAUDE_CONFIG_DIR"], str(self.inbox)), "")
+        records.save_supervisor(str(self.work), dict(records.empty_supervisor(), generation=GEN))
+        with mock.patch.object(cm, "_run", side_effect=runner), \
+                mock.patch.object(launcher.Tmux, "has_session", return_value=True), \
+                mock.patch.object(launcher.Tmux, "capture", return_value=TRUST_PANE):
+            rc, out, _ = self.main("verify")
+        self.assertEqual(rc, 1)
+        self.assertIn(f"INFO folder trust: {self.inbox} recorded", out)
+        self.assertIn(f"FAIL session: the pane waits at Claude Code's folder-trust dialog, so no task is answered; run "
+                      f"{cli.COMMAND} attach and answer it", out)
+        for present, pane in ((True, READY_PANE), (False, TRUST_PANE), (None, TRUST_PANE)):
+            with mock.patch.object(launcher.Tmux, "has_session", return_value=present), \
+                    mock.patch.object(launcher.Tmux, "capture", return_value=pane):
+                self.assertIsNone(cli.pane_dialog(records.load_supervisor(str(self.work))))
+        self.assertIsNone(cli.pane_dialog({}))
+        Path(trust.config_file(self.cfg["CLAUDE_CONFIG_DIR"])).write_text("[1]")
+        with mock.patch.object(cm, "_run", side_effect=runner):
+            out = self.main("verify")[1]
+        self.assertIn(f"INFO folder trust: {self.inbox} unreadable (it is not a JSON object)", out)
+
+    def test_install_refuses_a_root_the_launcher_would_refuse_and_applies_nothing(self):
+        (self.work / "logs").mkdir()
+        (self.work / "logs" / "other.log").write_text("x")
+        cli.config_path().unlink()
+        rc, out, err = self.install_with(self.runner())
+        self.assertEqual(rc, 1)
+        self.assertIn(f"error: refusing to start: {self.work} is not a fresh work dir for this adapter (it holds "
+                      f"logs/other.log); this adapter serves only a new, dedicated work dir; nothing was applied", err)
+        self.assertFalse(cli.config_path().exists() or cli.service_path().exists(), "nothing written")
+        self.assertFalse((self.work / "state").exists(), "the check writes nothing either")
+        (self.work / "logs" / "other.log").rename(self.work / "logs" / "gateway-bridge.log")
+        self.assertEqual(self.install_with(self.runner())[0], 0, "the bridge's own log is not foreign")
+
+    def test_an_unconfirmed_start_names_where_the_launchers_refusal_is(self):
+        cli.config_path().unlink()
+        rc, _, err = self.install_with(self.runner(root=False))
+        self.assertEqual(rc, 1)
+        self.assertIn(f"its refusal is in journalctl --user -u {cli.SERVICE_NAME}; run", err)
+        with mock.patch.object(cm, "is_macos", return_value=True):
+            self.assertEqual(cm.launcher_log(cli.LOCAL), str(cm.log_path(cli.LOCAL)))
+
+    def test_uninstall_names_the_token_file_only_when_it_exists(self):
+        self.assertEqual(cm.kept_line(cli.LOCAL), f"kept: {self.relay} (Sparrow's token) and the Claude login")
+        self.relay.unlink()
+        self.assertEqual(cm.kept_line(cli.LOCAL), "kept: the Claude login")
+        cli.config_path().unlink()
+        with mock.patch.object(cm, "_run", side_effect=Runner()):
+            rc, out, _ = self.main("uninstall")
+        self.assertEqual(rc, 0)
+        self.assertIn("nothing to remove", out)
+        self.assertIn("kept: the Claude login", out)
+        self.assertNotIn("relay.env", out)
+
+    def test_occupancy_names_hold_and_its_attached_claude(self):
+        with mock.patch.object(task_io, "occupancy", return_value="held"), \
+                mock.patch.object(task_io, "lock_holder", return_value={"pid": 9, "owner_pid": 7}), \
+                mock.patch.object(task_io, "holder_consumer", return_value={"pid": 9, "live": True}), \
+                mock.patch.object(cm, "manager_detail", return_value="active/running"):
+            self.assertEqual(cli.occupancy_line(str(self.work)), "held by hold pid 7, its claude pid 9 (manager active/running)")
 
 
 def cm_dict(req):

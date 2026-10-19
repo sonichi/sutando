@@ -24,7 +24,7 @@ from pathlib import Path
 from ... import _dirs, connect_common as cm, task_io
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, _v  # noqa: F401
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
-from . import hold, inbox, launcher
+from . import hold, inbox, launcher, trust
 from .shape import AUTOARM_VAR, HITL_ROOT_NAME, LOCAL, SESSION_NAME  # noqa: F401
 
 SHAPE, COMMAND, MIN_CLI = LOCAL.name, LOCAL.command, LOCAL.min_version
@@ -149,7 +149,7 @@ def install(args) -> int:
                 print("rotating the session id: the old generation is proven gone")
         session_id = kept or mint_session_id()
         return dict(values, SESSION_ID=session_id)
-    return cm.install(LOCAL, values, root, revise=revise)
+    return cm.install(LOCAL, values, root, revise=revise, precheck=inbox.root_problem)
 
 
 def child_env(cfg: dict, environ=None) -> dict:
@@ -198,17 +198,39 @@ def auth_problem(cfg: dict, run_=subprocess.run) -> str:
 
 
 def occupancy_line(root: str) -> str:
-    """The shared tri-state beside the manager's state: held names the fencing process (hold until the
-    consumer attaches, claude after), unobserved never reads free."""
+    """The shared tri-state beside the manager's state: held names the lock's holder (hold) and, once
+    attached, the claude whose liveness fences the root; unobserved never reads free."""
     occ = task_io.occupancy(root)
     manager = cm.manager_detail(LOCAL)
     if occ == "held":
         rec, consumer = task_io.lock_holder(root), task_io.holder_consumer(root)
-        who = f"claude pid {consumer['pid']}" if consumer and consumer.get("live") else f"hold pid {rec.get('pid')}"
+        who = f"hold pid {rec.get('owner_pid')}" + (f", its claude pid {consumer['pid']}" if consumer and consumer.get("live")
+                                                   else ", no live claude attached")
         return f"held by {who} (manager {manager})"
     if occ == "unobserved":
         return f"unobserved (the root's holder or consumer cannot be verified; manager {manager})"
     return cm.occupancy_line(LOCAL, root)
+
+
+def trust_line(cfg: dict, root: str) -> str:
+    """Whether the CLI's own folder trust for the inbox is recorded, read as the CLI reads it."""
+    inbox_dir = os.path.join(root, "tasks")
+    try:
+        if trust.trusted(trust.config_file(cfg.get("CLAUDE_CONFIG_DIR", "")), trust.project_key(inbox_dir)):
+            return f"{inbox_dir} recorded"
+    except (OSError, ValueError) as e:
+        return f"{inbox_dir} unreadable ({e})"
+    return f"{inbox_dir} not recorded (the launcher records it before it creates the session)"
+
+
+def pane_dialog(rec: dict) -> "str | None":
+    """The startup dialog the recorded session's pane shows now, from a capture; None when there is none
+    or no pane answers."""
+    gen = rec.get("generation")
+    if not gen:
+        return None
+    tm = launcher.Tmux(launcher.socket_path(config_dir()))
+    return trust.dialog(tm.capture(gen["pane_id"])) if tm.has_session() is True else None
 
 
 def projection_lines(cfg: dict) -> list:
@@ -257,11 +279,15 @@ def verify(_args) -> int:
     cm.check(results, cfg.get("HITL_STORE") == str(hitl_store_root()), "hitl store",
              cfg.get("HITL_STORE") or "none" if cfg.get("HITL_STORE") != str(hitl_store_root())
              else f"{cfg['HITL_STORE']} (the bridge's, beside its default store)")
-    cm.verify_tail(LOCAL, cfg, results)
+    cm.verify_tail(LOCAL, cfg, results, occupancy=occupancy_line)
     root = cm.work_root(cfg)
     print(f"INFO session id: {cfg['SESSION_ID']}")
-    print(f"INFO occupancy: {root} {occupancy_line(root)}")
+    print(f"INFO folder trust: {trust_line(cfg, root)}")
     rec = records.load_supervisor(root)
+    waiting = pane_dialog(rec)
+    if waiting:
+        cm.check(results, False, "session", f"the pane waits at Claude Code's {waiting} dialog, so no task is "
+                 f"answered; run {COMMAND} attach and answer it")
     if rec.get("stall"):
         print(f"INFO {'needs attention' if rec['stall'].get('reason', '').startswith('abnormal') else 'suspected hang'}: "
               f"{rec['stall'].get('reason')} (card {(rec.get('hitl') or {}).get('id') or 'not raised'})")

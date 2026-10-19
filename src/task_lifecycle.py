@@ -87,6 +87,13 @@ FORMAT_TEMP = re.compile(r"\.format\.\d+\.[0-9a-f]{6}\.tmp")
 BLOB_TEMP = re.compile(r"^\.(.+)\.(\d+)\.([0-9a-f]{24})\.(\d+)\.[0-9a-f]{8}\.tmp$")
 # A private temp older than the launcher's inner stop bound belongs to nobody.
 TEMP_SWEEP_AFTER = 120.0
+# The gateway bridge's own entries when its state dir sits directly in the work root: its poller lock
+# files, its default HITL stores and its log (the bridge's names, pinned to it by test).
+BRIDGE_LOCKS = re.compile(r"gateway-bridge(\.[A-Za-z0-9_-]+)?\.lock(\.guard|\.tmp\.\d+)?")
+BRIDGE_HITL = re.compile(r"requirements(-[a-z0-9-]+)?")
+BRIDGE_LOGS = re.compile(r"gateway-bridge\.log(\.1)?")
+# A refusal that names an unreadable work dir, not its layout: retryable.
+UNCHECKED = "refusing to start: cannot check"
 
 
 class StartupRefused(Exception):
@@ -215,12 +222,24 @@ def _is_type(path, want):
     return _stat.S_ISREG(mode) if want == "file" else _stat.S_ISDIR(mode)
 
 
+def bridge_entry(work, rel):
+    """Whether `rel` under the work root is the gateway bridge's by its layout: state/locks holding
+    only its lock files, state/hitl holding only its stores, logs holding only its log."""
+    path = os.path.join(work, rel)
+    kinds = {os.path.join("state", "locks"): (BRIDGE_LOCKS, "file"),
+             os.path.join("state", "hitl"): (BRIDGE_HITL, "dir"), "logs": (BRIDGE_LOGS, "file")}
+    if rel not in kinds or not _is_type(path, "dir"):
+        return False
+    pattern, kind = kinds[rel]
+    return all(pattern.fullmatch(n) and _is_type(os.path.join(path, n), kind) for n in os.listdir(path))
+
+
 def _state_entry_refusal(work):
-    """No marker yet: the work dir may hold the bridge's tasks/ and results/ and an interrupted
-    init's own state/ (an empty ledger, an empty claims/, one marker temp)."""
+    """No marker yet: the work dir may hold the bridge's tasks/ and results/ (and its own entries,
+    bridge_entry) and an interrupted init's own state/ (an empty ledger, an empty claims/, one marker temp)."""
     format_temps = 0
     for name in sorted(os.listdir(work)):
-        if name in ("tasks", "results") and _is_type(os.path.join(work, name), "dir"):
+        if name in ("tasks", "results") and _is_type(os.path.join(work, name), "dir") or bridge_entry(work, name):
             continue
         if name != "state" or not _is_type(os.path.join(work, name), "dir"):
             path = os.path.join(work, name)
@@ -230,6 +249,8 @@ def _state_entry_refusal(work):
             if inner == "settled-ids" and _is_type(path, "file") and not os.lstat(path).st_size:
                 continue
             if inner == "claims" and _is_type(path, "dir") and not os.listdir(path):
+                continue
+            if bridge_entry(work, os.path.join("state", inner)):
                 continue
             if FORMAT_TEMP.fullmatch(inner) and _is_type(path, "file") and format_temps == 0:
                 format_temps += 1
@@ -273,17 +294,21 @@ def _first_init(work):
     _init_step("done")
 
 
-def prepare_work_dir(work):
-    """None when `work` may be served (after completing a first init); else the refusal line."""
+def prepare_work_dir(work, check_only=False):
+    """None when `work` may be served (after completing a first init); else the refusal line.
+    `check_only` decides the same without writing anything (no first init, no temp sweep)."""
     state = os.path.join(work, "state")
     marker = os.path.join(state, "format")
     try:
         if not os.path.lexists(marker):
+            if check_only and not os.path.lexists(work):
+                return None
             entry = _state_entry_refusal(work)
             if entry:
                 return ("refusing to start: %s is not a fresh work dir for this adapter (it holds %s); "
                         "this adapter serves only a new, dedicated work dir" % (work, entry))
-            _first_init(work)
+            if not check_only:
+                _first_init(work)
             return None
         with open(marker, encoding="utf-8") as f:
             found = f.read().strip()
@@ -304,11 +329,14 @@ def prepare_work_dir(work):
                 continue
             if name.startswith(".") and name.endswith(".tmp") and any(name[1:].startswith(a + ".")
                                                                       for a in STATE_ALLOWED - {"format"}):
-                os.unlink(os.path.join(state, name))
+                if not check_only:
+                    os.unlink(os.path.join(state, name))
+                continue
+            if bridge_entry(work, os.path.join("state", name)):
                 continue
             return "refusing to start: state/%s is not this adapter's state (in %s)" % (name, work)
     except OSError as e:
-        return "refusing to start: cannot check %s: %s" % (work, e)
+        return "%s %s: %s" % (UNCHECKED, work, e)
     return None
 
 

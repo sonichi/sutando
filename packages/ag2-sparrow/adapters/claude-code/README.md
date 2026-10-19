@@ -26,9 +26,15 @@ CLI, which runs `task_lifecycle` under `state/claims.lock` and the progress
 record under `state/progress.lock`. A task is submitted only when the
 classifier reads it ABSENT (`claim`), and only with the one-use authorization
 `authorize` returns (one `PREPARED -> CALLING` per attempt: a claim already
-`CALLING` never authorizes a second submit). `turn.start` confirms the turn
-whose text hash matches the authorization (`TURN_CONFIRMED`, the turn id
-recorded); an unrelated manual turn changes nothing. The reply stages the body
+`CALLING` never authorizes a second submit). The submitted text ends with a
+one-use `[submission <16 hex>]` marker, and its hash is the authorization's.
+Claude Code frames a plugin's prompt in the turn's text ("The ag2space-inbox
+plugin sent a message:", the text, then its own note), so `turn.start` confirms
+the turn whose text carries the submitted text exactly once, the hash checked
+on that exact text (`TURN_CONFIRMED`, the turn id recorded); an unrelated
+manual turn, an altered text or a second turn with the same text changes
+nothing. The text tells the session to answer only through `ag2space_reply`,
+never by writing `results/` itself. The reply stages the body
 for that turn and publishes it (`RESULT_STAGED -> SETTLED`); in-flight is
 released only at `SETTLED`. A completed or aborted turn with nothing staged is
 the explicit protocol failure (`inbox park`), published once and never
@@ -192,6 +198,27 @@ stays the pane's. The session runs `claude --plugin-dir â€¦ --permission-mode â€
 `install --new-session` rotates it only once the old generation is proven
 gone (quiescent; otherwise the old id stays and the command says so).
 
+**Folder trust and startup dialogs.** Before it creates a session the launcher
+records Claude Code's own trust for exactly `<work>/tasks` (never a parent):
+`projects[<resolved path>].hasTrustDialogAccepted: true` in the CLI's global
+config (`.claude.json` in `CLAUDE_CONFIG_DIR`, or in `HOME`; a non-empty legacy
+`.config.json` wins), under the CLI's own lock directory (`<file>.lock`, waited
+for, never broken), the rest of the file unchanged and nothing written when it
+is already there. When it cannot, nothing is created and the line says why. A
+pane still showing a startup dialog (the folder-trust or the bypass-permissions
+one) is logged by the launcher, raises the needs-attention card after 60 s,
+and fails `verify`'s `session` row; `attach` and answer it.
+
+**The work root.** The root is this adapter's alone, beside the bridge's
+`tasks/` and `results/`: a root without the format marker must be fresh, and a
+marked root's `state/` holds only this adapter's records. When the bridge's
+state dir sits directly in the root, its own entries are accepted, by name:
+`state/locks/` (its poller lock files), `state/hitl/` (its HITL stores) and
+`logs/` (its log); anything else is refused. `install` checks the root first
+(nothing is written on a refusal), and the launcher treats a layout refusal as
+terminal (75: the manager stops, the owner fixes the root and installs again);
+an unreadable root is retried (74).
+
 **The generation and its classifier.** The supervisor record
 (`state/claude-local-supervisor.json`, written only by the launcher under
 `<config dir>/claude-local.supervisor.lock`) holds the generation {server
@@ -207,8 +234,8 @@ server proven gone, and a clear pane-key guard; anything else (a server this
 launcher did not create and record, a tuple that does not match, tmux not
 answering) is **unknown**: the launcher stays alive as the waiter, silent for
 90 s, then raises the card. Only foreign terminal contention (another
-adapter's live holder, or a claude-local holder of another install) is the
-logical 75. 74 is the retryable exit. The managed start never takes the
+adapter's live holder, or a claude-local holder of another install) and a root
+whose layout it may never serve are the logical 75. 74 is the retryable exit. The managed start never takes the
 install operation lock.
 
 **Stop.** `/exit` and `kill-session` each run as one tmux server command
@@ -270,9 +297,10 @@ every start.
 its length, plugin, inbox, results, hmac key, the HITL store being the
 bridge's, relay token, supervisor) and INFO lines: the HMAC mode (strict or
 not), whether non-owner tasks are refused or submitted, the manager's state, the
-occupancy beside it (`held by claude pid N`, `held by hold pid N`,
-`restarting`, `unobserved`, never a bare `free` under a live job), the
-session id, a suspected hang or needs-attention line with its card, a card
+occupancy beside it (`held by hold pid N, its claude pid M`, `held by hold
+pid N, no live claude attached`, `restarting`, `unobserved`, never a bare
+`free` under a live job), the session id, whether the inbox's folder trust is
+recorded, a suspected hang or needs-attention line with its card, a card
 pending projection (`no primary gateway`, or `gateway predates
 claude-local`), an uncertain pane-key guard, and on Linux that systemd
 ordering is asserted and not witnessed.
@@ -293,7 +321,7 @@ mtime delta.
 - `claude plugin validate ag2space-inbox`, `claude plugin test
   ag2space-inbox` (engine harness: envelope, the claim's admission framing the
   submission and a refused claim never submitted, once-only claims, one
-  authorization per attempt, turn confirmation by hash, park on a turn without
+  authorization per attempt, turn confirmation inside the CLI's frame, park on a turn without
   a reply, the inode refusal, the session-id witness, intake closing on a hard
   progress failure).
 - `python3 packages/ag2-sparrow/tests/test_claude_code_adapter.py` (stdlib:

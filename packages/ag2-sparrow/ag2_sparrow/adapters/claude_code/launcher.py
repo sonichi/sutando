@@ -6,8 +6,9 @@ Every start classifies the recorded generation: adopt when the pane's claude ver
 start and the plugin witness carries the configured session id; create only over a free root with
 no verified orphan, a clear pane-key guard and a dead or absent recorded generation; unknown is the
 live waiter (the 90 s deadline and the card id persist in the supervisor record across restarts);
-only foreign terminal contention is the logical 75. The stop path is `/exit` through the in-command
-fence, a bounded grace, `kill-session` through the same fence, then the server's own exit. Stdlib.
+only foreign terminal contention and a root whose layout it may never serve are the logical 75.
+The stop path is `/exit` through the in-command fence, a bounded grace, `kill-session` through the
+same fence, then the server's own exit. Stdlib.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from pathlib import Path
 
 from ... import connect_common as cm, task_io, tmux_pane_keys, tmux_probe
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
-from . import detector, hold, inbox
+from . import detector, hold, inbox, trust
 from .shape import (AUTOARM_VAR, HITL_ID_PREFIX, LAUNCHER_LOCK, LOCAL, MIN_TMUX, SESSION_NAME, SOCKET_NAME,
                     SOCKET_PATH_MAX, SUPERVISOR_LOCK)
 
@@ -235,6 +236,7 @@ class Launcher:
         self.observation: dict = {}
         self.created: "str | None" = None
         self.adopted = False
+        self.refused = ""
         self.store_root = Path(cfg["HITL_STORE"]) if cfg.get("HITL_STORE") else None
         self.supervisor_lock = self.config_dir / SUPERVISOR_LOCK
         self.opaque = card.opaque_install(task_io.install_id(), self.root)
@@ -275,6 +277,11 @@ class Launcher:
             return False, "the recorded server is not proven gone"
         problem = inbox.prepare_root(self.root)     # the format marker first: the record lives in state/
         if problem:
+            self.refused = "" if inbox.retryable(problem) else problem
+            return False, problem
+        problem = trust.record(self.cfg.get("CLAUDE_CONFIG_DIR", ""), os.path.join(self.root, "tasks"),
+                               home=(os.environ if self.environ is None else self.environ).get("HOME", ""))
+        if problem:
             return False, problem
         rec = self.retire_card()
         nonce = os.urandom(16).hex()
@@ -300,6 +307,10 @@ class Launcher:
         text = self.tm.capture(gen["pane_id"]) if gen else None
         if text is None:
             return rec
+        waiting = trust.dialog(text)
+        if waiting != self.observation.get("dialog", None):
+            self.log("the session waits at Claude Code's %s dialog; answer it in the pane (%s)" % (waiting, self.attach_command())
+                     if waiting else "the session is past its startup dialog")
         plugin = records.load_plugin(self.root)
         self.observation = detector.derive(self.observation, text, plugin, self.clock())
         stall = self.observation["stall"]
@@ -487,6 +498,10 @@ class Launcher:
             ok, problem = self.create(rec)
             if not ok:
                 self.log("cannot create a session: %s" % problem)
+                if self.refused:
+                    # A layout refusal holds until the owner fixes the root: terminal, so the manager stops.
+                    self.log("stopping: the work root needs attention, then run %s install again" % LOCAL.command)
+                    return cm.EXIT_HELD, rec
                 return EXIT_RETRY, rec
             rec = self._with_record(lambda r: dict(r, deadline=None))
             return None, rec

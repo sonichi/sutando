@@ -2830,6 +2830,69 @@ class CloudStepRefusalTest(SpyMixin, unittest.TestCase):
             self.assertEqual((Path(d) / "bin" / "claude.calls").exists(), False, "no provider call")
 
 
+class BridgeEntryTest(Base):
+    """The gateway bridge's own entries in a work root its state dir sits in, run against both copies."""
+
+    def bridge_writes(self, work):
+        """What the gateway bridge writes when its state dir sits directly in the work root, through its
+        own writers: the poller lock (workspace_lock), the default HITL store, and its log."""
+        from ag2_sparrow import workspace_lock
+        from ag2_sparrow.hitl.manager import HitlStore, default_store
+        src = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
+        for pin in ('_LOG_DIR = _STATE.parent / "logs"', '_LOG_FILE = _LOG_DIR / "gateway-bridge.log"',
+                    '_LOCK_ROLE = f"gateway-bridge{_INST_SUFFIX}"', "_LOCK_WS = _STATE.parent",
+                    "manager = HitlManager(HitlStore(default_store(workspace)))", '_LOG_FILE.with_suffix(".log.1")'):
+            self.assertIn(pin, src, "the bridge's layout moved: update task_lifecycle's BRIDGE_* names")
+        self.assertEqual(workspace_lock.acquire("gateway-bridge", Path(work)).status, "acquired")
+        workspace_lock.acquire("gateway-bridge.second", Path(work))
+        HitlStore(default_store(Path(work)))
+        (Path(work) / "logs").mkdir(exist_ok=True)
+        for name in ("gateway-bridge.log", "gateway-bridge.log.1"):
+            (Path(work) / "logs" / name).write_text("[remote-gateway-bridge] line\n")
+
+    def test_a_root_the_bridge_used_still_allows_a_new_session(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)), "the adapter initialises the root")
+        self.bridge_writes(self.work)
+        self.assertTrue((self.work / "state" / "locks" / "gateway-bridge.lock.guard").is_file())
+        self.assertTrue((self.work / "state" / "hitl" / "requirements").is_dir())
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)), "the old session gone, a new one may start")
+        with tempfile.TemporaryDirectory() as d:
+            self.bridge_writes(d)
+            self.assertIsNone(self.lc.prepare_work_dir(d, check_only=True))
+            self.assertFalse(os.path.exists(os.path.join(d, "state", "format")), "check_only writes nothing")
+            self.assertIsNone(self.lc.prepare_work_dir(d), "the bridge ran first: still a fresh root")
+        foreign = {"a foreign lock": ("state/locks/other.lock", "file"), "a foreign store": ("state/hitl/notes", "dir"),
+                   "a foreign log": ("logs/other.log", "file"), "a link for the lock": ("state/locks/gateway-bridge.lock", "link")}
+        for what, (rel, kind) in foreign.items():
+            for marked in (True, False) if not rel.startswith("logs/") else (False,):
+                with self.subTest(what=what, marked=marked), tempfile.TemporaryDirectory() as d:
+                    if marked:
+                        self.assertIsNone(self.lc.prepare_work_dir(d))
+                    path = Path(d) / rel
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    {"file": lambda: path.write_text("x"), "dir": path.mkdir,
+                     "link": lambda: os.symlink(Path(d) / "elsewhere", path)}[kind]()
+                    line = self.lc.prepare_work_dir(d)
+                    self.assertIsNotNone(line, rel)
+                    self.assertIn(rel.split("/")[0], line)
+
+    def test_check_only_leaves_a_stale_record_temp_that_a_start_sweeps(self):
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        temp = self.work / "state" / ".settled-ids.1.abcdef.tmp"
+        temp.write_text("x")
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work), check_only=True))
+        self.assertTrue(temp.exists(), "a check writes nothing")
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work)))
+        self.assertFalse(temp.exists())
+
+    def test_a_layout_refusal_and_an_unreadable_root_read_differently(self):
+        (self.work / "stray").write_text("x")
+        self.assertFalse(self.lc.prepare_work_dir(str(self.work)).startswith(self.lc.UNCHECKED))
+        with mock.patch.object(self.lc.os, "listdir", side_effect=PermissionError(13, "denied")):
+            self.assertTrue(self.lc.prepare_work_dir(str(self.work)).startswith(self.lc.UNCHECKED))
+        self.assertIsNone(self.lc.prepare_work_dir(str(self.work / "absent"), check_only=True), "install creates it")
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     copies = [("vendored", vendored)]
@@ -2838,7 +2901,7 @@ def load_tests(loader, tests, pattern):
         copies.append(("src", src))
     for label, mod in copies:
         for case in (LockTest, FreshDirTest, ProbeTest, ProbeBothDirsTest, ClassifyTest, PublicationTest,
-                     JournalTest, SettledIdsTest, DecisionTest, ErrorBranchTest, LocalClaimTest):
+                     JournalTest, SettledIdsTest, DecisionTest, ErrorBranchTest, LocalClaimTest, BridgeEntryTest):
             if label == "src" and case in (LockTest, FreshDirTest, ProbeBothDirsTest):
                 continue
             bound = GATE(type("%s_%s" % (case.__name__, label), (case,), {"lc": mod}))

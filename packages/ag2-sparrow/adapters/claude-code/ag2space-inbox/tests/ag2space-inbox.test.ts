@@ -7,13 +7,18 @@ const TASK = (id: string, tier = 'owner', extra = '') =>
   `id: ${id}\nenvelope_hmac: v1:00\ntimestamp: 2026-10-16T00:00:00Z\nsource: ag2space\n` +
   `channel_id: !room:ag2.space\nuser_id: @u:ag2.space\n${extra}access_tier: ${tier}\ntask: ping\n`
 
+// Claude Code 2.1.303 frames a plugin's prompt this way in turn.start's text (its tOt), measured live
+// with a probe Mod that logged e.text; the frame itself is the CLI's, never the Mod's.
+const FRAMED = (msg: string) => `The ag2space-inbox plugin sent a message:\n${msg}\n\nThis is how Claude Code surfaces ` +
+  "a prompt a plugin submits between turns \u2014 it starts this turn in the user's place. Address the message above."
+
 type Claim = { attempt: number; phase: string; token?: string; hash?: string; turnId?: string; body?: string }
 
 // An in-memory host: fs, process (the verifier's "<verdict> <tier> <collab>" line, the text hash, and
 // the inbox CLI's verbs over an in-memory claim store), clock, env, prompt sink, session id. Tier and
 // collaborator come from a plain read of the stdin text; the real rule is pinned to Sparrow's by
 // tests/test_claude_code_adapter.py, and the lifecycle verbs by the Python inbox tests.
-function host(on: any, opts: { verdict?: string; env?: Record<string, string>; rejectSubmits?: number; verifierFails?: boolean;
+function host(on: any, opts: { verdict?: string; env?: Record<string, string>; rejectSubmits?: number; verifierFails?: boolean; markerFails?: number;
                                progressFails?: number; sessionIds?: string[]; cwdInode?: string; allowNonOwner?: boolean;
                                claimAs?: Record<string, unknown> } = {}) {
   const files: Record<string, string> = {}
@@ -27,6 +32,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
   let rejectLeft = opts.rejectSubmits ?? 0
   let progressFailLeft = opts.progressFails ?? 0
   let failVerb = ''
+  let marks = 0
+  let markerFailLeft = opts.markerFails ?? 0
   on('session.start', () => ({ cwd: '/w' }))
   on('session.id', () => ({ value: sessionIds[Math.min(sidCalls++, sessionIds.length - 1)] }))
   on('session.cwd', () => ({ value: '/w/tasks' }))
@@ -57,6 +64,10 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       const tier = (text.match(/^access_tier: (\S+)/m)?.[1] ?? 'owner')
       const collab = text.includes('\ncollaborator: true\n') ? 'true' : 'false'
       return { value: { exitCode: 0, stdout: `${opts.verdict ?? 'verified'} ${tier} ${collab}\n`, stderr: '' } }
+    }
+    if (argv[0] === 'python3' && argv[2].includes('secrets')) {
+      if (markerFailLeft-- > 0) return { value: { exitCode: 1, stdout: '', stderr: 'python3: not found' } }
+      return { value: { exitCode: 0, stdout: (++marks).toString(16).padStart(16, '0') + '\n', stderr: '' } }
     }
     if (argv[0] === 'python3' && argv[2].includes('sha256')) return { value: { exitCode: 0, stdout: hash(e.init.stdin) + '\n', stderr: '' } }
     if (argv[0] !== 'ag2-sparrow-claude-local' || argv[1] !== 'inbox') return { value: { exitCode: 2, stdout: '', stderr: 'unknown' } }
@@ -151,8 +162,9 @@ test('each new task-*.txt is claimed, authorized and submitted once, wrapped in 
   expect(verbs(h)).toEqual(['progress', 'claim', 'authorize'])
   await h.clock.advance(3000)
   expect(h.submitted.length).toBe(1)
-  // The turn starts: confirmed with the turn id, then the reply stages and publishes through the CLI.
-  await $.turn.start({ text: msg, turnId: 'turn-1' })
+  expect(msg.endsWith(`Reply only with the ag2space_reply tool (task_id task-a1); it publishes results/task-a1.txt for you, so do not write that file yourself. [submission ${'0'.repeat(15)}1]`)).toBe(true)
+  // The turn starts, framed by the CLI: confirmed with the turn id, then the reply stages and publishes through the CLI.
+  await $.turn.start({ text: FRAMED(msg), turnId: 'turn-1' })
   expect(h.claims['task-a1'].phase).toBe('TURN_CONFIRMED')
   const r = await $.tool.call({ tool: REPLY, task_id: 'task-a1', text: 'four' })
   expect(String(r.text ?? r.result)).toContain('Published /out/task-a1.txt')
@@ -486,4 +498,48 @@ test('a progress write that fails at claim, authorize, confirm, stage or publish
   expect(h.submitted.length).toBe(2)
   await h.clock.advance(3000)
   expect(h.submitted.length).toBe(2)                 // the spent authorization is never resubmitted
+})
+
+test('the CLI\'s frame around the submitted text confirms the turn; a manual turn, an altered text or a repeat does not', async ($, on) => {
+  const h = host(on)
+  h.files['/in/task-f1.txt'] = TASK('task-f1')
+  await arm($, h)
+  await h.clock.advance(1000)
+  const msg = h.submitted[0]
+  await $.turn.start({ text: 'the owner typed: what is in the inbox?', turnId: 't-manual' })
+  expect(h.claims['task-f1'].phase).toBe('CALLING')
+  // The task text embedded with one byte changed, inside the same frame: never this submission.
+  await $.turn.start({ text: FRAMED(msg.replace('task: ping', 'task: pong')), turnId: 't-altered' })
+  expect(h.claims['task-f1'].phase).toBe('CALLING')
+  // The text twice in one turn is not the one submission the CLI frames.
+  await $.turn.start({ text: FRAMED(msg + '\n' + msg), turnId: 't-twice' })
+  expect(h.claims['task-f1'].phase).toBe('CALLING')
+  // A prefix-only or suffix-only frame carries the exact text once: confirmed, with the bound hash.
+  await $.turn.start({ text: 'Note from a plugin:\n' + msg, turnId: 't-f1' })
+  expect(h.claims['task-f1']).toEqual(expect.objectContaining({ phase: 'TURN_CONFIRMED', turnId: 't-f1' }))
+  const confirm = h.runs.find(a => a[1] === 'inbox' && a[2] === 'confirm')!
+  expect(confirm.slice(3)).toEqual(['task-f1', 't-f1', 'tok-task-f1', '--text-hash', h.hash(msg)])
+  // The same framed text again, as a duplicate turn, confirms nothing more.
+  await $.turn.start({ text: FRAMED(msg), turnId: 't-dup' })
+  expect(verbs(h).filter(v => v === 'confirm').length).toBe(1)
+  expect(h.claims['task-f1'].turnId).toBe('t-f1')
+  const r = await $.tool.call({ tool: REPLY, task_id: 'task-f1', text: 'pong' })
+  expect(String(r.text ?? r.result)).toContain('Published /out/task-f1.txt')
+  h.files['/in/task-f2.txt'] = TASK('task-f2')
+  await h.clock.advance(1000)
+  await $.turn.start({ text: msg + '\n\nThis is how Claude Code surfaces a prompt', turnId: 't-old' })
+  expect(h.claims['task-f2'].phase).toBe('CALLING')   // the earlier submission's text is not this one's: a fresh marker
+  await $.turn.start({ text: FRAMED(h.submitted[1]), turnId: 't-f2' })
+  expect(h.claims['task-f2'].phase).toBe('TURN_CONFIRMED')
+})
+
+test('without a submission marker nothing is authorized or submitted, and the task is retried', async ($, on) => {
+  const h = host(on, { markerFails: 1 })
+  h.files['/in/task-k1.txt'] = TASK('task-k1')
+  await arm($, h)
+  expect(h.submitted.length).toBe(0)
+  expect(verbs(h).filter(v => v === 'authorize').length).toBe(0)
+  await h.clock.advance(1000)
+  expect(h.submitted.length).toBe(1)
+  expect(h.submitted[0]).toContain('[submission ')
 })

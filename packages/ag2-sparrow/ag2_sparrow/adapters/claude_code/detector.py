@@ -4,7 +4,7 @@ pane's capture and the Mod's progress record, never from the process.
 Two cases: (a) the raw pane static for STALL_MIN_S while the plugin record shows an offer in flight
 (CALLING or TURN_CONFIRMED with no result), which is this adapter's rule, not cli_wedge's; (b)
 abnormal text on the pane, read line-anchored through the shared banner grammar
-(cli_wedge_patterns). The verdict is data the launcher writes into the supervisor record; nothing
+(cli_wedge_patterns), or a Claude Code startup dialog the pane waits at (trust.dialog). The verdict is data the launcher writes into the supervisor record; nothing
 here acts.
 """
 from __future__ import annotations
@@ -13,6 +13,7 @@ import hashlib
 import re
 
 from ...cli_wedge_patterns import ABNORMAL_PATTERNS
+from . import trust
 
 STALL_MIN_S = 600.0
 ABNORMAL_MIN_S = 60.0
@@ -27,7 +28,9 @@ def frame_hash(text: str) -> str:
 def abnormal_names(text: str) -> list:
     """The banner families whose pattern leads a line of the capture (prose mid-line never counts)."""
     lines = [_DECOR.sub("", ln) for ln in text.splitlines()]
-    return [name for name, rx in ABNORMAL_PATTERNS if any(rx.match(ln) for ln in lines)]
+    waiting = trust.dialog(text)
+    return [name for name, rx in ABNORMAL_PATTERNS if any(rx.match(ln) for ln in lines)] + (
+        ["dialog:" + waiting] if waiting else [])
 
 
 def inflight_task(plugin: dict) -> "str | None":
@@ -52,7 +55,7 @@ def derive(previous: dict, text: str, plugin: dict, now: float, stall_min_s: flo
     abnormal_since = (previous["abnormal_since"] if names and previous.get("abnormal") == names
                       and previous.get("abnormal_since") is not None else (now if names else None))
     out = {"frame_hash": h, "static_since": static_since, "task": task, "abnormal": names,
-           "abnormal_since": abnormal_since, "stall": None}
+           "abnormal_since": abnormal_since, "stall": None, "dialog": trust.dialog(text)}
     lines = text.splitlines()[-20:]
     kept = previous.get("stall")
     if kept and kept.get("frame_hash") == h and kept.get("task") == task and kept.get("since") in (static_since, abnormal_since):

@@ -161,6 +161,7 @@ def lock_holder(work):
     if not record:
         return {}
     return {"adapter": record.get("adapter"), "pid": record.get("pid"), "start": record.get("start"),
+            "owner_pid": record.get("owner_pid", record.get("pid")),
             "install_id": record.get("install_id"), "live": bool(state.get("holder_lineage"))}
 
 

@@ -638,17 +638,23 @@ def _fresh_holder(shape: Shape, root: str, before: dict) -> "dict | None":
 
 # ── install ──────────────────────────────────────────────────────────────────
 
-def install(shape: Shape, values: dict, root: str, revise=None) -> int:
+def install(shape: Shape, values: dict, root: str, revise=None, precheck=None) -> int:
     """`revise(old_config, values) -> values` runs once the job is stopped and the root proven free,
-    so a value that may only change over a quiescent root (a session id) is decided there."""
+    so a value that may only change over a quiescent root (a session id) is decided there.
+    `precheck(root) -> problem` is the launcher's own refusal of the root, asked before anything moves."""
     try:
         with operation_lock(shape):
-            return _install_locked(shape, values, root, revise)
+            return _install_locked(shape, values, root, revise, precheck)
     except Busy as e:
         return _refuse(str(e))
 
 
-def _install_locked(shape: Shape, values: dict, root: str, revise=None) -> int:
+def launcher_log(shape: Shape) -> str:
+    """Where the launcher's own lines go: the plist's log file, or the unit's journal."""
+    return str(log_path(shape)) if is_macos() else f"journalctl --user -u {shape.service_name}"
+
+
+def _install_locked(shape: Shape, values: dict, root: str, revise=None, precheck=None) -> int:
     """A quiescent replacement: both files owned, the same root as before, no orphan on it, the job
     stopped and absent, the root free; only then the files, the start, and the fresh holder."""
     conf, sup, marker = config_path(shape), supervisor_path(shape), supervisor_marker(shape)
@@ -662,6 +668,9 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None) -> int:
     if old.get("ROOT") and old["ROOT"] != root:
         return _refuse(f"the work root is {old['ROOT']}, not {root}; run {shape.command} uninstall, then "
                        f"{shape.command} install")
+    problem = precheck(root) if precheck is not None else ""
+    if problem:
+        return _refuse(f"{problem}; nothing was applied")
     unit, problem = render_supervisor(shape)
     if problem:
         return _refuse(problem)
@@ -697,7 +706,7 @@ def _install_locked(shape: Shape, values: dict, root: str, revise=None) -> int:
     rec = _fresh_holder(shape, root, before)
     if rec is None:
         return _refuse(f"the managed launcher did not acquire {root} within {CONFIRM_TIMEOUT_S:.0f} s ({holder_line(root)}); "
-                       f"run {shape.command} uninstall, then {shape.command} install")
+                       f"its refusal is in {launcher_log(shape)}; run {shape.command} uninstall, then {shape.command} install")
     linger(shape)
     print(f"the managed launcher acquired the expected root: {root} (launcher pid {rec['pid']})")
     return 0
@@ -788,9 +797,9 @@ def check(results: list, ok: bool, name: str, detail: str) -> None:
     print(f"{'PASS' if ok else 'FAIL'} {name}: {detail}")
 
 
-def verify_tail(shape: Shape, cfg: dict, results: list) -> None:
+def verify_tail(shape: Shape, cfg: dict, results: list, occupancy=None) -> None:
     """The rows every shape ends with: the relay token's mode (never its content), the marked unit, the
-    manager's word, and who holds the work root."""
+    manager's word, and who holds the work root (`occupancy(root)`: a shape's own wording of it)."""
     relay = _dirs.device_env_path()
     try:
         mode = stat.S_IMODE(relay.stat().st_mode)
@@ -802,7 +811,8 @@ def verify_tail(shape: Shape, cfg: dict, results: list) -> None:
     check(results, text is not None and marked(text, supervisor_marker(shape)), "supervisor",
           problem or (f"{sup} missing; run {shape.command} install" if text is None else str(sup)))
     print(f"INFO job: {job_name(shape)} {manager_state(shape)}")
-    print(f"INFO session: {work_root(cfg)} {occupancy_line(shape, work_root(cfg))}")
+    root = work_root(cfg)
+    print(f"INFO session: {root} {occupancy(root) if occupancy is not None else occupancy_line(shape, root)}")
     if not is_macos():
         print(f"INFO systemd ordering is asserted from KillMode={shape.kill_mode} and not witnessed")
     elif shape.kill_mode == "control-group":
@@ -811,6 +821,12 @@ def verify_tail(shape: Shape, cfg: dict, results: list) -> None:
     else:
         print(f"INFO launchd respawns the launcher after {THROTTLE_S} s; the session in its tmux pane is not in "
               "the launcher's process group and survives a launcher death until the next launcher adopts it")
+
+
+def kept_line(shape: Shape) -> str:
+    """What uninstall leaves in place, naming Sparrow's token file only when it exists."""
+    relay = _dirs.device_env_path()
+    return f"kept: {relay} (Sparrow's token) and {shape.kept}" if relay.exists() else f"kept: {shape.kept}"
 
 
 def uninstall(shape: Shape, before_free=None) -> int:
@@ -840,7 +856,7 @@ def _uninstall_locked(shape: Shape, before_free=None) -> int:
         return _refuse(f"{job_name(shape)}'s state is unknown; nothing was removed", recovery_lines(shape, root) if root else ())
     if unit is None and cfg is None and manager == "absent":
         print(f"nothing to remove: {shape.name} is not installed")
-        print(f"kept: {_dirs.device_env_path()} (Sparrow's token) and {shape.kept}")
+        print(kept_line(shape))
         return 0
     kept = (f"{sup} and {conf} were" if unit is not None and cfg else f"{conf} was" if cfg else
             f"{sup} was" if unit is not None else "nothing was") + " kept so a rerun knows the work root"
@@ -871,5 +887,5 @@ def _uninstall_locked(shape: Shape, before_free=None) -> int:
     if cfg is not None:
         conf.unlink()
         print(f"removed: {conf}")
-    print(f"kept: {_dirs.device_env_path()} (Sparrow's token) and {shape.kept}")
+    print(kept_line(shape))
     return 0
