@@ -485,6 +485,74 @@ class OneTaskFailsInABatchTest(unittest.TestCase):
         self.assertEqual(self.acked, [(t["id"], t["lease_id"]) for t in tasks])
         self.assertEqual(len(loop.polls), 1, "all eight acked before the next poll")
 
+    def _consumed(self, hitl, review=False):
+        queued: list = []
+        typed = {"id": "task-f6", "task": "hi", "lease_id": "lease-f6"}
+        click = {"id": "task-k5", "task": "Approve", "lease_id": "lease-k5"}
+        with patch.object(self.gw, "_handle_hitl_action",
+                          side_effect=lambda t: hitl if t is click else False), \
+                patch.object(self.gw, "_handle_review_decision",
+                             side_effect=lambda t: review and t is click), \
+                patch.object(self.gw, "_queue_review_control_result",
+                             side_effect=lambda t, body=None: queued.append((t["id"], body))), \
+                patch.object(self.gw, "_retry_review_control_results", new=lambda: None):
+            loop = self._run([click, typed], lambda task, *a, **k: (task["id"], True))
+        return loop, queued
+
+    def test_a_card_click_is_consumed_with_a_no_send_result_and_its_batch_mate_acked(self):
+        loop, queued = self._consumed("applied")
+        self.assertEqual(queued, [("task-k5", "[no-send]")])
+        self.assertEqual(self.acked, [("task-f6", "lease-f6")], "a consumed click is not queued")
+        self.assertIn("hitl: consumed card click task-k5 from the task relay (applied)", loop.logs)
+
+    def test_a_rejected_click_is_answered_with_the_reason_and_its_batch_mate_acked(self):
+        loop, queued = self._consumed("rejected:card moved")
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0][0], "task-k5")
+        self.assertIn("did not apply: the card had already moved (card moved)", queued[0][1])
+        self.assertEqual(self.acked, [("task-f6", "lease-f6")])
+
+    def test_a_review_decision_is_consumed_and_its_batch_mate_acked(self):
+        loop, queued = self._consumed(False, review=True)
+        self.assertEqual(queued, [("task-k5", None)])
+        self.assertEqual(self.acked, [("task-f6", "lease-f6")])
+        self.assertIn("consumed private review decision task-k5", loop.logs)
+
+    def test_only_a_task_new_to_the_in_flight_set_wakes_the_outbound_worker(self):
+        woken: list = []
+        for preloaded, want in ((set(), ["woken"]), ({"task-g7"}, [])):
+            woken.clear()
+            with _Loop(self.gw) as loop, \
+                    patch.object(self.gw, "_record_pending_acks", return_value=True), \
+                    patch.object(self.gw, "wake_outbound", new=lambda: woken.append("woken")):
+                self.gw._load_inflight = lambda *a, **k: set(preloaded)
+                loop.served = [[{"id": "task-g7", "task": "hi", "lease_id": "lease-g7"}]]
+                self.gw._write_task = lambda task, *a, **k: (task["id"], True)
+                loop.run()
+            self.assertEqual(woken, want, preloaded)
+
+    def test_an_auth_rejection_while_taking_a_task_still_reaches_auth_recovery(self):
+        import urllib.error
+        recovered: list = []
+        relay = {"id": "ask-5f3c9e0a1b2c", "task": "calendar?", "ack_first": True}
+        err = urllib.error.HTTPError("http://relay.invalid", 401, "Unauthorized", {}, None)
+        with patch.object(self.gw, "_take_ack_first", side_effect=err), \
+                patch.object(self.gw, "_recover_auth",
+                             side_effect=lambda code: recovered.append(code) or True):
+            loop = self._run([relay], lambda task, *a, **k: (task["id"], True))
+        self.assertEqual(recovered, [401])
+        self.assertFalse(any("not taken" in m for m in loop.logs))
+
+    def test_a_non_auth_http_error_costs_only_its_task(self):
+        import urllib.error
+        relay = {"id": "ask-5f3c9e0a1b2c", "task": "calendar?", "ack_first": True}
+        typed = {"id": "task-h8", "task": "hi", "lease_id": "lease-h8"}
+        err = urllib.error.HTTPError("http://relay.invalid", 500, "boom", {}, None)
+        with patch.object(self.gw, "_take_ack_first", side_effect=err):
+            loop = self._run([relay, typed], lambda task, *a, **k: (task["id"], True))
+        self.assertEqual(self.acked, [("task-h8", "lease-h8")])
+        self.assertTrue(any(relay["id"] in m and "HTTPError" in m for m in loop.logs))
+
     def test_an_ack_first_task_that_raises_does_not_stop_the_batch(self):
         relay = {"id": "ask-5f3c9e0a1b2c", "task": "calendar?", "ack_first": True}
         typed = {"id": "task-d4", "task": "hi", "lease_id": "lease-d4"}

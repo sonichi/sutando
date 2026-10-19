@@ -5031,6 +5031,12 @@ def _isolated(task: dict, take, *args) -> bool:
     the broker to re-serve, and the rest of its batch is still taken and acked."""
     try:
         return bool(take(*args))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise                     # the loop's auth recovery owns a rejected bearer
+        _log(f"task {_one_line(task.get('id'))[:128]} not taken (HTTPError: {e}) "
+             "— not acked; the broker re-serves it")
+        return False
     except Exception as e:  # noqa: BLE001 — one task must not withhold its batch's acks
         _log(f"task {_one_line(task.get('id'))[:128]} not taken ({type(e).__name__}: {e}) "
              "— not acked; the broker re-serves it")
