@@ -307,7 +307,10 @@ class RuntimeDispatcher:
                 return self.tasks.submit(params["task"],
                                          priority=params.get("priority") or "normal")
             if method == "task.list":
-                return self.tasks.list_tasks()
+                unfinished_only = params.get("unfinishedOnly", False)
+                if not isinstance(unfinished_only, bool):
+                    raise ProtocolError(-32602, "unfinishedOnly must be a boolean")
+                return self.tasks.list_tasks(unfinished_only=unfinished_only)
             if method == "task.list_results":
                 return self.tasks.list_results()
             if method == "task.get_result":
