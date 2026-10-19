@@ -2977,6 +2977,15 @@ def _retry_pending_acks(inflight: "set[str]") -> None:
         _post_task_ack(tid, durable, leases.get(tid))
 
 
+ACK_DROP_RETRY_S = 0.5
+
+
+def _connection_dropped(e: BaseException) -> bool:
+    """The peer closed or reset the connection: the request may never have been read."""
+    reason = e.reason if isinstance(e, urllib.error.URLError) else e
+    return isinstance(reason, (ConnectionResetError, http.client.IncompleteRead))
+
+
 def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = None) -> bool:
     """Tell the gateway a task made it safely into the local queue. `durable`
     says the task file, its media sidecar and the in-flight set are all fsync'd,
@@ -2998,7 +3007,14 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             body["lease_id"] = lease_id
         if durable:
             body["durable"] = True
-        _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10)
+        try:
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10)
+        except _NETWORK_ERRORS as e:
+            if not _connection_dropped(e):
+                raise
+            # A dropped link loses the ack; one prompt retry lands it inside the delivery lease.
+            time.sleep(ACK_DROP_RETRY_S)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         _forget_pending_ack(tid, lease_id)
         return True
