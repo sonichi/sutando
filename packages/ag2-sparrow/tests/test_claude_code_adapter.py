@@ -1732,13 +1732,15 @@ class ConnectOccupancy(ConnectBase):
 class ConnectReadme(unittest.TestCase):
     def test_the_readme_states_the_limits_and_the_fallbacks(self):
         text = " ".join((ADAPTER / "README.md").read_text().split())
-        for phrase in ("`AbandonProcessGroup` false", "`ThrottleInterval` 30", "`KillMode=control-group`", "it never SIGKILLs",
-                       "A session that ignores SIGTERM overlaps the new one", "calls `setsid()`",
-                       "asserted from `KillMode=control-group` and not witnessed here", "macOS has no `pidfd_open`",
-                       "`Popen` handle is the fallback", "`AG2_SPARROW_MANAGED=1`", "not a security boundary",
-                       "yours to stop", "no trampoline", "as its **direct child**", "never signals a bare pid or a group"):
+        for phrase in ("`AbandonProcessGroup` false", "`ThrottleInterval` 30", "`KillMode=process`", "`ExitTimeOut` 180",
+                       "`TimeoutStopSec=180`", "`SuccessfulExit: false`", "stray", "systemd ordering", "not witnessed",
+                       "`/clear`", "at-most-once", "commit-unknown", "`AG2_SPARROW_MANAGED=1`", "not a security boundary",
+                       "`hold --generation=<32 hex> --`", "`hitl/requirements-claude-local`", "`hitl_cl_`",
+                       "`stop --confirm`", "`attach`", "`/exit`", "Keep waiting", "`AG2_INBOX_INODE`",
+                       "`ag2-sparrow-claude-local inbox`"):
             self.assertIn(phrase, text, phrase)
-        for gone in ("held, launcher gone", "trampoline **parent**", "group kill", "sweeps the group"):
+        for gone in ("held, launcher gone", "trampoline **parent**", "group kill", "sweeps the group", "debug-run",
+                     "KillMode=control-group", "as its **direct child**", "stream-json"):
             self.assertNotIn(gone, text, gone)
 
 
