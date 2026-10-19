@@ -840,23 +840,25 @@ def verify_tail(shape: Shape, cfg: dict, results: list, occupancy=None, relay=No
               "the launcher's process group and survives a launcher death until the next launcher adopts it")
 
 
-def kept_line(shape: Shape) -> str:
-    """What uninstall leaves in place, naming Sparrow's token file only when it exists."""
-    relay = _dirs.device_env_path()
-    return f"kept: {relay} (Sparrow's token) and {shape.kept}" if relay.exists() else f"kept: {shape.kept}"
+def kept_line(shape: Shape, relay=None) -> str:
+    """What uninstall leaves in place, naming the token file only when it exists; `relay` is the one
+    the install configured ('' for none), else Sparrow's device env."""
+    relay = _dirs.device_env_path() if relay is None else relay
+    return f"kept: {relay} (Sparrow's token) and {shape.kept}" if relay and Path(relay).exists() else f"kept: {shape.kept}"
 
 
-def uninstall(shape: Shape, before_free=None) -> int:
+def uninstall(shape: Shape, before_free=None, token_file=None) -> int:
     """`before_free(config) -> problem` runs after the manager stop and before the root must read free:
-    a shape whose session outlives its launcher stops it there."""
+    a shape whose session outlives its launcher stops it there. `token_file(config)` names the token
+    file the install configured, for the kept line."""
     try:
         with operation_lock(shape):
-            return _uninstall_locked(shape, before_free)
+            return _uninstall_locked(shape, before_free, token_file)
     except Busy as e:
         return _refuse(str(e))
 
 
-def _uninstall_locked(shape: Shape, before_free=None) -> int:
+def _uninstall_locked(shape: Shape, before_free=None, token_file=None) -> int:
     """any -> absent, config last: stop through the manager, its explicit absent (systemd: inactive and
     disabled), the lock free, the marked unit removed, systemd reloaded with LoadState=not-found, then the
     config. Any unknown or failure keeps the config, so a rerun still knows the root; every step re-runs."""
@@ -868,12 +870,13 @@ def _uninstall_locked(shape: Shape, before_free=None) -> int:
     if problem:
         return _refuse(problem)
     root = cfg["ROOT"] if cfg else ""
+    relay = token_file(cfg) if token_file is not None and cfg else None
     manager = manager_state(shape)
     if manager == "unknown":
         return _refuse(f"{job_name(shape)}'s state is unknown; nothing was removed", recovery_lines(shape, root) if root else ())
     if unit is None and cfg is None and manager == "absent":
         print(f"nothing to remove: {shape.name} is not installed")
-        print(kept_line(shape))
+        print(kept_line(shape, relay))
         return 0
     kept = (f"{sup} and {conf} were" if unit is not None and cfg else f"{conf} was" if cfg else
             f"{sup} was" if unit is not None else "nothing was") + " kept so a rerun knows the work root"
@@ -904,5 +907,5 @@ def _uninstall_locked(shape: Shape, before_free=None) -> int:
     if cfg is not None:
         conf.unlink()
         print(f"removed: {conf}")
-    print(kept_line(shape))
+    print(kept_line(shape, relay))
     return 0

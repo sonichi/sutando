@@ -1881,6 +1881,7 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertIn(f"removed: {cm.service_path(cli.BRIDGE)}", out)
         self.assertLess(out.index(f"removed: {cm.service_path(cli.BRIDGE)}"), out.index(f"removed: {cli.config_path()}"))
         self.assertTrue((cli.bridge_home(self.root) / "state").is_dir(), "the bridge's state is kept")
+        self.assertIn(f"kept: {self.relay} (Sparrow's token)", out)
         fake = self.bridged()
         self.assertEqual(self.install_default(fake)[0], 0)
         cm.service_path(cli.BRIDGE).write_text("[Service]\nExecStart=/mine\n")
@@ -1960,6 +1961,9 @@ class ConnectAgentRoot(AgentRootBase):
         rc, _, err = self.install_default(self.bridged(root=second), "--token-env-file", str(other))
         self.assertEqual(rc, 0, err)
         self.assertEqual((self.cfg()["ROOT"], self.cfg()["TOKEN_ENV_FILE"]), (str(second), str(other)))
+        self.assertEqual(cli.kept_token(self.cfg()), str(other))
+        self.assertEqual(cm.kept_line(cli.LOCAL, str(other)), f"kept: {other} (Sparrow's token) and the Claude login",
+                         "uninstall names the token file this install configured, not the host's")
         self.assertNotEqual(second, bound, "two agents, two roots")
 
     def test_a_root_recorded_for_another_agent_is_refused_at_install_and_by_the_launcher(self):
@@ -2031,13 +2035,15 @@ class ConnectHostSupervised(AgentRootBase):
             out = self.main("verify")[1]
         self.assertIn(f"INFO relay token: the vault key {cli.vault_key(seg)}, read by sparrowd at start", out)
         self.assertIn(f"FAIL bridge: no bridge wrote a status under {self.root}.bridge/state", out)
-        self.assertIn(f"sparrowd runs no worker from {self.decl()} yet", out)
+        self.assertIn(f"sparrowd reads its workers only at start: restart it after install (src/sparrowd.py) so "
+                      f"it runs {self.decl()}", out)
         self.assertNotIn("relay token:", [ln.split(" ", 1)[1][:12] for ln in out.splitlines() if ln.startswith(("PASS", "FAIL"))])
         with mock.patch.object(cm, "_run", side_effect=fake):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertIn(f"removed: {self.decl()}", out)
         self.assertFalse(self.decl().exists())
+        self.assertIn("kept: the Claude login", out, "the token lives in the vault: no host token file is named")
 
     def test_a_foreign_declaration_is_never_replaced_or_removed(self):
         self.decl().parent.mkdir(parents=True)

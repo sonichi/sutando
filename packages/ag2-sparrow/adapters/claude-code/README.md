@@ -191,7 +191,17 @@ environment only (the workspace's own binding is the core's agent), and
 install writes no job: it writes `<root>.bridge/worker.json`, a declaration
 naming the worker, the module, the same environment and the vault key the
 token is read from (`vault set AG2_RELAY_TOKEN_BRIDGE_… <token>`). sparrowd
-does not read it yet; until it does, `verify` fails the bridge row and says so.
+reads every marked `<workspace>/agents/*.bridge/worker.json` at its start
+(`src/sparrowd.py`) and runs each as a worker through `src/sparrow_agent_bridge.py`:
+the token from the vault into `REMOTE_TASK_TOKEN` (never on disk; no token, no
+bridge), the agent's own dirs and the workspace's task stamper injected, the
+host's token file and proactive room cleared, and the package bridge run in
+that process. A declaration that is unmarked, malformed, names an absent vault
+key or points outside `<workspace>/agents` is skipped with one reason line.
+Restart sparrowd (`src/sparrowd.py`) after install: it reads its workers only
+at start, and until then `verify` fails the bridge row and says so. Nothing in
+this repo starts sparrowd (`startup.sh` and `restart.sh` run the core bridge
+directly), so whatever runs it on the host must be restarted.
 
 An explicit root (`--work`, `--inbox`, or `AGENT_CONNECT_TASK_DIR`) is served
 by a bridge you run; install records its agent when the host's chain names one

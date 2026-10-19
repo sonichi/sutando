@@ -86,6 +86,39 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
     return specs, skipped
 
 
+AGENT_BRIDGE = _SRC / "sparrow_agent_bridge.py"
+
+
+def _agent_bridge_specs(workspace=None, vault_keys=None) -> "tuple[list, list[str]]":
+    """One worker per agent bridge a claude-local install declared under <workspace>/agents; each skipped
+    declaration is one reason, never run."""
+    import sparrow_agent_bridge as agent_bridge
+    if vault_keys is None:
+        from vault_intercept import list_vault_keys
+        try:
+            vault_keys = list_vault_keys()
+        except Exception as exc:  # an unreadable manifest: no key can be shown present
+            vault_keys = []
+            print(f"sparrowd: vault manifest unreadable ({type(exc).__name__})", file=sys.stderr)
+    found, skipped = agent_bridge.declarations(workspace or resolve_workspace(), vault_keys)
+    specs, seen = [], set()
+    for path, decl in found:
+        if decl["name"] in seen:
+            skipped.append(f"{path}: the worker name {decl['name']} is already supervised")
+            continue
+        seen.add(decl["name"])
+        specs.append(WorkerSpec(name=decl["name"], argv=[sys.executable, str(AGENT_BRIDGE), str(path)], cwd=str(REPO)))
+    return specs, skipped
+
+
+def supervision_marker(spec) -> str:
+    """The pgrep pattern for a worker's process: an agent bridge by its own declaration path (one
+    wrapper runs every agent), any other worker by its script's name."""
+    if len(spec.argv) > 2 and Path(spec.argv[1]).name == AGENT_BRIDGE.name:
+        return spec.argv[-1]
+    return Path(spec.argv[-1]).name
+
+
 def worker_specs() -> list:
     specs = [
         WorkerSpec(
@@ -96,6 +129,9 @@ def worker_specs() -> list:
     ]
     skill_specs, skipped = _skill_worker_specs()
     specs.extend(skill_specs)
+    agent_specs, agent_skipped = _agent_bridge_specs()
+    specs.extend(agent_specs)
+    skipped.extend(agent_skipped)
     for why in skipped:
         print(f"sparrowd: not supervised — {why}", file=sys.stderr)
     return specs
@@ -123,7 +159,7 @@ def external_supervisor(marker: str) -> "str | None":
 
 def main() -> int:
     for spec in worker_specs():
-        owned = external_supervisor(Path(spec.argv[-1]).name)
+        owned = external_supervisor(supervision_marker(spec))
         if owned:
             print(f"sparrowd: refusing to start — {spec.name} already "
                   f"supervised outside sparrowd: {owned}. Stop that "

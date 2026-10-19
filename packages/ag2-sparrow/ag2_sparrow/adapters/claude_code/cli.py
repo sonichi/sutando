@@ -184,8 +184,8 @@ def bridge_fix(cfg: dict) -> str:
     if mode == UNIT:
         return f"see {cm.launcher_log(BRIDGE)}, or run {COMMAND} install again"
     if mode != EXTERNAL:
-        return (f"{mode} runs no worker from {bridge_home(root) / DECLARATION} yet; register it as a supervised "
-                f"worker, the token in the vault under {cfg.get('TOKEN_VAULT_KEY')}")
+        return (f"{mode} reads its workers only at start: restart it after install (src/sparrowd.py) so it "
+                f"runs {bridge_home(root) / DECLARATION}, with the token in the vault under {cfg.get('TOKEN_VAULT_KEY')}")
     return (f"start the bridge with AGENT_CONNECT_TASK_DIR={root}/tasks AGENT_CONNECT_RESULT_DIR={root}/results "
             f"AGENT_CONNECT_STATE_DIR={bridge_state(cfg)}")
 
@@ -240,8 +240,8 @@ def wire_bridge(cfg: dict) -> str:
                 "module": "ag2_sparrow.remote_gateway_bridge", "env": env, "token_vault_key": cfg["TOKEN_VAULT_KEY"],
                 "token_env": "REMOTE_TASK_TOKEN"}
         cm._write(path, json.dumps(body, indent=1, sort_keys=False) + "\n", 0o644)
-        print(f"declared: {path} ({mode} runs it as worker {body['name']}; the token is read from the vault: "
-              f"vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
+        print(f"declared: {path} ({mode} runs it as worker {body['name']} once restarted; the token is read from "
+              f"the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
         return ""
     sup = cm.supervisor_path(BRIDGE)
     text, problem = cm.owned_text(sup, cm.supervisor_marker(BRIDGE), "supervisor file")
@@ -581,8 +581,14 @@ def _stop_and_unregister(cfg: dict) -> str:
     return problem
 
 
+def kept_token(cfg: dict):
+    """The token file uninstall names as kept: the agent's own, none under a vault, else the host's."""
+    mode = bridge_mode(cfg)
+    return cfg.get("TOKEN_ENV_FILE", "") if mode == UNIT else None if mode == EXTERNAL else ""
+
+
 def uninstall(_args) -> int:
-    return cm.uninstall(LOCAL, before_free=_stop_and_unregister)
+    return cm.uninstall(LOCAL, before_free=_stop_and_unregister, token_file=kept_token)
 
 
 def attach(_args) -> int:
